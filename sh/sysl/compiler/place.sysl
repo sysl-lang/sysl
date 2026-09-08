@@ -1,0 +1,289 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a place is, and what a `?` anywhere inside a statement means for a `defer`.
+//
+// **A place is something with an address**: a local, a field, an element, a dereference. Anything
+// computed -- a call's result, an arithmetic result, a freshly built struct -- is not one, and the
+// refusals below say what a place is rather than that this is not one, because the mistake is
+// nearly always a call and "it has no address" is the fact that explains every case at once.
+
+// -- what a place is ------------------------------------------------------------------------------
+
+// Analyzes something that must be a place: an assignment target, or the operand of `&`.
+analyze_place(cx: &Analyzer, target: Expr, what: string) -> TExpr =
+    require_place(cx, type_expr_bare(cx, target), target, what, true)
+
+// The same demand made of an expression **already analyzed**, for a form that had to see the type
+// before it knew whether a place was what it wanted at all.
+//
+// `writes` separates the two questions. Both need an address, and only one of them *is* a write:
+// `&` hands back a `*T`, and what a program does with a raw pointer is the unsafe tier's business.
+require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool) -> TExpr
+    if texpr_type(t) == Unknown then return t
+
+    // A **captured** name reaches storage the walk below cannot see the binding of, so being
+    // written once is asked of the name it was declared under rather than of what it turned into.
+    val named = written_name(target)
+
+    if named.is_some()
+        val local = cx.lookup(named.unwrap())
+
+        if local.is_some() && local.unwrap().read_only
+            cx.fault(target.span, written_once(local.unwrap(), what))
+
+            return t
+        end if
+    end if
+
+    // A string is immutable, and it is worth saying so rather than reporting the absence of an
+    // address: writing one byte of UTF-8 is how a string stops being UTF-8.
+    *t.kind match
+        TIndex(recv, _, _) ->
+            if texpr_type(recv) == Str
+                cx.fault(target.span,
+                         "a string is immutable, so its bytes have no address to write through")
+                return t
+            end if
+
+            // `s.bytes` reinterprets the string's own storage rather than a copy of it, so writing
+            // through one is writing the string.
+            if writes && is_bytes(recv)
+                cx.fault(target.span, "a string is immutable, and 'bytes' views the string's own " +
+                         "storage rather than a copy of it — so writing through one is writing " +
+                         "the string. Bytes you may write are bytes of your own: copy them into a " +
+                         "'[]u8' first")
+                return t
+            end if
+
+            if writes && read_only_view(texpr_type(recv)) && texpr_type(recv) != Str
+                cx.fault(target.span, s"this element belongs to a " +
+                         s"'${type_show(texpr_type(recv))}', which views elements it may not " +
+                         "write, so there is nothing to assign through. Elements you may write " +
+                         "are elements of your own: copy them into a " +
+                         s"'[]${type_show(element(texpr_type(recv)).unwrap_or(Unknown))}' first")
+                return t
+            end if
+        _ -> ()
+
+    if !writable_place(t)
+        cx.fault(target.span, s"$what needs a variable, a field, an element, or a dereference — " +
+                 "something with an address")
+
+        return t
+    end if
+
+    val root = root_local(cx, t)
+
+    if root.is_some() && root.unwrap().read_only then
+        cx.fault(target.span, written_once(root.unwrap(), what))
+
+    t
+end require_place
+
+private is_bytes(t: TExpr) -> bool = *t.kind match
+    TBytes(_) -> true
+    _ -> false
+
+private written_name(target: Expr) -> Option[string] = *target.kind match
+    Ident(n) -> Some(n)
+    _ -> None
+
+// Why a write to a read-only place is refused, in the words of the form the program actually wrote.
+//
+// A pattern binding gets its own sentence rather than the `val` one, because the reader of an arm
+// wrote no `val` and the reason is a different reason: the name holds a **copy** of the part that
+// matched, so the write would land where nothing can observe it.
+private written_once(local: Local, what: string) -> string
+    if local.from_pattern then
+        return "a pattern binding is written once, because it holds a copy of what it matched — " +
+            s"so $what would reach that copy rather than the value it came from. Where you mean " +
+            "to change something, take a 'var' from the binding first"
+
+    s"a 'val' is written once, so $what has nothing to write through"
+end written_once
+
+// Whether a typed expression denotes a place -- something with an address, which can be assigned
+// through and pointed at.
+//
+// The element is the case with a condition on it. A slice's elements live wherever its owner keeps
+// them, so they have an address even when the slice itself is a temporary; an array's elements are
+// the array, so they do not; and what a pointer names is somewhere else, which is the same reason
+// `*p` is a place.
+writable_place(t: TExpr) -> bool = *t.kind match
+    TLoad(_, _) -> true
+    TGlobal(_, _, _) -> true
+    TDeref(_, _) -> true
+    TField(recv, _, _) -> writable_place(recv)
+    TIndex(recv, _, _) -> texpr_type(recv) match
+        Slice(_, _) -> true
+        Str -> false
+        Ptr(_) -> true
+        _ -> writable_place(recv)
+    _ -> false
+
+// The local a place bottoms out in, where it bottoms out in one at all -- the same descent
+// `writable_place` makes, kept apart from it because the refusal wants the *binding*.
+private root_local(cx: &Analyzer, t: TExpr) -> Option[Local] = *t.kind match
+    TLoad(name, _) -> local_named(cx, name)
+    TField(recv, _, _) -> root_local(cx, recv)
+    TIndex(recv, _, _) -> root_local(cx, recv)
+    _ -> None
+
+private local_named(cx: &Analyzer, unique: string) -> Option[Local]
+    for i in 0..<cx.locals.len()
+        if cx.locals.at(i).unique == unique then return Some(cx.locals.at(i))
+
+    None
+end local_named
+
+// How a diagnostic names an assignment target.
+describe_target(target: Expr) -> string = *target.kind match
+    Ident(n) -> s"'$n'"
+    Field(_, f) -> s"field '$f'"
+    Unary(op, _) -> if op == "*" then "the place it points at" else "this place"
+    Index(_, _) -> "this element"
+    _ -> "this place"
+
+// Whether a `?` stands anywhere in a run of statements, which is what a `defer` refuses.
+stmts_try(stmts: Buf[TStmt]) -> bool
+    for i in 0..<stmts.len()
+        if stmt_try(stmts.at(i)) then return true
+
+    false
+end stmts_try
+
+private stmt_try(s: TStmt) -> bool = s match
+    TVarDecl(_, _, init, _) -> expr_try(init)
+    TExprStmt(e) -> expr_try(e)
+    TInvariant(c, _) -> expr_try(c)
+    TVariantCheck(_, _, e) -> expr_try(e)
+    TRefDecl(_, _, place) -> expr_try(place)
+    TWriteStmt(w) -> expr_try(w.place) || expr_try(w.value)
+    TMultiAssign(ws) -> writes_try(ws)
+    TReturn(v) -> if v.is_none() then false else expr_try(v.unwrap())
+    TBecome(c) -> expr_try(c)
+    TBreak(v, _) -> if v.is_none() then false else expr_try(v.unwrap())
+    TContinue(_) -> false
+    TDefer(inner) -> stmts_try(inner)
+    TAsm(_, _, _) -> false
+
+private writes_try(ws: Buf[TWrite]) -> bool
+    for i in 0..<ws.len()
+        if expr_try(ws.at(i).place) || expr_try(ws.at(i).value) then return true
+
+    false
+end writes_try
+
+// Whether a `?` stands anywhere in a typed expression, which is what a `defer` refuses.
+//
+// The descent is over the forms that can hold one, which is every composite node: the operator can
+// be at any depth of any expression.
+expr_try(e: TExpr) -> bool = *e.kind match
+    TTry(_, _, _, _, _, _, _) -> true
+    TBox(v, _) -> expr_try(v)
+    TDowngrade(v, _) -> expr_try(v)
+    TUpgrade(v, _, _, _) -> expr_try(v)
+    TArrayLit(xs, _) -> any_expr_try(xs)
+    TArrayFill(v, _) -> expr_try(v)
+    TVectorLit(xs, _) -> any_expr_try(xs)
+    TSplat(v, _) -> expr_try(v)
+    TLane(r, _, _) -> expr_try(r)
+    TVecCompare(_, l, r, _) -> expr_try(l) || expr_try(r)
+    TSelect(m, a, b, _) -> expr_try(m) || expr_try(a) || expr_try(b)
+    TReduce(_, r, _) -> expr_try(r)
+    TVecLoad(r, i, _) -> expr_try(r) || expr_try(i)
+    TVecStore(r, i, v) -> expr_try(r) || expr_try(i) || expr_try(v)
+    TBufLit(xs, _) -> any_expr_try(xs)
+    TBufFill(v, n, _) -> expr_try(v) || expr_try(n)
+    TIndex(r, i, _) -> expr_try(r) || expr_try(i)
+    TLen(r, _) -> expr_try(r)
+    TBytes(r) -> expr_try(r)
+    TSlice(b, lo, hi, _, _) -> expr_try(b) || opt_expr_try(lo) || opt_expr_try(hi)
+    TCast(v, _) -> expr_try(v)
+    TConstrainedCheck(v, _) -> expr_try(v)
+    TConstrainedValid(v, _) -> expr_try(v)
+    TConstrainedStep(v, _, _, _) -> expr_try(v)
+    TDeref(v, _) -> expr_try(v)
+    TTypeId(r, _) -> expr_try(r)
+    TAddrOf(p, _) -> expr_try(p)
+    TTempAddr(v, _) -> expr_try(v)
+    TStore(p, v, _) -> expr_try(p) || expr_try(v)
+    TUpdate(p, _, v, _, _, _) -> expr_try(p) || expr_try(v)
+    TIncDec(p, _, _, _, _) -> expr_try(p)
+    TBinary(_, l, r, _) -> expr_try(l) || expr_try(r)
+    TUnary(_, v, _) -> expr_try(v)
+    TIntOp(_, v, a, _, _) -> expr_try(v) || opt_expr_try(a)
+    TAtomic(_, a, xs, _, _, _) -> expr_try(a) || any_expr_try(xs)
+    TLogical(_, l, r) -> expr_try(l) || expr_try(r)
+    TCompare(xs, _) -> any_expr_try(xs)
+    TSeq(xs) -> any_expr_try(xs)
+    TStr(a) -> expr_try(a)
+    TFromBytes(a) -> expr_try(a)
+    TConstView(a) -> expr_try(a)
+    TFormat(a, _) -> expr_try(a)
+    TRender(v, _, s, _) -> expr_try(v) || expr_try(s)
+    TCall(_, xs, _, _) -> any_expr_try(xs)
+    TCallPtr(c, xs, _, _) -> expr_try(c) || any_expr_try(xs)
+    TErase(v, _, _) -> expr_try(v)
+    TVCall(r, _, xs, _, _) -> expr_try(r) || any_expr_try(xs)
+    TVaStart(a) -> expr_try(a)
+    TVaEnd(a) -> expr_try(a)
+    TVaArg(a, _) -> expr_try(a)
+    TVaCopy(d, s) -> expr_try(d) || expr_try(s)
+    TVaPass(a) -> expr_try(a)
+    TStructNew(_, xs) -> any_expr_try(xs)
+    TStructInvCheck(v, _, _) -> expr_try(v)
+    TRecheck(a, r, _, _) -> expr_try(a) || expr_try(r)
+    TEnumNew(_, _, xs) -> any_expr_try(xs)
+    TEnumFromInt(v, _) -> expr_try(v)
+    TEnumTry(v, _, _, _, _) -> expr_try(v)
+    TEnumAttr(_, _, a, _) -> expr_try(a)
+    TField(r, _, _) -> expr_try(r)
+    TIf(c, t, e, _) -> any_cond_try(c) || block_try(t) || opt_block_try(e)
+    TMatch(s, arms, _) -> expr_try(s) || any_arm_try(arms)
+    TBlockExpr(b) -> block_try(b)
+    TWhile(c, body, e, _) -> any_cond_try(c) || stmts_try(body) || opt_block_try(e)
+    TDoWhile(body, c, e, _) -> stmts_try(body) || expr_try(c) || opt_block_try(e)
+    TLoop(body, _) -> stmts_try(body)
+    TFor(_, _, lo, hi, _, body, e, _) ->
+        expr_try(lo) || expr_try(hi) || stmts_try(body) || opt_block_try(e)
+    TCFor(init, c, step, body, e, _) ->
+        stmts_try(init) || opt_expr_try(c) || stmts_try(step) || stmts_try(body) || opt_block_try(e)
+    TForEach(_, _, seq, body, e, _) -> expr_try(seq) || stmts_try(body) || opt_block_try(e)
+    TIterate(_, _, init, next, _, body, e, _) ->
+        expr_try(init) || expr_try(next) || stmts_try(body) || opt_block_try(e)
+    TQuantifier(_, _, _, lo, hi, _, p) -> expr_try(lo) || expr_try(hi) || expr_try(p)
+    TCheckedLoop(_, _, l) -> expr_try(l)
+    _ -> false
+
+private any_expr_try(xs: Buf[TExpr]) -> bool
+    for i in 0..<xs.len()
+        if expr_try(xs.at(i)) then return true
+
+    false
+end any_expr_try
+
+private opt_expr_try(x: Option[TExpr]) -> bool = x.is_some() && expr_try(x.unwrap())
+
+private block_try(b: TBlock) -> bool = stmts_try(b.stmts) || opt_expr_try(b.result)
+
+private opt_block_try(b: Option[TBlock]) -> bool = b.is_some() && block_try(b.unwrap())
+
+private any_cond_try(cs: Buf[TCondTerm]) -> bool
+    for i in 0..<cs.len()
+        cs.at(i) match
+            TCondTest(c) -> if expr_try(c) then return true
+            TCondIs(s, _, _) -> if expr_try(s) then return true
+
+    false
+end any_cond_try
+
+private any_arm_try(arms: Buf[TArm]) -> bool
+    for i in 0..<arms.len()
+        if opt_expr_try(arms.at(i).guard) || block_try(arms.at(i).body) then return true
+
+    false
+end any_arm_try

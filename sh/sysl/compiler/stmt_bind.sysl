@@ -1,0 +1,421 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The forms that bind or write more than one thing at once: `a, b = b, a`, `val a, b = f()`, and
+// the binding whose left side is a pattern.
+//
+// **All three are one question asked three ways** -- how do several names or several places get
+// their values -- and they share the one mechanism: where the right side is a single carrier it is
+// evaluated once into a name no program can write, and each part is read back out of it.
+
+// -- the comma forms ------------------------------------------------------------------------------
+
+// The values a comma form on the left is given, where the right side is **one** thing carrying
+// several -- the third of the three feeds this syntax has.
+//
+// The one thing is evaluated once, into a name no program can write, and each part is read back out
+// of it. That is what keeps `a, b = f()` a single call, and it costs the form nothing else: the
+// hidden binding is an ordinary local.
+//
+// None where the right side is a list rather than one carrier, which is every other case.
+// Whether one carrier on the right was what the form was read as, which is what says the count
+// check has nothing left to add: a carrier that could not supply the parts has already been
+// complained about in its own terms.
+private spread_was_tried(places: usize, values: Buf[Expr]) -> bool =
+    values.len() == 1 && places > 1
+
+private spread(cx: &Analyzer, places: usize, values: Buf[Expr],
+               subject: string) -> Option[(TStmt, Buf[TExpr])]
+    if !spread_was_tried(places, values) then return None
+
+    val one_value = values.at(0)
+    val tv = type_expr_multi(cx, one_value, None)
+
+    underlying(texpr_type(tv)) match
+        Struct(d) ->
+            if !is_tuple(d)
+                spread_refused(cx, one_value.span, subject, tv, d)
+                return None
+            end if
+
+            if d.targs.len() != places
+                spread_refused(cx, one_value.span, subject, tv, d)
+                return None
+            end if
+
+            val name = cx.bind("$parts", texpr_type(tv))
+            var read: Buf[TExpr] = buf()
+
+            for i in 0..<d.fields.len()
+                read.push(TExpr(one_value.span,
+                                TField(TExpr(one_value.span, TLoad(name, texpr_type(tv))), int(i),
+                                       d.fields.at(i).1)))
+
+            Some((TVarDecl(name, texpr_type(tv), tv, None), read))
+
+        other ->
+            cx.fault(one_value.span, s"$subject, and one ${type_show(other)} is not something to " +
+                     "take apart — only a tuple is")
+            None
+
+// A carrier with the wrong number of parts, complained about in its own terms: a call that yields
+// several things has *results*, and the type nobody wrote is not worth naming back at the reader.
+private spread_refused(cx: &Analyzer, span: Span, subject: string, tv: TExpr, d: &StructType)
+    if yields_results(tv) then
+        cx.fault(span, s"$subject, and this yields ${quantity(d.targs.len(), "result")}")
+    else
+        cx.fault(span, s"$subject, and a ${type_show(texpr_type(tv))} has " +
+                 s"${quantity(d.targs.len(), "part")} to give them")
+
+private yields_results(t: TExpr) -> bool = *t.kind match
+    TCall(_, _, _, results) -> results
+    TVCall(_, _, _, _, results) -> results
+    _ -> false
+
+// `a, b = b, a` and `a, b += 1, 2`.
+//
+// Every place is read before any value, which is what fixes each value's expected type: a literal
+// on the right takes the width of the place it is heading for, exactly as it does after a single
+// `=`. Each arm is then checked by the rule its own operator already has.
+multi_assign(cx: &Analyzer, span: Span, op: string, targets: Buf[Expr],
+                     values: Buf[Expr]) -> Buf[TStmt]
+    val taken = spread(cx, targets.len(), values,
+                       s"this assignment has ${targets.len()} places on the left")
+
+    if !spread_was_tried(targets.len(), values) && targets.len() != values.len() then
+        cx.fault(span, s"this assignment has ${targets.len()} places on the left and " +
+                 s"${values.len()} ${if values.len() == 1 then "value" else "values"} on the right")
+
+    val what = if op == "=" then "assignment" else s"'$op'"
+    var places: Buf[TExpr] = buf()
+
+    for i in 0..<targets.len()
+        places.push(analyze_place(cx, targets.at(i), what))
+
+    var writes: Buf[TWrite] = buf()
+
+    for i in 0..<targets.len()
+        val place = places.at(i)
+        val part = part_at(taken, i)
+        val written = value_written(taken, targets, values, i)
+
+        writes.push(one_write(cx, op, targets.at(i), place, part, written))
+
+    var out: Buf[TStmt] = buf()
+
+    if taken.is_some() then out.push(taken.unwrap().0)
+
+    out.push(TMultiAssign(writes))
+    out
+end multi_assign
+
+// Each arm's position is the value it was written with, or -- where one carrier supplied them all
+// -- that carrier, since there is no separate expression to point at.
+private value_written(taken: Option[(TStmt, Buf[TExpr])], targets: Buf[Expr], values: Buf[Expr],
+                      i: usize) -> Expr
+    if taken.is_some() then return values.at(0)
+    if i < values.len() then return values.at(i)
+
+    targets.at(i)
+end value_written
+
+private part_at(taken: Option[(TStmt, Buf[TExpr])], i: usize) -> Option[TExpr]
+    if taken.is_none() then return None
+
+    val parts = taken.unwrap().1
+
+    if i < parts.len() then Some(parts.at(i)) else None
+end part_at
+
+// A part read out of a carrier is already analyzed, so what is left for the arm is the check the
+// written form performs after analyzing its own value. The two are kept together so that neither
+// feed can end up with a rule the other does not have.
+private one_write(cx: &Analyzer, op: string, target: Expr, place: TExpr, part: Option[TExpr],
+                  written: Expr) -> TWrite
+    if op == "="
+        val tv = arm_value(cx, part, written, texpr_type(place))
+
+        if texpr_type(tv) == Never || disagree(texpr_type(tv), texpr_type(place)) then
+            cx.fault(written.span, s"cannot assign ${type_show(texpr_type(tv))} to " +
+                     s"${describe_target(target)} of type ${type_show(texpr_type(place))}")
+
+        return TWrite(place, op, tv, None, buf(), None)
+    end if
+
+    val bin = op[0..<op.bytes.len - 1]
+    val tv = arm_value(cx, part, written, texpr_type(place))
+
+    if disagree(arith_type(cx, written.span, bin, texpr_type(place), texpr_type(tv), written.span),
+                texpr_type(place)) then
+        cx.fault(written.span, s"'$op' would change the type of ${describe_target(target)}")
+
+    TWrite(place, op, tv, None, buf(), constraint_of(texpr_type(place)))
+end one_write
+
+// The value one arm of a comma form is given: the part read out of the carrier, or the expression
+// written beside it.
+private arm_value(cx: &Analyzer, part: Option[TExpr], written: Expr, want: Type) -> TExpr
+    if part.is_some() then return part.unwrap()
+
+    type_expr(cx, written, Some(want))
+end arm_value
+
+// `val a, b = …` / `var a, b = …`.
+//
+// The names are declared only once every value has been read, so a value may still name whatever
+// the enclosing scope calls one of them -- the binding does not shadow itself half way through its
+// own right-hand side.
+multi_decl(cx: &Analyzer, span: Span, names: Buf[string], mutable: bool,
+                   values: Buf[Expr]) -> Buf[TStmt]
+    for i in 0..<names.len()
+        for j in 0..<i
+            if names.at(j) == names.at(i) then
+                cx.fault(span, s"'${names.at(i)}' is named twice in one binding")
+
+    val taken = spread(cx, names.len(), values, s"this binding names ${names.len()} things")
+
+    if !spread_was_tried(names.len(), values) && names.len() != values.len() then
+        cx.fault(span, s"this binding names ${names.len()} things and has ${values.len()} " +
+                 s"${if values.len() == 1 then "value" else "values"} to give them")
+
+    var tvs: Buf[TExpr] = buf()
+
+    if taken.is_some()
+        val parts = taken.unwrap().1
+
+        for i in 0..<parts.len()
+            tvs.push(parts.at(i))
+    else
+        for i in 0..<values.len()
+            val tv = type_expr_bare(cx, values.at(i))
+
+            if texpr_type(tv) == Never then
+                cx.fault(values.at(i).span,
+                         "cannot bind a name to an expression that never returns")
+
+            tvs.push(tv)
+    end if
+
+    var out: Buf[TStmt] = buf()
+
+    if taken.is_some() then out.push(taken.unwrap().0)
+
+    for i in 0..<names.len()
+        if i < tvs.len()
+            val tv = tvs.at(i)
+            val ty = texpr_type(tv)
+            val u = if mutable then cx.bind(names.at(i), ty) else cx.bind_read_only(names.at(i), ty)
+
+            out.push(TVarDecl(u, ty, tv, None))
+        else
+            out.push(TVarDecl(cx.bind(names.at(i), Unknown), Unknown, TExpr(span, TZero(Unknown)),
+                              None))
+
+    out
+end multi_decl
+
+// `val (a, b) = …` -- a binding whose left side is a pattern.
+//
+// The value is read once into a temporary and the pattern is then walked against its type, each
+// part reading a field of what is above it. **A part that is not a name is checked here rather than
+// where a match arm's is**, because the question is not the one an arm asks: an arm may be
+// refutable and fall through, and a binding has nowhere to fall.
+pattern_decl(cx: &Analyzer, span: Span, pat: Pattern, mutable: bool,
+                     value: Expr) -> Buf[TStmt]
+    var names: Buf[string] = buf()
+
+    pattern_names(&names, pat)
+
+    for i in 0..<names.len()
+        for j in 0..<i
+            if names.at(j) == names.at(i) then
+                cx.fault(span, s"'${names.at(i)}' is named twice in one binding")
+
+    val tv = type_expr_bare(cx, value)
+
+    if texpr_type(tv) == Never then
+        cx.fault(value.span, "cannot bind a name to an expression that never returns")
+
+    // The whole value is held once, under a name no program can write, and every part is read out
+    // of it. Reading the value expression again per part would run its side effects once each.
+    val temp = cx.bind("$parts", texpr_type(tv))
+    var out: Buf[TStmt] = buf()
+
+    out.push(TVarDecl(temp, texpr_type(tv), tv, None))
+    push_all(&out, bind_pattern(cx, span, pat,
+                                TExpr(value.span, TLoad(temp, texpr_type(tv))), mutable))
+    out
+end pattern_decl
+
+// Every name a pattern binds, in the order it binds them, so a repeat is reported against the whole
+// binding rather than found later as a shadow.
+pattern_names(out: *Buf[string], p: Pattern)
+    *p.kind match
+        IdentPattern(n) -> out.push(n)
+
+        // The outer name first, which is the order it is written in.
+        BindPattern(n, inner) ->
+            out.push(n)
+            pattern_names(out, inner)
+
+        TuplePattern(args) ->
+            for i in 0..<args.len()
+                pattern_names(out, args.at(i))
+
+        StructPattern(_, fields) ->
+            for i in 0..<fields.len()
+                pattern_names(out, fields.at(i).pat)
+
+        _ -> ()
+
+// One level of a pattern binding: bind a name, ignore a wildcard, or read the parts of a tuple and
+// descend into each.
+private bind_pattern(cx: &Analyzer, span: Span, p: Pattern, subject: TExpr,
+                     mutable: bool) -> Buf[TStmt]
+    *p.kind match
+        WildcardPattern -> buf()
+
+        // `var whole @ (a, b) = pair` -- the value under its own name, and its parts under theirs.
+        // The subject is already the held temporary, so naming it twice reads that temporary twice
+        // and runs nothing a second time.
+        BindPattern(n, inner) ->
+            var out = bind_name(cx, n, subject, mutable)
+
+            push_all(&out, bind_pattern(cx, span, inner, subject, mutable))
+            out
+
+        IdentPattern(n) -> bind_name(cx, n, subject, mutable)
+
+        TuplePattern(args) -> bind_parts(cx, span, args, subject, mutable, true)
+
+        StructPattern(name, fields) -> bind_fields(cx, span, name, fields, subject, mutable)
+
+        // A struct has exactly one shape, so `Name(…)` against one is the positional form and
+        // belongs at a binding for the reason a tuple pattern does.
+        VariantPattern(written, args) ->
+            underlying(texpr_type(subject)) match
+                Struct(d) -> bind_positional(cx, span, written, args, subject, mutable, d)
+                _ ->
+                    cx.fault(span, "a binding cannot choose among variants — this pattern matches " +
+                             "one of several shapes, and a binding has no other arm to take when " +
+                             "the value has another")
+                    buf()
+
+        LitPattern(_) -> cannot_test(cx, span)
+        RangePattern(_, _, _) -> cannot_test(cx, span)
+
+        // A quoted name is a *reference*, so it tests rather than binds. It earns its own sentence
+        // because the fix is not the one the other refusals want: the name here is almost always
+        // the name that was meant, and it is the backticks that are wrong.
+        EqPattern(n) ->
+            cx.fault(span, s"a binding cannot test a value — '`$n`' names something already " +
+                     "declared, and a binding has no other arm to take when the value turns out " +
+                     s"to differ; write '$n' to bind a new name")
+            buf()
+
+private cannot_test(cx: &Analyzer, span: Span) -> Buf[TStmt]
+    cx.fault(span, "a binding cannot test a value — this pattern matches only some values, and a " +
+             "binding has no other arm to take when it does not match")
+    buf()
+
+private bind_name(cx: &Analyzer, n: string, subject: TExpr, mutable: bool) -> Buf[TStmt]
+    val ty = texpr_type(subject)
+    val u = if mutable then cx.bind(n, ty) else cx.bind_read_only(n, ty)
+
+    one_stmt(TVarDecl(u, ty, subject, None))
+end bind_name
+
+private bind_parts(cx: &Analyzer, span: Span, args: Buf[Pattern], subject: TExpr, mutable: bool,
+                   tuple: bool) -> Buf[TStmt]
+    underlying(texpr_type(subject)) match
+        Struct(d) ->
+            if tuple && !is_tuple(d)
+                cx.fault(span, s"one ${type_show(texpr_type(subject))} is not something to take " +
+                         "apart — only a tuple is")
+                return buf()
+            end if
+
+            if d.fields.len() != args.len()
+                cx.fault(span, s"this pattern takes ${quantity(args.len(), "part")}, and a " +
+                         s"${type_show(texpr_type(subject))} has " +
+                         s"${quantity(d.targs.len(), "part")} to give it")
+                return buf()
+            end if
+
+            var out: Buf[TStmt] = buf()
+
+            for i in 0..<args.len()
+                push_all(&out, bind_pattern(cx, span, args.at(i),
+                                            TExpr(subject.span,
+                                                  TField(subject, int(i), d.fields.at(i).1)),
+                                            mutable))
+
+            out
+
+        other ->
+            cx.fault(span, s"one ${type_show(other)} is not something to take apart — only a " +
+                     "tuple is")
+            buf()
+
+private bind_fields(cx: &Analyzer, span: Span, name: string, fields: Buf[FieldPattern],
+                    subject: TExpr, mutable: bool) -> Buf[TStmt]
+    underlying(texpr_type(subject)) match
+        Struct(d) ->
+            if !struct_named(cx, name, d)
+                cx.fault(span, s"'$name{…}' does not match a ${type_show(Struct(d))} value")
+                return buf()
+            end if
+
+            var out: Buf[TStmt] = buf()
+
+            for i in 0..<fields.len()
+                val f = fields.at(i)
+
+                for j in 0..<i
+                    if fields.at(j).name == f.name then
+                        cx.fault(span, s"field '${f.name}' is matched more than once")
+
+                val idx = d.field_index(f.name)
+
+                if idx < 0
+                    cx.fault(span, s"struct '${module_show(d.base)}' has no field '${f.name}'")
+                else
+                    if !field_visible(cx, d.base, f.name) then
+                        cx.fault(span, s"'${f.name}' is private to the file that declares " +
+                                 s"'${module_show(d.base)}'")
+
+                    push_all(&out, bind_pattern(cx, span, f.pat,
+                                                TExpr(subject.span,
+                                                      TField(subject, idx,
+                                                             d.fields.at(usize(idx)).1)),
+                                                mutable))
+
+            out
+
+        other ->
+            cx.fault(span, s"'$name{…}' matches a struct, but the value is ${type_show(other)}")
+            buf()
+
+private bind_positional(cx: &Analyzer, span: Span, written: string, args: Buf[Pattern],
+                        subject: TExpr, mutable: bool, d: &StructType) -> Buf[TStmt]
+    if !struct_named(cx, written, d)
+        cx.fault(span, s"'$written(…)' does not match a ${type_show(Struct(d))} value")
+        return buf()
+    end if
+
+    if args.len() != d.fields.len()
+        cx.fault(span, s"struct '${module_show(d.base)}' has " +
+                 s"${quantity(d.fields.len(), "field")}, but ${supplied(args.len(), "sub-pattern")}")
+        return buf()
+    end if
+
+    bind_parts(cx, span, args, subject, mutable, false)
+end bind_positional
+
+private struct_named(cx: &Analyzer, written: string, d: &StructType) -> bool
+    val key = lookup_type_key(cx.an, cx.scope, written)
+
+    key.is_some() && key.unwrap() == d.base
+end struct_named
