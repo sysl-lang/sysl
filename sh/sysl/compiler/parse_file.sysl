@@ -177,23 +177,38 @@ end parse_header_attr
 //
 // **A literate file is tangled first**, so that everything below this point reads an ordinary
 // program. A `.sysl` file comes back from the tangle unchanged and pays nothing for the branch.
-parse(src: Source) -> Parsed
+// **A literate file is tangled first and the tangle is gated after**, in that order: a directive
+// sits at the margin, and in a literate document the margin is prose. So the gate reads the program
+// the tangle produced, which is where a `#if` written four columns in has arrived at column 1.
+parse(src: Source, target: Target = host_target()) -> Parsed
     tangle(src) match
-        Err(d) ->
-            var r = report()
-
-            r.add(d)
-            Parsed(empty_program(src), r, src, 0)
-        Ok(text) -> parse_tangled(src, text)
+        Err(d) -> refused(src, d, 0)
+        Ok(text) ->
+            gate(text, target) match
+                Err(d) -> refused(text, d, literate_shift(src))
+                Ok(gated) -> parse_tangled(src, gated)
 end parse
+
+// A file the passes before the parser refused, as a `Parsed` carrying the one complaint.
+private refused(src: Source, d: Diagnostic, shift: usize) -> Parsed
+    var r = report()
+
+    r.add(d)
+    Parsed(empty_program(src), r, src, shift)
+end refused
+
+// The four columns a literate file's tangle removed, which a position is reported with added back.
+private literate_shift(src: Source) -> usize
+    if is_literate(src.name) then return LiterateIndent
+
+    0
+end literate_shift
 
 private empty_program(src: Source) -> Program =
     Program(buf(), None, buf(), buf(), src, false, buf(), buf())
 
 private parse_tangled(original: Source, src: Source) -> Parsed
-    var shift: usize = 0
-
-    if is_literate(original.name) then shift = LiterateIndent
+    val shift = literate_shift(original)
 
     lex_documented(src) match
         Err(d) ->

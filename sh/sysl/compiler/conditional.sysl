@@ -1,0 +1,613 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, StrBuilder, str_builder, from_utf8_unchecked, replace_all}
+
+// Conditional compilation: the lines of a file that belong to the target being built for.
+//
+// A systems language needs one file to be able to say two things, because the two machines it is
+// describing genuinely differ -- a syscall number, a struct a header lays out differently, a symbol
+// one libc exports and the other does not. Everything else about a target is a fact the compiler
+// reads; this is the one place a *program* gets to read one.
+//
+// **The gating is by line, and it happens before the lexer sees anything.** A line inside a branch
+// this target is not being built for is replaced by an empty line -- replaced rather than removed,
+// so every line below keeps the number it was written at and a diagnostic quotes the line it means.
+// The directive lines go the same way, which is what makes them cost nothing: after this runs, the
+// file is an ordinary sysl file that happens to have some blank lines in it, and nothing downstream
+// knows any of it happened. It is the same trick the literate tangle plays on prose, for the same
+// reason.
+//
+// **The cost, stated rather than worked around: the inactive branch is never syntax-checked.** That
+// is C's cost too, and it is the price of gating text rather than trees. What is *not* given up is
+// the conditions themselves -- every condition on every directive is read and checked here, in the
+// branch being taken and the ones being skipped alike, so a misspelled symbol in the Linux half is
+// caught by a macOS build.
+
+// One open group.
+//
+// `taken` is whether *this* branch's lines are the ones being kept, and it already accounts for the
+// groups enclosing this one -- so the whole stack being `taken` is exactly the condition for a line
+// to survive. `chosen` is whether any branch of the group has been taken yet, which is what an
+// `#elif` and an `#else` consult. `else_line` is where this group's `#else` is, or `0` for a group
+// that has not reached one.
+private struct Frame
+    line: usize
+    taken: bool
+    chosen: bool
+    else_line: usize
+end Frame
+
+// The directive a line carries: the word, and the column its argument would start at.
+private struct Directive
+    word: string
+    at: usize
+end Directive
+
+// The source as this target sees it, or the first thing wrong with its directives.
+//
+// A file with no directives comes back **unchanged**: a compilation that gated nothing should be the
+// compilation it would have been before any of this existed.
+gate(src: Source, target: Target) -> Result[Source, Diagnostic]
+    val on = defined(target)
+    val lines = src.line_count()
+    var stack: Buf[Frame] = buf()
+    var keep: Buf[bool] = buf()
+    var touched = false
+
+    for line in 1..lines
+        val text = from_utf8_unchecked(src.line_text(line))
+
+        directive_of(text) match
+            None ->
+                // A line survives when every open group is in its taken branch: an `#if` inside a
+                // branch that was not taken selects nothing at all, however its own condition reads.
+                val live = all_taken(stack)
+
+                keep.push(live)
+
+                if !live then touched = true
+            Some(d) ->
+                touched = true
+                keep.push(false)
+
+                val word = d.word
+
+                if word == "if"
+                    val value = condition(src, line, text, d.at, word, on)?
+                    var taken = false
+
+                    if all_taken(stack) && value then taken = true
+
+                    stack.push(Frame(line, taken, value, 0))
+                elif word == "elif"
+                    if stack.len() == 0
+                        return Err(fail_at(src, line, 1,
+                            "'#elif' has no '#if' above it to be an alternative to"))
+
+                    val top = stack.at(stack.len() - 1)
+
+                    if top.else_line > 0
+                        return Err(fail_at(src, line, 1,
+                            s"'#elif' comes after the '#else' on line ${top.else_line}, which is already the alternative to everything above it"))
+
+                    val value = condition(src, line, text, d.at, word, on)?
+                    var taken = false
+
+                    // `chosen` is what makes the branches exclusive rather than merely conditional:
+                    // it says a branch of this group has already been taken, so no later one is,
+                    // however its own condition reads.
+                    if outer_taken(stack) && !top.chosen && value then taken = true
+
+                    stack.set(stack.len() - 1, Frame(top.line, taken, top.chosen || value, top.else_line))
+                elif word == "else"
+                    trailing(src, line, text, d.at, word) match
+                        Some(bad) -> return Err(bad)
+                        None -> ()
+
+                    if stack.len() == 0
+                        return Err(fail_at(src, line, 1,
+                            "'#else' has no '#if' above it to be an alternative to"))
+
+                    val top = stack.at(stack.len() - 1)
+
+                    if top.else_line > 0
+                        return Err(fail_at(src, line, 1,
+                            s"this group already has an '#else', on line ${top.else_line}"))
+
+                    var taken = false
+
+                    if outer_taken(stack) && !top.chosen then taken = true
+
+                    stack.set(stack.len() - 1, Frame(top.line, taken, true, line))
+                elif word == "endif"
+                    trailing(src, line, text, d.at, word) match
+                        Some(bad) -> return Err(bad)
+                        None -> ()
+
+                    if stack.len() == 0
+                        return Err(fail_at(src, line, 1, "'#endif' has no '#if' above it to close"))
+
+                    stack.pop()
+                else
+                    return Err(fail_at(src, line, 1, not_word_message(word).unwrap()))
+
+    // Reported at the `#if` rather than at the end of the file, because the `#if` is what the reader
+    // has to go and look at: an unterminated group is a missing `#endif`, and with several groups
+    // open the end of the file says nothing about which one is missing it. The outermost is named
+    // because it is the one whose `#endif` would have to come last.
+    if stack.len() > 0
+        return Err(fail_at(src, stack.at(0).line, 1, "this '#if' is never closed — add an '#endif'"))
+
+    if !touched then return Ok(src)
+
+    var out = str_builder()
+
+    for line in 1..lines
+        if line > 1 then out.push_char('\n')
+        if keep.at(line - 1) then out.push(line_raw(src, line))
+
+    Ok(source_of(src.name, out.finish()))
+end gate
+
+// Every symbol a condition may name, whatever the target.
+//
+// The set is **closed and derived**: the operating systems and processors the registry knows, plus
+// the three facts worth a name of their own, and nothing a project can add to. Derived so that a new
+// system extends it by existing rather than by also being written down here, where the two could
+// come to disagree.
+//
+// That it is closed is what lets a symbol nobody knows be refused, which is the whole reason to have
+// a set rather than a predicate: a misspelling that read as false would gate code out of the build
+// with nothing said, and silently missing code is the one failure this feature cannot have.
+symbols() -> Buf[string]
+    var out: Buf[string] = buf()
+    val systems = all_os()
+    val processors = all_cpus()
+
+    for i in 0..<systems.len()
+        out.push(os_symbol(systems.at(i)))
+
+    for i in 0..<processors.len()
+        out.push(cpu_symbol(processors.at(i)))
+
+    out.push("hosted")
+    out.push("posix")
+    out.push("bsd")
+    out
+end symbols
+
+// The symbols that are **true** for a target. Everything in `symbols` and not in here is false;
+// everything in neither is a mistake.
+defined(target: Target) -> Buf[string]
+    var out = os_defined(target.os)
+
+    out.push(cpu_symbol(target.cpu))
+    out
+end defined
+
+// The symbols an **operating system alone** settles, true for it and false for every other.
+//
+// This is the half a directory selects on, and the reason it is a function of a system rather than
+// of a whole target: the walk that reads a tree has an operating system and no processor. Every one
+// of these is also a `#if` symbol, because `defined` is this plus the processor -- the two places a
+// source file can name a machine share a vocabulary, and here is where that stops being a claim and
+// becomes an equation.
+os_defined(os: Os) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(os_symbol(os))
+
+    if os_hosted(os) then out.push("hosted")
+    if os_posix(os) then out.push("posix")
+    if os_bsd(os) then out.push("bsd")
+
+    out
+end os_defined
+
+// Every symbol a **directory** may select on -- the operating systems, plus the environment facts
+// that are answerable without a processor.
+//
+// A processor symbol is deliberately not here: a directory is chosen by a walk that has no processor
+// to ask, and source that varies by one is what `#if` is for.
+directory_symbols() -> Buf[string]
+    var out: Buf[string] = buf()
+    val systems = all_os()
+
+    for i in 0..<systems.len()
+        out.push(os_symbol(systems.at(i)))
+
+    out.push("hosted")
+    out.push("posix")
+    out.push("bsd")
+    out
+end directory_symbols
+
+// The whole vocabulary in one line, sorted, as a refusal names it.
+symbols_listed() -> string
+    val sorted = sorted_strings(symbols())
+    var out = ""
+
+    for i in 0..<sorted.len()
+        if i > 0 then out = out + ", "
+
+        out = out + sorted.at(i)
+
+    out
+end symbols_listed
+
+// Whether a list of symbols holds one.
+has(xs: Buf[string], s: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == s then return true
+
+    false
+end has
+
+// -- reading a directive line ---------------------------------------------------------------------
+
+// The words a directive line may open with, and the C spellings that are named rather than left to
+// the grammar.
+private is_directive_word(word: string) -> bool =
+    word == "if" || word == "elif" || word == "else" || word == "endif" ||
+        not_word_message(word).is_some()
+
+// The C spellings sysl does not have, kept so that writing one is told what to write instead.
+// Without this they fall through to the lexer as a stray `#` and a name, and the reader is left with
+// a syntax error about a token rather than with the sentence they need.
+private not_word_message(word: string) -> Option[string]
+    if word == "ifdef"
+        return Some("sysl has no '#ifdef' — a symbol is a fact about the target rather than something a build defines, so the test is written '#if <symbol>'")
+
+    if word == "ifndef" then return Some("sysl has no '#ifndef' — write '#if !<symbol>'")
+    if word == "elseif" then return Some("sysl spells this '#elif'")
+
+    if word == "define"
+        return Some(s"sysl has no '#define' — the symbols a condition may name are fixed by the target: ${symbols_listed()}")
+
+    if word == "undef"
+        return Some(s"sysl has no '#undef' — the symbols a condition may name are fixed by the target: ${symbols_listed()}")
+
+    None
+end not_word_message
+
+// The directive a line carries, or nothing for an ordinary line.
+//
+// **A directive sits at the margin, column 1, and that is a rule rather than a convention.** It is
+// what keeps the gate out of the channel the language reads block structure from: an indented `#if`
+// would look like it takes part in an indentation it has nothing to do with, when in fact the line
+// is gone before anything counts a column.
+//
+// What tells a directive from an annotation is the **sigil**, not the margin -- `#` gates lines, `@`
+// says something about a declaration, and an annotation on a `module` header sits at column 1 too.
+private directive_of(text: string) -> Option[Directive]
+    if !text.starts_with("#") then return None
+
+    val bs = text.bytes
+    var i: usize = 1
+
+    loop
+        if i >= bs.len then break
+        if !is_letter(bs[i]) then break
+
+        i += 1
+
+    val word = text[1..<i]
+
+    if !is_directive_word(word) then return None
+
+    // A word that reads as a name carrying on past the directive is left alone: `#iffy` is not `#if`
+    // with `fy` after it, and recognizing it as one would turn a typo in an attribute's name into a
+    // diagnostic about conditional compilation.
+    if i < bs.len && (is_digit(bs[i]) || bs[i] == u8('_')) then return None
+
+    Some(Directive(word, i + 1))
+end directive_of
+
+// What remains of a directive line after its word, with a trailing `//` comment dropped.
+//
+// A comment earns its place on these specifically: `#endif // linux` is how the reader of a long
+// gated region is told which group just closed. There is nothing else on such a line for a `//` to
+// be part of -- a condition has no strings in it -- so finding one is the whole of the work.
+private argument(text: string, at: usize) -> string
+    val rest = text[at - 1..<text.len]
+
+    rest.index_of("//") match
+        Some(n) -> rest[0..<n]
+        None -> rest
+end argument
+
+// Refuses anything written after `#else` or `#endif`, neither of which takes an argument.
+//
+// Left unchecked, `#endif linux` -- C's old habit, and legal there -- would read as an `#endif` with
+// the word quietly discarded, so the spelling most likely to arrive out of muscle memory would be
+// the one thing here that failed silently.
+private trailing(src: Source, line: usize, text: string, at: usize, word: string) -> Option[Diagnostic]
+    val rest = argument(text, at)
+    val bs = rest.bytes
+
+    for i in 0..<bs.len
+        if !is_blank(bs[i])
+            return Some(fail_at(src, line, at + i,
+                s"'#${word}' takes nothing after it, and '${rest.trim()}' is here"))
+
+    None
+end trailing
+
+// -- the condition --------------------------------------------------------------------------------
+
+// One token of a condition: what it is, what it says, and the column it was written at.
+private struct CondTok
+    kind: string
+    text: string
+    col: usize
+end CondTok
+
+// A condition being read, which is a token list and a position in it.
+private struct Cond
+    src: Source
+    line: usize
+    word: string
+    at: usize
+    toks: Buf[CondTok]
+    i: usize
+    on: Buf[string]
+end Cond
+
+// Whether a directive's condition holds for the symbols given, or what is wrong with it.
+//
+// **The condition is evaluated whether or not its branch could be taken**, so that a mistake in the
+// half of a file this build is not compiling is still this build's problem. That is the one part of
+// an inactive branch this pass checks, and it is the part most worth checking: the mistakes a
+// condition can hold are exactly the ones that would otherwise gate code out with nothing said.
+private condition(src: Source, line: usize, text: string, at: usize, word: string,
+                  on: Buf[string]) -> Result[bool, Diagnostic]
+    val arg = argument(text, at)
+    val named = arg.trim()
+
+    // A target's *name* is the thing a reader most plausibly reaches for and the one thing that
+    // cannot be a symbol: it has a `-` in it, which no identifier carries. Left to the tokenizer they
+    // are told a `-` is not an operator, which is true and no help.
+    if target_named(named).is_some()
+        return Err(fail_at(src, line, at + content_at(arg),
+            s"'${named}' is a target's name rather than something a condition asks about — a condition asks about one fact of the machine at a time, so this is written '${replace_all(named, "-", " && ")}'"))
+
+    var toks: Buf[CondTok] = buf()
+    val bs = arg.bytes
+    var i: usize = 0
+
+    loop
+        if i >= bs.len then break
+
+        val b = bs[i]
+        val col = at + i
+
+        if is_blank(b)
+            i += 1
+        elif is_letter(b) || b == u8('_')
+            var j = i
+
+            loop
+                if j >= bs.len then break
+                if !is_letter(bs[j]) && !is_digit(bs[j]) && bs[j] != u8('_') then break
+
+                j += 1
+
+            toks.push(CondTok("name", arg[i..<j], col))
+            i = j
+        elif b == u8('&') && i + 1 < bs.len && bs[i + 1] == u8('&')
+            toks.push(CondTok("&&", "&&", col))
+            i += 2
+        elif b == u8('|') && i + 1 < bs.len && bs[i + 1] == u8('|')
+            toks.push(CondTok("||", "||", col))
+            i += 2
+        elif b == u8('!') || b == u8('(') || b == u8(')')
+            toks.push(CondTok(arg[i..<i + 1], arg[i..<i + 1], col))
+            i += 1
+        else
+            return Err(fail_at(src, line, col,
+                s"a condition is built from symbols, '!', '&&', '||' and parentheses, and '${char_at(arg, i)}' is none of them"))
+
+    var c = Cond(src, line, word, at, toks, 0, on)
+    val value = cond_or(&c)?
+
+    if c.i < c.toks.len()
+        val extra = c.toks.at(c.i)
+
+        return Err(fail_at(src, line, extra.col, s"the condition is complete before '${extra.text}'"))
+
+    Ok(value)
+end condition
+
+// **Both sides are evaluated even where the result is already settled** -- this is a checker as much
+// as an evaluator, and short-circuiting would let a misspelled symbol through whenever the other
+// half of the condition happened to decide the answer.
+private cond_or(c: *Cond) -> Result[bool, Diagnostic]
+    var acc = cond_and(c)?
+
+    loop
+        if cond_kind(c) != "||" then break
+
+        c.i += 1
+
+        val rhs = cond_and(c)?
+
+        acc = acc || rhs
+
+    Ok(acc)
+end cond_or
+
+private cond_and(c: *Cond) -> Result[bool, Diagnostic]
+    var acc = cond_unary(c)?
+
+    loop
+        if cond_kind(c) != "&&" then break
+
+        c.i += 1
+
+        val rhs = cond_unary(c)?
+
+        acc = acc && rhs
+
+    Ok(acc)
+end cond_and
+
+private cond_unary(c: *Cond) -> Result[bool, Diagnostic]
+    if cond_kind(c) != "!" then return cond_atom(c)
+
+    c.i += 1
+
+    val value = cond_unary(c)?
+
+    Ok(!value)
+end cond_unary
+
+private cond_atom(c: *Cond) -> Result[bool, Diagnostic]
+    val kind = cond_kind(c)
+
+    if kind == ""
+        return Err(fail_at(c.src, c.line, cond_end(c), s"'#${c.word}' needs a condition after it"))
+
+    val tok = c.toks.at(c.i)
+
+    if kind == "name"
+        c.i += 1
+
+        if !has(symbols(), tok.text)
+            return Err(fail_at(c.src, c.line, tok.col,
+                s"'${tok.text}' is not something a target says about itself — sysl knows ${symbols_listed()}"))
+
+        return Ok(has(c.on, tok.text))
+
+    if kind == "("
+        c.i += 1
+
+        val inner = cond_or(c)?
+
+        if cond_kind(c) == ")"
+            c.i += 1
+            return Ok(inner)
+
+        if cond_kind(c) == ""
+            return Err(fail_at(c.src, c.line, cond_end(c), "this '(' is never closed"))
+
+        val next = c.toks.at(c.i)
+
+        return Err(fail_at(c.src, c.line, next.col, s"this '(' wants a ')' before '${next.text}'"))
+
+    Err(fail_at(c.src, c.line, tok.col,
+        s"a condition needs a symbol here, and '${tok.text}' is what is written"))
+end cond_atom
+
+private cond_kind(c: *Cond) -> string
+    if c.i >= c.toks.len() then return ""
+
+    c.toks.at(c.i).kind
+end cond_kind
+
+// Where the condition ran out, for the errors that are about something missing rather than something
+// written: past the last token there is, or at the argument itself when there are none.
+private cond_end(c: *Cond) -> usize
+    if c.toks.len() == 0 then return c.at
+
+    val last = c.toks.at(c.toks.len() - 1)
+
+    last.col + last.text.len
+end cond_end
+
+// -- the small mechanics --------------------------------------------------------------------------
+
+private all_taken(stack: Buf[Frame]) -> bool
+    for i in 0..<stack.len()
+        if !stack.at(i).taken then return false
+
+    true
+end all_taken
+
+// The same question about everything *enclosing* the innermost group, which is what an `#elif` and
+// an `#else` ask: whether this group may contribute at all.
+private outer_taken(stack: Buf[Frame]) -> bool
+    if stack.len() == 0 then return true
+
+    for i in 0..<stack.len() - 1
+        if !stack.at(i).taken then return false
+
+    true
+end outer_taken
+
+// A line as it was written, without its terminating newline and with the `\r` of a `\r\n` pair kept
+// -- a file's line endings survive on the lines that survive.
+private line_raw(src: Source, line: usize) -> string
+    val start = src.line_span(line).start
+    var stop = src.bytes.len
+
+    if line < src.line_count() then stop = src.starts.at(line) - 1
+
+    from_utf8_unchecked(src.bytes[start..<stop])
+end line_raw
+
+private fail_at(src: Source, line: usize, col: usize, message: string) -> Diagnostic =
+    error(point(src.line_span(line).start + col - 1), message)
+
+// Where a line's content begins, as an offset into it.
+private content_at(text: string) -> usize
+    val bs = text.bytes
+
+    for i in 0..<bs.len
+        if !is_blank(bs[i]) then return i
+
+    0
+end content_at
+
+// The whole character an offset falls on, which is one byte for everything a condition may legally
+// hold and more for the bytes it may not.
+private char_at(text: string, i: usize) -> string
+    val bs = text.bytes
+    var n: usize = 1
+
+    loop
+        if i + n >= bs.len then break
+        if bs[i + n] < u8(0x80) || bs[i + n] >= u8(0xC0) then break
+
+        n += 1
+
+    text[i..<i + n]
+end char_at
+
+private is_letter(b: u8) -> bool = (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z'))
+
+private is_digit(b: u8) -> bool = b >= u8('0') && b <= u8('9')
+
+private is_blank(b: u8) -> bool = b == u8(' ') || b == u8('\t') || b == u8('\r')
+
+private sorted_strings(xs: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<xs.len()
+        val value = xs.at(i)
+        var at = out.len()
+        var placed = false
+
+        for j in 0..<out.len()
+            if !placed && before(value, out.at(j))
+                at = j
+                placed = true
+
+        out.insert(at, value)
+
+    out
+end sorted_strings
+
+private before(a: string, b: string) -> bool
+    val x = a.bytes
+    val y = b.bytes
+    var n = x.len
+
+    if y.len < n then n = y.len
+
+    for i in 0..<n
+        if x[i] != y[i] then return x[i] < y[i]
+
+    x.len < y.len
+end before

@@ -1,0 +1,141 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The registry: what machines the compiler knows, what each one is called, and how a machine that
+// describes itself in its own runtime's words is turned into one of these rows.
+
+@test("the registry gives each target one name")
+each_target_has_one_name()
+    val all = all_targets()
+
+    assert_eq(all.len(), 22)
+
+    for i in 0..<all.len()
+        for j in 0..<all.len()
+            if i != j
+                assert(all.at(i).name != all.at(j).name, s"two rows share a name: ${all.at(i).name}")
+
+@test("and a triple, which is no longer unique across the registry")
+a_triple_is_not_unique()
+    val all = all_targets()
+    var same = 0
+
+    for i in 0..<all.len()
+        assert(all.at(i).triple != "", s"${all.at(i).name} says nothing to a toolchain")
+
+        for j in 0..<all.len()
+            if i < j && all.at(i).triple == all.at(j).triple then same += 1
+
+    // `thumb-freestanding-softfp` and `thumb-freestanding-soft` are two machines under one triple,
+    // told apart by the presence of a floating-point unit, which a triple does not state.
+    assert(same > 0, "a triple describes more than one machine")
+
+@test("it builds for every address width, and refuses only what it has no convention for")
+it_builds_for_every_address_width()
+    val all = all_targets()
+    var widths: Buf[usize] = buf()
+    var refused = ""
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.supported()
+            var seen = false
+
+            for j in 0..<widths.len()
+                if widths.at(j) == t.pointer_bits() then seen = true
+
+            if !seen then widths.push(t.pointer_bits())
+        else
+            refused = refused + t.name
+
+    assert_eq(widths.len(), 3)
+    assert_eq(refused, "x86-linux")
+
+@test("a processor's width is the processor's, and every target on one agrees about it")
+a_width_is_the_processors()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        assert_eq(t.pointer_bits(), cpu_bits(t.cpu))
+        assert_eq(t.pointer_bytes(), cpu_bits(t.cpu) / 8)
+
+@test("naming one resolves a name in the registry")
+naming_one_resolves()
+    assert_eq(target_named("x86_64-linux").unwrap().triple, "x86_64-unknown-linux-gnu")
+    assert_eq(target_resolved("x86_64-linux").unwrap().name, "x86_64-linux")
+
+@test("and says what there is when the name is not one of them")
+a_name_that_is_not_one_of_them()
+    val out = target_resolved("sparc-solaris").unwrap_err()
+
+    assert(out.contains("unknown target 'sparc-solaris'"), out)
+    assert(out.contains("aarch64-macos"), out)
+    assert(out.contains("x86_64-freestanding"), out)
+
+@test("and says why a target it knows cannot be built for, which is a different sentence")
+a_target_it_knows_and_cannot_build_for()
+    val out = target_resolved("x86-linux").unwrap_err()
+
+    assert(out.contains("sysl knows 'x86-linux' and cannot build for it"), out)
+    assert(out.contains("no C calling convention has been measured for x86"), out)
+    assert(!out.contains("64-bit"), out)
+
+@test("the listing gives the same reason the refusal gives")
+the_listing_and_the_refusal_agree()
+    val why = target_named("x86-linux").unwrap().unsupported().unwrap()
+
+    assert(target_resolved("x86-linux").unwrap_err().contains(why), why)
+    assert(!why.contains("not yet supported"), why)
+
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        if all.at(i).supported() then assert(all.at(i).unsupported().is_none(), all.at(i).name)
+
+@test("and it is case-sensitive, since the name is written down and not guessed at")
+naming_one_is_case_sensitive()
+    assert(target_named("X86_64-Linux").is_none(), "a name is written down")
+    assert(target_resolved("X86_64-Linux").is_err(), "a name is written down")
+
+@test("a machine naming itself reads the three vocabularies this machine speaks")
+a_machine_naming_itself()
+    assert_eq(host_name("aarch64", "Mac OS X"), "aarch64-macos")
+    assert_eq(host_name("aarch64", "darwin"), "aarch64-macos")
+    assert_eq(host_name("arm64", "darwin"), "aarch64-macos")
+
+@test("and the spellings a machine of another kind would use")
+the_spellings_another_machine_would_use()
+    assert_eq(host_name("amd64", "Linux"), "x86_64-linux")
+    assert_eq(host_name("x64", "linux"), "x86_64-linux")
+    assert_eq(host_name("x86_64", "linux"), "x86_64-linux")
+    assert_eq(host_name("amd64", "Windows 11"), "x86_64-windows")
+    assert_eq(host_name("x64", "win32"), "x86_64-windows")
+    assert_eq(host_name("riscv64", "linux"), "riscv64-linux")
+
+@test("and answers with nothing when either half is one it does not know")
+a_machine_it_does_not_know()
+    assert_eq(host_name("sparc", "Linux"), "")
+    assert_eq(host_name("aarch64", "SunOS"), "")
+    assert_eq(host_name("", ""), "")
+
+@test("and never answers with a machine that has no operating system under it")
+never_a_machine_with_no_system()
+    for processor in ["aarch64", "arm64", "x86_64", "amd64", "x64", "riscv64", "sparc", ""]
+        for system in ["Mac OS X", "darwin", "Linux", "linux", "Windows 11", "win32", "SunOS", ""]
+            target_named(host_name(processor, system)) match
+                None -> ()
+                Some(t) -> assert(os_symbol(t.os) != "freestanding", t.name)
+
+@test("the host is a row of the registry, and a compilation naming no target gets it")
+the_host_is_a_row_of_the_registry()
+    val host = host_target()
+
+    assert(target_named(host.name).is_some(), host.name)
+    assert_eq(host.name, host_name(cpu_symbol(host_cpu()), os_symbol(host_os())))
+    assert(host.supported(), host.name)

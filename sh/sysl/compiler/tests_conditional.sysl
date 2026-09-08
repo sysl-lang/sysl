@@ -1,0 +1,691 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, from_utf8_unchecked, split}
+
+// Conditional compilation: which lines a machine sees, what a condition may say, and what is refused
+// rather than quietly gated away.
+//
+// **A target is a value here, which is the whole reason this is testable at all**: one laptop asks
+// what each of the twenty-two machines in the registry sees, and reading the text that comes out is
+// the whole of what a cross-target question needs.
+
+private on_linux() -> Target = target_named("x86_64-linux").unwrap()
+private on_macos() -> Target = target_named("aarch64-macos").unwrap()
+private on_intel_macos() -> Target = target_named("x86_64-macos").unwrap()
+private on_windows() -> Target = target_named("x86_64-windows").unwrap()
+private on_bare() -> Target = target_named("riscv64-freestanding").unwrap()
+
+// What a target sees, as the lines it kept with the blank ones dropped -- which is the observable
+// half of the pass and reads far better in a failing assertion than a text full of newlines.
+private sees(target: Target, text: string) -> string
+    gate(source_of("<input>", text), target) match
+        Err(d) -> s"!${d.message}"
+        Ok(out) ->
+            var acc = ""
+
+            for line in split(from_utf8_unchecked(out.bytes), "\n")
+                val kept = line.trim()
+
+                if kept != ""
+                    if acc != "" then acc = acc + " "
+
+                    acc = acc + kept
+
+            acc
+end sees
+
+// The gated text exactly as it comes out, for the claims that are about its shape.
+private gated(target: Target, text: string) -> string
+    gate(source_of("<input>", text), target) match
+        Err(d) -> s"!${d.message}"
+        Ok(out) -> from_utf8_unchecked(out.bytes)
+end gated
+
+// What the gate refused, or "" where it did not.
+private refuses(text: string) -> string
+    gate(source_of("<input>", text), on_macos()) match
+        Err(d) -> d.message
+        Ok(_) -> ""
+end refuses
+
+// Where a refusal points, as the reader's own `line:column`.
+private refuses_at(text: string) -> string
+    val src = source_of("<input>", text)
+
+    gate(src, on_macos()) match
+        Err(d) -> str(src.locate(d.span.start))
+        Ok(_) -> ""
+end refuses_at
+
+private gated_lines(target: Target, text: string) -> usize =
+    source_of("<input>", gated(target, text)).line_count()
+
+// -- which lines a target sees --------------------------------------------------------------------
+
+@test("a branch whose condition holds is kept, and the alternative is not")
+the_branch_that_holds_is_kept()
+    val body = "#if linux\nkept = 1\n#else\nother = 2\n#endif\n"
+
+    assert_eq(sees(on_linux(), body), "kept = 1")
+    assert_eq(sees(on_macos(), body), "other = 2")
+
+@test("a group with no alternative contributes nothing where it does not hold")
+a_group_with_no_alternative()
+    val body = "before = 0\n#if linux\nkept = 1\n#endif\n"
+
+    assert_eq(sees(on_linux(), body), "before = 0 kept = 1")
+    assert_eq(sees(on_macos(), body), "before = 0")
+
+@test("a line outside every group is seen by every target")
+a_line_outside_every_group()
+    val all = all_targets()
+    val body = "#if linux\ngated = 1\n#endif\neveryone = 9\n"
+
+    for i in 0..<all.len()
+        assert(sees(all.at(i), body).contains("everyone = 9"), all.at(i).name)
+
+// -- the alternatives are exclusive ---------------------------------------------------------------
+
+@test("an '#elif' is not taken when the '#if' above it was")
+an_elif_after_a_taken_if()
+    // `posix` and `macos` are both true here, and exactly one branch may be taken. A group that
+    // merely evaluated each condition would take both.
+    assert_eq(sees(on_macos(), "#if posix\none = 1\n#elif macos\ntwo = 2\n#endif\n"), "one = 1")
+
+@test("and is taken when the '#if' above it was not")
+an_elif_after_an_untaken_if()
+    assert_eq(sees(on_macos(), "#if windows\none = 1\n#elif macos\ntwo = 2\n#endif\n"), "two = 2")
+
+@test("a second '#elif' is reached only when neither before it was taken")
+a_second_elif()
+    val body = "#if windows\none = 1\n#elif freestanding\ntwo = 2\n#elif posix\nthree = 3\n#endif\n"
+
+    assert_eq(sees(on_macos(), body), "three = 3")
+    assert_eq(sees(on_windows(), body), "one = 1")
+    assert_eq(sees(on_bare(), body), "two = 2")
+
+@test("an '#else' is not taken when any branch above it was")
+an_else_after_a_taken_branch()
+    assert_eq(sees(on_linux(), "#if linux\none = 1\n#elif windows\ntwo = 2\n#else\nthree = 3\n#endif\n"),
+        "one = 1")
+
+@test("and is taken when none was")
+an_else_after_no_taken_branch()
+    assert_eq(sees(on_windows(), "#if linux\none = 1\n#elif macos\ntwo = 2\n#else\nthree = 3\n#endif\n"),
+        "three = 3")
+
+// -- nesting --------------------------------------------------------------------------------------
+
+@test("a group inside a branch that was taken is read normally")
+a_group_inside_a_taken_branch()
+    val body = "#if posix\n#if macos\none = 1\n#else\ntwo = 2\n#endif\n#else\nthree = 3\n#endif\n"
+
+    assert_eq(sees(on_macos(), body), "one = 1")
+    assert_eq(sees(on_linux(), body), "two = 2")
+    assert_eq(sees(on_windows(), body), "three = 3")
+
+@test("a group inside a branch that was NOT taken selects nothing, however its own condition reads")
+a_group_inside_an_untaken_branch()
+    // The discriminating case: the inner `#if macos` is true on macOS, and the branch it sits in is
+    // not taken, so neither of its own branches may contribute.
+    assert_eq(sees(on_macos(), "#if windows\n#if macos\none = 1\n#else\ntwo = 2\n#endif\n#else\nthree = 3\n#endif\n"),
+        "three = 3")
+
+@test("an '#else' inside an untaken branch does not reopen it")
+an_else_inside_an_untaken_branch()
+    assert_eq(sees(on_macos(), "#if windows\n#if windows\none = 1\n#else\ntwo = 2\n#endif\n#endif\nthree = 3\n"),
+        "three = 3")
+
+@test("the groups close innermost first")
+the_groups_close_innermost_first()
+    val body = "#if posix\n#if aarch64\none = 1\n#endif\n#if x86_64\ntwo = 2\n#endif\n#endif\n"
+
+    assert_eq(sees(on_macos(), body), "one = 1")
+    assert_eq(sees(on_linux(), body), "two = 2")
+
+@test("groups nest as deeply as they are written")
+groups_nest_as_deeply_as_written()
+    var text = ""
+
+    for i in 0..<12
+        text = text + "#if posix\n"
+
+    text = text + "deep = 1\n"
+
+    for i in 0..<12
+        text = text + "#endif\n"
+
+    assert_eq(sees(on_macos(), text), "deep = 1")
+
+// -- the operators ---------------------------------------------------------------------------------
+
+@test("'!' inverts")
+a_bang_inverts()
+    assert_eq(sees(on_macos(), "#if !windows\none = 1\n#else\ntwo = 2\n#endif\n"), "one = 1")
+
+@test("'&&' needs both")
+an_and_needs_both()
+    val body = "#if posix && aarch64\none = 1\n#else\ntwo = 2\n#endif\n"
+
+    assert_eq(sees(on_macos(), body), "one = 1")
+    assert_eq(sees(on_linux(), body), "two = 2")
+
+@test("'||' needs either")
+an_or_needs_either()
+    val body = "#if windows || linux\none = 1\n#else\ntwo = 2\n#endif\n"
+
+    assert_eq(sees(on_linux(), body), "one = 1")
+    assert_eq(sees(on_macos(), body), "two = 2")
+
+@test("'&&' binds tighter than '||'")
+an_and_binds_tighter_than_an_or()
+    val body = "#if windows || posix && aarch64\none = 1\n#else\ntwo = 2\n#endif\n"
+
+    assert_eq(sees(on_macos(), body), "one = 1")
+    assert_eq(sees(on_linux(), body), "two = 2")
+
+@test("parentheses regroup")
+parentheses_regroup()
+    val body = "#if (macos || windows) && aarch64\none = 1\n#else\ntwo = 2\n#endif\n"
+
+    assert_eq(sees(on_macos(), body), "one = 1")
+    assert_eq(sees(on_intel_macos(), body), "two = 2")
+
+@test("'!' applies to a parenthesized condition rather than to its first symbol")
+a_bang_applies_to_a_group()
+    // `!(macos || linux)` is false on macOS and `!macos || linux` is false there too, so the machine
+    // that tells them apart is Linux.
+    assert_eq(sees(on_linux(), "#if !(macos || linux)\none = 1\n#else\ntwo = 2\n#endif\n"), "two = 2")
+    assert_eq(sees(on_linux(), "#if !macos || linux\none = 1\n#else\ntwo = 2\n#endif\n"), "one = 1")
+
+@test("'!' stacks")
+a_bang_stacks()
+    assert_eq(sees(on_macos(), "#if !!macos\none = 1\n#else\ntwo = 2\n#endif\n"), "one = 1")
+
+// -- the symbols -----------------------------------------------------------------------------------
+
+@test("every target defines exactly one operating system and one processor")
+one_system_and_one_processor()
+    // **Read off the registry rather than written out.** The symbol set is derived from the systems
+    // and the processors precisely so that adding a machine adds its symbol.
+    val all = all_targets()
+    val systems = all_os()
+    val processors = all_cpus()
+
+    for i in 0..<all.len()
+        val on = defined(all.at(i))
+        var seen_system = 0
+        var seen_processor = 0
+
+        for j in 0..<systems.len()
+            if has(on, os_symbol(systems.at(j))) then seen_system += 1
+
+        for j in 0..<processors.len()
+            if has(on, cpu_symbol(processors.at(j))) then seen_processor += 1
+
+        assert_eq(seen_system, 1)
+        assert_eq(seen_processor, 1)
+
+@test("nothing a target defines is outside the closed set")
+nothing_outside_the_closed_set()
+    // What makes an unknown symbol refusable: the vocabulary is fixed, so a name outside it is a
+    // mistake rather than a fact this build happens not to have.
+    val all = all_targets()
+    val every = symbols()
+
+    for i in 0..<all.len()
+        val on = defined(all.at(i))
+
+        for j in 0..<on.len()
+            assert(has(every, on.at(j)), s"${all.at(i).name} defines ${on.at(j)}")
+
+@test("'hosted' is exactly the targets with an operating system under them")
+hosted_is_exactly_the_hosted()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        assert_eq(has(defined(t), "hosted"), os_symbol(t.os) != "freestanding")
+
+@test("'posix' is exactly macOS, Linux and Android")
+posix_is_exactly_three_systems()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+        val name = os_symbol(t.os)
+
+        assert_eq(has(defined(t), "posix"), name == "macos" || name == "linux" || name == "android")
+
+@test("'android' and 'linux' are different symbols, and no target defines both")
+android_is_not_on_linux()
+    assert(has(symbols(), "android"), "the vocabulary has it")
+    assert(has(defined(target_named("aarch64-android").unwrap()), "android"), "a phone is android")
+    assert(!has(defined(target_named("aarch64-android").unwrap()), "linux"), "a phone is not linux")
+    assert(!has(defined(target_named("aarch64-linux").unwrap()), "android"), "linux is not android")
+
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val on = defined(all.at(i))
+
+        assert(!(has(on, "android") && has(on, "linux")), all.at(i).name)
+
+@test("'bsd' is exactly the BSD libcs, and is narrower than 'posix'")
+bsd_is_narrower_than_posix()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        assert_eq(has(defined(t), "bsd"), os_bsd(t.os))
+
+        // Narrower, and the point of it: everything that is `bsd` is `posix`, and the converse fails
+        // on the glibc systems. A gate that meant "not glibc" and wrote `posix` would take them.
+        if os_bsd(t.os) then assert(has(defined(t), "posix"), t.name)
+
+@test("a new operating system reaches the directory vocabulary and the '#if' one alike")
+one_vocabulary_for_two_askers()
+    val every = symbols()
+    val folders = directory_symbols()
+
+    for i in 0..<folders.len()
+        assert(has(every, folders.at(i)), folders.at(i))
+
+    assert(has(folders, "android"), "a folder may name a phone")
+    assert(has(folders, "bsd"), "a folder may name a libc family")
+    assert(!has(folders, "aarch64"), "a walk has no processor to ask")
+
+    assert_eq(spaced(os_defined(Android)), "android hosted posix")
+    assert_eq(spaced(os_defined(MacOS)), "macos hosted posix bsd")
+
+@test("every symbol is true of at least one target in the registry")
+every_symbol_is_reachable()
+    // A symbol nothing can ever satisfy gates code out on every machine, which is the same defect as
+    // a misspelling and would not otherwise be caught.
+    val all = all_targets()
+    val every = symbols()
+
+    for i in 0..<every.len()
+        var reached = false
+
+        for j in 0..<all.len()
+            if has(defined(all.at(j)), every.at(i)) then reached = true
+
+        assert(reached, s"nothing is ${every.at(i)}")
+
+@test("the target's own name is not a symbol, and writing one says so")
+a_targets_name_is_not_a_symbol()
+    val out = refuses("#if aarch64-macos\none = 1\n#endif\n")
+
+    assert(out.contains("'aarch64-macos' is a target's name"), out)
+    assert(out.contains("aarch64 && macos"), out)
+    assert_eq(refuses_at("#if aarch64-macos\none = 1\n#endif\n"), "1:5")
+
+private spaced(xs: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<xs.len()
+        if i > 0 then out = out + " "
+
+        out = out + xs.at(i)
+
+    out
+end spaced
+
+// -- line numbers survive the gating ----------------------------------------------------------------
+
+@test("a diagnostic below a gated-out group points at the line it was written on")
+a_diagnostic_below_a_gate()
+    // The whole reason an inactive line is blanked rather than removed. Deleting the lines would
+    // make every diagnostic below a gate point at the wrong place, and nothing would say so.
+    assert_eq(pf_at("#if windows\nvar a = 1\nvar b = 2\nvar c = 3\n#endif\nf() = 1 2\n"), "6:9")
+
+@test("and one inside a kept group does too")
+a_diagnostic_inside_a_kept_group()
+    assert_eq(pf_at("#if posix\nf() = 1 2\n#endif\n"), "2:9")
+
+@test("a file keeps exactly as many lines as it had")
+a_file_keeps_its_line_count()
+    val text = "#if linux\nvar a = 1\n#else\nvar b = 2\n#endif\n"
+    val had = source_of("<input>", text).line_count()
+
+    assert_eq(gated_lines(on_macos(), text), had)
+    assert_eq(gated_lines(on_linux(), text), had)
+
+// -- what is refused, and why -----------------------------------------------------------------------
+
+@test("a symbol nothing knows, with the ones there are named")
+a_symbol_nothing_knows()
+    val out = refuses("#if darwin\none = 1\n#endif\n")
+
+    assert(out.contains("'darwin' is not something a target says about itself"), out)
+    assert(out.contains("macos"), out)
+    assert_eq(refuses_at("#if darwin\none = 1\n#endif\n"), "1:5")
+
+@test("and one in a branch this build is NOT taking, since every condition is read")
+a_symbol_nothing_knows_in_an_untaken_branch()
+    // The discriminating one, and the reason conditions are evaluated in every branch: a misspelling
+    // reads as false, so without this a macOS build would silently drop the code it was supposed to
+    // keep for Linux and say nothing at all.
+    assert(refuses("#if macos\none = 1\n#elif linnux\ntwo = 2\n#endif\n").contains("'linnux' is not"),
+        "the skipped branch is read")
+
+@test("and one inside a group that was itself skipped")
+a_symbol_nothing_knows_inside_a_skipped_group()
+    assert(refuses("#if windows\n#if lunix\none = 1\n#endif\n#endif\n").contains("'lunix' is not"),
+        "a skipped group is still read")
+
+@test("an '#if' that is never closed, reported at the '#if'")
+an_if_that_is_never_closed()
+    val text = "one = 1\n#if macos\ntwo = 2\n"
+
+    assert(refuses(text).contains("this '#if' is never closed"), refuses(text))
+    assert_eq(refuses_at(text), "2:1")
+
+@test("and the outermost unclosed '#if' is the one named")
+the_outermost_unclosed_if()
+    assert_eq(refuses_at("#if macos\n#if aarch64\none = 1\n#endif\n"), "1:1")
+
+@test("an '#endif' with nothing to close")
+an_endif_with_nothing_to_close()
+    assert_eq(refuses("one = 1\n#endif\n"), "'#endif' has no '#if' above it to close")
+
+@test("an '#else' with nothing to be an alternative to")
+an_else_with_nothing_to_alternate()
+    assert_eq(refuses("one = 1\n#else\ntwo = 2\n#endif\n"),
+        "'#else' has no '#if' above it to be an alternative to")
+
+@test("an '#elif' with nothing to be an alternative to")
+an_elif_with_nothing_to_alternate()
+    assert_eq(refuses("one = 1\n#elif macos\ntwo = 2\n#endif\n"),
+        "'#elif' has no '#if' above it to be an alternative to")
+
+@test("a second '#else' in one group, with the first one's line")
+a_second_else_in_one_group()
+    assert_eq(refuses("#if macos\none = 1\n#else\ntwo = 2\n#else\nthree = 3\n#endif\n"),
+        "this group already has an '#else', on line 3")
+
+@test("an '#elif' after the '#else' it would follow")
+an_elif_after_an_else()
+    assert(refuses("#if macos\none = 1\n#else\ntwo = 2\n#elif linux\nthree = 3\n#endif\n")
+        .contains("'#elif' comes after the '#else' on line 3"), "the else is named")
+
+@test("an '#if' with no condition at all")
+an_if_with_no_condition()
+    assert_eq(refuses("#if\none = 1\n#endif\n"), "'#if' needs a condition after it")
+
+@test("an '#elif' with no condition at all")
+an_elif_with_no_condition()
+    assert_eq(refuses("#if windows\none = 1\n#elif\ntwo = 2\n#endif\n"),
+        "'#elif' needs a condition after it")
+
+@test("a '!' with nothing to invert")
+a_bang_with_nothing_to_invert()
+    assert_eq(refuses("#if !\none = 1\n#endif\n"), "'#if' needs a condition after it")
+
+@test("an operator where a symbol belongs")
+an_operator_where_a_symbol_belongs()
+    assert(refuses("#if && macos\none = 1\n#endif\n")
+        .contains("a condition needs a symbol here, and '&&' is"), "an operator is not a symbol")
+
+@test("a '(' that is never closed")
+a_paren_that_is_never_closed()
+    assert_eq(refuses("#if (macos || linux\none = 1\n#endif\n"), "this '(' is never closed")
+
+@test("and one wanting its ')' before what is written")
+a_paren_wanting_a_close()
+    assert_eq(refuses("#if (macos linux)\none = 1\n#endif\n"), "this '(' wants a ')' before 'linux'")
+
+@test("a ')' the condition did not open")
+a_close_the_condition_did_not_open()
+    assert_eq(refuses("#if macos)\none = 1\n#endif\n"), "the condition is complete before ')'")
+
+@test("two symbols with no operator between them")
+two_symbols_with_no_operator()
+    assert_eq(refuses("#if macos linux\none = 1\n#endif\n"), "the condition is complete before 'linux'")
+
+@test("a character a condition has no reading for")
+a_character_with_no_reading()
+    assert(refuses("#if macos & linux\none = 1\n#endif\n").contains("'&' is none of them"),
+        "one ampersand is not two")
+
+@test("a number where a symbol belongs")
+a_number_where_a_symbol_belongs()
+    // C's `#if 1` has no counterpart here: a condition asks about the machine, and there is nothing
+    // a literal could be asking.
+    assert(refuses("#if 1\none = 1\n#endif\n").contains("'1' is none of them"), "a literal asks nothing")
+
+@test("something written after an '#else'")
+something_after_an_else()
+    assert_eq(refuses("#if macos\none = 1\n#else linux\ntwo = 2\n#endif\n"),
+        "'#else' takes nothing after it, and 'linux' is here")
+
+@test("something written after an '#endif'")
+something_after_an_endif()
+    // C's old habit, and legal there. Silently discarding it would make the spelling most likely to
+    // arrive out of muscle memory the one thing here that failed quietly.
+    assert_eq(refuses("#if macos\none = 1\n#endif macos\n"),
+        "'#endif' takes nothing after it, and 'macos' is here")
+
+// -- the C spellings sysl does not have --------------------------------------------------------------
+
+@test("'#ifdef' is named rather than left to the parser")
+ifdef_is_named()
+    assert(refuses("#ifdef macos\none = 1\n#endif\n").contains("sysl has no '#ifdef'"), "it is named")
+
+@test("'#ifndef' is told what to write instead")
+ifndef_is_told_what_to_write()
+    assert(refuses("#ifndef macos\none = 1\n#endif\n").contains("write '#if !<symbol>'"), "it is named")
+
+@test("'#elseif' is told the spelling sysl uses")
+elseif_is_told_the_spelling()
+    assert(refuses("#if windows\none = 1\n#elseif macos\ntwo = 2\n#endif\n")
+        .contains("sysl spells this '#elif'"), "it is named")
+
+@test("'#define' says the vocabulary is fixed by the target")
+define_says_the_vocabulary_is_fixed()
+    assert(refuses("#define DEBUG\none = 1\n").contains("sysl has no '#define'"), "it is named")
+
+@test("and so does '#undef'")
+undef_says_the_vocabulary_is_fixed()
+    assert(refuses("#undef DEBUG\none = 1\n").contains("sysl has no '#undef'"), "it is named")
+
+// -- what is not a directive ---------------------------------------------------------------------------
+
+@test("an indented '#if' is not one")
+an_indented_if_is_not_one()
+    // A directive sits at the margin, which is what keeps it out of the channel the language reads
+    // block structure from. An indented one reaches the lexer as what it is: a stray `#`.
+    assert(!refuses("f()\n    #if macos\n    one = 1\n    #endif\n").contains("never closed"),
+        "an indented directive is not a directive")
+
+@test("a declaration's '@test' attribute at the margin is untouched")
+an_attribute_at_the_margin_is_untouched()
+    assert_eq(pf("@test\nproves_nothing()\n    1\n"), "(fn @test proves_nothing () 1)")
+
+@test("a word that carries on past the directive is left alone")
+a_word_that_carries_on()
+    // `#iffy` is not `#if` with `fy` after it. Recognizing it as one would turn a typo in an
+    // attribute's name into a diagnostic about conditional compilation.
+    assert(!refuses("#iffy\none = 1\n").contains("condition"), "a longer word is a different word")
+    assert(!refuses("#if_x\none = 1\n").contains("condition"), "a name carries on past the word")
+
+// -- a file with no directives in it -------------------------------------------------------------------
+
+@test("a file with no directives comes back unchanged")
+a_file_with_no_directives()
+    val text = "f() = 1\n"
+
+    assert_eq(gated(on_macos(), text), text)
+    assert_eq(gated(on_bare(), text), text)
+
+@test("and is unaffected on every target in the registry")
+unaffected_on_every_target()
+    val all = all_targets()
+    val text = "double(n: int) -> int = n * 2\n"
+
+    for i in 0..<all.len()
+        assert_eq(gated(all.at(i), text), text)
+
+// -- the smaller shapes -----------------------------------------------------------------------------
+
+@test("a '//' comment on a directive line says which group closed")
+a_comment_on_a_directive_line()
+    assert_eq(sees(on_macos(), "#if posix\nkept = 1 // kept\n#endif // posix\n"), "kept = 1 // kept")
+
+@test("and one on an '#if' line does not become part of the condition")
+a_comment_on_an_if_line()
+    assert_eq(sees(on_macos(), "#if macos // this machine\none = 1\n#else\ntwo = 2\n#endif\n"), "one = 1")
+
+@test("whitespace around a condition is ignored")
+whitespace_around_a_condition()
+    assert_eq(sees(on_macos(), "#if    macos   \none = 1\n#else\ntwo = 2\n#endif\n"), "one = 1")
+
+@test("a group may be empty")
+a_group_may_be_empty()
+    assert_eq(sees(on_macos(), "#if windows\n#endif\nkept = 7\n"), "kept = 7")
+
+@test("a group at the very end of a file, with no trailing newline")
+a_group_at_the_end_of_a_file()
+    assert_eq(gated(on_macos(), "one = 1\n#if macos\n#endif"), "one = 1\n\n")
+
+@test("an empty file gates to an empty file")
+an_empty_file_gates_to_an_empty_file()
+    assert_eq(gated(on_macos(), ""), "")
+
+@test("a file of nothing but directives")
+a_file_of_nothing_but_directives()
+    assert_eq(gated(on_macos(), "#if macos\n#endif\n"), "\n\n")
+
+@test("CRLF line endings survive on the lines that are kept")
+crlf_survives_on_the_kept_lines()
+    assert_eq(gated(on_macos(), "#if macos\r\none = 1\r\n#else\r\ntwo = 2\r\n#endif\r\n"),
+        "\none = 1\r\n\n\n\n")
+
+// -- against the rest of the language ------------------------------------------------------------------
+
+@test("a struct's fields may differ between targets")
+a_structs_fields_may_differ()
+    // The case the feature is for: a type that has to match what a header lays out, and the header
+    // does not lay it out the same way twice.
+    val text = "struct Handle\n    fd: int\n#if windows\n    reserved: int\n#endif\n"
+
+    assert_eq(pf(text), "(struct Handle (fd:int))")
+    assert_eq(sees(on_windows(), text), "struct Handle fd: int reserved: int")
+
+@test("an 'extern' may differ between targets")
+an_extern_may_differ()
+    // The other case it is for: the same call reaching a symbol each libc spells its own way.
+    val text = "#if macos\nextern \"printf\" say(fmt: *u8, ...) -> i32\n#else\nextern \"printf_chk\" say(fmt: *u8, ...) -> i32\n#endif\n"
+
+    assert(sees(on_macos(), text).contains("\"printf\" say"), sees(on_macos(), text))
+    assert(sees(on_linux(), text).contains("\"printf_chk\" say"), sees(on_linux(), text))
+
+@test("a gated import is an import the other target does not have")
+a_gated_import()
+    val text = "#if macos\nimport sysl.sys\n#endif\n\nf() = 1\n"
+
+    assert_eq(pf(text), "(import sysl.sys) (fn f () 1)")
+    assert_eq(sees(on_linux(), text), "f() = 1")
+
+@test("a gated '@test' is a test the other target does not run")
+a_gated_test_attribute()
+    // The attribute and the directive both start with `#` and are read by different things, so a
+    // file holding both is worth pinning.
+    val text = "#if macos\n@test\nonly_here()\n    1\n#endif\n\nf() = 1\n"
+
+    assert_eq(pf(text), "(fn @test only_here () 1) (fn f () 1)")
+    assert_eq(sees(on_windows(), text), "f() = 1")
+
+// -- an inactive branch does not have to be sysl at all ------------------------------------------------
+
+@test("an inactive branch may not parse")
+an_inactive_branch_may_not_parse()
+    // The stated cost of gating text rather than trees, and the thing most worth pinning: a reader
+    // told the branch is never syntax-checked should be able to see that it is not.
+    assert_eq(pf("#if windows\n)( this is not sysl and never was ][\n#endif\nf() = 1\n"), "(fn f () 1)")
+
+@test("and may not even lex")
+an_inactive_branch_may_not_lex()
+    assert_eq(pf("#if windows\nvar s = \"unterminated\nvar c = '\n#endif\nf() = 2\n"), "(fn f () 2)")
+
+@test("but a directive inside it is still read, because the group has to be closed")
+a_directive_inside_an_inactive_branch()
+    assert(refuses("#if windows\n#if linux\nnonsense ][\n#endif\nf() = 1\n").contains("never closed"),
+        "the group still has to be closed")
+
+// -- the property this pass does NOT have ----------------------------------------------------------------
+
+@test("a line at the margin inside a text block reads as a directive")
+a_margin_line_inside_a_text_block()
+    // Stated as a known property rather than left to be discovered. The gate runs before anything
+    // knows what a string is, so a text-block line that starts at the margin with a directive word
+    // is one. Recognizing it would mean a second copy of the lexer's rules about strings and
+    // comments, which is a worse defect than this -- two sets of rules drift, and nothing says so.
+    assert_eq(refuses("var s = \"\"\"\n#endif\n\"\"\"\n"), "'#endif' has no '#if' above it to close")
+
+// -- a literate file ------------------------------------------------------------------------------
+
+@test("a literate file is tangled first and gated after, so a directive four columns in is one")
+a_literate_file_is_gated_after_the_tangle()
+    // The order is forced: a directive sits at the margin, and in a literate document the margin is
+    // prose. What the gate reads is the program the tangle produced, where a `#if` written at the
+    // four columns that make a line code has arrived at column 1.
+    assert_eq(pl("Prose about the machine.\n\n    #if macos\n    f() = 1\n    #else\n    f() = 2\n    #endif\n"),
+        "(fn f () 1)")
+
+@test("and a mistake in one of its conditions is reported at the column the reader wrote it at")
+a_literate_condition_is_reported_where_it_was_written()
+    val text = "Prose about the machine.\n\n    #if darwin\n    f() = 1\n    #endif\n"
+
+    assert(pl_err(text).contains("'darwin' is not something a target says about itself"), pl_err(text))
+    assert_eq(pl_at(text), "3:9")
+
+// -- the reference page's own examples --------------------------------------------------------------
+
+@test("the page's gated implementation reads on every machine it names")
+the_pages_gated_implementation()
+    val text = "#if posix\nline_ending() -> string = \"\\n\"\n#else\nline_ending() -> string = \"\\r\\n\"\n#endif\n\nprint(\"a posix machine\", line_ending().len)\n"
+
+    assert(sees(on_macos(), text).contains("\"\\n\""), sees(on_macos(), text))
+    assert(sees(on_windows(), text).contains("\"\\r\\n\""), sees(on_windows(), text))
+    assert_eq(pf_err(text), "")
+
+@test("and its '#elif' chain answers one machine at a time")
+the_pages_elif_chain()
+    val text = "#if aarch64\nmachine() -> string = \"aarch64\"\n#elif x86_64\nmachine() -> string = \"x86_64\"\n#elif riscv64\nmachine() -> string = \"riscv64\"\n#else\nmachine() -> string = \"something else\"\n#endif\n"
+
+    assert_eq(sees(on_macos(), text), "machine() -> string = \"aarch64\"")
+    assert_eq(sees(on_linux(), text), "machine() -> string = \"x86_64\"")
+    assert_eq(sees(target_named("thumb-freestanding").unwrap(), text),
+        "machine() -> string = \"something else\"")
+
+@test("and the line the reader is told about is the line they wrote on")
+the_pages_line_number_example()
+    // The page's caret is on line 7, which is where the last line is written -- not line 2, where it
+    // would be if the four gated lines had been dropped. The page's own last line is refused by the
+    // analyzer rather than by the grammar, so what stands in for it here is a line the grammar
+    // refuses; the claim is the line, and it is the same claim.
+    val text = "#if linux\nsay() -> string = \"one\"\nextra() -> int = 1\nanother() -> int = 2\n#endif\n\nf() = 1 2\n"
+
+    assert_eq(pf_at(text), "7:9")
+
+@test("and the refusal it quotes for a symbol nothing knows is the one that comes out")
+the_pages_unknown_symbol_refusal()
+    assert_eq(refuses("#if darwin\nsay() -> string = \"one\"\n#else\nsay() -> string = \"two\"\n#endif\n"),
+        "'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, freestanding, hosted, linux, macos, posix, riscv32, riscv64, thumb, wasi, wasm32, windows, x86, x86_64")
+
+@test("and the one it quotes for a target's name")
+the_pages_target_name_refusal()
+    assert_eq(refuses("#if aarch64-macos\nsay() -> string = \"one\"\n#endif\n"),
+        "'aarch64-macos' is a target's name rather than something a condition asks about — a condition asks about one fact of the machine at a time, so this is written 'aarch64 && macos'")
+
+@test("and the one it quotes for a misspelling in a branch nothing is taking")
+the_pages_misspelling_in_a_skipped_branch()
+    assert(refuses("#if linux\nsay() -> string = \"one\"\n#elif nosuchmachine\nsay() -> string = \"two\"\n#else\nsay() -> string = \"three\"\n#endif\n")
+        .contains("'nosuchmachine' is not something a target says about itself"), "every condition is read")

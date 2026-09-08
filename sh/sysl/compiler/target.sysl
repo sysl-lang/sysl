@@ -1,0 +1,326 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, to_lower}
+
+// The machine a program is compiled **for**.
+//
+// A target is the pair a systems language cannot do without -- a processor and the operating system
+// conventions layered on it. It is a value rather than a global: a compilation names one and carries
+// it down, and nothing consults the machine the compiler happens to be running on. That is what lets
+// one compiler build for a machine it is not, and it is why the host appears here only as the
+// **default** a compilation that names no target gets.
+//
+// **What is recorded is what something reads today.** The reference compiler's registry carries the
+// `va_list` ABI, the float conventions and the flags a toolchain is handed; this compiler reads a
+// target for one thing so far -- the symbols a condition may test (`conditional.sysl`) -- so what is
+// here is the name, the triple, the processor and the system, and the address width that follows
+// from the processor. The rows themselves are the reference compiler's, name for name, because a
+// name is what a command line writes and two registries that disagreed about one would be two
+// compilers.
+
+// The operating system conventions a target is built for.
+//
+// `Freestanding` is a member because a machine with no operating system under it is still a machine
+// with an answer. `Android` is its own row rather than a kind of `Linux`: what a source file gating
+// on a system asks about is the libc and the libraries, and Bionic is neither glibc's set of `-l`
+// names nor its headers.
+enum Os
+    MacOS
+    Linux
+    Windows
+    Freestanding
+    Android
+    Wasi
+end Os
+
+// The processor a target is built for.
+//
+// `Thumb` rather than `Arm`, because the instruction set is what a program gating on a processor has
+// to be right about -- a Cortex-M executes Thumb and nothing else. The two widths of RISC-V are two
+// rows for the reason a 32-bit and a 64-bit x86 are: an address width is what most code asking this
+// question is asking about.
+enum Cpu
+    Aarch64
+    X86_64
+    Riscv64
+    Riscv32
+    Thumb
+    Wasm32
+    X86
+    Craft
+end Cpu
+
+// What an operating system is called where a *source file* names one.
+//
+// The same words a `__<os>__` directory selects on, because `#if linux` and `__linux__/` are one
+// reader's one idea and two spellings of it would be a thing to look up rather than a thing to know.
+os_symbol(os: Os) -> string
+    os match
+        MacOS -> "macos"
+        Linux -> "linux"
+        Windows -> "windows"
+        Freestanding -> "freestanding"
+        Android -> "android"
+        Wasi -> "wasi"
+end os_symbol
+
+// What a processor is called where a source file names one.
+//
+// **It is not the name LLVM registers a back end under**, and the difference is not cosmetic: LLVM
+// spells the 64-bit x86 back end `x86-64` where a source file writes `x86_64`. This half is sysl's
+// to choose.
+cpu_symbol(cpu: Cpu) -> string
+    cpu match
+        Aarch64 -> "aarch64"
+        X86_64 -> "x86_64"
+        Riscv64 -> "riscv64"
+        Riscv32 -> "riscv32"
+        Thumb -> "thumb"
+        Wasm32 -> "wasm32"
+        X86 -> "x86"
+        Craft -> "craft"
+end cpu_symbol
+
+// How wide an address is on a processor.
+cpu_bits(cpu: Cpu) -> usize
+    cpu match
+        Aarch64 -> 64
+        X86_64 -> 64
+        Riscv64 -> 64
+        Riscv32 -> 32
+        Thumb -> 32
+        Wasm32 -> 32
+        X86 -> 32
+        Craft -> 16
+end cpu_bits
+
+// Whether a machine running this system has an operating system under it at all, which is what code
+// gating on a platform is usually really asking: whether there is a libc there to call.
+os_hosted(os: Os) -> bool = os_symbol(os) != "freestanding"
+
+// Whether the system conventions are POSIX's. macOS, Linux and Android, which is the third of them
+// and the reason this reads as a set rather than as a pair.
+os_posix(os: Os) -> bool
+    os match
+        MacOS -> true
+        Linux -> true
+        Android -> true
+        _ -> false
+end os_posix
+
+// Whether the libc is a **BSD**, which is a question about the libc rather than about the kernel.
+//
+// A BSD and a glibc system are both POSIX and still disagree about a handful of things a source file
+// has to get right -- `__error` against `__errno_location`, `ENOTEMPTY` at 66 against 39, `mode_t`
+// at sixteen bits against thirty-two. Every one of those is a libc fact with nothing about any
+// particular system in it, which is why a gate for one says `bsd` and not `macos`.
+os_bsd(os: Os) -> bool = os_symbol(os) == "macos"
+
+// Every operating system there is, in the order the registry lists them.
+all_os() -> Buf[Os]
+    var out: Buf[Os] = buf()
+
+    out.push(MacOS)
+    out.push(Linux)
+    out.push(Windows)
+    out.push(Freestanding)
+    out.push(Android)
+    out.push(Wasi)
+    out
+end all_os
+
+// Every processor there is.
+all_cpus() -> Buf[Cpu]
+    var out: Buf[Cpu] = buf()
+
+    out.push(Aarch64)
+    out.push(X86_64)
+    out.push(Riscv64)
+    out.push(Riscv32)
+    out.push(Thumb)
+    out.push(Wasm32)
+    out.push(X86)
+    out.push(Craft)
+    out
+end all_cpus
+
+// One machine the compiler knows how to be asked about.
+struct Target
+    // What a command line writes, and what a diagnostic quotes back. `<processor>-<system>`, with a
+    // suffix where one triple describes two machines.
+    name: string
+
+    // What is said to the toolchain. Not unique across the registry: a triple names an architecture
+    // and a calling convention, and on Arm those two leave the *presence* of a floating-point unit
+    // unstated, so two rows may share one.
+    triple: string
+
+    cpu: Cpu
+    os: Os
+
+    // How wide an address is here, which is the processor's answer and every target on one agrees.
+    pointer_bits(self) -> usize = cpu_bits(self.cpu)
+
+    pointer_bytes(self) -> usize = cpu_bits(self.cpu) / 8
+
+    // Whether the compiler can lower for this target at all. A target it knows and cannot lower for
+    // is worth naming: the diagnostic then says what is missing instead of leaving the name unknown,
+    // which reads as a typo.
+    supported(self) -> bool = cpu_symbol(self.cpu) != "x86"
+
+    // What is missing, where something is. The reason is a **measured calling convention** and not
+    // an address width: all three widths are built for, and a reader sent looking for a width limit
+    // would be looking for one that is not there.
+    unsupported(self) -> Option[string]
+        if self.supported() then return None
+
+        Some(s"no C calling convention has been measured for ${cpu_symbol(self.cpu)}")
+    end unsupported
+end Target
+
+// Every target the compiler knows, in the order `sysl targets` lists them.
+//
+// **A row is added by measuring its answers against a C compiler for the same triple**, not by
+// reasoning about an ABI document -- which is why this is a table rather than a construction.
+all_targets() -> Buf[Target]
+    var out: Buf[Target] = buf()
+
+    out.push(Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS))
+    out.push(Target("x86_64-macos", "x86_64-apple-macosx", X86_64, MacOS))
+    out.push(Target("aarch64-linux", "aarch64-unknown-linux-gnu", Aarch64, Linux))
+    out.push(Target("x86_64-linux", "x86_64-unknown-linux-gnu", X86_64, Linux))
+    out.push(Target("riscv64-linux", "riscv64-unknown-linux-gnu", Riscv64, Linux))
+    out.push(Target("x86_64-windows", "x86_64-pc-windows-msvc", X86_64, Windows))
+    out.push(Target("aarch64-android", "aarch64-linux-android24", Aarch64, Android))
+    out.push(Target("aarch64-freestanding", "aarch64-none-elf", Aarch64, Freestanding))
+    out.push(Target("x86_64-freestanding", "x86_64-unknown-none-elf", X86_64, Freestanding))
+    out.push(Target("riscv64-freestanding", "riscv64-unknown-elf", Riscv64, Freestanding))
+    out.push(Target("thumb-freestanding", "thumbv8m.main-none-eabihf", Thumb, Freestanding))
+    out.push(Target("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Thumb, Freestanding))
+    out.push(Target("thumb-freestanding-soft", "thumbv8m.main-none-eabi", Thumb, Freestanding))
+    out.push(Target("thumbv6m-freestanding", "thumbv6m-none-eabi", Thumb, Freestanding))
+    out.push(Target("thumbv7m-freestanding", "thumbv7m-none-eabi", Thumb, Freestanding))
+    out.push(Target("thumbv7em-freestanding", "thumbv7em-none-eabihf", Thumb, Freestanding))
+    out.push(Target("thumbv7em-freestanding-soft", "thumbv7em-none-eabi", Thumb, Freestanding))
+    out.push(Target("riscv32-freestanding", "riscv32-unknown-elf", Riscv32, Freestanding))
+    out.push(Target("wasm32-freestanding", "wasm32-unknown-unknown", Wasm32, Freestanding))
+    out.push(Target("wasm32-wasi", "wasm32-wasip1", Wasm32, Wasi))
+    out.push(Target("craft-freestanding", "craft", Craft, Freestanding))
+    out.push(Target("x86-linux", "i386-unknown-linux-gnu", X86, Linux))
+    out
+end all_targets
+
+// The target of a given name, or nothing.
+//
+// **Case-sensitive**, since the name is written down rather than guessed at.
+target_named(name: string) -> Option[Target]
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        if all.at(i).name == name then return Some(all.at(i))
+
+    None
+end target_named
+
+// The same, refusing with the sentence the reader needs -- which is a different sentence for a name
+// the registry has and cannot build for than for one it has never heard of.
+target_resolved(name: string) -> Result[Target, string]
+    target_named(name) match
+        None -> Err(s"unknown target '${name}' — sysl knows ${target_names()}")
+        Some(t) ->
+            if t.supported() then Ok(t)
+            else Err(s"sysl knows '${name}' and cannot build for it: ${t.unsupported().unwrap()}")
+end target_resolved
+
+// Every target's name, in registry order, as a refusal lists them.
+target_names() -> string
+    val all = all_targets()
+    var out = ""
+
+    for i in 0..<all.len()
+        if i > 0 then out = out + ", "
+
+        out = out + all.at(i).name
+
+    out
+end target_names
+
+// The registry name for a machine described the way a runtime describes itself, or `""` for one the
+// registry has no entry for.
+//
+// Each platform a compiler runs on spells the same machine differently -- a JVM says `amd64` where
+// Node says `x64` and where a native build says `x86_64` -- so the asking is per-platform and the
+// answering is here, once, where it can be tested without a machine of each kind to run on.
+host_name(arch: string, system: string) -> string
+    var processor = ""
+    var os = ""
+    val a = to_lower(arch)
+    val s = to_lower(system)
+
+    if a == "aarch64" || a == "arm64" then processor = "aarch64"
+    elif a == "x86_64" || a == "amd64" || a == "x64" then processor = "x86_64"
+    elif a == "riscv64" then processor = "riscv64"
+
+    if s.contains("mac") || s.contains("darwin") then os = "macos"
+    elif s.contains("linux") then os = "linux"
+    elif s.contains("win") then os = "windows"
+
+    if processor == "" || os == "" then return ""
+
+    processor + "-" + os
+end host_name
+
+// Which operating system **this** compiler was built for.
+//
+// Read the way any other program reads it: from the gate, which the compiler that built this one ran
+// over these very lines. There is deliberately no `#else`, so an operating system added to the
+// registry without a branch here fails to build for that target rather than quietly answering
+// something else.
+host_os() -> Os
+#if macos
+    MacOS
+#elif linux
+    Linux
+#elif windows
+    Windows
+#elif android
+    Android
+#elif wasi
+    Wasi
+#elif freestanding
+    Freestanding
+#endif
+end host_os
+
+// Which processor this compiler was built for, on the same terms.
+host_cpu() -> Cpu
+#if aarch64
+    Aarch64
+#elif x86_64
+    X86_64
+#elif riscv64
+    Riscv64
+#elif riscv32
+    Riscv32
+#elif thumb
+    Thumb
+#elif wasm32
+    Wasm32
+#elif x86
+    X86
+#elif craft
+    Craft
+#endif
+end host_cpu
+
+// The machine this compiler is running on, as a registry row.
+//
+// **The registry may not have it**, and then the answer is the machine sysl is developed on -- the
+// honest assumption for a caller that named no target, and the one the reference compiler makes.
+// A driver reports the missing target and stops rather than reaching this.
+host_target() -> Target
+    target_named(host_name(cpu_symbol(host_cpu()), os_symbol(host_os()))) match
+        Some(t) -> t
+        None -> Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS)
+end host_target
