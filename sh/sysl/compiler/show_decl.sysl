@@ -1,0 +1,755 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// The shape a statement and a declaration print as, which is the other half of `show.sysl`.
+//
+// **It is split from the expression printer for length rather than for subject.** What a test reads
+// is one notation -- `(fn add (a:int b:int) -> int (+ a b))` beside `(+ 1 (* 2 3))` -- and the two
+// halves call each other freely, `private` being file-private here and so spent only on what one
+// file uses alone.
+
+write_stmt(out: *StrBuilder, s: Stmt)
+    *s.kind match
+        ExprStmt(e) -> write_expr(out, e)
+        Bad -> out.push("(bad)")
+
+        ValDecl(n, t, v, vis, align, section) ->
+            write_binding(out, "val", n, t, Some(v), vis, align, section)
+        VarDecl(n, t, v, vis, align, section) ->
+            write_binding(out, "var", n, t, v, vis, align, section)
+
+        ConstDecl(n, t, v, vis) ->
+            out.push("(const ")
+            write_vis(out, vis)
+            out.push(n)
+            out.push(" : ")
+            write_type(out, t)
+            out.push_char(' ')
+            write_expr(out, v)
+            out.push_char(')')
+
+        RefDecl(n, place) ->
+            out.push("(ref ")
+            out.push(n)
+            out.push_char(' ')
+            write_expr(out, place)
+            out.push_char(')')
+
+        StaticDecl(inner) ->
+            out.push("(static ")
+            write_stmt(out, inner)
+            out.push_char(')')
+
+        MultiDecl(names, mutable, values) ->
+            out.push(if mutable then "(var (" else "(val (")
+
+            for i in 0..<names.len()
+                if i > 0 then out.push_char(' ')
+
+                out.push(names.at(i))
+
+            out.push(")")
+            write_exprs(out, values)
+            out.push_char(')')
+
+        MultiAssign(op, targets, values) ->
+            out.push_char('(')
+            out.push(op)
+            out.push(" (")
+
+            for i in 0..<targets.len()
+                if i > 0 then out.push_char(' ')
+
+                write_expr(out, targets.at(i))
+
+            out.push(") (")
+
+            for i in 0..<values.len()
+                if i > 0 then out.push_char(' ')
+
+                write_expr(out, values.at(i))
+
+            out.push("))")
+
+        PatternDecl(pat, mutable, value) ->
+            out.push(if mutable then "(var " else "(val ")
+            write_pattern(out, pat)
+            out.push_char(' ')
+            write_expr(out, value)
+            out.push_char(')')
+
+        Return(v) ->
+            out.push("(return")
+            write_opt_expr(out, v)
+            out.push_char(')')
+
+        Become(call) ->
+            out.push("(become ")
+            write_expr(out, call)
+            out.push_char(')')
+
+        Break(label, value) ->
+            out.push("(break")
+            write_label(out, label)
+            write_opt_expr(out, value)
+            out.push_char(')')
+
+        Continue(label) ->
+            out.push("(continue")
+            write_label(out, label)
+            out.push_char(')')
+
+        Defer(inner) ->
+            out.push("(defer ")
+            write_stmt(out, inner)
+            out.push_char(')')
+
+        Require(c, m) -> write_clause(out, "require", c, m)
+        Ensure(c, m) -> write_clause(out, "ensure", c, m)
+        Invariant(c, m) -> write_clause(out, "invariant", c, m)
+
+        Variant(measure) ->
+            out.push("(variant ")
+            write_expr(out, measure)
+            out.push_char(')')
+
+        AssertDecl(cond, message) -> write_clause(out, "assert", cond, message)
+
+        ImportDecl(d) -> write_import(out, d)
+
+        CConstBlock(consts) ->
+            out.push("(cconst")
+
+            for i in 0..<consts.len()
+                val c = consts.at(i)
+
+                out.push(" (")
+                write_vis(out, c.vis)
+                out.push(c.name)
+                out.push(" : ")
+                write_type(out, c.typ)
+                out.push(" \"")
+                out.push(c.c)
+                out.push("\")")
+
+            out.push_char(')')
+
+        CTypeBlock(types) ->
+            out.push("(ctype")
+
+            for i in 0..<types.len()
+                val t = types.at(i)
+
+                out.push(" (")
+                write_vis(out, t.vis)
+                out.push(t.name)
+                out.push(" \"")
+                out.push(t.c)
+                out.push("\")")
+
+            out.push_char(')')
+
+        AsmStmt(arms) -> write_asm(out, arms)
+
+        FuncDecl(d) -> write_func(out, d)
+        ExternDecl(d) -> write_extern(out, d)
+
+        ExternVarDecl(n, t, link, vis) ->
+            out.push("(extern-var ")
+            write_vis(out, vis)
+            write_link(out, link)
+            out.push(n)
+            out.push(" : ")
+            write_type(out, t)
+            out.push_char(')')
+
+        StructDecl(d) -> write_struct(out, d)
+        EnumDecl(d) -> write_enum(out, d)
+        TraitDecl(d) -> write_trait(out, d)
+        ImplDecl(d) -> write_impl(out, d)
+        TypeDecl(d) -> write_type_decl(out, d)
+
+// A visibility, where one restricts what it is written on. Nothing is written for `Public`, its
+// absence being what public means.
+private write_vis(out: *StrBuilder, vis: Visibility)
+    vis match
+        Public -> ()
+        File -> out.push("private ")
+        Scoped(name) ->
+            out.push("private[")
+            out.push(name)
+            out.push("] ")
+
+private write_link(out: *StrBuilder, link: Option[string])
+    link match
+        Some(v) ->
+            out.push_char('"')
+            out.push(v)
+            out.push("\" ")
+        None -> ()
+
+write_opt_expr(out: *StrBuilder, e: Option[Expr])
+    e match
+        Some(v) ->
+            out.push_char(' ')
+            write_expr(out, v)
+        None -> ()
+
+write_label(out: *StrBuilder, label: Option[string])
+    label match
+        Some(n) ->
+            out.push(" '")
+            out.push(n)
+        None -> ()
+
+private write_clause(out: *StrBuilder, head: string, cond: Expr, message: Option[string])
+    out.push_char('(')
+    out.push(head)
+    out.push_char(' ')
+    write_expr(out, cond)
+
+    message match
+        Some(m) ->
+            out.push(" \"")
+            out.push(m)
+            out.push_char('"')
+        None -> ()
+
+    out.push_char(')')
+
+private write_binding(out: *StrBuilder, head: string, name: string, typ: Option[TypeRef],
+                      value: Option[Expr], vis: Visibility, align: Option[Expr],
+                      section: Option[string])
+    out.push_char('(')
+    out.push(head)
+    out.push_char(' ')
+    write_vis(out, vis)
+
+    align match
+        Some(n) ->
+            out.push("@align(")
+            write_expr(out, n)
+            out.push(") ")
+        None -> ()
+
+    section match
+        Some(n) ->
+            out.push("@section(\"")
+            out.push(n)
+            out.push("\") ")
+        None -> ()
+
+    out.push(name)
+
+    typ match
+        Some(t) ->
+            out.push(" : ")
+            write_type(out, t)
+        None -> ()
+
+    write_opt_expr(out, value)
+    out.push_char(')')
+
+private write_import(out: *StrBuilder, d: ImportDecl)
+    out.push("(import ")
+
+    for i in 0..<d.path.len()
+        if i > 0 then out.push_char('.')
+
+        out.push(d.path.at(i))
+
+    if d.wildcard then out.push(" .*")
+
+    if !d.selectors.is_empty()
+        out.push(" {")
+
+        for i in 0..<d.selectors.len()
+            val sel = d.selectors.at(i)
+
+            if i > 0 then out.push_char(' ')
+
+            out.push(sel.name)
+
+            sel.alias match
+                Some(a) ->
+                    out.push_char(':')
+                    out.push(a)
+                None -> ()
+
+        out.push_char('}')
+
+    d.alias match
+        Some(a) ->
+            out.push(" as ")
+            out.push(a)
+        None -> ()
+
+    out.push_char(')')
+
+private write_asm(out: *StrBuilder, arms: Buf[AsmArm])
+    out.push("(asm")
+
+    for i in 0..<arms.len()
+        val arm = arms.at(i)
+
+        out.push(" ([")
+
+        for j in 0..<arm.archs.len()
+            if j > 0 then out.push_char(' ')
+
+            out.push(arm.archs.at(j))
+
+        out.push_char(']')
+
+        arm.body match
+            AsmUnavailable(reason) ->
+                out.push(" unavailable \"")
+                out.push(reason)
+                out.push_char('"')
+            AsmCode(lines, operands, clobbers) ->
+                for j in 0..<lines.len()
+                    out.push(" \"")
+                    out.push(lines.at(j))
+                    out.push_char('"')
+
+                for j in 0..<operands.len()
+                    val op = operands.at(j)
+
+                    out.push(op.dir match
+                        In -> " (in "
+                        Out -> " (out ")
+                    out.push(op.name)
+                    out.push_char(' ')
+
+                    op.reg match
+                        Some(r) ->
+                            out.push_char('"')
+                            out.push(r)
+                            out.push_char('"')
+                        None -> out.push("reg")
+
+                    out.push_char(')')
+
+                for j in 0..<clobbers.len()
+                    out.push(" (clobbers \"")
+                    out.push(clobbers.at(j))
+                    out.push("\")")
+
+        out.push_char(')')
+
+    out.push_char(')')
+
+// -- the declarations ------------------------------------------------------------------------------
+
+// The annotations a function carries, each in the spelling it was written in, so that a test reads
+// what was attached rather than which field it landed in.
+private write_func_attrs(out: *StrBuilder, d: FuncDecl)
+    d.test match
+        Some(t) ->
+            out.push("@test")
+
+            t.display match
+                Some(v) ->
+                    out.push("(\"")
+                    out.push(v)
+                    out.push("\")")
+                None -> ()
+
+            if t.should_trap then out.push("@should_trap")
+
+            t.expected match
+                Some(v) ->
+                    out.push("(\"")
+                    out.push(v)
+                    out.push("\")")
+                None -> ()
+
+            out.push_char(' ')
+        None -> ()
+
+    d.hook match
+        Some(h) ->
+            out.push_char('@')
+            out.push(hook_word(h.kind))
+            out.push_char(' ')
+        None -> ()
+
+    if d.tailrec then out.push("@tailrec ")
+    if d.pure then out.push("@pure ")
+    if d.ghost then out.push("@ghost ")
+
+    write_frame(out, "reads", d.reads)
+    write_frame(out, "writes", d.writes)
+
+    d.exported match
+        Some(e) ->
+            out.push("@export")
+
+            e.symbol match
+                Some(v) ->
+                    out.push("(\"")
+                    out.push(v)
+                    out.push("\")")
+                None -> ()
+
+            out.push_char(' ')
+        None -> ()
+
+    d.section match
+        Some(v) ->
+            out.push("@section(\"")
+            out.push(v)
+            out.push("\") ")
+        None -> ()
+
+    write_names(out, "crossing", d.crossing)
+    write_names(out, "needs", d.needs)
+
+    d.conv match
+        Some(c) ->
+            out.push_char('@')
+            out.push(c.name)
+
+            c.arg match
+                Some(a) ->
+                    out.push_char('(')
+                    out.push(a)
+                    out.push_char(')')
+                None -> ()
+
+            out.push_char(' ')
+        None -> ()
+
+private write_frame(out: *StrBuilder, word: string, names: Option[Buf[string]])
+    names match
+        Some(ns) ->
+            out.push_char('@')
+            out.push(word)
+            out.push_char('(')
+
+            for i in 0..<ns.len()
+                if i > 0 then out.push_char(',')
+
+                out.push(ns.at(i))
+
+            out.push(") ")
+        None -> ()
+
+private write_names(out: *StrBuilder, word: string, names: Buf[string])
+    if names.is_empty() then return
+
+    out.push_char('@')
+    out.push(word)
+    out.push_char('(')
+
+    for i in 0..<names.len()
+        if i > 0 then out.push_char(',')
+
+        out.push(names.at(i))
+
+    out.push(") ")
+
+// The bracketed parameter list a declaration was written with: the names, the bounds, the defaults
+// and the packs, in the spelling `show_type_params` already gives them.
+private write_generics(out: *StrBuilder, names: Buf[string], bounds: Buf[NamedBounds],
+                       defaults: Buf[TypeBinding], values: Buf[TypeBinding], packs: Buf[string])
+    if names.is_empty() && values.is_empty() then return
+
+    out.push_char(' ')
+    out.push(show_type_params(TypeParams(names, bounds, defaults, values, buf(), packs)))
+
+private write_params(out: *StrBuilder, params: Buf[Param], variadic: bool)
+    out.push_char('(')
+
+    for i in 0..<params.len()
+        val p = params.at(i)
+
+        if i > 0 then out.push_char(' ')
+
+        write_vis(out, p.vis)
+        out.push(p.name)
+        out.push_char(':')
+
+        if p.rest then out.push("...")
+
+        if p.by_name then out.push("->")
+
+        out.push(param_type_text(p))
+
+        p.default match
+            Some(v) ->
+                out.push_char('=')
+                write_expr(out, v)
+            None -> ()
+
+    if variadic
+        if !params.is_empty() then out.push_char(' ')
+
+        out.push("...")
+
+    out.push_char(')')
+
+// What a parameter's type is written as. A rest parameter and a by-name one each carry a type the
+// grammar built around what was written, so what is shown is the part the reader typed.
+private param_type_text(p: Param) -> string
+    if p.rest
+        *p.typ.kind match
+            ArrayType(_, elem, _) -> return type_text(elem)
+            _ -> return type_text(p.typ)
+
+    if p.by_name
+        *p.typ.kind match
+            FnType(_, ret, _) -> return type_text(ret)
+            _ -> return type_text(p.typ)
+
+    type_text(p.typ)
+end param_type_text
+
+private write_result(out: *StrBuilder, ret: Option[TypeRef])
+    ret match
+        Some(t) ->
+            out.push(" -> ")
+            write_type(out, t)
+        None -> ()
+
+private write_func(out: *StrBuilder, d: FuncDecl)
+    out.push("(fn ")
+    write_vis(out, d.vis)
+    write_func_attrs(out, d)
+    out.push(d.name)
+    write_generics(out, d.tparams, d.bounds, d.tdefaults, d.tvalues, d.tpacks)
+    out.push_char(' ')
+    write_params(out, d.params, d.variadic)
+    write_result(out, d.ret_type)
+    write_block(out, d.body)
+    out.push_char(')')
+
+write_block(out: *StrBuilder, body: Buf[Stmt])
+    for i in 0..<body.len()
+        out.push_char(' ')
+        write_stmt(out, body.at(i))
+
+private write_extern(out: *StrBuilder, d: ExternDecl)
+    out.push("(extern ")
+    write_vis(out, d.vis)
+    write_names(out, "needs", d.needs)
+    write_link(out, d.link)
+    out.push(d.name)
+    out.push_char(' ')
+    write_params(out, d.params, d.variadic)
+    write_result(out, d.ret_type)
+    out.push_char(')')
+
+private write_method(out: *StrBuilder, m: MethodDecl)
+    out.push_char('(')
+    out.push(if m.is_property then "prop " else "method ")
+    write_vis(out, m.vis)
+
+    if m.overrides then out.push("override ")
+    if m.is_static then out.push("static ")
+
+    write_names(out, "crossing", m.crossing)
+    write_names(out, "borrows", m.borrows)
+    write_frame(out, "reads", m.reads)
+    write_frame(out, "writes", m.writes)
+
+    m.receiver match
+        Some(mode) ->
+            out.push(mode match
+                ByValue -> "self "
+                ByPtr -> "*self "
+                ByRef(sync) -> if sync then "&sync self " else "&self ")
+        None -> ()
+
+    out.push(m.name)
+    write_generics(out, m.tparams, m.bounds, m.tdefaults, m.tvalues, m.tpacks)
+
+    if !m.is_property
+        out.push_char(' ')
+        write_params(out, m.params, m.variadic)
+
+    write_result(out, m.ret_type)
+    write_block(out, m.body)
+    out.push_char(')')
+
+private write_members(out: *StrBuilder, members: Buf[MethodDecl])
+    for i in 0..<members.len()
+        out.push_char(' ')
+        write_method(out, members.at(i))
+
+private write_derives(out: *StrBuilder, derives: Buf[BoundRef])
+    if derives.is_empty() then return
+
+    out.push(" derives")
+
+    for i in 0..<derives.len()
+        out.push_char(' ')
+        out.push(bound_text(derives.at(i)))
+
+private write_struct(out: *StrBuilder, d: StructDecl)
+    out.push("(struct ")
+    write_vis(out, d.vis)
+
+    if d.opaque then out.push("opaque ")
+    if d.packed then out.push("@packed ")
+
+    d.alignment match
+        Some(n) ->
+            out.push("@align(")
+            write_expr(out, n)
+            out.push(") ")
+        None -> ()
+
+    d.cname match
+        Some(e) ->
+            out.push("@export")
+
+            e.symbol match
+                Some(v) ->
+                    out.push("(\"")
+                    out.push(v)
+                    out.push("\")")
+                None -> ()
+
+            out.push_char(' ')
+        None -> ()
+
+    out.push(d.name)
+    write_generics(out, d.tparams, d.bounds, d.tdefaults, d.tvalues, buf())
+    write_derives(out, d.deriving)
+    out.push_char(' ')
+    write_params(out, d.fields, false)
+
+    for i in 0..<d.invariants.len()
+        out.push(" (invariant ")
+        write_expr(out, d.invariants.at(i))
+        out.push_char(')')
+
+    write_members(out, d.members)
+    out.push_char(')')
+
+private write_enum(out: *StrBuilder, d: EnumDecl)
+    out.push("(enum ")
+    write_vis(out, d.vis)
+    out.push(d.name)
+    write_generics(out, d.tparams, d.bounds, d.tdefaults, d.tvalues, buf())
+
+    d.underlying match
+        Some(t) ->
+            out.push(" : ")
+            write_type(out, t)
+        None -> ()
+
+    write_derives(out, d.deriving)
+
+    for i in 0..<d.variants.len()
+        val v = d.variants.at(i)
+
+        out.push(" (")
+        out.push(v.name)
+
+        v.value match
+            Some(e) ->
+                out.push(" = ")
+                write_expr(out, e)
+            None -> ()
+
+        if !v.fields.is_empty()
+            out.push_char(' ')
+            write_params(out, v.fields, false)
+
+        out.push_char(')')
+
+    write_members(out, d.members)
+    out.push_char(')')
+
+private write_trait(out: *StrBuilder, d: TraitDecl)
+    out.push("(trait ")
+    write_vis(out, d.vis)
+    out.push(d.name)
+    write_generics(out, d.tparams, d.bounds, d.tdefaults, buf(), buf())
+
+    if !d.supers.is_empty()
+        out.push(" :")
+
+        for i in 0..<d.supers.len()
+            out.push_char(' ')
+            out.push(bound_text(d.supers.at(i)))
+
+    for i in 0..<d.assocs.len()
+        val a = d.assocs.at(i)
+
+        out.push(" (type ")
+        out.push(a.name)
+
+        for j in 0..<a.bounds.len()
+            out.push_char(' ')
+            out.push(bound_text(a.bounds.at(j)))
+
+        out.push_char(')')
+
+    write_members(out, d.methods)
+    out.push_char(')')
+
+private write_impl(out: *StrBuilder, d: ImplDecl)
+    out.push("(impl")
+
+    if d.overrides then out.push(" override")
+
+    write_generics(out, d.tparams, d.bounds, d.tdefaults, d.tvalues, d.tpacks)
+    out.push_char(' ')
+    out.push(d.trait_name)
+
+    if !d.trait_args.is_empty()
+        out.push_char('[')
+
+        for i in 0..<d.trait_args.len()
+            if i > 0 then out.push_char(' ')
+
+            write_type(out, d.trait_args.at(i))
+
+        out.push_char(']')
+
+    out.push(" for ")
+    write_type(out, d.for_type)
+
+    for i in 0..<d.assocs.len()
+        val a = d.assocs.at(i)
+
+        out.push(" (type ")
+        out.push(a.name)
+        out.push(" = ")
+        write_type(out, a.typ)
+        out.push_char(')')
+
+    write_members(out, d.methods)
+    out.push_char(')')
+
+private write_type_decl(out: *StrBuilder, d: TypeDecl)
+    out.push("(type ")
+    write_vis(out, d.vis)
+    out.push(d.name)
+    out.push(" = ")
+
+    if d.derived then out.push("new ")
+
+    write_type(out, d.base)
+
+    d.range match
+        Some(r) ->
+            out.push(" within ")
+            write_expr(out, r.lo)
+            out.push(if r.exclusive_hi then " ..< " else " .. ")
+            write_expr(out, r.hi)
+        None -> ()
+
+    d.pred match
+        Some(e) ->
+            out.push(" where ")
+            write_expr(out, e)
+        None -> ()
+
+    out.push_char(')')
