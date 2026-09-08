@@ -10,7 +10,11 @@ import sysl.buf.{Buf, buf}
 // their values -- and they share the one mechanism: where the right side is a single carrier it is
 // evaluated once into a name no program can write, and each part is read back out of it.
 
-// -- the comma forms ------------------------------------------------------------------------------
+// Whether one carrier on the right was what the form was read as, which is also what says the
+// count check has nothing left to add: a carrier that could not supply the parts has already been
+// complained about in its own terms.
+private spread_was_tried(places: usize, values: Buf[Expr]) -> bool =
+    values.len() == 1 && places > 1
 
 // The values a comma form on the left is given, where the right side is **one** thing carrying
 // several -- the third of the three feeds this syntax has.
@@ -20,12 +24,6 @@ import sysl.buf.{Buf, buf}
 // hidden binding is an ordinary local.
 //
 // None where the right side is a list rather than one carrier, which is every other case.
-// Whether one carrier on the right was what the form was read as, which is what says the count
-// check has nothing left to add: a carrier that could not supply the parts has already been
-// complained about in its own terms.
-private spread_was_tried(places: usize, values: Buf[Expr]) -> bool =
-    values.len() == 1 && places > 1
-
 private spread(cx: &Analyzer, places: usize, values: Buf[Expr],
                subject: string) -> Option[(TStmt, Buf[TExpr])]
     if !spread_was_tried(places, values) then return None
@@ -35,8 +33,10 @@ private spread(cx: &Analyzer, places: usize, values: Buf[Expr],
 
     underlying(texpr_type(tv)) match
         Struct(d) ->
+            // Only a tuple is taken apart: a struct of the reader's own has fields with names, and
+            // a comma form names places rather than fields.
             if !is_tuple(d)
-                spread_refused(cx, one_value.span, subject, tv, d)
+                not_something_to_take_apart(cx, one_value.span, subject, texpr_type(tv))
                 return None
             end if
 
@@ -56,9 +56,12 @@ private spread(cx: &Analyzer, places: usize, values: Buf[Expr],
             Some((TVarDecl(name, texpr_type(tv), tv, None), read))
 
         other ->
-            cx.fault(one_value.span, s"$subject, and one ${type_show(other)} is not something to " +
-                     "take apart — only a tuple is")
+            not_something_to_take_apart(cx, one_value.span, subject, other)
             None
+
+private not_something_to_take_apart(cx: &Analyzer, span: Span, subject: string, t: Type)
+    cx.fault(span, s"$subject, and one ${type_show(t)} is not something to take apart — only a " +
+             "tuple is")
 
 // A carrier with the wrong number of parts, complained about in its own terms: a call that yields
 // several things has *results*, and the type nobody wrote is not worth naming back at the reader.
