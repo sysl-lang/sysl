@@ -1,0 +1,342 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What the statement, pattern and control-flow pass refuses, and what it says.
+//
+// **Every message here was read out of the reference compiler**, by handing the installed `sysl`
+// the same source and quoting what came back -- never composed from the rule.
+
+private first(text: string) -> string
+    val ds = stmt_diagnostics(text)
+
+    if ds.is_empty() then return ""
+
+    ds.at(0)
+end first
+
+private complaints(text: string) -> usize = stmt_diagnostics(text).len()
+
+@test("a body whose statements are sound says nothing")
+a_sound_run_of_statements_says_nothing()
+    assert_eq(complaints("f(a: int) -> int\n    val b = a + 1\n\n    b\n"), 0)
+    assert_eq(complaints("f(xs: []const int) -> int\n    var n = 0\n\n    for x in xs\n" +
+                         "        n += x\n\n    n\n"), 0)
+    assert_eq(complaints("enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int = s match\n" +
+                         "    Dot -> 0\n    Round(r) -> r\n"), 0)
+
+// -- the bindings ----------------------------------------------------------------------------------
+
+@test("a 'var' with neither a type nor a value has nothing to be")
+a_var_with_nothing_to_be()
+    assert_eq(first("f()\n    var x\n"), "'x' needs either a type or an initial value")
+
+@test("a binding's declared type and its value have to agree")
+a_binding_that_disagrees()
+    assert_eq(first("f()\n    val x: int = \"two\"\n"),
+              "cannot initialize 'x': declared int but the value is string")
+
+@test("a binding needs a value to hold, so an initializer that never returns is refused")
+a_binding_to_something_that_never_returns()
+    assert_eq(first("keep() = ()\n\nf() -> int\n    val x = loop\n        keep()\n\n    x\n"),
+              "cannot bind 'x' to an expression that never returns")
+
+@test("'ref' names a place, and says what a place is")
+a_ref_to_something_with_no_address()
+    assert_eq(first("f()\n    ref x = 1 + 2\n"),
+              "'ref' names a place — a local, a field, an element, or a dereference — and this " +
+              "expression has no address for 'x' to name. Bind it with 'val' to hold the value it " +
+              "produces")
+
+@test("a local has no section, since its storage is the frame of whichever call is running")
+a_section_on_a_local()
+    assert_eq(first("f()\n    @section(\".noinit\") var n: int = 0\n"),
+              "'n' is a local, so it cannot be placed in section \".noinit\" — its storage is the " +
+              "frame of whichever call is running, and a section is a region of the image the " +
+              "linker decides once. Declare it as module storage, outside every function, for a " +
+              "section to be about")
+
+// -- assignment ---------------------------------------------------------------------------------
+
+@test("a 'val' is written once, and the refusal names the keyword rather than the address")
+assigning_to_a_val()
+    assert_eq(first("f()\n    val x = 1\n\n    x = 2\n"),
+              "a 'val' is written once, so assignment has nothing to write through")
+
+@test("and a pattern binding is written once for a different reason, said in its own words")
+assigning_to_a_pattern_binding()
+    assert_eq(first("f(n: int) -> int = n match\n    v ->\n        v = 1\n        v\n"),
+              "a pattern binding is written once, because it holds a copy of what it matched — so " +
+              "assignment would reach that copy rather than the value it came from. Where you " +
+              "mean to change something, take a 'var' from the binding first")
+
+@test("an assignment's value has to be something the place can hold")
+assigning_the_wrong_type()
+    assert_eq(first("f()\n    var x = 1\n\n    x = \"two\"\n"),
+              "cannot assign string to 'x' of type int")
+
+@test("and its target has to be somewhere with an address")
+assigning_to_a_value()
+    assert_eq(first("f(a: int)\n    a + 1 = 2\n"),
+              "assignment needs a variable, a field, an element, or a dereference — something " +
+              "with an address")
+
+@test("a string's bytes are not writable, and each way of reaching them says so")
+writing_through_a_string()
+    assert_eq(first("f(s: string)\n    s[0] = 1u8\n"),
+              "a string is immutable, so its bytes have no address to write through")
+
+@test("nor are the elements of a read-only view")
+writing_through_a_const_view()
+    assert_eq(first("f(xs: []const int)\n    xs[0] = 1\n"),
+              "this element belongs to a '[]const int', which views elements it may not write, so " +
+              "there is nothing to assign through. Elements you may write are elements of your " +
+              "own: copy them into a '[]int' first")
+
+@test("a comma form has to have as many values as it has places")
+a_comma_form_that_does_not_balance()
+    assert_eq(first("f()\n    var a = 1\n    var b = 2\n\n    a, b = 1\n"),
+              "this assignment has 2 places on the left, and one int is not something to take " +
+              "apart — only a tuple is")
+    assert_eq(first("f() -> int\n    val a, b = 1\n\n    a\n"),
+              "this binding names 2 things, and one int is not something to take apart — only a " +
+              "tuple is")
+
+@test("and a binding may not name one thing twice")
+a_binding_that_names_one_thing_twice()
+    assert_eq(first("f() -> int\n    val a, a = 1, 2\n\n    a\n"),
+              "'a' is named twice in one binding")
+
+// -- a binding whose left side is a pattern ------------------------------------------------------
+
+@test("a binding has no other arm, so a pattern that only sometimes matches is refused")
+a_binding_that_tests()
+    assert_eq(first("f(p: (int, int)) -> int\n    val (1, b) = p\n\n    b\n"),
+              "a binding cannot test a value — this pattern matches only some values, and a " +
+              "binding has no other arm to take when it does not match")
+    assert_eq(first("enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int\n" +
+                    "    val Round(r) = s\n\n    r\n"),
+              "a binding cannot choose among variants — this pattern matches one of several " +
+              "shapes, and a binding has no other arm to take when the value has another")
+
+@test("and a tuple pattern has to have as many parts as the value does")
+a_tuple_binding_of_the_wrong_width()
+    assert_eq(first("f(p: (int, int)) -> int\n    val (a, b, c) = p\n\n    a\n"),
+              "this pattern takes 3 parts, and a (int, int) has 2 parts to give it")
+    assert_eq(first("f(n: int) -> int\n    val (a, b) = n\n\n    a\n"),
+              "one int is not something to take apart — only a tuple is")
+
+// -- the jumps ------------------------------------------------------------------------------------
+
+@test("a 'return' is checked against the declared result, in both directions")
+a_return_that_disagrees()
+    assert_eq(first("f() -> int\n    return \"x\"\n"),
+              "return type mismatch: expected int, got string")
+    assert_eq(first("f()\n    return 1\n"),
+              "cannot return a value from a function with no return type")
+    assert_eq(first("f() -> int\n    return\n"), "this function must return a int value")
+
+@test("'break' and 'continue' need a loop to act on")
+a_jump_outside_a_loop()
+    assert_eq(first("f()\n    break 5\n"), "'break' is only allowed inside a loop")
+    assert_eq(first("f()\n    continue\n"), "'continue' is only allowed inside a loop")
+
+@test("a label has to name a loop this one is inside")
+a_label_that_names_nothing()
+    assert_eq(first("f()\n    for i in 0..<3\n        break 'nope\n"),
+              "no enclosing loop is labeled 'nope")
+    assert_eq(first("f()\n    for i in 0..<3\n        continue 'gone\n"),
+              "no enclosing loop is labeled 'gone")
+
+@test("and two loops in sight of each other may not share one")
+a_label_used_twice()
+    assert_eq(first("f()\n    'dup for i in 0..<3\n        'dup for j in 0..<3\n" +
+                    "            break 'dup\n"), "label 'dup is already in scope")
+
+@test("a value-carrying break needs an 'else' to answer for the path that finishes")
+a_break_with_no_else()
+    assert_eq(first("f() -> int\n    val r = while true\n        break 1\n\n    r\n"),
+              "this loop breaks with a int but has no 'else' to give a value when it finishes " +
+              "normally — add an 'else'")
+
+@test("and every break and the 'else' have to meet at one type")
+breaks_that_do_not_meet()
+    assert_eq(first("f() -> int\n    val r = for x in [1, 2]\n        if x == 2 then break x\n" +
+                    "    else \"no\"\n\n    r\n"),
+              "a loop's break values and its 'else' must have the same type, but got int and string")
+    assert_eq(first("f() -> int\n    val r = loop\n        if true then break 1\n" +
+                    "        break \"two\"\n\n    r\n"),
+              "a loop's break values must have the same type, but got int and string")
+
+// -- 'defer' -------------------------------------------------------------------------------------
+
+@test("a deferred statement runs while the block is being left, so it cannot leave it again")
+a_deferred_jump()
+    assert_eq(first("f() -> int\n    defer return 1\n\n    0\n"),
+              "a deferred statement runs while its block is being left, so it cannot 'return' — " +
+              "there is no exit left to take. Compute what the function returns before the block " +
+              "ends")
+
+@test("nor bind a name that dies the moment it finishes")
+a_deferred_declaration()
+    assert_eq(first("f()\n    defer val x = 1\n"),
+              "a deferred declaration binds a name that dies the moment the statement finishes, " +
+              "so nothing could read it — defer what uses the value instead of what declares it")
+
+// -- the branches -------------------------------------------------------------------------------
+
+@test("two branches that each yield a value have to yield the same one")
+branches_that_disagree()
+    assert_eq(first("f(c: bool) -> int\n    val x = if c then 1 else \"two\"\n\n    0\n"),
+              "if branches have different types: int and string")
+
+@test("a 'match' used for a value must be exhaustive, and an enum's gap is named")
+a_match_that_is_not_exhaustive()
+    assert_eq(first("enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int = s match\n" +
+                    "    Dot -> 0\n"),
+              "match on 'Shape' is not exhaustive; missing Round (add an 'else' arm)")
+    assert_eq(first("f() -> int = 1 match\n    1 -> 10\n    2 -> 20\n"),
+              "a 'match' that yields a value must be exhaustive — add an 'else' arm")
+
+@test("and a 'bool' is told what the type needs rather than which value is missing")
+a_match_on_a_bool()
+    assert_eq(first("f() -> int = true match\n    true -> 1\n"),
+              "a 'match' on 'bool' that yields a value must cover both 'true' and 'false' — add " +
+              "the missing arm or an 'else'")
+
+@test("two arms that each yield a value have to yield the same one")
+arms_that_disagree()
+    assert_eq(first("f() -> int = 3 match\n    1 -> 10\n    else \"big\"\n"),
+              "match arms have different types: int and string")
+
+// -- the patterns ----------------------------------------------------------------------------------
+
+@test("a positional struct pattern names every field, so a short one is a checked mistake")
+a_short_positional_pattern()
+    assert_eq(first("struct Point\n    x: int\n    y: int\n\nf(p: Point) -> int = p match\n" +
+                    "    Point(x) -> x\n    else 0\n"),
+              "struct 'Point' has 2 fields, but 1 sub-pattern was given")
+
+@test("a named struct pattern names fields the struct has, each at most once")
+a_named_pattern_that_misnames()
+    assert_eq(first("struct Point\n    x: int\n    y: int\n\nf(p: Point) -> int = p match\n" +
+                    "    Point{z} -> z\n    else 0\n"), "struct 'Point' has no field 'z'")
+    assert_eq(first("struct Point\n    x: int\n    y: int\n\nf(p: Point) -> int = p match\n" +
+                    "    Point{x, x} -> x\n    else 0\n"), "field 'x' is matched more than once")
+
+@test("and a pattern that names another type does not match this one")
+a_pattern_for_another_type()
+    assert_eq(first("struct Point\n    x: int\n    y: int\n\nf(p: Point) -> int = p match\n" +
+                    "    Other(x, y) -> x\n    else 0\n"),
+              "'Other(…)' does not match a Point value")
+
+@test("a pattern does not reach through a memory mode, and the refusal writes the dereference")
+a_pattern_through_a_mode()
+    assert_eq(first("enum Shape\n    Dot\n    Round(r: int)\n\nf(s: &Shape) -> int = s match\n" +
+                    "    Round(r) -> r\n    else 0\n"),
+              "'Round(…)' matches an enum variant or a struct, but the value is &Shape — a " +
+              "pattern does not reach through a memory mode the way a field selection does, so " +
+              "match what it holds: '*x match'")
+
+@test("but a value that was never going to match is not told to dereference itself")
+a_pattern_against_something_else()
+    assert_eq(first("struct Point\n    x: int\n\nf(n: int) -> int = n match\n    Point(x) -> x\n" +
+                    "    else 0\n"),
+              "'Point(…)' matches an enum variant or a struct, but the value is int")
+
+@test("a qualified name cannot bind, since no program can declare one")
+a_qualified_name_that_resolves_to_nothing()
+    assert_eq(first("enum Colour\n    Red\n    Green\n\nf(c: Colour) -> int = c match\n" +
+                    "    Colour.Blue -> 1\n    else 0\n"),
+              "'Colour.Blue' names no variant of Colour and no constant, and a qualified name " +
+              "cannot bind — write the name a program can declare")
+
+@test("a variant that carries data is matched with its fields, however it is spelled")
+a_nullary_pattern_on_a_data_variant()
+    assert_eq(first("enum Shape\n    Circle(radius: int)\n    Empty\n\nf(s: Shape) -> int = s match\n" +
+                    "    Shape.Circle -> 1\n    else 0\n"),
+              "variant 'Circle' carries data — match it as 'Circle(…)'")
+
+@test("a range pattern is for a number or a char, and a string's is a trap rather than a range")
+a_string_range_pattern()
+    assert_eq(first("f(s: string) -> int = s match\n    \"a\"..\"z\" -> 1\n    else 0\n"),
+              "a range pattern needs a numeric or char value, not string")
+
+@test("one name is bound once in one pattern, however deeply it nests")
+a_name_bound_twice_in_one_pattern()
+    assert_eq(first("struct Rect\n    w: int\n    h: int\n\nf(r: Rect) -> int = r match\n" +
+                    "    Rect(v, v) -> v\n    else 0\n"),
+              "'v' is bound twice in one pattern, and the second would quietly stand for a " +
+              "different part of the value — rename it, or compare the two in a guard")
+
+@test("and alternatives share one answer, so none of them may bind")
+alternatives_that_bind()
+    assert_eq(first("f(n: int) -> int = n match\n    a | 1 -> a\n    else 0\n"),
+              "alternative patterns joined by '|' cannot bind a name")
+
+// -- `is`, where a condition is wanted --------------------------------------------------------------
+
+@test("a test with one answer is a mistake rather than a tautology to fold away")
+an_irrefutable_is()
+    assert_eq(first("f(n: int) -> int\n    if n is m then return m\n\n    0\n"),
+              "this pattern matches every int, so the test is always true — take the value apart " +
+              "with 'match', or bind it with 'var'")
+
+@test("a pattern under 'is not' cannot bind, since the branch it guards is the one that missed")
+a_binder_under_is_not()
+    assert_eq(first("enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int\n" +
+                    "    if s is not Round(r) then return 0\n\n    1\n"),
+              "a pattern under 'is not' cannot bind a name — the branch it guards is the one " +
+              "where it did not match, so there would be nothing for the name to hold. Write '_' " +
+              "for the parts you are not naming")
+
+@test("and alternatives in a condition may not bind either, in the words that position needs")
+alternatives_in_a_condition()
+    assert_eq(first("enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int\n" +
+                    "    if s is Dot | Round(r) then return 1\n\n    0\n"),
+              "alternative patterns joined by '|' cannot bind a name — the branch cannot know " +
+              "which of them matched. Write '_' for the parts you are not naming")
+
+// -- the loops ---------------------------------------------------------------------------------------
+
+@test("a string has bytes and characters both, so which one a 'for' walks is written")
+a_for_over_a_string()
+    assert_eq(first("f(s: string)\n    for c in s\n        keep(c)\nend f\n\nkeep(c: char) = ()\n"),
+              "a string is iterated as 's.bytes' or 's.chars', since a string has bytes and " +
+              "characters both")
+
+@test("a quantifier walks an integer range and nothing else")
+a_quantifier_over_something_else()
+    assert_eq(first("f() -> bool = for all x in [1, 2] do true\n"),
+              "'for all' quantifies over an integer range, written 'lo..<hi' or 'lo..hi'")
+    assert_eq(first("f() -> bool = for some x in [1, 2] do true\n"),
+              "'for some' quantifies over an integer range, written 'lo..<hi' or 'lo..hi'")
+
+// -- where a clause and a declaration may stand ------------------------------------------------------
+
+@test("a contract clause comes before any other statement of a body")
+a_clause_after_a_statement()
+    assert_eq(first("f(x: int) -> int\n    var y = x + 1\n\n    require y >= 0\n\n    y\n"),
+              "'require'/'ensure' clauses must come before any other statement in a function body")
+
+@test("and an 'invariant' belongs at the head of a loop's body")
+an_invariant_after_a_statement()
+    assert_eq(first("f() -> int\n    var i = 0\n\n    while i < 2\n        i += 1\n" +
+                    "        invariant i > 0\n\n    i\n"),
+              "an 'invariant' belongs at the head of a loop's body — it is a condition that holds " +
+              "on every entry to that body, and one written after some of the work has already " +
+              "been done is not that. A condition over a struct's fields is written in the " +
+              "struct, and one over a function's arguments is a 'require'")
+
+@test("a type is a module member, and so is a constant")
+a_declaration_inside_a_body()
+    assert_eq(first("f()\n    struct P\n        x: int\n"),
+              "structs, enums, traits, impls, externs, and types may only be declared at the top " +
+              "level")
+    assert_eq(first("f()\n    const N: int = 1\n"),
+              "a constant is a module member and is declared at the top level — it is folded into " +
+              "its uses before the program runs, so there is no block for one written here to " +
+              "belong to. A name bound to a value inside a body is a 'val'")

@@ -1,0 +1,255 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a statement, a pattern and a branch **are**, asked through the type each settles.
+//
+// **Every claim here was read out of the reference compiler**, either from a test of its own or by
+// handing the installed `sysl` the same source and quoting what came back. Two seams answer:
+// `body_type`, which is what the last body of a source comes to, and `binding_type`, which is what
+// a named binding inside it holds -- since what a `val` or a pattern settles is a type nothing
+// hands back, and a body ending in an effect says nothing about it.
+
+private ty(text: string) -> string = body_type(text)
+
+private held(text: string, name: string) -> string = binding_type(text, name)
+
+// -- bindings ---------------------------------------------------------------------------------
+
+@test("a 'val' takes the type of its value, and the one it was declared with where there is one")
+a_val_takes_its_value()
+    assert_eq(held("f()\n    val x = 1\n\n    x\n", "x"), "int")
+    assert_eq(held("f()\n    val x: u8 = 1\n\n    x\n", "x"), "byte")
+    assert_eq(held("f(a: []const int)\n    val x = a\n\n    x\n", "x"), "[]const int")
+
+@test("a 'var' with a type and no value starts at that type's zero")
+a_var_with_no_value()
+    assert_eq(held("f()\n    var x: i64\n\n    x\n", "x"), "long")
+    assert_eq(held("f()\n    var p: *u8\n\n    p\n", "p"), "*byte")
+
+@test("a binding's initializer is read at the declared type, so a literal narrows into it")
+an_initializer_narrows()
+    assert_eq(ty("f() -> u8\n    val x: u8 = 3\n\n    x\n"), "byte")
+    assert_eq(ty("f() -> usize\n    var n: usize = 0\n\n    n\n"), "usize")
+
+@test("'ref' names the place it found, so the name holds that place's type")
+a_ref_names_a_place()
+    assert_eq(held("f(a: [4]int)\n    ref x = a[0]\n\n    x\n", "x"), "int")
+    assert_eq(held("struct P\n    v: int\n\nf(p: P)\n    ref x = p.v\n\n    x\n", "x"), "int")
+
+@test("a name bound twice in one body is bound twice in the frame, and the second is renamed")
+a_name_bound_twice()
+    assert_eq(held("f()\n    val x = 1\n    val x = \"two\"\n\n    x\n", "x"), "int")
+    assert_eq(held("f()\n    val x = 1\n    val x = \"two\"\n\n    x\n", "x.1"), "string")
+
+@test("a 'val' may shadow a parameter, and the parameter keeps its own slot")
+a_val_shadows_a_parameter()
+    assert_eq(held("f(a: int)\n    val a = \"text\"\n\n    a\n", "a.1"), "string")
+    assert_eq(ty("f(a: int) -> string\n    val a = \"text\"\n\n    a\n"), "string")
+
+@test("a binding made in a block leaves with it, so the name outside is the outer one")
+a_block_scope_closes()
+    val src = "keep(n: int) = ()\n\nf() -> int\n    val x = 1\n\n    if true\n" +
+        "        val x = 9\n\n        keep(x)\n\n    x\n"
+
+    assert_eq(ty(src), "int")
+    assert_eq(held(src, "x.1"), "int")
+
+// -- assignment --------------------------------------------------------------------------------
+
+@test("an assignment is an expression whose type is the place's")
+an_assignment_is_the_places_type()
+    assert_eq(ty("f()\n    var x = 1\n\n    x = 2\n"), "int")
+    assert_eq(ty("f(a: [4]u8)\n    var b = a\n\n    b[0] = 1u8\n"), "byte")
+
+@test("a compound assignment keeps the place's type, and the value takes the place's width")
+a_compound_assignment()
+    assert_eq(ty("f()\n    var x: u8 = 1\n\n    x += 1\n"), "byte")
+    assert_eq(ty("f()\n    var n: usize = 0\n\n    n <<= 2\n"), "usize")
+
+@test("several places at once are written from several values, and the statement yields nothing")
+several_places_at_once()
+    assert_eq(ty("f() -> int\n    var a = 1\n    var b = 2\n\n    a, b = b, a\n    a\n"), "int")
+    assert_eq(ty("g() -> (int, string) = (1, \"x\")\n\nf() -> int\n    val a, b = g()\n\n    a\n"),
+              "int")
+
+// -- patterns ----------------------------------------------------------------------------------
+
+@test("a variant pattern binds its fields at the types the variant declares")
+a_variant_pattern_binds_its_fields()
+    val src = "enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int = s match\n" +
+        "    Round(r) -> r\n    Dot -> 0\n"
+
+    assert_eq(held(src, "r"), "int")
+    assert_eq(ty(src), "int")
+
+@test("a struct pattern binds by name, in any order, and fills what it did not mention")
+a_struct_pattern_binds_by_name()
+    val src = "struct Point\n    x: int\n    y: string\n\nf(p: Point) -> string = p match\n" +
+        "    Point{y: label} -> label\n"
+
+    assert_eq(held(src, "label"), "string")
+    assert_eq(ty(src), "string")
+
+@test("a tuple pattern is the positional struct pattern with the name off")
+a_tuple_pattern()
+    val src = "f(p: (int, string)) -> string = p match\n    (n, s) -> s\n"
+
+    assert_eq(held(src, "n"), "int")
+    assert_eq(held(src, "s"), "string")
+
+@test("'@' binds the whole of what the inner pattern matched")
+an_at_pattern()
+    val src = "f(n: int) -> int = n match\n    v @ 1..9 -> v\n    else 0\n"
+
+    assert_eq(held(src, "v"), "int")
+    assert_eq(ty(src), "int")
+
+@test("a bare name in a pattern names a variant where the enum has one, and binds where it does not")
+a_bare_name_in_a_pattern()
+    assert_eq(ty("enum Colour\n    Red\n    Green\n\nf(c: Colour) -> int = c match\n" +
+                 "    Red -> 1\n    Green -> 2\n"), "int")
+    assert_eq(held("f(n: int) -> int = n match\n    other -> other\n", "other"), "int")
+
+@test("a quoted name tests what it already holds rather than binding a new one")
+a_quoted_name_tests()
+    assert_eq(ty("f(n: int, limit: int) -> int = n match\n    `limit` -> 1\n    else 0\n"), "int")
+
+@test("a constant in a pattern folds to the literal it stands for")
+a_constant_in_a_pattern()
+    assert_eq(ty("const Limit: int = 9\n\nf(n: int) -> int = n match\n    Limit -> 1\n    else 0\n"),
+              "int")
+
+@test("a binding whose left side is a pattern takes the value apart once")
+a_pattern_binding()
+    val src = "f(p: (int, string)) -> string\n    val (n, s) = p\n\n    s\n"
+
+    assert_eq(held(src, "n"), "int")
+    assert_eq(held(src, "s"), "string")
+    assert_eq(ty(src), "string")
+
+// -- `is`, and the branch it guards --------------------------------------------------------------
+
+@test("an 'is' binding reaches the branch its test guards")
+an_is_binding_reaches_the_branch()
+    val src = "enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int\n" +
+        "    if s is Round(r) then return r\n\n    0\n"
+
+    assert_eq(held(src, "r"), "int")
+    assert_eq(ty(src), "int")
+
+@test("and a chain of terms lets each read what the one before it bound")
+an_is_chain()
+    val src = "enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int\n" +
+        "    if s is Round(r) && r > 0 then return r\n\n    0\n"
+
+    assert_eq(ty(src), "int")
+
+// -- control flow as a value ----------------------------------------------------------------------
+
+@test("an 'if' with two branches meets at one type")
+an_if_meets_at_one_type()
+    assert_eq(ty("f(a: int, b: int) -> int = if a > b then a else b\n"), "int")
+    assert_eq(ty("f(c: bool) -> string = if c then \"y\" else \"n\"\n"), "string")
+
+@test("a branch that has no type of its own takes its sibling's")
+a_branch_takes_its_siblings_type()
+    assert_eq(ty("f(a: usize, b: usize)\n    val w = if a > b then a - b else 0\n\n    w\n"),
+              "usize")
+    assert_eq(held("f(a: usize, b: usize)\n    val w = if a > b then 0 else a - b\n\n    w\n", "w"),
+              "usize")
+
+@test("an 'if' with no 'else' is a statement, whatever its branch yields")
+an_if_with_no_else_is_a_statement()
+    assert_eq(ty("f(c: bool)\n    if c then 1\n"), "unit")
+
+@test("a branch that does not finish takes the other's type")
+a_branch_that_does_not_finish()
+    assert_eq(ty("f(c: bool) -> int = if c then 1 else return 0\n"), "int")
+
+@test("a 'match' used for a value meets its arms at one type")
+a_match_meets_its_arms()
+    assert_eq(ty("f(n: int) -> int = n match\n    0 -> 10\n    else 20\n"), "int")
+    assert_eq(ty("f(c: bool) -> string = c match\n    true -> \"y\"\n    false -> \"n\"\n"),
+              "string")
+
+@test("an arm that does not finish constrains nothing")
+an_arm_that_does_not_finish()
+    assert_eq(ty("f(n: int) -> int = n match\n    0 -> return 1\n    else 20\n"), "int")
+
+@test("a block is an expression, and its value is its trailing one")
+a_block_is_an_expression()
+    assert_eq(ty("f() -> int\n    val x =\n        val a = 1\n\n        a + 1\n\n    x\n"), "int")
+
+@test("a loop yields what its 'break' carried, met with its 'else'")
+a_loop_yields_what_it_breaks_with()
+    assert_eq(ty("f(xs: []const int) -> int\n    val r = for x in xs\n" +
+                 "        if x > 0 then break x\n    else 0\n\n    r\n"), "int")
+    assert_eq(ty("f() -> int\n    val r = loop\n        break 7\n\n    r\n"), "int")
+
+@test("a 'loop' nothing breaks out of never finishes, so it may stand where a value is wanted")
+an_endless_loop_is_never()
+    assert_eq(ty("print3() = ()\n\nf() -> int\n    loop\n        print3()\n"), "never")
+
+@test("a counted 'for' walks its bounds' own integer type")
+a_counted_for()
+    assert_eq(held("print4(i: usize) = ()\n\nf(n: usize)\n    for i in 0..<n\n        print4(i)\n",
+                   "i"), "usize")
+    assert_eq(held("print5(i: int) = ()\n\nf()\n    for i in 0..3\n        print5(i)\n", "i"),
+              "int")
+
+@test("and a 'for' over storage binds a copy of each element")
+a_for_over_storage()
+    assert_eq(held("print6(s: string) = ()\n\nf(xs: []const string)\n    for s in xs\n" +
+                   "        print6(s)\n", "s"), "string")
+    assert_eq(held("print7(b: u8) = ()\n\nf(xs: [4]u8)\n    for b in xs\n        print7(b)\n",
+                   "b"), "byte")
+
+@test("a three-clause 'for' binds its init in a scope the condition and the step can read")
+a_three_clause_for_binds_its_init()
+    assert_eq(held("print8(i: int) = ()\n\nf()\n    for var i = 0; i < 3; i += 1\n" +
+                   "        print8(i)\n", "i"), "int")
+
+@test("a 'while' is a value too, and its condition may bind")
+a_while_is_a_value()
+    assert_eq(ty("f(c: bool) -> int\n    val r = while c\n        break 1\n    else 0\n\n    r\n"),
+              "int")
+
+@test("a 'do while' reads its test after the body, in the scope around it")
+a_do_while()
+    assert_eq(ty("f(c: bool) -> int\n    val r = do\n        break 1\n    while c\n    else 0\n\n" +
+                 "    r\n"), "int")
+
+@test("a quantifier is a 'bool' over an integer range")
+a_quantifier()
+    assert_eq(ty("f(xs: [4]int) -> bool = for all i in 0..<4 do xs[i] > 0\n"), "bool")
+    assert_eq(ty("f(xs: [4]int) -> bool = for some i in 0..<4 do xs[i] > 0\n"), "bool")
+
+// -- the jumps and what they say about a block -----------------------------------------------------
+
+@test("a block that ends in a jump does not arrive, so its type is 'never'")
+a_block_that_ends_in_a_jump()
+    assert_eq(ty("f() -> int\n    return 1\n"), "no value")
+    assert_eq(ty("f(c: bool) -> int = if c then 1 else return 0\n"), "int")
+
+@test("a function that declares no result hands nothing back, whatever its body yields")
+a_function_with_no_result()
+    assert_eq(ty("f()\n    val x = 1\n\n    x\n"), "int")
+    assert_eq(body_type("f() = 42\n"), "int")
+
+@test("'defer' holds a statement back, and reads it where it was written")
+a_defer_reads_where_it_stands()
+    assert_eq(ty("print9(a: int) = ()\n\nf(a: int) -> int\n    defer print9(a)\n\n    a\n"),
+              "int")
+
+// -- the contract clauses ---------------------------------------------------------------------------
+
+@test("'require' and 'ensure' are read against the signature, and 'result' names what comes back")
+the_contract_clauses()
+    assert_eq(ty("f(a: int) -> int\n    require a > 0\n    ensure result > 0\n\n    a\n"), "int")
+
+@test("'old' remembers what an expression was on entry, at that expression's own type")
+old_remembers_the_entry_value()
+    assert_eq(ty("f(a: *int) -> int\n    ensure *a == old(*a)\n\n    *a\n"), "int")

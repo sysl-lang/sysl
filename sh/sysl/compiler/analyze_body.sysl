@@ -314,3 +314,143 @@ expr_type(text: string) -> string = body_type(text)
 
 // The same, wrapped in a function so a test may write an expression on its own.
 expr_type_of(expr: string) -> string = body_type(s"probe() = $expr\n")
+
+// The type a named binding of the **last** body holds, rendered the way a diagnostic quotes one.
+//
+// **It is the seam a statement's claim is asserted on**, since what a `val` or a pattern settles is
+// a type nothing hands back: a body ending in `print(x)` says nothing about what `x` is, and this
+// asks the declaration itself.
+binding_type(text: string, name: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+    if done.funcs.is_empty() then return "no body"
+
+    val found = binding_in_block(done.funcs.at(done.funcs.len() - 1).body, name)
+
+    if found.is_none() then return s"no binding named '$name'"
+
+    type_show(found.unwrap())
+end binding_type
+
+// The type a run of statements binds a name at, looking into the blocks a statement carries so that
+// a binding made inside a loop or a branch is reachable too.
+private binding_in(stmts: Buf[TStmt], name: string) -> Option[Type]
+    for i in 0..<stmts.len()
+        stmts.at(i) match
+            TVarDecl(bound, ty, _, _) -> if bound == name then return Some(ty)
+            TRefDecl(bound, ty, _) -> if bound == name then return Some(ty)
+            TExprStmt(e) ->
+                val inner = binding_in_expr(e, name)
+
+                if inner.is_some() then return inner
+            TDefer(inner) ->
+                val found = binding_in(inner, name)
+
+                if found.is_some() then return found
+            _ -> ()
+
+    None
+end binding_in
+
+private binding_in_expr(e: TExpr, name: string) -> Option[Type] = *e.kind match
+    TIf(cond, t, els, _) ->
+        binding_in_cond(cond, name).or_else(() -> binding_in_block(t, name))
+            .or_else(() -> binding_in_opt_block(els, name))
+    TBlockExpr(b) -> binding_in_block(b, name)
+    TMatch(_, arms, _) -> binding_in_arms(arms, name)
+    TWhile(cond, body, els, _) ->
+        binding_in_cond(cond, name).or_else(() -> binding_in(body, name))
+            .or_else(() -> binding_in_opt_block(els, name))
+    TDoWhile(body, _, els, _) ->
+        binding_in(body, name).or_else(() -> binding_in_opt_block(els, name))
+    TLoop(body, _) -> binding_in(body, name)
+    TFor(bound, var_ty, _, _, _, body, els, _) ->
+        if bound == name then Some(var_ty)
+        else binding_in(body, name).or_else(() -> binding_in_opt_block(els, name))
+    TForEach(bound, elem_ty, _, body, els, _) ->
+        if bound == name then Some(elem_ty)
+        else binding_in(body, name).or_else(() -> binding_in_opt_block(els, name))
+    TCFor(init, _, step, body, els, _) ->
+        binding_in(init, name).or_else(() -> binding_in(step, name))
+            .or_else(() -> binding_in(body, name))
+            .or_else(() -> binding_in_opt_block(els, name))
+    TCheckedLoop(_, _, walked) -> binding_in_expr(walked, name)
+    TSeq(xs) -> binding_in_exprs(xs, name)
+    _ -> None
+
+// A condition's terms, since an `is` binds into the branch the test guards.
+private binding_in_cond(cond: Buf[TCondTerm], name: string) -> Option[Type]
+    for i in 0..<cond.len()
+        cond.at(i) match
+            TCondIs(_, patterns, _) ->
+                val found = pattern_binding(patterns, name)
+
+                if found.is_some() then return found
+            _ -> ()
+
+    None
+end binding_in_cond
+
+private binding_in_exprs(xs: Buf[TExpr], name: string) -> Option[Type]
+    for i in 0..<xs.len()
+        val found = binding_in_expr(xs.at(i), name)
+
+        if found.is_some() then return found
+
+    None
+end binding_in_exprs
+
+private binding_in_block(b: TBlock, name: string) -> Option[Type]
+    val found = binding_in(b.stmts, name)
+
+    if found.is_some() then return found
+    if b.result.is_none() then return None
+
+    binding_in_expr(b.result.unwrap(), name)
+end binding_in_block
+
+private binding_in_opt_block(b: Option[TBlock], name: string) -> Option[Type]
+    if b.is_none() then return None
+
+    binding_in_block(b.unwrap(), name)
+end binding_in_opt_block
+
+private binding_in_arms(arms: Buf[TArm], name: string) -> Option[Type]
+    for i in 0..<arms.len()
+        val bound = pattern_binding(arms.at(i).patterns, name)
+
+        if bound.is_some() then return bound
+
+        val found = binding_in_block(arms.at(i).body, name)
+
+        if found.is_some() then return found
+
+    None
+end binding_in_arms
+
+// The type one of a run of patterns binds a name at, which is what an arm's capture asks.
+private pattern_binding(ps: Buf[TPattern], name: string) -> Option[Type]
+    for i in 0..<ps.len()
+        val found = pattern_binds_name(ps.at(i), name)
+
+        if found.is_some() then return found
+
+    None
+end pattern_binding
+
+private pattern_binds_name(p: TPattern, name: string) -> Option[Type] = p match
+    TBindPattern(bound, ty) -> if bound == name then Some(ty) else None
+    TAtPattern(bound, inner) ->
+        if bound == name then Some(tpattern_type(*inner)) else pattern_binds_name(*inner, name)
+    TVariantPattern(_, _, args) -> pattern_binding(args, name)
+    TStructPattern(_, args) -> pattern_binding(args, name)
+    _ -> None
