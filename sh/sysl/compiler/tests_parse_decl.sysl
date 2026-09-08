@@ -327,3 +327,86 @@ c_stays_an_ordinary_name()
 a_c_const_with_no_block()
     assert(pf_err("c const\n").contains("is followed by its constants, indented under it"),
         "the refusal shows the shape")
+
+// -- what a constrained type's bounds may be ---------------------------------------------------------
+
+@test("a 'within' bound may be a literal, a name, or an expression over names")
+a_within_bound_may_be_an_expression()
+    assert_eq(pf("type Slot = int within 0..<max_tasks\n"),
+        "(type Slot = int within 0 ..< max_tasks)")
+    assert_eq(pf("type Mid = int within lo..hi - 1\n"),
+        "(type Mid = int within lo .. (- hi 1))")
+    assert_eq(pf("type Letter = new u8 within 'a'..'z'\n"),
+        "(type Letter = new u8 within 'a' .. 'z')")
+    assert_eq(pf("type Delta = new int within -5..5\n"),
+        "(type Delta = new int within (- 5) .. 5)")
+
+@test("and it stops below the range operator, so the two bounds stay two")
+a_within_bound_stops_below_the_range()
+    assert_eq(pf("type S = int within a..<b\n"), "(type S = int within a ..< b)")
+
+@test("the three forms compose")
+the_constrained_forms_compose()
+    assert_eq(pf("type SafeAge = new int within 0..150 where value % 2 == 0\n"),
+        "(type SafeAge = new int within 0 .. 150 where (cmp (% value 2) == 0))")
+
+@test("'within', 'where' and 'new' stay ordinary identifiers outside a type declaration")
+the_type_words_stay_ordinary_identifiers()
+    assert_eq(pf("where(within: int) -> int = within\n"),
+        "(fn where (within:int) -> int within)")
+    assert_eq(pf("val new = 1\n"), "(val new 1)")
+
+@test("a 'within' bound may name a constant, as an array bound may")
+a_within_bound_may_name_a_constant()
+    assert_eq(pf("const n: usize = 8\ntype Slot = new u8 within 0..<n\n"),
+        "(const n : usize 8) (type Slot = new u8 within 0 ..< n)")
+
+// -- generics on a declaration -------------------------------------------------------------------
+
+@test("a generic struct, enum and function each carry the parameters they declared")
+the_generic_declarations()
+    assert_eq(pf("struct Pair[A, B]\n    a: A\n    b: B\n"),
+        "(struct Pair (A B) (a:A b:B))")
+    assert_eq(pf("enum Maybe[T]\n    Just(v: T)\n    Nothing\n"),
+        "(enum Maybe (T) (Just (v:T)) (Nothing))")
+
+@test("a bound written inline reaches the same place a 'where' clause does")
+a_bound_inline_and_a_where_clause()
+    assert_eq(pf("struct SortedList[T: Ord]\n    items: T\n"),
+        pf("struct SortedList[T] where T: Ord\n    items: T\n"))
+
+@test("an unbounded parameter is simply absent from the bounds")
+an_unbounded_parameter_is_absent_from_the_bounds()
+    assert_eq(pf("struct Pair[A: Eq, B]\n    a: A\n    b: B\n"),
+        "(struct Pair (A:Eq B) (a:A b:B))")
+
+@test("indexing is still an expression rather than a type application")
+indexing_is_still_an_expression()
+    assert_eq(pf("val x = xs[0]\n"), "(val x (index xs 0))")
+
+// -- contracts ---------------------------------------------------------------------------------
+
+@test("a contract clause stands at the top of a function's body, in the order it was written")
+contract_clauses_stand_at_the_top_of_a_body()
+    val src = "f(x: int, hi: int) -> int\n    require x > 0\n    require x < hi, \"in range\"\n    ensure result > 0\n    x\n"
+
+    assert_eq(pf(src),
+        "(fn f (x:int hi:int) -> int (require (cmp x > 0)) (require (cmp x < hi) \"in range\") (ensure (cmp result > 0)) x)")
+
+@test("a struct's invariants collect in source order, and its fields are left alone")
+a_structs_invariants_collect_in_order()
+    val src = "struct R\n    lo: int\n    hi: int\n    invariant lo <= hi\n    invariant hi < 100\n"
+
+    assert_eq(pf(src),
+        "(struct R (lo:int hi:int) (invariant (cmp lo <= hi)) (invariant (cmp hi < 100)))")
+
+@test("and a field may still be named 'invariant'")
+a_field_may_be_named_invariant()
+    assert_eq(pf("struct S\n    invariant: bool\n"), "(struct S (invariant:bool))")
+
+@test("invariants coexist with members")
+invariants_coexist_with_members()
+    val src = "struct R\n    lo: int\n    invariant lo >= 0\n    show(self) -> int = self.lo\n"
+
+    assert_eq(pf(src),
+        "(struct R (lo:int) (invariant (cmp lo >= 0)) (method self show () -> int (field self lo)))")

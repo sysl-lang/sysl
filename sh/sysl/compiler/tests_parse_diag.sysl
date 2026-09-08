@@ -227,3 +227,49 @@ the_forms_this_could_have_broken()
                 "'outer for i in 0..<3 do\n    break 'outer\nend for\n",
                 "'a loop do\n    break 'a\nend loop\n"]
         assert_eq(pf_err(src), "")
+
+// -- recovery, over the declarations ---------------------------------------------------------------
+
+@test("a broken line is dropped rather than stood in for, and the bindings around it survive")
+a_broken_line_is_dropped_between_two_bindings()
+    assert_eq(pf_tree("val a = 1\nprint(2 3)\nval b = 4\n"), "(val a 1) (val b 4)")
+    assert_eq(pf_kept("print(1 2)\nval a = 5\nprint(a)\n"), 2)
+
+@test("a broken statement in a function's body does not take the rest of the file")
+a_broken_statement_in_a_body()
+    val src = "main()\n    print(1 2)\n    print(3)\n\nprint(4)\n"
+
+    assert_eq(pf_line_text(src), "2")
+    assert_eq(pf_kept(src), 2)
+
+@test("a broken header takes the block it opened, and reports itself once")
+a_broken_header_takes_its_block()
+    val src = "if\n    print(1)\n    print(2)\n\nprint(3)\n"
+
+    assert_eq(pf_line_text(src), "1")
+    assert_eq(pf_tree(src), "(call print 3)")
+
+@test("an unclosed bracket in a declaration swallows the file, and says so once")
+an_unclosed_bracket_in_a_declaration()
+    val src = "struct Point(\n    x: int\n    y: int\n\nprint(1)\n"
+
+    assert_eq(pf_line_text(src), "1")
+    assert_eq(pf_kept(src), 0)
+
+@test("a mistake in a match arm below a binding does not take the arms below it")
+a_mistake_in_a_match_arm_below_a_binding()
+    assert_eq(pf_line_text("val n = 1\nn match\n    1 -> print(1 2)\n    _ -> print(3)\n"), "3")
+
+@test("a literate file's second mistake is reported in the reader's own columns")
+a_literate_files_second_mistake()
+    val src = "Some prose.\n\n    print(1 2)\n    print(3)\n    print(4 5)\n"
+    val r = parse(source_of("t.lsysl", src))
+    var lines = ""
+
+    for i in 0..<r.report.len()
+        if i > 0 then lines = lines + " "
+
+        lines = lines + str(r.src.locate(r.report.at(i).span.start).line)
+
+    assert_eq(lines, "3 5")
+    assert_eq(str(r.at()), "3:13")
