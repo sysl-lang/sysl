@@ -1,0 +1,416 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The type grammar.
+//
+// **Four of the type constructors are soft words rather than reserved ones** -- `sync`, `volatile`,
+// `some` and `Fn` -- so each is a keyword only where a type follows it, and a program with a type of
+// its own called `sync` still parses. That is what `at_word` plus a lookahead is doing at each of
+// them, and it is the one place this grammar needs two tokens of it.
+
+// Whether a token can begin a type.
+begins_type(t: Tok) -> bool = t match
+    Ident(_) -> true
+    QuotedIdent(_) -> true
+    Keyword(w) -> begins_type_word(w)
+    _ -> false
+
+private begins_type_word(w: string) -> bool
+    for word in ["*", "&", "[", "(", "<", "weak", ".."]
+        if word == w then return true
+
+    false
+end begins_type_word
+
+// A type, including the bare-arrow function form written over it.
+//
+// `A -> R` and `(A, B) -> R` are the same node: a parenthesised list before an arrow is the
+// parameter list rather than a tuple, which is what the second arm below says.
+parse_type(p: *Parser) -> TypeRef
+    val start = p.here()
+    val t = parse_core_type(p)
+
+    if !p.accept_kw("->") then return t
+
+    val ret = parse_type(p)
+    val at = start.to(p.just_taken())
+
+    *t.kind match
+        TupleType(parts, false) -> type_ref(at, FnType(parts, ret, true))
+        _ ->
+            var params: Buf[TypeRef] = buf()
+
+            params.push(t)
+            type_ref(at, FnType(params, ret, true))
+end parse_type
+
+// A type with no bare arrow over it.
+parse_core_type(p: *Parser) -> TypeRef
+    val start = p.here()
+
+    // `Fn(A) -> R`, the callable's type written out. It is read first because `Fn` is an ordinary
+    // identifier: left to the name production it would take the word and leave the list stranded.
+    if p.at_word("Fn") && p.kw_at(1, "(")
+        p.bump()
+        p.bump()
+
+        val params = parse_type_list(p, ")")
+
+        p.expect_kw(")")
+        p.expect_kw("->")
+
+        val ret = parse_type(p)
+
+        return type_ref(start.to(p.just_taken()), FnType(params, ret, false))
+    end if
+
+    // `() -> R` -- a callable of no arguments. Empty parentheses are not a type, so this is the one
+    // place they may be written, and the arrow is what says so.
+    if p.at_kw("(") && p.kw_at(1, ")") && p.kw_at(2, "->")
+        p.bump()
+        p.bump()
+        p.bump()
+
+        val ret = parse_type(p)
+
+        return type_ref(start.to(p.just_taken()), FnType(buf(), ret, true))
+    end if
+
+    if p.at_kw("*") then return parse_pointer_type(p, start)
+    if p.at_kw("&") then return parse_ref_type(p, start)
+    if p.at_kw("weak") then return parse_weak_type(p, start)
+    if p.at_kw("[") then return parse_array_type(p, start)
+    if p.at_kw("<") then return parse_vector_type(p, start)
+
+    // `volatile T`. A soft word, so it is special only in front of another type.
+    if p.at_word("volatile") && begins_type(p.peek_at(1))
+        p.bump()
+
+        val inner = parse_core_type(p)
+
+        return type_ref(start.to(p.just_taken()), VolatileType(inner))
+    end if
+
+    if p.at_kw("(") then return parse_tuple_type(p, start)
+
+    // A bare `..A` parses so that the analyzer can say what a pack is and where one may be written.
+    // Left to the grammar it would be a stray token, and the reader would be told a newline was
+    // expected rather than told about the feature they were reaching for.
+    if p.accept_kw("..")
+        p.name() match
+            Some(n) -> return type_ref(start.to(p.just_taken()), PackType(n))
+            None -> return type_ref(start.to(p.just_taken()), NamedType("", buf()))
+    end if
+
+    // `some Trait` says the type is inferred from a body, which only a result has -- so a reader who
+    // wrote one in a field, a parameter or a cast is told where it belongs. A bound must follow, so
+    // a program with a type of its own called `some` still parses.
+    if p.at_word("some") && names_a_bound(p.peek_at(1))
+        p.bump()
+
+        val bounds = parse_bounds(p)
+        val at = start.to(p.just_taken())
+
+        if !bounds.is_empty()
+            p.fault(at, s"'some ${bound_text(bounds.at(0))}' is a result whose type is read off the " +
+                "body that produced it, so it may stand only as the result of a member of an 'impl' " +
+                "block \u{2014} everywhere else the type has to be named")
+
+        return type_ref(at, SomeType(bounds))
+    end if
+
+    parse_named_type(p, start)
+end parse_core_type
+
+private names_a_bound(t: Tok) -> bool = t match
+    Ident(_) -> true
+    QuotedIdent(_) -> true
+    _ -> false
+
+// `*T`, and `*extern(A) -> R` before it.
+private parse_pointer_type(p: *Parser, start: Span) -> TypeRef
+    p.bump()
+
+    if !p.accept_kw("extern")
+        val inner = parse_core_type(p)
+
+        return type_ref(start.to(p.just_taken()), PtrType(inner))
+    end if
+
+    if !p.at_kw("(")
+        p.fault(start.to(p.just_taken()),
+            "'*extern' is a foreign function's address, so it is written with the signature that " +
+            "address is called at \u{2014} '*extern(int) -> int', and '*extern() -> unit' for one that " +
+            "takes nothing and yields nothing")
+
+        return type_ref(start.to(p.just_taken()), CFnType(buf(), named_type(p.here(), "unit")))
+    end if
+
+    p.bump()
+
+    val params = parse_type_list(p, ")")
+
+    p.expect_kw(")")
+    p.expect_kw("->")
+
+    val ret = parse_type(p)
+
+    type_ref(start.to(p.just_taken()), CFnType(params, ret))
+end parse_pointer_type
+
+// `&T` and `&sync T`. `sync` is soft, so `&sync` on its own is a reference to a type called `sync`.
+private parse_ref_type(p: *Parser, start: Span) -> TypeRef
+    p.bump()
+
+    val sync = p.at_word("sync") && begins_type(p.peek_at(1))
+
+    if sync then p.bump()
+
+    val inner = parse_core_type(p)
+
+    type_ref(start.to(p.just_taken()), RefType(inner, sync))
+end parse_ref_type
+
+// `weak T`. An atomic object has no weak form, and the refusal is at the spelling so a reader is
+// told which chapter it waits on rather than "newline expected".
+private parse_weak_type(p: *Parser, start: Span) -> TypeRef
+    p.bump()
+
+    if p.at_word("sync") && begins_type(p.peek_at(1))
+        p.fault(p.here(), "an atomic reference has no weak form yet \u{2014} 'weak sync T' wants the " +
+            "concurrency model of '06', which is not built")
+        p.bump()
+    end if
+
+    val inner = parse_core_type(p)
+
+    type_ref(start.to(p.just_taken()), WeakType(inner))
+end parse_weak_type
+
+// `[N]T`, `[]T` and `[]const T`.
+private parse_array_type(p: *Parser, start: Span) -> TypeRef
+    p.bump()
+
+    val length = if p.at_kw("]") then None else Some(parse_expr(p))
+
+    p.expect_kw("]")
+
+    val read_only = p.accept_kw("const")
+    val elem = parse_core_type(p)
+    val at = start.to(p.just_taken())
+
+    // `const` after the brackets says the *view* refuses writes, so a length in them is a
+    // contradiction: an array is storage rather than a view of it, and storage that is written once
+    // is what `val` declares.
+    if length.is_some() && read_only
+        p.fault(at, "'const' says a view refuses writes, and an array is storage rather than a view " +
+            s"of one \u{2014} read-only storage is declared with 'val', as 'val name: [N]${type_text(elem)}'")
+
+    type_ref(at, ArrayType(length, elem, read_only))
+end parse_array_type
+
+// `<N>T`. The angle brackets are free in type position: type arguments are spelled `[...]`, and
+// nothing reaches a type except after a `:`, a `->` or another type constructor.
+private parse_vector_type(p: *Parser, start: Span) -> TypeRef
+    p.bump()
+
+    // The empty spelling is caught here rather than left to fail as a stray `>`, because somebody
+    // writing it has read `[]T` and is owed the reason the two are not parallel.
+    if p.accept_kw(">")
+        val elem = parse_core_type(p)
+        val at = start.to(p.just_taken())
+        val shown = type_text(elem)
+
+        p.fault(at, s"a vector's lane count is part of its type, so '<>${shown}' has no meaning " +
+            "\u{2014} a slice drops its length because it carries one at run time, and a register's " +
+            s"width is settled when the code is generated; write '<4>${shown}' for four lanes")
+
+        return type_ref(at, VectorType(expr(at, IntLit("0", 10, "")), elem))
+    end if
+
+    val lanes = parse_lane_count(p)
+
+    p.expect_kw(">")
+
+    val elem = parse_core_type(p)
+
+    type_ref(start.to(p.just_taken()), VectorType(lanes, elem))
+end parse_vector_type
+
+// A vector's lane count: a literal, a name, or a parenthesised expression.
+private parse_lane_count(p: *Parser) -> Expr
+    if p.accept_kw("(")
+        val e = parse_expr(p)
+
+        p.expect_kw(")")
+        return e
+    end if
+
+    parse_expr_bp(p, PostfixPower)
+end parse_lane_count
+
+// `(A, B)`, and the pack tuple `(..A)`.
+private parse_tuple_type(p: *Parser, start: Span) -> TypeRef
+    p.bump()
+
+    if p.at_kw("..")
+        p.bump()
+
+        val n = p.name()
+        var parts: Buf[TypeRef] = buf()
+
+        parts.push(type_ref(p.just_taken(), PackType(n match
+            Some(x) -> x
+            None -> "")))
+
+        if p.at_kw(",")
+            p.fault(p.here(), "a type pack is the whole of the tuple it stands for \u{2014} '(..A, T)' " +
+                "appends to a pack, which is not built; write '(..A)' and reach the parts with 'for const'")
+
+            loop
+                if !p.accept_kw(",") then break
+
+                parse_type(p)
+        end if
+
+        p.expect_kw(")")
+        return type_ref(start.to(p.just_taken()), TupleType(parts, false))
+    end if
+
+    val parts = parse_type_list(p, ")")
+
+    p.expect_kw(")")
+
+    val at = start.to(p.just_taken())
+
+    // A product of one thing is that thing, so `(T)` is a type in parentheses and not a tuple.
+    if parts.len() == 1
+        val shown = type_text(parts.at(0))
+
+        p.fault(at, s"'(${shown})' is a type in parentheses, and a tuple has two or more parts " +
+            s"\u{2014} a product of one thing is that thing, so write '${shown}'")
+
+        return parts.at(0)
+    end if
+
+    type_ref(at, TupleType(parts, false))
+end parse_tuple_type
+
+// `Name`, `Name[A, B]`, and the `::` projections written over either.
+private parse_named_type(p: *Parser, start: Span) -> TypeRef
+    val name = p.qualified_name() match
+        Some(n) -> n
+        None -> return type_ref(start.to(p.just_taken()), NamedType("", buf()))
+
+    val none: Buf[TypeRef] = buf()
+    val args = if p.at_kw("[") then parse_type_args(p) else none
+    var out = type_ref(start.to(p.just_taken()), NamedType(name, args))
+
+    // The `::` is a suffix on the name rather than a production of its own, so `Buf[int]::Item`
+    // reads its arguments as the arguments they are before the projection is applied.
+    loop
+        if !p.accept_kw("::") then break
+
+        p.name() match
+            Some(member) -> out = type_ref(start.to(p.just_taken()), AssocType(out, member))
+            None -> break
+
+    out
+end parse_named_type
+
+// `[A, B]` after a type name.
+parse_type_args(p: *Parser) -> Buf[TypeRef]
+    p.expect_kw("[")
+
+    val args = parse_type_arg_list(p)
+
+    p.expect_kw("]")
+    args
+end parse_type_args
+
+private parse_type_arg_list(p: *Parser) -> Buf[TypeRef]
+    var out: Buf[TypeRef] = buf()
+
+    if p.at_kw("]") then return out
+
+    loop
+        out.push(parse_type_arg(p))
+
+        if !p.accept_kw(",") then break
+        if p.at_kw("]") then break
+
+    out
+end parse_type_arg_list
+
+// One type argument: a type, an associated type bound by name, or a **value**.
+//
+// The three are told apart by what the argument starts with rather than by trying each in turn: a
+// name and an `=` after it is an associated bound, a literal is a value, and everything else is a
+// type -- which is what makes `Matrix[N]` the type parameter `N` and `Matrix[4]` the number.
+private parse_type_arg(p: *Parser) -> TypeRef
+    val start = p.here()
+
+    if names_a_bound(p.peek()) && p.kw_at(1, "=")
+        val n = p.name()
+
+        p.bump()
+
+        val t = parse_type(p)
+
+        return type_ref(start.to(p.just_taken()), AssocArgType(n match
+            Some(x) -> x
+            None -> "", t))
+    end if
+
+    if !begins_type(p.peek())
+        val v = parse_expr(p)
+
+        return type_ref(start.to(p.just_taken()), ValueArgType(v))
+    end if
+
+    parse_type(p)
+end parse_type_arg
+
+// A comma-separated list of types, up to (but not taking) the closing bracket.
+parse_type_list(p: *Parser, close: string) -> Buf[TypeRef]
+    var out: Buf[TypeRef] = buf()
+
+    if p.at_kw(close) then return out
+
+    loop
+        out.push(parse_type(p))
+
+        if !p.accept_kw(",") then break
+        if p.at_kw(close) then break
+
+    out
+end parse_type_list
+
+// A trait named as a bound: `Display`, `Add[int]`.
+parse_bound_ref(p: *Parser) -> BoundRef
+    val start = p.here()
+    val name = p.qualified_name() match
+        Some(n) -> n
+        None -> ""
+
+    val none: Buf[TypeRef] = buf()
+    val args = if p.at_kw("[") then parse_type_args(p) else none
+
+    BoundRef(start.to(p.just_taken()), name, args)
+end parse_bound_ref
+
+// `Display + Hash` -- one or more bounds joined by `+`.
+parse_bounds(p: *Parser) -> Buf[BoundRef]
+    var out: Buf[BoundRef] = buf()
+
+    out.push(parse_bound_ref(p))
+
+    loop
+        if !p.accept_kw("+") then break
+
+        out.push(parse_bound_ref(p))
+
+    out
+end parse_bounds

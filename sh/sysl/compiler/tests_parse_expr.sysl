@@ -1,0 +1,467 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The expression grammar: precedence, the comparison chain, ranges, the prefix and postfix
+// operators, the primaries, closures, `with`, `match` as an expression, and what an interpolated
+// literal turns into.
+
+// -- precedence ---------------------------------------------------------------------------------
+
+@test("multiplication binds tighter than addition")
+multiplication_binds_tighter_than_addition()
+    assert_eq(pe("1 + 2 * 3"), "(+ 1 (* 2 3))")
+
+@test("a shift binds like a multiplication, tighter than addition")
+a_shift_binds_like_a_multiplication()
+    assert_eq(pe("1 + 2 << 3"), "(+ 1 (<< 2 3))")
+    assert_eq(pe("a << 8 + b"), "(+ (<< a 8) b)")
+
+@test("bitwise-and binds tighter than comparison, which is the fix to C")
+bitwise_and_binds_tighter_than_comparison()
+    assert_eq(pe("x & mask == 0"), "(cmp (& x mask) == 0)")
+
+@test("addition is left-associative")
+addition_is_left_associative()
+    assert_eq(pe("1 - 2 - 3"), "(- (- 1 2) 3)")
+
+@test("assignment is right-associative and loosest")
+assignment_is_right_associative()
+    assert_eq(pe("a = b = c"), "(= a (= b c))")
+
+@test("the three bitwise operators keep three levels, and-tightest")
+the_three_bitwise_operators_keep_three_levels()
+    assert_eq(pe("a | b ^ c"), "(| a (^ b c))")
+    assert_eq(pe("a ^ b & c"), "(^ a (& b c))")
+    assert_eq(pe("a | b ^ c & d"), "(| a (^ b (& c d)))")
+
+@test("and binds tighter than or")
+and_binds_tighter_than_or()
+    assert_eq(pe("a || b && c"), "(|| a (&& b c))")
+
+@test("prefix negation applies to the whole postfix chain, so '-a.b' is '-(a.b)'")
+prefix_negation_applies_to_the_whole_chain()
+    assert_eq(pe("-a.b"), "(- (field a b))")
+
+// -- comparison chains ---------------------------------------------------------------------------
+
+@test("a single comparison")
+a_single_comparison()
+    assert_eq(pe("a < b"), "(cmp a < b)")
+
+@test("a three-way chain keeps all operands and operators")
+a_three_way_chain_keeps_all_operands()
+    assert_eq(pe("a < b <= c"), "(cmp a < b <= c)")
+
+// -- ranges --------------------------------------------------------------------------------------
+
+@test("an exclusive range sits below arithmetic")
+an_exclusive_range_sits_below_arithmetic()
+    assert_eq(pe("0..<n + 1"), "(..< 0 (+ n 1))")
+
+@test("an open-ended range")
+an_open_ended_range()
+    assert_eq(pe("a.."), "(.. a _)")
+
+@test("a range binds tighter than a comparison, which is the level above it")
+a_range_binds_tighter_than_a_comparison()
+    assert_eq(pe("x == a..b"), "(cmp x == (.. a b))")
+
+@test("a range does not associate, so a chain of two has no reading")
+a_range_does_not_associate()
+    assert(pe_err("a..b..c") != "", "a chain of two ranges is refused")
+
+@test("'..=' is refused by name wherever a range may be written")
+inclusive_eq_is_refused_by_name()
+    assert(pe_err("a..=3").contains("'..=' is not a range"), "the spelling is named")
+    assert(pe_err("xs[0..=1]").contains("inclusive is 'a..b' and exclusive is 'a..<b'"),
+        "both spellings are offered")
+
+@test("and it points at the '..', not past the '='")
+inclusive_eq_points_at_the_dots()
+    assert_eq(pe_at("a..=3"), "1:2")
+
+// -- unary and postfix ----------------------------------------------------------------------------
+
+@test("postfix binds tighter than prefix, so '*p++' is '*(p++)'")
+postfix_binds_tighter_than_prefix()
+    assert_eq(pe("*p++"), "(* (post++ p))")
+
+@test("member access chains")
+member_access_chains()
+    assert_eq(pe("a.b.c"), "(field (field a b) c)")
+
+@test("a call with arguments")
+a_call_with_arguments()
+    assert_eq(pe("f(a, b)"), "(call f a b)")
+
+@test("index and try")
+index_and_try()
+    assert_eq(pe("xs[0]?"), "(try (index xs 0))")
+
+@test("one thing in the brackets is a subscript and more than one never was")
+brackets_holding_more_than_one_are_type_arguments()
+    assert_eq(pe("f[A]"), "(index f A)")
+    assert_eq(pe("f[A, B]"), "(typeargs f A B)")
+
+@test("a tuple's parts are selected by number, and two indices at once are refused by name")
+tuple_indices_are_fields()
+    assert_eq(pe("x.0"), "(field x 0)")
+    assert(pe_err("x.0.1").contains("reads as a number rather than as two tuple indices"),
+        "the reading is named")
+    assert(pe_err("x.0.1").contains("write '(x.0).1'"), "and what to write instead")
+
+// -- primaries -------------------------------------------------------------------------------------
+
+@test("unit, grouping and tuples")
+unit_grouping_and_tuples()
+    assert_eq(pe("()"), "()")
+    assert_eq(pe("(1 + 2) * 3"), "(* (+ 1 2) 3)")
+    assert_eq(pe("(1, 2, 3)"), "(tuple 1 2 3)")
+
+@test("literals carry their lexed values")
+literals_carry_their_lexed_values()
+    assert_eq(pe("42u8"), "42u8")
+    assert_eq(pe("3.14"), "3.14")
+    assert_eq(pe("true"), "true")
+    assert_eq(pe("\"hi\""), "\"hi\"")
+    assert_eq(pe("null"), "null")
+    assert_eq(pe("'a'"), "'a'")
+
+@test("a leading dot is a member of the type the context expects")
+a_leading_dot_is_an_implicit_member()
+    assert_eq(pe(".red"), "(dot red)")
+    assert_eq(pe(".Circle(3)"), "(call (dot Circle) 3)")
+
+@test("a number is written with a digit before the point")
+a_number_needs_a_digit_before_the_point()
+    assert(pe_err(".5").contains("a number is written with a digit before the point"),
+        "the spelling is named")
+
+@test("an array literal, an empty one, and the repeated form")
+array_literals()
+    assert_eq(pe("[1, 2, 3]"), "(array 1 2 3)")
+    assert_eq(pe("[]"), "(array)")
+    assert_eq(pe("[0; 4]"), "(fill 0 4)")
+
+@test("a subscript chains, and a range subscript is a slice")
+subscripts_chain_and_slice()
+    assert_eq(pe("a[1][2]"), "(index (index a 1) 2)")
+    assert_eq(pe("a[1..3]"), "(index a (.. 1 3))")
+    assert_eq(pe("a[1..<3]"), "(index a (..< 1 3))")
+
+@test("either end of a range subscript may be left open")
+either_end_of_a_range_subscript_may_be_open()
+    assert_eq(pe("a[1..]"), "(index a (.. 1 _))")
+    assert_eq(pe("a[..<3]"), "(index a (..< _ 3))")
+    assert_eq(pe("a[..]"), "(index a (.. _ _))")
+
+@test("a length reads as a field")
+a_length_reads_as_a_field()
+    assert_eq(pe("a.len"), "(field a len)")
+
+@test("address-of and dereference are prefix operators")
+address_of_and_dereference_are_prefix()
+    assert_eq(pe("&x"), "(& x)")
+    assert_eq(pe("*p"), "(* p)")
+    assert_eq(pe("**p"), "(* (* p))")
+
+@test("null is a primary, and compares")
+null_is_a_primary()
+    assert_eq(pe("p == null"), "(cmp p == null)")
+
+@test("a dereference is an assignment target")
+a_dereference_is_an_assignment_target()
+    assert_eq(pf("*p = 5"), "(= (* p) 5)")
+
+// -- the type attribute ------------------------------------------------------------------------------
+
+@test("a bare attribute is a TypeAttr on the type name")
+a_bare_attribute_is_a_type_attr()
+    assert_eq(pe("Age::First"), "(:: Age First)")
+
+@test("an attribute with an argument is a call over the TypeAttr")
+an_attribute_with_an_argument_is_a_call()
+    assert_eq(pe("Age::Succ(x)"), "(call (:: Age Succ) x)")
+
+@test("'::' binds tighter than a following operator")
+type_attr_binds_tighter_than_an_operator()
+    assert_eq(pe("Age::Last + 1"), "(+ (:: Age Last) 1)")
+
+// -- sizeof, alignof and offsetof ---------------------------------------------------------------------
+
+@test("the operand of 'sizeof' is read with the type grammar, not the expression grammar")
+sizeof_reads_a_type()
+    assert_eq(pe("sizeof(int)"), "(sizeof int)")
+    assert_eq(pe("sizeof(*Node)"), "(sizeof (ptr Node))")
+    assert_eq(pe("sizeof([16]u8)"), "(sizeof (array 16 u8))")
+    assert_eq(pe("sizeof([]int)"), "(sizeof (array _ int))")
+    assert_eq(pe("sizeof(&Node)"), "(sizeof (ref Node))")
+    assert_eq(pe("sizeof((int, real))"), "(sizeof (tuple int real))")
+    assert_eq(pe("sizeof(Option[int])"), "(sizeof (Option int))")
+
+@test("'alignof' is the same form under the other word")
+alignof_is_the_same_form()
+    assert_eq(pe("alignof(*Node)"), "(alignof (ptr Node))")
+
+@test("it is a primary, so an operator around it binds outside it")
+layout_of_is_a_primary()
+    assert_eq(pe("sizeof(int) * 4"), "(* (sizeof int) 4)")
+    assert_eq(pe("8 - alignof(int)"), "(- 8 (alignof int))")
+
+@test("a value operand is refused by name rather than left to a parse error")
+a_value_operand_of_sizeof_is_refused()
+    val e = pe_err("sizeof n")
+
+    assert(e.contains("'sizeof' takes a type in parentheses"), "the form is named")
+    assert(e.contains("there is no form that takes a value"), "and why there is no other")
+    assert(pe_err("alignof n").contains("'alignof' takes a type in parentheses"),
+        "'alignof' says the same in its own words")
+
+@test("'offsetof' takes a type and then a field name")
+offsetof_takes_a_type_and_a_name()
+    assert_eq(pe("offsetof(Header, length)"), "(offsetof Header length)")
+    assert_eq(pe("offsetof(Option[int], value)"), "(offsetof (Option int) value)")
+
+@test("and the field may be a quoted name, since every naming position takes one")
+offsetof_takes_a_quoted_field()
+    assert_eq(pe("offsetof(Header, `type`)"), "(offsetof Header type)")
+
+@test("a missing field name, and a missing operand list, are refused by name")
+offsetof_refuses_both_absences()
+    assert(pe_err("offsetof(Header)").contains(
+        "'offsetof' takes a struct type and a field name in parentheses"), "the form is named")
+    assert(pe_err("offsetof n").contains(
+        "'offsetof' takes a struct type and a field name in parentheses"), "and so is the value form")
+
+// -- closures -------------------------------------------------------------------------------------
+
+@test("one parameter drops its parentheses")
+one_closure_parameter_drops_its_parentheses()
+    assert_eq(pe("x -> x + 1"), "(lambda (x) (+ x 1))")
+
+@test("two or more are parenthesized, and none is the empty pair")
+closure_parameter_lists()
+    assert_eq(pe("(x, y) -> x + y"), "(lambda (x y) (+ x y))")
+    assert_eq(pe("() -> next_id()"), "(lambda () (call next_id))")
+    assert_eq(pe("(x) -> x"), "(lambda (x) x)")
+
+@test("the body extends as far right as an expression can")
+a_closure_body_extends_right()
+    assert_eq(pe("x -> x * 2 + 1"), "(lambda (x) (+ (* x 2) 1))")
+
+@test("a parameter may be annotated inside the parentheses, and not outside them")
+a_closure_parameter_is_annotated_inside()
+    assert_eq(pe("(x: int) -> x"), "(lambda (x:int) x)")
+    assert(pe_err("x: int -> x") != "", "an annotation outside them is not a second spelling")
+
+@test("at a call site a closure is an ordinary argument")
+a_closure_is_an_ordinary_argument()
+    assert_eq(pe("xs.map(x -> x * 2)"), "(call (field xs map) (lambda (x) (* x 2)))")
+    assert_eq(pe("fold(x -> x, y -> y)"), "(call fold (lambda (x) x) (lambda (y) y))")
+
+@test("a closure may yield a closure")
+a_closure_may_yield_a_closure()
+    assert_eq(pe("n -> x -> x + n"), "(lambda (n) (lambda (x) (+ x n)))")
+
+@test("a parenthesized list with no arrow after it is still a tuple")
+a_list_with_no_arrow_is_a_tuple()
+    assert_eq(pe("(x, y)"), "(tuple x y)")
+
+@test("an assignment's right side is a closure and its left side is not")
+an_assignments_right_side_is_a_closure()
+    assert_eq(pe("f = x -> x"), "(= f (lambda (x) x))")
+
+@test("a closure's parameter declares no default")
+a_closure_parameter_declares_no_default()
+    assert(pe_err("(x: int = 1) -> x").contains("a closure's parameter declares no default"),
+        "the reason is given rather than a parse error")
+
+@test("an indented block is a body, and its trailing expression is the value")
+a_closure_body_may_be_a_block()
+    assert_eq(pf("f(x ->\n    g(x)\n    x)\n"), "(call f (lambda (x) (call g x) x))")
+
+// -- with ----------------------------------------------------------------------------------------
+
+@test("one field changed, and several at once")
+with_changes_fields()
+    assert_eq(pe("base with { bg = ACCENT }"), "(with base (bg ACCENT))")
+    assert_eq(pe("base with { bg = 1, fg = 2 }"), "(with base (bg 1) (fg 2))")
+
+@test("it binds tighter than arithmetic, so it changes the operand it follows")
+with_binds_tighter_than_arithmetic()
+    assert_eq(pe("a + b with { v = 9 }"), "(+ a (with b (v 9)))")
+
+@test("a selection after the clause reads the changed value")
+a_selection_after_with_reads_the_copy()
+    assert_eq(pe("base with { bg = 9 }.bg"), "(field (with base (bg 9)) bg)")
+
+@test("no fields at all is refused by name, and so is a clause with no braces")
+with_refuses_both_absences()
+    assert(pe_err("base with { }").contains("'with' changes at least one field"), "the empty form")
+    assert(pe_err("base with bg = 9").contains("'with' takes the fields to change in braces"),
+        "and the one with no braces")
+
+@test("'with' is not reserved, so it stays a legal name")
+with_stays_a_legal_name()
+    assert_eq(pe("print(with)"), "(call print with)")
+    assert_eq(pe("f with { with = 9 }"), "(with f (with 9))")
+
+// -- is ------------------------------------------------------------------------------------------
+
+@test("'is' tests a pattern where a condition is wanted")
+is_tests_a_pattern()
+    assert_eq(pe("x is Some(v)"), "(is x (Some v))")
+    assert_eq(pe("x is not None"), "(is-not x None)")
+
+@test("its alternatives share one answer, so they are written with '|'")
+is_takes_alternatives()
+    assert_eq(pe("x is A | B"), "(is x A B)")
+
+@test("'is' sits between '&&' and the comparisons")
+is_sits_between_and_and_comparison()
+    assert_eq(pe("a is P && b"), "(&& (is a P) b)")
+
+// -- match ---------------------------------------------------------------------------------------
+
+@test("a literal, alternative, range, and else arm")
+match_arms_of_every_shape()
+    assert_eq(pf("n match\n    0 -> print(1)\n    1 | 2 -> print(2)\n    3..5 -> print(3)\n    else print(4)\n"),
+        "(match n (arm 0 -> (call print 1)) (arm 1 2 -> (call print 2)) " +
+        "(arm (.. 3 5) -> (call print 3)) (arm _ -> (call print 4)))")
+
+@test("the 'else' arm takes an indented body as readily as an inline one")
+the_else_arm_takes_an_indented_body()
+    assert_eq(pf("n match\n    0 -> print(1)\n    else\n        print(2)\n        print(3)\n"),
+        "(match n (arm 0 -> (call print 1)) (arm _ -> (call print 2) (call print 3)))")
+
+@test("and an arrow after 'else' is refused by name")
+an_arrow_after_else_is_refused()
+    assert(pf_err("n match\n    0 -> print(1)\n    else -> print(2)\n").contains(
+        "takes its body directly, with no '->'"), "the arrow is named")
+
+@test("the scrutinee is everything to the left of the keyword")
+the_scrutinee_is_everything_to_the_left()
+    assert_eq(pf("a < b match\n    true -> print(1)\n    false -> print(2)\n"),
+        "(match (cmp a < b) (arm true -> (call print 1)) (arm false -> (call print 2)))")
+
+@test("a second match takes the first one's value")
+a_second_match_takes_the_first_ones_value()
+    assert_eq(pf("n match\n    0 -> \"zero\"\n    else \"other\"\nmatch\n    \"zero\" -> print(1)\n    else print(2)\n"),
+        "(match (match n (arm 0 -> \"zero\") (arm _ -> \"other\")) " +
+        "(arm \"zero\" -> (call print 1)) (arm _ -> (call print 2)))")
+
+@test("a guarded wildcard arm")
+a_guarded_wildcard_arm()
+    assert_eq(pf("x match\n    _ if x > 0 -> print(1)\n    else print(2)\n"),
+        "(match x (arm _ (if (cmp x > 0)) -> (call print 1)) (arm _ -> (call print 2)))")
+
+@test("a positional struct pattern parses like a variant")
+a_positional_struct_pattern_parses_like_a_variant()
+    assert_eq(pf("p match\n    Point(0, y) -> print(y)\n    else print(0)\n"),
+        "(match p (arm (Point 0 y) -> (call print y)) (arm _ -> (call print 0)))")
+
+@test("a named struct pattern carries field-name and sub-pattern pairs")
+a_named_struct_pattern_carries_pairs()
+    assert_eq(pf("p match\n    Point{x: 0, y} -> print(y)\n    else print(0)\n"),
+        "(match p (arm (struct Point (x 0) (y y)) -> (call print y)) (arm _ -> (call print 0)))")
+
+@test("a named-field shorthand binds each field to its own name")
+a_named_field_shorthand_binds_each_field()
+    assert_eq(pf("p match\n    Point{x, y} -> print(x)\n"),
+        "(match p (arm (struct Point (x x) (y y)) -> (call print x)))")
+
+// -- if ------------------------------------------------------------------------------------------
+
+@test("'if' is an expression, and yields the value of the taken branch")
+if_is_an_expression()
+    assert_eq(pe("if c then a else b"), "(if c (then a) (else b))")
+
+@test("in statement position the 'else' may be left off")
+an_if_may_have_no_else()
+    assert_eq(pf("if c then print(1)\n"), "(if c (then (call print 1)))")
+
+@test("an indented body needs no 'then'")
+an_indented_if_body_needs_no_then()
+    assert_eq(pf("if c\n    print(1)\nelse\n    print(2)\n"),
+        "(if c (then (call print 1)) (else (call print 2)))")
+
+@test("an 'elif' is an 'if' in the 'else' of the one before it")
+an_elif_is_a_nested_if()
+    assert_eq(pf("if a then print(1)\nelif b then print(2)\nelse print(3)\n"),
+        "(if a (then (call print 1)) (else (if b (then (call print 2)) (else (call print 3)))))")
+
+@test("'end if' closes the form, and 'end' stays a soft word")
+end_if_closes_the_form()
+    assert_eq(pf("if c\n    print(1)\nend if\n"), "(if c (then (call print 1)))")
+
+// -- string interpolation -----------------------------------------------------------------------
+
+@test("an interpolation with no holes is just the literal")
+an_interpolation_with_no_holes()
+    assert_eq(pe("s\"plain\""), "\"plain\"")
+    assert_eq(pe("s\"\""), "\"\"")
+
+@test("a lone hole renders that name, with no surrounding literals")
+a_lone_hole_renders_that_name()
+    assert_eq(pe("s\"$name\""), "(call str name)")
+
+@test("surrounding text becomes the literal segments around each render")
+surrounding_text_becomes_literal_segments()
+    assert_eq(pe("s\"a${x}b\""), "(+ (+ \"a\" (call str x)) \"b\")")
+
+@test("adjacent holes render each with no literal between them")
+adjacent_holes_render_each()
+    assert_eq(pe("s\"$x$y\""), "(+ (call str x) (call str y))")
+    assert_eq(pe("s\"${x}${y}\""), "(+ (call str x) (call str y))")
+
+@test("a braced hole parses as a full expression")
+a_braced_hole_is_a_full_expression()
+    assert_eq(pe("s\"= ${a + b * 2}\""), "(+ \"= \" (call str (+ a (* b 2))))")
+
+@test("a hole may itself contain a string, a brace, and further interpolation")
+a_hole_may_contain_a_string()
+    assert_eq(pe("s\"${ f(\"x\") + g }\""), "(call str (+ (call f \"x\") g))")
+
+@test("'$$' is a literal dollar, not a hole")
+a_doubled_dollar_is_a_literal()
+    assert_eq(pe("s\"$$5\""), "\"$5\"")
+
+@test("raw keeps both a backslash and a hole as ordinary characters")
+raw_keeps_a_backslash_and_a_hole()
+    assert_eq(pe("raw\"a\\n$x\""), "\"a\\n$x\"")
+    assert_eq(pe("raw\"${x}\""), "\"${x}\"")
+
+@test("a malformed hole is a fatal error naming the interpolation")
+a_malformed_hole_names_the_interpolation()
+    assert(pe_err("s\"${1 +}\"").contains("in interpolation"), "the complaint says where it was")
+
+@test("an f-string hole with a specifier renders through format, not str")
+an_f_string_hole_renders_through_format()
+    assert_eq(pe("f\"${n}%04d\""), "(call format n \"%04d\")")
+
+@test("an f-string hole with no specifier still renders through str")
+an_f_string_hole_with_no_specifier()
+    assert_eq(pe("f\"$n\""), "(call str n)")
+
+@test("an f-string mixes formatted and plain holes around its literals")
+an_f_string_mixes_holes()
+    assert_eq(pe("f\"x=${a}%d y=$b\""),
+        "(+ (+ (+ \"x=\" (call format a \"%d\")) \" y=\") (call str b))")
+
+// -- arguments -------------------------------------------------------------------------------------
+
+@test("a named argument stands at the parameter it names")
+a_named_argument_stands_at_its_parameter()
+    assert_eq(pe("f(a = 1, 2)"), "(call f (named a 1) 2)")
+
+@test("'xs...' is the one argument that is already the rest")
+a_spread_argument()
+    assert_eq(pe("f(xs...)"), "(call f (spread xs))")
+
+@test("a trailing block stands at a parameter of its own")
+a_trailing_block_is_an_argument()
+    assert_eq(pf("column():\n    a\n    b\n"), "(call column (blockarg a b))")

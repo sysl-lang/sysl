@@ -1,0 +1,231 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The pattern grammar.
+//
+// **A pattern is matched against a type it already knows**, which is what separates it from an
+// expression at nearly every turn: there is no leading dot, because there is no expected type to
+// read one from; a bare name binds rather than reads; and a name that is *not* a binding is written
+// in backticks, which is the whole of what the quoting means here.
+
+// A pattern.
+parse_pattern(p: *Parser) -> Pattern
+    val start = p.here()
+
+    // A leading dot is the expression form, and somebody who wrote one is owed the difference
+    // rather than a refusal about a token.
+    if p.at_kw(".") && names_a_name(p.peek_at(1))
+        p.bump()
+
+        val n = p.name() match
+            Some(x) -> x
+            None -> ""
+
+        p.fault(start.to(p.just_taken()),
+            s"a pattern is matched against a type it already knows, so the variant is written '${n}' " +
+            "with no leading dot \u{2014} the dot is for an expression, where the type comes from what " +
+            "the context expects")
+
+        return pattern_of(start.to(p.just_taken()), IdentPattern(n))
+    end if
+
+    if p.at_kw("(") then return parse_tuple_pattern(p, start)
+
+    if p.at_wildcard()
+        p.bump()
+        return pattern_of(p.just_taken(), WildcardPattern)
+    end if
+
+    if names_a_name(p.peek()) then return parse_named_pattern(p, start)
+
+    parse_literal_pattern(p, start)
+end parse_pattern
+
+private names_a_name(t: Tok) -> bool = t match
+    Ident(_) -> true
+    QuotedIdent(_) -> true
+    _ -> false
+
+// `(a, b)` -- two or more parts, since one part is not a tuple.
+private parse_tuple_pattern(p: *Parser, start: Span) -> Pattern
+    p.bump()
+
+    var parts: Buf[Pattern] = buf()
+
+    if !p.at_kw(")")
+        loop
+            parts.push(parse_pattern(p))
+
+            if !p.accept_kw(",") then break
+            if p.at_kw(")") then break
+
+    p.expect_kw(")")
+
+    val at = start.to(p.just_taken())
+
+    if parts.len() == 1
+        p.fault(at, "a tuple pattern matches two or more parts \u{2014} one part is not a tuple")
+        return parts.at(0)
+    end if
+
+    pattern_of(at, TuplePattern(parts))
+end parse_tuple_pattern
+
+// A name, and everything written after one: a binding, a variant's fields, a struct's fields, or
+// nothing at all.
+private parse_named_pattern(p: *Parser, start: Span) -> Pattern
+    var name = ""
+    var quoted = false
+    var dotted = false
+
+    loop
+        p.peek() match
+            Ident(n) ->
+                p.bump()
+                name = if name == "" then n else name + "." + n
+                quoted = false
+            QuotedIdent(n) ->
+                p.bump()
+                name = if name == "" then n else name + "." + n
+                quoted = true
+            _ -> break
+
+        if !p.at_kw(".") then break
+        if !names_a_name(p.peek_at(1)) then break
+
+        p.bump()
+        dotted = true
+
+    // `n @ 1..9` -- a name bound to whatever the inner pattern matched.
+    if p.at_kw("@")
+        p.bump()
+
+        val inner = parse_pattern(p)
+        val at = start.to(p.just_taken())
+
+        // What a binding introduces is a local, and a local has no dot in its name.
+        if dotted
+            p.fault(at, s"'${name}' has a dot in it, and what a binding introduces is a local \u{2014} " +
+                "write a name a program can declare")
+
+        return pattern_of(at, BindPattern(name, inner))
+    end if
+
+    if p.at_kw("(")
+        p.bump()
+
+        var args: Buf[Pattern] = buf()
+
+        if !p.at_kw(")")
+            loop
+                args.push(parse_pattern(p))
+
+                if !p.accept_kw(",") then break
+                if p.at_kw(")") then break
+
+        p.expect_kw(")")
+        return pattern_of(start.to(p.just_taken()), VariantPattern(name, args))
+    end if
+
+    if p.at_kw("{")
+        p.bump()
+
+        var fields: Buf[FieldPattern] = buf()
+
+        if !p.at_kw("}")
+            loop
+                fields.push(parse_field_pattern(p))
+
+                if !p.accept_kw(",") then break
+                if p.at_kw("}") then break
+
+        p.expect_kw("}")
+        return pattern_of(start.to(p.just_taken()), StructPattern(name, fields))
+    end if
+
+    val at = start.to(p.just_taken())
+
+    // A quoted name is a *reference* to what that name already holds rather than a binding of it,
+    // which is the whole of what the backticks mean in a pattern.
+    if quoted then pattern_of(at, EqPattern(name)) else pattern_of(at, IdentPattern(name))
+end parse_named_pattern
+
+// `Point { x, y: b }` -- a field, with the short form being the long one with the name written once.
+private parse_field_pattern(p: *Parser) -> FieldPattern
+    val start = p.here()
+    val n = p.name() match
+        Some(x) -> x
+        None -> ""
+
+    if p.accept_kw(":") then FieldPattern(n, parse_pattern(p))
+    else FieldPattern(n, pattern_of(start.to(p.just_taken()), IdentPattern(n)))
+end parse_field_pattern
+
+// A literal, and the range a second one after `..` makes.
+private parse_literal_pattern(p: *Parser, start: Span) -> Pattern
+    val lo = parse_pattern_lit(p) match
+        Some(e) -> e
+        None ->
+            p.want("a pattern")
+            return pattern_of(start, WildcardPattern)
+
+    parse_range_op(p) match
+        None -> pattern_of(start.to(p.just_taken()), LitPattern(lo))
+        Some(inclusive) ->
+            val hi = parse_pattern_lit(p) match
+                Some(e) -> e
+                None ->
+                    p.want("expression")
+                    expr(p.here(), Bad)
+
+            pattern_of(start.to(p.just_taken()), RangePattern(lo, hi, inclusive))
+end parse_literal_pattern
+
+// The literals a pattern may hold, and the negative form of a number.
+private parse_pattern_lit(p: *Parser) -> Option[Expr]
+    val start = p.here()
+
+    if p.at_kw("-")
+        p.bump()
+
+        val inner = parse_number_lit(p)?
+
+        return Some(expr(start.to(p.just_taken()), Unary("-", inner)))
+    end if
+
+    p.peek() match
+        IntLit(digits, base, suffix) ->
+            p.bump()
+            Some(expr(p.just_taken(), IntLit(digits, base, suffix)))
+        FloatLit(text, suffix) ->
+            p.bump()
+            Some(expr(p.just_taken(), FloatLit(text, suffix)))
+        CharLit(c) ->
+            p.bump()
+            Some(expr(p.just_taken(), CharLit(c)))
+        StrLit(v) ->
+            p.bump()
+            Some(expr(p.just_taken(), StrLit(v)))
+        Keyword(w) ->
+            if w == "true"
+                p.bump()
+                Some(expr(p.just_taken(), BoolLit(true)))
+            else if w == "false"
+                p.bump()
+                Some(expr(p.just_taken(), BoolLit(false)))
+            else
+                None
+        _ -> None
+end parse_pattern_lit
+
+private parse_number_lit(p: *Parser) -> Option[Expr]
+    p.peek() match
+        IntLit(digits, base, suffix) ->
+            p.bump()
+            Some(expr(p.just_taken(), IntLit(digits, base, suffix)))
+        FloatLit(text, suffix) ->
+            p.bump()
+            Some(expr(p.just_taken(), FloatLit(text, suffix)))
+        _ -> None

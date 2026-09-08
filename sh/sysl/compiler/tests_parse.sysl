@@ -1,0 +1,97 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What the parser suites assert through.
+//
+// **A tree is pinned as the shape it prints, not as a struct compared field by field.** `(+ 1 (* 2
+// 3))` says at a glance what precedence and associativity the parser chose, which a nested
+// constructor call in an expected value does not -- and a shape that is wrong reads as a wrong
+// shape rather than as a diff. `show.sysl` is the renderer, and it exists for this.
+
+// One expression, as a shape. A refusal comes back marked, so a test that expected a tree and got a
+// complaint says which complaint.
+pe(text: string) -> string
+    val r = parse_expr_text("t.sysl", text)
+
+    if r.ok() then show_expr(r.value) else s"!${r.first().message}"
+
+// The first thing wrong with an expression, or `""` where nothing was.
+pe_err(text: string) -> string
+    val r = parse_expr_text("t.sysl", text)
+
+    if r.ok() then "" else r.first().message
+
+// Where the first complaint about an expression points, as the reader's own `line:column`.
+pe_at(text: string) -> string
+    val r = parse_expr_text("t.sysl", text)
+
+    if r.ok() then "" else str(r.at())
+
+// One type, as a shape.
+pt(text: string) -> string
+    val r = parse_type_text("t.sysl", text)
+
+    if r.ok() then show_type(r.value) else s"!${r.first().message}"
+
+// One type, as a program would have written it -- the form a diagnostic quotes back.
+pt_text(text: string) -> string
+    val r = parse_type_text("t.sysl", text)
+
+    if r.ok() then type_text(r.value) else s"!${r.first().message}"
+
+pt_err(text: string) -> string
+    val r = parse_type_text("t.sysl", text)
+
+    if r.ok() then "" else r.first().message
+
+// One pattern, as a shape.
+pp(text: string) -> string
+    val r = parse_pattern_text("t.sysl", text)
+
+    if r.ok() then show_pattern(r.value) else s"!${r.first().message}"
+
+pp_err(text: string) -> string
+    val r = parse_pattern_text("t.sysl", text)
+
+    if r.ok() then "" else r.first().message
+
+// A whole file's statements, as one shape.
+pf(text: string) -> string
+    val r = parse(source_of("t.sysl", text))
+
+    if r.ok() then show_stmts(r.program.body) else s"!${r.first().message}"
+
+pf_err(text: string) -> string
+    val r = parse(source_of("t.sysl", text))
+
+    if r.ok() then "" else r.first().message
+
+// Every complaint a file yields, as the lines they sit on, in the order a reader meets them.
+pf_lines(text: string) -> Buf[usize]
+    val r = parse(source_of("t.sysl", text))
+    var out: Buf[usize] = buf()
+
+    for i in 0..<r.report.len()
+        out.push(r.src.locate(r.report.at(i).span.start).line)
+
+    out
+end pf_lines
+
+// The same, as text, so that a failing assertion prints what was reported.
+pf_line_text(text: string) -> string
+    val lines = pf_lines(text)
+    var out = ""
+
+    for i in 0..<lines.len()
+        if i > 0 then out = out + " "
+
+        out = out + str(lines.at(i))
+
+    out
+end pf_line_text
+
+// How many statements a file kept, which is what recovery is judged by.
+pf_kept(text: string) -> usize = parse(source_of("t.sysl", text)).program.body.len()

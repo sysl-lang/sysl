@@ -1,0 +1,926 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The expression grammar, by binding power.
+//
+// **One number per operator, rather than one function per precedence level.** Written as recursive
+// descent this is `parse_or`, `parse_and`, `parse_equality`, `parse_comparison`, `parse_range`,
+// `parse_bit_or` and six more, each calling the next and all of them looking the same; the loop in
+// `sh.sysl.parsing` replaces every one of them with the table below.
+//
+// **The ladder is the bootstrap compiler's, and two rungs of it are deliberate corrections to C**:
+// a bitwise `&` binds tighter than a comparison, so `x & mask == 0` is the test it looks like, and a
+// shift binds like a multiplication rather than below addition, so `1 << 2 + 3` is `(1 << 2) + 3`.
+
+// -- the table ------------------------------------------------------------------------------------
+
+// `match` is written after the value it transforms and binds looser than everything, assignment
+// included -- it is not in the loop's table at all, being read after the loop has finished.
+private const MatchPower: u8 = 3
+
+private const AssignPower: u8 = 5
+private const OrPower: u8 = 10
+private const AndPower: u8 = 20
+
+// `is` sits between `&&` and the comparisons, so `a is P && b > 0` is two terms rather than an `is`
+// against a conjunction.
+private const IsPower: u8 = 25
+
+// **Every comparison is one level, because a chain of them is ONE comparison.** `a < b < c` is
+// `a < b && b < c` with `b` evaluated once, and giving `==` a level of its own would make
+// `a == b < c` group instead of chain.
+private const ComparePower: u8 = 30
+
+private const RangePower: u8 = 35
+private const BitOrPower: u8 = 40
+private const BitXorPower: u8 = 42
+private const BitAndPower: u8 = 44
+private const AddPower: u8 = 50
+private const MulPower: u8 = 60
+
+// How tightly a prefix operator holds its operand: above every binary operator and below the
+// postfix ones, which is what makes `-a * b` read as `(-a) * b` and `-a.b` as `-(a.b)`.
+const PrefixPower: u8 = 70
+
+// Calls, indexing, member access and `with` are postfix, so they bind tighter than any arithmetic.
+const PostfixPower: u8 = 80
+
+private power_of(t: Tok) -> Power = t match
+    Keyword(w) -> power_of_word(w)
+
+    // The two contextual operators. Both stay ordinary names everywhere an expression is not to
+    // their left, which is what a soft word is.
+    Ident(n) ->
+        if n == "is" then left_assoc(IsPower)
+        else if n == "with" then left_assoc(PostfixPower)
+        else left_assoc(0)
+    _ -> left_assoc(0)
+
+private power_of_word(w: string) -> Power
+    if is_assign_op(w) then return right_assoc(AssignPower)
+
+    if w == "||" then return left_assoc(OrPower)
+    if w == "&&" then return left_assoc(AndPower)
+    if is_compare_op(w) then return left_assoc(ComparePower)
+    if w == ".." || w == "..<" then return left_assoc(RangePower)
+    if w == "|" then return left_assoc(BitOrPower)
+    if w == "^" then return left_assoc(BitXorPower)
+    if w == "&" then return left_assoc(BitAndPower)
+    if w == "+" || w == "-" then return left_assoc(AddPower)
+
+    for m in ["*", "/", "%", "<<", ">>"]
+        if m == w then return left_assoc(MulPower)
+
+    for t in ["(", "[", ".", "::", "?", "++", "--"]
+        if t == w then return left_assoc(PostfixPower)
+
+    left_assoc(0)
+end power_of_word
+
+is_assign_op(w: string) -> bool
+    for o in ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="]
+        if o == w then return true
+
+    false
+end is_assign_op
+
+private is_compare_op(w: string) -> bool
+    for o in ["==", "!=", "<=", ">=", "<", ">"]
+        if o == w then return true
+
+    false
+end is_compare_op
+
+// -- entry points ----------------------------------------------------------------------------------
+
+// An expression, at the outermost level.
+parse_expr(p: *Parser) -> Expr = parse_expr_bp(p, 0)
+
+// An expression, at a given binding power.
+//
+// The two forms that are not operator expressions are read around the loop rather than inside it: a
+// closure, because deciding it needs more lookahead than a `nud` is handed, and `match`, because it
+// may sit on a **following** line and a token's binding power cannot see past a newline.
+parse_expr_bp(p: *Parser, min_bp: u8) -> Expr
+    if !can_begin_expr(p.peek())
+        p.want("expression")
+        return expr(p.here(), Bad)
+
+    val start = p.here()
+
+    var left = try_lambda(p) match
+        Some(e) -> e
+        None -> pratt(p, min_bp, nud, led, lbp) match
+            Some(e) -> e
+            None -> expr(p.here(), Bad)
+
+    if min_bp >= MatchPower then return left
+
+    loop
+        val tokens_at = p.mark()
+        val errors_at = p.errors_at()
+
+        p.skip_newlines()
+
+        if !p.accept_kw("match")
+            p.rewind(tokens_at, errors_at)
+            break
+        end if
+
+        left = expr(start.to(p.just_taken()), MatchExpr(left, parse_match_arms(p)))
+
+    left
+end parse_expr_bp
+
+private lbp(t: Spanned[Tok]) -> u8 = power_of(t.value).left
+
+// -- closures ---------------------------------------------------------------------------------------
+
+// `x -> x + 1` and `(a, b: int) -> a`.
+//
+// **A closure is decided by lookahead and put back where the lookahead was wrong**, which is what a
+// grammar with backtracking gets for free and a hand-written one has to say. The parameter list is
+// a name or a parenthesised list and nothing else, so `a + b -> c` is not a closure of a sum.
+private try_lambda(p: *Parser) -> Option[Expr]
+    val start = p.here()
+
+    if names_a_param(p.peek()) && p.kw_at(1, "->")
+        val n = p.name() match
+            Some(x) -> x
+            None -> ""
+
+        var params: Buf[LambdaParam] = buf()
+
+        params.push(LambdaParam(p.just_taken(), n, None))
+        p.bump()
+
+        return Some(expr(start.to(p.just_taken()), Lambda(params, parse_lambda_body(p), false)))
+    end if
+
+    if !p.at_kw("(") then return None
+
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+
+    p.bump()
+
+    var params: Buf[LambdaParam] = buf()
+    var ok = true
+
+    if !p.at_kw(")")
+        loop
+            parse_lambda_param(p) match
+                Some(lp) -> params.push(lp)
+                None ->
+                    ok = false
+                    break
+
+            if !p.accept_kw(",") then break
+            if p.at_kw(")") then break
+    end if
+
+    if !ok || !p.accept_kw(")") || !p.at_kw("->")
+        p.rewind(tokens_at, errors_at)
+        return None
+    end if
+
+    p.bump()
+    Some(expr(start.to(p.just_taken()), Lambda(params, parse_lambda_body(p), false)))
+end try_lambda
+
+private names_a_param(t: Tok) -> bool = t match
+    Ident(_) -> true
+    QuotedIdent(_) -> true
+    _ -> false
+
+private parse_lambda_param(p: *Parser) -> Option[LambdaParam]
+    if !names_a_param(p.peek()) then return None
+
+    val start = p.here()
+    val n = p.name() match
+        Some(x) -> x
+        None -> return None
+
+    if !p.accept_kw(":") then return Some(LambdaParam(start.to(p.just_taken()), n, None))
+
+    val t = parse_type(p)
+
+    // A closure's parameter declares no default: a call reaches a closure through `Fn`, which
+    // carries the types and not the names, so there would be nothing at the call to fill one from.
+    if p.at_kw("=")
+        p.fault(p.here(), "a closure's parameter declares no default \u{2014} a call reaches a closure " +
+            "through 'Fn', which carries the types and not the names, so there would be nothing at " +
+            "the call to fill one from. Give the value a name of its own and capture it")
+
+        // The default is read and thrown away, so that the list goes on to its bracket and the
+        // arrow after it: a parameter list abandoned here would be put back and re-read as a tuple,
+        // and the complaint above would go with it.
+        p.bump()
+        parse_expr(p)
+    end if
+
+    Some(LambdaParam(start.to(p.just_taken()), n, Some(t)))
+end parse_lambda_param
+
+// The body is a statement list for the same reason a function's is: an indented block's trailing
+// expression is its value, and the one-expression form is that list with one statement in it.
+private parse_lambda_body(p: *Parser) -> Buf[Stmt]
+    if p.block_ahead() then return parse_suite(p)
+
+    var out: Buf[Stmt] = buf()
+    val start = p.here()
+    val e = parse_expr(p)
+
+    out.push(stmt(start.to(p.just_taken()), ExprStmt(e)))
+    out
+end parse_lambda_body
+
+// -- prefix position -------------------------------------------------------------------------------
+
+// A token that begins an expression. The loop has already taken it, so what arrives here is the
+// token and a cursor standing after it.
+private nud(t: Spanned[Tok], p: *Parser) -> Expr
+    val at = t.span
+
+    t.value match
+        IntLit(digits, base, suffix) -> expr(at, IntLit(digits, base, suffix))
+        FloatLit(text, suffix) -> expr(at, FloatLit(text, suffix))
+        CharLit(c) -> expr(at, CharLit(c))
+        StrLit(v) -> expr(at, StrLit(v))
+        CStrLit(v) -> expr(at, CStrLit(v))
+        StrInterp(parts, exprs, specs) -> desugar_interp(p, at, parts, exprs, specs)
+        Ident(n) -> expr(at, Ident(n))
+        QuotedIdent(n) -> expr(at, Ident(n))
+        Keyword(w) -> nud_word(p, at, w)
+        _ ->
+            p.fault(at, "expression expected")
+            expr(at, Bad)
+end nud
+
+private nud_word(p: *Parser, at: Span, w: string) -> Expr
+    if w == "true" then return expr(at, BoolLit(true))
+    if w == "false" then return expr(at, BoolLit(false))
+    if w == "null" then return expr(at, NullLit)
+    if w == "self" then return expr(at, Ident("self"))
+
+    for u in ["-", "!", "~", "*", "&"]
+        if u == w
+            val operand = parse_expr_bp(p, PrefixPower)
+
+            return expr(at.to(p.just_taken()), Unary(u, operand))
+
+    for u in ["++", "--"]
+        if u == w
+            val operand = parse_expr_bp(p, PrefixPower)
+
+            return expr(at.to(p.just_taken()), PreIncDec(u, operand))
+
+    if w == "(" then return parse_paren_tail(p, at)
+    if w == "[" then return parse_array_literal(p, at)
+    if w == "." then return parse_implicit_member(p, at)
+    if w == "if" then return parse_if_expr(p, at)
+    if w == "sizeof" || w == "alignof" then return parse_layout_of(p, at, w)
+    if w == "offsetof" then return parse_offset_of(p, at)
+
+    // A range with no lower bound: `..b`, `..<b`, and the whole-of-it `..`.
+    if w == ".." || w == "..<"
+        val inclusive = w == ".."
+
+        if inclusive && p.at_kw("=") then refuse_inclusive_eq(p, at)
+
+        val hi = if can_begin_expr(p.peek()) then Some(parse_expr_bp(p, RangePower)) else None
+
+        return expr(at.to(p.just_taken()), RangeExpr(None, hi, inclusive))
+    end if
+
+    p.fault(at, "expression expected")
+    expr(at, Bad)
+end nud_word
+
+// `()`, `(e)` and `(a, b)`.
+private parse_paren_tail(p: *Parser, at: Span) -> Expr
+    if p.accept_kw(")") then return expr(at.to(p.just_taken()), UnitLit)
+
+    val first = parse_expr(p)
+
+    if !p.at_kw(",")
+        p.expect_kw(")")
+        return first
+    end if
+
+    var parts: Buf[Expr] = buf()
+
+    parts.push(first)
+
+    loop
+        if !p.accept_kw(",") then break
+        if p.at_kw(")") then break
+
+        parts.push(parse_expr(p))
+
+    p.expect_kw(")")
+    expr(at.to(p.just_taken()), Tuple(parts))
+end parse_paren_tail
+
+// `[a, b]`, `[v; n]` and the empty literal, whose element type comes from the context.
+private parse_array_literal(p: *Parser, at: Span) -> Expr
+    if p.accept_kw("]") then return expr(at.to(p.just_taken()), ArrayLit(buf()))
+
+    val first = parse_expr(p)
+
+    if p.accept_kw(";")
+        val count = parse_expr(p)
+
+        p.expect_kw("]")
+        return expr(at.to(p.just_taken()), ArrayFill(first, count))
+    end if
+
+    var items: Buf[Expr] = buf()
+
+    items.push(first)
+
+    loop
+        if !p.accept_kw(",") then break
+        if p.at_kw("]") then break
+
+        items.push(parse_expr(p))
+
+    p.expect_kw("]")
+    expr(at.to(p.just_taken()), ArrayLit(items))
+end parse_array_literal
+
+// `.red` -- a member of the type the context expects, with the type's own name left off.
+private parse_implicit_member(p: *Parser, at: Span) -> Expr
+    p.peek() match
+        Ident(n) ->
+            p.bump()
+            expr(at.to(p.just_taken()), ImplicitMember(n))
+        QuotedIdent(n) ->
+            p.bump()
+            expr(at.to(p.just_taken()), ImplicitMember(n))
+        IntLit(_, _, _) ->
+            p.fault(at, "a number is written with a digit before the point \u{2014} '0.5' rather than '.5'")
+            expr(at, Bad)
+        FloatLit(_, _) ->
+            p.fault(at, "a number is written with a digit before the point \u{2014} '0.5' rather than '.5'")
+            expr(at, Bad)
+        _ ->
+            p.want("identifier")
+            expr(at, Bad)
+end parse_implicit_member
+
+// `sizeof(T)` / `alignof(T)`. The operand is read with the **type** grammar: an argument list holds
+// values, so `sizeof(*Node)` read as a call would be a dereference of a name and `sizeof([16]u8)`
+// would not parse at all.
+private parse_layout_of(p: *Parser, at: Span, word: string) -> Expr
+    if !p.accept_kw("(")
+        p.fault(p.here(), s"'${word}' takes a type in parentheses, as '${word}(int)' \u{2014} there is " +
+            "no form that takes a value, since a value's type is what would be measured anyway")
+
+        return expr(at, Bad)
+    end if
+
+    val t = parse_type(p)
+
+    p.expect_kw(")")
+    expr(at.to(p.just_taken()), LayoutOf(word, t))
+end parse_layout_of
+
+// `offsetof(T, field)` -- two operands of two kinds, which is why it is not a third spelling of
+// `sizeof`.
+private parse_offset_of(p: *Parser, at: Span) -> Expr
+    if !p.accept_kw("(")
+        refuse_offsetof(p)
+        return expr(at, Bad)
+    end if
+
+    val t = parse_type(p)
+
+    if !p.accept_kw(",")
+        refuse_offsetof(p)
+        return expr(at, Bad)
+    end if
+
+    val field = p.name() match
+        Some(n) -> n
+        None ->
+            refuse_offsetof(p)
+            return expr(at, Bad)
+
+    p.expect_kw(")")
+    expr(at.to(p.just_taken()), OffsetOf(t, field))
+end parse_offset_of
+
+private refuse_offsetof(p: *Parser)
+    p.fault(p.here(), "'offsetof' takes a struct type and a field name in parentheses, as " +
+        "'offsetof(Header, length)'")
+
+// `if cond then a else b`, the `elif` chain folded into nested `else` branches.
+private parse_if_expr(p: *Parser, at: Span) -> Expr
+    val cond = parse_expr(p)
+    val then_body = parse_body(p, "then")
+    var conds: Buf[Expr] = buf()
+    var bodies: Buf[Buf[Stmt]] = buf()
+
+    loop
+        if !accept_on_next_line_kw(p, "elif") then break
+
+        conds.push(parse_expr(p))
+        bodies.push(parse_body(p, "then"))
+
+    var else_body: Option[Buf[Stmt]] = None
+
+    if accept_on_next_line_kw(p, "else")
+        else_body = Some(if p.block_ahead() then parse_suite(p) else parse_inline_body(p))
+
+    accept_end_marker(p, "if")
+
+    // Each `elif` is an `if` in the `else` of the one before it, built from the last one back.
+    var i = conds.len()
+
+    loop
+        if i == 0 then break
+
+        i -= 1
+
+        var wrapped: Buf[Stmt] = buf()
+        val inner = expr(at.to(p.just_taken()), IfExpr(conds.at(i), bodies.at(i), else_body))
+
+        wrapped.push(stmt(inner.span, ExprStmt(inner)))
+        else_body = Some(wrapped)
+
+    expr(at.to(p.just_taken()), IfExpr(cond, then_body, else_body))
+end parse_if_expr
+
+// A word that may sit on a following line, taken only if it is there.
+private accept_on_next_line_kw(p: *Parser, word: string) -> bool
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+
+    p.skip_newlines()
+
+    if p.accept_kw(word) then return true
+
+    p.rewind(tokens_at, errors_at)
+    false
+end accept_on_next_line_kw
+
+// `end if`, `end while` -- optional, and `end` is a soft word so it stays an ordinary name.
+private accept_end_marker(p: *Parser, word: string) -> bool
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+
+    p.skip_newlines()
+
+    if p.accept_word("end") && p.accept_kw(word) then return true
+
+    p.rewind(tokens_at, errors_at)
+    false
+end accept_end_marker
+
+// -- infix and postfix position -----------------------------------------------------------------
+
+// A token with an expression to its left. The loop has taken the operator, so a callback reads only
+// its right-hand side and every one of them is written the same way.
+private led(lhs: Expr, t: Spanned[Tok], p: *Parser) -> Expr
+    val at = t.span
+
+    t.value match
+        Ident(n) ->
+            if n == "is" then led_is(lhs, p) else led_with(lhs, at, p)
+        Keyword(w) -> led_word(lhs, at, w, p)
+        _ -> lhs
+end led
+
+private led_word(lhs: Expr, at: Span, w: string, p: *Parser) -> Expr
+    val from = lhs.span
+
+    if is_assign_op(w)
+        val value = parse_expr_bp(p, power_of_word(w).right)
+
+        return expr(from.to(p.just_taken()), Assign(w, lhs, value))
+    end if
+
+    if is_compare_op(w) then return led_compare(lhs, w, p)
+    if w == ".." || w == "..<" then return led_range(lhs, at, w == "..", p)
+    if w == "(" then return led_call(lhs, p)
+    if w == "[" then return led_index(lhs, p)
+    if w == "." then return led_field(lhs, p)
+    if w == "::" then return led_type_attr(lhs, p)
+    if w == "?" then return expr(from.to(at), TryExpr(lhs))
+    if w == "++" || w == "--" then return expr(from.to(at), PostIncDec(w, lhs))
+
+    val right = parse_expr_bp(p, power_of_word(w).right)
+
+    expr(from.to(p.just_taken()), Binary(w, lhs, right))
+end led_word
+
+// A chain of comparisons is one node: `a < b <= c` keeps all three operands and both operators.
+private led_compare(lhs: Expr, first: string, p: *Parser) -> Expr
+    var operands: Buf[Expr] = buf()
+    var ops: Buf[string] = buf()
+
+    operands.push(lhs)
+    ops.push(first)
+    operands.push(parse_expr_bp(p, ComparePower))
+
+    loop
+        val more = p.peek() match
+            Keyword(w) -> if is_compare_op(w) then w else ""
+            _ -> ""
+
+        if more == "" then break
+
+        p.bump()
+        ops.push(more)
+        operands.push(parse_expr_bp(p, ComparePower))
+
+    expr(lhs.span.to(p.just_taken()), Compare(operands, ops))
+end led_compare
+
+// `a..b` and `a..<b`, with the upper bound optional.
+private led_range(lhs: Expr, at: Span, inclusive: bool, p: *Parser) -> Expr
+    if inclusive && p.at_kw("=") then refuse_inclusive_eq(p, at)
+
+    // A range does not associate: `a..b..c` has no reading, and what the statement is owed at the
+    // second `..` is its end.
+    *lhs.kind match
+        RangeExpr(_, _, _) -> p.report.add(error(at, "newline expected"))
+        _ -> ()
+
+    val hi = if can_begin_expr(p.peek()) then Some(parse_expr_bp(p, RangePower)) else None
+
+    expr(lhs.span.to(p.just_taken()), RangeExpr(Some(lhs), hi, inclusive))
+end led_range
+
+// Rust spells an inclusive range `a..=b`, so a reader arriving from it writes one here once. Left to
+// the ordinary grammar it reads as the open-ended `a..` followed by a token nothing wants, and the
+// refusal is then about the range that was *parsed* rather than the one that was written.
+//
+// **The caret is under the `..`, not past the `=`**: pointing at the bound would put it on the one
+// part of the line that is right.
+private refuse_inclusive_eq(p: *Parser, at: Span)
+    p.fault(at, "'..=' is not a range \u{2014} inclusive is 'a..b' and exclusive is 'a..<b'")
+    p.bump()
+
+// `f(a, b)`, with the trailing block a call may write after it.
+private led_call(lhs: Expr, p: *Parser) -> Expr
+    var args: Buf[Expr] = buf()
+
+    if !p.at_kw(")")
+        loop
+            args.push(parse_argument(p))
+
+            if !p.accept_kw(",") then break
+            if p.at_kw(")") then break
+
+    p.expect_kw(")")
+
+    parse_trailing_block(p) match
+        Some(b) -> args.push(b)
+        None -> ()
+
+    expr(lhs.span.to(p.just_taken()), Call(lhs, args))
+end led_call
+
+// One argument: a name it stands at, the rest it already is, or an ordinary value.
+private parse_argument(p: *Parser) -> Expr
+    val start = p.here()
+
+    // `name = value` -- the argument stands at the parameter it names.
+    if names_a_param(p.peek()) && p.kw_at(1, "=")
+        val n = p.name() match
+            Some(x) -> x
+            None -> ""
+
+        p.bump()
+
+        val v = parse_expr(p)
+
+        return expr(start.to(p.just_taken()), NamedArg(n, v))
+    end if
+
+    val e = parse_expr(p)
+
+    // `xs...` -- this argument is already the slice a `...T` parameter collects.
+    if p.accept_kw("...") then return expr(start.to(p.just_taken()), Spread(e))
+
+    e
+end parse_argument
+
+// The indented block a call may write after a `:`.
+private parse_trailing_block(p: *Parser) -> Option[Expr]
+    if !p.at_kw(":") then return None
+    if p.peek_at(1) != Newline then return None
+    if p.peek_at(2) != Indent then return None
+
+    val start = p.here()
+
+    p.bump()
+    Some(expr(start.to(p.just_taken()), BlockArg(parse_suite(p))))
+end parse_trailing_block
+
+// **One thing in the brackets is a subscript; more than one never was.** The comma is what tells the
+// two readings apart without asking what the name is, and the multi-argument form exists for `&f[A,
+// B]`, the address of an instantiation.
+private led_index(lhs: Expr, p: *Parser) -> Expr
+    val first = parse_expr(p)
+
+    if !p.at_kw(",")
+        p.expect_kw("]")
+        return expr(lhs.span.to(p.just_taken()), Index(lhs, first))
+    end if
+
+    var args: Buf[Expr] = buf()
+
+    args.push(first)
+
+    loop
+        if !p.accept_kw(",") then break
+        if p.at_kw("]") then break
+
+        args.push(parse_expr(p))
+
+    p.expect_kw("]")
+    expr(lhs.span.to(p.just_taken()), TypeArgs(lhs, args))
+end led_index
+
+// `a.b`, and `a.0` -- a tuple's parts are selected by number and are fields like any other.
+//
+// **The span is taken after the dot**, so a diagnostic points at the member rather than at the
+// punctuation: every message about a member names the member, and a caret under the `.` sends the
+// reader looking one column to the left of what was said.
+private led_field(lhs: Expr, p: *Parser) -> Expr
+    val at = p.here()
+
+    p.peek() match
+        Ident(n) ->
+            p.bump()
+            expr(at, Field(lhs, n))
+        QuotedIdent(n) ->
+            p.bump()
+            expr(at, Field(lhs, n))
+        IntLit(digits, _, suffix) ->
+            p.bump()
+
+            if suffix != "" then p.want("tuple index")
+
+            expr(at, Field(lhs, digits))
+
+        // `x.0.1` lexes as a number, and reading it as two indices would be reading a token that is
+        // not there. The reader is told what to write instead.
+        FloatLit(text, suffix) ->
+            p.bump()
+
+            if suffix == ""
+                val parts = split_at_point(text)
+
+                p.fault(at, s"'.${text}' reads as a number rather than as two tuple indices \u{2014} " +
+                    s"write '(x.${parts.at(0)}).${parts.at(1)}' to select part ${parts.at(1)} of part " +
+                    s"${parts.at(0)}")
+            else
+                p.want("tuple index")
+
+            expr(at, Bad)
+        _ ->
+            p.want("identifier")
+            expr(at, Bad)
+end led_field
+
+private split_at_point(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var head = ""
+    var tail = ""
+    var seen = false
+
+    for c in text.chars
+        if c == '.'
+            seen = true
+        else if seen
+            tail = tail + str(c)
+        else
+            head = head + str(c)
+
+    out.push(head)
+    out.push(tail)
+    out
+end split_at_point
+
+// `T::Attr` -- metadata the type itself exposes, which is why it is not a `.`.
+private led_type_attr(lhs: Expr, p: *Parser) -> Expr
+    val at = p.here()
+
+    p.name() match
+        Some(n) -> expr(at, TypeAttr(lhs, n))
+        None -> expr(at, Bad)
+end led_type_attr
+
+// `subject is Pat` / `subject is not Pat`, with `|`-alternatives that share one answer.
+private led_is(lhs: Expr, p: *Parser) -> Expr
+    val negated = p.accept_word("not")
+    var pats: Buf[Pattern] = buf()
+
+    pats.push(parse_pattern(p))
+
+    loop
+        if !p.accept_kw("|") then break
+
+        pats.push(parse_pattern(p))
+
+    expr(lhs.span.to(p.just_taken()), IsPattern(lhs, pats, negated))
+end led_is
+
+// `base with { bg = ACCENT }` -- a tail rather than a binary operator, so it binds as tightly as a
+// field selection and `a + b with { ... }` changes `b` rather than the sum.
+private led_with(lhs: Expr, at: Span, p: *Parser) -> Expr
+    var fields: Buf[WithField] = buf()
+
+    if !p.accept_kw("{")
+        p.fault(p.here(), "'with' takes the fields to change in braces, as 'base with { bg = ACCENT }'")
+        return expr(lhs.span.to(at), WithExpr(lhs, fields))
+    end if
+
+    if p.at_kw("}")
+        p.fault(p.here(), "'with' changes at least one field \u{2014} with none, 'base with { }' is the " +
+            "value 'base' already is")
+        p.bump()
+        return expr(lhs.span.to(p.just_taken()), WithExpr(lhs, fields))
+    end if
+
+    loop
+        val start = p.here()
+        val n = p.name() match
+            Some(x) -> x
+            None -> ""
+
+        p.expect_kw("=")
+
+        val v = parse_expr(p)
+
+        fields.push(WithField(start, n, v))
+
+        if !p.accept_kw(",") then break
+        if p.at_kw("}") then break
+
+    p.expect_kw("}")
+    expr(lhs.span.to(at), WithExpr(lhs, fields))
+end led_with
+
+// -- match ------------------------------------------------------------------------------------------
+
+// The indented arms after a `match`, tried top to bottom.
+parse_match_arms(p: *Parser) -> Buf[MatchArm]
+    var arms: Buf[MatchArm] = buf()
+
+    if !p.accept(Newline)
+        p.want("newline")
+        return arms
+
+    if !p.accept(Indent)
+        p.want("indent")
+        return arms
+
+    p.skip_newlines()
+    p.depth += 1
+
+    loop
+        if p.at(Dedent) || p.at(Eof) then break
+
+        arms.push(parse_match_arm(p))
+        p.skip_newlines()
+
+    p.depth -= 1
+
+    if !p.accept(Dedent) then p.want("dedent")
+
+    arms
+end parse_match_arms
+
+private parse_match_arm(p: *Parser) -> MatchArm
+    val start = p.here()
+    var pats: Buf[Pattern] = buf()
+
+    if p.accept_kw("else")
+        // `else` names no pattern, so there is nothing for an arrow to separate one from.
+        if p.at_kw("->")
+            p.fault(p.here(), "the 'else' arm takes its body directly, with no '->' \u{2014} 'else' " +
+                "names no pattern to separate one from")
+            p.bump()
+        end if
+
+        pats.push(pattern_of(start, WildcardPattern))
+
+        return MatchArm(start.to(p.just_taken()), pats, None, parse_arm_body(p))
+    end if
+
+    if !can_begin_pattern(p.peek())
+        p.want("a pattern")
+        skip_arm(p)
+        return MatchArm(start, pats, None, buf())
+    end if
+
+    pats.push(parse_pattern(p))
+
+    loop
+        if !p.accept_kw("|") then break
+
+        pats.push(parse_pattern(p))
+
+    val guard = if p.accept_kw("if") then Some(parse_expr(p)) else None
+
+    p.expect_kw("->")
+
+    MatchArm(start.to(p.just_taken()), pats, guard, parse_arm_body(p))
+end parse_match_arm
+
+private parse_arm_body(p: *Parser) -> Buf[Stmt]
+    if p.block_ahead() then parse_suite(p) else parse_inline_body(p)
+
+private skip_arm(p: *Parser)
+    loop
+        if p.at(Newline) || p.at(Dedent) || p.at(Eof) then break
+
+        p.bump()
+
+// Whether a token can begin a pattern.
+can_begin_pattern(t: Tok) -> bool = t match
+    IntLit(_, _, _) -> true
+    FloatLit(_, _) -> true
+    CharLit(_) -> true
+    StrLit(_) -> true
+    Ident(_) -> true
+    QuotedIdent(_) -> true
+    Keyword(w) -> w == "(" || w == "-" || w == "." || w == "true" || w == "false"
+    _ -> false
+
+// -- string interpolation ----------------------------------------------------------------------------
+
+// `s"a ${x} b"` becomes the concatenation it means, and `f"${n}%04d"` renders through `format`.
+//
+// **The holes are lexed and parsed here**, the lexer having kept each one as the source between its
+// braces: what a hole says is the grammar's business and not that pass's.
+private desugar_interp(p: *Parser, at: Span, parts: Buf[string], exprs: Buf[string],
+        specs: Buf[string]) -> Expr
+    var terms: Buf[Expr] = buf()
+
+    if parts.len() > 0 && parts.at(0) != "" then terms.push(expr(at, StrLit(parts.at(0))))
+
+    for i in 0..<exprs.len()
+        val hole = exprs.at(i)
+        val inner = parse_embedded(p, at, hole)
+        val spec = specs.at(i)
+        var args: Buf[Expr] = buf()
+
+        args.push(inner)
+
+        if spec == ""
+            terms.push(expr(at, Call(expr(at, Ident("str")), args)))
+        else
+            args.push(expr(at, StrLit(spec)))
+            terms.push(expr(at, Call(expr(at, Ident("format")), args)))
+
+        val tail = parts.at(i + 1)
+
+        if tail != "" then terms.push(expr(at, StrLit(tail)))
+
+    if terms.is_empty() then return expr(at, StrLit(""))
+
+    var out = terms.at(0)
+
+    for i in 1..<terms.len()
+        out = expr(at, Binary("+", out, terms.at(i)))
+
+    out
+end desugar_interp
+
+// A hole, read as an expression of its own.
+//
+// **A malformed hole is fatal rather than a cue to try something else**, which is what keeps the
+// real message instead of a generic one from whatever the enclosing rule would have tried next.
+private parse_embedded(p: *Parser, at: Span, src: string) -> Expr
+    val inner = parse_expr_text(s"${p.src.name} (interpolation)", src)
+
+    if inner.ok() then return inner.value
+
+    p.fault(at, s"in interpolation '${src}': ${inner.first().message}")
+    expr(at, Bad)
+end parse_embedded
+
+// The range operator, where a pattern reads one.
+parse_range_op(p: *Parser) -> Option[bool]
+    if p.accept_kw("..<") then return Some(false)
+
+    if p.at_kw("..")
+        val at = p.here()
+
+        p.bump()
+
+        if p.at_kw("=") then refuse_inclusive_eq(p, at)
+
+        return Some(true)
+    end if
+
+    None
+end parse_range_op

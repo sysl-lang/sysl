@@ -1,0 +1,566 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// The tree, as parenthesised prefix notation, and a type as it was written.
+//
+// **The first of these exists for the tests, and that is the whole of its brief.** A parser is
+// checked by pinning the shape it produced, and a shape is only worth pinning if a person can read
+// it: `(+ 1 (* 2 3))` says what a field-by-field dump of a nested struct does not. Precedence,
+// associativity and the index-versus-type-argument decision are all visible at a glance.
+//
+// **The second exists for the diagnostics**, and is a different function for a reason rather than by
+// oversight: half a dozen refusals quote the type back at the reader in the spelling they wrote --
+// `'(int)' is a type in parentheses` -- and what that wants is the source form, not a tree.
+
+// -- the written form of a type ------------------------------------------------------------------
+
+// A type as a program would write it. The bootstrap compiler's `TypeRef.show`, mirrored because the
+// messages that embed it are mirrored.
+type_text(t: TypeRef) -> string
+    var out = str_builder()
+
+    write_type_text(&out, t)
+    out.finish()
+
+private write_type_list(out: *StrBuilder, ts: Buf[TypeRef])
+    for i in 0..<ts.len()
+        if i > 0 then out.push(", ")
+
+        write_type_text(out, ts.at(i))
+
+private write_type_text(out: *StrBuilder, t: TypeRef)
+    *t.kind match
+        NamedType(n, args) ->
+            out.push(n)
+
+            if !args.is_empty()
+                out.push_char('[')
+                write_type_list(out, args)
+                out.push_char(']')
+        PtrType(inner) ->
+            out.push_char('*')
+            write_type_text(out, inner)
+        RefType(inner, sync) ->
+            out.push_char('&')
+
+            if sync then out.push("sync ")
+
+            write_type_text(out, inner)
+        WeakType(inner) ->
+            out.push("weak ")
+            write_type_text(out, inner)
+        ArrayType(length, elem, ro) ->
+            length match
+                None ->
+                    out.push("[]")
+
+                    if ro then out.push("const ")
+                Some(n) ->
+                    out.push_char('[')
+
+                    *n.kind match
+                        IntLit(digits, _, _) -> out.push(digits)
+                        _ -> out.push("\u{2026}")
+
+                    out.push_char(']')
+
+            write_type_text(out, elem)
+        VectorType(lanes, elem) ->
+            out.push_char('<')
+
+            *lanes.kind match
+                IntLit(digits, _, _) -> out.push(digits)
+                Ident(n) -> out.push(n)
+                _ -> out.push("\u{2026}")
+
+            out.push_char('>')
+            write_type_text(out, elem)
+        VolatileType(inner) ->
+            out.push("volatile ")
+            write_type_text(out, inner)
+        TupleType(parts, results) ->
+            if results
+                write_type_list(out, parts)
+            else
+                out.push_char('(')
+                write_type_list(out, parts)
+                out.push_char(')')
+        PackType(n) -> out.push(s"..${n}")
+        FnType(params, ret, bare) ->
+            if bare && params.len() == 1
+                write_type_text(out, params.at(0))
+            else
+                if !bare then out.push("Fn")
+
+                out.push_char('(')
+                write_type_list(out, params)
+                out.push_char(')')
+
+            out.push(" -> ")
+            write_type_text(out, ret)
+        CFnType(params, ret) ->
+            out.push("*extern(")
+            write_type_list(out, params)
+            out.push(") -> ")
+            write_type_text(out, ret)
+        ValueArgType(v) ->
+            *v.kind match
+                IntLit(digits, _, _) -> out.push(digits)
+                Ident(n) -> out.push(n)
+                _ -> out.push("\u{2026}")
+        AssocType(base, member) ->
+            write_type_text(out, base)
+            out.push(s"::${member}")
+        AssocArgType(n, typ) ->
+            out.push(s"${n} = ")
+            write_type_text(out, typ)
+        SomeType(bounds) ->
+            out.push("some ")
+
+            for i in 0..<bounds.len()
+                if i > 0 then out.push(" + ")
+
+                out.push(bound_text(bounds.at(i)))
+end write_type_text
+
+// A trait named as a bound, as it was written.
+bound_text(b: BoundRef) -> string
+    if b.args.is_empty() then return b.name
+
+    var out = str_builder()
+
+    out.push(b.name)
+    out.push_char('[')
+    write_type_list(&out, b.args)
+    out.push_char(']')
+    out.finish()
+end bound_text
+
+// -- the tree, as a shape a test can read ---------------------------------------------------------
+
+show_expr(e: Expr) -> string
+    var out = str_builder()
+
+    write_expr(&out, e)
+    out.finish()
+
+show_type(t: TypeRef) -> string
+    var out = str_builder()
+
+    write_type(&out, t)
+    out.finish()
+
+show_pattern(p: Pattern) -> string
+    var out = str_builder()
+
+    write_pattern(&out, p)
+    out.finish()
+
+show_stmt(s: Stmt) -> string
+    var out = str_builder()
+
+    write_stmt(&out, s)
+    out.finish()
+
+// A whole statement list, space separated.
+show_stmts(ss: Buf[Stmt]) -> string
+    var out = str_builder()
+
+    write_stmts(&out, ss)
+    out.finish()
+
+private write_stmts(out: *StrBuilder, ss: Buf[Stmt])
+    for i in 0..<ss.len()
+        if i > 0 then out.push_char(' ')
+
+        write_stmt(out, ss.at(i))
+
+private write_stmt(out: *StrBuilder, s: Stmt)
+    *s.kind match
+        ExprStmt(e) -> write_expr(out, e)
+        Bad -> out.push("(bad)")
+        _ -> out.push("(stmt)")
+
+// A type, as a shape rather than as a spelling: a value argument is told from a name, which the
+// written form cannot do.
+private write_type(out: *StrBuilder, t: TypeRef)
+    *t.kind match
+        NamedType(n, args) ->
+            if args.is_empty()
+                out.push(n)
+            else
+                out.push_char('(')
+                out.push(n)
+
+                for i in 0..<args.len()
+                    out.push_char(' ')
+                    write_type(out, args.at(i))
+
+                out.push_char(')')
+        ValueArgType(v) ->
+            out.push("(value ")
+            write_expr(out, v)
+            out.push_char(')')
+        PtrType(inner) -> form1(out, "ptr", inner)
+        RefType(inner, sync) -> form1(out, if sync then "ref-sync" else "ref", inner)
+        WeakType(inner) -> form1(out, "weak", inner)
+        ArrayType(length, elem, ro) ->
+            out.push_char('(')
+            out.push(if ro then "slice-const" else "array")
+
+            length match
+                Some(n) ->
+                    out.push_char(' ')
+                    write_expr(out, n)
+                None -> out.push(" _")
+
+            out.push_char(' ')
+            write_type(out, elem)
+            out.push_char(')')
+        VectorType(lanes, elem) ->
+            out.push("(vector ")
+            write_expr(out, lanes)
+            out.push_char(' ')
+            write_type(out, elem)
+            out.push_char(')')
+        VolatileType(inner) -> form1(out, "volatile", inner)
+        TupleType(parts, results) ->
+            out.push_char('(')
+            out.push(if results then "results" else "tuple")
+
+            for i in 0..<parts.len()
+                out.push_char(' ')
+                write_type(out, parts.at(i))
+
+            out.push_char(')')
+        PackType(n) -> out.push(s"(pack ${n})")
+        FnType(params, ret, bare) ->
+            out.push_char('(')
+            out.push(if bare then "fn" else "Fn")
+
+            for i in 0..<params.len()
+                out.push_char(' ')
+                write_type(out, params.at(i))
+
+            out.push(" -> ")
+            write_type(out, ret)
+            out.push_char(')')
+        CFnType(params, ret) ->
+            out.push("(extern-fn")
+
+            for i in 0..<params.len()
+                out.push_char(' ')
+                write_type(out, params.at(i))
+
+            out.push(" -> ")
+            write_type(out, ret)
+            out.push_char(')')
+        AssocType(base, member) ->
+            out.push("(:: ")
+            write_type(out, base)
+            out.push(s" ${member})")
+        AssocArgType(n, typ) ->
+            out.push(s"(= ${n} ")
+            write_type(out, typ)
+            out.push_char(')')
+        SomeType(bounds) ->
+            out.push("(some")
+
+            for i in 0..<bounds.len()
+                out.push_char(' ')
+                out.push(bound_text(bounds.at(i)))
+
+            out.push_char(')')
+end write_type
+
+private form1(out: *StrBuilder, head: string, inner: TypeRef)
+    out.push_char('(')
+    out.push(head)
+    out.push_char(' ')
+    write_type(out, inner)
+    out.push_char(')')
+
+private write_pattern(out: *StrBuilder, p: Pattern)
+    *p.kind match
+        LitPattern(v) -> write_expr(out, v)
+        RangePattern(lo, hi, inclusive) ->
+            out.push(if inclusive then "(.. " else "(..< ")
+            write_expr(out, lo)
+            out.push_char(' ')
+            write_expr(out, hi)
+            out.push_char(')')
+        WildcardPattern -> out.push_char('_')
+        IdentPattern(n) -> out.push(n)
+        EqPattern(n) -> out.push(s"`${n}`")
+        VariantPattern(n, args) ->
+            out.push_char('(')
+            out.push(n)
+
+            for i in 0..<args.len()
+                out.push_char(' ')
+                write_pattern(out, args.at(i))
+
+            out.push_char(')')
+        StructPattern(n, fields) ->
+            out.push(s"(struct ${n}")
+
+            for i in 0..<fields.len()
+                val f = fields.at(i)
+
+                out.push(s" (${f.name} ")
+                write_pattern(out, f.pat)
+                out.push_char(')')
+
+            out.push_char(')')
+        TuplePattern(args) ->
+            out.push("(tuple")
+
+            for i in 0..<args.len()
+                out.push_char(' ')
+                write_pattern(out, args.at(i))
+
+            out.push_char(')')
+        BindPattern(n, inner) ->
+            out.push(s"(@ ${n} ")
+            write_pattern(out, inner)
+            out.push_char(')')
+end write_pattern
+
+private write_exprs(out: *StrBuilder, es: Buf[Expr])
+    for i in 0..<es.len()
+        out.push_char(' ')
+        write_expr(out, es.at(i))
+
+private write_body(out: *StrBuilder, head: string, ss: Buf[Stmt])
+    out.push_char('(')
+    out.push(head)
+
+    for i in 0..<ss.len()
+        out.push_char(' ')
+        write_stmt(out, ss.at(i))
+
+    out.push_char(')')
+
+private write_expr(out: *StrBuilder, e: Expr)
+    *e.kind match
+        IntLit(digits, base, suffix) ->
+            out.push(base match
+                2 -> s"0b${digits}"
+                8 -> s"0o${digits}"
+                16 -> s"0x${digits}"
+                _ -> digits)
+            out.push(suffix)
+        FloatLit(text, suffix) ->
+            out.push(text)
+            out.push(suffix)
+        CharLit(c) ->
+            out.push_char('\'')
+            out.push_char(c)
+            out.push_char('\'')
+        StrLit(v) -> out.push(s"\"${v}\"")
+        CStrLit(v) -> out.push(s"c\"${v}\"")
+        BoolLit(v) -> out.push(if v then "true" else "false")
+        UnitLit -> out.push("()")
+        NullLit -> out.push("null")
+        Ident(n) -> out.push(n)
+        Unary(op, operand) ->
+            out.push(s"(${op} ")
+            write_expr(out, operand)
+            out.push_char(')')
+        PreIncDec(op, operand) ->
+            out.push(s"(pre${op} ")
+            write_expr(out, operand)
+            out.push_char(')')
+        PostIncDec(op, operand) ->
+            out.push(s"(post${op} ")
+            write_expr(out, operand)
+            out.push_char(')')
+        Binary(op, left, right) ->
+            out.push(s"(${op} ")
+            write_expr(out, left)
+            out.push_char(' ')
+            write_expr(out, right)
+            out.push_char(')')
+        Compare(operands, ops) ->
+            out.push("(cmp")
+
+            for i in 0..<operands.len()
+                if i > 0 then out.push(s" ${ops.at(i - 1)}")
+
+                out.push_char(' ')
+                write_expr(out, operands.at(i))
+
+            out.push_char(')')
+        RangeExpr(lo, hi, inclusive) ->
+            out.push(if inclusive then "(.." else "(..<")
+
+            lo match
+                Some(v) ->
+                    out.push_char(' ')
+                    write_expr(out, v)
+                None -> out.push(" _")
+
+            hi match
+                Some(v) ->
+                    out.push_char(' ')
+                    write_expr(out, v)
+                None -> out.push(" _")
+
+            out.push_char(')')
+        Assign(op, target, value) ->
+            out.push(s"(${op} ")
+            write_expr(out, target)
+            out.push_char(' ')
+            write_expr(out, value)
+            out.push_char(')')
+        Call(callee, args) ->
+            out.push("(call ")
+            write_expr(out, callee)
+            write_exprs(out, args)
+            out.push_char(')')
+        NamedArg(n, value) ->
+            out.push(s"(named ${n} ")
+            write_expr(out, value)
+            out.push_char(')')
+        Spread(v) ->
+            out.push("(spread ")
+            write_expr(out, v)
+            out.push_char(')')
+        DefaultArg(_, v) ->
+            out.push("(default ")
+            write_expr(out, v)
+            out.push_char(')')
+        Index(receiver, index) ->
+            out.push("(index ")
+            write_expr(out, receiver)
+            out.push_char(' ')
+            write_expr(out, index)
+            out.push_char(')')
+        Field(receiver, n) ->
+            out.push("(field ")
+            write_expr(out, receiver)
+            out.push(s" ${n})")
+        TypeArgs(receiver, args) ->
+            out.push("(typeargs ")
+            write_expr(out, receiver)
+            write_exprs(out, args)
+            out.push_char(')')
+        TypeAttr(receiver, attr) ->
+            out.push("(:: ")
+            write_expr(out, receiver)
+            out.push(s" ${attr})")
+        WithExpr(base, fields) ->
+            out.push("(with ")
+            write_expr(out, base)
+
+            for i in 0..<fields.len()
+                val f = fields.at(i)
+
+                out.push(s" (${f.name} ")
+                write_expr(out, f.value)
+                out.push_char(')')
+
+            out.push_char(')')
+        ImplicitMember(n) -> out.push(s"(dot ${n})")
+        LayoutOf(op, typ) ->
+            out.push(s"(${op} ")
+            write_type(out, typ)
+            out.push_char(')')
+        OffsetOf(typ, field) ->
+            out.push("(offsetof ")
+            write_type(out, typ)
+            out.push(s" ${field})")
+        TryExpr(inner) ->
+            out.push("(try ")
+            write_expr(out, inner)
+            out.push_char(')')
+        Tuple(elements) ->
+            out.push("(tuple")
+            write_exprs(out, elements)
+            out.push_char(')')
+        Lambda(params, body, implicit_params) ->
+            out.push(if implicit_params then "(lambda-it (" else "(lambda (")
+
+            for i in 0..<params.len()
+                if i > 0 then out.push_char(' ')
+
+                val lp = params.at(i)
+
+                lp.typ match
+                    Some(t) ->
+                        out.push(s"${lp.name}:")
+                        write_type(out, t)
+                    None -> out.push(lp.name)
+
+            out.push(") ")
+            write_stmts(out, body)
+            out.push_char(')')
+        BlockArg(body) -> write_body(out, "blockarg", body)
+        ArrayLit(elements) ->
+            out.push("(array")
+            write_exprs(out, elements)
+            out.push_char(')')
+        ArrayFill(value, count) ->
+            out.push("(fill ")
+            write_expr(out, value)
+            out.push_char(' ')
+            write_expr(out, count)
+            out.push_char(')')
+        Block(stmts) -> write_body(out, "block", stmts)
+        IfExpr(cond, then_body, else_body) ->
+            out.push("(if ")
+            write_expr(out, cond)
+            out.push_char(' ')
+            write_body(out, "then", then_body)
+
+            else_body match
+                Some(b) ->
+                    out.push_char(' ')
+                    write_body(out, "else", b)
+                None -> ()
+
+            out.push_char(')')
+        MatchExpr(scrutinee, arms) ->
+            out.push("(match ")
+            write_expr(out, scrutinee)
+
+            for i in 0..<arms.len()
+                val a = arms.at(i)
+
+                out.push(" (arm")
+
+                for j in 0..<a.patterns.len()
+                    out.push_char(' ')
+                    write_pattern(out, a.patterns.at(j))
+
+                a.guard match
+                    Some(g) ->
+                        out.push(" (if ")
+                        write_expr(out, g)
+                        out.push_char(')')
+                    None -> ()
+
+                out.push(" -> ")
+                write_stmts(out, a.body)
+                out.push_char(')')
+
+            out.push_char(')')
+        IsPattern(subject, patterns, negated) ->
+            out.push(if negated then "(is-not " else "(is ")
+            write_expr(out, subject)
+
+            for i in 0..<patterns.len()
+                out.push_char(' ')
+                write_pattern(out, patterns.at(i))
+
+            out.push_char(')')
+        ResultList(values) ->
+            out.push("(results")
+            write_exprs(out, values)
+            out.push_char(')')
+        Bad -> out.push("(bad)")
+        _ -> out.push("(expr)")
+end write_expr

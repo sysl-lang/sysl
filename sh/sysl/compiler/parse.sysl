@@ -1,0 +1,514 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// Tokens to a tree: the reader every rule stands on, what a refusal says, and how a file with more
+// than one mistake in it goes on being read.
+//
+// **Recursive descent for the forms told apart by their first word, and `sh.sysl.parsing`'s
+// binding-power loop for the expressions.** That is the split nearly every hand-written front end
+// takes, and it is the one the bootstrap compiler does not take -- it is built on parser
+// combinators, which this compiler may not use. What is mirrored from it is the *tree* and the
+// *diagnostics*, never the machinery.
+//
+// **The `TokenStream` the loop runs on is this parser rather than its token cursor**, which the
+// package's own note says why: a `led` callback is handed the `*S` it was called with, so making `S`
+// the parser is what lets a callback reach the report and the source text.
+
+// Everything the grammar needs in one place, so that a bare-arrow callback reaches all of it.
+struct Parser
+    toks: Tokens[Tok]
+    src: Source
+    report: Report
+
+    // How many blocks deep the statement being read is. Zero is the top level of the file, and the
+    // difference is visible in a diagnostic: a token that begins nothing is an expression that is
+    // missing at the top level and a block that should have closed inside one.
+    depth: usize
+
+    // The kind of the next token. `Eof` where there is none, so that no caller unwraps.
+    peek(self) -> Tok = self.toks.peek() match
+        Some(t) -> t.value
+        None -> Eof
+
+    // The kind of the token `n` further on.
+    peek_at(self, n: usize) -> Tok = self.toks.peek_at(n) match
+        Some(t) -> t.value
+        None -> Eof
+
+    // Where the next token is.
+    here(self) -> Span = self.toks.here()
+
+    // Where the token just taken was.
+    just_taken(self) -> Span = self.toks.previous()
+
+    at(self, k: Tok) -> bool = self.peek() == k
+
+    // Whether the next token is this word or operator. **One test for both**, as the lexer has one
+    // token for both: what separates them is only which table the spelling came out of.
+    at_kw(self, word: string) -> bool = self.peek() match
+        Keyword(t) -> t == word
+        _ -> false
+
+    // Whether the next token is a *contextual* keyword: an identifier spelled exactly this word,
+    // which stays an ordinary name everywhere the grammar does not want the word.
+    at_word(self, word: string) -> bool = self.peek() match
+        Ident(n) -> n == word
+        _ -> false
+
+    // The same, `n` tokens further on.
+    kw_at(self, n: usize, word: string) -> bool = self.peek_at(n) match
+        Keyword(t) -> t == word
+        _ -> false
+
+    // Take the next token, whatever it is.
+    bump(*self)
+        self.toks.advance()
+
+    accept(*self, k: Tok) -> bool
+        if self.peek() != k then return false
+
+        self.toks.advance()
+        true
+    end accept
+
+    accept_kw(*self, word: string) -> bool
+        if !self.at_kw(word) then return false
+
+        self.toks.advance()
+        true
+    end accept_kw
+
+    accept_word(*self, word: string) -> bool
+        if !self.at_word(word) then return false
+
+        self.toks.advance()
+        true
+    end accept_word
+
+    // Take the next token, complaining if it is not the one wanted.
+    //
+    // **The complaint is `'X' expected`, which is the bootstrap compiler's wording and is a
+    // specification rather than a style.** Its whole diagnostic suite is written against it, and a
+    // message composed here instead would be a second answer to a question already settled.
+    expect_kw(*self, word: string) -> bool
+        if self.accept_kw(word) then return true
+
+        self.want(s"'${word}'")
+        false
+    end expect_kw
+
+    expect(*self, k: Tok, what: string) -> bool
+        if self.accept(k) then return true
+
+        self.want(what)
+        false
+    end expect
+
+    // Say what was owed here, in the one shape every refusal takes.
+    want(*self, what: string)
+        self.report.add(error(self.here(), s"${what} expected"))
+
+    // Say something is wrong, and keep going.
+    fault(*self, at: Span, message: string)
+        self.report.add(error(at, message))
+
+    // The text a span was written as.
+    text(self, at: Span) -> string = from_utf8_unchecked(self.src.text(at))
+
+    // A name: an ordinary identifier, or one written in backticks.
+    //
+    // **The two are one production**, since a quoted word is an ordinary name wherever one may be
+    // written -- that is what the backticks are for.
+    name(*self) -> Option[string]
+        self.peek() match
+            Ident(n) ->
+                self.bump()
+                Some(n)
+            QuotedIdent(n) ->
+                self.bump()
+                Some(n)
+            _ ->
+                self.want("identifier")
+                None
+    end name
+
+    // A dotted name, taken whole: `sysl.buf.Buf` is one string.
+    qualified_name(*self) -> Option[string]
+        var out = self.name()?
+
+        loop
+            if !self.at_kw(".") then break
+
+            // A `.` is only part of the name where a name follows it. `a.0` is a tuple index and
+            // `a.*` is an import's wildcard, and neither belongs to this production.
+            self.peek_at(1) match
+                Ident(n) ->
+                    self.bump()
+                    self.bump()
+                    out = out + "." + n
+                QuotedIdent(n) ->
+                    self.bump()
+                    self.bump()
+                    out = out + "." + n
+                _ -> break
+
+        Some(out)
+    end qualified_name
+
+    // `_` -- which is an ordinary identifier to the lexer and a word to the grammar.
+    at_wildcard(self) -> bool = self.at_word("_")
+
+    // Where the cursor is, so that a form which turns out to be another form can be tried and put
+    // back. **The report is wound back with it**, since a probe that failed said things about a
+    // reading nobody chose.
+    mark(self) -> usize = self.toks.mark()
+
+    errors_at(self) -> usize = self.report.len()
+
+    rewind(*self, tokens_at: usize, errors_at: usize)
+        self.toks.reset(tokens_at)
+        self.report.items.truncate(errors_at)
+
+    // Skip over newlines. Used where a construct spans lines but its parts are not statements.
+    skip_newlines(*self)
+        loop
+            if !self.accept(Newline) then break
+
+    // Step over the layout tokens a fragment may open with.
+    //
+    // **A fragment is not a file**, and an interpolation hole is the case: `${ f(x) }` is lexed on
+    // its own, so a hole written with a space after the brace opens a block that closes at the end
+    // of the text. Nothing in an expression wants either token, and a caller reading one expression
+    // out of a piece of text is owed the expression rather than a complaint about the space.
+    skip_layout(*self)
+        loop
+            if self.accept(Newline) then continue
+            if self.accept(Indent) then continue
+
+            break
+
+    // Whether an indented block opens here.
+    block_ahead(self) -> bool = self.at(Newline) && self.peek_at(1) == Indent
+
+    // Whether the statement just parsed has ended.
+    //
+    // **A block closing ends the statement that contained it**: an `if` with an indented body is
+    // followed by a `Dedent` and by no `Newline`, the newline having been spent inside the block.
+    end_of_statement(*self) -> bool
+        if self.accept(Newline) then return true
+
+        self.at(Dedent) || self.at(Eof)
+    end end_of_statement
+end Parser
+
+impl TokenStream for Parser
+    type Token = Spanned[Tok]
+
+    look(self) -> Option[Spanned[Tok]] = self.toks.peek()
+
+    take(*self) -> Option[Spanned[Tok]] = self.toks.advance()
+
+// Whether a token can begin an expression.
+//
+// **What it is for is the difference between two complaints**, not for deciding what to parse: a
+// token that begins nothing is an expression that is missing at the top level of a file, and a block
+// that should have closed inside one. Both wordings are the bootstrap's, and a parser that reported
+// one of them everywhere would be wrong half the time.
+can_begin_expr(t: Tok) -> bool = t match
+    IntLit(_, _, _) -> true
+    FloatLit(_, _) -> true
+    CharLit(_) -> true
+    StrLit(_) -> true
+    CStrLit(_) -> true
+    StrInterp(_, _, _) -> true
+    Ident(_) -> true
+    QuotedIdent(_) -> true
+    Label(_) -> true
+    Keyword(w) -> begins_expr_word(w)
+    _ -> false
+
+private begins_expr_word(w: string) -> bool
+    for word in ["(", "[", "-", "!", "~", "*", "&", "++", "--", ".", "..", "..<", "true", "false",
+                 "null", "self", "if", "match", "while", "loop", "do", "for", "sizeof", "alignof",
+                 "offsetof"]
+        if word == w then return true
+
+    false
+end begins_expr_word
+
+// -- entry points -------------------------------------------------------------------------------
+
+// What reading something answers with: the tree, and everything that was wrong with it.
+//
+// **The tree comes back even where the report is not empty**, which is the whole of what recovery
+// buys: a file with one bad line still hands an editor the lines around it. `ok` is what says
+// whether anything downstream may look at the tree.
+struct ParsedExpr
+    value: Expr
+    report: Report
+    src: Source
+
+    ok(self) -> bool = !self.report.has_errors()
+
+    // The first thing that was wrong, which is the one the grammar itself found.
+    first(self) -> Diagnostic = self.report.at(0)
+
+    // `line:column` of the first complaint, in the reader's own numbering.
+    at(self) -> Loc = self.src.locate(self.first().span.start)
+end ParsedExpr
+
+struct ParsedType
+    value: TypeRef
+    report: Report
+    src: Source
+
+    ok(self) -> bool = !self.report.has_errors()
+    first(self) -> Diagnostic = self.report.at(0)
+    at(self) -> Loc = self.src.locate(self.first().span.start)
+end ParsedType
+
+struct ParsedPattern
+    value: Pattern
+    report: Report
+    src: Source
+
+    ok(self) -> bool = !self.report.has_errors()
+    first(self) -> Diagnostic = self.report.at(0)
+    at(self) -> Loc = self.src.locate(self.first().span.start)
+end ParsedPattern
+
+// A whole file, read.
+struct Parsed
+    program: Program
+    report: Report
+    src: Source
+
+    ok(self) -> bool = !self.report.has_errors()
+    first(self) -> Diagnostic = self.report.at(0)
+    at(self) -> Loc = self.src.locate(self.first().span.start)
+end Parsed
+
+// A parser over a source, or the one lexical complaint that stopped it.
+//
+// **A lexical error outranks the grammar's reaction to it**, and there is one of them rather than a
+// report: everything after an unterminated literal is being read in the wrong language, so a second
+// complaint about it is noise at best and a wrong line number at worst.
+private reader(src: Source) -> Result[Parser, Diagnostic] =
+    Ok(Parser(tokens_of(lex(src)?), src, report(), 0))
+
+// One expression, read from text.
+//
+// The text has to be the whole of it: an expression followed by anything but the end of the line is
+// the mistake `val x = 1 2` makes, and it is reported here as it is reported there.
+parse_expr_text(name: string, text: string) -> ParsedExpr
+    val src = source_of(name, text)
+
+    reader(src) match
+        Err(d) ->
+            var r = report()
+
+            r.add(d)
+            ParsedExpr(expr(d.span, Bad), r, src)
+        Ok(started) ->
+            var p = started
+
+            p.skip_layout()
+
+            val e = parse_expr(&p)
+
+            if !p.end_of_statement() then p.want("newline")
+
+            ParsedExpr(e, p.report, src)
+end parse_expr_text
+
+// One type, read from text.
+parse_type_text(name: string, text: string) -> ParsedType
+    val src = source_of(name, text)
+
+    reader(src) match
+        Err(d) ->
+            var r = report()
+
+            r.add(d)
+            ParsedType(type_ref(d.span, NamedType("", buf())), r, src)
+        Ok(started) ->
+            var p = started
+
+            p.skip_layout()
+
+            val t = parse_type(&p)
+
+            if !p.end_of_statement() then p.want("newline")
+
+            ParsedType(t, p.report, src)
+end parse_type_text
+
+// One pattern, read from text.
+parse_pattern_text(name: string, text: string) -> ParsedPattern
+    val src = source_of(name, text)
+
+    reader(src) match
+        Err(d) ->
+            var r = report()
+
+            r.add(d)
+            ParsedPattern(pattern_of(d.span, WildcardPattern), r, src)
+        Ok(started) ->
+            var p = started
+
+            p.skip_layout()
+
+            val pat = parse_pattern(&p)
+
+            if !p.end_of_statement() then p.want("newline")
+
+            ParsedPattern(pat, p.report, src)
+end parse_pattern_text
+
+// A whole file.
+parse(src: Source) -> Parsed
+    val empty = Program(buf(), None, buf(), buf(), src, false, buf(), buf())
+
+    reader(src) match
+        Err(d) ->
+            var r = report()
+
+            r.add(d)
+            Parsed(empty, r, src)
+        Ok(started) ->
+            var p = started
+            val body = parse_stmts(&p, false)
+
+            Parsed(Program(body, None, buf(), buf(), src, false, buf(), buf()), p.report, src)
+end parse
+
+// -- statements ---------------------------------------------------------------------------------
+
+// A run of statements, to the end of the file or to the close of the block they are in.
+//
+// **A line that will not parse is dropped rather than stood in for, and the ones around it survive**
+// -- which is the whole of what an editor asking about line 3 needs when line 1 is unreadable. The
+// skip stays inside the block it began in, because the block's `Dedent` stops it: without that the
+// statement after the block is read as though it were part of it.
+parse_stmts(p: *Parser, in_block: bool) -> Buf[Stmt]
+    var stmts: Buf[Stmt] = buf()
+
+    p.skip_newlines()
+
+    loop
+        if p.at(Eof) then break
+        if in_block && p.at(Dedent) then break
+
+        // A token that can begin nothing is a block that should have closed, inside one, and an
+        // expression that is missing at the top level.
+        if !can_begin_stmt(p.peek())
+            if in_block then p.want("dedent") else p.want("expression")
+
+            skip_line(p)
+            p.skip_newlines()
+            continue
+        end if
+
+        val before = p.report.len()
+        val s = parse_stmt(p)
+
+        if p.report.len() == before && p.end_of_statement()
+            stmts.push(s)
+        else
+            // Either the statement itself would not read, or it ran on past where one has to end.
+            // Say the second of those once, then step past whatever is there so the loop cannot spin
+            // on a token nothing consumes.
+            if p.report.len() == before then p.want("newline")
+
+            skip_line(p)
+        end if
+
+        p.skip_newlines()
+    end loop
+
+    stmts
+end parse_stmts
+
+// Whether a token can begin a statement. Every statement of this section is an expression; the
+// declaration words widen this where they land.
+private can_begin_stmt(t: Tok) -> bool = can_begin_expr(t)
+
+// Step past the rest of an unreadable line, without leaving the block it was written in.
+//
+// **The block depth is what keeps it there.** An `Indent` met on the way is a block the broken line
+// opened, and everything down to its `Dedent` belongs to it; a `Dedent` at depth zero is the end of
+// the block *this* line is in and stops the skip before it.
+private skip_line(p: *Parser)
+    var depth = 0
+
+    loop
+        p.peek() match
+            Eof -> break
+            Newline ->
+                p.bump()
+
+                if depth == 0 then break
+            Indent ->
+                p.bump()
+                depth += 1
+            Dedent ->
+                if depth == 0 then break
+
+                p.bump()
+                depth -= 1
+            _ -> p.bump()
+end skip_line
+
+// One statement.
+//
+// **Every statement here is an expression**, which is the seam this section leaves: the declaration
+// and jump forms are read by the same loop above and add arms to this one.
+parse_stmt(p: *Parser) -> Stmt
+    val start = p.here()
+    val e = parse_expr(p)
+
+    stmt(start.to(p.just_taken()), ExprStmt(e))
+end parse_stmt
+
+// An indented block: the lexer's `Newline` `Indent` pair, statements, and the `Dedent` that closes
+// them.
+parse_suite(p: *Parser) -> Buf[Stmt]
+    if !p.accept(Newline)
+        p.want("newline")
+        return buf()
+
+    if !p.accept(Indent)
+        p.want("indent")
+        return buf()
+
+    p.depth += 1
+
+    val body = parse_stmts(p, true)
+
+    p.depth -= 1
+
+    if !p.accept(Dedent) then p.want("dedent")
+
+    body
+end parse_suite
+
+// A single statement written on the same line as the word that introduced it.
+parse_inline_body(p: *Parser) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    out.push(parse_stmt(p))
+    out
+end parse_inline_body
+
+// The body of a control-flow construct: the introducer word (`then`, `do`) is required for a
+// one-line body and optional before an indented block, a following `Newline` `Indent` already
+// marking the block unambiguously.
+parse_body(p: *Parser, word: string) -> Buf[Stmt]
+    if p.accept_kw(word)
+        if p.block_ahead() then parse_suite(p) else parse_inline_body(p)
+    else
+        parse_suite(p)
+end parse_body
