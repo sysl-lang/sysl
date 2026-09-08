@@ -1,0 +1,155 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The type grammar's tree.
+//
+// **A node is a span and a kind**, which is the shape the whole tree takes here: the span is read
+// off the outside without destructuring, and the recursion is one type wide -- a child is a
+// `TypeRef`, never a reference to one particular variant. The `&TypeKind` inside is what gives the
+// enum a size, which a recursive enum has to get from somewhere.
+struct TypeRef
+    span: Span
+    kind: &TypeKind
+end TypeRef
+
+// A type as written. Nothing here is resolved: `NamedType("int")` is the *word* `int`, and what it
+// names is the analyzer's question.
+enum TypeKind
+    // `Name`, `Name[A, B]`. A dotted name arrives whole -- `sysl.buf.Buf` is one string.
+    NamedType(name: string, args: Buf[TypeRef])
+
+    // A type argument that is a value rather than a type: the `4` of `Matrix[4]`.
+    ValueArgType(value: Expr)
+
+    // `*T` -- a raw pointer.
+    PtrType(inner: TypeRef)
+
+    // `&T` and `&sync T`.
+    RefType(inner: TypeRef, sync: bool)
+
+    // `weak T`.
+    WeakType(inner: TypeRef)
+
+    // `[N]T`, `[]T` and `[]const T`. No length is a slice; `read_only` is the `const` after the
+    // brackets, which says the *view* refuses writes.
+    ArrayType(length: Option[Expr], elem: TypeRef, read_only: bool)
+
+    // `<N>T` -- a vector of `N` lanes.
+    VectorType(lanes: Expr, elem: TypeRef)
+
+    // `volatile T`.
+    VolatileType(inner: TypeRef)
+
+    // `(A, B)`. `results` marks the unparenthesised list a declaration writes after `->` for
+    // several results, which is a different thing from a tuple and is told apart here.
+    TupleType(parts: Buf[TypeRef], results: bool)
+
+    // `..A` -- a type pack standing for a list of types.
+    PackType(name: string)
+
+    // `A -> R` (bare) and `Fn(A) -> R` (written out).
+    FnType(params: Buf[TypeRef], ret: TypeRef, bare: bool)
+
+    // `*extern(A) -> R` -- C's function pointer.
+    CFnType(params: Buf[TypeRef], ret: TypeRef)
+
+    // `T::Item` -- an associated type projected out of a type.
+    AssocType(base: TypeRef, member: string)
+
+    // `Item = T` inside a type-argument list -- an associated type bound by name.
+    AssocArgType(name: string, typ: TypeRef)
+
+    // `some Trait + Other` -- a result whose type is read off the body that produced it.
+    SomeType(bounds: Buf[BoundRef])
+end TypeKind
+
+// A trait named as a bound: `Display`, `Add[int]`.
+struct BoundRef
+    span: Span
+    name: string
+    args: Buf[TypeRef]
+end BoundRef
+
+// Who may see a declaration.
+enum Visibility
+    // Anything that imports the module.
+    Public
+
+    // This file only.
+    File
+
+    // The named module and what is under it.
+    Scoped(name: string)
+end Visibility
+
+// One parameter of a declaration: a name, a type, and the four things a parameter may additionally
+// say about how it is passed.
+struct Param
+    span: Span
+    name: string
+    typ: TypeRef
+    vis: Visibility
+    default: Option[Expr]
+    by_name: bool
+    rest: bool
+end Param
+
+// One type parameter's bounds, as a pair rather than as a map entry.
+//
+// **The bootstrap carries `Map[String, List[BoundRef]]` and this carries a list of pairs**, which
+// says the same thing and additionally keeps the order they were written in. Nothing reads these by
+// key often enough for the map to earn its lookup, and a list is what a test can compare.
+struct NamedBounds
+    name: string
+    bounds: Buf[BoundRef]
+end NamedBounds
+
+// One type parameter's default, or the type a value parameter takes -- the same pair shape, for the
+// same reason.
+struct TypeBinding
+    name: string
+    typ: TypeRef
+end TypeBinding
+
+// Everything a bracketed type-parameter list carried.
+struct TypeParams
+    // Every parameter, in order, whichever kind it is.
+    names: Buf[string]
+
+    // The bounds written after a `:`.
+    bounds: Buf[NamedBounds]
+
+    // The defaults written after a `=`.
+    defaults: Buf[TypeBinding]
+
+    // The type a `const N: usize` value parameter takes.
+    values: Buf[TypeBinding]
+
+    // The defaults those value parameters were given.
+    value_defaults: Buf[ValueBinding]
+
+    // The parameters written `..A`.
+    packs: Buf[string]
+end TypeParams
+
+// A value parameter's default -- a name and an expression.
+struct ValueBinding
+    name: string
+    value: Expr
+end ValueBinding
+
+// `where T: Display` -- the same pairing a bound written inline makes, read after the signature.
+struct WhereBound
+    span: Span
+    name: string
+    bounds: Buf[BoundRef]
+end WhereBound
+
+type_ref(span: Span, kind: TypeKind) -> TypeRef = TypeRef(span, kind)
+
+// A named type with no arguments, which is nearly every type written.
+named_type(span: Span, name: string) -> TypeRef = type_ref(span, NamedType(name, buf()))
+
+no_type_params() -> TypeParams = TypeParams(buf(), buf(), buf(), buf(), buf(), buf())

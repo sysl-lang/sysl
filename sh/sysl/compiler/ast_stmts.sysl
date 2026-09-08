@@ -1,0 +1,438 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Statements and declarations.
+//
+// **A declaration is a statement**, which is what lets a function be declared inside a function and
+// a `struct` stand at the top level of a file beside a `print`. The tree makes no distinction the
+// grammar does not.
+
+// A statement, with where it was written.
+struct Stmt
+    span: Span
+    kind: &StmtKind
+end Stmt
+
+// What a statement is.
+//
+// **The five biggest declarations carry a struct rather than a long variant.** `FuncDecl` alone has
+// twenty-two fields, and a variant with twenty-two positional arguments is a form nobody can read at
+// a construction site; the struct is named for the node and the variant holds one of it.
+enum StmtKind
+    // `import a.b.{c, d as e}`, `import a.b.*`, `import a.b as c`.
+    ImportDecl(decl: ImportDecl)
+
+    // `var name: T = init`.
+    VarDecl(name: string, typ: Option[TypeRef], init: Option[Expr], vis: Visibility,
+            align: Option[Expr], section: Option[string])
+
+    // `const NAME: T = value` -- settled while compiling, so the type is not optional.
+    ConstDecl(name: string, typ: TypeRef, value: Expr, vis: Visibility)
+
+    // `cconst` with an indented block: constants whose values are read out of C.
+    CConstBlock(consts: Buf[CConstDecl])
+
+    // `ctype` with an indented block: types whose layout is read out of C.
+    CTypeBlock(types: Buf[CTypeDecl])
+
+    // `@assert(cond)` standing on its own -- a condition settled while compiling.
+    AssertDecl(cond: Expr, message: Option[string])
+
+    // `static` in front of a binding: one copy for the program rather than one per call.
+    StaticDecl(inner: Stmt)
+
+    // `val name: T = value`.
+    ValDecl(name: string, typ: Option[TypeRef], value: Expr, vis: Visibility,
+            align: Option[Expr], section: Option[string])
+
+    // `ref name = place` -- another name for storage that already exists.
+    RefDecl(name: string, place: Expr)
+
+    // `a, b = f()` -- assignment to several places at once.
+    MultiAssign(op: string, targets: Buf[Expr], values: Buf[Expr])
+
+    // `val a, b = f()` -- several names bound at once.
+    MultiDecl(names: Buf[string], mutable: bool, values: Buf[Expr])
+
+    // `val Point(x, y) = p` -- a binding whose left side is a pattern.
+    PatternDecl(pat: Pattern, mutable: bool, value: Expr)
+
+    // An expression written for its effect, or as a block's trailing value.
+    ExprStmt(inner: Expr)
+
+    Return(value: Option[Expr])
+
+    // `become f(x)` -- a tail call that must be one.
+    Become(call: Expr)
+
+    Break(label: Option[string], value: Option[Expr])
+    Continue(label: Option[string])
+
+    // `defer stmt` -- run when the scope leaves, however it leaves.
+    Defer(inner: Stmt)
+
+    // The three contract clauses, each a condition and the message a failure carries.
+    Require(cond: Expr, msg: Option[string])
+    Ensure(cond: Expr, msg: Option[string])
+    Invariant(cond: Expr, msg: Option[string])
+
+    // `variant e` -- a loop's decreasing measure, which is what says it terminates.
+    Variant(measure: Expr)
+
+    // `asm` with a block per architecture.
+    AsmStmt(arms: Buf[AsmArm])
+
+    FuncDecl(decl: FuncDecl)
+    ExternDecl(decl: ExternDecl)
+
+    // `extern var errno: int`.
+    ExternVarDecl(name: string, typ: TypeRef, link: Option[string], vis: Visibility)
+
+    StructDecl(decl: StructDecl)
+    EnumDecl(decl: EnumDecl)
+    TraitDecl(decl: TraitDecl)
+    ImplDecl(decl: ImplDecl)
+
+    // `type Name = Base`, and the constrained forms that add a range or a predicate.
+    TypeDecl(decl: TypeDecl)
+
+    // A statement that would not parse.
+    //
+    // **Recovery keeps the shape and drops the line**, so a file with one bad statement still hands
+    // an editor the ones around it. Nothing that compiles holds one.
+    Bad
+end StmtKind
+
+// One name taken out of an import: `c`, or `c as d`.
+struct ImportSelector
+    span: Span
+    name: string
+    alias: Option[string]
+end ImportSelector
+
+// The whole of an import.
+struct ImportDecl
+    // The dotted module path, split.
+    path: Buf[string]
+
+    // The names taken out of it in braces, empty where none were.
+    selectors: Buf[ImportSelector]
+
+    // Whether it ended in `.*`.
+    wildcard: bool
+
+    // The name the module itself is bound under, where `as` renamed it.
+    alias: Option[string]
+end ImportDecl
+
+// One constant whose value comes from C.
+struct CConstDecl
+    span: Span
+    name: string
+    typ: TypeRef
+    c: string
+    vis: Visibility
+end CConstDecl
+
+// One type whose layout comes from C.
+struct CTypeDecl
+    span: Span
+    name: string
+    c: string
+    vis: Visibility
+end CTypeDecl
+
+// One architecture's arm of an `asm` statement.
+struct AsmArm
+    span: Span
+    archs: Buf[string]
+    body: AsmBody
+end AsmArm
+
+// What an `asm` arm holds: instructions, or a reason there are none for this architecture.
+enum AsmBody
+    AsmCode(lines: Buf[string], operands: Buf[AsmOperand], clobbers: Buf[string])
+    AsmUnavailable(reason: string)
+end AsmBody
+
+// Which way an operand travels.
+enum AsmDir
+    In
+    Out
+end AsmDir
+
+// One `in`/`out` operand of an inline-assembly block.
+struct AsmOperand
+    span: Span
+    dir: AsmDir
+    name: string
+    reg: Option[string]
+end AsmOperand
+
+// One line of an `asm` block as it was read, before the three kinds are separated.
+enum AsmItem
+    Line(text: string)
+    Operand(operand: AsmOperand)
+    Clobber(regs: Buf[string])
+end AsmItem
+
+// How a method takes its receiver.
+enum RecvMode
+    // `self`
+    ByValue
+
+    // `*self`
+    ByPtr
+
+    // `&self`, `&sync self`
+    ByRef(sync: bool)
+end RecvMode
+
+// A method of a struct, an enum, a trait or an `impl` block.
+struct MethodDecl
+    span: Span
+    name: string
+    receiver: Option[RecvMode]
+    is_property: bool
+    tparams: Buf[string]
+    params: Buf[Param]
+    ret_type: Option[TypeRef]
+    body: Buf[Stmt]
+    bounds: Buf[NamedBounds]
+    tdefaults: Buf[TypeBinding]
+    vis: Visibility
+    variadic: bool
+    overrides: bool
+    tvalues: Buf[TypeBinding]
+    tpacks: Buf[string]
+    crossing: Buf[string]
+    reads: Option[Buf[string]]
+    writes: Option[Buf[string]]
+    borrows: Buf[string]
+    is_static: bool
+
+    // A property with no written receiver takes one by value, which is what makes `x.area` reach a
+    // method the way a field reads.
+    recv_mode(self) -> Option[RecvMode] = self.receiver match
+        Some(m) -> Some(m)
+        None -> if self.is_property && !self.is_static then Some(ByValue) else None
+
+    is_associated(self) -> bool = self.recv_mode().is_none()
+end MethodDecl
+
+// `@convention(c)` -- how a function is called.
+struct CallConv
+    span: Span
+    name: string
+    arg: Option[string]
+end CallConv
+
+// A function declaration.
+struct FuncDecl
+    name: string
+    tparams: Buf[string]
+    params: Buf[Param]
+    ret_type: Option[TypeRef]
+    body: Buf[Stmt]
+    bounds: Buf[NamedBounds]
+    variadic: bool
+    vis: Visibility
+    tdefaults: Buf[TypeBinding]
+    tvalues: Buf[TypeBinding]
+    tpacks: Buf[string]
+    test: Option[TestAttr]
+    hook: Option[HookAttr]
+    conv: Option[CallConv]
+    tailrec: bool
+    pure: bool
+    ghost: bool
+    reads: Option[Buf[string]]
+    writes: Option[Buf[string]]
+    exported: Option[ExportAttr]
+    section: Option[string]
+    crossing: Buf[string]
+    needs: Buf[string]
+end FuncDecl
+
+// `@export` -- the symbol a function is visible under from C.
+struct ExportAttr
+    span: Span
+    symbol: Option[string]
+end ExportAttr
+
+// `@test`, with the name a report shows and what the run is expected to do.
+struct TestAttr
+    span: Span
+    display: Option[string]
+    should_trap: bool
+    expected: Option[string]
+end TestAttr
+
+// Which of the four test hooks an attribute names.
+enum HookKind
+    Setup
+    Teardown
+    SetupAll
+    TeardownAll
+end HookKind
+
+// The word each hook is written as.
+hook_word(k: HookKind) -> string = k match
+    Setup -> "setup"
+    Teardown -> "teardown"
+    SetupAll -> "setup_all"
+    TeardownAll -> "teardown_all"
+
+struct HookAttr
+    span: Span
+    kind: HookKind
+end HookAttr
+
+// An attribute as written, before it is folded into the declaration under it.
+enum Attr
+    Test(attr: TestAttr)
+    Hook(attr: HookAttr)
+    TailRec
+    Pure
+    Ghost
+    Reads(names: Buf[string])
+    Writes(names: Buf[string])
+    Packed
+    Align(bound: Expr)
+    Export(attr: ExportAttr)
+    Section(name: string)
+    Crossing(names: Buf[string])
+    Borrows(names: Buf[string])
+    Needs(caps: Buf[string])
+end Attr
+
+// The word an attribute is written as, which is what a complaint about it names.
+attr_word(a: Attr) -> string = a match
+    Test(_) -> "test"
+    Hook(h) -> hook_word(h.kind)
+    TailRec -> "tailrec"
+    Pure -> "pure"
+    Ghost -> "ghost"
+    Reads(_) -> "reads"
+    Writes(_) -> "writes"
+    Packed -> "packed"
+    Align(_) -> "align"
+    Export(_) -> "export"
+    Section(_) -> "section"
+    Crossing(_) -> "crossing"
+    Borrows(_) -> "borrows"
+    Needs(_) -> "needs"
+
+// A foreign function's declaration.
+struct ExternDecl
+    name: string
+    params: Buf[Param]
+    ret_type: Option[TypeRef]
+    variadic: bool
+    link: Option[string]
+    vis: Visibility
+    needs: Buf[string]
+end ExternDecl
+
+// A struct declaration: its fields, the methods written under it, and what the attributes said.
+struct StructDecl
+    name: string
+    tparams: Buf[string]
+    fields: Buf[Param]
+    members: Buf[MethodDecl]
+    bounds: Buf[NamedBounds]
+    invariants: Buf[Expr]
+    vis: Visibility
+    tdefaults: Buf[TypeBinding]
+    opaque: bool
+    tvalues: Buf[TypeBinding]
+    packed: bool
+    alignment: Option[Expr]
+    cname: Option[ExportAttr]
+    deriving: Buf[BoundRef]
+end StructDecl
+
+// One variant of an enum: its name, the value it pins where the enum has an underlying integer, and
+// the fields it carries where it is a sum.
+struct EnumVariantDecl
+    span: Span
+    name: string
+    value: Option[Expr]
+    fields: Buf[Param]
+end EnumVariantDecl
+
+struct EnumDecl
+    name: string
+    tparams: Buf[string]
+    underlying: Option[TypeRef]
+    variants: Buf[EnumVariantDecl]
+    members: Buf[MethodDecl]
+    bounds: Buf[NamedBounds]
+    vis: Visibility
+    tdefaults: Buf[TypeBinding]
+    tvalues: Buf[TypeBinding]
+    deriving: Buf[BoundRef]
+end EnumDecl
+
+// `new 1..100` on a constrained type -- the range its values must lie in.
+struct RangeBound
+    span: Span
+    lo: Expr
+    hi: Expr
+    exclusive_hi: bool
+end RangeBound
+
+// `type Name = Base`, and the constrained forms. `derived` is the `new` that makes the name a type
+// of its own rather than another spelling of its base.
+struct TypeDecl
+    name: string
+    base: TypeRef
+    derived: bool
+    range: Option[RangeBound]
+    pred: Option[Expr]
+    vis: Visibility
+    from_c: bool
+end TypeDecl
+
+// One associated type a trait requires: `type Item: Display`.
+struct AssocDecl
+    span: Span
+    name: string
+    bounds: Buf[BoundRef]
+end AssocDecl
+
+// One associated type an `impl` block supplies: `type Item = int`.
+struct AssocBind
+    span: Span
+    name: string
+    typ: TypeRef
+end AssocBind
+
+struct TraitDecl
+    name: string
+    tparams: Buf[string]
+    methods: Buf[MethodDecl]
+    bounds: Buf[NamedBounds]
+    supers: Buf[BoundRef]
+    vis: Visibility
+    tdefaults: Buf[TypeBinding]
+    assocs: Buf[AssocDecl]
+end TraitDecl
+
+struct ImplDecl
+    trait_name: string
+    for_type: TypeRef
+    methods: Buf[MethodDecl]
+    tparams: Buf[string]
+    bounds: Buf[NamedBounds]
+    trait_args: Buf[TypeRef]
+    tdefaults: Buf[TypeBinding]
+    overrides: bool
+    tvalues: Buf[TypeBinding]
+    tpacks: Buf[string]
+    assocs: Buf[AssocBind]
+end ImplDecl
+
+stmt(span: Span, kind: StmtKind) -> Stmt = Stmt(span, kind)

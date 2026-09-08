@@ -1,0 +1,86 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a file is, and the clauses its header may carry.
+//
+// Nothing here is a node: a `Program` is not a statement, and a header clause is not one either.
+// They are the file's own shape, which is why they sit apart from the four trees.
+
+// `module a.b.c`, split at the dots.
+struct ModuleName
+    span: Span
+    parts: Buf[string]
+
+    show(self) -> string
+        var out = ""
+
+        for i in 0..<self.parts.len()
+            if i > 0 then out = out + "."
+
+            out = out + self.parts.at(i)
+
+        out
+    end show
+end ModuleName
+
+// Which way a capability clause runs.
+enum CapabilityDirection
+    // `@narrows(os)` -- this module gives up a capability its importer has.
+    Narrows
+
+    // `@requires(os)` -- this module asks for one.
+    Requires
+end CapabilityDirection
+
+// `@narrows(x)` / `@requires(x)`.
+struct CapabilityClause
+    span: Span
+    direction: CapabilityDirection
+    name: string
+end CapabilityClause
+
+// `@link("m")` -- a library the program must be linked against.
+struct LinkClause
+    span: Span
+    name: string
+end LinkClause
+
+// `@include("stdio.h")` -- a C header a foreign declaration was read from.
+struct IncludeClause
+    span: Span
+    header: string
+end IncludeClause
+
+// `@tests` -- the file is compiled only when tests are being run.
+struct TestsClause
+    span: Span
+end TestsClause
+
+// One clause of a file's header.
+//
+// **An enum rather than a union of the four**, since sysl has no untagged union: what a caller
+// wants of one is to sort it into the list it belongs in, and a match does that in one place.
+enum HeaderClause
+    Capability(clause: CapabilityClause)
+    Link(clause: LinkClause)
+    Include(clause: IncludeClause)
+    Tests(clause: TestsClause)
+end HeaderClause
+
+// A whole file, read.
+struct Program
+    body: Buf[Stmt]
+    // The module the file declares, where it declared one. Spelled `module_name` because `module`
+    // is a reserved word and may not name a field.
+    module_name: Option[ModuleName]
+    capabilities: Buf[CapabilityClause]
+    links: Buf[LinkClause]
+    src: Source
+    test_only: bool
+    includes: Buf[IncludeClause]
+
+    // Each `/** ... */` comment the file carried, in source order, with its own extent.
+    docs: Buf[Spanned[string]]
+end Program

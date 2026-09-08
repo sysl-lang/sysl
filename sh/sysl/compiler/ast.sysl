@@ -1,0 +1,214 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The tree the parser builds and the analyzer reads.
+//
+// **The tree is untyped**: the parser produces it structurally, and what a name means is settled
+// afterwards. Every node carries the span it was found at, which is what lets a diagnostic quote the
+// line and point at the column.
+//
+// **The tree spans five files, and which node is in which is not a matter of taste.** `ExprKind`,
+// `StmtKind`, `PatKind` and `TypeKind` are each one enum, so each one's variants have to sit
+// together: this file holds expressions -- the loops and `match` among them, since those yield a
+// value -- while `ast_patterns.sysl`, `ast_types.sysl` and `ast_stmts.sysl` hold the other three.
+// `ast_file.sysl` holds what is not a node at all: `Program`, and the clauses a file's header
+// carries.
+//
+// **A node is a span and a kind rather than a variant carrying a span field**, which is the shape
+// `sh.sysl.parsing` was built around: the span is read without destructuring, and the recursion is
+// one type wide -- a child is an `Expr`, never a reference to one particular variant. The
+// `&ExprKind` is what gives the enum a size.
+
+// An expression, with where it was written.
+struct Expr
+    span: Span
+    kind: &ExprKind
+end Expr
+
+// What an expression is.
+enum ExprKind
+    // An integer literal, exactly as the lexer read it: the digits with the separators taken out,
+    // the base they were written in, and the suffix naming its type -- `""` where none was written.
+    //
+    // **The digits stay text, which is the lexer's decision followed rather than a second one.**
+    // sysl's integers are an open family and a literal may be wider than anything this compiler
+    // could hold it in; the analyzer knows the width the literal is going to and this does not.
+    IntLit(digits: string, base: int, suffix: string)
+
+    // A floating-point literal, kept as text so no precision is lost before the width is known.
+    FloatLit(text: string, suffix: string)
+
+    // `'a'` -- one Unicode scalar value.
+    CharLit(codepoint: char)
+
+    // `"hi"` -- a string literal, decoded.
+    StrLit(value: string)
+
+    // `c"hi"` -- a NUL-terminated C string, of type `*u8`.
+    CStrLit(value: string)
+
+    BoolLit(value: bool)
+
+    // `()` -- the sole value of `unit`.
+    UnitLit
+
+    // `null` -- the absent raw pointer, which takes the `*T` its context expects.
+    NullLit
+
+    // A name being read.
+    Ident(name: string)
+
+    // A prefix operator: `-x`, `!b`, `~n`, `*p`, `&x`.
+    Unary(op: string, operand: Expr)
+
+    PreIncDec(op: string, operand: Expr)
+    PostIncDec(op: string, operand: Expr)
+
+    Binary(op: string, left: Expr, right: Expr)
+
+    // A comparison chain: `a < b < c` holds three operands and two operators, and means
+    // `a < b && b < c` with `b` evaluated once. A single comparison is the two-operand case.
+    Compare(operands: Buf[Expr], ops: Buf[string])
+
+    // `a..b` (inclusive) / `a..<b` (exclusive), with either end optionally open.
+    RangeExpr(lo: Option[Expr], hi: Option[Expr], inclusive: bool)
+
+    // Assignment as an expression (`=` and the compound forms), right-associative.
+    Assign(op: string, target: Expr, value: Expr)
+
+    Call(callee: Expr, args: Buf[Expr])
+
+    // `name = value` at a call -- the argument stands at the parameter it names. It is an expression
+    // so that it travels in `Call.args` beside the positional arguments it is mixed with.
+    NamedArg(name: string, value: Expr)
+
+    // `xs...` in an argument list -- the one argument that is already the slice a `...T` parameter
+    // collects.
+    Spread(value: Expr)
+
+    // A parameter's default, spliced in at a call that left the argument out. Synthesized, never
+    // parsed. `owner` is the declaration the default was written in, absent for a nested function.
+    DefaultArg(owner: Option[string], value: Expr)
+
+    Index(receiver: Expr, index: Expr)
+    Field(receiver: Expr, name: string)
+
+    // `f[A, B]` -- brackets holding *more than one* thing, which is never a subscript. The
+    // single-argument form has no comma to tell it from an index and arrives as an `Index`, which
+    // the analyzer re-reads where the name is a generic function.
+    TypeArgs(receiver: Expr, args: Buf[Expr])
+
+    // `T::Attr` -- metadata a type exposes under a name, with `::` rather than `.` because it
+    // belongs to the type itself and not to a value of it.
+    TypeAttr(receiver: Expr, attr: string)
+
+    // `base with { bg = ACCENT }` -- the value `base` again, with the fields named here changed.
+    WithExpr(base: Expr, fields: Buf[WithField])
+
+    // `.red`, `.Circle(3)` -- a member of the type the context expects, with the name left off.
+    ImplicitMember(name: string)
+
+    // `sizeof(T)` / `alignof(T)`. The operand is a **type**, which is why this is a node of its own
+    // rather than a call the analyzer recognises by name.
+    LayoutOf(op: string, typ: TypeRef)
+
+    // `offsetof(T, field)` -- where a field starts inside the struct it is written in.
+    OffsetOf(typ: TypeRef, field: string)
+
+    // The postfix `?` error-propagation operator.
+    TryExpr(inner: Expr)
+
+    Tuple(elements: Buf[Expr])
+
+    // `x -> x + 1`. The body is a statement list for the reason a function's is: an indented block's
+    // trailing expression is its value, and the `= expr` short form is that list with one statement
+    // in it.
+    //
+    // `implicit_params` is set on the one closure a program does not write the parameters of -- the
+    // `BlockArg` a trailing block becomes at a callable parameter, whose single parameter is `it`.
+    Lambda(params: Buf[LambdaParam], body: Buf[Stmt], implicit_params: bool)
+
+    // The indented block a call may write after a `:`, standing at one of its parameters. It is
+    // **neutral about what it is**: argument binding turns it into an `ArrayLit` of the block's
+    // lines or a `Lambda` over them, and nothing downstream ever sees one.
+    BlockArg(body: Buf[Stmt])
+
+    // `[a, b, c]` -- an array literal, whose length is how many elements were written.
+    ArrayLit(elements: Buf[Expr])
+
+    // `[v; n]` -- `n` copies of one value.
+    ArrayFill(value: Expr, count: Expr)
+
+    // An indented block standing where a value is wanted -- the block a binding's `=` introduces.
+    // **A block of one expression is that expression**, collapsed by the parser rather than
+    // represented.
+    Block(stmts: Buf[Stmt])
+
+    // `if cond then a else b` as an expression: it yields the value of the taken branch.
+    IfExpr(cond: Expr, then_body: Buf[Stmt], else_body: Option[Buf[Stmt]])
+
+    // `scrutinee match` with indented arms, yielding the taken arm's value.
+    MatchExpr(scrutinee: Expr, arms: Buf[MatchArm])
+
+    // `subject is Pat` / `subject is not Pat` -- a pattern tested where a condition is wanted.
+    IsPattern(subject: Expr, patterns: Buf[Pattern], negated: bool)
+
+    // `a, b` where a function's own result list is what is being produced.
+    ResultList(values: Buf[Expr])
+
+    // `['label] while cond body [else elseBody]` as an expression.
+    While(label: Option[string], cond: Expr, body: Buf[Stmt], else_body: Option[Buf[Stmt]])
+
+    // `['label] do body while cond [else elseBody]` -- the post-test loop.
+    DoWhile(label: Option[string], body: Buf[Stmt], cond: Expr, else_body: Option[Buf[Stmt]])
+
+    // `['label] loop body` -- a loop with no condition, whose type is `never`.
+    Loop(label: Option[string], body: Buf[Stmt])
+
+    // `['label] for name in iter body [else elseBody]`.
+    For(label: Option[string], name: string, iter: Expr, body: Buf[Stmt], else_body: Option[Buf[Stmt]])
+
+    // `for const name in iter body` -- the loop the compiler unrolls, whose copies are type-checked
+    // separately. It carries no label and no `else`: there is no loop at run time to leave.
+    ConstFor(name: string, iter: Expr, body: Buf[Stmt])
+
+    // `['label] for init; cond; step` -- the three-clause loop, written without parentheses.
+    CFor(label: Option[string], init: Option[Stmt], cond: Option[Expr], step: Option[Stmt],
+         body: Buf[Stmt], else_body: Option[Buf[Stmt]])
+
+    // `for all i in 0..<n do P(i)` / `for some ...` -- a quantifier over an integer range.
+    Quantifier(universal: bool, name: string, iter: Expr, pred: Expr)
+
+    // A node meaning *something was wrong here*.
+    //
+    // **It is what keeps the tree shaped when a parse fails**, which is the thing a recovering
+    // parser has to have: a rule that could not read its operand hands one of these back, the loop
+    // above it goes on, and one pass reports every mistake. Nothing that compiles ever holds one --
+    // a file carrying a `Bad` is a file with a diagnostic against it.
+    Bad
+end ExprKind
+
+// How many copies one `for const` may be unrolled into.
+//
+// A bound rather than no bound, because the cost is in the emitted program and not in a number a
+// reader can see: `for const i in 0..<100000` is one line and a hundred thousand copies.
+const MaxConstForCopies: usize = 64
+
+// One field of a `with` clause: `bg = ACCENT`. The span is the **name**, so a field the struct does
+// not have is complained about where it was written rather than at the `with`.
+struct WithField
+    span: Span
+    name: string
+    value: Expr
+end WithField
+
+// One of a closure literal's parameters. Its type is written only where nothing else can supply one.
+struct LambdaParam
+    span: Span
+    name: string
+    typ: Option[TypeRef]
+end LambdaParam
+
+expr(span: Span, kind: ExprKind) -> Expr = Expr(span, kind)
