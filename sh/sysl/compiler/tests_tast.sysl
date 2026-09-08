@@ -1,0 +1,158 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// The typed tree: that a node's type is the one the reference compiler's `def ty` gives it, and
+// that the two questions asked of every expression -- what storage it names, and whether it names
+// any -- answer the way that compiler answers them.
+
+private nowhere() -> Span = Span(0, 0)
+
+private e(k: TExprKind) -> TExpr = TExpr(nowhere(), k)
+
+private a_struct(fields: Buf[(string, Type)]) -> &StructType =
+    StructType("S", buf(), fields, false, None, None)
+
+private one_field(name: string, t: Type) -> Buf[(string, Type)]
+    var fs: Buf[(string, Type)] = buf()
+
+    fs.push((name, t))
+    fs
+end one_field
+
+@test("a literal's type is the literal's, and the three that have only one do not carry it")
+a_literals_type()
+    assert(type_eq(texpr_type(e(TIntLit(from_int(1), byte_type()))), byte_type()))
+    assert(type_eq(texpr_type(e(TFloatLit(0, Floating(32)))), Floating(32)))
+    assert(type_eq(texpr_type(e(TStrLit("hi"))), Str))
+    assert(type_eq(texpr_type(e(TBoolLit(true))), Bool))
+    assert(type_eq(texpr_type(e(TUnitLit)), Unit))
+    assert(type_eq(texpr_type(e(TNullLit(Ptr(byte_type())))), Ptr(byte_type())))
+
+@test("a node whose type is fixed by what it is does not carry one")
+a_fixed_type_is_not_carried()
+    val x = e(TLoad("x", Str))
+
+    assert(type_eq(texpr_type(e(TBytes(x))), Slice(byte_type(), true)))
+    assert(type_eq(texpr_type(e(TCStrLit("hi"))), Ptr(byte_type())))
+    assert(type_eq(texpr_type(e(TVaPass(x))), Ptr(VaList)))
+    assert(type_eq(texpr_type(e(TStr(x))), Str))
+    assert(type_eq(texpr_type(e(TFromBytes(x))), Str))
+    assert(type_eq(texpr_type(e(TFormat(x, ""))), Str))
+    assert(type_eq(texpr_type(e(TLogical("&&", x, x))), Bool))
+    assert(type_eq(texpr_type(e(TCompare(buf(), buf()))), Bool))
+    assert(type_eq(texpr_type(e(TSeq(buf()))), Unit))
+    assert(type_eq(texpr_type(e(TFence("seq_cst"))), Unit))
+    assert(type_eq(texpr_type(e(TVaStart(x))), Unit))
+    assert(type_eq(texpr_type(e(TVaEnd(x))), Unit))
+    assert(type_eq(texpr_type(e(TVaCopy(x, x))), Unit))
+    assert(type_eq(texpr_type(e(TVecStore(x, x, x))), Unit))
+
+@test("and one whose type is another node's reads it off that node")
+a_derived_type_is_read_off_its_operand()
+    val slice = e(TLoad("xs", Slice(byte_type(), false)))
+    val body = TBlock(buf(), None, Char)
+
+    assert(type_eq(texpr_type(e(TConstView(slice))), Slice(byte_type(), true)))
+    assert(type_eq(texpr_type(e(TBlockExpr(body))), Char))
+    assert(type_eq(texpr_type(e(TRecheck(slice, slice, a_struct(buf()), "inv"))),
+                   Slice(byte_type(), false)))
+    assert(type_eq(texpr_type(e(TCheckedLoop("v", int_type(), e(TLoop(buf(), Unit))))), Unit))
+
+@test("a struct built from its fields is that struct")
+a_struct_new_is_the_struct()
+    val d = a_struct(one_field("x", int_type()))
+
+    assert(type_eq(texpr_type(e(TStructNew(d, buf()))), Struct(d)))
+    assert(type_eq(texpr_type(e(TStructInvCheck(e(TUnitLit), d, "inv"))), Struct(d)))
+
+@test("a place is a local, module storage, a dereference or an index")
+what_is_a_place()
+    val local = e(TLoad("x", int_type()))
+    val global = e(TGlobal("m$g", int_type(), true))
+    val through = e(TDeref(e(TLoad("p", Ptr(int_type()))), int_type()))
+    val at = e(TIndex(e(TCall("mk", buf(), Array(3, int_type()), false)), local, int_type()))
+
+    assert(is_place(local))
+    assert(is_place(global))
+    assert(is_place(through))
+    assert(is_place(at))
+
+@test("and a computed value is not, however it was reached")
+what_is_not_a_place()
+    val call = e(TCall("f", buf(), int_type(), false))
+
+    assert(!is_place(call))
+    assert(!is_place(e(TIntLit(from_int(1), int_type()))))
+    assert(!is_place(e(TBinary("+", call, call, int_type()))))
+
+@test("a field is a place only where its receiver is one")
+a_field_is_a_place_only_where_its_receiver_is()
+    val d = a_struct(one_field("x", int_type()))
+    val named = e(TLoad("p", Struct(d)))
+    val computed = e(TCall("mk", buf(), Struct(d), false))
+
+    assert(is_place(e(TField(named, 0, int_type()))))
+    assert(!is_place(e(TField(computed, 0, int_type()))))
+
+@test("the storage a node names keeps the qualifier the value read out of it dropped")
+place_type_keeps_the_qualifier()
+    val volatile_u32 = Volatile(Integer(32, false, false))
+    val through = e(TDeref(e(TLoad("p", Ptr(volatile_u32))), Integer(32, false, false)))
+    val d = a_struct(one_field("status", volatile_u32))
+    val field = e(TField(e(TLoad("regs", Struct(d))), 0, Integer(32, false, false)))
+    val arr = e(TLoad("xs", Array(3, volatile_u32)))
+    val at = e(TIndex(arr, e(TIntLit(from_int(0), usize_type(64))), Integer(32, false, false)))
+
+    assert(type_eq(texpr_type(through), Integer(32, false, false)))
+    assert(type_eq(place_type(through), volatile_u32))
+    assert(type_eq(place_type(field), volatile_u32))
+    assert(type_eq(place_type(at), volatile_u32))
+
+@test("and a node that names no storage answers with the type of its value")
+place_type_of_a_value_is_its_type()
+    val call = e(TCall("f", buf(), int_type(), false))
+
+    assert(type_eq(place_type(call), int_type()))
+
+@test("a field of something that is not a struct falls back to the type the node carries")
+place_type_falls_back()
+    val odd = e(TField(e(TLoad("x", int_type())), 0, Bool))
+
+    assert(type_eq(place_type(odd), Bool))
+
+@test("a pattern knows the type it matches against")
+a_pattern_knows_its_type()
+    val lit = TLitPattern(e(TIntLit(from_int(1), byte_type())))
+    val d = a_struct(one_field("x", int_type()))
+
+    assert(type_eq(tpattern_type(TWildPattern(Bool)), Bool))
+    assert(type_eq(tpattern_type(TBindPattern("x", Char)), Char))
+    assert(type_eq(tpattern_type(TAtPattern("whole", TWildPattern(Str))), Str))
+    assert(type_eq(tpattern_type(lit), byte_type()))
+    assert(type_eq(tpattern_type(TStructPattern(d, buf())), Struct(d)))
+
+@test("and a range pattern takes its type from the bound it starts at")
+a_range_pattern_takes_its_type_from_its_low_bound()
+    val lo = e(TIntLit(from_int(0), byte_type()))
+    val hi = e(TIntLit(from_int(9), byte_type()))
+
+    assert(type_eq(tpattern_type(TRangePattern(lo, hi, false)), byte_type()))
+
+@test("the hooks a module declared are taken by their kind, and a test with none carries none")
+hooks_are_taken_by_kind()
+    var hs: Buf[THook] = buf()
+
+    hs.push(THook(Teardown, "after", "f.sysl", 3))
+    hs.push(THook(Setup, "before", "f.sysl", 1))
+
+    val hooks = hooks_of(hs)
+
+    assert_eq(hooks.setup.unwrap().func, "before")
+    assert_eq(hooks.teardown.unwrap().func, "after")
+    assert(hooks.setup_all.is_none())
+    assert_eq(hooks.all().len(), 2)
+    assert_eq(no_hooks().all().len(), 0)

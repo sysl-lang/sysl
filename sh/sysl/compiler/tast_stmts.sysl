@@ -1,0 +1,293 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.BigInt
+
+// The typed statements, and every declaration a lowered program is made of.
+//
+// **A statement is not an expression here even where the source let it be one.** The analyzer has
+// already decided which of the two a form was written as, so a `while` that yields nothing is a
+// `TExprStmt` over a `TWhile` and the emitter never has to ask.
+
+// A statement.
+enum TStmt
+    // A local, its slot and what it starts at. `align` is what an attribute asked for.
+    TVarDecl(name: string, ty: Type, init: TExpr, align: Option[usize])
+
+    // An expression evaluated for its effects.
+    TExprStmt(expr: TExpr)
+
+    // A condition a run is required to hold at this point, and what to say when it does not.
+    TInvariant(cond: TExpr, msg: Option[string])
+
+    // A loop's decreasing measure, read into its slot so the next turn can be compared against it.
+    TVariantCheck(slot: string, var_ty: Type, expr: TExpr)
+
+    // A name bound to a place rather than to a copy of what is in it.
+    TRefDecl(name: string, ty: Type, place: TExpr)
+
+    // One place written from one value, with everything the write owes.
+    TWriteStmt(write: TWrite)
+
+    // `a, b = b, a` -- several places written from several values.
+    //
+    // The order of events is the whole content of the form, and it is phases rather than one write
+    // at a time: every place's own subexpressions are computed first and once, then everything the
+    // statement reads is read, and only then does anything land.
+    TMultiAssign(writes: Buf[TWrite])
+
+    TReturn(value: Option[TExpr])
+
+    // A call that replaces this frame rather than nesting inside it.
+    TBecome(call: TExpr)
+
+    TBreak(value: Option[TExpr], depth: int)
+    TContinue(depth: int)
+
+    // Statements held back until the frame leaves, in the reverse of the order they were written.
+    TDefer(stmts: Buf[TStmt])
+
+    // Inline assembly: the template, the operands bound to locals, and what it clobbers.
+    TAsm(lines: Buf[string], operands: Buf[TAsmOperand], clobbers: Buf[string])
+end TStmt
+
+// One place written from one value.
+//
+// `check` is the invariant re-check a write through a struct's receiver owes, as the function that
+// states it and the struct it belongs to. `constraint` is a compound arm's counterpart of
+// `TUpdate.check`: a plain arm's value carries its own check, having been analyzed against the
+// place's type, while a compound arm computes one here and so is checked here.
+struct TWrite
+    place: TExpr
+    op: string
+    value: TExpr
+    dispatch: Option[TDispatch]
+    check: Buf[TInvCheck]
+    constraint: Option[Type]
+end TWrite
+
+// An invariant a write has to re-establish: the value it is checked against, the struct that states
+// it, and the function that does the checking.
+struct TInvCheck
+    value: TExpr
+    decl: &StructType
+    inv_fn: string
+end TInvCheck
+
+// An assembly operand bound to the local it names.
+//
+// `name` is what the template says and `slot` is the local's unique name -- the storage an `in` is
+// loaded from and an `out` is stored to. Both are kept because they are two different jobs: the
+// template is the text a person wrote, and the slot is where the value lives after a scope has
+// renamed it. `reg` is the machine register the operand must occupy, or nothing for any
+// general-purpose one.
+struct TAsmOperand
+    dir: AsmDir
+    name: string
+    slot: string
+    ty: Type
+    reg: Option[string]
+end TAsmOperand
+
+// A user function.
+//
+// Parameters carry their unique names, so the body reads and writes them uniformly.
+// `requires`/`ensures` are the contract clauses: each precondition is checked on entry, each
+// postcondition before every return, with a `TResult` in an `ensure` standing for what is returned.
+//
+// `internal` says every caller of this function is in the module that defines it, so its symbol
+// needs no external linkage. It is the only thing the emitted linkage depends on.
+struct TFunc
+    span: Span
+    name: string
+    params: Buf[(string, Type)]
+    ret_ty: Type
+    body: TBlock
+    variadic: bool
+    requires: Buf[TClause]
+    ensures: Buf[TClause]
+    olds: Buf[TExpr]
+    internal: bool
+    conv: Option[CallConv]
+    tailrec: bool
+    variant: Option[TExpr]
+    pure: bool
+    ghost: bool
+    reads: Option[Buf[string]]
+    writes: Option[Buf[string]]
+    exported: Option[string]
+    section: Option[string]
+end TFunc
+
+// One contract clause: the condition, and what a failure of it says.
+struct TClause
+    cond: TExpr
+    msg: Option[string]
+end TClause
+
+// A function this compilation calls and does not define, under the C convention.
+struct TExtern
+    name: string
+    symbol: string
+    params: Buf[Type]
+    ret_ty: Type
+    variadic: bool
+end TExtern
+
+// A variable this compilation reads or writes and does not define.
+struct TExternVar
+    symbol: string
+    ty: Type
+end TExternVar
+
+// A trait's table for one type: what each slot calls, and the identity a downcast tests against.
+struct TVtable
+    name: string
+    trait_name: string
+    for_type: Type
+    boxed: bool
+    slots: Buf[TVSlot]
+    type_id: BigInt
+end TVtable
+
+// One slot of a table: what it calls, how the receiver reaches it, and the signature a caller
+// through the table uses.
+struct TVSlot
+    target: string
+    recv: RecvMode
+    params: Buf[Type]
+    ret_ty: Type
+    borrows: Buf[(usize, string)]
+end TVSlot
+
+// Module storage: the symbol, what is in it, and whether it is filled at run time.
+struct TVal
+    symbol: string
+    ty: Type
+    init: Option[TExpr]
+    computed: bool
+    writable: bool
+    align: Option[usize]
+    section: Option[string]
+end TVal
+
+// What a program's entry point is, and how its arguments and its result are handled.
+struct TEntry
+    func: string
+    args_fn: Option[string]
+    result_fn: Option[string]
+    result_ty: Option[Type]
+end TEntry
+
+// A `@test` function: what it is called in a report, what the run is expected to do, and where it
+// was written.
+struct TTest
+    func: string
+    display: string
+    should_trap: bool
+    expected: Option[string]
+    file: string
+    line: int
+    hooks: THooks
+end TTest
+
+// One hook a module declared.
+struct THook
+    kind: HookKind
+    func: string
+    file: string
+    line: int
+end THook
+
+// The four hooks that bracket a test.
+struct THooks
+    setup: Option[THook]
+    teardown: Option[THook]
+    setup_all: Option[THook]
+    teardown_all: Option[THook]
+
+    all(self) -> Buf[THook]
+        var out: Buf[THook] = buf()
+
+        if self.setup.is_some() then out.push(self.setup.unwrap())
+        if self.teardown.is_some() then out.push(self.teardown.unwrap())
+        if self.setup_all.is_some() then out.push(self.setup_all.unwrap())
+        if self.teardown_all.is_some() then out.push(self.teardown_all.unwrap())
+
+        out
+    end all
+end THooks
+
+// The hooks a list of them comes to, each taken by its kind.
+hooks_of(hooks: Buf[THook]) -> THooks =
+    THooks(hook_by(hooks, Setup), hook_by(hooks, Teardown), hook_by(hooks, SetupAll),
+           hook_by(hooks, TeardownAll))
+
+// No hooks at all, which is what a test with none carries.
+no_hooks() -> THooks = THooks(None, None, None, None)
+
+private hook_by(hooks: Buf[THook], kind: HookKind) -> Option[THook]
+    for i in 0..<hooks.len()
+        if hooks.at(i).kind == kind then return Some(hooks.at(i))
+
+    None
+end hook_by
+
+// A whole lowered program.
+struct TProgram
+    structs: Buf[Type]
+    enums: Buf[Type]
+    vtables: Buf[TVtable]
+    externs: Buf[TExtern]
+    vals: Buf[TVal]
+    funcs: Buf[TFunc]
+    main: Buf[TStmt]
+    entry: Option[TEntry]
+
+    // Functions a library already compiled, which this module calls but must not define. They are
+    // named here rather than turned into externs, because an `extern` is declared under the C
+    // convention and these are sysl functions: the declaration has to be built from the signature
+    // the definition would have had.
+    precompiled: Buf[string]
+
+    // Whether this module carries the program's entry point. A library does not.
+    entry_point: bool
+
+    // Whether the artifact is one a C project links, which is a second question rather than
+    // `entry_point` read backwards: two kinds of build have no entry point and they answer
+    // differently about who fills the module storage.
+    c_artifact: bool
+
+    // The modules that declared `no alloc`, and the same for what each module's tests may do. They
+    // are two lists because a `@tests` file may take the allocator back.
+    no_alloc_modules: Buf[string]
+    no_alloc_test_modules: Buf[string]
+
+    // The module whose terms the statements in `main` were written in.
+    main_module: string
+
+    // The `@test` functions the sources declared, in the order they were written, and every hook
+    // across every module. The hooks are carried flat as well as grouped, because a module may
+    // declare a hook and no tests.
+    tests: Buf[TTest]
+    hooks: Buf[THook]
+
+    // The `extern` variables the program reads or writes, declared beside the storage rather than
+    // up with the `extern` functions, because a named aggregate has to be defined before anything
+    // names it.
+    extern_vars: Buf[TExternVar]
+
+    // Everything declared in a file that said `@tests` -- the scaffolding a module's tests are
+    // written against, as keys, because it is asked of several lists at once.
+    test_only: Buf[string]
+
+    // The destructor each type that has one is filed under.
+    destructors: Buf[(string, string)]
+
+    // What the analysis warned about, which is not a reason to stop.
+    warnings: Buf[Diagnostic]
+
+    // Which modules each module reached, which is what an unused-import warning is read out of.
+    module_deps: Buf[(string, Buf[string])]
+end TProgram

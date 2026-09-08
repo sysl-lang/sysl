@@ -1,0 +1,417 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.BigInt
+
+// The *typed* tree: what the analyzer turns `ast.sysl`'s structural tree into.
+//
+// **Every node here has already been checked.** A name is resolved to the one binding it means, a
+// type is a `Type` rather than something written, and every rule that could fail -- an unknown name,
+// a mismatch, a wrong arity -- has been applied. What comes after is a straight lowering: the
+// emitter selects instructions from the types it is handed and makes no decision of its own.
+//
+// **A typed node keeps the span of the untyped one it came from**, so a pass that runs after the
+// analyzer and sees only this tree can still point at source.
+//
+// **Three files hold it**, the way the untyped tree is split and for the same reason -- one enum per
+// hierarchy: `TExprKind` here, `TPattern` in `tast_patterns.sysl`, and `TStmt` with every
+// declaration node in `tast_stmts.sysl`.
+//
+// **The type is asked of a node rather than stored beside it.** `texpr_type` mirrors the reference
+// compiler's `def ty` case by case: some nodes carry one, and the rest read it off what they are
+// made of, so a `TStrLit` is a `string` because it is one and not because a builder said so.
+
+// An expression, with where it was written.
+struct TExpr
+    span: Span
+    kind: &TExprKind
+end TExpr
+
+// What a typed expression is.
+enum TExprKind
+    // An integer, `char`, or simple-enum constant -- anything whose value is one whole number.
+    TIntLit(value: BigInt, ty: Type)
+
+    // A floating-point constant, held as the bits of its `double` value. A narrower type is reached
+    // by rounding that constant down to it, which costs nothing at run time.
+    TFloatLit(bits: long, ty: Type)
+
+    TStrLit(value: string)
+    TBoolLit(value: bool)
+    TUnitLit
+
+    // `null` at the pointer type its context fixed.
+    TNullLit(ty: Type)
+
+    // Puts a value on the heap, because a `&T` was expected where a `T` was written.
+    TBox(value: TExpr, ref_ty: Type)
+
+    // Weakens a reference, because a `weak T` was expected where a `&T` was written. The object's
+    // weak count goes up and its strong count does not.
+    TDowngrade(value: TExpr, weak_ty: Type)
+
+    // `w.get()` -- asks the box whether the object is still there, and takes a count if it is.
+    TUpgrade(value: TExpr, opt_ty: Type, some: EnumVariant, none: EnumVariant)
+
+    // The zero value of a type: what a declaration with no initializer starts at.
+    TZero(ty: Type)
+
+    // `[a, b, c]` -- an array value built from its elements.
+    TArrayLit(elems: Buf[TExpr], array_ty: Type)
+    TArrayFill(value: TExpr, array_ty: Type)
+
+    // `[a, b, c, d]` written where a `<4>T` was expected -- a vector built from its lanes. It is a
+    // node of its own and not an array literal with another type on it, because an array is built
+    // in a slot and filled through it while a vector is built by insertion and has no address.
+    TVectorLit(lanes: Buf[TExpr], vec_ty: Type)
+
+    // One value in every lane.
+    TSplat(value: TExpr, vec_ty: Type)
+
+    // One lane of a vector, by a number the analyzer has already checked.
+    TLane(receiver: TExpr, lane: int, ty: Type)
+
+    // A comparison of two vectors, lane for lane, yielding a mask.
+    TVecCompare(op: string, left: TExpr, right: TExpr, ty: Type)
+
+    // A lane-wise choice between two vectors, by a mask.
+    TSelect(mask: TExpr, when_true: TExpr, when_false: TExpr, ty: Type)
+
+    // Every lane of a vector folded into one value.
+    TReduce(op: string, receiver: TExpr, ty: Type)
+
+    // A vector read from, and written to, consecutive elements of something indexable.
+    TVecLoad(receiver: TExpr, index: TExpr, vec_ty: Type)
+    TVecStore(receiver: TExpr, index: TExpr, value: TExpr)
+
+    // A buffer built on the heap from its elements, or from one value repeated.
+    TBufLit(elems: Buf[TExpr], slice_ty: Type)
+    TBufFill(value: TExpr, count: TExpr, slice_ty: Type)
+
+    // An element of something indexable.
+    TIndex(receiver: TExpr, index: TExpr, ty: Type)
+
+    // How many elements something has.
+    TLen(receiver: TExpr, ty: Type)
+
+    // The bytes of a string, as a read-only view.
+    TBytes(receiver: TExpr)
+
+    // A view of part of something: `xs[lo..<hi]`.
+    TSlice(base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool, slice_ty: Type)
+
+    // A conversion the analyzer settled: a widening, a narrowing, a sign change, a float to an
+    // integer.
+    TCast(operand: TExpr, ty: Type)
+
+    // The three things a named subtype's constraint asks of a value.
+    TConstrainedCheck(value: TExpr, target: Type)
+    TConstrainedValid(value: TExpr, target: Type)
+    TConstrainedStep(value: TExpr, target: Type, up: bool, ty: Type)
+
+    // A local read, by the unique name a scope gave it.
+    TLoad(name: string, ty: Type)
+
+    // `result` inside an `ensure`, standing for what the function hands back.
+    TResult(ty: Type)
+
+    // `old(e)` inside an `ensure`, standing for what the expression was on entry.
+    TOld(index: int, ty: Type)
+
+    // Module storage, by the symbol it is filed under.
+    TGlobal(symbol: string, ty: Type, writable: bool)
+
+    // What a pointer or a reference points at.
+    TDeref(operand: TExpr, ty: Type)
+
+    // The identity of what an erased pointer points at, which is what a downcast tests.
+    TTypeId(receiver: TExpr, ty: Type)
+
+    // The address of a place.
+    TAddrOf(place: TExpr, ty: Type)
+
+    // The address of a value that has none, which is a slot made to hold it.
+    TTempAddr(value: TExpr, ty: Type)
+
+    // A place written from a value, as an expression, which is what an assignment inside one is.
+    TStore(place: TExpr, value: TExpr, ty: Type)
+
+    // A compound assignment: the place read, the operator applied, the result written back.
+    TUpdate(place: TExpr, op: string, value: TExpr, ty: Type, dispatch: Option[TDispatch],
+            check: Option[Type])
+
+    // `++` and `--`, before or after the place they move.
+    TIncDec(place: TExpr, op: string, pre: bool, ty: Type, check: Option[Type])
+
+    TBinary(op: string, left: TExpr, right: TExpr, ty: Type)
+    TUnary(op: string, operand: TExpr, ty: Type)
+
+    // The bit operations that are named rather than spelled: a rotate, a count, a reverse.
+    TIntOp(op: string, operand: TExpr, amount: Option[TExpr], width: Type, ty: Type)
+
+    // An atomic read, write or read-modify-write at an address, under a memory ordering.
+    TAtomic(op: string, addr: TExpr, ops: Buf[TExpr], ordering: string, at: Type, ty: Type)
+    TFence(ordering: string)
+
+    // `&&` and `||`, which do not evaluate their right operand unless they must.
+    TLogical(op: string, left: TExpr, right: TExpr)
+
+    // A chain of comparisons, each operand evaluated once.
+    TCompare(operands: Buf[TExpr], cmps: Buf[TCmp])
+
+    // Several expressions evaluated for their effects.
+    TSeq(exprs: Buf[TExpr])
+
+    // The string of a value, through whatever renders it.
+    TStr(arg: TExpr)
+
+    // A string from bytes that are known to be valid UTF-8.
+    TFromBytes(arg: TExpr)
+
+    // A writable view read as a read-only one.
+    TConstView(arg: TExpr)
+
+    // A value rendered under a format specification the analyzer has already parsed.
+    TFormat(arg: TExpr, spec: string)
+
+    // The same, through a method the type supplied.
+    TRender(value: TExpr, method: string, spec: TExpr, slot: Option[int])
+
+    // `c"hi"` -- a NUL-terminated constant.
+    TCStrLit(value: string)
+
+    // A call of a function this compilation knows by key.
+    TCall(name: string, args: Buf[TExpr], ty: Type, results: bool)
+
+    // The address of a function, and the entry point a caller of that address reaches.
+    TFuncAddr(name: string, entry: string, ty: Type)
+
+    // A call through a pointer, with the parameter types the pointer promised.
+    TCallPtr(callee: TExpr, args: Buf[TExpr], params: Buf[Type], ty: Type)
+
+    // A value put behind a trait's table, which is what makes a fat pointer.
+    TErase(operand: TExpr, vtable: string, ty: Type)
+
+    // A call through a table, by the slot the trait gave the member.
+    TVCall(receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type, results: bool)
+
+    // The four operations a C variadic walk is made of.
+    TVaStart(ap: TExpr)
+    TVaEnd(ap: TExpr)
+    TVaArg(ap: TExpr, ty: Type)
+    TVaCopy(dst: TExpr, src: TExpr)
+
+    // A walk handed on to another function, which takes it by address.
+    TVaPass(ap: TExpr)
+
+    // A struct built from its field values.
+    TStructNew(decl: &StructType, args: Buf[TExpr])
+
+    // The invariant a struct promises, checked against a value of it.
+    TStructInvCheck(value: TExpr, decl: &StructType, inv_fn: string)
+
+    // The same, checked again after something wrote through a receiver.
+    TRecheck(after: TExpr, recv: TExpr, decl: &StructType, inv_fn: string)
+
+    // An enum value built from a variant and what it carries.
+    TEnumNew(enum_ty: Type, variant: EnumVariant, args: Buf[TExpr])
+
+    // A simple enum read out of an integer, checked or unchecked.
+    TEnumFromInt(value: TExpr, en: Type)
+    TEnumTry(value: TExpr, en: Type, opt_ty: Type, some: EnumVariant, none: EnumVariant)
+
+    // What an enum's own attributes answer: how many variants it has, what one is called.
+    TEnumAttr(kind: string, en: Type, arg: TExpr, ty: Type)
+
+    // `?` -- the failure of a result handed straight back to this function's caller, widened
+    // through a conversion where the two error types differ.
+    TTry(operand: TExpr, ok_variant: EnumVariant, fail_variant: EnumVariant, ret_enum: Type,
+         ret_fail: EnumVariant, ty: Type, convert: Option[string])
+
+    // A field of a struct, by the index the declaration gave it.
+    TField(receiver: TExpr, index: int, ty: Type)
+
+    // The forms that yield a value and have a body.
+    TIf(cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TBlock], ty: Type)
+    TMatch(scrutinee: TExpr, arms: Buf[TArm], ty: Type)
+    TBlockExpr(block: TBlock)
+    TWhile(cond: Buf[TCondTerm], body: Buf[TStmt], else_block: Option[TBlock], ty: Type)
+    TDoWhile(body: Buf[TStmt], cond: TExpr, else_block: Option[TBlock], ty: Type)
+    TLoop(body: Buf[TStmt], ty: Type)
+    TFor(name: string, var_ty: Type, lo: TExpr, hi: TExpr, inclusive: bool, body: Buf[TStmt],
+         else_block: Option[TBlock], ty: Type)
+    TCFor(init: Buf[TStmt], cond: Option[TExpr], step: Buf[TStmt], body: Buf[TStmt],
+          else_block: Option[TBlock], ty: Type)
+    TForEach(name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt], else_block: Option[TBlock],
+             ty: Type)
+    TIterate(cursor: string, cursor_ty: Type, init: TExpr, next: TExpr, bind: TPattern,
+             body: Buf[TStmt], else_block: Option[TBlock], ty: Type)
+
+    // `forall`/`exists` over a range, which is a specification rather than a loop.
+    TQuantifier(universal: bool, name: string, var_ty: Type, lo: TExpr, hi: TExpr, inclusive: bool,
+                pred: TExpr)
+
+    // A loop whose decreasing measure is checked on every turn.
+    TCheckedLoop(slot: string, var_ty: Type, loop_expr: TExpr)
+end TExprKind
+
+// How a comparison or a compound assignment reaches an implementation: the function's key, and
+// whether the operands are swapped or the answer negated to get there.
+struct TDispatch
+    name: string
+    swap: bool
+    negate: bool
+end TDispatch
+
+// One link of a comparison chain: the operator, and how it is reached where it is not built in.
+struct TCmp
+    op: string
+    dispatch: Option[TDispatch]
+end TCmp
+
+// One term of a condition: a test, or a pattern the subject is matched against.
+enum TCondTerm
+    TCondTest(cond: TExpr)
+    TCondIs(subject: TExpr, patterns: Buf[TPattern], negated: bool)
+end TCondTerm
+
+// One arm of a `match`: the patterns it takes, the guard it is under, and what it does.
+struct TArm
+    patterns: Buf[TPattern]
+    guard: Option[TExpr]
+    body: TBlock
+end TArm
+
+// A block: what it does, what it yields, and the type of that.
+struct TBlock
+    stmts: Buf[TStmt]
+    result: Option[TExpr]
+    ty: Type
+end TBlock
+
+// -- what a node's type is -----------------------------------------------------------------------
+
+// The type of the value read out of the node.
+texpr_type(e: TExpr) -> Type = *e.kind match
+    TIntLit(_, ty) -> ty
+    TFloatLit(_, ty) -> ty
+    TStrLit(_) -> Str
+    TBoolLit(_) -> Bool
+    TUnitLit -> Unit
+    TNullLit(ty) -> ty
+    TBox(_, ref_ty) -> ref_ty
+    TDowngrade(_, weak_ty) -> weak_ty
+    TUpgrade(_, opt_ty, _, _) -> opt_ty
+    TZero(ty) -> ty
+    TArrayLit(_, array_ty) -> array_ty
+    TArrayFill(_, array_ty) -> array_ty
+    TVectorLit(_, vec_ty) -> vec_ty
+    TSplat(_, vec_ty) -> vec_ty
+    TLane(_, _, ty) -> ty
+    TVecCompare(_, _, _, ty) -> ty
+    TSelect(_, _, _, ty) -> ty
+    TReduce(_, _, ty) -> ty
+    TVecLoad(_, _, vec_ty) -> vec_ty
+    TVecStore(_, _, _) -> Unit
+    TBufLit(_, slice_ty) -> slice_ty
+    TBufFill(_, _, slice_ty) -> slice_ty
+    TIndex(_, _, ty) -> ty
+    TLen(_, ty) -> ty
+    TBytes(_) -> Slice(byte_type(), true)
+    TSlice(_, _, _, _, slice_ty) -> slice_ty
+    TCast(_, ty) -> ty
+    TConstrainedCheck(_, target) -> target
+    TConstrainedValid(_, _) -> Bool
+    TConstrainedStep(_, _, _, ty) -> ty
+    TLoad(_, ty) -> ty
+    TResult(ty) -> ty
+    TOld(_, ty) -> ty
+    TGlobal(_, ty, _) -> ty
+    TDeref(_, ty) -> ty
+    TTypeId(_, ty) -> ty
+    TAddrOf(_, ty) -> ty
+    TTempAddr(_, ty) -> ty
+    TStore(_, _, ty) -> ty
+    TUpdate(_, _, _, ty, _, _) -> ty
+    TIncDec(_, _, _, ty, _) -> ty
+    TBinary(_, _, _, ty) -> ty
+    TUnary(_, _, ty) -> ty
+    TIntOp(_, _, _, _, ty) -> ty
+    TAtomic(_, _, _, _, _, ty) -> ty
+    TFence(_) -> Unit
+    TLogical(_, _, _) -> Bool
+    TCompare(_, _) -> Bool
+    TSeq(_) -> Unit
+    TStr(_) -> Str
+    TFromBytes(_) -> Str
+    TConstView(arg) -> const_view(texpr_type(arg))
+    TFormat(_, _) -> Str
+    TRender(_, _, _, _) -> Str
+    TCStrLit(_) -> Ptr(byte_type())
+    TCall(_, _, ty, _) -> ty
+    TFuncAddr(_, _, ty) -> ty
+    TCallPtr(_, _, _, ty) -> ty
+    TErase(_, _, ty) -> ty
+    TVCall(_, _, _, ty, _) -> ty
+    TVaStart(_) -> Unit
+    TVaEnd(_) -> Unit
+    TVaArg(_, ty) -> ty
+    TVaCopy(_, _) -> Unit
+    TVaPass(_) -> Ptr(VaList)
+    TStructNew(decl, _) -> Struct(decl)
+    TStructInvCheck(_, decl, _) -> Struct(decl)
+    TRecheck(after, _, _, _) -> texpr_type(after)
+    TEnumNew(enum_ty, _, _) -> enum_ty
+    TEnumFromInt(_, en) -> en
+    TEnumTry(_, _, opt_ty, _, _) -> opt_ty
+    TEnumAttr(_, _, _, ty) -> ty
+    TTry(_, _, _, _, _, ty, _) -> ty
+    TField(_, _, ty) -> ty
+    TIf(_, _, _, ty) -> ty
+    TMatch(_, _, ty) -> ty
+    TBlockExpr(block) -> block.ty
+    TWhile(_, _, _, ty) -> ty
+    TDoWhile(_, _, _, ty) -> ty
+    TLoop(_, ty) -> ty
+    TFor(_, _, _, _, _, _, _, ty) -> ty
+    TCFor(_, _, _, _, _, ty) -> ty
+    TForEach(_, _, _, _, _, ty) -> ty
+    TIterate(_, _, _, _, _, _, _, ty) -> ty
+    TQuantifier(_, _, _, _, _, _, _) -> Bool
+    TCheckedLoop(_, _, loop_expr) -> texpr_type(loop_expr)
+
+// The type of the **storage** the node names, as against the type of the value read out of it.
+//
+// The two differ only by a `volatile` qualifier, which the projection that built the node stripped:
+// a read of a `volatile u32` hands back a `u32`. It is recovered from the receiver rather than kept
+// on the node, because the receiver is where the declaration that wrote the qualifier still is --
+// a struct's field list, an array's element type, a pointer's pointee. That keeps one statement of
+// the fact instead of two that could drift.
+place_type(e: TExpr) -> Type = *e.kind match
+    TDeref(operand, t) -> pointee(texpr_type(operand)).unwrap_or(t)
+    TIndex(receiver, _, t) -> element(texpr_type(receiver)).unwrap_or(t)
+    TField(receiver, i, t) -> field_place_type(texpr_type(receiver), i, t)
+    _ -> texpr_type(e)
+
+private field_place_type(recv: Type, i: int, fallback: Type) -> Type = recv match
+    Struct(d) -> if i >= 0 && usize(i) < d.fields.len() then d.fields.at(usize(i)).1 else fallback
+    _ -> fallback
+
+// Whether the node names **storage** -- somewhere with an address of its own -- rather than a value
+// that has just been computed.
+//
+// It is what tells a temporary from a place, and two passes need the same answer: the emitter gives
+// a computed value a slot before it can reach into one, and escape analysis moves a temporary to the
+// heap rather than refusing a view of it that gets out.
+//
+// **An index is a place whatever its receiver is**, since an element of a computed array is reached
+// through the slot that array is materialized into. A **field** is one only where its receiver is:
+// `f().x` is part of a value nobody has a name for.
+is_place(e: TExpr) -> bool = *e.kind match
+    TLoad(_, _) -> true
+    TGlobal(_, _, _) -> true
+    TDeref(_, _) -> true
+    TIndex(_, _, _) -> true
+    TField(receiver, _, _) -> is_place(receiver)
+    _ -> false

@@ -1,0 +1,43 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// The typed patterns: what a `match` arm, an `is` term or a destructuring binding takes apart.
+//
+// **A typed pattern knows the type it matches against**, which the untyped one does not: `Some(x)`
+// is a variant of one particular enum by the time it reaches here, and the field it binds has a
+// type. That is what lets the exhaustiveness check and the emitter read the same tree.
+
+// A pattern, and what it matches.
+enum TPattern
+    // `_` -- matches anything and binds nothing.
+    TWildPattern(ty: Type)
+
+    // A name, which matches anything and binds it.
+    TBindPattern(name: string, ty: Type)
+
+    // `name @ inner` -- binds the whole of what the inner pattern matched.
+    TAtPattern(name: string, inner: &TPattern)
+
+    // A constant the subject is compared against.
+    TLitPattern(value: TExpr)
+
+    // A range the subject is tested against.
+    TRangePattern(lo: TExpr, hi: TExpr, inclusive: bool)
+
+    // A variant of an enum, and the patterns its fields are taken apart by.
+    TVariantPattern(enum_ty: Type, variant: EnumVariant, args: Buf[TPattern])
+
+    // A struct taken apart field by field.
+    TStructPattern(decl: &StructType, args: Buf[TPattern])
+end TPattern
+
+// The type the pattern matches against.
+tpattern_type(p: TPattern) -> Type = p match
+    TWildPattern(ty) -> ty
+    TBindPattern(_, ty) -> ty
+    TAtPattern(_, inner) -> tpattern_type(*inner)
+    TLitPattern(value) -> texpr_type(value)
+    TRangePattern(lo, _, _) -> texpr_type(lo)
+    TVariantPattern(enum_ty, _, _) -> enum_ty
+    TStructPattern(decl, _) -> Struct(decl)
