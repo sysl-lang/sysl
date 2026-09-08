@@ -88,6 +88,10 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
                      expected: Option[Type]) -> Option[TExpr]
     if cx.lookup(name).is_some() then return None
 
+    // `old(e)` is the value an argument had on entry, and it means something only inside an
+    // `ensure` -- so it is a form there and an ordinary name everywhere else.
+    if name == "old" && cx.olds.is_some() then return Some(old_call(cx, span, args))
+
     if name == "str" && args.len() == 1 then
         return Some(TExpr(span, TStr(type_expr_bare(cx, args.at(0)))))
 
@@ -706,3 +710,23 @@ private base_of(t: Type) -> string = repr(t) match
 
 private option_key() -> string = module_qualify("sysl", "Option")
 private result_key() -> string = module_qualify("sysl", "Result")
+
+// `old(e)` -- the value an expression had when the call started. The expressions are collected in
+// the order they were written, and the node holds the slot rather than the expression, because what
+// the emitter has to do is snapshot each one on entry.
+private old_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 1 then
+        return cx.err(span, s"'old' takes exactly one argument, but got ${args.len()}")
+
+    val te = type_expr_bare(cx, args.at(0))
+
+    if texpr_type(te) == Unit then
+        return cx.err(span, "'old' needs a value to remember, but its argument is unit")
+
+    var held = cx.olds.unwrap()
+    val idx = held.len()
+
+    held.push(te)
+    cx.olds = Some(held)
+    TExpr(span, TOld(int(idx), texpr_type(te)))
+end old_call

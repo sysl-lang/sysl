@@ -1,0 +1,1379 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.BigInt
+
+// Statements, and the blocks they live in.
+//
+// **A block is an expression.** It has a type, taken from its trailing expression, or `never` where
+// it ends in a jump and control does not arrive at the bottom at all. That is what lets
+// `if c then 1 else return 0` be an `int`: the jump is still not an expression, but the block
+// around it is one, and its type says control does not arrive.
+//
+// **A statement in statement position has no value, whatever its last expression yields.** There is
+// no terminator to write "and throw this away" with, so a trailing call or an assignment would
+// otherwise make a block plainly written for its effect claim a value nobody asked for -- and two
+// such blocks under one `if` would then be made to agree on it.
+
+// A block whose trailing expression, where it has one, is its value -- a function body or a branch.
+// Its statements share one lexical scope with that expression.
+type_value_block(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
+                 discarded: bool) -> TBlock
+    cx.enter()
+
+    val b = type_block_body(cx, stmts, expected, discarded)
+
+    cx.leave()
+    b
+end type_value_block
+
+// The body of a value block, in whatever scope the caller has established -- a match arm runs this
+// after declaring its pattern bindings, so they are visible to the body.
+type_block_body(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
+                discarded: bool) -> TBlock
+    val last = trailing_kind(stmts)
+
+    if last == TrailingValue
+        var init: Buf[TStmt] = buf()
+
+        for i in 0..<stmts.len() - 1
+            push_all(&init, recover_stmt(cx, stmts.at(i)))
+
+        val e = trailing_expr(stmts.at(stmts.len() - 1))
+
+        // A block whose value *is* the enclosing function's result is the third place a result list
+        // may stand, which is what lets a branch or a nested block forward one.
+        val tr = trailing_value(cx, e, expected, discarded)
+        val ty = if discarded && texpr_type(tr) != Never then Unit else texpr_type(tr)
+
+        return TBlock(init, Some(tr), ty)
+    end if
+
+    var out: Buf[TStmt] = buf()
+
+    for i in 0..<stmts.len()
+        push_all(&out, recover_stmt(cx, stmts.at(i)))
+
+    TBlock(out, None, if last == TrailingJump then Never else Unit)
+end type_block_body
+
+// A block's trailing expression. A block whose value *is* the enclosing function's result is the
+// third place a result list may stand, which is what lets a branch or a nested block forward one.
+private trailing_value(cx: &Analyzer, e: Expr, expected: Option[Type], discarded: bool) -> TExpr
+    if wants_results(cx, expected) then return type_expr_multi(cx, e, expected)
+
+    type_expr_discarded(cx, e, expected, discarded)
+end trailing_value
+
+// What the last statement of a block says about the block's type.
+enum Trailing
+    // An expression, whose value the block's is.
+    TrailingValue
+
+    // `return`, `break` or `continue` -- control does not arrive at the bottom.
+    TrailingJump
+
+    // Anything else, which yields nothing.
+    TrailingNone
+end Trailing
+
+private trailing_kind(stmts: Buf[Stmt]) -> Trailing
+    if stmts.is_empty() then return TrailingNone
+
+    *stmts.at(stmts.len() - 1).kind match
+        ExprStmt(_) -> TrailingValue
+        Return(_) -> TrailingJump
+        Break(_, _) -> TrailingJump
+        Continue(_) -> TrailingJump
+        _ -> TrailingNone
+end trailing_kind
+
+private trailing_expr(s: Stmt) -> Expr = *s.kind match
+    ExprStmt(e) -> e
+    _ -> Expr(s.span, UnitLit)
+
+// A statement sequence used only for its effects -- a loop body: a fresh scope, no value.
+type_stmts(cx: &Analyzer, stmts: Buf[Stmt]) -> Buf[TStmt]
+    cx.enter()
+
+    val out = loop_stmts(cx, stmts)
+
+    cx.leave()
+    out
+end type_stmts
+
+// A loop body: the `invariant` and `variant` clauses at its head, then the rest.
+//
+// The clauses are read **in the loop's own scope**, before anything the body declares, which is
+// what lets one read the loop variable and stops one reading a local declared under it. The split
+// is by position, exactly as a function's contract block is -- so a clause that reaches
+// `recover_stmt` is one written somewhere it may not be, and says so there.
+loop_stmts(cx: &Analyzer, stmts: Buf[Stmt]) -> Buf[TStmt]
+    var out: Buf[TStmt] = buf()
+    var i: usize = 0
+
+    while i < stmts.len() && is_loop_clause(stmts.at(i))
+        out.push(loop_clause(cx, stmts.at(i)))
+        i = i + 1
+
+    // The rest is read BEFORE the measure is handed up, so a loop nested inside this one has
+    // already taken its own and put it back.
+    val slot = cx.pending_variant
+
+    cx.pending_variant = None
+
+    while i < stmts.len()
+        push_all(&out, recover_stmt(cx, stmts.at(i)))
+        i = i + 1
+
+    cx.pending_variant = slot
+    out
+end loop_stmts
+
+private is_loop_clause(s: Stmt) -> bool = *s.kind match
+    Invariant(_, _) -> true
+    Variant(_) -> true
+    _ -> false
+
+// One `invariant` or `variant` at the head of a loop's body.
+private loop_clause(cx: &Analyzer, c: Stmt) -> TStmt = *c.kind match
+    Invariant(cond, msg) -> TInvariant(analyze_bool(cx, cond), msg)
+    Variant(e) ->
+        if cx.pending_variant.is_some() then
+            cx.fault(c.span, "a loop declares one 'variant' — a measure is the thing that " +
+                     "decreases, and two of them say nothing about which")
+
+        val te = type_expr_bare(cx, e)
+        val ty = integer_measure(cx, c.span, texpr_type(te))
+
+        cx.variant_seq = cx.variant_seq + 1
+
+        val slot = s"variant${cx.variant_seq}"
+
+        cx.pending_variant = Some((slot, ty))
+        TVariantCheck(slot, ty, te)
+    _ -> TExprStmt(TExpr(c.span, TUnitLit))
+
+private integer_measure(cx: &Analyzer, span: Span, t: Type) -> Type = t match
+    Integer(_, _, _) -> t
+    Unknown -> t
+    other ->
+        cx.fault(span, s"a 'variant' is an integer measure, not ${type_show(other)}")
+        Unknown
+
+// A loop that declared a `variant`, wrapped so its slots are set up once per entry.
+checked_loop(ctx: &LoopCtx, span: Span, walked: TExpr) -> TExpr
+    if ctx.variant.is_none() then return walked
+
+    val v = ctx.variant.unwrap()
+
+    TExpr(span, TCheckedLoop(v.0, v.1, walked))
+end checked_loop
+
+// Opens a loop, so that `break` and `continue` inside its body reach this one and every `break`
+// value is collected for its result type.
+open_loop(cx: &Analyzer, span: Span, expected: Option[Type],
+          label: Option[string]) -> &LoopCtx
+    if label.is_some()
+        for i in 0..<cx.loops.len()
+            if cx.loops.at(i).label == label then
+                cx.fault(span, s"label '${label.unwrap()} is already in scope")
+    end if
+
+    val ctx = loop_ctx(expected, label)
+    var kept: Buf[&LoopCtx] = buf()
+
+    kept.push(ctx)
+
+    for i in 0..<cx.loops.len()
+        kept.push(cx.loops.at(i))
+
+    cx.loops = kept
+    ctx
+end open_loop
+
+// Closes it, taking whatever measure its body declared.
+close_loop(cx: &Analyzer, ctx: &LoopCtx)
+    var kept: Buf[&LoopCtx] = buf()
+
+    for i in 1..<cx.loops.len()
+        kept.push(cx.loops.at(i))
+
+    cx.loops = kept
+    ctx.variant = cx.pending_variant
+    cx.pending_variant = None
+
+// The result type of a loop: every `break` value and the `else` value meet at one type.
+//
+// With no `else`, finishing normally yields `unit`, so a value-carrying `break` has nothing to meet
+// on that path -- a clear error rather than a silent mismatch.
+loop_result_type(cx: &Analyzer, span: Span, ctx: &LoopCtx, else_block: Option[TBlock]) -> Type
+    var tys: Buf[Type] = buf()
+
+    for i in 0..<ctx.break_tys.len()
+        tys.push(ctx.break_tys.at(i))
+
+    tys.push(if else_block.is_none() then Unit else else_block.unwrap().ty)
+
+    val joined = meet_all(tys)
+
+    if joined.is_some() then return joined.unwrap()
+
+    if else_block.is_none()
+        val v = first_value(ctx.break_tys)
+
+        cx.fault(span, s"this loop breaks with a ${type_show(v)} but has no 'else' to give a " +
+                 "value when it finishes normally — add an 'else'")
+
+        return Unknown
+    end if
+
+    cx.fault(span, s"a loop's break values and its 'else' must have the same type, but got " +
+             s"${type_list_show(tys)}")
+    Unknown
+end loop_result_type
+
+// The result type of a `loop`, which has no `else` and so nothing on the normal-completion path for
+// its breaks to meet: they decide it between them.
+//
+// A `loop` nothing breaks out of is `never`. That is the one thing `while true` could not say, and
+// it is what lets one stand as the last thing a function returning a value does.
+endless_result_type(cx: &Analyzer, span: Span, ctx: &LoopCtx) -> Type
+    if ctx.break_tys.is_empty() then return Never
+
+    val joined = meet_all(ctx.break_tys)
+
+    if joined.is_some() then return joined.unwrap()
+
+    cx.fault(span, s"a loop's break values must have the same type, but got " +
+             s"${type_list_show(ctx.break_tys)}")
+    Unknown
+end endless_result_type
+
+private meet_all(tys: Buf[Type]) -> Option[Type]
+    if tys.is_empty() then return None
+
+    var acc: Option[Type] = Some(tys.at(0))
+
+    for i in 1..<tys.len()
+        if acc.is_none() then return None
+
+        acc = join_types(acc.unwrap(), tys.at(i))
+
+    acc
+end meet_all
+
+private first_value(tys: Buf[Type]) -> Type
+    for i in 0..<tys.len()
+        if !no_value(tys.at(i)) then return tys.at(i)
+
+    Unit
+end first_value
+
+// The distinct types of a list, as a diagnostic joins them.
+private type_list_show(tys: Buf[Type]) -> string
+    var seen: Buf[string] = buf()
+
+    for i in 0..<tys.len()
+        val text = type_show(tys.at(i))
+        var have = false
+
+        for j in 0..<seen.len()
+            if seen.at(j) == text then have = true
+
+        if !have then seen.push(text)
+
+    var out = ""
+
+    for i in 0..<seen.len()
+        if i > 0 then out = out + " and "
+
+        out = out + seen.at(i)
+
+    out
+end type_list_show
+
+// -- one statement -----------------------------------------------------------------------------
+
+// Analyzes one statement, keeping whatever the rest of the block will need from one that failed.
+//
+// A `var` binds its name even when its initializer did not analyze -- at `Unknown`, which poisons
+// rather than reports -- because otherwise one bad initializer turns every later use of the name
+// into an "undefined name" of its own and the real mistake is lost among them.
+recover_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = type_stmt(cx, stmt)
+
+// Most statements are one statement. The two comma forms are the exception, and the only reason
+// this hands back a list: a binding that names several things is several declarations.
+type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
+    MultiAssign(op, targets, values) -> multi_assign(cx, stmt.span, op, targets, values)
+    MultiDecl(names, mutable, values) -> multi_decl(cx, stmt.span, names, mutable, values)
+    PatternDecl(pat, mutable, value) -> pattern_decl(cx, stmt.span, pat, mutable, value)
+
+    VarDecl(name, typ, init, _, align, section) ->
+        var_decl(cx, stmt.span, name, typ, init, align, section)
+
+    // A local `val` is a `var` that may not be assigned to again -- same frame, same lifetime, same
+    // code. Only the binding differs, so the read-only half is enforced where an assignment target
+    // is checked rather than here.
+    ValDecl(name, typ, value, _, align, section) ->
+        val_decl(cx, stmt.span, name, typ, value, align, section)
+
+    RefDecl(name, place) -> ref_decl(cx, stmt.span, name, place)
+
+    // A statement's value is nobody's, so whatever branching it contains is read knowing that.
+    ExprStmt(e) -> one_stmt(TExprStmt(type_expr_discarded(cx, e, None, true)))
+
+    Return(value) -> return_stmt(cx, stmt.span, value)
+    Become(call) -> become_stmt(cx, stmt.span, call)
+    Break(label, value) -> break_stmt(cx, stmt.span, label, value)
+    Continue(label) -> continue_stmt(cx, stmt.span, label)
+    Defer(inner) -> defer_stmt(cx, stmt.span, inner)
+
+    AsmStmt(arms) -> one_stmt(type_asm(cx, stmt.span, arms))
+
+    // An import binds a name for the statements after it and emits nothing. A block-scoped import
+    // is the declaration pass's to record, so what is left here is the empty statement it lowers to.
+    ImportDecl(_) -> one_stmt(TExprStmt(TExpr(stmt.span, TUnitLit)))
+
+    // A `const` written at the top of a file is folded into its uses before anything runs, so it
+    // never reaches the statement walk. One that reaches here was written **inside a body**, where
+    // there is nothing to hoist it into.
+    ConstDecl(_, _, _, _) ->
+        refuse(cx, stmt.span, "a constant is a module member and is declared at the top level — " +
+               "it is folded into its uses before the program runs, so there is no block for one " +
+               "written here to belong to. A name bound to a value inside a body is a 'val'")
+
+    CConstBlock(_) ->
+        refuse(cx, stmt.span, "a 'c const' block is declared at the top level of a file — the C " +
+               "in it is compiled against that file's '@include' headers, and a block inside a " +
+               "body would be asking the same question from a place that cannot answer it")
+
+    CTypeBlock(_) ->
+        refuse(cx, stmt.span, "a 'c type' block is declared at the top level of a file — the C in " +
+               "it is compiled against that file's '@include' headers, and what it declares is a " +
+               "type, which is a module member rather than something a body can hold")
+
+    StaticDecl(_) ->
+        refuse(cx, stmt.span, "'static' marks a declaration at the top of the file the program " +
+               "starts in, saying it belongs to the module rather than to that file's body. A " +
+               "declaration inside a block is local to that block and there is no module member " +
+               "for it to be instead")
+
+    // The leading clauses of a function body are split off before the body is read, so any that
+    // reach here sit after another statement or inside an inner block -- both disallowed.
+    Require(_, _) -> refuse(cx, stmt.span, clause_out_of_place())
+    Ensure(_, _) -> refuse(cx, stmt.span, clause_out_of_place())
+
+    Invariant(_, _) ->
+        refuse(cx, stmt.span, "an 'invariant' belongs at the head of a loop's body — it is a " +
+               "condition that holds on every entry to that body, and one written after some of " +
+               "the work has already been done is not that. A condition over a struct's fields is " +
+               "written in the struct, and one over a function's arguments is a 'require'")
+
+    Variant(_) ->
+        refuse(cx, stmt.span, "a 'variant' belongs at the head of a loop's body, where it is what " +
+               "decreases from one iteration to the next, or in a function's contract block, " +
+               "where it is what decreases at each recursive call")
+
+    StructDecl(_) -> refuse(cx, stmt.span, top_level_only())
+    EnumDecl(_) -> refuse(cx, stmt.span, top_level_only())
+    TraitDecl(_) -> refuse(cx, stmt.span, top_level_only())
+    ImplDecl(_) -> refuse(cx, stmt.span, top_level_only())
+    ExternDecl(_) -> refuse(cx, stmt.span, top_level_only())
+    ExternVarDecl(_, _, _, _) -> refuse(cx, stmt.span, top_level_only())
+    TypeDecl(_) -> refuse(cx, stmt.span, top_level_only())
+
+    // A function declared inside a body is a nested function, and lifting a block's into an
+    // environment belongs with the rest of closure lowering.
+    FuncDecl(_) ->
+        refuse(cx, stmt.span, "a function declared inside a body is not lowered yet")
+
+    // `@assert` settles while compiling and emits nothing either way: a true assertion is not code,
+    // and a false one has already stopped the compilation.
+    AssertDecl(_, _) -> buf()
+
+    Bad -> one_stmt(TExprStmt(TExpr(stmt.span, TUnitLit)))
+
+private clause_out_of_place() -> string =
+    "'require'/'ensure' clauses must come before any other statement in a function body"
+
+private top_level_only() -> string =
+    "structs, enums, traits, impls, externs, and types may only be declared at the top level"
+
+private refuse(cx: &Analyzer, span: Span, message: string) -> Buf[TStmt]
+    cx.fault(span, message)
+    one_stmt(TExprStmt(TExpr(span, TUnitLit)))
+end refuse
+
+private one_stmt(s: TStmt) -> Buf[TStmt]
+    var out: Buf[TStmt] = buf()
+
+    out.push(s)
+    out
+end one_stmt
+
+push_all(out: *Buf[TStmt], xs: Buf[TStmt])
+    for i in 0..<xs.len()
+        out.push(xs.at(i))
+
+// -- the bindings ---------------------------------------------------------------------------------
+
+private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
+                 init: Option[Expr], align: Option[Expr], section: Option[string]) -> Buf[TStmt]
+    no_section(cx, span, name, section)
+
+    val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
+
+    if init.is_none()
+        if declared.is_none()
+            cx.fault(span, s"'$name' needs either a type or an initial value")
+
+            return one_stmt(TVarDecl(cx.bind(name, Unknown), Unknown, TExpr(span, TZero(Unknown)), None))
+        end if
+
+        val ty = declared.unwrap()
+
+        if !has_zero(ty) then
+            cx.fault(span, s"${type_show(ty)} has no zero value, so '$name' needs an initial value")
+
+        return one_stmt(TVarDecl(cx.bind(name, ty), ty, TExpr(span, TZero(ty)),
+                            boundary(cx, name, align)))
+    end if
+
+    val ti = type_expr(cx, init.unwrap(), declared)
+    val decl_ty = settled_binding_type(declared, ti)
+
+    check_binding(cx, init.unwrap().span, name, declared, decl_ty, ti)
+    one_stmt(TVarDecl(cx.bind(name, decl_ty), decl_ty, ti, boundary(cx, name, align)))
+end var_decl
+
+private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], value: Expr,
+                 align: Option[Expr], section: Option[string]) -> Buf[TStmt]
+    no_section(cx, span, name, section)
+
+    val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
+    val ti = type_expr(cx, value, declared)
+    val decl_ty = settled_binding_type(declared, ti)
+
+    check_binding(cx, value.span, name, declared, decl_ty, ti)
+    one_stmt(TVarDecl(cx.bind_read_only(name, decl_ty), decl_ty, ti, boundary(cx, name, align)))
+end val_decl
+
+// The type a binding holds: the one it was declared with, and the value's where it was not.
+private settled_binding_type(declared: Option[Type], ti: TExpr) -> Type
+    if declared.is_some() then return declared.unwrap()
+
+    texpr_type(ti)
+end settled_binding_type
+
+// A binding needs a value to hold, and an initializer that does not finish never produces one --
+// the code after it is unreachable, so the declaration is a mistake rather than a clever way to
+// spell divergence.
+private check_binding(cx: &Analyzer, span: Span, name: string, declared: Option[Type],
+                      decl_ty: Type, ti: TExpr)
+    if texpr_type(ti) == Never then
+        cx.fault(span, s"cannot bind '$name' to an expression that never returns")
+
+    if declared.is_some() && disagree(texpr_type(ti), decl_ty) then
+        cx.fault(span, s"cannot initialize '$name': declared ${type_show(decl_ty)} but the value " +
+                 s"is ${type_show(texpr_type(ti))}")
+
+// `ref name = place` -- another name for storage that already exists. The place is read once, here,
+// and what the name means afterwards is the storage it found.
+private ref_decl(cx: &Analyzer, span: Span, name: string, place: Expr) -> Buf[TStmt]
+    val tp = type_expr_bare(cx, place)
+
+    // Rule one, and the message says what a place is rather than that this is not one: the mistake
+    // is nearly always a call, and "it has no address" explains every case at once.
+    if !is_place(tp) && texpr_type(tp) != Unknown then
+        cx.fault(span, s"'ref' names a place — a local, a field, an element, or a dereference — " +
+                 s"and this expression has no address for '$name' to name. Bind it with 'val' to " +
+                 "hold the value it produces")
+
+    if texpr_type(tp) == Never then
+        cx.fault(span, s"cannot bind '$name' to an expression that never returns")
+
+    one_stmt(TRefDecl(cx.bind(name, texpr_type(tp)), texpr_type(tp), tp))
+end ref_decl
+
+// `@section("…")` above a **local**, which is refused here rather than in the grammar: a local's
+// storage is the frame, laid down by whichever call is running, and a section is a region of the
+// image decided once at the link.
+private no_section(cx: &Analyzer, span: Span, name: string, section: Option[string])
+    if section.is_none() then return
+
+    cx.fault(span, s"'$name' is a local, so it cannot be placed in section " +
+             s"\"${section.unwrap()}\" — its storage is the frame of whichever call is running, " +
+             "and a section is a region of the image the linker decides once. Declare it as " +
+             "module storage, outside every function, for a section to be about")
+
+// `@align(n)` above a binding, folded to the boundary it named. A refusal costs the annotation and
+// not the declaration, which is what lets the rest of the function still be read.
+private boundary(cx: &Analyzer, name: string, align: Option[Expr]) -> Option[usize]
+    if align.is_none() then return None
+
+    val folded = const_fold(cx, align.unwrap())
+
+    folded match
+        Some(c) -> c match
+            ConstInt(n) ->
+                val v = n.to_long().unwrap_or(0)
+
+                if v > 0 && (v & (v - 1)) == 0 && v <= (1 << 29) then return Some(usize(v))
+
+                cx.fault(align.unwrap().span, s"'@align($v)' on '$name' is not an alignment — a " +
+                         "boundary is a power of two, since an address is aligned by having low " +
+                         "bits clear")
+                None
+            _ -> not_a_boundary(cx, align.unwrap().span, name)
+        None -> not_a_boundary(cx, align.unwrap().span, name)
+end boundary
+
+private not_a_boundary(cx: &Analyzer, span: Span, name: string) -> Option[usize]
+    cx.fault(span, s"'@align' on '$name' needs a constant — a literal, a 'const', or the " +
+             "arithmetic over them. A layout is fixed while compiling and is part of what this " +
+             "module publishes, so it cannot wait on a value")
+    None
+end not_a_boundary
+
+// -- the comma forms ------------------------------------------------------------------------------
+
+// The values a comma form on the left is given, where the right side is **one** thing carrying
+// several -- the third of the three feeds this syntax has.
+//
+// The one thing is evaluated once, into a name no program can write, and each part is read back out
+// of it. That is what keeps `a, b = f()` a single call, and it costs the form nothing else: the
+// hidden binding is an ordinary local.
+//
+// None where the right side is a list rather than one carrier, which is every other case.
+private spread(cx: &Analyzer, places: usize, values: Buf[Expr],
+               subject: string) -> Option[(TStmt, Buf[TExpr])]
+    if values.len() != 1 || places <= 1 then return None
+
+    val one_value = values.at(0)
+    val tv = type_expr_multi(cx, one_value, None)
+
+    underlying(texpr_type(tv)) match
+        Struct(d) ->
+            if !is_tuple(d)
+                spread_refused(cx, one_value.span, subject, tv, d)
+                return None
+            end if
+
+            if d.targs.len() != places
+                spread_refused(cx, one_value.span, subject, tv, d)
+                return None
+            end if
+
+            val name = cx.bind("$parts", texpr_type(tv))
+            var read: Buf[TExpr] = buf()
+
+            for i in 0..<d.fields.len()
+                read.push(TExpr(one_value.span,
+                                TField(TExpr(one_value.span, TLoad(name, texpr_type(tv))), int(i),
+                                       d.fields.at(i).1)))
+
+            Some((TVarDecl(name, texpr_type(tv), tv, None), read))
+
+        other ->
+            cx.fault(one_value.span, s"$subject, and one ${type_show(other)} is not something to " +
+                     "take apart — only a tuple is")
+            None
+
+// A carrier with the wrong number of parts, complained about in its own terms: a call that yields
+// several things has *results*, and the type nobody wrote is not worth naming back at the reader.
+private spread_refused(cx: &Analyzer, span: Span, subject: string, tv: TExpr, d: &StructType)
+    if yields_results(tv) then
+        cx.fault(span, s"$subject, and this yields ${quantity(d.targs.len(), "result")}")
+    else
+        cx.fault(span, s"$subject, and a ${type_show(texpr_type(tv))} has " +
+                 s"${quantity(d.targs.len(), "part")} to give them")
+
+private yields_results(t: TExpr) -> bool = *t.kind match
+    TCall(_, _, _, results) -> results
+    TVCall(_, _, _, _, results) -> results
+    _ -> false
+
+// `a, b = b, a` and `a, b += 1, 2`.
+//
+// Every place is read before any value, which is what fixes each value's expected type: a literal
+// on the right takes the width of the place it is heading for, exactly as it does after a single
+// `=`. Each arm is then checked by the rule its own operator already has.
+private multi_assign(cx: &Analyzer, span: Span, op: string, targets: Buf[Expr],
+                     values: Buf[Expr]) -> Buf[TStmt]
+    val taken = spread(cx, targets.len(), values,
+                       s"this assignment has ${targets.len()} places on the left")
+
+    if taken.is_none() && targets.len() != values.len() then
+        cx.fault(span, s"this assignment has ${targets.len()} places on the left and " +
+                 s"${values.len()} ${if values.len() == 1 then "value" else "values"} on the right")
+
+    val what = if op == "=" then "assignment" else s"'$op'"
+    var places: Buf[TExpr] = buf()
+
+    for i in 0..<targets.len()
+        places.push(analyze_place(cx, targets.at(i), what))
+
+    var writes: Buf[TWrite] = buf()
+
+    for i in 0..<targets.len()
+        val place = places.at(i)
+        val part = part_at(taken, i)
+        val written = value_written(taken, targets, values, i)
+
+        writes.push(one_write(cx, op, targets.at(i), place, part, written))
+
+    var out: Buf[TStmt] = buf()
+
+    if taken.is_some() then out.push(taken.unwrap().0)
+
+    out.push(TMultiAssign(writes))
+    out
+end multi_assign
+
+// Each arm's position is the value it was written with, or -- where one carrier supplied them all
+// -- that carrier, since there is no separate expression to point at.
+private value_written(taken: Option[(TStmt, Buf[TExpr])], targets: Buf[Expr], values: Buf[Expr],
+                      i: usize) -> Expr
+    if taken.is_some() then return values.at(0)
+    if i < values.len() then return values.at(i)
+
+    targets.at(i)
+end value_written
+
+private part_at(taken: Option[(TStmt, Buf[TExpr])], i: usize) -> Option[TExpr]
+    if taken.is_none() then return None
+
+    val parts = taken.unwrap().1
+
+    if i < parts.len() then Some(parts.at(i)) else None
+end part_at
+
+// A part read out of a carrier is already analyzed, so what is left for the arm is the check the
+// written form performs after analyzing its own value. The two are kept together so that neither
+// feed can end up with a rule the other does not have.
+private one_write(cx: &Analyzer, op: string, target: Expr, place: TExpr, part: Option[TExpr],
+                  written: Expr) -> TWrite
+    if op == "="
+        val tv = arm_value(cx, part, written, texpr_type(place))
+
+        if texpr_type(tv) == Never || disagree(texpr_type(tv), texpr_type(place)) then
+            cx.fault(written.span, s"cannot assign ${type_show(texpr_type(tv))} to " +
+                     s"${describe_target(target)} of type ${type_show(texpr_type(place))}")
+
+        return TWrite(place, op, tv, None, buf(), None)
+    end if
+
+    val bin = op[0..<op.bytes.len - 1]
+    val tv = arm_value(cx, part, written, texpr_type(place))
+
+    if disagree(arith_type(cx, written.span, bin, texpr_type(place), texpr_type(tv), written.span),
+                texpr_type(place)) then
+        cx.fault(written.span, s"'$op' would change the type of ${describe_target(target)}")
+
+    TWrite(place, op, tv, None, buf(), constraint_of(texpr_type(place)))
+end one_write
+
+// The value one arm of a comma form is given: the part read out of the carrier, or the expression
+// written beside it.
+private arm_value(cx: &Analyzer, part: Option[TExpr], written: Expr, want: Type) -> TExpr
+    if part.is_some() then return part.unwrap()
+
+    type_expr(cx, written, Some(want))
+end arm_value
+
+// `val a, b = …` / `var a, b = …`.
+//
+// The names are declared only once every value has been read, so a value may still name whatever
+// the enclosing scope calls one of them -- the binding does not shadow itself half way through its
+// own right-hand side.
+private multi_decl(cx: &Analyzer, span: Span, names: Buf[string], mutable: bool,
+                   values: Buf[Expr]) -> Buf[TStmt]
+    for i in 0..<names.len()
+        for j in 0..<i
+            if names.at(j) == names.at(i) then
+                cx.fault(span, s"'${names.at(i)}' is named twice in one binding")
+
+    val taken = spread(cx, names.len(), values, s"this binding names ${names.len()} things")
+
+    if taken.is_none() && names.len() != values.len() then
+        cx.fault(span, s"this binding names ${names.len()} things and has ${values.len()} " +
+                 s"${if values.len() == 1 then "value" else "values"} to give them")
+
+    var tvs: Buf[TExpr] = buf()
+
+    if taken.is_some()
+        val parts = taken.unwrap().1
+
+        for i in 0..<parts.len()
+            tvs.push(parts.at(i))
+    else
+        for i in 0..<values.len()
+            val tv = type_expr_bare(cx, values.at(i))
+
+            if texpr_type(tv) == Never then
+                cx.fault(values.at(i).span,
+                         "cannot bind a name to an expression that never returns")
+
+            tvs.push(tv)
+    end if
+
+    var out: Buf[TStmt] = buf()
+
+    if taken.is_some() then out.push(taken.unwrap().0)
+
+    for i in 0..<names.len()
+        if i < tvs.len()
+            val tv = tvs.at(i)
+            val ty = texpr_type(tv)
+            val u = if mutable then cx.bind(names.at(i), ty) else cx.bind_read_only(names.at(i), ty)
+
+            out.push(TVarDecl(u, ty, tv, None))
+        else
+            out.push(TVarDecl(cx.bind(names.at(i), Unknown), Unknown, TExpr(span, TZero(Unknown)),
+                              None))
+
+    out
+end multi_decl
+
+// `val (a, b) = …` -- a binding whose left side is a pattern.
+//
+// The value is read once into a temporary and the pattern is then walked against its type, each
+// part reading a field of what is above it. **A part that is not a name is checked here rather than
+// where a match arm's is**, because the question is not the one an arm asks: an arm may be
+// refutable and fall through, and a binding has nowhere to fall.
+private pattern_decl(cx: &Analyzer, span: Span, pat: Pattern, mutable: bool,
+                     value: Expr) -> Buf[TStmt]
+    var names: Buf[string] = buf()
+
+    pattern_names(&names, pat)
+
+    for i in 0..<names.len()
+        for j in 0..<i
+            if names.at(j) == names.at(i) then
+                cx.fault(span, s"'${names.at(i)}' is named twice in one binding")
+
+    val tv = type_expr_bare(cx, value)
+
+    if texpr_type(tv) == Never then
+        cx.fault(value.span, "cannot bind a name to an expression that never returns")
+
+    // The whole value is held once, under a name no program can write, and every part is read out
+    // of it. Reading the value expression again per part would run its side effects once each.
+    val temp = cx.bind("$parts", texpr_type(tv))
+    var out: Buf[TStmt] = buf()
+
+    out.push(TVarDecl(temp, texpr_type(tv), tv, None))
+    push_all(&out, bind_pattern(cx, span, pat,
+                                TExpr(value.span, TLoad(temp, texpr_type(tv))), mutable))
+    out
+end pattern_decl
+
+// Every name a pattern binds, in the order it binds them, so a repeat is reported against the whole
+// binding rather than found later as a shadow.
+pattern_names(out: *Buf[string], p: Pattern)
+    *p.kind match
+        IdentPattern(n) -> out.push(n)
+
+        // The outer name first, which is the order it is written in.
+        BindPattern(n, inner) ->
+            out.push(n)
+            pattern_names(out, inner)
+
+        TuplePattern(args) ->
+            for i in 0..<args.len()
+                pattern_names(out, args.at(i))
+
+        StructPattern(_, fields) ->
+            for i in 0..<fields.len()
+                pattern_names(out, fields.at(i).pat)
+
+        _ -> ()
+
+// One level of a pattern binding: bind a name, ignore a wildcard, or read the parts of a tuple and
+// descend into each.
+private bind_pattern(cx: &Analyzer, span: Span, p: Pattern, subject: TExpr,
+                     mutable: bool) -> Buf[TStmt]
+    *p.kind match
+        WildcardPattern -> buf()
+
+        // `var whole @ (a, b) = pair` -- the value under its own name, and its parts under theirs.
+        // The subject is already the held temporary, so naming it twice reads that temporary twice
+        // and runs nothing a second time.
+        BindPattern(n, inner) ->
+            var out = bind_name(cx, n, subject, mutable)
+
+            push_all(&out, bind_pattern(cx, span, inner, subject, mutable))
+            out
+
+        IdentPattern(n) -> bind_name(cx, n, subject, mutable)
+
+        TuplePattern(args) -> bind_parts(cx, span, args, subject, mutable, true)
+
+        StructPattern(name, fields) -> bind_fields(cx, span, name, fields, subject, mutable)
+
+        // A struct has exactly one shape, so `Name(…)` against one is the positional form and
+        // belongs at a binding for the reason a tuple pattern does.
+        VariantPattern(written, args) ->
+            underlying(texpr_type(subject)) match
+                Struct(d) -> bind_positional(cx, span, written, args, subject, mutable, d)
+                _ ->
+                    cx.fault(span, "a binding cannot choose among variants — this pattern matches " +
+                             "one of several shapes, and a binding has no other arm to take when " +
+                             "the value has another")
+                    buf()
+
+        LitPattern(_) -> cannot_test(cx, span)
+        RangePattern(_, _, _) -> cannot_test(cx, span)
+
+        // A quoted name is a *reference*, so it tests rather than binds. It earns its own sentence
+        // because the fix is not the one the other refusals want: the name here is almost always
+        // the name that was meant, and it is the backticks that are wrong.
+        EqPattern(n) ->
+            cx.fault(span, s"a binding cannot test a value — '`$n`' names something already " +
+                     "declared, and a binding has no other arm to take when the value turns out " +
+                     s"to differ; write '$n' to bind a new name")
+            buf()
+
+private cannot_test(cx: &Analyzer, span: Span) -> Buf[TStmt]
+    cx.fault(span, "a binding cannot test a value — this pattern matches only some values, and a " +
+             "binding has no other arm to take when it does not match")
+    buf()
+
+private bind_name(cx: &Analyzer, n: string, subject: TExpr, mutable: bool) -> Buf[TStmt]
+    val ty = texpr_type(subject)
+    val u = if mutable then cx.bind(n, ty) else cx.bind_read_only(n, ty)
+
+    one_stmt(TVarDecl(u, ty, subject, None))
+end bind_name
+
+private bind_parts(cx: &Analyzer, span: Span, args: Buf[Pattern], subject: TExpr, mutable: bool,
+                   tuple: bool) -> Buf[TStmt]
+    underlying(texpr_type(subject)) match
+        Struct(d) ->
+            if tuple && !is_tuple(d)
+                cx.fault(span, s"one ${type_show(texpr_type(subject))} is not something to take " +
+                         "apart — only a tuple is")
+                return buf()
+            end if
+
+            if d.fields.len() != args.len()
+                cx.fault(span, s"this pattern takes ${quantity(args.len(), "part")}, and a " +
+                         s"${type_show(texpr_type(subject))} has " +
+                         s"${quantity(d.targs.len(), "part")} to give it")
+                return buf()
+            end if
+
+            var out: Buf[TStmt] = buf()
+
+            for i in 0..<args.len()
+                push_all(&out, bind_pattern(cx, span, args.at(i),
+                                            TExpr(subject.span,
+                                                  TField(subject, int(i), d.fields.at(i).1)),
+                                            mutable))
+
+            out
+
+        other ->
+            cx.fault(span, s"one ${type_show(other)} is not something to take apart — only a " +
+                     "tuple is")
+            buf()
+
+private bind_fields(cx: &Analyzer, span: Span, name: string, fields: Buf[FieldPattern],
+                    subject: TExpr, mutable: bool) -> Buf[TStmt]
+    underlying(texpr_type(subject)) match
+        Struct(d) ->
+            if !struct_named(cx, name, d)
+                cx.fault(span, s"'$name{…}' does not match a ${type_show(Struct(d))} value")
+                return buf()
+            end if
+
+            var out: Buf[TStmt] = buf()
+
+            for i in 0..<fields.len()
+                val f = fields.at(i)
+
+                for j in 0..<i
+                    if fields.at(j).name == f.name then
+                        cx.fault(span, s"field '${f.name}' is matched more than once")
+
+                val idx = d.field_index(f.name)
+
+                if idx < 0
+                    cx.fault(span, s"struct '${module_show(d.base)}' has no field '${f.name}'")
+                else
+                    if !field_visible(cx, d.base, f.name) then
+                        cx.fault(span, s"'${f.name}' is private to the file that declares " +
+                                 s"'${module_show(d.base)}'")
+
+                    push_all(&out, bind_pattern(cx, span, f.pat,
+                                                TExpr(subject.span,
+                                                      TField(subject, idx,
+                                                             d.fields.at(usize(idx)).1)),
+                                                mutable))
+
+            out
+
+        other ->
+            cx.fault(span, s"'$name{…}' matches a struct, but the value is ${type_show(other)}")
+            buf()
+
+private bind_positional(cx: &Analyzer, span: Span, written: string, args: Buf[Pattern],
+                        subject: TExpr, mutable: bool, d: &StructType) -> Buf[TStmt]
+    if !struct_named(cx, written, d)
+        cx.fault(span, s"'$written(…)' does not match a ${type_show(Struct(d))} value")
+        return buf()
+    end if
+
+    if args.len() != d.fields.len()
+        cx.fault(span, s"struct '${module_show(d.base)}' has " +
+                 s"${quantity(d.fields.len(), "field")}, but ${supplied(args.len(), "sub-pattern")}")
+        return buf()
+    end if
+
+    bind_parts(cx, span, args, subject, mutable, false)
+end bind_positional
+
+private struct_named(cx: &Analyzer, written: string, d: &StructType) -> bool
+    val key = lookup_type_key(cx.an, cx.scope, written)
+
+    key.is_some() && key.unwrap() == d.base
+end struct_named
+
+// -- the jumps ------------------------------------------------------------------------------------
+
+private return_stmt(cx: &Analyzer, span: Span, value: Option[Expr]) -> Buf[TStmt]
+    val want = cx.ret_ty.unwrap_or(Unit)
+
+    if value.is_none()
+        if want != Unit then
+            cx.fault(span, s"this function must return a ${type_show(want)} value")
+
+        return one_stmt(TReturn(None))
+    end if
+
+    val tv = returned_value(cx, value.unwrap(), want)
+
+    if want == Unit then
+        cx.fault(span, "cannot return a value from a function with no return type")
+    else if disagree(texpr_type(tv), want) then
+        cx.fault(span, s"return type mismatch: expected ${type_show(want)}, got " +
+                 s"${type_show(texpr_type(tv))}")
+
+    one_stmt(TReturn(Some(tv)))
+end return_stmt
+
+// What a `return` hands back, read in the one position a function's own result list may stand.
+private returned_value(cx: &Analyzer, e: Expr, want: Type) -> TExpr
+    if cx.ret_is_list then return type_expr_multi(cx, e, Some(want))
+
+    type_expr(cx, e, Some(want))
+end returned_value
+
+// `become f(…)` -- `return f(…)` with the jump guaranteed. What is settled here is that there is a
+// call at all; whether the frame can be replaced needs the whole program and is a later pass.
+private become_stmt(cx: &Analyzer, span: Span, call: Expr) -> Buf[TStmt]
+    val want = cx.ret_ty.unwrap_or(Unit)
+    val t = type_expr(cx, call, Some(want))
+
+    if !is_call(t) && texpr_type(t) != Unknown then
+        cx.fault(span, "'become' replaces this frame with a call's, so what follows it has to be " +
+                 "a call — 'return' is what hands a value back without replacing anything")
+
+    if disagree(texpr_type(t), want) then
+        cx.fault(span, s"'become' hands on this function's result, so the call has to answer " +
+                 s"${type_show(want)} — this one answers ${type_show(texpr_type(t))}")
+
+    one_stmt(TBecome(t))
+end become_stmt
+
+private is_call(t: TExpr) -> bool = *t.kind match
+    TCall(_, _, _, _) -> true
+    TCallPtr(_, _, _, _) -> true
+    _ -> false
+
+// `break value` records its type against the loop it targets, which unites it with that loop's
+// other breaks and its `else` to fix the loop's result type. The value is read at the target loop's
+// expected type, so a `break &T` boxes the same way a `break` in a `&T` context asks.
+private break_stmt(cx: &Analyzer, span: Span, label: Option[string],
+                   value: Option[Expr]) -> Buf[TStmt]
+    val found = resolve_loop(cx, span, "break", label)
+
+    if found.is_none()
+        if value.is_some() then type_expr_bare(cx, value.unwrap())
+
+        return one_stmt(TBreak(None, 0))
+    end if
+
+    val ctx = found.unwrap().0
+    val tv = value.map(e -> type_expr(cx, e, ctx.expected))
+
+    ctx.break_tys.push(if tv.is_none() then Unit else texpr_type(tv.unwrap()))
+    one_stmt(TBreak(tv, found.unwrap().1))
+end break_stmt
+
+private continue_stmt(cx: &Analyzer, span: Span, label: Option[string]) -> Buf[TStmt]
+    val found = resolve_loop(cx, span, "continue", label)
+
+    one_stmt(TContinue(if found.is_none() then 0 else found.unwrap().1))
+end continue_stmt
+
+// Resolves a `break`/`continue` to the loop it targets and that loop's distance out from the
+// innermost. An absent label is the nearest loop; a `'name` is the nearest loop carrying it.
+private resolve_loop(cx: &Analyzer, span: Span, keyword: string,
+                     label: Option[string]) -> Option[(&LoopCtx, int)]
+    if label.is_none()
+        if !cx.loops.is_empty() then return Some((cx.loops.at(0), 0))
+
+        if cx.in_const_for then return not_in_an_unrolled_loop(cx, span, keyword)
+
+        cx.fault(span, s"'$keyword' is only allowed inside a loop")
+        return None
+    end if
+
+    for i in 0..<cx.loops.len()
+        if cx.loops.at(i).label == label then return Some((cx.loops.at(i), int(i)))
+
+    if cx.in_const_for then return not_in_an_unrolled_loop(cx, span, keyword)
+
+    cx.fault(span, s"no enclosing loop is labeled '${label.unwrap()}")
+    None
+end resolve_loop
+
+// Why a `for const` body takes neither `break` nor `continue`: there is no loop at run time for
+// either to act on. The copies are straight-line code in the enclosing function, so a `break` here
+// would leave whatever loop the `for const` happens to sit inside, silently and one copy at a time.
+private not_in_an_unrolled_loop(cx: &Analyzer, span: Span,
+                                keyword: string) -> Option[(&LoopCtx, int)]
+    cx.fault(span, s"a 'for const' is unrolled into one copy of its body per value, so there is " +
+             s"no loop for '$keyword' to act on — a loop that is walked at run time is the " +
+             "ordinary 'for'")
+    None
+end not_in_an_unrolled_loop
+
+// `defer stmt`. The statement is read here, where it is written, so it sees exactly the names in
+// scope at that point -- and it is handed to the block rather than emitted, so nothing runs until
+// the block is left.
+//
+// What may be deferred is bounded by what teardown can mean, and each refusal is a different
+// mistake so each is named on its own.
+private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
+    *inner.kind match
+        Return(_) ->
+            cx.fault(span, "a deferred statement runs while its block is being left, so it cannot " +
+                     "'return' — there is no exit left to take. Compute what the function returns " +
+                     "before the block ends")
+        Break(_, _) -> cx.fault(span, deferred_jump())
+        Continue(_) -> cx.fault(span, deferred_jump())
+        Defer(_) ->
+            cx.fault(span, "'defer' schedules a statement, and scheduling a scheduling has " +
+                     "nothing to run: write the statement itself after this 'defer'")
+        VarDecl(_, _, _, _, _, _) -> cx.fault(span, deferred_declaration())
+        ValDecl(_, _, _, _, _, _) -> cx.fault(span, deferred_declaration())
+        MultiDecl(_, _, _) -> cx.fault(span, deferred_declaration())
+        ConstDecl(_, _, _, _) -> cx.fault(span, deferred_declaration())
+        _ -> ()
+
+    var body: Buf[Stmt] = buf()
+
+    body.push(inner)
+
+    val t = type_stmts(cx, body)
+
+    // A `?` leaves the function, which is the same exit a `return` would take and is refused for
+    // the same reason. It is read out of the analyzed body rather than the written statement,
+    // because `?` is an operator inside an expression at whatever depth the expression has.
+    if stmts_try(t) then
+        cx.fault(span, "a deferred statement runs while its block is being left, so a '?' in it " +
+                 "has nowhere to return to. Check the result and handle the failure in the " +
+                 "deferred statement itself")
+
+    one_stmt(TDefer(t))
+end defer_stmt
+
+private deferred_jump() -> string =
+    "a deferred statement runs while its block is being left, so it cannot 'break' or 'continue' " +
+        "— the loop edge it would take is the one already being taken"
+
+private deferred_declaration() -> string =
+    "a deferred declaration binds a name that dies the moment the statement finishes, so nothing " +
+        "could read it — defer what uses the value instead of what declares it"
+
+// -- what a place is ------------------------------------------------------------------------------
+
+// Analyzes something that must be a place: an assignment target, or the operand of `&`.
+analyze_place(cx: &Analyzer, target: Expr, what: string) -> TExpr =
+    require_place(cx, type_expr_bare(cx, target), target, what, true)
+
+// The same demand made of an expression **already analyzed**, for a form that had to see the type
+// before it knew whether a place was what it wanted at all.
+//
+// `writes` separates the two questions. Both need an address, and only one of them *is* a write:
+// `&` hands back a `*T`, and what a program does with a raw pointer is the unsafe tier's business.
+require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool) -> TExpr
+    if texpr_type(t) == Unknown then return t
+
+    // A **captured** name reaches storage the walk below cannot see the binding of, so being
+    // written once is asked of the name it was declared under rather than of what it turned into.
+    val named = written_name(target)
+
+    if named.is_some()
+        val local = cx.lookup(named.unwrap())
+
+        if local.is_some() && local.unwrap().read_only
+            cx.fault(target.span, written_once(local.unwrap(), what))
+
+            return t
+        end if
+    end if
+
+    // A string is immutable, and it is worth saying so rather than reporting the absence of an
+    // address: writing one byte of UTF-8 is how a string stops being UTF-8.
+    *t.kind match
+        TIndex(recv, _, _) ->
+            if texpr_type(recv) == Str
+                cx.fault(target.span,
+                         "a string is immutable, so its bytes have no address to write through")
+                return t
+            end if
+
+            // `s.bytes` reinterprets the string's own storage rather than a copy of it, so writing
+            // through one is writing the string.
+            if writes && is_bytes(recv)
+                cx.fault(target.span, "a string is immutable, and 'bytes' views the string's own " +
+                         "storage rather than a copy of it — so writing through one is writing " +
+                         "the string. Bytes you may write are bytes of your own: copy them into a " +
+                         "'[]u8' first")
+                return t
+            end if
+
+            if writes && read_only_view(texpr_type(recv)) && texpr_type(recv) != Str
+                cx.fault(target.span, s"this element belongs to a " +
+                         s"'${type_show(texpr_type(recv))}', which views elements it may not " +
+                         "write, so there is nothing to assign through. Elements you may write " +
+                         "are elements of your own: copy them into a " +
+                         s"'[]${type_show(element(texpr_type(recv)).unwrap_or(Unknown))}' first")
+                return t
+            end if
+        _ -> ()
+
+    if !writable_place(t)
+        cx.fault(target.span, s"$what needs a variable, a field, an element, or a dereference — " +
+                 "something with an address")
+
+        return t
+    end if
+
+    val root = root_local(cx, t)
+
+    if root.is_some() && root.unwrap().read_only then
+        cx.fault(target.span, written_once(root.unwrap(), what))
+
+    t
+end require_place
+
+private is_bytes(t: TExpr) -> bool = *t.kind match
+    TBytes(_) -> true
+    _ -> false
+
+private written_name(target: Expr) -> Option[string] = *target.kind match
+    Ident(n) -> Some(n)
+    _ -> None
+
+// Why a write to a read-only place is refused, in the words of the form the program actually wrote.
+//
+// A pattern binding gets its own sentence rather than the `val` one, because the reader of an arm
+// wrote no `val` and the reason is a different reason: the name holds a **copy** of the part that
+// matched, so the write would land where nothing can observe it.
+private written_once(local: Local, what: string) -> string
+    if local.from_pattern then
+        return "a pattern binding is written once, because it holds a copy of what it matched — " +
+            s"so $what would reach that copy rather than the value it came from. Where you mean " +
+            "to change something, take a 'var' from the binding first"
+
+    s"a 'val' is written once, so $what has nothing to write through"
+end written_once
+
+// Whether a typed expression denotes a place -- something with an address, which can be assigned
+// through and pointed at.
+//
+// The element is the case with a condition on it. A slice's elements live wherever its owner keeps
+// them, so they have an address even when the slice itself is a temporary; an array's elements are
+// the array, so they do not; and what a pointer names is somewhere else, which is the same reason
+// `*p` is a place.
+writable_place(t: TExpr) -> bool = *t.kind match
+    TLoad(_, _) -> true
+    TGlobal(_, _, _) -> true
+    TDeref(_, _) -> true
+    TField(recv, _, _) -> writable_place(recv)
+    TIndex(recv, _, _) -> texpr_type(recv) match
+        Slice(_, _) -> true
+        Str -> false
+        Ptr(_) -> true
+        _ -> writable_place(recv)
+    _ -> false
+
+// The local a place bottoms out in, where it bottoms out in one at all -- the same descent
+// `writable_place` makes, kept apart from it because the refusal wants the *binding*.
+private root_local(cx: &Analyzer, t: TExpr) -> Option[Local] = *t.kind match
+    TLoad(name, _) -> local_named(cx, name)
+    TField(recv, _, _) -> root_local(cx, recv)
+    TIndex(recv, _, _) -> root_local(cx, recv)
+    _ -> None
+
+private local_named(cx: &Analyzer, unique: string) -> Option[Local]
+    for i in 0..<cx.locals.len()
+        if cx.locals.at(i).unique == unique then return Some(cx.locals.at(i))
+
+    None
+end local_named
+
+// How a diagnostic names an assignment target.
+describe_target(target: Expr) -> string = *target.kind match
+    Ident(n) -> s"'$n'"
+    Field(_, f) -> s"field '$f'"
+    Unary(op, _) -> if op == "*" then "the place it points at" else "this place"
+    Index(_, _) -> "this element"
+    _ -> "this place"
+
+// Whether a `?` stands anywhere in a run of statements, which is what a `defer` refuses.
+private stmts_try(stmts: Buf[TStmt]) -> bool
+    for i in 0..<stmts.len()
+        if stmt_try(stmts.at(i)) then return true
+
+    false
+end stmts_try
+
+private stmt_try(s: TStmt) -> bool = s match
+    TVarDecl(_, _, init, _) -> expr_try(init)
+    TExprStmt(e) -> expr_try(e)
+    TInvariant(c, _) -> expr_try(c)
+    TVariantCheck(_, _, e) -> expr_try(e)
+    TRefDecl(_, _, place) -> expr_try(place)
+    TWriteStmt(w) -> expr_try(w.place) || expr_try(w.value)
+    TMultiAssign(ws) -> writes_try(ws)
+    TReturn(v) -> if v.is_none() then false else expr_try(v.unwrap())
+    TBecome(c) -> expr_try(c)
+    TBreak(v, _) -> if v.is_none() then false else expr_try(v.unwrap())
+    TContinue(_) -> false
+    TDefer(inner) -> stmts_try(inner)
+    TAsm(_, _, _) -> false
+
+private writes_try(ws: Buf[TWrite]) -> bool
+    for i in 0..<ws.len()
+        if expr_try(ws.at(i).place) || expr_try(ws.at(i).value) then return true
+
+    false
+end writes_try
+
+// Whether a `?` stands anywhere in a typed expression, which is what a `defer` refuses.
+//
+// The descent is over the forms that can hold one, which is every composite node: the operator can
+// be at any depth of any expression.
+expr_try(e: TExpr) -> bool = *e.kind match
+    TTry(_, _, _, _, _, _, _) -> true
+    TBox(v, _) -> expr_try(v)
+    TDowngrade(v, _) -> expr_try(v)
+    TUpgrade(v, _, _, _) -> expr_try(v)
+    TArrayLit(xs, _) -> any_expr_try(xs)
+    TArrayFill(v, _) -> expr_try(v)
+    TVectorLit(xs, _) -> any_expr_try(xs)
+    TSplat(v, _) -> expr_try(v)
+    TLane(r, _, _) -> expr_try(r)
+    TVecCompare(_, l, r, _) -> expr_try(l) || expr_try(r)
+    TSelect(m, a, b, _) -> expr_try(m) || expr_try(a) || expr_try(b)
+    TReduce(_, r, _) -> expr_try(r)
+    TVecLoad(r, i, _) -> expr_try(r) || expr_try(i)
+    TVecStore(r, i, v) -> expr_try(r) || expr_try(i) || expr_try(v)
+    TBufLit(xs, _) -> any_expr_try(xs)
+    TBufFill(v, n, _) -> expr_try(v) || expr_try(n)
+    TIndex(r, i, _) -> expr_try(r) || expr_try(i)
+    TLen(r, _) -> expr_try(r)
+    TBytes(r) -> expr_try(r)
+    TSlice(b, lo, hi, _, _) -> expr_try(b) || opt_expr_try(lo) || opt_expr_try(hi)
+    TCast(v, _) -> expr_try(v)
+    TConstrainedCheck(v, _) -> expr_try(v)
+    TConstrainedValid(v, _) -> expr_try(v)
+    TConstrainedStep(v, _, _, _) -> expr_try(v)
+    TDeref(v, _) -> expr_try(v)
+    TTypeId(r, _) -> expr_try(r)
+    TAddrOf(p, _) -> expr_try(p)
+    TTempAddr(v, _) -> expr_try(v)
+    TStore(p, v, _) -> expr_try(p) || expr_try(v)
+    TUpdate(p, _, v, _, _, _) -> expr_try(p) || expr_try(v)
+    TIncDec(p, _, _, _, _) -> expr_try(p)
+    TBinary(_, l, r, _) -> expr_try(l) || expr_try(r)
+    TUnary(_, v, _) -> expr_try(v)
+    TIntOp(_, v, a, _, _) -> expr_try(v) || opt_expr_try(a)
+    TAtomic(_, a, xs, _, _, _) -> expr_try(a) || any_expr_try(xs)
+    TLogical(_, l, r) -> expr_try(l) || expr_try(r)
+    TCompare(xs, _) -> any_expr_try(xs)
+    TSeq(xs) -> any_expr_try(xs)
+    TStr(a) -> expr_try(a)
+    TFromBytes(a) -> expr_try(a)
+    TConstView(a) -> expr_try(a)
+    TFormat(a, _) -> expr_try(a)
+    TRender(v, _, s, _) -> expr_try(v) || expr_try(s)
+    TCall(_, xs, _, _) -> any_expr_try(xs)
+    TCallPtr(c, xs, _, _) -> expr_try(c) || any_expr_try(xs)
+    TErase(v, _, _) -> expr_try(v)
+    TVCall(r, _, xs, _, _) -> expr_try(r) || any_expr_try(xs)
+    TVaStart(a) -> expr_try(a)
+    TVaEnd(a) -> expr_try(a)
+    TVaArg(a, _) -> expr_try(a)
+    TVaCopy(d, s) -> expr_try(d) || expr_try(s)
+    TVaPass(a) -> expr_try(a)
+    TStructNew(_, xs) -> any_expr_try(xs)
+    TStructInvCheck(v, _, _) -> expr_try(v)
+    TRecheck(a, r, _, _) -> expr_try(a) || expr_try(r)
+    TEnumNew(_, _, xs) -> any_expr_try(xs)
+    TEnumFromInt(v, _) -> expr_try(v)
+    TEnumTry(v, _, _, _, _) -> expr_try(v)
+    TEnumAttr(_, _, a, _) -> expr_try(a)
+    TField(r, _, _) -> expr_try(r)
+    TIf(c, t, e, _) -> any_cond_try(c) || block_try(t) || opt_block_try(e)
+    TMatch(s, arms, _) -> expr_try(s) || any_arm_try(arms)
+    TBlockExpr(b) -> block_try(b)
+    TWhile(c, body, e, _) -> any_cond_try(c) || stmts_try(body) || opt_block_try(e)
+    TDoWhile(body, c, e, _) -> stmts_try(body) || expr_try(c) || opt_block_try(e)
+    TLoop(body, _) -> stmts_try(body)
+    TFor(_, _, lo, hi, _, body, e, _) ->
+        expr_try(lo) || expr_try(hi) || stmts_try(body) || opt_block_try(e)
+    TCFor(init, c, step, body, e, _) ->
+        stmts_try(init) || opt_expr_try(c) || stmts_try(step) || stmts_try(body) || opt_block_try(e)
+    TForEach(_, _, seq, body, e, _) -> expr_try(seq) || stmts_try(body) || opt_block_try(e)
+    TIterate(_, _, init, next, _, body, e, _) ->
+        expr_try(init) || expr_try(next) || stmts_try(body) || opt_block_try(e)
+    TQuantifier(_, _, _, lo, hi, _, p) -> expr_try(lo) || expr_try(hi) || expr_try(p)
+    TCheckedLoop(_, _, l) -> expr_try(l)
+    _ -> false
+
+private any_expr_try(xs: Buf[TExpr]) -> bool
+    for i in 0..<xs.len()
+        if expr_try(xs.at(i)) then return true
+
+    false
+end any_expr_try
+
+private opt_expr_try(x: Option[TExpr]) -> bool = x.is_some() && expr_try(x.unwrap())
+
+private block_try(b: TBlock) -> bool = stmts_try(b.stmts) || opt_expr_try(b.result)
+
+private opt_block_try(b: Option[TBlock]) -> bool = b.is_some() && block_try(b.unwrap())
+
+private any_cond_try(cs: Buf[TCondTerm]) -> bool
+    for i in 0..<cs.len()
+        cs.at(i) match
+            TCondTest(c) -> if expr_try(c) then return true
+            TCondIs(s, _, _) -> if expr_try(s) then return true
+
+    false
+end any_cond_try
+
+private any_arm_try(arms: Buf[TArm]) -> bool
+    for i in 0..<arms.len()
+        if opt_expr_try(arms.at(i).guard) || block_try(arms.at(i).body) then return true
+
+    false
+end any_arm_try

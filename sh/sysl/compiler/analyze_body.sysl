@@ -1,0 +1,316 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Typing the body a function's declaration is followed by, whatever the body is made of.
+//
+// **A body is a block and a block is an expression**, so one entry answers for every function: the
+// parameters are bound, the contract clauses at the head are read against the signature, and the
+// rest is a value block asked for the declared result. What was a single expression before is that
+// same block with one statement in it.
+
+// The functions of a compilation whose bodies this stage types, with what it had to say about them.
+struct TypedBodies
+    funcs: Buf[TFunc]
+    reported: Buf[Placed]
+
+    // How many bodies were left for a later stage, and why.
+    skipped_generic: usize
+    skipped_defaults: usize
+end TypedBodies
+
+// Reads a compilation's declarations and types every body it can.
+analyze_bodies(units: Buf[Program], t: Target) -> TypedBodies
+    val a = analysis_for(t)
+
+    read_decls(a, units)
+
+    var funcs: Buf[TFunc] = buf()
+    var generic: usize = 0
+    var defaults: usize = 0
+
+    for i in 0..<units.len()
+        val unit = units.at(i)
+        val scope = scope_of_unit(unit)
+
+        for j in 0..<unit.body.len()
+            val s = unit.body.at(j)
+
+            *s.kind match
+                FuncDecl(d) ->
+                    if !d.tparams.is_empty() then generic += 1
+                    else if signature_needs_defaults(a, scope, d) then defaults += 1
+                    else funcs.push(analyze_body(a, scope, s.span, d))
+                _ -> ()
+
+    TypedBodies(funcs, a.diagnostics(), generic, defaults)
+end analyze_bodies
+
+// Whether a signature names a type declared with **type defaults** -- `struct Pair[A, B = A]`
+// written at `Pair[int]`.
+//
+// Filling the omitted argument in from the declaration's default is the stage that reads a
+// declaration's type parameters, so a body whose signature needs one is left for it rather than
+// typed against a type this stage would get wrong.
+private signature_needs_defaults(a: &Analysis, scope: Scope, d: FuncDecl) -> bool
+    var names: Buf[(string, Span)] = buf()
+
+    for i in 0..<d.params.len()
+        names_in(&names, d.params.at(i).typ, d.tparams)
+
+    if d.ret_type.is_some() then names_in(&names, d.ret_type.unwrap(), d.tparams)
+
+    for i in 0..<names.len()
+        val key = lookup_type_key(a, scope, names.at(i).0)
+
+        if key.is_some() then
+            val decl = a.tables.types.get(key.unwrap())
+
+            if decl.is_some() then
+                val has = decl.unwrap().kind match
+                    StructOf(t) -> !t.tdefaults.is_empty()
+                    EnumOf(t) -> !t.tdefaults.is_empty()
+                    _ -> false
+
+                if has then return true
+
+    false
+end signature_needs_defaults
+
+// One function: its parameters in scope, its contract read first, and its body as a value block.
+analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> TFunc
+    val cx = analyzer_for(a, scope)
+    var params: Buf[(string, Type)] = buf()
+
+    for i in 0..<d.params.len()
+        val p = d.params.at(i)
+        val ty = resolve_type(a, scope, p.typ, no_bindings())
+
+        params.push((cx.bind(p.name, ty), ty))
+
+    // **A function that declares no result hands nothing back**, so its body is read with nothing
+    // expected and the value it comes to is discarded -- which is why `probe() = 42` is a `unit`
+    // function rather than an `int` one.
+    val written = d.ret_type.map(w -> resolve_type(a, scope, w, no_bindings()))
+    val ret = declared_result_type(written)
+
+    cx.func_name = d.name
+    cx.ret_ty = Some(ret)
+    cx.ret_is_list = written.is_some() && is_result_list(written.unwrap())
+
+    val split = contract_length(d.body)
+    val contract = analyze_contract(cx, d.body, split, ret)
+    val rest = statements_from(d.body, split)
+
+    // A function owing no value is where statement position starts: its body block is the outermost
+    // one written for effect, and every `if` and `match` that ends it inherits that.
+    val body = body_block(cx, rest, ret)
+
+    if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
+        cx.fault(body_span(rest, span), s"function '${d.name}' should return ${type_show(ret)}, " +
+                 s"but its body yields ${type_show(body.ty)}")
+
+    TFunc(span, func_key(a, scope, span, d), params, ret, body, d.variadic, contract.0, contract.1,
+          contract.2, false, d.conv, d.tailrec, contract.3, d.pure, d.ghost, d.reads, d.writes,
+          exported_symbol(d), d.section)
+end analyze_body
+
+// The body itself, asked for the declared result -- or, where the function owes no value, read in
+// statement position with what it comes to discarded.
+private body_block(cx: &Analyzer, rest: Buf[Stmt], ret: Type) -> TBlock
+    if ret == Unit then return type_value_block(cx, rest, None, true)
+
+    type_value_block(cx, rest, Some(ret), false)
+end body_block
+
+// What a function hands back: the tuple a result list lays out as, and `unit` where none was
+// written.
+private declared_result_type(written: Option[Type]) -> Type
+    if written.is_none() then return Unit
+
+    result_type(written.unwrap())
+end declared_result_type
+
+private is_result_list(t: Type) -> bool = t match
+    Results(_) -> true
+    _ -> false
+
+// How many statements at the head of a body are its contract, which is what splits the clauses from
+// the code. A clause after that is one written somewhere it may not be, and the statement walk says
+// so there.
+private contract_length(body: Buf[Stmt]) -> usize
+    var n: usize = 0
+
+    while n < body.len() && is_contract_clause(body.at(n))
+        n = n + 1
+
+    n
+end contract_length
+
+private is_contract_clause(s: Stmt) -> bool = *s.kind match
+    Require(_, _) -> true
+    Ensure(_, _) -> true
+    Variant(_) -> true
+    _ -> false
+
+private statements_from(body: Buf[Stmt], first: usize) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    for i in first..<body.len()
+        out.push(body.at(i))
+
+    out
+end statements_from
+
+// The leading `require`/`ensure`/`variant` clauses. Both conditions must be `bool`; `result` and
+// `old(e)` are only in scope inside an `ensure` -- `result` also only where the function returns a
+// value -- and the `old` expressions are collected so that the emitter can snapshot them at entry.
+private analyze_contract(cx: &Analyzer, body: Buf[Stmt], upto: usize,
+                         ret: Type) -> (Buf[TClause], Buf[TClause], Buf[TExpr], Option[TExpr])
+    var requires: Buf[TClause] = buf()
+    var ensures: Buf[TClause] = buf()
+    var olds: Buf[TExpr] = buf()
+    var measure: Option[TExpr] = None
+
+    for i in 0..<upto
+        val c = body.at(i)
+
+        *c.kind match
+            Require(cond, msg) -> requires.push(TClause(analyze_bool(cx, cond), msg))
+
+            Ensure(cond, msg) ->
+                cx.ensure_result = if ret == Unit then None else Some(ret)
+                cx.olds = Some(olds)
+
+                val tc = analyze_bool(cx, cond)
+
+                olds = cx.olds.unwrap()
+                cx.olds = None
+                cx.ensure_result = None
+                ensures.push(TClause(tc, msg))
+
+            // The measure reads the parameters and nothing else, and **scoping is what enforces
+            // it** rather than a rule of this pass: the clause is read before the body, in a scope
+            // holding the parameters alone, so a name from the body is undefined here.
+            Variant(e) -> measure = function_measure(cx, c.span, e, measure)
+
+            _ -> ()
+
+    (requires, ensures, olds, measure)
+end analyze_contract
+
+private function_measure(cx: &Analyzer, span: Span, e: Expr,
+                         already: Option[TExpr]) -> Option[TExpr]
+    if already.is_some() then
+        cx.fault(span, "a function declares one 'variant' — a measure is the thing that " +
+                 "decreases, and two of them say nothing about which")
+
+    val te = type_expr_bare(cx, e)
+
+    texpr_type(te) match
+        Integer(_, _, _) -> ()
+        Unknown -> ()
+        other -> cx.fault(span, s"a 'variant' is an integer measure, not ${type_show(other)}")
+
+    Some(te)
+end function_measure
+
+// Where a complaint about the whole body points: its last statement, which is the expression the
+// body came to, and the declaration itself for a body with none.
+private body_span(rest: Buf[Stmt], span: Span) -> Span
+    if rest.is_empty() then return span
+
+    rest.at(rest.len() - 1).span
+end body_span
+
+// The key the declaration was filed under, which is the plain name for the first declaration of it
+// and the numbered slot for every overload after that.
+//
+// **It is read off the tables rather than composed**, so a call and a definition cannot disagree
+// about which of two declarations of one name a key means.
+private func_key(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> string
+    val plain = module_qualify(scope.module_name, d.name)
+    val keys = overload_keys(a, plain)
+
+    for i in 0..<keys.len()
+        val f = a.tables.funcs.get(keys.at(i))
+
+        if f.is_some() && f.unwrap().span.start == span.start &&
+                f.unwrap().scope.src.name == scope.src.name then
+            return keys.at(i)
+
+    plain
+end func_key
+
+// The symbol a function is visible under from C, where it is exported at all: the one the attribute
+// named, and the declaration's own bare name where it named none.
+private exported_symbol(d: FuncDecl) -> Option[string]
+    if d.exported.is_none() then return None
+
+    val named = d.exported.unwrap().symbol
+
+    if named.is_some() then return named
+
+    Some(d.name)
+end exported_symbol
+
+// -- what a test asks ------------------------------------------------------------------------------
+
+// Everything the body pass has to say about one source, as text.
+stmt_diagnostics(text: string) -> Buf[string]
+    val parsed = parse(source_of("test.sysl", text))
+    var out: Buf[string] = buf()
+
+    if !parsed.ok()
+        for i in 0..<parsed.report.len()
+            out.push(parsed.report.at(i).message)
+
+        return out
+    end if
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    for i in 0..<done.reported.len()
+        out.push(done.reported.at(i).diag.message)
+
+    out
+end stmt_diagnostics
+
+// The same, under the name the expression tests already assert on.
+expr_diagnostics(text: string) -> Buf[string] = stmt_diagnostics(text)
+
+// The type the **last** body of a source comes to, rendered the way a diagnostic quotes one.
+//
+// **It is the seam the typing tests assert on**, and the last function is what they read because a
+// test writes whatever it needs above the line it is about.
+body_type(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+    if done.funcs.is_empty() then return "no body"
+
+    val last = done.funcs.at(done.funcs.len() - 1)
+
+    if last.body.result.is_none() then return "no value"
+
+    type_show(texpr_type(last.body.result.unwrap()))
+end body_type
+
+// The same, under the name the expression tests already assert on.
+expr_type(text: string) -> string = body_type(text)
+
+// The same, wrapped in a function so a test may write an expression on its own.
+expr_type_of(expr: string) -> string = body_type(s"probe() = $expr\n")

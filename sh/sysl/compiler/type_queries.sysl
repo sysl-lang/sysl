@@ -289,3 +289,36 @@ wrap(value: BigInt, bits: int, signed: bool) -> BigInt
 
     if signed && cmp(low, pow(from_int(2), usize(bits - 1))) >= 0 then sub(low, span) else low
 end wrap
+
+// Whether a slot of this type may be left to the zero value, which is what a `var` with a type and
+// no initializer asks for.
+//
+// A zero-sized type is trivially its own zero -- there is nothing to produce and nowhere to put it
+// -- without which a struct would lose its zero value by gaining a field that costs nothing. A
+// zeroed view owns nothing and names no elements, which is exactly the empty slice; a weak
+// reference that never had an object and one whose object is gone are the same state, which is the
+// one place `weak T` parts company with `&T`.
+has_zero(t: Type) -> bool = t match
+    Integer(_, _, _) -> true
+    Floating(_) -> true
+    Char -> true
+    Bool -> true
+    Ptr(_) -> true
+    CFn(_, _) -> true
+    VaList -> true
+    Slice(_, _) -> true
+    Str -> true
+    Weak(_) -> true
+    Volatile(inner) -> has_zero(*inner)
+    Array(_, elem) -> has_zero(*elem)
+    Vector(_, elem) -> has_zero(*elem)
+    Struct(d) -> every_field_has_zero(d.fields)
+    Constrained(d) -> has_zero(d.base)
+    other -> zero_sized(other)
+
+private every_field_has_zero(fields: Buf[(string, Type)]) -> bool
+    for i in 0..<fields.len()
+        if !has_zero(fields.at(i).1) then return false
+
+    true
+end every_field_has_zero

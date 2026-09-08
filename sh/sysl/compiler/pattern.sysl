@@ -1,0 +1,456 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Typing a pattern against the value it takes apart.
+//
+// **A typed pattern knows what it matches**, which the untyped one does not: `Some(x)` is a variant
+// of one particular enum by the time it leaves here, and the name it binds has a type. That is what
+// lets the exhaustiveness check and the emitter read one tree.
+//
+// **A pattern is one binding form however deeply it nests**, so a name written twice inside one is a
+// name written twice rather than a shadow. The ordinary scope machinery cannot see that -- every
+// binding declares into the arm's one scope, and a second declaration of a name is how shadowing
+// legitimately works everywhere else -- so the names a pattern has bound are tracked on the
+// analyzer for as long as the outermost call is walking.
+
+// Turns one pattern into its typed form, declaring what it binds into the scope that is open.
+//
+// The outermost call is where a pattern's own set of bound names starts and every call inside it
+// goes straight through, which is what makes "twice in one pattern" a question this can answer and
+// keeps each alternative of an `a | b` arm its own pattern.
+type_pattern(cx: &Analyzer, p: Pattern, ty: Type) -> TPattern
+    if cx.walking_pattern then return pattern_in(cx, p, ty)
+
+    cx.walking_pattern = true
+    cx.bound_in_pattern.clear()
+
+    val t = pattern_in(cx, p, ty)
+
+    cx.walking_pattern = false
+    t
+end type_pattern
+
+// The name a binding introduces, refused where this pattern has already introduced it.
+//
+// It is written once, which is what a pattern binding is: the arm is handed a copy of the part it
+// matched, so a write to the name would be discarded where the arm ends.
+private bind_once(cx: &Analyzer, span: Span, name: string, ty: Type) -> string
+    for i in 0..<cx.bound_in_pattern.len()
+        if cx.bound_in_pattern.at(i) == name then
+            cx.fault(span, s"'$name' is bound twice in one pattern, and the second would quietly " +
+                     "stand for a different part of the value — rename it, or compare the two in " +
+                     "a guard")
+
+            return cx.bind_pattern(name, ty)
+
+    cx.bound_in_pattern.push(name)
+    cx.bind_pattern(name, ty)
+end bind_once
+
+private pattern_in(cx: &Analyzer, p: Pattern, ty: Type) -> TPattern = *p.kind match
+    WildcardPattern -> TWildPattern(ty)
+
+    // `n @ pat` -- the inner pattern against the same value, and the name bound to the whole of it.
+    //
+    // The outer name is declared **before** the inner pattern is walked, which is the order a
+    // reader meets them in: in `v @ Some(v)` the second `v` is the one that repeats. A binding is
+    // not a test, so nothing about the arm's coverage changes.
+    BindPattern(name, inner) ->
+        val bound = bind_once(cx, p.span, name, ty)
+
+        TAtPattern(bound, type_pattern(cx, inner, ty))
+
+    LitPattern(value) -> literal_pattern(cx, p.span, value, ty)
+
+    RangePattern(lo, hi, inclusive) -> range_pattern(cx, p.span, lo, hi, inclusive, ty)
+
+    IdentPattern(written) -> ident_pattern(cx, p.span, written, ty)
+
+    EqPattern(written) -> eq_pattern(cx, p.span, written, ty)
+
+    VariantPattern(written, args) -> variant_pattern(cx, p.span, written, args, ty)
+
+    TuplePattern(args) -> tuple_pattern(cx, p.span, args, ty)
+
+    StructPattern(name, fields) -> struct_pattern(cx, p.span, name, fields, ty)
+
+// A constant the subject is compared against. A literal pattern matches by equality, so any
+// equatable type may carry one -- the ordered scalars, and `bool`, whose two literals also make it
+// exhaustive on their own.
+private literal_pattern(cx: &Analyzer, span: Span, value: Expr, ty: Type) -> TPattern
+    val t = type_expr(cx, value, Some(ty))
+
+    if disagree(texpr_type(t), ty) then
+        cx.fault(span, s"pattern is ${type_show(texpr_type(t))} but the value is ${type_show(ty)}")
+
+    if !is_equatable(ty) && ty != Unknown then
+        cx.fault(span, s"a ${type_show(ty)} value cannot be matched against a literal")
+
+    TLitPattern(t)
+end literal_pattern
+
+// A range between two endpoints of a discrete, numerically ordered value -- the integers, the
+// floats and `char`.
+//
+// `string` is ordered too, but `"a".."z"` reads as a character range while quietly matching every
+// string whose bytes sort between them, so it is excluded rather than left as a surprise.
+private range_pattern(cx: &Analyzer, span: Span, lo: Expr, hi: Expr, inclusive: bool,
+                      ty: Type) -> TPattern
+    if !is_numeric(ty) && ty != Char && ty != Unknown then
+        cx.fault(span, s"a range pattern needs a numeric or char value, not ${type_show(ty)}")
+
+    val tl = type_expr(cx, lo, Some(ty))
+    val th = type_expr(cx, hi, Some(ty))
+
+    if disagree(texpr_type(tl), ty) || disagree(texpr_type(th), ty) then
+        cx.fault(span, s"range pattern must match the ${type_show(ty)} value")
+
+    TRangePattern(tl, th, inclusive)
+end range_pattern
+
+// A name in a pattern binds only where nothing answers to it: a variant is asked for first, then a
+// constant.
+//
+// A qualifier is read the way a variant pattern's is -- the scrutinee's type has already settled
+// which enum is meant, so the prefix is dropped. It cannot be a binding, though, since a name with
+// a dot in it is not a name a program can declare, so a qualified pattern that resolves to nothing
+// is a mistake rather than a new local.
+private ident_pattern(cx: &Analyzer, span: Span, written: string, ty: Type) -> TPattern
+    val name = last_segment(written)
+    val v = variant_named(ty, name)
+
+    if v.is_some() then return nullary_variant(cx, span, ty, v.unwrap(), name)
+
+    val ck = lookup_value_key(cx, cx.an.tables.consts, written)
+
+    if ck.is_some() then return const_pattern(cx, span, ck.unwrap(), ty)
+
+    // A `val` is storage read while the program runs, so there is no value here to compare against
+    // -- and letting the name bind instead is precisely the trap this order is written to avoid.
+    if lookup_value_key(cx, cx.an.tables.vals, written).is_some() then
+        cx.fault(span, s"'$written' is a 'val', which is read while the program runs, so a bare " +
+                 s"name here would bind rather than match — write it as '`$name`' to test the " +
+                 "value it holds, or bind a different name")
+
+        return TWildPattern(ty)
+    end if
+
+    if lookup_value_key(cx, cx.an.tables.extern_vars, written).is_some() then
+        cx.fault(span, s"'$written' is an 'extern' variable, which is read while the program runs, " +
+                 s"so a bare name here would bind rather than match — write it as '`$name`' to " +
+                 "test the value it holds, or bind a different name")
+
+        return TWildPattern(ty)
+    end if
+
+    if written != name then
+        cx.fault(span, s"'$written' names no variant of ${type_show(ty)} and no constant, and a " +
+                 "qualified name cannot bind — write the name a program can declare")
+
+        return TWildPattern(ty)
+    end if
+
+    TBindPattern(bind_once(cx, span, name, ty), ty)
+end ident_pattern
+
+// `` `name` `` -- the quoting says a reference was meant, so this never binds.
+//
+// The three answers are the three kinds of thing a name can stand for here. A nullary variant is
+// the same test the bare form gives and quoting it is merely explicit. A `const` folds to the
+// literal it always did. Everything else is *storage* and becomes an ordinary equality against
+// whatever it holds when the match runs -- a test rather than a shape, so it tells exhaustiveness
+// nothing and the arm still needs a catch-all after it.
+private eq_pattern(cx: &Analyzer, span: Span, written: string, ty: Type) -> TPattern
+    val name = last_segment(written)
+    val v = variant_named(ty, name)
+
+    if v.is_some() then return nullary_variant(cx, span, ty, v.unwrap(), name)
+
+    val ck = lookup_value_key(cx, cx.an.tables.consts, written)
+
+    if ck.is_some() then return const_pattern(cx, span, ck.unwrap(), ty)
+
+    val t = name_expr(cx, span, written, Some(ty))
+
+    if disagree(texpr_type(t), ty) then
+        cx.fault(span, s"pattern is ${type_show(texpr_type(t))} but the value is ${type_show(ty)}")
+
+    if !is_equatable(ty) && ty != Unknown then
+        cx.fault(span, s"a ${type_show(ty)} value cannot be matched against a name — there is no " +
+                 "'==' to test it with")
+
+    TLitPattern(t)
+end eq_pattern
+
+// A constant in a pattern, folded to the literal it stands for and matched as one.
+//
+// **It is read at the type the *scrutinee* has**, not at the one the constant was declared with,
+// which is what makes a `const` written as an `int` match a `u8` value exactly as the literal it
+// stands for would. The expression is read in the declaration's own terms, since that is where its
+// names mean what they meant.
+private const_pattern(cx: &Analyzer, span: Span, key: string, ty: Type) -> TPattern
+    val d = cx.an.tables.consts.get(key).unwrap()
+
+    if d.init.is_none() then return TWildPattern(ty)
+
+    val inner = analyzer_for(cx.an, d.scope)
+    val t = type_expr(inner, d.init.unwrap(), Some(ty))
+
+    if disagree(texpr_type(t), ty) then
+        cx.fault(span, s"pattern is ${type_show(texpr_type(t))} but the value is ${type_show(ty)}")
+
+    if !is_equatable(ty) && ty != Unknown then
+        cx.fault(span, s"a ${type_show(ty)} value cannot be matched against a literal")
+
+    TLitPattern(t)
+end const_pattern
+
+// The variant a name stands for, where the value is an enum that declares one.
+private variant_named(ty: Type, name: string) -> Option[EnumVariant] = underlying(ty) match
+    Enum(d) -> d.variant(name)
+    _ -> None
+
+// A variant matched as a name on its own, which is right only where it has no fields.
+private nullary_variant(cx: &Analyzer, span: Span, ty: Type, v: EnumVariant,
+                        name: string) -> TPattern
+    if !v.fields.is_empty() then
+        cx.fault(span, s"variant '$name' carries data — match it as '$name(…)'")
+
+        return TWildPattern(ty)
+    end if
+
+    TVariantPattern(underlying(ty), v, buf())
+end nullary_variant
+
+// `Circle(r)` -- a variant within the scrutinee's own enum, so a module prefix on the pattern is
+// repeating what the value already settled and is dropped. Against a struct the same spelling is
+// the positional form, which destructures the fields in declaration order.
+private variant_pattern(cx: &Analyzer, span: Span, written: string, args: Buf[Pattern],
+                        ty: Type) -> TPattern
+    val name = last_segment(written)
+
+    underlying(ty) match
+        Enum(d) ->
+            val found = d.variant(name)
+
+            if found.is_none()
+                cx.fault(span, s"enum '${module_show(d.base)}' has no variant '$name'")
+
+                return TWildPattern(ty)
+            end if
+
+            val v = found.unwrap()
+
+            // The same advice the construction gives, worded the same way for the same reason:
+            // naming the spelling that was just refused is no advice at all.
+            if v.fields.is_empty()
+                cx.fault(span, s"variant '$name' carries nothing, so it is matched as a name on " +
+                         "its own — drop the parentheses and the " +
+                         s"${quantity(args.len(), "sub-pattern")} inside them")
+
+                return TWildPattern(ty)
+            end if
+
+            if args.len() != v.fields.len() then
+                cx.fault(span, s"variant '$name' has ${quantity(v.fields.len(), "field")}, but " +
+                         s"${supplied(args.len(), "sub-pattern")}")
+
+            TVariantPattern(underlying(ty), v, sub_patterns(cx, args, v.fields))
+
+        Struct(d) ->
+            if !names_this_type(cx, written, d) then
+                cx.fault(span, s"'$written(…)' does not match a ${type_show(Struct(d))} value")
+
+            if args.len() != d.fields.len() then
+                cx.fault(span, s"struct '${module_show(d.base)}' has " +
+                         s"${quantity(d.fields.len(), "field")}, but " +
+                         s"${supplied(args.len(), "sub-pattern")}")
+
+            // Naming every field is reading every field, so the positional pattern needs each of
+            // them visible -- the same rule the positional constructor is held to.
+            every_field_visible(cx, span, d, "this pattern",
+                                "match the fields it does offer by name, as 'Name{…}'")
+            TStructPattern(d, sub_patterns(cx, args, d.fields))
+
+        other ->
+            cx.fault(span, s"'$name(…)' matches an enum variant or a struct, but the value is " +
+                     s"${type_show(other)}${held_behind(other)}")
+            TWildPattern(ty)
+
+// A tuple pattern is the positional struct pattern with the name off, which is why it ends as the
+// same node: a tuple's parts are its fields, and matching every one of them is what the positional
+// form already means.
+private tuple_pattern(cx: &Analyzer, span: Span, args: Buf[Pattern], ty: Type) -> TPattern
+    underlying(ty) match
+        Struct(d) ->
+            if !is_tuple(d)
+                cx.fault(span, s"'(…)' matches a tuple, but the value is " +
+                         s"${type_show(ty)}${held_behind(ty)}")
+
+                return TWildPattern(ty)
+            end if
+
+            if args.len() != d.fields.len() then
+                cx.fault(span, s"${type_show(Struct(d))} has ${quantity(d.fields.len(), "part")}, " +
+                         s"but ${supplied(args.len(), "sub-pattern")}")
+
+            TStructPattern(d, sub_patterns(cx, args, d.fields))
+
+        other ->
+            cx.fault(span, s"'(…)' matches a tuple, but the value is " +
+                     s"${type_show(other)}${held_behind(other)}")
+            TWildPattern(ty)
+
+// `Point { x, y: b }` -- a struct matched by field name, in any order, with any field left unlisted
+// unconstrained. Both source forms end as one node with a sub-pattern per field in declaration
+// order, a wildcard filling in whatever the pattern did not mention.
+private struct_pattern(cx: &Analyzer, span: Span, name: string, fields: Buf[FieldPattern],
+                       ty: Type) -> TPattern
+    underlying(ty) match
+        Struct(d) ->
+            if !names_this_type(cx, name, d) then
+                cx.fault(span, s"'$name{…}' does not match a ${type_show(Struct(d))} value")
+
+            for i in 0..<fields.len()
+                val f = fields.at(i)
+
+                for j in 0..<i
+                    if fields.at(j).name == f.name then
+                        cx.fault(span, s"field '${f.name}' is matched more than once")
+
+                if d.field_index(f.name) < 0 then
+                    cx.fault(span, s"struct '${module_show(d.base)}' has no field '${f.name}'")
+                else if !field_visible(cx, d.base, f.name) then
+                    cx.fault(span, s"'${f.name}' is private to the file that declares " +
+                             s"'${module_show(d.base)}'")
+
+            var args: Buf[TPattern] = buf()
+
+            for i in 0..<d.fields.len()
+                val written = field_pattern_named(fields, d.fields.at(i).0)
+
+                written match
+                    Some(sub) -> args.push(type_pattern(cx, sub, d.fields.at(i).1))
+                    None -> args.push(TWildPattern(d.fields.at(i).1))
+
+            TStructPattern(d, args)
+
+        other ->
+            cx.fault(span, s"'$name{…}' matches a struct, but the value is " +
+                     s"${type_show(other)}${held_behind(other)}")
+            TWildPattern(ty)
+
+private field_pattern_named(fields: Buf[FieldPattern], name: string) -> Option[Pattern]
+    for i in 0..<fields.len()
+        if fields.at(i).name == name then return Some(fields.at(i).pat)
+
+    None
+end field_pattern_named
+
+// The sub-patterns of a positional form, each against the field it stands at. A pattern with the
+// wrong number of them has already been complained about, so the extra ones are read against
+// nothing rather than dropped -- which is what keeps a name they bind from being undefined below.
+private sub_patterns(cx: &Analyzer, args: Buf[Pattern], fields: Buf[(string, Type)]) -> Buf[TPattern]
+    var out: Buf[TPattern] = buf()
+
+    for i in 0..<args.len()
+        val ty = if i < fields.len() then fields.at(i).1 else Unknown
+
+        out.push(type_pattern(cx, args.at(i), ty))
+
+    out
+end sub_patterns
+
+// Whether the name a pattern wrote is the struct the value turned out to be.
+private names_this_type(cx: &Analyzer, written: string, d: &StructType) -> bool
+    val key = lookup_type_key(cx.an, cx.scope, written)
+
+    key.is_some() && key.unwrap() == d.base
+end names_this_type
+
+// Every field of a positional form has to be visible, since naming them all is reading them all.
+private every_field_visible(cx: &Analyzer, span: Span, d: &StructType, form: string, advice: string)
+    for i in 0..<d.fields.len()
+        val f = d.fields.at(i).0
+
+        if !field_visible(cx, d.base, f) then
+            cx.fault(span, s"$form names every field of '${module_show(d.base)}' in order, and " +
+                     s"'$f' is private to the file that declares it — $advice")
+
+            return
+
+// What a "this pattern does not fit that value" complaint adds where the value is the right shape
+// held behind a memory mode.
+//
+// **Selection is the only implicit dereference**, and deliberately: `p.x` reaches through a `*T` or
+// a `&T` and a pattern does not, so a recursive type -- which has to be held behind one to exist at
+// all -- is matched by writing the dereference.
+private held_behind(t: Type) -> string
+    val inner = pointee(t)
+
+    if inner.is_none() then return ""
+
+    if !matchable(inner.unwrap()) then return ""
+
+    " — a pattern does not reach through a memory mode the way a field selection does, so match " +
+        "what it holds: '*x match'"
+end held_behind
+
+private matchable(t: Type) -> bool = t match
+    Enum(_) -> true
+    Struct(_) -> true
+    _ -> false
+
+// The last segment of a dotted name, which is the whole of it where there is no dot.
+last_segment(name: string) -> string
+    var cut: usize = 0
+
+    for i in 0..<name.bytes.len
+        if name.bytes[i] == u8('.') then cut = i + 1
+
+    name[cut..<name.bytes.len]
+end last_segment
+
+// `1 sub-pattern was given`, `2 sub-patterns were given`.
+supplied(n: usize, noun: string) -> string =
+    s"${quantity(n, noun)} ${if n == 1 then "was" else "were"} given"
+
+// -- what a pattern is, once it is typed -----------------------------------------------------------
+
+// Whether a pattern can fail: false for a wildcard, a binding, or a struct whose every field's
+// sub-pattern is itself irrefutable, since a struct has one form and nothing to test a tag against.
+//
+// A variant pattern is refutable even on a one-variant enum: the tag is read and compared either
+// way, and an enum gaining a variant should not change what an existing pattern means.
+refutable(p: TPattern) -> bool = p match
+    TWildPattern(_) -> false
+    TBindPattern(_, _) -> false
+
+    // A binding never rules a value in or out, so `n @ pat` can fail exactly where `pat` can.
+    TAtPattern(_, inner) -> refutable(*inner)
+    TStructPattern(_, args) -> any_refutable(args)
+    _ -> true
+
+private any_refutable(args: Buf[TPattern]) -> bool
+    for i in 0..<args.len()
+        if refutable(args.at(i)) then return true
+
+    false
+end any_refutable
+
+// Whether a pattern binds any name, directly or inside a variant's or a struct's sub-patterns.
+pattern_binds(p: TPattern) -> bool = p match
+    TBindPattern(_, _) -> true
+    TAtPattern(_, _) -> true
+    TVariantPattern(_, _, args) -> any_binds(args)
+    TStructPattern(_, args) -> any_binds(args)
+    _ -> false
+
+private any_binds(args: Buf[TPattern]) -> bool
+    for i in 0..<args.len()
+        if pattern_binds(args.at(i)) then return true
+
+    false
+end any_binds

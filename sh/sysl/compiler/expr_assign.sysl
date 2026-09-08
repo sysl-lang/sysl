@@ -1,0 +1,49 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Assignment, which is an expression in the tree and a statement everywhere a reader writes one.
+//
+// **What has to hold is that the result can be stored back.** A constrained place is the one case
+// where the arithmetic's type and the place's legitimately differ -- a transparent subtype computes
+// at its base -- so the test is on the representation the two share, and what the difference costs
+// is the check the constraint asks for.
+
+assign_expr(cx: &Analyzer, span: Span, op: string, target: Expr, value: Expr) -> TExpr
+    if op == "="
+        val place = analyze_place(cx, target, "assignment")
+
+        if texpr_type(place) == Unknown then return bad_expr(span)
+
+        val tv = type_expr(cx, value, Some(texpr_type(place)))
+
+        // A diverging value is no value to store, so it is refused here rather than agreeing the
+        // way a `never` does where one really may stand -- as the value a `return` yields.
+        if texpr_type(tv) == Never || disagree(texpr_type(tv), texpr_type(place)) then
+            cx.fault(span, s"cannot assign ${type_show(texpr_type(tv))} to " +
+                     s"${describe_target(target)} of type ${type_show(texpr_type(place))}")
+
+        return TExpr(span, TStore(place, tv, texpr_type(place)))
+    end if
+
+    val place = analyze_place(cx, target, s"'$op'")
+
+    if texpr_type(place) == Unknown then return bad_expr(span)
+
+    val bin = op[0..<op.bytes.len - 1]
+    val tv = type_expr(cx, value, update_expected(texpr_type(place)))
+    val got = arith_type(cx, span, bin, texpr_type(place), texpr_type(tv), value.span)
+
+    if disagree(got, texpr_type(place)) then
+        cx.fault(span, s"'$op' would change the type of ${describe_target(target)}")
+
+    TExpr(span, TUpdate(place, op, tv, texpr_type(place), None, constraint_of(texpr_type(place))))
+end assign_expr
+
+// What a compound arm's value is read at.
+//
+// A **transparent** subtype is homogeneous at its base, which is what `repr` gives: what `t += 120`
+// adds is an ordinary integer, and reading the addend as the subtype would check it against a range
+// that belongs to the total.
+private update_expected(place_ty: Type) -> Option[Type] = Some(repr(place_ty))

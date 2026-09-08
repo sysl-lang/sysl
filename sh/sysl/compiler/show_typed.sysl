@@ -30,13 +30,13 @@ show_typed_func(f: TFunc) -> string
     out.push("        body: ")
     block_node(&out, "        ", f.body)
     scalar_field(&out, "        ", "variadic", flag(f.variadic))
-    scalar_field(&out, "        ", "requires", "[]")
-    scalar_field(&out, "        ", "ensures", "[]")
-    scalar_field(&out, "        ", "olds", "[]")
+    clause_list(&out, "        ", "requires", f.requires)
+    clause_list(&out, "        ", "ensures", f.ensures)
+    expr_list(&out, "        ", "olds", f.olds)
     scalar_field(&out, "        ", "internal", flag(f.internal))
     scalar_field(&out, "        ", "conv", conv_text(f.conv))
     scalar_field(&out, "        ", "tailrec", flag(f.tailrec))
-    scalar_field(&out, "        ", "variant", "None")
+    opt_expr_field(&out, "        ", "variant", f.variant)
     scalar_field(&out, "        ", "pure", flag(f.pure))
     scalar_field(&out, "        ", "ghost", flag(f.ghost))
     scalar_field(&out, "        ", "reads", name_set(f.reads))
@@ -148,15 +148,298 @@ private opt_expr_field(out: *StrBuilder, indent: string, name: string, e: Option
         Some(x) -> expr_field(out, indent, name, x)
         None -> scalar_field(out, indent, name, "None")
 
-// A block, whose statements this stage does not build.
+// A block: the statements, the trailing value where there is one, and what the block comes to.
 private block_node(out: *StrBuilder, indent: string, b: TBlock)
     out.push("TBlock\n")
 
     val inner = indent + "  "
 
-    scalar_field(out, inner, "stmts", "[]")
+    stmt_list(out, inner, "stmts", b.stmts)
     opt_expr_field(out, inner, "result", b.result)
     scalar_field(out, inner, "ty", type_show(b.ty))
+
+private block_field(out: *StrBuilder, indent: string, name: string, b: TBlock)
+    out.push(indent)
+    out.push(name)
+    out.push(": ")
+    block_node(out, indent, b)
+
+private opt_block_field(out: *StrBuilder, indent: string, name: string, b: Option[TBlock])
+    b match
+        Some(x) -> block_field(out, indent, name, x)
+        None -> scalar_field(out, indent, name, "None")
+
+// A contract clause, which the reference tree holds as a plain pair rather than as a record of its
+// own -- so it prints as one.
+private clause_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TClause])
+    if xs.is_empty()
+        scalar_field(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+
+    for i in 0..<xs.len()
+        out.push(item)
+        out.push("- Tuple2\n")
+        expr_field(out, item + "    ", "_1", xs.at(i).cond)
+        scalar_field(out, item + "    ", "_2", option_text(xs.at(i).msg))
+
+// -- the statements ----------------------------------------------------------------------------
+
+private stmt_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TStmt])
+    if xs.is_empty()
+        scalar_field(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+
+    for i in 0..<xs.len()
+        out.push(item)
+        out.push("- ")
+        stmt_node(out, item + "  ", xs.at(i))
+
+private stmt_node(out: *StrBuilder, indent: string, s: TStmt)
+    val inner = indent + "  "
+
+    s match
+        TVarDecl(name, ty, init, align) ->
+            out.push("TVarDecl\n")
+            scalar_field(out, inner, "name", quoted_text(name))
+            scalar_field(out, inner, "ty", type_show(ty))
+            expr_field(out, inner, "init", init)
+            scalar_field(out, inner, "align", count_text(align))
+        TExprStmt(e) ->
+            out.push("TExprStmt\n")
+            expr_field(out, inner, "expr", e)
+        TInvariant(cond, msg) ->
+            out.push("TInvariant\n")
+            expr_field(out, inner, "cond", cond)
+            scalar_field(out, inner, "msg", option_text(msg))
+        TVariantCheck(slot, var_ty, e) ->
+            out.push("TVariantCheck\n")
+            scalar_field(out, inner, "slot", quoted_text(slot))
+            scalar_field(out, inner, "varTy", type_show(var_ty))
+            expr_field(out, inner, "expr", e)
+        TRefDecl(name, ty, place) ->
+            out.push("TRefDecl\n")
+            scalar_field(out, inner, "name", quoted_text(name))
+            scalar_field(out, inner, "ty", type_show(ty))
+            expr_field(out, inner, "place", place)
+        TWriteStmt(w) ->
+            out.push("TWrite\n")
+            write_fields(out, inner, w)
+        TMultiAssign(writes) ->
+            out.push("TMultiAssign\n")
+            write_list(out, inner, "writes", writes)
+        TReturn(value) ->
+            out.push("TReturn\n")
+            opt_expr_field(out, inner, "value", value)
+        TBecome(call) ->
+            out.push("TBecome\n")
+            expr_field(out, inner, "call", call)
+        TBreak(value, depth) ->
+            out.push("TBreak\n")
+            opt_expr_field(out, inner, "value", value)
+            scalar_field(out, inner, "depth", s"$depth")
+        TContinue(depth) ->
+            out.push("TContinue\n")
+            scalar_field(out, inner, "depth", s"$depth")
+        TDefer(stmts) ->
+            out.push("TDefer\n")
+            stmt_list(out, inner, "stmts", stmts)
+        TAsm(lines, operands, clobbers) ->
+            out.push("TAsm\n")
+            scalar_field(out, inner, "lines", quoted_list(lines))
+            operand_list(out, inner, "operands", operands)
+            scalar_field(out, inner, "clobbers", quoted_list(clobbers))
+
+private write_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TWrite])
+    if xs.is_empty()
+        scalar_field(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+
+    for i in 0..<xs.len()
+        out.push(item)
+        out.push("- TWrite\n")
+        write_fields(out, item + "    ", xs.at(i))
+
+private write_fields(out: *StrBuilder, indent: string, w: TWrite)
+    expr_field(out, indent, "place", w.place)
+    scalar_field(out, indent, "op", quoted_text(w.op))
+    expr_field(out, indent, "value", w.value)
+    scalar_field(out, indent, "dispatch", dispatch_text(w.dispatch))
+    scalar_field(out, indent, "check", "[]")
+    scalar_field(out, indent, "constraint", opt_type(w.constraint))
+
+private operand_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TAsmOperand])
+    if xs.is_empty()
+        scalar_field(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+
+    for i in 0..<xs.len()
+        val o = xs.at(i)
+
+        out.push(item)
+        out.push("- TAsmOperand\n")
+        scalar_field(out, item + "    ", "dir", dir_text(o.dir))
+        scalar_field(out, item + "    ", "name", quoted_text(o.name))
+        scalar_field(out, item + "    ", "slot", quoted_text(o.slot))
+        scalar_field(out, item + "    ", "ty", type_show(o.ty))
+        scalar_field(out, item + "    ", "reg", option_text(o.reg))
+
+private dir_text(d: AsmDir) -> string = d match
+    In -> "In"
+    Out -> "Out"
+
+private quoted_list(xs: Buf[string]) -> string
+    if xs.is_empty() then return "[]"
+
+    var out = "["
+
+    for i in 0..<xs.len()
+        if i > 0 then out = out + ", "
+
+        out = out + quoted_text(xs.at(i))
+
+    out + "]"
+end quoted_list
+
+private count_text(n: Option[usize]) -> string = n match
+    Some(v) -> s"$v"
+    None -> "None"
+
+// -- the patterns ------------------------------------------------------------------------------
+
+private pattern_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TPattern])
+    if xs.is_empty()
+        scalar_field(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+
+    for i in 0..<xs.len()
+        out.push(item)
+        out.push("- ")
+        pattern_node(out, item + "  ", xs.at(i))
+
+private pattern_field(out: *StrBuilder, indent: string, name: string, p: TPattern)
+    out.push(indent)
+    out.push(name)
+    out.push(": ")
+    pattern_node(out, indent, p)
+
+private pattern_node(out: *StrBuilder, indent: string, p: TPattern)
+    val inner = indent + "  "
+
+    p match
+        TWildPattern(ty) ->
+            out.push("TWildPattern\n")
+            scalar_field(out, inner, "ty", type_show(ty))
+        TBindPattern(name, ty) ->
+            out.push("TBindPattern\n")
+            scalar_field(out, inner, "name", quoted_text(name))
+            scalar_field(out, inner, "ty", type_show(ty))
+        TAtPattern(name, sub) ->
+            out.push("TAtPattern\n")
+            scalar_field(out, inner, "name", quoted_text(name))
+            pattern_field(out, inner, "inner", *sub)
+        TLitPattern(value) ->
+            out.push("TLitPattern\n")
+            expr_field(out, inner, "value", value)
+        TRangePattern(lo, hi, inclusive) ->
+            out.push("TRangePattern\n")
+            expr_field(out, inner, "lo", lo)
+            expr_field(out, inner, "hi", hi)
+            scalar_field(out, inner, "inclusive", flag(inclusive))
+        TVariantPattern(enum_ty, v, args) ->
+            out.push("TVariantPattern\n")
+            scalar_field(out, inner, "enumTy", type_show(enum_ty))
+            variant_field(out, inner, "variant", v)
+            pattern_list(out, inner, "args", args)
+        TStructPattern(d, args) ->
+            out.push("TStructPattern\n")
+            scalar_field(out, inner, "struct", type_show(Struct(d)))
+            pattern_list(out, inner, "args", args)
+
+// -- a condition's terms, and a match's arms -----------------------------------------------------
+
+private cond_term_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TCondTerm])
+    if xs.is_empty()
+        scalar_field(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+
+    for i in 0..<xs.len()
+        out.push(item)
+        out.push("- ")
+        cond_term_node(out, item + "  ", xs.at(i))
+
+private cond_term_node(out: *StrBuilder, indent: string, c: TCondTerm)
+    val inner = indent + "  "
+
+    c match
+        TCondTest(cond) ->
+            out.push("TCondTest\n")
+            expr_field(out, inner, "cond", cond)
+        TCondIs(subject, patterns, negated) ->
+            out.push("TCondIs\n")
+            expr_field(out, inner, "subject", subject)
+            pattern_list(out, inner, "patterns", patterns)
+            scalar_field(out, inner, "negated", flag(negated))
+
+private arm_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TArm])
+    if xs.is_empty()
+        scalar_field(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+
+    for i in 0..<xs.len()
+        out.push(item)
+        out.push("- TArm\n")
+        pattern_list(out, item + "    ", "patterns", xs.at(i).patterns)
+        opt_expr_field(out, item + "    ", "guard", xs.at(i).guard)
+        block_field(out, item + "    ", "body", xs.at(i).body)
 
 // An enum variant, read generically the way the reference's printer reads any record with no
 // hierarchy of its own.
@@ -406,6 +689,106 @@ private expr_node(out: *StrBuilder, indent: string, e: TExpr)
             expr_field(out, inner, "receiver", receiver)
             scalar_field(out, inner, "index", s"$index")
             scalar_field(out, inner, "ty", type_show(ty))
+        TStore(place, value, ty) ->
+            out.push("TStore\n")
+            expr_field(out, inner, "place", place)
+            expr_field(out, inner, "value", value)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TUpdate(place, op, value, ty, dispatch, check) ->
+            out.push("TUpdate\n")
+            expr_field(out, inner, "place", place)
+            scalar_field(out, inner, "op", quoted_text(op))
+            expr_field(out, inner, "value", value)
+            scalar_field(out, inner, "ty", type_show(ty))
+            scalar_field(out, inner, "dispatch", dispatch_text(dispatch))
+            scalar_field(out, inner, "check", opt_type(check))
+        TSeq(exprs) ->
+            out.push("TSeq\n")
+            expr_list(out, inner, "exprs", exprs)
+        TOld(index, ty) ->
+            out.push("TOld\n")
+            scalar_field(out, inner, "index", s"$index")
+            scalar_field(out, inner, "ty", type_show(ty))
+        TIf(cond, then_block, else_block, ty) ->
+            out.push("TIf\n")
+            cond_term_list(out, inner, "cond", cond)
+            block_field(out, inner, "thenBlock", then_block)
+            opt_block_field(out, inner, "elseBlock", else_block)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TMatch(scrutinee, arms, ty) ->
+            out.push("TMatch\n")
+            expr_field(out, inner, "scrutinee", scrutinee)
+            arm_list(out, inner, "arms", arms)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TBlockExpr(block) ->
+            out.push("TBlockExpr\n")
+            block_field(out, inner, "block", block)
+        TWhile(cond, body, else_block, ty) ->
+            out.push("TWhile\n")
+            cond_term_list(out, inner, "cond", cond)
+            stmt_list(out, inner, "body", body)
+            opt_block_field(out, inner, "elseBlock", else_block)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TDoWhile(body, cond, else_block, ty) ->
+            out.push("TDoWhile\n")
+            stmt_list(out, inner, "body", body)
+            expr_field(out, inner, "cond", cond)
+            opt_block_field(out, inner, "elseBlock", else_block)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TLoop(body, ty) ->
+            out.push("TLoop\n")
+            stmt_list(out, inner, "body", body)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TFor(name, var_ty, lo, hi, inclusive, body, else_block, ty) ->
+            out.push("TFor\n")
+            scalar_field(out, inner, "name", quoted_text(name))
+            scalar_field(out, inner, "varTy", type_show(var_ty))
+            expr_field(out, inner, "lo", lo)
+            expr_field(out, inner, "hi", hi)
+            scalar_field(out, inner, "inclusive", flag(inclusive))
+            stmt_list(out, inner, "body", body)
+            opt_block_field(out, inner, "elseBlock", else_block)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TCFor(init, cond, step, body, else_block, ty) ->
+            out.push("TCFor\n")
+            stmt_list(out, inner, "init", init)
+            opt_expr_field(out, inner, "cond", cond)
+            stmt_list(out, inner, "step", step)
+            stmt_list(out, inner, "body", body)
+            opt_block_field(out, inner, "elseBlock", else_block)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TForEach(name, elem_ty, seq, body, else_block, ty) ->
+            out.push("TForEach\n")
+            scalar_field(out, inner, "name", quoted_text(name))
+            scalar_field(out, inner, "elemTy", type_show(elem_ty))
+            expr_field(out, inner, "seq", seq)
+            stmt_list(out, inner, "body", body)
+            opt_block_field(out, inner, "elseBlock", else_block)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TIterate(cursor, cursor_ty, init, next, bind, body, else_block, ty) ->
+            out.push("TIterate\n")
+            scalar_field(out, inner, "cursor", quoted_text(cursor))
+            scalar_field(out, inner, "cursorTy", type_show(cursor_ty))
+            expr_field(out, inner, "init", init)
+            expr_field(out, inner, "next", next)
+            pattern_field(out, inner, "bind", bind)
+            stmt_list(out, inner, "body", body)
+            opt_block_field(out, inner, "elseBlock", else_block)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TQuantifier(universal, name, var_ty, lo, hi, inclusive, pred) ->
+            out.push("TQuantifier\n")
+            scalar_field(out, inner, "universal", flag(universal))
+            scalar_field(out, inner, "name", quoted_text(name))
+            scalar_field(out, inner, "varTy", type_show(var_ty))
+            expr_field(out, inner, "lo", lo)
+            expr_field(out, inner, "hi", hi)
+            scalar_field(out, inner, "inclusive", flag(inclusive))
+            expr_field(out, inner, "pred", pred)
+        TCheckedLoop(slot, var_ty, walked) ->
+            out.push("TCheckedLoop\n")
+            scalar_field(out, inner, "slot", quoted_text(slot))
+            scalar_field(out, inner, "varTy", type_show(var_ty))
+            expr_field(out, inner, "loop", walked)
         // A node this stage does not build. It is named rather than dropped, so a diff that meets
         // one says which node is missing instead of quietly agreeing.
         _ ->

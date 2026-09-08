@@ -1,0 +1,255 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Inline assembly: which arm this target is built for, and what each operand names.
+//
+// **The arms are chosen between here**, so what reaches the emitter is one architecture's
+// instructions and no record that there were others.
+
+type_asm(cx: &Analyzer, span: Span, arms: Buf[AsmArm]) -> TStmt
+    check_arch_names(cx, arms)
+    check_no_overlap(cx, arms)
+    check_exhaustive(cx, span, arms)
+
+    val here = cpu_symbol(cx.an.tables.target.cpu)
+    val arm = arm_for(arms, here)
+
+    if arm.is_none() then return TAsm(buf(), buf(), buf())
+
+    arm.unwrap().body match
+        // The reason travels from the arm into the diagnostic, which is the whole of what the form
+        // buys over leaving the arm out: omitting it fails every build with "no arm for aarch64",
+        // and writing it lets the builds that *do* have an answer succeed while this one is told
+        // why it cannot.
+        AsmUnavailable(reason) ->
+            cx.fault(arm.unwrap().span, s"this operation has no answer on $here: $reason")
+            TAsm(buf(), buf(), buf())
+
+        AsmCode(lines, operands, clobbers) ->
+            var bound: Buf[TAsmOperand] = buf()
+
+            for i in 0..<operands.len()
+                val one = bind_operand(cx, operands.at(i))
+
+                if one.is_some() then bound.push(one.unwrap())
+
+            check_no_double_binding(cx, operands)
+            check_placeholders(cx, arm.unwrap().span, lines, operands)
+            TAsm(lines, bound, clobbers)
+end type_asm
+
+private arm_for(arms: Buf[AsmArm], here: string) -> Option[AsmArm]
+    for i in 0..<arms.len()
+        val arm = arms.at(i)
+
+        for j in 0..<arm.archs.len()
+            if arm.archs.at(j) == here then return Some(arm)
+
+    None
+end arm_for
+
+// A processor name outside the closed set is a mistake rather than a machine nobody has heard of.
+// That is `#if`'s rule and it is here for `#if`'s reason: a name reading as "some other processor"
+// would leave the arm unselectable and the statement silently short an architecture.
+private check_arch_names(cx: &Analyzer, arms: Buf[AsmArm])
+    val all = all_cpus()
+
+    for i in 0..<arms.len()
+        for j in 0..<arms.at(i).archs.len()
+            val name = arms.at(i).archs.at(j)
+            var known = false
+
+            for k in 0..<all.len()
+                if cpu_symbol(all.at(k)) == name then known = true
+
+            if !known then
+                cx.fault(arms.at(i).span, s"'$name' is not a processor — ${cpu_names(all)} is what " +
+                         "there is")
+
+private cpu_names(all: Buf[Cpu]) -> string
+    var out = ""
+
+    for i in 0..<all.len()
+        if i > 0 then out = out + ", "
+
+        out = out + s"'${cpu_symbol(all.at(i))}'"
+
+    out
+end cpu_names
+
+// One processor, one arm. Two arms claiming the same one leave no rule for which wins, and a reader
+// would have to know the answer to know what the statement does.
+private check_no_overlap(cx: &Analyzer, arms: Buf[AsmArm])
+    var seen: Buf[string] = buf()
+
+    for i in 0..<arms.len()
+        for j in 0..<arms.at(i).archs.len()
+            val name = arms.at(i).archs.at(j)
+            var have = false
+
+            for k in 0..<seen.len()
+                if seen.at(k) == name then have = true
+
+            if have then
+                cx.fault(arms.at(i).span, s"'$name' already has an arm above this one, so there " +
+                         "is no saying which of them answers for it")
+            else
+                seen.push(name)
+
+// Every processor a target can be built for needs an answer, whether or not it is the one being
+// built for now. An architecture with nothing to say says `unavailable` and why; leaving it out is
+// the mistake this reports.
+private check_exhaustive(cx: &Analyzer, span: Span, arms: Buf[AsmArm])
+    val all = all_cpus()
+    var missing: Buf[string] = buf()
+
+    for i in 0..<all.len()
+        val name = cpu_symbol(all.at(i))
+
+        if name != "x86"
+            var covered = false
+
+            for j in 0..<arms.len()
+                for k in 0..<arms.at(j).archs.len()
+                    if arms.at(j).archs.at(k) == name then covered = true
+
+            if !covered then missing.push(s"'$name'")
+
+    if missing.is_empty() then return
+
+    // Commas up to the last, which takes the "or": a bare `asm` block names six processors, and
+    // "'a' or 'b' or 'c'" is a list a reader has to parse rather than read.
+    var named = ""
+
+    for i in 0..<missing.len()
+        if i > 0 then named = named + (if i == missing.len() - 1 then " or " else ", ")
+
+        named = named + missing.at(i)
+
+    cx.fault(span, s"this assembly has no arm for $named. Every processor needs an answer, so " +
+             "that one without instructions is found here rather than by whoever first builds for " +
+             "it — write the instructions, write an empty arm if none are needed there, or write " +
+             "'unavailable' with the reason there is nothing to write")
+
+// Binds an operand to the local it names, refusing what cannot be one.
+//
+// Nothing is what a bound that could not be made answers, and the statement is emitted without that
+// operand rather than with a broken one: the diagnostic has been recorded, and a later pass reading
+// a half-bound operand would be a crash on top of a message the reader already has.
+private bind_operand(cx: &Analyzer, op: AsmOperand) -> Option[TAsmOperand]
+    val local = cx.lookup(op.name)
+
+    if local.is_none()
+        cx.fault(op.span, s"undefined name '${op.name}'. An assembly operand names a variable " +
+                 "that already exists — an expression needs somewhere to be evaluated to, so bind " +
+                 "one first")
+
+        return None
+    end if
+
+    val l = local.unwrap()
+
+    if l.read_only && is_out(op.dir)
+        // A pattern binding is written once as well, and its advice cannot be "declare it 'var'":
+        // there is no keyword on an arm's capture to change.
+        if l.from_pattern then
+            cx.fault(op.span, s"'${op.name}' cannot be written by this assembly, because a " +
+                     "pattern binding holds a copy of what it matched and is written once. Copy " +
+                     "it into a 'var' and name that instead")
+        else
+            cx.fault(op.span, s"'${op.name}' cannot be written by this assembly, because it is a " +
+                     "'val'. Declare it 'var' if the instructions are meant to set it")
+    end if
+
+    if !fits_register(l.ty) then cx.fault(op.span, register_fit_message(op.name, l.ty))
+
+    Some(TAsmOperand(op.dir, op.name, l.unique, l.ty, op.reg))
+end bind_operand
+
+private is_out(d: AsmDir) -> bool = d match
+    Out -> true
+    In -> false
+
+// Whether a value of this type can live in a general-purpose register, which is the only class
+// there is. A trait object is two words and so is not one of them.
+private fits_register(ty: Type) -> bool = ty match
+    Integer(_, _, _) -> true
+    Bool -> true
+    Char -> true
+    Ptr(inner) -> !is_trait(*inner)
+    _ -> false
+
+private register_fit_message(name: string, ty: Type) -> string = ty match
+    Floating(_) ->
+        s"'$name' is a floating-point value, and there is no floating register class yet — only " +
+            "'reg', which is the general-purpose one. Move the value through an integer of the " +
+            "same width, or through memory"
+    Ptr(inner) ->
+        if is_trait(*inner) then
+            s"'$name' is a trait object, which is two words — a pointer to the value and a " +
+                "pointer to its table — so it does not fit a register. Pass whichever half the " +
+                "instructions need"
+        else
+            does_not_fit(name)
+    _ -> does_not_fit(name)
+
+private does_not_fit(name: string) -> string =
+    s"'$name' does not fit a general-purpose register, so it cannot be an assembly operand. " +
+        "Operands are the integers, the pointers and 'bool'; anything larger goes through memory"
+
+// Reading and writing one variable is two operands, and two operands may be two registers -- so the
+// spelling that looks like it says "read this and write the answer back" would compile to reading
+// one register and writing a different one.
+private check_no_double_binding(cx: &Analyzer, operands: Buf[AsmOperand])
+    for i in 0..<operands.len()
+        for j in 0..<i
+            if operands.at(j).name == operands.at(i).name &&
+                    is_out(operands.at(j).dir) != is_out(operands.at(i).dir) then
+                cx.fault(operands.at(i).span, s"'${operands.at(i).name}' is both read and written " +
+                         "here, which is two operands and so possibly two registers — the " +
+                         "instructions would read one and write another. A single operand that " +
+                         "does both is not something this language has yet")
+
+// Every `{name}` in the instructions has to be an operand. A placeholder nothing declares would
+// reach the assembler as a literal brace and fail there, with a message about the text rather than
+// about the name. The other direction is not an error: an operand the instructions do not name is
+// at worst untidy, and at best is how a value is kept alive across a block.
+private check_placeholders(cx: &Analyzer, span: Span, lines: Buf[string],
+                           operands: Buf[AsmOperand])
+    for i in 0..<lines.len()
+        var names: Buf[string] = buf()
+
+        placeholders(&names, lines.at(i))
+
+        for j in 0..<names.len()
+            var declared = false
+
+            for k in 0..<operands.len()
+                if operands.at(k).name == names.at(j) then declared = true
+
+            if !declared then
+                cx.fault(span, s"'{${names.at(j)}}' names an operand this assembly does not " +
+                         s"declare. Add 'in ${names.at(j)} : reg' or 'out ${names.at(j)} : reg', " +
+                         "or write the brace as part of an instruction some other way")
+
+// The `{name}` placeholders one line of instructions carries.
+private placeholders(out: *Buf[string], line: string)
+    val b = line.bytes
+    var i: usize = 0
+
+    while i < b.len
+        if b[i] == u8('{')
+            var j = i + 1
+
+            while j < b.len && b[j] != u8('}')
+                j = j + 1
+
+            if j < b.len
+                out.push(line[i + 1..<j])
+                i = j + 1
+            else
+                i = i + 1
+        else
+            i = i + 1

@@ -13,8 +13,17 @@ import sysl.math.bigint.{BigInt, from_int, negate}
 // comes back is `expr_coerce.sysl`'s; what a form *is* is here.
 
 // Analyzes an expression at the type its position wants.
+//
+// **Whether a result list may stand here is taken before anything below runs**, which is what
+// confines the permission to one expression: every subexpression is analyzed through this same
+// funnel and finds the flag already spent.
 type_expr(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
-    val t = analyze_expected(cx, e, expected)
+    val allowed = cx.multi_ok
+
+    cx.multi_ok = false
+
+    val raw = analyze_expected(cx, e, expected)
+    val t = unwrap_results(cx, e, raw, allowed)
 
     if texpr_type(t) == Unknown then cx.poisoned = true
 
@@ -23,6 +32,44 @@ end type_expr
 
 // The same, with nothing expected.
 type_expr_bare(cx: &Analyzer, e: Expr) -> TExpr = type_expr(cx, e, None)
+
+// Analyzes one expression in a place a **result list** may stand. The permission covers this
+// expression and nothing inside it.
+type_expr_multi(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
+    cx.multi_ok = true
+
+    val t = type_expr(cx, e, expected)
+
+    cx.multi_ok = false
+    t
+end type_expr_multi
+
+// Whether the position being read is the one place a function's own result list may stand: the
+// value of a function that declares one.
+wants_results(cx: &Analyzer, expected: Option[Type]) -> bool
+    if !cx.ret_is_list || expected.is_none() || cx.ret_ty.is_none() then return false
+
+    type_eq(expected.unwrap(), cx.ret_ty.unwrap())
+end wants_results
+
+// A result list unwrapped into the tuple its parts lay out as, so that nothing downstream -- no
+// other analysis, no pass, no emitter -- ever holds one.
+//
+// Where a list is *not* allowed this is the one place that knows it, and it is also the place with
+// the whole expression to name.
+private unwrap_results(cx: &Analyzer, e: Expr, raw: TExpr, allowed: bool) -> TExpr
+    texpr_type(raw) match
+        Results(parts) ->
+            if !allowed then
+                return cx.err(e.span, s"this yields ${quantity(parts.targs.len(), "result")}, and " +
+                              "one value is wanted here — a result list is taken apart by a " +
+                              "binding or an assignment that names every one of them")
+
+            *raw.kind match
+                TCall(name, args, _, _) -> TExpr(raw.span, TCall(name, args, Struct(parts), true))
+                _ -> TExpr(raw.span, *raw.kind)
+        _ -> raw
+end unwrap_results
 
 // A condition, which must be a `bool`.
 analyze_bool(cx: &Analyzer, e: Expr) -> TExpr
@@ -81,6 +128,39 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     LayoutOf(op, t) -> layout_of(cx, e.span, op, t, expected)
     OffsetOf(t, field) -> offset_of(cx, e.span, t, field, expected)
 
+    Assign(op, target, value) -> assign_expr(cx, e.span, op, target, value)
+
+    // An indented block under a binding's `=`. It is a value block like a branch's, asked the same
+    // question by the same context, and its scope closes with it.
+    Block(stmts) -> TExpr(e.span, TBlockExpr(type_value_block(cx, stmts, expected, false)))
+
+    IfExpr(cond, then_body, else_body) ->
+        if_expr(cx, e.span, cond, then_body, else_body, expected, false)
+    MatchExpr(scrut, arms) -> match_expr(cx, e.span, scrut, arms, expected, false)
+
+    While(label, cond, body, else_body) ->
+        while_expr(cx, e.span, label, cond, body, else_body, expected, false)
+    DoWhile(label, body, cond, else_body) ->
+        do_while_expr(cx, e.span, label, body, cond, else_body, expected, false)
+    Loop(label, body) -> loop_expr(cx, e.span, label, body, expected)
+    For(label, name, iter, body, else_body) ->
+        for_expr(cx, e.span, label, name, iter, body, else_body, expected, false)
+    CFor(label, init, cond, step, body, else_body) ->
+        c_for_expr(cx, e.span, label, init, cond, step, body, else_body, expected, false)
+    ConstFor(name, iter, body) -> const_for_expr(cx, e.span, name, iter, body)
+
+    Quantifier(universal, name, iter, pred) ->
+        quantifier_expr(cx, e.span, universal, name, iter, pred)
+
+    // `a, b` where a function's result list is what is being produced.
+    ResultList(values) -> result_list(cx, e.span, values, expected)
+
+    // An `is` outside a condition. The message names every position rather than the one this
+    // happens to be, which is why it lives here and not at the reading of a condition's terms.
+    IsPattern(_, _, _) ->
+        cx.err(e.span, "'is' asks a question about a value's shape, and it is written where a " +
+               "condition is wanted — an 'if', a 'while', or beside another test with '&&'")
+
     NamedArg(name, _) ->
         cx.err(e.span, s"'$name:' names an argument, and there is nothing being called here")
     Spread(_) ->
@@ -91,13 +171,48 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
 
     _ -> cx.err(e.span, deferred_form(e))
 
+// `a, b` where a function's result list is what is being produced. It builds the aggregate the
+// caller takes apart -- the same one a tuple builds, since a result list is a tuple's layout
+// without a tuple's type.
+private result_list(cx: &Analyzer, span: Span, values: Buf[Expr],
+                    expected: Option[Type]) -> TExpr
+    if !cx.ret_is_list then
+        return cx.err(span, "several values separated by commas are a function's result list, and " +
+                      "this function declares one result — write the values it wants, or declare " +
+                      "a result list")
+
+    val want = cx.ret_ty.unwrap_or(Unit)
+
+    underlying(want) match
+        Struct(d) ->
+            if values.len() != d.targs.len() then
+                cx.fault(span, s"this function yields ${quantity(d.targs.len(), "result")}, but " +
+                         s"${supplied(values.len(), "value")}")
+
+            var ts: Buf[TExpr] = buf()
+
+            for i in 0..<values.len()
+                val w = if i < d.fields.len() then Some(d.fields.at(i).1) else None
+                val t = type_expr(cx, values.at(i), w)
+
+                if w.is_some() && disagree(texpr_type(t), w.unwrap()) then
+                    cx.fault(values.at(i).span, s"this result is declared " +
+                             s"${type_show(w.unwrap())}, but the value is " +
+                             s"${type_show(texpr_type(t))}")
+
+                ts.push(t)
+
+            TExpr(span, TStructNew(d, ts))
+        _ -> bad_expr(span)
+end result_list
+
 // The forms a later stage of the analyzer answers, named so that a partial compiler says which
 // stage is missing rather than complaining about the reader's program.
 private deferred_form(e: Expr) -> string = *e.kind match
-    IfExpr(_, _, _) -> "a branch used as a value is not typed yet"
-    MatchExpr(_, _) -> "a 'match' used as a value is not typed yet"
-    Block(_) -> "a block used as a value is not typed yet"
     Lambda(_, _, _) -> "a closure is not typed yet"
+    BlockArg(_) -> "a trailing block is not typed yet"
+    WithExpr(_, _) -> "a 'with' expression is not typed yet"
+    RangeExpr(_, _, _) -> "a range used as a value is not typed yet"
     _ -> "this expression is not typed yet"
 
 private has_nul(s: string) -> bool
@@ -138,7 +253,7 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
 
     // `result` is a *contextual* keyword: a real binding of that name still shadows it.
     if name == "result" && local.is_none() then
-        if cx.ret_ty.is_some() then return TExpr(span, TResult(cx.ret_ty.unwrap()))
+        if cx.ensure_result.is_some() then return TExpr(span, TResult(cx.ensure_result.unwrap()))
 
         return cx.err(span, "'result' is only meaningful inside an 'ensure' of a value-returning " +
                       "function")

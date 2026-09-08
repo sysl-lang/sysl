@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.text.Search
 
 // The context an expression is typed in: the declaration tables the whole compilation shares, the
 // file's own terms, and the names in scope where the expression stands.
@@ -25,7 +26,33 @@ struct Local
     name: string
     unique: string
     ty: Type
+
+    // Whether a write to the name is refused, and whether the refusal is a **pattern's** rather
+    // than a `val`'s. A pattern binding holds a copy of the part it matched, so a write to it would
+    // land where nothing could observe it -- which is a different sentence from "a 'val' is
+    // written once", and the reader of an arm wrote no `val`.
+    read_only: bool
+    from_pattern: bool
 end Local
+
+// One loop, while its body is being read.
+//
+// **It is reached through `&` because a `break` writes into it from wherever it stands.** A loop's
+// result type is met from what its breaks carried and what its `else` yields, so the body has to be
+// able to reach the loop it is inside.
+struct LoopCtx
+    // What a `break` in this loop is read at -- the loop's own position's expectation.
+    expected: Option[Type]
+    label: Option[string]
+    break_tys: Buf[Type]
+
+    // The measure the body declared at its head, taken once the body is read.
+    variant: Option[(string, Type)]
+end LoopCtx
+
+// A loop with nothing broken out of it yet.
+loop_ctx(expected: Option[Type], label: Option[string]) -> &LoopCtx =
+    LoopCtx(expected, label, buf(), None)
 
 // Everything typing one expression needs.
 struct Analyzer
@@ -53,6 +80,50 @@ struct Analyzer
     // keeps a consequence from being reported as a second cause.
     poisoned: bool
 
+    // Every unique name this **function** has handed out, whichever scope it was in.
+    //
+    // **It is per-function rather than per-scope, which is what the typed tree records.** Two
+    // sibling blocks each binding an `x` are two slots of one frame, so the second is `x.1` even
+    // though neither is in scope while the other is -- and a diff against the reference compiler is
+    // a diff on those names.
+    used: Buf[string]
+
+    // The loops open around the expression being read, innermost first.
+    loops: Buf[&LoopCtx]
+
+    // Whether the function declares a **result list** rather than one result, which is what lets a
+    // `return a, b` and a block's trailing `a, b` stand.
+    ret_is_list: bool
+
+    // Whether the body being read is a `for const`'s, which has no loop at run time for a `break`
+    // or a `continue` to act on.
+    in_const_for: bool
+
+    // The measure a loop body declared, waiting for the loop that will carry it, and the counter
+    // that gives each one a slot nothing else holds.
+    pending_variant: Option[(string, Type)]
+    variant_seq: int
+
+    // What an `ensure`'s `result` stands for, and the `old(e)` expressions one collected. Both are
+    // live only while a postcondition is read.
+    ensure_result: Option[Type]
+    olds: Option[Buf[TExpr]]
+
+    // The names **this** pattern has bound so far, and whether one is already being walked.
+    //
+    // A pattern is one binding form however deeply it nests, so a name written twice inside it is a
+    // name written twice rather than a shadow -- which is what the ordinary scope machinery cannot
+    // see, every binding of a pattern declaring into the arm's one scope.
+    bound_in_pattern: Buf[string]
+    walking_pattern: bool
+
+    // Whether **this** expression is one of the three places a result list may stand: the right
+    // side of a binding, the right side of a multiple assignment, and the value of a function whose
+    // own declared result is a list. It is taken and spent at the top of `type_expr`, which is what
+    // confines it to one expression -- every subexpression goes through the same funnel and finds
+    // it already gone.
+    multi_ok: bool
+
     // Opens a scope.
     enter(*self)
         self.marks.push(self.locals.len())
@@ -68,26 +139,65 @@ struct Analyzer
 
     // Binds a name in the innermost scope, under a unique name of its own.
     bind(*self, name: string, ty: Type) -> string
-        val unique = self.unique_for(name)
+        val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty))
+        self.locals.push(Local(name, unique, ty, false, false))
         unique
     end bind
+
+    // Binds a name that may not be assigned to again -- what a local `val` declares.
+    bind_read_only(*self, name: string, ty: Type) -> string
+        val unique = self.fresh_name(name)
+
+        self.locals.push(Local(name, unique, ty, true, false))
+        unique
+    end bind_read_only
+
+    // Binds a name a **pattern** captured, which is written once for the reason a `val` is and
+    // says so in its own words.
+    bind_pattern(*self, name: string, ty: Type) -> string
+        val unique = self.fresh_name(name)
+
+        self.locals.push(Local(name, unique, ty, true, true))
+        unique
+    end bind_pattern
 
     // Binds a name under a unique name the caller chose, which is what a parameter needs: a
     // parameter is loaded by the name its declaration gave it.
     bind_as(*self, name: string, unique: string, ty: Type)
-        self.locals.push(Local(name, unique, ty))
+        self.locals.push(Local(name, unique, ty, false, false))
 
-    // A name nothing else in this body holds.
-    private unique_for(self, name: string) -> string
-        var n = 0
+    // A name nothing else in this **function** holds, which is what a slot of the frame is.
+    //
+    // A name the compiler made for itself starts with the module separator and is left alone;
+    // everything else has any `$` in it marked, so that two names a reader wrote between backticks
+    // cannot collide under the encoding the emitter applies.
+    fresh_name(*self, base: string) -> string
+        val safe = if base.starts_with("$") then base else guarded(base)
 
-        for i in 0..<self.locals.len()
-            if self.locals.at(i).name == name then n = n + 1
+        if !self.holds(safe)
+            self.used.push(safe)
 
-        if n == 0 then name else s"$name.$n"
-    end unique_for
+            return safe
+        end if
+
+        var k = 1
+
+        while self.holds(s"$safe.$k")
+            k = k + 1
+
+        val n = s"$safe.$k"
+
+        self.used.push(n)
+        n
+    end fresh_name
+
+    private holds(self, name: string) -> bool
+        for i in 0..<self.used.len()
+            if self.used.at(i) == name then return true
+
+        false
+    end holds
 
     // The innermost binding of a name, or none.
     lookup(self, name: string) -> Option[Local]
@@ -130,7 +240,21 @@ bad_expr(span: Span) -> TExpr = TExpr(span, TZero(Unknown))
 
 // An analyzer over a compilation's tables, reading a file in its own terms.
 analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
-    Analyzer(an, scope, buf(), buf(), buf(), "", None, None, false)
+    Analyzer(an, scope, buf(), buf(), buf(), "", None, None, false, buf(), buf(), false, false,
+             None, 0, None, None, buf(), false, false)
+
+// A `$` written by a reader is marked, so that `` `a b` `` and `` `a$20b` `` cannot become one
+// register once the emitter encodes the space.
+private guarded(name: string) -> string
+    if !name.contains("$") then return name
+
+    var out = ""
+
+    for c in name.chars
+        out = out + (if c == '$' then "$24" else s"$c")
+
+    out
+end guarded
 
 // Whether a value of one type genuinely cannot stand where another was asked for.
 //
