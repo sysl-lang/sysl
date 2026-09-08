@@ -1,0 +1,468 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int}
+
+// A written type, resolved to the type it means.
+//
+// **This is where a name stops being a name.** `TypeRef` is what the source wrote and `Type` is what
+// it means, and everything between the two is here: which declaration a name reaches, whether the
+// reader is allowed to reach it, how many arguments it takes, and what its fields turn out to be
+// once those arguments are filled in.
+//
+// **A named type is registered before its fields are resolved**, which is the whole of how a
+// declaration that mentions itself terminates: `struct Node { next: *Node }` asks for `Node` while
+// `Node` is still being built, and finds the record that is already there.
+
+// What a type parameter stands for while a declaration is being resolved.
+struct Binding
+    name: string
+    ty: Type
+end Binding
+
+// The bindings of no parameters at all.
+no_bindings() -> Buf[Binding] = buf()
+
+// What a name stands for in a set of bindings.
+bound_type(subst: Buf[Binding], name: string) -> Option[Type]
+    for i in 0..<subst.len()
+        if subst.at(i).name == name then return Some(subst.at(i).ty)
+
+    None
+end bound_type
+
+// The type a written one means.
+resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Type = *t.kind match
+    NamedType(name, args) -> resolve_named(a, scope, t.span, name, args, subst)
+    PtrType(inner) -> Ptr(resolve_type(a, scope, inner, subst))
+    RefType(inner, sync) -> Ref(resolve_type(a, scope, inner, subst), sync)
+    WeakType(inner) -> Weak(resolve_type(a, scope, inner, subst))
+    VolatileType(inner) -> Volatile(resolve_type(a, scope, inner, subst))
+    ArrayType(length, elem, read_only) ->
+        resolve_array(a, scope, t.span, length, elem, read_only, subst)
+    VectorType(lanes, elem) -> Vector(int(const_extent(a, scope, t.span, lanes)),
+                                      resolve_type(a, scope, elem, subst))
+    TupleType(parts, results) -> resolve_tuple(a, scope, parts, results, subst)
+    PackType(name) -> bound_type(subst, name).unwrap_or(Pack(buf()))
+    CFnType(params, ret) ->
+        CFn(resolve_list(a, scope, params, subst), resolve_type(a, scope, ret, subst))
+    FnType(params, ret, _) -> resolve_fn_trait(a, scope, params, ret, subst)
+    SomeType(_) -> Unknown
+    AssocType(_, _) -> Unknown
+    AssocArgType(_, inner) -> resolve_type(a, scope, inner, subst)
+    ValueArgType(e) -> ConstArg(from_int(long(const_extent(a, scope, t.span, e))), int_type())
+
+// Every type of a list, in order.
+resolve_list(a: &Analysis, scope: Scope, ts: Buf[TypeRef], subst: Buf[Binding]) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for i in 0..<ts.len()
+        out.push(resolve_type(a, scope, ts.at(i), subst))
+
+    out
+end resolve_list
+
+private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Expr], elem: TypeRef,
+                      read_only: bool, subst: Buf[Binding]) -> Type
+    val e = resolve_type(a, scope, elem, subst)
+
+    length match
+        Some(n) -> Array(int(const_extent(a, scope, span, n)), e)
+        None -> Slice(e, read_only)
+end resolve_array
+
+// A tuple is an ordinary struct declared by the compiler, and a result list is that tuple wearing a
+// second name -- which is what tells `return a, b` from `return (a, b)`.
+private resolve_tuple(a: &Analysis, scope: Scope, parts: Buf[TypeRef], results: bool,
+                      subst: Buf[Binding]) -> Type
+    val ts = resolve_list(a, scope, parts, subst)
+    val d = tuple_type(ts)
+
+    if results then Results(d) else Struct(d)
+end resolve_tuple
+
+// The struct a tuple of these types is: `$tupleN`, its arguments the parts, its fields numbered.
+tuple_type(ts: Buf[Type]) -> &StructType
+    var fields: Buf[(string, Type)] = buf()
+
+    for i in 0..<ts.len()
+        fields.push((str(i), ts.at(i)))
+
+    StructType(tuple_base(ts.len()), ts, fields, false, None, None)
+end tuple_type
+
+// A written `Fn(a, b) -> r` is the callable trait of that arity, its arguments the parameters with
+// the result last.
+private resolve_fn_trait(a: &Analysis, scope: Scope, params: Buf[TypeRef], ret: TypeRef,
+                         subst: Buf[Binding]) -> Type
+    var args = resolve_list(a, scope, params, subst)
+
+    args.push(resolve_type(a, scope, ret, subst))
+    Trait(fn_base(params.len()), args, buf())
+end resolve_fn_trait
+
+// How long a written extent is.
+//
+// **Only a literal is read here.** A length may be any constant expression, and folding one is
+// expression analysis; a declaration whose length is not a literal is left at zero rather than
+// guessed at, and the later stage that folds constants settles it.
+private const_extent(a: &Analysis, scope: Scope, span: Span, e: Expr) -> usize = *e.kind match
+    IntLit(digits, base, _) -> digits_value(digits, base)
+    _ -> 0
+
+private digits_value(digits: string, base: int) -> usize
+    var n: usize = 0
+    val b = digits.bytes
+
+    for i in 0..<b.len
+        val c = b[i]
+        var d: usize = 16
+
+        if c >= u8('0') && c <= u8('9') then d = usize(c - u8('0'))
+        else if c >= u8('a') && c <= u8('f') then d = usize(c - u8('a')) + 10
+        else if c >= u8('A') && c <= u8('F') then d = usize(c - u8('A')) + 10
+
+        if d < usize(base) then n = n * usize(base) + d
+
+    n
+end digits_value
+
+// -- a name -------------------------------------------------------------------------------------
+
+private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args: Buf[TypeRef],
+                      subst: Buf[Binding]) -> Type
+    val targs = resolve_list(a, scope, args, subst)
+
+    if args.is_empty() then
+        val stood_for = bound_type(subst, name)
+
+        if stood_for.is_some() then return stood_for.unwrap()
+
+    if name == "never" then return Never
+    if name == "Self" then return bound_type(subst, "Self").unwrap_or(Unknown)
+
+    val scalar = scalar_named(name, int(a.tables.target.pointer_bits()))
+
+    if scalar.is_some() then return plain_type(a, scope, span, name, targs, scalar.unwrap())
+
+    val width = width_type(a, scope, span, name)
+
+    if width.is_some() then return plain_type(a, scope, span, name, targs, width.unwrap())
+
+    val key = lookup_type_key(a, scope, name)
+
+    if key.is_none() then
+        a.fault(scope, span, s"unknown type '$name'")
+        return Unknown
+
+    instantiate(a, scope, span, name, key.unwrap(), targs)
+end resolve_named
+
+// A type that takes no arguments, told so where any were written.
+private plain_type(a: &Analysis, scope: Scope, span: Span, name: string, targs: Buf[Type],
+                   ty: Type) -> Type
+    if !targs.is_empty() then a.fault(scope, span, s"type '$name' does not take type arguments")
+
+    ty
+end plain_type
+
+// The width family: a letter and digits, and nothing else.
+//
+// **Once the shape matches, the name belongs to the family and a bad width is a diagnostic** --
+// never a fall-through to "unknown type", which would send a reader looking for a missing
+// declaration when what is wrong is the number they wrote.
+width_type(a: &Analysis, scope: Scope, span: Span, name: string) -> Option[Type]
+    val b = name.bytes
+
+    if b.len < 2 then return None
+    if b[0] != u8('i') && b[0] != u8('u') && b[0] != u8('f') then return None
+
+    for i in 1..<b.len
+        if b[i] < u8('0') || b[i] > u8('9') then return None
+
+    val head = name[0..<1]
+    val digits = name[1..<b.len]
+
+    if b[1] == u8('0') then
+        if all_zero(digits) then
+            a.fault(scope, span, s"'$name' has no bits — the width families start at 1, and a " +
+                    s"single bit is '${head}1'")
+        else
+            a.fault(scope, span, s"'$name' has a leading zero — a width is written plainly, as " +
+                    s"'$head${without_leading_zeros(digits)}'")
+
+        return Some(Unknown)
+
+    val bits = int(digits_value(digits, 10))
+
+    if b[0] == u8('f') then
+        if bits == 16 || bits == 32 || bits == 64 then return Some(Floating(bits))
+
+        if bits == 128 then a.fault(scope, span, "'f128' is not lowered yet — the widest float is 'f64'")
+        else a.fault(scope, span, s"'$name' is not an IEEE floating-point width; they are f16, f32, and f64")
+
+        return Some(Unknown)
+
+    if bits >= 1 && bits <= MaxIntegerBits then return Some(Integer(bits, b[0] == u8('i'), false))
+
+    a.fault(scope, span, s"'$name' is wider than the $MaxIntegerBits bits the back end lowers")
+    Some(Unknown)
+end width_type
+
+private all_zero(digits: string) -> bool
+    val b = digits.bytes
+
+    for i in 0..<b.len
+        if b[i] != u8('0') then return false
+
+    true
+end all_zero
+
+private without_leading_zeros(digits: string) -> string
+    val b = digits.bytes
+    var i: usize = 0
+
+    while i < b.len - 1 && b[i] == u8('0')
+        i += 1
+
+    digits[i..<b.len]
+end without_leading_zeros
+
+// Which declaration a written name reaches, in the terms of the file that wrote it.
+//
+// **The order is the reader's**: what they wrote themselves, what they imported by name, what their
+// own module declares, and only then what a wildcard brought in.
+lookup_type_key(a: &Analysis, scope: Scope, name: string) -> Option[string]
+    val dotted = last_dot(name)
+
+    if dotted.is_some() then return lookup_qualified(a, scope, name, dotted.unwrap())
+
+    val bound = scope.imports.name_key(name)
+
+    if bound.is_some() && a.tables.types.has(bound.unwrap()) then return bound
+
+    val here = module_qualify(scope.module_name, name)
+
+    if a.tables.types.has(here) then return Some(here)
+
+    var found: Option[string] = None
+
+    for i in 0..<scope.imports.wildcards.len()
+        val key = module_qualify(scope.imports.wildcards.at(i), name)
+
+        if found.is_none() && a.tables.types.has(key) && reachable_key(a, key, scope) then
+            found = Some(key)
+
+    found
+end lookup_type_key
+
+// A name written with a dot in it: either a module path and a name, or a bound module alias and a
+// name.
+private lookup_qualified(a: &Analysis, scope: Scope, name: string, cut: usize) -> Option[string]
+    val head = name[0..<cut]
+    val last = name[cut + 1..<name.bytes.len]
+    val aliased = scope.imports.module_as(head)
+
+    if aliased.is_some() then
+        val key = module_qualify(aliased.unwrap(), last)
+
+        if a.tables.types.has(key) then return Some(key)
+
+    val key = module_qualify(head, last)
+
+    if a.tables.types.has(key) then Some(key) else None
+end lookup_qualified
+
+private last_dot(name: string) -> Option[usize]
+    val b = name.bytes
+    var found: Option[usize] = None
+
+    for i in 0..<b.len
+        if b[i] == u8('.') then found = Some(i)
+
+    found
+end last_dot
+
+// Whether a key is one the reader's file may name.
+reachable_key(a: &Analysis, key: string, from: Scope) -> bool = a.tables.access.get(key) match
+    Some(acc) -> reachable(acc, from)
+    None -> true
+
+// -- filling in a declaration ---------------------------------------------------------------------
+
+// The type a declaration at these arguments is.
+instantiate(a: &Analysis, scope: Scope, span: Span, written: string, key: string,
+            targs: Buf[Type]) -> Type
+    if !reachable_key(a, key, scope) then
+        a.fault(scope, span, private_to(key, a.tables.access.get(key).unwrap().file))
+        return Unknown
+
+    val decl = a.tables.types.get(key).unwrap()
+
+    decl.kind match
+        StructOf(d) -> instantiate_struct(a, scope, span, written, key, d, decl.scope, targs)
+        EnumOf(d) -> instantiate_enum(a, scope, span, written, key, d, decl.scope, targs)
+        TraitOf(d) -> instantiate_trait(a, scope, span, written, key, d, targs)
+        TypeOf(d) -> instantiate_named_subtype(a, scope, span, written, key, d, decl.scope, targs)
+        CTypeOf(_) -> opaque_c_type(a, key)
+
+// A `c type` block declares a name a C header owns: the compiler knows it is a type and nothing
+// else about it, which is exactly an empty struct that never has its fields filled in.
+private opaque_c_type(a: &Analysis, key: string) -> Type
+    val already = a.tables.struct_insts.get(key)
+
+    if already.is_some() then return already.unwrap()
+
+    val made = Struct(StructType(key, buf(), buf(), false, None, None))
+
+    a.tables.struct_insts.put(key, made)
+    made
+end opaque_c_type
+
+// Whether the arity is right, and what to say when it is not.
+private check_arity(a: &Analysis, scope: Scope, span: Span, written: string, tparams: Buf[string],
+                    tdefaults: Buf[TypeBinding], targs: Buf[Type]) -> bool
+    val least = tparams.len() - tdefaults.len()
+
+    if targs.len() >= least && targs.len() <= tparams.len() then return true
+
+    a.fault(scope, span, s"type '$written' ${arity_phrase(tparams.len(), least)}, but " +
+            s"${quantity(targs.len(), "type argument")} ${if targs.len() == 1 then "was" else "were"} given")
+    false
+end check_arity
+
+private arity_phrase(most: usize, least: usize) -> string =
+    if least == most then s"takes ${quantity(most, "type argument")}"
+    else s"takes between $least and $most type arguments"
+
+// `1 type argument`, `2 type arguments`.
+quantity(n: usize, noun: string) -> string = s"$n $noun${if n == 1 then "" else "s"}"
+
+// The bindings a declaration's parameters take from the arguments this instantiation was made with.
+private bindings_for(tparams: Buf[string], targs: Buf[Type]) -> Buf[Binding]
+    var out: Buf[Binding] = buf()
+
+    for i in 0..<tparams.len()
+        out.push(Binding(tparams.at(i), if i < targs.len() then targs.at(i) else Unknown))
+
+    out
+end bindings_for
+
+// A struct at these arguments.
+//
+// **The record is registered before its fields are resolved**, so a declaration that mentions itself
+// finds the record already there rather than recursing for ever.
+instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key: string,
+                   d: StructDecl, home: Scope, targs: Buf[Type]) -> Type
+    if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, targs) then return Unknown
+
+    val inst = instance_key(key, targs)
+    val already = a.tables.struct_insts.get(inst)
+
+    if already.is_some() then return already.unwrap()
+
+    val made: &StructType = StructType(key, targs, buf(), d.packed, None, None)
+    val ty = Struct(made)
+
+    a.tables.struct_insts.put(inst, ty)
+
+    val subst = bindings_for(d.tparams, targs)
+
+    for i in 0..<d.fields.len()
+        val f = d.fields.at(i)
+
+        made.fields.push((f.name, resolve_type(a, home, f.typ, subst)))
+
+    ty
+end instantiate_struct
+
+// An enum at these arguments, by the same rule and for the same reason.
+instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: string, d: EnumDecl,
+                 home: Scope, targs: Buf[Type]) -> Type
+    if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, targs) then return Unknown
+
+    val inst = instance_key(key, targs)
+    val already = a.tables.enum_insts.get(inst)
+
+    if already.is_some() then return already.unwrap()
+
+    var simple = true
+
+    for i in 0..<d.variants.len()
+        if !d.variants.at(i).fields.is_empty() then simple = false
+
+    val underlying = d.underlying match
+        Some(t) -> resolve_type(a, home, t, no_bindings())
+        None -> int_type()
+
+    val made: &EnumType = EnumType(key, targs, simple, buf(), underlying)
+    val ty = Enum(made)
+
+    a.tables.enum_insts.put(inst, ty)
+
+    val subst = bindings_for(d.tparams, targs)
+
+    for i in 0..<d.variants.len()
+        val v = d.variants.at(i)
+        var fields: Buf[(string, Type)] = buf()
+
+        for j in 0..<v.fields.len()
+            fields.push((v.fields.at(j).name, resolve_type(a, home, v.fields.at(j).typ, subst)))
+
+        made.variants.push(EnumVariant(v.name, int(i), fields, !v.fields.is_empty()))
+
+    ty
+end instantiate_enum
+
+// A trait used as a type.
+private instantiate_trait(a: &Analysis, scope: Scope, span: Span, written: string, key: string,
+                          d: TraitDecl, targs: Buf[Type]) -> Type
+    if d.tparams.is_empty() && !targs.is_empty() then
+        a.fault(scope, span, s"trait '$written' does not take type arguments")
+        return Unknown
+
+    if !d.tparams.is_empty() then
+        if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, targs) then return Unknown
+
+    Trait(key, targs, buf())
+end instantiate_trait
+
+// A named subtype: a constrained type where it narrows anything, and another spelling of its base
+// where it does not.
+//
+// **Following one has to terminate**, so the chain is walked with the names already entered kept: a
+// name that leads back to itself is refused where it is declared rather than followed until the
+// stack runs out.
+instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: string, key: string,
+                          d: TypeDecl, home: Scope, targs: Buf[Type]) -> Type
+    if !targs.is_empty() then
+        a.fault(scope, span, s"'$written' is ${if is_plain_alias(d) then "an alias" else "a constrained subtype"} " +
+                "and takes no type arguments")
+        return Unknown
+
+    val already = a.tables.constrained_insts.get(key)
+
+    if already.is_some() then return already.unwrap()
+
+    if a.tables.broken.has(key) then return Unknown
+
+    // Entered before the base is resolved, so a chain that leads back here finds the mark rather
+    // than the answer.
+    a.tables.broken.put(key, true)
+
+    val base = resolve_type(a, home, d.base, no_bindings())
+
+    if type_eq(base, Unknown) then return Unknown
+
+    var made = base
+
+    if !is_plain_alias(d) then made = constrained(key, base, d.derived, None, None, false, None)
+
+    a.tables.constrained_insts.put(key, made)
+    made
+end instantiate_named_subtype
+
+// Whether a `type` declaration is only another spelling for what it names -- no `is`, no range, no
+// predicate.
+is_plain_alias(d: TypeDecl) -> bool = !d.derived && d.range.is_none() && d.pred.is_none()

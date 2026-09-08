@@ -1,0 +1,269 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// What the program is made of, as the analyzer holds it.
+//
+// **Every declaration the sources wrote, filed under one key.** A key is the module and the name
+// joined by `$` (`modules.sysl`), which is also the symbol an object file will carry, so there is no
+// second naming scheme to keep in step with the first.
+//
+// **A table keeps the order things were written in.** Two compilations of one program have to say
+// the same things in the same order -- a diagnostic list, a symbol order, a test order -- and a hash
+// table alone does not promise that. So every table is a hash for the lookup and a list for the
+// walk, which is the reference compiler's `LinkedHashMap` in the two parts sysl spells separately.
+
+// A table of declarations, keyed by the key and walked in the order they were registered.
+struct Table[V]
+    order: Buf[string]
+    by_key: Map[string, V]
+
+    put(*self, key: string, v: V)
+        if !self.by_key.has(key) then self.order.push(key)
+
+        self.by_key.put(key, v)
+
+    get(self, key: string) -> Option[V] = self.by_key.get(key)
+
+    has(self, key: string) -> bool = self.by_key.has(key)
+
+    len(self) -> usize = self.order.len()
+
+    key_at(self, i: usize) -> string = self.order.at(i)
+
+    at(self, i: usize) -> V = self.by_key.get(self.order.at(i)).unwrap()
+end Table
+
+// A table with nothing in it.
+table[V]() -> &Table[V] = Table(buf(), map())
+
+// What one file's `import` clauses brought into scope.
+//
+// **Three kinds, because an import says three different things.** A selector binds one name; a
+// module import binds a name that stands for a module and is written before a dot; a wildcard makes
+// everything a module declares reachable unqualified.
+struct Imports
+    names: Buf[(string, string)]
+    modules: Buf[(string, string)]
+    wildcards: Buf[string]
+
+    is_empty(self) -> bool =
+        self.names.is_empty() && self.modules.is_empty() && self.wildcards.is_empty()
+
+    // The key a bound name stands for.
+    name_key(self, name: string) -> Option[string] = lookup_pair(self.names, name)
+
+    // The module a bound name stands for.
+    module_as(self, name: string) -> Option[string] = lookup_pair(self.modules, name)
+
+    binds(self, name: string) -> bool = self.name_key(name).is_some() || self.module_as(name).is_some()
+end Imports
+
+private lookup_pair(pairs: Buf[(string, string)], name: string) -> Option[string]
+    for i in 0..<pairs.len()
+        if pairs.at(i).0 == name then return Some(pairs.at(i).1)
+
+    None
+end lookup_pair
+
+// Nothing imported.
+no_imports() -> Imports = Imports(buf(), buf(), buf())
+
+// The terms one file's declarations are read in: the module they contribute to, what the file
+// imported, and the file itself -- which is what `private` is measured against, since **`private` is
+// file-private and not module-private**.
+struct Scope
+    module_name: string
+    imports: Imports
+    src: Source
+end Scope
+
+// How far a declaration reaches, and from where.
+struct Access
+    vis: Visibility
+    file: string
+end Access
+
+// A declaration of a type: which kind it is, and enough of it to answer a question about the name
+// without reaching for the tree.
+enum DeclKind
+    StructOf(decl: StructDecl)
+    EnumOf(decl: EnumDecl)
+    TraitOf(decl: TraitDecl)
+    TypeOf(decl: TypeDecl)
+    CTypeOf(decl: CTypeDecl)
+end DeclKind
+
+// One declaration as the tables hold it: what it is, where it was written, and in whose terms.
+struct Decl
+    kind: DeclKind
+    span: Span
+    scope: Scope
+end Decl
+
+// A function as the tables hold it.
+struct Func
+    decl: FuncDecl
+    span: Span
+    scope: Scope
+end Func
+
+// A value declaration -- a `const`, a `val`, or an `extern` variable.
+struct ValueDecl
+    name: string
+    typ: Option[TypeRef]
+    vis: Visibility
+    span: Span
+    scope: Scope
+end ValueDecl
+
+// An `impl` block, kept in the order the sources wrote them, since nothing keys one.
+struct Impl
+    decl: ImplDecl
+    span: Span
+    scope: Scope
+end Impl
+
+// Everything the declaration pass builds.
+//
+// **What it deliberately does not hold is the reading of these tables.** Asking what members a type
+// has, whether it satisfies a bound and through which implementation, and what to say when it does
+// not, is a later stage's.
+struct Tables
+    target: Target
+    layout: TargetLayout
+
+    // The modules this compilation has files for, which is what an `import` is checked against.
+    modules: Buf[string]
+
+    // Every type declaration, by key, and how far each reaches.
+    types: &Table[Decl]
+    access: &Table[Access]
+
+    // The functions, and the keys the overloads of one name were filed under.
+    funcs: &Table[Func]
+    overloads: &Table[Buf[string]]
+
+    // The storage: `const`, `val`, `static var` and the `extern` variables.
+    consts: &Table[ValueDecl]
+    vals: &Table[ValueDecl]
+    extern_vars: &Table[ValueDecl]
+
+    // The `extern` functions, which are declared rather than defined.
+    externs: &Table[ExternDecl]
+
+    // The `impl` blocks, in the order they were written.
+    impls: Buf[Impl]
+
+    // Every instantiation the resolution made, so that one `Node[int]` is one type.
+    struct_insts: &Table[Type]
+    enum_insts: &Table[Type]
+    constrained_insts: &Table[Type]
+
+    // The declarations a mistake was already reported about, so that the mentions of one further
+    // down say nothing more.
+    broken: &Table[bool]
+
+    // What a `@tests` file declared, as keys, since it is asked of several tables at once.
+    test_only: Buf[string]
+
+    // Whether a key is one this compilation has a declaration for, whatever kind.
+    declares_type(self, key: string) -> bool = self.types.has(key)
+
+    // Which module a key belongs to.
+    module_of_key(self, key: string) -> string = module_of(key)
+
+    // Whether this compilation has files for a module.
+    has_module(self, name: string) -> bool
+        for i in 0..<self.modules.len()
+            if self.modules.at(i) == name then return true
+
+        false
+    end has_module
+end Tables
+
+// Empty tables for one target.
+tables_for(t: Target) -> &Tables =
+    Tables(t, layout_for(t), buf(), table(), table(), table(), table(), table(), table(), table(),
+           table(), buf(), table(), table(), table(), table(), buf())
+
+// The analyzer's state while the declarations are being read: the tables, what it has to say, and
+// the undo log a speculative walk rewinds through.
+//
+// **There are no exceptions in sysl, so a failure is recorded and answered with a fallback** rather
+// than thrown and caught. The reference compiler's `err` throws an `AnalyzerError` that `recover`
+// turns into a recorded diagnostic and a fallback value; here `fault` records the same diagnostic
+// and the caller answers with the same fallback, which is the same control flow written out. What
+// is kept exactly is the *set*: a diagnostic is recorded once however many times it is reached.
+struct Analysis
+    tables: &Tables
+    found: Buf[Placed]
+    warned: Buf[Placed]
+    journal: &Journal
+
+    // Records an error about a place, unless the same thing has already been said about it.
+    fault(*self, scope: Scope, span: Span, message: string)
+        val d = placed_error(scope.src, span, message)
+
+        if !already_said(self.found, d) then self.found.push(d)
+
+    // The same, for something that is not a reason to stop.
+    caution(*self, scope: Scope, span: Span, message: string)
+        val d = placed_warning(scope.src, span, message)
+
+        if !already_said(self.warned, d) then self.warned.push(d)
+
+    // How many complaints have been recorded, which is what an attempt compares across a trial.
+    complaints(self) -> usize = self.found.len()
+
+    // Everything to say, in the order a reader reads it.
+    diagnostics(self) -> Buf[Placed] = in_source_order(self.found)
+
+    warnings(self) -> Buf[Placed] = in_source_order(self.warned)
+
+    // Puts the complaints back to what they were, which is what a trial that is thrown away owes.
+    restore_complaints(*self, n: usize)
+        self.found.truncate(n)
+
+    // Runs a trial with everything it writes recorded, and puts all of it back afterwards.
+    //
+    // It is the one of the three that is always undone: it is asked to find something out, never to
+    // build anything.
+    sandboxed(*self) -> usize = self.journal.enter()
+
+    // Closes what `sandboxed` opened, undoing every write made inside it.
+    release(*self, mark: usize)
+        self.journal.rewind(mark)
+        self.journal.leave()
+end Analysis
+
+// Whether a report already carries a complaint about the same place.
+private already_said(all: Buf[Placed], d: Placed) -> bool
+    for i in 0..<all.len()
+        val a = all.at(i)
+
+        if a.src.name == d.src.name && a.diag.span.start == d.diag.span.start &&
+                a.diag.message == d.diag.message then return true
+
+    false
+end already_said
+
+// An analysis over empty tables.
+analysis_for(t: Target) -> &Analysis = Analysis(tables_for(t), buf(), buf(), journal())
+
+// -- how far a declaration reaches ---------------------------------------------------------------
+
+// Whether a declaration is reachable from a file.
+//
+// **`private` is file-private**, so a module split across files has a public seam between them: a
+// helper another file of the same module needs cannot be `private`.
+reachable(a: Access, from: Scope) -> bool = a.vis match
+    Public -> true
+    File -> a.file == from.src.name
+    Scoped(_) -> true
+
+// What a diagnostic says about a name the reader may not reach.
+private_to(key: string, file: string) -> string =
+    s"'${module_show(key)}' is private to '$file', the file that declares it"

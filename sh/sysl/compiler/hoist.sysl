@@ -1,0 +1,366 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Reading a program's declarations into the tables.
+//
+// **Nothing here resolves a type.** Hoisting registers *names*: what a file declares, in what module,
+// how far it reaches, and whether something already stood under that key. That has to happen for
+// every file before any type is resolved, because a declaration may name one written below it -- in
+// the same file, in a sibling, or in a module imported the other way round.
+//
+// **Each declaration is a recovery region.** A refusal is recorded and the declaration abandoned,
+// and the walk resumes at the next one. That is what turns one error per compilation into one error
+// per mistake.
+
+// The module the auto-import brings into scope with no `import` written.
+const AutoImportedModule: string = "sysl"
+
+// The module a file contributes to, which is what its header said or the root where it said nothing.
+module_of_unit(p: Program) -> string = p.module_name match
+    Some(m) -> m.show()
+    None -> ModuleRoot
+
+// The terms one file's declarations are read in.
+scope_of_unit(p: Program) -> Scope =
+    Scope(module_of_unit(p), gather_imports(p.body, module_of_unit(p)), p.src)
+
+// What a file's `import` clauses bring into scope, together with the auto-import every file gets.
+//
+// **A wildcard is a module rather than a set of names**, because what a module declares is not
+// settled until every file has been read: the list is resolved at the point a name is looked up.
+gather_imports(body: Buf[Stmt], here: string) -> Imports
+    var names: Buf[(string, string)] = buf()
+    var modules: Buf[(string, string)] = buf()
+    var wildcards: Buf[string] = buf()
+
+    if here != AutoImportedModule && !starts_with_module(here, AutoImportedModule) then
+        wildcards.push(AutoImportedModule)
+
+    for i in 0..<body.len()
+        *body.at(i).kind match
+            ImportDecl(d) -> read_import(&names, &modules, &wildcards, d)
+            _ -> ()
+
+    Imports(names, modules, wildcards)
+end gather_imports
+
+private read_import(names: *Buf[(string, string)], modules: *Buf[(string, string)],
+                    wildcards: *Buf[string], d: ImportDecl)
+    val path = joined(d.path, ".")
+
+    if d.wildcard then
+        wildcards.push(path)
+        return
+
+    if d.selectors.is_empty() then
+        modules.push((import_bound(d), path))
+        return
+
+    for i in 0..<d.selectors.len()
+        val s = d.selectors.at(i)
+
+        names.push((selector_bound(s), module_qualify(path, s.name)))
+
+// Whether one module name is the other or is below it.
+starts_with_module(name: string, outer: string) -> bool
+    val prefix = s"$outer."
+
+    name == outer || (name.bytes.len > prefix.bytes.len && name[0..<prefix.bytes.len] == prefix)
+end starts_with_module
+
+// The parts of a path joined by a separator.
+joined(parts: Buf[string], sep: string) -> string
+    var out = ""
+
+    for i in 0..<parts.len()
+        if i > 0 then out = s"$out$sep"
+
+        out = s"$out${parts.at(i)}"
+
+    out
+end joined
+
+// -- reading a whole compilation's declarations --------------------------------------------------
+
+// Registers every declaration of every file, in the terms its own file set up.
+hoist_units(a: &Analysis, units: Buf[Program])
+    var scopes: Buf[Scope] = buf()
+
+    for i in 0..<units.len()
+        val scope = scope_of_unit(units.at(i))
+
+        scopes.push(scope)
+
+        if !a.tables.has_module(scope.module_name) then a.tables.modules.push(scope.module_name)
+
+    // The reserved shape is refused before anything is registered, so a declaration that tried to
+    // take one is answered by that rather than by the consequences of a name the rest of the
+    // compiler then could not resolve.
+    for i in 0..<units.len()
+        val body = units.at(i).body
+
+        for j in 0..<body.len()
+            val taken = reserved_in(body.at(j))
+
+            for k in 0..<taken.len()
+                a.fault(scopes.at(i), taken.at(k).2, refuse_reserved(taken.at(k).0, taken.at(k).1))
+
+    for i in 0..<units.len()
+        val body = units.at(i).body
+
+        for j in 0..<body.len()
+            hoist_stmt(a, scopes.at(i), body.at(j))
+end hoist_units
+
+// Registers one top-level declaration.
+hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
+    *s.kind match
+        StructDecl(d) -> hoist_type_name(a, scope, s.span, d.name, d.vis, StructOf(d))
+        EnumDecl(d) -> hoist_type_name(a, scope, s.span, d.name, d.vis, EnumOf(d))
+        TraitDecl(d) -> hoist_type_name(a, scope, s.span, d.name, d.vis, TraitOf(d))
+        TypeDecl(d) -> hoist_type_name(a, scope, s.span, d.name, d.vis, TypeOf(d))
+        CTypeBlock(ts) ->
+            for i in 0..<ts.len()
+                val t = ts.at(i)
+
+                hoist_type_name(a, scope, t.span, t.name, t.vis, CTypeOf(t))
+        CConstBlock(cs) ->
+            for i in 0..<cs.len()
+                val c = cs.at(i)
+
+                hoist_value(a, scope, c.span, c.name, Some(c.typ), c.vis, a.tables.consts,
+                            "constant")
+        ConstDecl(name, typ, _, vis) ->
+            hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.consts, "constant")
+        ValDecl(name, typ, _, vis, _, _) ->
+            hoist_value(a, scope, s.span, name, typ, vis, a.tables.vals, "'val'")
+        ExternVarDecl(name, typ, _, vis) ->
+            hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.extern_vars,
+                        "'extern' variable")
+        ExternDecl(d) -> hoist_extern(a, scope, s.span, d)
+        FuncDecl(d) -> hoist_func(a, scope, s.span, d)
+        ImplDecl(d) -> a.tables.impls.push(Impl(d, s.span, scope))
+        StaticDecl(inner) -> hoist_stmt(a, scope, inner)
+        _ -> ()
+
+// Registers a name that stands for a type.
+private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vis: Visibility,
+                        kind: DeclKind)
+    val key = module_qualify(scope.module_name, name)
+
+    if type_name_taken(a, key, name) then
+        a.fault(scope, span, type_taken_message(kind, name))
+        return
+
+    a.tables.types.put(key, Decl(kind, span, scope))
+    a.tables.access.put(key, Access(vis, scope.src.name))
+
+    if is_test_only(scope) then a.tables.test_only.push(key)
+
+// What a second declaration of a type name is told. A named subtype says "the name", because what
+// it declares may be an alias rather than a type of its own.
+private type_taken_message(kind: DeclKind, name: string) -> string = kind match
+    TypeOf(d) -> if d.derived || d.range.is_some() || d.pred.is_some() then
+            s"type '$name' is already declared"
+        else s"the name '$name' is already declared"
+    _ -> s"type '$name' is already declared"
+
+// Whether something already stands for this name as a type: another declaration, a scalar, or one
+// of the two words the language answers for itself.
+type_name_taken(a: &Analysis, key: string, written: string) -> bool =
+    a.tables.types.has(key) || written == "never" || written == "Self" ||
+        scalar_named(written, int(a.tables.target.pointer_bits())).is_some()
+
+// Registers a name that stands for storage.
+private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
+                    vis: Visibility, into: &Table[ValueDecl], what: string)
+    val key = module_qualify(scope.module_name, name)
+    val holder = value_name_holder(a, key)
+
+    if holder.is_some() then
+        a.fault(scope, span, s"'$name' is already declared as ${holder.unwrap()}")
+        return
+
+    into.put(key, ValueDecl(name, typ, vis, span, scope))
+    a.tables.access.put(key, Access(vis, scope.src.name))
+
+    if is_test_only(scope) then a.tables.test_only.push(key)
+
+// What already holds a name that stands for storage, where anything does.
+//
+// A variant and a constant of one name have nothing to be told apart by, so the clash is real and is
+// reported where it is written; two *variants* of one name are told apart by their enums, which is
+// why an enum is not in this list.
+value_name_holder(a: &Analysis, key: string) -> Option[string]
+    if a.tables.consts.has(key) then return Some("a constant")
+    if a.tables.vals.has(key) then return Some("a 'val'")
+    if a.tables.extern_vars.has(key) then return Some("an 'extern' variable")
+
+    None
+end value_name_holder
+
+private hoist_extern(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
+    val key = module_qualify(scope.module_name, d.name)
+
+    if a.tables.externs.has(key) then
+        a.fault(scope, span, s"'${d.name}' is already declared as an 'extern' for the symbol " +
+                s"'${extern_symbol(a.tables.externs.get(key).unwrap())}' — two 'extern' declarations " +
+                "of one name are one declaration written twice")
+        return
+
+    if a.tables.funcs.has(key) then
+        a.fault(scope, span, s"'${d.name}' is already declared as a function, so this 'extern' " +
+                "would overload it — and an 'extern' has no sysl declaration for a call to be told " +
+                "apart by")
+        return
+
+    a.tables.externs.put(key, d)
+    a.tables.access.put(key, Access(d.vis, scope.src.name))
+
+// The symbol an `extern` names, which is its link name where it gave one and its own name otherwise.
+extern_symbol(d: ExternDecl) -> string = d.link match
+    Some(sym) -> sym
+    None -> d.name
+
+// Registers a function, which may be one of a set: two of a name are legal where a call can tell
+// them apart by its arguments, and are the same declaration written twice where it cannot.
+private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
+    val plain = module_qualify(scope.module_name, d.name)
+    val holder = value_name_holder(a, plain)
+
+    if holder.is_some() then
+        a.fault(scope, span, s"'${d.name}' is already declared as ${holder.unwrap()}")
+        return
+
+    if a.tables.externs.has(plain) then
+        a.fault(scope, span, s"'${d.name}' is already declared as an 'extern', which this would " +
+                "overload — what tells two declarations of one name apart is their parameters, and " +
+                "an 'extern' has none the analyzer may read")
+        return
+
+    val already = overload_keys(a, plain)
+    var clash = false
+
+    for i in 0..<already.len()
+        val other = a.tables.funcs.get(already.at(i))
+
+        val rival = rival_of(scope, d.vis, other)
+
+        if rival.is_some() then
+            if same_params(d.params, rival.unwrap().decl.params) then
+                a.fault(scope, span, s"function '${d.name}' is already declared" +
+                        differing_result(d, rival.unwrap().decl))
+                clash = true
+            else if overlapping(d, rival.unwrap().decl) then
+                a.fault(scope, span, indistinguishable(plain, d, rival.unwrap().decl))
+                clash = true
+
+    if clash then return
+
+    val key = if already.is_empty() then plain else s"$plain.${already.len()}"
+    var set: Buf[string] = buf()
+
+    for i in 0..<already.len()
+        set.push(already.at(i))
+
+    set.push(key)
+    a.tables.overloads.put(plain, set)
+    a.tables.funcs.put(key, Func(d, span, scope))
+    a.tables.access.put(key, Access(d.vis, scope.src.name))
+
+    if is_test_only(scope) then a.tables.test_only.push(key)
+
+// The other declaration a call site would have to be told apart from, where there is one: a
+// declaration this file cannot name is not one a call here could be confused with.
+private rival_of(here: Scope, mine: Visibility, other: Option[Func]) -> Option[Func]
+    if other.is_none() then return None
+    if separable(here, other.unwrap().scope, mine, other.unwrap().decl.vis) then return None
+
+    other
+end rival_of
+
+// The keys the declarations of one name are filed under.
+overload_keys(a: &Analysis, plain: string) -> Buf[string] = a.tables.overloads.get(plain) match
+    Some(set) -> set
+    None -> buf()
+
+// Whether two declarations of one name are ones no call site sees both of, which is what makes them
+// not an overload pair at all.
+//
+// The condition is deliberately both ways: it takes a file-private declaration past a sibling's
+// file-private one, and takes nothing past a public one.
+private separable(here: Scope, there: Scope, mine: Visibility, theirs: Visibility) -> bool =
+    is_file_private(mine) && is_file_private(theirs) && here.src.name != there.src.name
+
+private is_file_private(v: Visibility) -> bool = v match
+    File -> true
+    _ -> false
+
+// Whether two parameter lists are written the same way, which is what makes a pair a duplicate
+// rather than an overload set that needs distinguishing.
+private same_params(a: Buf[Param], b: Buf[Param]) -> bool
+    if a.len() != b.len() then return false
+
+    for i in 0..<a.len()
+        if type_text(a.at(i).typ) != type_text(b.at(i).typ) then return false
+
+    true
+end same_params
+
+// Whether a call could fit both declarations: the arities they accept overlap, and the parameters up
+// to the shorter of the two are written the same way.
+private overlapping(d: FuncDecl, other: FuncDecl) -> bool
+    val lo = max_usize2(required(d.params), required(other.params))
+    val hi = min_usize2(accepted(d.params, d.variadic), accepted(other.params, other.variadic))
+
+    if lo > hi then return false
+
+    val n = min_usize2(lo, min_usize2(d.params.len(), other.params.len()))
+
+    for i in 0..<n
+        if type_text(d.params.at(i).typ) != type_text(other.params.at(i).typ) then return false
+
+    true
+end overlapping
+
+private required(ps: Buf[Param]) -> usize
+    var n: usize = 0
+
+    for i in 0..<ps.len()
+        if ps.at(i).default.is_none() then n += 1
+
+    n
+end required
+
+private accepted(ps: Buf[Param], variadic: bool) -> usize =
+    if variadic then 4294967295 else ps.len()
+
+private max_usize2(a: usize, b: usize) -> usize = if a > b then a else b
+private min_usize2(a: usize, b: usize) -> usize = if a < b then a else b
+
+// The half of the duplicate message that is worth finishing where the two results differ, because
+// that is the pair a reader wrote on purpose and expected to work.
+private differing_result(d: FuncDecl, other: FuncDecl) -> string =
+    if written_result(d) == written_result(other) then ""
+    else " — which declaration a call means is decided by its arguments and never by what it " +
+        "returns, so two that differ only in the result have no call that tells them apart"
+
+private written_result(d: FuncDecl) -> string = d.ret_type match
+    Some(t) -> type_text(t)
+    None -> ""
+
+private indistinguishable(plain: string, d: FuncDecl, other: FuncDecl) -> string
+    val n = min_usize2(max_usize2(required(d.params), required(other.params)),
+                       min_usize2(d.params.len(), other.params.len()))
+
+    s"'${module_show(plain)}' is already declared with parameters this one could not be told from — " +
+    s"a call passing $n argument${if n == 1 then "" else "s"} would fit both, and which " +
+    "declaration a call means is decided by its arguments and never by what it returns. Two " +
+    "declarations of one name have to differ in a way a call site can show"
+end indistinguishable
+
+// Whether the file a scope belongs to said `@tests`, so that what it declares is the module's tests'
+// and no build but a test build keeps it.
+private is_test_only(scope: Scope) -> bool = false

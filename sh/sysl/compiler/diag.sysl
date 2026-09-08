@@ -1,0 +1,141 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// What the analyzer says, and how a compilation's worth of it is printed.
+//
+// **A diagnostic and its rendering are `sh.sysl.parsing`'s**, because every reader in the org wants
+// the same `-->`, the same quoted line and the same caret. What is here is the part that is this
+// compiler's: which **file** a complaint is about, in what order a compilation's complaints are
+// read, and how many of them are shown.
+//
+// **A complaint carries its source rather than an index into a list of them**, which is the
+// reference compiler's `Pos` and is what lets a diagnostic be rendered by whoever is holding it. An
+// analysis reads many files at once, so a span alone says nothing.
+
+// One complaint, and the file it is about.
+struct Placed
+    src: Source
+    diag: Diagnostic
+
+    is_error(self) -> bool = self.diag.is_error()
+
+    // The whole thing rendered against the file it is about.
+    render(self) -> string = self.diag.render(self.src)
+
+    // Where it is, in the one-line form a build log wants.
+    location(self) -> string
+        val at = self.src.locate(self.diag.span.start)
+
+        s"${self.src.name}:${at.line}:${at.col}"
+    end location
+end Placed
+
+// An error about a place in a file.
+placed_error(src: Source, span: Span, message: string) -> Placed = Placed(src, error(span, message))
+
+// A warning about one, which is not a reason to stop.
+placed_warning(src: Source, span: Span, message: string) -> Placed =
+    Placed(src, Diagnostic(Warning, span, message, "", ""))
+
+// How many errors one compilation reports.
+//
+// Five is already more than anyone fixes before compiling again, and the further down a broken file
+// a diagnostic is, the likelier it is to be a consequence of one further up rather than a mistake of
+// its own. A wall of them is not more information.
+//
+// **It is the renderer's rule and not the list's.** A caller reading diagnostics as data wants all
+// of them -- an editor underlines every mistake in the file, and five would leave the rest unmarked
+// -- so nothing truncates until the report does.
+const DiagnosticLimit: usize = 5
+
+// The order a reader reads a compilation in: by file, then by line, then by column.
+//
+// Every pass that collects more than one owes this, so it lives here rather than in whichever pass
+// happened to need it first. **Two complaints about one place keep the order they were made in**,
+// which is the order that reads as an explanation.
+in_source_order(all: Buf[Placed]) -> Buf[Placed]
+    var order: Buf[(string, usize, usize)] = buf()
+
+    for i in 0..<all.len()
+        order.push((all.at(i).src.name, all.at(i).diag.span.start, i))
+
+    var out: Buf[Placed] = buf()
+    var taken: Buf[bool] = buf()
+
+    for _i in 0..<all.len()
+        taken.push(false)
+
+    for _n in 0..<all.len()
+        var best = all.len()
+
+        for i in 0..<all.len()
+            if !taken.at(i) then
+                if best == all.len() then best = i
+                else if earlier(order.at(i), order.at(best)) then best = i
+
+        taken.set(best, true)
+        out.push(all.at(best))
+
+    out
+end in_source_order
+
+private earlier(a: (string, usize, usize), b: (string, usize, usize)) -> bool
+    if a.0 != b.0 then return a.0 < b.0
+    if a.1 != b.1 then return a.1 < b.1
+
+    a.2 < b.2
+end earlier
+
+// A compilation's diagnostics, assembled: at most the limit of them, separated by a blank line, with
+// a closing count where there were more. The ones kept are the **first** -- the list arrives in
+// source order, and an error early in a file is the one worth reading.
+analysis_report(all: Buf[Placed]) -> string
+    val ordered = in_source_order(all)
+    var b = str_builder()
+    val shown = if ordered.len() < DiagnosticLimit then ordered.len() else DiagnosticLimit
+
+    for i in 0..<shown
+        if i > 0 then b.push("\n\n")
+
+        b.push(ordered.at(i).render())
+
+    if ordered.len() > DiagnosticLimit then
+        b.push(s"\n\nshowing the first ${DiagnosticLimit} of ${ordered.len()} errors")
+
+    b.finish()
+end analysis_report
+
+// A note rather than a complaint: the location first, in the one-line form a build log wants, since
+// these are printed by the handful and not read one at a time.
+explain(msg: string, where: Placed) -> string = s"${where.location()}: $msg"
+
+// Whether anything in a list is an error, which is what decides an exit status -- a list of
+// warnings alone is a successful run.
+any_errors(all: Buf[Placed]) -> bool
+    for i in 0..<all.len()
+        if all.at(i).is_error() then return true
+
+    false
+end any_errors
+
+// The errors of a list, and the warnings, kept apart because they are answered differently.
+errors_of(all: Buf[Placed]) -> Buf[Placed]
+    var out: Buf[Placed] = buf()
+
+    for i in 0..<all.len()
+        if all.at(i).is_error() then out.push(all.at(i))
+
+    out
+end errors_of
+
+warnings_of(all: Buf[Placed]) -> Buf[Placed]
+    var out: Buf[Placed] = buf()
+
+    for i in 0..<all.len()
+        if !all.at(i).is_error() then out.push(all.at(i))
+
+    out
+end warnings_of

@@ -1,0 +1,428 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The declaration pass, from parsed files to the tables the later stages read.
+//
+// **It runs in the order the questions can be answered in, and no other.** Every name is registered
+// before any type is resolved, because a declaration may name one written below it; every type is
+// resolved before visibility is checked, because that question is about two declarations at a time
+// and either may be written below the other.
+
+// The declarations of a compilation, read.
+//
+// A compilation is a **list** of files rather than one, because a module is written across as many
+// as it likes and a name in one of them means what a sibling declared. Answers with the tables where
+// nothing was refused, and with everything there was to say where something was.
+analyze_decls(units: Buf[Program], t: Target) -> Result[&Tables, Buf[Placed]]
+    val a = analysis_for(t)
+
+    read_decls(a, units)
+
+    if a.found.is_empty() then Ok(a.tables) else Err(a.diagnostics())
+end analyze_decls
+
+// The same, over one file.
+analyze_decls_of(unit: Program, t: Target) -> Result[&Tables, Buf[Placed]]
+    var units: Buf[Program] = buf()
+
+    units.push(unit)
+    analyze_decls(units, t)
+end analyze_decls_of
+
+// The pass itself, on an analysis a caller may go on reading afterwards.
+read_decls(a: &Analysis, units: Buf[Program])
+    hoist_units(a, units)
+
+    var scopes: Buf[Scope] = buf()
+
+    for i in 0..<units.len()
+        scopes.push(scope_of_unit(units.at(i)))
+
+    // Every declaration exists now, so what an `import` claimed a module declares can be looked up.
+    for i in 0..<units.len()
+        check_imports(a, scopes.at(i), units.at(i).body)
+
+    // A type that takes no arguments is instantiated whether or not anything uses it, so a field of
+    // a type that does not exist is a mistake reported at the declaration rather than at whatever
+    // first mentions it.
+    eagerly_instantiate(a)
+
+    // Every named subtype is resolved for the same reason, and by a road of its own: an alias builds
+    // no constrained type to be checked, and what it owes at its declaration is that the name it
+    // stands for exists and that following it terminates.
+    resolve_named_subtypes(a)
+
+    // Then every signature, which is what makes a mistake in one a mistake at the declaration.
+    resolve_signatures(a)
+
+    // How far each declaration reaches is settled last, since the question is about two of them at
+    // a time.
+    check_exposed_types(a)
+end read_decls
+
+// What an `import` claimed a module declares.
+private check_imports(a: &Analysis, scope: Scope, body: Buf[Stmt])
+    for i in 0..<body.len()
+        *body.at(i).kind match
+            ImportDecl(d) -> check_import(a, scope, body.at(i).span, d)
+            _ -> ()
+
+private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
+    val path = joined(d.path, ".")
+
+    if !a.tables.has_module(path) then
+        a.fault(scope, span, s"no module is called '$path'")
+        return
+
+    for i in 0..<d.selectors.len()
+        val s = d.selectors.at(i)
+        val key = module_qualify(path, s.name)
+
+        if !declares(a, key) then
+            a.fault(scope, s.span, s"'$path' declares no '${s.name}' — there is no '$path.${s.name}'")
+
+// Whether this compilation has any declaration under a key, of any kind.
+declares(a: &Analysis, key: string) -> bool =
+    a.tables.types.has(key) || a.tables.funcs.has(key) || a.tables.consts.has(key) ||
+        a.tables.vals.has(key) || a.tables.externs.has(key) || a.tables.extern_vars.has(key) ||
+        a.tables.overloads.has(key) || is_variant_name(a, key)
+
+// Whether a key names a variant of an enum, which an import may name as well as the enum itself.
+private is_variant_name(a: &Analysis, key: string) -> bool
+    val here = module_of(key)
+    val name = module_bare(key)
+
+    for i in 0..<a.tables.types.len()
+        val decl = a.tables.types.at(i)
+
+        if module_of(a.tables.types.key_at(i)) == here then
+            decl.kind match
+                EnumOf(e) ->
+                    for j in 0..<e.variants.len()
+                        if e.variants.at(j).name == name then return true
+                _ -> ()
+
+    false
+end is_variant_name
+
+// Every non-generic struct and enum, built.
+private eagerly_instantiate(a: &Analysis)
+    for i in 0..<a.tables.types.len()
+        val key = a.tables.types.key_at(i)
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            StructOf(d) ->
+                if d.tparams.is_empty() then
+                    instantiate_struct(a, decl.scope, decl.span, d.name, key, d, decl.scope, buf())
+            EnumOf(d) ->
+                if d.tparams.is_empty() then
+                    instantiate_enum(a, decl.scope, decl.span, d.name, key, d, decl.scope, buf())
+            _ -> ()
+
+// Every named subtype, resolved.
+private resolve_named_subtypes(a: &Analysis)
+    for i in 0..<a.tables.types.len()
+        val key = a.tables.types.key_at(i)
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            TypeOf(d) ->
+                if alias_cycle(a, decl.scope, key, d) then
+                    a.fault(decl.scope, decl.span,
+                            s"'${d.name}' is an alias for itself, through a chain of aliases")
+                else
+                    instantiate_named_subtype(a, decl.scope, decl.span, d.name, key, d, decl.scope,
+                                              buf())
+            _ -> ()
+
+// Whether following a named subtype's base leads back to the name itself.
+//
+// The walk is what catches it rather than the resolve, which would otherwise recurse until the stack
+// ran out.
+private alias_cycle(a: &Analysis, scope: Scope, key: string, d: TypeDecl) -> bool
+    var seen: Buf[string] = buf()
+    var here = key
+    var base = d.base
+
+    for _step in 0..<64
+        val name = plain_alias_target(base)
+
+        if name.is_none() then return false
+
+        val next = lookup_type_key(a, scope, name.unwrap())
+
+        if next.is_none() then return false
+        if next.unwrap() == key then return true
+
+        val decl = a.tables.types.get(next.unwrap()).unwrap()
+
+        decl.kind match
+            TypeOf(inner) ->
+                if !is_plain_alias(inner) then return false
+
+                base = inner.base
+            _ -> return false
+
+    false
+end alias_cycle
+
+// The bare name a written type is, where it is one -- an alias chain is followed through names and
+// through nothing else.
+private plain_alias_target(t: TypeRef) -> Option[string] = *t.kind match
+    NamedType(name, args) -> if args.is_empty() then Some(name) else None
+    _ -> None
+
+// Every signature, resolved: the functions, the externs, the storage, and the members of every type.
+private resolve_signatures(a: &Analysis)
+    for i in 0..<a.tables.funcs.len()
+        val f = a.tables.funcs.at(i)
+
+        resolve_func_signature(a, f.scope, f.decl.tparams, f.decl.params, f.decl.ret_type)
+
+    for i in 0..<a.tables.externs.len()
+        val key = a.tables.externs.key_at(i)
+        val d = a.tables.externs.get(key).unwrap()
+        val scope = scope_of_key(a, key)
+
+        for j in 0..<d.params.len()
+            resolve_type(a, scope, d.params.at(j).typ, no_bindings())
+
+        if d.ret_type.is_some() then resolve_type(a, scope, d.ret_type.unwrap(), no_bindings())
+
+    resolve_value_types(a, a.tables.consts)
+    resolve_value_types(a, a.tables.vals)
+    resolve_value_types(a, a.tables.extern_vars)
+
+    for i in 0..<a.tables.types.len()
+        val decl = a.tables.types.at(i)
+        val key = a.tables.types.key_at(i)
+
+        decl.kind match
+            StructOf(d) -> resolve_members(a, decl.scope, key, d.tparams, d.members)
+            EnumOf(d) -> resolve_members(a, decl.scope, key, d.tparams, d.members)
+            TraitOf(d) -> resolve_members(a, decl.scope, key, d.tparams, d.methods)
+            _ -> ()
+
+    for i in 0..<a.tables.impls.len()
+        val im = a.tables.impls.at(i)
+        var subst = stand_ins(im.decl.tparams)
+
+        subst.push(Binding("Self", resolve_type(a, im.scope, im.decl.for_type, subst)))
+
+        for j in 0..<im.decl.methods.len()
+            resolve_method(a, im.scope, im.decl.methods.at(j), subst)
+end resolve_signatures
+
+// The terms a declaration's own file set up, which is where its signature is read.
+private scope_of_key(a: &Analysis, key: string) -> Scope
+    val decl = a.tables.types.get(key)
+
+    if decl.is_some() then return decl.unwrap().scope
+
+    val f = a.tables.funcs.get(key)
+
+    if f.is_some() then return f.unwrap().scope
+
+    Scope(module_of(key), no_imports(), source_of("", ""))
+end scope_of_key
+
+private resolve_value_types(a: &Analysis, from: &Table[ValueDecl])
+    for i in 0..<from.len()
+        val v = from.at(i)
+
+        if v.typ.is_some() then resolve_type(a, v.scope, v.typ.unwrap(), no_bindings())
+
+// A declaration's own type parameters, each standing for itself: what a signature is read against
+// before anything instantiates it.
+stand_ins(tparams: Buf[string]) -> Buf[Binding]
+    var out: Buf[Binding] = buf()
+
+    for i in 0..<tparams.len()
+        out.push(Binding(tparams.at(i), Abstract(tparams.at(i), buf())))
+
+    out
+end stand_ins
+
+private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string], params: Buf[Param],
+                               ret: Option[TypeRef])
+    val subst = stand_ins(tparams)
+
+    for i in 0..<params.len()
+        resolve_type(a, scope, params.at(i).typ, subst)
+
+    if ret.is_some() then resolve_type(a, scope, ret.unwrap(), subst)
+
+private resolve_members(a: &Analysis, scope: Scope, owner: string, tparams: Buf[string],
+                        members: Buf[MethodDecl])
+    var subst = stand_ins(tparams)
+
+    subst.push(Binding("Self", self_type(a, owner, tparams)))
+
+    for i in 0..<members.len()
+        resolve_method(a, scope, members.at(i), subst)
+
+private resolve_method(a: &Analysis, scope: Scope, m: MethodDecl, outer: Buf[Binding])
+    var subst: Buf[Binding] = buf()
+
+    for i in 0..<outer.len()
+        subst.push(outer.at(i))
+
+    for i in 0..<m.tparams.len()
+        subst.push(Binding(m.tparams.at(i), Abstract(m.tparams.at(i), buf())))
+
+    for i in 0..<m.params.len()
+        resolve_type(a, scope, m.params.at(i).typ, subst)
+
+    if m.ret_type.is_some() then resolve_type(a, scope, m.ret_type.unwrap(), subst)
+
+// What `Self` stands for inside a type's own members: the type at its own parameters.
+private self_type(a: &Analysis, owner: string, tparams: Buf[string]) -> Type
+    val decl = a.tables.types.get(owner)
+
+    if decl.is_none() then return Unknown
+
+    var targs: Buf[Type] = buf()
+
+    for i in 0..<tparams.len()
+        targs.push(Abstract(tparams.at(i), buf()))
+
+    decl.unwrap().kind match
+        StructOf(d) -> instantiate_struct(a, decl.unwrap().scope, decl.unwrap().span, d.name, owner,
+                                          d, decl.unwrap().scope, targs)
+        EnumOf(d) -> instantiate_enum(a, decl.unwrap().scope, decl.unwrap().span, d.name, owner, d,
+                                      decl.unwrap().scope, targs)
+        TraitOf(_) -> Trait(owner, targs, buf())
+        _ -> Unknown
+end self_type
+
+// -- how far a signature may reach ---------------------------------------------------------------
+
+// A declaration may not be more visible than the types it names.
+//
+// **A file-private declaration owes nothing here**: it reaches one file, and every type it names is
+// visible there or the signature would not have resolved. What this finds is a public declaration
+// naming something private.
+private check_exposed_types(a: &Analysis)
+    for i in 0..<a.tables.funcs.len()
+        val f = a.tables.funcs.at(i)
+
+        if !is_private_reach(f.decl.vis) then
+            for j in 0..<f.decl.params.len()
+                val p = f.decl.params.at(j)
+
+                check_exposed(a, f.scope, f.decl.name, f.decl.vis, s"parameter '${p.name}'", p.typ,
+                              f.decl.tparams)
+
+            if f.decl.ret_type.is_some() then
+                check_exposed(a, f.scope, f.decl.name, f.decl.vis, "its result",
+                              f.decl.ret_type.unwrap(), f.decl.tparams)
+
+    for i in 0..<a.tables.types.len()
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            StructOf(d) ->
+                if !is_private_reach(d.vis) then
+                    for j in 0..<d.fields.len()
+                        val f = d.fields.at(j)
+
+                        check_exposed(a, decl.scope, d.name, d.vis, s"the field '${f.name}'", f.typ,
+                                      d.tparams)
+            _ -> ()
+
+private is_private_reach(v: Visibility) -> bool = v match
+    File -> true
+    _ -> false
+
+private check_exposed(a: &Analysis, scope: Scope, label: string, vis: Visibility, what: string,
+                      t: TypeRef, skip: Buf[string])
+    var names: Buf[(string, Span)] = buf()
+
+    names_in(&names, t, skip)
+
+    for i in 0..<names.len()
+        val key = lookup_type_key(a, scope, names.at(i).0)
+
+        if key.is_some() && !reachable_key(a, key.unwrap(), scope_of_key(a, key.unwrap())) then ()
+
+        if key.is_some() then
+            val acc = a.tables.access.get(key.unwrap())
+
+            if acc.is_some() && is_private_reach(acc.unwrap().vis) then
+                a.fault(scope, names.at(i).1,
+                        s"'$label' is ${reach_phrase(vis)}, but $what names " +
+                        s"'${module_show(key.unwrap())}', which is " +
+                        s"${private_to_phrase(acc.unwrap().file)} — a declaration may not be more " +
+                        "visible than the types it names")
+
+private reach_phrase(v: Visibility) -> string = v match
+    Public -> "public"
+    Scoped(m) -> s"visible throughout module '$m'"
+    File -> "private"
+
+private private_to_phrase(file: string) -> string = s"private to '$file', the file that declares it"
+
+// Every name a written type mentions, skipping the declaration's own parameters.
+//
+// A value argument names no declaration, and neither does a pack -- so a signature can expose
+// nothing through either.
+private names_in(out: *Buf[(string, Span)], t: TypeRef, skip: Buf[string])
+    *t.kind match
+        NamedType(name, args) ->
+            if !holds(skip, name) then out.push((name, t.span))
+
+            for i in 0..<args.len()
+                names_in(out, args.at(i), skip)
+        PtrType(inner) -> names_in(out, inner, skip)
+        RefType(inner, _) -> names_in(out, inner, skip)
+        WeakType(inner) -> names_in(out, inner, skip)
+        VolatileType(inner) -> names_in(out, inner, skip)
+        ArrayType(_, elem, _) -> names_in(out, elem, skip)
+        VectorType(_, elem) -> names_in(out, elem, skip)
+        TupleType(parts, _) ->
+            for i in 0..<parts.len()
+                names_in(out, parts.at(i), skip)
+        FnType(params, ret, _) ->
+            for i in 0..<params.len()
+                names_in(out, params.at(i), skip)
+
+            names_in(out, ret, skip)
+        CFnType(params, ret) ->
+            for i in 0..<params.len()
+                names_in(out, params.at(i), skip)
+
+            names_in(out, ret, skip)
+        AssocArgType(_, inner) -> names_in(out, inner, skip)
+        _ -> ()
+
+private holds(xs: Buf[string], name: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == name then return true
+
+    false
+end holds
+
+// -- what a test asks --------------------------------------------------------------------------
+
+// The declaration diagnostics of one source, as text, which is what an error-path test asserts on.
+decl_diagnostics(text: string) -> Buf[string]
+    val parsed = parse(source_of("test.sysl", text))
+    var out: Buf[string] = buf()
+
+    if !parsed.ok() then
+        for i in 0..<parsed.report.len()
+            out.push(parsed.report.at(i).message)
+
+        return out
+
+    analyze_decls_of(parsed.program, host_target()) match
+        Ok(_) -> ()
+        Err(ds) ->
+            for i in 0..<ds.len()
+                out.push(ds.at(i).diag.message)
+
+    out
+end decl_diagnostics

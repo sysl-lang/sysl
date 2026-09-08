@@ -1,0 +1,257 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What the declaration pass refuses, and what it says.
+//
+// **Every message here was read out of the reference compiler**, by handing it the same source and
+// quoting what came back -- never composed from the rule.
+
+private only(text: string) -> string
+    val ds = decl_diagnostics(text)
+
+    if ds.is_empty() then return ""
+
+    ds.at(0)
+end only
+
+private count(text: string) -> usize = decl_diagnostics(text).len()
+
+@test("a program whose declarations are all sound says nothing")
+a_sound_program_says_nothing()
+    assert_eq(count("struct P\n    x: int\n\nf(p: P) -> int = p.x\n"), 0)
+    assert_eq(count("enum Color\n    Red\n    Green\n\nname(c: Color) -> string = \"c\"\n"), 0)
+
+@test("a type declared twice is refused at the second one")
+a_type_declared_twice()
+    assert_eq(only("struct P\n    x: int\n\nstruct P\n    y: int\n"), "type 'P' is already declared")
+    assert_eq(only("enum E\n    A\n\nenum E\n    B\n"), "type 'E' is already declared")
+    assert_eq(only("struct P\n    x: int\n\nenum P\n    A\n"), "type 'P' is already declared")
+
+@test("and so is one that takes a name the language answers for itself")
+a_type_taking_a_language_name()
+    assert_eq(only("struct int\n    x: bool\n"), "type 'int' is already declared")
+    assert_eq(only("struct Self\n    x: bool\n"), "type 'Self' is already declared")
+    assert_eq(only("struct never\n    x: bool\n"), "type 'never' is already declared")
+
+@test("a name of the compiler's own shape is refused wherever a declaration takes it")
+a_reserved_name_is_refused()
+    val message = only("struct P\n    __LINE__: int\n")
+
+    assert(message.bytes.len > 0)
+    assert_eq(message, "'__LINE__' begins and ends with '__', which is reserved for names the " +
+              "compiler answers for itself — so it is not a name a field may take. Everything of " +
+              "that shape belongs to the language, whether or not it means anything yet, which is " +
+              "what lets a later release add one without breaking a program that guessed it. " +
+              "Write 'line' instead")
+
+@test("and the name it suggests instead is the middle of the one that was written")
+the_suggested_name()
+    assert(ends_with(only("f__X__() -> int = 1\nstruct P\n    __MY_FIELD__: int\n"),
+                     "Write 'my_field' instead"))
+    assert(ends_with(only("struct P\n    ____: int\n"), "Write 'a name of your own' instead"))
+
+@test("a function declared twice with the same parameters is refused")
+a_function_declared_twice()
+    assert_eq(only("f(x: int) -> int = 1\nf(y: int) -> int = 2\n"),
+              "function 'f' is already declared")
+
+@test("and the sentence is finished where the two differ only in the result")
+a_function_differing_only_in_its_result()
+    assert_eq(only("f(x: int) -> int = 1\nf(x: int) -> bool = true\n"),
+              "function 'f' is already declared — which declaration a call means is decided by its " +
+              "arguments and never by what it returns, so two that differ only in the result have " +
+              "no call that tells them apart")
+
+@test("but two that a call can tell apart are an overload set, not a mistake")
+an_overload_set_is_not_a_mistake()
+    assert_eq(count("f(x: int) -> int = 1\nf(x: string) -> int = 2\n"), 0)
+
+@test("a name may not be both storage and something else")
+a_name_may_not_be_two_things()
+    assert_eq(only("const N: int = 1\nconst N: int = 2\n"), "'N' is already declared as a constant")
+    assert_eq(only("const N: int = 1\nN() -> int = 2\n"), "'N' is already declared as a constant")
+    assert_eq(only("val v: int = 1\nval v: int = 2\n"), "'v' is already declared as a 'val'")
+
+@test("a field, a variant and a parameter may repeat a name the declaration already used")
+what_may_repeat_a_name()
+    assert_eq(count("struct P\n    x: int\n    x: int\n"), 0)
+    assert_eq(count("enum E\n    A\n    A\n"), 0)
+
+@test("a type nothing declares is unknown, and it is the name that is quoted")
+an_unknown_type()
+    assert_eq(only("struct P\n    x: Nope\n"), "unknown type 'Nope'")
+    assert_eq(only("f(x: Nope) -> int = 1\n"), "unknown type 'Nope'")
+    assert_eq(only("f(x: int) -> Nope = 1\n"), "unknown type 'Nope'")
+
+@test("a generic is held to its arity, and the count is quoted both ways")
+a_generic_is_held_to_its_arity()
+    assert_eq(only("struct Box[T]\n    v: T\n\nf(b: Box[int, int]) -> int = 1\n"),
+              "type 'Box' takes 1 type argument, but 2 type arguments were given")
+    assert_eq(only("struct Pair[A, B]\n    a: A\n    b: B\n\nf(p: Pair[int]) -> int = 1\n"),
+              "type 'Pair' takes 2 type arguments, but 1 type argument was given")
+
+@test("and a type that takes none is told so")
+a_plain_type_takes_no_arguments()
+    assert_eq(only("f(x: int[bool]) -> int = 1\n"), "type 'int' does not take type arguments")
+
+@test("an alias that leads back to itself is refused where it is declared")
+an_alias_cycle()
+    assert_eq(only("type A = B\ntype B = A\n"),
+              "'A' is an alias for itself, through a chain of aliases")
+
+@test("but a chain that ends somewhere is followed")
+an_alias_chain_that_ends()
+    assert_eq(count("type A = B\ntype B = int\n\nf(x: A) -> int = 1\n"), 0)
+
+@test("a width family name is the family's, so a bad width is a diagnostic and not an unknown type")
+a_bad_width_is_the_familys_business()
+    assert_eq(only("f(x: u0) -> int = 1\n"),
+              "'u0' has no bits — the width families start at 1, and a single bit is 'u1'")
+    assert_eq(only("f(x: u08) -> int = 1\n"),
+              "'u08' has a leading zero — a width is written plainly, as 'u8'")
+    assert_eq(only("f(x: f24) -> int = 1\n"),
+              "'f24' is not an IEEE floating-point width; they are f16, f32, and f64")
+    assert_eq(only("f(x: f128) -> int = 1\n"), "'f128' is not lowered yet — the widest float is 'f64'")
+    assert_eq(count("f(x: u12) -> int = 1\nf(y: i128) -> int = 2\n"), 0)
+
+@test("and a name that only looks like one is an ordinary name")
+a_name_that_only_looks_like_a_width()
+    assert_eq(only("f(x: i5x) -> int = 1\n"), "unknown type 'i5x'")
+
+@test("an import of a module this compilation has no files for is refused")
+an_import_of_no_module()
+    assert_eq(only("module m\n\nimport nowhere.at.all.*\n"), "no module is called 'nowhere.at.all'")
+
+@test("and a selector naming something the module does not declare says which name it is")
+a_selector_naming_nothing()
+    var units: Buf[Program] = buf()
+
+    units.push(unit_of("a.sysl", "module m\n\nstruct P\n    x: int\n"))
+    units.push(unit_of("b.sysl", "module n\n\nimport m.{Nope}\n"))
+
+    assert_eq(first_message(units), "'m' declares no 'Nope' — there is no 'm.Nope'")
+
+@test("a name another file made private is not one this file may reach")
+a_private_name_is_not_reachable()
+    var units: Buf[Program] = buf()
+
+    units.push(unit_of("a.sysl", "module m\n\nprivate struct Hidden\n    x: int\n"))
+    units.push(unit_of("b.sysl", "module m\n\nreach(h: Hidden) -> int = 1\n"))
+
+    assert_eq(first_message(units), "'m.Hidden' is private to 'a.sysl', the file that declares it")
+
+@test("and its own file may")
+a_private_name_is_reachable_at_home()
+    var units: Buf[Program] = buf()
+
+    units.push(unit_of("a.sysl",
+                       "module m\n\nprivate struct Hidden\n    x: int\n\nprivate reach(h: Hidden) -> int = 1\n"))
+
+    assert_eq(messages(units).len(), 0)
+
+@test("a public declaration may not name a type the reader cannot reach")
+a_public_declaration_may_not_leak()
+    var units: Buf[Program] = buf()
+
+    units.push(unit_of("a.sysl",
+                       "module m\n\nprivate struct Hidden\n    x: int\n\nseen(t: Hidden) -> int = 1\n"))
+
+    assert_eq(first_message(units),
+              "'seen' is public, but parameter 't' names 'm.Hidden', which is private to 'a.sysl', " +
+              "the file that declares it — a declaration may not be more visible than the types it names")
+
+@test("a struct that mentions itself is built, and its field is a pointer to the record that was registered")
+a_struct_that_mentions_itself()
+    var units: Buf[Program] = buf()
+
+    units.push(unit_of("a.sysl", "struct Node\n    next: *Node\n    value: int\n"))
+
+    val tables = analyze_decls(units, host_target())
+
+    assert(tables.is_ok())
+
+    val built = tables.unwrap().struct_insts.get("Node")
+
+    assert(built.is_some())
+
+    built.unwrap() match
+        Struct(d) ->
+            assert_eq(d.fields.len(), 2)
+            assert(type_eq(d.fields.at(0).1, Ptr(Struct(d))))
+        _ -> assert(false, "Node is not a struct")
+
+@test("a generic is built once per set of arguments, and the same arguments give the same type")
+a_generic_is_built_once_per_instantiation()
+    var units: Buf[Program] = buf()
+
+    units.push(unit_of("a.sysl",
+                       "struct Box[T]\n    v: T\n\nf(a: Box[int], b: Box[int], c: Box[bool]) -> int = 1\n"))
+
+    val tables = analyze_decls(units, host_target()).unwrap()
+
+    assert(tables.struct_insts.has("Box[int]"))
+    assert(tables.struct_insts.has("Box[bool]"))
+    assert(!tables.struct_insts.has("Box[string]"))
+
+@test("an enum with nothing carried is simple, and one that carries something is not")
+a_simple_enum_is_told_from_a_carrying_one()
+    var units: Buf[Program] = buf()
+
+    units.push(unit_of("a.sysl", "enum Color\n    Red\n    Green\n\nenum Shape\n    Circle(r: int)\n    Empty\n"))
+
+    val tables = analyze_decls(units, host_target()).unwrap()
+
+    tables.enum_insts.get("Color").unwrap() match
+        Enum(d) ->
+            assert(d.simple)
+            assert_eq(d.variants.len(), 2)
+            assert_eq(d.variants.at(1).tag, 1)
+        _ -> assert(false, "Color is not an enum")
+
+    tables.enum_insts.get("Shape").unwrap() match
+        Enum(d) ->
+            assert(!d.simple)
+            assert(d.variants.at(0).carries)
+            assert(!d.variants.at(1).carries)
+        _ -> assert(false, "Shape is not an enum")
+
+@test("a module's declarations are keyed by the module and the name")
+a_module_keys_its_declarations()
+    var units: Buf[Program] = buf()
+
+    units.push(unit_of("a.sysl", "module sh.thing\n\nstruct P\n    x: int\n"))
+
+    val tables = analyze_decls(units, host_target()).unwrap()
+
+    assert(tables.types.has(module_qualify("sh.thing", "P")))
+    assert(!tables.types.has("P"))
+
+// -- reading a set of files ----------------------------------------------------------------------
+
+private unit_of(name: string, text: string) -> Program = parse(source_of(name, text)).program
+
+private messages(units: Buf[Program]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    analyze_decls(units, host_target()) match
+        Ok(_) -> ()
+        Err(ds) ->
+            for i in 0..<ds.len()
+                out.push(ds.at(i).diag.message)
+
+    out
+end messages
+
+private first_message(units: Buf[Program]) -> string
+    val ms = messages(units)
+
+    if ms.is_empty() then return ""
+
+    ms.at(0)
+end first_message
+
+private ends_with(s: string, tail: string) -> bool =
+    s.bytes.len >= tail.bytes.len && s[s.bytes.len - tail.bytes.len..<s.bytes.len] == tail

@@ -1,0 +1,176 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// The names the language keeps for itself.
+//
+// **`__…__` belongs to the compiler, whether or not it means anything yet.** That is what lets a
+// later release add one without breaking a program that guessed it, and it is why the refusal is
+// about the *shape* rather than about the six that are answered today.
+
+// The built-ins the shape currently holds. **What each one answers is an expression**, so the
+// answering is a later stage's; what belongs here is the refusal to let a declaration take one.
+builtin_names() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("__FILE__")
+    out.push("__LINE__")
+    out.push("__COLUMN__")
+    out.push("__FUNCTION__")
+    out.push("__DATE__")
+    out.push("__TIME__")
+    out
+end builtin_names
+
+// Whether a name has the reserved shape: `__`, capitals and underscores, `__`.
+reserved_shape(name: string) -> bool
+    val b = name.bytes
+
+    if b.len < 4 then return false
+    if b[0] != u8('_') || b[1] != u8('_') then return false
+    if b[b.len - 1] != u8('_') || b[b.len - 2] != u8('_') then return false
+
+    for i in 2..<b.len - 2
+        val c = b[i]
+
+        if !(c >= u8('A') && c <= u8('Z')) && c != u8('_') then return false
+
+    true
+end reserved_shape
+
+// What a declaration taking one is told.
+refuse_reserved(name: string, what: string) -> string =
+    s"'$name' begins and ends with '__', which is reserved for names the compiler answers for " +
+    s"itself — so it is not a name a $what may take. Everything of that shape belongs to the " +
+    s"language, whether or not it means anything yet, which is what lets a later release add one " +
+    s"without breaking a program that guessed it. Write '${suggest_instead(name)}' instead"
+
+// And what a *use* of one the compiler does not answer is told.
+unknown_builtin(name: string) -> string
+    val all = builtin_names()
+    var list = ""
+
+    for i in 0..<all.len()
+        if i > 0 then list = s"$list, "
+
+        list = s"$list${all.at(i)}"
+
+    s"there is no built-in called '$name' — the shape '__…__' is the language's, and what it " +
+    s"currently holds is $list"
+end unknown_builtin
+
+// The name to write instead: the middle, lowercased, with any leading or trailing underscore off.
+private suggest_instead(name: string) -> string
+    val b = name.bytes
+    var lo: usize = 2
+    var hi = b.len - 2
+
+    while lo < hi && b[lo] == u8('_')
+        lo += 1
+
+    while hi > lo && b[hi - 1] == u8('_')
+        hi -= 1
+
+    if lo >= hi then return "a name of your own"
+
+    var out: Buf[u8] = buf()
+
+    for i in lo..<hi
+        val c = b[i]
+
+        out.push(if c >= u8('A') && c <= u8('Z') then c + u8(32) else c)
+
+    from_utf8_unchecked(out.view())
+end suggest_instead
+
+// Every reserved-shaped name a declaration takes, with what kind of thing took it and where.
+//
+// One entry per offending name rather than one per declaration: a struct with two reserved fields
+// made two mistakes.
+reserved_in(s: Stmt) -> Buf[(string, string, Span)]
+    var out: Buf[(string, string, Span)] = buf()
+
+    collect_reserved(&out, s)
+    out
+end reserved_in
+
+private named_reserved(out: *Buf[(string, string, Span)], name: string, what: string, span: Span)
+    if reserved_shape(name) then out.push((name, what, span))
+
+private tparams_reserved(out: *Buf[(string, string, Span)], ns: Buf[string], span: Span)
+    for i in 0..<ns.len()
+        named_reserved(out, ns.at(i), "type parameter", span)
+
+private params_reserved(out: *Buf[(string, string, Span)], ps: Buf[Param])
+    for i in 0..<ps.len()
+        named_reserved(out, ps.at(i).name, "parameter", ps.at(i).span)
+
+private method_reserved(out: *Buf[(string, string, Span)], m: MethodDecl)
+    named_reserved(out, m.name, "method", m.span)
+    tparams_reserved(out, m.tparams, m.span)
+
+    if m.body.is_empty() then params_reserved(out, m.params)
+
+private collect_reserved(out: *Buf[(string, string, Span)], s: Stmt)
+    *s.kind match
+        FuncDecl(f) ->
+            named_reserved(out, f.name, "function", s.span)
+            tparams_reserved(out, f.tparams, s.span)
+
+            if f.body.is_empty() then params_reserved(out, f.params)
+        ExternDecl(e) ->
+            named_reserved(out, e.name, "declaration", s.span)
+            params_reserved(out, e.params)
+        ExternVarDecl(name, _, _, _) -> named_reserved(out, name, "declaration", s.span)
+        ValDecl(name, _, _, _, _, _) -> named_reserved(out, name, "'val'", s.span)
+        VarDecl(name, _, _, _, _, _) -> named_reserved(out, name, "'var'", s.span)
+        ConstDecl(name, _, _, _) -> named_reserved(out, name, "'const'", s.span)
+        TypeDecl(t) -> named_reserved(out, t.name, "type", s.span)
+        StructDecl(d) ->
+            named_reserved(out, d.name, "type", s.span)
+            tparams_reserved(out, d.tparams, s.span)
+
+            for i in 0..<d.fields.len()
+                named_reserved(out, d.fields.at(i).name, "field", d.fields.at(i).span)
+
+            for i in 0..<d.members.len()
+                method_reserved(out, d.members.at(i))
+        EnumDecl(d) ->
+            named_reserved(out, d.name, "type", s.span)
+            tparams_reserved(out, d.tparams, s.span)
+
+            for i in 0..<d.variants.len()
+                named_reserved(out, d.variants.at(i).name, "variant", d.variants.at(i).span)
+                params_reserved(out, d.variants.at(i).fields)
+
+            for i in 0..<d.members.len()
+                method_reserved(out, d.members.at(i))
+        TraitDecl(d) ->
+            named_reserved(out, d.name, "trait", s.span)
+            tparams_reserved(out, d.tparams, s.span)
+
+            for i in 0..<d.methods.len()
+                method_reserved(out, d.methods.at(i))
+        ImplDecl(d) ->
+            for i in 0..<d.methods.len()
+                method_reserved(out, d.methods.at(i))
+        ImportDecl(d) ->
+            if !d.wildcard then named_reserved(out, import_bound(d), "import", s.span)
+
+            for i in 0..<d.selectors.len()
+                named_reserved(out, selector_bound(d.selectors.at(i)), "import",
+                               d.selectors.at(i).span)
+        StaticDecl(inner) -> collect_reserved(out, inner)
+        _ -> ()
+
+// The name an import binds, which is its alias where it has one and the last of its path otherwise.
+import_bound(d: ImportDecl) -> string = d.alias match
+    Some(a) -> a
+    None -> if d.path.is_empty() then "" else d.path.at(d.path.len() - 1)
+
+// The name a selector binds, which is its alias where it has one.
+selector_bound(s: ImportSelector) -> string = s.alias match
+    Some(a) -> a
+    None -> s.name

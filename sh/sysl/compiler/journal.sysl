@@ -1,0 +1,59 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// The undo log a speculative walk rewinds through.
+//
+// **The analyzer tries things.** Whether a call resolves, whether an argument can be made to fit,
+// which of several implementations a member call means: each is answered by *doing* the work and
+// keeping the answer only if it came out. What makes that safe is that everything a trial writes
+// into a table is recorded here with a way to put it back, so a trial that is thrown away leaves no
+// trace -- the reference compiler's `Journal`, `sandboxed`, `probe` and `attempt`.
+//
+// **Recording is off unless a trial is open**, which is the whole of the cost model: an ordinary
+// walk writes to its tables and remembers nothing, and only the nesting inside a trial pays.
+struct Journal
+    undos: Buf[&Fn() -> unit]
+    open: usize
+
+    // How many writes this analysis had to remember how to undo, and how deep the log ever got.
+    // They are counters rather than questions about the log, since the log is emptied as it goes.
+    recorded: long
+    deepest: usize
+
+    // Whether a trial is open, which is what says a write owes an undo.
+    recording(self) -> bool = self.open > 0
+
+    // Opens a trial, and answers with the mark to rewind to.
+    enter(*self) -> usize
+        self.open += 1
+        self.undos.len()
+    end enter
+
+    // Closes one. The log is emptied when the outermost closes, because nothing outside a trial is
+    // ever going back.
+    leave(*self)
+        self.open -= 1
+
+        if self.open == 0 then self.undos.clear()
+
+    // Remembers how to put one write back.
+    record(*self, undo: &Fn() -> unit)
+        self.undos.push(undo)
+        self.recorded += 1
+
+        if self.undos.len() > self.deepest then self.deepest = self.undos.len()
+
+    // Puts back everything written since the mark, most recent first.
+    rewind(*self, mark: usize)
+        while self.undos.len() > mark
+            val i = self.undos.len() - 1
+            val undo = self.undos.at(i)
+
+            self.undos.truncate(i)
+            undo()
+    end rewind
+end Journal
+
+// A journal with nothing in it.
+journal() -> &Journal = Journal(buf(), 0, 0, 0)
