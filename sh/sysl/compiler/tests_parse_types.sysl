@@ -1,0 +1,248 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The type grammar: every form a type may take, the four soft words that are type constructors only
+// in front of a type, and the refusals that name a spelling rather than a token.
+
+// -- names and arguments ----------------------------------------------------------------------------
+
+@test("a bare name is a type")
+a_bare_name_is_a_type()
+    assert_eq(pt("int"), "int")
+    assert_eq(pt("sysl.buf.Buf"), "sysl.buf.Buf")
+
+@test("a type reference applied to one argument, and to nested ones")
+type_arguments_apply_and_nest()
+    assert_eq(pt("Box[int]"), "(Box int)")
+    assert_eq(pt("Result[Box[int], string]"), "(Result (Box int) string)")
+
+@test("a type argument that is a value is told from one that is a name")
+a_value_type_argument_is_told_from_a_name()
+    assert_eq(pt("Matrix[4]"), "(Matrix (value 4))")
+    assert_eq(pt("Matrix[N]"), "(Matrix N)")
+
+@test("an associated type is bound by name inside the argument list")
+an_associated_type_is_bound_by_name()
+    assert_eq(pt("Iterator[Item = int]"), "(Iterator (= Item int))")
+
+@test("'T::Item' projects an associated type, and the arguments are read before the projection")
+an_associated_type_is_projected_with_a_double_colon()
+    assert_eq(pt("T::Item"), "(:: T Item)")
+    assert_eq(pt("Buf[int]::Item"), "(:: (Buf int) Item)")
+
+// -- the memory modes ---------------------------------------------------------------------------
+
+@test("a raw pointer, a reference, and an atomic reference")
+the_three_memory_modes()
+    assert_eq(pt("*int"), "(ptr int)")
+    assert_eq(pt("&Point"), "(ref Point)")
+    assert_eq(pt("&sync Point"), "(ref-sync Point)")
+
+@test("sigils stack, right to left")
+sigils_stack_right_to_left()
+    assert_eq(pt("**int"), "(ptr (ptr int))")
+    assert_eq(pt("*&int"), "(ptr (ref int))")
+
+@test("a sigil applies to a type argument as readily as to a name")
+a_sigil_applies_to_a_type_argument()
+    assert_eq(pt("Box[*int]"), "(Box (ptr int))")
+
+@test("'weak' applies to a type the way the sigils do, and nests inside them")
+weak_applies_like_a_sigil()
+    assert_eq(pt("weak Node"), "(weak Node)")
+    assert_eq(pt("[]weak Node"), "(array _ (weak Node))")
+
+@test("'weak sync T' says which chapter it is waiting for")
+weak_sync_says_which_chapter_it_waits_for()
+    assert(pt_err("weak sync Node").contains("wants the concurrency model of '06'"),
+        "the reader is told what it waits on")
+
+@test("'sync' stays an ordinary name, so a type may be called it")
+sync_stays_an_ordinary_name()
+    assert_eq(pt("&sync"), "(ref sync)")
+
+@test("'volatile' is a soft word, so it is special only in front of another type")
+volatile_is_a_soft_word()
+    assert_eq(pt("volatile u32"), "(volatile u32)")
+    assert_eq(pt("volatile"), "volatile")
+
+// -- arrays, slices and vectors ------------------------------------------------------------------
+
+@test("a fixed array names its length and a slice omits it")
+arrays_and_slices()
+    assert_eq(pt("[4]int"), "(array 4 int)")
+    assert_eq(pt("[]u8"), "(array _ u8)")
+
+@test("arrays nest, which is how a rectangle is written")
+arrays_nest()
+    assert_eq(pt("[2][3]f64"), "(array 2 (array 3 f64))")
+
+@test("a slice of references keeps both sigils")
+a_slice_of_references_keeps_both_sigils()
+    assert_eq(pt("[]&Node"), "(array _ (ref Node))")
+
+@test("'const' after the brackets says the view refuses writes")
+a_const_slice_is_a_read_only_view()
+    assert_eq(pt("[]const u8"), "(slice-const _ u8)")
+
+@test("and a length in them beside it is a contradiction, named as one")
+a_counted_const_array_is_refused()
+    val e = pt_err("[4]const int")
+
+    assert(e.contains("'const' says a view refuses writes"), "the word is named")
+    assert(e.contains("read-only storage is declared with 'val'"), "and what to write instead")
+
+@test("a vector's lane count is part of its type")
+a_vector_names_its_lane_count()
+    assert_eq(pt("<4>u8"), "(vector 4 u8)")
+    assert_eq(pt("<N>f32"), "(vector N f32)")
+
+@test("and the empty spelling is refused with the reason a slice is not parallel")
+an_empty_vector_spelling_is_refused()
+    val e = pt_err("<>u8")
+
+    assert(e.contains("a vector's lane count is part of its type"), "the rule is stated")
+    assert(e.contains("write '<4>u8' for four lanes"), "and a spelling that works is offered")
+
+// -- tuples and packs -----------------------------------------------------------------------------
+
+@test("a tuple has two or more parts")
+a_tuple_has_two_or_more_parts()
+    assert_eq(pt("(int, real)"), "(tuple int real)")
+
+@test("and one part is that part, said rather than left to a parse error")
+a_tuple_of_one_is_refused()
+    val e = pt_err("(int)")
+
+    assert(e.contains("'(int)' is a type in parentheses"), "the spelling is quoted back")
+    assert(e.contains("so write 'int'"), "and the reading it has")
+
+@test("a bare pack parses so the analyzer can say where one may be written")
+a_bare_pack_parses()
+    assert_eq(pt("..A"), "(pack A)")
+    assert_eq(pt("(..A)"), "(tuple (pack A))")
+
+@test("a pack is the whole of the tuple it stands for")
+a_pack_is_the_whole_tuple()
+    assert(pt_err("(..A, T)").contains("a type pack is the whole of the tuple it stands for"),
+        "appending to a pack is named")
+
+// -- callables -------------------------------------------------------------------------------------
+
+@test("the bare arrow takes one domain, and several are parenthesized")
+the_bare_arrow_form()
+    assert_eq(pt("int -> int"), "(fn int -> int)")
+    assert_eq(pt("(int, string) -> bool"), "(fn int string -> bool)")
+    assert_eq(pt("() -> int"), "(fn -> int)")
+
+@test("'Fn' writes the same thing out")
+fn_writes_the_same_thing_out()
+    assert_eq(pt("Fn(int) -> int"), "(Fn int -> int)")
+    assert_eq(pt("Fn() -> unit"), "(Fn -> unit)")
+
+@test("a mode sigil takes the whole callable, not just its first parameter")
+a_sigil_takes_the_whole_callable()
+    assert_eq(pt("&Fn(int) -> int"), "(ref (Fn int -> int))")
+
+@test("the arrow binds looser than a sigil on its left")
+the_arrow_binds_looser_than_a_sigil()
+    assert_eq(pt("*int -> int"), "(fn (ptr int) -> int)")
+    assert_eq(pt("*Fn(int) -> int"), "(ptr (Fn int -> int))")
+
+@test("and looser than a slice on its left")
+the_arrow_binds_looser_than_a_slice()
+    assert_eq(pt("[]int -> int"), "(fn (array _ int) -> int)")
+
+@test("a callable may yield a callable")
+a_callable_may_yield_a_callable()
+    assert_eq(pt("Fn(int) -> &Fn(int) -> int"), "(Fn int -> (ref (Fn int -> int)))")
+
+@test("'Fn' stays a soft word, so a program may name a type of its own that")
+fn_stays_a_soft_word()
+    assert_eq(pt("Fn"), "Fn")
+    assert_eq(pt("Fn[int]"), "(Fn int)")
+
+@test("'*extern' is C's function pointer, written with the signature it is called at")
+extern_is_a_c_function_pointer()
+    assert_eq(pt("*extern(int) -> int"), "(extern-fn int -> int)")
+    assert_eq(pt("*extern() -> unit"), "(extern-fn -> unit)")
+
+@test("and one written without a signature is refused by name")
+a_bare_extern_pointer_is_refused()
+    assert(pt_err("*extern").contains("'*extern' is a foreign function's address"),
+        "the form is named rather than the token")
+
+// -- some ------------------------------------------------------------------------------------------
+
+@test("'some Trait' says where it may stand rather than that a type was expected")
+some_says_where_it_may_stand()
+    val e = pt_err("some Display")
+
+    assert(e.contains("'some Display' is a result whose type is read off the body"), "the form is quoted")
+    assert(e.contains("a member of an 'impl' block"), "and where it belongs")
+
+@test("and 'some' stays a soft word, so a type may be named it")
+some_stays_a_soft_word()
+    assert_eq(pt("some"), "some")
+
+// -- what a diagnostic quotes back ---------------------------------------------------------------
+
+@test("a type is quoted back in the spelling it was written in")
+a_type_is_quoted_back_as_written()
+    assert_eq(pt_text("[]const u8"), "[]const u8")
+    assert_eq(pt_text("*&sync Node"), "*&sync Node")
+    assert_eq(pt_text("Result[Box[int], string]"), "Result[Box[int], string]")
+    assert_eq(pt_text("(int, real) -> bool"), "(int, real) -> bool")
+    assert_eq(pt_text("Fn(int) -> int"), "Fn(int) -> int")
+    assert_eq(pt_text("<4>u8"), "<4>u8")
+    assert_eq(pt_text("..A"), "..A")
+    assert_eq(pt_text("T::Item"), "T::Item")
+
+// -- type parameters --------------------------------------------------------------------------------
+
+@test("a parameter list keeps the order it was written in")
+a_parameter_list_keeps_its_order()
+    assert_eq(ptp("[A, B]"), "(A B)")
+
+@test("a bound is written where the parameter is, and several join with '+'")
+bounds_are_written_at_the_parameter()
+    assert_eq(ptp("[T: Ord + Eq]"), "(T:Ord+Eq)")
+    assert_eq(ptp("[A, B: Show]"), "(A B:Show)")
+
+@test("a default is one type, written after an '='")
+a_type_parameter_may_carry_a_default()
+    assert_eq(ptp("[T = int]"), "(T=int)")
+    assert_eq(ptp("[T: Show = int]"), "(T:Show=int)")
+
+@test("a value parameter carries the type its argument must have")
+a_value_parameter_carries_a_type()
+    assert_eq(ptp("[const N: usize]"), "(N:const usize)")
+    assert_eq(ptp("[const N: usize = 4]"), "(N:const usize=4)")
+
+@test("and one written without a type is told what the type is for")
+a_value_parameter_without_a_type_is_refused()
+    assert(ptp("[const N]").contains("a value parameter needs the type its argument must have"),
+        "the reason is given")
+
+@test("a pack stands for a list of types, and may carry bounds")
+a_pack_parameter()
+    assert_eq(ptp("[..A]"), "(..A)")
+    assert_eq(ptp("[..A: Show]"), "(..A:Show)")
+
+@test("but takes no default, since a default is one type")
+a_pack_parameter_takes_no_default()
+    assert(ptp("[..A = int]").contains("a type pack takes no default"), "the reason is given")
+
+@test("a 'where' clause names a parameter and what it must implement")
+a_where_clause_names_a_parameter()
+    assert_eq(pwb("T: Display"), "(T:Display)")
+    assert_eq(pwb("T: Display, U: Eq + Ord"), "(T:Display U:Eq+Ord)")
+
+@test("and the ':' is what separates the two")
+a_where_clause_needs_its_colon()
+    assert(pwb("T Display").contains("a 'where' clause names a type parameter and what it must implement"),
+        "the separator is named")

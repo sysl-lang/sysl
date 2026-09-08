@@ -28,6 +28,13 @@ struct Parser
     // missing at the top level and a block that should have closed inside one.
     depth: usize
 
+    // How many lines this parse has given up on and stepped over.
+    //
+    // **It is what tells a statement that would not read from one that CONTAINS a line that would
+    // not read.** Both raise a diagnostic, and only the first should be dropped: an `if` whose body
+    // lost a line is still the `if` the reader wrote, and dropping it would cost them the block.
+    dropped: usize
+
     // The kind of the next token. `Eof` where there is none, so that no caller unwraps.
     peek(self) -> Tok = self.toks.peek() match
         Some(t) -> t.value
@@ -43,6 +50,11 @@ struct Parser
 
     // Where the token just taken was.
     just_taken(self) -> Span = self.toks.previous()
+
+    // The kind of the token just taken, which is what says whether a block has only now closed.
+    prev(self) -> Tok = self.toks.looked_back() match
+        Some(t) -> t.value
+        None -> Eof
 
     at(self, k: Tok) -> bool = self.peek() == k
 
@@ -200,7 +212,7 @@ struct Parser
     end_of_statement(*self) -> bool
         if self.accept(Newline) then return true
 
-        self.at(Dedent) || self.at(Eof)
+        self.prev() == Dedent || self.at(Dedent) || self.at(Eof)
     end end_of_statement
 end Parser
 
@@ -296,8 +308,8 @@ end Parsed
 // **A lexical error outranks the grammar's reaction to it**, and there is one of them rather than a
 // report: everything after an unterminated literal is being read in the wrong language, so a second
 // complaint about it is noise at best and a wrong line number at worst.
-private reader(src: Source) -> Result[Parser, Diagnostic] =
-    Ok(Parser(tokens_of(lex(src)?), src, report(), 0))
+parser_over(src: Source) -> Result[Parser, Diagnostic] =
+    Ok(Parser(tokens_of(lex(src)?), src, report(), 0, 0))
 
 // One expression, read from text.
 //
@@ -306,7 +318,7 @@ private reader(src: Source) -> Result[Parser, Diagnostic] =
 parse_expr_text(name: string, text: string) -> ParsedExpr
     val src = source_of(name, text)
 
-    reader(src) match
+    parser_over(src) match
         Err(d) ->
             var r = report()
 
@@ -328,7 +340,7 @@ end parse_expr_text
 parse_type_text(name: string, text: string) -> ParsedType
     val src = source_of(name, text)
 
-    reader(src) match
+    parser_over(src) match
         Err(d) ->
             var r = report()
 
@@ -350,7 +362,7 @@ end parse_type_text
 parse_pattern_text(name: string, text: string) -> ParsedPattern
     val src = source_of(name, text)
 
-    reader(src) match
+    parser_over(src) match
         Err(d) ->
             var r = report()
 
@@ -372,7 +384,7 @@ end parse_pattern_text
 parse(src: Source) -> Parsed
     val empty = Program(buf(), None, buf(), buf(), src, false, buf(), buf())
 
-    reader(src) match
+    parser_over(src) match
         Err(d) ->
             var r = report()
 
@@ -413,17 +425,25 @@ parse_stmts(p: *Parser, in_block: bool) -> Buf[Stmt]
         end if
 
         val before = p.report.len()
+        val dropped_before = p.dropped
         val s = parse_stmt(p)
 
-        if p.report.len() == before && p.end_of_statement()
+        if p.report.len() == before
+            if p.end_of_statement()
+                stmts.push(s)
+            else
+                // It ran on past where a statement has to end. Say so once, then step over whatever
+                // is there so the loop cannot spin on a token nothing consumes.
+                p.want("newline")
+                drop_line(p)
+        else if p.dropped > dropped_before
+            // The mistake was inside a block that has already recovered from it, so what is here is
+            // the statement the reader wrote with one line missing out of it.
+            if !p.end_of_statement() then drop_line(p)
+
             stmts.push(s)
         else
-            // Either the statement itself would not read, or it ran on past where one has to end.
-            // Say the second of those once, then step past whatever is there so the loop cannot spin
-            // on a token nothing consumes.
-            if p.report.len() == before then p.want("newline")
-
-            skip_line(p)
+            drop_line(p)
         end if
 
         p.skip_newlines()
@@ -441,7 +461,12 @@ private can_begin_stmt(t: Tok) -> bool = can_begin_expr(t)
 // **The block depth is what keeps it there.** An `Indent` met on the way is a block the broken line
 // opened, and everything down to its `Dedent` belongs to it; a `Dedent` at depth zero is the end of
 // the block *this* line is in and stops the skip before it.
-private skip_line(p: *Parser)
+// The same, counted -- which is what a caller reads to tell a line it gave up on from one it kept.
+drop_line(p: *Parser)
+    p.dropped += 1
+    skip_line(p)
+
+skip_line(p: *Parser)
     var depth = 0
 
     loop

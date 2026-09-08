@@ -1,0 +1,83 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The pattern grammar -- every form the table in `reference/patterns.md § The pattern forms` lists,
+// and the three refusals that name a spelling rather than a token.
+
+@test("a wildcard matches anything and binds nothing")
+a_wildcard_matches_anything()
+    assert_eq(pp("_"), "_")
+
+@test("a literal pattern is the literal that spells it")
+a_literal_pattern_is_its_literal()
+    assert_eq(pp("0"), "0")
+    assert_eq(pp("'a'"), "'a'")
+    assert_eq(pp("\"hi\""), "\"hi\"")
+    assert_eq(pp("true"), "true")
+    assert_eq(pp("false"), "false")
+
+@test("a negative number is the unary negation it is written as")
+a_negative_literal_pattern()
+    assert_eq(pp("-3"), "(- 3)")
+
+@test("a range pattern keeps both bounds and which end is open")
+a_range_pattern_keeps_both_bounds()
+    assert_eq(pp("3..7"), "(.. 3 7)")
+    assert_eq(pp("0..<10"), "(..< 0 10)")
+    assert_eq(pp("'a'..'z'"), "(.. 'a' 'z')")
+
+@test("a bare name binds, and a qualified one is a pattern wherever a bare one is")
+a_bare_name_binds()
+    assert_eq(pp("r"), "r")
+    assert_eq(pp("Empty"), "Empty")
+    assert_eq(pp("Shape.Empty"), "Shape.Empty")
+
+@test("a backticked name references rather than binds")
+a_backticked_name_references()
+    assert_eq(pp("`n`"), "`n`")
+    assert_eq(pp("Limits.`max`"), "`Limits.max`")
+
+@test("a variant pattern binds each sub-pattern to a field, and they nest")
+variant_patterns_nest()
+    assert_eq(pp("Circle(r)"), "(Circle r)")
+    assert_eq(pp("Wrap(Val(v))"), "(Wrap (Val v))")
+
+@test("a positional struct pattern binds every field by position")
+a_positional_struct_pattern()
+    assert_eq(pp("Point(a, b)"), "(Point a b)")
+
+@test("a named struct pattern binds fields by name, and the short form writes each name once")
+a_named_struct_pattern()
+    assert_eq(pp("Point{x: a}"), "(struct Point (x a))")
+    assert_eq(pp("Point{x, y}"), "(struct Point (x x) (y y))")
+
+@test("a tuple pattern matches by position")
+a_tuple_pattern_matches_by_position()
+    assert_eq(pp("(a, b)"), "(tuple a b)")
+    assert_eq(pp("(a, _)"), "(tuple a _)")
+
+@test("and one part is not a tuple, said rather than left to a parse error")
+a_tuple_pattern_of_one_is_refused()
+    assert(pp_err("(a)").contains("a tuple pattern matches two or more parts"),
+        "the reason is given")
+
+@test("'n @ pat' matches and names at once")
+at_matches_and_names_at_once()
+    assert_eq(pp("c @ Circle(r)"), "(@ c (Circle r))")
+    assert_eq(pp("n @ 1..9"), "(@ n (.. 1 9))")
+
+@test("what a binding introduces is a local, so a dotted name may not stand there")
+a_binding_name_has_no_dot()
+    assert(pp_err("a.b @ x").contains("has a dot in it, and what a binding introduces is a local"),
+        "the reason is given rather than a refusal about the '@'")
+
+@test("a pattern is matched against a type it already knows, so there is no leading dot")
+a_pattern_takes_no_leading_dot()
+    val e = pp_err(".Circle")
+
+    assert(e.contains("with no leading dot"), "the spelling is named")
+    assert(e.contains("the dot is for an expression"), "and where the dot does belong")

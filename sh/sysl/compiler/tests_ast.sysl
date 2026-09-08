@@ -1,0 +1,152 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The tree itself: that every node carries where it was written, and that the declaration nodes
+// exist before anything parses one.
+//
+// **The second half is the point of the file.** The whole tree is built at once so that the
+// declaration grammar adds no node kinds when it lands -- and a claim that a node exists is only
+// worth making if something constructs one, which is what the second block does.
+
+// -- spans ------------------------------------------------------------------------------------------
+
+// The span the parser gave the one expression in a piece of text.
+private span_of(text: string) -> Span = parse_expr_text("t.sysl", text).value.span
+
+@test("a node's span covers what was written, from its first token to its last")
+a_span_covers_what_was_written()
+    assert_eq(span_of("a + b"), Span(0, 5))
+    assert_eq(span_of("f(1, 2)"), Span(0, 7))
+    assert_eq(span_of("[1, 2, 3]"), Span(0, 9))
+
+@test("a member selection is positioned at the member, not at the punctuation")
+a_member_is_positioned_at_the_member()
+    // Every message about a member names the member, and a caret under the '.' would send the
+    // reader looking one column to the left of what was said.
+    assert_eq(span_of("a.bee"), Span(2, 5))
+    assert_eq(span_of("Age::First"), Span(5, 10))
+
+@test("a 'with' field is positioned at its name")
+a_with_field_is_positioned_at_its_name()
+    val e = parse_expr_text("t.sysl", "base with { bg = 1 }").value
+
+    *e.kind match
+        WithExpr(_, fields) -> assert_eq(fields.at(0).span, Span(12, 14))
+        _ -> assert(false, "a 'with' expression")
+
+@test("a match arm's span covers the arm")
+a_match_arms_span_covers_the_arm()
+    val p = parse(source_of("t.sysl", "n match\n    0 -> f()\n"))
+    val body = p.program.body
+
+    *body.at(0).kind match
+        ExprStmt(e) ->
+            *e.kind match
+                MatchExpr(_, arms) -> assert_eq(arms.at(0).span, Span(12, 20))
+                _ -> assert(false, "a match expression")
+        _ -> assert(false, "an expression statement")
+
+// -- the shapes a test reads --------------------------------------------------------------------
+
+@test("every expression form the grammar builds has a shape a test can read")
+every_expression_form_prints()
+    for text in ["1", "1.5", "'c'", "\"s\"", "c\"s\"", "true", "()", "null", "x", "-x", "++x", "x++",
+                 "a + b", "a < b", "a..b", "a = b", "f(x)", "f(a = 1)", "f(xs...)", "a[0]", "a.b",
+                 "f[A, B]", "T::A", "b with { f = 1 }", ".red", "sizeof(int)", "offsetof(T, f)",
+                 "x?", "(a, b)", "x -> x", "[1]", "[0; 2]", "if c then a else b", "x is P"]
+        val shown = pe(text)
+
+        assert(shown != "", s"'${text}' prints as something")
+        assert(!shown.starts_with("!"), s"'${text}' parses: ${shown}")
+
+@test("every type form has one too")
+every_type_form_prints()
+    for text in ["int", "Box[int]", "Matrix[4]", "Box[Item = int]", "*int", "&T", "&sync T",
+                 "weak T", "[4]int", "[]int", "[]const u8", "<4>u8", "volatile u32", "(int, real)",
+                 "..A", "int -> int", "Fn(int) -> int", "*extern(int) -> int", "T::Item"]
+        val shown = pt(text)
+
+        assert(!shown.starts_with("!"), s"'${text}' parses: ${shown}")
+
+@test("and every pattern form")
+every_pattern_form_prints()
+    for text in ["_", "0", "-1", "1..9", "'a'..'z'", "x", "`x`", "E.V", "C(r)", "P{x, y}", "(a, b)",
+                 "n @ 1..9"]
+        val shown = pp(text)
+
+        assert(!shown.starts_with("!"), s"'${text}' parses: ${shown}")
+
+// -- the declaration nodes ---------------------------------------------------------------------------
+
+// A span nothing was read at, for a node built here rather than parsed.
+private nowhere() -> Span = point(0)
+
+@test("a function declaration carries everything a declaration may say about a function")
+a_function_declaration_node_exists()
+    val f = FuncDecl("id", buf(), buf(), None, buf(), buf(), false, Public, buf(), buf(), buf(),
+        None, None, None, false, false, false, None, None, None, None, buf(), buf())
+
+    assert_eq(f.name, "id")
+    assert(!f.variadic, "a function is not variadic unless it says so")
+
+@test("a method knows how it takes its receiver, and a property with none takes it by value")
+a_method_declaration_node_exists()
+    val m = MethodDecl(nowhere(), "area", None, true, buf(), buf(), None, buf(), buf(), buf(),
+        Public, false, false, buf(), buf(), buf(), None, None, buf(), false)
+
+    assert(!m.is_associated(), "a property with no written receiver takes one")
+
+    val assoc = MethodDecl(nowhere(), "make", None, false, buf(), buf(), None, buf(), buf(), buf(),
+        Public, false, false, buf(), buf(), buf(), None, None, buf(), false)
+
+    assert(assoc.is_associated(), "and a plain member with none is associated")
+
+@test("the struct, enum, trait and impl nodes exist, with the members they carry")
+the_type_declaration_nodes_exist()
+    val s = StructDecl("Point", buf(), buf(), buf(), buf(), buf(), Public, buf(), false, buf(),
+        false, None, None, buf())
+    val e = EnumDecl("Shape", buf(), None, buf(), buf(), buf(), Public, buf(), buf(), buf())
+    val t = TraitDecl("Show", buf(), buf(), buf(), buf(), Public, buf(), buf())
+    val i = ImplDecl("Show", named_type(nowhere(), "Point"), buf(), buf(), buf(), buf(), buf(),
+        false, buf(), buf(), buf())
+
+    assert_eq(s.name, "Point")
+    assert_eq(e.name, "Shape")
+    assert_eq(t.name, "Show")
+    assert_eq(i.trait_name, "Show")
+
+@test("and the statement kinds a body is made of")
+the_statement_kinds_exist()
+    val ss = [stmt(nowhere(), Return(None)),
+              stmt(nowhere(), Break(None, None)),
+              stmt(nowhere(), Continue(None)),
+              stmt(nowhere(), Become(expr(nowhere(), Ident("f")))),
+              stmt(nowhere(), Defer(stmt(nowhere(), Bad))),
+              stmt(nowhere(), Require(expr(nowhere(), BoolLit(true)), None)),
+              stmt(nowhere(), Ensure(expr(nowhere(), BoolLit(true)), None)),
+              stmt(nowhere(), Invariant(expr(nowhere(), BoolLit(true)), None)),
+              stmt(nowhere(), Variant(expr(nowhere(), Ident("n")))),
+              stmt(nowhere(), RefDecl("r", expr(nowhere(), Ident("x")))),
+              stmt(nowhere(), ExternVarDecl("errno", named_type(nowhere(), "int"), None, Public))]
+
+    assert_eq(ss.len, 11)
+
+@test("an attribute knows the word it was written as")
+an_attribute_knows_its_word()
+    assert_eq(attr_word(TailRec), "tailrec")
+    assert_eq(attr_word(Hook(HookAttr(nowhere(), SetupAll))), "setup_all")
+    assert_eq(hook_word(Teardown), "teardown")
+
+@test("a module name is its parts, joined by the dots they were written with")
+a_module_name_joins_its_parts()
+    var parts: Buf[string] = buf()
+
+    parts.push("sh")
+    parts.push("sysl")
+    parts.push("compiler")
+
+    assert_eq(ModuleName(nowhere(), parts).show(), "sh.sysl.compiler")

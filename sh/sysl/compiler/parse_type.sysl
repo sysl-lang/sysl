@@ -414,3 +414,106 @@ parse_bounds(p: *Parser) -> Buf[BoundRef]
 
     out
 end parse_bounds
+
+// -- type parameters -------------------------------------------------------------------------------
+
+// `[T: Ord + Eq = int, const N: usize, ..A]` -- the bracketed list a declaration writes after its
+// name.
+//
+// **Three kinds of parameter in one list**, told apart by what each begins with: `const` makes it a
+// value, `..` makes it a pack, and anything else is a type. What each may carry differs, and the
+// three refusals below are where that is said rather than left to a parse error.
+parse_type_params(p: *Parser) -> TypeParams
+    var out = no_type_params()
+
+    if !p.expect_kw("[") then return out
+
+    if p.at_kw("]")
+        p.bump()
+        return out
+    end if
+
+    loop
+        parse_one_type_param(p, &out)
+
+        if !p.accept_kw(",") then break
+        if p.at_kw("]") then break
+
+    p.expect_kw("]")
+    out
+end parse_type_params
+
+private parse_one_type_param(p: *Parser, out: *TypeParams)
+    // `const N: usize` -- a parameter standing for a value rather than for a type.
+    if p.accept_kw("const")
+        val n = p.name() match
+            Some(x) -> x
+            None -> ""
+
+        out.names.push(n)
+
+        if p.accept_kw(":")
+            out.values.push(TypeBinding(n, parse_type(p)))
+        else
+            p.fault(p.here(), "a value parameter needs the type its argument must have, as " +
+                "'const N: usize' \u{2014} the type is what says which values may stand there")
+
+        if p.accept_kw("=") then out.value_defaults.push(ValueBinding(n, parse_expr(p)))
+
+        return
+    end if
+
+    // `..A` -- a parameter standing for a list of types.
+    if p.accept_kw("..")
+        val n = p.name() match
+            Some(x) -> x
+            None -> ""
+
+        out.names.push(n)
+        out.packs.push(n)
+
+        if p.accept_kw(":") then out.bounds.push(NamedBounds(n, parse_bounds(p)))
+
+        if p.accept_kw("=")
+            p.fault(p.just_taken(), "a type pack takes no default \u{2014} a default is one type, and a " +
+                "pack stands for a list of them")
+            parse_type(p)
+        end if
+
+        return
+    end if
+
+    val n = p.name() match
+        Some(x) -> x
+        None -> ""
+
+    out.names.push(n)
+
+    if p.accept_kw(":") then out.bounds.push(NamedBounds(n, parse_bounds(p)))
+    if p.accept_kw("=") then out.defaults.push(TypeBinding(n, parse_type(p)))
+end parse_one_type_param
+
+// `where T: Display, U: Eq` -- the same pairing a bound written inline makes, read after a
+// signature. `where` is a soft word, so a program may still have a name of its own that is one.
+parse_where_bounds(p: *Parser) -> Buf[WhereBound]
+    var out: Buf[WhereBound] = buf()
+
+    loop
+        val start = p.here()
+        val n = p.name() match
+            Some(x) -> x
+            None -> ""
+
+        if !p.accept_kw(":")
+            p.fault(p.here(), "a 'where' clause names a type parameter and what it must implement, " +
+                "as 'where T: Display' \u{2014} the ':' is what separates the two")
+
+            return out
+        end if
+
+        out.push(WhereBound(start.to(p.just_taken()), n, parse_bounds(p)))
+
+        if !p.accept_kw(",") then break
+
+    out
+end parse_where_bounds

@@ -1,0 +1,151 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What a file that will not parse is told, where the caret goes, and what is left of it afterwards.
+//
+// **The rule: the refusal is at the furthest point the grammar reached, and it names something the
+// reader could have written there.** Both halves are the bootstrap compiler's, whose whole
+// diagnostic suite is written against these wordings -- so `')' expected` and `expression expected`
+// are a specification here rather than a house style.
+//
+// **The second rule: a line that will not read is dropped, and the lines around it survive.** An
+// editor asked about line 3 has something to answer with though line 1 is unreadable, and that is
+// the whole of what recovery is for.
+
+// -- the caret is at the mistake ------------------------------------------------------------------
+
+@test("a second argument with no comma wants the comma's closing bracket")
+a_second_argument_wants_the_bracket()
+    assert_eq(pf_err("print(1 2)\n"), "')' expected")
+    assert_eq(pf_at("print(1 2)\n"), "1:9")
+
+@test("a second value after an expression wants the end of the statement")
+a_second_value_wants_the_end_of_the_statement()
+    assert_eq(pf_err("1 2\n"), "newline expected")
+    assert_eq(pf_at("1 2\n"), "1:3")
+
+@test("an operator with nothing after it wants a value")
+an_operator_with_nothing_after_it()
+    assert_eq(pf_err("print(1 +)\n"), "expression expected")
+    assert_eq(pf_at("print(1 +)\n"), "1:10")
+
+@test("a byte literal that does not exist is read as the name beside it")
+a_byte_literal_that_does_not_exist()
+    assert_eq(pf_err("print(b[0] == b';')\n"), "')' expected")
+    assert_eq(pf_at("print(b[0] == b';')\n"), "1:16")
+
+@test("a stray token inside a branch is reported in the branch")
+a_stray_token_in_a_branch()
+    val src = "if a\n    print(1)\nelse\n    print(2 3)\nend if\n"
+
+    assert_eq(pf_err(src), "')' expected")
+    assert_eq(pf_at(src), "4:13")
+
+// -- an absence is not an expectation -------------------------------------------------------------
+
+@test("a stray bracket is not told a 'match' is missing")
+a_stray_bracket_is_not_told_a_match_is_missing()
+    assert_eq(pf_err("print(1)\n)\n"), "expression expected")
+    assert_eq(pf_at("print(1)\n)\n"), "2:1")
+
+@test("and blank lines before it do not move the complaint onto them")
+blank_lines_do_not_move_the_complaint()
+    assert_eq(pf_at("print(1)\n\n)\n"), "3:1")
+
+@test("a file that opens badly is told what a statement begins with")
+a_file_that_opens_badly()
+    assert_eq(pf_err(")\nprint(1)\n"), "expression expected")
+    assert_eq(pf_at(")\nprint(1)\n"), "1:1")
+
+@test("a block that never closes still reports the block's own expectation")
+a_block_that_never_closes()
+    val src = "if a\n    print(1)\n    )\n"
+
+    assert_eq(pf_err(src), "dedent expected")
+    assert_eq(pf_at(src), "3:5")
+
+@test("an arm with no pattern")
+an_arm_with_no_pattern()
+    assert_eq(pf_err("x match\n    -> 1\n"), "a pattern expected")
+    assert_eq(pf_at("x match\n    -> 1\n"), "2:5")
+
+@test("a lexical error outranks the grammar's reaction to it")
+a_lexical_error_outranks_the_grammar()
+    assert_eq(pf_err("print(\"oops\n"), "unterminated string literal")
+    assert_eq(pf_lines("print(\"oops\n").len(), 1)
+
+// -- recovery --------------------------------------------------------------------------------------
+
+@test("a file reports every line it could not read, not only the first")
+every_unreadable_line_is_reported()
+    assert_eq(pf_line_text("print(1 2)\nprint(3)\nprint(4 5)\n"), "1 3")
+    assert_eq(pf_line_text("print(1 2)\nprint(3 4)\nprint(5 6)\n"), "1 2 3")
+
+@test("a good file yields none, and its tree is the whole of it")
+a_good_file_yields_no_complaints()
+    assert_eq(pf_line_text("print(1)\nprint(2)\n"), "")
+    assert_eq(pf("print(1)\nprint(2)\n"), "(call print 1) (call print 2)")
+
+@test("the statements around a broken one survive it")
+the_statements_around_a_broken_one_survive()
+    assert_eq(pf_kept("print(1 2)\nprint(3)\nprint(4)\n"), 2)
+
+@test("a broken line is dropped rather than stood in for")
+a_broken_line_is_dropped()
+    assert_eq(pf_tree("print(1)\nprint(2 3)\nprint(4)\n"), "(call print 1) (call print 4)")
+
+@test("a skip stays inside the block it began in")
+a_skip_stays_inside_its_block()
+    val src = "if a\n    print(1 2)\n    print(3)\n\nprint(4)\n"
+
+    assert_eq(pf_line_text(src), "2")
+    assert_eq(pf_kept(src), 2)
+
+@test("a mistake two blocks deep is reported where it is, and costs neither block")
+a_mistake_two_blocks_deep()
+    val src = "if a\n    if b\n        print(1 2)\n        print(3)\n    print(4)\n"
+
+    assert_eq(pf_line_text(src), "3")
+    assert_eq(pf_tree(src), pf("if a\n    if b\n        print(3)\n    print(4)\n"))
+
+@test("a mistake in a match arm does not take the arms below it")
+a_mistake_in_a_match_arm()
+    assert_eq(pf_line_text("n match\n    1 -> print(1 2)\n    _ -> print(3)\n"), "2")
+
+@test("two statements on one line are still two statements too many")
+two_statements_on_one_line()
+    assert_eq(pf_line_text("print(1) print(2)\nprint(3)\n"), "1")
+
+@test("diagnostics come back in source order")
+diagnostics_come_back_in_source_order()
+    assert_eq(pf_line_text("print(1 2)\nprint(3)\nprint(4 5)\nprint(6)\nprint(7 8)\n"), "1 3 5")
+
+// -- the shapes a skipping loop goes wrong on -------------------------------------------------------
+
+@test("an empty file is not a file with a mistake in it")
+an_empty_file_has_no_mistake()
+    assert_eq(pf_line_text(""), "")
+    assert_eq(pf_kept(""), 0)
+
+@test("nor is a file of blank lines")
+blank_lines_are_not_a_mistake()
+    assert_eq(pf_line_text("\n\n\n"), "")
+    assert_eq(pf_kept("\n\n\n"), 0)
+
+@test("a mistake at the very last token terminates")
+a_mistake_at_the_last_token_terminates()
+    assert_eq(pf_lines("print(1").len(), 1)
+
+@test("a file that is one unreadable token terminates")
+one_unreadable_token_terminates()
+    assert_eq(pf_lines(")").len(), 1)
+
+@test("an unclosed bracket swallows the file, and says so once")
+an_unclosed_bracket_swallows_the_file()
+    val src = "print(\n    1\n    2\n\nprint(3)\n"
+
+    assert_eq(pf_lines(src).len(), 1)
