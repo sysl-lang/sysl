@@ -1,0 +1,148 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A whole file: what its header says, what it imports, and the documentation it carries.
+
+// -- the module header ---------------------------------------------------------------------------
+
+@test("a file may declare the module it belongs to, and its parts are the dots it was written with")
+a_file_may_declare_its_module()
+    assert_eq(pf_module("module sh.sysl.compiler\n\nf() = 1\n"), "sh.sysl.compiler")
+    assert_eq(pf_module("module main\n"), "main")
+    assert_eq(pf_module("f() = 1\n"), "")
+
+@test("a module path is written with plain names, a module naming a directory")
+a_module_path_is_written_with_plain_names()
+    assert(pf_err("module sh.`sysl`\n").contains("is backtick-quoted, and a module path is written with plain names"),
+        "the refusal says what the parts are")
+
+@test("the statements under a header are read as they are anywhere")
+the_statements_under_a_header()
+    assert_eq(pf("module m\n\nf() = 1\n"), "(fn f () 1)")
+
+// -- the header clauses ---------------------------------------------------------------------------
+
+@test("'@tests' says the file is compiled only when tests are being run")
+tests_marks_a_file_for_a_test_run()
+    assert_eq(pf_header("module m\n@tests\n\nf() = 1\n"), "@tests")
+
+@test("a capability clause runs either way: given up, or asked for")
+a_capability_clause_runs_either_way()
+    assert_eq(pf_header("module m\n@no_alloc\n"), "@no_alloc")
+    assert_eq(pf_header("module m\n@requires(os)\n"), "@requires(os)")
+    assert_eq(pf_header("module m\n@requires(os, posix)\n"), "@requires(os) @requires(posix)")
+
+@test("a link names a library, and an include the C header a declaration was read from")
+a_link_and_an_include()
+    assert_eq(pf_header("module m\n@link(\"m\")\n"), "@link(\"m\")")
+    assert_eq(pf_header("module m\n@include(\"stdio.h\")\n"), "@include(\"stdio.h\")")
+
+@test("several clauses may follow one header, each on a line of its own")
+several_clauses_may_follow_one_header()
+    assert_eq(pf_header("module m\n@tests\n@no_alloc\n@link(\"m\")\n\nf() = 1\n"),
+        "@tests @no_alloc @link(\"m\")")
+
+@test("a file that declares no module may open with its clauses, the root module being one too")
+a_file_with_no_module_may_open_with_clauses()
+    assert_eq(pf_header("@no_alloc\n\nf() = 1\n"), "@no_alloc")
+
+@test("and the statements under the clauses are still read")
+the_statements_under_the_clauses()
+    assert_eq(pf("module m\n@tests\n\nf() = 1\n"), "(fn f () 1)")
+
+// -- imports ---------------------------------------------------------------------------------------
+
+@test("an import names a module, and may take names out of it")
+an_import_names_a_module()
+    assert_eq(pf("import sysl.buf\n"), "(import sysl.buf)")
+    assert_eq(pf("import sysl.buf.*\n"), "(import sysl.buf .*)")
+    assert_eq(pf("import sysl.buf.{Buf, buf}\n"), "(import sysl.buf {Buf buf})")
+    assert_eq(pf("import sysl.buf.{Buf as B}\n"), "(import sysl.buf {Buf:B})")
+
+@test("an import may bind the module itself under another name")
+an_import_may_rename_the_module()
+    assert_eq(pf("import sysl.buf as b\n"), "(import sysl.buf as b)")
+
+@test("but a rename beside a wildcard or a selector list would have nothing to name")
+a_rename_with_nothing_to_name()
+    assert(pf_err("import sysl.buf.* as b\n").contains("a rename here would have nothing to name"),
+        "the refusal says what each form already carries")
+    assert(pf_err("import sysl.buf.{Buf} as b\n").contains("carries its own 'as' per name"),
+        "and how a selector is renamed")
+
+// -- documentation ------------------------------------------------------------------------------------
+
+@test("a documentation comment is read off the lexer, a comment reaching no grammar rule")
+a_documentation_comment_is_read_off_the_lexer()
+    assert_eq(pf_docs("/** what f does */\nf() = 1\n"), "/** what f does */")
+    assert_eq(pf_docs("/** one */\nf() = 1\n\n/** two */\ng() = 2\n"), "/** one */ | /** two */")
+    assert_eq(pf_docs("f() = 1\n"), "")
+
+// -- literate source ------------------------------------------------------------------------------
+
+@test("a '.lsysl' file is a Markdown document whose indented blocks are the program")
+a_literate_file_is_markdown()
+    val src = "The greeting\n------------\n\nA program is a list of statements.\n\n    print(\"hi\")\n"
+
+    assert_eq(pl(src), "(call print \"hi\")")
+
+@test("consecutive indented blocks are one block, a paragraph between them ending nothing")
+consecutive_blocks_are_one_block()
+    val src = "First:\n\n    f() = 1\n\nThen an explanation.\n\n    print(f())\n"
+
+    assert_eq(pl(src), "(fn f () 1) (call print (call f))")
+
+@test("a body split by a paragraph resumes at the indentation it left off at")
+a_body_split_by_a_paragraph()
+    val src = "Here:\n\n    main()\n        print(1)\n\nAnd it goes on.\n\n        print(2)\n"
+
+    assert_eq(pl(src), "(fn main () (call print 1) (call print 2))")
+
+@test("a fenced block is an illustration, and is not compiled however it is indented")
+a_fenced_block_is_an_illustration()
+    val src = "Right:\n\n    print(1)\n\nWrong:\n\n~~~\n    print(2)\n~~~\n"
+
+    assert_eq(pl(src), "(call print 1)")
+
+@test("and a fence may quote a shorter one, the longer opener being how")
+a_fence_may_quote_a_shorter_one()
+    val src = "Shown:\n\n````\n```\n    print(2)\n```\n````\n\n    print(1)\n"
+
+    assert_eq(pl(src), "(call print 1)")
+
+@test("what is under a bullet is prose, an indented block there belonging to the item")
+what_is_under_a_bullet_is_prose()
+    val src = "- an item\n\n      print(2)\n\nBack at the margin.\n\n    print(1)\n"
+
+    assert_eq(pl(src), "(call print 1)")
+
+@test("a tab in the indentation is refused, being as wide as whatever is displaying it")
+a_tab_in_the_indentation_is_refused()
+    val src = "Text\n\n\tprint(1)\n"
+
+    assert_eq(pl_err(src),
+        "a tab in the indentation of a literate file — what makes a line program text is four columns of indent, and a tab is as wide as whatever happens to be displaying it, so this line is code in one editor and prose in another")
+    assert_eq(pl_at(src), "3:1")
+
+@test("a fence that is never closed is refused at the line that opened it")
+an_unclosed_fence_is_refused()
+    val src = "Text\n\n```\nprint(1)\n\n    print(2)\n"
+
+    assert_eq(pl_err(src),
+        "this fence is never closed, so everything below it is an illustration and none of it is compiled — close it, or indent the lines that are meant to run")
+    assert_eq(pl_at(src), "3:1")
+
+@test("positions survive: a line of program text is on the line it was written on")
+positions_survive_a_tangle()
+    val src = "Text\n\nAnd more.\n\n    print(1 2)\n"
+
+    assert_eq(pl_err(src), "')' expected")
+    assert_eq(pl_at(src), "5:13")
+
+@test("a file that is not literate is read as an ordinary program whatever its indentation")
+a_sysl_file_is_never_read_as_literate()
+    assert_eq(pf_err("    print(1)\n"), "expression expected")

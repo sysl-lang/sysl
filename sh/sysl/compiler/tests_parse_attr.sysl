@@ -1,0 +1,172 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// `@` and what follows it: the annotations a declaration carries, the ones a member may, `@assert`,
+// and the refusals for the ones written where they say nothing.
+
+// -- what a function carries -------------------------------------------------------------------
+
+@test("an annotation stands on the line above the declaration it marks")
+an_annotation_stands_on_the_line_above()
+    assert_eq(pf("@test\nf() = 1\n"), "(fn @test f () 1)")
+    assert_eq(pf("@tailrec\nf() = 1\n"), "(fn @tailrec f () 1)")
+    assert_eq(pf("@pure\nf() = 1\n"), "(fn @pure f () 1)")
+    assert_eq(pf("@ghost\nf() = 1\n"), "(fn @ghost f () 1)")
+
+@test("several may stand above one declaration, on one line or on several")
+several_may_stand_above_one_declaration()
+    assert_eq(pf("@tailrec\n@pure\nf() = 1\n"), pf("@tailrec @pure\nf() = 1\n"))
+
+@test("'@test' takes the description a report shows it under")
+test_takes_a_description()
+    assert_eq(pf("@test(\"an index past the end is refused\")\nf() = 1\n"),
+        "(fn @test(\"an index past the end is refused\") f () 1)")
+    assert_eq(pf("@test(should_trap)\nf() = 1\n"), "(fn @test@should_trap f () 1)")
+    assert_eq(pf("@test(\"it traps\", should_trap: \"boom\")\nf() = 1\n"),
+        "(fn @test(\"it traps\")@should_trap(\"boom\") f () 1)")
+
+@test("and '()' is neither a description nor nothing at all")
+test_refuses_empty_parentheses()
+    assert(pf_err("@test()\nf() = 1\n").contains("takes a description or nothing at all"),
+        "the refusal says what to write instead")
+
+@test("each of the four hooks says when a run calls the function, and takes no arguments")
+the_four_hooks()
+    for word in ["setup", "teardown", "setup_all", "teardown_all"]
+        assert_eq(pf(s"@${word}\nf() = 1\n"), s"(fn @${word} f () 1)")
+
+    assert(pf_err("@setup(1)\nf() = 1\n").contains("a hook takes no arguments"),
+        "a hook's parentheses carry nothing")
+
+@test("two annotations that each say when a run calls the function name different moments")
+two_runner_roles_name_different_moments()
+    assert_eq(pf_err("@test @setup\nf() = 1\n"),
+        "'@test' and '@setup' each say when 'sysl test' calls this function, and they name different moments — a function is a test or one of the hooks around one, and it is called once")
+
+@test("an annotation written twice says nothing the once does not")
+an_annotation_written_twice()
+    assert_eq(pf_err("@pure @pure\nf() = 1\n"),
+        "'@pure' is written twice above one declaration, and it says nothing the once does not")
+
+@test("a frame names the module variables it covers, and its parentheses are what say it covers none")
+a_frame_names_what_it_covers()
+    assert_eq(pf("@reads(count)\nf() = 1\n"), "(fn @reads(count) f () 1)")
+    assert_eq(pf("@writes()\nf() = 1\n"), "(fn @writes() f () 1)")
+    assert(pf_err("@reads\nf() = 1\n").contains("names the module variables it covers, in parentheses"),
+        "there is no bare form")
+
+@test("'@pure' already says what a frame says, so the two together say one thing twice")
+pure_beside_a_frame()
+    assert(pf_err("@pure @reads(n)\nf() = 1\n").contains("already says '@reads()' and '@writes()'"),
+        "the refusal says which claim is doubled")
+
+@test("'@export' names what C sees, under a symbol or under the function's own name")
+export_names_what_c_sees()
+    assert_eq(pf("@export\nf() = 1\n"), "(fn @export f () 1)")
+    assert_eq(pf("@export(\"mylib_parse\")\nf() = 1\n"), "(fn @export(\"mylib_parse\") f () 1)")
+
+@test("'@section' places one object, and names the section as a string")
+section_places_one_object()
+    assert_eq(pf("@section(\".ramfunc\")\nf() = 1\n"), "(fn @section(\".ramfunc\") f () 1)")
+    assert_eq(pf("@section(\".vectors\")\nval v = 1\n"), "(val @section(\".vectors\") v 1)")
+    assert(pf_err("@section(\"\")\nf() = 1\n").contains("is not the name of one"),
+        "an empty section resolves to nothing")
+
+@test("'@align' names the boundary a binding's storage begins on")
+align_names_a_boundary()
+    assert_eq(pf("@align(64)\nvar buffer: int\n"), "(var @align(64) buffer : int)")
+    assert(pf_err("@align\nvar b: int\n").contains("names the boundary in parentheses"),
+        "there is no bare form")
+
+@test("'@crossing' and '@needs' each name at least one thing")
+crossing_and_needs_name_something()
+    assert_eq(pf("@crossing(state)\nf(state: int) = 1\n"),
+        "(fn @crossing(state) f (state:int) 1)")
+    assert_eq(pf("@needs(heap)\nf() = 1\n"), "(fn @needs(heap) f () 1)")
+    assert(pf_err("@needs()\nf() = 1\n").contains("There is no empty form"),
+        "an empty list says nothing the absence does not")
+
+@test("'@needs' is the one annotation an 'extern' takes")
+needs_is_an_externs_annotation()
+    assert_eq(pf("@needs(heap)\nextern malloc(n: usize) -> *u8\n"),
+        "(extern @needs(heap) malloc (n:usize) -> (ptr u8))")
+
+@test("the layout annotations mark a struct")
+the_layout_annotations_mark_a_struct()
+    assert_eq(pf("@packed\nstruct P\n    x: int\n"), "(struct @packed P (x:int))")
+    assert_eq(pf("@align(16)\nstruct P\n    x: int\n"), "(struct @align(16) P (x:int))")
+    assert_eq(pf("@export(\"point_t\")\nstruct P\n    x: int\n"),
+        "(struct @export(\"point_t\") P (x:int))")
+
+@test("and '@packed' has nothing to pack above a binding or a function")
+packed_has_nothing_to_pack()
+    assert(pf_err("@packed\nval x = 1\n").contains("so it can only mark a struct"),
+        "a binding has no fields")
+    assert(pf_err("@packed\nf() = 1\n").contains("so it can only mark a struct"),
+        "nor has a function")
+
+@test("an annotation that marks a function says so above a declaration of another kind")
+an_annotation_above_the_wrong_kind()
+    assert_eq(pf_err("@test\nstruct P\n    x: int\n"),
+        "an annotation marks a function, and only a function — neither what 'sysl test' calls nor what recurses is anything a declaration of another kind supplies. '@packed', '@align(n)' and '@export(\"...\")' are the three that mark a struct instead")
+
+@test("a word that is not an annotation is answered with the roster")
+a_word_that_is_not_an_annotation()
+    assert(pf_err("@bogus\nf() = 1\n").starts_with("'bogus' is not an annotation a declaration takes"),
+        "the refusal opens with the word that was written")
+
+@test("'#' opens a directive, and an annotation is written '@'")
+a_hash_is_not_an_annotation()
+    assert_eq(pf_err("#test\nf() = 1\n"),
+        "an annotation is written '@test' — '#' opens a directive, which gates lines before the lexer sees them and sits at the margin")
+
+@test("'@borrows' says something only on a trait's method")
+borrows_says_nothing_above_a_function()
+    assert(pf_err("@borrows(bytes)\nf(bytes: int) = 1\n").contains("only on a trait's method"),
+        "the refusal says where it belongs")
+
+// -- what a member carries ---------------------------------------------------------------------
+
+@test("the annotations a member may carry are the ones about a parameter")
+a_members_annotations_are_about_a_parameter()
+    assert_eq(pf("trait T\n    @borrows(bytes)\n    take(self, bytes: int)\n"),
+        "(trait T (method @borrows(bytes) self take (bytes:int)))")
+    assert_eq(pf("struct P\n    @crossing(state)\n    send(self, state: int)\n        f()\n"),
+        "(struct P () (method @crossing(state) self send (state:int) (call f)))")
+
+@test("and the rest are about a free function or about a type")
+the_rest_are_not_a_members()
+    assert(pf_err("struct P\n    @test\n    m(self)\n        f()\n").contains("the only annotations a member may carry"),
+        "the refusal lists the four")
+
+@test("an annotation above a field has no parameter to name")
+an_annotation_above_a_field()
+    assert(pf_err("struct P\n    @crossing(x)\n    x: int\n").contains("a field and a variant have none"),
+        "the refusal says why")
+
+@test("'@assert' stands beside a type rather than inside it")
+assert_stands_beside_a_type()
+    assert(pf_err("struct P\n    @assert(1 == 1)\n    x: int\n").contains("stands where a declaration stands"),
+        "the refusal says where it goes")
+
+// -- '@assert' -----------------------------------------------------------------------------------
+
+@test("'@assert' is a declaration of its own, and its parentheses are what make it one")
+assert_is_a_declaration_of_its_own()
+    assert_eq(pf("@assert(sizeof(int) == 4)\n"),
+        "(assert (cmp (sizeof int) == 4))")
+    assert_eq(pf("@assert(sizeof(int) == 4, \"why\")\n"),
+        "(assert (cmp (sizeof int) == 4) \"why\")")
+    assert(pf_err("@assert sizeof(int) == 4\n").contains("takes its condition in parentheses"),
+        "the parentheses are what make it this declaration")
+
+// -- where a header clause belongs -----------------------------------------------------------------
+
+@test("a header clause written among the statements is told where it belongs")
+a_header_clause_among_the_statements()
+    assert_eq(pf_err("f() = 1\n@link(\"m\")\n"),
+        "this attribute belongs in the file's header, on the lines directly after 'module' and before everything else — it is a property of the whole module, not of the statements below it")

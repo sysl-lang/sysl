@@ -76,6 +76,15 @@ parse_attr_list(p: *Parser) -> Buf[Attr]
     loop
         if !p.at_kw("@") && !p.at_kw("#") then break
 
+        // **`@borrows` says something only on a trait's method.** A free function's body is right
+        // here and the analysis reads the answer out of it, so a promise written above one would
+        // restate what the compiler already knows and would go stale the moment the body changed.
+        if p.at_kw("@") && attr_name(p) == "borrows"
+            p.fault(p.here(), "'@borrows' is about a call whose body the compiler cannot see, so it says something only on a trait's method. A free function's body is right here and the analysis reads the answer out of it — a promise written above one would restate what the compiler already knows, and would go stale the moment the body changed")
+            skip_line(p)
+            break
+        end if
+
         parse_attribute(p) match
             Some(a) -> out.push(a)
             None -> break
@@ -395,20 +404,37 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     refuse_impossible_pairs(p, attrs)
 
     val vis = parse_visibility(p)
+    val at = p.here()
 
-    if p.at_kw("struct") then return laid_out(parse_struct_decl(p, start, vis, false), attrs)
+    if p.at_kw("struct") || (p.at_word("opaque") && p.kw_at(1, "struct"))
+        // **`@packed`, `@align(n)` and `@export("...")` are the three that mark a struct**, and
+        // anything else above one is about a function that is not here.
+        refuse_unless(p, at, attrs, "struct")
 
-    if p.at_word("opaque") && p.kw_at(1, "struct")
-        return laid_out(parse_opaque_struct(p, start, vis), attrs)
+        val hidden = p.at_word("opaque")
 
-    if p.at_kw("val") then return placed(parse_stmt_at(p, false), attrs)
-    if p.at_kw("var") then return placed(parse_stmt_at(p, false), attrs)
-    if p.at_kw("static") then return placed(parse_stmt_at(p, false), attrs)
+        if hidden then return laid_out(parse_opaque_struct(p, at, vis), attrs)
 
+        return laid_out(parse_struct_decl(p, at, vis, false), attrs)
+    end if
+
+    // `@align(n)` is the boundary one object's storage begins on and `@section("...")` places it,
+    // and between them they are what a binding may carry.
+    if p.at_kw("val") || p.at_kw("var") || p.at_kw("static")
+        refuse_unless(p, at, attrs, "binding")
+        return placed(parse_stmt_at(p, false), attrs)
+    end if
+
+    // `@needs(...)` is the one annotation an `extern` takes -- it is the declaration the annotation
+    // exists for, every other having a body the compiler reads instead.
     if p.at_kw("extern")
-        return parse_extern_decl(p, start, vis, capabilities_of(attrs))
+        refuse_unless(p, at, attrs, "extern")
+        return parse_extern_decl(p, at, vis, capabilities_of(attrs))
+    end if
 
-    try_func_decl(p, start, vis, attrs) match
+    refuse_unless(p, at, attrs, "function")
+
+    try_func_decl(p, at, vis, attrs) match
         Some(d) -> return d
         None -> ()
 
@@ -416,6 +442,21 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     skip_line(p)
     stmt(start.to(p.just_taken()), Bad)
 end parse_attributed_decl
+
+// That every annotation above this declaration is one the declaration may carry.
+private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)
+    for i in 0..<attrs.len()
+        if !may_carry(form, attrs.at(i))
+            p.fault(at, attributed_refusal(attrs))
+            return
+
+private may_carry(form: string, a: Attr) -> bool
+    if form == "struct" then return is_layout(a) || attr_word(a) == "export"
+    if form == "binding" then return attr_word(a) == "align" || attr_word(a) == "section"
+    if form == "extern" then return attr_word(a) == "needs"
+
+    !is_layout(a) && attr_word(a) != "borrows"
+end may_carry
 
 // The sentence a declaration that carries none of these gets, chosen by what was written above it.
 private attributed_refusal(attrs: Buf[Attr]) -> string
