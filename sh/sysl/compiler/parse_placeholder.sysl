@@ -1,0 +1,220 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// `_` -- a closure parameter with the name left out.
+//
+// **A bare `_` in operand position is a parameter, and the closure it builds closes at the nearest
+// of three boundaries: a parenthesised group, an argument, or a statement**
+// (`reference/expressions.md § _ -- a parameter with the name left out`). So `apply(_ + 1, 41)`
+// hands `apply` the closure `x -> x + 1`, and `(_ + 1) * 2` multiplies a *closure* by two -- which
+// is the one thing to know about the form, and is why the group is a boundary at all.
+//
+// **How it is done: the parser names each `_` and the boundary lifts.** Reading a `_` puts an
+// ordinary name in the tree that no program could have written; whichever boundary is reached first
+// collects the names free in what it holds and wraps it in a closure taking them, in the order they
+// were written. Nothing downstream ever meets a placeholder.
+
+// The prefix a placeholder's name carries. It is not a name a program can write, which is the whole
+// of what keeps a synthesized parameter from colliding with a real one.
+private const PlaceholderPrefix: string = "$ph"
+
+is_placeholder(name: string) -> bool = name.starts_with(PlaceholderPrefix)
+
+// The next placeholder's name. Counted per parser, so two `_` in one file are two parameters.
+fresh_placeholder(p: *Parser) -> string
+    p.ph_count += 1
+    s"${PlaceholderPrefix}${p.ph_count}"
+
+// The expression, or a closure over the placeholders free in it.
+//
+// **A boundary that holds none hands its expression straight back**, so nothing in a program with no
+// `_` in it goes through a closure it did not ask for.
+lift_placeholders(e: Expr) -> Expr
+    var found: Buf[Expr] = buf()
+
+    collect_free(e, &found)
+
+    if found.is_empty() then return e
+
+    var params: Buf[LambdaParam] = buf()
+
+    for i in 0..<found.len()
+        val id = found.at(i)
+
+        *id.kind match
+            Ident(n) -> params.push(LambdaParam(id.span, n, None))
+            _ -> ()
+
+    var body: Buf[Stmt] = buf()
+
+    body.push(stmt(e.span, ExprStmt(e)))
+    expr(e.span, Lambda(params, body, false))
+end lift_placeholders
+
+// The same, at an argument.
+//
+// **A bare `_` argument is left alone**, and so is one under a name: `f(_)` is the enclosing call's
+// placeholder rather than the identity closure, which is what makes `map(f, _)` mean what it looks
+// like.
+lift_argument(e: Expr) -> Expr
+    *e.kind match
+        Ident(n) -> if is_placeholder(n) then e else lift_placeholders(e)
+        NamedArg(n, v) ->
+            *v.kind match
+                Ident(m) -> if is_placeholder(m) then e else expr(e.span, NamedArg(n, lift_placeholders(v)))
+                _ -> expr(e.span, NamedArg(n, lift_placeholders(v)))
+        _ -> lift_placeholders(e)
+end lift_argument
+
+private collect_each(es: Buf[Expr], out: *Buf[Expr])
+    for i in 0..<es.len()
+        collect_free(es.at(i), out)
+
+private collect_opt(e: Option[Expr], out: *Buf[Expr])
+    e match
+        Some(v) -> collect_free(v, out)
+        None -> ()
+
+private collect_body(ss: Buf[Stmt], out: *Buf[Expr])
+    for i in 0..<ss.len()
+        collect_stmt(ss.at(i), out)
+
+private collect_opt_body(ss: Option[Buf[Stmt]], out: *Buf[Expr])
+    ss match
+        Some(b) -> collect_body(b, out)
+        None -> ()
+
+// The placeholders free in an expression, in the order they were written.
+//
+// **A closure and a trailing block are where the walk stops.** A closure has parameters of its own,
+// so a `_` inside one belongs to it; a trailing block stops for the same reason one step earlier --
+// it may *become* a closure, and which it becomes is not known until the parameter it stands at is,
+// so lifting out of it would decide that here and decide it wrong for every block filling a
+// callable.
+private collect_free(e: Expr, out: *Buf[Expr])
+    *e.kind match
+        Ident(n) -> if is_placeholder(n) then out.push(e)
+        Lambda(_, _, _) -> ()
+        BlockArg(_) -> ()
+        Unary(_, operand) -> collect_free(operand, out)
+        PreIncDec(_, operand) -> collect_free(operand, out)
+        PostIncDec(_, operand) -> collect_free(operand, out)
+        Binary(_, left, right) ->
+            collect_free(left, out)
+            collect_free(right, out)
+        Compare(operands, _) -> collect_each(operands, out)
+        RangeExpr(lo, hi, _) ->
+            collect_opt(lo, out)
+            collect_opt(hi, out)
+        Assign(_, target, value) ->
+            collect_free(target, out)
+            collect_free(value, out)
+        Call(callee, args) ->
+            collect_free(callee, out)
+            collect_each(args, out)
+        NamedArg(_, value) -> collect_free(value, out)
+        Spread(value) -> collect_free(value, out)
+        DefaultArg(_, value) -> collect_free(value, out)
+        Index(receiver, index) ->
+            collect_free(receiver, out)
+            collect_free(index, out)
+        Field(receiver, _) -> collect_free(receiver, out)
+        TypeArgs(receiver, args) ->
+            collect_free(receiver, out)
+            collect_each(args, out)
+        TypeAttr(receiver, _) -> collect_free(receiver, out)
+        WithExpr(base, fields) ->
+            collect_free(base, out)
+
+            for i in 0..<fields.len()
+                collect_free(fields.at(i).value, out)
+        LayoutOf(_, _) -> ()
+        OffsetOf(_, _) -> ()
+        TryExpr(inner) -> collect_free(inner, out)
+        Tuple(elements) -> collect_each(elements, out)
+        ArrayLit(elements) -> collect_each(elements, out)
+        ArrayFill(value, count) ->
+            collect_free(value, out)
+            collect_free(count, out)
+        Block(stmts) -> collect_body(stmts, out)
+        IfExpr(cond, then_body, else_body) ->
+            collect_free(cond, out)
+            collect_body(then_body, out)
+            collect_opt_body(else_body, out)
+        MatchExpr(scrutinee, arms) ->
+            collect_free(scrutinee, out)
+
+            for i in 0..<arms.len()
+                val a = arms.at(i)
+
+                collect_opt(a.guard, out)
+                collect_body(a.body, out)
+        IsPattern(subject, _, _) -> collect_free(subject, out)
+        ResultList(values) -> collect_each(values, out)
+        While(_, cond, body, else_body) ->
+            collect_free(cond, out)
+            collect_body(body, out)
+            collect_opt_body(else_body, out)
+        DoWhile(_, body, cond, else_body) ->
+            collect_body(body, out)
+            collect_free(cond, out)
+            collect_opt_body(else_body, out)
+        Loop(_, body) -> collect_body(body, out)
+        For(_, _, iter, body, else_body) ->
+            collect_free(iter, out)
+            collect_body(body, out)
+            collect_opt_body(else_body, out)
+        ConstFor(_, iter, body) ->
+            collect_free(iter, out)
+            collect_body(body, out)
+        CFor(_, init, cond, step, body, else_body) ->
+            init match
+                Some(s) -> collect_stmt(s, out)
+                None -> ()
+
+            collect_opt(cond, out)
+
+            step match
+                Some(s) -> collect_stmt(s, out)
+                None -> ()
+
+            collect_body(body, out)
+            collect_opt_body(else_body, out)
+        Quantifier(_, _, iter, pred) ->
+            collect_free(iter, out)
+            collect_free(pred, out)
+        _ -> ()
+end collect_free
+
+// The placeholders free in a statement.
+//
+// **A declaration is a boundary too, and not by omission**: a `_` written inside a nested function's
+// body was lifted at its own statement boundary before this walk could ever reach it, so descending
+// into one would find nothing and could only find the wrong thing.
+private collect_stmt(s: Stmt, out: *Buf[Expr])
+    *s.kind match
+        ExprStmt(e) -> collect_free(e, out)
+        VarDecl(_, _, init, _, _, _) -> collect_opt(init, out)
+        ValDecl(_, _, value, _, _, _) -> collect_free(value, out)
+        ConstDecl(_, _, value, _) -> collect_free(value, out)
+        RefDecl(_, place) -> collect_free(place, out)
+        MultiAssign(_, targets, values) ->
+            collect_each(targets, out)
+            collect_each(values, out)
+        MultiDecl(_, _, values) -> collect_each(values, out)
+        PatternDecl(_, _, value) -> collect_free(value, out)
+        Return(value) -> collect_opt(value, out)
+        Become(call) -> collect_free(call, out)
+        Break(_, value) -> collect_opt(value, out)
+        Defer(inner) -> collect_stmt(inner, out)
+        StaticDecl(inner) -> collect_stmt(inner, out)
+        Require(cond, _) -> collect_free(cond, out)
+        Ensure(cond, _) -> collect_free(cond, out)
+        Invariant(cond, _) -> collect_free(cond, out)
+        Variant(measure) -> collect_free(measure, out)
+        AssertDecl(cond, _) -> collect_free(cond, out)
+        _ -> ()
+end collect_stmt

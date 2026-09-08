@@ -116,6 +116,21 @@ parse_expr_bp(p: *Parser, min_bp: u8) -> Expr
             Some(e) -> e
             None -> expr(p.here(), Bad)
 
+    // `column:` with a block under it -- the trailing block written with no argument list in front
+    // of it, which is what a container reads like.
+    //
+    // **It is attached here rather than in the loop**, and it has to be: a token's binding power is
+    // asked of the token alone, and a `:` opens a block only when a `Newline` and an `Indent` follow
+    // it. Attaching it where the loop stopped is what keeps it as tight as a call's, so
+    // `a + column:` gives the block to `column` and not to the sum.
+    parse_trailing_block(p) match
+        Some(b) ->
+            var args: Buf[Expr] = buf()
+
+            args.push(b)
+            left = lift_placeholders(expr(left.span.to(p.just_taken()), Call(left, args)))
+        None -> ()
+
     if min_bp >= MatchPower then return left
 
     loop
@@ -233,7 +248,7 @@ private parse_lambda_body(p: *Parser) -> Buf[Stmt]
     val start = p.here()
     val e = parse_expr(p)
 
-    out.push(stmt(start.to(p.just_taken()), ExprStmt(e)))
+    out.push(stmt(start.to(p.just_taken()), ExprStmt(lift_placeholders(e))))
     out
 end parse_lambda_body
 
@@ -251,7 +266,7 @@ private nud(t: Spanned[Tok], p: *Parser) -> Expr
         StrLit(v) -> expr(at, StrLit(v))
         CStrLit(v) -> expr(at, CStrLit(v))
         StrInterp(parts, exprs, specs) -> desugar_interp(p, at, parts, exprs, specs)
-        Ident(n) -> expr(at, Ident(n))
+        Ident(n) -> if n == "_" then expr(at, Ident(fresh_placeholder(p))) else expr(at, Ident(n))
         QuotedIdent(n) -> expr(at, Ident(n))
         Keyword(w) -> nud_word(p, at, w)
         _ ->
@@ -305,9 +320,11 @@ private parse_paren_tail(p: *Parser, at: Span) -> Expr
 
     val first = parse_expr(p)
 
+    // A parenthesised group is a boundary for a `_`, which is the one thing to know about that
+    // form: `(_ + 1) * 2` multiplies a closure by two rather than closing over the doubled sum.
     if !p.at_kw(",")
         p.expect_kw(")")
-        return first
+        return lift_placeholders(first)
     end if
 
     var parts: Buf[Expr] = buf()
@@ -321,7 +338,7 @@ private parse_paren_tail(p: *Parser, at: Span) -> Expr
         parts.push(parse_expr(p))
 
     p.expect_kw(")")
-    expr(at.to(p.just_taken()), Tuple(parts))
+    lift_placeholders(expr(at.to(p.just_taken()), Tuple(parts)))
 end parse_paren_tail
 
 // `[a, b]`, `[v; n]` and the empty literal, whose element type comes from the context.
@@ -582,7 +599,9 @@ private led_call(lhs: Expr, p: *Parser) -> Expr
         Some(b) -> args.push(b)
         None -> ()
 
-    expr(lhs.span.to(p.just_taken()), Call(lhs, args))
+    // A call whose arguments were each big enough to lift where they stood has nothing free left in
+    // it, and this hands it straight back; what it catches is the bare `_` an argument left alone.
+    lift_placeholders(expr(lhs.span.to(p.just_taken()), Call(lhs, args)))
 end led_call
 
 // One argument: a name it stands at, the rest it already is, or an ordinary value.
@@ -605,9 +624,9 @@ private parse_argument(p: *Parser) -> Expr
     val e = parse_expr(p)
 
     // `xs...` -- this argument is already the slice a `...T` parameter collects.
-    if p.accept_kw("...") then return expr(start.to(p.just_taken()), Spread(e))
+    if p.accept_kw("...") then return expr(start.to(p.just_taken()), Spread(lift_argument(e)))
 
-    e
+    lift_argument(e)
 end parse_argument
 
 // The indented block a call may write after a `:`.
@@ -911,7 +930,9 @@ end desugar_interp
 private parse_embedded(p: *Parser, at: Span, src: string) -> Expr
     val inner = parse_expr_text(s"${p.src.name} (interpolation)", src)
 
-    if inner.ok() then return inner.value
+    // An interpolation hole is a boundary too, so a placeholder cannot reach out of a string to
+    // close over the whole of one.
+    if inner.ok() then return lift_placeholders(inner.value)
 
     p.fault(at, s"in interpolation '${src}': ${inner.first().message}")
     expr(at, Bad)

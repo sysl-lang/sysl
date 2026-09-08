@@ -35,6 +35,10 @@ struct Parser
     // lost a line is still the `if` the reader wrote, and dropping it would cost them the block.
     dropped: usize
 
+    // How many `_` placeholders this file has been given names for, which is what keeps those names
+    // apart.
+    ph_count: usize
+
     // The kind of the next token. `Eof` where there is none, so that no caller unwraps.
     peek(self) -> Tok = self.toks.peek() match
         Some(t) -> t.value
@@ -309,7 +313,7 @@ end Parsed
 // report: everything after an unterminated literal is being read in the wrong language, so a second
 // complaint about it is noise at best and a wrong line number at worst.
 parser_over(src: Source) -> Result[Parser, Diagnostic] =
-    Ok(Parser(tokens_of(lex(src)?), src, report(), 0, 0))
+    Ok(Parser(tokens_of(lex(src)?), src, report(), 0, 0, 0))
 
 // One expression, read from text.
 //
@@ -495,7 +499,8 @@ parse_stmt(p: *Parser) -> Stmt
     val start = p.here()
     val e = parse_expr(p)
 
-    stmt(start.to(p.just_taken()), ExprStmt(e))
+    // A statement is the outermost of the three boundaries a `_` may close at.
+    stmt(start.to(p.just_taken()), ExprStmt(lift_placeholders(e)))
 end parse_stmt
 
 // An indented block: the lexer's `Newline` `Indent` pair, statements, and the `Dedent` that closes
