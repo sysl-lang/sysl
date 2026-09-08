@@ -1,0 +1,558 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// `@` and what follows it: the annotations a declaration carries, the `@assert` that is a
+// declaration of its own, and the refusals for the ones written where they say nothing.
+//
+// **An annotation describes the declaration under it, and `@assert` describes nothing but itself.**
+// That is the whole of what tells the two apart, and it is why the parentheses are not optional
+// there: they are what make the line a declaration rather than a prefix.
+
+// No annotations at all, which is what most declarations carry.
+no_attrs() -> Buf[Attr] = buf()
+
+// The words that belong in a file's header rather than above a declaration.
+header_attr_word(w: string) -> bool
+    if w.starts_with("no_") && w.len > 3 then return true
+
+    for word in ["requires", "link", "include", "tests"]
+        if word == w then return true
+
+    false
+end header_attr_word
+
+// The word a `@` is followed by, or `""` where it is followed by no name at all.
+attr_name(p: *Parser) -> string = p.peek_at(1) match
+    Ident(n) -> n
+    _ -> ""
+
+// A statement opening with `@`.
+parse_at_stmt(p: *Parser, start: Span) -> Stmt
+    val word = attr_name(p)
+
+    if header_attr_word(word)
+        p.fault(start, "this attribute belongs in the file's header, on the lines directly after 'module' and before everything else — it is a property of the whole module, not of the statements below it")
+        skip_line(p)
+        return stmt(start.to(p.just_taken()), Bad)
+    end if
+
+    if word == "assert" then return parse_assert_decl(p, start)
+
+    parse_attributed_decl(p, start)
+end parse_at_stmt
+
+// `@assert(cond)`, `@assert(cond, "why")` -- a condition settled while compiling.
+private parse_assert_decl(p: *Parser, start: Span) -> Stmt
+    p.bump()
+    p.bump()
+
+    if !p.at_kw("(")
+        p.fault(start, "'@assert' takes its condition in parentheses — '@assert(sizeof(T) == 16)', with an optional message after a comma. It is the parentheses that make it this declaration rather than an annotation about the one under it")
+        skip_line(p)
+        return stmt(start.to(p.just_taken()), Bad)
+    end if
+
+    p.bump()
+
+    val cond = parse_expr(p)
+    var message: Option[string] = None
+
+    if p.accept_kw(",") then message = accept_string(p)
+
+    p.expect_kw(")")
+    stmt(start.to(p.just_taken()), AssertDecl(cond, message))
+end parse_assert_decl
+
+// -- the annotations themselves -------------------------------------------------------------------
+
+// Every annotation above one declaration, and the newlines between them: each is its own line and
+// the declaration follows the last of them.
+parse_attr_list(p: *Parser) -> Buf[Attr]
+    var out: Buf[Attr] = buf()
+
+    loop
+        if !p.at_kw("@") && !p.at_kw("#") then break
+
+        parse_attribute(p) match
+            Some(a) -> out.push(a)
+            None -> break
+
+        p.skip_newlines()
+
+    refuse_duplicates(p, out, "declaration")
+    out
+end parse_attr_list
+
+// The annotations a member may carry, which are the ones about a parameter.
+parse_member_attrs(p: *Parser) -> Buf[Attr]
+    var out: Buf[Attr] = buf()
+
+    loop
+        if !p.at_kw("@") && !p.at_kw("#") then break
+
+        val at = p.here()
+        val word = attr_name(p)
+
+        if p.at_kw("#")
+            refuse_hash_attr(p, at)
+            break
+        end if
+
+        if !member_attr_word(word)
+            if word == "assert"
+                p.fault(at, "'@assert' stands where a declaration stands, and a type's body holds its members — write it beside the type rather than inside it, where 'sizeof' and 'offsetof' still name what it is about")
+            else
+                p.fault(at, "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@reads' and '@writes'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')")
+
+            skip_line(p)
+            break
+        end if
+
+        parse_attribute(p) match
+            Some(a) -> out.push(a)
+            None -> break
+
+        p.skip_newlines()
+
+    refuse_duplicates(p, out, "member")
+    out
+end parse_member_attrs
+
+private member_attr_word(w: string) -> bool
+    for word in ["crossing", "borrows", "reads", "writes"]
+        if word == w then return true
+
+    false
+end member_attr_word
+
+// An annotation written twice above one declaration says nothing the once does not.
+private refuse_duplicates(p: *Parser, attrs: Buf[Attr], what: string)
+    for i in 0..<attrs.len()
+        for j in 0..<i
+            if attr_word(attrs.at(i)) == attr_word(attrs.at(j))
+                p.fault(p.here(), s"'@${attr_word(attrs.at(i))}' is written twice above one ${what}, and it says nothing the once does not")
+                return
+end refuse_duplicates
+
+private refuse_hash_attr(p: *Parser, at: Span)
+    p.bump()
+
+    val name = parse_bound_name(p)
+
+    p.fault(at, s"an annotation is written '@${name}' — '#' opens a directive, which gates lines before the lexer sees them and sits at the margin")
+    skip_line(p)
+end refuse_hash_attr
+
+// One annotation.
+parse_attribute(p: *Parser) -> Option[Attr]
+    val at = p.here()
+
+    if p.at_kw("#")
+        refuse_hash_attr(p, at)
+        return None
+    end if
+
+    p.bump()
+
+    val word = p.peek() match
+        Ident(n) -> n
+        _ -> ""
+
+    if word == ""
+        p.want("identifier")
+        return None
+    end if
+
+    p.bump()
+
+    if word == "test" then return Some(Test(parse_test_attr(p, at)))
+    if word == "setup" then return Some(hook_attr(p, at, Setup))
+    if word == "teardown" then return Some(hook_attr(p, at, Teardown))
+    if word == "setup_all" then return Some(hook_attr(p, at, SetupAll))
+    if word == "teardown_all" then return Some(hook_attr(p, at, TeardownAll))
+    if word == "tailrec" then return Some(TailRec)
+    if word == "pure" then return Some(Pure)
+    if word == "ghost" then return Some(Ghost)
+    if word == "packed" then return Some(Packed)
+    if word == "reads" then return Some(Reads(parse_frame_names(p, "reads")))
+    if word == "writes" then return Some(Writes(parse_frame_names(p, "writes")))
+    if word == "align" then return Some(parse_align_attr(p))
+    if word == "export" then return Some(parse_export_attr(p, at))
+    if word == "section" then return Some(parse_section_attr(p))
+    if word == "crossing" then return Some(Crossing(parse_named_list(p, "crossing")))
+    if word == "borrows" then return Some(Borrows(parse_named_list(p, "borrows")))
+    if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
+
+    p.fault(at, s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, '@packed' and '@align(n)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
+    skip_line(p)
+    None
+end parse_attribute
+
+private hook_attr(p: *Parser, at: Span, kind: HookKind) -> Attr
+    if p.at_kw("(")
+        p.fault(p.here(), "a hook takes no arguments — when it runs is what the word says, and what it does is its body. There is nothing left for a parenthesis to carry")
+        skip_line(p)
+    end if
+
+    Hook(HookAttr(at.to(p.just_taken()), kind))
+end hook_attr
+
+// `@reads(count)`, `@writes()` -- the module variables a frame covers. **The parentheses are what
+// tell a frame that covers nothing from a function that never said**, so there is no bare form.
+private parse_frame_names(p: *Parser, word: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if !p.accept_kw("(")
+        p.fault(p.here(), s"'@${word}' names the module variables it covers, in parentheses — '@${word}(count)', or '@${word}()' for none. The parentheses are what tell a frame that covers nothing from a function that never said")
+        return out
+    end if
+
+    if p.accept_kw(")") then return out
+
+    loop
+        p.name() match
+            Some(n) -> out.push(n)
+            None -> break
+
+        if !p.accept_kw(",") then break
+
+    p.expect_kw(")")
+    out
+end parse_frame_names
+
+// `@crossing(state)`, `@borrows(bytes)`, `@needs(heap)` -- each names at least one thing, and there
+// is no empty form: a declaration that names none says so by not writing the annotation.
+private parse_named_list(p: *Parser, word: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if !p.accept_kw("(") || p.at_kw(")")
+        p.fault(p.here(), named_list_refusal(word))
+        skip_line(p)
+        return out
+    end if
+
+    loop
+        p.name() match
+            Some(n) -> out.push(n)
+            None -> break
+
+        if !p.accept_kw(",") then break
+
+    p.expect_kw(")")
+    out
+end parse_named_list
+
+private named_list_refusal(word: string) -> string
+    if word == "crossing" then return "'@crossing' names the parameters a value reaches another concurrency domain through, in parentheses — '@crossing(state)'. There is no empty form: a function that hands nothing across a boundary says so by not writing the annotation"
+
+    if word == "borrows" then return "'@borrows' names the parameters a trait's method promises not to keep past the call, in parentheses — '@borrows(bytes)'. There is no empty form: a method that may keep what it is handed says so by not writing the annotation"
+
+    "'@needs' names the capabilities reaching this declaration requires, in parentheses — '@needs(heap)', '@needs(os, posix)'. There is no empty form: a declaration that needs nothing beyond what its module has says so by not writing the annotation"
+end named_list_refusal
+
+private parse_align_attr(p: *Parser) -> Attr
+    if !p.accept_kw("(")
+        p.fault(p.here(), "'@align' names the boundary in parentheses — '@align(64)', or '@align(CACHE_LINE)' for a constant that says what the number is for. There is no bare form: an alignment with no number is not a weaker claim, it is no claim")
+        return Align(expr(p.here(), Bad))
+    end if
+
+    val bound = parse_expr(p)
+
+    p.expect_kw(")")
+    Align(bound)
+end parse_align_attr
+
+// `@export`, `@export("mylib_parse")` -- the symbol a function is visible under from C, or the name
+// a struct's `typedef` carries in a generated header.
+private parse_export_attr(p: *Parser, at: Span) -> Attr
+    if !p.accept_kw("(") then return Export(ExportAttr(at.to(p.just_taken()), None))
+
+    var symbol: Option[string] = None
+
+    p.peek() match
+        StrLit(v) ->
+            p.bump()
+            symbol = Some(v)
+        _ ->
+            p.fault(p.here(), "'@export' names the C symbol as a string — '@export(\"mylib_parse\")' — or takes no parentheses at all, which exports the function under its own name")
+            skip_line(p)
+            return Export(ExportAttr(at.to(p.just_taken()), None))
+
+    p.expect_kw(")")
+    Export(ExportAttr(at.to(p.just_taken()), symbol))
+end parse_export_attr
+
+private parse_section_attr(p: *Parser) -> Attr
+    val bad = "'@section' names the linker section as a string — '@section(\".vectors\")' on the storage or the definition that goes there. The spelling is the target's: '.noinit' and '.ramfunc' are ELF's, '__DATA,__mysection' is Mach-O's"
+
+    if !p.accept_kw("(")
+        p.fault(p.here(), bad)
+        return Section("")
+    end if
+
+    val at = p.here()
+
+    p.peek() match
+        StrLit(v) ->
+            p.bump()
+
+            if v == ""
+                p.fault(at, "'@section' names a section, and \"\" is not the name of one — a section's spelling is the target's, so there is nothing an empty one could resolve to")
+
+            p.expect_kw(")")
+            Section(v)
+        _ ->
+            p.fault(at, bad)
+            skip_line(p)
+            Section("")
+end parse_section_attr
+
+// `@test`, `@test("what it shows")`, `@test("...", should_trap)`, `@test(should_trap: "text")`.
+private parse_test_attr(p: *Parser, at: Span) -> TestAttr
+    if !p.at_kw("(") then return TestAttr(at.to(p.just_taken()), None, false, None)
+
+    if p.kw_at(1, ")")
+        p.fault(p.here(), "'@test' takes a description or nothing at all, and '()' is neither — drop the parentheses, and the function's own name becomes its description")
+        p.bump()
+        p.bump()
+        return TestAttr(at.to(p.just_taken()), None, false, None)
+    end if
+
+    p.bump()
+
+    var display: Option[string] = None
+    var should_trap = false
+    var expected: Option[string] = None
+
+    p.peek() match
+        StrLit(v) ->
+            p.bump()
+            display = Some(v)
+        _ -> ()
+
+    if display.is_none() && !p.at_word("should_trap")
+        p.fault(p.here(), "'@test' takes the description a report shows it under, written as a string — '@test(\"an index past the end is refused\")' — and 'should_trap' for a run that is meant not to come back, optionally with the text such a run must have printed. The two compose, in that order")
+        skip_line(p)
+        return TestAttr(at.to(p.just_taken()), None, false, None)
+    end if
+
+    if display.is_some() then p.accept_kw(",")
+
+    if p.accept_word("should_trap")
+        should_trap = true
+
+        if p.accept_kw(":") then expected = accept_string(p)
+    end if
+
+    if !p.accept_kw(")")
+        p.fault(p.here(), "'@test' closes what it opened — the description and 'should_trap' go between parentheses, and there is no ')' here to end them")
+
+    TestAttr(at.to(p.just_taken()), display, should_trap, expected)
+end parse_test_attr
+
+// -- folding an annotation onto what it marks -----------------------------------------------------
+
+apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
+    for i in 0..<attrs.len()
+        attrs.at(i) match
+            Test(t) -> f.test = Some(t)
+            Hook(h) -> f.hook = Some(h)
+            TailRec -> f.tailrec = true
+            Pure -> f.pure = true
+            Ghost -> f.ghost = true
+            Reads(ns) -> f.reads = Some(ns)
+            Writes(ns) -> f.writes = Some(ns)
+            Export(e) -> f.exported = Some(e)
+            Section(s) -> f.section = Some(s)
+            Crossing(ns) -> f.crossing = ns
+            Needs(cs) -> f.needs = cs
+            _ -> ()
+end apply_func_attrs
+
+apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
+    for i in 0..<attrs.len()
+        attrs.at(i) match
+            Crossing(ns) -> m.crossing = ns
+            Borrows(ns) -> m.borrows = ns
+            Reads(ns) -> m.reads = Some(ns)
+            Writes(ns) -> m.writes = Some(ns)
+            _ -> ()
+end apply_member_attrs
+
+// -- routing a declaration to the thing its annotations describe -----------------------------------
+
+// A declaration with a line or more of annotation in front of it.
+//
+// **Reading an annotation commits the line to being an attributed declaration**, so a declaration
+// that cannot carry one is answered with a sentence about what the annotation marks rather than
+// with the grammar's complaint about the form it went on to try.
+private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
+    val attrs = parse_attr_list(p)
+
+    refuse_impossible_pairs(p, attrs)
+
+    val vis = parse_visibility(p)
+
+    if p.at_kw("struct") then return laid_out(parse_struct_decl(p, start, vis, false), attrs)
+
+    if p.at_word("opaque") && p.kw_at(1, "struct")
+        return laid_out(parse_opaque_struct(p, start, vis), attrs)
+
+    if p.at_kw("val") then return placed(parse_stmt_at(p, false), attrs)
+    if p.at_kw("var") then return placed(parse_stmt_at(p, false), attrs)
+    if p.at_kw("static") then return placed(parse_stmt_at(p, false), attrs)
+
+    if p.at_kw("extern")
+        return parse_extern_decl(p, start, vis, capabilities_of(attrs))
+
+    try_func_decl(p, start, vis, attrs) match
+        Some(d) -> return d
+        None -> ()
+
+    p.fault(start, attributed_refusal(attrs))
+    skip_line(p)
+    stmt(start.to(p.just_taken()), Bad)
+end parse_attributed_decl
+
+// The sentence a declaration that carries none of these gets, chosen by what was written above it.
+private attributed_refusal(attrs: Buf[Attr]) -> string
+    if all_are(attrs, "needs")
+        return "'@needs(...)' names what reaching a declaration requires, so it marks a function or an 'extern' — and this declares neither"
+
+    if all_layout(attrs)
+        return "'@packed' describes how a struct's fields are laid out, so it can only mark a struct — a 'var' or a 'val' has no fields to pack, and '@align(n)' is the one of the two that may stand above one"
+
+    if all_are(attrs, "section")
+        return "'@section(\"...\")' places one object in a linker section, so it marks a 'var', a 'val' or a function — a 'const' is folded into every use and has no storage to place, and an 'extern' names something this program does not define"
+
+    if all_are(attrs, "export")
+        return "'@export' names what C sees — a function's symbol, or the name a struct's 'typedef' carries in a generated header — and this declares neither. A simple enum is spelled as the integer it is, so it has no name in the header to choose, and an 'extern' names something this program does not define"
+
+    "an annotation marks a function, and only a function — neither what 'sysl test' calls nor what recurses is anything a declaration of another kind supplies. '@packed', '@align(n)' and '@export(\"...\")' are the three that mark a struct instead"
+end attributed_refusal
+
+// The pairs that cannot describe one declaration, whichever kind it turns out to be.
+private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
+    var runners = 0
+    var pure = false
+    var frame = false
+    var packed = false
+    var section = false
+
+    for i in 0..<attrs.len()
+        attrs.at(i) match
+            Test(_) -> runners += 1
+            Hook(_) -> runners += 1
+            Pure -> pure = true
+            Reads(_) -> frame = true
+            Writes(_) -> frame = true
+            Packed -> packed = true
+            Section(_) -> section = true
+            _ -> ()
+
+    // `@test` and the four hooks each say *when* `sysl test` calls the function, and they name four
+    // different moments. Two of them above one declaration is two requests, not a stricter one.
+    if runners > 1
+        var named = ""
+
+        for i in 0..<attrs.len()
+            attrs.at(i) match
+                Test(_) -> named = joined(named, attr_word(attrs.at(i)))
+                Hook(_) -> named = joined(named, attr_word(attrs.at(i)))
+                _ -> ()
+
+        p.fault(p.here(), s"${named} each say when 'sysl test' calls this function, and they name different moments — a function is a test or one of the hooks around one, and it is called once")
+    end if
+
+    // `@pure` *is* `@reads() @writes()` plus its further bans, so the two together say one thing
+    // twice -- and could be made to disagree, leaving nothing to say which claim was held to.
+    if pure && frame
+        p.fault(p.here(), "'@pure' already says '@reads()' and '@writes()', so a frame beside it says one thing twice — write the frame alone if the function touches module storage, and '@pure' alone if it touches none")
+
+    // `@packed` describes the arrangement of fields within a type and `@section` places one object,
+    // so the two cannot be about the same declaration whichever kind it turns out to be.
+    if packed && section
+        p.fault(p.here(), "'@packed' lays out a struct's fields and '@section(\"...\")' places one object, so they cannot stand above one declaration — a type occupies no address of its own, and the storage that holds a packed value is what a section would be about")
+end refuse_impossible_pairs
+
+private joined(so_far: string, word: string) -> string
+    if so_far == "" then return s"'@${word}'"
+
+    s"${so_far} and '@${word}'"
+end joined
+
+private is_layout(a: Attr) -> bool = a match
+    Packed -> true
+    Align(_) -> true
+    _ -> false
+
+private all_layout(attrs: Buf[Attr]) -> bool
+    if attrs.is_empty() then return false
+
+    for i in 0..<attrs.len()
+        if !is_layout(attrs.at(i)) then return false
+
+    true
+end all_layout
+
+private all_are(attrs: Buf[Attr], word: string) -> bool
+    if attrs.is_empty() then return false
+
+    for i in 0..<attrs.len()
+        if attr_word(attrs.at(i)) != word then return false
+
+    true
+end all_are
+
+// The capabilities a set of annotations names, flattened.
+private capabilities_of(attrs: Buf[Attr]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<attrs.len()
+        attrs.at(i) match
+            Needs(cs) ->
+                for j in 0..<cs.len()
+                    out.push(cs.at(j))
+            _ -> ()
+
+    out
+end capabilities_of
+
+// The layout pair and the C name, folded onto the struct they were written above.
+private laid_out(s: Stmt, attrs: Buf[Attr]) -> Stmt
+    *s.kind match
+        StructDecl(d) ->
+            var decl = d
+
+            for i in 0..<attrs.len()
+                attrs.at(i) match
+                    Packed -> decl.packed = true
+                    Align(n) -> decl.alignment = Some(n)
+                    Export(e) -> decl.cname = Some(e)
+                    _ -> ()
+
+            stmt(s.span, StructDecl(decl))
+        _ -> s
+end laid_out
+
+// `@align(n)` and `@section("...")` folded onto whichever binding they were written above, reaching
+// through the `static` wrapper to the declaration inside it.
+private placed(s: Stmt, attrs: Buf[Attr]) -> Stmt
+    var align: Option[Expr] = None
+    var section: Option[string] = None
+
+    for i in 0..<attrs.len()
+        attrs.at(i) match
+            Align(n) -> align = Some(n)
+            Section(name) -> section = Some(name)
+            _ -> ()
+
+    *s.kind match
+        ValDecl(n, t, v, vis, _, _) -> stmt(s.span, ValDecl(n, t, v, vis, align, section))
+        VarDecl(n, t, v, vis, _, _) -> stmt(s.span, VarDecl(n, t, v, vis, align, section))
+        StaticDecl(inner) -> stmt(s.span, StaticDecl(placed(inner, attrs)))
+        _ -> s
+end placed

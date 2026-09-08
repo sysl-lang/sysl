@@ -34,7 +34,7 @@ private const IsPower: u8 = 25
 private const ComparePower: u8 = 30
 
 private const RangePower: u8 = 35
-private const BitOrPower: u8 = 40
+const BitOrPower: u8 = 40
 private const BitXorPower: u8 = 42
 private const BitAndPower: u8 = 44
 private const AddPower: u8 = 50
@@ -268,6 +268,7 @@ private nud(t: Spanned[Tok], p: *Parser) -> Expr
         StrInterp(parts, exprs, specs) -> desugar_interp(p, at, parts, exprs, specs)
         Ident(n) -> if n == "_" then expr(at, Ident(fresh_placeholder(p))) else expr(at, Ident(n))
         QuotedIdent(n) -> expr(at, Ident(n))
+        Label(n) -> parse_labelled_loop(p, at, n)
         Keyword(w) -> nud_word(p, at, w)
         _ ->
             p.fault(at, "expression expected")
@@ -296,6 +297,10 @@ private nud_word(p: *Parser, at: Span, w: string) -> Expr
     if w == "[" then return parse_array_literal(p, at)
     if w == "." then return parse_implicit_member(p, at)
     if w == "if" then return parse_if_expr(p, at)
+
+    for l in ["while", "loop", "do", "for"]
+        if l == w then return parse_loop_word(p, at, w)
+
     if w == "sizeof" || w == "alignof" then return parse_layout_of(p, at, w)
     if w == "offsetof" then return parse_offset_of(p, at)
 
@@ -470,32 +475,6 @@ private parse_if_expr(p: *Parser, at: Span) -> Expr
 
     expr(at.to(p.just_taken()), IfExpr(cond, then_body, else_body))
 end parse_if_expr
-
-// A word that may sit on a following line, taken only if it is there.
-private accept_on_next_line_kw(p: *Parser, word: string) -> bool
-    val tokens_at = p.mark()
-    val errors_at = p.errors_at()
-
-    p.skip_newlines()
-
-    if p.accept_kw(word) then return true
-
-    p.rewind(tokens_at, errors_at)
-    false
-end accept_on_next_line_kw
-
-// `end if`, `end while` -- optional, and `end` is a soft word so it stays an ordinary name.
-private accept_end_marker(p: *Parser, word: string) -> bool
-    val tokens_at = p.mark()
-    val errors_at = p.errors_at()
-
-    p.skip_newlines()
-
-    if p.accept_word("end") && p.accept_kw(word) then return true
-
-    p.rewind(tokens_at, errors_at)
-    false
-end accept_end_marker
 
 // -- infix and postfix position -----------------------------------------------------------------
 

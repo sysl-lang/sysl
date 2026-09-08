@@ -1,0 +1,548 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a declaration holds: a parameter list, a function's body, a foreign name, the C a file reads
+// its constants and its types out of, and the constrained forms a `type` may take.
+//
+// **A declaration is told from a call by a probe, not by a keyword.** `f(x)` and `f(x: int) = x`
+// begin with the same two tokens and diverge several along, so the signature is read speculatively
+// and put back where it turned out to be an ordinary expression. That is what a grammar with
+// backtracking gets for free and a recursive-descent one has to say.
+
+// -- the nodes, blank -------------------------------------------------------------------------------
+
+// A function with nothing said about it yet. **The fields are set by name afterwards** rather than
+// passed positionally: twenty-three arguments at a construction site is a form nobody can read, and
+// most of them are the same empty in every caller.
+blank_func(name: string) -> FuncDecl =
+    FuncDecl(name, buf(), buf(), None, buf(), buf(), false, Public, buf(), buf(), buf(),
+        None, None, None, false, false, false, None, None, None, None, buf(), buf())
+
+blank_method(at: Span, name: string) -> MethodDecl =
+    MethodDecl(at, name, None, false, buf(), buf(), None, buf(), buf(), buf(), Public, false, false,
+        buf(), buf(), buf(), None, None, buf(), false)
+
+blank_struct(name: string) -> StructDecl =
+    StructDecl(name, buf(), buf(), buf(), buf(), buf(), Public, buf(), false, buf(), false, None,
+        None, buf())
+
+blank_enum(name: string) -> EnumDecl =
+    EnumDecl(name, buf(), None, buf(), buf(), buf(), Public, buf(), buf(), buf())
+
+blank_trait(name: string) -> TraitDecl = TraitDecl(name, buf(), buf(), buf(), buf(), Public, buf(),
+    buf())
+
+blank_impl(name: string, for_type: TypeRef) -> ImplDecl =
+    ImplDecl(name, for_type, buf(), buf(), buf(), buf(), buf(), false, buf(), buf(), buf())
+
+// -- parameters ---------------------------------------------------------------------------------
+
+// A name a parameter or a field may carry.
+//
+// **A reserved word is refused with the backticks that would have let it stand**, rather than with
+// the grammar's complaint that a name was missing: a field called `module` is a reasonable thing to
+// want, and what the reader needs is the spelling that works.
+private parse_param_name(p: *Parser, what: string) -> string
+    p.peek() match
+        Keyword(w) ->
+            if is_reserved(w) && p.kw_at(1, ":")
+                p.fault(p.here(), s"'${w}' is a reserved word, so it cannot stand as ${what} — write it '`${w}`' if that is the name you want, which is what the backticks are for: a quoted word is an ordinary name wherever one may be written")
+                p.bump()
+                return w
+            end if
+        _ -> ()
+
+    parse_bound_name(p)
+end parse_param_name
+
+// One parameter of a declaration.
+parse_param(p: *Parser, what: string) -> Param
+    val start = p.here()
+    val name = parse_param_name(p, what)
+
+    p.expect_kw(":")
+
+    // `xs: ...T` collects the rest of the call, which is a read-only slice of whatever was passed.
+    if p.accept_kw("...")
+        val elem = parse_type(p)
+        val at = start.to(p.just_taken())
+
+        return Param(at, name, type_ref(at, ArrayType(None, elem, true)), Public, None, false, true)
+    end if
+
+    // `body: -> T` is taken by name: the argument is a thunk the callee runs, written at the call
+    // site as an ordinary expression.
+    if p.accept_kw("->")
+        val ret = parse_type(p)
+        val at = start.to(p.just_taken())
+
+        return Param(at, name, type_ref(at, FnType(buf(), ret, true)), Public, None, true, false)
+    end if
+
+    val typ = parse_type(p)
+
+    Param(start.to(p.just_taken()), name, typ, Public, None, false, false)
+end parse_param
+
+// A function's parameter, which may carry a default.
+//
+// A parameter that collects the rest of the call declares none: a call that leaves it out gets the
+// empty slice, which is what "the rest" means when there is none.
+parse_func_param(p: *Parser) -> Param
+    var param = parse_param(p, "a parameter's name or a field's")
+
+    if p.accept_kw("=")
+        if param.rest
+            p.fault(param.span, "a parameter that collects the rest of the call declares no default — a call that leaves it out gets the empty slice, which is what 'the rest' means when there is none, and a default beside that is a second answer to a settled question")
+            parse_expr(p)
+        else
+            param.default = Some(lift_placeholders(parse_expr(p)))
+    end if
+
+    param
+end parse_func_param
+
+// A struct's field, which declares no default: what an unwritten field gets is decided by the
+// constructor that builds the value, not by the field.
+parse_field_param(p: *Parser) -> Param
+    val param = parse_param(p, "a parameter's name or a field's")
+
+    if p.accept_kw("=")
+        p.fault(param.span, "a field declares no default — what an unwritten field gets is decided by the constructor that builds the value, not by the field")
+        parse_expr(p)
+    end if
+
+    param
+end parse_field_param
+
+// Everything between a declaration's parentheses: the parameters, and whether the call is variadic.
+parse_param_list(p: *Parser, out: *Buf[Param]) -> bool
+    if p.at_kw(")") then return false
+    if p.accept_kw("...") then return true
+
+    loop
+        out.push(parse_func_param(p))
+
+        if !p.accept_kw(",") then break
+        if p.at_kw(")") then break
+
+        if p.accept_kw("...")
+            p.accept_kw(",")
+            return true
+        end if
+
+    false
+end parse_param_list
+
+// -- a function -----------------------------------------------------------------------------------
+
+// Whether a function declaration begins here, and the whole of it where one does.
+//
+// **The probe reads the signature and puts it back**, which is what tells `f(x: int) = x` from
+// `f(x)`: both open with a name and a bracket, and what separates them is the shape of the
+// parenthesised list and the body after it. Nothing is reported by a probe that fails -- the report
+// is wound back with the cursor, since a reading nobody chose said nothing about the file.
+try_func_decl(p: *Parser, start: Span, vis: Visibility, attrs: Buf[Attr]) -> Option[Stmt]
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+    var conv: Option[CallConv] = None
+
+    if at_call_conv(p) then conv = Some(parse_call_conv(p))
+
+    val named = p.peek() match
+        Ident(_) -> true
+        QuotedIdent(_) -> true
+        _ -> false
+
+    if !named
+        p.rewind(tokens_at, errors_at)
+        return None
+    end if
+
+    val name = parse_bound_name(p)
+    var tp = no_type_params()
+
+    if p.at_kw("[") then tp = parse_type_params(p)
+
+    if !p.accept_kw("(")
+        p.rewind(tokens_at, errors_at)
+        return None
+    end if
+
+    var params: Buf[Param] = buf()
+    val variadic = parse_param_list(p, &params)
+
+    if !p.accept_kw(")") || p.report.len() != errors_at
+        p.rewind(tokens_at, errors_at)
+        return None
+    end if
+
+    var ret: Option[TypeRef] = None
+
+    if p.accept_kw("->") then ret = Some(parse_result_type(p))
+
+    if p.at_word("where") then tp = parse_where_on(p, tp)
+
+    // The body is what settles it: an `=`, or an indented block. Anything else was a call.
+    if !p.at_kw("=") && !p.block_ahead() || p.report.len() != errors_at
+        p.rewind(tokens_at, errors_at)
+        return None
+    end if
+
+    var decl = blank_func(name)
+
+    decl.tparams = tp.names
+    decl.params = params
+    decl.ret_type = ret
+    decl.body = parse_func_body(p)
+    decl.bounds = tp.bounds
+    decl.variadic = variadic
+    decl.vis = vis
+    decl.tdefaults = tp.defaults
+    decl.tvalues = tp.values
+    decl.tpacks = tp.packs
+    decl.conv = conv
+
+    accept_end_name(p, name)
+    apply_func_attrs(&decl, attrs)
+    Some(stmt(start.to(p.just_taken()), FuncDecl(decl)))
+end try_func_decl
+
+// `interrupt`, `interrupt(irq)` -- how a function is called.
+//
+// The word is contextual and needs a lookahead past its optional argument to find the name it
+// qualifies, which is what keeps `interrupt` an ordinary identifier.
+private at_call_conv(p: *Parser) -> bool
+    if !p.at_word("interrupt") then return false
+
+    if p.kw_at(1, "(")
+        p.peek_at(2) match
+            Ident(_) -> return p.kw_at(3, ")") && names_a_decl(p.peek_at(4))
+            _ -> return false
+    end if
+
+    names_a_decl(p.peek_at(1))
+end at_call_conv
+
+private names_a_decl(t: Tok) -> bool = t match
+    Ident(_) -> true
+    QuotedIdent(_) -> true
+    _ -> false
+
+private parse_call_conv(p: *Parser) -> CallConv
+    val start = p.here()
+
+    p.bump()
+
+    var arg: Option[string] = None
+
+    if p.accept_kw("(")
+        arg = Some(parse_bound_name(p))
+        p.expect_kw(")")
+    end if
+
+    CallConv(start.to(p.just_taken()), "interrupt", arg)
+end parse_call_conv
+
+// What a function declares after `->`: one type, or the several a result list names.
+parse_result_type(p: *Parser) -> TypeRef
+    val start = p.here()
+    val first = parse_type(p)
+
+    if !p.at_kw(",") then return first
+
+    var parts: Buf[TypeRef] = buf()
+
+    parts.push(first)
+
+    loop
+        if !p.accept_kw(",") then break
+
+        parts.push(parse_type(p))
+
+    type_ref(start.to(p.just_taken()), TupleType(parts, true))
+end parse_result_type
+
+// `where T: Display` written after a signature, folded into the parameters it bounds.
+//
+// **A clause naming a parameter the declaration does not have is refused here**, where the list of
+// the ones it does have is still in hand.
+parse_where_on(p: *Parser, tp: TypeParams) -> TypeParams
+    val at = p.here()
+
+    if !p.accept_word("where") then return tp
+
+    var out = tp
+    val clause = parse_where_bounds(p)
+
+    for i in 0..<clause.len()
+        val w = clause.at(i)
+
+        if holds_value_param(out, w.name)
+            p.fault(w.span, s"'${w.name}' stands for a value rather than a type, and a value implements no trait — its 'const' declaration is where the type its argument must have is written")
+        elif !holds_type_param(out, w.name)
+            p.fault(w.span, s"this declaration has no type parameter '${w.name}', so a 'where' clause has nothing to bound — ${takes_text(out)}")
+        else
+            add_bounds(&out, w.name, w.bounds)
+
+    out
+end parse_where_on
+
+private holds_type_param(tp: TypeParams, name: string) -> bool
+    for n in tp.names.view()
+        if n == name then return true
+
+    false
+end holds_type_param
+
+private holds_value_param(tp: TypeParams, name: string) -> bool
+    for i in 0..<tp.values.len()
+        if tp.values.at(i).name == name then return true
+
+    false
+end holds_value_param
+
+private takes_text(tp: TypeParams) -> string
+    if tp.names.is_empty() then return "it takes none"
+
+    var out = "it takes "
+
+    for i in 0..<tp.names.len()
+        if i > 0 then out = out + ", "
+
+        out = out + s"'${tp.names.at(i)}'"
+
+    out
+end takes_text
+
+private add_bounds(tp: *TypeParams, name: string, bounds: Buf[BoundRef])
+    for i in 0..<tp.bounds.len()
+        if tp.bounds.at(i).name == name
+            var slot = tp.bounds.at(i)
+
+            for j in 0..<bounds.len()
+                slot.bounds.push(bounds.at(j))
+
+            tp.bounds.set(i, slot)
+            return
+
+    tp.bounds.push(NamedBounds(name, bounds))
+end add_bounds
+
+// A function's body: `= value` on the line, `= ` with a block under it, or a block with no `=` at
+// all.
+parse_func_body(p: *Parser) -> Buf[Stmt]
+    if !p.accept_kw("=") then return parse_suite(p)
+    if p.block_ahead() then return parse_suite(p)
+
+    var out: Buf[Stmt] = buf()
+    val start = p.here()
+    var values: Buf[Expr] = buf()
+
+    loop
+        values.push(lift_placeholders(parse_expr(p)))
+
+        if !p.accept_kw(",") then break
+
+    if values.len() == 1
+        out.push(stmt(values.at(0).span, ExprStmt(values.at(0))))
+        return out
+    end if
+
+    val list = expr(start.to(p.just_taken()), ResultList(values))
+
+    out.push(stmt(list.span, ExprStmt(list)))
+    out
+end parse_func_body
+
+// -- extern ------------------------------------------------------------------------------------
+
+// `extern "name" f(a: int) -> int` and `extern var errno: int`.
+//
+// **An `extern` declares no type parameters**: there is no body to monomorphize, and a foreign
+// symbol is one function at one signature.
+parse_extern_decl(p: *Parser, start: Span, vis: Visibility, needs: Buf[string]) -> Stmt
+    p.bump()
+
+    var link: Option[string] = None
+
+    p.peek() match
+        StrLit(v) ->
+            p.bump()
+            link = Some(v)
+        _ -> ()
+
+    if p.at_kw("var") then return parse_extern_var(p, start, vis, link)
+
+    val name = parse_bound_name(p)
+
+    if p.at_kw("[")
+        p.fault(p.here(), "an 'extern' declares no type parameters — there is no body to monomorphize, and a foreign symbol is one function at one signature")
+        skip_line(p)
+        return stmt(start.to(p.just_taken()), Bad)
+    end if
+
+    if p.accept_kw(":")
+        val typ = parse_type(p)
+
+        return stmt(start.to(p.just_taken()), ExternVarDecl(name, typ, link, vis))
+    end if
+
+    if !p.at_kw("(")
+        p.fault(p.here(), s"an 'extern' declares a function — '${name}(params) -> result' — or a variable — '${name}: type' — so what follows the name is '(' or ':'")
+        skip_line(p)
+        return stmt(start.to(p.just_taken()), Bad)
+    end if
+
+    p.bump()
+
+    var params: Buf[Param] = buf()
+    val variadic = parse_param_list(p, &params)
+
+    p.expect_kw(")")
+
+    var ret: Option[TypeRef] = None
+
+    if p.accept_kw("->") then ret = Some(parse_type(p))
+
+    stmt(start.to(p.just_taken()), ExternDecl(ExternDecl(name, params, ret, variadic, link, vis,
+        needs)))
+end parse_extern_decl
+
+private parse_extern_var(p: *Parser, start: Span, vis: Visibility, link: Option[string]) -> Stmt
+    p.bump()
+
+    val name = parse_bound_name(p)
+
+    p.expect_kw(":")
+
+    val typ = parse_type(p)
+
+    stmt(start.to(p.just_taken()), ExternVarDecl(name, typ, link, vis))
+end parse_extern_var
+
+// -- type declarations ---------------------------------------------------------------------------
+
+// `type Name = Base`, and the constrained forms that add a range or a predicate.
+//
+// `new` is what makes the name a type of its own rather than another spelling of its base.
+parse_type_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
+    p.bump()
+
+    val name = parse_bound_name(p)
+
+    p.expect_kw("=")
+
+    val derived = p.accept_word("new")
+    val base = parse_type(p)
+    var range: Option[RangeBound] = None
+    var pred: Option[Expr] = None
+
+    if p.at_word("within") then range = Some(parse_within(p))
+    if p.accept_word("where") then pred = Some(parse_expr(p))
+
+    stmt(start.to(p.just_taken()), TypeDecl(TypeDecl(name, base, derived, range, pred, vis, false)))
+end parse_type_decl
+
+private parse_within(p: *Parser) -> RangeBound
+    val start = p.here()
+
+    p.bump()
+
+    val lo = parse_expr_bp(p, BitOrPower)
+    val exclusive = p.at_kw("..<")
+
+    if !p.accept_kw("..<") then p.expect_kw("..")
+
+    val hi = parse_expr_bp(p, BitOrPower)
+
+    RangeBound(start.to(p.just_taken()), lo, hi, exclusive)
+end parse_within
+
+// -- the C a library carries ------------------------------------------------------------------------
+
+// `c const` and its constants, each of whose values is a C expression in quotes.
+//
+// **`c` is contextual and stays an ordinary identifier**, which the keyword after it is what makes
+// safe: nothing else in the language may follow a name with a keyword.
+parse_c_const_block(p: *Parser, start: Span, vis: Visibility) -> Stmt
+    p.bump()
+    p.bump()
+
+    var consts: Buf[CConstDecl] = buf()
+
+    if !p.block_ahead()
+        p.fault(p.here(), "'c const' is followed by its constants, indented under it, each a name and a type and a C expression in quotes: 'SIZE: usize = \"sizeof(struct s)\"'")
+        skip_line(p)
+        return stmt(start.to(p.just_taken()), CConstBlock(consts))
+    end if
+
+    p.bump()
+    p.bump()
+    p.skip_newlines()
+
+    loop
+        if p.at(Dedent) || p.at(Eof) then break
+
+        val at = p.here()
+        val name = parse_bound_name(p)
+
+        p.expect_kw(":")
+
+        val typ = parse_type(p)
+
+        p.expect_kw("=")
+
+        val c = accept_string(p) match
+            Some(v) -> v
+            None -> ""
+
+        consts.push(CConstDecl(at.to(p.just_taken()), name, typ, c, vis))
+        p.skip_newlines()
+
+    if !p.accept(Dedent) then p.want("dedent")
+
+    stmt(start.to(p.just_taken()), CConstBlock(consts))
+end parse_c_const_block
+
+// `c type` -- the sysl types a file's C typedefs turn out to be.
+//
+// **A line carries no sysl type**, which is the whole difference from a `c const` line: the type is
+// the answer rather than the question, and writing one would assert what the measurement is for.
+parse_c_type_block(p: *Parser, start: Span, vis: Visibility) -> Stmt
+    p.bump()
+    p.bump()
+
+    var types: Buf[CTypeDecl] = buf()
+
+    if !p.block_ahead()
+        p.fault(p.here(), "'c type' is followed by its types, indented under it, each a name and a C type name in quotes: 'Tick = \"TickType_t\"'")
+        skip_line(p)
+        return stmt(start.to(p.just_taken()), CTypeBlock(types))
+    end if
+
+    p.bump()
+    p.bump()
+    p.skip_newlines()
+
+    loop
+        if p.at(Dedent) || p.at(Eof) then break
+
+        val at = p.here()
+        val name = parse_bound_name(p)
+
+        p.expect_kw("=")
+
+        val c = accept_string(p) match
+            Some(v) -> v
+            None -> ""
+
+        types.push(CTypeDecl(at.to(p.just_taken()), name, c, vis))
+        p.skip_newlines()
+
+    if !p.accept(Dedent) then p.want("dedent")
+
+    stmt(start.to(p.just_taken()), CTypeBlock(types))
+end parse_c_type_block

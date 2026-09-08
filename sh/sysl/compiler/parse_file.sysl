@@ -1,0 +1,215 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A whole file: what its header may say, what it imports, and the run of statements under both.
+//
+// **The header is read once and never again.** `module` opens the file, the clauses that are
+// properties of the *module* rather than of a statement follow it, and everything after that is the
+// body -- which is why an `@link` written further down is answered by a sentence saying where it
+// belongs rather than by the annotation grammar's roster.
+
+// `import a.b`, `import a.b.*`, `import a.b.{c, d as e}`, `import a.b as c`.
+parse_import_decl(p: *Parser, start: Span) -> Stmt
+    p.bump()
+
+    var path: Buf[string] = buf()
+    var selectors: Buf[ImportSelector] = buf()
+    var wildcard = false
+    var alias: Option[string] = None
+
+    loop
+        if !read_path_part(p, &path) then break
+
+        // `.*` is one token, a `.` being otherwise only ever followed by a name.
+        if p.accept_kw(".*")
+            wildcard = true
+            break
+        end if
+
+        if !p.at_kw(".") then break
+
+        if p.kw_at(1, "{")
+            p.bump()
+            p.bump()
+
+            loop
+                val at = p.here()
+                val name = parse_bound_name(p)
+                var renamed: Option[string] = None
+
+                if p.accept_kw("as") then renamed = Some(parse_bound_name(p))
+
+                selectors.push(ImportSelector(at.to(p.just_taken()), name, renamed))
+
+                if !p.accept_kw(",") then break
+                if p.at_kw("}") then break
+
+            p.expect_kw("}")
+            break
+        end if
+
+        p.bump()
+
+    if p.accept_kw("as") then alias = Some(parse_bound_name(p))
+
+    // **A rename beside a wildcard or a selector list would have nothing to name**: a wildcard
+    // brings in every member, and a selector list carries its own `as` per name.
+    if alias.is_some() && (wildcard || !selectors.is_empty())
+        p.fault(start.to(p.just_taken()), "a rename here would have nothing to name — a wildcard brings in every member, and a selector list carries its own 'as' per name, as 'a.b.{c as d}'")
+
+    stmt(start.to(p.just_taken()), ImportDecl(ImportDecl(path, selectors, wildcard, alias)))
+end parse_import_decl
+
+// One part of a module path. **A backtick-quoted part is refused**: a module names a directory, and
+// its parts are what the file system holds.
+private read_path_part(p: *Parser, out: *Buf[string]) -> bool
+    p.peek() match
+        Ident(n) ->
+            p.bump()
+            out.push(n)
+            true
+        QuotedIdent(n) ->
+            p.fault(p.here(), s"'${n}' is backtick-quoted, and a module path is written with plain names — a module names a directory, and its parts are what the file system holds")
+            p.bump()
+            out.push(n)
+            true
+        _ ->
+            p.want("identifier")
+            false
+end read_path_part
+
+// -- the header ------------------------------------------------------------------------------------
+
+// Whether a header clause stands at the cursor.
+private at_header_attr(p: *Parser) -> bool = p.at_kw("@") && header_attr_word(attr_name(p))
+
+// `module a.b.c`, and the clauses that are properties of the module rather than of a statement.
+private parse_header(p: *Parser, program: *Program)
+    p.skip_newlines()
+
+    if p.at_kw("module")
+        val at = p.here()
+
+        p.bump()
+
+        var parts: Buf[string] = buf()
+
+        loop
+            if !read_path_part(p, &parts) then break
+            if !p.accept_kw(".") then break
+
+        program.module_name = Some(ModuleName(at.to(p.just_taken()), parts))
+    end if
+
+    loop
+        val tokens_at = p.mark()
+        val errors_at = p.errors_at()
+
+        p.skip_newlines()
+
+        if !at_header_attr(p)
+            p.rewind(tokens_at, errors_at)
+            break
+        end if
+
+        parse_header_attr(p, program)
+end parse_header
+
+// One header clause: `@tests`, `@no_alloc`, `@requires(os, posix)`, `@link("m")`, `@include("s.h")`.
+private parse_header_attr(p: *Parser, program: *Program)
+    val at = p.here()
+
+    p.bump()
+
+    val word = p.peek() match
+        Ident(n) -> n
+        _ -> ""
+
+    p.bump()
+
+    if word == "tests"
+        program.test_only = true
+        return
+    end if
+
+    // `@no_alloc` -- this module gives up a capability its importer has.
+    if word.starts_with("no_")
+        program.capabilities.push(CapabilityClause(at.to(p.just_taken()), Narrows,
+            word[3..<word.len]))
+        return
+    end if
+
+    if word == "requires"
+        p.expect_kw("(")
+
+        loop
+            val one = p.here()
+
+            p.name() match
+                Some(n) -> program.capabilities.push(CapabilityClause(one.to(p.just_taken()),
+                    Requires, n))
+                None -> break
+
+            if !p.accept_kw(",") then break
+
+        p.expect_kw(")")
+        return
+    end if
+
+    p.expect_kw("(")
+
+    val name = accept_string(p) match
+        Some(v) -> v
+        None -> ""
+
+    p.expect_kw(")")
+
+    if word == "link" then program.links.push(LinkClause(at.to(p.just_taken()), name))
+    else program.includes.push(IncludeClause(at.to(p.just_taken()), name))
+end parse_header_attr
+
+// -- the whole file ---------------------------------------------------------------------------------
+
+// A whole file, read.
+//
+// **A literate file is tangled first**, so that everything below this point reads an ordinary
+// program. A `.sysl` file comes back from the tangle unchanged and pays nothing for the branch.
+parse(src: Source) -> Parsed
+    tangle(src) match
+        Err(d) ->
+            var r = report()
+
+            r.add(d)
+            Parsed(empty_program(src), r, src, 0)
+        Ok(text) -> parse_tangled(src, text)
+end parse
+
+private empty_program(src: Source) -> Program =
+    Program(buf(), None, buf(), buf(), src, false, buf(), buf())
+
+private parse_tangled(original: Source, src: Source) -> Parsed
+    var shift: usize = 0
+
+    if is_literate(original.name) then shift = LiterateIndent
+
+    lex_documented(src) match
+        Err(d) ->
+            var r = report()
+
+            r.add(d)
+            Parsed(empty_program(src), r, src, shift)
+        Ok(lexed) ->
+            var p = Parser(tokens_of(lexed.tokens), src, report(), 0, 0, 0)
+            var program = empty_program(src)
+
+            // The lexer collected these while scanning, so they are read off it rather than parsed:
+            // a comment reaches no grammar rule, which is what keeps it trivia.
+            program.docs = lexed.docs
+            parse_header(&p, &program)
+
+            program.body = parse_stmts(&p, false)
+            Parsed(program, p.report, src, shift)
+end parse_tangled

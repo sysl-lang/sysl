@@ -302,9 +302,19 @@ struct Parsed
     report: Report
     src: Source
 
+    // How many columns a position in this file moved by before the lexer saw it, which is the four
+    // that made a literate file's line program text. It is added back here, where a position is
+    // reported, so that a diagnostic names the line and column of the file the reader has open.
+    col_shift: usize
+
     ok(self) -> bool = !self.report.has_errors()
     first(self) -> Diagnostic = self.report.at(0)
-    at(self) -> Loc = self.src.locate(self.first().span.start)
+
+    at(self) -> Loc
+        val found = self.src.locate(self.first().span.start)
+
+        Loc(found.line, found.col + self.col_shift)
+    end at
 end Parsed
 
 // A parser over a source, or the one lexical complaint that stopped it.
@@ -384,22 +394,6 @@ parse_pattern_text(name: string, text: string) -> ParsedPattern
             ParsedPattern(pat, p.report, src)
 end parse_pattern_text
 
-// A whole file.
-parse(src: Source) -> Parsed
-    val empty = Program(buf(), None, buf(), buf(), src, false, buf(), buf())
-
-    parser_over(src) match
-        Err(d) ->
-            var r = report()
-
-            r.add(d)
-            Parsed(empty, r, src)
-        Ok(started) ->
-            var p = started
-            val body = parse_stmts(&p, false)
-
-            Parsed(Program(body, None, buf(), buf(), src, false, buf(), buf()), p.report, src)
-end parse
 
 // -- statements ---------------------------------------------------------------------------------
 
@@ -456,10 +450,6 @@ parse_stmts(p: *Parser, in_block: bool) -> Buf[Stmt]
     stmts
 end parse_stmts
 
-// Whether a token can begin a statement. Every statement of this section is an expression; the
-// declaration words widen this where they land.
-private can_begin_stmt(t: Tok) -> bool = can_begin_expr(t)
-
 // Step past the rest of an unreadable line, without leaving the block it was written in.
 //
 // **The block depth is what keeps it there.** An `Indent` met on the way is a block the broken line
@@ -491,18 +481,6 @@ skip_line(p: *Parser)
             _ -> p.bump()
 end skip_line
 
-// One statement.
-//
-// **Every statement here is an expression**, which is the seam this section leaves: the declaration
-// and jump forms are read by the same loop above and add arms to this one.
-parse_stmt(p: *Parser) -> Stmt
-    val start = p.here()
-    val e = parse_expr(p)
-
-    // A statement is the outermost of the three boundaries a `_` may close at.
-    stmt(start.to(p.just_taken()), ExprStmt(lift_placeholders(e)))
-end parse_stmt
-
 // An indented block: the lexer's `Newline` `Indent` pair, statements, and the `Dedent` that closes
 // them.
 parse_suite(p: *Parser) -> Buf[Stmt]
@@ -525,11 +503,77 @@ parse_suite(p: *Parser) -> Buf[Stmt]
     body
 end parse_suite
 
+// A word that may sit on a following line, taken only if it is there.
+accept_on_next_line_kw(p: *Parser, word: string) -> bool
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+
+    p.skip_newlines()
+
+    if p.accept_kw(word) then return true
+
+    p.rewind(tokens_at, errors_at)
+    false
+end accept_on_next_line_kw
+
+// The same, for a contextual word.
+accept_on_next_line_word(p: *Parser, word: string) -> bool
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+
+    p.skip_newlines()
+
+    if p.accept_word(word) then return true
+
+    p.rewind(tokens_at, errors_at)
+    false
+end accept_on_next_line_word
+
+// `end if`, `end while` -- optional, and `end` is a soft word so it stays an ordinary name.
+accept_end_marker(p: *Parser, word: string) -> bool
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+
+    p.skip_newlines()
+
+    if p.accept_word("end") && p.accept_kw(word) then return true
+
+    p.rewind(tokens_at, errors_at)
+    false
+end accept_end_marker
+
+// `end Name` after a declaration -- optional, and the name is checked where one is written.
+//
+// **A mismatched name is a complaint rather than a refusal to read the declaration**, which is what
+// keeps a file whose `end` was left behind by a rename readable to everything below it.
+accept_end_name(p: *Parser, name: string)
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+
+    p.skip_newlines()
+
+    if !p.accept_word("end")
+        p.rewind(tokens_at, errors_at)
+        return
+
+    val at = p.here()
+
+    p.name() match
+        Some(n) ->
+            if n != name then p.fault(at, s"'end ${n}' does not match '${name}'")
+        None ->
+            p.rewind(tokens_at, errors_at)
+end accept_end_name
+
 // A single statement written on the same line as the word that introduced it.
+//
+// **It is every statement but a result list and an `asm` block**, which are whole lines by
+// construction: a branch written inline is part of a larger expression, so a comma after it belongs
+// to whatever that expression is part of.
 parse_inline_body(p: *Parser) -> Buf[Stmt]
     var out: Buf[Stmt] = buf()
 
-    out.push(parse_stmt(p))
+    out.push(parse_stmt_at(p, true))
     out
 end parse_inline_body
 

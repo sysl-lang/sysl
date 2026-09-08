@@ -1,0 +1,186 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The statements: the bindings, the jumps, the loops, the contract clauses and inline assembly.
+
+// -- bindings ------------------------------------------------------------------------------------
+
+@test("a 'val' binds a name to a value, and its type may be left off")
+a_val_binds_a_name()
+    assert_eq(pf("val x = 1\n"), "(val x 1)")
+    assert_eq(pf("val x: int = 1\n"), "(val x : int 1)")
+
+@test("a 'var' may be declared with no value at all")
+a_var_may_have_no_value()
+    assert_eq(pf("var x: int\n"), "(var x : int)")
+    assert_eq(pf("var x = 1\n"), "(var x 1)")
+
+@test("a 'const' states both halves, and neither is optional")
+a_const_states_both_halves()
+    assert_eq(pf("const N: int = 1\n"), "(const N : int 1)")
+
+@test("a binding's value may be an indented block, and a block of one expression is that expression")
+a_block_value_collapses_to_its_expression()
+    assert_eq(pf("val x =\n    1\n"), "(val x 1)")
+    assert_eq(pf("val x =\n    val y = 1\n    y\n"), "(val x (block (val y 1) y))")
+
+@test("'ref' names storage that already exists")
+ref_names_existing_storage()
+    assert_eq(pf("ref r = xs[0]\n"), "(ref r (index xs 0))")
+
+@test("'static' marks a binding as the module's rather than the body's")
+static_marks_a_binding()
+    assert_eq(pf("static val x = 1\n"), "(static (val x 1))")
+    assert_eq(pf("private static var n: int = 0\n"), "(static (var private n : int 0))")
+
+@test("a binding may name several things at once")
+a_binding_may_name_several()
+    assert_eq(pf("val a, b = f()\n"), "(val (a b) (call f))")
+    assert_eq(pf("var a, b = 1, 2\n"), "(var (a b) 1 2)")
+
+@test("a binding's left side may be a pattern")
+a_binding_may_be_a_pattern()
+    assert_eq(pf("val (a, b) = p\n"), "(val (tuple a b) p)")
+    assert_eq(pf("var Point{x, y} = p\n"), "(var (struct Point (x x) (y y)) p)")
+
+@test("a visibility restricts the declaration it is written in front of")
+a_visibility_restricts_a_declaration()
+    assert_eq(pf("private val x = 1\n"), "(val private x 1)")
+    assert_eq(pf("private[m] const N: int = 1\n"), "(const private[m] N : int 1)")
+
+// -- assignment ------------------------------------------------------------------------------------
+
+@test("an assignment to one place is an expression")
+an_assignment_to_one_place()
+    assert_eq(pf("a = 1\n"), "(= a 1)")
+    assert_eq(pf("a += 1\n"), "(+= a 1)")
+
+@test("an assignment to several places at once is a statement of its own")
+an_assignment_to_several_places()
+    assert_eq(pf("a, b = b, a\n"), "(= (a b) (b a))")
+    assert_eq(pf("a, b, c = f()\n"), "(= (a b c) ((call f)))")
+
+@test("a comma list with no assignment is a result list")
+a_comma_list_is_a_result_list()
+    assert_eq(pf("a, b\n"), "(results a b)")
+
+// -- jumps -----------------------------------------------------------------------------------------
+
+@test("'return' hands back nothing, one value, or the several a result list names")
+return_hands_back_what_it_was_given()
+    assert_eq(pf("return\n"), "(return)")
+    assert_eq(pf("return 1\n"), "(return 1)")
+    assert_eq(pf("return 1, 2\n"), "(return (results 1 2))")
+
+@test("'break' takes a label, a value, or both")
+break_takes_a_label_and_a_value()
+    assert_eq(pf("break\n"), "(break)")
+    assert_eq(pf("break 'outer\n"), "(break 'outer)")
+    assert_eq(pf("break 1\n"), "(break 1)")
+    assert_eq(pf("break 'outer 1\n"), "(break 'outer 1)")
+
+@test("'continue' takes a label and nothing else")
+continue_takes_a_label()
+    assert_eq(pf("continue\n"), "(continue)")
+    assert_eq(pf("continue 'outer\n"), "(continue 'outer)")
+
+@test("'defer' takes one statement, which is why the whole form is one line")
+defer_takes_one_statement()
+    assert_eq(pf("defer xs.close()\n"), "(defer (call (field xs close)))")
+    assert_eq(pf("defer n = 0\n"), "(defer (= n 0))")
+
+@test("'become' takes a call, and stays an ordinary name where none follows")
+become_takes_a_call()
+    assert_eq(pf("become f(x)\n"), "(become (call f x))")
+    assert_eq(pf("become = 1\n"), "(= become 1)")
+
+// -- the contract clauses ----------------------------------------------------------------------------
+
+@test("a contract clause takes a condition and the message a failure carries")
+a_contract_clause_takes_a_condition()
+    assert_eq(pf("require n > 0\n"), "(require (cmp n > 0))")
+    assert_eq(pf("ensure n > 0, \"positive\"\n"), "(ensure (cmp n > 0) \"positive\")")
+
+@test("'invariant' and 'variant' are contextual, so they stay ordinary names")
+invariant_and_variant_are_contextual()
+    assert_eq(pf("invariant i < n\n"), "(invariant (cmp i < n))")
+    assert_eq(pf("variant n - i\n"), "(variant (- n i))")
+    assert_eq(pf("val invariant = 1\n"), "(val invariant 1)")
+
+// -- the loops ------------------------------------------------------------------------------------
+
+@test("a 'while' takes a condition, a body, and the 'else' a finished loop runs")
+a_while_takes_a_condition()
+    assert_eq(pf("while c do f()\n"), "(while c (call f))")
+    assert_eq(pf("while c\n    f()\n"), "(while c (call f))")
+    assert_eq(pf("while c do f() else g()\n"), "(while c (call f) (else (call g)))")
+
+@test("a 'loop' takes no condition and no 'else', never finishing on its own")
+a_loop_takes_no_condition()
+    assert_eq(pf("loop do f()\n"), "(loop (call f))")
+    assert_eq(pf("loop\n    f()\n"), "(loop (call f))")
+
+@test("a 'do' loop tests after its body")
+a_do_loop_tests_after_its_body()
+    assert_eq(pf("do f() while c\n"), "(do-while (call f) c)")
+    assert_eq(pf("do\n    f()\nwhile c\n"), "(do-while (call f) c)")
+
+@test("a 'for' walks what it is given, and may take it apart")
+a_for_walks_what_it_is_given()
+    assert_eq(pf("for x in xs do f(x)\n"), "(for x xs (call f x))")
+    assert_eq(pf("for (k, v) in pairs do f(k)\n"),
+        "(for $elem pairs (var (tuple k v) $elem) (call f k))")
+
+@test("a three-clause 'for' takes an init, a test and a step, each of which may be empty")
+a_three_clause_for()
+    assert_eq(pf("for var i = 0; i < n; i += 1 do f()\n"),
+        "(cfor (var i 0) (cmp i < n) (+= i 1) (call f))")
+    assert_eq(pf("for ; ; do f()\n"), "(cfor (call f))")
+
+@test("'for const' is the loop the compiler unrolls, and takes no label")
+for_const_is_unrolled()
+    assert_eq(pf("for const i in 0..<n do f(i)\n"), "(const-for i (..< 0 n) (call f i))")
+
+@test("a quantifier is told from a counted loop by one token")
+a_quantifier_is_told_by_one_token()
+    assert_eq(pf("for all i in r do p(i)\n"), "(for-all i r (call p i))")
+    assert_eq(pf("for some k in r do p(k)\n"), "(for-some k r (call p k))")
+    assert_eq(pf("for all in r do f()\n"), "(for all r (call f))")
+
+@test("a label is written before the loop's own word, and a 'break' names it")
+a_label_is_written_before_the_word()
+    assert_eq(pf("'outer for x in xs do break 'outer\n"),
+        "(for 'outer x xs (break 'outer))")
+    assert_eq(pf("'again loop do f()\n"), "(loop 'again (call f))")
+
+@test("a loop is an expression, so a binding may take one")
+a_loop_is_an_expression()
+    assert_eq(pf("val x = loop do break 1\n"), "(val x (loop (break 1)))")
+
+// -- inline assembly ---------------------------------------------------------------------------------
+
+@test("an 'asm' block holds one arm per architecture")
+an_asm_block_holds_one_arm_per_architecture()
+    val src = "asm\n    [x86_64] \"nop\"\n    [aarch64] \"nop\"\n"
+
+    assert_eq(pf(src), "(asm ([x86_64] \"nop\") ([aarch64] \"nop\"))")
+
+@test("an arm may say the operation costs no instruction here")
+an_arm_may_be_unavailable()
+    assert_eq(pf("asm\n    [riscv64] unavailable \"no such instruction\"\n"),
+        "(asm ([riscv64] unavailable \"no such instruction\"))")
+
+@test("an arm's block holds instructions, operands and what it destroys")
+an_arms_block_holds_three_kinds_of_line()
+    val src = "asm\n    [x86_64]\n        \"mov %0, %1\"\n        in a: reg\n        out b: \"dx\"\n        clobbers \"cc\"\n"
+
+    assert_eq(pf(src),
+        "(asm ([x86_64] \"mov %0, %1\" (in a reg) (out b \"dx\") (clobbers \"cc\")))")
+
+@test("'asm' stays an ordinary name where no arm list follows it")
+asm_stays_an_ordinary_name()
+    assert_eq(pf("val asm = 1\n"), "(val asm 1)")
