@@ -1,0 +1,94 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{walk, read_text, metadata}
+import sysl.text.Search
+
+// The whole-tree proof: not a claim about one construct, but that the grammar reads real programs.
+//
+// **A suite of shapes is only as good as the inputs somebody thought to write.** What this does is
+// point the parser at every `.sysl` file on the machine that belongs to a sysl project -- this
+// compiler's own source, and the reference compiler's library -- and require that each one comes
+// back with an empty report. A construct nobody wrote a test for is covered by whichever of those
+// files uses it, and a construct neither uses is one the language does not have.
+//
+// **The library sweep is skipped where the library is not on this machine**, since a test that
+// depended on a path outside the repository would fail everywhere but here. What is never skipped
+// is this repository's own tree, which is checked in beside the test.
+
+// What a walk found: how many files it read, how many it stepped over, and the first thing wrong
+// with any of the ones it read.
+struct Swept
+    files: usize
+    gated: usize
+    first_bad: string
+end Swept
+
+// Every `.sysl` and `.lsysl` file under a directory, parsed.
+private sweep(root: string) -> Swept
+    var files: usize = 0
+    var gated: usize = 0
+    var first_bad = ""
+
+    for item in walk(root)
+        item match
+            Err(_) -> ()
+            Ok(entry) ->
+                if is_sysl_source(entry.path)
+                    read_text(entry.path) match
+                        Err(_) -> ()
+                        Ok(text) ->
+                            // **A file gated by directives is stepped over**, not read: `#if` and
+                            // its family are a pass that runs before the lexer and needs to know
+                            // what is being built for, which this compiler has no notion of yet.
+                            if has_directive(text)
+                                gated += 1
+                            else
+                                files += 1
+
+                                val parsed = parse(source_of(entry.path, text))
+
+                                if !parsed.ok() && first_bad == ""
+                                    first_bad = s"${entry.path}:${parsed.at()}: ${parsed.first().message}"
+
+    Swept(files, gated, first_bad)
+end sweep
+
+private is_sysl_source(path: string) -> bool = path.ends_with(".sysl") || path.ends_with(".lsysl")
+
+// Whether a file carries a conditional-compilation directive, which sits at the margin.
+private has_directive(text: string) -> bool = text.starts_with("#") || text.contains("\n#")
+
+// Whether a directory is on this machine at all.
+private present(path: string) -> bool = metadata(path).is_ok()
+
+@test("every file of this compiler's own source parses, with nothing to report")
+the_compilers_own_source_parses()
+    val swept = sweep("sh")
+
+    assert(swept.files >= 30, s"the walk found the tree: ${swept.files} files")
+    assert_eq(swept.first_bad, "")
+
+@test("and every file of the reference compiler's library, where that library is on this machine")
+the_reference_library_parses()
+    val root = "../sysl-bootstrap/library"
+
+    if !present(root) then return
+
+    val swept = sweep(root)
+
+    assert(swept.files >= 140, s"the walk found the library: ${swept.files} files")
+    assert_eq(swept.first_bad, "")
+
+@test("and the parsing package this compiler is built on, which is sysl written by hand as well")
+the_parsing_package_parses()
+    val root = "../parsing"
+
+    if !present(root) then return
+
+    val swept = sweep(root)
+
+    assert(swept.files >= 10, s"the walk found the package: ${swept.files} files")
+    assert_eq(swept.first_bad, "")
