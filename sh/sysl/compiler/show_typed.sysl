@@ -422,3 +422,54 @@ private quoted_text(s: string) -> string
     quoted(&out, s)
     out.finish()
 end quoted_text
+
+// The `funcs:` section of `sysl emit-typed --tables`, for the declarations a file makes of its own.
+//
+// **It is the one section of that report a compiler which has not done reachability can be held
+// to.** The rest -- `structs:`, `enums:`, `externs:`, `consts:` -- carry only what the analysis
+// *reached*: a simple enum nobody names, an `extern` nobody calls and a `val` nobody reads are all
+// absent from the reference's tables, and deciding what a program reaches is the driver's stage.
+// `funcs:` is every function the file declares, called or not, so the two tables are the same set
+// by construction and a difference is a real one.
+show_funcs_table(a: &Analysis) -> string
+    var keys: Buf[string] = buf()
+
+    for i in 0..<a.tables.funcs.len()
+        val key = a.tables.funcs.key_at(i)
+
+        if module_of(key) == "" then keys.push(key)
+
+    sort_names(&keys)
+
+    var out = str_builder()
+
+    out.push("funcs:\n")
+
+    for i in 0..<keys.len()
+        val f = a.tables.funcs.get(keys.at(i)).unwrap()
+
+        out.push("  ")
+        out.push(keys.at(i))
+        out.push("(")
+
+        for j in 0..<f.decl.params.len()
+            val p = f.decl.params.at(j)
+
+            if j > 0 then out.push(", ")
+
+            out.push(p.name)
+            out.push(": ")
+            out.push(type_show(resolve_type(a, f.scope, p.typ, no_bindings())))
+
+        out.push(") -> ")
+        out.push(type_show(declared_result_in(a, f.scope, f.decl.ret_type)))
+        out.push_char('\n')
+
+    out.finish()
+end show_funcs_table
+
+private declared_result_in(a: &Analysis, scope: Scope, written: Option[TypeRef]) -> Type
+    if written.is_none() then return Unit
+
+    result_type(resolve_type(a, scope, written.unwrap(), no_bindings()))
+end declared_result_in

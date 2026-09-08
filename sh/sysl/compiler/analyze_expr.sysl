@@ -18,6 +18,7 @@ struct TypedBodies
     // How many bodies were left for a later stage, and why.
     skipped_statements: usize
     skipped_generic: usize
+    skipped_defaults: usize
 end TypedBodies
 
 // Reads a compilation's declarations and types every single-expression body in it.
@@ -29,6 +30,7 @@ analyze_exprs(units: Buf[Program], t: Target) -> TypedBodies
     var funcs: Buf[TFunc] = buf()
     var statements: usize = 0
     var generic: usize = 0
+    var defaults: usize = 0
 
     for i in 0..<units.len()
         val unit = units.at(i)
@@ -39,16 +41,48 @@ analyze_exprs(units: Buf[Program], t: Target) -> TypedBodies
 
             *s.kind match
                 FuncDecl(d) ->
-                    if !d.tparams.is_empty() then generic = generic + 1
+                    if !d.tparams.is_empty() then generic += 1
+                    else if signature_needs_defaults(a, scope, d) then defaults += 1
                     else
                         val body = single_expression(d.body)
 
-                        if body.is_none() then statements = statements + 1
+                        if body.is_none() then statements += 1
                         else funcs.push(type_func(a, scope, s.span, d, body.unwrap()))
                 _ -> ()
 
-    TypedBodies(funcs, a.diagnostics(), statements, generic)
+    TypedBodies(funcs, a.diagnostics(), statements, generic, defaults)
 end analyze_exprs
+
+// Whether a signature names a type declared with **type defaults** -- `struct Pair[A, B = A]`
+// written at `Pair[int]`.
+//
+// Filling the omitted argument in from the declaration's default is the stage that reads a
+// declaration's type parameters, so a body whose signature needs one is left for it rather than
+// typed against a type this stage would get wrong.
+private signature_needs_defaults(a: &Analysis, scope: Scope, d: FuncDecl) -> bool
+    var names: Buf[(string, Span)] = buf()
+
+    for i in 0..<d.params.len()
+        names_in(&names, d.params.at(i).typ, d.tparams)
+
+    if d.ret_type.is_some() then names_in(&names, d.ret_type.unwrap(), d.tparams)
+
+    for i in 0..<names.len()
+        val key = lookup_type_key(a, scope, names.at(i).0)
+
+        if key.is_some() then
+            val decl = a.tables.types.get(key.unwrap())
+
+            if decl.is_some() then
+                val has = decl.unwrap().kind match
+                    StructOf(t) -> !t.tdefaults.is_empty()
+                    EnumOf(t) -> !t.tdefaults.is_empty()
+                    _ -> false
+
+                if has then return true
+
+    false
+end signature_needs_defaults
 
 // The one expression a body is, where it is one.
 single_expression(body: Buf[Stmt]) -> Option[Expr]
@@ -74,7 +108,7 @@ private type_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, body: Exp
     // **A function that declares no result hands nothing back**, so its body is read with nothing
     // expected and the value it comes to is discarded -- which is what the reference compiler does
     // and why `probe() = 42` is a `unit` function rather than an `int` one.
-    val declared = d.ret_type.map(w -> resolve_type(a, scope, w, no_bindings()))
+    val declared = d.ret_type.map(w -> result_type(resolve_type(a, scope, w, no_bindings())))
     val ret = declared.unwrap_or(Unit)
 
     cx.func_name = d.name
@@ -88,10 +122,29 @@ private type_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, body: Exp
 
     val block = TBlock(buf(), Some(t), block_type(declared, t))
 
-    TFunc(span, module_qualify(scope.module_name, d.name), params, ret, block, d.variadic, buf(),
+    TFunc(span, func_key(a, scope, span, d), params, ret, block, d.variadic, buf(),
           buf(), buf(), false, d.conv, d.tailrec, None, d.pure, d.ghost, d.reads, d.writes,
           exported_symbol(d), d.section)
 end type_func
+
+// The key the declaration was filed under, which is the plain name for the first declaration of it
+// and the numbered slot for every overload after that.
+//
+// **It is read off the tables rather than composed**, so a call and a definition cannot disagree
+// about which of two declarations of one name a key means.
+private func_key(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> string
+    val plain = module_qualify(scope.module_name, d.name)
+    val keys = overload_keys(a, plain)
+
+    for i in 0..<keys.len()
+        val f = a.tables.funcs.get(keys.at(i))
+
+        if f.is_some() && f.unwrap().span.start == span.start &&
+                f.unwrap().scope.src.name == scope.src.name then
+            return keys.at(i)
+
+    plain
+end func_key
 
 // The symbol a function is visible under from C, where it is exported at all: the one the
 // attribute named, and the declaration's own bare name where it named none.

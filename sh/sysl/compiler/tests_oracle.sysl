@@ -251,6 +251,7 @@ struct TypedAgreement
     skipped_generic: usize
     skipped_unresolved: usize
     skipped_absent: usize
+    skipped_defaults: usize
     first_bad: string
 end TypedAgreement
 
@@ -322,6 +323,7 @@ private compare_typed(binary: string, path: string, label: string, text: string,
 
     found.skipped_statements += ours.skipped_statements
     found.skipped_generic += ours.skipped_generic
+    found.skipped_defaults += ours.skipped_defaults
 
     if ours.funcs.is_empty() then return
 
@@ -401,7 +403,7 @@ the_typed_trees_agree()
             val dir = make_temp_dir("sysl-typed").unwrap()
             val scratch = dir + "/block.sysl"
 
-            var found = TypedAgreement(0, 0, 0, 0, 0, 0, "")
+            var found = TypedAgreement(0, 0, 0, 0, 0, 0, 0, "")
 
             for item in walk(root)
                 item match
@@ -423,6 +425,7 @@ the_typed_trees_agree()
             print(s"typed bodies: ${found.matched} matched, ${found.mismatched} mismatched, " +
                   s"skipped ${found.skipped_statements} for statements, " +
                   s"${found.skipped_generic} generic, " +
+                  s"${found.skipped_defaults} for type defaults, " +
                   s"${found.skipped_unresolved} this stage could not finish, " +
                   s"${found.skipped_absent} the reference did not print")
 
@@ -430,3 +433,182 @@ the_typed_trees_agree()
             assert_eq(found.first_bad, "")
             assert_eq(found.mismatched, 0)
 end the_typed_trees_agree
+
+// -- the declaration tables, which is 3a's own proof ------------------------------------------------
+
+// What a tables sweep found.
+struct TableAgreement
+    files: usize
+    mismatched: usize
+    skipped: usize
+    first_bad: string
+end TableAgreement
+
+// The reference compiler's declaration tables for one file.
+private ask_oracle_tables(binary: string, path: string) -> Option[string]
+    capture(binary, ["emit-typed", "--tables", path], "", [], true) match
+        Err(_) -> None
+        Ok(answer) -> if answer.status.ok() then Some(answer.text) else None
+end ask_oracle_tables
+
+// The `funcs:` section of such an answer, as one row per key.
+//
+// **The reference's table is written after lowering and after reachability**, so it holds rows this
+// stage has no counterpart for -- the library functions a program reached, and the environment form
+// a function that writes module storage was lowered into (`$env0.bump(self: *.env0)`). The
+// comparison is therefore per key: a key this compiler filed is looked for there, and one it does
+// not carry is counted rather than compared.
+private funcs_rows(text: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+    var inside = false
+
+    for line in split(text, "\n")
+        if !inside
+            if line == "funcs:" then inside = true
+        else if line.starts_with("  ")
+            val row = line[2..]
+            val open = row.index_of("(")
+
+            if open.is_some() then out.push((row[0..<open.unwrap()], row))
+
+    out
+end funcs_rows
+
+// The rows this compiler files for a file's own declarations, by key.
+private our_rows(a: &Analysis) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    for line in split(show_funcs_table(a), "\n")
+        if line.starts_with("  ")
+            val row = line[2..]
+            val open = row.index_of("(")
+
+            if open.is_some() then out.push((row[0..<open.unwrap()], row))
+
+    out
+end our_rows
+
+// Whether a file declares something whose function table this stage does not build the same way: a
+// generic, which the reference files once per instantiation, or an `impl`, whose members it files
+// under a mangled name of their own.
+private declares_beyond_this_stage(unit: Program) -> bool
+    for i in 0..<unit.body.len()
+        *unit.body.at(i).kind match
+            FuncDecl(d) -> if !d.tparams.is_empty() then return true
+            ImplDecl(_) -> return true
+            TraitDecl(_) -> return true
+            StructDecl(d) -> if !d.members.is_empty() || !d.tparams.is_empty() then return true
+            EnumDecl(d) -> if !d.members.is_empty() || !d.tparams.is_empty() then return true
+            _ -> ()
+
+    false
+end declares_beyond_this_stage
+
+private compare_tables(binary: string, path: string, label: string, text: string,
+                       found: *TableAgreement)
+    val parsed = parse(source_of(path, text))
+
+    if !parsed.ok() then return
+
+    if declares_beyond_this_stage(parsed.program)
+        found.skipped += 1
+
+        return
+    end if
+
+    val a = analysis_for(host_target())
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+    read_decls(a, units)
+
+    if !a.diagnostics().is_empty()
+        found.skipped += 1
+
+        return
+    end if
+
+    val ours = our_rows(a)
+
+    if ours.is_empty()
+        found.skipped += 1
+
+        return
+    end if
+
+    val theirs = ask_oracle_tables(binary, path)
+
+    if theirs.is_none()
+        found.skipped += ours.len()
+
+        return
+    end if
+
+    val rows = funcs_rows(theirs.unwrap())
+
+    for i in 0..<ours.len()
+        val mine = ours.at(i)
+        val theirs_row = row_named(rows, mine.0)
+
+        if theirs_row.is_none() then found.skipped += 1
+        else
+            found.files += 1
+
+            if theirs_row.unwrap() != mine.1
+                found.mismatched += 1
+
+                if found.mismatched <= 12 then
+                    found.first_bad = s"${found.first_bad}\n$label: reference " +
+                                      s"[${theirs_row.unwrap()}] ours [${mine.1}]"
+end compare_tables
+
+private row_named(rows: Buf[(string, string)], key: string) -> Option[string]
+    for i in 0..<rows.len()
+        if rows.at(i).0 == key then return Some(rows.at(i).1)
+
+    None
+end row_named
+
+@test("the two compilers file the same functions under the same keys, with the same signatures")
+the_declaration_tables_agree()
+    oracle() match
+        None ->
+            print("skipped: SYSL_ORACLE names no reference compiler on this machine")
+            return
+        Some(binary) ->
+            val root = "../sysl.sh/docs/content/reference"
+
+            if !present(root)
+                print("skipped: the reference pages are not on this machine")
+                return
+            end if
+
+            val dir = make_temp_dir("sysl-tables").unwrap()
+            val scratch = dir + "/block.sysl"
+
+            var found = TableAgreement(0, 0, 0, "")
+
+            for item in walk(root)
+                item match
+                    Err(_) -> ()
+                    Ok(entry) ->
+                        if entry.path.ends_with(".md")
+                            read_text(entry.path) match
+                                Err(_) -> ()
+                                Ok(page) ->
+                                    val blocks = sysl_blocks(page)
+
+                                    for i in 0..<blocks.len()
+                                        write_text(scratch, blocks.at(i)).unwrap()
+                                        compare_tables(binary, scratch,
+                                            s"${entry.path} block ${i + 1}", blocks.at(i), &found)
+
+            remove_file(scratch)
+
+            print(s"declaration tables: ${found.files} files compared, ${found.mismatched} " +
+                  s"mismatched, ${found.skipped} skipped")
+
+            assert(found.files > 0, "the sweep compared something")
+            assert_eq(found.first_bad, "")
+            assert_eq(found.mismatched, 0)
+end the_declaration_tables_agree
