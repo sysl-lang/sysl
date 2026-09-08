@@ -229,3 +229,204 @@ the_two_agree_on_the_reference_pages()
             assert_eq(found.first_bad, "")
             assert_eq(found.mismatches, 0)
 end the_two_agree_on_the_reference_pages
+
+// -- the typed tree, one single-expression body at a time ------------------------------------------
+
+// **`emit-typed` takes a file that stands on its own**, since a module is a directory and a module
+// file cannot be handed to it -- so the corpus for the typed diff is the reference pages' blocks
+// and the root-level programs, which is exactly what those are.
+//
+// **A function is compared only where this compiler produced one with nothing to say about it.**
+// The block is analyzed on its own, without the standard module, because reading two hundred
+// library files again for every block would cost more than the whole proof is worth; so a body that
+// names anything the library declares is *skipped* rather than compared, and counted by reason.
+// What is left is every function whose body is one expression over its own parameters, its own
+// file's declarations, and the language -- which is the whole of what this stage builds.
+
+// What a typed sweep found.
+struct TypedAgreement
+    matched: usize
+    mismatched: usize
+    skipped_statements: usize
+    skipped_generic: usize
+    skipped_unresolved: usize
+    skipped_absent: usize
+    first_bad: string
+end TypedAgreement
+
+// The reference compiler's typed tree for one file, or nothing where it would not analyze it.
+private ask_oracle_typed(binary: string, path: string) -> Option[string]
+    capture(binary, ["emit-typed", "--no-spans", path], "", [], true) match
+        Err(_) -> None
+        Ok(answer) -> if answer.status.ok() then Some(answer.text) else None
+end ask_oracle_typed
+
+// The `funcs:` section of one such answer, split into the block each function printed, by name.
+private printed_funcs(text: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+    var held = str_builder()
+    var name = ""
+    var inside = false
+    var open = false
+
+    for line in split(text, "\n")
+        if !inside
+            if line == "  funcs: " || line == "  funcs:" then inside = true
+        else if line == "    - TFunc"
+            if open then out.push((name, held.finish()))
+
+            held = str_builder()
+            name = ""
+            open = true
+
+            held.push(line)
+            held.push_char('\n')
+        else if starts_with_spaces(line, 4) && open
+            held.push(line)
+            held.push_char('\n')
+
+            if name == "" && line.starts_with("        name: \"") then
+                name = line[15..<line.bytes.len - 1]
+        else
+            if open then out.push((name, held.finish()))
+
+            open = false
+            inside = false
+
+    if open then out.push((name, held.finish()))
+
+    out
+end printed_funcs
+
+private starts_with_spaces(line: string, n: usize) -> bool
+    if line.bytes.len < n then return false
+
+    for i in 0..<n
+        if line.bytes[i] != u8(' ') then return false
+
+    true
+end starts_with_spaces
+
+// One file compared, function by function.
+private compare_typed(binary: string, path: string, label: string, text: string,
+                      found: *TypedAgreement)
+    val parsed = parse(source_of(path, text))
+
+    if !parsed.ok() then return
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val ours = analyze_exprs(units, host_target())
+
+    found.skipped_statements += ours.skipped_statements
+    found.skipped_generic += ours.skipped_generic
+
+    if ours.funcs.is_empty() then return
+
+    // A file this compiler had anything to say about is not evidence either way, so it is counted
+    // and left alone -- and asked about before the reference is run, since running it is the whole
+    // cost of the sweep.
+    if !ours.reported.is_empty()
+        found.skipped_unresolved += ours.funcs.len()
+
+        return
+    end if
+
+    val theirs = ask_oracle_typed(binary, path)
+
+    if theirs.is_none()
+        found.skipped_absent += ours.funcs.len()
+
+        return
+    end if
+
+    val printed = printed_funcs(theirs.unwrap())
+
+    for i in 0..<ours.funcs.len()
+        val f = ours.funcs.at(i)
+
+        // A body this compiler could not finish is not evidence either way, so it is counted and
+        // left alone: the stage that fills in the seam is what will compare it.
+        if said_anything_about(ours.reported, f.name)
+            found.skipped_unresolved += 1
+        else
+            val block = block_named(printed, f.name)
+
+            if block.is_none()
+                found.skipped_absent += 1
+            else
+                val mine = show_typed_func(f)
+                val where = first_difference(without_trailing_newlines(block.unwrap()),
+                                             without_trailing_newlines(mine))
+
+                if where == ""
+                    found.matched += 1
+                else
+                    found.mismatched += 1
+
+                    if found.mismatched <= 12 then
+                        found.first_bad = s"${found.first_bad}\n$label ${f.name}: $where"
+end compare_typed
+
+private block_named(printed: Buf[(string, string)], name: string) -> Option[string]
+    for i in 0..<printed.len()
+        if printed.at(i).0 == name then return Some(printed.at(i).1)
+
+    None
+end block_named
+
+// Whether the analyzer had anything to say about a body -- asked of the whole file, since a
+// diagnostic carries a place rather than a function.
+//
+// **It is deliberately coarse**: one complaint anywhere in a file takes every function of it out of
+// the comparison. That errs towards skipping, which is the safe direction for a proof.
+private said_anything_about(reported: Buf[Placed], name: string) -> bool = !reported.is_empty()
+
+@test("the two analyzers build the same typed tree for every single-expression body they both read")
+the_typed_trees_agree()
+    oracle() match
+        None ->
+            print("skipped: SYSL_ORACLE names no reference compiler on this machine")
+            return
+        Some(binary) ->
+            val root = "../sysl.sh/docs/content/reference"
+
+            if !present(root)
+                print("skipped: the reference pages are not on this machine")
+                return
+            end if
+
+            val dir = make_temp_dir("sysl-typed").unwrap()
+            val scratch = dir + "/block.sysl"
+
+            var found = TypedAgreement(0, 0, 0, 0, 0, 0, "")
+
+            for item in walk(root)
+                item match
+                    Err(_) -> ()
+                    Ok(entry) ->
+                        if entry.path.ends_with(".md")
+                            read_text(entry.path) match
+                                Err(_) -> ()
+                                Ok(page) ->
+                                    val blocks = sysl_blocks(page)
+
+                                    for i in 0..<blocks.len()
+                                        write_text(scratch, blocks.at(i)).unwrap()
+                                        compare_typed(binary, scratch,
+                                            s"${entry.path} block ${i + 1}", blocks.at(i), &found)
+
+            remove_file(scratch)
+
+            print(s"typed bodies: ${found.matched} matched, ${found.mismatched} mismatched, " +
+                  s"skipped ${found.skipped_statements} for statements, " +
+                  s"${found.skipped_generic} generic, " +
+                  s"${found.skipped_unresolved} this stage could not finish, " +
+                  s"${found.skipped_absent} the reference did not print")
+
+            assert(found.matched > 0, "the sweep compared something")
+            assert_eq(found.first_bad, "")
+            assert_eq(found.mismatched, 0)
+end the_typed_trees_agree

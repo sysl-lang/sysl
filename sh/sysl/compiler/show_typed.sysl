@@ -1,0 +1,424 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.to_string
+import sysl.text.{str_builder, StrBuilder}
+
+// The typed tree printed the *reference compiler's* way, which is the one thing the two analyzers
+// can be diffed on.
+//
+// **The format is `emit-ast`'s, one stage later**: one node per line, its type name, then every
+// field two spaces deeper as `fieldName: value`. A list of scalars prints inline, a list of nodes
+// as `- ` items. The one difference from the untyped printer is `Type`, which is rendered as the
+// compiler's own diagnostic text rather than structurally -- an oracle wants to know a call
+// resolved to a `byte`, not the layout underneath it.
+//
+// **The field names here are the reference's own spellings**, not this tree's: `retTy`, `arrayTy`,
+// `sliceTy`, `struct`. That is the whole point -- the two trees have to print the same text, and
+// this is the file that knows they are two trees.
+
+// One function, as the `funcs:` section of `sysl emit-typed --no-spans` writes it: a `- ` item at
+// four spaces, with everything under it.
+show_typed_func(f: TFunc) -> string
+    var out = str_builder()
+
+    out.push("    - TFunc\n")
+    scalar_field(&out, "        ", "name", quoted_text(f.name))
+    pair_list(&out, "        ", "params", f.params)
+    scalar_field(&out, "        ", "retTy", type_show(f.ret_ty))
+    out.push("        body: ")
+    block_node(&out, "        ", f.body)
+    scalar_field(&out, "        ", "variadic", flag(f.variadic))
+    scalar_field(&out, "        ", "requires", "[]")
+    scalar_field(&out, "        ", "ensures", "[]")
+    scalar_field(&out, "        ", "olds", "[]")
+    scalar_field(&out, "        ", "internal", flag(f.internal))
+    scalar_field(&out, "        ", "conv", conv_text(f.conv))
+    scalar_field(&out, "        ", "tailrec", flag(f.tailrec))
+    scalar_field(&out, "        ", "variant", "None")
+    scalar_field(&out, "        ", "pure", flag(f.pure))
+    scalar_field(&out, "        ", "ghost", flag(f.ghost))
+    scalar_field(&out, "        ", "reads", name_set(f.reads))
+    scalar_field(&out, "        ", "writes", name_set(f.writes))
+    scalar_field(&out, "        ", "exported", option_text(f.exported))
+    scalar_field(&out, "        ", "section", option_text(f.section))
+    out.finish()
+end show_typed_func
+
+private flag(b: bool) -> string = if b then "true" else "false"
+
+private option_text(v: Option[string]) -> string = v match
+    Some(s) -> quoted_text(s)
+    None -> "None"
+
+private conv_text(v: Option[CallConv]) -> string = v match
+    Some(c) -> c match
+        C -> "C"
+        Sysl -> "Sysl"
+        Naked -> "Naked"
+        Interrupt -> "Interrupt"
+    None -> "None"
+
+// A set of names prints inline and sorted, which is what makes two analyzers that built one in
+// different orders still agree on the text.
+private name_set(v: Option[Buf[string]]) -> string
+    if v.is_none() then return "None"
+
+    var names = v.unwrap()
+    var sorted: Buf[string] = buf()
+
+    for i in 0..<names.len()
+        sorted.push(names.at(i))
+
+    sort_names(&sorted)
+
+    var out = "["
+
+    for i in 0..<sorted.len()
+        if i > 0 then out = out + ", "
+
+        out = out + quoted_text(sorted.at(i))
+
+    out + "]"
+end name_set
+
+private sort_names(xs: *Buf[string])
+    for i in 1..<xs.len()
+        var j = i
+
+        while j > 0 && xs.at(j - 1) > xs.at(j)
+            val a = xs.at(j - 1)
+
+            xs.set(j - 1, xs.at(j))
+            xs.set(j, a)
+            j -= 1
+
+// -- the pieces a line is made of ------------------------------------------------------------------
+
+private scalar_field(out: *StrBuilder, indent: string, name: string, text: string)
+    out.push(indent)
+    out.push(name)
+    out.push(": ")
+    out.push(text)
+    out.push_char('\n')
+
+// A list of `(name, type)` pairs, which is what a function's parameters and a variant's fields are.
+private pair_list(out: *StrBuilder, indent: string, name: string, xs: Buf[(string, Type)])
+    if xs.is_empty() then
+        scalar_field(out, indent, name, "[]")
+        return
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+
+    for i in 0..<xs.len()
+        out.push(item)
+        out.push("- Tuple2\n")
+        scalar_field(out, item + "    ", "_1", quoted_text(xs.at(i).0))
+        scalar_field(out, item + "    ", "_2", type_show(xs.at(i).1))
+
+private expr_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TExpr])
+    if xs.is_empty() then
+        scalar_field(out, indent, name, "[]")
+        return
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+
+    for i in 0..<xs.len()
+        out.push(item)
+        out.push("- ")
+        expr_node(out, item + "  ", xs.at(i))
+
+private expr_field(out: *StrBuilder, indent: string, name: string, e: TExpr)
+    out.push(indent)
+    out.push(name)
+    out.push(": ")
+    expr_node(out, indent, e)
+
+private opt_expr_field(out: *StrBuilder, indent: string, name: string, e: Option[TExpr])
+    e match
+        Some(x) -> expr_field(out, indent, name, x)
+        None -> scalar_field(out, indent, name, "None")
+
+// A block, whose statements this stage does not build.
+private block_node(out: *StrBuilder, indent: string, b: TBlock)
+    out.push("TBlock\n")
+
+    val inner = indent + "  "
+
+    scalar_field(out, inner, "stmts", "[]")
+    opt_expr_field(out, inner, "result", b.result)
+    scalar_field(out, inner, "ty", type_show(b.ty))
+
+// An enum variant, read generically the way the reference's printer reads any record with no
+// hierarchy of its own.
+private variant_field(out: *StrBuilder, indent: string, name: string, v: EnumVariant)
+    out.push(indent)
+    out.push(name)
+    out.push(": EnumVariant\n")
+
+    val inner = indent + "  "
+
+    scalar_field(out, inner, "name", quoted_text(v.name))
+    scalar_field(out, inner, "tag", s"${v.tag}")
+    pair_list(out, inner, "fields", v.fields)
+    scalar_field(out, inner, "carries", flag(v.carries))
+
+private cmp_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TCmp])
+    if xs.is_empty() then
+        scalar_field(out, indent, name, "[]")
+        return
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+
+    for i in 0..<xs.len()
+        out.push(item)
+        out.push("- TCmp\n")
+        scalar_field(out, item + "    ", "op", quoted_text(xs.at(i).op))
+        scalar_field(out, item + "    ", "dispatch", dispatch_text(xs.at(i).dispatch))
+
+private dispatch_text(d: Option[TDispatch]) -> string = d match
+    Some(_) -> "TDispatch"
+    None -> "None"
+
+private type_list(ts: Buf[Type]) -> string
+    if ts.is_empty() then return "[]"
+
+    var out = "["
+
+    for i in 0..<ts.len()
+        if i > 0 then out = out + ", "
+
+        out = out + type_show(ts.at(i))
+
+    out + "]"
+end type_list
+
+// -- one node ---------------------------------------------------------------------------------------
+
+// A typed expression, written out. The header line's tag has already been positioned by the caller;
+// what this writes is that tag, a newline, and every field two spaces deeper.
+private expr_node(out: *StrBuilder, indent: string, e: TExpr)
+    val inner = indent + "  "
+
+    *e.kind match
+        TIntLit(value, ty) ->
+            out.push("TIntLit\n")
+            scalar_field(out, inner, "value", to_string(value))
+            scalar_field(out, inner, "ty", type_show(ty))
+        TFloatLit(bits, ty) ->
+            out.push("TFloatLit\n")
+            scalar_field(out, inner, "bits", s"$bits")
+            scalar_field(out, inner, "ty", type_show(ty))
+        TStrLit(value) ->
+            out.push("TStrLit\n")
+            scalar_field(out, inner, "value", quoted_text(value))
+        TBoolLit(value) ->
+            out.push("TBoolLit\n")
+            scalar_field(out, inner, "value", flag(value))
+        TUnitLit -> out.push("TUnitLit\n")
+        TNullLit(ty) ->
+            out.push("TNullLit\n")
+            scalar_field(out, inner, "ty", type_show(ty))
+        TBox(value, ref_ty) ->
+            out.push("TBox\n")
+            expr_field(out, inner, "value", value)
+            scalar_field(out, inner, "refTy", type_show(ref_ty))
+        TDowngrade(value, weak_ty) ->
+            out.push("TDowngrade\n")
+            expr_field(out, inner, "value", value)
+            scalar_field(out, inner, "weakTy", type_show(weak_ty))
+        TZero(ty) ->
+            out.push("TZero\n")
+            scalar_field(out, inner, "ty", type_show(ty))
+        TArrayLit(elems, array_ty) ->
+            out.push("TArrayLit\n")
+            expr_list(out, inner, "elems", elems)
+            scalar_field(out, inner, "arrayTy", type_show(array_ty))
+        TArrayFill(value, array_ty) ->
+            out.push("TArrayFill\n")
+            expr_field(out, inner, "value", value)
+            scalar_field(out, inner, "arrayTy", type_show(array_ty))
+        TVectorLit(lanes, vec_ty) ->
+            out.push("TVectorLit\n")
+            expr_list(out, inner, "lanes", lanes)
+            scalar_field(out, inner, "vecTy", type_show(vec_ty))
+        TSplat(value, vec_ty) ->
+            out.push("TSplat\n")
+            expr_field(out, inner, "value", value)
+            scalar_field(out, inner, "vecTy", type_show(vec_ty))
+        TLane(receiver, lane, ty) ->
+            out.push("TLane\n")
+            expr_field(out, inner, "receiver", receiver)
+            scalar_field(out, inner, "lane", s"$lane")
+            scalar_field(out, inner, "ty", type_show(ty))
+        TBufLit(elems, slice_ty) ->
+            out.push("TBufLit\n")
+            expr_list(out, inner, "elems", elems)
+            scalar_field(out, inner, "sliceTy", type_show(slice_ty))
+        TBufFill(value, count, slice_ty) ->
+            out.push("TBufFill\n")
+            expr_field(out, inner, "value", value)
+            expr_field(out, inner, "count", count)
+            scalar_field(out, inner, "sliceTy", type_show(slice_ty))
+        TIndex(receiver, index, ty) ->
+            out.push("TIndex\n")
+            expr_field(out, inner, "receiver", receiver)
+            expr_field(out, inner, "index", index)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TLen(receiver, ty) ->
+            out.push("TLen\n")
+            expr_field(out, inner, "receiver", receiver)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TBytes(receiver) ->
+            out.push("TBytes\n")
+            expr_field(out, inner, "receiver", receiver)
+        TSlice(base, lo, hi, inclusive, slice_ty) ->
+            out.push("TSlice\n")
+            expr_field(out, inner, "base", base)
+            opt_expr_field(out, inner, "lo", lo)
+            opt_expr_field(out, inner, "hi", hi)
+            scalar_field(out, inner, "inclusive", flag(inclusive))
+            scalar_field(out, inner, "sliceTy", type_show(slice_ty))
+        TCast(operand, ty) ->
+            out.push("TCast\n")
+            expr_field(out, inner, "operand", operand)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TConstrainedCheck(value, target) ->
+            out.push("TConstrainedCheck\n")
+            expr_field(out, inner, "value", value)
+            scalar_field(out, inner, "target", type_show(target))
+        TLoad(name, ty) ->
+            out.push("TLoad\n")
+            scalar_field(out, inner, "name", quoted_text(name))
+            scalar_field(out, inner, "ty", type_show(ty))
+        TResult(ty) ->
+            out.push("TResult\n")
+            scalar_field(out, inner, "ty", type_show(ty))
+        TGlobal(symbol, ty, writable) ->
+            out.push("TGlobal\n")
+            scalar_field(out, inner, "symbol", quoted_text(symbol))
+            scalar_field(out, inner, "ty", type_show(ty))
+            scalar_field(out, inner, "writable", flag(writable))
+        TDeref(operand, ty) ->
+            out.push("TDeref\n")
+            expr_field(out, inner, "operand", operand)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TAddrOf(place, ty) ->
+            out.push("TAddrOf\n")
+            expr_field(out, inner, "place", place)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TTempAddr(value, ty) ->
+            out.push("TTempAddr\n")
+            expr_field(out, inner, "value", value)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TIncDec(place, op, pre, ty, check) ->
+            out.push("TIncDec\n")
+            expr_field(out, inner, "place", place)
+            scalar_field(out, inner, "op", quoted_text(op))
+            scalar_field(out, inner, "pre", flag(pre))
+            scalar_field(out, inner, "ty", type_show(ty))
+            scalar_field(out, inner, "check", opt_type(check))
+        TBinary(op, left, right, ty) ->
+            out.push("TBinary\n")
+            scalar_field(out, inner, "op", quoted_text(op))
+            expr_field(out, inner, "left", left)
+            expr_field(out, inner, "right", right)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TUnary(op, operand, ty) ->
+            out.push("TUnary\n")
+            scalar_field(out, inner, "op", quoted_text(op))
+            expr_field(out, inner, "operand", operand)
+            scalar_field(out, inner, "ty", type_show(ty))
+        TLogical(op, left, right) ->
+            out.push("TLogical\n")
+            scalar_field(out, inner, "op", quoted_text(op))
+            expr_field(out, inner, "left", left)
+            expr_field(out, inner, "right", right)
+        TCompare(operands, cmps) ->
+            out.push("TCompare\n")
+            expr_list(out, inner, "operands", operands)
+            cmp_list(out, inner, "cmps", cmps)
+        TStr(arg) ->
+            out.push("TStr\n")
+            expr_field(out, inner, "arg", arg)
+        TFromBytes(arg) ->
+            out.push("TFromBytes\n")
+            expr_field(out, inner, "arg", arg)
+        TConstView(arg) ->
+            out.push("TConstView\n")
+            expr_field(out, inner, "arg", arg)
+        TFormat(arg, spec) ->
+            out.push("TFormat\n")
+            expr_field(out, inner, "arg", arg)
+            scalar_field(out, inner, "spec", quoted_text(spec))
+        TCStrLit(value) ->
+            out.push("TCStrLit\n")
+            scalar_field(out, inner, "value", quoted_text(value))
+        TCall(name, args, ty, results) ->
+            out.push("TCall\n")
+            scalar_field(out, inner, "name", quoted_text(name))
+            expr_list(out, inner, "args", args)
+            scalar_field(out, inner, "ty", type_show(ty))
+            scalar_field(out, inner, "results", flag(results))
+        TCallPtr(callee, args, params, ty) ->
+            out.push("TCallPtr\n")
+            expr_field(out, inner, "callee", callee)
+            expr_list(out, inner, "args", args)
+            scalar_field(out, inner, "params", type_list(params))
+            scalar_field(out, inner, "ty", type_show(ty))
+        TStructNew(decl, args) ->
+            out.push("TStructNew\n")
+            scalar_field(out, inner, "struct", type_show(Struct(decl)))
+            expr_list(out, inner, "args", args)
+        TEnumNew(enum_ty, variant, args) ->
+            out.push("TEnumNew\n")
+            scalar_field(out, inner, "enumTy", type_show(enum_ty))
+            variant_field(out, inner, "variant", variant)
+            expr_list(out, inner, "args", args)
+        TEnumFromInt(value, en) ->
+            out.push("TEnumFromInt\n")
+            expr_field(out, inner, "value", value)
+            scalar_field(out, inner, "en", type_show(en))
+        TTry(operand, ok_variant, fail_variant, ret_enum, ret_fail, ty, convert) ->
+            out.push("TTry\n")
+            expr_field(out, inner, "operand", operand)
+            variant_field(out, inner, "okVariant", ok_variant)
+            variant_field(out, inner, "failVariant", fail_variant)
+            scalar_field(out, inner, "retEnum", type_show(ret_enum))
+            variant_field(out, inner, "retFail", ret_fail)
+            scalar_field(out, inner, "ty", type_show(ty))
+            scalar_field(out, inner, "convert", option_text(convert))
+        TField(receiver, index, ty) ->
+            out.push("TField\n")
+            expr_field(out, inner, "receiver", receiver)
+            scalar_field(out, inner, "index", s"$index")
+            scalar_field(out, inner, "ty", type_show(ty))
+        // A node this stage does not build. It is named rather than dropped, so a diff that meets
+        // one says which node is missing instead of quietly agreeing.
+        _ ->
+            out.push("TUnprinted\n")
+
+private opt_type(t: Option[Type]) -> string = t match
+    Some(x) -> type_show(x)
+    None -> "None"
+
+// A double-quoted string, escaped the way both printers escape one.
+private quoted_text(s: string) -> string
+    var out = str_builder()
+
+    quoted(&out, s)
+    out.finish()
+end quoted_text

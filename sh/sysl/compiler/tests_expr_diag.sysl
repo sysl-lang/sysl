@@ -1,0 +1,149 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What the expression pass refuses, and what it says.
+//
+// **Every message here was read out of the reference compiler**, by handing the installed `sysl`
+// the same source and quoting what came back -- never composed from the rule.
+
+private only(text: string) -> string
+    val ds = expr_diagnostics(text)
+
+    if ds.is_empty() then return ""
+
+    ds.at(0)
+end only
+
+private count(text: string) -> usize = expr_diagnostics(text).len()
+
+@test("a body whose expression is sound says nothing")
+a_sound_body_says_nothing()
+    assert_eq(count("f(a: int, b: int) -> int = a + b\n"), 0)
+    assert_eq(count("struct P\n    x: int\n\nf(p: P) -> int = p.x\n"), 0)
+    assert_eq(count("g(a: int) -> int = a\nf() -> int = g(1)\n"), 0)
+
+@test("a literal too large for the type it landed in is told the number and the type")
+a_literal_that_does_not_fit()
+    assert_eq(only("f() -> u8 = 300\n"), "the literal 300 does not fit byte")
+    assert_eq(only("f() -> i8 = 128\n"), "the literal 128 does not fit i8")
+
+@test("an operator's operands have to agree, and the caret is under the second")
+operands_have_to_agree()
+    assert_eq(only("f() -> int = 1 + \"x\"\n"), "'+' needs matching types, got int and string")
+    assert_eq(only("f(a: u8, b: int) -> byte = a + b\n"),
+              "'+' needs matching types, got byte and int")
+
+@test("an operator that a type does not have is named with the type")
+an_operator_a_type_does_not_have()
+    assert_eq(only("f(a: string, b: string) -> string = a - b\n"),
+              "operator '-' is not defined for string")
+    assert_eq(only("f(a: bool, b: bool) -> bool = a * b\n"),
+              "operator '*' is not defined for bool")
+
+@test("a shift's count is a count, and has to be a number of places")
+a_shift_needs_a_count()
+    assert_eq(only("f(a: int, b: string) -> int = a << b\n"),
+              "'<<' shifts by a count, and string is not an integer")
+
+@test("unary minus has no meaning on an unsigned type, and the message says which")
+unary_minus_on_an_unsigned()
+    assert_eq(only("f(a: u8) -> byte = -a\n"),
+              "unary '-' is not defined for the unsigned type byte")
+    assert_eq(only("f(a: string) -> string = -a\n"), "unary '-' is not defined for string")
+    assert_eq(only("f(a: f32) -> f32 = ~a\n"), "unary '~' is not defined for f32")
+
+@test("two values that cannot be compared are named, both of them")
+values_that_cannot_be_compared()
+    assert_eq(only("f() -> bool = 1 < \"a\"\n"), "cannot compare int with string")
+
+@test("'null' takes its type from its context, and refuses to guess one")
+null_needs_a_context()
+    assert_eq(only("f() -> int = 1 + 2\ng() = null\n"),
+              "'null' takes its type from its context, and there is none here")
+    assert_eq(only("f() -> int = null\n"), "'null' is a raw pointer, and int was expected here")
+
+@test("a name that stands for nothing is named back")
+an_undefined_name()
+    assert_eq(only("f() -> int = nope\n"), "undefined name 'nope'")
+    assert_eq(only("f() -> int = nope(1)\n"), "undefined function 'nope'")
+
+@test("a call with the wrong number of arguments is told how many the declaration takes")
+a_call_of_the_wrong_arity()
+    assert_eq(only("g(a: int, b: int) -> int = a\nf() -> int = g(1)\n"),
+              "function 'g' takes 2 arguments, but 1 argument was given")
+    assert_eq(only("g(a: int) -> int = a\nf() -> int = g(1, 2)\n"),
+              "function 'g' takes 1 argument, but 2 arguments were given")
+
+@test("an argument of the wrong type names the parameter it was written for")
+an_argument_of_the_wrong_type()
+    assert_eq(only("g(a: int) -> int = a\nf() -> int = g(\"x\")\n"),
+              "'a' of 'g' is int, but string was given")
+
+@test("a named argument that names no parameter is told which names there are")
+a_named_argument_that_names_nothing()
+    assert_eq(only("g(a: int, b: int = 2) -> int = a\nf() -> int = g(1, c = 3)\n"),
+              "function 'g' declares no parameter named 'c' — it takes 'a' and 'b'")
+
+@test("a struct built with the wrong number of values is told how many fields it has")
+a_struct_built_wrong()
+    assert_eq(only("struct P\n    x: int\n    y: int\n\nf() -> P = P(1)\n"),
+              "struct 'P' has 2 fields, but 1 value was given")
+
+@test("and so is a variant")
+a_variant_built_wrong()
+    assert_eq(only("enum Shape\n    Circle(r: int)\n    Square\n\nf() -> Shape = Circle(1, 2)\n"),
+              "variant 'Circle' has 1 field, but 2 values were given")
+
+@test("a conversion that has no meaning names both types")
+a_conversion_with_no_meaning()
+    assert_eq(only("f(s: string) -> int = int(s)\n"), "cannot convert string to int")
+    assert_eq(only("f(n: int) -> string = string(n)\n"),
+              "a 'string' conversion encodes a char, and int is not one — 'str(x)' renders a " +
+              "value as text")
+
+@test("an array literal needs one element type")
+an_array_literal_needs_one_type()
+    assert_eq(only("f() -> [2]int = [1, \"x\"]\n"),
+              "an array literal needs one element type, got int and string")
+
+@test("an array's bound is a constant, since it is the array's bound")
+an_array_repeat_needs_a_constant()
+    assert_eq(only("f(n: int) -> [4]int = [0; n]\n"),
+              "an array's repeat count must be a constant, since it is the array's bound — a " +
+              "literal, or a 'const' naming one. A count computed while running makes storage " +
+              "instead, which is written where a '[]T' is expected")
+
+@test("an index has to be an integer, and a receiver has to have elements")
+an_index_and_its_receiver()
+    assert_eq(only("f(xs: [3]int, k: string) -> int = xs[k]\n"),
+              "an index must be an integer, not string")
+    assert_eq(only("f(n: int) -> int = n[0]\n"), "cannot index int")
+
+@test("a dereference needs a pointer")
+a_dereference_needs_a_pointer()
+    assert_eq(only("f(n: int) -> int = *n\n"), "'*' needs a pointer or a reference, not int")
+
+@test("a condition has to be a bool")
+a_condition_has_to_be_bool()
+    assert_eq(only("f(n: int) -> bool = !n\n"), "condition must be bool, got int")
+
+@test("a lane index is part of the instruction that reads it")
+a_lane_index_is_a_constant()
+    assert(only("f(v: <4>f32, k: usize) -> f32 = v[k]\n").starts_with(
+        "a lane index is part of the instruction that reads it"))
+    assert_eq(only("f(v: <4>f32) -> f32 = v[9]\n"), "<4>f32 has lanes 0 to 3, and this is 9")
+
+@test("a vector's width is part of its type, so a literal has to fill it")
+a_vector_literal_fills_its_width()
+    assert_eq(only("f() -> <4>f32 = [1.0, 2.0]\n"),
+              "<4>f32 has 4 lanes and this literal has 2 — a vector's width is part of its type, " +
+              "so the two have to agree")
+
+@test("a read-only view does not become a writable one")
+a_read_only_view_does_not_widen()
+    assert(only("f(xs: []const int) -> []int = xs\n").starts_with(
+        "a '[]const int' views elements it may not write"))

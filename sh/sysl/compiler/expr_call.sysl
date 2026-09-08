@@ -122,20 +122,28 @@ private convert_call(cx: &Analyzer, span: Span, written: string, to: Type,
 
     if texpr_type(t) == Unknown then return t
 
-    convert_to(cx, span, t, to, written)
+    convert_to(cx, span, t, to, None)
 end convert_call
 
 // The conversion itself, which a subtype's cast also reaches.
-convert_to(cx: &Analyzer, span: Span, t: TExpr, to: Type, written: string) -> TExpr
+//
+// **`asked` is what the reader actually wrote**, where that is not the target's own name: a
+// conversion into a transparent subtype is this conversion into its base, and a refusal naming the
+// base would be answering about a type the line does not mention.
+convert_to(cx: &Analyzer, span: Span, t: TExpr, to: Type, asked: Option[string]) -> TExpr
     if to == Str then return encode_string(cx, span, t)
 
     val from = underlying(texpr_type(t))
 
     if !converts(cx, span, from, to) then
-        return cx.err(span, s"cannot make $written from ${type_show(texpr_type(t))}")
+        return cx.err(span, refusal(asked, texpr_type(t), to))
 
     TExpr(span, TCast(t, to))
 end convert_to
+
+private refusal(asked: Option[string], from: Type, to: Type) -> string = asked match
+    Some(name) -> s"cannot make $name from ${type_show(from)}"
+    None -> s"cannot convert ${type_show(from)} to ${type_show(to)}"
 
 private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
     from match
@@ -289,7 +297,7 @@ private constrained_call(cx: &Analyzer, span: Span, key: string, written: string
             val t = type_expr(cx, args.at(0), Some(d.base))
 
             if disagree(texpr_type(t), d.base) then
-                val converted = convert_to(cx, span, t, d.base, written)
+                val converted = convert_to(cx, span, t, d.base, Some(written))
 
                 return TExpr(span, TConstrainedCheck(converted, target))
 
@@ -475,8 +483,9 @@ private bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, args
     for i in 0..<params.len()
         slots.push(None)
 
-    var next = 0
-    var failed = false
+    var next: usize = 0
+    var unknown_name = false
+    var extra: usize = 0
 
     for i in 0..<args.len()
         val a = args.at(i)
@@ -485,42 +494,30 @@ private bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, args
             NamedArg(name, value) ->
                 val idx = param_index(params, name)
 
-                if idx < 0 then
+                if idx < 0
                     if report then
                         cx.fault(a.span, s"function '$written' declares no parameter named " +
                                  s"'$name' — it takes ${name_list(params)}")
                     else
                         cx.fault(a.span, "no such parameter")
 
-                    failed = true
+                    unknown_name = true
                 else
-                    slots.truncate(usize(idx))
-                    slots.push(Some(value))
-
-                    for j in usize(idx) + 1..<params.len()
-                        slots.push(None)
+                    slots.set(usize(idx), Some(value))
             _ ->
-                if next >= int(params.len()) then
-                    failed = true
+                if next >= params.len() then extra += 1
                 else
-                    val keep = slots.at(usize(next))
+                    slots.set(next, Some(a))
+                    next += 1
 
-                    slots.truncate(usize(next))
-                    slots.push(Some(a))
+    if unknown_name then return None
 
-                    for j in usize(next) + 1..<params.len()
-                        slots.push(None)
-
-                    next = next + 1
-
-    if failed then return None
-
-    var missing = 0
+    var missing: usize = 0
 
     for i in 0..<params.len()
-        if slots.at(i).is_none() && params.at(i).default.is_none() then missing = missing + 1
+        if slots.at(i).is_none() && params.at(i).default.is_none() then missing += 1
 
-    if missing > 0 || args.len() > params.len() then
+    if missing > 0 || extra > 0
         if report then
             cx.fault(span, s"function '$written' takes ${quantity(params.len(), "argument")}, but " +
                      s"${quantity(args.len(), "argument")} " +
@@ -529,6 +526,7 @@ private bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, args
             cx.fault(span, "wrong arity")
 
         return None
+    end if
 
     Some(slots)
 end bind_arguments
