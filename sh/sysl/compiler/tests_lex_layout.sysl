@@ -1,0 +1,329 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_text
+
+// The layout: where a statement ends, where a block opens, and the two ways a line goes on.
+//
+// **These are claims about the shape of a token stream rather than about any token in it**, so they
+// are asserted against the whole stream, structural tokens included. The strongest form of a
+// continuation claim is that the continued text produces *exactly* the stream the same text written
+// on one line produces, which is discriminating in a way "it compiles" would not be: a stray
+// `Newline` that a parser happened to tolerate would still pass that.
+
+// -- the off-side rule ----------------------------------------------------------------------------
+
+@test("an indented block yields Newline, Indent and Dedent")
+the_off_side_rule()
+    assert_eq(all("a\n    b\nc"),
+              of([Ident("a"), Newline,
+                  Indent, Ident("b"), Newline,
+                  Dedent, Newline, Ident("c"), Newline]))
+
+@test("the first line of a file ends no statement, so nothing precedes it")
+the_first_line_opens_nothing()
+    assert_eq(all("a"), of([Ident("a"), Newline]))
+
+@test("what is still open at the end of the file closes there")
+the_end_of_the_file_closes_every_block()
+    assert_eq(all("a\n    b"),
+              of([Ident("a"), Newline, Indent, Ident("b"), Newline, Dedent, Newline]))
+
+@test("a tab indents as one column, and a file may use either character")
+tabs_indent()
+    assert_eq(all("a\n\tb\nc"), all("a\n    b\nc"))
+
+@test("a line indented with both tabs and spaces is refused where it is written")
+tabs_and_spaces_together()
+    assert_eq(bad("a\n \tb\n"), "only tabs or spaces (but not both on a given line) may be used for indentation")
+    assert_eq(bad_at("a\n \tb\n"), 2)
+
+@test("a line matching no open level closes the innermost and carries on below it")
+a_ragged_line()
+    // Not a lexical error: the layout carries on from the nearest level below the line, and what
+    // goes wrong is reported by whichever rule the line then fails.
+    assert_eq(all("a\n        b\n    c\nd"),
+              of([Ident("a"), Newline,
+                  Indent, Ident("b"), Newline,
+                  Dedent, Newline, Ident("c"), Newline,
+                  Ident("d"), Newline]))
+
+@test("a blank line is not a line")
+a_blank_line_is_not_a_line()
+    assert_eq(all("a\n\n\nb"), all("a\nb"))
+
+@test("a line holding only a comment is not a line either")
+a_comment_line_is_not_a_line()
+    assert_eq(all("a\n    // note\nb"), all("a\nb"))
+    assert_eq(all("a\n    /* note */\nb"), all("a\nb"))
+
+// -- comments and the margin ----------------------------------------------------------------------
+
+@test("a block comment spanning whole lines between statements opens no block")
+a_comment_spanning_whole_lines()
+    assert_eq(all("a\n/* one\ntwo\n*/\nb"), of([Ident("a"), Newline, Ident("b"), Newline]))
+
+@test("an indented line opening with a block comment indents by where the comment starts")
+a_line_opening_with_a_comment()
+    // The gap after the `*/` is four spaces wider than the code's own indentation. Measured from
+    // where the comment ended, `b` would look more deeply indented than it is and the block would
+    // gain a level nobody asked for.
+    assert_eq(all("a\n    /* note */    b\nc"),
+              of([Ident("a"), Newline,
+                  Indent, Ident("b"), Newline,
+                  Dedent, Newline, Ident("c"), Newline]))
+
+@test("a comment occupying a whole line contributes no indentation of its own")
+a_comment_alone_on_a_line()
+    assert_eq(all("a\n        /* alone */\n    b\nc"),
+              of([Ident("a"), Newline,
+                  Indent, Ident("b"), Newline,
+                  Dedent, Newline, Ident("c"), Newline]))
+
+@test("a comment opening the first line of a block still fixes the block's indentation")
+a_comment_opening_a_block()
+    assert_eq(all("a\n    /* why */ b\n    c\nd"),
+              of([Ident("a"), Newline,
+                  Indent, Ident("b"), Newline, Ident("c"), Newline,
+                  Dedent, Newline, Ident("d"), Newline]))
+
+// -- brackets -------------------------------------------------------------------------------------
+
+@test("brackets suspend the rule, so no indentation tokens appear inside")
+brackets_join_lines()
+    assert_eq(bare("(1\n 2)"),
+              of([Keyword("("), IntLit("1", 10, ""), IntLit("2", 10, ""), Keyword(")")]))
+    assert_eq(all("(1\n 2)"), all("(1 2)"))
+
+@test("every bracket pair suspends it")
+every_bracket_pair()
+    assert_eq(all("[1\n    2]"), all("[1 2]"))
+    assert_eq(all("{1\n    2}"), all("{1 2}"))
+
+@test("a bracket opened inside a block does not close that block")
+a_bracket_inside_a_block()
+    assert_eq(all("a\n    f(1,\n      2)\n    b"), all("a\n    f(1, 2)\n    b"))
+
+// -- a block opening inside brackets --------------------------------------------------------------
+
+@test("a match written as an argument opens its arms, brackets and all")
+a_match_as_an_argument()
+    assert_eq(all("print(n match\n    0 -> \"none\"\n    else \"many\")"),
+              of([Ident("print"), Keyword("("), Ident("n"), Keyword("match"), Newline,
+                  Indent, IntLit("0", 10, ""), Keyword("->"), StrLit("none"), Newline,
+                  Keyword("else"), StrLit("many"), Newline,
+                  Dedent, Keyword(")"), Newline]))
+
+@test("and so does an arrow, which is what a multi-statement closure needs")
+an_arrow_as_an_argument()
+    assert_eq(all("f((x) ->\n    x + 1, 5)"),
+              of([Ident("f"), Keyword("("), Keyword("("), Ident("x"), Keyword(")"), Keyword("->"), Newline,
+                  Indent, Ident("x"), Keyword("+"), IntLit("1", 10, ""), Newline,
+                  Dedent, Keyword(","), IntLit("5", 10, ""), Keyword(")"), Newline]))
+
+@test("the bracket rule resumes at the dedent, so an argument after the block is at the outer level")
+an_argument_after_a_block()
+    // The `5` is the call's second argument and not part of the closure's body, so the comma closes
+    // the block: no line ending will, the comma being on the block's own last line.
+    val ts = all("f((x) ->\n    x + 1, 5)")
+    var dedents: usize = 0
+
+    for t in ts.view()
+        if t == Dedent then dedents += 1
+
+    assert_eq(dedents, 1)
+
+@test("then, else and do are not among the two")
+the_other_block_words_are_not_triggers()
+    assert_eq(all("f(x then\n    y)"), all("f(x then y)"))
+    assert_eq(all("f(x do\n    y)"), all("f(x do y)"))
+
+@test("a function type written inside brackets may be broken before its arrow")
+a_function_type_broken_before_its_arrow()
+    assert_eq(all("apply(f: int\n    -> int, n: int)"), all("apply(f: int -> int, n: int)"))
+
+@test("…and may not be broken after it, which is the one layout the rule costs")
+a_function_type_broken_after_its_arrow()
+    // The line now ends in a token that opens a block, so it opens one. It is written down rather
+    // than guarded against: the alternative is a rule about which arrows open blocks and which do
+    // not, which is a thing nobody could state.
+    assert(all("apply(f: int ->\n    int, n: int)") != all("apply(f: int -> int, n: int)"),
+           "the arrow opens a block wherever it is written")
+
+// -- a line continued after an operator -----------------------------------------------------------
+
+@test("an arithmetic operator carries the line")
+an_arithmetic_operator_carries_the_line()
+    assert_eq(all("var a = 1 +\n2"), all("var a = 1 + 2"))
+
+@test("the continuation line's own indentation carries no meaning")
+a_continuation_line_has_no_margin()
+    assert_eq(all("var a = 1 +\n            2"), all("var a = 1 + 2"))
+    assert_eq(all("var a = 1 +\n2"), all("var a = 1 +\n        2"))
+
+@test("several operators in a row each carry the line")
+several_operators_in_a_row()
+    assert_eq(all("var a = 1 +\n2 +\n3 +\n4"), all("var a = 1 + 2 + 3 + 4"))
+
+@test("a comment after the operator does not end the line")
+a_comment_after_the_operator()
+    assert_eq(all("var a = 1 + // still coming\n2"), all("var a = 1 + 2"))
+
+@test("a blank line after the operator does not end it either")
+a_blank_line_after_the_operator()
+    assert_eq(all("var a = 1 +\n\n\n2"), all("var a = 1 + 2"))
+
+@test("a prefix operator continues, because it cannot finish an expression")
+a_prefix_operator_continues()
+    assert_eq(all("var a = !\ntrue"), all("var a = ! true"))
+    assert_eq(all("var a = ~\n1"), all("var a = ~ 1"))
+
+@test("a compound assignment continues")
+a_compound_assignment_continues()
+    assert_eq(all("a +=\n1"), all("a += 1"))
+
+@test("a comparison and a conjunction continue")
+comparisons_and_conjunctions_continue()
+    assert_eq(all("var a = b ==\nc"), all("var a = b == c"))
+    assert_eq(all("var a = b &&\nc"), all("var a = b && c"))
+
+// -- what still ends a statement ------------------------------------------------------------------
+
+@test("a line ending in a complete expression ends a statement")
+a_complete_line_ends_a_statement()
+    assert(all("var a = 1\nvar b = 2") != all("var a = 1 var b = 2"), "the newline says so")
+
+@test("'=' does not continue, because it opens a body")
+an_equals_does_not_continue()
+    assert(all("f() -> int =\n    42") != all("f() -> int = 42"), "a value too long goes under it")
+
+@test("'->' does not continue, because it separates a pattern from its body")
+an_arrow_does_not_continue()
+    assert(all("x match\n    1 ->\n        2") != all("x match\n    1 -> 2"), "the arrow opens a block")
+
+@test("a postfix operator is a complete statement")
+a_postfix_operator_ends_a_statement()
+    assert(all("n++\nm++") != all("n++ m++"), "a line ending in one is already complete")
+    assert(all("var a = f()?\nvar b = 2") != all("var a = f()? var b = 2"), "and so is a '?'")
+
+@test("a range operator does not continue, since it can be complete")
+a_range_operator_does_not_continue()
+    assert(all("var a = 0..\n5") != all("var a = 0..5"), "`s[..]` is the whole range")
+
+@test("a wildcard import is still a whole statement")
+a_wildcard_import_ends_its_statement()
+    assert(all("import isa.*\nvar a = 1") != all("import isa.* var a = 1"), "the tail is one token")
+
+// -- a line continued before a dot ----------------------------------------------------------------
+
+@test("one link lexes as though it had been written on one line")
+a_chain_broken_before_its_dot()
+    assert_eq(all("var a = \"hi\"\n    .len"), all("var a = \"hi\".len"))
+
+@test("and so does a chain of them")
+a_chain_of_links()
+    assert_eq(all("var a = x\n    .b\n    .c\n    .d"), all("var a = x.b.c.d"))
+
+@test("the continuation line's own indentation carries no meaning here either")
+a_chain_has_no_margin()
+    assert_eq(all("var a = x\n.b"), all("var a = x.b"))
+    assert_eq(all("var a = x\n            .b"), all("var a = x.b"))
+
+@test("a comment line in the middle of a chain does not end it")
+a_comment_inside_a_chain()
+    assert_eq(all("var a = x\n    // why\n    .b"), all("var a = x.b"))
+
+@test("nor does a blank line")
+a_blank_line_inside_a_chain()
+    assert_eq(all("var a = x\n\n\n    .b"), all("var a = x.b"))
+
+@test("the two continuation rules compose")
+the_two_rules_compose()
+    assert_eq(all("var a = x\n    .b +\n    y\n    .c"), all("var a = x.b + y.c"))
+
+@test("a range operator at the start of a line is not a chain")
+a_leading_range_is_not_a_chain()
+    assert(all("var a = 1\n    ..2") != all("var a = 1..2"), "a name after the dot is required")
+
+@test("a tuple index at the start of a line is not a chain")
+a_leading_tuple_index_is_not_a_chain()
+    assert(all("var a = t\n    .0") != all("var a = t.0"), "a digit is not a name")
+
+@test("a wildcard import is untouched from this side too")
+a_wildcard_import_is_untouched()
+    assert(all("import isa.*\nvar a = 1") != all("import isa.* var a = 1"), "and `.*` is one token")
+
+@test("the line above has to be one a chain could continue")
+the_line_above_must_admit_the_join()
+    // Without this half, the first arm of the `match` would read as a chain hanging off the header,
+    // and a reader who wrote the form they had just been taught would get a syntax error.
+    assert_eq(all("val n = c match\n    .Red -> 1"),
+              of([Keyword("val"), Ident("n"), Keyword("="), Ident("c"), Keyword("match"), Newline,
+                  Indent, Keyword("."), Ident("Red"), Keyword("->"), IntLit("1", 10, ""), Newline,
+                  Dedent, Newline]))
+
+@test("the four reserved words that are values are the exception")
+the_value_words_admit_a_chain()
+    assert_eq(all("var a = self\n    .field"), all("var a = self.field"))
+    assert_eq(all("var a = true\n    .str()"), all("var a = true.str()"))
+
+@test("a trailing dot is not a continuation, and stays whatever the parser makes of it")
+a_trailing_dot_is_not_a_continuation()
+    assert(all("val n = \"hi\".\n    len") != all("val n = \"hi\".len"),
+           "two ways to write one chain is a style argument in every file that has one")
+
+// -- the one hazard -------------------------------------------------------------------------------
+
+@test("a dedented continuation line has its dedent swallowed with the newline")
+the_hazard()
+    // Every language that joins lines has this, brackets included. It is documented rather than
+    // guarded against: guarding would mean the indentation of a continuation line carried meaning,
+    // and the whole point of continuing is that it does not.
+    assert_eq(all("f()\n    a = 1 +\n2\n    b"), all("f()\n    a = 1 + 2\n    b"))
+
+@test("a chain written at the outer margin is still inside the block above it")
+the_hazard_from_the_other_end()
+    assert_eq(all("f()\n    a = x\n.b\n    c"), all("f()\n    a = x.b\n    c"))
+
+@test("a leading dot admits a name in any script")
+a_chain_link_in_any_script()
+    assert_eq(all("var a = x\n    .año"), all("var a = x.año"))
+
+@test("a separator at the top level closes nothing")
+a_comma_outside_brackets()
+    assert_eq(all("a\n    b,\n    c"), of([Ident("a"), Newline,
+                                          Indent, Ident("b"), Keyword(","), Newline,
+                                          Ident("c"), Newline,
+                                          Dedent, Newline]))
+
+@test("a bracket opened inside a triggered body suspends that body again")
+a_bracket_inside_a_triggered_body()
+    assert_eq(all("f(x match\n    0 -> g(1,\n           2)\n    else 3)"),
+              all("f(x match\n    0 -> g(1, 2)\n    else 3)"))
+
+// -- the compiler's own sources -------------------------------------------------------------------
+
+@test("every file of this compiler lexes without a complaint")
+the_compiler_lexes_itself()
+    // **The suite above is made of two-line inputs, and a lexer can be right about all of them and
+    // wrong about a file.** These are the largest sysl sources to hand: a thousand lines of blocks,
+    // chains, interpolated literals, nested comments and text blocks, written by somebody who was
+    // not thinking about the lexer. Nothing here says what the tokens should be -- only that the
+    // reading finishes, which is the one claim a corpus can make and the suite above cannot.
+    val files = ["sh/sysl/compiler/main.sysl",
+                 "sh/sysl/compiler/tests.sysl",
+                 "sh/sysl/compiler/lex.sysl",
+                 "sh/sysl/compiler/lex_tables.sysl",
+                 "sh/sysl/compiler/lex_literal.sysl",
+                 "sh/sysl/compiler/tests_lex.sysl",
+                 "sh/sysl/compiler/tests_lex_literal.sysl",
+                 "sh/sysl/compiler/tests_lex_layout.sysl"]
+
+    for name in files
+        val text = read_text(name).unwrap()
+
+        lex(source_of(name, text)) match
+            Ok(ts) -> assert(ts.len() > 0, s"${name} lexed to nothing")
+            Err(d) -> assert(false, s"${name}: ${d.message}")

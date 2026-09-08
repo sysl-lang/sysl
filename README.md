@@ -23,7 +23,9 @@ first produces `./sysl`; the second runs every `@test` in the tree.
 1. A conformance suite: programs with the output and the diagnostics they owe, in a form either
    compiler can be run against. It is green against the bootstrap before anything else is written.
 2. A scanner and a parser for sysl's grammar, written by hand, producing the same tree the bootstrap
-   does.
+   does. **The scanner is written**: `sh/sysl/compiler/lex.sysl` turns bytes into tokens and turns
+   the shape of a file into `Newline`, `Indent` and `Dedent`, so that nothing above it ever looks at
+   a column. The parser is next.
 3. Analysis, then LLVM emission, phase by phase against the suite.
 4. This compiler builds itself, and the compiler it builds builds the same thing again.
 
