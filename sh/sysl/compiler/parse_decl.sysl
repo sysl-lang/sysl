@@ -202,10 +202,11 @@ end try_func_decl
 private looks_like_func_decl(p: *Parser) -> bool
     var i: usize = 0
 
-    if at_call_conv(p)
-        i = 1
-
-        if p.kw_at(1, "(") then i = 4
+    // **A calling convention can only introduce a declaration**, so the scan is over as soon as one
+    // stands at the cursor. `interrupt timer()` with no body is a declaration whose body is missing
+    // and is told so; read as an expression it would be two names on one line, and the reader would
+    // be told a newline was expected in the middle of the thing they were writing.
+    if at_call_conv(p) then return true
 
     if !names_a_decl(p.peek_at(i)) then return false
 
@@ -217,6 +218,13 @@ private looks_like_func_decl(p: *Parser) -> bool
         if i == 0 then return false
 
     if !p.kw_at(i, "(") then return false
+
+    // **A receiver makes it a member rather than a function**, and a member is read by
+    // `parse_member.sysl` inside the declaration that holds it. So a parameter list opening on one
+    // of the receiver's spellings is not a function declaration at all: what stands here is a call
+    // whose argument happens to be `self`, and reading it as a declaration would refuse the receiver
+    // instead of saying what is actually wrong with the line.
+    if p.kw_at(i + 1, "self") || p.kw_at(i + 1, "*") || p.kw_at(i + 1, "&") then return false
 
     i = past_bracket(p, i)
 
@@ -299,6 +307,13 @@ end parse_call_conv
 // What a function declares after `->`: one type, or the several a result list names.
 parse_result_type(p: *Parser) -> TypeRef
     val start = p.here()
+
+    // `some Trait` is the whole result where it is written at all, so it is read here and returned
+    // rather than joining the list a comma would open.
+    parse_some_result(p) match
+        Some(t) -> return t
+        None -> ()
+
     val first = parse_type(p)
 
     if !p.at_kw(",") then return first

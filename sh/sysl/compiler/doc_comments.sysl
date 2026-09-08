@@ -1,0 +1,222 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, Search, split, str_builder, StrBuilder}
+
+// Documentation comments: `/** ... */` above a declaration, and what a generator reads out of one.
+//
+// **A doc comment is not part of what a declaration means.** Nothing downstream reads one and a
+// program compiles identically with every one of them deleted. What they are for is the reader --
+// a generated API reference, an editor's hover text -- and the compiler carries them because it is
+// the only thing that knows which prose belongs to which declaration.
+//
+// **The form is scaladoc's**, and the delimiter is the whole of what distinguishes a doc comment
+// from an ordinary one: an implementation note above a declaration stays an implementation note by
+// being written `//`, and nothing has to guess at intent. The lexer collects the raw text as
+// trivia; what happens here is the reading of it -- the margin taken off, the tags split from the
+// prose, and the first sentence taken as the summary an index column wants.
+
+// One tag inside a doc comment: `@param xs the slice to sort`.
+//
+// `subject` is the first word after the tag for the two tags that take one, and absent for the rest.
+// `text` is everything after it, with the tag's own line and any continuation lines joined.
+struct DocTag
+    name: string
+    subject: Option[string]
+    text: string
+    line: usize
+end DocTag
+
+// A doc comment as read, and the lines it was found on.
+//
+// `summary` is the first sentence of the body, which is what an index column wants; `body` is the
+// whole of the prose before the first tag, summary included. Splitting rather than trimming means a
+// page can show either without a generator having to re-derive one from the other.
+struct Doc
+    summary: string
+    body: string
+    tags: Buf[DocTag]
+    start_line: usize
+    end_line: usize
+end Doc
+
+// The two tags whose first word names something in the signature.
+private takes_a_subject(name: string) -> bool = name == "param" || name == "tparam"
+
+// Every doc comment the lexer collected, read.
+read_doc_comments(src: Source, scanned: Buf[Spanned[string]]) -> Buf[Doc]
+    var out: Buf[Doc] = buf()
+
+    for i in 0..<scanned.len()
+        val one = scanned.at(i)
+        val start = one.span.start
+
+        // The end offset is one past the closing delimiter, so the line it lands on is the
+        // comment's last line -- except where the comment ends the file with no newline, which is
+        // the same line either way.
+        val last = if one.span.end > start then one.span.end - 1 else start
+
+        out.push(parse_doc(one.value, src.locate(start).line, src.locate(last).line))
+
+    out
+end read_doc_comments
+
+// The comment's lines with the delimiters and the left margin taken off.
+private doc_lines(text: string) -> Buf[string]
+    var inner = text
+
+    if inner.starts_with("/**") then inner = inner[3..]
+    if inner.ends_with("*/") then inner = inner[0..<(inner.len - 2)]
+
+    var out: Buf[string] = buf()
+
+    for raw in split(inner, "\n")
+        val line = raw.trim()
+
+        if line.starts_with("*")
+            val rest = line[1..]
+
+            out.push(if rest.starts_with(" ") then rest[1..] else rest)
+        else
+            out.push(line)
+
+    out
+end doc_lines
+
+// One doc comment, read into its prose and its tags.
+parse_doc(text: string, start_line: usize, end_line: usize) -> Doc
+    val lines = doc_lines(text)
+
+    var body: Buf[string] = buf()
+    var tags: Buf[DocTag] = buf()
+    var open = false
+    var name = ""
+    var subject: Option[string] = None
+    var held: Buf[string] = buf()
+    var at: usize = 0
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        tag_start(line) match
+            Some(found) ->
+                if open then tags.push(DocTag(name, subject, join(held.view(), "\n").trim(), at))
+
+                val rest = found.rest.trim()
+
+                open = true
+                name = found.name
+                at = start_line + i
+                held = buf()
+
+                if takes_a_subject(found.name)
+                    val word = leading_word(rest)
+
+                    subject = if word.len == 0 then None else Some(word)
+
+                    held.push(rest[word.len..].trim())
+                else
+                    subject = None
+
+                    held.push(rest)
+            None ->
+                if open then held.push(line) else body.push(line)
+
+    if open then tags.push(DocTag(name, subject, join(held.view(), "\n").trim(), at))
+
+    val prose = join(body.view(), "\n").trim()
+
+    Doc(first_sentence(prose), prose, tags, start_line, end_line)
+end parse_doc
+
+// What a line beginning with `@name` says: the name, and everything after the space that follows it.
+struct TagHead
+    name: string
+    rest: string
+end TagHead
+
+// A line that opens a tag, or nothing where it is ordinary prose.
+//
+// **An unrecognized `@name` opens a tag like any other.** sysl's `@` is the annotation sigil, so
+// the vocabulary a generator understands is a question for the generator; what is decided here is
+// only where one paragraph ends and the next begins.
+private tag_start(line: string) -> Option[TagHead]
+    if !line.starts_with("@") then return None
+
+    val b = line.bytes
+    var i: usize = 1
+
+    if i >= b.len || !(is_alpha(b[i]) || b[i] == u8('_')) then return None
+
+    i += 1
+
+    while i < b.len && (is_alnum(b[i]) || b[i] == u8('_'))
+        i += 1
+
+    val name = line[1..<i]
+    var j = i
+
+    while j < b.len && is_space(b[j])
+        j += 1
+
+    Some(TagHead(name, line[j..]))
+end tag_start
+
+// The run of non-whitespace a tag's subject is.
+private leading_word(s: string) -> string
+    val b = s.bytes
+    var i: usize = 0
+
+    while i < b.len && !is_space(b[i])
+        i += 1
+
+    s[0..<i]
+end leading_word
+
+// The first sentence of a paragraph, with its own line breaks flattened away.
+private first_sentence(body: string) -> string
+    val flat = collapse_space(body.trim())
+    val b = flat.bytes
+
+    if b.len == 0 then return ""
+
+    var i: usize = 0
+
+    while i < b.len
+        if b[i] == u8('.') || b[i] == u8('!') || b[i] == u8('?')
+            if i + 1 == b.len || is_space(b[i + 1]) then return flat[0..<(i + 1)]
+
+        i += 1
+
+    flat
+end first_sentence
+
+// Every run of whitespace as one space, which is what a summary read out of wrapped prose wants.
+private collapse_space(s: string) -> string
+    var out = str_builder()
+    var gap = false
+
+    for c in s.chars
+        if is_space_char(c)
+            gap = true
+        else
+            if gap then out.push_char(' ')
+
+            gap = false
+
+            out.push_char(c)
+
+    out.finish()
+end collapse_space
+
+private is_space(b: u8) -> bool =
+    b == u8(' ') || b == u8('\t') || b == u8('\n') || b == u8('\r') || b == 11u8 || b == 12u8
+
+private is_space_char(c: char) -> bool =
+    c == ' ' || c == '\t' || c == '\n' || c == '\r' || u32(c) == 11u32 || u32(c) == 12u32
+
+private is_alpha(b: u8) -> bool =
+    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z'))
+
+private is_alnum(b: u8) -> bool = is_alpha(b) || (b >= u8('0') && b <= u8('9'))

@@ -1,5 +1,9 @@
 module sh.sysl.compiler
 
+import sh.sysl.parsing.source_of
+import sysl.fs.read_text
+import sysl.text.Search
+
 // The driver: what the shell asked for, and what it hears back.
 //
 // **`main` is a few lines that bind the real arguments and the real terminal to `run_cli`**, which
@@ -28,12 +32,53 @@ run_cli(args: []string, say: string -> unit) -> int
         "--help" ->
             say(usage())
             Fine
+        "emit-ast" -> emit_ast_command(args, say)
         other ->
             say(s"sysl: `${other}` is not a command this compiler can carry out yet")
             say(usage())
             Misused
 
-usage() -> string = "usage: sysl --version | --help"
+// `sysl emit-ast [--no-spans] <file>` -- one file's untyped parse tree, written out as deterministic
+// text.
+//
+// **It exists so that two compilers can be diffed rather than compared by hand.** The reference
+// compiler answers the same command line with the same tree in the same notation, so agreement
+// between them is one `diff` over whatever corpus is to hand, and a disagreement names the node.
+// Nothing is analyzed: this stops where the parser does.
+private emit_ast_command(args: []string, say: string -> unit) -> int
+    var spans = true
+    var file = ""
+
+    for i in 2..<args.len
+        if args[i] == "--no-spans"
+            spans = false
+        else
+            file = args[i]
+
+    if file == ""
+        say("usage: sysl emit-ast [--no-spans] <file>")
+        return Misused
+
+    read_text(file) match
+        Err(_) ->
+            say(s"sysl: '${file}' cannot be read")
+            Failed
+        Ok(text) ->
+            val parsed = parse(source_of(file, text))
+
+            if !parsed.ok()
+                say(s"${file}:${parsed.at()}: ${parsed.first().message}")
+                return Failed
+
+            // Every node's line ends in a newline of its own, and `say` ends the line it is given,
+            // so the last one is dropped rather than written twice.
+            val text = emit_ast(parsed.program, spans)
+
+            say(if text.ends_with("\n") then text[0..<(text.len - 1)] else text)
+            Fine
+end emit_ast_command
+
+usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <file>"
 
 main(args: []string)
     val code = run_cli(args, line -> print(line))

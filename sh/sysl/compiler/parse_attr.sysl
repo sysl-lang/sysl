@@ -422,7 +422,7 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
     // and between them they are what a binding may carry.
     if p.at_kw("val") || p.at_kw("var") || p.at_kw("static")
         refuse_unless(p, at, attrs, "binding")
-        return placed(parse_stmt_at(p, false), attrs)
+        return placed(p, parse_stmt_at(p, false), attrs)
     end if
 
     // `@needs(...)` is the one annotation an `extern` takes -- it is the declaration the annotation
@@ -581,7 +581,7 @@ end laid_out
 
 // `@align(n)` and `@section("...")` folded onto whichever binding they were written above, reaching
 // through the `static` wrapper to the declaration inside it.
-private placed(s: Stmt, attrs: Buf[Attr]) -> Stmt
+private placed(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
     var align: Option[Expr] = None
     var section: Option[string] = None
 
@@ -594,6 +594,29 @@ private placed(s: Stmt, attrs: Buf[Attr]) -> Stmt
     *s.kind match
         ValDecl(n, t, v, vis, _, _) -> stmt(s.span, ValDecl(n, t, v, vis, align, section))
         VarDecl(n, t, v, vis, _, _) -> stmt(s.span, VarDecl(n, t, v, vis, align, section))
-        StaticDecl(inner) -> stmt(s.span, StaticDecl(placed(inner, attrs)))
+        StaticDecl(inner) -> stmt(s.span, StaticDecl(placed(p, inner, attrs)))
+
+        // **Both annotations are about one object**, so a binding that names several has nothing for
+        // them to be about. The refusal names the annotation rather than the binding, since the
+        // annotation is the half that has to go.
+        MultiDecl(_, _, _) -> refuse_several(p, s, attrs)
+        PatternDecl(_, _, _) -> refuse_several(p, s, attrs)
         _ -> s
 end placed
+
+private refuse_several(p: *Parser, s: Stmt, attrs: Buf[Attr]) -> Stmt
+    for i in 0..<attrs.len()
+        val word = attr_word(attrs.at(i))
+
+        if word == "align" || word == "section"
+            var about = "'@section(\"...\")' places one object"
+
+            if word == "align"
+                about = "'@align(n)' is the boundary one object's storage begins on"
+
+            p.fault(Span(s.span.end, s.span.end), s"${about}, and a binding that names several has " +
+                "no one object for it to be about \u{2014} declare them on lines of their own")
+            return s
+
+    s
+end refuse_several

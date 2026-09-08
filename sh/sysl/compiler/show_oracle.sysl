@@ -1,0 +1,1536 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.slices.binary_search
+import sysl.text.{chars_of, str_builder, StrBuilder}
+
+// The untyped parse tree, written out as deterministic, human-readable text -- `sysl emit-ast`'s
+// whole job, and the one thing this compiler and the reference compiler can be diffed on.
+//
+// **Why a second printer.** `show.sysl` prints `(+ 1 (* 2 3))`, which is what a test asserting a
+// shape wants to read and is deliberately lossy: it says nothing about a default's visibility or an
+// empty bound map. What a *differential* proof needs is the opposite -- every field of every node,
+// in a form two programs written in two languages can be made to agree on byte for byte.
+//
+// **The format is the reference compiler's, and every decision in it is theirs rather than ours.**
+// Every node is one line -- its type name, then its span where spans are wanted -- and every field
+// of that node is a line under it, indented two spaces deeper, `fieldName: value`:
+//
+//     Program
+//       body:
+//         - ExprStmt 3:1-3:14
+//             expr: Call 3:1-3:14
+//               callee: Ident 3:1-3:6
+//                 name: "print"
+//
+// So the field names are **the reference compiler's spellings** -- `retType`, `thenBody`,
+// `readOnly` -- rather than this tree's own, and where the two trees hold a thing differently the
+// printer converts: an integer literal is kept here as its digits and its base and is printed as
+// the value those name, and a bound list keyed by type-parameter name is printed as a map, sorted,
+// because neither program has any reason to reproduce the other's iteration order.
+//
+// A field's value is one of: a quoted string, a number, `true`/`false`, `None` for an absent
+// option, `[]` or an inline `[a, b]` where every element is a scalar, a block of `- ` items where
+// they are nodes, `{}` or a block of `"key": value` entries for a map.
+
+// What one printing needs to know: whether spans are wanted, and enough of the source to turn a
+// byte offset into the line and column a person counts.
+//
+// **The source is held as two slices rather than as a `Source`**, because this is threaded through
+// every node of the walk and a struct holding a `Buf` is copied at each hop.
+struct AstFmt
+    spans: bool
+    bytes: []const u8
+    starts: []const usize
+end AstFmt
+
+// One file's parse, printed. `spans` is false for `sysl emit-ast --no-spans`: a tree with no
+// positions in it diffs cleanly across an edit that only moves lines around, which is what a parser
+// under construction spends most of its time doing.
+emit_ast(p: Program, spans: bool) -> string
+    var out = str_builder()
+    var f = AstFmt(spans, p.src.bytes, p.src.starts.view())
+
+    emit_program(&out, &f, p, "")
+    out.finish()
+end emit_ast
+
+// -- the pieces every node is written out of -------------------------------------------------
+
+// A node's header: its name, the span where one is wanted, and the newline that ends the line.
+private head(out: *StrBuilder, f: *AstFmt, tag: string, at: Span, positioned: bool)
+    out.push(tag)
+
+    if f.spans && positioned
+        val (line, col) = loc_of(f, at.start)
+        val (eline, ecol) = loc_of(f, at.end)
+
+        out.push_char(' ')
+        out.push_uint(ulong(line))
+        out.push_char(':')
+        out.push_uint(ulong(col))
+        out.push_char('-')
+        out.push_uint(ulong(eline))
+        out.push_char(':')
+        out.push_uint(ulong(ecol))
+
+    out.push_char('\n')
+end head
+
+// A node with no position of its own, which is every pattern and the file itself.
+private head_bare(out: *StrBuilder, tag: string)
+    out.push(tag)
+    out.push_char('\n')
+
+// The start of one field's line: the indentation, the name, and the separator. The trailing space
+// is part of the format and stays even where the value opens a block of its own.
+private fld(out: *StrBuilder, ind: string, name: string)
+    out.push(ind)
+    out.push(name)
+    out.push(": ")
+
+// Which line and column an offset falls on, counted from one.
+private loc_of(f: *AstFmt, offset: usize) -> (usize, usize)
+    val at = if offset > f.bytes.len then f.bytes.len else offset
+    val (found, i) = binary_search(f.starts, at)
+    val line = if found then i else i - 1
+    val start = f.starts[line]
+
+    (line + 1, chars_of(f.bytes[start..<at]).count() + 1)
+end loc_of
+
+// A double-quoted string with control characters, quotes and backslashes escaped, so that no
+// field's value can introduce a raw newline into what is otherwise one node per line.
+private quoted(out: *StrBuilder, s: string)
+    out.push_char('"')
+
+    for c in s.chars
+        if c == '"'
+            out.push("\\\"")
+        else if c == '\\'
+            out.push("\\\\")
+        else if c == '\n'
+            out.push("\\n")
+        else if c == '\r'
+            out.push("\\r")
+        else if c == '\t'
+            out.push("\\t")
+        else if u32(c) < 32u32
+            out.push("\\u")
+            hex4(out, u32(c))
+        else
+            out.push_char(c)
+
+    out.push_char('"')
+end quoted
+
+private hex4(out: *StrBuilder, n: u32)
+    out.push_char(hex_digit((n / 4096u32) % 16u32))
+    out.push_char(hex_digit((n / 256u32) % 16u32))
+    out.push_char(hex_digit((n / 16u32) % 16u32))
+    out.push_char(hex_digit(n % 16u32))
+
+private hex_digit(n: u32) -> char =
+    if n < 10u32 then char(u32('0') + n) else char(u32('a') + n - 10u32)
+
+// -- scalar values ---------------------------------------------------------------------------
+
+private text_val(out: *StrBuilder, s: string)
+    quoted(out, s)
+    out.push_char('\n')
+
+private opt_text_val(out: *StrBuilder, o: Option[string])
+    o match
+        None -> out.push("None\n")
+        Some(s) -> text_val(out, s)
+
+private bool_val(out: *StrBuilder, b: bool)
+    out.push(if b then "true" else "false")
+    out.push_char('\n')
+
+private num_val(out: *StrBuilder, n: usize)
+    out.push_uint(ulong(n))
+    out.push_char('\n')
+
+// A list of names, inline, because every element of it is a scalar.
+private texts_val(out: *StrBuilder, xs: Buf[string])
+    out.push_char('[')
+
+    for i in 0..<xs.len()
+        if i > 0 then out.push(", ")
+
+        quoted(out, xs.at(i))
+
+    out.push("]\n")
+
+private opt_texts_val(out: *StrBuilder, o: Option[Buf[string]])
+    o match
+        None -> out.push("None\n")
+        Some(xs) -> texts_val(out, xs)
+
+// The same, sorted: a set of names carries no order, and alphabetical is the one ordering two
+// implementations arrive at without having read each other.
+private sorted_texts_val(out: *StrBuilder, xs: Buf[string])
+    val order = order_of(xs)
+
+    out.push_char('[')
+
+    for i in 0..<order.len()
+        if i > 0 then out.push(", ")
+
+        quoted(out, xs.at(order.at(i)))
+
+    out.push("]\n")
+
+// The indices of a list of names, in alphabetical order. An insertion sort, because the lists are
+// a type parameter's worth long.
+private order_of(names: Buf[string]) -> Buf[usize]
+    var order: Buf[usize] = buf()
+
+    for i in 0..<names.len()
+        order.push(i)
+
+    for i in 1..<order.len()
+        var j = i
+
+        while j > 0 && names.at(order.at(j)) < names.at(order.at(j - 1))
+            val held = order.at(j)
+
+            order.set(j, order.at(j - 1))
+            order.set(j - 1, held)
+
+            j -= 1
+
+    order
+end order_of
+
+// -- lists of nodes --------------------------------------------------------------------------
+
+// A list whose elements are nodes: a block of `- ` items, one per element, or `[]` where empty.
+private list_val[T](out: *StrBuilder, f: *AstFmt, xs: Buf[T], ind: string,
+                    each: (*StrBuilder, *AstFmt, T, string) -> unit)
+    if xs.is_empty()
+        out.push("[]\n")
+        return
+
+    out.push_char('\n')
+
+    val kid = ind + "  "
+    val inner = kid + "  "
+
+    for i in 0..<xs.len()
+        out.push(kid)
+        out.push("- ")
+        each(out, f, xs.at(i), inner)
+end list_val
+
+private opt_list_val[T](out: *StrBuilder, f: *AstFmt, o: Option[Buf[T]], ind: string,
+                        each: (*StrBuilder, *AstFmt, T, string) -> unit)
+    o match
+        None -> out.push("None\n")
+        Some(xs) -> list_val(out, f, xs, ind, each)
+
+private opt_node_val[T](out: *StrBuilder, f: *AstFmt, o: Option[T], ind: string,
+                        each: (*StrBuilder, *AstFmt, T, string) -> unit)
+    o match
+        None -> out.push("None\n")
+        Some(x) -> each(out, f, x, ind)
+
+// -- the two maps -----------------------------------------------------------------------------
+
+// `bounds`: what a declaration asks of each of its type parameters, keyed by the parameter's name.
+private bounds_map_val(out: *StrBuilder, f: *AstFmt, xs: Buf[NamedBounds], ind: string)
+    if xs.is_empty()
+        out.push("{}\n")
+        return
+
+    out.push_char('\n')
+
+    var names: Buf[string] = buf()
+
+    for i in 0..<xs.len()
+        names.push(xs.at(i).name)
+
+    val order = order_of(names)
+    val kid = ind + "  "
+
+    for i in 0..<order.len()
+        val one = xs.at(order.at(i))
+
+        out.push(kid)
+        quoted(out, one.name)
+        out.push(": ")
+        list_val(out, f, one.bounds, kid, emit_bound)
+end bounds_map_val
+
+// `tdefaults` and `tvalues`: one type per parameter name.
+private types_map_val(out: *StrBuilder, f: *AstFmt, xs: Buf[TypeBinding], ind: string)
+    if xs.is_empty()
+        out.push("{}\n")
+        return
+
+    out.push_char('\n')
+
+    var names: Buf[string] = buf()
+
+    for i in 0..<xs.len()
+        names.push(xs.at(i).name)
+
+    val order = order_of(names)
+    val kid = ind + "  "
+
+    for i in 0..<order.len()
+        val one = xs.at(order.at(i))
+
+        out.push(kid)
+        quoted(out, one.name)
+        out.push(": ")
+        emit_type(out, f, one.typ, kid)
+end types_map_val
+
+// -- the file ----------------------------------------------------------------------------------
+
+private emit_program(out: *StrBuilder, f: *AstFmt, p: Program, ind: string)
+    val kid = ind + "  "
+
+    head_bare(out, "Program")
+
+    fld(out, kid, "body")
+    list_val(out, f, p.body, kid, emit_stmt)
+    fld(out, kid, "module")
+    opt_node_val(out, f, p.module_name, kid, emit_module_name)
+    fld(out, kid, "capabilities")
+    list_val(out, f, p.capabilities, kid, emit_capability)
+    fld(out, kid, "links")
+    list_val(out, f, p.links, kid, emit_link)
+    fld(out, kid, "source")
+    out.push(p.src.name)
+    out.push_char('\n')
+    fld(out, kid, "testOnly")
+    bool_val(out, p.test_only)
+    fld(out, kid, "includes")
+    list_val(out, f, p.includes, kid, emit_include)
+    fld(out, kid, "docs")
+    list_val(out, f, p.docs, kid, emit_doc)
+end emit_program
+
+private emit_module_name(out: *StrBuilder, f: *AstFmt, m: ModuleName, ind: string)
+    head(out, f, "ModuleName", m.span, true)
+    fld(out, ind + "  ", "parts")
+    texts_val(out, m.parts)
+
+private emit_capability(out: *StrBuilder, f: *AstFmt, c: CapabilityClause, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "CapabilityClause", c.span, true)
+    fld(out, kid, "direction")
+    head_bare(out, c.direction match
+        Narrows -> "Narrows"
+        Requires -> "Requires")
+    fld(out, kid, "name")
+    text_val(out, c.name)
+end emit_capability
+
+private emit_link(out: *StrBuilder, f: *AstFmt, c: LinkClause, ind: string)
+    head(out, f, "LinkClause", c.span, true)
+    fld(out, ind + "  ", "name")
+    text_val(out, c.name)
+
+private emit_include(out: *StrBuilder, f: *AstFmt, c: IncludeClause, ind: string)
+    head(out, f, "IncludeClause", c.span, true)
+    fld(out, ind + "  ", "header")
+    text_val(out, c.header)
+
+private emit_doc(out: *StrBuilder, f: *AstFmt, d: Doc, ind: string)
+    val kid = ind + "  "
+
+    head_bare(out, "Doc")
+    fld(out, kid, "summary")
+    text_val(out, d.summary)
+    fld(out, kid, "body")
+    text_val(out, d.body)
+    fld(out, kid, "tags")
+    list_val(out, f, d.tags, kid, emit_doc_tag)
+    fld(out, kid, "startLine")
+    num_val(out, d.start_line)
+    fld(out, kid, "endLine")
+    num_val(out, d.end_line)
+end emit_doc
+
+private emit_doc_tag(out: *StrBuilder, f: *AstFmt, t: DocTag, ind: string)
+    val kid = ind + "  "
+
+    head_bare(out, "Tag")
+    fld(out, kid, "name")
+    text_val(out, t.name)
+    fld(out, kid, "subject")
+    opt_text_val(out, t.subject)
+    fld(out, kid, "text")
+    text_val(out, t.text)
+    fld(out, kid, "line")
+    num_val(out, t.line)
+end emit_doc_tag
+
+// -- the shared leaves ---------------------------------------------------------------------------
+
+private emit_vis(out: *StrBuilder, v: Visibility, ind: string)
+    v match
+        Public -> head_bare(out, "Public")
+        File -> head_bare(out, "File")
+        Scoped(name) ->
+            head_bare(out, "Scoped")
+            fld(out, ind + "  ", "module")
+            text_val(out, name)
+
+private emit_bound(out: *StrBuilder, f: *AstFmt, b: BoundRef, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "BoundRef", b.span, true)
+    fld(out, kid, "name")
+    text_val(out, b.name)
+    fld(out, kid, "args")
+    list_val(out, f, b.args, kid, emit_type)
+end emit_bound
+
+private emit_param(out: *StrBuilder, f: *AstFmt, p: Param, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "Param", p.span, true)
+    fld(out, kid, "name")
+    text_val(out, p.name)
+    fld(out, kid, "typ")
+    emit_type(out, f, p.typ, kid)
+    fld(out, kid, "vis")
+    emit_vis(out, p.vis, kid)
+    fld(out, kid, "default")
+    opt_node_val(out, f, p.default, kid, emit_expr)
+    fld(out, kid, "byName")
+    bool_val(out, p.by_name)
+    fld(out, kid, "rest")
+    bool_val(out, p.rest)
+end emit_param
+
+private emit_lambda_param(out: *StrBuilder, f: *AstFmt, p: LambdaParam, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "LambdaParam", p.span, true)
+    fld(out, kid, "name")
+    text_val(out, p.name)
+    fld(out, kid, "typ")
+    opt_node_val(out, f, p.typ, kid, emit_type)
+end emit_lambda_param
+
+private emit_with_field(out: *StrBuilder, f: *AstFmt, w: WithField, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "WithField", w.span, true)
+    fld(out, kid, "name")
+    text_val(out, w.name)
+    fld(out, kid, "value")
+    emit_expr(out, f, w.value, kid)
+end emit_with_field
+
+private emit_match_arm(out: *StrBuilder, f: *AstFmt, a: MatchArm, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "MatchArm", a.span, true)
+    fld(out, kid, "patterns")
+    list_val(out, f, a.patterns, kid, emit_pattern)
+    fld(out, kid, "guard")
+    opt_node_val(out, f, a.guard, kid, emit_expr)
+    fld(out, kid, "body")
+    list_val(out, f, a.body, kid, emit_stmt)
+end emit_match_arm
+
+private emit_import_selector(out: *StrBuilder, f: *AstFmt, s: ImportSelector, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "ImportSelector", s.span, true)
+    fld(out, kid, "name")
+    text_val(out, s.name)
+    fld(out, kid, "alias")
+    opt_text_val(out, s.alias)
+end emit_import_selector
+
+private emit_cconst(out: *StrBuilder, f: *AstFmt, c: CConstDecl, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "CConstDecl", c.span, true)
+    fld(out, kid, "name")
+    text_val(out, c.name)
+    fld(out, kid, "typ")
+    emit_type(out, f, c.typ, kid)
+    fld(out, kid, "c")
+    text_val(out, c.c)
+    fld(out, kid, "vis")
+    emit_vis(out, c.vis, kid)
+end emit_cconst
+
+private emit_ctype(out: *StrBuilder, f: *AstFmt, c: CTypeDecl, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "CTypeDecl", c.span, true)
+    fld(out, kid, "name")
+    text_val(out, c.name)
+    fld(out, kid, "c")
+    text_val(out, c.c)
+    fld(out, kid, "vis")
+    emit_vis(out, c.vis, kid)
+end emit_ctype
+
+private emit_asm_arm(out: *StrBuilder, f: *AstFmt, a: AsmArm, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "AsmArm", a.span, true)
+    fld(out, kid, "archs")
+    texts_val(out, a.archs)
+    fld(out, kid, "body")
+
+    a.body match
+        AsmCode(lines, operands, clobbers) ->
+            val inner = kid + "  "
+
+            head_bare(out, "AsmCode")
+            fld(out, inner, "lines")
+            texts_val(out, lines)
+            fld(out, inner, "operands")
+            list_val(out, f, operands, inner, emit_asm_operand)
+            fld(out, inner, "clobbers")
+            texts_val(out, clobbers)
+        AsmUnavailable(reason) ->
+            head_bare(out, "AsmUnavailable")
+            fld(out, kid + "  ", "reason")
+            text_val(out, reason)
+end emit_asm_arm
+
+private emit_asm_operand(out: *StrBuilder, f: *AstFmt, o: AsmOperand, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "AsmOperand", o.span, true)
+    fld(out, kid, "dir")
+    head_bare(out, o.dir match
+        In -> "In"
+        Out -> "Out")
+    fld(out, kid, "name")
+    text_val(out, o.name)
+    fld(out, kid, "reg")
+    opt_text_val(out, o.reg)
+end emit_asm_operand
+
+private emit_enum_variant(out: *StrBuilder, f: *AstFmt, v: EnumVariantDecl, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "EnumVariantDecl", v.span, true)
+    fld(out, kid, "name")
+    text_val(out, v.name)
+    fld(out, kid, "value")
+    opt_node_val(out, f, v.value, kid, emit_expr)
+    fld(out, kid, "fields")
+    list_val(out, f, v.fields, kid, emit_param)
+end emit_enum_variant
+
+private emit_range_bound(out: *StrBuilder, f: *AstFmt, r: RangeBound, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "RangeBound", r.span, true)
+    fld(out, kid, "lo")
+    emit_expr(out, f, r.lo, kid)
+    fld(out, kid, "hi")
+    emit_expr(out, f, r.hi, kid)
+    fld(out, kid, "exclusiveHi")
+    bool_val(out, r.exclusive_hi)
+end emit_range_bound
+
+private emit_assoc_decl(out: *StrBuilder, f: *AstFmt, a: AssocDecl, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "AssocDecl", a.span, true)
+    fld(out, kid, "name")
+    text_val(out, a.name)
+    fld(out, kid, "bounds")
+    list_val(out, f, a.bounds, kid, emit_bound)
+end emit_assoc_decl
+
+private emit_assoc_bind(out: *StrBuilder, f: *AstFmt, a: AssocBind, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "AssocBind", a.span, true)
+    fld(out, kid, "name")
+    text_val(out, a.name)
+    fld(out, kid, "typ")
+    emit_type(out, f, a.typ, kid)
+end emit_assoc_bind
+
+private emit_export_attr(out: *StrBuilder, f: *AstFmt, a: ExportAttr, ind: string)
+    head(out, f, "ExportAttr", a.span, true)
+    fld(out, ind + "  ", "symbol")
+    opt_text_val(out, a.symbol)
+
+private emit_test_attr(out: *StrBuilder, f: *AstFmt, a: TestAttr, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "TestAttr", a.span, true)
+    fld(out, kid, "display")
+    opt_text_val(out, a.display)
+    fld(out, kid, "shouldTrap")
+    bool_val(out, a.should_trap)
+    fld(out, kid, "expected")
+    opt_text_val(out, a.expected)
+end emit_test_attr
+
+private emit_hook_attr(out: *StrBuilder, f: *AstFmt, a: HookAttr, ind: string)
+    head(out, f, "HookAttr", a.span, true)
+    fld(out, ind + "  ", "kind")
+    head_bare(out, a.kind match
+        Setup -> "Setup"
+        Teardown -> "Teardown"
+        SetupAll -> "SetupAll"
+        TeardownAll -> "TeardownAll")
+
+private emit_call_conv(out: *StrBuilder, f: *AstFmt, c: CallConv, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "CallConv", c.span, true)
+    fld(out, kid, "name")
+    text_val(out, c.name)
+    fld(out, kid, "arg")
+    opt_text_val(out, c.arg)
+end emit_call_conv
+
+private emit_recv_mode(out: *StrBuilder, m: RecvMode, ind: string)
+    m match
+        ByValue -> head_bare(out, "ByValue")
+        ByPtr -> head_bare(out, "ByPtr")
+        ByRef(sync) ->
+            head_bare(out, "ByRef")
+            fld(out, ind + "  ", "sync")
+            bool_val(out, sync)
+
+// -- types ---------------------------------------------------------------------------------------
+
+private emit_type(out: *StrBuilder, f: *AstFmt, t: TypeRef, ind: string)
+    val kid = ind + "  "
+
+    *t.kind match
+        NamedType(name, args) ->
+            head(out, f, "NamedType", t.span, true)
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "args")
+            list_val(out, f, args, kid, emit_type)
+        ValueArgType(value) ->
+            head(out, f, "ValueArgType", t.span, true)
+            fld(out, kid, "value")
+            emit_expr(out, f, value, kid)
+        PtrType(inner) ->
+            head(out, f, "PtrType", t.span, true)
+            fld(out, kid, "inner")
+            emit_type(out, f, inner, kid)
+        RefType(inner, sync) ->
+            head(out, f, "RefType", t.span, true)
+            fld(out, kid, "inner")
+            emit_type(out, f, inner, kid)
+            fld(out, kid, "sync")
+            bool_val(out, sync)
+        WeakType(inner) ->
+            head(out, f, "WeakType", t.span, true)
+            fld(out, kid, "inner")
+            emit_type(out, f, inner, kid)
+        ArrayType(length, elem, read_only) ->
+            head(out, f, "ArrayType", t.span, true)
+            fld(out, kid, "length")
+            opt_node_val(out, f, length, kid, emit_expr)
+            fld(out, kid, "elem")
+            emit_type(out, f, elem, kid)
+            fld(out, kid, "readOnly")
+            bool_val(out, read_only)
+        VectorType(lanes, elem) ->
+            head(out, f, "VectorType", t.span, true)
+            fld(out, kid, "lanes")
+            emit_expr(out, f, lanes, kid)
+            fld(out, kid, "elem")
+            emit_type(out, f, elem, kid)
+        VolatileType(inner) ->
+            head(out, f, "VolatileType", t.span, true)
+            fld(out, kid, "inner")
+            emit_type(out, f, inner, kid)
+        TupleType(parts, results) ->
+            head(out, f, "TupleType", t.span, true)
+            fld(out, kid, "parts")
+            list_val(out, f, parts, kid, emit_type)
+            fld(out, kid, "results")
+            bool_val(out, results)
+        PackType(name) ->
+            head(out, f, "PackType", t.span, true)
+            fld(out, kid, "name")
+            text_val(out, name)
+        FnType(params, ret, bare) ->
+            head(out, f, "FnType", t.span, true)
+            fld(out, kid, "params")
+            list_val(out, f, params, kid, emit_type)
+            fld(out, kid, "ret")
+            emit_type(out, f, ret, kid)
+            fld(out, kid, "bare")
+            bool_val(out, bare)
+        CFnType(params, ret) ->
+            head(out, f, "CFnType", t.span, true)
+            fld(out, kid, "params")
+            list_val(out, f, params, kid, emit_type)
+            fld(out, kid, "ret")
+            emit_type(out, f, ret, kid)
+        AssocType(base, member) ->
+            head(out, f, "AssocType", t.span, true)
+            fld(out, kid, "base")
+            emit_type(out, f, base, kid)
+            fld(out, kid, "member")
+            text_val(out, member)
+        AssocArgType(name, typ) ->
+            head(out, f, "AssocArgType", t.span, true)
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "typ")
+            emit_type(out, f, typ, kid)
+        SomeType(bounds) ->
+            head(out, f, "SomeType", t.span, true)
+            fld(out, kid, "bounds")
+            list_val(out, f, bounds, kid, emit_bound)
+end emit_type
+
+// -- patterns --------------------------------------------------------------------------------
+
+// **A pattern carries no position**, so none of these prints a span: a pattern is complained about
+// at the `MatchArm` or the `is` that holds it.
+private emit_pattern(out: *StrBuilder, f: *AstFmt, p: Pattern, ind: string)
+    val kid = ind + "  "
+
+    *p.kind match
+        LitPattern(value) ->
+            head_bare(out, "LitPattern")
+            fld(out, kid, "value")
+            emit_expr(out, f, value, kid)
+        RangePattern(lo, hi, inclusive) ->
+            head_bare(out, "RangePattern")
+            fld(out, kid, "lo")
+            emit_expr(out, f, lo, kid)
+            fld(out, kid, "hi")
+            emit_expr(out, f, hi, kid)
+            fld(out, kid, "inclusive")
+            bool_val(out, inclusive)
+        WildcardPattern -> head_bare(out, "WildcardPattern")
+        IdentPattern(name) ->
+            head_bare(out, "IdentPattern")
+            fld(out, kid, "name")
+            text_val(out, name)
+        EqPattern(name) ->
+            head_bare(out, "EqPattern")
+            fld(out, kid, "name")
+            text_val(out, name)
+        VariantPattern(name, args) ->
+            head_bare(out, "VariantPattern")
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "args")
+            list_val(out, f, args, kid, emit_pattern)
+        StructPattern(name, fields) ->
+            head_bare(out, "StructPattern")
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "fields")
+            emit_field_patterns(out, f, fields, kid)
+        TuplePattern(args) ->
+            head_bare(out, "TuplePattern")
+            fld(out, kid, "args")
+            list_val(out, f, args, kid, emit_pattern)
+        BindPattern(name, inner) ->
+            head_bare(out, "BindPattern")
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "inner")
+            emit_pattern(out, f, inner, kid)
+end emit_pattern
+
+// A struct pattern's fields are the one place the tree holds a pair, and a pair prints as
+// `"name" -> value` rather than as a node of its own.
+private emit_field_patterns(out: *StrBuilder, f: *AstFmt, xs: Buf[FieldPattern], ind: string)
+    if xs.is_empty()
+        out.push("[]\n")
+        return
+
+    out.push_char('\n')
+
+    val kid = ind + "  "
+    val inner = kid + "  "
+
+    for i in 0..<xs.len()
+        val one = xs.at(i)
+
+        out.push(kid)
+        out.push("- ")
+        quoted(out, one.name)
+        out.push(" -> ")
+        emit_pattern(out, f, one.pat, inner)
+end emit_field_patterns
+
+// -- expressions -------------------------------------------------------------------------------
+
+private emit_expr(out: *StrBuilder, f: *AstFmt, e: Expr, ind: string)
+    val kid = ind + "  "
+
+    *e.kind match
+        IntLit(digits, base, suffix) ->
+            head(out, f, "IntLit", e.span, true)
+            fld(out, kid, "value")
+            out.push(decimal_of(digits, base))
+            out.push_char('\n')
+            fld(out, kid, "suffix")
+            opt_text_val(out, if suffix == "" then None else Some(suffix))
+        FloatLit(text, suffix) ->
+            head(out, f, "FloatLit", e.span, true)
+            fld(out, kid, "text")
+            text_val(out, text)
+            fld(out, kid, "suffix")
+            opt_text_val(out, if suffix == "" then None else Some(suffix))
+        CharLit(codepoint) ->
+            head(out, f, "CharLit", e.span, true)
+            fld(out, kid, "codepoint")
+            emit_codepoint(out, codepoint)
+        StrLit(value) ->
+            head(out, f, "StrLit", e.span, true)
+            fld(out, kid, "value")
+            text_val(out, value)
+        CStrLit(value) ->
+            head(out, f, "CStrLit", e.span, true)
+            fld(out, kid, "value")
+            text_val(out, value)
+        BoolLit(value) ->
+            head(out, f, "BoolLit", e.span, true)
+            fld(out, kid, "value")
+            bool_val(out, value)
+        UnitLit -> head(out, f, "UnitLit", e.span, true)
+        NullLit -> head(out, f, "NullLit", e.span, true)
+        Ident(name) ->
+            head(out, f, "Ident", e.span, true)
+            fld(out, kid, "name")
+            text_val(out, name)
+        Unary(op, operand) ->
+            head(out, f, "Unary", e.span, true)
+            fld(out, kid, "op")
+            text_val(out, op)
+            fld(out, kid, "operand")
+            emit_expr(out, f, operand, kid)
+        PreIncDec(op, operand) ->
+            head(out, f, "PreIncDec", e.span, true)
+            fld(out, kid, "op")
+            text_val(out, op)
+            fld(out, kid, "operand")
+            emit_expr(out, f, operand, kid)
+        PostIncDec(op, operand) ->
+            head(out, f, "PostIncDec", e.span, true)
+            fld(out, kid, "op")
+            text_val(out, op)
+            fld(out, kid, "operand")
+            emit_expr(out, f, operand, kid)
+        Binary(op, left, right) ->
+            head(out, f, "Binary", e.span, true)
+            fld(out, kid, "op")
+            text_val(out, op)
+            fld(out, kid, "left")
+            emit_expr(out, f, left, kid)
+            fld(out, kid, "right")
+            emit_expr(out, f, right, kid)
+        Compare(operands, ops) ->
+            head(out, f, "Compare", e.span, true)
+            fld(out, kid, "operands")
+            list_val(out, f, operands, kid, emit_expr)
+            fld(out, kid, "ops")
+            texts_val(out, ops)
+        RangeExpr(lo, hi, inclusive) ->
+            head(out, f, "RangeExpr", e.span, true)
+            fld(out, kid, "lo")
+            opt_node_val(out, f, lo, kid, emit_expr)
+            fld(out, kid, "hi")
+            opt_node_val(out, f, hi, kid, emit_expr)
+            fld(out, kid, "inclusive")
+            bool_val(out, inclusive)
+        Assign(op, target, value) ->
+            head(out, f, "Assign", e.span, true)
+            fld(out, kid, "op")
+            text_val(out, op)
+            fld(out, kid, "target")
+            emit_expr(out, f, target, kid)
+            fld(out, kid, "value")
+            emit_expr(out, f, value, kid)
+        Call(callee, args) ->
+            head(out, f, "Call", e.span, true)
+            fld(out, kid, "callee")
+            emit_expr(out, f, callee, kid)
+            fld(out, kid, "args")
+            list_val(out, f, args, kid, emit_expr)
+        NamedArg(name, value) ->
+            head(out, f, "NamedArg", e.span, true)
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "value")
+            emit_expr(out, f, value, kid)
+        Spread(value) ->
+            head(out, f, "Spread", e.span, true)
+            fld(out, kid, "value")
+            emit_expr(out, f, value, kid)
+        DefaultArg(owner, value) ->
+            head(out, f, "DefaultArg", e.span, true)
+            fld(out, kid, "owner")
+            opt_text_val(out, owner)
+            fld(out, kid, "value")
+            emit_expr(out, f, value, kid)
+        Index(receiver, index) ->
+            head(out, f, "Index", e.span, true)
+            fld(out, kid, "receiver")
+            emit_expr(out, f, receiver, kid)
+            fld(out, kid, "index")
+            emit_expr(out, f, index, kid)
+        Field(receiver, name) ->
+            head(out, f, "Field", e.span, true)
+            fld(out, kid, "receiver")
+            emit_expr(out, f, receiver, kid)
+            fld(out, kid, "name")
+            text_val(out, name)
+        TypeArgs(receiver, args) ->
+            head(out, f, "TypeArgs", e.span, true)
+            fld(out, kid, "receiver")
+            emit_expr(out, f, receiver, kid)
+            fld(out, kid, "args")
+            list_val(out, f, args, kid, emit_expr)
+        TypeAttr(receiver, attr) ->
+            head(out, f, "TypeAttr", e.span, true)
+            fld(out, kid, "receiver")
+            emit_expr(out, f, receiver, kid)
+            fld(out, kid, "attr")
+            text_val(out, attr)
+        WithExpr(base, fields) ->
+            head(out, f, "WithExpr", e.span, true)
+            fld(out, kid, "base")
+            emit_expr(out, f, base, kid)
+            fld(out, kid, "fields")
+            list_val(out, f, fields, kid, emit_with_field)
+        ImplicitMember(name) ->
+            head(out, f, "ImplicitMember", e.span, true)
+            fld(out, kid, "name")
+            text_val(out, name)
+        LayoutOf(op, typ) ->
+            head(out, f, "LayoutOf", e.span, true)
+            fld(out, kid, "op")
+            text_val(out, op)
+            fld(out, kid, "typ")
+            emit_type(out, f, typ, kid)
+        OffsetOf(typ, field) ->
+            head(out, f, "OffsetOf", e.span, true)
+            fld(out, kid, "typ")
+            emit_type(out, f, typ, kid)
+            fld(out, kid, "field")
+            text_val(out, field)
+        TryExpr(inner) ->
+            head(out, f, "TryExpr", e.span, true)
+            fld(out, kid, "expr")
+            emit_expr(out, f, inner, kid)
+        Tuple(elements) ->
+            head(out, f, "Tuple", e.span, true)
+            fld(out, kid, "elements")
+            list_val(out, f, elements, kid, emit_expr)
+        Lambda(params, body, implicit_params) ->
+            head(out, f, "Lambda", e.span, true)
+            fld(out, kid, "params")
+            list_val(out, f, params, kid, emit_lambda_param)
+            fld(out, kid, "body")
+            list_val(out, f, body, kid, emit_stmt)
+            fld(out, kid, "implicitParams")
+            bool_val(out, implicit_params)
+        BlockArg(body) ->
+            head(out, f, "BlockArg", e.span, true)
+            fld(out, kid, "body")
+            list_val(out, f, body, kid, emit_stmt)
+        ArrayLit(elements) ->
+            head(out, f, "ArrayLit", e.span, true)
+            fld(out, kid, "elements")
+            list_val(out, f, elements, kid, emit_expr)
+        ArrayFill(value, count) ->
+            head(out, f, "ArrayFill", e.span, true)
+            fld(out, kid, "value")
+            emit_expr(out, f, value, kid)
+            fld(out, kid, "count")
+            emit_expr(out, f, count, kid)
+        Block(stmts) ->
+            head(out, f, "Block", e.span, true)
+            fld(out, kid, "stmts")
+            list_val(out, f, stmts, kid, emit_stmt)
+        IfExpr(cond, then_body, else_body) ->
+            head(out, f, "IfExpr", e.span, true)
+            fld(out, kid, "cond")
+            emit_expr(out, f, cond, kid)
+            fld(out, kid, "thenBody")
+            list_val(out, f, then_body, kid, emit_stmt)
+            fld(out, kid, "elseBody")
+            opt_list_val(out, f, else_body, kid, emit_stmt)
+        MatchExpr(scrutinee, arms) ->
+            head(out, f, "MatchExpr", e.span, true)
+            fld(out, kid, "scrutinee")
+            emit_expr(out, f, scrutinee, kid)
+            fld(out, kid, "arms")
+            list_val(out, f, arms, kid, emit_match_arm)
+        IsPattern(subject, patterns, negated) ->
+            head(out, f, "IsPattern", e.span, true)
+            fld(out, kid, "subject")
+            emit_expr(out, f, subject, kid)
+            fld(out, kid, "patterns")
+            list_val(out, f, patterns, kid, emit_pattern)
+            fld(out, kid, "negated")
+            bool_val(out, negated)
+        ResultList(values) ->
+            head(out, f, "ResultList", e.span, true)
+            fld(out, kid, "values")
+            list_val(out, f, values, kid, emit_expr)
+        While(label, cond, body, else_body) ->
+            head(out, f, "While", e.span, true)
+            fld(out, kid, "label")
+            opt_text_val(out, label)
+            fld(out, kid, "cond")
+            emit_expr(out, f, cond, kid)
+            fld(out, kid, "body")
+            list_val(out, f, body, kid, emit_stmt)
+            fld(out, kid, "elseBody")
+            opt_list_val(out, f, else_body, kid, emit_stmt)
+        DoWhile(label, body, cond, else_body) ->
+            head(out, f, "DoWhile", e.span, true)
+            fld(out, kid, "label")
+            opt_text_val(out, label)
+            fld(out, kid, "body")
+            list_val(out, f, body, kid, emit_stmt)
+            fld(out, kid, "cond")
+            emit_expr(out, f, cond, kid)
+            fld(out, kid, "elseBody")
+            opt_list_val(out, f, else_body, kid, emit_stmt)
+        Loop(label, body) ->
+            head(out, f, "Loop", e.span, true)
+            fld(out, kid, "label")
+            opt_text_val(out, label)
+            fld(out, kid, "body")
+            list_val(out, f, body, kid, emit_stmt)
+        For(label, name, iter, body, else_body) ->
+            head(out, f, "For", e.span, true)
+            fld(out, kid, "label")
+            opt_text_val(out, label)
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "iter")
+            emit_expr(out, f, iter, kid)
+            fld(out, kid, "body")
+            list_val(out, f, body, kid, emit_stmt)
+            fld(out, kid, "elseBody")
+            opt_list_val(out, f, else_body, kid, emit_stmt)
+        ConstFor(name, iter, body) ->
+            head(out, f, "ConstFor", e.span, true)
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "iter")
+            emit_expr(out, f, iter, kid)
+            fld(out, kid, "body")
+            list_val(out, f, body, kid, emit_stmt)
+        CFor(label, init, cond, step, body, else_body) ->
+            head(out, f, "CFor", e.span, true)
+            fld(out, kid, "label")
+            opt_text_val(out, label)
+            fld(out, kid, "init")
+            opt_node_val(out, f, init, kid, emit_stmt)
+            fld(out, kid, "cond")
+            opt_node_val(out, f, cond, kid, emit_expr)
+            fld(out, kid, "step")
+            opt_node_val(out, f, step, kid, emit_stmt)
+            fld(out, kid, "body")
+            list_val(out, f, body, kid, emit_stmt)
+            fld(out, kid, "elseBody")
+            opt_list_val(out, f, else_body, kid, emit_stmt)
+        Quantifier(universal, name, iter, pred) ->
+            head(out, f, "Quantifier", e.span, true)
+            fld(out, kid, "universal")
+            bool_val(out, universal)
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "iter")
+            emit_expr(out, f, iter, kid)
+            fld(out, kid, "pred")
+            emit_expr(out, f, pred, kid)
+        Bad -> head(out, f, "Bad", e.span, true)
+end emit_expr
+
+// A character literal is the one raw number in the tree that means something other than a count, so
+// it is written by hand: the code point, and the character it names where that is printable.
+private emit_codepoint(out: *StrBuilder, c: char)
+    val n = u32(c)
+
+    out.push_uint(ulong(n))
+
+    if !(n < 32u32 || (n >= 127u32 && n <= 159u32))
+        out.push(" '")
+        out.push_char(c)
+        out.push_char('\'')
+
+    out.push_char('\n')
+end emit_codepoint
+
+// The value an integer literal's digits name, in decimal. The literal is kept as written -- its
+// digits and the base they are in -- and the reference compiler keeps the number, so this is where
+// the two are reconciled.
+//
+// **The conversion is done a decimal digit at a time rather than in a machine word**, because a
+// literal may name a number wider than any integer this compiler has: `0x10000000000000000` is a
+// legal thing to write and no `ulong` holds it. So the answer is built as its own digits, which is
+// the one representation that cannot overflow, and the multiply-and-carry is schoolbook.
+private decimal_of(digits: string, base: int) -> string
+    var value: Buf[u32] = buf()
+
+    for c in digits.chars
+        var carry = digit_value(c)
+
+        for i in 0..<value.len()
+            val at = value.at(i) * u32(base) + carry
+
+            value.set(i, at % 10u32)
+
+            carry = at / 10u32
+
+        while carry > 0u32
+            value.push(carry % 10u32)
+
+            carry = carry / 10u32
+
+    if value.is_empty() then return "0"
+
+    var out = str_builder()
+    var i = value.len()
+
+    while i > 0
+        i -= 1
+
+        out.push_char(char(u32('0') + value.at(i)))
+
+    out.finish()
+end decimal_of
+
+private digit_value(c: char) -> u32
+    val n = u32(c)
+
+    if n >= u32('0') && n <= u32('9') then return n - u32('0')
+    if n >= u32('a') && n <= u32('f') then return n - u32('a') + 10u32
+
+    n - u32('A') + 10u32
+end digit_value
+
+// -- statements and declarations -----------------------------------------------------------------
+
+private emit_stmt(out: *StrBuilder, f: *AstFmt, s: Stmt, ind: string)
+    val kid = ind + "  "
+
+    *s.kind match
+        ImportDecl(d) ->
+            head(out, f, "ImportDecl", s.span, true)
+            fld(out, kid, "path")
+            texts_val(out, d.path)
+            fld(out, kid, "selectors")
+            list_val(out, f, d.selectors, kid, emit_import_selector)
+            fld(out, kid, "wildcard")
+            bool_val(out, d.wildcard)
+            fld(out, kid, "alias")
+            opt_text_val(out, d.alias)
+        VarDecl(name, typ, init, vis, align, section) ->
+            head(out, f, "VarDecl", s.span, true)
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "typ")
+            opt_node_val(out, f, typ, kid, emit_type)
+            fld(out, kid, "init")
+            opt_node_val(out, f, init, kid, emit_expr)
+            fld(out, kid, "vis")
+            emit_vis(out, vis, kid)
+            fld(out, kid, "align")
+            opt_node_val(out, f, align, kid, emit_expr)
+            fld(out, kid, "section")
+            opt_text_val(out, section)
+        ConstDecl(name, typ, value, vis) ->
+            head(out, f, "ConstDecl", s.span, true)
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "typ")
+            emit_type(out, f, typ, kid)
+            fld(out, kid, "value")
+            emit_expr(out, f, value, kid)
+            fld(out, kid, "vis")
+            emit_vis(out, vis, kid)
+        CConstBlock(consts) ->
+            head(out, f, "CConstBlock", s.span, true)
+            fld(out, kid, "consts")
+            list_val(out, f, consts, kid, emit_cconst)
+        CTypeBlock(types) ->
+            head(out, f, "CTypeBlock", s.span, true)
+            fld(out, kid, "types")
+            list_val(out, f, types, kid, emit_ctype)
+        AssertDecl(cond, message) ->
+            head(out, f, "AssertDecl", s.span, true)
+            fld(out, kid, "cond")
+            emit_expr(out, f, cond, kid)
+            fld(out, kid, "message")
+            opt_text_val(out, message)
+        StaticDecl(inner) ->
+            head(out, f, "StaticDecl", s.span, true)
+            fld(out, kid, "inner")
+            emit_stmt(out, f, inner, kid)
+        ValDecl(name, typ, value, vis, align, section) ->
+            head(out, f, "ValDecl", s.span, true)
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "typ")
+            opt_node_val(out, f, typ, kid, emit_type)
+            fld(out, kid, "value")
+            emit_expr(out, f, value, kid)
+            fld(out, kid, "vis")
+            emit_vis(out, vis, kid)
+            fld(out, kid, "align")
+            opt_node_val(out, f, align, kid, emit_expr)
+            fld(out, kid, "section")
+            opt_text_val(out, section)
+        RefDecl(name, place) ->
+            head(out, f, "RefDecl", s.span, true)
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "place")
+            emit_expr(out, f, place, kid)
+        MultiAssign(op, targets, values) ->
+            head(out, f, "MultiAssign", s.span, true)
+            fld(out, kid, "op")
+            text_val(out, op)
+            fld(out, kid, "targets")
+            list_val(out, f, targets, kid, emit_expr)
+            fld(out, kid, "values")
+            list_val(out, f, values, kid, emit_expr)
+        MultiDecl(names, mutable, values) ->
+            head(out, f, "MultiDecl", s.span, true)
+            fld(out, kid, "names")
+            texts_val(out, names)
+            fld(out, kid, "mutable")
+            bool_val(out, mutable)
+            fld(out, kid, "values")
+            list_val(out, f, values, kid, emit_expr)
+        PatternDecl(pat, mutable, value) ->
+            head(out, f, "PatternDecl", s.span, true)
+            fld(out, kid, "pattern")
+            emit_pattern(out, f, pat, kid)
+            fld(out, kid, "mutable")
+            bool_val(out, mutable)
+            fld(out, kid, "value")
+            emit_expr(out, f, value, kid)
+        ExprStmt(inner) ->
+            head(out, f, "ExprStmt", s.span, true)
+            fld(out, kid, "expr")
+            emit_expr(out, f, inner, kid)
+        Return(value) ->
+            head(out, f, "Return", s.span, true)
+            fld(out, kid, "value")
+            opt_node_val(out, f, value, kid, emit_expr)
+        Become(call) ->
+            head(out, f, "Become", s.span, true)
+            fld(out, kid, "call")
+            emit_expr(out, f, call, kid)
+        Break(label, value) ->
+            head(out, f, "Break", s.span, true)
+            fld(out, kid, "label")
+            opt_text_val(out, label)
+            fld(out, kid, "value")
+            opt_node_val(out, f, value, kid, emit_expr)
+        Continue(label) ->
+            head(out, f, "Continue", s.span, true)
+            fld(out, kid, "label")
+            opt_text_val(out, label)
+        Defer(inner) ->
+            head(out, f, "Defer", s.span, true)
+            fld(out, kid, "stmt")
+            emit_stmt(out, f, inner, kid)
+        Require(cond, msg) ->
+            head(out, f, "Require", s.span, true)
+            fld(out, kid, "cond")
+            emit_expr(out, f, cond, kid)
+            fld(out, kid, "msg")
+            opt_text_val(out, msg)
+        Ensure(cond, msg) ->
+            head(out, f, "Ensure", s.span, true)
+            fld(out, kid, "cond")
+            emit_expr(out, f, cond, kid)
+            fld(out, kid, "msg")
+            opt_text_val(out, msg)
+        Invariant(cond, msg) ->
+            head(out, f, "Invariant", s.span, true)
+            fld(out, kid, "cond")
+            emit_expr(out, f, cond, kid)
+            fld(out, kid, "msg")
+            opt_text_val(out, msg)
+        Variant(measure) ->
+            head(out, f, "Variant", s.span, true)
+            fld(out, kid, "expr")
+            emit_expr(out, f, measure, kid)
+        AsmStmt(arms) ->
+            head(out, f, "AsmStmt", s.span, true)
+            fld(out, kid, "arms")
+            list_val(out, f, arms, kid, emit_asm_arm)
+        ExternVarDecl(name, typ, link, vis) ->
+            head(out, f, "ExternVarDecl", s.span, true)
+            fld(out, kid, "name")
+            text_val(out, name)
+            fld(out, kid, "typ")
+            emit_type(out, f, typ, kid)
+            fld(out, kid, "link")
+            opt_text_val(out, link)
+            fld(out, kid, "vis")
+            emit_vis(out, vis, kid)
+        FuncDecl(d) -> emit_func(out, f, d, s.span, kid)
+        ExternDecl(d) -> emit_extern(out, f, d, s.span, kid)
+        StructDecl(d) -> emit_struct(out, f, d, s.span, kid)
+        EnumDecl(d) -> emit_enum(out, f, d, s.span, kid)
+        TraitDecl(d) -> emit_trait(out, f, d, s.span, kid)
+        ImplDecl(d) -> emit_impl(out, f, d, s.span, kid)
+        TypeDecl(d) -> emit_typedecl(out, f, d, s.span, kid)
+        Bad -> head(out, f, "Bad", s.span, true)
+end emit_stmt
+
+private emit_func(out: *StrBuilder, f: *AstFmt, d: FuncDecl, at: Span, kid: string)
+    head(out, f, "FuncDecl", at, true)
+    fld(out, kid, "name")
+    text_val(out, d.name)
+    fld(out, kid, "tparams")
+    texts_val(out, d.tparams)
+    fld(out, kid, "params")
+    list_val(out, f, d.params, kid, emit_param)
+    fld(out, kid, "retType")
+    opt_node_val(out, f, d.ret_type, kid, emit_type)
+    fld(out, kid, "body")
+    list_val(out, f, d.body, kid, emit_stmt)
+    fld(out, kid, "bounds")
+    bounds_map_val(out, f, d.bounds, kid)
+    fld(out, kid, "variadic")
+    bool_val(out, d.variadic)
+    fld(out, kid, "vis")
+    emit_vis(out, d.vis, kid)
+    fld(out, kid, "tdefaults")
+    types_map_val(out, f, d.tdefaults, kid)
+    fld(out, kid, "tvalues")
+    types_map_val(out, f, d.tvalues, kid)
+    fld(out, kid, "tpacks")
+    sorted_texts_val(out, d.tpacks)
+    fld(out, kid, "test")
+    opt_node_val(out, f, d.test, kid, emit_test_attr)
+    fld(out, kid, "hook")
+    opt_node_val(out, f, d.hook, kid, emit_hook_attr)
+    fld(out, kid, "conv")
+    opt_node_val(out, f, d.conv, kid, emit_call_conv)
+    fld(out, kid, "tailrec")
+    bool_val(out, d.tailrec)
+    fld(out, kid, "pure")
+    bool_val(out, d.pure)
+    fld(out, kid, "ghost")
+    bool_val(out, d.ghost)
+    fld(out, kid, "reads")
+    opt_texts_val(out, d.reads)
+    fld(out, kid, "writes")
+    opt_texts_val(out, d.writes)
+    fld(out, kid, "exported")
+    opt_node_val(out, f, d.exported, kid, emit_export_attr)
+    fld(out, kid, "section")
+    opt_text_val(out, d.section)
+    fld(out, kid, "crossing")
+    texts_val(out, d.crossing)
+    fld(out, kid, "needs")
+    texts_val(out, d.needs)
+end emit_func
+
+private emit_method(out: *StrBuilder, f: *AstFmt, d: MethodDecl, ind: string)
+    val kid = ind + "  "
+
+    head(out, f, "MethodDecl", d.span, true)
+    fld(out, kid, "name")
+    text_val(out, d.name)
+    fld(out, kid, "receiver")
+
+    d.receiver match
+        None -> out.push("None\n")
+        Some(m) -> emit_recv_mode(out, m, kid)
+
+    fld(out, kid, "isProperty")
+    bool_val(out, d.is_property)
+    fld(out, kid, "tparams")
+    texts_val(out, d.tparams)
+    fld(out, kid, "params")
+    list_val(out, f, d.params, kid, emit_param)
+    fld(out, kid, "retType")
+    opt_node_val(out, f, d.ret_type, kid, emit_type)
+    fld(out, kid, "body")
+    list_val(out, f, d.body, kid, emit_stmt)
+    fld(out, kid, "bounds")
+    bounds_map_val(out, f, d.bounds, kid)
+    fld(out, kid, "tdefaults")
+    types_map_val(out, f, d.tdefaults, kid)
+    fld(out, kid, "vis")
+    emit_vis(out, d.vis, kid)
+    fld(out, kid, "variadic")
+    bool_val(out, d.variadic)
+    fld(out, kid, "overrides")
+    bool_val(out, d.overrides)
+    fld(out, kid, "tvalues")
+    types_map_val(out, f, d.tvalues, kid)
+    fld(out, kid, "tpacks")
+    sorted_texts_val(out, d.tpacks)
+    fld(out, kid, "crossing")
+    texts_val(out, d.crossing)
+    fld(out, kid, "reads")
+    opt_texts_val(out, d.reads)
+    fld(out, kid, "writes")
+    opt_texts_val(out, d.writes)
+    fld(out, kid, "borrows")
+    texts_val(out, d.borrows)
+    fld(out, kid, "isStatic")
+    bool_val(out, d.is_static)
+end emit_method
+
+private emit_extern(out: *StrBuilder, f: *AstFmt, d: ExternDecl, at: Span, kid: string)
+    head(out, f, "ExternDecl", at, true)
+    fld(out, kid, "name")
+    text_val(out, d.name)
+    fld(out, kid, "params")
+    list_val(out, f, d.params, kid, emit_param)
+    fld(out, kid, "retType")
+    opt_node_val(out, f, d.ret_type, kid, emit_type)
+    fld(out, kid, "variadic")
+    bool_val(out, d.variadic)
+    fld(out, kid, "link")
+    opt_text_val(out, d.link)
+    fld(out, kid, "vis")
+    emit_vis(out, d.vis, kid)
+    fld(out, kid, "needs")
+    texts_val(out, d.needs)
+end emit_extern
+
+private emit_struct(out: *StrBuilder, f: *AstFmt, d: StructDecl, at: Span, kid: string)
+    head(out, f, "StructDecl", at, true)
+    fld(out, kid, "name")
+    text_val(out, d.name)
+    fld(out, kid, "tparams")
+    texts_val(out, d.tparams)
+    fld(out, kid, "fields")
+    list_val(out, f, d.fields, kid, emit_param)
+    fld(out, kid, "members")
+    list_val(out, f, d.members, kid, emit_method)
+    fld(out, kid, "bounds")
+    bounds_map_val(out, f, d.bounds, kid)
+    fld(out, kid, "invariants")
+    list_val(out, f, d.invariants, kid, emit_expr)
+    fld(out, kid, "vis")
+    emit_vis(out, d.vis, kid)
+    fld(out, kid, "tdefaults")
+    types_map_val(out, f, d.tdefaults, kid)
+    fld(out, kid, "opaque")
+    bool_val(out, d.opaque)
+    fld(out, kid, "tvalues")
+    types_map_val(out, f, d.tvalues, kid)
+    fld(out, kid, "packed")
+    bool_val(out, d.packed)
+    fld(out, kid, "alignment")
+    opt_node_val(out, f, d.alignment, kid, emit_expr)
+    fld(out, kid, "cname")
+    opt_node_val(out, f, d.cname, kid, emit_export_attr)
+    fld(out, kid, "deriving")
+    list_val(out, f, d.deriving, kid, emit_bound)
+end emit_struct
+
+private emit_enum(out: *StrBuilder, f: *AstFmt, d: EnumDecl, at: Span, kid: string)
+    head(out, f, "EnumDecl", at, true)
+    fld(out, kid, "name")
+    text_val(out, d.name)
+    fld(out, kid, "tparams")
+    texts_val(out, d.tparams)
+    fld(out, kid, "underlying")
+    opt_node_val(out, f, d.underlying, kid, emit_type)
+    fld(out, kid, "variants")
+    list_val(out, f, d.variants, kid, emit_enum_variant)
+    fld(out, kid, "members")
+    list_val(out, f, d.members, kid, emit_method)
+    fld(out, kid, "bounds")
+    bounds_map_val(out, f, d.bounds, kid)
+    fld(out, kid, "vis")
+    emit_vis(out, d.vis, kid)
+    fld(out, kid, "tdefaults")
+    types_map_val(out, f, d.tdefaults, kid)
+    fld(out, kid, "tvalues")
+    types_map_val(out, f, d.tvalues, kid)
+    fld(out, kid, "deriving")
+    list_val(out, f, d.deriving, kid, emit_bound)
+end emit_enum
+
+private emit_trait(out: *StrBuilder, f: *AstFmt, d: TraitDecl, at: Span, kid: string)
+    head(out, f, "TraitDecl", at, true)
+    fld(out, kid, "name")
+    text_val(out, d.name)
+    fld(out, kid, "tparams")
+    texts_val(out, d.tparams)
+    fld(out, kid, "methods")
+    list_val(out, f, d.methods, kid, emit_method)
+    fld(out, kid, "bounds")
+    bounds_map_val(out, f, d.bounds, kid)
+    fld(out, kid, "supers")
+    list_val(out, f, d.supers, kid, emit_bound)
+    fld(out, kid, "vis")
+    emit_vis(out, d.vis, kid)
+    fld(out, kid, "tdefaults")
+    types_map_val(out, f, d.tdefaults, kid)
+    fld(out, kid, "assocs")
+    list_val(out, f, d.assocs, kid, emit_assoc_decl)
+end emit_trait
+
+private emit_impl(out: *StrBuilder, f: *AstFmt, d: ImplDecl, at: Span, kid: string)
+    head(out, f, "ImplDecl", at, true)
+    fld(out, kid, "traitName")
+    text_val(out, d.trait_name)
+    fld(out, kid, "forType")
+    emit_type(out, f, d.for_type, kid)
+    fld(out, kid, "methods")
+    list_val(out, f, d.methods, kid, emit_method)
+    fld(out, kid, "tparams")
+    texts_val(out, d.tparams)
+    fld(out, kid, "bounds")
+    bounds_map_val(out, f, d.bounds, kid)
+    fld(out, kid, "traitArgs")
+    list_val(out, f, d.trait_args, kid, emit_type)
+    fld(out, kid, "tdefaults")
+    types_map_val(out, f, d.tdefaults, kid)
+    fld(out, kid, "overrides")
+    bool_val(out, d.overrides)
+    fld(out, kid, "tvalues")
+    types_map_val(out, f, d.tvalues, kid)
+    fld(out, kid, "tpacks")
+    sorted_texts_val(out, d.tpacks)
+    fld(out, kid, "assocs")
+    list_val(out, f, d.assocs, kid, emit_assoc_bind)
+end emit_impl
+
+private emit_typedecl(out: *StrBuilder, f: *AstFmt, d: TypeDecl, at: Span, kid: string)
+    head(out, f, "TypeDecl", at, true)
+    fld(out, kid, "name")
+    text_val(out, d.name)
+    fld(out, kid, "base")
+    emit_type(out, f, d.base, kid)
+    fld(out, kid, "derived")
+    bool_val(out, d.derived)
+    fld(out, kid, "range")
+    opt_node_val(out, f, d.range, kid, emit_range_bound)
+    fld(out, kid, "pred")
+    opt_node_val(out, f, d.pred, kid, emit_expr)
+    fld(out, kid, "vis")
+    emit_vis(out, d.vis, kid)
+    fld(out, kid, "fromC")
+    bool_val(out, d.from_c)
+end emit_typedecl

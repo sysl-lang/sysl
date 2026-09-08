@@ -1,0 +1,231 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_temp_dir, metadata, read_text, remove_file, walk, write_text}
+import sysl.process.capture
+import sysl.text.{split, str_builder, Search}
+
+// The differential proof: this parser's tree against the reference compiler's, on the same input.
+//
+// **A suite of shapes says the parser does what somebody thought to ask for. This says the two
+// parsers agree.** Both compilers answer `emit-ast --no-spans <file>` with the same deterministic
+// rendering of the untyped tree, so a disagreement anywhere in a file is a line of `diff` naming
+// the node -- and the corpora below are every `.sysl` file on the machine plus every `sysl` block
+// the reference pages show, which between them exercise constructs no hand-written test covers.
+//
+// **The oracle is a binary this repository does not carry**, since it is thirty megabytes and is
+// built out of the other compiler's tree. `SYSL_ORACLE` names it; with the variable unset every
+// test here returns at once and says so, which is what keeps `sysl test .` green on a machine that
+// has no such binary. The project's own file says how to build one.
+
+// Where the reference compiler is, or nothing where this machine has no copy of it.
+private oracle() -> Option[string] = env_var("SYSL_ORACLE")
+
+private present(path: string) -> bool = metadata(path).is_ok()
+
+private is_sysl_source(path: string) -> bool = path.ends_with(".sysl") || path.ends_with(".lsysl")
+
+// The trailing newline `say` adds to what it is given, taken off both sides before they are
+// compared: the tree's own last line ends in one either way.
+private without_trailing_newlines(text: string) -> string
+    var end = text.len
+
+    while end > 0 && text.bytes[end - 1] == u8('\n')
+        end -= 1
+
+    text[0..<end]
+end without_trailing_newlines
+
+// What the reference compiler printed for one file, and whether it was willing to parse it at all.
+struct Answer
+    ok: bool
+    text: string
+    message: string
+end Answer
+
+// The reference compiler's answer for one file.
+private ask_oracle(binary: string, path: string) -> Answer
+    capture(binary, ["emit-ast", "--no-spans", path], "", [], true) match
+        Err(_) -> Answer(false, "", "the oracle could not be run")
+        Ok(answer) ->
+            Answer(answer.status.ok(), without_trailing_newlines(answer.text),
+                   first_error(answer.err.unwrap_or("")))
+end ask_oracle
+
+// The one message out of a refusal the reference compiler wrote, without the frame around it.
+private first_error(text: string) -> string
+    for line in split(text, "\n")
+        if line.starts_with("error: ") then return line[7..]
+
+    ""
+end first_error
+
+// This compiler's answer for the same file, computed in process.
+private ask_ourselves(path: string, text: string) -> Answer
+    val parsed = parse(source_of(path, text))
+
+    if !parsed.ok() then return Answer(false, "", parsed.first().message)
+
+    Answer(true, without_trailing_newlines(emit_ast(parsed.program, false)), "")
+end ask_ourselves
+
+// The first line at which two renderings of a tree part company, quoted from both.
+private first_difference(theirs: string, ours: string) -> string
+    val a = split(theirs, "\n")
+    val b = split(ours, "\n")
+    var i: usize = 0
+
+    while i < a.len && i < b.len
+        if a[i] != b[i] then return s"line ${i + 1}: reference [${a[i]}] ours [${b[i]}]"
+
+        i += 1
+
+    if a.len != b.len then return s"the trees are ${a.len} and ${b.len} lines long"
+
+    ""
+end first_difference
+
+// -- every file of the three corpora ---------------------------------------------------------
+
+// What a sweep found: how many files it compared, and the first file the two disagreed about.
+struct Agreement
+    files: usize
+    mismatches: usize
+    first_bad: string
+end Agreement
+
+private sweep_against(binary: string, root: string, found: *Agreement)
+    for item in walk(root)
+        item match
+            Err(_) -> ()
+            Ok(entry) ->
+                if is_sysl_source(entry.path)
+                    read_text(entry.path) match
+                        Err(_) -> ()
+                        Ok(text) -> compare_one(binary, entry.path, entry.path, text, found)
+end sweep_against
+
+private compare_one(binary: string, path: string, label: string, text: string,
+                    found: *Agreement)
+    val ours = ask_ourselves(path, text)
+    val theirs = ask_oracle(binary, path)
+
+    found.files += 1
+
+    if ours.ok != theirs.ok
+        found.mismatches += 1
+
+        if found.first_bad == ""
+            found.first_bad = s"${label}: the reference compiler ${if theirs.ok then "read" else "refused"} it and this one ${if ours.ok then "read" else "refused"} it"
+
+        return
+    end if
+
+    if !ours.ok
+        if ours.message != theirs.message
+            found.mismatches += 1
+
+            if found.first_bad == ""
+                found.first_bad = s"${label}: the reference compiler said [${theirs.message}] and this one said [${ours.message}]"
+
+        return
+    end if
+
+    val where = first_difference(theirs.text, ours.text)
+
+    if where != ""
+        found.mismatches += 1
+
+        if found.first_bad == "" then found.first_bad = s"${label}: ${where}"
+end compare_one
+
+@test("the two compilers build the same tree for every sysl file on this machine")
+the_trees_agree_over_every_corpus()
+    oracle() match
+        None ->
+            print("skipped: SYSL_ORACLE names no reference compiler on this machine")
+            return
+        Some(binary) ->
+            var found = Agreement(0, 0, "")
+
+            sweep_against(binary, "sh", &found)
+
+            for root in ["../sysl-bootstrap/library", "../parsing"]
+                if present(root) then sweep_against(binary, root, &found)
+
+            assert(found.files >= 30, s"the walk found the corpora: ${found.files} files")
+            assert_eq(found.first_bad, "")
+            assert_eq(found.mismatches, 0)
+end the_trees_agree_over_every_corpus
+
+// -- every block the reference pages show ------------------------------------------------------
+
+// Every ```sysl block of a page, in order.
+//
+// **The blocks that carry a setting after the fence are left out**, since `target=` picks a machine
+// other than this one and what is being compared here is one reading of one input rather than the
+// conditional-compilation pass.
+private sysl_blocks(page: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var held = str_builder()
+    var inside = false
+
+    for line in split(page, "\n")
+        if inside
+            if line == "```"
+                out.push(held.finish())
+
+                held = str_builder()
+                inside = false
+            else
+                held.push(line)
+                held.push_char('\n')
+        else if line == "```sysl"
+            inside = true
+
+    out
+end sysl_blocks
+
+@test("and on every sysl block the reference pages show, accepted and refused alike")
+the_two_agree_on_the_reference_pages()
+    val root = "../sysl.sh/docs/content/reference"
+
+    oracle() match
+        None ->
+            print("skipped: SYSL_ORACLE names no reference compiler on this machine")
+            return
+        Some(binary) ->
+            if !present(root)
+                print("skipped: the reference pages are not on this machine")
+                return
+            end if
+
+            val dir = make_temp_dir("sysl-oracle").unwrap()
+            val scratch = dir + "/block.sysl"
+
+            var found = Agreement(0, 0, "")
+
+            for item in walk(root)
+                item match
+                    Err(_) -> ()
+                    Ok(entry) ->
+                        if entry.path.ends_with(".md")
+                            read_text(entry.path) match
+                                Err(_) -> ()
+                                Ok(page) ->
+                                    val blocks = sysl_blocks(page)
+
+                                    for i in 0..<blocks.len()
+                                        write_text(scratch, blocks.at(i)).unwrap()
+                                        compare_one(binary, scratch,
+                                            s"${entry.path} block ${i + 1}", blocks.at(i), &found)
+
+            remove_file(scratch)
+
+            assert(found.files >= 500, s"the pages showed the blocks: ${found.files} of them")
+            assert_eq(found.first_bad, "")
+            assert_eq(found.mismatches, 0)
+end the_two_agree_on_the_reference_pages

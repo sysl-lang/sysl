@@ -124,6 +124,32 @@ parse_core_type(p: *Parser) -> TypeRef
     parse_named_type(p, start)
 end parse_core_type
 
+// `some Trait` where it is legal, which is a declaration's result and nowhere else.
+//
+// **The refusal lives in `parse_core_type`, and this is the one caller that goes round it.** A
+// result is the only position the form may stand in; whether that result belongs to an `impl` block
+// is a question about what the declaration is a member of, and so is the analyzer's rather than the
+// grammar's. It stands for the *whole* result and never for one part of a result list, which is why
+// the caller returns on it rather than folding it in beside a comma.
+parse_some_result(p: *Parser) -> Option[TypeRef]
+    if !(p.at_word("some") && names_a_bound(p.peek_at(1))) then return None
+
+    val start = p.here()
+
+    p.bump()
+
+    val bounds = parse_bounds(p)
+
+    Some(type_ref(start.to(p.just_taken()), SomeType(bounds)))
+end parse_some_result
+
+// A property's result, which is one type rather than the list a `->` after a parameter list may
+// open -- `some Trait` included, a property's answer being a result like any other.
+parse_single_result(p: *Parser) -> TypeRef
+    parse_some_result(p) match
+        Some(t) -> t
+        None -> parse_type(p)
+
 private names_a_bound(t: Tok) -> bool = t match
     Ident(_) -> true
     QuotedIdent(_) -> true
