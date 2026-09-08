@@ -1,0 +1,216 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What a compilation's worth of diagnostics looks like, and the undo log a speculative walk rewinds
+// through.
+//
+// **The shape of a report is a specification.** A build log, an editor and a test all read it, and
+// the reference compiler's is what they read today -- five at a time, separated by a blank line,
+// with a count of what was left out.
+
+private a_source(name: string, text: string) -> Source = source_of(name, text)
+
+private complaint(src: Source, at: usize, message: string) -> Placed =
+    placed_error(src, Span(at, at + 1), message)
+
+@test("a report shows the first five, separated by a blank line, and says how many there were")
+a_report_shows_the_first_five()
+    val src = a_source("many.sysl", "a\nb\nc\nd\ne\nf\ng\n")
+    var all: Buf[Placed] = buf()
+
+    for i in 0..<usize(7)
+        all.push(complaint(src, i * 2, s"wrong ${i + 1}"))
+
+    val text = analysis_report(all)
+
+    assert(text.contains("error: wrong 1"))
+    assert(text.contains("error: wrong 5"))
+    assert(!text.contains("error: wrong 6"))
+    assert(text.contains("\n\nerror: wrong 2"))
+    assert(text.ends_with("showing the first 5 of 7 errors"))
+
+@test("and says nothing about a count where there was nothing left out")
+a_short_report_says_no_count()
+    val src = a_source("few.sysl", "a\nb\n")
+    var all: Buf[Placed] = buf()
+
+    all.push(complaint(src, 0, "first"))
+    all.push(complaint(src, 2, "second"))
+
+    val text = analysis_report(all)
+
+    assert(!text.contains("showing the first"))
+    assert(text.contains("error: first"))
+    assert(text.contains("error: second"))
+
+@test("a diagnostic points at its file, its line and its column, and quotes the line under a caret")
+a_diagnostic_points_at_its_place()
+    val src = a_source("one.sysl", "val x = 1\nval y = 2\n")
+    val text = analysis_report(one_complaint(complaint(src, 14, "something")))
+
+    assert(text.contains("error: something"))
+    assert(text.contains("--> one.sysl:2:5"))
+    assert(text.contains("2 | val y = 2"))
+    assert(text.contains("^"))
+
+@test("the order a report is read in is by file, then by line, then by column")
+the_order_a_report_is_read_in()
+    val b = a_source("b.sysl", "one\ntwo\n")
+    val a = a_source("a.sysl", "one\ntwo\n")
+    var all: Buf[Placed] = buf()
+
+    all.push(complaint(b, 4, "in b, second line"))
+    all.push(complaint(a, 4, "in a, second line"))
+    all.push(complaint(a, 0, "in a, first line"))
+
+    val ordered = in_source_order(all)
+
+    assert_eq(ordered.at(0).diag.message, "in a, first line")
+    assert_eq(ordered.at(1).diag.message, "in a, second line")
+    assert_eq(ordered.at(2).diag.message, "in b, second line")
+
+@test("and two about one place keep the order they were made in, which reads as an explanation")
+two_about_one_place_keep_their_order()
+    val src = a_source("one.sysl", "x\n")
+    var all: Buf[Placed] = buf()
+
+    all.push(complaint(src, 0, "what is wrong"))
+    all.push(complaint(src, 0, "why it is wrong"))
+
+    val ordered = in_source_order(all)
+
+    assert_eq(ordered.at(0).diag.message, "what is wrong")
+    assert_eq(ordered.at(1).diag.message, "why it is wrong")
+
+@test("a warning is not an error, and a report of warnings alone is a successful run")
+a_warning_is_not_an_error()
+    val src = a_source("one.sysl", "x\n")
+    var all: Buf[Placed] = buf()
+
+    all.push(placed_warning(src, Span(0, 1), "worth mentioning"))
+
+    assert(!any_errors(all))
+    assert_eq(warnings_of(all).len(), 1)
+    assert_eq(errors_of(all).len(), 0)
+
+    all.push(complaint(src, 0, "wrong"))
+
+    assert(any_errors(all))
+    assert_eq(errors_of(all).len(), 1)
+
+@test("a note is the place first, in the one line a build log wants")
+a_note_is_the_place_first()
+    val src = a_source("one.sysl", "val x = 1\nval y = 2\n")
+
+    assert_eq(explain("worth knowing", complaint(src, 14, "")), "one.sysl:2:5: worth knowing")
+
+@test("the same thing said twice about one place is said once")
+one_thing_is_said_once()
+    val a = analysis_for(host_target())
+    val scope = Scope(ModuleRoot, no_imports(), a_source("one.sysl", "x\n"))
+
+    a.fault(scope, Span(0, 1), "wrong")
+    a.fault(scope, Span(0, 1), "wrong")
+    a.fault(scope, Span(0, 1), "also wrong")
+
+    assert_eq(a.complaints(), 2)
+
+@test("and what a trial said is put back when the trial is thrown away")
+a_trial_says_nothing_it_keeps()
+    val a = analysis_for(host_target())
+    val scope = Scope(ModuleRoot, no_imports(), a_source("one.sysl", "x\n"))
+
+    a.fault(scope, Span(0, 1), "kept")
+
+    val said = a.complaints()
+
+    a.fault(scope, Span(2, 3), "tried")
+    assert_eq(a.complaints(), said + 1)
+
+    a.restore_complaints(said)
+    assert_eq(a.complaints(), 1)
+    assert_eq(a.diagnostics().at(0).diag.message, "kept")
+
+// -- the undo log --------------------------------------------------------------------------------
+
+private struct_with(name: string) -> &StructType = StructType(name, buf(), buf(), false, None, None)
+
+@test("a journal remembers nothing until a trial is open")
+a_journal_remembers_nothing_outside_a_trial()
+    val j = journal()
+
+    assert(!j.recording())
+
+    val mark = j.enter()
+
+    assert(j.recording())
+    assert_eq(mark, 0)
+
+    j.leave()
+    assert(!j.recording())
+
+@test("and a trial's writes are put back, most recent first")
+a_trial_is_put_back()
+    val j = journal()
+    val cell: &StructType = struct_with("before")
+    val mark = j.enter()
+
+    cell.base = "during"
+    j.record(() -> cell.base = "before")
+
+    assert_eq(cell.base, "during")
+
+    j.rewind(mark)
+    assert_eq(cell.base, "before")
+    assert_eq(j.recorded, 1)
+
+    j.leave()
+
+@test("a trial inside a trial is put back to where the inner one began")
+a_nested_trial_is_put_back_to_its_own_mark()
+    val j = journal()
+    val cell: &StructType = struct_with("a")
+    val outer = j.enter()
+
+    cell.base = "b"
+    j.record(() -> cell.base = "a")
+
+    val inner = j.enter()
+
+    cell.base = "c"
+    j.record(() -> cell.base = "b")
+
+    j.rewind(inner)
+    assert_eq(cell.base, "b")
+
+    j.leave()
+    j.rewind(outer)
+    assert_eq(cell.base, "a")
+    assert_eq(j.deepest, 2)
+
+    j.leave()
+
+@test("and the log is emptied when the outermost trial closes, since nothing outside one goes back")
+the_log_is_emptied_when_the_outermost_closes()
+    val j = journal()
+    val cell: &StructType = struct_with("a")
+    val mark = j.enter()
+
+    j.record(() -> cell.base = "a")
+    j.leave()
+
+    assert(!j.recording())
+    assert_eq(j.enter(), 0)
+
+    j.leave()
+
+private one_complaint(d: Placed) -> Buf[Placed]
+    var out: Buf[Placed] = buf()
+
+    out.push(d)
+    out
+end one_complaint

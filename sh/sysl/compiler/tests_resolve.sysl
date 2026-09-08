@@ -1,0 +1,180 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a written type resolves to.
+//
+// **The claim under test is that two trees mean one thing.** `TypeRef` is what the source wrote and
+// `Type` is what it means, and every test here hands the pass a spelling and asks for the value.
+
+private of(written: string) -> Type = resolve_written("", written).0
+
+private of_with(text: string, written: string) -> Type = resolve_written(text, written).0
+
+private said(text: string, written: string) -> string
+    val answered = resolve_written(text, written)
+
+    if answered.1.is_empty() then return ""
+
+    answered.1.at(0)
+end said
+
+@test("a scalar resolves to the width it names, and the address-width two to the target's")
+a_scalar_resolves_to_its_width()
+    assert(type_eq(of("int"), Integer(32, true, false)))
+    assert(type_eq(of("byte"), Integer(8, false, false)))
+    assert(type_eq(of("bool"), Bool))
+    assert(type_eq(of("string"), Str))
+    assert(type_eq(of("unit"), Unit))
+    assert(type_eq(of("never"), Never))
+    assert(type_eq(of("u12"), Integer(12, false, false)))
+    assert(type_eq(of("i128"), Integer(128, true, false)))
+    assert(type_eq(of("f32"), Floating(32)))
+    assert(type_eq(of("usize"), usize_type(int(host_target().pointer_bits()))))
+
+@test("a qualifier and a pointer are what they are written as")
+a_qualifier_is_what_it_is_written_as()
+    assert(type_eq(of("*int"), Ptr(Integer(32, true, false))))
+    assert(type_eq(of("&int"), Ref(Integer(32, true, false), false)))
+    assert(type_eq(of("&sync int"), Ref(Integer(32, true, false), true)))
+    assert(type_eq(of("weak &int"), Weak(Ref(Integer(32, true, false), false))))
+    assert(type_eq(of("volatile u32"), Volatile(Integer(32, false, false))))
+    assert(type_eq(of("*volatile u32"), Ptr(Volatile(Integer(32, false, false)))))
+
+@test("a slice takes its element and whether it may be written; an array takes its length too")
+a_slice_and_an_array()
+    assert(type_eq(of("[]byte"), Slice(byte_type(), false)))
+    assert(type_eq(of("[]const byte"), Slice(byte_type(), true)))
+    assert(type_eq(of("[4]int"), Array(4, Integer(32, true, false))))
+    assert(type_eq(of("<4>f32"), Vector(4, Floating(32))))
+
+@test("a tuple is the compiler's own struct, and a result list is that struct wearing a second name")
+a_tuple_and_a_result_list()
+    val pair = of("(int, string)")
+
+    assert_eq(type_show(pair), "(int, string)")
+
+    pair match
+        Struct(d) ->
+            assert_eq(d.base, tuple_base(2))
+            assert_eq(d.fields.len(), 2)
+            assert_eq(d.fields.at(0).0, "0")
+            assert(type_eq(d.fields.at(1).1, Str))
+        _ -> assert(false, "a tuple is not a struct")
+
+@test("a written callable is the trait of its arity, with its result last")
+a_written_callable()
+    val f = of("Fn(int, bool) -> string")
+
+    f match
+        Trait(n, args, _) ->
+            assert_eq(n, fn_base(2))
+            assert_eq(args.len(), 3)
+            assert(type_eq(args.at(2), Str))
+        _ -> assert(false, "a callable is not a trait")
+
+    assert_eq(type_show(of("&Fn(int) -> int")), "&Fn(int) -> int")
+
+@test("a pointer to a C function keeps the convention it was written under")
+a_c_function_pointer_resolves()
+    assert(type_eq(of("*extern(int) -> unit"), CFn(one_type(Integer(32, true, false)), Unit)))
+
+@test("a declared type resolves to the one record every use of it shares")
+a_declared_type_is_one_record()
+    val text = "struct P\n    x: int\n"
+    val a = of_with(text, "P")
+    val b = of_with(text, "*P")
+
+    assert(type_eq(a, of_with(text, "P")))
+
+    b match
+        Ptr(inner) -> assert(type_eq(*inner, a))
+        _ -> assert(false, "a pointer is not a pointer")
+
+@test("a generic resolves once per set of arguments")
+a_generic_resolves_per_instantiation()
+    val text = "struct Box[T]\n    v: T\n"
+    val of_int = of_with(text, "Box[int]")
+
+    assert_eq(type_show(of_int), "Box[int]")
+
+    of_int match
+        Struct(d) ->
+            assert_eq(d.targs.len(), 1)
+            assert(type_eq(d.fields.at(0).1, Integer(32, true, false)))
+        _ -> assert(false, "a generic is not a struct")
+
+    of_with(text, "Box[string]") match
+        Struct(d) -> assert(type_eq(d.fields.at(0).1, Str))
+        _ -> assert(false, "a generic is not a struct")
+
+@test("a plain alias is another spelling for what it names, and nothing more")
+a_plain_alias_is_a_spelling()
+    assert(type_eq(of_with("type Small = byte\n", "Small"), byte_type()))
+    assert(type_eq(of_with("type A = B\ntype B = []const byte\n", "A"), Slice(byte_type(), true)))
+
+@test("and a derived one is a type of its own, over the base it narrows")
+a_derived_subtype_is_its_own_type()
+    val t = of_with("type Metres = new int\n", "Metres")
+
+    assert(!type_eq(t, Integer(32, true, false)))
+    assert(type_eq(underlying(t), Integer(32, true, false)))
+    assert_eq(type_show(t), "Metres")
+
+@test("a type parameter stands for itself while a signature is read")
+a_type_parameter_stands_for_itself()
+    var subst = stand_ins(one_name("T"))
+
+    assert(type_eq(bound_type(subst, "T").unwrap(), Abstract("T", buf())))
+    assert(bound_type(subst, "U").is_none())
+
+@test("a name nothing declares is refused, and what is refused answers with nothing settled")
+an_unresolvable_name_answers_unknown()
+    val answered = resolve_written("", "Nope")
+
+    assert(type_eq(answered.0, Unknown))
+    assert_eq(answered.1.at(0), "unknown type 'Nope'")
+
+@test("a trait with an associated type takes an argument that binds it")
+a_trait_with_an_associated_type()
+    val text = "trait Yield\n    type Item\n    next(*self) -> Self::Item\n"
+
+    assert_eq(said(text, "Yield[int]"), "")
+
+    of_with(text, "Yield[int]") match
+        Trait(_, args, assocs) ->
+            assert(args.is_empty())
+            assert_eq(assocs.len(), 1)
+            assert_eq(assocs.at(0).0, "Item")
+            assert(type_eq(assocs.at(0).1, Integer(32, true, false)))
+        _ -> assert(false, "a trait is not a trait")
+
+@test("and one with no parameters and no associated types is told it takes none")
+a_bare_trait_takes_no_arguments()
+    assert_eq(said("trait Show\n    show(self) -> string\n", "Show[int]"),
+              "trait 'Show' does not take type arguments")
+
+@test("a module's name may be written in front of a type, and an alias for the module may be too")
+a_qualified_type_name()
+    var units: Buf[Program] = buf()
+
+    units.push(parse(source_of("a.sysl", "module m\n\nstruct P\n    x: int\n")).program)
+    units.push(parse(source_of("b.sysl", "module n\n\nuse(p: m.P) -> int = 1\n")).program)
+
+    assert(analyze_decls(units, host_target()).is_ok())
+
+private one_type(t: Type) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    out.push(t)
+    out
+end one_type
+
+private one_name(n: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(n)
+    out
+end one_name

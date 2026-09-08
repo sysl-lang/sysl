@@ -418,15 +418,35 @@ end instantiate_enum
 // A trait used as a type.
 private instantiate_trait(a: &Analysis, scope: Scope, span: Span, written: string, key: string,
                           d: TraitDecl, targs: Buf[Type]) -> Type
+    // **An argument on a trait may bind an associated type rather than a parameter.** A trait with
+    // no parameters and one associated type has only one thing a bare argument could mean, so
+    // `Iterate[char]` and `Iterate[Item = char]` are one type -- which is why a trait with associated
+    // types is not told it takes no arguments.
     if d.tparams.is_empty() && !targs.is_empty() then
-        a.fault(scope, span, s"trait '$written' does not take type arguments")
-        return Unknown
+        if d.assocs.is_empty() then
+            a.fault(scope, span, s"trait '$written' does not take type arguments")
+            return Unknown
+
+        return Trait(key, buf(), assoc_bindings(d, targs))
 
     if !d.tparams.is_empty() then
         if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, targs) then return Unknown
 
     Trait(key, targs, buf())
 end instantiate_trait
+
+// What arguments written on a trait with associated types bind: a named one binds the associated
+// type it names, and a bare one binds the trait's only associated type.
+private assoc_bindings(d: TraitDecl, targs: Buf[Type]) -> Buf[(string, Type)]
+    var out: Buf[(string, Type)] = buf()
+
+    for i in 0..<targs.len()
+        val name = if i < d.assocs.len() then d.assocs.at(i).name else ""
+
+        out.push((name, targs.at(i)))
+
+    out
+end assoc_bindings
 
 // A named subtype: a constrained type where it narrows anything, and another spelling of its base
 // where it does not.

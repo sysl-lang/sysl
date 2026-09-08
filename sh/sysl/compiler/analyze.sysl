@@ -73,6 +73,10 @@ private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
     val path = joined(d.path, ".")
 
     if !a.tables.has_module(path) then
+        // A path with no braces after it may name one declaration rather than a module, which is
+        // what `import sysl.text.Ascii` does.
+        if d.selectors.is_empty() && !d.wildcard && names_a_declaration(a, path) then return
+
         a.fault(scope, span, s"no module is called '$path'")
         return
 
@@ -82,6 +86,17 @@ private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
 
         if !declares(a, key) then
             a.fault(scope, s.span, s"'$path' declares no '${s.name}' — there is no '$path.${s.name}'")
+
+// Whether a dotted path names one declaration of a module rather than a module.
+private names_a_declaration(a: &Analysis, path: string) -> bool
+    val cut = last_dot_in(path)
+
+    if cut.is_none() then return false
+
+    val here = path[0..<cut.unwrap()]
+
+    a.tables.has_module(here) && declares(a, module_qualify(here, path[cut.unwrap() + 1..<path.bytes.len]))
+end names_a_declaration
 
 // Whether this compilation has any declaration under a key, of any kind.
 declares(a: &Analysis, key: string) -> bool =
@@ -329,8 +344,11 @@ private check_exposed_types(a: &Analysis)
                     for j in 0..<d.fields.len()
                         val f = d.fields.at(j)
 
-                        check_exposed(a, decl.scope, d.name, d.vis, s"the field '${f.name}'", f.typ,
-                                      d.tparams)
+                        // **A field of its own may be private**, and one that is reaches exactly as
+                        // far as the type it names -- so there is nothing here to find.
+                        if !is_private_reach(f.vis) then
+                            check_exposed(a, decl.scope, d.name, d.vis, s"the field '${f.name}'",
+                                          f.typ, d.tparams)
             _ -> ()
 
 private is_private_reach(v: Visibility) -> bool = v match
@@ -426,3 +444,33 @@ decl_diagnostics(text: string) -> Buf[string]
 
     out
 end decl_diagnostics
+
+// The type a written one means, in the terms of a source that declares whatever it names.
+//
+// **It is here rather than in the test file because it is the pass's own seam**: hoist, resolve,
+// then ask what one more written type comes to. A caller wanting the diagnostics as well as the
+// answer gets both, since a resolution that failed still answers with something.
+resolve_written(text: string, written: string) -> (Type, Buf[string])
+    val parsed = parse(source_of("test.sysl", text))
+    val a = analysis_for(host_target())
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+    read_decls(a, units)
+
+    val t = parse_type_text("type.sysl", written)
+    var messages: Buf[string] = buf()
+
+    if !t.ok() then
+        messages.push(t.first().message)
+
+        return (Unknown, messages)
+
+    val answer = resolve_type(a, scope_of_unit(parsed.program), t.value, no_bindings())
+    val ds = a.diagnostics()
+
+    for i in 0..<ds.len()
+        messages.push(ds.at(i).diag.message)
+
+    (answer, messages)
+end resolve_written

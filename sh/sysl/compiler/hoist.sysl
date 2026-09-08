@@ -35,8 +35,9 @@ gather_imports(body: Buf[Stmt], here: string) -> Imports
     var modules: Buf[(string, string)] = buf()
     var wildcards: Buf[string] = buf()
 
-    if here != AutoImportedModule && !starts_with_module(here, AutoImportedModule) then
-        wildcards.push(AutoImportedModule)
+    // The auto-import is a wildcard over the standard module, for every file but the standard
+    // module's own -- a module does not import itself, and a module *below* it still does.
+    if here != AutoImportedModule then wildcards.push(AutoImportedModule)
 
     for i in 0..<body.len()
         *body.at(i).kind match
@@ -55,13 +56,34 @@ private read_import(names: *Buf[(string, string)], modules: *Buf[(string, string
         return
 
     if d.selectors.is_empty() then
+        // **A path with no braces after it may name a module or one declaration.** Which of the two
+        // it is is not decided here -- what a module declares is not settled until every file has
+        // been read -- so both readings are recorded and the lookup takes whichever exists.
         modules.push((import_bound(d), path))
+
+        val cut = last_dot_in(path)
+
+        if cut.is_some() then
+            names.push((import_bound(d), module_qualify(path[0..<cut.unwrap()],
+                                                        path[cut.unwrap() + 1..<path.bytes.len])))
+
         return
 
     for i in 0..<d.selectors.len()
         val s = d.selectors.at(i)
 
         names.push((selector_bound(s), module_qualify(path, s.name)))
+
+// Where the last dot of a path is, which is what separates a module from a name in it.
+last_dot_in(name: string) -> Option[usize]
+    val b = name.bytes
+    var found: Option[usize] = None
+
+    for i in 0..<b.len
+        if b[i] == u8('.') then found = Some(i)
+
+    found
+end last_dot_in
 
 // Whether one module name is the other or is below it.
 starts_with_module(name: string, outer: string) -> bool
@@ -150,7 +172,7 @@ private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vi
                         kind: DeclKind)
     val key = module_qualify(scope.module_name, name)
 
-    if type_name_taken(a, key, name) then
+    if type_name_taken(a, key, name) && type_contested(a, scope, vis, key) then
         a.fault(scope, span, type_taken_message(kind, name))
         return
 
@@ -167,6 +189,16 @@ private type_taken_message(kind: DeclKind, name: string) -> string = kind match
         else s"the name '$name' is already declared"
     _ -> s"type '$name' is already declared"
 
+// The same rule for a type: two file-private declarations in two files are not a clash.
+private type_contested(a: &Analysis, scope: Scope, vis: Visibility, key: string) -> bool
+    val other = a.tables.types.get(key)
+
+    if other.is_none() then return true
+    if other.unwrap().scope.src.name == scope.src.name then return true
+
+    !(is_file_private(vis) && is_file_private(a.tables.access.get(key).unwrap().vis))
+end type_contested
+
 // Whether something already stands for this name as a type: another declaration, a scalar, or one
 // of the two words the language answers for itself.
 type_name_taken(a: &Analysis, key: string, written: string) -> bool =
@@ -177,7 +209,7 @@ type_name_taken(a: &Analysis, key: string, written: string) -> bool =
 private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
                     vis: Visibility, into: &Table[ValueDecl], what: string)
     val key = module_qualify(scope.module_name, name)
-    val holder = value_name_holder(a, key)
+    val holder = if contested(a, scope, vis, key) then value_name_holder(a, key) else None
 
     if holder.is_some() then
         a.fault(scope, span, s"'$name' is already declared as ${holder.unwrap()}")
@@ -187,6 +219,36 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
     a.tables.access.put(key, Access(vis, scope.src.name))
 
     if is_test_only(scope) then a.tables.test_only.push(key)
+
+// Whether a name another file already registered is one this declaration could be confused with.
+//
+// **Two file-private declarations in two files are not a clash at all**: neither file sees the
+// other's, so there is no reference with two answers. `private const path_bytes` twice over in the
+// library's `sysl.fs` is exactly this, and it is not a mistake.
+private contested(a: &Analysis, scope: Scope, vis: Visibility, key: string) -> bool
+    val holder_scope = value_scope_of(a, key)
+
+    if holder_scope.is_none() then return true
+    if holder_scope.unwrap().src.name == scope.src.name then return true
+
+    !(is_file_private(vis) && is_file_private(value_vis_of(a, key)))
+end contested
+
+private value_scope_of(a: &Analysis, key: string) -> Option[Scope]
+    if a.tables.consts.has(key) then return Some(a.tables.consts.get(key).unwrap().scope)
+    if a.tables.vals.has(key) then return Some(a.tables.vals.get(key).unwrap().scope)
+    if a.tables.extern_vars.has(key) then return Some(a.tables.extern_vars.get(key).unwrap().scope)
+
+    None
+end value_scope_of
+
+private value_vis_of(a: &Analysis, key: string) -> Visibility
+    if a.tables.consts.has(key) then return a.tables.consts.get(key).unwrap().vis
+    if a.tables.vals.has(key) then return a.tables.vals.get(key).unwrap().vis
+    if a.tables.extern_vars.has(key) then return a.tables.extern_vars.get(key).unwrap().vis
+
+    Public
+end value_vis_of
 
 // What already holds a name that stands for storage, where anything does.
 //

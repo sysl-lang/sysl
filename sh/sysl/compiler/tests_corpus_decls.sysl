@@ -1,0 +1,75 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{walk, read_text, metadata}
+import sysl.text.Search
+
+// The whole-tree proof for the declaration pass: not a claim about one construct, but that the
+// analyzer reads the declarations of real programs and has nothing to say about them.
+//
+// **The three corpora are read as one compilation**, because that is what makes the imports mean
+// anything: this compiler's own module names `sh.sysl.parsing`, and the parsing package and the
+// library both name `sysl`. Resolving a *package* -- a manifest, a version, a fetch -- is a later
+// stage's; what is done here is reading the files that are already on the machine, which is enough
+// for every name in all three trees to have a declaration to reach.
+
+// Every `.sysl` file under a directory, parsed, added to a list of units.
+private gather(into: *Buf[Program], root: string) -> usize
+    var files: usize = 0
+
+    for item in walk(root)
+        item match
+            Err(_) -> ()
+            Ok(entry) ->
+                if is_corpus_source(entry.path)
+                    read_text(entry.path) match
+                        Err(_) -> ()
+                        Ok(text) ->
+                            val parsed = parse(source_of(entry.path, text))
+
+                            if parsed.ok()
+                                files += 1
+                                into.push(parsed.program)
+
+    files
+end gather
+
+private is_corpus_source(path: string) -> bool = path.ends_with(".sysl") || path.ends_with(".lsysl")
+
+private present(path: string) -> bool = metadata(path).is_ok()
+
+@test("every declaration of every file on this machine that belongs to a sysl project is read, with nothing to report")
+the_whole_corpus_reads()
+    var units: Buf[Program] = buf()
+    var files = gather(&units, "sh")
+
+    if present("../parsing") then files += gather(&units, "../parsing")
+
+    if present("../sysl-bootstrap/library") then files += gather(&units, "../sysl-bootstrap/library")
+
+    val whole = present("../parsing") && present("../sysl-bootstrap/library")
+
+    assert(files >= 30, s"the walk found the trees: $files files")
+
+    if whole then assert(files >= 200, s"the walk found all three trees: $files files")
+
+    analyze_decls(units, host_target()) match
+        Ok(tables) ->
+            // The tables are what the pass is for, so the sweep says they were filled rather than
+            // only that nothing was refused.
+            assert(tables.types.len() >= 200, s"the tables hold the corpus: ${tables.types.len()} types")
+
+            if whole then
+                assert(tables.types.has(module_qualify("sysl", "Option")),
+                       "the standard module's 'Option' is one of them")
+                assert(tables.enum_insts.len() > 0, "instantiations were made")
+                assert(tables.struct_insts.len() > 0, "and so were the structs'")
+        Err(ds) ->
+            var all = s"${ds.len()} to say:"
+
+            for i in 0..<ds.len()
+                all = s"$all\n${ds.at(i).location()}: ${ds.at(i).diag.message}"
+
+            assert(false, all)
