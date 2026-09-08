@@ -1,0 +1,554 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+import sysl.unicode
+
+// Bytes to tokens, with the shape of the file turned into tokens on the way.
+//
+// **The lexer is where an indentation-sensitive language does most of its deciding.** Above this
+// file nothing ever looks at a column: a block arriving as `Indent` and leaving as `Dedent` is the
+// only thing the parser is told about the margin, and a statement ending is a `Newline` rather than
+// the end of a line. Everything that makes that hard -- a bracket suspending the rule, a block
+// opening inside one anyway, an operator carrying a line, a chain broken before its dot -- is
+// settled here and is invisible afterwards.
+//
+// The bookkeeping is `sh.sysl.parsing`'s: `Scanner` walks the bytes, `Layout` keeps the column stack
+// and the bracket depth, and `Source` turns an offset back into a line and a column for a
+// diagnostic. What is here is what those cannot know -- which words sysl has taken, which operators
+// it spells, which of them may open a block, and what a literal means.
+
+// A tab is one column.
+//
+// **That is the bootstrap compiler's rule and it is not a shortcut.** A line's indentation must be
+// written all in tabs or all in spaces, so two lines' indentation is only ever compared between
+// lines using the same character, and a tab's display width never enters the question. A file that
+// mixes them on one line is refused where it is written, which is the diagnostic below.
+private const TabWidth: usize = 1
+
+// What the lexer answers with.
+//
+// **A token carries its decoded value, which is a decision rather than an omission.** The other
+// road is to carry a `Span` and let the parser read the lexeme back, which is what a language whose
+// literals are their own spelling can do; sysl's are not. A `"a\tb"` is five characters in the file
+// and three in the value, a text block's value is its lines with their indentation taken off, and an
+// interpolated literal is not one piece of text at all. Decoding once, here, is what keeps every
+// later pass from having to know the escape table -- and the value is built into one buffer per
+// literal, so what it costs is one allocation for a literal that needed one and none for a literal
+// that did not.
+//
+// **An identifier and an operator carry a `string` and that string is free**: a sysl `string` is a
+// length and a pointer, so a name is a view over the bytes the file already holds and no copy is
+// made anywhere in this file except where a value genuinely differs from its spelling.
+enum Tok derives Eq, Display
+    // An integer literal: its digits with the separators taken out, the base they are written in,
+    // and the suffix naming its type -- `""` where none was written.
+    //
+    // **The digits are kept as text for the same reason a float's are.** sysl's integers are an
+    // [open family](/reference/types/): `u256` is a type a program may write, and a literal that
+    // reaches one does not fit any integer this compiler could hold it in. The analyzer knows the
+    // width the literal is going to; the lexer does not, so it hands on what was written and
+    // converts nothing. `0xFF` is `IntLit("FF", 16, "")`.
+    IntLit(digits: string, base: int, suffix: string)
+
+    // A floating-point literal, kept as text so that no precision is lost before the analyzer knows
+    // the target width -- `f128` does not fit a `real`. The separators are gone and an exponent is
+    // spelled with a lower-case `e` whichever case it was written in, so the text is canonical.
+    FloatLit(text: string, suffix: string)
+
+    // A character literal, holding one Unicode scalar value.
+    CharLit(codepoint: char)
+
+    // A string literal, holding its decoded value.
+    StrLit(value: string)
+
+    // `c"..."` -- the same decoded value, marked for the terminator C expects and the `*u8` it reads
+    // as. Told apart at the token so that nothing downstream has to remember which quote form
+    // produced a given value.
+    CStrLit(value: string)
+
+    // `s"..."` or `f"..."` -- an interpolated literal. The literal pieces are decoded; the holes are
+    // held as the source between their braces, to be lexed and parsed where the token is consumed,
+    // because what a hole says is the grammar's business and not this pass's. `specs` carries one
+    // entry per hole -- the printf specifier written after it in an `f"..."` literal, or `""` for a
+    // hole rendered by `str`.
+    //
+    // `parts.len() == exprs.len() + 1` and `specs.len() == exprs.len()`, which is what lets the
+    // parser interleave them: `parts[0] + render(exprs[0]) + parts[1] + ...`.
+    StrInterp(parts: Buf[string], exprs: Buf[string], specs: Buf[string])
+
+    // `'name` -- the name a loop carries, so that a `break` can say which one it leaves. It is told
+    // from a character literal by the absence of a closing quote.
+    Label(name: string)
+
+    // `` `like this` `` -- a name the ordinary identifier grammar would refuse: a reserved word, or
+    // one carrying spaces and punctuation.
+    //
+    // **Its own token rather than an `Ident`**, and for two reasons. The contextual words -- `end`,
+    // `is`, `with` and the rest -- are matched by an identifier's text, so a quoted one is not the
+    // word and `` `end` `` names something instead of closing a block. And a `match` arm has to tell
+    // a reference from a binding, which is the whole of what the quoting means there.
+    QuotedIdent(name: string)
+
+    // A name the grammar has not taken.
+    Ident(name: string)
+
+    // A word the grammar has taken, or an operator. **One variant for both**, as the bootstrap
+    // compiler has: what separates them is only which table the spelling came out of, and every
+    // place that asks about one asks by spelling anyway.
+    Keyword(text: string)
+
+    // The end of a statement. A line ending that the layout rules count is one of these; one inside
+    // brackets, or after an operator that cannot finish an expression, is not.
+    Newline
+
+    // A block opening and a block closing. Nothing above this file looks at a column.
+    Indent
+    Dedent
+
+    // The end of the input, so that a parser reading past the last token has something to point at.
+    Eof
+end Tok
+
+// A whole file read: its tokens, and the documentation comments it carried.
+//
+// **The doc comments come out beside the tokens rather than in them**, because a comment is trivia:
+// no grammar rule can see one, nothing in the analyzer reads one, and a program compiles identically
+// with every one of them deleted. What wants them is `sysl doc` and an editor's hover text, and both
+// of those want the text and where it was, which is what this is.
+struct Lexed
+    tokens: Buf[Spanned[Tok]]
+
+    // Each `/** ... */` comment in the file, in source order, with its own extent. The text is the
+    // comment exactly as it was written, delimiters included; stripping the margin and reading the
+    // tags belongs to whatever generates the documentation.
+    docs: Buf[Spanned[string]]
+end Lexed
+
+// Read a whole source into tokens.
+//
+// **The first mistake stops the read**, and there is one diagnostic rather than a report of several.
+// A lexical mistake in sysl is nearly always a literal that did not end where the writer thought it
+// did -- an unclosed quote, a comment that swallowed the code under it -- and everything after such
+// a token is being read in the wrong language, so a second complaint about it is noise at best and a
+// wrong line number at worst.
+lex(src: Source) -> Result[Buf[Spanned[Tok]], Diagnostic] = Ok(lex_documented(src)?.tokens)
+
+// The same read, with the documentation comments kept.
+lex_documented(src: Source) -> Result[Lexed, Diagnostic]
+    var s = scan(src)
+    var lay = layout()
+    var out: Buf[Spanned[Tok]] = buf()
+    var docs: Buf[Spanned[string]] = buf()
+
+    // Whether the cursor is at the head of a line whose indentation has not been measured yet.
+    var at_line_head = true
+
+    // Whether any line has been read. The first line of a file ends no statement, so it gets no
+    // `Newline` before it; this is what tells it from an identical line further down.
+    var started = false
+
+    loop
+        if at_line_head
+            // A line's indentation is measured at its first non-blank character, **comment or not**.
+            // A line opening with a block comment and carrying code after it indents by where the
+            // comment starts, so that a wide gap after a `*/` cannot open a block the writer did not
+            // ask for.
+            val margin = s.offset
+            val ind = measure_indent(&s, TabWidth)
+
+            skip_trivia(&s, &docs)?
+
+            if s.at_end() then break
+
+            // A line with nothing on it but blanks, or nothing but comments, is not a line: it ends
+            // no statement and opens no block, and a person who lined a comment up with the code
+            // below it did not mean to open one.
+            if s.at_line_end()
+                s.accept_newline()
+                continue
+
+            if ind.is_mixed()
+                return Err(error(point(margin),
+                    "only tabs or spaces (but not both on a given line) may be used for indentation"))
+
+            emit_dent(&out, lay.line(ind.columns), point(s.offset), started)
+
+            started = true
+            at_line_head = false
+        else
+            skip_trivia(&s, &docs)?
+
+            if s.at_end() then break
+
+            if s.at_line_end()
+                if ends_the_statement(&s, &lay, &out) then at_line_head = true
+
+                continue
+        end if
+
+        scan_token(&s, &lay, &out)?
+    end loop
+
+    // Whatever is still open at the end of the file closes there, and the last line's statement ends
+    // there too. The empty span at the end is where a complaint about running out points.
+    val eof = point(s.offset)
+
+    out.push(Spanned(Newline, eof))
+
+    for _ in 0..<lay.finish()
+        out.push(Spanned(Dedent, eof))
+        out.push(Spanned(Newline, eof))
+
+    out.push(Spanned(Eof, eof))
+    Ok(Lexed(out, docs))
+end lex_documented
+
+// Turn one line's indentation into the tokens that stand for it.
+//
+// **A `Newline` comes before an `Indent` and after a `Dedent`**, which is the shape the bootstrap
+// compiler emits and therefore the shape sysl's grammar is written against: a block's first line is
+// preceded by the newline that ended the header, and each block a line closes is followed by the
+// newline that ends the statement outside it.
+//
+// A **ragged** line -- one less indented than the line above and matching no level still open -- is
+// not a lexical error. It closes the innermost block and carries on at the nearest level below it,
+// exactly as the bootstrap does, and what goes wrong is reported by whichever rule the line then
+// fails to satisfy.
+private emit_dent(out: *Buf[Spanned[Tok]], d: Dent, at: Span, started: bool)
+    d match
+        Same ->
+            if started then out.push(Spanned(Newline, at))
+        Deeper ->
+            if started then out.push(Spanned(Newline, at))
+
+            out.push(Spanned(Indent, at))
+        Shallower(levels) -> close_levels(out, levels, at, started)
+        Ragged(levels) -> close_levels(out, levels, at, started)
+end emit_dent
+
+private close_levels(out: *Buf[Spanned[Tok]], levels: usize, at: Span, started: bool)
+    if started then out.push(Spanned(Newline, at))
+
+    for _ in 0..<levels
+        out.push(Spanned(Dedent, at))
+        out.push(Spanned(Newline, at))
+end close_levels
+
+// Whether the line ending under the cursor ends a statement, having consumed it either way.
+//
+// Four things can be true at a line ending and only one of them ends anything:
+//
+//   - the newline is inside brackets, where the off-side rule is suspended;
+//   - the token before it opens a block, which puts the rule back **inside** those brackets;
+//   - the token before it cannot finish an expression, so the line goes on;
+//   - the next line begins with a `.` and a name, so it belongs to this one.
+private ends_the_statement(s: *Scanner, lay: *Layout, out: *Buf[Spanned[Tok]]) -> bool
+    val trigger = lay.brackets > 0 && opens_a_block(out)
+    val suspended = !lay.significant()
+    val leading = continues_before_a_dot(s, out)
+    val trailing = !suspended && continues_after_an_operator(out)
+
+    s.accept_newline()
+
+    if leading || trailing then return false
+    if suspended && !trigger then return false
+    if trigger then lay.opens_block()
+
+    true
+end ends_the_statement
+
+// The token just emitted, or `None` where nothing has been.
+private last_token(out: *Buf[Spanned[Tok]]) -> Option[Tok] =
+    if out.len() == 0 then None else Some(out.at(out.len() - 1).value)
+
+// Whether the token before this line ending opens an indented block, so that it opens one **inside
+// brackets too**.
+//
+// **There are two of them and there is a reason for each.** `match` opens its arms and `->` opens a
+// closure's body or an arm's, and a language admitting the first as an argument and refusing the
+// second would ask a reader to remember which block forms may be written where. Neither can finish
+// an expression, which is the safety condition: a token that could would make the *next* line's
+// margin significant in an argument list, which is what the bracket rule exists to prevent.
+//
+// `then`, `else` and `do` are deliberately not among them. An `if` written across lines puts its
+// `else` back at the outer margin, which is a dedent belonging to the bracket rather than to the
+// block, and that is a different mechanism rather than more of this one.
+private opens_a_block(out: *Buf[Spanned[Tok]]) -> bool =
+    last_token(out) match
+        Some(Keyword(w)) -> w == "match" || w == "->"
+        _ -> false
+
+// Whether the token before this line ending carries the expression onto the next line.
+//
+// **The rule is the narrowest one that works: an operator that cannot finish an expression continues
+// the line.** After `+`, `&&`, `==`, `<<` or a prefix `!` something must follow, so a newline there
+// cannot have been the end of a statement and there is nothing ambiguous to resolve. What is
+// excluded follows from the same rule rather than from taste, and `is_continuation` says which.
+private continues_after_an_operator(out: *Buf[Spanned[Tok]]) -> bool =
+    last_token(out) match
+        Some(Keyword(w)) -> is_continuation(w)
+        _ -> false
+
+// Whether the line under the cursor is continued by the line **after** it, which begins with a `.`
+// and a name.
+//
+// **A chain is the one expression people habitually break across lines, and the break goes before
+// the dot.** There is no operator at the end of `text(label)` for the rule above to see, so this one
+// looks at how the next line begins instead -- across blank lines and comment lines, since neither
+// is a line.
+//
+// **A name after the dot is required, and it is what makes the rule safe.** A continued line's own
+// margin is discarded, so a rule that fired on anything which could also *begin* a statement would
+// pull that line into the block above and move where the block ends. Requiring a letter or `_`
+// excludes everything else a line could start with a dot for: `..` and `..<` are ranges, `...` is a
+// variadic tail, `.0` is a tuple index, and `.*` is an import wildcard.
+//
+// **And the line above has to be one a chain could continue**, which is the exact dual of the
+// trailing rule: a trailing operator carries the line because it *cannot* finish an expression, and
+// a leading dot continues one only where the line above *could* have.
+private continues_before_a_dot(s: *Scanner, out: *Buf[Spanned[Tok]]) -> bool
+    if !can_end_an_expression(out) then return false
+
+    val m = s.mark()
+    var joined = false
+
+    s.accept_newline()
+
+    loop
+        skip_trivia_quietly(s)
+
+        if s.at_end() then break
+
+        if s.at_line_end()
+            s.accept_newline()
+            continue
+
+        if s.peek() != Some(u8('.')) then break
+
+        s.bump()
+        joined = s.peek_char() match
+            Some(c) -> is_name_start(c)
+            None -> false
+
+        break
+    end loop
+
+    s.reset(m)
+    joined
+end continues_before_a_dot
+
+// Whether the token before a line ending could have been the end of an expression.
+//
+// A reserved word could not -- there is nothing to call a method on -- so a block opened by one
+// keeps its body, and the first arm of a `match` is an arm rather than a chain hanging off the
+// header. The four reserved words that **are** values are the exception, so `self` on its own line
+// with `.field` under it is an ordinary chain. An operator that could not finish an expression has
+// already suppressed the newline at the other end, and never reaches this.
+private can_end_an_expression(out: *Buf[Spanned[Tok]]) -> bool =
+    last_token(out) match
+        None -> false
+        Some(Keyword(w)) -> !is_reserved(w) || is_value_word(w)
+        _ -> true
+
+// Everything between two tokens: blanks, line comments, and block comments, which nest and may span
+// lines. A `/** ... */` is collected on the way past.
+private skip_trivia(s: *Scanner, docs: *Buf[Spanned[string]]) -> Result[unit, Diagnostic]
+    loop
+        s.skip_blanks()
+
+        if s.starts_with("//".bytes)
+            s.skip_to_line_end()
+            return Ok(())
+
+        if !s.starts_with("/*".bytes) then return Ok(())
+
+        val m = s.mark()
+
+        s.skip_block_comment("/*".bytes, "*/".bytes, true) match
+            Err(_) -> return Err(error(point(m), "unclosed comment"))
+            Ok(_) -> ()
+
+        // **The delimiter is the whole of what makes a doc comment.** An implementation note stays
+        // an implementation note by being written `//`, and `/**/` is an empty block comment rather
+        // than a doc comment opening -- which is worth excluding here rather than discovering as an
+        // empty paragraph in somebody's generated documentation.
+        val text = s.text_from(m)
+
+        if text.len > 3 && text[0..<3] == "/**".bytes && text != "/**/".bytes
+            docs.push(Spanned(from_utf8_unchecked(text), s.span_from(m)))
+    end loop
+end skip_trivia
+
+// The same skipping, for a lookahead that must leave no trace: nothing is collected, and a comment
+// that never closes simply ends the search rather than being reported twice.
+private skip_trivia_quietly(s: *Scanner)
+    loop
+        s.skip_blanks()
+
+        if s.starts_with("//".bytes)
+            s.skip_to_line_end()
+            return
+
+        if !s.starts_with("/*".bytes) then return
+
+        s.skip_block_comment("/*".bytes, "*/".bytes, true) match
+            Err(_) -> return
+            Ok(_) -> ()
+end skip_trivia_quietly
+
+// One token, from wherever the cursor is standing.
+//
+// The cursor is known not to be at a blank, at a comment, at a line ending or at the end of the
+// input: the loop above has dealt with all four, so whatever is here begins something.
+private scan_token(s: *Scanner, lay: *Layout, out: *Buf[Spanned[Tok]]) -> Result[unit, Diagnostic]
+    val m = s.mark()
+
+    s.peek_char() match
+        None -> Err(error(point(m), "illegal character"))
+        Some(c) ->
+            if c == '\'' then
+                scan_label_or_char(s, out, m)
+            elif is_name_start(c) then
+                scan_word(s, out, m)
+            elif c >= '0' && c <= '9' then
+                scan_number(s, out, m)
+            elif c == '"' then
+                scan_string(s, out, m, Quoted.Plain)
+            elif c == '`' then
+                scan_quoted_ident(s, out, m)
+            else
+                scan_punct(s, lay, out, m)
+end scan_token
+
+// A word: an identifier, one of the words the grammar has taken, or the prefix of a literal.
+//
+// **A literal's prefix has to be the whole identifier**, which is why it is spotted after the name
+// has been read rather than before: `sfoo"..."` is an ordinary name beside a string, and `abc` is a
+// name whose last letter is not a `c"..."`.
+private scan_word(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit, Diagnostic]
+    read_name(s)
+
+    val text = s.text_from(m)
+
+    if s.peek() == Some(u8('"'))
+        if text == "c".bytes then return scan_string(s, out, m, Quoted.CStr)
+        if text == "raw".bytes then return scan_string(s, out, m, Quoted.Raw)
+        if text == "s".bytes then return scan_interpolated(s, out, m, false)
+        if text == "f".bytes then return scan_interpolated(s, out, m, true)
+
+    val name = from_utf8_unchecked(text)
+
+    out.push(Spanned(if is_reserved(name) then Keyword(name) else Ident(name), s.span_from(m)))
+    Ok(())
+end scan_word
+
+// `` `a name` `` -- everything up to the closing backtick, taken literally.
+//
+// There are no escapes inside, so a name can never carry a backtick, which is what keeps the scan a
+// single walk and the form unambiguous to a reader. A newline ends the search rather than the name,
+// so an unclosed quote is reported on the line that opened it instead of swallowing the file.
+private scan_quoted_ident(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit, Diagnostic]
+    s.bump()
+
+    val from = s.offset
+
+    s.accept_while((c) -> c != u8('`') && c != u8('\n'))
+
+    val name = s.text_from(from)
+
+    if !s.accept(u8('`')) then return Err(error(point(m), "unterminated quoted identifier"))
+    if name.len == 0 then return Err(error(point(m), "a quoted identifier needs a name between the backticks"))
+
+    // A qualified name is carried through the compiler as a dotted string, so a dot inside one part
+    // could not be told from the separator between two.
+    for i in 0..<name.len
+        if name[i] == u8('.')
+            return Err(error(point(m),
+                "a quoted identifier may not contain '.', which separates the parts of a qualified name"))
+
+    out.push(Spanned(QuotedIdent(from_utf8_unchecked(name)), s.span_from(m)))
+    Ok(())
+end scan_quoted_ident
+
+// An operator or a delimiter, tokenized by longest match.
+//
+// The brackets do the layout's bookkeeping on the way past, and two of them emit tokens before
+// themselves: a `)` closing a block that opened inside it, and a `,` separating an argument from a
+// block written as the one before it. Neither block has a line ending coming for it -- the `)` and
+// the `,` are on the block's own last line -- so the tokens that close it are written here.
+private scan_punct(s: *Scanner, lay: *Layout, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit, Diagnostic]
+    read_operator(s) match
+        None -> Err(error(point(m), "illegal character"))
+        Some(op) ->
+            val at = s.span_from(m)
+
+            if op == "(" || op == "[" || op == "{"
+                lay.open_bracket()
+            elif op == ")" || op == "]" || op == "}"
+                emit_drain(out, lay.close_bracket(), at)
+            elif op == ","
+                emit_drain(out, lay.close_blocks_in_bracket(), at)
+
+            out.push(Spanned(Keyword(op), at))
+            Ok(())
+end scan_punct
+
+// The `Dedent`s a bracket or a separator closed, with the `Newline` that ends the statement they
+// were the last line of. There is no line ending here to stand for it, which is the whole reason
+// the layout hands back a count.
+private emit_drain(out: *Buf[Spanned[Tok]], closed: usize, at: Span)
+    if closed == 0 then return
+
+    out.push(Spanned(Newline, at))
+
+    for _ in 0..<closed
+        out.push(Spanned(Dedent, at))
+end emit_drain
+
+// -- names ----------------------------------------------------------------------------------------
+
+// What may begin a name: `_`, or any character Unicode calls a letter.
+//
+// **`café`, `año`, `mu` and a name in Japanese are all names, and that is a readability decision
+// rather than an internationalization one.** A language whose identifiers are ASCII asks everybody
+// who does not think in English to transliterate their own vocabulary, and the words that suffer
+// most are the domain ones -- the very names a reader needs to recognize.
+//
+// **It stops at the Basic Multilingual Plane, which is a real edge rather than an oversight.** Every
+// living script's letters are inside it, CJK Unified Ideographs included; what is outside is the
+// historic scripts and the CJK extension planes. The bootstrap compiler draws the line in the same
+// place, where it falls out of a `Char` being one UTF-16 unit, and it is drawn deliberately here so
+// that the two compilers refuse the same programs.
+is_name_start(c: char) -> bool =
+    c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (u32(c) <= 0xFFFF && unicode.is_alpha(c))
+
+// What may continue one: anything that may begin it, plus a digit.
+//
+// **Unicode's digits, not ASCII's**, so a name written in a script with its own digits may use them.
+// The number *literal* grammar is deliberately unmoved: a literal is a value the arithmetic has to
+// read, and a digit outside ASCII is not a spelling of a number any of it knows.
+private is_name_cont(c: char) -> bool =
+    is_name_start(c) || (c >= '0' && c <= '9') || (u32(c) <= 0xFFFF && unicode.is_digit(c))
+
+// The name under the cursor, consumed. The ASCII test comes first because it is what almost every
+// character is, and asking Unicode is a table lookup.
+read_name(s: *Scanner)
+    loop
+        s.peek() match
+            None -> break
+            Some(b) ->
+                if b < 128
+                    if !is_name_cont(char(u32(b))) then break
+
+                    s.bump()
+                else
+                    s.peek_char() match
+                        Some(c) ->
+                            if !is_name_cont(c) then break
+
+                            s.next_char()
+                        None -> break
+end read_name

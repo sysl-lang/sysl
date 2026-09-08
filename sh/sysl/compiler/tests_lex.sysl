@@ -1,0 +1,382 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The lexer: identifiers, the words the grammar has taken, the operators, and the comments.
+//
+// The literals have a suite of their own -- `tests_lex_literal.sysl` -- because their edge cases
+// outnumber the rest of the token grammar put together, and so does the layout, whose claims are
+// about a token stream's *shape* rather than about any one token in it.
+//
+// **Every assertion here is on tokens or on a diagnostic**, which is what makes them lexer tests: a
+// claim checked by running a program is a claim about the whole compiler and belongs where the rest
+// of it does.
+
+// Every token a source lexes to, layout tokens and all, with the closing `Eof` dropped -- it is on
+// the end of every stream and says nothing about any of them.
+all(text: string) -> Buf[Tok]
+    var out: Buf[Tok] = buf()
+
+    for t in lex(source_of("test.sysl", text)).unwrap().view()
+        if t.value != Eof then out.push(t.value)
+
+    out
+end all
+
+// Just the lexical content, with the structural tokens dropped, for a claim about values.
+bare(text: string) -> Buf[Tok]
+    var out: Buf[Tok] = buf()
+
+    for t in all(text).view()
+        if t != Newline && t != Indent && t != Dedent then out.push(t)
+
+    out
+end bare
+
+// An expected list, written the way the tokens read.
+of(ts: []const Tok) -> Buf[Tok]
+    var out: Buf[Tok] = buf()
+
+    for t in ts
+        out.push(t)
+
+    out
+end of
+
+// The message of the diagnostic a malformed source produces.
+bad(text: string) -> string =
+    lex(source_of("test.sysl", text)) match
+        Ok(_) -> "no diagnostic"
+        Err(d) -> d.message
+
+// Where that diagnostic points, as a byte offset.
+bad_at(text: string) -> usize =
+    lex(source_of("test.sysl", text)) match
+        Ok(_) -> 0
+        Err(d) -> d.span.start
+
+// The tokens with the extents they came from.
+spanned(text: string) -> Buf[Spanned[Tok]] = lex(source_of("test.sysl", text)).unwrap()
+
+// The documentation comments a source carried, in source order.
+docs_of(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for d in lex_documented(source_of("test.sysl", text)).unwrap().docs.view()
+        out.push(d.value)
+
+    out
+end docs_of
+
+// -- identifiers ----------------------------------------------------------------------------------
+
+@test("an identifier is a letter or an underscore and then letters, digits and underscores")
+an_identifier()
+    assert_eq(bare("foo_bar1"), of([Ident("foo_bar1")]))
+    assert_eq(bare("_"), of([Ident("_")]))
+    assert_eq(bare("_x9"), of([Ident("_x9")]))
+
+@test("a letter is whatever Unicode calls one, so a name may be written in any script")
+a_name_in_any_script()
+    assert_eq(bare("año"), of([Ident("año")]))
+    assert_eq(bare("área"), of([Ident("área")]))
+    assert_eq(bare("Círculo"), of([Ident("Círculo")]))
+    assert_eq(bare("名前"), of([Ident("名前")]))
+
+@test("a digit is Unicode's too, but only inside a name")
+a_unicode_digit_may_not_begin_a_name()
+    assert_eq(bare("caf٣"), of([Ident("caf٣")]))
+    assert_eq(bad("٣"), "illegal character")
+
+@test("nothing is normalized, so a name is the spelling that was written")
+no_normalization()
+    val precomposed = "caf\u{e9}"
+
+    assert_eq(bare(precomposed), of([Ident(precomposed)]))
+    assert(bare(precomposed) != bare("caf\u{e8}"), "two accents, two names")
+
+@test("a combining mark may not continue a name, being neither a letter nor a digit")
+a_combining_mark_is_not_a_name_character()
+    // The rule is Unicode's *letter*, which is narrower than UAX #31's `ID_Continue`: a combining
+    // acute is category Mn and continues nothing. The reference page illustrates non-normalization
+    // with an `e` and a combining acute, and that spelling is not a name in either compiler.
+    assert_eq(bad("cafe\u{301}"), "illegal character")
+    assert_eq(bad_at("cafe\u{301}"), 4)
+
+@test("a letter above the Basic Multilingual Plane is refused")
+above_the_bmp_is_refused()
+    assert_eq(bad("val 𠮷 = 1"), "illegal character")
+    assert_eq(bad_at("val 𠮷 = 1"), 4)
+
+@test("an operator-shaped character is not a letter and never was")
+an_operator_shaped_character_is_not_a_letter()
+    assert_eq(bad("1 × 2"), "illegal character")
+    assert_eq(bad("1 ÷ 2"), "illegal character")
+
+@test("case is significant")
+case_is_significant()
+    assert(bare("Value") != bare("value"), "two spellings, two names")
+
+@test("a reserved identifier is an ordinary identifier here, being a predeclared name")
+a_reserved_identifier_is_a_name()
+    assert_eq(bare("__FILE__"), of([Ident("__FILE__")]))
+    assert_eq(bare("__MY_THING__"), of([Ident("__MY_THING__")]))
+
+// -- reserved and contextual words ----------------------------------------------------------------
+
+@test("a reserved word tokenizes as a keyword")
+a_reserved_word_is_a_keyword()
+    assert_eq(bare("weak"), of([Keyword("weak")]))
+    assert_eq(bare("true"), of([Keyword("true")]))
+
+@test("all forty of them, and nothing else")
+the_forty_reserved_words()
+    val words = ["alignof", "as", "break", "const", "continue",
+                 "defer", "do", "elif", "else", "ensure",
+                 "enum", "extern", "false", "for", "if",
+                 "impl", "import", "in", "loop", "match",
+                 "module", "null", "offsetof", "override", "private",
+                 "ref", "require", "return", "self", "sizeof",
+                 "static", "struct", "then", "trait", "true",
+                 "type", "val", "var", "weak", "while"]
+
+    assert_eq(words.len, 40)
+
+    for w in words
+        assert_eq(bare(w), of([Keyword(w)]), s"'${w}' is reserved")
+
+@test("a type name is an ordinary identifier, which is what keeps the iN family open")
+a_type_name_is_not_reserved()
+    for w in ["int", "usize", "f32", "bool", "string", "u12", "i5", "u256", "real", "byte"]
+        assert_eq(bare(w), of([Ident(w)]), s"'${w}' is a predeclared name, not a word")
+
+@test("a contextual word is an ordinary identifier, so a variable may be called 'where'")
+a_contextual_word_is_a_name()
+    for w in ["is", "not", "end", "become", "opaque", "derives", "invariant",
+              "new", "set", "some", "with", "within", "where", "c"]
+        assert_eq(bare(w), of([Ident(w)]), s"'${w}' is contextual, not reserved")
+
+@test("alloc, no and requires are not reserved, though they read like keywords")
+the_capability_words_are_not_reserved()
+    for w in ["alloc", "no", "requires"]
+        assert_eq(bare(w), of([Ident(w)]), s"'${w}' is an ordinary name")
+
+// -- operators ------------------------------------------------------------------------------------
+
+@test("operators tokenize by longest match")
+operators_by_longest_match()
+    assert_eq(bare("<<="), of([Keyword("<<=")]))
+    assert_eq(bare("<<"), of([Keyword("<<")]))
+    assert_eq(bare("a += b"), of([Ident("a"), Keyword("+="), Ident("b")]))
+
+@test("..< wins over .. and ... over ..")
+the_range_operators()
+    assert_eq(bare("..<"), of([Keyword("..<")]))
+    assert_eq(bare("..."), of([Keyword("...")]))
+    assert_eq(bare(".."), of([Keyword("..")]))
+
+@test("the wildcard import's tail is one token")
+the_wildcard_tail_is_one_token()
+    assert_eq(bare("import isa.*"), of([Keyword("import"), Ident("isa"), Keyword(".*")]))
+
+@test("the whole operator set lexes as itself")
+every_operator()
+    val ops = ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+               "||", "&&", "!",
+               "==", "!=", "<", ">", "<=", ">=",
+               "..", "..<", "...",
+               "|", "^", "&", "~",
+               "+", "-", "*", "/", "%", "<<", ">>",
+               "++", "--",
+               "(", ")", "[", "]", "{", "}", ".", "?",
+               ".*",
+               ",", "::", ":", "->",
+               "@", "#", ";"]
+
+    for op in ops
+        assert_eq(bare(op), of([Keyword(op)]), s"'${op}' is one token")
+
+@test("a character no rule wants is an illegal character, reported where it stands")
+an_unknown_character()
+    assert_eq(bad("a $ b"), "illegal character")
+    assert_eq(bad_at("a $ b"), 2)
+
+// -- loop labels ----------------------------------------------------------------------------------
+
+@test("a loop label is told from a character by its missing closing quote")
+a_label_has_no_closing_quote()
+    assert_eq(bare("'outer"), of([Label("outer")]))
+    assert_eq(bare("break 'scan"), of([Keyword("break"), Label("scan")]))
+
+@test("'x' with a closing quote stays a character literal")
+a_closing_quote_makes_it_a_character()
+    assert_eq(bare("'x'"), of([CharLit('x')]))
+    assert_eq(bare("'_'"), of([CharLit('_')]))
+
+@test("a label may hold digits and underscores after its first letter")
+a_label_may_hold_digits()
+    assert_eq(bare("'loop_2"), of([Label("loop_2")]))
+
+@test("a labeled loop keyword and an array of characters do not confuse the two")
+labels_and_character_arrays()
+    assert_eq(bare("'top for"), of([Label("top"), Keyword("for")]))
+    assert_eq(bare("['a', 'b']"), of([Keyword("["), CharLit('a'), Keyword(","), CharLit('b'), Keyword("]")]))
+
+// -- quoted identifiers ---------------------------------------------------------------------------
+
+@test("an ordinary word, quoted, is the same name")
+a_quoted_ordinary_word()
+    assert_eq(bare("`hello`"), of([QuotedIdent("hello")]))
+
+@test("a quoted identifier may hold spaces and punctuation")
+a_quoted_name_holds_anything()
+    assert_eq(bare("`hello world`"), of([QuotedIdent("hello world")]))
+    assert_eq(bare("`get-thing`"), of([QuotedIdent("get-thing")]))
+    assert_eq(bare("`a+b`"), of([QuotedIdent("a+b")]))
+    assert_eq(bare("`3 sheets`"), of([QuotedIdent("3 sheets")]))
+
+@test("a reserved word between backticks is a name")
+a_quoted_reserved_word()
+    assert_eq(bare("`match`"), of([QuotedIdent("match")]))
+    assert_eq(bare("`struct`"), of([QuotedIdent("struct")]))
+    assert_eq(bare("`if`"), of([QuotedIdent("if")]))
+
+@test("a contextual word quoted is a distinct token from the bare word")
+a_quoted_contextual_word()
+    assert_eq(bare("end"), of([Ident("end")]))
+    assert_eq(bare("`end`"), of([QuotedIdent("end")]))
+
+@test("a backtick is not an illegal character")
+a_lone_backtick()
+    assert_eq(bad("`"), "unterminated quoted identifier")
+
+@test("unterminated, and a newline does not close it")
+an_unterminated_quoted_identifier()
+    assert_eq(bad("`oops"), "unterminated quoted identifier")
+    assert_eq(bad("`oops\nmore`"), "unterminated quoted identifier")
+
+@test("a quoted identifier needs a name between the backticks")
+an_empty_quoted_identifier()
+    assert_eq(bad("``"), "a quoted identifier needs a name between the backticks")
+
+@test("a dot is refused, since a qualified name is carried as a dotted string")
+a_dot_in_a_quoted_identifier()
+    assert_eq(bad("`a.b`"), "a quoted identifier may not contain '.', which separates the parts of a qualified name")
+
+// -- comments -------------------------------------------------------------------------------------
+
+@test("comments are skipped")
+comments_are_skipped()
+    assert_eq(bare("1 // trailing\n2"), of([IntLit("1", 10, ""), IntLit("2", 10, "")]))
+    assert_eq(bare("1 /* inline */ 2"), of([IntLit("1", 10, ""), IntLit("2", 10, "")]))
+
+@test("a block comment nests, so an inner close does not end the outer one")
+block_comments_nest()
+    assert_eq(bare("1 /* outer /* inner */ still outer */ 2"), of([IntLit("1", 10, ""), IntLit("2", 10, "")]))
+
+@test("they nest to any depth")
+block_comments_nest_deeply()
+    assert_eq(bare("1 /* a /* b /* c */ b */ a */ 2"), of([IntLit("1", 10, ""), IntLit("2", 10, "")]))
+
+@test("an opener inside a line comment opens nothing")
+an_opener_inside_a_line_comment()
+    assert_eq(bare("1 // /* not a comment\n2"), of([IntLit("1", 10, ""), IntLit("2", 10, "")]))
+
+@test("a comment spanning lines joins what surrounds it")
+a_comment_spanning_lines()
+    assert_eq(bare("1 /* one\ntwo\nthree */ 2"), of([IntLit("1", 10, ""), IntLit("2", 10, "")]))
+
+@test("one closing the file with no newline after it is still closed")
+a_comment_closing_the_file()
+    assert_eq(bare("1\n/* done */"), of([IntLit("1", 10, "")]))
+
+@test("a block comment that never closes is reported where it opened")
+an_unclosed_block_comment()
+    assert_eq(bad("var a = 1\n/* oops\n"), "unclosed comment")
+    assert_eq(bad_at("var a = 1\n/* oops\n"), 10)
+
+@test("a nested opener inside a comment about a glob runs the comment on")
+the_glob_hazard()
+    // `/* a glob pattern: src/** */` opens a second comment at `c/*` and closes only that, so the
+    // outer one runs to the end of the file. It is the cost of nesting and is documented as one.
+    assert_eq(bad("/* a glob pattern: src/** */\nprint(1)\n"), "unclosed comment")
+
+// -- documentation comments -----------------------------------------------------------------------
+
+@test("the lexer collects the doc form and leaves every other comment alone")
+doc_comments_are_collected()
+    assert_eq(docs_of("/** documented */\nval n = 1\n"), of_text(["/** documented */"]))
+    assert_eq(docs_of("/* just a note */\nval n = 1\n").len(), 0)
+    assert_eq(docs_of("// a long and careful explanation\nval n = 1\n").len(), 0)
+
+@test("the empty block comment is not a doc comment opening")
+the_empty_block_comment()
+    assert_eq(docs_of("/**/\nval n = 1\n").len(), 0)
+
+@test("several are collected in source order, and each of them once")
+several_doc_comments()
+    assert_eq(docs_of("/** first */\nval a = 1\n\n/** second */\nval b = 2\n"),
+              of_text(["/** first */", "/** second */"]))
+    assert_eq(docs_of("val a = 1\n/** about b */\nval b = 2\n"), of_text(["/** about b */"]))
+
+@test("a doc comment is trivia, so it cannot change what a program means")
+a_doc_comment_is_trivia()
+    assert_eq(all("/** the answer */\nval n = 42\n"), all("val n = 42\n"))
+
+of_text(ts: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for t in ts
+        out.push(t)
+
+    out
+end of_text
+
+// -- spans ----------------------------------------------------------------------------------------
+
+@test("a token knows the extent it was read from")
+a_token_carries_its_extent()
+    val ts = spanned("ab cd")
+
+    assert_eq(ts.at(0).value, Ident("ab"))
+    assert_eq(ts.at(0).span, Span(0, 2))
+    assert_eq(ts.at(1).value, Ident("cd"))
+    assert_eq(ts.at(1).span, Span(3, 5))
+
+@test("a literal's extent is the whole lexeme, quotes and prefix included")
+a_literal_carries_its_whole_extent()
+    val ts = spanned("c\"hi\"")
+
+    assert_eq(ts.at(0).value, CStrLit("hi"))
+    assert_eq(ts.at(0).span, Span(0, 5))
+
+@test("an extent survives a line, so a diagnostic on line two names line two")
+an_extent_on_a_later_line()
+    val src = source_of("test.sysl", "a\nbc")
+    val ts = lex(src).unwrap()
+
+    assert_eq(ts.at(0).span, Span(0, 1))
+    assert_eq(src.locate(ts.at(2).span.start), Loc(2, 1))
+
+@test("the end of the input is a token of its own, with an empty extent there")
+the_end_of_the_input()
+    val ts = spanned("a")
+
+    assert_eq(ts.at(ts.len() - 1).value, Eof)
+    assert_eq(ts.at(ts.len() - 1).span, Span(1, 1))
+
+// -- source text ----------------------------------------------------------------------------------
+
+@test("a file need not end in a newline")
+no_trailing_newline_is_needed()
+    assert_eq(bare("var a = 1"), of([Keyword("var"), Ident("a"), Keyword("="), IntLit("1", 10, "")]))
+
+@test("line endings may be LF or CRLF")
+either_line_ending()
+    assert_eq(all("a\nb"), all("a\r\nb"))
+
+@test("non-ASCII text is legal in a comment")
+non_ascii_in_a_comment()
+    assert_eq(bare("1 // ¿qué? 名前\n2"), of([IntLit("1", 10, ""), IntLit("2", 10, "")]))

@@ -1,0 +1,133 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+
+// The words and the operators sysl has taken, and the three questions the layout asks about them.
+//
+// **They are tables rather than code because the sets are closed and short.** There are no
+// user-defined operators and no way to add one, and forty reserved words is the whole list -- so the
+// spelling of the language is a thing a reader can look at, which is what this file is for.
+
+// The forty reserved words.
+//
+// **Type names are deliberately absent.** `int`, `usize`, `f32`, `bool` and `string` are
+// *predeclared identifiers* the analyzer resolves, exactly as in Go and Swift, which is what lets
+// the `iN` / `uN` / `fN` families stay open: `u12` and `i5` are types a program may write without
+// the lexer having heard of them, and no list of widths has to be kept anywhere.
+//
+// **The contextual words are absent too** -- `is`, `not`, `end`, `become`, `opaque`, `derives`,
+// `invariant`, `new`, `set`, `some`, `with`, `within`, `where`, and the `c` of a `c const` block.
+// Each is special only where the grammar expects one and an ordinary identifier everywhere else, so
+// a variable may be called `where` and a struct may have a field called `set`. A word is contextual
+// rather than reserved whenever it can be, because a reserved word is spent out of every program's
+// namespace for the sake of one line apiece.
+private val Reserved: []const string = [
+    "true", "false", "null",
+    "var", "val", "ref", "const", "static",
+    "if", "then", "elif", "else",
+    "while", "loop", "do", "for", "in",
+    "break", "continue", "defer",
+    "match",
+    "struct", "enum", "trait", "impl", "override", "extern",
+    "module", "import", "as", "private",
+    "return", "self", "weak",
+    "sizeof", "alignof", "offsetof",
+    "require", "ensure", "type",
+]
+
+// The four reserved words that are **values**, and so can end an expression. Everything else in the
+// table above introduces something, so a line ending in one has not finished an expression and there
+// is nothing under it for a chain to continue.
+private val ValueWords: []const string = ["self", "true", "false", "null"]
+
+// The operators that carry an expression onto the next line: the ones that cannot finish one.
+//
+// The exclusions follow from that rule rather than from taste. **`=` and `->`** are binary but
+// already open an indented block -- a function body, a match arm -- and one token cannot mean both
+// "the block starts here" and "the line goes on". **`++`, `--` and `?`** are postfix, so a line
+// ending in one is already complete. **`..`, `..<` and `...`** can be complete too: `s[..]` is the
+// whole range and `int...` is a variadic tail. **`.`** would work, but the continuation style worth
+// having for a call chain puts the dot at the start of the next line, which needs the opposite
+// mechanism. **`,`, `:` and `;`** are separators, and the only one with a real customer already
+// continues wherever it appears, since an argument list is bracketed.
+//
+// The prefix operators are in: `!`, `~` and the unary readings of `-`, `*` and `&` cannot finish an
+// expression either, and leaving them out would make this a list to memorize instead of a rule.
+private val Continuations: []const string = [
+    "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=",
+    "||", "&&", "!",
+    "==", "!=", "<", ">", "<=", ">=",
+    "|", "^", "&", "~",
+    "+", "-", "*", "/", "%", "<<", ">>",
+]
+
+// The operator set, by width, longest first.
+//
+// **Longest match, and it is the same answer either way because the set is prefix-closed**: every
+// proper prefix of an operator is itself an operator, so `..<` wins over `..` and `<<=` over `<<`
+// without any rule about which alternative to try.
+private val Ops3: []const string = ["<<=", ">>=", "..<", "..."]
+
+private val Ops2: []const string = [
+    "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+    "||", "&&", "==", "!=", "<=", ">=",
+    "..", "<<", ">>", "++", "--",
+    // **The wildcard import's tail is one token rather than a `.` and a `*`.** A `.` is otherwise
+    // only ever followed by a name, so the pair is unambiguous -- and lexing it together is what
+    // lets `*` stay in the continuation set, since a line then never ends in a bare `*` that was
+    // really the end of a statement.
+    ".*",
+    "::", "->",
+]
+
+private val Ops1: []const string = [
+    "=", "!", "<", ">", "|", "^", "&", "~",
+    "+", "-", "*", "/", "%",
+    "(", ")", "[", "]", "{", "}", ".", "?",
+    ",", ":",
+    // `@` opens an **annotation** and `#` opens a **directive**, and between them they are a
+    // declaration's only prefixes that are not words. Nothing in the expression grammar spells
+    // either, so a line beginning with one can only be the one thing and the reading needs no
+    // lookahead. `#` is kept a token although no declaration form reads one, so that a `#` reaching
+    // the grammar is answered by a sentence naming `@` rather than by a complaint about a character
+    // the lexer does not know.
+    "@", "#",
+    // Only ever a separator inside a three-clause `for` header. It is deliberately not a statement
+    // terminator: a line ends a statement, and a token that could also end one would give the
+    // language two answers to the same question.
+    ";",
+]
+
+is_reserved(w: string) -> bool = holds(Reserved, w)
+
+is_value_word(w: string) -> bool = holds(ValueWords, w)
+
+is_continuation(w: string) -> bool = holds(Continuations, w)
+
+private holds(table: []const string, w: string) -> bool
+    for t in table
+        if t == w then return true
+
+    false
+end holds
+
+// The operator standing at the cursor, consumed. Nothing is allocated: the answer is the table's own
+// spelling, which is a view over constant bytes rather than a copy of what was read.
+read_operator(s: *Scanner) -> Option[string]
+    for op in Ops3
+        if s.starts_with(op.bytes)
+            s.skip(3)
+            return Some(op)
+
+    for op in Ops2
+        if s.starts_with(op.bytes)
+            s.skip(2)
+            return Some(op)
+
+    for op in Ops1
+        if s.starts_with(op.bytes)
+            s.skip(1)
+            return Some(op)
+
+    None
+end read_operator

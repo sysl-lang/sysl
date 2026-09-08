@@ -1,0 +1,779 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Ascii, StrBuilder, char_from_u32, from_utf8_unchecked, str_builder}
+
+// The literals: what a number, a character, a string and an interpolated string say.
+//
+// **A literal is where a lexer stops being a classifier and becomes a reader.** Everything else in
+// this pass answers "what kind of token is this"; here the answer is a *value*, and the value
+// differs from what was written. That is why the escape table, the digit separators, a text block's
+// incidental indentation and an interpolation's holes are all in one file: they are the same job.
+
+// Which quote form is being read, which is the whole of what the prefixes differ by.
+enum Quoted
+    // `"..."` -- a `string`, with escapes decoded.
+    Plain
+
+    // `c"..."` -- the same value, laid down with the terminator C expects.
+    CStr
+
+    // `raw"..."` -- left exactly alone: no escapes and no holes.
+    //
+    // **`raw` means raw, which is one rule rather than two thirds of one.** Scala's `raw` is an
+    // interpolator that happens to leave backslashes alone, and copying it left the one combination
+    // nobody could write: a plain literal reads no `${...}` and *does* decode escapes, so "leave all
+    // of it alone" had no spelling at all. That is the only thing a literal carrying another
+    // language's source can use, and `${` is not exotic -- shell, Make, Kotlin, Groovy and
+    // JavaScript template literals all spell interpolation with it.
+    Raw
+end Quoted
+
+private str_token(kind: Quoted, value: string) -> Tok =
+    kind match
+        CStr -> CStrLit(value)
+        _ -> StrLit(value)
+
+// -- numbers --------------------------------------------------------------------------------------
+
+// A numeric literal: decimal, `0x`, `0b` or `0o`, with `_` between digits and a canonical type name
+// as a suffix.
+//
+// **The scan is greedy and validated afterwards rather than stopping at the first character that
+// does not fit.** That is why `42abc` is *one bad literal* with a clear diagnostic, rather than `42`
+// followed by an identifier and a confusing parse error further along -- which is only knowable once
+// the trailing word has been consumed.
+scan_number(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit, Diagnostic]
+    var base = 10
+    var prefixed = false
+
+    if s.peek() == Some(u8('0'))
+        s.peek_at(1) match
+            Some(p) ->
+                if p == u8('x') then
+                    base = 16
+                    prefixed = true
+                elif p == u8('b') then
+                    base = 2
+                    prefixed = true
+                elif p == u8('o') then
+                    base = 8
+                    prefixed = true
+            None -> ()
+
+    if prefixed then s.skip(2)
+
+    val mantissa_at = s.offset
+
+    s.accept_while((c) -> c == u8('_') || c.digit_value(base).is_some())
+
+    val mantissa = s.text_from(mantissa_at)
+
+    // A `.` is part of the number only when a digit follows it, which is what keeps `0..<n` three
+    // tokens and `1.max()` a method call on an integer.
+    var fraction_at: usize = 0
+    var fraction_end: usize = 0
+    var has_fraction = false
+
+    if base == 10 && s.peek() == Some(u8('.')) && is_ascii_digit(s.peek_at(1))
+        s.bump()
+
+        fraction_at = s.offset
+
+        s.accept_while((c) -> c == u8('_') || is_digit(c))
+
+        fraction_end = s.offset
+        has_fraction = true
+    end if
+
+    // An `e` is part of it only when digits, or a sign and then digits, follow. Where they do not
+    // the `e` is left where it is and becomes the head of the suffix, which is what makes `1east` a
+    // literal with a bad suffix rather than a number beside a name.
+    var exponent_at: usize = 0
+    var exponent_end: usize = 0
+    var exponent_sign = ""
+    var has_exponent = false
+
+    if base == 10 && (s.peek() == Some(u8('e')) || s.peek() == Some(u8('E')))
+        val before_e = s.mark()
+
+        s.bump()
+
+        var sign = ""
+
+        if s.peek() == Some(u8('+')) then
+            sign = "+"
+            s.bump()
+        elif s.peek() == Some(u8('-')) then
+            sign = "-"
+            s.bump()
+
+        if is_ascii_digit(s.peek())
+            exponent_at = s.offset
+
+            s.accept_while((c) -> c == u8('_') || is_digit(c))
+
+            exponent_end = s.offset
+            exponent_sign = sign
+            has_exponent = true
+        else
+            s.reset(before_e)
+    end if
+
+    val suffix_at = s.offset
+
+    read_name(s)
+
+    val suffix = from_utf8_unchecked(s.text_from(suffix_at))
+    val at = s.span_from(m)
+
+    val digits = clean_digits(mantissa, prefixed) match
+        Err(why) -> return Err(error(point(m), why))
+        Ok(d) -> d
+
+    val float_suffix = suffix.len > 0 && suffix.bytes[0] == u8('f')
+
+    if suffix.len > 0 && !valid_suffix(suffix)
+        return Err(error(point(m), s"invalid literal suffix '${suffix}'"))
+
+    if (has_fraction || has_exponent) && suffix.len > 0 && !float_suffix
+        return Err(error(point(m), s"floating-point literal cannot have the integer suffix '${suffix}'"))
+
+    if float_suffix && base != 10
+        return Err(error(point(m), "floating-point suffix on a non-decimal literal"))
+
+    if !has_fraction && !has_exponent && !float_suffix
+        out.push(Spanned(IntLit(digits, base, suffix), at))
+        return Ok(())
+
+    var text = str_builder()
+
+    text.push(digits)
+
+    if has_fraction
+        text.push_char('.')
+        text.push(clean_digits(s.src[fraction_at..<fraction_end], true) match
+            Err(why) -> return Err(error(point(m), why))
+            Ok(d) -> d)
+
+    if has_exponent
+        // Always a lower-case `e`, whichever case it was written in, so that the text a token
+        // carries is canonical and two spellings of one value are one value.
+        text.push_char('e')
+        text.push(exponent_sign)
+        text.push(clean_digits(s.src[exponent_at..<exponent_end], true) match
+            Err(why) -> return Err(error(point(m), why))
+            Ok(d) -> d)
+
+    out.push(Spanned(FloatLit(text.finish(), suffix), at))
+    Ok(())
+end scan_number
+
+// One run of digits with its separators checked and taken out.
+//
+// **A separator sits between digits**, so it may neither trail the run nor double up; it may lead
+// only where a base prefix precedes it, since `0x_FF` has digits before it in the spelling if not in
+// the run. The answer is the run itself where it holds no separator, which is the ordinary case and
+// costs nothing.
+private clean_digits(run: []const u8, allow_leading: bool) -> Result[string, string]
+    if run.len == 0 then return Err("missing digits")
+    if run[0] == u8('_') && !allow_leading then return Err("digit separator may not lead the digits")
+    if run[run.len - 1] == u8('_') then return Err("digit separator may not trail the digits")
+
+    var separators: usize = 0
+
+    for i in 0..<run.len
+        if run[i] == u8('_')
+            separators += 1
+
+            if i + 1 < run.len && run[i + 1] == u8('_')
+                return Err("only a single digit separator may appear between digits")
+
+    if separators == 0 then return Ok(from_utf8_unchecked(run))
+
+    var b = str_builder()
+
+    for i in 0..<run.len
+        if run[i] != u8('_') then b.push_char(char(u32(run[i])))
+
+    val digits = b.finish()
+
+    if digits.len == 0 then Err("missing digits") else Ok(digits)
+end clean_digits
+
+// A suffix names a **canonical** primitive: the systematic `iN` / `uN` / `fN` forms plus the two
+// pointer-width types. The friendly aliases -- `int`, `byte`, `real` -- are not suffixes; a literal
+// reaches one of those through a type context or a cast.
+private valid_suffix(w: string) -> bool
+    if w == "usize" || w == "isize" then return true
+    if w.len < 2 then return false
+
+    val b = w.bytes
+
+    if b[0] != u8('i') && b[0] != u8('u') && b[0] != u8('f') then return false
+    if b[1] == u8('0') then return false
+
+    for i in 1..<b.len
+        if !is_digit(b[i]) then return false
+
+    true
+end valid_suffix
+
+private is_ascii_digit(c: Option[u8]) -> bool =
+    c match
+        Some(b) -> is_digit(b)
+        None -> false
+
+// -- characters and escapes -----------------------------------------------------------------------
+
+// `'name` or `'c'`, told apart by whether a closing quote follows.
+//
+// **A label is an apostrophe, a name, and no closing apostrophe**, which is the whole of the rule --
+// so `'a'` is the character `a` and `'a` is the label `a`, and neither reading needs the grammar's
+// help.
+scan_label_or_char(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit, Diagnostic]
+    val opening = s.mark()
+
+    s.bump()
+
+    val name_at = s.offset
+
+    val starts_a_name = s.peek_char() match
+        Some(c) -> is_name_start(c)
+        None -> false
+
+    if starts_a_name
+        read_name(s)
+
+        if s.peek() != Some(u8('\''))
+            out.push(Spanned(Label(from_utf8_unchecked(s.text_from(name_at))), s.span_from(m)))
+            return Ok(())
+    end if
+
+    s.reset(opening)
+    scan_char(s, out, m)
+end scan_label_or_char
+
+private scan_char(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit, Diagnostic]
+    s.bump()
+
+    if s.at_end() || s.at_line_end() then return Err(error(point(m), "unterminated character literal"))
+
+    if s.peek() == Some(u8('\''))
+        s.bump()
+        return Err(error(point(m), "empty character literal"))
+
+    val cp = read_one_char(s)?
+
+    if s.accept(u8('\''))
+        out.push(Spanned(CharLit(cp), s.span_from(m)))
+        return Ok(())
+
+    if s.at_end() || s.at_line_end() then return Err(error(point(m), "unterminated character literal"))
+
+    Err(error(point(m), "character literal must hold exactly one character"))
+end scan_char
+
+// One character of a character or string literal: an escape sequence, or the character itself.
+private read_one_char(s: *Scanner) -> Result[char, Diagnostic]
+    if s.peek() == Some(u8('\\')) then return read_escape_char(s)
+
+    s.next_char() match
+        Some(c) -> Ok(c)
+        None -> Err(error(point(s.offset), "illegal character"))
+end read_one_char
+
+// The escapes a character or string literal accepts: `\n` `\t` `\r` `\b` `\f` `\0` `\\` `\'` `\"`,
+// and `\u{...}` for anything else.
+//
+// **The named ones are the set C fixed and every language since has carried**, so a programmer
+// arriving from one of them finds what they reach for -- and it is deliberately no larger. The
+// notable absence is `\e` for the escape character, which ANSI terminal code wants more than it
+// wants any of the above: it is a GNU extension rather than standard C, and Rust and Go both refuse
+// it. A program that needs it writes `'\u{1b}'` once and gives it a name.
+private read_escape_char(s: *Scanner) -> Result[char, Diagnostic]
+    val start = s.offset
+
+    s.bump()
+
+    if s.at_end() then return Err(error(point(start), "incomplete escape sequence"))
+
+    val c = s.peek() match
+        Some(b) -> b
+        None -> u8(0)
+
+    if c == u8('n') then
+        s.bump()
+        Ok('\n')
+    elif c == u8('t') then
+        s.bump()
+        Ok('\t')
+    elif c == u8('r') then
+        s.bump()
+        Ok('\r')
+    elif c == u8('b') then
+        s.bump()
+        Ok(char(8u32))
+    elif c == u8('f') then
+        s.bump()
+        Ok(char(12u32))
+    elif c == u8('0') then
+        s.bump()
+        Ok(char(0u32))
+    elif c == u8('\\') || c == u8('\'') || c == u8('"') then
+        s.bump()
+        Ok(char(u32(c)))
+    elif c == u8('u') then
+        s.bump()
+        read_braced_codepoint(s, start)
+    else
+        val written = s.next_char() match
+            Some(ch) -> ch
+            None -> '?'
+
+        Err(error(point(start), s"unknown escape sequence '\\${written}'"))
+end read_escape_char
+
+// `\u{...}` is braced rather than a fixed four hex digits because a Unicode scalar value needs up to
+// six -- and the fixed-width form is what forces surrogate pairs into source text, which sysl's
+// `char` has no use for, being a scalar value rather than a UTF-16 code unit.
+private read_braced_codepoint(s: *Scanner, start: usize) -> Result[char, Diagnostic]
+    if !s.accept(u8('{')) then return Err(error(point(start), "expected '{' after \\u"))
+
+    val digits_at = s.offset
+    val n = s.accept_while(is_hex_digit)
+    val hex = from_utf8_unchecked(s.text_from(digits_at))
+
+    if n == 0 then return Err(error(point(start), "expected hex digits in \\u{...}"))
+    if !s.accept(u8('}')) then return Err(error(point(start), "unterminated \\u{...} escape"))
+    if n > 6 then return Err(error(point(start), s"'${hex}' is not a Unicode scalar value"))
+
+    var v: u32 = 0
+
+    for i in 0..<hex.bytes.len
+        v = v * 16 + u32(hex.bytes[i].digit_value(16) match
+            Some(d) -> d
+            None -> 0)
+
+    // The set `char` is defined over: every codepoint up to U+10FFFF except the surrogates, which is
+    // exactly what UTF-8 and UTF-16 encode.
+    char_from_u32(v) match
+        Some(c) -> Ok(c)
+        None -> Err(error(point(start), f"U+${v}%04X is not a Unicode scalar value"))
+end read_braced_codepoint
+
+// -- strings --------------------------------------------------------------------------------------
+
+// Whether the `"` under the cursor begins a **text block**, `"""`. Asked at the opening quote of
+// every form, so the prefixes compose: `c"""`, `s"""`, `raw"""`, `f"""`.
+private opens_a_text_block(s: *Scanner) -> bool =
+    s.peek() == Some(u8('"')) && s.peek_at(1) == Some(u8('"')) && s.peek_at(2) == Some(u8('"'))
+
+// What a text block treats as blank. A carriage return is in the set so that a block means the same
+// thing in a file with either line ending: it goes with the rest of a line's trailing whitespace
+// rather than into the value, so a checkout's line endings cannot change what a program says.
+private is_block_blank(c: u8) -> bool = c == u8(' ') || c == u8('\t') || c == u8('\r')
+
+private at_block_blank(s: *Scanner) -> bool =
+    s.peek() match
+        Some(c) -> is_block_blank(c)
+        None -> false
+
+scan_string(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize, kind: Quoted) -> Result[unit, Diagnostic]
+    if opens_a_text_block(s) then return scan_text_block(s, out, m, kind)
+
+    val escapes = kind match
+        Raw -> false
+        _ -> true
+
+    s.bump()
+
+    var b = str_builder()
+
+    loop
+        if s.at_end() || s.at_line_end() then return Err(error(point(m), "unterminated string literal"))
+
+        if s.peek() == Some(u8('"'))
+            s.bump()
+            break
+
+        if escapes then
+            b.push_char(read_one_char(s)?)
+        else
+            s.next_char() match
+                Some(c) -> b.push_char(c)
+                None -> return Err(error(point(s.offset), "illegal character"))
+    end loop
+
+    out.push(Spanned(str_token(kind, b.finish()), s.span_from(m)))
+    Ok(())
+end scan_string
+
+// The body of a text block, which is the one-quote scan with a line discipline over it.
+//
+// Three things happen to a line that do not happen inside `"..."`. Its incidental indentation is
+// dropped, so the block may be indented with the code around it. Its trailing blanks are dropped,
+// because whitespace at a line's end is invisible and would otherwise enter the value unseen --
+// `\u{20}` writes one that is meant, since escapes are read after the trimming and so survive it.
+// And a `\` at the end of a line joins it to the next, which is how data written a line at a time
+// becomes one string with no breaks in it.
+//
+// The trailing newline needs no rule of its own: a closing delimiter on a line of its own is reached
+// *after* the last content line's break has been taken, and one that follows content is reached
+// before any break at all.
+private scan_text_block(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize, kind: Quoted) -> Result[unit, Diagnostic]
+    val escapes = kind match
+        Raw -> false
+        _ -> true
+
+    s.skip(3)
+
+    val strip = block_indent(s, escapes, m)?
+
+    var b = str_builder()
+    var pending = str_builder()
+
+    after_indent(s, strip)
+
+    loop
+        if s.at_end() then return Err(error(point(m), "unterminated text block"))
+
+        if opens_a_text_block(s)
+            s.skip(3)
+            break
+
+        if s.peek() == Some(u8('\n'))
+            pending.clear()
+            b.push_char('\n')
+            s.bump()
+            after_indent(s, strip)
+            continue
+
+        if at_block_blank(s)
+            b_hold(&pending, s)
+            continue
+
+        if escapes && s.peek() == Some(u8('\\')) && joins_the_line(s)
+            pending.clear()
+            take_join(s)
+            after_indent(s, strip)
+            continue
+
+        b.push(pending.finish())
+        pending.clear()
+
+        if escapes then
+            b.push_char(read_one_char(s)?)
+        else
+            s.next_char() match
+                Some(c) -> b.push_char(c)
+                None -> return Err(error(point(s.offset), "illegal character"))
+    end loop
+
+    out.push(Spanned(str_token(kind, b.finish()), s.span_from(m)))
+    Ok(())
+end scan_text_block
+
+// One blank held back rather than written, in case the line ends before anything else does.
+private b_hold(pending: *StrBuilder, s: *Scanner)
+    s.next() match
+        Some(c) -> pending.push_char(char(u32(c)))
+        None -> ()
+
+// How much leading whitespace every line of the block gives up.
+//
+// This is the block's **incidental** indentation: the least indented of the lines that carry
+// content, together with the line the closing delimiter sits on when it sits on one alone. The
+// delimiter counting is what puts the programmer in control -- moving it left widens what the value
+// keeps, moving it right narrows it -- with no margin character to remember. Lines that are entirely
+// blank say nothing about the block's shape and are left out of the reckoning.
+//
+// A pre-pass rather than a running minimum, because the strip has to be known at the first line and
+// the last line may lower it. The cursor is left where it began.
+private block_indent(s: *Scanner, escapes: bool, m: usize) -> Result[usize, Diagnostic]
+    // The opening delimiter must end its line, which is what gives the rule an anchor: without it
+    // the opening column would mean something, and it means nothing.
+    if !joins_the_line_here(s)
+        return Err(error(point(m), "a text block's content begins on the line after its opening \"\"\""))
+
+    take_join_here(s)
+
+    val first = s.mark()
+    var least: usize = 0
+    var have_least = false
+    var indent: usize = 0
+    var blank = true
+    var at_start = true
+
+    loop
+        if s.at_end()
+            s.reset(first)
+            return Err(error(point(m), "unterminated text block"))
+
+        if opens_a_text_block(s)
+            val strip = if have_least && least < indent then least else indent
+
+            s.reset(first)
+            return Ok(strip)
+
+        if s.peek() == Some(u8('\n'))
+            if !blank && (!have_least || indent < least)
+                least = indent
+                have_least = true
+
+            indent = 0
+            blank = true
+            at_start = true
+            s.bump()
+            continue
+
+        if at_start && at_block_blank(s)
+            indent += 1
+            s.bump()
+            continue
+
+        at_start = false
+        blank = false
+
+        // Stepped over whole, so that a `\"""` inside the block does not read as the terminator.
+        if escapes && s.peek() == Some(u8('\\')) && s.remaining() > 1 then
+            s.skip(2)
+        else
+            s.bump()
+    end loop
+end block_indent
+
+// Steps over the incidental whitespace at the head of a line. A line with less whitespace than the
+// strip -- a blank one, in practice -- simply gives up what it has.
+private after_indent(s: *Scanner, strip: usize)
+    var n: usize = 0
+
+    while n < strip && at_block_blank(s)
+        s.bump()
+        n += 1
+end after_indent
+
+// Whether a `\` joins its line to the next: a backslash with nothing but blanks between it and the
+// line break. This is what lets embedded data be written a line at a time and still be one string
+// with no breaks in it, which is the case a text block otherwise cannot serve.
+private joins_the_line(s: *Scanner) -> bool
+    val save = s.mark()
+
+    s.bump()
+
+    val yes = joins_the_line_here(s)
+
+    s.reset(save)
+    yes
+end joins_the_line
+
+private take_join(s: *Scanner)
+    s.bump()
+    take_join_here(s)
+
+// The same question and the same step, from a cursor already past the backslash.
+private joins_the_line_here(s: *Scanner) -> bool
+    val save = s.mark()
+
+    s.accept_while(is_block_blank)
+
+    val yes = !s.at_end() && s.peek() == Some(u8('\n'))
+
+    s.reset(save)
+    yes
+end joins_the_line_here
+
+private take_join_here(s: *Scanner)
+    s.accept_while(is_block_blank)
+    s.accept_newline()
+
+// -- interpolation --------------------------------------------------------------------------------
+
+// `s"..."` and `f"..."`: the literal pieces, the source of each hole, and the specifier written
+// after it.
+//
+// **What the holes say is not read here.** A hole's source is captured and handed on to be lexed and
+// parsed where the token is consumed, because what an expression means is the grammar's business.
+// What this owns is the part every implementation gets wrong the same way: a `}` inside a nested
+// brace pair nests, and a `}` inside a *string* inside the hole is not a brace at all.
+scan_interpolated(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize,
+                          allow_spec: bool) -> Result[unit, Diagnostic]
+    var block = false
+    var strip: usize = 0
+
+    if opens_a_text_block(s)
+        block = true
+
+        s.skip(3)
+
+        // A block's shape is settled before its holes are, since the strip has to be known at the
+        // first line and only the last line can lower it.
+        strip = block_indent(s, true, m)?
+
+        after_indent(s, strip)
+    else
+        s.bump()
+
+    var parts: Buf[string] = buf()
+    var exprs: Buf[string] = buf()
+    var specs: Buf[string] = buf()
+    var part = str_builder()
+    var pending = str_builder()
+
+    loop
+        if s.at_end() || (!block && s.at_line_end())
+            return Err(error(point(m),
+                if block then "unterminated text block" else "unterminated string literal"))
+
+        // A block ends at `"""`, and a lone `"` inside one is ordinary text; a one-line literal ends
+        // at the first quote it meets.
+        if s.peek() == Some(u8('"')) && (!block || opens_a_text_block(s))
+            parts.push(part.finish())
+            s.skip(if block then 3 else 1)
+            break
+
+        if block && s.peek() == Some(u8('\n'))
+            pending.clear()
+            part.push_char('\n')
+            s.bump()
+            after_indent(s, strip)
+            continue
+
+        if block && at_block_blank(s)
+            b_hold(&pending, s)
+            continue
+
+        if block && s.peek() == Some(u8('\\')) && joins_the_line(s)
+            pending.clear()
+            take_join(s)
+            after_indent(s, strip)
+            continue
+
+        if s.peek() == Some(u8('$'))
+            part.push(pending.finish())
+            pending.clear()
+            s.bump()
+
+            if s.at_end() then return Err(error(point(m), "expected a name or '{' after '$'"))
+
+            // A doubled sigil is a literal one, which is Scala's `$$` and is what lets a literal hold
+            // a dollar at all.
+            if s.peek() == Some(u8('$'))
+                part.push_char('$')
+                s.bump()
+                continue
+
+            if s.peek() == Some(u8('{'))
+                s.bump()
+                exprs.push(read_braced(s, m)?)
+                parts.push(part.finish())
+                part = str_builder()
+                specs.push(read_spec(s, allow_spec))
+                continue
+
+            val starts_a_name = s.peek_char() match
+                Some(c) -> is_name_start(c)
+                None -> false
+
+            if !starts_a_name then return Err(error(point(m), "expected a name or '{' after '$'"))
+
+            val name_at = s.offset
+
+            read_name(s)
+            exprs.push(from_utf8_unchecked(s.text_from(name_at)))
+            parts.push(part.finish())
+            part = str_builder()
+            specs.push(read_spec(s, allow_spec))
+            continue
+        end if
+
+        part.push(pending.finish())
+        pending.clear()
+        part.push_char(read_one_char(s)?)
+    end loop
+
+    out.push(Spanned(StrInterp(parts, exprs, specs), s.span_from(m)))
+    Ok(())
+end scan_interpolated
+
+// The source of a `${ ... }` hole, captured by matching its braces and stepping over any string or
+// character literal inside, so that a `}` within one does not close the interpolation early.
+private read_braced(s: *Scanner, m: usize) -> Result[string, Diagnostic]
+    val from = s.offset
+    var depth = 1
+
+    loop
+        if s.at_end() || s.at_line_end() then return Err(error(point(m), "unterminated interpolation"))
+
+        val c = s.peek() match
+            Some(b) -> b
+            None -> u8(0)
+
+        if c == u8('{') then
+            depth += 1
+            s.bump()
+        elif c == u8('}') then
+            depth -= 1
+
+            if depth == 0
+                val text = s.text_from(from)
+
+                s.bump()
+                return Ok(from_utf8_unchecked(text))
+
+            s.bump()
+        elif c == u8('"') || c == u8('\'') then
+            step_over_quoted(s, c)
+        else
+            s.bump()
+    end loop
+end read_braced
+
+private step_over_quoted(s: *Scanner, quote: u8)
+    s.bump()
+
+    loop
+        if s.at_end() || s.at_line_end() then return
+
+        if s.peek() == Some(u8('\\')) && s.remaining() > 1
+            s.skip(2)
+            continue
+
+        if s.peek() == Some(quote)
+            s.bump()
+            return
+
+        s.bump()
+end step_over_quoted
+
+// The printf specifier written after a hole in an `f"..."` literal, or `""` where there is none.
+//
+// **It commits only on a complete specifier ending in a conversion letter**, so a bare percent in an
+// `f"..."` literal prints literally and a `%` that does not form one stays ordinary text.
+private read_spec(s: *Scanner, allow_spec: bool) -> string
+    if !allow_spec || s.peek() != Some(u8('%')) then return ""
+
+    val save = s.mark()
+
+    s.bump()
+    s.accept_while((c) -> c == u8('-') || c == u8('+') || c == u8(' ') || c == u8('0') || c == u8('#'))
+    s.accept_while(is_digit)
+
+    if s.accept(u8('.')) then s.accept_while(is_digit)
+
+    val conversion = s.peek() match
+        Some(c) -> is_conversion(c)
+        None -> false
+
+    if !conversion
+        s.reset(save)
+        return ""
+
+    s.bump()
+    from_utf8_unchecked(s.text_from(save))
+end read_spec
+
+private is_conversion(c: u8) -> bool =
+    c == u8('d') || c == u8('i') || c == u8('o') || c == u8('u') || c == u8('x') || c == u8('X') ||
+        c == u8('e') || c == u8('E') || c == u8('f') || c == u8('g') || c == u8('G') || c == u8('s')
