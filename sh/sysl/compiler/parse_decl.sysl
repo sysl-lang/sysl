@@ -145,51 +145,28 @@ end parse_param_list
 // parenthesised list and the body after it. Nothing is reported by a probe that fails -- the report
 // is wound back with the cursor, since a reading nobody chose said nothing about the file.
 try_func_decl(p: *Parser, start: Span, vis: Visibility, attrs: Buf[Attr]) -> Option[Stmt]
-    val tokens_at = p.mark()
-    val errors_at = p.errors_at()
+    if !looks_like_func_decl(p) then return None
+
     var conv: Option[CallConv] = None
 
     if at_call_conv(p) then conv = Some(parse_call_conv(p))
-
-    val named = p.peek() match
-        Ident(_) -> true
-        QuotedIdent(_) -> true
-        _ -> false
-
-    if !named
-        p.rewind(tokens_at, errors_at)
-        return None
-    end if
 
     val name = parse_bound_name(p)
     var tp = no_type_params()
 
     if p.at_kw("[") then tp = parse_type_params(p)
 
-    if !p.accept_kw("(")
-        p.rewind(tokens_at, errors_at)
-        return None
-    end if
+    p.expect_kw("(")
 
     var params: Buf[Param] = buf()
     val variadic = parse_param_list(p, &params)
 
-    if !p.accept_kw(")") || p.report.len() != errors_at
-        p.rewind(tokens_at, errors_at)
-        return None
-    end if
+    p.expect_kw(")")
 
     var ret: Option[TypeRef] = None
 
     if p.accept_kw("->") then ret = Some(parse_result_type(p))
-
     if p.at_word("where") then tp = parse_where_on(p, tp)
-
-    // The body is what settles it: an `=`, or an indented block. Anything else was a call.
-    if !p.at_kw("=") && !p.block_ahead() || p.report.len() != errors_at
-        p.rewind(tokens_at, errors_at)
-        return None
-    end if
 
     var decl = blank_func(name)
 
@@ -209,6 +186,68 @@ try_func_decl(p: *Parser, start: Span, vis: Visibility, attrs: Buf[Attr]) -> Opt
     apply_func_attrs(&decl, attrs)
     Some(stmt(start.to(p.just_taken()), FuncDecl(decl)))
 end try_func_decl
+
+// Whether a function declaration begins here.
+//
+// **It is a scan over the tokens rather than a speculative parse.** `f(x: int) = x` and `f(x)`
+// begin with the same two tokens, and what separates them is the *body* -- so the parenthesised
+// list is stepped over as brackets, and what follows it is asked. A parse that read the list and
+// put it back would have to throw away the diagnostics it found inside one, which is exactly the
+// declaration whose reader most needs them.
+private looks_like_func_decl(p: *Parser) -> bool
+    var i: usize = 0
+
+    if at_call_conv(p)
+        i = 1
+
+        if p.kw_at(1, "(") then i = 4
+
+    if !names_a_decl(p.peek_at(i)) then return false
+
+    i += 1
+
+    if p.kw_at(i, "[")
+        i = past_bracket(p, i)
+
+        if i == 0 then return false
+
+    if !p.kw_at(i, "(") then return false
+
+    i = past_bracket(p, i)
+
+    if i == 0 then return false
+
+    if p.kw_at(i, "=") then return true
+    if p.kw_at(i, "->") then return true
+
+    p.peek_at(i) match
+        Ident(n) -> if n == "where" then return true
+        Newline -> return p.peek_at(i + 1) == Indent
+        _ -> ()
+
+    false
+end looks_like_func_decl
+
+// Where the bracket pair opening at `i` ends, one token past its close -- or `0` where it never
+// closes, which is a file that will not parse whatever this decides.
+private past_bracket(p: *Parser, at: usize) -> usize
+    var i = at
+    var depth: usize = 0
+
+    loop
+        p.peek_at(i) match
+            Eof -> return 0
+            Keyword(w) ->
+                if w == "(" || w == "[" || w == "{"
+                    depth += 1
+                elif w == ")" || w == "]" || w == "}"
+                    depth -= 1
+
+                    if depth == 0 then return i + 1
+            _ -> ()
+
+        i += 1
+end past_bracket
 
 // `interrupt`, `interrupt(irq)` -- how a function is called.
 //

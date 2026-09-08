@@ -1,0 +1,329 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The declarations: functions and their parameters, the four kinds of type, the members inside
+// them, `extern`, the constrained `type` forms, and the C a library carries.
+
+// -- functions ---------------------------------------------------------------------------------
+
+@test("an expression-bodied function")
+an_expression_bodied_function()
+    assert_eq(pf("add(a: int, b: int) -> int = a + b\n"),
+        "(fn add (a:int b:int) -> int (+ a b))")
+
+@test("a block-bodied function, whose trailing expression is its result")
+a_block_bodied_function()
+    assert_eq(pf("f(x: int) -> int\n    val y = x + 1\n    y\n"),
+        "(fn f (x:int) -> int (val y (+ x 1)) y)")
+
+@test("a function with no result type takes unit, and one with no parameters takes none")
+a_function_with_no_result_type()
+    assert_eq(pf("greet()\n    print(1)\n"), "(fn greet () (call print 1))")
+
+@test("a bare call is not a declaration, and the two are told apart by the body")
+a_bare_call_is_not_a_declaration()
+    assert_eq(pf("print(1)\n"), "(call print 1)")
+    assert_eq(pf("f(x)\n"), "(call f x)")
+    assert_eq(pf("f(x)\nf(x: int) = x\n"), "(call f x) (fn f (x:int) x)")
+
+@test("a function may declare type parameters, and bound them where or inline")
+a_function_may_declare_type_parameters()
+    assert_eq(pf("id[T](x: T) -> T = x\n"), "(fn id (T) (x:T) -> T x)")
+    assert_eq(pf("show[T: Display](x: T) = f(x)\n"),
+        "(fn show (T:Display) (x:T) (call f x))")
+    assert_eq(pf("show[T](x: T) where T: Display = f(x)\n"),
+        "(fn show (T:Display) (x:T) (call f x))")
+
+@test("a 'where' clause naming a parameter the declaration has not got is refused")
+a_where_clause_over_an_unknown_parameter()
+    assert_eq(pf_err("f[T](x: T) where U: Display = x\n"),
+        "this declaration has no type parameter 'U', so a 'where' clause has nothing to bound — it takes 'T'")
+    assert_eq(pf_err("f(x: int) where U: Display = x\n"),
+        "this declaration has no type parameter 'U', so a 'where' clause has nothing to bound — it takes none")
+
+@test("a parameter may carry a default, and a field may not")
+a_parameter_may_carry_a_default()
+    assert_eq(pf("f(a: int = 1) = a\n"), "(fn f (a:int=1) a)")
+    assert_eq(pf_err("struct P\n    x: int = 1\n"),
+        "a field declares no default — what an unwritten field gets is decided by the constructor that builds the value, not by the field")
+
+@test("a parameter may collect the rest of the call, and declares no default beside it")
+a_parameter_may_collect_the_rest()
+    assert_eq(pf("f(xs: ...int) = g(xs)\n"), "(fn f (xs:...int) (call g xs))")
+    assert(pf_err("f(xs: ...int = 1) = g(xs)\n").contains("collects the rest of the call declares no default"),
+        "a rest parameter takes no default")
+
+@test("a parameter may be taken by name, its argument being a thunk the callee runs")
+a_parameter_may_be_taken_by_name()
+    assert_eq(pf("f(body: -> int) = body()\n"), "(fn f (body:->int) (call body))")
+
+@test("a function takes the same ellipsis an extern does")
+a_function_takes_the_same_ellipsis()
+    assert_eq(pf("f(n: int, ...) -> int = n\n"), "(fn f (n:int ...) -> int n)")
+
+@test("a function may hand back several results")
+a_function_may_hand_back_several_results()
+    assert_eq(pf("f() -> int, string = 1, \"a\"\n"),
+        "(fn f () -> (results int string) (results 1 \"a\"))")
+
+@test("a reserved word may name a parameter only in backticks")
+a_reserved_word_may_name_a_parameter_in_backticks()
+    assert_eq(pf("f(`module`: int) = 1\n"), "(fn f (module:int) 1)")
+    assert(pf_err("f(module: int) = 1\n").contains("is a reserved word, so it cannot stand as a parameter's name or a field's"),
+        "a bare reserved word is refused with the backticks that would work")
+
+@test("an 'end' marker closes a function, and one naming another declaration is said so")
+an_end_marker_closes_a_function()
+    assert_eq(pf("f()\n    print(1)\nend f\n"), pf("f()\n    print(1)\n"))
+    assert_eq(pf_err("f()\n    print(1)\nend g\n"), "'end g' does not match 'f'")
+
+@test("a function may be declared inside a function, a declaration being a statement")
+a_function_may_be_declared_inside_a_function()
+    assert_eq(pf("outer()\n    inner() = 1\n    print(inner())\n"),
+        "(fn outer () (fn inner () 1) (call print (call inner)))")
+
+@test("a call convention is written in front of the name")
+a_call_convention_is_written_in_front()
+    assert_eq(pf("interrupt handler()\n    print(1)\n"),
+        "(fn @interrupt handler () (call print 1))")
+    assert_eq(pf("interrupt(irq) handler()\n    print(1)\n"),
+        "(fn @interrupt(irq) handler () (call print 1))")
+
+// -- extern ----------------------------------------------------------------------------------------
+
+@test("an 'extern' declares a header and no body")
+an_extern_declares_a_header()
+    assert_eq(pf("extern exit(code: int) -> never\n"), "(extern exit (code:int) -> never)")
+    assert_eq(pf("extern getpid()\n"), "(extern getpid ())")
+
+@test("an 'extern' may be variadic, and the same declaration without one is not")
+an_extern_may_be_variadic()
+    assert_eq(pf("extern printf(fmt: *u8, ...) -> int\n"),
+        "(extern printf (fmt:*u8 ...) -> int)")
+    assert_eq(pf("extern printf(fmt: *u8) -> int\n"), "(extern printf (fmt:*u8) -> int)")
+    assert_eq(pf("extern f(...) -> int\n"), "(extern f (...) -> int)")
+
+@test("a link name is the symbol, and the name after it is the sysl one")
+a_link_name_is_the_symbol()
+    assert_eq(pf("extern \"printf\" fmt(s: *u8) -> int\n"),
+        "(extern \"printf\" fmt (s:*u8) -> int)")
+
+@test("an 'extern' declares no type parameters, there being no body to monomorphize")
+an_extern_declares_no_type_parameters()
+    assert(pf_err("extern id[T](x: T) -> T\n").contains("declares no type parameters"),
+        "the refusal names what an extern cannot declare")
+    assert(pf_err("extern id[T](x: T) -> T\n").contains("no body to monomorphize"),
+        "and says why")
+
+@test("an 'extern' variable states the type the other side laid down")
+an_extern_variable_states_its_type()
+    assert_eq(pf("extern var errno: int\n"), "(extern-var errno : int)")
+    assert_eq(pf("extern errno: int\n"), "(extern-var errno : int)")
+
+@test("and what follows an extern's name is a bracket or a colon")
+an_externs_name_is_followed_by_one_of_two_things()
+    assert(pf_err("extern f = 1\n").contains("so what follows the name is '(' or ':'"),
+        "the refusal names both spellings")
+
+// -- structs ---------------------------------------------------------------------------------------
+
+@test("a struct with two fields")
+a_struct_with_two_fields()
+    assert_eq(pf("struct Point\n    x: int\n    y: int\n"), "(struct Point (x:int y:int))")
+
+@test("a struct with no fields at all writes its emptiness")
+a_struct_with_no_fields_writes_its_emptiness()
+    assert_eq(pf("struct Console\nend Console\n"), "(struct Console ())")
+    assert(pf_err("struct Console\n").contains("declares no fields"),
+        "a struct with no body and no marker is the mistake it has always been")
+
+@test("an 'opaque' struct may have no body, being C's incomplete type")
+an_opaque_struct_may_have_no_body()
+    assert_eq(pf("opaque struct sqlite3\n"), "(struct opaque sqlite3 ())")
+
+@test("a struct's fields may each be restricted")
+a_structs_fields_may_be_restricted()
+    assert_eq(pf("struct P\n    private x: int\n    y: int\n"),
+        "(struct P (private x:int y:int))")
+
+@test("a struct may derive, and may declare type parameters")
+a_struct_may_derive_and_be_generic()
+    assert_eq(pf("struct Box[T]\n    item: T\n"), "(struct Box (T) (item:T))")
+    assert_eq(pf("struct P derives Eq, Display\n    x: int\n"),
+        "(struct P derives Eq Display (x:int))")
+
+@test("a struct's body may carry an invariant")
+a_structs_body_may_carry_an_invariant()
+    assert_eq(pf("struct R\n    lo: int\n    hi: int\n    invariant lo <= hi\n"),
+        "(struct R (lo:int hi:int) (invariant (cmp lo <= hi)))")
+
+@test("a member of a struct is told from a field by what follows its name")
+a_member_is_told_from_a_field()
+    assert_eq(pf("struct P\n    x: int\n    area(self) -> int = self.x\n"),
+        "(struct P (x:int) (method self area () -> int (field self x)))")
+    assert_eq(pf("struct P\n    x: int\n    area -> int = self.x\n"),
+        "(struct P (x:int) (prop area -> int (field self x)))")
+
+@test("a receiver says how a method takes the value it was called on")
+a_receiver_says_how_a_method_takes_its_value()
+    for text in ["self", "*self", "&self", "&sync self"]
+        assert_eq(pf(s"struct P\n    m(${text})\n        f()\n"),
+            s"(struct P () (method ${text} m () (call f)))")
+
+@test("a method's parameters follow its receiver")
+a_methods_parameters_follow_its_receiver()
+    assert_eq(pf("struct P\n    add(*self, n: int)\n        f(n)\n"),
+        "(struct P () (method *self add (n:int) (call f n)))")
+
+@test("a setter is filed under the property it writes")
+a_setter_is_filed_under_its_property()
+    assert_eq(pf("struct P\n    set width(w)\n        f(w)\n"),
+        "(struct P () (method *self width$set (w:$value) (call f w)))")
+
+@test("a static property is the type's rather than a value's")
+a_static_property_is_the_types()
+    assert_eq(pf("struct P\n    static zero -> int = 0\n"),
+        "(struct P () (prop static zero -> int 0))")
+
+@test("and a static member with a parameter list is an associated function already")
+a_static_member_with_a_parameter_list()
+    assert(pf_err("struct P\n    static make(n: int) -> int = n\n").contains("declares a property of the type"),
+        "the refusal says what 'static' declares")
+
+@test("'override' has nothing to replace outside an 'impl' block")
+override_has_nothing_to_replace_in_a_type()
+    assert(pf_err("struct P\n    override m(self)\n        f()\n").contains("inside the 'impl' block"),
+        "the refusal says where 'override' goes")
+
+// -- enums -------------------------------------------------------------------------------------
+
+@test("an enum's variants may be bare, valued, or carry named fields")
+an_enums_variants()
+    assert_eq(pf("enum Colour\n    Red\n    Green\n"), "(enum Colour (Red) (Green))")
+    assert_eq(pf("enum E: int\n    A = 1\n    B = 2\n"), "(enum E : int (A = 1) (B = 2))")
+    assert_eq(pf("enum Shape\n    Circle(r: real)\n    Square(side: real)\n"),
+        "(enum Shape (Circle (r:real)) (Square (side:real)))")
+
+@test("a variant's payload names its fields")
+a_variants_payload_names_its_fields()
+    assert(pf_err("enum Shape\n    Circle(real)\n").contains("a variant's payload names its fields"),
+        "the refusal shows the spelling that works")
+
+@test("an enum's body may hold members beside its variants")
+an_enums_body_may_hold_members()
+    assert_eq(pf("enum E\n    A\n    show(self) -> int = 1\n"),
+        "(enum E (A) (method self show () -> int 1))")
+
+@test("an enum may be generic and may derive")
+an_enum_may_be_generic_and_derive()
+    assert_eq(pf("enum Maybe[T] derives Eq\n    Just(v: T)\n    Nothing\n"),
+        "(enum Maybe (T) derives Eq (Just (v:T)) (Nothing))")
+
+// -- traits ------------------------------------------------------------------------------------
+
+@test("a trait's member may be a bare signature or carry a default body")
+a_traits_member_may_be_a_signature()
+    assert_eq(pf("trait Show\n    show(self) -> string\n"),
+        "(trait Show (method self show () -> string))")
+    assert_eq(pf("trait Show\n    show(self) -> string = \"x\"\n"),
+        "(trait Show (method self show () -> string \"x\"))")
+
+@test("a trait may require others, and one that does needs no body of its own")
+a_trait_may_require_others()
+    assert_eq(pf("trait Ord: Eq + Show\n"), "(trait Ord : Eq Show)")
+    assert_eq(pf("trait Ord: Eq\n    cmp(self, other: Self) -> int\n"),
+        "(trait Ord : Eq (method self cmp (other:Self) -> int))")
+
+@test("a trait declares the associated types an implementation supplies")
+a_trait_declares_associated_types()
+    assert_eq(pf("trait Iter\n    type Item: Display\n    next(*self) -> Item\n"),
+        "(trait Iter (type Item Display) (method *self next () -> Item))")
+
+@test("and there is nothing for a trait's associated type to equal")
+a_traits_associated_type_equals_nothing()
+    assert(pf_err("trait Iter\n    type Item = int\n").contains("is the associated type an implementation supplies"),
+        "the refusal says where the '=' belongs")
+
+@test("a trait's members carry no visibility of their own")
+a_traits_members_carry_no_visibility()
+    assert(pf_err("trait Show\n    private show(self) -> string\n").contains("carry no visibility of their own"),
+        "the refusal says why")
+
+// -- impl blocks ---------------------------------------------------------------------------------
+
+@test("an 'impl' supplies what a trait asked for, for one type")
+an_impl_supplies_what_a_trait_asked_for()
+    assert_eq(pf("impl Show for Point\n    show(self) -> string = \"p\"\n"),
+        "(impl Show for Point (method self show () -> string \"p\"))")
+
+@test("an 'impl' may be generic, and may name the trait's own arguments")
+an_impl_may_be_generic()
+    assert_eq(pf("impl[T] Show for Box[T]\n    show(self) -> string = \"b\"\n"),
+        "(impl (T) Show for (Box T) (method self show () -> string \"b\"))")
+    assert_eq(pf("impl Add[int] for Point\n    add(self, o: int) -> int = 1\n"),
+        "(impl Add[int] for Point (method self add (o:int) -> int 1))")
+
+@test("an 'impl' supplies the associated type rather than bounding it")
+an_impl_supplies_the_associated_type()
+    assert_eq(pf("impl Iter for R\n    type Item = int\n"), "(impl Iter for R (type Item = int))")
+    assert(pf_err("impl Iter for R\n    type Item: int\n").contains("supplies the associated type rather than bounding it"),
+        "the refusal says where the bound belongs")
+
+@test("'override' is written on the member inside an 'impl', and on the block")
+override_is_written_inside_an_impl()
+    assert_eq(pf("impl Show for P\n    override show(self) -> int = 1\n"),
+        "(impl Show for P (method override self show () -> int 1))")
+    assert_eq(pf("override impl Show for P\n    show(self) -> int = 1\n"),
+        "(impl override Show for P (method self show () -> int 1))")
+
+@test("an 'impl' block carries no visibility of its own")
+an_impl_carries_no_visibility()
+    assert(pf_err("private impl Show for P\n    show(self) -> int = 1\n").contains("carries no visibility of its own"),
+        "the refusal says why")
+
+@test("an 'end' after an impl names the type it was for")
+an_end_after_an_impl_names_the_type()
+    assert_eq(pf("impl Show for P\n    show(self) -> int = 1\nend P\n"),
+        pf("impl Show for P\n    show(self) -> int = 1\n"))
+    assert_eq(pf_err("impl Show for P\n    show(self) -> int = 1\nend Q\n"),
+        "'end Q' does not match 'P'")
+
+// -- type declarations ------------------------------------------------------------------------------
+
+@test("a 'type' names another spelling of its base, and 'new' makes it a type of its own")
+a_type_names_a_base()
+    assert_eq(pf("type Id = int\n"), "(type Id = int)")
+    assert_eq(pf("type Id = new int\n"), "(type Id = new int)")
+
+@test("a constrained type carries the range its values lie in, or the predicate they satisfy")
+a_constrained_type_carries_its_constraint()
+    assert_eq(pf("type Percent = new int within 0..100\n"),
+        "(type Percent = new int within 0 .. 100)")
+    assert_eq(pf("type Index = new int within 0..<8\n"),
+        "(type Index = new int within 0 ..< 8)")
+    assert_eq(pf("type Even = new int where it % 2 == 0\n"),
+        "(type Even = new int where (cmp (% it 2) == 0))")
+
+// -- the C a library carries -------------------------------------------------------------------------
+
+@test("'c const' reads its constants out of C, each in quotes")
+c_const_reads_its_constants_out_of_c()
+    assert_eq(pf("c const\n    SIZE: usize = \"sizeof(struct s)\"\n    MAX: u32 = \"MAXV\"\n"),
+        "(cconst (SIZE : usize \"sizeof(struct s)\") (MAX : u32 \"MAXV\"))")
+
+@test("'c type' reads a typedef's sysl type out of C, and carries no sysl type of its own")
+c_type_reads_a_typedef_out_of_c()
+    assert_eq(pf("c type\n    Tick = \"TickType_t\"\n"), "(ctype (Tick \"TickType_t\"))")
+
+@test("'c' stays an ordinary name, which the keyword after it is what makes safe")
+c_stays_an_ordinary_name()
+    assert_eq(pf("val c = 1\n"), "(val c 1)")
+
+@test("and a 'c const' with no block under it is told what one looks like")
+a_c_const_with_no_block()
+    assert(pf_err("c const\n").contains("is followed by its constants, indented under it"),
+        "the refusal shows the shape")

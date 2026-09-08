@@ -21,6 +21,10 @@ import sysl.buf.{Buf, buf}
 private const MatchPower: u8 = 3
 
 private const AssignPower: u8 = 5
+
+// The level an assignment's right side is read at: below `match`, so that one written after the
+// value belongs to the value.
+private const AssignRightPower: u8 = MatchPower - 1
 private const OrPower: u8 = 10
 private const AndPower: u8 = 20
 
@@ -109,6 +113,8 @@ parse_expr_bp(p: *Parser, min_bp: u8) -> Expr
         return expr(p.here(), Bad)
 
     val start = p.here()
+
+    p.bp = min_bp
 
     var left = try_lambda(p) match
         Some(e) -> e
@@ -256,6 +262,14 @@ end parse_lambda_body
 
 // A token that begins an expression. The loop has already taken it, so what arrives here is the
 // token and a cursor standing after it.
+// Whether the level the expression is being read at is one a control-flow form may stand at.
+private opens_an_expression(p: *Parser) -> bool = p.bp <= AssignPower
+
+private refuse_operand(p: *Parser, at: Span) -> Expr
+    p.fault(at, "expression expected")
+    expr(at, Bad)
+end refuse_operand
+
 private nud(t: Spanned[Tok], p: *Parser) -> Expr
     val at = t.span
 
@@ -268,7 +282,9 @@ private nud(t: Spanned[Tok], p: *Parser) -> Expr
         StrInterp(parts, exprs, specs) -> desugar_interp(p, at, parts, exprs, specs)
         Ident(n) -> if n == "_" then expr(at, Ident(fresh_placeholder(p))) else expr(at, Ident(n))
         QuotedIdent(n) -> expr(at, Ident(n))
-        Label(n) -> parse_labelled_loop(p, at, n)
+        Label(n) ->
+            if opens_an_expression(p) then parse_labelled_loop(p, at, n)
+            else refuse_operand(p, at)
         Keyword(w) -> nud_word(p, at, w)
         _ ->
             p.fault(at, "expression expected")
@@ -296,10 +312,20 @@ private nud_word(p: *Parser, at: Span, w: string) -> Expr
     if w == "(" then return parse_paren_tail(p, at)
     if w == "[" then return parse_array_literal(p, at)
     if w == "." then return parse_implicit_member(p, at)
-    if w == "if" then return parse_if_expr(p, at)
+    // **A control-flow form is an expression only where an expression begins** -- at the top of one,
+    // on an assignment's right, or inside brackets. `1 + if c then 2 else 3` is refused where it
+    // stands, which is the bootstrap compiler's reading and the one a reader of the line expects.
+    if w == "if"
+        if !opens_an_expression(p) then return refuse_operand(p, at)
+
+        return parse_if_expr(p, at)
+    end if
 
     for l in ["while", "loop", "do", "for"]
-        if l == w then return parse_loop_word(p, at, w)
+        if l == w
+            if !opens_an_expression(p) then return refuse_operand(p, at)
+
+            return parse_loop_word(p, at, w)
 
     if w == "sizeof" || w == "alignof" then return parse_layout_of(p, at, w)
     if w == "offsetof" then return parse_offset_of(p, at)
@@ -494,7 +520,11 @@ private led_word(lhs: Expr, at: Span, w: string, p: *Parser) -> Expr
     val from = lhs.span
 
     if is_assign_op(w)
-        val value = parse_expr_bp(p, power_of_word(w).right)
+        // **The right of an assignment is a whole expression, `match` included**, which is what
+        // makes `x = y match ...` give the match to `y` rather than to the assignment. Assignment
+        // stays right-associative all the same: its own power is above this level, so a second `=`
+        // is taken by the loop that reads the value.
+        val value = parse_expr_bp(p, AssignRightPower)
 
         return expr(from.to(p.just_taken()), Assign(w, lhs, value))
     end if

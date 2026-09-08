@@ -184,3 +184,89 @@ an_arms_block_holds_three_kinds_of_line()
 @test("'asm' stays an ordinary name where no arm list follows it")
 asm_stays_an_ordinary_name()
     assert_eq(pf("val asm = 1\n"), "(val asm 1)")
+
+// -- what a control-flow form is an operand of ----------------------------------------------------
+
+@test("a control-flow expression may sit on an assignment's right, whichever operator it is")
+control_flow_sits_on_an_assignments_right()
+    assert_eq(pf("x = if c then 1 else 2\n"), "(= x (if c (then 1) (else 2)))")
+    assert_eq(pf("x += if c then 1 else 2\n"), "(+= x (if c (then 1) (else 2)))")
+    assert_eq(pf("x = while c do 1\n"), "(= x (while c 1))")
+    assert_eq(pf("x = for k in xs do 1\n"), "(= x (for k xs 1))")
+    assert_eq(pf("x = 'scan while c do 1\n"), "(= x (while 'scan c 1))")
+
+@test("and where a bracket bounds it")
+control_flow_sits_where_a_bracket_bounds_it()
+    assert_eq(pf("a[if c then 0 else 1]\n"), "(index a (if c (then 0) (else 1)))")
+    assert_eq(pf("f(if c then 1 else 2)\n"), "(call f (if c (then 1) (else 2)))")
+    assert_eq(pf("(if c then 1 else 2) + 1\n"), "(+ (if c (then 1) (else 2)) 1)")
+
+@test("but it is not a bare operator's operand")
+control_flow_is_not_a_bare_operand()
+    assert_eq(pf_err("var z = 1 + if c then 2 else 3\n"), "expression expected")
+    assert_eq(pf_at("var z = 1 + if c then 2 else 3\n"), "1:13")
+    assert_eq(pf_err("var z = a < if c then 1 else 2\n"), "expression expected")
+    assert_eq(pf_err("var z = !if c then true else false\n"), "expression expected")
+    assert_eq(pf_err("var z = -if c then 1 else 2\n"), "expression expected")
+    assert_eq(pf_err("var z = 1 + while c do 2\n"), "expression expected")
+
+@test("every assignment operator parses under its own symbol")
+every_assignment_operator_parses()
+    for op in ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="]
+        assert_eq(pf(s"a ${op} b\n"), s"(${op} a b)")
+
+@test("the left of an assignment is a place, however it is written")
+the_left_of_an_assignment_is_a_place()
+    assert_eq(pf("a.b.c = d\n"), "(= (field (field a b) c) d)")
+    assert_eq(pf("a[i][j] = c\n"), "(= (index (index a i) j) c)")
+    assert_eq(pf("*p = c\n"), "(= (* p) c)")
+    assert_eq(pf("s.n += 1\n"), "(+= (field s n) 1)")
+
+@test("a 'match' written as a block reaches an assignment's right")
+a_block_match_reaches_an_assignments_right()
+    assert_eq(pf("x = y match\n    1 -> 10\n    else 20\n"),
+        "(= x (match y (arm 1 -> 10) (arm _ -> 20)))")
+
+// -- what introduces a body ------------------------------------------------------------------------
+
+@test("an introducer may be left off before an indented block")
+an_introducer_may_be_left_off_before_a_block()
+    assert_eq(pf("if x\n    print(1)\n"), pf("if x then\n    print(1)\n"))
+    assert_eq(pf("while c\n    print(1)\n"), pf("while c do\n    print(1)\n"))
+    assert_eq(pf("for x in xs\n    print(x)\n"), pf("for x in xs do\n    print(x)\n"))
+    assert_eq(pf("loop\n    print(1)\n"), pf("loop do\n    print(1)\n"))
+
+@test("but a one-line body needs it, there being nothing else to say where the body begins")
+a_one_line_body_needs_its_introducer()
+    assert_eq(pf_err("while c print(1)\n"), "newline expected")
+    assert_eq(pf_err("if c print(1)\n"), "newline expected")
+    assert_eq(pf_err("for x in xs print(x)\n"), "newline expected")
+    assert_eq(pf_err("loop print(1)\n"), "newline expected")
+
+@test("an inline body ends at the line it was written on")
+an_inline_body_ends_at_its_line()
+    assert_eq(pf("while c do print(1)\nprint(2)\n"), "(while c (call print 1)) (call print 2)")
+    assert_eq(pf("loop do print(1)\nprint(2)\n"), "(loop (call print 1)) (call print 2)")
+
+@test("an 'end' marker closes a loop, and parses the same as without one")
+an_end_marker_closes_a_loop()
+    assert_eq(pf("loop\n    print(1)\nend loop\n"), pf("loop\n    print(1)\n"))
+    assert_eq(pf("while c\n    print(1)\nend while\n"), pf("while c\n    print(1)\n"))
+    assert_eq(pf("for x in xs\n    print(x)\nend for\n"), pf("for x in xs\n    print(x)\n"))
+
+@test("a 'loop' takes no 'else', there being no normal completion for one to follow")
+a_loop_takes_no_else()
+    assert_eq(pf_err("loop\n    print(1)\nelse\n    print(2)\n"), "expression expected")
+
+@test("a nested loop's 'break' names which one it leaves")
+a_nested_loops_break_names_its_loop()
+    assert_eq(pf("'outer loop\n    loop\n        break 'outer\n"),
+        "(loop 'outer (loop (break 'outer)))")
+
+@test("a loop's body may hold several statements")
+a_loops_body_may_hold_several_statements()
+    assert_eq(pf("loop\n    print(i)\n    i++\n"), "(loop (call print i) (post++ i))")
+
+@test("'end' stays an ordinary name")
+end_stays_an_ordinary_name()
+    assert_eq(pf("val end = 1\n"), "(val end 1)")
