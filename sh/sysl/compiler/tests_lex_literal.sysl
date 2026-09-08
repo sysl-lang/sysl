@@ -1,0 +1,463 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.parse_ulong_base
+
+// The literals: numbers, characters, strings, the quote forms, and the text block.
+//
+// **They share one reader**, so a case that holds for a character holds inside a string, which is
+// why both are asked of the same escape table rather than in two suites.
+
+// The three quotes of a text block, spliced rather than written, since a sysl literal cannot hold
+// its own delimiter.
+val Q: string = "\"\"\""
+
+// The value an integer literal's digits denote, for the claims that are about the number rather than
+// about the token.
+value_of(t: Tok) -> ulong =
+    t match
+        IntLit(digits, base, _) -> parse_ulong_base(digits, base).unwrap()
+        _ -> 0
+
+one(text: string) -> Tok = bare(text).at(0)
+
+// -- integers -------------------------------------------------------------------------------------
+
+@test("a decimal literal")
+a_decimal_literal()
+    assert_eq(bare("42"), of([IntLit("42", 10, "")]))
+
+@test("hexadecimal, binary and octal share one value space")
+the_bases_share_one_value_space()
+    assert_eq(bare("0xFF"), of([IntLit("FF", 16, "")]))
+    assert_eq(bare("0b1010_0101"), of([IntLit("10100101", 2, "")]))
+    assert_eq(bare("0o17"), of([IntLit("17", 8, "")]))
+
+    assert_eq(value_of(one("0xFF")), 255)
+    assert_eq(value_of(one("0b1010_0101")), 165)
+    assert_eq(value_of(one("0o17")), 15)
+
+@test("hexadecimal is case-insensitive")
+hexadecimal_is_case_insensitive()
+    assert_eq(value_of(one("0xff")), 255)
+    assert_eq(value_of(one("0xFF")), 255)
+
+@test("there is no C leading-zero octal, so 010 is decimal ten")
+no_leading_zero_octal()
+    assert_eq(bare("010"), of([IntLit("010", 10, "")]))
+    assert_eq(value_of(one("010")), 10)
+
+@test("digit separators are stripped")
+digit_separators_are_stripped()
+    assert_eq(bare("1_000_000"), of([IntLit("1000000", 10, "")]))
+    assert_eq(bare("0xFF_FF"), of([IntLit("FFFF", 16, "")]))
+    assert_eq(value_of(one("0xFF_FF")), 65535)
+
+@test("a separator may lead the digits where a base prefix precedes it")
+a_separator_after_the_prefix()
+    assert_eq(bare("0x_FF"), of([IntLit("FF", 16, "")]))
+
+@test("a value wider than any integer this compiler holds still lexes")
+a_value_beyond_the_machine()
+    // The digits are carried as text precisely so that this is a token rather than an overflow: the
+    // analyzer knows which `uN` the literal is going to and this pass does not.
+    assert_eq(bare("340282366920938463463374607431768211456"),
+              of([IntLit("340282366920938463463374607431768211456", 10, "")]))
+
+@test("type suffixes")
+type_suffixes()
+    assert_eq(bare("42u8"), of([IntLit("42", 10, "u8")]))
+    assert_eq(bare("7i5"), of([IntLit("7", 10, "i5")]))
+    assert_eq(bare("100u12"), of([IntLit("100", 10, "u12")]))
+    assert_eq(bare("0xFFu16"), of([IntLit("FF", 16, "u16")]))
+    assert_eq(bare("10usize"), of([IntLit("10", 10, "usize")]))
+    assert_eq(bare("3isize"), of([IntLit("3", 10, "isize")]))
+
+@test("a friendly alias is not a valid suffix")
+a_friendly_alias_is_not_a_suffix()
+    assert_eq(bad("42int"), "invalid literal suffix 'int'")
+
+@test("a suffix naming a width that begins with a zero is not one either")
+a_zero_width_suffix()
+    assert_eq(bad("1u08"), "invalid literal suffix 'u08'")
+
+@test("the greedy scan makes a bad suffix one literal rather than two tokens")
+the_scan_is_greedy()
+    assert_eq(bad("42abc"), "invalid literal suffix 'abc'")
+    assert_eq(bad_at("42abc"), 0)
+
+@test("a trailing separator is refused")
+a_trailing_separator()
+    assert_eq(bad("1_000_"), "digit separator may not trail the digits")
+
+@test("a doubled separator is refused")
+a_doubled_separator()
+    assert_eq(bad("1__0"), "only a single digit separator may appear between digits")
+
+@test("a base prefix with no digits after it is missing its digits")
+a_prefix_with_no_digits()
+    assert_eq(bad("0x"), "missing digits")
+
+// -- floating point -------------------------------------------------------------------------------
+
+@test("a dot with fractional digits")
+a_dot_with_digits()
+    assert_eq(bare("1.5"), of([FloatLit("1.5", "")]))
+    assert_eq(bare("3.14"), of([FloatLit("3.14", "")]))
+
+@test("exponents, signed and unsigned")
+exponents()
+    assert_eq(bare("2.5e10"), of([FloatLit("2.5e10", "")]))
+    assert_eq(bare("1e-9"), of([FloatLit("1e-9", "")]))
+    assert_eq(bare("1e+9"), of([FloatLit("1e+9", "")]))
+
+@test("an exponent is spelled with a lower-case e whichever case it was written in")
+an_exponent_is_canonical()
+    assert_eq(bare("1E5"), of([FloatLit("1e5", "")]))
+
+@test("float suffixes")
+float_suffixes()
+    assert_eq(bare("3.0f32"), of([FloatLit("3.0", "f32")]))
+    assert_eq(bare("1.5f16"), of([FloatLit("1.5", "f16")]))
+
+@test("a float suffix makes a float of a literal written with no dot")
+a_float_suffix_alone()
+    assert_eq(bare("3f32"), of([FloatLit("3", "f32")]))
+
+@test("an integer suffix on a float is refused")
+an_integer_suffix_on_a_float()
+    assert_eq(bad("1.5u8"), "floating-point literal cannot have the integer suffix 'u8'")
+
+@test("a float suffix on a non-decimal literal is refused")
+a_float_suffix_on_a_non_decimal_literal()
+    assert_eq(bad("0b1f32"), "floating-point suffix on a non-decimal literal")
+
+@test("a hexadecimal literal swallows an f, because f is one of its digits")
+an_f_is_a_hexadecimal_digit()
+    // `0xFFf32` is the number 0xFFF32 and not a float suffix, which is the greedy scan being
+    // greedy about the right thing: the digits of the base come first.
+    assert_eq(bare("0xFFf32"), of([IntLit("FFf32", 16, "")]))
+    assert_eq(value_of(one("0xFFf32")), 1048370)
+
+@test("the value keeps its full width as text, since f128 exceeds a real")
+a_float_keeps_its_text()
+    val wide = "1.189731495357231765085759326628007e4932"
+
+    assert_eq(bare(wide + "f128"), of([FloatLit(wide, "f128")]))
+
+@test("separators come out of a fraction and an exponent too")
+separators_in_every_run()
+    assert_eq(bare("1_000.000_5"), of([FloatLit("1000.0005", "")]))
+    assert_eq(bare("1e1_0"), of([FloatLit("1e10", "")]))
+
+@test("an e with no digits after it is the head of a suffix, not an exponent")
+an_e_with_no_digits()
+    assert_eq(bad("1e"), "invalid literal suffix 'e'")
+
+// -- the range dot --------------------------------------------------------------------------------
+
+@test("the range dot does not start a float")
+the_range_dot()
+    assert_eq(bare("1..2"), of([IntLit("1", 10, ""), Keyword(".."), IntLit("2", 10, "")]))
+    assert_eq(bare("0..<10"), of([IntLit("0", 10, ""), Keyword("..<"), IntLit("10", 10, "")]))
+    assert_eq(bare("1.5"), of([FloatLit("1.5", "")]))
+
+@test("a method call on an integer is not a float either")
+a_method_on_an_integer()
+    assert_eq(bare("1.max()"),
+              of([IntLit("1", 10, ""), Keyword("."), Ident("max"), Keyword("("), Keyword(")")]))
+
+// -- the escape table -----------------------------------------------------------------------------
+
+@test("every escape the language defines")
+every_escape()
+    assert_eq(bare("'\\n'"), of([CharLit('\n')]))
+    assert_eq(bare("'\\t'"), of([CharLit('\t')]))
+    assert_eq(bare("'\\r'"), of([CharLit('\r')]))
+    assert_eq(bare("'\\b'"), of([CharLit(char(8u32))]))
+    assert_eq(bare("'\\f'"), of([CharLit(char(12u32))]))
+    assert_eq(bare("'\\0'"), of([CharLit(char(0u32))]))
+    assert_eq(bare("'\\\\'"), of([CharLit('\\')]))
+    assert_eq(bare("'\\''"), of([CharLit('\'')]))
+    assert_eq(bare("'\\\"'"), of([CharLit('"')]))
+
+@test("the same table applies inside a string")
+the_table_inside_a_string()
+    assert_eq(bare("\"a\\nb\\tc\\r\\\\\\\"d\""), of([StrLit("a\nb\tc\r\\\"d")]))
+
+@test("an escape the table does not name")
+an_unknown_escape()
+    assert_eq(bad("'\\q'"), "unknown escape sequence '\\q'")
+    assert_eq(bad("\"a\\qb\""), "unknown escape sequence '\\q'")
+
+@test("the escape character has no shorthand")
+no_escape_shorthand()
+    assert_eq(bad("'\\e'"), "unknown escape sequence '\\e'")
+    assert_eq(bare("'\\u{1b}'"), of([CharLit(char(27u32))]))
+
+@test("a backslash with nothing after it")
+a_dangling_backslash()
+    assert_eq(bad("\"a\\"), "incomplete escape sequence")
+
+@test("the braced codepoint escape takes one to six hex digits, in either case")
+the_braced_codepoint_escape()
+    assert_eq(bare("'\\u{41}'"), of([CharLit('A')]))
+    assert_eq(bare("'\\u{7}'"), of([CharLit(char(7u32))]))
+    assert_eq(bare("'\\u{e9}'"), of([CharLit('é')]))
+    assert_eq(bare("'\\u{E9}'"), of([CharLit('é')]))
+    assert_eq(bare("'\\u{1F600}'"), of([CharLit(char(0x1F600u32))]))
+    assert_eq(bare("'\\u{10FFFF}'"), of([CharLit(char(0x10FFFFu32))]))
+
+@test("it needs its braces")
+the_escape_needs_its_braces()
+    assert_eq(bad("'\\u41'"), "expected '{' after \\u")
+    assert_eq(bad("'\\u{41'"), "unterminated \\u{...} escape")
+
+@test("it needs at least one digit and at most six")
+the_escape_needs_digits()
+    assert_eq(bad("'\\u{}'"), "expected hex digits in \\u{...}")
+    assert_eq(bad("'\\u{1234567}'"), "'1234567' is not a Unicode scalar value")
+
+@test("it refuses the values that are not scalar values")
+the_escape_refuses_non_scalars()
+    assert_eq(bad("'\\u{110000}'"), "U+110000 is not a Unicode scalar value")
+    assert_eq(bad("'\\u{D800}'"), "U+D800 is not a Unicode scalar value")
+    assert_eq(bad("'\\u{DFFF}'"), "U+DFFF is not a Unicode scalar value")
+
+// -- source text outside ASCII --------------------------------------------------------------------
+
+@test("a supplementary character is one scalar value")
+a_supplementary_character()
+    assert_eq(bare("'😀'"), of([CharLit(char(0x1F600u32))]))
+    assert_eq(bare("\"😀\""), of([StrLit("😀")]))
+
+@test("a two- and three-byte character passes through unchanged")
+multibyte_characters()
+    assert_eq(bare("'é'"), of([CharLit('é')]))
+    assert_eq(bare("\"héllo ☃\""), of([StrLit("héllo ☃")]))
+
+// -- termination ----------------------------------------------------------------------------------
+
+@test("a character literal holds exactly one character")
+exactly_one_character()
+    assert_eq(bad("''"), "empty character literal")
+    assert_eq(bad("'ab'"), "character literal must hold exactly one character")
+
+@test("neither literal may run past the end of its line")
+neither_runs_past_its_line()
+    // A letter-started `'a` with no closing quote is a loop label, so the unterminated cases use a
+    // digit, which cannot begin one.
+    assert_eq(bad("'1"), "unterminated character literal")
+    assert_eq(bad("'1\nb"), "unterminated character literal")
+    assert_eq(bad("\"oops"), "unterminated string literal")
+    assert_eq(bad("\"oops\nmore\""), "unterminated string literal")
+
+@test("an empty string is a string")
+an_empty_string()
+    assert_eq(bare("\"\""), of([StrLit("")]))
+
+@test("a comment marker inside a string is ordinary text")
+a_comment_marker_in_a_string()
+    assert_eq(bare("\"a // b\""), of([StrLit("a // b")]))
+    assert_eq(bare("\"a /* b */ c\""), of([StrLit("a /* b */ c")]))
+
+@test("a quoted literal lexes to its decoded value")
+a_quoted_literal_is_its_value()
+    assert_eq(bare("'a'"), of([CharLit('a')]))
+    assert_eq(bare("\"hello\""), of([StrLit("hello")]))
+
+// -- the quote forms ------------------------------------------------------------------------------
+
+@test("a C string is its own literal, distinct from an ordinary one")
+a_c_string_is_its_own_literal()
+    assert_eq(bare("c\"hi\""), of([CStrLit("hi")]))
+    assert_eq(bare("\"hi\""), of([StrLit("hi")]))
+
+@test("escapes in a C string are decoded exactly as in an ordinary one")
+a_c_string_decodes_escapes()
+    assert_eq(bare("c\"a\\tb\\n\""), of([CStrLit("a\tb\n")]))
+
+@test("the empty C string is a literal like any other")
+the_empty_c_string()
+    assert_eq(bare("c\"\""), of([CStrLit("")]))
+
+@test("an unterminated C string is refused like any other")
+an_unterminated_c_string()
+    assert_eq(bad("c\"oops"), "unterminated string literal")
+
+@test("a name ending in c does not become a prefix")
+a_name_ending_in_c()
+    assert_eq(bare("abc\"x\""), of([Ident("abc"), StrLit("x")]))
+
+@test("raw leaves a backslash and a hole alone, which is the whole of what it is for")
+raw_leaves_everything_alone()
+    assert_eq(bare("raw\"a\\tb\""), of([StrLit("a\\tb")]))
+    assert_eq(bare("raw\"${x} $y\""), of([StrLit("${x} $y")]))
+
+@test("a prefix not against a quote is an ordinary identifier")
+a_prefix_needs_its_quote()
+    assert_eq(bare("s + raw"), of([Ident("s"), Keyword("+"), Ident("raw")]))
+    assert_eq(bare("raw + 1"), of([Ident("raw"), Keyword("+"), IntLit("1", 10, "")]))
+    assert_eq(bare("f + 1"), of([Ident("f"), Keyword("+"), IntLit("1", 10, "")]))
+    assert_eq(bare("c + 1"), of([Ident("c"), Keyword("+"), IntLit("1", 10, "")]))
+
+@test("on one line a raw literal cannot hold a quote")
+a_raw_literal_ends_at_its_first_quote()
+    // There is no escape left to write one with, which is what the tripled form is for.
+    assert_eq(bare("raw\"a\"b"), of([StrLit("a"), Ident("b")]))
+
+// -- interpolation --------------------------------------------------------------------------------
+
+interp(parts: []const string, exprs: []const string, specs: []const string) -> Tok =
+    StrInterp(of_text(parts), of_text(exprs), of_text(specs))
+
+@test("a hole separates the surrounding literals")
+a_hole_separates_the_literals()
+    assert_eq(bare("s\"a${x}b\""), of([interp(["a", "b"], ["x"], [""])]))
+
+@test("a bare $name is a hole whose source is the name")
+a_bare_hole()
+    assert_eq(bare("s\"hi $who\""), of([interp(["hi ", ""], ["who"], [""])]))
+
+@test("the parts still decode escapes")
+the_parts_decode_escapes()
+    assert_eq(bare("s\"a\\tb\""), of([interp(["a\tb"], [], [])]))
+
+@test("a hole's source keeps a nested string and brace verbatim for re-lexing")
+a_hole_keeps_its_source()
+    assert_eq(bare("s\"${ f(\"}\") + {1} }\""),
+              of([interp(["", ""], [" f(\"}\") + {1} "], [""])]))
+
+@test("a doubled sigil is one literal dollar, not a hole")
+a_doubled_sigil()
+    assert_eq(bare("s\"$$\""), of([interp(["$"], [], [])]))
+
+@test("an f-string captures a printf specifier after a hole")
+an_f_string_captures_a_specifier()
+    assert_eq(bare("f\"n=${x}%04d!\""), of([interp(["n=", "!"], ["x"], ["%04d"])]))
+
+@test("a specifier binds only after a hole; a stray percent is text")
+a_stray_percent_is_text()
+    assert_eq(bare("f\"$x%.2f done 100%\""),
+              of([interp(["", " done 100%"], ["x"], ["%.2f"])]))
+
+@test("a hole with no specifier in an f-string carries none")
+a_hole_with_no_specifier()
+    assert_eq(bare("f\"$x and ${y}\""), of([interp(["", " and ", ""], ["x", "y"], ["", ""])]))
+
+@test("s never captures a specifier, so the percent is text")
+s_captures_no_specifier()
+    assert_eq(bare("s\"$x%d\""), of([interp(["", "%d"], ["x"], [""])]))
+
+@test("a hole that runs off its line is refused")
+a_hole_running_off_its_line()
+    assert_eq(bad("s\"${1 + \nprint(1)\n"), "unterminated interpolation")
+
+@test("a sigil with nothing a hole could begin with is refused")
+a_sigil_with_no_hole()
+    assert_eq(bad("s\"$\""), "expected a name or '{' after '$'")
+    assert_eq(bad("s\"$1\""), "expected a name or '{' after '$'")
+
+// -- text blocks ----------------------------------------------------------------------------------
+
+@test("a block keeps its line breaks and drops the indentation it was written at")
+a_block_drops_its_indentation()
+    assert_eq(bare(s"${Q}\n    one\n    two\n    ${Q}"), of([StrLit("one\ntwo\n")]))
+
+@test("the closing delimiter says how much indentation is incidental")
+the_delimiter_sets_the_strip()
+    assert_eq(bare(s"${Q}\n    one\n      two\n${Q}"), of([StrLit("    one\n      two\n")]))
+
+@test("a delimiter on a content line leaves no trailing newline")
+a_delimiter_on_a_content_line()
+    assert_eq(bare(s"${Q}\n    one\n    two${Q}"), of([StrLit("one\ntwo")]))
+
+@test("a backslash at the end of a line joins it to the next")
+a_backslash_joins_the_lines()
+    assert_eq(bare(s"${Q}\n    abc\\\n    def\\\n    ghi\n    ${Q}"), of([StrLit("abcdefghi\n")]))
+
+@test("a block is an ordinary string literal")
+a_block_is_an_ordinary_string()
+    assert_eq(bare(s"${Q}\n    ab\n    ${Q}"), of([StrLit("ab\n")]))
+
+@test("the interpolation prefixes compose with the block form")
+the_prefixes_compose()
+    assert_eq(bare(s"s${Q}\n    n is $$n\n    ${Q}"), of([interp(["n is ", "\n"], ["n"], [""])]))
+
+@test("a raw block leaves a backslash alone")
+a_raw_block_keeps_its_backslash()
+    assert_eq(bare(s"raw${Q}\n    a\\nb\n    ${Q}"), of([StrLit("a\\nb\n")]))
+
+@test("a raw block reads no holes either, so it can carry another language")
+a_raw_block_reads_no_holes()
+    assert_eq(bare(s"raw${Q}\n    let re = \"\\d+\" and $${x} and $$x\n    ${Q}"),
+              of([StrLit("let re = \"\\d+\" and ${x} and $x\n")]))
+
+@test("the escape table still applies inside a block")
+the_escape_table_in_a_block()
+    assert_eq(bare(s"${Q}\n    a\\tb\\u{21}\n    ${Q}"), of([StrLit("a\tb!\n")]))
+
+@test("a lone quote inside a block is ordinary text")
+a_lone_quote_in_a_block()
+    assert_eq(bare(s"${Q}\n    he said \"hi\"\n    ${Q}"), of([StrLit("he said \"hi\"\n")]))
+
+@test("content on the opening line is refused")
+content_on_the_opening_line()
+    assert_eq(bad(s"${Q}abc\n"), "a text block's content begins on the line after its opening \"\"\"")
+
+@test("an unterminated block is refused")
+an_unterminated_block()
+    assert_eq(bad(s"${Q}\nabc\n"), "unterminated text block")
+
+@test("trailing blanks on a line are dropped")
+trailing_blanks_are_dropped()
+    assert_eq(bare(s"${Q}\n    ab   \n    cd\t\n    ${Q}"), of([StrLit("ab\ncd\n")]))
+
+@test("a trailing space that is meant is written as an escape")
+a_meant_trailing_space()
+    assert_eq(bare(s"${Q}\n    ab\\u{20}\n    ${Q}"), of([StrLit("ab \n")]))
+
+@test("a blank line does not lower the strip")
+a_blank_line_does_not_lower_the_strip()
+    assert_eq(bare(s"${Q}\n    one\n\n    two\n    ${Q}"), of([StrLit("one\n\ntwo\n")]))
+
+@test("a block with no content lines is the empty string")
+a_block_with_no_content()
+    assert_eq(bare(s"${Q}\n    ${Q}"), of([StrLit("")]))
+
+@test("a short blank line gives up only the whitespace it has")
+a_short_blank_line()
+    assert_eq(bare(s"${Q}\n    one\n  \n    two\n    ${Q}"), of([StrLit("one\n\ntwo\n")]))
+
+@test("a one-line literal beside a block is unaffected")
+a_one_line_literal_beside_a_block()
+    assert_eq(bare(s"\"x\"\n${Q}\n    y\n    ${Q}\n\"z\""),
+              of([StrLit("x"), StrLit("y\n"), StrLit("z")]))
+
+@test("an empty string is still an empty string beside the block form")
+an_empty_string_is_not_a_block()
+    assert_eq(bare("\"\"\nvar a = 1"),
+              of([StrLit(""), Keyword("var"), Ident("a"), Keyword("="), IntLit("1", 10, "")]))
+
+@test("a C string may be a block")
+a_c_string_block()
+    assert_eq(bare(s"c${Q}\n    ab\\\n    cd${Q}"), of([CStrLit("abcd")]))
+
+@test("an f-string block keeps its specifiers")
+an_f_string_block()
+    assert_eq(bare(s"f${Q}\n    [$${n}%03d]\n    ${Q}"), of([interp(["[", "]\n"], ["n"], ["%03d"])]))
+
+@test("a carriage return does not reach the value")
+a_carriage_return_in_a_block()
+    assert_eq(bare(s"${Q}\r\n    ab\r\n    ${Q}"), of([StrLit("ab\n")]))
+
+@test("a comment marker inside a block is ordinary text")
+a_comment_marker_in_a_block()
+    assert_eq(bare(s"${Q}\n    a // not a comment\n    /* nor this */\n    ${Q}"),
+              of([StrLit("a // not a comment\n/* nor this */\n")]))
+
+@test("a hole in a block may not span its lines")
+a_block_hole_running_off_its_line()
+    assert_eq(bad(s"s${Q}\n    $${1 +\n    2}\n    ${Q}\n"), "unterminated interpolation")
