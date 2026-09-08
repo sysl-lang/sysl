@@ -1,0 +1,892 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+import sysl.math.bigint.from_int
+
+// What a type's members are, and what its traits promise.
+//
+// Everything here answers a question *about a type* that the tables are the raw material for: which
+// key a member is filed under, whether a name reaches one, whether a type satisfies a bound and
+// through which implementation, and -- when it does not -- what to say about it. The hoist fills the
+// tables; this is how the rest of the analyzer reads them.
+
+// The trait a key names, where it names one.
+trait_decl_at(a: &Analysis, key: string) -> Option[TraitDecl]
+    val decl = a.tables.types.get(key)
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        TraitOf(d) -> Some(d)
+        _ -> None
+end trait_decl_at
+
+// What `Self` stands for, as a substitution of one binding.
+self_binding(t: Type) -> Buf[Binding]
+    var out: Buf[Binding] = buf()
+
+    out.push(Binding("Self", t))
+    out
+end self_binding
+
+// Two substitutions, the second winning where they name the same thing.
+joined_bindings(outer: Buf[Binding], inner: Buf[Binding]) -> Buf[Binding]
+    var out: Buf[Binding] = buf()
+
+    for i in 0..<outer.len()
+        out.push(outer.at(i))
+
+    for i in 0..<inner.len()
+        out.push(inner.at(i))
+
+    out
+end joined_bindings
+
+// -- where a type's members live -----------------------------------------------------------------
+
+// Where a type's members are registered: the key they are filed under, and the type arguments a
+// generic type was instantiated with.
+//
+// **Every** type has one. A struct or an enum is filed under the name it was declared with; every
+// other type under the name a diagnostic gives it, which is canonical -- one name per type, and the
+// same one whichever alias reached it (`int` and `i32` are one key, not two). That is what lets
+// `5.show()` resolve exactly as `p.show()` does, with no separate machinery for the built-ins.
+member_owner(t: Type) -> (string, Buf[Type]) = t match
+    // A tuple is filed under the whole of itself, exactly as `[]int` is: the type an `impl` written
+    // out in full is for. Its *shape* -- every tuple of that arity -- is a separate key.
+    Struct(d) -> if is_tuple(d) then (type_show(t), buf()) else (d.base, d.targs)
+    Enum(d) -> (d.base, d.targs)
+    _ -> (type_show(t), buf())
+
+// The key alone -- what an `impl` is filed under, and what a trait bound looks up.
+owner_key(t: Type) -> string = member_owner(t).0
+
+// The **shapes** of a composed type: the keys a block matching every type of that shape is filed
+// under, each with the type arguments this particular one matched at, **most specific first**.
+//
+// A composed type is filed under the whole of itself -- `[]int`, not `[]` -- because that is the
+// type a written `impl` is for and the name a diagnostic gives it. A shape-matched block is for
+// something else, so it needs a key of its own, and dropping the arguments is exactly what makes
+// one: every slice shares `[]`.
+//
+// There is a **list** of them because an array has two, and the order between them is the whole
+// reason this is not a single answer. Every argument a shape drops is one a block may be generic
+// over, and a value generic made an array's length one of those -- so `[3]T` and `[N]T` are both
+// blocks covering a `[3]int`, and the first covers less.
+//
+// A `string` is not a slice and has no shape here. It is a view of bytes that are valid UTF-8, and
+// that invariant is the whole difference between it and a `[]u8`.
+shape_owners(t: Type) -> Buf[(string, Buf[Type])]
+    var out: Buf[(string, Buf[Type])] = buf()
+
+    t match
+        // Both views share the one shape, and for the reason the shape exists: a block written for
+        // every slice is written against what a slice *is* -- a pointer and a count of `T` -- and
+        // whether this one may be written through is not part of that. A block that does write is
+        // caught where it writes, which is a better place to say so than a missing implementation.
+        Slice(elem, _) ->
+            var args: Buf[Type] = buf()
+
+            args.push(*elem)
+            out.push((SliceShape, args))
+        // The length is dropped from the second key and handed back as an **argument**, exactly as
+        // the element type is: a `[3]int` matches `[N]T` at `N = 3` and `T = int`, and the block's
+        // members are instantiated from that pair the way a slice's are from one.
+        Array(n, elem) ->
+            var fixed: Buf[Type] = buf()
+
+            fixed.push(*elem)
+            out.push((s"[$n]", fixed))
+
+            var open: Buf[Type] = buf()
+
+            open.push(ConstArg(from_int(long(n)), usize_marker()))
+            open.push(*elem)
+            out.push((ArrayShape, open))
+        Struct(d) ->
+            if is_tuple(d)
+                // A tuple has **two** shapes, and the order between them is what makes a block
+                // written for one arity beat one written for every arity. The arity's shape hands
+                // the parts back as separate arguments; the pack's hands them back as one list.
+                out.push((tuple_shape(d.targs.len()), d.targs))
+
+                var packed: Buf[Type] = buf()
+
+                packed.push(Pack(d.targs))
+                out.push((PackShape, packed))
+        _ -> ()
+
+    out
+end shape_owners
+
+// The width an array length is measured in. A shape's length argument travels as a `ConstArg` at
+// `usize`, and the width is the target's -- read off nothing here, since two lengths agree whenever
+// their values do.
+private usize_marker() -> Type = Integer(64, false, true)
+
+// The blanket keys a type is covered by, each paired with the type itself -- the pair a shape gives,
+// since a blanket's one type argument is the receiver.
+//
+// **The membership is asked of the compiler's own catalog directly and never through `satisfies`,
+// and that is load-bearing twice over.** It is what terminates: `satisfies` reaches `conforms`,
+// which reaches `impl_key`, which reaches here -- so a question asked back through `satisfies` would
+// be the same question one turn later. And it is what keeps the relaxation sound, since a bound the
+// compiler answers about is one nothing outside the compiler can join.
+blanket_owners(a: &Analysis, t: Type) -> Buf[(string, Buf[Type])]
+    var out: Buf[(string, Buf[Type])] = buf()
+    val bs = a.tables.members.blankets
+
+    if bs.len() == 0 then return out
+
+    for i in 0..<bs.len()
+        val key = bs.key_at(i)
+        val bound = bs.at(i)
+        val spelling = library_spelling(bound)
+
+        if spelling.is_some() && core_builtin(spelling.unwrap(), t)
+            var args: Buf[Type] = buf()
+
+            args.push(t)
+            out.push((key, args))
+
+    out
+end blanket_owners
+
+// The key a **writable** view also answers to: the read-only view of the same elements.
+//
+// A `[]T` is accepted wherever a `[]const T` is wanted -- it is one type with a bit, not two types
+// -- and a receiver is such a place, so `impl Search for []const u8` is reachable on a `[]u8`.
+//
+// **It goes one way only, which is the other half of the same sentence.** A member written for a
+// `[]T` may write through its receiver, and a `[]const T` that reached it would be a read-only view
+// with a writing member -- the one thing the bit is for.
+//
+// A `string` is deliberately not here, for the reason it has no shape: it is a view of bytes that
+// are valid UTF-8, and a block written for every read-only byte view has said nothing about it.
+widened_type(t: Type) -> Option[Type] = t match
+    Slice(elem, ro) -> if ro then None else Some(Slice(elem, true))
+    _ -> None
+
+// Where a member of that name is filed for a type: under the type's own key, or -- when only a
+// shape-matched block supplies it -- under the shape's, with the arguments this type matched at.
+//
+// **The type's own key is asked first, and that order is what makes an override work.** Two blocks
+// may give one name to one type only where the written-out one says `override`, and then asking the
+// type's key before the shape's is exactly the "written-out beats a parameter" half of the ordering.
+member_key(a: &Analysis, t: Type, mname: string) -> (string, Buf[Type])
+    val own = member_owner(t)
+
+    if has_member_at(a, own.0, mname) then return own
+
+    val wide = widened_type(t)
+
+    if wide.is_some()
+        val w = member_owner(wide.unwrap())
+
+        if has_member_at(a, w.0, mname) then return w
+
+    val shapes = shape_owners(t)
+
+    for i in 0..<shapes.len()
+        if has_member_at(a, shapes.at(i).0, mname) then return shapes.at(i)
+
+    // A blanket's members are filed under its key exactly as a shape's are under `[]`, and this is
+    // what a *call* finds them by. Without it a blanket would conform and have nothing callable.
+    val blankets = blanket_owners(a, t)
+
+    for i in 0..<blankets.len()
+        if has_member_at(a, blankets.at(i).0, mname) then return blankets.at(i)
+
+    own
+end member_key
+
+// The type a member of that name was actually found at -- the receiver's own, or the read-only view
+// it widened to.
+//
+// The **symbol** has to follow the key and not the receiver: a member found under `[]const u8` and
+// named from a `[]u8` receiver would be a call to a function nothing emitted.
+member_receiver_type(a: &Analysis, t: Type, mname: string) -> Type
+    if has_member_at(a, member_owner(t).0, mname) then return t
+
+    val wide = widened_type(t)
+
+    if wide.is_some() && has_member_at(a, member_owner(wide.unwrap()).0, mname) then
+        return wide.unwrap()
+
+    t
+end member_receiver_type
+
+// Whether a type has a member of that name at all, however it came by it.
+has_member(a: &Analysis, t: Type, mname: string) -> bool =
+    has_member_at(a, member_key(a, t, mname).0, mname)
+
+// Whether a member was reached on a **read-only** slice through the block written for every slice --
+// the one case where the key a member was found under says less about the receiver than the receiver
+// does. The block is made real at the receiver's own view, so a body that writes through `self` is
+// refused where it writes and a body that only reads is simply callable.
+viewed_const(ty: Type, key: string) -> bool
+    if key != SliceShape then return false
+
+    ty match
+        Slice(_, ro) -> ro
+        _ -> false
+end viewed_const
+
+// Whether a member of that name is one the *compiler* provides for the type.
+//
+// `len`, `bytes`, `chars` and `copy` are members of built-ins that have no source body to declare
+// them in, so they are reached ahead of the member table rather than through it. An `impl` for such
+// a type could otherwise register a member of the same name that nothing would ever find, which is
+// why this is asked at the declaration.
+builtin_member(t: Type, name: string) -> bool = t match
+    Array(_, _) -> name == "len"
+    Slice(_, _) -> name == "len"
+    Str -> name == "bytes" || name == "chars" || name == "copy"
+    Weak(_) -> name == "get"
+    _ -> false
+
+// The same question asked of a **shape** rather than of a type.
+//
+// A block matching every slice or every array at once has no `Self` to ask the type-keyed test about
+// -- the element is still a parameter when the members are hoisted -- so the one block that most
+// needs asking is the one it cannot see. `len` is the whole list: it is the only member the compiler
+// provides for a sequence, and the shapes that have one are the two written with brackets.
+builtin_shape_member(head: string, name: string) -> bool
+    if name != "len" then return false
+
+    val b = head.bytes
+
+    b.len > 0 && b[0] == u8('[')
+end builtin_shape_member
+
+// -- what a bound promises ------------------------------------------------------------------------
+
+// A bound as written, resolved: the trait's key, and the arguments with the ones the bound left out
+// taken from the trait's own defaults.
+resolve_bound(a: &Analysis, scope: Scope, span: Span, b: BoundRef, subst: Buf[Binding]) -> Bound
+    val written = resolve_list(a, scope, b.args, subst)
+    val key = lookup_trait_key(a, scope, b.name)
+
+    if key.is_none() then return Bound(b.name, written)
+
+    val d = trait_decl_at(a, key.unwrap())
+
+    if d.is_none() then return Bound(key.unwrap(), written)
+
+    val decl = d.unwrap()
+
+    check_trait_arity(a, scope, span, b.name, decl, written)
+    Bound(key.unwrap(), trait_args_with_defaults(a, scope, span, key.unwrap(), decl, written, subst))
+end resolve_bound
+
+// The key a name spells as a trait, where it spells one.
+lookup_trait_key(a: &Analysis, scope: Scope, written: string) -> Option[string]
+    val key = lookup_type_key(a, scope, written)
+
+    if key.is_none() then return None
+
+    if trait_decl_at(a, key.unwrap()).is_some() then key else None
+end lookup_trait_key
+
+// How many arguments a trait has to be given: the parameters it declares, less the ones carrying a
+// default. A default stands in only for an argument that was not written.
+least_trait_args(d: TraitDecl) -> usize
+    var n: usize = 0
+
+    for i in 0..<d.tparams.len()
+        if !has_binding(d.tdefaults, d.tparams.at(i)) then n += 1
+
+    n
+end least_trait_args
+
+// Whether a list of name-to-type pairs holds a name.
+has_binding(bs: Buf[TypeBinding], name: string) -> bool
+    for i in 0..<bs.len()
+        if bs.at(i).name == name then return true
+
+    false
+end has_binding
+
+// The type a name is bound to in a list of pairs.
+binding_named(bs: Buf[TypeBinding], name: string) -> Option[TypeRef]
+    for i in 0..<bs.len()
+        if bs.at(i).name == name then return Some(bs.at(i).typ)
+
+    None
+end binding_named
+
+// A trait applied to the wrong number of arguments, said in the words a trait deserves -- the
+// type-level message would send the reader looking for a struct of that name.
+private check_trait_arity(a: &Analysis, scope: Scope, span: Span, written: string, d: TraitDecl,
+                          targs: Buf[Type])
+    val least = least_trait_args(d)
+
+    if targs.len() <= d.tparams.len() && targs.len() >= least then return
+
+    if d.tparams.is_empty()
+        a.fault(scope, span, s"trait '$written' does not take type arguments")
+    else
+        a.fault(scope, span, s"trait '$written' ${arity_phrase(d.tparams.len(), least)}, but " +
+                s"${supplied_phrase(targs.len(), "type argument")}")
+end check_trait_arity
+
+// The arguments a trait was applied to, with the ones it was not given taken from the defaults it
+// declares. They are filled left to right, each resolved under the arguments already fixed, so a
+// later default may name an earlier parameter and `[T, U = T]` means what it reads as.
+trait_args_with_defaults(a: &Analysis, scope: Scope, span: Span, key: string, d: TraitDecl,
+                         targs: Buf[Type], self_bind: Buf[Binding]) -> Buf[Type]
+    if targs.len() >= d.tparams.len() || d.tdefaults.is_empty() then return targs
+
+    var filled: Buf[Type] = buf()
+
+    for i in 0..<targs.len()
+        filled.push(targs.at(i))
+
+    // Where the caller knows what `Self` is it says so. Where it does not, the implementing type is
+    // precisely what is not yet known, and the default stands for the one unknown type it is --
+    // which is enough to compare two requirements of the same trait.
+    var here: Buf[Binding] = buf()
+
+    if bound_type(self_bind, "Self").is_some() then here.push(Binding("Self", bound_type(self_bind, "Self").unwrap()))
+    else here.push(Binding("Self", Abstract("Self", buf())))
+
+    for i in filled.len()..<d.tparams.len()
+        for j in 0..<filled.len()
+            here.push(Binding(d.tparams.at(j), filled.at(j)))
+
+        val w = binding_named(d.tdefaults, d.tparams.at(i))
+
+        if w.is_none() then filled.push(Unknown)
+        else filled.push(resolve_type(a, scope_of_trait(a, key, scope), w.unwrap(), here))
+
+    filled
+end trait_args_with_defaults
+
+// The terms a trait's own declaration was written in, since a default is written in the file that
+// declares it and names what its author could see.
+private scope_of_trait(a: &Analysis, key: string, fallback: Scope) -> Scope
+    val decl = a.tables.types.get(key)
+
+    if decl.is_some() then decl.unwrap().scope else fallback
+end scope_of_trait
+
+// Every trait a bound promises: the traits it **requires**, transitively, and then itself.
+//
+// The order is what the rest of this depends on -- a required trait comes before the trait that
+// required it -- because it is the order a method table is laid out in, and a table and the call
+// sites that index into it have to agree. Depth-first with each trait taken once, so a diamond
+// carries the shared trait's members once rather than twice.
+//
+// **A trait is taken once by name, not once per argument list**: a type implements one trait once,
+// so a closure holding `Into[int]` and `Into[bool]` would be laying out two slots for one member.
+trait_closure(a: &Analysis, b: Bound, self_bind: Buf[Binding]) -> Buf[Bound]
+    var seen: Buf[string] = buf()
+    var acc: Buf[Bound] = buf()
+
+    walk_supers(a, b, self_bind, &seen, &acc)
+    acc
+end trait_closure
+
+private walk_supers(a: &Analysis, b: Bound, self_bind: Buf[Binding], seen: *Buf[string],
+                    acc: *Buf[Bound])
+    if holds_name(*seen, b.name) then return
+
+    seen.push(b.name)
+
+    val d = trait_decl_at(a, b.name)
+
+    if d.is_some()
+        val decl = d.unwrap()
+        val scope = scope_of_trait(a, b.name, Scope(module_of(b.name), no_imports(), source_of("", "")))
+
+        // `Self` in a required trait's arguments is the type implementing the requiring one, which
+        // is the same type all the way down a chain of requirements -- so it is carried in rather
+        // than rebound at each step.
+        var subst: Buf[Binding] = buf()
+
+        for i in 0..<self_bind.len()
+            subst.push(self_bind.at(i))
+
+        for i in 0..<decl.tparams.len()
+            if i < b.args.len() then subst.push(Binding(decl.tparams.at(i), b.args.at(i)))
+
+        for i in 0..<decl.supers.len()
+            val s = decl.supers.at(i)
+
+            walk_supers(a, resolve_bound(a, scope, s.span, s, subst), self_bind, seen, acc)
+
+    acc.push(b)
+end walk_supers
+
+private holds_name(xs: Buf[string], name: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == name then return true
+
+    false
+end holds_name
+
+// Everything a trait offers -- each member, with the bound of the trait that declared it.
+//
+// A trait that requires another offers that one's members too, so this is what a trait object
+// dispatches through and what a bound licenses, and both read it from here so that neither can
+// disagree with the other about which slot is which.
+trait_members(a: &Analysis, b: Bound, self_bind: Buf[Binding]) -> Buf[(Bound, MethodDecl)]
+    var out: Buf[(Bound, MethodDecl)] = buf()
+    val closure = trait_closure(a, b, self_bind)
+
+    for i in 0..<closure.len()
+        val sb = closure.at(i)
+        val d = trait_decl_at(a, sb.name)
+
+        if d.is_some()
+            val ms = d.unwrap().methods
+
+            for j in 0..<ms.len()
+                out.push((sb, ms.at(j)))
+
+    out
+end trait_members
+
+// The members a **table** lays out, which is every member but the ones no slot can hold.
+//
+// A member that declares type parameters of its own is not a function until a call names them, so
+// there is nothing for a slot to point at. That is a fact about the member and not about the trait:
+// a `filter` that cannot be dispatched sits perfectly well beside a `map` that can, so the object
+// still forms and what is refused is the call.
+slotted_members(a: &Analysis, b: Bound, self_bind: Buf[Binding]) -> Buf[(Bound, MethodDecl)]
+    var out: Buf[(Bound, MethodDecl)] = buf()
+    val all = trait_members(a, b, self_bind)
+
+    for i in 0..<all.len()
+        if all.at(i).1.tparams.is_empty() then out.push(all.at(i))
+
+    out
+end slotted_members
+
+// Whether a trait has a member no table can hold, which is what stops an **object** standing at a
+// bound on it: the members a bound licenses would then be more than the table can reach.
+has_unslotted_member(a: &Analysis, b: Bound) -> bool
+    val all = trait_members(a, b, buf())
+
+    for i in 0..<all.len()
+        if !all.at(i).1.tparams.is_empty() then return true
+
+    false
+end has_unslotted_member
+
+// -- whether a type implements a trait --------------------------------------------------------------
+
+// Whether a type implements a trait, which is the one question a bound asks.
+//
+// There are three ways to answer yes and they are not interchangeable. A **user** type opts in with
+// an explicit `impl`, filed under its owner key -- nominal conformance, never structural. A
+// **built-in** is a member by the compiler's own rule, because it has no module to write an `impl`
+// in and the integer family has no finite list of types to write one for. And a **type parameter**
+// implements exactly what its own bounds promise, which is what lets a bounded body hand its
+// parameter on to something that asks the same of it.
+satisfies(a: &Analysis, tr: Bound, t: Type) -> bool = t match
+    Abstract(_, bounds) -> bound_promises(a, bounds, tr, t)
+    // **A bound on a pack distributes over its members**, which is the whole of the bound syntax a
+    // pack needs: `[..A: Display]` is the ordinary `[T: Display]` read over a list. It is what makes
+    // the membership answerable before instantiation -- a tuple implements `Display` when every part
+    // does, so a call is refused where it is written rather than inside a body already committed to.
+    Pack(elems) -> every_satisfies(a, tr, elems)
+    _ -> conforms(a, tr, t) || erased_satisfies(a, tr, t) || builtin_satisfies(a, tr, t)
+
+private bound_promises(a: &Analysis, bounds: Buf[Bound], tr: Bound, t: Type) -> bool
+    for i in 0..<bounds.len()
+        val closure = trait_closure(a, bounds.at(i), self_binding(t))
+
+        for j in 0..<closure.len()
+            if closure.at(j).key() == tr.key() then return true
+
+    false
+end bound_promises
+
+private every_satisfies(a: &Analysis, tr: Bound, elems: Buf[Type]) -> bool
+    for i in 0..<elems.len()
+        if !satisfies(a, tr, elems.at(i)) then return false
+
+    true
+end every_satisfies
+
+// A compiler-provided membership is **homogeneous**: no operator promotes, so an `int` is `Mul[int]`
+// and is not `Mul` at anything else. The arguments are compared the way an assignment compares two
+// types, so a transparent subtype is its base's member exactly as it is its base's operand.
+private builtin_satisfies(a: &Analysis, tr: Bound, t: Type) -> bool
+    for i in 0..<tr.args.len()
+        if disagree(tr.args.at(i), t) then return false
+
+    val spelling = library_spelling(tr.name)
+
+    spelling.is_some() && core_builtin(spelling.unwrap(), t)
+end builtin_satisfies
+
+// Whether a **trait object** satisfies a bound, which it does for the trait it dispatches through
+// and for every trait that one requires.
+//
+// A `&Shape` has forgotten which type it holds, so there is no `impl` filed for it and nothing for
+// conformance to find. What it has instead is a table, and the table is the thing a bound was going
+// to be used for -- so the object implements the trait by dispatching, and the members a bound
+// licenses are exactly the members the table lays out.
+//
+// **It is not total: a trait may hold a member no table can.** The identity above rests on what a
+// bound licenses and what a table lays out being the same list; a member declaring type parameters
+// of its own is in the first and not the second, so an object standing at such a bound would license
+// a call with no slot to dispatch it.
+erased_satisfies(a: &Analysis, tr: Bound, t: Type) -> bool
+    if has_unslotted_member(a, tr) then return false
+
+    val o = erased_trait(t)
+
+    if o.is_none() then return false
+
+    val closure = trait_closure(a, trait_bound_of(o.unwrap()), self_binding(t))
+
+    for i in 0..<closure.len()
+        if closure.at(i).key() == tr.key() then return true
+
+    false
+end erased_satisfies
+
+// Which implementation of a trait **at these arguments** a type is covered by, if any: the one
+// written for the type, or the one written for its shape, with the arguments it matched at.
+//
+// The argument list is what selects, and it selects exactly one *per key*. A type may implement a
+// trait more than once, but never twice at one argument list; and a shape and a type written out in
+// full may both implement a trait only where the written-out block says `override`. That is the one
+// case where two answers exist, and the order is the type's own key before the shape's before a
+// blanket's, which is "written-out beats a parameter" read as a sequence of lookups.
+impl_key(a: &Analysis, tr: Bound, t: Type) -> Option[(Buf[Type], TraitImpl)]
+    val own = member_owner(t)
+    val here = impl_at(a, tr, own.0, t, own.1)
+
+    if here.is_some() then return Some((own.1, here.unwrap()))
+
+    val shapes = shape_owners(t)
+
+    for i in 0..<shapes.len()
+        val s = shapes.at(i)
+        val found = impl_at(a, tr, s.0, t, s.1)
+
+        if found.is_some() then return Some((s.1, found.unwrap()))
+
+    val blankets = blanket_owners(a, t)
+
+    for i in 0..<blankets.len()
+        val b = blankets.at(i)
+        val found = impl_at(a, tr, b.0, t, b.1)
+
+        if found.is_some() then return Some((b.1, found.unwrap()))
+
+    None
+end impl_key
+
+// Which of a type's implementations of a trait supplies exactly the promise the bound asks for. A
+// trait that takes no arguments has one promise to make, so the search is a lookup for everything
+// outside a generic trait.
+impl_at(a: &Analysis, tr: Bound, key: string, subject: Type, targs: Buf[Type]) -> Option[TraitImpl]
+    val rows = impls_of(a, tr.name, key)
+
+    for i in 0..<rows.len()
+        if supplied_bound(a, rows.at(i), tr.name, subject, targs).key() == tr.key() then
+            return Some(rows.at(i))
+
+    None
+end impl_at
+
+// The promise one implementation makes **about this subject**: what the block wrote, with the
+// subject's own type arguments put in for the block's parameters and the trait's own defaults
+// supplying the rest under a `Self` of the type being asked about.
+//
+// The substitution is what makes an argument built out of a parameter a promise about a particular
+// type rather than an open one. `impl[T] Index[usize, T] for Buf[T]` wrote `Index[usize, T]`, and
+// what a `Buf[int]` gets from it is `Index[usize, int]`.
+supplied_bound(a: &Analysis, ti: TraitImpl, name: string, subject: Type, targs: Buf[Type]) -> Bound
+    var subst: Buf[Binding] = buf()
+
+    for i in 0..<ti.tparams.len()
+        if i < targs.len() then subst.push(Binding(ti.tparams.at(i), targs.at(i)))
+
+    var written: Buf[Type] = buf()
+
+    for i in 0..<ti.written.len()
+        written.push(subst_params(a, ti.written.at(i), subst))
+
+    val d = trait_decl_at(a, name)
+
+    if d.is_none() || written.len() >= d.unwrap().tparams.len() then return Bound(name, written)
+
+    Bound(name, trait_args_with_defaults(a, ti.scope, ti.span, name, d.unwrap(), written,
+                                         self_binding(subject)))
+end supplied_bound
+
+// Whether a **written** `impl` covers this type at exactly these arguments, by any of the keys a
+// member lookup climbs.
+//
+// It is `satisfies` with the compiler's own memberships left out, which is the question operator
+// dispatch has to ask of a built-in: `real` is a member of `Mul` whatever anybody writes, so asking
+// whether it implements the trait says nothing about whether a *block* was written at the pair in
+// hand.
+written_impl_at(a: &Analysis, tr: Bound, subject: Type) -> bool
+    val own = member_owner(subject)
+
+    if impl_at(a, tr, own.0, subject, own.1).is_some() then return true
+
+    val shapes = shape_owners(subject)
+
+    for i in 0..<shapes.len()
+        if impl_at(a, tr, shapes.at(i).0, subject, shapes.at(i).1).is_some() then return true
+
+    val blankets = blanket_owners(a, subject)
+
+    for i in 0..<blankets.len()
+        if impl_at(a, tr, blankets.at(i).0, subject, blankets.at(i).1).is_some() then return true
+
+    false
+end written_impl_at
+
+// Whether a type implements a trait **through a source `impl`** -- conformance a table can point at,
+// as against a membership the compiler provides by rule.
+//
+// A generic `impl` may be conditional, and this is where the condition is answered: the implementing
+// type's own arguments must satisfy what the block asked of them, which is the same question one
+// step in. So `Box[int]` implements `Show` under `impl[T: Show] Show for Box[T]` exactly when `int`
+// does, and a `Box[Point]` over a `Point` with no `Show` does not.
+conforms(a: &Analysis, tr: Bound, t: Type) -> bool
+    val found = impl_key(a, tr, t)
+
+    if found.is_none() then return false
+
+    val targs = found.unwrap().0
+    val ti = found.unwrap().1
+
+    if !ti.conditional then return true
+
+    if targs.len() != ti.tparams.len() then return false
+
+    var subst: Buf[Binding] = buf()
+
+    for i in 0..<ti.tparams.len()
+        subst.push(Binding(ti.tparams.at(i), targs.at(i)))
+
+    unmet_condition_of(a, ti, subst).is_none()
+end conforms
+
+// The first of a block's own conditions this subject's arguments do not meet: the argument, and the
+// bound it fails. Read **in the block's own terms**, because the condition is the block's -- a
+// `[T: Display]` written in a library file means that file's `Display`, and the question is asked
+// wherever the trait is used.
+unmet_condition_of(a: &Analysis, ti: TraitImpl, subst: Buf[Binding]) -> Option[(Type, Bound)]
+    val bounds = ti.condition()
+
+    for i in 0..<bounds.len()
+        val nb = bounds.at(i)
+        val arg = bound_type(subst, nb.name)
+
+        if arg.is_some()
+            for j in 0..<nb.bounds.len()
+                val b = nb.bounds.at(j)
+                val tr = resolve_bound(a, ti.scope, b.span, b,
+                                       joined_bindings(subst, self_binding(arg.unwrap())))
+
+                if !satisfies(a, tr, arg.unwrap()) then return Some((arg.unwrap(), tr))
+
+    None
+end unmet_condition_of
+
+// The suffix the members of a type's implementation of one particular trait-at-arguments carry,
+// empty for the first implementation of that trait and distinct for each one after it.
+//
+// It is what makes a second implementation possible at all: a trait's members become the type's, and
+// a type's members are one namespace, so two implementations of one trait would give the type two
+// members of each name.
+impl_alt(a: &Analysis, tr: Bound, t: Type) -> string
+    val found = impl_key(a, tr, t)
+
+    if found.is_some() then found.unwrap().1.alt else ""
+end impl_alt
+
+// -- what to say when it does not -----------------------------------------------------------------
+
+// How a bound is spelled back to a programmer: **without** the arguments a default would have
+// supplied, because that is how the program writes it.
+//
+// `[T: Mul]` already means `Mul[T]`, so a diagnostic that told someone to write `T: Mul[T]` would be
+// telling them to write out what they may leave out. Trailing arguments a default would have
+// supplied are dropped one at a time, longest first, so a bound is spelled as short as it can be and
+// still mean what it means.
+show_bound(a: &Analysis, tr: Bound, subject: Type) -> string
+    val d = trait_decl_at(a, tr.name)
+
+    if d.is_none() || d.unwrap().tparams.is_empty() then return tr.show()
+
+    val decl = d.unwrap()
+    val scope = scope_of_trait(a, tr.name, Scope(module_of(tr.name), no_imports(), source_of("", "")))
+
+    for n in 0..<(tr.args.len() + 1)
+        var head: Buf[Type] = buf()
+
+        for i in 0..<n
+            head.push(tr.args.at(i))
+
+        val filled = trait_args_with_defaults(a, scope, span_of_nothing(), tr.name, decl, head,
+                                              self_binding(subject))
+
+        if Bound(tr.name, filled).key() == tr.key()
+            if n == 0 then return module_show(tr.name)
+
+            return Bound(tr.name, head).show()
+
+    tr.show()
+end show_bound
+
+private span_of_nothing() -> Span = Span(0, 0)
+
+// Why a type an implementation *covers* still does not implement the trait -- which is a different
+// answer from having no implementation at all, and the one a diagnostic should give when there is
+// one.
+//
+// Told to write an `impl Display for []Point`, a programmer would find it refused: an
+// `impl[T: Display] Display for []T` already covers every slice, and what the slice of points fails
+// is that block's condition. So the condition is what is worth saying. Nothing where nothing covers
+// the type, leaving the caller's own advice -- write one -- the right advice.
+unmet_bound(a: &Analysis, tr: Bound, t: Type) -> Option[string]
+    // **An object refused a bound on its own trait** reads as a contradiction without a reason. What
+    // is true is narrower and is worth spelling: the bound licenses every member, an object reaches
+    // only what its table holds, and one member here is not in the table. Named first, because when
+    // it applies the other two say nothing.
+    val short = erased_shortfall(a, tr, t)
+
+    if short.is_some() then return short
+
+    // A type that implements the trait at *other* arguments is a different situation from one that
+    // does not implement it at all, and the advice differs with it: what is missing is one more
+    // `impl`, at the arguments the bound asked for, beside the ones already there.
+    val wrong = wrong_arguments(a, tr, t)
+
+    if wrong.is_some() then return wrong
+
+    val found = impl_key(a, tr, t)
+
+    if found.is_none() then return None
+
+    val targs = found.unwrap().0
+    val ti = found.unwrap().1
+
+    if !ti.conditional || targs.len() != ti.tparams.len() then return None
+
+    var subst: Buf[Binding] = buf()
+
+    for i in 0..<ti.tparams.len()
+        subst.push(Binding(ti.tparams.at(i), targs.at(i)))
+
+    val unmet = unmet_condition_of(a, ti, subst)
+
+    if unmet.is_none() then return None
+
+    Some(s"the 'impl' that covers it asks '${unmet.unwrap().1.show()}' of " +
+         s"${type_show(unmet.unwrap().0)}, which does not implement it")
+end unmet_bound
+
+private wrong_arguments(a: &Analysis, tr: Bound, t: Type) -> Option[string]
+    var keys: Buf[(string, Buf[Type])] = buf()
+
+    keys.push(member_owner(t))
+
+    val shapes = shape_owners(t)
+
+    for i in 0..<shapes.len()
+        keys.push(shapes.at(i))
+
+    val blankets = blanket_owners(a, t)
+
+    for i in 0..<blankets.len()
+        keys.push(blankets.at(i))
+
+    for i in 0..<keys.len()
+        val key = keys.at(i).0
+        val targs = keys.at(i).1
+        val rows = impls_of(a, tr.name, key)
+
+        if !rows.is_empty() && impl_at(a, tr, key, t, targs).is_none()
+            var shown: Buf[string] = buf()
+
+            for j in 0..<rows.len()
+                shown.push(s"'${show_bound(a, supplied_bound(a, rows.at(j), tr.name, t, targs), t)}'")
+
+            return Some(s"it implements ${conjoin(shown)}")
+
+    None
+end wrong_arguments
+
+private erased_shortfall(a: &Analysis, tr: Bound, t: Type) -> Option[string]
+    val o = erased_trait(t)
+
+    if o.is_none() then return None
+
+    val closure = trait_closure(a, trait_bound_of(o.unwrap()), self_binding(t))
+    var reaches = false
+
+    for i in 0..<closure.len()
+        if closure.at(i).key() == tr.key() then reaches = true
+
+    if !reaches then return None
+
+    val all = trait_members(a, tr, buf())
+
+    for i in 0..<all.len()
+        if !all.at(i).1.tparams.is_empty()
+            return Some("a bound promises every member and an erased value reaches only what its " +
+                        s"table holds, and '${all.at(i).1.name}' declares type parameters of its " +
+                        "own, so it has no slot to be reached through. Call it on the value before " +
+                        "erasing it, or take the bound on a type parameter")
+
+    None
+end erased_shortfall
+
+// The bound a trait type stands for.
+trait_bound_of(t: Type) -> Bound = t match
+    Trait(n, args, _) -> Bound(n, args)
+    _ -> Bound("", buf())
+
+// The type a member is looked up on, seeing through one level of `*T` / `&T` so a method may be
+// called on a value, a pointer to it, or a reference to it alike.
+receiver_type(t: Type) -> Type = t match
+    Ptr(inner) -> *inner
+    Ref(inner, _) -> *inner
+    _ -> t
+
+// `a`, `a and b`, `a, b and c` -- a list read aloud, for a diagnostic naming everything a type does
+// implement when it does not implement the one that was asked for.
+conjoin(xs: Buf[string]) -> string
+    if xs.is_empty() then return ""
+
+    if xs.len() == 1 then return xs.at(0)
+
+    var b = str_builder()
+
+    for i in 0..<(xs.len() - 1)
+        if i > 0 then b.push(", ")
+
+        b.push(xs.at(i))
+
+    b.push(" and ")
+    b.push(xs.at(xs.len() - 1))
+    b.finish()
+end conjoin
+
+// A position as a message spells it: `1st`, `2nd`, `3rd`, `4th`.
+ordinal(n: usize) -> string =
+    if n == 1 then "1st"
+    else if n == 2 then "2nd"
+    else if n == 3 then "3rd"
+    else s"${n}th"
+
+// `1 argument was given`, `2 arguments were given` -- a count with its noun and its verb agreeing. A
+// diagnostic that misspells English reads like a bug in the thing reporting it.
+supplied_phrase(n: usize, noun: string) -> string =
+    s"${quantity(n, noun)} ${if n == 1 then "was" else "were"} given"
+

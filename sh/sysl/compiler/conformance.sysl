@@ -1,0 +1,231 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// Whether an `impl` block supplies what the trait declared, and what it inherits by not writing one.
+
+// Verifies that a block supplies the members the trait declares, each with an identical resolved
+// signature, and hands back the **defaults it inherits** -- the members it did not write and does not
+// have to, because the trait supplied a body for them.
+//
+// A member the trait declares without a default and the block leaves out, a member the trait does not
+// declare at all, or a mismatched kind, receiver, parameter or result is reported against the trait it
+// fails to satisfy.
+check_conformance(a: &Analysis, scope: Scope, span: Span, tr: TraitDecl, block: ImplDecl,
+                  home: MemberHome) -> Buf[MethodDecl]
+    var inherited: Buf[MethodDecl] = buf()
+    val shown = trait_shown(a, block)
+    val sig = signatures_under(a, home)
+
+    for i in 0..<tr.methods.len()
+        val tm = tr.methods.at(i)
+        val im = written_method(block, tm.name)
+
+        if im.is_some()
+            check_signature(a, scope, home.label, shown, tm, im.unwrap(), sig,
+                            trait_scope_of(a, block.trait_name), home.scope)
+            check_override_marking(a, home.scope, shown, tm, im.unwrap())
+        else if !tm.body.is_empty() then inherited.push(tm)
+        else
+            a.fault(scope, span, s"'${home.label}' does not implement '$shown': ${member_kind(tm)} " +
+                    s"'${source_member_name(tm.name)}' is missing")
+
+    for i in 0..<block.methods.len()
+        val im = block.methods.at(i)
+
+        if trait_method(tr, im.name).is_none() then
+            a.fault(home.scope, im.span, s"trait '$shown' declares no ${member_kind(im)} " +
+                    s"'${source_member_name(im.name)}', so this 'impl' cannot define it")
+
+    inherited
+end check_conformance
+
+private written_method(block: ImplDecl, name: string) -> Option[MethodDecl]
+    for i in 0..<block.methods.len()
+        if block.methods.at(i).name == name then return Some(block.methods.at(i))
+
+    None
+end written_method
+
+// What a signature written inside these members resolves under.
+//
+// A concrete `impl` binds only `Self`, to the one type it is for. A generic one binds its own
+// parameters to themselves and `Self` to the type applied to them, so `-> Self` and `-> Box[T]` are
+// the one signature conformance compares, exactly as `-> Self` and `-> Point` are on a concrete
+// implementation. The trait's own parameters are bound either way, since the block fixed them.
+signatures_under(a: &Analysis, home: MemberHome) -> Buf[Binding]
+    if home.tparams.is_empty() then return joined_bindings(home.outer, home.self_is)
+
+    val abstracts = abstract_subst(a, home.scope, home.tparams, home.bounds, home.tvalues,
+                                   home.tpacks, buf())
+    var out = joined_bindings(home.outer, abstracts)
+
+    out.push(Binding("Self", resolve_type(a, home.scope, home.self_ref, abstracts)))
+    out
+end signatures_under
+
+// What a diagnostic calls one member of a trait. The three kinds are told apart by shape rather than
+// by a keyword, so a message that names the wrong one sends the reader looking for the wrong mistake.
+member_kind(m: MethodDecl) -> string =
+    if is_setter_name(m.name) then "setter for property"
+    else if m.is_property then "property"
+    else if m.receiver.is_none() then "associated function"
+    else "method"
+
+// The trait an `impl` is for, as a message spells it -- which for a call trait is the arrow the block
+// was written with, not the arity-carrying declaration behind it.
+trait_shown(a: &Analysis, block: ImplDecl) -> string
+    if !fn_is_call(block.trait_name) || block.trait_args.is_empty() then
+        return module_show(block.trait_name)
+
+    var b = str_builder()
+
+    b.push("Fn(")
+
+    for i in 0..<(block.trait_args.len() - 1)
+        if i > 0 then b.push(", ")
+
+        b.push(type_text(block.trait_args.at(i)))
+
+    b.push(") -> ")
+    b.push(type_text(block.trait_args.at(block.trait_args.len() - 1)))
+    b.finish()
+end trait_shown
+
+// Whether a member the block wrote says `override` exactly when it is one.
+//
+// The trait's side is the whole of the test, and it is one question: does the member the block wrote
+// **replace a body**, or does it **answer a requirement**? A trait member with a body is a default
+// the block is replacing, and one without is a promise the block is keeping.
+check_override_marking(a: &Analysis, scope: Scope, trait_name: string, tm: MethodDecl,
+                       im: MethodDecl)
+    val written = source_member_name(tm.name)
+    // The words to write, which for a setter are not its name: `override set count(x)` is the whole
+    // member, and telling a reader to say `override count` would send them to the getter.
+    val say = if is_setter_name(tm.name) then s"set $written" else written
+
+    if !tm.body.is_empty() && !im.overrides then
+        a.fault(scope, im.span, s"trait '$trait_name' supplies a body for ${member_kind(tm)} " +
+                s"'$written', so writing one here replaces it — say 'override $say', or leave the " +
+                "member out to keep the trait's")
+    else if tm.body.is_empty() && im.overrides then
+        a.fault(scope, im.span, s"trait '$trait_name' declares ${member_kind(tm)} '$written' " +
+                "without a body, so this member supplies what the trait asked for rather than " +
+                "replacing anything — 'override' says a body was replaced")
+end check_override_marking
+
+// Compares one implementing method against the trait's signature: same receiver mode, same parameter
+// types in order, and the same result.
+//
+// Both sides are resolved with `Self` bound to the implementing type, which is what makes a signature
+// written with `Self` and one written with the concrete name the same signature -- the comparison is
+// between *resolved* types, so it does not matter which spelling either side chose.
+//
+// **A member's own type parameters stand for one another across the two signatures, by position.**
+// The trait's `map[U]` and the block's `map[V]` are the same promise -- the letters are each file's
+// own, and what corresponds is the order they were declared in. So one set of stand-ins is built from
+// the trait's declaration and *both* sides are resolved against it, the block's under its own
+// spelling.
+check_signature(a: &Analysis, scope: Scope, for_type: string, trait_name: string, tm: MethodDecl,
+                im: MethodDecl, outer: Buf[Binding], trait_scope: Scope, impl_scope: Scope)
+    // A message names the member the way it was **written**: a setter is filed under a name holding a
+    // marker, which is not sysl and must never reach a reader.
+    val name = source_member_name(im.name)
+
+    // Which *kind* of member it is comes first, because two of the three kinds have no receiver
+    // between them: a property and an associated function both have none, so the receiver comparison
+    // below would let one stand for the other without ever noticing.
+    if tm.is_property != im.is_property
+        if tm.is_property then
+            a.fault(impl_scope, im.span, s"'$name' is a property of trait '$trait_name', so an " +
+                    s"implementation writes it as '$name -> …' with no parameter list")
+        else
+            a.fault(impl_scope, im.span, s"'$name' is a method of trait '$trait_name', so an " +
+                    "implementation writes it with a parameter list — a property has none")
+
+    if !same_receiver(tm.receiver, im.receiver) then
+        a.fault(impl_scope, im.span, s"method '$name' of 'impl $trait_name for $for_type' takes a " +
+                "different receiver than the trait declares")
+
+    // A member of an `impl` is the trait's member supplied, so its shape is the trait's -- including
+    // how many types of its own it is generic over.
+    if tm.tparams.len() != im.tparams.len()
+        a.fault(impl_scope, im.span, s"${member_kind(im)} '$name' of 'impl $trait_name for " +
+                s"$for_type' declares ${quantity(im.tparams.len(), "type parameter")}, but trait " +
+                s"'$trait_name' declares ${tm.tparams.len()}")
+        return
+    end if
+
+    if tm.params.len() != im.params.len()
+        a.fault(impl_scope, im.span, s"method '$name' of 'impl $trait_name for $for_type' takes " +
+                s"${im.params.len()} parameters, but the trait declares ${tm.params.len()}")
+        return
+    end if
+
+    // A `...` is part of what a caller may write, so an implementation that has one where the trait
+    // has none -- or the other way about -- is a different promise, not a wider one.
+    if tm.variadic != im.variadic then
+        a.fault(impl_scope, im.span, s"method '$name' of 'impl $trait_name for $for_type' " +
+                s"${if im.variadic then "takes" else "does not take"} a '...', but trait " +
+                s"'$trait_name' declares ${if tm.variadic then "one" else "none"}")
+
+    val stand = abstract_subst(a, trait_scope, tm.tparams, tm.bounds, tm.tvalues, tm.tpacks, outer)
+    var trait_own = stand
+    var impl_own = joined_bindings(outer, renamed_stand_ins(tm.tparams, im.tparams, stand))
+
+    // The two signatures were written in two files -- the trait's and the block's -- so each side is
+    // resolved where it was written, under that file's module and its imports.
+    for i in 0..<tm.params.len()
+        val want = resolve_type(a, trait_scope, tm.params.at(i).typ, trait_own)
+        val got = resolve_type(a, impl_scope, im.params.at(i).typ, impl_own)
+
+        if !type_eq(want, got) then
+            a.fault(impl_scope, im.span, s"parameter '${im.params.at(i).name}' of method '$name' is " +
+                    s"${type_show(got)}, but trait '$trait_name' declares ${type_show(want)}")
+
+    var want = Unit
+    var got = Unit
+
+    if tm.ret_type.is_some() then
+        want = declared_result_type(Some(resolve_type(a, trait_scope, tm.ret_type.unwrap(),
+                                                      trait_own)))
+
+    if im.ret_type.is_some() then
+        got = declared_result_type(Some(resolve_type(a, impl_scope, im.ret_type.unwrap(), impl_own)))
+
+    if !type_eq(want, got) then
+        a.fault(impl_scope, im.span, s"method '$name' returns ${type_show(got)}, but trait " +
+                s"'$trait_name' declares ${type_show(want)}")
+end check_signature
+
+private same_receiver(x: Option[RecvMode], y: Option[RecvMode]) -> bool
+    if x.is_none() then return y.is_none()
+    if y.is_none() then return false
+
+    x.unwrap() match
+        ByValue -> y.unwrap() match
+            ByValue -> true
+            _ -> false
+        ByPtr -> y.unwrap() match
+            ByPtr -> true
+            _ -> false
+        ByRef(s) -> y.unwrap() match
+            ByRef(t) -> s == t
+            _ -> false
+end same_receiver
+
+// The trait's stand-ins under the block's own spellings, so that a member renaming its parameters is
+// read as the same promise.
+private renamed_stand_ins(from: Buf[string], to: Buf[string], stand: Buf[Binding]) -> Buf[Binding]
+    var out: Buf[Binding] = buf()
+
+    for i in 0..<to.len()
+        if i < from.len()
+            val t = bound_type(stand, from.at(i))
+
+            if t.is_some() then out.push(Binding(to.at(i), t.unwrap()))
+
+    out
+end renamed_stand_ins

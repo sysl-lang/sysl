@@ -1,0 +1,731 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// Registering a type's **members**, and lowering each one to the ordinary function it becomes.
+//
+// Every member in the language ends up as a function under a mangled name, so a call on a value
+// resolves through the ordinary call path with no dispatch machinery of its own -- and a trait's
+// methods become the implementing type's by the same route. `MemberHome` is what makes that one path
+// rather than three: it carries everything a member's signature resolves against that a call does not
+// have to supply.
+
+// Everything hoisting a list of members needs to know about the type they belong to, whichever
+// declaration form brought them.
+//
+//   - `key` is what the members are filed under. For a block matching a **shape** it is the shape
+//     itself, which is what a lookup falls back to when the type it is asked about has no members of
+//     its own.
+//   - `label` is what a diagnostic calls the type, which is the key everywhere the key is something
+//     a programmer would recognise -- and the subject as written where it is not, since `[]` names
+//     nothing and `[]T` names what the block covers.
+//   - `symbol` is the same type mangled, which is what the lowered functions are *named*. The two
+//     differ only for a type that has no name of its own: `[]int` is a fine key and an impossible
+//     symbol, so its members are emitted under `slice.int`.
+//   - `head` is the shape these members share a namespace with, where they have one. A type's
+//     members are one namespace whatever brought them, and this is what carries that rule across the
+//     two ways a composed type can come by one.
+//   - `self_ref` is the receiver's type as written, so a `self` parameter needs no reconstructing.
+//   - `tparams` are the parameters a member's signature may mention, **in the order the implementing
+//     type applies them**, so that instantiating a member from a receiver's type arguments
+//     substitutes them positionally. `bounds` is what was asked of them where they were declared.
+//   - `taken` are the names already spoken for inside the body -- a struct's fields, an enum's
+//     variants -- and `noun` what a diagnostic calls one of those.
+//   - `self_is` is what `Self` means inside these members, empty where the answer waits for an
+//     instantiation.
+//   - `outer` is what the **trait's** own type parameters mean, for the members an `impl` of a
+//     generic trait brings. They are fixed by the block rather than by anything a call does.
+//   - `alt` distinguishes the members of a second implementation of one trait from the first's.
+//   - `from_trait` is the trait an `impl` block is keeping, and nothing for a type's own body. It is
+//     what a use site's scope is asked about, since a trait's member is reachable only where the
+//     trait can be named.
+struct MemberHome
+    key: string
+    label: string
+    symbol: string
+    head: Option[string]
+    self_ref: TypeRef
+    tparams: Buf[string]
+    bounds: Buf[NamedBounds]
+    taken: Buf[string]
+    noun: string
+    self_is: Buf[Binding]
+    outer: Buf[Binding]
+    alt: string
+    from_trait: Option[string]
+    overrides: bool
+    tvalues: Buf[TypeBinding]
+    tpacks: Buf[string]
+    scope: Scope
+
+    // Everything a member's signature resolves against that a call does not supply: the trait's
+    // arguments, and `Self` where it is already known.
+    fixed(self) -> Buf[Binding] = joined_bindings(self.outer, self.self_is)
+
+    // Whether this block is the one matching the shape, rather than one of the types it covers. A
+    // composed type written out in full is never spelled as its own shape, so the keys settle it.
+    shaped(self) -> bool = self.head.is_some() && self.head.unwrap() == self.key
+end MemberHome
+
+// Every member of every declaration, and then the `impl` blocks.
+//
+// The two are separate walks and the order is load-bearing: a block's members share a namespace with
+// the type's own, so the type's have to be filed before a block can be told that a name is taken. The
+// blocks are read in the order the sources wrote them, since that is what decides which
+// implementation of a trait is the first and which carry a suffix.
+hoist_all_members(a: &Analysis, units: Buf[Program])
+    for i in 0..<a.tables.types.len()
+        val key = a.tables.types.key_at(i)
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            StructOf(d) ->
+                var names: Buf[string] = buf()
+
+                for j in 0..<d.fields.len()
+                    names.push(d.fields.at(j).name)
+
+                hoist_type_members(a, key, decl.scope, d.tparams, d.bounds, d.tvalues, names,
+                                   "field", d.members)
+            EnumOf(d) ->
+                var names: Buf[string] = buf()
+
+                for j in 0..<d.variants.len()
+                    names.push(d.variants.at(j).name)
+
+                hoist_type_members(a, key, decl.scope, d.tparams, d.bounds, d.tvalues, names,
+                                   "variant", d.members)
+            _ -> ()
+
+    for i in 0..<a.tables.impls.len()
+        hoist_impl(a, a.tables.impls.at(i))
+
+    // Every block is in, so a bound is answerable: a type's bounds are checked wherever it is
+    // applied, and the earliest applications are resolved while the file is still being hoisted.
+    a.tables.members.hoisted = true
+
+    drain_deferred_bounds(a)
+end hoist_all_members
+
+// The type applications whose bounds could not be answered where they were written, asked now.
+private drain_deferred_bounds(a: &Analysis)
+    val held = a.tables.members.deferred
+
+    a.tables.members.deferred = buf()
+
+    for i in 0..<held.len()
+        val d = held.at(i)
+
+        check_param_bounds(a, d.scope, d.span, d.what, d.tparams, d.bounds, d.targs, buf(), d.noun)
+end drain_deferred_bounds
+
+// Whether the type arguments a generic declaration was applied to implement what it asked of its
+// parameters -- the one rule, wherever the parameters came from: a function's, an `impl` block's, or a
+// type's own.
+//
+// An argument that could not be worked out is passed over. The mistake that produced it has been
+// reported, and a bound it fails to meet is a consequence of that rather than a second mistake.
+//
+// `seed` names types the bounds may mention that are **not** among the parameters being checked -- a
+// member's owner, whose arguments the receiver settled. They are resolved against and never iterated,
+// which is the distinction that matters: the owner's bounds were checked where its type was made, and
+// checking them again here would report one unmet bound twice.
+check_param_bounds(a: &Analysis, scope: Scope, span: Span, what: string, tparams: Buf[string],
+                   bounds: Buf[NamedBounds], targs: Buf[Type], seed: Buf[Binding], noun: string)
+    if bounds.is_empty() then return
+
+    var subst: Buf[Binding] = buf()
+
+    for i in 0..<seed.len()
+        subst.push(seed.at(i))
+
+    for i in 0..<tparams.len()
+        if i < targs.len() then subst.push(Binding(tparams.at(i), targs.at(i)))
+
+    for i in 0..<bounds.len()
+        val nb = bounds.at(i)
+        val arg = bound_type(subst, nb.name)
+
+        if arg.is_some() && arg.unwrap() != Unknown
+            for j in 0..<nb.bounds.len()
+                val want = nb.bounds.at(j)
+                // The bound is resolved under the very arguments being checked, since one may name
+                // another of the parameters: `[T: From[U], U]` asks a different thing of `T` at every
+                // call, and `U`'s argument is what says which.
+                val tr = resolve_bound(a, scope, want.span, want,
+                                       joined_bindings(subst, self_binding(arg.unwrap())))
+
+                if !satisfies(a, tr, arg.unwrap()) then
+                    report_unmet(a, scope, span, what, nb.name, tr, arg.unwrap(), noun)
+end check_param_bounds
+
+private report_unmet(a: &Analysis, scope: Scope, span: Span, what: string, tp: string, tr: Bound,
+                     arg: Type, noun: string)
+    arg match
+        // A type parameter standing in for itself, during the walk that checks a generic body. It is
+        // not a type anything has an `impl` for, so what it can promise is exactly what its own
+        // bounds promise -- a bound is satisfied by a bound.
+        Abstract(n, _) ->
+            a.fault(scope, span, s"'${module_show(what)}' requires its $noun '$tp' to implement " +
+                    s"'${show_bound(a, tr, arg)}', but '$n' is not bounded by it")
+        _ ->
+            // A type an implementation covers is told what that implementation asked of it, so the
+            // reader is sent one step in -- to the argument that fails -- rather than to a block that
+            // is already written.
+            val why = unmet_bound(a, tr, arg)
+            val tail = if why.is_some() then s" — ${why.unwrap()}" else ""
+
+            a.fault(scope, span, s"'${module_show(what)}' requires its $noun '$tp' to implement " +
+                    s"'${show_bound(a, tr, arg)}', but ${type_show(arg)} does not$tail")
+end report_unmet
+
+// The same, asked now if that can be answered and after the hoist if it cannot.
+deferred_bounds(a: &Analysis, scope: Scope, span: Span, what: string, tparams: Buf[string],
+                bounds: Buf[NamedBounds], targs: Buf[Type], noun: string)
+    if bounds.is_empty() || tparams.len() != targs.len() then return
+
+    if a.tables.members.hoisted then
+        check_param_bounds(a, scope, span, what, tparams, bounds, targs, buf(), noun)
+    else a.tables.members.deferred.push(DeferredBound(what, tparams, bounds, targs, span, scope,
+                                                      noun))
+end deferred_bounds
+
+// A type's own members: everything a struct or an enum declared in its body.
+//
+// A member of a concrete type is hoisted eagerly, so an uncalled member is still type-checked at its
+// definition. A member of a *generic* type cannot be: its signature mentions the type's parameters,
+// which have no meaning until a call fixes them, so it is stored as written and instantiated on
+// demand at each call site.
+hoist_type_members(a: &Analysis, key: string, scope: Scope, tparams: Buf[string],
+                   bounds: Buf[NamedBounds], tvalues: Buf[TypeBinding], taken: Buf[string],
+                   noun: string, members: Buf[MethodDecl])
+    // A member of a concrete type may write `Self` for the type it is a member of, exactly as an
+    // `impl`'s method may. A member of a *generic* one has its `Self` bound one step later, at each
+    // instantiation, since `Box[T]` is not a type until `T` is one.
+    var binds: Buf[Binding] = buf()
+
+    if tparams.is_empty()
+        val ty = concrete_instance(a, key)
+
+        if ty.is_some() then binds = self_binding(ty.unwrap())
+
+    var arg_refs: Buf[TypeRef] = buf()
+
+    for i in 0..<tparams.len()
+        arg_refs.push(named_type(span_zero(), tparams.at(i)))
+
+    // The receiver is written as the type's **bare** name applied to its own parameters, and read in
+    // the declaring file's own terms -- a key holds the module separator, which is not something a
+    // reference can be resolved from.
+    val home = MemberHome(key, module_show(key), key, None,
+                          type_ref(span_zero(), NamedType(module_bare(key), arg_refs)), tparams,
+                          bounds, taken,
+                          noun, binds, buf(), "", None, false, tvalues, buf(), scope)
+
+    hoist_member_list(a, home, members)
+end hoist_type_members
+
+// The instantiation of a non-generic struct or enum, which was made before any member was hoisted.
+// Read from the table rather than resolved again, so a type whose own declaration was already
+// reported does not report it a second time on the way to its members.
+concrete_instance(a: &Analysis, key: string) -> Option[Type]
+    val s = a.tables.struct_insts.get(key)
+
+    if s.is_some() then return s
+
+    a.tables.enum_insts.get(key)
+end concrete_instance
+
+// Lowers a list of members to functions, shared by a type's own body and an `impl` block. Each member
+// is registered under (owner key, filed name) and synthesized to a function under the mangled name; a
+// member of a concrete type is type-checked eagerly, while a member of a generic type waits for a
+// concrete instantiation.
+//
+// The declarations come back so that a caller with something further to do with them needs no second
+// walk to find them.
+hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl]) -> Buf[FuncDecl]
+    var lowered: Buf[FuncDecl] = buf()
+    // An `impl` block need not restate the property it is writing: the trait declared it, and a block
+    // supplying only the setter is supplying exactly what the trait left open.
+    val inherited = trait_properties(a, home.from_trait)
+    val paired = pair_setters(a, home.scope, members, home.label, inherited)
+
+    for i in 0..<paired.len()
+        val m = paired.at(i)
+        val filed = m.name + home.alt
+
+        // A member's parameters and its type's are two lists that end up in one signature, so a name
+        // used by both would leave the lowered function with two parameters of that name and nothing
+        // to say which one a `T` in the body meant.
+        for j in 0..<m.tparams.len()
+            if holds_string(home.tparams, m.tparams.at(j)) then
+                a.fault(home.scope, m.span, s"'${home.label}' already declares a type parameter " +
+                        s"'${m.tparams.at(j)}', so member '${m.name}' cannot declare one of that name")
+
+        // An associated function is reached by naming its type -- so the type needs a name a call
+        // can be written through. A composed type has none: `[]int` is a type an `impl` may be
+        // written for and not something that can stand in call position.
+        if m.is_associated() && !reachable_member_name(a, home.key) then
+            a.fault(home.scope, m.span, s"'${m.name}' has no receiver, and '${home.label}' is not " +
+                    "a name a call could reach it through — give it a 'self' parameter")
+
+        // Both messages name the member the way it was **written**, which for a setter is the
+        // property it writes rather than the name it is filed under.
+        val written = source_member_name(m.name)
+
+        if has_member_at(a, home.key, filed)
+            if is_setter_name(m.name) then
+                a.fault(home.scope, m.span, s"type '${home.label}' already has a setter for " +
+                        s"'$written'")
+            else
+                a.fault(home.scope, m.span, s"type '${home.label}' already has a member named " +
+                        s"'$written'")
+
+        if holds_string(home.taken, m.name) then
+            a.fault(home.scope, m.span, s"type '${home.label}' has both a ${home.noun} and a member " +
+                    s"named '$written'")
+
+        check_namespace_share(a, home, m, written)
+        check_hides_builtin(a, home, m)
+
+        a.tables.members.decls.put(member_key_of(home.key, filed), m)
+
+        // Which trait this member arrived with, for the members an `impl` brought. A type's own body
+        // records nothing, and that absence is what makes its members reachable wherever the type is.
+        if home.from_trait.is_some() then
+            a.tables.members.from_trait.put(member_key_of(home.key, filed), home.from_trait.unwrap())
+
+        // A name a program spells that now reaches more than one member is recorded as reaching all
+        // of them, so a call has the whole set to answer from. The bare name joins the set only if
+        // something was actually **filed** under it.
+        if filed != m.name then record_alt(a, home.key, m.name, filed)
+
+        val fd = synthesize(a, home, m)
+
+        // A member is filed under the type it belongs to, which an `impl` in another module may have
+        // named -- and an inherited default's body is the trait's source, wherever the trait is.
+        a.tables.members.decl_scope.put(fd.name, default_home(a, fd.name).unwrap_or(home.scope))
+        lowered.push(fd)
+
+        // A signature mentioning a type parameter -- the type's own, or the member's -- has no
+        // meaning until something fixes it, so the member is kept as written and made real per call.
+        if !fd.tparams.is_empty()
+            a.tables.members.generic.put(member_key_of(home.key, filed), fd)
+            // On a generic type `Self` is the type applied to its own parameters, which is not a type
+            // yet. The reference is what waits, and every substitution that fixes the parameters
+            // fixes it too.
+            a.tables.members.generic_self.put(fd.name, self_ref_for(a, fd.name, home))
+            a.tables.members.generic_scope.put(fd.name, home.scope)
+
+            if !home.outer.is_empty() then a.tables.members.selves.put(fd.name, home.outer)
+        else
+            // The signature is resolved *before* the member joins the list of bodies to type, so a
+            // type in it that does not resolve leaves the member out rather than half in.
+            var params: Buf[(string, Type)] = buf()
+            val fixed = home.fixed()
+
+            for j in 0..<fd.params.len()
+                params.push((fd.params.at(j).name,
+                             resolve_type(a, home.scope, fd.params.at(j).typ, fixed)))
+
+            var ret = Unit
+
+            if fd.ret_type.is_some() then
+                ret = declared_result_type(Some(resolve_type(a, home.scope, fd.ret_type.unwrap(),
+                                                             fixed)))
+
+            a.tables.members.lowered.push(fd)
+
+            if !fixed.is_empty() then a.tables.members.selves.put(fd.name, fixed)
+
+            a.tables.members.func_insts.put(fd.name, FuncSig(params, ret))
+            a.tables.members.funcs.put(member_key_of(home.key, filed), fd.name)
+
+    lowered
+end hoist_member_list
+
+// A composed type's members and its shape's are one namespace, so that a name reaches one member
+// however the type came by it. Both directions are asked, since a file may write the shape before the
+// types it covers or after them.
+//
+// A second implementation's members are left out: the name they are filed under is one no other block
+// can have written. An **override** is left out too, and it is the one case where sharing the name is
+// the point -- it supplies the same trait's members for one type of the shape.
+private check_namespace_share(a: &Analysis, home: MemberHome, m: MethodDecl, written: string)
+    if home.head.is_none() || home.alt != "" || home.overrides then return
+
+    val h = home.head.unwrap()
+
+    if home.shaped()
+        val other = a.tables.members.composed.get(member_key_of(h, m.name))
+
+        if other.is_some() then
+            a.fault(home.scope, m.span, s"'${other.unwrap()}' already has a member named " +
+                    s"'${m.name}', and this 'impl' would give ${every_shape(h)} one — a call on a " +
+                    s"'${other.unwrap()}' could mean either")
+    else
+        if has_member_at(a, h, m.name) then
+            a.fault(home.scope, m.span, s"${every_shape(h)} already has a member named " +
+                    s"'${m.name}', so '${home.label}' cannot declare one of its own")
+
+        a.tables.members.composed.put(member_key_of(h, m.name), home.label)
+end check_namespace_share
+
+// A built-in's catalog methods are the compiler's, and member lookup would find a member of the same
+// name first -- so an `impl` of some *other* trait may not quietly take `5.add` over from the `Add`
+// the type is already a member of. A **second** implementation is left out: its members carry a
+// suffix, so the built-in name was never theirs and cannot be hidden by them.
+private check_hides_builtin(a: &Analysis, home: MemberHome, m: MethodDecl)
+    val ty = bound_type(home.self_is, "Self")
+
+    if ty.is_some()
+        val declaring = core_declaring(m.name)
+
+        if home.alt == "" && declaring.is_some() && core_builtin(declaring.unwrap(), ty.unwrap()) then
+            a.fault(home.scope, m.span, s"'${m.name}' is how '${declaring.unwrap()}' is implemented " +
+                    s"for ${type_show(ty.unwrap())}, and the compiler provides that — a member of " +
+                    "this name would hide it")
+
+        // `len` and `bytes` are the same situation one step further out: a member of a built-in that
+        // the compiler supplies, reached ahead of the member table rather than through it.
+        if builtin_member(ty.unwrap(), m.name) then
+            a.fault(home.scope, m.span, s"'${m.name}' is a member the compiler provides for " +
+                    s"${type_show(ty.unwrap())} — a member of this name would hide it")
+
+    // A shape block never reaches the branch above, because `Self` is not a type until an
+    // instantiation says what its element is. Asking the shape instead is what closes the one
+    // spelling that got through.
+    if home.head.is_some() && home.shaped() && builtin_shape_member(home.head.unwrap(), m.name) then
+        a.fault(home.scope, m.span, s"'${m.name}' is a member the compiler provides for " +
+                s"${every_shape(home.head.unwrap())} — a member of this name would hide it")
+end check_hides_builtin
+
+// How a shape is named in a sentence about every type of it.
+every_shape(head: string) -> string =
+    if head == SliceShape then "every slice"
+    else if head == ArrayShape then "every array"
+    else if head == PackShape then "every tuple"
+    else s"every '$head'"
+
+// Whether a member's key is a name a call could be written through, which is what a member with **no
+// receiver** needs and what one with a receiver never asks for.
+reachable_member_name(a: &Analysis, key: string) -> bool
+    if a.tables.types.has(key) then return true
+
+    val scalar = scalar_named(key, word_bits_of(a))
+
+    if scalar.is_some() then return type_show(scalar.unwrap()) == key
+
+    // The width family is spelled rather than named, and `f32` reaches an associated function
+    // exactly as `int` does -- so a member with no receiver is callable through it.
+    val width = width_type(a, empty_scope(), span_zero(), key)
+
+    width.is_some() && type_show(width.unwrap()) == key
+end reachable_member_name
+
+// A scope naming nothing, for a question that is about a spelling rather than about a file.
+empty_scope() -> Scope = Scope("", no_imports(), source_of("", ""))
+
+private word_bits_of(a: &Analysis) -> int = int(a.tables.layout.word_bits)
+
+// The name a setter is written with, which is the property it writes.
+source_member_name(name: string) -> string =
+    if is_setter_name(name) then name[0..<(name.bytes.len - SetterSuffix.bytes.len)] else name
+
+// Whether a filed name is a setter's.
+is_setter_name(name: string) -> bool
+    val b = name.bytes
+    val s = SetterSuffix.bytes
+
+    if b.len <= s.len then return false
+
+    for i in 0..<s.len
+        if b[b.len - s.len + i] != s[i] then return false
+
+    true
+end is_setter_name
+
+// A setter's parameter takes the property's type, and the property may be the **trait's** -- an
+// `impl` supplying only the write half is supplying exactly what the trait left open.
+//
+// **Pairing is idempotent**: a member list may be walked more than once on its way in, so a setter
+// whose parameter already has a type is left exactly as it is.
+pair_setters(a: &Analysis, scope: Scope, members: Buf[MethodDecl], label: string,
+             inherited: Buf[MethodDecl]) -> Buf[MethodDecl]
+    var out: Buf[MethodDecl] = buf()
+
+    for i in 0..<members.len()
+        val m = members.at(i)
+
+        if !is_setter_name(m.name) || !unpaired_setter(m)
+            out.push(m)
+        else
+            val written = source_member_name(m.name)
+            val ret = property_result(members, inherited, written)
+
+            if ret.is_none()
+                a.fault(scope, m.span, s"'set $written' writes a property called '$written', and " +
+                        s"'$label' declares none — a property is read as well as written, and its " +
+                        "result is where the value's type comes from")
+                out.push(m)
+            else
+                var fixed = m
+
+                var ps: Buf[Param] = buf()
+
+                for j in 0..<m.params.len()
+                    val p = m.params.at(j)
+
+                    ps.push(Param(p.span, p.name, ret.unwrap(), p.vis, p.default, p.by_name, p.rest))
+
+                fixed.params = ps
+                out.push(fixed)
+
+    out
+end pair_setters
+
+private unpaired_setter(m: MethodDecl) -> bool
+    for i in 0..<m.params.len()
+        *m.params.at(i).typ.kind match
+            NamedType(n, _) -> if n == SetterValue then return true
+            _ -> ()
+
+    false
+end unpaired_setter
+
+private property_result(members: Buf[MethodDecl], inherited: Buf[MethodDecl],
+                        name: string) -> Option[TypeRef]
+    for i in 0..<inherited.len()
+        if inherited.at(i).is_property && inherited.at(i).name == name then
+            return inherited.at(i).ret_type
+
+    for i in 0..<members.len()
+        if members.at(i).is_property && members.at(i).name == name then return members.at(i).ret_type
+
+    None
+end property_result
+
+// The properties a trait declares, which an `impl` supplying only a setter reads its type from.
+private trait_properties(a: &Analysis, from: Option[string]) -> Buf[MethodDecl]
+    var out: Buf[MethodDecl] = buf()
+
+    if from.is_none() then return out
+
+    val d = trait_decl_at(a, from.unwrap())
+
+    if d.is_none() then return out
+
+    val ms = d.unwrap().methods
+
+    for i in 0..<ms.len()
+        out.push(ms.at(i))
+
+    out
+end trait_properties
+
+// Where a default's body was written, which is the trait's file rather than the block's.
+private default_home(a: &Analysis, member: string) -> Option[Scope]
+    val origin = a.tables.members.default_origin.get(member)
+
+    if origin.is_none() then return None
+
+    val cut = last_dot_in(origin.unwrap())
+
+    if cut.is_none() then return None
+
+    val key = origin.unwrap()[0..<cut.unwrap()]
+    val decl = a.tables.types.get(key)
+
+    if decl.is_some() then Some(decl.unwrap().scope) else None
+end default_home
+
+// The receiver's type as a member's lowered signature carries it.
+//
+// A member written here names it as the block did. An **inherited default** is read in the trait's
+// terms, because that is where its body and the rest of its signature came from -- and the subject is
+// the one thing in it that was not written there, so a copy naming it as the block spelled it would
+// have that spelling looked for in the trait's module.
+private self_ref_for(a: &Analysis, name: string, home: MemberHome) -> TypeRef =
+    if a.tables.members.default_origin.has(name) then named_type(span_zero(), "Self")
+    else home.self_ref
+
+// Builds the function a member lowers to: the receiver becomes an ordinary first parameter named
+// `self`, carrying the memory mode its sigil asked for. A property's receiver is an implicit by-value
+// read; an associated function has no receiver.
+//
+// A member's **own** parameters follow the type's, in that order and never interleaved, because the
+// two are fixed from different places and the order is what lets them be: a call reads the type's off
+// the receiver and appends the ones it solved.
+synthesize(a: &Analysis, home: MemberHome, m: MethodDecl) -> FuncDecl
+    val name = s"${home.symbol}.${m.name}${home.alt}"
+    var params: Buf[Param] = buf()
+    val recv = receiver_param(m, self_ref_for(a, name, home))
+
+    if recv.is_some() then params.push(recv.unwrap())
+
+    for i in 0..<m.params.len()
+        params.push(m.params.at(i))
+
+    var tparams: Buf[string] = buf()
+
+    for i in 0..<home.tparams.len()
+        tparams.push(home.tparams.at(i))
+
+    for i in 0..<m.tparams.len()
+        tparams.push(m.tparams.at(i))
+
+    var bounds: Buf[NamedBounds] = buf()
+
+    for i in 0..<home.bounds.len()
+        bounds.push(home.bounds.at(i))
+
+    for i in 0..<m.bounds.len()
+        bounds.push(m.bounds.at(i))
+
+    var tvalues: Buf[TypeBinding] = buf()
+
+    for i in 0..<home.tvalues.len()
+        tvalues.push(home.tvalues.at(i))
+
+    for i in 0..<m.tvalues.len()
+        tvalues.push(m.tvalues.at(i))
+
+    var tpacks: Buf[string] = buf()
+
+    for i in 0..<home.tpacks.len()
+        tpacks.push(home.tpacks.at(i))
+
+    for i in 0..<m.tpacks.len()
+        tpacks.push(m.tpacks.at(i))
+
+    // The three annotations a member may carry are about its **parameters**, so they cross to the
+    // lowered function unchanged -- the receiver is prepended in front of them and the names they
+    // gave still name the same parameters.
+    FuncDecl(name, tparams, params, m.ret_type, m.body, bounds, m.variadic, m.vis, buf(), tvalues,
+             tpacks, None, None, None, false, false, false, m.reads, m.writes, None, None,
+             m.crossing, buf())
+end synthesize
+
+// The `self` parameter a member's receiver becomes, at the self type it is a member of.
+receiver_param(m: MethodDecl, self_ref: TypeRef) -> Option[Param]
+    val mode = m.recv_mode()
+
+    if mode.is_none() then return None
+
+    val typ = mode.unwrap() match
+        ByValue -> self_ref
+        ByPtr -> type_ref(self_ref.span, PtrType(self_ref))
+        ByRef(sync) -> type_ref(self_ref.span, RefType(self_ref, sync))
+
+    Some(Param(m.span, "self", typ, Public, None, false, false))
+end receiver_param
+
+private record_alt(a: &Analysis, key: string, written: string, filed: string)
+    val held = a.tables.members.alts.get(member_key_of(key, written))
+    var prior: Buf[string] = buf()
+
+    if held.is_some()
+        for i in 0..<held.unwrap().len()
+            prior.push(held.unwrap().at(i))
+    else if has_member_at(a, key, written) then prior.push(written)
+
+    prior.push(filed)
+    a.tables.members.alts.put(member_key_of(key, written), prior)
+end record_alt
+
+// -- a declaration's parameters as its own body sees them ------------------------------------------
+
+// Each type parameter standing in for itself, carrying what the declaration asked of it.
+//
+// The bounds are resolved with the *siblings* standing in for themselves too, which is what lets
+// `f[T: Iter[U], U: Display]` know that what `T`'s iterator yields is something printable. A bound
+// that reaches back around to the parameter it belongs to is broken by dropping that parameter's own
+// bounds one level in -- the promise stays, and only the walk stops.
+//
+// **It must be read in the terms of the declaration whose parameters these are**, because a bound
+// names a trait the way anything else does, and what a short name means is what the declaring file
+// imported.
+abstract_subst(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: Buf[NamedBounds],
+               tvalues: Buf[TypeBinding], tpacks: Buf[string], outer: Buf[Binding]) -> Buf[Binding]
+    var plain: Buf[Binding] = buf()
+
+    for i in 0..<outer.len()
+        plain.push(outer.at(i))
+
+    for i in 0..<tparams.len()
+        plain.push(Binding(tparams.at(i), Abstract(tparams.at(i), buf())))
+
+    var once = bounded_pass(a, scope, tparams, bounds, tvalues, tpacks, outer, plain)
+
+    // A second pass, so that a bound naming a sibling reads that sibling with its own bounds on. The
+    // parameter's own stay off inside its own bound, which is what breaks the walk back around.
+    bounded_pass(a, scope, tparams, bounds, tvalues, tpacks, outer, once)
+end abstract_subst
+
+private bounded_pass(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: Buf[NamedBounds],
+                     tvalues: Buf[TypeBinding], tpacks: Buf[string], outer: Buf[Binding],
+                     others: Buf[Binding]) -> Buf[Binding]
+    var out: Buf[Binding] = buf()
+
+    for i in 0..<outer.len()
+        out.push(outer.at(i))
+
+    for i in 0..<tparams.len()
+        val tp = tparams.at(i)
+        val written = binding_named(tvalues, tp)
+
+        // A **value parameter** stands in as a zero rather than as a type. It is not a type, so
+        // nothing may ask what it implements -- and standing at a value is what lets the one walk
+        // that checks a generic body read `[N]T` as an array and `N` as a `usize`.
+        if written.is_some()
+            out.push(Binding(tp, ConstArg(from_int(0), resolve_type(a, scope, written.unwrap(),
+                                                                    others))))
+        else if holds_string(tpacks, tp)
+            // A **pack** stands at **two** types, each carrying the pack's own bounds, because an
+            // unrolled loop has no fixed length for this walk to run at. Two rather than one is what
+            // makes the walk worth doing: at two, the *between* is covered as well.
+            var parts: Buf[Type] = buf()
+
+            parts.push(Abstract(s"$tp.0", bounds_at(a, scope, bounds, tp, others, tp)))
+            parts.push(Abstract(s"$tp.1", bounds_at(a, scope, bounds, tp, others, tp)))
+            out.push(Binding(tp, Pack(parts)))
+        else
+            out.push(Binding(tp, Abstract(tp, bounds_at(a, scope, bounds, tp, others, tp))))
+
+    out
+end bounded_pass
+
+// One parameter's bounds, resolved with its siblings standing in for themselves and with `Self`
+// meaning the parameter the bound is written on -- bound-free, which is the stand-in that breaks the
+// walk back around.
+private bounds_at(a: &Analysis, scope: Scope, bounds: Buf[NamedBounds], tp: string,
+                  others: Buf[Binding], self_name: string) -> Buf[Bound]
+    var out: Buf[Bound] = buf()
+
+    for i in 0..<bounds.len()
+        if bounds.at(i).name == tp
+            var here: Buf[Binding] = buf()
+
+            for j in 0..<others.len()
+                if others.at(j).name != tp then here.push(others.at(j))
+
+            here.push(Binding(tp, Abstract(tp, buf())))
+            here.push(Binding("Self", Abstract(self_name, buf())))
+
+            val refs = bounds.at(i).bounds
+
+            for j in 0..<refs.len()
+                out.push(resolve_bound(a, scope, refs.at(j).span, refs.at(j), here))
+
+    out
+end bounds_at
+
+// The bounds a declaration wrote on one of its parameters, as a bound list.
+bounds_written_on(bounds: Buf[NamedBounds], tp: string) -> Buf[BoundRef]
+    for i in 0..<bounds.len()
+        if bounds.at(i).name == tp then return bounds.at(i).bounds
+
+    buf()
+end bounds_written_on

@@ -1,0 +1,765 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// Registering one `impl Trait for Type` block: what it is for, what it promises, and the members it
+// gives the type.
+//
+// A trait may be implemented for **any** type it makes sense to name -- built-ins included, since a
+// language whose `Show` cannot cover `int` has a `Show` no library can use; the composed types too,
+// so `impl Display for []int` says how a slice of ints renders; a **generic** struct or enum as a
+// whole, which is what an `impl` with type parameters of its own is for; and a composed **shape**,
+// which is that same block written for a type that has no name to be generic over.
+
+// Reads one block into the tables and lowers its members.
+hoist_impl(a: &Analysis, im: Impl)
+    val scope = im.scope
+    val span = im.span
+    val key = lookup_trait_key(a, scope, im.decl.trait_name)
+
+    if key.is_none()
+        a.fault(scope, span, s"unknown trait '${im.decl.trait_name}'")
+        return
+    end if
+
+    val tr = trait_decl_at(a, key.unwrap()).unwrap()
+    var block = im.decl
+
+    block.trait_name = key.unwrap()
+    block.methods = pair_setters(a, scope, opened_results(a, scope, key.unwrap(), tr, block),
+                                 written_subject(block),
+                                 tr.methods)
+
+    val target = impl_target(a, scope, span, block)
+    val ty = target.0
+    var home = target.1
+    val promise = impl_bound(a, scope, span, block, tr, home)
+    val bound = promise.0
+    val written = promise.1
+
+    home.outer = trait_outer(tr, bound)
+
+    // What this block's own promise is read against: the type where it has one, and the type applied
+    // to the block's own parameters where it is generic -- the subject every comparison below has to
+    // be made under for the two sides to mean the same thing.
+    var subject = ty
+
+    if !block.tparams.is_empty() then
+        subject = resolve_type(a, scope, block.for_type,
+                               abstract_subst(a, scope, block.tparams, block.bounds, block.tvalues,
+                                              block.tpacks, buf()))
+
+    // **Whether the compiler already provides this trait for what the block is written for.** A
+    // built-in's memberships come from the compiler, so an `impl` for one is not adding a capability
+    // but competing with the one that is already there. What the block *wrote* is what decides: a
+    // catalog trait's arguments default to the implementing type, so a block that wrote none of them
+    // is the one the compiler already provides, while one that wrote an argument is asking for
+    // something else entirely.
+    val family = a.tables.members.blankets.get(home.key)
+    val spelling = library_spelling(key.unwrap())
+    var provides = false
+
+    if spelling.is_some()
+        if core_builtin(spelling.unwrap(), ty) then provides = true
+
+        if family.is_some()
+            val closed = library_spelling(family.unwrap())
+
+            if closed.is_some() && core_family_provides(spelling.unwrap(), closed.unwrap()) then
+                provides = true
+
+    if written.is_empty() && provides
+        // **The one type reaching this that a program declared is a simple enum**, whose `Eq` the
+        // compiler supplies for the reason it supplies the open integer family's: the value *is* its
+        // discriminant, so there is one thing equality could mean.
+        val because = ty match
+            Enum(d) ->
+                if d.simple then
+                    " — no variant of it carries anything, so its value is its discriminant and " +
+                    "'==' is that comparison. Delete the block; a variant that needs an equality of " +
+                    "its own has to carry something for it to be about"
+                else " — the compiler provides it"
+            _ -> " — the compiler provides it"
+
+        // **A blanket's label is its type PARAMETER**, which names nothing a reader can act on. The
+        // family is what already implements it, so the family is what the refusal names.
+        var whose = s"'${home.label}'"
+
+        if family.is_some() then whose = s"every type in '${module_show(family.unwrap())}'"
+
+        a.fault(scope, span, s"$whose already implements '${module_show(key.unwrap())}'$because")
+    end if
+
+    // A **closed** trait names a family rather than a promise, so there is nothing for a block to
+    // supply: it declares no member, and an `impl` of it could only be a claim to belong to the
+    // family.
+    if spelling.is_some() && core_closed(spelling.unwrap()) then
+        a.fault(scope, span, s"'${module_show(key.unwrap())}' names a family of types the compiler " +
+                "settles, so nothing implements it — a type is one of them or it is not, and " +
+                s"'${home.label}' is not")
+
+    // **The overriding side is always a type written out in full**, which is what makes `override` a
+    // rule about two blocks rather than a rule about every pair of keys: a shape is one key and so is
+    // a generic type, so neither has anything below it to be more specific *than*.
+    if block.overrides && (home.shaped() || !home.tparams.is_empty()) then
+        a.fault(scope, span, s"'override' says this block replaces a more general one, and " +
+                s"'${home.label}' is the general kind — an implementation for a shape or for a " +
+                "generic type covers every type it matches at once, so there is nothing below it. " +
+                "The override is written on the block for one type spelled out in full")
+
+    val already = impls_of(a, key.unwrap(), home.key)
+    // Asked with **this** block's parameters standing in for the subject's arguments, so a block
+    // already filed under them is read in the names this one wrote.
+    val mine = stand_in_args(a, scope, home)
+
+    for i in 0..<already.len()
+        if supplied_bound(a, already.at(i), key.unwrap(), subject, mine).key() == bound.key() then
+            a.fault(scope, span, s"'${home.label}' already implements " +
+                    s"'${show_bound(a, bound, subject)}'" +
+                    second_implementation(key.unwrap(), tr, already.at(i)))
+
+    // A shape and a type of that shape written out in full would both implement the trait for that
+    // type. By default the second one written is refused, because two overlapping blocks are usually
+    // a mistake. **What lifts the refusal is `override` on the written-out side**, which says the
+    // overlap is deliberate.
+    if home.head.is_some() && !home.shaped() && !block.overrides &&
+       !impls_of(a, key.unwrap(), home.head.unwrap()).is_empty() then
+        a.fault(scope, span, s"${every_shape(home.head.unwrap())} already implements " +
+                s"'${module_show(key.unwrap())}', so '${home.label}' has an implementation and " +
+                "cannot be given a second one — write 'override impl' to say that replacing it for " +
+                "this one type is what was meant")
+
+    // The first implementation of a trait for a type files its members under the names they were
+    // written with; each one after it under names that differ, since a type's members are one
+    // namespace whatever brought them.
+    //
+    // **The compiler's own membership occupies the unsuffixed name even though it is in no table**,
+    // so a block written for a built-in at *other* arguments is the second implementation whatever
+    // the table holds.
+    val provided = !written.is_empty() && provides
+    val nth = already.len() + (if provided then 2 else 1)
+
+    // A **call** trait's member has no scope to be told apart by, for the same reason an inherent
+    // member has none: the call syntax names no trait for a file to have imported or left out.
+    val call_trait = fn_is_call(key.unwrap())
+
+    home.alt = if nth == 1 then "" else s".$nth"
+    home.from_trait = if call_trait then None else Some(key.unwrap())
+    home.overrides = block.overrides
+
+    // The associated types the block supplies, in its own terms -- the same substitution the subject
+    // is built under, so an argument built out of the block's parameter means one thing per
+    // instantiation and the subject settles which.
+    val assoc_subst = joined_bindings(abstract_subst(a, scope, home.tparams, home.bounds,
+                                                     home.tvalues, home.tpacks, buf()),
+                                      self_binding(subject))
+    var assocs: Buf[(string, Type)] = buf()
+
+    for i in 0..<block.assocs.len()
+        val bind = block.assocs.at(i)
+
+        if !declares_assoc(tr, bind.name) then
+            a.fault(scope, bind.span, s"trait '${module_show(block.trait_name)}' declares no associated type " +
+                    s"'${bind.name}', so this 'impl' has nothing to supply — the trait is where one " +
+                    s"is declared, as 'type ${bind.name}: …'")
+
+        if count_assoc(block, bind.name) > 1 then
+            a.fault(scope, bind.span, s"'${bind.name}' is supplied twice by this 'impl', and a type " +
+                    s"has one associated '${bind.name}' — the trait leaves it open once and the " +
+                    "implementation fills it once")
+
+        assocs.push((bind.name, resolve_type(a, scope, bind.typ, assoc_subst)))
+
+    for i in 0..<tr.assocs.len()
+        val ad = tr.assocs.at(i)
+
+        if !holds_assoc(assocs, ad.name) then
+            a.fault(scope, span, s"'${home.label}' does not implement '${module_show(block.trait_name)}': the " +
+                    s"associated type '${ad.name}' is missing — supply it with " +
+                    s"'type ${ad.name} = …', or give the member that produces it the result " +
+                    s"'some ${first_bound_shown(ad)}' and let the body say what it is")
+
+    val wkey = if written.is_empty() then "" else Bound(key.unwrap(), written).key()
+    var rows: Buf[TraitImpl] = buf()
+
+    for i in 0..<already.len()
+        rows.push(already.at(i))
+
+    rows.push(TraitImpl(block, span, scope, written, wkey, home.alt, home.tparams,
+                        !home.tparams.is_empty() && !home.bounds.is_empty(), assocs))
+    a.tables.members.impls.put(impl_key_of(key.unwrap(), home.key), rows)
+
+    // A default the block left out is hoisted for this type exactly as a written method is, from the
+    // body the trait supplied -- so everything downstream finds an ordinary member and needs to know
+    // nothing about where it came from.
+    val inherited = check_conformance(a, scope, span, tr, block, home)
+
+    for i in 0..<inherited.len()
+        a.tables.members.default_origin.put(
+            s"${home.symbol}.${inherited.at(i).name}${home.alt}",
+            s"${block.trait_name}.${inherited.at(i).name}")
+
+    var supplied: Buf[MethodDecl] = buf()
+
+    for i in 0..<block.methods.len()
+        supplied.push(with_trait_defaults(tr, block.methods.at(i)))
+
+    for i in 0..<inherited.len()
+        supplied.push(inherited.at(i))
+
+    hoist_member_list(a, home, supplied)
+end hoist_impl
+
+// The subject as the block wrote it, for a message that names it.
+private written_subject(block: ImplDecl) -> string = type_text(block.for_type)
+
+// What a trait's own parameters mean inside this block's members: the arguments the block fixed them
+// to.
+private trait_outer(tr: TraitDecl, bound: Bound) -> Buf[Binding]
+    var out: Buf[Binding] = buf()
+
+    for i in 0..<tr.tparams.len()
+        if i < bound.args.len() then out.push(Binding(tr.tparams.at(i), bound.args.at(i)))
+
+    out
+end trait_outer
+
+// The block's own parameters standing in for themselves, in the subject's argument order -- what a
+// comparison against an already-filed block is read under.
+private stand_in_args(a: &Analysis, scope: Scope, home: MemberHome) -> Buf[Type]
+    var out: Buf[Type] = buf()
+    val subst = abstract_subst(a, scope, home.tparams, home.bounds, home.tvalues, home.tpacks, buf())
+
+    for i in 0..<home.tparams.len()
+        val found = bound_type(subst, home.tparams.at(i))
+
+        out.push(found.unwrap_or(Abstract(home.tparams.at(i), buf())))
+
+    out
+end stand_in_args
+
+private declares_assoc(tr: TraitDecl, name: string) -> bool
+    for i in 0..<tr.assocs.len()
+        if tr.assocs.at(i).name == name then return true
+
+    false
+end declares_assoc
+
+private count_assoc(block: ImplDecl, name: string) -> usize
+    var n: usize = 0
+
+    for i in 0..<block.assocs.len()
+        if block.assocs.at(i).name == name then n += 1
+
+    n
+end count_assoc
+
+private holds_assoc(assocs: Buf[(string, Type)], name: string) -> bool
+    for i in 0..<assocs.len()
+        if assocs.at(i).0 == name then return true
+
+    false
+end holds_assoc
+
+private first_bound_shown(ad: AssocDecl) -> string =
+    if ad.bounds.is_empty() then "Trait" else ad.bounds.at(0).name
+
+// Why a trait implemented twice **at one argument list** is refused, where the arguments might have
+// made a reader think this block asked for something else.
+second_implementation(trait_key: string, tr: TraitDecl, other: TraitImpl) -> string
+    if tr.tparams.is_empty() then return ""
+
+    if other.written.is_empty() || other.wkey == "" then
+        return s" — arguments left out are the ones '${module_show(trait_key)}' declares them to " +
+               "default to, so the two blocks implement the same trait at the same arguments"
+
+    s" — a trait's members become the type's, so a second '${tr.methods.at(0).name}' at these " +
+    "arguments would have a call no way to say which was meant"
+end second_implementation
+
+// -- what the block promises ------------------------------------------------------------------------
+
+// The bound the block supplies, and the arguments it actually **wrote** as against the ones the
+// trait's defaults filled in.
+impl_bound(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, tr: TraitDecl,
+           home: MemberHome) -> (Bound, Buf[Type])
+    // The block's parameters resolve to themselves so that naming one here is caught as the thing it
+    // is, rather than reported as an unknown type.
+    val declared = abstract_subst(a, scope, block.tparams, block.bounds, block.tvalues, block.tpacks,
+                                 buf())
+    val written = resolve_list(a, scope, block.trait_args, declared)
+    val subject = resolve_type(a, scope, block.for_type, declared)
+
+    // What the block leaves out the trait supplies, and `Self` in one of those defaults is the type
+    // this block implements the trait for -- which is what makes `impl Mul for Point` the
+    // `impl Mul[Point] for Point` it reads as.
+    var args = written
+
+    if written.len() != tr.tparams.len() then
+        args = trait_args_with_defaults(a, scope, span, block.trait_name, tr, written,
+                                        self_binding(subject))
+
+    // Asked of what the block **wrote**, not of what the defaults filled in.
+    for i in 0..<block.tparams.len()
+        if holds_string(tr.tparams, block.tparams.at(i)) then
+            a.fault(scope, span, s"trait '${module_show(block.trait_name)}' already declares a type " +
+                    s"parameter '${block.tparams.at(i)}', so this 'impl' cannot declare one of that " +
+                    "name")
+
+    (Bound(block.trait_name, args), written)
+end impl_bound
+
+// The type an `impl` is for, and where its members belong.
+impl_target(a: &Analysis, scope: Scope, span: Span, block: ImplDecl) -> (Type, MemberHome)
+    *block.for_type.kind match
+        NamedType(written, arg_refs) ->
+            val key = lookup_type_key(a, scope, written)
+            val nom = if key.is_some() then nominal_of(a, key.unwrap()) else None
+
+            if nom.is_some() then named_target(a, scope, span, block, block.for_type,
+                                               key.unwrap(), nom.unwrap())
+            else structural_target(a, scope, span, block, block.for_type)
+        _ -> structural_target(a, scope, span, block, block.for_type)
+end impl_target
+
+// A struct's or an enum's parameters, the names its body already spoke for, and what a diagnostic
+// calls one of those.
+nominal_of(a: &Analysis, key: string) -> Option[(Buf[string], Buf[string], string)]
+    val decl = a.tables.types.get(key)
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        StructOf(d) ->
+            var names: Buf[string] = buf()
+
+            for i in 0..<d.fields.len()
+                names.push(d.fields.at(i).name)
+
+            Some((d.tparams, names, "field"))
+        EnumOf(d) ->
+            var names: Buf[string] = buf()
+
+            for i in 0..<d.variants.len()
+                names.push(d.variants.at(i).name)
+
+            Some((d.tparams, names, "variant"))
+        _ -> None
+end nominal_of
+
+// A name declaring a struct or an enum is the one shape that may be generic, so it is settled here
+// rather than by resolving a reference whose arguments are the block's own parameters. Its key is the
+// name it was declared under, which stands even where the declaration itself failed to resolve.
+private named_target(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, subject: TypeRef,
+                     key: string, nom: (Buf[string], Buf[string], string)) -> (Type, MemberHome)
+    val tparams = nom.0
+    val taken = nom.1
+    val noun = nom.2
+    val written = type_text(subject)
+
+    if tparams.is_empty()
+        if !block.tparams.is_empty() then
+            a.fault(scope, span, s"'$written' takes no type arguments, so an 'impl' for it has " +
+                    "nothing to be generic over")
+
+        val ty = concrete_instance(a, key).unwrap_or(Unknown)
+
+        return (ty, MemberHome(key, module_show(key), key, None, subject, buf(), buf(), taken, noun,
+                               self_binding(ty), buf(), "", None, false, buf(), buf(), scope))
+
+    // A generic type has no one instantiation to be, and nothing that reaches this needs one: an
+    // implementation covers every one of them at once, and each member is made real per receiver.
+    val order = impl_args(a, scope, span, block, key, tparams)
+
+    (Unknown, MemberHome(key, module_show(key), key, None, subject, order, block.bounds, taken, noun,
+                         buf(), buf(), "", None, false, block.tvalues, block.tpacks, scope))
+end named_target
+
+// Everything else: a built-in, a composed type written out in full, a shape, or a blanket over a
+// family the compiler closes.
+private structural_target(a: &Analysis, scope: Scope, span: Span, block: ImplDecl,
+                          subject: TypeRef) -> (Type, MemberHome)
+    // The block's parameters stand in for themselves while the subject is resolved, so a shape
+    // written with one comes back as the shape it is rather than through a complaint about a name
+    // that means nothing outside this block.
+    val abstracts = abstract_subst(a, scope, block.tparams, block.bounds, block.tvalues, block.tpacks,
+                                   buf())
+    // Resolved rather than taken as written, so the key is the type's one canonical name and two
+    // spellings of one type are one implementation.
+    val ty = resolve_type(a, scope, subject, abstracts)
+
+    refuse_unimplementable(a, scope, span, ty)
+
+    val blanket = ty match
+        Abstract(_, bounds) -> closed_bound(a, scope, span, ty, bounds)
+        _ -> None
+
+    var head = impl_shape(a, block, ty)
+
+    if blanket.is_some() then head = Some(blanket_key(blanket.unwrap()))
+
+    // Recorded where it is decided, since this is the only place that knows the block was a blanket:
+    // the key alone cannot be read back out of the table it is filed in.
+    if blanket.is_some() then
+        a.tables.members.blankets.put(blanket_key(blanket.unwrap()), blanket.unwrap())
+
+    if block.tparams.is_empty() then
+        return (ty, MemberHome(owner_key(ty), type_show(ty), member_symbol(ty), head, subject, buf(),
+                               buf(), buf(), "field", self_binding(ty), buf(), "", None, false,
+                               buf(), buf(), scope))
+
+    val shape = head.unwrap_or(owner_key(ty))
+    var order: Buf[string] = buf()
+    var symbol = ""
+
+    if blanket.is_some()
+        order = blanket_args(a, scope, span, block)
+        symbol = s"bound.${module_bare(blanket.unwrap())}"
+    else
+        order = shape_args(a, scope, span, block, ty, shape)
+        symbol = shape_symbol(ty, shape)
+
+    // Like a generic type's, the members are made real per receiver -- so there is no one
+    // instantiation to be, and the shape rather than any type of it is what they are filed under.
+    (Unknown, MemberHome(shape, type_text(subject), symbol, head, subject, order, block.bounds, buf(),
+                         "field", buf(), buf(), "", None, false, block.tvalues, block.tpacks, scope))
+end structural_target
+
+// Two shapes are refused outright, each because an `impl` for it would be about nothing. A **memory
+// mode** is a way of holding a type rather than a type, and a member call already sees through one. A
+// **trait object** has forgotten which type it holds, which is the one thing an `impl` is written
+// about.
+private refuse_unimplementable(a: &Analysis, scope: Scope, span: Span, ty: Type)
+    if erased(ty)
+        a.fault(scope, span, s"'${type_show(ty)}' has forgotten which type it holds, and an 'impl' " +
+                "says how one particular type behaves — so it is written for that type, not for an " +
+                "object over it")
+        return
+    end if
+
+    ty match
+        Ptr(inner) -> a.fault(scope, span, mode_is_not_a_type("*", *inner))
+        Ref(inner, sync) -> a.fault(scope, span,
+                                    mode_is_not_a_type(if sync then "&sync " else "&", *inner))
+        // The third mode, refused for the same reason with a sharper consequence: a member call
+        // reaches through a `*T` and a `&T`, and through a `weak T` it reaches nothing at all.
+        Weak(inner) -> a.fault(scope, span, s"'weak ${type_show(*inner)}' is a way of holding a " +
+                               s"${type_show(*inner)} rather than a type of its own — and nothing " +
+                               "goes through one but 'get()', so a member written here could never " +
+                               s"be called. Write the 'impl' for ${type_show(*inner)}, which " +
+                               "'get()' hands back")
+        VaList -> a.fault(scope, span,
+                          "a va_list is an ABI primitive, not something to implement a trait for")
+        _ -> ()
+end refuse_unimplementable
+
+private mode_is_not_a_type(sigil: string, inner: Type) -> string =
+    s"'$sigil${type_show(inner)}' is a way of holding a ${type_show(inner)} rather than a type of " +
+    s"its own, and a member call reaches through one — so the 'impl' is written for " +
+    s"${type_show(inner)}"
+
+// The **closed** bound a type parameter carries, where it carries one -- which is what makes a block
+// written for the bare parameter a blanket rather than a refusal.
+//
+// A parameter may be bounded by more than one trait, and only the closed one names the family the
+// block covers; the rest are what its body may assume.
+closed_bound(a: &Analysis, scope: Scope, span: Span, ty: Type, bounds: Buf[Bound]) -> Option[string]
+    var closed: Buf[string] = buf()
+
+    for i in 0..<bounds.len()
+        val spelling = library_spelling(bounds.at(i).name)
+
+        if spelling.is_some() && core_closed(spelling.unwrap()) then closed.push(bounds.at(i).name)
+
+    if closed.is_empty()
+        // Any other parameter stands for any type at all, so the block would be saying how every
+        // type behaves, which is what a trait's own defaults are for.
+        a.fault(scope, span, s"'${type_show(ty)}' is a type parameter of this 'impl', so it stands " +
+                "for every type at once — an 'impl' says how one kind of type behaves. A bound the " +
+                "compiler closes is the exception, since it names a family rather than every type")
+        return None
+    end if
+
+    if closed.len() > 1
+        var shown: Buf[string] = buf()
+
+        for i in 0..<closed.len()
+            shown.push(s"'${module_show(closed.at(i))}'")
+
+        a.fault(scope, span, s"'${type_show(ty)}' is bounded by ${conjoin(shown)}, and each of " +
+                "those names a family — so it is not one family this 'impl' covers, and there is " +
+                "no type that is in both")
+    end if
+
+    Some(closed.at(0))
+end closed_bound
+
+// The shape key **this block** is filed under, which the subject as *written* decides rather than the
+// type it resolved to: a value parameter stands at zero for the walk that checks the block's body, so
+// `[N]T` and `[0]T` resolve to the same array and only the syntax says which was written.
+private impl_shape(a: &Analysis, block: ImplDecl, ty: Type) -> Option[string]
+    if length_param(block).is_some() then return Some(ArrayShape)
+    if pack_param(block).is_some() then return Some(PackShape)
+
+    val shapes = shape_owners(ty)
+
+    if shapes.is_empty() then None else Some(shapes.at(0).0)
+end impl_shape
+
+// The block's own **value** parameter standing for an array's length, where the subject is an array
+// whose length was written as one.
+private length_param(block: ImplDecl) -> Option[string]
+    *block.for_type.kind match
+        ArrayType(length, _, _) ->
+            if length.is_none() then return None
+
+            *length.unwrap().kind match
+                Ident(n) -> if has_binding(block.tvalues, n) then Some(n) else None
+                _ -> None
+        _ -> None
+end length_param
+
+// The block's own **pack** parameter, where the subject is `(..A)` and `A` is one.
+private pack_param(block: ImplDecl) -> Option[string]
+    *block.for_type.kind match
+        TupleType(parts, _) ->
+            if parts.len() != 1 then return None
+
+            *parts.at(0).kind match
+                PackType(n) -> if holds_string(block.tpacks, n) then Some(n) else None
+                _ -> None
+        _ -> None
+end pack_param
+
+// The symbol a shape's members are emitted under, which is the mangling of the types it covers with
+// the arguments left off -- so an instantiation appends them and arrives back where the type written
+// out in full would have started.
+private shape_symbol(ty: Type, shape: string) -> string = ty match
+    Slice(_, _) -> "slice"
+    Array(n, _) -> if shape == ArrayShape then "arr" else s"arr$n"
+    _ -> "tuple"
+
+// The block's own parameters in the order a generic type applies them.
+//
+// A shape is one key, so a block that fixed part of what it matched would be implementing the trait
+// for *some* of the types the shape covers -- a second implementation for a key that holds one.
+impl_args(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, key: string,
+          tparams: Buf[string]) -> Buf[string]
+    var arg_refs: Buf[TypeRef] = buf()
+
+    *block.for_type.kind match
+        NamedType(_, written_args) -> arg_refs = written_args
+        _ -> ()
+
+    val written = type_text(block.for_type)
+    val spelled = s"impl[${joined(tparams, ", ")}] ${module_show(block.trait_name)} for " +
+                  s"${module_show(key)}[${joined(tparams, ", ")}]"
+
+    if block.tparams.is_empty() then
+        a.fault(scope, span, s"'${module_show(key)}' is generic, so an 'impl' for it covers every " +
+                s"instantiation at once — write '$spelled'")
+
+    if arg_refs.len() != tparams.len() then
+        a.fault(scope, span, s"'${module_show(key)}' takes " +
+                s"${quantity(tparams.len(), "type argument")}, but " +
+                s"${supplied_phrase(arg_refs.len(), "type argument")}")
+
+    var names: Buf[string] = buf()
+
+    for i in 0..<arg_refs.len()
+        *arg_refs.at(i).kind match
+            NamedType(n, as_written) ->
+                if as_written.is_empty() && holds_string(block.tparams, n) then names.push(n)
+                else fix_refused(a, scope, span, arg_refs.at(i), module_show(key))
+            _ -> fix_refused(a, scope, span, arg_refs.at(i), module_show(key))
+
+    check_argument_names(a, scope, span, block, names, written)
+    names
+end impl_args
+
+private fix_refused(a: &Analysis, scope: Scope, span: Span, at: TypeRef, written: string)
+    a.fault(scope, span, s"'${type_text(at)}' fixes an argument of '$written' to one type, and " +
+            "an 'impl' covers the whole of a generic type — write one of the block's own parameters " +
+            "here")
+
+private check_argument_names(a: &Analysis, scope: Scope, span: Span, block: ImplDecl,
+                             names: Buf[string], written: string)
+    for i in 0..<names.len()
+        for j in 0..<i
+            if names.at(i) == names.at(j) then
+                a.fault(scope, span, s"each argument of '$written' takes a type parameter of its " +
+                        s"own, and this 'impl' names '${names.at(i)}' twice")
+
+    var missing: Buf[string] = buf()
+
+    for i in 0..<block.tparams.len()
+        if !holds_string(names, block.tparams.at(i)) then missing.push(block.tparams.at(i))
+
+    if !missing.is_empty() then
+        a.fault(scope, span, s"'${joined(missing, "', '")}' is declared by this 'impl' but does not " +
+                s"appear in '$written', so nothing would ever fix it")
+end check_argument_names
+
+// The same, for a **shape**: the block's parameters in the order the shape applies them, which for a
+// slice is the one element type and for an array covering every length is the length and then the
+// element.
+private shape_args(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, ty: Type,
+                   shape: string) -> Buf[string]
+    var names: Buf[string] = buf()
+    val len_param = length_param(block)
+    val pack = pack_param(block)
+
+    if len_param.is_some() then names.push(len_param.unwrap())
+    if pack.is_some() then names.push(pack.unwrap())
+
+    if pack.is_none()
+        val shapes = shape_owners(ty)
+
+        if !shapes.is_empty()
+            val matched = shapes.at(0).1
+
+            for i in 0..<matched.len()
+                matched.at(i) match
+                    Abstract(n, _) ->
+                        if holds_string(block.tparams, n) then names.push(n)
+                        else element_fixed(a, scope, span, matched.at(i), shape)
+                    ConstArg(_, _) -> ()
+                    other -> element_fixed(a, scope, span, other, shape)
+
+    check_argument_names(a, scope, span, block, names, type_text(block.for_type))
+    names
+end shape_args
+
+private element_fixed(a: &Analysis, scope: Scope, span: Span, t: Type, shape: string)
+    a.fault(scope, span, s"'${type_show(t)}' fixes the element type, and an 'impl' with type " +
+            s"parameters covers ${every_shape(shape)} — write one of the block's own parameters here")
+
+// A blanket applies its one parameter, which is the receiver.
+private blanket_args(a: &Analysis, scope: Scope, span: Span, block: ImplDecl) -> Buf[string]
+    var names: Buf[string] = buf()
+
+    *block.for_type.kind match
+        NamedType(n, _) -> names.push(n)
+        _ -> ()
+
+    check_argument_names(a, scope, span, block, names, type_text(block.for_type))
+    names
+end blanket_args
+
+// -- the members the block wrote --------------------------------------------------------------------
+
+// The block's members with every `some` result replaced by the projection it stands for --
+// `Self::Body` -- and the two ways of writing one that are not this refused by name.
+//
+// The rewrite is the whole of the mechanism. Once the result reads `Self::Body`, the member's
+// signature is the one the trait declared, so conformance compares two identical things and every
+// later pass resolves an ordinary projection.
+opened_results(a: &Analysis, scope: Scope, trait_key: string, tr: TraitDecl,
+               block: ImplDecl) -> Buf[MethodDecl]
+    var out: Buf[MethodDecl] = buf()
+
+    for i in 0..<block.methods.len()
+        var m = block.methods.at(i)
+        val opened = opened_result_of(a, scope, trait_key, tr, m)
+
+        if opened.is_some() then m.ret_type = opened
+
+        out.push(m)
+
+    out
+end opened_results
+
+private opened_result_of(a: &Analysis, scope: Scope, trait_key: string, tr: TraitDecl,
+                         m: MethodDecl) -> Option[TypeRef]
+    if m.ret_type.is_none() then return None
+
+    val bounds = *m.ret_type.unwrap().kind match
+        SomeType(bs) -> Some(bs)
+        _ -> None
+
+    if bounds.is_none() then return None
+
+    val shown = s"some ${bounds_shown(bounds.unwrap())}"
+    val tm = trait_method(tr, m.name)
+
+    if tm.is_none() || tm.unwrap().ret_type.is_none()
+        a.fault(scope, m.span, s"trait '${module_show(trait_key)}' declares no ${member_kind(m)} " +
+                s"'${source_member_name(m.name)}', so there is no associated type for '$shown' to " +
+                "settle")
+        return None
+    end if
+
+    val declared = tm.unwrap().ret_type.unwrap()
+    val projected = assoc_of_self(declared)
+
+    if projected.is_none() || !declares_assoc(tr, projected.unwrap())
+        a.fault(scope, m.span, s"'$shown' says the trait left this result open for the " +
+                s"implementation to settle, and '${module_show(trait_key)}' declares " +
+                s"'${source_member_name(m.name)}' returning '${type_text(declared)}' — which is " +
+                "already the answer, so write it")
+        return None
+    end if
+
+    Some(type_ref(m.ret_type.unwrap().span,
+                  AssocType(named_type(m.span, "Self"), projected.unwrap())))
+end opened_result_of
+
+// The associated type a result names off `Self`, where that is what it is.
+private assoc_of_self(written: TypeRef) -> Option[string]
+    *written.kind match
+        AssocType(base, member) ->
+            *base.kind match
+                NamedType(n, args) -> if n == "Self" && args.is_empty() then Some(member) else None
+                _ -> None
+        _ -> None
+end assoc_of_self
+
+private bounds_shown(bs: Buf[BoundRef]) -> string
+    var b = str_builder()
+
+    for i in 0..<bs.len()
+        if i > 0 then b.push(" + ")
+
+        b.push(bs.at(i).name)
+
+    b.finish()
+end bounds_shown
+
+trait_method(tr: TraitDecl, name: string) -> Option[MethodDecl]
+    for i in 0..<tr.methods.len()
+        if tr.methods.at(i).name == name then return Some(tr.methods.at(i))
+
+    None
+end trait_method
+
+// One of an `impl` block's methods, carrying whatever defaults the trait declared for it.
+//
+// An `impl` may declare none of its own -- a call through an object has no implementation to read one
+// off, so the trait is the only place they can be written -- which is what makes this a copy rather
+// than a merge, and what leaves nothing to decide when the two disagree.
+private with_trait_defaults(tr: TraitDecl, im: MethodDecl) -> MethodDecl
+    val tm = trait_method(tr, im.name)
+
+    if tm.is_none() || tm.unwrap().params.len() != im.params.len() then return im
+
+    var any = false
+
+    for i in 0..<tm.unwrap().params.len()
+        if tm.unwrap().params.at(i).default.is_some() then any = true
+
+    if !any then return im
+
+    var out = im
+    var ps: Buf[Param] = buf()
+
+    for i in 0..<im.params.len()
+        val p = im.params.at(i)
+
+        ps.push(Param(p.span, p.name, p.typ, p.vis, tm.unwrap().params.at(i).default, p.by_name,
+                      p.rest))
+
+    out.params = ps
+    out
+end with_trait_defaults

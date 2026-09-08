@@ -49,7 +49,11 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
         CFn(resolve_list(a, scope, params, subst), resolve_type(a, scope, ret, subst))
     FnType(params, ret, _) -> resolve_fn_trait(a, scope, params, ret, subst)
     SomeType(_) -> Unknown
-    AssocType(_, _) -> Unknown
+    // `T::Item` -- the associated type, which the member tables are what answer. It resolves like
+    // anything else the moment the subject is known: the subject is resolved first, and a parameter
+    // standing in for itself answers off the bounds it carries.
+    AssocType(base, member) ->
+        assoc_type(a, scope, t.span, resolve_type(a, scope, base, subst), member)
     AssocArgType(_, inner) -> resolve_type(a, scope, inner, subst)
     ValueArgType(e) -> ConstArg(from_int(long(const_extent(a, scope, t.span, e))), int_type())
 
@@ -332,7 +336,9 @@ private check_arity(a: &Analysis, scope: Scope, span: Span, written: string, tpa
     false
 end check_arity
 
-private arity_phrase(most: usize, least: usize) -> string =
+// How an arity is described when it is wrong. Shared with the trait-arity check, which asks the same
+// question of a trait's parameter list.
+arity_phrase(most: usize, least: usize) -> string =
     if least == most then s"takes ${quantity(most, "type argument")}"
     else s"takes between $least and $most type arguments"
 

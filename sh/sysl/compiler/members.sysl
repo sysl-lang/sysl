@@ -1,0 +1,240 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a type's members are, as the tables hold them, and the `impl` blocks that give a type
+// somebody else's.
+//
+// **Every member in the language ends up as an ordinary function under a mangled name**, whether it
+// was written in a type's own body, in an `impl` block, or as a trait's default. That is what makes
+// `p.show()` one lookup whether `show` was written on `Point` or on a trait `Point` implements, and
+// it is why nothing downstream of here has a method concept: a call on a value is a call.
+//
+// The tables are grouped into one record rather than spread across `Tables` because they are one
+// stage's, and because the declaration pass that fills the rest of `Tables` deliberately does not
+// read them -- asking what members a type has, whether it satisfies a bound and through which
+// implementation, and what to say when it does not, is this stage's question.
+
+// The key a member is filed under: the type's own key and the name the member is filed as, joined by
+// a character no type's spelling and no identifier holds.
+member_key_of(owner: string, mname: string) -> string = s"$owner\t$mname"
+
+// The key one trait's implementations for one owner are filed under.
+impl_key_of(trait_name: string, owner: string) -> string = s"$trait_name\t$owner"
+
+// The synthetic owner key a **blanket** `impl` is filed under: one key per closed bound, standing
+// for every type that meets it.
+//
+// A blanket is not a new kind of storage and deliberately does not get one. A block matching every
+// slice is already filed under `[]` with its members instantiated per receiver, and a block matching
+// every integer is the same arrangement with a different key -- so the whole of this is a name that
+// no type's own key can collide with.
+blanket_key(bound_trait: string) -> string = s"@bound:$bound_trait"
+
+// A function's signature as the tables hold one: the parameters with the names they were written
+// with, and what the function hands back.
+struct FuncSig
+    params: Buf[(string, Type)]
+    ret: Type
+end FuncSig
+
+// One `impl Trait for Type` block, as everything downstream of the hoist reads it.
+//
+//   - `written` are the trait arguments the block **wrote**, as against the ones the trait's own
+//     defaults filled in. They may name the block's own type parameters, but only ones the
+//     **subject** binds: `impl[T] Index[usize, T] for Buf[T]` writes an argument that every
+//     particular `Buf` settles. The distinction is what a defaulted block means -- `impl Mul for
+//     Box[T]` does not promise `Mul` at one particular `Box` but whatever the default gives for the
+//     type being asked about.
+//   - `alt` is the suffix this block's members carry, empty for the first implementation of a trait
+//     for a type and distinct for each one after it.
+//   - `tparams` are the block's own type parameters **in the subject's argument order**, which is
+//     what lets a subject's arguments be substituted into `written` positionally. Empty for a block
+//     written for one type.
+//   - `bounds` is what a **generic** block asks of the type arguments its subject is applied to.
+//     `impl[T: Show] Show for Box[T]` is conditional conformance -- a `Box` implements `Show` when
+//     its element does -- and this is the condition. It is kept as written rather than resolved
+//     because one bound may name another of the block's parameters, and only the arguments a
+//     particular `Box` was made with say what that means. `conditional` is false where the block
+//     asks nothing, which is what makes the ordinary case a lookup that asks nothing further.
+//   - `scope` is the terms the block was **written** in, which is what a held-as-written bound has
+//     to be resolved under: whether a type conforms is asked wherever the trait is used, and a bound
+//     naming a trait by a short name means what the *block's* file imported.
+//   - `assocs` are the associated types this block supplies, in the block's own terms -- resolved
+//     with its parameters standing in for themselves, exactly as `written` is. They are kept apart
+//     from `written` and that separation is the whole feature: an argument in `written` was *chosen*
+//     where the trait was applied, so it is part of the key an implementation is selected by, while
+//     an associated type is *determined* by the subject and selects nothing.
+struct TraitImpl
+    decl: ImplDecl
+    span: Span
+    scope: Scope
+    written: Buf[Type]
+    wkey: string
+    alt: string
+    tparams: Buf[string]
+    conditional: bool
+    assocs: Buf[(string, Type)]
+
+    // Whether this block asks anything of the arguments its subject is applied to.
+    condition(self) -> Buf[NamedBounds] = self.decl.bounds
+end TraitImpl
+
+// Everything this stage builds on top of the declaration tables.
+struct MemberTables
+    // A type's members, keyed by (owner key, the name it is filed under). Methods, properties and
+    // associated functions all live here; each is also lowered to an ordinary function.
+    decls: &Table[MethodDecl]
+
+    // Which trait a member came from, for the members an `impl` block brought. A type's **own**
+    // members are absent, which is what tells the two apart at a lookup: a member is reachable only
+    // where the trait that declared it can be named, so an entry here is a question to ask of the
+    // use site's scope and no entry is a member that arrives with its type.
+    from_trait: &Table[string]
+
+    // Every member a type has under one **source** name, where more than one implementation of one
+    // trait gave it one. A type with one `mul` has no entry here and is reached by the name it was
+    // written with, which is what keeps the ordinary case a lookup.
+    alts: &Table[Buf[string]]
+
+    // The function a member was lowered to, keyed the way the member table is. The two names are not
+    // the same string and cannot be derived from each other: a member is *filed* under the key an
+    // `impl` may name and *lowered* under that type mangled, and a type an `impl` may name is not
+    // always a name.
+    funcs: &Table[string]
+
+    // A member of a *generic* type, kept as written and instantiated on demand at each call site
+    // once the receiver's concrete type arguments are known.
+    generic: &Table[FuncDecl]
+
+    // What `Self` and a trait's own arguments mean inside one lowered member, by the name it was
+    // lowered to.
+    selves: &Table[Buf[Binding]]
+
+    // The receiver a generic member's signature was written with, and the terms it was written in.
+    generic_self: &Table[TypeRef]
+    generic_scope: &Table[Scope]
+
+    // Which composed type already has a member of a name its shape shares a namespace with.
+    composed: &Table[string]
+
+    // Every `impl Trait for Type` for one (trait name, owner key), in the order the source wrote
+    // them. A trait that takes arguments is a family of promises rather than one, and a type may
+    // keep more than one: a `Complex` that is `Mul[Complex]` and `Mul[real]` multiplies by another
+    // complex number and scales by a real, and refusing the second would be refusing the arithmetic.
+    impls: &Table[Buf[TraitImpl]]
+
+    // Which closed bound each registered blanket `impl` was written over, by the key it is filed
+    // under. Small, and usually empty outside the library.
+    blankets: &Table[string]
+
+    // Instantiated function signatures, keyed by the name a symbol will carry.
+    func_insts: &Table[FuncSig]
+
+    // What each instantiation of a generic was made from, by the name the instantiation goes under.
+    // The mangled name cannot be read back to say so.
+    func_origin: &Table[string]
+
+    // Where a lowered member's names resolve, which is the file the member was written in -- an
+    // `impl` in another module may have named the type, and an inherited default's body is the
+    // trait's source wherever the trait is.
+    decl_scope: &Table[Scope]
+
+    // Which trait default a member was copied from, by the name the copy was lowered to. A default
+    // is materialized per implementing type, so one source body becomes several functions.
+    default_origin: &Table[string]
+
+    // The members lowered eagerly, in the order they were hoisted: every member of a concrete type,
+    // which is a function whose body is typed whether or not anything calls it.
+    lowered: Buf[FuncDecl]
+
+    // Instantiations whose body has not been typed yet. Queued rather than typed inline so that an
+    // instantiation discovered mid-function does not disturb the enclosing walk.
+    pending: Buf[PendingInst]
+
+    // The instantiations of a slice shape block made real at the **read-only** view.
+    const_self: &Table[bool]
+
+    // Whether every `impl` block has been registered, which is what makes a bound answerable. A
+    // type's bounds are checked wherever it is applied, and the earliest applications are resolved
+    // while the file is still being hoisted -- asking then would report a `Point` for not
+    // implementing a trait it implements six lines further down.
+    hoisted: bool
+
+    // Type applications whose bounds could not be answered where they were written. Drained once, as
+    // soon as the answer is available.
+    deferred: Buf[DeferredBound]
+end MemberTables
+
+// One instantiation waiting for its body to be typed: the name it goes under, the declaration it was
+// made from, and what its type parameters were fixed to.
+struct PendingInst
+    name: string
+    decl: FuncDecl
+    subst: Buf[Binding]
+    scope: Scope
+end PendingInst
+
+// One type application whose bounds could not be answered where it was written: what was applied, to
+// what, the bounds to hold it to, the place to report against -- and **the terms the bounds were
+// written in**.
+//
+// The scope is carried because the check is run later, from a walk that is nowhere near the file that
+// wrote the bound. A bound names a trait the way anything else does, so resolving it from wherever
+// the drain happens to be reaches whatever *that* module can see, which for an imported name is
+// nothing at all -- and a bound that resolved to nothing is compared against the same bound that
+// resolved properly, so the type is told its own parameter is not bounded by the trait it is bounded
+// by.
+struct DeferredBound
+    what: string
+    tparams: Buf[string]
+    bounds: Buf[NamedBounds]
+    targs: Buf[Type]
+    span: Span
+    scope: Scope
+
+    // What the thing being checked is called in the sentence -- `type parameter` for the ordinary
+    // case, `associated type` for a trait object's binding. The rule is identical and only the noun
+    // differs, so calling an associated type a parameter would send the reader looking for a bracket
+    // the trait does not have.
+    noun: string
+end DeferredBound
+
+// Empty member tables.
+member_tables() -> &MemberTables =
+    MemberTables(table(), table(), table(), table(), table(), table(), table(), table(), table(),
+                 table(), table(), table(), table(), table(), table(), buf(), buf(), table(), false,
+                 buf())
+
+// -- reading the tables --------------------------------------------------------------------------
+
+// Whether a member of that name is filed for an owner.
+has_member_at(a: &Analysis, owner: string, mname: string) -> bool =
+    a.tables.members.decls.has(member_key_of(owner, mname))
+
+// The member filed for an owner, where one is.
+member_at(a: &Analysis, owner: string, mname: string) -> Option[MethodDecl] =
+    a.tables.members.decls.get(member_key_of(owner, mname))
+
+// Every implementation of a trait for one owner key, in source order.
+impls_of(a: &Analysis, trait_name: string, owner: string) -> Buf[TraitImpl] =
+    a.tables.members.impls.get(impl_key_of(trait_name, owner)).unwrap_or(buf())
+
+// The bare name a key spells where the key names something the library declares, and nothing where
+// it names a program's own declaration.
+//
+// The catalog of compiler-known traits is written in **spellings**, which is what a program writes,
+// and a trait in the standard module is filed under `sysl$Display` rather than `Display`. A table
+// written in keys would have to be edited every time a declaration moved.
+library_spelling(key: string) -> Option[string]
+    val m = module_of(key)
+
+    if m == AutoImportedModule || starts_with_module(m, AutoImportedModule) then
+        Some(module_bare(key))
+    else None
+end library_spelling
+
+// The key the library files a trait's spelling under, which is what a bound resolved in a program
+// that imported the standard module comes to.
+library_key(name: string) -> string = module_qualify(AutoImportedModule, name)

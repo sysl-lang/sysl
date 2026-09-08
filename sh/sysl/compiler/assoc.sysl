@@ -1,0 +1,459 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// `T::Item` -- the associated types, and the three different things a projection can be read off.
+//
+// It is one question asked three ways rather than a section of a longer list: the subject may be a
+// **parameter**, answered by the bounds it carries; a **concrete** type, answered by its own
+// implementation through the same key ladder a member lookup climbs; or a **trait object**, which
+// forgot its type and wrote down the answer in its place.
+
+// Every trait declaring an associated type of this name. It is what makes `T::Item` writable without
+// naming the trait: a type implements at most one trait declaring an `Item`, and a program where
+// that is not so is told where it asked rather than made to qualify everywhere it is.
+traits_declaring(a: &Analysis, member: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<a.tables.types.len()
+        val d = trait_decl_at(a, a.tables.types.key_at(i))
+
+        if d.is_some()
+            val assocs = d.unwrap().assocs
+
+            for j in 0..<assocs.len()
+                if assocs.at(j).name == member then out.push(a.tables.types.key_at(i))
+
+    out
+end traits_declaring
+
+// The associated type an implementation supplies for a member, with the subject's own arguments put
+// in for the block's parameters -- the same substitution a supplied bound makes over what the block
+// wrote, and for the same reason: an associated type built out of the block's parameter is a promise
+// about a particular subject, so `impl[T] Sequence for Buf[T]` writing `type Item = T` says `int` at
+// a `Buf[int]`.
+impl_assoc(a: &Analysis, ti: TraitImpl, member: string, targs: Buf[Type]) -> Option[Type]
+    var sub: Buf[Binding] = buf()
+
+    for i in 0..<ti.tparams.len()
+        if i < targs.len() then sub.push(Binding(ti.tparams.at(i), targs.at(i)))
+
+    for i in 0..<ti.assocs.len()
+        if ti.assocs.at(i).0 == member then return Some(subst_params(a, ti.assocs.at(i).1, sub))
+
+    None
+end impl_assoc
+
+// The bounds an associated type carries -- what a generic caller reaching one may do with it.
+//
+// They are the trait's, resolved in the trait's own terms: the trait's own parameters are whatever
+// this bound applied it to. **`self` is the ASSOCIATED TYPE, not the type implementing the trait**:
+// a bound asks something of the thing it is written on, so passing the subject would fill a
+// parameterised bound's `Self` defaults from the implementing type instead.
+assoc_bounds_of(a: &Analysis, b: Bound, ad: AssocDecl, assoc_self: Type) -> Buf[Bound]
+    var out: Buf[Bound] = buf()
+    val d = trait_decl_at(a, b.name)
+
+    if d.is_none() then return out
+
+    val decl = d.unwrap()
+    val scope = trait_scope_of(a, b.name)
+    var subst: Buf[Binding] = buf()
+
+    for i in 0..<decl.tparams.len()
+        if i < b.args.len() then subst.push(Binding(decl.tparams.at(i), b.args.at(i)))
+
+    subst.push(Binding("Self", assoc_self))
+
+    for i in 0..<ad.bounds.len()
+        out.push(resolve_bound(a, scope, ad.bounds.at(i).span, ad.bounds.at(i), subst))
+
+    out
+end assoc_bounds_of
+
+// The terms a trait's own declaration was written in.
+trait_scope_of(a: &Analysis, key: string) -> Scope
+    val decl = a.tables.types.get(key)
+
+    if decl.is_some() then return decl.unwrap().scope
+
+    Scope(module_of(key), no_imports(), source_of("", ""))
+end trait_scope_of
+
+// `T::Item` where `T` is a type parameter standing in for itself: the projection stays abstract,
+// under a name built from the subject's, and carries exactly the bounds the trait declared for it.
+//
+// **It is an ordinary type parameter rather than a case of its own, and that is what makes the
+// feature cheap.** An abstract type is identified by its name alone, so `V::Item` compares,
+// substitutes, mangles and refuses a layout exactly as `V` does, and nothing that walks types has a
+// new shape to learn. The substitution is the one place that knows the name has parts, and it is
+// where a projection stops being abstract.
+private abstract_assoc(a: &Analysis, subject: Type, name: string, bounds: Buf[Bound],
+                       member: string) -> Option[Type]
+    for i in 0..<bounds.len()
+        val closure = trait_closure(a, bounds.at(i), self_binding(subject))
+
+        for j in 0..<closure.len()
+            val b = closure.at(j)
+            val d = trait_decl_at(a, b.name)
+
+            if d.is_some()
+                val assocs = d.unwrap().assocs
+
+                for k in 0..<assocs.len()
+                    if assocs.at(k).name == member
+                        val whole = s"$name::$member"
+
+                        // The bounds are the projection's own, so `Self` inside them is the
+                        // projection -- passed bound-free, which is the stand-in that breaks the
+                        // walk back around.
+                        return Some(Abstract(whole, assoc_bounds_of(a, b, assocs.at(k),
+                                                                    Abstract(whole, buf()))))
+
+    blanket_assoc(a, subject, name, bounds, member)
+end abstract_assoc
+
+// The same question answered by a **blanket** block, for a parameter whose bound is the family that
+// block was written over.
+//
+// `impl[T: Integer] Magnitude for T` says every integer implements the trait, so a `T` bounded by
+// `Integer` implements it at every instantiation and `T::Size` is exactly what the block supplies --
+// which is not something the parameter's own bounds can say, since the bound naming the family is
+// not the trait being implemented.
+//
+// Read off the **bound the parameter carries** rather than through conformance, for the reason a
+// blanket owner is: this is reached from conformance, and a question asked back through it would be
+// the same question one turn later.
+private blanket_assoc(a: &Analysis, subject: Type, name: string, bounds: Buf[Bound],
+                      member: string) -> Option[Type]
+    val bs = a.tables.members.blankets
+
+    if bs.len() == 0 then return None
+
+    val names = traits_declaring(a, member)
+    var hits: Buf[Type] = buf()
+
+    for i in 0..<bs.len()
+        val key = bs.key_at(i)
+        var covered = false
+
+        for j in 0..<bounds.len()
+            if bounds.at(j).name == bs.at(i) then covered = true
+
+        if covered
+            var targs: Buf[Type] = buf()
+
+            targs.push(subject)
+
+            for j in 0..<names.len()
+                val rows = impls_of(a, names.at(j), key)
+
+                for k in 0..<rows.len()
+                    val found = impl_assoc(a, rows.at(k), member, targs)
+
+                    if found.is_some() then push_distinct(&hits, found.unwrap())
+
+    if hits.len() == 1 then Some(hits.at(0)) else None
+end blanket_assoc
+
+private push_distinct(hits: *Buf[Type], t: Type)
+    for i in 0..<hits.len()
+        if type_eq(hits.at(i), t) then return
+
+    hits.push(t)
+
+// The same question asked of a **concrete** subject, where the answer is the implementation's.
+//
+// The answer is a type or the sentence saying why there is none, so that the quiet form can ask
+// without reporting: a substitution normalizing a projection asks about a type conformance has
+// already vouched for, and a failure there has no position worth printing.
+private concrete_assoc(a: &Analysis, t: Type, member: string) -> Result[Type, string]
+    val names = traits_declaring(a, member)
+    // The same ladder a member lookup climbs, and for the same reason: a `[]T` also answers to the
+    // read-only view of its elements, so an `impl` written for a `[]const u8` supplies the
+    // projection of a `[]u8` exactly as it supplies its members.
+    var keys: Buf[(string, Buf[Type])] = buf()
+
+    keys.push(member_owner(t))
+
+    val wide = widened_type(t)
+
+    if wide.is_some() then keys.push(member_owner(wide.unwrap()))
+
+    val shapes = shape_owners(t)
+
+    for i in 0..<shapes.len()
+        keys.push(shapes.at(i))
+
+    val blankets = blanket_owners(a, t)
+
+    for i in 0..<blankets.len()
+        keys.push(blankets.at(i))
+
+    var found_traits: Buf[string] = buf()
+    var found_types: Buf[Type] = buf()
+
+    for i in 0..<names.len()
+        for j in 0..<keys.len()
+            val rows = impls_of(a, names.at(i), keys.at(j).0)
+
+            for k in 0..<rows.len()
+                val supplied = impl_assoc(a, rows.at(k), member, keys.at(j).1)
+
+                if supplied.is_some()
+                    push_distinct_name(&found_traits, names.at(i))
+                    push_distinct(&found_types, supplied.unwrap())
+
+    if found_traits.is_empty()
+        val early = declared_assoc(a, t, member, keys)
+
+        if early.is_some() then return Ok(early.unwrap())
+
+        if names.is_empty() then
+            return Err(s"no trait declares an associated type '$member', so " +
+                       s"'${type_show(t)}::$member' names nothing — a trait declares one with " +
+                       s"'type $member: …' among its members")
+
+        return Err(s"${type_show(t)} implements no trait declaring the associated type '$member' — " +
+                   s"${quantity(names.len(), "trait")} " +
+                   s"${if names.len() == 1 then "declares" else "declare"} one " +
+                   s"(${shown_names(names)}), and this type implements none of them")
+
+    if found_traits.len() > 1 then
+        return Err(s"'$member' is declared by ${joined_names(found_traits)}, and ${type_show(t)} " +
+                   "implements more than one of them — an associated type is named without its " +
+                   "trait, so a type may have at most one of any name")
+
+    if found_types.len() == 1 then return Ok(found_types.at(0))
+
+    // One trait, more than one implementation of it for this subject, and they disagree about what
+    // the associated type is. A generic trait may be implemented once per argument list, and the
+    // projection names no argument list -- so this is a thing that cannot be said rather than one
+    // that resolves.
+    Err(s"${type_show(t)} implements '${module_show(found_traits.at(0))}' more than once and the " +
+        s"implementations give '$member' different types (${shown_types(found_types)}) — an " +
+        "associated type is written without the trait's arguments, so there is no way here to say " +
+        "which implementation is meant")
+end concrete_assoc
+
+private push_distinct_name(xs: *Buf[string], n: string)
+    for i in 0..<xs.len()
+        if xs.at(i) == n then return
+
+    xs.push(n)
+
+private shown_names(names: Buf[string]) -> string
+    var b = str_builder()
+
+    for i in 0..<names.len()
+        if i > 0 then b.push(", ")
+
+        b.push(module_show(names.at(i)))
+
+    b.finish()
+end shown_names
+
+private joined_names(names: Buf[string]) -> string
+    var b = str_builder()
+
+    for i in 0..<names.len()
+        if i > 0 then b.push(" and ")
+
+        b.push(module_show(names.at(i)))
+
+    b.finish()
+end joined_names
+
+private shown_types(ts: Buf[Type]) -> string
+    var b = str_builder()
+
+    for i in 0..<ts.len()
+        if i > 0 then b.push(", ")
+
+        b.push(type_show(ts.at(i)))
+
+    b.finish()
+end shown_types
+
+// The same question answered off the **`impl` declarations** rather than off the table the hoist
+// fills, for the window in which the table does not exist yet.
+//
+// **A struct's fields are resolved before any `impl` block is hoisted**, and a field may name a
+// projection. A non-generic type is instantiated eagerly so that it is emitted whether or not
+// anything uses it, and that pass runs where it does because the hoist reads its answer: a member's
+// `Self` and an `impl`'s subject are both the instantiation, so the blocks cannot be hoisted until it
+// exists. So a struct holding a `Sha[Sha2Narrow]` asked what `Sha2Narrow::W` was of an empty table.
+//
+// What breaks the circle is that an `impl`'s `type W = u32` is a **declaration**, and needs none of
+// what the block is hoisted *for*: the subject's key is the name it was declared under, and the
+// supplied type is a reference resolved in the block's own file. Neither waits on conformance, on
+// coherence, or on a member being lowered.
+//
+// **It answers only where the ordinary road found nothing and only before the table is filled**, so
+// it can neither shadow an implementation nor change a diagnostic anything already gave. Silent where
+// two blocks would answer differently: the block that creates the collision is refused when it is
+// hoisted, and saying so here would report it against whoever wrote the projection instead.
+private declared_assoc(a: &Analysis, t: Type, member: string,
+                       keys: Buf[(string, Buf[Type])]) -> Option[Type]
+    if a.tables.members.hoisted then return None
+
+    var hits: Buf[Type] = buf()
+
+    for i in 0..<a.tables.impls.len()
+        val im = a.tables.impls.at(i)
+        val written = written_assoc(im.decl, member)
+
+        if written.is_some()
+            val key = lookup_trait_key(a, im.scope, im.decl.trait_name)
+
+            if key.is_some() && declares_assoc_named(a, key.unwrap(), member)
+                val subject = declared_subject(a, im)
+
+                if subject.is_some()
+                    for j in 0..<keys.len()
+                        if keys.at(j).0 == subject.unwrap().0 &&
+                           keys.at(j).1.len() == subject.unwrap().1.len()
+                            var subst: Buf[Binding] = buf()
+
+                            for k in 0..<subject.unwrap().1.len()
+                                subst.push(Binding(subject.unwrap().1.at(k), keys.at(j).1.at(k)))
+
+                            subst.push(Binding("Self", t))
+                            push_distinct(&hits,
+                                          resolve_type(a, im.scope, written.unwrap(), subst))
+
+    if hits.len() == 1 then Some(hits.at(0)) else None
+end declared_assoc
+
+private written_assoc(d: ImplDecl, member: string) -> Option[TypeRef]
+    for i in 0..<d.assocs.len()
+        if d.assocs.at(i).name == member then return Some(d.assocs.at(i).typ)
+
+    None
+end written_assoc
+
+private declares_assoc_named(a: &Analysis, key: string, member: string) -> bool
+    val d = trait_decl_at(a, key)
+
+    if d.is_none() then return false
+
+    for i in 0..<d.unwrap().assocs.len()
+        if d.unwrap().assocs.at(i).name == member then return true
+
+    false
+end declares_assoc_named
+
+// The key a block is filed under, and the block's parameter standing at each of the type's arguments.
+// The key is the name the subject was declared under, which is exactly what makes this answerable
+// with nothing hoisted.
+private declared_subject(a: &Analysis, im: Impl) -> Option[(string, Buf[string])]
+    *im.decl.for_type.kind match
+        NamedType(written, arg_refs) ->
+            val key = lookup_type_key(a, im.scope, written)
+
+            if key.is_none() then return None
+
+            val nom = nominal_of(a, key.unwrap())
+
+            if nom.is_none() then return None
+
+            var names: Buf[string] = buf()
+
+            for i in 0..<arg_refs.len()
+                *arg_refs.at(i).kind match
+                    NamedType(n, inner) ->
+                        if inner.is_empty() && holds_string(im.decl.tparams, n) then names.push(n)
+                    _ -> ()
+
+            if nom.unwrap().0.len() != arg_refs.len() || names.len() != arg_refs.len() then None
+            else Some((key.unwrap(), names))
+        _ -> None
+end declared_subject
+
+// `T::Item` -- the associated type, or the diagnostic saying why there is none.
+assoc_type(a: &Analysis, scope: Scope, span: Span, subject: Type, member: string) -> Type
+    // A subject that could not be worked out has already been reported, and a projection off it is a
+    // consequence rather than a second mistake.
+    if subject == Unknown then return Unknown
+
+    subject match
+        Abstract(n, bounds) ->
+            val found = abstract_assoc(a, subject, n, bounds, member)
+
+            if found.is_some() then return found.unwrap()
+
+            a.fault(scope, span, s"'$n' is not bounded by a trait declaring an associated type " +
+                    s"'$member', so there is nothing here to say what '$n::$member' is — a bound " +
+                    s"is what gives a type parameter one, written '[$n: Trait]' where 'Trait' " +
+                    s"declares 'type $member'")
+            Unknown
+        // **The subject is a trait object**, which reaches here as the `Self` a slot's signature is
+        // read under: the object forgot its type, and what it wrote down in its place is exactly
+        // this.
+        Trait(_, _, assocs) ->
+            for i in 0..<assocs.len()
+                if assocs.at(i).0 == member then return assocs.at(i).1
+
+            a.fault(scope, span, s"'${type_show(subject)}' does not say what '$member' is, so a " +
+                    s"slot naming 'Self::$member' has no signature — write it as " +
+                    s"'${type_show(subject)}[$member = …]'")
+            Unknown
+        _ ->
+            concrete_assoc(a, subject, member) match
+                Ok(t) -> t
+                Err(why) ->
+                    a.fault(scope, span, why)
+                    Unknown
+end assoc_type
+
+// The same, answering nothing where the projection cannot be worked out instead of reporting.
+//
+// It is what a **substitution** asks: normalizing `V::Item` once `V` is known is not a place a
+// diagnostic can be raised usefully -- there is no source position, and the projection was already
+// held to a bound where it was written, which is what guarantees the implementation exists.
+assoc_type_opt(a: &Analysis, subject: Type, member: string) -> Option[Type]
+    if subject == Unknown then return Some(Unknown)
+
+    subject match
+        Abstract(n, bounds) -> abstract_assoc(a, subject, n, bounds, member)
+        Trait(_, _, assocs) ->
+            for i in 0..<assocs.len()
+                if assocs.at(i).0 == member then return Some(assocs.at(i).1)
+
+            None
+        _ ->
+            concrete_assoc(a, subject, member) match
+                Ok(t) -> Some(t)
+                Err(_) -> None
+end assoc_type_opt
+
+// -- what a value can be called through -----------------------------------------------------------
+
+// The callable trait a value implements, where it implements one: a bounded parameter's own bound, a
+// trait object's own trait, or the implementation a closure's struct was given.
+callable_of(a: &Analysis, t: Type) -> Option[Bound]
+    receiver_type(t) match
+        Abstract(_, bounds) ->
+            for i in 0..<bounds.len()
+                if fn_parts(bounds.at(i).name, bounds.at(i).args).is_some() then
+                    return Some(bounds.at(i))
+
+            None
+        Trait(n, args, _) ->
+            if fn_parts(n, args).is_some() then Some(Bound(n, args)) else None
+        Struct(d) -> callable_impl_of(a, d.base)
+        Enum(d) -> callable_impl_of(a, d.base)
+        _ -> None
+end callable_of
+
+private callable_impl_of(a: &Analysis, base: string) -> Option[Bound]
+    for n in 0..<(FnMaxArity + 1)
+        val key = library_key(fn_base(n))
+        val rows = impls_of(a, key, base)
+
+        if !rows.is_empty() then return Some(Bound(key, rows.at(0).written))
+
+    None
+end callable_impl_of

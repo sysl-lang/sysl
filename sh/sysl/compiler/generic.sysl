@@ -1,0 +1,518 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+import sysl.math.bigint.{BigInt, from_int}
+
+// Making a generic declaration real at one set of arguments, and working out from a call what those
+// arguments are.
+//
+// **Inference is bidirectional**: the arguments a call passes settle what they can, and the type the
+// position expects settles the rest. Neither alone is enough -- `id(3)` has no expected type and
+// `empty()` has no arguments -- so the two are read in a fixed order, with what already knows its
+// own type going first and what took its shape from somewhere else going last.
+
+// A type with a declaration's parameters put in for the names standing at them.
+//
+// It exists for one question: what an `impl` written with its own parameters promises about a
+// subject those parameters are bound in. `impl[T] Index[usize, T] for Buf[T]` stored `T` as a trait
+// argument, and asking what a `Buf[int]` implements means putting `int` there. Nothing unresolved is
+// reachable from here, so this is a walk rather than a resolution -- a named type is rebuilt through
+// its instantiator so the result is the one canonical instantiation, and anything with no parameter
+// inside it comes back as itself.
+subst_params(a: &Analysis, t: Type, subst: Buf[Binding]) -> Type
+    if subst.is_empty() then return t
+
+    t match
+        Abstract(n, _) ->
+            val found = bound_type(subst, n)
+
+            if found.is_some() then found.unwrap() else projected(a, t, n, subst)
+        Struct(d) ->
+            if d.targs.is_empty() then t
+            else if is_tuple(d) then Struct(tuple_type(subst_list(a, d.targs, subst)))
+            else reinstantiate(a, d.base, subst_list(a, d.targs, subst))
+        Enum(d) -> if d.targs.is_empty() then t else reinstantiate(a, d.base, subst_list(a, d.targs, subst))
+        Ptr(inner) -> Ptr(subst_params(a, *inner, subst))
+        Ref(inner, sync) -> Ref(subst_params(a, *inner, subst), sync)
+        Weak(inner) -> Weak(subst_params(a, *inner, subst))
+        Array(n, elem) -> Array(n, subst_params(a, *elem, subst))
+        Vector(n, elem) -> Vector(n, subst_params(a, *elem, subst))
+        Slice(elem, ro) -> Slice(subst_params(a, *elem, subst), ro)
+        Volatile(inner) -> Volatile(subst_params(a, *inner, subst))
+        Pack(es) -> Pack(subst_list(a, es, subst))
+        CFn(ps, r) -> CFn(subst_list(a, ps, subst), subst_params(a, *r, subst))
+        Trait(n, args, assocs) -> Trait(n, subst_list(a, args, subst), subst_assocs(a, assocs, subst))
+        Results(parts) -> Results(tuple_type(subst_list(a, parts.targs, subst)))
+        _ -> t
+end subst_params
+
+private subst_list(a: &Analysis, ts: Buf[Type], subst: Buf[Binding]) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for i in 0..<ts.len()
+        out.push(subst_params(a, ts.at(i), subst))
+
+    out
+end subst_list
+
+private subst_assocs(a: &Analysis, xs: Buf[(string, Type)], subst: Buf[Binding]) -> Buf[(string, Type)]
+    var out: Buf[(string, Type)] = buf()
+
+    for i in 0..<xs.len()
+        out.push((xs.at(i).0, subst_params(a, xs.at(i).1, subst)))
+
+    out
+end subst_assocs
+
+// A **projection** whose subject the substitution moved: `V::Item` with `V` bound to `Buf[int]` is
+// `Buf[int]::Item`, which the implementation then says is `int`.
+//
+// This is the one place that knows a type parameter's name may have parts, and it is what makes a
+// projection cost no new type. Everything else -- comparing two types, mangling one, refusing a
+// layout for one -- sees an opaque parameter with an unusual name and treats it exactly as it treats
+// a `T`.
+//
+// A subject the substitution does not move is left alone, which covers the ordinary case of a body
+// being checked at its own definition. And a projection the tables cannot answer is left abstract
+// rather than reported: the bound that licensed it was checked where it was written, so an
+// unanswerable one here means something has already been said with a position worth printing.
+private projected(a: &Analysis, whole: Type, name: string, subst: Buf[Binding]) -> Type
+    val cut = last_colons(name)
+
+    if cut.is_none() then return whole
+
+    val at = cut.unwrap()
+    val base: Type = Abstract(name[0..<at], buf())
+    val member = name[(at + 2)..<name.bytes.len]
+    val moved = subst_params(a, base, subst)
+
+    if type_eq(moved, base) then return whole
+
+    val found = assoc_type_opt(a, moved, member)
+
+    if found.is_some() then found.unwrap() else whole
+end projected
+
+// Where the last `::` of a projected name is.
+last_colons(name: string) -> Option[usize]
+    val b = name.bytes
+    var found: Option[usize] = None
+
+    if b.len < 2 then return None
+
+    for i in 0..<(b.len - 1)
+        if b[i] == u8(':') && b[i + 1] == u8(':') then found = Some(i)
+
+    found
+end last_colons
+
+// A named type at fresh arguments, through the instantiator that keeps one instantiation per key.
+reinstantiate(a: &Analysis, key: string, targs: Buf[Type]) -> Type
+    val decl = a.tables.types.get(key)
+
+    if decl.is_none() then return Unknown
+
+    val d = decl.unwrap()
+
+    d.kind match
+        StructOf(sd) -> instantiate_struct(a, d.scope, span_zero(), key, key, sd, d.scope, targs)
+        EnumOf(ed) -> instantiate_enum(a, d.scope, span_zero(), key, key, ed, d.scope, targs)
+        _ -> Unknown
+end reinstantiate
+
+// A span standing for nowhere in particular, which is what a walk over already-resolved types has
+// when it has to name a place at all.
+span_zero() -> Span = Span(0, 0)
+
+// -- reading a type argument off what a call was handed -------------------------------------------
+
+// Matches a declaration's type reference against an actual type, binding whatever type parameters it
+// determines.
+//
+// **Deliberately lenient**: a structural mismatch simply leaves the parameter unbound, and the
+// argument is type-checked properly against the instantiated signature afterwards, where the message
+// can name both types.
+unify(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, tparams: Buf[string],
+      sub: *Buf[Binding])
+    *want.kind match
+        PtrType(inner) -> actual match
+            Ptr(t) -> unify(a, scope, inner, *t, tparams, sub)
+            _ -> ()
+
+        // A `&T` parameter also accepts a bare `T`, which the call boxes, so the payload type is
+        // matched against either shape.
+        RefType(inner, sync) -> actual match
+            Ref(t, s) -> if s == sync then unify(a, scope, inner, *t, tparams, sub)
+            other -> unify(a, scope, inner, other, tparams, sub)
+
+        // A `weak T` parameter also accepts a `&T`, which the call weakens -- the same leniency `&T`
+        // is given, for the same reason.
+        WeakType(inner) -> actual match
+            Weak(t) -> unify(a, scope, inner, *t, tparams, sub)
+            Ref(t, _) -> unify(a, scope, inner, *t, tparams, sub)
+            _ -> ()
+
+        ArrayType(length, elem, _) ->
+            if length.is_none()
+                // Whether the view refuses writes is not matched here, for the reason `&T` and
+                // `weak T` do not match their own modes: this is where a type *parameter* is read
+                // off an argument, and whether the argument may stand in the parameter's place is
+                // the coercion's question.
+                //
+                // **An array is matched too, because an array coerces to a slice at the call.** A
+                // `[]T` parameter handed a `[3]int` is an ordinary call, so inference not following
+                // the coercion left `T` unbound and answered a perfectly good call with "cannot
+                // infer the type argument".
+                actual match
+                    Slice(e, _) -> unify(a, scope, elem, *e, tparams, sub)
+                    Array(_, e) -> unify(a, scope, elem, *e, tparams, sub)
+                    _ -> ()
+            else
+                // The **length binds a value parameter** the way the element binds a type one: a
+                // `[N]T` parameter handed a `[3]int` reads 3 off the argument's type, which is where
+                // the length already lives. Only a bare name is read -- a length written as
+                // arithmetic over a parameter is refused at resolution rather than solved here.
+                actual match
+                    Array(n, e) ->
+                        bind_extent(length.unwrap(), n, tparams, sub)
+                        unify(a, scope, elem, *e, tparams, sub)
+                    _ -> ()
+
+        // A vector's lane count binds a value parameter exactly as an array's length does, and this
+        // is the case the whole feature turns on: a kernel written at `<W>f32` handed an `<8>f32`
+        // reads 8 off the argument, with no width written at the call.
+        VectorType(lanes, elem) -> actual match
+            Vector(n, e) ->
+                bind_extent(lanes, n, tparams, sub)
+                unify(a, scope, elem, *e, tparams, sub)
+            _ -> ()
+
+        // A value argument written out fixes nothing. `Buf[4]` handed a `Buf[4]` has nothing to
+        // solve, and handed anything else is a mismatch the instantiated signature reports.
+        ValueArgType(_) -> ()
+
+        VolatileType(inner) -> unify(a, scope, inner, unqualified(actual), tparams, sub)
+
+        TupleType(parts, _) ->
+            // `(..A)` binds the pack to **every** part at once, at whatever arity the argument has,
+            // which is the whole of the inference a pack needs. It is `[N]T` reading a length off an
+            // argument one kind up: nothing is written at the call, and a tuple of three parts and a
+            // tuple of five each solve the one parameter.
+            val packed = sole_pack(parts)
+
+            if packed.is_some()
+                actual match
+                    Struct(d) ->
+                        if is_tuple(d) && holds_string(tparams, packed.unwrap()) &&
+                           bound_type(*sub, packed.unwrap()).is_none() then
+                            sub.push(Binding(packed.unwrap(), Pack(d.targs)))
+                    _ -> ()
+            else
+                actual match
+                    Struct(d) ->
+                        if is_tuple(d) && d.targs.len() == parts.len()
+                            for i in 0..<parts.len()
+                                unify(a, scope, parts.at(i), d.targs.at(i), tparams, sub)
+                    _ -> ()
+
+        // A bare pack stands where no type does, so nothing here can be matched against it.
+        PackType(_) -> ()
+
+        // A callable's parameters and result are matched through the trait they name, so a
+        // `&Fn(A) -> R` parameter binds `A` and `R` from a `&Fn(int) -> bool` argument exactly as any
+        // other applied trait binds its arguments.
+        //
+        // **A closure arrives as its own struct, not as the call trait its parameter names**, so the
+        // signature is asked of the implementation rather than matched against the type. That is
+        // what lets a `f: &Fn(T) -> U` parameter read `U` off the closure's body.
+        FnType(params, ret, _) ->
+            val callable = callable_of(a, actual)
+
+            if callable.is_some() && callable.unwrap().args.len() == params.len() + 1
+                val args = callable.unwrap().args
+
+                for i in 0..<params.len()
+                    unify(a, scope, params.at(i), args.at(i), tparams, sub)
+
+                unify(a, scope, ret, args.at(args.len() - 1), tparams, sub)
+
+        // A function pointer's parts bind exactly as a tuple's do -- position by position, and only
+        // against another one of the same width, since nothing else has parts to read.
+        CFnType(ps, r) -> actual match
+            CFn(ps2, r2) ->
+                if ps2.len() == ps.len()
+                    for i in 0..<ps.len()
+                        unify(a, scope, ps.at(i), ps2.at(i), tparams, sub)
+
+                    unify(a, scope, r, *r2, tparams, sub)
+            _ -> ()
+
+        // A projection binds nothing, and that is the same rule a trait gets rather than a
+        // limitation: solving `T` backwards from `T::Item` would need the implementation table read
+        // in reverse, and more than one type can have the same associated type. The subject is
+        // solved from wherever else it appears, and the projection then follows from it.
+        AssocType(_, _) -> ()
+
+        // An object's binding is written rather than solved: it is part of the object *type*, so a
+        // parameter named there is fixed by whoever wrote it.
+        AssocArgType(_, _) -> ()
+
+        // A `some` result stands in an `impl` block's member, which nothing calls generically.
+        SomeType(_) -> ()
+
+        NamedType(n, arg_refs) ->
+            if arg_refs.is_empty() && holds_string(tparams, n)
+                // A trait never binds a type parameter. A `f[T](p: *T)` handed a `*Writer` would
+                // otherwise instantiate at a type with no layout, and the body could then write a
+                // `var v: T` for a value that cannot exist; leaving it unsolved reports the
+                // inference failure instead. A qualifier is dropped on the way into a parameter, so
+                // `f[T](xs: []T)` handed a `[]volatile u32` solves `T` as `u32` -- and then the
+                // argument does not agree with the `[]u32` that instantiation asks for, which is the
+                // message worth reading.
+                if bound_type(*sub, n).is_none() && !is_trait(actual) then
+                    sub.push(Binding(n, unqualified(actual)))
+            else
+                // The reference is the declaration's, written in the declaration's terms, so the
+                // name it uses is matched against the resolved type by the key it names here.
+                unify_named(a, scope, n, arg_refs, actual, tparams, sub)
+end unify
+
+private unify_named(a: &Analysis, scope: Scope, n: string, arg_refs: Buf[TypeRef], actual: Type,
+                    tparams: Buf[string], sub: *Buf[Binding])
+    val key = lookup_type_key(a, scope, n)
+
+    if key.is_none() then return
+
+    actual match
+        Struct(d) ->
+            if d.base == key.unwrap() && d.targs.len() == arg_refs.len()
+                for i in 0..<arg_refs.len()
+                    unify(a, scope, arg_refs.at(i), d.targs.at(i), tparams, sub)
+        Enum(d) ->
+            if d.base == key.unwrap() && d.targs.len() == arg_refs.len()
+                for i in 0..<arg_refs.len()
+                    unify(a, scope, arg_refs.at(i), d.targs.at(i), tparams, sub)
+        // A trait applied to arguments binds them the way a generic type does -- what a trait cannot
+        // do is bind a parameter to *itself*.
+        Trait(tn, targs, _) ->
+            if tn == key.unwrap() && targs.len() == arg_refs.len()
+                for i in 0..<arg_refs.len()
+                    unify(a, scope, arg_refs.at(i), targs.at(i), tparams, sub)
+        _ -> ()
+end unify_named
+
+// The pack a one-element tuple reference is written over, where that is what it is.
+private sole_pack(parts: Buf[TypeRef]) -> Option[string]
+    if parts.len() != 1 then return None
+
+    *parts.at(0).kind match
+        PackType(n) -> Some(n)
+        _ -> None
+end sole_pack
+
+// A value parameter bound to the extent an argument's type carried.
+private bind_extent(written: Expr, n: int, tparams: Buf[string], sub: *Buf[Binding])
+    *written.kind match
+        Ident(v) ->
+            if holds_string(tparams, v) && bound_type(*sub, v).is_none() then
+                sub.push(Binding(v, ConstArg(from_int(long(n)), Integer(64, false, true))))
+        _ -> ()
+
+holds_string(xs: Buf[string], name: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == name then return true
+
+    false
+end holds_string
+
+// -- solving a whole argument list ----------------------------------------------------------------
+
+// Solves a generic declaration's type arguments from the argument types, falling back to the type
+// the whole expression is expected to be for parameters the arguments do not determine.
+//
+// `soft` marks the arguments that are bare literals, and they are consulted **last**. A literal has
+// no type of its own -- it takes one from where it appears -- so it is the weakest thing in the room
+// to conclude a type parameter from, and letting it go first is what made `pick(1, 2, 250u8)` fix
+// `T = int` and then reject the argument that actually knew. The order is the operand rule's, one
+// level up.
+//
+// `known` carries the parameters that are not being inferred at all because something already says
+// what they are -- a type's own arguments, read off the type an associated function was reached
+// through. Nothing infers over one: a binding is written only where the list is silent.
+solve(a: &Analysis, scope: Scope, span: Span, what: string, tparams: Buf[string],
+      param_refs: Buf[TypeRef], arg_tys: Buf[Type], result_ref: Option[TypeRef],
+      expected: Option[Type], soft: Buf[bool], bounds: Buf[NamedBounds],
+      known: Buf[Binding]) -> Buf[Type]
+    var sub: Buf[Binding] = buf()
+
+    for i in 0..<known.len()
+        if holds_string(tparams, known.at(i).name) then sub.push(known.at(i))
+
+    for i in 0..<param_refs.len()
+        if i < arg_tys.len() && !is_soft(soft, i) then
+            unify(a, scope, param_refs.at(i), arg_tys.at(i), tparams, &sub)
+
+    if sub.len() < tparams.len() && result_ref.is_some() && expected.is_some() then
+        unify(a, scope, result_ref.unwrap(), expected.unwrap(), tparams, &sub)
+
+    if sub.len() < tparams.len()
+        for i in 0..<param_refs.len()
+            if i < arg_tys.len() && is_soft(soft, i) then
+                unify(a, scope, param_refs.at(i), arg_tys.at(i), tparams, &sub)
+
+    // **What a callable argument yields is read back off the closure**, which is the other half of a
+    // call handing one an open result. The parameter itself has by now been solved to the closure's
+    // own struct, and that struct implements the call trait its body determined -- so the bound's
+    // arguments, written in the declaration's terms, are matched against the ones the closure turned
+    // out to have.
+    //
+    // Last, and only while something is still missing, for the reason the literals go last: this
+    // concludes a type parameter from a value that took its own shape from the context.
+    if sub.len() < tparams.len() then solve_from_callables(a, scope, tparams, bounds, &sub)
+
+    var out: Buf[Type] = buf()
+    val poisoned = mentions_unknown_any(arg_tys) ||
+                   (expected.is_some() && mentions_unknown(expected.unwrap()))
+
+    for i in 0..<tparams.len()
+        val found = bound_type(sub, tparams.at(i))
+
+        if found.is_some() then out.push(found.unwrap())
+        else
+            // A parameter left unsolved because what would have solved it could not itself be worked
+            // out is a consequence, not a mistake. Suppressing is safe by construction rather than by
+            // judgement: an unknown type exists only where something was already recorded.
+            if !poisoned then
+                a.fault(scope, span, s"cannot infer the type argument '${tparams.at(i)}' of " +
+                        s"'${module_show(what)}' here — annotate the expected type")
+
+            out.push(Unknown)
+
+    out
+end solve
+
+private is_soft(soft: Buf[bool], i: usize) -> bool = if i < soft.len() then soft.at(i) else false
+
+private solve_from_callables(a: &Analysis, scope: Scope, tparams: Buf[string],
+                             bounds: Buf[NamedBounds], sub: *Buf[Binding])
+    for i in 0..<bounds.len()
+        val nb = bounds.at(i)
+        val t = bound_type(*sub, nb.name)
+
+        if t.is_some()
+            for j in 0..<nb.bounds.len()
+                val b = nb.bounds.at(j)
+
+                if fn_is_call(b.name)
+                    val actual = callable_of(a, t.unwrap())
+
+                    if actual.is_some() && b.args.len() == actual.unwrap().args.len()
+                        for k in 0..<b.args.len()
+                            unify(a, scope, b.args.at(k), actual.unwrap().args.at(k), tparams, sub)
+end solve_from_callables
+
+private mentions_unknown_any(ts: Buf[Type]) -> bool
+    for i in 0..<ts.len()
+        if mentions_unknown(ts.at(i)) then return true
+
+    false
+end mentions_unknown_any
+
+// -- making one instantiation real ------------------------------------------------------------------
+
+// The name a generic function's instantiation goes under, with its signature registered and its body
+// queued.
+//
+// The tag is empty for every instantiation a value is ever made at, so an emitted symbol is exactly
+// what it always was. It is not empty for a **stand-in**, which is its name and nothing else -- so a
+// member under one declaration's `[T: Ord]` and under another's `[T: Display]` would be one entry,
+// and the second declaration's body would read the first one's signature back.
+//
+// `const_self` is the slice shape's second instantiation: the same block, made real at the read-only
+// view because that is what the receiver was. It is a different name because it is a different
+// **body** -- the machine code is identical and only one of the two had its writes checked.
+instantiate_func(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type], const_self: bool) -> string
+    val base = if const_self then slice_const_owner(f.name) else f.name
+    val name = s"${mangled(base, targs)}${tag_of(targs)}"
+
+    if !f.tparams.is_empty()
+        // Recorded here because this is the one place a generic becomes a function, and the name it
+        // becomes cannot be read back to say so.
+        a.tables.members.func_origin.put(name, f.name)
+
+    if const_self then a.tables.members.const_self.put(name, true)
+
+    if a.tables.members.func_insts.has(name) then return name
+
+    var subst = self_for(a, home, f, targs)
+
+    if const_self
+        val was = bound_type(subst, "Self")
+
+        if was.is_some() then subst.push(Binding("Self", const_view(was.unwrap())))
+
+    var params: Buf[(string, Type)] = buf()
+
+    for i in 0..<f.params.len()
+        val p = f.params.at(i)
+        var ty = resolve_type(a, home, p.typ, subst)
+
+        // Only the receiver moves. A member declaring a `[]T` **parameter** asked for one that may
+        // be written, and the read-only receiver says nothing about what its arguments are allowed
+        // to be.
+        if const_self && p.name == "self" then ty = const_receiver(ty)
+
+        params.push((p.name, ty))
+
+    var ret = Unit
+
+    if f.ret_type.is_some() then
+        ret = declared_result_type(Some(resolve_type(a, home, f.ret_type.unwrap(), subst)))
+
+    a.tables.members.func_insts.put(name, FuncSig(params, ret))
+    a.tables.members.pending.push(PendingInst(name, f, subst, home))
+    name
+end instantiate_func
+
+// A receiver's type with its view made read-only, through whatever mode the sigil asked for.
+private const_receiver(t: Type) -> Type = t match
+    Ptr(inner) -> Ptr(const_receiver(*inner))
+    other -> const_view(other)
+
+// The tag every stand-in instantiation carries, and nothing at all for the real ones.
+private tag_of(targs: Buf[Type]) -> string
+    var b = str_builder()
+
+    for i in 0..<targs.len()
+        b.push(stand_in_tag(targs.at(i)))
+
+    b.finish()
+end tag_of
+
+// What a declaration's own parameters mean at this instantiation, together with whatever `Self` and
+// a trait's arguments meant inside the member it was lowered from.
+private self_for(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type]) -> Buf[Binding]
+    var subst: Buf[Binding] = buf()
+    val outer = a.tables.members.selves.get(f.name)
+
+    if outer.is_some()
+        for i in 0..<outer.unwrap().len()
+            subst.push(outer.unwrap().at(i))
+
+    for i in 0..<f.tparams.len()
+        if i < targs.len() then subst.push(Binding(f.tparams.at(i), targs.at(i)))
+
+    // On a generic type `Self` is the type applied to its own parameters, which is not a type until
+    // the parameters are fixed -- so the receiver is kept as written and resolved here, where they
+    // are.
+    val written = a.tables.members.generic_self.get(f.name)
+
+    if written.is_some()
+        val scope = a.tables.members.generic_scope.get(f.name).unwrap_or(home)
+
+        subst.push(Binding("Self", resolve_type(a, scope, written.unwrap(), subst)))
+
+    subst
+end self_for

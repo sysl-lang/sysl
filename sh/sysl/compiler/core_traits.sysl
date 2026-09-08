@@ -1,0 +1,327 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The traits the compiler knows by name, and which built-in types satisfy them.
+//
+// The traits themselves are ordinary declarations of the library -- a program may read them and may
+// call their methods directly (`5.add(3)`) exactly as it calls any other. What lives here is the
+// part a source declaration cannot say: which operator each trait's one method *is*, and which
+// built-in types are members.
+//
+// **The memberships have to be a rule rather than a table of `impl` blocks**, because the integer
+// family is open: `i5` and `u12` are types a program may name, so there is no finite list of scalars
+// to write an implementation for. That is the same reason the memberships are compiler-provided in
+// the first place -- a built-in has no source body to hang one off.
+//
+// **Everything here is a spelling**, which is what a program writes, and a consumer holding a
+// resolved key goes through `library_spelling` before asking. A trait in the standard module is
+// filed under `sysl$Display` and not `Display`, and a table written in keys would have to be edited
+// every time a declaration moved.
+
+// What shape of instruction a trait's method lowers to on a built-in.
+enum OpKind
+    // A binary operator yielding the operand type: `Add`, `Shl`, and the rest of the table.
+    Arith
+
+    // A comparison yielding `bool`. The trait requires the *one* method the other operators are
+    // derived from, so this is `==` for `Eq` and `<` for `Ord`.
+    Compare
+
+    // A prefix operator on the receiver alone: `Neg`, `Not`.
+    Prefix
+end OpKind
+
+// The one method a trait requires, the operator that method *is*, and what it lowers to.
+//
+// There is exactly one method per trait, and that is the point: implementing a comparison means
+// writing `lt`, not four functions that could disagree with each other.
+core_required(trait_name: string) -> Option[(string, string, OpKind)] = trait_name match
+    "Add" -> Some(("add", "+", Arith))
+    "Sub" -> Some(("sub", "-", Arith))
+    "Mul" -> Some(("mul", "*", Arith))
+    "Div" -> Some(("div", "/", Arith))
+    "Rem" -> Some(("rem", "%", Arith))
+    "BitAnd" -> Some(("bitand", "&", Arith))
+    "BitOr" -> Some(("bitor", "|", Arith))
+    "BitXor" -> Some(("bitxor", "^", Arith))
+    "Shl" -> Some(("shl", "<<", Arith))
+    "Shr" -> Some(("shr", ">>", Arith))
+    "Neg" -> Some(("neg", "-", Prefix))
+    "Not" -> Some(("not", "~", Prefix))
+    "Eq" -> Some(("eq", "==", Compare))
+    "Ord" -> Some(("lt", "<", Compare))
+    _ -> None
+
+// The trait a method name belongs to, which is the direction member lookup needs: a call written
+// `x.add(y)` has to find `Add` before it can ask whether `x`'s type is a member. The method names
+// are distinct across the catalog, so this is unambiguous.
+core_declaring(method: string) -> Option[string] = method match
+    "add" -> Some("Add")
+    "sub" -> Some("Sub")
+    "mul" -> Some("Mul")
+    "div" -> Some("Div")
+    "rem" -> Some("Rem")
+    "bitand" -> Some("BitAnd")
+    "bitor" -> Some("BitOr")
+    "bitxor" -> Some("BitXor")
+    "shl" -> Some("Shl")
+    "shr" -> Some("Shr")
+    "neg" -> Some("Neg")
+    "not" -> Some("Not")
+    "eq" -> Some("Eq")
+    "lt" -> Some("Ord")
+    _ -> None
+
+// Each infix operator token, and the trait its operands must satisfy. The four derived comparisons
+// name the trait they are derived *from*, not one of their own -- there is no `Gt`.
+core_infix(op: string) -> Option[string] = op match
+    "+" -> Some("Add")
+    "-" -> Some("Sub")
+    "*" -> Some("Mul")
+    "/" -> Some("Div")
+    "%" -> Some("Rem")
+    "&" -> Some("BitAnd")
+    "|" -> Some("BitOr")
+    "^" -> Some("BitXor")
+    "<<" -> Some("Shl")
+    ">>" -> Some("Shr")
+    "==" -> Some("Eq")
+    "!=" -> Some("Eq")
+    "<" -> Some("Ord")
+    ">" -> Some("Ord")
+    "<=" -> Some("Ord")
+    ">=" -> Some("Ord")
+    _ -> None
+
+// Each prefix operator token and its trait, kept apart from the infix table because `-` is in both.
+core_prefix(op: string) -> Option[string] = op match
+    "-" -> Some("Neg")
+    "~" -> Some("Not")
+    _ -> None
+
+// Whether a trait's implementations are told apart by an operand rather than by the whole argument
+// list -- which is to say, whether its last argument is the operator's **result**.
+//
+// The ten binary arithmetic and bitwise traits are declared `[Rhs = Self, Out = Self]`, and a use
+// writes neither: `a * b` fixes the operands and asks to be told the result. So the operands select
+// and the result is what the selected implementation supplies, which is why two implementations
+// agreeing on the operands are refused however their results differ.
+core_selects_by_operand(trait_name: string) -> bool = core_required(trait_name) match
+    Some(row) -> row.2 == Arith
+    None -> false
+
+// How each comparison is built from the one method its trait requires: whether the operands are
+// swapped, and whether the result is negated.
+//
+// `a > b` is `lt(b, a)` and `a <= b` is `!lt(b, a)`, so two of the six **swap**. On a scalar that is
+// invisible -- the memberships below keep the built-ins on their native comparisons, which is also
+// what keeps a float's `NaN` behaviour intact -- but on a type whose `lt` is a real call, the swap
+// is a change in the order the two operand expressions are evaluated.
+core_derivation(op: string) -> (bool, bool) = op match
+    "==" -> (false, false)
+    "!=" -> (false, true)
+    "<" -> (false, false)
+    ">" -> (true, false)
+    "<=" -> (true, true)
+    ">=" -> (false, true)
+    _ -> (false, false)
+
+// The traits whose members a built-in has by rule, but which are **not** operators -- so they are
+// not in the required table, whose rows pair a method with the token it is.
+//
+// These exist for the reason the memberships do: the `iN` and `uN` families are open, so a magnitude
+// or a population count cannot be a library implementation however small the list of them is. What
+// is here is the method and its trait, and nothing else -- the signature is read off the trait's own
+// declaration like any other.
+core_numeric(method: string) -> Option[string] = method match
+    "abs" -> Some("Signed")
+    "signum" -> Some("Signed")
+    "count_ones" -> Some("Bits")
+    "count_zeros" -> Some("Bits")
+    "leading_zeros" -> Some("Bits")
+    "leading_ones" -> Some("Bits")
+    "trailing_zeros" -> Some("Bits")
+    "trailing_ones" -> Some("Bits")
+    "reverse_bits" -> Some("Bits")
+    "rotate_left" -> Some("Bits")
+    "rotate_right" -> Some("Bits")
+    _ -> None
+
+// The compiler-provided members that have **no receiver** -- a trait, and the whole number its one
+// member answers with.
+//
+// The numeric members above are reached from a value and lower from it; these are reached through
+// the *type*, because there is no value of `T` to hand a `zero()` before the accumulator that wants
+// one exists. That is the whole difference, and it is why they are a table of their own: what a
+// receiverless member lowers to cannot be read off a receiver, so the value is stated here.
+core_constant(method: string) -> Option[(string, int)] = method match
+    "zero" -> Some(("Zero", 0))
+    "one" -> Some(("One", 1))
+    _ -> None
+
+// The compiler-provided receiverless members whose answer is **read off the type** rather than
+// stated -- `u32.width()`, and `T.width()` in a body bounded by `Bits`.
+//
+// These are the constants' other half. The difference is where the answer comes from: `zero` is `0`
+// at every width, so the number is written in the table; a width is different at every width, so
+// what is written here is only which trait declares it.
+core_measure_trait(method: string) -> Option[string] =
+    if method == "width" then Some("Bits") else None
+
+// What a measure answers for one subject type, and nothing for a type it has no answer about.
+//
+// Asked at the operator's subject for the reason the memberships are: a constrained subtype has its
+// base's whole catalog, and a range narrows which values a type holds rather than how wide it is --
+// so a subtype of `u32` is thirty-two bits, and a vector is asked about at its lane.
+core_measure(method: string, subject: Type) -> Option[int]
+    if method != "width" then return None
+
+    op_subject(subject) match
+        Integer(bits, _, _) -> Some(bits)
+        _ -> None
+end core_measure
+
+// Whether a **built-in** type satisfies a trait without an implementation written for it.
+//
+// This is the operator table restated as trait membership, and it is deliberately no wider than that
+// table: a membership the compiler could not lower would promise a bounded generic an operation that
+// fails at the instantiation it was supposed to have proven.
+//
+// A constrained subtype is asked about at its **base**, since a subtype narrows which values a type
+// has and never which operations it has, and a vector is asked about at its **lane** -- a register
+// does not decide which operations a type has, only how many of them happen at once.
+core_builtin(trait_name: string, subject: Type) -> bool
+    // The two identities are the one pair here that is a **value** rather than an operation, and
+    // that is what decides their domain: every other row promises something a type can *do*, so it
+    // is asked at the operator's subject and a subtype inherits it, while these promise a particular
+    // value exists at the type. So they are asked of the type as written.
+    if trait_name == "Zero" || trait_name == "One" then
+        return subject match
+            Integer(_, _, _) -> true
+            _ -> false
+
+    val t = op_subject(subject)
+
+    trait_name match
+        "Add" -> is_numeric(t) || t == Str
+        "Sub" -> is_numeric(t)
+        "Mul" -> is_numeric(t)
+        "Div" -> is_numeric(t)
+
+        // Remainder, the bitwise operators and the shifts are integer-only, which is what the
+        // operator table gives them: there is no `frem` in the lowering, and no bit pattern a float
+        // agrees to be treated as.
+        "Rem" -> is_integer(t)
+        "BitAnd" -> is_integer(t)
+        "BitOr" -> is_integer(t)
+        "BitXor" -> is_integer(t)
+        "Shl" -> is_integer(t)
+        "Shr" -> is_integer(t)
+        "Not" -> is_integer(t)
+
+        "Neg" -> t match
+            Integer(_, signed, _) -> signed
+            Floating(_) -> true
+            _ -> false
+
+        "Eq" -> is_equatable(t)
+        "Ord" -> is_ordered(t)
+
+        // The magnitude and the sign are questions about a value that has a sign to discard, which
+        // is the signed integers and nothing else. A **float** is left out deliberately: the
+        // library's `Float` already declares both, binding `abs` to libm's `fabs` so that it can see
+        // the sign bit -- which is what makes `(-0.0).abs()` answer `0.0`, and is exactly what a
+        // comparison against zero cannot do.
+        "Signed" -> t match
+            Integer(_, signed, _) -> signed
+            _ -> false
+
+        // The bit surface is every integer, signed and unsigned, which is the domain the operator
+        // table already gives the bitwise operators and the shifts. **Every member of it is total
+        // over that domain**, which is what decided the surface: a membership the compiler cannot
+        // lower at some width would promise a bounded body an operation that fails at an
+        // instantiation the bound was supposed to have proven.
+        "Bits" -> is_integer(t)
+
+        // **Every integer type, and nothing else -- the family named by what it ranges over.** This
+        // is the membership a *blanket* implementation is written over, which is the whole reason it
+        // exists: `impl[T: Integer] Display for T` says once, in source, what no finite list of
+        // blocks could say about an open family.
+        //
+        // It is deliberately not the bit surface under another name. That one is named for what it
+        // provides -- a population count, a rotation -- and this for what it ranges over; they
+        // extend alike today and would part company the moment a bitset wanted the first without
+        // being the second.
+        "Integer" -> is_integer(t)
+
+        _ -> false
+end core_builtin
+
+private is_integer(t: Type) -> bool = t match
+    Integer(_, _, _) -> true
+    _ -> false
+
+// Whether a trait is one a program may never write an implementation for, because its membership is
+// a **family** rather than a promise: it says which types something *is one of*, and that is the
+// compiler's answer alone.
+//
+// This is what makes a blanket implementation over one of them sound, and the two facts are the same
+// fact. A blanket covers every type meeting its bound, so coherence needs the set of such types to
+// be one nothing outside the compiler can add to -- otherwise a program joins a family after the
+// fact and acquires an implementation written for something else entirely, with no block naming
+// either.
+core_closed(trait_name: string) -> bool = trait_name == "Integer"
+
+// Whether the compiler provides a trait for **some** type in the family a bound closes.
+//
+// A blanket implementation is filed under its bound's key rather than under any type's, so it has
+// one member name to serve a whole family -- and the membership above answers about one type at a
+// time. Asking it about the block's own parameter answers no for every trait, because a type
+// parameter is not a numeric type, which is how a blanket came to take the *plain* member name and
+// shadow the compiler's own for every width at once.
+//
+// **It is "some" rather than "every", and that is the whole of the decision.** `Neg` and `Signed`
+// are provided for the signed integers and not the unsigned ones, so a blanket implementing one of
+// them would be a second implementation at `i8` and a first at `u8` -- and one key carries one
+// suffix. The conservative answer is the only safe one: a suffix nothing needed leaves a plain name
+// unclaimed, where a plain name wrongly taken hides an operation the compiler owns.
+core_family_provides(trait_name: string, bound: string) -> bool
+    val ws = core_witnesses(bound)
+
+    for i in 0..<ws.len()
+        if core_builtin(trait_name, ws.at(i)) then return true
+
+    false
+end core_family_provides
+
+// The types that answer for a closed family, chosen so that every axis the memberships distinguish
+// has one on each side of it. For the integers that axis is the **sign** and nothing else -- no row
+// above asks about a width -- so a signed one and an unsigned one are exact rather than a sample.
+private core_witnesses(bound: string) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    if bound == "Integer"
+        out.push(int_type())
+        out.push(byte_type())
+
+    out
+end core_witnesses
+
+// The library function a built-in's `Hash` goes through, and the type its receiver widens to.
+//
+// Everything whose value is one whole number arrives at the same mixer, widened to 64 bits, which is
+// what makes `1u8` and `1i64` hash alike -- they compare alike, and the law is that they must.
+core_hash(t: Type) -> Option[(string, Type)] = t match
+    // A value too wide for the mixer is mixed in two halves. Truncating instead would keep the law
+    // and throw away every bit above the 64th, so a table keyed on values that differ only in their
+    // high half would put all of them in one bucket.
+    Integer(bits, _, _) ->
+        if bits > 64 then Some(("hash_u128", Integer(128, false, false)))
+        else Some(("hash_u64", Integer(64, false, false)))
+    Char -> Some(("hash_u64", Integer(64, false, false)))
+    // A `bool` is one bit, and one bit does not widen to a number in this language.
+    Bool -> Some(("hash_bool", Bool))
+    Str -> Some(("hash_str", Str))
+    _ -> None

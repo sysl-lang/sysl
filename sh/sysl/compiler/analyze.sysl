@@ -54,6 +54,11 @@ read_decls(a: &Analysis, units: Buf[Program])
     // stands for exists and that following it terminates.
     resolve_named_subtypes(a)
 
+    // Then the members: every type's own, and the ones an `impl` block gives it. It runs before the
+    // signatures because a signature may name an associated type, which is an `impl`'s to supply, and
+    // it runs after the eager instantiation because a member's `Self` is that instantiation.
+    hoist_all_members(a, units)
+
     // Then every signature, which is what makes a mistake in one a mistake at the declaration.
     resolve_signatures(a)
 
@@ -195,7 +200,8 @@ private resolve_signatures(a: &Analysis)
     for i in 0..<a.tables.funcs.len()
         val f = a.tables.funcs.at(i)
 
-        resolve_func_signature(a, f.scope, f.decl.tparams, f.decl.params, f.decl.ret_type)
+        resolve_func_signature(a, f.scope, f.decl.tparams, f.decl.bounds, f.decl.tvalues,
+                               f.decl.tpacks, f.decl.params, f.decl.ret_type)
 
     for i in 0..<a.tables.externs.len()
         val key = a.tables.externs.key_at(i)
@@ -216,14 +222,15 @@ private resolve_signatures(a: &Analysis)
         val key = a.tables.types.key_at(i)
 
         decl.kind match
-            StructOf(d) -> resolve_members(a, decl.scope, key, d.tparams, d.members)
-            EnumOf(d) -> resolve_members(a, decl.scope, key, d.tparams, d.members)
-            TraitOf(d) -> resolve_members(a, decl.scope, key, d.tparams, d.methods)
+            StructOf(d) -> resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.members)
+            EnumOf(d) -> resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.members)
+            TraitOf(d) -> resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.methods)
             _ -> ()
 
     for i in 0..<a.tables.impls.len()
         val im = a.tables.impls.at(i)
-        var subst = stand_ins(im.decl.tparams)
+        var subst = abstract_subst(a, im.scope, im.decl.tparams, im.decl.bounds, im.decl.tvalues,
+                                   im.decl.tpacks, buf())
 
         subst.push(Binding("Self", resolve_type(a, im.scope, im.decl.for_type, subst)))
 
@@ -261,9 +268,13 @@ stand_ins(tparams: Buf[string]) -> Buf[Binding]
     out
 end stand_ins
 
-private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string], params: Buf[Param],
-                               ret: Option[TypeRef])
-    val subst = stand_ins(tparams)
+private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string],
+                               bounds: Buf[NamedBounds], tvalues: Buf[TypeBinding],
+                               tpacks: Buf[string], params: Buf[Param], ret: Option[TypeRef])
+    // The parameters stand in for themselves **carrying what the declaration asked of them**, which
+    // is what lets a signature name a projection off one: `S::Token` is answerable exactly where `S`
+    // is bounded by a trait declaring a `Token`.
+    val subst = abstract_subst(a, scope, tparams, bounds, tvalues, tpacks, buf())
 
     for i in 0..<params.len()
         resolve_type(a, scope, params.at(i).typ, subst)
@@ -271,10 +282,10 @@ private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string],
     if ret.is_some() then resolve_type(a, scope, ret.unwrap(), subst)
 
 private resolve_members(a: &Analysis, scope: Scope, owner: string, tparams: Buf[string],
-                        members: Buf[MethodDecl])
-    var subst = stand_ins(tparams)
+                        bounds: Buf[NamedBounds], members: Buf[MethodDecl])
+    var subst = abstract_subst(a, scope, tparams, bounds, buf(), buf(), buf())
 
-    subst.push(Binding("Self", self_type(a, owner, tparams)))
+    subst.push(Binding("Self", self_type(a, scope, owner, tparams, bounds)))
 
     for i in 0..<members.len()
         resolve_method(a, scope, members.at(i), subst)
@@ -294,22 +305,35 @@ private resolve_method(a: &Analysis, scope: Scope, m: MethodDecl, outer: Buf[Bin
     if m.ret_type.is_some() then resolve_type(a, scope, m.ret_type.unwrap(), subst)
 
 // What `Self` stands for inside a type's own members: the type at its own parameters.
-private self_type(a: &Analysis, owner: string, tparams: Buf[string]) -> Type
+private self_type(a: &Analysis, scope: Scope, owner: string, tparams: Buf[string],
+                  bounds: Buf[NamedBounds]) -> Type
     val decl = a.tables.types.get(owner)
 
     if decl.is_none() then return Unknown
 
+    // The arguments are the declaration's own parameters standing in for themselves, **carrying what
+    // it asked of them** -- a field written `[8]C::W` is answerable exactly where `C` is bounded by
+    // the trait declaring a `W`.
+    val stood = abstract_subst(a, scope, tparams, bounds, buf(), buf(), buf())
     var targs: Buf[Type] = buf()
 
     for i in 0..<tparams.len()
-        targs.push(Abstract(tparams.at(i), buf()))
+        targs.push(bound_type(stood, tparams.at(i)).unwrap_or(Abstract(tparams.at(i), buf())))
 
     decl.unwrap().kind match
         StructOf(d) -> instantiate_struct(a, decl.unwrap().scope, decl.unwrap().span, d.name, owner,
                                           d, decl.unwrap().scope, targs)
         EnumOf(d) -> instantiate_enum(a, decl.unwrap().scope, decl.unwrap().span, d.name, owner, d,
                                       decl.unwrap().scope, targs)
-        TraitOf(_) -> Trait(owner, targs, buf())
+        // **Inside a trait's own declaration `Self` is a stand-in bounded by the trait**, not the
+        // object over it: a member writing `-> Self::Item` is naming the associated type of whatever
+        // implements the trait, and only a bound can say what that is. The object is what a *use*
+        // makes, and it has to write the binding out.
+        TraitOf(_) ->
+            var self_bounds: Buf[Bound] = buf()
+
+            self_bounds.push(Bound(owner, targs))
+            Abstract("Self", self_bounds)
         _ -> Unknown
 end self_type
 
