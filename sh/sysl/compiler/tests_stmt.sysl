@@ -253,3 +253,113 @@ the_contract_clauses()
 @test("'old' remembers what an expression was on entry, at that expression's own type")
 old_remembers_the_entry_value()
     assert_eq(ty("f(a: *int) -> int\n    ensure *a == old(*a)\n\n    *a\n"), "int")
+
+// -- what a loop header binds ------------------------------------------------------------------
+
+@test("a 'for' header may take its element apart, which is the binding's own pattern reached from a loop")
+a_for_that_takes_its_element_apart()
+    val src = "keep(a: int, b: string) = ()\n\nf(xs: []const (int, string))\n" +
+        "    for (a, b) in xs\n        keep(a, b)\n"
+
+    assert_eq(held(src, "a"), "int")
+    assert_eq(held(src, "b"), "string")
+
+@test("and the part it skips with a wildcard binds nothing")
+a_for_pattern_with_a_wildcard()
+    val src = "keep(b: string) = ()\n\nf(xs: []const (int, string))\n" +
+        "    for (_, b) in xs\n        keep(b)\n"
+
+    assert_eq(held(src, "b"), "string")
+
+@test("a loop variable is a 'var', so what a 'for' named may be written")
+a_loop_variable_may_be_written()
+    assert_eq(complaints_of("f(xs: []const int)\n    for x in xs\n        x = 1\n"), 0)
+
+private complaints_of(text: string) -> usize = stmt_diagnostics(text).len()
+
+// -- what a binding covers ----------------------------------------------------------------------
+
+@test("naming an arm with '@' does not change what it covers")
+an_at_pattern_still_covers()
+    assert_eq(ty("enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int = s match\n" +
+                 "    whole @ Dot -> 0\n    Round(r) -> r\n"), "int")
+
+@test("and a match that leaves one out is still refused when the rest are named")
+an_at_pattern_does_not_cover_the_rest()
+    assert_eq(ty("enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int = s match\n" +
+                 "    whole @ Dot -> 0\n"),
+              "match on 'Shape' is not exhaustive; missing Round (add an 'else' arm)")
+
+@test("a guarded arm discharges nothing, since the guard cannot be proved to hold")
+a_guarded_arm_covers_nothing()
+    assert_eq(ty("enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int = s match\n" +
+                 "    Dot if true -> 0\n    Round(r) -> r\n"),
+              "match on 'Shape' is not exhaustive; missing Dot (add an 'else' arm)")
+
+@test("a bool is covered by its two literals, and a tuple by every combination of them")
+a_closed_type_is_covered_by_its_values()
+    assert_eq(ty("f(c: bool) -> int = c match\n    true -> 1\n    false -> 0\n"), "int")
+    assert_eq(ty("f(p: (bool, bool)) -> int = p match\n    (true, true) -> 3\n" +
+                 "    (true, false) -> 2\n    (false, true) -> 1\n    (false, false) -> 0\n"), "int")
+
+@test("and a gap the split reaches names the combination that is missing")
+a_gap_names_the_combination()
+    assert_eq(ty("f(p: (bool, bool)) -> int = p match\n    (true, true) -> 3\n" +
+                 "    (false, false) -> 0\n"),
+              "match on '(bool, bool)' is not exhaustive; missing tuple2(true, false), " +
+              "tuple2(false, true) (add an 'else' arm)")
+
+@test("a struct has one shape, so a struct pattern over irrefutable parts covers it")
+a_struct_pattern_covers()
+    assert_eq(ty("struct Point\n    x: int\n    y: int\n\nf(p: Point) -> int = p match\n" +
+                 "    Point(a, b) -> a + b\n"), "int")
+
+@test("a literal leaves a gap with no name, so the complaint says only that there is one")
+a_literal_leaves_an_unnamed_gap()
+    assert_eq(ty("struct Point\n    x: int\n    y: int\n\nf(p: Point) -> int = p match\n" +
+                 "    Point(0, 0) -> 1\n"),
+              "a 'match' that yields a value must be exhaustive — add an 'else' arm")
+
+// -- where an `is` binding reaches -----------------------------------------------------------------
+
+@test("an 'is' binding does not reach the 'else' branch, nor the code after the whole 'if'")
+an_is_binding_does_not_leak()
+    assert_eq(ty("enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int\n" +
+                 "    if s is Round(r) then return r\n    else return r\n\n    0\n"),
+              "undefined name 'r'")
+    assert_eq(ty("enum Shape\n    Dot\n    Round(r: int)\n\nf(s: Shape) -> int\n" +
+                 "    if s is Round(r) then return r\n\n    r\n"), "undefined name 'r'")
+
+@test("a 'while' remakes its binding each round, and its 'else' cannot read one")
+an_is_binding_in_a_while()
+    val src = "enum Step\n    Halt\n    Go(n: int)\n\nnext() -> Step = Halt\n\nf() -> int\n" +
+        "    var total = 0\n\n    while next() is Go(n)\n        total += n\n\n    total\n"
+
+    assert_eq(held(src, "n"), "int")
+
+@test("a gap is named at the depth it is missing at")
+a_gap_is_named_at_its_depth()
+    val src = "enum Op\n    Halt\n    Push\n\nenum Maybe\n    Nothing\n    Just(op: Op)\n\n" +
+        "f(m: Maybe) -> int = m match\n    Nothing -> 0\n    Just(Halt) -> 1\n"
+
+    assert_eq(ty(src), "match on 'Maybe' is not exhaustive; missing Just(Push) (add an 'else' arm)")
+
+@test("and a column no arm narrowed stays a '_' rather than expanding behind it")
+a_column_nobody_narrowed()
+    val src = "enum Op\n    Halt\n    Push\n\nenum Maybe\n    Nothing\n    Just(op: Op)\n\n" +
+        "f(m: Maybe) -> int = m match\n    Nothing -> 0\n"
+
+    assert_eq(ty(src), "match on 'Maybe' is not exhaustive; missing Just (add an 'else' arm)")
+
+@test("a scalar match is checked only where it is used for a value, and an enum's in both places")
+where_coverage_is_checked()
+    assert_eq(complaints_of("keep(n: int) = ()\n\nf(n: int)\n    n match\n        1 -> keep(1)\n"), 0)
+    assert_eq(complaints_of("enum Shape\n    Dot\n    Round(r: int)\n\nkeep(n: int) = ()\n\n" +
+                            "f(s: Shape)\n    s match\n        Dot -> keep(0)\n"), 1)
+
+@test("a partial 'match' that does not carry a literal `Some` does not discharge the variant")
+a_literal_does_not_discharge_a_variant()
+    val src = "enum Maybe\n    Nothing\n    Just(n: int)\n\nf(m: Maybe) -> int = m match\n" +
+        "    Nothing -> 0\n    Just(0) -> 1\n"
+
+    assert_eq(ty(src), "match on 'Maybe' is not exhaustive; missing Just (add an 'else' arm)")
