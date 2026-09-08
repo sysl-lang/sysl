@@ -1,0 +1,156 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Typing the bodies a function's declaration is followed by, where the body is one expression.
+//
+// **A function whose body is a single expression is the whole of what this stage can finish**: a
+// statement introduces a binding and a binding introduces a scope, which is the next stage's. So
+// the walk here reads every declaration, finds the functions written as `f(...) = <expr>`, and
+// types the expression with the parameters in scope and nothing else.
+
+// The functions of a compilation whose bodies this stage types, with what it had to say about them.
+struct TypedBodies
+    funcs: Buf[TFunc]
+    reported: Buf[Placed]
+
+    // How many bodies were left for a later stage, and why.
+    skipped_statements: usize
+    skipped_generic: usize
+end TypedBodies
+
+// Reads a compilation's declarations and types every single-expression body in it.
+analyze_exprs(units: Buf[Program], t: Target) -> TypedBodies
+    val a = analysis_for(t)
+
+    read_decls(a, units)
+
+    var funcs: Buf[TFunc] = buf()
+    var statements: usize = 0
+    var generic: usize = 0
+
+    for i in 0..<units.len()
+        val unit = units.at(i)
+        val scope = scope_of_unit(unit)
+
+        for j in 0..<unit.body.len()
+            val s = unit.body.at(j)
+
+            *s.kind match
+                FuncDecl(d) ->
+                    if !d.tparams.is_empty() then generic = generic + 1
+                    else
+                        val body = single_expression(d.body)
+
+                        if body.is_none() then statements = statements + 1
+                        else funcs.push(type_func(a, scope, s.span, d, body.unwrap()))
+                _ -> ()
+
+    TypedBodies(funcs, a.diagnostics(), statements, generic)
+end analyze_exprs
+
+// The one expression a body is, where it is one.
+single_expression(body: Buf[Stmt]) -> Option[Expr]
+    if body.len() != 1 then return None
+
+    *body.at(0).kind match
+        ExprStmt(e) -> Some(e)
+        _ -> None
+end single_expression
+
+// One function, with its parameters in scope.
+private type_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, body: Expr) -> TFunc
+    val cx = analyzer_for(a, scope)
+    var params: Buf[(string, Type)] = buf()
+
+    for i in 0..<d.params.len()
+        val p = d.params.at(i)
+        val ty = resolve_type(a, scope, p.typ, no_bindings())
+
+        cx.bind_as(p.name, p.name, ty)
+        params.push((p.name, ty))
+
+    // **A function that declares no result hands nothing back**, so its body is read with nothing
+    // expected and the value it comes to is discarded -- which is what the reference compiler does
+    // and why `probe() = 42` is a `unit` function rather than an `int` one.
+    val declared = d.ret_type.map(w -> resolve_type(a, scope, w, no_bindings()))
+    val ret = declared.unwrap_or(Unit)
+
+    cx.func_name = d.name
+    cx.ret_ty = declared
+
+    val t = type_expr(cx, body, declared)
+
+    if declared.is_some() && disagree(texpr_type(t), ret) then
+        cx.fault(body.span, s"'${d.name}' returns ${type_show(ret)}, but this body is " +
+                 s"${type_show(texpr_type(t))}")
+
+    val block = TBlock(buf(), Some(t), block_type(declared, t))
+
+    TFunc(span, module_qualify(scope.module_name, d.name), params, ret, block, d.variadic, buf(),
+          buf(), buf(), false, d.conv, d.tailrec, None, d.pure, d.ghost, d.reads, d.writes, None,
+          d.section)
+end type_func
+
+// The type a body's block comes to: the declared result where there is one, and `unit` where the
+// value is discarded for want of anywhere to hand it back.
+private block_type(declared: Option[Type], t: TExpr) -> Type
+    if declared.is_none() then return Unit
+
+    texpr_type(t)
+end block_type
+
+// -- what a test asks ------------------------------------------------------------------------------
+
+// Everything the expression pass has to say about one source, as text.
+expr_diagnostics(text: string) -> Buf[string]
+    val parsed = parse(source_of("test.sysl", text))
+    var out: Buf[string] = buf()
+
+    if !parsed.ok() then
+        for i in 0..<parsed.report.len()
+            out.push(parsed.report.at(i).message)
+
+        return out
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val done = analyze_exprs(units, host_target())
+
+    for i in 0..<done.reported.len()
+        out.push(done.reported.at(i).diag.message)
+
+    out
+end expr_diagnostics
+
+// The type the **last** single-expression body of a source comes to, rendered the way a diagnostic
+// quotes one.
+//
+// **It is the seam the typing tests assert on**, and the last function is what they read because a
+// test writes whatever it needs above the line it is about.
+expr_type(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val done = analyze_exprs(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+    if done.funcs.is_empty() then return "no single-expression body"
+
+    val last = done.funcs.at(done.funcs.len() - 1)
+
+    if last.body.result.is_none() then return "no value"
+
+    type_show(texpr_type(last.body.result.unwrap()))
+end expr_type
+
+// The same, wrapped in a function so a test may write an expression on its own.
+expr_type_of(expr: string) -> string = expr_type(s"probe() = $expr\n")

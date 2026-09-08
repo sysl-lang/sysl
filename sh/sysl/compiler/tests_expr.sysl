@@ -1,0 +1,212 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What an expression **is**, asked through the type the analyzer gives it.
+//
+// **Every claim here was read out of the reference compiler**, either from a test of its own or by
+// handing the installed `sysl` the same source and quoting what came back. The seam is
+// `expr_type`, which types the last single-expression body of a source and renders its type the
+// way a diagnostic quotes one.
+
+private ty(expr: string) -> string = expr_type_of(expr)
+
+private tyf(text: string) -> string = expr_type(text)
+
+@test("an integer literal is an int, and its suffix says otherwise")
+an_integer_literals_type()
+    assert_eq(ty("42"), "int")
+    assert_eq(ty("42u8"), "byte")
+    assert_eq(ty("42i64"), "long")
+    assert_eq(ty("42usize"), "usize")
+    assert_eq(ty("0xffu16"), "ushort")
+
+@test("and the type its context asks for is the one it takes")
+an_integer_literal_takes_its_position()
+    assert_eq(tyf("f() -> u8 = 3\n"), "byte")
+    assert_eq(tyf("f() -> i64 = 42\n"), "long")
+    assert_eq(tyf("f() -> usize = 0\n"), "usize")
+
+@test("a float literal is a real, and never comes out of an integer one")
+a_float_literals_type()
+    assert_eq(ty("1.5"), "real")
+    assert_eq(ty("1.5f32"), "f32")
+    assert_eq(tyf("f() -> f32 = 1.5\n"), "f32")
+
+@test("the leaves that have exactly one type")
+the_fixed_leaves()
+    assert_eq(ty("'a'"), "char")
+    assert_eq(ty("\"hi\""), "string")
+    assert_eq(ty("true"), "bool")
+    assert_eq(ty("()"), "unit")
+    assert_eq(ty("c\"hi\""), "*byte")
+
+@test("'null' takes the pointer its context expects, and refuses to guess one")
+null_takes_its_context()
+    assert_eq(tyf("f() -> *u8 = null\n"), "*byte")
+    assert_eq(ty("null"), "'null' takes its type from its context, and there is none here")
+
+@test("a minus and the literal it precedes are one unit")
+a_negative_literal()
+    assert_eq(ty("-5"), "int")
+    assert_eq(tyf("f() -> i8 = -128\n"), "i8")
+    assert_eq(ty("-1.5"), "real")
+
+@test("a parameter is read at the type it was declared with")
+a_parameter_is_read()
+    assert_eq(tyf("f(a: u8) -> u8 = a\n"), "byte")
+    assert_eq(tyf("f(a: []const int) -> []const int = a\n"), "[]const int")
+
+@test("arithmetic answers the type its operands share")
+arithmetic_answers_its_operands()
+    assert_eq(ty("1 + 2"), "int")
+    assert_eq(tyf("f(a: u8) -> u8 = a + 1\n"), "byte")
+    assert_eq(tyf("f(a: f32) -> f32 = a * 2.0\n"), "f32")
+    assert_eq(ty("\"a\" + \"b\""), "string")
+
+@test("a shift's count is a count, so its width has nothing to do with the value's")
+a_shifts_count()
+    assert_eq(tyf("f(a: u8, n: int) -> u8 = a << n\n"), "byte")
+    assert_eq(tyf("f(a: u64, n: u8) -> u64 = a >> n\n"), "ulong")
+
+@test("two pointers subtract to a count of elements")
+pointer_difference()
+    assert_eq(tyf("f(a: *int, b: *int) -> isize = a - b\n"), "isize")
+
+@test("a comparison and the two logical operators are bool")
+comparisons_are_bool()
+    assert_eq(ty("1 < 2"), "bool")
+    assert_eq(ty("1 == 2"), "bool")
+    assert_eq(ty("true && false"), "bool")
+    assert_eq(ty("!true"), "bool")
+
+@test("unary minus and complement keep their operand's type")
+unary_keeps_its_operand()
+    assert_eq(tyf("f(a: i16) -> i16 = -a\n"), "short")
+    assert_eq(tyf("f(a: u8) -> u8 = ~a\n"), "byte")
+    assert_eq(tyf("f(a: f32) -> f32 = -a\n"), "f32")
+
+@test("an array literal decides its own length, and a view does not have one")
+an_array_literal()
+    assert_eq(ty("[1, 2, 3]"), "[3]int")
+    assert_eq(tyf("f() -> []const u8 = [1, 2]\n"), "[]const byte")
+    assert_eq(tyf("f() -> [2]f32 = [1.0, 2.0]\n"), "[2]f32")
+
+@test("a repeat is an array under an array and storage under a view")
+a_repeat()
+    assert_eq(ty("[0; 4]"), "[4]int")
+    assert_eq(tyf("const n: int = 3\nf() -> [3]u8 = [1; n]\n"), "[3]byte")
+
+@test("a subscript answers the element, and a range answers a view")
+a_subscript()
+    assert_eq(tyf("f(xs: [3]int) -> int = xs[0]\n"), "int")
+    assert_eq(tyf("f(xs: []const u8) -> byte = xs[1]\n"), "byte")
+    assert_eq(tyf("f(p: *int) -> int = p[2]\n"), "int")
+    assert_eq(tyf("f(xs: []int) -> []int = xs[1..]\n"), "[]int")
+    assert_eq(tyf("f(s: string) -> string = s[0..<2]\n"), "string")
+
+@test("the members the compiler supplies for the types it knows the shape of")
+the_supplied_members()
+    assert_eq(tyf("f(xs: [4]int) -> usize = xs.len\n"), "usize")
+    assert_eq(tyf("f(xs: []const int) -> usize = xs.len\n"), "usize")
+    assert_eq(tyf("f(s: string) -> []const u8 = s.bytes\n"), "[]const byte")
+
+@test("a struct's field is read by the name its declaration gave it")
+a_struct_field()
+    assert_eq(tyf("struct P\n    x: int\n    y: f32\n\nf(p: P) -> f32 = p.y\n"), "f32")
+    assert_eq(tyf("struct P\n    x: int\n\nf(p: *P) -> int = p.x\n"), "int")
+
+@test("a tuple's parts are named for their positions")
+a_tuple_part()
+    assert_eq(tyf("f(t: (int, string)) -> string = t.1\n"), "string")
+    assert_eq(ty("(1, \"a\")"), "(int, string)")
+
+@test("an address is a raw pointer, and reading through one gives the value")
+addresses_and_derefs()
+    assert_eq(tyf("f(a: int) -> *int = &a\n"), "*int")
+    assert_eq(tyf("f(p: *u8) -> byte = *p\n"), "byte")
+    assert_eq(tyf("struct P\n    x: int\n\nf(p: P) -> *int = &p.x\n"), "*int")
+
+@test("a call answers what the declaration hands back")
+a_call_answers_its_declaration()
+    assert_eq(tyf("g(a: int) -> string = \"x\"\nf() -> string = g(1)\n"), "string")
+    assert_eq(tyf("g() -> u8 = 1\nf() -> byte = g()\n"), "byte")
+
+@test("a default is spliced in where the argument was not written")
+a_default_is_spliced()
+    assert_eq(tyf("g(a: int, b: u8 = 2) -> byte = b\nf() -> byte = g(1)\n"), "byte")
+
+@test("a named argument fills the parameter it names, wherever it is written")
+a_named_argument()
+    assert_eq(tyf("g(a: int = 1, b: string = \"x\") -> string = b\n" +
+                  "f() -> string = g(b = \"y\")\n"), "string")
+
+@test("a conversion is a call, and every pair that has a meaning is listed")
+a_conversion_is_a_call()
+    assert_eq(tyf("f(a: int) -> u8 = u8(a)\n"), "byte")
+    assert_eq(tyf("f(a: f64) -> int = int(a)\n"), "int")
+    assert_eq(tyf("f(c: char) -> string = string(c)\n"), "string")
+    assert_eq(tyf("f(p: *u8) -> usize = usize(p)\n"), "usize")
+
+@test("a struct's name in call position is its positional constructor")
+a_struct_constructor()
+    assert_eq(tyf("struct P\n    x: int\n    y: int\n\nf() -> P = P(1, 2)\n"), "P")
+
+@test("a variant is named on its own where the position says which enum")
+a_variant_is_constructed()
+    assert_eq(tyf("enum Shape\n    Circle(r: int)\n    Square\n\nf() -> Shape = Square\n"), "Shape")
+    assert_eq(tyf("enum Shape\n    Circle(r: int)\n    Square\n\nf() -> Shape = Circle(3)\n"),
+              "Shape")
+    assert_eq(tyf("enum Shape\n    Circle(r: int)\n    Square\n\nf() -> Shape = Shape.Square\n"),
+              "Shape")
+
+@test("a simple enum is read out of an integer, checked")
+a_simple_enum_from_an_integer()
+    assert_eq(tyf("enum Color\n    Red\n    Green\n\nf(n: int) -> Color = Color(n)\n"), "Color")
+
+@test("a constant is folded into its use, at the type it was declared with")
+a_constant_is_folded()
+    assert_eq(tyf("const limit: usize = 8\nf() -> usize = limit\n"), "usize")
+    assert_eq(tyf("const limit: u8 = 8\nf() -> byte = limit + 1\n"), "byte")
+
+@test("a 'val' is storage, so the name reaches the storage itself")
+a_val_is_storage()
+    assert_eq(tyf("val table: [4]int = [1, 2, 3, 4]\nf() -> int = table[0]\n"), "int")
+
+@test("a layout is a compile-time constant, and so is a field's offset")
+layout_is_constant()
+    assert_eq(tyf("f() -> usize = sizeof(u32)\n"), "usize")
+    assert_eq(tyf("f() -> usize = alignof(u64)\n"), "usize")
+    assert_eq(tyf("struct P\n    x: int\n    y: int\n\nf() -> usize = offsetof(P, y)\n"), "usize")
+
+@test("the built-ins the compiler answers for itself")
+the_builtins()
+    assert_eq(tyf("f() -> string = __FILE__\n"), "string")
+    assert_eq(tyf("f() -> int = __LINE__\n"), "int")
+    assert_eq(tyf("f() -> u8 = __LINE__\n"), "byte")
+    assert_eq(tyf("f() -> string = __FUNCTION__\n"), "string")
+
+@test("a reference the position asked for is the ordinary construction, boxed")
+a_reference_is_boxed()
+    assert_eq(tyf("struct P\n    x: int\n\nf() -> &P = P(1)\n"), "&P")
+
+@test("a view of an array is what the position asks for, written out or not")
+a_view_of_an_array()
+    assert_eq(tyf("f(xs: [4]int) -> []const int = xs[..]\n"), "[]const int")
+    assert_eq(tyf("f(xs: [4]int) -> []const int = xs\n"), "[]const int")
+
+@test("a writable view stands where a read-only one was asked for")
+a_writable_view_narrows()
+    assert_eq(tyf("f(xs: []int) -> []const int = xs\n"), "[]const int")
+
+@test("a scalar where a vector was asked for is one value in every lane")
+a_splat()
+    assert_eq(tyf("f(a: f32) -> <4>f32 = a\n"), "<4>f32")
+    assert_eq(tyf("f() -> <4>f32 = [1.0, 2.0, 3.0, 4.0]\n"), "<4>f32")
+
+@test("a vector's lane is read by a constant, and its length is one")
+a_vector_lane()
+    assert_eq(tyf("f(v: <4>f32) -> f32 = v[2]\n"), "f32")
+    assert_eq(tyf("f(v: <4>f32) -> usize = v.len\n"), "usize")

@@ -1,0 +1,599 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, negate}
+
+// Typing an expression: the dispatcher every form goes through, and the leaves that are answered
+// here rather than in a file of their own.
+//
+// **`expected` is the type the context wants**, used where the expression cannot work out its own
+// type arguments -- a bare `null`, a literal's width, a branch whose sibling is the one that knows
+// -- and where it decides that a value belongs on the heap. Everything a position *does* to what
+// comes back is `expr_coerce.sysl`'s; what a form *is* is here.
+
+// Analyzes an expression at the type its position wants.
+type_expr(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
+    val t = analyze_expected(cx, e, expected)
+
+    if texpr_type(t) == Unknown then cx.poisoned = true
+
+    t
+end type_expr
+
+// The same, with nothing expected.
+type_expr_bare(cx: &Analyzer, e: Expr) -> TExpr = type_expr(cx, e, None)
+
+// A condition, which must be a `bool`.
+analyze_bool(cx: &Analyzer, e: Expr) -> TExpr
+    val t = type_expr(cx, e, Some(Bool))
+
+    if texpr_type(t) != Bool && texpr_type(t) != Unknown then
+        return cx.err(e.span, s"condition must be bool, got ${type_show(texpr_type(t))}")
+
+    t
+end analyze_bool
+
+// What a form *is*, before its position has done anything to it.
+analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind match
+    IntLit(digits, base, suffix) ->
+        int_literal(cx, e.span, literal_value(digits, base), suffix, expected)
+    FloatLit(text, suffix) -> float_literal(cx, e.span, text, suffix, expected)
+    CharLit(cp) -> TExpr(e.span, TIntLit(from_int(long(uint(cp))), Char))
+    StrLit(v) -> TExpr(e.span, TStrLit(v))
+
+    // A C callee finds the end by the terminator, so an interior NUL would hide everything written
+    // after it. Refused outright rather than silently truncated.
+    CStrLit(v) ->
+        if has_nul(v) then
+            cx.err(e.span, "a C string ends at its first NUL, so it cannot contain one — the " +
+                   "bytes after it could never be read")
+        else
+            TExpr(e.span, TCStrLit(v))
+
+    BoolLit(v) -> TExpr(e.span, TBoolLit(v))
+    UnitLit -> TExpr(e.span, TUnitLit)
+    NullLit -> null_literal(cx, e.span, expected)
+
+    Ident(name) -> name_expr(cx, e.span, name, expected)
+
+    // A minus and the literal it precedes are one unit for the range check, so a signed type's
+    // minimum is writable even though its magnitude overflows the positive range.
+    Unary(op, operand) -> unary_expr(cx, e, op, operand, expected)
+    PreIncDec(op, operand) -> inc_dec(cx, e.span, op, operand, true)
+    PostIncDec(op, operand) -> inc_dec(cx, e.span, op, operand, false)
+
+    Binary(op, l, r) -> binary_expr(cx, e.span, op, l, r, expected)
+    Compare(operands, ops) -> compare_expr(cx, e.span, operands, ops)
+
+    Tuple(elements) -> tuple_expr(cx, e.span, elements, expected)
+
+    ArrayLit(elements) -> array_literal(cx, e.span, elements, expected)
+    ArrayFill(value, count) -> array_fill(cx, e.span, value, count, expected)
+    Index(receiver, index) -> index_expr(cx, e.span, receiver, index, expected)
+
+    Field(receiver, name) -> field_expr(cx, e.span, receiver, name, expected)
+
+    Call(callee, args) -> call_expr(cx, e.span, callee, args, expected)
+
+    TryExpr(inner) -> try_expr(cx, e.span, inner, expected)
+
+    LayoutOf(op, t) -> layout_of(cx, e.span, op, t, expected)
+    OffsetOf(t, field) -> offset_of(cx, e.span, t, field, expected)
+
+    NamedArg(name, _) ->
+        cx.err(e.span, s"'$name:' names an argument, and there is nothing being called here")
+    Spread(_) ->
+        cx.err(e.span, "'...' spreads a sequence into a call's arguments, and there is nothing " +
+               "being called here")
+
+    Bad -> bad_expr(e.span)
+
+    _ -> cx.err(e.span, deferred_form(e))
+
+// The forms a later stage of the analyzer answers, named so that a partial compiler says which
+// stage is missing rather than complaining about the reader's program.
+private deferred_form(e: Expr) -> string = *e.kind match
+    IfExpr(_, _, _) -> "a branch used as a value is not typed yet"
+    MatchExpr(_, _) -> "a 'match' used as a value is not typed yet"
+    Block(_) -> "a block used as a value is not typed yet"
+    Lambda(_, _, _) -> "a closure is not typed yet"
+    _ -> "this expression is not typed yet"
+
+private has_nul(s: string) -> bool
+    val b = s.bytes
+
+    for i in 0..<b.len
+        if b[i] == 0u8 then return true
+
+    false
+end has_nul
+
+// `null` takes the `*T` its context expects. The null callback is the same word: several C
+// interfaces read one as "there is none, use the default".
+private null_literal(cx: &Analyzer, span: Span, expected: Option[Type]) -> TExpr
+    if expected.is_none() then
+        return cx.err(span, "'null' takes its type from its context, and there is none here")
+
+    val want = expected.unwrap()
+
+    want match
+        Ptr(_) -> TExpr(span, TNullLit(want))
+        CFn(_, _) -> TExpr(span, TNullLit(want))
+        _ -> cx.err(span, s"'null' is a raw pointer, and ${type_show(want)} was expected here")
+end null_literal
+
+// -- names ---------------------------------------------------------------------------------------
+
+// What a bare name reads.
+//
+// **The order is the reader's**: a name the compiler answers for itself, then `result`, then what
+// the scope binds, then a variant, a constant, storage, and an `extern` variable.
+name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TExpr
+    // A reserved identifier is the compiler's to answer and no scope is consulted: the shape may
+    // not be declared at all, so there is nothing a lookup could find and nothing to shadow one.
+    if reserved_shape(name) then return builtin(cx, span, name, expected)
+
+    val local = cx.lookup(name)
+
+    // `result` is a *contextual* keyword: a real binding of that name still shadows it.
+    if name == "result" && local.is_none() then
+        if cx.ret_ty.is_some() then return TExpr(span, TResult(cx.ret_ty.unwrap()))
+
+        return cx.err(span, "'result' is only meaningful inside an 'ensure' of a value-returning " +
+                      "function")
+
+    if local.is_some() then return TExpr(span, TLoad(local.unwrap().unique, local.unwrap().ty))
+
+    // A constant is folded into its use and analyzed as the expression it stands for, at the type
+    // it was declared with rather than the one the context asked for. That is what makes it behave
+    // like the value it names: `const n: usize = 5` used where an `int` belongs is the same
+    // mismatch a `usize` variable would be, not a silent adaptation.
+    val ck = lookup_value_key(cx, a_consts(cx), name)
+
+    if ck.is_some() then return const_expr(cx, span, ck.unwrap())
+
+    // A `val` is the other half of that: nothing is folded, because it is storage.
+    val vk = lookup_value_key(cx, a_vals(cx), name)
+
+    if vk.is_some() then return global_expr(cx, span, vk.unwrap(), a_vals(cx), false)
+
+    // An `extern` variable is storage too, and writable: what it names is what the linker supplies,
+    // so the storage is not this program's to promise anything about.
+    val ek = lookup_value_key(cx, a_extern_vars(cx), name)
+
+    if ek.is_some() then return global_expr(cx, span, ek.unwrap(), a_extern_vars(cx), true)
+
+    // A declared function standing where a callable is wanted is one, with nothing captured. It is
+    // asked for only where the context says a callable, so a bare function name anywhere else is
+    // still the mistake it was.
+    if !overload_keys(cx.an, module_qualify(cx.scope.module_name, name)).is_empty() then
+        return cx.err(span, s"'$name' is a function, and a function value is not typed yet")
+
+    variant_expr(cx, span, name, expected)
+end name_expr
+
+private a_consts(cx: &Analyzer) -> &Table[ValueDecl] = cx.an.tables.consts
+private a_vals(cx: &Analyzer) -> &Table[ValueDecl] = cx.an.tables.vals
+private a_extern_vars(cx: &Analyzer) -> &Table[ValueDecl] = cx.an.tables.extern_vars
+
+// Which declaration a written name reaches in a table of storage, in the terms of the file that
+// wrote it -- the same order `lookup_type_key` reads, over a different table.
+lookup_value_key(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Option[string]
+    val bound = cx.scope.imports.name_key(name)
+
+    if bound.is_some() && from.has(bound.unwrap()) then return bound
+
+    val here = module_qualify(cx.scope.module_name, name)
+
+    if from.has(here) then return Some(here)
+
+    var found: Option[string] = None
+
+    for i in 0..<cx.scope.imports.wildcards.len()
+        val key = module_qualify(cx.scope.imports.wildcards.at(i), name)
+
+        if found.is_none() && from.has(key) && reachable_key(cx.an, key, cx.scope) then
+            found = Some(key)
+
+    found
+end lookup_value_key
+
+// The type a declaration of storage was written at.
+value_type(cx: &Analyzer, d: ValueDecl) -> Type =
+    if d.typ.is_none() then Unknown
+    else resolve_type(cx.an, d.scope, d.typ.unwrap(), no_bindings())
+
+private const_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
+    val d = a_consts(cx).get(key).unwrap()
+    val ty = value_type(cx, d)
+
+    if d.init.is_none() then return TExpr(span, TZero(ty))
+
+    // Read in the declaration's own terms, since that is where its names mean what they meant.
+    val inner = analyzer_for(cx.an, d.scope)
+    val folded = type_expr(inner, d.init.unwrap(), Some(ty))
+
+    TExpr(span, *folded.kind)
+end const_expr
+
+private global_expr(cx: &Analyzer, span: Span, key: string, from: &Table[ValueDecl],
+                    writable: bool) -> TExpr
+    val d = from.get(key).unwrap()
+
+    TExpr(span, TGlobal(key, value_type(cx, d), writable))
+end global_expr
+
+// A bare name that stands for a variant of an enum, which is the one name form the *expected* type
+// helps to find: a bare `None` still means `Option`'s in a module that declares a `None` of its own.
+private variant_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TExpr
+    val found = variant_of(cx, name, expected)
+
+    if found.is_none() then
+        return cx.err(span, s"undefined name '${module_show(module_qualify(cx.scope.module_name, name))}'")
+
+    val (en, v) = found.unwrap()
+
+    if v.carries then
+        return cx.err(span, s"'$name' carries ${quantity(v.fields.len(), "field")}, so it is " +
+                      "constructed with them")
+
+    TExpr(span, TEnumNew(en, v, buf()))
+end variant_expr
+
+// The enum a bare variant name belongs to, preferring the one the position asked for.
+variant_of(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[(Type, EnumVariant)]
+    if expected.is_some() then
+        val want = repr(expected.unwrap())
+
+        want match
+            Enum(d) ->
+                val v = d.variant(name)
+
+                if v.is_some() then return Some((want, v.unwrap()))
+            _ -> ()
+
+    var found: Option[(Type, EnumVariant)] = None
+
+    for i in 0..<cx.an.tables.enum_insts.len()
+        val t = cx.an.tables.enum_insts.at(i)
+
+        t match
+            Enum(d) ->
+                if found.is_none() && reachable_key(cx.an, d.base, cx.scope) &&
+                        visible_here(cx, d.base) then
+                    val v = d.variant(name)
+
+                    if v.is_some() then found = Some((t, v.unwrap()))
+            _ -> ()
+
+    found
+end variant_of
+
+// Whether a declaration's module is one this file reads names out of without qualifying them.
+private visible_here(cx: &Analyzer, key: string) -> bool
+    val owner = module_of(key)
+
+    if owner == cx.scope.module_name then return true
+
+    for i in 0..<cx.scope.imports.wildcards.len()
+        if cx.scope.imports.wildcards.at(i) == owner then return true
+
+    false
+end visible_here
+
+// -- what the compiler answers for itself --------------------------------------------------------
+
+// What a reserved identifier stands for, folded into the use as the literal it names.
+//
+// `__LINE__` and `__COLUMN__` go through `int_literal`, so each takes the integer type its context
+// asks for and is range-checked like any other literal.
+private builtin(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TExpr
+    val at = cx.reported.unwrap_or(span)
+    val loc = cx.scope.src.locate(at.start)
+
+    if name == "__FILE__" then return TExpr(span, TStrLit(cx.scope.src.name))
+    if name == "__LINE__" then
+        return int_literal(cx, span, from_int(long(loc.line)), "", expected)
+    if name == "__COLUMN__" then
+        return int_literal(cx, span, from_int(long(loc.col)), "", expected)
+
+    // **Empty outside any body, rather than an error.** A module's storage is filled before any
+    // function runs, so there is genuinely no function to name there.
+    if name == "__FUNCTION__" then return TExpr(span, TStrLit(cx.func_name))
+
+    cx.err(span, unknown_builtin(name))
+end builtin
+
+// The expectation an arithmetic operand inherits: a position wanting a number says which number,
+// and one wanting anything else says nothing at all.
+//
+// **It is a function rather than a written `if`** because an `if ... then ... else` split across
+// two lines is `dedent expected` in the compiler this is built by, and the one-line form does not
+// fit. The gap is reported; the shape here is the workaround, and it is named so the reader sees a
+// rule rather than a contortion.
+private numeric_expectation(expected: Option[Type]) -> Option[Type]
+    if expected.is_none() then return None
+
+    if computes_numerically(expected.unwrap()) then expected else None
+end numeric_expectation
+
+// -- operators -----------------------------------------------------------------------------------
+
+private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
+                   expected: Option[Type]) -> TExpr
+    // A minus and the literal it precedes are one unit for the range check.
+    if op == "-" then
+        *operand.kind match
+            IntLit(digits, base, suffix) ->
+                return int_literal(cx, e.span, negate(literal_value(digits, base)), suffix, expected)
+            FloatLit(text, suffix) ->
+                return float_literal(cx, e.span, s"-$text", suffix, expected)
+            _ -> ()
+
+    if op == "!" then return TExpr(e.span, TUnary("!", analyze_bool(cx, operand), Bool))
+    if op == "&" then return address_expr(cx, e.span, operand)
+    if op == "*" then return deref_expr(cx, e.span, operand)
+
+    val numeric = numeric_expectation(expected)
+    val t = type_expr(cx, operand, numeric)
+    val ty = texpr_type(t)
+
+    if ty == Unknown then return t
+
+    if op == "-" then
+        op_subject(ty) match
+            Integer(_, signed, _) ->
+                if !signed then
+                    return cx.err(e.span, s"unary '-' is not defined for the unsigned type " +
+                                  s"${type_show(ty)}")
+
+                return produced(TExpr(e.span, TUnary("-", t, unary_type(ty))))
+            Floating(_) -> return produced(TExpr(e.span, TUnary("-", t, unary_type(ty))))
+            _ -> return cx.err(e.span, s"unary '-' is not defined for ${type_show(ty)}")
+
+    if op == "~" then
+        op_subject(ty) match
+            Integer(_, _, _) -> return produced(TExpr(e.span, TUnary("~", t, unary_type(ty))))
+            _ -> return cx.err(e.span, s"unary '~' is not defined for ${type_show(ty)}")
+
+    cx.err(e.span, s"unary '$op' is not supported yet")
+end unary_expr
+
+// Address-of yields a *raw* pointer: a place lives in a frame or inside another object, so there is
+// no refcount to take a share of.
+//
+// **A name is asking for THAT thing's address, so it is answered rather than given a copy.**
+// Something computed has no address of its own, so one is made for it: the value is written into a
+// hidden local of this scope and what comes back is that slot's address.
+private address_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
+    val t = type_expr_bare(cx, operand)
+    val ty = texpr_type(t)
+
+    if ty == Unknown then return t
+
+    if is_place(t) || named_place(operand) then
+        if !is_place(t) then
+            return cx.err(span, s"'&' needs somewhere to point at, and ${type_show(ty)} is a value")
+
+        return TExpr(span, TAddrOf(t, Ptr(place_type(t))))
+
+    // A value nothing occupies has no storage to point at, and a pointer to it could only ever be
+    // read through to produce nothing.
+    if no_value(ty) then
+        return cx.err(span, s"${type_show(ty)} is not a value, so there is nothing to make an " +
+                      "address of")
+
+    TExpr(span, TTempAddr(t, Ptr(ty)))
+end address_expr
+
+private deref_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
+    val t = type_expr_bare(cx, operand)
+    val ty = texpr_type(t)
+
+    if ty == Unknown then return t
+
+    val inner = pointee(ty)
+
+    if inner.is_some() then return TExpr(span, TDeref(t, unqualified(inner.unwrap())))
+
+    // A trait object points somewhere, but it has forgotten what is there, so there is no type to
+    // read out -- its methods are the whole of what it still offers.
+    if erased(ty) then
+        return cx.err(span, s"a ${type_show(ty)} has forgotten what it points at, so there is no " +
+                      "value to read through it — call one of the trait's methods instead")
+
+    cx.err(span, s"'*' needs a pointer or a reference, not ${type_show(ty)}")
+end deref_expr
+
+// `++`/`--` -- a step of one, which the base decides the existence of and a constrained place then
+// has to accept: the new value is checked between the addition and the store.
+private inc_dec(cx: &Analyzer, span: Span, op: string, target: Expr, pre: bool) -> TExpr
+    val place = type_expr_bare(cx, target)
+    val ty = texpr_type(place)
+
+    if ty == Unknown then return place
+
+    if !is_place(place) then
+        return cx.err(span, s"'$op' needs somewhere to write, and this is a value")
+
+    underlying(ty) match
+        Integer(_, _, _) -> TExpr(span, TIncDec(place, op, pre, ty, constraint_of(ty)))
+        _ -> cx.err(span, s"'$op' is not defined for ${type_show(ty)}")
+end inc_dec
+
+private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
+                    expected: Option[Type]) -> TExpr
+    if op == "&&" || op == "||" then
+        return TExpr(span, TLogical(op, analyze_bool(cx, l), analyze_bool(cx, r)))
+
+    var operands: Buf[Expr] = buf()
+
+    operands.push(l)
+    operands.push(r)
+
+    val numeric = numeric_expectation(expected)
+    val ts = analyze_operands(cx, operands, numeric)
+    val tl = ts.at(0)
+    val tr = ts.at(1)
+
+    if texpr_type(tl) == Unknown || texpr_type(tr) == Unknown then return bad_expr(span)
+
+    val ty = arith_type(cx, span, op, texpr_type(tl), texpr_type(tr), r.span)
+
+    if ty == Unknown then return bad_expr(span)
+
+    produced(TExpr(span, TBinary(op, tl, tr, ty)))
+end binary_expr
+
+// Each link of the chain is resolved on its own, so a chain reads and behaves exactly as a chain of
+// scalars does, sharing each middle operand between the two comparisons that use it.
+private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[string]) -> TExpr
+    val ts = analyze_operands(cx, operands, None)
+    var cmps: Buf[TCmp] = buf()
+
+    for i in 0..<ops.len()
+        val op = ops.at(i)
+        val a = texpr_type(ts.at(i))
+        val b = texpr_type(ts.at(i + 1))
+
+        if a != Unknown && b != Unknown then
+            if !type_eq(repr(a), repr(b)) then
+                cx.fault(span, s"cannot compare ${type_show(a)} with ${type_show(b)}")
+            else
+                val equality = op == "==" || op == "!="
+                val ok = if equality then is_equatable(a) else is_ordered(a)
+
+                if !ok then cx.fault(span, s"'$op' is not defined for ${type_show(a)}")
+
+        cmps.push(TCmp(op, None))
+
+    TExpr(span, TCompare(ts, cmps))
+end compare_expr
+
+// -- the tiering a pair of operands is read in ---------------------------------------------------
+
+// Analyzes operands that must share one type.
+//
+// **A bare literal has no type of its own, so it takes the type of a non-literal neighbour** --
+// which is what lets `n + 1` work for an `n` of any width without the literal needing a suffix, and
+// `p == null` work for any `*T`. The operands that have a type are analyzed first precisely so it
+// is available to the ones that do not.
+analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type]) -> Buf[TExpr]
+    var own: Buf[Option[TExpr]] = buf()
+
+    for i in 0..<operands.len()
+        val e = operands.at(i)
+
+        if is_literal(e) || typed_by_position(e) then own.push(None)
+        else own.push(Some(sandboxed_read(cx, e, expected)))
+
+    val settled = firmest(operands, own).or_else(() -> expected)
+    var told: Buf[Option[TExpr]] = buf()
+
+    for i in 0..<operands.len()
+        val e = operands.at(i)
+
+        if own.at(i).is_some() then told.push(own.at(i))
+        else if is_literal(e) then told.push(None)
+        else told.push(Some(type_expr(cx, e, settled)))
+
+    val ty = firmest(operands, told).or_else(() -> expected)
+    var out: Buf[TExpr] = buf()
+
+    for i in 0..<operands.len()
+        told.at(i) match
+            Some(t) -> out.push(if ty.is_some() then reread(cx, t, operands.at(i), ty.unwrap()) else t)
+            None -> out.push(type_expr(cx, operands.at(i), ty))
+
+    out
+end analyze_operands
+
+// One reading of an operand with everything it said put back, which is what lets the top tier come
+// back empty rather than complaining on behalf of a tier that had nothing to offer it.
+private sandboxed_read(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
+    val mark = cx.an.complaints()
+    val t = analyze_expected(cx, e, expected)
+
+    cx.an.restore_complaints(mark)
+    t
+end sandboxed_read
+
+// A last reading of an expression at the type its position turned out to have, taken only where the
+// reading it already has is about to be reported as a mismatch.
+//
+// **Conditional on the disagreement, unlike the tiers above, and deliberately so.** A re-reading
+// that succeeds can only turn a refusal into what the same expression at a *written* type would
+// already have been; one that fails changes nothing and leaves the original complaint to whoever
+// was going to report it.
+reread(cx: &Analyzer, t: TExpr, src: Expr, want: Type) -> TExpr
+    if !disagree(texpr_type(t), want) then return t
+
+    val mark = cx.an.complaints()
+    val again = analyze_expected(cx, src, Some(want))
+
+    cx.an.restore_complaints(mark)
+
+    if disagree(texpr_type(again), want) then t else again
+end reread
+
+// Which of the operands the pair takes its type from: the first that stands on its own, and only
+// failing that the first that was read at all.
+//
+// **An adaptable operand is passed over rather than dropped**, which is the whole of the difference
+// between this and taking the head.
+private firmest(operands: Buf[Expr], read: Buf[Option[TExpr]]) -> Option[Type]
+    var taken: Option[Type] = None
+    var any: Option[Type] = None
+
+    for i in 0..<operands.len()
+        read.at(i) match
+            Some(t) ->
+                if any.is_none() then any = Some(repr(texpr_type(t)))
+
+                if taken.is_none() && !adaptable(operands.at(i), t) then
+                    taken = Some(repr(texpr_type(t)))
+            None -> ()
+
+    val chosen = if taken.is_some() then taken else any
+
+    if chosen.is_none() then return None
+
+    Some(meet_views(chosen.unwrap(), read))
+end firmest
+
+// The two views of one slice, met at the read-only one -- the only place a pair of operands has a
+// type to settle on that neither of them wrote.
+//
+// Everywhere else an operand's type is taken as it stands, and it can, because sysl has no
+// subtyping among concrete types to widen towards. A `[]T` and a `[]const T` are the exception the
+// language already made, so the pair has a meeting point and it is the read-only view: it is the
+// one either side converts to, and the one a comparison needs, since comparing reads.
+private meet_views(taken: Type, read: Buf[Option[TExpr]]) -> Type
+    taken match
+        Slice(elem, read_only) ->
+            if read_only then return taken
+
+            for i in 0..<read.len()
+                read.at(i) match
+                    Some(t) -> if type_eq(texpr_type(t), Slice(*elem, true)) then
+                                   return Slice(*elem, true)
+                    None -> ()
+
+            taken
+        _ -> taken
+end meet_views
+
+// Whether an expression is one whose type the position it sits in supplies, rather than one it
+// carries itself -- the middle tier.
+//
+// The test is on the spelling, and it is allowed to be, because the middle tier is not a licence to
+// skip anything: it moves an operand one place later in the order and hands it the neighbour's type
+// as the position's, which is what an expected type is for.
+typed_by_position(e: Expr) -> bool = *e.kind match
+    ImplicitMember(_) -> true
+    Call(callee, args) -> *callee.kind match
+        ImplicitMember(_) -> true
+        Field(_, name) -> name == "load" && args.len() == 1
+        _ -> false
+    _ -> false

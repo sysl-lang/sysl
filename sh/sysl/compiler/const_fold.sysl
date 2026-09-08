@@ -1,0 +1,181 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, add, cmp, from_int, mul, negate, sub, to_string}
+
+// What an expression comes to while compiling, where it comes to anything.
+//
+// **Two positions in the language need this and neither of them is an optimization**: an array's
+// bound is part of its type, and a vector's lane index is part of the instruction that reads it. So
+// a count that does not fold is a mistake to report rather than a value to compute later, which is
+// why the answer is an `Option` and not a best effort.
+
+// A value settled while compiling.
+enum Const
+    ConstInt(value: BigInt)
+    ConstBool(value: bool)
+    ConstChar(value: char)
+    ConstStr(value: string)
+end Const
+
+// The integer an expression comes to, where it comes to one.
+const_int(cx: &Analyzer, e: Expr) -> Option[BigInt] = const_fold(cx, e) match
+    Some(v) -> v match
+        ConstInt(n) -> Some(n)
+        _ -> None
+    None -> None
+
+// What an expression comes to while compiling.
+const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
+    IntLit(digits, base, _) -> Some(ConstInt(literal_value(digits, base)))
+    BoolLit(v) -> Some(ConstBool(v))
+    CharLit(c) -> Some(ConstChar(c))
+    StrLit(s) -> Some(ConstStr(s))
+
+    // A declared constant folds to what it was written equal to, read in its own file's terms.
+    Ident(name) -> const_of_name(cx, name)
+
+    // A module-qualified constant -- `c.limit`. A `const` is registered under its dotted path, so
+    // the same declaration is a constant whether it was imported unqualified or reached through its
+    // module.
+    Field(receiver, name) -> dotted_name(receiver, name).and_then(n -> const_of_name(cx, n))
+
+    Unary(op, operand) -> const_unary(cx, op, operand)
+    Binary(op, l, r) -> const_binary(cx, op, l, r)
+    Compare(operands, ops) ->
+        if operands.len() == 2 && ops.len() == 1 then
+            const_binary(cx, ops.at(0), operands.at(0), operands.at(1))
+        else
+            None
+
+    // `sizeof(T)` and `alignof(T)` are compile-time constants, so they fold exactly as a literal
+    // does -- which is what makes them usable in an array bound and in a `const`.
+    LayoutOf(what, t) -> layout_bytes(cx, what, resolve_type(cx.an, cx.scope, t, cx.subst))
+    OffsetOf(t, field) -> offset_bytes(cx, resolve_type(cx.an, cx.scope, t, cx.subst), field)
+
+    // `T::Min` and `T::Max` on a built-in integer are constants for the reason `sizeof` is: the
+    // answer is a property of the type and is known once the type is.
+    TypeAttr(receiver, attr) -> const_type_attr(cx, receiver, attr)
+
+    _ -> None
+
+private const_of_name(cx: &Analyzer, name: string) -> Option[Const]
+    if cx.lookup(name).is_some() then return None
+
+    val key = lookup_value_key(cx, cx.an.tables.consts, name)
+
+    if key.is_none() then return None
+
+    val d = cx.an.tables.consts.get(key.unwrap()).unwrap()
+
+    if d.init.is_none() then return None
+
+    val inner = analyzer_for(cx.an, d.scope)
+
+    const_fold(inner, d.init.unwrap())
+end const_of_name
+
+// The dotted spelling a `Field` over a chain of plain names comes to, where it is one.
+private dotted_name(receiver: Expr, name: string) -> Option[string] = *receiver.kind match
+    Ident(head) -> Some(s"$head.$name")
+    Field(inner, mid) -> dotted_name(inner, mid).map(head -> s"$head.$name")
+    _ -> None
+
+private const_unary(cx: &Analyzer, op: string, operand: Expr) -> Option[Const]
+    val v = const_fold(cx, operand)
+
+    if v.is_none() then return None
+
+    v.unwrap() match
+        ConstInt(n) ->
+            if op == "-" then Some(ConstInt(negate(n)))
+            else None
+        ConstBool(b) -> if op == "!" then Some(ConstBool(!b)) else None
+        _ -> None
+end const_unary
+
+// A conversion is written, so what it does while compiling is what it does while running.
+private const_binary(cx: &Analyzer, op: string, l: Expr, r: Expr) -> Option[Const]
+    val a = const_fold(cx, l)
+    val b = const_fold(cx, r)
+
+    if a.is_none() || b.is_none() then return None
+
+    a.unwrap() match
+        ConstInt(x) -> b.unwrap() match
+            ConstInt(y) -> int_binary(op, x, y)
+            _ -> None
+        ConstBool(x) -> b.unwrap() match
+            ConstBool(y) -> bool_binary(op, x, y)
+            _ -> None
+        _ -> None
+end const_binary
+
+private int_binary(op: string, x: BigInt, y: BigInt) -> Option[Const]
+    if op == "+" then return Some(ConstInt(add(x, y)))
+    if op == "-" then return Some(ConstInt(sub(x, y)))
+    if op == "*" then return Some(ConstInt(mul(x, y)))
+    if op == "==" then return Some(ConstBool(cmp(x, y) == 0))
+    if op == "!=" then return Some(ConstBool(cmp(x, y) != 0))
+    if op == "<" then return Some(ConstBool(cmp(x, y) < 0))
+    if op == "<=" then return Some(ConstBool(cmp(x, y) <= 0))
+    if op == ">" then return Some(ConstBool(cmp(x, y) > 0))
+    if op == ">=" then return Some(ConstBool(cmp(x, y) >= 0))
+
+    None
+end int_binary
+
+private bool_binary(op: string, x: bool, y: bool) -> Option[Const]
+    if op == "&&" then return Some(ConstBool(x && y))
+    if op == "||" then return Some(ConstBool(x || y))
+    if op == "==" then return Some(ConstBool(x == y))
+    if op == "!=" then return Some(ConstBool(x != y))
+
+    None
+end bool_binary
+
+// How many bytes `sizeof` or `alignof` answers with, where the type is one this compilation has a
+// layout for. A type parameter is not measured: its width is fixed at each instantiation.
+layout_bytes(cx: &Analyzer, what: string, t: Type) -> Option[Const]
+    if t == Unknown || mentions_abstract(t) then return None
+
+    if what == "sizeof" then return Some(ConstInt(from_int(long(cx.an.tables.layout.size(t)))))
+    if what == "alignof" then return Some(ConstInt(from_int(long(cx.an.tables.layout.align(t)))))
+
+    None
+end layout_bytes
+
+// Where a field sits in a struct, in bytes.
+offset_bytes(cx: &Analyzer, t: Type, field: string) -> Option[Const]
+    if t == Unknown || mentions_abstract(t) then return None
+
+    underlying(t) match
+        Struct(d) -> cx.an.tables.layout.field_offset(d, field)
+                       .map(n -> ConstInt(from_int(long(n))))
+        _ -> None
+end offset_bytes
+
+// A width family name, measured with nothing to say about a spelling that is not one.
+private width_of(cx: &Analyzer, name: string) -> Option[Type] =
+    width_type(cx.an, cx.scope, Span(0, 0), name)
+
+// `T::Min` and `T::Max` on a built-in integer.
+private const_type_attr(cx: &Analyzer, receiver: Expr, attr: string) -> Option[Const]
+    val name = *receiver.kind match
+        Ident(n) -> Some(n)
+        _ -> None
+
+    if name.is_none() then return None
+
+    val t = scalar_named(name.unwrap(), word_bits(cx)).or_else(() -> width_of(cx, name.unwrap()))
+
+    if t.is_none() then return None
+
+    t.unwrap() match
+        Integer(bits, signed, _) ->
+            if attr == "Min" then Some(ConstInt(min_of(bits, signed)))
+            else if attr == "Max" then Some(ConstInt(max_of(bits, signed)))
+            else None
+        _ -> None
+end const_type_attr

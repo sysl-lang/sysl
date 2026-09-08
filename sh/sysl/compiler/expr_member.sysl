@@ -1,0 +1,220 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int}
+
+// Reading a member off a value: a struct's field, a tuple's part, and the members the compiler
+// supplies for the types it knows the shape of.
+//
+// **What a type declares of its own -- a property, a method, a trait's member -- is looked up
+// through `lookup_trait_member`**, which the stage that builds the member tables fills in. Reading
+// a field is here because a field is layout: the declaration already says where it is, and nothing
+// has to be resolved to find it.
+
+// A member read off a value, where the value is one the compiler knows the shape of.
+field_expr(cx: &Analyzer, span: Span, receiver: Expr, name: string,
+           expected: Option[Type]) -> TExpr
+    // A module path folded into a name -- `m.limit` is one name and not a member read.
+    val through = through_module(cx, receiver, name)
+
+    if through.is_some() then return name_expr(cx, span, through.unwrap(), expected)
+
+    // A **type** in the position a value would be read from. What a type offers under its own name
+    // is an associated function and nothing else, so the parentheses are what is missing.
+    val on_type = type_member(cx, span, receiver, name, expected)
+
+    if on_type.is_some() then return on_type.unwrap()
+
+    val outer = type_expr_bare(cx, receiver)
+
+    if texpr_type(outer) == Unknown then return outer
+
+    val tr = auto_deref(cx, outer)
+    val rt = texpr_type(tr)
+
+    // A trait object has no fields: the layout is exactly what it forgot.
+    if erased(rt) then
+        return lookup_trait_member(cx, span, tr, name, buf(), expected)
+
+    rt match
+        Struct(d) -> struct_field(cx, span, tr, d, name, expected)
+        Str ->
+            if name == "bytes" then TExpr(span, TBytes(tr))
+            else if name == "copy" then
+                cx.err(span, "'copy' is a method of 'string' — call it with 'copy()', since it " +
+                       "allocates and copies the bytes rather than naming what is already there")
+            else lookup_trait_member(cx, span, tr, name, buf(), expected)
+        Array(_, _) ->
+            if name == "len" then TExpr(span, TLen(tr, usize_type(word_bits(cx))))
+            else lookup_trait_member(cx, span, tr, name, buf(), expected)
+        Slice(_, _) ->
+            if name == "len" then TExpr(span, TLen(tr, usize_type(word_bits(cx))))
+            else lookup_trait_member(cx, span, tr, name, buf(), expected)
+        // A vector's `len` is its lane count, which is part of its type -- so this is a constant
+        // folded here rather than anything read.
+        Vector(lanes, _) ->
+            if name == "len" then
+                TExpr(span, TIntLit(from_int(long(lanes)), usize_type(word_bits(cx))))
+            else lookup_trait_member(cx, span, tr, name, buf(), expected)
+        // Everything about the object is behind `get()`, including whether there still is one.
+        Weak(inner) ->
+            cx.err(span, s"a ${type_show(rt)} may be gone, so nothing is read off one directly — " +
+                   s"'get()' hands back 'Option[&${type_show(*inner)}]', and '$name' is read off " +
+                   "what is inside it")
+        _ -> lookup_trait_member(cx, span, tr, name, buf(), expected)
+end field_expr
+
+// A struct's field, by the index the declaration gave it. A tuple's parts are named for their
+// positions, so `t.0` arrives here as an ordinary field selection.
+private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name: string,
+                     expected: Option[Type]) -> TExpr
+    val idx = d.field_index(name)
+
+    if idx >= 0 then
+        if !field_visible(cx, d.base, name) then
+            return cx.err(span, s"'$name' is private to the file that declares " +
+                          s"'${module_show(d.base)}'")
+
+        // Whatever qualifier the field was declared with stays in the struct's field list and comes
+        // off here: reading a register yields an ordinary value.
+        return TExpr(span, TField(tr, idx, unqualified(d.fields.at(usize(idx)).1)))
+
+    if is_tuple(d) then
+        if all_digits(name) then
+            return cx.err(span, s"${type_show(Struct(d))} has " +
+                          s"${quantity(d.fields.len(), "part")}, so there is no '.$name' — the " +
+                          "parts are numbered from 0")
+
+        return lookup_trait_member(cx, span, tr, name, buf(), expected)
+
+    // A struct's fields have names, and a number does not address one.
+    if all_digits(name) then
+        return cx.err(span, s"'$name' is a compile-time index, and ${type_show(Struct(d))} is a " +
+                      "struct — its fields are reached by name, and a position addresses the parts " +
+                      "of a tuple")
+
+    lookup_trait_member(cx, span, tr, name, buf(), expected)
+end struct_field
+
+private all_digits(name: string) -> bool
+    val b = name.bytes
+
+    if b.len == 0 then return false
+
+    for i in 0..<b.len
+        if b[i] < u8('0') || b[i] > u8('9') then return false
+
+    true
+end all_digits
+
+// Whether a field the reader named is one their file may read.
+//
+// **`private` is file-private**, so a field declared private is read only inside the file that
+// declares the struct -- the same rule every other declaration follows.
+private field_visible(cx: &Analyzer, base: string, field: string) -> bool
+    val decl = cx.an.tables.types.get(base)
+
+    if decl.is_none() then return true
+
+    decl.unwrap().kind match
+        StructOf(d) ->
+            for i in 0..<d.fields.len()
+                val f = d.fields.at(i)
+
+                if f.name == field then
+                    return f.vis match
+                        File -> decl.unwrap().scope.src.name == cx.scope.src.name
+                        _ -> true
+
+            true
+        _ -> true
+end field_visible
+
+// A member read off a **type** rather than off a value: an enum's variant, and the associated names
+// a later stage answers.
+private type_member(cx: &Analyzer, span: Span, receiver: Expr, name: string,
+                    expected: Option[Type]) -> Option[TExpr]
+    val written = *receiver.kind match
+        Ident(n) -> if cx.lookup(n).is_none() then Some(n) else None
+        _ -> None
+
+    if written.is_none() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+
+    if key.is_none() then return None
+
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        EnumOf(_) -> Some(enum_member(cx, span, key.unwrap(), written.unwrap(), name, expected))
+        _ -> None
+end type_member
+
+// A variant named through its enum -- `Colour.Red`.
+private enum_member(cx: &Analyzer, span: Span, key: string, written: string, name: string,
+                    expected: Option[Type]) -> TExpr
+    val inst = cx.an.tables.enum_insts.get(instance_key(key, buf()))
+
+    if inst.is_none() then
+        return cx.err(span, s"'$written' takes type arguments, so a variant of it is named " +
+                      "through the type at those arguments")
+
+    val en = inst.unwrap()
+
+    en match
+        Enum(d) ->
+            val v = d.variant(name)
+
+            if v.is_none() then
+                return cx.err(span, s"'${module_show(key)}' has no variant '$name'")
+
+            if v.unwrap().carries then
+                return cx.err(span, s"'$name' carries " +
+                              s"${quantity(v.unwrap().fields.len(), "field")}, so it is " +
+                              "constructed with them")
+
+            TExpr(span, TEnumNew(en, v.unwrap(), buf()))
+        _ -> bad_expr(span)
+end enum_member
+
+// A `Field` chain that spells a module path rather than a member read.
+private through_module(cx: &Analyzer, receiver: Expr, name: string) -> Option[string]
+    val dotted = module_path(receiver, name)
+
+    if dotted.is_none() then return None
+
+    val written = dotted.unwrap()
+
+    if cx.an.tables.consts.has(module_key_of(cx, written)) then return dotted
+    if lookup_value_key(cx, cx.an.tables.consts, written).is_some() then return dotted
+    if lookup_value_key(cx, cx.an.tables.vals, written).is_some() then return dotted
+    if lookup_value_key(cx, cx.an.tables.extern_vars, written).is_some() then return dotted
+
+    None
+end through_module
+
+private module_key_of(cx: &Analyzer, written: string) -> string =
+    module_qualify(cx.scope.module_name, written)
+
+private module_path(receiver: Expr, name: string) -> Option[string] = *receiver.kind match
+    Ident(head) -> Some(s"$head.$name")
+    Field(inner, mid) -> module_path(inner, mid).map(head -> s"$head.$name")
+    _ -> None
+
+// -- the seam a later stage fills in --------------------------------------------------------------
+
+// What a type declares of its own: a property, a method reached without parentheses, a trait's
+// member, an `impl`'s.
+//
+// **Answering it needs the member tables**, which are built out of the `impl` blocks and the trait
+// declarations -- so it belongs to the stage that reads those, and everything up to it is written
+// against this one call. What it says until then names the member and the stage, so a partial
+// compiler never reports a reader's program as wrong for a rule it has not learned.
+lookup_trait_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr],
+                    expected: Option[Type]) -> TExpr =
+    cx.err(span, s"'$name' on ${type_show(texpr_type(receiver))} is looked up through the member " +
+           "tables, which are not built yet")

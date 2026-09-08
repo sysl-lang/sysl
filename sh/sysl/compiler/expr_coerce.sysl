@@ -1,0 +1,140 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a position does to the expression standing in it.
+//
+// **A context expecting `&T` asks the expression for a `T` and boxes what comes back**, so writing
+// the ordinary construction is the whole spelling of an allocation. The same shape covers weakening
+// a reference, giving up the ability to write a view, viewing an array whole, and putting one
+// value in every lane of a vector -- each of them a conversion the position performs rather than a
+// word the reader writes.
+
+// Analyzes an expression at the type its position wants, performing whatever that position does to
+// what comes back.
+analyze_expected(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
+    if expected.is_none() then return analyze_value(cx, e, None)
+
+    val want = expected.unwrap()
+
+    // A `&T` written where a `&T` was wanted is already one; anything else is asked for a `T`.
+    want match
+        Ref(inner, _) ->
+            if address_of(e) then return analyze_value(cx, e, expected)
+
+            *e.kind match
+                NullLit -> return cx.err(e.span, s"a ${type_show(want)} always points at a live " +
+                                         s"object — an absent one is Option[${type_show(want)}]")
+                _ -> return coerce(cx, analyze_value(cx, e, Some(*inner)), want)
+        Weak(inner) ->
+            *e.kind match
+                NullLit -> return cx.err(e.span, s"a weak reference is absent as 'None', which is " +
+                                         "what 'get()' hands back for one")
+                _ -> return coerce(cx, analyze_value(cx, e, expected), want)
+        // A transparent subtype's values are its base's, so the expression is read at the base and
+        // checked into the subtype where it produces one.
+        Constrained(d) ->
+            if d.derived then return analyze_value(cx, e, expected)
+
+            val v = analyze_value(cx, e, Some(d.base))
+
+            if disagree(texpr_type(v), d.base) then return v
+
+            return TExpr(v.span, TConstrainedCheck(v, want))
+        Slice(_, _) -> return coerce(cx, analyze_value(cx, e, expected), want)
+        Vector(_, _) -> return coerce(cx, analyze_value(cx, e, expected), want)
+        _ -> ()
+
+    analyze_value(cx, e, expected)
+end analyze_expected
+
+private address_of(e: Expr) -> bool = *e.kind match
+    Unary(op, _) -> op == "&"
+    _ -> false
+
+// Whether an expression names storage the reader can point at, which is what a `&` in front of one
+// is allowed to take.
+named_place(e: Expr) -> bool = *e.kind match
+    Ident(_) -> true
+    Field(_, _) -> true
+    Index(_, _) -> true
+    Unary(op, _) -> op == "*"
+    _ -> false
+
+// What a position does to a value of the wrong-but-convertible type.
+//
+// Nothing else coerces -- any other mismatch is left for the caller to diagnose, where the message
+// can name the parameter or the variable it is about.
+coerce(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
+    val got = texpr_type(t)
+
+    expected match
+        Ref(inner, sync) ->
+            if type_eq(got, *inner) then return TExpr(t.span, TBox(t, expected))
+
+            if type_eq(got, Ref(*inner, !sync)) then
+                return cx.err(t.span, s"'&${type_show(*inner)}' and '&sync ${type_show(*inner)}' " +
+                              "are distinct types, and neither converts to the other: a count is " +
+                              "atomic or it is not from the moment the object is allocated, and a " +
+                              "conversion would put an ordinary retain beside an atomic one. " +
+                              s"Allocate ${type_show(*inner)} as a " +
+                              s"'&${if sync then "sync " else ""}${type_show(*inner)}' where it is " +
+                              "constructed")
+
+            t
+        Weak(inner) ->
+            if type_eq(got, Ref(*inner, false)) then return TExpr(t.span, TDowngrade(t, expected))
+
+            *inner match
+                Ref(deep, _) ->
+                    if type_eq(got, *inner) then
+                        return cx.err(t.span, s"'weak ${type_show(*deep)}' is already a weak edge " +
+                                      s"to a counted ${type_show(*deep)}, so the '&' says the mode " +
+                                      s"a second time — write 'weak ${type_show(*deep)}'")
+                _ -> ()
+
+            if type_eq(got, *inner) then
+                return cx.err(t.span, s"a weak reference does not keep ${type_show(*inner)} alive, " +
+                              "and nothing else here holds this one — so it would be gone before " +
+                              s"it could be read. Hold it in a '&${type_show(*inner)}' first, and " +
+                              "weaken that")
+
+            t
+        Slice(want, read_only) ->
+            if read_only && type_eq(got, Slice(*want, false)) then
+                return TExpr(t.span, TConstView(t))
+
+            if !read_only && type_eq(got, Slice(*want, true)) then
+                return cx.err(t.span, s"a '[]const ${type_show(*want)}' views elements it may not " +
+                              s"write, and a '[]${type_show(*want)}' is a licence to write them — " +
+                              "so the one does not become the other. Copy what you need into a " +
+                              s"'[]${type_show(*want)}' of your own, or take the parameter as " +
+                              s"'[]const ${type_show(*want)}' if it is only read")
+
+            array_view(t, *want, read_only).unwrap_or(t)
+        Vector(_, elem) ->
+            if type_eq(repr(got), repr(*elem)) then TExpr(t.span, TSplat(t, expected)) else t
+        _ -> t
+end coerce
+
+// The whole-array view an array coerces to, where its elements are the ones the slice wants.
+//
+// It is exactly what `a[..]` builds: a view of read-only storage is read-only, and one asked for as
+// `[]const T` is made read-only rather than made writable and then given up. A **heap** array
+// converts on the same terms as a frame one, and the reference is what the view is built over.
+private array_view(t: TExpr, want: Type, read_only: bool) -> Option[TExpr]
+    val elem = array_elem(texpr_type(t))
+
+    if elem.is_none() then return None
+    if !type_eq(elem.unwrap(), want) then return None
+
+    Some(TExpr(t.span, TSlice(t, None, None, true, Slice(want, read_only))))
+end array_view
+
+private array_elem(t: Type) -> Option[Type] = t match
+    Array(_, e) -> Some(*e)
+    Ref(inner, sync) -> if sync then None else *inner match
+        Array(_, e) -> Some(*e)
+        _ -> None
+    _ -> None

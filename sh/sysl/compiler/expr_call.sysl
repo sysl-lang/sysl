@@ -1,0 +1,710 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int}
+
+// What a pair of parentheses means, which is six different things told apart by what stands in
+// front of them: a conversion, a variant, a struct's constructor, a simple enum read out of an
+// integer, a function, and a member.
+//
+// **A conversion is written with call syntax, so a type name in call position is one.** That is
+// what makes `u8(x)` and `T(b)` the same form: every instantiation replaces the parameter with a
+// type this same spelling would have accepted written out.
+
+call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
+          expected: Option[Type]) -> TExpr
+    *callee.kind match
+        Ident(name) -> named_call(cx, span, callee, name, args, expected)
+        // A member call. A module path folded into a name is a plain call under another spelling,
+        // so it is asked about first.
+        Field(receiver, member) ->
+            val dotted = module_path_of(receiver, member)
+
+            if dotted.is_some() && names_a_function(cx, dotted.unwrap()) then
+                return named_call(cx, span, callee, dotted.unwrap(), args, expected)
+
+            val tr = type_expr_bare(cx, receiver)
+
+            if texpr_type(tr) == Unknown then return tr
+
+            lookup_trait_member(cx, span, auto_deref(cx, tr), member, args, expected)
+        _ -> cx.err(span, "this is not something that can be called")
+end call_expr
+
+private module_path_of(receiver: Expr, name: string) -> Option[string] = *receiver.kind match
+    Ident(head) -> Some(s"$head.$name")
+    Field(inner, mid) -> module_path_of(inner, mid).map(head -> s"$head.$name")
+    _ -> None
+
+private names_a_function(cx: &Analyzer, written: string) -> bool =
+    !function_keys(cx, written).is_empty()
+
+// A name in call position, in the order the reader's own bindings are consulted.
+private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: Buf[Expr],
+                   expected: Option[Type]) -> TExpr
+    val special = special_form(cx, span, name, args, expected)
+
+    if special.is_some() then return special.unwrap()
+
+    val shadowed = cx.lookup(name).is_some()
+    val tkey = if shadowed then None else lookup_type_key(cx.an, cx.scope, name)
+
+    // A conversion, where no declaration claims the name.
+    if !shadowed && tkey.is_none() then
+        val scalar = scalar_type_named(cx, span, name)
+
+        if scalar.is_some() then return convert_call(cx, span, name, scalar.unwrap(), args)
+
+    if tkey.is_some() then
+        val kind = cx.an.tables.types.get(tkey.unwrap()).unwrap().kind
+
+        kind match
+            // A bare variant name in call position, with the enum taken from the expected type --
+            // but a **type** of the same name is asked about first, since a struct's constructor is
+            // named by the struct's own name and has no second spelling at all.
+            StructOf(_) -> return struct_call(cx, span, tkey.unwrap(), name, args, expected)
+            // A simple enum's name in call position is a checked cast from an integer.
+            EnumOf(_) -> return enum_cast(cx, span, tkey.unwrap(), name, args)
+            TypeOf(_) -> return constrained_call(cx, span, tkey.unwrap(), name, args)
+            _ -> ()
+
+    if !shadowed then
+        val v = variant_of(cx, name, expected)
+
+        if v.is_some() then return variant_call(cx, span, v.unwrap().0, v.unwrap().1, args)
+
+    // A local holding a callable is called through it, and it wins over a declaration of the same
+    // name for the reason the nearest binding always does.
+    if shadowed then return call_through(cx, span, name, args, expected)
+
+    function_call(cx, span, name, args, expected)
+end named_call
+
+// -- the forms the compiler answers by name ------------------------------------------------------
+
+// `print`, the two rendering companions, and the primitives no sysl body could implement.
+private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
+                     expected: Option[Type]) -> Option[TExpr]
+    if cx.lookup(name).is_some() then return None
+
+    if name == "str" && args.len() == 1 then
+        return Some(TExpr(span, TStr(type_expr_bare(cx, args.at(0)))))
+
+    if name == "format" && args.len() == 2 then
+        *args.at(1).kind match
+            StrLit(spec) ->
+                return Some(TExpr(span, TFormat(type_expr_bare(cx, args.at(0)), spec)))
+            _ -> ()
+
+    if name == "ptr_cast" && args.len() == 1 then
+        if expected.is_none() then
+            return Some(cx.err(span, "'ptr_cast' reads an address as a pointer to some type, and " +
+                                "nothing here says which"))
+
+        val t = type_expr_bare(cx, args.at(0))
+
+        return Some(TExpr(span, TCast(t, expected.unwrap())))
+
+    None
+end special_form
+
+// An explicit scalar conversion. Every pair that has a meaning is listed; nothing widens, narrows,
+// or changes representation without being written.
+private convert_call(cx: &Analyzer, span: Span, written: string, to: Type,
+                     args: Buf[Expr]) -> TExpr
+    if args.len() != 1 then
+        return cx.err(span, s"a conversion to '$written' takes one value, and " +
+                      s"${quantity(args.len(), "argument")} " +
+                      s"${if args.len() == 1 then "was" else "were"} given")
+
+    val t = type_expr_bare(cx, args.at(0))
+
+    if texpr_type(t) == Unknown then return t
+
+    convert_to(cx, span, t, to, written)
+end convert_call
+
+// The conversion itself, which a subtype's cast also reaches.
+convert_to(cx: &Analyzer, span: Span, t: TExpr, to: Type, written: string) -> TExpr
+    if to == Str then return encode_string(cx, span, t)
+
+    val from = underlying(texpr_type(t))
+
+    if !converts(cx, span, from, to) then
+        return cx.err(span, s"cannot make $written from ${type_show(texpr_type(t))}")
+
+    TExpr(span, TCast(t, to))
+end convert_to
+
+private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
+    from match
+        Integer(_, _, _) -> to match
+            Integer(_, _, _) -> return true
+            Floating(_) -> return true
+            Char -> return true
+            _ -> return false
+        Floating(_) -> to match
+            Integer(_, _, _) -> return true
+            Floating(_) -> return true
+            _ -> return false
+        Char -> to match
+            Integer(_, _, _) -> return true
+            Char -> return true
+            _ -> return false
+        // Enum to integer is total: every enum value is one of its declared discriminants. Only a
+        // simple enum has an integer value to give; a data enum is a tagged union, not a number.
+        Enum(d) -> to match
+            Integer(_, _, _) ->
+                if !d.simple then
+                    cx.fault(span, s"only a simple enum converts to an integer — " +
+                             s"${type_show(from)} carries data")
+
+                return true
+            _ -> return false
+        // A pointer to an integer is total: an address *is* a number of `usize`'s width. It goes
+        // only this way; making a pointer out of an integer is `ptr_cast`.
+        Ptr(inner) -> to match
+            Integer(_, _, pw) ->
+                if is_trait(*inner) then
+                    cx.fault(span, "a pointer to a trait is two words — the address and the table " +
+                             "of the type it was erased from — so it is not a number")
+                else if !pw then
+                    cx.fault(span, s"an address is read as 'usize' or 'isize' rather than as " +
+                             s"${type_show(to)} — a fixed width is not an address's width on " +
+                             "every target")
+
+                return true
+            _ -> return false
+        CFn(_, _) -> to match
+            Integer(_, _, pw) ->
+                if !pw then
+                    cx.fault(span, s"an address is read as 'usize' or 'isize' rather than as " +
+                             s"${type_show(to)} — a fixed width is not an address's width on " +
+                             "every target")
+
+                return true
+            _ -> return false
+        _ -> return false
+end converts
+
+// `string(c)` -- one scalar value encoded as the bytes that spell it. It is the one conversion whose
+// result is not a scalar, so it produces fresh bytes rather than a reinterpretation.
+private encode_string(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
+    val from = underlying(texpr_type(t))
+
+    from match
+        Char -> TExpr(span, TStr(t))
+        Str -> cx.err(span, "a 'string' conversion encodes a char, and this value is already a " +
+                      "string")
+        Slice(elem, _) ->
+            if type_eq(*elem, byte_type()) then
+                cx.err(span, "a 'string' conversion encodes a char — bytes are already text or " +
+                       "are not, so 'sysl.text.from_utf8(b)' is what says which")
+            else
+                cx.err(span, s"a 'string' conversion encodes a char, and ${type_show(from)} is " +
+                       "not one — 'str(x)' renders a value as text")
+        _ -> cx.err(span, s"a 'string' conversion encodes a char, and ${type_show(from)} is not " +
+                    "one — 'str(x)' renders a value as text")
+end encode_string
+
+// -- what a declared type's name means in call position -------------------------------------------
+
+// A struct's name in call position is its positional constructor.
+private struct_call(cx: &Analyzer, span: Span, key: string, written: string, args: Buf[Expr],
+                    expected: Option[Type]) -> TExpr
+    val inst = cx.an.tables.struct_insts.get(instance_key(key, buf()))
+
+    if inst.is_none() then
+        return cx.err(span, s"'$written' takes type arguments, and inferring them is not built yet")
+
+    inst.unwrap() match
+        Struct(d) ->
+            if args.len() != d.fields.len() then
+                return cx.err(span, s"struct '$written' has " +
+                              s"${quantity(d.fields.len(), "field")}, but " +
+                              s"${quantity(args.len(), "value")} " +
+                              s"${if args.len() == 1 then "was" else "were"} given")
+
+            var ts: Buf[TExpr] = buf()
+
+            for i in 0..<args.len()
+                val want = d.fields.at(i).1
+                val t = type_expr(cx, args.at(i), Some(want))
+
+                if disagree(texpr_type(t), want) then
+                    cx.fault(args.at(i).span, s"'${d.fields.at(i).0}' of '$written' is " +
+                             s"${type_show(want)}, but ${type_show(texpr_type(t))} was given")
+
+                ts.push(t)
+
+            TExpr(span, TStructNew(d, ts))
+        _ -> bad_expr(span)
+end struct_call
+
+// A simple enum's name in call position is a checked cast from an integer.
+private enum_cast(cx: &Analyzer, span: Span, key: string, written: string,
+                  args: Buf[Expr]) -> TExpr
+    val inst = cx.an.tables.enum_insts.get(instance_key(key, buf()))
+
+    if inst.is_none() then
+        return cx.err(span, s"'$written' takes type arguments, and inferring them is not built yet")
+
+    val en = inst.unwrap()
+
+    en match
+        Enum(d) ->
+            if !d.simple then
+                return cx.err(span, s"only a simple enum is read out of an integer — " +
+                              s"'${module_show(key)}' carries data")
+
+            if args.len() != 1 then
+                return cx.err(span, s"a conversion to '$written' takes one value, and " +
+                              s"${quantity(args.len(), "argument")} " +
+                              s"${if args.len() == 1 then "was" else "were"} given")
+
+            TExpr(span, TEnumFromInt(type_expr(cx, args.at(0), Some(d.underlying)), en))
+        _ -> bad_expr(span)
+end enum_cast
+
+// A constrained subtype's name in call position wraps a base value into the subtype, checking it.
+// Unlike an implicit produce site, the cast is written, so it applies even where the base would not
+// flow in on its own.
+private constrained_call(cx: &Analyzer, span: Span, key: string, written: string,
+                         args: Buf[Expr]) -> TExpr
+    val inst = cx.an.tables.constrained_insts.get(instance_key(key, buf()))
+
+    if inst.is_none() then
+        return cx.err(span, s"'$written' is an alias, and an alias is not something that is called")
+
+    val target = inst.unwrap()
+
+    if args.len() != 1 then
+        return cx.err(span, s"a conversion to '$written' takes one value, and " +
+                      s"${quantity(args.len(), "argument")} " +
+                      s"${if args.len() == 1 then "was" else "were"} given")
+
+    target match
+        Constrained(d) ->
+            val t = type_expr(cx, args.at(0), Some(d.base))
+
+            if disagree(texpr_type(t), d.base) then
+                val converted = convert_to(cx, span, t, d.base, written)
+
+                return TExpr(span, TConstrainedCheck(converted, target))
+
+            TExpr(span, TConstrainedCheck(t, target))
+        _ -> bad_expr(span)
+end constrained_call
+
+// A variant with what it carries.
+private variant_call(cx: &Analyzer, span: Span, en: Type, v: EnumVariant,
+                     args: Buf[Expr]) -> TExpr
+    if args.len() != v.fields.len() then
+        return cx.err(span, s"variant '${v.name}' has ${quantity(v.fields.len(), "field")}, but " +
+                      s"${quantity(args.len(), "value")} " +
+                      s"${if args.len() == 1 then "was" else "were"} given")
+
+    var ts: Buf[TExpr] = buf()
+
+    for i in 0..<args.len()
+        val want = v.fields.at(i).1
+        val t = type_expr(cx, args.at(i), Some(want))
+
+        if disagree(texpr_type(t), want) then
+            cx.fault(args.at(i).span, s"'${v.fields.at(i).0}' of '${v.name}' is " +
+                     s"${type_show(want)}, but ${type_show(texpr_type(t))} was given")
+
+        ts.push(t)
+
+    TExpr(span, TEnumNew(en, v, ts))
+end variant_call
+
+// -- a call of a declared function ----------------------------------------------------------------
+
+// The keys the declarations of one written name are filed under, in the reader's own terms.
+function_keys(cx: &Analyzer, written: string) -> Buf[string]
+    val bound = cx.scope.imports.name_key(written)
+
+    if bound.is_some() then
+        val set = overload_keys(cx.an, bound.unwrap())
+
+        if !set.is_empty() then return set
+
+    val here = module_qualify(cx.scope.module_name, written)
+    val mine = overload_keys(cx.an, here)
+
+    if !mine.is_empty() then return mine
+
+    for i in 0..<cx.scope.imports.wildcards.len()
+        val key = module_qualify(cx.scope.imports.wildcards.at(i), written)
+        val set = overload_keys(cx.an, key)
+
+        if !set.is_empty() && reachable_key(cx.an, set.at(0), cx.scope) then return set
+
+    // A written module path is already a key.
+    val dotted = overload_keys(cx.an, written)
+
+    if !dotted.is_empty() then return dotted
+
+    buf()
+end function_keys
+
+// A call of a function this compilation knows by key.
+//
+// **Which declaration a call means is decided by its arguments**, so a name with more than one
+// declaration is resolved by trying each with everything it says put back, and taking the one that
+// fits. A name with one declaration is read directly, which is what makes its diagnostic name the
+// parameter rather than the set.
+private function_call(cx: &Analyzer, span: Span, written: string, args: Buf[Expr],
+                      expected: Option[Type]) -> TExpr
+    val keys = function_keys(cx, written)
+
+    if keys.is_empty() then
+        val ext = extern_key(cx, written)
+
+        if ext.is_some() then return extern_call(cx, span, written, ext.unwrap(), args)
+
+        return cx.err(span, s"undefined function '$written'")
+
+    if keys.len() == 1 then return call_key(cx, span, written, keys.at(0), args, expected, true)
+
+    var chosen: Option[string] = None
+
+    for i in 0..<keys.len()
+        if chosen.is_none() then
+            val mark = cx.an.complaints()
+            val trial = call_key(cx, span, written, keys.at(i), args, expected, false)
+            val said = cx.an.complaints() > mark
+
+            cx.an.restore_complaints(mark)
+
+            if !said then chosen = Some(keys.at(i))
+
+    if chosen.is_none() then
+        return cx.err(span, s"no '$written' takes these arguments — the declarations of that name " +
+                      s"are:\n${signature_list(cx, keys)}")
+
+    call_key(cx, span, written, chosen.unwrap(), args, expected, true)
+end function_call
+
+// The declarations of one name, as a reader would write them.
+private signature_list(cx: &Analyzer, keys: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<keys.len()
+        val f = cx.an.tables.funcs.get(keys.at(i)).unwrap()
+        var params = ""
+
+        for j in 0..<f.decl.params.len()
+            val p = f.decl.params.at(j)
+
+            if j > 0 then params = params + ", "
+
+            params = params + s"${p.name}: ${type_show(param_type(cx, f, p))}"
+
+        out = out + s"    ${f.decl.name}($params)"
+
+        if i + 1 < keys.len() then out = out + "\n"
+
+    out
+end signature_list
+
+// The type a parameter was declared at, in the terms of the file that declared it.
+param_type(cx: &Analyzer, f: Func, p: Param) -> Type =
+    resolve_type(cx.an, f.scope, p.typ, stand_ins(f.decl.tparams))
+
+// One candidate, with its arguments bound and checked.
+private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: Buf[Expr],
+                 expected: Option[Type], report: bool) -> TExpr
+    val f = cx.an.tables.funcs.get(key).unwrap()
+
+    // A generic call infers its type arguments, which is the stage after this one.
+    if !f.decl.tparams.is_empty() then
+        if report then
+            return cx.err(span, s"'$written' is generic, and inferring a call's type arguments is " +
+                          "not built yet")
+
+        cx.fault(span, "generic")
+        return bad_expr(span)
+
+    val bound = bind_arguments(cx, span, written, f, args, report)
+
+    if bound.is_none() then return bad_expr(span)
+
+    val slots = bound.unwrap()
+    var ts: Buf[TExpr] = buf()
+
+    for i in 0..<slots.len()
+        val p = f.decl.params.at(i)
+        val want = param_type(cx, f, p)
+
+        slots.at(i) match
+            Some(e) ->
+                val t = type_expr(cx, e, Some(want))
+
+                if disagree(texpr_type(t), want) then
+                    cx.fault(e.span, s"'${p.name}' of '$written' is ${type_show(want)}, but " +
+                             s"${type_show(texpr_type(t))} was given")
+
+                ts.push(t)
+            // A parameter's default, spliced in where the argument was not written. It is analyzed
+            // in the declaration's own terms and with nothing local in scope, which is what makes
+            // it mean the same thing from every module that calls the function -- and what makes a
+            // default of `__LINE__` name the caller's line.
+            None ->
+                val inner = analyzer_for(cx.an, f.scope)
+
+                inner.reported = Some(span)
+                ts.push(type_expr(inner, p.default.unwrap(), Some(want)))
+
+    val ret = declared_result(cx, f.scope, f.decl.ret_type)
+
+    TExpr(span, TCall(key, ts, ret, false))
+end call_key
+
+// Which written argument fills which parameter.
+//
+// **A named argument may be written for any parameter, not only one with a default**, and a
+// parameter left unfilled is an error unless it has one.
+private bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, args: Buf[Expr],
+                       report: bool) -> Option[Buf[Option[Expr]]]
+    val params = f.decl.params
+    var slots: Buf[Option[Expr]] = buf()
+
+    for i in 0..<params.len()
+        slots.push(None)
+
+    var next = 0
+    var failed = false
+
+    for i in 0..<args.len()
+        val a = args.at(i)
+
+        *a.kind match
+            NamedArg(name, value) ->
+                val idx = param_index(params, name)
+
+                if idx < 0 then
+                    if report then
+                        cx.fault(a.span, s"function '$written' declares no parameter named " +
+                                 s"'$name' — it takes ${name_list(params)}")
+                    else
+                        cx.fault(a.span, "no such parameter")
+
+                    failed = true
+                else
+                    slots.truncate(usize(idx))
+                    slots.push(Some(value))
+
+                    for j in usize(idx) + 1..<params.len()
+                        slots.push(None)
+            _ ->
+                if next >= int(params.len()) then
+                    failed = true
+                else
+                    val keep = slots.at(usize(next))
+
+                    slots.truncate(usize(next))
+                    slots.push(Some(a))
+
+                    for j in usize(next) + 1..<params.len()
+                        slots.push(None)
+
+                    next = next + 1
+
+    if failed then return None
+
+    var missing = 0
+
+    for i in 0..<params.len()
+        if slots.at(i).is_none() && params.at(i).default.is_none() then missing = missing + 1
+
+    if missing > 0 || args.len() > params.len() then
+        if report then
+            cx.fault(span, s"function '$written' takes ${quantity(params.len(), "argument")}, but " +
+                     s"${quantity(args.len(), "argument")} " +
+                     s"${if args.len() == 1 then "was" else "were"} given")
+        else
+            cx.fault(span, "wrong arity")
+
+        return None
+
+    Some(slots)
+end bind_arguments
+
+private param_index(params: Buf[Param], name: string) -> int
+    for i in 0..<params.len()
+        if params.at(i).name == name then return int(i)
+
+    -1
+end param_index
+
+private name_list(params: Buf[Param]) -> string
+    var out = ""
+
+    for i in 0..<params.len()
+        if i > 0 then
+            out = out + (if i + 1 == params.len() then " and " else ", ")
+
+        out = out + s"'${params.at(i).name}'"
+
+    out
+end name_list
+
+// -- the calls a later stage resolves --------------------------------------------------------------
+
+private extern_key(cx: &Analyzer, written: string) -> Option[string]
+    val bound = cx.scope.imports.name_key(written)
+
+    if bound.is_some() && cx.an.tables.externs.has(bound.unwrap()) then return bound
+
+    val here = module_qualify(cx.scope.module_name, written)
+
+    if cx.an.tables.externs.has(here) then return Some(here)
+
+    var found: Option[string] = None
+
+    for i in 0..<cx.scope.imports.wildcards.len()
+        val key = module_qualify(cx.scope.imports.wildcards.at(i), written)
+
+        if found.is_none() && cx.an.tables.externs.has(key) then found = Some(key)
+
+    found
+end extern_key
+
+// An `extern` is declared rather than defined, so its parameters are read off the declaration and
+// its arguments are checked against them exactly as a function's are.
+private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
+                    args: Buf[Expr]) -> TExpr
+    val d = cx.an.tables.externs.get(key).unwrap()
+    val scope = extern_scope(cx, key)
+    var ts: Buf[TExpr] = buf()
+
+    if !d.variadic && args.len() != d.params.len() then
+        return cx.err(span, s"function '$written' takes ${quantity(d.params.len(), "argument")}, " +
+                      s"but ${quantity(args.len(), "argument")} " +
+                      s"${if args.len() == 1 then "was" else "were"} given")
+
+    for i in 0..<args.len()
+        if i < d.params.len() then
+            val want = resolve_type(cx.an, scope, d.params.at(i).typ, no_bindings())
+            val t = type_expr(cx, args.at(i), Some(want))
+
+            if disagree(texpr_type(t), want) then
+                cx.fault(args.at(i).span, s"'${d.params.at(i).name}' of '$written' is " +
+                         s"${type_show(want)}, but ${type_show(texpr_type(t))} was given")
+
+            ts.push(t)
+        else
+            ts.push(type_expr_bare(cx, args.at(i)))
+
+    val ret = declared_result(cx, scope, d.ret_type)
+
+    TExpr(span, TCall(key, ts, ret, false))
+end extern_call
+
+private extern_scope(cx: &Analyzer, key: string) -> Scope
+    for i in 0..<cx.an.tables.funcs.len()
+        if cx.an.tables.funcs.key_at(i) == key then return cx.an.tables.funcs.at(i).scope
+
+    cx.scope
+end extern_scope
+
+// A local holding something callable, called through it.
+private call_through(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
+                     expected: Option[Type]) -> TExpr
+    val local = cx.lookup(name).unwrap()
+
+    local.ty match
+        CFn(params, ret) ->
+            var ts: Buf[TExpr] = buf()
+
+            for i in 0..<args.len()
+                val want = if i < params.len() then Some(params.at(i)) else None
+
+                ts.push(type_expr(cx, args.at(i), want))
+
+            TExpr(span, TCallPtr(TExpr(span, TLoad(local.unique, local.ty)), ts, params, *ret))
+        _ -> cx.err(span, s"'$name' holds ${type_show(local.ty)}, and calling one through its " +
+                    "trait is not built yet")
+end call_through
+
+// The type a declaration hands back, which is `unit` where nothing was written.
+declared_result(cx: &Analyzer, scope: Scope, written: Option[TypeRef]) -> Type
+    if written.is_none() then return Unit
+
+    resolve_type(cx.an, scope, written.unwrap(), no_bindings())
+end declared_result
+
+// -- `?` -------------------------------------------------------------------------------------------
+
+// `?` -- the failure of a result handed straight back to this function's caller.
+//
+// **The enclosing function's return type must be able to carry the failure**, and the two channels
+// do not cross: an `Option`'s `?` cannot early-return from a `Result`-returning function.
+try_expr(cx: &Analyzer, span: Span, inner: Expr, expected: Option[Type]) -> TExpr
+    val t = type_expr_bare(cx, inner)
+    val ty = texpr_type(t)
+
+    if ty == Unknown then return t
+
+    val parts = fallible_parts(ty)
+
+    if parts.is_none() then
+        return cx.err(span, s"'?' unwraps a ${module_show(option_key())} or a " +
+                      s"${module_show(result_key())}, and ${type_show(ty)} is neither")
+
+    if cx.ret_ty.is_none() then
+        return cx.err(span, s"'?' may only be used in a function returning " +
+                      s"${module_show(base_of(ty))}, not unit")
+
+    val (ok, fail, value) = parts.unwrap()
+    val ret = cx.ret_ty.unwrap()
+
+    if base_of(ret) != base_of(ty) then
+        return cx.err(span, s"'?' may only be used in a function returning " +
+                      s"${module_show(base_of(ty))}, not ${type_show(ret)}")
+
+    val ret_parts = fallible_parts(ret)
+
+    if ret_parts.is_none() then return bad_expr(span)
+
+    val (_, ret_fail, _) = ret_parts.unwrap()
+
+    // Where the two error types differ, `?` converts through `From` -- which is a member table's
+    // to find, so it waits for the stage that builds them.
+    if !type_eq(carried(fail), carried(ret_fail)) then
+        return cx.err(span, s"'?' converts ${type_show(carried(fail))} to " +
+                      s"${type_show(carried(ret_fail))} through 'From', which is looked up through " +
+                      "the member tables and those are not built yet")
+
+    TExpr(span, TTry(t, ok, fail, ret, ret_fail, value, None))
+end try_expr
+
+// The two variants a `Result` or an `Option` is made of, and the type its success carries.
+private fallible_parts(t: Type) -> Option[(EnumVariant, EnumVariant, Type)]
+    repr(t) match
+        Enum(d) ->
+            val base = d.base
+
+            if base != option_key() && base != result_key() then return None
+
+            val some = if base == option_key() then d.variant("Some") else d.variant("Ok")
+            val none = if base == option_key() then d.variant("None") else d.variant("Err")
+
+            if some.is_none() || none.is_none() then return None
+
+            Some((some.unwrap(), none.unwrap(), carried(some.unwrap())))
+        _ -> None
+end fallible_parts
+
+private carried(v: EnumVariant) -> Type =
+    if v.fields.is_empty() then Unit else v.fields.at(0).1
+
+private base_of(t: Type) -> string = repr(t) match
+    Enum(d) -> d.base
+    _ -> ""
+
+private option_key() -> string = module_qualify("sysl", "Option")
+private result_key() -> string = module_qualify("sysl", "Result")

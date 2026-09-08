@@ -1,0 +1,289 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, negate, parse_radix, to_string}
+import sysl.text.parse_real
+
+// The scalar leaves of expression analysis: how a literal takes its type, how operands that must
+// share one reconcile a bare literal with a typed neighbour, explicit conversions, and the result
+// type of an arithmetic or bitwise operator.
+//
+// **Nothing here widens, narrows, or promotes on its own** -- every representation change is
+// written by the programmer.
+
+// The scalar type a context wants, seen through a vector: a position asking for `<4>f32` wants an
+// `f32` out of a bare literal, which is then splatted into every lane.
+//
+// It is the same reading `repr` already performs for a transparent subtype -- the position's type
+// is not what the literal denotes, and both cases exist because a literal has no type of its own to
+// defend.
+scalar_wanted(t: Type) -> Type = repr(t) match
+    Vector(_, lane) -> repr(*lane)
+    other -> other
+
+// The value a written integer literal denotes.
+literal_value(digits: string, base: int) -> BigInt = parse_radix(digits, base).unwrap_or(from_int(0))
+
+// An integer literal takes its type from its suffix, else from the type the context expects, else
+// `int`. The default is never magnitude-dependent: a value too large for the type it landed in is
+// an error asking for a suffix, not a silent widening.
+//
+// **The expected type is consulted through `repr`**, which is the same identity `disagree` uses --
+// a qualifier says how a place is reached and never what is in it, so the value a literal denotes
+// is not `volatile` even where the field it is about to fill is.
+int_literal(cx: &Analyzer, span: Span, value: BigInt, suffix: string,
+            expected: Option[Type]) -> TExpr
+    val ty = if suffix != "" then suffixed_int(cx, span, suffix) else expected_int(cx, expected)
+
+    ty match
+        Integer(bits, signed, _) ->
+            if !fits(value, bits, signed) then
+                return cx.err(span, s"the literal ${to_string(value)} does not fit ${type_show(ty)}")
+        _ -> ()
+
+    TExpr(span, TIntLit(value, ty))
+end int_literal
+
+private suffixed_int(cx: &Analyzer, span: Span, suffix: string) -> Type
+    val named = scalar_type_named(cx, span, suffix)
+
+    named match
+        Some(t) -> t match
+            Integer(_, _, _) -> t
+            _ ->
+                cx.fault(span, s"'$suffix' is not an integer type")
+                Unknown
+        None ->
+            cx.fault(span, s"'$suffix' is not an integer type")
+            Unknown
+end suffixed_int
+
+// The type an unsuffixed integer literal takes from its position.
+//
+// **A type parameter is taken as it stands.** It is opaque, so there is no width to check against
+// and no representation to pick -- but it is still the type the literal has, since what the
+// instantiation makes of `T` is what the literal is read as when the body is lowered.
+private expected_int(cx: &Analyzer, expected: Option[Type]) -> Type
+    if expected.is_none() then return int_type()
+
+    scalar_wanted(expected.unwrap()) match
+        Integer(bits, signed, pw) -> Integer(bits, signed, pw)
+        Abstract(n, bs) -> Abstract(n, bs)
+        _ -> int_type()
+end expected_int
+
+// A float literal takes its type from its suffix, else from the expected type when that is a
+// float, else `real`. An integer literal never becomes a float on its own -- writing `1` where a
+// `real` is wanted is a type error, not a silent conversion.
+float_literal(cx: &Analyzer, span: Span, text: string, suffix: string,
+              expected: Option[Type]) -> TExpr
+    val ty = if suffix != "" then suffixed_float(cx, span, suffix) else expected_float(cx, expected)
+
+    TExpr(span, TFloatLit(double_bits(text), ty))
+end float_literal
+
+private suffixed_float(cx: &Analyzer, span: Span, suffix: string) -> Type
+    val named = scalar_type_named(cx, span, suffix)
+
+    named match
+        Some(t) -> t match
+            Floating(_) -> t
+            _ ->
+                cx.fault(span, s"'$suffix' is not a floating-point type")
+                Unknown
+        None ->
+            cx.fault(span, s"'$suffix' is not a floating-point type")
+            Unknown
+end suffixed_float
+
+private expected_float(cx: &Analyzer, expected: Option[Type]) -> Type
+    if expected.is_none() then return real_type()
+
+    scalar_wanted(expected.unwrap()) match
+        Floating(bits) -> Floating(bits)
+        Abstract(n, bs) -> Abstract(n, bs)
+        _ -> real_type()
+end expected_float
+
+// The bits of a decimal literal's `double` value, which is what the typed tree carries.
+//
+// **The reference compiler holds a float literal as `doubleToLongBits` of the text**, so a narrower
+// type is reached by rounding that constant down to it and costs nothing at run time. There is no
+// such conversion in the standard library, so it is the reinterpretation `ptr_cast` already
+// licenses -- one line in the raw tier rather than a rewrite of the format.
+private double_bits(text: string) -> long
+    var v = parse_real(text).unwrap_or(0.0)
+    val p: *i64 = ptr_cast(&v)
+
+    *p
+end double_bits
+
+// -- which operand a pair takes its type from ----------------------------------------------------
+
+// Whether an expression is a literal with no type of its own. A suffixed numeric literal has
+// already said what it is, so it counts as fixed rather than adaptable.
+is_literal(e: Expr) -> bool = *e.kind match
+    IntLit(_, _, suffix) -> suffix == ""
+    FloatLit(_, suffix) -> suffix == ""
+    NullLit -> true
+    Unary(op, operand) -> op == "-" && is_literal(operand)
+    _ -> false
+
+// Whether an expression is written out of adaptable literals and nothing else -- one of them, or a
+// construction over them, however deeply nested.
+//
+// A string, a character and a suffixed number all stop it, because each of those says what it is.
+literal_shaped(e: Expr) -> bool
+    if is_literal(e) then return true
+
+    *e.kind match
+        NamedArg(_, v) -> literal_shaped(v)
+        Call(_, args) -> !args.is_empty() && all_literal_shaped(args)
+        ArrayLit(elems) -> !elems.is_empty() && all_literal_shaped(elems)
+        ArrayFill(v, _) -> literal_shaped(v)
+        _ -> false
+end literal_shaped
+
+private all_literal_shaped(es: Buf[Expr]) -> bool
+    for i in 0..<es.len()
+        if !literal_shaped(es.at(i)) then return false
+
+    true
+end all_literal_shaped
+
+// Whether an analyzed expression is a **construction**: a value built here out of the parts written
+// beside it, rather than one something else answered with.
+//
+// The distinction is the type's provenance and not the node's kind. A construction's type arguments
+// are read off what it was handed, so literals inside it reach its type; anything else -- a call, a
+// load, a field -- has a type of its own that the literals in the expression cannot have decided.
+constructed(t: TExpr) -> bool = *t.kind match
+    TEnumNew(_, _, _) -> true
+    TStructNew(_, _) -> true
+    TArrayLit(_, _) -> true
+    TArrayFill(_, _) -> true
+    TBufLit(_, _) -> true
+    TBufFill(_, _, _) -> true
+    TVectorLit(_, _) -> true
+    _ -> false
+
+// Whether an argument or operand is **adaptable**: the tier a bare literal is in, widened to the
+// things built out of nothing but bare literals.
+//
+// Both halves are needed. `literal_shaped` reads the *source*, and is what keeps a suffix
+// load-bearing: `Some(3)` and `Some(3int)` analyze to the same node at the same type, so only the
+// spelling says that one of them chose its width. `constructed` reads the analyzed node, and is
+// what separates `Some(3)` from `f(3)`: the two parse identically, and a function's result has
+// nothing to do with the literals handed to it.
+adaptable(e: Expr, t: TExpr) -> bool = is_literal(e) || literal_shaped(e) && constructed(t)
+
+// The type an adaptable literal falls back to, worked out from how it is written rather than by
+// analyzing it.
+literal_default(e: Expr) -> Option[Type] = *e.kind match
+    IntLit(_, _, suffix) -> if suffix == "" then Some(int_type()) else None
+    FloatLit(_, suffix) -> if suffix == "" then Some(real_type()) else None
+    Unary(op, operand) -> if op == "-" then literal_default(operand) else None
+    _ -> None
+
+// -- what an operator answers --------------------------------------------------------------------
+
+// The type a unary operator yields at `a`: a transparent subtype's arithmetic happens at its base
+// and yields the base, while a derived one's happens at itself and yields itself.
+unary_type(a: Type) -> Type = a match
+    Constrained(d) -> if d.derived then a else repr(a)
+    _ -> repr(a)
+
+// What a value has to satisfy to come to have a type, where that type is a constrained subtype that
+// asks anything of its values. A subtype with neither a range nor a predicate asks nothing.
+constraint_of(t: Type) -> Option[Type] = t match
+    Constrained(d) -> if d.lo.is_some() || d.hi.is_some() || d.pred_fn.is_some() then Some(t) else None
+    _ -> None
+
+// An operation whose *result* is a constrained subtype, checked where it is made. Only a derived
+// subtype's own arithmetic produces one -- a transparent subtype computes at its base, so its
+// results are base values and the check waits for the store that gives one the subtype again.
+produced(t: TExpr) -> TExpr = constraint_of(texpr_type(t)) match
+    Some(c) -> TExpr(t.span, TConstrainedCheck(t, c))
+    None -> t
+
+// Widens a value to the one width a renderer takes, leaving one that is already there alone.
+widen(t: TExpr, to: Type) -> TExpr =
+    if type_eq(texpr_type(t), to) then t else TExpr(t.span, TCast(t, to))
+
+// The result type of an arithmetic or bitwise binary operator. Operands must already have the same
+// type -- there is no implicit promotion, so a mixed-width expression is an error asking for a
+// conversion rather than a silent widening.
+//
+// **A shift is the exception.** `a + b` combines two values that have to agree on what they are;
+// `x << n` asks for `x` shifted `n` places, and `n`'s width has nothing to do with `x`'s. So the
+// count may be any integer, the result is the shifted value's own type, and the count is brought to
+// that width by codegen rather than by a conversion the reader has to write.
+arith_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type, rhs: Span) -> Type
+    val ra = repr(a)
+    val shift = (op == "<<" || op == ">>") && is_integer(underlying(a))
+
+    if !shift && !type_eq(ra, repr(b)) then
+        cx.fault(rhs, s"'$op' needs matching types, got ${type_show(a)} and ${type_show(b)}")
+
+        return Unknown
+
+    if shift && !is_integer(underlying(b)) then
+        cx.fault(rhs, s"'$op' shifts by a count, and ${type_show(b)} is not an integer")
+
+        return Unknown
+
+    val result = a match
+        Constrained(d) -> if d.derived && (type_eq(a, b) || shift) then a else ra
+        _ -> ra
+
+    underlying(a) match
+        Integer(_, _, _) -> if integer_op(op) then result else undefined_for(cx, span, op, a)
+        Floating(_) -> if floating_op(op) then result else undefined_for(cx, span, op, a)
+        Str -> if op == "+" then result else undefined_for(cx, span, op, a)
+        Ptr(_) ->
+            if op == "-" then return isize_type(word_bits(cx))
+
+            undefined_for(cx, span, op, a)
+        Vector(_, lane) -> vector_arith(cx, span, op, a, *lane, result)
+        _ -> undefined_for(cx, span, op, a)
+end arith_type
+
+private integer_op(op: string) -> bool =
+    op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "<<" || op == ">>" ||
+        op == "&" || op == "|" || op == "^"
+
+private floating_op(op: string) -> bool = op == "+" || op == "-" || op == "*" || op == "/"
+
+// **A vector's operators are its lane's, applied to every lane.** A mask -- `<N>bool` -- has the
+// bitwise three and nothing else, which is what makes `(a < b) & (c < d)` the way two conditions
+// are combined; `&&` is not among them and cannot be, since it short-circuits and there is no such
+// thing per lane.
+private vector_arith(cx: &Analyzer, span: Span, op: string, a: Type, lane: Type,
+                     result: Type) -> Type
+    underlying(lane) match
+        Integer(_, _, _) ->
+            if op == "/" || op == "%" then
+                cx.fault(span, s"'$op' is not defined on ${type_show(a)} — integer division traps " +
+                         "per lane and a register traps as a whole, so divide the lanes in a loop " +
+                         "over an array")
+
+                return Unknown
+
+            if integer_op(op) then result else undefined_for(cx, span, op, a)
+        Floating(_) -> if floating_op(op) then result else undefined_for(cx, span, op, a)
+        Bool ->
+            if op == "&" || op == "|" || op == "^" then return result
+
+            undefined_for(cx, span, op, a)
+        _ -> undefined_for(cx, span, op, a)
+end vector_arith
+
+private undefined_for(cx: &Analyzer, span: Span, op: string, a: Type) -> Type
+    cx.fault(span, s"operator '$op' is not defined for ${type_show(a)}")
+    Unknown
+end undefined_for
+
+private is_integer(t: Type) -> bool = t match
+    Integer(_, _, _) -> true
+    _ -> false

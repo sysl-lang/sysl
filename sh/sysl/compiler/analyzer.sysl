@@ -1,0 +1,176 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The context an expression is typed in: the declaration tables the whole compilation shares, the
+// file's own terms, and the names in scope where the expression stands.
+//
+// **The tables are 3a's and are read here, never written.** What this adds is everything that is
+// true of one *place* rather than of the program: which locals a reader can name, what `Self` and a
+// type parameter stand for, and which function's `result` and `__FUNCTION__` are being asked about.
+//
+// **There are no exceptions in sysl**, so the reference compiler's `err` -- which throws and is
+// caught by a `recover` -- is written out the way 3a writes it: `fault` records the diagnostic and
+// the caller answers with a node of type `Unknown`, which every rule downstream agrees with so that
+// one mistake is reported once.
+
+// One name a scope binds: what the reader wrote, the unique name the frame holds it under, and
+// what it is.
+//
+// **The two names are separate because a block may rebind one.** A scope gives every binding a name
+// nothing else has, and the typed tree loads through that; the written name is only what a lookup
+// matches.
+struct Local
+    name: string
+    unique: string
+    ty: Type
+end Local
+
+// Everything typing one expression needs.
+struct Analyzer
+    an: &Analysis
+    scope: Scope
+
+    // The names in scope, innermost last, with `marks` holding where each open scope began.
+    locals: Buf[Local]
+    marks: Buf[usize]
+
+    // What a type parameter stands for while a generic body is read.
+    subst: Buf[Binding]
+
+    // The function the expression is written in: what `__FUNCTION__` answers, and what `result`
+    // and a bare `return` mean. Empty and `None` outside any body, which is the honest answer for
+    // a module's own storage.
+    func_name: string
+    ret_ty: Option[Type]
+
+    // Where a built-in that reports its own place says it stands. It is the node's own span
+    // everywhere except while a parameter's default is filled in, where it is the call's.
+    reported: Option[Span]
+
+    // Whether a mistake has already been reported about the expression being read, which is what
+    // keeps a consequence from being reported as a second cause.
+    poisoned: bool
+
+    // Opens a scope.
+    enter(*self)
+        self.marks.push(self.locals.len())
+
+    // Closes the innermost scope, taking its bindings with it.
+    leave(*self)
+        if self.marks.is_empty() then return
+
+        val mark = self.marks.at(self.marks.len() - 1)
+
+        self.marks.truncate(self.marks.len() - 1)
+        self.locals.truncate(mark)
+
+    // Binds a name in the innermost scope, under a unique name of its own.
+    bind(*self, name: string, ty: Type) -> string
+        val unique = self.unique_for(name)
+
+        self.locals.push(Local(name, unique, ty))
+        unique
+    end bind
+
+    // Binds a name under a unique name the caller chose, which is what a parameter needs: a
+    // parameter is loaded by the name its declaration gave it.
+    bind_as(*self, name: string, unique: string, ty: Type)
+        self.locals.push(Local(name, unique, ty))
+
+    // A name nothing else in this body holds.
+    private unique_for(self, name: string) -> string
+        var n = 0
+
+        for i in 0..<self.locals.len()
+            if self.locals.at(i).name == name then n = n + 1
+
+        if n == 0 then name else s"$name.$n"
+    end unique_for
+
+    // The innermost binding of a name, or none.
+    lookup(self, name: string) -> Option[Local]
+        var i = self.locals.len()
+
+        while i > 0
+            i = i - 1
+
+            if self.locals.at(i).name == name then return Some(self.locals.at(i))
+
+        None
+    end lookup
+
+    // Records a mistake about a place.
+    fault(*self, span: Span, message: string)
+        self.an.fault(self.scope, span, message)
+
+    // Records a mistake and answers with the node every rule downstream agrees with.
+    err(*self, span: Span, message: string) -> TExpr
+        self.fault(span, message)
+        self.poisoned = true
+        bad_expr(span)
+    end err
+
+    // Everything said so far, in the order a reader reads it.
+    messages(self) -> Buf[string]
+        var out: Buf[string] = buf()
+        val ds = self.an.diagnostics()
+
+        for i in 0..<ds.len()
+            out.push(ds.at(i).diag.message)
+
+        out
+    end messages
+end Analyzer
+
+// The node a failed reading answers with. Its type is `Unknown`, which `disagree` treats as
+// agreeing with everything so that the consequences of one mistake say nothing more.
+bad_expr(span: Span) -> TExpr = TExpr(span, TZero(Unknown))
+
+// An analyzer over a compilation's tables, reading a file in its own terms.
+analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
+    Analyzer(an, scope, buf(), buf(), buf(), "", None, None, false)
+
+// Whether a value of one type genuinely cannot stand where another was asked for.
+//
+// **A type that could not be worked out agrees with everything**, in either direction: the mistake
+// that produced it has been reported, and a second complaint about what it fails to match is noise
+// about a consequence. A `never` agrees in one direction only -- it may stand anywhere, because
+// control does not reach the place the value would have been used, and nothing may stand for it.
+disagree(got: Type, want: Type) -> bool =
+    !type_eq(repr(got), repr(want)) && got != Unknown && want != Unknown && got != Never
+
+// The one type two alternatives meet at -- the branches of an `if`, the arms of a `match` -- or
+// none where they have none.
+//
+// The only interesting case is `never`: an alternative that does not finish constrains nothing, so
+// it takes the other side's type. Everything else must already agree, since sysl has no subtyping
+// among concrete types to widen towards -- except the two views of one slice, which are one type
+// with a bit and meet at the read-only one.
+join_types(a: Type, b: Type) -> Option[Type]
+    if type_eq(a, b) then return Some(a)
+    if a == Never then return Some(b)
+    if b == Never then return Some(a)
+    if type_eq(repr(a), repr(b)) then return Some(repr(a))
+    if type_eq(const_view(a), const_view(b)) then return Some(const_view(a))
+
+    None
+end join_types
+
+// The scalar a name spells, over both families: the words a program writes plainly (`int`, `byte`,
+// `real`) and the widths written as a letter and digits (`u8`, `i16`, `f32`).
+//
+// **A width whose number is wrong is a diagnostic rather than a fall-through**, which is
+// `width_type`'s rule and the reason the two are asked together here rather than at each site.
+scalar_type_named(cx: &Analyzer, span: Span, name: string) -> Option[Type]
+    val plain = scalar_named(name, word_bits(cx))
+
+    if plain.is_some() then return plain
+
+    width_type(cx.an, cx.scope, span, name)
+end scalar_type_named
+
+// How wide a pointer is on the target this compilation is for, which is what a `usize` and an
+// address-shaped conversion are measured in.
+word_bits(cx: &Analyzer) -> int = int(cx.an.tables.layout.word_bits)

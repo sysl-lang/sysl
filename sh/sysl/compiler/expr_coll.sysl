@@ -1,0 +1,369 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, cmp, from_int, to_string}
+
+// The forms that make a sequence and the forms that read one: an array literal, a repeat, a
+// subscript, a view, and a tuple.
+//
+// **What is being asked for decides which of two things a literal is.** The same `[1, 2, 3]` is an
+// array where an array was wanted, a buffer where a view was, and a vector where a register was --
+// because an array's length is part of its type, a view's is not in its type at all, and a
+// register's is part of the instruction.
+
+// The element type a position wants out of a sequence.
+private element_wanted(t: Type) -> Option[Type] = repr(t) match
+    Array(_, e) -> Some(*e)
+    Slice(e, _) -> Some(*e)
+    Vector(_, e) -> Some(*e)
+    _ -> None
+
+array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type]) -> TExpr
+    val elem_exp = expected.and_then(t -> element_wanted(t))
+    var ts: Buf[TExpr] = buf()
+
+    for i in 0..<elems.len()
+        ts.push(type_expr(cx, elems.at(i), elem_exp))
+
+    for i in 0..<ts.len()
+        val t = texpr_type(ts.at(i))
+
+        if no_value(t) then
+            cx.fault(span, s"an array cannot hold ${type_show(t)} values")
+        else if !type_eq(t, texpr_type(ts.at(0))) then
+            cx.fault(span, s"an array literal needs one element type, got " +
+                     s"${type_show(texpr_type(ts.at(0)))} and ${type_show(t)}")
+
+    val elem_ty = settled_element(ts, elem_exp)
+
+    if elem_ty == Unknown && ts.is_empty() then
+        return cx.err(span, "an empty array literal takes its element type from its context, and " +
+                      "there is none here")
+
+    if expected.is_none() then return TExpr(span, TArrayLit(ts, Array(int(ts.len()), elem_ty)))
+
+    repr(expected.unwrap()) match
+        // The buffer is storage this expression makes, so nobody else can be holding a writable
+        // view of it and it takes whichever form was asked for.
+        Slice(_, read_only) -> TExpr(span, TBufLit(ts, Slice(elem_ty, read_only)))
+        // The lane count is part of the type, so a literal that does not fill it is a mistake with
+        // an exact number in it -- unlike an array, whose length the literal is free to decide.
+        Vector(n, _) ->
+            if int(ts.len()) != n then
+                cx.fault(span, s"${type_show(expected.unwrap())} has $n lanes and this literal has " +
+                         s"${ts.len()} — a vector's width is part of its type, so the two have to " +
+                         "agree")
+
+            TExpr(span, TVectorLit(ts, Vector(n, elem_ty)))
+        _ -> TExpr(span, TArrayLit(ts, Array(int(ts.len()), elem_ty)))
+end array_literal
+
+// `[v; n]` -- the form for an array whose element type has no zero, or has one that is not the
+// wanted starting value. The value is evaluated **once** and copied into every element, which is
+// what makes `[f(); 8]` mean one call rather than eight.
+array_fill(cx: &Analyzer, span: Span, value: Expr, count: Expr, expected: Option[Type]) -> TExpr
+    val elem_exp = expected.and_then(t -> element_wanted(t))
+    val tv = type_expr(cx, value, elem_exp)
+    val vt = texpr_type(tv)
+
+    if no_value(vt) then cx.fault(span, s"an array cannot hold ${type_show(vt)} values")
+
+    if expected.is_some() then
+        repr(expected.unwrap()) match
+            Vector(n, elem) -> return vector_fill(cx, span, tv, count, n, *elem, expected.unwrap())
+            Slice(_, read_only) -> return buffer_fill(cx, span, tv, count, read_only)
+            _ -> ()
+
+    val n = const_int(cx, count)
+
+    if n.is_none() then
+        return cx.err(span, "an array's repeat count must be a constant, since it is the array's " +
+                      "bound — a literal, or a 'const' naming one. A count computed while running " +
+                      "makes storage instead, which is written where a '[]T' is expected")
+
+    if cmp(n.unwrap(), from_int(0)) < 0 then
+        return cx.err(span, s"an array cannot have ${to_string(n.unwrap())} elements")
+
+    TExpr(span, TArrayFill(tv, Array(int(n.unwrap().to_long().unwrap_or(0)), vt)))
+end array_fill
+
+// `[v; n]` where a vector was asked for is the splat written out, accepted because the reader has
+// written the array form of a thing a vector also has. The count is still checked against the lane
+// count, since a vector that does not fill its width is the same mistake as a literal that does not.
+private vector_fill(cx: &Analyzer, span: Span, tv: TExpr, count: Expr, lanes: int, elem: Type,
+                    vec: Type) -> TExpr
+    val n = const_int(cx, count)
+
+    if n.is_none() then
+        cx.fault(span, s"${type_show(vec)} has $lanes lanes, which is part of its type — so a " +
+                 "repeat filling one needs a constant count")
+    else if n.unwrap().to_long().unwrap_or(-1) != long(lanes) then
+        cx.fault(span, s"${type_show(vec)} has $lanes lanes and this repeat makes " +
+                 s"${to_string(n.unwrap())}")
+
+    TExpr(span, TSplat(coerce(cx, tv, elem), vec))
+end vector_fill
+
+// A count is an index's twin, so it takes a transparent subtype for the same reason one does.
+private buffer_fill(cx: &Analyzer, span: Span, tv: TExpr, count: Expr, read_only: bool) -> TExpr
+    val tc = type_expr_bare(cx, count)
+    val ct = texpr_type(tc)
+
+    repr(ct) match
+        Integer(_, _, _) -> ()
+        _ -> if ct != Unknown then
+                 cx.fault(count.span, s"a repeat count is a number of elements, and " +
+                          s"${type_show(ct)} is not an integer")
+
+    TExpr(span, TBufFill(tv, tc, Slice(texpr_type(tv), read_only)))
+end buffer_fill
+
+// The element type a literal settles on: the first element's where there is one, and the one the
+// position asked for where there is not.
+private settled_element(ts: Buf[TExpr], wanted: Option[Type]) -> Type
+    if !ts.is_empty() then return texpr_type(ts.at(0))
+    if wanted.is_some() then return wanted.unwrap()
+
+    Unknown
+end settled_element
+
+// -- reading one ---------------------------------------------------------------------------------
+
+index_expr(cx: &Analyzer, span: Span, receiver: Expr, index: Expr,
+           expected: Option[Type]) -> TExpr
+    *index.kind match
+        RangeExpr(lo, hi, inclusive) ->
+            return slice_expr(cx, span, receiver, lo, hi, inclusive, expected)
+        _ -> ()
+
+    val raw = type_expr_bare(cx, receiver)
+
+    if texpr_type(raw) == Unknown then return raw
+
+    // `p[i]` on a raw pointer is C's, unchecked: the pointer is a bare address, so the subscript is
+    // the address arithmetic C spells the same way. A pointer to an *array* keeps the checked form,
+    // because that one has a length in its type to check against.
+    val tr = texpr_type(raw) match
+        Ptr(inner) -> *inner match
+            Array(_, _) -> auto_deref(cx, raw)
+            _ -> raw
+        _ -> auto_deref(cx, raw)
+
+    repr(texpr_type(tr)) match
+        // A lane is read out of a register rather than through an address, so the index is held to
+        // being a constant and checked here, where there is a number to name.
+        Vector(lanes, elem) -> lane_expr(cx, span, tr, index, lanes, *elem)
+        _ -> index_non_vector(cx, span, tr, index)
+end index_expr
+
+private lane_expr(cx: &Analyzer, span: Span, tr: TExpr, index: Expr, lanes: int,
+                  elem: Type) -> TExpr
+    // The index is analyzed for its *type* even though its value comes from folding, so that `v[k]`
+    // where `k` is a string is told it is not an integer rather than told it is not a constant.
+    val ti = type_expr(cx, index, Some(usize_type(word_bits(cx))))
+
+    repr(texpr_type(ti)) match
+        Integer(_, _, _) -> ()
+        other -> if other != Unknown then
+                     cx.fault(index.span, s"an index must be an integer, not ${type_show(other)}")
+
+    val n = const_int(cx, index)
+
+    if n.is_none() then
+        return cx.err(index.span, "a lane index is part of the instruction that reads it, so it " +
+                      "has to be a constant — a literal, or a 'const' naming one. To index " +
+                      s"${type_show(repr(texpr_type(tr)))} by a computed number, keep the values " +
+                      s"in a '[$lanes]${type_show(elem)}'")
+
+    val v = n.unwrap().to_long().unwrap_or(-1)
+
+    if v < 0 || v >= long(lanes) then
+        return cx.err(index.span, s"${type_show(repr(texpr_type(tr)))} has lanes 0 to " +
+                      s"${lanes - 1}, and this is ${to_string(n.unwrap())}")
+
+    TExpr(span, TLane(tr, int(v), unqualified(elem)))
+end lane_expr
+
+private index_non_vector(cx: &Analyzer, span: Span, tr: TExpr, index: Expr) -> TExpr
+    val elem = element(texpr_type(tr))
+
+    if elem.is_none() then
+        return cx.err(span, s"cannot index ${type_show(texpr_type(tr))}")
+
+    val ti = type_expr(cx, index, Some(usize_type(word_bits(cx))))
+
+    // A transparent constrained subtype stands where its base does, so an `Index within 0..<n`
+    // indexes without a cast. A derived one does not: `new` is nominal, and reaching the base is
+    // exactly what a written conversion is for.
+    repr(texpr_type(ti)) match
+        // The element's qualifier stays on the receiver's type and comes off the value read out of
+        // it, exactly as a field's does.
+        Integer(_, _, _) -> TExpr(span, TIndex(tr, ti, unqualified(elem.unwrap())))
+        other ->
+            if other == Unknown then return bad_expr(span)
+
+            cx.err(index.span, s"an index must be an integer, not ${type_show(other)}")
+end index_non_vector
+
+// A range subscript takes a view. The receiver is left *undereferenced* on purpose: for a heap
+// array the reference is both where the elements are and what keeps them alive, and evaluating it
+// once is what makes those the same object.
+private slice_expr(cx: &Analyzer, span: Span, receiver: Expr, lo: Option[Expr], hi: Option[Expr],
+                   inclusive: bool, expected: Option[Type]) -> TExpr
+    if !inclusive && hi.is_none() then cx.fault(span, "an open-ended slice is written 'a[lo..]'")
+
+    // **An array literal is the one receiver with no type of its own**, so a view of one is the one
+    // place the view's expectation has to reach through to the elements.
+    val hint = elem_hint(receiver, expected)
+    val tr = type_expr(cx, receiver, hint)
+    val rt = texpr_type(tr)
+
+    if rt == Unknown then return tr
+
+    val want_const = expected.is_some() && read_only_view(expected.unwrap())
+    val elem = slice_elem(cx, span, rt, hi)
+
+    if elem.is_none() then return bad_expr(span)
+
+    // Part of a string is a string, not a `[]u8` -- the bytes between two character boundaries are
+    // still well-formed UTF-8, which is what the check at those boundaries is for.
+    val view_ty = view_of(rt, elem.unwrap(), want_const || read_only_view(rt))
+
+    TExpr(span, TSlice(tr, lo.map(b -> slice_bound(cx, b)), hi.map(b -> slice_bound(cx, b)),
+                       inclusive, view_ty))
+end slice_expr
+
+// Part of a string is a string, not a `[]u8` -- the bytes between two character boundaries are
+// still well-formed UTF-8, which is what the check at those boundaries is for.
+private view_of(receiver: Type, elem: Type, read_only: bool) -> Type
+    if receiver == Str then return Str
+
+    Slice(elem, read_only)
+end view_of
+
+private elem_hint(receiver: Expr, expected: Option[Type]) -> Option[Type]
+    if expected.is_none() then return None
+
+    *receiver.kind match
+        ArrayLit(es) -> expected.unwrap() match
+            Slice(elem, _) -> Some(Array(int(es.len()), *elem))
+            _ -> None
+        _ -> None
+end elem_hint
+
+private slice_elem(cx: &Analyzer, span: Span, rt: Type, hi: Option[Expr]) -> Option[Type]
+    rt match
+        Str -> return Some(byte_type())
+        Ref(inner, sync) ->
+            if sync then
+                cx.fault(span, "a slice does not record whether its owner's count is atomic, so a " +
+                         "'&sync' array cannot be sliced")
+
+                return None
+
+            *inner match
+                Array(_, e) -> return Some(*e)
+                _ -> ()
+        Array(_, e) -> return Some(*e)
+        Slice(e, _) -> return Some(*e)
+        // A view of a `*T` region -- the shape every C function that fills a buffer hands back. The
+        // pointer carries no length, so the end must be written and is taken on trust.
+        Ptr(inner) ->
+            *inner match
+                Array(_, e) -> return Some(*e)
+                _ ->
+                    if hi.is_none() then
+                        cx.fault(span, s"a ${type_show(rt)} carries no length, so a view of one " +
+                                 "needs its end written — 'p[0..<n]' with the number of elements " +
+                                 "that are really there")
+
+                        return None
+
+                    return Some(*inner)
+        _ -> ()
+
+    cx.fault(span, s"cannot slice ${type_show(rt)}")
+    None
+end slice_elem
+
+// One end of a slice range: an index like any other, so any integer will do.
+private slice_bound(cx: &Analyzer, e: Expr) -> TExpr
+    val t = type_expr(cx, e, Some(usize_type(word_bits(cx))))
+
+    texpr_type(t) match
+        Integer(_, _, _) -> t
+        other ->
+            if other == Unknown then return t
+
+            cx.err(e.span, s"a slice bound must be an integer, not ${type_show(other)}")
+end slice_bound
+
+// A receiver read through however many pointers and references stand in front of it.
+auto_deref(cx: &Analyzer, t: TExpr) -> TExpr
+    var out = t
+    var steps = 0
+
+    while steps < 8
+        val inner = pointee(texpr_type(out))
+
+        if inner.is_none() then return out
+
+        out = TExpr(out.span, TDeref(out, unqualified(inner.unwrap())))
+        steps = steps + 1
+
+    out
+end auto_deref
+
+// -- the rest of the sequence forms --------------------------------------------------------------
+
+// A tuple is a struct whose base names how many parts it has, exactly as the reference compiler
+// builds one -- so nothing tells a tuple from a struct but its name.
+tuple_expr(cx: &Analyzer, span: Span, elements: Buf[Expr], expected: Option[Type]) -> TExpr
+    var wanted: Buf[Type] = buf()
+
+    if expected.is_some() then
+        repr(expected.unwrap()) match
+            Struct(d) -> if is_tuple(d) then
+                             for i in 0..<d.fields.len()
+                                 wanted.push(d.fields.at(i).1)
+            _ -> ()
+
+    var ts: Buf[TExpr] = buf()
+    var parts: Buf[Type] = buf()
+
+    for i in 0..<elements.len()
+        val want = if i < wanted.len() then Some(wanted.at(i)) else None
+        val t = type_expr(cx, elements.at(i), want)
+
+        ts.push(t)
+        parts.push(texpr_type(t))
+
+    TExpr(span, TStructNew(tuple_type(parts), ts))
+end tuple_expr
+
+// `sizeof(T)` and `alignof(T)` -- a property of the type, known once the type is.
+layout_of(cx: &Analyzer, span: Span, op: string, t: TypeRef, expected: Option[Type]) -> TExpr
+    val ty = resolve_type(cx.an, cx.scope, t, cx.subst)
+    val v = layout_bytes(cx, op, ty)
+
+    if v.is_none() then
+        return cx.err(span, s"'$op' measures a type this compilation has no layout for")
+
+    v.unwrap() match
+        ConstInt(n) -> int_literal(cx, span, n, "", Some(expected.unwrap_or(usize_type(word_bits(cx)))))
+        _ -> bad_expr(span)
+end layout_of
+
+// `offsetof(T, field)` folds for the same reason and under the same deferral.
+offset_of(cx: &Analyzer, span: Span, t: TypeRef, field: string, expected: Option[Type]) -> TExpr
+    val ty = resolve_type(cx.an, cx.scope, t, cx.subst)
+    val v = offset_bytes(cx, ty, field)
+
+    if v.is_none() then
+        return cx.err(span, s"'${type_show(ty)}' has no field '$field' to measure the offset of")
+
+    v.unwrap() match
+        ConstInt(n) -> int_literal(cx, span, n, "", Some(expected.unwrap_or(usize_type(word_bits(cx)))))
+        _ -> bad_expr(span)
+end offset_of
