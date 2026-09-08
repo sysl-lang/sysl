@@ -1,0 +1,409 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int}
+import sysl.math.decimal.Decimal
+
+// What a written type resolves to: the representation the analyzer settles every name against, and
+// the one every later pass reads.
+//
+// **A `Type` is what a program *means* by a type, and `TypeRef` in `ast_types.sysl` is what it
+// *wrote*.** The two are deliberately different trees. `[]const u8` is a `TypeRef` with a name and a
+// qualifier in it; the `Type` it resolves to is a `Slice` of an eight-bit unsigned integer that has
+// forgotten how it was spelled, and two files spelling it differently arrive at the same value.
+//
+// **A named type is a reference, and every use of it is that same reference.** `struct` and `enum`
+// declarations are mutually recursive -- a list's node holds a list -- so the record is registered
+// under its name before its fields are resolved and filled in afterwards. That is why `StructType`
+// and `EnumType` are structs reached through `&`, while everything structural is a variant of the
+// enum: an `Array` of an `int` is built fresh wherever it is written and two of them are the same
+// type because they say the same thing.
+//
+// **Equality follows that split.** A named type is equal to another by its `base` and its type
+// arguments and never by its fields, which is what lets the comparison terminate on a recursive
+// declaration; everything else is compared by what it is made of. `type_eq` is the whole of it, and
+// `impl Eq` hands it to `==`.
+
+// The widest integer this compiler will build. It is LLVM's own limit on `iN`, and a width past it
+// is refused where it is written rather than left to the backend.
+const MaxIntegerBits: int = (1 << 23) - 1
+
+// A trait a type parameter was bounded by: the trait's key and the arguments it was written with.
+struct Bound
+    name: string
+    args: Buf[Type]
+
+    // The spelling a table keys on -- the module-qualified name with its arguments.
+    key(self) -> string = qualified(self.name, self.args)
+
+    // The spelling a diagnostic quotes, which shows a module with dots rather than the separator.
+    show(self) -> string = qualified(module_show(self.name), self.args)
+end Bound
+
+// One variant of an enum: its name, the tag it is stored as, what it carries, and whether it
+// carries anything at all.
+//
+// `carries` is asked rather than derived from `fields`, because a variant may be declared with an
+// empty field list and that is not the same as a variant declared as a name on its own -- one is
+// constructed with `V()` and the other with `V`.
+struct EnumVariant
+    name: string
+    tag: int
+    fields: Buf[(string, Type)]
+    carries: bool
+
+    // The fields that take room. A zero-sized one is dropped, so an index into the values a variant
+    // stores is not the index of the field that named it.
+    stored(self) -> Buf[(string, Type)] = stored_fields(self.fields)
+
+    // Where the `i`th declared field lands among the stored ones.
+    slot(self, i: usize) -> usize = field_slot(self.fields, i)
+end EnumVariant
+
+// A `struct` declaration, as one record shared by every use of it.
+//
+// The fields are filled in after the record is registered, which is what lets a struct hold itself
+// through a pointer. `packed`, `min_align` and `cname` are the three things an attribute may say
+// about its layout and its C name.
+struct StructType
+    base: string
+    targs: Buf[Type]
+    fields: Buf[(string, Type)]
+    packed: bool
+    min_align: Option[usize]
+    cname: Option[string]
+
+    // The name a table keys on and a diagnostic starts from.
+    name(self) -> string = qualified(self.base, self.targs)
+
+    // Where a field sits in the declaration, or -1 where there is no such field.
+    field_index(self, field: string) -> int
+        for i in 0..<self.fields.len()
+            if self.fields.at(i).0 == field then return int(i)
+
+        -1
+    end field_index
+
+    field_type(self, field: string) -> Option[Type]
+        for i in 0..<self.fields.len()
+            if self.fields.at(i).0 == field then return Some(self.fields.at(i).1)
+
+        None
+    end field_type
+
+    stored(self) -> Buf[(string, Type)] = stored_fields(self.fields)
+
+    slot(self, i: usize) -> usize = field_slot(self.fields, i)
+end StructType
+
+// An `enum` declaration, as one record shared by every use of it.
+//
+// `simple` says every variant carries nothing, which is the case that is stored as a bare integer
+// rather than as a tag beside a payload -- and the one an integer may be converted to and from.
+struct EnumType
+    base: string
+    targs: Buf[Type]
+    simple: bool
+    variants: Buf[EnumVariant]
+    underlying: Type
+
+    name(self) -> string = qualified(self.base, self.targs)
+
+    variant(self, v: string) -> Option[EnumVariant]
+        for i in 0..<self.variants.len()
+            if self.variants.at(i).name == v then return Some(self.variants.at(i))
+
+        None
+    end variant
+end EnumType
+
+// A named subtype's declaration, as one record shared by every use of it.
+//
+// **The bootstrap compiler holds this inline in the variant, and it is a record here for one
+// reason**: `==` on an enum whose widest variant has six or more counted fields faults in the
+// compiler this is built by, and seven inline fields is exactly that shape. The record keeps every
+// variant narrow, and `type_eq` compares the seven as the case class it mirrors does.
+struct ConstrainedType
+    name: string
+    base: Type
+    derived: bool
+    lo: Option[Decimal]
+    hi: Option[Decimal]
+    exclusive_hi: bool
+    pred_fn: Option[string]
+end ConstrainedType
+
+// A type.
+enum Type
+    // `int`, `u8`, `usize` -- an integer of a width, signed or not. `pointer_width` marks the two
+    // that are as wide as an address, which is a property of the target rather than of the number
+    // and is what lets a diagnostic call one `usize` instead of `u64`.
+    Integer(bits: int, signed: bool, pointer_width: bool)
+
+    // `real`, `f32` -- a binary floating-point number of a width.
+    Floating(bits: int)
+
+    // `char` -- one Unicode scalar value.
+    Char
+
+    Bool
+
+    // `unit` -- the type with one value, which takes no room.
+    Unit
+
+    // `va_list` -- the C variadic cursor, whose representation is the platform's.
+    VaList
+
+    // `never` -- the type of an expression that does not come back.
+    Never
+
+    // A type nothing has settled yet. It is produced where an error has already been reported, so
+    // that the walk goes on and does not report the same mistake twice.
+    Unknown
+
+    // A type parameter, standing for whatever it is instantiated with, and the bounds written on it.
+    // Two of them are the same parameter when they have the same name, which is what makes a
+    // substitution a lookup.
+    Abstract(name: string, bounds: Buf[Bound])
+
+    // A trait used as a type: `&Display`, or a bound's subject. `assocs` carries the associated
+    // types that were written out.
+    Trait(name: string, args: Buf[Type], assocs: Buf[(string, Type)])
+
+    // `*T` -- a raw pointer, which promises nothing about what it points at.
+    Ptr(inner: &Type)
+
+    // `*extern(int) -> int` -- a pointer to a function under the C convention.
+    CFn(params: Buf[Type], ret: &Type)
+
+    // `volatile T` -- a qualifier on the storage rather than a type of its own: every access
+    // through it reaches the device, and none of them is folded away.
+    Volatile(inner: &Type)
+
+    // `&T`, `&sync T` -- a counted reference. `sync` says the count is atomic.
+    Ref(inner: &Type, sync: bool)
+
+    // `weak T` -- a reference that does not keep its object alive.
+    Weak(inner: &Type)
+
+    // `[N]T` -- a fixed number of elements, stored one after another.
+    Array(length: int, elem: &Type)
+
+    // `<N>T` -- a fixed number of lanes, stored in a register.
+    Vector(length: int, elem: &Type)
+
+    // A value written where a type argument was expected -- `[4]` in `Buf[int, 4]`. It is a type so
+    // that one substitution machinery carries both kinds of argument.
+    ConstArg(value: BigInt, ty: &Type)
+
+    // A run of types standing where one was written, which is what a variadic type parameter binds
+    // to.
+    Pack(elems: Buf[Type])
+
+    // `[]T`, `[]const T` -- a pointer, a length and a capacity over elements somebody else owns.
+    Slice(elem: &Type, read_only: bool)
+
+    // `string` -- a read-only view of bytes that are valid UTF-8.
+    Str
+
+    // A `struct`, at the arguments it was instantiated with.
+    Struct(decl: &StructType)
+
+    // An `enum`, at the arguments it was instantiated with.
+    Enum(decl: &EnumType)
+
+    // The several values a function with a result list returns, held as the tuple they are packed
+    // into. It is distinct from that tuple so that a `return a, b` and a `return (a, b)` are told
+    // apart.
+    Results(parts: &StructType)
+
+    // A named subtype: a base type narrowed by a range, by a predicate, or by nothing at all where
+    // the name is the whole of the distinction.
+    //
+    // `derived` says the name is a type of its own rather than another spelling of its base -- a
+    // `type Metres = int` that may not be added to an `int`.
+    Constrained(decl: &ConstrainedType)
+end Type
+
+// -- the scalars, by name ------------------------------------------------------------------------
+
+// `int` -- the width an integer literal falls to when nothing else settles it.
+int_type() -> Type = Integer(32, true, false)
+
+// `real`.
+real_type() -> Type = Floating(64)
+
+// `byte` -- the element of every slice of bytes.
+byte_type() -> Type = Integer(8, false, false)
+
+// `usize` and `isize` at a target's address width.
+usize_type(word_bits: int) -> Type = Integer(word_bits, false, true)
+isize_type(word_bits: int) -> Type = Integer(word_bits, true, true)
+
+// The scalar a name spells, or nothing where it names something else. The two address-width ones
+// depend on the target, so it is asked with the word size rather than read from a table.
+scalar_named(name: string, word_bits: int) -> Option[Type] = name match
+    "bool" -> Some(Bool)
+    "char" -> Some(Char)
+    "string" -> Some(Str)
+    "unit" -> Some(Unit)
+    "int" -> Some(Integer(32, true, false))
+    "short" -> Some(Integer(16, true, false))
+    "long" -> Some(Integer(64, true, false))
+    "byte" -> Some(Integer(8, false, false))
+    "ushort" -> Some(Integer(16, false, false))
+    "uint" -> Some(Integer(32, false, false))
+    "ulong" -> Some(Integer(64, false, false))
+    "real" -> Some(Floating(64))
+    "va_list" -> Some(VaList)
+    "usize" -> Some(usize_type(word_bits))
+    "isize" -> Some(isize_type(word_bits))
+    _ -> None
+
+// -- fields that take room -----------------------------------------------------------------------
+
+// The fields of an aggregate that are stored, which is every one whose type takes room.
+stored_fields(fields: Buf[(string, Type)]) -> Buf[(string, Type)]
+    var out: Buf[(string, Type)] = buf()
+
+    for i in 0..<fields.len()
+        if !zero_sized(fields.at(i).1) then out.push(fields.at(i))
+
+    out
+end stored_fields
+
+// Where the `i`th declared field lands among the stored ones.
+field_slot(fields: Buf[(string, Type)], i: usize) -> usize
+    var n: usize = 0
+
+    for j in 0..<i
+        if !zero_sized(fields.at(j).1) then n += 1
+
+    n
+end field_slot
+
+// -- equality ------------------------------------------------------------------------------------
+
+// Whether two types are the same type.
+//
+// **A named type is compared by its name and its arguments alone.** Comparing the fields would not
+// terminate on a declaration that mentions itself, and it would also be wrong: two `Node[int]`s are
+// the same type because they came from the same declaration, not because their fields happen to
+// agree today.
+type_eq(a: Type, b: Type) -> bool = a match
+    Integer(ab, asg, apw) -> b match
+        Integer(bb, bsg, bpw) -> ab == bb && asg == bsg && apw == bpw
+        _ -> false
+    Floating(ab) -> b match
+        Floating(bb) -> ab == bb
+        _ -> false
+    Char -> b match
+        Char -> true
+        _ -> false
+    Bool -> b match
+        Bool -> true
+        _ -> false
+    Unit -> b match
+        Unit -> true
+        _ -> false
+    VaList -> b match
+        VaList -> true
+        _ -> false
+    Never -> b match
+        Never -> true
+        _ -> false
+    Unknown -> b match
+        Unknown -> true
+        _ -> false
+    Str -> b match
+        Str -> true
+        _ -> false
+    Abstract(an, _) -> b match
+        Abstract(bn, _) -> an == bn
+        _ -> false
+    Trait(an, aargs, aassocs) -> b match
+        Trait(bn, bargs, bassocs) -> an == bn && types_eq(aargs, bargs) && assocs_eq(aassocs, bassocs)
+        _ -> false
+    Ptr(ai) -> b match
+        Ptr(bi) -> type_eq(*ai, *bi)
+        _ -> false
+    CFn(aps, ar) -> b match
+        CFn(bps, br) -> types_eq(aps, bps) && type_eq(*ar, *br)
+        _ -> false
+    Volatile(ai) -> b match
+        Volatile(bi) -> type_eq(*ai, *bi)
+        _ -> false
+    Ref(ai, async_) -> b match
+        Ref(bi, bsync) -> async_ == bsync && type_eq(*ai, *bi)
+        _ -> false
+    Weak(ai) -> b match
+        Weak(bi) -> type_eq(*ai, *bi)
+        _ -> false
+    Array(an, ae) -> b match
+        Array(bn, be) -> an == bn && type_eq(*ae, *be)
+        _ -> false
+    Vector(an, ae) -> b match
+        Vector(bn, be) -> an == bn && type_eq(*ae, *be)
+        _ -> false
+    ConstArg(av, at) -> b match
+        ConstArg(bv, bt) -> av == bv && type_eq(*at, *bt)
+        _ -> false
+    Pack(aes) -> b match
+        Pack(bes) -> types_eq(aes, bes)
+        _ -> false
+    Slice(ae, aro) -> b match
+        Slice(be, bro) -> aro == bro && type_eq(*ae, *be)
+        _ -> false
+    Struct(ad) -> b match
+        Struct(bd) -> ad.base == bd.base && types_eq(ad.targs, bd.targs)
+        _ -> false
+    Enum(ad) -> b match
+        Enum(bd) -> ad.base == bd.base && types_eq(ad.targs, bd.targs)
+        _ -> false
+    Results(ap) -> b match
+        Results(bp) -> ap.base == bp.base && types_eq(ap.targs, bp.targs)
+        _ -> false
+    Constrained(ad) -> b match
+        Constrained(bd) -> constrained_eq(ad, bd)
+        _ -> false
+
+// Two named subtypes, field for field, as the case class this mirrors compares.
+private constrained_eq(a: &ConstrainedType, b: &ConstrainedType) -> bool =
+    a.name == b.name && a.derived == b.derived && a.exclusive_hi == b.exclusive_hi &&
+        a.pred_fn == b.pred_fn && decimal_opt_eq(a.lo, b.lo) && decimal_opt_eq(a.hi, b.hi) &&
+        type_eq(a.base, b.base)
+
+// A named subtype, built the way the reference compiler's case class is.
+constrained(name: string, base: Type, derived: bool, lo: Option[Decimal], hi: Option[Decimal],
+            exclusive_hi: bool, pred_fn: Option[string]) -> Type =
+    Constrained(ConstrainedType(name, base, derived, lo, hi, exclusive_hi, pred_fn))
+
+// Two lists of types, element for element.
+types_eq(xs: Buf[Type], ys: Buf[Type]) -> bool
+    if xs.len() != ys.len() then return false
+
+    for i in 0..<xs.len()
+        if !type_eq(xs.at(i), ys.at(i)) then return false
+
+    true
+end types_eq
+
+private assocs_eq(xs: Buf[(string, Type)], ys: Buf[(string, Type)]) -> bool
+    if xs.len() != ys.len() then return false
+
+    for i in 0..<xs.len()
+        if xs.at(i).0 != ys.at(i).0 then return false
+        if !type_eq(xs.at(i).1, ys.at(i).1) then return false
+
+    true
+end assocs_eq
+
+private decimal_opt_eq(a: Option[Decimal], b: Option[Decimal]) -> bool = a match
+    Some(x) -> b match
+        Some(y) -> x == y
+        None -> false
+    None -> b.is_none()
+
+
+impl Eq for Type
+    eq(self, rhs: Type) -> bool = type_eq(self, rhs)

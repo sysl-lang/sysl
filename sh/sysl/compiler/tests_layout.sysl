@@ -1,0 +1,225 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.decimal.{from_int}
+
+// How much room a value takes, measured against the reference compiler's `LayoutTests`.
+//
+// **Every measurement here is a number that compiler produces**, not one reasoned from an ABI
+// document: the rules are LLVM's, and the odd widths in particular are only knowable by asking.
+
+private at64() -> TargetLayout = TargetLayout(64)
+private at32() -> TargetLayout = TargetLayout(32)
+
+private u8_type() -> Type = Integer(8, false, false)
+private i64_type() -> Type = Integer(64, true, false)
+
+private a_struct(fields: Buf[(string, Type)]) -> &StructType =
+    StructType("S", buf(), fields, false, None, None)
+
+private two_fields(a: string, at: Type, b: string, bt: Type) -> Buf[(string, Type)]
+    var fs: Buf[(string, Type)] = buf()
+
+    fs.push((a, at))
+    fs.push((b, bt))
+    fs
+end two_fields
+
+@test("a scalar is its own width, aligned to it")
+a_scalar_is_its_own_width()
+    val l = at64()
+
+    assert_eq(l.size(Bool), 1)
+    assert_eq(l.size(u8_type()), 1)
+    assert_eq(l.size(Integer(32, true, false)), 4)
+    assert_eq(l.size(i64_type()), 8)
+    assert_eq(l.size(Floating(32)), 4)
+    assert_eq(l.size(Char), 4)
+    assert_eq(l.align(Bool), 1)
+    assert_eq(l.align(Char), 4)
+    assert_eq(l.align(i64_type()), 8)
+
+@test("an odd width costs what LLVM makes it cost, not its bit count over eight")
+an_odd_width_costs_what_llvm_makes_it_cost()
+    val l = at64()
+
+    assert_eq(l.size(Integer(1, false, false)), 1)
+    assert_eq(l.size(Integer(5, false, false)), 1)
+    assert_eq(l.size(Integer(12, false, false)), 2)
+    assert_eq(l.size(Integer(20, false, false)), 4)
+    assert_eq(l.size(Integer(96, false, false)), 16)
+    assert_eq(l.size(Integer(128, false, false)), 16)
+    assert_eq(l.align(Integer(5, false, false)), 1)
+    assert_eq(l.align(Integer(12, false, false)), 2)
+    assert_eq(l.align(Integer(20, false, false)), 4)
+    assert_eq(l.align(Integer(96, false, false)), 16)
+    assert_eq(l.align(Integer(128, false, false)), 16)
+
+@test("an address is one word, and a view of one is three")
+an_address_is_one_word()
+    val l = at64()
+
+    assert_eq(l.size(Ptr(u8_type())), 8)
+    assert_eq(l.size(Ref(u8_type(), false)), 8)
+    assert_eq(l.size(Slice(u8_type(), false)), 24)
+    assert_eq(l.size(Str), 24)
+
+@test("and an address to a trait is two, since it carries its table")
+an_address_to_a_trait_is_two()
+    val l = at64()
+    val show: Type = Trait("Show", buf(), buf())
+
+    assert_eq(l.size(Ptr(show)), 16)
+    assert_eq(l.align(Ptr(show)), 8)
+
+@test("a zero-sized type occupies nothing")
+a_zero_sized_type_occupies_nothing()
+    val l = at64()
+
+    assert_eq(l.size(Unit), 0)
+    assert_eq(l.align(Unit), 1)
+
+@test("a struct pads each field onto its own alignment")
+a_struct_pads_each_field()
+    val l = at64()
+    val s = a_struct(two_fields("a", u8_type(), "b", i64_type()))
+
+    assert_eq(l.size(Struct(s)), 16)
+    assert_eq(l.align(Struct(s)), 8)
+
+@test("and carries the padding at its end that an array of it needs")
+it_carries_trailing_padding()
+    val l = at64()
+    val s = a_struct(two_fields("a", i64_type(), "b", u8_type()))
+
+    assert_eq(l.size(Struct(s)), 16)
+    assert_eq(l.size(Array(3, Struct(s))), 48)
+
+@test("a field that occupies nothing changes neither")
+a_zero_sized_field_changes_neither()
+    val l = at64()
+    val s = a_struct(two_fields("a", i64_type(), "n", Unit))
+
+    assert_eq(l.size(Struct(s)), 8)
+    assert_eq(l.align(Struct(s)), 8)
+
+@test("an array is its elements end to end")
+an_array_is_its_elements_end_to_end()
+    val l = at64()
+
+    assert_eq(l.size(Array(4, Integer(32, true, false))), 16)
+    assert_eq(l.align(Array(4, Integer(32, true, false))), 4)
+    assert_eq(l.size(Array(0, i64_type())), 0)
+
+@test("a constrained subtype is laid out as the type it constrains")
+a_constrained_subtype_is_laid_out_as_its_base()
+    val l = at64()
+    val within: Type =
+        constrained("TaskId", u8_type(), true, Some(from_int(0)), Some(from_int(200)), true, None)
+
+    assert_eq(l.size(within), 1)
+    assert_eq(l.align(within), 1)
+
+@test("a 32-bit target makes an address, and everything measured in addresses, half the width")
+a_32_bit_target_halves_an_address()
+    val l32 = at32()
+    val l64 = at64()
+
+    assert_eq(l32.size(Ptr(u8_type())), 4)
+    assert_eq(l32.align(Ptr(u8_type())), 4)
+    assert_eq(l32.size(CFn(buf(), Unit)), 4)
+    assert_eq(l32.size(Slice(u8_type(), false)), 12)
+    assert_eq(l64.size(Slice(u8_type(), false)), 24)
+    assert_eq(l32.size(Str), 12)
+    assert_eq(l32.size(VaList), 16)
+    assert_eq(l64.size(VaList), 32)
+
+@test("and leaves every scalar, and every rule about packing, exactly where it was")
+a_32_bit_target_leaves_every_scalar()
+    val l32 = at32()
+    val l64 = at64()
+    var ts: Buf[Type] = buf()
+
+    ts.push(Bool)
+    ts.push(u8_type())
+    ts.push(Char)
+    ts.push(i64_type())
+    ts.push(Integer(32, true, false))
+    ts.push(Floating(32))
+    ts.push(Floating(64))
+    ts.push(Integer(12, false, false))
+    ts.push(Integer(96, true, false))
+
+    for i in 0..<ts.len()
+        val t = ts.at(i)
+
+        assert_eq(l32.size(t), l64.size(t), type_show(t))
+        assert_eq(l32.align(t), l64.align(t), type_show(t))
+
+    var fs: Buf[(string, Type)] = buf()
+
+    fs.push(("a", u8_type()))
+    fs.push(("b", Integer(32, true, false)))
+    fs.push(("c", u8_type()))
+
+    val s = Struct(a_struct(fs))
+
+    assert_eq(l32.size(s), l64.size(s))
+    assert_eq(l32.align(s), l64.align(s))
+
+@test("and puts a pointer field on a four-byte boundary, which changes the struct around it")
+a_32_bit_target_moves_a_pointer_field()
+    val p = Struct(a_struct(two_fields("tag", u8_type(), "at", Ptr(u8_type()))))
+
+    assert_eq(at64().size(p), 16)
+    assert_eq(at64().align(p), 8)
+    assert_eq(at32().size(p), 8)
+    assert_eq(at32().align(p), 4)
+
+@test("an enum with no payload is laid out as the integer it is stored in")
+a_simple_enum_is_its_underlying()
+    val l = at64()
+    val e = EnumType("Color", buf(), true, buf(), Integer(32, true, false))
+
+    assert_eq(l.size(Enum(e)), 4)
+    assert_eq(l.align(Enum(e)), 4)
+
+@test("and one that carries something is a tag beside a region wide enough for the widest variant")
+a_data_enum_is_a_tag_beside_a_payload()
+    val l = at64()
+    var one: Buf[(string, Type)] = buf()
+
+    one.push(("n", Integer(32, true, false)))
+
+    var vs: Buf[EnumVariant] = buf()
+
+    vs.push(EnumVariant("Full", 0, one, true))
+    vs.push(EnumVariant("Empty", 1, buf(), false))
+
+    val e = EnumType("Box", buf(), false, vs, Integer(32, true, false))
+
+    assert_eq(l.payload_size(e), 4)
+    assert_eq(l.payload_align(e), 4)
+    assert_eq(l.size(Enum(e)), 8)
+    assert_eq(l.align(Enum(e)), 4)
+
+@test("a value bigger than the direct limit is handed over by address")
+a_big_value_goes_indirect()
+    val l = at64()
+    val small = Struct(a_struct(two_fields("a", i64_type(), "b", i64_type())))
+    val big = Array(64, i64_type())
+
+    assert(!l.indirect(small))
+    assert(l.indirect(big))
+    assert(!l.indirect(i64_type()))
+
+@test("a field's offset is where the padding before it leaves it")
+a_field_offset_is_where_padding_leaves_it()
+    val l = at64()
+    val s = a_struct(two_fields("a", u8_type(), "b", i64_type()))
+
+    assert_eq(l.field_offset(s, "a").unwrap(), 0)
+    assert_eq(l.field_offset(s, "b").unwrap(), 8)
+    assert(l.field_offset(s, "c").is_none())
+

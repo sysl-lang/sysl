@@ -1,0 +1,78 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// How a declaration's module and its own name are held as one string.
+//
+// **Every table in the analyzer is keyed by one string rather than by a pair**, because a key is
+// compared, hashed and printed in dozens of places and a pair would have to be threaded through all
+// of them. The separator is `$`, which no identifier may contain and which LLVM accepts in a symbol
+// name -- so the key a table uses is also the symbol the object file carries, and there is no second
+// naming scheme to keep in step with the first.
+
+// The character that joins a module to a name.
+const ModuleSep: char = '$'
+
+// The module a file with no `module` clause belongs to. It is the empty string, so a top-level name
+// is its own key and a program of one file has no prefix on anything.
+const ModuleRoot: string = ""
+
+// The key for a name in a module.
+module_qualify(module_name: string, name: string) -> string =
+    if module_name == "" then llvm_guard(name) else s"$module_name${ModuleSep}${llvm_guard(name)}"
+
+// The module a key belongs to, and the bare name inside it.
+module_split(key: string) -> (string, string)
+    val bytes = key.bytes
+
+    for i in 0..<bytes.len
+        if bytes[i] == u8(ModuleSep) then
+            return (from_utf8_unchecked(bytes[0..<i]), from_utf8_unchecked(bytes[i + 1..<bytes.len]))
+
+    (ModuleRoot, key)
+end module_split
+
+// The module half of a key.
+module_of(key: string) -> string = module_split(key).0
+
+// The name half of a key.
+module_bare(key: string) -> string = module_split(key).1
+
+// A key as a person writes it: the separator shown as the dot the source used.
+module_show(key: string) -> string
+    val bytes = key.bytes
+    var out: Buf[u8] = buf()
+
+    for i in 0..<bytes.len
+        out.push(if bytes[i] == u8(ModuleSep) then u8('.') else bytes[i])
+
+    from_utf8_unchecked(out.view())
+end module_show
+
+// A name with nothing in it that LLVM would read as the separator.
+//
+// Only `$` is at risk, since it is the one character an identifier may not hold and a *symbol* may:
+// a name that already carries one came from somewhere other than an identifier, and escaping it
+// keeps `module_split` able to find the real separator.
+llvm_guard(name: string) -> string
+    val bytes = name.bytes
+    var found = false
+
+    for i in 0..<bytes.len
+        if bytes[i] == u8('$') then found = true
+
+    if !found then return name
+
+    var out: Buf[u8] = buf()
+
+    for i in 0..<bytes.len
+        if bytes[i] == u8('$') then
+            out.push(u8('$'))
+            out.push(u8('2'))
+            out.push(u8('4'))
+        else
+            out.push(bytes[i])
+
+    from_utf8_unchecked(out.view())
+end llvm_guard

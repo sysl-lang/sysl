@@ -1,0 +1,304 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+import sysl.math.bigint.BigInt
+
+// What a type is called: to a reader, and to a symbol table.
+//
+// **Two namings, and they are not the same job.** `type_show` is what a diagnostic quotes back --
+// `[]const u8`, `sysl.io.Reader`, `a closure` -- and it is allowed to be friendly, because the
+// reader is being told about something they wrote. `mangle` is what a table and an object file key
+// on; it has to be unique and it has to be spellable in a symbol, so it says `constslice.u8` where
+// the reader is told `[]const u8`.
+//
+// The mirrored wordings are the bootstrap compiler's, because the diagnostics that embed them are.
+
+// A name with its type arguments, as `Name[A, B]`, or the bare name where there are none.
+qualified(base: string, targs: Buf[Type]) -> string
+    if targs.is_empty() then return base
+
+    var b = str_builder()
+
+    b.push(base)
+    b.push("[")
+
+    for i in 0..<targs.len()
+        if i > 0 then b.push(", ")
+
+        b.push(type_show(targs.at(i)))
+
+    b.push("]")
+    b.finish()
+end qualified
+
+// The same, in the spelling a symbol carries: a dot rather than brackets, and each argument mangled.
+mangled(base: string, targs: Buf[Type]) -> string
+    if targs.is_empty() then return base
+
+    var b = str_builder()
+
+    b.push(base)
+
+    for i in 0..<targs.len()
+        b.push(".")
+        b.push(mangle(targs.at(i)))
+
+    b.finish()
+end mangled
+
+// Whether a struct is one of the tuples, which are declared by the compiler rather than written.
+tuple_base(n: usize) -> string = s"${ModuleSep}tuple$n"
+
+// The shape a tuple of `n` is written as in a diagnostic that names an arity.
+tuple_shape(n: usize) -> string
+    var b = str_builder()
+
+    b.push("(")
+
+    for _i in 1..<n
+        b.push(",")
+
+    b.push(")")
+    b.finish()
+end tuple_shape
+
+is_tuple(s: &StructType) -> bool = s.base == tuple_base(s.targs.len())
+
+// Whether a struct is the one a closure literal lowered to. A reader never wrote its name, so a
+// diagnostic never shows it.
+is_closure_literal(t: Type) -> bool = t match
+    Struct(d) -> starts_with(d.base, closure_prefix())
+    _ -> false
+
+// Whether a name begins with a prefix.
+private starts_with(name: string, prefix: string) -> bool =
+    name.bytes.len >= prefix.bytes.len && name[0..<prefix.bytes.len] == prefix
+
+private closure_prefix() -> string = s"${ModuleSep}closure"
+
+// The type as a reader is shown it.
+type_show(t: Type) -> string = t match
+    Results(parts) -> show_list(parts.targs)
+    Struct(d) -> struct_show(d)
+    Enum(d) -> qualified(module_show(d.base), d.targs)
+    Constrained(d) -> module_show(d.name)
+    _ -> friendly_name(t) match
+        Some(name) -> name
+        None -> canonical_name(t)
+
+// A struct as a reader is shown it: a tuple by its parentheses, a closure by what it is rather than
+// by the name the compiler filed it under, and everything else by its name.
+private struct_show(d: &StructType) -> string
+    if is_tuple(d) then return s"(${show_list(d.targs)})"
+    if starts_with(d.base, closure_prefix()) then return "a closure"
+
+    qualified(module_show(d.base), d.targs)
+end struct_show
+
+// The same with the article taken off, for a message that supplies its own.
+show_bare(t: Type) -> string
+    val s = type_show(t)
+
+    if s.bytes.len > 2 && s[0..<2] == "a " then return s[2..<s.bytes.len]
+    if s.bytes.len > 3 && s[0..<3] == "an " then return s[3..<s.bytes.len]
+
+    s
+end show_bare
+
+private show_list(ts: Buf[Type]) -> string
+    var b = str_builder()
+
+    for i in 0..<ts.len()
+        if i > 0 then b.push(", ")
+
+        b.push(type_show(ts.at(i)))
+
+    b.finish()
+end show_list
+
+// The names a program writes for the widths it uses most. They displace the canonical spelling, so
+// an `int` is quoted as `int` and not as `i32`.
+private friendly_name(t: Type) -> Option[string] = t match
+    Integer(32, true, false) -> Some("int")
+    Integer(16, true, false) -> Some("short")
+    Integer(64, true, false) -> Some("long")
+    Integer(8, false, false) -> Some("byte")
+    Integer(16, false, false) -> Some("ushort")
+    Integer(32, false, false) -> Some("uint")
+    Integer(64, false, false) -> Some("ulong")
+    Floating(64) -> Some("real")
+    _ -> None
+
+// What a type is called where no friendlier name displaces it.
+private canonical_name(t: Type) -> string = t match
+    Integer(_, signed, true) -> if signed then "isize" else "usize"
+    Integer(bits, signed, _) -> s"${if signed then "i" else "u"}$bits"
+    Floating(bits) -> s"f$bits"
+    Char -> "char"
+    Bool -> "bool"
+    Str -> "string"
+    Unit -> "unit"
+    VaList -> "va_list"
+    Never -> "never"
+    Unknown -> "?"
+    Ptr(inner) -> s"*${type_show(*inner)}"
+    Ref(inner, sync) -> s"&${if sync then "sync " else ""}${type_show(*inner)}"
+    Weak(inner) -> s"weak ${type_show(*inner)}"
+    CFn(ps, r) -> s"*extern(${show_list(ps)}) -> ${type_show(*r)}"
+    Array(n, elem) -> s"[$n]${type_show(*elem)}"
+    Vector(n, elem) -> s"<$n>${type_show(*elem)}"
+    Slice(elem, ro) -> s"[]${if ro then "const " else ""}${type_show(*elem)}"
+    Volatile(inner) -> s"volatile ${type_show(*inner)}"
+    // A pack member's stand-in is named `A#0` so that two of them are two types, and shown as `A`
+    // because that is the parameter the reader wrote.
+    Abstract(n, _) -> before_hash(n)
+    // A value argument is shown the way it was written rather than the way it travels: a `bool`, a
+    // `char` and an enum variant all reach here as the number that makes their type's identity.
+    ConstArg(v, ty) -> const_arg_text(v, *ty)
+    Pack(es) -> show_list(es)
+    Trait(n, args, assocs) -> trait_text(n, args, assocs)
+    _ -> "?"
+
+private before_hash(n: string) -> string
+    val bytes = n.bytes
+
+    for i in 0..<bytes.len
+        if bytes[i] == u8('#') then return n[0..<i]
+
+    n
+end before_hash
+
+private const_arg_text(v: BigInt, ty: Type) -> string = ty match
+    Bool -> if v.is_zero() then "false" else "true"
+    Char -> s"'${char(u32(v.to_long().unwrap_or(0)))}'"
+    Enum(d) -> enum_tag_text(d, v)
+    _ -> str(v)
+
+private enum_tag_text(d: &EnumType, v: BigInt) -> string
+    val n = v.to_long()
+
+    if n.is_some() then
+        for i in 0..<d.variants.len()
+            if long(d.variants.at(i).tag) == n.unwrap() then return d.variants.at(i).name
+
+    str(v)
+end enum_tag_text
+
+// A trait as a type: an `Fn` written the way a program spells one, and everything else as its name
+// with whatever it was written with.
+private trait_text(n: string, args: Buf[Type], assocs: Buf[(string, Type)]) -> string
+    fn_parts(n, args) match
+        Some(parts) -> return s"Fn(${show_list(parts.0)}) -> ${type_show(parts.1)}"
+        None -> ()
+
+    if assocs.is_empty() then return qualified(module_show(n), args)
+
+    var b = str_builder()
+
+    b.push(module_show(n))
+    b.push("[")
+
+    for i in 0..<args.len()
+        if i > 0 then b.push(", ")
+
+        b.push(type_show(args.at(i)))
+
+    for i in 0..<assocs.len()
+        if i > 0 || !args.is_empty() then b.push(", ")
+
+        b.push(assocs.at(i).0)
+        b.push(" = ")
+        b.push(type_show(assocs.at(i).1))
+
+    b.push("]")
+    b.finish()
+end trait_text
+
+// The greatest number of arguments a callable trait takes.
+const FnMaxArity: usize = 4
+
+// The trait a call of `n` arguments is written against.
+fn_base(n: usize) -> string = s"Fn$n"
+
+// Whether a trait key is one of the callable family.
+fn_is_call(name: string) -> bool
+    val bare = module_bare(name)
+    val bytes = bare.bytes
+
+    if bytes.len < 3 || bytes[0] != u8('F') || bytes[1] != u8('n') then return false
+
+    for i in 2..<bytes.len
+        if bytes[i] < u8('0') || bytes[i] > u8('9') then return false
+
+    true
+end fn_is_call
+
+// The parameters and the result a callable trait's arguments hold: every argument but the last is a
+// parameter, and the last is the result.
+fn_parts(name: string, args: Buf[Type]) -> Option[(Buf[Type], Type)]
+    if !fn_is_call(name) || args.is_empty() then return None
+
+    var ps: Buf[Type] = buf()
+
+    for i in 0..<args.len() - 1
+        ps.push(args.at(i))
+
+    Some((ps, args.at(args.len() - 1)))
+end fn_parts
+
+// -- the spelling a symbol carries ---------------------------------------------------------------
+
+// The type as a symbol names it.
+mangle(t: Type) -> string = t match
+    Struct(d) -> mangled(d.base, d.targs)
+    Enum(d) -> mangled(d.base, d.targs)
+    Ptr(inner) -> s"ptr.${mangle(*inner)}"
+    Ref(inner, sync) -> if sync then s"sync.${mangle(*inner)}" else s"ref.${mangle(*inner)}"
+    Weak(inner) -> s"weak.${mangle(*inner)}"
+    Array(n, elem) -> s"arr$n.${mangle(*elem)}"
+    Vector(n, elem) -> s"vec$n.${mangle(*elem)}"
+    ConstArg(v, _) -> s"c${str(v)}"
+    Pack(es) -> s"pk${es.len()}.${mangle_list(es)}"
+    Slice(elem, ro) -> if ro then s"constslice.${mangle(*elem)}" else s"slice.${mangle(*elem)}"
+    Volatile(inner) -> s"volatile.${mangle(*inner)}"
+    Trait(n, args, _) -> mangled(n, args)
+    CFn(ps, r) -> cfn_mangle(ps, *r)
+    Constrained(d) -> if d.derived then mangled(d.name, buf()) else mangle(d.base)
+    _ -> type_show(t)
+
+private mangle_list(ts: Buf[Type]) -> string
+    var b = str_builder()
+
+    for i in 0..<ts.len()
+        if i > 0 then b.push(".")
+
+        b.push(mangle(ts.at(i)))
+
+    b.finish()
+end mangle_list
+
+private cfn_mangle(ps: Buf[Type], r: Type) -> string
+    var all: Buf[Type] = buf()
+
+    for i in 0..<ps.len()
+        all.push(ps.at(i))
+
+    all.push(r)
+    s"cfn${ps.len()}.${mangle_list(all)}"
+end cfn_mangle
+
+// The spelling a member of a type is filed under. A constrained type is filed under the name it was
+// declared with, since that is what tells it from its base.
+member_symbol(t: Type) -> string = t match
+    Constrained(_) -> type_show(t)
+    _ -> mangle(t)
+
+// The name a slice's owner is filed under: a read-only slice's members are its own.
+slice_const_owner(name: string) -> string =
+    if starts_with(name, "slice.") then s"const$name" else name
+
+// The shapes a diagnostic names when it says what kind of thing was expected.
+const ArrayShape: string = "[N]"
+const SliceShape: string = "[]"
+const PackShape: string = "(..)"

@@ -1,0 +1,291 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, pow, sub, negate, cmp, rem, add, zero}
+
+// The questions asked of a type that are answered by the type alone.
+//
+// **They are here and not on `Type` because they are questions, not structure.** Whether something
+// can be compared, whether it takes room, what its representation is once the qualifiers and the
+// named subtypes are peeled off: each is asked from several passes, so each has one answer.
+
+// Whether an expression of this type has no value to hand back -- `unit`, which has one value and
+// no room to hold it, and `never`, which does not come back at all.
+no_value(t: Type) -> bool = t == Unit || t == Never
+
+// Whether a value of this type takes no room, so that a field of it is not stored.
+zero_sized(t: Type) -> bool = t == Unit
+
+// Whether a type parameter is anywhere inside this type, which is what says a declaration is still
+// generic and cannot be lowered.
+mentions_abstract(t: Type) -> bool = t match
+    Abstract(_, _) -> true
+    Struct(d) -> any_mentions_abstract(d.targs)
+    Enum(d) -> any_mentions_abstract(d.targs)
+    Results(parts) -> any_mentions_abstract(parts.targs)
+    Ptr(inner) -> mentions_abstract(*inner)
+    Ref(inner, _) -> mentions_abstract(*inner)
+    Weak(inner) -> mentions_abstract(*inner)
+    Array(_, elem) -> mentions_abstract(*elem)
+    Vector(_, elem) -> mentions_abstract(*elem)
+    Slice(elem, _) -> mentions_abstract(*elem)
+    Volatile(inner) -> mentions_abstract(*inner)
+    CFn(ps, r) -> any_mentions_abstract(ps) || mentions_abstract(*r)
+    _ -> false
+
+private any_mentions_abstract(ts: Buf[Type]) -> bool
+    for i in 0..<ts.len()
+        if mentions_abstract(ts.at(i)) then return true
+
+    false
+end any_mentions_abstract
+
+// The stand-ins a type mentions, written out so that two instantiations differing only by which
+// parameter they were made from are two instantiations.
+stand_in_tag(t: Type) -> string = t match
+    Abstract(n, bounds) -> s"{$n:${bound_keys(bounds)}}"
+    Struct(d) -> tag_list(d.targs)
+    Enum(d) -> tag_list(d.targs)
+    Results(parts) -> tag_list(parts.targs)
+    Ptr(inner) -> stand_in_tag(*inner)
+    Ref(inner, _) -> stand_in_tag(*inner)
+    Weak(inner) -> stand_in_tag(*inner)
+    Array(_, elem) -> stand_in_tag(*elem)
+    Vector(_, elem) -> stand_in_tag(*elem)
+    Slice(elem, _) -> stand_in_tag(*elem)
+    Volatile(inner) -> stand_in_tag(*inner)
+    CFn(ps, r) -> s"${tag_list(ps)}${stand_in_tag(*r)}"
+    _ -> ""
+
+private bound_keys(bounds: Buf[Bound]) -> string
+    var out = ""
+
+    for i in 0..<bounds.len()
+        if i > 0 then out = s"$out+"
+
+        out = s"$out${bounds.at(i).key()}"
+
+    out
+end bound_keys
+
+private tag_list(ts: Buf[Type]) -> string
+    var out = ""
+
+    for i in 0..<ts.len()
+        out = s"$out${stand_in_tag(ts.at(i))}"
+
+    out
+end tag_list
+
+// The key an instantiation is filed under: what it is called, and which stand-ins it was made from.
+instance_key(base: string, targs: Buf[Type]) -> string = s"${qualified(base, targs)}${tag_list(targs)}"
+
+// Whether anything in this type is still unsettled, which is what says a diagnostic has already been
+// reported about it.
+mentions_unknown(t: Type) -> bool = t match
+    Unknown -> true
+    Struct(d) -> any_mentions_unknown(d.targs)
+    Enum(d) -> any_mentions_unknown(d.targs)
+    Results(parts) -> any_mentions_unknown(parts.targs)
+    Ptr(inner) -> mentions_unknown(*inner)
+    Ref(inner, _) -> mentions_unknown(*inner)
+    Weak(inner) -> mentions_unknown(*inner)
+    Array(_, elem) -> mentions_unknown(*elem)
+    Vector(_, elem) -> mentions_unknown(*elem)
+    Slice(elem, _) -> mentions_unknown(*elem)
+    Volatile(inner) -> mentions_unknown(*inner)
+    CFn(ps, r) -> any_mentions_unknown(ps) || mentions_unknown(*r)
+    _ -> false
+
+private any_mentions_unknown(ts: Buf[Type]) -> bool
+    for i in 0..<ts.len()
+        if mentions_unknown(ts.at(i)) then return true
+
+    false
+end any_mentions_unknown
+
+// -- peeling ---------------------------------------------------------------------------------
+
+// The type with its qualifiers taken off. A qualifier says how storage is reached and never what is
+// in it, so every question about the value is asked of this.
+unqualified(t: Type) -> Type = t match
+    Volatile(inner) -> unqualified(*inner)
+    _ -> t
+
+// Whether a qualifier is anywhere inside, which is what says an aggregate may not be copied whole.
+volatile_in(t: Type) -> bool = t match
+    Volatile(_) -> true
+    Array(_, elem) -> volatile_in(*elem)
+    Struct(d) -> fields_volatile(d.fields)
+    Enum(d) -> variants_volatile(d.variants)
+    Constrained(d) -> volatile_in(d.base)
+    _ -> false
+
+private fields_volatile(fields: Buf[(string, Type)]) -> bool
+    for i in 0..<fields.len()
+        if volatile_in(fields.at(i).1) then return true
+
+    false
+end fields_volatile
+
+private variants_volatile(vs: Buf[EnumVariant]) -> bool
+    for i in 0..<vs.len()
+        if fields_volatile(vs.at(i).fields) then return true
+
+    false
+end variants_volatile
+
+// How a value of this type is *stored*: a named subtype that is only a name is its base, and a
+// qualifier is not part of the representation.
+repr(t: Type) -> Type = t match
+    Constrained(d) -> if d.derived then t else repr(d.base)
+    Volatile(inner) -> repr(*inner)
+    _ -> t
+
+// The whole of the peeling: every named subtype and every qualifier taken off, whether or not the
+// subtype was a type of its own.
+underlying(t: Type) -> Type = t match
+    Constrained(d) -> underlying(d.base)
+    Volatile(inner) -> underlying(*inner)
+    _ -> t
+
+// Whether the type holds anything that carries a count, which is what says a copy is not a copy.
+contains_counted(t: Type) -> bool = t match
+    Ref(_, _) -> true
+    Weak(_) -> true
+    Slice(_, _) -> true
+    Str -> true
+    Array(_, elem) -> contains_counted(*elem)
+    Struct(d) -> fields_counted(d.fields)
+    Enum(d) -> variants_counted(d.variants)
+    _ -> false
+
+private fields_counted(fields: Buf[(string, Type)]) -> bool
+    for i in 0..<fields.len()
+        if contains_counted(fields.at(i).1) then return true
+
+    false
+end fields_counted
+
+private variants_counted(vs: Buf[EnumVariant]) -> bool
+    for i in 0..<vs.len()
+        if fields_counted(vs.at(i).fields) then return true
+
+    false
+end variants_counted
+
+// Whether the type is a view over elements it may not write.
+read_only_view(t: Type) -> bool = t match
+    Slice(_, ro) -> ro
+    Str -> true
+    _ -> false
+
+// Whether the type is a view at all: a slice, or the string that is one over bytes.
+is_view(t: Type) -> bool = t match
+    Slice(_, _) -> true
+    Str -> true
+    _ -> false
+
+// The element a view is over.
+view_elem(t: Type) -> Option[Type] = t match
+    Slice(e, _) -> Some(*e)
+    Str -> Some(byte_type())
+    _ -> None
+
+// The same view, read-only. Anything that is not a writable slice is already itself.
+const_view(t: Type) -> Type = t match
+    Slice(e, ro) -> if ro then t else Slice(e, true)
+    _ -> t
+
+// The element of anything indexable.
+element(t: Type) -> Option[Type] = t match
+    Array(_, e) -> Some(*e)
+    Vector(_, e) -> Some(*e)
+    Slice(e, _) -> Some(*e)
+    Str -> Some(byte_type())
+    Ptr(e) -> Some(*e)
+    _ -> None
+
+// What a pointer or a reference points at, where it points at something a program can name. An
+// erased trait's pointer is a fat one, and there is no single type behind it.
+pointee(t: Type) -> Option[Type]
+    if erased(t) then return None
+
+    t match
+        Ptr(inner) -> Some(*inner)
+        Ref(inner, _) -> Some(*inner)
+        _ -> None
+end pointee
+
+// Whether a pointer or a reference carries a vtable beside its address.
+erased(t: Type) -> bool = erased_trait(t).is_some()
+
+// The trait an erased pointer was made against.
+erased_trait(t: Type) -> Option[Type] = t match
+    Ptr(inner) -> if is_trait(*inner) then Some(*inner) else None
+    Ref(inner, _) -> if is_trait(*inner) then Some(*inner) else None
+    _ -> None
+
+is_trait(t: Type) -> bool = t match
+    Trait(_, _, _) -> true
+    _ -> false
+
+// -- what may be operated on -----------------------------------------------------------------
+
+// Whether arithmetic is defined on the type itself.
+is_numeric(t: Type) -> bool = underlying(t) match
+    Integer(_, _, _) -> true
+    Floating(_) -> true
+    _ -> false
+
+// The type an operator is really applied to: a vector's lane, and otherwise the type itself.
+op_subject(t: Type) -> Type = underlying(t) match
+    Vector(_, lane) -> underlying(*lane)
+    other -> other
+
+// Whether an operator on this type computes rather than dispatches.
+computes_numerically(t: Type) -> bool = is_numeric(op_subject(t))
+
+// Whether `<` is defined on the type without an implementation being written for it.
+is_ordered(t: Type) -> bool
+    val u = underlying(t)
+
+    is_numeric(u) || u == Char || u == Str
+end is_ordered
+
+// Whether `==` is defined on the type without an implementation being written for it.
+is_equatable(t: Type) -> bool
+    if erased(t) then return false
+
+    t match
+        Bool -> true
+        Ptr(_) -> true
+        Ref(_, _) -> true
+        CFn(_, _) -> true
+        Enum(d) -> d.simple
+        _ -> is_ordered(t)
+end is_equatable
+
+// -- the range an integer width holds ----------------------------------------------------------
+
+// The smallest value the width holds.
+min_of(bits: int, signed: bool) -> BigInt =
+    if signed then negate(pow(from_int(2), usize(bits - 1))) else zero()
+
+// The largest value the width holds.
+max_of(bits: int, signed: bool) -> BigInt =
+    sub(pow(from_int(2), usize(if signed then bits - 1 else bits)), from_int(1))
+
+// Whether a value is one the width holds.
+fits(value: BigInt, bits: int, signed: bool) -> bool =
+    cmp(value, min_of(bits, signed)) >= 0 && cmp(value, max_of(bits, signed)) <= 0
+
+// The value the width holds, where the one written does not fit -- what a wrapping conversion
+// produces, which is the two's-complement reading of the low bits.
+wrap(value: BigInt, bits: int, signed: bool) -> BigInt
+    val span = pow(from_int(2), usize(bits))
+    val r = rem(value, span)
+    val low = if cmp(r, zero()) < 0 then add(r, span) else r
+
+    if signed && cmp(low, pow(from_int(2), usize(bits - 1))) >= 0 then sub(low, span) else low
+end wrap

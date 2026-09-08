@@ -1,0 +1,385 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, cmp}
+import sysl.math.decimal.{from_int as decimal_of}
+
+// What a resolved type is: what it is called, what a symbol calls it, when two of them are one, and
+// the questions the passes ask of one.
+//
+// **Every spelling here was read out of the reference compiler**, by handing it a program whose
+// diagnostic quotes the type back -- `'x' of 'f' is []const byte, but int was given` -- rather than
+// composed from the grammar. That is why `[]const u8` is pinned as `[]const byte`.
+
+private types(ts: Buf[Type]) -> Buf[Type] = ts
+
+private one(t: Type) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    out.push(t)
+    out
+end one
+
+private two(a: Type, b: Type) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    out.push(a)
+    out.push(b)
+    out
+end two
+
+private a_struct(base: string, targs: Buf[Type]) -> &StructType =
+    StructType(base, targs, buf(), false, None, None)
+
+// -- what a reader is shown ----------------------------------------------------------------------
+
+@test("a width a program has a word for is shown as that word")
+a_width_with_a_word()
+    assert_eq(type_show(Integer(32, true, false)), "int")
+    assert_eq(type_show(Integer(16, true, false)), "short")
+    assert_eq(type_show(Integer(64, true, false)), "long")
+    assert_eq(type_show(Integer(8, false, false)), "byte")
+    assert_eq(type_show(Integer(16, false, false)), "ushort")
+    assert_eq(type_show(Integer(32, false, false)), "uint")
+    assert_eq(type_show(Integer(64, false, false)), "ulong")
+    assert_eq(type_show(Floating(64)), "real")
+
+@test("and one it has no word for is shown as its width")
+a_width_with_no_word()
+    assert_eq(type_show(Integer(12, false, false)), "u12")
+    assert_eq(type_show(Integer(128, true, false)), "i128")
+    assert_eq(type_show(Integer(1, false, false)), "u1")
+    assert_eq(type_show(Floating(32)), "f32")
+
+@test("an address-width integer is shown by the name that says so, not by its width")
+an_address_width_integer()
+    assert_eq(type_show(usize_type(64)), "usize")
+    assert_eq(type_show(isize_type(64)), "isize")
+    assert_eq(type_show(usize_type(32)), "usize")
+
+@test("the scalars that are not numbers are shown by their own names")
+the_other_scalars()
+    assert_eq(type_show(Bool), "bool")
+    assert_eq(type_show(Char), "char")
+    assert_eq(type_show(Str), "string")
+    assert_eq(type_show(Unit), "unit")
+    assert_eq(type_show(VaList), "va_list")
+    assert_eq(type_show(Never), "never")
+    assert_eq(type_show(Unknown), "?")
+
+@test("a composite is shown the way it is written")
+a_composite_is_shown_as_written()
+    assert_eq(type_show(Ptr(Integer(32, true, false))), "*int")
+    assert_eq(type_show(Ref(Integer(32, true, false), false)), "&int")
+    assert_eq(type_show(Ref(Integer(32, true, false), true)), "&sync int")
+    assert_eq(type_show(Weak(Ref(Integer(32, true, false), false))), "weak &int")
+    assert_eq(type_show(Array(3, Integer(32, true, false))), "[3]int")
+    assert_eq(type_show(Vector(4, Floating(32))), "<4>f32")
+    assert_eq(type_show(Slice(byte_type(), false)), "[]byte")
+    assert_eq(type_show(Slice(byte_type(), true)), "[]const byte")
+    assert_eq(type_show(Volatile(Integer(32, false, false))), "volatile uint")
+    assert_eq(type_show(Ptr(Volatile(Integer(32, false, false)))), "*volatile uint")
+
+@test("a pointer to a C function is shown with the word that says which convention it is under")
+a_c_function_pointer()
+    assert_eq(type_show(CFn(one(Integer(32, true, false)), Unit)), "*extern(int) -> unit")
+    assert_eq(type_show(CFn(buf(), Unit)), "*extern() -> unit")
+
+@test("a tuple is shown as its parentheses, not as the declaration it lowers to")
+a_tuple_is_shown_as_parentheses()
+    val t = Struct(a_struct(tuple_base(2), two(Integer(32, true, false), Str)))
+
+    assert_eq(type_show(t), "(int, string)")
+    assert_eq(tuple_shape(2), "(,)")
+    assert_eq(tuple_shape(3), "(,,)")
+
+@test("a callable trait is shown as the call it stands for")
+a_callable_trait_is_shown_as_a_call()
+    val f = Trait(fn_base(1), two(Integer(32, true, false), Integer(32, true, false)), buf())
+
+    assert_eq(type_show(Ref(f, false)), "&Fn(int) -> int")
+    assert(fn_is_call("Fn1"))
+    assert(fn_is_call(s"sysl${ModuleSep}Fn2"))
+    assert(!fn_is_call("Fnx"))
+    assert(!fn_is_call("Display"))
+
+@test("a named type is shown with its module in dots and its arguments in brackets")
+a_named_type_is_shown_with_its_module()
+    val key = module_qualify("sysl.io", "Reader")
+    val plain = Struct(a_struct(key, buf()))
+    val generic = Struct(a_struct(module_qualify("sysl.buf", "Buf"), one(Integer(32, true, false))))
+
+    assert_eq(type_show(plain), "sysl.io.Reader")
+    assert_eq(type_show(generic), "sysl.buf.Buf[int]")
+
+@test("a named subtype is shown by the name it was declared under")
+a_named_subtype_is_shown_by_its_name()
+    val t = constrained("TaskId", byte_type(), true, Some(decimal_of(0)), Some(decimal_of(200)),
+                        true, None)
+
+    assert_eq(type_show(t), "TaskId")
+
+@test("a stand-in is shown as the parameter that was written, without the pack's bookkeeping")
+a_stand_in_drops_its_bookkeeping()
+    assert_eq(type_show(Abstract("T", buf())), "T")
+    assert_eq(type_show(Abstract("A#0", buf())), "A")
+
+@test("and the article is taken off where a message supplies its own")
+show_bare_drops_the_article()
+    assert_eq(show_bare(Integer(32, true, false)), "int")
+
+// -- what a symbol is called ---------------------------------------------------------------------
+
+@test("a symbol names a type in a spelling a linker will take")
+a_symbol_names_a_type()
+    val u8t = byte_type()
+
+    assert_eq(mangle(Ptr(u8t)), "ptr.byte")
+    assert_eq(mangle(Ref(u8t, false)), "ref.byte")
+    assert_eq(mangle(Ref(u8t, true)), "sync.byte")
+    assert_eq(mangle(Weak(u8t)), "weak.byte")
+    assert_eq(mangle(Array(3, u8t)), "arr3.byte")
+    assert_eq(mangle(Vector(4, u8t)), "vec4.byte")
+    assert_eq(mangle(Slice(u8t, false)), "slice.byte")
+    assert_eq(mangle(Slice(u8t, true)), "constslice.byte")
+    assert_eq(mangle(Volatile(u8t)), "volatile.byte")
+    assert_eq(mangle(Pack(two(u8t, Bool))), "pk2.byte.bool")
+    assert_eq(mangle(CFn(one(u8t), Unit)), "cfn1.byte.unit")
+
+@test("and a named type by its declaration and the arguments this one was made with")
+a_symbol_names_an_instantiation()
+    val key = module_qualify("sysl.buf", "Buf")
+
+    assert_eq(mangle(Struct(a_struct(key, buf()))), key)
+    assert_eq(mangle(Struct(a_struct(key, one(byte_type())))), s"$key.byte")
+    assert_eq(qualified(key, one(byte_type())), s"$key[byte]")
+
+@test("a named subtype is its own symbol only where it is a type of its own")
+a_subtype_is_its_own_symbol_when_derived()
+    val derived = constrained("Metres", Integer(32, true, false), true, None, None, false, None)
+    val alias = constrained("Small", byte_type(), false, None, None, false, None)
+
+    assert_eq(mangle(derived), "Metres")
+    assert_eq(mangle(alias), "byte")
+    assert_eq(member_symbol(derived), "Metres")
+
+@test("a read-only slice's members are filed under a name of their own")
+a_const_slice_owns_its_members()
+    assert_eq(slice_const_owner("slice.byte"), "constslice.byte")
+    assert_eq(slice_const_owner("sysl.buf.Buf"), "sysl.buf.Buf")
+
+// -- keys ----------------------------------------------------------------------------------------
+
+@test("a declaration's key is its module and its name, joined by a character no name may hold")
+a_key_is_a_module_and_a_name()
+    val key = module_qualify("sysl.io", "Reader")
+
+    assert_eq(key, s"sysl.io${ModuleSep}Reader")
+    assert_eq(module_of(key), "sysl.io")
+    assert_eq(module_bare(key), "Reader")
+    assert_eq(module_show(key), "sysl.io.Reader")
+
+@test("and a file with no module clause qualifies nothing")
+the_root_module_qualifies_nothing()
+    assert_eq(module_qualify(ModuleRoot, "main"), "main")
+    assert_eq(module_of("main"), ModuleRoot)
+    assert_eq(module_bare("main"), "main")
+
+@test("a name that already carries the separator has it escaped, so the split still finds the real one")
+a_name_carrying_the_separator_is_escaped()
+    val key = module_qualify("m", s"a${ModuleSep}b")
+
+    assert_eq(module_of(key), "m")
+    assert_eq(module_bare(key), "a$24b")
+    assert_eq(llvm_guard("plain"), "plain")
+
+// -- when two types are one ----------------------------------------------------------------------
+
+@test("a named type is the same type as another by its name and its arguments, never by its fields")
+a_named_type_is_compared_by_its_name()
+    val key = module_qualify("m", "Node")
+    val a = a_struct(key, one(Integer(32, true, false)))
+    val b = a_struct(key, one(Integer(32, true, false)))
+    val c = a_struct(key, one(Str))
+
+    a.fields.push(("next", Ptr(Struct(a))))
+
+    assert(type_eq(Struct(a), Struct(b)))
+    assert(!type_eq(Struct(a), Struct(c)))
+
+@test("a stand-in is the same stand-in by its name alone")
+a_stand_in_is_compared_by_name()
+    var bounds: Buf[Bound] = buf()
+
+    bounds.push(Bound("Display", buf()))
+
+    assert(type_eq(Abstract("T", buf()), Abstract("T", bounds)))
+    assert(!type_eq(Abstract("T", buf()), Abstract("U", buf())))
+
+@test("an integer is the same integer by its width, its sign and whether it is an address")
+an_integer_is_compared_by_all_three()
+    assert(type_eq(Integer(64, false, false), Integer(64, false, false)))
+    assert(!type_eq(Integer(64, false, false), usize_type(64)))
+    assert(!type_eq(Integer(64, false, false), Integer(64, true, false)))
+
+@test("and a composite by what it is made of")
+a_composite_is_compared_by_its_parts()
+    assert(type_eq(Slice(byte_type(), true), Slice(byte_type(), true)))
+    assert(!type_eq(Slice(byte_type(), true), Slice(byte_type(), false)))
+    assert(type_eq(Array(3, Bool), Array(3, Bool)))
+    assert(!type_eq(Array(3, Bool), Array(4, Bool)))
+    assert(types_eq(two(Bool, Char), two(Bool, Char)))
+    assert(!types_eq(two(Bool, Char), one(Bool)))
+
+// -- what the passes ask -------------------------------------------------------------------------
+
+@test("a type that takes no room is not stored, and one that yields nothing is not a value")
+what_takes_no_room()
+    assert(zero_sized(Unit))
+    assert(!zero_sized(Never))
+    assert(no_value(Unit))
+    assert(no_value(Never))
+    assert(!no_value(Bool))
+
+@test("the peeling takes a qualifier off, and a named subtype only where it is not a type of its own")
+the_peeling()
+    val alias = constrained("Small", byte_type(), false, None, None, false, None)
+    val derived = constrained("Metres", Integer(32, true, false), true, None, None, false, None)
+
+    assert(type_eq(unqualified(Volatile(Bool)), Bool))
+    assert(type_eq(repr(alias), byte_type()))
+    assert(type_eq(repr(derived), derived))
+    assert(type_eq(underlying(derived), Integer(32, true, false)))
+    assert(type_eq(underlying(Volatile(alias)), byte_type()))
+
+@test("what may be compared, ordered and computed with")
+what_may_be_operated_on()
+    assert(is_numeric(Integer(8, false, false)))
+    assert(is_numeric(Floating(32)))
+    assert(!is_numeric(Bool))
+    assert(is_ordered(Char))
+    assert(is_ordered(Str))
+    assert(!is_ordered(Bool))
+    assert(is_equatable(Bool))
+    assert(is_equatable(Ptr(Bool)))
+    assert(is_equatable(Str))
+    assert(!is_equatable(Unit))
+    assert(computes_numerically(Vector(4, Floating(32))))
+    assert(type_eq(op_subject(Vector(4, Floating(32))), Floating(32)))
+
+@test("an enum is equatable where every variant carries nothing")
+a_simple_enum_is_equatable()
+    val simple = EnumType("Color", buf(), true, buf(), Integer(32, true, false))
+    val carrying = EnumType("Shape", buf(), false, buf(), Integer(32, true, false))
+
+    assert(is_equatable(Enum(simple)))
+    assert(!is_equatable(Enum(carrying)))
+
+@test("a pointer to a trait carries a table, so it points at nothing a program can name")
+an_erased_pointer_has_no_pointee()
+    val show = Trait("Display", buf(), buf())
+
+    assert(erased(Ptr(show)))
+    assert(erased(Ref(show, false)))
+    assert(!erased(Ptr(Bool)))
+    assert(pointee(Ptr(show)).is_none())
+    assert(type_eq(pointee(Ptr(Bool)).unwrap(), Bool))
+    assert(type_eq(pointee(Ref(Bool, true)).unwrap(), Bool))
+
+@test("what a thing is indexed to, and what a view of it is")
+what_is_indexed_and_viewed()
+    assert(type_eq(element(Array(3, Bool)).unwrap(), Bool))
+    assert(type_eq(element(Vector(4, Bool)).unwrap(), Bool))
+    assert(type_eq(element(Slice(Bool, false)).unwrap(), Bool))
+    assert(type_eq(element(Str).unwrap(), byte_type()))
+    assert(type_eq(element(Ptr(Bool)).unwrap(), Bool))
+    assert(element(Bool).is_none())
+    assert(read_only_view(Str))
+    assert(read_only_view(Slice(Bool, true)))
+    assert(!read_only_view(Slice(Bool, false)))
+    assert(type_eq(const_view(Slice(Bool, false)), Slice(Bool, true)))
+    assert(type_eq(const_view(Bool), Bool))
+
+@test("a type holding anything counted is not copied by copying its bytes")
+what_holds_a_count()
+    assert(contains_counted(Str))
+    assert(contains_counted(Ref(Bool, false)))
+    assert(contains_counted(Array(3, Slice(Bool, false))))
+    assert(!contains_counted(Array(3, Bool)))
+
+@test("a type still mentioning a parameter cannot be lowered, and one mentioning nothing settled is already reported")
+what_is_still_unsettled()
+    assert(mentions_abstract(Ptr(Abstract("T", buf()))))
+    assert(mentions_abstract(Struct(a_struct("m", one(Abstract("T", buf()))))))
+    assert(!mentions_abstract(Ptr(Bool)))
+    assert(mentions_unknown(Slice(Unknown, false)))
+    assert(!mentions_unknown(Slice(Bool, false)))
+
+@test("an instantiation is filed under what it is called and which stand-ins it was made from")
+an_instantiation_is_filed_under_its_stand_ins()
+    val plain = instance_key("m", one(Integer(32, true, false)))
+    val from_param = instance_key("m", one(Abstract("T", buf())))
+
+    assert_eq(plain, "m[int]")
+    assert_eq(from_param, "m[T]{T:}")
+    assert_eq(stand_in_tag(Integer(32, true, false)), "")
+    assert_eq(stand_in_tag(Ptr(Abstract("T", buf()))), "{T:}")
+
+@test("the range a width holds, and what a value that does not fit becomes")
+the_range_a_width_holds()
+    assert_eq(str(min_of(8, false)), "0")
+    assert_eq(str(max_of(8, false)), "255")
+    assert_eq(str(min_of(8, true)), "-128")
+    assert_eq(str(max_of(8, true)), "127")
+    assert_eq(str(max_of(32, true)), "2147483647")
+    assert(fits(from_int(255), 8, false))
+    assert(!fits(from_int(256), 8, false))
+    assert(!fits(from_int(-1), 8, false))
+    assert_eq(str(wrap(from_int(256), 8, false)), "0")
+    assert_eq(str(wrap(from_int(-1), 8, false)), "255")
+    assert_eq(str(wrap(from_int(200), 8, true)), "-56")
+
+@test("a field that takes no room is not stored, and the slots after it move up")
+a_zero_sized_field_moves_the_slots()
+    var fs: Buf[(string, Type)] = buf()
+
+    fs.push(("a", Unit))
+    fs.push(("b", Bool))
+    fs.push(("c", Char))
+
+    val s = StructType("S", buf(), fs, false, None, None)
+
+    assert_eq(s.stored().len(), 2)
+    assert_eq(s.slot(0), 0)
+    assert_eq(s.slot(1), 0)
+    assert_eq(s.slot(2), 1)
+    assert_eq(s.field_index("b"), 1)
+    assert_eq(s.field_index("z"), -1)
+    assert(type_eq(s.field_type("c").unwrap(), Char))
+    assert(s.field_type("z").is_none())
+
+@test("an enum's variants are found by name, and each carries where it says it does")
+an_enums_variants_are_found_by_name()
+    var vs: Buf[EnumVariant] = buf()
+    var one_field: Buf[(string, Type)] = buf()
+
+    one_field.push(("n", Integer(32, true, false)))
+    vs.push(EnumVariant("Full", 0, one_field, true))
+    vs.push(EnumVariant("Empty", 1, buf(), false))
+
+    val e = EnumType("Box", buf(), false, vs, Integer(32, true, false))
+
+    assert_eq(e.variant("Full").unwrap().tag, 0)
+    assert(e.variant("Full").unwrap().carries)
+    assert(!e.variant("Empty").unwrap().carries)
+    assert(e.variant("Half").is_none())
+    assert_eq(e.name(), "Box")
+
+@test("a scalar is looked up by the word a program writes for it")
+a_scalar_is_looked_up_by_its_word()
+    assert(type_eq(scalar_named("int", 64).unwrap(), Integer(32, true, false)))
+    assert(type_eq(scalar_named("usize", 64).unwrap(), usize_type(64)))
+    assert(type_eq(scalar_named("usize", 32).unwrap(), usize_type(32)))
+    assert(type_eq(scalar_named("va_list", 64).unwrap(), VaList))
+    assert(scalar_named("Buf", 64).is_none())

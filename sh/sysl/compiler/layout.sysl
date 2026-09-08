@@ -1,0 +1,293 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// How much room a value takes, and on what boundary it sits.
+//
+// **It is a model of what the backend will do, kept beside the types rather than inside them.** A
+// size depends on the target -- an address is four bytes or eight -- so it is asked of a `Layout`
+// made for one machine, and two of them can be asked side by side, which is what makes a
+// cross-compilation testable without one.
+//
+// **The rules are LLVM's and are mirrored rather than reasoned about.** An odd integer width costs
+// what LLVM makes it cost: `u12` is two bytes aligned to two, `u96` is sixteen aligned to sixteen.
+// A struct pads every field onto its own alignment and then pads its end onto the widest of them, so
+// that an array of it steps by its size.
+
+// A run of bits inside a packed struct's container.
+struct BitRange
+    name: string
+    ty: Type
+    offset: int
+    width: int
+end BitRange
+
+// How wide the bits of a field are, where the field is one that can be packed into a container.
+bitfield_width(t: Type) -> Option[int] = underlying(t) match
+    Integer(bits, _, _) -> Some(bits)
+    Enum(d) -> if d.simple then simple_enum_bits(d) else None
+    _ -> None
+
+private simple_enum_bits(d: &EnumType) -> Option[int] = d.underlying match
+    Integer(bits, _, _) -> Some(bits)
+    _ -> None
+
+// The ranges a packed struct's fields occupy, where it is one whose fields are bit-sized.
+//
+// A `@packed` struct whose every field is a whole number of bytes is laid out end to end and is not
+// a bitfield container; one with a field of an odd width is.
+bitfield_ranges(s: &StructType) -> Option[Buf[BitRange]]
+    if !s.packed then return None
+
+    val fields = s.stored()
+    var any_odd = false
+    var all_known = true
+
+    for i in 0..<fields.len()
+        bitfield_width(fields.at(i).1) match
+            Some(w) -> if w % 8 != 0 then any_odd = true
+            None -> all_known = false
+
+    if !any_odd || !all_known then return None
+
+    var out: Buf[BitRange] = buf()
+    var offset = 0
+
+    for i in 0..<fields.len()
+        val w = bitfield_width(fields.at(i).1).unwrap()
+
+        out.push(BitRange(fields.at(i).0, fields.at(i).1, offset, w))
+        offset += w
+
+    Some(out)
+end bitfield_ranges
+
+// How wide the container holding a run of ranges is, in bits: a whole number of bytes, and never
+// fewer than one.
+bitfield_bits(ranges: Buf[BitRange]) -> int
+    var used = 0
+
+    for i in 0..<ranges.len()
+        used += ranges.at(i).width
+
+    val bytes = (used + 7) / 8 * 8
+
+    if bytes < 8 then 8 else bytes
+end bitfield_bits
+
+// The most bytes a value may be handed to a function in before it goes by address instead.
+const DirectBytes: usize = 128
+
+// The measurements one target makes.
+//
+// **It is `TargetLayout` and not `Layout`, which is the one name in this compiler that its
+// reference does not share**: `sh.sysl.parsing.Layout` is the lexer's indentation state, this module
+// imports that package wholesale, and the two would collide.
+struct TargetLayout
+    word_bits: usize
+
+    pointer_bytes(self) -> usize = self.word_bits / 8
+
+    // A pointer that carries a table beside it.
+    private fat(self) -> usize = self.pointer_bytes() * 2
+
+    // How many bytes a value of the type takes.
+    size(self, t: Type) -> usize = underlying(t) match
+        Bool -> 1
+        Char -> 4
+        Integer(bits, _, _) -> int_alloc(bits)
+        Floating(bits) -> usize(bits / 8)
+        Unit -> 0
+        Never -> 0
+        Unknown -> 0
+        VaList -> self.pointer_bytes() * 4
+        Ptr(_) -> if erased(underlying(t)) then self.fat() else self.pointer_bytes()
+        Ref(_, _) -> if erased(underlying(t)) then self.fat() else self.pointer_bytes()
+        Weak(inner) -> if is_trait(*inner) then self.fat() else self.pointer_bytes()
+        CFn(_, _) -> self.pointer_bytes()
+        Slice(_, _) -> self.pointer_bytes() * 3
+        Str -> self.pointer_bytes() * 3
+        Array(n, elem) -> usize(n) * self.size(*elem)
+        Vector(n, elem) -> self.vector_size(n, *elem)
+        Struct(d) -> self.struct_layout(d).0
+        Enum(d) -> self.enum_size_of(d)
+        _ -> 0
+
+    private vector_size(self, n: int, elem: Type) -> usize =
+        if underlying(elem) == Bool then usize(n + 7) / 8 else usize(n) * self.size(elem)
+
+    private enum_size_of(self, d: &EnumType) -> usize =
+        if d.simple then self.size(d.underlying) else self.enum_size(d)
+
+    // Whether a value of the type is handed to a function by address rather than in registers.
+    indirect(self, t: Type) -> bool = underlying(t) match
+        Struct(_) -> self.size(t) > DirectBytes
+        Array(_, _) -> self.size(t) > DirectBytes
+        Enum(d) -> !d.simple && self.size(t) > DirectBytes
+        _ -> false
+
+    // The boundary a value of the type sits on.
+    align(self, t: Type) -> usize = underlying(t) match
+        Bool -> 1
+        Char -> 4
+        Integer(bits, _, _) -> int_align(bits)
+        Floating(bits) -> usize(bits / 8)
+        Unit -> 1
+        Never -> 1
+        Unknown -> 1
+        VaList -> self.pointer_bytes()
+        Ptr(_) -> self.pointer_bytes()
+        Ref(_, _) -> self.pointer_bytes()
+        Weak(_) -> self.pointer_bytes()
+        CFn(_, _) -> self.pointer_bytes()
+        Slice(_, _) -> self.pointer_bytes()
+        Str -> self.pointer_bytes()
+        Array(_, elem) -> self.align(*elem)
+        Vector(n, elem) -> highest_one_bit(max_usize(self.vector_size(n, *elem) * 2 - 1, 1))
+        Struct(d) -> self.struct_layout(d).1
+        Enum(d) -> self.enum_align_of(d)
+        _ -> 1
+
+    private enum_align_of(self, d: &EnumType) -> usize =
+        if d.simple then self.align(d.underlying) else self.enum_align(d)
+
+    // The size and the alignment a run of members end to end comes to.
+    private aggregate(self, members: Buf[Type]) -> (usize, usize)
+        var offset: usize = 0
+        var widest: usize = 1
+
+        for i in 0..<members.len()
+            val m = members.at(i)
+
+            widest = max_usize(widest, self.align(m))
+            offset = round_up(offset, self.align(m)) + self.size(m)
+
+        (round_up(offset, widest), widest)
+    end aggregate
+
+    private struct_layout(self, s: &StructType) -> (usize, usize)
+        var members: Buf[Type] = buf()
+        val fields = s.stored()
+
+        for i in 0..<fields.len()
+            members.push(fields.at(i).1)
+
+        var bytes: usize = 0
+        var alignment: usize = 0
+
+        bitfield_ranges(s) match
+            Some(ranges) ->
+                bytes = usize(bitfield_bits(ranges) / 8)
+                alignment = 1
+            None ->
+                if s.packed then
+                    var total: usize = 0
+
+                    for i in 0..<members.len()
+                        total += self.size(members.at(i))
+
+                    bytes = max_usize(total, 1)
+                    alignment = 1
+                else
+                    val both = self.aggregate(members)
+
+                    bytes = both.0
+                    alignment = both.1
+
+        s.min_align match
+            Some(n) -> if n > alignment then (max_usize(round_up(bytes, n), n), n) else (bytes, alignment)
+            None -> (bytes, alignment)
+    end struct_layout
+
+    // Where a field begins inside its struct.
+    field_offset(self, s: &StructType, field: string) -> Option[usize]
+        var offset: usize = 0
+        val fields = s.stored()
+
+        for i in 0..<fields.len()
+            val name = fields.at(i).0
+            val ty = fields.at(i).1
+
+            if !s.packed then offset = round_up(offset, self.align(ty))
+
+            if name == field then return Some(offset)
+
+            offset += self.size(ty)
+
+        None
+    end field_offset
+
+    // How much room the widest variant of an enum needs, and on what boundary it sits.
+    payload_size(self, e: &EnumType) -> usize
+        var widest: usize = 0
+
+        for i in 0..<e.variants.len()
+            if e.variants.at(i).carries then
+                widest = max_usize(widest, self.variant_aggregate(e.variants.at(i)).0)
+
+        widest
+    end payload_size
+
+    payload_align(self, e: &EnumType) -> usize
+        var widest: usize = 1
+        var any = false
+
+        for i in 0..<e.variants.len()
+            if e.variants.at(i).carries then
+                any = true
+                widest = max_usize(widest, self.variant_aggregate(e.variants.at(i)).1)
+
+        if any then widest else 1
+    end payload_align
+
+    private variant_aggregate(self, v: EnumVariant) -> (usize, usize)
+        var members: Buf[Type] = buf()
+        val fields = v.stored()
+
+        for i in 0..<fields.len()
+            members.push(fields.at(i).1)
+
+        self.aggregate(members)
+    end variant_aggregate
+
+    private enum_size(self, e: &EnumType) -> usize
+        val a = self.enum_align(e)
+
+        round_up(round_up(4, self.payload_align(e)) + self.payload_size(e), a)
+    end enum_size
+
+    private enum_align(self, e: &EnumType) -> usize = max_usize(4, self.payload_align(e))
+end TargetLayout
+
+// The layout a target measures with.
+layout_for(t: Target) -> TargetLayout = TargetLayout(t.pointer_bits())
+
+// An integer's alignment: the next power of two at or above its byte count, capped at sixteen.
+int_align(bits: int) -> usize
+    var a: usize = 1
+
+    while a < 16 && a * 8 < usize(bits)
+        a *= 2
+
+    a
+end int_align
+
+// The room an integer takes: its bytes rounded up onto its own alignment.
+int_alloc(bits: int) -> usize = round_up(usize(bits + 7) / 8, int_align(bits))
+
+// The next multiple of `to` at or above `n`.
+round_up(n: usize, to: usize) -> usize = (n + to - 1) / to * to
+
+private max_usize(a: usize, b: usize) -> usize = if a > b then a else b
+
+// The highest power of two at or below `n`.
+private highest_one_bit(n: usize) -> usize
+    if n == 0 then return 0
+
+    var bit: usize = 1
+
+    while bit <= n / 2
+        bit *= 2
+
+    bit
+end highest_one_bit
