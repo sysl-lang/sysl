@@ -194,6 +194,12 @@ struct Tables
     impls: Buf[Impl]
 
     // Every instantiation the resolution made, so that one `Node[int]` is one type.
+    //
+    // **A record joins the table once its fields are resolved**, so the walk over it reads a type
+    // after everything it is made of -- which is the order a layout can be worked out in, and the
+    // order the reference records. What holds the recursion open in the meantime is `in_progress`:
+    // a declaration that mentions itself finds the record there and does not recurse for ever.
+    in_progress: &Table[Type]
     struct_insts: &Table[Type]
     enum_insts: &Table[Type]
     constrained_insts: &Table[Type]
@@ -207,6 +213,10 @@ struct Tables
     // property of the FILE and a key alone does not say which file wrote it.
     test_only: Buf[string]
     test_only_files: Buf[string]
+
+    // Which modules each module reached, in the order each edge was first made. It is what an
+    // unused-import warning is read out of, and what the acyclicity of the module graph is asked of.
+    module_deps: Buf[(string, Buf[string])]
 
     // The keys in `vals` a program may write to, which is what a `var` declares and a `val` does
     // not. Held beside the table rather than on the declaration, because the two forms are one
@@ -237,8 +247,8 @@ end Tables
 // Empty tables for one target.
 tables_for(t: Target) -> &Tables =
     Tables(t, layout_for(t), buf(), table(), table(), table(), table(), table(), table(), table(),
-           table(), table(), table(), buf(), table(), table(), table(), table(), buf(), buf(), buf(),
-           member_tables())
+           table(), table(), table(), buf(), table(), table(), table(), table(), table(), buf(),
+           buf(), buf(), buf(), member_tables())
 
 // The names a compilation has produced, held behind a reference so that the undo log can put a
 // trial's back.

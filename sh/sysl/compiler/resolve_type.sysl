@@ -92,7 +92,7 @@ end resolve_array
 private resolve_tuple(a: &Analysis, scope: Scope, parts: Buf[TypeRef], results: bool,
                       subst: Buf[Binding]) -> Type
     val ts = resolve_list(a, scope, parts, subst)
-    val d = tuple_type(ts)
+    val d = registered_tuple(a, ts)
 
     if results then Results(d) else Struct(d)
 end resolve_tuple
@@ -106,6 +106,26 @@ tuple_type(ts: Buf[Type]) -> &StructType
 
     StructType(tuple_base(ts.len()), ts, fields, false, None, None)
 end tuple_type
+
+// The same, recorded -- so that one `(string, string)` is one type wherever it is written, and so
+// that a compilation's list of what it laid out holds the tuples as well as the declared records.
+//
+// **After the parts, like every other record**, since a tuple is a struct the compiler declared and
+// what it is made of is laid out before it is.
+registered_tuple(a: &Analysis, ts: Buf[Type]) -> &StructType
+    val made = tuple_type(ts)
+    val key = instance_key(made.base, ts)
+    val already = a.tables.struct_insts.get(key)
+
+    if already.is_some()
+        already.unwrap() match
+            Struct(d) -> return d
+            _ -> ()
+    end if
+
+    a.tables.struct_insts.put(key, Struct(made))
+    made
+end registered_tuple
 
 // A written `Fn(a, b) -> r` is the callable trait of that arity, its arguments the parameters with
 // the result last.
@@ -304,6 +324,17 @@ end without_leading_zeros
 // **The order is the reader's**: what they wrote themselves, what they imported by name, what their
 // own module declares, and only then what a wildcard brought in.
 lookup_type_key(a: &Analysis, scope: Scope, name: string) -> Option[string]
+    val found = type_key_of(a, scope, name)
+
+    // **Resolution is where a dependency between two modules is MADE**, so it is where one is
+    // recorded: nothing earlier could see it, since which module an unqualified name reaches is the
+    // whole question this answered.
+    if found.is_some() then depends_on(a, scope.module_name, found.unwrap())
+
+    found
+end lookup_type_key
+
+private type_key_of(a: &Analysis, scope: Scope, name: string) -> Option[string]
     val dotted = last_dot(name)
 
     if dotted.is_some() then return lookup_qualified(a, scope, name, dotted.unwrap())
@@ -329,7 +360,7 @@ lookup_type_key(a: &Analysis, scope: Scope, name: string) -> Option[string]
     if found.is_none() && a.tables.types.has(here) then return Some(here)
 
     found
-end lookup_type_key
+end type_key_of
 
 // A name written with a dot in it: either a module path and a name, or a bound module alias and a
 // name.
@@ -469,10 +500,14 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
 
     if already.is_some() then return already.unwrap()
 
+    val open = a.tables.in_progress.get(inst)
+
+    if open.is_some() then return open.unwrap()
+
     val made: &StructType = StructType(key, targs, buf(), d.packed, None, None)
     val ty = Struct(made)
 
-    a.tables.struct_insts.put(inst, ty)
+    a.tables.in_progress.put(inst, ty)
 
     val subst = bindings_for(d.tparams, targs)
 
@@ -481,6 +516,8 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
 
         made.fields.push((f.name, resolve_type(a, home, f.typ, subst)))
 
+    a.tables.in_progress.remove(inst)
+    a.tables.struct_insts.put(inst, ty)
     ty
 end instantiate_struct
 
@@ -496,6 +533,10 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
 
     if already.is_some() then return already.unwrap()
 
+    val open = a.tables.in_progress.get(inst)
+
+    if open.is_some() then return open.unwrap()
+
     var simple = true
 
     for i in 0..<d.variants.len()
@@ -508,7 +549,7 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
     val made: &EnumType = EnumType(key, targs, simple, buf(), underlying)
     val ty = Enum(made)
 
-    a.tables.enum_insts.put(inst, ty)
+    a.tables.in_progress.put(inst, ty)
 
     val subst = bindings_for(d.tparams, targs)
 
@@ -521,6 +562,8 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
 
         made.variants.push(EnumVariant(v.name, int(i), fields, !v.fields.is_empty()))
 
+    a.tables.in_progress.remove(inst)
+    a.tables.enum_insts.put(inst, ty)
     ty
 end instantiate_enum
 

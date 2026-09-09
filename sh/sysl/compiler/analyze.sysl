@@ -86,10 +86,22 @@ private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
     if !a.tables.has_module(path) then
         // A path with no braces after it may name one declaration rather than a module, which is
         // what `import sysl.text.Ascii` does.
-        if d.selectors.is_empty() && !d.wildcard && names_a_declaration(a, path) then return
+        if d.selectors.is_empty() && !d.wildcard && names_a_declaration(a, path)
+            // The path is a module and a name in it, so the edge is to the module half.
+            val cut = last_dot_in(path)
+
+            if cut.is_some() then depends_on_module(a, scope.module_name, path[0..<cut.unwrap()])
+
+            return
+        end if
 
         a.fault(scope, span, s"no module is called '$path'")
         return
+
+    // **An import IS a dependency**, whether or not anything below it names what was brought in: a
+    // file that writes the clause has said its module reaches the other one, and the graph is what
+    // that statement is held to.
+    depends_on_module(a, scope.module_name, path)
 
     for i in 0..<d.selectors.len()
         val s = d.selectors.at(i)
@@ -108,6 +120,37 @@ private names_a_declaration(a: &Analysis, path: string) -> bool
 
     a.tables.has_module(here) && declares(a, module_qualify(here, path[cut.unwrap() + 1..<path.bytes.len]))
 end names_a_declaration
+
+// Records that a module reached into another, which is what resolving a name to a key *makes*.
+//
+// **A module does not depend on itself, and nothing depends on the ROOT module**: the library lives
+// there and is the language rather than a module, and a program's own root-module declarations are
+// its files' alone. So the root only ever depends, and is never depended on. A path that names no
+// module this compilation has files for is not an edge either -- an import may be written for one
+// that does not exist, and the diagnostic for that says so far better than a graph could.
+depends_on(a: &Analysis, from: string, key: string) = depends_on_module(a, from, module_of(key))
+
+// The same, where the module is already known rather than read off a key.
+depends_on_module(a: &Analysis, from: string, to: string)
+
+    if to == from || to == ModuleRoot || from == "" || !a.tables.has_module(to) then return
+
+    for i in 0..<a.tables.module_deps.len()
+        if a.tables.module_deps.at(i).0 == from
+            val reached = a.tables.module_deps.at(i).1
+
+            if holds_string(reached, to) then return
+
+            var grown = reached
+
+            grown.push(to)
+            a.tables.module_deps.set(i, (from, grown))
+            return
+
+    var first: Buf[string] = buf()
+
+    first.push(to)
+    a.tables.module_deps.push((from, first))
 
 // Whether this compilation has any declaration under a key, of any kind.
 declares(a: &Analysis, key: string) -> bool =
@@ -133,8 +176,21 @@ private is_variant_name(a: &Analysis, key: string) -> bool
     false
 end is_variant_name
 
-// Every non-generic struct and enum, built.
+// Every non-generic enum, then every non-generic struct.
+//
+// **The two are separate passes and the order is part of the answer**: what a compilation records is
+// the order its types were made real in, and that order is what a back end lays them out in.
 private eagerly_instantiate(a: &Analysis)
+    for i in 0..<a.tables.types.len()
+        val key = a.tables.types.key_at(i)
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            EnumOf(d) ->
+                if d.tparams.is_empty() then
+                    instantiate_enum(a, decl.scope, decl.span, d.name, key, d, decl.scope, buf())
+            _ -> ()
+
     for i in 0..<a.tables.types.len()
         val key = a.tables.types.key_at(i)
         val decl = a.tables.types.at(i)
@@ -143,9 +199,6 @@ private eagerly_instantiate(a: &Analysis)
             StructOf(d) ->
                 if d.tparams.is_empty() then
                     instantiate_struct(a, decl.scope, decl.span, d.name, key, d, decl.scope, buf())
-            EnumOf(d) ->
-                if d.tparams.is_empty() then
-                    instantiate_enum(a, decl.scope, decl.span, d.name, key, d, decl.scope, buf())
             _ -> ()
 
 // Every named subtype, resolved.
