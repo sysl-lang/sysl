@@ -585,6 +585,10 @@ for_expr(cx: &Analyzer, span: Span, label: Option[string], name: string, iter: E
     end if
 
     val seq = auto_deref(cx, type_expr_bare(cx, iter))
+    val cursor = iterated(cx, span, seq, name, body, expected, label, else_body, discarded)
+
+    if cursor.is_some() then return cursor.unwrap()
+
     val elem = walked_element(cx, span, texpr_type(seq), name)
 
     if elem.is_none() then return bad_expr(span)
@@ -604,10 +608,84 @@ for_expr(cx: &Analyzer, span: Span, label: Option[string], name: string, iter: E
     checked_loop(ctx, span, TExpr(span, TForEach(u, elem.unwrap(), seq, tb, telse, ty)))
 end for_expr
 
-// What one turn of a `for` binds, or nothing where the value is not something a loop walks.
+// `for x in c` where `c` is a **cursor** -- a value whose type implements `Iterate`.
 //
-// **Walking a type that implements `Iterate` is the one road out of here that this stage does not
-// take**: it goes through the trait member `next`, which is the seam the generics stage fills in.
+// **The cursor is a local of the loop and the walk is a copy**, which is what the trait's `next`
+// asks for by taking `*self`: the value is bound once, its address is handed to `next` on every
+// turn, and what comes back is matched against `Some`. So a loop over a cursor somebody else holds
+// advances that copy and leaves theirs where it was.
+//
+// Nothing where the type implements no `Iterate`, which leaves the sequence shapes and the
+// diagnostic to the rule below.
+private iterated(cx: &Analyzer, span: Span, seq: TExpr, name: string, body: Buf[Stmt],
+                 expected: Option[Type], label: Option[string], else_body: Option[Buf[Stmt]],
+                 discarded: bool) -> Option[TExpr]
+    val cty = texpr_type(seq)
+    val key = catalog_key(cx.an, "Iterate")
+
+    if key.is_none() then return None
+    if !conforms(cx.an, Bound(key.unwrap(), buf()), cty) then return None
+
+    val item = assoc_type_opt(cx.an, cty, "Item")
+
+    if item.is_none() then return None
+
+    val fname = member_func_name(cx, span, cty, "next")
+
+    if fname == "" then return Some(bad_expr(span))
+
+    val answer = option_of(cx, span, item.unwrap())
+
+    if answer.is_none() then return Some(bad_expr(span))
+
+    val (opt_ty, some) = answer.unwrap()
+
+    cx.enter()
+
+    val slot = cx.bind_pattern("iter", cty)
+    var next_args: Buf[TExpr] = buf()
+
+    next_args.push(TExpr(span, TAddrOf(TExpr(span, TLoad(slot, cty)), Ptr(cty))))
+
+    val next = TExpr(span, TCall(fname, next_args, opt_ty, false))
+    val u = cx.bind(name, item.unwrap())
+    var captures: Buf[TPattern] = buf()
+
+    captures.push(TBindPattern(u, item.unwrap()))
+
+    val bind = TVariantPattern(opt_ty, some, captures)
+    val ctx = open_loop(cx, span, expected, label)
+    val tb = loop_stmts(cx, body)
+
+    close_loop(cx, ctx)
+    cx.leave()
+
+    val telse = else_body.map(b -> type_value_block(cx, b, expected, discarded))
+    val ty = loop_result_type(cx, span, ctx, telse)
+
+    Some(checked_loop(ctx, span, TExpr(span, TIterate(slot, cty, seq, next, bind, tb, telse, ty))))
+end iterated
+
+// The `Option` of one type, with its `Some` variant -- what a cursor's `next` answers and what one
+// turn of the loop matches against.
+private option_of(cx: &Analyzer, span: Span, item: Type) -> Option[(Type, EnumVariant)]
+    var args: Buf[Type] = buf()
+
+    args.push(item)
+
+    val ty = reinstantiate(cx.an, module_qualify(StdModule, "Option"), args)
+
+    ty match
+        Enum(d) ->
+            val v = d.variant("Some")
+
+            if v.is_none() then return None
+
+            Some((ty, v.unwrap()))
+        _ -> None
+end option_of
+
+// What one turn of a `for` binds, or nothing where the value is not something a loop walks.
 private walked_element(cx: &Analyzer, span: Span, ty: Type, name: string) -> Option[Type]
     ty match
         Array(_, elem) -> Some(*elem)

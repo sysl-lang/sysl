@@ -41,7 +41,7 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     VolatileType(inner) -> Volatile(resolve_type(a, scope, inner, subst))
     ArrayType(length, elem, read_only) ->
         resolve_array(a, scope, t.span, length, elem, read_only, subst)
-    VectorType(lanes, elem) -> Vector(int(const_extent(a, scope, t.span, lanes)),
+    VectorType(lanes, elem) -> Vector(int(const_extent(a, scope, t.span, lanes, subst)),
                                       resolve_type(a, scope, elem, subst))
     TupleType(parts, results) -> resolve_tuple(a, scope, parts, results, subst)
     PackType(name) -> bound_type(subst, name).unwrap_or(Pack(buf()))
@@ -55,7 +55,8 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     AssocType(base, member) ->
         assoc_type(a, scope, t.span, resolve_type(a, scope, base, subst), member)
     AssocArgType(_, inner) -> resolve_type(a, scope, inner, subst)
-    ValueArgType(e) -> ConstArg(from_int(long(const_extent(a, scope, t.span, e))), int_type())
+    ValueArgType(e) -> ConstArg(from_int(long(const_extent(a, scope, t.span, e, subst))),
+                               int_type())
 
 // Every type of a list, in order.
 resolve_list(a: &Analysis, scope: Scope, ts: Buf[TypeRef], subst: Buf[Binding]) -> Buf[Type]
@@ -72,7 +73,7 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
     val e = resolve_type(a, scope, elem, subst)
 
     length match
-        Some(n) -> Array(int(const_extent(a, scope, span, n)), e)
+        Some(n) -> Array(int(const_extent(a, scope, span, n, subst)), e)
         None -> Slice(e, read_only)
 end resolve_array
 
@@ -117,12 +118,22 @@ end resolve_fn_trait
 // type parameter has no value during the walk that checks a generic declaration itself -- there is no
 // `T` yet -- and every array the program actually gets is built again for each instantiation, where
 // the measurement answers.
-private const_extent(a: &Analysis, scope: Scope, span: Span, e: Expr) -> usize
+private const_extent(a: &Analysis, scope: Scope, span: Span, e: Expr,
+                     subst: Buf[Binding]) -> usize
     *e.kind match
         IntLit(digits, base, _) -> return digits_value(digits, base)
         _ -> ()
 
-    val folded = const_int(analyzer_for(a, scope), e)
+    // Read in the terms the type was written in, and with whatever it says put back: a length that
+    // does not fold is a length this walk cannot settle, and the walk that can settles it again.
+    val inner = analyzer_for(a, scope)
+
+    inner.subst = subst
+
+    val mark = a.complaints()
+    val folded = const_int(inner, e)
+
+    a.restore_complaints(mark)
 
     if folded.is_none() then return 0
 
