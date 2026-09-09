@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
 import sysl.text.{str_builder, StrBuilder}
 
 // Reaching a member: what a type declares of its own, what a trait gave it, and what a table
@@ -80,9 +81,21 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
     val found = member_key(cx.an, ty, name)
     val m = member_at(cx.an, found.0, name)
 
-    if m.is_none() then
+    if m.is_none()
+        // A receiverless member the compiler provides is reached through the type, which is exactly
+        // the spelling this form is: `uint.zero()` and `u32.width()` are calls with no arguments.
+        val provided = builtin_constant_read(cx, span, ty, name)
+
+        if provided.is_some()
+            if !args.is_empty() then
+                cx.fault(span, s"'${module_show(found.0)}.$name' takes no arguments")
+
+            return provided
+        end if
+
         return Some(cx.err(span, s"type '${module_show(found.0)}' has no associated function " +
                            s"'$name'"))
+    end if
 
     val decl = m.unwrap()
 
@@ -196,7 +209,7 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
 
     if !has_member_at(cx.an, found.0, name) &&
        !cx.an.tables.members.alts.has(member_key_of(found.0, name)) then
-        return no_such_method(cx, span, receiver, rty, found.0, name)
+        return no_such_method(cx, span, receiver, rty, found.0, name, args)
 
     val chosen = chosen_member(cx, rty, found.0, name, span, args)
 
@@ -204,7 +217,7 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
 
     val m = member_at(cx.an, found.0, chosen.unwrap())
 
-    if m.is_none() then return no_such_method(cx, span, receiver, rty, found.0, name)
+    if m.is_none() then return no_such_method(cx, span, receiver, rty, found.0, name, args)
 
     val decl = m.unwrap()
 
@@ -646,8 +659,8 @@ private no_such_member(cx: &Analyzer, span: Span, rty: Type, base: string, name:
 end no_such_member
 
 private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, base: string,
-                       name: string) -> TExpr
-    val provided = builtin_method(cx, span, receiver, rty, name)
+                       name: string, args: Buf[Expr]) -> TExpr
+    val provided = builtin_method(cx, span, receiver, rty, name, args)
 
     if provided.is_some() then return provided.unwrap()
 
@@ -818,16 +831,89 @@ end weak_get
 // A member the compiler provides for a built-in, called: the bit surface, the magnitude and the
 // sign, and a hash.
 private builtin_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type,
-                       name: string) -> Option[TExpr]
+                       name: string, args: Buf[Expr]) -> Option[TExpr]
     val numeric = core_numeric(name)
 
     if numeric.is_none() then return None
-
     if !core_builtin(numeric.unwrap(), rty) then return None
 
-    None
+    val found = catalog_key(cx.an, numeric.unwrap())
+
+    if found.is_none() then return None
+
+    val tr_name = found.unwrap()
+    val d = trait_decl_at(cx.an, tr_name)
+
+    if d.is_none() then return None
+
+    val m = trait_method(d.unwrap(), name)
+
+    if m.is_none() then return None
+
+    // The signature is the **trait's**, read with `Self` standing for the receiver: `count_ones`
+    // answers a `u32` at every width and `abs` answers the type it was asked of, and both of those
+    // are written in the declaration rather than known here.
+    val scope = trait_scope_of(cx.an, tr_name)
+    val subst = self_binding(rty)
+    val decl = m.unwrap()
+
+    if args.len() != decl.params.len()
+        cx.fault(span, s"method '${type_show(rty)}.$name' takes " +
+                 s"${quantity(decl.params.len(), "argument")}, but " +
+                 s"${supplied_phrase(args.len(), "argument")}")
+        return Some(bad_expr(span))
+    end if
+
+    var amount: Option[TExpr] = None
+
+    if !decl.params.is_empty()
+        val want = resolve_type(cx.an, scope, decl.params.at(0).typ, subst)
+
+        amount = Some(type_expr(cx, args.at(0), Some(want)))
+    end if
+
+    val ret = if decl.ret_type.is_some() then
+                  resolve_type(cx.an, scope, decl.ret_type.unwrap(), subst)
+              else Unit
+
+    Some(TExpr(span, TIntOp(name, receiver, amount, op_subject(rty), ret)))
 end builtin_method
 
-// A receiverless member the compiler provides, read through a type rather than off a value.
-private builtin_constant_read(cx: &Analyzer, span: Span, rty: Type, name: string) -> Option[TExpr] =
-    None
+// A receiverless member the compiler provides, read through a type rather than off a value: the two
+// identities, whose value is stated in the catalog, and a width, whose answer is read off the type.
+private builtin_constant_read(cx: &Analyzer, span: Span, rty: Type, name: string) -> Option[TExpr]
+    val constant = core_constant(name)
+
+    if constant.is_some()
+        if !core_builtin(constant.unwrap().0, rty) then return None
+
+        return Some(TExpr(span, TIntLit(from_int(long(constant.unwrap().1)), rty)))
+    end if
+
+    val measured = core_measure_trait(name)
+
+    if measured.is_none() then return None
+    if !core_builtin(measured.unwrap(), rty) then return None
+
+    val answer = core_measure(name, rty)
+
+    if answer.is_none() then return None
+
+    val found = catalog_key(cx.an, measured.unwrap())
+
+    if found.is_none() then return None
+
+    val tr_name = found.unwrap()
+    val d = trait_decl_at(cx.an, tr_name)
+
+    if d.is_none() then return None
+
+    val m = trait_method(d.unwrap(), name)
+
+    if m.is_none() || m.unwrap().ret_type.is_none() then return None
+
+    val ret = resolve_type(cx.an, trait_scope_of(cx.an, tr_name), m.unwrap().ret_type.unwrap(),
+                           self_binding(rty))
+
+    Some(TExpr(span, TIntLit(from_int(long(answer.unwrap())), ret)))
+end builtin_constant_read
