@@ -194,12 +194,14 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
 private hoist_storage(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
                       vis: Visibility, init: Option[Expr])
     hoist_value(a, scope, span, name, typ, vis, a.tables.vals, "'var'", init)
-    a.tables.writable.push(module_qualify(scope.module_name, name))
+    a.tables.writable.push(file_private_key(a, scope.src.name,
+                                            module_qualify(scope.module_name, name)))
 
 // Registers a name that stands for a type.
 private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vis: Visibility,
                         kind: DeclKind)
-    val key = module_qualify(scope.module_name, name)
+    val plain = module_qualify(scope.module_name, name)
+    val key = decl_key(a, scope, plain, vis, a.tables.types.has(plain))
 
     if type_name_taken(a, key, name) && type_contested(a, scope, vis, key) then
         a.fault(scope, span, type_taken_message(kind, name))
@@ -237,7 +239,8 @@ type_name_taken(a: &Analysis, key: string, written: string) -> bool =
 // Registers a name that stands for storage.
 private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
                     vis: Visibility, into: &Table[ValueDecl], what: string, init: Option[Expr])
-    val key = module_qualify(scope.module_name, name)
+    val plain = module_qualify(scope.module_name, name)
+    val key = decl_key(a, scope, plain, vis, value_scope_of(a, plain).is_some())
     val holder = if contested(a, scope, vis, key) then value_name_holder(a, key) else None
 
     if holder.is_some() then
@@ -354,7 +357,7 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
     // is why the private slot is worked out first. Counting them off the plain key alone would file
     // a file that declares one spelling twice, privately, beside a sibling contending it under one
     // slot -- and the second would overwrite the first.
-    val base = decl_key(a, scope, plain, d.vis)
+    val base = decl_key(a, scope, plain, d.vis, a.tables.funcs.has(plain))
     val siblings = overload_keys(a, base)
 
     // **The slot is one-based**, so the second declaration of a name is `f.2` and never `f.1`.
@@ -385,7 +388,12 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
 // file's file-private declaration: the plain key comes back and the duplicate check above reports
 // it, so a private name against a PUBLIC one of the same spelling is refused exactly as it was.
 // Something holds it and IS another file's file-private declaration: a slot, and the two coexist.
-private decl_key(a: &Analysis, scope: Scope, plain: string, vis: Visibility) -> string
+//
+// `taken` is the question "does something already hold the plain key", asked by the caller because
+// each kind of declaration asks it of a different table -- a function of the functions, a name that
+// stands for storage of the three that hold storage. Passing it in keeps this from having to know
+// which namespace it is being asked about, which is the thing that would go stale.
+private decl_key(a: &Analysis, scope: Scope, plain: string, vis: Visibility, taken: bool) -> string
     if !is_file_private(vis) then return plain
 
     val mine = file_slot_key(scope.src.name, plain)
@@ -398,7 +406,8 @@ private decl_key(a: &Analysis, scope: Scope, plain: string, vis: Visibility) -> 
     val held = a.tables.access.get(plain)
     var key = plain
 
-    if held.is_some() && is_file_private(held.unwrap().vis) && held.unwrap().file != scope.src.name
+    if taken && held.is_some() && is_file_private(held.unwrap().vis) &&
+            held.unwrap().file != scope.src.name
         var n: usize = 1
 
         while a.tables.access.has(s"$plain.private$n")
