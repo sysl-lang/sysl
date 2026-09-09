@@ -18,6 +18,12 @@ struct TypedBodies
     // How many bodies were left for a later stage, and why.
     skipped_generic: usize
     skipped_defaults: usize
+
+    // How many of the functions are the ones the sources **declared** at the top level, which are
+    // the first of them. What follows are the members each type's declaration lowered to and the
+    // instantiations the calls asked for -- functions a program never wrote a heading for, so a test
+    // reading "the last body" means the last one somebody typed.
+    declared: usize
 end TypedBodies
 
 // Reads a compilation's declarations and types every body it can.
@@ -38,13 +44,48 @@ analyze_bodies(units: Buf[Program], t: Target) -> TypedBodies
             val s = unit.body.at(j)
 
             *s.kind match
+                // **A generic declaration is not a function**, so there is no body to type here:
+                // what a program runs is the instantiation a call asked for, and each one is typed
+                // below with its parameters fixed.
                 FuncDecl(d) ->
                     if !d.tparams.is_empty() then generic += 1
                     else if signature_needs_defaults(a, scope, d) then defaults += 1
                     else funcs.push(analyze_body(a, scope, s.span, d))
                 _ -> ()
 
-    TypedBodies(funcs, a.diagnostics(), generic, defaults)
+    val declared = funcs.len()
+
+    // **A generic body is checked once, at its definition**, with each type parameter opaque except
+    // for what its bounds promise. What separates that from a template is that the body is wrong on
+    // its own, so the complaint does not wait for a call site to expose it.
+    check_generic_bodies(a, units)
+
+    // A member of a concrete type is a function whose body is typed whether or not anything calls
+    // it, which is what makes a mistake in one a mistake at its declaration.
+    val lowered = a.tables.members.lowered
+
+    for i in 0..<lowered.len()
+        funcs.push(analyze_instance(a, lowered.at(i).name, lowered.at(i)))
+
+    // Then the instantiations, drained until nothing more is asked for: typing one body may reach a
+    // call that asks for another.
+    var guard: usize = 0
+
+    while !a.tables.members.pending.is_empty() && guard < 4096
+        val work = a.tables.members.pending
+
+        a.tables.members.pending = buf()
+
+        for i in 0..<work.len()
+            val job = work.at(i)
+            val cx = analyzer_for(a, job.scope)
+
+            cx.subst = job.subst
+            funcs.push(analyze_instance_in(a, cx, job.name, job.decl))
+
+        guard += 1
+
+    TypedBodies(funcs, a.diagnostics(), generic, defaults, declared)
 end analyze_bodies
 
 // Whether a signature names a type declared with **type defaults** -- `struct Pair[A, B = A]`
@@ -115,6 +156,136 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> TFunc
           contract.2, false, d.conv, d.tailrec, contract.3, d.pure, d.ghost, d.reads, d.writes,
           exported_symbol(d), d.section)
 end analyze_body
+
+// Every generic declaration's body, read once with its parameters standing in for themselves.
+//
+// **The tree is thrown away and so is nearly everything the walk said.** An instantiation reads the
+// same body again against concrete types and raises the ordinary complaints there, with a position
+// in the caller's own terms; what survives is what only this walk can find -- a call a bound does
+// not license, and a call that disagrees with the *trait's* signature rather than with any one
+// implementation's.
+private check_generic_bodies(a: &Analysis, units: Buf[Program])
+    for i in 0..<units.len()
+        val unit = units.at(i)
+        val scope = scope_of_unit(unit)
+
+        for j in 0..<unit.body.len()
+            *unit.body.at(j).kind match
+                FuncDecl(d) -> if !d.tparams.is_empty() then check_abstract_body(a, scope, d)
+                _ -> ()
+
+    // A generic type's members and a generic `impl`'s are checkable before anything instantiates
+    // them, against the bounds the block wrote on its own parameters -- the same walk. An inherited
+    // default is left out: it was checked at the trait, against what the trait promises, which is
+    // the whole of what its body may assume wherever it is copied to.
+    val generic = a.tables.members.generic
+
+    for i in 0..<generic.len()
+        val fd = generic.at(i)
+
+        if !a.tables.members.default_origin.has(fd.name)
+            val scope = a.tables.members.decl_scope.get(fd.name).unwrap_or(empty_scope())
+
+            check_abstract_body(a, scope, fd)
+end check_generic_bodies
+
+// One such body, in a region everything but a kept complaint is rewound out of.
+private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl)
+    if d.body.is_empty() then return
+
+    val mark = a.complaints()
+    val queued = a.tables.members.pending.len()
+    val outer = a.tables.members.selves.get(d.name).unwrap_or(buf())
+    var subst = joined_bindings(outer, abstract_subst(a, scope, d.tparams, d.bounds, d.tvalues,
+                                                      d.tpacks, outer))
+    // On a generic type `Self` is the type applied to its own parameters, which is what the members
+    // of one are read under.
+    val written = a.tables.members.generic_self.get(d.name)
+
+    if written.is_some() then subst.push(Binding("Self", resolve_type(a, scope, written.unwrap(),
+                                                                      subst)))
+
+    val cx = analyzer_for(a, scope)
+
+    cx.subst = subst
+
+    for i in 0..<d.params.len()
+        val p = d.params.at(i)
+
+        cx.bind(p.name, resolve_type(a, scope, p.typ, subst))
+
+    var ret = Unit
+
+    if d.ret_type.is_some() then
+        ret = declared_result_type(Some(resolve_type(a, scope, d.ret_type.unwrap(), subst)))
+
+    cx.func_name = d.name
+    cx.ret_ty = Some(ret)
+    cx.ret_is_list = false
+
+    val split = contract_length(d.body)
+
+    analyze_contract(cx, d.body, split, ret)
+    body_block(cx, statements_from(d.body, split), ret)
+
+    a.restore_complaints(mark)
+    a.tables.members.pending.truncate(queued)
+end check_abstract_body
+
+// One function whose signature the tables already hold, under the name they hold it by: a member
+// lowered from a type's body or from an `impl` block, or one instantiation of a generic.
+//
+// **The signature is read back rather than resolved again**, which is what makes the body agree with
+// the call that asked for it: the arguments a call solved are what the parameters were made real at,
+// and resolving the declaration a second time would have nothing to make them real from.
+analyze_instance(a: &Analysis, name: string, d: FuncDecl) -> TFunc
+    val scope = a.tables.members.decl_scope.get(name).unwrap_or(empty_scope())
+    val cx = analyzer_for(a, scope)
+    val outer = a.tables.members.selves.get(name)
+
+    if outer.is_some() then cx.subst = outer.unwrap()
+
+    analyze_instance_in(a, cx, name, d)
+end analyze_instance
+
+// The same, on an analyzer whose terms a caller has already set.
+analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> TFunc
+    val sig = a.tables.members.func_insts.get(name)
+
+    if sig.is_none() then return TFunc(span_zero(), name, buf(), Unit, empty_block(), false, buf(),
+                                       buf(), buf(), false, None, false, None, false, false, None,
+                                       None, None, None)
+
+    var params: Buf[(string, Type)] = buf()
+
+    for i in 0..<sig.unwrap().params.len()
+        val p = sig.unwrap().params.at(i)
+
+        params.push((cx.bind(p.0, p.1), p.1))
+
+    val ret = sig.unwrap().ret
+
+    cx.func_name = name
+    cx.ret_ty = Some(ret)
+    cx.ret_is_list = false
+
+    val split = contract_length(d.body)
+    val contract = analyze_contract(cx, d.body, split, ret)
+    val rest = statements_from(d.body, split)
+    val body = body_block(cx, rest, ret)
+    val span = body_span(rest, span_zero())
+
+    if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
+        cx.fault(span, s"function '$name' should return ${type_show(ret)}, but its body yields " +
+                 s"${type_show(body.ty)}")
+
+    TFunc(span, name, params, ret, body, d.variadic, contract.0, contract.1, contract.2, false,
+          d.conv, d.tailrec, contract.3, d.pure, d.ghost, d.reads, d.writes, exported_symbol(d),
+          d.section)
+end analyze_instance_in
+
+// A block with nothing in it, for a function whose signature never resolved.
+private empty_block() -> TBlock = TBlock(buf(), None, Unit)
 
 // The body itself, asked for the declared result -- or, where the function owes no value, read in
 // statement position with what it comes to discarded.
@@ -300,14 +471,72 @@ body_type(text: string) -> string
     val done = analyze_bodies(units, host_target())
 
     if !done.reported.is_empty() then return done.reported.at(0).diag.message
-    if done.funcs.is_empty() then return "no body"
+    if done.declared == 0 then return "no body"
 
-    val last = done.funcs.at(done.funcs.len() - 1)
+    val last = done.funcs.at(done.declared - 1)
 
     if last.body.result.is_none() then return "no value"
 
     type_show(texpr_type(last.body.result.unwrap()))
 end body_type
+
+// The type the body of one **named** function comes to, which for an instantiation is the mangled
+// name a call filed it under and for a member the name its type lowered it to.
+//
+// **It is the seam a generic's claim is asserted on.** What a generic declaration means is what its
+// instantiations turn out to be, and a source that calls one at two types has two answers -- neither
+// of them the last body, and neither of them anything the declaration alone could be asked for.
+inst_type(text: string, name: string) -> string
+    val done = typed_of(text)
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    for i in 0..<done.funcs.len()
+        val f = done.funcs.at(i)
+
+        if f.name == name
+            if f.body.result.is_none() then return type_show(f.ret_ty)
+
+            return type_show(texpr_type(f.body.result.unwrap()))
+
+    s"no function named '$name'"
+end inst_type
+
+// The names every function a source came to is filed under, in the order they were typed -- what a
+// test asserting which instantiations a program asked for reads.
+inst_names(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val done = typed_of(text)
+
+    for i in 0..<done.funcs.len()
+        out.push(done.funcs.at(i).name)
+
+    out
+end inst_names
+
+// One source, parsed and typed.
+private typed_of(text: string) -> TypedBodies
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok()
+        var said: Buf[Placed] = buf()
+        val src = source_of("test.sysl", text)
+
+        for i in 0..<parsed.report.len()
+            said.push(Placed(src, parsed.report.at(i)))
+
+        return TypedBodies(buf(), said, 0, 0, 0)
+    end if
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+    analyze_bodies(units, host_target())
+end typed_of
+
+// Everything the trait and generic machinery has to say about one source, which is what an
+// error-path test for a bound, an `impl` or a member asserts on.
+trait_diagnostics(text: string) -> Buf[string] = stmt_diagnostics(text)
 
 // The same, under the name the expression tests already assert on.
 expr_type(text: string) -> string = body_type(text)
@@ -332,9 +561,9 @@ binding_type(text: string, name: string) -> string
     val done = analyze_bodies(units, host_target())
 
     if !done.reported.is_empty() then return done.reported.at(0).diag.message
-    if done.funcs.is_empty() then return "no body"
+    if done.declared == 0 then return "no body"
 
-    val found = binding_in_block(done.funcs.at(done.funcs.len() - 1).body, name)
+    val found = binding_in_block(done.funcs.at(done.declared - 1).body, name)
 
     if found.is_none() then return s"no binding named '$name'"
 

@@ -133,8 +133,9 @@ end drain_deferred_bounds
 // which is the distinction that matters: the owner's bounds were checked where its type was made, and
 // checking them again here would report one unmet bound twice.
 check_param_bounds(a: &Analysis, scope: Scope, span: Span, what: string, tparams: Buf[string],
-                   bounds: Buf[NamedBounds], targs: Buf[Type], seed: Buf[Binding], noun: string)
-    if bounds.is_empty() then return
+                   bounds: Buf[NamedBounds], targs: Buf[Type], seed: Buf[Binding],
+                   noun: string) -> bool
+    if bounds.is_empty() then return true
 
     var subst: Buf[Binding] = buf()
 
@@ -143,6 +144,8 @@ check_param_bounds(a: &Analysis, scope: Scope, span: Span, what: string, tparams
 
     for i in 0..<tparams.len()
         if i < targs.len() then subst.push(Binding(tparams.at(i), targs.at(i)))
+
+    var met = true
 
     for i in 0..<bounds.len()
         val nb = bounds.at(i)
@@ -157,8 +160,11 @@ check_param_bounds(a: &Analysis, scope: Scope, span: Span, what: string, tparams
                 val tr = resolve_bound(a, scope, want.span, want,
                                        joined_bindings(subst, self_binding(arg.unwrap())))
 
-                if !satisfies(a, tr, arg.unwrap()) then
+                if !satisfies(a, tr, arg.unwrap())
                     report_unmet(a, scope, span, what, nb.name, tr, arg.unwrap(), noun)
+                    met = false
+
+    met
 end check_param_bounds
 
 private report_unmet(a: &Analysis, scope: Scope, span: Span, what: string, tp: string, tr: Bound,
@@ -167,9 +173,13 @@ private report_unmet(a: &Analysis, scope: Scope, span: Span, what: string, tp: s
         // A type parameter standing in for itself, during the walk that checks a generic body. It is
         // not a type anything has an `impl` for, so what it can promise is exactly what its own
         // bounds promise -- a bound is satisfied by a bound.
+        //
+        // **Kept rather than dropped with the rest of that walk**: nothing else will ever ask it,
+        // since an instantiation hands the callee a concrete type and asks the question again about
+        // that.
         Abstract(n, _) ->
-            a.fault(scope, span, s"'${module_show(what)}' requires its $noun '$tp' to implement " +
-                    s"'${show_bound(a, tr, arg)}', but '$n' is not bounded by it")
+            a.bound_fault(scope, span, s"'${module_show(what)}' requires its $noun '$tp' to " +
+                          s"implement '${show_bound(a, tr, arg)}', but '$n' is not bounded by it")
         _ ->
             // A type an implementation covers is told what that implementation asked of it, so the
             // reader is sent one step in -- to the argument that fails -- rather than to a block that
@@ -287,6 +297,7 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl]) -> B
             a.fault(home.scope, m.span, s"type '${home.label}' has both a ${home.noun} and a member " +
                     s"named '$written'")
 
+        check_bound_names(a, home.scope, s"${home.label}.${m.name}", m.bounds)
         check_namespace_share(a, home, m, written)
         check_hides_builtin(a, home, m)
 
@@ -345,6 +356,39 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl]) -> B
 
     lowered
 end hoist_member_list
+
+// Checks that every bound a declaration writes names a trait and applies it to as many arguments as
+// it declares, whichever declaration form wrote it.
+//
+// **A bound is a trait and nothing else**, so a name that is a struct, a scalar, or nothing at all is
+// reported here rather than silently promising something no type could ever be held to. The
+// complaint points at the bound rather than at the declaration carrying it, because that is the text
+// that is wrong.
+check_bound_names(a: &Analysis, scope: Scope, what: string, bounds: Buf[NamedBounds])
+    for i in 0..<bounds.len()
+        val nb = bounds.at(i)
+
+        for j in 0..<nb.bounds.len()
+            val written = nb.bounds.at(j)
+            val key = lookup_trait_key(a, scope, written.name)
+
+            if key.is_none() then
+                a.fault(scope, written.span, s"the bound on '${nb.name}' in '$what' names " +
+                        s"'${written.name}', which is not a trait")
+            else
+                // What the *arguments* are is left to the resolution, which is reached wherever the
+                // substitution that gives them meaning exists; the arity is answerable here and is
+                // worth saying at the declaration rather than at whatever first applied it.
+                val d = trait_decl_at(a, key.unwrap())
+
+                if d.is_some()
+                    var unknown: Buf[Type] = buf()
+
+                    for k in 0..<written.args.len()
+                        unknown.push(Unknown)
+
+                    check_trait_arity_at(a, scope, written.span, written.name, d.unwrap(), unknown)
+end check_bound_names
 
 // A composed type's members and its shape's are one namespace, so that a name reaches one member
 // however the type came by it. Both directions are asked, since a file may write the shape before the

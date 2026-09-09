@@ -1,0 +1,143 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a type's members **are**, and what a trait's promise turns into.
+//
+// **A member is a function under a mangled name**, so the claim a test makes about one is the same
+// claim it would make about any other function: which name it was filed under, and what its body
+// comes to. `inst_type` reads one by that name.
+
+private held(text: string, name: string) -> string = inst_type(text, name)
+
+private made(text: string) -> Buf[string] = inst_names(text)
+
+private lowered_holds(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end lowered_holds
+
+private point() -> string = "struct P\n    x: int\n    y: int\n"
+
+@test("a type's own method is a function whose receiver is its first parameter")
+a_method_is_a_function()
+    val src = point() + "\n    sum(self) -> int = self.x + self.y\n"
+
+    assert(lowered_holds(made(src), "P.sum"), "the member was lowered under the type's name")
+    assert_eq(held(src, "P.sum"), "int")
+
+@test("and a call on a value is a call to it")
+a_method_call_is_a_call()
+    val src = point() + "\n    sum(self) -> int = self.x + self.y\n\n" +
+              "use(p: P) -> int = p.sum()\n"
+
+    assert_eq(body_type(src), "int")
+
+@test("a property is read without parentheses, and is the same call underneath")
+a_property_is_read()
+    val src = point() + "\n    area -> int = self.x * self.y\n\n" +
+              "use(p: P) -> int = p.area\n"
+
+    assert_eq(body_type(src), "int")
+
+@test("a trait's member becomes the implementing type's, under that type's name")
+a_traits_member_becomes_the_types()
+    val src = "trait Show\n    show(self) -> int\n\n" + point() + "\n" +
+              "impl Show for P\n    show(self) -> int = self.x\n\n" +
+              "use(p: P) -> int = p.show()\n"
+
+    assert(lowered_holds(made(src), "P.show"), "the trait's member was lowered under 'P'")
+    assert_eq(body_type(src), "int")
+
+@test("a default the block left out is materialized for the implementing type")
+a_default_is_materialized()
+    val src = "trait Show\n" +
+              "    show(self) -> int\n" +
+              "    twice(self) -> int = self.show() + self.show()\n\n" + point() + "\n" +
+              "impl Show for P\n    show(self) -> int = self.x\n\n" +
+              "use(p: P) -> int = p.twice()\n"
+
+    assert(lowered_holds(made(src), "P.twice"), "the default was copied for the type")
+    assert_eq(body_type(src), "int")
+
+@test("a value that forgot its type reaches its trait's members through a table")
+an_object_dispatches()
+    val src = "trait Show\n    show(self) -> int\n\n" +
+              "use(s: &Show) -> int = s.show()\n"
+
+    assert_eq(body_type(src), "int")
+
+@test("and the slot a member sits in is the position it has in what the table lays out")
+a_slot_is_a_position()
+    val src = "trait Pair\n" +
+              "    first(self) -> int\n" +
+              "    second(self) -> int\n\n" +
+              "use(p: &Pair) -> int = p.second()\n"
+
+    assert_eq(body_type(src), "int")
+
+@test("a required trait's members are the requiring one's too, and come first in the table")
+a_supertraits_members_come_first()
+    val src = "trait Base\n    base(self) -> int\n\n" +
+              "trait Sub: Base\n    sub(self) -> int\n\n" +
+              "use(s: &Sub) -> int = s.base() + s.sub()\n"
+
+    assert_eq(body_type(src), "int")
+
+@test("an implementation is selected by the argument list, so a type may keep more than one")
+one_implementation_per_argument_list()
+    val src = "trait Into[T]\n    into(self) -> T\n\n" + point() + "\n" +
+              "impl Into[int] for P\n    into(self) -> int = self.x\n\n" +
+              "impl Into[bool] for P\n    into(self) -> bool = true\n\n" +
+              "use(p: P) -> int = p.into()\n"
+
+    assert(lowered_holds(made(src), "P.into"), "the first implementation kept the written name")
+    assert(lowered_holds(made(src), "P.into.2"), "the second took a suffix of its own")
+
+@test("an associated type is what the implementation said it was")
+an_associated_type_is_the_implementations()
+    val src = "trait Holder\n" +
+              "    type Item\n\n" +
+              "    get(self) -> Self::Item\n\n" + point() + "\n" +
+              "impl Holder for P\n" +
+              "    type Item = int\n\n" +
+              "    get(self) -> int = self.x\n\n" +
+              "use(p: P) -> int = p.get()\n"
+
+    assert_eq(body_type(src), "int")
+
+@test("and a bound's projection is the same question asked of a parameter")
+a_projection_off_a_bound()
+    val src = "trait Holder\n" +
+              "    type Item\n\n" +
+              "    get(self) -> Self::Item\n\n" + point() + "\n" +
+              "impl Holder for P\n" +
+              "    type Item = int\n\n" +
+              "    get(self) -> int = self.x\n\n" +
+              "first[T: Holder](h: T) -> T::Item = h.get()\n" +
+              "use(p: P) -> int = first(p)\n"
+
+    assert_eq(held(src, "first.P"), "int")
+
+@test("a member written for every slice is reached on one, at the element it matched")
+a_shape_block_is_reached()
+    val src = "trait Count\n    tally(self) -> usize\n\n" +
+              "impl[T] Count for []T\n    tally(self) -> usize = self.len\n\n" +
+              "use(xs: []int) -> usize = xs.tally()\n"
+
+    assert_eq(body_type(src), "usize")
+
+@test("a generic block's condition is asked of the type's own arguments")
+a_conditional_implementation()
+    val src = "trait Show\n    show(self) -> int\n\n" +
+              "struct Box[T]\n    x: T\n\n" +
+              "impl[T: Show] Show for Box[T]\n    show(self) -> int = self.x.show()\n\n" +
+              "struct P\n    v: int\n\n" +
+              "impl Show for P\n    show(self) -> int = self.v\n\n" +
+              "use(b: Box[P]) -> int = b.show()\n"
+
+    assert_eq(body_type(src), "int")

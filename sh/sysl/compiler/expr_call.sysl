@@ -28,7 +28,10 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
             if texpr_type(tr) == Unknown then return tr
 
-            lookup_trait_member(cx, span, auto_deref(cx, tr), member, args, expected)
+            // **The receiver is handed over as it stands.** A call reaches through one level of
+            // indirection and only one, exactly as selection does, and what is left after that is a
+            // type the reader never wrote -- so the lookup sees the mode and the message can name it.
+            call_member(cx, span, tr, member, args, expected)
         _ -> cx.err(span, "this is not something that can be called")
 end call_expr
 
@@ -431,14 +434,10 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
                  expected: Option[Type], report: bool) -> TExpr
     val f = cx.an.tables.funcs.get(key).unwrap()
 
-    // A generic call infers its type arguments, which is the stage after this one.
+    // A generic call works its type arguments out from what it supplies, makes the instantiation
+    // real, and checks the arguments against the signature that instantiation has.
     if !f.decl.tparams.is_empty() then
-        if report then
-            return cx.err(span, s"'$written' is generic, and inferring a call's type arguments is " +
-                          "not built yet")
-
-        cx.fault(span, "generic")
-        return bad_expr(span)
+        return generic_call(cx, span, written, key, f, args, expected, report)
 
     val bound = bind_arguments(cx, span, written, f, args, report)
 
@@ -479,7 +478,7 @@ end call_key
 //
 // **A named argument may be written for any parameter, not only one with a default**, and a
 // parameter left unfilled is an error unless it has one.
-private bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, args: Buf[Expr],
+bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, args: Buf[Expr],
                        report: bool) -> Option[Buf[Option[Expr]]]
     val params = f.decl.params
     var slots: Buf[Option[Expr]] = buf()

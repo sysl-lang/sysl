@@ -218,6 +218,21 @@ struct Analysis
     warned: Buf[Placed]
     journal: &Journal
 
+    // What a trial that is thrown away still says. See `bound_fault`.
+    kept: Buf[Placed]
+
+    // Records an error about a place that a **thrown-away trial must keep**, which is the one kind
+    // of complaint the walk over a generic body at its own definition makes.
+    //
+    // Nothing else will ever check those: an instantiation resolves the same call against a concrete
+    // implementation instead, so a mistake in what a bound licenses is caught at the definition or
+    // nowhere. Every other complaint that walk makes is one an instantiation raises again, and is
+    // dropped with the rest of the trial.
+    bound_fault(*self, scope: Scope, span: Span, message: string)
+        val d = placed_error(scope.src, span, message)
+
+        if !already_said(self.kept, d) && !already_said(self.found, d) then self.kept.push(d)
+
     // Records an error about a place, unless the same thing has already been said about it.
     fault(*self, scope: Scope, span: Span, message: string)
         val d = placed_error(scope.src, span, message)
@@ -233,8 +248,19 @@ struct Analysis
     // How many complaints have been recorded, which is what an attempt compares across a trial.
     complaints(self) -> usize = self.found.len()
 
-    // Everything to say, in the order a reader reads it.
-    diagnostics(self) -> Buf[Placed] = in_source_order(self.found)
+    // Everything to say, in the order a reader reads it -- what the walk found, and what a walk that
+    // was otherwise thrown away kept.
+    diagnostics(self) -> Buf[Placed]
+        var all: Buf[Placed] = buf()
+
+        for i in 0..<self.found.len()
+            all.push(self.found.at(i))
+
+        for i in 0..<self.kept.len()
+            if !already_said(self.found, self.kept.at(i)) then all.push(self.kept.at(i))
+
+        in_source_order(all)
+    end diagnostics
 
     warnings(self) -> Buf[Placed] = in_source_order(self.warned)
 
@@ -271,7 +297,7 @@ private already_said(all: Buf[Placed], d: Placed) -> bool
 end already_said
 
 // An analysis over empty tables.
-analysis_for(t: Target) -> &Analysis = Analysis(tables_for(t), buf(), buf(), journal())
+analysis_for(t: Target) -> &Analysis = Analysis(tables_for(t), buf(), buf(), journal(), buf())
 
 // -- how far a declaration reaches ---------------------------------------------------------------
 

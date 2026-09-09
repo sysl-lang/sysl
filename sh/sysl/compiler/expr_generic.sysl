@@ -1,0 +1,218 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// A call to a generic declaration: its type arguments worked out from what the call supplies, the
+// instantiation made real, and the arguments checked against the signature that instantiation has.
+//
+// **Inference is bidirectional and the order is the whole of the precedence.** What already carries a
+// type of its own settles a parameter first, the type the position expects settles what is left, and
+// a bare literal's default only reaches a parameter nothing else did.
+
+// One call to a generic function.
+generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, args: Buf[Expr],
+             expected: Option[Type], report: bool) -> TExpr
+    val bound = bind_arguments(cx, span, written, f, args, report)
+
+    if bound.is_none() then return bad_expr(span)
+
+    val slots = bound.unwrap()
+    val decl = f.decl
+
+    // **Asked before the solve rather than left to it**, because the solve can only report what it
+    // failed to find and the answer here is that it was never going to find it: a parameter named in
+    // neither the parameters nor the result is one nothing in a call could settle.
+    val stuck = unsettleable(decl)
+
+    if !stuck.is_empty()
+        if report
+            val names = quoted_and(stuck)
+            val is_are = if stuck.len() == 1 then "is" else "are"
+            val it_them = if stuck.len() == 1 then "it" else "them"
+
+            cx.fault(span, s"$names $is_are in neither the parameters of '$written' nor its " +
+                     s"result, so nothing in this call says what $it_them should be — write " +
+                     s"$it_them out, as '$written[…](…)'")
+        else cx.fault(span, "unsettleable")
+
+        return bad_expr(span)
+    end if
+
+    val prov = provisional_args(cx, f, slots)
+    var param_refs: Buf[TypeRef] = buf()
+
+    for i in 0..<decl.params.len()
+        param_refs.push(decl.params.at(i).typ)
+
+    val targs = solve(cx.an, f.scope, span, key, decl.tparams, param_refs, prov.0, decl.ret_type,
+                      expected, prov.1, decl.bounds, buf())
+
+    if !report
+        for i in 0..<targs.len()
+            if targs.at(i) == Unknown
+                cx.fault(span, "not inferable")
+                return bad_expr(span)
+
+    // A type argument that does not meet what the declaration asked of it ends the call: the body
+    // would be read at a type the bound was supposed to have ruled out, and every complaint that
+    // came back would be a consequence of this one.
+    if !check_param_bounds(cx.an, cx.scope, span, key, decl.tparams, decl.bounds, targs, buf(),
+                           "type parameter") then return bad_expr(span)
+
+    val name = instantiate_func(cx.an, f.scope, decl, targs, false)
+    val sig = cx.an.tables.members.func_insts.get(name)
+
+    if sig.is_none() then return bad_expr(span)
+
+    var ts: Buf[TExpr] = buf()
+
+    for i in 0..<slots.len()
+        val want = if i < sig.unwrap().params.len() then sig.unwrap().params.at(i).1 else Unknown
+
+        slots.at(i) match
+            Some(e) ->
+                val t = type_expr(cx, e, Some(want))
+
+                if disagree(texpr_type(t), want)
+                    if report then
+                        cx.fault(e.span, s"'${decl.params.at(i).name}' of '$written' is " +
+                                 s"${type_show(want)}, but ${type_show(texpr_type(t))} was given")
+                    else cx.fault(e.span, "argument disagrees")
+
+                ts.push(t)
+            None ->
+                val inner = analyzer_for(cx.an, f.scope)
+
+                inner.reported = Some(span)
+                ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
+
+    TExpr(span, TCall(name, ts, sig.unwrap().ret, false))
+end generic_call
+
+// The type parameters a call can settle nothing about: the ones named in neither the parameters nor
+// the result.
+//
+// A bare arrow is sugar for a bounded parameter, so a declaration written `f(g: A -> B)` carries the
+// types in a *bound* rather than in a parameter -- and a walk over the written parameter types no
+// longer sees them.
+private unsettleable(d: FuncDecl) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<d.tparams.len()
+        val tp = d.tparams.at(i)
+        var one: Buf[string] = buf()
+
+        one.push(tp)
+
+        var named = false
+
+        for j in 0..<d.params.len()
+            if ref_mentions(d.params.at(j).typ, one) then named = true
+
+        if d.ret_type.is_some() && ref_mentions(d.ret_type.unwrap(), one) then named = true
+
+        for j in 0..<d.bounds.len()
+            val nb = d.bounds.at(j)
+
+            for k in 0..<nb.bounds.len()
+                if any_ref_mentions(nb.bounds.at(k).args, one) then named = true
+
+        if !named then out.push(tp)
+
+    out
+end unsettleable
+
+private quoted_and(names: Buf[string]) -> string
+    var b = str_builder()
+
+    for i in 0..<names.len()
+        if i > 0 then b.push(" and ")
+
+        b.push(s"'${names.at(i)}'")
+
+    b.finish()
+end quoted_and
+
+// What each argument reads as before the type arguments are known, and whether reading it took a
+// **literal's default** for want of anything better -- which is what the tiering turns on.
+//
+// An argument standing at a parameter whose type names none of the declaration's own parameters is
+// read against that type, exactly as a call to something non-generic reads it. Everything else is
+// read on its own, with what it said put back: the reading is a guess made to solve with, and a
+// complaint about a guess is one nobody asked for.
+private provisional_args(cx: &Analyzer, f: Func, slots: Buf[Option[Expr]]) -> (Buf[Type], Buf[bool])
+    var tys: Buf[Type] = buf()
+    var soft: Buf[bool] = buf()
+    val tparams = f.decl.tparams
+
+    for i in 0..<slots.len()
+        val p = f.decl.params.at(i)
+
+        slots.at(i) match
+            None ->
+                tys.push(Unknown)
+                soft.push(true)
+            Some(e) ->
+                if !ref_mentions(p.typ, tparams)
+                    val want = resolve_type(cx.an, f.scope, p.typ, no_bindings())
+                    val t = sandboxed_arg(cx, e, Some(want))
+
+                    tys.push(texpr_type(t))
+                    soft.push(false)
+                else
+                    val t = sandboxed_arg(cx, e, None)
+
+                    tys.push(texpr_type(t))
+                    soft.push(adaptable(e, t))
+
+    (tys, soft)
+end provisional_args
+
+// One reading of an argument with everything it said put back.
+private sandboxed_arg(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
+    val mark = cx.an.complaints()
+    val t = type_expr(cx, e, expected)
+
+    cx.an.restore_complaints(mark)
+    t
+end sandboxed_arg
+
+// Whether a written type names one of a list of type parameters, anywhere inside it.
+ref_mentions(t: TypeRef, names: Buf[string]) -> bool
+    if names.is_empty() then return false
+
+    *t.kind match
+        NamedType(n, args) -> holds_string(names, n) || any_ref_mentions(args, names)
+        PtrType(inner) -> ref_mentions(inner, names)
+        RefType(inner, _) -> ref_mentions(inner, names)
+        WeakType(inner) -> ref_mentions(inner, names)
+        VolatileType(inner) -> ref_mentions(inner, names)
+        // A **length** names a value parameter the way an element names a type one, so a walk that
+        // read only the element reported `N` as a parameter nothing in the call could settle.
+        ArrayType(length, elem, _) ->
+            (length.is_some() && expr_mentions(length.unwrap(), names)) || ref_mentions(elem, names)
+        VectorType(lanes, elem) -> expr_mentions(lanes, names) || ref_mentions(elem, names)
+        ValueArgType(e) -> expr_mentions(e, names)
+        TupleType(parts, _) -> any_ref_mentions(parts, names)
+        PackType(n) -> holds_string(names, n)
+        FnType(params, ret, _) -> any_ref_mentions(params, names) || ref_mentions(ret, names)
+        CFnType(params, ret) -> any_ref_mentions(params, names) || ref_mentions(ret, names)
+        AssocType(base, _) -> ref_mentions(base, names)
+        AssocArgType(_, inner) -> ref_mentions(inner, names)
+        _ -> false
+end ref_mentions
+
+// Whether a written extent names one of them, which for a bare name is the whole of the question:
+// an extent written as arithmetic over a parameter is refused at resolution rather than solved.
+private expr_mentions(e: Expr, names: Buf[string]) -> bool = *e.kind match
+    Ident(n) -> holds_string(names, n)
+    _ -> false
+
+any_ref_mentions(ts: Buf[TypeRef], names: Buf[string]) -> bool
+    for i in 0..<ts.len()
+        if ref_mentions(ts.at(i), names) then return true
+
+    false
+end any_ref_mentions

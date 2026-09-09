@@ -1,0 +1,560 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// Reaching a member: what a type declares of its own, what a trait gave it, and what a table
+// dispatches to when the value has forgotten which type it holds.
+//
+// **A member is an ordinary function under a mangled name**, so a call on a value is a call and the
+// only question here is which function. The receiver is passed as the first argument, in whatever
+// memory mode the member's `self` asked for.
+
+// `value.member` -- a property read, or a member named without the parentheses it needs.
+//
+// The reader wrote no parentheses, so what answers is a property; everything else is told what it is
+// and how to write it, which is the whole of what a message about a member owes.
+lookup_trait_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr],
+                    expected: Option[Type]) -> TExpr
+    val rty = receiver_type(texpr_type(receiver))
+
+    rty match
+        // A parameter standing in for itself, during the walk that checks a generic body once at its
+        // own definition: what it can promise is exactly what its bounds promise.
+        Abstract(_, bounds) -> read_bound_property(cx, span, receiver, rty, name, bounds)
+        // A trait object's property is a slot like any other member, dispatched through the table.
+        Trait(_, _, _) -> read_erased(cx, span, receiver, rty, name)
+        _ ->
+            val found = member_key(cx.an, rty, name)
+            val chosen = chosen_member(cx, rty, found.0, name, buf())
+            val m = member_at(cx.an, found.0, chosen)
+
+            if m.is_none() then return no_such_member(cx, span, rty, found.0, name)
+
+            val decl = m.unwrap()
+
+            if decl.is_property then
+                return member_dispatch(cx, span, receiver, rty, found.0, chosen, decl, buf(),
+                                       expected, name)
+
+            if decl.recv_mode().is_some() then
+                return cx.err(span, s"'$name' is a method of '${module_show(found.0)}' — call it " +
+                              s"with '$name(…)'")
+
+            cx.err(span, s"'$name' is an associated function of '${module_show(found.0)}' — call it " +
+                   s"with '${module_show(found.0)}.$name(…)'")
+end lookup_trait_member
+
+// `value.member(args)` -- a call, which is what the parentheses said.
+call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr],
+            expected: Option[Type]) -> TExpr
+    val rty = receiver_type(texpr_type(receiver))
+
+    if rty == Unknown then return bad_expr(span)
+
+    rty match
+        // A parameter standing in for itself: the call is checked against the *trait's* signature,
+        // which is what lets one walk stand in for every instantiation.
+        Abstract(_, bounds) -> call_bound_method(cx, span, receiver, rty, name, bounds, args)
+        // A trait object has forgotten which type it holds, and what it wrote down in its place is
+        // the table -- so a call on one is an index into that table rather than a name.
+        Trait(_, _, _) -> call_erased(cx, span, receiver, rty, name, args, expected)
+        // Everything about a weak reference is behind `get()`, including whether there still is one.
+        Weak(inner) -> weak_get(cx, span, receiver, *inner, name, args)
+        // The operation that stops a substring holding its parent buffer alive: the bytes are copied
+        // into a string that owns them, so what the result keeps is its own. Parentheses because it
+        // allocates and walks the bytes.
+        Str ->
+            if name == "copy"
+                if !args.is_empty() then
+                    cx.fault(span, "'copy' takes no arguments — it copies the string it is read off")
+
+                TExpr(span, TFromBytes(TExpr(span, TBytes(receiver))))
+            else call_declared(cx, span, receiver, rty, name, args, expected)
+        _ -> call_declared(cx, span, receiver, rty, name, args, expected)
+end call_member
+
+// A member the tables hold, called.
+private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string,
+                      args: Buf[Expr], expected: Option[Type]) -> TExpr
+    val found = member_key(cx.an, rty, name)
+    val chosen = chosen_member(cx, rty, found.0, name, args)
+    val m = member_at(cx.an, found.0, chosen)
+
+    if m.is_none() then return no_such_method(cx, span, receiver, rty, found.0, name)
+
+    val decl = m.unwrap()
+
+    // Neither of the two kinds with no receiver is reached through a value, and they are not the
+    // same mistake: a property is this call with the parentheses dropped, an associated function is
+    // not reached through a value at all.
+    if decl.is_property then
+        return cx.err(span, s"'$name' is a property of '${module_show(found.0)}' — read it as " +
+                      s"'value.$name', without '()'")
+
+    if decl.recv_mode().is_none() then
+        return cx.err(span, s"'$name' is an associated function of '${module_show(found.0)}' — " +
+                      s"call it with '${module_show(found.0)}.$name(…)'")
+
+    member_dispatch(cx, span, receiver, rty, found.0, chosen, decl, args, expected, name)
+end call_declared
+
+// The call itself, once the member is known: the receiver in the mode its `self` asked for, the
+// arguments bound and checked against the instantiated signature, and a call to the function the
+// member was lowered to.
+private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, base: string,
+                        chosen: string, m: MethodDecl, args: Buf[Expr], expected: Option[Type],
+                        written: string) -> TExpr
+    check_member_visible(cx, span, base, chosen, m)
+
+    val shown = s"method '${type_show(rty)}.$chosen'"
+    val fname = member_func_name(cx, span, rty, chosen)
+
+    if fname == "" then return bad_expr(span)
+
+    val sig = cx.an.tables.members.func_insts.get(fname)
+
+    // **A member whose own signature did not resolve is registered and has no lowered form**, which
+    // is the lowering's deliberate order: the declaration is filed before the signature is built, so
+    // that a mistake in the signature does not also erase the member it is about. The mistake has
+    // been reported where it belongs, so the call is abandoned in silence rather than complained
+    // about twice.
+    if sig.is_none() then return bad_expr(span)
+
+    val params = sig.unwrap().params
+    val slots = bind_member_args(cx, span, shown, m, args)
+
+    if slots.is_none() then return bad_expr(span)
+
+    var ts: Buf[TExpr] = buf()
+
+    ts.push(build_receiver(cx, span, m.recv_mode().unwrap(), receiver, written))
+
+    for i in 0..<slots.unwrap().len()
+        val want = if i + 1 < params.len() then params.at(i + 1).1 else Unknown
+
+        slots.unwrap().at(i) match
+            Some(e) ->
+                val t = type_expr(cx, e, Some(want))
+
+                if disagree(texpr_type(t), want) then
+                    cx.fault(e.span, s"'${m.params.at(i).name}' of $shown is ${type_show(want)}, " +
+                             s"but ${type_show(texpr_type(t))} was given")
+
+                ts.push(t)
+            None ->
+                val inner = analyzer_for(cx.an, cx.scope)
+
+                inner.reported = Some(span)
+                ts.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
+
+    TExpr(span, TCall(fname, ts, sig.unwrap().ret, false))
+end member_dispatch
+
+// Which written argument fills which of a member's parameters. The receiver is not among them, so
+// this is the free function's rule read one slot in.
+private bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
+                         args: Buf[Expr]) -> Option[Buf[Option[Expr]]]
+    var slots: Buf[Option[Expr]] = buf()
+
+    for i in 0..<m.params.len()
+        slots.push(None)
+
+    var next: usize = 0
+    var extra: usize = 0
+
+    for i in 0..<args.len()
+        val a = args.at(i)
+
+        *a.kind match
+            NamedArg(name, value) ->
+                var idx: int = -1
+
+                for j in 0..<m.params.len()
+                    if m.params.at(j).name == name then idx = int(j)
+
+                if idx < 0
+                    cx.fault(a.span, s"$shown declares no parameter named '$name'")
+                    return None
+
+                slots.set(usize(idx), Some(value))
+            _ ->
+                if next >= m.params.len() then extra += 1
+                else
+                    slots.set(next, Some(a))
+                    next += 1
+
+    var missing: usize = 0
+
+    for i in 0..<m.params.len()
+        if slots.at(i).is_none() && m.params.at(i).default.is_none() then missing += 1
+
+    if (missing > 0 || extra > 0) && !m.variadic
+        cx.fault(span, s"$shown takes ${quantity(m.params.len(), "argument")}, but " +
+                 s"${supplied_phrase(args.len(), "argument")}")
+        return None
+    end if
+
+    Some(slots)
+end bind_member_args
+
+// The receiver as the member's `self` asked for it: a copy, an address, or a counted reference.
+private build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
+                       member: string) -> TExpr = mode match
+    ByValue -> texpr_type(tr) match
+        Struct(_) -> tr
+        Enum(_) -> tr
+        _ -> auto_deref(cx, tr)
+    ByPtr -> texpr_type(tr) match
+        Ptr(_) -> tr
+        _ ->
+            val place = texpr_type(tr) match
+                Ref(_, _) -> auto_deref(cx, tr)
+                _ -> tr
+
+            if !is_place(place) then
+                cx.fault(span, "'*self' needs a variable, field, or dereference to point at — this " +
+                         "receiver has no address")
+
+            TExpr(span, TAddrOf(place, Ptr(texpr_type(place))))
+    ByRef(sync) -> texpr_type(tr) match
+        Ref(_, _) -> tr
+        _ -> TExpr(span, TBox(tr, Ref(texpr_type(tr), sync)))
+
+// The name the lowered member goes under. A member of a concrete type was lowered eagerly; a member
+// of a generic type is instantiated here, from the receiver's own type arguments, and its body
+// queued -- so both answer with a name the instantiation table holds.
+//
+// A member with type parameters **of its own** is not named by its receiver: the arguments that fix
+// those come from the call, so the call is where it is named.
+member_func_name(cx: &Analyzer, span: Span, ty: Type, mname: string) -> string
+    val found = member_key(cx.an, ty, mname)
+    val generic = cx.an.tables.members.generic.get(member_key_of(found.0, mname))
+
+    if generic.is_none()
+        val filed = cx.an.tables.members.funcs.get(member_key_of(found.0, mname))
+
+        if filed.is_some() then return filed.unwrap()
+
+        return s"${member_symbol(member_receiver_type(cx.an, ty, mname))}.$mname"
+
+    val fd = generic.unwrap()
+
+    if fd.tparams.len() > found.1.len()
+        cx.fault(span, s"'$mname' has type parameters of its own, so ${type_show(ty)} alone does " +
+                 "not say which instantiation is meant — call it, and the arguments will")
+        return ""
+
+    val home = cx.an.tables.members.generic_scope.get(fd.name).unwrap_or(cx.scope)
+
+    instantiate_func(cx.an, home, fd, found.1, viewed_const(ty, found.0))
+end member_func_name
+
+// Which of a type's members a written name means, where more than one implementation of one trait
+// gave the type a member of that name.
+//
+// A name that reaches one member comes straight back, so the ordinary call is the lookup it always
+// was. Where there are several, the arguments decide: each candidate's parameters are compared
+// against the types the arguments already have, and exactly one candidate accepting them is the
+// answer.
+//
+// This is **not** overloading, and the difference is that the answer is determined rather than
+// chosen. A trait's argument list is what tells its implementations apart, and a call carries the
+// argument list in the values it passes.
+private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string,
+                      args: Buf[Expr]) -> string
+    val alts = cx.an.tables.members.alts.get(member_key_of(base, mname))
+
+    if alts.is_none() then return mname
+
+    val cands = alts.unwrap()
+
+    if cands.len() == 1 then return cands.at(0)
+
+    var reachable: Buf[string] = buf()
+
+    for i in 0..<cands.len()
+        if member_reachable(cx, base, cands.at(i)) then reachable.push(cands.at(i))
+
+    if reachable.len() == 1 then return reachable.at(0)
+    if reachable.is_empty() then return mname
+
+    var arg_tys: Buf[Type] = buf()
+
+    for i in 0..<args.len()
+        val mark = cx.an.complaints()
+        val t = type_expr(cx, args.at(i), None)
+
+        cx.an.restore_complaints(mark)
+        arg_tys.push(texpr_type(t))
+
+    for i in 0..<reachable.len()
+        if member_accepts(cx, base, reachable.at(i), arg_tys) then return reachable.at(i)
+
+    reachable.at(0)
+end chosen_member
+
+private member_accepts(cx: &Analyzer, base: string, filed: string, arg_tys: Buf[Type]) -> bool
+    val fname = cx.an.tables.members.funcs.get(member_key_of(base, filed))
+
+    if fname.is_none() then return false
+
+    val sig = cx.an.tables.members.func_insts.get(fname.unwrap())
+
+    if sig.is_none() || sig.unwrap().params.len() != arg_tys.len() + 1 then return false
+
+    for i in 0..<arg_tys.len()
+        if arg_tys.at(i) != Unknown && disagree(arg_tys.at(i), sig.unwrap().params.at(i + 1).1) then
+            return false
+
+    true
+end member_accepts
+
+// -- what a use site is allowed to reach ------------------------------------------------------------
+
+// Whether a member a trait brought is one this file may name. A trait's member is reachable only
+// where the trait can be named, which is what keeps the first library to implement a wide trait for
+// a built-in from claiming those names from everybody.
+private member_reachable(cx: &Analyzer, base: string, filed: string) -> bool
+    val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed))
+
+    // A member that arrives with its type is reachable wherever the type is.
+    if from.is_none() then return true
+
+    reachable_key(cx.an, from.unwrap(), cx.scope) || names_trait(cx, from.unwrap())
+end member_reachable
+
+// Whether the file the expression is written in can name a trait: its own module's, one it imported,
+// or one a bound in force promised.
+private names_trait(cx: &Analyzer, key: string) -> bool
+    if module_of(key) == cx.scope.module_name then return true
+
+    for i in 0..<cx.subst.len()
+        cx.subst.at(i).ty match
+            Abstract(_, bounds) ->
+                for j in 0..<bounds.len()
+                    if bounds.at(j).name == key then return true
+            _ -> ()
+
+    lookup_trait_key(cx.an, cx.scope, module_bare(key)).unwrap_or("") == key
+end names_trait
+
+// Whether a member the reader named is one their file may reach.
+private check_member_visible(cx: &Analyzer, span: Span, base: string, filed: string, m: MethodDecl)
+    if !member_reachable(cx, base, filed)
+        val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed)).unwrap_or("")
+
+        cx.fault(span, s"'${source_member_name(filed)}' is a member '${module_show(from)}' gave " +
+                 s"'${module_show(base)}', and a trait's member is reached where the trait can be " +
+                 "named — import it")
+        return
+    end if
+
+    m.vis match
+        File ->
+            val decl_at = cx.an.tables.members.decl_scope.get(
+                cx.an.tables.members.funcs.get(member_key_of(base, filed)).unwrap_or(""))
+
+            if decl_at.is_some() && decl_at.unwrap().src.name != cx.scope.src.name then
+                cx.fault(span, s"${member_kind(m)} '${source_member_name(filed)}' of " +
+                         s"'${module_show(base)}' is private to the file that declares it")
+        _ -> ()
+end check_member_visible
+
+// -- the answers when nothing is filed ----------------------------------------------------------------
+
+private no_such_member(cx: &Analyzer, span: Span, rty: Type, base: string, name: string) -> TExpr
+    val provided = builtin_constant_read(cx, span, rty, name)
+
+    if provided.is_some() then return provided.unwrap()
+
+    cx.err(span, s"'${module_show(base)}' has no field or property '$name'")
+end no_such_member
+
+private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, base: string,
+                       name: string) -> TExpr
+    val provided = builtin_method(cx, span, receiver, rty, name)
+
+    if provided.is_some() then return provided.unwrap()
+
+    // A call reaches through one level of indirection and only one, exactly as selection does. A
+    // receiver still carrying a mode after that has more than the shorthand walks, and the complaint
+    // below would name what is *left* -- a type the reader never wrote.
+    texpr_type(receiver) match
+        Ptr(_) -> return indirection_message(cx, span, receiver, rty, name)
+        Ref(_, _) -> return indirection_message(cx, span, receiver, rty, name)
+        _ -> ()
+
+    // A member the compiler provides, written with parentheses it does not take.
+    if builtin_member(rty, name) then
+        return cx.err(span, s"'$name' is a property the compiler provides for " +
+                      s"'${module_show(base)}' — read it as 'value.$name', without '()'")
+
+    cx.err(span, s"type '${module_show(base)}' has no method '$name'")
+end no_such_method
+
+private indirection_message(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type,
+                            name: string) -> TExpr =
+    cx.err(span, s"a method call reaches through one level of indirection and " +
+           s"${type_show(texpr_type(receiver))} has more, so the rest is written: " +
+           s"'(*x).$name(…)' calls '$name' on the ${type_show(rty)} it leaves")
+
+// -- a value that has forgotten which type it holds ----------------------------------------------------
+
+// A call through a trait object: the slot the member sits in, and the table the value carries.
+private call_erased(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string,
+                    args: Buf[Expr], expected: Option[Type]) -> TExpr
+    val slot = erased_slot(cx, rty, name)
+
+    if slot.is_none()
+        // **A member the trait really has, that the table could not hold**, is worth saying so about
+        // rather than reporting as a name the trait does not declare: the reader wrote something
+        // that exists and reached it the one way that cannot work.
+        val unslotted = unslotted_member(cx, rty, name)
+
+        if unslotted then
+            return cx.err(span, s"'$name' of '${trait_bound_of(rty).name}' declares type parameters " +
+                          "of its own, so it is not a function until a call names them and no slot " +
+                          s"of a ${type_show(texpr_type(receiver))}'s table can point at it — " +
+                          "reach it through a bound, where the type is known")
+
+        return cx.err(span, s"trait '${trait_bound_of(rty).name}' declares no method '$name' — it " +
+                      s"has ${slot_names(cx, rty)}")
+    end if
+
+    val m = slot.unwrap().1
+
+    if m.is_property then
+        return cx.err(span, s"'$name' is a property of '${trait_bound_of(rty).name}' — read it as " +
+                      s"'value.$name', without '()'")
+
+    erased_call(cx, span, receiver, rty, slot.unwrap().0, slot.unwrap().2, m, args)
+end call_erased
+
+// A property read through a trait object, which is the same slot with no arguments.
+private read_erased(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string) -> TExpr
+    val slot = erased_slot(cx, rty, name)
+
+    if slot.is_none() then
+        return cx.err(span, s"a ${type_show(texpr_type(receiver))} has no fields, and trait " +
+                      s"'${trait_bound_of(rty).name}' declares no '$name'")
+
+    val m = slot.unwrap().1
+
+    if !m.is_property then
+        return cx.err(span, s"'$name' is a method of '${trait_bound_of(rty).name}' — call it with " +
+                      s"'$name(…)'")
+
+    erased_call(cx, span, receiver, rty, slot.unwrap().0, slot.unwrap().2, m, buf())
+end read_erased
+
+// The slot a name sits in, the member the trait declared, and the bound of the trait that declared
+// it. The table is laid out from the same list a bound licenses, which is what makes a slot number
+// mean one thing.
+// Whether a name the table has no slot for is one the trait really declares.
+private unslotted_member(cx: &Analyzer, rty: Type, name: string) -> bool
+    val all = trait_members(cx.an, trait_bound_of(rty), self_binding(rty))
+
+    for i in 0..<all.len()
+        if all.at(i).1.name == name then return true
+
+    false
+end unslotted_member
+
+// The members a table lays out, as a message lists them.
+private slot_names(cx: &Analyzer, rty: Type) -> string
+    val members = slotted_members(cx.an, trait_bound_of(rty), self_binding(rty))
+    var b = str_builder()
+
+    for i in 0..<members.len()
+        if i > 0 then b.push("', '")
+
+        b.push(members.at(i).1.name)
+
+    s"'${b.finish()}'"
+end slot_names
+
+private erased_slot(cx: &Analyzer, rty: Type, name: string) -> Option[(int, MethodDecl, Bound)]
+    val members = slotted_members(cx.an, trait_bound_of(rty), self_binding(rty))
+
+    for i in 0..<members.len()
+        if members.at(i).1.name == name then return Some((int(i), members.at(i).1, members.at(i).0))
+
+    None
+end erased_slot
+
+// The call itself, with the member's signature read in the object's own terms: `Self` is the object,
+// which is what an object writes its bindings down for.
+private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot: int,
+                    tr: Bound, m: MethodDecl, args: Buf[Expr]) -> TExpr
+    val scope = trait_scope_of(cx.an, tr.name)
+    val d = trait_decl_at(cx.an, tr.name)
+    var subst = self_binding(rty)
+
+    if d.is_some()
+        for i in 0..<d.unwrap().tparams.len()
+            if i < tr.args.len() then subst.push(Binding(d.unwrap().tparams.at(i), tr.args.at(i)))
+
+    var ts: Buf[TExpr] = buf()
+
+    for i in 0..<args.len()
+        val want = if i < m.params.len() then
+                       Some(resolve_type(cx.an, scope, m.params.at(i).typ, subst))
+                   else None
+
+        ts.push(type_expr(cx, args.at(i), want))
+
+    val ret = if m.ret_type.is_some() then
+                  declared_result_type(Some(resolve_type(cx.an, scope, m.ret_type.unwrap(), subst)))
+              else Unit
+
+    TExpr(span, TVCall(receiver, slot, ts, ret, false))
+end erased_call
+
+// Everything about a weak reference is behind `get()`, including whether there still is one.
+private weak_get(cx: &Analyzer, span: Span, receiver: TExpr, inner: Type, name: string,
+                 args: Buf[Expr]) -> TExpr
+    if name != "get" then
+        return cx.err(span, s"a weak ${type_show(inner)} has no method '$name' — a weak reference " +
+                      "may be gone, so 'get()' is the only thing to ask one, and what it hands " +
+                      "back is what has methods")
+
+    if !args.is_empty() then cx.fault(span, "'get' takes no arguments")
+
+    val key = library_key("Option")
+    var targs: Buf[Type] = buf()
+
+    targs.push(Ref(inner, false))
+
+    val opt = reinstantiate(cx.an, key, targs)
+
+    opt match
+        Enum(d) ->
+            val some = d.variant("Some")
+            val none = d.variant("None")
+
+            if some.is_none() || none.is_none() then return bad_expr(span)
+
+            TExpr(span, TUpgrade(receiver, opt, some.unwrap(), none.unwrap()))
+        _ -> bad_expr(span)
+end weak_get
+
+// -- the members the compiler supplies -----------------------------------------------------------------
+
+// A member the compiler provides for a built-in, called: the bit surface, the magnitude and the
+// sign, and a hash.
+private builtin_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type,
+                       name: string) -> Option[TExpr]
+    val numeric = core_numeric(name)
+
+    if numeric.is_none() then return None
+
+    if !core_builtin(numeric.unwrap(), rty) then return None
+
+    None
+end builtin_method
+
+// A receiverless member the compiler provides, read through a type rather than off a value.
+private builtin_constant_read(cx: &Analyzer, span: Span, rty: Type, name: string) -> Option[TExpr] =
+    None

@@ -1,0 +1,165 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What the compiler says when a member, a bound or an `impl` block is wrong.
+//
+// **Every message here was obtained by running the reference compiler on the same source and quoting
+// what came back.** None of them is composed from a rule: the wording is a specification, and a
+// message that reads differently is a difference between the two compilers whether or not it means
+// the same thing.
+
+private only(text: string) -> string
+    val said = trait_diagnostics(text)
+
+    if said.is_empty() then "" else said.at(0)
+end only
+
+private point() -> string = "struct P\n    x: int\n"
+
+private show_trait() -> string = "trait Show\n    show(self) -> int\n\n"
+
+// -- reaching a member ---------------------------------------------------------------------------
+
+@test("a name a type has no member of is told what it does not have, in the words the read used")
+a_name_no_member_answers()
+    assert_eq(only(point() + "\nf(p: P) -> int = p.nope\n"), "'P' has no field or property 'nope'")
+    assert_eq(only(point() + "\nf(p: P) -> int = p.nope()\n"), "type 'P' has no method 'nope'")
+
+@test("and a member reached the wrong way is told which way is right")
+a_member_reached_the_wrong_way()
+    assert_eq(only(point() + "\n    area -> int = 1\n\nf(p: P) -> int = p.area()\n"),
+              "'area' is a property of 'P' — read it as 'value.area', without '()'")
+    assert_eq(only(point() + "\n    area(self) -> int = 1\n\nf(p: P) -> int = p.area\n"),
+              "'area' is a method of 'P' — call it with 'area(…)'")
+    assert_eq(only(point() + "\n    make(v: int) -> P = P(v)\n\nf(p: P) -> int = p.make(1).x\n"),
+              "'make' is an associated function of 'P' — call it with 'P.make(…)'")
+
+@test("a call reaches through one level of indirection, and the rest is written out")
+one_level_of_indirection()
+    assert_eq(only(point() + "\n    area(self) -> int = 1\n\nf(p: **P) -> int = p.area()\n"),
+              "a method call reaches through one level of indirection and **P has more, so the " +
+              "rest is written: '(*x).area(…)' calls 'area' on the *P it leaves")
+
+// -- what a bound licenses -----------------------------------------------------------------------
+
+@test("a generic nothing instantiates is still checked, and the bound is what it is told to write")
+a_generic_is_checked_at_its_definition()
+    assert_eq(only(show_trait() + "loose[T](x: T) -> int = x.show()\n"), "'show' needs 'T: Show'")
+
+@test("a method no trait declares names no bound to add")
+a_method_no_trait_declares()
+    assert_eq(only("loose[T](x: T) -> int = x.nope()\n"),
+              "no trait declares a method 'nope', so no bound on 'T' could license this call")
+
+@test("and a method two traits declare offers both")
+a_method_two_traits_declare()
+    assert_eq(only(show_trait() + "trait Render\n    show(self) -> int\n\n" +
+                   "loose[T](x: T) -> int = x.show()\n"),
+              "'show' needs a bound on 'T' — it is declared by 'Show', 'Render'")
+
+@test("the call is checked against the trait's signature, not against any implementation's")
+checked_against_the_traits_signature()
+    assert_eq(only(show_trait() + "render[T: Show](x: T) -> int = x.show(1)\n"),
+              "method 'Show.show' takes 0 arguments, but 1 argument was given")
+    assert_eq(only("trait Scale\n    by(self, n: int) -> int\n\n" +
+                   "render[T: Scale](x: T) -> int = x.by(\"a\")\n"),
+              "'n' of 'Scale.by' is int, but string was given")
+
+@test("an unbounded parameter cannot satisfy a callee's bound")
+an_unbounded_parameter()
+    assert_eq(only(show_trait() + "render[T: Show](x: T) -> int = x.show()\n" +
+                   "outer[U](x: U) -> int = render(x)\n"),
+              "'render' requires its type parameter 'T' to implement 'Show', but 'U' is not " +
+              "bounded by it")
+
+@test("and a concrete argument that does not implement the bound is told so at the call")
+a_concrete_argument_that_does_not()
+    assert_eq(only(show_trait() + "render[T: Show](x: T) -> int = x.show()\n" +
+                   "use() -> int = render(3)\n"),
+              "'render' requires its type parameter 'T' to implement 'Show', but int does not")
+
+@test("a parameter no call could settle is refused where it is written")
+a_parameter_no_call_settles()
+    assert_eq(only("f[T]() -> int = 1\nuse() -> int = f()\n"),
+              "'T' is in neither the parameters of 'f' nor its result, so nothing in this call " +
+              "says what it should be — write it out, as 'f[…](…)'")
+
+@test("a bound naming something that is not a trait is refused at the bound")
+a_bound_that_is_not_a_trait()
+    assert_eq(only("struct Box[T]\n    x: T\n\nf[T: Box](v: T) -> int = 1\n"),
+              "the bound on 'T' in 'f' names 'Box', which is not a trait")
+
+@test("and a trait applied to the wrong number of arguments is told in a trait's words")
+a_trait_at_the_wrong_arity()
+    assert_eq(only("trait Sink[T]\n    put(self, x: T)\n\nf[T: Sink[int, bool]](x: T) -> int = 1\n"),
+              "trait 'Sink' takes 1 type argument, but 2 type arguments were given")
+    assert_eq(only("trait Plain\n    go(self)\n\nf[T: Plain[int]](x: T) -> int = 1\n"),
+              "trait 'Plain' does not take type arguments")
+
+// -- what an implementation owes -----------------------------------------------------------------
+
+@test("a member the trait does not declare is not one an implementation may define")
+a_member_the_trait_does_not_declare()
+    assert_eq(only(show_trait() + point() + "\nimpl Show for P\n    show(self) -> int = self.x\n" +
+                   "    other(self) -> int = 1\n"),
+              "trait 'Show' declares no method 'other', so this 'impl' cannot define it")
+
+@test("and one it declares without a body is one the implementation owes")
+a_member_the_implementation_owes()
+    assert_eq(only("trait Show\n    show(self) -> int\n    tag(self) -> int\n\n" + point() +
+                   "\nimpl Show for P\n    show(self) -> int = self.x\n"),
+              "'P' does not implement 'Show': method 'tag' is missing")
+
+@test("replacing a default says so, and supplying a requirement does not")
+override_says_which_it_is()
+    assert_eq(only("trait Show\n    show(self) -> int = 1\n\n" + point() +
+                   "\nimpl Show for P\n    show(self) -> int = self.x\n"),
+              "trait 'Show' supplies a body for method 'show', so writing one here replaces it — " +
+              "say 'override show', or leave the member out to keep the trait's")
+
+@test("a signature that does not match the trait's is reported at the part that differs")
+a_signature_that_does_not_match()
+    assert_eq(only(show_trait() + point() + "\nimpl Show for P\n" +
+                   "    show(self, n: int) -> int = self.x\n"),
+              "method 'show' of 'impl Show for P' takes 1 parameters, but the trait declares 0")
+    assert_eq(only(show_trait() + point() + "\nimpl Show for P\n    show(self) -> string = \"a\"\n"),
+              "method 'show' returns string, but trait 'Show' declares int")
+
+@test("a trait implemented twice at one argument list is refused at the second block")
+a_trait_implemented_twice()
+    assert_eq(only(show_trait() + point() + "\nimpl Show for P\n    show(self) -> int = self.x\n\n" +
+                   "impl Show for P\n    show(self) -> int = 2\n"),
+              "'P' already implements 'Show'")
+
+@test("an associated type the trait leaves open is one the implementation fills")
+an_associated_type_is_owed()
+    assert_eq(only("trait Holder\n    type Item\n\n    get(self) -> Self::Item\n\n" + point() +
+                   "\nimpl Holder for P\n    get(self) -> int = self.x\n"),
+              "'P' does not implement 'Holder': the associated type 'Item' is missing — supply it " +
+              "with 'type Item = …', or give the member that produces it the result 'some Trait' " +
+              "and let the body say what it is")
+
+@test("a block written for a bare type parameter says how every type behaves, and is refused")
+a_blanket_over_everything()
+    assert_eq(only(show_trait() + "impl[T] Show for T\n    show(self) -> int = 1\n"),
+              "'T' is a type parameter of this 'impl', so it stands for every type at once — an " +
+              "'impl' says how one kind of type behaves. A bound the compiler closes is the " +
+              "exception, since it names a family rather than every type")
+
+@test("a name a type's own body already used is a collision whatever brought the second one")
+a_member_name_collision()
+    assert_eq(only(point() + "\n    x(self) -> int = 1\n"),
+              "type 'P' has both a field and a member named 'x'")
+    assert_eq(only(show_trait() + point() + "\nimpl Show for P\n    show(self) -> int = self.x\n" +
+                   "    show(self) -> int = 2\n"),
+              "type 'P' already has a member named 'show'")
+
+// -- a value that has forgotten its type ---------------------------------------------------------
+
+@test("a trait object reaches what its table holds, and is told what that is")
+an_object_reaches_its_table()
+    assert_eq(only(show_trait() + "f(s: &Show) -> int = s.nope()\n"),
+              "trait 'Show' declares no method 'nope' — it has 'show'")

@@ -1,0 +1,142 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// What a generic declaration **becomes**, asked through the instantiations a program's calls made.
+//
+// **A generic is not a function**, so there is no one body to ask about: what a program runs is the
+// instantiation a call asked for, filed under the declaration's name with its arguments mangled onto
+// it. `inst_type` reads one of those by name and `inst_names` says which ones a source came to,
+// which between them are what a claim about inference can be written against.
+//
+// **Every claim here was read out of the reference compiler**, either from a test of its own or by
+// handing the installed `sysl` the same source and asking `emit-typed` what it made.
+
+private held(text: string, name: string) -> string = inst_type(text, name)
+
+private made(text: string) -> Buf[string] = inst_names(text)
+
+private made_holds(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end made_holds
+
+private trait_show() -> string = "trait Show\n    show(self) -> int\n"
+
+@test("a call's arguments say what a type parameter is, and the instantiation is named for them")
+arguments_settle_the_parameter()
+    val src = "id[T](x: T) -> T = x\n" +
+              "use() -> int = id(3)\n" +
+              "other() -> string = id(\"hi\")\n"
+
+    assert(made_holds(made(src), "id.int"), "the int instantiation was made")
+    assert(made_holds(made(src), "id.string"), "the string instantiation was made")
+    assert_eq(held(src, "id.int"), "int")
+    assert_eq(held(src, "id.string"), "string")
+
+@test("and one call makes one instantiation, however many times it is written")
+one_instantiation_per_argument_list()
+    val src = "id[T](x: T) -> T = x\n" +
+              "use() -> int = id(3) + id(4)\n"
+    var seen: usize = 0
+    val names = made(src)
+
+    for i in 0..<names.len()
+        if names.at(i) == "id.int" then seen += 1
+
+    assert_eq(seen, 1)
+
+@test("the type a position expects settles what the arguments do not")
+the_expected_type_settles_the_rest()
+    val src = "none_of[T]() -> *T = null\n" +
+              "use() -> *u8 = none_of()\n"
+
+    assert_eq(held(src, "none_of.byte"), "*byte")
+
+@test("a bare literal is the weakest thing in the room, so an argument that knows wins")
+a_literal_is_consulted_last()
+    val src = "pick[T](a: T, b: T) -> T = a\n" +
+              "use() -> byte = pick(1, 250u8)\n"
+
+    assert_eq(held(src, "pick.byte"), "byte")
+
+@test("an array is matched against a slice parameter, because the call coerces one")
+an_array_solves_a_slice_parameter()
+    val src = "first[T](xs: []const T) -> usize = xs.len\n" +
+              "use() -> usize = first([1, 2, 3])\n"
+
+    assert(made_holds(made(src), "first.int"), "the element type was read off the array")
+
+@test("a length is a value a parameter may stand for, read off the argument's own type")
+a_length_binds_a_value_parameter()
+    val src = "count[const N: usize, T](a: [N]T) -> usize = N\n" +
+              "use() -> usize = count([1, 2, 3])\n"
+
+    assert(made_holds(made(src), "count.c3.int"), s"made ${first_of(made(src))}")
+
+@test("a vector's lane count binds one the same way, which is what lets one kernel serve every width")
+lanes_bind_a_value_parameter()
+    val src = "lanes[const W: usize](v: <W>f32) -> usize = W\n" +
+              "use(v: <4>f32) -> usize = lanes(v)\n"
+
+    assert(made_holds(made(src), "lanes.c4"), s"made ${first_of(made(src))}")
+
+@test("a generic type's argument is read through the type it was written on")
+a_generic_types_argument_is_read()
+    val src = "struct Box[T]\n    x: T\n\n" +
+              "inner[T](b: Box[T]) -> T = b.x\n" +
+              "use(b: Box[string]) -> string = inner(b)\n"
+
+    assert_eq(held(src, "inner.string"), "string")
+
+@test("a parameter nothing in the call reaches is refused where it is written")
+a_parameter_nothing_reaches()
+    assert_eq(first_of(trait_diagnostics("f[T]() -> int = 1\nuse() -> int = f()\n")),
+              "'T' is in neither the parameters of 'f' nor its result, so nothing in this call " +
+              "says what it should be — write it out, as 'f[…](…)'")
+
+@test("a member of a generic type is made real from the receiver's own arguments")
+a_generic_types_member()
+    val src = "struct Box[T]\n" +
+              "    x: T\n\n" +
+              "    get(self) -> T = self.x\n\n" +
+              "use(b: Box[int]) -> int = b.get()\n"
+
+    assert_eq(held(src, "Box.get.int"), "int")
+
+@test("a type parameter carries what its bound promised, and the call is checked against the trait")
+a_bound_licenses_a_call()
+    val src = trait_show() +
+              "struct P\n    v: int\n\n" +
+              "impl Show for P\n    show(self) -> int = self.v\n\n" +
+              "render[T: Show](x: T) -> int = x.show()\n" +
+              "use(p: P) -> int = render(p)\n"
+
+    assert_eq(held(src, "render.P"), "int")
+
+@test("and the instantiation resolves the same call against the implementation")
+an_instantiation_resolves_concretely()
+    val src = trait_show() +
+              "struct P\n    v: int\n\n" +
+              "impl Show for P\n    show(self) -> int = self.v\n\n" +
+              "render[T: Show](x: T) -> int = x.show()\n" +
+              "use(p: P) -> int = render(p)\n"
+
+    assert(made_holds(made(src), "P.show"), "the implementation's member was lowered")
+
+// The first of a list, for a message that has to show what was actually made.
+private first_of(names: Buf[string]) -> string
+    var b = str_builder()
+
+    for i in 0..<names.len()
+        if i > 0 then b.push(", ")
+
+        b.push(names.at(i))
+
+    b.finish()
+end first_of

@@ -1,0 +1,209 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// Calling a member on a receiver whose type is not yet a concrete one.
+//
+// **A generic body is checked once, at its definition**, with each type parameter opaque except for
+// what its bounds promise: the call is looked up in the traits the bounds name and checked against
+// the *trait's* signature, which is what lets one walk stand in for every instantiation. An `impl`
+// conforms to its trait exactly, so a call the trait's signature accepts is one every implementation
+// accepts.
+//
+// **Nothing else will ever check these.** An instantiation resolves the same call against a concrete
+// implementation, so a mistake in what a bound licenses is caught here or nowhere -- which is why the
+// complaints survive a walk that is otherwise thrown away.
+
+// The first member of that name one of a parameter's bounds declares, with the substitution its
+// signature is read under.
+//
+// That substitution is the whole of what a bound's *arguments* buy. `Self` is the parameter itself,
+// which is what makes an `add` yield a `T` and an `lt` a `bool` inside a body that has not met a
+// concrete type yet; the trait's own parameters are the arguments the bound applied it to, so a
+// `T: From[int]` has a `from` that takes an `int`.
+bound_member(a: &Analysis, subject: Type, bounds: Buf[Bound],
+             mname: string) -> Option[(Bound, Buf[Binding], MethodDecl)]
+    for i in 0..<bounds.len()
+        val closure = trait_closure(a, bounds.at(i), self_binding(subject))
+
+        for j in 0..<closure.len()
+            val b = closure.at(j)
+            val d = trait_decl_at(a, b.name)
+
+            if d.is_some()
+                val m = trait_method(d.unwrap(), mname)
+
+                if m.is_some()
+                    var subst = self_binding(subject)
+
+                    // Padded rather than zipped, because a bound whose own resolution failed is
+                    // recorded with whatever survived of its arguments -- and reading a member
+                    // against a short list would report the trait's signature as unresolvable.
+                    for k in 0..<d.unwrap().tparams.len()
+                        val arg = if k < b.args.len() then b.args.at(k) else Unknown
+
+                        subst.push(Binding(d.unwrap().tparams.at(k), arg))
+
+                    return Some((b, subst, m.unwrap()))
+
+    None
+end bound_member
+
+// `x.m(…)` where `x` is a type parameter.
+call_bound_method(cx: &Analyzer, span: Span, receiver: TExpr, subject: Type, name: string,
+                  bounds: Buf[Bound], args: Buf[Expr]) -> TExpr
+    val found = bound_member(cx.an, subject, bounds, name)
+
+    if found.is_none() then return unlicensed(cx, span, subject, name)
+
+    val tr = found.unwrap().0
+    val subst = found.unwrap().1
+    val m = found.unwrap().2
+    val fname = s"${tr.name}.$name"
+    val shown = s"method '${module_show(tr.name)}.$name'"
+
+    if m.is_property then
+        cx.an.bound_fault(cx.scope, span, s"'$name' is a property of '${tr.show()}' — read it as " +
+                          s"'value.$name', without '()'")
+
+    if m.recv_mode().is_none() then
+        cx.an.bound_fault(cx.scope, span, s"'$name' is an associated function of '${tr.show()}', so " +
+                          "it has no receiver — a value cannot be the thing it is called on")
+
+    val scope = trait_scope_of(cx.an, tr.name)
+    var params: Buf[(string, Type)] = buf()
+
+    for i in 0..<m.params.len()
+        params.push((m.params.at(i).name, resolve_type(cx.an, scope, m.params.at(i).typ, subst)))
+
+    if args.len() != params.len() && !m.variadic
+        cx.an.bound_fault(cx.scope, span, s"$shown takes ${quantity(params.len(), "argument")}, but " +
+                          s"${supplied_phrase(args.len(), "argument")}")
+        return bad_expr(span)
+    end if
+
+    var ts: Buf[TExpr] = buf()
+
+    ts.push(receiver)
+
+    for i in 0..<args.len()
+        val want = if i < params.len() then Some(params.at(i).1) else None
+        val t = type_expr(cx, args.at(i), want)
+
+        if want.is_some() && disagree(texpr_type(t), want.unwrap()) then
+            cx.an.bound_fault(cx.scope, args.at(i).span,
+                              s"'${params.at(i).0}' of '${module_show(tr.name)}.$name' is " +
+                              s"${type_show(want.unwrap())}, but ${type_show(texpr_type(t))} was given")
+
+        ts.push(t)
+
+    val ret = if m.ret_type.is_some() then
+                  declared_result_type(Some(resolve_type(cx.an, scope, m.ret_type.unwrap(), subst)))
+              else Unit
+
+    TExpr(span, TCall(fname, ts, ret, false))
+end call_bound_method
+
+// `x.p` where `x` is a type parameter and `p` is a property one of its bounds declares -- the read a
+// bound method call is to a call, checked the same way and for the same reason.
+//
+// A **field** would be refused here whatever the bounds said, because a field is layout and no
+// promise about behaviour reaches one. A property is the opposite case: it is behaviour that happens
+// to be spelled like a field, so a trait can promise it.
+read_bound_property(cx: &Analyzer, span: Span, receiver: TExpr, subject: Type, name: string,
+                    bounds: Buf[Bound]) -> TExpr
+    val found = bound_member(cx.an, subject, bounds, name)
+
+    if found.is_none() then return unlicensed_property(cx, span, subject, name)
+
+    val tr = found.unwrap().0
+    val subst = found.unwrap().1
+    val m = found.unwrap().2
+
+    if !m.is_property then
+        cx.an.bound_fault(cx.scope, span, s"'$name' is a method of '${tr.show()}' — call it with " +
+                          s"'$name(…)'")
+
+    val scope = trait_scope_of(cx.an, tr.name)
+    val ret = if m.ret_type.is_some() then
+                  declared_result_type(Some(resolve_type(cx.an, scope, m.ret_type.unwrap(), subst)))
+              else Unit
+    var ts: Buf[TExpr] = buf()
+
+    ts.push(receiver)
+    TExpr(span, TCall(s"${tr.name}.$name", ts, ret, false))
+end read_bound_property
+
+// -- what to say when no bound licenses the name -----------------------------------------------------
+
+// The traits a file can name that declare a member of this name, which is what the fix is written
+// out of: with one, the bound to add; with several, the choice the reader has to make.
+private declaring_traits(cx: &Analyzer, name: string, want_property: bool,
+                         want_associated: bool) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<cx.an.tables.types.len()
+        val key = cx.an.tables.types.key_at(i)
+        val d = trait_decl_at(cx.an, key)
+
+        if d.is_some() && reachable_key(cx.an, key, cx.scope)
+            val m = trait_method(d.unwrap(), name)
+
+            if m.is_some()
+                var fits = true
+
+                if want_property then fits = m.unwrap().is_property
+                else if want_associated then fits = m.unwrap().recv_mode().is_none()
+
+                if fits then out.push(module_show(key))
+
+    out
+end declaring_traits
+
+private unlicensed(cx: &Analyzer, span: Span, subject: Type, name: string) -> TExpr
+    val named = declaring_traits(cx, name, false, false)
+
+    if named.is_empty() then
+        return kept_error(cx, span, s"no trait declares a method '$name', so no bound on " +
+                          s"'${type_show(subject)}' could license this call")
+
+    if named.len() == 1 then
+        return kept_error(cx, span, s"'$name' needs '${type_show(subject)}: ${named.at(0)}'")
+
+    kept_error(cx, span, s"'$name' needs a bound on '${type_show(subject)}' — it is declared by " +
+               quoted_list(named))
+end unlicensed
+
+private unlicensed_property(cx: &Analyzer, span: Span, subject: Type, name: string) -> TExpr
+    val named = declaring_traits(cx, name, true, false)
+
+    if named.is_empty() then
+        return kept_error(cx, span, s"'${type_show(subject)}' is a type parameter, so it has no " +
+                          "fields to read — a field is layout, and no trait declares a property " +
+                          s"'$name' that a bound could promise instead")
+
+    if named.len() == 1 then
+        return kept_error(cx, span, s"'$name' needs '${type_show(subject)}: ${named.at(0)}'")
+
+    kept_error(cx, span, s"'$name' needs a bound on '${type_show(subject)}' — it is declared by " +
+               quoted_list(named))
+end unlicensed_property
+
+// A complaint the walk keeps, and the node a caller carries on with.
+private kept_error(cx: &Analyzer, span: Span, message: string) -> TExpr
+    cx.an.bound_fault(cx.scope, span, message)
+    bad_expr(span)
+end kept_error
+
+private quoted_list(names: Buf[string]) -> string
+    var b = str_builder()
+
+    for i in 0..<names.len()
+        if i > 0 then b.push(", ")
+
+        b.push(s"'${names.at(i)}'")
+
+    b.finish()
+end quoted_list

@@ -24,6 +24,21 @@ import sysl.text.{split, str_builder, Search}
 // Where the reference compiler is, or nothing where this machine has no copy of it.
 private oracle() -> Option[string] = env_var("SYSL_ORACLE")
 
+// Where a sweep leaves the line it counted, for a reader who wants the numbers rather than a pass.
+//
+// **The test runner shows what a test says only when it fails**, so a sweep that agrees prints its
+// counts into a report nobody sees. `SYSL_ORACLE_SUMMARY` names a file to append them to; with the
+// variable unset nothing is written, which is what keeps a run that only wants a verdict silent.
+private record_summary(line: string)
+    val where = env_var("SYSL_ORACLE_SUMMARY")
+
+    if where.is_none() then return
+
+    val held = read_text(where.unwrap()).unwrap_or("")
+
+    write_text(where.unwrap(), s"$held$line\n").unwrap_or(())
+end record_summary
+
 private present(path: string) -> bool = metadata(path).is_ok()
 
 private is_sysl_source(path: string) -> bool = path.ends_with(".sysl") || path.ends_with(".lsysl")
@@ -427,6 +442,7 @@ the_typed_trees_agree()
                 s"${found.skipped_absent} the reference did not print"
 
             print(summary)
+            record_summary(s"$summary${found.first_bad}")
             assert(found.matched > 0, "the sweep compared something")
             assert(found.first_bad == "", s"$summary${found.first_bad}")
             assert(found.mismatched == 0, summary)
@@ -603,8 +619,11 @@ the_declaration_tables_agree()
 
             remove_file(scratch)
 
-            print(s"declaration tables: ${found.files} files compared, ${found.mismatched} " +
-                  s"mismatched, ${found.skipped} skipped")
+            val tables = s"declaration tables: ${found.files} files compared, " +
+                         s"${found.mismatched} mismatched, ${found.skipped} skipped"
+
+            print(tables)
+            record_summary(tables)
 
             assert(found.files > 0, "the sweep compared something")
             assert_eq(found.first_bad, "")
