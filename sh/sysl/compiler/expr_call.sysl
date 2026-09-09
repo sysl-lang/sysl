@@ -641,8 +641,15 @@ function_keys(cx: &Analyzer, written: string) -> Buf[string]
 
         if !set.is_empty() then return set
 
+    // The reader's own module, and only the declarations of it the reader's file may name.
+    //
+    // **A file-private declaration of ANOTHER file is not in the set at all**, which is what keeps a
+    // helper one file kept to itself from deciding what a name means everywhere else in the module.
+    // Where the whole set is out of reach it is still the right answer to end on -- a call of a name
+    // that is genuinely private somewhere else should say so rather than say it does not exist -- so
+    // it is held back and used only when nothing else answered.
     val here = module_qualify(cx.scope.module_name, written)
-    val mine = overload_keys(cx.an, here)
+    val mine = visible_keys(cx, overload_keys(cx.an, here))
 
     if !mine.is_empty() then return mine
 
@@ -657,8 +664,40 @@ function_keys(cx: &Analyzer, written: string) -> Buf[string]
 
     if !dotted.is_empty() then return dotted
 
-    buf()
+    // **A module may be written out in full at the call**, `sysl.slices.equal(a, b)`, which is a
+    // module path and a name and not a member reached on a value. The cut is at the LAST dot,
+    // because everything before it is the module and a module name holds as many dots as it likes.
+    // It is asked last, so a name the file already has a meaning for keeps it.
+    val cut = last_dot_in(written)
+
+    if cut.is_some()
+        val head = written[0..<cut.unwrap()]
+        val tail = written[(cut.unwrap() + 1)..<written.bytes.len]
+        val aliased = cx.scope.imports.module_as(head)
+
+        if aliased.is_some()
+            val set = overload_keys(cx.an, module_qualify(aliased.unwrap(), tail))
+
+            if !set.is_empty() then return set
+        end if
+
+        val set = overload_keys(cx.an, module_qualify(head, tail))
+
+        if !set.is_empty() then return set
+    end if
+
+    overload_keys(cx.an, here)
 end function_keys
+
+// The declarations of a set the reader's own file may name.
+private visible_keys(cx: &Analyzer, keys: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<keys.len()
+        if reachable_key(cx.an, keys.at(i), cx.scope) then out.push(keys.at(i))
+
+    out
+end visible_keys
 
 // The key a dotted name spells where its head is a module the file bound a name to.
 private module_bound_key(cx: &Analyzer, written: string) -> Option[string]
