@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, add, cmp, from_int, mul, negate, sub, to_string}
+import sysl.math.bigint.{BigInt, add, cmp, div_rem, from_int, mul, negate, pow, sub, to_string}
 
 // What an expression comes to while compiling, where it comes to anything.
 //
@@ -123,8 +123,50 @@ private int_binary(op: string, x: BigInt, y: BigInt) -> Option[Const]
     if op == ">" then return Some(ConstBool(cmp(x, y) > 0))
     if op == ">=" then return Some(ConstBool(cmp(x, y) >= 0))
 
+    // A division by zero is a mistake in what was written rather than something to answer, and it
+    // is left to the reading that asked for the fold to say so.
+    if op == "/" then
+        if cmp(y, from_int(0)) == 0 then return None
+        else return Some(ConstInt(div_rem(x, y).0))
+
+    if op == "%" then
+        if cmp(y, from_int(0)) == 0 then return None
+        else return Some(ConstInt(div_rem(x, y).1))
+
+    if op == "<<" || op == ">>" then return shifted(op, x, y)
+
     None
 end int_binary
+
+// A constant shift, done as a multiplication or a division by a power of two, since these are
+// numbers with no width to shift bits inside of.
+//
+// **The ceiling on the distance is the widest integer a type may be and not 64**, because a shift
+// past 64 places is meaningful the moment a type is wider than that: `1 << 200` is an ordinary
+// constant at `u256`. A distance beyond every possible width is refused -- it cannot be a shift of
+// anything, and the number it would produce is unbounded.
+private shifted(op: string, x: BigInt, places: BigInt) -> Option[Const]
+    if cmp(places, from_int(0)) < 0 || cmp(places, from_int(long(MaxIntegerBits))) > 0 then
+        return None
+
+    val n = places.to_long()
+
+    if n.is_none() then return None
+
+    val scale = pow(from_int(2), usize(n.unwrap()))
+
+    if op == "<<" then return Some(ConstInt(mul(x, scale)))
+
+    // **A right shift rounds DOWN and a division rounds toward zero**, and the two disagree on
+    // every negative value that does not divide exactly: `-3 >> 1` is `-2` and `-3 / 2` is `-1`.
+    // The shift is the arithmetic one, so a negative left over takes the quotient one further down.
+    val q = div_rem(x, scale)
+
+    if cmp(x, from_int(0)) < 0 && cmp(q.1, from_int(0)) != 0 then
+        return Some(ConstInt(sub(q.0, from_int(1))))
+
+    Some(ConstInt(q.0))
+end shifted
 
 private bool_binary(op: string, x: bool, y: bool) -> Option[Const]
     if op == "&&" then return Some(ConstBool(x && y))

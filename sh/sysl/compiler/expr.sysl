@@ -352,10 +352,30 @@ private const_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
 
     // Read in the declaration's own terms, since that is where its names mean what they meant.
     val inner = analyzer_for(cx.an, d.scope)
+
+    // **A `const` IS ITS VALUE, so a use of one is the value and not the arithmetic that wrote it.**
+    // `(1 << 23) - 1` is a way of saying 8388607 that a reader can check, and every use of the name
+    // is the number. Where the initializer is something no fold answers -- a struct, an array, a
+    // call -- the expression itself is what a use gets, exactly as it was.
+    val settled = const_fold(inner, d.init.unwrap())
+
+    if settled.is_some()
+        val lit = const_literal(span, settled.unwrap(), ty)
+
+        if lit.is_some() then return lit.unwrap()
+    end if
+
     val folded = type_expr(inner, d.init.unwrap(), Some(ty))
 
     TExpr(span, *folded.kind)
 end const_expr
+
+// A settled value as the literal a use of the name reads, where there is a literal form for it.
+private const_literal(span: Span, v: Const, ty: Type) -> Option[TExpr] = v match
+    ConstInt(n) -> Some(TExpr(span, TIntLit(n, ty)))
+    ConstBool(b) -> Some(TExpr(span, TBoolLit(b)))
+    ConstStr(s) -> Some(TExpr(span, TStrLit(s)))
+    _ -> None
 
 // Whether a name that stands for module storage is one a program may write to.
 private writable_key(cx: &Analyzer, key: string) -> bool
