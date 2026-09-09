@@ -1,0 +1,101 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.math.bigint.from_int
+import sysl.buf.{Buf, buf}
+
+// The forms the compiler answers to by name, and implements no part of.
+//
+// **`print` is a DESUGARING and not a builtin.** The compiler knows a handful of *names* the way it
+// already knows `Option`'s variants, and the printing itself is the library's: a scalar reaches the
+// library renderer for its width, and everything else reaches its own `Display`. Putting the seam at
+// a name is what keeps the printing surface out of the compiler.
+
+// `print(a, b, ...)` -- each value rendered by the library function its type reaches, a space
+// between and a newline at the end.
+//
+// **The space and the newline go out as characters rather than one-character strings**, so printing
+// a number reaches nothing that allocates: a `string` is reference-counted, and a single
+// `prints(" ")` would pull the whole reference-counting runtime and an allocator into a program
+// whose own code asks for neither.
+print_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    var parts: Buf[TExpr] = buf()
+
+    for i in 0..<args.len()
+        if i > 0 then parts.push(print_char(cx, span, ' '))
+
+        parts.push(print_one(cx, span, type_expr_bare(cx, args.at(i))))
+
+    parts.push(print_char(cx, span, '\n'))
+    TExpr(span, TSeq(parts))
+end print_call
+
+// One value, rendered by the library function that takes its type.
+//
+// **Every argument is widened to the one width its renderer takes** -- the integers to `long` or
+// `ulong`, the floats to `real` -- so the library needs one function per *kind* rather than one per
+// type, which sysl has no overloading to hide anyway. A scalar keeps this direct path rather than
+// going through its `Display`: the two render identically, and the one that does not build a sink
+// is the one to emit.
+private print_one(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
+    val ty = texpr_type(t)
+
+    if ty == Unknown then return t
+
+    ty match
+        // A width past 64 bits has no printf conversion to be widened to, so it renders itself
+        // first and goes out as the string that came back. That is the one scalar whose printing
+        // allocates, and it allocates because C cannot be asked to do this one.
+        Integer(bits, signed, _) ->
+            if bits > 64 then return library_call(cx, span, "prints", TExpr(span, TStr(t)))
+
+            if signed then library_call(cx, span, "printi", widened(span, t, Integer(64, true, false)))
+            else library_call(cx, span, "printu", widened(span, t, Integer(64, false, false)))
+        Floating(_) -> library_call(cx, span, "printr", widened(span, t, Floating(64)))
+        Bool -> library_call(cx, span, "printb", t)
+        Char -> library_call(cx, span, "printc", t)
+        Str -> library_call(cx, span, "prints", t)
+        _ -> cx.err(span, s"printing a ${type_show(ty)} goes through its 'Display', and that is " +
+                    "not typed yet")
+end print_one
+
+// The separator and the terminator `print` puts around its values.
+private print_char(cx: &Analyzer, span: Span, c: char) -> TExpr =
+    library_call(cx, span, "printc", TExpr(span, TIntLit(from_int(long(int(c))), Char)))
+
+// A value at the width its renderer takes, and the value itself where it is already that width.
+private widened(span: Span, t: TExpr, to: Type) -> TExpr =
+    if texpr_type(t) == to then t else TExpr(span, TCast(t, to))
+
+// A call to a library function, built from an already-typed argument.
+//
+// **This is the one place the compiler calls a function it named itself** rather than one a program
+// wrote, so it is the one place the translation from the library's own spelling to the key it is
+// filed under belongs.
+private library_call(cx: &Analyzer, span: Span, name: string, arg: TExpr) -> TExpr
+    val key = library_key(cx, name)
+
+    if key.is_none()
+        return cx.err(span, s"'print' is written in terms of the library's '$name', which the " +
+                      "standard module this compilation was given does not declare")
+
+    var args: Buf[TExpr] = buf()
+
+    args.push(arg)
+    TExpr(span, TCall(key.unwrap(), args, Unit, false))
+end library_call
+
+// The key the library files one of its own names under. It is looked up rather than composed, so
+// that a library which moved a function between its modules is followed rather than guessed at.
+library_key(cx: &Analyzer, name: string) -> Option[string]
+    val direct = module_qualify(StdModule, name)
+
+    if cx.an.tables.funcs.has(direct) then return Some(direct)
+
+    for i in 0..<cx.an.tables.funcs.len()
+        val key = cx.an.tables.funcs.key_at(i)
+
+        if key == name then return Some(key)
+
+    None
+end library_key
