@@ -374,3 +374,139 @@ a_solved_argument_is_converted_by_its_position()
 
     assert(out.contains("TConstView"), out)
     assert(out.contains("sliceTy: []string"), out)
+
+// -- closures ---------------------------------------------------------------------------------------
+
+// A function taking a callable, which is the shape every closure test below stands at: the bare
+// arrow is sugar for a bounded type parameter, so the call instantiates `apply` at the closure.
+private applier() -> string = "apply(f: int -> int, x: int) -> int = f(x)\n"
+
+// The body the **last** closure of a source lowered to. A closure's name is a counter over the whole
+// compilation, so which number the source's own closure gets depends on how many the library lowered
+// before it -- and what a test is asking about is the last one lowered, which is the source's.
+private closure_body(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = library_trees()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    var found = ""
+
+    for i in 0..<done.funcs.len()
+        if done.funcs.at(i).name.ends_with(".call") &&
+           done.funcs.at(i).name.starts_with("$closure") then
+            found = show_typed_func(done.funcs.at(i))
+
+    if found == "" && !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    found
+end closure_body
+
+@test("a closure literal is a struct of what it captures, built where it is written")
+a_closure_is_a_struct_of_its_captures()
+    if no_library() then return
+
+    val out = shown(applier() + "use(k: int) -> int = apply(n -> n + k, 3)\n", "use")
+
+    assert(out.contains("TStructNew"), out)
+    assert(out.contains("struct: a closure"), out)
+    assert(out.contains("name: \"k\""), out)
+
+@test("and the call is to the instantiation the closure's own struct made")
+a_closure_instantiates_the_callable_it_stands_at()
+    if no_library() then return
+
+    val out = shown(applier() + "use(k: int) -> int = apply(n -> n + k, 3)\n", "use")
+
+    assert(out.contains("name: \"apply.$closure"), out)
+
+@test("a capture is read as a field of the environment the body was handed")
+a_capture_reads_a_field_of_the_environment()
+    if no_library() then return
+
+    val out = closure_body(applier() + "use(k: int) -> int = apply(n -> n + k, 3)\n")
+
+    assert(out.contains("_1: \"self\""), out)
+    assert(out.contains("_2: *a closure"), out)
+    assert(out.contains("TDeref"), out)
+    assert(out.contains("index: 0"), out)
+
+@test("and the body it lowers to is internal, since nothing outside can name it")
+a_closure_body_is_internal()
+    if no_library() then return
+
+    val out = closure_body(applier() + "use(k: int) -> int = apply(n -> n + k, 3)\n")
+
+    assert(out.contains("internal: true"), out)
+
+@test("a closure capturing nothing is a struct with no fields")
+a_closure_with_no_captures_has_no_fields()
+    if no_library() then return
+
+    val out = shown(applier() + "use() -> int = apply(n -> n + 1, 3)\n", "use")
+
+    assert(out.contains("struct: a closure"), out)
+    assert(out.contains("args: []"), out)
+
+@test("a bare-arrow parameter is called through the call trait, taking its receiver by address")
+a_callable_parameter_is_called_through_its_trait()
+    if no_library() then return
+
+    val out = closure_body(applier() + "use() -> int = apply(n -> n + 1, 3)\n")
+
+    assert(out.contains("retTy: int"), out)
+    assert(out.contains("_2: *a closure"), out)
+
+@test("a declared function where a callable is wanted is the capture-free closure")
+a_function_name_is_a_capture_free_closure()
+    if no_library() then return
+
+    val src = applier() + "double(n: int) -> int = n * 2\n\nuse() -> int = apply(double, 3)\n"
+    val out = closure_body(src)
+
+    assert(out.contains("_1: \"$a0\""), out)
+    assert(out.contains("name: \"double\""), out)
+
+@test("a closure's result comes from its body, and nothing has to say what it is")
+a_closure_yields_what_its_body_yields()
+    if no_library() then return
+
+    val src = "apply(f: int -> string, x: int) -> string = f(x)\n\n" +
+              "use() -> string = apply(n -> str(n), 3)\n"
+    val out = closure_body(src)
+
+    assert(out.contains("retTy: string"), out)
+
+@test("a closure standing at a callable of another arity is refused where it stands")
+a_closure_of_the_wrong_arity_is_refused()
+    if no_library() then return
+
+    val said = complaints(applier() + "use() -> int = apply((a: int, b: int) -> a, 3)\n")
+
+    assert(says(said, "this closure takes 2 parameters, and what it is being used as takes 1"),
+           s"${said.len()} said")
+
+@test("a parameter nothing says the type of is reported against the parameter")
+a_closure_parameter_with_no_type_says_so()
+    if no_library() then return
+
+    val said = complaints("use() -> int\n    val f = n -> n + 1\n\n    f(2)\n")
+
+    assert(says(said, "'n' has no type here — nothing says what this closure takes, so write it: " +
+                "'(n: …) -> …'"), s"${said.len()} said")
+
+@test("a member with type parameters of its own is instantiated from the call")
+a_generic_member_is_instantiated_from_its_call()
+    if no_library() then return
+
+    val out = shown("use(o: sysl.Option[int]) -> sysl.Option[string] = o.map(n -> str(n))\n", "use")
+
+    assert(out.contains("sysl$Option.map"), out)

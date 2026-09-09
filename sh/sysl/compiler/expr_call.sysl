@@ -863,8 +863,21 @@ private call_through(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
                 ts.push(type_expr(cx, args.at(i), want))
 
             TExpr(span, TCallPtr(TExpr(span, TLoad(local.unique, local.ty)), ts, params, *ret))
-        _ -> cx.err(span, s"'$name' holds ${type_show(local.ty)}, and calling one through its " +
-                    "trait is not built yet")
+        // Everything else is called through the call trait its type implements, which makes it the
+        // ordinary method call it looks like: a bare-arrow parameter is a direct call and a `&Fn`
+        // field an indirect one, with nothing here choosing between them -- the receiver decides,
+        // exactly as it does everywhere.
+        _ ->
+            if callable_of(cx.an, local.ty).is_none() then
+                return cx.err(span, s"'$name' holds ${type_show(local.ty)}, which is not " +
+                              "something that can be called")
+
+            val read = cx.capture_read(local.unique)
+            var recv = TExpr(span, TLoad(local.unique, local.ty))
+
+            if read.is_some() then recv = read.unwrap()
+
+            call_member(cx, span, recv, "call", args, expected)
 end call_through
 
 // The type a declaration hands back, which is `unit` where nothing was written.

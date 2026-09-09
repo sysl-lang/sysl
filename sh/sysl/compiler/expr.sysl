@@ -167,6 +167,13 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
         cx.err(e.span, "'...' spreads a sequence into a call's arguments, and there is nothing " +
                "being called here")
 
+    // A closure literal, and the closure a trailing block became: a struct of what it captures,
+    // whose one member is the body.
+    Lambda(params, body, implicit) ->
+        closure_expr(cx, e.span, params, body, implicit, expected)
+    BlockArg(body) ->
+        closure_expr(cx, e.span, buf(), body, true, expected)
+
     Bad -> bad_expr(e.span)
 
     _ -> cx.err(e.span, deferred_form(e))
@@ -258,7 +265,15 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
         return cx.err(span, "'result' is only meaningful inside an 'ensure' of a value-returning " +
                       "function")
 
-    if local.is_some() then return TExpr(span, TLoad(local.unwrap().unique, local.unwrap().ty))
+    if local.is_some()
+        // A capture is a binding like any other, and what it reaches is the field of the
+        // environment its closure was handed rather than a slot of this frame.
+        val read = cx.capture_read(local.unwrap().unique)
+
+        if read.is_some() then return read.unwrap()
+
+        return TExpr(span, TLoad(local.unwrap().unique, local.unwrap().ty))
+    end if
 
     // A constant is folded into its use and analyzed as the expression it stands for, at the type
     // it was declared with rather than the one the context asked for. That is what makes it behave
@@ -283,8 +298,14 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
     // A declared function standing where a callable is wanted is one, with nothing captured. It is
     // asked for only where the context says a callable, so a bare function name anywhere else is
     // still the mistake it was.
-    if !overload_keys(cx.an, module_qualify(cx.scope.module_name, name)).is_empty() then
+    if !overload_keys(cx.an, module_qualify(cx.scope.module_name, name)).is_empty()
+        val want = if expected.is_none() then None else callable_signature(cx.an, expected.unwrap())
+
+        if want.is_some() then
+            return function_as_callable(cx, span, name, want.unwrap().0, want.unwrap().1)
+
         return cx.err(span, s"'$name' is a function, and a function value is not typed yet")
+    end if
 
     variant_expr(cx, span, name, expected)
 end name_expr

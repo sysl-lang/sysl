@@ -232,8 +232,111 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
         return cx.err(span, s"'$name' is an associated function of '${module_show(found.0)}' — " +
                       s"call it with '${module_show(found.0)}.$name(…)'")
 
+    // A member with type parameters of its own is instantiated from the call, exactly as a generic
+    // free function is: the type's own arguments arrived with the receiver, and these are what the
+    // arguments say.
+    val generic = cx.an.tables.members.generic.get(member_key_of(found.0, chosen.unwrap()))
+
+    if generic.is_some() && generic.unwrap().tparams.len() > found.1.len() then
+        return call_generic_member(cx, span, receiver, rty, found.0, decl, generic.unwrap(),
+                                   found.1, args, expected, name)
+
     member_dispatch(cx, span, receiver, rty, found.0, chosen.unwrap(), decl, args, expected, name)
 end call_declared
+
+// `o.map(f)` -- a member declaring type parameters of its own, instantiated from the call.
+//
+// **The two lists of parameters the lowered function carries are fixed from two different places**,
+// which is the whole of what makes this its own path. The *type's* are already settled -- the
+// receiver is a value of a type, and a type has its arguments -- so they are read off it and held
+// to nothing further here. The *member's own* are solved from the arguments and from the type the
+// context expects, exactly as a generic free function's are, and held to the bounds the member
+// wrote. Appending the second list to the first is what the lowering laid them out in that order
+// for, so the substitution needs to know nothing about which parameter came from where.
+private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, base: string,
+                            m: MethodDecl, fd: FuncDecl, owner_args: Buf[Type], args: Buf[Expr],
+                            expected: Option[Type], written: string) -> TExpr
+    val shown = s"method '${type_show(rty)}.${source_member_name(m.name)}'"
+    val home = cx.an.tables.members.generic_scope.get(fd.name).unwrap_or(cx.scope)
+    val slots = bind_member_args(cx, span, shown, m, args)
+
+    if slots.is_none() then return bad_expr(span)
+
+    // The receiver holds the first slot, so the parameters an argument stands at begin one past it.
+    var tail: Buf[Param] = buf()
+
+    for i in 1..<fd.params.len()
+        tail.push(fd.params.at(i))
+
+    // The receiver's arguments, handed to the inference as already answered: they arrived with the
+    // value and were never a question, and without them a parameter naming the *type's* parameter
+    // reads as unsolved and a closure standing at one is held back for a type no argument was ever
+    // going to supply.
+    var seed: Buf[Binding] = buf()
+
+    for i in 0..<owner_args.len()
+        if i < fd.tparams.len() then seed.push(Binding(fd.tparams.at(i), owner_args.at(i)))
+
+    val prov = provisional_of(cx, home, m.tparams, tail, fd.ret_type, m.bounds, slots.unwrap(),
+                              seed, expected)
+    var param_refs: Buf[TypeRef] = buf()
+
+    for i in 0..<tail.len()
+        param_refs.push(tail.at(i).typ)
+
+    val own = solve(cx.an, home, span, fd.name, m.tparams, param_refs, prov.tys, fd.ret_type,
+                    expected, prov.soft, m.bounds, seed)
+
+    // The member's own bounds, checked with the receiver's arguments to hand. Reading the whole
+    // lowered signature's bounds here would sweep the type's own in as well and report anything
+    // unmet a second time, having already said it where the receiver's type was made.
+    if !check_param_bounds(cx.an, home, span, fd.name, m.tparams, m.bounds, own, seed,
+                           "type parameter") then return bad_expr(span)
+
+    var targs: Buf[Type] = buf()
+
+    for i in 0..<owner_args.len()
+        targs.push(owner_args.at(i))
+
+    for i in 0..<own.len()
+        targs.push(own.at(i))
+
+    val name = instantiate_func(cx.an, home, fd, targs, viewed_const(rty, base))
+    val sig = cx.an.tables.members.func_insts.get(name)
+
+    if sig.is_none() then return bad_expr(span)
+
+    val params = sig.unwrap().params
+    var ts: Buf[TExpr] = buf()
+
+    ts.push(build_receiver(cx, span, m.recv_mode().unwrap(), receiver, written))
+
+    for i in 0..<slots.unwrap().len()
+        val want = if i + 1 < params.len() then params.at(i + 1).1 else Unknown
+
+        slots.unwrap().at(i) match
+            Some(e) ->
+                // A callable was read once already, against the bound the solve had settled by
+                // then: reading it again would lower a second closure for the one a program wrote.
+                var t = bad_expr(e.span)
+
+                if i < prov.kept.len() && prov.kept.at(i).is_some() then
+                    t = prov.kept.at(i).unwrap()
+                else t = type_expr(cx, e, Some(want))
+
+                if disagree(texpr_type(t), want) then
+                    cx.fault(e.span, s"'${m.params.at(i).name}' of $shown is ${type_show(want)}, " +
+                             s"but ${type_show(texpr_type(t))} was given")
+
+                ts.push(t)
+            None ->
+                val inner = analyzer_for(cx.an, cx.scope)
+
+                inner.reported = Some(span)
+                ts.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
+
+    TExpr(span, TCall(name, ts, sig.unwrap().ret, false))
+end call_generic_member
 
 // The call itself, once the member is known: the receiver in the mode its `self` asked for, the
 // arguments bound and checked against the instantiated signature, and a call to the function the
@@ -289,7 +392,7 @@ end member_dispatch
 
 // Which written argument fills which of a member's parameters. The receiver is not among them, so
 // this is the free function's rule read one slot in.
-private bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
+bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
                          args: Buf[Expr]) -> Option[Buf[Option[Expr]]]
     var slots: Buf[Option[Expr]] = buf()
 
@@ -335,7 +438,7 @@ private bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl
 end bind_member_args
 
 // The receiver as the member's `self` asked for it: a copy, an address, or a counted reference.
-private build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
+build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
                        member: string) -> TExpr = mode match
     ByValue -> texpr_type(tr) match
         Struct(_) -> tr

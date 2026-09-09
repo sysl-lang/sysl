@@ -1,0 +1,735 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// A closure literal, what it captures, and the type it inhabits.
+//
+// **A closure is a struct and an `impl`, and that is the whole reduction.** The struct's fields are
+// the variables the body names from the scope it was written in; the implementation is of the call
+// trait for the closure's arity (`Fn2[A, B, R]`, spelled `Fn(A, B) -> R`), and its one member is
+// the body with those names reaching the fields instead of the locals. Everything downstream then
+// already works: a bound over `Fn(A) -> R` is met by the struct, a trait object is built out of it,
+// and a generic parameter written as a bare arrow is solved to it like any other type.
+//
+// What is genuinely new is only this -- deciding which names a body captures, and binding them
+// inside the body so that reading one reaches the field. **Nothing rewrites the body**: a capture
+// is bound in the closure's own scope like any other name, with a note saying where it lives, so
+// shadowing, assignment and a closure inside a closure are the ordinary cases of rules that already
+// hold.
+
+// The name a closure's struct is filed under. It holds the module separator, which no identifier
+// and no module name may, so nothing a program can write collides with one.
+closure_base(n: usize) -> string = s"${ModuleSep}closure$n"
+
+// What a trailing block calls the one value it is passed.
+closure_it() -> string = "it"
+
+// A closure literal, and the closure a trailing block became.
+//
+// The parameter types come from the context asking for a callable and the result comes from the
+// body -- never the other way round, so a closure is analyzed once and what it yields is what it
+// yields.
+closure_expr(cx: &Analyzer, span: Span, written: Buf[LambdaParam], body: Buf[Stmt],
+             implicit: bool, expected: Option[Type]) -> TExpr
+    val want = if expected.is_none() then None else callable_signature(cx.an, expected.unwrap())
+    val params = if implicit then block_params(span, want) else written
+
+    if want.is_some() && want.unwrap().0.len() != params.len()
+        val n = want.unwrap().0.len()
+
+        if implicit then
+            cx.fault(span, s"a trailing block binds the one value it is passed as " +
+                     s"'${closure_it()}', so it stands at a callable taking one or none — and " +
+                     s"what this one is being used as takes $n. Write it as a closure literal, " +
+                     s"which names its parameters: '(${letters(n)}) -> …'")
+        else
+            cx.fault(span, s"this closure takes ${quantity(params.len(), "parameter")}, and what " +
+                     s"it is being used as takes $n")
+    end if
+
+    // An annotation is read where one is written and the context supplies the rest. A parameter
+    // with neither is the one shape a closure cannot be analyzed at all, and it is reported against
+    // the parameter rather than against the literal, since that is where the answer would go.
+    var ptypes: Buf[Type] = buf()
+    var names: Buf[string] = buf()
+
+    for i in 0..<params.len()
+        val p = params.at(i)
+
+        names.push(p.name)
+
+        if p.typ.is_some()
+            ptypes.push(resolve_type(cx.an, cx.scope, p.typ.unwrap(), cx.subst))
+        else if want.is_some() && i < want.unwrap().0.len()
+            ptypes.push(want.unwrap().0.at(i))
+        else
+            cx.fault(p.span, missing_parameter_type(p.name))
+            ptypes.push(Unknown)
+
+    val result = if want.is_none() then None else want.unwrap().1
+
+    lower_closure(cx, span, names, ptypes, result, body)
+end closure_expr
+
+// What a parameter with no type of its own and no context is told.
+//
+// **The type position is an ellipsis and not a `T`.** The place this fires is a call into a generic
+// member, whose own signature very likely calls something `T`, so a reader copying the advice would
+// write a name that means nothing at the call.
+private missing_parameter_type(name: string) -> string
+    if is_placeholder(name) then
+        return "this '_' has no type here — nothing says what the closure it stands in takes, so " +
+               "write that closure with a named parameter: '(x: …) -> …'"
+
+    s"'$name' has no type here — nothing says what this closure takes, so write it: " +
+    s"'($name: …) -> …'"
+end missing_parameter_type
+
+// The names a diagnostic offers for a parameter list a reader has to write out.
+private letters(n: usize) -> string
+    var b = str_builder()
+
+    for i in 0..<n
+        if i > 0 then b.push(", ")
+
+        b.push(s"${char(u32('a') + u32(i))}")
+
+    b.finish()
+end letters
+
+// What a trailing block's closure calls its parameters, which is the arity it stands at and nothing
+// the block wrote.
+//
+// One parameter is `it`. **None is the empty list, and so is anything else** -- a block cannot name
+// two, and handing back nothing is what lets the arity check above say so in the sentence a reader
+// who wrote no parameters needs.
+private block_params(span: Span, want: Option[(Buf[Type], Option[Type])]) -> Buf[LambdaParam]
+    var out: Buf[LambdaParam] = buf()
+
+    if want.is_some() && want.unwrap().0.len() == 1 then
+        out.push(LambdaParam(span, closure_it(), None))
+
+    out
+end block_params
+
+// The signature a type asking for a callable asks for: what it takes, and what it yields where the
+// type says so.
+//
+// The shapes are a bounded type parameter (which is what a bare arrow a parameter wrote became), a
+// trait object behind either mode, and the trait itself. A result is `None` where the context
+// genuinely does not fix one, which is not the same as fixing it to `unit`.
+callable_signature(a: &Analysis, t: Type) -> Option[(Buf[Type], Option[Type])]
+    val b = callable_of(a, t)
+
+    if b.is_none() then return None
+
+    val parts = fn_parts(b.unwrap().name, b.unwrap().args)
+
+    if parts.is_none() then return None
+
+    val ret = parts.unwrap().1
+
+    Some((parts.unwrap().0, if ret == Unknown then None else Some(ret)))
+end callable_signature
+
+// Builds the struct, the implementation and the body of one closure, and yields the struct value
+// that *is* the closure -- its captures, in the order the fields hold them.
+lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
+              result: Option[Type], body: Buf[Stmt]) -> TExpr
+    val captured = captures(cx, body, names)
+    var fields: Buf[(string, Type)] = buf()
+
+    for i in 0..<captured.len()
+        fields.push((captured.at(i), cx.lookup(captured.at(i)).unwrap().ty))
+
+    val base = closure_base(cx.an.closure_count)
+
+    cx.an.closure_count += 1
+
+    val st = StructType(base, buf(), fields, false, None, None)
+
+    cx.an.tables.struct_insts.put(base, Struct(st))
+
+    val fname = s"$base.call"
+    val lowered = closure_body(cx, span, st, fname, names, ptypes, result, captured, body)
+
+    cx.an.tables.members.func_insts.put(fname, FuncSig(lowered.params, lowered.ret_ty))
+    cx.an.closure_funcs.push(lowered)
+
+    register_call_trait(cx, span, st, ptypes, lowered.ret_ty)
+
+    // Every capture is read where the closure is **formed**, so a value is copied in and a `&T`
+    // takes a share -- which is what the ordinary field-by-field construction of a struct already
+    // does, and the reason capture needed no rule of its own.
+    var args: Buf[TExpr] = buf()
+
+    for i in 0..<captured.len()
+        args.push(name_expr(cx, span, captured.at(i), None))
+
+    TExpr(span, TStructNew(st, args))
+end lower_closure
+
+// The body itself, read in a frame of its own.
+//
+// **A closure's body is written in the middle of its enclosing function and analyzed there**,
+// because that is where the names it captures are still in scope. But a body is analyzed against
+// per-function state -- the scope stack, the unique names, the declared result, the loops a `break`
+// may name -- and every one of those belongs to the function being interrupted, so the body gets an
+// analyzer of its own. What it keeps from around it is what a reader would expect to keep: the
+// file's terms, what a type parameter stands for, and the name `__FUNCTION__` answers with, since a
+// closure has no name a reader wrote.
+private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
+                     names: Buf[string], ptypes: Buf[Type], result: Option[Type],
+                     captured: Buf[string], body: Buf[Stmt]) -> TFunc
+    val inner = analyzer_for(cx.an, cx.scope)
+
+    inner.subst = cx.subst
+    inner.func_name = cx.func_name
+
+    val self_ty = Ptr(Struct(st))
+
+    var params: Buf[(string, Type)] = buf()
+
+    // The receiver comes first, so the closure's own environment is the argument every call already
+    // passes and the parameters after it are the ones a program wrote.
+    params.push((inner.bind("self", self_ty), self_ty))
+
+    for i in 0..<names.len()
+        params.push((inner.bind(names.at(i), ptypes.at(i)), ptypes.at(i)))
+
+    for i in 0..<captured.len()
+        val stored = st.fields.at(i).1
+        val read = TExpr(span, TField(TExpr(span, TDeref(TExpr(span, TLoad("self", self_ty)),
+                                                         Struct(st))), int(st.slot(i)), stored))
+
+        inner.captured.push((inner.bind(captured.at(i), stored), read))
+
+    inner.ret_ty = Some(result.unwrap_or(Unknown))
+
+    val split = contract_length(body)
+    val contract = analyze_contract(inner, body, split, result.unwrap_or(Unit))
+    val rest = statements_from(body, split)
+
+    // A closure whose result the context did not fix is analyzed with nothing expected, so what its
+    // body yields is what it yields -- the only reading under which `x -> x * 2` has a result at
+    // all.
+    val block = if result.is_some() && result.unwrap() == Unit then
+        type_value_block(inner, rest, None, true)
+    else type_value_block(inner, rest, result, false)
+
+    var ret = Unit
+
+    if result.is_some() then ret = result.unwrap()
+    else if block.result.is_some() then ret = block.ty
+
+    if result.is_some() && result.unwrap() != Unit && block.result.is_some() &&
+       disagree(block.ty, result.unwrap()) then
+        inner.fault(body_span(rest, span), s"this closure should yield " +
+                    s"${type_show(result.unwrap())}, but its body yields ${type_show(block.ty)}")
+
+    // **Internal, always.** Nothing outside this compilation can name a closure, so the symbol has
+    // no reason to leave the object file -- and leaving it there is what a per-compilation counter
+    // for a name makes unsafe: two units that each lowered a fourth closure both call it
+    // `$closure4.call`, and with external linkage the linker is free to resolve one unit's call to
+    // the other unit's body.
+    TFunc(span, fname, params, ret, block, false, contract.0, contract.1, contract.2, true, None,
+          false, contract.3, false, false, None, None, None, None)
+end closure_body
+
+// Files the closure's struct as an implementation of the call trait for its arity, so a bound over
+// `Fn(A) -> R` is met by it and a `&Fn(A) -> R` may be built out of it.
+//
+// The block is synthetic and there is no source `impl` behind it, which is exactly right: a closure
+// implements the call trait by being one, and nothing about the block is a promise a program made
+// and could have made differently.
+private register_call_trait(cx: &Analyzer, span: Span, st: &StructType, ptypes: Buf[Type],
+                            ret: Type)
+    val key = catalog_key(cx.an, fn_base(ptypes.len()))
+
+    if key.is_none()
+        cx.fault(span, s"a callable of ${quantity(ptypes.len(), "parameter")} has no call trait")
+        return
+    end if
+
+    var args: Buf[Type] = buf()
+
+    for i in 0..<ptypes.len()
+        args.push(ptypes.at(i))
+
+    args.push(ret)
+
+    val subject = TypeRef(span, NamedType(st.base, buf()))
+    val block = ImplDecl(key.unwrap(), subject, buf(), buf(), buf(), buf(), buf(), false, buf(),
+                         buf(), buf())
+    var rows: Buf[TraitImpl] = buf()
+
+    // A closure's call trait declares no associated type, and could not: the shape is synthesized
+    // here rather than written, so there is nothing for an implementation to have chosen.
+    rows.push(TraitImpl(block, span, cx.scope, args, Bound(key.unwrap(), args).key(), "", buf(),
+                        false, buf()))
+    cx.an.tables.members.impls.put(impl_key_of(key.unwrap(), st.base), rows)
+
+    // The member is registered as the ordinary method it is, so calling a closure is a method call
+    // and needs no path of its own -- its parameters are the signature `func_insts` already holds,
+    // so what is recorded here is the shape a call reads: a method, taking its receiver by address.
+    var mparams: Buf[Param] = buf()
+
+    for i in 0..<ptypes.len()
+        mparams.push(Param(span, s"a$i", TypeRef(span, NamedType("", buf())), Public, None, false, false))
+
+    cx.an.tables.members.decls.put(member_key_of(st.base, "call"),
+                                   MethodDecl(span, "call", Some(ByPtr), false, buf(), mparams,
+                                              None, buf(), buf(), buf(), Public, false, false,
+                                              buf(), buf(), buf(), None, None, buf(), false))
+    cx.an.tables.members.funcs.put(member_key_of(st.base, "call"), s"${st.base}.call")
+end register_call_trait
+
+// `xs.map(square)` -- a declared function where a callable is wanted.
+//
+// **A named function is the capture-free closure**, so it is one: the same struct with no fields,
+// whose `call` is a call to the function. There is no function-pointer type beside the call trait
+// and no wrapper for a program to write, and the degenerate case costs nothing at run time -- an
+// empty environment is an empty struct.
+function_as_callable(cx: &Analyzer, span: Span, written: string, ptypes: Buf[Type],
+                     result: Option[Type]) -> TExpr
+    // The parameters are named where no program can name them, so nothing the function's own body
+    // reaches is shadowed by one of them.
+    var names: Buf[string] = buf()
+    var args: Buf[Expr] = buf()
+
+    for i in 0..<ptypes.len()
+        val n = s"${ModuleSep}a$i"
+
+        names.push(n)
+        args.push(expr(span, Ident(n)))
+
+    var body: Buf[Stmt] = buf()
+
+    body.push(stmt(span, ExprStmt(expr(span, Call(expr(span, Ident(written)), args)))))
+    lower_closure(cx, span, names, ptypes, result, body)
+end function_as_callable
+
+// -- what a body reads from around it ------------------------------------------------------------
+
+// The names a body reads from the scope it was written in, in the order it first reads them.
+//
+// This is a walk over what was **written** rather than over what it resolved to, which is what lets
+// it run before the body is analyzed -- and it has to, since the body cannot be analyzed until the
+// type holding its captures exists. A name is a capture when the enclosing scope has one and the
+// body did not declare it: a parameter, a local or a loop variable of the body's own shadows the
+// outer name exactly as it would anywhere else, and a name that resolves to a declaration rather
+// than to a local is reached the way any other function reaches it.
+private captures(cx: &Analyzer, body: Buf[Stmt], bound: Buf[string]) -> Buf[string]
+    var found: Buf[string] = buf()
+
+    read_block(cx, body, bound, &found)
+    found
+end captures
+
+// A block is its own scope, so what it declares is gone at its end and nothing after it sees one.
+//
+// A binding is in scope for what comes **after** it, so the shadow starts at the declaration and
+// the initializer is still read outside it -- `var n = n` captures the outer `n`.
+private read_block(cx: &Analyzer, stmts: Buf[Stmt], bound: Buf[string], found: *Buf[string])
+    var here = copied(bound)
+
+    for i in 0..<stmts.len()
+        read_stmt(cx, stmts.at(i), &here, found)
+end read_block
+
+private read_stmt(cx: &Analyzer, s: Stmt, bound: *Buf[string], found: *Buf[string])
+    *s.kind match
+        ExprStmt(e) -> read_expr(cx, e, *bound, found)
+        VarDecl(name, _, init, _, _, _) ->
+            read_opt(cx, init, *bound, found)
+            bound.push(name)
+        ValDecl(name, _, value, _, _, _) ->
+            read_expr(cx, value, *bound, found)
+            bound.push(name)
+        ConstDecl(name, _, value, _) ->
+            read_expr(cx, value, *bound, found)
+            bound.push(name)
+        RefDecl(name, place) ->
+            read_expr(cx, place, *bound, found)
+            bound.push(name)
+        MultiAssign(_, targets, values) ->
+            read_each(cx, targets, *bound, found)
+            read_each(cx, values, *bound, found)
+        MultiDecl(names, _, values) ->
+            read_each(cx, values, *bound, found)
+
+            for i in 0..<names.len()
+                bound.push(names.at(i))
+        PatternDecl(pat, _, value) ->
+            read_expr(cx, value, *bound, found)
+            pattern_binds_into(pat, bound)
+        Return(value) -> read_opt(cx, value, *bound, found)
+        Become(call) -> read_expr(cx, call, *bound, found)
+        Break(_, value) -> read_opt(cx, value, *bound, found)
+        Defer(inner) -> read_stmt(cx, inner, bound, found)
+        StaticDecl(inner) -> read_stmt(cx, inner, bound, found)
+        Require(cond, _) -> read_expr(cx, cond, *bound, found)
+        Ensure(cond, _) -> read_expr(cx, cond, *bound, found)
+        Invariant(cond, _) -> read_expr(cx, cond, *bound, found)
+        Variant(measure) -> read_expr(cx, measure, *bound, found)
+        AssertDecl(cond, _) -> read_expr(cx, cond, *bound, found)
+        // A function nested in the body is a closure by another spelling, so what it reads from
+        // around it is read here too -- and its own parameters shadow, exactly as a closure's do.
+        FuncDecl(d) ->
+            var inner = copied(*bound)
+
+            for i in 0..<d.params.len()
+                inner.push(d.params.at(i).name)
+
+            read_block(cx, d.body, inner, found)
+            bound.push(d.name)
+        _ -> ()
+end read_stmt
+
+private read_each(cx: &Analyzer, es: Buf[Expr], bound: Buf[string], found: *Buf[string])
+    for i in 0..<es.len()
+        read_expr(cx, es.at(i), bound, found)
+
+private read_opt(cx: &Analyzer, e: Option[Expr], bound: Buf[string], found: *Buf[string])
+    e match
+        Some(v) -> read_expr(cx, v, bound, found)
+        None -> ()
+
+private read_opt_block(cx: &Analyzer, ss: Option[Buf[Stmt]], bound: Buf[string],
+                       found: *Buf[string])
+    ss match
+        Some(b) -> read_block(cx, b, bound, found)
+        None -> ()
+
+// A name is a capture where the body did not bind it and the scope around the closure has one.
+private read_expr(cx: &Analyzer, e: Expr, bound: Buf[string], found: *Buf[string])
+    *e.kind match
+        Ident(n) ->
+            if !names_hold(bound, n) && cx.lookup(n).is_some() && !names_hold(*found, n) then
+                found.push(n)
+        // A closure inside this one captures from further out through this one, so what it reads is
+        // read here too -- which is what makes capture reach through a nesting.
+        Lambda(ps, b, _) ->
+            var inner = copied(bound)
+
+            for i in 0..<ps.len()
+                inner.push(ps.at(i).name)
+
+            read_block(cx, b, inner, found)
+        BlockArg(b) ->
+            var inner = copied(bound)
+
+            inner.push(closure_it())
+            read_block(cx, b, inner, found)
+        Unary(_, operand) -> read_expr(cx, operand, bound, found)
+        PreIncDec(_, operand) -> read_expr(cx, operand, bound, found)
+        PostIncDec(_, operand) -> read_expr(cx, operand, bound, found)
+        Binary(_, left, right) ->
+            read_expr(cx, left, bound, found)
+            read_expr(cx, right, bound, found)
+        Compare(operands, _) -> read_each(cx, operands, bound, found)
+        RangeExpr(lo, hi, _) ->
+            read_opt(cx, lo, bound, found)
+            read_opt(cx, hi, bound, found)
+        Assign(_, target, value) ->
+            read_expr(cx, target, bound, found)
+            read_expr(cx, value, bound, found)
+        Call(callee, args) ->
+            read_expr(cx, callee, bound, found)
+            read_each(cx, args, bound, found)
+        NamedArg(_, value) -> read_expr(cx, value, bound, found)
+        Spread(value) -> read_expr(cx, value, bound, found)
+        DefaultArg(_, value) -> read_expr(cx, value, bound, found)
+        Index(receiver, index) ->
+            read_expr(cx, receiver, bound, found)
+            read_expr(cx, index, bound, found)
+        Field(receiver, _) -> read_expr(cx, receiver, bound, found)
+        TypeArgs(receiver, args) ->
+            read_expr(cx, receiver, bound, found)
+            read_each(cx, args, bound, found)
+        TypeAttr(receiver, _) -> read_expr(cx, receiver, bound, found)
+        WithExpr(base, fields) ->
+            read_expr(cx, base, bound, found)
+
+            for i in 0..<fields.len()
+                read_expr(cx, fields.at(i).value, bound, found)
+        TryExpr(inner) -> read_expr(cx, inner, bound, found)
+        Tuple(elements) -> read_each(cx, elements, bound, found)
+        ArrayLit(elements) -> read_each(cx, elements, bound, found)
+        ArrayFill(value, count) ->
+            read_expr(cx, value, bound, found)
+            read_expr(cx, count, bound, found)
+        Block(stmts) -> read_block(cx, stmts, bound, found)
+        IfExpr(cond, then_body, else_body) ->
+            read_expr(cx, cond, bound, found)
+            read_block(cx, then_body, bound, found)
+            read_opt_block(cx, else_body, bound, found)
+        MatchExpr(scrutinee, arms) ->
+            read_expr(cx, scrutinee, bound, found)
+
+            for i in 0..<arms.len()
+                val arm = arms.at(i)
+                var inner = copied(bound)
+
+                for j in 0..<arm.patterns.len()
+                    pattern_binds_into(arm.patterns.at(j), &inner)
+
+                // What the patterns **read**, which is the quoted names: they reference something
+                // already declared rather than binding it, and are resolved against what was bound
+                // before the arm.
+                for j in 0..<arm.patterns.len()
+                    pattern_reads(cx, arm.patterns.at(j), bound, found)
+
+                read_opt(cx, arm.guard, inner, found)
+                read_block(cx, arm.body, inner, found)
+        IsPattern(subject, _, _) -> read_expr(cx, subject, bound, found)
+        ResultList(values) -> read_each(cx, values, bound, found)
+        While(_, cond, body, else_body) ->
+            read_expr(cx, cond, bound, found)
+            read_block(cx, body, bound, found)
+            read_opt_block(cx, else_body, bound, found)
+        DoWhile(_, body, cond, else_body) ->
+            read_block(cx, body, bound, found)
+            read_expr(cx, cond, bound, found)
+            read_opt_block(cx, else_body, bound, found)
+        Loop(_, body) -> read_block(cx, body, bound, found)
+        For(_, name, iter, body, else_body) ->
+            read_expr(cx, iter, bound, found)
+
+            var inner = copied(bound)
+
+            inner.push(name)
+            read_block(cx, body, inner, found)
+            read_opt_block(cx, else_body, bound, found)
+        ConstFor(name, iter, body) ->
+            read_expr(cx, iter, bound, found)
+
+            var inner = copied(bound)
+
+            inner.push(name)
+            read_block(cx, body, inner, found)
+        CFor(_, init, cond, step, body, else_body) ->
+            var inner = copied(bound)
+
+            init match
+                Some(s) -> read_stmt(cx, s, &inner, found)
+                None -> ()
+
+            read_opt(cx, cond, inner, found)
+
+            step match
+                Some(s) -> read_stmt(cx, s, &inner, found)
+                None -> ()
+
+            read_block(cx, body, inner, found)
+            read_opt_block(cx, else_body, inner, found)
+        // A quantifier binds its name over the predicate and nowhere else, so an outer name of the
+        // same spelling is not captured by a clause that only shadows it.
+        Quantifier(_, name, iter, pred) ->
+            read_expr(cx, iter, bound, found)
+
+            var inner = copied(bound)
+
+            inner.push(name)
+            read_expr(cx, pred, inner, found)
+        _ -> ()
+end read_expr
+
+// Every name a pattern binds, which shadows inside the arm it introduces.
+private pattern_binds_into(p: Pattern, out: *Buf[string])
+    *p.kind match
+        IdentPattern(name) -> out.push(name)
+        BindPattern(name, inner) ->
+            out.push(name)
+            pattern_binds_into(inner, out)
+        VariantPattern(_, args) ->
+            for i in 0..<args.len()
+                pattern_binds_into(args.at(i), out)
+        TuplePattern(args) ->
+            for i in 0..<args.len()
+                pattern_binds_into(args.at(i), out)
+        StructPattern(_, fields) ->
+            for i in 0..<fields.len()
+                pattern_binds_into(fields.at(i).pat, out)
+        _ -> ()
+end pattern_binds_into
+
+// Every name a pattern **reads** -- the quoted ones, which reference something already declared
+// rather than binding it.
+private pattern_reads(cx: &Analyzer, p: Pattern, bound: Buf[string], found: *Buf[string])
+    *p.kind match
+        EqPattern(name) ->
+            if !names_hold(bound, name) && cx.lookup(name).is_some() &&
+               !names_hold(*found, name) then
+                found.push(name)
+        BindPattern(_, inner) -> pattern_reads(cx, inner, bound, found)
+        VariantPattern(_, args) ->
+            for i in 0..<args.len()
+                pattern_reads(cx, args.at(i), bound, found)
+        TuplePattern(args) ->
+            for i in 0..<args.len()
+                pattern_reads(cx, args.at(i), bound, found)
+        StructPattern(_, fields) ->
+            for i in 0..<fields.len()
+                pattern_reads(cx, fields.at(i).pat, bound, found)
+        _ -> ()
+end pattern_reads
+
+private copied(xs: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<xs.len()
+        out.push(xs.at(i))
+
+    out
+end copied
+
+private names_hold(xs: Buf[string], name: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == name then return true
+
+    false
+end names_hold
+
+// -- the bare arrow a parameter may write --------------------------------------------------------
+
+// The name the sugar gives the type parameter it adds. It holds the module separator, so nothing a
+// program can write collides with it and a diagnostic that has to name one reads as the synthetic
+// thing it is.
+call_bound_name(n: usize) -> string = s"${ModuleSep}F$n"
+
+// Whether a type parameter is one of those.
+is_call_bound(name: string) -> bool =
+    name.bytes.len > 1 && name[0..<1] == s"$ModuleSep" && name[1..<2] == "F"
+
+// Turns each bare-arrow parameter into the bounded type parameter it is sugar for.
+//
+// `map(self, f: A -> B)` is `map[$F0: Fn(A) -> B](self, f: $F0)`, and the rewrite happens at the
+// **declaration** so that everything after it -- resolving the signature, inferring the argument,
+// instantiating the body, emitting the direct call -- is the generic machinery that already exists.
+// The parameter is a bound and not a type, which is what makes the call direct, and it is the whole
+// reason the arrow is available in a parameter and nowhere else.
+//
+// **It is idempotent**, which is what lets a declaration go through here wherever it is read: a
+// rewritten parameter is a written name, and only a bare `FnType` is looked for.
+with_call_bounds(d: FuncDecl) -> FuncDecl
+    val rewritten = call_bounds(d.tparams, d.params)
+
+    if rewritten.is_none() then return d
+
+    val (tparams, params, bounds) = rewritten.unwrap()
+
+    FuncDecl(d.name, tparams, params, d.ret_type, d.body, joined_bounds(d.bounds, bounds),
+             d.variadic, d.vis, d.tdefaults, d.tvalues, d.tpacks, d.test, d.hook, d.conv, d.tailrec,
+             d.pure, d.ghost, d.reads, d.writes, d.exported, d.section, d.crossing, d.needs)
+end with_call_bounds
+
+// The same for a member, which writes the sugar wherever a function does.
+with_member_call_bounds(m: MethodDecl) -> MethodDecl
+    val rewritten = call_bounds(m.tparams, m.params)
+
+    if rewritten.is_none() then return m
+
+    val (tparams, params, bounds) = rewritten.unwrap()
+
+    MethodDecl(m.span, m.name, m.receiver, m.is_property, tparams, params, m.ret_type, m.body,
+               joined_bounds(m.bounds, bounds), m.tdefaults, m.vis, m.variadic, m.overrides,
+               m.tvalues, m.tpacks, m.crossing, m.reads, m.writes, m.borrows, m.is_static)
+end with_member_call_bounds
+
+// The added parameters, the parameter list with each arrow replaced by the name that stands for it,
+// and the bounds those names carry -- or nothing at all where no parameter wrote an arrow, so that
+// a declaration which did not use the sugar is left exactly as it was.
+private call_bounds(tparams: Buf[string],
+                    params: Buf[Param]) -> Option[(Buf[string], Buf[Param], Buf[NamedBounds])]
+    var added: Buf[string] = buf()
+    var bounds: Buf[NamedBounds] = buf()
+    var out: Buf[Param] = buf()
+
+    for i in 0..<params.len()
+        val p = params.at(i)
+
+        *p.typ.kind match
+            FnType(fparams, ret, bare) ->
+                if !bare
+                    out.push(p)
+                else
+                    val tp = call_bound_name(tparams.len() + added.len())
+                    var args: Buf[TypeRef] = buf()
+
+                    for j in 0..<fparams.len()
+                        args.push(fparams.at(j))
+
+                    args.push(ret)
+                    added.push(tp)
+
+                    var bs: Buf[BoundRef] = buf()
+
+                    bs.push(BoundRef(p.typ.span, fn_base(fparams.len()), args))
+                    bounds.push(NamedBounds(tp, bs))
+                    out.push(Param(p.span, p.name, TypeRef(p.typ.span, NamedType(tp, buf())), p.vis,
+                                   p.default, p.by_name, p.rest))
+            _ -> out.push(p)
+
+    if added.is_empty() then return None
+
+    var all: Buf[string] = buf()
+
+    for i in 0..<tparams.len()
+        all.push(tparams.at(i))
+
+    for i in 0..<added.len()
+        all.push(added.at(i))
+
+    Some((all, out, bounds))
+end call_bounds
+
+private joined_bounds(outer: Buf[NamedBounds], added: Buf[NamedBounds]) -> Buf[NamedBounds]
+    var out: Buf[NamedBounds] = buf()
+
+    for i in 0..<outer.len()
+        out.push(outer.at(i))
+
+    for i in 0..<added.len()
+        out.push(added.at(i))
+
+    out
+end joined_bounds
+
+// A trait's members get the same rewrite a type's do, so that a signature written with an arrow
+// means the same thing wherever it is read back -- at a call through a bound, at a conformance
+// check, and in the default body the trait supplies.
+with_trait_call_bounds(d: TraitDecl) -> TraitDecl
+    var methods: Buf[MethodDecl] = buf()
+
+    for i in 0..<d.methods.len()
+        methods.push(with_member_call_bounds(d.methods.at(i)))
+
+    TraitDecl(d.name, d.tparams, methods, d.bounds, d.supers, d.vis, d.tdefaults, d.assocs)
+end with_trait_call_bounds
+
+// The same for the three other declaration forms that carry members, so that a signature written
+// with an arrow means one thing wherever it is read: at a call, at a conformance check, and in the
+// body an `impl` block wrote.
+with_impl_call_bounds(d: ImplDecl) -> ImplDecl
+    ImplDecl(d.trait_name, d.for_type, lowered_members(d.methods), d.tparams, d.bounds,
+             d.trait_args, d.tdefaults, d.overrides, d.tvalues, d.tpacks, d.assocs)
+
+with_struct_call_bounds(d: StructDecl) -> StructDecl
+    StructDecl(d.name, d.tparams, d.fields, lowered_members(d.members), d.bounds, d.invariants,
+               d.vis, d.tdefaults, d.opaque, d.tvalues, d.packed, d.alignment, d.cname, d.deriving)
+
+with_enum_call_bounds(d: EnumDecl) -> EnumDecl
+    EnumDecl(d.name, d.tparams, d.underlying, d.variants, lowered_members(d.members), d.bounds,
+             d.vis, d.tdefaults, d.tvalues, d.deriving)
+
+private lowered_members(ms: Buf[MethodDecl]) -> Buf[MethodDecl]
+    var out: Buf[MethodDecl] = buf()
+
+    for i in 0..<ms.len()
+        out.push(with_member_call_bounds(ms.at(i)))
+
+    out
+end lowered_members

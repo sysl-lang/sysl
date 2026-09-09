@@ -292,7 +292,10 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl]) -> B
     val paired = pair_setters(a, home.scope, members, home.label, inherited)
 
     for i in 0..<paired.len()
-        val m = paired.at(i)
+        // A bare-arrow parameter is sugar for a bounded type parameter, and a member writes the
+        // sugar wherever a function does -- so `map(self, f: A -> B)` asks for a callable it can
+        // call directly rather than for one in a counted box.
+        val m = with_member_call_bounds(paired.at(i))
         val filed = m.name + home.alt
 
         // A member's parameters and its type's are two lists that end up in one signature, so a name
@@ -750,7 +753,15 @@ abstract_subst(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: Buf[Nam
     for i in 0..<tparams.len()
         plain.push(Binding(tparams.at(i), Abstract(tparams.at(i), buf())))
 
+    // **The first pass is scaffolding and says nothing.** It reads every bound against siblings that
+    // are still bound-free, so a bound naming a projection off one -- `Fn2[S::Token, *S, N]`, which
+    // is what a bare arrow over an associated type becomes -- cannot be answered there and would
+    // complain about a parameter the second pass answers for. What the second pass reads is strictly
+    // more, so anything genuinely wrong is said there.
+    val mark = a.complaints()
     var once = bounded_pass(a, scope, tparams, bounds, tvalues, tpacks, outer, plain)
+
+    a.restore_complaints(mark)
 
     // A second pass, so that a bound naming a sibling reads that sibling with its own bounds on. The
     // parameter's own stay off inside its own bound, which is what breaks the walk back around.

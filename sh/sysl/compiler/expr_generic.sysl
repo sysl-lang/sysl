@@ -170,8 +170,8 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
     for i in 0..<decl.params.len()
         param_refs.push(decl.params.at(i).typ)
 
-    val targs = solve(cx.an, f.scope, span, key, decl.tparams, param_refs, prov.0, decl.ret_type,
-                      expected, prov.1, decl.bounds, buf())
+    val targs = solve(cx.an, f.scope, span, key, decl.tparams, param_refs, prov.tys, decl.ret_type,
+                      expected, prov.soft, decl.bounds, buf())
 
     if !report
         for i in 0..<targs.len()
@@ -197,7 +197,13 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
 
         slots.at(i) match
             Some(e) ->
-                val t = argument_at(cx, decl, i, e, want)
+                // A callable was read once, against the bound the solve had settled by then, and
+                // the node is the one that reading made: reading it again would lower a second
+                // closure for the one a program wrote.
+                var t = bad_expr(e.span)
+
+                if i < prov.kept.len() && prov.kept.at(i).is_some() then t = prov.kept.at(i).unwrap()
+                else t = argument_at(cx, decl, i, e, want)
 
                 if disagree(texpr_type(t), want)
                     if report then
@@ -309,33 +315,120 @@ end quoted_and
 // read against that type, exactly as a call to something non-generic reads it. Everything else is
 // read on its own, with what it said put back: the reading is a guess made to solve with, and a
 // complaint about a guess is one nobody asked for.
-private provisional_args(cx: &Analyzer, f: Func, slots: Buf[Option[Expr]]) -> (Buf[Type], Buf[bool])
+private provisional_args(cx: &Analyzer, f: Func, slots: Buf[Option[Expr]]) -> Provisional =
+    provisional_of(cx, f.scope, f.decl.tparams, f.decl.params, f.decl.ret_type, f.decl.bounds,
+                   slots, no_bindings(), None)
+
+// What a first reading of a call's arguments settled: the type each one came to, whether it was a
+// literal's default, and the node itself where the argument is one that was **kept**.
+//
+// A callable is the one shape with no type of its own -- a closure's parameters come from its
+// context and a bare function name is a callable only where one is asked for -- so it is held back
+// from the first pass and read once the others have said what the parameter it stands at takes.
+// The node is kept because reading it again would lower a second closure for the one a program
+// wrote.
+struct Provisional
+    tys: Buf[Type]
+    soft: Buf[bool]
+    kept: Buf[Option[TExpr]]
+end Provisional
+
+// The reading itself, for a free function and for a member alike. `known` is what the caller
+// already settled -- a member's receiver answers the type's own parameters before an argument is
+// read -- and `expected` is what the call's own position asks for.
+provisional_of(cx: &Analyzer, scope: Scope, tparams: Buf[string], params: Buf[Param],
+               result: Option[TypeRef], bounds: Buf[NamedBounds], slots: Buf[Option[Expr]],
+               known: Buf[Binding], expected: Option[Type]) -> Provisional
     var tys: Buf[Type] = buf()
     var soft: Buf[bool] = buf()
-    val tparams = f.decl.tparams
+    var kept: Buf[Option[TExpr]] = buf()
+    var held: Buf[usize] = buf()
 
     for i in 0..<slots.len()
-        val p = f.decl.params.at(i)
+        val p = params.at(i)
 
-        slots.at(i) match
-            None ->
-                tys.push(Unknown)
-                soft.push(true)
-            Some(e) ->
-                if !ref_mentions(p.typ, tparams)
-                    val want = resolve_type(cx.an, f.scope, p.typ, no_bindings())
-                    val t = sandboxed_arg(cx, e, Some(want))
+        kept.push(None)
 
-                    tys.push(texpr_type(t))
-                    soft.push(false)
-                else
-                    val t = sandboxed_arg(cx, e, None)
+        val e = slots.at(i)
 
-                    tys.push(texpr_type(t))
-                    soft.push(adaptable(e, t))
+        if e.is_none()
+            tys.push(Unknown)
+            soft.push(true)
+        else if callable_arg(cx, e.unwrap())
+            // Held back: an argument with no type of its own has nothing to unify, so the parameter
+            // it stands at is settled by the others or by nothing at all -- and waiting cannot lose
+            // the solution.
+            held.push(i)
+            tys.push(Unknown)
+            soft.push(true)
+        else if !ref_mentions(p.typ, unsolved_names(tparams, known))
+            val want = resolve_type(cx.an, scope, p.typ, known)
+            val t = sandboxed_arg(cx, e.unwrap(), Some(want))
 
-    (tys, soft)
-end provisional_args
+            tys.push(texpr_type(t))
+            soft.push(false)
+        else
+            val t = sandboxed_arg(cx, e.unwrap(), None)
+
+            tys.push(texpr_type(t))
+            soft.push(adaptable(e.unwrap(), t))
+
+    if held.is_empty() then return Provisional(tys, soft, kept)
+
+    // What the first pass settles, in the three tiers `solve` reads: what carries a type of its own
+    // first, the expected type next, and a literal's default only where neither reached it. A held
+    // argument is then read against that, which is what makes `collect([1, 2, 3], n -> s"<${n}>")`
+    // a call whose closure knows what it takes.
+    var param_refs: Buf[TypeRef] = buf()
+
+    for i in 0..<params.len()
+        param_refs.push(params.at(i).typ)
+
+    var sub: Buf[Binding] = buf()
+
+    for i in 0..<known.len()
+        sub.push(known.at(i))
+
+    for i in 0..<param_refs.len()
+        if i < tys.len() && !soft.at(i) then
+            unify(cx.an, scope, param_refs.at(i), tys.at(i), tparams, &sub)
+
+    if sub.len() < tparams.len() && result.is_some() && expected.is_some() then
+        unify(cx.an, scope, result.unwrap(), expected.unwrap(), tparams, &sub)
+
+    if sub.len() < tparams.len()
+        for i in 0..<param_refs.len()
+            if i < tys.len() && soft.at(i) && tys.at(i) != Unknown then
+                unify(cx.an, scope, param_refs.at(i), tys.at(i), tparams, &sub)
+
+    // **By readiness rather than left to right**, so that a callable whose result settles what the
+    // next one takes is read first whichever order the two were written in. A round that reads
+    // nothing ends it.
+    var pending = held
+    var again = true
+
+    while again && !pending.is_empty()
+        again = false
+
+        var later: Buf[usize] = buf()
+
+        for i in 0..<pending.len()
+            val at = pending.at(i)
+            val want = held_want(cx, scope, params.at(at).typ, tparams, bounds, sub)
+
+            if want.is_none() then later.push(at)
+            else
+                val t = type_expr(cx, slots.at(at).unwrap(), want)
+
+                kept.set(at, Some(t))
+                tys.set(at, texpr_type(t))
+                unify(cx.an, scope, param_refs.at(at), texpr_type(t), tparams, &sub)
+                again = true
+
+        pending = later
+
+    Provisional(tys, soft, kept)
+end provisional_of
 
 // One reading of an argument with everything it said put back.
 private sandboxed_arg(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
@@ -383,3 +476,125 @@ any_ref_mentions(ts: Buf[TypeRef], names: Buf[string]) -> bool
 
     false
 end any_ref_mentions
+
+// -- the arguments a first pass holds back -------------------------------------------------------
+
+// Whether an argument is a **callable**: the one shape with no type of its own, since a closure's
+// parameters come from its context and a bare function name is a callable only where one is wanted.
+//
+// It is asked in the **caller's** scope, before anything enters the declaration's: asking it later
+// would be asking whether the callee's module declares a function of that name.
+callable_arg(cx: &Analyzer, e: Expr) -> bool = *written_arg(e).kind match
+    Lambda(_, _, _) -> true
+    BlockArg(_) -> true
+    Ident(n) ->
+        cx.lookup(n).is_none() &&
+        !overload_keys(cx.an, module_qualify(cx.scope.module_name, n)).is_empty()
+    _ -> false
+
+// What was actually written at an argument position, which for a filled default is inside the
+// wrapper the binding put around it: a default stands exactly where the argument would have been,
+// so what is asked about it is what would have been asked about the expression written there.
+private written_arg(e: Expr) -> Expr = *e.kind match
+    DefaultArg(_, inner) -> written_arg(inner)
+    _ -> e
+
+// The names a solve has still to answer.
+private unsolved_names(tparams: Buf[string], known: Buf[Binding]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<tparams.len()
+        if bound_type(known, tparams.at(i)).is_none() then out.push(tparams.at(i))
+
+    out
+end unsolved_names
+
+// What a held-back argument is read against, once the others have settled what they can.
+//
+// A **callable** wants its parameter's *bound*; everything else held back wants the parameter
+// itself. Nothing at all where the parameter still names something undetermined, which leaves the
+// closure to report that its parameters have no types -- the honest answer there, since they have
+// none.
+private held_want(cx: &Analyzer, scope: Scope, ptype: TypeRef, tparams: Buf[string],
+                  bounds: Buf[NamedBounds], sub: Buf[Binding]) -> Option[Type]
+    val shape = call_shape(cx, scope, ptype, tparams, bounds)
+
+    if shape.is_some()
+        val unsolved = unsolved_names(tparams, sub)
+
+        // **Only what the closure TAKES has to be settled; what it yields may still be open.** A
+        // closure takes its parameter types from its context and its result from its body, so a
+        // result nothing here knows is the ordinary case rather than a difficulty.
+        if !any_ref_mentions(shape.unwrap().1, unsolved)
+            var args: Buf[Type] = buf()
+
+            for i in 0..<shape.unwrap().1.len()
+                args.push(resolve_type(cx.an, scope, shape.unwrap().1.at(i), sub))
+
+            var yields = Unknown
+
+            if shape.unwrap().2.is_some() && !ref_mentions(shape.unwrap().2.unwrap(), unsolved) then
+                yields = resolve_type(cx.an, scope, shape.unwrap().2.unwrap(), sub)
+
+            args.push(yields)
+            return Some(Trait(shape.unwrap().0, args, buf()))
+        end if
+
+    if ref_mentions(ptype, unsolved_names(tparams, sub)) then return None
+
+    Some(resolve_type(cx.an, scope, ptype, sub))
+end held_want
+
+// The two ways a parameter can ask for a callable, read down to one shape: the trait's key, what it
+// takes, and what it yields.
+//
+// **A bare arrow and a boxed `&Fn` are the same question.** They differ in what they cost -- the
+// arrow becomes a bounded type parameter and is called directly, the boxed one is a trait object
+// and dispatches -- and in nothing else that matters here, since both state a signature the closure
+// standing at them can be read against.
+private call_shape(cx: &Analyzer, scope: Scope, ptype: TypeRef, tparams: Buf[string],
+                   bounds: Buf[NamedBounds]) -> Option[(string, Buf[TypeRef], Option[TypeRef])]
+    *ptype.kind match
+        NamedType(name, args) ->
+            if !args.is_empty() then return applied_call_shape(cx, scope, name, args)
+            if !holds_string(tparams, name) then return applied_call_shape(cx, scope, name, args)
+
+            for i in 0..<bounds.len()
+                if bounds.at(i).name == name
+                    val bs = bounds.at(i).bounds
+
+                    for j in 0..<bs.len()
+                        val found = applied_call_shape(cx, scope, bs.at(j).name, bs.at(j).args)
+
+                        if found.is_some() then return found
+
+            None
+        FnType(params, ret, _) ->
+            val key = lookup_trait_key(cx.an, scope, fn_base(params.len()))
+
+            if key.is_none() then return None
+
+            Some((key.unwrap(), params, Some(ret)))
+        RefType(inner, _) -> call_shape(cx, scope, inner, tparams, bounds)
+        PtrType(inner) -> call_shape(cx, scope, inner, tparams, bounds)
+        _ -> None
+end call_shape
+
+// A trait written out with its arguments, where the trait is one of the call traits: the last
+// argument is what it yields and the rest are what it takes.
+private applied_call_shape(cx: &Analyzer, scope: Scope,
+                           name: string, args: Buf[TypeRef]) -> Option[(string, Buf[TypeRef],
+                                                                        Option[TypeRef])]
+    if !fn_is_call(name) then return None
+
+    val key = lookup_trait_key(cx.an, scope, name)
+
+    if key.is_none() || args.is_empty() then return None
+
+    var taken: Buf[TypeRef] = buf()
+
+    for i in 0..<(args.len() - 1)
+        taken.push(args.at(i))
+
+    Some((key.unwrap(), taken, Some(args.at(args.len() - 1))))
+end applied_call_shape

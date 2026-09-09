@@ -38,6 +38,15 @@ analyze_bodies(units: Buf[Program], t: Target) -> TypedBodies
     var generic: usize = 0
     var defaults: usize = 0
 
+    // **A generic body is checked once, at its definition**, with each type parameter opaque except
+    // for what its bounds promise. What separates that from a template is that the body is wrong on
+    // its own, so the complaint does not wait for a call site to expose it.
+    //
+    // It runs before any body is typed, because it is a question about declarations rather than
+    // about a program: a mistake in a generic body is the same mistake whichever call reaches it
+    // first, and a closure lowered while checking one is a closure this compilation lowered.
+    check_generic_bodies(a, units)
+
     for i in 0..<units.len()
         val unit = units.at(i)
         val scope = scope_of_unit(unit)
@@ -49,17 +58,14 @@ analyze_bodies(units: Buf[Program], t: Target) -> TypedBodies
                 // **A generic declaration is not a function**, so there is no body to type here:
                 // what a program runs is the instantiation a call asked for, and each one is typed
                 // below with its parameters fixed.
-                FuncDecl(d) ->
+                FuncDecl(written) ->
+                    val d = with_call_bounds(written)
+
                     if !d.tparams.is_empty() then generic += 1
                     else funcs.push(analyze_body(a, scope, s.span, d))
                 _ -> ()
 
     val declared = funcs.len()
-
-    // **A generic body is checked once, at its definition**, with each type parameter opaque except
-    // for what its bounds promise. What separates that from a template is that the body is wrong on
-    // its own, so the complaint does not wait for a call site to expose it.
-    check_generic_bodies(a, units)
 
     // A member of a concrete type is a function whose body is typed whether or not anything calls
     // it, which is what makes a mistake in one a mistake at its declaration.
@@ -85,6 +91,12 @@ analyze_bodies(units: Buf[Program], t: Target) -> TypedBodies
             funcs.push(analyze_instance_in(a, cx, job.name, job.decl))
 
         guard += 1
+
+    // The `call` bodies the closures lowered to, after everything a program declared: a closure has
+    // no declaration of its own to sit beside, and one lowered while a later body was typed would
+    // otherwise land in the middle of the list.
+    for i in 0..<a.closure_funcs.len()
+        funcs.push(a.closure_funcs.at(i))
 
     TypedBodies(funcs, a.diagnostics(), generic, defaults, declared)
 end analyze_bodies
@@ -152,7 +164,10 @@ private check_generic_bodies(a: &Analysis, units: Buf[Program])
 
         for j in 0..<unit.body.len()
             *unit.body.at(j).kind match
-                FuncDecl(d) -> if !d.tparams.is_empty() then check_abstract_body(a, scope, d)
+                FuncDecl(written) ->
+                    val d = with_call_bounds(written)
+
+                    if !d.tparams.is_empty() then check_abstract_body(a, scope, d)
                 _ -> ()
 
     // A generic type's members and a generic `impl`'s are checkable before anything instantiates
@@ -292,7 +307,7 @@ private is_result_list(t: Type) -> bool = t match
 // How many statements at the head of a body are its contract, which is what splits the clauses from
 // the code. A clause after that is one written somewhere it may not be, and the statement walk says
 // so there.
-private contract_length(body: Buf[Stmt]) -> usize
+contract_length(body: Buf[Stmt]) -> usize
     var n: usize = 0
 
     while n < body.len() && is_contract_clause(body.at(n))
@@ -307,7 +322,7 @@ private is_contract_clause(s: Stmt) -> bool = *s.kind match
     Variant(_) -> true
     _ -> false
 
-private statements_from(body: Buf[Stmt], first: usize) -> Buf[Stmt]
+statements_from(body: Buf[Stmt], first: usize) -> Buf[Stmt]
     var out: Buf[Stmt] = buf()
 
     for i in first..<body.len()
@@ -319,7 +334,7 @@ end statements_from
 // The leading `require`/`ensure`/`variant` clauses. Both conditions must be `bool`; `result` and
 // `old(e)` are only in scope inside an `ensure` -- `result` also only where the function returns a
 // value -- and the `old` expressions are collected so that the emitter can snapshot them at entry.
-private analyze_contract(cx: &Analyzer, body: Buf[Stmt], upto: usize,
+analyze_contract(cx: &Analyzer, body: Buf[Stmt], upto: usize,
                          ret: Type) -> (Buf[TClause], Buf[TClause], Buf[TExpr], Option[TExpr])
     var requires: Buf[TClause] = buf()
     var ensures: Buf[TClause] = buf()
@@ -371,7 +386,7 @@ end function_measure
 
 // Where a complaint about the whole body points: its last statement, which is the expression the
 // body came to, and the declaration itself for a body with none.
-private body_span(rest: Buf[Stmt], span: Span) -> Span
+body_span(rest: Buf[Stmt], span: Span) -> Span
     if rest.is_empty() then return span
 
     rest.at(rest.len() - 1).span
