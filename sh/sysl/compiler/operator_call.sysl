@@ -1,0 +1,512 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Operators, which are trait-method calls with a token for a name.
+//
+// `a + b` means `Add::add(a, b)` and is accepted exactly where the type of `a` satisfies `Add` **at
+// the type of `b`** -- one rule, whether the operand is a scalar the machine has an instruction for,
+// a type with a written `impl`, or a type parameter whose implementation arrives when it is
+// instantiated. What differs between the three is only where the implementation comes from, which is
+// why this is one file rather than three cases spread through the analyzer.
+//
+// Two things here are not simply a member lookup. A comparison chain holds the **link** between two
+// operands rather than a `bool`, because the middle operand of `a < b < c` is one value compared
+// twice and codegen has to read it once. And the catalog declares a method for only two of the six
+// comparisons: `>` is `<` with the operands exchanged and `>=` is `<` negated, so a `TDispatch`
+// carries a swap and a negation and one written `lt` serves all four.
+
+// `a op b` where the operands are not something the machine has an instruction for.
+//
+// A built-in keeps its instruction and this answers nothing, which leaves the scalar path to type it
+// -- that is what keeps a float comparison on IEEE semantics rather than routing it through a
+// negated `lt`. Nothing, too, for an operand type with no membership either way, so the diagnostic
+// stays the one the scalar path already gives.
+operator_call(cx: &Analyzer, span: Span, op: string, l: TExpr, r: TExpr) -> Option[TExpr]
+    val spelling = core_infix(op)
+
+    if spelling.is_none() then return None
+
+    trait_operator(cx, span, spelling.unwrap(), op, Some(r), l)
+end operator_call
+
+// `-a`, `~a` -- the same, for the two prefix operators.
+prefix_call(cx: &Analyzer, span: Span, op: string, t: TExpr) -> Option[TExpr]
+    val spelling = core_prefix(op)
+
+    if spelling.is_none() then return None
+
+    trait_operator(cx, span, spelling.unwrap(), op, None, t)
+end prefix_call
+
+// `spelling` is the trait as the catalog names it, which is what a program writes; the key the
+// tables hold it under is the library's for that spelling.
+private trait_operator(cx: &Analyzer, span: Span, spelling: string, op: string, rhs: Option[TExpr],
+                       recv: TExpr) -> Option[TExpr]
+    val tr_name = library_key(spelling)
+    val recv_ty = texpr_type(recv)
+    var rhs_ty: Option[Type] = None
+
+    if rhs.is_some() then rhs_ty = Some(texpr_type(rhs.unwrap()))
+
+    val tr = op_bound(cx.an, cx.scope, tr_name, recv_ty, rhs_ty)
+    val found = dispatch_for(cx, span, spelling, op, recv_ty, tr)
+
+    if found.is_none() then return None
+
+    val d = found.unwrap()
+    val subst = op_subst(cx.an, tr_name, recv_ty, tr)
+    val m = catalog_method(cx.an, tr_name, spelling)
+
+    if m.is_none() then return None
+
+    val scope = trait_scope_of(cx.an, tr_name)
+
+    if rhs.is_some() && !m.unwrap().params.is_empty() then
+        check_operand(cx, op, recv_ty, rhs.unwrap(),
+                      resolve_type(cx.an, scope, m.unwrap().params.at(0).typ, subst))
+
+    val rty = if m.unwrap().ret_type.is_some() then
+                  declared_result_type(Some(resolve_type(cx.an, scope, m.unwrap().ret_type.unwrap(),
+                                                         subst)))
+              else Unit
+
+    var args: Buf[TExpr] = buf()
+
+    if d.swap
+        if rhs.is_some() then args.push(rhs.unwrap())
+
+        args.push(recv)
+    else
+        args.push(recv)
+
+        if rhs.is_some() then args.push(rhs.unwrap())
+    end if
+
+    val call = TExpr(span, TCall(d.name, args, rty, false))
+
+    if d.negate then Some(TExpr(span, TUnary("!", call, Bool))) else Some(call)
+end trait_operator
+
+// The one method a trait requires, read off the trait's own declaration.
+private catalog_method(a: &Analysis, tr_name: string, spelling: string) -> Option[MethodDecl]
+    val required = core_required(spelling)
+
+    if required.is_none() then return None
+
+    val d = trait_decl_at(a, tr_name)
+
+    if d.is_none() then return None
+
+    trait_method(d.unwrap(), required.unwrap().0)
+end catalog_method
+
+// The trait an operator asks of its **pair** of operands: the catalog's binary arithmetic traits
+// take the right-hand type as an argument, so `c * 2.0` asks for `Mul[real]` while `a * b` on one
+// type asks for that type's own `Mul`. A trait that takes no parameters -- `Eq`, `Ord`, and the two
+// prefix operators -- is asked for bare, which is what keeps a comparison homogeneous.
+//
+// **The result is an argument too, and a use cannot supply it.** `Mul[Rhs = Self, Out = Self]`
+// declares two and `a * b` names only the first: what `*` gives back is what the implementation says
+// it gives back, which is the whole reason `Out` is carried as an argument rather than fixed to
+// `Self`. So the operand **selects** and the matched implementation supplies the rest.
+op_bound(a: &Analysis, scope: Scope, tr_name: string, subject: Type,
+         rhs: Option[Type]) -> Bound
+    val d = trait_decl_at(a, tr_name)
+
+    if d.is_none() || d.unwrap().tparams.is_empty() then return Bound(tr_name, buf())
+
+    var selector: Buf[Type] = buf()
+
+    if rhs.is_some() then selector.push(rhs.unwrap())
+
+    val found = written_operand_bound(a, tr_name, subject, selector, d.unwrap())
+    val args = if found.is_some() then found.unwrap().args
+    else trait_args_with_defaults(a, scope, span_zero(), tr_name, d.unwrap(), selector,
+                                  self_binding(subject))
+    var carried: Buf[Type] = buf()
+
+    for i in 0..<args.len()
+        carried.push(as_operand(subject, args.at(i)))
+
+    Bound(tr_name, carried)
+end op_bound
+
+// Where the arguments an operator's trait was applied at come from: a type parameter reads them off
+// its own **bounds**, because it has no implementation to read a result out of, and everything else
+// reads them off the block that was written.
+private written_operand_bound(a: &Analysis, tr_name: string, subject: Type, selector: Buf[Type],
+                              d: TraitDecl) -> Option[Bound] = subject match
+    Abstract(_, bounds) -> bound_at_operand(a, tr_name, subject, bounds, selector, d)
+    _ -> impl_by_operand(a, tr_name, subject, selector, d)
+
+// `[T: Mul[T, real]]` is what tells a body multiplying two `T`s that it gets a `real`. The defaults
+// fill in for a parameter whose bound named no arguments, which keeps a bare `[T: Mul]` the
+// homogeneous reading it has always been.
+private bound_at_operand(a: &Analysis, tr_name: string, subject: Type, bounds: Buf[Bound],
+                         selector: Buf[Type], d: TraitDecl) -> Option[Bound]
+    for i in 0..<bounds.len()
+        val closure = trait_closure(a, bounds.at(i), self_binding(subject))
+
+        for j in 0..<closure.len()
+            val b = closure.at(j)
+
+            if b.name == tr_name && b.args.len() == d.tparams.len()
+                if selected_key(tr_name, selector, b) == b.key() then return Some(b)
+
+    None
+end bound_at_operand
+
+// The whole argument list an implementation was written at, found from the arguments a **use**
+// supplies rather than from all of them.
+//
+// An operator is the one use that cannot name every argument: `a * b` fixes the right-hand type and
+// says nothing about the result, because the result is what it is asking to be told. So a use's
+// arguments are a **prefix** -- the selector -- and the implementation supplies the tail. Two
+// implementations agreeing on the selector are refused where they are written, so at most one is
+// found here and this stays a lookup rather than a choice.
+impl_by_operand(a: &Analysis, tr_name: string, subject: Type, selector: Buf[Type],
+                d: TraitDecl) -> Option[Bound]
+    if selector.len() >= d.tparams.len() then return None
+
+    var owners: Buf[(string, Buf[Type])] = buf()
+
+    owners.push(member_owner(subject))
+
+    val shapes = shape_owners(subject)
+
+    for i in 0..<shapes.len()
+        owners.push(shapes.at(i))
+
+    val blankets = blanket_owners(a, subject)
+
+    for i in 0..<blankets.len()
+        owners.push(blankets.at(i))
+
+    for i in 0..<owners.len()
+        val rows = impls_of(a, tr_name, owners.at(i).0)
+
+        for j in 0..<rows.len()
+            val b = supplied_bound(a, rows.at(j), tr_name, subject, owners.at(i).1)
+
+            if b.args.len() == d.tparams.len()
+                if selected_key(tr_name, selector, b) == b.key() then return Some(b)
+
+    None
+end impl_by_operand
+
+// The bound a candidate would be if the use's selector replaced its own leading arguments -- which
+// is how a candidate is tested against a prefix rather than against a whole list.
+private selected_key(tr_name: string, selector: Buf[Type], b: Bound) -> string
+    var args: Buf[Type] = buf()
+
+    for i in 0..<selector.len()
+        args.push(selector.at(i))
+
+    for i in selector.len()..<b.args.len()
+        args.push(b.args.at(i))
+
+    Bound(tr_name, args).key()
+end selected_key
+
+// The subject put back where a bound named it, which is what keeps the **result** of one dispatched
+// operator usable as the operand of the next.
+//
+// A trait's own bounds are resolved with the parameter's bounds dropped one level in, so that a
+// bound reaching back around to its own parameter terminates. That leaves the `Self` in the closure
+// a bare `T` carrying no promises -- and reading a result off it would make `(x & y) ^ z` in a
+// `[T: BitAnd + BitXor]` body fail at the `^`, the first operator whose operand came from another
+// one rather than from a parameter.
+private as_operand(subject: Type, arg: Type) -> Type = subject match
+    Abstract(sname, _) -> arg match
+        Abstract(aname, abounds) -> if aname == sname && abounds.is_empty() then subject else arg
+        _ -> arg
+    _ -> arg
+
+// The substitution a catalog method's signature is read under at an operand pair: `Self` is the left
+// operand's type, and the trait's parameters are the arguments the selected implementation turned
+// out to be written at -- which is what binds `Out` to a result the use site never named.
+private op_subst(a: &Analysis, tr_name: string, lhs: Type, tr: Bound) -> Buf[Binding]
+    var subst = self_binding(lhs)
+    val d = trait_decl_at(a, tr_name)
+
+    if d.is_none() then return subst
+
+    for i in 0..<d.unwrap().tparams.len()
+        val arg = if i < tr.args.len() then tr.args.at(i) else Unknown
+
+        subst.push(Binding(d.unwrap().tparams.at(i), arg))
+
+    subst
+end op_subst
+
+// Which method an operator on a type dispatches to, or nothing where the machine has an instruction
+// for it.
+//
+// A built-in keeps its instruction **unless a block was written at these very arguments**: `impl
+// Mul[Point, Point] for real` is the block that puts a scalar on the left of an operator, and
+// nothing but the argument list tells it from the multiplication the machine does. A type parameter
+// answers with the **trait's** own method, since which implementation runs is settled when it is
+// instantiated, and a bound the parameter does not carry is reported here at the definition. A
+// written type answers with the member its `impl` produced.
+private dispatch_for(cx: &Analyzer, span: Span, spelling: string, op: string, ty: Type,
+                     tr: Bound) -> Option[TDispatch]
+    val tr_name = library_key(spelling)
+    val derived = core_derivation(op)
+    val required = core_required(spelling)
+
+    if required.is_none() then return None
+
+    val method = required.unwrap().0
+
+    if core_builtin(spelling, ty) && !written_impl_at(cx.an, tr, ty) then return None
+
+    ty match
+        Abstract(_, _) ->
+            if !satisfies(cx.an, tr, ty) then
+                cx.an.bound_fault(cx.scope, span,
+                                  s"'$op' needs '${type_show(ty)}: ${show_bound(cx.an, tr, ty)}'")
+
+            return Some(TDispatch(s"$tr_name.$method", derived.0, derived.1))
+        _ -> ()
+
+    if satisfies(cx.an, tr, ty) then
+        return Some(TDispatch(member_func_name(cx, span, ty, method + impl_alt(cx.an, tr, ty)),
+                              derived.0, derived.1))
+
+    // A type that implements the operator's trait, but not at **this** pair of operands, is worth
+    // saying so about here. Falling through would leave the scalar path's "operands must match",
+    // which is advice to change the operands when the answer is to implement the trait for them.
+    val why = unmet_bound(cx.an, tr, ty)
+
+    if why.is_some()
+        val between = if tr.args.is_empty() then type_show(ty)
+        else s"${type_show(ty)} and ${type_show(tr.args.at(0))}"
+
+        cx.fault(span, s"'$op' between $between needs '${show_bound(cx.an, tr, ty)}' — " +
+                 s"${why.unwrap()}")
+    end if
+
+    None
+end dispatch_for
+
+// The other operand of a dispatched binary operator, against what the trait's signature asks for --
+// `Self` for a homogeneous trait, and the argument the bound was found at for one that takes a
+// right-hand type.
+private check_operand(cx: &Analyzer, op: string, recv_ty: Type, b: TExpr, want: Type)
+    if disagree(texpr_type(b), want) then
+        cx.fault(b.span, s"'$op' needs matching types, got ${type_show(recv_ty)} and " +
+                 s"${type_show(texpr_type(b))}")
+end check_operand
+
+// One link of a comparison chain: the operator, plus the method performing it where the operand type
+// reaches `Eq`/`Ord` through a trait.
+//
+// What this hands codegen is a **name**, not a call tree, and that is the whole reason it exists. A
+// chain compares each middle operand against both its neighbours from a single evaluation, so a
+// dispatched comparison has to read the value codegen is already holding; a call wrapped around the
+// operand's own tree would evaluate it again.
+compare_link(cx: &Analyzer, span: Span, op: string, l: TExpr, r: TExpr) -> Option[TDispatch]
+    val spelling = core_infix(op)
+
+    if spelling.is_none() then return None
+
+    val tr_name = library_key(spelling.unwrap())
+    val tr = op_bound(cx.an, cx.scope, tr_name, texpr_type(l), Some(texpr_type(r)))
+    val found = dispatch_for(cx, span, spelling.unwrap(), op, texpr_type(l), tr)
+
+    if found.is_none() then return None
+
+    val m = catalog_method(cx.an, tr_name, spelling.unwrap())
+
+    if m.is_some() && !m.unwrap().params.is_empty()
+        val scope = trait_scope_of(cx.an, tr_name)
+        val subst = op_subst(cx.an, tr_name, texpr_type(l), tr)
+
+        check_operand(cx, op, texpr_type(l), r,
+                      resolve_type(cx.an, scope, m.unwrap().params.at(0).typ, subst))
+    end if
+
+    found
+end compare_link
+
+// The right-hand type a type parameter's own **bounds** name for an operator, where one of them
+// names that operator's trait at all.
+//
+// It is what decides a bare literal beside a parameter: `x - 1` in a `[T: Sub]` body means `T`'s own
+// subtraction, while `x * 2.0` in a `[T: Mul[f64]]` body means the `real` that bound names. A
+// parameter carrying no bound for the operator at all is left homogeneous, because that is the
+// reading whose diagnostic -- write `T: Mul` -- is the one that helps.
+private bound_rhs(a: &Analysis, op: string, subject: Type, bounds: Buf[Bound]) -> Option[Type]
+    val spelling = core_infix(op)
+
+    if spelling.is_none() then return None
+
+    val tr_name = library_key(spelling.unwrap())
+
+    for i in 0..<bounds.len()
+        val closure = trait_closure(a, bounds.at(i), self_binding(subject))
+
+        for j in 0..<closure.len()
+            if closure.at(j).name == tr_name && !closure.at(j).args.is_empty() then
+                return Some(closure.at(j).args.at(0))
+
+    None
+end bound_rhs
+
+// The right-hand type a **concrete** type's own implementations of an operator's trait agree on,
+// where they agree.
+//
+// A type may implement one operator at more than one right-hand type, and there is nothing to read
+// off when it does: a `Complex` that is both `Mul[Complex]` and `Mul[real]` leaves `c * 2` genuinely
+// ambiguous, and guessing one would be worse than the diagnostic. So the answer is the **agreed**
+// argument or nothing, which makes this a lookup for the ordinary case and silent for the
+// interesting one.
+private impl_rhs(a: &Analysis, op: string, subject: Type) -> Option[Type]
+    val spelling = core_infix(op)
+
+    if spelling.is_none() then return None
+    if core_builtin(spelling.unwrap(), subject) then return None
+
+    val tr_name = library_key(spelling.unwrap())
+    val d = trait_decl_at(a, tr_name)
+
+    if d.is_none() || d.unwrap().tparams.is_empty() then return None
+
+    agreed_operand(a, tr_name, subject, d.unwrap())
+end impl_rhs
+
+// Every argument list the subject's implementations of a trait were written at, reduced to the one
+// right-hand type they all name.
+private agreed_operand(a: &Analysis, tr_name: string, subject: Type, d: TraitDecl) -> Option[Type]
+    var owners: Buf[(string, Buf[Type])] = buf()
+
+    owners.push(member_owner(subject))
+
+    val shapes = shape_owners(subject)
+
+    for i in 0..<shapes.len()
+        owners.push(shapes.at(i))
+
+    val blankets = blanket_owners(a, subject)
+
+    for i in 0..<blankets.len()
+        owners.push(blankets.at(i))
+
+    var heads: Buf[Type] = buf()
+
+    for i in 0..<owners.len()
+        val rows = impls_of(a, tr_name, owners.at(i).0)
+
+        for j in 0..<rows.len()
+            val b = supplied_bound(a, rows.at(j), tr_name, subject, owners.at(i).1)
+
+            if b.args.len() == d.tparams.len() && !b.args.is_empty() then heads.push(b.args.at(0))
+
+    if heads.is_empty() then return None
+
+    for i in 0..<heads.len()
+        if disagree(heads.at(i), heads.at(0)) then return None
+
+    Some(heads.at(0))
+end agreed_operand
+
+// The right-hand operand of a binary operator, re-read where the left operand's own implementation
+// names a right-hand type the literal did not take.
+//
+// A bare literal beside a typed neighbour takes that neighbour's type, and for a dispatched operator
+// that is the wrong reading twice over. Beside a **type parameter** it has already become the
+// parameter's own type, and the bound is what says otherwise. Beside a **written type** it has
+// nothing to take at all, since `Duration` is not an integer, so it falls back to `int` -- and `d *
+// 3` was then refused for wanting `Mul[int]` from a type that implements `Mul[long]`, which is a
+// complaint about the literal's default rather than about anything the program said.
+operand_rhs(cx: &Analyzer, op: string, l: TExpr, r: Expr, t: TExpr) -> TExpr
+    val lty = texpr_type(l)
+
+    lty match
+        Abstract(_, bounds) ->
+            if !is_literal(r) || !type_eq(texpr_type(t), lty) then return t
+
+            val want = bound_rhs(cx.an, op, lty, bounds)
+
+            if want.is_none() || type_eq(want.unwrap(), lty) then return t
+
+            return type_expr(cx, r, Some(want.unwrap()))
+        _ -> ()
+
+    if !is_literal(r) then return t
+
+    val want = impl_rhs(cx.an, op, lty)
+
+    if want.is_none() || !disagree(texpr_type(t), want.unwrap()) then return t
+
+    type_expr(cx, r, Some(want.unwrap()))
+end operand_rhs
+
+// What a compound assignment's right-hand side is read as.
+//
+// A scalar's `+=` is homogeneous, so the place's type is what the value should be -- that is what
+// makes the `1` in `n += 1` a literal of the place's own width. An operator that **dispatches** may
+// take a right-hand type of its own, and there the place's type is the wrong thing to read the value
+// as: `c *= 2.0` on a complex number wants a `real`, and offering it `Complex` would hand the
+// literal a type it cannot be.
+update_expected(a: &Analysis, op: string, place_ty: Type) -> Option[Type]
+    val spelling = core_infix(op)
+
+    if spelling.is_none() then return Some(place_ty)
+
+    place_ty match
+        Abstract(_, bounds) ->
+            val want = bound_rhs(a, op, place_ty, bounds)
+
+            return Some(want.unwrap_or(place_ty))
+        _ -> ()
+
+    if core_builtin(spelling.unwrap(), place_ty) then return Some(repr(place_ty))
+
+    impl_rhs(a, op, place_ty)
+end update_expected
+
+// `place op= value` where `op` is a trait method -- the same dispatch `place op value` makes, handed
+// over as a name so codegen applies it to the value it already loaded from the place rather than
+// reading the place a second time.
+update_dispatch(cx: &Analyzer, span: Span, op: string, place: TExpr,
+                value: TExpr) -> Option[TDispatch]
+    val spelling = core_infix(op)
+
+    if spelling.is_none() then return None
+
+    val tr_name = library_key(spelling.unwrap())
+    val place_ty = texpr_type(place)
+    val tr = op_bound(cx.an, cx.scope, tr_name, place_ty, Some(texpr_type(value)))
+    val found = dispatch_for(cx, span, spelling.unwrap(), op, place_ty, tr)
+
+    if found.is_none() then return None
+
+    val m = catalog_method(cx.an, tr_name, spelling.unwrap())
+
+    if m.is_none() then return found
+
+    val scope = trait_scope_of(cx.an, tr_name)
+    val subst = op_subst(cx.an, tr_name, place_ty, tr)
+
+    if !m.unwrap().params.is_empty() then
+        check_operand(cx, op, place_ty, value,
+                      resolve_type(cx.an, scope, m.unwrap().params.at(0).typ, subst))
+
+    // `a op= b` is `a = a op b`, so an operator whose result is not the left operand's type has
+    // nothing to assign back. The compound form is refused rather than quietly changing what the
+    // place holds, and the reader is pointed at the spelling that says which type it means.
+    if m.unwrap().ret_type.is_some()
+        val want = declared_result_type(Some(resolve_type(cx.an, scope,
+                                                          m.unwrap().ret_type.unwrap(), subst)))
+
+        if disagree(want, place_ty) then
+            cx.fault(span, s"'$op=' updates ${type_show(place_ty)} in place, but '$op' between " +
+                     s"${type_show(place_ty)} and ${type_show(texpr_type(value))} gives " +
+                     s"${type_show(want)} — write the assignment out to say where it goes")
+    end if
+
+    found
+end update_dispatch

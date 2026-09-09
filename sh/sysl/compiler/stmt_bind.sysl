@@ -148,22 +148,31 @@ private one_write(cx: &Analyzer, op: string, target: Expr, place: TExpr, part: O
     end if
 
     val bin = op[0..<op.bytes.len - 1]
-    val tv = arm_value(cx, part, written, texpr_type(place))
+    val tv = arm_value_at(cx, part, written, update_expected(cx.an, bin, texpr_type(place)))
+    val dispatch = update_dispatch(cx, written.span, bin, place, tv)
 
-    if disagree(arith_type(cx, written.span, bin, texpr_type(place), texpr_type(tv), written.span),
-                texpr_type(place)) then
-        cx.fault(written.span, s"'$op' would change the type of ${describe_target(target)}")
+    if dispatch.is_none()
+        if disagree(arith_type(cx, written.span, bin, texpr_type(place), texpr_type(tv),
+                               written.span), texpr_type(place)) then
+            cx.fault(written.span, s"'$op' would change the type of ${describe_target(target)}")
+    end if
 
     TWrite(place, op, tv, None, buf(), constraint_of(texpr_type(place)))
 end one_write
 
 // The value one arm of a comma form is given: the part read out of the carrier, or the expression
 // written beside it.
-private arm_value(cx: &Analyzer, part: Option[TExpr], written: Expr, want: Type) -> TExpr
+private arm_value(cx: &Analyzer, part: Option[TExpr], written: Expr, want: Type) -> TExpr =
+    arm_value_at(cx, part, written, Some(want))
+
+// The same, where the position may have nothing to say -- which is what a compound assignment
+// through a dispatched operator has when the type's implementations name no one right-hand type.
+private arm_value_at(cx: &Analyzer, part: Option[TExpr], written: Expr,
+                     want: Option[Type]) -> TExpr
     if part.is_some() then return part.unwrap()
 
-    type_expr(cx, written, Some(want))
-end arm_value
+    type_expr(cx, written, want)
+end arm_value_at
 
 // `val a, b = …` / `var a, b = …`.
 //

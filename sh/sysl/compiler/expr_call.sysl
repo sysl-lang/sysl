@@ -274,7 +274,26 @@ end encode_string
 // A struct's name in call position is its positional constructor.
 private struct_call(cx: &Analyzer, span: Span, key: string, written: string, args: Buf[Expr],
                     expected: Option[Type]) -> TExpr
-    val inst = cx.an.tables.struct_insts.get(instance_key(key, buf()))
+    val decl = cx.an.tables.types.get(key)
+    var sd: Option[StructDecl] = None
+
+    if decl.is_some() then
+        decl.unwrap().kind match
+            StructOf(one) -> sd = Some(one)
+            _ -> ()
+
+    var inst = cx.an.tables.struct_insts.get(instance_key(key, buf()))
+
+    // A generic struct has no instantiation under an empty argument list, so the constructor works
+    // out what it is being built at -- from the type the position expects where that says, and from
+    // the values otherwise.
+    if sd.is_some() && !sd.unwrap().tparams.is_empty()
+        val targs = struct_targs(cx, span, key, decl.unwrap().scope, sd.unwrap(), args, expected)
+
+        reinstantiate(cx.an, key, targs) match
+            Struct(d) -> inst = Some(Struct(d))
+            _ -> return bad_expr(span)
+    end if
 
     if inst.is_none() then
         return cx.err(span, s"'$written' takes type arguments, and inferring them is not built yet")
@@ -302,6 +321,46 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
             TExpr(span, TStructNew(d, ts))
         _ -> bad_expr(span)
 end struct_call
+
+// The arguments a generic struct is built at: the ones the position already names, where it names a
+// struct of this very declaration, and otherwise the ones the field values determine.
+//
+// **A position that says outright is trusted over the values**, because the values are read against
+// the fields and the fields are written in the parameters being worked out -- so a `var b: Buf[T] =
+// Buf([], 0)` settles `T` from the annotation rather than from an empty array literal that says
+// nothing.
+private struct_targs(cx: &Analyzer, span: Span, key: string, home: Scope, sd: StructDecl,
+                     args: Buf[Expr], expected: Option[Type]) -> Buf[Type]
+    if expected.is_some()
+        expected.unwrap() match
+            Struct(d) -> if d.base == key then return d.targs
+            _ -> ()
+    end if
+
+    var field_refs: Buf[TypeRef] = buf()
+
+    for i in 0..<sd.fields.len()
+        field_refs.push(sd.fields.at(i).typ)
+
+    var prov: Buf[Type] = buf()
+    var soft: Buf[bool] = buf()
+
+    for i in 0..<args.len()
+        if i < field_refs.len() && !ref_mentions(field_refs.at(i), sd.tparams)
+            val want = resolve_type(cx.an, home, field_refs.at(i), no_bindings())
+            val t = sandboxed_read(cx, args.at(i), Some(want))
+
+            prov.push(texpr_type(t))
+            soft.push(false)
+        else
+            val t = sandboxed_read(cx, args.at(i), None)
+
+            prov.push(texpr_type(t))
+            soft.push(adaptable(args.at(i), t))
+
+    solve(cx.an, home, span, key, sd.tparams, field_refs, prov, None, expected, soft, sd.bounds,
+          buf())
+end struct_targs
 
 // A simple enum's name in call position is a checked cast from an integer.
 private enum_cast(cx: &Analyzer, span: Span, key: string, written: string,

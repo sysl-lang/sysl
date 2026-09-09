@@ -471,6 +471,11 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
 
     if ty == Unknown then return t
 
+    if op == "-" || op == "~" then
+        val dispatched = prefix_call(cx, e.span, op, t)
+
+        if dispatched.is_some() then return dispatched.unwrap()
+
     if op == "-" then
         op_subject(ty) match
             Integer(_, signed, _) ->
@@ -565,9 +570,13 @@ private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
     val numeric = numeric_expectation(expected)
     val ts = analyze_operands(cx, operands, numeric)
     val tl = ts.at(0)
-    val tr = ts.at(1)
+    val tr = operand_rhs(cx, op, tl, r, ts.at(1))
 
     if texpr_type(tl) == Unknown || texpr_type(tr) == Unknown then return bad_expr(span)
+
+    val dispatched = operator_call(cx, span, op, tl, tr)
+
+    if dispatched.is_some() then return dispatched.unwrap()
 
     val ty = arith_type(cx, span, op, texpr_type(tl), texpr_type(tr), r.span)
 
@@ -587,7 +596,15 @@ private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[st
         val a = texpr_type(ts.at(i))
         val b = texpr_type(ts.at(i + 1))
 
-        if a != Unknown && b != Unknown then
+        var dispatch: Option[TDispatch] = None
+
+        if a != Unknown && b != Unknown then dispatch = compare_link(cx, span, op, ts.at(i),
+                                                                    ts.at(i + 1))
+
+        // A link a trait supplies had both its operands checked against the trait's own signature
+        // where it was resolved; a link the machine performs directly needs them to agree here, and
+        // needs the type to have the comparison being asked of it.
+        if a != Unknown && b != Unknown && dispatch.is_none() then
             if !type_eq(repr(a), repr(b)) then
                 cx.fault(span, s"cannot compare ${type_show(a)} with ${type_show(b)}")
             else
@@ -596,7 +613,7 @@ private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[st
 
                 if !ok then cx.fault(span, s"'$op' is not defined for ${type_show(a)}")
 
-        cmps.push(TCmp(op, None))
+        cmps.push(TCmp(op, dispatch))
 
     TExpr(span, TCompare(ts, cmps))
 end compare_expr
@@ -641,7 +658,7 @@ end analyze_operands
 
 // One reading of an operand with everything it said put back, which is what lets the top tier come
 // back empty rather than complaining on behalf of a tier that had nothing to offer it.
-private sandboxed_read(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
+sandboxed_read(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     val mark = cx.an.complaints()
     val t = analyze_expected(cx, e, expected)
 

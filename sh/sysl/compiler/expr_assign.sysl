@@ -32,14 +32,20 @@ assign_expr(cx: &Analyzer, span: Span, op: string, target: Expr, value: Expr) ->
     if texpr_type(place) == Unknown then return bad_expr(span)
 
     val bin = op[0..<op.bytes.len - 1]
-    val tv = type_expr(cx, value, update_expected(texpr_type(place)))
-    val got = arith_type(cx, span, bin, texpr_type(place), texpr_type(tv), value.span)
+    val tv = type_expr(cx, value, update_expected(cx.an, bin, texpr_type(place)))
+    val dispatch = update_dispatch(cx, span, bin, place, tv)
 
-    if disagree(got, texpr_type(place)) then
-        cx.fault(span, s"'$op' would change the type of ${describe_target(target)}")
+    // An operator that reaches an implementation had both its operands checked against the trait's
+    // own signature where it was resolved, and its result checked against the place there too.
+    if dispatch.is_none()
+        val got = arith_type(cx, span, bin, texpr_type(place), texpr_type(tv), value.span)
+
+        if disagree(got, texpr_type(place)) then
+            cx.fault(span, s"'$op' would change the type of ${describe_target(target)}")
+    end if
 
     rechecked(cx, span, place,
-              TExpr(span, TUpdate(place, op, tv, texpr_type(place), None,
+              TExpr(span, TUpdate(place, op, tv, texpr_type(place), dispatch,
                                   constraint_of(texpr_type(place)))))
 end assign_expr
 
@@ -107,4 +113,3 @@ inv_key(base: string) -> string = s"$base${ModuleSep}inv"
 // A **transparent** subtype is homogeneous at its base, which is what `repr` gives: what `t += 120`
 // adds is an ordinary integer, and reading the addend as the subtype would check it against a range
 // that belongs to the total.
-private update_expected(place_ty: Type) -> Option[Type] = Some(repr(place_ty))
