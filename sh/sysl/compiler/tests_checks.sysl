@@ -679,3 +679,89 @@ a_value_handed_back_by_copy()
 @test("and a struct nothing places inside one with an invariant is not held to the rule at all")
 a_struct_no_invariant_covers()
     assert_eq(how_many("struct Inner\n    n: int\n\n    leak(*self) -> *int = &self.n\n"), 0)
+
+// -- what a '@pure' function may do ----------------------------------------------------------------
+
+private impure_because(what: string) -> string =
+    s"a '@pure' function $what, and a caller of one may observe nothing about the call but its result"
+
+@test("writing through storage the call was handed rather than made is an effect")
+a_pure_function_writing_through_a_reference()
+    assert_eq(said("module m\n\n@pure\nput(p: *int) = *p = 1\n"),
+              impure_because("writes through a reference to storage it did not create"))
+
+@test("and so is reading module storage that may change under the call")
+a_pure_function_reading_module_storage()
+    assert_eq(said("module m\n\nvar counter: int = 0\n\n@pure\nread() -> int = counter\n"),
+              impure_because("reaches 'm.counter', which is storage outside the call and may " +
+                             "change under it"))
+
+@test("a call to anything that has not made the same promise is one too")
+a_pure_function_calling_an_impure_one()
+    assert_eq(said("module m\n\nplain() -> int = 1\n\n@pure\nask() -> int = plain()\n"),
+              impure_because("calls 'm.plain', which is not marked '@pure'"))
+
+@test("an 'extern' says nothing about what it does, so a pure function may not call one")
+a_pure_function_calling_an_extern()
+    assert_eq(said("module m\n\nextern puts(s: *byte) -> int\n\n@pure\nask() -> int = puts(null)\n"),
+              impure_because("calls 'm.puts', which is an 'extern' and says nothing about what it " +
+                             "does"))
+
+@test("and neither may it dispatch through a trait object, which settles its body while running")
+a_pure_function_dispatching()
+    if checks_no_library() then return
+
+    assert(says(complaints_of("module m\n\n@pure\nask(f: &Fn() -> int) -> int = f()\n"),
+                impure_because("dispatches through a trait object, where which body runs is " +
+                               "settled while the program is")),
+           listed_of(complaints_of("module m\n\n@pure\nask(f: &Fn() -> int) -> int = f()\n")))
+
+@test("a pure function may write its own storage, however deep the path into it")
+a_pure_function_writing_its_own_storage()
+    assert_eq(how_many("module m\n\n@pure\nask(n: int) -> int\n    var a = [0, 0]\n\n" +
+                       "    a[0] = n\n\n    a[0] + n\n"), 0)
+
+// -- what only a test build keeps ------------------------------------------------------------------
+
+// Two files of one module, analyzed together -- which is what a rule about a `@tests` file needs,
+// since one file cannot both ship and be scaffolding.
+private two_files(ordinary: string, tests: string) -> Buf[string]
+    val first = parse(source_of("a.sysl", ordinary))
+    val second = parse(source_of("t.sysl", tests))
+    var out: Buf[string] = buf()
+
+    if !first.ok() || !second.ok()
+        out.push("did not parse")
+        return out
+    end if
+
+    var units: Buf[Program] = buf()
+
+    units.push(first.program)
+    units.push(second.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    for i in 0..<done.reported.len()
+        out.push(done.reported.at(i).diag.message)
+
+    out
+end two_files
+
+@test("a declaration a '@tests' file wrote is not there in any build but a test run")
+naming_a_test_only_declaration()
+    val out = two_files("module ts\n\nuse() -> int = helper()\n",
+                        "module ts\n@tests\n\nhelper() -> int = 1\n")
+
+    assert(says(out, "'ts.helper' is declared in a file that said '@tests', so it is there for the " +
+                "module's tests and no build but 'sysl test' keeps it — only another such file, or " +
+                "a '@test' function, may name it"),
+           listed_of(out))
+
+@test("and another such file may name it, which is what the scaffolding is for")
+a_test_file_naming_its_own()
+    val out = two_files("module ts\n\nuse() -> int = 1\n",
+                        "module ts\n@tests\n\nhelper() -> int = 1\n\n@test(\"t\")\n" +
+                        "tt()\n    val n = helper()\n")
+
+    assert_eq(out.len(), usize(0), listed_of(out))

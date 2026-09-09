@@ -1,0 +1,208 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What a `@pure` function may do, and what a declaration only a `@tests` file keeps may be named by.
+//
+// **A caller of a pure function may observe nothing about the call but its result.** So what is
+// refused is not computation but effect: a write through storage the call was handed rather than
+// made, a read of module storage that may change under it, a call to anything that has not made the
+// same promise, and the two forms that settle which body runs while the program is running.
+
+// Whether a symbol IS a closure's own body rather than merely carrying one's name. A closure's base
+// starts the name; an instantiation made at a closure's type carries it further along.
+is_closure_symbol(name: string) -> bool = name.starts_with(s"${ModuleSep}closure")
+
+// Holds every `@pure` function to its promise.
+//
+// The clauses are the function's own code and run on every call, so they are held to the same rule
+// the body is -- an `ensure` that printed would be a pure function that prints.
+check_purity(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern])
+    var pure: Buf[string] = buf()
+
+    for i in 0..<funcs.len()
+        if funcs.at(i).pure then pure.push(funcs.at(i).name)
+
+    if pure.is_empty() then return
+
+    var foreign: Buf[string] = buf()
+
+    for i in 0..<externs.len()
+        foreign.push(externs.at(i).name)
+
+    // One caret, one message. A single line a reader wrote can lower to several observable nodes --
+    // `print(x)` is a call for the value and another for the newline -- and telling them twice about
+    // one `print` reads as two mistakes.
+    val said: &Skipped = Skipped(buf())
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        if !f.pure then continue
+
+        val scope = func_home(a, f.name)
+
+        walk_block_stmts(f.body, TWalk(false, e -> pure_one(a, scope, said, pure, foreign, e),
+                                       w -> (), s -> pure_stmt(a, scope, said, s)))
+
+        for j in 0..<f.requires.len()
+            walk_texpr(f.requires.at(j).cond,
+                       expr_walk(false, e -> pure_one(a, scope, said, pure, foreign, e)))
+
+        for j in 0..<f.ensures.len()
+            walk_texpr(f.ensures.at(j).cond,
+                       expr_walk(false, e -> pure_one(a, scope, said, pure, foreign, e)))
+
+        if f.variant.is_some() then
+            walk_texpr(f.variant.unwrap(),
+                       expr_walk(false, e -> pure_one(a, scope, said, pure, foreign, e)))
+end check_purity
+
+private pure_stmt(a: &Analysis, scope: Scope, said: &Skipped, s: TStmt)
+    s match
+        TAsm(_, _, _) ->
+            a.fault(scope, span_zero(), "a '@pure' function may contain no 'asm' block — what the " +
+                    "instructions do is outside anything the compiler can say about the call")
+        _ -> ()
+end pure_stmt
+
+private pure_one(a: &Analysis, scope: Scope, said: &Skipped, pure: Buf[string],
+                 foreign: Buf[string], e: TExpr)
+    val what = observable(pure, foreign, e)
+
+    if what.is_none() || said.covers(e.span) then return
+
+    said.cover(e.span)
+    a.fault(scope, e.span, s"a '@pure' function ${what.unwrap()}, and a caller of one may observe " +
+            "nothing about the call but its result")
+end pure_one
+
+// What a node does that a caller could observe, said the way a reader would say it, or nothing.
+//
+// A **write** is examined through its place: what is refused is not writing but writing through a
+// dereference, since that is exactly the storage the function was handed rather than made. An
+// element of a local array is an index over a load and is the function's own; a field of a `&T`
+// parameter is a field over a dereference and is its caller's.
+private observable(pure: Buf[string], foreign: Buf[string], e: TExpr) -> Option[string] = *e.kind match
+    TStore(place, _, _) -> if own_storage_of(place) then None else Some(wrote_outside())
+    TUpdate(place, _, _, _, _, _) -> if own_storage_of(place) then None else Some(wrote_outside())
+    TIncDec(place, _, _, _, _) -> if own_storage_of(place) then None else Some(wrote_outside())
+
+    // `xs.store(i, v)` is a write like any other, judged by the same question. It is named here
+    // rather than left to the walk because what the walk reports is nodes, and this is the one write
+    // that is not a store.
+    TVecStore(receiver, _, _) -> if own_storage_of(receiver) then None else Some(wrote_outside())
+
+    TGlobal(symbol, _, writable) ->
+        if writable then
+            Some(s"reaches '${module_show(symbol)}', which is storage outside the call and may " +
+                 "change under it")
+        else None
+
+    TCall(name, _, _, _) -> observable_call(pure, foreign, name)
+    TCallPtr(_, _, _, _) ->
+        Some("calls through a value, which names no declaration for the compiler to consult")
+    TVCall(_, _, _, _, _) ->
+        Some("dispatches through a trait object, where which body runs is settled while the " +
+             "program is")
+    TAtomic(_, _, _, _, _, _) ->
+        Some("performs an atomic operation, which is an effect other threads observe")
+    TFence(_) -> Some("orders memory, which is an effect other threads observe")
+    _ -> None
+
+private wrote_outside() -> string = "writes through a reference to storage it did not create"
+
+// A call through an `Fn` value the analyzer resolved to one particular closure is still a call the
+// reader made through a value, so it is reported as one -- naming the struct the compiler filed the
+// closure under would name something nobody wrote.
+private observable_call(pure: Buf[string], foreign: Buf[string], name: string) -> Option[string]
+    if holds_string(pure, name) then return None
+
+    if is_closure_symbol(name) then
+        return Some("calls through a closure, which names no declaration for the compiler to consult")
+
+    if holds_string(foreign, name) then
+        return Some(s"calls '${module_show(name)}', which is an 'extern' and says nothing about " +
+                    "what it does")
+
+    Some(s"calls '${module_show(name)}', which is not marked '@pure'")
+end observable_call
+
+// Whether a place is storage this call made: a local, or a part of one reached without ever going
+// through a pointer or a reference.
+//
+// The walk stops at the first dereference and answers no, which is the whole rule. It is stated as a
+// property of the *path* rather than of the root because both endpoints matter: `a[i] = v` on a
+// local array is the function's own storage however deep the indexing goes, and `p.f.g = v` is the
+// caller's from the first hop.
+private own_storage_of(place: TExpr) -> bool = *place.kind match
+    TDeref(_, _) -> false
+    TGlobal(_, _, _) -> false
+    TField(r, _, _) -> own_storage_of(r)
+    TIndex(r, _, _) -> own_storage_of(r)
+    TSlice(b, _, _, _, _) -> own_storage_of(b)
+    _ -> true
+
+// -- what only a test build keeps ------------------------------------------------------------------
+
+// Reports every reference from an ordinary body into a declaration a `@tests` file wrote.
+//
+// **The two dispatching forms are absent, and neither is a hole.** A trait-object call names a slot
+// and which body answers it is settled while the program runs; an operator a trait supplies carries
+// the method it lowers to as data. Both reach a function only through a method table, and every
+// entry in one is put there by an `impl` -- which a `@tests` file may not write.
+check_test_scope(a: &Analysis, funcs: Buf[TFunc])
+    val test_only = a.tables.test_only
+
+    if test_only.is_empty() then return
+
+    val said: &Skipped = Skipped(buf())
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        if holds_string(test_only, f.name) then continue
+
+        val scope = func_home(a, f.name)
+
+        walk_block_stmts(f.body, expr_walk(false, e -> test_scope_one(a, scope, said, test_only, e)))
+
+        for j in 0..<f.requires.len()
+            walk_texpr(f.requires.at(j).cond,
+                       expr_walk(false, e -> test_scope_one(a, scope, said, test_only, e)))
+
+        for j in 0..<f.ensures.len()
+            walk_texpr(f.ensures.at(j).cond,
+                       expr_walk(false, e -> test_scope_one(a, scope, said, test_only, e)))
+end check_test_scope
+
+private test_scope_one(a: &Analysis, scope: Scope, said: &Skipped, test_only: Buf[string], e: TExpr)
+    val key = test_scope_named(test_only, e)
+
+    if key.is_none() || said.covers(e.span) then return
+
+    said.cover(e.span)
+    a.fault(scope, e.span, s"'${module_show(key.unwrap())}' is declared in a file that said " +
+            "'@tests', so it is there for the module's tests and no build but 'sysl test' keeps " +
+            "it — only another such file, or a '@test' function, may name it")
+end test_scope_one
+
+// What one node names, where that is a declaration a test file wrote. The three are the ways such a
+// declaration can be named at all: called, had its address taken, or read as storage.
+//
+// A **lowered** closure is in the set and is not reportable: an instantiation keyed on a test's
+// closure type can only have been demanded by that test, so it goes when the test does. What is left
+// is exactly the names a reader wrote.
+private test_scope_named(test_only: Buf[string], e: TExpr) -> Option[string] = *e.kind match
+    TCall(name, _, _, _) -> reportable_test_name(test_only, name)
+    TFuncAddr(name, _, _) -> reportable_test_name(test_only, name)
+    TGlobal(symbol, _, _) -> reportable_test_name(test_only, symbol)
+    _ -> None
+
+private reportable_test_name(test_only: Buf[string], name: string) -> Option[string]
+    if !holds_string(test_only, name) || mentions_closure(name) then return None
+
+    Some(name)
+end reportable_test_name
