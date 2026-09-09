@@ -108,12 +108,30 @@ end resolve_fn_trait
 
 // How long a written extent is.
 //
-// **Only a literal is read here.** A length may be any constant expression, and folding one is
-// expression analysis; a declaration whose length is not a literal is left at zero rather than
-// guessed at, and the later stage that folds constants settles it.
-private const_extent(a: &Analysis, scope: Scope, span: Span, e: Expr) -> usize = *e.kind match
-    IntLit(digits, base, _) -> digits_value(digits, base)
-    _ -> 0
+// **A literal is read here and anything else is folded**, because a length may be any constant
+// expression: `[addr_bytes]u8` is an array of a hundred and twenty-eight bytes wherever the `const`
+// naming that number can be reached. The fold is the same one an expression performs, run against
+// the file the type was written in.
+//
+// **What does not fold stands at zero rather than being guessed at.** A length written in terms of a
+// type parameter has no value during the walk that checks a generic declaration itself -- there is no
+// `T` yet -- and every array the program actually gets is built again for each instantiation, where
+// the measurement answers.
+private const_extent(a: &Analysis, scope: Scope, span: Span, e: Expr) -> usize
+    *e.kind match
+        IntLit(digits, base, _) -> return digits_value(digits, base)
+        _ -> ()
+
+    val folded = const_int(analyzer_for(a, scope), e)
+
+    if folded.is_none() then return 0
+
+    val n = folded.unwrap().to_long().unwrap_or(-1)
+
+    if n < 0 then return 0
+
+    usize(n)
+end const_extent
 
 private digits_value(digits: string, base: int) -> usize
     var n: usize = 0
