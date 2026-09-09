@@ -168,15 +168,16 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         ConstDecl(name, typ, value, vis) ->
             hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.consts, "constant",
                         Some(value))
-        ValDecl(name, typ, value, vis, _, _) ->
-            hoist_value(a, scope, s.span, name, typ, vis, a.tables.vals, "'val'", Some(value))
+        ValDecl(name, typ, value, vis, align, section) ->
+            hoist_value(a, scope, s.span, name, typ, vis, a.tables.vals, "'val'", Some(value), align,
+                        section)
         // **A top-level `var` in a file that names a module is that module's storage.** A file with
         // no header could have been a body instead, and there its `var` is an ordinary local; a
         // file that names a module has no body for one to belong to, so there is nothing else it
         // could be.
-        VarDecl(name, typ, init, vis, _, _) ->
+        VarDecl(name, typ, init, vis, align, section) ->
             if scope.module_name != "" then
-                hoist_storage(a, scope, s.span, name, typ, vis, init)
+                hoist_storage(a, scope, s.span, name, typ, vis, init, align, section)
         ExternVarDecl(name, typ, _, vis) ->
             hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.extern_vars,
                         "'extern' variable", None)
@@ -190,15 +191,16 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // starts in, where an ordinary `var` is a local of that body.
         StaticDecl(inner) ->
             *inner.kind match
-                VarDecl(name, typ, init, vis, _, _) ->
-                    hoist_storage(a, scope, inner.span, name, typ, vis, init)
+                VarDecl(name, typ, init, vis, align, section) ->
+                    hoist_storage(a, scope, inner.span, name, typ, vis, init, align, section)
                 _ -> hoist_stmt(a, scope, inner)
         _ -> ()
 
 // Module storage: a `val` that may be written to, which is what a top-level `var` declares.
 private hoist_storage(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
-                      vis: Visibility, init: Option[Expr])
-    hoist_value(a, scope, span, name, typ, vis, a.tables.vals, "'var'", init)
+                      vis: Visibility, init: Option[Expr], align: Option[Expr],
+                      section: Option[string])
+    hoist_value(a, scope, span, name, typ, vis, a.tables.vals, "'var'", init, align, section)
     a.tables.writable.push(file_private_key(a, scope.src.name,
                                             module_qualify(scope.module_name, name)))
 
@@ -243,7 +245,8 @@ type_name_taken(a: &Analysis, key: string, written: string) -> bool =
 
 // Registers a name that stands for storage.
 private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
-                    vis: Visibility, into: &Table[ValueDecl], what: string, init: Option[Expr])
+                    vis: Visibility, into: &Table[ValueDecl], what: string, init: Option[Expr],
+                    align: Option[Expr] = None, section: Option[string] = None)
     val plain = module_qualify(scope.module_name, name)
     val key = decl_key(a, scope, plain, vis, value_scope_of(a, plain).is_some())
     val holder = if contested(a, scope, vis, key) then value_name_holder(a, key) else None
@@ -252,7 +255,7 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
         a.fault(scope, span, s"'$name' is already declared as ${holder.unwrap()}")
         return
 
-    into.put(key, ValueDecl(name, typ, vis, span, scope, init))
+    into.put(key, ValueDecl(name, typ, vis, span, scope, init, align, section))
     a.tables.access.put(key, Access(vis, scope.src.name))
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)

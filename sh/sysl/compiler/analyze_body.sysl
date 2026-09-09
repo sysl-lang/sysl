@@ -28,6 +28,9 @@ struct TypedBodies
     // reading "the last body" means the last one somebody typed.
     declared: usize
 
+    // The module storage, in the order the object file lays it down.
+    vals: Buf[TVal]
+
     // The tables the walk filled and the trees it read, so that what a whole program is made of --
     // its tables, its storage, its tests -- can be assembled without reading everything twice.
     an: &Analysis
@@ -56,6 +59,11 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
     // about a program: a mistake in a generic body is the same mistake whichever call reaches it
     // first, and a closure lowered while checking one is a closure this compilation lowered.
     check_generic_bodies(a, units)
+
+    // **A module's storage is analyzed before any body is**, because its initializer is code like
+    // any other and what it reaches is reached by the program: a `val` whose value is a call brings
+    // that call's body in exactly as a function's would.
+    val storage = module_storage(a)
 
     // **The library's own functions are held back**: they are analyzed below, and only if
     // something reaches them. That is what keeps a program that never prints from carrying the
@@ -161,7 +169,7 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
     for i in 0..<a.closure_funcs.len()
         funcs.push(a.closure_funcs.at(i))
 
-    TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, a, units, entry)
+    TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, ordered_vals(storage), a, units, entry)
 end analyze_bodies
 
 // One body waiting for something to reach it: the name it will be analyzed under, the terms it was
@@ -681,7 +689,7 @@ private typed_of(text: string) -> TypedBodies
         for i in 0..<parsed.report.len()
             said.push(Placed(src, parsed.report.at(i)))
 
-        return TypedBodies(buf(), said, 0, 0, 0, analysis_for(host_target()), buf(), None)
+        return TypedBodies(buf(), said, 0, 0, 0, buf(), analysis_for(host_target()), buf(), None)
     end if
 
     var units: Buf[Program] = buf()
@@ -839,3 +847,94 @@ private pattern_binds_name(p: TPattern, name: string) -> Option[Type] = p match
     TVariantPattern(_, _, args) -> pattern_binding(args, name)
     TStructPattern(_, args) -> pattern_binding(args, name)
     _ -> None
+
+// -- a module's own storage -----------------------------------------------------------------------
+
+// Every `static var` a program declares, then every `val`, each read in its own file's terms.
+//
+// **The two are one thing under two declarations** -- storage that belongs to a module rather than
+// to a call -- and they are kept apart here only because a `var` may be written to and starts at its
+// type's zero where nothing was written, which a `val` may not and does not.
+private module_storage(a: &Analysis) -> Buf[TVal]
+    var out: Buf[TVal] = buf()
+
+    for pass in 0..<2
+        for i in 0..<a.tables.vals.len()
+            val key = a.tables.vals.key_at(i)
+            val writable = holds_string(a.tables.writable, key)
+
+            if (pass == 0) == writable
+                val d = a.tables.vals.at(i)
+                val cx = analyzer_for(a, d.scope)
+                val ty = if d.typ.is_none() then Unknown
+                else resolve_type(a, d.scope, d.typ.unwrap(), no_bindings())
+
+                var init: Option[TExpr] = None
+
+                if d.init.is_some() then init = Some(type_expr(cx, d.init.unwrap(), Some(ty)))
+
+                val computed = init.is_some() && !laid_down(init.unwrap())
+
+                out.push(TVal(key, ty, init, computed, writable, storage_align(cx, d), d.section))
+
+    out
+end module_storage
+
+// The boundary a declaration asked its storage to start on, where it asked for one.
+private storage_align(cx: &Analyzer, d: ValueDecl) -> Option[usize]
+    if d.align.is_none() then return None
+
+    const_fold(cx, d.align.unwrap()) match
+        Some(ConstInt(n)) -> n.to_long().map(v -> usize(v))
+        _ -> None
+end storage_align
+
+// Whether a value can be **laid down** rather than worked out: everything about it is known while
+// compiling, so the object file carries the bytes and nothing runs to fill them in.
+private laid_down(t: TExpr) -> bool = *t.kind match
+    TIntLit(_, _) -> true
+    TFloatLit(_, _) -> true
+    TBoolLit(_) -> true
+    TStrLit(_) -> true
+    TNullLit(_) -> true
+    TArrayLit(elems, _) -> all_laid_down(elems)
+    TArrayFill(value, _) -> laid_down(value)
+    TStructNew(_, args) -> all_laid_down(args)
+    TEnumNew(_, variant, _) -> !variant.carries
+    TCast(inner, to) ->
+        val pointerish = to match
+            Ptr(_) -> true
+            CFn(_, _) -> true
+            _ -> false
+
+        pointerish && (*inner.kind match
+            TIntLit(_, _) -> true
+            _ -> false)
+    _ -> false
+
+private all_laid_down(xs: Buf[TExpr]) -> bool
+    for i in 0..<xs.len()
+        if !laid_down(xs.at(i)) then return false
+
+    true
+end all_laid_down
+
+// The storage in the order it is filled: what the object file lays down first, then what has to be
+// worked out -- each after everything it reads.
+private ordered_vals(vals: Buf[TVal]) -> Buf[TVal]
+    var out: Buf[TVal] = buf()
+    var computed = false
+
+    for i in 0..<vals.len()
+        if vals.at(i).computed then computed = true
+
+    if !computed then return vals
+
+    for i in 0..<vals.len()
+        if !vals.at(i).computed then out.push(vals.at(i))
+
+    for i in 0..<vals.len()
+        if vals.at(i).computed then out.push(vals.at(i))
+
+    out
+end ordered_vals
