@@ -106,6 +106,72 @@ call_bound_method(cx: &Analyzer, span: Span, receiver: TExpr, subject: Type, nam
     TExpr(span, TCall(fname, ts, ret, false))
 end call_bound_method
 
+// `T.f(…)` where `T` is a type parameter and `f` is an associated function one of its bounds
+// declares -- what a bound method call is to a value, asked of the type itself.
+//
+// Checked against the trait's signature and discarded, exactly as a bound method call is: the name it
+// carries is the trait's, and which implementation runs is settled once a concrete type is known.
+call_bound_associated(cx: &Analyzer, span: Span, subject: Type, name: string, bounds: Buf[Bound],
+                      args: Buf[Expr]) -> TExpr
+    val found = bound_member(cx.an, subject, bounds, name)
+
+    if found.is_none() then return unlicensed_associated(cx, span, subject, name)
+
+    val tr = found.unwrap().0
+    val subst = found.unwrap().1
+    val m = found.unwrap().2
+    val shown = s"associated function '${module_show(tr.name)}.$name'"
+
+    // A **static** property belongs to the type, so `T.count` is the read and there is no value to
+    // reach it on. It arrives here because a read with no parentheses is analyzed as the call it is.
+    if m.is_property && !m.is_static then
+        cx.an.bound_fault(cx.scope, span, s"'$name' is a property of '${tr.show()}' — read it on a " +
+                          s"value, as 'value.$name'")
+
+    if m.recv_mode().is_some() then
+        cx.an.bound_fault(cx.scope, span, s"'$name' is a method of '${tr.show()}' — call it on a " +
+                          s"value of '${type_show(subject)}', not on the type itself")
+
+    val scope = trait_scope_of(cx.an, tr.name)
+    var params: Buf[(string, Type)] = buf()
+
+    for i in 0..<m.params.len()
+        params.push((m.params.at(i).name, resolve_type(cx.an, scope, m.params.at(i).typ, subst)))
+
+    if args.len() != params.len() && !m.variadic
+        cx.an.bound_fault(cx.scope, span, s"$shown takes ${quantity(params.len(), "argument")}, but " +
+                          s"${supplied_phrase(args.len(), "argument")}")
+        return bad_expr(span)
+    end if
+
+    var ts: Buf[TExpr] = buf()
+
+    for i in 0..<args.len()
+        val want = if i < params.len() then Some(params.at(i).1) else None
+
+        ts.push(type_expr(cx, args.at(i), want))
+
+    val ret = if m.ret_type.is_some() then
+                  declared_result_type(Some(resolve_type(cx.an, scope, m.ret_type.unwrap(), subst)))
+              else Unit
+
+    TExpr(span, TCall(s"${tr.name}.$name", ts, ret, false))
+end call_bound_associated
+
+private unlicensed_associated(cx: &Analyzer, span: Span, subject: Type, name: string) -> TExpr
+    val named = declaring_traits(cx, name, false, true)
+
+    if named.is_empty() then
+        return kept_error(cx, span, s"'${type_show(subject)}' is a type parameter, and no trait " +
+                          s"declares an associated function '$name' that a bound could promise")
+
+    if named.len() == 1 then
+        return kept_error(cx, span, s"'$name' needs '${type_show(subject)}: ${named.at(0)}'")
+
+    kept_error(cx, span, s"'$name' needs a bound on '${type_show(subject)}' — it is declared by " +
+               quoted_list(named))
+end unlicensed_associated
+
 // `x.p` where `x` is a type parameter and `p` is a property one of its bounds declares -- the read a
 // bound method call is to a call, checked the same way and for the same reason.
 //

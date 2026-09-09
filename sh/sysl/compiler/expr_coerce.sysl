@@ -32,14 +32,20 @@ analyze_expected(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
                 NullLit -> return cx.err(e.span, s"a weak reference is absent as 'None', which is " +
                                          "what 'get()' hands back for one")
                 _ -> return coerce(cx, analyze_value(cx, e, expected), want)
-        // A transparent subtype's values are its base's, so the expression is read at the base and
-        // checked into the subtype where it produces one.
+        // A value produced into a transparent constrained subtype is read at the **subtype** and
+        // then checked into it. The expectation is passed down whole rather than as the base because
+        // a type parameter is solved from it: `val a: Age = widest()` binds `T` to what the reader
+        // wrote. Nothing else needs the base, since every reading of an expectation that must see
+        // through a transparent subtype already goes through the representation the two share.
         Constrained(d) ->
             if d.derived then return analyze_value(cx, e, expected)
 
-            val v = analyze_value(cx, e, Some(d.base))
+            val v = analyze_value(cx, e, Some(want))
 
             if disagree(texpr_type(v), d.base) then return v
+            // A value that is already the subtype has been checked into it where it was produced,
+            // and checking it again would be the same test written twice.
+            if type_eq(texpr_type(v), want) then return v
 
             return TExpr(v.span, TConstrainedCheck(v, want))
         Slice(_, _) -> return coerce(cx, analyze_value(cx, e, expected), want)

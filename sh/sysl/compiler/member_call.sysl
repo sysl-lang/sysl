@@ -46,6 +46,109 @@ lookup_trait_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, ar
                    s"with '${module_show(found.0)}.$name(…)'")
 end lookup_trait_member
 
+// `Box.of(…)`, `u32.bits()`, `Self.width()` -- an associated function, reached through the **type**
+// rather than through a value of it.
+//
+// It is what a bound can say about the type rather than about a value: a parameter is not a name
+// anything else can be written through, so without it every fact a generic body needs -- a width, a
+// zero, a table of constants -- would have to arrive as a member carrying a receiver nothing reads.
+//
+// Nothing where the name is not a type, which is what leaves an ordinary member read to answer.
+associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: Buf[Expr],
+                expected: Option[Type]) -> Option[TExpr]
+    val subject = subject_named(cx, receiver)
+
+    if subject.is_none() then return None
+
+    val ty = subject.unwrap()
+
+    // A parameter standing in for itself answers off the bounds it carries, exactly as a value of it
+    // does -- and this is the half that has no value to be read off.
+    ty match
+        Abstract(_, bounds) -> return Some(call_bound_associated(cx, span, ty, name, bounds, args))
+        _ -> ()
+
+    val found = member_key(cx.an, ty, name)
+    val m = member_at(cx.an, found.0, name)
+
+    if m.is_none() then return None
+
+    val decl = m.unwrap()
+
+    if decl.recv_mode().is_some() then
+        return Some(cx.err(span, s"'$name' is a method of '${module_show(found.0)}' — call it on a " +
+                           s"value of ${type_show(ty)}, not on the type itself"))
+
+    val fname = member_func_name(cx, span, ty, name)
+
+    if fname == "" then return Some(bad_expr(span))
+
+    val sig = cx.an.tables.members.func_insts.get(fname)
+
+    if sig.is_none() then return Some(bad_expr(span))
+
+    check_member_visible(cx, span, found.0, name, decl)
+
+    val shown = s"associated function '${module_show(found.0)}.$name'"
+    val slots = bind_member_args(cx, span, shown, decl, args)
+
+    if slots.is_none() then return Some(bad_expr(span))
+
+    var ts: Buf[TExpr] = buf()
+
+    for i in 0..<slots.unwrap().len()
+        val want = if i < sig.unwrap().params.len() then sig.unwrap().params.at(i).1 else Unknown
+
+        slots.unwrap().at(i) match
+            Some(e) ->
+                val t = type_expr(cx, e, Some(want))
+
+                if disagree(texpr_type(t), want) then
+                    cx.fault(e.span, s"'${decl.params.at(i).name}' of $shown is ${type_show(want)}, " +
+                             s"but ${type_show(texpr_type(t))} was given")
+
+                ts.push(t)
+            None ->
+                val inner = analyzer_for(cx.an, cx.scope)
+
+                inner.reported = Some(span)
+                ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
+
+    Some(TExpr(span, TCall(fname, ts, sig.unwrap().ret, false)))
+end associated_call
+
+// The type a name stands for where it stands for one: `Self`, a declared type at no arguments, or a
+// scalar spelled the way a program writes it.
+subject_named(cx: &Analyzer, receiver: Expr) -> Option[Type]
+    val written = *receiver.kind match
+        Ident(n) -> if cx.lookup(n).is_none() then Some(n) else None
+        _ -> None
+
+    if written.is_none() then return None
+
+    val n = written.unwrap()
+
+    if n == "Self" then return bound_type(cx.subst, "Self")
+
+    val stood = bound_type(cx.subst, n)
+
+    if stood.is_some() then return stood
+
+    val scalar = scalar_named(n, int(cx.an.tables.target.pointer_bits()))
+
+    if scalar.is_some() then return scalar
+
+    val width = width_type(cx.an, cx.scope, receiver.span, n)
+
+    if width.is_some() then return width
+
+    val key = lookup_type_key(cx.an, cx.scope, n)
+
+    if key.is_none() then return None
+
+    concrete_instance(cx.an, key.unwrap())
+end subject_named
+
 // `value.member(args)` -- a call, which is what the parentheses said.
 call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr],
             expected: Option[Type]) -> TExpr

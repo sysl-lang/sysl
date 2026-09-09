@@ -267,6 +267,11 @@ struct TypedAgreement
     skipped_absent: usize
     skipped_defaults: usize
     first_bad: string
+
+    // The first few blocks this compiler had something to say about, with what it said. A block it
+    // complains about is skipped rather than compared -- which is the safe direction for a proof and
+    // the blind one for whoever has to make the count go down, so the reasons are carried out.
+    first_unresolved: string
 end TypedAgreement
 
 // The reference compiler's typed tree for one file, or nothing where it would not analyze it.
@@ -346,6 +351,10 @@ private compare_typed(binary: string, path: string, label: string, text: string,
     if !ours.reported.is_empty()
         found.skipped_unresolved += ours.funcs.len()
 
+        if found.skipped_unresolved <= 40 then
+            found.first_unresolved = s"${found.first_unresolved}\n$label: " +
+                                     ours.reported.at(0).diag.message
+
         return
     end if
 
@@ -416,7 +425,7 @@ the_typed_trees_agree()
             val dir = make_temp_dir("sysl-typed").unwrap()
             val scratch = dir + "/block.sysl"
 
-            var found = TypedAgreement(0, 0, 0, 0, 0, 0, "")
+            var found = TypedAgreement(0, 0, 0, 0, 0, 0, "", "")
 
             for item in walk(root)
                 item match
@@ -436,13 +445,14 @@ the_typed_trees_agree()
             remove_file(scratch)
 
             val summary = s"typed bodies: ${found.matched} matched, " +
-                s"${found.mismatched} mismatched, skipped ${found.skipped_generic} generic, " +
-                s"${found.skipped_defaults} for type defaults, " +
+                s"${found.mismatched} mismatched, ${found.skipped_generic} generic declarations " +
+                "read through their instantiations, " +
+                s"${found.skipped_defaults} skipped for type defaults, " +
                 s"${found.skipped_unresolved} this stage could not finish, " +
                 s"${found.skipped_absent} the reference did not print"
 
             print(summary)
-            record_summary(s"$summary${found.first_bad}")
+            record_summary(s"$summary${found.first_bad}${found.first_unresolved}")
             assert(found.matched > 0, "the sweep compared something")
             assert(found.first_bad == "", s"$summary${found.first_bad}")
             assert(found.mismatched == 0, summary)

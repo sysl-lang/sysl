@@ -355,14 +355,45 @@ private bindings_for(tparams: Buf[string], targs: Buf[Type]) -> Buf[Binding]
     out
 end bindings_for
 
+// The arguments a declaration was applied to, with the ones it was not given taken from the defaults
+// it declares.
+//
+// They are filled left to right, each resolved under the arguments already fixed, so a later default
+// may name an earlier parameter and `[A, B = A]` means what it reads as. A default is written in the
+// file that declares it, so it is resolved in **that** file's terms rather than the applying one's.
+filled_targs(a: &Analysis, home: Scope, tparams: Buf[string], tdefaults: Buf[TypeBinding],
+             targs: Buf[Type]) -> Buf[Type]
+    if targs.len() >= tparams.len() || tdefaults.is_empty() then return targs
+
+    var filled: Buf[Type] = buf()
+
+    for i in 0..<targs.len()
+        filled.push(targs.at(i))
+
+    for i in filled.len()..<tparams.len()
+        var here: Buf[Binding] = buf()
+
+        for j in 0..<filled.len()
+            here.push(Binding(tparams.at(j), filled.at(j)))
+
+        val w = binding_named(tdefaults, tparams.at(i))
+
+        if w.is_none() then filled.push(Unknown)
+        else filled.push(resolve_type(a, home, w.unwrap(), here))
+
+    filled
+end filled_targs
+
 // A struct at these arguments.
 //
 // **The record is registered before its fields are resolved**, so a declaration that mentions itself
 // finds the record already there rather than recursing for ever.
 instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key: string,
-                   d: StructDecl, home: Scope, targs: Buf[Type]) -> Type
-    if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, targs) then return Unknown
+                   d: StructDecl, home: Scope, written_targs: Buf[Type]) -> Type
+    if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, written_targs) then
+        return Unknown
 
+    val targs = filled_targs(a, home, d.tparams, d.tdefaults, written_targs)
     val inst = instance_key(key, targs)
     val already = a.tables.struct_insts.get(inst)
 
@@ -385,9 +416,11 @@ end instantiate_struct
 
 // An enum at these arguments, by the same rule and for the same reason.
 instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: string, d: EnumDecl,
-                 home: Scope, targs: Buf[Type]) -> Type
-    if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, targs) then return Unknown
+                 home: Scope, written_targs: Buf[Type]) -> Type
+    if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, written_targs) then
+        return Unknown
 
+    val targs = filled_targs(a, home, d.tparams, d.tdefaults, written_targs)
     val inst = instance_key(key, targs)
     val already = a.tables.enum_insts.get(inst)
 

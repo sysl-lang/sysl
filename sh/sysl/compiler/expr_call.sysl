@@ -16,6 +16,22 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
           expected: Option[Type]) -> TExpr
     *callee.kind match
         Ident(name) -> named_call(cx, span, callee, name, args, expected)
+        // `f[A, B](x)` -- the instantiation the reader named, which is what brackets mean in a
+        // **type** and what a call borrows them for.
+        TypeArgs(head, targs) -> written_call(cx, span, head, targs, args, expected)
+        // `f[A](x)` has no comma to tell its brackets from a subscript, so it arrives as an index
+        // and is re-read here where the name is one a generic declares.
+        Index(head, one) ->
+            val name = written_name_of(head)
+
+            if name.is_some() && names_a_function(cx, name.unwrap())
+                var targs: Buf[Expr] = buf()
+
+                targs.push(one)
+                return written_call(cx, span, head, targs, args, expected)
+            end if
+
+            cx.err(span, "this is not something that can be called")
         // A member call. A module path folded into a name is a plain call under another spelling,
         // so it is asked about first.
         Field(receiver, member) ->
@@ -23,6 +39,12 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
             if dotted.is_some() && names_a_function(cx, dotted.unwrap()) then
                 return named_call(cx, span, callee, dotted.unwrap(), args, expected)
+
+            // An **associated function**, reached through the type rather than through a value: a
+            // name in front of the dot that stands for a type is not something to read a value off.
+            val on_type = associated_call(cx, span, receiver, member, args, expected)
+
+            if on_type.is_some() then return on_type.unwrap()
 
             val tr = type_expr_bare(cx, receiver)
 
@@ -34,6 +56,21 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             call_member(cx, span, tr, member, args, expected)
         _ -> cx.err(span, "this is not something that can be called")
 end call_expr
+
+// The name a written type application was made on, where it is one a call could be written through.
+private written_name_of(head: Expr) -> Option[string] = *head.kind match
+    Ident(n) -> Some(n)
+    Field(inner, name) -> module_path_of(inner, name)
+    _ -> None
+
+private written_call(cx: &Analyzer, span: Span, head: Expr, targs: Buf[Expr], args: Buf[Expr],
+                     expected: Option[Type]) -> TExpr
+    val name = written_name_of(head)
+
+    if name.is_none() then return cx.err(span, "this is not something that can be called")
+
+    written_generic_call(cx, span, name.unwrap(), targs, args, expected)
+end written_call
 
 private module_path_of(receiver: Expr, name: string) -> Option[string] = *receiver.kind match
     Ident(head) -> Some(s"$head.$name")

@@ -24,7 +24,7 @@ assign_expr(cx: &Analyzer, span: Span, op: string, target: Expr, value: Expr) ->
             cx.fault(span, s"cannot assign ${type_show(texpr_type(tv))} to " +
                      s"${describe_target(target)} of type ${type_show(texpr_type(place))}")
 
-        return TExpr(span, TStore(place, tv, texpr_type(place)))
+        return rechecked(cx, span, place, TExpr(span, TStore(place, tv, texpr_type(place))))
     end if
 
     val place = analyze_place(cx, target, s"'$op'")
@@ -38,8 +38,69 @@ assign_expr(cx: &Analyzer, span: Span, op: string, target: Expr, value: Expr) ->
     if disagree(got, texpr_type(place)) then
         cx.fault(span, s"'$op' would change the type of ${describe_target(target)}")
 
-    TExpr(span, TUpdate(place, op, tv, texpr_type(place), None, constraint_of(texpr_type(place))))
+    rechecked(cx, span, place,
+              TExpr(span, TUpdate(place, op, tv, texpr_type(place), None,
+                                  constraint_of(texpr_type(place)))))
 end assign_expr
+
+// A write with the invariant re-checks it owes wrapped around it, innermost first.
+//
+// **A struct's invariant is a claim about the whole value**, so a write to one of its fields is what
+// can break it -- and the check belongs at the write rather than at the field, because the field on
+// its own says nothing about what the clause reads. The walk goes outward through the **whole**
+// place, since an invariant may read through a field: `invariant a.n <= b` is a claim `o.a.n = 9`
+// can break just as `o.b = 0` can, and only the enclosing struct knows it.
+rechecked(cx: &Analyzer, span: Span, place: TExpr, written: TExpr) -> TExpr
+    var out = written
+    val owed = inv_checks_for(cx, place)
+
+    for i in 0..<owed.len()
+        out = TExpr(span, TRecheck(out, owed.at(i).0, owed.at(i).1, inv_key(owed.at(i).1.base)))
+
+    out
+end rechecked
+
+// Every struct a write through a place obliges a re-check of: what to re-read, and its declaration.
+// Nothing is owed by the parts of a place that merely locate it, so an index contributes no check of
+// its own and is walked through.
+inv_checks_for(cx: &Analyzer, place: TExpr) -> Buf[(TExpr, &StructType)]
+    var out: Buf[(TExpr, &StructType)] = buf()
+
+    *place.kind match
+        TField(recv, _, _) ->
+            val d = invariant_bearing(cx, texpr_type(recv))
+
+            if d.is_some() then out.push((recv, d.unwrap()))
+
+            val outer = inv_checks_for(cx, recv)
+
+            for i in 0..<outer.len()
+                out.push(outer.at(i))
+        TIndex(recv, _, _) -> out = inv_checks_for(cx, recv)
+        _ -> ()
+
+    out
+end inv_checks_for
+
+// The struct a type is, where its declaration carries invariants a write owes a re-check of.
+//
+// A **generic** struct carries none for this purpose: the clause is written once and every
+// instantiation would need its own predicate, which is the instantiation's business rather than the
+// write's.
+private invariant_bearing(cx: &Analyzer, t: Type) -> Option[&StructType] = t match
+    Struct(d) ->
+        val decl = cx.an.tables.types.get(d.base)
+
+        if decl.is_none() then return None
+
+        decl.unwrap().kind match
+            StructOf(sd) ->
+                if sd.invariants.is_empty() || !sd.tparams.is_empty() then None else Some(d)
+            _ -> None
+    _ -> None
+
+// The function a struct's invariants are checked by.
+inv_key(base: string) -> string = s"$base${ModuleSep}inv"
 
 // What a compound arm's value is read at.
 //
