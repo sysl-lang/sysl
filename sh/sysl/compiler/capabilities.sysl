@@ -1,0 +1,293 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// What a module says it needs of a machine, and what it gives up in exchange.
+//
+// **A capability is a property of the MODULE**, not of a file and not of a declaration, so every
+// file of a module states the same clauses and its `@tests` files state one thing between them. What
+// a clause leaves behind is the module's two sets -- what it requires, and what it narrowed away --
+// and it is those the rest of the compiler asks.
+
+const CapHeap: string = "heap"
+const CapOs: string = "os"
+const CapPosix: string = "posix"
+
+// The capabilities there are, in the order a refusal lists them.
+capability_core() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(CapHeap)
+    out.push(CapOs)
+    out.push(CapPosix)
+    out
+end capability_core
+
+// **The two directions are asked of different vocabularies.** A `requires` names a FACILITY the
+// machine supplies and a narrowing names the CONDUCT a module gives up, and `alloc` and `heap` are
+// the one pair where those are different words.
+narrowed_by(word: string) -> Option[string] = word match
+    "alloc" -> Some(CapHeap)
+    "os" -> Some(CapOs)
+    "posix" -> Some(CapPosix)
+    _ -> None
+
+// The word a narrowing is written with, for a capability named as a facility.
+narrow_word(cap: string) -> string = cap match
+    "heap" -> "alloc"
+    _ -> cap
+
+// Whether a name is a facility a machine supplies.
+is_facility(name: string) -> bool = name == CapHeap || name == CapOs || name == CapPosix
+
+// A capability and the ones that come with it: requiring `posix` requires `os`.
+capability_closure(cap: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(cap)
+
+    if cap == CapPosix then out.push(CapOs)
+
+    out
+end capability_closure
+
+// Whether a clause is one the compiler actually enforces, which is what decides whether it is
+// recorded at all.
+private enforceable(c: CapabilityClause) -> bool = c.direction match
+    Requires -> is_facility(c.name)
+    Narrows -> narrowed_by(c.name).is_some()
+
+// The capability a clause is about, as against the word it was written with.
+private capability_of(c: CapabilityClause) -> string = c.direction match
+    Requires -> c.name
+    Narrows -> narrowed_by(c.name).unwrap_or(c.name)
+
+// Reads every file's clauses, refuses the ones that are not clauses about anything, and holds the
+// files of a module to agreeing.
+//
+// **The library's own headers are read and not checked.** They were checked when the library was
+// built, so a complaint here would point at a file the program's author did not write.
+read_capabilities(a: &Analysis, units: Buf[Program])
+    for i in 0..<units.len()
+        val unit = units.at(i)
+
+        if !from_library(scope_of_unit(unit))
+            for j in 0..<unit.capabilities.len()
+                check_clause(a, unit, unit.capabilities.at(j))
+
+            check_repeats(a, unit)
+
+    check_module_agreement(a, units)
+end read_capabilities
+
+// Refuses a clause that names nothing, or that names the facility where the conduct belongs.
+private check_clause(a: &Analysis, u: Program, c: CapabilityClause)
+    val scope = scope_of_unit(u)
+
+    c.direction match
+        Requires ->
+            if !is_facility(c.name)
+                // Naming what a module *does* where a facility belongs. `@requires(alloc)` is the
+                // one that happens, since the narrowing beside it is spelled that way.
+                if narrowed_by(c.name).is_some() then
+                    a.fault(scope, c.span, s"'${c.name}' is what a module does, not something a " +
+                            "machine has — a 'requires' names the facility, so this is " +
+                            s"'@requires(${narrowed_by(c.name).unwrap()})'")
+                else unknown_capability(a, scope, c)
+        Narrows ->
+            if narrowed_by(c.name).is_none()
+                // The mirror image: naming the facility where the conduct belongs. `@no_heap` is
+                // what a reader writes once, having seen `heap` in the config.
+                if is_facility(c.name) then
+                    a.fault(scope, c.span, s"'@no_${c.name}' says a machine has no ${c.name}, " +
+                            "which is the project's to say and not this module's — what a module " +
+                            "promises is what it does, so this is " +
+                            s"'@no_${narrow_word(c.name)}'")
+                else unknown_capability(a, scope, c)
+end check_clause
+
+private unknown_capability(a: &Analysis, scope: Scope, c: CapabilityClause)
+    a.fault(scope, c.span, s"no capability is called '${c.name}' — the set is 'heap', 'os', 'posix'")
+
+// Refuses a file that says the same thing about one capability twice, and one that says both things
+// about it.
+//
+// The two are one check because they are one mistake: the module's set is what the clauses describe,
+// and a capability appearing twice means the file's author believed two clauses were doing different
+// work. Silently folding them would leave `no alloc` beside `requires alloc` meaning whichever the
+// code happened to fold last.
+private check_repeats(a: &Analysis, u: Program)
+    val scope = scope_of_unit(u)
+
+    for i in 0..<u.capabilities.len()
+        val c = u.capabilities.at(i)
+
+        if !enforceable(c) then continue
+
+        // Grouped by the **capability** and not by the word, which is the whole reason this reads
+        // the way it does: `@no_alloc` beside `requires heap` is one contradiction written in the
+        // two vocabularies, and grouping by what was typed would have let it through.
+        val cap = capability_of(c)
+        val first = first_clause_about(u, cap)
+
+        if first != i then continue
+
+        val second = second_clause_about(u, cap)
+
+        if second.is_none() then continue
+
+        val other = u.capabilities.at(second.unwrap())
+
+        if same_direction(c.direction, other.direction) then
+            a.fault(scope, other.span, s"'${c.name}' is declared twice, and the second says " +
+                    "nothing the first did not")
+        else
+            val both = if c.name != other.name then
+                           s" — '@no_${narrow_word(cap)}' and 'requires $cap' are the two " +
+                           "directions of one capability"
+                       else ""
+
+            a.fault(scope, other.span, s"'$cap' is both given up and required here, and a module " +
+                    "cannot do without something it cannot be built without" + both)
+end check_repeats
+
+private same_direction(x: CapabilityDirection, y: CapabilityDirection) -> bool = x match
+    Requires -> y match
+        Requires -> true
+        _ -> false
+    Narrows -> y match
+        Narrows -> true
+        _ -> false
+
+private first_clause_about(u: Program, cap: string) -> usize
+    for i in 0..<u.capabilities.len()
+        val c = u.capabilities.at(i)
+
+        if enforceable(c) && capability_of(c) == cap then return i
+
+    u.capabilities.len()
+end first_clause_about
+
+private second_clause_about(u: Program, cap: string) -> Option[usize]
+    var seen = false
+
+    for i in 0..<u.capabilities.len()
+        val c = u.capabilities.at(i)
+
+        if enforceable(c) && capability_of(c) == cap
+            if seen then return Some(i)
+
+            seen = true
+
+    None
+end second_clause_about
+
+// Holds the files of one module to declaring the same clauses.
+//
+// **The files that ship and the files that do not are two groups, held apart.** A `@tests` file is
+// dropped by every build but a test run, so the module's clause -- which is a promise about what a
+// program linking this module may do -- is not a promise about it. The scaffolding is held to
+// agreeing with *itself* for the reason the shipping files are held to agreeing with each other.
+//
+// The comparison is of the **set** of clauses rather than of the text: order between two clauses
+// says nothing, and a file that wrote the same one twice is a separate mistake reported on its own
+// line.
+private check_module_agreement(a: &Analysis, units: Buf[Program])
+    var seen: Buf[string] = buf()
+
+    for i in 0..<units.len()
+        val unit = units.at(i)
+
+        if from_library(scope_of_unit(unit)) then continue
+
+        val module_name = module_of_unit(unit)
+
+        if holds_string(seen, module_name) then continue
+
+        seen.push(module_name)
+
+        agree_within(a, units, module_name, true)
+        agree_within(a, units, module_name, false)
+end check_module_agreement
+
+private agree_within(a: &Analysis, units: Buf[Program], module_name: string, scaffolding: bool)
+    var first: Option[Program] = None
+
+    for i in 0..<units.len()
+        val unit = units.at(i)
+
+        if from_library(scope_of_unit(unit)) then continue
+        if module_of_unit(unit) != module_name || unit.test_only != scaffolding then continue
+
+        if first.is_none()
+            first = Some(unit)
+            continue
+        end if
+
+        if clauses_written(unit) == clauses_written(first.unwrap()) then continue
+
+        // The two groups are held to agreeing for the same reason and are not held to each other,
+        // so the sentence has to say which rule was broken -- a reader told that every file of the
+        // module states the clause, having just been told a `@tests` file states its own, would
+        // take one of the two for a lie.
+        val whose = if scaffolding then
+                        "the tests of a module are one body of scaffolding, so its '@tests' files " +
+                        "state one thing between them"
+                    else "a capability is a property of the module, so every one of its files " +
+                         "states it"
+        val whose_module = if module_name == "" then "the same module" else s"'$module_name'"
+
+        a.fault(scope_of_unit(unit), disagreement_span(unit),
+                s"${unit.src.name} and ${first.unwrap().src.name} are both files of " +
+                s"$whose_module, and they declare different capabilities — $whose: " +
+                s"${spell_clauses(unit)} against ${spell_clauses(first.unwrap())}")
+end agree_within
+
+// Where a disagreement is reported: the file's first clause, or its module header where it wrote
+// none at all.
+private disagreement_span(u: Program) -> Span
+    if !u.capabilities.is_empty() then return u.capabilities.at(0).span
+
+    u.module_name match
+        Some(m) -> m.span
+        None -> span_zero()
+end disagreement_span
+
+// One file's clauses as a set, so that the order two of them were written in says nothing.
+private clauses_written(u: Program) -> string
+    var out: Buf[string] = buf()
+
+    for i in 0..<u.capabilities.len()
+        val c = u.capabilities.at(i)
+        val d = c.direction match
+            Requires -> "requires"
+            Narrows -> "narrows"
+
+        out.push(s"$d ${c.name}")
+
+    val sorted = sort_names(out)
+    var joined = ""
+
+    for i in 0..<sorted.len()
+        joined = joined + sorted.at(i) + ";"
+
+    joined
+end clauses_written
+
+// A file's clauses as a reader wrote them, for a message comparing two files.
+private spell_clauses(u: Program) -> string
+    if u.capabilities.is_empty() then return "none"
+
+    var out = ""
+
+    for i in 0..<u.capabilities.len()
+        val c = u.capabilities.at(i)
+        val one = c.direction match
+            Narrows -> s"'@no_${c.name}'"
+            Requires -> s"'@requires(${c.name})'"
+
+        out = out + (if i > 0 then ", " else "") + one
+
+    out
+end spell_clauses
