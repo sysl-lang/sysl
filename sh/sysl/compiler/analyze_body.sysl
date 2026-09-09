@@ -286,6 +286,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl)
     val mark = a.complaints()
     val trial = a.sandboxed()
     val queued = a.tables.members.pending.len()
+    val tables = a.tables.members.vtables.len()
     val outer = a.tables.members.selves.get(d.name).unwrap_or(buf())
     var subst = joined_bindings(outer, abstract_subst(a, scope, d.tparams, d.bounds, d.tvalues,
                                                       d.tpacks, outer))
@@ -321,7 +322,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl)
 
     a.release(trial)
     a.restore_complaints(mark)
-    rewind_instantiations(a, queued)
+    rewind_instantiations(a, queued, tables)
 end check_abstract_body
 
 // The instantiations this reading asked for, taken back out.
@@ -332,13 +333,24 @@ end check_abstract_body
 // already there, asks for nothing, and the program ends up calling a body no pass analyzed. It cost
 // `Buf[string]`, `Buf[sh.sysl.parsing.Span]` and everything each of those reaches, all of them
 // first asked for from inside a generic body being read at its own definition.
-rewind_instantiations(a: &Analysis, queued: usize)
+rewind_instantiations(a: &Analysis, queued: usize, tables: usize)
     val pending = a.tables.members.pending
 
     for i in queued..<pending.len()
         a.tables.members.func_insts.remove(pending.at(i).name)
 
     a.tables.members.pending.truncate(queued)
+
+    // A method table is the same case one step out: built once and found by every later erasure, so
+    // one a thrown-away reading built would be a table in the program because of a reading nobody
+    // kept -- and in the order that reading happened to run in.
+    var made: Buf[string] = buf()
+
+    for i in tables..<a.tables.members.vtables.len()
+        made.push(a.tables.members.vtables.key_at(i))
+
+    for i in 0..<made.len()
+        a.tables.members.vtables.remove(made.at(i))
 end rewind_instantiations
 
 // One function whose signature the tables already hold, under the name they hold it by: a member
