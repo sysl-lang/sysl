@@ -1,0 +1,180 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// Putting a value behind a trait's table, which is what makes a trait object.
+//
+// **An object has forgotten which type it holds**, so what it carries in its place is a table of the
+// trait's members filled in for the type that went in. Building one is the only place both halves are
+// known -- the object type at the context, the implementation at the value -- which is why the
+// agreement checks live here and nowhere else.
+
+// A value where an object was expected. Anything this cannot build is left alone, so the caller's own
+// mismatch diagnostic -- which names the parameter or the variable -- is the one that gets reported.
+erase_to(cx: &Analyzer, t: TExpr, want: Type) -> TExpr
+    val o = erased_trait(want)
+
+    if o.is_none() then return t
+
+    val tr = o.unwrap()
+    val got = texpr_type(t)
+
+    if type_eq(got, want) then return t
+
+    // The value is **already an object**, over some other trait. It gets here because a bound on one
+    // trait is satisfied by an object over a trait that requires it -- and it would be a short step
+    // from there to reading the second as the same kind of thing. The two questions are not the same
+    // one: satisfying a bound asks what may be *called* through the value, and the table answers it;
+    // building an object asks what may be *assembled* from the value's type, and an object has no
+    // implementations to assemble from.
+    val from_obj = erased_trait(got)
+
+    if from_obj.is_some() && trait_bound_of(from_obj.unwrap()).key() != trait_bound_of(tr).key() then
+        return cx.err(t.span, s"a ${type_show(got)} has forgotten which type it holds, so there is " +
+                      s"nothing for a ${type_show(want)} to be built from — " +
+                      s"'${trait_bound_of(tr).show()}' is reachable *through* the value, and a bound " +
+                      "on it is satisfied by one, but its slots are not a table of their own")
+
+    want match
+        Ptr(_) -> got match
+            Ptr(inner) -> erase(cx, t, tr, *inner, want, false)
+            inner ->
+                if !conforms(cx.an, trait_bound_of(tr), inner) then return t
+
+                // A concrete value where a *raw* object was expected has no address of its own to
+                // hand over, and taking one silently would be putting a pointer to a temporary in a
+                // program.
+                cx.err(t.span, s"a ${type_show(want)} points at a value, so it needs an address — " +
+                       s"write '&' in front of the ${show_bare(inner)} to take one")
+        Ref(_, sync) -> got match
+            Ref(inner, s2) ->
+                if s2 != sync then t else erase(cx, t, tr, *inner, want, true)
+            // A value where a counted object was expected is boxed first, exactly as a plain `&T`
+            // context boxes one -- the allocation is the construction, and the erasure rides on top.
+            inner ->
+                if !conforms(cx.an, trait_bound_of(tr), inner) then return t
+
+                erase(cx, TExpr(t.span, TBox(t, Ref(inner, sync))), tr, inner, want, true)
+        _ -> t
+end erase_to
+
+// The erasure itself, once the type going in is known.
+private erase(cx: &Analyzer, t: TExpr, tr: Type, inner: Type, want: Type, boxed: bool) -> TExpr
+    val bound = trait_bound_of(tr)
+
+    if !conforms(cx.an, bound, inner)
+        // A type an implementation covers is told what that implementation asked of it, since the
+        // reason it does not conform is a condition rather than an absence.
+        val why = unmet_bound(cx.an, bound, inner)
+        val tail = if why.is_some() then s" — ${why.unwrap()}" else ""
+
+        return cx.err(t.span, s"a ${type_show(want)} needs a type that implements " +
+                      s"'${bound.show()}', and ${type_show(inner)} does not$tail")
+    end if
+
+    // **The object wrote down what the implementation chose, so the two have to agree.** This is the
+    // check the binding buys and the reason it is sound: every slot's signature was read under the
+    // object's answer, so a value whose implementation answers differently would be called through a
+    // table promising the wrong types.
+    val wrote = trait_assocs_of(tr)
+
+    for i in 0..<wrote.len()
+        val supplied = assoc_type_opt(cx.an, inner, wrote.at(i).0)
+
+        if supplied.is_some() && !type_eq(supplied.unwrap(), wrote.at(i).1) then
+            return cx.err(t.span, s"a ${type_show(want)} says '${wrote.at(i).0}' is " +
+                          s"${type_show(wrote.at(i).1)}, and ${type_show(inner)} supplies " +
+                          s"${type_show(supplied.unwrap())} for it — an object fixes the associated " +
+                          "type, so only a type that chose the same one goes into it")
+
+    TExpr(t.span, TErase(t, vtable_for(cx, tr, inner, boxed), want))
+end erase
+
+// The associated types an object wrote down.
+private trait_assocs_of(t: Type) -> Buf[(string, Type)] = t match
+    Trait(_, _, assocs) -> assocs
+    _ -> buf()
+
+// The method table for one type seen as one trait, registered the first time it is needed.
+//
+// Every conforming type reaches this through a source `impl`, whose methods were lowered to ordinary
+// functions -- so a slot is a name that already exists, and the table is the trait's members in the
+// order they are laid out, which is the order a call site indexes by. A trait that **requires**
+// another carries the required trait's slots too, rather than a pointer to a table of its own: that
+// keeps a required trait's method the single indirect call the trait's own methods are.
+private vtable_for(cx: &Analyzer, tr: Type, ty: Type, boxed: bool) -> string
+    // The **member** prefix rather than the plain mangling, for the reason the members themselves
+    // take it: a transparent subtype and its base have different implementations, and one table
+    // holding both is the same collision one symbol holding two bodies is.
+    val name = s"vt.${if boxed then "ref." else ""}${mangle(tr)}.${member_symbol(ty)}"
+
+    if cx.an.tables.members.vtables.has(name) then return name
+
+    val members = slotted_members(cx.an, trait_bound_of(tr), self_binding(ty))
+    var slots: Buf[TVSlot] = buf()
+
+    for i in 0..<members.len()
+        val from = members.at(i).0
+        val m = members.at(i).1
+
+        // The trait's own membership was checked before this was reached; a **required** one is
+        // checked here, where the table is being built, and the two ways it can fail want different
+        // things said.
+        if !conforms(cx.an, from, ty)
+            if satisfies(cx.an, from, ty) then
+                cx.fault(span_zero(), s"${type_show(ty)} implements '${module_show(from.name)}' by " +
+                         "the compiler's own rule rather than through an 'impl', so there is no " +
+                         s"'${m.name}' for a slot of '${type_show(tr)}' to point at")
+            else
+                cx.fault(span_zero(), s"'${type_show(tr)}' requires '${from.show()}', and " +
+                         s"${type_show(ty)} does not implement it — so there is no '${m.name}' for " +
+                         "its table to point at")
+
+            return name
+        end if
+
+        // Named by the trait the slot is for, not by the member's own name alone: a type may
+        // implement one trait at more than one argument list, and a table whose slot pointed at the
+        // other one's member would be a table pointing at the wrong thing.
+        val fname = trait_member_name(cx, ty, from, m.name)
+        val sig = cx.an.tables.members.func_insts.get(fname)
+
+        // A member whose signature did not match the trait's was reported where the `impl` is
+        // written and never registered, so there is nothing here to point a slot at.
+        if sig.is_none()
+            cx.fault(span_zero(), s"${type_show(ty)} has no '${m.name}' that '${type_show(tr)}' can " +
+                     "point a slot at — the one it declares does not match what " +
+                     s"'${module_show(from.name)}' asks for")
+            return name
+        end if
+
+        var params: Buf[Type] = buf()
+
+        for j in 1..<sig.unwrap().params.len()
+            params.push(sig.unwrap().params.at(j).1)
+
+        // The promise is the **trait's**, so it is read off the member the trait declared and not off
+        // whatever the `impl` wrote: an implementation cannot grant itself the exemption. Positions
+        // are the implementation's, so a written parameter's index is one past its place in the
+        // declared list.
+        var promised: Buf[(usize, string)] = buf()
+
+        for j in 0..<m.borrows.len()
+            for k in 0..<m.params.len()
+                if m.params.at(k).name == m.borrows.at(j) then
+                    promised.push((k + 1, m.borrows.at(j)))
+
+        slots.push(TVSlot(fname, m.recv_mode().unwrap_or(ByValue), params, sig.unwrap().ret,
+                          promised))
+
+    // The identity a downcast tests against is emission's to settle, and nothing here reads it.
+    cx.an.tables.members.vtables.put(name, TVtable(name, trait_bound_of(tr).name, ty, boxed, slots,
+                                                   from_int(0)))
+    name
+end vtable_for
+
+// The name a member reaches under one particular implementation of a trait.
+private trait_member_name(cx: &Analyzer, t: Type, tr: Bound, mname: string) -> string =
+    member_func_name(cx, span_zero(), t, mname + impl_alt(cx.an, tr, t))

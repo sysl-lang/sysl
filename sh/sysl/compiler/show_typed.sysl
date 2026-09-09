@@ -843,6 +843,14 @@ show_funcs_table(a: &Analysis) -> string
 
         if module_of(key) == "" then keys.push(key)
 
+    // **A member is a function**, so it is a row of this table like any other -- filed under the name
+    // it was lowered to rather than under the key it is looked up by, which is what the reference
+    // prints and what an object file will carry.
+    val lowered = a.tables.members.func_insts
+
+    for i in 0..<lowered.len()
+        if module_of(lowered.key_at(i)) == "" then keys.push(lowered.key_at(i))
+
     sort_names(&keys)
 
     var out = str_builder()
@@ -850,27 +858,52 @@ show_funcs_table(a: &Analysis) -> string
     out.push("funcs:\n")
 
     for i in 0..<keys.len()
-        val f = a.tables.funcs.get(keys.at(i)).unwrap()
+        val f = a.tables.funcs.get(keys.at(i))
+
+        if f.is_none()
+            write_lowered_row(&out, keys.at(i), lowered.get(keys.at(i)).unwrap())
+            continue
+        end if
 
         out.push("  ")
         out.push(keys.at(i))
         out.push("(")
 
-        for j in 0..<f.decl.params.len()
-            val p = f.decl.params.at(j)
+        for j in 0..<f.unwrap().decl.params.len()
+            val p = f.unwrap().decl.params.at(j)
 
             if j > 0 then out.push(", ")
 
             out.push(p.name)
             out.push(": ")
-            out.push(type_show(resolve_type(a, f.scope, p.typ, no_bindings())))
+            out.push(type_show(resolve_type(a, f.unwrap().scope, p.typ, no_bindings())))
 
         out.push(") -> ")
-        out.push(type_show(declared_result_in(a, f.scope, f.decl.ret_type)))
+        out.push(type_show(declared_result_in(a, f.unwrap().scope, f.unwrap().decl.ret_type)))
         out.push_char('\n')
 
     out.finish()
 end show_funcs_table
+
+// One row for a function the tables already hold the signature of, which is every member and every
+// instantiation: the names and the types are the ones that were made real, so nothing is resolved
+// again here.
+private write_lowered_row(out: *StrBuilder, name: string, sig: FuncSig)
+    out.push("  ")
+    out.push(name)
+    out.push("(")
+
+    for i in 0..<sig.params.len()
+        if i > 0 then out.push(", ")
+
+        out.push(sig.params.at(i).0)
+        out.push(": ")
+        out.push(type_show(sig.params.at(i).1))
+
+    out.push(") -> ")
+    out.push(type_show(sig.ret))
+    out.push_char('\n')
+end write_lowered_row
 
 private declared_result_in(a: &Analysis, scope: Scope, written: Option[TypeRef]) -> Type
     if written.is_none() then return Unit
