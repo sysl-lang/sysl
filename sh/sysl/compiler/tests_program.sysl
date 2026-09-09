@@ -117,6 +117,16 @@ private emits(text: string, name: string) -> bool
     false
 end emits
 
+// What a report said, as one line, for a failing assertion to show.
+private listed(xs: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<xs.len()
+        out = s"$out${if i > 0 then " | " else ""}${xs.at(i)}"
+
+    out
+end listed
+
 private says(xs: Buf[string], message: string) -> bool
     for i in 0..<xs.len()
         if xs.at(i) == message then return true
@@ -926,3 +936,42 @@ a_tables_slots_are_reached()
 
     assert(emits(text, "sysl$Stdout.write") || complaints(text).len() > 0,
            "the 'write' the table points at is emitted")
+
+@test("what a 'within' declaration narrowed is part of the type its attributes read")
+a_constrained_subtypes_ends_are_its_own()
+    if no_library() then return
+
+    val text = "type Age = int within 0..150\n\nuse() -> Age = Age::Max\n"
+    val out = shown(text, "use")
+
+    assert(out.index_of("value: 150").is_some(), out)
+
+    val low = shown("type Age = int within 7..150\n\nuse() -> Age = Age::Min\n", "use")
+
+    assert(low.index_of("value: 7").is_some(), low)
+
+    val last = shown("type Age = int within 0..<150\n\nuse() -> Age = Age::Last\n", "use")
+
+    assert(last.index_of("value: 149").is_some(), last)
+
+@test("and a type parameter bound to one reads that type's ends and not its base's")
+a_parameter_at_a_constrained_subtype()
+    if no_library() then return
+
+    val text = "type Age = int within 0..150\n\nwidest[T]() -> T = T::Max\n\n" +
+        "use() -> Age = widest[Age]()\n"
+    val out = shown(text, "widest.int")
+
+    assert(out.index_of("value: 150").is_some(), out)
+
+@test("an unranged subtype has no ends to name, and its bounds are its base's")
+an_unranged_subtype_has_no_ends()
+    if no_library() then return
+
+    val said = complaints("type Tag = new int\n\nuse() -> Tag = Tag::First\n")
+
+    assert(says(said, "'Tag::First' needs a 'within' range"), listed(said))
+
+    val out = shown("type Tag = new int\n\nuse() -> Tag = Tag::Max\n", "use")
+
+    assert(out.index_of("value: 2147483647").is_some(), out)

@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int}
+import sysl.math.decimal.{Decimal, of as decimal_of, parse as decimal_parse}
 
 // A written type, resolved to the type it means.
 //
@@ -641,11 +642,50 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
 
     var made = base
 
-    if !is_plain_alias(d) then made = constrained(key, base, d.derived, None, None, false, None)
+    // **WHAT THE DECLARATION NARROWED IS PART OF THE TYPE.** `type Age = int within 0..150` is not
+    // an `int` wearing a name: its ends are what `Age::Min` and `Age::Max` answer, what `Age::Valid`
+    // asks about, and what a literal standing at it is held to. Left off, every one of those reads
+    // the base's range and says nothing about the type the reader declared.
+    var lo: Option[Decimal] = None
+    var hi: Option[Decimal] = None
+    var exclusive = false
+
+    if d.range.is_some()
+        val r = d.range.unwrap()
+
+        lo = range_end(a, home, r.lo)
+        hi = range_end(a, home, r.hi)
+        exclusive = r.exclusive_hi
+    end if
+
+    // A `where` predicate narrows the type without saying where to, which is why the ends are not
+    // readable off such a declaration. It is recorded as the declaration's own key: what a program
+    // *calls* to test one is the lifting this stage does not do.
+    val pred = if d.pred.is_none() then None else Some(key)
+
+    if !is_plain_alias(d) then made = constrained(key, base, d.derived, lo, hi, exclusive, pred)
 
     a.tables.constrained_insts.put(key, made)
     made
 end instantiate_named_subtype
+
+// The number a written range end stands for, where it settles at all. A `within` may be written over
+// floats as well as integers, so a literal is read as text and everything else is folded.
+private range_end(a: &Analysis, scope: Scope, e: Expr) -> Option[Decimal]
+    *e.kind match
+        FloatLit(text, _) -> return decimal_parse(text)
+        _ -> ()
+
+    val cx = analyzer_for(a, scope)
+    val mark = a.complaints()
+    val folded = const_fold(cx, e)
+
+    a.restore_complaints(mark)
+
+    folded match
+        Some(ConstInt(n)) -> Some(decimal_of(n, 0))
+        _ -> None
+end range_end
 
 // Whether a `type` declaration is only another spelling for what it names -- no `is`, no range, no
 // predicate.
