@@ -15,6 +15,7 @@ import sysl.text.{Search, from_utf8_unchecked}
 // Everything a program has to answer for, run in the order the reference runs them.
 whole_program_checks(a: &Analysis, funcs: Buf[TFunc])
     check_conventions(a)
+    check_exports(a)
     check_drop_returns(a)
     check_ghost(a, funcs)
 end whole_program_checks
@@ -381,3 +382,129 @@ private frame_shaped(params: Buf[Type]) -> bool
         Integer(_, _, _) -> true
         _ -> false
 end frame_shaped
+
+// -- `@export`, and what C could name -------------------------------------------------------------
+
+// Whether a declaration is one anything importing the module may name.
+private is_public(v: Visibility) -> bool = v match
+    Public -> true
+    _ -> false
+
+// Holds every declaration carrying `@export` -- a free function, and a struct naming itself for a
+// generated header.
+//
+// **A free function and a struct are the whole of it, and that is the grammar's doing rather than a
+// choice made here.** An attribute is read at statement position only, so none reaches a struct
+// member, an enum member or an `impl` member -- a rule refusing `@export` on a method would be a
+// rule nothing could reach, and the refusal a reader meets comes from the parser.
+private check_exports(a: &Analysis)
+    val funcs = a.tables.funcs
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        if f.decl.exported.is_some() then
+            check_export(a, funcs.key_at(i), f, f.decl.exported.unwrap())
+
+    val types = a.tables.types
+
+    for i in 0..<types.len()
+        types.at(i).kind match
+            StructOf(d) ->
+                if d.cname.is_some() then
+                    check_struct_export(a, types.key_at(i), types.at(i), d, d.cname.unwrap())
+            _ -> ()
+end check_exports
+
+// Refuses a C name a header could not declare, or a struct that has no one name to give.
+//
+// **The rules are the function's, arrived at from a different direction.** A symbol and a type name
+// are both spellings a C reader writes, so what C can name is the same question -- but a `typedef`
+// has no linkage, so `private` is not the contradiction here that it is on a function. It is
+// refused anyway, and for a reason worth reading: the visibility rule already stops a public
+// declaration naming a type less visible than itself, and an exported function is public.
+private check_struct_export(a: &Analysis, key: string, at: Decl, d: StructDecl, e: ExportAttr)
+    if e.symbol.is_some() && !c_identifier(e.symbol.unwrap()) then
+        a.fault(at.scope, e.span, s"'${e.symbol.unwrap()}' is not a name C can declare — a type's " +
+                "name in a header is a C identifier, so it is a letter or '_' followed by letters, " +
+                "digits and '_'")
+
+    // Checked against the declared name, since that is what an unwritten one becomes. A
+    // backtick-quoted declaration is the case: it may hold anything the reader wanted.
+    if e.symbol.is_none() && !c_identifier(module_bare(spelled_key(key))) then
+        a.fault(at.scope, e.span, s"'${qualified_name(key)}' is not a name C can declare, so " +
+                "naming it after itself would put a spelling in the header no C declaration could " +
+                "use — name it instead, '@export(\"...\")'")
+
+    if !is_public(d.vis) then
+        a.fault(at.scope, e.span, s"'${qualified_name(key)}' is private, so no exported function " +
+                "may name it — an export is public, and a declaration may not be more visible " +
+                "than the types it names. No header can carry this type at all, so there is no " +
+                "name in one for it to take")
+
+    // Generic is refused for the reason an exported generic function is, and the argument is even
+    // shorter here: every instantiation is a struct of its own, so one written name would be
+    // claimed by all of them at once.
+    if !d.tparams.is_empty() then
+        a.fault(at.scope, e.span, s"a header names one type at one shape, so " +
+                s"'${qualified_name(key)}' cannot be generic — each instantiation is a struct of " +
+                "its own and they would all claim this one name. Wrap the instantiation the header " +
+                "carries in a struct of its own and name that")
+end check_struct_export
+
+// Refuses an export whose symbol C could not name, or whose function C could not call.
+private check_export(a: &Analysis, key: string, f: Func, e: ExportAttr)
+    if e.symbol.is_some() && !c_identifier(e.symbol.unwrap()) then
+        a.fault(f.scope, e.span, s"'${e.symbol.unwrap()}' is not a name C can call — an exported " +
+                "symbol is a C identifier, so it is a letter or '_' followed by letters, digits " +
+                "and '_'")
+
+    // **An overload exported under its own name is refused here**, and it is worth catching by name
+    // rather than leaving to the rule below: an overload's key carries a numbered segment, which is
+    // not a C identifier, so the rule below would refuse it quoting a spelling the source does not
+    // contain. C has no overloading at all -- two exports of one name are two definitions of one
+    // symbol, which is a link error rather than anything a reader of either line could act on.
+    if e.symbol.is_none() && overload_keys(a, overload_plain(key)).len() > 1 then
+        a.fault(f.scope, e.span, s"'${qualified_name(key)}' is declared more than once, and C has " +
+                "no overloading — two exports of one name would be two definitions of one symbol. " +
+                "Give each export a symbol of its own, '@export(\"...\")'")
+
+    // Checked against the **declared** name, since that is what an unwritten symbol becomes.
+    if e.symbol.is_none() && !c_identifier(module_bare(spelled_key(overload_plain(key)))) then
+        a.fault(f.scope, e.span, s"'${qualified_name(key)}' is not a name C can call, so exporting " +
+                "it under its own name would publish a symbol no C declaration could spell — name " +
+                "the symbol instead, '@export(\"...\")'")
+
+    // Generic is refused before anything is resolved, for the reason a convention's is: a type
+    // parameter has nothing to resolve *to* out here.
+    if !f.decl.tparams.is_empty() then
+        a.fault(f.scope, e.span, "an exported symbol is one function at one signature, so " +
+                s"'${f.decl.name}' cannot be generic — there would be no way to say which " +
+                "instantiation the linker holds. Export a wrapper per instantiation, each naming " +
+                "its own symbol")
+
+    // `private` emits the symbol internal, which is the promise that every caller is inside this
+    // module. An export is the opposite promise, and a definition cannot make both.
+    if !is_public(f.decl.vis) then
+        a.fault(f.scope, e.span, s"'${module_show(key)}' is private, which promises every caller " +
+                "is inside its own module — and an export promises the opposite. A definition " +
+                "cannot make both claims")
+
+    if f.decl.ghost then
+        a.fault(f.scope, e.span, s"'${module_show(key)}' is '@ghost', so it is erased before " +
+                "codegen and there is no symbol for C to link against")
+
+    if f.decl.test.is_some() then
+        a.fault(f.scope, e.span, s"'${module_show(key)}' is a '@test', which only 'sysl test' " +
+                "builds — an exported symbol has to be in the artifact a C project links, and a " +
+                "test is not")
+
+    // A variadic sysl definition reads its tail through `va_start`/`va_arg`, which is C's own
+    // mechanism -- but the *promotions* a C caller applies to the tail are the caller's, and nothing
+    // here has seen that caller's prototype.
+    if f.decl.variadic then
+        a.fault(f.scope, e.span, s"'${module_show(key)}' is variadic, and what a C caller promotes " +
+                "into the tail is decided by the prototype it compiled against rather than by this " +
+                "declaration — take a 'va_list' parameter instead, which states the same thing and " +
+                "is what C's own 'v' variants do")
+end check_export

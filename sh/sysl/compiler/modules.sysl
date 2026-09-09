@@ -76,3 +76,89 @@ llvm_guard(name: string) -> string
 
     from_utf8_unchecked(out.view())
 end llvm_guard
+
+// A key with the segments the compiler added to it taken off -- an overload's number and a
+// file-private slot -- so that what is left is the qualified name a file actually wrote.
+//
+// They come off in turn because a private slot can carry an overload suffix: a file that declares
+// one spelling twice, privately, while a sibling file holds the plain key, has its second
+// declaration at `m$pick.private1.1`.
+spelled_key(key: string) -> string
+    val cut = last_dot(key)
+
+    if cut <= 0 || cut >= isize(key.bytes.len) - 1 then return key
+
+    val last = from_utf8_unchecked(key.bytes[usize(cut) + 1..<key.bytes.len])
+
+    if !all_digits(last) && !private_slot(last) then return key
+
+    spelled_key(from_utf8_unchecked(key.bytes[0..<usize(cut)]))
+end spelled_key
+
+// The same, with an **overload's** number off and a private slot left on -- the key the declarations
+// of one spelling in one file share.
+overload_plain(key: string) -> string
+    val cut = last_dot(key)
+
+    if cut <= 0 || cut >= isize(key.bytes.len) - 1 then return key
+
+    if !all_digits(from_utf8_unchecked(key.bytes[usize(cut) + 1..<key.bytes.len])) then return key
+
+    from_utf8_unchecked(key.bytes[0..<usize(cut)])
+end overload_plain
+
+// The qualified name a file wrote, which is what a diagnostic says when it names a declaration.
+qualified_name(key: string) -> string = module_show(spelled_key(key))
+
+private last_dot(key: string) -> isize
+    val bytes = key.bytes
+    var at: isize = -1
+
+    for i in 0..<bytes.len
+        if bytes[i] == u8('.') then at = isize(i)
+
+    at
+end last_dot
+
+private all_digits(s: string) -> bool
+    val bytes = s.bytes
+
+    if bytes.len == 0 then return false
+
+    for i in 0..<bytes.len
+        if bytes[i] < u8('0') || bytes[i] > u8('9') then return false
+
+    true
+end all_digits
+
+private private_slot(s: string) -> bool
+    val bytes = s.bytes
+    val head = "private"
+
+    if bytes.len <= head.bytes.len then return false
+
+    for i in 0..<head.bytes.len
+        if bytes[i] != head.bytes[i] then return false
+
+    all_digits(from_utf8_unchecked(bytes[head.bytes.len..<bytes.len]))
+end private_slot
+
+// Whether a spelling is one a C declaration could use: a letter or `_`, then letters, digits and
+// `_`, all of them ASCII.
+c_identifier(s: string) -> bool
+    val bytes = s.bytes
+
+    if bytes.len == 0 then return false
+
+    if !c_letter(bytes[0]) && bytes[0] != u8('_') then return false
+
+    for i in 1..<bytes.len
+        if !c_letter(bytes[i]) && !c_digit(bytes[i]) && bytes[i] != u8('_') then return false
+
+    true
+end c_identifier
+
+private c_letter(b: u8) -> bool =
+    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z'))
+
+private c_digit(b: u8) -> bool = b >= u8('0') && b <= u8('9')
