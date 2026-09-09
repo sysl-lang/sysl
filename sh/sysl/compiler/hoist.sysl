@@ -350,21 +350,76 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
 
     if clash then return
 
+    // **Overloads are counted off whichever key this FILE's declarations of the name share**, which
+    // is why the private slot is worked out first. Counting them off the plain key alone would file
+    // a file that declares one spelling twice, privately, beside a sibling contending it under one
+    // slot -- and the second would overwrite the first.
+    val base = decl_key(a, scope, plain, d.vis)
+    val siblings = overload_keys(a, base)
+
     // **The slot is one-based**, so the second declaration of a name is `f.2` and never `f.1`.
     // It is the key an object file and a diff both read, so the two compilers have to spell it the
     // same way; the typed differential proof is what found this.
-    val key = if already.is_empty() then plain else s"$plain.${already.len() + 1}"
+    val key = if siblings.is_empty() then base else s"$base.${siblings.len() + 1}"
     var set: Buf[string] = buf()
 
-    for i in 0..<already.len()
-        set.push(already.at(i))
+    for i in 0..<siblings.len()
+        set.push(siblings.at(i))
 
     set.push(key)
-    a.tables.overloads.put(plain, set)
+    a.tables.overloads.put(base, set)
     a.tables.funcs.put(key, Func(d, span, scope))
     a.tables.access.put(key, Access(d.vis, scope.src.name))
 
     if is_test_only(scope) then a.tables.test_only.push(key)
+
+// The key a declaration is filed under, where a SIBLING FILE already holds the plain one privately.
+//
+// **Two files may each keep a helper of one spelling to themselves.** Neither is ever a candidate at
+// the other's call sites, so there is nothing for a call to be told apart and the two are not an
+// overload pair at all -- but a table is keyed by one string, so they may not share a key either.
+// The first file read takes the plain key and each one after it takes a numbered private slot.
+//
+// Three cases, and only the third is new. Nothing holds the key: this declaration takes it, and the
+// claim is recorded so that its own file resolves to it. Something holds it that is not another
+// file's file-private declaration: the plain key comes back and the duplicate check above reports
+// it, so a private name against a PUBLIC one of the same spelling is refused exactly as it was.
+// Something holds it and IS another file's file-private declaration: a slot, and the two coexist.
+private decl_key(a: &Analysis, scope: Scope, plain: string, vis: Visibility) -> string
+    if !is_file_private(vis) then return plain
+
+    val mine = file_slot_key(scope.src.name, plain)
+    val claimed = a.tables.file_private.get(mine)
+
+    // A second declaration of the spelling in THIS file is an ordinary duplicate, and has to arrive
+    // at the same key for the check above to see it as one.
+    if claimed.is_some() then return claimed.unwrap()
+
+    val held = a.tables.access.get(plain)
+    var key = plain
+
+    if held.is_some() && is_file_private(held.unwrap().vis) && held.unwrap().file != scope.src.name
+        var n: usize = 1
+
+        while a.tables.access.has(s"$plain.private$n")
+            n = n + 1
+
+        key = s"$plain.private$n"
+    end if
+
+    a.tables.file_private.put(mine, key)
+    key
+end decl_key
+
+// How a file and a spelling are held as one key, so that the claims of one name by several files are
+// one table rather than a table of tables. A file's name cannot hold a newline and a key cannot
+// either, so nothing else can be spelled this way.
+file_slot_key(file: string, plain: string) -> string = s"$file\n$plain"
+
+// The key a name written in this file resolves to before the module's plain one is tried -- this
+// file's own file-private declaration of it, where it has one.
+file_private_key(a: &Analysis, file: string, plain: string) -> string =
+    a.tables.file_private.get(file_slot_key(file, plain)).unwrap_or(plain)
 
 // The other declaration a call site would have to be told apart from, where there is one: a
 // declaration this file cannot name is not one a call here could be confused with.
