@@ -756,10 +756,19 @@ private function_call(cx: &Analyzer, span: Span, written: string, args: Buf[Expr
     var fitting: Buf[string] = buf()
 
     for i in 0..<keys.len()
+        // **A CANDIDATE THAT WAS NOT CHOSEN BUILT NOTHING.** Reading a call against a declaration
+        // asks for whatever that declaration would need -- an instantiation of a generic `copy[T]`
+        // at the very call a written-out `copy` on bytes wins -- and the chosen one is read again
+        // from scratch. So the whole trial is rewound, not only what it had to say: a name a
+        // discarded reading registered is a body the program never calls.
         val mark = cx.an.complaints()
+        val sandbox = cx.an.sandboxed()
+        val queued = cx.an.tables.members.pending.len()
         val trial = call_key(cx, span, written, keys.at(i), args, expected, false)
         val said = cx.an.complaints() > mark
 
+        cx.an.release(sandbox)
+        rewind_instantiations(cx.an, queued)
         cx.an.restore_complaints(mark)
 
         if !said then fitting.push(keys.at(i))

@@ -116,6 +116,7 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
     while reached
         reached = false
 
+        val before = a.funcs_used().len()
         val names = a.funcs_used()
 
         for i in 0..<names.len()
@@ -135,6 +136,12 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
                     else funcs.push(analyze_body(a, at.scope, at.span, at.decl))
 
         drain_pending(a, &funcs)
+
+        // **DRAINING THE QUEUE REACHES THINGS TOO**, and a round that analyzed no held body may
+        // still have found one to analyze: a vtable built while an instantiation was typed names
+        // the members its slots point at, and those are library bodies waiting to be asked for. So
+        // the round ends when nothing new is reached, not when nothing was held.
+        if a.funcs_used().len() > before then reached = true
 
     // The `call` bodies the closures lowered to, after everything a program declared: a closure has
     // no declaration of its own to sit beside, and one lowered while a later body was typed would
@@ -325,7 +332,7 @@ end check_abstract_body
 // already there, asks for nothing, and the program ends up calling a body no pass analyzed. It cost
 // `Buf[string]`, `Buf[sh.sysl.parsing.Span]` and everything each of those reaches, all of them
 // first asked for from inside a generic body being read at its own definition.
-private rewind_instantiations(a: &Analysis, queued: usize)
+rewind_instantiations(a: &Analysis, queued: usize)
     val pending = a.tables.members.pending
 
     for i in queued..<pending.len()
