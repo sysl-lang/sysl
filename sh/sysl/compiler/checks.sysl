@@ -1,0 +1,69 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// The checks a whole program is held to once every body it reaches has been typed.
+//
+// **What separates these from everything in `analyze_body.sysl` is the question they ask.** Typing a
+// body asks whether each expression means anything; these ask whether the program a compilation
+// came to is one the reader is allowed to have written -- which cannot be answered until the last
+// body a call reached has been read, because the answer is about what a body *reaches* rather than
+// about what it says.
+
+// Everything a program has to answer for, run in the order the reference runs them.
+whole_program_checks(a: &Analysis, funcs: Buf[TFunc])
+    check_ghost(a, funcs)
+end whole_program_checks
+
+// The file a typed body was written in, or an empty one where the body has no source of its own.
+func_home(a: &Analysis, name: string) -> Scope = a.tables.homes.get(name).unwrap_or(empty_scope())
+
+// -- `@ghost` --------------------------------------------------------------------------------
+
+// Reports every call to a `@ghost` function from somewhere that runs.
+//
+// **The rule that makes erasing a ghost declaration sound is a rule about who may mention it.**
+// Nothing executable may call one, since erasing it would then change what the program computes; a
+// clause that calls one is a clause that does not run, and is the one place a call is allowed.
+//
+// So the clauses are not walked: a function's `require`, `ensure` and `variant` are held beside the
+// body, and a loop's `invariant` and `variant` are statements the walk stops at. Everything else is
+// executable. A ghost function's own body is where real state is read, so it may call whatever it
+// likes.
+private check_ghost(a: &Analysis, funcs: Buf[TFunc])
+    var ghost: Buf[string] = buf()
+
+    for i in 0..<funcs.len()
+        if funcs.at(i).ghost then ghost.push(funcs.at(i).name)
+
+    if ghost.is_empty() then return
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        if !f.ghost
+            val scope = func_home(a, f.name)
+            val an = a
+            val named = ghost
+
+            walk_block_stmts(f.body, false, e -> ghost_call(an, scope, named, e))
+end check_ghost
+
+private ghost_call(a: &Analysis, scope: Scope, ghost: Buf[string], e: TExpr)
+    *e.kind match
+        TCall(name, _, _, _) ->
+            if holds_string(ghost, name) then
+                a.fault(scope, e.span, s"'${module_show(name)}' is '@ghost', so it exists for the " +
+                        "specification and is not there when the program runs — it may be called " +
+                        "from a 'require', an 'ensure', a loop's 'invariant' or 'variant', or from " +
+                        "another '@ghost' function, and from nowhere else")
+        _ -> ()
+end ghost_call
+
+// A block's statements and the value it comes to, walked as one body.
+private walk_block_stmts(b: TBlock, clauses: bool, each: &Fn(TExpr) -> unit)
+    walk_stmts(b.stmts, clauses, each)
+
+    if b.result.is_some() then walk_texpr(b.result.unwrap(), clauses, each)
+end walk_block_stmts

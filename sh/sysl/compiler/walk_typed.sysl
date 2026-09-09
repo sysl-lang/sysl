@@ -1,0 +1,269 @@
+module sh.sysl.compiler
+
+import sysl.buf.Buf
+
+// A walk over a typed body, node by node.
+//
+// **Every check that asks "what does this body do?" asks it of the whole tree**, and the tree is a
+// hundred and ten expression forms deep. The reference compiler reaches them with reflection over
+// its case classes, which is a walk it never has to write down; here the walk is written once and
+// every check is a function handed to it.
+//
+// `clauses` is what separates the part of a body that RUNS from the part that only states
+// something. A `require`, an `ensure`, a loop's `invariant` and its `variant` are conditions the
+// program is held to, and one of them may name a declaration that is not there when the program
+// runs -- so a check about execution walks with `clauses` false and one about the whole text walks
+// with it true.
+
+// Visits every expression of a body, outermost first.
+walk_stmts(stmts: Buf[TStmt], clauses: bool, each: &Fn(TExpr) -> unit)
+    for i in 0..<stmts.len()
+        walk_stmt(stmts.at(i), clauses, each)
+end walk_stmts
+
+walk_stmt(s: TStmt, clauses: bool, each: &Fn(TExpr) -> unit)
+    s match
+        TVarDecl(_, _, init, _) -> walk_texpr(init, clauses, each)
+        TExprStmt(e) -> walk_texpr(e, clauses, each)
+        TInvariant(cond, _) -> if clauses then walk_texpr(cond, clauses, each)
+        TVariantCheck(_, _, e) -> if clauses then walk_texpr(e, clauses, each)
+        TRefDecl(_, _, place) -> walk_texpr(place, clauses, each)
+        TWriteStmt(w) -> walk_write(w, clauses, each)
+        TMultiAssign(writes) ->
+            for i in 0..<writes.len()
+                walk_write(writes.at(i), clauses, each)
+        TReturn(value) -> if value.is_some() then walk_texpr(value.unwrap(), clauses, each)
+        TBecome(call) -> walk_texpr(call, clauses, each)
+        TBreak(value, _) -> if value.is_some() then walk_texpr(value.unwrap(), clauses, each)
+        TContinue(_) -> ()
+        TDefer(stmts) -> walk_stmts(stmts, clauses, each)
+        TAsm(_, _, _) -> ()
+end walk_stmt
+
+private walk_write(w: TWrite, clauses: bool, each: &Fn(TExpr) -> unit)
+    walk_texpr(w.place, clauses, each)
+    walk_texpr(w.value, clauses, each)
+
+    for i in 0..<w.check.len()
+        walk_texpr(w.check.at(i).value, clauses, each)
+end walk_write
+
+private walk_block(b: TBlock, clauses: bool, each: &Fn(TExpr) -> unit)
+    walk_stmts(b.stmts, clauses, each)
+
+    if b.result.is_some() then walk_texpr(b.result.unwrap(), clauses, each)
+end walk_block
+
+private walk_opt_block(b: Option[TBlock], clauses: bool, each: &Fn(TExpr) -> unit)
+    if b.is_some() then walk_block(b.unwrap(), clauses, each)
+end walk_opt_block
+
+private walk_all(es: Buf[TExpr], clauses: bool, each: &Fn(TExpr) -> unit)
+    for i in 0..<es.len()
+        walk_texpr(es.at(i), clauses, each)
+end walk_all
+
+private walk_opt(e: Option[TExpr], clauses: bool, each: &Fn(TExpr) -> unit)
+    if e.is_some() then walk_texpr(e.unwrap(), clauses, each)
+end walk_opt
+
+private walk_terms(cond: Buf[TCondTerm], clauses: bool, each: &Fn(TExpr) -> unit)
+    for i in 0..<cond.len()
+        cond.at(i) match
+            TCondTest(c) -> walk_texpr(c, clauses, each)
+            TCondIs(subject, patterns, _) ->
+                walk_texpr(subject, clauses, each)
+
+                for j in 0..<patterns.len()
+                    walk_tpattern(patterns.at(j), clauses, each)
+end walk_terms
+
+// A pattern holds expressions where it compares against one: a literal arm, and the ends of a
+// range.
+walk_tpattern(p: TPattern, clauses: bool, each: &Fn(TExpr) -> unit)
+    p match
+        TWildPattern(_) -> ()
+        TBindPattern(_, _) -> ()
+        TAtPattern(_, inner) -> walk_tpattern(*inner, clauses, each)
+        TLitPattern(value) -> walk_texpr(value, clauses, each)
+        TRangePattern(lo, hi, _) ->
+            walk_texpr(lo, clauses, each)
+            walk_texpr(hi, clauses, each)
+        TVariantPattern(_, _, args) ->
+            for i in 0..<args.len()
+                walk_tpattern(args.at(i), clauses, each)
+        TStructPattern(_, args) ->
+            for i in 0..<args.len()
+                walk_tpattern(args.at(i), clauses, each)
+end walk_tpattern
+
+// The expression itself, then everything under it.
+walk_texpr(e: TExpr, clauses: bool, each: &Fn(TExpr) -> unit)
+    each(e)
+
+    *e.kind match
+        TIntLit(_, _) -> ()
+        TFloatLit(_, _) -> ()
+        TStrLit(_) -> ()
+        TBoolLit(_) -> ()
+        TUnitLit -> ()
+        TNullLit(_) -> ()
+        TBox(value, _) -> walk_texpr(value, clauses, each)
+        TDowngrade(value, _) -> walk_texpr(value, clauses, each)
+        TUpgrade(value, _, _, _) -> walk_texpr(value, clauses, each)
+        TZero(_) -> ()
+        TArrayLit(elems, _) -> walk_all(elems, clauses, each)
+        TArrayFill(value, _) -> walk_texpr(value, clauses, each)
+        TVectorLit(lanes, _) -> walk_all(lanes, clauses, each)
+        TSplat(value, _) -> walk_texpr(value, clauses, each)
+        TLane(receiver, _, _) -> walk_texpr(receiver, clauses, each)
+        TVecCompare(_, left, right, _) ->
+            walk_texpr(left, clauses, each)
+            walk_texpr(right, clauses, each)
+        TSelect(mask, when_true, when_false, _) ->
+            walk_texpr(mask, clauses, each)
+            walk_texpr(when_true, clauses, each)
+            walk_texpr(when_false, clauses, each)
+        TReduce(_, receiver, _) -> walk_texpr(receiver, clauses, each)
+        TVecLoad(receiver, index, _) ->
+            walk_texpr(receiver, clauses, each)
+            walk_texpr(index, clauses, each)
+        TVecStore(receiver, index, value) ->
+            walk_texpr(receiver, clauses, each)
+            walk_texpr(index, clauses, each)
+            walk_texpr(value, clauses, each)
+        TBufLit(elems, _) -> walk_all(elems, clauses, each)
+        TBufFill(value, count, _) ->
+            walk_texpr(value, clauses, each)
+            walk_texpr(count, clauses, each)
+        TIndex(receiver, index, _) ->
+            walk_texpr(receiver, clauses, each)
+            walk_texpr(index, clauses, each)
+        TLen(receiver, _) -> walk_texpr(receiver, clauses, each)
+        TBytes(receiver) -> walk_texpr(receiver, clauses, each)
+        TSlice(base, lo, hi, _, _) ->
+            walk_texpr(base, clauses, each)
+            walk_opt(lo, clauses, each)
+            walk_opt(hi, clauses, each)
+        TCast(operand, _) -> walk_texpr(operand, clauses, each)
+        TConstrainedCheck(value, _) -> walk_texpr(value, clauses, each)
+        TConstrainedValid(value, _) -> walk_texpr(value, clauses, each)
+        TConstrainedStep(value, _, _, _) -> walk_texpr(value, clauses, each)
+        TLoad(_, _) -> ()
+        TResult(_) -> ()
+        TOld(_, _) -> ()
+        TGlobal(_, _, _) -> ()
+        TDeref(operand, _) -> walk_texpr(operand, clauses, each)
+        TTypeId(receiver, _) -> walk_texpr(receiver, clauses, each)
+        TAddrOf(place, _) -> walk_texpr(place, clauses, each)
+        TTempAddr(value, _) -> walk_texpr(value, clauses, each)
+        TStore(place, value, _) ->
+            walk_texpr(place, clauses, each)
+            walk_texpr(value, clauses, each)
+        TUpdate(place, _, value, _, _, _) ->
+            walk_texpr(place, clauses, each)
+            walk_texpr(value, clauses, each)
+        TIncDec(place, _, _, _, _) -> walk_texpr(place, clauses, each)
+        TBinary(_, left, right, _) ->
+            walk_texpr(left, clauses, each)
+            walk_texpr(right, clauses, each)
+        TUnary(_, operand, _) -> walk_texpr(operand, clauses, each)
+        TIntOp(_, operand, amount, _, _) ->
+            walk_texpr(operand, clauses, each)
+            walk_opt(amount, clauses, each)
+        TAtomic(_, addr, ops, _, _, _) ->
+            walk_texpr(addr, clauses, each)
+            walk_all(ops, clauses, each)
+        TFence(_) -> ()
+        TLogical(_, left, right) ->
+            walk_texpr(left, clauses, each)
+            walk_texpr(right, clauses, each)
+        TCompare(operands, _) -> walk_all(operands, clauses, each)
+        TSeq(exprs) -> walk_all(exprs, clauses, each)
+        TStr(arg) -> walk_texpr(arg, clauses, each)
+        TFromBytes(arg) -> walk_texpr(arg, clauses, each)
+        TConstView(arg) -> walk_texpr(arg, clauses, each)
+        TFormat(arg, _) -> walk_texpr(arg, clauses, each)
+        TRender(value, _, spec, _) ->
+            walk_texpr(value, clauses, each)
+            walk_texpr(spec, clauses, each)
+        TCStrLit(_) -> ()
+        TCall(_, args, _, _) -> walk_all(args, clauses, each)
+        TFuncAddr(_, _, _) -> ()
+        TCallPtr(callee, args, _, _) ->
+            walk_texpr(callee, clauses, each)
+            walk_all(args, clauses, each)
+        TErase(operand, _, _) -> walk_texpr(operand, clauses, each)
+        TVCall(receiver, _, args, _, _) ->
+            walk_texpr(receiver, clauses, each)
+            walk_all(args, clauses, each)
+        TVaStart(ap) -> walk_texpr(ap, clauses, each)
+        TVaEnd(ap) -> walk_texpr(ap, clauses, each)
+        TVaArg(ap, _) -> walk_texpr(ap, clauses, each)
+        TVaCopy(dst, src) ->
+            walk_texpr(dst, clauses, each)
+            walk_texpr(src, clauses, each)
+        TVaPass(ap) -> walk_texpr(ap, clauses, each)
+        TStructNew(_, args) -> walk_all(args, clauses, each)
+        TStructInvCheck(value, _, _) -> walk_texpr(value, clauses, each)
+        TRecheck(after, recv, _, _) ->
+            walk_texpr(after, clauses, each)
+            walk_texpr(recv, clauses, each)
+        TEnumNew(_, _, args) -> walk_all(args, clauses, each)
+        TEnumFromInt(value, _) -> walk_texpr(value, clauses, each)
+        TEnumTry(value, _, _, _, _) -> walk_texpr(value, clauses, each)
+        TEnumAttr(_, _, arg, _) -> walk_texpr(arg, clauses, each)
+        TTry(operand, _, _, _, _, _, _) -> walk_texpr(operand, clauses, each)
+        TField(receiver, _, _) -> walk_texpr(receiver, clauses, each)
+        TIf(cond, then_block, else_block, _) ->
+            walk_terms(cond, clauses, each)
+            walk_block(then_block, clauses, each)
+            walk_opt_block(else_block, clauses, each)
+        TMatch(scrutinee, arms, _) ->
+            walk_texpr(scrutinee, clauses, each)
+
+            for i in 0..<arms.len()
+                val arm = arms.at(i)
+
+                for j in 0..<arm.patterns.len()
+                    walk_tpattern(arm.patterns.at(j), clauses, each)
+
+                walk_opt(arm.guard, clauses, each)
+                walk_block(arm.body, clauses, each)
+        TBlockExpr(block) -> walk_block(block, clauses, each)
+        TWhile(cond, body, else_block, _) ->
+            walk_terms(cond, clauses, each)
+            walk_stmts(body, clauses, each)
+            walk_opt_block(else_block, clauses, each)
+        TDoWhile(body, cond, else_block, _) ->
+            walk_stmts(body, clauses, each)
+            walk_texpr(cond, clauses, each)
+            walk_opt_block(else_block, clauses, each)
+        TLoop(body, _) -> walk_stmts(body, clauses, each)
+        TFor(_, _, lo, hi, _, body, else_block, _) ->
+            walk_texpr(lo, clauses, each)
+            walk_texpr(hi, clauses, each)
+            walk_stmts(body, clauses, each)
+            walk_opt_block(else_block, clauses, each)
+        TCFor(init, cond, step, body, else_block, _) ->
+            walk_stmts(init, clauses, each)
+            walk_opt(cond, clauses, each)
+            walk_stmts(step, clauses, each)
+            walk_stmts(body, clauses, each)
+            walk_opt_block(else_block, clauses, each)
+        TForEach(_, _, seq, body, else_block, _) ->
+            walk_texpr(seq, clauses, each)
+            walk_stmts(body, clauses, each)
+            walk_opt_block(else_block, clauses, each)
+        TIterate(_, _, init, next, bind, body, else_block, _) ->
+            walk_texpr(init, clauses, each)
+            walk_texpr(next, clauses, each)
+            walk_tpattern(bind, clauses, each)
+            walk_stmts(body, clauses, each)
+            walk_opt_block(else_block, clauses, each)
+        TQuantifier(_, _, _, lo, hi, _, pred) ->
+            walk_texpr(lo, clauses, each)
+            walk_texpr(hi, clauses, each)
+            walk_texpr(pred, clauses, each)
+        TCheckedLoop(_, _, loop_expr) -> walk_texpr(loop_expr, clauses, each)
+end walk_texpr

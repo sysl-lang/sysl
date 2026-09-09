@@ -1,0 +1,54 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What a whole program is refused for, and what it says.
+//
+// **Every message here was read out of the reference compiler**, by handing the installed `sysl` the
+// same source and quoting what came back -- never composed from the rule. Each check gets both
+// halves: the source that is refused, and the neighbouring one that is not.
+
+private said(text: string) -> string
+    val ds = stmt_diagnostics(text)
+
+    if ds.is_empty() then return ""
+
+    ds.at(0)
+end said
+
+private how_many(text: string) -> usize = stmt_diagnostics(text).len()
+
+// -- `@ghost` --------------------------------------------------------------------------------
+
+private ghost_erased() -> string =
+    "'m.spec' is '@ghost', so it exists for the specification and is not there when the program " +
+    "runs — it may be called from a 'require', an 'ensure', a loop's 'invariant' or 'variant', or " +
+    "from another '@ghost' function, and from nowhere else"
+
+private a_ghost() -> string = "module m\n\n@ghost\nspec(n: int) -> bool = n > 0\n\n"
+
+@test("a '@ghost' function called from something that runs is refused")
+a_ghost_called_from_code()
+    assert_eq(said(a_ghost() + "use(n: int) -> bool = spec(n)\n"), ghost_erased())
+
+@test("and so is one called from a body reached through a statement")
+a_ghost_called_from_a_statement()
+    assert_eq(said(a_ghost() + "use(n: int) -> int\n    if spec(n) then return 1\n\n    0\n"),
+              ghost_erased())
+
+@test("a contract clause is where a '@ghost' function may be called")
+a_ghost_called_from_a_contract()
+    assert_eq(how_many(a_ghost() + "ok(n: int) -> int\n    require spec(n)\n" +
+                       "    ensure spec(result)\n\n    n\n"), 0)
+
+@test("and so is a loop's 'invariant'")
+a_ghost_called_from_an_invariant()
+    assert_eq(how_many(a_ghost() + "run(n: int) -> int\n    var i = 0\n\n    while i < n\n" +
+                       "        invariant spec(n)\n\n        i += 1\n\n    i\n"), 0)
+
+@test("a '@ghost' function may call another, its own body being where real state is read")
+a_ghost_calling_a_ghost()
+    assert_eq(how_many(a_ghost() + "@ghost\nother(n: int) -> bool = spec(n)\n"), 0)
