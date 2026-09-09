@@ -18,6 +18,17 @@ analyze_expected(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
 
     val want = expected.unwrap()
 
+    // **An `if`, a `match`, a loop or a block yields its value through its branches**, so a context
+    // that converts belongs to each of those rather than to the aggregate: every branch boxes or
+    // erases on its own. That is what lets a `&T` branch and a plain-value branch meet at `&T`, and
+    // two branches of different concrete types meet at one trait object. Converting the whole
+    // expression instead would ask each branch for something it may already be past being able to
+    // supply.
+    //
+    // A block is among them though it has one path: what a converting context has to reach is the
+    // expression the value comes from, and for a block that is its trailing expression.
+    if converts(want) && branching(e) then return analyze_value(cx, e, expected)
+
     // A `&T` written where a `&T` was wanted is already one; anything else is asked for a `T`.
     want match
         Ref(inner, _) ->
@@ -60,6 +71,27 @@ analyze_expected(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
 
     analyze_value(cx, e, expected)
 end analyze_expected
+
+// The conversions a **position** performs, which are the ones a branch has to perform for itself.
+private converts(want: Type) -> bool
+    if erased(want) then return true
+
+    want match
+        Ref(_, _) -> true
+        Weak(_) -> true
+        Slice(_, ro) -> ro
+        _ -> false
+end converts
+
+// Whether an expression yields its value through branches rather than producing one itself.
+private branching(e: Expr) -> bool = *e.kind match
+    IfExpr(_, _, _) -> true
+    MatchExpr(_, _) -> true
+    Block(_) -> true
+    While(_, _, _, _) -> true
+    DoWhile(_, _, _, _) -> true
+    For(_, _, _, _, _) -> true
+    _ -> false
 
 private address_of(e: Expr) -> bool = *e.kind match
     Unary(op, _) -> op == "&"
