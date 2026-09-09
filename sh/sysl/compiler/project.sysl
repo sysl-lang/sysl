@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.{Source, source_of}
 import sysl.buf.{Buf, buf}
-import sysl.fs.{entries, metadata, read_text}
+import sysl.fs.{current_dir, entries, metadata, read_text}
 import sysl.text.{split, Search}
 
 // Which files one invocation compiles, and which module each of them is in.
@@ -57,10 +57,45 @@ collect(root: string, os: Option[Os]) -> Result[Buf[Found], Selection]
 
     var out: Buf[Found] = buf()
 
-    walk_tree(root, buf(), os, None, &out)?
+    // **A TREE IS WALKED FROM AN ABSOLUTE ROOT, SO EVERY FILE IS NAMED FROM THE ROOT OF THE
+    // FILESYSTEM.** A file's name is written down -- into `__FILE__`, into a test's record of where
+    // it was declared, into a diagnostic -- and a relative one names a place only the directory the
+    // command happened to be run from can find. Naming a single file is the other case and keeps
+    // what the reader wrote, because there the path IS what they typed.
+    walk_tree(absolute_path(root), buf(), os, None, &out)?
 
     Ok(out)
 end collect
+
+// A path written from the root of the filesystem, with `.` and `..` resolved away.
+//
+// **Purely textual, and no symlink is followed.** What this is for is making a path independent of
+// *when* it is read; resolving symlinks would additionally make it independent of what the
+// filesystem does later, which is a different promise and not one a build makes on anybody's behalf.
+absolute_path(path: string) -> string
+    val rooted = if path.starts_with("/") then path
+    else current_dir() match
+        Err(_) -> return path
+        Ok(here) -> join_path(here, path)
+
+    var parts: Buf[string] = buf()
+    val segments = split(rooted, "/")
+
+    for i in 0..<segments.len
+        val part = segments[i]
+
+        if part == "" || part == "." then ()
+        else if part == ".."
+            if !parts.is_empty() then parts.truncate(parts.len() - 1)
+        else parts.push(part)
+
+    var out = ""
+
+    for i in 0..<parts.len()
+        out = s"$out/${parts.at(i)}"
+
+    if out == "" then "/" else out
+end absolute_path
 
 // Whether a path names a directory on this machine.
 is_directory(path: string) -> bool
