@@ -765,3 +765,142 @@ a_test_file_naming_its_own()
                         "tt()\n    val n = helper()\n")
 
     assert_eq(out.len(), usize(0), listed_of(out))
+
+// -- what a struct's invariant demands of the aliases a program makes ------------------------------
+
+private an_outer() -> string =
+    "struct Inner\n    n: int\nend Inner\n\n" +
+    "struct Outer\n    a: Inner\n    c: Inner\n    b: int\n\n    invariant a.n <= b\nend Outer\n\n"
+
+@test("a pointer into a struct whose invariant reads the field names no such struct, and is refused")
+an_address_that_severs_a_clause()
+    if checks_no_library() then return
+
+    val said = complaints_of(an_outer() + "use(o: *Outer) -> *Inner = &o.a\n")
+
+    assert(says(said, "'&' here makes a '*Inner' pointing inside Outer, whose invariant reads " +
+                "'a.n' — and a '*Inner' names no Outer, so a write through it would break the " +
+                "clause with nothing left to re-check it against. Take the address of the Outer " +
+                "itself, which keeps the invariant in its type, or make the change through a " +
+                "method"), listed_of(said))
+
+@test("and one into a field no clause mentions is left alone")
+an_address_no_clause_reaches()
+    if checks_no_library() then return
+
+    val said = complaints_of(an_outer() + "use(o: *Outer) -> *Inner = &o.c\n")
+
+    assert(said.is_empty(), listed_of(said))
+
+@test("a writable view of storage a clause reads is the same alias written longer")
+a_view_that_severs_a_clause()
+    if checks_no_library() then return
+
+    val text = "struct Held\n    items: [4]int\n    b: int\n\n    invariant items[0] <= b\nend Held\n\n" +
+        "use(h: *Held) -> []int = h.items[0..<2]\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "this view may be written, and it views storage inside Held, whose " +
+                "invariant reads 'items' — a '[]int' names no Held, so a write through it would " +
+                "break the clause with nothing left to re-check it against. Take it as a " +
+                "'[]const int', which may not write, or make the change through a method"),
+           listed_of(said))
+
+@test("and a read-only one carries no promise it could break")
+a_read_only_view_is_no_alias()
+    if checks_no_library() then return
+
+    val text = "struct Held\n    items: [4]int\n    b: int\n\n    invariant items[0] <= b\nend Held\n\n" +
+        "use(h: *Held) -> []const int = h.items[0..<2]\n"
+    val said = complaints_of(text)
+
+    assert(said.is_empty(), listed_of(said))
+
+@test("'&' of a field inside a '@packed' struct promises an alignment the offset need not have")
+an_address_into_a_packed_struct()
+    if checks_no_library() then return
+
+    val text = "@packed\nstruct P\n    a: byte\n    b: uint\nend P\n\n" +
+        "use(p: *P) -> *uint = &p.b\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "'&' here makes a '*uint' into P, which is '@packed' — its fields sit at " +
+                "their declared offsets, so this one need not be on a 'uint' boundary, and every " +
+                "use of a '*uint' is entitled to assume that it is. Read or write the field " +
+                "through the struct, which is where the offset is known, or take the address of " +
+                "the P itself"), listed_of(said))
+
+@test("and the same field read or written through the struct is where the offset is known")
+a_packed_field_read_through_the_struct()
+    if checks_no_library() then return
+
+    val text = "@packed\nstruct P\n    a: byte\n    b: uint\nend P\n\n" +
+        "use(p: *P) -> uint = p.b\n"
+    val said = complaints_of(text)
+
+    assert(said.is_empty(), listed_of(said))
+
+@test("a struct holding a register carries no invariant, since a check reads every field")
+an_invariant_beside_a_register()
+    if checks_no_library() then return
+
+    val text = "struct Dev\n    ctl: volatile uint\n    shadow: int\n\n    invariant shadow >= 0\nend Dev\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "'Dev' holds the register 'ctl', so it carries no invariant — a check reads " +
+                "every field of the struct, so one written over the ordinary fields beside a " +
+                "register would make writing them an access to the device. And a device changes a " +
+                "register between the check and the instruction after it, which is what no clause " +
+                "could hold. Check a register where it is read"), listed_of(said))
+
+@test("and the same struct without the clause is an ordinary block of registers")
+a_register_with_no_invariant()
+    if checks_no_library() then return
+
+    val said = complaints_of("struct Dev\n    ctl: volatile uint\n    shadow: int\nend Dev\n")
+
+    assert(said.is_empty(), listed_of(said))
+
+@test("an invariant may only read storage the struct owns, so a read through a pointer is refused")
+an_invariant_reading_through_a_pointer()
+    if checks_no_library() then return
+
+    val text = "struct Cell\n    v: int\nend Cell\n\n" +
+        "struct Held\n    p: *Cell\n    b: int\n\n    invariant p.v <= b\nend Held\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "an invariant may only read storage the struct owns, and 'v' is read " +
+                "through *Cell — what is on the far side has an identity of its own, so another " +
+                "alias of it could break the clause with nothing left to re-check it against. " +
+                "Hold the value in a field of the struct, and state the invariant over that"),
+           listed_of(said))
+
+@test("and an element of a view is somebody else's storage by the same rule")
+an_invariant_reading_through_a_view()
+    if checks_no_library() then return
+
+    val text = "struct Held\n    xs: []int\n    b: int\n\n    invariant xs[0] <= b\nend Held\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "an invariant may only read storage the struct owns, and an element is read " +
+                "through []int — what is on the far side has an identity of its own, so another " +
+                "alias of it could break the clause with nothing left to re-check it against. " +
+                "Hold the value in a field of the struct, and state the invariant over that"),
+           listed_of(said))
+
+@test("while an element of an array the struct owns is the struct's own storage")
+an_invariant_reading_an_owned_element()
+    if checks_no_library() then return
+
+    val text = "struct Held\n    xs: [4]int\n    b: int\n\n    invariant xs[0] <= b\nend Held\n"
+    val said = complaints_of(text)
+
+    assert(said.is_empty(), listed_of(said))
+
+@test("a generic struct's clause is written once and every instantiation would need its own")
+an_invariant_on_a_generic_struct()
+    if checks_no_library() then return
+
+    val said = complaints_of("struct Box[T]\n    a: int\n    v: T\n\n    invariant a >= 0\nend Box\n")
+
+    assert(says(said, "invariants on generic structs are not supported yet — 'Box'"), listed_of(said))

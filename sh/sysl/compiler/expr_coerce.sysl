@@ -161,7 +161,7 @@ coerce(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
                               s"'[]${type_show(*want)}' of your own, or take the parameter as " +
                               s"'[]const ${type_show(*want)}' if it is only read")
 
-            array_view(t, *want, read_only).unwrap_or(t)
+            array_view(cx, t, *want, read_only).unwrap_or(t)
         Vector(_, elem) ->
             if type_eq(repr(got), repr(*elem)) then TExpr(t.span, TSplat(t, expected)) else t
         _ -> t
@@ -172,13 +172,19 @@ end coerce
 // It is exactly what `a[..]` builds: a view of read-only storage is read-only, and one asked for as
 // `[]const T` is made read-only rather than made writable and then given up. A **heap** array
 // converts on the same terms as a frame one, and the reference is what the view is built over.
-private array_view(t: TExpr, want: Type, read_only: bool) -> Option[TExpr]
+private array_view(cx: &Analyzer, t: TExpr, want: Type, read_only: bool) -> Option[TExpr]
     val elem = array_elem(texpr_type(t))
 
     if elem.is_none() then return None
     if !type_eq(elem.unwrap(), want) then return None
 
-    Some(TExpr(t.span, TSlice(t, None, None, true, Slice(want, read_only))))
+    val view = Slice(want, read_only)
+
+    // A view that may be written is an alias like any other, and the array it is taken of may sit
+    // inside a struct whose invariant reads it.
+    check_sliceable(cx, t.span, t, view)
+
+    Some(TExpr(t.span, TSlice(t, None, None, true, view)))
 end array_view
 
 private array_elem(t: Type) -> Option[Type] = t match
