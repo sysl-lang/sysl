@@ -436,29 +436,43 @@ provisional_of(cx: &Analyzer, scope: Scope, tparams: Buf[string], params: Buf[Pa
         again = false
 
         var later: Buf[usize] = buf()
+        var ready: Buf[usize] = buf()
+        var wants: Buf[Type] = buf()
 
+        // **A ROUND SETTLES WHO IS IN IT BEFORE IT READS ANY OF THEM.** Reading one callable
+        // settles type parameters, and letting that carry a later argument into the same round
+        // would make the order the closures are lowered in depend on where in the list the settling
+        // argument happened to sit. The number inside a closure's name is that order, so it is not
+        // a detail: it is part of the symbol. An argument ready at the start of a round has nothing
+        // unsolved in what it takes, so reading it against what the round started with loses
+        // nothing.
         for i in 0..<pending.len()
             val at = pending.at(i)
             val want = held_want(cx, scope, params.at(at).typ, tparams, bounds, sub)
 
             if want.is_none() then later.push(at)
             else
-                val t = type_expr(cx, slots.at(at).unwrap(), want)
+                ready.push(at)
+                wants.push(want.unwrap())
 
-                kept.set(at, Some(t))
-                tys.set(at, texpr_type(t))
-                unify(cx.an, scope, param_refs.at(at), texpr_type(t), tparams, &sub)
+        for i in 0..<ready.len()
+            val at = ready.at(i)
+            val t = type_expr(cx, slots.at(at).unwrap(), Some(wants.at(i)))
 
-                // **What a callable yields is read back off it**, which is the other half of a call
-                // handing one an open result: the parameter is now the closure's own struct, and
-                // that struct implements the call trait its body determined -- so the bound's
-                // arguments, written in the declaration's terms, are matched against the ones the
-                // closure turned out to have. Without it a parameter named only by an arrow's
-                // result stays unknown, and the next arrow is told nothing says what it takes by a
-                // call whose previous argument had just said so.
-                solve_from_callables(cx.an, scope, tparams, bounds, &sub)
+            kept.set(at, Some(t))
+            tys.set(at, texpr_type(t))
+            unify(cx.an, scope, param_refs.at(at), texpr_type(t), tparams, &sub)
 
-                again = true
+            // **What a callable yields is read back off it**, which is the other half of a call
+            // handing one an open result: the parameter is now the closure's own struct, and that
+            // struct implements the call trait its body determined -- so the bound's arguments,
+            // written in the declaration's terms, are matched against the ones the closure turned
+            // out to have. Without it a parameter named only by an arrow's result stays unknown,
+            // and the next arrow is told nothing says what it takes by a call whose previous
+            // argument had just said so.
+            solve_from_callables(cx.an, scope, tparams, bounds, &sub)
+
+            again = true
 
         pending = later
 
