@@ -1,0 +1,318 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.{Source, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, metadata, read_text}
+import sysl.text.{split, Search}
+
+// Which files one invocation compiles, and which module each of them is in.
+//
+// **A module is a directory**, so where a file sits is half of what says which module it belongs
+// to and the header is the other half. The walk below is what reads the first half: every file
+// carries the segments it was found under, and the declaration pass holds its header to them.
+//
+// Pointing at a **directory** makes it the root and takes the whole tree beneath it. Naming a
+// single **file** takes that file alone, as the root module with nothing else in it -- which is
+// what makes `sysl emit-typed hello.sysl` free of ceremony.
+
+// A file, and the module directories it was found under.
+struct Found
+    src: Source
+
+    // The path down to the file from the root, without the file's own name. Empty for a file of
+    // the root module, and for a file named on its own.
+    dir: Buf[string]
+end Found
+
+// A directory whose name selects for a machine rather than naming a module, read wrong.
+//
+// **It travels rather than being reported where it is found**, because a walk that quietly took
+// nothing from a misspelled `__linx__` would drop half a tree with nothing said -- which is the one
+// failure this whole axis has.
+struct Selection
+    message: string
+end Selection
+
+// The directory holding the root's examples, which a build never compiles.
+val ExamplesDir: string = "examples"
+
+// Where a project keeps the packages it vendored, which the walk is not to read as modules.
+val VendorDir: string = "vendor"
+
+// The source files one invocation compiles.
+//
+// `os` is which operating system's per-OS directories to take. It has **no default** on purpose: a
+// walk that guessed would drop half a tree with nothing said. `None` takes every one of them, which
+// is what a command that renders a tree rather than compiling it wants.
+collect(root: string, os: Option[Os]) -> Result[Buf[Found], Selection]
+    if !is_directory(root)
+        var one: Buf[Found] = buf()
+
+        read_text(root) match
+            Err(_) -> return Err(Selection(s"cannot read $root"))
+            Ok(text) -> one.push(Found(source_of(root, text), buf()))
+
+        return Ok(one)
+    end if
+
+    var out: Buf[Found] = buf()
+
+    walk_tree(root, buf(), os, None, &out)?
+
+    Ok(out)
+end collect
+
+// Whether a path names a directory on this machine.
+is_directory(path: string) -> bool
+    metadata(path) match
+        Err(_) -> false
+        Ok(meta) -> meta.is_dir()
+end is_directory
+
+// One directory of the project: its own sysl files, then the sub-directories under it. A directory
+// holding no source is not a module and contributes nothing; it is still walked, since modules
+// further down are reached through it.
+private walk_tree(path: string, dir: Buf[string], os: Option[Os], within: Option[string],
+                  out: *Buf[Found]) -> Result[unit, Selection]
+    val here = contents(path, os, within)?
+
+    for i in 0..<here.files.len()
+        val file = here.files.at(i)
+
+        if is_sysl_file(file)
+            read_text(file) match
+                Err(_) -> ()
+                Ok(text) -> out.push(Found(source_of(file, text), dir))
+        end if
+
+    for i in 0..<here.subs.len()
+        val sub = here.subs.at(i)
+
+        if !skipped_at_root(dir, sub.0)
+            var below = dir
+
+            below.push(basename(sub.0))
+            walk_tree(sub.0, below, os, sub.1, out)?
+        end if
+
+    Ok(())
+end walk_tree
+
+// The root's `examples/` and `vendor/` are left out, and the `dir.is_empty()` test is what makes it
+// the *root's* one: everywhere else the name is ordinary.
+private skipped_at_root(dir: Buf[string], sub: string) -> bool
+    if !dir.is_empty() then return false
+
+    val name = basename(sub)
+
+    name == ExamplesDir || name == VendorDir
+end skipped_at_root
+
+// One directory's contents with per-OS selection already folded in: the files that belong to it,
+// and the sub-directories below it paired with whichever `__<os>__` directory each is inside.
+//
+// **The folder disappears**, which is exactly what a selector does: a directory's files are its own
+// plus the selected child's, and its sub-directories are its own plus that child's.
+struct Contents
+    files: Buf[string]
+    subs: Buf[(string, Option[string])]
+end Contents
+
+private contents(path: string, os: Option[Os], within: Option[string]) -> Result[Contents, Selection]
+    val names = entries(path).unwrap_or(buf())
+    var sorted = sort_names(names)
+
+    var files: Buf[string] = buf()
+    var plain: Buf[(string, Option[string])] = buf()
+    var selectors: Buf[string] = buf()
+
+    for i in 0..<sorted.len()
+        val full = join_path(path, sorted.at(i))
+
+        if !is_directory(full)
+            files.push(full)
+        else if marked(sorted.at(i))
+            selectors.push(full)
+        else
+            plain.push((full, within))
+
+    // Every selector is read, not only the ones this target takes -- a misspelling in the Linux half
+    // is a mistake a macOS build reports, exactly as a condition on a branch nobody takes is read.
+    var taken: Buf[string] = buf()
+
+    for i in 0..<selectors.len()
+        val named = selects(basename(selectors.at(i)), within)?
+
+        if os.is_none() || names_the_machine(named, os.unwrap())
+            taken.push(selectors.at(i))
+
+    var nested_files: Buf[string] = buf()
+
+    for i in 0..<taken.len()
+        val inner = contents(taken.at(i), os, Some(basename(taken.at(i))))?
+
+        for j in 0..<inner.files.len()
+            nested_files.push(inner.files.at(j))
+
+        for j in 0..<inner.subs.len()
+            plain.push(inner.subs.at(j))
+
+    // **Two selectors that both answer, each holding a file of the same name.** A selector may name
+    // a family, so `__posix__` and `__macos__` are both true on macOS -- and what two of them
+    // holding one name produces is a duplicate symbol reported a long way from the cause.
+    if os.is_some() && taken.len() > 1
+        collided(nested_files)?
+
+    for i in 0..<nested_files.len()
+        files.push(nested_files.at(i))
+
+    Ok(Contents(files, plain))
+end contents
+
+private names_the_machine(named: Buf[string], os: Os) -> bool
+    val defined = os_defined(os)
+
+    for i in 0..<named.len()
+        for j in 0..<defined.len()
+            if named.at(i) == defined.at(j) then return true
+
+    false
+end names_the_machine
+
+// The name a collision is reported under: two selected directories holding one file name.
+private collided(nested: Buf[string]) -> Result[unit, Selection]
+    for i in 0..<nested.len()
+        for j in (i + 1)..<nested.len()
+            if basename(nested.at(i)) == basename(nested.at(j))
+                val a = basename(parent_of(nested.at(i)).unwrap_or(nested.at(i)))
+                val b = basename(parent_of(nested.at(j)).unwrap_or(nested.at(j)))
+                val both = if a < b then s"'$a' and '$b'" else s"'$b' and '$a'"
+
+                return Err(Selection(s"'${basename(nested.at(i))}' is in more than one directory " +
+                    s"that selects source for this machine -- $both. A selector may name a family, " +
+                    "so two of them can answer at once and both files would be taken. Give them " +
+                    "different names, or name the machines so that at most one matches"))
+
+    Ok(())
+end collided
+
+// Whether a directory's name has the shape that says *this selects rather than names*.
+//
+// The shape is matched before the spelling, so that a name which was **meant** to select and is
+// misspelled is an error rather than an ordinary directory.
+private marked(name: string) -> bool =
+    name.len > 4 && name.starts_with("__") && name.ends_with("__")
+
+// Which machines a selector directory names, or the mistake it is.
+//
+// A selector names one or more symbols separated by commas and is taken when **any** of them holds
+// for the target, which is `#if`'s rule with `#if`'s vocabulary.
+private selects(name: string, within: Option[string]) -> Result[Buf[string], Selection]
+    if within.is_some()
+        return Err(Selection(s"'$name' sits inside '${within.unwrap()}', and both select source " +
+            "for a machine -- an unselected directory is never read, so nothing inside one could " +
+            "ever be taken. Write them beside each other, or use '#if' inside a sysl file or the C " +
+            "preprocessor inside a '.c'"))
+
+    val inner = name[2..<(name.len - 2)]
+    var written: Buf[string] = buf()
+    val allowed = directory_symbols()
+
+    for piece in split(inner, ",")
+        val symbol = trimmed(piece)
+        var known = false
+
+        for i in 0..<allowed.len()
+            if allowed.at(i) == symbol then known = true
+
+        if !known
+            return Err(Selection(s"'$symbol', in the directory '$name', names no machine this " +
+                "compiler selects source for. A selector names operating systems and the two facts " +
+                "that hold without naming one, separated by commas: " +
+                s"${listed(sort_names(allowed))}. A processor is not among them -- that is what " +
+                "'#if' is for"))
+
+        written.push(symbol)
+
+    Ok(written)
+end selects
+
+private listed(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + ", "
+
+        out = out + names.at(i)
+
+    out
+end listed
+
+private trimmed(text: string) -> string
+    var lo: usize = 0
+    var hi = text.bytes.len
+
+    while lo < hi && text.bytes[lo] == u8(' ')
+        lo += 1
+
+    while hi > lo && text.bytes[hi - 1] == u8(' ')
+        hi -= 1
+
+    text[lo..<hi]
+end trimmed
+
+// The two suffixes a program may be written under: the ordinary one, and the literate one whose
+// program is the indented part of a Markdown document.
+is_sysl_file(path: string) -> bool = path.ends_with(".sysl") || path.ends_with(".lsysl")
+
+// The last segment of a path, whichever separator wrote it.
+basename(path: string) -> string
+    var cut = path.bytes.len
+
+    for i in 0..<path.bytes.len
+        if path.bytes[i] == u8('/') || path.bytes[i] == u8('\\') then cut = i + 1
+
+    path[cut..]
+end basename
+
+// The directory a path sits in, or nothing where it names no directory above it.
+parent_of(path: string) -> Option[string]
+    var cut: usize = 0
+    var seen = false
+
+    for i in 0..<path.bytes.len
+        if path.bytes[i] == u8('/') || path.bytes[i] == u8('\\')
+            cut = i
+            seen = true
+
+    if !seen then return None
+
+    if cut == 0 then Some("/") else Some(path[0..<cut])
+end parent_of
+
+// A path and one more segment, without doubling the separator.
+join_path(dir: string, name: string) -> string =
+    if dir == "" then name
+    else if dir.ends_with("/") then dir + name
+    else s"$dir/$name"
+
+// The names a directory listed, in an order that does not depend on the filesystem's.
+//
+// **A listing arrives in whatever order the filesystem keeps it**, which is neither sorted nor
+// stable between two listings of one directory -- so what a compilation sees would otherwise depend
+// on something nobody wrote down.
+sort_names(names: Buf[string]) -> Buf[string]
+    var out = names
+
+    for i in 1..<out.len()
+        var j = i
+
+        while j > 0 && out.at(j) < out.at(j - 1)
+            val held = out.at(j)
+
+            out.set(j, out.at(j - 1))
+            out.set(j - 1, held)
+            j -= 1
+
+    out
+end sort_names

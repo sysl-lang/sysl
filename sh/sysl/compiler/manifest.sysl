@@ -1,0 +1,325 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{cache_dir, read_text}
+import sysl.text.{split, Search}
+
+// `package.hocon` -- what a project says about itself before a line of it is read.
+//
+// **Everything here is a statement about the PROJECT rather than about a line somebody wrote**,
+// which is why none of it is a diagnostic: there is no source position to point at, and a build
+// that cannot mean anything should stop before it parses a file. What the manifest decides is which
+// machine, which packages, and whether this compiler is new enough to be reading it at all.
+
+// The one name the driver looks for.
+val ManifestName: string = "package.hocon"
+
+// A dependency, as the manifest wrote it.
+struct Dependency
+    // What the file called it, which is the leading segment of the module paths it mounts.
+    label: string
+
+    // Where it comes from, without a scheme: `github.com/sysl-lang/parsing`.
+    git: string
+
+    // The release wanted, without a leading `v`.
+    version: string
+end Dependency
+
+// What a manifest says, of the parts that decide what is compiled.
+struct Manifest
+    name: string
+    version: string
+
+    // The oldest compiler this package builds with, or the empty string where it said nothing.
+    floor: string
+
+    // The machine to build for where the command line names none.
+    default_target: string
+
+    // What the package cannot be built without, asked of the machine it is built for.
+    requires: Buf[string]
+
+    dependencies: Buf[Dependency]
+
+    // A key this compiler does not understand is said out loud and then ignored, once per key.
+    warnings: Buf[string]
+end Manifest
+
+// A project that said nothing, which is what a missing file means.
+empty_manifest() -> Manifest = Manifest("", "", "", "", buf(), buf(), buf())
+
+// The manifest a directory carries, or the empty one where it carries none.
+manifest_at(root: string) -> Result[Manifest, Refusal]
+    val file = join_path(root, ManifestName)
+
+    read_text(file) match
+        Err(_) -> Ok(empty_manifest())
+        Ok(text) -> read_manifest(text) match
+            Err(why) -> Err(Refusal(s"$ManifestName: $why"))
+            Ok(m) -> Ok(m)
+end manifest_at
+
+// What one invocation is missing, asked of the machine it is being built for.
+//
+// **A capability a target does not name is provided.** The compiler's prior is that a machine can do
+// everything -- that is what every target did before there was a file to say otherwise -- so what is
+// checked here is only what the project said it needs.
+unmet_requirement(m: Manifest, t: Target) -> Option[string]
+    val given = target_provides(t)
+    var missing: Buf[string] = buf()
+
+    for i in 0..<m.requires.len()
+        var found = false
+
+        for j in 0..<given.len()
+            if given.at(j) == m.requires.at(i) then found = true
+
+        if !found then missing.push(m.requires.at(i))
+
+    if missing.is_empty() then return None
+
+    val sorted = sort_names(missing)
+
+    Some(s"this package requires '${sorted.at(0)}', and '${t.name}' does not provide it")
+end unmet_requirement
+
+// The capabilities a machine has. A hosted system has all of them; a freestanding one has none of
+// the three an operating system supplies.
+private target_provides(t: Target) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("heap")
+
+    if os_hosted(t.os)
+        out.push("os")
+        out.push("threads")
+        out.push("float")
+    else
+        out.push("float")
+
+    out
+end target_provides
+
+// Refuses a project whose manifest asks for a compiler newer than the one in hand.
+//
+// **The whole of what the field buys is this sentence.** A package that uses something the language
+// grew builds or does not depending on what the consumer happens to have installed, and when it does
+// not, the diagnostic points at a line inside somebody else's package with nothing to say the
+// compiler is the problem.
+check_floor(who: string, floor: string, compiler: string) -> Option[string]
+    if floor == "" then return None
+
+    if !older(compiler, floor) then return None
+
+    Some(s"$who cannot be built because it requires sysl $floor or newer, while the compiler in " +
+        s"hand is $compiler")
+end check_floor
+
+// Whether one release came before another, compared a number at a time. A pre-release suffix is cut
+// away first: `0.0.66-fcf4e33a` is dev heading for 0.0.66 and has everything 0.0.65 shipped.
+older(a: string, b: string) -> bool
+    val left = numbers_of(a)
+    val right = numbers_of(b)
+    var i: usize = 0
+
+    while i < left.len() || i < right.len()
+        val x = if i < left.len() then left.at(i) else 0
+        val y = if i < right.len() then right.at(i) else 0
+
+        if x != y then return x < y
+
+        i += 1
+
+    false
+end older
+
+private numbers_of(text: string) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    var held: usize = 0
+    var any = false
+
+    for i in 0..<text.bytes.len
+        val c = text.bytes[i]
+
+        if c == u8('-') then break
+
+        if c >= u8('0') && c <= u8('9')
+            held = held * 10 + usize(c - u8('0'))
+            any = true
+        else if c == u8('.')
+            out.push(held)
+            held = 0
+            any = false
+
+    if any || !out.is_empty() then out.push(held)
+
+    out
+end numbers_of
+
+// Where a fetched package lives on this machine.
+//
+// **Under the cache rather than in the project**, because a package at a version is the same bytes
+// for every project on the machine and the alternative is one copy each. A project that vendored its
+// packages holds them itself, and that answer comes first -- vendoring is for a build that must not
+// depend on a cache being warm.
+package_cache_root(project_root: string) -> Result[string, string]
+    val vendored = join_path(project_root, VendorDir)
+
+    if project_root != "" && is_directory(vendored) then return Ok(vendored)
+
+    cache_dir() match
+        None -> Err("cannot find a cache directory to fetch packages into -- set XDG_CACHE_HOME, " +
+            "or vendor the dependencies so that nothing has to be fetched")
+        Some(dir) -> Ok(s"$dir/sysl/pkg")
+end package_cache_root
+
+// Where this coordinate at this version sits, fetched or not.
+package_directory(cache: string, coordinate: string, version: string) -> string =
+    s"$cache/$coordinate/@v$version"
+
+// The trees of every package this project depends on, read off disk.
+//
+// **Nothing here reaches the network.** A dependency that is not on this machine is a refusal that
+// names the command which would bring it down, rather than a fetch nobody asked for -- the same
+// ruling `build-lib` makes for the same reason.
+package_units(root: string, m: Manifest, t: Target) -> Result[Buf[Program], Refusal]
+    var out: Buf[Program] = buf()
+
+    if m.dependencies.is_empty() then return Ok(out)
+
+    val cache = package_cache_root(root) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(dir) -> dir
+
+    for i in 0..<m.dependencies.len()
+        val dep = m.dependencies.at(i)
+        val dir = package_directory(cache, dep.git, dep.version)
+
+        if !is_directory(dir)
+            return Err(Refusal(s"'${dep.git}' ${dep.version} is not on this machine -- it should " +
+                s"be at $dir. Run 'sysl vendor' or a command that fetches, and try again"))
+
+        val found = collect(dir, Some(t.os)) match
+            Err(e) -> return Err(Refusal(e.message))
+            Ok(f) -> f
+
+        if found.is_empty()
+            return Err(Refusal(s"'${dep.git}' holds no sysl source files"))
+
+        for j in 0..<found.len()
+            val parsed = parse(found.at(j).src, t)
+
+            if !parsed.ok()
+                return Err(Refusal(s"${found.at(j).src.name}:${parsed.at()}: " +
+                    s"${parsed.first().message}"))
+
+            if !parsed.program.test_only then out.push(parsed.program)
+
+    Ok(out)
+end package_units
+
+// The manifest itself, read out of the notation.
+//
+// **Read off the parsed tree rather than through dotted-path getters**, which split on `.` without
+// regard for quoting: `targets.aarch64-kernel` would resolve and `targets."a.b"` would not, and a
+// target whose name carried a dot would be looked for in a nesting nobody wrote.
+read_manifest(text: string) -> Result[Manifest, string]
+    val root = read_conf(text)?
+    var name = ""
+    var version = ""
+    var floor = ""
+    var warnings: Buf[string] = buf()
+
+    conf_at(root, "package") match
+        None -> ()
+        Some(pkg) ->
+            name = conf_text(pkg, "name")
+            version = conf_text(pkg, "version")
+            floor = conf_text(pkg, "sysl")
+
+            val keys = conf_keys(pkg)
+
+            for i in 0..<keys.len()
+                if !known_package_key(keys.at(i))
+                    warnings.push(s"$ManifestName: 'package.${keys.at(i)}' is not a key this " +
+                        "compiler understands, so it was ignored")
+
+    if name != "" && !valid_package_name(name)
+        return Err(s"'package.name' is '$name', which is not a name a package may have -- a name " +
+            "is a letter followed by letters, digits, '_' and '-'")
+
+    val default_target = conf_at(root, "targets") match
+        None -> ""
+        Some(block) -> conf_text(block, "default")
+
+    val requires = conf_at(root, "requires") match
+        None -> buf()
+        Some(block) -> conf_flags_set(block)
+
+    val dependencies = read_dependencies(root, "dependencies")?
+
+    val keys = conf_keys(root)
+
+    for i in 0..<keys.len()
+        if !known_top_key(keys.at(i))
+            warnings.push(s"$ManifestName: '${keys.at(i)}' is not a key this compiler understands, " +
+                "so it was ignored")
+
+    Ok(Manifest(name, version, floor, default_target, requires, dependencies, warnings))
+end read_manifest
+
+private read_dependencies(root: &Conf, key: string) -> Result[Buf[Dependency], string]
+    var out: Buf[Dependency] = buf()
+
+    conf_at(root, key) match
+        None -> return Ok(out)
+        Some(block) ->
+            val labels = conf_keys(block)
+
+            for i in 0..<labels.len()
+                val entry = conf_at(block, labels.at(i)).unwrap()
+                val git = conf_text(entry, "git")
+                val version = conf_text(entry, "version")
+
+                if git == ""
+                    return Err(s"'$key.${labels.at(i)}' names no 'git' coordinate, which is the " +
+                        "only way a package says where it comes from")
+
+                if version == ""
+                    return Err(s"'$key.${labels.at(i)}' names no 'version', so nothing says which " +
+                        "release of it this project was written against")
+
+                out.push(Dependency(labels.at(i), git, version))
+
+    Ok(out)
+end read_dependencies
+
+// Whether a name is one a package may have. It reaches a command line and a file path, so it must
+// be tellable from a directory by looking.
+valid_package_name(name: string) -> bool
+    if name == "" then return false
+
+    val first = name.bytes[0]
+
+    if !((first >= u8('a') && first <= u8('z')) || (first >= u8('A') && first <= u8('Z')))
+        return false
+
+    for i in 0..<name.bytes.len
+        val c = name.bytes[i]
+
+        if !((c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) ||
+             (c >= u8('0') && c <= u8('9')) || c == u8('_') || c == u8('-'))
+            return false
+
+    true
+end valid_package_name
+
+private known_package_key(key: string) -> bool =
+    key == "name" || key == "version" || key == "sysl" || key == "description" ||
+    key == "license" || key == "authors" || key == "repository" || key == "keywords"
+
+private known_top_key(key: string) -> bool =
+    key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
+    key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
+    key == "links"

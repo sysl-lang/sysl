@@ -33,6 +33,7 @@ run_cli(args: []string, say: string -> unit) -> int
             say(usage())
             Fine
         "emit-ast" -> emit_ast_command(args, say)
+        "emit-typed" -> emit_typed_command(args, say)
         other ->
             say(s"sysl: `${other}` is not a command this compiler can carry out yet")
             say(usage())
@@ -78,7 +79,64 @@ private emit_ast_command(args: []string, say: string -> unit) -> int
             Fine
 end emit_ast_command
 
-usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <file>"
+// `sysl emit-typed [--no-spans] [--tables] [--target <name>] <path>` -- one whole program's typed
+// tree, or its declaration tables.
+//
+// **The path is a program and not a file.** A directory is the project root and everything below it
+// is compiled; a single file is compiled alone, as the root module. Either way the standard module
+// is read from source and analyzed with the program, so a free `print` and an `Option` mean what the
+// library says they mean.
+private emit_typed_command(args: []string, say: string -> unit) -> int
+    var tables = false
+    var named: Option[string] = None
+    var file = ""
+    var i: usize = 2
+
+    while i < args.len
+        if args[i] == "--tables"
+            tables = true
+        else if args[i] == "--no-spans"
+            // The typed tree carries no spans yet, so the flag is taken and changes nothing. It is
+            // accepted rather than refused because the whole point of this command is that two
+            // compilers answer one command line.
+            tables = tables
+        else if args[i] == "--target"
+            if i + 1 >= args.len
+                say("usage: sysl emit-typed [--no-spans] [--tables] [--target <name>] <path>")
+                return Misused
+            end if
+
+            i += 1
+            named = Some(args[i])
+        else
+            file = args[i]
+
+        i += 1
+
+    if file == ""
+        say("usage: sysl emit-typed [--no-spans] [--tables] [--target <name>] <path>")
+        return Misused
+    end if
+
+    emit_typed_text(file, named, tables) match
+        Err(refusal) ->
+            say(s"error: ${refusal.message}")
+            Failed
+        Ok(emitted) ->
+            // An analysis error is reported exactly as any other compiling command reports one,
+            // with nothing on standard output.
+            if !emitted.report.is_empty()
+                say(analysis_report(emitted.report))
+                return Failed
+            end if
+
+            say(if emitted.text.ends_with("\n") then emitted.text[0..<(emitted.text.len - 1)]
+                else emitted.text)
+            Fine
+end emit_typed_command
+
+usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <file> | " +
+    "emit-typed [--no-spans] [--tables] [--target <name>] <path>"
 
 main(args: []string)
     val code = run_cli(args, line -> print(line))

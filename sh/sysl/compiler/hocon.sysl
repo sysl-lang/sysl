@@ -1,0 +1,276 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, Search}
+
+// The manifest's notation, read far enough to answer what a build asks of it.
+//
+// **A manifest is configuration and not a program**, so this is a reader rather than a parser: it
+// takes text to a tree of blocks, strings and flags, and everything about what a key *means* is in
+// `manifest.sysl` where a test can ask it directly. A key this compiler does not understand is
+// carried through and reported by the caller rather than refused, because a manifest written for a
+// newer compiler must still build with an older one wherever the parts it uses are understood.
+
+// What a value in a manifest can be.
+enum Conf
+    // A nested block, as a list of pairs -- in the order the file wrote them, since a warning about
+    // an unknown key reads better in the reader's own order.
+    Block(pairs: Buf[(string, &Conf)])
+    Text(value: string)
+    Flag(on: bool)
+end Conf
+
+// The block a whole file is.
+read_conf(text: string) -> Result[&Conf, string]
+    var at: usize = 0
+    val out = read_block(text, &at, true)?
+
+    skip_blank(text, &at)
+
+    if at < text.bytes.len
+        return Err(s"unexpected '${one_char(text, at)}' after the last entry")
+
+    Ok(out)
+end read_conf
+
+// One block's entries, up to its closing brace or to the end of the file.
+private read_block(text: string, at: *usize, top: bool) -> Result[&Conf, string]
+    var pairs: Buf[(string, &Conf)] = buf()
+
+    loop
+        skip_blank(text, at)
+
+        if *at >= text.bytes.len
+            if top then break
+
+            return Err("a block was opened and never closed")
+        end if
+
+        if text.bytes[*at] == u8('}')
+            if top then return Err("a '}' closes a block that was never opened")
+
+            *at += 1
+            break
+        end if
+
+        if text.bytes[*at] == u8(',')
+            *at += 1
+            continue
+        end if
+
+        val key = read_key(text, at)?
+
+        skip_blank(text, at)
+
+        if *at >= text.bytes.len then return Err(s"'$key' names nothing")
+
+        if text.bytes[*at] == u8('{')
+            *at += 1
+            pairs.push((key, read_block(text, at, false)?))
+            continue
+        end if
+
+        if text.bytes[*at] != u8('=') && text.bytes[*at] != u8(':')
+            return Err(s"'$key' is followed by '${one_char(text, *at)}' rather than '=' or a block")
+        end if
+
+        *at += 1
+        skip_blank(text, at)
+
+        if *at < text.bytes.len && text.bytes[*at] == u8('{')
+            *at += 1
+            pairs.push((key, read_block(text, at, false)?))
+            continue
+        end if
+
+        pairs.push((key, read_value(text, at)?))
+
+    Ok(Block(pairs))
+end read_block
+
+// A key: quoted where it holds anything unusual, and bare otherwise. A bare key runs to the first
+// character that could not be part of one, which is what lets `a.b = 1` and `a { b = 1 }` be
+// written for the same thing.
+private read_key(text: string, at: *usize) -> Result[string, string]
+    if text.bytes[*at] == u8('"') then return read_quoted(text, at)
+
+    val start = *at
+
+    while *at < text.bytes.len && bare_key_char(text.bytes[*at])
+        *at += 1
+
+    if *at == start then return Err(s"'${one_char(text, *at)}' cannot begin a key")
+
+    Ok(text[start..<*at])
+end read_key
+
+private bare_key_char(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) ||
+    (c >= u8('0') && c <= u8('9')) || c == u8('_') || c == u8('-') || c == u8('.') || c == u8('+')
+
+// A value: a quoted string, `true`, `false`, or a bare word running to the end of its line.
+private read_value(text: string, at: *usize) -> Result[&Conf, string]
+    if *at >= text.bytes.len then return Err("a value was expected")
+
+    if text.bytes[*at] == u8('"') then return Ok(Text(read_quoted(text, at)?))
+
+    if text.bytes[*at] == u8('[')
+        skip_list(text, at)?
+
+        return Ok(Text(""))
+    end if
+
+    val start = *at
+
+    while *at < text.bytes.len && text.bytes[*at] != u8('\n') && text.bytes[*at] != u8(',') &&
+          text.bytes[*at] != u8('}')
+        *at += 1
+
+    val raw = trimmed_value(text[start..<*at])
+
+    if raw == "true" then Ok(Flag(true))
+    else if raw == "false" then Ok(Flag(false))
+    else Ok(Text(raw))
+end read_value
+
+// A list is read past rather than read: nothing the driver asks about is one, and a reader that
+// refused what it does not use would fail a manifest whose other half it understands.
+private skip_list(text: string, at: *usize) -> Result[unit, string]
+    var depth: usize = 0
+
+    while *at < text.bytes.len
+        if text.bytes[*at] == u8('[') then depth += 1
+        else if text.bytes[*at] == u8(']')
+            depth -= 1
+            *at += 1
+
+            if depth == 0 then return Ok(())
+
+            continue
+        end if
+
+        *at += 1
+
+    Err("a '[' was opened and never closed")
+end skip_list
+
+private trimmed_value(text: string) -> string
+    var lo: usize = 0
+    var hi = text.bytes.len
+
+    while lo < hi && space(text.bytes[lo])
+        lo += 1
+
+    while hi > lo && space(text.bytes[hi - 1])
+        hi -= 1
+
+    text[lo..<hi]
+end trimmed_value
+
+private space(c: u8) -> bool = c == u8(' ') || c == u8('\t') || c == u8('\r')
+
+private read_quoted(text: string, at: *usize) -> Result[string, string]
+    var out = str_builder()
+
+    *at += 1
+
+    while *at < text.bytes.len
+        val c = text.bytes[*at]
+
+        if c == u8('"')
+            *at += 1
+
+            return Ok(out.finish())
+        end if
+
+        if c == u8('\\') && *at + 1 < text.bytes.len
+            *at += 1
+            out.push_char(char(escaped(text.bytes[*at])))
+        else
+            out.push_char(char(c))
+
+        *at += 1
+
+    Err("a quoted string was opened and never closed")
+end read_quoted
+
+private escaped(c: u8) -> u8 =
+    if c == u8('n') then u8('\n')
+    else if c == u8('t') then u8('\t')
+    else if c == u8('r') then u8('\r')
+    else c
+
+// Whitespace and comments, which HOCON writes three ways.
+private skip_blank(text: string, at: *usize)
+    loop
+        while *at < text.bytes.len && (space(text.bytes[*at]) || text.bytes[*at] == u8('\n'))
+            *at += 1
+
+        if *at < text.bytes.len && text.bytes[*at] == u8('#')
+            skip_to_newline(text, at)
+            continue
+        end if
+
+        if *at + 1 < text.bytes.len && text.bytes[*at] == u8('/') && text.bytes[*at + 1] == u8('/')
+            skip_to_newline(text, at)
+            continue
+        end if
+
+        break
+end skip_blank
+
+private skip_to_newline(text: string, at: *usize)
+    while *at < text.bytes.len && text.bytes[*at] != u8('\n')
+        *at += 1
+
+private one_char(text: string, at: usize) -> string =
+    if at >= text.bytes.len then "the end of the file" else text[at..<(at + 1)]
+
+// The entry a block holds under a name, or nothing.
+conf_at(c: &Conf, key: string) -> Option[&Conf]
+    *c match
+        Block(pairs) ->
+            for i in 0..<pairs.len()
+                if pairs.at(i).0 == key then return Some(pairs.at(i).1)
+
+            None
+        _ -> None
+end conf_at
+
+// The string a block holds under a name, or the empty string.
+conf_text(c: &Conf, key: string) -> string
+    conf_at(c, key) match
+        None -> ""
+        Some(v) -> *v match
+            Text(s) -> s
+            Flag(b) -> if b then "true" else "false"
+            _ -> ""
+end conf_text
+
+// The names a block wrote, in the order it wrote them.
+conf_keys(c: &Conf) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    *c match
+        Block(pairs) ->
+            for i in 0..<pairs.len()
+                out.push(pairs.at(i).0)
+        _ -> ()
+
+    out
+end conf_keys
+
+// Every name a block gave a `true`, which is what a `requires` block means.
+conf_flags_set(c: &Conf) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    *c match
+        Block(pairs) ->
+            for i in 0..<pairs.len()
+                *pairs.at(i).1 match
+                    Flag(true) -> out.push(pairs.at(i).0)
+                    _ -> ()
+        _ -> ()
+
+    out
+end conf_flags_set

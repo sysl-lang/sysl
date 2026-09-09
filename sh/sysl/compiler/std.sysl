@@ -1,0 +1,250 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.{Source, source}
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_var
+import sysl.slices.as_mut_ptr
+import sysl.text.{cstring, from_cstring, Search}
+
+// Where the standard module's source is, and what a compilation gets from it.
+//
+// **Every program is compiled against the library**, so a compiler that cannot find its own is
+// broken rather than unlucky -- which is why the failure below is a list of every place that was
+// looked at rather than a report that something went wrong.
+//
+// The library is read from **source** here. The reference compiler can also read a prebuilt
+// artifact, which is object code for one machine with the trees beside it; that road exists so a
+// program need not compile the library into itself, and it means exactly what the source means.
+// This compiler mirrors the source road only.
+
+// The **auto-imported** module, and the root of the library's tree: every other module the library
+// carries is below it.
+val StdModule: string = "sysl"
+
+// What a library file is called in a diagnostic, whatever directory it was read out of.
+//
+// **A message naming a library file has to read the same on every machine.** The library moves with
+// the installation, so the path it was read from would be noise on one machine and different on the
+// next -- and unquotable by the documentation on either.
+val StdPrefix: string = "library"
+
+// What the directory holding the library is called, in the order a search trusts them. `lib` is
+// tried after `library` everywhere, because copies of the tree under the older name are on disk in
+// other repositories and inside every compiler already installed.
+private std_names() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("library")
+    out.push("lib")
+    out
+end std_names
+
+// A place a library root was looked for, and why it was a candidate -- the reasons being what the
+// diagnostic below is made of.
+struct Candidate
+    root: string
+    why: string
+end Candidate
+
+// The places a library root is looked for, in order.
+//
+// The installed answer is `<prefix>/share/sysl/library`, reached from the binary's own resolved path
+// by going up out of `bin`. That is a plain Unix prefix layout, so an installed sysl finds its
+// library with nothing configured and two installs of different versions each find their own. The
+// relative ones are the development tree.
+std_candidates(exe: Option[string]) -> Buf[Candidate]
+    var out: Buf[Candidate] = buf()
+    val names = std_names()
+
+    val prefix = exe match
+        None -> None
+        Some(p) -> parent_of(p) match
+            None -> None
+            Some(bin) -> parent_of(bin)
+
+    for i in 0..<names.len()
+        if prefix.is_some()
+            out.push(Candidate(s"${prefix.unwrap()}/share/sysl/${names.at(i)}", "beside this compiler"))
+
+    for i in 0..<names.len()
+        out.push(Candidate(names.at(i), "from the working directory"))
+        out.push(Candidate(s"../${names.at(i)}", "from the working directory"))
+        out.push(Candidate(s"../../${names.at(i)}", "from the working directory"))
+
+    out
+end std_candidates
+
+// The resolution itself, over its three inputs rather than over the machine it runs on -- the
+// variable, this compiler's own location, and what counts as a directory.
+//
+// The order is the order the answers are *trusted* in. An explicit `SYSL_LIB` is the user overriding
+// everything and is taken at its word; the compiler's own location is the installed case and is what
+// makes an install self-contained; the working directory is the development one.
+//
+// A root is one that **holds the standard module**, not merely one that exists: both spellings are
+// ordinary directory names, so an installed compiler standing in someone's source tree would
+// otherwise take theirs for its own and fail a long way from the cause.
+std_root_of(named: Option[string], exe: Option[string]) -> Result[string, string]
+    if named.is_some()
+        val given = named.unwrap()
+
+        if holds_library(given) then return Ok(given)
+
+        return Err(s"SYSL_LIB names '$given', which does not hold a '$StdModule' directory -- it " +
+            s"should be the library root, which is the directory *above* '$StdModule' rather than " +
+            s"'$StdModule' itself")
+    end if
+
+    val tried = std_candidates(exe)
+
+    for i in 0..<tried.len()
+        if holds_library(tried.at(i).root) then return Ok(tried.at(i).root)
+
+    Err(std_missing(tried))
+end std_root_of
+
+private holds_library(root: string) -> bool = is_directory(s"$root/$StdModule")
+
+// What a compilation with no library to compile against says.
+//
+// **This is what replaces a guarantee**, so it is written as the thing a reader can act on: every
+// path that was tried, in the order they were tried, with what each one was.
+private std_missing(tried: Buf[Candidate]) -> string
+    var out = s"cannot find the standard module's source, which every program is compiled against. " +
+              s"Looked for a library root holding '$StdModule' at:\n"
+
+    for i in 0..<tried.len()
+        out = out + s"  ${tried.at(i).root} (${tried.at(i).why})\n"
+
+    out + "\nA sysl installed from a package has it beside the binary; one run out of a checkout " +
+        "finds it in the tree. Set SYSL_LIB to the library root to name it outright."
+end std_missing
+
+// Where the library is on this machine, resolved the way the driver resolves it.
+std_root() -> Result[string, string] = std_root_of(env_var("SYSL_LIB"), executable_path())
+
+// A library file under the name a diagnostic should call it: the library root's own name and the
+// file's place below it, never the path it was read from.
+std_named(found: Found) -> Found
+    var parts = found.dir
+    var place = StdPrefix
+
+    for i in 0..<parts.len()
+        place = s"$place/${parts.at(i)}"
+
+    Found(source(s"$place/${basename(found.src.name)}", found.src.bytes), found.dir)
+end std_named
+
+// The library's files, sorted by their place in it rather than by where they were found -- so that
+// what a compilation sees depends on the library and not on the order a directory listed, or on
+// which of the candidate paths the root was reached by.
+std_sources(root: string, os: Option[Os]) -> Result[Buf[Found], string]
+    val found = collect(root, os) match
+        Err(e) -> return Err(e.message)
+        Ok(f) -> f
+
+    // A directory that answers the search and holds nothing readable is a *different* failure from
+    // not finding one, and it has to say so: every program would otherwise fail at its first free
+    // name, which points at the program rather than at the empty library that caused it.
+    if found.is_empty()
+        return Err(s"the library at $root holds no sysl source files")
+
+    var out: Buf[Found] = buf()
+    val order = by_place(found)
+
+    for i in 0..<order.len()
+        out.push(std_named(order.at(i)))
+
+    Ok(out)
+end std_sources
+
+// A file's place in the library: the module directories it sits under, then its own name. The same
+// key wherever the library was found, while its path is not.
+private place_of(found: Found) -> string
+    var out = ""
+
+    for i in 0..<found.dir.len()
+        out = out + found.dir.at(i) + "/"
+
+    out + basename(found.src.name)
+end place_of
+
+private by_place(found: Buf[Found]) -> Buf[Found]
+    var out = found
+
+    for i in 1..<out.len()
+        var j = i
+
+        while j > 0 && place_of(out.at(j)) < place_of(out.at(j - 1))
+            val held = out.at(j)
+
+            out.set(j, out.at(j - 1))
+            out.set(j - 1, held)
+            j -= 1
+
+    out
+end by_place
+
+// The library's files, parsed for a target and with its own `@tests` files dropped.
+//
+// **The strip is here rather than at the caller** because the library's `@tests` files are
+// scaffolding for the library's own suite: a name only one of them writes is not a name the standard
+// module declares, and every build but that suite's drops them.
+std_units(root: string, t: Target) -> Result[Buf[Program], string]
+    val files = std_sources(root, Some(t.os))?
+    var out: Buf[Program] = buf()
+
+    for i in 0..<files.len()
+        val parsed = parse(files.at(i).src, t)
+
+        if !parsed.ok()
+            return Err(s"the standard module does not parse: ${files.at(i).src.name}:" +
+                s"${parsed.at()}: ${parsed.first().message}")
+
+        if !parsed.program.test_only then out.push(parsed.program)
+
+    Ok(out)
+end std_units
+
+// Where this compiler's own binary is, or nothing on a machine that will not say.
+//
+// **An install is self-contained because of this one answer**: the library sits at
+// `<prefix>/share/sysl/library` and is reached by going up out of `bin`, so a compiler installed
+// anywhere finds its own copy with nothing configured. macOS asks the loader; Linux reads the
+// symlink the kernel keeps. Anything else answers nothing and the search falls through to the
+// working directory, which is what a development tree wants anyway.
+executable_path() -> Option[string]
+#if macos
+    var room: u32 = 4096
+    var into: []u8 = [0; PathMax]
+
+    if c_exe_path(as_mut_ptr(into), &room) != 0 then return None
+
+    var resolved: []u8 = [0; PathMax]
+
+    if c_realpath(as_mut_ptr(into), as_mut_ptr(resolved)) == null then return None
+
+    from_cstring(as_mut_ptr(resolved)).ok()
+#elif linux
+    var resolved: []u8 = [0; PathMax]
+    val name = cstring("/proc/self/exe")
+
+    if c_realpath(name.ptr, as_mut_ptr(resolved)) == null then return None
+
+    from_cstring(as_mut_ptr(resolved)).ok()
+#else
+    None
+#endif
+end executable_path
+
+private const PathMax: usize = 4096
+
+#if macos
+private extern "_NSGetExecutablePath" c_exe_path(into: *u8, room: *u32) -> int
+#endif
+
+#if macos
+private extern "realpath" c_realpath(name: *u8, into: *u8) -> *u8
+#elif linux
+private extern "realpath" c_realpath(name: *u8, into: *u8) -> *u8
+#endif
