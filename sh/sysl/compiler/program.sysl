@@ -116,7 +116,8 @@ program_of(done: TypedBodies, main_module: string) -> TProgram
 
     TProgram(reached_structs(a), reached_enums(a), reached_vtables(a), reached_externs(a),
              reached_vals(a), emitted_funcs(done.funcs), buf(), done.entry, buf(), true, false,
-             buf(), buf(), main_module, buf(), buf(), buf(), a.tables.test_only, buf(), buf(), buf())
+             buf(), buf(), main_module, declared_tests(done), declared_hooks(done), buf(),
+             a.tables.test_only, buf(), buf(), buf())
 end program_of
 
 // The bodies a program **emits**, which is the question a printed tree answers.
@@ -226,3 +227,83 @@ private reached_vals(a: &Analysis) -> Buf[TVal] = buf()
 // meant.
 private extern_home(a: &Analysis, key: string) -> Scope =
     a.tables.extern_scopes.get(key).unwrap_or(empty_scope())
+
+// The `@test` functions the sources declared, in the order they were written, each carrying the
+// hooks its own module declared.
+//
+// **Only the ones whose bodies survived analysis.** A test that was reported is not one a runner
+// could run, and listing it would put a name in the report that no dispatcher arm matches -- which
+// reads as a test that vanished rather than as the error already printed.
+private declared_tests(done: TypedBodies) -> Buf[TTest]
+    val hooks = declared_hooks(done)
+    var out: Buf[TTest] = buf()
+
+    for i in 0..<done.units.len()
+        val unit = done.units.at(i)
+        val scope = scope_of_unit(unit)
+
+        for j in 0..<unit.body.len()
+            val s = unit.body.at(j)
+
+            *s.kind match
+                FuncDecl(written) ->
+                    val d = with_call_bounds(written)
+
+                    if d.test.is_some() && d.tparams.is_empty()
+                        val key = func_key(done.an, scope, s.span, d)
+                        val attr = d.test.unwrap()
+
+                        if analyzed_body(done.funcs, key)
+                            out.push(TTest(key, attr.display.unwrap_or(module_bare(key)),
+                                           attr.should_trap, attr.expected, unit.src.name,
+                                           int(unit.src.locate(attr.span.start).line),
+                                           module_hooks(hooks, module_of(key))))
+                _ -> ()
+
+    out
+end declared_tests
+
+// The hooks every module declared, on the same terms.
+private declared_hooks(done: TypedBodies) -> Buf[THook]
+    var out: Buf[THook] = buf()
+
+    for i in 0..<done.units.len()
+        val unit = done.units.at(i)
+        val scope = scope_of_unit(unit)
+
+        for j in 0..<unit.body.len()
+            val s = unit.body.at(j)
+
+            *s.kind match
+                FuncDecl(written) ->
+                    val d = with_call_bounds(written)
+
+                    if d.hook.is_some() && d.tparams.is_empty()
+                        val key = func_key(done.an, scope, s.span, d)
+                        val attr = d.hook.unwrap()
+
+                        if analyzed_body(done.funcs, key)
+                            out.push(THook(attr.kind, key, unit.src.name,
+                                           int(unit.src.locate(attr.span.start).line)))
+                _ -> ()
+
+    out
+end declared_hooks
+
+// Every test is handed its own module's hooks, which is what lets a runner work from a list of tests
+// alone -- a cached suite arrives with no program behind it at all.
+private module_hooks(hooks: Buf[THook], module_name: string) -> THooks
+    var mine: Buf[THook] = buf()
+
+    for i in 0..<hooks.len()
+        if module_of(hooks.at(i).func) == module_name then mine.push(hooks.at(i))
+
+    hooks_of(mine)
+end module_hooks
+
+private analyzed_body(funcs: Buf[TFunc], name: string) -> bool
+    for i in 0..<funcs.len()
+        if funcs.at(i).name == name then return true
+
+    false
+end analyzed_body

@@ -110,6 +110,11 @@ end joined
 hoist_units(a: &Analysis, units: Buf[Program])
     var scopes: Buf[Scope] = buf()
 
+    // Which files said `@tests`, recorded before anything is registered: what a `@tests` file
+    // declares is scaffolding, and that is asked of every declaration below.
+    for i in 0..<units.len()
+        if units.at(i).test_only then a.tables.test_only_files.push(units.at(i).src.name)
+
     for i in 0..<units.len()
         val scope = scope_of_unit(units.at(i))
 
@@ -210,7 +215,7 @@ private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vi
     a.tables.types.put(key, Decl(kind, span, scope))
     a.tables.access.put(key, Access(vis, scope.src.name))
 
-    if is_test_only(scope) then a.tables.test_only.push(key)
+    if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
 
 // What a second declaration of a type name is told. A named subtype says "the name", because what
 // it declares may be an alias rather than a type of its own.
@@ -250,7 +255,7 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
     into.put(key, ValueDecl(name, typ, vis, span, scope, init))
     a.tables.access.put(key, Access(vis, scope.src.name))
 
-    if is_test_only(scope) then a.tables.test_only.push(key)
+    if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
 
 // Whether a name another file already registered is one this declaration could be confused with.
 //
@@ -375,7 +380,7 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
     a.tables.funcs.put(key, Func(d, span, scope))
     a.tables.access.put(key, Access(d.vis, scope.src.name))
 
-    if is_test_only(scope) then a.tables.test_only.push(key)
+    if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
 
 // The key a declaration is filed under, where a SIBLING FILE already holds the plain one privately.
 //
@@ -522,4 +527,10 @@ end indistinguishable
 
 // Whether the file a scope belongs to said `@tests`, so that what it declares is the module's tests'
 // and no build but a test build keeps it.
-private is_test_only(scope: Scope) -> bool = false
+// Whether a file is one that said `@tests`, which is what makes everything it declares scaffolding.
+test_only_file(a: &Analysis, name: string) -> bool
+    for i in 0..<a.tables.test_only_files.len()
+        if a.tables.test_only_files.at(i) == name then return true
+
+    false
+end test_only_file

@@ -81,7 +81,19 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
                     if !d.tparams.is_empty() then generic += 1
                     else if library then held.push(HeldBody(func_key(a, scope, s.span, d), scope,
                                                             s.span, d, None))
-                    else funcs.push(analyze_body(a, scope, s.span, d))
+                    else
+                        // **A closure lowered inside a test body goes when the test does.** It has
+                        // no declaration of its own to be marked by, so what marks it is the body
+                        // it was written in -- the ones lowered while this one was read.
+                        val opened = a.closure_funcs.len()
+                        val typed = analyze_body(a, scope, s.span, d)
+
+                        funcs.push(typed)
+
+                        if d.test.is_some() || d.hook.is_some() || holds_string(a.tables.test_only,
+                                                                               typed.name)
+                            for k in opened..<a.closure_funcs.len()
+                                a.tables.test_only.push(a.closure_funcs.at(k).name)
                 _ -> ()
 
     val declared = funcs.len()
@@ -527,7 +539,7 @@ end body_span
 //
 // **It is read off the tables rather than composed**, so a call and a definition cannot disagree
 // about which of two declarations of one name a key means.
-private func_key(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> string
+func_key(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> string
     val plain = file_private_key(a, scope.src.name, module_qualify(scope.module_name, d.name))
     val keys = overload_keys(a, plain)
 
