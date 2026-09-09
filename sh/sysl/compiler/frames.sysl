@@ -1,0 +1,314 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// What a function's `@reads` and `@writes` cover, and the three rules that hold it to them.
+//
+// A frame is what makes a call something other than an eraser. Given `f()` with nothing written
+// down, the weakest precondition of anything after the call is `true` -- every module variable might
+// have changed -- so a prover that meets an unannotated call has to forget everything it knew. The
+// annotation is the only thing that stops that.
+//
+// **Asked of the typed tree**, for the reason a `@pure` function's promise is: what touches module
+// storage is decided across the analyzer, and a guard at each site is a list nobody can read.
+// Storage reached by name is a `TGlobal` node, so looking at nodes is the whole answer.
+//
+// The three rules, and what each is for:
+//
+//   1. **Body conformance** -- a read of `V` needs `V` in `R` or `W`, a write needs `V` in `W`. `W`
+//      is readable on purpose: `count += 1` is a read and a write of one variable, and a form that
+//      common should not have to be declared twice.
+//   2. **Call-site subset** -- an annotated caller may not call something whose frame is wider than
+//      its own, since it would then be doing through the callee what it promised not to do.
+//   3. **Strict closure** -- an annotated function may call only annotated or `@pure` functions, and
+//      may not call through a value, dispatch through a trait object, or contain an `asm` block.
+//      Each of those is a call site with no declaration to consult, and a frame that covered them
+//      would be a promise made about code nobody looked at.
+//
+// **Unannotated is not defaulted to anything, and that is what makes adoption possible.** A function
+// with no frame has effects nobody has written down and may call and be called by anything. Only the
+// annotated are checked, so the discipline climbs from the leaves at whatever pace its author sets.
+
+// The written names of a frame as the symbols the body will be seen to touch.
+//
+// **Resolution happens once, here**, rather than at each comparison: a frame written inside a module
+// names `count` and the body's `TGlobal` carries the qualified key, and comparing the two spellings
+// anywhere else would be comparing a name against a symbol.
+//
+// A name that resolves to nothing is refused rather than dropped. A frame is a promise, and one
+// quietly missing a name it could not find is a promise about less than it appears to cover -- which
+// is worse than no promise, because a reader trusts it.
+//
+// What comes back is a **set**: the names are held in one order however they were written, and a
+// spelling written twice stands once.
+frame_symbols(cx: &Analyzer, span: Span, of: string, names: Option[Buf[string]],
+              word: string) -> Option[Buf[string]]
+    if names.is_none() then return None
+
+    val written = names.unwrap()
+    var out: Buf[string] = buf()
+
+    for i in 0..<written.len()
+        val n = written.at(i)
+        val key = lookup_value_key(cx, cx.an.tables.vals, n)
+
+        if key.is_none()
+            cx.fault(span, s"'@$word' names '$n', which is not module-level storage — a frame " +
+                     "covers a module's own 'val' and 'var' declarations, and a local or a " +
+                     "parameter is not something a caller could observe across the call")
+
+            if !holds_string(cx.an.tables.broken_frames, of) then
+                cx.an.tables.broken_frames.push(of)
+        else if !holds_string(out, key.unwrap()) then out.push(key.unwrap())
+
+    Some(out)
+end frame_symbols
+
+// Every place a complaint has already been made about, which is what keeps one line one message.
+//
+// **One caret, one message**: a single node can break more than one of the rules at once -- a write
+// outside the frame is a read outside it too -- and telling a reader twice about one line reads as
+// two mistakes.
+struct FrameSaid
+    at: Buf[(usize, usize)]
+
+    holds(self, span: Span) -> bool
+        for i in 0..<self.at.len()
+            if self.at.at(i).0 == span.start && self.at.at(i).1 == span.end then return true
+
+        false
+    end holds
+
+    add(*self, span: Span) -> bool
+        if self.holds(span) then return false
+
+        self.at.push((span.start, span.end))
+        true
+    end add
+end FrameSaid
+
+// What one framed function is being held to while its body is walked.
+struct Framed
+    reads: Buf[string]
+    writes: Buf[string]
+    scope: Scope
+    said: &FrameSaid
+
+    // The places a plain store names, which are written rather than read. They are recorded by span
+    // so that the descent below can pass over the one node a store's place is *about*, and go on
+    // reading everything that merely located it.
+    stored: Buf[(usize, usize)]
+end Framed
+
+// Holds every annotated function to its frame.
+check_frames(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern])
+    var framed = false
+
+    for i in 0..<funcs.len()
+        if funcs.at(i).reads.is_some() || funcs.at(i).writes.is_some() then framed = true
+
+    if !framed then return
+
+    var pure: Buf[string] = buf()
+
+    for i in 0..<funcs.len()
+        if funcs.at(i).pure then pure.push(funcs.at(i).name)
+
+    var foreign: Buf[string] = buf()
+
+    for i in 0..<externs.len()
+        foreign.push(externs.at(i).name)
+
+    val said: &FrameSaid = FrameSaid(buf())
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        if f.reads.is_none() && f.writes.is_none() then continue
+        if holds_string(a.tables.broken_frames, f.name) then continue
+
+        val w = f.writes.unwrap_or(buf())
+        var r: Buf[string] = buf()
+
+        val declared = f.reads.unwrap_or(buf())
+
+        for j in 0..<declared.len()
+            r.push(declared.at(j))
+
+        for j in 0..<w.len()
+            if !holds_string(r, w.at(j)) then r.push(w.at(j))
+
+        val fr: &Framed = Framed(r, w, func_home(a, f.name), said, buf())
+
+        // The writes are found first, because a store's place names storage the body does not
+        // *read* -- and which node that is has to be known before the reads are counted.
+        walk_block_stmts(f.body, TWalk(true, e -> frame_write(a, fr, e), x -> (),
+                                       s -> frame_stmt(a, fr, s)))
+        frame_reads(a, fr, funcs, pure, foreign, f.body)
+
+        // The clauses run on every call, so they are the function's effects as much as its body is.
+        for j in 0..<f.requires.len()
+            frame_clause(a, fr, funcs, pure, foreign, f.requires.at(j).cond)
+
+        for j in 0..<f.ensures.len()
+            frame_clause(a, fr, funcs, pure, foreign, f.ensures.at(j).cond)
+
+        if f.variant.is_some() then frame_clause(a, fr, funcs, pure, foreign, f.variant.unwrap())
+end check_frames
+
+private frame_clause(a: &Analysis, fr: &Framed, funcs: Buf[TFunc], pure: Buf[string],
+                     foreign: Buf[string], e: TExpr)
+    walk_texpr(e, expr_walk(true, x -> frame_write(a, fr, x)))
+    walk_texpr(e, expr_walk(true, x -> frame_read(a, fr, funcs, pure, foreign, x)))
+
+private frame_reads(a: &Analysis, fr: &Framed, funcs: Buf[TFunc], pure: Buf[string],
+                    foreign: Buf[string], body: TBlock)
+    walk_block_stmts(body, expr_walk(true, e -> frame_read(a, fr, funcs, pure, foreign, e)))
+
+// A statement a frame could say nothing about.
+private frame_stmt(a: &Analysis, fr: &Framed, s: TStmt)
+    s match
+        TAsm(_, _, _) ->
+            frame_fault(a, fr, span_zero(), "may contain no 'asm' block — what the instructions do " +
+                        "is outside anything a frame could describe")
+        _ -> ()
+
+// The module storage a place ultimately names, or nothing where the path never reaches any.
+//
+// A write to *any part* of a global is a write of that global: after `buffer[i] = b` the variable
+// `buffer` holds something different, and a prover asking whether `buffer` changed across the call
+// needs the answer yes. Stopping at the root is what makes that true whatever the path is -- an
+// element, a field, a field of an element.
+//
+// The walk stops at a dereference, which is the one hop that leaves the storage the path started
+// from: writing through a pointer read out of a global changes what the pointer addresses, not the
+// global, and a frame naming the global would be describing the wrong storage.
+private storage_root(place: TExpr) -> Option[(string, Span)] = *place.kind match
+    TGlobal(symbol, _, _) -> Some((symbol, place.span))
+    TDeref(_, _) -> None
+    TField(r, _, _) -> storage_root(r)
+    TIndex(r, _, _) -> storage_root(r)
+    TSlice(b, _, _, _, _) -> storage_root(b)
+    _ -> None
+
+// Reports each write of module storage the frame does not cover, and records the place so that the
+// read pass passes over the storage a plain store names.
+private frame_write(a: &Analysis, fr: &Framed, e: TExpr)
+    *e.kind match
+        TStore(place, _, _) ->
+            wrote(a, fr, e.span, place)
+            passed_over(fr, place)
+        // A compound update and an increment read the place as well as writing it, which is exactly
+        // why the writes are readable: `count += 1` names one variable and needs one annotation.
+        TUpdate(place, _, _, _, _, _) -> wrote(a, fr, e.span, place)
+        TIncDec(place, _, _, _, _) -> wrote(a, fr, e.span, place)
+        _ -> ()
+
+private passed_over(fr: &Framed, place: TExpr)
+    val root = storage_root(place)
+
+    if root.is_some() then fr.stored.push((root.unwrap().1.start, root.unwrap().1.end))
+
+private wrote(a: &Analysis, fr: &Framed, span: Span, place: TExpr)
+    val root = storage_root(place)
+
+    if root.is_none() then return
+
+    if !holds_string(fr.writes, root.unwrap().0)
+        frame_fault(a, fr, span, s"writes '${module_show(root.unwrap().0)}', which its '@writes' " +
+                    "does not name")
+
+// Reports each read of module storage the frame does not cover, and each call it may not make.
+private frame_read(a: &Analysis, fr: &Framed, funcs: Buf[TFunc], pure: Buf[string],
+                   foreign: Buf[string], e: TExpr)
+    *e.kind match
+        TGlobal(symbol, _, _) ->
+            if !stored_at(fr, e.span) && !holds_string(fr.reads, symbol)
+                frame_fault(a, fr, e.span, s"reads '${module_show(symbol)}', which neither its " +
+                            "'@reads' nor its '@writes' names")
+        TCall(name, _, _, _) -> frame_call(a, fr, funcs, pure, foreign, e.span, name)
+        TCallPtr(_, _, _, _) ->
+            frame_fault(a, fr, e.span, "calls through a value, which names no declaration whose " +
+                        "frame could be checked")
+        TVCall(_, _, _, _, _) ->
+            frame_fault(a, fr, e.span, "dispatches through a trait object, where which body runs " +
+                        "is settled while the program is, so no frame can be read off the call")
+        _ -> ()
+
+private stored_at(fr: &Framed, span: Span) -> bool
+    for i in 0..<fr.stored.len()
+        if fr.stored.at(i).0 == span.start && fr.stored.at(i).1 == span.end then return true
+
+    false
+end stored_at
+
+// Rules 2 and 3 at one call: the callee has a frame, and its frame fits inside this one.
+private frame_call(a: &Analysis, fr: &Framed, funcs: Buf[TFunc], pure: Buf[string],
+                   foreign: Buf[string], span: Span, name: string)
+    // `@pure` is `@reads() @writes()` and is therefore inside every frame there is, so it passes
+    // without anything to compare -- which is what lets a framed function call the library.
+    if holds_string(pure, name) then return
+
+    if is_closure_symbol(name)
+        frame_fault(a, fr, span, "calls through a closure, which names no declaration whose frame " +
+                    "could be checked")
+        return
+
+    if holds_string(foreign, name)
+        frame_fault(a, fr, span, s"calls '${module_show(name)}', which is an 'extern' and says " +
+                    "nothing about what it touches")
+        return
+
+    if holds_string(a.tables.broken_frames, name) then return
+
+    val callee = named_func(funcs, name)
+
+    if callee.is_none() then return
+
+    val g = callee.unwrap()
+
+    if g.reads.is_none() && g.writes.is_none()
+        frame_fault(a, fr, span, s"calls '${module_show(name)}', which has no '@reads' or " +
+                    "'@writes' — an annotated function may call only annotated or '@pure' ones, " +
+                    "since a frame cannot cover what a callee never said")
+        return
+
+    val gw = g.writes.unwrap_or(buf())
+
+    // The offending *name* is what the diagnostic reports: a reader fixing this needs to know which
+    // variable escaped the frame, not that a comparison failed.
+    for i in 0..<gw.len()
+        if !holds_string(fr.writes, gw.at(i))
+            frame_fault(a, fr, span, s"calls '${module_show(name)}', which writes " +
+                        s"'${module_show(gw.at(i))}' — a name this function's '@writes' does not have")
+            return
+
+    var gr: Buf[string] = buf()
+
+    val declared = g.reads.unwrap_or(buf())
+
+    for i in 0..<declared.len()
+        gr.push(declared.at(i))
+
+    for i in 0..<gw.len()
+        if !holds_string(gr, gw.at(i)) then gr.push(gw.at(i))
+
+    for i in 0..<gr.len()
+        if !holds_string(fr.reads, gr.at(i))
+            frame_fault(a, fr, span, s"calls '${module_show(name)}', which reads " +
+                        s"'${module_show(gr.at(i))}' — a name neither this function's '@reads' nor " +
+                        "its '@writes' has")
+            return
+
+private named_func(funcs: Buf[TFunc], name: string) -> Option[TFunc]
+    for i in 0..<funcs.len()
+        if funcs.at(i).name == name then return Some(funcs.at(i))
+
+    None
+end named_func
+
+private frame_fault(a: &Analysis, fr: &Framed, span: Span, what: string)
+    if !fr.said.add(span) then return
+
+    a.fault(fr.scope, span, s"a function with a frame $what")

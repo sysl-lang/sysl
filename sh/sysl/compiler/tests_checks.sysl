@@ -904,3 +904,172 @@ an_invariant_on_a_generic_struct()
     val said = complaints_of("struct Box[T]\n    a: int\n    v: T\n\n    invariant a >= 0\nend Box\n")
 
     assert(says(said, "invariants on generic structs are not supported yet — 'Box'"), listed_of(said))
+
+// -- what a function's '@reads' and '@writes' cover ------------------------------------------------
+
+private a_framed_module() -> string = "module m\n\nvar count: int = 0\nvar other: int = 0\n\n"
+
+@test("a frame names module storage, and a name that reaches none of it is refused")
+a_frame_naming_nothing()
+    if checks_no_library() then return
+
+    val said = complaints_of(a_framed_module() + "@reads(missing)\ngo() -> int = count\n")
+
+    assert(says(said, "'@reads' names 'missing', which is not module-level storage — a frame " +
+                "covers a module's own 'val' and 'var' declarations, and a local or a parameter " +
+                "is not something a caller could observe across the call"), listed_of(said))
+
+@test("and a frame that could not be read holds its function to nothing more")
+a_frame_that_could_not_be_read()
+    if checks_no_library() then return
+
+    val said = complaints_of(a_framed_module() + "@reads(missing)\ngo() -> int = count\n")
+
+    assert(said.len() == 1, listed_of(said))
+
+@test("a body reading storage neither its '@reads' nor its '@writes' names is refused")
+a_read_outside_the_frame()
+    if checks_no_library() then return
+
+    val said = complaints_of(a_framed_module() + "@reads(count)\ngo() -> int = count + other\n")
+
+    assert(says(said, "a function with a frame reads 'm.other', which neither its '@reads' nor " +
+                "its '@writes' names"), listed_of(said))
+
+@test("and a write needs the '@writes', which the '@reads' does not stand in for")
+a_write_outside_the_frame()
+    if checks_no_library() then return
+
+    val said = complaints_of(a_framed_module() + "@reads(count)\ngo() -> int\n    count = 1\n\n    count\nend go\n")
+
+    assert(says(said, "a function with a frame writes 'm.count', which its '@writes' does not " +
+                "name"), listed_of(said))
+
+@test("while what a function writes it may read, since 'count += 1' is one variable and one name")
+a_write_is_readable()
+    if checks_no_library() then return
+
+    val said = complaints_of(a_framed_module() +
+                             "@writes(count)\ngo() -> int\n    count = count + 1\n\n    count\nend go\n")
+
+    assert(said.is_empty(), listed_of(said))
+
+@test("a place locating a write is read, so an index into named storage needs its own name")
+an_index_into_written_storage()
+    if checks_no_library() then return
+
+    val text = "module m\n\nvar buffer: [4]int = [0, 0, 0, 0]\nvar pos: int = 0\n\n" +
+        "@writes(buffer)\ngo()\n    buffer[pos] = 1\nend go\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "a function with a frame reads 'm.pos', which neither its '@reads' nor its " +
+                "'@writes' names"), listed_of(said))
+
+@test("and naming it is what the frame is for")
+an_index_the_frame_names()
+    if checks_no_library() then return
+
+    val text = "module m\n\nvar buffer: [4]int = [0, 0, 0, 0]\nvar pos: int = 0\n\n" +
+        "@reads(pos)\n@writes(buffer)\ngo()\n    buffer[pos] = 1\nend go\n"
+    val said = complaints_of(text)
+
+    assert(said.is_empty(), listed_of(said))
+
+@test("a clause runs on every call, so what it reads is inside the frame or outside the promise")
+a_clause_reads_inside_the_frame()
+    if checks_no_library() then return
+
+    val text = a_framed_module() + "@reads(count)\ngo() -> int\n    ensure result >= other\n\n    count\nend go\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "a function with a frame reads 'm.other', which neither its '@reads' nor " +
+                "its '@writes' names"), listed_of(said))
+
+@test("and a loop's invariant is a clause of the body by the same rule")
+a_loop_invariant_reads_inside_the_frame()
+    if checks_no_library() then return
+
+    val text = a_framed_module() + "@reads(count)\ngo() -> int\n    var i = 0\n\n    while i < count\n" +
+        "        invariant other >= 0\n\n        i = i + 1\n\n    i\nend go\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "a function with a frame reads 'm.other', which neither its '@reads' nor " +
+                "its '@writes' names"), listed_of(said))
+
+@test("an annotated caller may not reach through a callee what its own frame does not cover")
+a_callee_that_writes_outside_the_frame()
+    if checks_no_library() then return
+
+    val text = a_framed_module() + "@writes(other)\ninner()\n    other = 1\nend inner\n\n" +
+        "@reads(count)\ngo() -> int\n    inner()\n\n    count\nend go\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "a function with a frame calls 'm.inner', which writes 'm.other' — a name " +
+                "this function's '@writes' does not have"), listed_of(said))
+
+@test("and the same holds of what the callee merely reads")
+a_callee_that_reads_outside_the_frame()
+    if checks_no_library() then return
+
+    val text = a_framed_module() + "@reads(other)\ninner() -> int = other\n\n" +
+        "@reads(count)\ngo() -> int\n    inner()\n\n    count\nend go\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "a function with a frame calls 'm.inner', which reads 'm.other' — a name " +
+                "neither this function's '@reads' nor its '@writes' has"), listed_of(said))
+
+@test("an annotated function may call only annotated or '@pure' ones")
+a_callee_with_no_frame()
+    if checks_no_library() then return
+
+    val text = a_framed_module() + "plain() -> int = 1\n\n@reads(count)\ngo() -> int = count + plain()\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "a function with a frame calls 'm.plain', which has no '@reads' or " +
+                "'@writes' — an annotated function may call only annotated or '@pure' ones, since " +
+                "a frame cannot cover what a callee never said"), listed_of(said))
+
+@test("and a '@pure' one is inside every frame there is, so it passes with nothing to compare")
+a_pure_callee_is_inside_every_frame()
+    if checks_no_library() then return
+
+    val text = a_framed_module() + "@pure\ntwice(n: int) -> int = n * 2\n\n" +
+        "@reads(count)\ngo() -> int = twice(count)\n"
+    val said = complaints_of(text)
+
+    assert(said.is_empty(), listed_of(said))
+
+@test("an 'extern' says nothing about what it touches, so a frame may not reach one")
+a_frame_calling_an_extern()
+    if checks_no_library() then return
+
+    val text = a_framed_module() + "extern m_printf(fmt: *byte, ...) -> int\n\n" +
+        "@reads(count)\ngo() -> int\n    m_printf(null)\n\n    count\nend go\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "a function with a frame calls 'm.m_printf', which is an 'extern' and says " +
+                "nothing about what it touches"), listed_of(said))
+
+@test("nor a closure, which names no declaration whose frame could be checked")
+a_frame_calling_a_closure()
+    if checks_no_library() then return
+
+    val text = a_framed_module() + "@reads(count)\ngo() -> int\n    val f = () -> count\n\n    f()\nend go\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "a function with a frame calls through a closure, which names no " +
+                "declaration whose frame could be checked"), listed_of(said))
+
+@test("nor an 'asm' block, which is outside anything a frame could describe")
+a_frame_holding_assembly()
+    if checks_no_library() then return
+
+    val text = a_framed_module() + "@reads(count)\ngo() -> int\n    asm\n" +
+        "        [x86_64] \"nop\"\n        [aarch64] \"nop\"\n        [riscv64] \"nop\"\n" +
+        "        [riscv32] \"nop\"\n        [thumb] \"nop\"\n" +
+        "        [wasm32] unavailable \"no such instruction\"\n" +
+        "        [craft] unavailable \"no such instruction\"\n\n    count\nend go\n"
+    val said = complaints_of(text)
+
+    assert(says(said, "a function with a frame may contain no 'asm' block — what the instructions " +
+                "do is outside anything a frame could describe"), listed_of(said))
