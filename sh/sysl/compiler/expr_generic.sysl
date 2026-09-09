@@ -80,6 +80,7 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
                 inner.here_src = caller_source(cx)
                 ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
 
+    cx.an.uses(name)
     TExpr(span, TCall(name, ts, sig.unwrap().ret, false))
 end written_generic_call
 
@@ -179,6 +180,13 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
                 cx.fault(span, "not inferable")
                 return bad_expr(span)
 
+    // **An argument that could not be worked out ends the call rather than instantiating at it.**
+    // The mistake that left it unknown has been reported where it was made -- or deliberately
+    // suppressed as a consequence of one -- and a body made real at `?` would complain again from
+    // inside the declaration, about a line the reader did not write.
+    for i in 0..<targs.len()
+        if targs.at(i) == Unknown then return bad_expr(span)
+
     // A type argument that does not meet what the declaration asked of it ends the call: the body
     // would be read at a type the bound was supposed to have ruled out, and every complaint that
     // came back would be a consequence of this one.
@@ -219,6 +227,7 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
                 inner.here_src = caller_source(cx)
                 ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
 
+    cx.an.uses(name)
     TExpr(span, TCall(name, ts, sig.unwrap().ret, false))
 end generic_call
 
@@ -423,6 +432,16 @@ provisional_of(cx: &Analyzer, scope: Scope, tparams: Buf[string], params: Buf[Pa
                 kept.set(at, Some(t))
                 tys.set(at, texpr_type(t))
                 unify(cx.an, scope, param_refs.at(at), texpr_type(t), tparams, &sub)
+
+                // **What a callable yields is read back off it**, which is the other half of a call
+                // handing one an open result: the parameter is now the closure's own struct, and
+                // that struct implements the call trait its body determined -- so the bound's
+                // arguments, written in the declaration's terms, are matched against the ones the
+                // closure turned out to have. Without it a parameter named only by an arrow's
+                // result stays unknown, and the next arrow is told nothing says what it takes by a
+                // call whose previous argument had just said so.
+                solve_from_callables(cx.an, scope, tparams, bounds, &sub)
+
                 again = true
 
         pending = later
@@ -433,9 +452,17 @@ end provisional_of
 // One reading of an argument with everything it said put back.
 private sandboxed_arg(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     val mark = cx.an.complaints()
+    // **A reading that is thrown away lowers no closure**, because the argument is read again at the
+    // parameter the solve arrived at and the second reading is the one the program gets. The counter
+    // is what makes a closure's name its own, so leaving it forward here would number every closure
+    // after a generic call one higher than the compilation actually lowered.
+    val lowered = cx.an.closure_count
+    val made = cx.an.closure_funcs.len()
     val t = type_expr(cx, e, expected)
 
     cx.an.restore_complaints(mark)
+    cx.an.closure_count = lowered
+    cx.an.closure_funcs.truncate(made)
     t
 end sandboxed_arg
 
@@ -488,8 +515,7 @@ callable_arg(cx: &Analyzer, e: Expr) -> bool = *written_arg(e).kind match
     Lambda(_, _, _) -> true
     BlockArg(_) -> true
     Ident(n) ->
-        cx.lookup(n).is_none() &&
-        !overload_keys(cx.an, module_qualify(cx.scope.module_name, n)).is_empty()
+        cx.lookup(n).is_none() && !function_keys(cx, n).is_empty()
     _ -> false
 
 // What was actually written at an argument position, which for a filled default is inside the

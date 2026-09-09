@@ -738,3 +738,120 @@ a_bare_none_is_held_over_for_its_sibling()
     val out = shown("use(c: bool) -> sysl.Option[string] = if c then Some(\"a\") else None\n", "use")
 
     assert(out.contains("sysl.Option[string]"), out)
+
+// -- what 'derives' writes ----------------------------------------------------------------------
+
+@test("'derives Eq' walks a struct's fields, and the first disagreement decides")
+derived_eq_walks_the_fields()
+    if no_library() then return
+
+    val src = "struct P derives Eq\n    x: int\n    y: int\n\n" +
+              "use(a: P, b: P) -> bool = a == b\n"
+    val out = shown(src, "P.eq")
+
+    assert(out.contains("name: \"eq\"") || out.contains("retTy: bool"), out)
+    assert(out.contains("TIf"), out)
+
+@test("'derives Ord' is lexicographic, written as a ladder")
+derived_ord_is_a_ladder()
+    if no_library() then return
+
+    val src = "struct P derives Eq, Ord\n    x: int\n    y: int\n\n" +
+              "use(a: P, b: P) -> bool = a < b\n"
+    val out = shown(src, "P.lt")
+
+    assert(out.contains("retTy: bool"), out)
+    assert(out.contains("TIf"), out)
+
+@test("'derives Hash' mixes the fields in order with FNV's prime")
+derived_hash_mixes_the_fields()
+    if no_library() then return
+
+    val src = "struct P derives Hash\n    x: int\n\nuse(a: P) -> u64 = a.hash()\n"
+    val out = shown(src, "P.hash")
+
+    assert(out.contains("retTy: ulong"), out)
+    assert(out.contains("sysl$hash_u64"), out)
+
+@test("'derives Display' renders a data enum's variant under its own name")
+derived_display_renders_a_variant()
+    if no_library() then return
+
+    val src = "enum Shape derives Display\n    Dot\n    Line(n: int)\n\n" +
+              "use(s: Shape) -> string = str(s)\n"
+    val out = shown(src, "Shape.display")
+
+    assert(out.contains("sysl$display_fill"), out)
+
+@test("a simple enum is already 'Eq', so deriving one is refused at the word")
+deriving_eq_on_a_simple_enum_is_refused()
+    if no_library() then return
+
+    val said = complaints("enum Colour derives Eq\n    Red\n    Green\n\n" +
+                          "use(a: Colour) -> bool = a == a\n")
+
+    assert(says(said, "a simple enum is already 'Eq' — no variant of it carries anything, so its " +
+                "value is its discriminant and '==' is that comparison. Remove 'Eq' from the " +
+                "'derives' clause; the other three are still worth deriving"), s"${said.len()} said")
+
+@test("and a trait the compiler cannot write is refused by name")
+deriving_an_unknown_trait_is_refused()
+    if no_library() then return
+
+    val said = complaints("trait Fancy\n    fancy(self) -> int\n\n" +
+                          "struct P derives Fancy\n    x: int\n")
+
+    assert(says(said, "'Fancy' is not a trait the compiler knows how to write — 'derives' names " +
+                "Eq, Ord, Hash or Display, which are the four the library provides structurally " +
+                "for every tuple. A trait of your own is implemented with an 'impl' block"),
+           s"${said.len()} said")
+
+// -- what the whole compiler's own sources found ---------------------------------------------------
+
+@test("a closure standing at a boxed callable is erased into the object the type names")
+a_closure_at_a_boxed_callable_is_erased()
+    if no_library() then return
+
+    val src = "take(f: &Fn() -> unit) = f()\n\nuse() = take(() -> ())\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("TErase") || out.contains("vtable"), out)
+
+@test("a module bound to a name is written before a dot, and the call reaches through it")
+a_module_alias_qualifies_a_call()
+    if no_library() then return
+
+    val src = "import sysl.unicode\n\nuse(c: char) -> bool = unicode.is_alpha(c)\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("sysl.unicode$is_alpha"), out)
+
+@test("a generic enum's variant named through its enum is worked out from what it carries")
+a_qualified_generic_variant_is_solved()
+    if no_library() then return
+
+    val src = "use(n: int) -> sysl.Option[int] = sysl.Option.Some(n)\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("sysl.Option[int]"), out)
+
+@test("and a nullary one takes the instantiation its position names")
+a_qualified_nullary_variant_takes_its_position()
+    if no_library() then return
+
+    val src = "use() -> sysl.Option[int] = sysl.Option.None\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("sysl.Option[int]"), out)
+
+@test("what one callable yields settles what the next one takes")
+a_callable_settles_the_next_one()
+    if no_library() then return
+
+    val src = "walk[A, B](x: A, first: A -> B, again: B -> B) -> B = again(first(x))\n\n" +
+              "wrap(n: int) -> string = str(n)\n" +
+              "twice(s: string) -> string = s + s\n\n" +
+              "use() -> string = walk(1, wrap, twice)\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("retTy: string"), out)

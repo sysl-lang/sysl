@@ -62,6 +62,17 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             if qualified.is_some() then
                 return variant_call(cx, span, qualified.unwrap().0, qualified.unwrap().1, args)
 
+            // A **generic** enum has no single instantiation for its name to stand for, so the one
+            // meant is worked out from what the variant carries -- exactly as it is for the bare
+            // name, and for the same reason: `Slot.Live(h, k, v)` is a `Slot[K, V]` because that is
+            // what the values say.
+            val qualified_generic = qualified_variant_solved(cx, span, receiver, member, args,
+                                                             expected)
+
+            if qualified_generic.is_some() then
+                return variant_call(cx, span, qualified_generic.unwrap().0,
+                                    qualified_generic.unwrap().1, args)
+
             val tr = type_expr_bare(cx, receiver)
 
             if texpr_type(tr) == Unknown then return tr
@@ -104,6 +115,18 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
     if special.is_some() then return special.unwrap()
 
     val shadowed = cx.lookup(name).is_some()
+
+    // **A variant the position asked for outright claims the name**, before a type of that name is
+    // asked about: a variant and a struct may share a spelling, and `ImplDecl(d)` at a parameter
+    // whose type is the enum is the variant however many structs are called that. Nothing else
+    // could have decided it, and the expected type was there to be read.
+    if !shadowed
+        val wanted = variant_from_expected(cx, name, expected)
+
+        if wanted.is_some() then
+            return variant_call(cx, span, wanted.unwrap().0, wanted.unwrap().1, args)
+    end if
+
     val tkey = if shadowed then None else lookup_type_key(cx.an, cx.scope, name)
 
     // A conversion, where no declaration claims the name.
@@ -544,6 +567,42 @@ private variant_instance(cx: &Analyzer, span: Span, key: string, home: Scope, ed
         _ -> None
 end variant_instance
 
+// The same where the enum is **generic**: the name in front of the dot says which enum, and the
+// values say which instantiation of it.
+private qualified_variant_solved(cx: &Analyzer, span: Span, receiver: Expr, member: string,
+                                 args: Buf[Expr],
+                                 expected: Option[Type]) -> Option[(Type, EnumVariant)]
+    val written = *receiver.kind match
+        Ident(n) -> if cx.lookup(n).is_none() then Some(n) else None
+        _ -> None
+
+    if written.is_none() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+
+    if key.is_none() then return None
+
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        EnumOf(ed) ->
+            if ed.tparams.is_empty() then return None
+
+            val found = variant_decl_named(ed, member)
+
+            if found.is_none() then return None
+
+            // The position is trusted first, since it says outright which instantiation is wanted.
+            val wanted = variant_from_expected(cx, member, expected)
+
+            if wanted.is_some() then return wanted
+
+            variant_instance(cx, span, key.unwrap(), decl.unwrap().scope, ed, found.unwrap(), args)
+        _ -> None
+end qualified_variant_solved
+
 // A variant named through its enum, where the name in front of the dot stands for one.
 private qualified_variant(cx: &Analyzer, receiver: Expr, member: string) -> Option[(Type, EnumVariant)]
     val subject = subject_named(cx, receiver)
@@ -564,6 +623,17 @@ end qualified_variant
 
 // The keys the declarations of one written name are filed under, in the reader's own terms.
 function_keys(cx: &Analyzer, written: string) -> Buf[string]
+    // A module bound to a name is written before a dot, so `unicode.is_alpha` is the module's key
+    // and the name after it. It is asked first, since the alias is what the file said the word
+    // means.
+    val through = module_bound_key(cx, written)
+
+    if through.is_some()
+        val set = overload_keys(cx.an, through.unwrap())
+
+        if !set.is_empty() then return set
+    end if
+
     val bound = cx.scope.imports.name_key(written)
 
     if bound.is_some() then
@@ -589,6 +659,31 @@ function_keys(cx: &Analyzer, written: string) -> Buf[string]
 
     buf()
 end function_keys
+
+// The key a dotted name spells where its head is a module the file bound a name to.
+private module_bound_key(cx: &Analyzer, written: string) -> Option[string]
+    val at = first_dot_in(written)
+
+    if at.is_none() then return None
+
+    val head = written[0..<at.unwrap()]
+    val rest = written[(at.unwrap() + 1)..<written.bytes.len]
+    val owner = cx.scope.imports.module_as(head)
+
+    if owner.is_none() || first_dot_in(rest).is_some() then return None
+
+    Some(module_qualify(owner.unwrap(), rest))
+end module_bound_key
+
+// Where the first dot of a name is, if it has one.
+private first_dot_in(name: string) -> Option[usize]
+    val bytes = name.bytes
+
+    for i in 0..<bytes.len
+        if bytes[i] == u8('.') then return Some(i)
+
+    None
+end first_dot_in
 
 // A call of a function this compilation knows by key.
 //
@@ -720,6 +815,7 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
 
     val ret = declared_result(cx, f.scope, f.decl.ret_type)
 
+    cx.an.uses(key)
     TExpr(span, TCall(key, ts, ret, false))
 end call_key
 
@@ -851,6 +947,7 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
 
     val ret = declared_result(cx, scope, d.ret_type)
 
+    cx.an.uses(key)
     TExpr(span, TCall(key, ts, ret, false))
 end extern_call
 

@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.text.Search
 
 // Typing the body a function's declaration is followed by, whatever the body is made of.
 //
@@ -29,10 +30,9 @@ struct TypedBodies
 end TypedBodies
 
 // Reads a compilation's declarations and types every body it can.
-analyze_bodies(units: Buf[Program], t: Target) -> TypedBodies
+analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
     val a = analysis_for(t)
-
-    read_decls(a, units)
+    val units = read_decls(a, written)
 
     var funcs: Buf[TFunc] = buf()
     var generic: usize = 0
@@ -47,9 +47,16 @@ analyze_bodies(units: Buf[Program], t: Target) -> TypedBodies
     // first, and a closure lowered while checking one is a closure this compilation lowered.
     check_generic_bodies(a, units)
 
+    // **The library's own functions are held back**: they are analyzed below, and only if
+    // something reaches them. That is what keeps a program that never prints from carrying the
+    // printing surface, and it is what makes the list of functions a compilation ends with the list
+    // of functions it runs.
+    var held: Buf[HeldBody] = buf()
+
     for i in 0..<units.len()
         val unit = units.at(i)
         val scope = scope_of_unit(unit)
+        val library = from_library(scope)
 
         for j in 0..<unit.body.len()
             val s = unit.body.at(j)
@@ -62,20 +69,94 @@ analyze_bodies(units: Buf[Program], t: Target) -> TypedBodies
                     val d = with_call_bounds(written)
 
                     if !d.tparams.is_empty() then generic += 1
+                    else if library then held.push(HeldBody(func_key(a, scope, s.span, d), scope,
+                                                            s.span, d, None))
                     else funcs.push(analyze_body(a, scope, s.span, d))
                 _ -> ()
 
     val declared = funcs.len()
 
     // A member of a concrete type is a function whose body is typed whether or not anything calls
-    // it, which is what makes a mistake in one a mistake at its declaration.
+    // it, which is what makes a mistake in one a mistake at its declaration. A **library** member
+    // is held back on the same terms a library function is, and for the same reason: a library type
+    // with members would otherwise put every one of them into every program.
     val lowered = a.tables.members.lowered
 
     for i in 0..<lowered.len()
-        funcs.push(analyze_instance(a, lowered.at(i).name, lowered.at(i)))
+        val m = lowered.at(i)
+        val home = a.tables.members.decl_scope.get(m.name).unwrap_or(empty_scope())
+
+        if from_library(home) then held.push(HeldBody(m.name, home, span_zero(), m, Some(m)))
+        else funcs.push(analyze_instance(a, m.name, m))
 
     // Then the instantiations, drained until nothing more is asked for: typing one body may reach a
     // call that asks for another.
+    drain_pending(a, &funcs)
+
+    // A library function is analyzed only once something has called it, and analyzing one may call
+    // another -- `printi` reaches `putbytes`, `printb` reaches `prints` -- so this runs to a
+    // fixpoint too.
+    var analyzed: Buf[string] = buf()
+    var reached = true
+
+    while reached
+        reached = false
+
+        val names = a.funcs_used()
+
+        for i in 0..<names.len()
+            val name = names.at(i)
+
+            if !holds_string(analyzed, name)
+                val body = held_named(held, name)
+
+                if body.is_some()
+                    analyzed.push(name)
+                    reached = true
+
+                    val at = body.unwrap()
+
+                    if at.member.is_some() then
+                        funcs.push(analyze_instance(a, at.name, at.member.unwrap()))
+                    else funcs.push(analyze_body(a, at.scope, at.span, at.decl))
+
+        drain_pending(a, &funcs)
+
+    // The `call` bodies the closures lowered to, after everything a program declared: a closure has
+    // no declaration of its own to sit beside, and one lowered while a later body was typed would
+    // otherwise land in the middle of the list.
+    for i in 0..<a.closure_funcs.len()
+        funcs.push(a.closure_funcs.at(i))
+
+    TypedBodies(funcs, a.diagnostics(), generic, defaults, declared)
+end analyze_bodies
+
+// One body waiting for something to reach it: the name it will be analyzed under, the terms it was
+// written in, and either the declaration itself or the member it was lowered from.
+struct HeldBody
+    name: string
+    scope: Scope
+    span: Span
+    decl: FuncDecl
+    member: Option[FuncDecl]
+end HeldBody
+
+// The held body of a name, where one is held under it.
+private held_named(held: Buf[HeldBody], name: string) -> Option[HeldBody]
+    for i in 0..<held.len()
+        if held.at(i).name == name then return Some(held.at(i))
+
+    None
+end held_named
+
+// Whether a file is one the standard module supplied. A library file is named for its place in the
+// library rather than for the path it was read from, which is what makes the question answerable
+// wherever the library was installed.
+private from_library(scope: Scope) -> bool = scope.src.name.starts_with(s"$StdPrefix/")
+
+// The instantiations a walk asked for, typed until nothing more is asked. Typing one body may reach
+// a call that asks for another, so it runs to a fixpoint.
+private drain_pending(a: &Analysis, funcs: *Buf[TFunc])
     var guard: usize = 0
 
     while !a.tables.members.pending.is_empty() && guard < 4096
@@ -91,15 +172,7 @@ analyze_bodies(units: Buf[Program], t: Target) -> TypedBodies
             funcs.push(analyze_instance_in(a, cx, job.name, job.decl))
 
         guard += 1
-
-    // The `call` bodies the closures lowered to, after everything a program declared: a closure has
-    // no declaration of its own to sit beside, and one lowered while a later body was typed would
-    // otherwise land in the middle of the list.
-    for i in 0..<a.closure_funcs.len()
-        funcs.push(a.closure_funcs.at(i))
-
-    TypedBodies(funcs, a.diagnostics(), generic, defaults, declared)
-end analyze_bodies
+end drain_pending
 
 // Whether a declaration's symbol is one only its own file can name.
 file_local(v: Visibility) -> bool = v match
@@ -190,6 +263,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl)
     if d.body.is_empty() then return
 
     val mark = a.complaints()
+    val trial = a.sandboxed()
     val queued = a.tables.members.pending.len()
     val outer = a.tables.members.selves.get(d.name).unwrap_or(buf())
     var subst = joined_bindings(outer, abstract_subst(a, scope, d.tparams, d.bounds, d.tvalues,
@@ -224,6 +298,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl)
     analyze_contract(cx, d.body, split, ret)
     body_block(cx, statements_from(d.body, split), ret)
 
+    a.release(trial)
     a.restore_complaints(mark)
     a.tables.members.pending.truncate(queued)
 end check_abstract_body
@@ -275,8 +350,13 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
         cx.fault(span, s"function '$name' should return ${type_show(ret)}, but its body yields " +
                  s"${type_show(body.ty)}")
 
+    // **An instantiation whose name carries a closure's is internal on the same ground the closure
+    // itself is.** `sysl.time$resolve.$closure4` is a symbol only the unit that lowered that closure
+    // can mean anything by, since the number in it is that unit's counter -- so it may not cross a
+    // link. Asked of the emitted name rather than of the substitution, so that a closure reached
+    // through a composite argument is covered by the one rule.
     TFunc(span, name, params, ret, body, d.variadic, contract.0, contract.1, contract.2,
-          file_local(d.vis),
+          file_local(d.vis) || mentions_closure(name),
           d.conv, d.tailrec, contract.3, d.pure, d.ghost, d.reads, d.writes, exported_symbol(d),
           d.section)
 end analyze_instance_in

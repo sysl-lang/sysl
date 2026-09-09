@@ -1,0 +1,759 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `derives Eq, Ord, Hash, Display` -- the four implementations the compiler writes over a type's own
+// parts.
+//
+// The list is **closed**, and deliberately: an open one would be an extension point, and the
+// extension point would be the field loop this feature exists instead of. These four are the ones
+// the library already provides structurally for every tuple, which is the same claim in the same
+// words -- a composite has them exactly when its parts do.
+//
+// **What is built is source**, and that is the whole design: a clause becomes the `impl` block a
+// reader could have written, hoisted and analyzed by the ordinary machinery, so nothing downstream
+// learns anything about deriving. A derived body that cannot be typed is reported against the block
+// it stands in, which is positioned at the word in the clause that asked for it.
+
+// The traits a clause may name, in the order a diagnostic lists them.
+private derivable() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("Eq")
+    out.push("Ord")
+    out.push("Hash")
+    out.push("Display")
+    out
+end derivable
+
+// FNV-1a's offset basis and prime, which is what the tuple's `Hash` mixes with and therefore what a
+// struct's must. The prime is what makes position matter -- a plain XOR would make `Size(1, 2)` and
+// `Size(2, 1)` one key.
+private fnv_basis() -> string = "cbf29ce484222325"
+private fnv_prime() -> string = "100000001b3"
+
+// Every unit with the blocks its `derives` clauses ask for written out after the declarations that
+// asked, which is what the rest of the compiler reads.
+derived_units(a: &Analysis, units: Buf[Program]) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    for i in 0..<units.len()
+        val unit = units.at(i)
+        val scope = scope_of_unit(unit)
+        var body: Buf[Stmt] = buf()
+        var grew = false
+
+        for j in 0..<unit.body.len()
+            val s = unit.body.at(j)
+
+            body.push(s)
+
+            val made = derived_blocks(a, scope, s)
+
+            for k in 0..<made.len()
+                body.push(made.at(k))
+                grew = true
+
+        if !grew then out.push(unit)
+        else out.push(Program(body, unit.module_name, unit.capabilities, unit.links, unit.src,
+                              unit.test_only, unit.includes, unit.docs))
+
+    out
+end derived_units
+
+// The blocks one declaration's clause asks for, in the order the clause wrote them, with everything
+// the clause got wrong reported at the word that is wrong.
+private derived_blocks(a: &Analysis, scope: Scope, s: Stmt) -> Buf[Stmt]
+    val clause = derives_clause(s)
+
+    if clause.is_empty() then return buf()
+
+    var out: Buf[Stmt] = buf()
+    var seen: Buf[string] = buf()
+
+    for i in 0..<clause.len()
+        val entry = clause.at(i)
+        val simple = last_dotted(entry.name)
+        val wrong = derives_problem(entry, simple, s)
+
+        if wrong.is_some() then a.fault(scope, entry.span, wrong.unwrap())
+        else if holds_string(seen, simple)
+            // Two entries naming one trait mean the reader believes something is happening twice.
+            a.fault(scope, entry.span, s"'$simple' is named twice in this 'derives' clause, and " +
+                    "one implementation is written either way — remove the second")
+        else
+            seen.push(simple)
+
+            val made = one_derivation(entry, simple, s)
+
+            for j in 0..<made.len()
+                out.push(made.at(j))
+
+    out
+end derived_blocks
+
+// The clause as written, or nothing where the declaration has none.
+private derives_clause(s: Stmt) -> Buf[BoundRef] = *s.kind match
+    StructDecl(d) -> d.deriving
+    EnumDecl(d) -> d.deriving
+    _ -> buf()
+
+// What is wrong with one entry of a clause, or nothing where nothing is.
+//
+// It is separate from the expansion because the two answer at different moments -- every entry is
+// reported on and only the sound ones become blocks -- and because a refusal here is about the
+// **clause**, where every other refusal a derived block can raise is about the body it wrote.
+private derives_problem(entry: BoundRef, simple: string, s: Stmt) -> Option[string]
+    // An **opaque** struct with no fields is C's incomplete type: the storage belongs to whoever
+    // allocated it and nothing here knows its shape. Derived over no fields at all, `Eq` answers
+    // true for every pair and `Display` renders every value the same -- a wrong answer with nothing
+    // to warn the reader.
+    *s.kind match
+        StructDecl(d) ->
+            if d.opaque && d.fields.is_empty() then
+                return Some("this type is opaque and declares no fields, so a derived " +
+                            "implementation would have nothing to walk — every value would compare " +
+                            "equal and render the same. An opaque handle is reached as a pointer; " +
+                            "write an 'impl' block where one genuinely needs a trait")
+        _ -> ()
+
+    // A **simple** enum is already `Eq` by rule: every variant is dataless, so the value is its
+    // discriminant and there is one thing equality could mean. A derived block for one would be
+    // refused by that same rule, with a sentence telling the reader to delete a block they did not
+    // write.
+    if simple == "Eq"
+        *s.kind match
+            EnumDecl(d) ->
+                if simple_sum(d.variants) then
+                    return Some("a simple enum is already 'Eq' — no variant of it carries " +
+                                "anything, so its value is its discriminant and '==' is that " +
+                                "comparison. Remove 'Eq' from the 'derives' clause; the other " +
+                                "three are still worth deriving")
+            _ -> ()
+
+    if !entry.args.is_empty() then
+        return Some(s"'${entry.name}' writes trait arguments, and a derived implementation takes " +
+                    "none — the compiler writes Eq, Ord, Hash, Display over a type's own fields, " +
+                    "and there is nothing for an argument to vary")
+
+    if !holds_string(derivable(), simple) then
+        return Some(s"'$simple' is not a trait the compiler knows how to write — 'derives' names " +
+                    "Eq, Ord, Hash or Display, which are the four the library provides " +
+                    "structurally for every tuple. A trait of your own is implemented with an " +
+                    "'impl' block")
+
+    None
+end derives_problem
+
+// Whether no variant carries anything, which is what makes the value its own discriminant.
+private simple_sum(vs: Buf[EnumVariantDecl]) -> bool
+    for i in 0..<vs.len()
+        if !vs.at(i).fields.is_empty() then return false
+
+    true
+end simple_sum
+
+// Whether anything at all is written between brackets. A fieldless struct and a simple enum render
+// as one string literal and have nothing to gather.
+private has_parts(s: Stmt) -> bool = *s.kind match
+    StructDecl(d) -> !d.fields.is_empty()
+    EnumDecl(d) -> !simple_sum(d.variants)
+    _ -> false
+
+// The bare name of a possibly-qualified trait.
+private last_dotted(name: string) -> string
+    val at = last_dot_in(name)
+
+    if at.is_none() then return name
+
+    name[(at.unwrap() + 1)..<name.bytes.len]
+end last_dotted
+
+// -- one derivation ------------------------------------------------------------------------------
+
+private one_derivation(entry: BoundRef, simple: string, s: Stmt) -> Buf[Stmt]
+    val at = entry.span
+    var out: Buf[Stmt] = buf()
+
+    val name = declared_name(s)
+    val tparams = declared_tparams(s)
+    val tvalues = declared_tvalues(s)
+
+    // **A generic type derives conditionally**: every *type* parameter gains the derived trait as a
+    // bound, so a `Box[int]` is `Eq` and a `Box[Unequatable]` is not, and neither needs saying. A
+    // value parameter gains nothing -- it is not a type and has no membership to ask for. The type's
+    // own bounds come along because the subject does not resolve without them.
+    var bounds: Buf[NamedBounds] = buf()
+
+    for i in 0..<declared_bounds(s).len()
+        bounds.push(declared_bounds(s).at(i))
+
+    for i in 0..<tparams.len()
+        if !has_binding(tvalues, tparams.at(i))
+            var bs: Buf[BoundRef] = buf()
+
+            bs.push(BoundRef(at, entry.name, buf()))
+            bounds.push(NamedBounds(tparams.at(i), bs))
+
+    var targs: Buf[TypeRef] = buf()
+
+    for i in 0..<tparams.len()
+        targs.push(TypeRef(at, NamedType(tparams.at(i), buf())))
+
+    val subject = TypeRef(at, NamedType(name, targs))
+    var method = eq_method(at, s)
+
+    if simple == "Ord" then method = ord_method(at, s)
+    else if simple == "Hash" then method = hash_method(at, s)
+    else if simple == "Display"
+        // `Display` is the one that needs a declaration of its own beside the block: the parts are
+        // written straight through a renderer rather than gathered into a string, and a renderer is
+        // a function.
+        if has_parts(s)
+            out.push(renderer_decl(at, name, tparams, bounds, tvalues, s))
+            method = display_method(at, name)
+        else method = display_literal_method(at, name, s)
+
+    var methods: Buf[MethodDecl] = buf()
+
+    methods.push(method)
+    out.push(stmt(at, ImplDecl(ImplDecl(entry.name, subject, methods, tparams, bounds, buf(), buf(),
+                                        false, tvalues, buf(), buf()))))
+    out
+end one_derivation
+
+private declared_name(s: Stmt) -> string = *s.kind match
+    StructDecl(d) -> d.name
+    EnumDecl(d) -> d.name
+    _ -> ""
+
+private declared_tparams(s: Stmt) -> Buf[string] = *s.kind match
+    StructDecl(d) -> d.tparams
+    EnumDecl(d) -> d.tparams
+    _ -> buf()
+
+private declared_bounds(s: Stmt) -> Buf[NamedBounds] = *s.kind match
+    StructDecl(d) -> d.bounds
+    EnumDecl(d) -> d.bounds
+    _ -> buf()
+
+private declared_tvalues(s: Stmt) -> Buf[TypeBinding] = *s.kind match
+    StructDecl(d) -> d.tvalues
+    EnumDecl(d) -> d.tvalues
+    _ -> buf()
+
+private variants_of(s: Stmt) -> Buf[EnumVariantDecl] = *s.kind match
+    EnumDecl(d) -> d.variants
+    _ -> buf()
+
+private fields_of(s: Stmt) -> Buf[string] = *s.kind match
+    StructDecl(d) ->
+        var out: Buf[string] = buf()
+
+        for i in 0..<d.fields.len()
+            out.push(d.fields.at(i).name)
+
+        out
+    _ -> buf()
+
+private is_sum(s: Stmt) -> bool = *s.kind match
+    EnumDecl(_) -> true
+    _ -> false
+
+// -- the pieces a body is built from ---------------------------------------------------------------
+
+private ident(at: Span, name: string) -> Expr = expr(at, Ident(name))
+private field_of(at: Span, e: Expr, name: string) -> Expr = expr(at, Field(e, name))
+private self_field(at: Span, name: string) -> Expr = field_of(at, ident(at, "self"), name)
+private rhs_field(at: Span, name: string) -> Expr = field_of(at, ident(at, "rhs"), name)
+
+private compare(at: Span, op: string, l: Expr, r: Expr) -> Expr
+    var operands: Buf[Expr] = buf()
+    var ops: Buf[string] = buf()
+
+    operands.push(l)
+    operands.push(r)
+    ops.push(op)
+    expr(at, Compare(operands, ops))
+end compare
+
+private call_of(at: Span, callee: Expr, args: Buf[Expr]) -> Expr = expr(at, Call(callee, args))
+
+private no_args() -> Buf[Expr] = buf()
+
+private one_arg(e: Expr) -> Buf[Expr]
+    var out: Buf[Expr] = buf()
+
+    out.push(e)
+    out
+end one_arg
+
+private one_stmt_of(s: Stmt) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    out.push(s)
+    out
+end one_stmt_of
+
+// `if <cond> then return <v>` -- the one statement shape three of the four bodies are built from.
+private guard_stmt(at: Span, cond: Expr, v: bool) -> Stmt =
+    stmt(at, ExprStmt(expr(at, IfExpr(cond,
+                                      one_stmt_of(stmt(at, Return(Some(expr(at, BoolLit(v)))))),
+                                      None))))
+
+// The binders one side of a two-sided match introduces: `l0`, `l1` for the left operand's fields
+// and `r0`, `r1` for the right's. Positional, because a variant's fields are matched positionally.
+private binder(side: string, i: usize) -> string = s"$side$i"
+
+// The pattern matching a variant, binding each of its fields, or `_` where the body has no use for
+// them. A variant carrying nothing is a bare name, which the analyzer reads as a nullary variant.
+private variant_pattern(at: Span, v: EnumVariantDecl, side: string) -> Pattern
+    if v.fields.is_empty() then return pattern_of(at, IdentPattern(v.name))
+
+    var args: Buf[Pattern] = buf()
+
+    for i in 0..<v.fields.len()
+        args.push(pattern_of(at, IdentPattern(binder(side, i))))
+
+    pattern_of(at, VariantPattern(v.name, args))
+end variant_pattern
+
+private any_of(at: Span, v: EnumVariantDecl) -> Pattern
+    if v.fields.is_empty() then return pattern_of(at, IdentPattern(v.name))
+
+    var args: Buf[Pattern] = buf()
+
+    for i in 0..<v.fields.len()
+        args.push(pattern_of(at, WildcardPattern))
+
+    pattern_of(at, VariantPattern(v.name, args))
+end any_of
+
+private arm_of(at: Span, p: Pattern, body: Buf[Stmt]) -> MatchArm
+    var ps: Buf[Pattern] = buf()
+
+    ps.push(p)
+    MatchArm(at, ps, None, body)
+end arm_of
+
+// Which variant a value is, as an `int` -- one `match` whose arms are the declaration positions.
+//
+// A data enum's discriminant is not something a program can read, and it does not need to be: every
+// arm knows its own position at the moment this is built, so the literal is the tag.
+private tag_of(at: Span, scrutinee: Expr, vs: Buf[EnumVariantDecl]) -> Expr
+    var arms: Buf[MatchArm] = buf()
+
+    for i in 0..<vs.len()
+        arms.push(arm_of(at, any_of(at, vs.at(i)),
+                         one_stmt_of(stmt(at, ExprStmt(int_of(at, s"$i"))))))
+
+    expr(at, MatchExpr(scrutinee, arms))
+end tag_of
+
+private int_of(at: Span, digits: string) -> Expr = expr(at, IntLit(digits, 10, ""))
+private u64_of(at: Span, digits: string) -> Expr = expr(at, IntLit(digits, 16, "u64"))
+
+// The arms of a match over **both** operands: one per variant, pairing that variant with itself, and
+// a catch-all for every pair that disagrees.
+private both_arms(at: Span, vs: Buf[EnumVariantDecl], same_eq: bool) -> Buf[MatchArm]
+    var arms: Buf[MatchArm] = buf()
+
+    for i in 0..<vs.len()
+        var pair: Buf[Pattern] = buf()
+
+        pair.push(variant_pattern(at, vs.at(i), "l"))
+        pair.push(variant_pattern(at, vs.at(i), "r"))
+
+        val body = if same_eq then same_variant_eq(at, vs.at(i)) else same_variant_ord(at, vs.at(i))
+
+        arms.push(arm_of(at, pattern_of(at, TuplePattern(pair)), body))
+
+    // A tag comparison is only needed where there is more than one variant to tell apart, and a
+    // catch-all arm is only *reachable* then -- a one-variant sum's tuple match covers every pair.
+    if vs.len() > 1 then
+        arms.push(arm_of(at, pattern_of(at, WildcardPattern),
+                         one_stmt_of(stmt(at, ExprStmt(expr(at, BoolLit(false)))))))
+
+    arms
+end both_arms
+
+private pair_match(at: Span, vs: Buf[EnumVariantDecl], same_eq: bool) -> Stmt
+    var parts: Buf[Expr] = buf()
+
+    parts.push(ident(at, "self"))
+    parts.push(ident(at, "rhs"))
+    stmt(at, ExprStmt(expr(at, MatchExpr(expr(at, Tuple(parts)), both_arms(at, vs, same_eq)))))
+end pair_match
+
+private method_of(at: Span, name: string, params: Buf[Param], ret: Option[TypeRef],
+                  body: Buf[Stmt]) -> MethodDecl =
+    MethodDecl(at, name, Some(ByValue), false, buf(), params, ret, body, buf(), buf(), Public,
+               false, false, buf(), buf(), buf(), None, None, buf(), false)
+
+private param_of(at: Span, name: string, typ: TypeRef) -> Param =
+    Param(at, name, typ, Public, None, false, false)
+
+private self_param(at: Span) -> Buf[Param]
+    var out: Buf[Param] = buf()
+
+    out.push(param_of(at, "rhs", TypeRef(at, NamedType("Self", buf()))))
+    out
+end self_param
+
+private bool_ref(at: Span) -> Option[TypeRef] = Some(TypeRef(at, NamedType("bool", buf())))
+
+// -- Eq --------------------------------------------------------------------------------------------
+
+// Field by field, first disagreement decides -- which is the tuple's body with a name in place of
+// the position, and is the only thing equality on a product can mean.
+private eq_method(at: Span, s: Stmt) -> MethodDecl
+    var body: Buf[Stmt] = buf()
+
+    if is_sum(s) then
+        // Two variants agree when they are the same variant and every field of it agrees, which is
+        // one match over the pair rather than a tag comparison and a second match inside it.
+        body.push(pair_match(at, variants_of(s), true))
+    else
+        val fields = fields_of(s)
+
+        for i in 0..<fields.len()
+            body.push(guard_stmt(at, compare(at, "!=", self_field(at, fields.at(i)),
+                                             rhs_field(at, fields.at(i))), false))
+
+        body.push(stmt(at, ExprStmt(expr(at, BoolLit(true)))))
+
+    method_of(at, "eq", self_param(at), bool_ref(at), body)
+end eq_method
+
+private same_variant_eq(at: Span, v: EnumVariantDecl) -> Buf[Stmt]
+    var body: Buf[Stmt] = buf()
+
+    for i in 0..<v.fields.len()
+        body.push(guard_stmt(at, compare(at, "!=", ident(at, binder("l", i)),
+                                         ident(at, binder("r", i))), false))
+
+    body.push(stmt(at, ExprStmt(expr(at, BoolLit(true)))))
+    body
+end same_variant_eq
+
+// -- Ord -------------------------------------------------------------------------------------------
+
+// Lexicographic, first field first, written as a ladder rather than as `<` on each field in turn:
+// deciding a position takes *two* comparisons -- this one is less, or it is greater, or the two
+// agree and the next field decides. All-tied ends `false`, since a value is not less than one it
+// agrees with everywhere.
+private ord_method(at: Span, s: Stmt) -> MethodDecl
+    var body: Buf[Stmt] = buf()
+
+    if !is_sum(s)
+        val fields = fields_of(s)
+
+        for i in 0..<fields.len()
+            body.push(guard_stmt(at, compare(at, "<", self_field(at, fields.at(i)),
+                                             rhs_field(at, fields.at(i))), true))
+            body.push(guard_stmt(at, compare(at, "<", rhs_field(at, fields.at(i)),
+                                             self_field(at, fields.at(i))), false))
+
+        body.push(stmt(at, ExprStmt(expr(at, BoolLit(false)))))
+    else if simple_sum(variants_of(s))
+        // A simple sum is its discriminant, so its order is the discriminants' and there is nothing
+        // to walk.
+        body.push(stmt(at, ExprStmt(compare(at, "<",
+                                            call_of(at, ident(at, "int"),
+                                                    one_arg(ident(at, "self"))),
+                                            call_of(at, ident(at, "int"),
+                                                    one_arg(ident(at, "rhs")))))))
+    else
+        // **Variants first, then fields.** A `Circle` is less than a `Rect` because it is declared
+        // first, and two `Rect`s are decided by their fields -- so the tag is compared before
+        // anything is taken apart, and the pair-match below only ever runs where the tags agree.
+        val vs = variants_of(s)
+
+        body.push(stmt(at, ValDecl("l", None, tag_of(at, ident(at, "self"), vs), Public, None, None)))
+        body.push(stmt(at, ValDecl("r", None, tag_of(at, ident(at, "rhs"), vs), Public, None, None)))
+        body.push(stmt(at, ExprStmt(expr(at, IfExpr(
+            compare(at, "!=", ident(at, "l"), ident(at, "r")),
+            one_stmt_of(stmt(at, Return(Some(compare(at, "<", ident(at, "l"),
+                                                     ident(at, "r")))))),
+            None)))))
+        body.push(pair_match(at, vs, false))
+
+    method_of(at, "lt", self_param(at), bool_ref(at), body)
+end ord_method
+
+private same_variant_ord(at: Span, v: EnumVariantDecl) -> Buf[Stmt]
+    var body: Buf[Stmt] = buf()
+
+    for i in 0..<v.fields.len()
+        body.push(guard_stmt(at, compare(at, "<", ident(at, binder("l", i)),
+                                         ident(at, binder("r", i))), true))
+        body.push(guard_stmt(at, compare(at, "<", ident(at, binder("r", i)),
+                                         ident(at, binder("l", i))), false))
+
+    body.push(stmt(at, ExprStmt(expr(at, BoolLit(false)))))
+    body
+end same_variant_ord
+
+// -- Hash ------------------------------------------------------------------------------------------
+
+// The fields mixed in order with FNV's prime, seeded from the offset basis rather than from the
+// first field's hash -- which is what lets the empty struct and the one-field struct take the same
+// shape rather than needing a case each.
+private hash_method(at: Span, s: Stmt) -> MethodDecl
+    var body: Buf[Stmt] = buf()
+
+    body.push(stmt(at, VarDecl("h", None, Some(u64_of(at, fnv_basis())), Public, None, None)))
+
+    if !is_sum(s)
+        val fields = fields_of(s)
+
+        for i in 0..<fields.len()
+            body.push(mix_in(at, call_of(at, field_of(at, self_field(at, fields.at(i)), "hash"),
+                                         no_args())))
+    else
+        // The **tag is mixed first**, so two variants carrying equal payloads are different keys --
+        // `Some(0)` and a one-field `Other(0)` have to be, or a table holding both collides on
+        // every insert. Then each variant's own fields, which is the product case one level down.
+        val vs = variants_of(s)
+
+        body.push(mix_in(at, call_of(at, ident(at, "hash_u64"),
+                                     one_arg(call_of(at, ident(at, "u64"),
+                                                     one_arg(tag_of(at, ident(at, "self"), vs)))))))
+
+        if !simple_sum(vs)
+            var arms: Buf[MatchArm] = buf()
+
+            for i in 0..<vs.len()
+                val v = vs.at(i)
+                var inner: Buf[Stmt] = buf()
+
+                if v.fields.is_empty() then inner.push(stmt(at, ExprStmt(expr(at, UnitLit))))
+                else
+                    for j in 0..<v.fields.len()
+                        inner.push(mix_in(at, call_of(at, field_of(at, ident(at, binder("l", j)),
+                                                                   "hash"), no_args())))
+
+                arms.push(arm_of(at, variant_pattern(at, v, "l"), inner))
+
+            body.push(stmt(at, ExprStmt(expr(at, MatchExpr(ident(at, "self"), arms)))))
+
+    body.push(stmt(at, ExprStmt(call_of(at, ident(at, "hash_u64"), one_arg(ident(at, "h"))))))
+    method_of(at, "hash", buf(), Some(TypeRef(at, NamedType("u64", buf()))), body)
+end hash_method
+
+// `h = h * prime ^ <part>` -- one step of the FNV fold. The multiply is what carries the position,
+// so that a value's parts in a different order are a different key; a plain XOR would make them the
+// same one.
+private mix_in(at: Span, part: Expr) -> Stmt =
+    stmt(at, ExprStmt(expr(at, Assign("=", ident(at, "h"),
+                                      expr(at, Binary("^",
+                                                      expr(at, Binary("*", ident(at, "h"),
+                                                                      u64_of(at, fnv_prime()))),
+                                                      part))))))
+
+// -- Display ---------------------------------------------------------------------------------------
+
+// The name of the renderer a derived `Display` writes its parts through.
+//
+// **The space is what makes it unforgeable.** An ordinary identifier is letters, digits and `_`, so
+// no unquoted name can collide with this one, and a program that wanted to collide would have to
+// write the backticks out itself.
+private render_name(name: string) -> string = s"render $name"
+
+// What the renderer's receiver is called. Not `self`: it is an ordinary function rather than a
+// member, and `self` there would read as a receiver it does not have.
+private subject_param() -> string = "v"
+
+private writer_param(at: Span) -> Param =
+    param_of(at, "out", TypeRef(at, PtrType(TypeRef(at, NamedType("Writer", buf())))))
+
+private spec_param(at: Span, name: string) -> Param =
+    param_of(at, name, TypeRef(at, NamedType("FormatSpec", buf())))
+
+// A shape with no parts renders as one string literal, which `display_pad` already pads without
+// gathering anything.
+private display_literal_method(at: Span, name: string, s: Stmt) -> MethodDecl
+    var text = expr(at, StrLit(name))
+
+    if is_sum(s)
+        val vs = variants_of(s)
+        var arms: Buf[MatchArm] = buf()
+
+        for i in 0..<vs.len()
+            arms.push(arm_of(at, any_of(at, vs.at(i)),
+                             one_stmt_of(stmt(at, ExprStmt(expr(at, StrLit(vs.at(i).name)))))))
+
+        text = expr(at, MatchExpr(ident(at, "self"), arms))
+    end if
+
+    var args: Buf[Expr] = buf()
+
+    args.push(field_of(at, text, "bytes"))
+    args.push(ident(at, "out"))
+    args.push(ident(at, "fmt"))
+
+    var params: Buf[Param] = buf()
+
+    params.push(writer_param(at))
+    params.push(spec_param(at, "fmt"))
+
+    method_of(at, "display", params, None,
+              one_stmt_of(stmt(at, ExprStmt(call_of(at, ident(at, "display_pad"), args)))))
+end display_literal_method
+
+// `Size(3, 4)` -- the type's own name and its fields in order, which is the tuple's rendering with
+// the name in front.
+//
+// **Two declarations, because the field belongs to the whole value and the parts do not.** A
+// specifier describes the field the *whole* value occupies, so `%12s` on a `Size` pads the `Size`
+// and not its first field -- and the only way to pad once is to know how wide the parts came out
+// before writing them.
+private renderer_decl(at: Span, name: string, tparams: Buf[string], bounds: Buf[NamedBounds],
+                      tvalues: Buf[TypeBinding], s: Stmt) -> Stmt
+    var body: Buf[Stmt] = buf()
+
+    if !is_sum(s)
+        val fields = fields_of(s)
+        var parts: Buf[Expr] = buf()
+
+        for i in 0..<fields.len()
+            parts.push(field_of(at, ident(at, subject_param()), fields.at(i)))
+
+        body = writes_of(at, name, parts)
+    else
+        // A variant renders under **its own** name rather than the enum's, which is how it is
+        // written: `Circle(2)`, not `Shape(2)`.
+        val vs = variants_of(s)
+        var arms: Buf[MatchArm] = buf()
+
+        for i in 0..<vs.len()
+            val v = vs.at(i)
+            var parts: Buf[Expr] = buf()
+
+            for j in 0..<v.fields.len()
+                parts.push(ident(at, binder("l", j)))
+
+            arms.push(arm_of(at, variant_pattern(at, v, "l"), writes_of(at, v.name, parts)))
+
+        body.push(stmt(at, ExprStmt(expr(at, MatchExpr(ident(at, subject_param()), arms)))))
+
+    var targs: Buf[TypeRef] = buf()
+
+    for i in 0..<tparams.len()
+        targs.push(TypeRef(at, NamedType(tparams.at(i), buf())))
+
+    var params: Buf[Param] = buf()
+
+    params.push(param_of(at, subject_param(), TypeRef(at, NamedType(name, targs))))
+    params.push(writer_param(at))
+    params.push(spec_param(at, "parts"))
+
+    stmt(at, FuncDecl(FuncDecl(render_name(name), tparams, params, None, body, bounds, false, File,
+                               buf(), tvalues, buf(), None, None, None, false, false, false, None,
+                               None, None, None, buf(), buf())))
+end renderer_decl
+
+private write_text(at: Span, text: string) -> Stmt =
+    stmt(at, ExprStmt(call_of(at, field_of(at, ident(at, "out"), "write"),
+                              one_arg(field_of(at, expr(at, StrLit(text)), "bytes")))))
+
+// `Size(`, each part, `, ` between them, `)` -- the rendering as a sequence of writes rather than as
+// a string that was built to be written once.
+//
+// Each part is handed the **neutral** specifier, which is exactly what a rendering handed it before:
+// the specifier that arrived describes the field the whole value occupies, so applying it to a part
+// would pad inside the rendering.
+private writes_of(at: Span, name: string, parts: Buf[Expr]) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    if parts.is_empty()
+        out.push(write_text(at, name))
+        return out
+    end if
+
+    out.push(write_text(at, s"$name("))
+
+    for i in 0..<parts.len()
+        if i > 0 then out.push(write_text(at, ", "))
+
+        var args: Buf[Expr] = buf()
+
+        args.push(ident(at, "out"))
+        args.push(ident(at, "parts"))
+        out.push(stmt(at, ExprStmt(call_of(at, field_of(at, parts.at(i), "display"), args))))
+
+    out.push(write_text(at, ")"))
+    out
+end writes_of
+
+// Measure, pad, render, pad -- the body of a derived `display`, which is the shape every compound
+// rendering in the library has. The sink is built only where a width was actually asked for, so an
+// ordinary print costs one pass and allocates nothing at all.
+private display_method(at: Span, name: string) -> MethodDecl
+    val helper = render_name(name)
+    val width = field_of(at, ident(at, "fmt"), "width")
+    var body: Buf[Stmt] = buf()
+    var spec_args: Buf[Expr] = buf()
+
+    spec_args.push(int_of(at, "0"))
+    spec_args.push(expr(at, Unary("-", int_of(at, "1"))))
+    spec_args.push(expr(at, BoolLit(false)))
+
+    body.push(stmt(at, ValDecl("parts", None,
+                               call_of(at, ident(at, "FormatSpec"), spec_args), Public, None,
+                               None)))
+    body.push(stmt(at, VarDecl("pad", None, Some(int_of(at, "0")), Public, None, None)))
+
+    var measure: Buf[Stmt] = buf()
+
+    measure.push(stmt(at, VarDecl("count", None,
+                                  Some(call_of(at, ident(at, "Counting"),
+                                               one_arg(int_of(at, "0")))), Public, None, None)))
+    measure.push(stmt(at, VarDecl("sink",
+                                  Some(TypeRef(at, PtrType(TypeRef(at,
+                                                                   NamedType("Writer", buf()))))),
+                                  Some(expr(at, Unary("&", ident(at, "count")))), Public, None,
+                                  None)))
+    measure.push(render_call(at, helper, ident(at, "sink")))
+    measure.push(stmt(at, ExprStmt(expr(at, Assign("=", ident(at, "pad"),
+        expr(at, Binary("-", width, call_of(at, ident(at, "int"),
+                                            one_arg(field_of(at, ident(at, "count"), "n"))))))))))
+    measure.push(stmt(at, ExprStmt(expr(at, IfExpr(
+        compare(at, "<", ident(at, "pad"), int_of(at, "0")),
+        one_stmt_of(stmt(at, ExprStmt(expr(at, Assign("=", ident(at, "pad"), int_of(at, "0")))))),
+        None)))))
+
+    body.push(stmt(at, ExprStmt(expr(at, IfExpr(compare(at, ">", width, int_of(at, "0")), measure,
+                                                None)))))
+
+    var fill_args: Buf[Expr] = buf()
+
+    fill_args.push(ident(at, "out"))
+    fill_args.push(int_of(at, "32"))
+    fill_args.push(ident(at, "pad"))
+
+    val fill = stmt(at, ExprStmt(call_of(at, ident(at, "display_fill"), fill_args)))
+
+    body.push(stmt(at, ExprStmt(expr(at, IfExpr(expr(at, Unary("!", field_of(at, ident(at, "fmt"),
+                                                                            "left"))),
+                                                one_stmt_of(fill), None)))))
+    body.push(render_call(at, helper, ident(at, "out")))
+    body.push(stmt(at, ExprStmt(expr(at, IfExpr(field_of(at, ident(at, "fmt"), "left"),
+                                                one_stmt_of(fill), None)))))
+
+    var params: Buf[Param] = buf()
+
+    params.push(writer_param(at))
+    params.push(spec_param(at, "fmt"))
+    method_of(at, "display", params, None, body)
+end display_method
+
+private render_call(at: Span, helper: string, sink: Expr) -> Stmt
+    var args: Buf[Expr] = buf()
+
+    args.push(ident(at, "self"))
+    args.push(sink)
+    args.push(ident(at, "parts"))
+    stmt(at, ExprStmt(call_of(at, ident(at, helper), args)))
+end render_call

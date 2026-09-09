@@ -73,10 +73,27 @@ call_bound_method(cx: &Analyzer, span: Span, receiver: TExpr, subject: Type, nam
                           "it has no receiver — a value cannot be the thing it is called on")
 
     val scope = trait_scope_of(cx.an, tr.name)
+    // **A member's own type parameters stand in for themselves, carrying what it asked of them.**
+    // A bare arrow in the signature became one of them, so without this a closure standing at
+    // `f: int -> int` is read against a name nothing here answers for and comes back unknown.
+    val terms = joined_bindings(subst, abstract_subst(cx.an, scope, m.tparams, m.bounds, m.tvalues,
+                                                      m.tpacks, subst))
+    // **What a written type SAYS about one is open until the call settles it**, which is the other
+    // half of the same rule: `f: &Fn(int) -> U` tells a closure what it takes and nothing about what
+    // it yields, so `U` stands at nothing and the body is what answers. A parameter that *is* one of
+    // those names is the exception -- there the bound is the whole of what was said.
+    var open_terms = subst
+
+    for i in 0..<m.tparams.len()
+        open_terms = joined_bindings(open_terms, one_binding(m.tparams.at(i), Unknown))
+
     var params: Buf[(string, Type)] = buf()
 
     for i in 0..<m.params.len()
-        params.push((m.params.at(i).name, resolve_type(cx.an, scope, m.params.at(i).typ, subst)))
+        val written = m.params.at(i).typ
+        val at = if names_own_tparam(written, m.tparams) then terms else open_terms
+
+        params.push((m.params.at(i).name, resolve_type(cx.an, scope, written, at)))
 
     if args.len() != params.len() && !m.variadic
         cx.an.bound_fault(cx.scope, span, s"$shown takes ${quantity(params.len(), "argument")}, but " +
@@ -92,19 +109,68 @@ call_bound_method(cx: &Analyzer, span: Span, receiver: TExpr, subject: Type, nam
         val want = if i < params.len() then Some(params.at(i).1) else None
         val t = type_expr(cx, args.at(i), want)
 
-        if want.is_some() && disagree(texpr_type(t), want.unwrap()) then
+        // A parameter standing in for itself is held to its **bounds** and not to being the same
+        // type as what arrived: that is the whole of what a bound licenses.
+        if want.is_some() && !stands_for_itself(want.unwrap()) &&
+                disagree(texpr_type(t), want.unwrap()) then
             cx.an.bound_fault(cx.scope, args.at(i).span,
                               s"'${params.at(i).0}' of '${module_show(tr.name)}.$name' is " +
                               s"${type_show(want.unwrap())}, but ${type_show(texpr_type(t))} was given")
 
         ts.push(t)
 
+    // **The member's own type parameters are solved from what the call supplied**, exactly as a
+    // generic function's are: `apply[U](self, f: &Fn(int) -> U) -> U` learns what `U` is from the
+    // closure that arrived, and the result the call yields is that.
+    var solved = subst
+
+    if !m.tparams.is_empty()
+        var param_refs: Buf[TypeRef] = buf()
+        var arg_tys: Buf[Type] = buf()
+        var soft: Buf[bool] = buf()
+
+        for i in 0..<m.params.len()
+            param_refs.push(m.params.at(i).typ)
+
+            if i + 1 < ts.len()
+                arg_tys.push(texpr_type(ts.at(i + 1)))
+                soft.push(false)
+
+        val own = solve(cx.an, scope, span, fname, m.tparams, param_refs, arg_tys, None, None, soft,
+                        m.bounds, subst)
+
+        for i in 0..<m.tparams.len()
+            if i < own.len() && own.at(i) != Unknown then
+                solved = joined_bindings(solved, one_binding(m.tparams.at(i), own.at(i)))
+    end if
+
     val ret = if m.ret_type.is_some() then
-                  declared_result_type(Some(resolve_type(cx.an, scope, m.ret_type.unwrap(), subst)))
+                  declared_result_type(Some(resolve_type(cx.an, scope, m.ret_type.unwrap(), solved)))
               else Unit
 
+    cx.an.uses(fname)
     TExpr(span, TCall(fname, ts, ret, false))
 end call_bound_method
+
+// Whether a written type is one of the member's own parameters, named bare -- which is what a bare
+// arrow in a signature became.
+private names_own_tparam(t: TypeRef, tparams: Buf[string]) -> bool = *t.kind match
+    NamedType(n, args) -> args.is_empty() && holds_string(tparams, n)
+    _ -> false
+
+// One binding, as a list of one.
+private one_binding(name: string, t: Type) -> Buf[Binding]
+    var out: Buf[Binding] = buf()
+
+    out.push(Binding(name, t))
+    out
+end one_binding
+
+// Whether a type is a parameter standing in for itself, which is what a bound's argument is while a
+// call through the bound is being read.
+private stands_for_itself(t: Type) -> bool = t match
+    Abstract(_, _) -> true
+    _ -> false
 
 // `T.f(…)` where `T` is a type parameter and `f` is an associated function one of its bounds
 // declares -- what a bound method call is to a value, asked of the type itself.
@@ -133,10 +199,15 @@ call_bound_associated(cx: &Analyzer, span: Span, subject: Type, name: string, bo
                           s"value of '${type_show(subject)}', not on the type itself")
 
     val scope = trait_scope_of(cx.an, tr.name)
+    // **A member's own type parameters stand in for themselves, carrying what it asked of them.**
+    // A bare arrow in the signature became one of them, so without this a closure standing at
+    // `f: int -> int` is read against a name nothing here answers for and comes back unknown.
+    val terms = joined_bindings(subst, abstract_subst(cx.an, scope, m.tparams, m.bounds, m.tvalues,
+                                                      m.tpacks, subst))
     var params: Buf[(string, Type)] = buf()
 
     for i in 0..<m.params.len()
-        params.push((m.params.at(i).name, resolve_type(cx.an, scope, m.params.at(i).typ, subst)))
+        params.push((m.params.at(i).name, resolve_type(cx.an, scope, m.params.at(i).typ, terms)))
 
     if args.len() != params.len() && !m.variadic
         cx.an.bound_fault(cx.scope, span, s"$shown takes ${quantity(params.len(), "argument")}, but " +
@@ -152,9 +223,10 @@ call_bound_associated(cx: &Analyzer, span: Span, subject: Type, name: string, bo
         ts.push(type_expr(cx, args.at(i), want))
 
     val ret = if m.ret_type.is_some() then
-                  declared_result_type(Some(resolve_type(cx.an, scope, m.ret_type.unwrap(), subst)))
+                  declared_result_type(Some(resolve_type(cx.an, scope, m.ret_type.unwrap(), terms)))
               else Unit
 
+    cx.an.uses(s"${tr.name}.$name")
     TExpr(span, TCall(s"${tr.name}.$name", ts, ret, false))
 end call_bound_associated
 
@@ -199,6 +271,7 @@ read_bound_property(cx: &Analyzer, span: Span, receiver: TExpr, subject: Type, n
     var ts: Buf[TExpr] = buf()
 
     ts.push(receiver)
+    cx.an.uses(s"${tr.name}.$name")
     TExpr(span, TCall(s"${tr.name}.$name", ts, ret, false))
 end read_bound_property
 

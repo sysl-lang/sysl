@@ -209,6 +209,19 @@ tables_for(t: Target) -> &Tables =
     Tables(t, layout_for(t), buf(), table(), table(), table(), table(), table(), table(), table(),
            table(), buf(), table(), table(), table(), table(), buf(), buf(), member_tables())
 
+// The names a compilation has produced, held behind a reference so that the undo log can put a
+// trial's back.
+struct Reached
+    names: Buf[string]
+
+    holds(self, name: string) -> bool
+        for i in 0..<self.names.len()
+            if self.names.at(i) == name then return true
+
+        false
+    end holds
+end Reached
+
 // The analyzer's state while the declarations are being read: the tables, what it has to say, and
 // the undo log a speculative walk rewinds through.
 //
@@ -237,6 +250,35 @@ struct Analysis
     // The `call` bodies those closures lowered to, in the order they were lowered. They are
     // functions of the compilation like any other, and go after everything a program declared.
     closure_funcs: Buf[TFunc]
+
+    // Every function name this compilation has **produced** -- at a call, at an address, or as the
+    // entry the platform runs. It is what says which of the library's bodies the program reaches:
+    // the library is analyzed on demand, so nothing reaches its printing surface in a program that
+    // never prints.
+    //
+    // **It is written through the undo log**, which is what keeps a trial from reaching anything: a
+    // reading that was thrown away asked a question, and the call it wrote down while asking is not
+    // one the program makes.
+    reached: &Reached
+
+    // Records a name as produced. The set is what matters and not the order, but the order is what
+    // a walk over it reads, so a name is kept once.
+    uses(*self, name: string)
+        if self.reached.holds(name) then return
+
+        val set = self.reached
+        val mark = set.names.len()
+
+        if self.journal.recording() then self.journal.record(() -> set.names.truncate(mark))
+
+        set.names.push(name)
+    end uses
+
+    // Whether a name has been produced.
+    used(self, name: string) -> bool = self.reached.holds(name)
+
+    // The names produced so far, in the order they were first reached.
+    funcs_used(self) -> Buf[string] = self.reached.names
 
     // Records an error about a place that a **thrown-away trial must keep**, which is the one kind
     // of complaint the walk over a generic body at its own definition makes.
@@ -315,7 +357,7 @@ end already_said
 
 // An analysis over empty tables.
 analysis_for(t: Target) -> &Analysis =
-    Analysis(tables_for(t), buf(), buf(), journal(), buf(), 0, buf())
+    Analysis(tables_for(t), buf(), buf(), journal(), buf(), 0, buf(), Reached(buf()))
 
 // -- how far a declaration reaches ---------------------------------------------------------------
 
