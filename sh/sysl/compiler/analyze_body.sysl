@@ -27,6 +27,16 @@ struct TypedBodies
     // instantiations the calls asked for -- functions a program never wrote a heading for, so a test
     // reading "the last body" means the last one somebody typed.
     declared: usize
+
+    // The tables the walk filled and the trees it read, so that what a whole program is made of --
+    // its tables, its storage, its tests -- can be assembled without reading everything twice.
+    an: &Analysis
+    units: Buf[Program]
+
+    // The entry point, read while there was still a pass that would go and analyze whatever it
+    // reached: an entry wants a library conversion, and marking one as reached after the fixpoint
+    // would name a function nothing analyzed.
+    entry: Option[TEntry]
 end TypedBodies
 
 // Reads a compilation's declarations and types every body it can.
@@ -89,6 +99,10 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
         if from_library(home) then held.push(HeldBody(m.name, home, span_zero(), m, Some(m)))
         else funcs.push(analyze_instance(a, m.name, m))
 
+    // The entry point, before the queue is drained, since what it reaches has to be analyzed with
+    // everything else a program reaches.
+    val entry = declared_entry(a)
+
     // Then the instantiations, drained until nothing more is asked for: typing one body may reach a
     // call that asks for another.
     drain_pending(a, &funcs)
@@ -128,7 +142,7 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
     for i in 0..<a.closure_funcs.len()
         funcs.push(a.closure_funcs.at(i))
 
-    TypedBodies(funcs, a.diagnostics(), generic, defaults, declared)
+    TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, a, units, entry)
 end analyze_bodies
 
 // One body waiting for something to reach it: the name it will be analyzed under, the terms it was
@@ -300,8 +314,25 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl)
 
     a.release(trial)
     a.restore_complaints(mark)
-    a.tables.members.pending.truncate(queued)
+    rewind_instantiations(a, queued)
 end check_abstract_body
+
+// The instantiations this reading asked for, taken back out.
+//
+// **A REGISTRATION LEFT BEHIND IS AN INSTANTIATION NOBODY WILL EVER TYPE.** Asking for one records
+// its signature and queues its body, and the two have to be rewound together: dropping the queue
+// alone leaves the *name* registered, so a later reading that genuinely wants it finds a signature
+// already there, asks for nothing, and the program ends up calling a body no pass analyzed. It cost
+// `Buf[string]`, `Buf[sh.sysl.parsing.Span]` and everything each of those reaches, all of them
+// first asked for from inside a generic body being read at its own definition.
+private rewind_instantiations(a: &Analysis, queued: usize)
+    val pending = a.tables.members.pending
+
+    for i in queued..<pending.len()
+        a.tables.members.func_insts.remove(pending.at(i).name)
+
+    a.tables.members.pending.truncate(queued)
+end rewind_instantiations
 
 // One function whose signature the tables already hold, under the name they hold it by: a member
 // lowered from a type's body or from an `impl` block, or one instantiation of a generic.
@@ -619,7 +650,7 @@ private typed_of(text: string) -> TypedBodies
         for i in 0..<parsed.report.len()
             said.push(Placed(src, parsed.report.at(i)))
 
-        return TypedBodies(buf(), said, 0, 0, 0)
+        return TypedBodies(buf(), said, 0, 0, 0, analysis_for(host_target()), buf(), None)
     end if
 
     var units: Buf[Program] = buf()

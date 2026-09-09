@@ -1,0 +1,111 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// What a whole program is made of, assembled once every body has been typed.
+//
+// **The typed tree is one function at a time and a program is not**: what a back end is handed is
+// the layouts, the tables, the storage, the entry point and the scaffolding a test run needs, and
+// every one of those is a question about the compilation rather than about any one body. This is
+// where they are answered.
+
+// The entry point a program declared, where it declared one.
+//
+// **Read after the bodies are typed and before the held ones are**, because the conversion an entry
+// wants is a library function: marking one as reached has to happen while there is still a pass that
+// will go and analyze it.
+declared_entry(a: &Analysis) -> Option[TEntry]
+    var found: Option[string] = None
+
+    for i in 0..<a.tables.funcs.len()
+        val key = a.tables.funcs.key_at(i)
+
+        if module_bare(key) == "main" && !a.tables.externs.has(key) && found.is_none() then
+            found = Some(key)
+
+    if found.is_none() then return None
+
+    val key = found.unwrap()
+    val f = a.tables.funcs.get(key).unwrap()
+    val ret = if f.decl.ret_type.is_none() then Unit
+    else resolve_type(a, f.scope, f.decl.ret_type.unwrap(), no_bindings())
+
+    // **A `main` either yields nothing or answers with a `Result[unit, E]`**, and the second is what
+    // lets `?` reach the top of a program. Nothing else is admitted: an exit status is one byte and
+    // a result is a value, so mapping one onto the other is the program's own business.
+    val fallible = result_entry(a, ret)
+    val reporter = entry_reporter(a, fallible)
+
+    if f.decl.params.is_empty() then return Some(TEntry(key, None, reporter, fallible))
+
+    // The one parameter a platform can fill: the program's arguments, which the library reads.
+    val first = resolve_type(a, f.scope, f.decl.params.at(0).typ, no_bindings())
+    val args_fn = a_library_key(a, "args_of")
+
+    if f.decl.params.len() == 1 && takes_args(first) && args_fn.is_some()
+        a.uses(args_fn.unwrap())
+
+        return Some(TEntry(key, args_fn, reporter, fallible))
+    end if
+
+    Some(TEntry(key, None, reporter, fallible))
+end declared_entry
+
+// Whether a parameter is the `[]string` a platform fills with the program's arguments.
+private takes_args(t: Type) -> bool = t match
+    Slice(elem, _) -> *elem match
+        Str -> true
+        _ -> false
+    _ -> false
+
+// The `Result[unit, E]` a fallible entry answers with, where that is what it answers with.
+private result_entry(a: &Analysis, ret: Type) -> Option[Type] = ret match
+    Enum(d) ->
+        if d.base == library_key("Result") && !d.targs.is_empty() && no_value(d.targs.at(0)) then
+            Some(ret)
+        else None
+    _ -> None
+
+// The library function an entry's failure is reported through, instantiated at what the entry
+// carries. It is a function the program never wrote, so reaching it is recorded here.
+private entry_reporter(a: &Analysis, fallible: Option[Type]) -> Option[string]
+    if fallible.is_none() then return None
+
+    val key = a_library_key(a, "main_result")
+
+    if key.is_none() then return None
+
+    fallible.unwrap() match
+        Enum(d) ->
+            if d.targs.len() < 2 then return None
+
+            val f = a.tables.funcs.get(key.unwrap())
+
+            if f.is_none() then return None
+
+            var targs: Buf[Type] = buf()
+
+            targs.push(d.targs.at(1))
+
+            val sym = instantiate_func(a, f.unwrap().scope, f.unwrap().decl, targs, false)
+
+            a.uses(sym)
+            Some(sym)
+        _ -> None
+end entry_reporter
+
+// The key the library files one of its own names under, looked up rather than composed.
+private a_library_key(a: &Analysis, name: string) -> Option[string]
+    val direct = module_qualify(StdModule, name)
+
+    if a.tables.funcs.has(direct) then return Some(direct)
+
+    for i in 0..<a.tables.funcs.len()
+        val key = a.tables.funcs.key_at(i)
+        val bare = library_spelling(key)
+
+        if bare.is_some() && bare.unwrap() == name then return Some(key)
+
+    None
+end a_library_key
