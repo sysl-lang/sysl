@@ -21,8 +21,15 @@ declared_entry(a: &Analysis) -> Option[TEntry]
     for i in 0..<a.tables.funcs.len()
         val key = a.tables.funcs.key_at(i)
 
-        if module_bare(key) == "main" && !a.tables.externs.has(key) && found.is_none() then
-            found = Some(key)
+        if module_bare(key) == "main" && !a.tables.externs.has(key)
+            // **A program starts in one place, so it declares one `main`.** The first is the
+            // program's and every one after it is told which declaration already holds the name.
+            if found.is_none() then found = Some(key)
+            else
+                val other = a.tables.funcs.get(key).unwrap()
+
+                a.fault(other.scope, other.span, "'main' is where a program starts, so there is " +
+                        s"one — ${module_show(found.unwrap())} already declares it")
 
     if found.is_none() then return None
 
@@ -31,26 +38,69 @@ declared_entry(a: &Analysis) -> Option[TEntry]
     val ret = if f.decl.ret_type.is_none() then Unit
     else resolve_type(a, f.scope, f.decl.ret_type.unwrap(), no_bindings())
 
+    // **The first of these ends the reading**, because everything after it is a question about a
+    // signature the platform has already been told it cannot call.
+    if !f.decl.tparams.is_empty()
+        a.fault(f.scope, f.span, "'main' is called by the platform, which has no type arguments " +
+                "to give it")
+        return None
+    end if
+
     // **A `main` either yields nothing or answers with a `Result[unit, E]`**, and the second is what
     // lets `?` reach the top of a program. Nothing else is admitted: an exit status is one byte and
-    // a result is a value, so mapping one onto the other is the program's own business.
+    // a result is a value, so mapping one onto the other is the program's own business -- and the
+    // refusal names the answer, since `exit` is how a program chooses its own status.
     val fallible = result_entry(a, ret)
+
+    if fallible.is_none() && !no_value(ret)
+        a.fault(f.scope, f.span, "'main' yields nothing or a 'Result[unit, E]', so it may not " +
+                s"result in ${type_show(ret)} — a program's exit status is not something a " +
+                "signature can say. 'exit(code)' is how a program chooses its own, and prints " +
+                "nothing")
+        return None
+    end if
+
+    if f.decl.variadic
+        a.fault(f.scope, f.span, "'main' is called with the arguments the platform has, not a " +
+                "list it reads")
+        return None
+    end if
+
     val reporter = entry_reporter(a, fallible)
 
     if f.decl.params.is_empty() then return Some(TEntry(key, None, reporter, fallible))
 
     // The one parameter a platform can fill: the program's arguments, which the library reads.
+    // Written either way: the arguments are the platform's and a program that only reads them may
+    // say so, since the two views are one layout.
     val first = resolve_type(a, f.scope, f.decl.params.at(0).typ, no_bindings())
     val args_fn = a_library_key(a, "args_of")
 
-    if f.decl.params.len() == 1 && takes_args(first) && args_fn.is_some()
+    if f.decl.params.len() == 1 && takes_args(first)
+        if args_fn.is_none() then return Some(TEntry(key, None, reporter, fallible))
+
         a.uses(args_fn.unwrap())
 
         return Some(TEntry(key, args_fn, reporter, fallible))
     end if
 
-    Some(TEntry(key, None, reporter, fallible))
+    a.fault(f.scope, f.span, "'main' takes either nothing or one '[]string' of the program's " +
+            s"arguments, not (${entry_params(a, f)})")
+
+    None
 end declared_entry
+
+// What a `main` declares that the platform cannot fill, as the refusal names them.
+private entry_params(a: &Analysis, f: Func) -> string
+    var out = ""
+
+    for i in 0..<f.decl.params.len()
+        val t = resolve_type(a, f.scope, f.decl.params.at(i).typ, no_bindings())
+
+        out = out + (if i > 0 then ", " else "") + type_show(t)
+
+    out
+end entry_params
 
 // Whether a parameter is the `[]string` a platform fills with the program's arguments.
 private takes_args(t: Type) -> bool = t match
