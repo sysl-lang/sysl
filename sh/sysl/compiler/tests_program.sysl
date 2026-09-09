@@ -510,3 +510,231 @@ a_generic_member_is_instantiated_from_its_call()
     val out = shown("use(o: sysl.Option[int]) -> sysl.Option[string] = o.map(n -> str(n))\n", "use")
 
     assert(out.contains("sysl$Option.map"), out)
+
+// -- the atomics ------------------------------------------------------------------------------------
+
+// The ordering is a variant written at the call, so every atomic test brings the enum into scope.
+private ordering_import() -> string = "import sysl.sync.Ordering\n\n"
+
+@test("an atomic load reads the word its address points at, at the ordering written")
+an_atomic_load_reads_a_word()
+    if no_library() then return
+
+    val src = ordering_import() + "use(p: *i32) -> i32 = atomic_load(p, Ordering.Acquire)\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("TAtomic"), out)
+    assert(out.contains("op: \"atomic_load\""), out)
+    assert(out.contains("ordering: \"Acquire\""), out)
+
+@test("a fence is nothing but its ordering, so it reaches no address")
+a_fence_orders_what_is_around_it()
+    if no_library() then return
+
+    val out = shown(ordering_import() + "use() = atomic_fence(Ordering.SeqCst)\n", "use")
+
+    assert(out.contains("TFence"), out)
+    assert(out.contains("ordering: \"SeqCst\""), out)
+
+@test("a load has nothing to release, so a releasing one is refused")
+a_releasing_load_is_refused()
+    if no_library() then return
+
+    val said = complaints(ordering_import() +
+                          "use(p: *i32) -> i32 = atomic_load(p, Ordering.Release)\n")
+
+    assert(says(said, "a load has nothing to release, so 'Release' asks it to publish writes it " +
+                "never made and there is no such instruction — write 'Acquire' to see what the " +
+                "releasing side published, 'Relaxed' if nothing else follows from the read, or " +
+                "'SeqCst'"), s"${said.len()} said")
+
+@test("and a width the machine has no instruction for is refused where it is written")
+an_atomic_at_an_odd_width_is_refused()
+    if no_library() then return
+
+    val said = complaints(ordering_import() +
+                          "use(p: *sysl.Option[int], v: sysl.Option[int]) = " +
+                          "atomic_store(p, v, Ordering.Relaxed)\n")
+
+    assert(said.len() > 0, "the width was refused")
+
+@test("a relaxed fence would order nothing, and the machine has no instruction for one")
+a_relaxed_fence_is_refused()
+    if no_library() then return
+
+    val said = complaints(ordering_import() + "use() = atomic_fence(Ordering.Relaxed)\n")
+
+    assert(says(said, "a fence is nothing but its ordering, so 'Relaxed' would ask for a barrier " +
+                "that orders nothing — write 'Acquire', 'Release', 'AcqRel' or 'SeqCst', or drop " +
+                "the fence. A relaxed *access* is the thing that is meaningful, and that is the " +
+                "ordering on the operation itself"), s"${said.len()} said")
+
+@test("a declaration of the name wins, since these forms take no name out of a program's vocabulary")
+a_declared_atomic_name_wins()
+    if no_library() then return
+
+    val src = "atomic_load(n: int) -> int = n + 1\n\nuse() -> int = atomic_load(2)\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("name: \"atomic_load\""), out)
+
+// -- what a type's own name offers ------------------------------------------------------------------
+
+@test("a simple enum maps a value to its position and a position back to a value")
+an_enum_maps_between_values_and_positions()
+    if no_library() then return
+
+    val src = "enum Colour\n    Red\n    Green\n\nuse(c: Colour) -> int = Colour::Pos(c)\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("TEnumAttr"), out)
+    assert(out.contains("kind: \"Pos\""), out)
+    assert(out.contains("retTy: int"), out)
+
+@test("and a value to the name it was declared under")
+an_enum_maps_a_value_to_its_name()
+    if no_library() then return
+
+    val src = "enum Colour\n    Red\n    Green\n\nuse(c: Colour) -> string = Colour::Image(c)\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("kind: \"Image\""), out)
+    assert(out.contains("retTy: string"), out)
+
+@test("an enum's ends are its first and last variants, folded where they are written")
+an_enum_has_ends()
+    if no_library() then return
+
+    val src = "enum Colour\n    Red\n    Green\n\nuse() -> Colour = Colour::Last\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("TIntLit"), out)
+    assert(out.contains("value: 1"), out)
+
+@test("an integer type states the extremes it can hold, and they fold to literals")
+an_integer_states_its_extremes()
+    if no_library() then return
+
+    val out = shown("use() -> u8 = u8::Max\n", "use")
+
+    assert(out.contains("value: 255"), out)
+
+@test("an integer is not a declared sequence, and its ends are named differently")
+an_integer_has_no_first()
+    if no_library() then return
+
+    val said = complaints("use() -> u8 = u8::First\n")
+
+    assert(says(said, "'u8' is an integer, not a declared sequence — its extremes are 'u8::Min' " +
+                "and 'u8::Max'. 'First' and 'Last' name the ends of an enum's variants or of a " +
+                "'within' range, which is a different question"), s"${said.len()} said")
+
+@test("an enum carrying data has no ordinal maps to read")
+a_data_enum_has_no_attributes()
+    if no_library() then return
+
+    val said = complaints("enum Shape\n    Dot\n    Line(n: int)\n\nuse(s: Shape) -> int = " +
+                          "Shape::Pos(s)\n")
+
+    assert(says(said, "'Shape::Pos' needs a simple enum, and 'Shape' carries data"),
+           s"${said.len()} said")
+
+@test("every type answers its own compile-time identity")
+every_type_answers_an_identity()
+    if no_library() then return
+
+    val out = shown("struct P\n    x: int\n\nuse() -> usize = P::Id\n", "use")
+
+    assert(out.contains("TIntLit"), out)
+    assert(out.contains("ty: usize"), out)
+
+// -- indexing through a trait -----------------------------------------------------------------------
+
+@test("a type with no elements of its own is read by a subscript through 'Index'")
+a_container_is_read_through_index()
+    if no_library() then return
+
+    val src = "struct Row\n    xs: sysl.buf.Buf[int]\n\n" +
+              "impl sysl.Index[usize, int] for Row\n" +
+              "    index(self, i: usize) -> int = self.xs[i]\n\n" +
+              "use(r: Row) -> int = r[0]\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("Row.index"), out)
+
+@test("and set through 'IndexSet', which is a call rather than a store")
+a_container_is_set_through_index_set()
+    if no_library() then return
+
+    val src = "struct Row\n    xs: sysl.buf.Buf[int]\n\n" +
+              "impl sysl.IndexSet[usize, int] for Row\n" +
+              "    index_set(*self, i: usize, v: int) = self.xs.set(i, v)\n\n" +
+              "use(r: *Row) = r[0] = 3\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("Row.index_set"), out)
+
+@test("a compound assignment through the trait would evaluate the receiver twice")
+a_compound_index_assignment_is_refused()
+    if no_library() then return
+
+    val said = complaints("struct Row\n    xs: sysl.buf.Buf[int]\n\n" +
+                          "impl sysl.IndexSet[usize, int] for Row\n" +
+                          "    index_set(*self, i: usize, v: int) = self.xs.set(i, v)\n\n" +
+                          "use(r: *Row) = r[0] += 3\n")
+
+    assert(says(said, "'+=' on an element read through 'Index' would evaluate the receiver and " +
+                "the index twice — write it out as 'b[i] = b[i] + …'"), s"${said.len()} said")
+
+// -- a function's address ---------------------------------------------------------------------------
+
+@test("'&f' on a declared function is the address C's function pointer holds")
+a_function_has_an_address()
+    if no_library() then return
+
+    val src = "twice(n: int) -> int = n * 2\n\n" +
+              "use() -> *extern(int) -> int = &twice\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("TFuncAddr"), out)
+    assert(out.contains("name: \"twice\""), out)
+
+@test("a variadic function is reached by calling it, since a tail has no width to state")
+a_variadic_function_has_no_address()
+    if no_library() then return
+
+    val said = complaints("many(n: int, ...) -> int = n\n\n" +
+                          "use() -> *extern(int) -> int = &many\n")
+
+    assert(says(said, "'many' is variadic, and a '*extern' fixes the arguments a call passes — a " +
+                "tail has no width a signature could state, so a variadic function is reached by " +
+                "calling it"), s"${said.len()} said")
+
+@test("an aggregate crosses to C in whichever registers that machine names, so its address is refused")
+an_aggregate_signature_has_no_address()
+    if no_library() then return
+
+    val said = complaints("struct P\n    x: int\n    y: int\n\n" +
+                          "take(p: P) -> int = p.x\n\n" +
+                          "use() -> *extern(P) -> int = &take\n")
+
+    assert(said.len() > 0, "the aggregate was refused")
+
+// -- a variant with nothing to settle it --------------------------------------------------------------
+
+@test("a nullary variant of a generic enum with nothing to settle it reports rather than picking")
+a_bare_none_with_no_context_reports()
+    if no_library() then return
+
+    val said = complaints("use() -> int\n    val x = None\n\n    3\n")
+
+    assert(says(said, "cannot infer the type argument 'T' of 'None' here — annotate the expected " +
+                "type"), s"${said.len()} said")
+
+@test("and the branch is held over for its sibling, which is what makes the 'if' read")
+a_bare_none_is_held_over_for_its_sibling()
+    if no_library() then return
+
+    val out = shown("use(c: bool) -> sysl.Option[string] = if c then Some(\"a\") else None\n", "use")
+
+    assert(out.contains("sysl.Option[string]"), out)

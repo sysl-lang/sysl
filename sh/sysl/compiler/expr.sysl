@@ -174,6 +174,9 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     BlockArg(body) ->
         closure_expr(cx, e.span, buf(), body, true, expected)
 
+    // `T::Attr` -- what a type's own name offers, and `::Id` on an erased value.
+    TypeAttr(subject, attr) -> type_attr_expr(cx, e.span, subject, attr)
+
     Bad -> bad_expr(e.span)
 
     _ -> cx.err(e.span, deferred_form(e))
@@ -372,6 +375,16 @@ end global_expr
 // A bare name that stands for a variant of an enum, which is the one name form the *expected* type
 // helps to find: a bare `None` still means `Option`'s in a module that declares a `None` of its own.
 private variant_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TExpr
+    // **A nullary variant of a generic enum has nothing in it to say which instantiation is meant**,
+    // so where the position does not say either, this reports rather than picking one. Reporting is
+    // what lets a branch be held over for its sibling: `if c then Some(s) else None` reads the
+    // `else` a second time once the `then` has said what the `Option` carries.
+    val open = unsettled_variant(cx, name, expected)
+
+    if open.is_some() then
+        return cx.err(span, s"cannot infer the type argument '${open.unwrap()}' of '$name' here — " +
+                      "annotate the expected type")
+
     val found = variant_of(cx, name, expected)
 
     if found.is_none() then
@@ -425,6 +438,31 @@ variant_of(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[(Type,
 
     found
 end variant_of
+
+// The type parameter a bare variant name leaves open, where the enum declaring it is generic and
+// nothing here settles it.
+//
+// A nullary variant carries nothing, so unlike `Some(s)` there is no value in it to solve from --
+// and reaching for whichever instantiation some other file happened to register first would make
+// the answer depend on what the rest of the program does.
+private unsettled_variant(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[string]
+    if variant_from_expected(cx, name, expected).is_some() then return None
+
+    for i in 0..<cx.an.tables.types.len()
+        val key = cx.an.tables.types.key_at(i)
+
+        cx.an.tables.types.at(i).kind match
+            EnumOf(e) ->
+                if !e.tparams.is_empty() && reachable_key(cx.an, key, cx.scope) &&
+                        visible_here(cx, key)
+                    for j in 0..<e.variants.len()
+                        if e.variants.at(j).name == name &&
+                                e.variants.at(j).fields.is_empty() then
+                            return Some(e.tparams.at(0))
+            _ -> ()
+
+    None
+end unsettled_variant
 
 // Whether a declaration's module is one this file reads names out of without qualifying them.
 visible_here(cx: &Analyzer, key: string) -> bool
@@ -494,7 +532,15 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
             _ -> ()
 
     if op == "!" then return TExpr(e.span, TUnary("!", analyze_bool(cx, operand), Bool))
-    if op == "&" then return address_expr(cx, e.span, operand)
+    if op == "&"
+        // `&f` on a declared function is C's address of it rather than the address of a place.
+        val named = names_a_declared_function(cx, operand)
+
+        if named.is_some() then
+            return function_address(cx, e.span, named.unwrap(), expected)
+
+        return address_expr(cx, e.span, operand)
+    end if
     if op == "*" then return deref_expr(cx, e.span, operand)
 
     val numeric = numeric_expectation(expected)

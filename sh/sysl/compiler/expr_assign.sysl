@@ -11,6 +11,28 @@ import sysl.buf.{Buf, buf}
 // is the check the constraint asks for.
 
 assign_expr(cx: &Analyzer, span: Span, op: string, target: Expr, value: Expr) -> TExpr
+    // `b[i] = v` on a type with no elements of its own is `IndexSet`, and it is a **call** rather
+    // than a store because a trait's method gives back a value and never an address -- so there is
+    // no place for the ordinary path to write through, and the trait says as much by taking the
+    // value. The compound forms would have to read the element and write it back, which means
+    // evaluating the receiver and the index twice, and a container's subscript is a call.
+    *target.kind match
+        Index(receiver, index) ->
+            if indexes_written(cx, "IndexSet", receiver)
+                if op != "=" then
+                    return cx.err(span, s"'$op' on an element read through 'Index' would evaluate " +
+                                  "the receiver and the index twice — write it out as " +
+                                  s"'b[i] = b[i] ${op[0..<op.bytes.len - 1]} …'")
+
+                var args: Buf[Expr] = buf()
+
+                args.push(index)
+                args.push(value)
+
+                return call_member(cx, span, type_expr_bare(cx, receiver), "index_set", args, None)
+            end if
+        _ -> ()
+
     if op == "="
         val place = analyze_place(cx, target, "assignment")
 

@@ -1,0 +1,335 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, mul, sub, add as add_big}
+import sysl.math.decimal.{Decimal, rescale, Rounding}
+
+// `T::Attr` -- what a type's own name offers.
+//
+// **The left side is a type and not a value**, which is the whole of what tells this form from a
+// selection: `Colour::First` asks the declaration a question, and no value of the type is involved.
+// The one exception is `::Id` on an erased value, which is the one fact about the type inside an
+// object that the object still carries.
+//
+// A simple enum answers its endpoints, the ordinal maps between a value and its position, the
+// neighbouring values, and the name maps. A `within`-ranged subtype answers its ends, the total
+// membership test and the trapping steps. A built-in integer answers the extremes it can hold. And
+// every type answers `Id`.
+
+// `T::Attr`, with no arguments.
+type_attr_expr(cx: &Analyzer, span: Span, receiver: Expr, attr: string) -> TExpr
+    val name = attr_type_name(receiver)
+
+    // **`::Id` on a value reads the identity an erased value carries**, and that is the case the
+    // form exists for: an object has forgotten which type is inside it, and this is the one fact
+    // about that type it still holds. Everywhere else the static type is known and `T::Id` is how
+    // to ask.
+    if name.is_none() || cx.lookup(name.unwrap()).is_some()
+        if attr != "Id" then
+            return cx.err(span, s"'::$attr' is a type attribute, so its left side must be a type " +
+                          "name")
+
+        val t = type_expr_bare(cx, receiver)
+
+        if !erased(texpr_type(t)) then
+            return cx.err(span, s"'::Id' on a value reads the identity an erased value carries, " +
+                          s"and this one is a ${type_show(texpr_type(t))}, whose type is known " +
+                          s"right here — write '${type_show(unqualified(texpr_type(t)))}::Id'")
+
+        return TExpr(span, TTypeId(t, usize_type(word_bits(cx))))
+    end if
+
+    type_attr_call(cx, span, name.unwrap(), attr, buf())
+end type_attr_expr
+
+// `T::Attr(x)` -- the attributes that carry an operand, and the ones that do not, refused by name.
+type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf[Expr]) -> TExpr
+    val subject = attr_subject(cx, span, written)
+
+    if subject.is_none() then
+        return cx.err(span, s"'$written' has no type attributes")
+
+    val ty = subject.unwrap()
+
+    // **`Id` is answered before the dispatch, because it is the one attribute EVERY type has.** The
+    // arms below reach an enum, a constrained subtype and a built-in integer, and everything else
+    // is told it has no type attributes -- which is right for `Max` and wrong for an identity.
+    if attr == "Id"
+        if !args.is_empty() then
+            return cx.err(span, s"'$written::Id' takes no arguments")
+
+        return TExpr(span, TIntLit(type_identity(member_symbol(ty), word_bits(cx)),
+                                   usize_type(word_bits(cx))))
+    end if
+
+    ty match
+        // A parameter standing in for itself, in the one walk that has no argument for it: there is
+        // no width to answer with and none is wanted, since every instantiation supplies one.
+        Abstract(_, _) -> parameter_attr(cx, span, written, attr, args, ty)
+        Enum(d) ->
+            if !d.targs.is_empty() then
+                return cx.err(span, s"'${module_show(d.base)}' is generic, so " +
+                              s"'${module_show(d.base)}::$attr' has no single enum to read")
+
+            enum_attr(cx, span, d, attr, args)
+        Constrained(d) -> constrained_attr(cx, span, d, ty, attr, args)
+        Integer(bits, signed, pw) -> integer_attr(cx, span, written, bits, signed, pw, attr, args)
+        _ -> cx.err(span, s"'$written' has no type attributes")
+end type_attr_call
+
+// The written name a type attribute is asked of, where the left side is one.
+attr_type_name(receiver: Expr) -> Option[string] = *receiver.kind match
+    Ident(n) -> Some(n)
+    _ -> None
+
+// The type a written name stands for here, in the order a reader's own terms are consulted: a type
+// parameter of the body being read, then a declared type, then a built-in integer.
+private attr_subject(cx: &Analyzer, span: Span, written: string) -> Option[Type]
+    val stood = bound_type(cx.subst, written)
+
+    if stood.is_some() then return stood
+
+    val key = lookup_type_key(cx.an, cx.scope, written)
+
+    if key.is_some() then
+        return Some(resolve_type(cx.an, cx.scope, named_type(span, written), cx.subst))
+
+    scalar_type_named(cx, span, written)
+end attr_subject
+
+// What a **type parameter** answers, which is the two extremes and nothing else: every other
+// attribute is asked on a written type name, where the type it belongs to is known while the body is
+// being checked rather than once per instantiation.
+private parameter_attr(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf[Expr],
+                       stood: Type) -> TExpr
+    if attr != "Min" && attr != "Max" then
+        return cx.err(span, s"'$written' is a type parameter, and the only attributes one answers " +
+                      s"are '$written::Min' and '$written::Max' — '::$attr' is asked on a written " +
+                      "type name, where the type it belongs to is known while the body is being " +
+                      "checked rather than once per instantiation")
+
+    if !args.is_empty() then return cx.err(span, s"'$written::$attr' takes no arguments")
+
+    // The walk that checks the body, where `T` stands for itself. The literal is typed as the
+    // parameter, so that a body handing back `T::Max` still agrees with its own declared result.
+    TExpr(span, TIntLit(from_int(0), stood))
+end parameter_attr
+
+// The attributes a **built-in integer type** exposes: its bounds, `Min` and `Max`.
+//
+// They are under different names from an enum's `First`/`Last` on purpose: `First` and `Last` name
+// the ends of a *declared sequence*, `Min` and `Max` the numeric extremes a type can hold. They
+// agree on an integer and part company on an enum, whose first-declared variant need not carry the
+// smallest discriminant.
+private integer_attr(cx: &Analyzer, span: Span, written: string, bits: int, signed: bool,
+                     pw: bool, attr: string, args: Buf[Expr]) -> TExpr
+    if !args.is_empty() then return cx.err(span, s"'$written::$attr' takes no arguments")
+
+    val ty = Integer(bits, signed, pw)
+
+    if attr == "Min" then return TExpr(span, TIntLit(min_of(bits, signed), ty))
+    if attr == "Max" then return TExpr(span, TIntLit(max_of(bits, signed), ty))
+
+    if attr == "First" || attr == "Last" then
+        return cx.err(span, s"'$written' is an integer, not a declared sequence — its extremes " +
+                      s"are '$written::Min' and '$written::Max'. 'First' and 'Last' name the ends " +
+                      "of an enum's variants or of a 'within' range, which is a different question")
+
+    cx.err(span, s"'$written' has no attribute '$attr' — an integer type answers '$written::Min' " +
+           s"and '$written::Max'")
+end integer_attr
+
+// The attributes a simple enum exposes: its endpoints (`First`/`Last`), the ordinal maps (`Pos` a
+// value to its 0-based position, `Val` a position back to its value), the neighbouring values
+// (`Succ`/`Pred`), and the name maps (`Image` a value to its name, `Value` a name to its value).
+//
+// All but `First`/`Last` carry an operand, and the ones that could be handed something out of range
+// -- `Val`, `Succ` at the end, `Pred` at the start, `Value` with no such name -- trap.
+private enum_attr(cx: &Analyzer, span: Span, d: &EnumType, attr: string, args: Buf[Expr]) -> TExpr
+    val shown = module_show(d.base)
+    val en = Enum(d)
+
+    if !d.simple then
+        return cx.err(span, s"'$shown::$attr' needs a simple enum, and '$shown' carries data")
+
+    if attr == "First" || attr == "Last"
+        if !args.is_empty() then return cx.err(span, s"'$shown::$attr' takes no arguments")
+        if d.variants.is_empty() then return cx.err(span, s"'$shown' declares no variants")
+
+        val at = if attr == "First" then 0 else d.variants.len() - 1
+
+        return TExpr(span, TIntLit(from_int(long(d.variants.at(at).tag)), en))
+    end if
+
+    var takes = en
+
+    if attr == "Val" then takes = int_type()
+    else if attr == "Value" then takes = Str
+
+    if attr != "Pos" && attr != "Val" && attr != "Succ" && attr != "Pred" && attr != "Image" &&
+       attr != "Value" then
+        return cx.err(span, s"'$shown' has no attribute '$attr'")
+
+    val x = attr_one_arg(cx, span, s"$shown::$attr", takes, args)
+
+    if x.is_none() then return bad_expr(span)
+
+    var gives = en
+
+    if attr == "Pos" then gives = int_type()
+    else if attr == "Image" then gives = Str
+
+    TExpr(span, TEnumAttr(attr, en, x.unwrap(), gives))
+end enum_attr
+
+// The attributes a constrained integer subtype exposes: its bounds (`First`/`Last`), the total
+// membership test (`Valid`), and the trapping steps (`Succ`/`Pred`).
+//
+// Every attribute but `Valid` speaks the **subtype**: a bound of `T` is a `T` and the step from one
+// `T` is another, so a derived subtype can use its own attributes without casting through the base
+// it was declared `new` to stay out of. `Valid` is the one that takes the base, because asking
+// whether a value is a `T` is only a question for something that is not yet one.
+private constrained_attr(cx: &Analyzer, span: Span, d: &ConstrainedType, ty: Type, attr: string,
+                         args: Buf[Expr]) -> TExpr
+    val shown = module_show(d.name)
+    val what = s"$shown::$attr"
+    val base = underlying(ty)
+
+    val bits = base match
+        Integer(b, _, _) -> b
+        _ -> 0
+
+    if bits == 0 then
+        return cx.err(span, s"'$what' needs an integer subtype, not ${type_show(d.base)}")
+
+    val signed = base match
+        Integer(_, s, _) -> s
+        _ -> true
+
+    if attr == "Range" then
+        return cx.err(span, s"'$shown::Range' is only meaningful as the iterable of a 'for' loop")
+
+    if attr == "First" || attr == "Last" || attr == "Min" || attr == "Max"
+        if !args.is_empty() then return cx.err(span, s"'$what' takes no arguments")
+
+        // **An end the declaration does not narrow is the base's** for `Min` and `Max`, because
+        // that is what the type can hold; `First` and `Last` name the ends of a range as *written*,
+        // so an unranged subtype has none. A `where` predicate is the exception to the first: it
+        // narrows the type without saying where to, so its extremes are not readable off a
+        // declaration.
+        val ends = attr == "First" || attr == "Last"
+
+        if ends && (d.lo.is_none() || d.hi.is_none()) then
+            return cx.err(span, s"'$what' needs a 'within' range")
+
+        val low = attr == "First" || attr == "Min"
+
+        if low
+            if d.lo.is_some() then
+                return TExpr(span, TIntLit(decimal_to_int(d.lo.unwrap()), ty))
+            if d.pred_fn.is_some() then return cx.err(span, s"'$what' needs a 'within' range")
+
+            return TExpr(span, TIntLit(min_of(bits, signed), ty))
+        end if
+
+        if d.hi.is_some()
+            var top = decimal_to_int(d.hi.unwrap())
+
+            if d.exclusive_hi then top = sub(top, from_int(1))
+
+            return TExpr(span, TIntLit(top, ty))
+        end if
+
+        if d.pred_fn.is_some() then return cx.err(span, s"'$what' needs a 'within' range")
+
+        return TExpr(span, TIntLit(max_of(bits, signed), ty))
+    end if
+
+    if attr != "Valid" && attr != "Succ" && attr != "Pred" then
+        return cx.err(span, s"'$shown' has no attribute '$attr'")
+
+    val takes = if attr == "Valid" then base else ty
+    val x = attr_one_arg(cx, span, what, takes, args)
+
+    if x.is_none() then return bad_expr(span)
+
+    if d.lo.is_none() || d.hi.is_none() then return cx.err(span, s"'$what' needs a 'within' range")
+
+    if attr == "Valid" then return TExpr(span, TConstrainedValid(x.unwrap(), ty))
+
+    TExpr(span, TConstrainedStep(x.unwrap(), ty, attr == "Succ", ty))
+end constrained_attr
+
+// A bound written on an integer subtype, as the whole number it is. An integer subtype's range is
+// written in integers, so the scale is nothing to round away.
+private decimal_to_int(d: Decimal) -> BigInt = rescale(d, 0, Rounding.Down).coefficient()
+
+// The one operand an attribute that carries one takes, read at the type it wants.
+private attr_one_arg(cx: &Analyzer, span: Span, what: string, want: Type,
+                     args: Buf[Expr]) -> Option[TExpr]
+    if args.len() != 1
+        cx.fault(span, s"'$what' takes exactly one argument")
+        return None
+    end if
+
+    val x = type_expr(cx, args.at(0), Some(want))
+
+    if disagree(texpr_type(x), want)
+        cx.fault(args.at(0).span, s"'$what' takes a ${type_show(want)}, not " +
+                 s"${type_show(texpr_type(x))}")
+        return None
+    end if
+
+    Some(x)
+end attr_one_arg
+
+// The compile-time identity of a type -- what `T::Id` answers.
+//
+// **It is a hash rather than a counter, and that is forced rather than chosen.** A method table is a
+// private global, so a type erased inside a precompiled library and the same type erased in the
+// program that links it have a table each -- and a counter would number them from two different
+// compilations, so two values of one type would answer with two ids. A hash of the type's name is
+// computed the same way by every compilation that ever sees that type, which is the property the
+// feature actually needs.
+//
+// What identifies a type here is the name its **members** are filed under, which keeps `Age` apart
+// from `int`: a transparent subtype shares its base's representation and mangles as the base, and an
+// id that merged the two would silently merge a cache keyed on it.
+type_identity(name: string, word_bits: int) -> BigInt
+    var h: u64 = 0xcbf29ce484222325u64
+
+    for c in name.chars
+        h = (h ^ u64(u32(c))) * 0x100000001b3u64
+
+    from_u64(avalanche(h), word_bits)
+end type_identity
+
+// MurmurHash3's finalizer, both rounds -- one diffuses most of the way and is the easy place to
+// stop, and the second is what its constant was chosen with.
+private avalanche(h: u64) -> u64
+    var x = h
+
+    x = x ^ (x >> 33)
+    x = x * 0xff51afd7ed558ccdu64
+    x = x ^ (x >> 33)
+    x = x * 0xc4ceb9fe1a85ec53u64
+    x = x ^ (x >> 33)
+    x
+end avalanche
+
+// The hash narrowed to the target's word, masked rather than truncated: the answer is a `usize` and
+// a `usize` is unsigned, so the literal the analyzer folds has to be in range for the type it
+// carries.
+private from_u64(h: u64, word_bits: int) -> BigInt
+    if word_bits >= 64 then return from_u64_whole(h)
+
+    from_u64_whole(h & ((1u64 << u64(word_bits)) - 1u64))
+end from_u64
+
+private from_u64_whole(h: u64) -> BigInt
+    val low = from_int(long(h & 0xffffffffu64))
+    val high = from_int(long(h >> 32))
+
+    add_big(mul(high, from_int(4294967296)), low)
+end from_u64_whole

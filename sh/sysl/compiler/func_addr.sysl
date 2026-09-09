@@ -1,0 +1,241 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `&f` -- the address of a declared function, which is what C's function pointer holds.
+//
+// The `&` is the same one every other address is written with, and it is deliberate that no bare `f`
+// reaches here: a bare function name already means the capture-free closure, and a spelling that
+// meant a sysl callable in one slot and a C address in another would be a silent choice between two
+// representations that share nothing. Nothing here can take the address of a closure, for the same
+// reason: a closure is a struct and a body, and what C calls is the body alone.
+
+// Whether a written name in `&name` position is a declared function rather than a place.
+names_a_declared_function(cx: &Analyzer, operand: Expr) -> Option[string] = *operand.kind match
+    Ident(n) ->
+        if cx.lookup(n).is_some() then None
+        else if overload_keys(cx.an, module_qualify(cx.scope.module_name, n)).is_empty() then None
+        else Some(n)
+    _ -> None
+
+// The address itself.
+function_address(cx: &Analyzer, span: Span, written: string, expected: Option[Type]) -> TExpr
+    val key = addressed_overload(cx, span, written, expected)
+
+    if key == "" then return bad_expr(span)
+
+    val f = cx.an.tables.funcs.get(key)
+
+    if f.is_none() then return bad_expr(span)
+
+    val decl = f.unwrap().decl
+
+    // Which copy of it? A generic function is not code until its arguments are settled, so there is
+    // no single body to name until they are -- but the expected type settles them wherever there is
+    // one, exactly as a call's arguments do.
+    var inst = key
+
+    if !decl.tparams.is_empty()
+        val made = addressed_instantiation(cx, span, written, f.unwrap(), expected)
+
+        if made == "" then return bad_expr(span)
+
+        inst = made
+    end if
+
+    // A `...` is read relative to the last named argument, so a caller has to know where the named
+    // ones stop. A `*extern` says only what it is called with, and there is nothing in that to hold
+    // a tail.
+    if decl.variadic then
+        return cx.err(span, s"'$written' is variadic, and a '*extern' fixes the arguments a call " +
+                      "passes — a tail has no width a signature could state, so a variadic " +
+                      "function is reached by calling it")
+
+    if decl.test.is_some() then
+        return cx.err(span, s"'$written' is a '@test' function, which 'sysl test' calls and " +
+                      "nothing else does — every other build leaves it out, so its address would " +
+                      "be of a definition the program does not have")
+
+    var ptypes: Buf[Type] = buf()
+    var ret = Unit
+
+    // An instantiation's signature is the one the tables hold; a function with no type parameters
+    // has none there, and its own declaration is what says what it takes.
+    val sig = cx.an.tables.members.func_insts.get(inst)
+
+    if sig.is_some()
+        for i in 0..<sig.unwrap().params.len()
+            ptypes.push(sig.unwrap().params.at(i).1)
+
+        ret = sig.unwrap().ret
+    else
+        for i in 0..<decl.params.len()
+            ptypes.push(param_type(cx, f.unwrap(), decl.params.at(i)))
+
+        ret = declared_result(cx, f.unwrap().scope, decl.ret_type)
+
+    // The address is of **code**, and the code has to be the code C would call. Where every part of
+    // the signature crosses as itself the two conventions agree and the function's own symbol is
+    // the answer; where one does not, sysl emitted the aggregate its own way and C would read the
+    // wrong registers. An `extern` and a function carrying `@export` are past this rather than
+    // exempted from it: neither is code this compiler laid out its own way.
+    val c_convention = cx.an.tables.externs.has(inst) || decl.exported.is_some()
+
+    if !c_convention
+        for i in 0..<(ptypes.len() + 1)
+            val t = if i < ptypes.len() then ptypes.at(i) else ret
+
+            if !crosses_as_itself(t)
+                var which = "the result"
+
+                if i < ptypes.len() then which = s"the ${ordinal(i + 1)} parameter"
+
+                return cx.err(span, s"$which of '$written' is ${type_show(t)}, an aggregate, and " +
+                              "an aggregate crosses to C in whichever registers that machine's " +
+                              "convention names rather than the ones a sysl call uses — so this " +
+                              "address would be of a function C cannot call correctly. A wrapper " +
+                              "taking the parts behind a '*T', or '@export' on this one, is what " +
+                              "has an address")
+
+    TExpr(span, TFuncAddr(inst, inst, CFn(ptypes, ret)))
+end function_address
+
+// Which declaration of an overloaded name an address is of.
+//
+// **The expected type decides, and it is the same mechanism a generic function's arguments are read
+// off**: an address is handed to something whose signature is already fixed, so the signature is
+// there to be matched. What is compared is the parameter list -- a `*extern` states exactly what a
+// call through it passes, and that is what tells two overloads apart. The result is deliberately not
+// compared, since a pair differing only in it is refused where they are declared.
+//
+// **With no expected type there is nothing to read**, and this reports rather than guessing: an
+// address is one word with no context of its own, and taking the first declaration would be
+// choosing silently between functions that share nothing but a name.
+private addressed_overload(cx: &Analyzer, span: Span, written: string,
+                           expected: Option[Type]) -> string
+    val keys = function_keys(cx, written)
+
+    if keys.is_empty()
+        cx.fault(span, s"undefined function '$written'")
+        return ""
+    end if
+
+    if keys.len() == 1 then return keys.at(0)
+
+    val wanted = if expected.is_none() then None else cfn_of(expected.unwrap())
+    var fits: Buf[string] = buf()
+
+    for i in 0..<keys.len()
+        val sig = cx.an.tables.members.func_insts.get(keys.at(i))
+
+        if wanted.is_some() && sig.is_some()
+            var ps: Buf[Type] = buf()
+
+            for j in 0..<sig.unwrap().params.len()
+                ps.push(sig.unwrap().params.at(j).1)
+
+            if types_eq(ps, wanted.unwrap().0) then fits.push(keys.at(i))
+
+    if fits.len() == 1 then return fits.at(0)
+
+    if wanted.is_none()
+        cx.fault(span, s"'$written' names ${keys.len()} functions, and an address is of one of " +
+                 "them — which is read off the type the context wants, and there is none here. " +
+                 "Annotate what this address is being stored in or passed as")
+        return ""
+    end if
+
+    if fits.is_empty()
+        cx.fault(span, s"no '$written' has the parameters " +
+                 s"'${type_show(expected.unwrap())}' asks for")
+        return ""
+    end if
+
+    cx.fault(span, s"'$written' is ambiguous as an address — ${fits.len()} of its declarations " +
+             s"match '${type_show(expected.unwrap())}'")
+    ""
+end addressed_overload
+
+// Which copy of a generic function this address names, read off the type the context wants.
+//
+// The match is against the **signature as declared**, so it solves exactly what a call site's
+// arguments would. A parameter the signature does not mention cannot be solved here, and the message
+// says so.
+private addressed_instantiation(cx: &Analyzer, span: Span, written: string, f: Func,
+                                expected: Option[Type]) -> string
+    val decl = f.decl
+    val want = if expected.is_none() then None else cfn_of(expected.unwrap())
+
+    if want.is_none()
+        cx.fault(span, s"'$written' is generic, so which copy of it this addresses depends on its " +
+                 "type arguments, and nothing here says what they are — write them, as " +
+                 s"'&$written[${joined(decl.tparams, ", ")}]', or write the type this is stored " +
+                 s"in, as 'var f: *extern(…) -> … = &$written'")
+        return ""
+    end if
+
+    val ps = want.unwrap().0
+
+    if ps.len() != decl.params.len()
+        cx.fault(span, s"'$written' takes ${quantity(decl.params.len(), "parameter")}, and the " +
+                 s"${type_show(expected.unwrap())} wanted here takes ${ps.len()}")
+        return ""
+    end if
+
+    var sub: Buf[Binding] = buf()
+
+    for i in 0..<decl.params.len()
+        unify(cx.an, f.scope, decl.params.at(i).typ, ps.at(i), decl.tparams, &sub)
+
+    if decl.ret_type.is_some() then
+        unify(cx.an, f.scope, decl.ret_type.unwrap(), want.unwrap().1, decl.tparams, &sub)
+
+    var targs: Buf[Type] = buf()
+    var unsolved: Buf[string] = buf()
+
+    for i in 0..<decl.tparams.len()
+        val found = bound_type(sub, decl.tparams.at(i))
+
+        if found.is_none() then unsolved.push(s"'${decl.tparams.at(i)}'")
+        else targs.push(found.unwrap())
+
+    if !unsolved.is_empty()
+        cx.fault(span, s"'$written' is generic, and the ${type_show(expected.unwrap())} wanted " +
+                 s"here does not say what ${joined(unsolved, " or ")} should be — a type " +
+                 "parameter the signature does not mention cannot be settled by the type of the " +
+                 s"address. Write it: '&$written[${joined(decl.tparams, ", ")}]'")
+        return ""
+    end if
+
+    instantiate_func(cx.an, f.scope, decl, targs, false)
+end addressed_instantiation
+
+// Whether a type is handed over to C as the thing it is, so a sysl definition of that signature is
+// already one the other side can call.
+//
+// The test is by **shape** rather than by asking the calling convention, and deliberately: the
+// classification is a property of the target and this runs before one is chosen, so a rule that
+// consulted it would let a program compile for one machine and not another. What every convention
+// agrees about is the boundary drawn here -- a value that occupies one register crosses as itself
+// everywhere, and an aggregate is what each of them has its own reading of.
+private crosses_as_itself(t: Type) -> bool = underlying(t) match
+    Integer(_, _, _) -> true
+    Floating(_) -> true
+    Bool -> true
+    Char -> true
+    Unit -> true
+    Never -> true
+    CFn(_, _) -> true
+    // A trait object is a pair of words on either mode, so it is an aggregate however it is spelled.
+    Weak(inner) -> !is_trait(*inner)
+    Ptr(_) -> !erased(t)
+    Ref(_, _) -> !erased(t)
+    // A simple enum is its underlying integer and nothing else; a data enum is a tag beside a union.
+    Enum(d) -> d.simple
+    _ -> false
+
+// The C function pointer a type is, where it is one.
+cfn_of(t: Type) -> Option[(Buf[Type], Type)] = underlying(t) match
+    CFn(ps, r) -> Some((ps, *r))
+    _ -> None

@@ -1,0 +1,246 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The atomic operations, which are the `*T` tier of concurrency.
+//
+// These sit beside `sizeof` and `ptr_cast` rather than beside `print`, and for the same reason: each
+// is a machine instruction with no sysl body, at a place where the language's guarantees stop. An
+// atomic operation makes one access indivisible and says nothing about the object it reaches, who
+// else holds the address, or whether the algorithm around it is right. That is the tier's bargain --
+// the compiler guarantees nothing and the uses are greppable.
+//
+// **They are the plumbing rather than the surface.** `Atomic[T]` and `SpinLock` are ordinary sysl
+// written on top of what is here: a struct with a field and methods that take the address of it.
+// Nothing about the tier is meant to be pleasant to write directly, which is why the ordering is
+// required at every call rather than defaulted -- the default belongs on the library surface, where
+// a reader can see which one they are getting.
+//
+// **Why an ordering is not an ordinary argument.** It becomes a *keyword* in the emitted
+// instruction rather than a value the instruction reads, so it has to be known where the
+// instruction is emitted; a variable holding one could not be lowered at all. So the argument is
+// required to be one of `sysl.sync.Ordering`'s variants written at the call, and anything else is
+// refused by name rather than left to fail as a type error somewhere below.
+
+// How many value operands each addressed form takes, after the address and before the ordering, or
+// nothing where the name is not one of them. The dispatch, the arity check and the name registry
+// all read it, so that adding a form is one line rather than three that could disagree.
+atomic_operands(name: string) -> Option[usize]
+    if name == "atomic_load" then return Some(0)
+    if name == "atomic_store" || name == "atomic_swap" then return Some(1)
+    if name == "atomic_add" || name == "atomic_sub" then return Some(1)
+    if name == "atomic_and" || name == "atomic_or" || name == "atomic_xor" then return Some(1)
+    if name == "atomic_cas" then return Some(2)
+
+    None
+end atomic_operands
+
+// The five that are read-modify-write arithmetic, which is the set a pointer is **not** allowed at:
+// adding to an address atomically is a question about pointer arithmetic that the raw tier has no
+// answer for.
+private atomic_arithmetic(name: string) -> bool =
+    name == "atomic_add" || name == "atomic_sub" || name == "atomic_and" || name == "atomic_or" ||
+    name == "atomic_xor"
+
+// Whether the name still means the form here, rather than something the program declared.
+//
+// **Nine names is a lot to take out of a program's vocabulary**, and these do not take them: a
+// function or a local of the name is what a call to it reaches, and the form applies only where
+// nothing else claims the name. That is a deliberate difference from the forms beside them --
+// `ptr_cast` and `print` win over a declaration and leave the declaration unreachable -- and it is
+// the behaviour worth having, since `atomic_add` is a name a program writing its own concurrency
+// could reasonably want.
+private unclaimed(cx: &Analyzer, name: string) -> bool =
+    cx.lookup(name).is_none() &&
+    overload_keys(cx.an, module_qualify(cx.scope.module_name, name)).is_empty()
+
+// Whether a name in call position is one of these forms.
+atomic_form(cx: &Analyzer, name: string) -> bool =
+    (atomic_operands(name).is_some() || name == "atomic_fence") && unclaimed(cx, name)
+
+// One of the forms, analyzed.
+atomic_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
+    if name == "atomic_fence" then return atomic_fence(cx, span, args)
+
+    val values = atomic_operands(name).unwrap()
+
+    if args.len() != values + 2 then
+        return cx.err(span, s"'$name' takes ${quantity(values + 2, "argument")} — an address, " +
+                      s"${if values == 0 then "no value" else quantity(values, "value")}, and an " +
+                      s"ordering — but ${supplied(args.len(), "argument")}")
+
+    val addr = type_expr_bare(cx, args.at(0))
+    val at = atomic_pointee(cx, span, name, addr)
+
+    if at == Unknown then return bad_expr(span)
+
+    var ops: Buf[TExpr] = buf()
+
+    for i in 0..<values
+        val op = type_expr(cx, args.at(i + 1), Some(at))
+
+        if underlying(texpr_type(op)) != at then
+            cx.fault(args.at(i + 1).span, s"'$name' operates at the type its address points at, " +
+                     s"so argument ${i + 2} is a ${type_show(at)} — this one is a " +
+                     s"${type_show(texpr_type(op))}")
+
+        ops.push(op)
+
+    val ord = atomic_ordering(cx, span, name, args.at(args.len() - 1))
+
+    if ord == "" then return bad_expr(span)
+    if !halves_agree(cx, span, name, ord) then return bad_expr(span)
+
+    val out = if name == "atomic_store" then Unit else at
+
+    TExpr(span, TAtomic(name, addr, ops, ord, at, out))
+end atomic_call
+
+// `atomic_fence(ord)` -- a barrier with no address, ordering everything around it rather than one
+// access. The one form here that is about the thread instead of about a location.
+private atomic_fence(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 1 then
+        return cx.err(span, "'atomic_fence' takes one argument, the ordering to fence at — it " +
+                      "orders the accesses around it rather than reaching any address of its own")
+
+    val ord = atomic_ordering(cx, span, "atomic_fence", args.at(0))
+
+    if ord == "" then return bad_expr(span)
+
+    // A fence *is* its ordering -- there is no access under it to be indivisible -- so `Relaxed`
+    // describes a fence that does nothing, and the machine has no instruction for one. Refused here
+    // rather than left to the assembler, whose complaint names neither the word that was written
+    // nor the file it was written in.
+    if ord == "Relaxed" then
+        return cx.err(span, "a fence is nothing but its ordering, so 'Relaxed' would ask for a " +
+                      "barrier that orders nothing — write 'Acquire', 'Release', 'AcqRel' or " +
+                      "'SeqCst', or drop the fence. A relaxed *access* is the thing that is " +
+                      "meaningful, and that is the ordering on the operation itself")
+
+    TExpr(span, TFence(ord))
+end atomic_fence
+
+// Refuses an ordering whose half the operation has nothing to do with.
+//
+// This is about what the operation *is* rather than about the machine. A release publishes the
+// writes that came before it, and a load makes none; an acquire sees what a release published, and a
+// store reads nothing. `AcqRel` asks for both halves, so each of the two refuses it for the half it
+// is missing. Every read-modify-write does both and takes all five, which is why only these two
+// forms are named here.
+private halves_agree(cx: &Analyzer, span: Span, name: string, ord: string) -> bool
+    if name == "atomic_load" && (ord == "Release" || ord == "AcqRel")
+        cx.fault(span, s"a load has nothing to release, so '$ord' asks it to publish writes it " +
+                 "never made and there is no such instruction — write 'Acquire' to see what the " +
+                 "releasing side published, 'Relaxed' if nothing else follows from the read, or " +
+                 "'SeqCst'")
+        return false
+    end if
+
+    if name == "atomic_store" && (ord == "Acquire" || ord == "AcqRel")
+        cx.fault(span, s"a store reads nothing, so '$ord' asks it to acquire writes it never " +
+                 "looks at and there is no such instruction — write 'Release' to publish what came " +
+                 "before it, 'Relaxed' if nothing else follows from the write, or 'SeqCst'")
+        return false
+    end if
+
+    true
+end halves_agree
+
+// The type an atomic form runs at, read off the address it was given.
+//
+// The refusals name what the machine cannot do rather than what the type is not, because the reader
+// of a `u12` counter has written something reasonable that no processor implements -- and being told
+// "not an integer" would send them looking for a cast.
+private atomic_pointee(cx: &Analyzer, span: Span, name: string, addr: TExpr) -> Type
+    val outer = underlying(texpr_type(addr))
+
+    outer match
+        Ptr(inner) ->
+            val ty = underlying(*inner)
+
+            ty match
+                Integer(bits, _, _) ->
+                    if bits == 8 || bits == 16 || bits == 32 || bits == 64 then return ty
+
+                    cx.fault(span, s"'$name' is one machine instruction, and a machine has one " +
+                             s"for 8, 16, 32 and 64 bits — ${type_show(*inner)} is $bits, so " +
+                             "there is nothing to emit. Hold the value at a width the machine has " +
+                             "and narrow it where it is read")
+                    Unknown
+                Ptr(_) ->
+                    if !atomic_arithmetic(name) then return ty
+
+                    cx.fault(span, s"'$name' is arithmetic, and what an address plus a number " +
+                             "means is the question the raw tier does not answer — use " +
+                             "'atomic_swap' or 'atomic_cas' to change a pointer, or do the " +
+                             "arithmetic on a 'usize' beside it")
+                    Unknown
+                _ ->
+                    cx.fault(span, s"'$name' reaches a word the machine can touch indivisibly — " +
+                             "an integer of 8, 16, 32 or 64 bits, or a pointer — and " +
+                             s"${type_show(*inner)} is neither. An aggregate is what a 'SpinLock' " +
+                             "or a '&sync Mutex[T]' is for")
+                    Unknown
+        Ref(_, _) ->
+            cx.fault(span, s"'$name' takes a raw address, and a ${type_show(texpr_type(addr))} is " +
+                     "a counted reference — atomicity here is about the bytes rather than about " +
+                     "the count, which is already atomic in a '&sync T'. Reach the field with '&' " +
+                     "and hand that in")
+            Unknown
+        _ ->
+            cx.fault(span, s"'$name' takes the address of the word to operate on, and this is a " +
+                     s"${type_show(texpr_type(addr))} — write '&place' to hand it one")
+            Unknown
+end atomic_pointee
+
+// The ordering, which has to be a variant of `sysl.sync.Ordering` written at the call.
+//
+// The complaint is deliberate rather than inherited. An ordering held in a variable is well-typed
+// sysl that cannot be lowered, so the type checker would pass it and the emitter would have nothing
+// to write; said here, the reader is told the reason -- the instruction spells the ordering out --
+// at the place they wrote it.
+private atomic_ordering(cx: &Analyzer, span: Span, name: string, arg: Expr) -> string
+    val t = type_expr_bare(cx, arg)
+    val key = ordering_key(cx)
+
+    *t.kind match
+        TEnumNew(en, variant, _) ->
+            en match
+                Enum(d) -> if d.base == key then return variant.name
+                _ -> ()
+        _ -> ()
+
+    underlying(texpr_type(t)) match
+        Enum(d) ->
+            if d.base == key
+                cx.fault(arg.span, s"'$name' spells its ordering into the instruction, so it has " +
+                         "to be one of Ordering's names written here — not a value carrying one. " +
+                         "Where a caller chooses, branch on their choice and write a call per " +
+                         "ordering")
+                return ""
+        _ -> ()
+
+    cx.fault(arg.span, s"'$name' takes an ordering last, one of Ordering's names from 'sysl.sync' " +
+             "— 'SeqCst' if there is no reason to want another")
+    ""
+end atomic_ordering
+
+// Where the library files the ordering, **found** rather than composed: `Ordering` lives in
+// `sysl.sync` rather than in the standard module itself, so a key built by qualifying the
+// auto-imported name answers for nothing.
+private ordering_key(cx: &Analyzer) -> string
+    val direct = module_qualify(module_qualify(AutoImportedModule, "sync"), "Ordering")
+
+    if cx.an.tables.types.has(direct) then return direct
+
+    for i in 0..<cx.an.tables.types.len()
+        val k = cx.an.tables.types.key_at(i)
+
+        if module_bare(k) == "Ordering"
+            cx.an.tables.types.at(i).kind match
+                EnumOf(_) -> return k
+                _ -> ()
+
+    direct
+end ordering_key

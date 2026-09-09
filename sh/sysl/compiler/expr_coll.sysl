@@ -154,8 +154,32 @@ index_expr(cx: &Analyzer, span: Span, receiver: Expr, index: Expr,
         // A lane is read out of a register rather than through an address, so the index is held to
         // being a constant and checked here, where there is a number to name.
         Vector(lanes, elem) -> lane_expr(cx, span, tr, index, lanes, *elem)
-        _ -> index_non_vector(cx, span, tr, index)
+        _ -> index_non_vector(cx, span, raw, tr, index, expected)
 end index_expr
+
+// Whether a subscript on this type reaches one of the two indexing traits, asked of a type that has
+// no elements of its own. A built-in's subscript is never this: an array, a slice and a string are
+// indexed by the compiler, and nothing a program writes competes with that.
+indexes_through(a: &Analysis, trait_name: string, t: Type) -> bool =
+    !impls_of(a, trait_name, owner_key(t)).is_empty()
+
+// The same, asked of a written receiver before a statement has committed to being a store.
+// Whatever goes wrong typing the receiver is left for the ordinary path to report, where it was
+// written.
+indexes_written(cx: &Analyzer, trait_name: string, receiver: Expr) -> bool
+    val key = catalog_key(cx.an, trait_name)
+
+    if key.is_none() then return false
+
+    val mark = cx.an.complaints()
+    val t = type_expr_bare(cx, receiver)
+
+    cx.an.restore_complaints(mark)
+
+    if texpr_type(t) == Unknown then return false
+
+    indexes_through(cx.an, key.unwrap(), receiver_type(texpr_type(t)))
+end indexes_written
 
 private lane_expr(cx: &Analyzer, span: Span, tr: TExpr, index: Expr, lanes: int,
                   elem: Type) -> TExpr
@@ -185,11 +209,33 @@ private lane_expr(cx: &Analyzer, span: Span, tr: TExpr, index: Expr, lanes: int,
     TExpr(span, TLane(tr, int(v), unqualified(elem)))
 end lane_expr
 
-private index_non_vector(cx: &Analyzer, span: Span, tr: TExpr, index: Expr) -> TExpr
+private index_non_vector(cx: &Analyzer, span: Span, raw: TExpr, tr: TExpr, index: Expr,
+                         expected: Option[Type]) -> TExpr
     val elem = element(texpr_type(tr))
 
-    if elem.is_none() then
+    if elem.is_none()
+        // A type with no elements of its own is indexed through `Index`, whose one method the
+        // subscript **is**. The index is not held to being an integer here: what a container is
+        // read by is the trait's own argument, and a type that indexes by something else is
+        // implementing a different `Index` rather than misusing this one.
+        var args: Buf[Expr] = buf()
+
+        args.push(index)
+
+        val key = catalog_key(cx.an, "Index")
+
+        if key.is_some() && indexes_through(cx.an, key.unwrap(), texpr_type(tr)) then
+            return call_member(cx, span, raw, "index", args, expected)
+
+        // A parameter has no implementation to find -- a bound is not one -- so the subscript goes
+        // the way every other use of a parameter goes: to the member machinery, which answers from
+        // the bounds and complains where they license nothing.
+        texpr_type(tr) match
+            Abstract(_, _) -> return call_member(cx, span, raw, "index", args, expected)
+            _ -> ()
+
         return cx.err(span, s"cannot index ${type_show(texpr_type(tr))}")
+    end if
 
     val ti = type_expr(cx, index, Some(usize_type(word_bits(cx))))
 
@@ -282,6 +328,20 @@ private slice_elem(cx: &Analyzer, span: Span, rt: Type, hi: Option[Expr]) -> Opt
 
                     return Some(*inner)
         _ -> ()
+
+    // A type read by a subscript through `Index` cannot be **sliced** through it: the index would
+    // have to be a range, and a range is not yet a type a program can name, so there is nothing for
+    // the trait's argument to be. Somebody who has written an `Index` and is reaching for the
+    // neighbouring form is owed that rather than "cannot slice", which reads as though their type
+    // were the wrong shape for an operation that exists.
+    val key = catalog_key(cx.an, "Index")
+
+    if key.is_some() && indexes_through(cx.an, key.unwrap(), rt)
+        cx.fault(span, s"${type_show(rt)} is read by a subscript through " +
+                 s"'${module_show(key.unwrap())}', but slicing through the trait is not built: the " +
+                 "index would have to be a range, and a range is not yet a type a program can name")
+        return None
+    end if
 
     cx.fault(span, s"cannot slice ${type_show(rt)}")
     None

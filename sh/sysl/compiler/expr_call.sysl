@@ -34,6 +34,15 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             cx.err(span, "this is not something that can be called")
         // A member call. A module path folded into a name is a plain call under another spelling,
         // so it is asked about first.
+        // `T::Attr(x)` -- a type attribute that carries an operand.
+        TypeAttr(subject, attr) ->
+            val name = attr_type_name(subject)
+
+            if name.is_none() || cx.lookup(name.unwrap()).is_some() then
+                return cx.err(span, s"'::$attr' is a type attribute, so its left side must be a " +
+                              "type name")
+
+            type_attr_call(cx, span, name.unwrap(), attr, args)
         Field(receiver, member) ->
             val dotted = module_path_of(receiver, member)
 
@@ -154,6 +163,10 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
     if name == "old" && cx.olds.is_some() then return Some(old_call(cx, span, args))
 
     if name == "print" then return Some(print_call(cx, span, args))
+
+    // The atomics yield to a declaration of the name, which is why they are asked about with the
+    // analyzer rather than by name alone.
+    if atomic_form(cx, name) then return Some(atomic_call(cx, span, name, args))
 
     if name == "str_cast" then return Some(str_cast_call(cx, span, args))
 
