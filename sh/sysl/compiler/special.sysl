@@ -99,3 +99,37 @@ library_key(cx: &Analyzer, name: string) -> Option[string]
 
     None
 end library_key
+
+// `str_cast(bytes)` -- the bytes taken as a string, with nothing checked.
+//
+// **A program does not write this; it writes `sysl.text.from_utf8_unchecked`**, which is an
+// ordinary library function over this form. Keeping the primitive under a raw-tier name rather than
+// the readable one is what lets the two halves of the pair -- validating and not -- sit beside each
+// other in `sysl.text`.
+str_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 1
+        return cx.err(span, "'str_cast' takes exactly one value, the bytes to take as a string")
+
+    val t = type_expr_bare(cx, args.at(0))
+
+    underlying(texpr_type(t)) match
+        // Either view will do: making a string out of bytes reads them, and a `[]const u8` is the
+        // shape `s.bytes` hands over, which is the commonest thing anyone validates.
+        Slice(inner, _) ->
+            if *inner != Integer(8, false, false)
+                return cx.err(span, s"'str_cast' takes a []u8, but the value has type " +
+                              s"${type_show(texpr_type(t))}")
+
+            TExpr(span, TFromBytes(t))
+        // An array of bytes is a view of itself here, on the same terms every other position takes
+        // one on: this form asks for a `[]u8` and is one of the places that asks.
+        Array(_, elem) ->
+            if *elem != Integer(8, false, false)
+                return cx.err(span, s"'str_cast' takes a []u8, but the value has type " +
+                              s"${type_show(texpr_type(t))}")
+
+            TExpr(span, TFromBytes(coerce(cx, t, Slice(elem, true))))
+        Str -> cx.err(span, "'str_cast' makes a string out of bytes, and this value is already a " +
+                      "string")
+        other -> cx.err(span, s"'str_cast' takes a []u8, but the value has type ${type_show(other)}")
+end str_cast_call
