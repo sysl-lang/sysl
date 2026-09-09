@@ -1,0 +1,107 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+
+// Where the standard module's source is, and what a compilation gets from it.
+
+private present(path: string) -> bool = metadata(path).is_ok()
+
+private a_root_holding(named: string) -> string
+    val root = make_temp_dir("sysl-lib").unwrap()
+
+    make_dir_all(s"$root/$named").unwrap()
+    write_text(s"$root/$named/print.sysl", "module sysl\n").unwrap()
+    root
+end a_root_holding
+
+@test("SYSL_LIB is taken at its word, and is the directory above 'sysl' rather than 'sysl' itself")
+sysl_lib_is_the_library_root()
+    val root = a_root_holding(StdModule)
+
+    assert_eq(std_root_of(Some(root), None).unwrap(), root)
+    remove_dir_all(root).unwrap_or(())
+
+@test("and a SYSL_LIB that holds no 'sysl' says which of the two directories it should have been")
+sysl_lib_aimed_one_level_low_says_so()
+    val root = a_root_holding(StdModule)
+    val said = std_root_of(Some(s"$root/$StdModule"), None).unwrap_err()
+
+    assert(said.index_of("does not hold a 'sysl' directory").is_some(), said)
+    assert(said.index_of("the directory *above*").is_some(), said)
+    remove_dir_all(root).unwrap_or(())
+
+@test("the installed answer is beside the binary, reached by going up out of 'bin'")
+the_installed_library_sits_beside_the_compiler()
+    val tried = std_candidates(Some("/opt/pkg/bin/sysl"))
+
+    assert_eq(tried.at(0).root, "/opt/pkg/share/sysl/library")
+    assert_eq(tried.at(0).why, "beside this compiler")
+    assert_eq(tried.at(1).root, "/opt/pkg/share/sysl/lib")
+
+@test("'lib' is tried after 'library' everywhere, because copies under the old name are on disk")
+the_old_spelling_is_still_searched()
+    val tried = std_candidates(None)
+    var names = ""
+
+    for i in 0..<tried.len()
+        names = names + tried.at(i).root + " "
+
+    assert_eq(names, "library ../library ../../library lib ../lib ../../lib ")
+
+@test("a compiler that cannot find its library lists every path it tried, and the two ways out")
+a_missing_library_lists_what_was_tried()
+    val said = std_root_of(None, Some("/nowhere/bin/sysl")).unwrap_err()
+
+    assert(said.index_of("cannot find the standard module's source").is_some(), said)
+    assert(said.index_of("/nowhere/share/sysl/library (beside this compiler)").is_some(), said)
+    assert(said.index_of("Set SYSL_LIB").is_some(), said)
+
+@test("a library file is called by its place in the library, never by the path it was read from")
+a_library_file_is_named_by_its_place()
+    var dir: Buf[string] = buf()
+
+    dir.push("sysl")
+    dir.push("text")
+
+    val named = std_named(Found(source_of("/opt/x/share/sysl/library/sysl/text/find.sysl", ""), dir))
+
+    assert_eq(named.src.name, "library/sysl/text/find.sysl")
+
+@test("and a file of the library's own root keeps its name under the prefix alone")
+a_root_library_file_is_named_by_the_prefix()
+    val named = std_named(Found(source_of("/wherever/print.sysl", ""), buf()))
+
+    assert_eq(named.src.name, "library/print.sysl")
+
+@test("the library on this machine reads, parses, and has its own '@tests' files dropped")
+the_library_reads_and_strips_its_tests()
+    val root = std_root() match
+        Err(_) -> return
+        Ok(dir) -> dir
+
+    val sources = std_sources(root, Some(host_target().os)).unwrap()
+    val units = std_units(root, host_target()).unwrap()
+
+    assert(sources.len() >= 150, s"the walk found the library: ${sources.len()} files")
+    assert(units.len() < sources.len(), "a '@tests' file is not one the standard module declares")
+
+    // Sorted by place, so what a compilation sees does not depend on which candidate path the root
+    // was reached by, or on the order a directory listed.
+    for i in 1..<sources.len()
+        assert(sources.at(i - 1).src.name <= sources.at(i).src.name,
+               s"${sources.at(i - 1).src.name} before ${sources.at(i).src.name}")
+
+@test("a library root that holds nothing readable is a different failure from not finding one")
+an_empty_library_says_so()
+    val root = make_temp_dir("sysl-empty").unwrap()
+
+    make_dir_all(s"$root/$StdModule").unwrap()
+
+    val said = std_sources(root, None).unwrap_err()
+
+    assert(said.index_of("holds no sysl source files").is_some(), said)
+    remove_dir_all(root).unwrap_or(())

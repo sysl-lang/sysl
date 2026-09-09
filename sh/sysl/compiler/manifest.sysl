@@ -245,9 +245,13 @@ read_manifest(text: string) -> Result[Manifest, string]
                     warnings.push(s"$ManifestName: 'package.${keys.at(i)}' is not a key this " +
                         "compiler understands, so it was ignored")
 
-    if name != "" && !valid_package_name(name)
-        return Err(s"'package.name' is '$name', which is not a name a package may have -- a name " +
-            "is a letter followed by letters, digits, '_' and '-'")
+    val bad_name = name_refusal(root, name)
+
+    if bad_name != "" then return Err(bad_name)
+
+    if floor != "" && !plain_release(floor)
+        return Err(s"'package.sysl' is '$floor', which is not a version -- a floor is a release a " +
+            "package states, written as three numbers")
 
     val default_target = conf_at(root, "targets") match
         None -> ""
@@ -295,25 +299,54 @@ private read_dependencies(root: &Conf, key: string) -> Result[Buf[Dependency], s
     Ok(out)
 end read_dependencies
 
-// Whether a name is one a package may have. It reaches a command line and a file path, so it must
-// be tellable from a directory by looking.
-valid_package_name(name: string) -> bool
-    if name == "" then return false
+// What is wrong with a package's name, or the empty string where nothing is.
+//
+// **A name is what a directory project's output is called, so it reaches the filesystem.** Each of
+// these is refused rather than repaired: a file that names its output was written by somebody
+// expecting an answer, and both silent repairs -- falling back to the directory name, and
+// flattening the separator -- write a different executable and say nothing.
+name_refusal(root: &Conf, name: string) -> string
+    if conf_at(root, "package").is_none() then return ""
 
-    val first = name.bytes[0]
+    val pkg = conf_at(root, "package").unwrap()
 
-    if !((first >= u8('a') && first <= u8('z')) || (first >= u8('A') && first <= u8('Z')))
-        return false
+    if conf_at(pkg, "name").is_none() then return ""
+
+    if name == "" then return "'package.name' is empty"
+
+    if names_a_path(name)
+        return s"'package.name' is '$name', which names a path rather than a name"
+
+    ""
+end name_refusal
+
+// Whether a name is a path rather than a name. The two directory names are in here for the same
+// reason a separator is: both are legal path segments and neither names a file, so a link would
+// fail at the far end with a message about a directory instead of about this line.
+names_a_path(name: string) -> bool
+    if name == "." || name == ".." then return true
 
     for i in 0..<name.bytes.len
-        val c = name.bytes[i]
+        if name.bytes[i] == u8('/') || name.bytes[i] == u8('\\') then return true
 
-        if !((c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) ||
-             (c >= u8('0') && c <= u8('9')) || c == u8('_') || c == u8('-'))
-            return false
+    false
+end names_a_path
 
-    true
-end valid_package_name
+// Whether a version is a plain release: three numbers and nothing else. A range and a pre-release
+// are both refused, because a package states a release rather than a preference.
+plain_release(text: string) -> bool
+    var digits: usize = 0
+    var dots: usize = 0
+
+    for i in 0..<text.bytes.len
+        val c = text.bytes[i]
+
+        if c >= u8('0') && c <= u8('9') then digits += 1
+        else if c == u8('.') then dots += 1
+        else return false
+
+    dots == 2 && digits >= 3
+end plain_release
 
 private known_package_key(key: string) -> bool =
     key == "name" || key == "version" || key == "sysl" || key == "description" ||

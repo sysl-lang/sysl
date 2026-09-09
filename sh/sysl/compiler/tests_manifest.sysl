@@ -1,0 +1,150 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.read_text
+
+// What a project says about itself before a line of it is read.
+
+private read(text: string) -> Manifest = read_manifest(text).unwrap()
+
+private refused(text: string) -> string = read_manifest(text) match
+    Err(why) -> why
+    Ok(_) -> ""
+
+@test("a name and a version")
+a_name_and_a_version()
+    val m = read("package {\n  name    = \"geom\"\n  version = \"1.4.2\"\n}\n")
+
+    assert_eq(m.name, "geom")
+    assert_eq(m.version, "1.4.2")
+
+@test("and neither is required")
+neither_is_required()
+    assert_eq(read("targets { default = \"x86_64-linux\" }").name, "")
+
+@test("a name that is a path rather than a name is refused, and so are the two directory names")
+a_name_that_is_a_path_is_refused()
+    assert(refused("package { name = \"build/tool\" }").index_of("names a path rather than a name")
+           .is_some(), "a separator")
+    assert(refused("package { name = \".\" }").index_of("names a path rather than a name")
+           .is_some(), "this directory")
+    assert(refused("package { name = \"..\" }").index_of("names a path rather than a name")
+           .is_some(), "the one above")
+
+@test("an empty name is refused as its own mistake")
+an_empty_name_is_its_own_mistake()
+    assert(refused("package { name = \"\" }").index_of("is empty").is_some(), "said so")
+
+@test("an empty file is a project that said nothing")
+an_empty_file_says_nothing()
+    val m = read("")
+
+    assert_eq(m.name, "")
+    assert(m.dependencies.is_empty(), "no dependencies")
+    assert(m.requires.is_empty(), "and nothing required")
+
+@test("a package may state a compiler floor")
+a_package_may_state_a_floor()
+    assert_eq(read("package { name = \"sdl3\"\n version = \"0.2.6\"\n sysl = \"0.0.62\" }").floor,
+              "0.0.62")
+    assert_eq(read("package { name = \"sdl3\" }").floor, "")
+
+@test("something that is not a version is refused, and the field is named")
+a_floor_that_is_not_a_version_is_refused()
+    val said = refused("package { sysl = \">= 0.0.62\" }")
+
+    assert(said.index_of("'package.sysl'").is_some(), said)
+    assert(said.index_of("is not a version").is_some(), said)
+
+@test("an interim spelling is refused too -- a package states a release")
+an_interim_floor_is_refused()
+    assert(refused("package { sysl = \"0.0.66-fcf4e33a\" }").index_of("is not a version").is_some(),
+           "said so")
+
+@test("an older compiler is refused, naming the package, the floor and what is in hand")
+an_older_compiler_is_refused()
+    assert_eq(check_floor("github.com/sysl-lang/sdl3 v0.2.6", "0.0.62", "0.0.61").unwrap(),
+              "github.com/sysl-lang/sdl3 v0.2.6 cannot be built because it requires sysl 0.0.62 " +
+              "or newer, while the compiler in hand is 0.0.61")
+
+@test("the floor itself is old enough, and so is anything above it")
+the_floor_itself_is_enough()
+    assert(check_floor("this project", "0.0.62", "0.0.62").is_none(), "the floor itself")
+    assert(check_floor("this project", "0.0.62", "0.1.0").is_none(), "a minor above it")
+    assert(check_floor("this project", "0.0.62", "1.0.0").is_none(), "a major above it")
+    assert(check_floor("this project", "", "0.0.1").is_none(), "and no floor asks nothing")
+
+@test("an interim compiler satisfies the floor its numbers reach")
+an_interim_compiler_reaches_its_own_numbers()
+    assert(check_floor("this project", "0.0.65", "0.0.66-fcf4e33a").is_none(), "dev at 0.0.66")
+
+@test("a coordinate and a version")
+a_dependency_is_a_coordinate_and_a_version()
+    val deps = read("dependencies {\n  json { git = \"github.com/e/sysl-json\", version = \"1.4.0\" }\n}")
+        .dependencies
+
+    assert_eq(deps.len(), 1)
+    assert_eq(deps.at(0).label, "json")
+    assert_eq(deps.at(0).git, "github.com/e/sysl-json")
+    assert_eq(deps.at(0).version, "1.4.0")
+
+@test("a dependency naming no coordinate, and one naming no version, are each refused")
+a_dependency_needs_both_halves()
+    assert(refused("dependencies { json { version = \"1.0.0\" } }").index_of("names no 'git'")
+           .is_some(), "the coordinate")
+    assert(refused("dependencies { json { git = \"github.com/e/j\" } }").index_of("names no 'version'")
+           .is_some(), "the release")
+
+@test("an unknown key at the top level is reported and ignored")
+an_unknown_top_key_is_a_warning()
+    val m = read("profiles { release { } }")
+
+    assert_eq(m.warnings.len(), 1)
+    assert(m.warnings.at(0).index_of("'profiles'").is_some(), m.warnings.at(0))
+    assert(m.warnings.at(0).index_of(ManifestName).is_some(), m.warnings.at(0))
+    assert(m.warnings.at(0).index_of("ignored").is_some(), m.warnings.at(0))
+
+@test("and it does not stop the keys beside it from being read")
+an_unknown_key_costs_nothing_else()
+    val m = read("package { name = \"thing\", version = \"1.0.0\" }\nprofiles { release { } }\n")
+
+    assert_eq(m.name, "thing")
+    assert_eq(m.version, "1.0.0")
+    assert_eq(m.warnings.len(), 1)
+
+@test("one inside 'package' is reported the same way, under its own path")
+an_unknown_package_key_is_reported_under_its_path()
+    val m = read("package { name = \"thing\", licence = \"MIT\" }")
+
+    assert_eq(m.warnings.len(), 1)
+    assert(m.warnings.at(0).index_of("'package.licence'").is_some(), m.warnings.at(0))
+
+@test("what a package cannot be built without is asked of the machine it is built for")
+a_requirement_is_asked_of_the_machine()
+    val m = read("requires { os = true }")
+    val board = target_named("aarch64-none").unwrap()
+    val mac = target_named("aarch64-macos").unwrap()
+
+    assert_eq(unmet_requirement(m, board).unwrap(),
+              "this package requires 'os', and 'aarch64-none' does not provide it")
+    assert(unmet_requirement(m, mac).is_none(), "a hosted machine provides it")
+
+@test("a package at a version is the same bytes for every project, so it lives under the cache")
+a_package_lives_under_the_cache()
+    assert_eq(package_directory("/c/sysl/pkg", "github.com/sysl-lang/parsing", "0.9.0"),
+              "/c/sysl/pkg/github.com/sysl-lang/parsing/@v0.9.0")
+
+@test("this repository's own manifest reads, and says what it says")
+our_own_manifest_reads()
+    val m = read_manifest(read_text("package.hocon").unwrap()).unwrap()
+
+    assert_eq(m.name, "sysl")
+    assert_eq(m.version, Version)
+    assert_eq(m.floor, "0.0.109")
+    assert_eq(m.dependencies.len(), 1)
+    assert_eq(m.dependencies.at(0).git, "github.com/sysl-lang/parsing")
+    assert_eq(m.requires.len(), 1)
+    assert_eq(m.requires.at(0), "heap")
+    assert(m.warnings.is_empty(), "and nothing in it is a key this compiler does not know")

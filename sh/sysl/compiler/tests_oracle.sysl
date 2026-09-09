@@ -641,3 +641,198 @@ the_declaration_tables_agree()
             assert_eq(found.first_bad, "")
             assert_eq(found.mismatched, 0)
 end the_declaration_tables_agree
+
+// -- the same tree, over a WHOLE PROGRAM ----------------------------------------------------------
+
+// **A block compiled on its own has no library, so what a free `print` or an `Option` means is
+// whatever the block itself declares -- which is nothing.** Compiled *with* the standard module the
+// same block is a program: its names resolve to the library's declarations, the calls it makes reach
+// the library's own bodies, and the reference compiler's answer for it holds those bodies too. That
+// is what this sweep compares, and it is what nothing in this repository could reach until the
+// driver could assemble a compilation.
+
+// The library's trees, parsed once for the whole sweep.
+//
+// **Parsing 152 files is most of what one comparison costs**, so doing it per block would turn a
+// four-minute sweep into an hour's. What is cached is the parse; the analysis is per block, because
+// that is the thing being compared.
+private var library_cache: Buf[Program] = buf()
+private var library_read: bool = false
+
+private library_units() -> Buf[Program]
+    if library_read then return library_cache
+
+    library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> library_cache = units
+
+    library_cache
+end library_units
+
+// The modules a diagnostic came from, which are the modules whose bodies are not evidence.
+//
+// **A library file this compiler had something to say about has a body it did not finish**, and
+// comparing that body would report a difference whose cause is already known and already counted.
+// The module is read off the file's place under the library root, which is the same key its header
+// declares.
+private complaining_modules(reported: Buf[Placed]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<reported.len()
+        val name = module_of_source(reported.at(i).src.name)
+        var seen = false
+
+        for j in 0..<out.len()
+            if out.at(j) == name then seen = true
+
+        if !seen then out.push(name)
+
+    out
+end complaining_modules
+
+// The module a library file belongs to, read off the name a diagnostic calls it: `library/sysl/text/
+// find.sysl` is `sysl.text`. A file outside the library is the block itself, which is the anonymous
+// root module -- so a complaint anywhere in the block takes every function it declared out of the
+// comparison, which is the same coarse rule the single-file sweep uses.
+private module_of_source(name: string) -> string
+    if !name.starts_with("library/") then return ""
+
+    var parts = split(name[8..], "/")
+    var out = ""
+    var held: Buf[string] = buf()
+
+    for piece in parts
+        held.push(piece)
+
+    if held.len() < 2 then return ""
+
+    for i in 0..<(held.len() - 1)
+        if i > 0 then out = out + "."
+
+        out = out + held.at(i)
+
+    out
+end module_of_source
+
+private in_set(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end in_set
+
+// One block compiled as a whole program, function by function.
+private compare_whole(binary: string, path: string, label: string, text: string,
+                      found: *TypedAgreement)
+    val parsed = parse(source_of(path, text))
+
+    if !parsed.ok() then return
+
+    val library = library_units()
+
+    if library.is_empty() then return
+
+    var units: Buf[Program] = buf()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val ours = analyze_bodies(units, host_target())
+    val blocked = complaining_modules(ours.reported)
+
+    // The block's own module is the anonymous root one, so a complaint anywhere in the block takes
+    // every function it declared out of the comparison -- which is the same coarse rule the
+    // single-file sweep uses, and errs towards skipping.
+    val theirs = ask_oracle_typed(binary, path)
+
+    if theirs.is_none()
+        found.skipped_absent += 1
+
+        return
+    end if
+
+    val printed = printed_funcs(theirs.unwrap())
+
+    for i in 0..<ours.funcs.len()
+        val f = ours.funcs.at(i)
+        val block = block_named(printed, f.name)
+
+        // A function the reference did not print is one this program does not reach, which is the
+        // stage above this one -- there is nothing to compare it against.
+        if block.is_none() then continue
+
+        if in_set(blocked, module_of(f.name))
+            found.skipped_unresolved += 1
+            continue
+        end if
+
+        val mine = show_typed_func(f)
+        val where = first_difference(without_trailing_newlines(block.unwrap()),
+                                     without_trailing_newlines(mine))
+
+        if where == ""
+            found.matched += 1
+        else
+            found.mismatched += 1
+
+            if found.mismatched <= 12 then
+                found.first_bad = s"${found.first_bad}\n$label ${f.name}: $where"
+end compare_whole
+
+@test("the two analyzers agree on a whole program, with the library's own bodies in it")
+the_typed_trees_agree_over_whole_programs()
+    oracle() match
+        None ->
+            print("skipped: SYSL_ORACLE names no reference compiler on this machine")
+            return
+        Some(binary) ->
+            if library_units().is_empty()
+                print("skipped: the standard module's source is not on this machine")
+                return
+            end if
+
+            val root = "../sysl.sh/docs/content/reference"
+
+            if !present(root)
+                print("skipped: the reference pages are not on this machine")
+                return
+            end if
+
+            val dir = make_temp_dir("sysl-whole").unwrap()
+            val scratch = dir + "/block.sysl"
+
+            var found = TypedAgreement(0, 0, 0, 0, 0, 0, "", "")
+
+            for item in walk(root)
+                item match
+                    Err(_) -> ()
+                    Ok(entry) ->
+                        if entry.path.ends_with(".md")
+                            read_text(entry.path) match
+                                Err(_) -> ()
+                                Ok(page) ->
+                                    val blocks = sysl_blocks(page)
+
+                                    for i in 0..<blocks.len()
+                                        write_text(scratch, blocks.at(i)).unwrap()
+                                        compare_whole(binary, scratch,
+                                            s"${entry.path} block ${i + 1}", blocks.at(i), &found)
+
+            remove_file(scratch)
+
+            val summary = s"whole programs: ${found.matched} bodies matched, " +
+                s"${found.mismatched} mismatched, " +
+                s"${found.skipped_unresolved} in modules this stage could not finish, " +
+                s"${found.skipped_absent} blocks the reference refused"
+
+            print(summary)
+            record_summary(s"$summary${found.first_bad}")
+            assert(found.matched > 0, "the sweep compared something")
+            assert(found.mismatched == 0, s"$summary${found.first_bad}")
+end the_typed_trees_agree_over_whole_programs

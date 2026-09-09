@@ -1,0 +1,198 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+
+// What one invocation compiles, and what it says when it cannot.
+
+private library_here() -> bool = std_root().is_ok()
+
+private project_of(shape: Buf[(string, string)]) -> string
+    val root = make_temp_dir("sysl-proj").unwrap()
+
+    for i in 0..<shape.len()
+        val at = s"$root/${shape.at(i).0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, shape.at(i).1).unwrap()
+
+    root
+end project_of
+
+private pair(a: string, b: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push((a, b))
+    out
+end pair
+
+@test("a module is a directory, so a header and a location are two statements of one fact")
+a_header_and_a_location_must_agree()
+    var found: Buf[Found] = buf()
+    var units: Buf[Program] = buf()
+
+    found.push(Found(source_of("main.sysl", ""), buf()))
+    units.push(parse(source_of("main.sysl", "module geom\n")).program)
+
+    val said = check_locations(found, units)
+
+    assert_eq(said.len(), 1)
+    assert(said.at(0).index_of("declares 'geom', but it sits at the project root").is_some(),
+           said.at(0))
+    assert(said.at(0).index_of("a module is a directory").is_some(), said.at(0))
+
+@test("and a file that sits in a directory and declares nothing is the same mistake the other way")
+a_file_in_a_directory_must_name_it()
+    var dir: Buf[string] = buf()
+    var found: Buf[Found] = buf()
+    var units: Buf[Program] = buf()
+
+    dir.push("geom")
+    found.push(Found(source_of("geom/point.sysl", ""), dir))
+    units.push(parse(source_of("geom/point.sysl", "f() -> int = 1\n")).program)
+
+    val said = check_locations(found, units)
+
+    assert_eq(said.len(), 1)
+    assert(said.at(0).index_of("declares no module, but it sits in 'geom'").is_some(), said.at(0))
+
+@test("a file whose header agrees with where it sits has nothing to answer for")
+a_file_that_agrees_says_nothing()
+    var dir: Buf[string] = buf()
+    var found: Buf[Found] = buf()
+    var units: Buf[Program] = buf()
+
+    dir.push("geom")
+    dir.push("plane")
+    found.push(Found(source_of("geom/plane/p.sysl", ""), dir))
+    units.push(parse(source_of("geom/plane/p.sysl", "module geom.plane\n")).program)
+
+    assert(check_locations(found, units).is_empty(), "the two agree")
+
+@test("the module a file contributes to is what its header says, or the anonymous root module")
+the_module_a_file_is_in()
+    assert_eq(module_written(parse(source_of("a.sysl", "module a.b\n")).program), "a.b")
+    assert_eq(module_written(parse(source_of("a.sysl", "f() = ()\n")).program), "")
+
+@test("a compilation reads the library, the packages and the program, and knows which is which")
+a_compilation_is_three_things()
+    if !library_here() then return
+
+    val root = project_of(pair("main.sysl", "main()\n    print(\"hi\")\n"))
+    val made = compilation_of(root, host_target()).unwrap()
+
+    assert(made.units.len() > 100, s"the library is in it: ${made.units.len()} files")
+    assert_eq(made.own.len(), 1)
+    assert_eq(made.own.at(0), "")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a program's own '@tests' file is not one the program declares")
+a_test_file_is_dropped_from_a_build()
+    if !library_here() then return
+
+    var shape: Buf[(string, string)] = buf()
+
+    shape.push(("main.sysl", "main()\n    print(\"hi\")\n"))
+    shape.push(("tests.sysl", "@tests\n\nf() -> int = 1\n"))
+
+    val root = project_of(shape)
+    val made = compilation_of(root, host_target()).unwrap()
+
+    assert_eq(made.own.len(), 1)
+    remove_dir_all(root).unwrap_or(())
+
+@test("a directory holding no sysl is not a program, and says so before anything is parsed")
+an_empty_directory_is_not_a_program()
+    val root = project_of(pair("README.md", "nothing here\n"))
+    val said = compilation_of(root, host_target()).unwrap_err()
+
+    assert(said.message.index_of("holds no sysl source files").is_some(), said.message)
+    remove_dir_all(root).unwrap_or(())
+
+@test("what a package cannot be built without stops the build before a line of it is read")
+an_unmet_requirement_stops_a_build()
+    val root = project_of(pair("package.hocon", "requires { os = true }\n"))
+    val board = target_named("aarch64-none").unwrap()
+    val said = compilation_of(root, board).unwrap_err()
+
+    assert(said.message.index_of("requires 'os'").is_some(), said.message)
+    remove_dir_all(root).unwrap_or(())
+
+@test("a dependency nobody brought down is a refusal naming where it should have been")
+a_missing_dependency_names_where_it_should_be()
+    var shape: Buf[(string, string)] = buf()
+
+    shape.push(("package.hocon",
+                "dependencies { nope { git = \"github.com/nobody/nope\", version = \"9.9.9\" } }\n"))
+    shape.push(("main.sysl", "main()\n    print(\"hi\")\n"))
+
+    val root = project_of(shape)
+    val said = compilation_of(root, host_target()).unwrap_err()
+
+    assert(said.message.index_of("is not on this machine").is_some(), said.message)
+    assert(said.message.index_of("@v9.9.9").is_some(), said.message)
+    remove_dir_all(root).unwrap_or(())
+
+@test("a manifest naming a machine this compiler has no entry for is refused as itself")
+an_unknown_target_is_refused()
+    var shape: Buf[(string, string)] = buf()
+
+    shape.push(("package.hocon", "targets { default = \"pdp11-unix\" }\n"))
+    shape.push(("main.sysl", "main()\n    print(\"hi\")\n"))
+
+    val root = project_of(shape)
+    val said = emit_typed_text(root, None, false) match
+        Err(refusal) -> refusal.message
+        Ok(_) -> ""
+
+    assert(said != "", "a machine nobody has is not guessed at")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a project asking for a compiler newer than this one is refused, naming both versions")
+a_newer_floor_is_refused()
+    var shape: Buf[(string, string)] = buf()
+
+    shape.push(("package.hocon", "package { name = \"later\", version = \"1.0.0\", sysl = \"99.0.0\" }\n"))
+    shape.push(("main.sysl", "main()\n    print(\"hi\")\n"))
+
+    val root = project_of(shape)
+    val said = emit_typed_text(root, None, false) match
+        Err(refusal) -> refusal.message
+        Ok(_) -> ""
+
+    assert(said.index_of("'later' 1.0.0 cannot be built").is_some(), said)
+    assert(said.index_of("requires sysl 99.0.0 or newer").is_some(), said)
+    remove_dir_all(root).unwrap_or(())
+
+@test("the declaration tables of a program hold the program's rows and not the library's")
+the_tables_are_the_programs_own()
+    if !library_here() then return
+
+    val root = project_of(pair("main.sysl", "add(a: int, b: int) -> int = a + b\n"))
+
+    emit_typed_text(root, None, true) match
+        Err(refusal) -> assert(false, refusal.message)
+        Ok(emitted) ->
+            assert(emitted.text.index_of("  add(a: int, b: int) -> int").is_some(), emitted.text)
+            assert(emitted.text.index_of("sysl.buf").is_none(),
+                   "the library's rows are not this program's")
+
+    remove_dir_all(root).unwrap_or(())
+
+@test("the typed tree of a whole program holds the library's own bodies as well as the program's")
+the_tree_holds_the_librarys_bodies()
+    if !library_here() then return
+
+    val root = project_of(pair("main.sysl", "main()\n    print(\"hi\")\n"))
+
+    emit_typed_text(root, None, false) match
+        Err(refusal) -> assert(false, refusal.message)
+        Ok(emitted) ->
+            assert(emitted.text.index_of("name: \"main\"").is_some(), "the program's own")
+            assert(emitted.text.index_of("name: \"sysl$prints\"").is_some(),
+                   "and the library function 'print' desugared into")
+
+    remove_dir_all(root).unwrap_or(())

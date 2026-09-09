@@ -1,0 +1,93 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The manifest's notation, read far enough to answer what a build asks of it.
+
+private at(text: string, key: string) -> string = conf_text(read_conf(text).unwrap(), key)
+
+private refused(text: string) -> string = read_conf(text) match
+    Err(why) -> why
+    Ok(_) -> ""
+
+@test("a key and a quoted value")
+a_key_and_a_value()
+    assert_eq(at("name = \"geom\"", "name"), "geom")
+
+@test("a colon says what an equals says, since both are how the notation spells a binding")
+a_colon_is_an_equals()
+    assert_eq(at("name : \"geom\"", "name"), "geom")
+
+@test("a block is written with or without the equals, and either way it nests")
+a_block_nests_either_way()
+    val with_it = read_conf("package = { name = \"a\" }").unwrap()
+    val without = read_conf("package { name = \"a\" }").unwrap()
+
+    assert_eq(conf_text(conf_at(with_it, "package").unwrap(), "name"), "a")
+    assert_eq(conf_text(conf_at(without, "package").unwrap(), "name"), "a")
+
+@test("entries are separated by a newline or a comma, and either may be doubled")
+entries_separate_two_ways()
+    val c = read_conf("package { name = \"a\", version = \"1.0.0\" }").unwrap()
+    val pkg = conf_at(c, "package").unwrap()
+
+    assert_eq(conf_text(pkg, "name"), "a")
+    assert_eq(conf_text(pkg, "version"), "1.0.0")
+
+@test("both comment spellings run to the end of their line")
+comments_run_to_the_line_end()
+    assert_eq(at("// a comment\nname = \"a\" // and another\n# and a third\n", "name"), "a")
+
+@test("'true' and 'false' are flags rather than words, which is what a requires block reads")
+flags_are_read_as_flags()
+    val c = read_conf("requires { heap = true\n os = false }").unwrap()
+    val set = conf_flags_set(conf_at(c, "requires").unwrap())
+
+    assert_eq(set.len(), 1)
+    assert_eq(set.at(0), "heap")
+
+@test("a quoted key holds what a bare one may not")
+a_quoted_key_holds_anything()
+    assert_eq(at("\"a.b\" = \"1\"", "a.b"), "1")
+
+@test("the names a block wrote, in the order it wrote them")
+keys_come_back_in_order()
+    val c = read_conf("b = \"1\"\na = \"2\"\nc = \"3\"").unwrap()
+    val keys = conf_keys(c)
+
+    assert_eq(keys.len(), 3)
+    assert_eq(keys.at(0), "b")
+    assert_eq(keys.at(1), "a")
+    assert_eq(keys.at(2), "c")
+
+@test("a list is read past rather than read, since nothing a build asks about is one")
+a_list_is_skipped()
+    val c = read_conf("keywords = [\"a\", \"b\"]\nname = \"geom\"").unwrap()
+
+    assert_eq(conf_text(c, "name"), "geom")
+
+@test("a block opened and never closed is one line rather than a tree that half exists")
+an_unclosed_block_is_refused()
+    assert(refused("package { name = \"a\"").index_of("never closed").is_some(), "said so")
+
+@test("and so is a brace that closes nothing")
+a_stray_close_is_refused()
+    assert(refused("}").index_of("closes a block that was never opened").is_some(), "said so")
+
+@test("a quoted string opened and never closed says so rather than running to the end")
+an_unclosed_string_is_refused()
+    assert(refused("name = \"a").index_of("never closed").is_some(), "said so")
+
+@test("a key followed by neither an equals nor a block names nothing")
+a_key_with_no_value_names_nothing()
+    assert(refused("name \"a\"").index_of("rather than '=' or a block").is_some(), "said so")
+
+@test("a name a block does not hold answers with nothing, and asking a value for a key answers so too")
+a_missing_key_answers_nothing()
+    val c = read_conf("name = \"a\"").unwrap()
+
+    assert(conf_at(c, "version").is_none(), "no such key")
+    assert_eq(conf_text(c, "version"), "")
+    assert(conf_at(conf_at(c, "name").unwrap(), "x").is_none(), "a string holds no keys")

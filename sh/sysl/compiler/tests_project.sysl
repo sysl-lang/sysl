@@ -1,0 +1,176 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// Which files a build reads, and which module each of them is in.
+
+private tree_of(shape: Buf[(string, string)]) -> string
+    val root = make_temp_dir("sysl-walk").unwrap()
+
+    for i in 0..<shape.len()
+        val at = s"$root/${shape.at(i).0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, shape.at(i).1).unwrap()
+
+    root
+end tree_of
+
+private files(shape: Buf[(string, string)], os: Option[Os]) -> Buf[string]
+    val root = tree_of(shape)
+    var out: Buf[string] = buf()
+
+    collect(root, os) match
+        Err(_) -> ()
+        Ok(found) ->
+            for i in 0..<found.len()
+                var place = ""
+
+                for j in 0..<found.at(i).dir.len()
+                    place = place + found.at(i).dir.at(j) + "/"
+
+                out.push(place + basename(found.at(i).src.name))
+
+    remove_dir_all(root).unwrap_or(())
+    sort_names(out)
+end files
+
+private refusal(shape: Buf[(string, string)], os: Option[Os]) -> string
+    val root = tree_of(shape)
+
+    val said = collect(root, os) match
+        Err(e) -> e.message
+        Ok(_) -> ""
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end refusal
+
+private shape(entries: []const string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    for i in 0..<entries.len
+        out.push((entries[i], "\n"))
+
+    out
+end shape
+
+private listed(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + " "
+
+        out = out + names.at(i)
+
+    out
+end listed
+
+@test("a file named on its own is compiled alone, as the root module")
+one_file_is_the_root_module()
+    val root = tree_of(shape(["a.sysl"]))
+    val found = collect(s"$root/a.sysl", None).unwrap()
+
+    assert_eq(found.len(), 1)
+    assert(found.at(0).dir.is_empty(), "a file named on its own sits under nothing")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a directory is the root, and each sub-directory below it is a module")
+a_directory_is_a_tree()
+    assert_eq(listed(files(shape(["main.sysl", "geom/point.sysl", "geom/plane/plane.sysl"]), None)),
+              "geom/plane/plane.sysl geom/point.sysl main.sysl")
+
+@test("a directory's own segments are its own, and are not appended to its siblings'")
+segments_do_not_leak_between_siblings()
+    assert_eq(listed(files(shape(["a/one.sysl", "b/two.sysl", "c/three.sysl"]), None)),
+              "a/one.sysl b/two.sysl c/three.sysl")
+
+@test("the root's 'examples' and 'vendor' are not compiled, and the name is ordinary elsewhere")
+the_roots_examples_are_left_out()
+    assert_eq(listed(files(shape(["main.sysl", "examples/demo.sysl", "vendor/dep/dep.sysl",
+                                  "geom/examples/e.sysl"]), None)),
+              "geom/examples/e.sysl main.sysl")
+
+@test("a per-OS directory disappears, and its files belong to the directory above it")
+a_selector_folds_away()
+    val posix = target_named("aarch64-macos").unwrap()
+
+    assert_eq(listed(files(shape(["fs/fs.sysl", "fs/__macos__/stat.sysl"]), Some(posix.os))),
+              "fs/fs.sysl fs/stat.sysl")
+
+@test("and a selector this machine is not is never read")
+a_selector_for_elsewhere_is_skipped()
+    val mac = target_named("aarch64-macos").unwrap()
+
+    assert_eq(listed(files(shape(["fs/fs.sysl", "fs/__linux__/stat.sysl"]), Some(mac.os))),
+              "fs/fs.sysl")
+
+@test("with no machine named, every selector answers -- which is what renders a tree")
+every_selector_answers_for_a_render()
+    assert_eq(listed(files(shape(["fs/__linux__/a.sysl", "fs/__macos__/b.sysl"]), None)),
+              "fs/a.sysl fs/b.sysl")
+
+@test("a selector naming no machine is a mistake in the tree, and says which quarter of it is wrong")
+a_misspelled_selector_is_refused()
+    val said = refusal(shape(["fs/__linx__/a.sysl"]), None)
+
+    assert(said.index_of("'linx'").is_some(), said)
+    assert(said.index_of("names no machine this compiler selects source for").is_some(), said)
+
+@test("a selector inside a selector could never be read, so it is refused rather than skipped")
+a_nested_selector_is_refused()
+    val mac = target_named("aarch64-macos").unwrap()
+    val said = refusal(shape(["fs/__posix__/__macos__/a.sysl"]), Some(mac.os))
+
+    assert(said.index_of("sits inside").is_some(), said)
+
+@test("two selectors that both answer, each holding one name, is a collision rather than a merge")
+two_selectors_holding_one_name_collide()
+    val mac = target_named("aarch64-macos").unwrap()
+    val said = refusal(shape(["fs/__posix__/stat.sysl", "fs/__macos__/stat.sysl"]), Some(mac.os))
+
+    assert(said.index_of("is in more than one directory").is_some(), said)
+    assert(said.index_of("'__macos__' and '__posix__'").is_some(), said)
+
+@test("two selectors that both answer holding different names is a pair, not a mistake")
+two_selectors_holding_two_names_are_fine()
+    val mac = target_named("aarch64-macos").unwrap()
+
+    assert_eq(listed(files(shape(["fs/__posix__/dirs.sysl", "fs/__macos__/stat.sysl"]),
+                           Some(mac.os))), "fs/dirs.sysl fs/stat.sysl")
+
+@test("a listing is sorted, so what a compilation sees does not depend on the filesystem's order")
+a_listing_is_sorted()
+    var names: Buf[string] = buf()
+
+    names.push("c")
+    names.push("a")
+    names.push("b")
+    assert_eq(listed(sort_names(names)), "a b c")
+
+@test("the last segment of a path, whichever separator wrote it")
+basename_reads_either_separator()
+    assert_eq(basename("a/b/c.sysl"), "c.sysl")
+    assert_eq(basename("c.sysl"), "c.sysl")
+    assert_eq(basename("a\\b\\c.sysl"), "c.sysl")
+
+@test("the directory a path sits in, and nothing where it names none")
+parent_of_climbs_one()
+    assert_eq(parent_of("a/b/c.sysl").unwrap(), "a/b")
+    assert_eq(parent_of("/c.sysl").unwrap(), "/")
+    assert(parent_of("c.sysl").is_none(), "a bare name sits in no directory this can name")
+
+@test("a path and one more segment, without doubling the separator")
+join_path_writes_one_separator()
+    assert_eq(join_path("a", "b"), "a/b")
+    assert_eq(join_path("a/", "b"), "a/b")
+    assert_eq(join_path("", "b"), "b")
+
+@test("the two suffixes a program may be written under")
+both_suffixes_are_source()
+    assert(is_sysl_file("a.sysl"), "the ordinary one")
+    assert(is_sysl_file("a.lsysl"), "the literate one")
+    assert(!is_sysl_file("a.c"), "and nothing else")

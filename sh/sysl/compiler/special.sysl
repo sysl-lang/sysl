@@ -133,3 +133,83 @@ str_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
                       "string")
         other -> cx.err(span, s"'str_cast' takes a []u8, but the value has type ${type_show(other)}")
 end str_cast_call
+
+// `va_start(ap)`, `va_end(ap)`, `va_copy(dst, src)` and `va_arg(ap)` -- the C variadic cursor, which
+// no sysl body could implement and which the language therefore spells as forms.
+va_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
+        expected: Option[Type]) -> Option[TExpr]
+    if name == "va_start"
+        if !cx.in_variadic
+            return Some(cx.err(span, "'va_start' is only allowed in a function declared with " +
+                               "'...' — there is no tail here"))
+
+        return Some(TExpr(span, TVaStart(va_list_of(cx, span, "va_start", args))))
+
+    if name == "va_end" then return Some(TExpr(span, TVaEnd(va_list_of(cx, span, "va_end", args))))
+
+    if name == "va_copy"
+        if args.len() != 2
+            return Some(cx.err(span, "'va_copy' takes two arguments, the va_list to start and the " +
+                               "one to copy"))
+
+        return Some(TExpr(span, TVaCopy(va_list_arg(cx, span, "va_copy", args.at(0)),
+                                        va_list_arg(cx, span, "va_copy", args.at(1)))))
+
+    if name == "va_arg"
+        val ap = va_list_of(cx, span, "va_arg", args)
+
+        if expected.is_none()
+            return Some(cx.err(span, "'va_arg' reads the next argument as some type, and nothing " +
+                               "here says which — annotate the variable it is read into"))
+
+        return Some(TExpr(span, TVaArg(ap, va_arg_type(cx, span, expected.unwrap()))))
+
+    None
+end va_form
+
+private va_list_of(cx: &Analyzer, span: Span, what: string, args: Buf[Expr]) -> TExpr
+    if args.len() != 1
+        return cx.err(span, s"'$what' takes exactly one argument, the va_list it walks")
+
+    va_list_arg(cx, span, what, args.at(0))
+end va_list_of
+
+// A `va_list` reaches these by address: the walk advances the cursor, so what is handed over is
+// where the cursor is and never a copy of it.
+private va_list_arg(cx: &Analyzer, span: Span, what: string, arg: Expr) -> TExpr
+    val t = type_expr_bare(cx, arg)
+
+    texpr_type(t) match
+        Ptr(inner) ->
+            if *inner == VaList then t
+            else cx.err(span, s"'$what' needs a va_list, not ${type_show(texpr_type(t))}")
+        VaList ->
+            TExpr(span, TAddrOf(require_place(cx, t, arg, s"'$what'", false), Ptr(VaList)))
+        other -> cx.err(span, s"'$what' needs a va_list, not ${type_show(other)}")
+end va_list_arg
+
+// What a variadic argument may be read as. C promotes every one of them, so the narrow types are
+// refused with the type to read instead rather than being read at a width the caller never sent.
+private va_arg_type(cx: &Analyzer, span: Span, ty: Type) -> Type
+    ty match
+        Integer(bits, signed, _) ->
+            if bits >= 32 then return ty
+
+            cx.fault(span, s"a variadic argument is promoted to at least 32 bits, so it cannot be " +
+                     s"read as ${type_show(ty)} — read it as " +
+                     s"${if signed then "'int'" else "'uint'"} and convert")
+            ty
+        Floating(bits) ->
+            if bits == 64 then return ty
+
+            cx.fault(span, s"a variadic argument is promoted to double, so it cannot be read as " +
+                     s"${type_show(ty)} — read it as 'real' and convert")
+            ty
+        Char -> ty
+        Ptr(_) -> ty
+        CFn(_, _) -> ty
+        other ->
+            cx.fault(span, s"a variadic argument cannot be read as ${type_show(other)} — it may " +
+                     "be an integer, a real, a char, a raw pointer, or the address of a function")
+            ty
+end va_arg_type
