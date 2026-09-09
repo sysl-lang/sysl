@@ -3,6 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.text.Search
 
 // What an expression **is**, asked through the type the analyzer gives it.
 //
@@ -233,3 +234,35 @@ the_position_settles_a_variant()
               "use(n: int) -> Maybe[long] = Just(long(n))\n"
 
     assert_eq(body_type(src), "Maybe[long]")
+
+@test("a constant shift, a division and a remainder fold, and a use of a const is its value")
+a_const_is_its_value()
+    val mask = typed_body_text("const Mask: int = (1 << 23) - 1\n\nprobe() -> int = Mask\n", "probe")
+
+    assert(mask.index_of("value: 8388607").is_some(), mask)
+    assert(mask.index_of("TBinary").is_none(), mask)
+
+    val half = typed_body_text("const Half: int = 7 / 2\n\nprobe() -> int = Half\n", "probe")
+
+    assert(half.index_of("value: 3").is_some(), half)
+
+    val rest = typed_body_text("const Rest: int = 7 % 2\n\nprobe() -> int = Rest\n", "probe")
+
+    assert(rest.index_of("value: 1").is_some(), rest)
+
+@test("and a right shift rounds down where a division would round toward zero")
+a_right_shift_rounds_down()
+    val down = typed_body_text("const Down: int = -3 >> 1\n\nprobe() -> int = Down\n", "probe")
+
+    assert(down.index_of("value: -2").is_some(), down)
+
+    val up = typed_body_text("const Up: int = -3 / 2\n\nprobe() -> int = Up\n", "probe")
+
+    assert(up.index_of("value: -1").is_some(), up)
+
+@test("a shift by more places than any type is wide does not fold")
+a_shift_past_every_width_does_not_fold()
+    val text = "const Wide: int = 1 << 99999999\n\nprobe() -> int = Wide\n"
+    val shown = typed_body_text(text, "probe")
+
+    assert(shown.index_of("TBinary").is_some(), shown)

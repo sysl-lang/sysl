@@ -94,6 +94,29 @@ private complaints(text: string) -> Buf[string]
     out
 end complaints
 
+// Whether a source compiled beside the library emits a body under a name, which is what says a
+// program reached it.
+private emits(text: string, name: string) -> bool
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return false
+
+    var units: Buf[Program] = buf()
+    val library = library_trees()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    for i in 0..<done.funcs.len()
+        if done.funcs.at(i).name == name then return true
+
+    false
+end emits
+
 private says(xs: Buf[string], message: string) -> bool
     for i in 0..<xs.len()
         if xs.at(i) == message then return true
@@ -855,3 +878,51 @@ a_callable_settles_the_next_one()
     val out = shown(src, "use")
 
     assert(out.contains("retTy: string"), out)
+
+@test("a value that is not a scalar renders itself through its 'Display'")
+a_value_renders_through_its_display()
+    if no_library() then return
+
+    val text = point() + "impl Display for P\n" +
+        "    display(self, out: *Writer, fmt: FormatSpec) = display_str(\"p\", out, fmt)\n\n" +
+        "probe(p: P) -> string = str(p)\n"
+    val shown_text = shown(text, "probe")
+
+    assert(shown_text.index_of("TRender").is_some(), shown_text)
+    assert(shown_text.index_of("method: \"P.display\"").is_some(), shown_text)
+    assert(shown_text.index_of("struct: sysl.FormatSpec").is_some(), shown_text)
+
+@test("and a scalar goes out directly, since the two render alike and one builds no sink")
+a_scalar_renders_directly()
+    if no_library() then return
+
+    val shown_text = shown("probe(n: int) -> string = str(n)\n", "probe")
+
+    assert(shown_text.index_of("TStr").is_some(), shown_text)
+    assert(shown_text.index_of("TRender").is_none(), shown_text)
+
+@test("a module may be written out in full at a call")
+a_module_may_be_written_out_at_a_call()
+    if no_library() then return
+
+    val text = "probe(a: []const byte, b: []const byte) -> bool = sysl.slices.equal(a, b)\n"
+    val shown_text = shown(text, "probe")
+
+    assert(shown_text.index_of("sysl.slices$equal").is_some(), shown_text)
+
+@test("an operator's dispatch is a body the program reaches")
+an_operators_dispatch_is_reached()
+    if no_library() then return
+
+    val text = "probe(a: sysl.math.bigint.BigInt, b: sysl.math.bigint.BigInt) -> bool = a == b\n"
+
+    assert(emits(text, "sysl.math.bigint$BigInt.eq"), "the 'eq' the '==' dispatches to is emitted")
+
+@test("and so is every slot of a table a value was erased into")
+a_tables_slots_are_reached()
+    if no_library() then return
+
+    val text = "probe() -> unit\n    var out: *sysl.Writer = &sysl.stdout()\n\n    out.write(\"x\".bytes)\n"
+
+    assert(emits(text, "sysl$Stdout.write") || complaints(text).len() > 0,
+           "the 'write' the table points at is emitted")

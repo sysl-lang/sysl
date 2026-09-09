@@ -89,8 +89,8 @@ a_compilation_is_three_things()
     assert_eq(made.own.at(0), "")
     remove_dir_all(root).unwrap_or(())
 
-@test("a program's own '@tests' file is not one the program declares")
-a_test_file_is_dropped_from_a_build()
+@test("a program's own '@tests' file is one of its files, marked rather than dropped")
+a_test_file_is_part_of_the_compilation()
     if !library_here() then return
 
     var shape: Buf[(string, string)] = buf()
@@ -101,7 +101,7 @@ a_test_file_is_dropped_from_a_build()
     val root = project_of(shape)
     val made = compilation_of(root, host_target()).unwrap()
 
-    assert_eq(made.own.len(), 1)
+    assert_eq(made.own.len(), 2)
     remove_dir_all(root).unwrap_or(())
 
 @test("a directory holding no sysl is not a program, and says so before anything is parsed")
@@ -196,3 +196,102 @@ the_tree_holds_the_librarys_bodies()
                    "and the library function 'print' desugared into")
 
     remove_dir_all(root).unwrap_or(())
+
+@test("a tree is walked from an absolute root, so every file is named from the root of the filesystem")
+a_tree_names_its_files_absolutely()
+    var shape: Buf[(string, string)] = buf()
+
+    shape.push(("a.sysl", "f() -> int = 1\n"))
+
+    val root = project_of(shape)
+    val found = collect(root, None).unwrap()
+
+    assert_eq(found.len(), 1)
+    assert(found.at(0).src.name.starts_with("/"), found.at(0).src.name)
+
+@test("and naming a single file keeps the path the reader wrote")
+a_named_file_keeps_its_path()
+    var shape: Buf[(string, string)] = buf()
+
+    shape.push(("a.sysl", "f() -> int = 1\n"))
+
+    val root = project_of(shape)
+    val found = collect(s"$root/a.sysl", None).unwrap()
+
+    assert_eq(found.len(), 1)
+    assert_eq(found.at(0).src.name, s"$root/a.sysl")
+
+@test("a '.' and a '..' are resolved away and no symlink is followed")
+an_absolute_path_is_textual()
+    assert_eq(absolute_path("/a/b/../c/./d"), "/a/c/d")
+    assert_eq(absolute_path("/"), "/")
+
+@test("a compilation holds its '@tests' files, and marks what they declare")
+a_compilation_holds_its_tests_files()
+    if !library_here() then return
+
+    var shape: Buf[(string, string)] = buf()
+
+    shape.push(("package.hocon", "package {\n  name = \"probe\"\n}\n"))
+    shape.push(("a.sysl", "helper() -> int = 1\n\nmain() -> unit = ()\n"))
+    shape.push(("tests_a.sysl", "@tests\n\nscaffolding() -> int = helper()\n"))
+
+    val root = project_of(shape)
+    val out = emit_typed_text(root, None, false)
+
+    assert(out.is_ok(), "the program compiles")
+
+    val text = out.unwrap().text
+
+    assert(text.index_of("\"scaffolding\"").is_some(), "the test file's body is analyzed")
+    assert(text.index_of("testOnly: [\"scaffolding\"]").is_some(),
+           "and what it declares is marked as scaffolding")
+
+@test("a program carries its entry point, and the arguments the platform fills")
+a_program_carries_its_entry()
+    if !library_here() then return
+
+    var shape: Buf[(string, string)] = buf()
+
+    shape.push(("package.hocon", "package {\n  name = \"probe\"\n}\n"))
+    shape.push(("a.sysl", "main(args: []string) -> unit = ()\n"))
+
+    val root = project_of(shape)
+    val text = emit_typed_text(root, None, false).unwrap().text
+
+    assert(text.index_of("entry: TEntry").is_some(), text_head(text))
+    assert(text.index_of("func: \"main\"").is_some(), text_head(text))
+    assert(text.index_of("argsFn: \"sysl.args$args_of\"").is_some(), text_head(text))
+
+@test("and the tests it declared, each with the hooks its own module wrote")
+a_program_carries_its_tests()
+    if !library_here() then return
+
+    var shape: Buf[(string, string)] = buf()
+
+    shape.push(("package.hocon", "package {\n  name = \"probe\"\n}\n"))
+    shape.push(("a.sysl", "@test(\"it holds\")\nit_holds() -> unit = ()\n\nmain() -> unit = ()\n"))
+
+    val root = project_of(shape)
+    val text = emit_typed_text(root, None, false).unwrap().text
+
+    assert(text.index_of("- TTest").is_some(), text_head(text))
+    assert(text.index_of("display: \"it holds\"").is_some(), text_head(text))
+    assert(text.index_of("func: \"it_holds\"").is_some(), text_head(text))
+
+@test("two files that each keep a helper of one spelling to themselves get a key each")
+two_private_helpers_of_one_name()
+    var shape: Buf[(string, string)] = buf()
+
+    shape.push(("package.hocon", "package {\n  name = \"probe\"\n}\n"))
+    shape.push(("m/a.sysl", "module m\n\nprivate pick() -> int = 1\n\nfrom_a() -> int = pick()\n"))
+    shape.push(("m/b.sysl", "module m\n\nprivate pick() -> int = 2\n\nfrom_b() -> int = pick()\n"))
+
+    val root = project_of(shape)
+    val text = emit_typed_text(root, None, false).unwrap().text
+
+    assert(text.index_of("\"m$pick\"").is_some(), "the first file keeps the plain key")
+    assert(text.index_of("\"m$pick.private1\"").is_some(), "and the second takes a slot of its own")
+
+private text_head(text: string) -> string =
+    if text.bytes.len < 400 then text else text[0..<400]
