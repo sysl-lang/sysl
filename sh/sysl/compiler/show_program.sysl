@@ -1,0 +1,394 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.to_string
+import sysl.text.{str_builder, StrBuilder}
+
+// A whole program printed the reference compiler's way, which is what `sysl emit-typed` writes.
+//
+// **The format is `show_typed.sysl`'s, one level out**: the program is a node like any other, and
+// every field of it prints two spaces deeper as `fieldName: value`. A list of scalars is one inline
+// line, a list of nodes a run of `- ` items, and a set of names is sorted -- which is what lets two
+// compilers that built one in different orders still agree on the text.
+
+show_typed_program(p: TProgram) -> string
+    var out = str_builder()
+    val at = "  "
+
+    out.push("TProgram\n")
+    type_list_field(&out, at, "structs", p.structs)
+    type_list_field(&out, at, "enums", p.enums)
+    vtable_list(&out, at, "vtables", p.vtables)
+    extern_list(&out, at, "externs", p.externs)
+    val_list(&out, at, "vals", p.vals)
+    out.push("  funcs: ")
+
+    if p.funcs.is_empty() then out.push("[]\n")
+    else
+        out.push("\n")
+
+        for i in 0..<p.funcs.len()
+            out.push(show_typed_func(p.funcs.at(i)))
+
+    program_stmt_list(&out, at, "main", p.main)
+    entry_field(&out, at, "entry", p.entry)
+    name_list_field(&out, at, "precompiled", p.precompiled)
+    program_scalar(&out, at, "entryPoint", program_flag(p.entry_point))
+    program_scalar(&out, at, "cArtifact", program_flag(p.c_artifact))
+    name_list_field(&out, at, "noAllocModules", p.no_alloc_modules)
+    name_list_field(&out, at, "noAllocTestModules", p.no_alloc_test_modules)
+    program_scalar(&out, at, "mainModule", program_quoted(p.main_module))
+    test_list(&out, at, "tests", p.tests)
+    hook_list(&out, at, "hooks", p.hooks)
+    extern_var_list(&out, at, "externVars", p.extern_vars)
+    name_list_field(&out, at, "testOnly", p.test_only)
+    pair_map_field(&out, at, "destructors", p.destructors)
+    program_scalar(&out, at, "warnings", "[]")
+    module_deps_field(&out, at, "moduleDeps", p.module_deps)
+    out.finish()
+end show_typed_program
+
+private program_flag(b: bool) -> string = if b then "true" else "false"
+
+private program_scalar(out: *StrBuilder, indent: string, name: string, text: string)
+    out.push(indent)
+    out.push(name)
+    out.push(": ")
+    out.push(text)
+    out.push("\n")
+
+// A list of types, which are scalars, so it prints as one line.
+private type_list_field(out: *StrBuilder, indent: string, name: string, xs: Buf[Type])
+    var b = str_builder()
+
+    b.push("[")
+
+    for i in 0..<xs.len()
+        if i > 0 then b.push(", ")
+
+        b.push(type_show(xs.at(i)))
+
+    b.push("]")
+    program_scalar(out, indent, name, b.finish())
+
+// A set of names, sorted and inline: two analyzers that filled one in different orders agree here.
+private name_list_field(out: *StrBuilder, indent: string, name: string, xs: Buf[string])
+    var b = str_builder()
+    val sorted = sort_names(xs)
+
+    b.push("[")
+
+    for i in 0..<sorted.len()
+        if i > 0 then b.push(", ")
+
+        b.push(program_quoted(sorted.at(i)))
+
+    b.push("]")
+    program_scalar(out, indent, name, b.finish())
+
+// A map of name to name, sorted by key, `{}` where it holds nothing.
+private pair_map_field(out: *StrBuilder, indent: string, name: string, xs: Buf[(string, string)])
+    if xs.is_empty()
+        program_scalar(out, indent, name, "{}")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    var keys: Buf[string] = buf()
+
+    for i in 0..<xs.len()
+        keys.push(xs.at(i).0)
+
+    val sorted = sort_names(keys)
+    val inner = indent + "  "
+
+    for i in 0..<sorted.len()
+        for j in 0..<xs.len()
+            if xs.at(j).0 == sorted.at(i) then
+                program_scalar(out, inner, program_quoted(xs.at(j).0), program_quoted(xs.at(j).1))
+
+// A map of name to a set of names, sorted by key and each set sorted.
+private module_deps_field(out: *StrBuilder, indent: string, name: string,
+                          xs: Buf[(string, Buf[string])])
+    if xs.is_empty()
+        program_scalar(out, indent, name, "{}")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    var keys: Buf[string] = buf()
+
+    for i in 0..<xs.len()
+        keys.push(xs.at(i).0)
+
+    val sorted = sort_names(keys)
+    val inner = indent + "  "
+
+    for i in 0..<sorted.len()
+        for j in 0..<xs.len()
+            if xs.at(j).0 == sorted.at(i) then
+                name_list_field(out, inner, program_quoted(xs.at(j).0), xs.at(j).1)
+
+private vtable_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TVtable])
+    if xs.is_empty()
+        program_scalar(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+    val inner = item + "    "
+
+    for i in 0..<xs.len()
+        val v = xs.at(i)
+
+        out.push(item)
+        out.push("- TVtable\n")
+        program_scalar(out, inner, "name", program_quoted(v.name))
+        program_scalar(out, inner, "traitName", program_quoted(v.trait_name))
+        program_scalar(out, inner, "forType", type_show(v.for_type))
+        program_scalar(out, inner, "boxed", program_flag(v.boxed))
+        slot_list(out, inner, "slots", v.slots)
+        program_scalar(out, inner, "typeId", to_string(v.type_id))
+
+private slot_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TVSlot])
+    if xs.is_empty()
+        program_scalar(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+    val inner = item + "    "
+
+    for i in 0..<xs.len()
+        val s = xs.at(i)
+
+        out.push(item)
+        out.push("- TVSlot\n")
+        program_scalar(out, inner, "target", program_quoted(s.target))
+        program_scalar(out, inner, "recv", recv_text(s.recv))
+        type_list_field(out, inner, "params", s.params)
+        program_scalar(out, inner, "retTy", type_show(s.ret_ty))
+        slot_borrows(out, inner, s.borrows)
+
+// What a slot promises about the arguments it borrows, keyed by position and sorted numerically.
+private slot_borrows(out: *StrBuilder, indent: string, xs: Buf[(usize, string)])
+    if xs.is_empty()
+        program_scalar(out, indent, "borrows", "{}")
+        return
+    end if
+
+    out.push(indent)
+    out.push("borrows: \n")
+
+    val inner = indent + "  "
+    var sorted = xs
+
+    for i in 1..<sorted.len()
+        var j = i
+
+        while j > 0 && sorted.at(j).0 < sorted.at(j - 1).0
+            val held = sorted.at(j)
+
+            sorted.set(j, sorted.at(j - 1))
+            sorted.set(j - 1, held)
+            j -= 1
+
+    for i in 0..<sorted.len()
+        program_scalar(out, inner, str(sorted.at(i).0), program_quoted(sorted.at(i).1))
+
+private recv_text(r: RecvMode) -> string = r match
+    ByValue -> "ByValue"
+    ByPtr -> "ByPtr"
+    ByRef(_) -> "ByRef"
+
+private extern_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TExtern])
+    if xs.is_empty()
+        program_scalar(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+    val inner = item + "    "
+
+    for i in 0..<xs.len()
+        val e = xs.at(i)
+
+        out.push(item)
+        out.push("- TExtern\n")
+        program_scalar(out, inner, "name", program_quoted(e.name))
+        program_scalar(out, inner, "symbol", program_quoted(e.symbol))
+        type_list_field(out, inner, "params", e.params)
+        program_scalar(out, inner, "retTy", type_show(e.ret_ty))
+        program_scalar(out, inner, "variadic", program_flag(e.variadic))
+
+private extern_var_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TExternVar])
+    if xs.is_empty()
+        program_scalar(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+    val inner = item + "    "
+
+    for i in 0..<xs.len()
+        out.push(item)
+        out.push("- TExternVar\n")
+        program_scalar(out, inner, "symbol", program_quoted(xs.at(i).symbol))
+        program_scalar(out, inner, "ty", type_show(xs.at(i).ty))
+
+private val_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TVal])
+    if xs.is_empty()
+        program_scalar(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+    val inner = item + "    "
+
+    for i in 0..<xs.len()
+        val v = xs.at(i)
+
+        out.push(item)
+        out.push("- TVal\n")
+        program_scalar(out, inner, "symbol", program_quoted(v.symbol))
+        program_scalar(out, inner, "ty", type_show(v.ty))
+        show_typed_opt_expr(out, inner, "init", v.init)
+        program_scalar(out, inner, "computed", program_flag(v.computed))
+        program_scalar(out, inner, "writable", program_flag(v.writable))
+        program_scalar(out, inner, "align", usize_option_text(v.align))
+        program_scalar(out, inner, "section", string_option_text(v.section))
+
+private entry_field(out: *StrBuilder, indent: string, name: string, e: Option[TEntry])
+    if e.is_none()
+        program_scalar(out, indent, name, "None")
+        return
+    end if
+
+    val v = e.unwrap()
+    val inner = indent + "  "
+
+    out.push(indent)
+    out.push(name)
+    out.push(": TEntry\n")
+    program_scalar(out, inner, "func", program_quoted(v.func))
+    program_scalar(out, inner, "argsFn", string_option_text(v.args_fn))
+    program_scalar(out, inner, "resultFn", string_option_text(v.result_fn))
+    program_scalar(out, inner, "resultTy", type_option_text(v.result_ty))
+
+private test_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TTest])
+    if xs.is_empty()
+        program_scalar(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+    val inner = item + "    "
+
+    for i in 0..<xs.len()
+        val t = xs.at(i)
+
+        out.push(item)
+        out.push("- TTest\n")
+        program_scalar(out, inner, "func", program_quoted(t.func))
+        program_scalar(out, inner, "display", program_quoted(t.display))
+        program_scalar(out, inner, "shouldTrap", program_flag(t.should_trap))
+        program_scalar(out, inner, "expected", string_option_text(t.expected))
+        program_scalar(out, inner, "file", program_quoted(t.file))
+        program_scalar(out, inner, "line", str(t.line))
+        hooks_field(out, inner, t.hooks)
+
+private hooks_field(out: *StrBuilder, indent: string, h: THooks)
+    val inner = indent + "  "
+
+    out.push(indent)
+    out.push("hooks: THooks\n")
+    hook_option(out, inner, "setup", h.setup)
+    hook_option(out, inner, "teardown", h.teardown)
+    hook_option(out, inner, "setupAll", h.setup_all)
+    hook_option(out, inner, "teardownAll", h.teardown_all)
+
+private hook_option(out: *StrBuilder, indent: string, name: string, h: Option[THook])
+    if h.is_none()
+        program_scalar(out, indent, name, "None")
+        return
+    end if
+
+    hook_node(out, indent, name, h.unwrap())
+
+private hook_node(out: *StrBuilder, indent: string, name: string, h: THook)
+    val inner = indent + "  "
+
+    out.push(indent)
+    out.push(name)
+    out.push(": THook\n")
+    program_scalar(out, inner, "kind", hook_kind_text(h.kind))
+    program_scalar(out, inner, "func", program_quoted(h.func))
+    program_scalar(out, inner, "file", program_quoted(h.file))
+    program_scalar(out, inner, "line", str(h.line))
+
+private hook_kind_text(k: HookKind) -> string = k match
+    Setup -> "Setup"
+    Teardown -> "Teardown"
+    SetupAll -> "SetupAll"
+    TeardownAll -> "TeardownAll"
+
+private hook_list(out: *StrBuilder, indent: string, name: string, xs: Buf[THook])
+    if xs.is_empty()
+        program_scalar(out, indent, name, "[]")
+        return
+    end if
+
+    out.push(indent)
+    out.push(name)
+    out.push(": \n")
+
+    val item = indent + "  "
+
+    for i in 0..<xs.len()
+        val h = xs.at(i)
+        val inner = item + "  "
+
+        out.push(item)
+        out.push("- THook\n")
+        program_scalar(out, inner, "kind", hook_kind_text(h.kind))
+        program_scalar(out, inner, "func", program_quoted(h.func))
+        program_scalar(out, inner, "file", program_quoted(h.file))
+        program_scalar(out, inner, "line", str(h.line))
+
+private program_stmt_list(out: *StrBuilder, indent: string, name: string, xs: Buf[TStmt])
+    if xs.is_empty()
+        program_scalar(out, indent, name, "[]")
+        return
+    end if
+
+    show_typed_stmt_list(out, indent, name, xs)

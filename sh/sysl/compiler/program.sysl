@@ -109,3 +109,120 @@ private a_library_key(a: &Analysis, name: string) -> Option[string]
 
     None
 end a_library_key
+
+// Everything one compilation amounts to, once every body it reaches has been typed.
+program_of(done: TypedBodies, main_module: string) -> TProgram
+    val a = done.an
+
+    TProgram(reached_structs(a), reached_enums(a), reached_vtables(a), reached_externs(a),
+             reached_vals(a), emitted_funcs(done.funcs), buf(), done.entry, buf(), true, false,
+             buf(), buf(), main_module, buf(), buf(), buf(), a.tables.test_only, buf(), buf(), buf())
+end program_of
+
+// The bodies a program **emits**, which is the question a printed tree answers.
+//
+// An instantiation at a **type parameter** is a diagnostic shape rather than a laid-out one: the
+// walk that reads a generic body once at its own definition builds one, and no value at run time has
+// that type. It has no layout to emit, so it is left out here rather than reaching a back end that
+// would have to invent one.
+private emitted_funcs(funcs: Buf[TFunc]) -> Buf[TFunc]
+    var out: Buf[TFunc] = buf()
+
+    for i in 0..<funcs.len()
+        if emitted_shape(funcs.at(i)) then out.push(funcs.at(i))
+
+    out
+end emitted_funcs
+
+private emitted_shape(f: TFunc) -> bool
+    for i in 0..<f.params.len()
+        if mentions_abstract(f.params.at(i).1) then return false
+
+    !mentions_abstract(f.ret_ty)
+end emitted_shape
+
+// The struct types a program laid out, in the order they were made real. One made at a type
+// parameter names the family a generic covers rather than a type, so nothing has that layout.
+private reached_structs(a: &Analysis) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for i in 0..<a.tables.struct_insts.len()
+        val t = a.tables.struct_insts.at(i)
+
+        if !instantiated_abstract(t) then out.push(t)
+
+    out
+end reached_structs
+
+// The enums, on the same terms, less the **simple** ones: an enum with nothing in any variant is its
+// underlying integer and has no layout of its own to record.
+private reached_enums(a: &Analysis) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for i in 0..<a.tables.enum_insts.len()
+        val t = a.tables.enum_insts.at(i)
+        val simple = t match
+            Enum(d) -> d.simple
+            _ -> false
+
+        if !simple && !instantiated_abstract(t) then out.push(t)
+
+    out
+end reached_enums
+
+// Whether a named type was made real at something that is not a type -- a parameter standing in for
+// itself while a generic body was read at its own definition.
+private instantiated_abstract(t: Type) -> bool = t match
+    Struct(d) -> any_mentions_abstract(d.targs)
+    Enum(d) -> any_mentions_abstract(d.targs)
+    _ -> false
+
+private any_mentions_abstract(ts: Buf[Type]) -> bool
+    for i in 0..<ts.len()
+        if mentions_abstract(ts.at(i)) then return true
+
+    false
+end any_mentions_abstract
+
+private reached_vtables(a: &Analysis) -> Buf[TVtable]
+    var out: Buf[TVtable] = buf()
+
+    for i in 0..<a.tables.members.vtables.len()
+        out.push(a.tables.members.vtables.at(i))
+
+    out
+end reached_vtables
+
+// The `extern` functions a program calls, with their signatures as the tables resolved them. An
+// `extern` nothing reaches is a declaration and not a link.
+private reached_externs(a: &Analysis) -> Buf[TExtern]
+    var out: Buf[TExtern] = buf()
+    val used = a.funcs_used()
+
+    for i in 0..<used.len()
+        val key = used.at(i)
+        val d = a.tables.externs.get(key)
+
+        if d.is_some()
+            val scope = extern_home(a, key)
+            var params: Buf[Type] = buf()
+
+            for j in 0..<d.unwrap().params.len()
+                params.push(resolve_type(a, scope, d.unwrap().params.at(j).typ, no_bindings()))
+
+            var ret = Unit
+
+            if d.unwrap().ret_type.is_some() then
+                ret = resolve_type(a, scope, d.unwrap().ret_type.unwrap(), no_bindings())
+
+            out.push(TExtern(key, extern_symbol(d.unwrap()), params, ret, d.unwrap().variadic))
+
+    out
+end reached_externs
+
+private reached_vals(a: &Analysis) -> Buf[TVal] = buf()
+
+// The file an `extern` was written in, which is where the types in its signature mean what they
+// meant.
+private extern_home(a: &Analysis, key: string) -> Scope =
+    a.tables.extern_scopes.get(key).unwrap_or(empty_scope())
