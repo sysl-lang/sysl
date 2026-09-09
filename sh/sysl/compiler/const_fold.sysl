@@ -221,3 +221,152 @@ private const_type_attr(cx: &Analyzer, receiver: Expr, attr: string) -> Option[C
             else None
         _ -> None
 end const_type_attr
+
+// -- `@assert` -----------------------------------------------------------------------------------
+
+// What an `@assert` says when its condition does not hold, is not a condition, or does not settle.
+//
+// **It is settled while compiling and emits nothing either way**: a true assertion is not code, and
+// a false one has already stopped the compilation. So the whole of the form is what is said about
+// it here.
+//
+// Inside a generic body the folding is done against the substitution the instantiation supplied,
+// which is the only moment `sizeof(T)` is a number -- and a condition that is still waiting for one
+// is not a mistake, since a later instantiation settles it.
+check_assert(cx: &Analyzer, span: Span, cond: Expr, message: Option[string])
+    const_fold(cx, cond) match
+        Some(ConstBool(true)) -> ()
+        Some(ConstBool(false)) ->
+            val head = assertion_head(message)
+
+            cx.fault(span, head + compared_note(cx, cond) + instantiation_note(cx))
+        Some(other) ->
+            cx.fault(span, s"'@assert' takes a condition, and this is ${const_kind(other)} — an " +
+                     "assertion is something that can be true or false")
+        None ->
+            if !awaits_instantiation(cx, cond) then
+                cx.fault(span, "'@assert' is settled while compiling, so its condition has to be " +
+                         "a constant expression — a literal, a 'const', 'sizeof', 'alignof', " +
+                         "'offsetof', or the arithmetic and comparisons over them, and never a call")
+end check_assert
+
+private assertion_head(message: Option[string]) -> string
+    if message.is_none() then return "assertion failed"
+
+    s"assertion failed: ${message.unwrap()}"
+end assertion_head
+
+// What a failed **comparison** adds: the value each side folded to, for a side the reader did not
+// write out as a literal. The compiler folded both to decide the comparison, so it is holding the
+// two numbers that explain the answer.
+private compared_note(cx: &Analyzer, cond: Expr) -> string
+    var left: Option[string] = None
+    var right: Option[string] = None
+
+    *cond.kind match
+        Compare(operands, ops) ->
+            if operands.len() == 2 && ops.len() == 1
+                left = folded_side(cx, operands.at(0))
+                right = folded_side(cx, operands.at(1))
+        _ -> ()
+
+    if left.is_some() && right.is_some() then
+        return s" — the left side is ${left.unwrap()} and the right side is ${right.unwrap()}"
+
+    if left.is_some() then return s" — the left side is ${left.unwrap()}"
+    if right.is_some() then return s" — the right side is ${right.unwrap()}"
+
+    ""
+end compared_note
+
+// One side of the comparison, as text, unless the reader wrote it out as a literal -- in which case
+// reporting it back says nothing they cannot already see.
+private folded_side(cx: &Analyzer, e: Expr) -> Option[string]
+    if written_literal(e) then return None
+
+    const_fold(cx, e).map(v -> const_text(v))
+end folded_side
+
+// Whether an operand is a literal the reader **wrote**. A negative number is written `-1` and parses
+// as a unary minus over a literal, so it counts too -- otherwise the shape a bound is most often
+// compared against would be the one reported back.
+private written_literal(e: Expr) -> bool = *e.kind match
+    IntLit(_, _, _) -> true
+    FloatLit(_, _) -> true
+    BoolLit(_) -> true
+    CharLit(_) -> true
+    StrLit(_) -> true
+    Unary(op, operand) -> op == "-" && written_literal(operand)
+    _ -> false
+
+// A folded value as it should appear inside a sentence, spelled the way it would be written.
+private const_text(v: Const) -> string = v match
+    ConstInt(n) -> to_string(n)
+    ConstBool(b) -> if b then "true" else "false"
+    ConstChar(c) -> s"'$c'"
+    ConstStr(s) -> s"\"$s\""
+
+// What a value that is not a condition is, said the way the refusal names it.
+private const_kind(v: Const) -> string = v match
+    ConstInt(_) -> "an integer"
+    ConstBool(_) -> "a boolean"
+    ConstChar(_) -> "a character"
+    ConstStr(_) -> "a string"
+
+// Whether the condition is one a later instantiation settles rather than one that cannot settle at
+// all: a measurement of a type parameter, or a value parameter standing in for itself.
+private awaits_instantiation(cx: &Analyzer, e: Expr) -> bool = *e.kind match
+    LayoutOf(_, t) -> is_abstract_underlying(resolve_type(cx.an, cx.scope, t, cx.subst))
+    OffsetOf(t, _) -> is_abstract_underlying(resolve_type(cx.an, cx.scope, t, cx.subst))
+    Ident(n) -> binding_is_abstract(cx.subst, n)
+    Unary(_, operand) -> awaits_instantiation(cx, operand)
+    Binary(_, l, r) -> awaits_instantiation(cx, l) || awaits_instantiation(cx, r)
+    Compare(operands, _) ->
+        operands.len() == 2 && (awaits_instantiation(cx, operands.at(0)) ||
+                                awaits_instantiation(cx, operands.at(1)))
+    Call(callee, args) -> args.len() == 1 && is_bare_name(callee) && awaits_instantiation(cx, args.at(0))
+    _ -> false
+
+private is_bare_name(e: Expr) -> bool = *e.kind match
+    Ident(_) -> true
+    _ -> false
+
+private is_abstract_underlying(t: Type) -> bool = underlying(t) match
+    Abstract(_, _) -> true
+    _ -> false
+
+private binding_is_abstract(subst: Buf[Binding], name: string) -> bool
+    for i in 0..<subst.len()
+        if subst.at(i).name == name
+            return subst.at(i).ty match
+                Abstract(_, _) -> true
+                _ -> false
+
+    false
+end binding_is_abstract
+
+// Which type parameters the body was compiled against, where it was compiled against any.
+//
+// The mistake is at the call that asked while the sentence explaining why is at the declaration, so
+// a report carrying only one of the two sends the reader to the wrong file. `Self` is named
+// alongside the parameters rather than filtered out as the compiler's own word: in an inherited
+// default body -- one text shared by every implementing type -- it is the whole of the answer.
+private instantiation_note(cx: &Analyzer) -> string
+    if cx.subst.is_empty() then return ""
+
+    var names: Buf[string] = buf()
+
+    for i in 0..<cx.subst.len()
+        names.push(cx.subst.at(i).name)
+
+    val sorted = sort_names(names)
+    var out = " — where "
+
+    for i in 0..<sorted.len()
+        for j in 0..<cx.subst.len()
+            if cx.subst.at(j).name == sorted.at(i)
+                out = out + (if i > 0 then ", " else "") +
+                      s"${sorted.at(i)} = ${type_show(cx.subst.at(j).ty)}"
+
+    out
+end instantiation_note

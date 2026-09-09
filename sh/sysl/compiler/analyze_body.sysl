@@ -65,6 +65,10 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
     // that call's body in exactly as a function's would.
     val storage = module_storage(a)
 
+    // The asserts a file declared beside its declarations, once every constant has been folded: a
+    // condition may name one wherever it was declared.
+    check_top_level_asserts(a, units)
+
     // **The library's own functions are held back**: they are analyzed below, and only if
     // something reaches them. That is what keeps a program that never prints from carrying the
     // printing surface, and it is what makes the list of functions a compilation ends with the list
@@ -176,6 +180,22 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
     TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, ordered_vals(storage), a, units, entry)
 end analyze_bodies
 
+// Every `@assert` written where a declaration stands, settled in the terms of the file that wrote
+// it.
+private check_top_level_asserts(a: &Analysis, units: Buf[Program])
+    for i in 0..<units.len()
+        val unit = units.at(i)
+        val scope = scope_of_unit(unit)
+        val cx = analyzer_for(a, scope)
+
+        for j in 0..<unit.body.len()
+            val s = unit.body.at(j)
+
+            *s.kind match
+                AssertDecl(cond, message) -> check_assert(cx, s.span, cond, message)
+                _ -> ()
+end check_top_level_asserts
+
 // One body waiting for something to reach it: the name it will be analyzed under, the terms it was
 // written in, and either the declaration itself or the member it was lowered from.
 struct HeldBody
@@ -257,8 +277,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> TFunc
     val body = body_block(cx, rest, ret)
 
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
-        cx.fault(body_span(rest, span), s"function '${d.name}' should return ${type_show(ret)}, " +
-                 s"but its body yields ${type_show(body.ty)}")
+        cx.fault(body_span(rest, span), body_disagreement(d.name, ret, body.ty))
 
     a.tables.homes.put(func_key(a, scope, span, d), scope)
 
@@ -433,8 +452,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     val span = body_span(rest, span_zero())
 
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
-        cx.fault(span, s"function '$name' should return ${type_show(ret)}, but its body yields " +
-                 s"${type_show(body.ty)}")
+        cx.fault(span, body_disagreement(d.name, ret, body.ty))
 
     // **An instantiation whose name carries a closure's is internal on the same ground the closure
     // itself is.** `sysl.time$resolve.$closure4` is a symbol only the unit that lowered that closure
@@ -448,6 +466,21 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
           d.conv, d.tailrec, contract.3, d.pure, d.ghost, d.reads, d.writes, exported_symbol(d),
           d.section)
 end analyze_instance_in
+
+// What a body that does not answer with what its signature declared is told.
+//
+// **A `where` predicate and a struct `invariant` are lowered to functions the reader never wrote**,
+// so the mistake in one is reported as what they did write -- a condition that is not a `bool` --
+// rather than as a return type nothing in the source names.
+body_disagreement(name: string, ret: Type, got: Type) -> string
+    if name.ends_with("$pred") then
+        return s"a 'where' predicate must be a 'bool', but this one is ${type_show(got)}"
+
+    if name.ends_with("$inv") then
+        return s"an 'invariant' must be a 'bool', but this one is ${type_show(got)}"
+
+    s"function '$name' should return ${type_show(ret)}, but its body yields ${type_show(got)}"
+end body_disagreement
 
 // A block with nothing in it, for a function whose signature never resolved.
 private empty_block() -> TBlock = TBlock(buf(), None, Unit)
