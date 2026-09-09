@@ -214,3 +214,98 @@ sizeof_is_always_a_usize()
 an_instantiation_names_its_declaration()
     assert_eq(said("pack[T](x: T) -> int = sizeof(T)\n\nuse() -> int = pack[int](1)\n"),
               "function 'pack' should return int, but its body yields usize")
+
+// -- a calling convention, and what a processor makes of it ---------------------------------------
+
+private for_machine(text: string, name: string) -> string
+    val t = target_named(name)
+
+    if t.is_none() then return s"no target called '$name'"
+
+    val ds = stmt_diagnostics_for(text, t.unwrap())
+
+    if ds.is_empty() then return ""
+
+    ds.at(0)
+end for_machine
+
+private many_for(text: string, name: string) -> usize
+    val t = target_named(name)
+
+    if t.is_none() then return usize(99)
+
+    stmt_diagnostics_for(text, t.unwrap()).len()
+end many_for
+
+private a_frame() -> string = "struct Frame\n    ip: usize\n\n"
+
+@test("a processor with no interrupt form says so in its own terms")
+an_interrupt_on_a_machine_without_one()
+    assert_eq(for_machine(a_frame() + "interrupt handler(frame: *Frame) = ()\n", "aarch64-macos"),
+              "'interrupt' is not something aarch64 has: its exception entry goes through a " +
+              "vector table of fixed-size instruction slots, so a handler is assembly and there " +
+              "is nothing here for a convention to describe")
+
+@test("and each of them says something true of its own machine")
+each_machine_without_one_says_its_own_reason()
+    val text = a_frame() + "interrupt handler(frame: *Frame) = ()\n"
+
+    assert(for_machine(text, "thumb-freestanding").contains("Cortex-M exception"),
+           for_machine(text, "thumb-freestanding"))
+    assert(for_machine(text, "wasm32-freestanding").contains("nothing arrives asynchronously"),
+           for_machine(text, "wasm32-freestanding"))
+    assert(for_machine(text, "craft-freestanding").contains("the reason in 'cause'"),
+           for_machine(text, "craft-freestanding"))
+
+@test("an x86-64 handler taking the frame the processor pushed is what the ABI wants")
+an_x86_handler_that_is_shaped_right()
+    assert_eq(many_for(a_frame() + "interrupt handler(frame: *Frame) = ()\n", "x86_64-linux"), 0)
+    assert_eq(many_for(a_frame() + "interrupt handler(frame: *Frame, code: int) = ()\n",
+                       "x86_64-linux"), 0)
+
+@test("one taking nothing is told what to write instead")
+an_x86_handler_with_no_frame()
+    assert_eq(for_machine("interrupt handler() = ()\n", "x86_64-linux"),
+              "an x86-64 interrupt handler is handed the frame the processor pushed, so 'handler' " +
+              "takes a pointer to it — 'interrupt handler(frame: *Frame)'")
+
+@test("and one taking something else is told what the shape is for")
+an_x86_handler_of_the_wrong_shape()
+    assert_eq(for_machine("interrupt handler(a: int, b: int) = ()\n", "x86_64-linux"),
+              "an x86-64 interrupt handler takes a pointer to the frame the processor pushed, " +
+              "optionally followed by the error code some vectors push after it — so at most '*T' " +
+              "and one integer, which is not what 'handler' declares")
+
+@test("a RISC-V handler is entered with no arguments at all")
+a_riscv_handler_takes_none()
+    assert_eq(many_for("interrupt handler() = ()\n", "riscv64-freestanding"), 0)
+    assert_eq(for_machine(a_frame() + "interrupt handler(frame: *Frame) = ()\n",
+                          "riscv64-freestanding"),
+              "a RISC-V interrupt handler is entered with no arguments, so 'handler' takes none — " +
+              "what the handler needs is read from the machine's own registers")
+
+@test("a handler yields nothing, since there is nowhere for a value to go")
+a_handler_that_returns_something()
+    assert_eq(for_machine("interrupt handler() -> int = 1\n", "riscv64-freestanding"),
+              "an interrupt handler returns to whatever it interrupted, so it yields nothing — " +
+              "'handler' declares int")
+
+@test("and it cannot be generic, there being no way to say which instantiation the vector holds")
+a_generic_handler()
+    assert_eq(for_machine("interrupt handler[T]() = ()\n", "riscv64-freestanding"),
+              "an interrupt handler is a single entry point the processor jumps to, so 'handler' " +
+              "cannot be generic — there would be no way to say which instantiation the vector holds")
+
+@test("a privilege mode is RISC-V's alone, and only three of them are modes")
+a_privilege_mode()
+    assert_eq(many_for("interrupt(supervisor) handler() = ()\n", "riscv64-freestanding"), 0)
+    assert_eq(for_machine("interrupt(hypervisor) handler() = ()\n", "riscv64-freestanding"),
+              "'hypervisor' is not a privilege mode — RISC-V has 'machine', 'supervisor', 'user', " +
+              "and an unwritten one is 'machine'")
+
+@test("and a machine with none to name is told to write the convention alone")
+a_privilege_mode_where_there_are_none()
+    assert_eq(for_machine("interrupt(machine) handler(frame: *int) = ()\n", "x86_64-linux"),
+              "'interrupt(machine)' names a privilege mode, and x86_64 has none to name — its " +
+              "interrupt convention describes the frame the processor pushed, not the level it " +
+              "was pushed at. Write 'interrupt' alone")

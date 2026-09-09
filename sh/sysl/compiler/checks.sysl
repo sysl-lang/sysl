@@ -14,6 +14,7 @@ import sysl.text.{Search, from_utf8_unchecked}
 
 // Everything a program has to answer for, run in the order the reference runs them.
 whole_program_checks(a: &Analysis, funcs: Buf[TFunc])
+    check_conventions(a)
     check_drop_returns(a)
     check_ghost(a, funcs)
 end whole_program_checks
@@ -178,3 +179,205 @@ private drops_or_args(drops: Buf[string], base: string, targs: Buf[Type]) -> Opt
 
     None
 end drops_or_args
+
+// -- a calling convention, and what a processor makes of it ---------------------------------------
+
+// The one convention there is. Named rather than assumed, so that the refusal for an unknown one can
+// list what there is.
+const InterruptConv: string = "interrupt"
+
+// The privilege modes RISC-V distinguishes, in the spelling its attribute takes. `machine` is the
+// default because a handler with no mode written is the one a bare-metal program means.
+private riscv_modes() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("machine")
+    out.push("supervisor")
+    out.push("user")
+    out
+end riscv_modes
+
+const DefaultRiscvMode: string = "machine"
+
+// How a processor spells an interrupt handler.
+//
+// **`interrupt` is one concept with several answers, and a processor without one is without it for
+// its own reason.** On x86-64 it is a calling convention and the ABI insists the handler take a
+// pointer to the frame the hardware pushed; on RISC-V it is a function attribute and the handler
+// must take nothing at all. The rest carry their reason here, because a shared sentence could only
+// be true of one of them.
+enum InterruptForm
+    // An LLVM calling convention, written on the definition -- x86-64's.
+    FormConvention
+
+    // An LLVM function attribute, written after the signature -- RISC-V's.
+    FormAttribute
+
+    // This processor has none, and this is why.
+    FormAbsent(why: string)
+end InterruptForm
+
+interrupt_form(cpu: Cpu) -> InterruptForm = cpu match
+    X86_64 -> FormConvention
+
+    // Both RISC-V widths spell it the same way, because it is the same attribute: the privilege
+    // modes are the architecture's rather than the register width's.
+    Riscv64 -> FormAttribute
+    Riscv32 -> FormAttribute
+
+    Aarch64 -> FormAbsent("its exception entry goes through a vector table of fixed-size " +
+                          "instruction slots, so a handler is assembly and there is nothing here " +
+                          "for a convention to describe")
+
+    // A Cortex-M handler is an ordinary function, and that is the whole answer rather than a gap:
+    // the processor stacks the caller-saved registers itself and puts `EXC_RETURN` in the link
+    // register, so a plain function returning normally is already correct.
+    Thumb -> FormAbsent("a Cortex-M exception is entered with the caller-saved registers already " +
+                        "stacked by the processor and 'EXC_RETURN' in the link register, so an " +
+                        "ordinary function is already a correct handler and there is no prologue " +
+                        "for a convention to arrange — write one, and give it the name the vector " +
+                        "table holds with '@export(\"SysTick_Handler\")'")
+
+    // WebAssembly has no interrupts to have a form for, which is a different kind of absence: the
+    // others are machines whose entry a convention cannot usefully describe, and this is a machine
+    // with no asynchronous entry at all.
+    Wasm32 -> FormAbsent("a wasm module is only ever entered by its embedder calling an exported " +
+                         "function, so nothing arrives asynchronously and there is no handler for " +
+                         "a convention to describe")
+
+    // CRAFT has traps and still has nothing for a convention to describe: it enters every one at a
+    // single vector, so what the hardware reaches is the kernel's decoder rather than a handler.
+    Craft -> FormAbsent("CRAFT enters every trap at one vector with the reason in 'cause', so what " +
+                        "the hardware reaches is the kernel's own decoder rather than a handler — " +
+                        "write that entry in assembly, and let it call an ordinary function for " +
+                        "each cause it decodes")
+
+    X86 -> FormAbsent("sysl cannot lower for i386 at all, for want of a measured C ABI, so its " +
+                      "interrupt convention is not something this compiler implements")
+
+// Whether this processor's interrupt form takes a mode. Only RISC-V's does -- x86-64's convention
+// describes the frame the hardware pushed and has no privilege level to name.
+private takes_mode(cpu: Cpu) -> bool = cpu match
+    Riscv64 -> true
+    _ -> false
+
+// Holds every declaration carrying a convention to what this processor allows.
+//
+// **A declaration pass, not part of the body walk.** Every rule is about the signature, and the
+// signature exists whether or not the body is ever analyzed -- a generic handler nothing
+// instantiates has no body walked at all, and it is exactly as wrong as one that does.
+private check_conventions(a: &Analysis)
+    val funcs = a.tables.funcs
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        if f.decl.conv.is_some() then check_convention(a, f, f.decl.conv.unwrap())
+end check_conventions
+
+private check_convention(a: &Analysis, f: Func, c: CallConv)
+    if c.name != InterruptConv then
+        a.fault(f.scope, c.span, s"'${c.name}' is not a calling convention — '$InterruptConv' is " +
+                "what there is")
+
+    val cpu = a.tables.target.cpu
+
+    interrupt_form(cpu) match
+        // The reason comes from the table rather than from here, because the processors without an
+        // interrupt form are without one for unrelated reasons.
+        FormAbsent(why) ->
+            a.fault(f.scope, c.span, s"'${c.name}' is not something ${cpu_symbol(cpu)} has: $why")
+        form ->
+            check_convention_mode(a, f, c, cpu)
+
+            // Generic is refused before anything is resolved, because a type parameter has nothing
+            // to resolve *to* out here.
+            if !f.decl.tparams.is_empty() then
+                a.fault(f.scope, c.span, "an interrupt handler is a single entry point the " +
+                        s"processor jumps to, so '${f.decl.name}' cannot be generic — there would " +
+                        "be no way to say which instantiation the vector holds")
+
+            check_convention_shape(a, f, c, form)
+end check_convention
+
+// The parenthesised word, which only RISC-V has anything to put in.
+//
+// A mode on a processor with none is refused rather than dropped, because a reader who wrote
+// `interrupt(supervisor)` believed it was saying something.
+private check_convention_mode(a: &Analysis, f: Func, c: CallConv, cpu: Cpu)
+    if c.arg.is_none() then return
+
+    val mode = c.arg.unwrap()
+
+    if takes_mode(cpu)
+        if !holds_string(riscv_modes(), mode) then
+            a.fault(f.scope, c.span, s"'$mode' is not a privilege mode — RISC-V has 'machine', " +
+                    s"'supervisor', 'user', and an unwritten one is '$DefaultRiscvMode'")
+    else
+        a.fault(f.scope, c.span, s"'${c.name}($mode)' names a privilege mode, and " +
+                s"${cpu_symbol(cpu)} has none to name — its interrupt convention describes the " +
+                "frame the processor pushed, not the level it was pushed at. Write 'interrupt' alone")
+end check_convention_mode
+
+// The signature the ABI demands, which the two processors that have interrupts disagree about.
+//
+// Neither rule is sysl's invention and neither is negotiable: clang refuses an x86-64 handler
+// without the frame pointer in as many words, and a RISC-V handler is entered with nothing in the
+// argument registers that a parameter could have come from.
+private check_convention_shape(a: &Analysis, f: Func, c: CallConv, form: InterruptForm)
+    val ret = declared_result_type(f.decl.ret_type.map(t -> resolve_type(a, f.scope, t,
+                                                                        no_bindings())))
+
+    // Nothing returns to. A handler is left through the processor's own return-from-interrupt,
+    // which restores the interrupted context and has nowhere to put a value.
+    if !no_value(ret) then
+        a.fault(f.scope, c.span, "an interrupt handler returns to whatever it interrupted, so it " +
+                s"yields nothing — '${f.decl.name}' declares ${type_show(ret)}")
+
+    if f.decl.variadic then
+        a.fault(f.scope, c.span, "an interrupt handler is entered by the processor with a fixed " +
+                s"frame, so '${f.decl.name}' cannot be variadic")
+
+    var params: Buf[Type] = buf()
+
+    for i in 0..<f.decl.params.len()
+        params.push(resolve_type(a, f.scope, f.decl.params.at(i).typ, no_bindings()))
+
+    form match
+        // RISC-V enters the handler with the interrupted program's registers still live; there is
+        // no argument to read, and a parameter would be whatever the interrupted code left behind.
+        FormAttribute ->
+            if !params.is_empty() then
+                a.fault(f.scope, c.span, "a RISC-V interrupt handler is entered with no arguments, " +
+                        s"so '${f.decl.name}' takes none — what the handler needs is read from the " +
+                        "machine's own registers")
+
+        // x86-64 pushes a frame and the ABI hands the handler its address; some vectors push an
+        // error code after it. Clang refuses any other shape.
+        FormConvention ->
+            if params.is_empty() then
+                a.fault(f.scope, c.span, "an x86-64 interrupt handler is handed the frame the " +
+                        s"processor pushed, so '${f.decl.name}' takes a pointer to it — " +
+                        s"'interrupt ${f.decl.name}(frame: *Frame)'")
+            else if !frame_shaped(params) then
+                a.fault(f.scope, c.span, "an x86-64 interrupt handler takes a pointer to the frame " +
+                        "the processor pushed, optionally followed by the error code some vectors " +
+                        "push after it — so at most '*T' and one integer, which is not what " +
+                        s"'${f.decl.name}' declares")
+        _ -> ()
+end check_convention_shape
+
+// A pointer to the frame, optionally followed by one integer, and nothing else.
+private frame_shaped(params: Buf[Type]) -> bool
+    val head = params.at(0) match
+        Ptr(_) -> true
+        _ -> false
+
+    if !head || params.len() > 2 then return false
+
+    if params.len() == 1 then return true
+
+    params.at(1) match
+        Integer(_, _, _) -> true
+        _ -> false
+end frame_shaped
