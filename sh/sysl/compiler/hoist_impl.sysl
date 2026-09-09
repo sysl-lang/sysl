@@ -13,15 +13,16 @@ import sysl.text.{str_builder, StrBuilder}
 // whole, which is what an `impl` with type parameters of its own is for; and a composed **shape**,
 // which is that same block written for a type that has no name to be generic over.
 
-// Reads one block into the tables and lowers its members.
-hoist_impl(a: &Analysis, im: Impl)
+// Reads one block into the tables and lowers its members, handing back the block with its setters
+// paired and its trait named by the key it resolved to.
+hoist_impl(a: &Analysis, im: Impl) -> Impl
     val scope = im.scope
     val span = im.span
     val key = lookup_trait_key(a, scope, im.decl.trait_name)
 
     if key.is_none()
         a.fault(scope, span, s"unknown trait '${im.decl.trait_name}'")
-        return
+        return im
     end if
 
     val tr = trait_decl_at(a, key.unwrap()).unwrap()
@@ -109,6 +110,11 @@ hoist_impl(a: &Analysis, im: Impl)
                 "generic type covers every type it matches at once, so there is nothing below it. " +
                 "The override is written on the block for one type spelled out in full")
 
+    // Everything above is about **the block as a whole**, and a block that fails one of those checks
+    // is not registered and its members are not lowered: what would come back otherwise is one
+    // mistake reported as several, in the terms of a promise the block was already told it may not
+    // make.
+    val before = a.complaints()
     val already = impls_of(a, key.unwrap(), home.key)
     // Asked with **this** block's parameters standing in for the subject's arguments, so a block
     // already filed under them is read in the names this one wrote.
@@ -121,15 +127,32 @@ hoist_impl(a: &Analysis, im: Impl)
                     second_implementation(key.unwrap(), tr, already.at(i)))
 
     // A shape and a type of that shape written out in full would both implement the trait for that
-    // type. By default the second one written is refused, because two overlapping blocks are usually
-    // a mistake. **What lifts the refusal is `override` on the written-out side**, which says the
-    // overlap is deliberate.
-    if home.head.is_some() && !home.shaped() && !block.overrides &&
-       !impls_of(a, key.unwrap(), home.head.unwrap()).is_empty() then
-        a.fault(scope, span, s"${every_shape(home.head.unwrap())} already implements " +
-                s"'${module_show(key.unwrap())}', so '${home.label}' has an implementation and " +
-                "cannot be given a second one — write 'override impl' to say that replacing it for " +
-                "this one type is what was meant")
+    // type. By default the second one written is refused, in whichever order the file put them,
+    // because two overlapping blocks are usually a mistake. **What lifts the refusal is `override`
+    // on the written-out side**, which says the overlap is deliberate -- and it is asked of that
+    // block whichever order the two were hoisted in, which is why the flag travels in the table
+    // rather than being read off whichever block reaches here second.
+    if home.head.is_some()
+        val h = home.head.unwrap()
+
+        if home.shaped()
+            val one = a.tables.members.written_shapes.get(impl_key_of(key.unwrap(), h))
+
+            if one.is_some() && !one.unwrap().1 then
+                a.fault(scope, span, s"'${one.unwrap().0}' already implements " +
+                        s"'${module_show(key.unwrap())}', and this 'impl' would implement it for " +
+                        s"${every_shape(h)} — including that one")
+        else
+            if !impls_of(a, key.unwrap(), h).is_empty() && !block.overrides then
+                a.fault(scope, span, s"${every_shape(h)} already implements " +
+                        s"'${module_show(key.unwrap())}', so '${home.label}' has an implementation " +
+                        "and cannot be given a second one — write 'override impl' to say that " +
+                        "replacing it for this one type is what was meant")
+
+            a.tables.members.written_shapes.put(impl_key_of(key.unwrap(), h),
+                                                (home.label, block.overrides))
+
+    if a.complaints() > before then return Impl(block, span, scope)
 
     // The first implementation of a trait for a type files its members under the names they were
     // written with; each one after it under names that differ, since a type's members are one
@@ -139,11 +162,18 @@ hoist_impl(a: &Analysis, im: Impl)
     // so a block written for a built-in at *other* arguments is the second implementation whatever
     // the table holds.
     val provided = !written.is_empty() && provides
-    val nth = already.len() + (if provided then 2 else 1)
 
     // A **call** trait's member has no scope to be told apart by, for the same reason an inherent
     // member has none: the call syntax names no trait for a file to have imported or left out.
     val call_trait = fn_is_call(key.unwrap())
+
+    // A name some **other trait** already gave the type is not a collision: a trait's member is
+    // reachable only where the trait can be named, so two traits declaring one name for one type are
+    // two members a use site tells apart. The block takes the next suffix nobody else is under.
+    var nth = already.len() + (if provided then 2 else 1)
+
+    while held_by_another(a, tr, home.key, key.unwrap(), call_trait, suffix_of(nth))
+        nth += 1
 
     home.alt = if nth == 1 then "" else s".$nth"
     home.from_trait = if call_trait then None else Some(key.unwrap())
@@ -185,7 +215,7 @@ hoist_impl(a: &Analysis, im: Impl)
                     s"missing — supply it with 'type ${ad.name} = …', or give the member that " +
                     s"produces it the result 'some ${first_bound_shown(ad)}' and let the body say " +
                     "what it is")
-            return
+            return Impl(block, span, scope)
         end if
 
     val wkey = if written.is_empty() then "" else Bound(key.unwrap(), written).key()
@@ -217,7 +247,25 @@ hoist_impl(a: &Analysis, im: Impl)
         supplied.push(inherited.at(i))
 
     hoist_member_list(a, home, supplied)
+    Impl(block, span, scope)
 end hoist_impl
+
+// The suffix an implementation's members carry, empty for the first.
+private suffix_of(nth: usize) -> string = if nth == 1 then "" else s".$nth"
+
+// Whether one of the trait's member names, at this suffix, is already a member some **other** trait
+// gave the type -- which is what makes the suffix taken rather than free.
+private held_by_another(a: &Analysis, tr: TraitDecl, owner: string, trait_key: string,
+                        call_trait: bool, alt: string) -> bool
+    if call_trait then return false
+
+    for i in 0..<tr.methods.len()
+        val held = a.tables.members.from_trait.get(member_key_of(owner, tr.methods.at(i).name + alt))
+
+        if held.is_some() && held.unwrap() != trait_key then return true
+
+    false
+end held_by_another
 
 // The subject as the block wrote it, for a message that names it.
 private written_subject(block: ImplDecl) -> string = type_text(block.for_type)
@@ -464,8 +512,18 @@ end refuse_unimplementable
 
 private mode_is_not_a_type(sigil: string, inner: Type) -> string =
     s"'$sigil${type_show(inner)}' is a way of holding a ${type_show(inner)} rather than a type of " +
-    s"its own, and a member call reaches through one — so the 'impl' is written for " +
-    s"${type_show(inner)}"
+    s"its own — write the 'impl' for ${type_show(inner)}, which a member call reaches through one " +
+    s"'${trimmed(sigil)}' to find"
+
+private trimmed(sigil: string) -> string
+    val b = sigil.bytes
+    var end = b.len
+
+    while end > 0 && b[end - 1] == u8(' ')
+        end -= 1
+
+    sigil[0..<end]
+end trimmed
 
 // The **closed** bound a type parameter carries, where it carries one -- which is what makes a block
 // written for the bare parameter a blanket rather than a refusal.

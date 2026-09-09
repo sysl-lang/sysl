@@ -76,6 +76,33 @@ end MemberHome
 // blocks are read in the order the sources wrote them, since that is what decides which
 // implementation of a trait is the first and which carry a suffix.
 hoist_all_members(a: &Analysis, units: Buf[Program])
+    // **Every setter is paired first, and the paired list is written back**, because a declaration
+    // is read from the tables by more than this walk: a signature is resolved from them, conformance
+    // compares an `impl`'s setter against the trait's, and a table lays a trait's members out. A
+    // setter whose parameter has no type yet would be a signature nothing could be compared to.
+    for i in 0..<a.tables.types.len()
+        val key = a.tables.types.key_at(i)
+        val decl = a.tables.types.at(i)
+        val label = module_show(key)
+
+        decl.kind match
+            StructOf(d) ->
+                var paired = d
+
+                paired.members = pair_setters(a, decl.scope, d.members, label, buf())
+                a.tables.types.put(key, Decl(StructOf(paired), decl.span, decl.scope))
+            EnumOf(d) ->
+                var paired = d
+
+                paired.members = pair_setters(a, decl.scope, d.members, label, buf())
+                a.tables.types.put(key, Decl(EnumOf(paired), decl.span, decl.scope))
+            TraitOf(d) ->
+                var paired = d
+
+                paired.methods = pair_setters(a, decl.scope, d.methods, label, buf())
+                a.tables.types.put(key, Decl(TraitOf(paired), decl.span, decl.scope))
+            _ -> ()
+
     for i in 0..<a.tables.types.len()
         val key = a.tables.types.key_at(i)
         val decl = a.tables.types.at(i)
@@ -99,8 +126,10 @@ hoist_all_members(a: &Analysis, units: Buf[Program])
                                    "variant", d.members)
             _ -> ()
 
+    // The block is written back with its setters paired for the reason a declaration is: what a
+    // later pass reads is the table, not the copy this walk made.
     for i in 0..<a.tables.impls.len()
-        hoist_impl(a, a.tables.impls.at(i))
+        a.tables.impls.set(i, hoist_impl(a, a.tables.impls.at(i)))
 
     // Every block is in, so a bound is answerable: a type's bounds are checked wherever it is
     // applied, and the earliest applications are resolved while the file is still being hoisted.

@@ -160,6 +160,25 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
         a.fault(scope, span, s"unknown type '$name'")
         return Unknown
 
+    // **An argument that binds an associated type by name is not a type argument**, so it is taken
+    // out before the arity is counted: `Keyed[int, Item = int]` applies one argument and binds one
+    // associated type, and counting two would report a trait with one parameter as given two.
+    val d = trait_decl_at(a, key.unwrap())
+
+    if d.is_some()
+        var positional: Buf[TypeRef] = buf()
+        var named: Buf[(string, Type)] = buf()
+
+        for i in 0..<args.len()
+            *args.at(i).kind match
+                AssocArgType(bound, inner) ->
+                    named.push((bound, resolve_type(a, scope, inner, subst)))
+                _ -> positional.push(args.at(i))
+
+        return instantiate_trait(a, scope, span, name, key.unwrap(), d.unwrap(),
+                                 resolve_list(a, scope, positional, subst), named)
+    end if
+
     instantiate(a, scope, span, name, key.unwrap(), targs)
 end resolve_named
 
@@ -307,7 +326,7 @@ instantiate(a: &Analysis, scope: Scope, span: Span, written: string, key: string
     decl.kind match
         StructOf(d) -> instantiate_struct(a, scope, span, written, key, d, decl.scope, targs)
         EnumOf(d) -> instantiate_enum(a, scope, span, written, key, d, decl.scope, targs)
-        TraitOf(d) -> instantiate_trait(a, scope, span, written, key, d, targs)
+        TraitOf(d) -> instantiate_trait(a, scope, span, written, key, d, targs, buf())
         TypeOf(d) -> instantiate_named_subtype(a, scope, span, written, key, d, decl.scope, targs)
         CTypeOf(_) -> opaque_c_type(a, key)
 
@@ -456,7 +475,7 @@ end instantiate_enum
 
 // A trait used as a type.
 private instantiate_trait(a: &Analysis, scope: Scope, span: Span, written: string, key: string,
-                          d: TraitDecl, targs: Buf[Type]) -> Type
+                          d: TraitDecl, targs: Buf[Type], named: Buf[(string, Type)]) -> Type
     // **An argument on a trait may bind an associated type rather than a parameter.** A trait with
     // no parameters and one associated type has only one thing a bare argument could mean, so
     // `Iterate[char]` and `Iterate[Item = char]` are one type -- which is why a trait with associated
@@ -466,13 +485,25 @@ private instantiate_trait(a: &Analysis, scope: Scope, span: Span, written: strin
             a.fault(scope, span, s"trait '$written' does not take type arguments")
             return Unknown
 
-        return Trait(key, buf(), assoc_bindings(d, targs))
+        return Trait(key, buf(), joined_assocs(assoc_bindings(d, targs), named))
 
     if !d.tparams.is_empty() then
         if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, targs) then return Unknown
 
-    Trait(key, targs, buf())
+    Trait(key, targs, named)
 end instantiate_trait
+
+private joined_assocs(a: Buf[(string, Type)], b: Buf[(string, Type)]) -> Buf[(string, Type)]
+    var out: Buf[(string, Type)] = buf()
+
+    for i in 0..<a.len()
+        out.push(a.at(i))
+
+    for i in 0..<b.len()
+        out.push(b.at(i))
+
+    out
+end joined_assocs
 
 // What arguments written on a trait with associated types bind: a named one binds the associated
 // type it names, and a bare one binds the trait's only associated type.

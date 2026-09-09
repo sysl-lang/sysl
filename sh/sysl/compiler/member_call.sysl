@@ -27,16 +27,19 @@ lookup_trait_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, ar
         Trait(_, _, _) -> read_erased(cx, span, receiver, rty, name)
         _ ->
             val found = member_key(cx.an, rty, name)
-            val chosen = chosen_member(cx, rty, found.0, name, buf())
-            val m = member_at(cx.an, found.0, chosen)
+            val chosen = chosen_member(cx, rty, found.0, name, span, buf())
+
+            if chosen.is_none() then return bad_expr(span)
+
+            val m = member_at(cx.an, found.0, chosen.unwrap())
 
             if m.is_none() then return no_such_member(cx, span, rty, found.0, name)
 
             val decl = m.unwrap()
 
             if decl.is_property then
-                return member_dispatch(cx, span, receiver, rty, found.0, chosen, decl, buf(),
-                                       expected, name)
+                return member_dispatch(cx, span, receiver, rty, found.0, chosen.unwrap(), decl,
+                                       buf(), expected, name)
 
             if decl.recv_mode().is_some() then
                 return cx.err(span, s"'$name' is a method of '${module_show(found.0)}' — call it " +
@@ -182,8 +185,16 @@ end call_member
 private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string,
                       args: Buf[Expr], expected: Option[Type]) -> TExpr
     val found = member_key(cx.an, rty, name)
-    val chosen = chosen_member(cx, rty, found.0, name, args)
-    val m = member_at(cx.an, found.0, chosen)
+
+    if !has_member_at(cx.an, found.0, name) &&
+       !cx.an.tables.members.alts.has(member_key_of(found.0, name)) then
+        return no_such_method(cx, span, receiver, rty, found.0, name)
+
+    val chosen = chosen_member(cx, rty, found.0, name, span, args)
+
+    if chosen.is_none() then return bad_expr(span)
+
+    val m = member_at(cx.an, found.0, chosen.unwrap())
 
     if m.is_none() then return no_such_method(cx, span, receiver, rty, found.0, name)
 
@@ -200,7 +211,7 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
         return cx.err(span, s"'$name' is an associated function of '${module_show(found.0)}' — " +
                       s"call it with '${module_show(found.0)}.$name(…)'")
 
-    member_dispatch(cx, span, receiver, rty, found.0, chosen, decl, args, expected, name)
+    member_dispatch(cx, span, receiver, rty, found.0, chosen.unwrap(), decl, args, expected, name)
 end call_declared
 
 // The call itself, once the member is known: the receiver in the mode its `self` asked for, the
@@ -354,65 +365,216 @@ member_func_name(cx: &Analyzer, span: Span, ty: Type, mname: string) -> string
     instantiate_func(cx.an, home, fd, found.1, viewed_const(ty, found.0))
 end member_func_name
 
-// Which of a type's members a written name means, where more than one implementation of one trait
-// gave the type a member of that name.
+// Which of a type's members a written name means, where more than one thing gave the type a member
+// of that name.
 //
 // A name that reaches one member comes straight back, so the ordinary call is the lookup it always
-// was. Where there are several, the arguments decide: each candidate's parameters are compared
-// against the types the arguments already have, and exactly one candidate accepting them is the
-// answer.
+// was. Where there are several, **scope decides before the arguments do**, because the two axes
+// answer different questions and only the first can answer its own: two implementations of one trait
+// differ in their argument lists and are told apart by a call's values, while two *different traits*
+// may declare one name with one parameter list -- and nothing in a call could ever tell those apart.
+// What tells them apart is that a trait's member is reachable only where the trait can be named.
 //
-// This is **not** overloading, and the difference is that the answer is determined rather than
-// chosen. A trait's argument list is what tells its implementations apart, and a call carries the
-// argument list in the values it passes.
-private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string,
-                      args: Buf[Expr]) -> string
+// This is **not** overloading. A trait's argument list is what tells its implementations apart, and a
+// call carries that list in the values it passes -- so a call that does not determine one is a call
+// whose arguments name no implementation, which is reported rather than resolved by a preference
+// rule.
+//
+// Nothing where the name settles nothing, which is what tells the caller to stop.
+private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, span: Span,
+                      args: Buf[Expr]) -> Option[string]
     val alts = cx.an.tables.members.alts.get(member_key_of(base, mname))
+    val subject = type_show(rty)
 
-    if alts.is_none() then return mname
+    if alts.is_none()
+        if member_reachable(cx, base, mname) then return Some(mname)
 
-    val cands = alts.unwrap()
+        var one: Buf[string] = buf()
 
-    if cands.len() == 1 then return cands.at(0)
+        one.push(mname)
+        out_of_scope(cx, span, base, mname, one, subject)
+        return None
+    end if
 
-    var reachable: Buf[string] = buf()
+    // **A bound answers ahead of everything else.** Inside a generic body a member means the one the
+    // bound promised, and at an instantiation the parameter has become an ordinary type whose table
+    // may hold several -- so the traits the parameter was bounded by narrow the candidates first.
+    var cands: Buf[string] = buf()
 
-    for i in 0..<cands.len()
-        if member_reachable(cx, base, cands.at(i)) then reachable.push(cands.at(i))
+    for i in 0..<alts.unwrap().len()
+        if member_reachable(cx, base, alts.unwrap().at(i)) then cands.push(alts.unwrap().at(i))
 
-    if reachable.len() == 1 then return reachable.at(0)
-    if reachable.is_empty() then return mname
+    if cands.is_empty()
+        out_of_scope(cx, span, base, mname, alts.unwrap(), subject)
+        return None
+    end if
 
-    var arg_tys: Buf[Type] = buf()
+    if cands.len() == 1 then return Some(cands.at(0))
+
+    var arg_tys: Buf[Option[Type]] = buf()
 
     for i in 0..<args.len()
         val mark = cx.an.complaints()
         val t = type_expr(cx, args.at(i), None)
 
         cx.an.restore_complaints(mark)
-        arg_tys.push(texpr_type(t))
 
-    for i in 0..<reachable.len()
-        if member_accepts(cx, base, reachable.at(i), arg_tys) then return reachable.at(i)
+        if texpr_type(t) == Unknown then arg_tys.push(None) else arg_tys.push(Some(texpr_type(t)))
 
-    reachable.at(0)
+    val from = s"'$mname' comes from ${quantity(cands.len(), "implementation")} of one trait on " +
+               subject
+
+    // Which candidate a call means is read off the arguments it wrote, **in the order it wrote
+    // them** -- so a name, which is exactly a refusal to say what an argument's position is, has
+    // nothing here to choose between them.
+    for i in 0..<args.len()
+        *args.at(i).kind match
+            NamedArg(_, _) ->
+                cx.fault(args.at(i).span, s"$from, and which is meant is read off the arguments as " +
+                         "written — so an argument given by name leaves nothing to tell them " +
+                         "apart. Write them in declared order")
+                return None
+            _ -> ()
+
+    var fits: Buf[string] = buf()
+
+    for i in 0..<cands.len()
+        if member_accepts(cx, rty, base, cands.at(i), arg_tys) then fits.push(cands.at(i))
+
+    if fits.len() == 1 then return Some(fits.at(0))
+
+    // Nothing has settled it. Which complaint that is depends on what is left standing: several
+    // **traits** is a use that reached more than one of them, and no argument could have told those
+    // apart. Several implementations of one trait is the older situation, where the arguments were
+    // the question and did not answer it.
+    val left = if fits.is_empty() then cands else fits
+    var traits: Buf[string] = buf()
+
+    for i in 0..<left.len()
+        val tr = cx.an.tables.members.from_trait.get(member_key_of(base, left.at(i)))
+
+        if tr.is_some()
+            var seen = false
+
+            for j in 0..<traits.len()
+                if traits.at(j) == module_show(tr.unwrap()) then seen = true
+
+            if !seen then traits.push(module_show(tr.unwrap()))
+
+    if traits.len() > 1
+        cx.fault(span, s"'$mname' on $subject comes from ${conjoin(traits)}, and each is in scope " +
+                 "here — nothing in the call says which was meant")
+        return None
+    end if
+
+    if fits.is_empty()
+        cx.fault(span, s"$from, and none of them takes (${shown_args(arg_tys)}) — write the " +
+                 "argument at the type of the implementation that was meant")
+        return None
+    end if
+
+    cx.fault(span, s"$from, and the arguments do not say which was meant")
+    None
 end chosen_member
 
-private member_accepts(cx: &Analyzer, base: string, filed: string, arg_tys: Buf[Type]) -> bool
-    val fname = cx.an.tables.members.funcs.get(member_key_of(base, filed))
-
-    if fname.is_none() then return false
-
-    val sig = cx.an.tables.members.func_insts.get(fname.unwrap())
-
-    if sig.is_none() || sig.unwrap().params.len() != arg_tys.len() + 1 then return false
+// The argument types a refusal quotes back, with an argument that could not be read left as a
+// question mark rather than as a guess.
+private shown_args(arg_tys: Buf[Option[Type]]) -> string
+    var b = str_builder()
 
     for i in 0..<arg_tys.len()
-        if arg_tys.at(i) != Unknown && disagree(arg_tys.at(i), sig.unwrap().params.at(i + 1).1) then
-            return false
+        if i > 0 then b.push(", ")
+
+        b.push(if arg_tys.at(i).is_none() then "?" else type_show(arg_tys.at(i).unwrap()))
+
+    b.finish()
+end shown_args
+
+// A member a use site cannot reach at all: the trait that brought it is one this file may not name.
+private out_of_scope(cx: &Analyzer, span: Span, base: string, mname: string, cands: Buf[string],
+                     subject: string)
+    var named: Buf[string] = buf()
+
+    for i in 0..<cands.len()
+        val tr = cx.an.tables.members.from_trait.get(member_key_of(base, cands.at(i)))
+
+        if tr.is_some() && reachable_key(cx.an, tr.unwrap(), cx.scope)
+            var seen = false
+
+            for j in 0..<named.len()
+                if named.at(j) == module_show(tr.unwrap()) then seen = true
+
+            if !seen then named.push(module_show(tr.unwrap()))
+
+    // A trait this file may not **name** is not one an import would reach, so advising the import
+    // would send a reader after a line the compiler refuses.
+    if named.is_empty()
+        cx.fault(span, s"$subject has '$mname', but the trait declaring it is private to the module " +
+                 "that wrote it — the member is an implementation detail rather than something to " +
+                 "import")
+        return
+    end if
+
+    val tail = if named.len() == 1 then
+                   "that trait is not in scope here — import it to reach the member"
+               else "none of those traits is in scope here — import the one that was meant"
+
+    cx.fault(span, s"$subject has '$mname' from ${conjoin(named)}, and $tail")
+end out_of_scope
+
+// Whether one candidate's declared parameters accept the arguments a call wrote.
+//
+// A candidate that takes a `...` is answered for by its declared parameters alone: the tail stands at
+// none, so what it may be told apart by stops where they do. A default widens the same count
+// downwards, and for the same reason -- a call may stop where the defaults begin.
+private member_accepts(cx: &Analyzer, rty: Type, base: string, filed: string,
+                       arg_tys: Buf[Option[Type]]) -> bool
+    val m = member_at(cx.an, base, filed)
+
+    if m.is_none() then return false
+
+    val fname = member_func_name_quiet(cx, rty, filed)
+
+    if fname == "" then return false
+
+    val sig = cx.an.tables.members.func_insts.get(fname)
+
+    if sig.is_none() then return false
+
+    var params: Buf[Type] = buf()
+
+    for i in 1..<sig.unwrap().params.len()
+        params.push(sig.unwrap().params.at(i).1)
+
+    var least: usize = 0
+
+    for i in 0..<m.unwrap().params.len()
+        if m.unwrap().params.at(i).default.is_none() then least += 1
+
+    var counted = arg_tys.len() <= params.len() && arg_tys.len() >= least
+
+    if m.unwrap().variadic then counted = arg_tys.len() >= params.len()
+
+    if !counted then return false
+
+    for i in 0..<params.len()
+        if i < arg_tys.len()
+            if arg_tys.at(i).is_none() then return false
+            if !type_eq(arg_tys.at(i).unwrap(), params.at(i)) then return false
 
     true
 end member_accepts
+
+// The lowered name a candidate goes under, with nothing said where it has none: this is asked while
+// candidates are being weighed, and a complaint about one that was not chosen is one nobody asked
+// for.
+private member_func_name_quiet(cx: &Analyzer, rty: Type, filed: string) -> string
+    val mark = cx.an.complaints()
+    val name = member_func_name(cx, span_zero(), rty, filed)
+
+    cx.an.restore_complaints(mark)
+    name
+end member_func_name_quiet
 
 // -- what a use site is allowed to reach ------------------------------------------------------------
 
