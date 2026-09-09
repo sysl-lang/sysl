@@ -59,6 +59,117 @@ private print_one(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
                     "not typed yet")
 end print_one
 
+// Whether a value renders through a printf conversion rather than through an `impl`: the five types
+// the library has a renderer of its own for.
+scalar_render(t: Type) -> bool = t match
+    Integer(_, _, _) -> true
+    Floating(_) -> true
+    Bool -> true
+    Char -> true
+    Str -> true
+    _ -> false
+
+// `str(x)` on a value that renders itself -- and, since an interpolation's holes are `str` calls,
+// every `s"${value}"` over one too.
+//
+// **A scalar is not this**: an integer, a float, a bool, a char and a `string` each have a direct
+// path that does not build a sink, and this is what everything else takes. The value writes itself
+// into a growable buffer through its `Display`, and the bytes that land there become the string.
+str_render(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
+    val found = renderer(cx, span, t, "make a string of")
+
+    TExpr(span, TRender(t, found.0, format_spec(cx, span), found.1))
+end str_render
+
+// Which `display` a value reaches, and the table slot to read it out of where the value is an
+// object rather than a type.
+//
+// **A subtype renders exactly as its base does** -- a number or a character -- so it reaches the
+// base's renderer rather than needing a `Display` of its own, which is what keeps a
+// `type Percent = int :: 0..100` printing like the integer it is. Unless it has said otherwise: a
+// block written for the subtype itself is an override, and collapsing first would find the base's
+// and make that block compile and do nothing.
+private renderer(cx: &Analyzer, span: Span, t: TExpr, asked: string) -> (string, Option[int])
+    val vt = texpr_type(t)
+    val tr = display_bound(cx)
+    val here = if !impls_of(cx.an, tr.name, owner_key(vt)).is_empty() then vt else underlying(vt)
+
+    // An object has forgotten which type it holds, so the renderer is a word read out of its own
+    // table -- and the trait it was erased at has to require `Display` for the table to hold one.
+    if erased(here)
+        val slot = display_slot(cx, here)
+
+        if slot.is_none()
+            cx.fault(span, s"cannot $asked a ${type_show(vt)} value — an object offers what its " +
+                     "trait declares and what that trait requires, so write " +
+                     s"'trait ${module_show(erased_bound_name(here))}: ${tr.show()}' to keep the " +
+                     "rendering the value had before it was erased")
+            return (s"${tr.name}.display", None)
+
+        return (s"${tr.name}.display", slot)
+    end if
+
+    // A type parameter renders through whatever its bounds promised, which is a dispatch to the
+    // trait's own member rather than to a lowered one.
+    here match
+        Abstract(_, _) ->
+            if !satisfies(cx.an, tr, here) then
+                cx.fault(span, s"'$asked' needs '${type_show(here)}: ${tr.show()}'")
+
+            return (s"${tr.name}.display", None)
+        _ -> ()
+
+    if !conforms(cx.an, tr, here) && !satisfies(cx.an, tr, here)
+        cx.fault(span, s"cannot $asked a ${type_show(here)} value — it does not implement " +
+                 s"'${tr.show()}'")
+        return ("", None)
+    end if
+
+    val fname = member_func_name(cx, span, here, "display")
+
+    cx.an.uses(fname)
+    (fname, None)
+end renderer
+
+// The library's `Display`, as the bound every rendering is asked about.
+private display_bound(cx: &Analyzer) -> Bound = Bound(library_key("Display"), buf())
+
+// Which slot of an object's table holds the renderer, where the trait it was erased at requires one.
+private display_slot(cx: &Analyzer, ty: Type) -> Option[int]
+    val obj = erased_trait(ty)
+
+    if obj.is_none() then return None
+
+    val tr = display_bound(cx)
+    val members = slotted_members(cx.an, trait_bound_of(obj.unwrap()), self_binding(ty))
+
+    for i in 0..<members.len()
+        if members.at(i).0.name == tr.name && members.at(i).1.name == "display" then return Some(int(i))
+
+    None
+end display_slot
+
+// The name of the trait an object was erased at, for the advice that says to widen it.
+private erased_bound_name(ty: Type) -> string = erased_trait(ty) match
+    Some(o) -> trait_bound_of(o).name
+    None -> ""
+
+// The specifier a bare rendering carries: no width, no precision, not left-aligned. A `f"…"` hole
+// is the same node with the three the reader wrote.
+private format_spec(cx: &Analyzer, span: Span) -> TExpr
+    val spec = reinstantiate(cx.an, library_key("FormatSpec"), buf())
+
+    spec match
+        Struct(d) ->
+            var args: Buf[TExpr] = buf()
+
+            args.push(TExpr(span, TIntLit(from_int(0), d.fields.at(0).1)))
+            args.push(TExpr(span, TIntLit(from_int(-1), d.fields.at(1).1)))
+            args.push(TExpr(span, TBoolLit(false)))
+            TExpr(span, TStructNew(d, args))
+        _ -> bad_expr(span)
+end format_spec
+
 // The separator and the terminator `print` puts around its values.
 private print_char(cx: &Analyzer, span: Span, c: char) -> TExpr =
     library_call(cx, span, "printc", TExpr(span, TIntLit(from_int(long(int(c))), Char)))
