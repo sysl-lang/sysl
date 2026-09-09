@@ -79,6 +79,7 @@ read_capabilities(a: &Analysis, units: Buf[Program])
             check_repeats(a, unit)
 
     check_module_agreement(a, units)
+    record_capabilities(a, units)
 end read_capabilities
 
 // Refuses a clause that names nothing, or that names the facility where the conduct belongs.
@@ -291,3 +292,128 @@ private spell_clauses(u: Program) -> string
 
     out
 end spell_clauses
+
+// -- what a module's clauses leave behind ----------------------------------------------------------
+
+// Records each module's two sets, read off a file that **ships**: the header is one statement about
+// the module however many files repeat it.
+//
+// Only the clauses the compiler enforces are kept, so a module that wrote something refused is left
+// with the set it would have had without it -- which is what makes one mistake report once rather
+// than again at every use of what the bad clause was about.
+record_capabilities(a: &Analysis, units: Buf[Program])
+    var seen: Buf[string] = buf()
+
+    for i in 0..<units.len()
+        val module_name = module_of_unit(units.at(i))
+
+        if holds_string(seen, module_name) then continue
+
+        seen.push(module_name)
+
+        val shipped = first_file_of(units, module_name, false)
+        val scaffolding = first_file_of(units, module_name, true)
+
+        if shipped.is_some()
+            record_module(a, module_name, shipped.unwrap())
+
+        // After the module's own, because what the scaffolding states is an override of it.
+        if scaffolding.is_some()
+            record_module_tests(a, module_name, shipped, scaffolding.unwrap())
+end record_capabilities
+
+private first_file_of(units: Buf[Program], module_name: string, tests: bool) -> Option[Program]
+    for i in 0..<units.len()
+        val unit = units.at(i)
+
+        if module_of_unit(unit) == module_name && unit.test_only == tests then return Some(unit)
+
+    None
+end first_file_of
+
+private record_module(a: &Analysis, module_name: string, u: Program)
+    for i in 0..<u.capabilities.len()
+        val c = u.capabilities.at(i)
+
+        if !enforceable(c) then continue
+
+        val spread = implied_by(c)
+
+        for j in 0..<spread.len()
+            c.direction match
+                Narrows -> a.tables.module_narrows.push((module_name, spread.at(j)))
+                Requires -> a.tables.module_requires.push((module_name, spread.at(j)))
+end record_module
+
+// The tests' set is the module's own with the scaffolding's changes folded in, per capability: a
+// `@tests` file writing no clause records the module's, one that requires a capability takes it back
+// out of the narrowing, and one that narrows it narrows it whatever the module said.
+//
+// Only the narrowing is kept. What the scaffolding **requires** is not asked of the target, because
+// every build but a test run analyzes a `@tests` file and then drops it.
+private record_module_tests(a: &Analysis, module_name: string, shipped: Option[Program], u: Program)
+    var taken_back: Buf[string] = buf()
+    var narrowed: Buf[string] = buf()
+
+    for i in 0..<u.capabilities.len()
+        val c = u.capabilities.at(i)
+
+        if !enforceable(c) then continue
+
+        val spread = implied_by(c)
+
+        for j in 0..<spread.len()
+            c.direction match
+                Requires -> taken_back.push(spread.at(j))
+                Narrows -> narrowed.push(spread.at(j))
+
+    // What the module gave up, less what the scaffolding took back.
+    for i in 0..<a.tables.module_narrows.len()
+        val pair = a.tables.module_narrows.at(i)
+
+        if pair.0 == module_name && !holds_string(taken_back, pair.1) &&
+                !holds_string(narrowed, pair.1) then
+            a.tables.module_test_narrows.push(pair)
+
+    for i in 0..<narrowed.len()
+        a.tables.module_test_narrows.push((module_name, narrowed.at(i)))
+        a.tables.module_test_own.push((module_name, narrowed.at(i)))
+end record_module_tests
+
+// A clause's capability and the ones that come with it, in whichever direction it points.
+//
+// The implication runs opposite ways for the two: **requiring** `posix` requires what `posix` needs,
+// and **giving up** `os` gives up everything that needs `os`.
+private implied_by(c: CapabilityClause) -> Buf[string]
+    val cap = capability_of(c)
+
+    c.direction match
+        Requires -> capability_closure(cap)
+        Narrows ->
+            var out: Buf[string] = buf()
+
+            out.push(cap)
+
+            if cap == CapOs then out.push(CapPosix)
+
+            out
+end implied_by
+
+// Whether a module gave a capability up, and the same asked of what its tests may do.
+module_narrowed(a: &Analysis, module_name: string, cap: string) -> bool =
+    holds_pair(a.tables.module_narrows, module_name, cap)
+
+module_tests_narrowed(a: &Analysis, module_name: string, cap: string) -> bool =
+    holds_pair(a.tables.module_test_narrows, module_name, cap)
+
+// Whether the narrowing on the tests' side is one the `@tests` file wrote rather than one it
+// inherited, which is what tells a reader which line to go and look at.
+module_tests_own_narrowing(a: &Analysis, module_name: string, cap: string) -> bool =
+    holds_pair(a.tables.module_test_own, module_name, cap)
+
+private holds_pair(pairs: Buf[(string, string)], a: string, b: string) -> bool
+    for i in 0..<pairs.len()
+        if pairs.at(i).0 == a && pairs.at(i).1 == b then return true
+
+    false
+end holds_pair

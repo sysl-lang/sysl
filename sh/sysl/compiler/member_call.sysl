@@ -770,6 +770,11 @@ private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, ba
 
     if provided.is_some() then return provided.unwrap()
 
+    // A field holding a callable, reached only where no method of the name exists.
+    val through_field = callable_field(cx, span, rty, name, receiver, args, None)
+
+    if through_field.is_some() then return through_field.unwrap()
+
     // A call reaches through one level of indirection and only one, exactly as selection does. A
     // receiver still carrying a mode after that has more than the shorthand walks, and the complaint
     // below would name what is *left* -- a type the reader never wrote.
@@ -1023,3 +1028,59 @@ private builtin_constant_read(cx: &Analyzer, span: Span, rty: Type, name: string
 
     Some(TExpr(span, TIntLit(from_int(long(answer.unwrap())), ret)))
 end builtin_constant_read
+
+// -- a field holding something callable ------------------------------------------------------------
+
+// `b.on_click(7)` -- a **field** holding a callable, called through the selection that reads it.
+//
+// A field is only reached this way where no method of that name exists, so a type never loses a
+// method to a field: the two share a spelling and the method wins, which is the order every other
+// lookup already takes. It is what makes a `struct Button` with an `on_click: &Fn(int) -> unit` a
+// usable shape rather than one whose field has to be read into a local before it can be called.
+callable_field(cx: &Analyzer, span: Span, rty: Type, name: string, recv: TExpr, args: Buf[Expr],
+               expected: Option[Type]) -> Option[TExpr]
+    val d = rty match
+        Struct(decl) -> Some(decl)
+        _ -> None
+
+    if d.is_none() then return None
+
+    val idx = d.unwrap().field_index(name)
+
+    if idx < 0 then return None
+
+    val fty = unqualified(d.unwrap().fields.at(usize(idx)).1)
+    val is_cfn = fty match
+        CFn(_, _) -> true
+        _ -> false
+
+    if !is_cfn && callable_of(cx.an, fty).is_none() then return None
+
+    if !field_visible(cx, d.unwrap().base, name) then
+        return Some(cx.err(span, s"'$name' is private to the file that declares " +
+                           s"'${module_show(d.unwrap().base)}'"))
+
+    val field = TExpr(span, TField(auto_deref(cx, recv), idx, fty))
+
+    // A field holding C's function pointer is called through in the same position and by the same
+    // spelling; what differs is only that there is no receiver to hand over.
+    if is_cfn then
+        val params = fty match
+            CFn(ps, _) -> ps
+            _ -> buf()
+        val ret = fty match
+            CFn(_, r) -> *r
+            _ -> Unit
+
+        var ts: Buf[TExpr] = buf()
+
+        for i in 0..<args.len()
+            val want = if i < params.len() then Some(params.at(i)) else None
+
+            ts.push(type_expr(cx, args.at(i), want))
+
+        return Some(TExpr(span, TCallPtr(field, ts, params, ret)))
+    end if
+
+    Some(call_member(cx, span, field, "call", args, expected))
+end callable_field

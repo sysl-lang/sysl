@@ -1,0 +1,270 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// Which trees can arrive at one of a named set of functions, and the smallest sub-tree that still
+// can -- the walk a capability check is written in terms of.
+//
+// **What varies between the checks is the seed set and the sentence; the descent does not.** The
+// allocator-free check seeds it with the functions whose own bodies make heap storage and reports an
+// allocation reached from a module that gave the allocator up; the `@needs` check seeds it with the
+// declarations that named a capability and reports one reached from a module that does not have it.
+//
+// **A dynamic call is answered against the tables this code erased a value into**, and not against
+// every table for the trait. The distinction is the whole of what makes a capability a promise about
+// a module's own conduct: which implementation is behind a `*Writer` parameter is its caller's
+// choice, made in a module of their own. What a module is still held to is the erasure it wrote --
+// a body that makes a growable sink and hands it over as a trait object is answered with that sink.
+
+// What one tree names, without following any of it.
+struct Refs
+    calls: Buf[string]
+    erased: Buf[string]
+    sites: Buf[(string, int)]
+
+    call(*self, name: string)
+        if name != "" && !holds_string(self.calls, name) then self.calls.push(name)
+
+    erase(*self, name: string)
+        if !holds_string(self.erased, name) then self.erased.push(name)
+
+    site(*self, trait_name: string, slot: int)
+        for i in 0..<self.sites.len()
+            if self.sites.at(i).0 == trait_name && self.sites.at(i).1 == slot then return
+
+        self.sites.push((trait_name, slot))
+end Refs
+
+no_refs() -> &Refs = Refs(buf(), buf(), buf())
+
+// What ONE node names, without descending: the calls it makes and the table it erased into.
+//
+// The names a node holds as **data** rather than as a child are read out here -- a dispatched
+// operator, an invariant a write has to re-establish, the conversion a `?` widens through -- because
+// nothing about the shape of the tree tells those from any other string.
+node_refs(out: &Refs, e: TExpr)
+    *e.kind match
+        TCall(name, _, _, _) -> out.call(name)
+
+        // Taking a function's address is a use of it exactly as calling it is.
+        TFuncAddr(name, _, _) -> out.call(name)
+        TTry(_, _, _, _, _, _, convert) -> if convert.is_some() then out.call(convert.unwrap())
+        TStructInvCheck(_, _, inv_fn) -> out.call(inv_fn)
+        TRecheck(_, _, _, inv_fn) -> out.call(inv_fn)
+        TUpdate(_, _, _, _, dispatch, _) -> dispatch_ref(out, dispatch)
+        TCompare(_, cmps) ->
+            for i in 0..<cmps.len()
+                dispatch_ref(out, cmps.at(i).dispatch)
+
+        // Erasing a value into a trait object is where a body says which implementation it is
+        // putting behind the trait, and the name is the table's.
+        TErase(_, vtable, _) -> out.erase(vtable)
+        TVCall(receiver, slot, _, _, _) -> dynamic_ref(out, texpr_type(receiver), slot)
+        TRender(value, method, _, slot) ->
+            if slot.is_some() then dynamic_ref(out, texpr_type(value), slot.unwrap())
+            else out.call(method)
+        _ -> ()
+end node_refs
+
+// The same for a write, which carries its dispatched operator and its re-checks as data.
+write_refs(out: &Refs, w: TWrite)
+    dispatch_ref(out, w.dispatch)
+
+    for i in 0..<w.check.len()
+        out.call(w.check.at(i).inv_fn)
+end write_refs
+
+private dispatch_ref(out: &Refs, d: Option[TDispatch])
+    if d.is_some() then out.call(d.unwrap().name)
+end dispatch_ref
+
+// A call at a slot is left unresolved: which functions answer it depends on the tables this walk
+// saw a value erased into, which are not all known until it has finished.
+private dynamic_ref(out: &Refs, recv: Type, slot: int)
+    val name = recv match
+        Ptr(inner) -> trait_named(*inner)
+        Ref(inner, _) -> trait_named(*inner)
+        _ -> None
+
+    if name.is_some() then out.site(name.unwrap(), slot)
+end dynamic_ref
+
+private trait_named(t: Type) -> Option[string] = t match
+    Trait(n, _, _) -> Some(n)
+    _ -> None
+
+// Everything a body names, following nothing.
+refs_of_block(b: TBlock) -> &Refs
+    val out = no_refs()
+
+    walk_block_stmts(b, TWalk(false, e -> node_refs(out, e), w -> write_refs(out, w)))
+    out
+end refs_of_block
+
+// Everything one expression names, following nothing.
+refs_of_expr(e: TExpr) -> &Refs
+    val out = no_refs()
+
+    walk_texpr(e, TWalk(false, n -> node_refs(out, n), w -> write_refs(out, w)))
+    out
+end refs_of_expr
+
+// The names an expression holds ITSELF, without anything under it -- which is what says whether the
+// node is as close to the call as the tree can put the caret.
+own_refs(e: TExpr) -> &Refs
+    val out = no_refs()
+
+    node_refs(out, e)
+    out
+end own_refs
+
+// Everything under an expression but not the expression itself. The walk visits the root first, so
+// skipping one visit is the whole of the difference.
+strict_refs(e: TExpr) -> &Refs
+    val out = no_refs()
+    val seen: &Counted = Counted(0)
+
+    walk_texpr(e, TWalk(false, n -> nested_refs(out, seen, n), w -> write_refs(out, w)))
+    out
+end strict_refs
+
+// A counter a closure can move, closures capturing by value.
+struct Counted
+    n: usize
+end Counted
+
+private nested_refs(out: &Refs, seen: &Counted, e: TExpr)
+    if seen.n == 0
+        seen.n = 1
+        return
+    end if
+
+    node_refs(out, e)
+end nested_refs
+
+// -- what a tree can arrive at ---------------------------------------------------------------------
+
+// The call graph of one compilation, with a set of seeded functions, answering whether a tree can
+// arrive at one of them.
+struct Reaches
+    funcs: Buf[TFunc]
+    vtables: Buf[TVtable]
+    seeds: Buf[string]
+
+    // What each function names, worked out once: the walk asks the same question of one body many
+    // times over.
+    summarized: Buf[(string, &Refs)]
+end Reaches
+
+reaches_over(funcs: Buf[TFunc], vtables: Buf[TVtable], seeds: Buf[string]) -> &Reaches =
+    Reaches(funcs, vtables, seeds, buf())
+
+// What one function names, remembered.
+private summary_of(r: &Reaches, name: string) -> Option[&Refs]
+    for i in 0..<r.summarized.len()
+        if r.summarized.at(i).0 == name then return Some(r.summarized.at(i).1)
+
+    for i in 0..<r.funcs.len()
+        if r.funcs.at(i).name == name
+            val refs = refs_of_block(r.funcs.at(i).body)
+
+            r.summarized.push((name, refs))
+            return Some(refs)
+
+    None
+end summary_of
+
+// Every seed this tree can arrive at, in the order they were first reached.
+//
+// The dynamic sites are answered against the tables the walk saw a value erased into -- and an
+// erasure can turn up in a body reached only through an earlier answer, so answering opens sites and
+// sites open answers. It repeats until neither grows, which terminates because both sets only ever
+// gain and both are bounded by the program.
+reached_seeds(r: &Reaches, root: &Refs) -> Buf[string]
+    var found: Buf[string] = buf()
+
+    if r.seeds.is_empty() then return found
+
+    var called: Buf[string] = buf()
+    var erased: Buf[string] = buf()
+    var sites: Buf[(string, int)] = buf()
+    var queue: Buf[string] = buf()
+
+    take_refs(root, &called, &erased, &sites, &queue)
+    drain_calls(r, &called, &erased, &sites, &queue)
+
+    var growing = true
+
+    while growing
+        val before = called.len()
+
+        for i in 0..<sites.len()
+            val site = sites.at(i)
+
+            for j in 0..<r.vtables.len()
+                val t = r.vtables.at(j)
+
+                if t.name == "" || !holds_string(erased, t.name) then continue
+                if t.trait_name != site.0 || usize(site.1) >= t.slots.len() then continue
+
+                val target = t.slots.at(usize(site.1)).target
+
+                if !holds_string(called, target)
+                    called.push(target)
+                    queue.push(target)
+
+        drain_calls(r, &called, &erased, &sites, &queue)
+
+        growing = called.len() != before
+
+    for i in 0..<called.len()
+        if holds_string(r.seeds, called.at(i)) then found.push(called.at(i))
+
+    found
+end reached_seeds
+
+private take_refs(refs: &Refs, called: *Buf[string], erased: *Buf[string],
+                  sites: *Buf[(string, int)], queue: *Buf[string])
+    for i in 0..<refs.erased.len()
+        if !holds_string(*erased, refs.erased.at(i)) then erased.push(refs.erased.at(i))
+
+    for i in 0..<refs.sites.len()
+        var have = false
+
+        for j in 0..<sites.len()
+            if sites.at(j).0 == refs.sites.at(i).0 && sites.at(j).1 == refs.sites.at(i).1 then
+                have = true
+
+        if !have then sites.push(refs.sites.at(i))
+
+    for i in 0..<refs.calls.len()
+        if !holds_string(*called, refs.calls.at(i))
+            called.push(refs.calls.at(i))
+            queue.push(refs.calls.at(i))
+end take_refs
+
+private drain_calls(r: &Reaches, called: *Buf[string], erased: *Buf[string],
+                    sites: *Buf[(string, int)], queue: *Buf[string])
+    while !queue.is_empty()
+        val name = queue.at(queue.len() - 1)
+
+        queue.truncate(queue.len() - 1)
+
+        val body = summary_of(r, name)
+
+        if body.is_some() then take_refs(body.unwrap(), called, erased, sites, queue)
+end drain_calls
+
+// Whether this tree arrives at a seed at all.
+reaches_a_seed(r: &Reaches, refs: &Refs) -> bool = !reached_seeds(r, refs).is_empty()
+
+// The **least** seed a tree reaches by name, which is what a diagnostic names: the site is what the
+// reader has to change, and a message that varied between runs would be a poor thing to assert on.
+least_seed(r: &Reaches, refs: &Refs) -> Option[string]
+    val found = reached_seeds(r, refs)
+
+    if found.is_empty() then return None
+
+    Some(sort_names(found).at(0))
+end least_seed

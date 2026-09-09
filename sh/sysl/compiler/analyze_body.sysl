@@ -179,7 +179,7 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
 
     // What a program is held to once everything it reaches has been typed. It runs here rather than
     // per body because every one of these questions is about the whole compilation.
-    whole_program_checks(a, funcs)
+    whole_program_checks(a, funcs, ordered_vals(storage))
 
     TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, ordered_vals(storage), a, units, entry)
 end analyze_bodies
@@ -281,7 +281,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> TFunc
     val body = body_block(cx, rest, ret)
 
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
-        cx.fault(body_span(rest, span), body_disagreement(d.name, ret, body.ty))
+        cx.fault(body_span(rest, span), body_disagreement(func_key(a, scope, span, d), ret, body.ty))
 
     a.tables.homes.put(func_key(a, scope, span, d), scope)
 
@@ -456,7 +456,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     val span = body_span(rest, span_zero())
 
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
-        cx.fault(span, body_disagreement(d.name, ret, body.ty))
+        cx.fault(span, body_disagreement(declared_key(a, cx.scope, d), ret, body.ty))
 
     // **An instantiation whose name carries a closure's is internal on the same ground the closure
     // itself is.** `sysl.time$resolve.$closure4` is a symbol only the unit that lowered that closure
@@ -470,6 +470,17 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
           d.conv, d.tailrec, contract.3, d.pure, d.ghost, d.reads, d.writes, exported_symbol(d),
           d.section)
 end analyze_instance_in
+
+// The key a declaration was filed under, for a diagnostic naming the declaration an instantiation
+// came from rather than the instantiation itself. A member's own name is already a key; a free
+// function's is its module and its name.
+private declared_key(a: &Analysis, scope: Scope, d: FuncDecl) -> string
+    val qualified = module_qualify(scope.module_name, d.name)
+
+    if a.tables.funcs.has(qualified) then return qualified
+
+    d.name
+end declared_key
 
 // What a body that does not answer with what its signature declared is told.
 //

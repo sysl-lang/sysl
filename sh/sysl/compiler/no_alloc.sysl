@@ -1,0 +1,224 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// A module that gave the allocator up, and what that costs it.
+//
+// **A module declaring `@no_alloc` may hold and release storage made elsewhere, and may make none of
+// its own.** So two things are refused: every construction in its bodies that makes heap storage,
+// and every call out of one that arrives somewhere that does.
+//
+// **The diagnostic lands at the CALL rather than at the import**, and the reason is the standard
+// library: `sysl` is one module and is half allocator-free, so a rule stated over modules would
+// refuse every allocator-free module that names anything at all -- `print` and `from_utf8` are the
+// same module, and only one of them allocates.
+
+// Whether this module gave the allocator up, and the same asked of what its tests may do.
+//
+// **Only the module's half moves between the two. The target's does not**: a `@tests` file may take
+// back what the module gave up, because the module's clause is a promise about what ships and the
+// file does not ship -- but it cannot take back what the machine never had.
+private no_alloc_here(a: &Analysis, module_name: string, scaffolding: bool) -> bool
+    if scaffolding then return module_tests_narrowed(a, module_name, CapHeap)
+
+    module_narrowed(a, module_name, CapHeap)
+end no_alloc_here
+
+// Which of the two made this module allocator-free, said the way the diagnostic needs it.
+//
+// The distinction is the whole reason it is carried rather than assumed: a reader told their module
+// "declared 'no alloc'" when no file of it says any such thing would go looking for a clause that is
+// not there.
+private because(a: &Analysis, module_name: string, scaffolding: bool) -> string
+    if scaffolding && module_tests_own_narrowing(a, module_name, CapHeap) then
+        return "this module's '@tests' file declared '@no_alloc'"
+
+    "this module declared '@no_alloc'"
+end because
+
+// What a node allocates, said the way a reader would say it, or nothing for a node that does not.
+//
+// A weakening is deliberately absent: a weak reference is a count inside the box the strong one
+// already made, so it allocates nothing -- and the `&T` it has to come from is the boxing, which is
+// gated one step earlier.
+allocates(e: TExpr) -> Option[string] = *e.kind match
+    TBox(_, _) -> Some("a reference")
+
+    // An **empty** buffer makes none: a view of nothing is the zero value of its own representation
+    // and reaches no allocator, which is what a function answering "no results" wants to write.
+    TBufLit(elems, _) ->
+        if elems.is_empty() then None else Some("a slice with storage of its own")
+    TBufFill(_, _, _) -> Some("a slice with storage of its own")
+    TStr(_) -> Some("the string a value renders as")
+    TRender(_, _, _, _) -> Some("the string a value renders as")
+    TFormat(_, _) -> Some("the string a formatted value renders as")
+    TFromBytes(_) -> Some("a string built from bytes")
+    TBinary(_, _, _, ty) ->
+        ty match
+            Str -> Some("the string two strings join into")
+            _ -> None
+    _ -> None
+
+// Reports every construction that makes heap storage in a module that gave the allocator up, and
+// every call out of one that arrives somewhere that does.
+//
+// **A generic is answered for by the body it was written as, and an instantiation of one by
+// nobody**: the clause is a promise about a module's own conduct, and a generic has no conduct until
+// a type is chosen -- by somebody else, in a module of their own. An instantiation is passed over
+// rather than dropped, so a module calling a generic that allocates is reported at *its* call, which
+// is the line its author can change.
+check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
+    var any = false
+
+    for i in 0..<a.tables.module_narrows.len()
+        if a.tables.module_narrows.at(i).1 == CapHeap then any = true
+
+    for i in 0..<a.tables.module_test_narrows.len()
+        if a.tables.module_test_narrows.at(i).1 == CapHeap then any = true
+
+    // Lazily, because building the call graph walks every body in the program: a compilation with
+    // no clause anywhere -- which is almost all of them -- should pay nothing at all for this pass.
+    if !any then return
+
+    var seeds: Buf[string] = buf()
+
+    for i in 0..<funcs.len()
+        if first_allocation(funcs.at(i).body).is_some() then seeds.push(funcs.at(i).name)
+
+    val walk = reaches_over(funcs, vtables, seeds)
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+        val module_name = module_of(f.name)
+        val scaffolding = holds_string(a.tables.test_only, f.name)
+
+        if !no_alloc_here(a, module_name, scaffolding) then continue
+
+        val why = because(a, module_name, scaffolding)
+        val scope = func_home(a, f.name)
+
+        scan_allocations(a, scope, f.body, why)
+        blame_block(a, walk, scope, f.body, why)
+
+    // The module storage is code like any other: an initializer that makes heap storage makes it in
+    // the module that wrote the declaration.
+    for i in 0..<vals.len()
+        val v = vals.at(i)
+
+        if v.init.is_none() then continue
+
+        val module_name = module_of(v.symbol)
+
+        if !no_alloc_here(a, module_name, holds_string(a.tables.test_only, v.symbol)) then continue
+
+        val why = because(a, module_name, holds_string(a.tables.test_only, v.symbol))
+        val scope = val_home(a, v.symbol)
+        val skip: &Skipped = Skipped(buf())
+
+        walk_texpr(v.init.unwrap(), expr_walk(false, e -> scan_one(a, scope, skip, e, why)))
+        walk_texpr(v.init.unwrap(), TWalk(false, e -> blame_one(a, walk, scope, e, why),
+                                          w -> blame_write(a, walk, scope, w, why)))
+end check_no_alloc
+
+// The file a module's storage was declared in.
+private val_home(a: &Analysis, symbol: string) -> Scope
+    val d = a.tables.vals.get(symbol)
+
+    if d.is_some() then return d.unwrap().scope
+
+    empty_scope()
+end val_home
+
+// The first construction under a body that makes heap storage, wherever it is.
+private first_allocation(b: TBlock) -> Option[string]
+    val found: &Counted = Counted(0)
+
+    walk_block_stmts(b, expr_walk(false, e -> note_allocation(found, e)))
+
+    if found.n == 0 then return None
+
+    Some("yes")
+end first_allocation
+
+private note_allocation(found: &Counted, e: TExpr)
+    if allocates(e).is_some() then found.n = 1
+end note_allocation
+
+// Walks a body, reporting the OUTERMOST allocation on each path and going no deeper into one.
+//
+// Stopping at the outermost is what keeps `str(a) + str(b)` from being three messages about one
+// line. What a reader has to change is the expression, and the expression is the node that was
+// reported; the pieces inside it go away with it. The walk is outermost-first, so a node whose span
+// is inside one already reported is one of those pieces.
+private scan_allocations(a: &Analysis, scope: Scope, b: TBlock, why: string)
+    val skip: &Skipped = Skipped(buf())
+
+    walk_block_stmts(b, expr_walk(false, e -> scan_one(a, scope, skip, e, why)))
+end scan_allocations
+
+// The spans of everything inside a node that has already been reported, so that the pieces of one
+// expression are not each a message of their own.
+struct Skipped
+    inside: Buf[(usize, usize)]
+
+    covers(self, span: Span) -> bool
+        for i in 0..<self.inside.len()
+            val at = self.inside.at(i)
+
+            if span.start >= at.0 && span.end <= at.1 then return true
+
+        false
+    end covers
+
+    cover(*self, span: Span)
+        self.inside.push((span.start, span.end))
+end Skipped
+
+private scan_one(a: &Analysis, scope: Scope, skip: &Skipped, e: TExpr, why: string)
+    val what = allocates(e)
+
+    if what.is_none() || skip.covers(e.span) then return
+
+    skip.cover(e.span)
+    a.fault(scope, e.span, s"${what.unwrap()} needs an allocator, and $why — it may hold and " +
+            "release storage made elsewhere, and may make none of its own")
+end scan_one
+
+// Reports the **smallest** sub-tree that still reaches a function that allocates, which is as close
+// to the call as the tree can put the caret.
+//
+// **Every such sub-tree, not merely the first.** A body that calls two allocating functions has two
+// things wrong with it and two places to change. What keeps that from being a message per node on
+// the way down is that a node reports only where nothing under it does.
+private blame_block(a: &Analysis, walk: &Reaches, scope: Scope, b: TBlock, why: string)
+    walk_block_stmts(b, TWalk(false, e -> blame_one(a, walk, scope, e, why),
+                              w -> blame_write(a, walk, scope, w, why)))
+end blame_block
+
+private blame_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, why: string)
+    val mine = least_seed(walk, own_refs(e))
+
+    if mine.is_none() then return
+    if reaches_a_seed(walk, strict_refs(e)) then return
+
+    a.fault(scope, e.span, s"this reaches '${module_show(mine.unwrap())}', which makes heap " +
+            s"storage, and $why — an allocator-free module may only call what is allocator-free " +
+            "itself")
+end blame_one
+
+// A write's own names -- the dispatched operator it goes through, and the invariant it re-establishes
+// -- are reported at the place it writes, which is the nearest thing it has to a position of its own.
+private blame_write(a: &Analysis, walk: &Reaches, scope: Scope, w: TWrite, why: string)
+    val out = no_refs()
+
+    write_refs(out, w)
+
+    val mine = least_seed(walk, out)
+
+    if mine.is_none() then return
+
+    a.fault(scope, w.place.span, s"this reaches '${module_show(mine.unwrap())}', which makes heap " +
+            s"storage, and $why — an allocator-free module may only call what is allocator-free " +
+            "itself")
+end blame_write

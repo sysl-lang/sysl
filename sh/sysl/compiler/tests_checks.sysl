@@ -117,6 +117,50 @@ a_ghost_calling_a_ghost()
 
 // -- a value with a destructor, handed back by value ---------------------------------------------
 
+// Everything the program has to say about a source read beside the library, less what the library
+// itself says.
+private complaints_of(text: string) -> Buf[string]
+    val parsed = parse(source_of("test.sysl", text))
+    var out: Buf[string] = buf()
+
+    if !parsed.ok()
+        out.push(parsed.report.at(0).message)
+        return out
+    end if
+
+    var units: Buf[Program] = buf()
+    val library = checks_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/") then
+            out.push(done.reported.at(i).diag.message)
+
+    out
+end complaints_of
+
+private says(xs: Buf[string], message: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == message then return true
+
+    false
+end says
+
+private listed_of(xs: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<xs.len()
+        out = out + (if i > 0 then " | " else "") + xs.at(i)
+
+    out
+end listed_of
+
 private a_handle() -> string =
     "struct Handle\n    fd: int\n\nimpl Drop for Handle\n    drop(self) = ()\n\n"
 
@@ -457,3 +501,94 @@ a_capability_both_given_up_and_required()
 a_capability_stated_once()
     assert_eq(how_many("module mm\n@requires(posix)\n"), 0)
     assert_eq(how_many("module mm\n@no_alloc\n"), 0)
+
+// -- a module that gave the allocator up -----------------------------------------------------------
+
+private allocator_free() -> string = "module mm\n@no_alloc\n\n"
+
+private needs_one(what: string) -> string =
+    s"$what needs an allocator, and this module declared '@no_alloc' — it may hold and release " +
+    "storage made elsewhere, and may make none of its own"
+
+@test("a reference is made on the heap, so an allocator-free module may not make one")
+a_reference_in_an_allocator_free_module()
+    if checks_no_library() then return
+
+    assert(says(complaints_of(allocator_free() + "mk() -> &int = 1\n"), needs_one("a reference")),
+           listed_of(complaints_of(allocator_free() + "mk() -> &int = 1\n")))
+
+@test("and neither a slice with storage of its own, nor the string a value renders as")
+the_other_allocations()
+    if checks_no_library() then return
+
+    assert(says(complaints_of(allocator_free() + "mk() -> []int = [1, 2]\n"),
+                needs_one("a slice with storage of its own")),
+           listed_of(complaints_of(allocator_free() + "mk() -> []int = [1, 2]\n")))
+    assert(says(complaints_of(allocator_free() + "mk(n: int) -> string = str(n)\n"),
+                needs_one("the string a value renders as")),
+           listed_of(complaints_of(allocator_free() + "mk(n: int) -> string = str(n)\n")))
+
+@test("an empty slice is the zero value of its own representation, so it reaches no allocator")
+an_empty_slice_allocates_nothing()
+    if checks_no_library() then return
+
+    assert_eq(complaints_of(allocator_free() + "mk() -> []int\n    val e: []int = []\n\n    e\n").len(),
+              usize(0))
+
+@test("a call that arrives somewhere that allocates is reported at the call")
+a_call_that_reaches_an_allocation()
+    if checks_no_library() then return
+
+    val out = complaints_of(allocator_free() + "private mk() -> &int = 1\n\n" +
+                            "go()\n    val x = mk()\n")
+
+    assert(says(out, "this reaches 'mm.mk', which makes heap storage, and this module declared " +
+                "'@no_alloc' — an allocator-free module may only call what is allocator-free itself"),
+           listed_of(out))
+
+@test("a module that gave nothing up may allocate as it likes")
+a_module_with_no_clause()
+    if checks_no_library() then return
+
+    assert_eq(complaints_of("module mm\n\nmk() -> &int = 1\n").len(), usize(0))
+
+// -- a field holding something callable ------------------------------------------------------------
+
+@test("a field holding a callable is called through the selection that reads it")
+a_callable_field()
+    if checks_no_library() then return
+
+    assert_eq(complaints_of("struct Holder\n    f: &Fn(int) -> unit\n\n" +
+                            "run(h: Holder)\n    h.f(1)\n").len(), usize(0))
+
+@test("and one reached through a reference is the same call, the shorthand walking one level")
+a_callable_field_through_a_reference()
+    if checks_no_library() then return
+
+    assert_eq(complaints_of("struct Holder\n    f: &Fn(int) -> unit\n\n" +
+                            "run(h: &Holder)\n    h.f(1)\n").len(), usize(0))
+
+@test("a field that is not callable is still not a method")
+a_field_that_is_not_callable()
+    if checks_no_library() then return
+
+    assert(says(complaints_of("struct Holder\n    n: int\n\nrun(h: Holder)\n    h.n(1)\n"),
+                "type 'Holder' has no method 'n'"),
+           listed_of(complaints_of("struct Holder\n    n: int\n\nrun(h: Holder)\n    h.n(1)\n")))
+
+// -- which modules a module reached ----------------------------------------------------------------
+
+@test("the root module depends like any other, and nothing depends on it")
+the_root_module_only_ever_depends()
+    if checks_no_library() then return
+
+    val p = checks_program("struct Holder\n    f: &Fn(int) -> unit\n\n" +
+                           "run(h: Holder)\n    h.f(1)\n")
+    var from_root = false
+
+    for i in 0..<p.module_deps.len()
+        if p.module_deps.at(i).0 == "" then from_root = true
+
+        assert(!holds_string(p.module_deps.at(i).1, ""), "something depends on the root module")
+
+    assert(from_root, "the root module reached nothing")
