@@ -116,7 +116,8 @@ program_of(done: TypedBodies, main_module: string) -> TProgram
 
     TProgram(reached_structs(a), reached_enums(a), reached_vtables(a), reached_externs(a),
              reached_vals(a), emitted_funcs(done.funcs), buf(), done.entry, buf(), true, false,
-             buf(), buf(), main_module, declared_tests(done), declared_hooks(done), buf(),
+             no_alloc_modules(done.units, false), no_alloc_modules(done.units, true), main_module,
+             declared_tests(done), declared_hooks(done), buf(),
              a.tables.test_only, buf(), buf(), buf())
 end program_of
 
@@ -307,3 +308,64 @@ private analyzed_body(funcs: Buf[TFunc], name: string) -> bool
 
     false
 end analyzed_body
+
+// The modules that gave the allocator up, and the same asked of what each module's TESTS may do --
+// two lists, because a `@tests` file may take the allocator back for the scaffolding alone.
+//
+// **A module's clauses are read off the first file that ships it**, since the header is one
+// statement about the module however many files repeat it, and a test file's clause is an override
+// rather than a second opinion.
+private no_alloc_modules(units: Buf[Program], for_tests: bool) -> Buf[string]
+    var named: Buf[string] = buf()
+    var out: Buf[string] = buf()
+
+    for i in 0..<units.len()
+        val unit = units.at(i)
+        val module_name = module_of_unit(unit)
+
+        if module_name != "" && !holds_string(named, module_name)
+            val clauses = module_clauses(units, module_name, for_tests)
+
+            named.push(module_name)
+
+            if gives_up_heap(clauses) then out.push(module_name)
+
+    out
+end no_alloc_modules
+
+// The clauses a module is held to: its own, or -- on the test side, where its `@tests` file says
+// anything at all about a capability -- that file's instead.
+private module_clauses(units: Buf[Program], module_name: string,
+                       for_tests: bool) -> Buf[CapabilityClause]
+    var mine: Buf[CapabilityClause] = buf()
+    var theirs: Buf[CapabilityClause] = buf()
+    var found_mine = false
+    var found_theirs = false
+
+    for i in 0..<units.len()
+        val unit = units.at(i)
+
+        if module_of_unit(unit) == module_name && !unit.capabilities.is_empty()
+            if unit.test_only
+                if !found_theirs
+                    theirs = unit.capabilities
+                    found_theirs = true
+            else if !found_mine
+                mine = unit.capabilities
+                found_mine = true
+
+    if for_tests && found_theirs then theirs else mine
+end module_clauses
+
+// Whether a module's clauses give up the allocator. `no alloc` is the word a module writes for it.
+private gives_up_heap(clauses: Buf[CapabilityClause]) -> bool
+    for i in 0..<clauses.len()
+        val c = clauses.at(i)
+        val narrows = c.direction match
+            Narrows -> true
+            Requires -> false
+
+        if narrows && c.name == "alloc" then return true
+
+    false
+end gives_up_heap
