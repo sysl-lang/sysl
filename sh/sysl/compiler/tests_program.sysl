@@ -975,3 +975,52 @@ an_unranged_subtype_has_no_ends()
     val out = shown("type Tag = new int\n\nuse() -> Tag = Tag::Max\n", "use")
 
     assert(out.index_of("value: 2147483647").is_some(), out)
+
+// Where each type stands in the record of what a compilation made real, by the type's own spelling.
+private made_real_at(p: TProgram, shown: string) -> Option[usize]
+    for i in 0..<p.enums.len()
+        if type_show(p.enums.at(i)) == shown then return Some(i)
+
+    None
+end made_real_at
+
+private program_of_text(text: string) -> TProgram
+    val parsed = parse(source_of("test.sysl", text))
+    var units: Buf[Program] = buf()
+    val library = library_trees()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    program_of(analyze_bodies(units, host_target()), "")
+end program_of_text
+
+@test("a module's storage names its types after its members do, which is the order they are laid out in")
+storage_types_come_after_the_members()
+    if no_library() then return
+
+    val text = "module m\n\n" +
+        "struct Sink\n    n: int\nend Sink\n\n" +
+        "struct Held\n    n: int\nend Held\n\n" +
+        "struct Holder\n    n: int\n\n" +
+        "    pick(self) -> Option[Held] = Some(Held(self.n))\nend Holder\n\n" +
+        "var current: Option[*Sink] = None\n\n" +
+        "read() -> bool = current.is_some()\n"
+    val p = program_of_text(text)
+    val member = made_real_at(p, "sysl.Option[m.Held]")
+    val storage = made_real_at(p, "sysl.Option[*m.Sink]")
+
+    assert(member.is_some(), "the member's result was never made real")
+    assert(storage.is_some(), "the storage's type was never made real")
+    assert(storage.unwrap() > member.unwrap(),
+           s"storage at ${storage.unwrap()}, member at ${member.unwrap()}")
+
+@test("and the type is still read where nothing names the storage, so a mistake in one is reported")
+storage_of_a_type_that_is_not_there()
+    if no_library() then return
+
+    val said = complaints("module m\n\nvar current: Option[*Missing] = None\n")
+
+    assert(says(said, "unknown type 'Missing'"), listed(said))
