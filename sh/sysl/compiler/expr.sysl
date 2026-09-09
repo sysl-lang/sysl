@@ -365,17 +365,28 @@ private variant_expr(cx: &Analyzer, span: Span, name: string, expected: Option[T
     TExpr(span, TEnumNew(en, v, buf()))
 end variant_expr
 
+// The enum the **position** asked for, where it asked for one that has this variant.
+variant_from_expected(cx: &Analyzer, name: string,
+                      expected: Option[Type]) -> Option[(Type, EnumVariant)]
+    if expected.is_none() then return None
+
+    val want = repr(expected.unwrap())
+
+    want match
+        Enum(d) ->
+            val v = d.variant(name)
+
+            if v.is_none() then return None
+
+            Some((want, v.unwrap()))
+        _ -> None
+end variant_from_expected
+
 // The enum a bare variant name belongs to, preferring the one the position asked for.
 variant_of(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[(Type, EnumVariant)]
-    if expected.is_some() then
-        val want = repr(expected.unwrap())
+    val settled = variant_from_expected(cx, name, expected)
 
-        want match
-            Enum(d) ->
-                val v = d.variant(name)
-
-                if v.is_some() then return Some((want, v.unwrap()))
-            _ -> ()
+    if settled.is_some() then return settled
 
     var found: Option[(Type, EnumVariant)] = None
 
@@ -395,7 +406,7 @@ variant_of(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[(Type,
 end variant_of
 
 // Whether a declaration's module is one this file reads names out of without qualifying them.
-private visible_here(cx: &Analyzer, key: string) -> bool
+visible_here(cx: &Analyzer, key: string) -> bool
     val owner = module_of(key)
 
     if owner == cx.scope.module_name then return true
