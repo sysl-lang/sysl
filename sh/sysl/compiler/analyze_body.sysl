@@ -89,6 +89,11 @@ analyze_bodies(units: Buf[Program], t: Target) -> TypedBodies
     TypedBodies(funcs, a.diagnostics(), generic, defaults, declared)
 end analyze_bodies
 
+// Whether a declaration's symbol is one only its own file can name.
+file_local(v: Visibility) -> bool = v match
+    File -> true
+    _ -> false
+
 // One function: its parameters in scope, its contract read first, and its body as a value block.
 analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> TFunc
     val cx = analyzer_for(a, scope)
@@ -125,9 +130,12 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> TFunc
         cx.fault(body_span(rest, span), s"function '${d.name}' should return ${type_show(ret)}, " +
                  s"but its body yields ${type_show(body.ty)}")
 
+    // **A file-private declaration's symbol is internal**, since nothing outside the file it was
+    // written in can name it -- which is what keeps two files' `private pick` from being one symbol
+    // at the link.
     TFunc(span, func_key(a, scope, span, d), params, ret, body, d.variadic, contract.0, contract.1,
-          contract.2, false, d.conv, d.tailrec, contract.3, d.pure, d.ghost, d.reads, d.writes,
-          exported_symbol(d), d.section)
+          contract.2, file_local(d.vis), d.conv, d.tailrec, contract.3, d.pure, d.ghost, d.reads,
+          d.writes, exported_symbol(d), d.section)
 end analyze_body
 
 // Every generic declaration's body, read once with its parameters standing in for themselves.
@@ -252,7 +260,8 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
         cx.fault(span, s"function '$name' should return ${type_show(ret)}, but its body yields " +
                  s"${type_show(body.ty)}")
 
-    TFunc(span, name, params, ret, body, d.variadic, contract.0, contract.1, contract.2, false,
+    TFunc(span, name, params, ret, body, d.variadic, contract.0, contract.1, contract.2,
+          file_local(d.vis),
           d.conv, d.tailrec, contract.3, d.pure, d.ghost, d.reads, d.writes, exported_symbol(d),
           d.section)
 end analyze_instance_in
