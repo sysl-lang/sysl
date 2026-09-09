@@ -5,13 +5,14 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.text.Search
 
-// Operators reaching an implementation through a trait.
+// What a source means **as a program**, with the standard module beside it.
 //
 // **These need the library**, and that is the whole reason they are a file of their own: `Eq`, `Ord`
-// and the ten arithmetic traits are ordinary declarations of the standard module, so a source
-// compiled on its own has nothing for `==` to dispatch through. Every test here is a **program** --
-// the library's trees, then the source -- and every one of them says so and returns where the
-// library is not on the machine.
+// and the ten arithmetic traits are ordinary declarations of the standard module, a member the
+// compiler provides reads its signature off a trait the library declares, and `s.chars` is a call to
+// a function the library writes. A source compiled on its own has none of that. Every test here is a
+// program -- the library's trees, then the source -- and every one of them says so and returns where
+// the library is not on the machine.
 
 // The library's trees, parsed once for the whole file. Parsing them is most of what one of these
 // costs, and the analysis is the thing being tested.
@@ -245,3 +246,46 @@ a_catalog_trait_is_found_where_it_lives()
     val out = shown(bits_import() + "use(x: uint) -> uint = x.leading_zeros()\n", "use")
 
     assert(out.contains("op: \"leading_zeros\""), out)
+
+// -- what the library supplies for a built-in ------------------------------------------------------
+
+@test("a string's characters are the library's cursor over its bytes, reached without being named")
+a_strings_characters_are_the_librarys_cursor()
+    if no_library() then return
+
+    val out = shown("use(s: string) -> sysl.text.Chars = s.chars\n", "use")
+
+    assert(out.contains("name: \"sysl.text$chars_of\""), out)
+    assert(out.contains("TBytes"), out)
+
+@test("a library name is found where the library put it, not under the standard module")
+a_library_name_is_found_where_it_lives()
+    if no_library() then return
+
+    val said = complaints("use(s: string) -> sysl.text.Chars = s.chars\n")
+
+    assert(said.is_empty(), s"${said.len()} said")
+
+// -- a raw object -----------------------------------------------------------------------------------
+
+private sink_decls() -> string =
+    "struct S\n    n: int\n\n" +
+    "impl sysl.Fallible for S\n\n" +
+    "impl sysl.Writer for S\n    write(*self, bytes: []const u8) = self.n += 1\n\n"
+
+@test("a pointer at a type that implements the trait goes behind the table a raw object carries")
+a_pointer_is_erased_into_a_raw_object()
+    if no_library() then return
+
+    val out = shown(sink_decls() + "use(p: *S) -> *sysl.Writer = p\n", "use")
+
+    assert(out.contains("TErase"), out)
+    assert(out.contains("vtable: \"vt.sysl$Writer.S\""), out)
+
+@test("and a value with no address of its own is told to take one")
+a_value_needs_an_address()
+    if no_library() then return
+
+    val said = complaints(sink_decls() + "use(s: S) -> *sysl.Writer = s\n")
+
+    assert(!said.is_empty(), "the value was refused")

@@ -86,7 +86,9 @@ private library_call(cx: &Analyzer, span: Span, name: string, arg: TExpr) -> TEx
 end library_call
 
 // The key the library files one of its own names under. It is looked up rather than composed, so
-// that a library which moved a function between its modules is followed rather than guessed at.
+// that a library which moved a function between its modules is followed rather than guessed at --
+// `prints` is `sysl$prints` and `chars_of` is `sysl.text$chars_of`, and nothing here should have to
+// know which.
 library_key(cx: &Analyzer, name: string) -> Option[string]
     val direct = module_qualify(StdModule, name)
 
@@ -94,11 +96,32 @@ library_key(cx: &Analyzer, name: string) -> Option[string]
 
     for i in 0..<cx.an.tables.funcs.len()
         val key = cx.an.tables.funcs.key_at(i)
+        val bare = library_spelling(key)
 
-        if key == name then return Some(key)
+        if bare.is_some() && bare.unwrap() == name then return Some(key)
 
     None
 end library_key
+
+// A call to a library function the compiler named for itself, at the result the library declares
+// for it -- which is what a member the compiler provides but does not implement comes to.
+library_result_call(cx: &Analyzer, span: Span, name: string, arg: TExpr) -> TExpr
+    val key = library_key(cx, name)
+
+    if key.is_none()
+        return cx.err(span, s"this is written in terms of the library's '$name', which the " +
+                      "standard module this compilation was given does not declare")
+
+    val f = cx.an.tables.funcs.get(key.unwrap())
+
+    if f.is_none() then return bad_expr(span)
+
+    var args: Buf[TExpr] = buf()
+
+    args.push(arg)
+    TExpr(span, TCall(key.unwrap(), args,
+                      declared_result(cx, f.unwrap().scope, f.unwrap().decl.ret_type), false))
+end library_result_call
 
 // `str_cast(bytes)` -- the bytes taken as a string, with nothing checked.
 //
