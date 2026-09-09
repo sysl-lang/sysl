@@ -66,7 +66,7 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
 
         slots.at(i) match
             Some(e) ->
-                val t = type_expr(cx, e, Some(want))
+                val t = argument_at(cx, decl, i, e, want)
 
                 if disagree(texpr_type(t), want) then
                     cx.fault(e.span, s"'${decl.params.at(i).name}' of '$written' is " +
@@ -197,7 +197,7 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
 
         slots.at(i) match
             Some(e) ->
-                val t = type_expr(cx, e, Some(want))
+                val t = argument_at(cx, decl, i, e, want)
 
                 if disagree(texpr_type(t), want)
                     if report then
@@ -215,6 +215,48 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
 
     TExpr(span, TCall(name, ts, sig.unwrap().ret, false))
 end generic_call
+
+// One argument of a generic call, read at the parameter the solve arrived at.
+//
+// **An argument standing at a parameter that was still being solved was read with nothing expected
+// of it**, so what a position would have done to it -- boxing a value into a `&T`, giving up the
+// ability to write a view, erasing into an object -- is done *here*, once the parameter is known,
+// rather than inside the reading. That is what makes `copy(bigger, self.elems[0..])` a writable view
+// with the const view around it, which is what the position performs and what the reference records.
+//
+// A **literal** is the one case that cannot be repaired afterwards, because a literal does not
+// convert -- it *is* the type its position gives it. So it is read against the parameter it turned
+// out to have. A written-out array standing where a slice was asked for is the other: by the time
+// there is an array to coerce, the storage has been made as one.
+private argument_at(cx: &Analyzer, decl: FuncDecl, i: usize, e: Expr, want: Type) -> TExpr
+    if i >= decl.params.len() || !ref_mentions(decl.params.at(i).typ, decl.tparams) ||
+            is_literal(e) then
+        return type_expr(cx, e, Some(want))
+
+    val bare = type_expr(cx, e, None)
+
+    if becomes_slice(texpr_type(bare), want) then return type_expr(cx, e, Some(want))
+
+    val fitted = coerce(cx, bare, want)
+
+    if !disagree(texpr_type(fitted), want) then return fitted
+
+    // What the position could not repair is read again against the parameter, and kept only where
+    // that answers -- otherwise the first reading is what the complaint should name.
+    val again = type_expr(cx, e, Some(want))
+
+    if disagree(texpr_type(again), want) then fitted else again
+end argument_at
+
+// A written-out array where a view of it was asked for, which is the one conversion the analysis
+// performs rather than one the position repairs afterwards.
+private becomes_slice(actual: Type, want: Type) -> bool
+    unqualified(actual) match
+        Array(_, _) -> unqualified(want) match
+            Slice(_, _) -> true
+            _ -> false
+        _ -> false
+end becomes_slice
 
 // The type parameters a call can settle nothing about: the ones named in neither the parameters nor
 // the result.

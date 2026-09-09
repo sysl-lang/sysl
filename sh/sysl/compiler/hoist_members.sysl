@@ -676,10 +676,30 @@ synthesize(a: &Analysis, home: MemberHome, m: MethodDecl) -> FuncDecl
     // The three annotations a member may carry are about its **parameters**, so they cross to the
     // lowered function unchanged -- the receiver is prepended in front of them and the names they
     // gave still name the same parameters.
-    FuncDecl(name, tparams, params, m.ret_type, m.body, bounds, m.variadic, m.vis, buf(), tvalues,
+    FuncDecl(name, tparams, params, m.ret_type, m.body, bounds, m.variadic,
+             member_visibility(a, home, m), buf(), tvalues,
              tpacks, None, None, None, false, false, false, m.reads, m.writes, None, None,
              m.crossing, buf())
 end synthesize
+
+// **A member is no more visible than the type it belongs to.** Nothing outside the file that
+// declares a `private enum` can name the type, so nothing there can reach a member of it either --
+// and the symbol that member lowers to is `internal` for the same reason a file-private function's
+// is.
+private member_visibility(a: &Analysis, home: MemberHome, m: MethodDecl) -> Visibility
+    if file_local(m.vis) then return m.vis
+
+    val decl = a.tables.types.get(home.key)
+
+    if decl.is_none() then return m.vis
+
+    val owner = decl.unwrap().kind match
+        StructOf(sd) -> sd.vis
+        EnumOf(ed) -> ed.vis
+        _ -> m.vis
+
+    if file_local(owner) then File else m.vis
+end member_visibility
 
 // The `self` parameter a member's receiver becomes, at the self type it is a member of.
 receiver_param(m: MethodDecl, self_ref: TypeRef) -> Option[Param]

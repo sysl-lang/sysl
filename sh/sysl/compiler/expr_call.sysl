@@ -596,17 +596,18 @@ private function_call(cx: &Analyzer, span: Span, written: string, args: Buf[Expr
 
     if keys.len() == 1 then return call_key(cx, span, written, keys.at(0), args, expected, true)
 
-    var chosen: Option[string] = None
+    var fitting: Buf[string] = buf()
 
     for i in 0..<keys.len()
-        if chosen.is_none() then
-            val mark = cx.an.complaints()
-            val trial = call_key(cx, span, written, keys.at(i), args, expected, false)
-            val said = cx.an.complaints() > mark
+        val mark = cx.an.complaints()
+        val trial = call_key(cx, span, written, keys.at(i), args, expected, false)
+        val said = cx.an.complaints() > mark
 
-            cx.an.restore_complaints(mark)
+        cx.an.restore_complaints(mark)
 
-            if !said then chosen = Some(keys.at(i))
+        if !said then fitting.push(keys.at(i))
+
+    val chosen = narrowed(cx, fitting)
 
     if chosen.is_none() then
         return cx.err(span, s"no '$written' takes these arguments — the declarations of that name " +
@@ -614,6 +615,28 @@ private function_call(cx: &Analyzer, span: Span, written: string, args: Buf[Expr
 
     call_key(cx, span, written, chosen.unwrap(), args, expected, true)
 end function_call
+
+// Which of the declarations a call fits is the one meant.
+//
+// **A declaration written out beats one a type parameter covers**, which is the whole of what a
+// specialization is for: the library declares `copy[T](dst: []T, src: []const T)` and then
+// `copy(dst: []u8, src: []const u8)` beside it, and a call on bytes means the second. Both fit, so
+// order alone would answer with whichever was written first.
+private narrowed(cx: &Analyzer, fitting: Buf[string]) -> Option[string]
+    if fitting.is_empty() then return None
+    if fitting.len() == 1 then return Some(fitting.at(0))
+
+    var spelled: Buf[string] = buf()
+
+    for i in 0..<fitting.len()
+        val f = cx.an.tables.funcs.get(fitting.at(i))
+
+        if f.is_some() && f.unwrap().decl.tparams.is_empty() then spelled.push(fitting.at(i))
+
+    if spelled.len() == 1 then return Some(spelled.at(0))
+
+    Some(fitting.at(0))
+end narrowed
 
 // The declarations of one name, as a reader would write them.
 private signature_list(cx: &Analyzer, keys: Buf[string]) -> string
