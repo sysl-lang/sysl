@@ -592,3 +592,43 @@ the_root_module_only_ever_depends()
         assert(!holds_string(p.module_deps.at(i).1, ""), "something depends on the root module")
 
     assert(from_root, "the root module reached nothing")
+
+// -- what a declaration needs, and whether the module reaching it has it ---------------------------
+
+@test("a '@needs' naming nothing is refused with the set there is")
+a_needs_that_is_not_a_capability()
+    assert_eq(said("module mm\n\n@needs(nonesuch)\nlow() -> int = 1\n"),
+              "no capability is called 'nonesuch' — the set is 'heap', 'os', 'posix'")
+
+@test("and one naming the conduct is refused with the facility")
+a_needs_naming_the_conduct()
+    assert_eq(said("module mm\n\n@needs(alloc)\nlow() -> int = 1\n"),
+              "'alloc' is what a module does, not something a machine has — a '@needs' names the " +
+              "facility, so this is '@needs(heap)'")
+
+@test("a reference to something the module gave up is reported at the reference")
+a_reference_to_what_a_module_gave_up()
+    assert_eq(said("module mm\n@no_os\n\n@needs(os)\nprivate opens() -> int = 1\n\n" +
+                   "go()\n    val n = opens()\n"),
+              "this reaches 'mm.opens', which needs 'os', and 'mm' declared '@no_os'")
+
+@test("and so is one that arrives there through something else, reported at the nearest reference")
+a_reference_that_arrives_through_another()
+    val out = stmt_diagnostics("module mm\n@no_os\n\n@needs(os)\nprivate opens() -> int = 1\n\n" +
+                               "private mid() -> int = opens()\n\ngo()\n    val n = mid()\n")
+
+    // The SEED is what a message names, and `mid` declares nothing: what a reader has to change is
+    // the reference, and what it reaches is the declaration that asked for the capability.
+    assert(says(out, "this reaches 'mm.opens', which needs 'os', and 'mm' declared '@no_os'"),
+           listed_of(out))
+
+@test("giving up 'os' gives up 'posix' with it, since posix needs os")
+giving_up_os_gives_up_posix()
+    assert_eq(said("module mm\n@no_os\n\n@needs(posix)\nprivate low() -> int = 1\n\n" +
+                   "go()\n    val n = low()\n"),
+              "this reaches 'mm.low', which needs 'os', and 'mm' declared '@no_os'")
+
+@test("a module that gave nothing up may reach whatever it likes")
+a_module_that_gave_nothing_up()
+    assert_eq(how_many("module mm\n\n@needs(os)\nprivate opens() -> int = 1\n\n" +
+                       "go()\n    val n = opens()\n"), 0)

@@ -417,3 +417,154 @@ private holds_pair(pairs: Buf[(string, string)], a: string, b: string) -> bool
 
     false
 end holds_pair
+
+// -- what a declaration needs, and whether the module reaching it has it ---------------------------
+
+// Every declaration that wrote `@needs(...)`, as the capabilities it needs with their implications
+// folded in -- a declaration needing `posix` needs `os`, whether or not it said so.
+//
+// Both tables are read because an `extern` is in both: a shim is filed so that a call resolves like
+// any other, and the foreign declaration beside it is what a back end reads.
+private declared_needs(a: &Analysis, cap: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<a.tables.funcs.len()
+        if needs_capability(a.tables.funcs.at(i).decl.needs, cap) then out.push(a.tables.funcs.key_at(i))
+
+    for i in 0..<a.tables.externs.len()
+        val key = a.tables.externs.key_at(i)
+
+        if !holds_string(out, key) && needs_capability(a.tables.externs.at(i).needs, cap) then
+            out.push(key)
+
+    out
+end declared_needs
+
+private needs_capability(needs: Buf[string], cap: string) -> bool
+    for i in 0..<needs.len()
+        if !is_facility(needs.at(i)) then continue
+
+        val spread = capability_closure(needs.at(i))
+
+        if holds_string(spread, cap) then return true
+
+    false
+end needs_capability
+
+// Refuses a `@needs` naming nothing, said the way a file header's clause says it -- one vocabulary,
+// one message, whichever position the mistake was written in.
+//
+// `alloc` is the one worth its own sentence: it is what a module *does*, and a `@needs` names the
+// facility, so somebody who wrote `@needs(alloc)` beside the `@no_alloc` they had just read meant
+// `@needs(heap)`.
+private check_needs_names(a: &Analysis)
+    for i in 0..<a.tables.funcs.len()
+        val f = a.tables.funcs.at(i)
+
+        for j in 0..<f.decl.needs.len()
+            val cap = f.decl.needs.at(j)
+
+            if is_facility(cap) then continue
+
+            if narrowed_by(cap).is_some() then
+                a.fault(f.scope, f.span, s"'$cap' is what a module does, not something a machine " +
+                        "has — a '@needs' names the facility, so this is " +
+                        s"'@needs(${narrowed_by(cap).unwrap()})'")
+            else
+                a.fault(f.scope, f.span, s"no capability is called '$cap' — the set is 'heap', " +
+                        "'os', 'posix'")
+end check_needs_names
+
+// Whether a module is without a capability, because it gave the capability up.
+//
+// **Only the module's half moves between a module and its tests.** A `@tests` file may take back
+// what the module gave up, because the module's clause is a promise about what ships and the file
+// does not ship.
+private lacks(a: &Analysis, module_name: string, cap: string, scaffolding: bool) -> bool
+    if scaffolding then return module_tests_narrowed(a, module_name, cap)
+
+    module_narrowed(a, module_name, cap)
+end lacks
+
+// Which of the two put the capability out of reach, said the way the diagnostic needs it. A reader
+// told their module "declared 'no os'" when no file of it says any such thing would go looking for a
+// clause that is not there.
+private why_lacking(a: &Analysis, module_name: string, cap: string, scaffolding: bool) -> string
+    val word = narrow_word(cap)
+    val here = if module_name == "" then "this module" else s"'$module_name'"
+
+    if scaffolding && module_tests_own_narrowing(a, module_name, cap) then
+        return s"the '@tests' file of $here declared '@no_$word'"
+
+    s"$here declared '@no_$word'"
+end why_lacking
+
+// Refuses a `@needs(...)` naming something that is not a capability, and reports every reference
+// from a module that does not have what the declaration it reaches requires.
+//
+// It runs beside the allocator-free check, over the same finished tree and for the same reason: what
+// reaches what is a property of the typed program rather than of any one place in the analyzer.
+check_decl_capabilities(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
+    check_needs_names(a)
+
+    val core = capability_core()
+
+    // One walk per capability rather than one per declaration: what a reader has to change is the
+    // reference, and a reference refused for two capabilities at once is one line with one fix.
+    for c in 0..<core.len()
+        val cap = core.at(c)
+        val seeds = declared_needs(a, cap)
+
+        // Almost every compilation writes no `@needs` at all, and the walk reads every body -- so
+        // one with nothing to ask pays nothing for it.
+        if seeds.is_empty() then continue
+
+        val walk = reaches_over(funcs, vtables, seeds)
+
+        for i in 0..<funcs.len()
+            val f = funcs.at(i)
+            val module_name = module_of(f.name)
+            val scaffolding = holds_string(a.tables.test_only, f.name)
+
+            if !lacks(a, module_name, cap, scaffolding) then continue
+
+            blame_needs(a, walk, func_home(a, f.name), f.body, cap,
+                        why_lacking(a, module_name, cap, scaffolding))
+
+        for i in 0..<vals.len()
+            val v = vals.at(i)
+
+            if v.init.is_none() then continue
+
+            val module_name = module_of(v.symbol)
+            val scaffolding = holds_string(a.tables.test_only, v.symbol)
+
+            if !lacks(a, module_name, cap, scaffolding) then continue
+
+            val d = a.tables.vals.get(v.symbol)
+            val scope = if d.is_some() then d.unwrap().scope else empty_scope()
+
+            blame_needs_expr(a, walk, scope, v.init.unwrap(), cap,
+                             why_lacking(a, module_name, cap, scaffolding))
+end check_decl_capabilities
+
+private blame_needs(a: &Analysis, walk: &Reaches, scope: Scope, b: TBlock, cap: string, why: string)
+    walk_block_stmts(b, TWalk(false, e -> blame_needs_one(a, walk, scope, e, cap, why),
+                              w -> ()))
+end blame_needs
+
+private blame_needs_expr(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, cap: string,
+                         why: string)
+    walk_texpr(e, TWalk(false, n -> blame_needs_one(a, walk, scope, n, cap, why), w -> ()))
+end blame_needs_expr
+
+private blame_needs_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, cap: string,
+                        why: string)
+    val mine = least_seed(walk, own_refs(e))
+
+    if mine.is_none() then return
+    if reaches_a_seed(walk, strict_refs(e)) then return
+
+    a.fault(scope, e.span, s"this reaches '${module_show(mine.unwrap())}', which needs '$cap', " +
+            s"and $why")
+end blame_needs_one
