@@ -21,6 +21,68 @@ end said
 
 private how_many(text: string) -> usize = stmt_diagnostics(text).len()
 
+// The same, beside the standard module -- which a check about a library trait needs, since `Drop` is
+// an ordinary declaration of it.
+private var checks_library_cache: Buf[Program] = buf()
+private var checks_library_read: bool = false
+
+private checks_library() -> Buf[Program]
+    if checks_library_read then return checks_library_cache
+
+    checks_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> checks_library_cache = units
+
+    checks_library_cache
+end checks_library
+
+private checks_no_library() -> bool
+    if checks_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end checks_no_library
+
+private checks_program(text: string) -> TProgram
+    val parsed = parse(source_of("test.sysl", text))
+    var units: Buf[Program] = buf()
+    val library = checks_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    program_of(analyze_bodies(units, host_target()), "")
+end checks_program
+
+// What the program warned about, as messages.
+private warned(text: string) -> Buf[string]
+    val p = checks_program(text)
+    var out: Buf[string] = buf()
+
+    for i in 0..<p.warnings.len()
+        out.push(p.warnings.at(i).diag.message)
+
+    out
+end warned
+
+// The symbol each type with a destructor is released through.
+private destructors(text: string) -> Buf[string]
+    val p = checks_program(text)
+    var out: Buf[string] = buf()
+
+    for i in 0..<p.destructors.len()
+        out.push(s"${p.destructors.at(i).0} -> ${p.destructors.at(i).1}")
+
+    out
+end destructors
+
 // -- `@ghost` --------------------------------------------------------------------------------
 
 private ghost_erased() -> string =
@@ -52,3 +114,52 @@ a_ghost_called_from_an_invariant()
 @test("a '@ghost' function may call another, its own body being where real state is read")
 a_ghost_calling_a_ghost()
     assert_eq(how_many(a_ghost() + "@ghost\nother(n: int) -> bool = spec(n)\n"), 0)
+
+// -- a value with a destructor, handed back by value ---------------------------------------------
+
+private a_handle() -> string =
+    "struct Handle\n    fd: int\n\nimpl Drop for Handle\n    drop(self) = ()\n\n"
+
+@test("handing back a value whose type has a 'Drop' is warned about")
+a_drop_type_returned_by_value()
+    if checks_no_library() then return
+
+    val w = warned(a_handle() + "open(n: int) -> Handle = Handle(n)\n")
+
+    assert_eq(w.len(), usize(1), s"warned ${w.len()}")
+    assert_eq(w.at(0), "'open' hands back 'Handle' by value, and 'Handle' has a 'Drop' — a " +
+              "destructor runs when a box's count reaches zero, so nothing here will ever call " +
+              "it. Return '&Handle' instead, or take the resource apart before returning it")
+
+@test("handing back the boxed form is what the warning asks for, so it says nothing")
+a_drop_type_returned_boxed()
+    if checks_no_library() then return
+
+    assert_eq(warned(a_handle() + "lend(n: int) -> &Handle = Handle(n)\n").len(), usize(0))
+
+@test("a raw pointer owns nothing, so handing one back makes no claim about who frees it")
+a_drop_type_behind_a_pointer()
+    if checks_no_library() then return
+
+    assert_eq(warned(a_handle() + "at(p: *Handle) -> *Handle = p\n").len(), usize(0))
+
+@test("the 'drop' the block itself declares never trips the rule")
+the_drop_member_itself()
+    if checks_no_library() then return
+
+    assert_eq(warned(a_handle()).len(), usize(0))
+
+@test("a type this compilation made real and gave a destructor is released through its 'drop'")
+a_destructor_is_recorded()
+    if checks_no_library() then return
+
+    val ds = destructors(a_handle() + "open(n: int) -> &Handle = Handle(n)\n")
+
+    assert_eq(ds.len(), usize(1), s"recorded ${ds.len()}")
+    assert_eq(ds.at(0), "Handle -> Handle.drop")
+
+@test("a program with no destructor records none")
+no_destructor_at_all()
+    if checks_no_library() then return
+
+    assert_eq(destructors("struct P\n    x: int\n\nmk(n: int) -> P = P(n)\n").len(), usize(0))

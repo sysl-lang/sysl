@@ -118,8 +118,41 @@ program_of(done: TypedBodies, main_module: string) -> TProgram
              done.vals, emitted_funcs(done.funcs), buf(), done.entry, buf(), true, false,
              no_alloc_modules(done.units, false), no_alloc_modules(done.units, true), main_module,
              declared_tests(done), declared_hooks(done), buf(),
-             a.tables.test_only, buf(), buf(), a.tables.module_deps)
+             a.tables.test_only, destructors_of(a), a.warnings(), a.tables.module_deps)
 end program_of
+
+// Every type this compilation made real that has a destructor, paired with the symbol of it.
+//
+// **Asked of the INSTANTIATED types rather than of the `impl` blocks**, because a block for a
+// generic type is one block covering a family and the hook is a function per concrete payload. A
+// type the program never made needs no entry: nothing can release a box of it.
+private destructors_of(a: &Analysis) -> Buf[(string, string)]
+    val drops = drops_declared(a)
+    var out: Buf[(string, string)] = buf()
+
+    if drops.is_empty() then return out
+
+    val made = reached_structs(a)
+    val enums = reached_enums(a)
+
+    for i in 0..<made.len()
+        push_destructor(a, drops, &out, made.at(i))
+
+    for i in 0..<enums.len()
+        push_destructor(a, drops, &out, enums.at(i))
+
+    out
+end destructors_of
+
+private push_destructor(a: &Analysis, drops: Buf[string], out: *Buf[(string, string)], t: Type)
+    val owner = owner_key(t)
+
+    if !holds_string(drops, owner) then return
+
+    val filed = a.tables.members.funcs.get(member_key_of(owner, "drop"))
+
+    out.push((mangle(t), filed.unwrap_or(s"${member_symbol(t)}.drop")))
+end push_destructor
 
 // The bodies a program **emits**, which is the question a printed tree answers.
 //

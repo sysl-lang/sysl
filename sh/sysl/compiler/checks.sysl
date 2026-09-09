@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.text.{Search, from_utf8_unchecked}
 
 // The checks a whole program is held to once every body it reaches has been typed.
 //
@@ -13,6 +14,7 @@ import sysl.buf.{Buf, buf}
 
 // Everything a program has to answer for, run in the order the reference runs them.
 whole_program_checks(a: &Analysis, funcs: Buf[TFunc])
+    check_drop_returns(a)
     check_ghost(a, funcs)
 end whole_program_checks
 
@@ -67,3 +69,112 @@ private walk_block_stmts(b: TBlock, clauses: bool, each: &Fn(TExpr) -> unit)
 
     if b.result.is_some() then walk_texpr(b.result.unwrap(), clauses, each)
 end walk_block_stmts
+
+// -- a value with a destructor, handed back by value ---------------------------------------------
+
+// The types this compilation declared a destructor for, by the key their members are filed under.
+//
+// **It is read off the `impl` blocks rather than off the instantiated types**, because a block for a
+// generic type is one block covering a family: what has a destructor is the family.
+drops_declared(a: &Analysis) -> Buf[string]
+    var out: Buf[string] = buf()
+    val drop_trait = catalog_key(a, "Drop")
+
+    if drop_trait.is_none() then return out
+
+    val from = a.tables.members.from_trait
+
+    for i in 0..<from.len()
+        val key = from.key_at(i)
+
+        if from.at(i) == drop_trait.unwrap() && member_filed_as(key) == "drop"
+            out.push(member_owner_of(key))
+
+    out
+end drops_declared
+
+// The two halves of a member key, which is an owner and the name the member is filed under.
+private member_split(key: string) -> (string, string)
+    val bytes = key.bytes
+
+    for i in 0..<bytes.len
+        if bytes[i] == u8('\t') then
+            return (from_utf8_unchecked(bytes[0..<i]), from_utf8_unchecked(bytes[i + 1..<bytes.len]))
+
+    (key, "")
+end member_split
+
+private member_owner_of(key: string) -> string = member_split(key).0
+private member_filed_as(key: string) -> string = member_split(key).1
+
+// Warns about every declaration that hands back a value whose type has a destructor.
+//
+// **A destructor runs when a box's count reaches zero**, so a value handed back by value has nothing
+// that will ever call it. Returning one stays legal -- a caller may take the value apart, or hand it
+// straight into something that boxes it -- which is why this is a warning: what the compiler can see
+// is that the usual reading of the declaration is wrong.
+//
+// The check is over what a program **declared** rather than over what it instantiated, so that a
+// constructor nobody has called yet is exactly the one told.
+private check_drop_returns(a: &Analysis)
+    val drops = drops_declared(a)
+
+    if drops.is_empty() then return
+
+    val funcs = a.tables.funcs
+
+    for i in 0..<funcs.len()
+        val key = funcs.key_at(i)
+
+        // The `drop` a `Drop` block declares takes `self` by value and answers `unit`, so it never
+        // trips this; and the block itself is not the place to complain about a member of the
+        // dropping type that legitimately hands one back.
+        if module_bare(key) != "drop" && !key.ends_with(".drop")
+            val f = funcs.at(i)
+
+            if f.decl.ret_type.is_some()
+                val saved = a.complaints()
+                val ty = resolve_type(a, f.scope, f.decl.ret_type.unwrap(), no_bindings())
+
+                a.restore_complaints(saved)
+
+                val held = drop_by_value(drops, ty)
+
+                if held.is_some() then
+                    val name = module_bare(held.unwrap())
+
+                    a.caution(f.scope, f.span, s"'${module_show(key)}' hands back " +
+                              s"'${module_show(held.unwrap())}' by value, and " +
+                              s"'${module_show(held.unwrap())}' has a 'Drop' — a destructor runs " +
+                              "when a box's count reaches zero, so nothing here will ever call " +
+                              s"it. Return '&$name' instead, or take the resource apart before " +
+                              "returning it")
+end check_drop_returns
+
+// The first type carried **by value** in this one that declares a destructor.
+//
+// **`&T` and `*T` both stop the walk, for opposite reasons.** A `&T` is the boxed form, which is the
+// whole answer the warning asks for; a raw pointer owns nothing and never did, so a binding handing
+// one back is making no claim about who frees it. A slice and an array stop it too: their elements
+// are not destructed either, which is a real question and a different one.
+private drop_by_value(drops: Buf[string], t: Type) -> Option[string] = t match
+    Ref(_, _) -> None
+    Ptr(_) -> None
+    Weak(_) -> None
+    Slice(_, _) -> None
+    Array(_, _) -> None
+    Struct(d) -> drops_or_args(drops, d.base, d.targs)
+    Enum(d) -> drops_or_args(drops, d.base, d.targs)
+    Volatile(inner) -> drop_by_value(drops, *inner)
+    _ -> None
+
+private drops_or_args(drops: Buf[string], base: string, targs: Buf[Type]) -> Option[string]
+    if holds_string(drops, base) then return Some(base)
+
+    for i in 0..<targs.len()
+        val held = drop_by_value(drops, targs.at(i))
+
+        if held.is_some() then return held
+
+    None
+end drops_or_args
