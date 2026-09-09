@@ -1,0 +1,384 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// A `*self` method that lets a pointer into its receiver's own storage outlive the call.
+//
+// **The rule is narrow on purpose, and the set it applies to is what makes it narrow.** A struct
+// that states an invariant is re-checked wherever a write could break it, and the re-check names
+// the struct -- so a pointer into a field of one is somewhere to write that names no such struct,
+// and every write through it goes unchecked. What is held to this is therefore only the types that
+// sit INLINE inside such a struct: a value reached through a reference is somebody else's storage
+// and carries its own checks.
+
+// Whether a struct declares an invariant of its own. A generic one is left out for the reason its
+// instantiations are: what the invariant reads is settled per instantiation.
+private carries_invariants(a: &Analysis, base: string) -> bool
+    val decl = a.tables.types.get(base)
+
+    if decl.is_none() then return false
+
+    decl.unwrap().kind match
+        StructOf(d) -> !d.invariants.is_empty() && d.tparams.is_empty()
+        _ -> false
+end carries_invariants
+
+// The structs a value of this type holds INLINE: itself, an array's element, a variant's fields.
+// A reference, a view, a pointer and a weak reference all stop the walk -- what is on the far side
+// is somebody else's storage.
+private inline_structs(t: Type) -> Buf[&StructType]
+    var out: Buf[&StructType] = buf()
+
+    t match
+        Struct(d) -> out.push(d)
+        Array(_, elem) ->
+            val inner = inline_structs(*elem)
+
+            for i in 0..<inner.len()
+                out.push(inner.at(i))
+        Enum(d) ->
+            for i in 0..<d.variants.len()
+                val fields = d.variants.at(i).fields
+
+                for j in 0..<fields.len()
+                    val inner = inline_structs(fields.at(j).1)
+
+                    for k in 0..<inner.len()
+                        out.push(inner.at(k))
+        _ -> ()
+
+    out
+end inline_structs
+
+// Every struct this program placed inline inside one that states an invariant, by base name.
+private covered_structs(a: &Analysis) -> Buf[string]
+    var found: Buf[string] = buf()
+    var work: Buf[&StructType] = buf()
+
+    for i in 0..<a.tables.struct_insts.len()
+        a.tables.struct_insts.at(i) match
+            Struct(d) ->
+                if carries_invariants(a, d.base)
+                    for j in 0..<d.fields.len()
+                        val inner = inline_structs(d.fields.at(j).1)
+
+                        for k in 0..<inner.len()
+                            work.push(inner.at(k))
+            _ -> ()
+
+    while !work.is_empty()
+        val s = work.at(work.len() - 1)
+
+        work.truncate(work.len() - 1)
+
+        if holds_string(found, s.base) then continue
+
+        found.push(s.base)
+
+        for j in 0..<s.fields.len()
+            val inner = inline_structs(s.fields.at(j).1)
+
+            for k in 0..<inner.len()
+                work.push(inner.at(k))
+
+    found
+end covered_structs
+
+// Holds every `*self` method of such a struct to finishing with its receiver when it returns.
+//
+// It runs once over the whole program, because the set above is only complete when every type the
+// program mentions has been instantiated. Each finding is reported and the walk goes on, so a body
+// with two escapes names both rather than the first.
+check_self_aliasing(a: &Analysis, funcs: Buf[TFunc])
+    val covered = covered_structs(a)
+
+    if covered.is_empty() then return
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        if f.params.is_empty() || f.params.at(0).0 != "self" then continue
+
+        val base = f.params.at(0).1 match
+            Ptr(inner) -> *inner match
+                Struct(d) -> Some(d.base)
+                _ -> None
+            _ -> None
+
+        if base.is_none() || !holds_string(covered, base.unwrap()) then continue
+
+        check_one_self_alias(a, func_home(a, f.name), f)
+end check_self_aliasing
+
+// What a body carries out of a `*self` method, tracked through the locals it passes through.
+struct SelfAlias
+    // The locals that may hold a pointer into the receiver's inline storage. `self` seeds it: the
+    // receiver is one.
+    confined: Buf[string]
+
+    // The place each `ref` in this body names. A ref is a second name for storage, so `&r` is `&<the
+    // place r names>` -- and the question this pass asks of an address is structural, "is this a
+    // chain of steps from `*self`", which a bare name cannot answer for itself.
+    refs: Buf[(string, TExpr)]
+
+    // Whether the last round of the fixpoint learned anything.
+    changed: bool
+
+    holds(self, name: string) -> bool = holds_string(self.confined, name)
+
+    ref_place(self, name: string) -> Option[TExpr]
+        for i in 0..<self.refs.len()
+            if self.refs.at(i).0 == name then return Some(self.refs.at(i).1)
+
+        None
+    end ref_place
+end SelfAlias
+
+private check_one_self_alias(a: &Analysis, scope: Scope, f: TFunc)
+    val st: &SelfAlias = SelfAlias(buf(), buf(), false)
+
+    st.confined.push("self")
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> note_ref(st, s)))
+
+    // Which locals hold one is a fixpoint, because a body may pass the pointer along a chain of them
+    // before letting it out. Nothing shrinks, so it settles.
+    st.changed = true
+
+    while st.changed
+        st.changed = false
+
+        walk_block_stmts(f.body, stmt_walk(false, s -> bind_confined(st, s)))
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> escaped_in(a, scope, st, s)))
+
+    if f.body.result.is_some()
+        got_out(a, scope, st, f.body.result.unwrap(), "is returned")
+        written_out(a, scope, st, f.body.result.unwrap())
+end check_one_self_alias
+
+private note_ref(st: &SelfAlias, s: TStmt)
+    s match
+        TRefDecl(n, _, place) -> st.refs.push((n, place))
+        _ -> ()
+end note_ref
+
+private bind_confined(st: &SelfAlias, s: TStmt)
+    s match
+        TVarDecl(n, _, init, _) -> bind_one(st, n, init)
+
+        // A `ref` into the receiver carries the receiver's storage under a new name, so the name has
+        // to be tracked as one that does -- otherwise `&r` would be the leak this pass exists to
+        // catch, written one line longer and unseen.
+        TRefDecl(n, _, place) -> bind_one(st, n, place)
+        TExprStmt(e) ->
+            *e.kind match
+                TStore(place, value, _) ->
+                    *place.kind match
+                        TLoad(n, _) -> bind_one(st, n, value)
+                        _ -> ()
+                _ -> ()
+        TMultiAssign(writes) ->
+            for i in 0..<writes.len()
+                val w = writes.at(i)
+
+                *w.place.kind match
+                    TLoad(n, _) -> bind_one(st, n, w.value)
+                    _ -> ()
+        _ -> ()
+end bind_confined
+
+private bind_one(st: &SelfAlias, name: string, value: TExpr)
+    if st.holds(name) || !carries(st, value) then return
+
+    st.confined.push(name)
+    st.changed = true
+end bind_one
+
+// Whether a value carries a pointer into the receiver's inline storage -- directly, or inside
+// something built around one. A struct made of it, a branch that yields it and a box holding it are
+// all the same pointer with a wrapper on.
+private carries(st: &SelfAlias, e: TExpr) -> bool = *e.kind match
+    TLoad(n, _) -> st.holds(n)
+    TAddrOf(place, _) -> own_storage(st, place)
+
+    // The slot a `&value` makes is this frame's and is not the receiver's -- but what was written
+    // into it may still be a pointer into the receiver, so the question is asked of the value.
+    TTempAddr(v, _) -> carries(st, v)
+    TStructNew(_, args) -> any_carries(st, args)
+    TEnumNew(_, _, args) -> any_carries(st, args)
+    TArrayLit(elems, _) -> any_carries(st, elems)
+    TArrayFill(v, _) -> carries(st, v)
+    TBufLit(elems, _) -> any_carries(st, elems)
+    TBufFill(v, _, _) -> carries(st, v)
+    TBox(v, _) -> carries(st, v)
+    TCast(v, _) -> carries(st, v)
+    TStore(_, v, _) -> carries(st, v)
+    TRecheck(after, _, _, _) -> carries(st, after)
+    TSeq(exprs) -> !exprs.is_empty() && carries(st, exprs.at(exprs.len() - 1))
+    TIf(_, then_block, else_block, _) ->
+        block_carries(st, then_block) || opt_block_carries(st, else_block)
+    TBlockExpr(b) -> block_carries(st, b)
+    TMatch(_, arms, _) ->
+        var any = false
+
+        for i in 0..<arms.len()
+            if block_carries(st, arms.at(i).body) then any = true
+
+        any
+
+    // A loop's value comes from its `break`s and its `else`, so a pointer carried out of the loop is
+    // carried out of whatever the loop's value is used for.
+    TWhile(_, body, else_block, _) -> loop_carries(st, body, else_block)
+    TDoWhile(body, _, else_block, _) -> loop_carries(st, body, else_block)
+    TLoop(body, _) -> loop_carries(st, body, None)
+    TFor(_, _, _, _, _, body, else_block, _) -> loop_carries(st, body, else_block)
+    TForEach(_, _, _, body, else_block, _) -> loop_carries(st, body, else_block)
+    TIterate(_, _, _, _, _, body, else_block, _) -> loop_carries(st, body, else_block)
+    TCFor(_, _, _, body, else_block, _) -> loop_carries(st, body, else_block)
+    _ -> false
+
+private any_carries(st: &SelfAlias, es: Buf[TExpr]) -> bool
+    for i in 0..<es.len()
+        if carries(st, es.at(i)) then return true
+
+    false
+end any_carries
+
+private block_carries(st: &SelfAlias, b: TBlock) -> bool =
+    b.result.is_some() && carries(st, b.result.unwrap())
+
+private opt_block_carries(st: &SelfAlias, b: Option[TBlock]) -> bool =
+    b.is_some() && block_carries(st, b.unwrap())
+
+private loop_carries(st: &SelfAlias, body: Buf[TStmt], else_block: Option[TBlock]) -> bool
+    val values = own_break_values(body)
+
+    for i in 0..<values.len()
+        if carries(st, values.at(i)) then return true
+
+    opt_block_carries(st, else_block)
+end loop_carries
+
+// The values this loop's OWN breaks carry, which is what the loop yields: a break inside a nested
+// loop leaves that one instead.
+private own_break_values(stmts: Buf[TStmt]) -> Buf[TExpr]
+    var out: Buf[TExpr] = buf()
+
+    for i in 0..<stmts.len()
+        stmts.at(i) match
+            TBreak(v, _) -> if v.is_some() then out.push(v.unwrap())
+            TExprStmt(e) -> push_all(&out, own_breaks_in(e))
+            TVarDecl(_, _, e, _) -> push_all(&out, own_breaks_in(e))
+            TRefDecl(_, _, e) -> push_all(&out, own_breaks_in(e))
+            TReturn(v) -> if v.is_some() then push_all(&out, own_breaks_in(v.unwrap()))
+            TMultiAssign(writes) ->
+                for j in 0..<writes.len()
+                    push_all(&out, own_breaks_in(writes.at(j).place))
+                    push_all(&out, own_breaks_in(writes.at(j).value))
+            _ -> ()
+
+    out
+end own_break_values
+
+private own_breaks_in(e: TExpr) -> Buf[TExpr] = *e.kind match
+    TWhile(_, _, _, _) -> buf()
+    TDoWhile(_, _, _, _) -> buf()
+    TLoop(_, _) -> buf()
+    TFor(_, _, _, _, _, _, _, _) -> buf()
+    TForEach(_, _, _, _, _, _) -> buf()
+    TCFor(_, _, _, _, _, _) -> buf()
+    TIterate(_, _, _, _, _, _, _, _) -> buf()
+    TIf(_, then_block, else_block, _) ->
+        var out = own_break_values(then_block.stmts)
+
+        if else_block.is_some() then push_all(&out, own_break_values(else_block.unwrap().stmts))
+
+        out
+    TMatch(_, arms, _) ->
+        var out: Buf[TExpr] = buf()
+
+        for i in 0..<arms.len()
+            push_all(&out, own_break_values(arms.at(i).body.stmts))
+
+        out
+    _ -> buf()
+
+private push_all(out: *Buf[TExpr], more: Buf[TExpr])
+    for i in 0..<more.len()
+        out.push(more.at(i))
+end push_all
+
+// Whether a place IS the receiver's inline storage: a chain of field and element steps from `*self`,
+// with nothing on the way that points elsewhere.
+private own_storage(st: &SelfAlias, p: TExpr) -> bool = *p.kind match
+    TDeref(ptr, _) -> carries(st, ptr)
+    TField(r, _, _) -> steps_into(st, r)
+    TIndex(r, _, _) -> steps_into(st, r)
+    TLoad(n, _) ->
+        val place = st.ref_place(n)
+
+        place.is_some() && own_storage(st, place.unwrap())
+    _ -> false
+
+// Whether stepping *through* this receiver stays in the same object. A reference, a view or a weak
+// reference is where the receiver's own storage ends and somebody else's begins.
+private steps_into(st: &SelfAlias, r: TExpr) -> bool = texpr_type(r) match
+    Slice(_, _) -> false
+    Str -> false
+    Ref(_, _) -> false
+    Weak(_) -> false
+    Ptr(_) -> false
+    _ -> own_storage(st, r)
+
+// -- what got out ----------------------------------------------------------------------------------
+
+private escaped_in(a: &Analysis, scope: Scope, st: &SelfAlias, s: TStmt)
+    s match
+        TReturn(v) ->
+            if v.is_some()
+                got_out(a, scope, st, v.unwrap(), "is returned")
+                written_out(a, scope, st, v.unwrap())
+        TExprStmt(e) -> written_out(a, scope, st, e)
+        TVarDecl(_, _, e, _) -> written_out(a, scope, st, e)
+        TRefDecl(_, _, e) -> written_out(a, scope, st, e)
+        TBreak(v, _) -> if v.is_some() then written_out(a, scope, st, v.unwrap())
+        TMultiAssign(writes) ->
+            for i in 0..<writes.len()
+                val w = writes.at(i)
+
+                written_out(a, scope, st, w.value)
+
+                *w.place.kind match
+                    TLoad(_, _) -> ()
+                    _ -> got_out(a, scope, st, w.value,
+                                 "is stored somewhere the call does not own")
+        _ -> ()
+end escaped_in
+
+// A store into anything but a plain local of this body, wherever it is written -- and a box, which
+// puts what it holds on the heap.
+private written_out(a: &Analysis, scope: Scope, st: &SelfAlias, e: TExpr)
+    walk_texpr(e, expr_walk(false, n -> written_one(a, scope, st, n)))
+end written_out
+
+private written_one(a: &Analysis, scope: Scope, st: &SelfAlias, e: TExpr)
+    *e.kind match
+        TStore(place, v, _) ->
+            *place.kind match
+                TLoad(_, _) -> ()
+                _ -> got_out(a, scope, st, v, "is stored somewhere the call does not own")
+        TBox(v, _) -> got_out(a, scope, st, v, "is put on the heap")
+        _ -> ()
+end written_one
+
+private got_out(a: &Analysis, scope: Scope, st: &SelfAlias, at: TExpr, how: string)
+    if !carries(st, at) then return
+
+    a.fault(scope, at.span, "a '*self' method may not let a pointer into the receiver's own " +
+            s"storage outlive the call, and this one $how — the receiver may be a field of a " +
+            "struct whose invariant reads it, and a pointer that gets out is somewhere to write " +
+            "that names no such struct. Hand back a copy of the value, or an index into it, and " +
+            "let the caller reach the storage through the receiver it already has")
+end got_out

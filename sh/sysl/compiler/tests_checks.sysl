@@ -632,3 +632,50 @@ giving_up_os_gives_up_posix()
 a_module_that_gave_nothing_up()
     assert_eq(how_many("module mm\n\n@needs(os)\nprivate opens() -> int = 1\n\n" +
                        "go()\n    val n = opens()\n"), 0)
+
+// -- a pointer into the receiver's own storage -----------------------------------------------------
+
+private a_covered_struct() -> string =
+    "struct Outer\n    inner: Inner\n    invariant inner.n >= 0\n"
+
+private got_out_because(how: string) -> string =
+    s"a '*self' method may not let a pointer into the receiver's own storage outlive the call, and " +
+    s"this one $how — the receiver may be a field of a struct whose invariant reads it, and a " +
+    "pointer that gets out is somewhere to write that names no such struct. Hand back a copy of " +
+    "the value, or an index into it, and let the caller reach the storage through the receiver it " +
+    "already has"
+
+@test("a '*self' method of a struct inside one that states an invariant may not hand its storage out")
+a_pointer_into_the_receiver_returned()
+    assert_eq(said("struct Inner\n    n: int\n\n    leak(*self) -> *int = &self.n\n\n" +
+                   a_covered_struct()),
+              got_out_because("is returned"))
+
+@test("and a 'ref' is a second name for the same storage, so taking its address is the same leak")
+a_pointer_into_the_receiver_through_a_ref()
+    assert_eq(said("struct Inner\n    n: int\n\n    hide(*self) -> *int\n        ref r = self.n\n\n" +
+                   "        &r\n\n" + a_covered_struct()),
+              got_out_because("is returned"))
+
+@test("a local passed the pointer along carries it, which is why the tracking is a fixpoint")
+a_pointer_passed_along_locals()
+    assert_eq(said("struct Inner\n    n: int\n\n    chain(*self) -> *int\n" +
+                   "        val p = &self.n\n        val q = p\n\n        q\n\n" + a_covered_struct()),
+              got_out_because("is returned"))
+
+@test("storing it somewhere the call does not own is the same escape, said its own way")
+a_pointer_stored_outside_the_call()
+    val out = stmt_diagnostics("struct Sink\n    p: *int\n\nstruct Inner\n    n: int\n\n" +
+                               "    put(*self, s: *Sink)\n        s.p = &self.n\n\n" +
+                               a_covered_struct())
+
+    assert(says(out, got_out_because("is stored somewhere the call does not own")), listed_of(out))
+
+@test("handing back a copy of the value is what the rule asks for, so it says nothing")
+a_value_handed_back_by_copy()
+    assert_eq(how_many("struct Inner\n    n: int\n\n    fine(*self) -> int = self.n\n\n" +
+                       a_covered_struct()), 0)
+
+@test("and a struct nothing places inside one with an invariant is not held to the rule at all")
+a_struct_no_invariant_covers()
+    assert_eq(how_many("struct Inner\n    n: int\n\n    leak(*self) -> *int = &self.n\n"), 0)
