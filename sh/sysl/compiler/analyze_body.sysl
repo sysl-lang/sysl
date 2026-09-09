@@ -307,6 +307,9 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl)
     val trial = a.sandboxed()
     val queued = a.tables.members.pending.len()
     val tables = a.tables.members.vtables.len()
+    val structs = a.tables.struct_insts.len()
+    val enums = a.tables.enum_insts.len()
+    val constrained = a.tables.constrained_insts.len()
     val outer = a.tables.members.selves.get(d.name).unwrap_or(buf())
     var subst = joined_bindings(outer, abstract_subst(a, scope, d.tparams, d.bounds, d.tvalues,
                                                       d.tpacks, outer))
@@ -342,7 +345,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl)
 
     a.release(trial)
     a.restore_complaints(mark)
-    rewind_instantiations(a, queued, tables)
+    rewind_instantiations(a, queued, tables, structs, enums, constrained)
 end check_abstract_body
 
 // The instantiations this reading asked for, taken back out.
@@ -353,7 +356,8 @@ end check_abstract_body
 // already there, asks for nothing, and the program ends up calling a body no pass analyzed. It cost
 // `Buf[string]`, `Buf[sh.sysl.parsing.Span]` and everything each of those reaches, all of them
 // first asked for from inside a generic body being read at its own definition.
-rewind_instantiations(a: &Analysis, queued: usize, tables: usize)
+rewind_instantiations(a: &Analysis, queued: usize, tables: usize, structs: usize = 0,
+                      enums: usize = 0, constrained: usize = 0)
     val pending = a.tables.members.pending
 
     for i in queued..<pending.len()
@@ -371,6 +375,12 @@ rewind_instantiations(a: &Analysis, queued: usize, tables: usize)
 
     for i in 0..<made.len()
         a.tables.members.vtables.remove(made.at(i))
+
+    // And the records a reading made real, on the same terms: a type is one a program lays out
+    // because something in it asked for one, and a reading nobody kept asked for nothing.
+    if structs > 0 then rewind_registered(a.tables.struct_insts, structs)
+    if enums > 0 then rewind_registered(a.tables.enum_insts, enums)
+    if constrained > 0 then rewind_registered(a.tables.constrained_insts, constrained)
 end rewind_instantiations
 
 // One function whose signature the tables already hold, under the name they hold it by: a member

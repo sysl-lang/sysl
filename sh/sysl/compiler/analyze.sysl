@@ -59,17 +59,20 @@ read_decls(a: &Analysis, written: Buf[Program]) -> Buf[Program]
     // stands for exists and that following it terminates.
     resolve_named_subtypes(a)
 
-    // Then the members: every type's own, and the ones an `impl` block gives it. It runs before the
-    // signatures because a signature may name an associated type, which is an `impl`'s to supply, and
-    // it runs after the eager instantiation because a member's `Self` is that instantiation.
-    hoist_all_members(a, units)
+    // **How far each declaration reaches is settled BEFORE the members are hoisted**, and so is
+    // every signature: what a signature mentions is made real while it is read, and the record a
+    // compilation keeps of what it laid out is in the order things were made real. Reading the
+    // signatures after the members would put every type a member's own signature mentions ahead of
+    // the ones the declarations wrote, which is not the order anything else in the compilation
+    // agrees with.
+    check_exposed_types(a)
 
     // Then every signature, which is what makes a mistake in one a mistake at the declaration.
     resolve_signatures(a)
 
-    // How far each declaration reaches is settled last, since the question is about two of them at
-    // a time.
-    check_exposed_types(a)
+    // Then the members: every type's own, and the ones an `impl` block gives it. It runs after the
+    // eager instantiation because a member's `Self` is that instantiation.
+    hoist_all_members(a, units)
     units
 end read_decls
 
@@ -109,6 +112,16 @@ private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
 
         if !declares(a, key) then
             a.fault(scope, s.span, s"'$path' declares no '${s.name}' — there is no '$path.${s.name}'")
+
+// The entries a table took on since a mark, taken back out.
+rewind_registered(into: &Table[Type], mark: usize)
+    var made: Buf[string] = buf()
+
+    for i in mark..<into.len()
+        made.push(into.key_at(i))
+
+    for i in 0..<made.len()
+        into.remove(made.at(i))
 
 // Whether a dotted path names one declaration of a module rather than a module.
 private names_a_declaration(a: &Analysis, path: string) -> bool
@@ -260,8 +273,26 @@ private resolve_signatures(a: &Analysis)
         val f = a.tables.funcs.at(i)
 
         check_bound_names(a, f.scope, f.decl.name, f.decl.bounds)
+
+        // **A GENERIC SIGNATURE IS READ AT STAND-INS, AND WHAT THAT READING BUILDS IS NOT A TYPE THE
+        // PROGRAM HAS.** `spawn[T](…) -> Option[Thread]` names an `Option[Thread]` at every
+        // instantiation and at none of them: the declaration is a shape, and the types a program
+        // actually lays out are the ones its calls ask for. So the complaints are kept and the
+        // registrations are taken back.
+        val generic = !f.decl.tparams.is_empty()
+        val trial = if generic then a.sandboxed() else 0
+        val structs = a.tables.struct_insts.len()
+        val enums = a.tables.enum_insts.len()
+        val constrained = a.tables.constrained_insts.len()
+
         resolve_func_signature(a, f.scope, f.decl.tparams, f.decl.bounds, f.decl.tvalues,
                                f.decl.tpacks, f.decl.params, f.decl.ret_type)
+
+        if generic
+            a.release(trial)
+            rewind_registered(a.tables.struct_insts, structs)
+            rewind_registered(a.tables.enum_insts, enums)
+            rewind_registered(a.tables.constrained_insts, constrained)
 
     for i in 0..<a.tables.externs.len()
         val key = a.tables.externs.key_at(i)
