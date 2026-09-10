@@ -373,7 +373,72 @@ value_type(cx: &Analyzer, d: ValueDecl) -> Type =
     if d.typ.is_none() then Unknown
     else resolve_type(cx.an, d.scope, d.typ.unwrap(), no_bindings())
 
+// A use of a constant, with the loop a constant written in terms of itself would make cut.
+//
+// **The cycle is reported at the DECLARATION and named in the order the walk followed it**, which is
+// the same account a cycle between modules gets.
 private const_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
+    if const_cycle_at(cx, key) then return bad_expr(span)
+
+    cx.an.consts_in_progress.push(key)
+
+    val out = const_value_expr(cx, span, key)
+
+    cx.an.consts_in_progress.truncate(cx.an.consts_in_progress.len() - 1)
+    out
+end const_expr
+
+// Whether a constant is already being folded.
+//
+// **Every constant in the loop is told, at its own declaration and in its own terms**, because every
+// one of them is defined in terms of itself: the loop is the same run of names read from a different
+// starting place, and a reader looking at any of the declarations is owed the account from there.
+const_cycle_at(cx: &Analyzer, key: string) -> bool
+    if !holds_string(cx.an.consts_in_progress, key) then return false
+
+    val round = const_loop(cx.an, key)
+
+    for i in 0..<round.len()
+        val d = cx.an.tables.consts.get(round.at(i))
+
+        if d.is_some() then
+            cx.an.fault(d.unwrap().scope, d.unwrap().span,
+                        s"constant '${module_show(round.at(i))}' is defined in terms of itself: " +
+                        loop_from(round, i))
+
+    true
+end const_cycle_at
+
+// The constants the loop is made of, in the order the walk followed them.
+private const_loop(a: &Analysis, key: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var seen = false
+
+    for i in 0..<a.consts_in_progress.len()
+        val at = a.consts_in_progress.at(i)
+
+        if at == key then seen = true
+
+        if seen then out.push(at)
+
+    out
+end const_loop
+
+// The same loop read from one of its own names, round to itself.
+private loop_from(round: Buf[string], start: usize) -> string
+    var out = ""
+
+    for i in 0..<round.len()
+        val at = round.at((start + i) % round.len())
+
+        if out != "" then out = out + " \u{2192} "
+
+        out = out + module_show(at)
+
+    s"$out \u{2192} ${module_show(round.at(start))}"
+end loop_from
+
+private const_value_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
     val d = a_consts(cx).get(key).unwrap()
     val ty = value_type(cx, d)
 
@@ -397,7 +462,7 @@ private const_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
     val folded = type_expr(inner, d.init.unwrap(), Some(ty))
 
     TExpr(span, *folded.kind)
-end const_expr
+end const_value_expr
 
 // A settled value as the literal a use of the name reads, where there is a literal form for it.
 private const_literal(span: Span, v: Const, ty: Type) -> Option[TExpr] = v match
