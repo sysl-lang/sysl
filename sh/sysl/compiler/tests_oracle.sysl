@@ -861,6 +861,19 @@ struct TypeAgreement
     skipped_absent: usize
     skipped_unresolved: usize
     first_bad: string
+
+    // The **function-level** half of the same comparison, which is what makes a partial lowering
+    // provable. A function this compiler has not built is absent from its text rather than wrong, so
+    // a symbol in both texts whose bodies differ is a defect and a symbol in the reference's alone is
+    // a count to drive down.
+    fn_matched: usize
+    fn_mismatched: usize
+    fn_absent: usize
+    first_bad_fn: string
+
+    // Why the bodies that are absent are absent, most often first. It is the census a next stage
+    // works down, and it is read out of the lowering itself rather than guessed at from the symbol.
+    reasons: Buf[(string, usize)]
 end TypeAgreement
 
 // The reference compiler's LLVM text for one program, and whether it was willing to lower it.
@@ -918,7 +931,99 @@ private compare_types(binary: string, path: string, label: string, found: *TypeA
 
                 if found.mismatched <= 8
                     found.first_bad = s"${found.first_bad}\n$label: ${where.unwrap()}"
+
+            compare_funcs(theirs.text, mine.text, mine.gaps, label, found)
 end compare_types
+
+// The functions of two texts, matched by symbol.
+//
+// **The comparison is over the symbols both texts define**, which is the whole of what makes it
+// possible before either compiler lowers everything: a body this one does not build contributes
+// nothing to either side of the diff, and is counted instead. The reference's runtime helpers are
+// counted with them -- they are hand-written LLVM templates rather than lowered bodies, so they
+// arrive with the ownership runtime rather than with a function.
+private compare_funcs(theirs: string, mine: string, gaps: Buf[(string, string)], label: string,
+                      found: *TypeAgreement)
+    val ours = func_texts(mine)
+    val wanted = func_texts(theirs)
+
+    for i in 0..<wanted.len()
+        val name = wanted.at(i).0
+
+        text_for(ours, name) match
+            None ->
+                found.fn_absent += 1
+                tally(&found.reasons, reason_for(gaps, name))
+            Some(body) ->
+                if body == wanted.at(i).1 then found.fn_matched += 1
+                else
+                    found.fn_mismatched += 1
+
+                    if found.fn_mismatched <= 4
+                        found.first_bad_fn = s"${found.first_bad_fn}\n$label: '@$name' differs" +
+                            s"${first_body_difference(wanted.at(i).1, body)}"
+end compare_funcs
+
+// Why one symbol is absent, as the lowering recorded it. A symbol nothing recorded a gap for is one
+// the reference's own text has and this compilation never had a declaration of -- a runtime helper,
+// or a function the reference emitted and this program pruned.
+private reason_for(gaps: Buf[(string, string)], symbol: string) -> string
+    for i in 0..<gaps.len()
+        if llvm_safe(gaps.at(i).0) == symbol then return gaps.at(i).1
+
+    "no body of this compilation's own"
+end reason_for
+
+private tally(counts: *Buf[(string, usize)], what: string)
+    for i in 0..<counts.len()
+        if counts.at(i).0 == what
+            counts.set(i, (what, counts.at(i).1 + 1))
+            return
+
+    counts.push((what, 1))
+end tally
+
+// The census, most often first and at most eight lines of it.
+private census(counts: Buf[(string, usize)]) -> string
+    var rest = counts
+    var out = str_builder()
+
+    for k in 0..<8
+        var best: usize = 0
+        var seen = false
+
+        for i in 0..<rest.len()
+            if rest.at(i).1 > 0 && (!seen || rest.at(i).1 > rest.at(best).1)
+                best = i
+                seen = true
+
+        if !seen then return out.finish()
+
+        out.push(s"\n  ${rest.at(best).1} x ${rest.at(best).0}")
+        rest.set(best, (rest.at(best).0, 0))
+
+    out.finish()
+end census
+
+private text_for(items: Buf[(string, string)], name: string) -> Option[string]
+    for i in 0..<items.len()
+        if items.at(i).0 == name then return Some(items.at(i).1)
+
+    None
+end text_for
+
+// The first line of two bodies that disagrees, which is what a report of a mismatch is worth.
+private first_body_difference(theirs: string, ours: string) -> string
+    val a = lines_of(theirs)
+    val b = lines_of(ours)
+    val n = if a.len() < b.len() then a.len() else b.len()
+
+    for i in 0..<n
+        if a.at(i) != b.at(i)
+            return s" at line ${i + 1}: theirs '${a.at(i)}', ours '${b.at(i)}'"
+
+    s" after ${n} lines: ${a.len()} lines theirs, ${b.len()} ours"
+end first_body_difference
 
 // Where two lists of lines first disagree, or nothing where they do not.
 private first_difference(want: Buf[string], got: Buf[string]) -> Option[string]
@@ -942,7 +1047,7 @@ end first_difference
 private declares_a_type(block: string) -> bool =
     block.index_of("struct ").is_some() || block.index_of("enum ").is_some()
 
-@test("the two compilers define the same LLVM types for every program that declares one")
+@test("the two compilers emit the same LLVM types and the same bodies for the ones both lower")
 the_emitted_types_agree()
     oracle() match
         None ->
@@ -964,7 +1069,8 @@ the_emitted_types_agree()
             val dir = make_temp_dir("sysl-types").unwrap()
             val scratch = dir + "/block.sysl"
 
-            var found = TypeAgreement(0, 0, 0, 0, 0, "")
+            var reasons: Buf[(string, usize)] = buf()
+            var found = TypeAgreement(0, 0, 0, 0, 0, "", 0, 0, 0, "", reasons)
 
             for item in walk(root)
                 item match
@@ -989,8 +1095,16 @@ the_emitted_types_agree()
                 s"${found.skipped_absent} the reference refused, " +
                 s"${found.skipped_unresolved} this compiler could not finish"
 
+            val fn_summary = s"emitted functions: ${found.fn_matched} matched, " +
+                s"${found.fn_mismatched} mismatched, ${found.fn_absent} not lowered yet"
+
             print(summary)
+            print(fn_summary)
             record_summary(s"$summary${found.first_bad}")
+            record_summary(s"$fn_summary${found.first_bad_fn}${census(found.reasons)}")
+            print(census(found.reasons))
             assert(found.compared > 0, "the sweep compared something")
             assert(found.mismatched == 0, s"$summary${found.first_bad}")
+            assert(found.fn_matched > 0, "the sweep compared a function")
+            assert(found.fn_mismatched == 0, s"$fn_summary${found.first_bad_fn}")
 end the_emitted_types_agree

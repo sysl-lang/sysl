@@ -165,7 +165,7 @@ emit_typed_text(path: string, named_target: Option[string],
 
     val program = compilation_of(path, t)?
 
-    if tables then Ok(Emitted(tables_text(program), buf())) else Ok(typed_text(program))
+    if tables then Ok(Emitted(tables_text(program), buf(), buf())) else Ok(typed_text(program))
 end emit_typed_text
 
 // `sysl emit-llvm [--target <name>] <path>` -- one program's LLVM text.
@@ -179,7 +179,9 @@ emit_llvm_text(path: string, named_target: Option[string]) -> Result[Emitted, Re
     val program = compilation_of(path, t)?
     val done = analyze_bodies(program.units, program.target)
 
-    Ok(Emitted(codegen_text(program_of(done, done.main_module), t), errors_of(done.reported)))
+    val lowered = codegen_with_gaps(program_of(done, done.main_module), t)
+
+    Ok(Emitted(ir_print_module(lowered.0), errors_of(done.reported), lowered.1))
 end emit_llvm_text
 
 // The machine a command line asked for: the one it named, the manifest's default, or this host --
@@ -209,6 +211,12 @@ end target_for
 struct Emitted
     text: string
     report: Buf[Placed]
+
+    // The bodies the lowering left out, each as its key and the form it reached. It is empty for
+    // every command but `emit-llvm`, and there only while some form is still unbuilt -- what a
+    // partial lowering owes is a census of what it did not say, so that the differential proof can
+    // tell an absence from a wrong answer.
+    gaps: Buf[(string, string)]
 end Emitted
 
 // What the reader has to act on when a floor refuses a build: a package's name and version, or the
@@ -227,7 +235,7 @@ private who_of(m: Manifest, path: string) -> string =
 private typed_text(c: Compilation) -> Emitted
     val done = analyze_bodies(c.units, c.target)
 
-    Emitted(show_typed_program(program_of(done, done.main_module)), errors_of(done.reported))
+    Emitted(show_typed_program(program_of(done, done.main_module)), errors_of(done.reported), buf())
 end typed_text
 
 // Whether a body is one a program **emits**, which is the question a printed tree answers.
