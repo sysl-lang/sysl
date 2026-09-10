@@ -4,6 +4,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.text.Search
+import sysl.text.str_builder
 
 // What a source means **as a program**, with the standard module beside it.
 //
@@ -1099,3 +1100,107 @@ a_construction_with_no_invariant()
     val out = shown(text, "m$hold")
 
     assert(!out.contains("TStructInvCheck"), out)
+
+// -- where a program starts ------------------------------------------------------------------------
+
+// Two files analyzed as one program, which is what a question about *which* file starts it needs.
+private two_files(first: string, second: string) -> Buf[string]
+    var units: Buf[Program] = buf()
+    val library = library_trees()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    val a = parse(source_of("one.sysl", first))
+    val b = parse(source_of("two.sysl", second))
+
+    if !a.ok() || !b.ok()
+        var bad: Buf[string] = buf()
+
+        bad.push("the source did not parse")
+        return bad
+
+    units.push(a.program)
+    units.push(b.program)
+
+    val done = analyze_bodies(units, host_target())
+    var out: Buf[string] = buf()
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/") then
+            out.push(done.reported.at(i).diag.message)
+
+    out
+end two_files
+
+// The statements a program starts with, as the printed program shows them.
+private started_with(text: string) -> string
+    val p = program_of_text(text)
+    var out = str_builder()
+
+    show_typed_stmt_list(&out, "  ", "main", p.main)
+    out.finish()
+end started_with
+
+@test("the file carrying the statements a program runs is the one it starts in")
+the_entry_file_carries_the_statements()
+    if no_library() then return
+
+    val out = started_with("val greeting = \"hi\"\n\nprint(greeting)\n")
+
+    assert(out.contains("TVarDecl"), out)
+    assert(out.contains("greeting"), out)
+
+@test("and a file of pure declarations is not, however much it declares")
+declarations_alone_are_not_a_beginning()
+    if no_library() then return
+
+    val said = two_files("const Size: int = 4\n\nhelp() -> int = Size\n", "print(help())\n")
+
+    assert(said.is_empty(), listed(said))
+
+@test("a program starts in one place, so a second file carrying statements is told to hold none")
+two_files_carrying_statements()
+    if no_library() then return
+
+    val said = two_files("print(1)\n", "print(2)\n")
+
+    assert(says(said, "one.sysl already carries the statements this program runs, so two.sysl may " +
+                "hold declarations only"), listed(said))
+
+@test("and a 'main' beside those statements is the same mistake written the other way")
+statements_beside_a_declared_main()
+    if no_library() then return
+
+    val said = complaints("print(1)\n\nmain() = print(2)\n")
+
+    assert(says(said, "a program starts in one place, and this 'main' is a second — whichever of " +
+                "the two the program means, the other belongs inside it. The statements this " +
+                "program starts with are in test.sysl"), listed(said))
+
+@test("a top-level 'var' in a file that names a module is that module's storage")
+a_var_in_a_module_file()
+    if no_library() then return
+
+    val said = two_files("module m\n\nvar counter: int = 0\n\npeek() -> int = counter\n",
+                         "import m.*\n\nprint(peek())\n")
+
+    assert(said.is_empty(), listed(said))
+
+@test("'static' says a declaration is the module's, and says nothing in a file with no body")
+static_outside_the_entry_file()
+    if no_library() then return
+
+    val said = two_files("module m\n\nstatic var counter: int = 0\n", "import m.*\n\nprint(1)\n")
+
+    assert(says(said, "'static' says a declaration belongs to the module rather than to the body " +
+                "of the file the program starts in — and this file has no such body, so " +
+                "everything it declares is the module's already"), listed(said))
+
+@test("while in the file the program starts in it is what opts a binding back into the module")
+static_in_the_entry_file()
+    if no_library() then return
+
+    val said = complaints("static var counter: int = 0\n\nprint(counter)\n")
+
+    assert(said.is_empty(), listed(said))

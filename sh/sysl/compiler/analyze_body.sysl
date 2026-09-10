@@ -40,6 +40,10 @@ struct TypedBodies
     // reached: an entry wants a library conversion, and marking one as reached after the fixpoint
     // would name a function nothing analyzed.
     entry: Option[TEntry]
+
+    // The statements the program starts with, and the module whose terms they were written in.
+    main: Buf[TStmt]
+    main_module: string
 end TypedBodies
 
 // Reads a compilation's declarations and types every body it can.
@@ -83,9 +87,15 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
         val unit = units.at(i)
         val scope = scope_of_unit(unit)
         val library = from_library(scope)
+        val is_entry = a.tables.entry_src != "" && unit.src.name == a.tables.entry_src
 
         for j in 0..<unit.body.len()
             val s = unit.body.at(j)
+
+            // The entry file's own statements are the body the program starts in, and are typed
+            // below rather than here -- including the functions of that body, which are nested
+            // functions of it and are lowered where they stand.
+            if is_entry && !belongs_to_module(s, a.tables.entry_captures) then continue
 
             *s.kind match
                 // **A generic declaration is not a function**, so there is no body to type here:
@@ -137,6 +147,10 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
 
         if from_library(home) then held.push(HeldBody(m.name, home, span_zero(), m, Some(m)))
         else funcs.push(analyze_instance(a, m.name, m))
+
+    // The statements the program starts with, typed after every declaration's body and before the
+    // queue is drained: what they reach is reached by the program.
+    val started = entry_body(a, units)
 
     // The entry point, before the queue is drained, since what it reaches has to be analyzed with
     // everything else a program reaches.
@@ -192,8 +206,40 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
     // per body because every one of these questions is about the whole compilation.
     whole_program_checks(a, funcs, ordered_vals(storage))
 
-    TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, ordered_vals(storage), a, units, entry)
+    TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, ordered_vals(storage), a, units,
+                entry, started.0, started.1)
 end analyze_bodies
+
+// The statements the file the program starts in carries, typed in that file's own terms.
+//
+// **The entry file is a body**, so this is everything in it that is not a module member -- its
+// statements, and also the `val`s and the functions that read what it binds, which belong to that
+// body rather than to the module. They arrive in **source order**, which is what makes a `val` there
+// an ordinary local: it is initialized where it is written, rather than before every statement in
+// the file the way a module member's is.
+private entry_body(a: &Analysis, units: Buf[Program]) -> (Buf[TStmt], string)
+    if a.tables.entry_src == "" then return (buf(), ModuleRoot)
+
+    for i in 0..<units.len()
+        val unit = units.at(i)
+
+        if unit.src.name != a.tables.entry_src then continue
+
+        val scope = scope_of_unit(unit)
+        val cx = analyzer_for(a, scope)
+        val written = entry_statements(unit, a.tables.entry_captures)
+        var out: Buf[TStmt] = buf()
+
+        cx.enter()
+
+        for j in 0..<written.len()
+            push_all(&out, recover_stmt(cx, written.at(j)))
+
+        cx.leave()
+        return (out, scope.module_name)
+
+    (buf(), ModuleRoot)
+end entry_body
 
 // The body of a function a declaration lowered a condition to, typed where the declaration stands.
 //
@@ -791,7 +837,8 @@ private typed_of(text: string) -> TypedBodies
         for i in 0..<parsed.report.len()
             said.push(Placed(src, parsed.report.at(i)))
 
-        return TypedBodies(buf(), said, 0, 0, 0, buf(), analysis_for(host_target()), buf(), None)
+        return TypedBodies(buf(), said, 0, 0, 0, buf(), analysis_for(host_target()), buf(), None,
+                           buf(), ModuleRoot)
     end if
 
     var units: Buf[Program] = buf()

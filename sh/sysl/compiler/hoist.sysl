@@ -136,8 +136,14 @@ hoist_units(a: &Analysis, units: Buf[Program])
 
     for i in 0..<units.len()
         val body = units.at(i).body
+        val is_entry = a.tables.entry_src != "" && units.at(i).src.name == a.tables.entry_src
 
         for j in 0..<body.len()
+            // The entry file is a body, so what it declares is that body's unless it has no
+            // run-time identity. Everything else it carries is registered here as any other file's
+            // would be.
+            if is_entry && !belongs_to_module(body.at(j), a.tables.entry_captures) then continue
+
             hoist_stmt(a, scopes.at(i), body.at(j))
 
             // A `where` predicate and a struct's `invariant` clauses are ordinary functions of the
@@ -176,13 +182,11 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         ValDecl(name, typ, value, vis, align, section) ->
             hoist_value(a, scope, s.span, name, typ, vis, a.tables.vals, "'val'", Some(value), align,
                         section)
-        // **A top-level `var` in a file that names a module is that module's storage.** A file with
-        // no header could have been a body instead, and there its `var` is an ordinary local; a
-        // file that names a module has no body for one to belong to, so there is nothing else it
-        // could be.
+        // **A top-level `var` is the module's storage**, wherever it was written. The one file
+        // where it is a local instead is the one the program starts in, and that file's bindings
+        // never reach this walk.
         VarDecl(name, typ, init, vis, align, section) ->
-            if scope.module_name != "" then
-                hoist_storage(a, scope, s.span, name, typ, vis, init, align, section)
+            hoist_storage(a, scope, s.span, name, typ, vis, init, align, section)
         ExternVarDecl(name, typ, _, vis) ->
             hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.extern_vars,
                         "'extern' variable", None)
@@ -191,14 +195,10 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // at the declaration so that everything after it is the generic machinery that exists.
         FuncDecl(d) -> hoist_func(a, scope, s.span, with_call_bounds(d))
         ImplDecl(d) -> a.tables.impls.push(Impl(with_impl_call_bounds(d), s.span, scope))
-        // **`static` says outright what a header would have said**, so a top-level `var` under one
-        // is the module's storage wherever it was written -- including in the file the program
-        // starts in, where an ordinary `var` is a local of that body.
-        StaticDecl(inner) ->
-            *inner.kind match
-                VarDecl(name, typ, init, vis, align, section) ->
-                    hoist_storage(a, scope, inner.span, name, typ, vis, init, align, section)
-                _ -> hoist_stmt(a, scope, inner)
+        // **`static` says outright what a header would have said**, so what is under one is
+        // registered exactly as another file's declaration of it would be -- which is the whole of
+        // what the modifier does, in the one file where an ordinary `var` is a local instead.
+        StaticDecl(inner) -> hoist_stmt(a, scope, inner)
         _ -> ()
 
 // Module storage: a `val` that may be written to, which is what a top-level `var` declares.

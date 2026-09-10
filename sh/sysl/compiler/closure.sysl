@@ -355,60 +355,64 @@ end function_as_callable
 // body did not declare it: a parameter, a local or a loop variable of the body's own shadows the
 // outer name exactly as it would anywhere else, and a name that resolves to a declaration rather
 // than to a local is reached the way any other function reaches it.
-private captures(cx: &Analyzer, body: Buf[Stmt], bound: Buf[string]) -> Buf[string]
+captures_where(keep: &Fn(string) -> bool, body: Buf[Stmt], bound: Buf[string]) -> Buf[string]
     var found: Buf[string] = buf()
 
-    read_block(cx, body, bound, &found)
+    read_block(keep, body, bound, &found)
     found
-end captures
+end captures_where
+
+// The same, for a closure: what counts is a name the enclosing scope has something under.
+private captures(cx: &Analyzer, body: Buf[Stmt], bound: Buf[string]) -> Buf[string] =
+    captures_where(n -> cx.lookup(n).is_some(), body, bound)
 
 // A block is its own scope, so what it declares is gone at its end and nothing after it sees one.
 //
 // A binding is in scope for what comes **after** it, so the shadow starts at the declaration and
 // the initializer is still read outside it -- `var n = n` captures the outer `n`.
-private read_block(cx: &Analyzer, stmts: Buf[Stmt], bound: Buf[string], found: *Buf[string])
+private read_block(keep: &Fn(string) -> bool, stmts: Buf[Stmt], bound: Buf[string], found: *Buf[string])
     var here = copied(bound)
 
     for i in 0..<stmts.len()
-        read_stmt(cx, stmts.at(i), &here, found)
+        read_stmt(keep, stmts.at(i), &here, found)
 end read_block
 
-private read_stmt(cx: &Analyzer, s: Stmt, bound: *Buf[string], found: *Buf[string])
+private read_stmt(keep: &Fn(string) -> bool, s: Stmt, bound: *Buf[string], found: *Buf[string])
     *s.kind match
-        ExprStmt(e) -> read_expr(cx, e, *bound, found)
+        ExprStmt(e) -> read_expr(keep, e, *bound, found)
         VarDecl(name, _, init, _, _, _) ->
-            read_opt(cx, init, *bound, found)
+            read_opt(keep, init, *bound, found)
             bound.push(name)
         ValDecl(name, _, value, _, _, _) ->
-            read_expr(cx, value, *bound, found)
+            read_expr(keep, value, *bound, found)
             bound.push(name)
         ConstDecl(name, _, value, _) ->
-            read_expr(cx, value, *bound, found)
+            read_expr(keep, value, *bound, found)
             bound.push(name)
         RefDecl(name, place) ->
-            read_expr(cx, place, *bound, found)
+            read_expr(keep, place, *bound, found)
             bound.push(name)
         MultiAssign(_, targets, values) ->
-            read_each(cx, targets, *bound, found)
-            read_each(cx, values, *bound, found)
+            read_each(keep, targets, *bound, found)
+            read_each(keep, values, *bound, found)
         MultiDecl(names, _, values) ->
-            read_each(cx, values, *bound, found)
+            read_each(keep, values, *bound, found)
 
             for i in 0..<names.len()
                 bound.push(names.at(i))
         PatternDecl(pat, _, value) ->
-            read_expr(cx, value, *bound, found)
+            read_expr(keep, value, *bound, found)
             pattern_binds_into(pat, bound)
-        Return(value) -> read_opt(cx, value, *bound, found)
-        Become(call) -> read_expr(cx, call, *bound, found)
-        Break(_, value) -> read_opt(cx, value, *bound, found)
-        Defer(inner) -> read_stmt(cx, inner, bound, found)
-        StaticDecl(inner) -> read_stmt(cx, inner, bound, found)
-        Require(cond, _) -> read_expr(cx, cond, *bound, found)
-        Ensure(cond, _) -> read_expr(cx, cond, *bound, found)
-        Invariant(cond, _) -> read_expr(cx, cond, *bound, found)
-        Variant(measure) -> read_expr(cx, measure, *bound, found)
-        AssertDecl(cond, _) -> read_expr(cx, cond, *bound, found)
+        Return(value) -> read_opt(keep, value, *bound, found)
+        Become(call) -> read_expr(keep, call, *bound, found)
+        Break(_, value) -> read_opt(keep, value, *bound, found)
+        Defer(inner) -> read_stmt(keep, inner, bound, found)
+        StaticDecl(inner) -> read_stmt(keep, inner, bound, found)
+        Require(cond, _) -> read_expr(keep, cond, *bound, found)
+        Ensure(cond, _) -> read_expr(keep, cond, *bound, found)
+        Invariant(cond, _) -> read_expr(keep, cond, *bound, found)
+        Variant(measure) -> read_expr(keep, measure, *bound, found)
+        AssertDecl(cond, _) -> read_expr(keep, cond, *bound, found)
         // A function nested in the body is a closure by another spelling, so what it reads from
         // around it is read here too -- and its own parameters shadow, exactly as a closure's do.
         FuncDecl(d) ->
@@ -417,31 +421,31 @@ private read_stmt(cx: &Analyzer, s: Stmt, bound: *Buf[string], found: *Buf[strin
             for i in 0..<d.params.len()
                 inner.push(d.params.at(i).name)
 
-            read_block(cx, d.body, inner, found)
+            read_block(keep, d.body, inner, found)
             bound.push(d.name)
         _ -> ()
 end read_stmt
 
-private read_each(cx: &Analyzer, es: Buf[Expr], bound: Buf[string], found: *Buf[string])
+private read_each(keep: &Fn(string) -> bool, es: Buf[Expr], bound: Buf[string], found: *Buf[string])
     for i in 0..<es.len()
-        read_expr(cx, es.at(i), bound, found)
+        read_expr(keep, es.at(i), bound, found)
 
-private read_opt(cx: &Analyzer, e: Option[Expr], bound: Buf[string], found: *Buf[string])
+private read_opt(keep: &Fn(string) -> bool, e: Option[Expr], bound: Buf[string], found: *Buf[string])
     e match
-        Some(v) -> read_expr(cx, v, bound, found)
+        Some(v) -> read_expr(keep, v, bound, found)
         None -> ()
 
-private read_opt_block(cx: &Analyzer, ss: Option[Buf[Stmt]], bound: Buf[string],
+private read_opt_block(keep: &Fn(string) -> bool, ss: Option[Buf[Stmt]], bound: Buf[string],
                        found: *Buf[string])
     ss match
-        Some(b) -> read_block(cx, b, bound, found)
+        Some(b) -> read_block(keep, b, bound, found)
         None -> ()
 
 // A name is a capture where the body did not bind it and the scope around the closure has one.
-private read_expr(cx: &Analyzer, e: Expr, bound: Buf[string], found: *Buf[string])
+private read_expr(keep: &Fn(string) -> bool, e: Expr, bound: Buf[string], found: *Buf[string])
     *e.kind match
         Ident(n) ->
-            if !names_hold(bound, n) && cx.lookup(n).is_some() && !names_hold(*found, n) then
+            if !names_hold(bound, n) && keep(n) && !names_hold(*found, n) then
                 found.push(n)
         // A closure inside this one captures from further out through this one, so what it reads is
         // read here too -- which is what makes capture reach through a nesting.
@@ -451,57 +455,57 @@ private read_expr(cx: &Analyzer, e: Expr, bound: Buf[string], found: *Buf[string
             for i in 0..<ps.len()
                 inner.push(ps.at(i).name)
 
-            read_block(cx, b, inner, found)
+            read_block(keep, b, inner, found)
         BlockArg(b) ->
             var inner = copied(bound)
 
             inner.push(closure_it())
-            read_block(cx, b, inner, found)
-        Unary(_, operand) -> read_expr(cx, operand, bound, found)
-        PreIncDec(_, operand) -> read_expr(cx, operand, bound, found)
-        PostIncDec(_, operand) -> read_expr(cx, operand, bound, found)
+            read_block(keep, b, inner, found)
+        Unary(_, operand) -> read_expr(keep, operand, bound, found)
+        PreIncDec(_, operand) -> read_expr(keep, operand, bound, found)
+        PostIncDec(_, operand) -> read_expr(keep, operand, bound, found)
         Binary(_, left, right) ->
-            read_expr(cx, left, bound, found)
-            read_expr(cx, right, bound, found)
-        Compare(operands, _) -> read_each(cx, operands, bound, found)
+            read_expr(keep, left, bound, found)
+            read_expr(keep, right, bound, found)
+        Compare(operands, _) -> read_each(keep, operands, bound, found)
         RangeExpr(lo, hi, _) ->
-            read_opt(cx, lo, bound, found)
-            read_opt(cx, hi, bound, found)
+            read_opt(keep, lo, bound, found)
+            read_opt(keep, hi, bound, found)
         Assign(_, target, value) ->
-            read_expr(cx, target, bound, found)
-            read_expr(cx, value, bound, found)
+            read_expr(keep, target, bound, found)
+            read_expr(keep, value, bound, found)
         Call(callee, args) ->
-            read_expr(cx, callee, bound, found)
-            read_each(cx, args, bound, found)
-        NamedArg(_, value) -> read_expr(cx, value, bound, found)
-        Spread(value) -> read_expr(cx, value, bound, found)
-        DefaultArg(_, value) -> read_expr(cx, value, bound, found)
+            read_expr(keep, callee, bound, found)
+            read_each(keep, args, bound, found)
+        NamedArg(_, value) -> read_expr(keep, value, bound, found)
+        Spread(value) -> read_expr(keep, value, bound, found)
+        DefaultArg(_, value) -> read_expr(keep, value, bound, found)
         Index(receiver, index) ->
-            read_expr(cx, receiver, bound, found)
-            read_expr(cx, index, bound, found)
-        Field(receiver, _) -> read_expr(cx, receiver, bound, found)
+            read_expr(keep, receiver, bound, found)
+            read_expr(keep, index, bound, found)
+        Field(receiver, _) -> read_expr(keep, receiver, bound, found)
         TypeArgs(receiver, args) ->
-            read_expr(cx, receiver, bound, found)
-            read_each(cx, args, bound, found)
-        TypeAttr(receiver, _) -> read_expr(cx, receiver, bound, found)
+            read_expr(keep, receiver, bound, found)
+            read_each(keep, args, bound, found)
+        TypeAttr(receiver, _) -> read_expr(keep, receiver, bound, found)
         WithExpr(base, fields) ->
-            read_expr(cx, base, bound, found)
+            read_expr(keep, base, bound, found)
 
             for i in 0..<fields.len()
-                read_expr(cx, fields.at(i).value, bound, found)
-        TryExpr(inner) -> read_expr(cx, inner, bound, found)
-        Tuple(elements) -> read_each(cx, elements, bound, found)
-        ArrayLit(elements) -> read_each(cx, elements, bound, found)
+                read_expr(keep, fields.at(i).value, bound, found)
+        TryExpr(inner) -> read_expr(keep, inner, bound, found)
+        Tuple(elements) -> read_each(keep, elements, bound, found)
+        ArrayLit(elements) -> read_each(keep, elements, bound, found)
         ArrayFill(value, count) ->
-            read_expr(cx, value, bound, found)
-            read_expr(cx, count, bound, found)
-        Block(stmts) -> read_block(cx, stmts, bound, found)
+            read_expr(keep, value, bound, found)
+            read_expr(keep, count, bound, found)
+        Block(stmts) -> read_block(keep, stmts, bound, found)
         IfExpr(cond, then_body, else_body) ->
-            read_expr(cx, cond, bound, found)
-            read_block(cx, then_body, bound, found)
-            read_opt_block(cx, else_body, bound, found)
+            read_expr(keep, cond, bound, found)
+            read_block(keep, then_body, bound, found)
+            read_opt_block(keep, else_body, bound, found)
         MatchExpr(scrutinee, arms) ->
-            read_expr(cx, scrutinee, bound, found)
+            read_expr(keep, scrutinee, bound, found)
 
             for i in 0..<arms.len()
                 val arm = arms.at(i)
@@ -514,60 +518,60 @@ private read_expr(cx: &Analyzer, e: Expr, bound: Buf[string], found: *Buf[string
                 // already declared rather than binding it, and are resolved against what was bound
                 // before the arm.
                 for j in 0..<arm.patterns.len()
-                    pattern_reads(cx, arm.patterns.at(j), bound, found)
+                    pattern_reads(keep, arm.patterns.at(j), bound, found)
 
-                read_opt(cx, arm.guard, inner, found)
-                read_block(cx, arm.body, inner, found)
-        IsPattern(subject, _, _) -> read_expr(cx, subject, bound, found)
-        ResultList(values) -> read_each(cx, values, bound, found)
+                read_opt(keep, arm.guard, inner, found)
+                read_block(keep, arm.body, inner, found)
+        IsPattern(subject, _, _) -> read_expr(keep, subject, bound, found)
+        ResultList(values) -> read_each(keep, values, bound, found)
         While(_, cond, body, else_body) ->
-            read_expr(cx, cond, bound, found)
-            read_block(cx, body, bound, found)
-            read_opt_block(cx, else_body, bound, found)
+            read_expr(keep, cond, bound, found)
+            read_block(keep, body, bound, found)
+            read_opt_block(keep, else_body, bound, found)
         DoWhile(_, body, cond, else_body) ->
-            read_block(cx, body, bound, found)
-            read_expr(cx, cond, bound, found)
-            read_opt_block(cx, else_body, bound, found)
-        Loop(_, body) -> read_block(cx, body, bound, found)
+            read_block(keep, body, bound, found)
+            read_expr(keep, cond, bound, found)
+            read_opt_block(keep, else_body, bound, found)
+        Loop(_, body) -> read_block(keep, body, bound, found)
         For(_, name, iter, body, else_body) ->
-            read_expr(cx, iter, bound, found)
+            read_expr(keep, iter, bound, found)
 
             var inner = copied(bound)
 
             inner.push(name)
-            read_block(cx, body, inner, found)
-            read_opt_block(cx, else_body, bound, found)
+            read_block(keep, body, inner, found)
+            read_opt_block(keep, else_body, bound, found)
         ConstFor(name, iter, body) ->
-            read_expr(cx, iter, bound, found)
+            read_expr(keep, iter, bound, found)
 
             var inner = copied(bound)
 
             inner.push(name)
-            read_block(cx, body, inner, found)
+            read_block(keep, body, inner, found)
         CFor(_, init, cond, step, body, else_body) ->
             var inner = copied(bound)
 
             init match
-                Some(s) -> read_stmt(cx, s, &inner, found)
+                Some(s) -> read_stmt(keep, s, &inner, found)
                 None -> ()
 
-            read_opt(cx, cond, inner, found)
+            read_opt(keep, cond, inner, found)
 
             step match
-                Some(s) -> read_stmt(cx, s, &inner, found)
+                Some(s) -> read_stmt(keep, s, &inner, found)
                 None -> ()
 
-            read_block(cx, body, inner, found)
-            read_opt_block(cx, else_body, inner, found)
+            read_block(keep, body, inner, found)
+            read_opt_block(keep, else_body, inner, found)
         // A quantifier binds its name over the predicate and nowhere else, so an outer name of the
         // same spelling is not captured by a clause that only shadows it.
         Quantifier(_, name, iter, pred) ->
-            read_expr(cx, iter, bound, found)
+            read_expr(keep, iter, bound, found)
 
             var inner = copied(bound)
 
             inner.push(name)
-            read_expr(cx, pred, inner, found)
+            read_expr(keep, pred, inner, found)
         _ -> ()
 end read_expr
 
@@ -592,22 +596,22 @@ end pattern_binds_into
 
 // Every name a pattern **reads** -- the quoted ones, which reference something already declared
 // rather than binding it.
-private pattern_reads(cx: &Analyzer, p: Pattern, bound: Buf[string], found: *Buf[string])
+private pattern_reads(keep: &Fn(string) -> bool, p: Pattern, bound: Buf[string], found: *Buf[string])
     *p.kind match
         EqPattern(name) ->
-            if !names_hold(bound, name) && cx.lookup(name).is_some() &&
+            if !names_hold(bound, name) && keep(name) &&
                !names_hold(*found, name) then
                 found.push(name)
-        BindPattern(_, inner) -> pattern_reads(cx, inner, bound, found)
+        BindPattern(_, inner) -> pattern_reads(keep, inner, bound, found)
         VariantPattern(_, args) ->
             for i in 0..<args.len()
-                pattern_reads(cx, args.at(i), bound, found)
+                pattern_reads(keep, args.at(i), bound, found)
         TuplePattern(args) ->
             for i in 0..<args.len()
-                pattern_reads(cx, args.at(i), bound, found)
+                pattern_reads(keep, args.at(i), bound, found)
         StructPattern(_, fields) ->
             for i in 0..<fields.len()
-                pattern_reads(cx, fields.at(i).pat, bound, found)
+                pattern_reads(keep, fields.at(i).pat, bound, found)
         _ -> ()
 end pattern_reads
 
