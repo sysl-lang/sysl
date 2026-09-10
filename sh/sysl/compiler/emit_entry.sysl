@@ -1,0 +1,295 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **Where a program starts**, and the two shapes that is: the entry point an ordinary program gets,
+// and the dispatcher a test build gets instead.
+
+// The symbol a declared `main` is defined under, which is not the platform's `main` -- that name
+// belongs to the C-shaped function below, and the two would collide.
+entry_symbol() -> string = s"${ModuleSep}${ModuleSep}main"
+
+// The platform's own start-up code calls `main` with two arguments whether or not the program asked
+// for them, so this is C's signature and not a sysl one -- neither `argc` nor `argv` appears in a
+// sysl declaration anywhere.
+//
+// **On WASI the symbol is `__main_argc_argv`, and that is not a decoration.** wasm has no
+// out-of-band way to say how many arguments a function takes, so a two-argument `main` and a
+// no-argument one cannot share a name: clang's *frontend* renames the two-argument form, and
+// wasi-libc's start-up calls `__main_void`, which calls `__main_argc_argv` where it exists and falls
+// back to a weak `main` of no arguments. Intermediate representation handed to clang never went
+// through that frontend, so a `main` emitted here at the two-argument signature is a *different*
+// symbol from the one the start-up code weakly refers to.
+private entry_sig(t: Target) -> IrFuncSig
+    var params: Buf[IrParam] = buf()
+
+    params.push(IrParam(l_i32(), no_ir_attrs(), Some(VReg("argc"))))
+    params.push(IrParam(LPtr, no_ir_attrs(), Some(VReg("argv"))))
+    ir_sig(if t.os == Wasi then "__main_argc_argv" else "main", ir_fn_type(l_i32(), params))
+end entry_sig
+
+// `@main`, which is three things in the order the language puts them: the computed `val`s, the
+// program's own top-level statements, and the `main` it declared if it declared one.
+//
+// The `val`s are laid down here rather than in a constructor the platform runs, and that is the
+// whole of the mechanism: the entry point is the one place that certainly runs first and it is
+// already written. Each one gets a region of its own, exactly as a statement does, so whatever its
+// initializer allocated on the way to the value is let go of before the next one starts.
+gen_main(e: *Emit, p: TProgram) -> Option[IrFunc]
+    start_function(e)
+    push_temps(e)
+    push_owned(e)
+    gen_stack_guard(e)
+    gen_computed_vals(e, p.vals)
+    gen_stmts(e, p.main)
+
+    // The declared `main` runs in a region of its own, so the slice its arguments came in is
+    // released when it returns -- the same handover an ordinary call makes, since a callee takes a
+    // count for each parameter on entry and gives it back at its own return.
+    p.entry match
+        Some(en) ->
+            push_temps(e)
+
+            var args: Buf[IrArg] = buf()
+
+            en.args_fn match
+                Some(fn) ->
+                    val slice = Slice(Str, false)
+                    val r = fresh_reg(e)
+
+                    var made: Buf[IrArg] = buf()
+
+                    made.push(ir_arg(l_i32(), VReg("argc")))
+                    made.push(ir_arg(LPtr, VReg("argv")))
+                    emit(e, ir_call(Some(r), lty(e, slice), VGlobal(fn), made))
+                    args.push(ir_arg(lty(e, slice), own_temp(e, r, slice)))
+                None -> ()
+
+            // **A `main` that answers with a `Result` is called for its answer**, which is then
+            // handed to the reporter the walk instantiated: it is what prints the error and picks
+            // the status, and it is ordinary sysl for the same reason the argument conversion is --
+            // the entry point should carry as little hand-written intermediate representation as
+            // the platform will let it.
+            if en.result_fn.is_some() && en.result_ty.is_some()
+                val ty = en.result_ty.unwrap()
+                val r = fresh_reg(e)
+
+                emit(e, ir_call(Some(r), lty(e, ty), VGlobal(entry_symbol()), args))
+
+                var reported: Buf[IrArg] = buf()
+
+                reported.push(ir_arg(lty(e, ty), r))
+                emit(e, ir_call(None, LVoid, VGlobal(en.result_fn.unwrap()), reported))
+            else emit(e, ir_call(None, LVoid, VGlobal(entry_symbol()), args))
+
+            pop_temps(e)
+        None -> ()
+
+    release_all(e)
+    emit_term(e, InRet(Some(l_i32()), Some(VInt(from_int(0)))))
+
+    if has_gap(e) then return None
+
+    Some(finish_func(e, entry_sig(e.target)))
+end gen_main
+
+// Each computed `val`, filled in a region of its own.
+//
+// **The storage takes a count of its own for what it is given, and releases nothing.** Both halves
+// matter and neither is what an ordinary assignment does. The retain is needed because the value is
+// a temporary of the region around this store, so without one it would be released at the end of the
+// region and the storage left addressing freed bytes. The release is *absent* because there is
+// nothing to release: the storage has never held anything, and a `&T`'s zero is not a reference --
+// loading it and letting go of it would be a decrement through null.
+private gen_computed_vals(e: *Emit, vals: Buf[TVal])
+    for i in 0..<vals.len()
+        val v = vals.at(i)
+
+        if v.computed && v.init.is_some()
+            push_temps(e)
+
+            val value = gen_expr(e, v.init.unwrap())
+
+            if contains_counted(v.ty) then retain_value(e, v.ty, value)
+
+            emit(e, InStore(lty(e, v.ty), value, VGlobal(v.symbol), AccPlain, None))
+            pop_temps(e)
+end gen_computed_vals
+
+// Installs the handler that says *why* a program that ran out of stack stopped, and recovers what it
+// had already printed.
+//
+// **It is the first thing the program does**, before the module's storage is filled and before any
+// statement runs -- a fault during initialization is exactly as unexplained as one later, and a
+// guard installed after the thing it guards is a guard for the second half of the program.
+//
+// **Only where the machine has signals.** The C sits in a `__posix__` directory, so it is neither
+// compiled nor linked for a freestanding target; emitting the call there would be a reference to a
+// symbol nothing defines.
+private gen_stack_guard(e: *Emit)
+    if !posix_machine(e.target.os) then return
+
+    request_intrinsic(e, ir_sig(stack_guard_symbol(), ir_fn_type(LVoid, no_params())))
+    emit(e, ir_call(None, LVoid, VGlobal(stack_guard_symbol()), no_ir_args()))
+end gen_stack_guard
+
+// The C function a hosted program calls first: the handler that tells an overflowed stack from a
+// wild pointer, and flushes what the program had already printed.
+stack_guard_symbol() -> string = "sysl_install_stack_guard"
+
+// Whether the machine has POSIX signals, which is the same question the capability model asks.
+private posix_machine(os: Os) -> bool = os match
+    MacOS -> true
+    Linux -> true
+    Android -> true
+    _ -> false
+
+// -- the dispatcher a test build gets ---------------------------------------------------------------
+
+// `@main` for a **test build**: the entry point `sysl test` drives, which runs the one test named on
+// its command line and nothing else.
+//
+// **One test to a process, chosen from outside.** A test that fails does so by trapping, and a trap
+// takes the process with it -- so a runner that called them in a loop would learn the name of the
+// first failure and nothing after it. Dispatching on an argument instead means one compile and one
+// short-lived process per test, and a test's verdict is then the exit status the platform already
+// reports.
+//
+// The status says which of three things happened, and the runner reads all three: `0` for a test
+// that returned, whatever the platform makes of a trap for one that did not, and `2` for a name that
+// matches nothing here -- which is a runner and a binary that disagree, not a test result.
+gen_test_main(e: *Emit, p: TProgram) -> Option[IrFunc]
+    start_function(e)
+    push_temps(e)
+    push_owned(e)
+    gen_computed_vals(e, p.vals)
+
+    val named = fresh_label(e, "test.named")
+    val missing = fresh_label(e, "test.missing")
+    val enough = fresh_reg(e)
+
+    emit(e, InIntCmp(enough, ISgt, l_i32(), VReg("argc"), VInt(from_int(1))))
+    emit_term(e, InCondBr(enough, named, missing))
+    emit_label(e, named)
+
+    val slot = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(LInt(64), VInt(from_int(1))))
+    emit(e, InGep(slot, LPtr, VReg("argv"), idx))
+
+    val want = fresh_reg(e)
+
+    emit(e, InLoad(want, LPtr, slot, AccPlain, None))
+
+    // Each arm compares the wanted name against one test's key and calls it on a match. The keys are
+    // interned with the terminator `strcmp` reads to, which an ordinary sysl string constant does
+    // not carry: a `string` knows its own length and has never had a use for one.
+    for i in 0..<p.tests.len()
+        val t = p.tests.at(i)
+        val run = fresh_label(e, "test.run")
+        val next = fresh_label(e, "test.next")
+
+        dispatch_on(e, want, t.func, run, next)
+        emit_label(e, run)
+
+        // The test's own process is where its module's `@setup` runs, and it has to be: a setup
+        // exists to leave something behind for the test to find, and module storage is one
+        // process's.
+        t.hooks.setup match
+            Some(h) ->
+                emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, h.func)), no_ir_args()))
+                emit_mark(e, setup_mark())
+            None -> ()
+
+        emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, t.func)), no_ir_args()))
+
+        // `@teardown` runs here only where the test **returned**, which is the whole of what the
+        // mark records. A test that trapped took this process with it, so the runner starts a fresh
+        // one for the teardown instead.
+        t.hooks.teardown match
+            Some(h) ->
+                emit_mark(e, test_mark())
+                emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, h.func)), no_ir_args()))
+            None -> ()
+
+        emit_term(e, InRet(Some(l_i32()), Some(VInt(from_int(0)))))
+        emit_label(e, next)
+
+    // An arm per hook as well, so that the runner can ask for one by name: the two `_all` hooks are
+    // invocations of their own, and so is a `@teardown` after a test that did not come back. Keys
+    // are distinct, so an arm for a hook cannot be reached by a test's name or the other way round.
+    for i in 0..<p.hooks.len()
+        val h = p.hooks.at(i)
+        val run = fresh_label(e, "hook.run")
+        val next = fresh_label(e, "hook.next")
+
+        dispatch_on(e, want, h.func, run, next)
+        emit_label(e, run)
+        emit(e, ir_call(None, LVoid, VGlobal(symbol_of(e, h.func)), no_ir_args()))
+        emit_term(e, InRet(Some(l_i32()), Some(VInt(from_int(0)))))
+        emit_label(e, next)
+
+    // Falling off the end of the arms and arriving with no name at all are the same answer: this
+    // binary has no such test. They share a block rather than each getting one, because a runner
+    // reading the status cannot tell them apart and there is nothing it would do differently.
+    emit_term(e, InBr(missing))
+    emit_label(e, missing)
+    emit_term(e, InRet(Some(l_i32()), Some(VInt(from_int(2)))))
+
+    if has_gap(e) then return None
+
+    Some(finish_func(e, entry_sig(e.target)))
+end gen_test_main
+
+private dispatch_on(e: *Emit, want: Val, key: string, run: string, next: string)
+    val cmp = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, want))
+    args.push(ir_arg(LPtr, string_global(e, key + "\u{0}")))
+    emit(e, ir_call(Some(cmp), l_i32(), VGlobal("strcmp"), args))
+
+    val hit = fresh_reg(e)
+
+    emit(e, InIntCmp(hit, IEq, l_i32(), cmp, VInt(from_int(0))))
+    emit_term(e, InCondBr(hit, run, next))
+end dispatch_on
+
+// One byte to standard error, saying how far the dispatcher has got.
+//
+// Standard error rather than standard output because the runner reads both and shows both, and a
+// test that prints on stdout should not have a mark land in the middle of a line it wrote. The
+// result is discarded: there is nothing useful to do about a failed `write` here, and a run whose
+// marks did not arrive is read as one that did not reach them, which is the safe direction.
+private emit_mark(e: *Emit, mark: string)
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(l_i32(), VInt(from_int(2))))
+    args.push(ir_arg(LPtr, string_global(e, mark)))
+    args.push(ir_arg(word_lty(e), VInt(from_int(1))))
+    emit(e, ir_call(Some(fresh_reg(e)), word_lty(e), VGlobal("write"), args))
+end emit_mark
+
+// The byte a dispatcher writes once its module's `@setup` has returned, and the one it writes once
+// the test itself has.
+setup_mark() -> string = "\u{1}"
+
+test_mark() -> string = "\u{2}"
+
+// Whether this build's dispatcher writes a phase mark, which is what decides whether `write` is
+// declared. Only a per-test hook makes it say anything: an `_all` hook is a process of its own and
+// its verdict is that process's own exit status.
+dispatcher_marks(p: TProgram) -> bool
+    if !p.entry_point || p.tests.is_empty() then return false
+
+    for i in 0..<p.tests.len()
+        val h = p.tests.at(i).hooks
+
+        if h.setup.is_some() || h.teardown.is_some() then return true
+
+    false
+end dispatcher_marks

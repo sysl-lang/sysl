@@ -5,17 +5,29 @@ import sysl.math.bigint.from_int
 
 // **One statement, lowered for its effects.**
 
-gen_stmt(e: *Emit, s: TStmt) = s match
+// A statement is its own ownership region: whatever it took a count of on the way through is given
+// back where the statement ends, which is what makes `f(g())` let go of `g`'s result and not
+// before.
+gen_stmt(e: *Emit, s: TStmt)
+    push_temps(e)
+    gen_stmt_body(e, s)
+    pop_temps(e)
+end gen_stmt
+
+private gen_stmt_body(e: *Emit, s: TStmt) = s match
     // A zero-sized binding is not a slot: the initializer still runs, for its effect, and there is
     // nothing to keep afterwards.
     TVarDecl(name, ty, init, align) ->
         if zero_sized(ty)
             gen_expr(e, init)
+        else if is_promoted(e, name) && promoted_elem(ty).is_some()
+            gen_promoted_decl(e, name, ty, promoted_elem(ty).unwrap(), init)
         else
             // The slot is laid down **before** the initializer runs, because a large one is written
             // into it rather than handed to it.
             emit_alloca(e, VReg(s"$name.addr"), lty(e, ty), int_align(align))
             gen_into(e, VReg(s"$name.addr"), init)
+            own_slot(e, name, ty)
 
     // `ref name = place`. The walk to the place is made **once**, here, and its result becomes the
     // name's address -- so every later read and write is the one instruction it would have been.
@@ -38,6 +50,9 @@ gen_stmt(e: *Emit, s: TStmt) = s match
 
     TReturn(opt) -> gen_return(e, opt)
 
+    // A `break`/`continue` leaves the body from the middle, so it unwinds the body's ownership
+    // regions before jumping -- the same discipline as `return`, bounded to the loop. `break v`
+    // hands its value over with a count taken, so that it survives the unwind.
     TBreak(opt, depth) ->
         val enclosing = loop_at(e, depth)
 
@@ -45,18 +60,33 @@ gen_stmt(e: *Emit, s: TStmt) = s match
             Some(t) ->
                 val v = gen_expr(e, t)
 
+                retain_value(e, texpr_type(t), v)
                 emit(e, InStore(lty_of(e, t), v, enclosing.slot, AccPlain, None))
             None -> ()
 
+        release_to_depth(e, enclosing.owned_depth, enclosing.temp_depth)
         emit_term(e, InBr(enclosing.break_label))
 
-    TContinue(depth) -> emit_term(e, InBr(loop_at(e, depth).continue_label))
+    TContinue(depth) ->
+        val enclosing = loop_at(e, depth)
+
+        release_to_depth(e, enclosing.owned_depth, enclosing.temp_depth)
+        emit_term(e, InBr(enclosing.continue_label))
+
+    // Reaching a `defer` emits nothing: it hands its statements to the scope, which lays them down
+    // at each edge that leaves the block. Registering here rather than at the top of the block is
+    // what makes a `defer` control never reached schedule nothing.
+    TDefer(stmts) -> defer_stmts(e, stmts)
 
     // A loop's `invariant` is a condition that traps on false, which is every other clause the
     // verification chapter states.
     TInvariant(cond, _) -> emit_contract(e, cond, "invariant")
 
     TVariantCheck(slot, var_ty, expr) -> gen_variant_check(e, slot, var_ty, expr)
+
+    // One architecture's instructions arrived here; the arms that answered for the others were
+    // chosen between in the analyzer and are not represented.
+    TAsm(lines, operands, clobbers) -> if !lines.is_empty() then gen_asm(e, lines, operands, clobbers)
 
     _ -> gap_here(e, tstmt_kind_name(s))
 
@@ -78,13 +108,12 @@ end loop_at
 gen_into(e: *Emit, dest: Val, x: TExpr)
     val ty = texpr_type(x)
 
-    if contains_counted(ty)
-        gap_here(e, "storage that holds a reference")
-        return
-
     if !e.layout.indirect(ty)
         val v = gen_expr(e, x)
 
+        // The storage owns what is written into it, so it takes a count of its own -- and the slot
+        // is fresh, so there is nothing there to give back.
+        retain_value(e, ty, v)
         emit(e, InStore(lty(e, ty), v, dest, AccPlain, None))
         return
 
@@ -119,7 +148,7 @@ private gen_write(e: *Emit, w: TWrite)
         Some(c) -> emit_constraint_checks(e, updated, c)
         None -> ()
 
-    store_place(e, w.place, p, updated)
+    store_over(e, w.place, p, updated, Some(cur))
 end gen_write
 
 // A `return`, which is where a frame's promises are discharged.
@@ -132,32 +161,42 @@ private gen_return(e: *Emit, opt: Option[TExpr])
                 gap_here(e, "a large result returned through storage")
                 return
 
-            if contains_counted(ty)
-                gap_here(e, "a result that holds a reference")
-                return
-
             val v = gen_expr(e, t)
 
+            retain_value(e, ty, v)
             emit_ensures(e, Some(v))
+            release_all(e)
             emit_term(e, InRet(Some(lty(e, ty)), Some(v)))
         None ->
             emit_ensures(e, None)
+            release_all(e)
             emit_term(e, InRet(None, None))
 end gen_return
 
 // -- contracts ---------------------------------------------------------------------------------------
 
-// A clause that traps on false, which is what every contract clause is at run time.
+// A clause that traps on false, which is what every contract clause is at run time. The condition's
+// own temporaries are given back before the trap, so the checked path stays leak-free.
 emit_contract(e: *Emit, cond: TExpr, kind: string)
+    push_temps(e)
+
     val ok = gen_expr(e, cond)
 
+    pop_temps(e)
     trap_unless(e, ok, kind)
 end emit_contract
 
-// Runs every postcondition with `result` bound to the value about to be returned. A function that
-// states one is a gap for as long as `result` has nowhere to come from.
+// Runs every postcondition with `result` bound to the value about to be returned.
 emit_ensures(e: *Emit, result: Option[Val])
-    if e.ensures > 0 then gap_here(e, "a postcondition")
+    if e.ensures.is_empty() then return
+
+    e.result_ssa = result
+
+    for i in 0..<e.ensures.len()
+        emit_contract(e, e.ensures.at(i).cond, "ensure")
+
+    e.result_ssa = None
+end emit_ensures
 
 // One iteration's `variant` check: measure, compare against the last one where there was a last one,
 // and store. The comparison is **strict** and is signed or unsigned according to the measure's own

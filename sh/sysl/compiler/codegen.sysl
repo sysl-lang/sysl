@@ -20,24 +20,25 @@ import sysl.text.{str_builder, StrBuilder}
 
 // The module a program lowers to.
 codegen_module(p: TProgram, t: Target) -> IrModule
-    var e = emitter(t)
+    var e = emitter_for(t, p.destructors)
 
-    codegen_into(&e, p, t).0
+    codegen_into(&e, p, t, no_promotions()).0
 end codegen_module
 
 // The same, with the census of the bodies that were left out beside it: each one's key and the form
 // it reached.
-codegen_with_gaps(p: TProgram, t: Target) -> (IrModule, Buf[(string, string)])
-    var e = emitter(t)
+codegen_with_gaps(p: TProgram, t: Target, pr: Promotions) -> (IrModule, Buf[(string, string)])
+    var e = emitter_for(t, p.destructors)
 
-    codegen_into(&e, p, t)
+    codegen_into(&e, p, t, pr)
 end codegen_with_gaps
 
-private codegen_into(e: *Emit, p: TProgram, t: Target) -> (IrModule, Buf[(string, string)])
+private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrModule, Buf[(string, string)])
     val layout = layout_for(t)
     val word_bits = int(t.pointer_bits())
 
     record_symbols(e, p)
+    set_promotions(e, pr)
 
     var funcs: Buf[IrFunc] = buf()
     var gaps: Buf[(string, string)] = buf()
@@ -51,6 +52,8 @@ private codegen_into(e: *Emit, p: TProgram, t: Target) -> (IrModule, Buf[(string
             if f.exported.is_some()
                 gaps.push((f.name, "an exported function's C-callable entry"))
             else
+                set_promoted(e, pr.for_func(f.name))
+
                 gen_function(e, f) match
                     Some(built) -> funcs.push(built)
                     None -> gaps.push((f.name, gap_text(e)))
@@ -65,15 +68,138 @@ private codegen_into(e: *Emit, p: TProgram, t: Target) -> (IrModule, Buf[(string
     for i in 0..<vals.len()
         globals.push(vals.at(i))
 
+    // A library has no entry point. Emitting one would put a second `main` in every program that
+    // linked against it, which the linker reports as a duplicate symbol and nothing else explains.
+    // It is built **before** the helpers are, because it is a body like any other and may ask for
+    // one.
+    var entry: Option[IrFunc] = None
+
+    if p.entry_point
+        set_promoted(e, pr.for_func(""))
+
+        val built = if p.tests.is_empty() then gen_main(e, p) else gen_test_main(e, p)
+
+        built match
+            Some(f) -> entry = Some(f)
+            None -> gaps.push(("main", gap_text(e)))
+
+    // Emitting a runtime helper may ask for another -- a destructor releases the references its
+    // payload holds -- so this runs until nothing new is requested. **A helper that reaches the
+    // allocator asks for the plain hook, and it is asked here rather than at the several places
+    // that request one**: every box a helper builds carries a hook that gives its storage back, so
+    // reading it off the helper itself keeps that from being a list somebody has to remember.
+    var built_helpers: Buf[IrFunc] = buf()
+    var made: usize = 0
+
+    while made < e.queue.len()
+        val what = e.queue.at(made)
+        val name = e.requested.at(made)
+
+        made += 1
+
+        gen_helper(e, what, name) match
+            Some(built) ->
+                if allocates(built, malloc_symbol()) then plain_drop_fn(e)
+
+                built_helpers.push(built)
+            None -> gaps.push((name, gap_text(e)))
+
+    // The hand-written blocks go in front of the generated ones, and which of them the module needs
+    // is settled only once every helper has been written -- a helper is as much a reason to hold the
+    // runtime as a body is.
+    var helpers = runtime_bundles(e, t)
+
+    for i in 0..<built_helpers.len()
+        helpers.push(RtEmitted(built_helpers.at(i)))
+
+    // The interned strings a helper laid down are in the same list every body's are, so this is
+    // read **after** the drain.
     for i in 0..<e.globals.len()
         globals.push(e.globals.at(i))
 
     val m = IrModule(t.triple, declares(e, p), struct_defs(p, word_bits), enum_defs(p, layout),
-                     no_defs(), no_sigs(), globals, no_runtime(), funcs, no_funcs(), None, None,
-                     None)
+                     box_defs(e, word_bits), no_sigs(), globals, helpers, funcs, no_funcs(), entry,
+                     used_of(p, funcs), None)
 
     (m, gaps)
 end codegen_into
+
+// A box is the strong count, the function that destroys it, the weak count, and the payload -- so
+// ARC works the same everywhere, and an object frees itself into whichever heap made it. The two
+// counts are the machine's word, and must stay in step with `%arc.header`: the runtime reads these
+// very fields through that type, so a disagreement is not a type error anywhere, it is a count read
+// at the wrong width.
+//
+// A buffer is the same box with the element count in front of elements there may be any number of,
+// so the hook -- which is reached with no static type -- can still find them all.
+private box_defs(e: *Emit, word_bits: int) -> Buf[IrTypeDef]
+    var out: Buf[IrTypeDef] = buf()
+
+    for i in 0..<e.boxes.len()
+        var fields: Buf[LType] = buf()
+
+        fields.push(LInt(word_bits))
+        fields.push(LPtr)
+        fields.push(LInt(word_bits))
+        fields.push(lty(e, e.boxes.at(i).1))
+        out.push(IrTypeDef(e.boxes.at(i).0, fields, false))
+
+    for i in 0..<e.bufs.len()
+        var fields: Buf[LType] = buf()
+
+        fields.push(LInt(word_bits))
+        fields.push(LPtr)
+        fields.push(LInt(word_bits))
+        fields.push(LInt(word_bits))
+        fields.push(LArr(0, lty(e, e.bufs.at(i).1)))
+        out.push(IrTypeDef(e.bufs.at(i).0, fields, false))
+
+    out
+end box_defs
+
+// The parts of the runtime the module turned out to need, each a hand-written template and so
+// reachable to anything that is not LLVM only by name.
+private runtime_bundles(e: *Emit, t: Target) -> Buf[IrRuntime]
+    var out: Buf[IrRuntime] = buf()
+
+    if e.heap then out.push(RtTemplate("arc.core", arc_core(t)))
+    if e.sync_heap then out.push(RtTemplate("arc.atomic", arc_atomic(t)))
+    if e.maybe_heap then out.push(RtTemplate("arc.maybe", arc_maybe()))
+    if e.weak_heap then out.push(RtTemplate("arc.weak", arc_weak(t)))
+
+    out
+end runtime_bundles
+
+// Whether a generated helper reaches the allocator, and so needs the hook that gives storage back.
+// Its calls are instructions, so the question is whether one of them names the allocating symbol.
+private allocates(f: IrFunc, symbol: string) -> bool
+    for i in 0..<f.blocks.len()
+        val b = f.blocks.at(i)
+
+        for j in 0..<b.instrs.len()
+            b.instrs.at(j) match
+                InCall(_, _, callee, _, _, _, _, _) ->
+                    callee match
+                        VGlobal(n) -> if n == symbol then return true
+                        _ -> ()
+                _ -> ()
+
+    false
+end allocates
+
+// The symbols this module places by hand and nothing in it reads, which is what keeps a section a
+// linker script gathers from being discarded.
+private used_of(p: TProgram, funcs: Buf[IrFunc]) -> Option[IrGlobal]
+    var names: Buf[string] = buf()
+
+    for i in 0..<p.vals.len()
+        if p.vals.at(i).section.is_some() then names.push(p.vals.at(i).symbol)
+
+    for i in 0..<funcs.len()
+        if funcs.at(i).sig.section.is_some() then names.push(funcs.at(i).sig.name)
+
+    gen_used(names)
+end used_of
 
 private gap_text(e: *Emit) -> string = e.gap match
     Some(w) -> w
@@ -111,6 +237,38 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     var out: Buf[IrFuncSig] = buf()
 
     if e.traps then out.push(ir_sig(llvm_trap(), ir_fn_type(LVoid, no_params())))
+
+    if e.heap
+        var alloc_params: Buf[IrParam] = buf()
+
+        alloc_params.push(ir_param(word_lty(e)))
+        out.push(ir_sig(malloc_symbol(), ir_fn_type(LPtr, alloc_params)))
+
+        var free_params: Buf[IrParam] = buf()
+
+        free_params.push(ir_param(LPtr))
+        out.push(ir_sig(free_symbol(), ir_fn_type(LVoid, free_params)))
+
+    // The test dispatcher's one dependency, and the only thing in a test build that is not also in
+    // an ordinary one. It is declared from the shape of the program rather than from a flag set
+    // while emitting, because the entry point is emitted after this list is read.
+    if p.entry_point && !p.tests.is_empty()
+        var cmp_params: Buf[IrParam] = buf()
+
+        cmp_params.push(ir_param(LPtr))
+        cmp_params.push(ir_param(LPtr))
+        out.push(ir_sig("strcmp", ir_fn_type(l_i32(), cmp_params)))
+
+    // What the dispatcher tells the runner with, and only where there is a hook for it to say
+    // anything about. It is the same primitive the library prints with, at the signature the
+    // standard module already binds it at.
+    if dispatcher_marks(p)
+        var write_params: Buf[IrParam] = buf()
+
+        write_params.push(ir_param(l_i32()))
+        write_params.push(ir_param(LPtr))
+        write_params.push(ir_param(word_lty(e)))
+        out.push(ir_sig("write", ir_fn_type(word_lty(e), write_params)))
 
     var seen: Buf[string] = buf()
 
@@ -231,18 +389,6 @@ private no_sigs() -> Buf[IrFuncSig]
 
     out
 end no_sigs
-
-private no_defs() -> Buf[IrTypeDef]
-    var out: Buf[IrTypeDef] = buf()
-
-    out
-end no_defs
-
-private no_runtime() -> Buf[IrRuntime]
-    var out: Buf[IrRuntime] = buf()
-
-    out
-end no_runtime
 
 private no_funcs() -> Buf[IrFunc]
     var out: Buf[IrFunc] = buf()
@@ -380,7 +526,7 @@ emit_func_text(text: string, symbol: string) -> string
     // **Nothing is pruned here**, because a test writes the one body it is about and a walk from a
     // program's roots would drop it before it could be read.
     val p = strip_tests(program_of(done, done.main_module))
-    val lowered = codegen_with_gaps(p, done.an.tables.target)
+    val lowered = codegen_with_gaps(p, done.an.tables.target, check_escapes(done.an, p))
     val fs = func_texts(ir_print_module(lowered.0))
 
     for i in 0..<fs.len()
@@ -396,7 +542,7 @@ emit_gap_for(text: string, name: string) -> string
     if !done.reported.is_empty() then return done.reported.at(0).diag.message
 
     val p = strip_tests(program_of(done, done.main_module))
-    val gaps = codegen_with_gaps(p, done.an.tables.target).1
+    val gaps = codegen_with_gaps(p, done.an.tables.target, check_escapes(done.an, p)).1
 
     for i in 0..<gaps.len()
         if gaps.at(i).0 == name then return gaps.at(i).1

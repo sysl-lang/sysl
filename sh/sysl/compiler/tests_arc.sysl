@@ -1,0 +1,694 @@
+module sh.sysl.compiler
+@tests
+
+// **The ownership runtime, and the rest of what a body needs**: where a count is taken, where it is
+// given back, what a heap object looks like while it is held, and the entry point a program gets.
+//
+// **Every LLVM text here was read out of the reference compiler**, by handing the installed `sysl`
+// the same source and quoting `emit-llvm` -- never composed from the rule. A text this compiler
+// composed rather than quoted is a text that has drifted.
+//
+// The sources reach nothing the standard module declares, because the seam below compiles one file
+// against a standard module that is a stub: a program that printed something would not get past the
+// analysis here, and the *reference* prunes what nothing reaches, so each of them ends with the
+// statements that make the function under test reachable there.
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+private lowered_arc(text: string, symbol: string) -> string = emit_func_text(text, symbol)
+
+// The same, over a source compiled against the **real** standard module rather than the stub the
+// seam above uses -- which is what a program naming one of the library's own traits needs.
+private var arc_library_cache: Buf[Program] = buf()
+private var arc_library_read: bool = false
+
+private arc_library() -> Buf[Program]
+    if arc_library_read then return arc_library_cache
+
+    arc_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> arc_library_cache = units
+
+    arc_library_cache
+end arc_library
+
+private arc_no_library() -> bool
+    if arc_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end arc_no_library
+
+// What the seam between the analyzer and the lowering refuses, over a whole program.
+private refused_whole(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+    var units: Buf[Program] = buf()
+    val library = arc_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    val said = errors_of(done.an.diagnostics())
+
+    if said.is_empty() then "" else said.at(0).diag.message
+end refused_whole
+
+private lowered_whole(text: string, symbol: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+    var units: Buf[Program] = buf()
+    val library = arc_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), buf())
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+    val fs = func_texts(ir_print_module(lowered.0))
+
+    for i in 0..<fs.len()
+        if fs.at(i).0 == symbol then return fs.at(i).1
+
+    ""
+end lowered_whole
+
+@test("a counted parameter is retained at entry and released at every return")
+a_counted_parameter_is_owned_by_the_frame()
+    assert_eq(lowered_arc("struct Node\n" +
+                           "    v: int\n" +
+                           "end Node\n" +
+                           "\n" +
+                           "take(n: &Node) -> int = n.v\n" +
+                           "\n" +
+                           "var r: &Node = Node(1)\n" +
+                           "var got: int = 0\n" +
+                           "\n" +
+                           "got = take(r)\n",
+                          "take"),
+              "define i32 @take(ptr %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca ptr\n" +
+              "  store ptr %n.param, ptr %n.addr\n" +
+              "  call void @arc.retain(ptr %n.param)\n" +
+              "  %t1 = load ptr, ptr %n.addr\n" +
+              "  %t2 = getelementptr %arc.Node, ptr %t1, i32 0, i32 3\n" +
+              "  %t3 = load %struct.Node, ptr %t2\n" +
+              "  %t4 = extractvalue %struct.Node %t3, 0\n" +
+              "  %t5 = load ptr, ptr %n.addr\n" +
+              "  call void @arc.release(ptr %t5)\n" +
+              "  ret i32 %t4\n" +
+              "}\n")
+end a_counted_parameter_is_owned_by_the_frame
+
+@test("a result is handed back with a count already taken")
+a_result_carries_its_own_count()
+    assert_eq(lowered_arc("struct Node\n" +
+                           "    v: int\n" +
+                           "end Node\n" +
+                           "\n" +
+                           "make(n: int) -> &Node = Node(n)\n" +
+                           "\n" +
+                           "var r: &Node = make(1)\n",
+                          "make"),
+              "define ptr @make(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = insertvalue %struct.Node undef, i32 %t1, 0\n" +
+              "  %t3 = getelementptr %arc.Node, ptr null, i32 1\n" +
+              "  %t4 = ptrtoint ptr %t3 to i64\n" +
+              "  %t5 = call ptr @malloc(i64 %t4)\n" +
+              "  store i64 1, ptr %t5\n" +
+              "  %t6 = getelementptr %arc.Node, ptr %t5, i32 0, i32 1\n" +
+              "  store ptr @arc.drop.plain, ptr %t6\n" +
+              "  %t7 = getelementptr %arc.Node, ptr %t5, i32 0, i32 2\n" +
+              "  store i64 1, ptr %t7\n" +
+              "  %t8 = getelementptr %arc.Node, ptr %t5, i32 0, i32 3\n" +
+              "  store %struct.Node %t2, ptr %t8\n" +
+              "  call void @arc.retain(ptr %t5)\n" +
+              "  call void @arc.release(ptr %t5)\n" +
+              "  ret ptr %t5\n" +
+              "}\n")
+end a_result_carries_its_own_count
+
+@test("an aggregate delegates to a helper that walks its reference-carrying fields")
+an_aggregate_walks_the_fields_that_hold_a_count()
+    assert_eq(lowered_arc("struct Pair\n" +
+                           "    name: string\n" +
+                           "    n: int\n" +
+                           "end Pair\n" +
+                           "\n" +
+                           "hold(p: Pair) -> int = p.n\n" +
+                           "\n" +
+                           "var one = Pair(\"a\", 1)\n" +
+                           "var got: int = 0\n" +
+                           "\n" +
+                           "got = hold(one)\n",
+                          "arc.copy.Pair"),
+              "define private void @arc.copy.Pair(%struct.Pair %v) {\n" +
+              "entry:\n" +
+              "  %t1 = extractvalue %struct.Pair %v, 0\n" +
+              "  %t2 = extractvalue { ptr, ptr, i64 } %t1, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t2)\n" +
+              "  ret void\n" +
+              "}\n")
+end an_aggregate_walks_the_fields_that_hold_a_count
+
+@test("a payload with a destructor gets a hook of its own, which runs the drop before the walk")
+a_payload_with_a_destructor_gets_its_own_hook()
+    if arc_no_library() then return
+
+    assert_eq(lowered_whole("struct Env\n" +
+                            "    v: int\n" +
+                            "end Env\n" +
+                            "\n" +
+                            "impl Drop for Env\n" +
+                            "    drop(self) = ()\n" +
+                            "\n" +
+                            "var r: &Env = Env(1)\n",
+                            "arc.drop.Env"),
+              "define private void @arc.drop.Env(ptr %p, i1 %storage) {\n" +
+              "entry:\n" +
+              "  br i1 %storage, label %arc.give1, label %arc.over2\n" +
+              "arc.over2:\n" +
+              "  %t1 = getelementptr %arc.Env, ptr %p, i32 0, i32 3\n" +
+              "  %t2 = load %struct.Env, ptr %t1\n" +
+              "  call void @Env.drop(%struct.Env %t2)\n" +
+              "  ret void\n" +
+              "arc.give1:\n" +
+              "  call void @free(ptr %p)\n" +
+              "  ret void\n" +
+              "}\n")
+end a_payload_with_a_destructor_gets_its_own_hook
+
+@test("a payload that holds nothing shares the one hook that only gives the storage back")
+a_payload_holding_nothing_shares_the_plain_hook()
+    assert_eq(lowered_arc("struct Node\n" +
+                           "    v: int\n" +
+                           "end Node\n" +
+                           "\n" +
+                           "var r: &Node = Node(1)\n",
+                          "arc.drop.plain"),
+              "define private void @arc.drop.plain(ptr %p, i1 %storage) {\n" +
+              "entry:\n" +
+              "  br i1 %storage, label %arc.give1, label %arc.over2\n" +
+              "arc.over2:\n" +
+              "  ret void\n" +
+              "arc.give1:\n" +
+              "  call void @free(ptr %p)\n" +
+              "  ret void\n" +
+              "}\n")
+end a_payload_holding_nothing_shares_the_plain_hook
+
+@test("a buffer's hook walks the elements it still holds and then returns the storage")
+a_buffer_of_counted_elements_releases_each_one()
+    assert_eq(lowered_arc("var xs: []string = [\"a\"; 2]\n",
+                          "arc.dropbuf.string"),
+              "define private void @arc.dropbuf.string(ptr %p, i1 %storage) {\n" +
+              "entry:\n" +
+              "  %t4 = alloca i64\n" +
+              "  br i1 %storage, label %arc.give1, label %arc.over2\n" +
+              "arc.over2:\n" +
+              "  %t1 = getelementptr %arc.buf.string, ptr %p, i32 0, i32 3\n" +
+              "  %t2 = load i64, ptr %t1\n" +
+              "  %t3 = getelementptr %arc.buf.string, ptr %p, i32 0, i32 4\n" +
+              "  store i64 0, ptr %t4\n" +
+              "  br label %buf.test3\n" +
+              "buf.test3:\n" +
+              "  %t5 = load i64, ptr %t4\n" +
+              "  %t6 = icmp ult i64 %t5, %t2\n" +
+              "  br i1 %t6, label %buf.elem4, label %buf.done5\n" +
+              "buf.elem4:\n" +
+              "  %t7 = getelementptr { ptr, ptr, i64 }, ptr %t3, i64 %t5\n" +
+              "  %t8 = load { ptr, ptr, i64 }, ptr %t7\n" +
+              "  %t9 = extractvalue { ptr, ptr, i64 } %t8, 0\n" +
+              "  call void @arc.release_maybe(ptr %t9)\n" +
+              "  %t10 = add i64 %t5, 1\n" +
+              "  store i64 %t10, ptr %t4\n" +
+              "  br label %buf.test3\n" +
+              "buf.done5:\n" +
+              "  ret void\n" +
+              "arc.give1:\n" +
+              "  call void @free(ptr %p)\n" +
+              "  ret void\n" +
+              "}\n")
+end a_buffer_of_counted_elements_releases_each_one
+
+@test("a sized buffer checks its own size before it asks for the storage")
+a_sized_buffer_is_checked_before_it_is_asked_for()
+    assert_eq(lowered_arc("make(n: usize) -> usize\n" +
+                           "    val xs: []int = [7; n]\n" +
+                           "\n" +
+                           "    xs.len\n" +
+                           "end make\n" +
+                           "\n" +
+                           "var got: usize = 0\n" +
+                           "\n" +
+                           "got = make(2)\n",
+                          "make"),
+              "define i64 @make(i64 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i64\n" +
+              "  %xs.addr = alloca { ptr, ptr, i64 }\n" +
+              "  %t20 = alloca i64\n" +
+              "  store i64 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i64, ptr %n.addr\n" +
+              "  %t2 = getelementptr i32, ptr null, i64 1\n" +
+              "  %t3 = ptrtoint ptr %t2 to i64\n" +
+              "  %t4 = getelementptr %arc.buf.int, ptr null, i32 0, i32 4\n" +
+              "  %t5 = ptrtoint ptr %t4 to i64\n" +
+              "  %t6 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 %t1, i64 %t3)\n" +
+              "  %t7 = extractvalue { i64, i1 } %t6, 0\n" +
+              "  %t8 = extractvalue { i64, i1 } %t6, 1\n" +
+              "  %t9 = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %t7, i64 %t5)\n" +
+              "  %t10 = extractvalue { i64, i1 } %t9, 0\n" +
+              "  %t11 = extractvalue { i64, i1 } %t9, 1\n" +
+              "  %t12 = or i1 %t8, %t11\n" +
+              "  %t13 = xor i1 %t12, true\n" +
+              "  br i1 %t13, label %size.ok1, label %size.bad2\n" +
+              "size.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "size.ok1:\n" +
+              "  %t14 = call ptr @malloc(i64 %t10)\n" +
+              "  %t15 = icmp ne ptr %t14, null\n" +
+              "  br i1 %t15, label %alloc.ok3, label %alloc.bad4\n" +
+              "alloc.bad4:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "alloc.ok3:\n" +
+              "  store i64 1, ptr %t14\n" +
+              "  %t16 = getelementptr %arc.buf.int, ptr %t14, i32 0, i32 1\n" +
+              "  store ptr @arc.drop.plain, ptr %t16\n" +
+              "  %t17 = getelementptr %arc.buf.int, ptr %t14, i32 0, i32 2\n" +
+              "  store i64 1, ptr %t17\n" +
+              "  %t18 = getelementptr %arc.buf.int, ptr %t14, i32 0, i32 3\n" +
+              "  store i64 %t1, ptr %t18\n" +
+              "  %t19 = getelementptr %arc.buf.int, ptr %t14, i32 0, i32 4\n" +
+              "  store i64 0, ptr %t20\n" +
+              "  br label %buf.test5\n" +
+              "buf.test5:\n" +
+              "  %t21 = load i64, ptr %t20\n" +
+              "  %t22 = icmp ult i64 %t21, %t1\n" +
+              "  br i1 %t22, label %buf.elem6, label %buf.done7\n" +
+              "buf.elem6:\n" +
+              "  %t23 = getelementptr i32, ptr %t19, i64 %t21\n" +
+              "  store i32 7, ptr %t23\n" +
+              "  %t24 = add i64 %t21, 1\n" +
+              "  store i64 %t24, ptr %t20\n" +
+              "  br label %buf.test5\n" +
+              "buf.done7:\n" +
+              "  %t25 = insertvalue { ptr, ptr, i64 } zeroinitializer, ptr %t14, 0\n" +
+              "  %t26 = insertvalue { ptr, ptr, i64 } %t25, ptr %t19, 1\n" +
+              "  %t27 = insertvalue { ptr, ptr, i64 } %t26, i64 %t1, 2\n" +
+              "  %t28 = extractvalue { ptr, ptr, i64 } %t27, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t28)\n" +
+              "  store { ptr, ptr, i64 } %t27, ptr %xs.addr\n" +
+              "  %t29 = extractvalue { ptr, ptr, i64 } %t27, 0\n" +
+              "  call void @arc.release_maybe(ptr %t29)\n" +
+              "  %t30 = load { ptr, ptr, i64 }, ptr %xs.addr\n" +
+              "  %t31 = extractvalue { ptr, ptr, i64 } %t30, 2\n" +
+              "  %t32 = load { ptr, ptr, i64 }, ptr %xs.addr\n" +
+              "  %t33 = extractvalue { ptr, ptr, i64 } %t32, 0\n" +
+              "  call void @arc.release_maybe(ptr %t33)\n" +
+              "  ret i64 %t31\n" +
+              "}\n")
+end a_sized_buffer_is_checked_before_it_is_asked_for
+
+@test("an array literal is an insertvalue chain over the zero")
+an_array_literal_is_an_insertvalue_chain()
+    assert_eq(lowered_arc("sum3() -> int\n" +
+                           "    val a: [3]int = [1, 2, 3]\n" +
+                           "\n" +
+                           "    a[0] + a[1] + a[2]\n" +
+                           "end sum3\n" +
+                           "\n" +
+                           "var got: int = 0\n" +
+                           "\n" +
+                           "got = sum3()\n",
+                          "sum3"),
+              "define i32 @sum3() {\n" +
+              "entry:\n" +
+              "  %a.addr = alloca [3 x i32]\n" +
+              "  %t1 = insertvalue [3 x i32] zeroinitializer, i32 1, 0\n" +
+              "  %t2 = insertvalue [3 x i32] %t1, i32 2, 1\n" +
+              "  %t3 = insertvalue [3 x i32] %t2, i32 3, 2\n" +
+              "  store [3 x i32] %t3, ptr %a.addr\n" +
+              "  %t4 = icmp ult i64 0, 3\n" +
+              "  br i1 %t4, label %bounds.ok1, label %bounds.bad2\n" +
+              "bounds.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok1:\n" +
+              "  %t5 = getelementptr i32, ptr %a.addr, i64 0\n" +
+              "  %t6 = load i32, ptr %t5\n" +
+              "  %t7 = icmp ult i64 1, 3\n" +
+              "  br i1 %t7, label %bounds.ok3, label %bounds.bad4\n" +
+              "bounds.bad4:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok3:\n" +
+              "  %t8 = getelementptr i32, ptr %a.addr, i64 1\n" +
+              "  %t9 = load i32, ptr %t8\n" +
+              "  %t10 = add i32 %t6, %t9\n" +
+              "  %t11 = icmp ult i64 2, 3\n" +
+              "  br i1 %t11, label %bounds.ok5, label %bounds.bad6\n" +
+              "bounds.bad6:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok5:\n" +
+              "  %t12 = getelementptr i32, ptr %a.addr, i64 2\n" +
+              "  %t13 = load i32, ptr %t12\n" +
+              "  %t14 = add i32 %t10, %t13\n" +
+              "  ret i32 %t14\n" +
+              "}\n")
+end an_array_literal_is_an_insertvalue_chain
+
+@test("the entry point installs the stack guard and fills the storage a program starts with")
+the_entry_point_is_the_platform_s_own_signature()
+    assert_eq(lowered_arc("var acc: int = 0\n" +
+                           "\n" +
+                           "acc = 1\n",
+                          "main"),
+              "define i32 @main(i32 %argc, ptr %argv) {\n" +
+              "entry:\n" +
+              "  %acc.addr = alloca i32\n" +
+              "  call void @sysl_install_stack_guard()\n" +
+              "  store i32 0, ptr %acc.addr\n" +
+              "  store i32 1, ptr %acc.addr\n" +
+              "  ret i32 0\n" +
+              "}\n")
+end the_entry_point_is_the_platform_s_own_signature
+
+@test("a postcondition runs with 'result' bound to the value about to be returned")
+a_postcondition_reads_the_returned_value()
+    assert_eq(lowered_arc("double(n: int) -> int\n" +
+                           "    ensure result == n * 2\n" +
+                           "    n * 2\n" +
+                           "end double\n" +
+                           "\n" +
+                           "var got: int = 0\n" +
+                           "\n" +
+                           "got = double(2)\n",
+                          "double"),
+              "define i32 @double(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = mul i32 %t1, 2\n" +
+              "  %t3 = load i32, ptr %n.addr\n" +
+              "  %t4 = mul i32 %t3, 2\n" +
+              "  %t5 = icmp eq i32 %t2, %t4\n" +
+              "  br i1 %t5, label %ensure.ok1, label %ensure.bad2\n" +
+              "ensure.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "ensure.ok1:\n" +
+              "  ret i32 %t2\n" +
+              "}\n")
+end a_postcondition_reads_the_returned_value
+
+@test("an 'old' snapshot is taken into a hidden slot at entry")
+an_old_snapshot_is_taken_at_entry()
+    assert_eq(lowered_arc("bump(n: *int)\n" +
+                           "    ensure *n == old(*n) + 1\n" +
+                           "    *n += 1\n" +
+                           "end bump\n" +
+                           "\n" +
+                           "var x = 1\n" +
+                           "\n" +
+                           "bump(&x)\n",
+                          "bump"),
+              "define void @bump(ptr %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca ptr\n" +
+              "  %old.0.addr = alloca i32\n" +
+              "  store ptr %n.param, ptr %n.addr\n" +
+              "  %t1 = load ptr, ptr %n.addr\n" +
+              "  %t2 = load i32, ptr %t1\n" +
+              "  store i32 %t2, ptr %old.0.addr\n" +
+              "  %t3 = load ptr, ptr %n.addr\n" +
+              "  %t4 = load i32, ptr %t3\n" +
+              "  %t5 = add i32 %t4, 1\n" +
+              "  store i32 %t5, ptr %t3\n" +
+              "  %t6 = load ptr, ptr %n.addr\n" +
+              "  %t7 = load i32, ptr %t6\n" +
+              "  %t8 = load i32, ptr %old.0.addr\n" +
+              "  %t9 = add i32 %t8, 1\n" +
+              "  %t10 = icmp eq i32 %t7, %t9\n" +
+              "  br i1 %t10, label %ensure.ok1, label %ensure.bad2\n" +
+              "ensure.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "ensure.ok1:\n" +
+              "  ret void\n" +
+              "}\n")
+end an_old_snapshot_is_taken_at_entry
+
+@test("inline assembly loads every input before the block and stores every output after it")
+inline_assembly_is_operands_in_and_operands_out()
+    assert_eq(lowered_arc("copy(n: int) -> int\n" +
+                           "    var v: int = 0\n" +
+                           "    asm\n" +
+                           "        [x86_64]\n" +
+                           "            \"movl {n}, {v}\"\n" +
+                           "            in n : reg\n" +
+                           "            out v : reg\n" +
+                           "        [aarch64, thumb]\n" +
+                           "            \"mov {v}, {n}\"\n" +
+                           "            in n : reg\n" +
+                           "            out v : reg\n" +
+                           "        [riscv64, riscv32, craft]\n" +
+                           "            \"mv {v}, {n}\"\n" +
+                           "            in n : reg\n" +
+                           "            out v : reg\n" +
+                           "        [wasm32] unavailable \"there are no registers for an operand to land in\"\n" +
+                           "    v\n" +
+                           "end copy\n" +
+                           "\n" +
+                           "var got: int = 0\n" +
+                           "\n" +
+                           "got = copy(7)\n",
+                          "copy"),
+              "define i32 @copy(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %v.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  store i32 0, ptr %v.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = call i32 asm sideeffect \"mov $0, $1\", \"=r,r,~{memory},~{cc}\"(i32 %t1)\n" +
+              "  store i32 %t2, ptr %v.addr\n" +
+              "  %t3 = load i32, ptr %v.addr\n" +
+              "  ret i32 %t3\n" +
+              "}\n")
+end inline_assembly_is_operands_in_and_operands_out
+
+@test("a simple enum's variant carries the value the program wrote, not its position")
+a_simple_enum_s_variant_is_its_declared_value()
+    assert_eq(lowered_arc("enum Status: u8\n" +
+                           "    Ok = 0\n" +
+                           "    Warn = 10\n" +
+                           "\n" +
+                           "var got: u8 = 0\n" +
+                           "\n" +
+                           "got = u8(Warn)\n",
+                          "main"),
+              "define i32 @main(i32 %argc, ptr %argv) {\n" +
+              "entry:\n" +
+              "  %got.addr = alloca i8\n" +
+              "  call void @sysl_install_stack_guard()\n" +
+              "  store i8 0, ptr %got.addr\n" +
+              "  store i8 10, ptr %got.addr\n" +
+              "  ret i32 0\n" +
+              "}\n")
+end a_simple_enum_s_variant_is_its_declared_value
+
+@test("a volatile field reached through a pointer is one volatile load of the field")
+a_volatile_field_is_reached_at_its_own_address()
+    assert_eq(lowered_arc("struct Uart\n" +
+                           "    status: volatile u32\n" +
+                           "    data:   volatile u32\n" +
+                           "end Uart\n" +
+                           "\n" +
+                           "var block = Uart(1, 0)\n" +
+                           "var regs: *Uart = &block\n" +
+                           "var seen: u32 = 0\n" +
+                           "\n" +
+                           "regs.data = 65\n" +
+                           "seen = regs.status\n",
+                          "main"),
+              "define i32 @main(i32 %argc, ptr %argv) {\n" +
+              "entry:\n" +
+              "  %block.addr = alloca %struct.Uart\n" +
+              "  %regs.addr = alloca ptr\n" +
+              "  %seen.addr = alloca i32\n" +
+              "  call void @sysl_install_stack_guard()\n" +
+              "  %t1 = insertvalue %struct.Uart undef, i32 1, 0\n" +
+              "  %t2 = insertvalue %struct.Uart %t1, i32 0, 1\n" +
+              "  store %struct.Uart %t2, ptr %block.addr\n" +
+              "  store ptr %block.addr, ptr %regs.addr\n" +
+              "  store i32 0, ptr %seen.addr\n" +
+              "  %t3 = load ptr, ptr %regs.addr\n" +
+              "  %t4 = getelementptr %struct.Uart, ptr %t3, i32 0, i32 1\n" +
+              "  store volatile i32 65, ptr %t4\n" +
+              "  %t5 = load ptr, ptr %regs.addr\n" +
+              "  %t6 = getelementptr %struct.Uart, ptr %t5, i32 0, i32 0\n" +
+              "  %t7 = load volatile i32, ptr %t6\n" +
+              "  store i32 %t7, ptr %seen.addr\n" +
+              "  ret i32 0\n" +
+              "}\n")
+end a_volatile_field_is_reached_at_its_own_address
+
+@test("a bitfield struct places every field before it ors any of them together")
+a_bitfield_struct_places_before_it_joins()
+    assert_eq(lowered_arc("@packed\n" +
+                           "struct Ctrl\n" +
+                           "    enable: u1\n" +
+                           "    mode: u3\n" +
+                           "    prescale: u4\n" +
+                           "\n" +
+                           "var c = Ctrl(1, 5, 9)\n" +
+                           "var got: u4 = 0\n" +
+                           "\n" +
+                           "got = c.prescale\n",
+                          "main"),
+              "define i32 @main(i32 %argc, ptr %argv) {\n" +
+              "entry:\n" +
+              "  %c.addr = alloca %struct.Ctrl\n" +
+              "  %got.addr = alloca i4\n" +
+              "  call void @sysl_install_stack_guard()\n" +
+              "  %t1 = zext i1 1 to i8\n" +
+              "  %t2 = zext i3 5 to i8\n" +
+              "  %t3 = shl i8 %t2, 1\n" +
+              "  %t4 = zext i4 9 to i8\n" +
+              "  %t5 = shl i8 %t4, 4\n" +
+              "  %t6 = or i8 %t1, %t3\n" +
+              "  %t7 = or i8 %t6, %t5\n" +
+              "  %t8 = insertvalue %struct.Ctrl undef, i8 %t7, 0\n" +
+              "  store %struct.Ctrl %t8, ptr %c.addr\n" +
+              "  store i4 0, ptr %got.addr\n" +
+              "  %t9 = load %struct.Ctrl, ptr %c.addr\n" +
+              "  %t10 = extractvalue %struct.Ctrl %t9, 0\n" +
+              "  %t11 = lshr i8 %t10, 4\n" +
+              "  %t12 = trunc i8 %t11 to i4\n" +
+              "  store i4 %t12, ptr %got.addr\n" +
+              "  ret i32 0\n" +
+              "}\n")
+end a_bitfield_struct_places_before_it_joins
+
+
+// -- what escapes, and what has nowhere to go ------------------------------------------------------
+
+@test("a view of an array a caller passed by value has nowhere to be promoted")
+a_view_of_storage_this_body_did_not_make()
+    if arc_no_library() then return
+
+    assert_eq(refused_whole("struct Holder\n" +
+                            "    xs: [4]int\n" +
+                            "end Holder\n" +
+                            "\n" +
+                            "leak(h: Holder) -> []int = h.xs[..]\n" +
+                            "\n" +
+                            "var out: []int = [0; 1]\n" +
+                            "\n" +
+                            "out = leak(one_holder())\n" +
+                            "\n" +
+                            "one_holder() -> Holder = Holder([1, 2, 3, 4])\n"),
+              "a slice of an array this frame owns is returned, so it would outlive the array, " +
+              "and the storage is not this body's to move — it is a field of a value, an array a " +
+              "caller passed by value, or part of an array literal, which has no declaration to " +
+              "move. Declare it as a '[]T', which makes a buffer of its own and owns it, or as a " +
+              "'&[N]T' where the length is fixed")
+end a_view_of_storage_this_body_did_not_make
+
+@test("an array that asked for a boundary of its own may not be promoted to the heap")
+a_promotion_of_aligned_storage_is_refused()
+    if arc_no_library() then return
+
+    assert_eq(refused_whole("escape() -> []int\n" +
+                            "    @align(64)\n" +
+                            "    var a: [4]int = [1, 2, 3, 4]\n" +
+                            "\n" +
+                            "    a[..]\n" +
+                            "end escape\n" +
+                            "\n" +
+                            "var out: []int = [0; 1]\n" +
+                            "\n" +
+                            "out = escape()\n"),
+              "this view of 'a' is returned, so the array would move to the heap to outlive the " +
+              "frame — and 'a' asked to begin on a 64-byte boundary, which is the allocator's to " +
+              "answer there rather than this declaration's. Keep the view inside the frame, or " +
+              "put the boundary on a struct with '@align', which every value of that type carries " +
+              "wherever its storage is")
+end a_promotion_of_aligned_storage_is_refused
+
+@test("a view that stays inside the frame is not an escape and earns nothing")
+a_view_that_stays_in_the_frame_is_left_alone()
+    if arc_no_library() then return
+
+    assert_eq(refused_whole("count() -> usize\n" +
+                            "    var a: [4]int = [1, 2, 3, 4]\n" +
+                            "    val v = a[..]\n" +
+                            "\n" +
+                            "    v.len\n" +
+                            "end count\n" +
+                            "\n" +
+                            "var got: usize = 0\n" +
+                            "\n" +
+                            "got = count()\n"),
+              "")
+end a_view_that_stays_in_the_frame_is_left_alone
+
+// **Nothing in a type says "borrowed", so a promise a trait writes down has to be checked against
+// every implementation of it** -- and that check is what licenses a call site to pass a
+// frame-backed view through a trait object at all.
+@test("an implementation that keeps what a trait lent it is refused by the name the trait gave")
+an_implementation_that_keeps_what_it_borrowed()
+    if arc_no_library() then return
+
+    assert_eq(refused_whole("trait Sink\n" +
+                            "    @borrows(bytes)\n" +
+                            "    put(*self, bytes: []const u8)\n" +
+                            "\n" +
+                            "struct Bad\n" +
+                            "    held: []const u8\n" +
+                            "\n" +
+                            "impl Sink for Bad\n" +
+                            "    put(*self, bytes: []const u8)\n" +
+                            "        self.held = bytes\n" +
+                            "\n" +
+                            "var b: Bad\n" +
+                            "var s: *Sink = &b\n" +
+                            "var buf: [8]u8\n" +
+                            "\n" +
+                            "s.put(buf[0..<4])\n"),
+              "'Bad.put' keeps what it is passed as 'bytes', but 'Sink' declares that parameter " +
+              "borrowed for the call — it may be a view of the caller's stack, so copy what this " +
+              "needs into storage of its own")
+end an_implementation_that_keeps_what_it_borrowed

@@ -41,6 +41,12 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         emit(e, InLoad(r, lty(e, ty), VReg(s"$name.addr"), access_of(ty), None))
         r
 
+    // `result` in a postcondition is the value about to be returned, which is a register the return
+    // is already holding rather than anything read back.
+    TResult(_) -> e.result_ssa match
+        Some(v) -> v
+        None -> gap_at(e, "'result' outside a postcondition")
+
     TOld(index, ty) ->
         val r = fresh_reg(e)
 
@@ -61,6 +67,17 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         r
 
     TAddrOf(place, _) -> address(e, place)
+
+    // `&value` -- the storage a computed value has no address for. The slot is an ordinary alloca,
+    // so it belongs to the **frame** rather than to the block that wrote it, and the count it takes
+    // is the one a `var`'s slot takes: registered with the scope being emitted, released where that
+    // scope ends. Everything about the pointer afterwards is what a `*T` always is.
+    TTempAddr(value, _) ->
+        val slot = alloca(e, fresh_reg(e), lty_of(e, value))
+
+        gen_into(e, slot, value)
+        own_at(e, slot, texpr_type(value))
+        slot
 
     TField(receiver, index, ty) -> gen_field(e, x, receiver, index, ty)
 
@@ -117,6 +134,71 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
 
     TConstrainedValid(value, c) -> gen_constrained_valid(e, value, c)
     TConstrainedStep(value, c, up, _) -> gen_constrained_step(e, value, c, up)
+
+    // A reference is made by putting the value on the heap, and the expression owns the count it
+    // comes back with.
+    TBox(value, ref_ty) -> gen_box(e, value, ref_ty)
+
+    // An array literal is an `insertvalue` chain over the zero, which is what makes a literal of
+    // constants fold to one in the object file. A large one is built in storage instead, which
+    // nothing here writes yet.
+    TArrayLit(elems, array_ty) ->
+        if e.layout.indirect(array_ty) then return gap_at(e, "a large array literal")
+
+        var acc: Val = VZero
+
+        for i in 0..<elems.len()
+            val v = gen_expr(e, elems.at(i))
+            val r = fresh_reg(e)
+
+            emit(e, InInsert(r, lty(e, array_ty), acc, lty(e, element(array_ty).unwrap_or(int_type())), v, index_list(int(i))))
+            acc = r
+
+        acc
+
+    // The same two forms, sized and owned rather than laid out in a frame. Each element the buffer
+    // takes is a share of its own -- the box holds them until its hook lets them go -- so the value
+    // that lands in one is retained as it is stored, exactly as a slot that binds an array is.
+    //
+    // An empty view has no storage to make, so it is the zero value of its own representation:
+    // `{owner = null, data = null, len = 0}`. It is not owned either -- there is no box for a
+    // release to let go of, and a null owner is what a view that owns nothing already carries.
+    TBufLit(elems, slice_ty) ->
+        if elems.is_empty() then return VZero
+
+        val elem = element(slice_ty).unwrap_or(int_type())
+
+        var vals: Buf[Val] = buf()
+
+        for i in 0..<elems.len()
+            vals.push(gen_expr(e, elems.at(i)))
+
+        val n = VInt(from_int(long(vals.len())))
+        val made = gen_buffer(e, elem, n)
+
+        for i in 0..<vals.len()
+            retain_value(e, elem, vals.at(i))
+
+            val ep = fresh_reg(e)
+
+            var idx: Buf[IrArg] = buf()
+
+            idx.push(ir_arg(word_lty(e), VInt(from_int(long(i)))))
+            emit(e, InGep(ep, lty(e, elem), made.1, idx))
+            emit(e, InStore(lty(e, elem), vals.at(i), ep, AccPlain, None))
+
+        buffer_view(e, slice_ty, made.0, made.1, n)
+
+    // The value is generated once, above the loop, which is what makes `[tick(); n]` one call whose
+    // result lands in n places -- and the reason the count may be zero and the call still happen.
+    TBufFill(value, count, slice_ty) ->
+        val elem = element(slice_ty).unwrap_or(int_type())
+        val v = gen_expr(e, value)
+        val n = widen_index(e, count)
+        val made = gen_buffer(e, elem, n)
+
+        fill_elements(e, elem, made.1, n, v)
+        buffer_view(e, slice_ty, made.0, made.1, n)
 
     TEnumNew(enum_ty, variant, args) -> gen_enum_new(e, enum_ty, variant, args)
     TEnumFromInt(value, en) -> gen_expr(e, value)
@@ -437,7 +519,7 @@ private gen_update(e: *Emit, place: TExpr, op: string, value: TExpr, ty: Type,
         Some(c) -> emit_constraint_checks(e, updated, c)
         None -> ()
 
-    store_place(e, place, p, updated)
+    store_over(e, place, p, updated, Some(cur))
     updated
 end gen_update
 
@@ -453,7 +535,7 @@ private gen_inc_dec(e: *Emit, place: TExpr, op: string, pre: bool, ty: Type,
         Some(c) -> emit_constraint_checks(e, nv, c)
         None -> ()
 
-    store_place(e, place, p, nv)
+    store_over(e, place, p, nv, Some(cur))
     if pre then nv else cur
 end gen_inc_dec
 
@@ -689,8 +771,6 @@ end arg_value
 
 // Emits a call from sysl to sysl and hands back the register holding its result.
 gen_sysl_call(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type) -> Val
-    if contains_counted(ty) then return gap_at(e, "a call whose result holds a reference")
-
     if e.layout.indirect(ty)
         val slot = alloca(e, fresh_reg(e), lty(e, ty))
 
@@ -706,7 +786,7 @@ gen_sysl_call(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type) -> Val
         val r = fresh_reg(e)
 
         emit(e, InLoad(r, lty(e, ty), slot, AccPlain, None))
-        return r
+        return own_temp(e, r, ty)
 
     if no_value(ty)
         emit(e, InCall(None, LVoid, callee, arg_vals, no_ir_attrs(), None, no_fast_math(), false))
@@ -719,7 +799,7 @@ gen_sysl_call(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type) -> Val
 
     emit(e, InCall(Some(r), lty(e, ty), callee, arg_vals, c_extension(ty, e.target), None,
                    no_fast_math(), false))
-    r
+    own_temp(e, r, ty)
 end gen_sysl_call
 
 no_fast_math() -> Buf[FastMath]

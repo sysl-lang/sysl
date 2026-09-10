@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, from_int}
+import sysl.math.bigint.{BigInt, from_int, to_string}
 import sysl.math.decimal.{Decimal, of as decimal_of, parse as decimal_parse}
 import sysl.text.Search
 
@@ -639,7 +639,10 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
 
         return open.unwrap()
 
-    val made: &StructType = StructType(key, targs, buf(), d.packed, None, None)
+    // **`@align` is part of what the layout IS**, so it is folded here rather than left for whoever
+    // asks the size: it is fixed while compiling and is part of what the module publishes.
+    val made: &StructType = StructType(key, targs, buf(), d.packed,
+                                       aligned_to(a, scope, span, written, d.alignment), None)
     val ty = Struct(made)
 
     a.tables.in_progress.put(inst, ty)
@@ -694,6 +697,12 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
 
     val subst = bindings_for(d.tparams, targs)
 
+    // **A simple enum's tag is its discriminant, which is the value the program wrote.** A data
+    // enum's is its position, since nothing may name one. So the two are assigned by different
+    // rules, and only the first of them reads what was written after the `=`.
+    val cx = analyzer_for(a, home)
+    var next_tag = 0
+
     for i in 0..<d.variants.len()
         val v = d.variants.at(i)
         var fields: Buf[(string, Type)] = buf()
@@ -701,13 +710,102 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
         for j in 0..<v.fields.len()
             fields.push((v.fields.at(j).name, resolve_type(a, home, v.fields.at(j).typ, subst)))
 
-        made.variants.push(EnumVariant(v.name, int(i), fields, !v.fields.is_empty()))
+        var tag = next_tag
+
+        if simple
+            v.value match
+                // A discriminant is any compile-time integer, so a negative one under a signed
+                // underlying type folds from the unary negation the parser gives, and a `const` may
+                // stand where a literal does.
+                Some(written_value) -> const_int(cx, written_value) match
+                    Some(n) -> tag = fitting_tag(a, scope, span, v.name, n, underlying)
+                    None ->
+                        a.fault(scope, span,
+                                s"the value of variant '${v.name}' must be a constant integer")
+                None -> tag = fitting_tag(a, scope, span, v.name, from_int(long(next_tag)),
+                                          underlying)
+        else if v.value.is_some()
+            a.fault(scope, span,
+                    s"variant '${v.name}' carries data, so it cannot also have an explicit value")
+
+        next_tag = tag + 1
+        made.variants.push(EnumVariant(v.name, tag, fields, !v.fields.is_empty()))
+
+    // A simple enum's value *is* its identity -- there is nothing else to tell two variants apart --
+    // so two names for one value leave the language unable to keep its own promises: the second
+    // variant's `match` arm can never run, and the lowering becomes a switch with a repeated case
+    // the assembler rejects outright. A data enum cannot reach this, since its tags are assigned in
+    // order and it refuses an explicit value.
+    if simple then refuse_repeated_tags(a, scope, span, made.variants)
 
     a.resolving.truncate(a.resolving.len() - 1)
     a.tables.in_progress.remove(inst)
     a.tables.enum_insts.put(inst, ty)
     ty
 end instantiate_enum
+
+// One discriminant, checked against the storage the `: iN` annotation pinned -- which is the whole
+// point of pinning it.
+private fitting_tag(a: &Analysis, scope: Scope, span: Span, name: string, n: BigInt,
+                    underlying: Type) -> int
+    underlying match
+        Integer(bits, signed, _) ->
+            if !fits(n, bits, signed)
+                a.fault(scope, span, s"discriminant ${to_string(n)} of variant '$name' does not " +
+                        s"fit ${type_show(underlying)}")
+        _ -> ()
+
+    int(n.to_long().unwrap_or(0))
+end fitting_tag
+
+private refuse_repeated_tags(a: &Analysis, scope: Scope, span: Span, variants: Buf[EnumVariant])
+    for i in 0..<variants.len()
+        for j in 0..<i
+            if variants.at(j).tag == variants.at(i).tag
+                a.fault(scope, span,
+                        s"variants '${variants.at(j).name}' and '${variants.at(i).name}' both " +
+                        s"stand for ${variants.at(i).tag}, and a simple enum's values are the " +
+                        "whole of what tells its variants apart — a second name for one value is " +
+                        "a 'const'")
+                return
+end refuse_repeated_tags
+
+// The boundary a struct asked to begin on, where it asked for one. A boundary is a power of two,
+// since an address is aligned by having low bits clear, and it has to be settled while compiling.
+private aligned_to(a: &Analysis, scope: Scope, span: Span, written: string,
+                   asked: Option[Expr]) -> Option[usize]
+    if asked.is_none() then return None
+
+    val cx = analyzer_for(a, scope)
+
+    const_int(cx, asked.unwrap()) match
+        None ->
+            a.fault(scope, span, s"'@align' on '$written' needs a constant — a literal, a 'const', " +
+                    "or the arithmetic over them. A layout is fixed while compiling and is part of " +
+                    "what this module publishes, so it cannot wait on a value")
+            None
+        Some(n) ->
+            val bytes = n.to_long().unwrap_or(0)
+
+            if bytes <= 0 || !is_power_of_two(bytes)
+                a.fault(scope, span, s"'@align(${to_string(n)})' on '$written' is not an " +
+                        "alignment — a boundary is a power of two, since an address is aligned by " +
+                        "having low bits clear")
+                return None
+
+            Some(usize(bytes))
+end aligned_to
+
+private is_power_of_two(n: long) -> bool
+    var v = n
+
+    while v > 1
+        if v % 2 != 0 then return false
+
+        v /= 2
+
+    v == 1
+end is_power_of_two
 
 // A trait used as a type.
 private instantiate_trait(a: &Analysis, scope: Scope, span: Span, written: string, key: string,

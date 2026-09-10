@@ -383,3 +383,76 @@ a_scalar_is_looked_up_by_its_word()
     assert(type_eq(scalar_named("usize", 32).unwrap(), usize_type(32)))
     assert(type_eq(scalar_named("va_list", 64).unwrap(), VaList))
     assert(scalar_named("Buf", 64).is_none())
+
+// -- a simple enum's discriminants -------------------------------------------------------------------
+
+// **`tag` is the discriminant**: a simple enum's is the integer value the program wrote, and a data
+// enum's is its position, since nothing may name one. Every message below was read out of the
+// reference compiler on the same source.
+private enum_said(text: string) -> string
+    val said = decl_diagnostics(text)
+
+    if said.is_empty() then "" else said.at(0)
+end enum_said
+
+@test("a value that does not fit the underlying integer is refused, naming the type it was pinned to")
+a_discriminant_that_does_not_fit()
+    assert_eq(enum_said("enum E: u8\n    A = 300\n"),
+              "discriminant 300 of variant 'A' does not fit byte")
+end a_discriminant_that_does_not_fit
+
+@test("a variant that carries data cannot also be given a value")
+a_data_variant_has_no_value_to_give()
+    assert_eq(enum_said("enum E\n    A(n: int)\n    B = 2\n"),
+              "variant 'B' carries data, so it cannot also have an explicit value")
+end a_data_variant_has_no_value_to_give
+
+@test("two variants standing for one value leave nothing to tell them apart")
+two_variants_may_not_share_a_value()
+    assert_eq(enum_said("enum E: u8\n    A = 1\n    B = 1\n"),
+              "variants 'A' and 'B' both stand for 1, and a simple enum's values are the whole of " +
+              "what tells its variants apart — a second name for one value is a 'const'")
+end two_variants_may_not_share_a_value
+
+@test("a value that is not a compile-time integer is refused")
+a_discriminant_must_fold_to_an_integer()
+    assert_eq(enum_said("enum E: u8\n    A = \"x\"\n"),
+              "the value of variant 'A' must be a constant integer")
+end a_discriminant_must_fold_to_an_integer
+
+// -- what `@align` on a struct says --------------------------------------------------------------
+
+// **A boundary is part of what the layout IS**, so a struct that asked for one is that wide and that
+// aligned. Every message below was read out of the reference compiler on the same source.
+@test("a struct that asked for a boundary is that aligned, and its size rounds up to it")
+an_aligned_struct_is_as_wide_as_its_boundary()
+    assert_eq(emit_func_text("@align(64)\nstruct Head\n    tag: u8\n    len: u32\n\n" +
+                             "var q: usize = 0\nvar r: usize = 0\n\n" +
+                             "q = sizeof(Head)\nr = alignof(Head)\n", "main"),
+              "define i32 @main(i32 %argc, ptr %argv) {\n" +
+              "entry:\n" +
+              "  %q.addr = alloca i64\n" +
+              "  %r.addr = alloca i64\n" +
+              "  call void @sysl_install_stack_guard()\n" +
+              "  store i64 0, ptr %q.addr\n" +
+              "  store i64 0, ptr %r.addr\n" +
+              "  store i64 64, ptr %q.addr\n" +
+              "  store i64 64, ptr %r.addr\n" +
+              "  ret i32 0\n" +
+              "}\n")
+end an_aligned_struct_is_as_wide_as_its_boundary
+
+@test("a boundary that is not a power of two is not a boundary")
+an_alignment_is_a_power_of_two()
+    assert_eq(enum_said("@align(3)\nstruct H\n    a: u8\n"),
+              "'@align(3)' on 'H' is not an alignment — a boundary is a power of two, since an " +
+              "address is aligned by having low bits clear")
+end an_alignment_is_a_power_of_two
+
+@test("a boundary that is not settled while compiling is refused")
+an_alignment_must_be_a_constant()
+    assert_eq(enum_said("@align(x)\nstruct H\n    a: u8\n"),
+              "'@align' on 'H' needs a constant — a literal, a 'const', or the arithmetic over " +
+              "them. A layout is fixed while compiling and is part of what this module publishes, " +
+              "so it cannot wait on a value")
+end an_alignment_must_be_a_constant

@@ -1,0 +1,983 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// **Escape analysis for slices.**
+//
+// A slice keeps its buffer alive through its owner word -- except when there is no owner, which is
+// exactly the case of a slice of an array this frame owns. Such a view is valid until the frame
+// returns and no longer, so this pass finds the ones that could be reached afterwards, moves the
+// arrays it can move, and refuses the rest.
+//
+// The programmer writes nothing. Two things make that affordable: the answer for a whole function
+// collapses to one bit per parameter -- *does the callee let this argument outlive the call* -- and
+// every body is available to be asked. The bits are computed over the call graph and iterated to a
+// fixpoint, so a recursive function converges on the truth rather than on the conservative answer.
+
+// Which local arrays each body must allocate on the heap rather than in its frame.
+//
+// An array is in here when a view of it gets out of the frame that declared it, and the answer to
+// that is promotion rather than a diagnostic: the storage becomes a counted buffer, the slice's
+// owner points at it, and it lives exactly as long as the last view of it. Only arrays that are
+// **both** sliced and escaped are here; one that is merely read, or whose views stay in the frame,
+// keeps its stack slot.
+struct Promotions
+    // Keyed by function name, with the entry file's statements under the empty key because they are
+    // not a function.
+    by_func: Buf[(string, Buf[string])]
+    in_main: Buf[string]
+
+    // The **temporaries** to give storage of their own: a full-range slice of an array literal that
+    // escapes, by the span of the slice.
+    //
+    // A declared array has a declaration to promote and is named above; an array literal in
+    // expression position has none, and until this existed it was refused outright -- with a
+    // sentence offering two explanations that are neither of them true of a temporary in the frame
+    // that made it.
+    temporaries: Buf[Span]
+
+    // The arrays this body must move, in the terms the emitter asks: a function's name, or the empty
+    // string for the statements a program runs.
+    for_func(self, name: string) -> Buf[string]
+        if name == "" then return self.in_main
+
+        for i in 0..<self.by_func.len()
+            if self.by_func.at(i).0 == name then return self.by_func.at(i).1
+
+        buf()
+    end for_func
+
+    holds_temp(self, at: Span) -> bool
+        for i in 0..<self.temporaries.len()
+            if self.temporaries.at(i) == at then return true
+
+        false
+    end holds_temp
+end Promotions
+
+// The answer for a program nothing escapes out of.
+no_promotions() -> Promotions
+    var by_func: Buf[(string, Buf[string])] = buf()
+    var in_main: Buf[string] = buf()
+    var temporaries: Buf[Span] = buf()
+
+    Promotions(by_func, in_main, temporaries)
+end no_promotions
+
+// What one body's walk found: the arrays it must move, the temporaries it must give storage to,
+// whether any confined view left the frame at all, and the sites a module with no allocator has to
+// be told about.
+struct EscapeWalk
+    confined: Buf[(string, EView)]
+    promoted: Buf[string]
+    temps: Buf[(Span, string)]
+
+    // The array, where the view that carried it out was written, and how -- for the two readers
+    // that have to say something else about a promotion.
+    sites: Buf[EscapeSite]
+
+    // Whether any confined view left the frame at all, promotable or not. This is what a parameter
+    // summary asks -- "does the callee let this outlive the call" is a yes/no, and the roots that
+    // answer promotion are not its question.
+    got_out: bool
+
+    // The first escape that has nowhere to be promoted, which is the one refusal this walk makes.
+    refusal: Option[(Span, string)]
+
+    // Whether returning a view counts as leaving. A returned view goes up one frame, where the
+    // storage it names is still alive; that is the difference between keeping a thing and viewing
+    // it, and it is what a parameter summary is asked without.
+    returning_escapes: bool
+
+    // The arrays this body declares for itself, which are the ones it may move. A `[N]T` parameter
+    // is storage the caller laid out, so it is deliberately not here.
+    locals: Buf[string]
+
+    // The place each `ref` in the body stands for, so a walk that reaches one of those names can
+    // carry on to the storage it really names.
+    ref_of: Buf[(string, TExpr)]
+
+    // The arrays this body declared with a boundary of their own, and the boundary each asked for.
+    aligned: Buf[(string, usize)]
+end EscapeWalk
+
+// One promotion, with its parts still separate.
+struct EscapeSite
+    // The array's own name, or the empty string where the subject is a temporary.
+    name: string
+
+    // What to call a temporary in the one sentence a reader is given about it. There is no name they
+    // wrote, so the sentence has to hand back something they can find on the line.
+    what: string
+    at: Span
+    how: string
+end EscapeSite
+
+// What frame-owned storage a value may view: the local arrays it roots at by name, the temporaries
+// it roots at by position, and whether it also views frame storage this pass cannot name.
+//
+// The distinction is what decides promotion from diagnostic. A view rooted at a plain local array
+// has somewhere to move the storage to, and so does one rooted at a **temporary** -- a value the
+// frame computed and nobody named, which is nobody else's to move either. One rooted at a field of a
+// **named** local struct, or at an array parameter the caller passed by value, does not.
+struct EView
+    named: Buf[string]
+    anonymous: bool
+    temps: Buf[(Span, string)]
+
+    non_empty(self) -> bool = !self.named.is_empty() || self.anonymous || !self.temps.is_empty()
+end EView
+
+private no_view() -> EView
+    var named: Buf[string] = buf()
+    var temps: Buf[(Span, string)] = buf()
+
+    EView(named, false, temps)
+end no_view
+
+private unnamed_view() -> EView
+    var v = no_view()
+
+    v.anonymous = true
+    v
+end unnamed_view
+
+private named_view(name: string) -> EView
+    var v = no_view()
+
+    v.named.push(name)
+    v
+end named_view
+
+private temp_view(at: Span, what: string) -> EView
+    var v = no_view()
+
+    v.temps.push((at, what))
+    v
+end temp_view
+
+private join_views(a: EView, b: EView) -> EView
+    var out = no_view()
+
+    for i in 0..<a.named.len()
+        push_name(&out.named, a.named.at(i))
+
+    for i in 0..<b.named.len()
+        push_name(&out.named, b.named.at(i))
+
+    for i in 0..<a.temps.len()
+        out.temps.push(a.temps.at(i))
+
+    for i in 0..<b.temps.len()
+        out.temps.push(b.temps.at(i))
+
+    out.anonymous = a.anonymous || b.anonymous
+    out
+end join_views
+
+private push_name(into: *Buf[string], name: string)
+    for i in 0..<into.len()
+        if into.at(i) == name then return
+
+    into.push(name)
+end push_name
+
+// -- the whole program -------------------------------------------------------------------------------
+
+// Analyzes a whole program: the promotions to make, with every escape that has nowhere to go
+// reported against the view that causes it.
+check_escapes(a: &Analysis, p: TProgram) -> Promotions
+    val keeps: &KeptParams = KeptParams(buf())
+
+    settle_summaries(p, keeps)
+    refuse_borrowed(a, p, keeps)
+
+    var out = no_promotions()
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+        val w = walk_body(p, keeps, f.body.stmts, f.body.result, true)
+
+        report_body(a, p, func_home(a, f.name), Some(f.name), w)
+
+        if !w.promoted.is_empty() then out.by_func.push((f.name, w.promoted))
+
+        for j in 0..<w.temps.len()
+            out.temporaries.push(w.temps.at(j).0)
+
+    val mw = walk_body(p, keeps, p.main, None, true)
+
+    report_body(a, p, entry_home(a), None, mw)
+
+    for j in 0..<mw.temps.len()
+        out.temporaries.push(mw.temps.at(j).0)
+
+    out.in_main = mw.promoted
+    out
+end check_escapes
+
+// For each function, which of its slice-carrying parameters it lets outlive the call. Starts
+// optimistic -- nothing is kept -- and grows until it stops changing, which is what makes a
+// recursive function converge on its real behaviour.
+struct KeptParams
+    pairs: Buf[(string, usize)]
+
+    holds(self, name: string, i: usize) -> bool
+        for k in 0..<self.pairs.len()
+            if self.pairs.at(k).0 == name && self.pairs.at(k).1 == i then return true
+
+        false
+    end holds
+end KeptParams
+
+private settle_summaries(p: TProgram, keeps: &KeptParams)
+    var changed = true
+
+    while changed
+        changed = false
+
+        for i in 0..<p.funcs.len()
+            val f = p.funcs.at(i)
+
+            for j in 0..<f.params.len()
+                if !carries_view(f.params.at(j).1) then continue
+                if keeps.holds(f.name, j) then continue
+
+                if kepts(p, keeps, f, f.params.at(j).0)
+                    keeps.pairs.push((f.name, j))
+                    changed = true
+end settle_summaries
+
+// Whether a function lets a parameter outlive the *call* -- which returning a view of it does not.
+private kepts(p: TProgram, keeps: &KeptParams, f: TFunc, param: string) -> bool
+    var seeds: Buf[(string, EView)] = buf()
+
+    seeds.push((param, unnamed_view()))
+
+    val w = walk_seeded(p, keeps, seeds, f.body.stmts, f.body.result, false, false)
+
+    w.got_out
+end kepts
+
+// A function whose body is not here keeps everything, since nothing can tell whether the foreign
+// side holds on to what it was handed.
+private kept_by(p: TProgram, keeps: &KeptParams, name: string, i: usize) -> bool
+    if !declares_body(p, name) then return true
+
+    keeps.holds(name, i)
+end kept_by
+
+private declares_body(p: TProgram, name: string) -> bool
+    for i in 0..<p.funcs.len()
+        if p.funcs.at(i).name == name then return true
+
+    false
+end declares_body
+
+// -- one body ----------------------------------------------------------------------------------------
+
+private walk_body(p: TProgram, keeps: &KeptParams, stmts: Buf[TStmt], result: Option[TExpr],
+                  returning: bool) -> EscapeWalk
+    var seeds: Buf[(string, EView)] = buf()
+
+    walk_seeded(p, keeps, seeds, stmts, result, returning, true)
+end walk_body
+
+// Propagates through the body's own locals to a fixpoint, then looks for the places a confined view
+// could get out.
+private walk_seeded(p: TProgram, keeps: &KeptParams, seeds: Buf[(string, EView)], stmts: Buf[TStmt],
+                    result: Option[TExpr], returning: bool, gather: bool) -> EscapeWalk
+    var promoted: Buf[string] = buf()
+    var temps: Buf[(Span, string)] = buf()
+    var sites: Buf[EscapeSite] = buf()
+    var locals: Buf[string] = buf()
+    var ref_of: Buf[(string, TExpr)] = buf()
+    var aligned: Buf[(string, usize)] = buf()
+
+    if gather
+        locals = local_arrays(stmts)
+        ref_of = ref_bindings(stmts)
+        aligned = aligned_arrays(stmts)
+
+    val w: &EscapeWalk = EscapeWalk(seeds, promoted, temps, sites, false, None, returning, locals,
+                                    ref_of, aligned)
+    val prog = p
+    val kp = keeps
+    var changed = true
+
+    while changed
+        val before: &Counted = Counted(0)
+
+        walk_stmts(stmts, stmt_walk(false, s -> bind_one(prog, kp, w, before, s)))
+        changed = before.n > 0
+
+    walk_stmts(stmts, stmt_walk(false, s -> check_one(prog, kp, w, s)))
+
+    result match
+        Some(r) -> returned(prog, kp, w, r)
+        None -> ()
+
+    *w
+end walk_seeded
+
+// One statement's bindings: a local views whatever it was given, and a `ref` name views whatever its
+// place views.
+private bind_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, changed: &Counted, s: TStmt) = s match
+    TVarDecl(name, _, init, _) -> bind_view(p, keeps, w, changed, name, init)
+    TRefDecl(name, _, place) -> bind_view(p, keeps, w, changed, name, place)
+    TExprStmt(e) -> *e.kind match
+        TStore(place, v, _) -> *place.kind match
+            TLoad(name, _) -> bind_view(p, keeps, w, changed, name, v)
+            _ -> ()
+        _ -> ()
+
+    // A multi-assignment's arms are stores, and one landing in a plain local binds that local to
+    // what it was given for the same reason a single one does.
+    TMultiAssign(writes) ->
+        for i in 0..<writes.len()
+            *writes.at(i).place.kind match
+                TLoad(name, _) -> bind_view(p, keeps, w, changed, name, writes.at(i).value)
+                _ -> ()
+    _ -> ()
+
+private bind_view(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, changed: &Counted, name: string,
+                  from: TExpr)
+    val v = views(p, keeps, w, from)
+    val had = confined_of(w, name)
+    val now = join_views(had, v)
+
+    if view_eq(had, now) then return
+
+    set_confined(w, name, now)
+    changed.n = changed.n + 1
+end bind_view
+
+private confined_of(w: &EscapeWalk, name: string) -> EView
+    for i in 0..<w.confined.len()
+        if w.confined.at(i).0 == name then return w.confined.at(i).1
+
+    no_view()
+end confined_of
+
+private set_confined(w: &EscapeWalk, name: string, v: EView)
+    for i in 0..<w.confined.len()
+        if w.confined.at(i).0 == name
+            w.confined.set(i, (name, v))
+            return
+
+    w.confined.push((name, v))
+end set_confined
+
+private view_eq(a: EView, b: EView) -> bool
+    if a.anonymous != b.anonymous then return false
+    if a.named.len() != b.named.len() || a.temps.len() != b.temps.len() then return false
+
+    for i in 0..<a.named.len()
+        if a.named.at(i) != b.named.at(i) then return false
+
+    for i in 0..<a.temps.len()
+        if a.temps.at(i).0 != b.temps.at(i).0 then return false
+
+    true
+end view_eq
+
+// -- where a view stops being confined ------------------------------------------------------------------
+
+private check_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, s: TStmt) = s match
+    TReturn(v) -> v match
+        Some(x) -> returned(p, keeps, w, x)
+        None -> ()
+    TVarDecl(_, _, e, _) -> escaping(p, keeps, w, e)
+    TRefDecl(_, _, e) -> escaping(p, keeps, w, e)
+    TExprStmt(e) -> escaping(p, keeps, w, e)
+
+    // Each arm is a store, so each is walked as one: a view that lands anywhere but a plain local of
+    // this body has left it, exactly as it would after a single `=`.
+    TMultiAssign(writes) ->
+        for i in 0..<writes.len()
+            escaping(p, keeps, w, writes.at(i).value)
+
+            *writes.at(i).place.kind match
+                TLoad(_, _) -> escaping(p, keeps, w, writes.at(i).place)
+                _ ->
+                    if views(p, keeps, w, writes.at(i).value).non_empty()
+                        gets_out(p, keeps, w, writes.at(i).value,
+                                 "is stored somewhere the frame does not own")
+
+    // A `break value` carries the value out of the loop; walk it for the escape sites it may
+    // contain. Whether it then leaves the frame is decided where the loop's own value is used.
+    TBreak(v, _) -> v match
+        Some(x) -> escaping(p, keeps, w, x)
+        None -> ()
+    _ -> ()
+
+private returned(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, v: TExpr)
+    if w.returning_escapes && views(p, keeps, w, v).non_empty() then gets_out(p, keeps, w, v,
+                                                                             "is returned")
+    else escaping(p, keeps, w, v)
+end returned
+
+// Walks an expression for the places a confined view stops being confined: the heap, a store into
+// anything but a plain local of this function, and an argument the callee keeps.
+private escaping(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr)
+    val prog = p
+    val kp = keeps
+    val walk = w
+
+    walk_texpr(e, expr_walk(false, x -> escaping_one(prog, kp, walk, x)))
+end escaping
+
+private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) = *e.kind match
+    TBox(v, _) -> if views(p, keeps, w, v).non_empty() then gets_out(p, keeps, w, v,
+                                                                    "is put on the heap")
+
+    TStore(place, v, _) -> *place.kind match
+        TLoad(_, _) -> ()
+        _ ->
+            if views(p, keeps, w, v).non_empty()
+                gets_out(p, keeps, w, v, "is stored somewhere the frame does not own")
+
+    TCall(name, args, _, _) ->
+        for i in 0..<args.len()
+            if views(p, keeps, w, args.at(i)).non_empty() && kept_by(p, keeps, name, i)
+                gets_out(p, keeps, w, args.at(i), s"is passed to '$name', which holds on to it")
+
+    // Which body a trait object's call reaches is decided at run time, so there is no one summary to
+    // consult -- the conservative answer is the only sound one, exactly as it is for a function
+    // whose body this program does not have. A borrowing promise is the exception, and only because
+    // every implementation of one has been checked to borrow rather than keep.
+    TVCall(recv, slot, args, _, _) ->
+        val promised = borrows_of(p, texpr_type(recv), slot)
+
+        for i in 0..<args.len()
+            if !holds_index(promised, i) && views(p, keeps, w, args.at(i)).non_empty()
+                gets_out(p, keeps, w, args.at(i),
+                         "is passed through a trait object, which may hold on to it")
+
+    // Nothing is known about what is at the other end of a function pointer -- not even which
+    // program compiled it -- so the worst is assumed of every argument, exactly as this analysis
+    // assumes it of an `extern`.
+    TCallPtr(_, args, _, _) ->
+        for i in 0..<args.len()
+            if views(p, keeps, w, args.at(i)).non_empty()
+                gets_out(p, keeps, w, args.at(i),
+                         "is passed through a function pointer, which may hold on to it")
+    _ -> ()
+
+// A confined view has left the frame. Where it roots at arrays this body declared, they are
+// promoted -- the storage moves to the heap and the program is unchanged otherwise. Where it roots
+// at storage that cannot be moved, the escape is reported against the expression that causes it, so
+// the caret lands on the slice that leaves the frame rather than on the function as a whole.
+private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how: string)
+    val v = views(p, keeps, w, at)
+
+    for i in 0..<v.named.len()
+        val name = v.named.at(i)
+
+        if !holds_string(w.promoted, name)
+            w.sites.push(EscapeSite(name, "", at.span, how))
+            w.promoted.push(name)
+
+    // A temporary is promoted like a named array and is reported like one under `no alloc`, since
+    // what it costs there is the same allocation. It has no name a reader wrote, so it is named for
+    // what it is.
+    for i in 0..<v.temps.len()
+        val t = v.temps.at(i)
+
+        if !holds_temp_span(w.temps, t.0)
+            w.sites.push(EscapeSite("", t.1, t.0, how))
+            w.temps.push(t)
+
+    w.got_out = true
+
+    if v.anonymous && w.refusal.is_none()
+        w.refusal = Some((at.span,
+            s"a slice of an array this frame owns $how, so it would outlive the array, and the " +
+            "storage is not this body's to move — it is a field of a value, an array a caller " +
+            "passed by value, or part of an array literal, which has no declaration to move. " +
+            "Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' " +
+            "where the length is fixed"))
+end gets_out
+
+private holds_temp_span(temps: Buf[(Span, string)], at: Span) -> bool
+    for i in 0..<temps.len()
+        if temps.at(i).0 == at then return true
+
+    false
+end holds_temp_span
+
+private holds_index(xs: Buf[usize], i: usize) -> bool
+    for k in 0..<xs.len()
+        if xs.at(k) == i then return true
+
+    false
+end holds_index
+
+// -- what a value views ---------------------------------------------------------------------------------
+
+// Whether a value of this type could carry a view of somebody's elements.
+//
+// **A `string` cannot.** It is three words over bytes in the layout and a *counted heap object* to
+// this analysis: a conversion copies into storage of its own, a literal is static, and nothing else
+// makes one. So a string outlives every frame by construction and there is nothing in it for a frame
+// to own.
+carries_view(t: Type) -> bool = t match
+    Slice(_, _) -> true
+    Array(_, elem) -> carries_view(*elem)
+    Struct(d) -> fields_carry_view(d.fields)
+    Enum(d) -> variants_carry_view(d.variants)
+    _ -> false
+
+private fields_carry_view(fields: Buf[(string, Type)]) -> bool
+    for i in 0..<fields.len()
+        if carries_view(fields.at(i).1) then return true
+
+    false
+end fields_carry_view
+
+private variants_carry_view(vs: Buf[EnumVariant]) -> bool
+    for i in 0..<vs.len()
+        if fields_carry_view(vs.at(i).fields) then return true
+
+    false
+end variants_carry_view
+
+// Which frame-owned storage a value may view. Answering with the *roots* rather than with a yes/no
+// is the whole of what promotion needs: the escape sites already knew that something got out, and
+// what they could not say was which array to move.
+private views(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -> EView
+    if !carries_view(texpr_type(e)) then return no_view()
+
+    views_value(p, keeps, w, e)
+end views
+
+private views_value(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -> EView = *e.kind match
+    // A **whole** temporary array, viewed. It has no declaration to promote, so what it is instead
+    // is a temporary this frame made -- which is exactly the thing promotion exists for. The escape
+    // gives it storage of its own, and the base's own views are still walked, since what the
+    // temporary was *built from* may be the frame's.
+    //
+    // **What makes it a temporary is having no address of its own**, which is the same question the
+    // lowering asks before giving a computed value a slot. Storage with an address is left to
+    // `array_root` below, which is what keeps a field of a *named* value and an array a caller
+    // passed by value refused: those are somebody else's to move, and a temporary is nobody's.
+    TSlice(base, lo, hi, _, _) ->
+        if lo.is_none() && hi.is_none() && is_array(texpr_type(base)) && !is_place(base)
+            join_views(views(p, keeps, w, base), temp_view(e.span, describe_temp(base)))
+        else if is_array(texpr_type(base))
+            // A view of a `*T` region is the programmer's problem, like every `*T`. Storage inside a
+            // counted object is not the frame's either: it is on the heap already, and the view
+            // names the box that holds it as its owner.
+            if via_pointer(base) || via_reference(base) then no_view()
+            else array_root(w, base)
+        else views(p, keeps, w, base)
+
+    TLoad(name, _) -> confined_of(w, name)
+    TCall(_, args, _, _) -> any_view(p, keeps, w, args)
+    TVCall(_, _, args, _, _) -> any_view(p, keeps, w, args)
+    TCallPtr(_, args, _, _) -> any_view(p, keeps, w, args)
+    TStructNew(_, args) -> any_view(p, keeps, w, args)
+    TStructInvCheck(v, _, _) -> views(p, keeps, w, v)
+    TRecheck(after, _, _, _) -> views(p, keeps, w, after)
+    TEnumNew(_, _, args) -> any_view(p, keeps, w, args)
+    TArrayLit(elems, _) -> any_view(p, keeps, w, elems)
+    TArrayFill(v, _) -> views(p, keeps, w, v)
+
+    // The storage a buffer form makes is its own and outlives every frame, so the view it yields is
+    // never the frame's -- but what it was filled *with* may still be, which is the same rule the
+    // two array forms above follow and the same route out.
+    TBufLit(elems, _) -> any_view(p, keeps, w, elems)
+    TBufFill(v, _, _) -> views(p, keeps, w, v)
+    TField(r, _, _) -> views(p, keeps, w, r)
+    TIndex(r, _, _) -> views(p, keeps, w, r)
+    TBytes(r) -> views(p, keeps, w, r)
+
+    // `str(s)` on a string is the identity, so it inherits its argument's view; on any other type it
+    // allocates a fresh buffer, and that argument carries no view for this to find, so the one rule
+    // covers both.
+    TStr(x) -> views(p, keeps, w, x)
+    TStore(_, v, _) -> views(p, keeps, w, v)
+    TIf(_, t, els, _) ->
+        val here = block_value_view(p, keeps, w, t)
+
+        els match
+            Some(b) -> join_views(here, block_value_view(p, keeps, w, b))
+            None -> here
+
+    // One copy of an unrolled `for const` -- a block, so it views whatever its own value views,
+    // exactly as an `if` branch does.
+    TBlockExpr(b) -> block_value_view(p, keeps, w, b)
+    TMatch(_, arms, _) ->
+        var out = no_view()
+
+        for i in 0..<arms.len()
+            out = join_views(out, block_value_view(p, keeps, w, arms.at(i).body))
+
+        out
+
+    // A loop's value comes from its `break`s and its `else`, so it views the frame when any of those
+    // do -- a `break` of a frame-backed slice out of the loop is the same escape route as returning
+    // one.
+    TWhile(_, body, els, _) -> loop_views(p, keeps, w, body, els)
+    TDoWhile(body, _, els, _) -> loop_views(p, keeps, w, body, els)
+    TLoop(body, _) -> loop_views(p, keeps, w, body, None)
+    TCFor(_, _, _, body, els, _) -> loop_views(p, keeps, w, body, els)
+    TFor(_, _, _, _, _, body, els, _) -> loop_views(p, keeps, w, body, els)
+    _ -> no_view()
+
+private any_view(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, xs: Buf[TExpr]) -> EView
+    var out = no_view()
+
+    for i in 0..<xs.len()
+        out = join_views(out, views(p, keeps, w, xs.at(i)))
+
+    out
+end any_view
+
+private block_value_view(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, b: TBlock) -> EView =
+    b.result match
+        Some(r) -> views(p, keeps, w, r)
+        None -> no_view()
+
+private loop_views(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, body: Buf[TStmt],
+                   els: Option[TBlock]) -> EView
+    var out = any_view(p, keeps, w, break_values(body))
+
+    els match
+        Some(b) -> join_views(out, block_value_view(p, keeps, w, b))
+        None -> out
+end loop_views
+
+// The array a slice's base names, when that is a local of this body.
+//
+// An **index** step is walked through: an element of a local array of arrays is part of that array's
+// storage, so moving the whole thing moves the element with it. A **field** step is not, because the
+// storage belongs to a struct and moving it would be a promotion of aggregates, which is not
+// specified. An array the caller passed **by value** is storage this frame was handed rather than
+// storage it made, so it is not this body's to move either.
+private array_root(w: &EscapeWalk, base: TExpr) -> EView = *base.kind match
+    TLoad(name, _) ->
+        if holds_string(w.locals, name) then named_view(name)
+        else ref_place(w, name) match
+            // A `ref` declares no storage, so it is never itself a root -- the array it names is
+            // whatever its place was rooted at.
+            Some(place) -> array_root(w, place)
+            None -> unnamed_view()
+
+    // **Module storage is not this frame's and never dies with it**, so a slice of one views nothing
+    // here: it is static for the whole run, and both answers this pass could otherwise give are
+    // wrong for it.
+    TGlobal(_, _, _) -> no_view()
+    TIndex(r, _, _) -> array_root(w, r)
+    _ -> unnamed_view()
+
+private ref_place(w: &EscapeWalk, name: string) -> Option[TExpr]
+    for i in 0..<w.ref_of.len()
+        if w.ref_of.at(i).0 == name then return Some(w.ref_of.at(i).1)
+
+    None
+end ref_place
+
+// Whether the storage an array place names is reached through a raw pointer, and so is not this
+// frame's to lose. The question is about the *root* of the place rather than about its last step.
+private via_pointer(e: TExpr) -> bool = *e.kind match
+    TDeref(operand, _) -> is_raw_pointer(texpr_type(operand))
+    TField(r, _, _) -> via_pointer(r)
+    TIndex(r, _, _) -> via_pointer(r)
+    _ -> false
+
+// Whether the storage lives inside a **counted object** -- a fixed array that is a field of a
+// `&Struct`, or an element of one. Such storage is on the heap already, so there is nothing to
+// promote and nothing to refuse.
+private via_reference(e: TExpr) -> bool = *e.kind match
+    TDeref(operand, _) -> is_counted_ref(texpr_type(operand))
+    TField(r, _, _) -> via_reference(r)
+    TIndex(r, _, _) -> via_reference(r)
+    _ -> false
+
+private is_raw_pointer(t: Type) -> bool = t match
+    Ptr(_) -> true
+    _ -> false
+
+private is_counted_ref(t: Type) -> bool = t match
+    Ref(_, _) -> true
+    _ -> false
+
+private is_array(t: Type) -> bool = t match
+    Array(_, _) -> true
+    _ -> false
+
+// What to call a temporary in the one sentence a reader is given about it. There is no name they
+// wrote, so the sentence has to hand back something they can find on the line: the literal they see,
+// or the call whose answer they sliced.
+private describe_temp(base: TExpr) -> string = *base.kind match
+    TArrayLit(_, _) -> "an array literal"
+    TArrayFill(_, _) -> "an array literal"
+    TCall(name, _, _, _) -> s"the array '$name' answered with"
+    _ -> "a temporary array"
+
+// -- what a body declares ------------------------------------------------------------------------------
+
+private local_arrays(stmts: Buf[TStmt]) -> Buf[string]
+    val found: &NameList = NameList(buf())
+
+    walk_stmts(stmts, stmt_walk(false, s -> note_local_array(found, s)))
+    found.names
+end local_arrays
+
+private note_local_array(found: &NameList, s: TStmt) = s match
+    TVarDecl(name, ty, _, _) -> if is_array(ty) then found.names.push(name)
+    _ -> ()
+
+private ref_bindings(stmts: Buf[TStmt]) -> Buf[(string, TExpr)]
+    val found: &RefList = RefList(buf())
+
+    walk_stmts(stmts, stmt_walk(false, s -> note_ref(found, s)))
+    found.places
+end ref_bindings
+
+private note_ref(found: &RefList, s: TStmt) = s match
+    TRefDecl(name, _, place) -> found.places.push((name, place))
+    _ -> ()
+
+// The arrays a body declared with a boundary of their own, and the boundary each asked for.
+private aligned_arrays(stmts: Buf[TStmt]) -> Buf[(string, usize)]
+    val found: &AlignList = AlignList(buf())
+
+    walk_stmts(stmts, stmt_walk(false, s -> note_aligned(found, s)))
+    found.asked
+end aligned_arrays
+
+private note_aligned(found: &AlignList, s: TStmt) = s match
+    TVarDecl(name, ty, _, align) ->
+        if is_array(ty) && align.is_some() then found.asked.push((name, align.unwrap()))
+    _ -> ()
+
+private break_values(stmts: Buf[TStmt]) -> Buf[TExpr]
+    val found: &ExprList = ExprList(buf())
+
+    walk_stmts(stmts, stmt_walk(false, s -> note_break(found, s)))
+    found.exprs
+end break_values
+
+private note_break(found: &ExprList, s: TStmt) = s match
+    TBreak(v, depth) ->
+        if depth == 0
+            v match
+                Some(x) -> found.exprs.push(x)
+                None -> ()
+    _ -> ()
+
+// The four little boxes a closure writes its findings into. A closure captures by value, so what a
+// walk accumulates has to live behind a reference the closure copies rather than in a list it does.
+struct NameList
+    names: Buf[string]
+end NameList
+
+struct RefList
+    places: Buf[(string, TExpr)]
+end RefList
+
+struct AlignList
+    asked: Buf[(string, usize)]
+end AlignList
+
+struct ExprList
+    exprs: Buf[TExpr]
+end ExprList
+
+// -- the refusals ------------------------------------------------------------------------------------
+
+// Everything one body's walk earns: the escape with nowhere to go, and the promotions a module that
+// gave the allocator up or a declaration that asked for a boundary cannot have.
+private report_body(a: &Analysis, p: TProgram, scope: Scope, who: Option[string], w: EscapeWalk)
+    w.refusal match
+        Some(r) -> a.fault(scope, r.0, r.1)
+        None -> ()
+
+    refuse_no_alloc(a, p, scope, who, w)
+end report_body
+
+// A promotion in a module that declared `no alloc`, said as the refusal it is there.
+//
+// Promotion is deliberately silent everywhere else -- the program means what it said and the storage
+// quietly moves. A module that gave the allocator up has nowhere for it to move to, so the same fact
+// has to be reported, and it is reported against the view that leaves the frame rather than against
+// the array: the array is fine, and what the reader has to change is where its contents go.
+private refuse_no_alloc(a: &Analysis, p: TProgram, scope: Scope, who: Option[string], w: EscapeWalk)
+    val module_name = who match
+        Some(n) -> module_of(n)
+        None -> p.main_module
+
+    // A test answers to its module's `@tests` clause rather than to the module's, since that file is
+    // dropped by every build but `sysl test` and the module's promise is about what ships.
+    val scaffolding = who match
+        Some(n) -> holds_string(p.test_only, n) || is_test_func(p, n)
+        None -> false
+
+    val narrowed = if scaffolding then holds_string(p.no_alloc_test_modules, module_name)
+    else holds_string(p.no_alloc_modules, module_name)
+
+    // Named as the tests' own clause only where the module has none, since a `@tests` file that
+    // wrote nothing is being held to its module's line and that is the line to go and read.
+    val theirs = scaffolding && !holds_string(p.no_alloc_modules, module_name)
+
+    if !narrowed
+        refuse_aligned(a, scope, w)
+        return
+
+    for i in 0..<w.sites.len()
+        val site = w.sites.at(i)
+        val subject = if site.name == "" then site.what else s"'${site.name}'"
+
+        a.fault(scope, site.at,
+            s"this view of $subject ${site.how}, so the array would move to the heap to outlive " +
+            s"the frame — and ${if theirs then "this module's '@tests' file" else "this module"} " +
+            "declared '@no_alloc', so there is nothing to move it into. Keep the view inside the " +
+            "frame, or take the storage from a caller as a '[]T' parameter, which is already " +
+            "wherever its owner put it")
+end refuse_no_alloc
+
+// A promotion of storage that asked for a boundary of its own, refused for the reason the
+// allocator-free case is refused: what promotion is allowed to be silent about is *where* the
+// storage went, and here that is precisely what the declaration was about.
+//
+// `malloc` promises an alignment good for any fundamental type and nothing beyond it, so a request
+// for a page is not something the heap path can answer. Not honouring it silently would be worse
+// than refusing, because a boundary is only ever asked for when something else depends on it -- a
+// DMA engine, a page table, a cache line -- and none of those report anything when the address is
+// wrong.
+private refuse_aligned(a: &Analysis, scope: Scope, w: EscapeWalk)
+    if w.aligned.is_empty() then return
+
+    for i in 0..<w.sites.len()
+        val site = w.sites.at(i)
+
+        if site.name == "" then continue
+
+        val asked = alignment_asked(w.aligned, site.name)
+
+        if asked.is_none() then continue
+
+        a.fault(scope, site.at,
+            s"this view of '${site.name}' ${site.how}, so the array would move to the heap to " +
+            s"outlive the frame — and '${site.name}' asked to begin on a ${asked.unwrap()}-byte " +
+            "boundary, which is the allocator's to answer there rather than this declaration's. " +
+            "Keep the view inside the frame, or put the boundary on a struct with '@align', which " +
+            "every value of that type carries wherever its storage is")
+end refuse_aligned
+
+private alignment_asked(asked: Buf[(string, usize)], name: string) -> Option[usize]
+    for i in 0..<asked.len()
+        if asked.at(i).0 == name then return Some(asked.at(i).1)
+
+    None
+end alignment_asked
+
+private is_test_func(p: TProgram, name: string) -> bool
+    for i in 0..<p.tests.len()
+        if p.tests.at(i).func == name then return true
+
+    for i in 0..<p.hooks.len()
+        if p.hooks.at(i).func == name then return true
+
+    false
+end is_test_func
+
+// A trait method that declared `@borrows` is handed a view it must not keep, and this is what makes
+// that true rather than trusted.
+//
+// **Nothing in a type says "borrowed", so a promise a trait writes down has to be checked against
+// every implementation of it.** That check is what licenses a call site to pass a frame-backed slice
+// through a trait object at all -- a call through one is otherwise opaque, so the analysis must
+// assume the worst of every argument and a local array passed through one is promoted.
+private refuse_borrowed(a: &Analysis, p: TProgram, keeps: &KeptParams)
+    var seen: Buf[string] = buf()
+
+    for i in 0..<p.vtables.len()
+        val vt = p.vtables.at(i)
+
+        for j in 0..<vt.slots.len()
+            val slot = vt.slots.at(j)
+
+            for k in 0..<slot.borrows.len()
+                val at = slot.borrows.at(k).0
+                val pname = slot.borrows.at(k).1
+
+                if !keeps.holds(slot.target, at) then continue
+
+                val key = s"${slot.target}|${vt.trait_name}|$pname"
+
+                if holds_string(seen, key) then continue
+
+                seen.push(key)
+
+                val at = target_span(p, slot.target)
+
+                if at.is_none() then continue
+
+                // The trait is named by its key, never spelled: a program with a `Writer` of its own
+                // reaches the library's only by path, and a message that spells it plainly names the
+                // wrong trait to the one reader who has to tell them apart.
+                a.fault(func_home(a, slot.target), at.unwrap(),
+                    s"'${slot.target}' keeps what it is passed as '$pname', but " +
+                    s"'${module_show(vt.trait_name)}' declares that parameter borrowed for the " +
+                    "call — it may be a view of the caller's stack, so copy what this needs into " +
+                    "storage of its own")
+end refuse_borrowed
+
+private target_span(p: TProgram, name: string) -> Option[Span]
+    for i in 0..<p.funcs.len()
+        if p.funcs.at(i).name == name then return Some(p.funcs.at(i).span)
+
+    None
+end target_span
+
+// Which of a trait object call's arguments the trait promised to borrow, by **argument** position --
+// one less than the parameter position, since a call site's list has no receiver in it.
+//
+// Read off any table for that trait, because the promise is the trait's and every table carries the
+// same answer.
+private borrows_of(p: TProgram, ty: Type, slot: int) -> Buf[usize]
+    var out: Buf[usize] = buf()
+
+    val tr = erased_trait(ty)
+
+    if tr.is_none() then return out
+
+    val name = trait_key(tr.unwrap())
+
+    for i in 0..<p.vtables.len()
+        val vt = p.vtables.at(i)
+
+        if vt.trait_name != name then continue
+        if usize(slot) >= vt.slots.len() then return out
+
+        val s = vt.slots.at(usize(slot))
+
+        for k in 0..<s.borrows.len()
+            if s.borrows.at(k).0 > 0 then out.push(s.borrows.at(k).0 - 1)
+
+        return out
+
+    out
+end borrows_of
+
+private trait_key(t: Type) -> string = t match
+    Trait(name, _, _) -> name
+    _ -> ""
+
+// The file the entry point's statements were written in, found by the one thing that names it: a
+// declaration whose home is that file. A program whose entry file declares nothing else has none,
+// and its escapes are reported with the message and no source line.
+private entry_home(a: &Analysis) -> Scope
+    if a.tables.entry_src == "" then return empty_scope()
+
+    for i in 0..<a.tables.homes.len()
+        val s = a.tables.homes.at(i)
+
+        if s.src.name == a.tables.entry_src then return s
+
+    empty_scope()
+end entry_home

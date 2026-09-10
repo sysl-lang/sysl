@@ -1,0 +1,297 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// **Inline assembly, lowered.**
+//
+// Every input is loaded before the call and every output stored after it, which is what makes an
+// operand a *value* rather than a register the programmer had to find: LLVM is told what has to be
+// where, and satisfying it is the allocator's problem. The template and the constraint string are
+// built together from one list, because an operand's position in the second is the number its name
+// becomes in the first, and the two disagreeing is exactly the failure this construct removes.
+
+gen_asm(e: *Emit, lines: Buf[string], operands: Buf[TAsmOperand], clobbers: Buf[string])
+    val ins = operands_by(operands, false)
+    val outs = operands_by(operands, true)
+    val slots = asm_numbering(operands)
+
+    var loaded: Buf[IrArg] = buf()
+
+    for i in 0..<ins.len()
+        val o = ins.at(i)
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, o.ty), VReg(s"${o.slot}.addr"), AccPlain, None))
+        loaded.push(ir_arg(lty(e, o.ty), r))
+
+    e.asm_site += 1
+
+    val text = asm_text(lines, e.asm_site, slots)
+    val cons = asm_constraints(operands, clobbers)
+
+    // `sideeffect` says the block matters even where nothing reads its result, which is true of
+    // every assembly sysl can express: the instructions worth reaching for here are the ones whose
+    // whole purpose is what they do to the machine rather than what they hand back.
+    if outs.is_empty()
+        emit(e, InAsm(None, LVoid, text, cons, loaded))
+        return
+
+    if outs.len() == 1
+        val o = outs.at(0)
+        val r = fresh_reg(e)
+
+        emit(e, InAsm(Some(r), lty(e, o.ty), text, cons, loaded))
+        emit(e, InStore(lty(e, o.ty), r, VReg(s"${o.slot}.addr"), AccPlain, None))
+        return
+
+    // Several outputs come back as one anonymous structure, which is LLVM's shape rather than
+    // anything the language says -- so it is taken apart here and never seen above this line.
+    var fields: Buf[LType] = buf()
+
+    for i in 0..<outs.len()
+        fields.push(lty(e, outs.at(i).ty))
+
+    val shape = LStruct(fields)
+    val r = fresh_reg(e)
+
+    emit(e, InAsm(Some(r), shape, text, cons, loaded))
+
+    for i in 0..<outs.len()
+        val o = outs.at(i)
+        val part = fresh_reg(e)
+
+        emit(e, InExtract(part, shape, r, index_list(int(i))))
+        emit(e, InStore(lty(e, o.ty), part, VReg(s"${o.slot}.addr"), AccPlain, None))
+end gen_asm
+
+private operands_by(operands: Buf[TAsmOperand], out: bool) -> Buf[TAsmOperand]
+    var got: Buf[TAsmOperand] = buf()
+
+    for i in 0..<operands.len()
+        if asm_is_out(operands.at(i).dir) == out then got.push(operands.at(i))
+
+    got
+end operands_by
+
+private asm_is_out(d: AsmDir) -> bool = d match
+    Out -> true
+    In -> false
+
+// The operand numbers a template's names stand for, outputs first, matching the constraint string.
+private asm_numbering(operands: Buf[TAsmOperand]) -> Buf[(string, int)]
+    var out: Buf[(string, int)] = buf()
+
+    for i in 0..<operands.len()
+        if asm_is_out(operands.at(i).dir) then out.push((operands.at(i).name, int(out.len())))
+
+    for i in 0..<operands.len()
+        if !asm_is_out(operands.at(i).dir) then out.push((operands.at(i).name, int(out.len())))
+
+    out
+end asm_numbering
+
+private slot_of(slots: Buf[(string, int)], name: string) -> Option[int]
+    for i in 0..<slots.len()
+        if slots.at(i).0 == name then return Some(slots.at(i).1)
+
+    None
+end slot_of
+
+// LLVM's constraint string, in the order the call's operands are passed.
+//
+// Outputs come first because that is the order LLVM reads them in, and it is why the operand
+// numbering in a template counts outputs before inputs -- a fact a programmer never has to know,
+// since they wrote names.
+//
+// **Memory and the condition flags are always clobbered**, and that is the conservative direction on
+// purpose: assuming them costs optimization quality across a handful of instructions; not assuming
+// them costs a value kept in a register the block overwrote, which is a wrong answer with nothing to
+// point at.
+private asm_constraints(operands: Buf[TAsmOperand], clobbers: Buf[string]) -> string
+    var parts: Buf[string] = buf()
+
+    for i in 0..<operands.len()
+        if asm_is_out(operands.at(i).dir) then parts.push(s"=${asm_place(operands.at(i))}")
+
+    for i in 0..<operands.len()
+        if !asm_is_out(operands.at(i).dir) then parts.push(asm_place(operands.at(i)))
+
+    for i in 0..<clobbers.len()
+        parts.push(s"~{${clobbers.at(i)}}")
+
+    parts.push("~{memory}")
+    parts.push("~{cc}")
+
+    var b = str_builder()
+
+    for i in 0..<parts.len()
+        if i > 0 then b.push(",")
+
+        b.push(parts.at(i))
+
+    b.finish()
+end asm_constraints
+
+// Where one operand has to live: a named machine register, or any general-purpose one.
+private asm_place(o: TAsmOperand) -> string = o.reg match
+    Some(r) -> s"{$r}"
+    None -> "r"
+
+// The whole template as one line, with the labels made this site's own and every name replaced by
+// the operand number it stands for.
+private asm_text(lines: Buf[string], site: int, slots: Buf[(string, int)]) -> string
+    val unique = uniquify_labels(lines, site)
+
+    var b = str_builder()
+
+    for i in 0..<unique.len()
+        if i > 0 then b.push("\\0A")
+
+        b.push(asm_render(unique.at(i), slots))
+
+    b.finish()
+end asm_text
+
+// One line, with the escapes the compiler owns resolved.
+//
+// `$` is LLVM's own operand marker, so a `$` the program wrote -- an x86 immediate, `movq $1, %rsi`
+// -- is doubled *here* rather than in the source, where doubling it would be the language's syntax
+// leaking into a place the reader thinks is assembly. Doubled braces collapse to single ones for the
+// same reason, at the same time, so the text a program wrote is the text the assembler sees.
+private asm_render(line: string, slots: Buf[(string, int)]) -> string
+    var b = str_builder()
+    var i: usize = 0
+
+    while i < line.bytes.len
+        val c = line.bytes[i]
+
+        if c == u8('$')
+            b.push("$$")
+            i += 1
+        else if c == u8('{') && i + 1 < line.bytes.len && line.bytes[i + 1] == u8('{')
+            b.push("{")
+            i += 2
+        else if c == u8('}') && i + 1 < line.bytes.len && line.bytes[i + 1] == u8('}')
+            b.push("}")
+            i += 2
+        else if c == u8('{')
+            val close = index_from(line, u8('}'), i)
+
+            if close.is_none()
+                b.push_char('{')
+                i += 1
+            else
+                val at = close.unwrap()
+                val name = line[(i + 1)..<at]
+
+                // A name with no slot has already been reported by the analysis; leaving the text as
+                // it stands keeps the emitter from inventing an operand number that indexes nothing.
+                slot_of(slots, name) match
+                    Some(n) -> b.push(s"$$$n")
+                    None -> b.push(line[i..(at)])
+
+                i = at + 1
+        else
+            b.push(line[i..<(i + 1)])
+            i += 1
+
+    b.finish()
+end asm_render
+
+private index_from(s: string, c: u8, from: usize) -> Option[usize]
+    for i in from..<s.bytes.len
+        if s.bytes[i] == c then return Some(i)
+
+    None
+end index_from
+
+// Gives every label an arm defines a name of its own, so a block emitted twice does not define the
+// same symbol twice.
+//
+// A label written in inline assembly is a global symbol, and the assembler rejects the second
+// definition -- which happens the second time the enclosing function is emitted, for reasons that
+// have nothing to do with the code and that the programmer cannot do anything about from where they
+// are standing. Renaming is the compiler's job because uniqueness is the compiler's fact.
+private uniquify_labels(lines: Buf[string], id: int) -> Buf[string]
+    var defined: Buf[string] = buf()
+
+    for i in 0..<lines.len()
+        label_defined(lines.at(i)) match
+            Some(name) -> if !holds_name(defined, name) then defined.push(name)
+            None -> ()
+
+    var out: Buf[string] = buf()
+
+    for i in 0..<lines.len()
+        var line = lines.at(i)
+
+        for j in 0..<defined.len()
+            line = rename_whole(line, defined.at(j), s"${defined.at(j)}.$id")
+
+        out.push(line)
+
+    out
+end uniquify_labels
+
+private holds_name(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end holds_name
+
+// A label defined at the start of a line, which is the only place assembly puts one. The leading dot
+// and the dollar are allowed because both begin ordinary label names, and a colon anywhere else on
+// the line -- an x86 segment override, `%fs:0x28` -- is not matched by construction.
+private label_defined(line: string) -> Option[string]
+    var i: usize = 0
+
+    while i < line.bytes.len && (line.bytes[i] == u8(' ') || line.bytes[i] == u8('\t'))
+        i += 1
+
+    val start = i
+
+    if i >= line.bytes.len || !starts_label(line.bytes[i]) then return None
+
+    i += 1
+
+    while i < line.bytes.len && continues_label(line.bytes[i])
+        i += 1
+
+    if i >= line.bytes.len || line.bytes[i] != u8(':') then return None
+
+    Some(line[start..<i])
+end label_defined
+
+private starts_label(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || c == u8('_') ||
+        c == u8('.') || c == u8('$')
+
+// Whether a character carries on a label name, and so means an occurrence of one is really part of
+// something longer. Exactly the letters, the digits, and the three marks -- spelled out rather than
+// asked of a Unicode predicate, because an assembler label is not Unicode.
+private continues_label(c: u8) -> bool = starts_label(c) || (c >= u8('0') && c <= u8('9'))
+
+// Replaces whole occurrences of `name`, leaving alone any that is part of a longer name.
+private rename_whole(line: string, name: string, replacement: string) -> string
+    if name.bytes.len == 0 then return line
+
+    var b = str_builder()
+    var i: usize = 0
+
+    while i < line.bytes.len
+        val ends = i + name.bytes.len
+        val here = ends <= line.bytes.len && line[i..<ends] == name
+        val whole = here && (i == 0 || !continues_label(line.bytes[i - 1])) &&
+            (ends >= line.bytes.len || !continues_label(line.bytes[ends]))
+
+        if whole
+            b.push(replacement)
+            i = ends
+        else
+            b.push(line[i..<(i + 1)])
+            i += 1
+
+    b.finish()
+end rename_whole

@@ -13,14 +13,13 @@ import sysl.math.bigint.from_int
 // The function, or nothing where its body reached a form this compiler does not lower yet.
 gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     start_function(e)
-    e.ensures = int(f.ensures.len())
+    push_temps(e)
+    push_owned(e)
+
+    for i in 0..<f.ensures.len()
+        e.ensures.push(f.ensures.at(i))
 
     if f.tailrec then gap_here(e, "a tail-recursive frame")
-    if !f.olds.is_empty() then gap_here(e, "an 'old' snapshot")
-
-    // A function hands its result back with a count already taken, which is the ownership runtime's
-    // and not this stage's.
-    if contains_counted(f.ret_ty) then gap_here(e, "a result that holds a reference")
 
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep, so
     // it takes no slot and the emitted signature does not mention it.
@@ -32,13 +31,17 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
             alloca(e, VReg(s"${p.0}.addr"), lty(e, ty))
 
+            // A large one arrived as an address, so the copy the callee makes for itself is a copy
+            // of bytes and the count it takes is taken at the slot rather than off a value it never
+            // had.
             if e.layout.indirect(ty)
                 gap_here(e, "a large parameter copied at entry")
-            else if contains_counted(ty)
-                gap_here(e, "a parameter that holds a reference")
             else
                 emit(e, InStore(lty(e, ty), VReg(s"${p.0}.param"), VReg(s"${p.0}.addr"), AccPlain,
                                 None))
+                retain_value(e, ty, VReg(s"${p.0}.param"))
+
+            own_slot(e, p.0, ty)
 
     // Where the function calls itself as the last thing it does, that call is a jump to here rather
     // than a second frame. The target sits *after* the parameter slots are written and *before*
@@ -67,27 +70,50 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     for i in 0..<f.requires.len()
         emit_contract(e, f.requires.at(i).cond, "require")
 
+    // Each `old(e)` snapshots the entry value into a hidden owned slot, exactly as a `var` would, so
+    // a postcondition can compare the returned state against the state on entry. The slot is
+    // released with every other local at each return.
+    for i in 0..<f.olds.len()
+        push_temps(e)
+
+        val old = f.olds.at(i)
+        val oty = texpr_type(old)
+        val v = gen_expr(e, old)
+
+        alloca(e, VReg(s"old.$i.addr"), lty(e, oty))
+        retain_value(e, oty, v)
+        emit(e, InStore(lty(e, oty), v, VReg(s"old.$i.addr"), AccPlain, None))
+        own_slot(e, s"old.$i", oty)
+        pop_temps(e)
+
     gen_stmts(e, f.body.stmts)
 
+    // A `never` result is `void` like `unit`: the body's trailing expression diverges, so it has
+    // already terminated the block and the `ret` emitted here is dropped.
     f.body.result match
         Some(r) ->
             if e.layout.indirect(f.ret_ty) then gap_here(e, "a large result returned through storage")
             else if !no_value(f.ret_ty)
                 val v = gen_expr(e, r)
 
+                retain_value(e, f.ret_ty, v)
                 emit_ensures(e, Some(v))
+                release_all(e)
                 emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(v)))
             else
                 gen_expr(e, r)
                 emit_ensures(e, None)
+                release_all(e)
                 emit_term(e, InRet(None, None))
         None ->
             if no_value(f.ret_ty)
                 emit_ensures(e, None)
+                release_all(e)
                 emit_term(e, InRet(None, None))
             else if e.layout.indirect(f.ret_ty)
                 gap_here(e, "a large result returned through storage")
             else
+                release_all(e)
                 emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(zero_of(e, f.ret_ty))))
 
     if has_gap(e) then return None

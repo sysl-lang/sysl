@@ -18,8 +18,15 @@ access_of(t: Type) -> IrAccess = if volatile_in(t) then AccVolatile else AccPlai
 place_access(x: TExpr) -> IrAccess = access_of(place_ty(x))
 
 // The type the storage behind a place is declared at, which is not always the type of the values
-// read out of it -- a qualifier lives on the storage.
-place_ty(x: TExpr) -> Type = texpr_type(x)
+// read out of it -- a qualifier lives on the storage, and a read through it yields a plain value.
+// So this asks what the storage was **declared** as rather than what the node's type is.
+place_ty(x: TExpr) -> Type = *x.kind match
+    TDeref(operand, t) -> pointee(texpr_type(operand)).unwrap_or(t)
+    TIndex(receiver, _, t) -> element(texpr_type(receiver)).unwrap_or(t)
+    TField(receiver, i, t) -> underlying(texpr_type(receiver)) match
+        Struct(d) -> if i >= 0 && usize(i) < d.fields.len() then d.fields.at(usize(i)).1 else t
+        _ -> t
+    _ -> texpr_type(x)
 
 // The address of a place, as a `ptr` register or an existing slot name.
 address(e: *Emit, place: TExpr) -> Val = *place.kind match
@@ -75,14 +82,12 @@ bitfield_ranges_of(t: Type) -> Option[Buf[BitRange]] = underlying(t) match
     Struct(d) -> bitfield_ranges(d)
     _ -> None
 
-// What a `&T` points at, which is the payload inside the box rather than the box itself.
+// What a `&T` points at, which is the payload inside the box rather than the box itself. A `*T`
+// addresses its value directly.
 payload_addr(e: *Emit, operand: TExpr) -> Val
     val p = gen_expr(e, operand)
 
-    texpr_type(operand) match
-        Ref(_, _) ->
-            gap_at(e, "the payload of a counted reference")
-        _ -> p
+    box_payload_addr(e, p, texpr_type(operand))
 end payload_addr
 
 // The address of one element, after checking that it exists. An array is indexed from its own
@@ -197,24 +202,64 @@ private load_container(e: *Emit, ranges: Buf[BitRange], receiver: TExpr, addr: V
     t
 end load_container
 
-// Puts `v` in the place. A slot that holds a counted reference owes a retain and a release, which
-// nothing here writes yet, so such a place is a gap rather than an unbalanced store.
-store_place(e: *Emit, place: TExpr, p: Val, v: Val) = bit_place(place) match
+// Puts `v` in the place, giving up whatever was there at the address.
+store_place(e: *Emit, place: TExpr, p: Val, v: Val) = store_over(e, place, p, v, None)
+
+// The same, where a compound form has already read what was there: the release is of **that** value
+// rather than of a second load.
+//
+// A bitfield needs neither: every field of a bitfield struct is an integer, so nothing there carries
+// a count. **Its container is re-read here** rather than reused, because two arms of one statement
+// may be two fields of one container and the second has to see what the first left behind.
+store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) = bit_place(place) match
     Some(b) ->
         val acc = access_of(place_ty(b.0))
         val c = load_container(e, b.1, b.0, p)
 
         emit(e, InStore(container_lty(b.1), write_bits(e, b.1, b.2, c, v), p, acc, None))
-    None -> store_into(e, texpr_type(place), p, v, place_access(place))
+    None ->
+        val ty = texpr_type(place)
+        val acc = place_access(place)
 
-// Writes `v` into the storage at `p`.
+        cur match
+            None -> store_into(e, ty, p, v, acc)
+            Some(old) ->
+                if contains_counted(ty)
+                    retain_value(e, ty, v)
+                    emit(e, InStore(lty(e, ty), v, p, acc, None))
+                    release_value(e, ty, old)
+                else emit(e, InStore(lty(e, ty), v, p, acc, None))
+
+// Writes `v` into the storage at `p`. A slot that holds a count takes one for the value arriving
+// and lets go of the one leaving, **in that order**, so assigning something to itself never briefly
+// drops the last count.
 store_into(e: *Emit, ty: Type, p: Val, v: Val, acc: IrAccess)
-    if contains_counted(ty)
-        gap_here(e, "a write through storage that holds a reference")
+    if !contains_counted(ty)
+        emit(e, InStore(lty(e, ty), v, p, acc, None))
         return
 
+    // A large aggregate gives its old contents back at the address rather than out of a value read
+    // for the purpose: there is nothing to load one into that would not be the whole-aggregate load
+    // lowering it through memory exists to avoid.
+    if e.layout.indirect(ty) && is_plain(acc)
+        retain_value(e, ty, v)
+        release_at(e, ty, p)
+        emit(e, InStore(lty(e, ty), v, p, AccPlain, None))
+        return
+
+    val old = fresh_reg(e)
+
+    emit(e, InLoad(old, lty(e, ty), p, acc, None))
+    retain_value(e, ty, v)
     emit(e, InStore(lty(e, ty), v, p, acc, None))
+    release_value(e, ty, old)
 end store_into
+
+// Whether an access says nothing beyond "read it" -- which is the only one an aggregate written at
+// its address may be, since the other two are per-instruction and there is no one instruction here.
+private is_plain(acc: IrAccess) -> bool = acc match
+    AccPlain -> true
+    _ -> false
 
 // -- the bit ranges of a bitfield struct's container --------------------------------------------------
 
@@ -309,17 +354,23 @@ end write_bits
 build_bits(e: *Emit, ranges: Buf[BitRange], vals: Buf[Val]) -> Val
     val ct = container_lty(ranges)
 
-    var acc: Option[Val] = None
+    // **Every range is placed before any of them is ored in.** The two phases are what the register
+    // numbering says: the shifts belong to the fields and the ors to the container, and interleaving
+    // them numbers the whole expression differently.
+    var placed: Buf[Val] = buf()
 
     for i in 0..<vals.len()
-        val placed = place_bits(e, ranges, ranges.at(i), vals.at(i))
+        placed.push(place_bits(e, ranges, ranges.at(i), vals.at(i)))
 
+    var acc: Option[Val] = None
+
+    for i in 0..<placed.len()
         acc = acc match
-            None -> Some(placed)
+            None -> Some(placed.at(i))
             Some(prev) ->
                 val t = fresh_reg(e)
 
-                emit(e, InBin(t, OpOr, ct, prev, placed))
+                emit(e, InBin(t, OpOr, ct, prev, placed.at(i)))
                 Some(t)
 
     acc match

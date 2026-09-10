@@ -38,6 +38,10 @@ struct Emit
     uses_memcpy: bool
     checked: bool
 
+    // How many assembly blocks the module has emitted, which is what lets each one's labels be its
+    // own.
+    asm_site: int
+
     // The blocks of the function being built. `prologue` is kept apart because a stack slot is
     // hoisted to the top of the entry block from wherever it was needed, so the two halves of that
     // block are built at different times and joined only when the function is finished.
@@ -69,9 +73,10 @@ struct Emit
     foreigns: Buf[string]
     variadics: Buf[string]
 
-    // How many postconditions the function being lowered states, which is what says whether a return
-    // owes anything beyond the `ret`.
-    ensures: int
+    // The postconditions the function being lowered states, and what `result` stands for while one
+    // of them is being emitted. A return owes nothing beyond the `ret` where there are none.
+    ensures: Buf[TClause]
+    result_ssa: Option[Val]
 
     // Where a tail self-call jumps, and which calls are the ones that jump.
     //
@@ -87,9 +92,71 @@ struct Emit
     // with the arguments a call was written with.
     tail_params: Buf[(string, Type)]
 
+    // -- the ownership runtime ---------------------------------------------------------------
+
+    // The destructor each type that has one is filed under, read straight off the program. A hook
+    // is built from a type with no call site anywhere near it, so this has to be here rather than
+    // handed down from a caller.
+    destructors: Buf[(string, string)]
+
+    // Whether anything in this module put an object on the heap, took an atomic count, held a weak
+    // reference, or counted against an owner that may be absent. Each decides one block of the
+    // runtime, which is why they are four flags rather than one.
+    heap: bool
+    sync_heap: bool
+    weak_heap: bool
+    maybe_heap: bool
+
+    // The boxes and buffers the module turned out to need, keyed by their LLVM name so that two
+    // instantiations mangling to one name are one definition.
+    boxes: Buf[(string, Type)]
+    bufs: Buf[(string, Type)]
+
+    // The runtime helpers asked for, by name, and what each is to be built from. A helper is named
+    // where it is called and generated afterwards, because generating one may ask for another.
+    requested: Buf[string]
+    queue: Buf[HelperReq]
+
+    // The scopes a value's count is given back at: the slots a lexical block owns, the values a
+    // statement or sub-expression region owns, and the statements a block runs on the way out.
+    //
+    // **Each is one flat list with a list of region starts beside it**, rather than a list of
+    // lists. A `Buf` copied out of another `Buf` shares the storage it views and carries its own
+    // length, so pushing into one read back by `at` writes into the shared elements and leaves the
+    // outer list's idea of the length behind -- a nesting that looks right and records nothing. A
+    // start index is the whole of what a region is, so this says the same thing with no copy in it.
+    temps: Buf[(Val, Type)]
+    temp_marks: Buf[usize]
+    owned_slots: Buf[(Val, Type)]
+    owned_marks: Buf[usize]
+    defers: Buf[TStmt]
+    defer_marks: Buf[usize]
+
+    // The names whose array lives in a buffer rather than a slot, because a view of it gets out of
+    // this frame, and the box each of those buffers is. The **temporaries** are whole-program rather
+    // than per-function, since a span already says which body a node is in.
+    promoted: Buf[string]
+    promoted_boxes: Buf[(string, Val)]
+    promoted_temps: Buf[Span]
+
     // The first form this body reached that nothing here lowers. A body that has one is not emitted.
     gap: Option[string]
 end Emit
+
+// What a runtime helper is built from. A helper is asked for by name while a body is being written
+// and generated once every body is, so what it is to be made of travels as a description rather
+// than as a function of its own.
+enum HelperReq
+    // The retain / release walk over a value of a type, and the same over one at an address.
+    HrValue(ty: Type, retain: bool)
+    HrSlot(ty: Type, retain: bool)
+
+    // The hook that destroys a box of this payload, a buffer of this element, and the one shared by
+    // every box whose payload holds nothing.
+    HrDrop(payload: Type)
+    HrDropBuf(elem: Type)
+    HrPlainDrop
+end HelperReq
 
 // What a definition and every call to it name.
 symbol_of(e: *Emit, name: string) -> string
@@ -122,10 +189,25 @@ struct GenLoop
     continue_label: string
     slot: Val
     has_slot: bool
+
+    // How deep the ownership regions were when the loop was entered, which is what bounds the
+    // unwinding a `break` or a `continue` from the middle of the body owes. Recorded before the
+    // condition's own bindings: each term of a condition closes its own region, so by the time the
+    // body runs there is nothing of the test left outstanding for the loop to give back.
+    owned_depth: usize
+    temp_depth: usize
 end GenLoop
 
-// An emitter for one module, with no function open.
+// An emitter for one module, with no function open, and no program behind it -- which is what a
+// test asserting on one instruction wants.
 emitter(t: Target) -> Emit
+    var none: Buf[(string, string)] = buf()
+
+    emitter_for(t, none)
+end emitter
+
+// The same, over a program whose destructors a hook has to be able to ask about.
+emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
     var globals: Buf[IrGlobal] = buf()
     var sat_decls: Buf[IrFuncSig] = buf()
     var prologue: Buf[Inst] = buf()
@@ -139,11 +221,28 @@ emitter(t: Target) -> Emit
     var variadics: Buf[string] = buf()
     var tail_calls: Buf[Span] = buf()
     var tail_params: Buf[(string, Type)] = buf()
+    var ensures: Buf[TClause] = buf()
 
-    Emit(t, layout_for(t), int(t.pointer_bits()), globals, 0, sat_decls, false, false, false,
+    var boxes: Buf[(string, Type)] = buf()
+    var bufs: Buf[(string, Type)] = buf()
+    var requested: Buf[string] = buf()
+    var queue: Buf[HelperReq] = buf()
+    var temps: Buf[(Val, Type)] = buf()
+    var temp_marks: Buf[usize] = buf()
+    var owned_slots: Buf[(Val, Type)] = buf()
+    var owned_marks: Buf[usize] = buf()
+    var defers: Buf[TStmt] = buf()
+    var defer_marks: Buf[usize] = buf()
+    var promoted: Buf[string] = buf()
+    var promoted_boxes: Buf[(string, Val)] = buf()
+    var promoted_temps: Buf[Span] = buf()
+
+    Emit(t, layout_for(t), int(t.pointer_bits()), globals, 0, sat_decls, false, false, false, 0,
          prologue, blocks, current, None, "entry", 0, 0, false, reached, loops, scratch, symbols,
-         foreigns, variadics, 0, "", tail_calls, tail_params, None)
-end emitter
+         foreigns, variadics, ensures, None, "", tail_calls, tail_params, destructors, false, false, false,
+         false, boxes, bufs, requested, queue, temps, temp_marks, owned_slots, owned_marks, defers,
+         defer_marks, promoted, promoted_boxes, promoted_temps, None)
+end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
 
@@ -178,10 +277,18 @@ start_function(e: *Emit)
     e.reached.clear()
     e.loops.clear()
     e.scratch.clear()
-    e.ensures = 0
+    e.ensures.clear()
+    e.result_ssa = None
     e.tail_target = ""
     e.tail_calls.clear()
     e.tail_params.clear()
+    e.temps.clear()
+    e.temp_marks.clear()
+    e.owned_slots.clear()
+    e.owned_marks.clear()
+    e.defers.clear()
+    e.defer_marks.clear()
+    e.promoted_boxes.clear()
     e.gap = None
 end start_function
 

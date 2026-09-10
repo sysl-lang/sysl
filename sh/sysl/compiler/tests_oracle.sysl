@@ -871,6 +871,13 @@ struct TypeAgreement
     fn_absent: usize
     first_bad_fn: string
 
+    // The **box** definitions, which are the ownership runtime's own types and are compared by name
+    // rather than in a run: the reference declares the library's functions where this compiler
+    // defines them, so the two modules need boxes for different sets of payloads and only the names
+    // both texts define say anything.
+    box_matched: usize
+    box_mismatched: usize
+
     // Why the bodies that are absent are absent, most often first. It is the census a next stage
     // works down, and it is read out of the lowering itself rather than guessed at from the symbol.
     reasons: Buf[(string, usize)]
@@ -919,7 +926,7 @@ private compare_types(binary: string, path: string, label: string, found: *TypeA
             end if
 
             val want = declared_type_lines(theirs.text)
-            val got = type_def_lines(mine.text)
+            val got = declared_type_lines(mine.text)
 
             found.compared += 1
             found.definitions += want.len()
@@ -929,11 +936,50 @@ private compare_types(binary: string, path: string, label: string, found: *TypeA
             if where.is_some()
                 found.mismatched += 1
 
-                if found.mismatched <= 8
+                if found.mismatched <= 4
                     found.first_bad = s"${found.first_bad}\n$label: ${where.unwrap()}"
 
+            compare_boxes(theirs.text, mine.text, label, found)
             compare_funcs(theirs.text, mine.text, mine.gaps, label, found)
 end compare_types
+
+// The ownership runtime's own type definitions, matched by name. A box this compilation never built
+// is absent rather than wrong, exactly as an unlowered body is, so what is compared is the names
+// both texts define.
+private compare_boxes(theirs: string, mine: string, label: string, found: *TypeAgreement)
+    val ours = box_lines(mine)
+    val wanted = box_lines(theirs)
+
+    for i in 0..<wanted.len()
+        text_for(ours, wanted.at(i).0) match
+            None -> ()
+            Some(body) ->
+                if body == wanted.at(i).1 then found.box_matched += 1
+                else
+                    found.box_mismatched += 1
+
+                    if found.box_mismatched <= 4
+                        found.first_bad = s"${found.first_bad}\n$label: '${wanted.at(i).0}' is " +
+                            s"'${wanted.at(i).1}' theirs and '$body' ours"
+end compare_boxes
+
+// Each `%arc.` definition of a text, as its name and what it is defined as.
+private box_lines(text: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    val all = type_def_lines(text)
+
+    for i in 0..<all.len()
+        val line = all.at(i)
+
+        if line.starts_with("%arc.")
+            val at = line.index_of(" = type ")
+
+            if at.is_some()
+                out.push((line[0..<at.unwrap()], line[(at.unwrap() + 8)..<line.bytes.len]))
+
+    out
+end box_lines
 
 // The functions of two texts, matched by symbol.
 //
@@ -988,7 +1034,7 @@ private census(counts: Buf[(string, usize)]) -> string
     var rest = counts
     var out = str_builder()
 
-    for k in 0..<8
+    for k in 0..<20
         var best: usize = 0
         var seen = false
 
@@ -1070,7 +1116,7 @@ the_emitted_types_agree()
             val scratch = dir + "/block.sysl"
 
             var reasons: Buf[(string, usize)] = buf()
-            var found = TypeAgreement(0, 0, 0, 0, 0, "", 0, 0, 0, "", reasons)
+            var found = TypeAgreement(0, 0, 0, 0, 0, "", 0, 0, 0, "", 0, 0, reasons)
 
             for item in walk(root)
                 item match
@@ -1096,15 +1142,22 @@ the_emitted_types_agree()
                 s"${found.skipped_unresolved} this compiler could not finish"
 
             val fn_summary = s"emitted functions: ${found.fn_matched} matched, " +
-                s"${found.fn_mismatched} mismatched, ${found.fn_absent} not lowered yet"
+                s"${found.fn_mismatched} mismatched, ${found.fn_absent} not lowered yet; " +
+                s"boxes: ${found.box_matched} matched, ${found.box_mismatched} mismatched"
+
+            // **The census is taken ONCE.** Reading it consumes the counts -- each entry it names
+            // is zeroed so the next-largest can be found -- so asking twice answers with the top of
+            // the list and then with whatever the first ask left behind.
+            val by_reason = census(found.reasons)
 
             print(summary)
             print(fn_summary)
             record_summary(s"$summary${found.first_bad}")
-            record_summary(s"$fn_summary${found.first_bad_fn}${census(found.reasons)}")
-            print(census(found.reasons))
+            record_summary(s"$fn_summary${found.first_bad_fn}$by_reason")
+            print(by_reason)
             assert(found.compared > 0, "the sweep compared something")
             assert(found.mismatched == 0, s"$summary${found.first_bad}")
             assert(found.fn_matched > 0, "the sweep compared a function")
             assert(found.fn_mismatched == 0, s"$fn_summary${found.first_bad_fn}")
+            assert(found.box_mismatched == 0, s"$fn_summary${found.first_bad}")
 end the_emitted_types_agree

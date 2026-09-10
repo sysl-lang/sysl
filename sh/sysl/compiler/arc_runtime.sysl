@@ -1,0 +1,258 @@
+module sh.sysl.compiler
+
+// **All of the ownership runtime that is the same for every type** -- which, because the destructor
+// lives behind the box's hook, is all of it but the hooks themselves.
+//
+// Taking a share needs no ordering: a count you already hold cannot reach zero underneath you, so
+// the atomic form is a relaxed increment. Giving one back publishes with release ordering and
+// acquires before destroying, so the thread that frees sees every other domain's writes. The
+// `_maybe` pair is for views -- slices and strings -- whose owner is null when the elements are
+// static, on a frame, or reached through a `*T`; the plain pair stays branch-free, since a reference
+// is non-null by construction.
+//
+// **Teardown is iterative, not recursive.** A destructor releases the references its payload holds,
+// so a chain of `&T` -- a linked list, a degenerate tree -- would otherwise recurse one C stack
+// frame per node and overflow the stack on a long one. Instead, when a count reaches zero the object
+// is pushed onto a worklist (reusing its now-dead count slot as the link) and the *first* release to
+// hit zero drains the list in a loop: each destructor it runs pushes more work rather than
+// recursing, so teardown depth is constant regardless of structure depth.
+//
+// **The worklist is per thread, because it is scratch space and not shared state.** Two threads
+// releasing the last reference to two unrelated `&sync` structures at the same moment both reach
+// `arc.reap`, and one list between them would have each overwrite the other's head. So the head and
+// the flag travel together as one **slot**, each thread drains its own, and that is what makes the
+// flag mean what it says: it asks whether *this* thread is already inside a drain further up its own
+// stack.
+//
+// **Where there is no notion of a current thread, the slot is asked for rather than assumed.** A
+// target with thread-local storage reaches its own directly and this costs nothing. A freestanding
+// target has no thread pointer, so it calls `__sysl_arc_reaper`, defined `weak` here to return the
+// one plain slot. A program with no scheduler defines nothing and gets exactly the single-list
+// behaviour it has always had; a port that *does* schedule defines the symbol over this one and
+// answers with storage belonging to the running task.
+
+// The one symbol a freestanding **port** may define to say what the running task's reaper scratch
+// is. It is a C name rather than a sysl one because whoever knows the answer is a scheduler written
+// in C.
+reaper_slot_symbol() -> string = "__sysl_arc_reaper"
+
+// The header, the reaper's scratch, and the four functions every heap module needs.
+//
+// The two counts are pointer-width. Nothing forces that -- a reference count is not an address --
+// but the alternative is a fixed `i64`, which costs sixteen bytes of header on a machine whose whole
+// point is having very little memory. What *is* forced is that this agrees with the stores the
+// emitter makes into these fields: a count written as one width and read as another is not a type
+// error anywhere, it is a leak or a double free.
+arc_core(t: Target) -> string
+    val tls = if t.thread_local_storage() then "thread_local " else ""
+    val supplied = !t.thread_local_storage()
+    val word = word_llvm(t)
+
+    val supplier = if !supplied then "" else
+        s"\ndefine weak ptr @${reaper_slot_symbol()}() {\nentry:\n  ret ptr @arc.reaper.self\n}"
+
+    val fetch_slot = if !supplied then "" else s"  %s = call ptr @${reaper_slot_symbol()}()\n"
+    val slot = if supplied then "%s" else "@arc.reaper.self"
+
+    s"%arc.header = type { $word, ptr, $word }\n" +
+    "\n" +
+    "%arc.reaper = type { ptr, i8 }\n" +
+    "\n" +
+    s"@arc.reaper.self = internal ${tls}global %arc.reaper zeroinitializer\n" +
+    s"$supplier\n" +
+    "\n" +
+    s"define private void @arc.retain(ptr %p) {\n" +
+    "entry:\n" +
+    s"  %c = load $word, ptr %p\n" +
+    s"  %n = add $word %c, 1\n" +
+    s"  store $word %n, ptr %p\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n" +
+    "define private void @arc.destroy(ptr %p) {\n" +
+    "entry:\n" +
+    "  %h = getelementptr %arc.header, ptr %p, i32 0, i32 1\n" +
+    "  %f = load ptr, ptr %h\n" +
+    "  %none = icmp eq ptr %f, null\n" +
+    "  br i1 %none, label %after, label %run\n" +
+    "run:\n" +
+    "  call void %f(ptr %p, i1 false)\n" +
+    "  br label %after\n" +
+    "after:\n" +
+    "  call void @arc.unshare(ptr %p)\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n" +
+    "define private void @arc.unshare(ptr %p) {\n" +
+    "entry:\n" +
+    "  %w = getelementptr %arc.header, ptr %p, i32 0, i32 2\n" +
+    s"  %c = load $word, ptr %w\n" +
+    s"  %n = sub $word %c, 1\n" +
+    s"  store $word %n, ptr %w\n" +
+    s"  %z = icmp eq $word %n, 0\n" +
+    "  br i1 %z, label %gone, label %kept\n" +
+    "gone:\n" +
+    "  %h = getelementptr %arc.header, ptr %p, i32 0, i32 1\n" +
+    "  %f = load ptr, ptr %h\n" +
+    "  %none = icmp eq ptr %f, null\n" +
+    "  br i1 %none, label %kept, label %give\n" +
+    "give:\n" +
+    "  call void %f(ptr %p, i1 true)\n" +
+    "  ret void\n" +
+    "kept:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n" +
+    "define private void @arc.reap(ptr %p) {\n" +
+    "entry:\n" +
+    s"$fetch_slot  %head = getelementptr %arc.reaper, ptr $slot, i32 0, i32 0\n" +
+    s"  %flag = getelementptr %arc.reaper, ptr $slot, i32 0, i32 1\n" +
+    "  %w = load ptr, ptr %head\n" +
+    "  store ptr %w, ptr %p\n" +
+    "  store ptr %p, ptr %head\n" +
+    "  %d = load i8, ptr %flag\n" +
+    "  %in = icmp ne i8 %d, 0\n" +
+    "  br i1 %in, label %done, label %drain\n" +
+    "drain:\n" +
+    "  store i8 1, ptr %flag\n" +
+    "  br label %loop\n" +
+    "loop:\n" +
+    "  %q = load ptr, ptr %head\n" +
+    "  %e = icmp eq ptr %q, null\n" +
+    "  br i1 %e, label %finish, label %step\n" +
+    "step:\n" +
+    "  %next = load ptr, ptr %q\n" +
+    "  store ptr %next, ptr %head\n" +
+    s"  store $word 0, ptr %q\n" +
+    "  call void @arc.destroy(ptr %q)\n" +
+    "  br label %loop\n" +
+    "finish:\n" +
+    "  store i8 0, ptr %flag\n" +
+    "  ret void\n" +
+    "done:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n" +
+    "define private void @arc.release(ptr %p) {\n" +
+    "entry:\n" +
+    s"  %c = load $word, ptr %p\n" +
+    s"  %n = sub $word %c, 1\n" +
+    s"  store $word %n, ptr %p\n" +
+    s"  %z = icmp eq $word %n, 0\n" +
+    "  br i1 %z, label %reap, label %live\n" +
+    "reap:\n" +
+    "  call void @arc.reap(ptr %p)\n" +
+    "  ret void\n" +
+    "live:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n"
+end arc_core
+
+// The three functions a `weak T` needs, emitted only into a module that holds one.
+//
+// `upgrade` is the whole of what separates a weak reference from a dangling one: it reads the strong
+// count, and a zero there means the object has already been destroyed, so the caller is handed
+// nothing instead of an address. A live count is taken, which is why the answer is a reference the
+// caller owns rather than one it has to be careful with.
+arc_weak(t: Target) -> string
+    val word = word_llvm(t)
+
+    "define private void @arc.weak_retain(ptr %p) {\n" +
+    "entry:\n" +
+    "  %empty = icmp eq ptr %p, null\n" +
+    "  br i1 %empty, label %done, label %live\n" +
+    "live:\n" +
+    "  %w = getelementptr %arc.header, ptr %p, i32 0, i32 2\n" +
+    s"  %c = load $word, ptr %w\n" +
+    s"  %n = add $word %c, 1\n" +
+    s"  store $word %n, ptr %w\n" +
+    "  ret void\n" +
+    "done:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n" +
+    "define private void @arc.weak_release(ptr %p) {\n" +
+    "entry:\n" +
+    "  %empty = icmp eq ptr %p, null\n" +
+    "  br i1 %empty, label %done, label %live\n" +
+    "live:\n" +
+    "  call void @arc.unshare(ptr %p)\n" +
+    "  ret void\n" +
+    "done:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n" +
+    "define private ptr @arc.upgrade(ptr %p) {\n" +
+    "entry:\n" +
+    "  %empty = icmp eq ptr %p, null\n" +
+    "  br i1 %empty, label %gone, label %check\n" +
+    "check:\n" +
+    s"  %c = load $word, ptr %p\n" +
+    s"  %z = icmp eq $word %c, 0\n" +
+    "  br i1 %z, label %gone, label %live\n" +
+    "live:\n" +
+    s"  %n = add $word %c, 1\n" +
+    s"  store $word %n, ptr %p\n" +
+    "  ret ptr %p\n" +
+    "gone:\n" +
+    "  ret ptr null\n" +
+    "}\n" +
+    "\n"
+end arc_weak
+
+// The atomic pair, emitted only into a module that has a `&sync` in it.
+arc_atomic(t: Target) -> string
+    val word = word_llvm(t)
+
+    "define private void @arc.retain_sync(ptr %p) {\n" +
+    "entry:\n" +
+    s"  %o = atomicrmw add ptr %p, $word 1 monotonic\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n" +
+    "define private void @arc.release_sync(ptr %p) {\n" +
+    "entry:\n" +
+    s"  %o = atomicrmw sub ptr %p, $word 1 release\n" +
+    s"  %z = icmp eq $word %o, 1\n" +
+    "  br i1 %z, label %reap, label %live\n" +
+    "reap:\n" +
+    "  fence acquire\n" +
+    "  call void @arc.reap(ptr %p)\n" +
+    "  ret void\n" +
+    "live:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n"
+end arc_atomic
+
+// The null-tolerant pair, emitted only into a module that holds a view of something.
+//
+// Alone among the four blocks this one names no count, so it needs no width: it is a null check and
+// a delegation, and the two functions it calls are the ones that know how wide a count is.
+arc_maybe() -> string =
+    "define private void @arc.retain_maybe(ptr %p) {\n" +
+    "entry:\n" +
+    "  %null = icmp eq ptr %p, null\n" +
+    "  br i1 %null, label %done, label %live\n" +
+    "live:\n" +
+    "  call void @arc.retain(ptr %p)\n" +
+    "  ret void\n" +
+    "done:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n" +
+    "define private void @arc.release_maybe(ptr %p) {\n" +
+    "entry:\n" +
+    "  %null = icmp eq ptr %p, null\n" +
+    "  br i1 %null, label %done, label %live\n" +
+    "live:\n" +
+    "  call void @arc.release(ptr %p)\n" +
+    "  ret void\n" +
+    "done:\n" +
+    "  ret void\n" +
+    "}\n" +
+    "\n"
+
+// The machine's word, as LLVM spells it.
+private word_llvm(t: Target) -> string = s"i${t.pointer_bits()}"

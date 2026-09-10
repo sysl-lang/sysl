@@ -49,7 +49,7 @@ private load_result(e: *Emit, slot: Val, ty: Type) -> Val
     val r = fresh_reg(e)
 
     emit(e, InLoad(r, lty(e, ty), slot, AccPlain, None))
-    r
+    own_temp(e, r, ty)
 end load_result
 
 // Closes the merge point of a form whose every path diverges: no branch arrives, so the label
@@ -94,11 +94,14 @@ gen_while(e: *Emit, cond: Buf[TCondTerm], body: Buf[TStmt], else_block: Option[T
     val else_l = if else_block.is_some() then fresh_label(e, "while.else") else end_l
     val slot = result_slot(e, ty)
 
-    e.loops.push(GenLoop(end_l, cond_l, slot, !no_value(ty)))
+    e.loops.push(GenLoop(end_l, cond_l, slot, !no_value(ty), e.owned_marks.len(),
+                         e.temp_marks.len()))
     emit_term(e, InBr(cond_l))
     emit_label(e, cond_l)
     gen_cond(e, cond, body_l, else_l)
+    push_owned(e)
     gen_stmts(e, body)
+    pop_owned(e)
     emit_term(e, InBr(cond_l))
     e.loops.pop()
     gen_loop_result(e, slot, ty, else_l, end_l, else_block)
@@ -113,15 +116,23 @@ gen_do_while(e: *Emit, body: Buf[TStmt], cond: TExpr, else_block: Option[TBlock]
     val else_l = if else_block.is_some() then fresh_label(e, "dowhile.else") else end_l
     val slot = result_slot(e, ty)
 
-    e.loops.push(GenLoop(end_l, cond_l, slot, !no_value(ty)))
+    e.loops.push(GenLoop(end_l, cond_l, slot, !no_value(ty), e.owned_marks.len(),
+                         e.temp_marks.len()))
     emit_term(e, InBr(body_l))
     emit_label(e, body_l)
+    push_owned(e)
     gen_stmts(e, body)
+    pop_owned(e)
     emit_term(e, InBr(cond_l))
     emit_label(e, cond_l)
 
+    // Re-evaluated every round, so what the test borrows is let go before the branch rather than
+    // piling up in the enclosing statement's region.
+    push_temps(e)
+
     val v = gen_expr(e, cond)
 
+    pop_temps(e)
     emit_term(e, InCondBr(v, body_l, else_l))
     e.loops.pop()
     gen_loop_result(e, slot, ty, else_l, end_l, else_block)
@@ -134,10 +145,13 @@ gen_loop(e: *Emit, body: Buf[TStmt], ty: Type) -> Val
     val end_l = fresh_label(e, "loop.end")
     val slot = result_slot(e, ty)
 
-    e.loops.push(GenLoop(end_l, body_l, slot, !no_value(ty)))
+    e.loops.push(GenLoop(end_l, body_l, slot, !no_value(ty), e.owned_marks.len(),
+                         e.temp_marks.len()))
     emit_term(e, InBr(body_l))
     emit_label(e, body_l)
+    push_owned(e)
     gen_stmts(e, body)
+    pop_owned(e)
     emit_term(e, InBr(body_l))
     e.loops.pop()
     gen_loop_result(e, slot, ty, end_l, end_l, None)
@@ -162,7 +176,8 @@ gen_for(e: *Emit, name: string, var_ty: Type, lo: TExpr, hi: TExpr, inclusive: b
 
     alloca(e, VReg(s"$name.addr"), w)
     emit(e, InStore(w, lo_v, VReg(s"$name.addr"), AccPlain, None))
-    e.loops.push(GenLoop(end_l, step_l, slot, !no_value(ty)))
+    e.loops.push(GenLoop(end_l, step_l, slot, !no_value(ty), e.owned_marks.len(),
+                         e.temp_marks.len()))
     emit_term(e, InBr(cond_l))
     emit_label(e, cond_l)
 
@@ -176,7 +191,9 @@ gen_for(e: *Emit, name: string, var_ty: Type, lo: TExpr, hi: TExpr, inclusive: b
                      hi_v))
     emit_term(e, InCondBr(cmp, body_l, else_l))
     emit_label(e, body_l)
+    push_owned(e)
     gen_stmts(e, body)
+    pop_owned(e)
     emit_term(e, InBr(step_l))
     emit_label(e, step_l)
 
@@ -213,22 +230,32 @@ gen_cfor(e: *Emit, init: Buf[TStmt], cond: Option[TExpr], step: Buf[TStmt], body
     val slot = result_slot(e, ty)
 
     gen_stmts(e, init)
-    e.loops.push(GenLoop(end_l, step_l, slot, !no_value(ty)))
+    e.loops.push(GenLoop(end_l, step_l, slot, !no_value(ty), e.owned_marks.len(),
+                         e.temp_marks.len()))
     emit_term(e, InBr(cond_l))
     emit_label(e, cond_l)
 
     cond match
         Some(c) ->
+            // Re-evaluated every iteration, so what it borrows is let go before the branch rather
+            // than accumulating in the enclosing statement's region.
+            push_temps(e)
+
             val v = gen_expr(e, c)
 
+            pop_temps(e)
             emit_term(e, InCondBr(v, body_l, else_l))
         None -> emit_term(e, InBr(body_l))
 
     emit_label(e, body_l)
+    push_owned(e)
     gen_stmts(e, body)
+    pop_owned(e)
     emit_term(e, InBr(step_l))
     emit_label(e, step_l)
+    push_temps(e)
     gen_stmts(e, step)
+    pop_temps(e)
     emit_term(e, InBr(cond_l))
     e.loops.pop()
     gen_loop_result(e, slot, ty, if cond.is_some() then else_l else end_l, end_l, else_block)
@@ -253,19 +280,37 @@ end gen_loop_result
 // -- blocks -----------------------------------------------------------------------------------------
 
 gen_block_void(e: *Emit, b: TBlock)
+    push_temps(e)
+    push_owned(e)
     gen_stmts(e, b.stmts)
 
     b.result match
         Some(r) -> gen_expr(e, r)
         None -> ()
+
+    pop_owned(e)
+    pop_temps(e)
 end gen_block_void
 
+// A branch's value, handed out with a count of its own. The block's locals and temporaries are
+// released before control leaves it -- that is what keeps every release site dominating the value
+// it releases -- so the result is retained first and becomes the caller's to let go.
 gen_block_value(e: *Emit, b: TBlock) -> Val
+    push_temps(e)
+    push_owned(e)
     gen_stmts(e, b.stmts)
 
-    b.result match
-        Some(r) -> gen_expr(e, r)
+    val v = b.result match
+        Some(r) ->
+            val got = gen_expr(e, r)
+
+            retain_value(e, texpr_type(r), got)
+            got
         None -> VNothing
+
+    pop_owned(e)
+    pop_temps(e)
+    v
 end gen_block_value
 
 gen_stmts(e: *Emit, xs: Buf[TStmt])

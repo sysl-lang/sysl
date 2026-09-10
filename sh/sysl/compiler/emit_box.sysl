@@ -1,0 +1,252 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **Putting something on the heap**: the box a `&T` is, the buffer a sized run of elements is, and
+// the view of one.
+//
+// Both are the same header -- a strong count, the hook that destroys the object, and a weak count --
+// so the runtime works the same whatever it is holding and an object frees itself into whichever
+// heap made it. A buffer adds the element count in front of the elements, because the hook is what
+// destroys them and the hook is reached with no static type in sight.
+
+// Puts a value on the heap: one count for the reference this yields, the hook that will destroy it,
+// and a copy of the payload -- whose own references the box now holds a share of.
+gen_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
+    val inner = ref_inner(ref_ty)
+    val bn = box_lty(e, inner)
+
+    // A large payload is written into the box rather than produced and then stored into it, for the
+    // reason every other destination has: the value would be a first-class aggregate of kilobytes
+    // for the length of one instruction. The address is not known until the box exists, so this is
+    // the one destination that cannot be handed over before the expression runs.
+    val large = e.layout.indirect(inner)
+    val v = if large then VNothing else gen_expr(e, value)
+    val p = allocate_box(e, bn)
+
+    emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
+    store_header_word(e, bn, p, 1, LPtr, drop_fn(e, inner))
+
+    // One weak share stands for every strong reference together, so the storage outlives the object
+    // exactly as long as some weak reference is still asking about it.
+    store_header_word(e, bn, p, 2, word_lty(e), VInt(from_int(1)))
+
+    val slot = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields())))))
+    emit(e, InGep(slot, bn, p, idx))
+
+    if large then gen_into(e, slot, value)
+    else
+        retain_value(e, inner, v)
+        emit(e, InStore(lty(e, inner), v, slot, AccPlain, None))
+
+    own_temp(e, p, ref_ty)
+end gen_box
+
+// The bytes one box occupies, asked of LLVM rather than computed here: a `getelementptr` one past
+// null, read back as an integer, is the size of what was stepped over.
+private allocate_box(e: *Emit, bn: LType) -> Val
+    val end = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(1))))
+    emit(e, InGep(end, bn, VNull, idx))
+
+    val size = fresh_reg(e)
+
+    emit(e, InCast(size, CastPtrToInt, LPtr, end, word_lty(e)))
+
+    val p = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(word_lty(e), size))
+    emit(e, ir_call(Some(p), LPtr, VGlobal(malloc_symbol()), args))
+    p
+end allocate_box
+
+private store_header_word(e: *Emit, bn: LType, p: Val, field: int, ty: LType, v: Val)
+    val r = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(field)))))
+    emit(e, InGep(r, bn, p, idx))
+    emit(e, InStore(ty, v, r, AccPlain, None))
+end store_header_word
+
+// The inner type of a `&T`, or the type itself where it is not one -- which nothing reaching here
+// should be, and which answers something rather than stopping the walk if it is.
+ref_inner(t: Type) -> Type = underlying(t) match
+    Ref(inner, _) -> *inner
+    _ -> t
+
+// -- a buffer, and the view of one ---------------------------------------------------------------------
+
+// The box that holds `n` elements sized while running, and the address its elements start at.
+//
+// The size is computed with the checked forms: a count the program worked out can be anything, and
+// a multiplication that wrapped would ask for a block far smaller than the elements written into
+// it.
+gen_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val)
+    val bn = buf_lty(e, elem)
+
+    e.checked = true
+
+    val e1 = fresh_reg(e)
+
+    var eidx: Buf[IrArg] = buf()
+
+    eidx.push(ir_arg(LInt(64), VInt(from_int(1))))
+    emit(e, InGep(e1, lty(e, elem), VNull, eidx))
+
+    val esz = fresh_reg(e)
+
+    emit(e, InCast(esz, CastPtrToInt, LPtr, e1, word_lty(e)))
+
+    val h1 = fresh_reg(e)
+
+    var hidx: Buf[IrArg] = buf()
+
+    hidx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    hidx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields() + 1)))))
+    emit(e, InGep(h1, bn, VNull, hidx))
+
+    val hsz = fresh_reg(e)
+
+    emit(e, InCast(hsz, CastPtrToInt, LPtr, h1, word_lty(e)))
+
+    val bytes = size_op(e, "mul", n, esz)
+    val total = size_op(e, "add", bytes.0, hsz)
+    val over = fresh_reg(e)
+
+    emit(e, InBin(over, OpOr, l_i1(), bytes.1, total.1))
+
+    val fits = fresh_reg(e)
+
+    emit(e, InBin(fits, OpXor, l_i1(), over, VBool(true)))
+    trap_unless(e, fits, "size")
+
+    val p = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(word_lty(e), total.0))
+    emit(e, ir_call(Some(p), LPtr, VGlobal(malloc_symbol()), args))
+
+    val got = fresh_reg(e)
+
+    emit(e, InIntCmp(got, INe, LPtr, p, VNull))
+    trap_unless(e, got, "alloc")
+    emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
+    store_header_word(e, bn, p, 1, LPtr, drop_buf_fn(e, elem))
+    store_header_word(e, bn, p, 2, word_lty(e), VInt(from_int(1)))
+    store_header_word(e, bn, p, header_fields(), word_lty(e), n)
+
+    val data = fresh_reg(e)
+
+    var didx: Buf[IrArg] = buf()
+
+    didx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    didx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields() + 1)))))
+    emit(e, InGep(data, bn, p, didx))
+    (p, data)
+end gen_buffer
+
+// One step of a size computation, with the overflow flag beside the answer. The intrinsic carries
+// its width in the **name** as well as in the signature, so a size computed at the machine's own
+// width has to name the matching overload.
+private size_op(e: *Emit, op: string, a: Val, b: Val) -> (Val, Val)
+    val w = word_lty(e)
+    val fn = llvm_with_overflow(op, false, w)
+
+    var pair_fields: Buf[LType] = buf()
+
+    pair_fields.push(w)
+    pair_fields.push(l_i1())
+
+    val both = LStruct(pair_fields)
+
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(w))
+    params.push(ir_param(w))
+    request_intrinsic(e, ir_sig(fn, ir_fn_type(both, params)))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(w, a))
+    args.push(ir_arg(w, b))
+
+    val pair = fresh_reg(e)
+
+    emit(e, ir_call(Some(pair), both, VGlobal(fn), args))
+
+    val v = fresh_reg(e)
+
+    emit(e, InExtract(v, both, pair, index_list(0)))
+
+    val ovf = fresh_reg(e)
+
+    emit(e, InExtract(ovf, both, pair, index_list(1)))
+    (v, ovf)
+end size_op
+
+// The view of a whole buffer: the box keeps the elements alive, and the one count it was made with
+// is the count this view holds.
+buffer_view(e: *Emit, slice_ty: Type, box: Val, data: Val, n: Val) -> Val
+    e.maybe_heap = true
+
+    val lt = lty(e, slice_ty)
+    val with_owner = fresh_reg(e)
+
+    emit(e, InInsert(with_owner, lt, VZero, LPtr, box, index_list(0)))
+
+    val with_ptr = fresh_reg(e)
+
+    emit(e, InInsert(with_ptr, lt, with_owner, LPtr, data, index_list(1)))
+
+    val whole = fresh_reg(e)
+
+    emit(e, InInsert(whole, lt, with_ptr, word_lty(e), n, index_list(2)))
+    own_temp(e, whole, slice_ty)
+end buffer_view
+
+// -- an array whose storage a view outlives -------------------------------------------------------------
+
+// The element type of an array, where the type is one -- which is the whole of what makes a
+// declaration promotable.
+promoted_elem(ty: Type) -> Option[Type] = underlying(ty) match
+    Array(_, elem) -> Some(*elem)
+    _ -> None
+
+// An array a view of which gets out of this frame lives in a buffer instead of a slot, and that is
+// the whole of the difference: the name still means the address of the storage, so the store and
+// every later use are the ones an unpromoted array gets. What the buffer adds is an owner for the
+// views to count against, and a release when the name goes out of scope.
+gen_promoted_decl(e: *Emit, name: string, ty: Type, elem: Type, init: TExpr)
+    val n = array_length(ty)
+    val v = gen_expr(e, init)
+    val made = gen_buffer(e, elem, VInt(from_int(long(n))))
+
+    e.promoted_boxes.push((name, made.0))
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(LInt(64), VInt(from_int(0))))
+    emit(e, InGep(VReg(s"$name.addr"), lty(e, elem), made.1, idx))
+    retain_value(e, ty, v)
+    emit(e, InStore(lty(e, ty), v, VReg(s"$name.addr"), AccPlain, None))
+    own_box(e, name, made.0, elem)
+end gen_promoted_decl
+
+private array_length(ty: Type) -> int = underlying(ty) match
+    Array(n, _) -> n
+    _ -> 0
