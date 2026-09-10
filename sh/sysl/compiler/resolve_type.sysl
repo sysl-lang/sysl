@@ -4,6 +4,7 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int}
 import sysl.math.decimal.{Decimal, of as decimal_of, parse as decimal_parse}
+import sysl.text.Search
 
 // A written type, resolved to the type it means.
 //
@@ -46,9 +47,12 @@ rebind(subst: *Buf[Binding], name: string, ty: Type)
 // The type a written one means.
 resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Type = *t.kind match
     NamedType(name, args) -> resolve_named(a, scope, t.span, name, args, subst)
-    PtrType(inner) -> Ptr(resolve_type(a, scope, inner, subst))
-    RefType(inner, sync) -> Ref(resolve_type(a, scope, inner, subst), sync)
-    WeakType(inner) -> Weak(resolve_type(a, scope, inner, subst))
+    // **A hop is what makes a cycle finite**, so the four forms that point rather than hold are
+    // counted -- and the count is what a type reached again is judged against.
+    PtrType(inner) -> Ptr(under_indirection(a, () -> resolve_type(a, scope, inner, subst)))
+    RefType(inner, sync) -> Ref(under_indirection(a, () -> resolve_type(a, scope, inner, subst)),
+                                sync)
+    WeakType(inner) -> Weak(under_indirection(a, () -> resolve_type(a, scope, inner, subst)))
     VolatileType(inner) -> Volatile(resolve_type(a, scope, inner, subst))
     ArrayType(length, elem, read_only) ->
         resolve_array(a, scope, t.span, length, elem, read_only, subst)
@@ -81,12 +85,136 @@ end resolve_list
 
 private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Expr], elem: TypeRef,
                       read_only: bool, subst: Buf[Binding]) -> Type
+    // A fixed array HOLDS its elements and a slice POINTS at them, which is the whole of why one is
+    // an indirection and the other is not.
+    if length.is_none() then
+        return Slice(under_indirection(a, () -> resolve_type(a, scope, elem, subst)), read_only)
+
     val e = resolve_type(a, scope, elem, subst)
 
-    length match
-        Some(n) -> Array(int(const_extent(a, scope, span, n, subst)), e)
-        None -> Slice(e, read_only)
+    Array(int(const_extent(a, scope, span, length.unwrap(), subst)), e)
 end resolve_array
+
+// A resolution run one hop further out than the one around it.
+under_indirection(a: &Analysis, resolve: &Fn() -> Type) -> Type
+    a.indirection += 1
+
+    val out = resolve()
+
+    a.indirection -= 1
+    out
+end under_indirection
+
+// A resolution run inside a type-argument list, which is not on its own an answer to whether a type
+// contains itself: whether `Buf[Node]` holds a `Node` depends on how `Buf` uses its parameter, and
+// the question is asked again where the substitution is used.
+under_type_arg(a: &Analysis, resolve: &Fn() -> Buf[Type]) -> Buf[Type]
+    a.type_arg_depth += 1
+
+    val out = resolve()
+
+    a.type_arg_depth -= 1
+    out
+end under_type_arg
+
+// Whether reaching an in-progress instantiation again is a legal cycle: it is exactly when at least
+// one hop was crossed on the way back to it. Both counts are compared against where the type was
+// ENTERED rather than against zero -- an argument list entered after it is what excuses a path, and
+// never what a type does to itself.
+// Answers whether it fired, because a field whose type is the shape being refused may not be
+// RECORDED as that shape: the table would then hold a type that genuinely contains itself, and every
+// pass that walks a layout would follow it for ever. What the field gets instead is `Unknown`, which
+// is what everything downstream already means by "a mistake was reported here".
+cycle_check(a: &Analysis, scope: Scope, span: Span, key: string) -> bool
+    var found = false
+
+    for i in 0..<a.resolving.len()
+        val at = a.resolving.at(i)
+
+        if at.0 == key && a.indirection <= at.1 && a.type_arg_depth <= at.2
+            a.fault(scope, span,
+                    s"type '${module_show(instance_base(key))}' contains itself, so it has no " +
+                    "finite size")
+
+            found = true
+
+    found
+end cycle_check
+
+// The declared name an instance key was made from, which is what a diagnostic calls the type.
+private instance_base(key: string) -> string
+    val at = key.index_of("[")
+
+    if at.is_none() then return key
+
+    key[0..<at.unwrap()]
+end instance_base
+
+// What a type parameter stands for, asked the containment question the argument position deferred:
+// a `T` used **by value** here is the containing type held by value, whatever hop the parameter was
+// written behind.
+//
+// **The question is about what the argument REACHES, not about what it is.** Asking only whether the
+// argument is itself in progress answers a mutual cycle wrong, because the other type on the cycle
+// has usually finished by the time the generic's field substitutes it.
+substituted(a: &Analysis, scope: Scope, span: Span, t: Type) -> Type
+    if a.resolving.is_empty() then return t
+
+    var found: Buf[string] = buf()
+    var seen: Buf[string] = buf()
+
+    reached_by_value(a, t, &seen, &found)
+
+    var cut = false
+
+    for i in 0..<found.len()
+        if cycle_check(a, scope, span, found.at(i)) then cut = true
+
+    if cut then Unknown else t
+end substituted
+
+// Every still-resolving type a layout reaches **without crossing a hop**, which is the whole of what
+// makes a cycle infinite. A struct's fields, an enum variant's payload, a fixed array's elements and
+// a constrained type's base are all held; a pointer, a reference, a weak reference and a slice all
+// point, so the walk stops at them.
+//
+// **Every one of them rather than the first**, because `resolving` records the hop count each type
+// was entered at and a walk can reach two entered at different ones.
+private reached_by_value(a: &Analysis, t: Type, seen: *Buf[string], found: *Buf[string])
+    t match
+        Struct(d) ->
+            val key = instance_key(d.base, d.targs)
+
+            if is_resolving(a, key)
+                if !holds_string(*found, key) then found.push(key)
+            else if !holds_string(*seen, key)
+                seen.push(key)
+
+                for i in 0..<d.fields.len()
+                    reached_by_value(a, d.fields.at(i).1, seen, found)
+        Enum(d) ->
+            val key = instance_key(d.base, d.targs)
+
+            if is_resolving(a, key)
+                if !holds_string(*found, key) then found.push(key)
+            else if !holds_string(*seen, key)
+                seen.push(key)
+
+                for i in 0..<d.variants.len()
+                    val v = d.variants.at(i)
+
+                    for j in 0..<v.fields.len()
+                        reached_by_value(a, v.fields.at(j).1, seen, found)
+        Array(_, elem) -> reached_by_value(a, *elem, seen, found)
+        Constrained(d) -> reached_by_value(a, d.base, seen, found)
+        _ -> ()
+
+private is_resolving(a: &Analysis, key: string) -> bool
+    for i in 0..<a.resolving.len()
+        if a.resolving.at(i).0 == key then return true
+
+    false
+end is_resolving
 
 // A tuple is an ordinary struct declared by the compiler, and a result list is that tuple wearing a
 // second name -- which is what tells `return a, b` from `return (a, b)`.
@@ -204,12 +332,15 @@ end digits_value
 
 private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args: Buf[TypeRef],
                       subst: Buf[Binding]) -> Type
-    val targs = resolve_list(a, scope, args, subst)
+    val targs = under_type_arg(a, () -> resolve_list(a, scope, args, subst))
 
     if args.is_empty() then
         val stood_for = bound_type(subst, name)
 
-        if stood_for.is_some() then return stood_for.unwrap()
+        // A parameter used here stands where the declaration wrote it, and what it stands for is
+        // held exactly as the parameter is -- so this is where the argument position's deferral is
+        // paid for.
+        if stood_for.is_some() then return substituted(a, scope, span, stood_for.unwrap())
 
     if name == "never" then return Never
     if name == "Self" then return bound_type(subst, "Self").unwrap_or(Unknown)
@@ -503,12 +634,16 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
 
     val open = a.tables.in_progress.get(inst)
 
-    if open.is_some() then return open.unwrap()
+    if open.is_some()
+        if cycle_check(a, scope, span, inst) then return Unknown
+
+        return open.unwrap()
 
     val made: &StructType = StructType(key, targs, buf(), d.packed, None, None)
     val ty = Struct(made)
 
     a.tables.in_progress.put(inst, ty)
+    a.resolving.push((inst, a.indirection, a.type_arg_depth))
 
     val subst = bindings_for(d.tparams, targs)
 
@@ -517,6 +652,7 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
 
         made.fields.push((f.name, resolve_type(a, home, f.typ, subst)))
 
+    a.resolving.truncate(a.resolving.len() - 1)
     a.tables.in_progress.remove(inst)
     a.tables.struct_insts.put(inst, ty)
     ty
@@ -536,7 +672,10 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
 
     val open = a.tables.in_progress.get(inst)
 
-    if open.is_some() then return open.unwrap()
+    if open.is_some()
+        if cycle_check(a, scope, span, inst) then return Unknown
+
+        return open.unwrap()
 
     var simple = true
 
@@ -551,6 +690,7 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
     val ty = Enum(made)
 
     a.tables.in_progress.put(inst, ty)
+    a.resolving.push((inst, a.indirection, a.type_arg_depth))
 
     val subst = bindings_for(d.tparams, targs)
 
@@ -563,6 +703,7 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
 
         made.variants.push(EnumVariant(v.name, int(i), fields, !v.fields.is_empty()))
 
+    a.resolving.truncate(a.resolving.len() - 1)
     a.tables.in_progress.remove(inst)
     a.tables.enum_insts.put(inst, ty)
     ty
