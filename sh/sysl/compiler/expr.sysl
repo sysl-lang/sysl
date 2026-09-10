@@ -841,7 +841,7 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type]) -> 
     for i in 0..<operands.len()
         val e = operands.at(i)
 
-        if is_literal(e) || typed_by_position(e) then own.push(None)
+        if is_literal(e) || typed_by_position(cx, e) then own.push(None)
         else own.push(Some(sandboxed_read(cx, e, expected)))
 
     val settled = firmest(operands, own).or_else(() -> expected)
@@ -946,10 +946,41 @@ end meet_views
 // The test is on the spelling, and it is allowed to be, because the middle tier is not a licence to
 // skip anything: it moves an operand one place later in the order and hands it the neighbour's type
 // as the position's, which is what an expected type is for.
-typed_by_position(e: Expr) -> bool = *e.kind match
+typed_by_position(cx: &Analyzer, e: Expr) -> bool = *e.kind match
     ImplicitMember(_) -> true
+
+    // A **payload-free variant of a generic enum** -- `None` above all. It is not a literal and it
+    // is not a load, and falling through both tiers means asking what an `Option` of nothing in
+    // particular holds. It belongs here for precisely the reason `.red` does: the form has no type
+    // at all until something says which type is wanted, and a sibling is something.
+    //
+    // **A variant that CARRIES something is deliberately not here.** `Some(3)` knows what it is
+    // before anything asks, so it is what the pair takes its type *from*.
+    Ident(name) -> payload_free_generic_variant(cx, name)
     Call(callee, args) -> *callee.kind match
         ImplicitMember(_) -> true
         Field(_, name) -> name == "load" && args.len() == 1
         _ -> false
     _ -> false
+
+// Whether a bare name is a variant that carries nothing, of an enum that takes type arguments.
+//
+// Both halves are needed and each rules out a case that must not be in the tier above. A variant of
+// a **non-generic** enum has a type the moment it is named -- `Colour.Red` is a `Colour` -- so it is
+// an answer rather than a question. One that **carries** something derives its arguments from what
+// it was given, which is what makes `Some(3)` a type its sibling can be read against.
+private payload_free_generic_variant(cx: &Analyzer, name: string) -> bool
+    for i in 0..<cx.an.tables.types.len()
+        val key = cx.an.tables.types.key_at(i)
+
+        cx.an.tables.types.at(i).kind match
+            EnumOf(d) ->
+                if !d.tparams.is_empty() && reachable_key(cx.an, key, cx.scope) &&
+                        visible_here(cx, key)
+                    for j in 0..<d.variants.len()
+                        if d.variants.at(j).name == name && d.variants.at(j).fields.is_empty()
+                            return true
+            _ -> ()
+
+    false
+end payload_free_generic_variant
