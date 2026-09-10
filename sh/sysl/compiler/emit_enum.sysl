@@ -1,0 +1,79 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **A data enum is a tag and one payload region**, wide enough for whichever variant needs the most.
+// The region is a union, so a payload cannot be dropped in with `insertvalue` -- an aggregate value
+// has no operation that reinterprets part of itself. It goes through a stack slot instead: written
+// at the variant's own type, read back at the enum's.
+
+// The address of the payload region inside an enum sitting at `base`.
+payload_ptr(e: *Emit, d: &EnumType, base: Val) -> Val
+    val r = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(1))))
+    emit(e, InGep(r, enum_lty(d), base, idx))
+    r
+end payload_ptr
+
+// Reads a variant's payload out of an enum value, at that variant's type.
+//
+// Reading a variant the value is not holding yields whatever the one it *is* holding left there --
+// which is what a pattern test does before it knows the tag, and the tag test beside it is what
+// makes the answer count.
+enum_payload(e: *Emit, d: &EnumType, v: EnumVariant, value: Val) -> Val
+    val slot = scratch_slot(e, enum_lty(d))
+
+    emit(e, InStore(enum_lty(d), value, slot, AccPlain, None))
+
+    val p = payload_ptr(e, d, slot)
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, variant_lty(d, v), p, AccPlain, None))
+    r
+end enum_payload
+
+// Builds an enum value from already-lowered payload values: the tag, then the variant's payload
+// aggregate written into the region every variant shares.
+enum_value(e: *Emit, en: Type, d: &EnumType, v: EnumVariant, vals: Buf[Val]) -> Val
+    if d.simple then return VInt(from_int(long(v.tag)))
+
+    if !v.carries
+        val tagged = fresh_reg(e)
+
+        emit(e, InInsert(tagged, enum_lty(d), VUndef, l_i32(), VInt(from_int(long(v.tag))),
+                         index_list(0)))
+        return tagged
+
+    var payload: Val = VUndef
+
+    for i in 0..<vals.len()
+        if !zero_sized(v.fields.at(i).1)
+            val r = fresh_reg(e)
+
+            emit(e, InInsert(r, variant_lty(d, v), payload, lty(e, v.fields.at(i).1), vals.at(i),
+                             index_list(int(v.slot(i)))))
+            payload = r
+
+    val slot = scratch_slot(e, enum_lty(d))
+
+    emit(e, InStore(l_i32(), VInt(from_int(long(v.tag))), slot, AccPlain, None))
+
+    val p = payload_ptr(e, d, slot)
+
+    emit(e, InStore(variant_lty(d, v), payload, p, AccPlain, None))
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, enum_lty(d), slot, AccPlain, None))
+    r
+end enum_value
+
+// The declaration behind an enum type, where the type is one.
+enum_decl(t: Type) -> Option[&EnumType] = underlying(t) match
+    Enum(d) -> Some(d)
+    _ -> None

@@ -62,7 +62,7 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
 
     TAddrOf(place, _) -> address(e, place)
 
-    TField(receiver, index, ty) -> gen_field(e, receiver, index, ty)
+    TField(receiver, index, ty) -> gen_field(e, x, receiver, index, ty)
 
     TIndex(receiver, index, ty) ->
         val p = element_addr(e, receiver, index)
@@ -118,44 +118,55 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
 
     TEnumNew(enum_ty, variant, args) -> gen_enum_new(e, enum_ty, variant, args)
     TEnumFromInt(value, en) -> gen_expr(e, value)
+    TStructNew(decl, args) -> gen_struct_new(e, decl, args)
+    TMatch(scrutinee, arms, ty) -> gen_match(e, scrutinee, arms, ty)
 
     _ -> gap_at(e, texpr_kind_name(x))
 
-// A field read: through the value where the receiver is one, and through an address where the
-// storage is a device register that a whole-block load would be the wrong access to.
-private gen_field(e: *Emit, receiver: TExpr, index: int, ty: Type) -> Val
-    if zero_sized(ty) then return VNothing
+// A field read.
+//
+// A **bitfield** is read out of its container, and the container is reached the way the *receiver*
+// is: at its address where it has one, so that a field of a `volatile` register block is one
+// volatile load of the whole register -- and out of the value otherwise.
+//
+// A register is reached at its own address, because the ordinary lowering would read the whole block
+// to get at one field of it -- and reading a register block is not a way of reading one register. So
+// is a field of a **large** struct, for a reason that is arithmetic rather than hardware: lifting one
+// field out of a value means producing the whole value first.
+private gen_field(e: *Emit, x: TExpr, receiver: TExpr, index: int, ty: Type) -> Val
+    if zero_sized(ty)
+        gen_expr(e, receiver)
+        return VNothing
 
     val rty = texpr_type(receiver)
 
     bitfield_ranges_of(rty) match
         Some(ranges) ->
+            val acc = access_of(place_ty(receiver))
+            val ct = container_lty(ranges)
+            val at_address = has_address(receiver) && (e.layout.indirect(rty) || volatile_in(place_ty(receiver)))
+
+            val c = container_read(e, receiver, rty, ct, acc, at_address)
+
             val s = underlying(rty) match
                 Struct(d) -> d.slot(usize(index))
                 _ -> usize(index)
 
-            val c = fresh_reg(e)
-
-            if volatile_in(rty) || has_address(receiver)
-                emit(e, InLoad(c, container_lty(ranges), address(e, receiver), access_of(rty), None))
-                return read_bits(e, ranges, ranges.at(s), c)
-
-            return read_bits(e, ranges, ranges.at(s), gen_expr(e, receiver))
+            return read_bits(e, ranges, ranges.at(s), c)
         None -> ()
 
-    if volatile_in(rty) && has_address(receiver)
-        val p = address(e, receiver)
-        val f = fresh_reg(e)
-
-        var idx: Buf[IrArg] = buf()
-
-        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
-        idx.push(ir_arg(l_i32(), VInt(from_int(long(field_slot_of(rty, index))))))
-        emit(e, InGep(f, lty(e, rty), p, idx))
-
+    if volatile_in(place_ty(x)) && has_address(receiver)
+        val p = address(e, x)
         val r = fresh_reg(e)
 
-        emit(e, InLoad(r, lty(e, ty), f, access_of(rty), None))
+        emit(e, InLoad(r, lty(e, ty), p, AccVolatile, None))
+        return r
+
+    if e.layout.indirect(rty) && has_address(receiver)
+        val p = address(e, x)
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, ty), p, AccPlain, None))
         return r
 
     val v = gen_expr(e, receiver)
@@ -164,6 +175,29 @@ private gen_field(e: *Emit, receiver: TExpr, index: int, ty: Type) -> Val
     emit(e, InExtract(r, lty(e, rty), v, index_list(int(field_slot_of(rty, index)))))
     r
 end gen_field
+
+private container_read(e: *Emit, receiver: TExpr, rty: Type, ct: LType, acc: IrAccess,
+                       at_address: bool) -> Val
+    if at_address then return loaded_container(e, receiver, ct, acc)
+
+    extracted_container(e, receiver, rty)
+end container_read
+
+private loaded_container(e: *Emit, receiver: TExpr, ct: LType, acc: IrAccess) -> Val
+    val p = address(e, receiver)
+    val t = fresh_reg(e)
+
+    emit(e, InLoad(t, ct, p, acc, None))
+    t
+end loaded_container
+
+private extracted_container(e: *Emit, receiver: TExpr, rty: Type) -> Val
+    val rv = gen_expr(e, receiver)
+    val t = fresh_reg(e)
+
+    emit(e, InExtract(t, lty(e, rty), rv, index_list(0)))
+    t
+end extracted_container
 
 // Whether a node names storage rather than a value, which is what says `address` can walk to it.
 has_address(x: TExpr) -> bool = *x.kind match
@@ -377,10 +411,11 @@ comparison(e: *Emit, c: TCmp, ty: Type, av: Val, bv: Val) -> Val = c.dispatch ma
 private gen_store(e: *Emit, place: TExpr, value: TExpr, ty: Type) -> Val
     if zero_sized(ty)
         gen_expr(e, value)
+        address(e, place)
         return VNothing
 
-    val p = place_addr(e, place)
     val v = gen_expr(e, value)
+    val p = place_addr(e, place)
 
     store_place(e, place, p, v)
     v
@@ -408,15 +443,16 @@ private gen_inc_dec(e: *Emit, place: TExpr, op: string, pre: bool, ty: Type,
                     check: Option[Type]) -> Val
     val p = place_addr(e, place)
     val cur = load_place(e, place, p)
-    val one = VInt(from_int(1))
-    val updated = combine(e, if op == "++" then "+=" else "-=", ty, underlying(ty), cur, one)
+    val nv = fresh_reg(e)
+
+    emit(e, InBin(nv, if op == "++" then OpAdd else OpSub, lty(e, ty), cur, VInt(from_int(1))))
 
     check match
-        Some(c) -> emit_constraint_checks(e, updated, c)
+        Some(c) -> emit_constraint_checks(e, nv, c)
         None -> ()
 
-    store_place(e, place, p, updated)
-    if pre then updated else cur
+    store_place(e, place, p, nv)
+    if pre then nv else cur
 end gen_inc_dec
 
 // What a compound assignment stores: what its operator makes of the place's current value and the
@@ -531,24 +567,57 @@ end gen_constrained_step
 
 // -- enums ------------------------------------------------------------------------------------------
 
-// An enum value built from a variant and what it carries. A **simple** enum is its tag; a nullary
-// variant of a data enum is the tag written into an otherwise undefined value.
+// An enum value built from a variant and what it carries.
 private gen_enum_new(e: *Emit, enum_ty: Type, variant: EnumVariant, args: Buf[TExpr]) -> Val
-    val d = underlying(enum_ty) match
-        Enum(decl) -> decl
-        _ -> return gap_at(e, "an enum construction of something that is not an enum")
+    val d = enum_decl(enum_ty) match
+        Some(decl) -> decl
+        None -> return gap_at(e, "an enum construction of something that is not an enum")
 
-    if d.simple then return VInt(from_int(long(variant.tag)))
+    var vals: Buf[Val] = buf()
 
-    if !variant.carries
-        val tagged = fresh_reg(e)
+    for i in 0..<args.len()
+        vals.push(gen_expr(e, args.at(i)))
 
-        emit(e, InInsert(tagged, lty(e, enum_ty), VUndef, l_i32(),
-                         VInt(from_int(long(variant.tag))), index_list(0)))
-        return tagged
-
-    gap_at(e, "an enum variant that carries a payload")
+    enum_value(e, enum_ty, d, variant, vals)
 end gen_enum_new
+
+// A struct built from its field values: an `insertvalue` chain over an undefined aggregate, with the
+// fields that occupy nothing skipped exactly as the layout skips them. A **bitfield** struct is one
+// integer instead, and its fields are ranges of it.
+private gen_struct_new(e: *Emit, decl: &StructType, args: Buf[TExpr]) -> Val
+    bitfield_ranges(decl) match
+        Some(ranges) ->
+            var vals: Buf[Val] = buf()
+
+            for i in 0..<args.len()
+                val v = gen_expr(e, args.at(i))
+
+                if !zero_sized(decl.fields.at(i).1) then vals.push(v)
+
+            val c = build_bits(e, ranges, vals)
+            val r = fresh_reg(e)
+
+            emit(e, InInsert(r, struct_lty(decl), VUndef, container_lty(ranges), c, index_list(0)))
+            return r
+        None -> ()
+
+    var vals: Buf[Val] = buf()
+
+    for i in 0..<args.len()
+        vals.push(gen_expr(e, args.at(i)))
+
+    var acc: Val = VUndef
+
+    for i in 0..<vals.len()
+        if !zero_sized(decl.fields.at(i).1)
+            val r = fresh_reg(e)
+
+            emit(e, InInsert(r, struct_lty(decl), acc, lty(e, decl.fields.at(i).1), vals.at(i),
+                             index_list(int(decl.slot(i)))))
+            acc = r
+
+    acc
+end gen_struct_new
 
 // -- calls ----------------------------------------------------------------------------------------
 

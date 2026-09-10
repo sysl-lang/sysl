@@ -302,3 +302,27 @@ write_bits(e: *Emit, ranges: Buf[BitRange], r: BitRange, c: Val, v: Val) -> Val
     emit(e, InBin(merged, OpOr, ct, cleared, shifted))
     merged
 end write_bits
+
+// A whole container built from one value per field, which is what constructing a bitfield struct is.
+// It ors the placed ranges together rather than folding a write over a zero, because there is
+// nothing to preserve: every bit of the result is being written.
+build_bits(e: *Emit, ranges: Buf[BitRange], vals: Buf[Val]) -> Val
+    val ct = container_lty(ranges)
+
+    var acc: Option[Val] = None
+
+    for i in 0..<vals.len()
+        val placed = place_bits(e, ranges, ranges.at(i), vals.at(i))
+
+        acc = acc match
+            None -> Some(placed)
+            Some(prev) ->
+                val t = fresh_reg(e)
+
+                emit(e, InBin(t, OpOr, ct, prev, placed))
+                Some(t)
+
+    acc match
+        Some(v) -> v
+        None -> VInt(from_int(0))
+end build_bits

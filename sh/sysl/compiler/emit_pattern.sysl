@@ -1,0 +1,253 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **What a pattern tests, and what it binds** -- the two halves of an arm, kept apart because they
+// happen at different moments: a binding is established only once the arm has been taken, and a
+// guard runs between the two.
+
+// The `i1` result of testing a pattern against a value. Every pattern node carries the type it tests
+// at, so the value's type does not have to be passed alongside it.
+//
+// A variant's payload is tested **behind** its tag rather than beside it. The payload is only this
+// variant's while the tag says so, so reading it out of a value that turned out to be another
+// variant reinterprets whatever that other variant stored.
+pattern_test(e: *Emit, p: TPattern, value: Val) -> Val = p match
+    TWildPattern(_) -> VBool(true)
+    TBindPattern(_, _) -> VBool(true)
+
+    // The binding is established later; what decides the arm is the inner test alone, since naming a
+    // value says nothing about whether it matched.
+    TAtPattern(_, inner) -> pattern_test(e, *inner, value)
+    TLitPattern(v) -> compare_value(e, "==", underlying(texpr_type(v)), value, gen_expr(e, v))
+    TRangePattern(lo, hi, inclusive) ->
+        val lo_ok = compare_value(e, ">=", underlying(texpr_type(lo)), value, gen_expr(e, lo))
+        val hi_ok = compare_value(e, if inclusive then "<=" else "<", underlying(texpr_type(hi)),
+                                  value, gen_expr(e, hi))
+
+        and_i1(e, lo_ok, hi_ok)
+    TVariantPattern(enum_ty, variant, args) -> variant_test(e, enum_ty, variant, args, value)
+
+    // A struct has no tag, so the test is just its refutable fields' tests ANDed together.
+    TStructPattern(decl, args) ->
+        var acc: Val = VBool(true)
+
+        for i in 0..<args.len()
+            if refutable(args.at(i))
+                acc = and_i1(e, acc, pattern_test(e, args.at(i), struct_field(e, decl, value, i)))
+
+        acc
+
+private variant_test(e: *Emit, enum_ty: Type, variant: EnumVariant, args: Buf[TPattern],
+                     value: Val) -> Val
+    val d = enum_decl(enum_ty) match
+        Some(decl) -> decl
+        None -> return gap_at(e, "a variant pattern on something that is not an enum")
+
+    val tag_val = tag_of(e, d, value)
+
+    val tag_ok = fresh_reg(e)
+
+    emit(e, InIntCmp(tag_ok, IEq, enum_tag_lty(d, e.word_bits), tag_val,
+                     VInt(from_int(long(variant.tag)))))
+
+    if !any_refutable(args) then return tag_ok
+
+    // The tag decides whether the payload may be read at all, so its test is a branch and not an
+    // operand of an `and`: the block below runs only for a value of this variant.
+    val answer = alloca(e, fresh_reg(e), l_i1())
+    val test_l = fresh_label(e, "pat.payload")
+    val done_l = fresh_label(e, "pat.done")
+
+    emit(e, InStore(l_i1(), VBool(false), answer, AccPlain, None))
+    emit_term(e, InCondBr(tag_ok, test_l, done_l))
+    emit_label(e, test_l)
+
+    val payload = enum_payload(e, d, variant, value)
+
+    var inner: Val = VBool(true)
+
+    for i in 0..<args.len()
+        if refutable(args.at(i))
+            inner = and_i1(e, inner, pattern_test(e, args.at(i),
+                                                  payload_field(e, d, variant, payload, i)))
+
+    emit(e, InStore(l_i1(), inner, answer, AccPlain, None))
+    emit_term(e, InBr(done_l))
+    emit_label(e, done_l)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, l_i1(), answer, AccPlain, None))
+    r
+end variant_test
+
+// A value's tag: the value itself where the enum is simple, and the first slot otherwise.
+private tag_of(e: *Emit, d: &EnumType, value: Val) -> Val
+    if d.simple then return value
+
+    extracted_tag(e, d, value)
+end tag_of
+
+private extracted_tag(e: *Emit, d: &EnumType, value: Val) -> Val
+    val t = fresh_reg(e)
+
+    emit(e, InExtract(t, enum_lty(d), value, index_list(0)))
+    t
+end extracted_tag
+
+// Establishes the bindings a pattern introduces, once its arm has been taken. Only binding and
+// (nested) variant patterns carry bindings; the rest do nothing.
+pattern_bind(e: *Emit, p: TPattern, value: Val) = p match
+    // A zero-sized binding is not a slot, exactly as a `var` of one is not. The name is still in
+    // scope for the arm; every read of it yields nothing.
+    TBindPattern(name, bty) ->
+        if !zero_sized(bty)
+            if contains_counted(bty) then gap_here(e, "a binding that holds a reference")
+            else
+                alloca(e, VReg(s"$name.addr"), lty(e, bty))
+                emit(e, InStore(lty(e, bty), value, VReg(s"$name.addr"), AccPlain, None))
+
+    // `n @ pat` binds the whole value and then whatever the inner pattern binds, both off the same
+    // value.
+    TAtPattern(name, inner) ->
+        pattern_bind(e, TBindPattern(name, tpattern_type(*inner)), value)
+        pattern_bind(e, *inner, value)
+
+    TVariantPattern(enum_ty, variant, args) ->
+        if any_binds(args)
+            enum_decl(enum_ty) match
+                Some(d) ->
+                    val payload = enum_payload(e, d, variant, value)
+
+                    for i in 0..<args.len()
+                        pattern_bind(e, args.at(i), payload_field(e, d, variant, payload, i))
+                None -> gap_here(e, "a variant binding on something that is not an enum")
+
+    TStructPattern(decl, args) ->
+        for i in 0..<args.len()
+            if binds_any(args.at(i))
+                pattern_bind(e, args.at(i), struct_field(e, decl, value, i))
+
+    _ -> ()
+
+// One field of a variant's payload, or nothing where the field is zero-sized -- the same skipping
+// the layout does, seen from the reading side.
+private payload_field(e: *Emit, d: &EnumType, v: EnumVariant, payload: Val, i: usize) -> Val
+    if zero_sized(v.fields.at(i).1) then return VNothing
+
+    val fv = fresh_reg(e)
+
+    emit(e, InExtract(fv, variant_lty(d, v), payload, index_list(int(v.slot(i)))))
+    fv
+end payload_field
+
+// One field of a struct being destructured -- a bit range of the container where the struct is a
+// bitfield struct, and a slot of the aggregate otherwise.
+private struct_field(e: *Emit, d: &StructType, value: Val, i: usize) -> Val
+    if zero_sized(d.fields.at(i).1) then return VNothing
+
+    bitfield_ranges(d) match
+        Some(ranges) ->
+            val c = fresh_reg(e)
+
+            emit(e, InExtract(c, struct_lty(d), value, index_list(0)))
+            read_bits(e, ranges, ranges.at(d.slot(i)), c)
+        None ->
+            val fv = fresh_reg(e)
+
+            emit(e, InExtract(fv, struct_lty(d), value, index_list(int(d.slot(i)))))
+            fv
+end struct_field
+
+// Whether a pattern introduces a name.
+binds_any(p: TPattern) -> bool = p match
+    TBindPattern(_, _) -> true
+    TAtPattern(_, _) -> true
+    TVariantPattern(_, _, args) -> any_binds(args)
+    TStructPattern(_, args) -> any_binds(args)
+    _ -> false
+
+private any_binds(args: Buf[TPattern]) -> bool
+    for i in 0..<args.len()
+        if binds_any(args.at(i)) then return true
+
+    false
+end any_binds
+
+// Whether any of a pattern's parts needs a run-time test. `refutable` in `pattern.sysl` is the one
+// that answers for a single pattern, and this is its list form -- the exhaustiveness check and the
+// emitter ask the same question of the same tree.
+private any_refutable(args: Buf[TPattern]) -> bool
+    for i in 0..<args.len()
+        if refutable(args.at(i)) then return true
+
+    false
+end any_refutable
+
+// -- a whole `match` ---------------------------------------------------------------------------------
+
+// Every arm in turn: the pattern decides whether the arm is entered, the bindings are made once it
+// is, and a guard runs between the two.
+gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type) -> Val
+    val sv = gen_expr(e, scrutinee)
+    val end_l = fresh_label(e, "match.end")
+    val slot = if no_value(ty) then VNothing else alloca(e, fresh_reg(e), lty(e, ty))
+
+    for i in 0..<arms.len()
+        val arm = arms.at(i)
+        val body_l = fresh_label(e, "match.arm")
+        val next_l = fresh_label(e, "match.next")
+
+        var pat_cond: Val = pattern_test(e, arm.patterns.at(0), sv)
+
+        for j in 1..<arm.patterns.len()
+            pat_cond = or_i1(e, pat_cond, pattern_test(e, arm.patterns.at(j), sv))
+
+        arm.guard match
+            None ->
+                emit_term(e, InCondBr(pat_cond, body_l, next_l))
+                emit_label(e, body_l)
+
+                if arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
+            Some(g) ->
+                val guard_l = fresh_label(e, "match.guard")
+
+                emit_term(e, InCondBr(pat_cond, guard_l, next_l))
+                emit_label(e, guard_l)
+
+                if arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
+
+                val gv = gen_expr(e, g)
+                val unbind_l = fresh_label(e, "match.unbind")
+
+                emit_term(e, InCondBr(gv, body_l, unbind_l))
+                emit_label(e, unbind_l)
+                emit_term(e, InBr(next_l))
+                emit_label(e, body_l)
+
+        if no_value(ty) then gen_block_void(e, arm.body)
+        else store_arm_value(e, arm.body, ty, slot)
+
+        emit_term(e, InBr(end_l))
+        emit_label(e, next_l)
+
+    // Fallthrough with no matching arm: a value or enum match is exhaustive, so this point is
+    // unreachable; a plain scalar statement match simply proceeds.
+    if no_value(ty) then emit_term(e, InBr(end_l)) else emit_term(e, InUnreachable)
+
+    emit_label(e, end_l)
+    ends_nowhere(e, ty)
+
+    if no_value(ty) then return VNothing
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, ty), slot, AccPlain, None))
+    r
+end gen_match
+
+private store_arm_value(e: *Emit, b: TBlock, ty: Type, slot: Val)
+    if b.ty == Never then gen_block_void(e, b)
+    else emit(e, InStore(lty(e, ty), gen_block_value(e, b), slot, AccPlain, None))
