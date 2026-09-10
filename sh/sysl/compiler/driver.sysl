@@ -179,9 +179,23 @@ emit_llvm_text(path: string, named_target: Option[string]) -> Result[Emitted, Re
     val program = compilation_of(path, t)?
     val done = analyze_bodies(program.units, program.target)
 
-    val lowered = codegen_with_gaps(program_of(done, done.main_module), t)
+    // Everything a program is held to on the way to being lowered runs on the **unpruned** tree: a
+    // declaration nothing can reach is still one the program declared, and checking it is what makes
+    // a mistake in it a mistake at all.
+    val whole = program_of(done, done.main_module)
 
-    Ok(Emitted(ir_print_module(lowered.0), errors_of(done.reported), lowered.1))
+    post_analysis_checks(done.an, whole, program.own)
+
+    // The tests go next, and they go **after** the analysis rather than instead of it: a `@test`
+    // that does not compile is an error in a build that would never have run it, which is what makes
+    // it safe to leave one beside the code it tests. Pruning is then the last thing that happens to
+    // the tree and the only thing between the checks and the lowering.
+    val kept = prune(strip_tests(whole), program.own)
+    val lowered = codegen_with_gaps(kept, t)
+
+    // Read back out of the analysis rather than off the snapshot the body pass answered with: the
+    // checks above have just added to it.
+    Ok(Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1))
 end emit_llvm_text
 
 // The machine a command line asked for: the one it named, the manifest's default, or this host --

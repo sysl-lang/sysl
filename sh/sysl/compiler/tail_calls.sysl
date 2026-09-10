@@ -1,0 +1,195 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// Which of a function's calls to itself are the last thing it does, and so can be a jump back to its
+// own entry instead of a second frame.
+//
+// The whole of the transformation is here and in the function emitter, and the division is the usual
+// one: this pass decides, codegen emits. A call named here is one where replacing the frame is
+// invisible — the caller's locals are already released along the same edge a `return` would release
+// them on, and what the callee does with the frame is what the caller was going to do with the value
+// it handed back, which is return it.
+//
+// **Missing a tail call costs nothing; naming one wrongly costs everything.** So the walk below is
+// deliberately incomplete rather than deliberately clever: it recognizes the shapes a recursive
+// function is actually written in — the body's trailing expression, a `return`, and the arms of the
+// `if` and `match` those reach through — and says no to anything it has not thought about.
+
+// The self-calls in `f` that codegen may lower as a jump to its entry, by where each was written.
+//
+// The reference compares them by **identity**, which is the same thing said of a tree whose nodes
+// are shared: what is wanted is *this* call and not another written alike. A span is what this tree
+// has that says which occurrence a node is, and two calls to one function at one span are one call.
+tail_calls_of(f: TFunc) -> Buf[Span]
+    if tailrec_disqualified(f).is_some() then return buf()
+
+    var out: Buf[Span] = buf()
+
+    tail_block(f, f.body, false, &out)
+    out
+end tail_calls_of
+
+// Whether the call at this span is one the walk named.
+is_tail_call(found: Buf[Span], at: Span) -> bool
+    for i in 0..<found.len()
+        if found.at(i) == at then return true
+
+    false
+end is_tail_call
+
+// Why a function is not a candidate at all, as the sentence `@tailrec` reports. These are properties
+// of the *declaration*, so they are answered once rather than at each call, and they are the cases
+// where a jump would change what the program does rather than only what it costs.
+tailrec_disqualified(f: TFunc) -> Option[string]
+    // A variadic function's tail is read relative to its last named argument, and the arguments a
+    // jump rebinds are the named ones — so the second iteration would walk the first call's tail.
+    if f.variadic
+        return Some("it is variadic, and a jump back to the entry cannot rebind the tail the " +
+                    "first call was passed")
+
+    // A postcondition is checked **when a call returns**, and a tail call never returns: the frame
+    // that would have checked it is the frame being replaced.
+    if !f.ensures.is_empty()
+        return Some("it has an 'ensures', which is checked when a call returns — a tail call " +
+                    "never returns, so the postcondition of every frame but the last would go " +
+                    "unchecked")
+
+    None
+end tailrec_disqualified
+
+// The tail positions of a block: everything its statements can return from, and its trailing
+// expression.
+//
+// `deferred` arrives true where some enclosing scope has already registered a `defer`, and turns
+// true at the first one this block registers. A deferred statement runs on the way *out* of the
+// scope, which for an ordinary call is after the callee has returned and for a jump would be before
+// it is even entered.
+private tail_block(f: TFunc, b: TBlock, deferred: bool, out: *Buf[Span])
+    val after = tail_stmts(f, b.stmts, deferred, out)
+
+    b.result match
+        Some(r) -> tail_expr(f, r, after, out)
+        None -> ()
+end tail_block
+
+// Walks a statement list in order, answering whether a `defer` was registered along the way — which
+// the caller needs, because the block's trailing expression sits after all of them.
+private tail_stmts(f: TFunc, ss: Buf[TStmt], deferred: bool, out: *Buf[Span]) -> bool
+    var d = deferred
+
+    for i in 0..<ss.len()
+        ss.at(i) match
+            // Registering one puts every tail position after it — in this block and in every block
+            // it encloses — out of reach.
+            TDefer(inner) ->
+                tail_stmts(f, inner, true, out)
+                d = true
+            TReturn(value) ->
+                value match
+                    Some(e) -> tail_expr(f, e, d, out)
+                    None -> ()
+
+            // A block-bearing expression in statement position yields no value, so nothing in it is
+            // in tail position. What it can still hold is a `return`.
+            TExprStmt(e) -> nested_returns(f, e, d, out)
+            _ -> ()
+
+    d
+end tail_stmts
+
+// What an expression in tail position contributes: itself, where it is a self-call the jump can
+// replace, and whatever its arms hold where it is a form that has arms.
+private tail_expr(f: TFunc, e: TExpr, deferred: bool, out: *Buf[Span])
+    *e.kind match
+        TCall(name, args, ty, _) ->
+            if !deferred && is_self_call(f, name, args, ty) then out.push(e.span)
+
+        // Both arms end the function, so both are tail positions — and they are independent, so a
+        // function may jump back from one and return from the other.
+        TIf(_, t, els, _) ->
+            tail_block(f, t, deferred, out)
+
+            els match
+                Some(b) -> tail_block(f, b, deferred, out)
+                None -> ()
+        TMatch(_, arms, _) ->
+            for i in 0..<arms.len()
+                tail_block(f, arms.at(i).body, deferred, out)
+        _ -> nested_returns(f, e, deferred, out)
+end tail_expr
+
+// The `return`s inside an expression whose own value is **not** in tail position. Only the forms
+// that carry statements are followed: a `return` is a statement, so it can be nowhere else.
+private nested_returns(f: TFunc, e: TExpr, deferred: bool, out: *Buf[Span])
+    *e.kind match
+        TIf(_, t, els, _) ->
+            tail_stmts(f, t.stmts, deferred, out)
+
+            els match
+                Some(b) -> tail_stmts(f, b.stmts, deferred, out)
+                None -> ()
+        TMatch(_, arms, _) ->
+            for i in 0..<arms.len()
+                tail_stmts(f, arms.at(i).body.stmts, deferred, out)
+
+        // A copy of an unrolled `for const` may `return`, and its own value is not in tail position:
+        // the copies are a sequence, so only the last of them could be.
+        TBlockExpr(b) -> tail_stmts(f, b.stmts, deferred, out)
+
+        // A loop's body may return, and none of it is in tail position however the loop ends: the
+        // value a `break` carries is the loop's, and the loop's value is what the expression around
+        // it goes on to use.
+        TWhile(_, body, els, _) -> loop_returns(f, body, els, deferred, out)
+        TDoWhile(body, _, els, _) -> loop_returns(f, body, els, deferred, out)
+        TLoop(body, _) -> loop_returns(f, body, None, deferred, out)
+        TFor(_, _, _, _, _, body, els, _) -> loop_returns(f, body, els, deferred, out)
+        TCFor(_, _, _, body, els, _) -> loop_returns(f, body, els, deferred, out)
+        TForEach(_, _, _, body, els, _) -> loop_returns(f, body, els, deferred, out)
+        TIterate(_, _, _, _, _, body, els, _) -> loop_returns(f, body, els, deferred, out)
+        _ -> ()
+end nested_returns
+
+private loop_returns(f: TFunc, body: Buf[TStmt], els: Option[TBlock], deferred: bool,
+                     out: *Buf[Span])
+    tail_stmts(f, body, deferred, out)
+
+    els match
+        Some(b) -> tail_stmts(f, b.stmts, deferred, out)
+        None -> ()
+end loop_returns
+
+// Whether a call in tail position is one to the very function it stands in, at the shape a jump can
+// rebind.
+//
+// The name is the mangled one on both sides, so a generic's instantiation matches its own recursive
+// call and not the instantiation beside it. The result type is checked rather than assumed: a call
+// whose result is wrapped reaches here as the wrapper's operand and not as the tail expression.
+private is_self_call(f: TFunc, name: string, args: Buf[TExpr], ty: Type) -> bool =
+    name == f.name && type_eq(ty, f.ret_ty) && args.len() == f.params.len()
+
+// -- what `@tailrec` earns ----------------------------------------------------------------------------
+
+// The refusals `@tailrec` earns across a whole program: one sentence per function that asked for the
+// jump and did not get it.
+//
+// The attribute is an assertion rather than a request — the optimization applies wherever it
+// applies, written or not — so what it buys is exactly this diagnostic.
+check_tail_calls(a: &Analysis, funcs: Buf[TFunc])
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+
+        if f.tailrec
+            tailrec_disqualified(f) match
+                Some(why) ->
+                    a.fault(func_home(a, f.name), f.span,
+                            s"'${module_show(f.name)}' is marked '@tailrec' but $why")
+                None ->
+                    if tail_calls_of(f).is_empty()
+                        a.fault(func_home(a, f.name), f.span,
+                                s"'${module_show(f.name)}' is marked '@tailrec' but calls itself " +
+                                "nowhere the jump can replace — a tail call is the last thing the " +
+                                "function does, so nothing may wait on its result and no 'defer' " +
+                                "may be in scope where it stands")
+end check_tail_calls

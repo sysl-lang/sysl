@@ -1,0 +1,397 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// **The seam between the analyzer and the lowering**: what a program has to be true of before any of
+// it is emitted, over and above what typing it asked.
+//
+// Everything here reads the *typed tree* and none of it reads a body's meaning: each is a question
+// about the program a compilation came to rather than about a line somebody wrote, which is why none
+// of them can be answered where the declarations are. They run on the way to `emit-llvm` and nowhere
+// else — `emit-typed` stops at the typed tree, so a program it prints is one none of these has been
+// asked about.
+
+// Everything a program is held to on the way to being lowered.
+//
+// **`check_exports` reads the tree this build is going to emit, which is the stripped one.** Reading
+// the unstripped one made an `@export` in a `@tests` file a definition in every build. The two above
+// it are deliberately not moved with it: both are about whether a body is *correct*, and a `@test`
+// that does not compile is an error in a build that would never have run it.
+post_analysis_checks(a: &Analysis, p: TProgram, own: Buf[string])
+    check_tail_calls(a, p.funcs)
+    check_tail_jumps(a, p)
+    check_exports_emitted(a, strip_tests(p), own)
+end post_analysis_checks
+
+// -- `become` -----------------------------------------------------------------------------------------
+
+// Every refusal a program's `become` statements earn.
+//
+// `tail_calls.sysl` recognizes a function's calls to *itself* and lowers them as a jump back to its
+// own entry. That is a real optimization and this is not: what a chain of calls to **different**
+// functions needs is a tail call that is *guaranteed*, because the whole program is one chain of them
+// and an un-eliminated call is an immediate stack overflow rather than a slowdown. So the rules below
+// are refusals rather than conditions on an optimization.
+check_tail_jumps(a: &Analysis, p: TProgram)
+    for i in 0..<p.funcs.len()
+        check_becomes(a, p, p.funcs.at(i))
+end check_tail_jumps
+
+private check_becomes(a: &Analysis, p: TProgram, f: TFunc)
+    val scope = func_home(a, f.name)
+
+    // A `defer` anywhere in the body puts every `become` under it out of reach, exactly as it puts a
+    // tail position out of reach: the deferred statement runs on the way out of the scope, and the
+    // jump *is* the way out. Bounded to the body rather than to the block, which is coarser than the
+    // tail-call rule and deliberately so — a refusal that is easy to state is worth more here,
+    // because what a reader does about it is the same either way.
+    val deferred = has_defer(f)
+    val an = a
+    val prog = p
+    val fn = f
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> one_become(an, prog, fn, scope, deferred, s)))
+end check_becomes
+
+private has_defer(f: TFunc) -> bool
+    val found: &Counted = Counted(0)
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> mark_defer(found, s)))
+    found.n > 0
+end has_defer
+
+private mark_defer(found: &Counted, s: TStmt) = s match
+    TDefer(_) -> found.n = 1
+    _ -> ()
+
+private one_become(a: &Analysis, p: TProgram, f: TFunc, scope: Scope, deferred: bool, s: TStmt)
+    s match
+        TBecome(call) -> become_refusal(a, p, f, scope, deferred, call)
+        _ -> ()
+end one_become
+
+private become_refusal(a: &Analysis, p: TProgram, f: TFunc, scope: Scope, deferred: bool,
+                       call: TExpr)
+    val at = call.span
+
+    if f.variadic
+        refuse_become(a, scope, at, "this function is variadic — the tail a first call was passed " +
+                      "lives in the frame being replaced, and nothing can rebind it")
+        return
+
+    if !f.ensures.is_empty()
+        refuse_become(a, scope, at, "this function has an 'ensures', which is checked when a call " +
+                      "returns — a 'become' never returns, so the postcondition would go unchecked")
+        return
+
+    if f.variant.is_some()
+        refuse_become(a, scope, at, "this function has a 'decreases' measure, which is checked " +
+                      "against the frame it was taken in — and that frame is the one being replaced")
+        return
+
+    if deferred
+        refuse_become(a, scope, at, "this function has a 'defer', which runs on the way out of its " +
+                      "scope — and the jump is the way out, so there would be nowhere left to run it")
+        return
+
+    if counted_params(f)
+        refuse_become(a, scope, at, s"'${module_show(f.name)}' takes a counted value — the frame's " +
+                      "own references are let go before the jump, so an argument read out of one of " +
+                      "them would outlive nothing. Pass what the callee needs through a raw pointer " +
+                      "or a value that carries no count")
+        return
+
+    *call.kind match
+        TCall(name, _, _, _) ->
+            if is_extern_name(p, name)
+                refuse_become(a, scope, at, s"'${module_show(name)}' is an 'extern' — its frame is " +
+                              "C's, and nothing here knows what C does with one")
+                return
+
+            func_named(p, name) match
+                None ->
+                    refuse_become(a, scope, at, s"'${module_show(name)}' has no body here, so there " +
+                                  "is no frame to replace this one with")
+                Some(g) ->
+                    become_mismatch(a, f, g) match
+                        Some(why) -> refuse_become(a, scope, at, why)
+                        None -> become_shape(a, scope, at, f)
+
+        // A call through a function address is the case threaded dispatch is *for* — the next
+        // handler comes out of a table. Nothing names the callee, so the prototype it is held to is
+        // the pointer's own type, which the analyzer already checked the arguments against.
+        TCallPtr(_, _, _, _) -> become_shape(a, scope, at, f)
+        _ ->
+            refuse_become(a, scope, at, "what follows it is not a call — 'return' is what hands a " +
+                          "value back without replacing anything")
+end become_refusal
+
+private refuse_become(a: &Analysis, scope: Scope, at: Span, why: string) =
+    a.fault(scope, at, s"'become' replaces this frame with the call's, and $why")
+
+private counted_params(f: TFunc) -> bool
+    for i in 0..<f.params.len()
+        if contains_counted(f.params.at(i).1) then return true
+
+    false
+end counted_params
+
+private is_extern_name(p: TProgram, name: string) -> bool
+    for i in 0..<p.externs.len()
+        if p.externs.at(i).name == name then return true
+
+    false
+end is_extern_name
+
+private func_named(p: TProgram, name: string) -> Option[TFunc]
+    for i in 0..<p.funcs.len()
+        if p.funcs.at(i).name == name then return Some(p.funcs.at(i))
+
+    None
+end func_named
+
+// Why one function's frame cannot be replaced with another's, or nothing where it can. The prototype
+// is the whole of it: same parameter types in order, same result.
+private become_mismatch(a: &Analysis, f: TFunc, g: TFunc) -> Option[string]
+    if g.variadic
+        return Some(s"'${module_show(g.name)}' is variadic and this function is not, so the two do " +
+                    "not have the same shape")
+
+    if f.params.len() != g.params.len()
+        return Some(s"'${module_show(g.name)}' takes ${g.params.len()} " +
+                    s"argument${plural_s(g.params.len())} and this function takes " +
+                    s"${f.params.len()} — a frame can only be replaced by one of the same shape")
+
+    if !param_types_agree(f.params, g.params)
+        return Some(s"'${module_show(g.name)}' takes ${param_type_list(f.params)} where this " +
+                    s"function takes ${param_type_list(g.params)} — a frame can only be replaced " +
+                    "by one of the same shape")
+
+    if !type_eq(f.ret_ty, g.ret_ty)
+        return Some(s"'${module_show(g.name)}' answers ${type_show(g.ret_ty)} and this function " +
+                    s"answers ${type_show(f.ret_ty)} — the result comes back the way this frame's " +
+                    "caller is waiting for it")
+
+    None
+end become_mismatch
+
+// What is true of the enclosing function alone, whichever callee it names.
+//
+// A **large result** travels through a pointer the caller supplied, and a frame being replaced is a
+// frame whose caller is somebody else.
+private become_shape(a: &Analysis, scope: Scope, at: Span, f: TFunc)
+    if !layout_for(a.tables.target).indirect(f.ret_ty) then return
+
+    refuse_become(a, scope, at, s"this function answers ${type_show(f.ret_ty)}, which comes back " +
+                  "through a pointer its caller supplied — a result that large is not something a " +
+                  "replaced frame can hand on. Answer something that fits in a register, or a '&T'")
+end become_shape
+
+private param_types_agree(a: Buf[(string, Type)], b: Buf[(string, Type)]) -> bool
+    for i in 0..<a.len()
+        if !type_eq(a.at(i).1, b.at(i).1) then return false
+
+    true
+end param_types_agree
+
+private param_type_list(ps: Buf[(string, Type)]) -> string
+    var out = ""
+
+    for i in 0..<ps.len()
+        if i > 0 then out = out + ", "
+
+        out = out + type_show(ps.at(i).1)
+
+    out
+end param_type_list
+
+private plural_s(n: usize) -> string = if n == 1 then "" else "s"
+
+// -- `@export`, over the whole program -----------------------------------------------------------------
+
+// The two things about `@export` that only the whole program can answer: whether the parameters and
+// result are types C can spell, and whether two exports claim one symbol.
+//
+// Both are about the **emitted** symbol table, which is why the exports are the ones this build
+// contributes rather than every one the tree declares: an export in a dependency module the program
+// never reaches is not emitted, so holding it to a shape C can spell would be refusing a build over
+// a definition that build does not contain.
+check_exports_emitted(a: &Analysis, p: TProgram, own: Buf[string])
+    val exported = exported_funcs(p, own)
+
+    for i in 0..<exported.len()
+        export_signature(a, exported.at(i))
+
+    export_duplicates(a, exported)
+end check_exports_emitted
+
+// A parameter or a result C has no way to spell.
+//
+// A scalar and a pointer are one register on every machine sysl lowers for. An aggregate is the
+// opposite: each ABI says which registers a struct arrives in, LLVM applies no rule of its own, and
+// passing one by value would be a corrupt call rather than a link error — which is why it is
+// refused here instead of lowered hopefully.
+private export_signature(a: &Analysis, f: TFunc)
+    val scope = func_home(a, f.name)
+
+    for i in 0..<f.params.len()
+        val p = f.params.at(i)
+
+        if !export_crosses(p.1)
+            a.fault(scope, f.span, s"'${p.0}' of the exported '${module_show(f.name)}' is " +
+                    s"${type_show(p.1)}, which C has no way to spell — an exported function takes " +
+                    s"${export_spellable()}. ${export_advice(p.1)}")
+
+    if !no_value(f.ret_ty) && !export_crosses(f.ret_ty)
+        a.fault(scope, f.span, s"the exported '${module_show(f.name)}' returns " +
+                s"${type_show(f.ret_ty)}, which C has no way to spell — an exported function " +
+                s"returns that or nothing at all. ${export_advice(f.ret_ty)}")
+end export_signature
+
+// Two definitions exporting one symbol.
+//
+// The linker would report this itself, as a duplicate definition, naming a symbol that appears in no
+// sysl file. Saying it here costs one grouping and names both declarations, which is the difference
+// between a diagnostic and an archaeology exercise.
+private export_duplicates(a: &Analysis, exported: Buf[TFunc])
+    var seen: Buf[string] = buf()
+
+    for i in 0..<exported.len()
+        val symbol = exported.at(i).exported.unwrap()
+
+        if !holds_string(seen, symbol)
+            seen.push(symbol)
+
+            var claimants: Buf[string] = buf()
+            var first = exported.at(i)
+
+            for j in 0..<exported.len()
+                if exported.at(j).exported.unwrap() == symbol
+                    claimants.push(s"'${module_show(exported.at(j).name)}'")
+
+            if claimants.len() > 1
+                a.fault(func_home(a, first.name), first.span,
+                        s"'$symbol' is exported by ${joined_and(sorted_names(claimants))} — one " +
+                        "symbol is one definition, and the linker has no way to tell which was meant")
+end export_duplicates
+
+private sorted_names(xs: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<xs.len()
+        out.push(xs.at(i))
+
+    for i in 0..<out.len()
+        for j in (i + 1)..<out.len()
+            if out.at(j) < out.at(i)
+                val t = out.at(i)
+
+                out.set(i, out.at(j))
+                out.set(j, t)
+
+    out
+end sorted_names
+
+private joined_and(xs: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<xs.len()
+        if i > 0 then out = out + " and "
+
+        out = out + xs.at(i)
+
+    out
+end joined_and
+
+// The shapes an exported signature may take, in the sentence a refusal quotes.
+export_spellable() -> string =
+    "an integer, a float, a 'bool', a 'char', a pointer, a function pointer, a simple enum, or a " +
+    "struct built out of those"
+
+// Whether a type crosses to C **as itself**, which is a narrower question than whether it has a
+// meaning over there.
+//
+// **An array is not a parameter or a result in C at all**, though it is a perfectly good field: C
+// decays an array parameter to a pointer, so there is no prototype that passes one by value.
+export_crosses(t: Type) -> bool = repr(t) match
+    Array(_, _) -> false
+    other -> export_carried(other)
+
+// The same question at a **field**, which admits the one thing a signature does not.
+export_carried(t: Type) -> bool = repr(t) match
+    Integer(_, _, _) -> true
+    Floating(_) -> true
+    Bool -> true
+    Char -> true
+    CFn(_, _) -> true
+    Ptr(_) -> !erased(repr(t))
+    Constrained(d) -> export_carried(d.base)
+    Struct(d) -> all_carried(d.stored())
+    Array(_, elem) -> export_carried(*elem)
+
+    // A simple enum **is** its underlying integer, so it crosses as one. A data enum is a tag beside
+    // a union of payloads sysl laid out, which is not what a C union is.
+    Enum(d) -> d.simple
+    _ -> false
+
+private all_carried(fields: Buf[(string, Type)]) -> bool
+    for i in 0..<fields.len()
+        if !export_carried(fields.at(i).1) then return false
+
+    true
+end all_carried
+
+// The one line of help the refusal can honestly give, which differs by what was written. Anything
+// with no specific advice gets none rather than a guess.
+export_advice(t: Type) -> string = repr(t) match
+    Slice(_, _) -> slice_advice()
+    Str -> slice_advice()
+    Ref(_, _) -> counted_advice()
+    Weak(_) -> counted_advice()
+    Trait(_, _, _) -> "A trait object is a value and a method table together. Export one function " +
+                      "per implementation, or take a function pointer"
+    Ptr(_) ->
+        if erased(repr(t))
+            "A pointer to a trait is the value and its method table together, so it is two words " +
+            "rather than the one every other pointer is. Point at the concrete type instead"
+        else ""
+    Struct(d) -> struct_advice(t, d)
+    Array(_, elem) ->
+        if !export_carried(*elem)
+            s"its element is ${type_show(*elem)}, which is what C has no declaration for — the " +
+            s"array around it is fine. ${export_advice(*elem)}"
+        else
+            "C decays an array parameter to a pointer, so there is no prototype that passes one by " +
+            "value. Wrap it in a struct, which is how C hands an array over as a value and lays out " +
+            "identically, or take a pointer to its first element and a length"
+    Enum(d) ->
+        if !d.simple
+            "A data enum is a tag beside a union of the payloads sysl laid out, which is not the " +
+            "shape a C union has. Export the tag and the payload as separate parameters, or a " +
+            "pointer to the whole"
+        else ""
+    _ -> ""
+
+private slice_advice() -> string =
+    "A slice is an address and a length, so C takes them as two parameters — a pointer and a " +
+    "'usize' — which is the shape its own string and buffer functions already have"
+
+private counted_advice() -> string =
+    "A counted reference has a header C would have to know the layout of. Hand out a raw pointer " +
+    "and keep the counted one on this side"
+
+// An aggregate itself crosses, so arriving here means one of its **fields** does not — and naming
+// the field is the whole of what the reader needs, since the declaration they are looking at does
+// not mention it.
+private struct_advice(t: Type, d: &StructType) -> string
+    val fields = d.stored()
+
+    for i in 0..<fields.len()
+        if !export_carried(fields.at(i).1)
+            return s"'${fields.at(i).0}' of ${type_show(t)} is ${type_show(fields.at(i).1)}, which " +
+                   s"is what C has no declaration for — the aggregate around it is fine. " +
+                   s"${export_advice(fields.at(i).1)}"
+
+    ""
+end struct_advice

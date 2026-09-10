@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 
 // **The substrate a body is written into**: registers, basic blocks, the entry-block prologue, and
@@ -72,6 +73,20 @@ struct Emit
     // owes anything beyond the `ret`.
     ensures: int
 
+    // Where a tail self-call jumps, and which calls are the ones that jump.
+    //
+    // The target sits just after the parameter slots are written, so the jump lands where a fresh
+    // call would have landed: the preconditions are checked again and each `old(e)` is snapshotted
+    // again, because a tail call *is* a call and those belong to the invocation rather than to the
+    // frame. It is empty in a function with no tail call, which is what keeps a label out of every
+    // other function in the module.
+    tail_target: string
+    tail_calls: Buf[Span]
+
+    // The parameters a jump rebinds, in declaration order -- every one of them, so that they line up
+    // with the arguments a call was written with.
+    tail_params: Buf[(string, Type)]
+
     // The first form this body reached that nothing here lowers. A body that has one is not emitted.
     gap: Option[string]
 end Emit
@@ -122,10 +137,12 @@ emitter(t: Target) -> Emit
     var symbols: Buf[(string, string)] = buf()
     var foreigns: Buf[string] = buf()
     var variadics: Buf[string] = buf()
+    var tail_calls: Buf[Span] = buf()
+    var tail_params: Buf[(string, Type)] = buf()
 
     Emit(t, layout_for(t), int(t.pointer_bits()), globals, 0, sat_decls, false, false, false,
          prologue, blocks, current, None, "entry", 0, 0, false, reached, loops, scratch, symbols,
-         foreigns, variadics, 0, None)
+         foreigns, variadics, 0, "", tail_calls, tail_params, None)
 end emitter
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -162,6 +179,9 @@ start_function(e: *Emit)
     e.loops.clear()
     e.scratch.clear()
     e.ensures = 0
+    e.tail_target = ""
+    e.tail_calls.clear()
+    e.tail_params.clear()
     e.gap = None
 end start_function
 

@@ -40,6 +40,30 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
                 emit(e, InStore(lty(e, ty), VReg(s"${p.0}.param"), VReg(s"${p.0}.addr"), AccPlain,
                                 None))
 
+    // Where the function calls itself as the last thing it does, that call is a jump to here rather
+    // than a second frame. The target sits *after* the parameter slots are written and *before*
+    // everything below, so a jump arrives where a fresh call would: the arguments are in the slots
+    // the body reads, and the preconditions that follow belong to the invocation rather than to the
+    // frame, so they are taken again.
+    //
+    // The slots themselves are the entry block's and are not re-entered, which is what makes the
+    // jump free: every one of them is hoisted, so going round again reuses the frame instead of
+    // growing it.
+    val found = tail_calls_of(f)
+
+    if !found.is_empty()
+        val l = fresh_label(e, "tailrec")
+
+        for i in 0..<f.params.len()
+            e.tail_params.push(f.params.at(i))
+
+        for i in 0..<found.len()
+            e.tail_calls.push(found.at(i))
+
+        e.tail_target = l
+        emit_term(e, InBr(l))
+        emit_label(e, l)
+
     for i in 0..<f.requires.len()
         emit_contract(e, f.requires.at(i).cond, "require")
 

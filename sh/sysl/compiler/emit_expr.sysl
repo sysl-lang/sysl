@@ -89,7 +89,9 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         gen_update(e, place, op, value, ty, dispatch, check)
     TIncDec(place, op, pre, ty, check) -> gen_inc_dec(e, place, op, pre, ty, check)
 
-    TCall(name, args, ty, _) -> gen_call(e, name, args, ty)
+    TCall(name, args, ty, _) ->
+        if e.tail_target != "" && is_tail_call(e.tail_calls, x.span) then gen_tail_self_call(e, args)
+        else gen_call(e, name, args, ty)
     TFuncAddr(_, entry, _) -> VGlobal(symbol_of(e, entry))
 
     TBlockExpr(b) ->
@@ -620,6 +622,44 @@ private gen_struct_new(e: *Emit, decl: &StructType, args: Buf[TExpr]) -> Val
 end gen_struct_new
 
 // -- calls ----------------------------------------------------------------------------------------
+
+// A call the function makes to itself as the last thing it does, lowered as a jump back to its own
+// entry rather than a second frame.
+//
+// **The order is the whole of the correctness, and it is the order a `return` already uses.** Each
+// argument is computed while the frame is still whole -- it may well read the very slots about to be
+// overwritten -- and only then do the new values land.
+//
+// The jump is a `br` and the block ends there, which is all any caller needs to know: this returns
+// no register because there is no value.
+private gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
+    var staged: Buf[Option[Val]] = buf()
+
+    for i in 0..<e.tail_params.len()
+        val ty = e.tail_params.at(i).1
+
+        if zero_sized(ty)
+            gen_expr(e, args.at(i))
+            staged.push(None)
+        else if e.layout.indirect(ty)
+            gap_here(e, "a large argument staged for a tail call")
+            staged.push(None)
+        else if contains_counted(ty)
+            gap_here(e, "a counted argument staged for a tail call")
+            staged.push(None)
+        else staged.push(Some(gen_expr(e, args.at(i))))
+
+    for i in 0..<e.tail_params.len()
+        staged.at(i) match
+            Some(v) ->
+                val p = e.tail_params.at(i)
+
+                emit(e, InStore(lty(e, p.1), v, VReg(s"${p.0}.addr"), AccPlain, None))
+            None -> ()
+
+    emit_term(e, InBr(e.tail_target))
+    VNothing
+end gen_tail_self_call
 
 private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
     if is_foreign(e, name) then return gap_at(e, "a call to an extern")

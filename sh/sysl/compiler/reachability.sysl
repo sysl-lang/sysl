@@ -1,0 +1,422 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// **What a program can arrive at**, and the declarations that go when nothing can.
+//
+// Pruning is the last thing that happens to a typed tree and the only thing between the checks and
+// the lowering: a declaration nothing can reach is still one the program declared, and checking it
+// is what makes a mistake in it a mistake at all.
+//
+// **The roots are not only what the program runs.** Four kinds of function are reached from
+// somewhere no walk can see -- an interrupt handler, entered by the processor; an `@export`, called
+// by something outside; a `@section` definition, found by a linker script; and a destructor, called
+// by the release hook the emitter builds. Each is a root, and each is a root only where the program
+// reaches its module: a handed source root is compiled whole rather than by what the program
+// imports, so an unconditional root would put an unimported module's contribution into the output.
+
+// What one walk found: every function it can arrive at and every `val` it reads.
+struct Live
+    calls: Buf[string]
+    vals: Buf[string]
+    erased: Buf[string]
+end Live
+
+// The program with everything nothing can reach dropped.
+prune(p: TProgram, own: Buf[string]) -> TProgram
+    val live = walk_program(p, own)
+
+    var externs: Buf[TExtern] = buf()
+
+    for i in 0..<p.externs.len()
+        if holds_string(live.calls, p.externs.at(i).name) then externs.push(p.externs.at(i))
+
+    var funcs: Buf[TFunc] = buf()
+
+    for i in 0..<p.funcs.len()
+        if holds_string(live.calls, p.funcs.at(i).name) then funcs.push(p.funcs.at(i))
+
+    with_declarations(p, externs, funcs)
+end prune
+
+// The whole walk, including the one root kind that cannot be decided before it has run.
+//
+// **An `@export` whose symbol answers an `extern` the program actually calls is a root.** It is the
+// fifth kind, and it is the only one that is not a property of the function alone: what a
+// capability-free module declares and defines nowhere is supplied by whoever links the program, and
+// the consumer never names the supplier -- so asking whether the program reached the supplier's
+// module answers no for precisely the case the seam exists to serve.
+private walk_program(p: TProgram, own: Buf[string]) -> &Live
+    val entries = entry_points(p, own)
+
+    var extra: Buf[TFunc] = buf()
+    var live = no_reached()
+    var more = true
+
+    while more
+        live = reached_from(p, roots_of(p, entries, extra))
+
+        for i in 0..<entries.len()
+            add_string(&live.calls, entries.at(i).name)
+
+        for i in 0..<extra.len()
+            add_string(&live.calls, extra.at(i).name)
+
+        more = false
+
+        for i in 0..<p.externs.len()
+            val x = p.externs.at(i)
+
+            if holds_string(live.calls, x.name)
+                for j in 0..<p.funcs.len()
+                    val f = p.funcs.at(j)
+
+                    if f.exported == Some(x.symbol) && !holds_func(extra, f.name)
+                        extra.push(f)
+                        more = true
+
+    live
+end walk_program
+
+private holds_func(fs: Buf[TFunc], name: string) -> bool
+    for i in 0..<fs.len()
+        if fs.at(i).name == name then return true
+
+    false
+end holds_func
+
+// The trees a walk starts from: the program's own statements, the storage it lays down, the tables
+// it built, the entry point, and every function nothing in the program names.
+private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
+    val out = no_reached()
+
+    walk_stmts(p.main, expr_walk(false, e -> take_node(out, e)))
+
+    for i in 0..<p.vals.len()
+        p.vals.at(i).init match
+            Some(x) -> walk_texpr(x, expr_walk(false, e -> take_node(out, e)))
+            None -> ()
+
+    for i in 0..<p.vtables.len()
+        val t = p.vtables.at(i)
+
+        for j in 0..<t.slots.len()
+            add_string(&out.calls, t.slots.at(j).target)
+
+    p.entry match
+        Some(en) ->
+            add_string(&out.calls, en.func)
+
+            en.args_fn match
+                Some(n) -> add_string(&out.calls, n)
+                None -> ()
+
+            en.result_fn match
+                Some(n) -> add_string(&out.calls, n)
+                None -> ()
+        None -> ()
+
+    for i in 0..<entries.len()
+        add_string(&out.calls, entries.at(i).name)
+
+    for i in 0..<extra.len()
+        add_string(&out.calls, extra.at(i).name)
+
+    out
+end roots_of
+
+// Everything a set of roots can arrive at, following each call into the body it lands in.
+//
+// A plain reachability walk rather than a fixpoint: what is being accumulated is a set, and a
+// function already visited adds nothing a second time. A **dynamic** call is answered with every
+// table for the trait, since a table is a constant the program can read a function out of and a
+// definition it points at has to survive.
+private reached_from(p: TProgram, root: &Live) -> &Live
+    val out = no_reached()
+
+    var queue: Buf[string] = buf()
+
+    take_all(out, root, &queue)
+
+    while !queue.is_empty()
+        val name = queue.at(queue.len() - 1)
+
+        queue.truncate(queue.len() - 1)
+
+        for i in 0..<p.funcs.len()
+            if p.funcs.at(i).name == name
+                val body = body_refs(p, p.funcs.at(i))
+
+                take_all(out, body, &queue)
+
+    out
+end reached_from
+
+private take_all(out: &Live, from: &Live, queue: *Buf[string])
+    for i in 0..<from.vals.len()
+        add_string(&out.vals, from.vals.at(i))
+
+    for i in 0..<from.erased.len()
+        add_string(&out.erased, from.erased.at(i))
+
+    for i in 0..<from.calls.len()
+        if add_string(&out.calls, from.calls.at(i)) then queue.push(from.calls.at(i))
+end take_all
+
+// What one body names, without following any of it.
+private body_refs(p: TProgram, f: TFunc) -> &Live
+    val out = no_reached()
+
+    walk_block_stmts(f.body, TWalk(true, e -> take_node_of(p, out, e), w -> take_write(out, w),
+                                   s -> ()))
+
+    for i in 0..<f.requires.len()
+        walk_texpr(f.requires.at(i).cond, expr_walk(true, e -> take_node_of(p, out, e)))
+
+    for i in 0..<f.ensures.len()
+        walk_texpr(f.ensures.at(i).cond, expr_walk(true, e -> take_node_of(p, out, e)))
+
+    for i in 0..<f.olds.len()
+        walk_texpr(f.olds.at(i), expr_walk(true, e -> take_node_of(p, out, e)))
+
+    out
+end body_refs
+
+private take_node(out: &Live, e: TExpr) = node_names(out, e, None)
+
+private take_node_of(p: TProgram, out: &Live, e: TExpr) = node_names(out, e, Some(p.vtables))
+
+// The names one node holds, as a call, as storage, or as a table it erased a value into.
+//
+// The names a node carries as **data** rather than as a child are read out here -- a dispatched
+// operator, an invariant a write has to re-establish, the conversion a `?` widens through, a
+// constrained subtype's predicate -- because nothing about the shape of the tree tells those from
+// any other string.
+private node_names(out: &Live, e: TExpr, tables: Option[Buf[TVtable]])
+    *e.kind match
+        TGlobal(symbol, _, _) -> add_string(&out.vals, symbol)
+        TCall(name, _, _, _) -> add_string(&out.calls, name)
+        TFuncAddr(name, _, _) -> add_string(&out.calls, name)
+        TTry(_, _, _, _, _, _, convert) ->
+            if convert.is_some() then add_string(&out.calls, convert.unwrap())
+        TStructInvCheck(_, _, inv_fn) -> add_string(&out.calls, inv_fn)
+        TRecheck(_, _, _, inv_fn) -> add_string(&out.calls, inv_fn)
+        TConstrainedCheck(_, target) -> take_predicate(out, target)
+        TUpdate(_, _, _, _, dispatch, check) ->
+            take_dispatch(out, dispatch)
+
+            if check.is_some() then take_predicate(out, check.unwrap())
+        TIncDec(_, _, _, _, check) -> if check.is_some() then take_predicate(out, check.unwrap())
+        TCompare(_, cmps) ->
+            for i in 0..<cmps.len()
+                take_dispatch(out, cmps.at(i).dispatch)
+        TErase(_, vtable, _) -> add_string(&out.erased, vtable)
+        TVCall(receiver, slot, _, _, _) -> take_dynamic(out, tables, texpr_type(receiver), slot)
+        TRender(value, method, _, slot) ->
+            if slot.is_some() then take_dynamic(out, tables, texpr_type(value), slot.unwrap())
+            else add_string(&out.calls, method)
+        _ -> ()
+end node_names
+
+private take_write(out: &Live, w: TWrite)
+    take_dispatch(out, w.dispatch)
+
+    for i in 0..<w.check.len()
+        add_string(&out.calls, w.check.at(i).inv_fn)
+
+    if w.constraint.is_some() then take_predicate(out, w.constraint.unwrap())
+end take_write
+
+private take_dispatch(out: &Live, d: Option[TDispatch])
+    if d.is_some() then add_string(&out.calls, d.unwrap().name)
+
+private take_predicate(out: &Live, t: Type) = t match
+    Constrained(d) ->
+        if d.pred_fn.is_some() then add_string(&out.calls, d.pred_fn.unwrap())
+    _ -> ()
+
+// A call at a slot is answered with the functions every implementation of the trait put there.
+private take_dynamic(out: &Live, tables: Option[Buf[TVtable]], recv: Type, slot: int)
+    if tables.is_none() then return
+
+    val name = recv match
+        Ptr(inner) -> trait_name_of(*inner)
+        Ref(inner, _) -> trait_name_of(*inner)
+        _ -> None
+
+    if name.is_none() then return
+
+    val ts = tables.unwrap()
+
+    for i in 0..<ts.len()
+        val t = ts.at(i)
+
+        if t.trait_name == name.unwrap() && usize(slot) < t.slots.len()
+            add_string(&out.calls, t.slots.at(usize(slot)).target)
+end take_dynamic
+
+private trait_name_of(t: Type) -> Option[string] = t match
+    Trait(n, _, _) -> Some(n)
+    _ -> None
+
+private no_reached() -> &Live = Live(buf(), buf(), buf())
+
+// Adds a name to a set, answering whether it was new.
+private add_string(xs: *Buf[string], name: string) -> bool
+    if name == "" then return false
+
+    for i in 0..<xs.len()
+        if xs.at(i) == name then return false
+
+    xs.push(name)
+    true
+end add_string
+
+// -- the roots nothing in the program names -----------------------------------------------------------
+
+// The functions that are roots because **nothing in the program names them**, whatever the walk
+// starts from.
+//
+// **A root the program did not write counts only where the program reaches its module**, and that is
+// the one qualification on any of the four -- the same qualification on each of them, since a rule
+// told per kind turns into a rule about which attributes a function carries together.
+entry_points(p: TProgram, own: Buf[string]) -> Buf[TFunc]
+    val reached = reached_modules(p, own)
+
+    var out: Buf[TFunc] = buf()
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+        val kind = f.conv.is_some() || f.exported.is_some() || f.section.is_some() ||
+                   is_destructor(p, f.name)
+
+        if kind && contributes(reached, f.name) then out.push(f)
+
+    out
+end entry_points
+
+// The exports this compilation is answerable for: the ones it will emit, which is what every pass
+// that reads the emitted program's symbol table should read.
+exported_funcs(p: TProgram, own: Buf[string]) -> Buf[TFunc]
+    val reached = reached_modules(p, own)
+    val supplies = walk_program(p, own)
+
+    var out: Buf[TFunc] = buf()
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if f.exported.is_some() && (contributes(reached, f.name) ||
+                                    holds_string(supplies.calls, f.name))
+            out.push(f)
+
+    out
+end exported_funcs
+
+private is_destructor(p: TProgram, name: string) -> bool
+    for i in 0..<p.destructors.len()
+        if p.destructors.at(i).1 == name then return true
+
+    false
+end is_destructor
+
+// Whether the module a function is in contributes roots to this compilation at all.
+private contributes(reached: Option[Buf[string]], name: string) -> bool
+    if reached.is_none() then return true
+
+    holds_string(reached.unwrap(), module_of(name))
+end contributes
+
+// Which modules a root in counts, or nothing where every module's does. The referring is asked of
+// the graph name resolution built, which records an `import` as readily as a call.
+private reached_modules(p: TProgram, own: Buf[string]) -> Option[Buf[string]]
+    if own.is_empty() then return None
+
+    var reached: Buf[string] = buf()
+
+    for i in 0..<own.len()
+        add_string(&reached, own.at(i))
+
+    add_string(&reached, ModuleRoot)
+
+    var i: usize = 0
+
+    while i < reached.len()
+        val from = reached.at(i)
+
+        i += 1
+
+        for j in 0..<p.module_deps.len()
+            if p.module_deps.at(j).0 == from
+                val to = p.module_deps.at(j).1
+
+                for k in 0..<to.len()
+                    add_string(&reached, to.at(k))
+
+    Some(reached)
+end reached_modules
+
+// -- one program with something taken out of it -------------------------------------------------------
+
+// The same program with a different set of declarations, which is what pruning answers with.
+private with_declarations(p: TProgram, externs: Buf[TExtern], funcs: Buf[TFunc]) -> TProgram =
+    TProgram(p.structs, p.enums, p.vtables, externs, p.vals, funcs, p.main, p.entry, p.precompiled,
+             p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
+             p.main_module, p.tests, p.hooks, p.extern_vars, p.test_only, p.destructors,
+             p.warnings, p.module_deps)
+
+// **The scaffolding a module's tests are written against, taken out of the build that runs none.**
+//
+// A hook goes with the tests it brackets, and is read from the program rather than from the tests
+// because a module may declare one and no tests -- a hook left behind is a function nothing calls in
+// a build that runs nothing. Everything declared in a file that said `@tests` goes with them.
+strip_tests(p: TProgram) -> TProgram
+    var gone: Buf[string] = buf()
+
+    for i in 0..<p.tests.len()
+        gone.push(p.tests.at(i).func)
+
+    for i in 0..<p.hooks.len()
+        gone.push(p.hooks.at(i).func)
+
+    for i in 0..<p.test_only.len()
+        gone.push(p.test_only.at(i))
+
+    if gone.is_empty() then return p
+
+    var vtables: Buf[TVtable] = buf()
+
+    for i in 0..<p.vtables.len()
+        if !fills_a_slot(gone, p.vtables.at(i)) then vtables.push(p.vtables.at(i))
+
+    var funcs: Buf[TFunc] = buf()
+
+    for i in 0..<p.funcs.len()
+        if !holds_string(gone, p.funcs.at(i).name) then funcs.push(p.funcs.at(i))
+
+    var vals: Buf[TVal] = buf()
+
+    for i in 0..<p.vals.len()
+        if !holds_string(gone, p.vals.at(i).symbol) then vals.push(p.vals.at(i))
+
+    var externs: Buf[TExtern] = buf()
+
+    for i in 0..<p.externs.len()
+        if !holds_string(gone, p.externs.at(i).name) then externs.push(p.externs.at(i))
+
+    var no_tests: Buf[TTest] = buf()
+    var no_hooks: Buf[THook] = buf()
+    var no_only: Buf[string] = buf()
+
+    TProgram(p.structs, p.enums, vtables, externs, vals, funcs, p.main, p.entry, p.precompiled,
+             p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
+             p.main_module, no_tests, no_hooks, p.extern_vars, no_only, p.destructors,
+             p.warnings, p.module_deps)
+end strip_tests
+
+private fills_a_slot(gone: Buf[string], t: TVtable) -> bool
+    for i in 0..<t.slots.len()
+        if holds_string(gone, t.slots.at(i).target) then return true
+
+    false
+end fills_a_slot
