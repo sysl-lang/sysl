@@ -1,0 +1,378 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// **The substrate a body is written into**: registers, basic blocks, the entry-block prologue, and
+// the module-level constants a body lays down as it goes.
+//
+// This file holds *how* intermediate representation is written down and none of what it says. The
+// rules live in the files around it -- `emit_scalar.sysl` for what an operator becomes,
+// `emit_place.sysl` for what an address is, `emit_flow.sysl` for the blocks a branch needs, and
+// `emit_func.sysl` for the frame all three are emitted into.
+//
+// **A form nothing here lowers yet is recorded rather than guessed at.** `gap` holds the first one
+// a body reached, and a body that reached one is left out of the module altogether: an answer this
+// compiler cannot give is worth nothing beside the reference's, and a *wrong* one costs the diff
+// its meaning. So a partial lowering is a smaller module rather than a different one, which is what
+// makes it provable a function at a time.
+
+// Everything one function's lowering needs, plus the module-level lists a body contributes to.
+struct Emit
+    target: Target
+    layout: TargetLayout
+    word_bits: int
+
+    // The module-level storage bodies laid down -- the interned strings, so far.
+    globals: Buf[IrGlobal]
+    str_id: int
+
+    // The LLVM intrinsics the module turned out to need. Each is declared once under its
+    // overload-mangled name, which is why this is a list rather than a flag: the name carries the
+    // width, so a program using one at three widths needs three declarations.
+    sat_decls: Buf[IrFuncSig]
+
+    // Whether anything stopped the program, copied a block of storage, or asked for the checked
+    // arithmetic a size computation needs.
+    traps: bool
+    uses_memcpy: bool
+    checked: bool
+
+    // The blocks of the function being built. `prologue` is kept apart because a stack slot is
+    // hoisted to the top of the entry block from wherever it was needed, so the two halves of that
+    // block are built at different times and joined only when the function is finished.
+    prologue: Buf[Inst]
+    blocks: Buf[IrBlock]
+    current: Buf[Inst]
+    current_end: Option[Inst]
+    current_label: string
+    temp: int
+    label: int
+    terminated: bool
+
+    // Every label an emitted terminator names, which is what opening a block asks to decide whether
+    // the block can be reached at all.
+    reached: Buf[string]
+
+    // The enclosing loops, innermost last, so a `break`/`continue` knows where to jump and what
+    // result slot to store into.
+    loops: Buf[GenLoop]
+
+    // One stack slot per LLVM type per function, for the type punning a union needs: a value goes in
+    // written as one type and comes back out read as another.
+    scratch: Buf[(string, Val)]
+
+    // What the module knows about the functions a body calls: the keys whose emitted symbol differs
+    // from the key itself, the `extern`s -- which cross under C's convention rather than sysl's --
+    // and the ones whose parameter list is open at the end.
+    symbols: Buf[(string, string)]
+    foreigns: Buf[string]
+    variadics: Buf[string]
+
+    // How many postconditions the function being lowered states, which is what says whether a return
+    // owes anything beyond the `ret`.
+    ensures: int
+
+    // The first form this body reached that nothing here lowers. A body that has one is not emitted.
+    gap: Option[string]
+end Emit
+
+// What a definition and every call to it name.
+symbol_of(e: *Emit, name: string) -> string
+    for i in 0..<e.symbols.len()
+        if e.symbols.at(i).0 == name then return e.symbols.at(i).1
+
+    name
+end symbol_of
+
+// Whether a key names an `extern` rather than a function of this program's own.
+is_foreign(e: *Emit, name: string) -> bool
+    for i in 0..<e.foreigns.len()
+        if e.foreigns.at(i) == name then return true
+
+    false
+end is_foreign
+
+// Whether a key names something whose parameter list is open at the end.
+is_variadic(e: *Emit, name: string) -> bool
+    for i in 0..<e.variadics.len()
+        if e.variadics.at(i) == name then return true
+
+    false
+end is_variadic
+
+// Where a `break` and a `continue` in the innermost loop go, and where a `break` with a value puts
+// it.
+struct GenLoop
+    break_label: string
+    continue_label: string
+    slot: Val
+    has_slot: bool
+end GenLoop
+
+// An emitter for one module, with no function open.
+emitter(t: Target) -> Emit
+    var globals: Buf[IrGlobal] = buf()
+    var sat_decls: Buf[IrFuncSig] = buf()
+    var prologue: Buf[Inst] = buf()
+    var blocks: Buf[IrBlock] = buf()
+    var current: Buf[Inst] = buf()
+    var reached: Buf[string] = buf()
+    var loops: Buf[GenLoop] = buf()
+    var scratch: Buf[(string, Val)] = buf()
+    var symbols: Buf[(string, string)] = buf()
+    var foreigns: Buf[string] = buf()
+    var variadics: Buf[string] = buf()
+
+    Emit(t, layout_for(t), int(t.pointer_bits()), globals, 0, sat_decls, false, false, false,
+         prologue, blocks, current, None, "entry", 0, 0, false, reached, loops, scratch, symbols,
+         foreigns, variadics, 0, None)
+end emitter
+
+// -- what a body could not say --------------------------------------------------------------------
+
+// Records that this body reached a form nothing lowers yet, and answers a value standing where the
+// one it could not compute would have gone. The first reached is the one kept: it is the one a
+// reader can act on, and everything after it is downstream of a value that was never computed.
+gap_at(e: *Emit, what: string) -> Val
+    if e.gap.is_none() then e.gap = Some(what)
+
+    VUndef
+end gap_at
+
+// The same, for a caller with nothing to answer with.
+gap_here(e: *Emit, what: string)
+    if e.gap.is_none() then e.gap = Some(what)
+
+// Whether this body has already given up.
+has_gap(e: *Emit) -> bool = e.gap.is_some()
+
+// -- the function under construction ---------------------------------------------------------------
+
+// Resets everything that is one function's, which is everything but the module-level lists.
+start_function(e: *Emit)
+    e.prologue.clear()
+    e.blocks.clear()
+    e.current.clear()
+    e.current_end = None
+    e.current_label = "entry"
+    e.temp = 0
+    e.label = 0
+    e.terminated = false
+    e.reached.clear()
+    e.loops.clear()
+    e.scratch.clear()
+    e.ensures = 0
+    e.gap = None
+end start_function
+
+// A register nothing else in this function uses.
+fresh_reg(e: *Emit) -> Val
+    e.temp += 1
+
+    VReg(s"t${e.temp}")
+end fresh_reg
+
+// A label nothing else in this function uses.
+fresh_label(e: *Emit, stem: string) -> string
+    e.label += 1
+
+    s"$stem${e.label}"
+end fresh_label
+
+// Emits a plain instruction, unless the current block is already terminated.
+emit(e: *Emit, i: Inst)
+    if !e.terminated then e.current.push(i)
+
+// Emits a stack slot into the function's entry block rather than where it is needed. Every name is
+// unique within a function, so hoisting is safe -- and it keeps a slot inside a loop from growing
+// the stack on every iteration.
+emit_alloca(e: *Emit, name: Val, ty: LType, align: Option[int]) -> Val
+    e.prologue.push(InAlloca(name, ty, align))
+    name
+end emit_alloca
+
+// A slot with whatever boundary the type it holds already asks for.
+alloca(e: *Emit, name: Val, ty: LType) -> Val = emit_alloca(e, name, ty, None)
+
+// Emits a block terminator, marks the block closed, and records wherever it sends control -- which
+// is what makes the labels it names reachable.
+emit_term(e: *Emit, i: Inst)
+    if !e.terminated
+        e.current_end = Some(i)
+        e.terminated = true
+
+        i match
+            InBr(l) -> mark_reached(e, l)
+            InCondBr(_, t, f) ->
+                mark_reached(e, t)
+                mark_reached(e, f)
+            InSwitch(_, _, d, cs) ->
+                mark_reached(e, d)
+
+                for j in 0..<cs.len()
+                    mark_reached(e, cs.at(j).1)
+            _ -> ()
+end emit_term
+
+private mark_reached(e: *Emit, l: string)
+    for i in 0..<e.reached.len()
+        if e.reached.at(i) == l then return
+
+    e.reached.push(l)
+end mark_reached
+
+private is_reached(e: *Emit, l: string) -> bool
+    for i in 0..<e.reached.len()
+        if e.reached.at(i) == l then return true
+
+    false
+end is_reached
+
+// Opens a block under `l`.
+//
+// **A label nothing has branched to is unreachable, and emission stays suppressed through it.** LLVM
+// has no fall-through -- a block is entered only by a terminator naming it -- so a label opened
+// while no emitted branch mentions it can be reached at most by a back edge from the region it
+// opens, which is unreachable from the entry by the same argument.
+emit_label(e: *Emit, l: string)
+    close_block(e)
+    e.current_label = l
+    e.terminated = !is_reached(e, l)
+end emit_label
+
+// Files the block being built and starts a fresh one. A block still marked closed at the moment it
+// is filed never had a terminator of its own, because everything emitted into it was dropped -- it
+// is unreachable code, and `unreachable` is what it says.
+private close_block(e: *Emit)
+    val end = e.current_end match
+        Some(t) -> Some(t)
+        None -> if e.terminated then Some(InUnreachable) else None
+
+    var instrs: Buf[Inst] = buf()
+
+    for i in 0..<e.current.len()
+        instrs.push(e.current.at(i))
+
+    e.blocks.push(IrBlock(e.current_label, instrs, end))
+    e.current.clear()
+    e.current_end = None
+end close_block
+
+// The function just emitted: its header, and the blocks it is made of. The hoisted slots go at the
+// front of the entry block, which is where they were always printed.
+finish_func(e: *Emit, sig: IrFuncSig) -> IrFunc
+    close_block(e)
+
+    var out: Buf[IrBlock] = buf()
+
+    for i in 0..<e.blocks.len()
+        val b = e.blocks.at(i)
+
+        if i == 0
+            var instrs: Buf[Inst] = buf()
+
+            for j in 0..<e.prologue.len()
+                instrs.push(e.prologue.at(j))
+
+            for j in 0..<b.instrs.len()
+                instrs.push(b.instrs.at(j))
+
+            out.push(IrBlock(b.label, instrs, b.terminator))
+        else
+            out.push(b)
+
+    IrFunc(sig, out)
+end finish_func
+
+// -- the constants a body folds against ------------------------------------------------------------
+
+// The two widths written often enough to be worth naming: a condition, and the index a
+// `getelementptr` steps with.
+l_i1() -> LType = LInt(1)
+l_i32() -> LType = LInt(32)
+
+// The LLVM integer exactly one address wide, which is what a length, a size or an index must be
+// spelled as.
+word_lty(e: *Emit) -> LType = LInt(e.word_bits)
+
+// The constant a folded condition is tested against, which is by shape rather than by an equality
+// `Val` does not have.
+private is_yes(v: Val) -> bool = v match
+    VBool(b) -> b
+    _ -> false
+
+// Folding `and` / `or` over `i1`s, with the constant cases collapsed rather than emitted -- a test
+// that cannot fail contributes `true`, and ANDing that in would be an instruction saying nothing.
+and_i1(e: *Emit, a: Val, b: Val) -> Val
+    if is_yes(a) then return b
+    if is_yes(b) then return a
+
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, OpAnd, l_i1(), a, b))
+    r
+end and_i1
+
+or_i1(e: *Emit, a: Val, b: Val) -> Val
+    if is_yes(a) || is_yes(b) then return VBool(true)
+
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, OpOr, l_i1(), a, b))
+    r
+end or_i1
+
+not_i1(e: *Emit, a: Val) -> Val
+    if is_yes(a) then return VBool(false)
+
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, OpXor, l_i1(), a, VBool(true)))
+    r
+end not_i1
+
+// -- storage a lowering borrows ----------------------------------------------------------------------
+
+// One stack slot per LLVM type per function, for the type punning a union needs. Sharing the slot
+// is safe because every use of it stores and immediately loads with nothing emitted in between.
+scratch_slot(e: *Emit, ty: LType) -> Val
+    val key = l_render(ty)
+
+    for i in 0..<e.scratch.len()
+        if e.scratch.at(i).0 == key then return e.scratch.at(i).1
+
+    val slot = alloca(e, fresh_reg(e), ty)
+
+    e.scratch.push((key, slot))
+    slot
+end scratch_slot
+
+// A string's bytes as an interned constant holds them: UTF-8, with the terminator a C caller reads
+// by -- which a `string`, knowing its own length, has never had a use for.
+string_global(e: *Emit, s: string) -> Val
+    e.str_id += 1
+
+    val name = s".str${e.str_id}"
+
+    var bytes: Buf[u8] = buf()
+
+    for i in 0..<s.bytes.len
+        bytes.push(s.bytes[i])
+
+    bytes.push(u8(0))
+
+    e.globals.push(ir_global(name, true, LArr(int(bytes.len()), LInt(8)), VBytes(bytes)))
+    VGlobal(name)
+end string_global
+
+// -- the LLVM form of a type, as a body writes it ----------------------------------------------------
+
+// What a value of this type is held in. A type nothing lowers is a gap rather than a guess.
+lty(e: *Emit, t: Type) -> LType = type_lty(t, e.word_bits) match
+    Some(l) -> l
+    None ->
+        gap_here(e, s"type ${type_show(t)}")
+        LVoid
+
+// The type a `load` or a `store` names, which is the same question.
+lty_of(e: *Emit, x: TExpr) -> LType = lty(e, texpr_type(x))

@@ -1,0 +1,170 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int}
+
+// **Module storage**, and the constant expressions that fill it.
+//
+// A `val`'s initializer is text laid straight into the object file, with no instruction emitted for
+// any of it. What cannot be written that way is `computed`, and the entry point fills it -- so the
+// global is emitted zeroed and this file has nothing to say about it.
+
+// What a `val`'s storage starts at. A `computed` one is filled by the entry point, so the object
+// file carries zeros for it and nothing here has anything to say.
+private val_init(e: *Emit, v: TVal) -> Val
+    if v.computed then return VZero
+
+    v.init match
+        Some(x) -> constant_value(e, x)
+        None -> VZero
+end val_init
+
+// The storage a program's `val`s come to.
+gen_vals(e: *Emit, vals: Buf[TVal]) -> Buf[IrGlobal]
+    var out: Buf[IrGlobal] = buf()
+
+    for i in 0..<vals.len()
+        val v = vals.at(i)
+
+        val init = val_init(e, v)
+
+        val align = v.align match
+            Some(n) -> Some(int(n))
+            None -> None
+
+        out.push(IrGlobal(v.symbol, !(v.computed || v.writable), lty(e, v.ty), Some(init),
+                          LinkPrivate, v.section, align))
+
+    out
+end gen_vals
+
+// `@llvm.used` -- the symbols this module places by hand and nothing in it reads. It is what keeps
+// the feature from compiling, linking and placing nothing: a table gathered by a linker script has
+// no reader inside the program.
+gen_used(names: Buf[string]) -> Option[IrGlobal]
+    if names.is_empty() then return None
+
+    var elems: Buf[IrArg] = buf()
+
+    for i in 0..<names.len()
+        elems.push(ir_arg(LPtr, VGlobal(names.at(i))))
+
+    Some(IrGlobal("llvm.used", false, LArr(int(names.len()), LPtr), Some(VArray(elems)),
+                  LinkAppending, Some("llvm.metadata"), None))
+end gen_used
+
+// A `val`'s initializer as a **constant expression**.
+constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
+    TIntLit(v, _) -> VInt(v)
+
+    // A module-level `bool` is written as its bit rather than as `true`, which is what LLVM's own
+    // constant grammar takes -- the word is the *instruction* operand's spelling.
+    TBoolLit(b) -> VInt(from_int(if b then 1 else 0))
+    TFloatLit(bits, ty) -> if ty == real_type() then VFloat(bits) else v_float32(real_of_bits(bits))
+
+    // Three words naming bytes that are never freed. The owner is null, which is what makes the whole
+    // value a constant expression rather than something a prologue has to build.
+    TStrLit(s) -> string_const(e, s)
+
+    // **`[0; N]` is one word, not N of them.** `zeroinitializer` is what LLVM takes for an aggregate
+    // whose every bit is zero, and writing the elements out instead costs the whole array in the
+    // module's text for an output that never grows.
+    TArrayFill(value, array_ty) ->
+        val elem = constant_value(e, value)
+
+        if is_zero_const(elem) then VZero
+        else
+            val n = underlying(array_ty) match
+                Array(len, _) -> len
+                _ -> 0
+
+            val ety = underlying(array_ty) match
+                Array(_, el) -> *el
+                _ -> int_type()
+
+            var elems: Buf[IrArg] = buf()
+
+            for i in 0..<n
+                elems.push(ir_arg(lty(e, ety), elem))
+
+            VArray(elems)
+
+    TArrayLit(items, array_ty) ->
+        val ety = underlying(array_ty) match
+            Array(_, el) -> *el
+            _ -> int_type()
+
+        var elems: Buf[IrArg] = buf()
+
+        for i in 0..<items.len()
+            elems.push(ir_arg(lty(e, ety), constant_value(e, items.at(i))))
+
+        VArray(elems)
+
+    // A struct constant lists its fields in the order the type declares them, and skips the ones that
+    // occupy nothing -- the initializer has to match the type this module emitted.
+    TStructNew(decl, args) ->
+        var fields: Buf[IrArg] = buf()
+
+        for i in 0..<args.len()
+            val ft = decl.fields.at(i).1
+
+            if !zero_sized(ft) then fields.push(ir_arg(lty(e, ft), constant_value(e, args.at(i))))
+
+        VAgg(fields)
+
+    // A device address written as a number: `inttoptr` is a constant expression, so the pointer is in
+    // the object file rather than stored into it by a prologue.
+    TCast(v, _) -> VIntToPtr(lty_of(e, v), constant_value(e, v))
+
+    // A trait pointer is two words, so its empty value is not the one-word `null`.
+    TNullLit(ty) -> if erased(underlying(ty)) then VZero else VNull
+
+    // A variant that carries nothing is a tag and a payload region nothing will read.
+    TEnumNew(en, variant, _) ->
+        if variant.carries then gap_at(e, "a constant enum variant that carries a payload")
+        else if variant.tag == 0 then VZero
+        else
+            val d = underlying(en) match
+                Enum(decl) -> decl
+                _ -> return gap_at(e, "a constant enum of something that is not an enum")
+
+            val area = payload_area(d, e.layout)
+
+            var fields: Buf[IrArg] = buf()
+
+            fields.push(ir_arg(l_i32(), VInt(from_int(long(variant.tag)))))
+            fields.push(ir_arg(LArr(area.1, area.0), VZero))
+            VAgg(fields)
+
+    _ -> gap_at(e, s"a constant ${texpr_kind_name(t)}")
+
+// A string as a value: the owner nothing frees, the bytes, and how many there are.
+string_const(e: *Emit, s: string) -> Val
+    var fields: Buf[IrArg] = buf()
+
+    fields.push(ir_arg(LPtr, VNull))
+    fields.push(ir_arg(LPtr, string_global(e, s)))
+    fields.push(ir_arg(word_lty(e), VInt(from_int(long(s.bytes.len)))))
+    VAgg(fields)
+end string_const
+
+// Whether a constant is every bit zero, which is the one thing `zeroinitializer` may stand for. A
+// float is zero at bit pattern zero alone, so `-0.0` -- whose sign bit is set -- is correctly not
+// one.
+private is_zero_const(v: Val) -> bool = v match
+    VInt(n) -> n == from_int(0)
+    VBool(b) -> !b
+    VFloat(bits) -> bits == 0
+    VNull -> true
+    VZero -> true
+    VAgg(fields) -> all_zero(fields)
+    VArray(elems) -> all_zero(elems)
+    _ -> false
+
+private all_zero(items: Buf[IrArg]) -> bool
+    for i in 0..<items.len()
+        if !is_zero_const(items.at(i).value) then return false
+
+    true
+end all_zero

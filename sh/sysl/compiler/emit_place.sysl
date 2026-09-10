@@ -1,0 +1,304 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, mul, pow, sub}
+
+// **Where a value lives**, and the walks that reach it.
+//
+// A place bottoms out either in a local's stack slot or in a pointer the program already holds, so
+// the field chain is walked with `getelementptr` rather than read out with `extractvalue`. What a
+// computed value gets instead is a slot of its own, which is the one case that is not a place at
+// all and is only ever reached on the way to a read.
+
+// Whether an access through this storage reaches the device rather than a register the back end may
+// keep for itself.
+access_of(t: Type) -> IrAccess = if volatile_in(t) then AccVolatile else AccPlain
+
+// The same asked of the node a place came from.
+place_access(x: TExpr) -> IrAccess = access_of(place_ty(x))
+
+// The type the storage behind a place is declared at, which is not always the type of the values
+// read out of it -- a qualifier lives on the storage.
+place_ty(x: TExpr) -> Type = texpr_type(x)
+
+// The address of a place, as a `ptr` register or an existing slot name.
+address(e: *Emit, place: TExpr) -> Val = *place.kind match
+    TLoad(name, _) -> VReg(s"$name.addr")
+
+    // A `val`'s storage is the global itself, so its address needs no instruction to compute -- it
+    // is what makes indexing one reach into the table rather than copy it out first.
+    TGlobal(symbol, _, _) -> VGlobal(symbol)
+    TDeref(operand, _) -> payload_addr(e, operand)
+
+    // A zero-sized field occupies nothing, so it is wherever its receiver is: the address is never
+    // read or written through, and handing back the receiver's keeps the walk to it exactly as it is
+    // for every other field.
+    TField(receiver, index, ty) ->
+        if zero_sized(ty) then return address(e, receiver)
+
+        val rty = texpr_type(receiver)
+
+        if bitfield_ranges_of(rty).is_some()
+            return gap_at(e, "address of a bitfield")
+
+        val base = address(e, receiver)
+        val r = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(field_slot_of(rty, index))))))
+        emit(e, InGep(r, lty(e, rty), base, idx))
+        r
+
+    TIndex(receiver, index, _) -> element_addr(e, receiver, index)
+
+    // A computed value has no address of its own, so reaching into one means giving it a slot first.
+    _ ->
+        val ty = texpr_type(place)
+        val slot = alloca(e, fresh_reg(e), lty(e, ty))
+
+        if e.layout.indirect(ty)
+            gap_here(e, "a large temporary's address")
+        else
+            emit(e, InStore(lty(e, ty), gen_expr(e, place), slot, AccPlain, None))
+
+        slot
+
+// Where the `i`th declared field of a receiver lands among the stored ones.
+field_slot_of(recv_ty: Type, index: int) -> usize = underlying(recv_ty) match
+    Struct(d) -> d.slot(usize(index))
+    _ -> usize(index)
+
+// The ranges of the bitfield struct this type is one of, through whatever qualifies it.
+bitfield_ranges_of(t: Type) -> Option[Buf[BitRange]] = underlying(t) match
+    Struct(d) -> bitfield_ranges(d)
+    _ -> None
+
+// What a `&T` points at, which is the payload inside the box rather than the box itself.
+payload_addr(e: *Emit, operand: TExpr) -> Val
+    val p = gen_expr(e, operand)
+
+    texpr_type(operand) match
+        Ref(_, _) ->
+            gap_at(e, "the payload of a counted reference")
+        _ -> p
+end payload_addr
+
+// The address of one element, after checking that it exists. An array is indexed from its own
+// storage; a view is indexed from the pointer it carries; a `*T` has no length, so no check.
+element_addr(e: *Emit, receiver: TExpr, index: TExpr) -> Val
+    val rty = texpr_type(receiver)
+
+    val parts = rty match
+        Array(n, elem) -> (address(e, receiver), Some(VInt(from_int(long(n)))), *elem)
+        Slice(elem, _) -> view_parts(e, receiver, *elem)
+        Str -> view_parts(e, receiver, byte_type())
+        Ptr(elem) -> (gen_expr(e, receiver), None, *elem)
+        other ->
+            gap_here(e, s"index into ${type_show(other)}")
+            (VUndef, None, int_type())
+
+    val i = widen_index(e, index)
+
+    parts.1 match
+        Some(l) -> bounds_check(e, i, l)
+        None -> ()
+
+    val r = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(word_lty(e), i))
+    emit(e, InGep(r, lty(e, parts.2), parts.0, idx))
+    r
+end element_addr
+
+// A view's pointer and its length, lifted out of the three words it is.
+private view_parts(e: *Emit, receiver: TExpr, elem: Type) -> (Val, Option[Val], Type)
+    val wty = lty(e, texpr_type(receiver))
+    val v = gen_expr(e, receiver)
+    val p = fresh_reg(e)
+
+    emit(e, InExtract(p, wty, v, index_list(1)))
+
+    val l = fresh_reg(e)
+
+    emit(e, InExtract(l, wty, v, index_list(2)))
+    (p, Some(l), elem)
+end view_parts
+
+index_list(n: int) -> Buf[int]
+    var out: Buf[int] = buf()
+
+    out.push(n)
+    out
+end index_list
+
+// An index brought to the address width. A wider one is checked to fit first, since truncating it
+// would turn an index past the end into one inside.
+widen_index(e: *Emit, index: TExpr) -> Val = underlying(texpr_type(index)) match
+    Integer(bits, signed, _) ->
+        if bits <= e.word_bits then convert_int(e, bits, signed, e.word_bits, gen_expr(e, index))
+        else
+            val v = gen_expr(e, index)
+            val wide = LInt(bits)
+            val limit = sub(pow(from_int(2), usize(e.word_bits)), from_int(1))
+            val fits = fresh_reg(e)
+
+            emit(e, InIntCmp(fits, IUle, wide, v, VInt(limit)))
+            trap_unless(e, fits, "bounds")
+            convert_int(e, bits, signed, e.word_bits, v)
+    other -> gap_at(e, s"index of type ${type_show(other)}")
+
+// Traps unless `i` names an element that exists. The comparison is unsigned at the address width, so
+// a negative index arrives as a very large one and fails the same test.
+bounds_check(e: *Emit, i: Val, len: Val)
+    val ok = fresh_reg(e)
+
+    emit(e, InIntCmp(ok, IUlt, word_lty(e), i, len))
+    trap_unless(e, ok, "bounds")
+end bounds_check
+
+// -- reading and writing through a place -------------------------------------------------------------
+
+// Where a write to this place goes: a bitfield's **container**, since the field itself has no
+// address at all, and the place's own otherwise.
+place_addr(e: *Emit, place: TExpr) -> Val = bit_place(place) match
+    Some(p) -> address(e, p.0)
+    None -> address(e, place)
+
+// A place that is a bit range of a bitfield struct: the receiver holding the container, the struct's
+// ranges, and this field's one -- or nothing for every other place, which is nearly all of them.
+bit_place(place: TExpr) -> Option[(TExpr, Buf[BitRange], BitRange)] = *place.kind match
+    TField(receiver, index, _) -> bitfield_ranges_of(texpr_type(receiver)) match
+        Some(ranges) ->
+            val s = underlying(texpr_type(receiver)) match
+                Struct(d) -> d.slot(usize(index))
+                _ -> usize(index)
+
+            Some((receiver, ranges, ranges.at(s)))
+        None -> None
+    _ -> None
+
+// What is in the place now -- one load of the container and a shift for a bitfield.
+load_place(e: *Emit, place: TExpr, p: Val) -> Val = bit_place(place) match
+    Some(b) -> read_bits(e, b.1, b.2, load_container(e, b.1, b.0, p))
+    None ->
+        val t = fresh_reg(e)
+
+        emit(e, InLoad(t, lty(e, texpr_type(place)), p, place_access(place), None))
+        t
+
+private load_container(e: *Emit, ranges: Buf[BitRange], receiver: TExpr, addr: Val) -> Val
+    val t = fresh_reg(e)
+
+    emit(e, InLoad(t, container_lty(ranges), addr, access_of(place_ty(receiver)), None))
+    t
+end load_container
+
+// Puts `v` in the place. A slot that holds a counted reference owes a retain and a release, which
+// nothing here writes yet, so such a place is a gap rather than an unbalanced store.
+store_place(e: *Emit, place: TExpr, p: Val, v: Val) = bit_place(place) match
+    Some(b) ->
+        val acc = access_of(place_ty(b.0))
+        val c = load_container(e, b.1, b.0, p)
+
+        emit(e, InStore(container_lty(b.1), write_bits(e, b.1, b.2, c, v), p, acc, None))
+    None -> store_into(e, texpr_type(place), p, v, place_access(place))
+
+// Writes `v` into the storage at `p`.
+store_into(e: *Emit, ty: Type, p: Val, v: Val, acc: IrAccess)
+    if contains_counted(ty)
+        gap_here(e, "a write through storage that holds a reference")
+        return
+
+    emit(e, InStore(lty(e, ty), v, p, acc, None))
+end store_into
+
+// -- the bit ranges of a bitfield struct's container --------------------------------------------------
+
+// The bits of a container that this range does **not** occupy, which is what a write has to
+// preserve. The range's own bits are a subset of the container's, so taking them away is the same
+// answer a complement and an `and` would give.
+clear_mask(r: BitRange, bits: int) -> BigInt
+    val full = sub(pow(from_int(2), usize(bits)), from_int(1))
+    val mine = mul(sub(pow(from_int(2), usize(r.width)), from_int(1)),
+                   pow(from_int(2), usize(r.offset)))
+
+    sub(full, mine)
+end clear_mask
+
+// The container type a bitfield struct's fields are ranges of.
+container_lty(ranges: Buf[BitRange]) -> LType = LInt(bitfield_bits(ranges))
+
+// A field's value at the container's own width, which a field occupying the whole of it already is.
+private widened_to(e: *Emit, ranges: Buf[BitRange], r: BitRange, v: Val, ct: LType) -> Val
+    if r.width == bitfield_bits(ranges) then return v
+
+    val t = fresh_reg(e)
+
+    emit(e, InCast(t, CastZExt, LInt(r.width), v, ct))
+    t
+end widened_to
+
+// The container with this range's bits at the bottom.
+private shifted_down(e: *Emit, r: BitRange, c: Val, ct: LType) -> Val
+    if r.offset == 0 then return c
+
+    val t = fresh_reg(e)
+
+    emit(e, InBin(t, OpLShr, ct, c, VInt(from_int(long(r.offset)))))
+    t
+end shifted_down
+
+// A field's value widened to the container and shifted to where it belongs.
+place_bits(e: *Emit, ranges: Buf[BitRange], r: BitRange, v: Val) -> Val
+    val ct = container_lty(ranges)
+
+    val wide = widened_to(e, ranges, r, v, ct)
+
+    if r.offset == 0 then return wide
+
+    val t = fresh_reg(e)
+
+    emit(e, InBin(t, OpShl, ct, wide, VInt(from_int(long(r.offset)))))
+    t
+end place_bits
+
+// One range lifted out of the container. No sign fixup is needed and none is emitted: an `i5` field
+// *is* an LLVM `i5`, so truncating the shifted container to the field's own width lands the
+// two's-complement value already in place.
+read_bits(e: *Emit, ranges: Buf[BitRange], r: BitRange, c: Val) -> Val
+    val ct = container_lty(ranges)
+
+    val shifted = shifted_down(e, r, c, ct)
+
+    if r.width == bitfield_bits(ranges) then return shifted
+
+    val t = fresh_reg(e)
+
+    emit(e, InCast(t, CastTrunc, ct, shifted, LInt(r.width)))
+    t
+end read_bits
+
+// The container `c` with one range replaced by `v` -- the read-modify-write a bitfield write is,
+// with the read already done by the caller.
+write_bits(e: *Emit, ranges: Buf[BitRange], r: BitRange, c: Val, v: Val) -> Val
+    val ct = container_lty(ranges)
+    val bits = bitfield_bits(ranges)
+    val shifted = place_bits(e, ranges, r, v)
+
+    // A field occupying the whole container has nothing to preserve.
+    if r.width == bits then return shifted
+
+    val clear = clear_mask(r, bits)
+    val cleared = fresh_reg(e)
+
+    emit(e, InBin(cleared, OpAnd, ct, c, VInt(clear)))
+
+    val merged = fresh_reg(e)
+
+    emit(e, InBin(merged, OpOr, ct, cleared, shifted))
+    merged
+end write_bits

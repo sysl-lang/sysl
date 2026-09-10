@@ -1,0 +1,139 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// **How a sysl signature is spelled**, which four places write down: a definition, a declaration of
+// one a library already compiled, a call, and the `ret` itself. They agree because they all ask
+// here.
+
+// A **narrow** result carries the C convention's extension, which is the one thing about a sysl
+// signature that is not sysl's own answer. Widening a result is the *callee's* obligation, and a
+// definition cannot know who calls it: `@export` and `&f` hand this very symbol to C, and a `bool`
+// returned without the attribute would reach it as whatever was in the top of the register.
+//
+// A **parameter** gets none, which is the same rule seen from the other side: widening an argument
+// is the caller's obligation, so it is stated at a foreign call and nowhere else.
+c_extension(t: Type, target: Target) -> Buf[IrAttr] = underlying(t) match
+    Bool -> widen_attr(1, false, target)
+    Char -> widen_attr(32, false, target)
+    Enum(d) ->
+        if !d.simple then no_ir_attrs()
+        else d.underlying match
+            Integer(bits, signed, _) -> widen_attr(bits, signed, target)
+            _ -> no_ir_attrs()
+    Integer(bits, signed, _) -> widen_attr(bits, signed, target)
+    _ -> no_ir_attrs()
+
+// **CRAFT widens nothing, because a widening is a promise made to a C compiler and there is no C
+// compiler there.** Every rule below says what some clang does with the bits above a narrow value.
+private widen_attr(bits: int, signed: bool, target: Target) -> Buf[IrAttr]
+    var out: Buf[IrAttr] = buf()
+
+    if target.cpu == Craft then return out
+    if target.cpu == Aarch64 && target.os != MacOS then return out
+
+    if bits == 1
+        out.push(AttrZeroExt)
+        return out
+
+    if target.cpu == X86_64 && target.os == Windows then return out
+
+    if bits < 32
+        out.push(if signed then AttrSignExt else AttrZeroExt)
+        return out
+
+    if bits == 32 && target.cpu == Riscv64 then out.push(AttrSignExt)
+
+    out
+end widen_attr
+
+// The result's **type**, with no attribute on it -- what a `ret` instruction carries. A return
+// attribute belongs to the signature, and LLVM refuses `ret zeroext i1 %x` outright.
+sysl_result_lty(e: *Emit, ret_ty: Type) -> LType =
+    if no_value(ret_ty) || e.layout.indirect(ret_ty) then LVoid else lty(e, ret_ty)
+
+// The out-pointer's attributes, less the `noalias` only a caller that made the storage may claim.
+sret_attrs(ty: LType, align: int) -> Buf[IrAttr]
+    var out: Buf[IrAttr] = buf()
+
+    out.push(AttrSRet(ty))
+    out.push(AttrAlign(align))
+    out
+end sret_attrs
+
+// Whether a result of this type comes back through an out-pointer rather than in registers.
+sysl_indirect(e: *Emit, ret_ty: Type) -> bool = e.layout.indirect(ret_ty)
+
+// The out-pointer a **large** result comes back through, in front of every declared parameter.
+sysl_sret(e: *Emit, ret_ty: Type, name: Option[Val]) -> Option[IrParam]
+    if !e.layout.indirect(ret_ty) then return None
+
+    var attrs: Buf[IrAttr] = buf()
+
+    attrs.push(AttrNoAlias)
+
+    val sr = sret_attrs(lty(e, ret_ty), int(e.layout.align(ret_ty)))
+
+    for i in 0..<sr.len()
+        attrs.push(sr.at(i))
+
+    Some(IrParam(LPtr, attrs, name))
+end sysl_sret
+
+// The name the out-pointer takes inside a function that has one.
+sret_param() -> Val = VReg("sret.out")
+
+// How a parameter is declared. A **large** one arrives as the address of storage the caller holds;
+// the callee makes its own copy at entry.
+sysl_param_lty(e: *Emit, ty: Type) -> LType = if e.layout.indirect(ty) then LPtr else lty(e, ty)
+
+// What a sysl function looks like to LLVM, which is what its **definition** writes and what a
+// declaration of one compiled elsewhere writes too -- the two have to be the one answer.
+//
+// `defining` names the parameters and settles whether the first of them is an interrupt handler's
+// frame; a declaration has neither.
+sysl_fn_type(e: *Emit, ret_ty: Type, params: Buf[(string, Type)], variadic: bool,
+             defining: Option[TFunc]) -> IrFnType
+    var out: Buf[IrParam] = buf()
+
+    val named = defining.is_some()
+
+    sysl_sret(e, ret_ty, if named then Some(sret_param()) else None) match
+        Some(p) -> out.push(p)
+        None -> ()
+
+    for i in 0..<params.len()
+        val p = params.at(i)
+
+        if !zero_sized(p.1)
+            val attrs = defining match
+                Some(f) -> frame_attrs(e, f, p.1, p.0)
+                None -> no_ir_attrs()
+
+            val name = if named then Some(VReg(s"${p.0}.param")) else None
+
+            out.push(IrParam(sysl_param_lty(e, p.1), attrs, name))
+
+    IrFnType(sysl_result_lty(e, ret_ty), out, variadic, c_extension_of_result(e, ret_ty))
+end sysl_fn_type
+
+private c_extension_of_result(e: *Emit, ret_ty: Type) -> Buf[IrAttr] =
+    if no_value(ret_ty) || e.layout.indirect(ret_ty) then no_ir_attrs()
+    else c_extension(ret_ty, e.target)
+
+// `byval` on an x86-64 interrupt handler's frame parameter, which the ABI requires and which is the
+// one place sysl emits a parameter attribute. Nothing else carries one, so an ordinary function's
+// answer is the empty list.
+private frame_attrs(e: *Emit, f: TFunc, ty: Type, name: string) -> Buf[IrAttr]
+    var out: Buf[IrAttr] = buf()
+
+    if f.conv.is_none() then return out
+    if f.params.is_empty() || f.params.at(0).0 != name then return out
+    if e.target.cpu != X86_64 then return out
+
+    ty match
+        Ptr(inner) -> out.push(AttrByVal(lty(e, *inner)))
+        _ -> ()
+
+    out
+end frame_attrs

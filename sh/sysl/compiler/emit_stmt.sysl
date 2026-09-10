@@ -1,0 +1,186 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **One statement, lowered for its effects.**
+
+gen_stmt(e: *Emit, s: TStmt) = s match
+    // A zero-sized binding is not a slot: the initializer still runs, for its effect, and there is
+    // nothing to keep afterwards.
+    TVarDecl(name, ty, init, align) ->
+        if zero_sized(ty)
+            gen_expr(e, init)
+        else
+            // The slot is laid down **before** the initializer runs, because a large one is written
+            // into it rather than handed to it.
+            emit_alloca(e, VReg(s"$name.addr"), lty(e, ty), int_align(align))
+            gen_into(e, VReg(s"$name.addr"), init)
+
+    // `ref name = place`. The walk to the place is made **once**, here, and its result becomes the
+    // name's address -- so every later read and write is the one instruction it would have been.
+    //
+    // The zero-offset `getelementptr` is there to give the address a name of its own: `address` may
+    // hand back an existing slot or a global, and a register cannot simply be renamed.
+    TRefDecl(name, _, place) ->
+        val base = address(e, place)
+
+        if volatile_in(place_ty(place)) then gap_here(e, "a ref to volatile storage")
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(LInt(64), VInt(from_int(0))))
+        emit(e, InGep(VReg(s"$name.addr"), LInt(8), base, idx))
+
+    TExprStmt(expr) -> gen_expr(e, expr)
+
+    TWriteStmt(w) -> gen_write(e, w)
+
+    TReturn(opt) -> gen_return(e, opt)
+
+    TBreak(opt, depth) ->
+        val enclosing = loop_at(e, depth)
+
+        opt match
+            Some(t) ->
+                val v = gen_expr(e, t)
+
+                emit(e, InStore(lty_of(e, t), v, enclosing.slot, AccPlain, None))
+            None -> ()
+
+        emit_term(e, InBr(enclosing.break_label))
+
+    TContinue(depth) -> emit_term(e, InBr(loop_at(e, depth).continue_label))
+
+    // A loop's `invariant` is a condition that traps on false, which is every other clause the
+    // verification chapter states.
+    TInvariant(cond, _) -> emit_contract(e, cond, "invariant")
+
+    TVariantCheck(slot, var_ty, expr) -> gen_variant_check(e, slot, var_ty, expr)
+
+    _ -> gap_here(e, tstmt_kind_name(s))
+
+// The boundary a declaration asked for, which wins over the one the type carries.
+private int_align(align: Option[usize]) -> Option[int] = align match
+    Some(n) -> Some(int(n))
+    None -> None
+
+// The loop a `break` or a `continue` at this depth belongs to. The list is innermost **last**, so a
+// depth of zero is the one on the end.
+private loop_at(e: *Emit, depth: int) -> GenLoop
+    val i = e.loops.len() - 1 - usize(depth)
+
+    e.loops.at(i)
+end loop_at
+
+// Writes `x`'s value into `dest`. A large one is written where it is going rather than produced and
+// then stored, since that is what the callee of `val k = kernel()` needs.
+gen_into(e: *Emit, dest: Val, x: TExpr)
+    val ty = texpr_type(x)
+
+    if contains_counted(ty)
+        gap_here(e, "storage that holds a reference")
+        return
+
+    if !e.layout.indirect(ty)
+        val v = gen_expr(e, x)
+
+        emit(e, InStore(lty(e, ty), v, dest, AccPlain, None))
+        return
+
+    gap_here(e, "a large value written where it is going")
+end gen_into
+
+// One place written from one value, with everything the write owes.
+private gen_write(e: *Emit, w: TWrite)
+    if !w.check.is_empty() then gap_here(e, "an invariant re-check after a write")
+
+    if zero_sized(texpr_type(w.place))
+        gen_expr(e, w.value)
+        return
+
+    val p = place_addr(e, w.place)
+
+    if w.op == "="
+        val v = gen_expr(e, w.value)
+
+        store_place(e, w.place, p, v)
+        return
+
+    if w.dispatch.is_some()
+        gap_here(e, "a compound assignment through a trait method")
+        return
+
+    val cur = load_place(e, w.place, p)
+    val v = gen_expr(e, w.value)
+    val updated = combine(e, w.op, texpr_type(w.place), texpr_type(w.value), cur, v)
+
+    w.constraint match
+        Some(c) -> emit_constraint_checks(e, updated, c)
+        None -> ()
+
+    store_place(e, w.place, p, updated)
+end gen_write
+
+// A `return`, which is where a frame's promises are discharged.
+private gen_return(e: *Emit, opt: Option[TExpr])
+    opt match
+        Some(t) ->
+            val ty = texpr_type(t)
+
+            if e.layout.indirect(ty)
+                gap_here(e, "a large result returned through storage")
+                return
+
+            val v = gen_expr(e, t)
+
+            emit_ensures(e, Some(v))
+            emit_term(e, InRet(Some(lty(e, ty)), Some(v)))
+        None ->
+            emit_ensures(e, None)
+            emit_term(e, InRet(None, None))
+end gen_return
+
+// -- contracts ---------------------------------------------------------------------------------------
+
+// A clause that traps on false, which is what every contract clause is at run time.
+emit_contract(e: *Emit, cond: TExpr, kind: string)
+    val ok = gen_expr(e, cond)
+
+    trap_unless(e, ok, kind)
+end emit_contract
+
+// Runs every postcondition with `result` bound to the value about to be returned. A function that
+// states one is a gap for as long as `result` has nowhere to come from.
+emit_ensures(e: *Emit, result: Option[Val])
+    if e.ensures > 0 then gap_here(e, "a postcondition")
+
+// One iteration's `variant` check: measure, compare against the last one where there was a last one,
+// and store. The comparison is **strict** and is signed or unsigned according to the measure's own
+// type.
+private gen_variant_check(e: *Emit, slot: string, var_ty: Type, expr: TExpr)
+    val w = lty(e, var_ty)
+    val cur = gen_expr(e, expr)
+    val armed_v = fresh_reg(e)
+
+    emit(e, InLoad(armed_v, l_i1(), VReg(s"$slot.armed"), AccPlain, None))
+
+    val cmp_l = fresh_label(e, "variant.cmp")
+    val set_l = fresh_label(e, "variant.set")
+
+    emit_term(e, InCondBr(armed_v, cmp_l, set_l))
+    emit_label(e, cmp_l)
+
+    val prev = fresh_reg(e)
+
+    emit(e, InLoad(prev, w, VReg(s"$slot.prev"), AccPlain, None))
+
+    val ok = fresh_reg(e)
+
+    emit(e, InIntCmp(ok, int_pred(e, "<", underlying(var_ty)), w, cur, prev))
+    trap_unless(e, ok, "variant")
+    emit_term(e, InBr(set_l))
+    emit_label(e, set_l)
+    emit(e, InStore(w, cur, VReg(s"$slot.prev"), AccPlain, None))
+    emit(e, InStore(l_i1(), VInt(from_int(1)), VReg(s"$slot.armed"), AccPlain, None))
+end gen_variant_check

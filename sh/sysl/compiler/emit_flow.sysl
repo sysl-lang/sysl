@@ -1,0 +1,274 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **The forms that yield a value and have a body**, which are all of them here: every branch stores
+// into one slot and the merge loads it back, so a `never`-typed arm simply never reaches the store.
+//
+// The labels are named after the form they came from, which is what makes emitted text readable
+// beside the source it came from.
+
+// An `if`, with or without an `else` and with or without a value.
+gen_if(e: *Emit, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TBlock],
+       ty: Type) -> Val
+    val then_l = fresh_label(e, "if.then")
+    val else_l = fresh_label(e, "if.else")
+    val end_l = fresh_label(e, "if.end")
+    val target = if else_block.is_some() then else_l else end_l
+    val slot = result_slot(e, ty)
+
+    gen_cond(e, cond, then_l, target)
+
+    if no_value(ty) then gen_block_void(e, then_block)
+    else store_block_value(e, then_block, ty, slot)
+
+    emit_term(e, InBr(end_l))
+
+    else_block match
+        Some(eb) ->
+            emit_label(e, else_l)
+
+            if no_value(ty) then gen_block_void(e, eb) else store_block_value(e, eb, ty, slot)
+
+            emit_term(e, InBr(end_l))
+        None -> ()
+
+    emit_label(e, end_l)
+    ends_nowhere(e, ty)
+    load_result(e, slot, ty)
+end gen_if
+
+// The slot a form's branches store their value into, or nothing where there is no value.
+private result_slot(e: *Emit, ty: Type) -> Val =
+    if no_value(ty) then VNothing else alloca(e, fresh_reg(e), lty(e, ty))
+
+private load_result(e: *Emit, slot: Val, ty: Type) -> Val
+    if no_value(ty) then return VNothing
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, ty), slot, AccPlain, None))
+    r
+end load_result
+
+// Closes the merge point of a form whose every path diverges: no branch arrives, so the label
+// control would have landed on is unreachable.
+ends_nowhere(e: *Emit, ty: Type)
+    if ty == Never then emit_term(e, InUnreachable)
+
+private store_block_value(e: *Emit, b: TBlock, ty: Type, slot: Val)
+    if b.ty == Never then gen_block_void(e, b)
+    else emit(e, InStore(lty(e, ty), gen_block_value(e, b), slot, AccPlain, None))
+
+// Emits an `if`'s or a `while`'s condition as the chain of `&&`-joined terms it is, landing on
+// `success_l` where all of them held. Each term branches to the next on success and to `fail_l` on
+// failure, so a condition with no `is` in it is the one test and the one `br` it always was.
+gen_cond(e: *Emit, terms: Buf[TCondTerm], success_l: string, fail_l: string)
+    for i in 0..<terms.len()
+        val last = i == terms.len() - 1
+
+        terms.at(i) match
+            TCondTest(c) ->
+                val next_l = if last then success_l else fresh_label(e, "cond.and")
+                val v = gen_expr(e, c)
+
+                emit_term(e, InCondBr(v, next_l, fail_l))
+                emit_label(e, next_l)
+            TCondIs(_, _, _) ->
+                gap_here(e, "a pattern in a condition")
+
+                val next_l = if last then success_l else fresh_label(e, "cond.and")
+
+                emit_term(e, InCondBr(VBool(true), next_l, fail_l))
+                emit_label(e, next_l)
+end gen_cond
+
+// -- the loops ------------------------------------------------------------------------------------
+
+gen_while(e: *Emit, cond: Buf[TCondTerm], body: Buf[TStmt], else_block: Option[TBlock],
+          ty: Type) -> Val
+    val cond_l = fresh_label(e, "while.cond")
+    val body_l = fresh_label(e, "while.body")
+    val end_l = fresh_label(e, "while.end")
+    val else_l = if else_block.is_some() then fresh_label(e, "while.else") else end_l
+    val slot = result_slot(e, ty)
+
+    e.loops.push(GenLoop(end_l, cond_l, slot, !no_value(ty)))
+    emit_term(e, InBr(cond_l))
+    emit_label(e, cond_l)
+    gen_cond(e, cond, body_l, else_l)
+    gen_stmts(e, body)
+    emit_term(e, InBr(cond_l))
+    e.loops.pop()
+    gen_loop_result(e, slot, ty, else_l, end_l, else_block)
+end gen_while
+
+// The post-test loop, which is the same shape entered one label later: the entry branch goes to the
+// body rather than to the test, and `continue` targets the **test**.
+gen_do_while(e: *Emit, body: Buf[TStmt], cond: TExpr, else_block: Option[TBlock], ty: Type) -> Val
+    val body_l = fresh_label(e, "dowhile.body")
+    val cond_l = fresh_label(e, "dowhile.cond")
+    val end_l = fresh_label(e, "dowhile.end")
+    val else_l = if else_block.is_some() then fresh_label(e, "dowhile.else") else end_l
+    val slot = result_slot(e, ty)
+
+    e.loops.push(GenLoop(end_l, cond_l, slot, !no_value(ty)))
+    emit_term(e, InBr(body_l))
+    emit_label(e, body_l)
+    gen_stmts(e, body)
+    emit_term(e, InBr(cond_l))
+    emit_label(e, cond_l)
+
+    val v = gen_expr(e, cond)
+
+    emit_term(e, InCondBr(v, body_l, else_l))
+    e.loops.pop()
+    gen_loop_result(e, slot, ty, else_l, end_l, else_block)
+end gen_do_while
+
+// The same shape with the test gone: the body branches straight back to itself, and the end is
+// reached only by a `break`.
+gen_loop(e: *Emit, body: Buf[TStmt], ty: Type) -> Val
+    val body_l = fresh_label(e, "loop.body")
+    val end_l = fresh_label(e, "loop.end")
+    val slot = result_slot(e, ty)
+
+    e.loops.push(GenLoop(end_l, body_l, slot, !no_value(ty)))
+    emit_term(e, InBr(body_l))
+    emit_label(e, body_l)
+    gen_stmts(e, body)
+    emit_term(e, InBr(body_l))
+    e.loops.pop()
+    gen_loop_result(e, slot, ty, end_l, end_l, None)
+end gen_loop
+
+// The counted loop.
+//
+// **An inclusive one stops at its bound rather than stepping past it**, and that is not a nicety: at
+// `250u8..255u8` the increment wraps to zero and `0 <= 255` starts the walk again, so the loop never
+// ends. There is no value one greater than the last one to test against.
+gen_for(e: *Emit, name: string, var_ty: Type, lo: TExpr, hi: TExpr, inclusive: bool,
+        body: Buf[TStmt], else_block: Option[TBlock], ty: Type) -> Val
+    val w = lty(e, var_ty)
+    val lo_v = gen_expr(e, lo)
+    val hi_v = gen_expr(e, hi)
+    val cond_l = fresh_label(e, "for.cond")
+    val body_l = fresh_label(e, "for.body")
+    val step_l = fresh_label(e, "for.step")
+    val end_l = fresh_label(e, "for.end")
+    val else_l = if else_block.is_some() then fresh_label(e, "for.else") else end_l
+    val slot = result_slot(e, ty)
+
+    alloca(e, VReg(s"$name.addr"), w)
+    emit(e, InStore(w, lo_v, VReg(s"$name.addr"), AccPlain, None))
+    e.loops.push(GenLoop(end_l, step_l, slot, !no_value(ty)))
+    emit_term(e, InBr(cond_l))
+    emit_label(e, cond_l)
+
+    val iv = fresh_reg(e)
+
+    emit(e, InLoad(iv, w, VReg(s"$name.addr"), AccPlain, None))
+
+    val cmp = fresh_reg(e)
+
+    emit(e, InIntCmp(cmp, int_pred(e, if inclusive then "<=" else "<", underlying(var_ty)), w, iv,
+                     hi_v))
+    emit_term(e, InCondBr(cmp, body_l, else_l))
+    emit_label(e, body_l)
+    gen_stmts(e, body)
+    emit_term(e, InBr(step_l))
+    emit_label(e, step_l)
+
+    val cur = fresh_reg(e)
+
+    emit(e, InLoad(cur, w, VReg(s"$name.addr"), AccPlain, None))
+
+    if inclusive
+        val done = fresh_reg(e)
+        val more = fresh_label(e, "for.more")
+
+        emit(e, InIntCmp(done, int_pred(e, "==", underlying(var_ty)), w, cur, hi_v))
+        emit_term(e, InCondBr(done, else_l, more))
+        emit_label(e, more)
+
+    val nxt = fresh_reg(e)
+
+    emit(e, InBin(nxt, OpAdd, w, cur, VInt(from_int(1))))
+    emit(e, InStore(w, nxt, VReg(s"$name.addr"), AccPlain, None))
+    emit_term(e, InBr(cond_l))
+    e.loops.pop()
+    gen_loop_result(e, slot, ty, else_l, end_l, else_block)
+end gen_for
+
+// The three-clause loop: the counted loop's shape with both fixed parts opened up. `continue`
+// targets the **step** block, which is the whole point of the form.
+gen_cfor(e: *Emit, init: Buf[TStmt], cond: Option[TExpr], step: Buf[TStmt], body: Buf[TStmt],
+         else_block: Option[TBlock], ty: Type) -> Val
+    val cond_l = fresh_label(e, "cfor.cond")
+    val body_l = fresh_label(e, "cfor.body")
+    val step_l = fresh_label(e, "cfor.step")
+    val end_l = fresh_label(e, "cfor.end")
+    val else_l = if else_block.is_some() then fresh_label(e, "cfor.else") else end_l
+    val slot = result_slot(e, ty)
+
+    gen_stmts(e, init)
+    e.loops.push(GenLoop(end_l, step_l, slot, !no_value(ty)))
+    emit_term(e, InBr(cond_l))
+    emit_label(e, cond_l)
+
+    cond match
+        Some(c) ->
+            val v = gen_expr(e, c)
+
+            emit_term(e, InCondBr(v, body_l, else_l))
+        None -> emit_term(e, InBr(body_l))
+
+    emit_label(e, body_l)
+    gen_stmts(e, body)
+    emit_term(e, InBr(step_l))
+    emit_label(e, step_l)
+    gen_stmts(e, step)
+    emit_term(e, InBr(cond_l))
+    e.loops.pop()
+    gen_loop_result(e, slot, ty, if cond.is_some() then else_l else end_l, end_l, else_block)
+end gen_cfor
+
+private gen_loop_result(e: *Emit, slot: Val, ty: Type, else_l: string, end_l: string,
+                        else_block: Option[TBlock]) -> Val
+    else_block match
+        Some(eb) ->
+            emit_label(e, else_l)
+
+            if no_value(ty) then gen_block_void(e, eb) else store_block_value(e, eb, ty, slot)
+
+            emit_term(e, InBr(end_l))
+        None -> ()
+
+    emit_label(e, end_l)
+    ends_nowhere(e, ty)
+    load_result(e, slot, ty)
+end gen_loop_result
+
+// -- blocks -----------------------------------------------------------------------------------------
+
+gen_block_void(e: *Emit, b: TBlock)
+    gen_stmts(e, b.stmts)
+
+    b.result match
+        Some(r) -> gen_expr(e, r)
+        None -> ()
+end gen_block_void
+
+gen_block_value(e: *Emit, b: TBlock) -> Val
+    gen_stmts(e, b.stmts)
+
+    b.result match
+        Some(r) -> gen_expr(e, r)
+        None -> VNothing
+end gen_block_value
+
+gen_stmts(e: *Emit, xs: Buf[TStmt])
+    for i in 0..<xs.len()
+        gen_stmt(e, xs.at(i))
+end gen_stmts

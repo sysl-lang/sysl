@@ -1,0 +1,476 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, add, cmp, from_int, mul, negate, pow, sub}
+
+// Arithmetic, comparison, and the conversions between scalar widths.
+//
+// Two things run through all of it. The first is that a **constrained** type is laid out as its base
+// and computes as its base -- the subtype names a set of values, not a second way to add -- so
+// `a += e` and `a = a + e` reach the same instruction by different routes and must agree about it.
+//
+// The second is that overflow checking is **opt-in and narrow**. Arithmetic on raw integers is
+// defined to wrap, so the checked form is in play only when an operand came through a ranged
+// (`within`) type, and only then when the exact interval the operands allow can fall outside the
+// base width.
+
+// The names LLVM reserves that a scalar lowering writes down.
+llvm_trap() -> string = "llvm.trap"
+
+// The overflow-detecting form of one operator, at one width. The width is in the **name** as well as
+// the signature, so naming the wrong overload is a call to a function that does not exist.
+llvm_with_overflow(op: string, signed: bool, ty: LType) -> string =
+    s"llvm.${if signed then "s" else "u"}$op.with.overflow.${overload_of(ty)}"
+
+private overload_of(t: LType) -> string = l_overload_suffix(t) match
+    Some(s) -> s
+    None -> l_render(t)
+
+// -- stopping the program ------------------------------------------------------------------------
+
+// Traps unless `ok` holds. The stop has no message: what the check was is in the source line, which
+// is more than anything emitted here could say.
+trap_unless(e: *Emit, ok: Val, what: string)
+    e.traps = true
+
+    val ok_l = fresh_label(e, s"$what.ok")
+    val bad_l = fresh_label(e, s"$what.bad")
+
+    emit_term(e, InCondBr(ok, ok_l, bad_l))
+    emit_label(e, bad_l)
+    emit(e, ir_call(None, LVoid, VGlobal(llvm_trap()), no_ir_args()))
+    emit_term(e, InUnreachable)
+    emit_label(e, ok_l)
+end trap_unless
+
+// -- what an operator becomes ---------------------------------------------------------------------
+
+// One binary operation over two values the caller is holding.
+//
+// A **vector** picks its instruction from the lane and emits at the whole register: LLVM spells both
+// widths of the word with one mnemonic, so lane-wise arithmetic needs no operation of its own, only
+// the type it is written at.
+arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val) -> Val
+    val lane = underlying(ty) match
+        Vector(_, elem) -> underlying(*elem)
+        other -> other
+
+    val ety = lty(e, ty)
+
+    val instr = lane match
+        Integer(_, signed, _) -> int_instr(e, op, signed)
+        Char -> int_instr(e, op, false)
+        Bool -> op match
+            "&" -> OpAnd
+            "|" -> OpOr
+            "^" -> OpXor
+            _ ->
+                gap_here(e, s"mask arith '$op'")
+                OpAnd
+        Floating(_) -> op match
+            "+" -> OpFAdd
+            "-" -> OpFSub
+            "*" -> OpFMul
+            "/" -> OpFDiv
+            _ ->
+                gap_here(e, s"float arith '$op'")
+                OpFAdd
+        other ->
+            gap_here(e, s"arith on ${type_show(other)}")
+            OpAdd
+
+    // Integer division and remainder have two inputs LLVM leaves undefined and would miscompile: a
+    // zero divisor always, and -- for signed operands -- the minimum by -1, whose true quotient
+    // overflows the width. A zero divisor traps; signed `/` traps on that overflow; signed `%`
+    // returns its defined zero by dividing by 1 in the one case -1 would leave undefined.
+    var divisor = rv
+
+    underlying(ty) match
+        Integer(bits, signed, _) ->
+            if op == "/" || op == "%"
+                val nz = fresh_reg(e)
+
+                emit(e, InIntCmp(nz, INe, ety, rv, VInt(from_int(0))))
+                trap_unless(e, nz, "div")
+
+                if signed
+                    val neg1 = fresh_reg(e)
+
+                    emit(e, InIntCmp(neg1, IEq, ety, rv, VInt(from_int(-1))))
+
+                    if op == "/"
+                        val min = negate(pow(from_int(2), usize(bits - 1)))
+                        val is_min = fresh_reg(e)
+
+                        emit(e, InIntCmp(is_min, IEq, ety, lv, VInt(min)))
+
+                        val ovf = fresh_reg(e)
+
+                        emit(e, InBin(ovf, OpAnd, l_i1(), is_min, neg1))
+
+                        val ok = fresh_reg(e)
+
+                        emit(e, InBin(ok, OpXor, l_i1(), ovf, VBool(true)))
+                        trap_unless(e, ok, "overflow")
+                    else
+                        val safe = fresh_reg(e)
+
+                        emit(e, InSelect(safe, neg1, ety, VInt(from_int(1)), rv, l_i1()))
+                        divisor = safe
+        _ -> ()
+
+    // A shift amount at or past the operand's width is undefined on every machine instruction this
+    // lowers to, and LLVM propagates that as poison rather than as a number.
+    lane match
+        Integer(bits, _, _) ->
+            if op == "<<" || op == ">>" then return bounded_shift(e, ty, bits, instr, lv, divisor)
+        _ -> ()
+
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, instr, ety, lv, divisor))
+    r
+end arith
+
+private int_instr(e: *Emit, op: string, signed: bool) -> BinOp = op match
+    "+" -> OpAdd
+    "-" -> OpSub
+    "*" -> OpMul
+    "/" -> if signed then OpSDiv else OpUDiv
+    "%" -> if signed then OpSRem else OpURem
+    "<<" -> OpShl
+    ">>" -> if signed then OpAShr else OpLShr
+    "&" -> OpAnd
+    "|" -> OpOr
+    "^" -> OpXor
+    _ ->
+        gap_here(e, s"arith '$op'")
+        OpAdd
+
+// A shift whose amount may be anything, lowered so that every amount means something.
+//
+// **Shifting a value by its own width or more answers what shifting it all the way answers**: zero
+// for `<<` and for an unsigned `>>`, and the sign for a signed one. The amount is clamped rather
+// than the shift being emitted and thrown away, so no poison is built at all.
+bounded_shift(e: *Emit, ty: Type, bits: int, instr: BinOp, lv: Val, amt: Val) -> Val
+    val ety = lty(e, ty)
+
+    val cond_ty = underlying(ty) match
+        Vector(n, _) -> LVec(n, l_i1())
+        _ -> l_i1()
+
+    val width = constant_at(e, ty, from_int(long(bits)))
+    val highest = constant_at(e, ty, from_int(long(bits - 1)))
+
+    val too_big = fresh_reg(e)
+
+    emit(e, InIntCmp(too_big, IUge, ety, amt, width))
+
+    val safe = fresh_reg(e)
+
+    emit(e, InSelect(safe, too_big, ety, highest, amt, cond_ty))
+
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, instr, ety, lv, safe))
+
+    // An arithmetic right shift by `width - 1` is already every bit of the sign, so the clamp alone
+    // is the whole of the signed case. The other two have to say zero.
+    if instr == OpAShr then return r
+
+    val out = fresh_reg(e)
+
+    emit(e, InSelect(out, too_big, ety, VZero, r, cond_ty))
+    out
+end bounded_shift
+
+// An integer constant at a type, splat across the lanes where that type is a vector.
+constant_at(e: *Emit, ty: Type, value: BigInt) -> Val = underlying(ty) match
+    Vector(n, elem) ->
+        val vty = lty(e, ty)
+        val one = fresh_reg(e)
+
+        emit(e, InInsertElement(one, vty, VPoison, lty(e, underlying(*elem)), VInt(value),
+                                ir_arg(l_i32(), VInt(from_int(0)))))
+
+        val r = fresh_reg(e)
+
+        emit(e, InShuffle(r, vty, one, VPoison, ir_arg(LVec(n, l_i32()), VZero)))
+        r
+    _ -> VInt(value)
+
+// A shift's count, brought to the shifted value's own width. A **narrower** count is extended; a
+// **wider** one is clamped at the shifted width *before* it is truncated, since truncating first
+// would turn a count of 256 into a count of 0.
+shift_amount(e: *Emit, ty: Type, amt_ty: Type, amt: Val) -> Val = (underlying(ty), underlying(amt_ty)) match
+    (Integer(to_bits, to_signed, _), Integer(from_bits, from_signed, _)) ->
+        if to_bits == from_bits then amt
+        else if from_bits < to_bits then
+            convert_int(e, from_bits, from_signed, to_bits, amt)
+        else
+            val fty = LInt(from_bits)
+            val width = VInt(from_int(long(to_bits)))
+            val too_big = fresh_reg(e)
+
+            emit(e, InIntCmp(too_big, IUge, fty, amt, width))
+
+            val safe = fresh_reg(e)
+
+            emit(e, InSelect(safe, too_big, fty, width, amt, l_i1()))
+            convert_int(e, from_bits, from_signed, to_bits, safe)
+    _ -> amt
+
+// Which cast one integer width to another is: a narrowing truncates, and a widening extends by
+// whatever the source's own signedness says.
+private width_cast(from_bits: int, from_signed: bool, to_bits: int) -> CastOp
+    if to_bits < from_bits then return CastTrunc
+    if from_signed then return CastSExt
+
+    CastZExt
+end width_cast
+
+// One integer width brought to another, sign-extending where the source says so.
+convert_int(e: *Emit, from_bits: int, from_signed: bool, to_bits: int, v: Val) -> Val
+    if from_bits == to_bits then return v
+
+    val r = fresh_reg(e)
+    val op = width_cast(from_bits, from_signed, to_bits)
+
+    emit(e, InCast(r, op, LInt(from_bits), v, LInt(to_bits)))
+    r
+end convert_int
+
+// -- comparison ------------------------------------------------------------------------------------
+
+// The `icmp` predicate for an operator at a type. `char` compares by scalar value, so it uses the
+// unsigned predicates over its `i32` representation.
+int_pred(e: *Emit, op: string, ty: Type) -> ICmp = ty match
+    Bool -> eq_pred(e, op)
+    Ptr(_) -> eq_pred(e, op)
+    Ref(_, _) -> eq_pred(e, op)
+    CFn(_, _) -> eq_pred(e, op)
+    Char -> unsigned_pred(e, op)
+    Integer(_, false, _) -> unsigned_pred(e, op)
+    Integer(_, true, _) -> signed_pred(e, op)
+    other ->
+        gap_here(e, s"compare on ${type_show(other)}")
+        IEq
+
+private eq_pred(e: *Emit, op: string) -> ICmp = op match
+    "==" -> IEq
+    "!=" -> INe
+    _ ->
+        gap_here(e, s"compare '$op'")
+        IEq
+
+private unsigned_pred(e: *Emit, op: string) -> ICmp = op match
+    "==" -> IEq
+    "!=" -> INe
+    "<" -> IUlt
+    ">" -> IUgt
+    "<=" -> IUle
+    ">=" -> IUge
+    _ ->
+        gap_here(e, s"compare '$op'")
+        IEq
+
+private signed_pred(e: *Emit, op: string) -> ICmp = op match
+    "==" -> IEq
+    "!=" -> INe
+    "<" -> ISlt
+    ">" -> ISgt
+    "<=" -> ISle
+    ">=" -> ISge
+    _ ->
+        gap_here(e, s"compare '$op'")
+        IEq
+
+// The `fcmp` predicate. IEEE 754 makes `!=` the negation of `==`, and a `NaN` is equal to nothing
+// including itself -- so `!=` is **unordered** or not equal, not ordered and not equal.
+float_pred(e: *Emit, op: string) -> FCmp = op match
+    "==" -> FOeq
+    "!=" -> FUne
+    "<" -> FOlt
+    ">" -> FOgt
+    "<=" -> FOle
+    ">=" -> FOge
+    _ ->
+        gap_here(e, s"compare '$op'")
+        FOeq
+
+// One comparison over two values the caller is holding.
+//
+// A constrained subtype is laid out as the type it narrows, so it is compared as that one; a
+// **simple** enum is its discriminant, and equality on it is that integer's compare.
+compare_value(e: *Emit, op: string, base: Type, av: Val, bv: Val) -> Val
+    val ty = underlying(base) match
+        Enum(d) -> if d.simple then d.underlying else Enum(d)
+        other -> other
+
+    if ty == Str
+        gap_here(e, "string comparison")
+        return VUndef
+
+    val r = fresh_reg(e)
+
+    ty match
+        Floating(_) -> emit(e, InFloatCmp(r, float_pred(e, op), lty(e, ty), av, bv))
+        Vector(_, _) -> gap_here(e, "vector comparison")
+        _ -> emit(e, InIntCmp(r, int_pred(e, op, ty), lty(e, ty), av, bv))
+
+    r
+end compare_value
+
+// -- the checked forms -------------------------------------------------------------------------------
+
+// A ranged constrained integer -- a `within` type -- is the opt-in that makes arithmetic checked; a
+// predicate-only subtype or a bare `new` derivation bounds no magnitude and does not qualify.
+is_ranged(t: Type) -> bool = t match
+    Constrained(d) ->
+        if d.lo == None && d.hi == None then false
+        else underlying(t) match
+            Integer(_, _, _) -> true
+            _ -> false
+    _ -> false
+
+// Whether an integer `+`/`-`/`*` needs the overflow-detecting form.
+overflow_checked(op: string, l: TExpr, r: TExpr, bits: int, signed: bool) -> bool
+    if op != "+" && op != "-" && op != "*" then return false
+    if !is_ranged(texpr_type(l)) && !is_ranged(texpr_type(r)) then return false
+
+    val a = interval(l, bits, signed)
+    val b = interval(r, bits, signed)
+
+    val bounds = op match
+        "+" -> (add(a.0, b.0), add(a.1, b.1))
+        "-" -> (sub(a.0, b.1), sub(a.1, b.0))
+        _ ->
+            val c1 = mul(a.0, b.0)
+            val c2 = mul(a.0, b.1)
+            val c3 = mul(a.1, b.0)
+            val c4 = mul(a.1, b.1)
+
+            (least(least(c1, c2), least(c3, c4)), most(most(c1, c2), most(c3, c4)))
+
+    cmp(bounds.0, base_min(bits, signed)) < 0 || cmp(bounds.1, base_max(bits, signed)) > 0
+end overflow_checked
+
+private least(a: BigInt, b: BigInt) -> BigInt = if cmp(a, b) <= 0 then a else b
+private most(a: BigInt, b: BigInt) -> BigInt = if cmp(a, b) >= 0 then a else b
+
+// The exact value interval an operand can hold: a literal is its own value; a ranged type is its
+// declared bounds (`..<` excludes the top); anything else spans the whole base width.
+private interval(x: TExpr, bits: int, signed: bool) -> (BigInt, BigInt) = *x.kind match
+    TIntLit(v, _) -> (v, v)
+    _ -> texpr_type(x) match
+        Constrained(d) ->
+            if !is_ranged(texpr_type(x)) then (base_min(bits, signed), base_max(bits, signed))
+            else
+                val lo = d.lo match
+                    Some(v) -> decimal_int(v)
+                    None -> base_min(bits, signed)
+
+                val hi = d.hi match
+                    Some(v) ->
+                        val n = decimal_int(v)
+
+                        if d.exclusive_hi then sub(n, from_int(1)) else n
+                    None -> base_max(bits, signed)
+
+                (lo, hi)
+        _ -> (base_min(bits, signed), base_max(bits, signed))
+
+base_min(bits: int, signed: bool) -> BigInt =
+    if signed then negate(pow(from_int(2), usize(bits - 1))) else from_int(0)
+
+base_max(bits: int, signed: bool) -> BigInt =
+    if signed then sub(pow(from_int(2), usize(bits - 1)), from_int(1))
+    else sub(pow(from_int(2), usize(bits)), from_int(1))
+
+// Integer `+`, `-`, `*` where the operands' declared ranges allow a result the base width cannot
+// hold, so a plain instruction would wrap before the range check at the produce site could see it.
+checked_arith(e: *Emit, op: string, bits: int, signed: bool, lv: Val, rv: Val) -> Val
+    val name = op match
+        "+" -> "add"
+        "-" -> "sub"
+        _ -> "mul"
+
+    val ity = LInt(bits)
+    val fn = llvm_with_overflow(name, signed, ity)
+
+    var pair_fields: Buf[LType] = buf()
+
+    pair_fields.push(ity)
+    pair_fields.push(l_i1())
+
+    val both = LStruct(pair_fields)
+
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(ity))
+    params.push(ir_param(ity))
+    request_intrinsic(e, ir_sig(fn, ir_fn_type(both, params)))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(ity, lv))
+    args.push(ir_arg(ity, rv))
+
+    val pair = fresh_reg(e)
+
+    emit(e, ir_call(Some(pair), both, VGlobal(fn), args))
+
+    val v = fresh_reg(e)
+
+    emit(e, InExtract(v, both, pair, one_index(0)))
+
+    val ovf = fresh_reg(e)
+
+    emit(e, InExtract(ovf, both, pair, one_index(1)))
+
+    val ok = fresh_reg(e)
+
+    emit(e, InBin(ok, OpXor, l_i1(), ovf, VBool(true)))
+    trap_unless(e, ok, "overflow")
+    v
+end checked_arith
+
+private one_index(n: int) -> Buf[int]
+    var out: Buf[int] = buf()
+
+    out.push(n)
+    out
+end one_index
+
+// A left shift of a value produced through a ranged type. There is no overflow intrinsic for a
+// shift, so the check is direct: the amount must be below the width, and shifting the result back
+// must recover the value, since a bit pushed out of the top is exactly the overflow.
+checked_shl(e: *Emit, bits: int, signed: bool, lv: Val, sh: Val) -> Val
+    val ity = LInt(bits)
+    val amt_ok = fresh_reg(e)
+
+    emit(e, InIntCmp(amt_ok, IUlt, ity, sh, VInt(from_int(long(bits)))))
+    trap_unless(e, amt_ok, "overflow")
+
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, OpShl, ity, lv, sh))
+
+    val back = fresh_reg(e)
+
+    emit(e, InBin(back, if signed then OpAShr else OpLShr, ity, r, sh))
+
+    val ok = fresh_reg(e)
+
+    emit(e, InIntCmp(ok, IEq, ity, back, lv))
+    trap_unless(e, ok, "overflow")
+    r
+end checked_shl
+
+// Declares an intrinsic once, under the overload-mangled name that carries its width.
+request_intrinsic(e: *Emit, sig: IrFuncSig)
+    for i in 0..<e.sat_decls.len()
+        if e.sat_decls.at(i).name == sig.name then return
+
+    e.sat_decls.push(sig)
+end request_intrinsic

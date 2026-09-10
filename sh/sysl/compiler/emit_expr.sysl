@@ -1,0 +1,689 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, sub as big_sub}
+import sysl.math.decimal.{Decimal, rescale, Rounding}
+
+// **One expression, lowered.** The register or immediate holding its value comes back; whatever it
+// had to do to get there has been emitted into the block that is open.
+//
+// A form nothing here lowers yet records a gap and answers `undef`, and the function it was reached
+// from is left out of the module altogether -- so a partial lowering is a smaller module rather than
+// a different one.
+
+gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
+    TIntLit(v, _) -> VInt(v)
+    TBoolLit(b) -> VInt(from_int(if b then 1 else 0))
+    TUnitLit -> VNothing
+    TNullLit(ty) -> zero_of(e, ty)
+    TZero(ty) -> zero_of(e, ty)
+    TCStrLit(s) -> string_global(e, s)
+
+    // A float constant is the `double` bit pattern whatever the type is, so a narrower one is that
+    // constant rounded down to it -- which costs nothing at run time.
+    TFloatLit(bits, ty) ->
+        if ty == real_type() then VFloat(bits)
+        else
+            val r = fresh_reg(e)
+
+            emit(e, InCast(r, CastFPTrunc, LFloat(64), VFloat(bits), lty(e, ty)))
+            r
+
+    // A constrained operand converts from its base representation.
+    TCast(operand, ty) -> convert(e, underlying(texpr_type(operand)), ty, gen_expr(e, operand))
+
+    // Nothing is stored for a zero-sized binding, so there is nothing to read back.
+    TLoad(name, ty) ->
+        if zero_sized(ty) then return VNothing
+
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, ty), VReg(s"$name.addr"), access_of(ty), None))
+        r
+
+    TOld(index, ty) ->
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, ty), VReg(s"old.$index.addr"), AccPlain, None))
+        r
+
+    TGlobal(symbol, ty, _) ->
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, ty), VGlobal(symbol), access_of(ty), None))
+        r
+
+    TDeref(operand, ty) ->
+        val p = payload_addr(e, operand)
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, ty), p, place_access(x), None))
+        r
+
+    TAddrOf(place, _) -> address(e, place)
+
+    TField(receiver, index, ty) -> gen_field(e, receiver, index, ty)
+
+    TIndex(receiver, index, ty) ->
+        val p = element_addr(e, receiver, index)
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, ty), p, access_of(ty), None))
+        r
+
+    TLen(receiver, _) -> gen_len(e, receiver)
+
+    TSeq(exprs) ->
+        for i in 0..<exprs.len()
+            gen_expr(e, exprs.at(i))
+
+        VNothing
+
+    TBinary(op, l, r, ty) -> gen_binary(e, op, l, r, ty)
+    TUnary(op, operand, ty) -> gen_unary(e, op, operand, ty)
+    TLogical(op, l, r) -> gen_logical(e, op, l, r)
+    TCompare(operands, cmps) -> gen_compare(e, operands, cmps)
+
+    TStore(place, value, ty) -> gen_store(e, place, value, ty)
+    TUpdate(place, op, value, ty, dispatch, check) ->
+        gen_update(e, place, op, value, ty, dispatch, check)
+    TIncDec(place, op, pre, ty, check) -> gen_inc_dec(e, place, op, pre, ty, check)
+
+    TCall(name, args, ty, _) -> gen_call(e, name, args, ty)
+    TFuncAddr(_, entry, _) -> VGlobal(symbol_of(e, entry))
+
+    TBlockExpr(b) ->
+        if zero_sized(b.ty)
+            gen_block_void(e, b)
+            VNothing
+        else gen_block_value(e, b)
+
+    TIf(cond, then_block, else_block, ty) -> gen_if(e, cond, then_block, else_block, ty)
+    TWhile(cond, body, else_block, ty) -> gen_while(e, cond, body, else_block, ty)
+    TLoop(body, ty) -> gen_loop(e, body, ty)
+    TFor(name, var_ty, lo, hi, inclusive, body, else_block, ty) ->
+        gen_for(e, name, var_ty, lo, hi, inclusive, body, else_block, ty)
+    TCFor(init, cond, step, body, else_block, ty) ->
+        gen_cfor(e, init, cond, step, body, else_block, ty)
+    TDoWhile(body, cond, else_block, ty) -> gen_do_while(e, body, cond, else_block, ty)
+
+    TConstrainedCheck(value, target) ->
+        val v = gen_expr(e, value)
+
+        emit_constraint_checks(e, v, target)
+        v
+
+    TConstrainedValid(value, c) -> gen_constrained_valid(e, value, c)
+    TConstrainedStep(value, c, up, _) -> gen_constrained_step(e, value, c, up)
+
+    TEnumNew(enum_ty, variant, args) -> gen_enum_new(e, enum_ty, variant, args)
+    TEnumFromInt(value, en) -> gen_expr(e, value)
+
+    _ -> gap_at(e, texpr_kind_name(x))
+
+// A field read: through the value where the receiver is one, and through an address where the
+// storage is a device register that a whole-block load would be the wrong access to.
+private gen_field(e: *Emit, receiver: TExpr, index: int, ty: Type) -> Val
+    if zero_sized(ty) then return VNothing
+
+    val rty = texpr_type(receiver)
+
+    bitfield_ranges_of(rty) match
+        Some(ranges) ->
+            val s = underlying(rty) match
+                Struct(d) -> d.slot(usize(index))
+                _ -> usize(index)
+
+            val c = fresh_reg(e)
+
+            if volatile_in(rty) || has_address(receiver)
+                emit(e, InLoad(c, container_lty(ranges), address(e, receiver), access_of(rty), None))
+                return read_bits(e, ranges, ranges.at(s), c)
+
+            return read_bits(e, ranges, ranges.at(s), gen_expr(e, receiver))
+        None -> ()
+
+    if volatile_in(rty) && has_address(receiver)
+        val p = address(e, receiver)
+        val f = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(field_slot_of(rty, index))))))
+        emit(e, InGep(f, lty(e, rty), p, idx))
+
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, ty), f, access_of(rty), None))
+        return r
+
+    val v = gen_expr(e, receiver)
+    val r = fresh_reg(e)
+
+    emit(e, InExtract(r, lty(e, rty), v, index_list(int(field_slot_of(rty, index)))))
+    r
+end gen_field
+
+// Whether a node names storage rather than a value, which is what says `address` can walk to it.
+has_address(x: TExpr) -> bool = *x.kind match
+    TLoad(_, _) -> true
+    TGlobal(_, _, _) -> true
+    TDeref(_, _) -> true
+    TField(receiver, _, _) -> has_address(receiver)
+    TIndex(_, _, _) -> true
+    _ -> false
+
+// How many elements something has. An array's length is its type's, so the receiver is evaluated for
+// its effects and the constant answered.
+private gen_len(e: *Emit, receiver: TExpr) -> Val = underlying(texpr_type(receiver)) match
+    Array(n, _) ->
+        gen_expr(e, receiver)
+        VInt(from_int(long(n)))
+    Slice(_, _) -> view_len(e, receiver)
+    Str -> view_len(e, receiver)
+    other -> gap_at(e, s"length of ${type_show(other)}")
+
+private view_len(e: *Emit, receiver: TExpr) -> Val
+    val wty = lty(e, texpr_type(receiver))
+    val v = gen_expr(e, receiver)
+    val r = fresh_reg(e)
+
+    emit(e, InExtract(r, wty, v, index_list(2)))
+    r
+end view_len
+
+// -- arithmetic ---------------------------------------------------------------------------------
+
+private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type) -> Val
+    if underlying(ty) == Str then return gap_at(e, "string concatenation")
+
+    val lt = underlying(texpr_type(l))
+
+    lt match
+        Ptr(_) ->
+            if op == "-" then return gen_ptr_diff(e, l, r, lt)
+        _ -> ()
+
+    val bt = lt
+    val lv = gen_expr(e, l)
+    val rv0 = gen_expr(e, r)
+
+    // A shift's count may be any integer width, so it is brought to the shifted value's own here:
+    // every instruction below takes two operands of one type.
+    val rv = if op == "<<" || op == ">>" then shift_amount(e, bt, texpr_type(r), rv0) else rv0
+
+    bt match
+        Integer(bits, signed, _) ->
+            if op == "<<" && is_ranged(texpr_type(l)) then return checked_shl(e, bits, signed, lv, rv)
+            if overflow_checked(op, l, r, bits, signed) then return checked_arith(e, op, bits, signed, lv, rv)
+        _ -> ()
+
+    arith(e, op, bt, lv, rv)
+end gen_binary
+
+// `p - q`, C's `ptrdiff_t`. The bytes between the two addresses, divided by the pointee's size so
+// the answer counts elements. The divide is skipped for a one-byte pointee.
+private gen_ptr_diff(e: *Emit, l: TExpr, r: TExpr, lt: Type) -> Val
+    val stride = lt match
+        Ptr(inner) -> e.layout.size(*inner)
+        _ -> usize(1)
+
+    val ity = LInt(e.word_bits)
+    val lv = gen_expr(e, l)
+    val rv = gen_expr(e, r)
+    val la = fresh_reg(e)
+
+    emit(e, InCast(la, CastPtrToInt, LPtr, lv, ity))
+
+    val ra = fresh_reg(e)
+
+    emit(e, InCast(ra, CastPtrToInt, LPtr, rv, ity))
+
+    val bytes = fresh_reg(e)
+
+    emit(e, InBin(bytes, OpSub, ity, la, ra))
+
+    if stride <= 1 then return bytes
+
+    val n = fresh_reg(e)
+
+    emit(e, InBin(n, OpSDiv, ity, bytes, VInt(from_int(long(stride)))))
+    n
+end gen_ptr_diff
+
+private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type) -> Val
+    val v = gen_expr(e, operand)
+    val ety = lty(e, ty)
+    val r = fresh_reg(e)
+
+    if op == "!"
+        emit(e, InBin(r, OpXor, l_i1(), v, VBool(true)))
+        return r
+
+    if op == "~"
+        underlying(ty) match
+            Vector(_, elem) ->
+                emit(e, InBin(r, OpXor, ety, v, VSplat(lty(e, underlying(*elem)), VInt(from_int(-1)))))
+            _ -> emit(e, InBin(r, OpXor, ety, v, VInt(from_int(-1))))
+
+        return r
+
+    if op == "-"
+        vector_lane_of(ty) match
+            Integer(_, _, _) ->
+                underlying(ty) match
+                    Vector(_, _) -> emit(e, InBin(r, OpSub, ety, VZero, v))
+                    _ -> emit(e, InBin(r, OpSub, ety, VInt(from_int(0)), v))
+            Floating(_) -> emit(e, InNeg(r, ety, v))
+            other -> gap_here(e, s"negation of ${type_show(other)}")
+
+        return r
+
+    gap_at(e, s"unary '$op'")
+end gen_unary
+
+// The lane a vector's operation is chosen from, or the type itself where it is not one.
+vector_lane_of(t: Type) -> Type = underlying(t) match
+    Vector(_, elem) -> underlying(*elem)
+    other -> other
+
+// `&&` and `||`, which do not evaluate their right operand unless they must.
+private gen_logical(e: *Emit, op: string, l: TExpr, r: TExpr) -> Val
+    val lv = gen_expr(e, l)
+    val slot = alloca(e, fresh_reg(e), l_i1())
+
+    emit(e, InStore(l_i1(), lv, slot, AccPlain, None))
+
+    val rhs_l = fresh_label(e, "sc.rhs")
+    val end_l = fresh_label(e, "sc.end")
+
+    if op == "&&" then emit_term(e, InCondBr(lv, rhs_l, end_l))
+    else emit_term(e, InCondBr(lv, end_l, rhs_l))
+
+    emit_label(e, rhs_l)
+
+    val rv = gen_expr(e, r)
+
+    emit(e, InStore(l_i1(), rv, slot, AccPlain, None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, end_l)
+
+    val res = fresh_reg(e)
+
+    emit(e, InLoad(res, l_i1(), slot, AccPlain, None))
+    res
+end gen_logical
+
+// One comparison has nothing to short-circuit, so it stays straight-line -- which is what the
+// overwhelming majority of comparisons are. A **chain** stops at the first comparison that fails,
+// with each operand still evaluated exactly once.
+private gen_compare(e: *Emit, operands: Buf[TExpr], cmps: Buf[TCmp]) -> Val
+    if cmps.len() == 1
+        val lv = gen_expr(e, operands.at(0))
+
+        return comparison(e, cmps.at(0), texpr_type(operands.at(0)), lv, gen_expr(e, operands.at(1)))
+
+    val slot = alloca(e, fresh_reg(e), l_i1())
+
+    var exits: Buf[string] = buf()
+
+    for k in 0..<cmps.len()
+        exits.push(fresh_label(e, "cmp.exit"))
+
+    val end_l = fresh_label(e, "cmp.end")
+
+    var left: Val = VNothing
+
+    for k in 0..<cmps.len()
+        if k == 0 then left = gen_expr(e, operands.at(0))
+
+        val right = gen_expr(e, operands.at(k + 1))
+        val c = comparison(e, cmps.at(k), texpr_type(operands.at(k)), left, right)
+
+        emit(e, InStore(l_i1(), c, slot, AccPlain, None))
+
+        if k == cmps.len() - 1 then emit_term(e, InBr(exits.at(k)))
+        else
+            val next_l = fresh_label(e, "cmp.next")
+
+            emit_term(e, InCondBr(c, next_l, exits.at(k)))
+            emit_label(e, next_l)
+
+        left = right
+
+    for j in 0..<cmps.len()
+        val k = cmps.len() - 1 - j
+
+        emit_label(e, exits.at(k))
+        emit_term(e, InBr(if k == 0 then end_l else exits.at(k - 1)))
+
+    emit_label(e, end_l)
+
+    val res = fresh_reg(e)
+
+    emit(e, InLoad(res, l_i1(), slot, AccPlain, None))
+    res
+end gen_compare
+
+// One comparison over two values the caller is holding: an instruction where the operand type has
+// one, the method its `Eq`/`Ord` supplies otherwise.
+comparison(e: *Emit, c: TCmp, ty: Type, av: Val, bv: Val) -> Val = c.dispatch match
+    Some(_) -> gap_at(e, "a comparison through a trait method")
+    None -> compare_value(e, c.op, underlying(ty), av, bv)
+
+// -- writing --------------------------------------------------------------------------------------
+
+private gen_store(e: *Emit, place: TExpr, value: TExpr, ty: Type) -> Val
+    if zero_sized(ty)
+        gen_expr(e, value)
+        return VNothing
+
+    val p = place_addr(e, place)
+    val v = gen_expr(e, value)
+
+    store_place(e, place, p, v)
+    v
+end gen_store
+
+private gen_update(e: *Emit, place: TExpr, op: string, value: TExpr, ty: Type,
+                   dispatch: Option[TDispatch], check: Option[Type]) -> Val
+    if dispatch.is_some() then return gap_at(e, "a compound assignment through a trait method")
+    if underlying(ty) == Str then return gap_at(e, "a string compound assignment")
+
+    val p = place_addr(e, place)
+    val cur = load_place(e, place, p)
+    val v = gen_expr(e, value)
+    val updated = combine(e, op, ty, texpr_type(value), cur, v)
+
+    check match
+        Some(c) -> emit_constraint_checks(e, updated, c)
+        None -> ()
+
+    store_place(e, place, p, updated)
+    updated
+end gen_update
+
+private gen_inc_dec(e: *Emit, place: TExpr, op: string, pre: bool, ty: Type,
+                    check: Option[Type]) -> Val
+    val p = place_addr(e, place)
+    val cur = load_place(e, place, p)
+    val one = VInt(from_int(1))
+    val updated = combine(e, if op == "++" then "+=" else "-=", ty, underlying(ty), cur, one)
+
+    check match
+        Some(c) -> emit_constraint_checks(e, updated, c)
+        None -> ()
+
+    store_place(e, place, p, updated)
+    if pre then updated else cur
+end gen_inc_dec
+
+// What a compound assignment stores: what its operator makes of the place's current value and the
+// value on the right. A constrained slot is arithmetic at the type it is laid out as, and it detects
+// overflow on the same terms, so `a += e` computes what `a = a + e` computes.
+combine(e: *Emit, op: string, ty: Type, value_ty: Type, cur: Val, v: Val) -> Val
+    val bin = op[0..<(op.bytes.len - 1)]
+    val bt = underlying(ty)
+    val rv = if bin == "<<" || bin == ">>" then shift_amount(e, bt, value_ty, v) else v
+
+    bt match
+        Integer(bits, signed, _) ->
+            if bin == "<<" && is_ranged(ty) then return checked_shl(e, bits, signed, cur, rv)
+
+            if (bin == "+" || bin == "-" || bin == "*") && is_ranged(ty)
+                return checked_arith(e, bin, bits, signed, cur, rv)
+        _ -> ()
+
+    arith(e, bin, bt, cur, rv)
+end combine
+
+// -- what a constrained subtype asks of its values -------------------------------------------------
+
+// Everything a constrained subtype asks of a value: the `within` range, then the `where` predicate
+// -- a synthesised `i1`-returning function over the base value, which traps exactly as the range
+// does when it answers false.
+emit_constraint_checks(e: *Emit, v: Val, c: Type)
+    c match
+        Constrained(d) ->
+            val base = underlying(d.base)
+
+            base match
+                Floating(_) ->
+                    if d.lo != None || d.hi != None then gap_here(e, "a float range check")
+                _ ->
+                    d.lo match
+                        Some(lo) ->
+                            trap_unless(e, compare_value(e, ">=", base, v, VInt(decimal_int(lo))),
+                                        "within")
+                        None -> ()
+
+                    d.hi match
+                        Some(hi) ->
+                            val op = if d.exclusive_hi then "<" else "<="
+
+                            trap_unless(e, compare_value(e, op, base, v, VInt(decimal_int(hi))),
+                                        "within")
+                        None -> ()
+
+            d.pred_fn match
+                Some(pf) ->
+                    val r = fresh_reg(e)
+
+                    var args: Buf[IrArg] = buf()
+
+                    args.push(ir_arg(lty(e, base), v))
+                    emit(e, ir_call(Some(r), l_i1(), VGlobal(pf), args))
+                    trap_unless(e, r, "where")
+                None -> ()
+        _ -> ()
+end emit_constraint_checks
+
+private gen_constrained_valid(e: *Emit, value: TExpr, c: Type) -> Val
+    val v = gen_expr(e, value)
+
+    c match
+        Constrained(d) ->
+            val base = underlying(d.base)
+            val lo = d.lo match
+                Some(x) -> decimal_int(x)
+                None -> from_int(0)
+            val hi = d.hi match
+                Some(x) -> decimal_int(x)
+                None -> from_int(0)
+
+            val ge_lo = compare_value(e, ">=", base, v, VInt(lo))
+            val le_hi = compare_value(e, if d.exclusive_hi then "<" else "<=", base, v, VInt(hi))
+            val r = fresh_reg(e)
+
+            emit(e, InBin(r, OpAnd, l_i1(), ge_lo, le_hi))
+            r
+        _ -> VBool(true)
+end gen_constrained_valid
+
+private gen_constrained_step(e: *Emit, value: TExpr, c: Type, up: bool) -> Val
+    val v = gen_expr(e, value)
+
+    c match
+        Constrained(d) ->
+            val base = underlying(d.base)
+
+            if up
+                val h = d.hi match
+                    Some(x) -> decimal_int(x)
+                    None -> from_int(0)
+                val last = if d.exclusive_hi then big_sub(h, from_int(1)) else h
+
+                trap_unless(e, compare_value(e, "<", base, v, VInt(last)), "succ")
+            else
+                val first = d.lo match
+                    Some(x) -> decimal_int(x)
+                    None -> from_int(0)
+
+                trap_unless(e, compare_value(e, ">", base, v, VInt(first)), "pred")
+
+            val r = fresh_reg(e)
+
+            emit(e, InBin(r, if up then OpAdd else OpSub, lty(e, base), v, VInt(from_int(1))))
+            r
+        _ -> v
+end gen_constrained_step
+
+// -- enums ------------------------------------------------------------------------------------------
+
+// An enum value built from a variant and what it carries. A **simple** enum is its tag; a nullary
+// variant of a data enum is the tag written into an otherwise undefined value.
+private gen_enum_new(e: *Emit, enum_ty: Type, variant: EnumVariant, args: Buf[TExpr]) -> Val
+    val d = underlying(enum_ty) match
+        Enum(decl) -> decl
+        _ -> return gap_at(e, "an enum construction of something that is not an enum")
+
+    if d.simple then return VInt(from_int(long(variant.tag)))
+
+    if !variant.carries
+        val tagged = fresh_reg(e)
+
+        emit(e, InInsert(tagged, lty(e, enum_ty), VUndef, l_i32(),
+                         VInt(from_int(long(variant.tag))), index_list(0)))
+        return tagged
+
+    gap_at(e, "an enum variant that carries a payload")
+end gen_enum_new
+
+// -- calls ----------------------------------------------------------------------------------------
+
+private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
+    if is_foreign(e, name) then return gap_at(e, "a call to an extern")
+    if is_variadic(e, name) then return gap_at(e, "a call to a variadic function")
+
+    var arg_vals: Buf[IrArg] = buf()
+
+    for i in 0..<args.len()
+        arg_value(e, args.at(i), &arg_vals)
+
+    gen_sysl_call(e, VGlobal(symbol_of(e, name)), arg_vals, ty)
+end gen_call
+
+// One argument, in whatever form the boundary takes it: a large value crosses as the address of
+// storage the caller holds, and a zero-sized one is evaluated and not passed.
+arg_value(e: *Emit, a: TExpr, out: *Buf[IrArg])
+    val ty = texpr_type(a)
+
+    if e.layout.indirect(ty)
+        out.push(ir_arg(LPtr, address(e, a)))
+        return
+
+    val v = gen_expr(e, a)
+
+    if !zero_sized(ty) then out.push(ir_arg(lty(e, ty), v))
+end arg_value
+
+// Emits a call from sysl to sysl and hands back the register holding its result.
+gen_sysl_call(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type) -> Val
+    if contains_counted(ty) then return gap_at(e, "a call whose result holds a reference")
+
+    if e.layout.indirect(ty)
+        val slot = alloca(e, fresh_reg(e), lty(e, ty))
+
+        var all: Buf[IrArg] = buf()
+
+        all.push(IrArg(LPtr, slot, sret_attrs(lty(e, ty), int(e.layout.align(ty)))))
+
+        for i in 0..<arg_vals.len()
+            all.push(arg_vals.at(i))
+
+        emit(e, InCall(None, LVoid, callee, all, no_ir_attrs(), None, no_fast_math(), false))
+
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, ty), slot, AccPlain, None))
+        return r
+
+    if no_value(ty)
+        emit(e, InCall(None, LVoid, callee, arg_vals, no_ir_attrs(), None, no_fast_math(), false))
+
+        if ty == Never then emit_term(e, InUnreachable)
+
+        return VNothing
+
+    val r = fresh_reg(e)
+
+    emit(e, InCall(Some(r), lty(e, ty), callee, arg_vals, c_extension(ty, e.target), None,
+                   no_fast_math(), false))
+    r
+end gen_sysl_call
+
+no_fast_math() -> Buf[FastMath]
+    var out: Buf[FastMath] = buf()
+
+    out
+end no_fast_math
+
+// -- conversions and zeros ----------------------------------------------------------------------------
+
+// One scalar type read as another.
+convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
+    if type_eq(from, to) then return v
+
+    val ut = underlying(to)
+
+    (from, ut) match
+        (Integer(a_bits, a_signed, _), Integer(b_bits, _, _)) ->
+            convert_int(e, a_bits, a_signed, b_bits, v)
+        (Integer(_, a_signed, _), Floating(_)) ->
+            cast_to(e, if a_signed then CastSIToFP else CastUIToFP, from, ut, v)
+        (Floating(_), Integer(_, _, _)) -> gap_at(e, "a saturating float conversion")
+        (Floating(a_bits), Floating(b_bits)) ->
+            cast_to(e, if b_bits > a_bits then CastFPExt else CastFPTrunc, from, ut, v)
+        (Char, Integer(b_bits, _, _)) -> convert_int(e, 32, false, b_bits, v)
+        (Integer(_, _, _), Char) -> gap_at(e, "a checked conversion to char")
+        (Enum(d), Integer(_, _, _)) -> convert(e, underlying(d.underlying), ut, v)
+        (Ptr(_), Ptr(_)) -> v
+        (Ptr(_), Integer(_, _, _)) -> cast_to(e, CastPtrToInt, from, ut, v)
+        (Integer(_, _, _), Ptr(_)) -> cast_to(e, CastIntToPtr, from, ut, v)
+        (Ptr(_), CFn(_, _)) -> v
+        (CFn(_, _), Ptr(_)) -> v
+        (CFn(_, _), CFn(_, _)) -> v
+        (CFn(_, _), Integer(_, _, _)) -> cast_to(e, CastPtrToInt, from, ut, v)
+        (Integer(_, _, _), CFn(_, _)) -> cast_to(e, CastIntToPtr, from, ut, v)
+        _ -> gap_at(e, s"a conversion from ${type_show(from)} to ${type_show(to)}")
+end convert
+
+private cast_to(e: *Emit, op: CastOp, from: Type, to: Type, v: Val) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InCast(r, op, lty(e, from), v, lty(e, to)))
+    r
+end cast_to
+
+// The zero value of a type: what a declaration with no initializer starts at.
+zero_of(e: *Emit, ty: Type) -> Val
+    if zero_sized(ty) then return VNothing
+
+    ty match
+        Constrained(_) -> return zero_of(e, underlying(ty))
+        Volatile(inner) -> return zero_of(e, *inner)
+        _ -> ()
+
+    underlying(ty) match
+        Integer(_, _, _) -> VInt(from_int(0))
+        Floating(_) -> v_float(0.0)
+        Char -> VInt(from_int(0))
+        Bool -> VInt(from_int(0))
+        Ptr(_) -> if erased(underlying(ty)) then VZero else VNull
+        Ref(_, _) -> if erased(underlying(ty)) then VZero else VNull
+        Weak(inner) -> if is_trait(*inner) then VZero else VNull
+        CFn(_, _) -> VNull
+        Struct(_) -> VZero
+        Array(_, _) -> VZero
+        Vector(_, _) -> VZero
+        Slice(_, _) -> VZero
+        Str -> VZero
+        VaList -> VZero
+        Enum(d) -> if d.simple then VInt(from_int(0)) else VZero
+        other -> gap_at(e, s"the zero of ${type_show(other)}")
+end zero_of
+
+// A range bound as a whole number. Every bound an integer type carries is one; a float base is a
+// gap rather than a rounding, since the check there compares in double precision.
+decimal_int(d: Decimal) -> BigInt = rescale(d, 0, Rounding.Down).coefficient()

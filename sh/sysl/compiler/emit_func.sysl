@@ -1,0 +1,101 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **One whole function**: the frame its parameters are copied into, the body, and the return.
+//
+// A function owns its parameters and returns its result with a count already taken, so a caller can
+// hand over a temporary and a callee can store one without either having to know what the other did
+// with it. That bookkeeping is the ownership runtime's, and a function whose signature or body needs
+// any of it is left out of the module rather than emitted without it.
+
+// The function, or nothing where its body reached a form this compiler does not lower yet.
+gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
+    start_function(e)
+    e.ensures = int(f.ensures.len())
+
+    if f.tailrec then gap_here(e, "a tail-recursive frame")
+    if !f.olds.is_empty() then gap_here(e, "an 'old' snapshot")
+
+    // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep, so
+    // it takes no slot and the emitted signature does not mention it.
+    for i in 0..<f.params.len()
+        val p = f.params.at(i)
+
+        if !zero_sized(p.1)
+            val ty = p.1
+
+            alloca(e, VReg(s"${p.0}.addr"), lty(e, ty))
+
+            if e.layout.indirect(ty)
+                gap_here(e, "a large parameter copied at entry")
+            else if contains_counted(ty)
+                gap_here(e, "a parameter that holds a reference")
+            else
+                emit(e, InStore(lty(e, ty), VReg(s"${p.0}.param"), VReg(s"${p.0}.addr"), AccPlain,
+                                None))
+
+    for i in 0..<f.requires.len()
+        emit_contract(e, f.requires.at(i).cond, "require")
+
+    gen_stmts(e, f.body.stmts)
+
+    f.body.result match
+        Some(r) ->
+            if e.layout.indirect(f.ret_ty) then gap_here(e, "a large result returned through storage")
+            else if !no_value(f.ret_ty)
+                val v = gen_expr(e, r)
+
+                emit_ensures(e, Some(v))
+                emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(v)))
+            else
+                gen_expr(e, r)
+                emit_ensures(e, None)
+                emit_term(e, InRet(None, None))
+        None ->
+            if no_value(f.ret_ty)
+                emit_ensures(e, None)
+                emit_term(e, InRet(None, None))
+            else if e.layout.indirect(f.ret_ty)
+                gap_here(e, "a large result returned through storage")
+            else
+                emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(zero_of(e, f.ret_ty))))
+
+    if has_gap(e) then return None
+
+    // A file-private declaration has every caller in the module that defines it, so its symbol is
+    // `internal`: nothing outside may resolve it, and the linker is free to discard it when nothing
+    // inside calls it either.
+    val linkage = if f.internal then LinkInternal else LinkDefault
+
+    Some(finish_func(e, IrFuncSig(symbol_of(e, f.name),
+                                  sysl_fn_type(e, f.ret_ty, f.params, f.variadic, Some(f)),
+                                  linkage, convention_of(e, f), attribute_of(e, f), f.section)))
+end gen_function
+
+// What a calling convention becomes on the `define` line for **this** machine. LLVM spells the one
+// concept two ways: x86-64's interrupt handler is a *calling convention* written before the result
+// type, and RISC-V's is a *function attribute* written after the signature.
+private convention_of(e: *Emit, f: TFunc) -> Option[string]
+    if f.conv.is_none() then return None
+    if e.target.cpu == X86_64 then return Some("x86_intrcc")
+
+    None
+end convention_of
+
+private attribute_of(e: *Emit, f: TFunc) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    f.conv match
+        Some(c) ->
+            if e.target.cpu == Riscv64 || e.target.cpu == Riscv32
+                val mode = c.arg match
+                    Some(m) -> m
+                    None -> "machine"
+
+                out.push(("interrupt", mode))
+        None -> ()
+
+    out
+end attribute_of

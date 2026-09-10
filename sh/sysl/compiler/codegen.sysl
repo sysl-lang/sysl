@@ -5,22 +5,171 @@ import sysl.text.{str_builder, StrBuilder}
 
 // Lowering a whole program to a module of intermediate representation.
 //
-// **What is built here is what a program's *declarations* amount to**: the machine it is for, and
-// the named types every value of it is stored at. A function's body is lowered elsewhere; nothing
-// here reads one, which is what makes every line of it answerable from the typed tree alone.
+// **What is built here is what a program's declarations amount to, plus every body this compiler can
+// lower**: the machine it is for, the named types every value of it is stored at, the storage its
+// `val`s come to, and the functions.
 //
 // **A type is defined once per LLVM name.** Two instantiations that mangle to one name are one
 // layout -- the only thing mangling collapses is a subtype into the base it is stored as -- and
 // defining it twice is a module the back end refuses rather than one it chooses for.
+//
+// **A body that reaches a form nothing lowers yet is left out rather than approximated.** What a
+// partial lowering owes the differential proof is that everything it does say is what the reference
+// says; a body it cannot finish is a smaller module, and the census beside the module is the list of
+// them.
 
 // The module a program lowers to.
 codegen_module(p: TProgram, t: Target) -> IrModule
-    val layout = TargetLayout(t.pointer_bits())
+    var e = emitter(t)
+
+    codegen_into(&e, p, t).0
+end codegen_module
+
+// The same, with the census of the bodies that were left out beside it: each one's key and the form
+// it reached.
+codegen_with_gaps(p: TProgram, t: Target) -> (IrModule, Buf[(string, string)])
+    var e = emitter(t)
+
+    codegen_into(&e, p, t)
+end codegen_with_gaps
+
+private codegen_into(e: *Emit, p: TProgram, t: Target) -> (IrModule, Buf[(string, string)])
+    val layout = layout_for(t)
     val word_bits = int(t.pointer_bits())
 
-    IrModule(t.triple, no_sigs(), struct_defs(p, word_bits), enum_defs(p, layout), no_defs(),
-             no_sigs(), no_globals(), no_runtime(), no_funcs(), no_funcs(), None, None, None)
-end codegen_module
+    record_symbols(e, p)
+
+    var funcs: Buf[IrFunc] = buf()
+    var gaps: Buf[(string, string)] = buf()
+
+    // A `@ghost` function is not emitted at all: nothing executable may call one, and the clauses
+    // that may are the ones a body never reaches.
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if !f.ghost
+            if f.exported.is_some()
+                gaps.push((f.name, "an exported function's C-callable entry"))
+            else
+                gen_function(e, f) match
+                    Some(built) -> funcs.push(built)
+                    None -> gaps.push((f.name, gap_text(e)))
+
+    var globals: Buf[IrGlobal] = buf()
+
+    for i in 0..<p.extern_vars.len()
+        globals.push(ir_extern_global(p.extern_vars.at(i).symbol, lty(e, p.extern_vars.at(i).ty)))
+
+    val vals = gen_vals(e, p.vals)
+
+    for i in 0..<vals.len()
+        globals.push(vals.at(i))
+
+    for i in 0..<e.globals.len()
+        globals.push(e.globals.at(i))
+
+    val m = IrModule(t.triple, declares(e, p), struct_defs(p, word_bits), enum_defs(p, layout),
+                     no_defs(), no_sigs(), globals, no_runtime(), funcs, no_funcs(), None, None,
+                     None)
+
+    (m, gaps)
+end codegen_into
+
+private gap_text(e: *Emit) -> string = e.gap match
+    Some(w) -> w
+    None -> "nothing"
+
+// What a call names, where the key and the emitted symbol are two different things: an `extern` under
+// a link name of its own, and the entry point, which is defined under a name of the compiler's.
+private record_symbols(e: *Emit, p: TProgram)
+    for i in 0..<p.externs.len()
+        val x = p.externs.at(i)
+
+        if x.symbol != x.name then e.symbols.push((x.name, x.symbol))
+
+        e.foreigns.push(x.name)
+
+        if x.variadic then e.variadics.push(x.name)
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if f.variadic then e.variadics.push(f.name)
+
+    p.entry match
+        Some(en) -> e.symbols.push((en.func, "$$main"))
+        None -> ()
+end record_symbols
+
+// The declarations the module turned out to need: LLVM's own first, then the `extern`s, then the
+// intrinsics a body asked for by name.
+//
+// **An `extern` whose signature is not all scalars is not declared here yet.** How an aggregate
+// crosses to a foreign callee is the C convention's answer, measured per machine, and a declaration
+// composed without it would be a promise this compiler cannot keep.
+private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
+    var out: Buf[IrFuncSig] = buf()
+
+    if e.traps then out.push(ir_sig(llvm_trap(), ir_fn_type(LVoid, no_params())))
+
+    var seen: Buf[string] = buf()
+
+    for i in 0..<p.funcs.len()
+        p.funcs.at(i).exported match
+            Some(s) -> seen.push(s)
+            None -> ()
+
+    for i in 0..<p.externs.len()
+        val x = p.externs.at(i)
+
+        if !holds(seen, x.symbol) && all_scalar(x)
+            seen.push(x.symbol)
+            out.push(ir_sig(x.symbol, foreign_signature(e, x)))
+
+    for i in 0..<e.sat_decls.len()
+        out.push(e.sat_decls.at(i))
+
+    out
+end declares
+
+// Whether every type an `extern` names crosses in a register as itself.
+private all_scalar(x: TExtern) -> bool
+    if !crosses_plainly(x.ret_ty) then return false
+
+    for i in 0..<x.params.len()
+        if !crosses_plainly(x.params.at(i)) then return false
+
+    true
+end all_scalar
+
+private crosses_plainly(t: Type) -> bool = underlying(t) match
+    Integer(_, _, _) -> true
+    Floating(_) -> true
+    Bool -> true
+    Char -> true
+    Ptr(_) -> !erased(underlying(t))
+    CFn(_, _) -> true
+    Unit -> true
+    Never -> true
+    Enum(d) -> d.simple
+    _ -> false
+
+// What a foreign declaration says, for the signatures every part of which crosses as itself. A
+// narrow scalar carries the convention's extension on each side.
+private foreign_signature(e: *Emit, x: TExtern) -> IrFnType
+    var params: Buf[IrParam] = buf()
+
+    for i in 0..<x.params.len()
+        val p = x.params.at(i)
+
+        if !zero_sized(p) then params.push(IrParam(lty(e, p), c_extension(p, e.target), None))
+
+    val void = no_value(x.ret_ty)
+    val ret = if void then LVoid else lty(e, x.ret_ty)
+    val ret_attrs = if void then no_ir_attrs() else c_extension(x.ret_ty, e.target)
+
+    IrFnType(ret, params, x.variadic, ret_attrs)
+end foreign_signature
 
 // A whole module as LLVM text, which is what `emit-llvm` prints.
 codegen_text(p: TProgram, t: Target) -> string = ir_print_module(codegen_module(p, t))
@@ -89,12 +238,6 @@ private no_defs() -> Buf[IrTypeDef]
     out
 end no_defs
 
-private no_globals() -> Buf[IrGlobal]
-    var out: Buf[IrGlobal] = buf()
-
-    out
-end no_globals
-
 private no_runtime() -> Buf[IrRuntime]
     var out: Buf[IrRuntime] = buf()
 
@@ -159,3 +302,65 @@ lines_of(text: string) -> Buf[string]
 
     out
 end lines_of
+
+// -- the functions of a module's text, for the differential proof ----------------------------------
+
+// Each `define`d function of a module's text, as its symbol and the whole of its body.
+//
+// **A partial lowering is proved a function at a time**, which is what this makes possible: a body
+// this compiler has not built is absent rather than wrong, so a symbol in one text and not in the
+// other is a count to drive down, while a symbol in both whose text differs is a defect.
+func_texts(text: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    val all = lines_of(text)
+
+    var name = ""
+    var body = str_builder()
+    var inside = false
+
+    for i in 0..<all.len()
+        val line = all.at(i)
+
+        if !inside
+            if starts_with_text(line, "define ")
+                inside = true
+                name = define_symbol(line)
+                body = str_builder()
+                body.push(line)
+                body.push_char('\n')
+        else
+            body.push(line)
+            body.push_char('\n')
+
+            if line == "}"
+                inside = false
+                out.push((name, body.finish()))
+
+    out
+end func_texts
+
+private starts_with_text(line: string, prefix: string) -> bool
+    if prefix.bytes.len > line.bytes.len then return false
+
+    line[0..<prefix.bytes.len] == prefix
+end starts_with_text
+
+// The symbol a `define` line names, which is the last `@` up to the parenthesis that opens its
+// parameter list.
+private define_symbol(line: string) -> string
+    var at: usize = 0
+    var found = false
+
+    for i in 0..<line.bytes.len
+        if !found && line.bytes[i] == u8('@')
+            at = i + 1
+            found = true
+
+    if !found then return ""
+
+    for i in at..<line.bytes.len
+        if line.bytes[i] == u8('(') then return line[at..<i]
+
+    line[at..<line.bytes.len]
+end define_symbol
