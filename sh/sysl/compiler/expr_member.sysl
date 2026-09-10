@@ -140,8 +140,12 @@ field_visible(cx: &Analyzer, base: string, field: string) -> bool
         _ -> true
 end field_visible
 
-// A member read off a **type** rather than off a value: an enum's variant, and the associated names
-// a later stage answers.
+// A member read off a **type** rather than off a value: an enum's variant, a static property, and
+// the refusals that say which of the readings a name standing for a type could have meant.
+//
+// A name in front of the dot that is not a value is not a receiver, so reading it as one reports the
+// **type** as an undefined name and says nothing about the member -- which is the complaint a reader
+// can do least with. Each arm below names the member instead and says where it is reached from.
 private type_member(cx: &Analyzer, span: Span, receiver: Expr, name: string,
                     expected: Option[Type]) -> Option[TExpr]
     val written = *receiver.kind match
@@ -150,18 +154,203 @@ private type_member(cx: &Analyzer, span: Span, receiver: Expr, name: string,
 
     if written.is_none() then return None
 
-    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+    val w = written.unwrap()
+    val key = lookup_type_key(cx.an, cx.scope, w)
 
-    if key.is_none() then return None
+    // **A static property is an associated function the reader writes no `()` after**, so it is
+    // analyzed as the call it is and nothing below this line has to know it exists. That is the
+    // whole of the lowering: `recv_mode()` already answers `None` for one, so every pass that
+    // dispatches on a receiver has been treating it as associated since it was parsed.
+    if key.is_some() && static_property_at(cx.an, key.unwrap(), name) then
+        return associated_call(cx, span, receiver, name, buf(), expected)
 
-    val decl = cx.an.tables.types.get(key.unwrap())
+    if key.is_some()
+        val decl = cx.an.tables.types.get(key.unwrap())
 
-    if decl.is_none() then return None
+        if decl.is_none() then return None
 
-    decl.unwrap().kind match
-        EnumOf(_) -> Some(enum_member(cx, span, key.unwrap(), written.unwrap(), name, expected))
-        _ -> None
+        decl.unwrap().kind match
+            EnumOf(_) -> return Some(enum_member(cx, span, key.unwrap(), w, name, expected))
+            StructOf(_) -> return Some(struct_type_member(cx, span, key.unwrap(), w, name))
+            TraitOf(d) -> return Some(trait_type_member(cx, span, key.unwrap(), d, name))
+            TypeOf(d) ->
+                return Some(constrained_member(cx, span, key.unwrap(), d, receiver, w, name,
+                                               expected))
+            // A C type carries nothing to read under its own name, so the ordinary reading of the
+            // receiver is left to answer.
+            _ -> return None
+    end if
+
+    // **`A.len` -- how many types a pack stands for**, which is a compile-time integer and folds
+    // into its use as one. `len` and no other name, because a pack is not a value and has no other
+    // member to read.
+    val stood = bound_type(cx.subst, w)
+
+    if stood.is_some()
+        stood.unwrap() match
+            Pack(elems) ->
+                if name == "len" then
+                    return Some(TExpr(span, TIntLit(from_int(long(elems.len())),
+                                                    usize_type(word_bits(cx)))))
+
+                return Some(cx.err(span, s"'..$w' is a type pack, and 'len' — how many types it " +
+                                   "stands for — is the whole of what one offers; there is no " +
+                                   s"'$w.$name'"))
+            _ -> ()
+    end if
+
+    // A type that is not one of the declaration tables: a type parameter, the `Self` a member's body
+    // is analyzed under, or a built-in an `impl` was written for.
+    val subject = subject_named(cx, receiver)
+
+    if subject.is_none() then return None
+
+    Some(bare_type_member(cx, span, receiver, subject.unwrap(), w, name, expected))
 end type_member
+
+// Whether the type filed under this key declares a **static property** of that name -- the one
+// associated member a read resolves rather than being told to put parentheses after.
+private static_property_at(a: &Analysis, key: string, name: string) -> bool
+    val m = member_at(a, key, name)
+
+    m.is_some() && m.unwrap().is_static
+end static_property_at
+
+// A struct's name with a member selected from it. What a type offers under its own name is an
+// associated function, so each of the other three readings is told where it is reached from.
+private struct_type_member(cx: &Analyzer, span: Span, key: string, written: string,
+                           name: string) -> TExpr
+    val m = member_at(cx.an, key, name)
+
+    if m.is_none() then
+        return cx.err(span, s"type '${module_show(key)}' has no member '$name' — and " +
+                      s"'${module_show(key)}' is a type, not a value")
+
+    val decl = m.unwrap()
+
+    if decl.is_property then
+        return cx.err(span, s"'$name' is a property of '${module_show(key)}' — read it on a " +
+                      s"value, as 'value.$name'")
+
+    if decl.receiver.is_some() then
+        return cx.err(span, s"'$name' is a method of '${module_show(key)}' — call it on a value, " +
+                      s"as 'value.$name(…)'")
+
+    cx.err(span, s"'$name' is an associated function of '${module_show(key)}' — call it with " +
+           s"'$written.$name(…)'")
+end struct_type_member
+
+// A trait's name with a member selected from it, which is the same shape of mistake one type over.
+// A trait is not a value and is not a type on its own: what its members are reached through is a
+// value of an implementing type, or a trait object.
+private trait_type_member(cx: &Analyzer, span: Span, key: string, d: TraitDecl,
+                          name: string) -> TExpr
+    val m = trait_method(d, name)
+
+    if m.is_none() then
+        return cx.err(span, s"'${module_show(key)}' is a trait, not a value, and declares no " +
+                      s"member '$name'")
+
+    if m.unwrap().is_property then
+        return cx.err(span, s"'$name' is a property of the trait '${module_show(key)}' — read it " +
+                      s"on a value of a type that implements '${module_show(key)}', or on a " +
+                      s"'&${module_show(key)}'")
+
+    cx.err(span, s"'$name' is a member of the trait '${module_show(key)}' — call it on a value of " +
+           s"a type that implements '${module_show(key)}', or on a '&${module_show(key)}'")
+end trait_type_member
+
+// A constrained subtype's name with a member selected from it. What one offers under its own name is
+// spelled with `::`, so a range that has one is told about the attributes rather than only that the
+// member is missing.
+private constrained_member(cx: &Analyzer, span: Span, key: string, d: TypeDecl, receiver: Expr,
+                           written: string, name: string, expected: Option[Type]) -> TExpr
+    val stood = concrete_instance(cx.an, key)
+
+    // An alias reaches this case because it is declared in the same table, and none of what follows
+    // is about it: it has no range to be asked about and no cast to be told to use. What it has is
+    // whatever the base has, so the complaint is the base's, said about the name that was written.
+    if is_plain_alias(d) && stood.is_some() then
+        return bare_type_member(cx, span, receiver, stood.unwrap(), written, name, expected)
+
+    var ranged = false
+
+    if stood.is_some()
+        stood.unwrap() match
+            Constrained(c) ->
+                underlying(c.base) match
+                    Integer(_, _, _) -> ranged = c.lo.is_some()
+                    _ -> ()
+            _ -> ()
+    end if
+
+    val m = member_at(cx.an, key, name)
+
+    if m.is_some()
+        val decl = m.unwrap()
+
+        if decl.is_property then
+            return cx.err(span, s"'$name' is a property of '${module_show(key)}' — read it on a " +
+                          s"value, as 'value.$name'")
+
+        if decl.receiver.is_some() then
+            return cx.err(span, s"'$name' is a method of '${module_show(key)}' — call it on a " +
+                          s"value, as 'value.$name(…)'")
+
+        return cx.err(span, s"'$name' is an associated function of '${module_show(key)}' — call " +
+                      s"it with '$written.$name(…)'")
+    end if
+
+    if name == "try"
+        val without = if ranged then
+                          s", and '$written::Valid(x)' asks the question without trapping"
+                      else ""
+
+        return cx.err(span, s"'${module_show(key)}' is a constrained type and has no 'try': a " +
+                      "value outside its range is a mistake in the code that produced it rather " +
+                      s"than a condition to handle, so '$written(x)' checks it and traps$without")
+    end if
+
+    val offered = if ranged then
+                      s" — what a constrained type offers under its own name is written with " +
+                      s"'::': '$written::First', '$written::Last', '$written::Valid(x)', " +
+                      s"'$written::Succ(x)', '$written::Pred(x)'"
+                  else ""
+
+    cx.err(span, s"'${module_show(key)}' is a type, not a value, and has no member " +
+           s"'$name'$offered")
+end constrained_member
+
+// A type in the position a value would be read from, where the type is not one of the declaration
+// tables: a type parameter, the `Self` a member's body is analyzed under, or a built-in an `impl`
+// was written for.
+private bare_type_member(cx: &Analyzer, span: Span, receiver: Expr, subject: Type, written: string,
+                         name: string, expected: Option[Type]) -> TExpr
+    subject match
+        Abstract(_, bounds) -> bound_type_member(cx, span, subject, bounds, written, name)
+        _ ->
+            val found = member_key(cx.an, subject, name)
+            val m = member_at(cx.an, found.0, name)
+
+            if m.is_none() then
+                return cx.err(span, s"'$written' is a type, not a value, and has no associated " +
+                              s"function '$name'")
+
+            val decl = m.unwrap()
+
+            if decl.is_static
+                val read = associated_call(cx, span, receiver, name, buf(), expected)
+
+                return if read.is_some() then read.unwrap() else bad_expr(span)
+            end if
+
+            if decl.recv_mode().is_none() then
+                return cx.err(span, s"'$name' is an associated function of " +
+                              s"'${type_show(subject)}' — call it with '$written.$name()'")
+
+            cx.err(span, s"'$name' is reached on a value of ${type_show(subject)}, and '$written' " +
+                   "is the type itself")
+end bare_type_member
 
 // A variant named through its enum -- `Colour.Red`.
 private enum_member(cx: &Analyzer, span: Span, key: string, written: string, name: string,
@@ -225,3 +414,77 @@ private module_path(receiver: Expr, name: string) -> Option[string] = *receiver.
 // **What a type declares of its own is looked up through `lookup_trait_member`**, which reads the
 // member tables the `impl` blocks and the type declarations were hoisted into. It lives in
 // `member_call.sysl`, beside the call form that shares its lookup.
+
+// `base with { bg = 9 }` -- `base` again, with the fields named in the braces changed.
+//
+// **The whole of the form is one desugaring**, and nothing else about it is defined anywhere:
+//
+// ```
+// var tmp = base
+// tmp.bg = 9
+// tmp
+// ```
+//
+// so a struct's `invariant` is re-checked because a field assignment re-checks it, a field another
+// module keeps `private` is refused because an assignment refuses it, a literal needs no width
+// suffix because it is read against the field's type, and a settable property runs its setter
+// because `p.count = v` is a call. The base is evaluated once, however many fields change.
+//
+// **The one thing the desugaring gets wrong on its own is a base that is not a struct**, and it gets
+// it wrong silently: `var tmp = p` where `p` is a `&Style` binds a second reference to one object,
+// so the writes reach every other holder rather than a copy. That is the reading this form exists to
+// avoid, so it is refused before the desugaring is built -- with the parenthesised spelling that
+// does copy, since `*p with { … }` is `*(p with { … })` and would be refused again.
+with_expr(cx: &Analyzer, span: Span, base: Expr, fields: Buf[WithField],
+          expected: Option[Type]) -> TExpr
+    // Asked speculatively: a base that does not analyze at all has a complaint of its own, and the
+    // desugaring below reaches it in its own position rather than having it reported here.
+    val mark = cx.an.sandboxed()
+    val probed = texpr_type(type_expr(cx, base, None))
+
+    cx.an.release(mark)
+
+    if probed != Unknown
+        repr(probed) match
+            Struct(d) ->
+                if is_tuple(d) then
+                    return cx.err(span, "a tuple's parts are named for their positions rather " +
+                                  "than by a name 'with' could write, so a changed one is " +
+                                  "spelled by rebuilding it — '(t.0, 9)'")
+            Ref(inner, _) -> return not_a_struct(cx, span, *inner, "a counted reference to")
+            Ptr(inner) -> return not_a_struct(cx, span, *inner, "a pointer to")
+            other ->
+                return cx.err(span, "'with' copies a struct and changes some of its fields, and " +
+                              s"'${type_show(other)}' is not a struct")
+    end if
+
+    // Written twice, the second write is what the value would carry and the first is dead -- which
+    // no reader means, and which the desugaring would carry out in silence.
+    for i in 0..<fields.len()
+        for j in 0..<i
+            if fields.at(j).name == fields.at(i).name then
+                return cx.err(fields.at(i).span, s"'${fields.at(i).name}' is changed twice in one " +
+                              "'with', so the first change is thrown away — write the value it " +
+                              "should end with, once")
+
+    val tmp = s"${ModuleSep}with"
+    var stmts: Buf[Stmt] = buf()
+
+    stmts.push(stmt(span, VarDecl(tmp, None, Some(base), File, None, None)))
+
+    for i in 0..<fields.len()
+        val f = fields.at(i)
+        val place = expr(f.span, Field(expr(f.span, Ident(tmp)), f.name))
+
+        stmts.push(stmt(f.span, ExprStmt(expr(f.span, Assign("=", place, f.value)))))
+
+    stmts.push(stmt(span, ExprStmt(expr(span, Ident(tmp)))))
+    type_expr(cx, expr(span, Block(stmts)), expected)
+end with_expr
+
+// The refusal for a base that reaches a struct without being one. It names the copy, because the
+// copy is the whole difference between what was written and what it would have meant.
+private not_a_struct(cx: &Analyzer, span: Span, inner: Type, what: string) -> TExpr =
+    cx.err(span, s"'with' copies a struct, and this is $what one — writing through it would " +
+           s"change the '${type_show(inner)}' every other holder can see. Copy what it points at " +
+           "first, as '(*base) with { … }'")

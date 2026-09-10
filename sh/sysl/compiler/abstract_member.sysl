@@ -230,6 +230,25 @@ call_bound_associated(cx: &Analyzer, span: Span, subject: Type, name: string, bo
     TExpr(span, TCall(s"${tr.name}.$name", ts, ret, false))
 end call_bound_associated
 
+// `T.f` -- a member selected from a type **parameter's own name**, where the parameter stands for
+// itself. What a bound licenses under the type's name is an associated function, so the parentheses
+// are what is missing -- except for a **static property**, which belongs to the type and is the one
+// associated member a read resolves rather than being told to add them to.
+//
+// Everything else is left to the call form, whose complaints each say the right thing about a read
+// as well: a property is read on a value, a method is called on one, and a name no bound licenses is
+// told which bound would license it.
+bound_type_member(cx: &Analyzer, span: Span, subject: Type, bounds: Buf[Bound], written: string,
+                  name: string) -> TExpr
+    val found = bound_member(cx.an, subject, bounds, name)
+
+    if found.is_some() && !found.unwrap().2.is_static && found.unwrap().2.recv_mode().is_none() then
+        return kept_error(cx, span, s"'$name' is an associated function of " +
+                          s"'${found.unwrap().0.show()}' — call it with '$written.$name()'")
+
+    call_bound_associated(cx, span, subject, name, bounds, buf())
+end bound_type_member
+
 private unlicensed_associated(cx: &Analyzer, span: Span, subject: Type, name: string) -> TExpr
     val named = declaring_traits(cx, name, false, true)
 
