@@ -187,3 +187,52 @@ a_conditional_implementation()
               "use(b: Box[P]) -> int = b.show()\n"
 
     assert_eq(body_type(src), "int")
+
+// -- a property that is written as well as read -------------------------------------------------------
+
+@test("a setter's parameter takes the property's type, and a write to the property is a call")
+a_settable_property()
+    val src = "struct Counter\n    v: int\n\n    count -> int = self.v * 2\n\n" +
+              "    set count(x)\n        self.v = x / 2\n    end count\n\n" +
+              "use(c: *Counter) -> int\n    c.count = 4\n\n    c.count\n"
+
+    assert_eq(trait_diagnostics(src).len(), 0)
+    assert_eq(body_type(src), "int")
+end a_settable_property
+
+@test("and a compound write reads through the receiver's address once")
+a_compound_write_to_a_property()
+    val src = "struct Counter\n    v: int\n\n    count -> int = self.v * 2\n\n" +
+              "    set count(x)\n        self.v = x / 2\n    end count\n\n" +
+              "use(c: *Counter)\n    c.count += 4\n"
+
+    assert_eq(trait_diagnostics(src).len(), 0)
+end a_compound_write_to_a_property
+
+@test("a property with no setter says what is missing and where it goes")
+a_property_with_no_setter()
+    val src = "struct RO\n    n: int\n\n    twice -> int = self.n * 2\n\n" +
+              "use(r: *RO)\n    r.twice = 3\n"
+
+    assert_eq(trait_diagnostics(src).at(0),
+              "'twice' is a property of 'RO', which computes rather than naming storage, so there " +
+              "is nothing to assign through — write 'set twice(…)' on 'RO' to give it a setter")
+end a_property_with_no_setter
+
+@test("and a compound one is told what it has nothing to write back")
+a_compound_write_with_no_setter()
+    val src = "struct RO\n    n: int\n\n    twice -> int = self.n * 2\n\n" +
+              "use(r: *RO)\n    r.twice += 3\n"
+
+    assert_eq(trait_diagnostics(src).at(0),
+              "'twice' is a property of 'RO', which computes rather than naming storage, so '+=' " +
+              "has nothing to write back — write 'set twice(…)' on 'RO' to give it a setter")
+end a_compound_write_with_no_setter
+
+@test("a setter with no property to write is refused where the pairing would have happened")
+a_setter_with_no_property()
+    assert_eq(trait_diagnostics("struct C\n    v: int\n\n    set count(x)\n        self.v = x\n" +
+                                "    end count\n").at(0),
+              "'set count' writes a property called 'count', and 'C' declares none — a property " +
+              "is read as well as written, and its result is where the value's type comes from")
+end a_setter_with_no_property

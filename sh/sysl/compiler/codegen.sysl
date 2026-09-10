@@ -364,3 +364,84 @@ private define_symbol(line: string) -> string
 
     line[at..<line.bytes.len]
 end define_symbol
+
+// -- the seams a test asserts on ------------------------------------------------------------------
+
+// One source lowered, and the LLVM text of the function named -- the whole `define` line to the
+// brace that closes it, or an empty string where the body was not lowered.
+//
+// **It is what a lowering test reads**, since what a body becomes is text and nothing about the
+// intermediate representation says whether it is the reference's text.
+emit_func_text(text: string, symbol: string) -> string
+    val done = typed_of(text)
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    // **Nothing is pruned here**, because a test writes the one body it is about and a walk from a
+    // program's roots would drop it before it could be read.
+    val p = strip_tests(program_of(done, done.main_module))
+    val lowered = codegen_with_gaps(p, done.an.tables.target)
+    val fs = func_texts(ir_print_module(lowered.0))
+
+    for i in 0..<fs.len()
+        if fs.at(i).0 == symbol then return fs.at(i).1
+
+    ""
+end emit_func_text
+
+// Why the function named was not lowered, or an empty string where it was.
+emit_gap_for(text: string, name: string) -> string
+    val done = typed_of(text)
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val p = strip_tests(program_of(done, done.main_module))
+    val gaps = codegen_with_gaps(p, done.an.tables.target).1
+
+    for i in 0..<gaps.len()
+        if gaps.at(i).0 == name then return gaps.at(i).1
+
+    ""
+end emit_gap_for
+
+// The symbols a program is left with once nothing it can reach has been dropped.
+emit_kept_funcs(text: string) -> Buf[string]
+    val done = typed_of(text)
+
+    var out: Buf[string] = buf()
+
+    if !done.reported.is_empty() then return out
+
+    val p = prune(strip_tests(program_of(done, done.main_module)), buf())
+
+    for i in 0..<p.funcs.len()
+        out.push(p.funcs.at(i).name)
+
+    out
+end emit_kept_funcs
+
+// What the checks between the analyzer and the lowering refuse, in the order they say it.
+//
+// **They run on the way to `emit-llvm` and nowhere else**, so a test that asked the ordinary
+// analysis seam would be asking a pass that never runs them.
+emit_diagnostics(text: string) -> Buf[string]
+    val done = typed_of(text)
+
+    var out: Buf[string] = buf()
+
+    if !done.reported.is_empty()
+        for i in 0..<done.reported.len()
+            out.push(done.reported.at(i).diag.message)
+
+        return out
+    end if
+
+    post_analysis_checks(done.an, program_of(done, done.main_module), buf())
+
+    val said = done.an.diagnostics()
+
+    for i in 0..<said.len()
+        out.push(said.at(i).diag.message)
+
+    out
+end emit_diagnostics

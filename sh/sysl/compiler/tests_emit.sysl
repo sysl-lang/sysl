@@ -1,0 +1,344 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What a body becomes, and what the checks between the analyzer and the lowering refuse.
+//
+// **Every LLVM text here was read out of the reference compiler**, by handing the installed `sysl`
+// the same source and quoting `emit-llvm` -- never composed from the rule. The same is true of every
+// message: a refusal this compiler composes rather than quotes is a refusal that has drifted.
+
+private lowered(text: string, symbol: string) -> string = emit_func_text(text, symbol)
+
+private first_refusal(text: string) -> string
+    val said = emit_diagnostics(text)
+
+    if said.is_empty() then return ""
+
+    said.at(0)
+end first_refusal
+
+// -- the frame ------------------------------------------------------------------------------------
+
+@test("a parameter is copied into a slot of its own at entry, and the body reads the slot")
+a_frame_copies_its_parameters()
+    assert_eq(lowered("add(a: int, b: int) -> int = a + b\n", "add"),
+              "define i32 @add(i32 %a.param, i32 %b.param) {\n" +
+              "entry:\n" +
+              "  %a.addr = alloca i32\n" +
+              "  %b.addr = alloca i32\n" +
+              "  store i32 %a.param, ptr %a.addr\n" +
+              "  store i32 %b.param, ptr %b.addr\n" +
+              "  %t1 = load i32, ptr %a.addr\n" +
+              "  %t2 = load i32, ptr %b.addr\n" +
+              "  %t3 = add i32 %t1, %t2\n" +
+              "  ret i32 %t3\n" +
+              "}\n")
+end a_frame_copies_its_parameters
+
+@test("a zero-sized parameter takes no slot and is not in the signature")
+a_zero_sized_parameter_is_not_an_argument()
+    assert_eq(lowered("f(u: unit, n: int) -> int = n\n", "f"),
+              "define i32 @f(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  ret i32 %t1\n" +
+              "}\n")
+end a_zero_sized_parameter_is_not_an_argument
+
+@test("a file-private function is emitted under internal linkage")
+a_private_definition_is_internal()
+    assert_eq(lowered("private p() -> int = 1\n", "p"),
+              "define internal i32 @p() {\n" +
+              "entry:\n" +
+              "  ret i32 1\n" +
+              "}\n")
+end a_private_definition_is_internal
+
+// -- what an operator becomes -----------------------------------------------------------------------
+
+@test("integer division traps on a zero divisor and on the one overflow a signed quotient has")
+a_signed_division_is_guarded()
+    assert_eq(lowered("d(a: int, b: int) -> int = a / b\n", "d"),
+              "define i32 @d(i32 %a.param, i32 %b.param) {\n" +
+              "entry:\n" +
+              "  %a.addr = alloca i32\n" +
+              "  %b.addr = alloca i32\n" +
+              "  store i32 %a.param, ptr %a.addr\n" +
+              "  store i32 %b.param, ptr %b.addr\n" +
+              "  %t1 = load i32, ptr %a.addr\n" +
+              "  %t2 = load i32, ptr %b.addr\n" +
+              "  %t3 = icmp ne i32 %t2, 0\n" +
+              "  br i1 %t3, label %div.ok1, label %div.bad2\n" +
+              "div.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "div.ok1:\n" +
+              "  %t4 = icmp eq i32 %t2, -1\n" +
+              "  %t5 = icmp eq i32 %t1, -2147483648\n" +
+              "  %t6 = and i1 %t5, %t4\n" +
+              "  %t7 = xor i1 %t6, true\n" +
+              "  br i1 %t7, label %overflow.ok3, label %overflow.bad4\n" +
+              "overflow.bad4:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "overflow.ok3:\n" +
+              "  %t8 = sdiv i32 %t1, %t2\n" +
+              "  ret i32 %t8\n" +
+              "}\n")
+end a_signed_division_is_guarded
+
+@test("a shift is clamped so that every amount means something")
+a_shift_is_bounded()
+    assert_eq(lowered("s(a: uint, n: uint) -> uint = a << n\n", "s"),
+              "define i32 @s(i32 %a.param, i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %a.addr = alloca i32\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %a.param, ptr %a.addr\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %a.addr\n" +
+              "  %t2 = load i32, ptr %n.addr\n" +
+              "  %t3 = icmp uge i32 %t2, 32\n" +
+              "  %t4 = select i1 %t3, i32 31, i32 %t2\n" +
+              "  %t5 = shl i32 %t1, %t4\n" +
+              "  %t6 = select i1 %t3, i32 zeroinitializer, i32 %t5\n" +
+              "  ret i32 %t6\n" +
+              "}\n")
+end a_shift_is_bounded
+
+@test("'&&' does not evaluate its right operand unless it must")
+a_short_circuit_branches()
+    assert_eq(lowered("f(a: bool, b: bool) -> bool = a && b\n", "f"),
+              "define zeroext i1 @f(i1 %a.param, i1 %b.param) {\n" +
+              "entry:\n" +
+              "  %a.addr = alloca i1\n" +
+              "  %b.addr = alloca i1\n" +
+              "  %t2 = alloca i1\n" +
+              "  store i1 %a.param, ptr %a.addr\n" +
+              "  store i1 %b.param, ptr %b.addr\n" +
+              "  %t1 = load i1, ptr %a.addr\n" +
+              "  store i1 %t1, ptr %t2\n" +
+              "  br i1 %t1, label %sc.rhs1, label %sc.end2\n" +
+              "sc.rhs1:\n" +
+              "  %t3 = load i1, ptr %b.addr\n" +
+              "  store i1 %t3, ptr %t2\n" +
+              "  br label %sc.end2\n" +
+              "sc.end2:\n" +
+              "  %t4 = load i1, ptr %t2\n" +
+              "  ret i1 %t4\n" +
+              "}\n")
+end a_short_circuit_branches
+
+// -- places -------------------------------------------------------------------------------------------
+
+@test("an element is reached through a bounds check the index is widened for")
+an_index_is_checked()
+    assert_eq(lowered("ix(xs: [3]int, i: usize) -> int = xs[i]\n", "ix"),
+              "define i32 @ix([3 x i32] %xs.param, i64 %i.param) {\n" +
+              "entry:\n" +
+              "  %xs.addr = alloca [3 x i32]\n" +
+              "  %i.addr = alloca i64\n" +
+              "  store [3 x i32] %xs.param, ptr %xs.addr\n" +
+              "  store i64 %i.param, ptr %i.addr\n" +
+              "  %t1 = load i64, ptr %i.addr\n" +
+              "  %t2 = icmp ult i64 %t1, 3\n" +
+              "  br i1 %t2, label %bounds.ok1, label %bounds.bad2\n" +
+              "bounds.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok1:\n" +
+              "  %t3 = getelementptr i32, ptr %xs.addr, i64 %t1\n" +
+              "  %t4 = load i32, ptr %t3\n" +
+              "  ret i32 %t4\n" +
+              "}\n")
+end an_index_is_checked
+
+@test("a field is lifted out of the receiver's value where the receiver is one")
+a_field_is_extracted()
+    assert_eq(lowered("struct P\n    x: int\n    y: int\nend P\n\nfld(q: P) -> int = q.y\n", "fld"),
+              "define i32 @fld(%struct.P %q.param) {\n" +
+              "entry:\n" +
+              "  %q.addr = alloca %struct.P\n" +
+              "  store %struct.P %q.param, ptr %q.addr\n" +
+              "  %t1 = load %struct.P, ptr %q.addr\n" +
+              "  %t2 = extractvalue %struct.P %t1, 1\n" +
+              "  ret i32 %t2\n" +
+              "}\n")
+end a_field_is_extracted
+
+// -- control flow --------------------------------------------------------------------------------------
+
+@test("a counted loop tests, steps and goes round, and its counter is a slot")
+a_counted_loop()
+    assert_eq(lowered("f(n: int) -> int\n    var t = 0\n\n    for i in 0..<n\n        t += i\n\n" +
+                      "    t\n", "f"),
+              "define i32 @f(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %t.addr = alloca i32\n" +
+              "  %i.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  store i32 0, ptr %t.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  store i32 0, ptr %i.addr\n" +
+              "  br label %for.cond1\n" +
+              "for.cond1:\n" +
+              "  %t2 = load i32, ptr %i.addr\n" +
+              "  %t3 = icmp slt i32 %t2, %t1\n" +
+              "  br i1 %t3, label %for.body2, label %for.end4\n" +
+              "for.body2:\n" +
+              "  %t4 = load i32, ptr %t.addr\n" +
+              "  %t5 = load i32, ptr %i.addr\n" +
+              "  %t6 = add i32 %t4, %t5\n" +
+              "  store i32 %t6, ptr %t.addr\n" +
+              "  br label %for.step3\n" +
+              "for.step3:\n" +
+              "  %t7 = load i32, ptr %i.addr\n" +
+              "  %t8 = add i32 %t7, 1\n" +
+              "  store i32 %t8, ptr %i.addr\n" +
+              "  br label %for.cond1\n" +
+              "for.end4:\n" +
+              "  %t9 = load i32, ptr %t.addr\n" +
+              "  ret i32 %t9\n" +
+              "}\n")
+end a_counted_loop
+
+@test("a match on a simple enum compares tags and each arm stores into one slot")
+a_match_on_an_enum()
+    assert_eq(lowered("enum C\n    Red\n    Green\nend C\n\nm(c: C) -> int = c match\n" +
+                      "    C.Red -> 1\n    C.Green -> 2\n", "m"),
+              "define i32 @m(i32 %c.param) {\n" +
+              "entry:\n" +
+              "  %c.addr = alloca i32\n" +
+              "  %t2 = alloca i32\n" +
+              "  store i32 %c.param, ptr %c.addr\n" +
+              "  %t1 = load i32, ptr %c.addr\n" +
+              "  %t3 = icmp eq i32 %t1, 0\n" +
+              "  br i1 %t3, label %match.arm2, label %match.next3\n" +
+              "match.arm2:\n" +
+              "  store i32 1, ptr %t2\n" +
+              "  br label %match.end1\n" +
+              "match.next3:\n" +
+              "  %t4 = icmp eq i32 %t1, 1\n" +
+              "  br i1 %t4, label %match.arm4, label %match.next5\n" +
+              "match.arm4:\n" +
+              "  store i32 2, ptr %t2\n" +
+              "  br label %match.end1\n" +
+              "match.next5:\n" +
+              "  unreachable\n" +
+              "match.end1:\n" +
+              "  %t5 = load i32, ptr %t2\n" +
+              "  ret i32 %t5\n" +
+              "}\n")
+end a_match_on_an_enum
+
+@test("a self-call in tail position is a jump back to the entry rather than a second frame")
+a_tail_call_is_a_jump()
+    assert_eq(lowered("count(n: int, acc: int) -> int\n    if n == 0 then return acc\n\n" +
+                      "    count(n - 1, acc + n)\n", "count"),
+              "define i32 @count(i32 %n.param, i32 %acc.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %acc.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  store i32 %acc.param, ptr %acc.addr\n" +
+              "  br label %tailrec1\n" +
+              "tailrec1:\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = icmp eq i32 %t1, 0\n" +
+              "  br i1 %t2, label %if.then2, label %if.end4\n" +
+              "if.then2:\n" +
+              "  %t3 = load i32, ptr %acc.addr\n" +
+              "  ret i32 %t3\n" +
+              "if.end4:\n" +
+              "  %t4 = load i32, ptr %n.addr\n" +
+              "  %t5 = sub i32 %t4, 1\n" +
+              "  %t6 = load i32, ptr %acc.addr\n" +
+              "  %t7 = load i32, ptr %n.addr\n" +
+              "  %t8 = add i32 %t6, %t7\n" +
+              "  store i32 %t5, ptr %n.addr\n" +
+              "  store i32 %t8, ptr %acc.addr\n" +
+              "  br label %tailrec1\n" +
+              "}\n")
+end a_tail_call_is_a_jump
+
+// -- module storage --------------------------------------------------------------------------------
+
+@test("a body this compiler does not lower yet is left out, and says what it reached")
+an_unlowered_body_says_why()
+    assert_eq(emit_gap_for("f(s: string) -> usize = s.bytes.len\n", "f"),
+              "a parameter that holds a reference")
+    assert_eq(emit_gap_for("f(n: int) -> int = n + 1\n", "f"), "")
+end an_unlowered_body_says_why
+
+// -- the checks the lowering runs first ---------------------------------------------------------------
+
+@test("'@tailrec' on a function that calls itself nowhere the jump can replace is refused")
+tailrec_with_no_jump()
+    assert_eq(first_refusal("@tailrec\nloopy(n: int) -> int = if n == 0 then 0 else 1 + loopy(n - 1)\n"),
+              "'loopy' is marked '@tailrec' but calls itself nowhere the jump can replace — a tail " +
+              "call is the last thing the function does, so nothing may wait on its result and no " +
+              "'defer' may be in scope where it stands")
+end tailrec_with_no_jump
+
+@test("'@tailrec' on a function with an 'ensures' is refused, since a tail call never returns")
+tailrec_with_a_postcondition()
+    assert_eq(first_refusal("@tailrec\nf(n: int) -> int\n    ensure result > 0\n\n    f(n)\n"),
+              "'f' is marked '@tailrec' but it has an 'ensures', which is checked when a call " +
+              "returns — a tail call never returns, so the postcondition of every frame but the " +
+              "last would go unchecked")
+end tailrec_with_a_postcondition
+
+@test("a 'become' whose callee has another shape is refused")
+become_at_another_shape()
+    assert_eq(first_refusal("a(n: int) -> int\n    become c(n, n)\n\nc(n: int, m: int) -> int = n + m\n"),
+              "'become' replaces this frame with the call's, and 'c' takes 2 arguments and this " +
+              "function takes 1 — a frame can only be replaced by one of the same shape")
+end become_at_another_shape
+
+@test("a 'become' out of a frame holding a counted value is refused")
+become_with_a_counted_parameter()
+    assert_eq(first_refusal("a(s: string) -> string\n    become b(s)\n\nb(s: string) -> string = s\n"),
+              "'become' replaces this frame with the call's, and 'a' takes a counted value — the " +
+              "frame's own references are let go before the jump, so an argument read out of one " +
+              "of them would outlive nothing. Pass what the callee needs through a raw pointer or " +
+              "a value that carries no count")
+end become_with_a_counted_parameter
+
+@test("two exports claiming one symbol are refused, and both are named")
+two_exports_of_one_symbol()
+    assert_eq(first_refusal("@export(\"dup\")\nf() -> int = 1\n\n@export(\"dup\")\ng() -> int = 2\n"),
+              "'dup' is exported by 'f' and 'g' — one symbol is one definition, and the linker has " +
+              "no way to tell which was meant")
+end two_exports_of_one_symbol
+
+@test("an exported function taking something C cannot spell is refused, with the shape to write")
+an_export_c_cannot_spell()
+    assert_eq(first_refusal("@export(\"takes\")\nf(s: string) -> int = 1\n"),
+              "'s' of the exported 'f' is string, which C has no way to spell — an exported " +
+              "function takes an integer, a float, a 'bool', a 'char', a pointer, a function " +
+              "pointer, a simple enum, or a struct built out of those. A slice is an address and a " +
+              "length, so C takes them as two parameters — a pointer and a 'usize' — which is the " +
+              "shape its own string and buffer functions already have")
+end an_export_c_cannot_spell
+
+@test("a sound program earns none of these refusals")
+a_sound_program_is_refused_nothing()
+    assert_eq(emit_diagnostics("f(n: int) -> int = n + 1\n\nmain()\n    val n = f(1)\n").len(), 0)
+end a_sound_program_is_refused_nothing
+
+// -- what the program is pruned to ------------------------------------------------------------------
+
+@test("a function nothing can reach is not emitted at all")
+an_unreached_function_is_dropped()
+    val kept = emit_kept_funcs("unused(n: int) -> int = n + 1\n\nused(n: int) -> int = n * 2\n\n" +
+                               "main()\n    val n = used(2)\n")
+
+    assert(!holds_string(kept, "unused"), "the unreached one is dropped")
+    assert(holds_string(kept, "used"), "the reached one is kept")
+end an_unreached_function_is_dropped

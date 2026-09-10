@@ -1,0 +1,211 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// **`p.count = v` where `count` is a settable property is a call**, exactly as `b[i] = v` on a
+// container is: a property computes rather than naming storage, so there is no place for a store to
+// write through, and the setter takes the value instead.
+//
+// What is here is the question an assignment has to ask before it commits to a store, and the two
+// answers it may get: the setter to call, or the sentence a property with no setter earns.
+
+// The name a setter is filed under, which is the property's with a mark nothing a program spells can
+// hold.
+setter_filed(name: string) -> string = name + SetterSuffix
+
+// Whether `recv.name = …` reaches a **setter** rather than storage.
+//
+// The receiver is read in a **probe**: its complaints are put back, because the reading is a
+// question about the receiver's type and not a place a mistake in it should be reported from — the
+// assignment reaches it again in its own position.
+settable(cx: &Analyzer, receiver: Expr, name: string) -> bool = receiver_probe(cx, receiver) match
+    Some(ty) -> has_setter(cx.an, ty, name)
+    None -> false
+
+// The receiver's type, read without reporting anything.
+receiver_probe(cx: &Analyzer, receiver: Expr) -> Option[Type]
+    val mark = cx.an.complaints()
+    val t = type_expr_bare(cx, receiver)
+
+    cx.an.restore_complaints(mark)
+
+    if texpr_type(t) == Unknown then return None
+
+    Some(receiver_type(texpr_type(t)))
+end receiver_probe
+
+// Whether this type has a setter for `name`.
+//
+// The three receivers a property can be read off are the three it can be written through, and each
+// is asked the question the same way its read asks it: a bound consults what it licenses, a trait
+// object consults the table's members, and everything else consults the type's own.
+has_setter(a: &Analysis, ty: Type, name: string) -> bool
+    val filed = setter_filed(name)
+
+    if erased(ty) then return trait_offers(a, ty, filed, false)
+
+    ty match
+        Abstract(_, bounds) -> bound_member(a, ty, bounds, filed).is_some()
+        _ -> has_member_at(a, member_key(a, ty, filed).0, filed)
+end has_setter
+
+// Whether the trait behind an erased pointer offers this member, and where `want_property` is set
+// offers it as a property.
+private trait_offers(a: &Analysis, ty: Type, name: string, want_property: bool) -> bool
+    val tr = erased_trait(ty)
+
+    if tr.is_none() then return false
+
+    tr.unwrap() match
+        Trait(n, args, _) ->
+            val ms = trait_members(a, Bound(n, args), self_binding(ty))
+
+            for i in 0..<ms.len()
+                if ms.at(i).1.name == name && (!want_property || ms.at(i).1.is_property)
+                    return true
+
+            false
+        _ -> false
+end trait_offers
+
+// `recv.name = value`, as the call it is.
+//
+// The compound forms are where a property parts company with `IndexSet`: a container's subscript
+// would evaluate the receiver *and the index* twice, and a property has no index — so taking the
+// receiver's address once is the whole of what the form needs, and it is the line the feature exists
+// for, `count += 1` rather than the two calls written out.
+//
+// It is desugared into **source** rather than built here, so every rule arrives through its ordinary
+// spelling: `&` refuses a receiver with no address, the setter's own `*self` refuses a `val`, and
+// the arithmetic is whatever `+` means for that type. The temporary holds the **address**, since a
+// copy of the receiver would be written and thrown away.
+setter_assign(cx: &Analyzer, span: Span, op: string, receiver: Expr, name: string, value: Expr,
+              expected: Option[Type]) -> TExpr
+    // Asked of the receiver as **written**, and before the desugaring below replaces it with the
+    // temporary holding its address — after that there is no `self` left to recognize.
+    check_not_own_setter(cx, span, receiver, name)
+
+    if op == "="
+        var args: Buf[Expr] = buf()
+
+        args.push(value)
+        return call_member(cx, span, type_expr_bare(cx, receiver), setter_filed(name), args, None)
+    end if
+
+    if !addressable_receiver(cx, receiver)
+        cx.fault(span, s"'$op' reads '$name' and writes it back, so it needs a receiver it can " +
+                 "reach twice — this one is computed, and has no address. Bind it to a 'var' first")
+
+    val tmp = s"${ModuleSep}recv"
+    val bin = op[0..<(op.bytes.len - 1)]
+
+    var stmts: Buf[Stmt] = buf()
+
+    stmts.push(Stmt(span, ValDecl(tmp, None, Expr(span, Unary("&", receiver)), File, None, None)))
+    stmts.push(Stmt(span, ExprStmt(Expr(span, Assign("=", through_temp(span, tmp, name),
+                                                     Expr(span, Binary(bin,
+                                                                       through_temp(span, tmp, name),
+                                                                       value)))))))
+
+    type_expr(cx, Expr(span, Block(stmts)), expected)
+end setter_assign
+
+// `(*$recv).name`, which is the place the desugaring reads and writes.
+private through_temp(span: Span, tmp: string, name: string) -> Expr =
+    Expr(span, Field(Expr(span, Unary("*", Expr(span, Ident(tmp)))), name))
+
+// **A property that writes itself calls itself**, and there is no reading under which that is what
+// was meant.
+private check_not_own_setter(cx: &Analyzer, span: Span, receiver: Expr, name: string)
+    if !names_self(receiver) then return
+    if enclosing_member(cx) != setter_filed(name) then return
+
+    cx.fault(span, s"'$name' writes the property it is defining, so it calls itself — a setter is " +
+             "what writing the property means, and there is nothing further in for it to reach. " +
+             "What a body like this means to write is the field it is in front of")
+end check_not_own_setter
+
+private names_self(receiver: Expr) -> bool = *receiver.kind match
+    Ident(n) -> n == "self"
+    Unary(op, inner) -> op == "*" && names_self(inner)
+    _ -> false
+
+// The member the body being analyzed *is*, as it was filed — `count` in `Cell.count`, and
+// `count$set` in `Cell.count$set`.
+private enclosing_member(cx: &Analyzer) -> string
+    val name = cx.func_name
+    val b = name.bytes
+
+    var cut: usize = 0
+    var found = false
+
+    for i in 0..<b.len
+        if b[i] == u8('.')
+            cut = i + 1
+            found = true
+
+    if !found then return name
+
+    name[cut..<b.len]
+end enclosing_member
+
+// A property with **no** setter, where the ordinary path would report an expression with no address.
+// That is true and is not what the reader needs to know: what is missing is the member, and the
+// sentence that says so also says where it goes.
+//
+// The three receivers are the three `has_setter` asks about, and the answer differs in one word: a
+// property reached through a bound or through a table belongs to the **trait**, so that is where a
+// setter for it is declared, and saying "on 'Cell'" there would send the reader to write a member no
+// bound would license.
+//
+// The answer is what the type is called, where the setter goes, and whether the reading was through
+// a bound — which decides whether the complaint is one the generic pass keeps.
+read_only_property(cx: &Analyzer, receiver: Expr, name: string) -> Option[(string, string, bool)]
+    val probed = receiver_probe(cx, receiver)
+
+    if probed.is_none() then return None
+
+    val ty = probed.unwrap()
+
+    if has_setter(cx.an, ty, name) then return None
+
+    if erased(ty)
+        if !trait_offers(cx.an, ty, name, true) then return None
+
+        val tr = erased_trait(ty)
+
+        tr.unwrap() match
+            Trait(n, _, _) -> return Some((type_show(ty), s"in trait '${module_show(n)}'", false))
+            _ -> return None
+    end if
+
+    ty match
+        Abstract(_, bounds) ->
+            val found = bound_member(cx.an, ty, bounds, name)
+
+            if found.is_none() || !found.unwrap().2.is_property then return None
+
+            Some((type_show(ty), s"in trait '${module_show(found.unwrap().0.name)}'", true))
+        _ ->
+            val m = member_at(cx.an, member_key(cx.an, ty, name).0, name)
+
+            if m.is_none() || !m.unwrap().is_property then return None
+
+            Some((type_show(ty), s"on '${type_show(ty)}'", false))
+end read_only_property
+
+// The sentence a property with no setter earns, in the terms the assignment was written in.
+read_only_message(op: string, name: string, of: string, where: string) -> string =
+    s"'$name' is a property of '$of', which computes rather than naming storage, so " +
+    s"${if op == "=" then "there is nothing to assign through" else s"'$op' has nothing to write back"}" +
+    s" — write 'set $name(…)' $where to give it a setter"
+
+// Whether a receiver has an address a compound form can reach twice.
+private addressable_receiver(cx: &Analyzer, receiver: Expr) -> bool
+    val mark = cx.an.complaints()
+    val t = auto_deref(cx, type_expr_bare(cx, receiver))
+
+    cx.an.restore_complaints(mark)
+    is_place(t)
+end addressable_receiver

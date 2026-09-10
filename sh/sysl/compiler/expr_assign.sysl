@@ -31,6 +31,23 @@ assign_expr(cx: &Analyzer, span: Span, op: string, target: Expr, value: Expr) ->
 
                 return call_member(cx, span, type_expr_bare(cx, receiver), "index_set", args, None)
             end if
+
+        // `p.count = v` where `count` is a settable property is a **call** for the reason an element
+        // set through `IndexSet` is: a property computes rather than naming storage, so there is no
+        // place for a store to write through, and the setter takes the value instead.
+        Field(receiver, name) ->
+            if settable(cx, receiver, name)
+                return setter_assign(cx, span, op, receiver, name, value, None)
+
+            // A property with **no** setter. The ordinary path would report an expression with no
+            // address, which is true and is not what the reader needs to know: what is missing is
+            // the member, and the sentence that says so also says what to write.
+            val read_only = read_only_property(cx, receiver, name)
+
+            if read_only.is_some()
+                val p = read_only.unwrap()
+
+                return cx.err(span, read_only_message(op, name, p.0, p.1))
         _ -> ()
 
     if op == "="

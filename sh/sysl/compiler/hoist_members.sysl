@@ -69,17 +69,14 @@ struct MemberHome
     shaped(self) -> bool = self.head.is_some() && self.head.unwrap() == self.key
 end MemberHome
 
-// Every member of every declaration, and then the `impl` blocks.
+// **Every setter is paired with the property it writes, before anything reads a signature.**
 //
-// The two are separate walks and the order is load-bearing: a block's members share a namespace with
-// the type's own, so the type's have to be filed before a block can be told that a name is taken. The
-// blocks are read in the order the sources wrote them, since that is what decides which
-// implementation of a trait is the first and which carry a suffix.
-hoist_all_members(a: &Analysis, units: Buf[Program])
-    // **Every setter is paired first, and the paired list is written back**, because a declaration
-    // is read from the tables by more than this walk: a signature is resolved from them, conformance
-    // compares an `impl`'s setter against the trait's, and a table lays a trait's members out. A
-    // setter whose parameter has no type yet would be a signature nothing could be compared to.
+// A declaration is read from the tables by more than the member hoist: a signature is resolved from
+// them, conformance compares an `impl`'s setter against the trait's, and a table lays a trait's
+// members out. A setter whose parameter has no type yet would be a signature nothing could be
+// compared to -- and, since resolving one happens before the members are hoisted, a placeholder
+// nobody wrote reported as a type that does not exist.
+pair_all_setters(a: &Analysis)
     for i in 0..<a.tables.types.len()
         val key = a.tables.types.key_at(i)
         val decl = a.tables.types.at(i)
@@ -102,10 +99,15 @@ hoist_all_members(a: &Analysis, units: Buf[Program])
                 paired.methods = pair_setters(a, decl.scope, d.methods, label, buf())
                 a.tables.types.put(key, Decl(TraitOf(paired), decl.span, decl.scope))
             _ -> ()
+end pair_all_setters
 
-    // **Every struct's members, then every enum's, then the blocks** -- three passes rather than one,
-    // because what a member's signature resolves is recorded in the order it was resolved, and that
-    // order is part of what a compilation says about itself.
+// Every member of every declaration, and then the `impl` blocks.
+//
+// The two are separate walks and the order is load-bearing: a block's members share a namespace with
+// the type's own, so the type's have to be filed before a block can be told that a name is taken. The
+// blocks are read in the order the sources wrote them, since that is what decides which
+// implementation of a trait is the first and which carry a suffix.
+hoist_all_members(a: &Analysis, units: Buf[Program])
     for i in 0..<a.tables.types.len()
         val key = a.tables.types.key_at(i)
         val decl = a.tables.types.at(i)
