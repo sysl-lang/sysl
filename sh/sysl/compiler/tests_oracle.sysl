@@ -850,3 +850,147 @@ the_typed_trees_agree_over_whole_programs()
             assert(found.matched > 0, "the sweep compared something")
             assert(found.mismatched == 0, s"$summary${found.first_bad}")
 end the_typed_trees_agree_over_whole_programs
+
+// -- the LLVM text, restricted to the section this stage lowers ------------------------------------
+
+// What one sweep of the emitted types came to.
+struct TypeAgreement
+    compared: usize
+    mismatched: usize
+    definitions: usize
+    skipped_absent: usize
+    skipped_unresolved: usize
+    first_bad: string
+end TypeAgreement
+
+// The reference compiler's LLVM text for one program, and whether it was willing to lower it.
+private ask_oracle_llvm(binary: string, path: string) -> Answer
+    capture(binary, ["emit-llvm", path], "", [], true) match
+        Err(_) -> Answer(false, "", "the oracle could not be run")
+        Ok(answer) ->
+            Answer(answer.status.ok(), without_trailing_newlines(answer.text),
+                   first_error(answer.err.unwrap_or("")))
+end ask_oracle_llvm
+
+// The reference's type definitions, less the ones a **body's** lowering introduces.
+//
+// `%arc.header`, `%arc.reaper` and the box a counted value is held in are the ownership runtime's
+// own types: nothing declares them and no layout table holds them, so they arrive when a body that
+// counts something is lowered. This stage lowers no body, so they are not its to write, and leaving
+// them in the comparison would be holding this stage to the next one's work.
+private declared_type_lines(text: string) -> Buf[string]
+    val all = type_def_lines(text)
+    var out: Buf[string] = buf()
+
+    for i in 0..<all.len()
+        if !all.at(i).starts_with("%arc.") then out.push(all.at(i))
+
+    out
+end declared_type_lines
+
+private compare_types(binary: string, path: string, label: string, found: *TypeAgreement)
+    val theirs = ask_oracle_llvm(binary, path)
+
+    if !theirs.ok
+        found.skipped_absent += 1
+        return
+    end if
+
+    emit_llvm_text(path, None) match
+        Err(_) ->
+            found.skipped_unresolved += 1
+        Ok(mine) ->
+            if !mine.report.is_empty()
+                found.skipped_unresolved += 1
+                return
+            end if
+
+            val want = declared_type_lines(theirs.text)
+            val got = type_def_lines(mine.text)
+
+            found.compared += 1
+            found.definitions += want.len()
+
+            val where = first_difference(want, got)
+
+            if where.is_some()
+                found.mismatched += 1
+
+                if found.mismatched <= 8
+                    found.first_bad = s"${found.first_bad}\n$label: ${where.unwrap()}"
+end compare_types
+
+// Where two lists of lines first disagree, or nothing where they do not.
+private first_difference(want: Buf[string], got: Buf[string]) -> Option[string]
+    val n = if want.len() < got.len() then want.len() else got.len()
+
+    for i in 0..<n
+        if want.at(i) != got.at(i)
+            return Some(s"line ${i + 1}: theirs '${want.at(i)}', ours '${got.at(i)}'")
+
+    if want.len() != got.len()
+        return Some(s"${want.len()} definitions theirs, ${got.len()} ours")
+
+    None
+end first_difference
+
+// Whether a block declares a type of its own, which is what makes it worth lowering here.
+//
+// **A block that declares none contributes only the library's own definitions**, and every block
+// that does declare one proves those as well -- so sweeping all of them would be running the
+// reference compiler eight hundred times to learn the same list eight hundred times.
+private declares_a_type(block: string) -> bool =
+    block.index_of("struct ").is_some() || block.index_of("enum ").is_some()
+
+@test("the two compilers define the same LLVM types for every program that declares one")
+the_emitted_types_agree()
+    oracle() match
+        None ->
+            print("skipped: SYSL_ORACLE names no reference compiler on this machine")
+            return
+        Some(binary) ->
+            if library_units().is_empty()
+                print("skipped: the standard module's source is not on this machine")
+                return
+            end if
+
+            val root = "../sysl.sh/docs/content/reference"
+
+            if !present(root)
+                print("skipped: the reference pages are not on this machine")
+                return
+            end if
+
+            val dir = make_temp_dir("sysl-types").unwrap()
+            val scratch = dir + "/block.sysl"
+
+            var found = TypeAgreement(0, 0, 0, 0, 0, "")
+
+            for item in walk(root)
+                item match
+                    Err(_) -> ()
+                    Ok(entry) ->
+                        if entry.path.ends_with(".md")
+                            read_text(entry.path) match
+                                Err(_) -> ()
+                                Ok(page) ->
+                                    val blocks = sysl_blocks(page)
+
+                                    for i in 0..<blocks.len()
+                                        if declares_a_type(blocks.at(i))
+                                            write_text(scratch, blocks.at(i)).unwrap()
+                                            compare_types(binary, scratch,
+                                                s"${entry.path} block ${i + 1}", &found)
+
+            remove_file(scratch)
+
+            val summary = s"emitted types: ${found.compared} programs compared, " +
+                s"${found.definitions} definitions, ${found.mismatched} mismatched, " +
+                s"${found.skipped_absent} the reference refused, " +
+                s"${found.skipped_unresolved} this compiler could not finish"
+
+            print(summary)
+            record_summary(s"$summary${found.first_bad}")
+            assert(found.compared > 0, "the sweep compared something")
+            assert(found.mismatched == 0, s"$summary${found.first_bad}")
+end the_emitted_types_agree

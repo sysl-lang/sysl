@@ -1,0 +1,161 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// Lowering a whole program to a module of intermediate representation.
+//
+// **What is built here is what a program's *declarations* amount to**: the machine it is for, and
+// the named types every value of it is stored at. A function's body is lowered elsewhere; nothing
+// here reads one, which is what makes every line of it answerable from the typed tree alone.
+//
+// **A type is defined once per LLVM name.** Two instantiations that mangle to one name are one
+// layout -- the only thing mangling collapses is a subtype into the base it is stored as -- and
+// defining it twice is a module the back end refuses rather than one it chooses for.
+
+// The module a program lowers to.
+codegen_module(p: TProgram, t: Target) -> IrModule
+    val layout = TargetLayout(t.pointer_bits())
+    val word_bits = int(t.pointer_bits())
+
+    IrModule(t.triple, no_sigs(), struct_defs(p, word_bits), enum_defs(p, layout), no_defs(),
+             no_sigs(), no_globals(), no_runtime(), no_funcs(), no_funcs(), None, None, None)
+end codegen_module
+
+// A whole module as LLVM text, which is what `emit-llvm` prints.
+codegen_text(p: TProgram, t: Target) -> string = ir_print_module(codegen_module(p, t))
+
+// The struct definitions, in the order the program made them real and one per LLVM name.
+private struct_defs(p: TProgram, word_bits: int) -> Buf[IrTypeDef]
+    var out: Buf[IrTypeDef] = buf()
+    var seen: Buf[string] = buf()
+
+    for i in 0..<p.structs.len()
+        p.structs.at(i) match
+            Struct(d) ->
+                val name = l_render(struct_lty(d))
+
+                if !holds(seen, name)
+                    seen.push(name)
+
+                    struct_type_def(d, word_bits) match
+                        Some(def) -> out.push(def)
+                        None -> ()
+            _ -> ()
+
+    out
+end struct_defs
+
+// The enum definitions: each data variant's payload aggregate, and then the enum itself. A simple
+// enum is its underlying integer and is not in this list at all.
+private enum_defs(p: TProgram, layout: TargetLayout) -> Buf[IrTypeDef]
+    var out: Buf[IrTypeDef] = buf()
+    var seen: Buf[string] = buf()
+
+    for i in 0..<p.enums.len()
+        p.enums.at(i) match
+            Enum(d) ->
+                val name = l_render(enum_lty(d))
+
+                if !holds(seen, name)
+                    seen.push(name)
+
+                    val defs = enum_type_defs(d, layout)
+
+                    for j in 0..<defs.len()
+                        out.push(defs.at(j))
+            _ -> ()
+
+    out
+end enum_defs
+
+private holds(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end holds
+
+// The empty lists a module that lowers no body still has to be built with.
+private no_sigs() -> Buf[IrFuncSig]
+    var out: Buf[IrFuncSig] = buf()
+
+    out
+end no_sigs
+
+private no_defs() -> Buf[IrTypeDef]
+    var out: Buf[IrTypeDef] = buf()
+
+    out
+end no_defs
+
+private no_globals() -> Buf[IrGlobal]
+    var out: Buf[IrGlobal] = buf()
+
+    out
+end no_globals
+
+private no_runtime() -> Buf[IrRuntime]
+    var out: Buf[IrRuntime] = buf()
+
+    out
+end no_runtime
+
+private no_funcs() -> Buf[IrFunc]
+    var out: Buf[IrFunc] = buf()
+
+    out
+end no_funcs
+
+// -- reading one section back out of a module's text ----------------------------------------------
+
+// The **type definition** lines of a module's LLVM text, in order.
+//
+// **It is what makes a partial lowering provable.** Two compilers' whole outputs cannot be diffed
+// until both lower everything; one section of each can be diffed the moment either builds it, and a
+// section is a run of lines told apart by their shape rather than by where they sit. A definition is
+// the only line that reads `<name> = type <body>`.
+type_def_lines(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    val all = lines_of(text)
+
+    for i in 0..<all.len()
+        if is_type_def(all.at(i)) then out.push(all.at(i))
+
+    out
+end type_def_lines
+
+private is_type_def(line: string) -> bool
+    if line.bytes.len == 0 || line.bytes[0] != u8('%') then return false
+
+    holds_text(line, " = type ")
+end is_type_def
+
+// Whether one string holds another.
+private holds_text(text: string, needle: string) -> bool
+    val n = needle.bytes.len
+
+    if n > text.bytes.len then return false
+
+    for i in 0..(text.bytes.len - n)
+        if text[i..<(i + n)] == needle then return true
+
+    false
+end holds_text
+
+// A text's lines, without the newlines that ended them. A trailing newline ends the last line
+// rather than beginning an empty one.
+lines_of(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var start: usize = 0
+
+    for i in 0..<text.bytes.len
+        if text.bytes[i] == u8('\n')
+            out.push(text[start..<i])
+            start = i + 1
+
+    if start < text.bytes.len then out.push(text[start..<text.bytes.len])
+
+    out
+end lines_of

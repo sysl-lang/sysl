@@ -34,6 +34,7 @@ run_cli(args: []string, say: string -> unit) -> int
             Fine
         "emit-ast" -> emit_ast_command(args, say)
         "emit-typed" -> emit_typed_command(args, say)
+        "emit-llvm" -> emit_llvm_command(args, say)
         other ->
             say(s"sysl: `${other}` is not a command this compiler can carry out yet")
             say(usage())
@@ -135,8 +136,53 @@ private emit_typed_command(args: []string, say: string -> unit) -> int
             Fine
 end emit_typed_command
 
+// `sysl emit-llvm [--target <name>] <path>` -- one whole program's LLVM text.
+//
+// **The reference compiler answers this command line with the text it hands to the back end**, so
+// the two are diffed rather than compared by hand. The path is a program on the same terms
+// `emit-typed`'s is.
+private emit_llvm_command(args: []string, say: string -> unit) -> int
+    var named: Option[string] = None
+    var file = ""
+    var i: usize = 2
+
+    while i < args.len
+        if args[i] == "--target"
+            if i + 1 >= args.len
+                say("usage: sysl emit-llvm [--target <name>] <path>")
+                return Misused
+            end if
+
+            i += 1
+            named = Some(args[i])
+        else
+            file = args[i]
+
+        i += 1
+
+    if file == ""
+        say("usage: sysl emit-llvm [--target <name>] <path>")
+        return Misused
+    end if
+
+    emit_llvm_text(file, named) match
+        Err(refusal) ->
+            say(s"error: ${refusal.message}")
+            Failed
+        Ok(emitted) ->
+            if !emitted.report.is_empty()
+                say(analysis_report(emitted.report))
+                return Failed
+            end if
+
+            say(if emitted.text.ends_with("\n") then emitted.text[0..<(emitted.text.len - 1)]
+                else emitted.text)
+            Fine
+end emit_llvm_command
+
 usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <file> | " +
-    "emit-typed [--no-spans] [--tables] [--target <name>] <path>"
+    "emit-typed [--no-spans] [--tables] [--target <name>] <path> | " +
+    "emit-llvm [--target <name>] <path>"
 
 main(args: []string)
     val code = run_cli(args, line -> print(line))

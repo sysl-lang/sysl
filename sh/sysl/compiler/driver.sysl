@@ -168,6 +168,42 @@ emit_typed_text(path: string, named_target: Option[string],
     if tables then Ok(Emitted(tables_text(program), buf())) else Ok(typed_text(program))
 end emit_typed_text
 
+// `sysl emit-llvm [--target <name>] <path>` -- one program's LLVM text.
+//
+// **It is the same command line the reference compiler answers**, so agreement between the two is
+// one `diff` and a disagreement names the line. What this compiler lowers today is the module
+// header and the named types a program's values are stored at; the sections a function body fills
+// are empty, which is what makes the comparison one of a section rather than of a whole.
+emit_llvm_text(path: string, named_target: Option[string]) -> Result[Emitted, Refusal]
+    val t = target_for(path, named_target)?
+    val program = compilation_of(path, t)?
+    val done = analyze_bodies(program.units, program.target)
+
+    Ok(Emitted(codegen_text(program_of(done, done.main_module), t), errors_of(done.reported)))
+end emit_llvm_text
+
+// The machine a command line asked for: the one it named, the manifest's default, or this host --
+// with the floor the manifest states checked before anything is read.
+private target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal]
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+    val manifest = manifest_at(root)?
+
+    val chosen = named_target match
+        Some(name) -> name
+        None -> manifest.default_target
+
+    val t = if chosen == "" then host_target()
+    else target_resolved(chosen) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(found) -> found
+
+    check_floor(who_of(manifest, path), manifest.floor, Version) match
+        None -> ()
+        Some(why) -> return Err(Refusal(why))
+
+    Ok(t)
+end target_for
+
 // What `emit-typed` came to: the text to print, and what the analyzer had to say. A program the
 // compiler refused prints nothing on standard output, exactly as every compiling command does.
 struct Emitted

@@ -1470,3 +1470,68 @@ a_default_registers_nothing()
         if type_show(p.structs.at(i)) == "a closure" then shapes += 1
 
     assert(shapes == 0, "the default's own closure was recorded as a shape the program laid out")
+
+// -- what a program lays out ----------------------------------------------------------------------
+
+// The named types a source laid out beside the library, as a diagnostic spells each.
+private laid_out(text: string) -> Buf[string]
+    val parsed = parse(source_of("test.sysl", text))
+    var out: Buf[string] = buf()
+
+    if !parsed.ok()
+        out.push(parsed.report.at(0).message)
+        return out
+    end if
+
+    var units: Buf[Program] = buf()
+    val library = library_trees()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val program = program_of(done, done.main_module)
+
+    for i in 0..<program.structs.len()
+        out.push(type_show(program.structs.at(i)))
+
+    for i in 0..<program.enums.len()
+        out.push(type_show(program.enums.at(i)))
+
+    out
+end laid_out
+
+private any_holding(names: Buf[string], text: string) -> Option[string]
+    for i in 0..<names.len()
+        if names.at(i).index_of(text).is_some() then return Some(names.at(i))
+
+    None
+end any_holding
+
+@test("a generic container read at its own definition lays out nothing, because nothing has that type")
+a_stand_in_is_not_a_layout()
+    if no_library() then return
+
+    val names = laid_out("struct Env\n    n: int\nend Env\n\nmain()\n    print(Env(1).n)\n")
+    val found = any_holding(names, "[?")
+
+    assert(found.is_none(), s"a type made real at nothing: ${found.unwrap_or("")}")
+    assert(any_holding(names, "Env").is_some(), "the program's own struct is laid out")
+end a_stand_in_is_not_a_layout
+
+@test("a declaration the destructor warning reads is not a type the program laid out")
+reading_a_declaration_lays_out_nothing()
+    if no_library() then return
+
+    // The warning runs only where a program declares a `Drop`, and it resolves the declared result
+    // of every function there is -- `spawn[T](…) -> Option[Thread]` among them.
+    val names = laid_out("struct Env\n    n: int\nend Env\n\nimpl Drop for Env\n" +
+                         "    drop(self)\n        print(\"closed\")\n\n" +
+                         "main()\n    var e: &Env = Env(7)\n\n    print(e.n)\n")
+    val found = any_holding(names, "posix.threads.Thread]")
+
+    assert(found.is_none(), s"a type only a declaration named: ${found.unwrap_or("")}")
+    assert(any_holding(names, "Env").is_some(), "the program's own struct is laid out")
+end reading_a_declaration_lays_out_nothing

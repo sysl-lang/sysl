@@ -1,0 +1,165 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// Lowering a type to LLVM's, and the module-level definitions the named ones need.
+//
+// **This is the erasure**, and it is the whole reason the intermediate representation has a type
+// system of its own: a `Constrained` subtype is its base, a `volatile` qualifier is nothing at all,
+// a trait object is two words, and a type parameter has no answer because a type parameter never
+// reaches here. What comes out is what LLVM's own type system says and nothing the language knew.
+//
+// **Four shapes have no lowering, and they answer `None` rather than something plausible.** A type
+// parameter, a trait standing as a type of its own, a value written where a type was expected, and
+// a pack of types are each a *diagnostic* shape: the walk that reads a generic body once at its own
+// definition builds them, and no value at run time has one. A back end that was handed a guess for
+// one of them would lay out a type nothing has.
+type_lty(t: Type, word_bits: int) -> Option[LType] = t match
+    Integer(bits, _, _) -> Some(LInt(bits))
+    Floating(bits) -> Some(LFloat(bits))
+    Char -> Some(LInt(32))
+    Bool -> Some(LInt(1))
+    Unit -> Some(LVoid)
+
+    // Four pointers' worth covers every variadic cursor the compiler targets, and only the prefix
+    // the ABI defines is ever touched.
+    VaList -> Some(LArr(4, LPtr))
+
+    // An expression that does not come back leaves no value, so there is nothing to carry.
+    Never -> Some(LVoid)
+    Unknown -> Some(LVoid)
+
+    Abstract(_, _) -> None
+    Trait(_, _, _) -> None
+    ConstArg(_, _) -> None
+    Pack(_) -> None
+
+    // A pointer to a trait carries the table beside the address; every other pointer is one word.
+    Ptr(inner) -> Some(if points_at_trait(*inner) then l_fat() else LPtr)
+    Ref(inner, _) -> Some(if points_at_trait(*inner) then l_fat() else LPtr)
+    Weak(inner) -> Some(if points_at_trait(*inner) then l_fat() else LPtr)
+
+    // A function under the C convention is an address and nothing else.
+    CFn(_, _) -> Some(LPtr)
+
+    // A qualifier on the storage rather than a type of its own.
+    Volatile(inner) -> type_lty(*inner, word_bits)
+
+    Array(length, elem) -> type_lty(*elem, word_bits) match
+        Some(e) -> Some(LArr(length, e))
+        None -> None
+    Vector(length, elem) -> type_lty(*elem, word_bits) match
+        Some(e) -> Some(LVec(length, e))
+        None -> None
+
+    // Every view has the same three words, so the element type shows up only in the instructions
+    // that reach through it -- which is what lets a slice and a string share one implementation.
+    Slice(_, _) -> Some(l_view(word_bits))
+    Str -> Some(l_view(word_bits))
+
+    Struct(d) -> Some(struct_lty(d))
+    Results(parts) -> Some(struct_lty(parts))
+
+    // A simple enum is its underlying integer and has no layout of its own.
+    Enum(d) -> if d.simple then type_lty(d.underlying, word_bits) else Some(enum_lty(d))
+
+    // A named subtype is stored as what it narrows.
+    Constrained(d) -> type_lty(d.base, word_bits)
+
+// Whether what a pointer points at is a trait, which is the one thing that makes it two words.
+private points_at_trait(inner: Type) -> bool = inner match
+    Trait(_, _, _) -> true
+    _ -> false
+
+// The name LLVM knows a struct by. A tuple and a result list are structs too, so this is the one
+// spelling for all three.
+struct_lty(d: &StructType) -> LType = LNamed(s"%struct.${mangled(d.base, d.targs)}")
+
+// The name LLVM knows a data enum by.
+enum_lty(d: &EnumType) -> LType = LNamed(s"%enum.${mangled(d.base, d.targs)}")
+
+// The payload aggregate a data variant stores -- `%Shape.Circle`.
+variant_lty(d: &EnumType, v: EnumVariant) -> LType = LNamed(s"%${mangled(d.base, d.targs)}.${v.name}")
+
+// The type a data enum's tag is read at. A simple enum's tag is the whole of it and takes the
+// underlying width; every other is an `i32`.
+enum_tag_lty(d: &EnumType, word_bits: int) -> LType =
+    if d.simple then type_lty(d.underlying, word_bits).unwrap_or(LInt(32)) else LInt(32)
+
+// The same, written down. Every LLVM type text comes from here and none of it is built by
+// concatenation: `type_lty` decides the shape and `l_render` spells it, so the two questions have
+// one answer each rather than one answer between them.
+type_llvm(t: Type, word_bits: int) -> Option[string] = type_lty(t, word_bits) match
+    Some(l) -> Some(l_render(l))
+    None -> None
+
+// -- the definitions a named type needs at module level -------------------------------------------
+
+// A struct's definition: its stored fields in declaration order, or the one integer a bitfield
+// struct really is.
+//
+// **A bitfield struct has no members here at all**: it is one integer, and its fields are bit ranges
+// of that integer rather than anything LLVM is told about. Writing the container inside `<{ }>`
+// rather than as a bare `iM` is what keeps every site that reaches into a struct -- an alloca, a
+// by-value parameter, a load of the whole of one -- on the one shape.
+//
+// `@align` is not written here. A type carries no alignment in LLVM's textual form: the boundary is
+// stated where storage is created, which is what an alloca and a global carry.
+struct_type_def(d: &StructType, word_bits: int) -> Option[IrTypeDef]
+    var fields: Buf[LType] = buf()
+
+    bitfield_ranges(d) match
+        Some(ranges) -> fields.push(LInt(bitfield_bits(ranges)))
+        None ->
+            val stored = d.stored()
+
+            for i in 0..<stored.len()
+                type_lty(stored.at(i).1, word_bits) match
+                    Some(l) -> fields.push(l)
+                    None -> return None
+
+    Some(IrTypeDef(s"%struct.${mangled(d.base, d.targs)}", fields, d.packed))
+end struct_type_def
+
+// A data enum's definitions: one aggregate per variant that carries something, and then the enum
+// itself.
+//
+// A data enum is the tag and **one** payload region, wide enough and aligned for whichever variant
+// needs the most. Each variant's own payload keeps its named aggregate type, which is what a
+// construction stores into that region and what a match reads back out of it.
+enum_type_defs(d: &EnumType, l: TargetLayout) -> Buf[IrTypeDef]
+    val word_bits = int(l.word_bits)
+    var out: Buf[IrTypeDef] = buf()
+
+    for i in 0..<d.variants.len()
+        val v = d.variants.at(i)
+
+        if v.carries
+            var fields: Buf[LType] = buf()
+            val stored = v.stored()
+            var whole = true
+
+            for j in 0..<stored.len()
+                type_lty(stored.at(j).1, word_bits) match
+                    Some(t) -> fields.push(t)
+                    None -> whole = false
+
+            if whole then out.push(ir_type_def(l_render(variant_lty(d, v)), fields))
+
+    val area = payload_area(d, l)
+    var body: Buf[LType] = buf()
+
+    body.push(LInt(32))
+    body.push(LArr(area.1, area.0))
+    out.push(ir_type_def(l_render(enum_lty(d)), body))
+    out
+end enum_type_defs
+
+// The payload region: a unit as wide as the strictest alignment any variant needs, and as many of
+// them as the widest payload takes.
+payload_area(d: &EnumType, l: TargetLayout) -> (LType, int)
+    val align = l.payload_align(d)
+    val unit = if align > 1 then align else 1
+
+    (LInt(int(unit) * 8), int(round_up(l.payload_size(d), unit) / unit))
+end payload_area
