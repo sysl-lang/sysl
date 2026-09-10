@@ -1024,3 +1024,78 @@ storage_of_a_type_that_is_not_there()
     val said = complaints("module m\n\nvar current: Option[*Missing] = None\n")
 
     assert(says(said, "unknown type 'Missing'"), listed(said))
+
+// -- what a declaration's condition lowers to -----------------------------------------------------
+
+// The names of the functions a program ends up with, in the order it declared them.
+private declared_names(text: string) -> Buf[string]
+    val p = program_of_text(text)
+    var out: Buf[string] = buf()
+
+    for i in 0..<p.funcs.len()
+        out.push(p.funcs.at(i).name)
+
+    out
+end declared_names
+
+private names_hold_one(xs: Buf[string], name: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == name then return true
+
+    false
+end names_hold_one
+
+@test("a 'where' predicate becomes a function of the value, named after the type it narrows")
+a_where_predicate_is_lifted()
+    if no_library() then return
+
+    val names = declared_names("module m\n\ntype Even = int where value % 2 == 0\n")
+
+    assert(names_hold_one(names, "m$Even$pred"), "no 'm$Even$pred' among the functions")
+
+@test("and a struct's invariant clauses become one function of its fields")
+invariant_clauses_are_lifted()
+    if no_library() then return
+
+    val text = "module m\n\nstruct Held\n    a: int\n    b: int\n\n    invariant a <= b\nend Held\n"
+    val names = declared_names(text)
+
+    assert(names_hold_one(names, "m$Held$inv"), "no 'm$Held$inv' among the functions")
+
+@test("a predicate is code, so one that is not a 'bool' is reported as the condition a reader wrote")
+a_where_predicate_that_is_not_a_bool()
+    if no_library() then return
+
+    val said = complaints("module m\n\ntype Even = int where value + 1\n")
+
+    assert(says(said, "a 'where' predicate must be a 'bool', but this one is int"), listed(said))
+
+@test("and so is an invariant clause")
+an_invariant_clause_that_is_not_a_bool()
+    if no_library() then return
+
+    val text = "module m\n\nstruct Held\n    a: int\n    b: int\n\n    invariant a + b\nend Held\n"
+    val said = complaints(text)
+
+    assert(says(said, "an 'invariant' must be a 'bool', but this one is int"), listed(said))
+
+@test("a struct that states an invariant is checked the moment one is built")
+a_construction_checks_the_invariant()
+    if no_library() then return
+
+    val text = "module m\n\nstruct Held\n    a: int\n    b: int\n\n    invariant a <= b\nend Held\n\n" +
+        "hold(x: int, y: int) -> Held = Held(x, y)\n"
+    val out = shown(text, "m$hold")
+
+    assert(out.contains("TStructInvCheck"), out)
+    assert(out.contains("invFn: \"m$Held$inv\""), out)
+
+@test("and one that states none is built with nothing wrapped around it")
+a_construction_with_no_invariant()
+    if no_library() then return
+
+    val text = "module m\n\nstruct Plain\n    a: int\nend Plain\n\n" +
+        "hold(x: int) -> Plain = Plain(x)\n"
+    val out = shown(text, "m$hold")
+
+    assert(!out.contains("TStructInvCheck"), out)

@@ -382,9 +382,26 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
 
                 ts.push(t)
 
-            TExpr(span, TStructNew(d, ts))
+            // **A struct with `invariant` clauses is checked the moment it is built**, and every
+            // construction flows through here, so one wrap covers them all. A generic one has no
+            // predicate to call -- the clause is refused where it is declared -- so it builds
+            // unchecked.
+            checked_new(cx, span, TExpr(span, TStructNew(d, ts)), d)
         _ -> bad_expr(span)
 end struct_call
+
+// A construction with the invariant check its type owes wrapped around it, where it states one.
+private checked_new(cx: &Analyzer, span: Span, made: TExpr, d: &StructType) -> TExpr
+    val decl = cx.an.tables.types.get(d.base)
+
+    if decl.is_none() then return made
+
+    decl.unwrap().kind match
+        StructOf(sd) ->
+            if sd.invariants.is_empty() || !sd.tparams.is_empty() then made
+            else TExpr(span, TStructInvCheck(made, d, inv_key(d.base)))
+        _ -> made
+end checked_new
 
 // The arguments a generic struct is built at: the ones the position already names, where it names a
 // struct of this very declaration, and otherwise the ones the field values determine.

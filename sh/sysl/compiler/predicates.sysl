@@ -1,0 +1,82 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The functions a declaration lowers a condition to.
+//
+// **A `where` predicate and a struct's `invariant` clauses are code somebody wrote**, and the way to
+// hold them to everything code is held to is to make them ordinary functions rather than a shape
+// some later pass reads specially. So a `where` becomes `<Type>$pred(value: Base) -> bool` and a
+// struct's clauses become `<Struct>$inv(field1: T1, ...) -> bool`, both registered where every other
+// function is registered and both typed where every other body is typed. What calls them -- a
+// conversion into the subtype, a write to a field -- names them by the key below.
+//
+// The clauses are the *fields* rather than one `self`, so the bare field names a clause writes
+// resolve with no rewrite of the expression, and a clause that is not a `bool` is reported as such
+// through the ordinary body pass.
+
+// The function a `where` predicate lowered to.
+pred_key(base: string) -> string = s"$base${ModuleSep}pred"
+
+// Registers the function a declaration's condition lowered to, where it has one.
+//
+// It runs in the pass that fills the function tables rather than at the check, so the condition is
+// type-checked whether or not anything uses the type.
+register_predicate(a: &Analysis, scope: Scope, s: Stmt)
+    *s.kind match
+        TypeDecl(d) ->
+            if d.pred.is_none() then return
+
+            val key = module_qualify(scope.module_name, d.name)
+            var params: Buf[Param] = buf()
+
+            params.push(Param(s.span, "value", d.base, Public, None, false, false))
+            a.tables.funcs.put(pred_key(key),
+                               Func(bool_func(pred_key(key), params, d.pred.unwrap(), s.span),
+                                    s.span, scope))
+        StructDecl(d) ->
+            if d.invariants.is_empty() || !d.tparams.is_empty() then return
+
+            val key = module_qualify(scope.module_name, d.name)
+            var params: Buf[Param] = buf()
+
+            for i in 0..<d.fields.len()
+                val f = d.fields.at(i)
+
+                // The parameter takes the field's type without whatever qualifier the field carried:
+                // a `volatile u32` field is a `u32` argument, exactly as it is everywhere else a
+                // register is read. A clause that reads one is refused where the struct is declared.
+                params.push(Param(f.span, f.name, unqualified_ref(f.typ), Public, None, false, false))
+
+            a.tables.funcs.put(inv_key(key),
+                               Func(bool_func(inv_key(key), params, all_of(d.invariants), s.span),
+                                    s.span, scope))
+        _ -> ()
+
+// The declaration one of these lowers to: a plain function of the values, answering a `bool`.
+private bool_func(name: string, params: Buf[Param], cond: Expr, span: Span) -> FuncDecl
+    var body: Buf[Stmt] = buf()
+
+    body.push(stmt(cond.span, ExprStmt(cond)))
+
+    FuncDecl(name, buf(), params, Some(named_type(span, "bool")), body, buf(), false, Public, buf(),
+             buf(), buf(), None, None, None, false, false, false, None, None, None, None, buf(),
+             buf())
+end bool_func
+
+// A run of clauses as the one condition they amount to.
+private all_of(clauses: Buf[Expr]) -> Expr
+    var out = clauses.at(0)
+
+    for i in 1..<clauses.len()
+        out = expr(out.span, Binary("&&", out, clauses.at(i)))
+
+    out
+end all_of
+
+// A written type with the qualifier a field carried taken off, which is what a value of it is.
+private unqualified_ref(t: TypeRef) -> TypeRef = *t.kind match
+    VolatileType(inner) -> unqualified_ref(inner)
+    _ -> t

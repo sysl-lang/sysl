@@ -110,6 +110,17 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
                                                                                typed.name)
                             for k in opened..<a.closure_funcs.len()
                                 a.tables.test_only.push(a.closure_funcs.at(k).name)
+                // A `where` predicate and a struct's `invariant` clauses are functions the
+                // declaration lowered to, and are typed where the declaration stands -- which is
+                // the order every other body is typed in.
+                TypeDecl(d) ->
+                    if d.pred.is_some() then
+                        type_lowered(a, &funcs, &held, scope, library, s.span,
+                                     pred_key(module_qualify(scope.module_name, d.name)))
+                StructDecl(d) ->
+                    if !d.invariants.is_empty() && d.tparams.is_empty() then
+                        type_lowered(a, &funcs, &held, scope, library, s.span,
+                                     inv_key(module_qualify(scope.module_name, d.name)))
                 _ -> ()
 
     val declared = funcs.len()
@@ -161,7 +172,7 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
 
                     if at.member.is_some() then
                         funcs.push(analyze_instance(a, at.name, at.member.unwrap()))
-                    else funcs.push(analyze_body(a, at.scope, at.span, at.decl))
+                    else funcs.push(analyze_body(a, at.scope, at.span, at.decl, at.name))
 
         drain_pending(a, &funcs)
 
@@ -183,6 +194,19 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
 
     TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, ordered_vals(storage), a, units, entry)
 end analyze_bodies
+
+// The body of a function a declaration lowered a condition to, typed where the declaration stands.
+//
+// The library's are held back on the same terms its own functions are: a program that never makes a
+// value of a library subtype never checks one.
+private type_lowered(a: &Analysis, funcs: *Buf[TFunc], held: *Buf[HeldBody], scope: Scope,
+                     library: bool, span: Span, key: string)
+    val at = a.tables.funcs.get(key)
+
+    if at.is_none() then return
+
+    if library then held.push(HeldBody(key, scope, span, at.unwrap().decl, None))
+    else funcs.push(analyze_body(a, scope, span, at.unwrap().decl, key))
 
 // Every `@assert` written where a declaration stands, settled in the terms of the file that wrote
 // it.
@@ -249,8 +273,12 @@ file_local(v: Visibility) -> bool = v match
     _ -> false
 
 // One function: its parameters in scope, its contract read first, and its body as a value block.
-analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> TFunc
+// `key` is what the body is filed under, for the declarations that were never written: a `where`
+// predicate and a struct's `invariant` clauses lower to functions whose names hold a separator no
+// spelling a reader could write does, so the key is handed over rather than composed.
+analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = "") -> TFunc
     val cx = analyzer_for(a, scope)
+    val name = if key == "" then func_key(a, scope, span, d) else key
 
     cx.in_variadic = d.variadic
 
@@ -281,17 +309,17 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl) -> TFunc
     val body = body_block(cx, rest, ret)
 
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
-        cx.fault(body_span(rest, span), body_disagreement(func_key(a, scope, span, d), ret, body.ty))
+        cx.fault(body_span(rest, span), body_disagreement(name, ret, body.ty))
 
-    a.tables.homes.put(func_key(a, scope, span, d), scope)
+    a.tables.homes.put(name, scope)
 
     // **A file-private declaration's symbol is internal**, since nothing outside the file it was
     // written in can name it -- which is what keeps two files' `private pick` from being one symbol
     // at the link.
-    TFunc(span, func_key(a, scope, span, d), params, ret, body, d.variadic, contract.0, contract.1,
+    TFunc(span, name, params, ret, body, d.variadic, contract.0, contract.1,
           contract.2, file_local(d.vis), d.conv, d.tailrec, contract.3, d.pure, d.ghost,
-          frame_symbols(cx, span, func_key(a, scope, span, d), d.reads, "reads"),
-          frame_symbols(cx, span, func_key(a, scope, span, d), d.writes, "writes"),
+          frame_symbols(cx, span, name, d.reads, "reads"),
+          frame_symbols(cx, span, name, d.writes, "writes"),
           exported_symbol(d), d.section)
 end analyze_body
 
