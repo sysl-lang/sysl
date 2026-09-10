@@ -1,0 +1,74 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// A parameter's default, read where it is **written**.
+//
+// A default is filled at a call but written at the declaration, so it is a declaration's expression
+// the way a module member's initializer is: it is checked here, in the terms of the file that wrote
+// it and whether or not any call takes it, exactly as an unused `val` is. What a call does with one
+// is to stand it where the argument would have been.
+//
+// **A closure written as a default is lowered here**, which is the visible half of this: the number
+// inside a closure's name is the order the compilation lowered them in, and a default read only at
+// the calls that took it would number every closure after it by how many calls there happened to be.
+check_value_defaults(a: &Analysis)
+    for i in 0..<a.tables.funcs.len()
+        val f = a.tables.funcs.at(i)
+
+        read_defaults(a, f.scope, f.decl.tparams, f.decl.bounds, f.decl.tvalues, f.decl.tpacks,
+                      f.decl.params)
+
+    val lowered = a.tables.members.lowered
+
+    for i in 0..<lowered.len()
+        val m = lowered.at(i)
+        val home = a.tables.members.decl_scope.get(m.name)
+
+        if home.is_some() then
+            read_defaults(a, home.unwrap(), m.tparams, m.bounds, m.tvalues, m.tpacks, m.params)
+
+// One parameter list's defaults, each at the type its parameter was declared with.
+//
+// The parameters stand in for themselves where the declaration is generic, which is the same reading
+// its signature was resolved against: a default written at a type parameter is held to what the
+// bound promises and to nothing more.
+private read_defaults(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: Buf[NamedBounds],
+                      tvalues: Buf[TypeBinding], tpacks: Buf[string], params: Buf[Param])
+    var any = false
+
+    for i in 0..<params.len()
+        if params.at(i).default.is_some() then any = true
+
+    if !any then return
+
+    val subst = abstract_subst(a, scope, tparams, bounds, tvalues, tpacks, buf())
+
+    for i in 0..<params.len()
+        val p = params.at(i)
+
+        if p.default.is_none() then continue
+
+        val cx = analyzer_for(a, scope)
+        val want = resolve_type(a, scope, p.typ, subst)
+
+        cx.subst = subst
+
+        // **The reading is thrown away and the closure it lowered is not.** What this pass is for is
+        // holding the expression to being one -- the types it makes real are the ones the CALLS that
+        // take it make real, and registering them here would put a shape in the record of what the
+        // program laid out that no call asked for. A closure is the exception because its name is a
+        // counter over the whole compilation: the number is part of the symbol, so the body stays
+        // and only the registrations go.
+        val trial = a.sandboxed()
+        val structs = a.tables.struct_insts.len()
+        val enums = a.tables.enum_insts.len()
+        val constrained = a.tables.constrained_insts.len()
+
+        type_expr(cx, p.default.unwrap(), Some(want))
+
+        a.release(trial)
+        rewind_registered(a.tables.struct_insts, structs)
+        rewind_registered(a.tables.enum_insts, enums)
+        rewind_registered(a.tables.constrained_insts, constrained)

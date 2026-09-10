@@ -1430,3 +1430,43 @@ two_types_that_hold_each_other()
     val said = complaints("struct A\n    b: B\n\nstruct B\n    a: A\n\nmain() = print(1)\n")
 
     assert(says(said, "type 'A' contains itself, so it has no finite size"), listed(said))
+
+@test("a parameter's default is read where it is written, whether or not any call takes it")
+a_default_is_read_at_its_declaration()
+    if no_library() then return
+
+    val text = "apply(g: int -> int = y -> y * 2) -> int = g(21)\n\nmain() = print(1)\n"
+    val names = declared_names(text)
+
+    assert(names_hold_one(names, "$closure4.call"),
+           "the default's closure was not lowered where it was written")
+
+@test("and a call that leaves the argument out settles the type parameter from the default")
+a_default_settles_a_type_parameter()
+    if no_library() then return
+
+    val text = "apply(g: int -> int = y -> y * 2) -> int = g(21)\n\nmain() = print(apply())\n"
+    val said = complaints(text)
+
+    assert(said.is_empty(), listed(said))
+
+    val names = declared_names(text)
+    var applied = false
+
+    for i in 0..<names.len()
+        if names.at(i).starts_with("apply.") then applied = true
+
+    assert(applied, "the call took no instantiation of 'apply'")
+
+@test("a default read at its declaration makes nothing real, since what it makes is the caller's")
+a_default_registers_nothing()
+    if no_library() then return
+
+    val text = "apply(g: int -> int = y -> y * 2) -> int = g(21)\n\nmain() = print(1)\n"
+    val p = program_of_text(text)
+    var shapes = 0
+
+    for i in 0..<p.structs.len()
+        if type_show(p.structs.at(i)) == "a closure" then shapes += 1
+
+    assert(shapes == 0, "the default's own closure was recorded as a shape the program laid out")

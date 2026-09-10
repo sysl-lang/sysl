@@ -165,7 +165,7 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
         return bad_expr(span)
     end if
 
-    val prov = provisional_args(cx, f, slots)
+    val prov = provisional_args(cx, span, f, slots)
     var param_refs: Buf[TypeRef] = buf()
 
     for i in 0..<decl.params.len()
@@ -220,12 +220,17 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
                     else cx.fault(e.span, "argument disagrees")
 
                 ts.push(t)
+            // A default that was read while the solve was settling is the node the program gets:
+            // reading it again would lower a second closure for the one the declaration wrote.
             None ->
-                val inner = analyzer_for(cx.an, f.scope)
+                if i < prov.kept.len() && prov.kept.at(i).is_some()
+                    ts.push(prov.kept.at(i).unwrap())
+                else
+                    val inner = analyzer_for(cx.an, f.scope)
 
-                inner.reported = Some(span)
-                inner.here_src = caller_source(cx)
-                ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
+                    inner.reported = Some(span)
+                    inner.here_src = caller_source(cx)
+                    ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
 
     cx.an.uses(name)
     TExpr(span, TCall(name, ts, sig.unwrap().ret, false))
@@ -340,8 +345,9 @@ end quoted_and
 // read against that type, exactly as a call to something non-generic reads it. Everything else is
 // read on its own, with what it said put back: the reading is a guess made to solve with, and a
 // complaint about a guess is one nobody asked for.
-private provisional_args(cx: &Analyzer, f: Func, slots: Buf[Option[Expr]]) -> Provisional =
-    provisional_of(cx, f.scope, f.decl.tparams, f.decl.params, f.decl.ret_type, f.decl.bounds,
+private provisional_args(cx: &Analyzer, span: Span, f: Func,
+                         slots: Buf[Option[Expr]]) -> Provisional =
+    provisional_of(cx, span, f.scope, f.decl.tparams, f.decl.params, f.decl.ret_type, f.decl.bounds,
                    slots, no_bindings(), None)
 
 // What a first reading of a call's arguments settled: the type each one came to, whether it was a
@@ -361,7 +367,7 @@ end Provisional
 // The reading itself, for a free function and for a member alike. `known` is what the caller
 // already settled -- a member's receiver answers the type's own parameters before an argument is
 // read -- and `expected` is what the call's own position asks for.
-provisional_of(cx: &Analyzer, scope: Scope, tparams: Buf[string], params: Buf[Param],
+provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], params: Buf[Param],
                result: Option[TypeRef], bounds: Buf[NamedBounds], slots: Buf[Option[Expr]],
                known: Buf[Binding], expected: Option[Type]) -> Provisional
     var tys: Buf[Type] = buf()
@@ -369,17 +375,28 @@ provisional_of(cx: &Analyzer, scope: Scope, tparams: Buf[string], params: Buf[Pa
     var kept: Buf[Option[TExpr]] = buf()
     var held: Buf[usize] = buf()
 
+    // **A default stands exactly where the argument would have been**, so it says as much about a
+    // type parameter as a written argument does -- and a call that left one out would otherwise have
+    // nothing to settle that parameter from. It is read in the DECLARATION's own terms, which is
+    // where its names mean what they meant.
+    var written: Buf[Option[Expr]] = buf()
+
+    for i in 0..<slots.len()
+        if slots.at(i).is_some() then written.push(slots.at(i))
+        else written.push(params.at(i).default)
+
     for i in 0..<slots.len()
         val p = params.at(i)
 
         kept.push(None)
 
-        val e = slots.at(i)
+        val e = written.at(i)
+        val inner = arg_reader(cx, span, scope, slots.at(i).is_none())
 
         if e.is_none()
             tys.push(Unknown)
             soft.push(true)
-        else if callable_arg(cx, e.unwrap())
+        else if callable_arg(inner, e.unwrap())
             // Held back: an argument with no type of its own has nothing to unify, so the parameter
             // it stands at is settled by the others or by nothing at all -- and waiting cannot lose
             // the solution.
@@ -388,12 +405,12 @@ provisional_of(cx: &Analyzer, scope: Scope, tparams: Buf[string], params: Buf[Pa
             soft.push(true)
         else if !ref_mentions(p.typ, unsolved_names(tparams, known))
             val want = resolve_type(cx.an, scope, p.typ, known)
-            val t = sandboxed_arg(cx, e.unwrap(), Some(want))
+            val t = sandboxed_arg(inner, e.unwrap(), Some(want))
 
             tys.push(texpr_type(t))
             soft.push(false)
         else
-            val t = sandboxed_arg(cx, e.unwrap(), None)
+            val t = sandboxed_arg(inner, e.unwrap(), None)
 
             tys.push(texpr_type(t))
             soft.push(adaptable(e.unwrap(), t))
@@ -457,7 +474,8 @@ provisional_of(cx: &Analyzer, scope: Scope, tparams: Buf[string], params: Buf[Pa
 
         for i in 0..<ready.len()
             val at = ready.at(i)
-            val t = type_expr(cx, slots.at(at).unwrap(), Some(wants.at(i)))
+            val reader = arg_reader(cx, span, scope, slots.at(at).is_none())
+            val t = type_expr(reader, written.at(at).unwrap(), Some(wants.at(i)))
 
             kept.set(at, Some(t))
             tys.set(at, texpr_type(t))
@@ -478,6 +496,19 @@ provisional_of(cx: &Analyzer, scope: Scope, tparams: Buf[string], params: Buf[Pa
 
     Provisional(tys, soft, kept)
 end provisional_of
+
+// Who reads an argument: the caller for one a program wrote, and an analyzer in the declaration's
+// own terms for a default -- which is what makes a default mean the same thing from every module
+// that calls the function, and what makes a default of `__LINE__` name the caller's line.
+private arg_reader(cx: &Analyzer, span: Span, scope: Scope, from_default: bool) -> &Analyzer
+    if !from_default then return cx
+
+    val inner = analyzer_for(cx.an, scope)
+
+    inner.reported = Some(span)
+    inner.here_src = caller_source(cx)
+    inner
+end arg_reader
 
 // One reading of an argument with everything it said put back.
 private sandboxed_arg(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
