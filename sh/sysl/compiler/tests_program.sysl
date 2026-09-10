@@ -1204,3 +1204,162 @@ static_in_the_entry_file()
     val said = complaints("static var counter: int = 0\n\nprint(counter)\n")
 
     assert(said.is_empty(), listed(said))
+
+// -- a function declared inside a body -------------------------------------------------------------
+
+@test("a function declared inside a body is lifted into the environment its block shares")
+a_nested_function_is_lifted()
+    if no_library() then return
+
+    val text = "outer() -> int\n    var n = 1\n\n    bump() = n = n + 1\n\n    bump()\n    n\nend outer\n"
+    val out = shown(text, "$env0.bump")
+
+    assert(out.contains("name: \"$env0.bump\""), out)
+    assert(out.contains("_1: \"self\""), out)
+
+@test("and the block's functions share one environment, so a sibling call is a call on the receiver")
+nested_siblings_share_one_environment()
+    if no_library() then return
+
+    val text = "outer() -> int\n    var n = 0\n\n    a(k: int) -> int = if k <= 0 then n else b(k)\n\n" +
+        "    b(k: int) -> int = a(k - 1)\n\n    a(4)\nend outer\n"
+    val out = shown(text, "$env0.a")
+
+    assert(out.contains("name: \"$env0.b\""), out)
+    assert(out.contains("name: \"self\""), out)
+
+@test("the environment holds the address of each capture, so a nested function writes the local")
+a_nested_function_writes_the_local()
+    if no_library() then return
+
+    val text = "outer() -> int\n    var n = 1\n\n    bump() = n = n + 1\n\n    bump()\n    n\nend outer\n"
+    val out = shown(text, "$env0.bump")
+
+    assert(out.contains("TDeref"), out)
+
+@test("a nested function is called where it is written and is not a value")
+a_nested_function_is_not_a_value()
+    if no_library() then return
+
+    val text = "outer() -> int\n    var n = 1\n\n    helper() -> int = n\n\n    val f = helper\n\n    n\nend outer\n"
+    val said = complaints(text)
+
+    assert(says(said, "'helper' is a nested function, so it is called where it is written rather " +
+                "than passed — its environment is the frame it was declared in, and a callable " +
+                "value is a way of carrying it out. Something that has to be passed is a closure " +
+                "of its own: 'var helper = x -> …'"), listed(said))
+
+@test("and it has no address to take, for the same reason")
+a_nested_function_has_no_address()
+    if no_library() then return
+
+    val text = "outer() -> int\n    var n = 1\n\n    helper() -> int = n\n\n    val p = &helper\n\n    n\nend outer\n"
+    val said = complaints(text)
+
+    assert(says(said, "'helper' is a nested function, so it has no address to take — what would " +
+                "have to travel beside the address is the frame it reads, and a '*extern' is one " +
+                "word. A top-level function is what has an address"), listed(said))
+
+@test("it may not be generic, since the type arguments would have nowhere to come from")
+a_nested_function_may_not_be_generic()
+    if no_library() then return
+
+    val text = "outer() -> int\n    var n = 1\n\n    helper[T](x: T) -> int = n\n\n    n\nend outer\n"
+    val said = complaints(text)
+
+    assert(says(said, "'helper' is declared inside a function body and cannot be generic — the " +
+                "type arguments would have nowhere to come from, since nothing outside the body " +
+                "calls it"), listed(said))
+
+@test("and nothing outside can name it, so there is nothing for a visibility modifier to restrict")
+a_nested_function_takes_no_visibility()
+    if no_library() then return
+
+    val text = "outer() -> int\n    var n = 1\n\n    private helper() -> int = n\n\n    n\nend outer\n"
+    val said = complaints(text)
+
+    assert(says(said, "'helper' is declared inside a function body, so nothing outside can name it " +
+                "and there is nothing for a visibility modifier to restrict"), listed(said))
+
+@test("a group that reads a binding written below it is built after the last of them")
+a_group_waiting_on_a_binding()
+    if no_library() then return
+
+    val text = "outer() -> int\n    later() -> int = m\n\n    var m = 2\n\n    later()\nend outer\n"
+    val said = complaints(text)
+
+    assert(said.is_empty(), listed(said))
+
+@test("and a call written above that point has no environment to make, and is told which name it waits on")
+a_call_above_the_environment()
+    if no_library() then return
+
+    val text = "outer() -> int\n    later() -> int = m\n\n    later()\n\n    var m = 2\n\n    m\nend outer\n"
+    val said = complaints(text)
+
+    assert(says(said, "'later' cannot be called here — the nested functions of this block share " +
+                "one environment, and it is not built until everything they read is bound. 'm' is " +
+                "bound below this call: move the call below it, or move it above the functions"),
+           listed(said))
+
+@test("a call above the functions themselves is told that instead")
+a_call_above_the_functions()
+    if no_library() then return
+
+    val text = "outer() -> int\n    var n = 1\n\n    grow()\n\n    grow() = n = n * 2\n\n    n\nend outer\n"
+    val said = complaints(text)
+
+    assert(says(said, "'grow' is declared below this call — the nested functions of a block share " +
+                "an environment formed where the first of them is written, so they may be called " +
+                "from there on"), listed(said))
+
+@test("a body reaches its own group and no further, so one of the body around it is out of reach")
+a_nested_function_of_the_body_around()
+    if no_library() then return
+
+    val text = "outer() -> int\n    var n = 1\n\n    grow() = n = n * 2\n\n    if n > 0\n" +
+        "        inner() -> int\n            grow()\n\n            n\n        end inner\n\n" +
+        "        n = inner()\n\n    n\nend outer\n"
+    val said = complaints(text)
+
+    assert(says(said, "'grow' is a nested function of the body around this one, which reaches its " +
+                "own nested functions and its own captures and no further — a top-level function " +
+                "is what several bodies share"), listed(said))
+
+@test("and a closure written beside one reaches no further either")
+a_closure_beside_a_nested_function()
+    if no_library() then return
+
+    val text = "outer() -> int\n    var n = 1\n\n    take(f: &Fn() -> int) -> int = f()\n\n" +
+        "    helper() -> int = n\n\n    take(() -> helper())\nend outer\n"
+    val said = complaints(text)
+
+    assert(says(said, "'helper' is a nested function of the body around this one, which reaches " +
+                "its own nested functions and its own captures and no further — a top-level " +
+                "function is what several bodies share"), listed(said))
+
+@test("a loop body is a block, so the functions in one are its own")
+a_nested_function_in_a_loop()
+    if no_library() then return
+
+    val text = "outer(xs: []int) -> int\n    var total = 0\n\n    for x in xs\n" +
+        "        add(k: int) = total = total + k\n\n        add(x)\n\n    total\nend outer\n"
+    val said = complaints(text)
+
+    assert(said.is_empty(), listed(said))
+
+@test("a top-level function in the file the program starts in stays the module's unless it captures")
+an_entry_file_function_that_captures_nothing()
+    if no_library() then return
+
+    val said = complaints("help() -> int = 1\n\nprint(help())\n")
+
+    assert(said.is_empty(), listed(said))
+
+@test("and one that reads what the body binds is a nested function of it")
+an_entry_file_function_that_captures()
+    if no_library() then return
+
+    val out = started_with("var counter: int = 0\n\nread() -> int = counter\n\nprint(read())\n")
+
+    assert(out.contains("$env0"), out)

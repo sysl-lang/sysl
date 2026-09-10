@@ -12,10 +12,76 @@ import sysl.math.bigint.{BigInt, from_int}
 // what makes `u8(x)` and `T(b)` the same form: every instantiation replaces the parameter with a
 // type this same spelling would have accepted written out.
 
+// A call to a nested function whose environment does not exist yet, or to one of a body around this
+// one -- each a different mistake, and each with a sentence of its own.
+private call_before_the_group(cx: &Analyzer, span: Span, name: string) -> Option[TExpr]
+    if pending_named(cx, name)
+        // The group is waiting on a binding written below this call. The functions themselves are
+        // above it, so "declared below this call" would be flatly false -- what is below is the
+        // data. **All of them wait, not only the one that reads it**: a block's nested functions
+        // share one environment, which is what lets them call each other in either order, so there
+        // is nothing to pass to any of them until it is built.
+        if cx.awaiting_needs
+            var waiting: Buf[string] = buf()
+
+            for i in 0..<cx.pending_needs.len()
+                waiting.push(cx.pending_needs.at(i))
+
+            waiting = sort_names(waiting)
+
+            var which = ""
+
+            for i in 0..<waiting.len()
+                if i > 0 then which = which + ", "
+
+                which = which + s"'${waiting.at(i)}'"
+
+            val one = waiting.len() == 1
+            val it = if one then "it" else "them"
+
+            return Some(cx.err(span, s"'$name' cannot be called here — the nested functions of " +
+                               "this block share one environment, and it is not built until " +
+                               s"everything they read is bound. $which " +
+                               s"${if one then "is" else "are"} bound below this call: move the " +
+                               s"call below $it, or move $it above the functions"))
+
+        return Some(cx.err(span, s"'$name' is declared below this call — the nested functions of a " +
+                           "block share an environment formed where the first of them is written, " +
+                           "so they may be called from there on"))
+
+    // One belonging to a body this one is written inside. A body reaches its own group and no
+    // further, because what it would have to carry to reach further is the frame around it.
+    if holds_string(cx.outer_nested, name) then
+        return Some(cx.err(span, s"'$name' is a nested function of the body around this one, which " +
+                           "reaches its own nested functions and its own captures and no further " +
+                           "— a top-level function is what several bodies share"))
+
+    None
+end call_before_the_group
+
+private pending_named(cx: &Analyzer, name: string) -> bool
+    for i in 0..<cx.pending_nested.len()
+        if cx.pending_nested.at(i).name == name then return true
+
+    false
+end pending_named
+
 call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
           expected: Option[Type]) -> TExpr
     *callee.kind match
-        Ident(name) -> named_call(cx, span, callee, name, args, expected)
+        Ident(name) ->
+            // A nested function is called on the receiver the body already has, and the name is the
+            // block's rather than the module's -- so a local of the same spelling still shadows it.
+            if cx.lookup(name).is_none()
+                val inner = cx.nested_of(name)
+
+                if inner.is_some() then return call_nested(cx, span, inner.unwrap(), name, args)
+
+                val early = call_before_the_group(cx, span, name)
+
+                if early.is_some() then return early.unwrap()
+
+            named_call(cx, span, callee, name, args, expected)
         // `f[A, B](x)` -- the instantiation the reader named, which is what brackets mean in a
         // **type** and what a call borrows them for.
         TypeArgs(head, targs) -> written_call(cx, span, head, targs, args, expected)

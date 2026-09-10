@@ -22,11 +22,117 @@ type_value_block(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
                  discarded: bool) -> TBlock
     cx.enter()
 
+    // **A block is the unit a nested function is hoisted over**, so the group is found here, from
+    // the statements themselves, rather than by looking ahead from the one being read. What the
+    // block declares is given back at its end for the same reason its scope is: an inner block's
+    // nested functions are not the outer block's.
+    val group = open_group(cx, stmts)
     val b = type_block_body(cx, stmts, expected, discarded)
 
+    close_group(cx, group)
     cx.leave()
     b
 end type_value_block
+
+// What a block took over from the one around it, so that its end can give it back.
+struct BlockGroup
+    pending: Buf[FuncDecl]
+    needs: Buf[string]
+    awaiting: bool
+    in_view: usize
+end BlockGroup
+
+open_group(cx: &Analyzer, stmts: Buf[Stmt]) -> BlockGroup
+    var pending: Buf[FuncDecl] = buf()
+
+    for i in 0..<cx.pending_nested.len()
+        pending.push(cx.pending_nested.at(i))
+
+    var needs: Buf[string] = buf()
+
+    for i in 0..<cx.pending_needs.len()
+        needs.push(cx.pending_needs.at(i))
+
+    val was = BlockGroup(pending, needs, cx.awaiting_needs, cx.nested.len())
+
+    open_block_group(cx, stmts)
+    was
+end open_group
+
+close_group(cx: &Analyzer, was: BlockGroup)
+    cx.pending_nested.truncate(0)
+
+    for i in 0..<was.pending.len()
+        cx.pending_nested.push(was.pending.at(i))
+
+    cx.pending_needs.truncate(0)
+
+    for i in 0..<was.needs.len()
+        cx.pending_needs.push(was.needs.at(i))
+
+    cx.awaiting_needs = was.awaiting
+    cx.nested.truncate(was.in_view)
+
+// The nested functions a run of statements declares, and what the group of them still needs.
+open_block_group(cx: &Analyzer, stmts: Buf[Stmt])
+    cx.pending_nested.truncate(0)
+
+    for i in 0..<stmts.len()
+        *stmts.at(i).kind match
+            FuncDecl(d) -> cx.pending_nested.push(with_call_bounds(d))
+            _ -> ()
+
+    // Every name the block binds, whether or not it has been reached yet. A name bound further down
+    // is still one the group may read, and the environment waits for it.
+    var binds: Buf[string] = buf()
+
+    for i in 0..<stmts.len()
+        block_binds(stmts.at(i), &binds)
+
+    cx.pending_needs.truncate(0)
+
+    val needs = group_needs(cx.pending_nested, binds)
+
+    for i in 0..<needs.len()
+        cx.pending_needs.push(needs.at(i))
+
+    cx.awaiting_needs = false
+end open_block_group
+
+// Strikes off what a statement just bound, and lowers the pending group once it has them all.
+//
+// Run after **every** statement, so the environment is built directly after the *last* binding any
+// of the block's nested functions reads -- which is the whole of what lets one read a binding
+// written below it. The lowered environment sits at that point, exactly as it would have sat at the
+// first function.
+settle_needs(cx: &Analyzer, span: Span, s: Stmt) -> Buf[TStmt]
+    if !cx.pending_needs.is_empty()
+        var bound: Buf[string] = buf()
+
+        block_binds(s, &bound)
+
+        var left: Buf[string] = buf()
+
+        for i in 0..<cx.pending_needs.len()
+            if !holds_string(bound, cx.pending_needs.at(i)) then left.push(cx.pending_needs.at(i))
+
+        cx.pending_needs.truncate(0)
+
+        for i in 0..<left.len()
+            cx.pending_needs.push(left.at(i))
+
+    if !cx.awaiting_needs || !cx.pending_needs.is_empty() || cx.pending_nested.is_empty() then
+        return buf()
+
+    var group: Buf[FuncDecl] = buf()
+
+    for i in 0..<cx.pending_nested.len()
+        group.push(cx.pending_nested.at(i))
+
+    cx.pending_nested.truncate(0)
+    cx.awaiting_needs = false
+    lower_nested_group(cx, span, group)
+end settle_needs
 
 // The body of a value block, in whatever scope the caller has established -- a match arm runs this
 // after declaring its pattern bindings, so they are visible to the body.
@@ -110,6 +216,9 @@ end type_stmts
 // is by position, exactly as a function's contract block is -- so a clause that reaches
 // `recover_stmt` is one written somewhere it may not be, and says so there.
 loop_stmts(cx: &Analyzer, stmts: Buf[Stmt]) -> Buf[TStmt]
+    // A loop body is a block, so its nested functions are its own. The caller opened the scope, and
+    // this is where the statements are, which is what the group is read from.
+    val group = open_group(cx, stmts)
     var out: Buf[TStmt] = buf()
     var i: usize = 0
 
@@ -128,6 +237,7 @@ loop_stmts(cx: &Analyzer, stmts: Buf[Stmt]) -> Buf[TStmt]
         i = i + 1
 
     cx.pending_variant = slot
+    close_group(cx, group)
     out
 end loop_stmts
 
@@ -308,7 +418,12 @@ end type_list_show
 //
 // It is named for what the reference calls it because every caller is a place the reference calls
 // it, and the two walks are read side by side.
-recover_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = type_stmt(cx, stmt)
+recover_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt]
+    var out = type_stmt(cx, stmt)
+
+    push_all(&out, settle_needs(cx, stmt.span, stmt))
+    out
+end recover_stmt
 
 // Most statements are one statement. The two comma forms are the exception, and the only reason
 // this hands back a list: a binding that names several things is several declarations.
@@ -391,10 +506,26 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
     ExternVarDecl(_, _, _, _) -> refuse(cx, stmt.span, top_level_only())
     TypeDecl(_) -> refuse(cx, stmt.span, top_level_only())
 
-    // A function declared inside a body is a nested function, and lifting a block's into an
-    // environment belongs with the rest of closure lowering.
+    // A function declared inside a body is a **nested function**, and the block's are lowered
+    // together the first time one is reached -- so the ones after it in the same block have already
+    // been dealt with and contribute nothing further here.
     FuncDecl(_) ->
-        refuse(cx, stmt.span, "a function declared inside a body is not lowered yet")
+        if cx.pending_nested.is_empty() then buf()
+        // The group reads something this block binds further down, so its environment cannot be
+        // built here -- it holds the *address* of every capture, and a slot whose declaration has
+        // not run has no name to point at. It waits, and `settle_needs` lowers it after the last of
+        // them.
+        else if !cx.pending_needs.is_empty()
+            cx.awaiting_needs = true
+            buf()
+        else
+            var group: Buf[FuncDecl] = buf()
+
+            for i in 0..<cx.pending_nested.len()
+                group.push(cx.pending_nested.at(i))
+
+            cx.pending_nested.truncate(0)
+            lower_nested_group(cx, stmt.span, group)
 
     // `@assert` settles while compiling and emits nothing either way: a true assertion is not code,
     // and a false one has already stopped the compilation. **The substitution is what makes one

@@ -261,6 +261,22 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
 
     val local = cx.lookup(name)
 
+    // A nested function is **called** where it is written and is not a value. Its environment is a
+    // row of addresses into the frame it was declared in, which is sound exactly because nothing
+    // can carry it out of that frame -- and a callable value is a way of carrying it.
+    if local.is_none() && cx.nested_of(name).is_some() then
+        return cx.err(span, s"'$name' is a nested function, so it is called where it is written " +
+                      "rather than passed — its environment is the frame it was declared in, and " +
+                      "a callable value is a way of carrying it out. Something that has to be " +
+                      s"passed is a closure of its own: 'var $name = x -> …'")
+
+    // A nested function of the frame around this body is a name this body may not reach, and is
+    // told so rather than told the name stands for nothing.
+    if local.is_none() && holds_string(cx.outer_nested, name) then
+        return cx.err(span, s"'$name' is a nested function of the body around this one, which " +
+                      "reaches its own nested functions and its own captures and no further — a " +
+                      "top-level function is what several bodies share")
+
     // `result` is a *contextual* keyword: a real binding of that name still shadows it.
     if name == "result" && local.is_none() then
         if cx.ensure_result.is_some() then return TExpr(span, TResult(cx.ensure_result.unwrap()))
@@ -613,6 +629,16 @@ end unary_expr
 // Something computed has no address of its own, so one is made for it: the value is written into a
 // hidden local of this scope and what comes back is that slot's address.
 private address_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
+    // A nested function's environment is the frame it was declared in, and an address is a way of
+    // carrying it out of that frame -- the same reason the name is not a value either.
+    val named = nested_ident(operand)
+
+    if named.is_some() && cx.lookup(named.unwrap()).is_none() &&
+            names_a_nested(cx, named.unwrap()) then
+        return cx.err(span, s"'${named.unwrap()}' is a nested function, so it has no address to " +
+                      "take — what would have to travel beside the address is the frame it reads, " +
+                      "and a '*extern' is one word. A top-level function is what has an address")
+
     val t = type_expr_bare(cx, operand)
     val ty = texpr_type(t)
 

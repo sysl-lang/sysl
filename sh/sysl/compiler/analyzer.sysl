@@ -136,6 +136,36 @@ struct Analyzer
     // whole `Source` and not its name, because a line is an offset looked up in the text.
     here_src: Option[Source]
 
+    // The nested functions of the block being read, and of every block around it inside this same
+    // body. A call to one is a call on the receiver the body already has.
+    nested: Buf[(string, &Nested)]
+
+    // The nested functions of a frame around this one, which are names this body may not reach --
+    // remembering them is what lets that be said rather than reported as a name standing for
+    // nothing.
+    outer_nested: Buf[string]
+
+    // The functions the block being read declared and has not lowered yet. They are lowered
+    // together, at the first of them a statement reaches.
+    pending_nested: Buf[FuncDecl]
+
+    // What the group still reads from this block and has not seen bound. The environment holds the
+    // address of every capture, and a slot whose declaration has not run has no name to point at --
+    // so a group waiting for one is lowered after the last of them instead.
+    pending_needs: Buf[string]
+
+    // Whether the group has been reached and is waiting, which is what keeps it from being lowered
+    // ABOVE where the functions are written.
+    awaiting_needs: bool
+
+    // What a nested function of this block is called, or nothing where the name is not one.
+    nested_of(self, name: string) -> Option[&Nested]
+        for i in 0..<self.nested.len()
+            if self.nested.at(i).0 == name then return Some(self.nested.at(i).1)
+
+        None
+    end nested_of
+
     // What a captured name reaches, by the unique name the closure's own scope bound it under.
     //
     // **Nothing rewrites a closure's body.** A capture is bound like any other name and this says
@@ -268,7 +298,11 @@ bad_expr(span: Span) -> TExpr = TExpr(span, TZero(Unknown))
 // An analyzer over a compilation's tables, reading a file in its own terms.
 analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
     Analyzer(an, scope, buf(), buf(), buf(), "", None, None, false, buf(), buf(), false, false,
-             None, 0, None, None, buf(), false, false, false, None, buf())
+             None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
+             empty_names(), false, buf())
+
+// A run of names with nothing in it, named so that a constructor can say which kind it means.
+private empty_names() -> Buf[string] = buf()
 
 // A `$` written by a reader is marked, so that `` `a b` `` and `` `a$20b` `` cannot become one
 // register once the emitter encodes the space.

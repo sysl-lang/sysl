@@ -1,0 +1,356 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// A function declared inside a body, and the environment its block shares.
+//
+// **They share one environment**, and that is the whole design. A nested function *is* a closure --
+// what it captures and how it is represented follow the same rules -- but the block's functions are
+// members of one struct rather than one struct each, which is what makes both halves of the rule
+// true at once: every name is in scope throughout the block, so two may call each other, while what
+// may be *captured* is settled at the position the group is written.
+//
+// A sibling call and a recursive call are then the same thing -- a call on the receiver the body
+// already has -- so neither takes a share of anything and no reference cycle ever forms.
+//
+// **The environment holds the ADDRESS of every capture rather than a copy**, which is the one
+// difference from a closure literal. A closure may outlive the frame it was written in; a nested
+// function may not -- nothing outside the body can name one, so it cannot be stored or returned --
+// and a body of statements that could not assign to the variable it was written beside would not be
+// worth the name it has.
+
+// What the environment shared by one block of nested functions is filed under.
+env_base(n: usize) -> string = s"${ModuleSep}env$n"
+
+// One nested function as a name in the block that declared it: the function to call, the environment
+// to call it on, and the signature a call is read against.
+struct Nested
+    fname: string
+    env: TExpr
+    variadic: bool
+    params: Buf[Param]
+end Nested
+
+// Whether a name is one of the nested functions this body may see -- one of the block's own, or one
+// of a frame around it, which is a name this body may not reach and is told so rather than told the
+// name stands for nothing.
+names_a_nested(cx: &Analyzer, name: string) -> bool =
+    cx.nested_of(name).is_some() || holds_string(cx.outer_nested, name)
+
+// The name an expression is, where it is a bare one.
+nested_ident(e: Expr) -> Option[string] = *e.kind match
+    Ident(n) -> Some(n)
+    _ -> None
+
+// The nested functions of one block, lowered together.
+//
+// The environment is built where the first of them is written, which is also where the captures are
+// read. Everything a nested function names from around it must therefore be declared above that
+// point.
+lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt]
+    var names: Buf[string] = buf()
+
+    for i in 0..<group.len()
+        names.push(group.at(i).name)
+
+    // **A refusal ends the lowering.** What a nested function may not be is a property of the
+    // declaration, so a group holding one is not a group: binding the names anyway would report the
+    // one mistake and then everything that followed from a body nothing could analyze.
+    for i in 0..<group.len()
+        if refuse_nested_shape(cx, span, group.at(i), names) then return buf()
+
+    // A sibling is reached through the shared receiver rather than captured, so the names of the
+    // group are bound here and are not free in each other's bodies.
+    var captured: Buf[string] = buf()
+
+    for i in 0..<group.len()
+        val d = group.at(i)
+        var bound: Buf[string] = buf()
+
+        for j in 0..<names.len()
+            bound.push(names.at(j))
+
+        for j in 0..<d.params.len()
+            bound.push(d.params.at(j).name)
+
+        val reads = captures_where(n -> cx.lookup(n).is_some(), d.body, bound)
+
+        for j in 0..<reads.len()
+            if !holds_string(captured, reads.at(j)) then captured.push(reads.at(j))
+
+    var fields: Buf[(string, Type)] = buf()
+
+    for i in 0..<captured.len()
+        // The field holds the **address** of the enclosing variable, not a copy of it. That is what
+        // makes a nested function assigning to one of the block's locals assign to the block's
+        // local, which is the thing the form exists for.
+        fields.push((captured.at(i), Ptr(cx.lookup(captured.at(i)).unwrap().ty)))
+
+    val base = env_base(cx.an.env_count)
+
+    cx.an.env_count += 1
+
+    val st = StructType(base, buf(), fields, false, None, None)
+    val env = Struct(st)
+
+    cx.an.tables.struct_insts.put(base, env)
+
+    val slot = cx.bind(base, env)
+    val here = TExpr(span, TAddrOf(TExpr(span, TLoad(slot, env)), Ptr(env)))
+    val inner_self = TExpr(span, TLoad("self", Ptr(env)))
+
+    // Every signature is registered before any body is analyzed, which is what lets one call another
+    // whichever order they are written in. A nested function states its parameters and its result,
+    // so there is nothing here to infer and nothing to wait for.
+    var lowered: Buf[string] = buf()
+
+    for i in 0..<group.len()
+        val d = group.at(i)
+        val fname = s"${mangle(env)}.${d.name}"
+
+        lowered.push(fname)
+
+        var params: Buf[(string, Type)] = buf()
+
+        params.push(("self", Ptr(env)))
+
+        for j in 0..<d.params.len()
+            params.push((d.params.at(j).name,
+                         resolve_type(cx.an, cx.scope, d.params.at(j).typ, cx.subst)))
+
+        val ret = if d.ret_type.is_none() then Unit
+        else resolve_type(cx.an, cx.scope, d.ret_type.unwrap(), cx.subst)
+
+        cx.an.tables.members.func_insts.put(fname, FuncSig(params, ret))
+
+    // The names are bound **before** any body is analyzed, so a body that does not analyze leaves
+    // the group callable and the block is told about its one mistake rather than about that one and
+    // an undefined name at every call.
+    var inside: Buf[(string, &Nested)] = buf()
+
+    for i in 0..<group.len()
+        val d = group.at(i)
+
+        inside.push((d.name, Nested(lowered.at(i), inner_self, d.variadic, d.params)))
+        cx.nested.push((d.name, Nested(lowered.at(i), here, d.variadic, d.params)))
+
+    for i in 0..<group.len()
+        cx.an.closure_funcs.push(nested_body(cx, span, st, lowered.at(i), captured, group.at(i),
+                                             inside))
+
+    // The environment holds addresses, so nothing in it is counted and nothing is copied: it is a
+    // row of pointers into the frame it was built in, which is sound exactly because a nested
+    // function cannot leave that frame.
+    //
+    // Read through the ordinary analysis rather than off the scope, so a name this block itself
+    // captured from further out is the field it reaches there, and the address taken is of the one
+    // variable rather than of a copy of it.
+    var addresses: Buf[TExpr] = buf()
+
+    for i in 0..<captured.len()
+        val place = name_expr(cx, span, captured.at(i), None)
+
+        addresses.push(TExpr(span, TAddrOf(place, Ptr(place_type(place)))))
+
+    var out: Buf[TStmt] = buf()
+
+    out.push(TVarDecl(slot, env, TExpr(span, TStructNew(st, addresses)), None))
+    out
+end lower_nested_group
+
+// What a nested function may not be, each a consequence of holding a frame rather than of where the
+// declaration was written.
+private refuse_nested_shape(cx: &Analyzer, span: Span, d: FuncDecl, names: Buf[string]) -> bool
+    if file_local(d.vis)
+        cx.fault(span, s"'${d.name}' is declared inside a function body, so nothing outside can " +
+                 "name it and there is nothing for a visibility modifier to restrict")
+        return true
+
+    var seen = 0
+
+    for i in 0..<names.len()
+        if names.at(i) == d.name then seen += 1
+
+    if seen > 1
+        cx.fault(span, s"'${d.name}' is already declared in this block")
+        return true
+
+    if !d.tparams.is_empty()
+        cx.fault(span, s"'${d.name}' is declared inside a function body and cannot be generic — " +
+                 "the type arguments would have nowhere to come from, since nothing outside the " +
+                 "body calls it")
+        return true
+
+    false
+end refuse_nested_shape
+
+// What the group reads from **this** block, whether or not it has been bound yet.
+//
+// This is what decides **where** the group is lowered. Asking about the block's whole binding set
+// rather than about what is in scope is what lets a nested function read something written below it;
+// the environment is then built after the last of them, so every address it holds is of a slot whose
+// declaration has run.
+group_needs(group: Buf[FuncDecl], candidates: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+    var names: Buf[string] = buf()
+
+    for i in 0..<group.len()
+        names.push(group.at(i).name)
+
+    for i in 0..<group.len()
+        val d = group.at(i)
+        var bound: Buf[string] = buf()
+
+        for j in 0..<names.len()
+            bound.push(names.at(j))
+
+        for j in 0..<d.params.len()
+            bound.push(d.params.at(j).name)
+
+        val reads = captures_where(n -> holds_string(candidates, n), d.body, bound)
+
+        for j in 0..<reads.len()
+            if !holds_string(out, reads.at(j)) then out.push(reads.at(j))
+
+    out
+end group_needs
+
+// The names a top-level statement of a block binds, which is what a group may still be waiting for.
+block_binds(s: Stmt, out: *Buf[string])
+    *s.kind match
+        VarDecl(n, _, _, _, _, _) -> out.push(n)
+        ValDecl(n, _, _, _, _, _) -> out.push(n)
+        RefDecl(n, _) -> out.push(n)
+        MultiDecl(ns, _, _) ->
+            for i in 0..<ns.len()
+                out.push(ns.at(i))
+        PatternDecl(p, _, _) -> pattern_names(out, p)
+        _ -> ()
+
+// One nested function's body, read in a frame of its own.
+//
+// What it keeps from around it is what a reader would expect to keep: the file's terms, what a type
+// parameter stands for, and the name `__FUNCTION__` answers with. What it does not keep is the
+// enclosing function's scope stack: a body is analyzed against per-function state, and every part of
+// that belongs to the function being interrupted.
+private nested_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
+                    captured: Buf[string], d: FuncDecl,
+                    siblings: Buf[(string, &Nested)]) -> TFunc
+    val inner = analyzer_for(cx.an, cx.scope)
+
+    inner.subst = cx.subst
+    inner.func_name = cx.func_name
+    inner.in_variadic = d.variadic
+
+    val env = Struct(st)
+    val self_ty = Ptr(env)
+
+    var params: Buf[(string, Type)] = buf()
+
+    params.push((inner.bind("self", self_ty), self_ty))
+
+    for i in 0..<d.params.len()
+        val ty = resolve_type(cx.an, cx.scope, d.params.at(i).typ, cx.subst)
+
+        params.push((inner.bind(d.params.at(i).name, ty), ty))
+
+    for i in 0..<captured.len()
+        val stored = st.fields.at(i).1
+        val field = TExpr(span, TField(TExpr(span, TDeref(TExpr(span, TLoad("self", self_ty)), env)),
+                                       int(st.slot(i)), stored))
+
+        // The environment holds the address of the frame's own variable, so what the name reaches is
+        // the variable itself -- one dereference further, and a place, which is what lets a nested
+        // function assign to it.
+        stored match
+            Ptr(pointee) ->
+                inner.captured.push((inner.bind(captured.at(i), *pointee),
+                                     TExpr(span, TDeref(field, *pointee))))
+            _ -> inner.captured.push((inner.bind(captured.at(i), stored), field))
+
+    // A sibling is in scope throughout the group, so a body may call one written below it. What a
+    // body does *not* reach is a nested function of the frame around it, and remembering their
+    // names is what lets that be said rather than reported as a name standing for nothing.
+    for i in 0..<siblings.len()
+        inner.nested.push(siblings.at(i))
+
+    carry_outer_nested(cx, inner, siblings)
+
+    val written = d.ret_type.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
+    val ret = declared_result_type(written)
+
+    inner.ret_ty = Some(ret)
+
+    val split = contract_length(d.body)
+    val contract = analyze_contract(inner, d.body, split, ret)
+    val rest = statements_from(d.body, split)
+    val block = if ret == Unit then type_value_block(inner, rest, None, true)
+    else type_value_block(inner, rest, Some(ret), false)
+
+    if ret != Unit && block.result.is_some() && disagree(block.ty, ret) then
+        inner.fault(body_span(rest, span), body_disagreement(fname, ret, block.ty))
+
+    cx.an.tables.homes.put(fname, cx.scope)
+
+    TFunc(span, fname, params, ret, block, d.variadic, contract.0, contract.1, contract.2, true,
+          None, false, contract.3, false, false, None, None, None, None)
+end nested_body
+
+// A group with nothing in it, which is what a closure has: it is one body and not a block of them.
+no_siblings() -> Buf[(string, &Nested)] = buf()
+
+// The nested functions of the frame around a body, which that body may not reach.
+carry_outer_nested(cx: &Analyzer, inner: &Analyzer, siblings: Buf[(string, &Nested)])
+    for i in 0..<cx.nested.len()
+        val name = cx.nested.at(i).0
+
+        if !named_sibling(siblings, name) && !holds_string(inner.outer_nested, name) then
+            inner.outer_nested.push(name)
+
+    for i in 0..<cx.outer_nested.len()
+        val name = cx.outer_nested.at(i)
+
+        if !named_sibling(siblings, name) && !holds_string(inner.outer_nested, name) then
+            inner.outer_nested.push(name)
+
+private named_sibling(siblings: Buf[(string, &Nested)], name: string) -> bool
+    for i in 0..<siblings.len()
+        if siblings.at(i).0 == name then return true
+
+    false
+end named_sibling
+
+// `f(a)` where `f` is one of the block's nested functions: a call on the receiver the body already
+// has, with the arguments a reader wrote after it.
+call_nested(cx: &Analyzer, span: Span, n: &Nested, written: string, args: Buf[Expr]) -> TExpr
+    val sig = cx.an.tables.members.func_insts.get(n.fname)
+
+    if sig.is_none() then return bad_expr(span)
+
+    val params = sig.unwrap().params
+    val declared = params.len() - 1
+
+    if args.len() != declared && !n.variadic
+        cx.fault(span, s"'$written' takes ${declared} argument${if declared == 1 then "" else "s"}" +
+                 s", but ${args.len()} argument${if args.len() == 1 then " was" else "s were"} given")
+
+        return bad_expr(span)
+
+    var supplied: Buf[TExpr] = buf()
+
+    supplied.push(n.env)
+
+    for i in 0..<args.len()
+        val want = if i + 1 < params.len() then Some(params.at(i + 1).1) else None
+        val t = type_expr(cx, args.at(i), want)
+
+        if want.is_some() && disagree(texpr_type(t), want.unwrap()) then
+            cx.fault(args.at(i).span, s"'${params.at(i + 1).0}' of '$written' is " +
+                     s"${type_show(want.unwrap())}, but ${type_show(texpr_type(t))} was given")
+
+        supplied.push(t)
+
+    cx.an.uses(n.fname)
+    TExpr(span, TCall(n.fname, supplied, sig.unwrap().ret, false))
+end call_nested
