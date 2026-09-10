@@ -1,0 +1,391 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, to_string}
+import sysl.text.{str_builder, StrBuilder}
+
+// **An instruction, as data.** Every mnemonic the back end writes, with its operands as values
+// rather than as text.
+//
+// There is no `phi`, and that is a fact about the lowering rather than an omission: codegen keeps
+// every local in a stack slot and reaches it with `load` and `store`, so what a consumer receives is
+// memory form and it may promote or not as it likes.
+
+// The arithmetic and bitwise operations LLVM names one word each.
+enum BinOp
+    OpAdd
+    OpSub
+    OpMul
+    OpSDiv
+    OpUDiv
+    OpSRem
+    OpURem
+    OpShl
+    OpAShr
+    OpLShr
+    OpAnd
+    OpOr
+    OpXor
+    OpFAdd
+    OpFSub
+    OpFMul
+    OpFDiv
+end BinOp
+
+bin_render(op: BinOp) -> string = op match
+    OpAdd -> "add"
+    OpSub -> "sub"
+    OpMul -> "mul"
+    OpSDiv -> "sdiv"
+    OpUDiv -> "udiv"
+    OpSRem -> "srem"
+    OpURem -> "urem"
+    OpShl -> "shl"
+    OpAShr -> "ashr"
+    OpLShr -> "lshr"
+    OpAnd -> "and"
+    OpOr -> "or"
+    OpXor -> "xor"
+    OpFAdd -> "fadd"
+    OpFSub -> "fsub"
+    OpFMul -> "fmul"
+    OpFDiv -> "fdiv"
+
+// The conversions, which are the same instruction shape whatever the pair of types.
+enum CastOp
+    CastTrunc
+    CastZExt
+    CastSExt
+    CastFPTrunc
+    CastFPExt
+    CastFPToUI
+    CastFPToSI
+    CastUIToFP
+    CastSIToFP
+    CastPtrToInt
+    CastIntToPtr
+    CastBitCast
+end CastOp
+
+cast_render(op: CastOp) -> string = op match
+    CastTrunc -> "trunc"
+    CastZExt -> "zext"
+    CastSExt -> "sext"
+    CastFPTrunc -> "fptrunc"
+    CastFPExt -> "fpext"
+    CastFPToUI -> "fptoui"
+    CastFPToSI -> "fptosi"
+    CastUIToFP -> "uitofp"
+    CastSIToFP -> "sitofp"
+    CastPtrToInt -> "ptrtoint"
+    CastIntToPtr -> "inttoptr"
+    CastBitCast -> "bitcast"
+
+// An integer comparison, which says whether the operands are read as signed.
+enum ICmp
+    IEq
+    INe
+    IUgt
+    IUge
+    IUlt
+    IUle
+    ISgt
+    ISge
+    ISlt
+    ISle
+end ICmp
+
+icmp_render(p: ICmp) -> string = p match
+    IEq -> "eq"
+    INe -> "ne"
+    IUgt -> "ugt"
+    IUge -> "uge"
+    IUlt -> "ult"
+    IUle -> "ule"
+    ISgt -> "sgt"
+    ISge -> "sge"
+    ISlt -> "slt"
+    ISle -> "sle"
+
+// A float comparison, which says what it answers when an operand is a NaN: `o` for ordered, `u`
+// for unordered.
+enum FCmp
+    FOeq
+    FOne
+    FOgt
+    FOge
+    FOlt
+    FOle
+    FOrd
+    FUeq
+    FUne
+    FUgt
+    FUge
+    FUlt
+    FUle
+    FUno
+end FCmp
+
+fcmp_render(p: FCmp) -> string = p match
+    FOeq -> "oeq"
+    FOne -> "one"
+    FOgt -> "ogt"
+    FOge -> "oge"
+    FOlt -> "olt"
+    FOle -> "ole"
+    FOrd -> "ord"
+    FUeq -> "ueq"
+    FUne -> "une"
+    FUgt -> "ugt"
+    FUge -> "uge"
+    FUlt -> "ult"
+    FUle -> "ule"
+    FUno -> "uno"
+
+// How strongly an atomic access is ordered against everything around it.
+enum IrOrdering
+    OrdRelaxed
+    OrdAcquire
+    OrdRelease
+    OrdAcqRel
+    OrdSeqCst
+end IrOrdering
+
+// LLVM's spelling, which is its own for three of the five.
+ord_render(o: IrOrdering) -> string = o match
+    OrdRelaxed -> "monotonic"
+    OrdAcquire -> "acquire"
+    OrdRelease -> "release"
+    OrdAcqRel -> "acq_rel"
+    OrdSeqCst -> "seq_cst"
+
+// The ordering a compare-and-exchange is held to on the attempt that did not take: it may not be
+// stronger than the success ordering, and it may not be a release, because nothing was published.
+ord_on_failure(o: IrOrdering) -> IrOrdering = o match
+    OrdRelease -> OrdRelaxed
+    OrdAcqRel -> OrdAcquire
+    _ -> o
+
+// What kind of access a load or a store is.
+enum IrAccess
+    AccPlain
+    AccVolatile
+    AccAtomic(ordering: IrOrdering)
+end IrAccess
+
+// The relaxations the back end is allowed on a floating-point operation.
+enum FastMath
+    FmReassoc
+end FastMath
+
+fast_render(f: FastMath) -> string = f match
+    FmReassoc -> "reassoc"
+
+// The read-modify-write operations an atomic may name.
+enum RmwOp
+    RmwXchg
+    RmwAdd
+    RmwSub
+    RmwAnd
+    RmwOr
+    RmwXor
+end RmwOp
+
+rmw_render(op: RmwOp) -> string = op match
+    RmwXchg -> "xchg"
+    RmwAdd -> "add"
+    RmwSub -> "sub"
+    RmwAnd -> "and"
+    RmwOr -> "or"
+    RmwXor -> "xor"
+
+// One instruction.
+enum Inst
+    InBin(dest: Val, op: BinOp, ty: LType, a: Val, b: Val)
+    InNeg(dest: Val, ty: LType, v: Val)
+    InIntCmp(dest: Val, pred: ICmp, ty: LType, a: Val, b: Val)
+    InFloatCmp(dest: Val, pred: FCmp, ty: LType, a: Val, b: Val)
+    InCast(dest: Val, op: CastOp, from: LType, v: Val, to: LType)
+    InAlloca(dest: Val, ty: LType, align: Option[int])
+    InLoad(dest: Val, ty: LType, ptr: Val, access: IrAccess, align: Option[int])
+    InStore(ty: LType, value: Val, ptr: Val, access: IrAccess, align: Option[int])
+    InGep(dest: Val, ty: LType, ptr: Val, indices: Buf[IrArg])
+    InExtract(dest: Val, ty: LType, agg: Val, indices: Buf[int])
+    InInsert(dest: Val, ty: LType, agg: Val, value_ty: LType, value: Val, indices: Buf[int])
+    InSelect(dest: Val, cond: Val, ty: LType, a: Val, b: Val, cond_ty: LType)
+    InInsertElement(dest: Val, ty: LType, vec: Val, elem_ty: LType, value: Val, index: IrArg)
+    InExtractElement(dest: Val, ty: LType, vec: Val, index: IrArg)
+    InShuffle(dest: Val, ty: LType, a: Val, b: Val, mask: IrArg)
+    InAsm(dest: Option[Val], ret: LType, text: string, constraints: string, args: Buf[IrArg])
+    InCall(dest: Option[Val], ret: LType, callee: Val, args: Buf[IrArg], ret_attrs: Buf[IrAttr],
+           callee_type: Option[IrFnType], fast: Buf[FastMath], must_tail: bool)
+    InVaArg(dest: Val, list: Val, ty: LType)
+    InAtomicRmw(dest: Val, op: RmwOp, ptr: Val, ty: LType, value: Val, ordering: IrOrdering)
+    InCmpXchg(dest: Val, ptr: Val, ty: LType, expected: Val, desired: Val, ordering: IrOrdering)
+    InFence(ordering: IrOrdering)
+    InBr(label: string)
+    InCondBr(cond: Val, if_true: string, if_false: string)
+    InRet(ty: Option[LType], value: Option[Val])
+    InSwitch(ty: LType, value: Val, default: string, cases: Buf[(BigInt, string)])
+    InUnreachable
+end Inst
+
+// Whether an instruction ends its block, which is what makes it a terminator.
+inst_terminates(i: Inst) -> bool = i match
+    InBr(_) -> true
+    InCondBr(_, _, _) -> true
+    InRet(_, _) -> true
+    InSwitch(_, _, _, _) -> true
+    InUnreachable -> true
+    _ -> false
+
+// A plain call with nothing said about it.
+ir_call(dest: Option[Val], ret: LType, callee: Val, args: Buf[IrArg]) -> Inst
+    var fast: Buf[FastMath] = buf()
+
+    InCall(dest, ret, callee, args, no_ir_attrs(), None, fast, false)
+end ir_call
+
+// The empty argument list.
+no_ir_args() -> Buf[IrArg]
+    var out: Buf[IrArg] = buf()
+
+    out
+end no_ir_args
+
+// The LLVM text for one instruction, and the only place any of it is written down.
+inst_render(i: Inst) -> string = i match
+    InBin(d, op, ty, a, b) ->
+        s"${v_render(d)} = ${bin_render(op)} ${l_render(ty)} ${v_render(a)}, ${v_render(b)}"
+    InNeg(d, ty, v) -> s"${v_render(d)} = fneg ${l_render(ty)} ${v_render(v)}"
+    InIntCmp(d, p, ty, a, b) ->
+        s"${v_render(d)} = icmp ${icmp_render(p)} ${l_render(ty)} ${v_render(a)}, ${v_render(b)}"
+    InFloatCmp(d, p, ty, a, b) ->
+        s"${v_render(d)} = fcmp ${fcmp_render(p)} ${l_render(ty)} ${v_render(a)}, ${v_render(b)}"
+    InCast(d, op, f, v, t) ->
+        s"${v_render(d)} = ${cast_render(op)} ${l_render(f)} ${v_render(v)} to ${l_render(t)}"
+    InAlloca(d, ty, align) -> s"${v_render(d)} = alloca ${l_render(ty)}${align_text(align)}"
+    InLoad(d, ty, p, acc, align) ->
+        s"${v_render(d)} = load${access_text(acc)} ${l_render(ty)}, ptr ${v_render(p)}" +
+            s"${order_text(acc)}${align_text(align)}"
+    InStore(ty, v, p, acc, align) ->
+        s"store${access_text(acc)} ${l_render(ty)} ${v_render(v)}, ptr ${v_render(p)}" +
+            s"${order_text(acc)}${align_text(align)}"
+    InGep(d, ty, p, idx) ->
+        s"${v_render(d)} = getelementptr ${l_render(ty)}, ptr ${v_render(p)}, ${arg_list(idx)}"
+    InExtract(d, ty, agg, idx) ->
+        s"${v_render(d)} = extractvalue ${l_render(ty)} ${v_render(agg)}, ${int_list(idx)}"
+    InInsert(d, ty, agg, vty, v, idx) ->
+        s"${v_render(d)} = insertvalue ${l_render(ty)} ${v_render(agg)}, ${l_render(vty)} " +
+            s"${v_render(v)}, ${int_list(idx)}"
+    InSelect(d, c, ty, a, b, ct) ->
+        s"${v_render(d)} = select ${l_render(ct)} ${v_render(c)}, ${l_render(ty)} ${v_render(a)}, " +
+            s"${l_render(ty)} ${v_render(b)}"
+    InInsertElement(d, ty, vec, ety, v, ix) ->
+        s"${v_render(d)} = insertelement ${l_render(ty)} ${v_render(vec)}, ${l_render(ety)} " +
+            s"${v_render(v)}, ${arg_render(ix)}"
+    InExtractElement(d, ty, vec, ix) ->
+        s"${v_render(d)} = extractelement ${l_render(ty)} ${v_render(vec)}, ${arg_render(ix)}"
+    InShuffle(d, ty, a, b, mask) ->
+        s"${v_render(d)} = shufflevector ${l_render(ty)} ${v_render(a)}, ${l_render(ty)} " +
+            s"${v_render(b)}, ${arg_render(mask)}"
+    InAsm(d, ret, text, cons, args) ->
+        s"${dest_text(d)}call ${l_render(ret)} asm sideeffect \"$text\", \"$cons\"(${arg_list(args)})"
+    InCall(d, ret, callee, args, ret_attrs, fn, fast, must) ->
+        s"${dest_text(d)}${if must then "musttail " else ""}call ${fast_text(fast)}" +
+            s"${call_kind(ret, ret_attrs, fn)} ${v_render(callee)}(${arg_list(args)})"
+    InVaArg(d, list, ty) -> s"${v_render(d)} = va_arg ptr ${v_render(list)}, ${l_render(ty)}"
+    InAtomicRmw(d, op, p, ty, v, ord) ->
+        s"${v_render(d)} = atomicrmw ${rmw_render(op)} ptr ${v_render(p)}, ${l_render(ty)} " +
+            s"${v_render(v)} ${ord_render(ord)}"
+    InCmpXchg(d, p, ty, e, n, ord) ->
+        s"${v_render(d)} = cmpxchg ptr ${v_render(p)}, ${l_render(ty)} ${v_render(e)}, " +
+            s"${l_render(ty)} ${v_render(n)} ${ord_render(ord)} ${ord_render(ord_on_failure(ord))}"
+    InFence(ord) -> s"fence ${ord_render(ord)}"
+    InBr(l) -> s"br label %$l"
+    InCondBr(c, t, f) -> s"br i1 ${v_render(c)}, label %$t, label %$f"
+    InRet(ty, value) -> ty match
+        None -> "ret void"
+        Some(t) -> value match
+            Some(v) -> s"ret ${l_render(t)} ${v_render(v)}"
+            None -> s"ret ${l_render(t)}"
+    InUnreachable -> "unreachable"
+    InSwitch(ty, v, default, cases) ->
+        s"switch ${l_render(ty)} ${v_render(v)}, label %$default [ ${switch_arms(ty, cases)} ]"
+
+// The `%d = ` a result is bound by, or nothing where the instruction produces none.
+private dest_text(d: Option[Val]) -> string = d match
+    Some(r) -> s"${v_render(r)} = "
+    None -> ""
+
+// What a call names between `call` and the callee: the whole function type where the call needs one
+// -- a variadic callee does -- and the result alone where it does not.
+private call_kind(ret: LType, ret_attrs: Buf[IrAttr], fn: Option[IrFnType]) -> string = fn match
+    Some(t) -> fn_render(t)
+    None ->
+        var b = str_builder()
+
+        for i in 0..<ret_attrs.len()
+            b.push(attr_render(ret_attrs.at(i)))
+            b.push_char(' ')
+
+        b.push(l_render(ret))
+        b.finish()
+
+private fast_text(fast: Buf[FastMath]) -> string
+    var b = str_builder()
+
+    for i in 0..<fast.len()
+        b.push(fast_render(fast.at(i)))
+        b.push_char(' ')
+
+    b.finish()
+end fast_text
+
+private arg_list(args: Buf[IrArg]) -> string
+    var b = str_builder()
+
+    for i in 0..<args.len()
+        if i > 0 then b.push(", ")
+
+        b.push(arg_render(args.at(i)))
+
+    b.finish()
+end arg_list
+
+private int_list(idx: Buf[int]) -> string
+    var b = str_builder()
+
+    for i in 0..<idx.len()
+        if i > 0 then b.push(", ")
+
+        b.push(str(idx.at(i)))
+
+    b.finish()
+end int_list
+
+private switch_arms(ty: LType, cases: Buf[(BigInt, string)]) -> string
+    var b = str_builder()
+
+    for i in 0..<cases.len()
+        if i > 0 then b.push_char(' ')
+
+        val arm = cases.at(i)
+
+        b.push(s"${l_render(ty)} ${to_string(arm.0)}, label %${arm.1}")
+
+    b.finish()
+end switch_arms
+
+private access_text(a: IrAccess) -> string = a match
+    AccPlain -> ""
+    AccVolatile -> " volatile"
+    AccAtomic(_) -> " atomic"
+
+private order_text(a: IrAccess) -> string = a match
+    AccAtomic(o) -> s" ${ord_render(o)}"
+    _ -> ""
+
+private align_text(align: Option[int]) -> string = align match
+    Some(n) -> s", align $n"
+    None -> ""

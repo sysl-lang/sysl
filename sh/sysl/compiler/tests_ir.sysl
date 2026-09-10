@@ -1,0 +1,739 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int}
+
+// What the intermediate representation renders as.
+//
+// **Every expected string here was read out of the reference compiler**, either as a whole function
+// of a program it was handed (`sysl emit-llvm`) or as one line of one, rather than composed from
+// LLVM's grammar. That is what makes these a specification rather than a restatement of the code
+// they check: a renderer that drifted a space would be caught by the text the other compiler had
+// already written.
+
+private ltypes(a: LType, b: LType) -> Buf[LType]
+    var out: Buf[LType] = buf()
+
+    out.push(a)
+    out.push(b)
+    out
+end ltypes
+
+private params2(a: IrParam, b: IrParam) -> Buf[IrParam]
+    var out: Buf[IrParam] = buf()
+
+    out.push(a)
+    out.push(b)
+    out
+end params2
+
+private named(name: string, reg: string) -> IrParam = IrParam(LNamed(name), no_ir_attrs(), Some(VReg(reg)))
+
+private args2(a: IrArg, b: IrArg) -> Buf[IrArg]
+    var out: Buf[IrArg] = buf()
+
+    out.push(a)
+    out.push(b)
+    out
+end args2
+
+private ints(a: int) -> Buf[int]
+    var out: Buf[int] = buf()
+
+    out.push(a)
+    out
+end ints
+
+// -- types ---------------------------------------------------------------------------------------
+
+@test("an integer, a float and a pointer render as LLVM spells them")
+scalar_types()
+    assert_eq(l_render(LInt(1)), "i1")
+    assert_eq(l_render(LInt(32)), "i32")
+    assert_eq(l_render(LInt(5)), "i5")
+    assert_eq(l_render(LFloat(16)), "half")
+    assert_eq(l_render(LFloat(32)), "float")
+    assert_eq(l_render(LFloat(64)), "double")
+    assert_eq(l_render(LPtr), "ptr")
+    assert_eq(l_render(LVoid), "void")
+
+@test("an array and a vector differ by one bracket pair, which is the whole of the distinction")
+array_and_vector()
+    assert_eq(l_render(LArr(64, LInt(8))), "[64 x i8]")
+    assert_eq(l_render(LArr(0, LInt(32))), "[0 x i32]")
+    assert_eq(l_render(LVec(4, LFloat(32))), "<4 x float>")
+    assert_eq(l_render(LArr(2, LArr(3, LInt(64)))), "[2 x [3 x i64]]")
+
+@test("an anonymous aggregate keeps its interior spaces, and an empty one has none")
+aggregate_types()
+    assert_eq(l_render(l_fat()), "{ ptr, ptr }")
+    assert_eq(l_render(l_view(64)), "{ ptr, ptr, i64 }")
+    assert_eq(l_render(l_view(32)), "{ ptr, ptr, i32 }")
+    assert_eq(l_render(LStruct(l_none())), "{}")
+    assert_eq(l_render(LStruct(ltypes(LInt(32), LPtr))), "{ i32, ptr }")
+
+@test("a named type keeps its sigil and is made safe behind it")
+named_types()
+    assert_eq(l_render(LNamed("%struct.Point")), "%struct.Point")
+    assert_eq(l_render(LNamed("%struct.sysl.time$Instant")), "%struct.sysl.time$Instant")
+    assert_eq(l_render(LNamed("%enum.Shape")), "%enum.Shape")
+    assert_eq(l_render(LNamed("%struct.item count")), "%struct.item$20count")
+
+@test("an intrinsic's overload suffix is not the rendered type with the spaces taken out")
+overload_suffixes()
+    assert_eq(l_overload_suffix(LInt(32)), Some("i32"))
+    assert_eq(l_overload_suffix(LFloat(32)), Some("f32"))
+    assert_eq(l_overload_suffix(LFloat(64)), Some("f64"))
+    assert_eq(l_overload_suffix(LPtr), Some("p0"))
+    assert_eq(l_overload_suffix(LVec(4, LFloat(32))), Some("v4f32"))
+    assert_eq(l_overload_suffix(LStruct(l_none())), None)
+    assert_eq(l_overload_suffix(LVoid), None)
+
+// -- names ---------------------------------------------------------------------------------------
+
+@test("an ordinary name reaches LLVM with the spelling it was given")
+plain_names()
+    assert_eq(llvm_safe("add"), "add")
+    assert_eq(llvm_safe("sysl.args$Opt"), "sysl.args$Opt")
+    assert_eq(llvm_safe("github.com.sysl-lang.json"), "github.com.sysl-lang.json")
+    assert_eq(llvm_safe("_start.2"), "_start.2")
+
+@test("a character LLVM refuses is written as its codepoint, and a wide one takes six digits")
+escaped_names()
+    assert_eq(llvm_safe("item count"), "item$20count")
+    assert_eq(llvm_safe("a+b"), "a$2bb")
+    assert_eq(llvm_safe("área"), "$e1rea")
+    assert_eq(llvm_safe("名"), "$u00540d")
+
+@test("escaping is idempotent, so applying it where a name becomes text is safe")
+escaping_twice()
+    assert_eq(llvm_safe(llvm_safe("item count")), "item$20count")
+    assert_eq(llvm_safe(llvm_guard("a$b")), "a$24b")
+
+@test("a leading sigil survives, and it is the only character that does")
+sigiled_names()
+    assert_eq(llvm_safe_sigiled("%struct.Point"), "%struct.Point")
+    assert_eq(llvm_safe_sigiled("@item count"), "@item$20count")
+    assert_eq(llvm_safe_sigiled("no sigil"), "no$20sigil")
+    assert_eq(llvm_safe_sigiled(""), "")
+
+@test("hex is padded to the width asked for and no further")
+hex_digits()
+    assert_eq(hex_lower(0u64, 2), "00")
+    assert_eq(hex_lower(0xffu64, 2), "ff")
+    assert_eq(hex_lower(0x540du64, 6), "00540d")
+    assert_eq(hex_upper(0x3ff8000000000000u64, 16), "3FF8000000000000")
+    assert_eq(hex_upper(0xffffffffffffffffu64, 16), "FFFFFFFFFFFFFFFF")
+
+// -- operands ------------------------------------------------------------------------------------
+
+@test("a register and a symbol carry their sigil, which is not part of the name")
+register_and_symbol()
+    assert_eq(v_render(VReg("t1")), "%t1")
+    assert_eq(v_render(VReg("a.addr")), "%a.addr")
+    assert_eq(v_render(VGlobal("sysl.harness$out")), "@sysl.harness$out")
+    assert_eq(v_render(VGlobal("item count")), "@item$20count")
+
+@test("a constant renders as itself, and a float as the bit pattern of the double it is")
+constant_operands()
+    assert_eq(v_render(VInt(from_int(42))), "42")
+    assert_eq(v_render(VInt(from_int(-1))), "-1")
+    assert_eq(v_render(VBool(true)), "true")
+    assert_eq(v_render(VBool(false)), "false")
+    assert_eq(v_render(v_float(1.5)), "0x3FF8000000000000")
+    assert_eq(v_render(v_float(0.0)), "0x0000000000000000")
+    assert_eq(v_render(v_float32(1.5)), "0x3FF8000000000000")
+
+@test("the placeholders each have their own word")
+placeholder_operands()
+    assert_eq(v_render(VNull), "null")
+    assert_eq(v_render(VUndef), "undef")
+    assert_eq(v_render(VZero), "zeroinitializer")
+    assert_eq(v_render(VPoison), "poison")
+    assert_eq(v_render(VNothing), "")
+
+@test("an aggregate constant writes a type beside every member")
+aggregate_operands()
+    assert_eq(v_render(VAgg(args2(ir_arg(LInt(32), VInt(from_int(1))),
+                                  ir_arg(LArr(2, LInt(64)), VZero)))),
+              "{ i32 1, [2 x i64] zeroinitializer }")
+    assert_eq(v_render(VArray(args2(ir_arg(LInt(32), VInt(from_int(7))),
+                                    ir_arg(LInt(32), VInt(from_int(12)))))),
+              "[i32 7, i32 12]")
+
+@test("a splat and an address made from a constant are each written as a constant expression")
+constant_expressions()
+    assert_eq(v_render(VSplat(LFloat(32), v_float32(1.5))), "splat (float 0x3FF8000000000000)")
+    assert_eq(v_render(VIntToPtr(LInt(64), VInt(from_int(1024)))), "inttoptr (i64 1024 to ptr)")
+
+@test("a run of bytes escapes what LLVM's own escape covers and nothing else")
+byte_operands()
+    var bs: Buf[u8] = buf()
+
+    bs.push(u8('h'))
+    bs.push(u8('i'))
+    bs.push(u8(0))
+    bs.push(u8('"'))
+    bs.push(u8('\\'))
+    bs.push(u8(10))
+    bs.push(u8(0x7f))
+    assert_eq(v_render(VBytes(bs)), "c\"hi\\00\\22\\5C\\0A\\7F\"")
+
+@test("only a register and a symbol are settled at run time")
+which_operands_are_constant()
+    assert_eq(v_is_const(VReg("t1")), false)
+    assert_eq(v_is_const(VGlobal("x")), false)
+    assert_eq(v_is_const(VZero), true)
+    assert_eq(v_is_const(VInt(from_int(0))), true)
+
+// -- signatures ----------------------------------------------------------------------------------
+
+@test("an attribute names the type it is about where it has one")
+attribute_text()
+    assert_eq(attr_render(AttrSRet(LNamed("%struct.Point"))), "sret(%struct.Point)")
+    assert_eq(attr_render(AttrByVal(LNamed("%struct.Point"))), "byval(%struct.Point)")
+    assert_eq(attr_render(AttrAlign(8)), "align 8")
+    assert_eq(attr_render(AttrAlignStack(16)), "alignstack(16)")
+    assert_eq(attr_render(AttrNoAlias), "noalias")
+    assert_eq(attr_render(AttrZeroExt), "zeroext")
+    assert_eq(attr_render(AttrSignExt), "signext")
+
+@test("a run of attributes is one run of words")
+attribute_run()
+    var attrs: Buf[IrAttr] = buf()
+
+    attrs.push(AttrNoAlias)
+    attrs.push(AttrAlign(8))
+    assert_eq(attr_text(attrs), "noalias align 8")
+    assert_eq(attr_text(no_ir_attrs()), "")
+
+@test("a linkage puts its word and the space that separates it in front of the line")
+linkage_words()
+    assert_eq(linkage_prefix(LinkDefault), "")
+    assert_eq(linkage_prefix(LinkPrivate), "private ")
+    assert_eq(linkage_prefix(LinkInternal), "internal ")
+    assert_eq(linkage_prefix(LinkExternal), "external ")
+    assert_eq(linkage_prefix(LinkAppending), "appending ")
+
+@test("a declaration says the type and nothing a body would have added")
+declaration_lines()
+    var ps: Buf[IrParam] = buf()
+
+    ps.push(ir_param(LPtr))
+    ps.push(ir_param(LInt(64)))
+    ps.push(ir_param(LPtr))
+
+    assert_eq(sig_declare(ir_sig("snprintf", IrFnType(LInt(32), ps, true, no_ir_attrs()))),
+              "declare i32 @snprintf(ptr, i64, ptr, ...)")
+    assert_eq(sig_declare(ir_sig("putchar", ir_fn_type(LInt(32), l_int_params()))),
+              "declare i32 @putchar(i32)")
+    assert_eq(sig_declare(ir_sig("sysl_install_stack_guard", ir_fn_type(LVoid, no_params()))),
+              "declare void @sysl_install_stack_guard()")
+    assert_eq(sig_declare(ir_sig("sysl$putbytes", ir_fn_type(LVoid, one_param(l_view(64))))),
+              "declare void @sysl$putbytes({ ptr, ptr, i64 })")
+
+private l_int_params() -> Buf[IrParam] = one_param(LInt(32))
+
+private one_param(t: LType) -> Buf[IrParam]
+    var out: Buf[IrParam] = buf()
+
+    out.push(ir_param(t))
+    out
+end one_param
+
+@test("a variadic list with no fixed parameters is the ellipsis alone")
+variadic_alone()
+    assert_eq(fn_param_list(IrFnType(LVoid, no_params(), true, no_ir_attrs())), "...")
+
+@test("a definition line carries the convention, the string attributes and the section, in order")
+definition_lines()
+    var attrs: Buf[(string, string)] = buf()
+
+    attrs.push(("frame-pointer", "all"))
+
+    val ty = ir_fn_type(LInt(32), l_int_params())
+    val sig = IrFuncSig("boot", ty, LinkInternal, Some("fastcc"), attrs, Some(".text.boot"))
+
+    assert_eq(sig_define(sig),
+              "define internal fastcc i32 @boot(i32) \"frame-pointer\"=\"all\" section \".text.boot\"")
+    assert_eq(sig_define(ir_sig("add", ty)), "define i32 @add(i32)")
+
+@test("a return attribute stands in front of the result type wherever the result is written")
+return_attributes()
+    var rets: Buf[IrAttr] = buf()
+
+    rets.push(AttrZeroExt)
+
+    val ty = IrFnType(LInt(8), no_params(), false, rets)
+
+    assert_eq(fn_result(ty), "zeroext i8")
+    assert_eq(fn_render(ty), "zeroext i8 ()")
+    assert_eq(sig_declare(ir_sig("flag", ty)), "declare zeroext i8 @flag()")
+
+@test("a signature answers the symbol a call reaches it by")
+signature_symbol()
+    assert_eq(v_render(sig_symbol(ir_sig("area", ir_fn_type(LInt(32), no_params())))), "@area")
+
+@test("an argument writes its attributes between its type and its value")
+argument_text()
+    var attrs: Buf[IrAttr] = buf()
+
+    attrs.push(AttrByVal(LNamed("%struct.Point")))
+    assert_eq(arg_render(ir_arg(LInt(32), VInt(from_int(3)))), "i32 3")
+    assert_eq(arg_render(IrArg(LPtr, VReg("p"), attrs)), "ptr byval(%struct.Point) %p")
+    assert_eq(arg_render(ir_arg(LVoid, VNothing)), "void")
+
+// -- instructions --------------------------------------------------------------------------------
+
+@test("each arithmetic and bitwise operation has LLVM's own mnemonic")
+binary_mnemonics()
+    assert_eq(bin_render(OpAdd), "add")
+    assert_eq(bin_render(OpSub), "sub")
+    assert_eq(bin_render(OpMul), "mul")
+    assert_eq(bin_render(OpSDiv), "sdiv")
+    assert_eq(bin_render(OpUDiv), "udiv")
+    assert_eq(bin_render(OpSRem), "srem")
+    assert_eq(bin_render(OpURem), "urem")
+    assert_eq(bin_render(OpShl), "shl")
+    assert_eq(bin_render(OpAShr), "ashr")
+    assert_eq(bin_render(OpLShr), "lshr")
+    assert_eq(bin_render(OpAnd), "and")
+    assert_eq(bin_render(OpOr), "or")
+    assert_eq(bin_render(OpXor), "xor")
+    assert_eq(bin_render(OpFAdd), "fadd")
+    assert_eq(bin_render(OpFSub), "fsub")
+    assert_eq(bin_render(OpFMul), "fmul")
+    assert_eq(bin_render(OpFDiv), "fdiv")
+
+@test("each conversion has its own, and four of them are not the name lowercased")
+cast_mnemonics()
+    assert_eq(cast_render(CastTrunc), "trunc")
+    assert_eq(cast_render(CastZExt), "zext")
+    assert_eq(cast_render(CastSExt), "sext")
+    assert_eq(cast_render(CastFPTrunc), "fptrunc")
+    assert_eq(cast_render(CastFPExt), "fpext")
+    assert_eq(cast_render(CastFPToUI), "fptoui")
+    assert_eq(cast_render(CastFPToSI), "fptosi")
+    assert_eq(cast_render(CastUIToFP), "uitofp")
+    assert_eq(cast_render(CastSIToFP), "sitofp")
+    assert_eq(cast_render(CastPtrToInt), "ptrtoint")
+    assert_eq(cast_render(CastIntToPtr), "inttoptr")
+    assert_eq(cast_render(CastBitCast), "bitcast")
+
+@test("a comparison says whether its operands are signed, and a float one what a NaN answers")
+comparison_predicates()
+    assert_eq(icmp_render(IEq), "eq")
+    assert_eq(icmp_render(INe), "ne")
+    assert_eq(icmp_render(IUgt), "ugt")
+    assert_eq(icmp_render(IUge), "uge")
+    assert_eq(icmp_render(IUlt), "ult")
+    assert_eq(icmp_render(IUle), "ule")
+    assert_eq(icmp_render(ISgt), "sgt")
+    assert_eq(icmp_render(ISge), "sge")
+    assert_eq(icmp_render(ISlt), "slt")
+    assert_eq(icmp_render(ISle), "sle")
+    assert_eq(fcmp_render(FOeq), "oeq")
+    assert_eq(fcmp_render(FOne), "one")
+    assert_eq(fcmp_render(FOgt), "ogt")
+    assert_eq(fcmp_render(FOge), "oge")
+    assert_eq(fcmp_render(FOlt), "olt")
+    assert_eq(fcmp_render(FOle), "ole")
+    assert_eq(fcmp_render(FOrd), "ord")
+    assert_eq(fcmp_render(FUeq), "ueq")
+    assert_eq(fcmp_render(FUne), "une")
+    assert_eq(fcmp_render(FUgt), "ugt")
+    assert_eq(fcmp_render(FUge), "uge")
+    assert_eq(fcmp_render(FUlt), "ult")
+    assert_eq(fcmp_render(FUle), "ule")
+    assert_eq(fcmp_render(FUno), "uno")
+
+@test("three of the five orderings are spelled LLVM's way rather than the language's")
+ordering_words()
+    assert_eq(ord_render(OrdRelaxed), "monotonic")
+    assert_eq(ord_render(OrdAcquire), "acquire")
+    assert_eq(ord_render(OrdRelease), "release")
+    assert_eq(ord_render(OrdAcqRel), "acq_rel")
+    assert_eq(ord_render(OrdSeqCst), "seq_cst")
+
+@test("the attempt that did not take publishes nothing, so its ordering may not be a release")
+failure_ordering()
+    assert_eq(ord_render(ord_on_failure(OrdRelease)), "monotonic")
+    assert_eq(ord_render(ord_on_failure(OrdAcqRel)), "acquire")
+    assert_eq(ord_render(ord_on_failure(OrdSeqCst)), "seq_cst")
+    assert_eq(ord_render(ord_on_failure(OrdAcquire)), "acquire")
+    assert_eq(ord_render(ord_on_failure(OrdRelaxed)), "monotonic")
+
+@test("the read-modify-write operations have the same mnemonics the plain ones do")
+rmw_mnemonics()
+    assert_eq(rmw_render(RmwXchg), "xchg")
+    assert_eq(rmw_render(RmwAdd), "add")
+    assert_eq(rmw_render(RmwSub), "sub")
+    assert_eq(rmw_render(RmwAnd), "and")
+    assert_eq(rmw_render(RmwOr), "or")
+    assert_eq(rmw_render(RmwXor), "xor")
+    assert_eq(fast_render(FmReassoc), "reassoc")
+
+@test("arithmetic names its type once and both operands after it")
+arithmetic_instructions()
+    assert_eq(inst_render(InBin(VReg("t3"), OpAdd, LInt(32), VReg("t1"), VReg("t2"))),
+              "%t3 = add i32 %t1, %t2")
+    assert_eq(inst_render(InBin(VReg("t5"), OpFMul, LFloat(64), VReg("t3"), VReg("t4"))),
+              "%t5 = fmul double %t3, %t4")
+    assert_eq(inst_render(InNeg(VReg("t2"), LFloat(64), VReg("t1"))), "%t2 = fneg double %t1")
+
+@test("a comparison writes its predicate between the mnemonic and the type")
+comparison_instructions()
+    assert_eq(inst_render(InIntCmp(VReg("t4"), IEq, LInt(32), VReg("t3"), VInt(from_int(0)))),
+              "%t4 = icmp eq i32 %t3, 0")
+    assert_eq(inst_render(InIntCmp(VReg("t4"), ISlt, LInt(32), VReg("t3"), VInt(from_int(3)))),
+              "%t4 = icmp slt i32 %t3, 3")
+    assert_eq(inst_render(InFloatCmp(VReg("t4"), FOlt, LFloat(64), VReg("a"), VReg("b"))),
+              "%t4 = fcmp olt double %a, %b")
+
+@test("a conversion names both types, with the value between them")
+cast_instructions()
+    assert_eq(inst_render(InCast(VReg("t3"), CastSIToFP, LInt(32), VReg("t2"), LFloat(64))),
+              "%t3 = sitofp i32 %t2 to double")
+    assert_eq(inst_render(InCast(VReg("t3"), CastSExt, LInt(32), VReg("t2"), LInt(64))),
+              "%t3 = sext i32 %t2 to i64")
+
+@test("storage and the accesses through it, with the alignment where one was stated")
+memory_instructions()
+    assert_eq(inst_render(InAlloca(VReg("a.addr"), LInt(32), None)), "%a.addr = alloca i32")
+    assert_eq(inst_render(InAlloca(VReg("p"), LNamed("%struct.Point"), Some(8))),
+              "%p = alloca %struct.Point, align 8")
+    assert_eq(inst_render(InLoad(VReg("t1"), LInt(32), VReg("a.addr"), AccPlain, None)),
+              "%t1 = load i32, ptr %a.addr")
+    assert_eq(inst_render(InStore(LInt(32), VReg("a.param"), VReg("a.addr"), AccPlain, None)),
+              "store i32 %a.param, ptr %a.addr")
+
+@test("a volatile access says so, and an atomic one says how strongly it is ordered")
+qualified_accesses()
+    assert_eq(inst_render(InLoad(VReg("t1"), LInt(32), VReg("p"), AccVolatile, None)),
+              "%t1 = load volatile i32, ptr %p")
+    assert_eq(inst_render(InLoad(VReg("t1"), LInt(32), VReg("p"), AccAtomic(OrdAcquire), Some(4))),
+              "%t1 = load atomic i32, ptr %p acquire, align 4")
+    assert_eq(inst_render(InStore(LInt(32), VInt(from_int(1)), VReg("p"), AccAtomic(OrdSeqCst), Some(4))),
+              "store atomic i32 1, ptr %p seq_cst, align 4")
+
+@test("reaching into an aggregate: by address, and by value in either direction")
+aggregate_instructions()
+    assert_eq(inst_render(InGep(VReg("t6"), LNamed("%enum.Shape"), VReg("t5"),
+                                args2(ir_arg(LInt(32), VInt(from_int(0))),
+                                      ir_arg(LInt(32), VInt(from_int(1)))))),
+              "%t6 = getelementptr %enum.Shape, ptr %t5, i32 0, i32 1")
+    assert_eq(inst_render(InExtract(VReg("t3"), LNamed("%enum.Shape"), VReg("t1"), ints(0))),
+              "%t3 = extractvalue %enum.Shape %t1, 0")
+    assert_eq(inst_render(InInsert(VReg("t1"), LNamed("%struct.Point"), VUndef, LInt(32),
+                                   VInt(from_int(3)), ints(0))),
+              "%t1 = insertvalue %struct.Point undef, i32 3, 0")
+
+@test("a select names the condition's type as well as the result's")
+select_instruction()
+    assert_eq(inst_render(InSelect(VReg("t3"), VReg("c"), LInt(32), VReg("a"), VReg("b"), LInt(1))),
+              "%t3 = select i1 %c, i32 %a, i32 %b")
+
+@test("the lane instructions each name the vector's type and the lane's separately")
+vector_instructions()
+    assert_eq(inst_render(InInsertElement(VReg("t2"), LVec(4, LFloat(32)), VReg("v"), LFloat(32),
+                                          VReg("x"), ir_arg(LInt(32), VInt(from_int(2))))),
+              "%t2 = insertelement <4 x float> %v, float %x, i32 2")
+    assert_eq(inst_render(InExtractElement(VReg("t3"), LVec(4, LFloat(32)), VReg("v"),
+                                           ir_arg(LInt(32), VInt(from_int(1))))),
+              "%t3 = extractelement <4 x float> %v, i32 1")
+    assert_eq(inst_render(InShuffle(VReg("t4"), LVec(4, LFloat(32)), VReg("a"), VReg("b"),
+                                    ir_arg(LVec(4, LInt(32)), VZero))),
+              "%t4 = shufflevector <4 x float> %a, <4 x float> %b, <4 x i32> zeroinitializer")
+
+@test("a call names the result type, or the whole function type where the callee is variadic")
+call_instructions()
+    assert_eq(inst_render(ir_call(Some(VReg("t10")), LInt(32), VGlobal("area"),
+                                  one_arg(ir_arg(LNamed("%enum.Shape"), VReg("t9"))))),
+              "%t10 = call i32 @area(%enum.Shape %t9)")
+    assert_eq(inst_render(ir_call(None, LVoid, VGlobal("sysl$printc"),
+                                  one_arg(ir_arg(LInt(32), VInt(from_int(10)))))),
+              "call void @sysl$printc(i32 10)")
+
+    var ps: Buf[IrParam] = buf()
+
+    ps.push(ir_param(LPtr))
+
+    val variadic = IrFnType(LInt(32), ps, true, no_ir_attrs())
+
+    assert_eq(inst_render(InCall(Some(VReg("t1")), LInt(32), VGlobal("printf"),
+                                 one_arg(ir_arg(LPtr, VGlobal("fmt"))), no_ir_attrs(),
+                                 Some(variadic), no_fast(), false)),
+              "%t1 = call i32 (ptr, ...) @printf(ptr @fmt)")
+
+@test("a tail call and a relaxed one each say so in front of the mnemonic they qualify")
+qualified_calls()
+    var fast: Buf[FastMath] = buf()
+
+    fast.push(FmReassoc)
+    assert_eq(inst_render(InCall(None, LVoid, VGlobal("loop"), no_ir_args(), no_ir_attrs(), None,
+                                 no_fast(), true)),
+              "musttail call void @loop()")
+    assert_eq(inst_render(InCall(Some(VReg("t1")), LFloat(64), VGlobal("sum"), no_ir_args(),
+                                 no_ir_attrs(), None, fast, false)),
+              "%t1 = call reassoc double @sum()")
+
+private no_fast() -> Buf[FastMath]
+    var out: Buf[FastMath] = buf()
+
+    out
+end no_fast
+
+private one_arg(a: IrArg) -> Buf[IrArg]
+    var out: Buf[IrArg] = buf()
+
+    out.push(a)
+    out
+end one_arg
+
+@test("inline assembly is a call whose callee is the text and its constraints")
+asm_instruction()
+    assert_eq(inst_render(InAsm(None, LVoid, "wfi", "", no_ir_args())),
+              "call void asm sideeffect \"wfi\", \"\"()")
+    assert_eq(inst_render(InAsm(Some(VReg("t1")), LInt(32), "mrs $0, cpsr", "=r", no_ir_args())),
+              "%t1 = call i32 asm sideeffect \"mrs $0, cpsr\", \"=r\"()")
+
+@test("the atomics name the pointer's type nowhere, because a pointer no longer has one")
+atomic_instructions()
+    assert_eq(inst_render(InAtomicRmw(VReg("t1"), RmwAdd, VReg("p"), LInt(32), VInt(from_int(1)),
+                                      OrdSeqCst)),
+              "%t1 = atomicrmw add ptr %p, i32 1 seq_cst")
+    assert_eq(inst_render(InCmpXchg(VReg("t1"), VReg("p"), LInt(32), VReg("e"), VReg("n"),
+                                    OrdAcqRel)),
+              "%t1 = cmpxchg ptr %p, i32 %e, i32 %n acq_rel acquire")
+    assert_eq(inst_render(InFence(OrdSeqCst)), "fence seq_cst")
+
+@test("a variadic cursor is read through the list it advances")
+va_arg_instruction()
+    assert_eq(inst_render(InVaArg(VReg("t1"), VReg("ap"), LInt(32))), "%t1 = va_arg ptr %ap, i32")
+
+@test("the terminators, and which instructions are ones")
+terminator_instructions()
+    assert_eq(inst_render(InBr("while.cond1")), "br label %while.cond1")
+    assert_eq(inst_render(InCondBr(VReg("t2"), "if.then1", "if.else2")),
+              "br i1 %t2, label %if.then1, label %if.else2")
+    assert_eq(inst_render(InRet(None, None)), "ret void")
+    assert_eq(inst_render(InRet(Some(LInt(32)), Some(VReg("t3")))), "ret i32 %t3")
+    assert_eq(inst_render(InRet(Some(LInt(32)), None)), "ret i32")
+    assert_eq(inst_render(InUnreachable), "unreachable")
+    assert_eq(inst_terminates(InBr("x")), true)
+    assert_eq(inst_terminates(InUnreachable), true)
+    assert_eq(inst_terminates(InFence(OrdSeqCst)), false)
+    assert_eq(inst_terminates(InAlloca(VReg("a"), LInt(32), None)), false)
+
+@test("a switch writes its arms between brackets, separated by one space")
+switch_instruction()
+    var cases: Buf[(BigInt, string)] = buf()
+
+    cases.push((from_int(0), "arm0"))
+    cases.push((from_int(1), "arm1"))
+    assert_eq(inst_render(InSwitch(LInt(32), VReg("t1"), "fallback", cases)),
+              "switch i32 %t1, label %fallback [ i32 0, label %arm0 i32 1, label %arm1 ]")
+
+// -- module-level lines --------------------------------------------------------------------------
+
+@test("a type definition renders exactly as the reference compiler writes one")
+type_definitions()
+    assert_eq(type_def_render(ir_type_def("%struct.Point", ltypes(LInt(32), LInt(32)))),
+              "%struct.Point = type { i32, i32 }")
+    assert_eq(type_def_render(ir_type_def("%Shape.Circle", one_type(LInt(32)))),
+              "%Shape.Circle = type { i32 }")
+    assert_eq(type_def_render(ir_type_def("%enum.Shape", ltypes(LInt(32), LArr(1, LInt(32))))),
+              "%enum.Shape = type { i32, [1 x i32] }")
+    assert_eq(type_def_render(ir_type_def("%struct.sysl.fs$Dir", l_none())),
+              "%struct.sysl.fs$Dir = type {  }")
+    assert_eq(type_def_render(IrTypeDef("%struct.Packed", ltypes(LInt(8), LInt(32)), true)),
+              "%struct.Packed = type <{ i8, i32 }>")
+
+private one_type(t: LType) -> Buf[LType] = l_one(t)
+
+@test("a global renders exactly as the reference compiler writes one")
+global_definitions()
+    assert_eq(global_render(ir_global("sysl.harness$attached", false, LInt(1), VBool(false))),
+              "@sysl.harness$attached = private global i1 false")
+    assert_eq(global_render(ir_global("sysl.harness$name_buf", false, LArr(64, LInt(8)), VZero)),
+              "@sysl.harness$name_buf = private global [64 x i8] zeroinitializer")
+    assert_eq(global_render(ir_global("sysl.log$threshold", false, LInt(32), VInt(from_int(1)))),
+              "@sysl.log$threshold = private global i32 1")
+    assert_eq(global_render(ir_global("sysl.log$current", false,
+                                      LNamed("%enum.sysl$Option.ptr.sysl.log$Sink"),
+                                      VAgg(args2(ir_arg(LInt(32), VInt(from_int(1))),
+                                                 ir_arg(LArr(2, LInt(64)), VZero))))),
+              "@sysl.log$current = private global %enum.sysl$Option.ptr.sysl.log$Sink " +
+                  "{ i32 1, [2 x i64] zeroinitializer }")
+
+@test("storage the linker supplies is a declaration and carries no initializer")
+external_global()
+    assert_eq(global_render(ir_extern_global("environ", LPtr)),
+              "@environ = external global ptr")
+
+@test("a section and an alignment are written after the initializer, in that order")
+global_placement()
+    assert_eq(global_render(IrGlobal("boot", true, LInt(32), Some(VInt(from_int(7))), LinkPrivate,
+                                     Some(".rodata.boot"), Some(16))),
+              "@boot = private constant i32 7, section \".rodata.boot\", align 16")
+
+// -- whole functions, byte for byte against the reference compiler --------------------------------
+
+// `scale(p: Point, k: real) -> real = real(p.x) * k + real(p.y)`, as the reference compiler
+// emitted it. Every line of the expected text below was copied out of its `emit-llvm` output.
+@test("a whole function renders byte for byte as the reference compiler wrote it")
+whole_function()
+    var blocks: Buf[IrBlock] = buf()
+    var body: Buf[Inst] = buf()
+
+    val point = LNamed("%struct.Point")
+
+    body.push(InAlloca(VReg("p.addr"), point, None))
+    body.push(InAlloca(VReg("k.addr"), LFloat(64), None))
+    body.push(InStore(point, VReg("p.param"), VReg("p.addr"), AccPlain, None))
+    body.push(InStore(LFloat(64), VReg("k.param"), VReg("k.addr"), AccPlain, None))
+    body.push(InLoad(VReg("t1"), point, VReg("p.addr"), AccPlain, None))
+    body.push(InExtract(VReg("t2"), point, VReg("t1"), ints(0)))
+    body.push(InCast(VReg("t3"), CastSIToFP, LInt(32), VReg("t2"), LFloat(64)))
+    body.push(InLoad(VReg("t4"), LFloat(64), VReg("k.addr"), AccPlain, None))
+    body.push(InBin(VReg("t5"), OpFMul, LFloat(64), VReg("t3"), VReg("t4")))
+    body.push(InLoad(VReg("t6"), point, VReg("p.addr"), AccPlain, None))
+    body.push(InExtract(VReg("t7"), point, VReg("t6"), ints(1)))
+    body.push(InCast(VReg("t8"), CastSIToFP, LInt(32), VReg("t7"), LFloat(64)))
+    body.push(InBin(VReg("t9"), OpFAdd, LFloat(64), VReg("t5"), VReg("t8")))
+    blocks.push(IrBlock("entry", body, Some(InRet(Some(LFloat(64)), Some(VReg("t9"))))))
+
+    val sig = ir_sig("scale", ir_fn_type(LFloat(64),
+                                         params2(named("%struct.Point", "p.param"),
+                                                 IrParam(LFloat(64), no_ir_attrs(),
+                                                         Some(VReg("k.param"))))))
+
+    assert_eq(ir_print_func(IrFunc(sig, blocks)),
+              "define double @scale(%struct.Point %p.param, double %k.param) {\n" +
+                  "entry:\n" +
+                  "  %p.addr = alloca %struct.Point\n" +
+                  "  %k.addr = alloca double\n" +
+                  "  store %struct.Point %p.param, ptr %p.addr\n" +
+                  "  store double %k.param, ptr %k.addr\n" +
+                  "  %t1 = load %struct.Point, ptr %p.addr\n" +
+                  "  %t2 = extractvalue %struct.Point %t1, 0\n" +
+                  "  %t3 = sitofp i32 %t2 to double\n" +
+                  "  %t4 = load double, ptr %k.addr\n" +
+                  "  %t5 = fmul double %t3, %t4\n" +
+                  "  %t6 = load %struct.Point, ptr %p.addr\n" +
+                  "  %t7 = extractvalue %struct.Point %t6, 1\n" +
+                  "  %t8 = sitofp i32 %t7 to double\n" +
+                  "  %t9 = fadd double %t5, %t8\n" +
+                  "  ret double %t9\n" +
+                  "}\n")
+
+@test("a function of several blocks writes each label at the margin and its body indented")
+several_blocks()
+    var blocks: Buf[IrBlock] = buf()
+    var entry: Buf[Inst] = buf()
+    var then_arm: Buf[Inst] = buf()
+
+    entry.push(InLoad(VReg("t2"), LInt(1), VReg("c.addr"), AccPlain, None))
+    blocks.push(IrBlock("entry", entry, Some(InCondBr(VReg("t2"), "if.then1", "if.else2"))))
+    then_arm.push(InLoad(VReg("t3"), LInt(32), VReg("a.addr"), AccPlain, None))
+    blocks.push(IrBlock("if.then1", then_arm, Some(InBr("if.end3"))))
+
+    val sig = ir_sig("pick", ir_fn_type(LInt(32), no_params()))
+
+    assert_eq(ir_print_func(IrFunc(sig, blocks)),
+              "define i32 @pick() {\n" +
+                  "entry:\n" +
+                  "  %t2 = load i1, ptr %c.addr\n" +
+                  "  br i1 %t2, label %if.then1, label %if.else2\n" +
+                  "if.then1:\n" +
+                  "  %t3 = load i32, ptr %a.addr\n" +
+                  "  br label %if.end3\n" +
+                  "}\n")
+
+// -- a whole module ------------------------------------------------------------------------------
+
+private empty_module(triple: string) -> IrModule
+    var declares: Buf[IrFuncSig] = buf()
+    var structs: Buf[IrTypeDef] = buf()
+    var enums: Buf[IrTypeDef] = buf()
+    var boxes: Buf[IrTypeDef] = buf()
+    var imports: Buf[IrFuncSig] = buf()
+    var globals: Buf[IrGlobal] = buf()
+    var runtime: Buf[IrRuntime] = buf()
+    var funcs: Buf[IrFunc] = buf()
+    var thunks: Buf[IrFunc] = buf()
+
+    IrModule(triple, declares, structs, enums, boxes, imports, globals, runtime, funcs, thunks,
+             None, None, None)
+end empty_module
+
+@test("a module with nothing in it is its triple, and the blank line the declarations always leave")
+bare_module()
+    assert_eq(ir_print_module(empty_module("arm64-apple-macosx")),
+              "target triple = \"arm64-apple-macosx\"\n\n\n\n\n\n")
+
+@test("a section with nothing in it contributes no blank line, and the declarations one either way")
+module_sections()
+    var m = empty_module("arm64-apple-macosx")
+
+    m.declares.push(ir_sig("putchar", ir_fn_type(LInt(32), l_int_params())))
+    m.structs.push(ir_type_def("%struct.Point", ltypes(LInt(32), LInt(32))))
+    m.globals.push(ir_global("sysl.log$threshold", false, LInt(32), VInt(from_int(1))))
+
+    assert_eq(ir_print_module(m),
+              "target triple = \"arm64-apple-macosx\"\n" +
+                  "\n" +
+                  "declare i32 @putchar(i32)\n" +
+                  "\n" +
+                  "%struct.Point = type { i32, i32 }\n" +
+                  "\n" +
+                  "@sysl.log$threshold = private global i32 1\n" +
+                  "\n" +
+                  "\n\n\n")
+
+@test("the entry point, the initializer and the used list each close the module in their own way")
+module_tail()
+    var m = empty_module("x86_64-unknown-linux-gnu")
+    var blocks: Buf[IrBlock] = buf()
+    var body: Buf[Inst] = buf()
+
+    body.push(ir_call(None, LVoid, VGlobal("$$main"), no_ir_args()))
+    blocks.push(IrBlock("entry", body, Some(InRet(Some(LInt(32)), Some(VInt(from_int(0)))))))
+
+    var ps: Buf[IrParam] = buf()
+
+    ps.push(IrParam(LInt(32), no_ir_attrs(), Some(VReg("argc"))))
+    ps.push(IrParam(LPtr, no_ir_attrs(), Some(VReg("argv"))))
+    m.entry = Some(IrFunc(ir_sig("main", ir_fn_type(LInt(32), ps)), blocks))
+    m.used = Some(IrGlobal("llvm.used", true, LArr(1, LPtr), Some(VZero), LinkAppending,
+                           Some("llvm.metadata"), None))
+
+    assert_eq(ir_print_module(m),
+              "target triple = \"x86_64-unknown-linux-gnu\"\n" +
+                  "\n" +
+                  "\n\n\n\n" +
+                  "define i32 @main(i32 %argc, ptr %argv) {\n" +
+                  "entry:\n" +
+                  "  call void @$$main()\n" +
+                  "  ret i32 0\n" +
+                  "}\n" +
+                  "@llvm.used = appending constant [1 x ptr] zeroinitializer, " +
+                  "section \"llvm.metadata\"\n")
+
+@test("a runtime function written by hand is carried as its text and one generated as a function")
+module_runtime()
+    var m = empty_module("arm64-apple-macosx")
+    var blocks: Buf[IrBlock] = buf()
+    var body: Buf[Inst] = buf()
+
+    blocks.push(IrBlock("entry", body, Some(InRet(None, None))))
+    m.runtime.push(RtTemplate("sysl.str$eq", "define i1 @sysl.str$eq() {\nentry:\n  ret i1 0\n}\n"))
+    m.runtime.push(RtEmitted(IrFunc(ir_sig("arc.drop", ir_fn_type(LVoid, no_params())), blocks)))
+
+    assert_eq(ir_print_module(m),
+              "target triple = \"arm64-apple-macosx\"\n" +
+                  "\n\n" +
+                  "define i1 @sysl.str$eq() {\nentry:\n  ret i1 0\n}\n" +
+                  "define void @arc.drop() {\nentry:\n  ret void\n}\n" +
+                  "\n\n\n")

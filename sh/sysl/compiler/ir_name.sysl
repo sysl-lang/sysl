@@ -1,0 +1,118 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// Turning a sysl name into one LLVM will accept.
+//
+// An LLVM identifier admits `[-A-Za-z$._0-9]` and nothing else. A sysl identifier is a letter or
+// `_` followed by letters, digits and `_` -- where *letter* is Unicode's answer rather than
+// ASCII's -- and a backtick-quoted name may hold anything but a backtick, a newline and a `.`. So
+// a space, a `+`, an `á` or a `名` all reach the emitter and would produce IR that does not parse.
+//
+// **Two jobs, and keeping them apart is the whole of this file.** A declaration's key is also its
+// emitted symbol, so a name has to survive two different readers, and each wants something the
+// other does not:
+//
+// - the module key is recovered by finding a name's first `$`, so a name that holds a `$` of its
+//   own would be read as a module boundary. `llvm_guard` stops that, and it is applied where a key
+//   is built. It touches `$` and nothing else, so a key otherwise spells the name the programmer
+//   wrote.
+// - LLVM refuses most of what a name may hold. `llvm_safe` fixes that, and it is applied where a
+//   name is written into IR text and nowhere earlier.
+//
+// **Both write `$XX`, and that is one encoding rather than two.** A `$` surviving into IR is either
+// the module separator, a mangling separator (`sysl.args$Opt`), or the marker one of these two put
+// there; `llvm_safe` therefore leaves a `$` alone, which is what makes it applicable to an
+// already-mangled name where `llvm_guard` is not.
+//
+// **Escaping rather than LLVM's quoted-identifier form**, which would also have been legal. The
+// emitter builds names by concatenation -- `%$name.addr`, `arc.drop.$m` -- and a quoted identifier
+// has to enclose the *whole* name, so `%"item count".addr` is invalid where `%"item count.addr"`
+// is what was meant. Escaping composes with concatenation; quoting does not.
+
+// Whether a character may stand in an LLVM name unescaped.
+//
+// This is LLVM's own set, `[-A-Za-z$._0-9]`, and the `-` in it is load-bearing rather than
+// generous: a package's canonical prefix is its coordinate with the slashes turned to dots, so
+// `github.com.sysl-lang.json` is a module name in every program that fetches one.
+//
+// `$` is in the set although it is also the escape character, and that is the point rather than an
+// oversight -- see the note above about the two jobs being one encoding.
+private plain_in_llvm(c: char) -> bool =
+    c == '.' || c == '_' || c == '$' || c == '-' ||
+        (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+
+// One character as its escape -- its codepoint in hex, `$uXXXXXX` beyond one byte.
+private marked_char(c: char) -> string =
+    if u32(c) <= 0xffu32 then s"$$${hex_lower(u64(u32(c)), 2)}"
+    else s"$$u${hex_lower(u64(u32(c)), 6)}"
+
+// A number in lowercase hexadecimal, left-padded with zeros to at least `width` digits.
+hex_lower(value: u64, width: usize) -> string = hex_of(value, width, "0123456789abcdef")
+
+// The same in uppercase, which is what a float's bit pattern is written in.
+hex_upper(value: u64, width: usize) -> string = hex_of(value, width, "0123456789ABCDEF")
+
+private hex_of(value: u64, width: usize, digits: string) -> string
+    var out: Buf[char] = buf()
+    var n = value
+
+    while n > 0u64
+        out.push(char(u32(digits.bytes[usize(n % 16u64)])))
+        n = n / 16u64
+
+    while out.len() < width
+        out.push('0')
+
+    var b = str_builder()
+    var i = out.len()
+
+    while i > 0
+        i = i - 1
+        b.push_char(out.at(i))
+
+    b.finish()
+end hex_of
+
+// A name safe to write into IR text, with every character LLVM refuses written as `$XX`.
+//
+// **This one takes a mangled name and is applied at the emitter**, which is the difference from
+// `llvm_guard`: it leaves a `$` exactly where it found it, so a separator survives and so does a
+// mark `llvm_guard` already wrote. Applying it twice changes nothing.
+//
+// **An ordinary name passes through untouched**, which is the property that matters most: every
+// symbol this compiler emits keeps the spelling it had.
+llvm_safe(name: string) -> string
+    if all_plain(name) then return name
+
+    var b = str_builder()
+
+    for c in name.chars
+        if plain_in_llvm(c) then b.push_char(c) else b.push(marked_char(c))
+
+    b.finish()
+end llvm_safe
+
+private all_plain(name: string) -> bool
+    for c in name.chars
+        if !plain_in_llvm(c) then return false
+
+    true
+end all_plain
+
+// `llvm_safe` for a name that carries its sigil -- `%struct.Point`, `%Shape.Circle`.
+//
+// A `%` is not a character a name may hold: the ordinary grammar cannot produce one and a quoted
+// name that does is marked `$25` on the way into its key. So a leading one is the sigil, always,
+// and it is the only character here that must survive unmarked.
+llvm_safe_sigiled(name: string) -> string
+    if name.bytes.len == 0 then return name
+
+    val head = name.bytes[0]
+
+    if head == u8('%') || head == u8('@')
+        return s"${name[0..<1]}${llvm_safe(name[1..<name.bytes.len])}"
+
+    llvm_safe(name)
+end llvm_safe_sigiled

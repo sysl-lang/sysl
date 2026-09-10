@@ -1,0 +1,135 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, to_string}
+import sysl.text.{str_builder, StrBuilder}
+
+// **An operand, as data.** Everything that can stand where LLVM expects a value: a register, a
+// symbol, a constant of any shape, and the two placeholders that stand for "no particular value".
+//
+// A value carries no type of its own -- LLVM writes the type beside the operand rather than in it,
+// so a type and a value travel together in an `IrArg` where both are wanted, and separately in the
+// instructions that already name a type once for several operands.
+enum Val
+    // `%name` -- a local. The name is the emitter's, and is made safe on the way out rather than
+    // when it is chosen.
+    VReg(name: string)
+
+    // `@name` -- a module-level symbol.
+    VGlobal(name: string)
+
+    // An integer constant, held wide because a literal may name a number wider than any integer
+    // this compiler has.
+    VInt(value: BigInt)
+
+    // A float constant, as the bit pattern LLVM writes it in. LLVM's textual form for a
+    // floating-point constant is the `double` bit pattern in hex whatever the type is, which is why
+    // this is bits rather than a number.
+    VFloat(bits: long)
+
+    VBool(value: bool)
+
+    // The null pointer.
+    VNull
+
+    // A value that has not been given one, which the back end may pick for.
+    VUndef
+
+    // Every bit zero, whatever the type's shape is -- what a global with no initializer of its own
+    // is given, and the only way to write a large aggregate constant of zeros.
+    VZero
+
+    // Undefined, and undefined in a way that poisons whatever reads it. Stronger than `VUndef`.
+    VPoison
+
+    // One value in every lane -- LLVM's own spelling for a vector constant whose lanes agree.
+    VSplat(lane: LType, value: &Val)
+
+    // No operand at all: what a `ret void` writes after the type, which is nothing.
+    VNothing
+
+    // An aggregate constant, its members each carrying their own type.
+    VAgg(fields: Buf[IrArg])
+
+    // An array constant, the same but in brackets.
+    VArray(elems: Buf[IrArg])
+
+    // An address named by a constant integer, which is how a fixed device address is written.
+    VIntToPtr(from: LType, value: &Val)
+
+    // A run of bytes, as LLVM's `c"..."`.
+    VBytes(bytes: Buf[u8])
+end Val
+
+// The LLVM text for an operand, and the only place any of it is written down.
+v_render(v: Val) -> string = v match
+    VReg(name) -> s"%${llvm_safe(name)}"
+    VGlobal(name) -> s"@${llvm_safe(name)}"
+    VInt(value) -> to_string(value)
+    VFloat(bits) -> s"0x${hex_upper(u64(bits), 16)}"
+    VBool(b) -> if b then "true" else "false"
+    VNull -> "null"
+    VUndef -> "undef"
+    VZero -> "zeroinitializer"
+    VPoison -> "poison"
+    VSplat(lane, value) -> s"splat (${l_render(lane)} ${v_render(*value)})"
+    VNothing -> ""
+    VAgg(fields) -> args_between(fields, "{ ", ", ", " }")
+    VArray(elems) -> args_between(elems, "[", ", ", "]")
+    VIntToPtr(from, value) -> s"inttoptr (${l_render(from)} ${v_render(*value)} to ptr)"
+    VBytes(bs) -> byte_string(bs)
+
+// Whether an operand may stand in a constant initializer, which is what a global's value has to be.
+v_is_const(v: Val) -> bool = v match
+    VReg(_) -> false
+    VGlobal(_) -> false
+    _ -> true
+
+// A run of bytes as `c"..."`, with a quote, a backslash and anything outside printable ASCII
+// written as its two hex digits. LLVM's escape is `\XX` and takes no other form.
+private byte_string(bs: Buf[u8]) -> string
+    var b = str_builder()
+
+    b.push("c\"")
+
+    for i in 0..<bs.len()
+        val u = u32(bs.at(i))
+
+        if u == u32(u8('"')) || u == u32(u8('\\')) || u < 0x20u32 || u >= 0x7fu32
+            b.push_char('\\')
+            b.push(hex_upper(u64(u), 2))
+        else
+            b.push_char(char(u))
+
+    b.push_char('"')
+    b.finish()
+end byte_string
+
+private args_between(items: Buf[IrArg], open: string, sep: string, close: string) -> string
+    var b = str_builder()
+
+    b.push(open)
+
+    for i in 0..<items.len()
+        if i > 0 then b.push(sep)
+
+        b.push(arg_render(items.at(i)))
+
+    b.push(close)
+    b.finish()
+end args_between
+
+// A `double`'s bit pattern, which is what LLVM writes a float constant as whatever its width.
+//
+// There is no such conversion in the standard library, so it is the reinterpretation `ptr_cast`
+// already licenses.
+v_float(x: real) -> Val
+    var v = x
+    val p: *i64 = ptr_cast(&v)
+
+    VFloat(*p)
+end v_float
+
+// The same for a `f32` constant: the value is narrowed first and the pattern taken of the `double`
+// it widens back to, which is what LLVM's textual form for a `float` says.
+v_float32(x: real) -> Val = v_float(real(f32(x)))

@@ -1,0 +1,156 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// **An LLVM type, as data.** The eight shapes the back end lowers a sysl type to, and the one
+// function that writes one down.
+//
+// Every LLVM type text this compiler emits comes from `l_render` here. Nothing else concatenates
+// one: a type built by interpolation is a type nothing can read back, which is the whole reason
+// this exists -- a second back end consuming what codegen produced needs the shape rather than the
+// characters, and a shape that is only ever a `string` is one it would have to parse.
+//
+// **It is deliberately not `Type`.** A sysl type carries what the *language* knows -- a
+// `Constrained` subtype, a `Volatile` qualifier, the difference between a `*T` and a `&T`, a type
+// parameter that has no representation at all -- and lowering is precisely the step that erases all
+// of it. Handing a consumer the sysl type would hand back the information the compiler had just
+// finished discarding, and leave it to re-derive an erasure that had already been performed
+// correctly once. What a back end wants is what LLVM's own type system says, which is this.
+//
+// **Widths are resolved, never symbolic.** A view's length is a `usize`, so its third member is
+// `i64` on one machine and `i32` on another -- and that answer is settled when the type is *built*,
+// from the word the emitter was given. There is no node here standing for "whatever a pointer is":
+// a target-less type would be a type nothing could lay out, and making one unrepresentable is
+// cheaper than checking for one.
+enum LType
+    // An integer of any width -- `i1` for a `bool`, `i32` for a `char`, `i5` for a bitfield's
+    // container, and whatever a `usize` came out as.
+    LInt(bits: int)
+
+    // An IEEE binary float. LLVM names these rather than numbering them, which is the one place its
+    // type text is not systematic.
+    LFloat(bits: int)
+
+    // An address. Opaque, as LLVM's pointers have been since it stopped typing them: what is at the
+    // far end is said by the instruction that reaches through, not by the pointer.
+    LPtr
+
+    // No value at all -- what a function returning nothing is declared as, and what a zero-sized
+    // type lowers to.
+    LVoid
+
+    // `[N x T]`, which is an array and also how a `va_list`'s reserved bytes are spelled.
+    LArr(length: int, elem: &LType)
+
+    // `<N x T>`, which is an array whose arithmetic happens in every lane at once.
+    //
+    // **The difference from `Arr` is what the instructions do, not what the bytes are.** LLVM's
+    // arithmetic mnemonics are the same for both widths of the word, so a vector needs no operation
+    // of its own anywhere in the emitter and an array needs no lane semantics. Two shapes that
+    // render one bracket pair apart is the whole of the distinction, and it is exactly the
+    // distinction the language draws between `[N]T` and `<N>T`.
+    LVec(length: int, elem: &LType)
+
+    // An **anonymous** aggregate -- `{ ptr, ptr }` for a trait object, `{ ptr, ptr, i64 }` for a
+    // view. A declared struct is `Named` instead: LLVM gives one a name at module level and refers
+    // to it by that name everywhere afterwards, which is what keeps a recursive type writable.
+    LStruct(fields: Buf[LType])
+
+    // A type LLVM knows by name -- `%struct.Point`, `%enum.Shape`, `%Shape.Circle`, `%arc.Point`.
+    // The sigil is part of the name, because it is part of every use of it.
+    LNamed(name: string)
+end LType
+
+// The LLVM text for a type, and the only place any of it is written down.
+//
+// The spacing is LLVM's own and is not a matter of taste here: the codegen tests assert on emitted
+// IR by substring, so `{ ptr, ptr }` with its interior spaces is the answer and `{ptr,ptr}` is a
+// different one.
+l_render(t: LType) -> string = t match
+    LInt(bits) -> s"i$bits"
+    LFloat(bits) -> if bits == 16 then "half" else if bits == 32 then "float" else "double"
+    LPtr -> "ptr"
+    LVoid -> "void"
+    LArr(n, elem) -> s"[$n x ${l_render(*elem)}]"
+    LVec(n, elem) -> s"<$n x ${l_render(*elem)}>"
+
+    // An aggregate with nothing in it renders as `{}` rather than as `{  }`, which is what LLVM
+    // itself writes. Nothing this compiler lowers produces one -- a zero-sized value takes no
+    // storage at all -- so this is here to be right rather than because anything reaches it.
+    LStruct(fields) -> if fields.is_empty() then "{}" else joined(fields, "{ ", ", ", " }")
+    LNamed(name) -> llvm_safe_sigiled(name)
+
+// The rendered members of an aggregate, between the brackets that say which kind it is.
+private joined(fields: Buf[LType], open: string, sep: string, close: string) -> string
+    var b = str_builder()
+
+    b.push(open)
+
+    for i in 0..<fields.len()
+        if i > 0 then b.push(sep)
+
+        b.push(l_render(fields.at(i)))
+
+    b.push(close)
+    b.finish()
+end joined
+
+// The suffix LLVM spells an **overloaded intrinsic's** operand type with -- `v4f32` in
+// `llvm.vector.reduce.fadd.v4f32`.
+//
+// **It is not `l_render` with the spaces taken out, which is the mistake worth naming**: a float is
+// `float` in a type and `f32` in a name, so the two spellings genuinely differ and a suffix built
+// by filtering the rendered text produces `4xfloat`, which names no intrinsic. LLVM accepts that
+// silently at the text level and fails in the verifier, one layer further on than the mistake.
+//
+// Only the shapes an intrinsic sysl emits is overloaded on have one; an aggregate answers `None`,
+// because no intrinsic the compiler reaches takes one.
+l_overload_suffix(t: LType) -> Option[string] = t match
+    LInt(bits) -> Some(s"i$bits")
+    LFloat(bits) -> Some(s"f$bits")
+    LPtr -> Some("p0")
+    LVec(n, elem) -> l_overload_suffix(*elem) match
+        Some(inner) -> Some(s"v$n$inner")
+        None -> None
+    _ -> None
+
+// A list of types, for the aggregates that take one.
+l_types(ts: Buf[LType]) -> Buf[LType] = ts
+
+// The empty list, spelled once so a caller need not annotate it.
+l_none() -> Buf[LType]
+    var out: Buf[LType] = buf()
+
+    out
+end l_none
+
+// One type as a list.
+l_one(t: LType) -> Buf[LType]
+    var out: Buf[LType] = buf()
+
+    out.push(t)
+    out
+end l_one
+
+// A trait object: the method table for the type it forgot, and the value itself. Two words rather
+// than one, which is the whole of what a `dyn` keyword would have announced.
+l_fat() -> LType
+    var fields: Buf[LType] = buf()
+
+    fields.push(LPtr)
+    fields.push(LPtr)
+    LStruct(fields)
+end l_fat
+
+// A view of elements someone else owns -- where they are, where they end, and how many there are.
+// The count is a `usize`, which is why this is the one type in the language whose text depends on
+// the machine and so the one that has to be asked for rather than named.
+l_view(word_bits: int) -> LType
+    var fields: Buf[LType] = buf()
+
+    fields.push(LPtr)
+    fields.push(LPtr)
+    fields.push(LInt(word_bits))
+    LStruct(fields)
+end l_view

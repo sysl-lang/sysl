@@ -1,0 +1,259 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// **A module, as data**, and the one function that writes one down as LLVM's textual form.
+//
+// Codegen lowers the typed tree to an `IrModule`, and `ir_print_module` writes one out. Nothing
+// else in this compiler concatenates a type, an operand, an instruction, a signature or a
+// module-level line: the render functions in the `ir_*` files are the only places any of that
+// syntax is written, which is what makes the text one function over the model rather than the
+// model's only form.
+//
+// **It exists so that a back end that is not LLVM has something to read.** An IR that is characters
+// is one a second back end would have to parse back into the shapes the compiler had just finished
+// deciding. That parser is the thing this removes, and every choice here is about not putting it
+// back one layer in: operands are values rather than names, types are an LLVM tree rather than
+// rendered strings, and basic blocks are captured as the emitters build them rather than
+// reconstructed from labels and terminators by whoever consumes them.
+//
+// **The one place LLVM text survives is a runtime template, and it is named rather than
+// anonymous.** Some of the ownership runtime and all of the string operations are hand-written
+// LLVM, so there is nothing to hand a back end that is not LLVM except what the function has to do
+// -- which is what a name is.
+
+// A named aggregate type at module level -- `%struct.Point = type { i32, i32 }`.
+struct IrTypeDef
+    name: string
+    fields: Buf[LType]
+    packed: bool
+end IrTypeDef
+
+// A definition with the ordinary layout, which is nearly all of them.
+ir_type_def(name: string, fields: Buf[LType]) -> IrTypeDef = IrTypeDef(name, fields, false)
+
+// `@packed` is LLVM's `<{ }>`, which is the same declaration order with every interior gap removed
+// and the aggregate's own alignment dropped to one -- so the offsets the back end computes are the
+// ones the layout computed, rather than two answers that agree until a field needs padding in front
+// of it.
+//
+// A type carries no alignment in LLVM's textual form: the boundary is stated where storage is
+// created, which is what an alloca and a global carry.
+type_def_render(d: IrTypeDef) -> string
+    var b = str_builder()
+
+    b.push(llvm_safe_sigiled(d.name))
+    b.push(" = type ")
+    b.push(if d.packed then "<{ " else "{ ")
+
+    for i in 0..<d.fields.len()
+        if i > 0 then b.push(", ")
+
+        b.push(l_render(d.fields.at(i)))
+
+    b.push(if d.packed then " }>" else " }")
+    b.finish()
+end type_def_render
+
+// Storage at module level: a `global` or a `constant`, with whatever the line around it carries.
+struct IrGlobal
+    name: string
+    constant: bool
+    ty: LType
+    value: Option[Val]
+    linkage: IrLinkage
+    section: Option[string]
+    align: Option[int]
+end IrGlobal
+
+// Storage this module lays down, private to it and initialized.
+ir_global(name: string, constant: bool, ty: LType, value: Val) -> IrGlobal =
+    IrGlobal(name, constant, ty, Some(value), LinkPrivate, None, None)
+
+// Storage the linker supplies: the declaration line and nothing else, since this module lays none
+// of it down.
+ir_extern_global(name: string, ty: LType) -> IrGlobal =
+    IrGlobal(name, false, ty, None, LinkExternal, None, None)
+
+global_render(g: IrGlobal) -> string
+    var b = str_builder()
+
+    b.push("@")
+    b.push(llvm_safe(g.name))
+    b.push(" = ")
+    b.push(linkage_prefix(g.linkage))
+    b.push(if g.constant then "constant " else "global ")
+    b.push(l_render(g.ty))
+
+    g.value match
+        Some(v) ->
+            b.push_char(' ')
+            b.push(v_render(v))
+        None -> ()
+
+    g.section match
+        Some(s) -> b.push(s", section \"$s\"")
+        None -> ()
+
+    g.align match
+        Some(n) -> b.push(s", align $n")
+        None -> ()
+
+    b.finish()
+end global_render
+
+// A basic block: the label a branch names it by, the instructions in order, and the one that ends
+// it. The terminator is held apart because a block without one is a block still being built rather
+// than a block that is wrong.
+struct IrBlock
+    label: string
+    instrs: Buf[Inst]
+    terminator: Option[Inst]
+end IrBlock
+
+// A function: its signature and its blocks. A declaration is a signature with no function around
+// it, which is why the two are not one type here.
+struct IrFunc
+    sig: IrFuncSig
+    blocks: Buf[IrBlock]
+end IrFunc
+
+// A runtime function: one this compiler generated like any other, or one whose LLVM was written by
+// hand and is carried as text under a name.
+enum IrRuntime
+    RtEmitted(func: IrFunc)
+    RtTemplate(name: string, llvm: string)
+end IrRuntime
+
+// A module's static initializer and the list that registers it, which travel together because
+// neither means anything alone.
+struct IrInit
+    func: IrFunc
+    list: IrGlobal
+end IrInit
+
+// **A whole module.** Its fields are in the order LLVM requires rather than an arrangement chosen
+// for tidiness, which is what makes printing it a walk rather than a sort.
+struct IrModule
+    triple: string
+    declares: Buf[IrFuncSig]
+    structs: Buf[IrTypeDef]
+    enums: Buf[IrTypeDef]
+    boxes: Buf[IrTypeDef]
+    imports: Buf[IrFuncSig]
+    globals: Buf[IrGlobal]
+    runtime: Buf[IrRuntime]
+    funcs: Buf[IrFunc]
+    thunks: Buf[IrFunc]
+    entry: Option[IrFunc]
+    used: Option[IrGlobal]
+    init: Option[IrInit]
+end IrModule
+
+// One function, from its `define` line to the brace that closes it.
+ir_print_func(f: IrFunc) -> string
+    var b = str_builder()
+
+    b.push(sig_define(f.sig))
+    b.push(" {\n")
+
+    for i in 0..<f.blocks.len()
+        print_block(f.blocks.at(i), &b)
+
+    b.push("}\n")
+    b.finish()
+end ir_print_func
+
+private print_block(bl: IrBlock, out: *StrBuilder)
+    out.push(bl.label)
+    out.push(":\n")
+
+    for i in 0..<bl.instrs.len()
+        out.push("  ")
+        out.push(inst_render(bl.instrs.at(i)))
+        out.push_char('\n')
+
+    bl.terminator match
+        Some(t) ->
+            out.push("  ")
+            out.push(inst_render(t))
+            out.push_char('\n')
+        None -> ()
+end print_block
+
+// **A whole module as LLVM text.** The blank lines are part of the answer: a section that has
+// nothing in it contributes none, and the declarations at the top contribute one whether or not
+// there were any.
+ir_print_module(m: IrModule) -> string
+    var b = str_builder()
+
+    b.push(s"target triple = \"${m.triple}\"\n\n")
+
+    sig_lines(m.declares, &b, true)
+    def_lines(m.structs, &b)
+    def_lines(m.enums, &b)
+    def_lines(m.boxes, &b)
+    sig_lines(m.imports, &b, false)
+    global_lines(m.globals, &b)
+
+    for i in 0..<m.runtime.len()
+        m.runtime.at(i) match
+            RtEmitted(f) -> b.push(ir_print_func(f))
+            RtTemplate(_, t) -> b.push(t)
+
+    b.push_char('\n')
+
+    for i in 0..<m.funcs.len()
+        b.push(ir_print_func(m.funcs.at(i)))
+
+    b.push_char('\n')
+
+    for i in 0..<m.thunks.len()
+        b.push(ir_print_func(m.thunks.at(i)))
+
+    b.push_char('\n')
+
+    m.entry match
+        Some(f) -> b.push(ir_print_func(f))
+        None -> ()
+
+    m.init match
+        Some(i) ->
+            b.push(ir_print_func(i.func))
+            b.push(global_render(i.list))
+            b.push_char('\n')
+        None -> ()
+
+    m.used match
+        Some(g) ->
+            b.push(global_render(g))
+            b.push_char('\n')
+        None -> ()
+
+    b.finish()
+end ir_print_module
+
+private sig_lines(items: Buf[IrFuncSig], out: *StrBuilder, always: bool)
+    for i in 0..<items.len()
+        out.push(sig_declare(items.at(i)))
+        out.push_char('\n')
+
+    if always || !items.is_empty() then out.push_char('\n')
+end sig_lines
+
+private def_lines(items: Buf[IrTypeDef], out: *StrBuilder)
+    for i in 0..<items.len()
+        out.push(type_def_render(items.at(i)))
+        out.push_char('\n')
+
+    if !items.is_empty() then out.push_char('\n')
+end def_lines
+
+private global_lines(items: Buf[IrGlobal], out: *StrBuilder)
+    for i in 0..<items.len()
+        out.push(global_render(items.at(i)))
+        out.push_char('\n')
+
+    if !items.is_empty() then out.push_char('\n')
+end global_lines

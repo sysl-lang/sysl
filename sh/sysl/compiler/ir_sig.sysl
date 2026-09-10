@@ -1,0 +1,253 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// **A signature, as data.** What a parameter is, what a function type is, and what a definition or
+// a declaration line says -- with the attributes that ride on either.
+//
+// An attribute is where a calling convention stops being the type's business and starts being the
+// call site's: `sret` and `byval` say a value the type calls a struct travels in memory, and the
+// two extensions say a narrow integer arrives widened. All four are things the *other* side was
+// compiled to expect, so they belong to the boundary rather than to the value.
+
+// A parameter or return attribute.
+enum IrAttr
+    // The caller passed the address of the space the result is to be written into. The type is the
+    // one being returned, not the pointer.
+    AttrSRet(ty: LType)
+
+    // The argument is a copy the callee owns, made from the address given. The type is what is
+    // copied.
+    AttrByVal(ty: LType)
+
+    // The boundary this argument is laid out on.
+    AttrAlign(n: int)
+
+    // The stack alignment a by-value argument's copy is made at.
+    AttrAlignStack(n: int)
+
+    // This pointer aliases nothing else the callee can reach.
+    AttrNoAlias
+
+    // A narrow integer arrives widened, and this says with what.
+    AttrZeroExt
+    AttrSignExt
+end IrAttr
+
+attr_render(a: IrAttr) -> string = a match
+    AttrSRet(ty) -> s"sret(${l_render(ty)})"
+    AttrByVal(ty) -> s"byval(${l_render(ty)})"
+    AttrAlign(n) -> s"align $n"
+    AttrAlignStack(n) -> s"alignstack($n)"
+    AttrNoAlias -> "noalias"
+    AttrZeroExt -> "zeroext"
+    AttrSignExt -> "signext"
+
+// Several attributes as one run of words, which is how LLVM writes them.
+attr_text(attrs: Buf[IrAttr]) -> string
+    var b = str_builder()
+
+    for i in 0..<attrs.len()
+        if i > 0 then b.push_char(' ')
+
+        b.push(attr_render(attrs.at(i)))
+
+    b.finish()
+end attr_text
+
+// A parameter: its type, whatever the boundary says about it, and -- in a definition -- the name
+// the body reaches it by.
+struct IrParam
+    ty: LType
+    attrs: Buf[IrAttr]
+    name: Option[Val]
+end IrParam
+
+// A parameter with nothing said about it, which is nearly all of them.
+ir_param(ty: LType) -> IrParam = IrParam(ty, no_ir_attrs(), None)
+
+// The empty attribute list, spelled once so a caller need not annotate it.
+no_ir_attrs() -> Buf[IrAttr]
+    var out: Buf[IrAttr] = buf()
+
+    out
+end no_ir_attrs
+
+param_render(p: IrParam) -> string
+    var b = str_builder()
+
+    b.push(l_render(p.ty))
+
+    for i in 0..<p.attrs.len()
+        b.push_char(' ')
+        b.push(attr_render(p.attrs.at(i)))
+
+    p.name match
+        Some(v) ->
+            b.push_char(' ')
+            b.push(v_render(v))
+        None -> ()
+
+    b.finish()
+end param_render
+
+// A function type: what comes back, what goes in, and whether the list is open at the end.
+struct IrFnType
+    ret: LType
+    params: Buf[IrParam]
+    variadic: bool
+    ret_attrs: Buf[IrAttr]
+end IrFnType
+
+// A function type with nothing said about its result and a closed parameter list.
+ir_fn_type(ret: LType, params: Buf[IrParam]) -> IrFnType = IrFnType(ret, params, false, no_ir_attrs())
+
+// The empty parameter list.
+no_params() -> Buf[IrParam]
+    var out: Buf[IrParam] = buf()
+
+    out
+end no_params
+
+// The result as it stands in a `define`, `declare` or `call` -- the return attributes and then the
+// type, which is the order LLVM writes them in.
+fn_result(t: IrFnType) -> string
+    var b = str_builder()
+
+    for i in 0..<t.ret_attrs.len()
+        b.push(attr_render(t.ret_attrs.at(i)))
+        b.push_char(' ')
+
+    b.push(l_render(t.ret))
+    b.finish()
+end fn_result
+
+// The parameters between the parentheses, with the ellipsis where the list is open.
+fn_param_list(t: IrFnType) -> string
+    var b = str_builder()
+
+    for i in 0..<t.params.len()
+        if i > 0 then b.push(", ")
+
+        b.push(param_render(t.params.at(i)))
+
+    if t.variadic
+        if !t.params.is_empty() then b.push(", ")
+
+        b.push("...")
+
+    b.finish()
+end fn_param_list
+
+fn_render(t: IrFnType) -> string = s"${fn_result(t)} (${fn_param_list(t)})"
+
+// How much of the linker a symbol is visible to.
+enum IrLinkage
+    // Whatever LLVM's own default is for the line it stands on, which for a definition is external.
+    LinkDefault
+
+    // Not a symbol at all: the name survives only inside this module.
+    LinkPrivate
+
+    // A symbol the linker sees but nothing outside the module may name.
+    LinkInternal
+
+    // Declared here and defined elsewhere.
+    LinkExternal
+
+    // A list the linker concatenates rather than picks one of, which is what `llvm.used` is.
+    LinkAppending
+end IrLinkage
+
+// The word a linkage puts in front of the rest of the line, with the space that separates it.
+linkage_prefix(l: IrLinkage) -> string = l match
+    LinkDefault -> ""
+    LinkPrivate -> "private "
+    LinkInternal -> "internal "
+    LinkExternal -> "external "
+    LinkAppending -> "appending "
+
+// A function's name, type and everything the line around it carries.
+struct IrFuncSig
+    name: string
+    ty: IrFnType
+    linkage: IrLinkage
+    cconv: Option[string]
+    attrs: Buf[(string, string)]
+    section: Option[string]
+end IrFuncSig
+
+// A signature with nothing said about it beyond its name and type.
+ir_sig(name: string, ty: IrFnType) -> IrFuncSig
+    var attrs: Buf[(string, string)] = buf()
+
+    IrFuncSig(name, ty, LinkDefault, None, attrs, None)
+end ir_sig
+
+// The `define` line, without the brace that opens the body.
+sig_define(s: IrFuncSig) -> string
+    var b = str_builder()
+
+    b.push("define ")
+    b.push(linkage_prefix(s.linkage))
+
+    s.cconv match
+        Some(c) ->
+            b.push(c)
+            b.push_char(' ')
+        None -> ()
+
+    b.push(fn_result(s.ty))
+    b.push(" @")
+    b.push(llvm_safe(s.name))
+    b.push("(")
+    b.push(fn_param_list(s.ty))
+    b.push(")")
+
+    for i in 0..<s.attrs.len()
+        val kv = s.attrs.at(i)
+
+        b.push(s" \"${kv.0}\"=\"${kv.1}\"")
+
+    s.section match
+        Some(name) -> b.push(s" section \"$name\"")
+        None -> ()
+
+    b.finish()
+end sig_define
+
+// The `declare` line, which says the type and nothing about the body there is not.
+sig_declare(s: IrFuncSig) -> string =
+    s"declare ${fn_result(s.ty)} @${llvm_safe(s.name)}(${fn_param_list(s.ty)})"
+
+// The symbol a call reaches this function by.
+sig_symbol(s: IrFuncSig) -> Val = VGlobal(s.name)
+
+// An operand with the type LLVM writes beside it, and whatever the boundary says about it.
+struct IrArg
+    ty: LType
+    value: Val
+    attrs: Buf[IrAttr]
+end IrArg
+
+// An argument with nothing said about it.
+ir_arg(ty: LType, value: Val) -> IrArg = IrArg(ty, value, no_ir_attrs())
+
+arg_render(a: IrArg) -> string
+    var b = str_builder()
+
+    b.push(l_render(a.ty))
+
+    for i in 0..<a.attrs.len()
+        b.push_char(' ')
+        b.push(attr_render(a.attrs.at(i)))
+
+    val v = v_render(a.value)
+
+    if v != "" then
+        b.push_char(' ')
+        b.push(v)
+
+    b.finish()
+end arg_render
