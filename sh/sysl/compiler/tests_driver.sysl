@@ -121,20 +121,31 @@ an_unmet_requirement_stops_a_build()
     assert(said.message.index_of("requires 'os'").is_some(), said.message)
     remove_dir_all(root).unwrap_or(())
 
-@test("a dependency nobody brought down is a refusal naming where it should have been")
-a_missing_dependency_names_where_it_should_be()
+// **A vendored directory is the cache moved into the project**, so a package put there by hand is a
+// package already fetched -- which is what lets a driver-level assertion about the package layer be
+// made with nothing reaching the network.
+@test("a dependency the project vendored is read, and its modules are what the program imports")
+a_vendored_dependency_is_read()
     var shape: Buf[(string, string)] = buf()
 
     shape.push(("package.hocon",
-                "dependencies { nope { git = \"github.com/nobody/nope\", version = \"9.9.9\" } }\n"))
-    shape.push(("main.sysl", "main()\n    print(\"hi\")\n"))
+                "dependencies { side { git = \"github.com/e/side\", version = \"1.2.3\" } }\n"))
+    shape.push(("vendor/github.com/e/side/@v1.2.3/package.hocon",
+                "package { name = \"side\", version = \"1.2.3\" }\n"))
+    shape.push(("vendor/github.com/e/side/@v1.2.3/side/side.sysl",
+                "module side\n\npub twice(n: int) -> int = n * 2\n"))
+    shape.push(("main.sysl", "import side.twice\n\nmain()\n    print(twice(2))\n"))
 
     val root = project_of(shape)
-    val said = compilation_of(root, host_target()).unwrap_err()
+    val built = compilation_of(root, host_target()).unwrap()
+    var found = false
 
-    assert(said.message.index_of("is not on this machine").is_some(), said.message)
-    assert(said.message.index_of("@v9.9.9").is_some(), said.message)
+    for i in 0..<built.units.len()
+        if built.units.at(i).src.name.ends_with("side.sysl") then found = true
+
+    assert(found, "the vendored package's source is part of the compilation")
     remove_dir_all(root).unwrap_or(())
+end a_vendored_dependency_is_read
 
 @test("a manifest naming a machine this compiler has no entry for is refused as itself")
 an_unknown_target_is_refused()
@@ -151,20 +162,31 @@ an_unknown_target_is_refused()
     assert(said != "", "a machine nobody has is not guessed at")
     remove_dir_all(root).unwrap_or(())
 
-@test("a project asking for a compiler newer than this one is refused, naming both versions")
-a_newer_floor_is_refused()
+// **A floor states the oldest *released* compiler a package builds with, and this compiler has never
+// been released under that line** -- it reports 0.0.1 and is numbered from its own beginning. So it
+// makes no claim, which is the reference's own answer for a version it cannot read as a release, and
+// a project stating any floor at all is read rather than turned away. The refusal itself is still
+// what it was: the test below asks `check_floor` directly, which is the seam a compiler that *is* on
+// the line uses.
+@test("a floor makes no claim against a compiler that is not on the line floors are written against")
+a_floor_makes_no_claim_here()
     var shape: Buf[(string, string)] = buf()
 
     shape.push(("package.hocon", "package { name = \"later\", version = \"1.0.0\", sysl = \"99.0.0\" }\n"))
     shape.push(("main.sysl", "main()\n    print(\"hi\")\n"))
 
     val root = project_of(shape)
+
+    assert(floor_refusal("'later' 1.0.0", "99.0.0").is_none(), "nothing to compare it against")
+    assert_eq(check_floor("'later' 1.0.0", "99.0.0", "0.0.113").unwrap(),
+              "'later' 1.0.0 cannot be built because it requires sysl 99.0.0 or newer, while the " +
+              "compiler in hand is 0.0.113")
+
     val said = emit_typed_text(root, None, false) match
         Err(refusal) -> refusal.message
         Ok(_) -> ""
 
-    assert(said.index_of("'later' 1.0.0 cannot be built").is_some(), said)
-    assert(said.index_of("requires sysl 99.0.0 or newer").is_some(), said)
+    assert_eq(said, "")
     remove_dir_all(root).unwrap_or(())
 
 @test("the declaration tables of a program hold the program's rows and not the library's")

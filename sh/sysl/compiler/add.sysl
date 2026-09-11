@@ -1,0 +1,179 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, read_text, write_text}
+import sysl.process.capture
+import sysl.text.{split, Search}
+
+// `sysl add` -- the write half of the package manager.
+//
+// A build could fetch a dependency graph and the only way to *add* an entry was to open
+// `package.hocon` and type it. That is the command a package manager is judged by, and its absence
+// is felt every time somebody has to go and look up how a coordinate is spelled and what the newest
+// tag is.
+//
+// **Where the version comes from: `git ls-remote --tags`, not a forge's API.** A coordinate here is
+// a git identity and a fetch clones it with plain git, so asking git what tags exist is the same
+// question the build already asks and works for any host -- a self-hosted server, a mirror, an
+// internal GitLab. Reading tags through one forge's API would make `sysl add` work for one host and
+// fail for the rest, which is a worse command than none.
+//
+// **What is written**: the manifest is rewritten by changing the smallest run of bytes it can, and
+// the result is read back through the manifest reader *before* it is written to disk, so a rewrite
+// that produced something the compiler cannot read leaves the file exactly as it was.
+//
+// Nothing is fetched. `sysl add` records what a project takes; the next build is what goes and gets
+// it, and that is where a coordinate that does not exist is reported -- by the machinery that
+// already says so well.
+
+// What a person typed: a coordinate, and a version where they pinned one.
+struct Asked
+    coordinate: string
+    version: Option[string]
+    label: string
+end Asked
+
+// Reads `github.com/owner/repo` or `github.com/owner/repo@1.2.3`.
+//
+// **A leading `v` on the version is taken and dropped.** A repository's tag is `v1.2.3` and a
+// manifest writes `1.2.3`, so both spellings arrive from people reading the same page, and refusing
+// one of them would be refusing a version that is right.
+read_add_spec(spec: string) -> Result[Asked, string]
+    val parts = split(spec, "@")
+
+    if parts.len > 2
+        return Err(s"'$spec' writes '@' more than once — a package is " +
+            "'<host>/<owner>/<repo>' or '<host>/<owner>/<repo>@<version>'")
+
+    val coordinate = parts[0]
+    var wanted: Option[string] = None
+
+    if parts.len == 2
+        val text = parts[1]
+
+        wanted = Some(if text.starts_with("v") then text[1..<text.bytes.len] else text)
+
+    if coordinate.index_of("://").is_some()
+        return Err(s"'$coordinate' is a URL — a coordinate is an identity, so it carries no " +
+            s"scheme: ${without_scheme(coordinate)}")
+
+    if slashes_in(coordinate) < 2
+        return Err(s"'$coordinate' is not a coordinate — it is a host and a path, as in " +
+            "'github.com/sysl-lang/sdl3'")
+
+    if wanted.is_some()
+        release_of(wanted.unwrap()) match
+            Err(why) -> return Err(why)
+            Ok(_) -> ()
+
+    Ok(Asked(coordinate, wanted, label_of(coordinate)))
+end read_add_spec
+
+private without_scheme(text: string) -> string
+    text.index_of("://") match
+        None -> text
+        Some(at) -> text[(at + 3)..<text.bytes.len]
+end without_scheme
+
+private slashes_in(text: string) -> usize
+    var n: usize = 0
+
+    for i in 0..<text.bytes.len
+        if text.bytes[i] == u8('/') then n += 1
+
+    n
+end slashes_in
+
+// What the entry is called, which is what an `import` line will say.
+//
+// The last segment of the coordinate, with a major-version suffix dropped -- `.../json/v2` is the
+// `json` package at its second major, and naming it `v2` would name the version rather than the
+// package.
+label_of(coordinate: string) -> string
+    val bare = without_major(coordinate)
+    var at = bare.bytes.len
+
+    for i in 0..<bare.bytes.len
+        if bare.bytes[i] == u8('/') then at = i + 1
+
+    if at == bare.bytes.len then bare else bare[at..<bare.bytes.len]
+end label_of
+
+// The newest release tag a repository has, out of what it has.
+//
+// A tag that is not a version is ignored rather than refused: repositories carry `latest`, `nightly`
+// and release-candidate tags, and none of them is what a manifest can pin.
+newest_release(tags: Buf[string]) -> Option[Release]
+    var best: Option[Release] = None
+
+    for i in 0..<tags.len()
+        val text = tags.at(i)
+        val bare = if text.starts_with("v") then text[1..<text.bytes.len] else text
+
+        release_of(bare) match
+            Err(_) -> ()
+            Ok(v) ->
+                if best.is_none() || release_before(best.unwrap(), v) then best = Some(v)
+
+    best
+end newest_release
+
+// The tags a repository publishes, asked of git rather than of a forge.
+tags_of(coordinate: string) -> Result[Buf[string], string]
+    val url = clone_url(coordinate)
+
+    val answer = capture("git", ["ls-remote", "--tags", "--refs", url], "", [], true) match
+        Err(_) -> return Err(s"cannot ask $url what versions it has: git is not on this machine")
+        Ok(got) -> got
+
+    if !answer.status.ok()
+        return Err(s"cannot ask $url what versions it has:\n${answer.err.unwrap_or("").trim()}")
+
+    var out: Buf[string] = buf()
+
+    for line in split(answer.text, "\n")
+        line.index_of("refs/tags/") match
+            None -> ()
+            Some(at) -> out.push(line[(at + 10)..<line.bytes.len].trim())
+
+    Ok(out)
+end tags_of
+
+// The whole command: work out the version, rewrite the manifest, check it still reads, write it.
+add_to_project(root: string, spec: string) -> Result[string, string]
+    val file = join_path(root, ManifestName)
+
+    if !is_file(file)
+        return Err(s"there is no $ManifestName here — 'sysl add' adds a dependency to a project, " +
+            "and a project is a directory with a manifest in it")
+
+    val asked = read_add_spec(spec)?
+
+    val pinned = asked.version match
+        Some(v) -> v
+        None ->
+            newest_release(tags_of(asked.coordinate)?) match
+                None -> return Err(s"${asked.coordinate} has no version tag, so there is nothing " +
+                    "to pin — a package is published by tagging it 'v<major>.<minor>.<patch>'")
+                Some(v) -> release_shown(v)
+
+    val text = read_text(file) match
+        Err(_) -> return Err(s"cannot read $file")
+        Ok(got) -> got
+
+    val edited = add_dependency(text, asked.label, asked.coordinate, pinned)?
+
+    // Read back before writing. The rewrite is textual, so the one thing it cannot know for itself
+    // is whether what came out is still a manifest -- and a project whose manifest a tool broke is a
+    // much worse outcome than a refusal.
+    read_manifest(edited) match
+        Err(why) -> return Err(s"adding '${asked.label}' would have made $ManifestName unreadable, " +
+            s"so nothing was written:\n  $why")
+        Ok(_) -> ()
+
+    write_text(file, edited) match
+        Err(_) -> return Err(s"cannot write $file")
+        Ok(_) -> ()
+
+    Ok(s"added ${asked.label} ${asked.coordinate} $pinned")
+end add_to_project

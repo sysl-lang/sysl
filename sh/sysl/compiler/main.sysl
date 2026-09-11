@@ -40,6 +40,7 @@ run_cli(args: []string, say: string -> unit) -> int
         "build" -> build_command(args, say)
         "run" -> run_command(args, say)
         "test" -> test_command(args, say)
+        "add" -> add_command(args, say)
         other ->
             say(s"sysl: `${other}` is not a command this compiler can carry out yet")
             say(usage())
@@ -412,12 +413,50 @@ private stream_out(piece: string)
 // is for. There is no flush in the library's printing surface, so the C one is named here.
 private extern "fflush" c_flush_all(stream: *u8) -> int
 
+// `sysl add <coordinate>[@<version>] [<path>]` -- one dependency written into a project's manifest.
+//
+// The version is what the repository's newest release tag says where the command line pins none, and
+// the manifest is rewritten by changing the smallest run of bytes that has to change. Nothing is
+// fetched: the next build is what goes and gets it.
+private add_command(args: []string, say: string -> unit) -> int
+    var spec = ""
+    var root = "."
+    var extra: usize = 0
+    var i: usize = 2
+
+    while i < args.len
+        if spec.is_empty() then spec = args[i]
+        else if extra == 0
+            root = args[i]
+            extra += 1
+        else
+            say(add_usage())
+            return Misused
+
+        i += 1
+
+    if spec.is_empty()
+        say(add_usage())
+        return Misused
+
+    add_to_project(root, spec) match
+        Err(why) ->
+            say(s"error: $why")
+            Failed
+        Ok(said) ->
+            say(said)
+            Fine
+end add_command
+
+private add_usage() -> string = "usage: sysl add <coordinate>[@<version>] [<path>]"
+
 usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <file> | " +
     "emit-typed [--no-spans] [--tables] [--target <name>] <path> | " +
     "emit-llvm [--target <name>] <path> | " +
     "build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path> | " +
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
-    "test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path>"
+    "test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
+    "add <coordinate>[@<version>] [<path>]"
 
 main(args: []string)
     val code = run_cli(args, line -> print(line))

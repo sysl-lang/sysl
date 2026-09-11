@@ -1,0 +1,879 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// Version selection and the naming rules over it.
+//
+// **Every graph here is built in a cache of its own**, so the answers are about the resolver rather
+// than about what this machine happens to have fetched before. The seam that makes it possible is
+// real rather than a test hook: a fetch clones only where the cache has not got the package, so a
+// cache populated by hand exercises every path but the clone itself -- the `sysl.sum` check, the
+// recorded-hash sibling, selection, the import tables and each of the refusals.
+
+private a_cache() -> string = make_temp_dir("sysl-pkg-cache").unwrap()
+
+// A manifest naming a package and, optionally, what it depends on.
+private a_manifest(name: string, version: string, deps: string) -> string =
+    s"package { name = \"$name\", version = \"$version\" }\n" +
+    (if deps.is_empty() then "" else s"dependencies { $deps }\n")
+
+// One `dependencies` entry, as a manifest writes it.
+private a_dep(label: string, coordinate: string, version: string) -> string =
+    s"$label { git = \"$coordinate\", version = \"$version\" }"
+
+private a_mounted_dep(label: string, coordinate: string, version: string, mount: string) -> string =
+    s"$label { git = \"$coordinate\", version = \"$version\", mount = \"$mount\" }"
+
+// A package placed in the cache at a coordinate and version, as a fetch would have left it.
+private published(cache: string, coordinate: string, version: Release, config: string) -> string
+    val dir = fetch_directory(cache, coordinate, version)
+
+    make_dir_all(dir).unwrap()
+
+    if !config.is_empty() then write_text(join_path(dir, ManifestName), config).unwrap()
+
+    dir
+end published
+
+// The usual case: a package in the cache holding one module, in a directory of its own.
+//
+// A package's modules are the directories of it that **hold source**, so a package with none offers
+// nothing -- which makes this, rather than the bare form, what almost every test wants. The module
+// may be a path, which is how a package that namespaces itself by reverse DNS is laid out.
+private published_module(cache: string, coordinate: string, version: Release, module_path: string,
+                         deps: string) -> string
+    val leaf = leaf_of(module_path)
+    val dir = published(cache, coordinate, version, a_manifest(leaf, release_shown(version), deps))
+
+    make_dir_all(s"$dir/$module_path").unwrap()
+    write_text(s"$dir/$module_path/$leaf.sysl", s"module ${dotted(module_path)}\n").unwrap()
+    dir
+end published_module
+
+private leaf_of(path: string) -> string
+    var at: usize = 0
+
+    for i in 0..<path.bytes.len
+        if path.bytes[i] == u8('/') then at = i + 1
+
+    path[at..<path.bytes.len]
+end leaf_of
+
+private dotted(path: string) -> string
+    var out = ""
+
+    for i in 0..<path.bytes.len
+        out = out + (if path.bytes[i] == u8('/') then "." else path[i..<(i + 1)])
+
+    out
+end dotted
+
+// A project on disk: a manifest, and whatever modules it has of its own. Each name gets a source
+// file in it, because a directory holding none is not a module and so is not a name anything can
+// collide with.
+private a_project(config: string, dirs: Buf[string]) -> string
+    val root = make_temp_dir("sysl-pkg-project").unwrap()
+
+    if !config.is_empty() then write_text(join_path(root, ManifestName), config).unwrap()
+
+    for i in 0..<dirs.len()
+        val d = dirs.at(i)
+
+        make_dir_all(s"$root/$d").unwrap()
+        write_text(s"$root/$d/${leaf_of(d)}.sysl", s"module ${dotted(d)}\n").unwrap()
+
+    root
+end a_project
+
+private no_dirs() -> Buf[string] = buf()
+
+private one_dir(d: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(d)
+    out
+end one_dir
+
+private resolved(root: string, cache: string) -> Graph
+    val m = manifest_of_package(root).unwrap()
+
+    resolve_graph(root, m, empty_sums(), cache).unwrap()
+end resolved
+
+private refused_graph(root: string, cache: string) -> string
+    val m = manifest_of_package(root).unwrap()
+
+    resolve_graph(root, m, empty_sums(), cache) match
+        Err(why) -> why
+        Ok(_) -> ""
+end refused_graph
+
+// What a resolved graph selected, as sorted `coordinate=version` words -- the answer selection is
+// asked for, and the one thing a package's directory only says indirectly.
+private selected_shown(g: &Graph) -> string
+    var rows: Buf[string] = buf()
+
+    for i in 0..<g.packages.len()
+        val p = g.packages.at(i)
+
+        if is_root_package(p) then continue
+
+        p.version match
+            None -> rows.push(s"${p.canonical}=path")
+            Some(v) -> rows.push(s"${p.canonical}=${release_shown(v)}")
+
+    join(sorted_labels(rows).view(), " ")
+end selected_shown
+
+// One package's import table, written out so a test can say what it expects.
+private imports_shown(g: &Graph, canonical: string) -> string
+    for i in 0..<g.packages.len()
+        if g.packages.at(i).canonical != canonical then continue
+
+        var rows: Buf[string] = buf()
+
+        for j in 0..<g.packages.at(i).imports.len()
+            val row = g.packages.at(i).imports.at(j)
+
+            rows.push(s"${row.0}->${row.1}")
+
+        return join(sorted_labels(rows).view(), " ")
+
+    "no such package"
+end imports_shown
+
+// -- a version -------------------------------------------------------------------------------------
+
+@test("a version is three numbers, and anything else is refused")
+a_version_is_three_numbers()
+    assert_eq(release_shown(release_of("1.4.2").unwrap()), "1.4.2")
+    assert_eq(release_tag(release_of("0.9.0").unwrap()), "v0.9.0")
+    assert_eq(release_of("1.4").unwrap_err(),
+              "'1.4' is not a version — a version is three numbers, as in '1.4.2'")
+    assert_eq(release_of("1.4.2-rc1").unwrap_err(),
+              "'1.4.2-rc1' is not a version — a version is three numbers, as in '1.4.2'")
+
+// `01` and `1` comparing equal would give one version two spellings, which is why a leading zero is
+// a typo rather than a number.
+@test("a leading zero is refused, except where the number is zero")
+a_leading_zero_is_refused()
+    assert(release_of("01.2.3").is_err(), "a padded major")
+    assert(release_of("0.0.0").is_ok(), "and zero itself is a number")
+
+// 1.10.0 is higher than 1.9.0, which is the case a comparison done on the text gets wrong.
+@test("versions are compared as numbers and not as text")
+versions_compare_as_numbers()
+    assert(release_before(release_of("1.9.0").unwrap(), release_of("1.10.0").unwrap()), "1.9 < 1.10")
+    assert(!release_before(release_of("1.10.0").unwrap(), release_of("1.9.0").unwrap()), "and back")
+
+// An interim is the next patch plus the commit it was built from, and it has everything the release
+// below it shipped.
+@test("an interim compiler reads as the numbers it carries")
+an_interim_reads_as_its_numbers()
+    assert_eq(release_shown(release_of_compiler("0.0.66-fcf4e33a").unwrap()), "0.0.66")
+    assert(release_of_compiler("what").is_none(), "and a version nothing can read makes no claim")
+
+// -- a coordinate ----------------------------------------------------------------------------------
+
+// The major version rides in the coordinate, so `/json` and `/json/v2` are two packages rather than
+// two versions of one.
+@test("a major above the first rides in the coordinate")
+a_major_rides_in_the_coordinate()
+    assert_eq(major_suffix("github.com/e/json/v2").unwrap(), 2)
+    assert(major_suffix("github.com/e/json").is_none(), "the first two majors ride in the path")
+    assert(major_suffix("github.com/e/json/v1").is_none(), "and so v1 is not a suffix")
+    assert_eq(without_major("github.com/e/json/v2"), "github.com/e/json")
+    assert_eq(clone_url("github.com/e/json/v2"), "https://github.com/e/json.git")
+
+@test("a coordinate that disagrees with its own major is refused")
+a_coordinate_that_disagrees_is_refused()
+    assert_eq(read_manifest("dependencies { j { git = \"github.com/e/j/v2\", " +
+                            "version = \"3.0.0\" } }").unwrap_err(),
+              "'dependencies.j' asks for 3.0.0 from a coordinate ending '/v2' — a major version " +
+              "is part of the coordinate, so '/v2' holds 2.x and nothing else")
+
+@test("and a second major with no suffix at all is refused the other way")
+a_second_major_needs_a_suffix()
+    assert_eq(read_manifest("dependencies { j { git = \"github.com/e/j\", " +
+                            "version = \"2.0.0\" } }").unwrap_err(),
+              "'dependencies.j' asks for 2.0.0 from a coordinate with no '/v2' — from the second " +
+              "major version on, the major rides in the coordinate, because two of them are two " +
+              "packages rather than two versions of one")
+
+@test("a coordinate is an identity, so a scheme on it is refused")
+a_coordinate_carries_no_scheme()
+    assert_eq(read_manifest("dependencies { j { git = \"https://github.com/e/j\", " +
+                            "version = \"1.0.0\" } }").unwrap_err(),
+              "'dependencies.j.git' is a URL — a coordinate is written as 'github.com/you/thing', " +
+              "since it is the package's identity and not the way it is fetched")
+
+@test("one package named twice is two answers to a question that has one")
+one_package_is_one_dependency()
+    assert_eq(read_manifest("dependencies { a { git = \"github.com/e/j\", version = \"1.0.0\" }\n" +
+                            "b { git = \"github.com/e/j\", version = \"1.1.0\" } }").unwrap_err(),
+              "'github.com/e/j' is named by 'a' and 'b' — one package is one dependency, and a " +
+              "module gets one version of it")
+
+@test("and two packages mounted under one name cannot share a root name")
+two_mounts_cannot_agree()
+    assert_eq(read_manifest("dependencies { a { git = \"github.com/e/a\", version = \"1.0.0\", " +
+                            "mount = \"j\" }\nb { git = \"github.com/e/b\", version = \"1.0.0\", " +
+                            "mount = \"j\" } }").unwrap_err(),
+              "'a' and 'b' are both mounted as 'j' — two packages cannot share a root name")
+
+@test("a key a dependency does not have was written by somebody who thought it did")
+an_unknown_dependency_key_is_refused()
+    assert_eq(read_manifest("dependencies { j { git = \"github.com/e/j\", " +
+                            "versoin = \"1.0.0\" } }").unwrap_err(),
+              "'dependencies.j.versoin' is not something a dependency says — the keys are 'git', " +
+              "'mount', 'path', 'version'")
+
+@test("a dependency is fetched or it is beside you, and it cannot be both")
+a_dependency_is_one_or_the_other()
+    assert_eq(read_manifest("dependencies { j { git = \"github.com/e/j\", version = \"1.0.0\", " +
+                            "path = \"../j\" } }").unwrap_err(),
+              "'dependencies.j' names both a 'git' coordinate and a 'path' — a dependency is " +
+              "fetched or it is beside you, and it cannot be both")
+
+@test("a path dependency is the directory as it is now, so a version beside one is refused")
+a_path_takes_no_version()
+    assert_eq(read_manifest("dependencies { j { path = \"../j\", version = \"1.0.0\" } }")
+              .unwrap_err(),
+              "'dependencies.j' names a 'path' and a 'version' — a path dependency is the " +
+              "directory as it is now, and there is nothing to resolve a version against")
+
+@test("a mount becomes the first segment of an import line, so it has to be a name")
+a_mount_has_to_be_a_name()
+    assert_eq(read_manifest("dependencies { j { git = \"github.com/e/j\", version = \"1.0.0\", " +
+                            "mount = \"e-json\" } }").unwrap_err(),
+              "'dependencies.j.mount' is 'e-json', which is not a name a module can have — a " +
+              "mount becomes the first segment of an import line")
+
+@test("a package named by both blocks says two things about one dependency")
+a_package_may_not_be_in_both_blocks()
+    assert_eq(read_manifest("dependencies { j { git = \"github.com/e/j\", version = \"1.0.0\" } }\n" +
+                            "dev_dependencies { j { git = \"github.com/e/j\", " +
+                            "version = \"1.0.0\" } }").unwrap_err(),
+              "'j' is named by both 'dependencies' and 'dev_dependencies' — a dependency reaches " +
+              "this package's consumers or it does not, and it cannot do both. Name it once, in " +
+              "'dependencies' if anything a consumer compiles imports it")
+
+// -- the highest minimum wins ----------------------------------------------------------------------
+
+// Your project depends on `a` and `b`; `a` wants buf 1.2.0 and `b` wants buf 1.4.0, so buf resolves
+// to 1.4.0 -- a floor raised from further down the graph.
+@test("the highest minimum wins, not the newest that exists")
+the_highest_minimum_wins()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/buf", Release(1, 2, 0), "buf", "")
+    published_module(cache, "github.com/e/buf", Release(1, 4, 0), "buf", "")
+    published_module(cache, "github.com/e/a", Release(1, 0, 0), "a",
+                     a_dep("buf", "github.com/e/buf", "1.2.0"))
+    published_module(cache, "github.com/e/b", Release(1, 0, 0), "b",
+                     a_dep("buf", "github.com/e/buf", "1.4.0"))
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("a", "github.com/e/a", "1.0.0") + ", " +
+                                    a_dep("b", "github.com/e/b", "1.0.0")), no_dirs())
+
+    assert_eq(selected_shown(resolved(root, cache)),
+              "github.com.e.a=1.0.0 github.com.e.b=1.0.0 github.com.e.buf=1.4.0")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end the_highest_minimum_wins
+
+// The whole point of it: a dependency that wants nothing new cannot move anything.
+@test("a dependency that asks for less does not lower a floor")
+asking_for_less_lowers_nothing()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/buf", Release(1, 2, 0), "buf", "")
+    published_module(cache, "github.com/e/buf", Release(1, 4, 0), "buf", "")
+    published_module(cache, "github.com/e/a", Release(1, 0, 0), "a",
+                     a_dep("buf", "github.com/e/buf", "1.2.0"))
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("a", "github.com/e/a", "1.0.0") + ", " +
+                                    a_dep("buf", "github.com/e/buf", "1.4.0")), no_dirs())
+
+    assert_eq(selected_shown(resolved(root, cache)),
+              "github.com.e.a=1.0.0 github.com.e.buf=1.4.0")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end asking_for_less_lowers_nothing
+
+// The lower version's manifest was read on the way to raising the floor; it must not survive into
+// what gets built, and its modules must not be what the import table names.
+@test("the version that was passed over is not in the graph")
+the_version_passed_over_is_gone()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/buf", Release(1, 2, 0), "early", "")
+    published_module(cache, "github.com/e/buf", Release(1, 4, 0), "later", "")
+    published_module(cache, "github.com/e/a", Release(1, 0, 0), "a",
+                     a_dep("buf", "github.com/e/buf", "1.2.0"))
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("a", "github.com/e/a", "1.0.0") + ", " +
+                                    a_dep("buf", "github.com/e/buf", "1.4.0")), no_dirs())
+    val graph = resolved(root, cache)
+
+    assert_eq(selected_shown(graph), "github.com.e.a=1.0.0 github.com.e.buf=1.4.0")
+
+    // `a` asked for 1.2.0 and gets the selected 1.4.0, so what its import lines may name is what the
+    // built version holds rather than what the version it asked for held.
+    assert_eq(imports_shown(graph, "github.com.e.a"), "later->github.com.e.buf.later")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end the_version_passed_over_is_gone
+
+// -- what a name at the head of an import line means --------------------------------------------------
+
+// A library's own documentation says `json.parse`, and mandatory mounting was rejected so that a
+// consumer could write exactly that.
+@test("a package's own modules come in under their own names")
+a_packages_modules_keep_their_names()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/json", Release(1, 0, 0), "json", "")
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("json", "github.com/e/json", "1.0.0")), no_dirs())
+
+    assert_eq(imports_shown(resolved(root, cache), ""), "json->github.com.e.json.json")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end a_packages_modules_keep_their_names
+
+// What a package namespaced by reverse DNS offers is the shallowest directory holding source, and not
+// the word above it -- `sh` and `sh/sysl` hold nothing and are nobody's module.
+@test("a namespaced package offers the one path that holds its source")
+a_namespaced_package_offers_one_path()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/sysl-lang/table", Release(0, 1, 2), "sh/sysl/table", "")
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("table", "github.com/sysl-lang/table", "0.1.2")),
+                         no_dirs())
+
+    assert_eq(imports_shown(resolved(root, cache), ""),
+              "sh.sysl.table->github.com.sysl-lang.table.sh.sysl.table")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end a_namespaced_package_offers_one_path
+
+@test("a mount hangs the whole package under one segment")
+a_mount_hangs_the_package()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/json", Release(1, 0, 0), "json", "")
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_mounted_dep("json", "github.com/e/json", "1.0.0", "ejson")),
+                         no_dirs())
+
+    assert_eq(imports_shown(resolved(root, cache), ""), "ejson->github.com.e.json")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end a_mount_hangs_the_package
+
+// A package reached through another is importable, so naming one dependency brings its own with it.
+@test("a package reached through another is importable too")
+a_package_reached_through_another()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/buf", Release(1, 0, 0), "buf", "")
+    published_module(cache, "github.com/e/a", Release(1, 0, 0), "a",
+                     a_dep("buf", "github.com/e/buf", "1.0.0"))
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("a", "github.com/e/a", "1.0.0")), no_dirs())
+
+    assert_eq(imports_shown(resolved(root, cache), ""),
+              "a->github.com.e.a.a buf->github.com.e.buf.buf")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end a_package_reached_through_another
+
+// A mount is a name its writer chose for their own import lines, so it does not travel.
+@test("an intermediate's mount does not leak to whoever depends on it")
+a_mount_does_not_travel()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/buf", Release(1, 0, 0), "buf", "")
+    published_module(cache, "github.com/e/a", Release(1, 0, 0), "a",
+                     a_mounted_dep("buf", "github.com/e/buf", "1.0.0", "b"))
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("a", "github.com/e/a", "1.0.0")), no_dirs())
+    val graph = resolved(root, cache)
+
+    assert_eq(imports_shown(graph, "github.com.e.a"), "b->github.com.e.buf")
+    assert_eq(imports_shown(graph, ""), "a->github.com.e.a.a buf->github.com.e.buf.buf")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end a_mount_does_not_travel
+
+// A name nobody asked for never takes one somebody wrote: the project's own modules beat what
+// arrived through something else.
+@test("the project's own module beats one that arrived through something else")
+our_own_module_wins()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/buf", Release(1, 0, 0), "buf", "")
+    published_module(cache, "github.com/e/a", Release(1, 0, 0), "a",
+                     a_dep("buf", "github.com/e/buf", "1.0.0"))
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("a", "github.com/e/a", "1.0.0")), one_dir("buf"))
+
+    assert_eq(imports_shown(resolved(root, cache), ""), "a->github.com.e.a.a")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end our_own_module_wins
+
+// -- two packages claiming one name -----------------------------------------------------------------
+
+@test("two dependencies whose modules want one name are refused rather than ordered")
+two_dependencies_wanting_one_name()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/one", Release(1, 0, 0), "json", "")
+    published_module(cache, "github.com/e/two", Release(1, 0, 0), "json", "")
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("one", "github.com/e/one", "1.0.0") + ", " +
+                                    a_dep("two", "github.com/e/two", "1.0.0")), no_dirs())
+
+    assert_eq(refused_graph(root, cache),
+              "package.hocon: 'json' and 'json' cannot both be imported — github.com.e.one and " +
+              "github.com.e.two claim the same module. Give one of them a 'mount' in package.hocon " +
+              "to say which name it takes here")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end two_dependencies_wanting_one_name
+
+// Two majors of one library are two packages to selection, and it should not fold them together --
+// but a reader who named neither of them deserves to be told what they are looking at.
+@test("two major versions of one library say so")
+two_majors_of_one_library()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/json", Release(1, 0, 0), "json", "")
+    published_module(cache, "github.com/e/json/v2", Release(2, 0, 0), "json", "")
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("json", "github.com/e/json", "1.0.0") + ", " +
+                                    a_dep("json2", "github.com/e/json/v2", "2.0.0")), no_dirs())
+    val said = refused_graph(root, cache)
+
+    assert(said.index_of("are two major versions of one library and both are in this graph, and " +
+                         "their modules have the same names").is_some(), said)
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end two_majors_of_one_library
+
+// A directory holding no source is not a module, so two packages namespaced under one prefix share
+// only names neither of them declares.
+@test("two packages namespaced under one prefix are not a collision")
+one_prefix_is_not_a_collision()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/sysl-lang/a", Release(1, 0, 0), "sh/sysl/one", "")
+    published_module(cache, "github.com/sysl-lang/b", Release(1, 0, 0), "sh/sysl/two", "")
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("a", "github.com/sysl-lang/a", "1.0.0") + ", " +
+                                    a_dep("b", "github.com/sysl-lang/b", "1.0.0")), no_dirs())
+
+    assert_eq(imports_shown(resolved(root, cache), ""),
+              "sh.sysl.one->github.com.sysl-lang.a.sh.sysl.one " +
+              "sh.sysl.two->github.com.sysl-lang.b.sh.sysl.two")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end one_prefix_is_not_a_collision
+
+// A package offering `sh.sysl` and another offering `sh.sysl.table` share no name, but the longer one
+// read as an import answers to both -- and picking the longer would be the silent winner the whole
+// rule exists to refuse.
+@test("but a package offering a path inside another's is a collision")
+a_path_inside_another_collides()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/outer", Release(1, 0, 0), "sh/sysl", "")
+    published_module(cache, "github.com/e/inner", Release(1, 0, 0), "sh/sysl/table", "")
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("outer", "github.com/e/outer", "1.0.0") + ", " +
+                                    a_dep("inner", "github.com/e/inner", "1.0.0")), no_dirs())
+
+    assert(refused_graph(root, cache).index_of("cannot both be imported").is_some(),
+           "one answers to the other")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end a_path_inside_another_collides
+
+@test("a dependency taking a name the project already uses for a module of its own is refused")
+a_dependency_taking_our_own_name()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/json", Release(1, 0, 0), "json", "")
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("json", "github.com/e/json", "1.0.0")), one_dir("json"))
+
+    assert_eq(refused_graph(root, cache),
+              "package.hocon: 'json' is both a module of this project and one github.com.e.json " +
+              "offers — give the dependency a 'mount' to say what it is called here")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end a_dependency_taking_our_own_name
+
+@test("and a mount settles it")
+a_mount_settles_a_collision()
+    val cache = a_cache()
+
+    published_module(cache, "github.com/e/json", Release(1, 0, 0), "json", "")
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_mounted_dep("json", "github.com/e/json", "1.0.0", "ejson")),
+                         one_dir("json"))
+
+    assert_eq(imports_shown(resolved(root, cache), ""), "ejson->github.com.e.json")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end a_mount_settles_a_collision
+
+@test("a package with no modules at all offers nothing to import")
+a_package_with_no_modules()
+    val cache = a_cache()
+
+    published(cache, "github.com/e/empty", Release(1, 0, 0), a_manifest("empty", "1.0.0", ""))
+
+    val root = a_project(a_manifest("app", "0.1.0",
+                                    a_dep("empty", "github.com/e/empty", "1.0.0")), no_dirs())
+
+    assert_eq(refused_graph(root, cache),
+              "package.hocon: 'empty' has no modules — a package is a tree of directories holding " +
+              "source, each of them a module, and there is nothing here to import")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end a_package_with_no_modules
+
+// -- a path dependency ------------------------------------------------------------------------------
+
+@test("a path dependency is read and named like any other")
+a_path_dependency_is_read()
+    val cache = a_cache()
+    val beside = a_project(a_manifest("side", "0.1.0", ""), one_dir("side"))
+    val root = a_project("package { name = \"app\", version = \"0.1.0\" }\n" +
+                         s"dependencies { side { path = \"$beside\" } }\n", no_dirs())
+    val graph = resolved(root, cache)
+
+    assert_eq(selected_shown(graph), "side=path")
+    assert_eq(imports_shown(graph, ""), "side->side.side")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(beside).unwrap_or(())
+end a_path_dependency_is_read
+
+// A relative path in a fetched package would be relative to a checkout that only exists on the
+// machine that made it, which is a build that works for its author and nobody else.
+@test("a path dependency may not itself have one")
+a_path_dependency_has_no_path_of_its_own()
+    val cache = a_cache()
+    val inner = a_project(a_manifest("inner", "0.1.0", ""), one_dir("inner"))
+    val beside = a_project("package { name = \"side\", version = \"0.1.0\" }\n" +
+                           s"dependencies { inner { path = \"$inner\" } }\n", one_dir("side"))
+    val root = a_project("package { name = \"app\", version = \"0.1.0\" }\n" +
+                         s"dependencies { side { path = \"$beside\" } }\n", no_dirs())
+
+    assert_eq(refused_graph(root, cache),
+              "'side' is a path dependency that itself has a path dependency — a relative path " +
+              "only means something in the project it was written in")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(beside).unwrap_or(())
+    remove_dir_all(inner).unwrap_or(())
+end a_path_dependency_has_no_path_of_its_own
+
+@test("a path dependency that is not a directory is refused, naming the label and the path")
+a_path_that_is_not_there()
+    val cache = a_cache()
+    val root = a_project("package { name = \"app\" }\n" +
+                         "dependencies { side { path = \"../nowhere\" } }\n", no_dirs())
+
+    assert_eq(refused_graph(root, cache),
+              "'side' is a path dependency, and '../nowhere' is not a directory")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end a_path_that_is_not_there
+
+@test("a project with no dependencies resolves to itself")
+a_project_with_no_dependencies()
+    val cache = a_cache()
+    val root = a_project(a_manifest("app", "0.1.0", ""), one_dir("app"))
+    val graph = resolved(root, cache)
+
+    assert_eq(graph.packages.len(), 1)
+    assert(is_root_package(graph.packages.at(0)), "and the one is the project itself")
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end a_project_with_no_dependencies
+
+// -- `sysl.sum` ------------------------------------------------------------------------------------
+
+private a_digest(of: string) -> string
+    var out = DigestPrefix
+
+    for i in 0..<64
+        out = out + of
+
+    out
+end a_digest
+
+@test("a file records what each package's source was when it was first seen")
+a_sum_file_records_a_package()
+    val text = s"github.com/e/a v1.0.0 ${a_digest("a")}\ngithub.com/e/b v2.1.0 ${a_digest("b")}\n"
+    val sums = sums_read(text).unwrap()
+
+    assert_eq(sums.entries.len(), 2)
+    assert_eq(sum_of(sums, "github.com/e/a", Release(1, 0, 0)).unwrap(), a_digest("a"))
+    assert(sum_of(sums, "github.com/e/a", Release(1, 1, 0)).is_none(), "a version no line covers")
+
+@test("what is written back is stable, sorted by coordinate and then by version")
+what_is_written_back_is_sorted()
+    var sums = empty_sums()
+
+    sums = sums_recording(sums, "github.com/e/b", Release(1, 0, 0), a_digest("b"))
+    sums = sums_recording(sums, "github.com/e/a", Release(1, 10, 0), a_digest("c"))
+    sums = sums_recording(sums, "github.com/e/a", Release(1, 9, 0), a_digest("d"))
+
+    assert_eq(sums_render(sums),
+              s"github.com/e/a v1.9.0 ${a_digest("d")}\n" +
+              s"github.com/e/a v1.10.0 ${a_digest("c")}\n" +
+              s"github.com/e/b v1.0.0 ${a_digest("b")}\n")
+
+@test("a line that cannot be read is an error rather than a line skipped")
+a_bad_line_is_an_error()
+    assert_eq(sums_read("github.com/e/a v1.0.0\n").unwrap_err(),
+              "sysl.sum:1: a line is a coordinate, a version tag and a digest")
+    assert_eq(sums_read(s"github.com/e/a 1.0.0 ${a_digest("a")}\n").unwrap_err(),
+              "sysl.sum:1: '1.0.0' is not a version tag")
+    assert_eq(sums_read("github.com/e/a v1.0.0 deadbeef\n").unwrap_err(),
+              "sysl.sum:1: 'deadbeef' is not a sha256: digest")
+
+@test("one package recorded twice, differently, is a file nobody can read a right answer out of")
+one_package_recorded_twice()
+    assert_eq(sums_read(s"github.com/e/a v1.0.0 ${a_digest("a")}\n" +
+                        s"github.com/e/a v1.0.0 ${a_digest("b")}\n").unwrap_err(),
+              "sysl.sum: 'github.com/e/a v1.0.0' is recorded with two different digests")
+
+@test("and recorded twice identically is not a disagreement")
+recorded_twice_identically()
+    assert_eq(sums_read(s"github.com/e/a v1.0.0 ${a_digest("a")}\n\n" +
+                        s"github.com/e/a v1.0.0 ${a_digest("a")}\n").unwrap().entries.len(), 1)
+
+// -- the tree hash and the cache --------------------------------------------------------------------
+
+// The listing is sorted by the path relative to the package root, which is what makes a package hash
+// to the same value wherever it was unpacked.
+@test("a tree hashes to the same value from two copies of it, and a change moves it")
+a_tree_hashes_by_its_content()
+    val one = make_temp_dir("sysl-hash").unwrap()
+    val two = make_temp_dir("sysl-hash").unwrap()
+
+    make_dir_all(s"$one/sh/sysl").unwrap()
+    make_dir_all(s"$two/sh/sysl").unwrap()
+    write_text(s"$one/a.sysl", "module a\n").unwrap()
+    write_text(s"$two/a.sysl", "module a\n").unwrap()
+    write_text(s"$one/sh/sysl/b.sysl", "module sh.sysl\n").unwrap()
+    write_text(s"$two/sh/sysl/b.sysl", "module sh.sysl\n").unwrap()
+
+    val first = tree_hash(one).unwrap()
+
+    assert_eq(first, tree_hash(two).unwrap())
+    assert(first.starts_with(DigestPrefix), first)
+    write_text(s"$two/a.sysl", "module a\n\n").unwrap()
+    assert(first != tree_hash(two).unwrap(), "and a byte changed moves it")
+    remove_dir_all(one).unwrap_or(())
+    remove_dir_all(two).unwrap_or(())
+end a_tree_hashes_by_its_content
+
+// The repository's own bookkeeping is not the package: two clones of one commit differ inside `.git`
+// and hash the same without it.
+@test("a '.git' anywhere below the root is not part of what a package hashes to")
+a_git_directory_is_not_the_package()
+    val root = make_temp_dir("sysl-hash").unwrap()
+
+    write_text(s"$root/a.sysl", "module a\n").unwrap()
+
+    val bare = tree_hash(root).unwrap()
+
+    make_dir_all(s"$root/.git").unwrap()
+    write_text(s"$root/.git/HEAD", "ref: refs/heads/main\n").unwrap()
+    assert_eq(bare, tree_hash(root).unwrap())
+    remove_dir_all(root).unwrap_or(())
+end a_git_directory_is_not_the_package
+
+// A cache entry is checked against what was recorded beside it when it was written, so a project
+// whose sums cover a package some *other* project fetched first is checked too.
+@test("a cached package is checked against the hash recorded beside it")
+a_cached_package_is_checked()
+    val cache = a_cache()
+    val dir = published_module(cache, "github.com/e/json", Release(1, 0, 0), "json", "")
+    val hash = tree_hash(dir).unwrap()
+
+    write_text(s"$dir.hash", s"$hash\n").unwrap()
+
+    val dep = Dependency("json", Git("github.com/e/json", Release(1, 0, 0)), None)
+    val right = sums_recording(empty_sums(), "github.com/e/json", Release(1, 0, 0), hash)
+
+    assert_eq(fetch_ensure(dep, right, cache).unwrap().hash.unwrap(), hash)
+
+    val wrong = sums_recording(empty_sums(), "github.com/e/json", Release(1, 0, 0), a_digest("a"))
+    val said = fetch_ensure(dep, wrong, cache).unwrap_err()
+
+    assert(said.starts_with("'json' does not hash to what sysl.sum records for github.com/e/json " +
+                            "v1.0.0\n  recorded: "), said)
+    assert(said.index_of("A version's content is not supposed to change.").is_some(), said)
+    remove_dir_all(cache).unwrap_or(())
+end a_cached_package_is_checked
+
+// A directory with no hash beside it was not written by this compiler -- an interrupted fetch, or
+// something a person put there -- so it is evidence about nothing and is refused.
+@test("a cached package with nothing recording what it hashed to is refused")
+a_cached_package_with_no_record()
+    val cache = a_cache()
+    val dir = published_module(cache, "github.com/e/json", Release(1, 0, 0), "json", "")
+    val dep = Dependency("json", Git("github.com/e/json", Release(1, 0, 0)), None)
+    val sums = sums_recording(empty_sums(), "github.com/e/json", Release(1, 0, 0), a_digest("a"))
+
+    assert_eq(fetch_ensure(dep, sums, cache).unwrap_err(),
+              s"'$dir' holds github.com/e/json v1.0.0 but nothing recording what it hashed to, so " +
+              "sysl.sum cannot be checked against it — remove that directory and build again")
+    remove_dir_all(cache).unwrap_or(())
+end a_cached_package_with_no_record
+
+// A package at a version is the same bytes for every project on the machine, so it lives under the
+// cache -- unless the project vendored its packages, which is the answer that comes first.
+@test("a vendored directory is preferred to the machine's cache")
+a_vendor_directory_comes_first()
+    val root = make_temp_dir("sysl-proj").unwrap()
+
+    make_dir_all(join_path(root, VendorDir)).unwrap()
+    assert_eq(cache_root(root).unwrap(), join_path(root, VendorDir))
+    remove_dir_all(root).unwrap_or(())
+
+// -- fetching, which is the one path a populated cache does not exercise -------------------------------
+
+// **A real clone, gated on `SYSL_NET`.** Everything above runs against a cache built by hand, which
+// covers every path but the clone itself; this covers the clone, and it is off by default because a
+// unit suite that reaches the network fails for reasons that have nothing to do with the compiler.
+@test("a package is fetched at its tag, hashed, and checked on the way back in")
+a_package_is_fetched_at_its_tag()
+    if env_var("SYSL_NET").is_none()
+        print("skipped: SYSL_NET is unset, so nothing here reaches the network")
+        return
+    end if
+
+    val cache = a_cache()
+    val dep = Dependency("parsing", Git("github.com/sysl-lang/parsing", Release(0, 9, 0)), None)
+
+    fetch_ensure(dep, empty_sums(), cache) match
+        Err(why) ->
+            remove_dir_all(cache).unwrap_or(())
+            assert(false, why)
+        Ok(got) ->
+            val hash = got.hash.unwrap()
+            val recorded = sums_recording(empty_sums(), "github.com/sysl-lang/parsing",
+                                          Release(0, 9, 0), hash)
+
+            // The second call is the cache hit, checked against the line the first one would have
+            // written -- which is the whole of what `sysl.sum` buys.
+            assert_eq(fetch_ensure(dep, recorded, cache).unwrap().hash.unwrap(), hash)
+            assert_eq(tree_hash(got.root).unwrap(), hash)
+            remove_dir_all(cache).unwrap_or(())
+end a_package_is_fetched_at_its_tag
+
+// -- `sysl add` ---------------------------------------------------------------------------------------
+
+@test("a coordinate, and a version where one was pinned")
+an_add_spec_is_read()
+    val plain = read_add_spec("github.com/sysl-lang/sdl3").unwrap()
+
+    assert_eq(plain.coordinate, "github.com/sysl-lang/sdl3")
+    assert_eq(plain.label, "sdl3")
+    assert(plain.version.is_none(), "and nothing pinned")
+
+    val pinned = read_add_spec("github.com/sysl-lang/sdl3@v0.2.6").unwrap()
+
+    assert_eq(pinned.version.unwrap(), "0.2.6")
+    assert_eq(read_add_spec("github.com/e/json/v2").unwrap().label, "json")
+
+@test("and what is not a coordinate is refused before anything is asked of a network")
+a_bad_add_spec_is_refused()
+    assert_eq(read_add_spec("https://github.com/e/j").unwrap_err(),
+              "'https://github.com/e/j' is a URL — a coordinate is an identity, so it carries no " +
+              "scheme: github.com/e/j")
+    assert_eq(read_add_spec("github.com/j").unwrap_err(),
+              "'github.com/j' is not a coordinate — it is a host and a path, as in " +
+              "'github.com/sysl-lang/sdl3'")
+
+// A repository carries `latest`, `nightly` and release-candidate tags, and none of them is what a
+// manifest can pin.
+@test("the newest release tag a repository has, with everything that is not a version ignored")
+the_newest_release_tag()
+    var tags: Buf[string] = buf()
+
+    tags.push("v0.9.0")
+    tags.push("latest")
+    tags.push("v0.10.0")
+    tags.push("v0.1.0-rc1")
+
+    assert_eq(release_shown(newest_release(tags).unwrap()), "0.10.0")
+    assert(newest_release(buf()).is_none(), "and a repository with none says so")
+
+@test("an entry takes the indent its siblings have, and nothing else in the file moves")
+an_added_entry_follows_the_file()
+    val before = "// why this project takes what it takes.\ndependencies {\n" +
+        "  // the parser.\n  parsing { git = \"github.com/sysl-lang/parsing\", " +
+        "version = \"0.9.0\" }\n}\n"
+
+    assert_eq(add_dependency(before, "table", "github.com/sysl-lang/table", "0.1.2").unwrap(),
+              "// why this project takes what it takes.\ndependencies {\n" +
+              "  // the parser.\n  parsing { git = \"github.com/sysl-lang/parsing\", " +
+              "version = \"0.9.0\" }\n" +
+              "  table   { git = \"github.com/sysl-lang/table\", version = \"0.1.2\" }\n}\n")
+
+@test("a project with no dependencies at all gets the block at the end")
+a_block_is_added_at_the_end()
+    assert_eq(add_dependency("package { name = \"app\" }\n", "table",
+                             "github.com/sysl-lang/table", "0.1.2").unwrap(),
+              "package { name = \"app\" }\n\ndependencies {\n" +
+              "  table { git = \"github.com/sysl-lang/table\", version = \"0.1.2\" }\n}\n")
+
+@test("and a name already there is a version to change rather than a line to add")
+an_entry_already_there()
+    assert_eq(add_dependency("dependencies {\n  table { git = \"github.com/sysl-lang/table\", " +
+                             "version = \"0.1.2\" }\n}\n", "table", "github.com/sysl-lang/table",
+                             "0.2.0").unwrap_err(),
+              "'table' is already a dependency of this project — change its version in " +
+              "package.hocon, or remove the entry and add it again")
+
+// A `}` inside a comment closes nothing, and a counter that did not know the difference would stop in
+// the middle of a sentence.
+@test("a brace inside a comment closes nothing")
+a_brace_in_a_comment_closes_nothing()
+    val text = "dependencies {\n  // a } in here closes nothing\n  a { git = \"x/y/z\", " +
+        "version = \"1.0.0\" }\n}\n"
+    val span = block_of(text, "dependencies").unwrap()
+
+    assert_eq(text[span.0..<span.1],
+              "\n  // a } in here closes nothing\n  a { git = \"x/y/z\", version = \"1.0.0\" }\n")
