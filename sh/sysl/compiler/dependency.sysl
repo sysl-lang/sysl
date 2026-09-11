@@ -1,0 +1,382 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, Search}
+
+// Where a dependency's source comes from.
+//
+// **The two are not variations of one shape**: a git dependency always has a version, because that
+// is what a coordinate resolves *at*, and a path dependency never does, because the directory is
+// whatever it is on disk right now. One struct with two optional halves would put that rule in a
+// validation pass instead of in the type, where every later reader would have to re-derive it.
+enum Origin
+    // A repository and the version to read it at. The coordinate carries the `/vN` suffix where
+    // there is one, because a major version is *part of the identity* rather than a decoration on
+    // it -- `github.com/e/json` and `github.com/e/json/v2` are two packages that may both be linked.
+    Git(coordinate: string, version: Release)
+
+    // A directory beside the consumer, for a package being developed alongside what uses it.
+    Local(dir: string)
+end Origin
+
+// One entry of the `dependencies` block.
+//
+// `label` is the key it was written under. It is **not** the module name the code will use: the
+// root name goes to the dependency itself, so that a consumer's import lines match the library's
+// own documentation, and `mount` is what a consumer writes when two dependencies want one name. The
+// label is what diagnostics call this entry, and it has to be unique for that reason alone.
+struct Dependency
+    label: string
+    origin: Origin
+
+    // The one segment a consumer chose to hang the whole package under, where it chose one.
+    mount: Option[string]
+end Dependency
+
+// The identity everything mangles, caches and resolves by -- the coordinate, with the separators a
+// module name is allowed to hold.
+//
+// A local dependency has no coordinate to be canonical, so it answers with its label. That is
+// honest rather than convenient: a package with no coordinate genuinely has no identity beyond this
+// project, which is why a local dependency's name cannot be relied on to be the same name anywhere
+// else.
+dependency_canonical(dep: &Dependency) -> string
+    dep.origin match
+        Git(coordinate, _) -> canonical_prefix(coordinate)
+        Local(_) -> dep.label
+end dependency_canonical
+
+// The coordinate a dependency names, where it names one.
+dependency_coordinate(dep: &Dependency) -> Option[string]
+    dep.origin match
+        Git(coordinate, _) -> Some(coordinate)
+        Local(_) -> None
+end dependency_coordinate
+
+// The version a dependency asks for, where it asks for one.
+dependency_version(dep: &Dependency) -> Option[Release]
+    dep.origin match
+        Git(_, version) -> Some(version)
+        Local(_) -> None
+end dependency_version
+
+// The directory a path dependency names, where it names one.
+dependency_dir(dep: &Dependency) -> Option[string]
+    dep.origin match
+        Git(_, _) -> None
+        Local(dir) -> Some(dir)
+end dependency_dir
+
+// Whether a dependency is fetched rather than sitting beside the consumer.
+is_git_dependency(dep: &Dependency) -> bool = dependency_coordinate(dep).is_some()
+
+// How a coordinate becomes something `git` can clone.
+//
+// The `/vN` suffix is identity and not location -- there is no branch or directory called `v2` in
+// the repository -- so it comes off before the URL is built. HTTPS rather than SSH, because a public
+// package should be fetchable by someone who has no account anywhere.
+clone_url(coordinate: string) -> string = s"https://${without_major(coordinate)}.git"
+
+// The coordinate with its `/vN` suffix removed, which is the repository itself.
+without_major(coordinate: string) -> string
+    major_suffix(coordinate) match
+        None -> coordinate
+        Some(_) -> coordinate[0..<last_slash(coordinate)]
+end without_major
+
+// The major version a coordinate declares in its path, where it declares one. `v0` and `v1` are not
+// suffixes: the first two majors ride in the bare path, so a `github.com/e/json/v1` would be a
+// second spelling of a package that already has one.
+major_suffix(coordinate: string) -> Option[usize]
+    val at = last_slash(coordinate)
+    val last = coordinate[(if at == coordinate.bytes.len then 0 else at + 1)..<coordinate.bytes.len]
+
+    if last.bytes.len < 2 || last.bytes[0] != u8('v') then return None
+
+    var n: usize = 0
+
+    for i in 1..<last.bytes.len
+        val c = last.bytes[i]
+
+        if c < u8('0') || c > u8('9') then return None
+
+        n = n * 10 + usize(c - u8('0'))
+
+    if n >= 2 then Some(n) else None
+end major_suffix
+
+// Where the last `/` of a path is, or its length where it holds none.
+private last_slash(text: string) -> usize
+    var at = text.bytes.len
+
+    for i in 0..<text.bytes.len
+        if text.bytes[i] == u8('/') then at = i
+
+    at
+end last_slash
+
+// The `dependencies` or `dev_dependencies` block, read.
+read_dependencies(root: &Conf, block: string) -> Result[Buf[Dependency], string]
+    var out: Buf[Dependency] = buf()
+
+    conf_at(root, block) match
+        None -> return Ok(out)
+        Some(deps) ->
+            val labels = sorted_labels(conf_keys(deps))
+
+            for i in 0..<labels.len()
+                val sub = conf_at(deps, labels.at(i)).unwrap()
+
+                out.push(read_dependency(labels.at(i), sub, block)?)
+
+    unique_dependencies(out)?
+    Ok(out)
+end read_dependencies
+
+// Refuses a package named by both blocks.
+//
+// The two say different things about the same package -- one that a consumer gets it, the other that
+// a consumer does not -- and there is no reading under which both are meant. It is the judgement a
+// `git` beside a `path` gets: a closed vocabulary, where the writer believes they have said one
+// thing and a build that quietly picked one of them would let them go on believing it.
+not_in_both(deps: &Buf[Dependency], dev: &Buf[Dependency]) -> Result[unit, string]
+    var both: Buf[string] = buf()
+
+    for i in 0..<dev.len()
+        for j in 0..<deps.len()
+            if dev.at(i).label == deps.at(j).label then both.push(dev.at(i).label)
+
+    if both.is_empty() then return Ok(())
+
+    val named = sorted_labels(both)
+    val is_are = if named.len() == 1 then "is" else "are"
+
+    Err(s"${quoted_list(named)} $is_are named by both 'dependencies' and 'dev_dependencies' — a " +
+        "dependency reaches this package's consumers or it does not, and it cannot do both. Name " +
+        "it once, in 'dependencies' if anything a consumer compiles imports it")
+end not_in_both
+
+// One entry, held to a shape in which every field is decided by the others.
+//
+// The unknown-key refusal is the same judgement a misspelled capability gets: a file saying
+// `versoin = "1.0.0"` was written by somebody who believes they have pinned a version, and ignoring
+// the key would resolve whatever the repository's default branch happens to be while they went on
+// believing it.
+private read_dependency(label: string, sub: &Conf, block: string) -> Result[Dependency, string]
+    val where = s"$block.$label"
+
+    val keys = sorted_labels(conf_keys(sub))
+
+    for i in 0..<keys.len()
+        if !known_dependency_key(keys.at(i))
+            return Err(s"'$where.${keys.at(i)}' is not something a dependency says — the keys are " +
+                "'git', 'mount', 'path', 'version'")
+
+    val mount = read_mount(sub, where)?
+
+    Ok(Dependency(label, read_origin(sub, where)?, mount))
+end read_dependency
+
+private known_dependency_key(key: string) -> bool =
+    key == "git" || key == "version" || key == "path" || key == "mount"
+
+// The root name a consumer may put a dependency under, which has to be a name a module could have:
+// it becomes the first segment of every import line that reaches the package.
+private read_mount(sub: &Conf, where: string) -> Result[Option[string], string]
+    if conf_at(sub, "mount").is_none() then return Ok(None)
+
+    val name = conf_text(sub, "mount")
+
+    if is_module_segment(name) then return Ok(Some(name))
+
+    Err(s"'$where.mount' is '$name', which is not a name a module can have — a mount becomes the " +
+        "first segment of an import line")
+end read_mount
+
+private is_module_segment(name: string) -> bool
+    if name.is_empty() then return false
+
+    val head = name.bytes[0]
+
+    if !(letter_byte(head) || head == u8('_')) then return false
+
+    for i in 1..<name.bytes.len
+        val c = name.bytes[i]
+
+        if !(letter_byte(c) || (c >= u8('0') && c <= u8('9')) || c == u8('_')) then return false
+
+    true
+end is_module_segment
+
+private letter_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || c >= 128
+
+private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
+    val has_git = conf_at(sub, "git").is_some()
+    val has_path = conf_at(sub, "path").is_some()
+
+    if has_git && has_path
+        return Err(s"'$where' names both a 'git' coordinate and a 'path' — a dependency is fetched " +
+            "or it is beside you, and it cannot be both")
+
+    if !has_git && !has_path
+        return Err(s"'$where' names neither a 'git' coordinate nor a 'path'")
+
+    if has_path
+        // A path dependency is whatever is in that directory right now, so a version beside one is
+        // not a weaker promise than it looks -- it is a promise nothing could keep.
+        if conf_at(sub, "version").is_some()
+            return Err(s"'$where' names a 'path' and a 'version' — a path dependency is the " +
+                "directory as it is now, and there is nothing to resolve a version against")
+
+        val dir = conf_text(sub, "path")
+
+        if dir.is_empty() then return Err(s"'$where.path' is empty")
+
+        return Ok(Local(dir))
+
+    val coordinate = conf_text(sub, "git")
+
+    if conf_at(sub, "version").is_none()
+        return Err(s"'$where' names a 'git' coordinate and no 'version' — a coordinate says which " +
+            "repository and a version says which of it")
+
+    val version = release_of(conf_text(sub, "version")) match
+        Err(why) -> return Err(s"'$where.version': $why")
+        Ok(v) -> v
+
+    check_coordinate(coordinate, where)?
+    check_major(coordinate, version, where)?
+    Ok(Git(coordinate, version))
+end read_origin
+
+// What a coordinate is: a host and a path under it, as `git` would be given, and **not a URL**.
+//
+// The scheme is refused rather than accepted-and-stripped because the coordinate is *identity* --
+// two spellings of one package would mangle to two module names and link as two incompatible
+// copies, which is a link error a long way from the line that caused it.
+private check_coordinate(coordinate: string, where: string) -> Result[unit, string]
+    if coordinate.index_of("://").is_some()
+        return Err(s"'$where.git' is a URL — a coordinate is written as 'github.com/you/thing', " +
+            "since it is the package's identity and not the way it is fetched")
+
+    if coordinate.starts_with("/") || coordinate.ends_with("/") ||
+       coordinate.index_of("//").is_some()
+        return Err(s"'$where.git' is not a coordinate — 'github.com/you/thing' is the shape")
+
+    if coordinate.index_of("/").is_none()
+        return Err(s"'$where.git' names a host and nothing under it")
+
+    Ok(())
+end check_coordinate
+
+// The rule that a major version rides in the path, checked both ways.
+//
+// Both halves matter and they catch opposite mistakes. A suffix that disagrees with the version is a
+// manifest asking for one package and naming another. A major of 2 or more with *no* suffix is the
+// mistake `/vN` exists to prevent: it would put two incompatible majors under one module name, and a
+// module name is mangled into every symbol, so the two would collide at the linker rather than
+// anywhere a diagnostic could reach.
+private check_major(coordinate: string, version: Release, where: string) -> Result[unit, string]
+    val shown = release_shown(version)
+
+    major_suffix(coordinate) match
+        Some(n) ->
+            if n != version.major
+                return Err(s"'$where' asks for $shown from a coordinate ending '/v$n' — a major " +
+                    s"version is part of the coordinate, so '/v$n' holds ${n}.x and nothing else")
+        None ->
+            if version.major >= 2
+                return Err(s"'$where' asks for $shown from a coordinate with no " +
+                    s"'/v${version.major}' — from the second major version on, the major rides in " +
+                    "the coordinate, because two of them are two packages rather than two versions " +
+                    "of one")
+
+    Ok(())
+end check_major
+
+// The two ways one manifest can name one thing twice.
+//
+// A repeated **coordinate** is refused because a module gets one version: two entries for one
+// package are two answers to a question that has one, and taking either silently would make which
+// one depend on the order a file was read in. A repeated **mount** is the collision the package
+// layer exists to refuse, caught here in the one case where the file alone is enough to see it.
+private unique_dependencies(entries: &Buf[Dependency]) -> Result[unit, string]
+    for i in 0..<entries.len()
+        dependency_coordinate(entries.at(i)) match
+            None -> ()
+            Some(coordinate) ->
+                var group: Buf[string] = buf()
+
+                for j in 0..<entries.len()
+                    dependency_coordinate(entries.at(j)) match
+                        None -> ()
+                        Some(other) -> if other == coordinate then group.push(entries.at(j).label)
+
+                if group.len() > 1
+                    return Err(s"'$coordinate' is named by ${joined_and(group)} — one package is " +
+                        "one dependency, and a module gets one version of it")
+
+    for i in 0..<entries.len()
+        entries.at(i).mount match
+            None -> ()
+            Some(mount) ->
+                var group: Buf[string] = buf()
+
+                for j in 0..<entries.len()
+                    entries.at(j).mount match
+                        None -> ()
+                        Some(other) -> if other == mount then group.push(entries.at(j).label)
+
+                if group.len() > 1
+                    return Err(s"${joined_and(group)} are both mounted as '$mount' — two packages " +
+                        "cannot share a root name")
+
+    Ok(())
+end unique_dependencies
+
+// The labels of a group, quoted and joined by the word the reference uses between two of them.
+private joined_and(labels: &Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<labels.len()
+        if i > 0 then out = out + " and "
+
+        out = out + s"'${labels.at(i)}'"
+
+    out
+end joined_and
+
+// A list of quoted names, comma separated, as a refusal naming several of them writes it.
+private quoted_list(names: &Buf[string]) -> string
+    var parts: Buf[string] = buf()
+
+    for i in 0..<names.len()
+        parts.push(s"'${names.at(i)}'")
+
+    join(parts.view(), ", ")
+end quoted_list
+
+// Names in the order a refusal walks them, which is the file's keys sorted rather than written.
+sorted_labels(names: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<names.len()
+        var at = out.len()
+
+        for j in 0..<out.len()
+            if at == out.len() && names.at(i) < out.at(j) then at = j
+
+        var next: Buf[string] = buf()
+
+        for j in 0..<out.len()
+            if j == at then next.push(names.at(i))
+
+            next.push(out.at(j))
+
+        if at == out.len() then next.push(names.at(i))
+
+        out = next
+
+    out
+end sorted_labels

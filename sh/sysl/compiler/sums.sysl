@@ -1,0 +1,193 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{split, str_builder, Search}
+
+// `sysl.sum` -- what each resolved package's source was when it was first seen.
+//
+// It sits beside `package.hocon`, is committed, and is checked on every fetch that populates the
+// cache. **It is not a lockfile**, and the difference is worth keeping straight: version selection
+// has already made the *version* a pure function of the manifests, so there is nothing here
+// recording what was chosen. What this pins is *content* -- a tag moved to point at different
+// commits, a repository rewritten, a mirror serving something other than what the author published.
+// A version number cannot describe any of those, because in all three the version number is exactly
+// what it was.
+//
+// A **path** dependency has no entry. A directory beside the consumer is expected to change -- that
+// is what it is for -- so a hash of it would be a promise broken by the next keystroke.
+//
+// The first fetch of a package that no entry covers is trusted and recorded, which is what `go.sum`
+// does and carries the same caveat: it establishes what was there, not that what was there was
+// right. Reading the diff a new entry makes is the part a person has to do.
+
+// The one name a project's sums are kept under.
+val SumsName: string = "sysl.sum"
+
+// One line of it: which package, at which version, hashing to what.
+struct SumEntry
+    coordinate: string
+    version: Release
+    hash: string
+end SumEntry
+
+// The file, read.
+struct Sums
+    entries: Buf[SumEntry]
+end Sums
+
+// A project that records nothing, which is what a missing file means.
+empty_sums() -> Sums = Sums(buf())
+
+// What this file says a package at a version hashed to, where it says anything.
+sum_of(sums: &Sums, coordinate: string, version: Release) -> Option[string] =
+    sum_in(sums.entries, coordinate, version)
+
+// The same, asked of the lines alone -- which is what the reader wants while it still has them and
+// nothing to hold them in.
+sum_in(entries: &Buf[SumEntry], coordinate: string, version: Release) -> Option[string]
+    for i in 0..<entries.len()
+        val entry = entries.at(i)
+
+        if entry.coordinate == coordinate && entry.version == version then return Some(entry.hash)
+
+    None
+end sum_in
+
+// The sums with one more line in them, or with one line's digest replaced.
+sums_recording(sums: Sums, coordinate: string, version: Release, hash: string) -> Sums
+    var out: Buf[SumEntry] = buf()
+
+    for i in 0..<sums.entries.len()
+        val entry = sums.entries.at(i)
+
+        if entry.coordinate != coordinate || entry.version != version then out.push(entry)
+
+    out.push(SumEntry(coordinate, version, hash))
+    Sums(out)
+end sums_recording
+
+// The file's text: one entry per line, sorted, so that two runs which resolved the same graph write
+// the same bytes and a diff shows what changed rather than how a table was walked.
+sums_render(sums: &Sums) -> string
+    var order: Buf[usize] = buf()
+
+    for i in 0..<sums.entries.len()
+        var at = order.len()
+
+        for j in 0..<order.len()
+            if at == order.len() && sum_before(sums.entries.at(i), sums.entries.at(order.at(j)))
+                at = j
+
+        var next: Buf[usize] = buf()
+
+        for j in 0..<order.len()
+            if j == at then next.push(i)
+
+            next.push(order.at(j))
+
+        if at == order.len() then next.push(i)
+
+        order = next
+
+    var out = str_builder()
+
+    for i in 0..<order.len()
+        val entry = sums.entries.at(order.at(i))
+
+        out.push(s"${entry.coordinate} ${release_tag(entry.version)} ${entry.hash}\n")
+
+    out.finish()
+end sums_render
+
+// The order the file is written in: by coordinate, then by version.
+private sum_before(a: SumEntry, b: SumEntry) -> bool
+    if a.coordinate != b.coordinate then return a.coordinate < b.coordinate
+
+    release_before(a.version, b.version)
+end sum_before
+
+// Reads the file, or says which line is wrong with it.
+//
+// Text in and a value out, with finding the file left to the driver -- the same split the manifest
+// takes, and for the same reason: what the file *means* is then a function a test can ask about
+// directly.
+//
+// **A line that cannot be read is an error rather than a line skipped.** This file exists to refuse
+// things; one that quietly ignored what it could not parse would answer "no entry covers this
+// package" for a package it was carrying an entry for, and trust something it had been told to
+// check.
+sums_read(text: string) -> Result[Sums, string]
+    var out: Buf[SumEntry] = buf()
+    val lines = split(text, "\n")
+
+    for i in 0..<lines.len
+        val parts = fields(lines[i])
+
+        if parts.is_empty() then continue
+
+        val at = s"$SumsName:${i + 1}"
+
+        if parts.len() != 3
+            return Err(s"$at: a line is a coordinate, a version tag and a digest")
+
+        val tag = parts.at(1)
+
+        if !tag.starts_with("v") then return Err(s"$at: '$tag' is not a version tag")
+
+        val version = release_of(tag[1..<tag.bytes.len]) match
+            Err(why) -> return Err(s"$at: $why")
+            Ok(v) -> v
+
+        if !is_digest(parts.at(2))
+            return Err(s"$at: '${parts.at(2)}' is not a $DigestPrefix digest")
+
+        // Two lines for one package disagreeing is a file that has been merged badly or edited by
+        // hand, and there is no reading of it under which one of the two is the right answer.
+        sum_in(out, parts.at(0), version) match
+            None -> ()
+            Some(already) ->
+                if already != parts.at(2)
+                    return Err(s"$SumsName: '${parts.at(0)} ${release_tag(version)}' is recorded " +
+                        "with two different digests")
+
+        out.push(SumEntry(parts.at(0), version, parts.at(2)))
+
+    Ok(Sums(out))
+end sums_read
+
+// A line's words, with the runs of blanks between them dropped.
+private fields(line: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var start = line.bytes.len
+
+    for i in 0..<line.bytes.len
+        val blank = line.bytes[i] == u8(' ') || line.bytes[i] == u8('\t') ||
+            line.bytes[i] == u8('\r')
+
+        if blank
+            if start < line.bytes.len then out.push(line[start..<i])
+
+            start = line.bytes.len
+        else if start == line.bytes.len
+            start = i
+
+    if start < line.bytes.len then out.push(line[start..<line.bytes.len])
+
+    out
+end fields
+
+// Whether a word is a digest as one is written here: the algorithm, and then its hexadecimal.
+private is_digest(text: string) -> bool
+    if !text.starts_with(DigestPrefix) then return false
+
+    val hex = text[DigestPrefix.bytes.len..<text.bytes.len]
+
+    if hex.bytes.len != 64 then return false
+
+    for i in 0..<hex.bytes.len
+        val c = hex.bytes[i]
+
+        if !((c >= u8('0') && c <= u8('9')) || (c >= u8('a') && c <= u8('f'))) then return false
+
+    true
+end is_digest

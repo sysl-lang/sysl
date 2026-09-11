@@ -1,0 +1,788 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, read_text}
+import sysl.text.Search
+
+// The dependency graph, resolved.
+//
+// **Minimal Version Selection**: the version chosen for a package is *the highest minimum anybody
+// asked for*, not the newest that exists. It is a walk taking a maximum rather than a search, which
+// is what makes it a few hundred lines instead of a solver, and it gives three properties that fall
+// out of the arithmetic rather than out of cleverness -- adding a dependency cannot silently upgrade
+// an unrelated one, the answer is a function of the manifests reachable from this one, and upgrading
+// is an edit to a file rather than a command that walks everything forward.
+//
+// **Selecting and materializing are two passes, and they have to be.** A floor can rise *after* the
+// package it belongs to has been reached: a dependency named 1.2.0 and something further down the
+// graph named 1.4.0, so what was read first is not what gets built. One pass that resolved names as
+// it walked would have built the import table of a version it then stopped using. So the first pass
+// reads manifests and does nothing but raise floors, and the second pass runs over the answer, by
+// which time every version is final.
+
+// One package of a resolved graph: where its source is, what it says about itself, and what the
+// names in *its* import lines mean.
+//
+// `imports` is per-package and that is the whole of the two-layer identity. A package's own source
+// says `json.Parser` and means whatever *it* calls `json`; a consumer of that package says
+// `json.Parser` and may mean something else entirely. Both resolve through their own table to one
+// canonical name, so the two never have to agree on a spelling and always agree on which code they
+// linked.
+struct ResolvedPackage
+    // The canonical prefix its modules sit under, or the empty one for the project being built.
+    canonical: string
+
+    root: string
+    manifest: Manifest
+
+    // What each name this package writes at the head of an import line means.
+    imports: Buf[(string, string)]
+
+    version: Option[Release]
+end ResolvedPackage
+
+// Whether this is the project being built rather than something it depends on. The root project has
+// no coordinate, and its modules keep the names they were written with.
+is_root_package(p: &ResolvedPackage) -> bool = p.canonical.is_empty()
+
+// One manifest asking for one coordinate at one floor, kept so that a reader can be told who wanted
+// what.
+//
+// `asker` is named the way a reader can go and look it up: a fetched package by its coordinate, a
+// path dependency by its label, and the root by whatever its manifest calls itself.
+struct Claim
+    coordinate: string
+    asker: string
+    version: Release
+end Claim
+
+// Everything a build needs from the package system: the packages in a stable order, the claims that
+// decided their versions, and the `sysl.sum` that should be on disk afterwards.
+struct Graph
+    packages: Buf[ResolvedPackage]
+    claims: Buf[Claim]
+    sums: Sums
+    sums_changed: bool
+end Graph
+
+// What the selecting pass carries: the version floors, who asked for them, the manifests read so
+// far, the packages that are directories rather than coordinates, and the sums as they stand.
+struct ResolveState
+    selected: Buf[(string, Release)]
+    claims: Buf[Claim]
+    manifests: Buf[ReadPackage]
+    locals: Buf[ReadPackage]
+    sums: Sums
+    changed: bool
+end ResolveState
+
+// A manifest that has been read, and where it was read from. The coordinate is the empty string for
+// a package that arrived as a directory, which has none.
+struct ReadPackage
+    canonical: string
+    coordinate: string
+    version: Option[Release]
+    dir: string
+    manifest: Manifest
+end ReadPackage
+
+// Resolves the graph rooted at `root`, fetching whatever this machine has not got.
+//
+// `cache` is passed in rather than found here so that a test can resolve a whole graph without
+// writing into the machine's own package cache -- the same reason the manifest reader takes text
+// rather than a path.
+resolve_graph(root: string, config: &Manifest, sums: Sums,
+              cache: string) -> Result[Graph, string]
+    var state = ResolveState(buf(), buf(), buf(), buf(), sums, false)
+
+    read_locals(config.dependencies, &state, cache)?
+    demanding(&state, root_asker(config), config.dependencies)
+    select_versions(&state, cache)?
+
+    val root_table = table_of(ManifestName, root, config.dependencies, state)?
+    val settled = materialize(state)
+    var packages: Buf[ResolvedPackage] = buf()
+
+    packages.push(ResolvedPackage("", root, *config, root_table, None))
+
+    for i in 0..<settled.len()
+        var p = settled.at(i)
+
+        p.imports = table_of(package_owner(p), p.root, p.manifest.dependencies, state)?
+        packages.push(p)
+
+    check_floors(packages)?
+    Ok(Graph(packages, state.claims, state.sums, state.changed))
+end resolve_graph
+
+// What the root calls itself when it is the one asking, since it has no coordinate to be named by.
+//
+// A manifest need not name its package, and a listing that then attributed a claim to the empty
+// string would read as though nobody had asked for it -- which is the opposite of what the claim
+// says.
+private root_asker(config: &Manifest) -> string =
+    if config.name.is_empty() then "this project" else config.name
+
+// A package as the person who has to act on the message thinks of it -- the name it calls itself and
+// the tag they wrote, rather than the dotted canonical form the resolver keys on.
+private package_named(p: &ResolvedPackage) -> string
+    val name = if p.manifest.name.is_empty() then p.canonical else p.manifest.name
+
+    p.version match
+        None -> s"package $name"
+        Some(v) -> s"package $name ${release_tag(v)}"
+end package_named
+
+// The other spelling, which labels a *manifest* being read rather than a package being refused.
+private package_owner(p: &ResolvedPackage) -> string
+    p.version match
+        None -> p.canonical
+        Some(v) -> s"${p.canonical} ${release_tag(v)}"
+end package_owner
+
+// Every dependency's stated floor against the compiler in hand, where this compiler is in a
+// position to make a claim about one at all (`floor_refusal`).
+//
+// **This is the whole point of the field**, and it is why the check is here rather than left to
+// whatever fails later: a package using something the language grew fails somewhere *inside* itself,
+// with a diagnostic pointing at a line in a tree the consumer did not write and nothing to say the
+// compiler is what is wrong. The manifest is what turns that into one sentence naming the package,
+// the floor and the compiler.
+//
+// The **root** is not checked here -- the driver does it, which is the funnel every command's own
+// manifest comes through, and checking it twice would report it twice.
+private check_floors(packages: &Buf[ResolvedPackage]) -> Result[unit, string]
+    for i in 0..<packages.len()
+        val p = packages.at(i)
+
+        if is_root_package(p) then continue
+
+        floor_refusal(package_named(p), p.manifest.floor) match
+            None -> ()
+            Some(why) -> return Err(why)
+
+    Ok(())
+end check_floors
+
+// Every requirement raises a floor and nothing ever lowers one, which is the whole of selection --
+// and every one of them is written down on the way past, whether or not it won.
+//
+// **This is the only place holding both halves at once.** Downstream has the answer and not the
+// question: what is selected keeps a version with no memory of where it came from, and a version
+// that was passed over has its manifest dropped on purpose. So a claim recomputed from the finished
+// graph can only ever find the one that won, which is the half nobody needed to be told.
+private demanding(state: *ResolveState, asker: string, deps: &Buf[Dependency])
+    for i in 0..<deps.len()
+        deps.at(i).origin match
+            Local(_) -> ()
+            Git(coordinate, version) ->
+                state.claims.push(Claim(coordinate, asker, version))
+
+                var known = false
+                var raised: Buf[(string, Release)] = buf()
+
+                for j in 0..<state.selected.len()
+                    val entry = state.selected.at(j)
+
+                    if entry.0 != coordinate then raised.push(entry)
+                    else
+                        known = true
+
+                        if release_before(entry.1, version) then raised.push((coordinate, version))
+                        else raised.push(entry)
+
+                if !known then raised.push((coordinate, version))
+
+                state.selected = raised
+end demanding
+
+// The version selection settled on for a coordinate, where it has settled on one.
+private selected_version(state: &ResolveState, coordinate: string) -> Option[Release]
+    for i in 0..<state.selected.len()
+        if state.selected.at(i).0 == coordinate then return Some(state.selected.at(i).1)
+
+    None
+end selected_version
+
+// A package's hash written into the sums where no line covered it yet.
+//
+// Asked against what is held rather than against how the package arrived, so that a project
+// depending on something another project already fetched still records what it got. A line that is
+// already there and already agrees is not a change, which is what keeps a build from rewriting the
+// file every time.
+private with_fetch(state: *ResolveState, dep: &Dependency, got: &Fetched)
+    if got.hash.is_none() then return
+
+    dep.origin match
+        Local(_) -> ()
+        Git(coordinate, version) ->
+            val hash = got.hash.unwrap()
+            val already = sum_of(state.sums, coordinate, version)
+
+            if already.is_none() || already.unwrap() != hash
+                state.sums = sums_recording(state.sums, coordinate, version, hash)
+                state.changed = true
+end with_fetch
+
+// The path dependencies of the **root** manifest, which are not part of version selection.
+//
+// A directory beside the consumer has no version to select and no coordinate to be identified by, so
+// it takes no part in selection and is simply read. A *dependency* may not have one: a relative path
+// in a fetched package would be relative to a checkout that only exists on the machine that made it,
+// which is a build that works for its author and nobody else.
+private read_locals(deps: &Buf[Dependency], state: *ResolveState,
+                    cache: string) -> Result[unit, string]
+    for i in 0..<deps.len()
+        val dep = deps.at(i)
+
+        if is_git_dependency(dep) then continue
+
+        val got = fetch_ensure(dep, state.sums, cache)?
+        val theirs = manifest_of_package(got.root)?
+
+        for j in 0..<theirs.dependencies.len()
+            if !is_git_dependency(theirs.dependencies.at(j))
+                return Err(s"'${dep.label}' is a path dependency that itself has a path " +
+                    "dependency — a relative path only means something in the project it was " +
+                    "written in")
+
+        state.locals.push(ReadPackage(dependency_canonical(dep), "", None, got.root, theirs))
+        demanding(state, dep.label, theirs.dependencies)
+
+    Ok(())
+end read_locals
+
+// The selecting pass: read the manifest of every floor, raise whatever it demands, repeat.
+//
+// It terminates because a floor only rises and a coordinate has finitely many versions, so each step
+// either reads a pair nothing has read or finds none left and stops.
+private select_versions(state: *ResolveState, cache: string) -> Result[unit, string]
+    loop
+        val next = unread_pair(*state)
+
+        if next.is_none() then return Ok(())
+
+        val coordinate = next.unwrap().0
+        val version = next.unwrap().1
+        val dep = Dependency(coordinate, Git(coordinate, version), None)
+        val got = fetch_ensure(dep, state.sums, cache)?
+        val theirs = manifest_of_package(got.root)?
+
+        for j in 0..<theirs.dependencies.len()
+            if !is_git_dependency(theirs.dependencies.at(j))
+                return Err(s"$coordinate ${release_tag(version)} has a path dependency, which " +
+                    "only means something in the project it was written in")
+
+        with_fetch(state, dep, got)
+        state.manifests.push(ReadPackage(canonical_prefix(coordinate), coordinate, Some(version),
+                                         got.root, theirs))
+        demanding(state, coordinate, theirs.dependencies)
+end select_versions
+
+// The lowest coordinate whose selected version has no manifest read for it yet.
+private unread_pair(state: &ResolveState) -> Option[(string, Release)]
+    var best: Option[(string, Release)] = None
+
+    for i in 0..<state.selected.len()
+        val entry = state.selected.at(i)
+        var read = false
+
+        for j in 0..<state.manifests.len()
+            val had = state.manifests.at(j)
+
+            if had.coordinate == entry.0 && had.version.unwrap() == entry.1 then read = true
+
+        if read then continue
+
+        if best.is_none() || entry.0 < best.unwrap().0 then best = Some(entry)
+
+    best
+end unread_pair
+
+// Every package the build will read, at the version selection settled on.
+//
+// The manifests read hold every version that was *looked at*, which is more than what is used -- a
+// floor that rose left the lower one behind. Reading the answer off what was selected rather than
+// off the manifests is what drops those.
+private materialize(state: &ResolveState) -> Buf[ResolvedPackage]
+    var out: Buf[ResolvedPackage] = buf()
+
+    val coordinates = sorted_labels(selected_coordinates(state))
+
+    for i in 0..<coordinates.len()
+        val name = coordinates.at(i)
+        val version = selected_version(state, name).unwrap()
+
+        for j in 0..<state.manifests.len()
+            val had = state.manifests.at(j)
+
+            if had.coordinate == name && had.version.unwrap() == version
+                out.push(ResolvedPackage(canonical_prefix(name), had.dir, had.manifest, buf(),
+                                         Some(version)))
+
+    var labels: Buf[string] = buf()
+
+    for i in 0..<state.locals.len()
+        labels.push(state.locals.at(i).canonical)
+
+    val ordered = sorted_labels(labels)
+
+    for i in 0..<ordered.len()
+        for j in 0..<state.locals.len()
+            val had = state.locals.at(j)
+
+            if had.canonical == ordered.at(i)
+                out.push(ResolvedPackage(ordered.at(i), had.dir, had.manifest, buf(), None))
+
+    out
+end materialize
+
+private selected_coordinates(state: &ResolveState) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<state.selected.len()
+        out.push(state.selected.at(i).0)
+
+    out
+end selected_coordinates
+
+// One entry of an import table: the name a file writes, what it canonically means, and which package
+// put it there.
+//
+// The owner is carried beside the name and dropped at the end. The collision test is about
+// *packages* -- two of them wanting one name -- and the target alone cannot answer that, since a
+// mount stores the coordinate where an unmounted binding stores the coordinate and the module both.
+struct MountedName
+    written: string
+    canonical: string
+    owner: string
+end MountedName
+
+// One package's import table: what each name it writes at the head of an import line means.
+//
+// Built after selection, so a dependency that named 1.2.0 while something else named 1.4.0 gets the
+// manifest of the version that is actually being built -- which is where its *name* comes from when
+// no mount overrides it, and is exactly the thing one pass would have got wrong.
+private table_of(owner: string, owner_root: string, deps: &Buf[Dependency],
+                 state: &ResolveState) -> Result[Buf[(string, string)], string]
+    var table = declared_table(owner, owner_root, deps, state)?
+    val indirect = inherited(deps, state)?
+
+    for i in 0..<indirect.len()
+        val dep = Dependency(indirect.at(i).label, indirect.at(i).origin, None)
+        val dir = their_root(dep, state)?
+        val added = bindings_of(dep, dir) match
+            Err(why) -> return Err(s"$owner: $why")
+            Ok(got) -> got
+
+        for j in 0..<added.len()
+            table = inherit(owner, owner_root, table, added.at(j), dep, deps)?
+
+    var out: Buf[(string, string)] = buf()
+
+    for i in 0..<table.len()
+        out.push((table.at(i).written, table.at(i).canonical))
+
+    Ok(out)
+end table_of
+
+// The names a manifest's own `dependencies` block binds, which is what it wrote down.
+private declared_table(owner: string, owner_root: string, deps: &Buf[Dependency],
+                       state: &ResolveState) -> Result[Buf[MountedName], string]
+    var table: Buf[MountedName] = buf()
+
+    for i in 0..<deps.len()
+        val dep = deps.at(i)
+        val dir = their_root(dep, state)?
+        val added = bindings_of(dep, dir) match
+            Err(why) -> return Err(s"$owner: $why")
+            Ok(got) -> got
+
+        for j in 0..<added.len()
+            no_collision(owner, owner_root, table, added.at(j).written, dep)?
+
+        for j in 0..<added.len()
+            table.push(added.at(j))
+
+    Ok(table)
+end declared_table
+
+// Every package reachable through the ones a manifest named, minus those it named itself.
+//
+// **Imports are transitive, and a manifest names what it *takes* rather than what it sees.** A
+// dependency's public surface is made of its own dependencies' types, so a consumer that could not
+// name them could not call the one function that package exists for. Requiring it to be declared
+// anyway is asking for a line that says nothing a build could not work out.
+//
+// **Breadth first, so that nearer packages are offered a name first**, which is what makes the
+// precedence below decidable at all.
+private inherited(deps: &Buf[Dependency], state: &ResolveState) -> Result[Buf[Dependency], string]
+    var queue: Buf[Dependency] = buf()
+    var seen: Buf[string] = buf()
+    var out: Buf[Dependency] = buf()
+
+    for i in 0..<deps.len()
+        queue.push(deps.at(i))
+
+    var at: usize = 0
+
+    while at < queue.len()
+        val dep = queue.at(at)
+        val canonical = dependency_canonical(dep)
+
+        at += 1
+
+        var already = false
+
+        for i in 0..<seen.len()
+            if seen.at(i) == canonical then already = true
+
+        if already then continue
+
+        seen.push(canonical)
+
+        val theirs = their_manifest(dep, state)?
+
+        for i in 0..<theirs.dependencies.len()
+            queue.push(theirs.dependencies.at(i))
+
+        var declared = false
+
+        for i in 0..<deps.len()
+            if dependency_canonical(deps.at(i)) == canonical then declared = true
+
+        if !declared then out.push(dep)
+
+    Ok(out)
+end inherited
+
+// One name a package further down the graph offers, placed or passed over.
+//
+// **Three levels of precedence, and only a tie inside one of them is refused.** The consumer's own
+// modules win, then what its manifest declared, then what came in through something else -- and two
+// packages at the *same* level wanting one name is the collision that is refused rather than
+// resolved.
+//
+// **A name nobody asked for never takes one somebody wrote.** A project with its own `json/`, or a
+// dependency it mounted as `json`, keeps that name however many packages three levels down offer a
+// `json` of their own: passing over is not a silent winner, because the name that won is the one in
+// front of the person reading the manifest.
+private inherit(owner: string, owner_root: string, table: Buf[MountedName], binding: MountedName,
+                dep: &Dependency, declared: &Buf[Dependency]) -> Result[Buf[MountedName], string]
+    val local = binding.written
+    val mine = dependency_canonical(dep)
+
+    for i in 0..<table.len()
+        val had = table.at(i)
+
+        if !module_overlap(had.written, local) then continue
+
+        if had.owner == mine then return Ok(table)
+
+        for j in 0..<declared.len()
+            if dependency_canonical(declared.at(j)) == had.owner then return Ok(table)
+
+        return Err(s"$owner: '$local' and '${had.written}' cannot both be imported — " +
+            s"${same_library(had.owner, mine)}, and both arrived through something else this " +
+            s"project depends on. Name one of them in $ManifestName with a 'mount' to say which " +
+            "name it takes here")
+
+    val ours = package_modules(owner_root)
+
+    for i in 0..<ours.len()
+        if module_overlap(ours.at(i), local) then return Ok(table)
+
+    var out = table
+
+    out.push(MountedName(local, binding.canonical, mine))
+    Ok(out)
+end inherit
+
+// The manifest of the version of `dep` that is being built, read off the selection rather than off
+// the edge that asked for it -- the same rule the root below follows, for the same reason.
+private their_manifest(dep: &Dependency, state: &ResolveState) -> Result[Manifest, string]
+    val entry = their_entry(dep, state)?
+
+    Ok(entry.manifest)
+end their_manifest
+
+// Where the version of `dep` that is being built has its source, which for a git dependency is the
+// version selection settled on rather than the one this edge asked for.
+private their_root(dep: &Dependency, state: &ResolveState) -> Result[string, string]
+    val entry = their_entry(dep, state)?
+
+    Ok(entry.dir)
+end their_root
+
+private their_entry(dep: &Dependency, state: &ResolveState) -> Result[ReadPackage, string]
+    dep.origin match
+        Local(_) ->
+            val canonical = dependency_canonical(dep)
+
+            for i in 0..<state.locals.len()
+                if state.locals.at(i).canonical == canonical then return Ok(state.locals.at(i))
+
+            Err(s"'${dep.label}' was never read")
+
+        Git(coordinate, _) ->
+            val version = selected_version(state, coordinate) match
+                None -> return Err(s"'$coordinate' was never selected")
+                Some(v) -> v
+
+            for i in 0..<state.manifests.len()
+                val had = state.manifests.at(i)
+
+                if had.coordinate == coordinate && had.version.unwrap() == version
+                    return Ok(had)
+
+            Err(s"'$coordinate' was never read")
+end their_entry
+
+// What a dependency binds in the manifest that named it.
+//
+// **With no mount, a package's modules come in under their own names.** That is what makes a mount
+// optional: mandatory mounting would make every project's import lines differ from the library's own
+// documentation, and an import line only matches the documentation if `sqlite.open` is what a
+// consumer writes.
+//
+// **A name here is a module path and not a directory.** A package namespaced by reverse DNS offers
+// `sh.sysl.table`; its `sh/` and `sh/sysl/` hold no source, so neither is a module and neither is a
+// name it can be asked for.
+//
+// **A mount hangs the whole package under one segment**, which is the escape hatch for two
+// dependencies wanting one name: mount one as `ejson` and its `json` is reached as `ejson.json`,
+// leaving the project's own `json` alone. It is unchanged by any of the above -- a mount is a name
+// the consumer chose, so there is no tree to read it off.
+bindings_of(dep: &Dependency, dir: string) -> Result[Buf[MountedName], string]
+    var out: Buf[MountedName] = buf()
+    val canonical = dependency_canonical(dep)
+
+    dep.mount match
+        Some(mount) ->
+            out.push(MountedName(mount, canonical, canonical))
+            return Ok(out)
+        None -> ()
+
+    val modules = package_modules(dir)
+
+    if modules.is_empty()
+        return Err(s"'${dep.label}' has no modules — a package is a tree of directories holding " +
+            "source, each of them a module, and there is nothing here to import")
+
+    for i in 0..<modules.len()
+        out.push(MountedName(modules.at(i), package_qualify(canonical, modules.at(i)), canonical))
+
+    Ok(out)
+end bindings_of
+
+// The two ways one module name can be claimed twice, both refused rather than resolved by order.
+//
+// A collision is an error and never a silent winner. The class path is the counter-example: the same
+// package in two jars is decided by jar order, quietly, and what results is a program somebody has
+// to bisect to understand.
+//
+// **What is compared is the module path**, so two packages that both namespace themselves under
+// `sh.sysl` and offer `sh.sysl.sqlite` and `sh.sysl.linenoise` do not collide, because no import
+// line can be read as either. The names they share are `sh` and `sh.sysl`, and neither package
+// declares those -- a directory holding no source is not a module.
+private no_collision(owner: string, owner_root: string, table: &Buf[MountedName], local: string,
+                     dep: &Dependency) -> Result[unit, string]
+    val mine = dependency_canonical(dep)
+
+    for i in 0..<table.len()
+        val had = table.at(i)
+
+        if module_overlap(had.written, local) && had.owner != mine
+            return Err(s"$owner: '$local' and '${had.written}' cannot both be imported — " +
+                s"${same_library(had.owner, mine)}. Give one of them a 'mount' in $ManifestName " +
+                "to say which name it takes here")
+
+    // The consumer's own modules are in the same name space, and a project with a `json` directory
+    // at its root taking a dependency that offers `json` is the common case rather than an exotic
+    // one. Refused in the same words, because it is the same collision.
+    val ours = package_modules(owner_root)
+
+    for i in 0..<ours.len()
+        if module_overlap(ours.at(i), local)
+            return Err(s"$owner: '$local' is both a module of this project and one $mine offers — " +
+                "give the dependency a 'mount' to say what it is called here")
+
+    Ok(())
+end no_collision
+
+// What to say about two packages claiming one module name, which is not always the same thing.
+//
+// **Two major versions of one library is the case worth naming, and transitive imports made it
+// likely.** A major above the first rides in the coordinate, so `github.com/e/json` and
+// `github.com/e/json/v2` are two *different* packages to selection -- it cannot fold them together,
+// and it should not: they are allowed to be incompatible, which is what the suffix says. What they
+// are not allowed to do is quietly both answer `json`, and their module names are identical because
+// a module's name is its directory.
+private same_library(a: string, b: string) -> string
+    val one = slashed(a)
+    val two = slashed(b)
+
+    if without_major(one) == without_major(two) && one != two
+        return s"$a and $b are two major versions of one library and both are in this graph, and " +
+            "their modules have the same names"
+
+    s"$a and $b claim the same module"
+end same_library
+
+// A canonical name back to the shape a coordinate has, which is what the major-version suffix is
+// read off.
+private slashed(name: string) -> string
+    var out = ""
+
+    for i in 0..<name.bytes.len
+        out = out + (if name.bytes[i] == u8('.') then "/" else name[i..<(i + 1)])
+
+    out
+end slashed
+
+// Whether two module paths claim ground the other needs: the same name, or one a path **inside** the
+// other.
+//
+// The nesting half is what keeps the table unambiguous rather than merely unique. A package offering
+// `sh.sysl` and another offering `sh.sysl.table` share no name, but `sh.sysl.table` read as an
+// import answers to both -- and picking the longer would be the silent winner this whole rule exists
+// to refuse.
+module_overlap(a: string, b: string) -> bool =
+    starts_with_module(a, b) || starts_with_module(b, a)
+
+// A package's manifest, where it has one. A package with no file is a package that said nothing,
+// exactly as a project with none is.
+//
+// **A dependency's unknown keys are worth saying more than a project's**, because this is the case
+// the manifest cannot report for itself: a package written against a newer sysl than the one in
+// hand, being built by the older one. The root says whose manifest it is, since the reader did not
+// write this file.
+manifest_of_package(root: string) -> Result[Manifest, string]
+    val file = join_path(root, ManifestName)
+
+    if !is_file(file) then return Ok(empty_manifest())
+
+    val text = read_text(file) match
+        Err(_) -> return Err(s"cannot read $file")
+        Ok(got) -> got
+
+    val m = read_manifest(text) match
+        Err(why) -> return Err(s"$root: $why")
+        Ok(got) -> got
+
+    for i in 0..<m.warnings.len()
+        eprints(s"$root: ${m.warnings.at(i)}\n")
+
+    Ok(m)
+end manifest_of_package
+
+// Everything a compilation takes from the package system: the source of every package the graph
+// reached, what the project's own files mean by the paths they import, and the directories a C walk
+// visits.
+//
+// **It is the roots as well as the parsed trees, and that is the whole reason the third field
+// exists**: a package may carry `.c` of its own, and what compiles that is a walk over the
+// directory. The units hand back what was parsed, which says nothing about the files beside them.
+struct PackageSources
+    units: Buf[Program]
+    root_mounts: Buf[(string, string)]
+    roots: Buf[string]
+end PackageSources
+
+// A project that depends on nothing, which is what an empty `dependencies` block means.
+no_package_sources() -> PackageSources = PackageSources(buf(), buf(), buf())
+
+// The graph resolved, fetched and read, for one project at one machine.
+//
+// `packaged` says whether a dependency's modules arrive under the canonical prefix its coordinate
+// gives them. `emit-typed` and `sysl prove` see them under the names they were written with, which
+// is the reference's own answer: what those commands compare is what a module *means* rather than
+// what it links against.
+package_sources(root: string, m: &Manifest, t: Target,
+                packaged: bool) -> Result[PackageSources, Refusal]
+    if m.dependencies.is_empty() then return Ok(no_package_sources())
+
+    val graph = resolved_graph(root, m)?
+    var out = no_package_sources()
+
+    for i in 0..<graph.packages.len()
+        val p = graph.packages.at(i)
+
+        if is_root_package(p)
+            out.root_mounts = p.imports
+            continue
+
+        out.roots.push(p.root)
+
+        val found = collect(p.root, Some(t.os)) match
+            Err(e) -> return Err(Refusal(e.message))
+            Ok(f) -> f
+
+        if found.is_empty()
+            return Err(Refusal(s"'${p.canonical}' holds no sysl source files"))
+
+        // **The package's own terms, not the consumer's.** Its modules sit under the prefix its
+        // coordinate gives them, and the paths its own files write at the head of an import line
+        // mean whatever *its* manifest bound -- which is what makes a package's source read the
+        // same whoever depends on it.
+        var theirs = no_packaging()
+
+        if packaged then theirs = Packaging(p.canonical, p.imports)
+
+        for j in 0..<found.len()
+            val parsed = parse(found.at(j).src, t)
+
+            if !parsed.ok()
+                return Err(Refusal(s"${found.at(j).src.name}:${parsed.at()}: " +
+                    s"${parsed.first().message}"))
+
+            var unit = parsed.program
+
+            unit.pkg = theirs
+            out.units.push(unit)
+
+    Ok(out)
+end package_sources
+
+// The graph alone, which is what a build and a listing of what a project takes have in common.
+//
+// **Writing the sums back is part of resolving rather than part of building.** A line is recorded
+// because a package was fetched, and every caller here fetches; leaving it to the build would mean
+// the first listing after adding a dependency downloaded a package and recorded nothing about what
+// it got.
+resolved_graph(root: string, m: &Manifest) -> Result[Graph, Refusal]
+    val cache = cache_root(root) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(dir) -> dir
+
+    val sums = sums_at(root) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(got) -> got
+
+    val graph = resolve_graph(root, m, sums, cache) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(got) -> got
+
+    if graph.sums_changed then write_sums(root, graph.sums)
+
+    Ok(graph)
+end resolved_graph
+
+// The directory each of this project's packages was fetched into, which is what a build walks for
+// the C they carry.
+//
+// A dependency that cannot be resolved is not a refusal here: whatever needed its *source* has
+// already said so, and a build that got this far has one to walk.
+package_roots(root: string, m: &Manifest) -> Buf[string]
+    if m.dependencies.is_empty() then return buf()
+
+    resolved_graph(root, m) match
+        Err(_) -> buf()
+        Ok(graph) ->
+            var out: Buf[string] = buf()
+
+            for i in 0..<graph.packages.len()
+                if !is_root_package(graph.packages.at(i)) then out.push(graph.packages.at(i).root)
+
+            out
+end package_roots

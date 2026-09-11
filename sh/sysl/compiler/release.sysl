@@ -1,0 +1,97 @@
+module sh.sysl.compiler
+
+import sysl.text.split
+
+// A version, as a package states one: semver, three numbers, and nothing else.
+//
+// **A pre-release and a build suffix are refused rather than ignored.** Version selection takes a
+// maximum over what the manifests ask for, so every version has to be comparable to every other by
+// one total order -- and semver's pre-release ordering is the part of the specification that is
+// least agreed on and most surprising. Nothing needs it, and admitting it later is an addition;
+// admitting it now and getting the order wrong is a resolution that silently picks the wrong
+// package.
+//
+// It is a value rather than the text it was written as, because the resolver compares versions far
+// more often than it prints them and a comparison over text is the thing that reads `0.10.0` as
+// older than `0.9.0`.
+struct Release derives Eq
+    major: usize
+    minor: usize
+    patch: usize
+end Release
+
+// The git tag this version is published under, which is semver's own convention and Go's.
+release_tag(v: Release) -> string = s"v${release_shown(v)}"
+
+// The version as a manifest writes it, which is the tag without its `v`.
+release_shown(v: Release) -> string = s"${v.major}.${v.minor}.${v.patch}"
+
+// Whether one release came before another, compared a number at a time.
+release_before(a: Release, b: Release) -> bool
+    if a.major != b.major then return a.major < b.major
+    if a.minor != b.minor then return a.minor < b.minor
+
+    a.patch < b.patch
+end release_before
+
+// A version read out of what somebody wrote, or what is wrong with it.
+release_of(text: string) -> Result[Release, string]
+    val parts = split(text, ".")
+
+    if parts.len != 3 then return Err(not_a_version(text))
+
+    val major = release_number(parts[0])
+    val minor = release_number(parts[1])
+    val patch = release_number(parts[2])
+
+    if major.is_none() || minor.is_none() || patch.is_none() then return Err(not_a_version(text))
+
+    Ok(Release(major.unwrap(), minor.unwrap(), patch.unwrap()))
+end release_of
+
+// **The compiler's own version, which is the one version in the system that may carry a suffix.**
+//
+// An interim is stamped `0.0.66-fcf4e33a` -- the next patch, plus the commit it was built from --
+// so `release_of` refuses it, correctly: nothing may *depend* on an interim, since nobody else can
+// install one. What a comparison against a package's floor wants is the numbers, and an interim
+// satisfies whatever they reach.
+//
+// Nothing is refused here. A version this cannot read is the compiler's own, so the answer is to
+// make no claim about it rather than to fail a build over it.
+release_of_compiler(text: string) -> Option[Release]
+    var cut = text.bytes.len
+
+    for i in 0..<text.bytes.len
+        if text.bytes[i] == u8('-') && cut == text.bytes.len then cut = i
+
+    release_of(text[0..<cut]) match
+        Err(_) -> None
+        Ok(v) -> Some(v)
+end release_of_compiler
+
+// One of the three numbers, or nothing where it is not one.
+//
+// **Not a plain read of digits**: that admits a sign and a leading zero, and `01.2.3` written by
+// hand is a typo rather than a version -- semver refuses one for the same reason, since `01` and
+// `1` comparing equal would give one version two spellings. Held to digits, to a single leading
+// zero only where the number *is* zero, and to a length no version needs.
+private release_number(text: string) -> Option[usize]
+    val bytes = text.bytes
+
+    if bytes.len == 0 || bytes.len > 9 then return None
+
+    for i in 0..<bytes.len
+        if bytes[i] < u8('0') || bytes[i] > u8('9') then return None
+
+    if bytes.len > 1 && bytes[0] == u8('0') then return None
+
+    var out: usize = 0
+
+    for i in 0..<bytes.len
+        out = out * 10 + usize(bytes[i] - u8('0'))
+
+    Some(out)
+end release_number
+
+private not_a_version(text: string) -> string =
+    s"'$text' is not a version — a version is three numbers, as in '1.4.2'"

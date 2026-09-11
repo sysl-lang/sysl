@@ -120,24 +120,31 @@ a_mount_is_the_module_under_its_prefix()
 
     val m = read_manifest("dependencies { table { git = \"github.com/sysl-lang/table\", " +
                           "version = \"0.1.2\" } }").unwrap()
-    val mounts = package_mounts(root, m)
+    val mounts = root_imports_of(root, m)
 
     assert_eq(mounts.len(), 1)
     assert_eq(mounts.at(0).0, "sh.sysl.table")
     assert_eq(mounts.at(0).1, "github.com.sysl-lang.table.sh.sysl.table")
     remove_dir_all(root).unwrap_or(())
 
-@test("a dependency nobody brought down offers nothing rather than refusing")
-a_missing_dependency_offers_nothing()
+// A `path` dependency is a directory somebody is editing beside this one, so what is refused is the
+// directory not being there -- and nothing reaches the network to find that out.
+@test("a path dependency that is not a directory is refused, naming the label and the path")
+a_path_dependency_that_is_not_there()
     val root = make_temp_dir("sysl-proj").unwrap()
+    val m = read_manifest("dependencies { side { path = \"../nowhere\" } }").unwrap()
 
-    make_dir_all(s"$root/vendor").unwrap()
-
-    val m = read_manifest("dependencies { gone { git = \"github.com/e/gone\", " +
-                          "version = \"9.9.9\" } }").unwrap()
-
-    assert(package_mounts(root, m).is_empty(), "nothing to offer")
+    assert_eq(resolve_graph(root, m, empty_sums(), s"$root/vendor").unwrap_err(),
+              "'side' is a path dependency, and '../nowhere' is not a directory")
     remove_dir_all(root).unwrap_or(())
+
+// What the project's own files mean by the paths at the head of their import lines, resolved off a
+// vendor directory so that nothing here reaches the network.
+private root_imports_of(root: string, m: Manifest) -> Buf[(string, string)]
+    val graph = resolve_graph(root, m, empty_sums(), s"$root/vendor").unwrap()
+
+    graph.packages.at(0).imports
+end root_imports_of
 
 // The match is by longest key, so a name reaches the most specific package that offers it and
 // anything under that name comes with it.

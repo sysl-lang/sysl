@@ -1,0 +1,251 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_file, walk, write_text}
+import sysl.process.capture
+import sysl.text.{split, str_builder, to_lower, Search}
+
+// The content hash a fetched package is held to.
+//
+// `sysl.sum` records what a package's source *was* when it was first resolved, and every fetch after
+// that is checked against it. What that protects against is the class of change a version number
+// cannot describe -- a tag moved to point somewhere else, a repository rewritten, a mirror serving
+// something other than what the author published. Version selection has already made the *selection*
+// deterministic, so there is nothing here about which version was chosen; this is only ever about
+// whether the bytes are the ones that were promised.
+//
+// **This is not the library artifact's fingerprint and must not become it.** That one answers "did
+// my own library change, so is the cached artifact stale", where a fast non-cryptographic hash is
+// the right tool. This one answers "is somebody else's tree the one it claims to be", which is a
+// question with an adversary in it, and a hash an adversary can find a collision in answers it
+// wrongly. The two never share code.
+//
+// **The definition is independent of the tool that computes it.** The digest itself is computed by
+// the platform's own utility rather than here, which is the arrangement this compiler already has
+// with clang and llvm-ar -- and a fetch needs git in any case. What that must never leak into is the
+// *definition*: a hash written into somebody's `sysl.sum` is a promise that outlives whatever
+// computed it, so the tree hash is specified over a canonical listing and not over "whatever the
+// utility printed".
+
+// How a digest is written where one is recorded, so that a file naming an algorithm can be read by a
+// later version that offers more than one.
+val DigestPrefix: string = "sha256:"
+
+// How many files go on one command line. Well inside every system's argument limit at any path
+// length a package will have, and large enough that a package is one or two calls.
+private val DigestBatch: usize = 256
+
+// The tree hash of a package rooted at `root`: SHA-256 of the canonical listing.
+//
+// The listing is one line per file, the lowercase hexadecimal digest, two spaces, the relative path,
+// newline terminated, sorted by that path -- which is the shape Go's `h1:` uses and is chosen for
+// the same reason: it is a total order over content that no filesystem detail can perturb. The paths
+// are relative to `root` and separated by `/` whatever the platform writes, so a package hashes to
+// the same value wherever it was unpacked and on whichever machine.
+//
+// **What is in it is every file except a `.git` anywhere in the path.** The repository's own
+// bookkeeping is not the package: it holds timestamps, packing choices and remote names that differ
+// between two clones of the very same commit, so including it would make the hash of an honest fetch
+// depend on how it was fetched.
+tree_hash(root: string) -> Result[string, string]
+    val paths = hashed_files(root)?
+    val digests = digests_of(paths)?
+    var listing = str_builder()
+
+    for i in 0..<paths.len()
+        listing.push(s"${digests.at(i)}  ${relative_to(root, paths.at(i))}\n")
+
+    Ok(DigestPrefix + digest_of_text(listing.finish())?)
+end tree_hash
+
+// Every file under `root` that the hash covers, in the order the listing wants -- which is the order
+// of their *relative* paths, since that is what the definition sorts by and the two orders are not
+// the same once a root's own name is in front of them.
+hashed_files(root: string) -> Result[Buf[string], string]
+    var found: Buf[string] = buf()
+
+    for item in walk(root)
+        item match
+            Err(_) -> return Err(s"cannot read $root")
+            Ok(entry) ->
+                if !entry.is_dir() && !under_git(root, entry.path) then found.push(entry.path)
+
+    // A name holding a newline would be indistinguishable from two entries once the listing is a
+    // text file, and the digest utility's own output has the same problem one step earlier. Refused
+    // rather than escaped: nothing legitimate is being turned away, and an escaping rule is a second
+    // thing the definition would have to pin forever.
+    for i in 0..<found.len()
+        if found.at(i).index_of("\n").is_some()
+            return Err(s"cannot hash '${found.at(i)}' — a file name may not hold a newline")
+
+    Ok(sorted_by_relative(root, found))
+end hashed_files
+
+// Whether a file sits under a `.git` anywhere below the package root. The repository's own
+// bookkeeping is not the package, so it is not part of what the package hashes to.
+private under_git(root: string, path: string) -> bool
+    for segment in split(relative_to(root, path), "/")
+        if segment == ".git" then return true
+
+    false
+end under_git
+
+// A file's path as the listing spells it: relative to the package root, `/` separated.
+relative_to(root: string, path: string) -> string
+    var base = root
+
+    if base.ends_with("/") then base = base[0..<base.bytes.len - 1]
+
+    val prefix = base + "/"
+
+    if path.starts_with(prefix) then path[prefix.bytes.len..<path.bytes.len] else path
+end relative_to
+
+private sorted_by_relative(root: string, paths: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<paths.len()
+        val key = relative_to(root, paths.at(i))
+        var at = out.len()
+
+        for j in 0..<out.len()
+            if at == out.len() && key < relative_to(root, out.at(j)) then at = j
+
+        var next: Buf[string] = buf()
+
+        for j in 0..<out.len()
+            if j == at then next.push(paths.at(i))
+
+            next.push(out.at(j))
+
+        if at == out.len() then next.push(paths.at(i))
+
+        out = next
+
+    out
+end sorted_by_relative
+
+// The digest of each of `paths`, in the order given.
+//
+// **Answered by position rather than by parsing the name back.** Both utilities print the path they
+// were handed, and both mark the mode they read it in -- so the name in the output is a thing with a
+// format of its own, while the order is not. Reading only the first field and holding the count to
+// the input's is the arrangement with less to go wrong, and a utility that reordered its output
+// would be caught by the count rather than silently mismatching a digest to a file.
+digests_of(paths: Buf[string]) -> Result[Buf[string], string]
+    var out: Buf[string] = buf()
+
+    if paths.is_empty() then return Ok(out)
+
+    val command = digest_command()?
+    var at: usize = 0
+
+    while at < paths.len()
+        var args: Buf[string] = buf()
+
+        for i in 1..<command.len()
+            args.push(command.at(i))
+
+        var taken: usize = 0
+
+        while taken < DigestBatch && at + taken < paths.len()
+            args.push(paths.at(at + taken))
+            taken += 1
+
+        val answered = run_digest(command.at(0), args, taken)?
+
+        for i in 0..<answered.len()
+            out.push(answered.at(i))
+
+        at += taken
+
+    Ok(out)
+end digests_of
+
+private run_digest(program: string, args: Buf[string], wanted: usize) -> Result[Buf[string], string]
+    var argv: Buf[string] = buf()
+
+    for i in 0..<args.len()
+        argv.push(args.at(i))
+
+    val answer = capture(program, argv.view(), "", [], true) match
+        Err(_) -> return Err(s"cannot run '$program'")
+        Ok(got) -> got
+
+    if !answer.status.ok()
+        return Err(s"'$program' failed:\n${answer.err.unwrap_or("").trim()}")
+
+    var out: Buf[string] = buf()
+    val lines = split(answer.text, "\n")
+
+    for i in 0..<lines.len
+        if lines[i].is_empty() then continue
+
+        var cut = lines[i].bytes.len
+
+        for j in 0..<lines[i].bytes.len
+            if cut == lines[i].bytes.len && lines[i].bytes[j] == u8(' ') then cut = j
+
+        out.push(to_lower(lines[i][0..<cut]))
+
+    if out.len() != wanted
+        return Err(s"'$program' answered for ${out.len()} files where $wanted were asked")
+
+    for i in 0..<out.len()
+        if !hex_digest(out.at(i))
+            return Err(s"'$program' printed something that is not a SHA-256 digest")
+
+    Ok(out)
+end run_digest
+
+private hex_digest(text: string) -> bool
+    if text.bytes.len != 64 then return false
+
+    for i in 0..<text.bytes.len
+        val c = text.bytes[i]
+
+        if !((c >= u8('0') && c <= u8('9')) || (c >= u8('a') && c <= u8('f'))) then return false
+
+    true
+end hex_digest
+
+// The digest of a string, by way of a file, since the utilities read files.
+private digest_of_text(text: string) -> Result[string, string]
+    val file = make_temp_dir("sysl-sum") match
+        Err(_) -> return Err("cannot hash: there is nowhere to write a listing")
+        Ok(dir) -> s"$dir/listing"
+
+    write_text(file, text) match
+        Err(_) -> return Err("cannot hash: a listing could not be written")
+        Ok(_) -> ()
+
+    var one: Buf[string] = buf()
+
+    one.push(file)
+
+    val answered = digests_of(one)
+
+    remove_file(file).unwrap_or(())
+    answered.map(got -> got.at(0))
+end digest_of_text
+
+// The utility this machine hashes with, chosen by what the machine is rather than by trying each in
+// turn. Both print the same digest-then-name line, which is why one reader serves both, and each is
+// part of its system rather than something to install: `shasum` ships with macOS, and `sha256sum` is
+// in coreutils and in busybox, so a minimal image has it too.
+private digest_command() -> Result[Buf[string], string]
+    var out: Buf[string] = buf()
+
+    host_target().os match
+        MacOS ->
+            out.push("shasum")
+            out.push("-a")
+            out.push("256")
+        Linux -> out.push("sha256sum")
+        _ ->
+            return Err(s"cannot hash a package on ${host_target().name} — verifying what was " +
+                "fetched needs a SHA-256 utility, and this machine is not one this compiler knows " +
+                "how to find one on")
+
+    Ok(out)
+end digest_command

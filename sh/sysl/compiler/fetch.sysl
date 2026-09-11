@@ -1,0 +1,207 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{cache_dir, is_dir, is_file, make_dir_all, read_text, remove_dir_all, rename,
+                write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// Getting a package's source onto this machine.
+//
+// A coordinate is a git repository and a version is a tag on it, so fetching is a clone at a tag and
+// nothing more -- there is no registry to ask, no account to have, and no service that has to be up.
+// What that costs is two things worth stating rather than glossing: there is nowhere central to
+// search, and a repository that disappears takes its package with it. Vendoring answers the second.
+//
+// **The cache is content-addressed by promise, not by hash.** A fetched package lands under
+// `<cache>/sysl/pkg/<coordinate>/@v<version>/`, which is one directory per package and version and
+// is shared by every project on the machine. Beside it sits a file holding the tree hash that was
+// computed when it was written, so a project whose `sysl.sum` covers a package that some *other*
+// project fetched first is still checked, and is checked without walking the tree again. Trusting a
+// populated cache blindly is the hole that would make `sysl.sum` a formality on any machine with
+// more than one project on it.
+//
+// The hash file is a **sibling** of the package directory rather than a file inside it, because
+// anything inside would be part of what the tree hash covers and the hash cannot cover itself.
+
+// Where a package's source is once it is here, and what it is checked against.
+struct Fetched
+    root: string
+    hash: Option[string]
+end Fetched
+
+// The directory every fetched package lives under.
+//
+// **Under the cache rather than in the project**, because a package at a version is the same bytes
+// for every project on the machine and the alternative is one copy each. A project that vendored its
+// packages holds them itself, and that answer comes first -- vendoring is for a build that must not
+// depend on a cache being warm.
+cache_root(project_root: string) -> Result[string, string]
+    val vendored = join_path(project_root, VendorDir)
+
+    if project_root != "" && is_directory(vendored) then return Ok(vendored)
+
+    cache_dir() match
+        None -> Err("cannot find a cache directory to fetch packages into — set XDG_CACHE_HOME, " +
+            "or vendor the dependencies so that nothing has to be fetched")
+        Some(dir) -> Ok(s"$dir/sysl/pkg")
+end cache_root
+
+// Where this coordinate at this version sits, fetched or not.
+fetch_directory(cache: string, coordinate: string, version: Release) -> string =
+    s"$cache/$coordinate/@${release_tag(version)}"
+
+// The package's source on disk, cloning it if this machine has not got it, and checked against
+// `sums` either way.
+//
+// Answers with **the hash however it was arrived at** -- computed from the clone, or read from what
+// was recorded beside a package already here. Returning it only for a fresh clone would have meant
+// that a project depending on a package some other project had already fetched wrote no `sysl.sum`
+// line at all, and so was never checked afterwards. Whether the line is *new* is the caller's
+// question, and it can only be answered against the sums it holds.
+fetch_ensure(dep: &Dependency, sums: &Sums, cache: string) -> Result[Fetched, string]
+    dep.origin match
+        // Nothing to fetch and nothing to check: no entry is kept for a directory that is expected
+        // to change under you, which is the whole point of developing a package beside its consumer.
+        Local(dir) ->
+            if is_directory(dir) then Ok(Fetched(dir, None))
+            else Err(s"'${dep.label}' is a path dependency, and '$dir' is not a directory")
+
+        Git(coordinate, version) ->
+            val dir = fetch_directory(cache, coordinate, version)
+
+            if is_directory(dir)
+                Ok(Fetched(dir, verify_cached(dep, coordinate, version, dir, sums)?))
+            else
+                Ok(Fetched(dir, Some(clone_at_tag(dep, coordinate, version, dir, sums)?)))
+end fetch_ensure
+
+// A cache entry checked against `sysl.sum`, by way of the hash recorded when it was written.
+//
+// **The tree is not walked again.** What is being asked is whether *this* project's record agrees
+// with what was verified when the directory was populated, and that question is answered by two
+// strings -- walking the tree would answer a different and weaker question, since a cache someone
+// had edited would simply hash to whatever it now holds.
+private verify_cached(dep: &Dependency, coordinate: string, version: Release, dir: string,
+                      sums: &Sums) -> Result[Option[string], string]
+    val want = sum_of(sums, coordinate, version)
+    val got = recorded_hash(dir)
+
+    if want.is_none() then return Ok(got)
+
+    // A directory with no hash beside it was not written by this compiler -- an interrupted fetch,
+    // or something a person put there. It is not evidence about anything, so it is refused rather
+    // than trusted or silently replaced.
+    if got.is_none()
+        return Err(s"'$dir' holds $coordinate ${release_tag(version)} but nothing recording what " +
+            s"it hashed to, so $SumsName cannot be checked against it — remove that directory and " +
+            "build again")
+
+    if want.unwrap() != got.unwrap()
+        return Err(hash_mismatch(dep, coordinate, version, want.unwrap(), got.unwrap()))
+
+    Ok(got)
+end verify_cached
+
+// Clones at the tag, checks what arrived, and only then puts it where the build will read it.
+//
+// The clone goes to a sibling directory and is moved into place, so nothing ever reads a directory
+// that is half a package: an interrupted fetch leaves the partial one, which is refused on the next
+// run rather than compiled. It is a sibling rather than a temporary somewhere else so that the move
+// is a rename within one filesystem instead of a copy that can fail halfway.
+private clone_at_tag(dep: &Dependency, coordinate: string, version: Release, dir: string,
+                     sums: &Sums) -> Result[string, string]
+    val partial = s"$dir.partial"
+    val url = clone_url(coordinate)
+    val tag = release_tag(version)
+
+    make_dir_all(parent_of(dir).unwrap_or(".")).unwrap_or(())
+    remove_dir_all(partial).unwrap_or(())
+    eprints(s"fetching $coordinate $tag\n")
+
+    // `--depth 1` at the tag: a package is read at one version and its history is not part of what
+    // is compiled, so fetching the rest of it is bytes nobody asks for. It also keeps the clone out
+    // of the tree hash's way, since `.git` is excluded from that either way.
+    val answer = capture("git", ["clone", "--quiet", "--depth", "1", "--branch", tag, url, partial],
+                         "", [], true) match
+        Err(_) ->
+            remove_dir_all(partial).unwrap_or(())
+            return Err(s"cannot fetch $coordinate $tag: git is not on this machine")
+        Ok(got) -> got
+
+    if !answer.status.ok()
+        val said = answer.err.unwrap_or("").trim()
+
+        remove_dir_all(partial).unwrap_or(())
+        return Err(s"cannot fetch $coordinate $tag from $url:\n$said")
+
+    val hash = tree_hash(partial) match
+        Err(why) ->
+            remove_dir_all(partial).unwrap_or(())
+            return Err(why)
+        Ok(got) -> got
+
+    sum_of(sums, coordinate, version) match
+        None -> ()
+        Some(want) ->
+            if want != hash
+                remove_dir_all(partial).unwrap_or(())
+                return Err(hash_mismatch(dep, coordinate, version, want, hash))
+
+    write_text(s"$dir.hash", s"$hash\n").unwrap_or(())
+
+    rename(partial, dir) match
+        Err(_) ->
+            remove_dir_all(partial).unwrap_or(())
+            return Err(s"cannot fetch $coordinate $tag: what was cloned could not be moved into " +
+                s"'$dir'")
+        Ok(_) -> ()
+
+    Ok(hash)
+end clone_at_tag
+
+// The one diagnostic that says the fetch was not the package that was promised.
+//
+// It says what to do about it, because the honest answer depends on something the compiler cannot
+// know: either the upstream moved and the record should follow it, or the record is right and what
+// arrived is not the package.
+private hash_mismatch(dep: &Dependency, coordinate: string, version: Release, want: string,
+                      got: string) -> string =
+    s"'${dep.label}' does not hash to what $SumsName records for $coordinate " +
+        s"${release_tag(version)}\n  recorded: $want\n  fetched:  $got\n" +
+        "A version's content is not supposed to change. Either the tag was moved and the recorded " +
+        "line should be replaced deliberately, or what was fetched is not the package that was " +
+        "published."
+
+// The hash written beside a cached package when it was fetched, where there is one.
+private recorded_hash(dir: string) -> Option[string]
+    if !is_file(s"$dir.hash") then return None
+
+    read_text(s"$dir.hash") match
+        Err(_) -> None
+        Ok(text) ->
+            val trimmed = text.trim()
+
+            if trimmed.is_empty() then None else Some(trimmed)
+end recorded_hash
+
+// The sums a project carries, or nothing where it carries none.
+sums_at(root: string) -> Result[Sums, string]
+    val file = join_path(root, SumsName)
+
+    if !is_file(file) then return Ok(empty_sums())
+
+    read_text(file) match
+        Err(_) -> Err(s"cannot read $file")
+        Ok(text) -> sums_read(text)
+end sums_at
+
+// The sums written back where a package was fetched that no line covered.
+//
+// **Writing it is not fatal.** A read-only checkout should still build, and the alternative is
+// refusing to compile over a file that exists to be compared against next time.
+write_sums(root: string, sums: &Sums)
+    write_text(join_path(root, SumsName), sums_render(sums)) match
+        Err(_) -> eprints(s"warning: cannot write $SumsName\n")
+        Ok(_) -> ()
+end write_sums
