@@ -102,15 +102,19 @@ end extracted_tag
 pattern_bind(e: *Emit, p: TPattern, value: Val) = p match
     // A zero-sized binding is not a slot, exactly as a `var` of one is not. The name is still in
     // scope for the arm; every read of it yields nothing.
+    //
+    // The name takes a share of what it is bound to and the arm gives it back where it ends, which
+    // is what makes a `&T` destructured out of a variant outlive the value it was read from.
     TBindPattern(name, bty) ->
         if !zero_sized(bty)
-            if contains_counted(bty) then gap_here(e, "a binding that holds a reference")
-            else
-                alloca(e, VReg(s"$name.addr"), lty(e, bty))
-                emit(e, InStore(lty(e, bty), value, VReg(s"$name.addr"), AccPlain, None))
+            alloca(e, VReg(s"$name.addr"), lty(e, bty))
+            retain_value(e, bty, value)
+            emit(e, InStore(lty(e, bty), value, VReg(s"$name.addr"), AccPlain, None))
+            own_slot(e, name, bty)
 
     // `n @ pat` binds the whole value and then whatever the inner pattern binds, both off the same
-    // value.
+    // value -- so a `&T` matched this way is retained once for the outer name and once for each
+    // inner one, which is what every other pattern that names a value more than once already does.
     TAtPattern(name, inner) ->
         pattern_bind(e, TBindPattern(name, tpattern_type(*inner)), value)
         pattern_bind(e, *inner, value)
@@ -205,10 +209,14 @@ gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type) -> Val
         for j in 1..<arm.patterns.len()
             pat_cond = or_i1(e, pat_cond, pattern_test(e, arm.patterns.at(j), sv))
 
+        // **An arm's bindings are its own ownership region.** A name bound out of the scrutinee
+        // holds a share of what it names, and the arm is where that share goes back -- so the region
+        // opens where the bindings are made and closes where the arm hands its value over.
         arm.guard match
             None ->
                 emit_term(e, InCondBr(pat_cond, body_l, next_l))
                 emit_label(e, body_l)
+                push_owned(e)
 
                 if arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
             Some(g) ->
@@ -216,20 +224,30 @@ gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type) -> Val
 
                 emit_term(e, InCondBr(pat_cond, guard_l, next_l))
                 emit_label(e, guard_l)
+                push_owned(e)
 
                 if arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
 
+                push_temps(e)
+
                 val gv = gen_expr(e, g)
+
+                pop_temps(e)
+
+                // A guard that fails leaves an arm whose bindings were already made, so they are
+                // given back before falling through to the next one.
                 val unbind_l = fresh_label(e, "match.unbind")
 
                 emit_term(e, InCondBr(gv, body_l, unbind_l))
                 emit_label(e, unbind_l)
+                release_owned(e)
                 emit_term(e, InBr(next_l))
                 emit_label(e, body_l)
 
         if no_value(ty) then gen_block_void(e, arm.body)
         else store_arm_value(e, arm.body, ty, slot)
 
+        pop_owned(e)
         emit_term(e, InBr(end_l))
         emit_label(e, next_l)
 

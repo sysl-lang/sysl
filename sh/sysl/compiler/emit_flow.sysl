@@ -18,12 +18,18 @@ gen_if(e: *Emit, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TB
     val target = if else_block.is_some() then else_l else end_l
     val slot = result_slot(e, ty)
 
-    gen_cond(e, cond, then_l, target)
+    // The last term's success edge is the branch's entry, so a condition with nothing to bind emits
+    // exactly the one test and the one `br` it always did.
+    val paths = gen_cond(e, cond, then_l, target)
 
     if no_value(ty) then gen_block_void(e, then_block)
     else store_block_value(e, then_block, ty, slot)
 
+    // The branch's value is computed before the condition's bindings are given back, so a `then`
+    // that yields what it destructured has taken its own count by the time this runs.
+    release_cond(e, paths)
     emit_term(e, InBr(end_l))
+    emit_cond_cleanups(e, paths)
 
     else_block match
         Some(eb) ->
@@ -61,28 +67,159 @@ private store_block_value(e: *Emit, b: TBlock, ty: Type, slot: Val)
     if b.ty == Never then gen_block_void(e, b)
     else emit(e, InStore(lty(e, ty), gen_block_value(e, b), slot, AccPlain, None))
 
+// What emitting a condition left open: the owned scopes its `is` terms pushed for their bindings,
+// and the small blocks that sit on the edges leaving the chain part-way through.
+//
+// The two are separate because they run at different points. `release_cond` closes the success path,
+// where every binding was made and the branch has finished with them. `emit_cond_cleanups` lays down
+// the blocks a failing term branches to, each giving back exactly what had been taken by the time
+// control reached it and falling into the block for the term before it -- so a chain that fails at
+// its third term releases what its first two took, and a chain that fails at its first releases
+// nothing.
+struct CondPaths
+    scopes: usize
+    cleanups: Buf[CondCleanup]
+end CondPaths
+
+struct CondCleanup
+    label: string
+    held: Buf[(Val, Type)]
+    slots: bool
+    next: string
+end CondCleanup
+
+release_cond(e: *Emit, paths: CondPaths)
+    for i in 0..<paths.scopes
+        pop_owned(e)
+
+emit_cond_cleanups(e: *Emit, paths: CondPaths)
+    for i in 0..<paths.cleanups.len()
+        val c = paths.cleanups.at(i)
+
+        emit_label(e, c.label)
+
+        if c.slots then release_slots(e, c.held) else release_values(e, c.held)
+
+        emit_term(e, InBr(c.next))
+
 // Emits an `if`'s or a `while`'s condition as the chain of `&&`-joined terms it is, landing on
-// `success_l` where all of them held. Each term branches to the next on success and to `fail_l` on
-// failure, so a condition with no `is` in it is the one test and the one `br` it always was.
-gen_cond(e: *Emit, terms: Buf[TCondTerm], success_l: string, fail_l: string)
+// `success_l` -- open, with every binding established -- where all of them held. Each term branches
+// to the next on success and to `fail_l` on failure, so a condition with no `is` in it is the one
+// test and the one `br` it always was.
+//
+// A term that **bound** something moves the failure target to an unbind block of its own, so
+// everything to its right leaves through the releases it owes. That is the whole reason this is not
+// an expression the short-circuit `&&` could have generated: a `&&` has no bindings to unwind, and
+// its two edges meet again at one point, where these do not.
+//
+// A pattern's test and its bindings are separated for the reason `gen_match` separates them -- the
+// test is a pure read, so a chain may run several before anything is committed to, and a failure
+// retains nothing it then has to hand back.
+//
+// **Every term borrows in a region of its own**, which is the discipline the short-circuit `&&`
+// keeps: a later term's temporaries exist only on the edges that reached it, so releasing them
+// anywhere the whole chain meets would release values the incoming path never made. A term that does
+// not bind closes its region *before* it branches, so both of its edges are already clear; a term
+// that binds cannot, having to retain out of the very value it is holding, so its failing edge gets
+// a block that closes the region for it.
+gen_cond(e: *Emit, terms: Buf[TCondTerm], success_l: string, fail_l: string) -> CondPaths
+    var target = fail_l
+    var scopes: usize = 0
+    var cleanups: Buf[CondCleanup] = buf()
+
     for i in 0..<terms.len()
         val last = i == terms.len() - 1
+        val term = terms.at(i)
 
-        terms.at(i) match
+        // The block a term hands control to when it holds: the branch's own entry for the last term,
+        // and otherwise a label named after what happens there -- a binding is established in it, so
+        // a reader of the emitted text can see where the pattern was committed to.
+        val next_l =
+            if last then success_l
+            else if binding_term(term) then fresh_label(e, "cond.bind")
+            else fresh_label(e, "cond.and")
+
+        push_temps(e)
+
+        // **And an ownership region of its own, for the same reason one term further along.** A term
+        // may *materialize* storage -- `&Named("x")` writes a hidden local -- and that slot is
+        // written only where the chain reached this term, while a release registered with the
+        // enclosing scope is emitted on every path out of it.
+        push_owned(e)
+
+        term match
             TCondTest(c) ->
-                val next_l = if last then success_l else fresh_label(e, "cond.and")
                 val v = gen_expr(e, c)
 
-                emit_term(e, InCondBr(v, next_l, fail_l))
+                pop_owned(e)
+                pop_temps(e)
+                emit_term(e, InCondBr(v, next_l, target))
                 emit_label(e, next_l)
-            TCondIs(_, _, _) ->
-                gap_here(e, "a pattern in a condition")
+            TCondIs(subject, pats, negated) ->
+                val sv = gen_expr(e, subject)
 
-                val next_l = if last then success_l else fresh_label(e, "cond.and")
+                var held = pattern_test(e, pats.at(0), sv)
 
-                emit_term(e, InCondBr(VBool(true), next_l, fail_l))
-                emit_label(e, next_l)
+                for k in 1..<pats.len()
+                    held = or_i1(e, held, pattern_test(e, pats.at(k), sv))
+
+                val ok = if negated then not_i1(e, held) else held
+
+                // Closed before the branch in every case below, so both edges are clear of it -- and
+                // before the bindings open a region of their own, which the arms manage separately.
+                pop_owned(e)
+
+                // A negated test binds nothing, and neither does a list of alternatives -- the
+                // analyzer refused a pattern that tried in either position -- so both close their
+                // region here and leave the failure target where it was.
+                if negated || pats.len() != 1 || !binds_any(pats.at(0))
+                    pop_temps(e)
+                    emit_term(e, InCondBr(ok, next_l, target))
+                    emit_label(e, next_l)
+                else
+                    // The bind retains out of the subject, so the subject has to still be held when
+                    // it runs. That puts the release after the branch on the taken edge, and in a
+                    // block of its own on the other.
+                    val borrowed = temps_here(e)
+
+                    var on_fail = target
+
+                    if !borrowed.is_empty()
+                        val l = fresh_label(e, "cond.drop")
+
+                        cleanups.push(CondCleanup(l, borrowed, false, target))
+
+                        on_fail = l
+
+                    emit_term(e, InCondBr(ok, next_l, on_fail))
+                    emit_label(e, next_l)
+                    push_owned(e)
+                    pattern_bind(e, pats.at(0), sv)
+
+                    scopes += 1
+
+                    pop_temps(e)
+
+                    // Only a binding that holds a count has anything to give back; the rest of the
+                    // chain can keep failing straight to where it was already going. Its region is
+                    // closed by then, so this block owes the bindings alone.
+                    val slots = owned_here(e)
+
+                    if !slots.is_empty()
+                        val unbind_l = fresh_label(e, "cond.unbind")
+
+                        cleanups.push(CondCleanup(unbind_l, slots, true, target))
+
+                        target = unbind_l
+
+    CondPaths(scopes, cleanups)
 end gen_cond
+
+// Whether a term is the one shape that establishes a binding: a single pattern, not negated, with a
+// name in it.
+private binding_term(t: TCondTerm) -> bool = t match
+    TCondIs(_, pats, negated) -> !negated && pats.len() == 1 && binds_any(pats.at(0))
+    _ -> false
 
 // -- the loops ------------------------------------------------------------------------------------
 
@@ -98,11 +235,17 @@ gen_while(e: *Emit, cond: Buf[TCondTerm], body: Buf[TStmt], else_block: Option[T
                          e.temp_marks.len()))
     emit_term(e, InBr(cond_l))
     emit_label(e, cond_l)
-    gen_cond(e, cond, body_l, else_l)
+    val paths = gen_cond(e, cond, body_l, else_l)
+
     push_owned(e)
     gen_stmts(e, body)
     pop_owned(e)
+
+    // A binding is per-iteration: it is released at the bottom of the body and made again by the
+    // next round's test, so nothing accumulates across a loop that runs a million times.
+    release_cond(e, paths)
     emit_term(e, InBr(cond_l))
+    emit_cond_cleanups(e, paths)
     e.loops.pop()
     gen_loop_result(e, slot, ty, else_l, end_l, else_block)
 end gen_while
@@ -156,6 +299,89 @@ gen_loop(e: *Emit, body: Buf[TStmt], ty: Type) -> Val
     e.loops.pop()
     gen_loop_result(e, slot, ty, end_l, end_l, None)
 end gen_loop
+
+// The loop over what a sequence holds.
+//
+// **The sequence is evaluated once, into the statement's own region**, so a slice temporary stays
+// alive for the whole walk; the loop variable is a copy of the element, taking a count of its own
+// and giving it back at the end of each iteration.
+gen_for_each(e: *Emit, name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt],
+             else_block: Option[TBlock], ty: Type) -> Val
+    val parts = texpr_type(seq) match
+        Array(n, _) -> (address(e, seq), VInt(from_int(long(n))))
+        Slice(_, _) -> each_view_parts(e, seq)
+        Str -> each_view_parts(e, seq)
+        other ->
+            gap_here(e, s"iteration over ${type_show(other)}")
+            (VUndef, VInt(from_int(0)))
+
+    val w = word_lty(e)
+    val idx = alloca(e, fresh_reg(e), w)
+    val cond_l = fresh_label(e, "each.cond")
+    val body_l = fresh_label(e, "each.body")
+    val step_l = fresh_label(e, "each.step")
+    val end_l = fresh_label(e, "each.end")
+    val else_l = if else_block.is_some() then fresh_label(e, "each.else") else end_l
+    val slot = result_slot(e, ty)
+
+    emit(e, InStore(w, VInt(from_int(0)), idx, AccPlain, None))
+    e.loops.push(GenLoop(end_l, step_l, slot, !no_value(ty), e.owned_marks.len(),
+                         e.temp_marks.len()))
+    emit_term(e, InBr(cond_l))
+    emit_label(e, cond_l)
+
+    val iv = fresh_reg(e)
+
+    emit(e, InLoad(iv, w, idx, AccPlain, None))
+
+    val more = fresh_reg(e)
+
+    emit(e, InIntCmp(more, IUlt, w, iv, parts.1))
+    emit_term(e, InCondBr(more, body_l, else_l))
+    emit_label(e, body_l)
+
+    val ep = fresh_reg(e)
+
+    var at: Buf[IrArg] = buf()
+
+    at.push(ir_arg(w, iv))
+    emit(e, InGep(ep, lty(e, elem_ty), parts.0, at))
+
+    val ev = fresh_reg(e)
+
+    emit(e, InLoad(ev, lty(e, elem_ty), ep, AccPlain, None))
+    alloca(e, VReg(s"$name.addr"), lty(e, elem_ty))
+    retain_value(e, elem_ty, ev)
+    emit(e, InStore(lty(e, elem_ty), ev, VReg(s"$name.addr"), AccPlain, None))
+    push_owned(e)
+    own_slot(e, name, elem_ty)
+    gen_stmts(e, body)
+    pop_owned(e)
+    emit_term(e, InBr(step_l))
+    emit_label(e, step_l)
+
+    val nxt = fresh_reg(e)
+
+    emit(e, InBin(nxt, OpAdd, w, iv, VInt(from_int(1))))
+    emit(e, InStore(w, nxt, idx, AccPlain, None))
+    emit_term(e, InBr(cond_l))
+    e.loops.pop()
+    gen_loop_result(e, slot, ty, else_l, end_l, else_block)
+end gen_for_each
+
+// The pointer and the length a view carries, which is what a walk over one needs.
+private each_view_parts(e: *Emit, seq: TExpr) -> (Val, Val)
+    val wty = lty(e, texpr_type(seq))
+    val v = gen_expr(e, seq)
+    val p = fresh_reg(e)
+
+    emit(e, InExtract(p, wty, v, index_list(1)))
+
+    val l = fresh_reg(e)
+
+    emit(e, InExtract(l, wty, v, index_list(2)))
+    (p, l)
+end each_view_parts
 
 // The counted loop.
 //

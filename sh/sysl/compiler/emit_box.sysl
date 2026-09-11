@@ -227,6 +227,99 @@ promoted_elem(ty: Type) -> Option[Type] = underlying(ty) match
     Array(_, elem) -> Some(*elem)
     _ -> None
 
+// -- the weak edge ----------------------------------------------------------------------------------
+
+// Weakens a reference: the same address, counted in the box's third word instead of its first. The
+// strong count is untouched, which is the whole point -- the edge this makes keeps nothing alive.
+//
+// The value is registered as an owned temporary so the region that produced it gives the weak share
+// back, exactly as it would for a reference. What ends up holding it long-term is the slot it is
+// stored into, which takes a share of its own when it is written.
+gen_downgrade(e: *Emit, value: TExpr, weak_ty: Type) -> Val
+    val v = gen_expr(e, value)
+
+    retain_value(e, weak_ty, v)
+    own_temp(e, v, weak_ty)
+end gen_downgrade
+
+// `w.get()` -- asks the box whether the object is still there. A live one comes back with a count
+// taken for the caller, so what the `Some` carries is an ordinary owned reference; a dead one gives
+// a null address, which is the `None`.
+//
+// A trait object is rebuilt around the answer rather than reused: the method table it was carrying
+// is a constant that says nothing about whether the object is alive, so it is put back beside the
+// address only on the arm where there is one.
+gen_upgrade(e: *Emit, value: TExpr, opt_ty: Type, some: EnumVariant, none: EnumVariant) -> Val
+    e.weak_heap = true
+
+    val fat = weak_inner(texpr_type(value)).map(is_trait).unwrap_or(false)
+    val v = gen_expr(e, value)
+    val addr = if fat then erased_box(e, v) else v
+    val d = enum_decl(opt_ty)
+
+    if d.is_none() then return gap_at(e, "an upgrade whose option is not an enum")
+
+    val got = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, addr))
+    emit(e, ir_call(Some(got), LPtr, VGlobal("arc.upgrade"), args))
+
+    val live = fresh_reg(e)
+
+    emit(e, InIntCmp(live, INe, LPtr, got, VNull))
+
+    val slot = alloca(e, fresh_reg(e), lty(e, opt_ty))
+    val some_l = fresh_label(e, "weak.live")
+    val none_l = fresh_label(e, "weak.gone")
+    val end_l = fresh_label(e, "weak.end")
+
+    emit_term(e, InCondBr(live, some_l, none_l))
+    emit_label(e, some_l)
+
+    var strong = got
+
+    if fat
+        val tbl = fresh_reg(e)
+
+        emit(e, InExtract(tbl, l_fat(), v, index_list(0)))
+
+        val f0 = fresh_reg(e)
+
+        emit(e, InInsert(f0, l_fat(), VUndef, LPtr, tbl, index_list(0)))
+
+        val f1 = fresh_reg(e)
+
+        emit(e, InInsert(f1, l_fat(), f0, LPtr, got, index_list(1)))
+
+        strong = f1
+
+    var carried: Buf[Val] = buf()
+
+    carried.push(strong)
+    emit(e, InStore(lty(e, opt_ty), enum_value(e, opt_ty, d.unwrap(), some, carried), slot, AccPlain,
+                    None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, none_l)
+
+    var empty: Buf[Val] = buf()
+
+    emit(e, InStore(lty(e, opt_ty), enum_value(e, opt_ty, d.unwrap(), none, empty), slot, AccPlain,
+                    None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, end_l)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, opt_ty), slot, AccPlain, None))
+    own_temp(e, r, opt_ty)
+end gen_upgrade
+
+private weak_inner(ty: Type) -> Option[Type] = underlying(ty) match
+    Weak(inner) -> Some(*inner)
+    _ -> None
+
 // An array a view of which gets out of this frame lives in a buffer instead of a slot, and that is
 // the whole of the difference: the name still means the address of the storage, so the store and
 // every later use are the ones an unpromoted array gets. What the buffer adds is an owner for the

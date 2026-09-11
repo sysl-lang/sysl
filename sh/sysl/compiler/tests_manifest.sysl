@@ -3,7 +3,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.text.Search
-import sysl.fs.read_text
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
 
 // What a project says about itself before a line of it is read.
 
@@ -148,3 +148,32 @@ our_own_manifest_reads()
     assert_eq(m.requires.len(), 1)
     assert_eq(m.requires.at(0), "heap")
     assert(m.warnings.is_empty(), "and nothing in it is a key this compiler does not know")
+
+// **A package carries its own `.c` on the same terms the program does**, since a binding is a sysl
+// surface over C and the C is part of what was fetched. `package_units` hands back parsed units,
+// which says nothing about the files beside them, so what compiles a package's C is a walk over its
+// **directory** -- and that is what this answers.
+//
+// A dependency that is not on the machine is left out rather than refused: whatever needed its
+// source has already said so, and a build that got this far has a directory to walk.
+@test("a fetched package's directory is what a build walks for the C it carries")
+a_packages_directory_is_where_its_c_is_found()
+    val root = make_temp_dir("sysl-pkg").unwrap()
+    val here = s"$root/vendor/github.com/e/thing/@v1.2.3"
+
+    make_dir_all(here).unwrap()
+    write_text(s"$here/side.c", "int side(void) { return 7; }\n").unwrap()
+
+    val m = read("dependencies { thing { git = \"github.com/e/thing\", version = \"1.2.3\" } }\n" +
+                 "dependencies { gone { git = \"github.com/e/gone\", version = \"9.9.9\" } }")
+    val roots = package_roots(root, m)
+
+    assert_eq(roots.len(), 1)
+    assert_eq(roots.at(0), here)
+
+    val found = c_sources(roots.at(0), Some(MacOS)).unwrap()
+
+    assert_eq(found.len(), 1)
+    assert(found.at(0).ends_with("side.c"), found.at(0))
+    remove_dir_all(root).unwrap_or(())
+end a_packages_directory_is_where_its_c_is_found

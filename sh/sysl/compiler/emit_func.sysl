@@ -35,7 +35,9 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
             // of bytes and the count it takes is taken at the slot rather than off a value it never
             // had.
             if e.layout.indirect(ty)
-                gap_here(e, "a large parameter copied at entry")
+                emit_memcpy(e, VReg(s"${p.0}.addr"), VReg(s"${p.0}.param"), int(e.layout.size(ty)),
+                            int(e.layout.align(ty)))
+                retain_at(e, ty, VReg(s"${p.0}.addr"))
             else
                 emit(e, InStore(lty(e, ty), VReg(s"${p.0}.param"), VReg(s"${p.0}.addr"), AccPlain,
                                 None))
@@ -92,7 +94,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     // already terminated the block and the `ret` emitted here is dropped.
     f.body.result match
         Some(r) ->
-            if e.layout.indirect(f.ret_ty) then gap_here(e, "a large result returned through storage")
+            if e.layout.indirect(f.ret_ty) then gen_indirect_return(e, r)
             else if !no_value(f.ret_ty)
                 val v = gen_expr(e, r)
 
@@ -111,7 +113,9 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
                 release_all(e)
                 emit_term(e, InRet(None, None))
             else if e.layout.indirect(f.ret_ty)
-                gap_here(e, "a large result returned through storage")
+                emit(e, InStore(lty(e, f.ret_ty), VZero, sret_param(), AccPlain, None))
+                release_all(e)
+                emit_term(e, InRet(None, None))
             else
                 release_all(e)
                 emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(zero_of(e, f.ret_ty))))
@@ -153,3 +157,25 @@ private attribute_of(e: *Emit, f: TFunc) -> Buf[(string, string)]
 
     out
 end attribute_of
+
+// A result too large for registers, written where the caller said rather than handed back. The
+// out-pointer *is* the destination, so what would have been the returned value is built where it is
+// going.
+//
+// A postcondition still gets the value it is written about. Reading it back out of the storage is a
+// whole-aggregate load of the kind this lowering exists to avoid -- but only on a function that
+// *has* an `ensures`, and only once at each of its returns, which is a price a contract already
+// announces it is willing to pay.
+gen_indirect_return(e: *Emit, r: TExpr)
+    gen_into(e, sret_param(), r)
+
+    if !e.ensures.is_empty()
+        val v = fresh_reg(e)
+
+        emit(e, InLoad(v, lty_of(e, r), sret_param(), AccPlain, None))
+        emit_ensures(e, Some(v))
+    else emit_ensures(e, None)
+
+    release_all(e)
+    emit_term(e, InRet(None, None))
+end gen_indirect_return

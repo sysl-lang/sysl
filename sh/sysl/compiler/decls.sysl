@@ -354,6 +354,15 @@ struct Analysis
     // one the program makes.
     reached: &Reached
 
+    // The `extern`s something in this compilation actually calls, **in the order they were first
+    // reached**, which is neither the order they were written nor the order the names above are in.
+    //
+    // It is a set of its own because it is filled at a different moment: a call records the extern
+    // it is *about to* make before it analyzes its arguments, so `take(give())` reaches `take`
+    // first. That order is the order the `declare` lines come out in, so it is a fact about the
+    // emitted text rather than bookkeeping.
+    externs_reached: &Reached
+
     // Records a name as produced. The set is what matters and not the order, but the order is what
     // a walk over it reads, so a name is kept once.
     uses(*self, name: string)
@@ -366,6 +375,21 @@ struct Analysis
 
         set.names.push(name)
     end uses
+
+    // Records an `extern` as reached, on the same terms and through the same undo log.
+    uses_extern(*self, name: string)
+        if self.externs_reached.holds(name) then return
+
+        val set = self.externs_reached
+        val mark = set.names.len()
+
+        if self.journal.recording() then self.journal.record(() -> set.names.truncate(mark))
+
+        set.names.push(name)
+    end uses_extern
+
+    // The externs reached so far, in the order they were first reached.
+    externs_used(self) -> Buf[string] = self.externs_reached.names
 
     // Whether a name has been produced.
     used(self, name: string) -> bool = self.reached.holds(name)
@@ -451,7 +475,7 @@ end already_said
 // An analysis over empty tables.
 analysis_for(t: Target) -> &Analysis =
     Analysis(tables_for(t), buf(), buf(), journal(), buf(), 0, 0, 0, 0, buf(), buf(), buf(),
-             Reached(buf()))
+             Reached(buf()), Reached(buf()))
 
 // -- how far a declaration reaches ---------------------------------------------------------------
 

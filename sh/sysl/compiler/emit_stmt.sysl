@@ -53,6 +53,8 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
 
     TWriteStmt(w) -> gen_write(e, w)
 
+    TMultiAssign(writes) -> gen_multi_assign(e, writes)
+
     TReturn(opt) -> gen_return(e, opt)
 
     // A `break`/`continue` leaves the body from the middle, so it unwinds the body's ownership
@@ -121,9 +123,267 @@ gen_into(e: *Emit, dest: Val, x: TExpr)
         retain_value(e, ty, v)
         emit(e, InStore(lty(e, ty), v, dest, AccPlain, None))
         return
+    end if
 
-    gap_here(e, "a large value written where it is going")
+    // A tail self-call needs no destination: the jump keeps the frame, so the out-pointer the caller
+    // handed in is still the one the return that eventually happens will write through. `dest` here
+    // *is* that pointer, and passing it on would be writing the result of a call that is not made.
+    *x.kind match
+        TCall(name, args, _, _) ->
+            if e.tail_target != "" && is_tail_call(e.tail_calls, x.span)
+                gen_tail_self_call(e, args)
+                return
+            end if
+
+            // A result already arrives with its count taken, and the out-pointer is what says where.
+            // This is the case the whole mechanism is for: `val k = kernel()` writes the callee's
+            // work straight into `k`'s slot, and no aggregate is ever an LLVM value.
+            if !is_foreign(e, name) && !is_variadic(e, name)
+                var arg_vals: Buf[IrArg] = buf()
+
+                for i in 0..<args.len()
+                    arg_value(e, args.at(i), &arg_vals)
+
+                gen_sysl_call_into(e, VGlobal(symbol_of(e, name)), arg_vals, ty, Some(dest))
+                return
+            end if
+        _ -> ()
+
+    gen_borrowed_into(e, dest, x)
+    retain_at(e, ty, dest)
 end gen_into
+
+// Writes `x`'s value into `dest` without taking a count for anything in it -- what lands there is
+// borrowed, exactly as the register `gen_expr` hands back is.
+//
+// A **call** is deliberately not a case of its own here. Its result arrives owned, and giving it
+// this destination would leave a count in a place with nothing registered to release it; sending it
+// through `gen_expr` instead costs the whole-value load this path exists to avoid, but only where a
+// large result is nested inside a literal that is itself being built in place.
+gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
+    val ty = texpr_type(x)
+
+    *x.kind match
+        // A bitfield struct has one slot however many fields were written, so there is nothing to
+        // build field by field: the container is assembled as a value and stored once.
+        TStructNew(decl, args) ->
+            bitfield_ranges_of(Struct(decl)) match
+                Some(ranges) ->
+                    var vals: Buf[Val] = buf()
+
+                    for i in 0..<args.len()
+                        val v = gen_expr(e, args.at(i))
+
+                        if !zero_sized(decl.fields.at(i).1) then vals.push(v)
+
+                    emit(e, InStore(container_lty(ranges), build_bits(e, ranges, vals), dest,
+                                    AccPlain, None))
+                None ->
+                    for i in 0..<args.len()
+                        if !zero_sized(decl.fields.at(i).1)
+                            val p = fresh_reg(e)
+
+                            var idx: Buf[IrArg] = buf()
+
+                            idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+                            idx.push(ir_arg(l_i32(), VInt(from_int(long(decl.slot(i))))))
+                            emit(e, InGep(p, struct_lty(decl), dest, idx))
+                            gen_borrowed_into(e, p, args.at(i))
+
+        TArrayLit(elems, array_ty) ->
+            val elem = element(array_ty).unwrap_or(int_type())
+
+            for i in 0..<elems.len()
+                val p = fresh_reg(e)
+
+                var idx: Buf[IrArg] = buf()
+
+                idx.push(ir_arg(word_lty(e), VInt(from_int(long(i)))))
+                emit(e, InGep(p, lty(e, elem), dest, idx))
+                gen_borrowed_into(e, p, elems.at(i))
+
+        // The tag, and then the variant's own fields written into the region every variant shares.
+        // Reaching the region by address is what the value form has to use a stack slot for anyway --
+        // a union has no `insertvalue` -- so this is the shorter of the two lowerings as well.
+        TEnumNew(enum_ty, variant, args) ->
+            enum_decl(enum_ty) match
+                Some(d) ->
+                    if d.simple then store_through_value(e, dest, x, ty)
+                    else
+                        emit(e, InStore(l_i32(), VInt(from_int(long(variant.tag))), dest, AccPlain,
+                                        None))
+
+                        if variant.carries
+                            val base = payload_ptr(e, d, dest)
+
+                            for i in 0..<args.len()
+                                if !zero_sized(variant.fields.at(i).1)
+                                    val p = fresh_reg(e)
+
+                                    var idx: Buf[IrArg] = buf()
+
+                                    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+                                    idx.push(ir_arg(l_i32(),
+                                                    VInt(from_int(long(variant.slot(i))))))
+                                    emit(e, InGep(p, variant_lty(d, variant), base, idx))
+                                    gen_borrowed_into(e, p, args.at(i))
+                None -> store_through_value(e, dest, x, ty)
+
+        // The value is generated once, above the loop, exactly as the value form does -- every
+        // element is a copy of that one evaluation. It is generated even where there are no
+        // elements, because one evaluation is what the form promises.
+        TArrayFill(value, array_ty) ->
+            val v = gen_expr(e, value)
+
+            fill_at(e, dest, array_ty, v)
+
+        // A copy from one place to another is a copy of bytes. Reading the value out first would
+        // make a first-class aggregate of it for the length of one instruction, which is the cost.
+        _ ->
+            if has_address(x)
+                emit_memcpy(e, dest, address(e, x), int(e.layout.size(ty)),
+                            int(e.layout.align(ty)))
+            else store_through_value(e, dest, x, ty)
+end gen_borrowed_into
+
+private store_through_value(e: *Emit, dest: Val, x: TExpr, ty: Type)
+    val v = gen_expr(e, x)
+
+    emit(e, InStore(lty(e, ty), v, dest, AccPlain, None))
+
+// `x` built where a value of it is wanted, for a caller that asked for a register rather than
+// offering somewhere to put one. The load is the very thing the destination forms avoid, so this is
+// the fallback and not the path anything hot takes.
+through_slot(e: *Emit, x: TExpr) -> Val
+    val ty = texpr_type(x)
+    val slot = alloca(e, fresh_reg(e), lty(e, ty))
+
+    gen_borrowed_into(e, slot, x)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, ty), slot, AccPlain, None))
+    r
+end through_slot
+
+// **`a, b = b, a`** -- several places written from several values, in phases rather than one write at
+// a time.
+//
+// Every place's own subexpressions are located first, and once, so an index that calls something
+// calls it a single time. Then everything the statement *reads* is read -- what a compound arm finds
+// in its place, and then the whole right side -- which is what makes a swap a swap instead of two
+// statements that leave both names holding the same thing. Only then does anything land.
+//
+// **Every read takes a count for the statement**, which is what a form that reads everything before
+// it writes anything needs and a single assignment does not: writing into the first place lets go of
+// what was there, and in a swap what was there is exactly the value the second arm is holding.
+//
+// **Every `invariant` re-check waits until all of them have landed**, and once per struct however
+// many of its fields were written -- a clause relating two fields would otherwise trap on the
+// half-written state on the way to a perfectly good one.
+private gen_multi_assign(e: *Emit, writes: Buf[TWrite])
+    var addrs: Buf[Val] = buf()
+
+    for i in 0..<writes.len()
+        val w = writes.at(i)
+
+        addrs.push(if zero_sized(texpr_type(w.place)) then VNothing else place_addr(e, w.place))
+
+    var curs: Buf[Val] = buf()
+
+    for i in 0..<writes.len()
+        val w = writes.at(i)
+
+        if w.op == "=" || nowhere(addrs.at(i)) then curs.push(VNothing)
+        else curs.push(held_for_statement(e, load_place(e, w.place, addrs.at(i)),
+                                          texpr_type(w.place)))
+
+    var vals: Buf[Val] = buf()
+
+    for i in 0..<writes.len()
+        val w = writes.at(i)
+
+        vals.push(held_for_statement(e, gen_expr(e, w.value), texpr_type(w.value)))
+
+    for i in 0..<writes.len()
+        val w = writes.at(i)
+        val p = addrs.at(i)
+
+        if !nowhere(p)
+            if w.op == "="
+                store_place(e, w.place, p, vals.at(i))
+            else
+                val updated = combine(e, w.op, texpr_type(w.place), texpr_type(w.value), w.dispatch,
+                                      curs.at(i), vals.at(i))
+
+                w.constraint match
+                    Some(c) -> emit_constraint_checks(e, updated, c)
+                    None -> ()
+
+                store_over(e, w.place, p, updated, Some(curs.at(i)))
+
+    // One check per struct however many of its fields were written: two arms writing two fields of
+    // one value each owe the same re-read of the same clause, and running it twice would say nothing
+    // the first did not.
+    var done: Buf[TInvCheck] = buf()
+
+    for i in 0..<writes.len()
+        val checks = writes.at(i).check
+
+        for k in 0..<checks.len()
+            val c = checks.at(k)
+
+            if not_seen(&done, c) then emit_inv_check(e, gen_expr(e, c.value), c.decl, c.inv_fn)
+end gen_multi_assign
+
+// Whether this is the first time the check has been asked for, recording it either way.
+private not_seen(seen: *Buf[TInvCheck], c: TInvCheck) -> bool
+    for i in 0..<seen.len()
+        if seen.at(i).inv_fn == c.inv_fn && same_place(seen.at(i).value, c.value) then return false
+
+    seen.push(c)
+    true
+end not_seen
+
+// Whether two checks name the **same storage**, which is what decides that one of them is worth
+// running.
+//
+// **It is asked of the place and not of the node**, and that is the whole of why it exists: `w.lo`
+// and `w.hi` each owe a re-read of `w`, and the two `w`s are different occurrences of one name. A
+// comparison by position would call them different and run the clause twice.
+//
+// An index is compared by occurrence rather than by value, since two indices that happen to compute
+// the same number are not the same expression -- the cost of being wrong there is one extra check
+// and never a missing one.
+private same_place(a: TExpr, b: TExpr) -> bool = *a.kind match
+    TLoad(n, _) -> *b.kind match
+        TLoad(m, _) -> n == m
+        _ -> false
+    TGlobal(s, _, _) -> *b.kind match
+        TGlobal(t, _, _) -> s == t
+        _ -> false
+    TField(r, i, _) -> *b.kind match
+        TField(q, j, _) -> i == j && same_place(r, q)
+        _ -> false
+    TIndex(r, x, _) -> *b.kind match
+        TIndex(q, y, _) -> same_place(r, q) && x.span == y.span
+        _ -> false
+    TDeref(o, _) -> *b.kind match
+        TDeref(p, _) -> same_place(o, p)
+        _ -> false
+    _ -> a.span == b.span && texpr_kind_name(a) == texpr_kind_name(b)
+
+// Whether a place turned out to have no address at all, which is what a zero-sized one has.
+private nowhere(v: Val) -> bool = v match
+    VNothing -> true
+    _ -> false
+
+// A value read before anything is written, held for the length of the statement so that a write
+// into one place cannot free what another arm is still carrying.
+private held_for_statement(e: *Emit, v: Val, ty: Type) -> Val
+    retain_value(e, ty, v)
+    own_temp(e, v, ty)
+end held_for_statement
 
 // One place written from one value, with everything the write owes.
 private gen_write(e: *Emit, w: TWrite)
@@ -159,7 +419,7 @@ private gen_return(e: *Emit, opt: Option[TExpr])
             val ty = texpr_type(t)
 
             if e.layout.indirect(ty)
-                gap_here(e, "a large result returned through storage")
+                gen_indirect_return(e, t)
                 return
 
             val v = gen_expr(e, t)

@@ -1,0 +1,1054 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// The forms a body can reach that nothing else here has a file for: the loop over a sequence, the
+// comma assignment, the weak edge, the type attributes of a simple enum, a type's identity read off
+// an object, a pattern where a condition is wanted, a binding that holds a reference, and the four
+// places a value too large for registers goes through storage.
+//
+// **Every LLVM text here was read out of the reference compiler**, by handing the installed `sysl`
+// the same source and quoting `emit-llvm` -- never composed from the rule.
+//
+// **Each program is lowered beside the library and pruned**, which is what the driver does, so each
+// carries a `main` that reaches the function under test.
+
+private var form_library_cache: Buf[Program] = buf()
+private var form_library_read: bool = false
+
+private form_library() -> Buf[Program]
+    if form_library_read then return form_library_cache
+
+    form_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> form_library_cache = units
+
+    form_library_cache
+end form_library
+
+private no_form_library() -> bool
+    if form_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end no_form_library
+
+// One source lowered the way the driver lowers it -- analyzed beside the library, checked, pruned --
+// and the LLVM text of the function named. A body this compiler could not finish answers with the
+// form it reached, so a failure says why rather than only that.
+private form_lowered(text: string, symbol: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = form_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, done.main_module)
+
+    var own: Buf[string] = buf()
+
+    own.push(module_written(parsed.program))
+
+    val promotions = post_analysis_checks(done.an, whole, own)
+    val kept = prune(strip_tests(whole), own)
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+    val texts = func_texts(ir_print_module(lowered.0))
+
+    for i in 0..<texts.len()
+        if texts.at(i).0 == symbol then return texts.at(i).1
+
+    for i in 0..<lowered.1.len()
+        if llvm_safe(lowered.1.at(i).0) == symbol then
+            return s"not lowered: ${lowered.1.at(i).1}"
+
+    s"no definition of '$symbol'"
+end form_lowered
+
+// The `declare` lines of the externs a program reaches, in the order the module writes them down.
+private form_declares(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return out
+
+    var units: Buf[Program] = buf()
+    val library = form_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return out
+
+    val whole = program_of(done, done.main_module)
+
+    var own: Buf[string] = buf()
+
+    own.push(module_written(parsed.program))
+
+    val promotions = post_analysis_checks(done.an, whole, own)
+    val kept = prune(strip_tests(whole), own)
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    for i in 0..<kept.externs.len()
+        out.push(kept.externs.at(i).name)
+
+    out
+end form_declares
+
+// **The sequence is evaluated once, into the statement's own region**, and the index is a slot of
+// the loop's rather than a register, so the body may branch. The element is a copy: it is written
+// into the name's slot with a count of its own and given back at the end of each round.
+@test("a 'for' over a sequence evaluates it once and copies each element into the loop's own slot")
+a_for_each_walks_a_sequence_once()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "walk(xs: [3]int) -> int\n" +
+                  "    var total = 0\n" +
+                  "\n" +
+                  "    for x in xs\n" +
+                  "        total += x\n" +
+                  "\n" +
+                  "    total\n" +
+                  "end walk\n" +
+                  "\n" +
+                  "main() = print(walk([1, 2, 3]))\n",
+              "walk"),
+              "define i32 @walk([3 x i32] %xs.param) {\n" +
+              "entry:\n" +
+              "  %xs.addr = alloca [3 x i32]\n" +
+              "  %total.addr = alloca i32\n" +
+              "  %t1 = alloca i64\n" +
+              "  %x.addr = alloca i32\n" +
+              "  store [3 x i32] %xs.param, ptr %xs.addr\n" +
+              "  store i32 0, ptr %total.addr\n" +
+              "  store i64 0, ptr %t1\n" +
+              "  br label %each.cond1\n" +
+              "each.cond1:\n" +
+              "  %t2 = load i64, ptr %t1\n" +
+              "  %t3 = icmp ult i64 %t2, 3\n" +
+              "  br i1 %t3, label %each.body2, label %each.end4\n" +
+              "each.body2:\n" +
+              "  %t4 = getelementptr i32, ptr %xs.addr, i64 %t2\n" +
+              "  %t5 = load i32, ptr %t4\n" +
+              "  store i32 %t5, ptr %x.addr\n" +
+              "  %t6 = load i32, ptr %total.addr\n" +
+              "  %t7 = load i32, ptr %x.addr\n" +
+              "  %t8 = add i32 %t6, %t7\n" +
+              "  store i32 %t8, ptr %total.addr\n" +
+              "  br label %each.step3\n" +
+              "each.step3:\n" +
+              "  %t9 = add i64 %t2, 1\n" +
+              "  store i64 %t9, ptr %t1\n" +
+              "  br label %each.cond1\n" +
+              "each.end4:\n" +
+              "  %t10 = load i32, ptr %total.addr\n" +
+              "  ret i32 %t10\n" +
+              "}\n")
+end a_for_each_walks_a_sequence_once
+
+// Every place is located first, then everything the statement reads is read, and only then does
+// anything land. Written one arm at a time the second would read what the first had already
+// overwritten and both names would end holding one value.
+@test("'a, b = b, a' reads both places before it writes either, which is what makes a swap a swap")
+a_comma_assignment_reads_everything_before_it_writes_anything()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "swap(a: *int, b: *int)\n" +
+                  "    *a, *b = *b, *a\n" +
+                  "end swap\n" +
+                  "\n" +
+                  "main()\n" +
+                  "    var x = 1\n" +
+                  "    var y = 2\n" +
+                  "\n" +
+                  "    swap(&x, &y)\n" +
+                  "    print(x, y)\n" +
+                  "end main\n",
+              "swap"),
+              "define void @swap(ptr %a.param, ptr %b.param) {\n" +
+              "entry:\n" +
+              "  %a.addr = alloca ptr\n" +
+              "  %b.addr = alloca ptr\n" +
+              "  store ptr %a.param, ptr %a.addr\n" +
+              "  store ptr %b.param, ptr %b.addr\n" +
+              "  %t1 = load ptr, ptr %a.addr\n" +
+              "  %t2 = load ptr, ptr %b.addr\n" +
+              "  %t3 = load ptr, ptr %b.addr\n" +
+              "  %t4 = load i32, ptr %t3\n" +
+              "  %t5 = load ptr, ptr %a.addr\n" +
+              "  %t6 = load i32, ptr %t5\n" +
+              "  store i32 %t4, ptr %t1\n" +
+              "  store i32 %t6, ptr %t2\n" +
+              "  ret void\n" +
+              "}\n")
+end a_comma_assignment_reads_everything_before_it_writes_anything
+
+// **The check waits until every arm has landed**, and runs once however many fields were written:
+// a clause relating two fields would otherwise trap on the half-written state on the way to a
+// perfectly good one -- `6 <= 5` on the road from `2..10` to `6..8`.
+//
+// The two arms owe the same check of the same value, and the two occurrences of `w` are different
+// nodes of one place. Telling them apart by position would run the clause twice.
+@test("two fields of one struct written together re-check its invariant once, after both have landed")
+a_comma_assignment_re_checks_one_invariant_once()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Window\n" +
+                  "    lo: int\n" +
+                  "    hi: int\n" +
+                  "    invariant lo <= hi\n" +
+                  "end Window\n" +
+                  "\n" +
+                  "widen(w: *Window)\n" +
+                  "    w.lo, w.hi = 6, 8\n" +
+                  "end widen\n" +
+                  "\n" +
+                  "main()\n" +
+                  "    var w = Window(2, 10)\n" +
+                  "\n" +
+                  "    widen(&w)\n" +
+                  "    print(w.lo)\n" +
+                  "end main\n",
+              "widen"),
+              "define void @widen(ptr %w.param) {\n" +
+              "entry:\n" +
+              "  %w.addr = alloca ptr\n" +
+              "  store ptr %w.param, ptr %w.addr\n" +
+              "  %t1 = load ptr, ptr %w.addr\n" +
+              "  %t2 = getelementptr %struct.Window, ptr %t1, i32 0, i32 0\n" +
+              "  %t3 = load ptr, ptr %w.addr\n" +
+              "  %t4 = getelementptr %struct.Window, ptr %t3, i32 0, i32 1\n" +
+              "  store i32 6, ptr %t2\n" +
+              "  store i32 8, ptr %t4\n" +
+              "  %t5 = load ptr, ptr %w.addr\n" +
+              "  %t6 = load %struct.Window, ptr %t5\n" +
+              "  %t7 = extractvalue %struct.Window %t6, 0\n" +
+              "  %t8 = extractvalue %struct.Window %t6, 1\n" +
+              "  %t9 = call i1 @Window$inv(i32 %t7, i32 %t8)\n" +
+              "  br i1 %t9, label %invariant.ok1, label %invariant.bad2\n" +
+              "invariant.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "invariant.ok1:\n" +
+              "  ret void\n" +
+              "}\n")
+end a_comma_assignment_re_checks_one_invariant_once
+
+// The edge this makes keeps nothing alive, which is the whole point of it. The value is an owned
+// temporary, so the region that produced it gives the weak share back; what holds it afterwards is
+// the slot it was stored into, which took a share of its own.
+@test("a reference becomes weak by taking a share of the box's weak count, leaving the strong one alone")
+a_reference_weakens_by_counting_in_the_third_word()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Node\n" +
+                  "    value: int\n" +
+                  "end Node\n" +
+                  "\n" +
+                  "weaken(r: &Node) -> weak Node = r\n" +
+                  "\n" +
+                  "main()\n" +
+                  "    var r: &Node = Node(9)\n" +
+                  "\n" +
+                  "    print(weaken(r).get().unwrap().value)\n" +
+                  "end main\n",
+              "weaken"),
+              "define ptr @weaken(ptr %r.param) {\n" +
+              "entry:\n" +
+              "  %r.addr = alloca ptr\n" +
+              "  store ptr %r.param, ptr %r.addr\n" +
+              "  call void @arc.retain(ptr %r.param)\n" +
+              "  %t1 = load ptr, ptr %r.addr\n" +
+              "  call void @arc.weak_retain(ptr %t1)\n" +
+              "  call void @arc.weak_retain(ptr %t1)\n" +
+              "  call void @arc.weak_release(ptr %t1)\n" +
+              "  %t2 = load ptr, ptr %r.addr\n" +
+              "  call void @arc.release(ptr %t2)\n" +
+              "  ret ptr %t1\n" +
+              "}\n")
+end a_reference_weakens_by_counting_in_the_third_word
+
+// A live one comes back from `arc.upgrade` with a count taken for the caller, so what the `Some`
+// carries is an ordinary owned reference; a dead one gives a null address, which is the `None`.
+@test("'get' on a weak reference answers a live object with a counted reference and a dead one with 'None'")
+a_weak_reference_asks_the_box_whether_the_object_is_there()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Node\n" +
+                  "    value: int\n" +
+                  "end Node\n" +
+                  "\n" +
+                  "look(w: weak Node) -> int = w.get() match\n" +
+                  "    Some(p) -> p.value\n" +
+                  "    None -> 0\n" +
+                  "\n" +
+                  "main()\n" +
+                  "    var r: &Node = Node(3)\n" +
+                  "\n" +
+                  "    print(look(r))\n" +
+                  "end main\n",
+              "look"),
+              "define i32 @look(ptr %w.param) {\n" +
+              "entry:\n" +
+              "  %w.addr = alloca ptr\n" +
+              "  %t4 = alloca %enum.sysl$Option.ref.Node\n" +
+              "  %t6 = alloca %enum.sysl$Option.ref.Node\n" +
+              "  %t11 = alloca i32\n" +
+              "  %p.addr = alloca ptr\n" +
+              "  store ptr %w.param, ptr %w.addr\n" +
+              "  call void @arc.weak_retain(ptr %w.param)\n" +
+              "  %t1 = load ptr, ptr %w.addr\n" +
+              "  %t2 = call ptr @arc.upgrade(ptr %t1)\n" +
+              "  %t3 = icmp ne ptr %t2, null\n" +
+              "  br i1 %t3, label %weak.live1, label %weak.gone2\n" +
+              "weak.live1:\n" +
+              "  %t5 = insertvalue %sysl$Option.ref.Node.Some undef, ptr %t2, 0\n" +
+              "  store i32 0, ptr %t6\n" +
+              "  %t7 = getelementptr %enum.sysl$Option.ref.Node, ptr %t6, i32 0, i32 1\n" +
+              "  store %sysl$Option.ref.Node.Some %t5, ptr %t7\n" +
+              "  %t8 = load %enum.sysl$Option.ref.Node, ptr %t6\n" +
+              "  store %enum.sysl$Option.ref.Node %t8, ptr %t4\n" +
+              "  br label %weak.end3\n" +
+              "weak.gone2:\n" +
+              "  %t9 = insertvalue %enum.sysl$Option.ref.Node undef, i32 1, 0\n" +
+              "  store %enum.sysl$Option.ref.Node %t9, ptr %t4\n" +
+              "  br label %weak.end3\n" +
+              "weak.end3:\n" +
+              "  %t10 = load %enum.sysl$Option.ref.Node, ptr %t4\n" +
+              "  %t12 = extractvalue %enum.sysl$Option.ref.Node %t10, 0\n" +
+              "  %t13 = icmp eq i32 %t12, 0\n" +
+              "  br i1 %t13, label %match.arm5, label %match.next6\n" +
+              "match.arm5:\n" +
+              "  store %enum.sysl$Option.ref.Node %t10, ptr %t6\n" +
+              "  %t14 = getelementptr %enum.sysl$Option.ref.Node, ptr %t6, i32 0, i32 1\n" +
+              "  %t15 = load %sysl$Option.ref.Node.Some, ptr %t14\n" +
+              "  %t16 = extractvalue %sysl$Option.ref.Node.Some %t15, 0\n" +
+              "  call void @arc.retain(ptr %t16)\n" +
+              "  store ptr %t16, ptr %p.addr\n" +
+              "  %t17 = load ptr, ptr %p.addr\n" +
+              "  %t18 = getelementptr %arc.Node, ptr %t17, i32 0, i32 3\n" +
+              "  %t19 = load %struct.Node, ptr %t18\n" +
+              "  %t20 = extractvalue %struct.Node %t19, 0\n" +
+              "  store i32 %t20, ptr %t11\n" +
+              "  %t21 = load ptr, ptr %p.addr\n" +
+              "  call void @arc.release(ptr %t21)\n" +
+              "  br label %match.end4\n" +
+              "match.next6:\n" +
+              "  %t22 = extractvalue %enum.sysl$Option.ref.Node %t10, 0\n" +
+              "  %t23 = icmp eq i32 %t22, 1\n" +
+              "  br i1 %t23, label %match.arm7, label %match.next8\n" +
+              "match.arm7:\n" +
+              "  store i32 0, ptr %t11\n" +
+              "  br label %match.end4\n" +
+              "match.next8:\n" +
+              "  unreachable\n" +
+              "match.end4:\n" +
+              "  %t24 = load i32, ptr %t11\n" +
+              "  call void @arc.dispose.sysl$Option.ref.Node(%enum.sysl$Option.ref.Node %t10)\n" +
+              "  %t25 = load ptr, ptr %w.addr\n" +
+              "  call void @arc.weak_release(ptr %t25)\n" +
+              "  ret i32 %t24\n" +
+              "}\n")
+end a_weak_reference_asks_the_box_whether_the_object_is_there
+
+// **Discriminants need not be contiguous and need not start at zero**, so neither of a tag and a
+// position can be computed from the other. What can be done instead is to compare against each tag
+// in turn, which is a fold over at most as many entries as the author wrote.
+//
+// The register the `select` takes is allocated before the comparison feeding it, and the comparison
+// is emitted first: a step is one whole unit of the fold.
+@test("'Pos' walks the variant list rather than computing, because a tag is not its own position")
+an_enums_position_is_a_chain_over_its_variants()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "enum Gap\n" +
+                  "    A = 5\n" +
+                  "    B = 10\n" +
+                  "    C = 20\n" +
+                  "end Gap\n" +
+                  "\n" +
+                  "pos(g: Gap) -> int = Gap::Pos(g)\n" +
+                  "\n" +
+                  "nxt(g: Gap) -> int = Gap::Pos(Gap::Succ(g))\n" +
+                  "\n" +
+                  "prv(g: Gap) -> int = Gap::Pos(Gap::Pred(g))\n" +
+                  "\n" +
+                  "back(n: int) -> int = Gap::Pos(Gap::Val(n))\n" +
+                  "\n" +
+                  "main() = print(pos(Gap.B), nxt(Gap.A), prv(Gap.C), back(1))\n",
+              "pos"),
+              "define i32 @pos(i32 %g.param) {\n" +
+              "entry:\n" +
+              "  %g.addr = alloca i32\n" +
+              "  store i32 %g.param, ptr %g.addr\n" +
+              "  %t1 = load i32, ptr %g.addr\n" +
+              "  %t3 = icmp eq i32 %t1, 10\n" +
+              "  %t2 = select i1 %t3, i32 1, i32 2\n" +
+              "  %t5 = icmp eq i32 %t1, 5\n" +
+              "  %t4 = select i1 %t5, i32 0, i32 %t2\n" +
+              "  ret i32 %t4\n" +
+              "}\n")
+end an_enums_position_is_a_chain_over_its_variants
+
+// The trap comes first and the chain leaves the last variant as its default, which the trap keeps
+// it from reaching. `Pred` is the same fold read the other way.
+@test("'Succ' maps each variant to the one after it and traps on the last, where there is no next")
+the_neighbouring_value_traps_at_the_end_it_runs_off()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "enum Gap\n" +
+                  "    A = 5\n" +
+                  "    B = 10\n" +
+                  "    C = 20\n" +
+                  "end Gap\n" +
+                  "\n" +
+                  "pos(g: Gap) -> int = Gap::Pos(g)\n" +
+                  "\n" +
+                  "nxt(g: Gap) -> int = Gap::Pos(Gap::Succ(g))\n" +
+                  "\n" +
+                  "prv(g: Gap) -> int = Gap::Pos(Gap::Pred(g))\n" +
+                  "\n" +
+                  "back(n: int) -> int = Gap::Pos(Gap::Val(n))\n" +
+                  "\n" +
+                  "main() = print(pos(Gap.B), nxt(Gap.A), prv(Gap.C), back(1))\n",
+              "nxt"),
+              "define i32 @nxt(i32 %g.param) {\n" +
+              "entry:\n" +
+              "  %g.addr = alloca i32\n" +
+              "  store i32 %g.param, ptr %g.addr\n" +
+              "  %t1 = load i32, ptr %g.addr\n" +
+              "  %t2 = icmp ne i32 %t1, 20\n" +
+              "  br i1 %t2, label %succ.ok1, label %succ.bad2\n" +
+              "succ.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "succ.ok1:\n" +
+              "  %t4 = icmp eq i32 %t1, 10\n" +
+              "  %t3 = select i1 %t4, i32 20, i32 20\n" +
+              "  %t6 = icmp eq i32 %t1, 5\n" +
+              "  %t5 = select i1 %t6, i32 10, i32 %t3\n" +
+              "  %t8 = icmp eq i32 %t5, 10\n" +
+              "  %t7 = select i1 %t8, i32 1, i32 2\n" +
+              "  %t10 = icmp eq i32 %t5, 5\n" +
+              "  %t9 = select i1 %t10, i32 0, i32 %t7\n" +
+              "  ret i32 %t9\n" +
+              "}\n")
+end the_neighbouring_value_traps_at_the_end_it_runs_off
+
+// The bounds are the list's own length, so a gapped enum is walked exactly as a contiguous one is.
+// The comparison is at `int` -- the position's type -- and the results are at the enum's.
+@test("'Val' checks the position names a variant at all, then reads that variant's tag off the chain")
+a_position_back_to_a_value_is_range_checked_first()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "enum Gap\n" +
+                  "    A = 5\n" +
+                  "    B = 10\n" +
+                  "    C = 20\n" +
+                  "end Gap\n" +
+                  "\n" +
+                  "pos(g: Gap) -> int = Gap::Pos(g)\n" +
+                  "\n" +
+                  "nxt(g: Gap) -> int = Gap::Pos(Gap::Succ(g))\n" +
+                  "\n" +
+                  "prv(g: Gap) -> int = Gap::Pos(Gap::Pred(g))\n" +
+                  "\n" +
+                  "back(n: int) -> int = Gap::Pos(Gap::Val(n))\n" +
+                  "\n" +
+                  "main() = print(pos(Gap.B), nxt(Gap.A), prv(Gap.C), back(1))\n",
+              "back"),
+              "define i32 @back(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = icmp sge i32 %t1, 0\n" +
+              "  %t3 = icmp slt i32 %t1, 3\n" +
+              "  %t4 = and i1 %t2, %t3\n" +
+              "  br i1 %t4, label %val.ok1, label %val.bad2\n" +
+              "val.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "val.ok1:\n" +
+              "  %t6 = icmp eq i32 %t1, 1\n" +
+              "  %t5 = select i1 %t6, i32 10, i32 20\n" +
+              "  %t8 = icmp eq i32 %t1, 0\n" +
+              "  %t7 = select i1 %t8, i32 5, i32 %t5\n" +
+              "  %t10 = icmp eq i32 %t7, 10\n" +
+              "  %t9 = select i1 %t10, i32 1, i32 2\n" +
+              "  %t12 = icmp eq i32 %t7, 5\n" +
+              "  %t11 = select i1 %t12, i32 0, i32 %t9\n" +
+              "  ret i32 %t11\n" +
+              "}\n")
+end a_position_back_to_a_value_is_range_checked_first
+
+// A pattern's test and its bindings are separated for the reason `match` separates them: the test is
+// a pure read, so a chain may run several before anything is committed to, and a failure retains
+// nothing it then has to hand back. A term that bound something moves the failure target to an
+// unbind block of its own, so everything to its right leaves through the releases it owes.
+@test("'is' in a condition tests first and binds only on the edge where the test held")
+a_pattern_in_a_condition_binds_on_the_edge_that_took_it()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "enum Shape\n" +
+                  "    Dot\n" +
+                  "    Circle(r: int)\n" +
+                  "    Rect(w: int, h: int)\n" +
+                  "end Shape\n" +
+                  "\n" +
+                  "area(s: Shape) -> int\n" +
+                  "    if s is Circle(r) && r > 0 then return r * r\n" +
+                  "    if s is Rect(w, h) then return w * h\n" +
+                  "\n" +
+                  "    0\n" +
+                  "end area\n" +
+                  "\n" +
+                  "main() = print(area(Circle(3)), area(Rect(2, 5)), area(Dot))\n",
+              "area"),
+              "define i32 @area(%enum.Shape %s.param) {\n" +
+              "entry:\n" +
+              "  %s.addr = alloca %enum.Shape\n" +
+              "  %t4 = alloca %enum.Shape\n" +
+              "  %r.addr = alloca i32\n" +
+              "  %w.addr = alloca i32\n" +
+              "  %h.addr = alloca i32\n" +
+              "  store %enum.Shape %s.param, ptr %s.addr\n" +
+              "  %t1 = load %enum.Shape, ptr %s.addr\n" +
+              "  %t2 = extractvalue %enum.Shape %t1, 0\n" +
+              "  %t3 = icmp eq i32 %t2, 1\n" +
+              "  br i1 %t3, label %cond.bind4, label %if.end3\n" +
+              "cond.bind4:\n" +
+              "  store %enum.Shape %t1, ptr %t4\n" +
+              "  %t5 = getelementptr %enum.Shape, ptr %t4, i32 0, i32 1\n" +
+              "  %t6 = load %Shape.Circle, ptr %t5\n" +
+              "  %t7 = extractvalue %Shape.Circle %t6, 0\n" +
+              "  store i32 %t7, ptr %r.addr\n" +
+              "  %t8 = load i32, ptr %r.addr\n" +
+              "  %t9 = icmp sgt i32 %t8, 0\n" +
+              "  br i1 %t9, label %if.then1, label %if.end3\n" +
+              "if.then1:\n" +
+              "  %t10 = load i32, ptr %r.addr\n" +
+              "  %t11 = load i32, ptr %r.addr\n" +
+              "  %t12 = mul i32 %t10, %t11\n" +
+              "  ret i32 %t12\n" +
+              "if.end3:\n" +
+              "  %t13 = load %enum.Shape, ptr %s.addr\n" +
+              "  %t14 = extractvalue %enum.Shape %t13, 0\n" +
+              "  %t15 = icmp eq i32 %t14, 2\n" +
+              "  br i1 %t15, label %if.then5, label %if.end7\n" +
+              "if.then5:\n" +
+              "  store %enum.Shape %t13, ptr %t4\n" +
+              "  %t16 = getelementptr %enum.Shape, ptr %t4, i32 0, i32 1\n" +
+              "  %t17 = load %Shape.Rect, ptr %t16\n" +
+              "  %t18 = extractvalue %Shape.Rect %t17, 0\n" +
+              "  store i32 %t18, ptr %w.addr\n" +
+              "  %t19 = extractvalue %Shape.Rect %t17, 1\n" +
+              "  store i32 %t19, ptr %h.addr\n" +
+              "  %t20 = load i32, ptr %w.addr\n" +
+              "  %t21 = load i32, ptr %h.addr\n" +
+              "  %t22 = mul i32 %t20, %t21\n" +
+              "  ret i32 %t22\n" +
+              "if.end7:\n" +
+              "  ret i32 0\n" +
+              "}\n")
+end a_pattern_in_a_condition_binds_on_the_edge_that_took_it
+
+// That is what makes a `&T` destructured out of a value outlive the value it was read from: the arm
+// is its own ownership region, opened where the bindings are made and closed where the arm hands
+// its value over.
+@test("a name bound out of a variant takes a count of what it names, and the arm gives it back")
+a_binding_that_holds_a_reference_takes_a_share_of_it()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Node\n" +
+                  "    value: int\n" +
+                  "end Node\n" +
+                  "\n" +
+                  "enum Held\n" +
+                  "    Empty\n" +
+                  "    One(n: &Node)\n" +
+                  "end Held\n" +
+                  "\n" +
+                  "peek(h: Held) -> int = h match\n" +
+                  "    One(n) -> n.value\n" +
+                  "    Empty -> 0\n" +
+                  "\n" +
+                  "pick(h: Held) -> int\n" +
+                  "    if h is One(n) then return n.value\n" +
+                  "\n" +
+                  "    0\n" +
+                  "end pick\n" +
+                  "\n" +
+                  "main()\n" +
+                  "    var r: &Node = Node(7)\n" +
+                  "\n" +
+                  "    print(peek(One(r)), pick(One(r)))\n" +
+                  "end main\n",
+              "peek"),
+              "define i32 @peek(%enum.Held %h.param) {\n" +
+              "entry:\n" +
+              "  %h.addr = alloca %enum.Held\n" +
+              "  %t2 = alloca i32\n" +
+              "  %t5 = alloca %enum.Held\n" +
+              "  %n.addr = alloca ptr\n" +
+              "  store %enum.Held %h.param, ptr %h.addr\n" +
+              "  call void @arc.copy.Held(%enum.Held %h.param)\n" +
+              "  %t1 = load %enum.Held, ptr %h.addr\n" +
+              "  %t3 = extractvalue %enum.Held %t1, 0\n" +
+              "  %t4 = icmp eq i32 %t3, 1\n" +
+              "  br i1 %t4, label %match.arm2, label %match.next3\n" +
+              "match.arm2:\n" +
+              "  store %enum.Held %t1, ptr %t5\n" +
+              "  %t6 = getelementptr %enum.Held, ptr %t5, i32 0, i32 1\n" +
+              "  %t7 = load %Held.One, ptr %t6\n" +
+              "  %t8 = extractvalue %Held.One %t7, 0\n" +
+              "  call void @arc.retain(ptr %t8)\n" +
+              "  store ptr %t8, ptr %n.addr\n" +
+              "  %t9 = load ptr, ptr %n.addr\n" +
+              "  %t10 = getelementptr %arc.Node, ptr %t9, i32 0, i32 3\n" +
+              "  %t11 = load %struct.Node, ptr %t10\n" +
+              "  %t12 = extractvalue %struct.Node %t11, 0\n" +
+              "  store i32 %t12, ptr %t2\n" +
+              "  %t13 = load ptr, ptr %n.addr\n" +
+              "  call void @arc.release(ptr %t13)\n" +
+              "  br label %match.end1\n" +
+              "match.next3:\n" +
+              "  %t14 = extractvalue %enum.Held %t1, 0\n" +
+              "  %t15 = icmp eq i32 %t14, 0\n" +
+              "  br i1 %t15, label %match.arm4, label %match.next5\n" +
+              "match.arm4:\n" +
+              "  store i32 0, ptr %t2\n" +
+              "  br label %match.end1\n" +
+              "match.next5:\n" +
+              "  unreachable\n" +
+              "match.end1:\n" +
+              "  %t16 = load i32, ptr %t2\n" +
+              "  %t17 = load %enum.Held, ptr %h.addr\n" +
+              "  call void @arc.dispose.Held(%enum.Held %t17)\n" +
+              "  ret i32 %t16\n" +
+              "}\n")
+end a_binding_that_holds_a_reference_takes_a_share_of_it
+
+// The bind retains out of the subject, so the subject has to still be held when it runs. That puts
+// the release after the branch on the taken edge, and in a block of its own on the other.
+@test("a reference bound by an 'is' in a condition is released on the taken edge and on the unbind block")
+a_condition_that_binds_a_reference_releases_it_on_every_edge()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Node\n" +
+                  "    value: int\n" +
+                  "end Node\n" +
+                  "\n" +
+                  "enum Held\n" +
+                  "    Empty\n" +
+                  "    One(n: &Node)\n" +
+                  "end Held\n" +
+                  "\n" +
+                  "peek(h: Held) -> int = h match\n" +
+                  "    One(n) -> n.value\n" +
+                  "    Empty -> 0\n" +
+                  "\n" +
+                  "pick(h: Held) -> int\n" +
+                  "    if h is One(n) then return n.value\n" +
+                  "\n" +
+                  "    0\n" +
+                  "end pick\n" +
+                  "\n" +
+                  "main()\n" +
+                  "    var r: &Node = Node(7)\n" +
+                  "\n" +
+                  "    print(peek(One(r)), pick(One(r)))\n" +
+                  "end main\n",
+              "pick"),
+              "define i32 @pick(%enum.Held %h.param) {\n" +
+              "entry:\n" +
+              "  %h.addr = alloca %enum.Held\n" +
+              "  %t4 = alloca %enum.Held\n" +
+              "  %n.addr = alloca ptr\n" +
+              "  store %enum.Held %h.param, ptr %h.addr\n" +
+              "  call void @arc.copy.Held(%enum.Held %h.param)\n" +
+              "  %t1 = load %enum.Held, ptr %h.addr\n" +
+              "  %t2 = extractvalue %enum.Held %t1, 0\n" +
+              "  %t3 = icmp eq i32 %t2, 1\n" +
+              "  br i1 %t3, label %if.then1, label %if.end3\n" +
+              "if.then1:\n" +
+              "  store %enum.Held %t1, ptr %t4\n" +
+              "  %t5 = getelementptr %enum.Held, ptr %t4, i32 0, i32 1\n" +
+              "  %t6 = load %Held.One, ptr %t5\n" +
+              "  %t7 = extractvalue %Held.One %t6, 0\n" +
+              "  call void @arc.retain(ptr %t7)\n" +
+              "  store ptr %t7, ptr %n.addr\n" +
+              "  %t8 = load ptr, ptr %n.addr\n" +
+              "  %t9 = getelementptr %arc.Node, ptr %t8, i32 0, i32 3\n" +
+              "  %t10 = load %struct.Node, ptr %t9\n" +
+              "  %t11 = extractvalue %struct.Node %t10, 0\n" +
+              "  %t12 = load ptr, ptr %n.addr\n" +
+              "  call void @arc.release(ptr %t12)\n" +
+              "  %t13 = load %enum.Held, ptr %h.addr\n" +
+              "  call void @arc.dispose.Held(%enum.Held %t13)\n" +
+              "  ret i32 %t11\n" +
+              "cond.unbind4:\n" +
+              "  unreachable\n" +
+              "if.end3:\n" +
+              "  %t16 = load %enum.Held, ptr %h.addr\n" +
+              "  call void @arc.dispose.Held(%enum.Held %t16)\n" +
+              "  ret i32 0\n" +
+              "}\n")
+end a_condition_that_binds_a_reference_releases_it_on_every_edge
+
+// The table says which type the data word is, and its first word is that number. Nothing else is
+// read, and the load is from storage nothing writes.
+@test("'o::Id' loads the identity out of the method table, which is a constant global")
+a_type_id_is_the_first_word_of_the_table_the_object_points_at()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "trait Shape\n" +
+                  "    area(self) -> int\n" +
+                  "end Shape\n" +
+                  "\n" +
+                  "struct Rect\n" +
+                  "    w: int\n" +
+                  "end Rect\n" +
+                  "\n" +
+                  "impl Shape for Rect\n" +
+                  "    area(self) -> int = self.w\n" +
+                  "\n" +
+                  "which(o: &Shape) -> usize = o::Id\n" +
+                  "\n" +
+                  "main()\n" +
+                  "    var r: &Rect = Rect(4)\n" +
+                  "\n" +
+                  "    print(which(r) == Rect::Id)\n" +
+                  "end main\n",
+              "which"),
+              "define i64 @which({ ptr, ptr } %o.param) {\n" +
+              "entry:\n" +
+              "  %o.addr = alloca { ptr, ptr }\n" +
+              "  store { ptr, ptr } %o.param, ptr %o.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr } %o.param, 1\n" +
+              "  call void @arc.retain(ptr %t1)\n" +
+              "  %t2 = load { ptr, ptr }, ptr %o.addr\n" +
+              "  %t3 = extractvalue { ptr, ptr } %t2, 0\n" +
+              "  %t4 = load i64, ptr %t3\n" +
+              "  %t5 = load { ptr, ptr }, ptr %o.addr\n" +
+              "  %t6 = extractvalue { ptr, ptr } %t5, 1\n" +
+              "  call void @arc.release(ptr %t6)\n" +
+              "  ret i64 %t4\n" +
+              "}\n")
+end a_type_id_is_the_first_word_of_the_table_the_object_points_at
+
+// The out-pointer *is* the destination, so what would have been the returned value is written where
+// it is going -- element by element for the fill, and a copy of bytes for the field beside it.
+@test("a result too large for registers is built through the caller's storage and never held as a value")
+a_large_result_is_written_where_the_caller_said()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Kernel\n" +
+                  "    cells: [40]int\n" +
+                  "    tag: int\n" +
+                  "end Kernel\n" +
+                  "\n" +
+                  "make(n: int) -> Kernel = Kernel([n; 40], n)\n" +
+                  "\n" +
+                  "sum(k: Kernel) -> int = k.cells[0] + k.tag\n" +
+                  "\n" +
+                  "run() -> int\n" +
+                  "    val k = make(3)\n" +
+                  "\n" +
+                  "    sum(k)\n" +
+                  "end run\n" +
+                  "\n" +
+                  "main() = print(run())\n",
+              "make"),
+              "define void @make(ptr noalias sret(%struct.Kernel) align 4 %sret.out, i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %t3 = alloca i64\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = getelementptr %struct.Kernel, ptr %sret.out, i32 0, i32 0\n" +
+              "  %t2 = load i32, ptr %n.addr\n" +
+              "  store i64 0, ptr %t3\n" +
+              "  br label %fill.test1\n" +
+              "fill.test1:\n" +
+              "  %t4 = load i64, ptr %t3\n" +
+              "  %t5 = icmp ult i64 %t4, 40\n" +
+              "  br i1 %t5, label %fill.elem2, label %fill.done3\n" +
+              "fill.elem2:\n" +
+              "  %t6 = getelementptr i32, ptr %t1, i64 %t4\n" +
+              "  store i32 %t2, ptr %t6\n" +
+              "  %t7 = add i64 %t4, 1\n" +
+              "  store i64 %t7, ptr %t3\n" +
+              "  br label %fill.test1\n" +
+              "fill.done3:\n" +
+              "  %t8 = getelementptr %struct.Kernel, ptr %sret.out, i32 0, i32 1\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %t8, ptr align 4 %n.addr, i64 4, i1 false)\n" +
+              "  ret void\n" +
+              "}\n")
+end a_large_result_is_written_where_the_caller_said
+
+// Reading the value out first would make a first-class aggregate of it for the length of one
+// instruction, which is the whole cost this avoids. The count the slot takes is taken **at** the
+// slot rather than off a value the frame never had.
+@test("a parameter too large for registers arrives as an address and the callee copies it into its own slot")
+a_large_parameter_is_copied_into_the_frame_as_bytes()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Kernel\n" +
+                  "    cells: [40]int\n" +
+                  "    tag: int\n" +
+                  "end Kernel\n" +
+                  "\n" +
+                  "make(n: int) -> Kernel = Kernel([n; 40], n)\n" +
+                  "\n" +
+                  "sum(k: Kernel) -> int = k.cells[0] + k.tag\n" +
+                  "\n" +
+                  "run() -> int\n" +
+                  "    val k = make(3)\n" +
+                  "\n" +
+                  "    sum(k)\n" +
+                  "end run\n" +
+                  "\n" +
+                  "main() = print(run())\n",
+              "sum"),
+              "define i32 @sum(ptr %k.param) {\n" +
+              "entry:\n" +
+              "  %k.addr = alloca %struct.Kernel\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %k.addr, ptr align 4 %k.param, i64 164, i1 false)\n" +
+              "  %t1 = getelementptr %struct.Kernel, ptr %k.addr, i32 0, i32 0\n" +
+              "  %t2 = icmp ult i64 0, 40\n" +
+              "  br i1 %t2, label %bounds.ok1, label %bounds.bad2\n" +
+              "bounds.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok1:\n" +
+              "  %t3 = getelementptr i32, ptr %t1, i64 0\n" +
+              "  %t4 = load i32, ptr %t3\n" +
+              "  %t5 = getelementptr %struct.Kernel, ptr %k.addr, i32 0, i32 1\n" +
+              "  %t6 = load i32, ptr %t5\n" +
+              "  %t7 = add i32 %t4, %t6\n" +
+              "  ret i32 %t7\n" +
+              "}\n")
+end a_large_parameter_is_copied_into_the_frame_as_bytes
+
+// This is the case the whole mechanism is for: no aggregate is ever an LLVM value at either end,
+// and the caller with somewhere to put one is saved the round trip `through_slot` would have cost.
+@test("'val k = make(3)' hands the callee the declaration's own storage rather than a slot of its own")
+a_large_result_lands_straight_in_the_slot_that_will_hold_it()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Kernel\n" +
+                  "    cells: [40]int\n" +
+                  "    tag: int\n" +
+                  "end Kernel\n" +
+                  "\n" +
+                  "make(n: int) -> Kernel = Kernel([n; 40], n)\n" +
+                  "\n" +
+                  "sum(k: Kernel) -> int = k.cells[0] + k.tag\n" +
+                  "\n" +
+                  "run() -> int\n" +
+                  "    val k = make(3)\n" +
+                  "\n" +
+                  "    sum(k)\n" +
+                  "end run\n" +
+                  "\n" +
+                  "main() = print(run())\n",
+              "run"),
+              "define i32 @run() {\n" +
+              "entry:\n" +
+              "  %k.addr = alloca %struct.Kernel\n" +
+              "  call void @make(ptr sret(%struct.Kernel) align 4 %k.addr, i32 3)\n" +
+              "  %t1 = call i32 @sum(ptr %k.addr)\n" +
+              "  ret i32 %t1\n" +
+              "}\n")
+end a_large_result_lands_straight_in_the_slot_that_will_hold_it
+
+// Small ones are an `insertvalue` chain over the zero, which is what makes a literal of constants
+// fold to one in the object file. A large one has no such value to build, so each element is stored
+// at the address it belongs at.
+@test("an array literal too large for a register is written into the storage it is heading for")
+a_large_array_literal_is_laid_down_element_by_element()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "lit() -> [17]long = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]\n" +
+                  "\n" +
+                  "main() = print(lit()[16])\n",
+              "lit"),
+              "define void @lit(ptr noalias sret([17 x i64]) align 8 %sret.out) {\n" +
+              "entry:\n" +
+              "  %t1 = getelementptr i64, ptr %sret.out, i64 0\n" +
+              "  store i64 1, ptr %t1\n" +
+              "  %t2 = getelementptr i64, ptr %sret.out, i64 1\n" +
+              "  store i64 2, ptr %t2\n" +
+              "  %t3 = getelementptr i64, ptr %sret.out, i64 2\n" +
+              "  store i64 3, ptr %t3\n" +
+              "  %t4 = getelementptr i64, ptr %sret.out, i64 3\n" +
+              "  store i64 4, ptr %t4\n" +
+              "  %t5 = getelementptr i64, ptr %sret.out, i64 4\n" +
+              "  store i64 5, ptr %t5\n" +
+              "  %t6 = getelementptr i64, ptr %sret.out, i64 5\n" +
+              "  store i64 6, ptr %t6\n" +
+              "  %t7 = getelementptr i64, ptr %sret.out, i64 6\n" +
+              "  store i64 7, ptr %t7\n" +
+              "  %t8 = getelementptr i64, ptr %sret.out, i64 7\n" +
+              "  store i64 8, ptr %t8\n" +
+              "  %t9 = getelementptr i64, ptr %sret.out, i64 8\n" +
+              "  store i64 9, ptr %t9\n" +
+              "  %t10 = getelementptr i64, ptr %sret.out, i64 9\n" +
+              "  store i64 10, ptr %t10\n" +
+              "  %t11 = getelementptr i64, ptr %sret.out, i64 10\n" +
+              "  store i64 11, ptr %t11\n" +
+              "  %t12 = getelementptr i64, ptr %sret.out, i64 11\n" +
+              "  store i64 12, ptr %t12\n" +
+              "  %t13 = getelementptr i64, ptr %sret.out, i64 12\n" +
+              "  store i64 13, ptr %t13\n" +
+              "  %t14 = getelementptr i64, ptr %sret.out, i64 13\n" +
+              "  store i64 14, ptr %t14\n" +
+              "  %t15 = getelementptr i64, ptr %sret.out, i64 14\n" +
+              "  store i64 15, ptr %t15\n" +
+              "  %t16 = getelementptr i64, ptr %sret.out, i64 15\n" +
+              "  store i64 16, ptr %t16\n" +
+              "  %t17 = getelementptr i64, ptr %sret.out, i64 16\n" +
+              "  store i64 17, ptr %t17\n" +
+              "  ret void\n" +
+              "}\n")
+end a_large_array_literal_is_laid_down_element_by_element
+
+// **The order is settled in analysis and is not the order the externs were written.** A call records
+// the extern it is about to make *before* it analyzes its arguments, so `take(give())` reaches
+// `take` first and the module declares it first. The two spellings look alike until a program passes
+// one extern's result to another.
+@test("an extern is declared in the order a call reached it, not the order it was written")
+externs_are_declared_in_the_order_calls_reached_them()
+    if no_form_library() then return
+
+    val order = form_declares(
+                    "struct S\n" +
+                    "    a: int\n" +
+                    "    b: int\n" +
+                    "end S\n" +
+                    "\n" +
+                    "extern give() -> S\n" +
+                    "extern take(v: S)\n" +
+                    "\n" +
+                    "hand() = take(give())\n" +
+                    "\n" +
+                    "main() = hand()\n")
+
+    assert_eq(order.len(), 2)
+    assert_eq(order.at(0), "take")
+    assert_eq(order.at(1), "give")
+end externs_are_declared_in_the_order_calls_reached_them
+
+// A value to its name. The result is a string aggregate, so it is chosen through memory rather than
+// a `select`: each variant's block stores its name and the default lands on the last.
+//
+// **The interned strings are compared with their numbers stripped**, which is `precompiled` and not
+// this form: the reference declares the library's functions where this compiler defines them, so
+// every string a library body interns is in this module's numbering and in none of the reference's.
+@test("an enum value's name is chosen through storage, since a string is three words")
+an_enums_image_is_chosen_through_storage()
+    if no_form_library() then return
+
+    assert_eq(without_form_str_ids(form_lowered(
+                  "enum Gap\n" +
+                  "    A = 5\n" +
+                  "    B = 10\n" +
+                  "    C = 20\n" +
+                  "end Gap\n" +
+                  "\n" +
+                  "name(g: Gap) -> string = Gap::Image(g)\n" +
+                  "\n" +
+                  "main() = print(name(Gap.C))\n",
+              "name")),
+              "define { ptr, ptr, i64 } @name(i32 %g.param) {\n" +
+              "entry:\n" +
+              "  %g.addr = alloca i32\n" +
+              "  %t2 = alloca { ptr, ptr, i64 }\n" +
+              "  store i32 %g.param, ptr %g.addr\n" +
+              "  %t1 = load i32, ptr %g.addr\n" +
+              "  switch i32 %t1, label %image.case4 [ i32 5, label %image.case2 i32 10, label %image.case3 ]\n" +
+              "image.case2:\n" +
+              "  store { ptr, ptr, i64 } { ptr null, ptr @.str, i64 1 }, ptr %t2\n" +
+              "  br label %image.end1\n" +
+              "image.case3:\n" +
+              "  store { ptr, ptr, i64 } { ptr null, ptr @.str, i64 1 }, ptr %t2\n" +
+              "  br label %image.end1\n" +
+              "image.case4:\n" +
+              "  store { ptr, ptr, i64 } { ptr null, ptr @.str, i64 1 }, ptr %t2\n" +
+              "  br label %image.end1\n" +
+              "image.end1:\n" +
+              "  %t3 = load { ptr, ptr, i64 }, ptr %t2\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t3, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t4)\n" +
+              "  ret { ptr, ptr, i64 } %t3\n" +
+              "}\n")
+end an_enums_image_is_chosen_through_storage
+
+// A body with the number off each interned string it names, and everything else left alone.
+private without_form_str_ids(text: string) -> string
+    var out: Buf[u8] = buf()
+    val bytes = text.bytes
+    var i: usize = 0
+
+    while i < bytes.len
+        if form_starts_at(bytes, i, "@.str")
+            out.extend("@.str".bytes)
+
+            i += 5
+
+            while i < bytes.len && bytes[i] >= u8('0') && bytes[i] <= u8('9')
+                i += 1
+        else
+            out.push(bytes[i])
+
+            i += 1
+
+    from_utf8_unchecked(out.view())
+end without_form_str_ids
+
+private form_starts_at(bytes: []const u8, at: usize, what: string) -> bool
+    if at + what.bytes.len > bytes.len then return false
+
+    for k in 0..<what.bytes.len
+        if bytes[at + k] != what.bytes[k] then return false
+
+    true
+end form_starts_at
