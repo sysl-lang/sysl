@@ -1,0 +1,409 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **A `string` in a body**: what a literal is, what its bytes are, and the runtime calls that join
+// two, order two, render a value into one, and ask whether an offset falls between characters.
+//
+// A `string` *is* an immutable validated `[]u8`, so most of what can be done to one is already the
+// view's: its ownership is `emit_arc.sysl`'s and reaching an element or taking a substring is
+// `emit_place.sysl`'s. What is here is the part where the bytes have a meaning rather than a length.
+
+// A literal as a value: three words naming bytes that are never freed, so the owner is null and
+// counting it costs nothing at run time.
+//
+// The length leaves out the NUL the interned constant carries. That byte is there so a literal can
+// be handed to C without a copy -- it is not where the string ends, which is why a NUL can also
+// appear *inside* one as an ordinary byte.
+string_value(e: *Emit, s: string) -> Val = string_const(e, s)
+
+// The bytes of a string and how many there are -- what every operation on its content needs.
+str_bytes(e: *Emit, v: Val) -> (Val, Val)
+    val lt = lty(e, Str)
+    val p = fresh_reg(e)
+
+    emit(e, InExtract(p, lt, v, index_list(1)))
+
+    val n = fresh_reg(e)
+
+    emit(e, InExtract(n, lt, v, index_list(2)))
+    (p, n)
+end str_bytes
+
+// A string's bytes as a call's two arguments. Every helper in the runtime takes them in that order
+// and at those types, which is what makes this worth naming once.
+private str_args(e: *Emit, p: Val, n: Val) -> Buf[IrArg]
+    var out: Buf[IrArg] = buf()
+
+    out.push(ir_arg(LPtr, p))
+    out.push(ir_arg(word_lty(e), n))
+    out
+end str_args
+
+// Asks for a hand-written block once, and hands back the name -- the same queue every generated
+// helper is asked for through, so the order a module writes them down is the order they were needed.
+request_text(e: *Emit, name: string, text: string) -> string = request_helper(e, name, HrText(text))
+
+// Joins two strings into a fresh one. The result owns a new `StrBuf` -- an ordinary heap object
+// whose payload is the two halves' bytes laid end to end -- so it carries a count of its own and
+// returns its storage through the hook like every other heap object. Both operands are copied out,
+// so neither is retained; the caller records the result as an owned temporary.
+str_concat(e: *Emit, av: Val, bv: Val) -> Val
+    e.heap = true
+
+    val a = str_bytes(e, av)
+    val b = str_bytes(e, bv)
+    val fn = request_text(e, "sysl.str.concat", str_concat_text(word_llvm_of(e), str_llvm(e)))
+    val r = fresh_reg(e)
+
+    var args = str_args(e, a.0, a.1)
+
+    val more = str_args(e, b.0, b.1)
+
+    for i in 0..<more.len()
+        args.push(more.at(i))
+
+    emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
+    r
+end str_concat
+
+// Compares two strings by their bytes, yielding the usual -1 / 0 / 1 so that every comparison
+// operator is one `icmp` against the result.
+str_cmp(e: *Emit, av: Val, bv: Val) -> Val
+    val a = str_bytes(e, av)
+    val b = str_bytes(e, bv)
+    val fn = request_text(e, "sysl.str.cmp", str_cmp_text(word_llvm_of(e)))
+    val r = fresh_reg(e)
+
+    var args = str_args(e, a.0, a.1)
+
+    val more = str_args(e, b.0, b.1)
+
+    for i in 0..<more.len()
+        args.push(more.at(i))
+
+    emit(e, ir_call(Some(r), l_i32(), VGlobal(fn), args))
+    r
+end str_cmp
+
+// Whether a byte offset falls between characters rather than inside one. The caller has already
+// checked that the offset is within the string, so this only has to look at the byte it names.
+str_boundary(e: *Emit, p: Val, n: Val, i: Val) -> Val
+    val fn = request_text(e, "sysl.str.boundary", str_boundary_text(word_llvm_of(e)))
+    val r = fresh_reg(e)
+
+    var args = str_args(e, p, n)
+
+    args.push(ir_arg(word_lty(e), i))
+    emit(e, ir_call(Some(r), l_i1(), VGlobal(fn), args))
+    r
+end str_boundary
+
+// The word and the string's own text, as the templates spell them.
+private word_llvm_of(e: *Emit) -> string = s"i${e.word_bits}"
+
+private str_llvm(e: *Emit) -> string = l_render(lty(e, Str))
+
+// A view over bytes nothing owns -- what a `bool` renders to, since the two words it may be are
+// immortal constants.
+private str_view(e: *Emit, owner: Val, ptr: Val, len: Val) -> Val
+    val lt = lty(e, Str)
+    val v0 = fresh_reg(e)
+
+    emit(e, InInsert(v0, lt, VUndef, LPtr, owner, index_list(0)))
+
+    val v1 = fresh_reg(e)
+
+    emit(e, InInsert(v1, lt, v0, LPtr, ptr, index_list(1)))
+
+    val v2 = fresh_reg(e)
+
+    emit(e, InInsert(v2, lt, v1, word_lty(e), len, index_list(2)))
+    v2
+end str_view
+
+// **`str(x)` of a scalar.** A `string` is itself, since the value is already the three words a
+// string is; every other type is rendered into a fresh owning buffer, so the result is an owned
+// temporary the enclosing statement releases. A `bool` renders to one of two immortal literals and
+// needs no allocation at all.
+gen_str(e: *Emit, arg: TExpr) -> Val
+    val ty = underlying(texpr_type(arg))
+
+    if ty == Str then return gen_expr(e, arg)
+    if ty == Bool then return gen_bool_str(e, arg)
+    if ty == Char then return gen_char_str(e, arg)
+
+    ty match
+        Integer(bits, signed, _) -> gen_int_str(e, arg, bits, signed)
+        Floating(_) -> gen_float_str(e, arg, ty)
+        other -> gap_at(e, s"str of ${type_show(other)}")
+end gen_str
+
+private gen_bool_str(e: *Emit, arg: TExpr) -> Val
+    e.bool_strs = true
+
+    val v = gen_expr(e, arg)
+    val p = fresh_reg(e)
+
+    emit(e, InSelect(p, v, LPtr, VGlobal(".true"), VGlobal(".false"), l_i1()))
+
+    val n = fresh_reg(e)
+
+    emit(e, InSelect(n, v, word_lty(e), VInt(from_int(4)), VInt(from_int(5)), l_i1()))
+    str_view(e, VNull, p, n)
+end gen_bool_str
+
+private gen_char_str(e: *Emit, arg: TExpr) -> Val
+    e.char_buf = true
+    e.heap = true
+
+    request_from_bytes(e)
+
+    val fn = request_text(e, "sysl.str.char", str_char_text(word_llvm_of(e), str_llvm(e)))
+    val cp = gen_expr(e, arg)
+    val r = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(l_i32(), cp))
+    emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
+    r
+end gen_char_str
+
+// Rendered at a width that holds the value, which for anything past 64 bits is **the value's own**.
+// Up to 64 it goes through the renderer every program has always used -- one instance, shared, and
+// the overwhelmingly common case.
+//
+// **Beyond that the width may not be clamped.** Rendering an `i256` through a 128-bit renderer would
+// not be a lossy answer, it would be the wrong number: the conversion below narrows first and the
+// digits printed are of the truncated value. A renderer is generated per width instead.
+private gen_int_str(e: *Emit, arg: TExpr, bits: int, signed: bool) -> Val
+    e.heap = true
+
+    request_from_bytes(e)
+
+    val wide_bits = if bits > 64 then bits else 64
+    val fn = request_text(e, str_int_name(wide_bits),
+                          str_int_text(wide_bits, word_llvm_of(e), str_llvm(e)))
+    val wide = convert(e, underlying(texpr_type(arg)), Integer(wide_bits, signed, false),
+                       gen_expr(e, arg))
+    val r = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LInt(wide_bits), wide))
+    args.push(ir_arg(l_i1(), VInt(from_int(if signed then 1 else 0))))
+    emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
+    r
+end gen_int_str
+
+private gen_float_str(e: *Emit, arg: TExpr, from: Type) -> Val
+    e.heap = true
+    e.uses_snprintf = true
+
+    val fn = request_text(e, "sysl.str.float", str_float_text(word_llvm_of(e), str_llvm(e)))
+    val v = convert(e, from, real_type(), gen_expr(e, arg))
+    val r = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LFloat(64), v))
+    emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
+    r
+end gen_float_str
+
+// The copy every rendering finishes through, asked for wherever one is.
+request_from_bytes(e: *Emit) -> string =
+    request_text(e, "sysl.str.from_bytes", str_from_bytes_text(word_llvm_of(e), str_llvm(e)))
+
+// The bytes are copied into a string that owns them rather than viewed in place: a `[]u8` can be
+// written through afterwards, and a `string` whose bytes could change is not one that was ever
+// validated. The same copy is what `str(x)` finishes through, so both spend one allocation.
+gen_from_bytes(e: *Emit, arg: TExpr) -> Val
+    e.heap = true
+
+    val fn = request_from_bytes(e)
+    val v = gen_expr(e, arg)
+    val at = lty(e, texpr_type(arg))
+    val p = fresh_reg(e)
+
+    emit(e, InExtract(p, at, v, index_list(1)))
+
+    val n = fresh_reg(e)
+
+    emit(e, InExtract(n, at, v, index_list(2)))
+
+    val r = fresh_reg(e)
+
+    emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), str_args(e, p, n)))
+    own_temp(e, r, Str)
+end gen_from_bytes
+
+// **`format(x, spec)`** -- one value rendered through a printf specifier, into a fresh owning string.
+// A numeric value is widened and handed to `snprintf` with the C form of the specifier; a string is
+// copied NUL-terminated and handed to `snprintf` as a `%s`, so width, precision and justification
+// are C's to apply. The result is always a fresh buffer this statement owns.
+gen_format(e: *Emit, arg: TExpr, spec: string) -> Val
+    e.heap = true
+    e.uses_snprintf = true
+
+    val c = spec_conversion(spec)
+    val fmt = string_global(e, c_format(spec))
+    val r = fresh_reg(e)
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, fmt))
+
+    if spec_is_str(c)
+        val fn = request_text(e, "sysl.str.fmt_s", str_fmt_str_text(word_llvm_of(e), str_llvm(e)))
+        val parts = str_bytes(e, gen_expr(e, arg))
+
+        args.push(ir_arg(LPtr, parts.0))
+        args.push(ir_arg(word_lty(e), parts.1))
+        emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
+        return r
+    end if
+
+    if spec_is_float(c)
+        val fn = request_text(e, "sysl.str.fmt_f", str_fmt_float_text(word_llvm_of(e), str_llvm(e)))
+        val v = convert(e, underlying(texpr_type(arg)), real_type(), gen_expr(e, arg))
+
+        args.push(ir_arg(LFloat(64), v))
+        emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
+        return r
+    end if
+
+    // A signed conversion widens by the value's own signedness, so a decimal keeps its value; an
+    // unsigned one reads the bits as unsigned, so `%x` shows exactly the value's own width. Both end
+    // at 64 bits and print through a `%ll...`.
+    val fn = request_text(e, "sysl.str.fmt_i", str_fmt_int_text(word_llvm_of(e), str_llvm(e)))
+    val from = underlying(texpr_type(arg))
+    val bits = int_bits_of(from)
+    val v = if spec_is_signed_int(c) then
+            convert(e, from, Integer(64, int_signed_of(from), false), gen_expr(e, arg))
+        else
+            val unsigned = convert(e, from, Integer(bits, false, false), gen_expr(e, arg))
+
+            convert(e, Integer(bits, false, false), Integer(64, false, false), unsigned)
+
+    args.push(ir_arg(LInt(64), v))
+    emit(e, ir_call(Some(r), lty(e, Str), VGlobal(fn), args))
+    r
+end gen_format
+
+private int_bits_of(t: Type) -> int = t match
+    Integer(bits, _, _) -> bits
+    _ -> 32
+
+private int_signed_of(t: Type) -> bool = t match
+    Integer(_, signed, _) -> signed
+    _ -> true
+
+// -- a printf-style specifier ----------------------------------------------------------------------
+
+// The conversion letter, which the lexer guarantees is the last character of a well-formed spec.
+spec_conversion(spec: string) -> char
+    var last = '%'
+
+    for c in spec.chars
+        last = c
+
+    last
+end spec_conversion
+
+spec_is_int(c: char) -> bool = one_of("diouxX", c)
+
+spec_is_signed_int(c: char) -> bool = c == 'd' || c == 'i'
+
+spec_is_float(c: char) -> bool = one_of("eEfgG", c)
+
+private one_of(set: string, c: char) -> bool
+    for x in set.chars
+        if x == c then return true
+
+    false
+end one_of
+
+spec_is_str(c: char) -> bool = c == 's'
+
+// The C format string for the same specifier. An integer conversion is fed a 64-bit value, so its
+// conversion gains the `ll` length modifier; a float (a `double`) and a string (a C pointer) pass
+// through unchanged.
+c_format(spec: string) -> string
+    val c = spec_conversion(spec)
+
+    if !spec_is_int(c) then return spec
+
+    s"${spec[0..<(spec.bytes.len - 1)]}ll$c"
+end c_format
+
+// -- rendering into a buffer -------------------------------------------------------------------------
+
+// **A value written into a growable buffer, and what landed there as a string.** A zeroed stack slot
+// becomes the sink, the value writes itself into it, and the bytes are copied into a string the
+// statement owns. The slot is re-zeroed on every arrival rather than once, since an alloca is hoisted
+// to the entry block and a render inside a loop meets the same one each time round.
+gen_render(e: *Emit, value: TExpr, method: string, spec: TExpr, vslot: Option[int]) -> Val
+    e.heap = true
+
+    request_from_bytes(e)
+
+    val table = buffer_table(e)
+
+    // **A large receiver crosses as the address of storage the caller holds**, exactly as it does at
+    // any other call -- a value past the indirect boundary is passed and received through memory, so
+    // its parameter is a pointer. Producing it as a first-class aggregate and handing that over
+    // instead puts the struct's first word where the callee reads an address.
+    val big = e.layout.indirect(texpr_type(value))
+    val v = if big then address(e, value) else gen_expr(e, value)
+    val s = gen_expr(e, spec)
+    val slot_lty = buffer_lty(e)
+    val slot = alloca(e, fresh_reg(e), slot_lty)
+
+    emit(e, InStore(slot_lty, VZero, slot, AccPlain, None))
+
+    val a = fresh_reg(e)
+
+    emit(e, InInsert(a, l_fat(), VUndef, LPtr, VGlobal(table), index_list(0)))
+
+    val w = fresh_reg(e)
+
+    emit(e, InInsert(w, l_fat(), a, LPtr, slot, index_list(1)))
+
+    var args: Buf[IrArg] = buf()
+
+    // A trait object renders through the table it carries, so the callee and the receiver both come
+    // out of the value: the data word is the receiver a slot's entry expects, exactly as it is for
+    // any other call through one.
+    val callee = vslot match
+        Some(n) ->
+            val vt = fresh_reg(e)
+
+            emit(e, InExtract(vt, l_fat(), v, index_list(0)))
+
+            val data = fresh_reg(e)
+
+            emit(e, InExtract(data, l_fat(), v, index_list(1)))
+
+            val fn = vtable_entry(e, vt, n)
+
+            args.push(ir_arg(LPtr, data))
+            fn
+        None ->
+            args.push(ir_arg(if big then LPtr else lty(e, texpr_type(value)), v))
+            VGlobal(symbol_of(e, method))
+
+    args.push(ir_arg(l_fat(), w))
+    args.push(ir_arg(lty(e, texpr_type(spec)), s))
+    emit(e, ir_call(None, LVoid, callee, args))
+
+    val r = fresh_reg(e)
+
+    var finish: Buf[IrArg] = buf()
+
+    finish.push(ir_arg(LPtr, slot))
+    emit(e, ir_call(Some(r), lty(e, Str), VGlobal("sysl.w.buf.finish"), finish))
+    own_temp(e, r, Str)
+end gen_render

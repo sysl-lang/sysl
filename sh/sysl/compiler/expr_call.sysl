@@ -243,10 +243,15 @@ end named_call
 // -- the forms the compiler answers by name ------------------------------------------------------
 
 // `print`, the two rendering companions, and the primitives no sysl body could implement.
+// **These are resolved by NAME, not by looking a function up, and a local of the same spelling does
+// not take the name back.** `str(x)` means the rendering however many things called `str` are in
+// scope, which is what lets an interpolation hole read a parameter named `str` -- the hole desugars
+// to `str(str)`, and a guard that yielded to the local would leave a call to a value nothing can
+// call. The forms that *do* yield are the atomics, which say so where they are asked (nine names is
+// too much of a program's vocabulary to take outright), and the conversions, which `named_call`
+// asks about only where nothing claims the name.
 private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
                      expected: Option[Type]) -> Option[TExpr]
-    if cx.lookup(name).is_some() then return None
-
     // `old(e)` is the value an argument had on entry, and it means something only inside an
     // `ensure` -- so it is a form there and an ordinary name everywhere else.
     if name == "old" && cx.olds.is_some() then return Some(old_call(cx, span, args))
@@ -1182,15 +1187,72 @@ try_expr(cx: &Analyzer, span: Span, inner: Expr, expected: Option[Type]) -> TExp
 
     val (_, ret_fail, _) = ret_parts.unwrap()
 
-    // Where the two error types differ, `?` converts through `From` -- which is a member table's
-    // to find, so it waits for the stage that builds them.
-    if !type_eq(carried(fail), carried(ret_fail)) then
-        return cx.err(span, s"'?' converts ${type_show(carried(fail))} to " +
-                      s"${type_show(carried(ret_fail))} through 'From', which is looked up through " +
-                      "the member tables and those are not built yet")
+    // Where the two error types differ, `?` converts through `From`.
+    //
+    // **The conversion is looked up rather than written**, which is the whole of what it buys: every
+    // layer of a program otherwise writes `.map_err(...)` at each call that crosses between two
+    // error types. What is found here is the concrete function the `impl` lowered to, and the
+    // lowering splices a call to it between unwrapping the failure and re-wrapping it.
+    var convert: Option[string] = None
 
-    TExpr(span, TTry(t, ok, fail, ret, ret_fail, value, None))
+    if !type_eq(carried(fail), carried(ret_fail))
+        convert = from_conversion(cx.an, carried(fail), carried(ret_fail))
+
+        if convert.is_none()
+            return cx.err(span, s"'?' propagates a ${type_show(carried(fail))} error, but this " +
+                          s"function returns ${type_show(carried(ret_fail))} — a '?' converts " +
+                          s"through '${module_show(from_key())}', so " +
+                          s"'impl ${module_bare(from_key())}[${type_show(carried(fail))}] for " +
+                          s"${type_show(carried(ret_fail))}' is what joins the two layers")
+
+        cx.an.uses(convert.unwrap())
+    end if
+
+    TExpr(span, TTry(t, ok, fail, ret, ret_fail, value, convert))
 end try_expr
+
+// The library's `From`, whose one member is what a `?` across two error types goes through.
+private from_key() -> string = module_qualify(StdModule, "From")
+
+// The `From[from]` conversion into `to`, as the name of the function that performs it.
+//
+// **A type may implement `From` several times over**, so the answer is not "the member called
+// `from`" -- it is the overload slot whose one parameter is the source type and whose result is the
+// destination. That is the same question a written call answers with its argument, asked here with a
+// type instead, because a `?` has no argument written anywhere for the ordinary path to read.
+//
+// The trait is checked as well as the shape: an inherent `from` of the right signature is a function
+// that happens to be spelled the same, and reading it would make `?` convert through something
+// nobody declared a conversion.
+private from_conversion(a: &Analysis, from: Type, to: Type) -> Option[string]
+    val owner = member_key(a, to, "from").0
+    val slots = a.tables.members.alts.get(member_key_of(owner, "from")).unwrap_or(one_name("from"))
+
+    for i in 0..<slots.len()
+        val filed = member_key_of(owner, slots.at(i))
+
+        if a.tables.members.from_trait.get(filed).unwrap_or("") == from_key()
+            val decl = a.tables.members.decls.get(filed)
+
+            if decl.is_some() && decl.unwrap().receiver.is_none() && !decl.unwrap().is_property
+                val fname = a.tables.members.funcs.get(filed)
+
+                if fname.is_some()
+                    val sig = a.tables.members.func_insts.get(fname.unwrap())
+
+                    if sig.is_some() && sig.unwrap().params.len() == 1 &&
+                       type_eq(sig.unwrap().params.at(0).1, from) && type_eq(sig.unwrap().ret, to)
+                        return fname
+
+    None
+end from_conversion
+
+private one_name(name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(name)
+    out
+end one_name
 
 // The two variants a `Result` or an `Option` is made of, and the type its success carries.
 private fallible_parts(t: Type) -> Option[(EnumVariant, EnumVariant, Type)]

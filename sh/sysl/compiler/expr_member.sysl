@@ -89,7 +89,23 @@ private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name:
         // off here: reading a register yields an ordinary value.
         return TExpr(span, TField(tr, idx, unqualified(d.fields.at(usize(idx)).1)))
 
+    // A **compile-time constant** selects a part by its value, which is what makes one written line
+    // cover parts of different types inside a `for const`. It is the same selection `t.0` already
+    // is, with the position arriving as a constant rather than as a literal -- so an index past the
+    // end is the same complaint, said about the name that carried it.
+    val selected = const_selector(cx.subst, name)
+
     if is_tuple(d) then
+        if selected.is_some()
+            val v = selected.unwrap()
+
+            if v >= 0 && usize(v) < d.fields.len()
+                return TExpr(span, TField(tr, v, d.fields.at(usize(v)).1))
+
+            return cx.err(span, s"'$name' is $v here, and ${type_show(Struct(d))} has " +
+                          s"${quantity(d.fields.len(), "part")} — the parts are numbered from 0")
+        end if
+
         if all_digits(name) then
             return cx.err(span, s"${type_show(Struct(d))} has " +
                           s"${quantity(d.fields.len(), "part")}, so there is no '.$name' — the " +
@@ -97,14 +113,34 @@ private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name:
 
         return lookup_trait_member(cx, span, tr, name, buf(), expected)
 
-    // A struct's fields have names, and a number does not address one.
-    if all_digits(name) then
+    // A struct's fields have names, and a number does not address one -- so a compile-time index is
+    // refused here rather than falling through to a complaint about a missing property, which would
+    // send a reader looking for a field they never meant to name.
+    if all_digits(name) || selected.is_some() then
         return cx.err(span, s"'$name' is a compile-time index, and ${type_show(Struct(d))} is a " +
                       "struct — its fields are reached by name, and a position addresses the parts " +
                       "of a tuple")
 
     lookup_trait_member(cx, span, tr, name, buf(), expected)
 end struct_field
+
+// The value a selector stands for where it names a **compile-time constant** rather than a field --
+// the loop variable of a `for const`, or a value parameter.
+//
+// A local of the same name is not consulted and does not shadow this, because a selector is not a
+// name being read: `t.i` asks for a part of `t`, and what a variable called `i` happens to hold at
+// run time could not be the answer. That is the one place this differs from an `Ident`, which asks
+// the scope first for exactly the opposite reason.
+const_selector(subst: Buf[Binding], name: string) -> Option[int]
+    bound_type(subst, name) match
+        Some(ConstArg(v, ty)) -> underlying(*ty) match
+            Integer(_, _, _) -> v.to_long().and_then(n -> if n >= -2147483648 && n <= 2147483647 then
+                    Some(int(n))
+                else
+                    None)
+            _ -> None
+        _ -> None
+end const_selector
 
 private all_digits(name: string) -> bool
     val b = name.bytes

@@ -39,6 +39,11 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
 
         if volatile_in(place_ty(place)) then gap_here(e, "a ref to volatile storage")
 
+        // What keeps the storage alive belongs to the place, and the name that replaces the path has
+        // no declaration to read it off -- so it is recorded here and asked for at every view taken
+        // through the name.
+        e.ref_places.push((name, place))
+
         var idx: Buf[IrArg] = buf()
 
         idx.push(ir_arg(LInt(64), VInt(from_int(0))))
@@ -136,13 +141,9 @@ private gen_write(e: *Emit, w: TWrite)
         store_place(e, w.place, p, v)
         return
 
-    if w.dispatch.is_some()
-        gap_here(e, "a compound assignment through a trait method")
-        return
-
     val cur = load_place(e, w.place, p)
     val v = gen_expr(e, w.value)
-    val updated = combine(e, w.op, texpr_type(w.place), texpr_type(w.value), cur, v)
+    val updated = combine(e, w.op, texpr_type(w.place), texpr_type(w.value), w.dispatch, cur, v)
 
     w.constraint match
         Some(c) -> emit_constraint_checks(e, updated, c)
@@ -227,3 +228,42 @@ private gen_variant_check(e: *Emit, slot: string, var_ty: Type, expr: TExpr)
     emit(e, InStore(w, cur, VReg(s"$slot.prev"), AccPlain, None))
     emit(e, InStore(l_i1(), VInt(from_int(1)), VReg(s"$slot.armed"), AccPlain, None))
 end gen_variant_check
+
+// Checks a struct value against its `invariant` function: read each stored field out of the
+// aggregate, call the function, and trap on a false result. The fields are handed over exactly as an
+// ordinary call's arguments are -- the callee borrows, so no count is taken here.
+//
+// **A bitfield struct's fields are ranges of one container rather than slots of an aggregate**, so
+// they are read out of it once it has been lifted out, which is the same one read whether the
+// invariant relates one field or all of them.
+emit_inv_check(e: *Emit, v: Val, d: &StructType, inv_fn: string)
+    val ranges = bitfield_ranges(d)
+    val container = if ranges.is_none() then
+            VNothing
+        else
+            val c = fresh_reg(e)
+
+            emit(e, InExtract(c, struct_lty(d), v, index_list(0)))
+            c
+
+    var args: Buf[IrArg] = buf()
+
+    for i in 0..<d.fields.len()
+        val ft = d.fields.at(i).1
+
+        if !zero_sized(ft)
+            val r = ranges match
+                Some(rs) -> read_bits(e, rs, rs.at(d.slot(i)), container)
+                None ->
+                    val t = fresh_reg(e)
+
+                    emit(e, InExtract(t, struct_lty(d), v, index_list(int(d.slot(i)))))
+                    t
+
+            args.push(ir_arg(lty(e, ft), r))
+
+    val ok = fresh_reg(e)
+
+    emit(e, ir_call(Some(ok), l_i1(), VGlobal(symbol_of(e, inv_fn)), args))
+    trap_unless(e, ok, "invariant")
+end emit_inv_check

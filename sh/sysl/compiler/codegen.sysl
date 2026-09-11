@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.text.{str_builder, StrBuilder}
+import sysl.text.{str_builder, StrBuilder, Search}
 
 // Lowering a whole program to a module of intermediate representation.
 //
@@ -58,15 +58,19 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
                     Some(built) -> funcs.push(built)
                     None -> gaps.push((f.name, gap_text(e)))
 
-    var globals: Buf[IrGlobal] = buf()
+    // Storage the linker supplies and storage this module lays down, held apart from the two words a
+    // `bool` renders as -- which go in front of both and are not known to be needed until the last
+    // body has been written.
+    var declared_globals: Buf[IrGlobal] = buf()
 
     for i in 0..<p.extern_vars.len()
-        globals.push(ir_extern_global(p.extern_vars.at(i).symbol, lty(e, p.extern_vars.at(i).ty)))
+        declared_globals.push(ir_extern_global(p.extern_vars.at(i).symbol,
+                                               lty(e, p.extern_vars.at(i).ty)))
 
     val vals = gen_vals(e, p.vals)
 
     for i in 0..<vals.len()
-        globals.push(vals.at(i))
+        declared_globals.push(vals.at(i))
 
     // A library has no entry point. Emitting one would put a second `main` in every program that
     // linked against it, which the linker reports as a duplicate symbol and nothing else explains.
@@ -83,12 +87,19 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
             Some(f) -> entry = Some(f)
             None -> gaps.push(("main", gap_text(e)))
 
+    // The tables come after the bodies because a table only exists for a type something erased, and
+    // it may ask for an adapter, which the drain below is what emits.
+    var vtables: Buf[IrGlobal] = buf()
+
+    for i in 0..<p.vtables.len()
+        vtables.push(gen_vtable(e, p.vtables.at(i)))
+
     // Emitting a runtime helper may ask for another -- a destructor releases the references its
     // payload holds -- so this runs until nothing new is requested. **A helper that reaches the
     // allocator asks for the plain hook, and it is asked here rather than at the several places
     // that request one**: every box a helper builds carries a hook that gives its storage back, so
     // reading it off the helper itself keeps that from being a list somebody has to remember.
-    var built_helpers: Buf[IrFunc] = buf()
+    var built_helpers: Buf[IrRuntime] = buf()
     var made: usize = 0
 
     while made < e.queue.len()
@@ -97,12 +108,18 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
 
         made += 1
 
-        gen_helper(e, what, name) match
-            Some(built) ->
-                if allocates(built, malloc_symbol()) then plain_drop_fn(e)
+        what match
+            HrText(llvm) ->
+                if text_allocates(llvm, malloc_symbol()) then plain_drop_fn(e)
 
-                built_helpers.push(built)
-            None -> gaps.push((name, gap_text(e)))
+                built_helpers.push(RtTemplate(name, llvm))
+            _ ->
+                gen_helper(e, what, name) match
+                    Some(built) ->
+                        if allocates(built, malloc_symbol()) then plain_drop_fn(e)
+
+                        built_helpers.push(RtEmitted(built))
+                    None -> gaps.push((name, gap_text(e)))
 
     // The hand-written blocks go in front of the generated ones, and which of them the module needs
     // is settled only once every helper has been written -- a helper is as much a reason to hold the
@@ -110,12 +127,26 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
     var helpers = runtime_bundles(e, t)
 
     for i in 0..<built_helpers.len()
-        helpers.push(RtEmitted(built_helpers.at(i)))
+        helpers.push(built_helpers.at(i))
+
+    // The two words a `bool` renders as, laid down once for the whole module and in front of
+    // everything else it stores.
+    var globals: Buf[IrGlobal] = buf()
+
+    if e.bool_strs
+        globals.push(bool_constant("true"))
+        globals.push(bool_constant("false"))
+
+    for i in 0..<declared_globals.len()
+        globals.push(declared_globals.at(i))
 
     // The interned strings a helper laid down are in the same list every body's are, so this is
     // read **after** the drain.
     for i in 0..<e.globals.len()
         globals.push(e.globals.at(i))
+
+    for i in 0..<vtables.len()
+        globals.push(vtables.at(i))
 
     val m = IrModule(t.triple, declares(e, p), struct_defs(p, word_bits), enum_defs(p, layout),
                      box_defs(e, word_bits), no_sigs(), globals, helpers, funcs, no_funcs(), entry,
@@ -162,6 +193,7 @@ end box_defs
 private runtime_bundles(e: *Emit, t: Target) -> Buf[IrRuntime]
     var out: Buf[IrRuntime] = buf()
 
+    if e.char_buf then out.push(RtTemplate("sysl.utf8", utf8_encoder()))
     if e.heap then out.push(RtTemplate("arc.core", arc_core(t)))
     if e.sync_heap then out.push(RtTemplate("arc.atomic", arc_atomic(t)))
     if e.maybe_heap then out.push(RtTemplate("arc.maybe", arc_maybe()))
@@ -169,6 +201,22 @@ private runtime_bundles(e: *Emit, t: Target) -> Buf[IrRuntime]
 
     out
 end runtime_bundles
+
+// One of the two words a `bool` renders as, as the constant a module lays down.
+private bool_constant(word: string) -> IrGlobal
+    var bytes: Buf[u8] = buf()
+
+    for i in 0..<word.bytes.len
+        bytes.push(word.bytes[i])
+
+    bytes.push(u8(0))
+    ir_global(s".$word", true, LArr(int(bytes.len()), LInt(8)), VBytes(bytes))
+end bool_constant
+
+// The same question `allocates` asks of a generated helper, asked of a hand-written one -- which is
+// still text, and still answered by looking for the call in it.
+private text_allocates(llvm: string, symbol: string) -> bool =
+    llvm.index_of(s"call ptr @$symbol(").is_some()
 
 // Whether a generated helper reaches the allocator, and so needs the hook that gives storage back.
 // Its calls are instructions, so the question is whether one of them names the allocating symbol.
@@ -248,6 +296,16 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
 
         free_params.push(ir_param(LPtr))
         out.push(ir_sig(free_symbol(), ir_fn_type(LVoid, free_params)))
+
+    // C's own formatting, which a float and a specifier are rendered through. Its size argument is
+    // the machine's word rather than eight bytes, and it is open at the end.
+    if e.uses_snprintf
+        var pr_params: Buf[IrParam] = buf()
+
+        pr_params.push(ir_param(LPtr))
+        pr_params.push(ir_param(word_lty(e)))
+        pr_params.push(ir_param(LPtr))
+        out.push(ir_sig("snprintf", IrFnType(l_i32(), pr_params, true, no_ir_attrs())))
 
     // The test dispatcher's one dependency, and the only thing in a test build that is not also in
     // an ordinary one. It is declared from the shape of the program rather than from a flag set

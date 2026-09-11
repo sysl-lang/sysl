@@ -1,0 +1,237 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **The method tables trait objects dispatch through.**
+//
+// A table is a constant array of function pointers, one per method the trait declares, and every
+// entry has the same shape: the object's data word first, then the method's own parameters. That
+// uniformity is what lets a call site load a slot and call it knowing only the trait.
+//
+// Keeping it uniform is what the adapters here are for. An implementation may want its receiver by
+// value, behind a pointer, or behind a reference, and the data word addresses the value itself in a
+// raw object but the reference-counted box in a counted one -- so between the word a call site has
+// and the receiver an implementation declared there may be a header to step over and a value to
+// load. Where the two already agree, the implementation goes into the slot directly.
+
+// One table's constant, with whatever adapters its slots need queued for emission.
+//
+// **The type's identity is the first word, and the slots follow it.** That is what an erased value
+// carries `o::Id` in: the object's first word is this table's address, so one load answers a question
+// the value itself has forgotten. It costs a word per table -- one per trait, implementing type and
+// memory mode -- and nothing per value.
+//
+// The layout is a struct rather than a longer array of pointers with an `inttoptr` in front, because
+// that is what is actually there: a word and then function pointers.
+gen_vtable(e: *Emit, vt: TVtable) -> IrGlobal
+    var entries: Buf[IrArg] = buf()
+
+    for i in 0..<vt.slots.len()
+        entries.push(ir_arg(LPtr, VGlobal(slot_fn(e, vt, vt.slots.at(i)))))
+
+    val slots = LArr(int(vt.slots.len()), LPtr)
+
+    var fields: Buf[IrArg] = buf()
+
+    fields.push(ir_arg(word_lty(e), VInt(vt.type_id)))
+    fields.push(ir_arg(slots, VArray(entries)))
+
+    var shape: Buf[LType] = buf()
+
+    shape.push(word_lty(e))
+    shape.push(slots)
+    ir_global(vt.name, true, LStruct(shape), VAgg(fields))
+end gen_vtable
+
+// The function a slot holds: the implementation itself where its receiver already *is* the data word
+// -- a `*self` method reached through a raw object, a `&self` method reached through a counted one --
+// and an adapter for everything else.
+private slot_fn(e: *Emit, vt: TVtable, slot: TVSlot) -> string
+    slot.recv match
+        ByPtr -> if !vt.boxed then return symbol_of(e, slot.target)
+        ByRef(_) -> if vt.boxed then return symbol_of(e, slot.target)
+        _ -> ()
+
+    val name = s"vt.adapt.${if vt.boxed then "ref." else ""}${slot.target}"
+
+    request_helper(e, name, HrAdapter(vt, slot))
+end slot_fn
+
+// The adapter's signature. It carries the extension a narrow result owes whoever called through the
+// table; a large result is written into the caller's storage, so the adapter neither receives it in a
+// register nor returns one -- it forwards the out-pointer it was handed and returns nothing.
+//
+// **A zero-sized parameter is not in the implementation's signature, so it is not in the adapter's
+// either** -- the two have to agree, and the argument was never a word to forward.
+adapter_sig(e: *Emit, name: string, slot: TVSlot) -> IrFuncSig
+    var ps: Buf[IrParam] = buf()
+
+    sysl_sret(e, slot.ret_ty, Some(sret_param())) match
+        Some(p) -> ps.push(IrParam(LPtr, sret_forward_attrs(p.attrs), Some(sret_param())))
+        None -> ()
+
+    ps.push(IrParam(LPtr, no_ir_attrs(), Some(VReg("d"))))
+
+    for i in 0..<slot.params.len()
+        if !zero_sized(slot.params.at(i))
+            ps.push(IrParam(sysl_param_lty(e, slot.params.at(i)), no_ir_attrs(),
+                            Some(VReg(s"a$i"))))
+
+    var attrs: Buf[(string, string)] = buf()
+
+    IrFuncSig(name, IrFnType(sysl_result_lty(e, slot.ret_ty), ps, false,
+                             adapter_ret_attrs(e, slot.ret_ty)),
+              LinkPrivate, None, attrs, None)
+end adapter_sig
+
+// The out-pointer's attributes, less the `noalias` only a caller that made the storage may claim: the
+// adapter did not create it and cannot promise nothing else addresses it.
+private sret_forward_attrs(attrs: Buf[IrAttr]) -> Buf[IrAttr]
+    var out: Buf[IrAttr] = buf()
+
+    for i in 0..<attrs.len()
+        attrs.at(i) match
+            AttrNoAlias -> ()
+            other -> out.push(other)
+
+    out
+end sret_forward_attrs
+
+private adapter_ret_attrs(e: *Emit, ret_ty: Type) -> Buf[IrAttr] =
+    if e.layout.indirect(ret_ty) || no_value(ret_ty) then no_ir_attrs()
+    else c_extension(ret_ty, e.target)
+
+// The adapter's body: step over the header where the object is counted, bring the receiver to the
+// shape the implementation declared, and forward everything else untouched.
+gen_adapter(e: *Emit, vt: TVtable, slot: TVSlot)
+    val payload = if !vt.boxed then VReg("d") else
+        val p = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields())))))
+        emit(e, InGep(p, box_lty(e, vt.for_type), VReg("d"), idx))
+        p
+
+    // The receiver is *borrowed* here, not owned: the implementation retains its parameters on entry
+    // and releases them on return, so handing it a value loaded out of the object leaves the object's
+    // own count exactly where it was.
+    val recv = slot.recv match
+        // A large receiver is passed at its address like any other large argument, so the
+        // implementation makes the copy it was always going to make and the adapter makes none.
+        ByValue ->
+            if e.layout.indirect(vt.for_type) then ir_arg(LPtr, payload)
+            else
+                val v = fresh_reg(e)
+
+                emit(e, InLoad(v, lty(e, vt.for_type), payload, AccPlain, None))
+                ir_arg(lty(e, vt.for_type), v)
+        ByPtr -> ir_arg(LPtr, payload)
+
+        // A `&self` method on a raw object is refused where the object's type is formed, and on a
+        // counted one the implementation is named directly, so no adapter is ever built for it.
+        ByRef(_) ->
+            gap_here(e, "an adapter for a '&self' method")
+            ir_arg(LPtr, payload)
+
+    var call: Buf[IrArg] = buf()
+
+    sysl_sret(e, slot.ret_ty, None) match
+        Some(p) -> call.push(IrArg(LPtr, sret_param(), sret_forward_attrs(p.attrs)))
+        None -> ()
+
+    call.push(recv)
+
+    for i in 0..<slot.params.len()
+        if !zero_sized(slot.params.at(i))
+            call.push(ir_arg(sysl_param_lty(e, slot.params.at(i)), VReg(s"a$i")))
+
+    val target = VGlobal(symbol_of(e, slot.target))
+
+    if no_value(slot.ret_ty) || e.layout.indirect(slot.ret_ty)
+        emit(e, ir_call(None, LVoid, target, call))
+        emit_term(e, InRet(None, None))
+        return
+    end if
+
+    val r = fresh_reg(e)
+
+    emit(e, InCall(Some(r), lty(e, slot.ret_ty), target, call, c_extension(slot.ret_ty, e.target),
+                   None, no_fast_math(), false))
+    emit_term(e, InRet(Some(sysl_result_lty(e, slot.ret_ty)), Some(r)))
+end gen_adapter
+
+// -- what a body does with a table ------------------------------------------------------------------
+
+// **Erasing costs one word**: the value goes on pointing where it pointed, and the table for the type
+// it is losing is a constant beside it. Nothing is retained -- a counted object holds the count its
+// operand already had, which is what makes `f(&T)` and `f(&Trait)` the same handover.
+gen_erase(e: *Emit, operand: TExpr, vtable: string) -> Val
+    val d = gen_expr(e, operand)
+    val a = fresh_reg(e)
+
+    emit(e, InInsert(a, l_fat(), VUndef, LPtr, VGlobal(vtable), index_list(0)))
+
+    val b = fresh_reg(e)
+
+    emit(e, InInsert(b, l_fat(), a, LPtr, d, index_list(1)))
+    b
+end gen_erase
+
+// A call whose callee is a word in the object's table rather than a name. The data word goes in front
+// of the declared arguments, which is the shape every slot was built to.
+gen_vcall(e: *Emit, receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type) -> Val
+    val obj = gen_expr(e, receiver)
+    val table = fresh_reg(e)
+
+    emit(e, InExtract(table, l_fat(), obj, index_list(0)))
+
+    val data = fresh_reg(e)
+
+    emit(e, InExtract(data, l_fat(), obj, index_list(1)))
+
+    var arg_vals: Buf[IrArg] = buf()
+
+    for i in 0..<args.len()
+        arg_value(e, args.at(i), &arg_vals)
+
+    val fn = vtable_entry(e, table, slot)
+
+    var all: Buf[IrArg] = buf()
+
+    all.push(ir_arg(LPtr, data))
+
+    for i in 0..<arg_vals.len()
+        all.push(arg_vals.at(i))
+
+    gen_sysl_call(e, fn, all, ty)
+end gen_vcall
+
+// The function one slot of a table holds, loaded. The indexing type has **no** entries in it: a table
+// is as long as its trait and a call site knows only which slot it wants.
+vtable_entry(e: *Emit, table: Val, slot: int) -> Val
+    val entry = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(1))))
+    idx.push(ir_arg(word_lty(e), VInt(from_int(long(slot)))))
+    emit(e, InGep(entry, vtable_lty(e), table, idx))
+
+    val fn = fresh_reg(e)
+
+    emit(e, InLoad(fn, LPtr, entry, AccPlain, None))
+    fn
+end vtable_entry
+
+// The shape a call site reaches a slot through: the identity word and the slots after it.
+vtable_lty(e: *Emit) -> LType
+    var fields: Buf[LType] = buf()
+
+    fields.push(word_lty(e))
+    fields.push(LArr(0, LPtr))
+    LStruct(fields)
+end vtable_lty

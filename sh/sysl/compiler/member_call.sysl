@@ -346,7 +346,7 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Typ
                 ts.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
 
     cx.an.uses(name)
-    TExpr(span, TCall(name, ts, sig.unwrap().ret, false))
+    recheck_after(cx, span, ts.at(0), TExpr(span, TCall(name, ts, sig.unwrap().ret, false)))
 end call_generic_member
 
 // The call itself, once the member is known: the receiver in the mode its `self` asked for, the
@@ -399,8 +399,24 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
                 ts.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
 
     cx.an.uses(fname)
-    TExpr(span, TCall(fname, ts, sig.unwrap().ret, false))
+    recheck_after(cx, span, ts.at(0), TExpr(span, TCall(fname, ts, sig.unwrap().ret, false)))
 end member_dispatch
+
+// Re-checks, after a call, every invariant the receiver's place lies below.
+//
+// **A `*self` method reached through a field -- `o.a.bump()` -- is the one severed place the
+// language still has**, since there are no parameter modes and so no other way to hand a callee
+// somewhere to write without writing `&`. What makes it recoverable is that the **call site** still
+// knows the whole place: the receiver is `o.a`, `o` is right there, and the clause can be re-run the
+// moment the call returns. So the alias is allowed and the promise is kept at the boundary instead
+// of inside.
+//
+// Wrapping is by the same fold a write uses, so where a place lies below more than one struct the
+// innermost clause is the one that fires first.
+private recheck_after(cx: &Analyzer, span: Span, recv_arg: TExpr, call: TExpr) -> TExpr =
+    *recv_arg.kind match
+        TAddrOf(place, _) -> rechecked(cx, span, place, call)
+        _ -> call
 
 // Which written argument fills which of a member's parameters. The receiver is not among them, so
 // this is the free function's rule read one slot in.

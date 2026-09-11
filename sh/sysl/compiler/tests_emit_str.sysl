@@ -1,0 +1,1148 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a `string`, a view, a method table, a sink, a `?` and an invariant become.
+//
+// **Every LLVM text here was read out of the reference compiler**, by handing the installed `sysl`
+// the same source and quoting `emit-llvm` -- never composed from the rule.
+//
+// **Each program is lowered beside the library and pruned**, which is what the driver does: the
+// forms below reach the library's own printing and its `Result`, and a body the reference kept and
+// this one dropped is exactly the kind of difference worth a test. So each program carries a `main`
+// that reaches the function under test.
+
+private var str_library_cache: Buf[Program] = buf()
+private var str_library_read: bool = false
+
+private str_library() -> Buf[Program]
+    if str_library_read then return str_library_cache
+
+    str_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> str_library_cache = units
+
+    str_library_cache
+end str_library
+
+private no_str_library() -> bool
+    if str_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end no_str_library
+
+// One source lowered the way the driver lowers it -- analyzed beside the library, checked, pruned --
+// and the LLVM text of the function named. A body this compiler could not finish answers with the
+// form it reached, so a failure says why rather than only that.
+private str_lowered(text: string, symbol: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = str_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, done.main_module)
+
+    var own: Buf[string] = buf()
+
+    own.push(module_written(parsed.program))
+
+    val promotions = post_analysis_checks(done.an, whole, own)
+    val kept = prune(strip_tests(whole), own)
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+    val texts = func_texts(ir_print_module(lowered.0))
+
+    for i in 0..<texts.len()
+        if texts.at(i).0 == symbol then return texts.at(i).1
+
+    for i in 0..<lowered.1.len()
+        if llvm_safe(lowered.1.at(i).0) == symbol then
+            return s"not lowered: ${lowered.1.at(i).1}"
+
+    s"no definition of '$symbol'"
+end str_lowered
+
+// What the same source is refused with, which is what an error path is proved against.
+private str_refusal(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = str_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if done.reported.is_empty() then return ""
+
+    done.reported.at(0).diag.message
+end str_refusal
+
+@test("a string literal is the owner nothing frees, the bytes, and how many there are")
+a_literal_is_three_words()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "lit() -> string = \"hi\"\n" +
+                  "main() = prints(lit())\n",
+              "lit"),
+              "define { ptr, ptr, i64 } @lit() {\n" +
+              "entry:\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } { ptr null, ptr @.str1, i64 2 }, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  ret { ptr, ptr, i64 } { ptr null, ptr @.str1, i64 2 }\n" +
+              "}\n")
+end a_literal_is_three_words
+
+@test("concatenation allocates a buffer, copies both halves in, and owns what comes back")
+two_strings_join_into_a_fresh_one()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "join(a: string, b: string) -> string = a + b\n" +
+                  "main() = prints(join(\"a\", \"b\"))\n",
+              "join"),
+              "define { ptr, ptr, i64 } @join({ ptr, ptr, i64 } %a.param, { ptr, ptr, i64 } %b.param) {\n" +
+              "entry:\n" +
+              "  %a.addr = alloca { ptr, ptr, i64 }\n" +
+              "  %b.addr = alloca { ptr, ptr, i64 }\n" +
+              "  store { ptr, ptr, i64 } %a.param, ptr %a.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %a.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  store { ptr, ptr, i64 } %b.param, ptr %b.addr\n" +
+              "  %t2 = extractvalue { ptr, ptr, i64 } %b.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t2)\n" +
+              "  %t3 = load { ptr, ptr, i64 }, ptr %a.addr\n" +
+              "  %t4 = load { ptr, ptr, i64 }, ptr %b.addr\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t3, 1\n" +
+              "  %t6 = extractvalue { ptr, ptr, i64 } %t3, 2\n" +
+              "  %t7 = extractvalue { ptr, ptr, i64 } %t4, 1\n" +
+              "  %t8 = extractvalue { ptr, ptr, i64 } %t4, 2\n" +
+              "  %t9 = call { ptr, ptr, i64 } @sysl.str.concat(ptr %t5, i64 %t6, ptr %t7, i64 %t8)\n" +
+              "  %t10 = extractvalue { ptr, ptr, i64 } %t9, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t10)\n" +
+              "  %t11 = extractvalue { ptr, ptr, i64 } %t9, 0\n" +
+              "  call void @arc.release_maybe(ptr %t11)\n" +
+              "  %t12 = load { ptr, ptr, i64 }, ptr %b.addr\n" +
+              "  %t13 = extractvalue { ptr, ptr, i64 } %t12, 0\n" +
+              "  call void @arc.release_maybe(ptr %t13)\n" +
+              "  %t14 = load { ptr, ptr, i64 }, ptr %a.addr\n" +
+              "  %t15 = extractvalue { ptr, ptr, i64 } %t14, 0\n" +
+              "  call void @arc.release_maybe(ptr %t15)\n" +
+              "  ret { ptr, ptr, i64 } %t9\n" +
+              "}\n")
+end two_strings_join_into_a_fresh_one
+
+@test("a compound assignment on a string is the same join, stored back over what was there")
+a_string_grows_in_place()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "grow(a: string) -> string\n" +
+                  "    var acc = a\n" +
+                  "\n" +
+                  "    acc += \"x\"\n" +
+                  "    acc\n" +
+                  "main() = prints(grow(\"a\"))\n",
+              "grow"),
+              "define { ptr, ptr, i64 } @grow({ ptr, ptr, i64 } %a.param) {\n" +
+              "entry:\n" +
+              "  %a.addr = alloca { ptr, ptr, i64 }\n" +
+              "  %acc.addr = alloca { ptr, ptr, i64 }\n" +
+              "  store { ptr, ptr, i64 } %a.param, ptr %a.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %a.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  %t2 = load { ptr, ptr, i64 }, ptr %a.addr\n" +
+              "  %t3 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t3)\n" +
+              "  store { ptr, ptr, i64 } %t2, ptr %acc.addr\n" +
+              "  %t4 = load { ptr, ptr, i64 }, ptr %acc.addr\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t4, 1\n" +
+              "  %t6 = extractvalue { ptr, ptr, i64 } %t4, 2\n" +
+              "  %t7 = extractvalue { ptr, ptr, i64 } { ptr null, ptr @.str1, i64 1 }, 1\n" +
+              "  %t8 = extractvalue { ptr, ptr, i64 } { ptr null, ptr @.str1, i64 1 }, 2\n" +
+              "  %t9 = call { ptr, ptr, i64 } @sysl.str.concat(ptr %t5, i64 %t6, ptr %t7, i64 %t8)\n" +
+              "  %t10 = extractvalue { ptr, ptr, i64 } %t9, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t10)\n" +
+              "  store { ptr, ptr, i64 } %t9, ptr %acc.addr\n" +
+              "  %t11 = extractvalue { ptr, ptr, i64 } %t4, 0\n" +
+              "  call void @arc.release_maybe(ptr %t11)\n" +
+              "  %t12 = extractvalue { ptr, ptr, i64 } %t9, 0\n" +
+              "  call void @arc.release_maybe(ptr %t12)\n" +
+              "  %t13 = load { ptr, ptr, i64 }, ptr %acc.addr\n" +
+              "  %t14 = extractvalue { ptr, ptr, i64 } %t13, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t14)\n" +
+              "  %t15 = load { ptr, ptr, i64 }, ptr %acc.addr\n" +
+              "  %t16 = extractvalue { ptr, ptr, i64 } %t15, 0\n" +
+              "  call void @arc.release_maybe(ptr %t16)\n" +
+              "  %t17 = load { ptr, ptr, i64 }, ptr %a.addr\n" +
+              "  %t18 = extractvalue { ptr, ptr, i64 } %t17, 0\n" +
+              "  call void @arc.release_maybe(ptr %t18)\n" +
+              "  ret { ptr, ptr, i64 } %t13\n" +
+              "}\n")
+end a_string_grows_in_place
+
+@test("equality on strings is one call and an icmp against its answer")
+two_strings_compare_by_their_bytes()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "same(a: string, b: string) -> bool = a == b\n" +
+                  "main() = print(same(\"a\", \"b\"))\n",
+              "same"),
+              "define zeroext i1 @same({ ptr, ptr, i64 } %a.param, { ptr, ptr, i64 } %b.param) {\n" +
+              "entry:\n" +
+              "  %a.addr = alloca { ptr, ptr, i64 }\n" +
+              "  %b.addr = alloca { ptr, ptr, i64 }\n" +
+              "  store { ptr, ptr, i64 } %a.param, ptr %a.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %a.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  store { ptr, ptr, i64 } %b.param, ptr %b.addr\n" +
+              "  %t2 = extractvalue { ptr, ptr, i64 } %b.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t2)\n" +
+              "  %t3 = load { ptr, ptr, i64 }, ptr %a.addr\n" +
+              "  %t4 = load { ptr, ptr, i64 }, ptr %b.addr\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t3, 1\n" +
+              "  %t6 = extractvalue { ptr, ptr, i64 } %t3, 2\n" +
+              "  %t7 = extractvalue { ptr, ptr, i64 } %t4, 1\n" +
+              "  %t8 = extractvalue { ptr, ptr, i64 } %t4, 2\n" +
+              "  %t9 = call i32 @sysl.str.cmp(ptr %t5, i64 %t6, ptr %t7, i64 %t8)\n" +
+              "  %t10 = icmp eq i32 %t9, 0\n" +
+              "  %t11 = load { ptr, ptr, i64 }, ptr %b.addr\n" +
+              "  %t12 = extractvalue { ptr, ptr, i64 } %t11, 0\n" +
+              "  call void @arc.release_maybe(ptr %t12)\n" +
+              "  %t13 = load { ptr, ptr, i64 }, ptr %a.addr\n" +
+              "  %t14 = extractvalue { ptr, ptr, i64 } %t13, 0\n" +
+              "  call void @arc.release_maybe(ptr %t14)\n" +
+              "  ret i1 %t10\n" +
+              "}\n")
+end two_strings_compare_by_their_bytes
+
+@test("an ordering comparison reads the same -1 / 0 / 1 a subtraction would")
+strings_order_by_their_bytes()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "order(a: string, b: string) -> bool = a < b\n" +
+                  "main() = print(order(\"a\", \"b\"))\n",
+              "order"),
+              "define zeroext i1 @order({ ptr, ptr, i64 } %a.param, { ptr, ptr, i64 } %b.param) {\n" +
+              "entry:\n" +
+              "  %a.addr = alloca { ptr, ptr, i64 }\n" +
+              "  %b.addr = alloca { ptr, ptr, i64 }\n" +
+              "  store { ptr, ptr, i64 } %a.param, ptr %a.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %a.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  store { ptr, ptr, i64 } %b.param, ptr %b.addr\n" +
+              "  %t2 = extractvalue { ptr, ptr, i64 } %b.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t2)\n" +
+              "  %t3 = load { ptr, ptr, i64 }, ptr %a.addr\n" +
+              "  %t4 = load { ptr, ptr, i64 }, ptr %b.addr\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t3, 1\n" +
+              "  %t6 = extractvalue { ptr, ptr, i64 } %t3, 2\n" +
+              "  %t7 = extractvalue { ptr, ptr, i64 } %t4, 1\n" +
+              "  %t8 = extractvalue { ptr, ptr, i64 } %t4, 2\n" +
+              "  %t9 = call i32 @sysl.str.cmp(ptr %t5, i64 %t6, ptr %t7, i64 %t8)\n" +
+              "  %t10 = icmp slt i32 %t9, 0\n" +
+              "  %t11 = load { ptr, ptr, i64 }, ptr %b.addr\n" +
+              "  %t12 = extractvalue { ptr, ptr, i64 } %t11, 0\n" +
+              "  call void @arc.release_maybe(ptr %t12)\n" +
+              "  %t13 = load { ptr, ptr, i64 }, ptr %a.addr\n" +
+              "  %t14 = extractvalue { ptr, ptr, i64 } %t13, 0\n" +
+              "  call void @arc.release_maybe(ptr %t14)\n" +
+              "  ret i1 %t10\n" +
+              "}\n")
+end strings_order_by_their_bytes
+
+@test("str of an integer widens to 64 bits and renders through one shared function")
+an_integer_renders_through_the_shared_renderer()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "si(n: int) -> string = str(n)\n" +
+                  "main() = prints(si(1))\n",
+              "si"),
+              "define { ptr, ptr, i64 } @si(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = sext i32 %t1 to i64\n" +
+              "  %t3 = call { ptr, ptr, i64 } @sysl.str.int(i64 %t2, i1 1)\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t3, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t4)\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t3, 0\n" +
+              "  call void @arc.release_maybe(ptr %t5)\n" +
+              "  ret { ptr, ptr, i64 } %t3\n" +
+              "}\n")
+end an_integer_renders_through_the_shared_renderer
+
+@test("str of an integer wider than 64 bits renders at that width rather than a clamped one")
+a_wide_integer_renders_at_its_own_width()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "sw(n: i128) -> string = str(n)\n" +
+                  "main() = prints(sw(1))\n",
+              "sw"),
+              "define { ptr, ptr, i64 } @sw(i128 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i128\n" +
+              "  store i128 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i128, ptr %n.addr\n" +
+              "  %t2 = call { ptr, ptr, i64 } @sysl.str.int128(i128 %t1, i1 1)\n" +
+              "  %t3 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t3)\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  call void @arc.release_maybe(ptr %t4)\n" +
+              "  ret { ptr, ptr, i64 } %t2\n" +
+              "}\n")
+end a_wide_integer_renders_at_its_own_width
+
+@test("str of a bool selects between two constants and allocates nothing")
+a_bool_renders_to_one_of_two_immortal_words()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "sb(b: bool) -> string = str(b)\n" +
+                  "main() = prints(sb(true))\n",
+              "sb"),
+              "define { ptr, ptr, i64 } @sb(i1 %b.param) {\n" +
+              "entry:\n" +
+              "  %b.addr = alloca i1\n" +
+              "  store i1 %b.param, ptr %b.addr\n" +
+              "  %t1 = load i1, ptr %b.addr\n" +
+              "  %t2 = select i1 %t1, ptr @.true, ptr @.false\n" +
+              "  %t3 = select i1 %t1, i64 4, i64 5\n" +
+              "  %t4 = insertvalue { ptr, ptr, i64 } undef, ptr null, 0\n" +
+              "  %t5 = insertvalue { ptr, ptr, i64 } %t4, ptr %t2, 1\n" +
+              "  %t6 = insertvalue { ptr, ptr, i64 } %t5, i64 %t3, 2\n" +
+              "  %t7 = extractvalue { ptr, ptr, i64 } %t6, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t7)\n" +
+              "  %t8 = extractvalue { ptr, ptr, i64 } %t6, 0\n" +
+              "  call void @arc.release_maybe(ptr %t8)\n" +
+              "  ret { ptr, ptr, i64 } %t6\n" +
+              "}\n")
+end a_bool_renders_to_one_of_two_immortal_words
+
+@test("str of a char lays the codepoint down and copies the bytes out")
+a_char_renders_as_its_utf8_bytes()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "sc(c: char) -> string = str(c)\n" +
+                  "main() = prints(sc('a'))\n",
+              "sc"),
+              "define { ptr, ptr, i64 } @sc(i32 %c.param) {\n" +
+              "entry:\n" +
+              "  %c.addr = alloca i32\n" +
+              "  store i32 %c.param, ptr %c.addr\n" +
+              "  %t1 = load i32, ptr %c.addr\n" +
+              "  %t2 = call { ptr, ptr, i64 } @sysl.str.char(i32 %t1)\n" +
+              "  %t3 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t3)\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  call void @arc.release_maybe(ptr %t4)\n" +
+              "  ret { ptr, ptr, i64 } %t2\n" +
+              "}\n")
+end a_char_renders_as_its_utf8_bytes
+
+@test("str of a float goes out through snprintf, which is what print uses too")
+a_float_renders_through_c()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "sf(f: f64) -> string = str(f)\n" +
+                  "main() = prints(sf(1.5))\n",
+              "sf"),
+              "define { ptr, ptr, i64 } @sf(double %f.param) {\n" +
+              "entry:\n" +
+              "  %f.addr = alloca double\n" +
+              "  store double %f.param, ptr %f.addr\n" +
+              "  %t1 = load double, ptr %f.addr\n" +
+              "  %t2 = call { ptr, ptr, i64 } @sysl.str.float(double %t1)\n" +
+              "  %t3 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t3)\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  call void @arc.release_maybe(ptr %t4)\n" +
+              "  ret { ptr, ptr, i64 } %t2\n" +
+              "}\n")
+end a_float_renders_through_c
+
+@test("format with an unsigned conversion widens as unsigned and prints through a %ll form")
+an_unsigned_specifier_reads_the_value_at_its_own_width()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "fx(n: u32) -> string = format(n, \"%x\")\n" +
+                  "main() = prints(fx(1))\n",
+              "fx"),
+              "define { ptr, ptr, i64 } @fx(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t2 = load i32, ptr %n.addr\n" +
+              "  %t3 = zext i32 %t2 to i64\n" +
+              "  %t1 = call { ptr, ptr, i64 } @sysl.str.fmt_i(ptr @.str1, i64 %t3)\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t1, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t4)\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t1, 0\n" +
+              "  call void @arc.release_maybe(ptr %t5)\n" +
+              "  ret { ptr, ptr, i64 } %t1\n" +
+              "}\n")
+end an_unsigned_specifier_reads_the_value_at_its_own_width
+
+@test("format of a string hands C a terminated copy so width and justification are C's")
+a_string_specifier_goes_through_a_nul_terminated_copy()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "fs(s: string) -> string = format(s, \"%-10s\")\n" +
+                  "main() = prints(fs(\"a\"))\n",
+              "fs"),
+              "define { ptr, ptr, i64 } @fs({ ptr, ptr, i64 } %s.param) {\n" +
+              "entry:\n" +
+              "  %s.addr = alloca { ptr, ptr, i64 }\n" +
+              "  store { ptr, ptr, i64 } %s.param, ptr %s.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %s.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  %t3 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t3, 1\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t3, 2\n" +
+              "  %t2 = call { ptr, ptr, i64 } @sysl.str.fmt_s(ptr @.str1, ptr %t4, i64 %t5)\n" +
+              "  %t6 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t6)\n" +
+              "  %t7 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  call void @arc.release_maybe(ptr %t7)\n" +
+              "  %t8 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t9 = extractvalue { ptr, ptr, i64 } %t8, 0\n" +
+              "  call void @arc.release_maybe(ptr %t9)\n" +
+              "  ret { ptr, ptr, i64 } %t2\n" +
+              "}\n")
+end a_string_specifier_goes_through_a_nul_terminated_copy
+
+@test("format of a float widens to double and hands the specifier straight over")
+a_float_specifier_passes_a_double()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "ff(f: f32) -> string = format(f, \"%.2f\")\n" +
+                  "main() = prints(ff(1.0))\n",
+              "ff"),
+              "define { ptr, ptr, i64 } @ff(float %f.param) {\n" +
+              "entry:\n" +
+              "  %f.addr = alloca float\n" +
+              "  store float %f.param, ptr %f.addr\n" +
+              "  %t2 = load float, ptr %f.addr\n" +
+              "  %t3 = fpext float %t2 to double\n" +
+              "  %t1 = call { ptr, ptr, i64 } @sysl.str.fmt_f(ptr @.str1, double %t3)\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t1, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t4)\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t1, 0\n" +
+              "  call void @arc.release_maybe(ptr %t5)\n" +
+              "  ret { ptr, ptr, i64 } %t1\n" +
+              "}\n")
+end a_float_specifier_passes_a_double
+
+@test("a []u8 read as a string copies the bytes, since a string that could change was never validated")
+bytes_taken_as_a_string_are_copied()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "from_utf8_unchecked(b: []const u8) -> string = str_cast(b)\n" +
+                  "main() = prints(from_utf8_unchecked(\"a\".bytes))\n",
+              "from_utf8_unchecked"),
+              "define { ptr, ptr, i64 } @from_utf8_unchecked({ ptr, ptr, i64 } %b.param) {\n" +
+              "entry:\n" +
+              "  %b.addr = alloca { ptr, ptr, i64 }\n" +
+              "  store { ptr, ptr, i64 } %b.param, ptr %b.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %b.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  %t2 = load { ptr, ptr, i64 }, ptr %b.addr\n" +
+              "  %t3 = extractvalue { ptr, ptr, i64 } %t2, 1\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t2, 2\n" +
+              "  %t5 = call { ptr, ptr, i64 } @sysl.str.from_bytes(ptr %t3, i64 %t4)\n" +
+              "  %t6 = extractvalue { ptr, ptr, i64 } %t5, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t6)\n" +
+              "  %t7 = extractvalue { ptr, ptr, i64 } %t5, 0\n" +
+              "  call void @arc.release_maybe(ptr %t7)\n" +
+              "  %t8 = load { ptr, ptr, i64 }, ptr %b.addr\n" +
+              "  %t9 = extractvalue { ptr, ptr, i64 } %t8, 0\n" +
+              "  call void @arc.release_maybe(ptr %t9)\n" +
+              "  ret { ptr, ptr, i64 } %t5\n" +
+              "}\n")
+end bytes_taken_as_a_string_are_copied
+
+@test("a substring is bounds-checked and then checked to start and end between characters")
+a_substring_checks_both_ends_fall_between_characters()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "sub(s: string) -> string = s[1..<3]\n" +
+                  "main() = prints(sub(\"abcd\"))\n",
+              "sub"),
+              "define { ptr, ptr, i64 } @sub({ ptr, ptr, i64 } %s.param) {\n" +
+              "entry:\n" +
+              "  %s.addr = alloca { ptr, ptr, i64 }\n" +
+              "  store { ptr, ptr, i64 } %s.param, ptr %s.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %s.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  %t2 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t3 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t2, 1\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t2, 2\n" +
+              "  %t6 = icmp ule i64 3, %t5\n" +
+              "  br i1 %t6, label %bounds.ok1, label %bounds.bad2\n" +
+              "bounds.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok1:\n" +
+              "  %t7 = icmp ule i64 1, 3\n" +
+              "  br i1 %t7, label %bounds.ok3, label %bounds.bad4\n" +
+              "bounds.bad4:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok3:\n" +
+              "  %t8 = call i1 @sysl.str.boundary(ptr %t4, i64 %t5, i64 1)\n" +
+              "  br i1 %t8, label %boundary.ok5, label %boundary.bad6\n" +
+              "boundary.bad6:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "boundary.ok5:\n" +
+              "  %t9 = call i1 @sysl.str.boundary(ptr %t4, i64 %t5, i64 3)\n" +
+              "  br i1 %t9, label %boundary.ok7, label %boundary.bad8\n" +
+              "boundary.bad8:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "boundary.ok7:\n" +
+              "  %t10 = getelementptr i8, ptr %t4, i64 1\n" +
+              "  %t11 = sub i64 3, 1\n" +
+              "  call void @arc.retain_maybe(ptr %t3)\n" +
+              "  %t12 = insertvalue { ptr, ptr, i64 } zeroinitializer, ptr %t3, 0\n" +
+              "  %t13 = insertvalue { ptr, ptr, i64 } %t12, ptr %t10, 1\n" +
+              "  %t14 = insertvalue { ptr, ptr, i64 } %t13, i64 %t11, 2\n" +
+              "  %t15 = extractvalue { ptr, ptr, i64 } %t14, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t15)\n" +
+              "  %t16 = extractvalue { ptr, ptr, i64 } %t14, 0\n" +
+              "  call void @arc.release_maybe(ptr %t16)\n" +
+              "  %t17 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t18 = extractvalue { ptr, ptr, i64 } %t17, 0\n" +
+              "  call void @arc.release_maybe(ptr %t18)\n" +
+              "  ret { ptr, ptr, i64 } %t14\n" +
+              "}\n")
+end a_substring_checks_both_ends_fall_between_characters
+
+@test("reading a string's bytes is nothing at all: the guarantee given up is the analyzer's business")
+a_strings_bytes_are_the_same_three_words()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "raw(s: string) -> []const u8 = s.bytes\n" +
+                  "main() = print(raw(\"ab\").len)\n",
+              "raw"),
+              "define { ptr, ptr, i64 } @raw({ ptr, ptr, i64 } %s.param) {\n" +
+              "entry:\n" +
+              "  %s.addr = alloca { ptr, ptr, i64 }\n" +
+              "  store { ptr, ptr, i64 } %s.param, ptr %s.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %s.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  %t2 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t3 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t3)\n" +
+              "  %t4 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t4, 0\n" +
+              "  call void @arc.release_maybe(ptr %t5)\n" +
+              "  ret { ptr, ptr, i64 } %t2\n" +
+              "}\n")
+end a_strings_bytes_are_the_same_three_words
+
+@test("a view of storage this frame holds counts against nothing, and the count call is still made")
+a_slice_of_a_frame_array_owns_nothing()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "part(xs: [4]int) -> usize = xs[1..<3].len\n" +
+                  "main() = print(part([1, 2, 3, 4]))\n",
+              "part"),
+              "define i64 @part([4 x i32] %xs.param) {\n" +
+              "entry:\n" +
+              "  %xs.addr = alloca [4 x i32]\n" +
+              "  store [4 x i32] %xs.param, ptr %xs.addr\n" +
+              "  %t1 = icmp ule i64 3, 4\n" +
+              "  br i1 %t1, label %bounds.ok1, label %bounds.bad2\n" +
+              "bounds.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok1:\n" +
+              "  %t2 = icmp ule i64 1, 3\n" +
+              "  br i1 %t2, label %bounds.ok3, label %bounds.bad4\n" +
+              "bounds.bad4:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok3:\n" +
+              "  %t3 = getelementptr i32, ptr %xs.addr, i64 1\n" +
+              "  %t4 = sub i64 3, 1\n" +
+              "  call void @arc.retain_maybe(ptr null)\n" +
+              "  %t5 = insertvalue { ptr, ptr, i64 } zeroinitializer, ptr null, 0\n" +
+              "  %t6 = insertvalue { ptr, ptr, i64 } %t5, ptr %t3, 1\n" +
+              "  %t7 = insertvalue { ptr, ptr, i64 } %t6, i64 %t4, 2\n" +
+              "  %t8 = extractvalue { ptr, ptr, i64 } %t7, 2\n" +
+              "  %t9 = extractvalue { ptr, ptr, i64 } %t7, 0\n" +
+              "  call void @arc.release_maybe(ptr %t9)\n" +
+              "  ret i64 %t8\n" +
+              "}\n")
+end a_slice_of_a_frame_array_owns_nothing
+
+@test("a view of a view keeps the owner and narrows the pointer and the length")
+a_slice_of_a_slice_narrows_and_shares_the_owner()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "part(xs: []const int, a: usize, b: usize) -> []const int = xs[a..<b]\n" +
+                  "main()\n" +
+                  "    val xs = [1, 2, 3]\n" +
+                  "\n" +
+                  "    print(part(xs[0..<3], 0, 1).len)\n",
+              "part"),
+              "define { ptr, ptr, i64 } @part({ ptr, ptr, i64 } %xs.param, i64 %a.param, i64 %b.param) {\n" +
+              "entry:\n" +
+              "  %xs.addr = alloca { ptr, ptr, i64 }\n" +
+              "  %a.addr = alloca i64\n" +
+              "  %b.addr = alloca i64\n" +
+              "  store { ptr, ptr, i64 } %xs.param, ptr %xs.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %xs.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  store i64 %a.param, ptr %a.addr\n" +
+              "  store i64 %b.param, ptr %b.addr\n" +
+              "  %t2 = load { ptr, ptr, i64 }, ptr %xs.addr\n" +
+              "  %t3 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t2, 1\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t2, 2\n" +
+              "  %t6 = load i64, ptr %a.addr\n" +
+              "  %t7 = load i64, ptr %b.addr\n" +
+              "  %t8 = icmp ule i64 %t7, %t5\n" +
+              "  br i1 %t8, label %bounds.ok1, label %bounds.bad2\n" +
+              "bounds.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok1:\n" +
+              "  %t9 = icmp ule i64 %t6, %t7\n" +
+              "  br i1 %t9, label %bounds.ok3, label %bounds.bad4\n" +
+              "bounds.bad4:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok3:\n" +
+              "  %t10 = getelementptr i32, ptr %t4, i64 %t6\n" +
+              "  %t11 = sub i64 %t7, %t6\n" +
+              "  call void @arc.retain_maybe(ptr %t3)\n" +
+              "  %t12 = insertvalue { ptr, ptr, i64 } zeroinitializer, ptr %t3, 0\n" +
+              "  %t13 = insertvalue { ptr, ptr, i64 } %t12, ptr %t10, 1\n" +
+              "  %t14 = insertvalue { ptr, ptr, i64 } %t13, i64 %t11, 2\n" +
+              "  %t15 = extractvalue { ptr, ptr, i64 } %t14, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t15)\n" +
+              "  %t16 = extractvalue { ptr, ptr, i64 } %t14, 0\n" +
+              "  call void @arc.release_maybe(ptr %t16)\n" +
+              "  %t17 = load { ptr, ptr, i64 }, ptr %xs.addr\n" +
+              "  %t18 = extractvalue { ptr, ptr, i64 } %t17, 0\n" +
+              "  call void @arc.release_maybe(ptr %t18)\n" +
+              "  ret { ptr, ptr, i64 } %t14\n" +
+              "}\n")
+end a_slice_of_a_slice_narrows_and_shares_the_owner
+
+@test("an inclusive high end is checked to be inside before one is added to it")
+an_inclusive_end_names_an_element_that_exists()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "part(xs: []const int, a: usize, b: usize) -> []const int = xs[a..b]\n" +
+                  "main()\n" +
+                  "    val xs = [1, 2, 3]\n" +
+                  "\n" +
+                  "    print(part(xs[0..<3], 0, 1).len)\n",
+              "part"),
+              "define { ptr, ptr, i64 } @part({ ptr, ptr, i64 } %xs.param, i64 %a.param, i64 %b.param) {\n" +
+              "entry:\n" +
+              "  %xs.addr = alloca { ptr, ptr, i64 }\n" +
+              "  %a.addr = alloca i64\n" +
+              "  %b.addr = alloca i64\n" +
+              "  store { ptr, ptr, i64 } %xs.param, ptr %xs.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %xs.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  store i64 %a.param, ptr %a.addr\n" +
+              "  store i64 %b.param, ptr %b.addr\n" +
+              "  %t2 = load { ptr, ptr, i64 }, ptr %xs.addr\n" +
+              "  %t3 = extractvalue { ptr, ptr, i64 } %t2, 0\n" +
+              "  %t4 = extractvalue { ptr, ptr, i64 } %t2, 1\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t2, 2\n" +
+              "  %t6 = load i64, ptr %a.addr\n" +
+              "  %t7 = load i64, ptr %b.addr\n" +
+              "  %t8 = icmp ult i64 %t7, %t5\n" +
+              "  br i1 %t8, label %bounds.ok1, label %bounds.bad2\n" +
+              "bounds.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok1:\n" +
+              "  %t9 = add i64 %t7, 1\n" +
+              "  %t10 = icmp ule i64 %t6, %t9\n" +
+              "  br i1 %t10, label %bounds.ok3, label %bounds.bad4\n" +
+              "bounds.bad4:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok3:\n" +
+              "  %t11 = getelementptr i32, ptr %t4, i64 %t6\n" +
+              "  %t12 = sub i64 %t9, %t6\n" +
+              "  call void @arc.retain_maybe(ptr %t3)\n" +
+              "  %t13 = insertvalue { ptr, ptr, i64 } zeroinitializer, ptr %t3, 0\n" +
+              "  %t14 = insertvalue { ptr, ptr, i64 } %t13, ptr %t11, 1\n" +
+              "  %t15 = insertvalue { ptr, ptr, i64 } %t14, i64 %t12, 2\n" +
+              "  %t16 = extractvalue { ptr, ptr, i64 } %t15, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t16)\n" +
+              "  %t17 = extractvalue { ptr, ptr, i64 } %t15, 0\n" +
+              "  call void @arc.release_maybe(ptr %t17)\n" +
+              "  %t18 = load { ptr, ptr, i64 }, ptr %xs.addr\n" +
+              "  %t19 = extractvalue { ptr, ptr, i64 } %t18, 0\n" +
+              "  call void @arc.release_maybe(ptr %t19)\n" +
+              "  ret { ptr, ptr, i64 } %t15\n" +
+              "}\n")
+end an_inclusive_end_names_an_element_that_exists
+
+@test("a call on a trait object reads its table, loads the slot, and puts the data word in front")
+a_call_through_a_table_loads_the_slot_and_passes_the_data_word()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "trait Shape\n" +
+                  "    area(self) -> int\n" +
+                  "    name(*self) -> int\n" +
+                  "\n" +
+                  "struct Sq\n" +
+                  "    n: int\n" +
+                  "\n" +
+                  "impl Shape for Sq\n" +
+                  "    area(self) -> int = self.n * self.n\n" +
+                  "    name(*self) -> int = self.n\n" +
+                  "\n" +
+                  "use(s: *Shape) -> int = s.area() + s.name()\n" +
+                  "main()\n" +
+                  "    var q = Sq(3)\n" +
+                  "\n" +
+                  "    print(use(&q))\n",
+              "use"),
+              "define i32 @use({ ptr, ptr } %s.param) {\n" +
+              "entry:\n" +
+              "  %s.addr = alloca { ptr, ptr }\n" +
+              "  store { ptr, ptr } %s.param, ptr %s.addr\n" +
+              "  %t1 = load { ptr, ptr }, ptr %s.addr\n" +
+              "  %t2 = extractvalue { ptr, ptr } %t1, 0\n" +
+              "  %t3 = extractvalue { ptr, ptr } %t1, 1\n" +
+              "  %t4 = getelementptr { i64, [0 x ptr] }, ptr %t2, i32 0, i32 1, i64 0\n" +
+              "  %t5 = load ptr, ptr %t4\n" +
+              "  %t6 = call i32 %t5(ptr %t3)\n" +
+              "  %t7 = load { ptr, ptr }, ptr %s.addr\n" +
+              "  %t8 = extractvalue { ptr, ptr } %t7, 0\n" +
+              "  %t9 = extractvalue { ptr, ptr } %t7, 1\n" +
+              "  %t10 = getelementptr { i64, [0 x ptr] }, ptr %t8, i32 0, i32 1, i64 1\n" +
+              "  %t11 = load ptr, ptr %t10\n" +
+              "  %t12 = call i32 %t11(ptr %t9)\n" +
+              "  %t13 = add i32 %t6, %t12\n" +
+              "  ret i32 %t13\n" +
+              "}\n")
+end a_call_through_a_table_loads_the_slot_and_passes_the_data_word
+
+@test("a slot whose implementation wants its receiver by value gets an adapter that loads it")
+a_by_value_receiver_reaches_the_implementation_through_an_adapter()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "trait Shape\n" +
+                  "    area(self) -> int\n" +
+                  "    name(*self) -> int\n" +
+                  "\n" +
+                  "struct Sq\n" +
+                  "    n: int\n" +
+                  "\n" +
+                  "impl Shape for Sq\n" +
+                  "    area(self) -> int = self.n * self.n\n" +
+                  "    name(*self) -> int = self.n\n" +
+                  "\n" +
+                  "use(s: *Shape) -> int = s.area() + s.name()\n" +
+                  "main()\n" +
+                  "    var q = Sq(3)\n" +
+                  "\n" +
+                  "    print(use(&q))\n",
+              "vt.adapt.Sq.area"),
+              "define private i32 @vt.adapt.Sq.area(ptr %d) {\n" +
+              "entry:\n" +
+              "  %t1 = load %struct.Sq, ptr %d\n" +
+              "  %t2 = call i32 @Sq.area(%struct.Sq %t1)\n" +
+              "  ret i32 %t2\n" +
+              "}\n")
+end a_by_value_receiver_reaches_the_implementation_through_an_adapter
+
+@test("str of a type with a Display writes into a growable buffer and finishes with its bytes")
+a_value_renders_into_a_zeroed_stack_slot()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "struct Pt\n" +
+                  "    x: int\n" +
+                  "    y: int\n" +
+                  "\n" +
+                  "impl Display for Pt\n" +
+                  "    display(self, out: *Writer, spec: FormatSpec)\n" +
+                  "        out.write(\"pt\".bytes)\n" +
+                  "\n" +
+                  "shown(p: Pt) -> string = str(p)\n" +
+                  "main() = prints(shown(Pt(1, 2)))\n",
+              "shown"),
+              "define { ptr, ptr, i64 } @shown(%struct.Pt %p.param) {\n" +
+              "entry:\n" +
+              "  %p.addr = alloca %struct.Pt\n" +
+              "  %t5 = alloca { ptr, i64, i64 }\n" +
+              "  store %struct.Pt %p.param, ptr %p.addr\n" +
+              "  %t1 = load %struct.Pt, ptr %p.addr\n" +
+              "  %t2 = insertvalue %struct.sysl\u{24}FormatSpec undef, i32 0, 0\n" +
+              "  %t3 = insertvalue %struct.sysl\u{24}FormatSpec %t2, i32 -1, 1\n" +
+              "  %t4 = insertvalue %struct.sysl\u{24}FormatSpec %t3, i1 0, 2\n" +
+              "  store { ptr, i64, i64 } zeroinitializer, ptr %t5\n" +
+              "  %t6 = insertvalue { ptr, ptr } undef, ptr @sysl.vt.buf, 0\n" +
+              "  %t7 = insertvalue { ptr, ptr } %t6, ptr %t5, 1\n" +
+              "  call void @Pt.display(%struct.Pt %t1, { ptr, ptr } %t7, %struct.sysl\u{24}FormatSpec %t4)\n" +
+              "  %t8 = call { ptr, ptr, i64 } @sysl.w.buf.finish(ptr %t5)\n" +
+              "  %t9 = extractvalue { ptr, ptr, i64 } %t8, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t9)\n" +
+              "  %t10 = extractvalue { ptr, ptr, i64 } %t8, 0\n" +
+              "  call void @arc.release_maybe(ptr %t10)\n" +
+              "  ret { ptr, ptr, i64 } %t8\n" +
+              "}\n")
+end a_value_renders_into_a_zeroed_stack_slot
+
+@test("on failure a '?' returns at once with the error re-wrapped in this function's own result")
+a_question_mark_returns_the_failure_rewrapped()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "half(n: int) -> Result[int, string]\n" +
+                  "    if n % 2 == 0 then Ok(n / 2) else Err(\"odd\")\n" +
+                  "\n" +
+                  "use(n: int) -> Result[int, string]\n" +
+                  "    val v = half(n)?\n" +
+                  "\n" +
+                  "    Ok(v + 1)\n" +
+                  "main() = print(use(4).unwrap())\n",
+              "use"),
+              "define %enum.sysl\u{24}Result.int.string @use(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %v.addr = alloca i32\n" +
+              "  %t5 = alloca %enum.sysl\u{24}Result.int.string\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = call %enum.sysl\u{24}Result.int.string @half(i32 %t1)\n" +
+              "  %t3 = extractvalue %enum.sysl\u{24}Result.int.string %t2, 0\n" +
+              "  %t4 = icmp eq i32 %t3, 0\n" +
+              "  br i1 %t4, label %try.ok1, label %try.fail2\n" +
+              "try.fail2:\n" +
+              "  store %enum.sysl\u{24}Result.int.string %t2, ptr %t5\n" +
+              "  %t6 = getelementptr %enum.sysl\u{24}Result.int.string, ptr %t5, i32 0, i32 1\n" +
+              "  %t7 = load %sysl\u{24}Result.int.string.Err, ptr %t6\n" +
+              "  %t8 = extractvalue %sysl\u{24}Result.int.string.Err %t7, 0\n" +
+              "  %t9 = insertvalue %sysl\u{24}Result.int.string.Err undef, { ptr, ptr, i64 } %t8, 0\n" +
+              "  store i32 1, ptr %t5\n" +
+              "  %t10 = getelementptr %enum.sysl\u{24}Result.int.string, ptr %t5, i32 0, i32 1\n" +
+              "  store %sysl\u{24}Result.int.string.Err %t9, ptr %t10\n" +
+              "  %t11 = load %enum.sysl\u{24}Result.int.string, ptr %t5\n" +
+              "  call void @arc.copy.sysl\u{24}Result.int.string(%enum.sysl\u{24}Result.int.string %t11)\n" +
+              "  call void @arc.dispose.sysl\u{24}Result.int.string(%enum.sysl\u{24}Result.int.string %t2)\n" +
+              "  ret %enum.sysl\u{24}Result.int.string %t11\n" +
+              "try.ok1:\n" +
+              "  store %enum.sysl\u{24}Result.int.string %t2, ptr %t5\n" +
+              "  %t12 = getelementptr %enum.sysl\u{24}Result.int.string, ptr %t5, i32 0, i32 1\n" +
+              "  %t13 = load %sysl\u{24}Result.int.string.Ok, ptr %t12\n" +
+              "  %t14 = extractvalue %sysl\u{24}Result.int.string.Ok %t13, 0\n" +
+              "  store i32 %t14, ptr %v.addr\n" +
+              "  call void @arc.dispose.sysl\u{24}Result.int.string(%enum.sysl\u{24}Result.int.string %t2)\n" +
+              "  %t15 = load i32, ptr %v.addr\n" +
+              "  %t16 = add i32 %t15, 1\n" +
+              "  %t17 = insertvalue %sysl\u{24}Result.int.string.Ok undef, i32 %t16, 0\n" +
+              "  store i32 0, ptr %t5\n" +
+              "  %t18 = getelementptr %enum.sysl\u{24}Result.int.string, ptr %t5, i32 0, i32 1\n" +
+              "  store %sysl\u{24}Result.int.string.Ok %t17, ptr %t18\n" +
+              "  %t19 = load %enum.sysl\u{24}Result.int.string, ptr %t5\n" +
+              "  call void @arc.copy.sysl\u{24}Result.int.string(%enum.sysl\u{24}Result.int.string %t19)\n" +
+              "  ret %enum.sysl\u{24}Result.int.string %t19\n" +
+              "}\n")
+end a_question_mark_returns_the_failure_rewrapped
+
+@test("where the two error types differ a '?' calls the conversion and retains nothing after it")
+a_converted_failure_arrives_owned()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "struct Mine\n" +
+                  "    n: int\n" +
+                  "\n" +
+                  "impl From[string] for Mine\n" +
+                  "    from(s: string) -> Mine = Mine(int(s.len))\n" +
+                  "\n" +
+                  "half(n: int) -> Result[int, string]\n" +
+                  "    if n % 2 == 0 then Ok(n / 2) else Err(\"odd\")\n" +
+                  "\n" +
+                  "widen(n: int) -> Result[int, Mine]\n" +
+                  "    val v = half(n)?\n" +
+                  "\n" +
+                  "    Ok(v)\n" +
+                  "main() = print(widen(4).unwrap())\n",
+              "widen"),
+              "define %enum.sysl\u{24}Result.int.Mine @widen(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %v.addr = alloca i32\n" +
+              "  %t5 = alloca %enum.sysl\u{24}Result.int.string\n" +
+              "  %t11 = alloca %enum.sysl\u{24}Result.int.Mine\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = call %enum.sysl\u{24}Result.int.string @half(i32 %t1)\n" +
+              "  %t3 = extractvalue %enum.sysl\u{24}Result.int.string %t2, 0\n" +
+              "  %t4 = icmp eq i32 %t3, 0\n" +
+              "  br i1 %t4, label %try.ok1, label %try.fail2\n" +
+              "try.fail2:\n" +
+              "  store %enum.sysl\u{24}Result.int.string %t2, ptr %t5\n" +
+              "  %t6 = getelementptr %enum.sysl\u{24}Result.int.string, ptr %t5, i32 0, i32 1\n" +
+              "  %t7 = load %sysl\u{24}Result.int.string.Err, ptr %t6\n" +
+              "  %t8 = extractvalue %sysl\u{24}Result.int.string.Err %t7, 0\n" +
+              "  %t9 = call %struct.Mine @Mine.from({ ptr, ptr, i64 } %t8)\n" +
+              "  %t10 = insertvalue %sysl\u{24}Result.int.Mine.Err undef, %struct.Mine %t9, 0\n" +
+              "  store i32 1, ptr %t11\n" +
+              "  %t12 = getelementptr %enum.sysl\u{24}Result.int.Mine, ptr %t11, i32 0, i32 1\n" +
+              "  store %sysl\u{24}Result.int.Mine.Err %t10, ptr %t12\n" +
+              "  %t13 = load %enum.sysl\u{24}Result.int.Mine, ptr %t11\n" +
+              "  call void @arc.dispose.sysl\u{24}Result.int.string(%enum.sysl\u{24}Result.int.string %t2)\n" +
+              "  ret %enum.sysl\u{24}Result.int.Mine %t13\n" +
+              "try.ok1:\n" +
+              "  store %enum.sysl\u{24}Result.int.string %t2, ptr %t5\n" +
+              "  %t14 = getelementptr %enum.sysl\u{24}Result.int.string, ptr %t5, i32 0, i32 1\n" +
+              "  %t15 = load %sysl\u{24}Result.int.string.Ok, ptr %t14\n" +
+              "  %t16 = extractvalue %sysl\u{24}Result.int.string.Ok %t15, 0\n" +
+              "  store i32 %t16, ptr %v.addr\n" +
+              "  call void @arc.dispose.sysl\u{24}Result.int.string(%enum.sysl\u{24}Result.int.string %t2)\n" +
+              "  %t17 = load i32, ptr %v.addr\n" +
+              "  %t18 = insertvalue %sysl\u{24}Result.int.Mine.Ok undef, i32 %t17, 0\n" +
+              "  store i32 0, ptr %t11\n" +
+              "  %t19 = getelementptr %enum.sysl\u{24}Result.int.Mine, ptr %t11, i32 0, i32 1\n" +
+              "  store %sysl\u{24}Result.int.Mine.Ok %t18, ptr %t19\n" +
+              "  %t20 = load %enum.sysl\u{24}Result.int.Mine, ptr %t11\n" +
+              "  ret %enum.sysl\u{24}Result.int.Mine %t20\n" +
+              "}\n")
+end a_converted_failure_arrives_owned
+
+@test("a '?' on an Option returns None at once rather than a re-wrapped payload")
+an_option_question_mark_returns_none()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "pick(n: int) -> Option[int]\n" +
+                  "    if n > 0 then Some(n) else None\n" +
+                  "\n" +
+                  "chain(n: int) -> Option[int]\n" +
+                  "    val v = pick(n)?\n" +
+                  "\n" +
+                  "    Some(v + 1)\n" +
+                  "main() = print(chain(1).unwrap())\n",
+              "chain"),
+              "define %enum.sysl\u{24}Option.int @chain(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %v.addr = alloca i32\n" +
+              "  %t6 = alloca %enum.sysl\u{24}Option.int\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = call %enum.sysl\u{24}Option.int @pick(i32 %t1)\n" +
+              "  %t3 = extractvalue %enum.sysl\u{24}Option.int %t2, 0\n" +
+              "  %t4 = icmp eq i32 %t3, 0\n" +
+              "  br i1 %t4, label %try.ok1, label %try.fail2\n" +
+              "try.fail2:\n" +
+              "  %t5 = insertvalue %enum.sysl\u{24}Option.int undef, i32 1, 0\n" +
+              "  ret %enum.sysl\u{24}Option.int %t5\n" +
+              "try.ok1:\n" +
+              "  store %enum.sysl\u{24}Option.int %t2, ptr %t6\n" +
+              "  %t7 = getelementptr %enum.sysl\u{24}Option.int, ptr %t6, i32 0, i32 1\n" +
+              "  %t8 = load %sysl\u{24}Option.int.Some, ptr %t7\n" +
+              "  %t9 = extractvalue %sysl\u{24}Option.int.Some %t8, 0\n" +
+              "  store i32 %t9, ptr %v.addr\n" +
+              "  %t10 = load i32, ptr %v.addr\n" +
+              "  %t11 = add i32 %t10, 1\n" +
+              "  %t12 = insertvalue %sysl\u{24}Option.int.Some undef, i32 %t11, 0\n" +
+              "  store i32 0, ptr %t6\n" +
+              "  %t13 = getelementptr %enum.sysl\u{24}Option.int, ptr %t6, i32 0, i32 1\n" +
+              "  store %sysl\u{24}Option.int.Some %t12, ptr %t13\n" +
+              "  %t14 = load %enum.sysl\u{24}Option.int, ptr %t6\n" +
+              "  ret %enum.sysl\u{24}Option.int %t14\n" +
+              "}\n")
+end an_option_question_mark_returns_none
+
+@test("a write that could break a struct's invariant re-reads the struct and traps on false")
+a_write_through_a_reference_rechecks_the_invariant()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "struct Range\n" +
+                  "    lo: int\n" +
+                  "    hi: int\n" +
+                  "\n" +
+                  "    invariant lo <= hi\n" +
+                  "\n" +
+                  "bump(r: *Range)\n" +
+                  "    r.hi += 1\n" +
+                  "main()\n" +
+                  "    var r = Range(1, 2)\n" +
+                  "\n" +
+                  "    bump(&r)\n" +
+                  "    print(r.hi)\n",
+              "bump"),
+              "define void @bump(ptr %r.param) {\n" +
+              "entry:\n" +
+              "  %r.addr = alloca ptr\n" +
+              "  store ptr %r.param, ptr %r.addr\n" +
+              "  %t1 = load ptr, ptr %r.addr\n" +
+              "  %t2 = getelementptr %struct.Range, ptr %t1, i32 0, i32 1\n" +
+              "  %t3 = load i32, ptr %t2\n" +
+              "  %t4 = add i32 %t3, 1\n" +
+              "  store i32 %t4, ptr %t2\n" +
+              "  %t5 = load ptr, ptr %r.addr\n" +
+              "  %t6 = load %struct.Range, ptr %t5\n" +
+              "  %t7 = extractvalue %struct.Range %t6, 0\n" +
+              "  %t8 = extractvalue %struct.Range %t6, 1\n" +
+              "  %t9 = call i1 @Range\u{24}inv(i32 %t7, i32 %t8)\n" +
+              "  br i1 %t9, label %invariant.ok1, label %invariant.bad2\n" +
+              "invariant.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "invariant.ok1:\n" +
+              "  ret void\n" +
+              "}\n")
+end a_write_through_a_reference_rechecks_the_invariant
+
+
+// -- what a destructor is kept by -------------------------------------------------------------------
+
+@test("a destructor is a root: nothing in the program names it, and the release hook calls it")
+a_destructor_survives_pruning()
+    if no_str_library() then return
+
+    assert_eq(str_lowered(
+                  "struct Env\n" +
+                  "    n: int\n" +
+                  "\n" +
+                  "impl Drop for Env\n" +
+                  "    drop(self)\n" +
+                  "        print(\"env closed\")\n" +
+                  "\n" +
+                  "main()\n" +
+                  "    var e: &Env = Env(7)\n" +
+                  "\n" +
+                  "    print(e.n)\n",
+              "Env.drop"),
+              "define void @Env.drop(%struct.Env %self.param) {\n" +
+              "entry:\n" +
+              "  %self.addr = alloca %struct.Env\n" +
+              "  store %struct.Env %self.param, ptr %self.addr\n" +
+              "  call void @sysl$prints({ ptr, ptr, i64 } { ptr null, ptr @.str1, i64 10 })\n" +
+              "  call void @sysl$printc(i32 10)\n" +
+              "  ret void\n" +
+              "}\n")
+end a_destructor_survives_pruning
+
+// -- what a `?` and a rendering refuse ---------------------------------------------------------------
+
+@test("a '?' across two error types with no conversion names the block that would join them")
+a_try_with_no_conversion_names_the_impl()
+    if no_str_library() then return
+
+    assert_eq(str_refusal(
+                  "half(n: int) -> Result[int, string]\n" +
+                  "    if n % 2 == 0 then Ok(n / 2) else Err(\"odd\")\n" +
+                  "\n" +
+                  "widen(n: int) -> Result[int, bool]\n" +
+                  "    val v = half(n)?\n" +
+                  "\n" +
+                  "    Ok(v)\n" +
+                  "\n" +
+                  "main() = print(widen(4).unwrap())\n"),
+              "'?' propagates a string error, but this function returns bool — a '?' converts " +
+              "through 'sysl.From', so 'impl From[string] for bool' is what joins the two layers")
+end a_try_with_no_conversion_names_the_impl
+
+@test("printing a type with no 'Display' names the block to write")
+printing_without_a_display_names_the_impl()
+    if no_str_library() then return
+
+    assert_eq(str_refusal("struct Pt\n    x: int\n\nmain() = print(Pt(1))\n"),
+              "cannot print a Pt value — write an 'impl sysl.Display for Pt' to say how it renders")
+end printing_without_a_display_names_the_impl
+
+@test("a generic type's advice names the block's own parameters, not this value's arguments")
+a_generic_display_advice_names_its_parameters()
+    if no_str_library() then return
+
+    assert_eq(str_refusal("struct Box[T]\n    v: T\n\nmain() = print(Box(1))\n"),
+              "cannot print a Box[int] value — write an 'impl[T] sysl.Display for Box[T]' to say " +
+              "how it renders")
+end a_generic_display_advice_names_its_parameters
+
+@test("making a string of a type with no 'Display' names the same block")
+str_without_a_display_names_the_impl()
+    if no_str_library() then return
+
+    assert_eq(str_refusal("struct Pt\n    x: int\n\nmain() = prints(str(Pt(1)))\n"),
+              "cannot make a string of a Pt value — write an 'impl sysl.Display for Pt' to say " +
+              "how it renders")
+end str_without_a_display_names_the_impl
+
+@test("an object whose trait does not require 'Display' names the trait clause to widen")
+an_object_without_display_names_the_bound()
+    if no_str_library() then return
+
+    assert_eq(str_refusal(
+                  "trait Shape\n" +
+                  "    area(self) -> int\n" +
+                  "\n" +
+                  "struct Sq\n" +
+                  "    n: int\n" +
+                  "\n" +
+                  "impl Shape for Sq\n" +
+                  "    area(self) -> int = self.n\n" +
+                  "\n" +
+                  "show(s: *Shape) = print(s)\n" +
+                  "\n" +
+                  "main()\n" +
+                  "    var q = Sq(3)\n" +
+                  "\n" +
+                  "    show(&q)\n"),
+              "cannot print a *Shape value — an object offers what its trait declares and what " +
+              "that trait requires, so write 'trait Shape: sysl.Display' to keep the rendering " +
+              "the value had before it was erased")
+end an_object_without_display_names_the_bound

@@ -38,6 +38,14 @@ struct Emit
     uses_memcpy: bool
     checked: bool
 
+    // Whether anything rendered a `bool`, laid a codepoint's bytes down, or went out through C's
+    // formatting. Each decides one thing the module carries -- the two immortal words a `bool`
+    // renders to, the encoder, and the `snprintf` declaration -- which is why they are three flags
+    // rather than one.
+    bool_strs: bool
+    char_buf: bool
+    uses_snprintf: bool
+
     // How many assembly blocks the module has emitted, which is what lets each one's labels be its
     // own.
     asm_site: int
@@ -139,6 +147,11 @@ struct Emit
     promoted_boxes: Buf[(string, Val)]
     promoted_temps: Buf[Span]
 
+    // The place each `ref` name stands for. A ref names storage it did not declare, so what keeps
+    // that storage alive is whatever the place was rooted at -- which is a question asked long after
+    // the declaration is out of sight.
+    ref_places: Buf[(string, TExpr)]
+
     // The first form this body reached that nothing here lowers. A body that has one is not emitted.
     gap: Option[string]
 end Emit
@@ -156,6 +169,15 @@ enum HelperReq
     HrDrop(payload: Type)
     HrDropBuf(elem: Type)
     HrPlainDrop
+
+    // A block written out by hand as LLVM, which is text and can only be **named** by anything that
+    // is not LLVM. It shares the queue with the generated ones so that a module writes its helpers
+    // down in the order they were first needed.
+    HrText(llvm: string)
+
+    // The forwarder one slot of a method table holds, where what the table promises and what the
+    // implementation declared are not already the same handover.
+    HrAdapter(table: TVtable, slot: TVSlot)
 end HelperReq
 
 // What a definition and every call to it name.
@@ -236,12 +258,14 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
     var promoted: Buf[string] = buf()
     var promoted_boxes: Buf[(string, Val)] = buf()
     var promoted_temps: Buf[Span] = buf()
+    var ref_places: Buf[(string, TExpr)] = buf()
 
-    Emit(t, layout_for(t), int(t.pointer_bits()), globals, 0, sat_decls, false, false, false, 0,
+    Emit(t, layout_for(t), int(t.pointer_bits()), globals, 0, sat_decls, false, false, false,
+         false, false, false, 0,
          prologue, blocks, current, None, "entry", 0, 0, false, reached, loops, scratch, symbols,
          foreigns, variadics, ensures, None, "", tail_calls, tail_params, destructors, false, false, false,
          false, boxes, bufs, requested, queue, temps, temp_marks, owned_slots, owned_marks, defers,
-         defer_marks, promoted, promoted_boxes, promoted_temps, None)
+         defer_marks, promoted, promoted_boxes, promoted_temps, ref_places, None)
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -289,6 +313,7 @@ start_function(e: *Emit)
     e.defers.clear()
     e.defer_marks.clear()
     e.promoted_boxes.clear()
+    e.ref_places.clear()
     e.gap = None
 end start_function
 

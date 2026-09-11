@@ -377,3 +377,266 @@ build_bits(e: *Emit, ranges: Buf[BitRange], vals: Buf[Val]) -> Val
         Some(v) -> v
         None -> VInt(from_int(0))
 end build_bits
+
+// -- taking a view of some of what a place holds ------------------------------------------------------
+
+// The dereference a place walk bottoms out at, following **receivers only**.
+private spine_root(place: TExpr) -> Option[TExpr] = *place.kind match
+    TField(r, _, _) -> spine_root(r)
+    TIndex(r, _, _) -> underlying(texpr_type(r)) match
+        Array(_, _) -> spine_root(r)
+        _ -> None
+    TDeref(_, _) -> Some(place)
+    _ -> None
+
+// Whatever keeps an array place's storage alive where the place is not rooted at a reference: the
+// buffer a promotion moved it to, or nothing at all for storage on the frame.
+//
+// A `ref` names storage it did not declare, so the box belongs to whatever its place was rooted at.
+// Without this step a view taken through a ref would own nothing, and the buffer the array was
+// promoted into would be released while the view still pointed into it.
+private promoted_owner(e: *Emit, base: TExpr) -> Val = *base.kind match
+    TLoad(name, _) ->
+        for i in 0..<e.promoted_boxes.len()
+            if e.promoted_boxes.at(i).0 == name then return e.promoted_boxes.at(i).1
+
+        for i in 0..<e.ref_places.len()
+            if e.ref_places.at(i).0 == name then return promoted_owner(e, e.ref_places.at(i).1)
+
+        VNull
+    TIndex(r, _, _) -> promoted_owner(e, r)
+    _ -> VNull
+
+// The address of an array place together with whatever keeps its storage alive: the box it lives
+// inside, the buffer a promotion moved it to, or nothing at all for storage on the frame.
+//
+// A place rooted at a **counted reference** is the box's, so the reference is evaluated once here and
+// the walk to the field continues from the payload it addresses -- which is what lets a view of a
+// fixed array inside a `&Struct` name that box as its owner. Reaching for it structurally rather than
+// watching what the ordinary walk happened to compute is what keeps a `&Struct` inside another one
+// honest: the box that owns the storage is the **innermost** one on the chain, and the ordinary walk
+// evaluates the outermost first.
+address_owned(e: *Emit, place: TExpr) -> (Val, Val)
+    val root = spine_root(place)
+
+    if root.is_some()
+        *root.unwrap().kind match
+            TDeref(operand, inner) ->
+                if is_counted_ref(texpr_type(operand))
+                    val box = gen_expr(e, operand)
+                    val at = fresh_reg(e)
+
+                    var idx: Buf[IrArg] = buf()
+
+                    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+                    idx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields())))))
+                    emit(e, InGep(at, box_lty(e, inner), box, idx))
+                    return (box, address_under(e, place, root.unwrap(), at))
+            _ -> ()
+
+    (promoted_owner(e, place), address(e, place))
+end address_owned
+
+// The rest of a place walk, once its root has been evaluated and reached. Every step is the one
+// `address` takes; what differs is only where the chain starts.
+private address_under(e: *Emit, place: TExpr, root: TExpr, at: Val) -> Val
+    if same_node(place, root) then return at
+
+    *place.kind match
+        TField(r, index, ty) ->
+            if zero_sized(ty) then return address_under(e, r, root, at)
+
+            val rty = texpr_type(r)
+            val base = address_under(e, r, root, at)
+            val x = fresh_reg(e)
+
+            var idx: Buf[IrArg] = buf()
+
+            idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+            idx.push(ir_arg(l_i32(), VInt(from_int(long(field_slot_of(rty, index))))))
+            emit(e, InGep(x, lty(e, rty), base, idx))
+            x
+
+        TIndex(r, index, _) ->
+            val parts = underlying(texpr_type(r)) match
+                Array(n, elem) -> (long(n), *elem)
+                _ -> (long(0), int_type())
+            val base = address_under(e, r, root, at)
+            val i = widen_index(e, index)
+
+            bounds_check(e, i, VInt(from_int(parts.0)))
+
+            val x = fresh_reg(e)
+
+            var idx: Buf[IrArg] = buf()
+
+            idx.push(ir_arg(word_lty(e), i))
+            emit(e, InGep(x, lty(e, parts.1), base, idx))
+            x
+
+        _ -> address(e, place)
+end address_under
+
+// Whether the operand of a dereference is a counted reference, which is what makes the box behind it
+// the owner of everything the place reaches.
+private is_counted_ref(t: Type) -> bool = t match
+    Ref(_, _) -> true
+    _ -> false
+
+// Whether two nodes are the same occurrence, which a span answers here where the reference compares
+// by identity.
+private same_node(a: TExpr, b: TExpr) -> bool = a.span == b.span && texpr_kind_name(a) == texpr_kind_name(b)
+
+// **Takes a view of some of an array's, a slice's, or a string's elements.** The base is evaluated
+// once and gives up three things -- what keeps the elements alive, where the first of them is, and
+// how many there are -- and the view is built by narrowing the last two and taking a share of the
+// first.
+gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
+          slice_ty: Type) -> Val
+    val elem = element(slice_ty).unwrap_or(byte_type())
+    val parts = slice_base(e, base)
+    val owner = parts.0
+    val first = parts.1
+    val len = parts.2
+
+    val start = lo match
+        Some(l) -> widen_index(e, l)
+        None -> VInt(from_int(0))
+
+    // The check is on the half-open interval the view ends up naming. An inclusive high end
+    // additionally has to name an element that exists, which is also what stops `hi + 1` from
+    // wrapping past the end.
+    val end = hi match
+        None -> len.unwrap_or(VUndef)
+        Some(h) ->
+            val v = widen_index(e, h)
+
+            if !inclusive then v
+            else
+                len match
+                    Some(l) ->
+                        val within = fresh_reg(e)
+
+                        emit(e, InIntCmp(within, IUlt, word_lty(e), v, l))
+                        trap_unless(e, within, "bounds")
+                    None -> ()
+
+                val one = fresh_reg(e)
+
+                emit(e, InBin(one, OpAdd, word_lty(e), v, VInt(from_int(1))))
+                one
+
+    if hi.is_some() && !inclusive
+        len match
+            Some(l) ->
+                val fits = fresh_reg(e)
+
+                emit(e, InIntCmp(fits, IUle, word_lty(e), end, l))
+                trap_unless(e, fits, "bounds")
+            None -> ()
+
+    val ordered = fresh_reg(e)
+
+    emit(e, InIntCmp(ordered, IUle, word_lty(e), start, end))
+    trap_unless(e, ordered, "bounds")
+
+    // A substring has to be a string, so both ends must fall between characters. This runs after the
+    // bounds checks, which is what makes reading the byte at either end safe.
+    if slice_ty == Str
+        len match
+            Some(l) ->
+                trap_unless(e, str_boundary(e, first, l, start), "boundary")
+                trap_unless(e, str_boundary(e, first, l, end), "boundary")
+            None -> ()
+
+    val p = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(word_lty(e), start))
+    emit(e, InGep(p, lty(e, elem), first, idx))
+
+    val n = fresh_reg(e)
+
+    emit(e, InBin(n, OpSub, word_lty(e), end, start))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, owner))
+    emit(e, ir_call(None, LVoid, VGlobal("arc.retain_maybe"), args))
+
+    e.maybe_heap = true
+    e.heap = true
+
+    val lt = lty(e, slice_ty)
+    val with_owner = fresh_reg(e)
+
+    emit(e, InInsert(with_owner, lt, VZero, LPtr, owner, index_list(0)))
+
+    val with_ptr = fresh_reg(e)
+
+    emit(e, InInsert(with_ptr, lt, with_owner, LPtr, p, index_list(1)))
+
+    val whole = fresh_reg(e)
+
+    emit(e, InInsert(whole, lt, with_ptr, word_lty(e), n, index_list(2)))
+    own_temp(e, whole, slice_ty)
+end gen_slice
+
+// What a slice's base gives up: what keeps the elements alive, where the first of them is, and how
+// many there are -- which a `*T` region does not know.
+private slice_base(e: *Emit, base: TExpr) -> (Val, Val, Option[Val]) = texpr_type(base) match
+    Ref(inner, _) -> underlying(*inner) match
+        Array(n, _) ->
+            val r = gen_expr(e, base)
+            val p = fresh_reg(e)
+
+            var idx: Buf[IrArg] = buf()
+
+            idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+            idx.push(ir_arg(l_i32(), VInt(from_int(long(header_fields())))))
+            emit(e, InGep(p, box_lty(e, *inner), r, idx))
+            (r, p, Some(VInt(from_int(long(n)))))
+        other ->
+            gap_here(e, s"slice of ${type_show(other)}")
+            (VNull, VUndef, None)
+
+    Slice(_, _) -> view_base(e, base)
+    Str -> view_base(e, base)
+
+    // Storage this frame owns, storage inside a box the walk went through, or a `*T` region. A
+    // frame-backed array has no owner, so counting it is a no-op -- unless the escape analysis moved
+    // it to the heap, in which case the buffer it moved into is exactly what a view of it must count
+    // against. Nothing makes a `*T` region safe; that is what `*T` is.
+    Array(n, _) ->
+        val owned = address_owned(e, base)
+
+        (owned.0, owned.1, Some(VInt(from_int(long(n)))))
+
+    Ptr(inner) -> underlying(*inner) match
+        Array(n, _) -> (VNull, gen_expr(e, base), Some(VInt(from_int(long(n)))))
+
+        // A `*T` region: no owner to count and no length to check the end against. The analyzer has
+        // already insisted the end be written, since there is nothing here to supply one.
+        _ -> (VNull, gen_expr(e, base), None)
+
+    other ->
+        gap_here(e, s"slice of ${type_show(other)}")
+        (VNull, VUndef, None)
+
+private view_base(e: *Emit, base: TExpr) -> (Val, Val, Option[Val])
+    val wty = lty(e, texpr_type(base))
+    val v = gen_expr(e, base)
+    val o = fresh_reg(e)
+
+    emit(e, InExtract(o, wty, v, index_list(0)))
+
+    val p = fresh_reg(e)
+
+    emit(e, InExtract(p, wty, v, index_list(1)))
+
+    val l = fresh_reg(e)
+
+    emit(e, InExtract(l, wty, v, index_list(2)))
+    (o, p, Some(l))
+end view_base

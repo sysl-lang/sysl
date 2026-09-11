@@ -296,6 +296,18 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
         return TExpr(span, TLoad(local.unwrap().unique, local.unwrap().ty))
     end if
 
+    // A **value parameter**, folded into its use exactly as a declared constant is -- which is what
+    // it is, a `const` whose value the instantiation supplied. The substitution holds one for it
+    // wherever the body is walked: the real argument at an instantiation, and a zero placeholder
+    // during the walk that checks the generic body, where there is no argument yet and the tree
+    // built is discarded.
+    //
+    // **A local of the same name still wins**, which is why the scope was asked first: a parameter
+    // is the outermost binding of its name, not the only one.
+    val stands_for = const_parameter(cx, span, name, expected)
+
+    if stands_for.is_some() then return stands_for.unwrap()
+
     // A constant is folded into its use and analyzed as the expression it stands for, at the type
     // it was declared with rather than the one the context asked for. That is what makes it behave
     // like the value it names: `const n: usize = 5` used where an `int` belongs is the same
@@ -330,6 +342,29 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
 
     variant_expr(cx, span, name, expected)
 end name_expr
+
+// What a name bound to a value parameter stands for, where it is bound to one.
+//
+// **A simple enum's argument travels as its tag**, and what the body wants back is the variant -- so
+// the name is handed to the ordinary variant path rather than rebuilt here, and everything a written
+// `Fast` gets follows from that.
+private const_parameter(cx: &Analyzer, span: Span, name: string,
+                        expected: Option[Type]) -> Option[TExpr]
+    bound_type(cx.subst, name) match
+        Some(ConstArg(v, ty)) -> underlying(*ty) match
+            Enum(d) ->
+                val n = v.to_long().unwrap_or(-1)
+
+                for i in 0..<d.variants.len()
+                    if long(d.variants.at(i).tag) == n then
+                        return Some(variant_expr(cx, span, d.variants.at(i).name, Some(*ty)))
+
+                Some(cx.err(span, s"'$name' stands for no variant of ${type_show(*ty)}"))
+            Bool -> Some(TExpr(span, TBoolLit(v != from_int(0))))
+            Char -> Some(TExpr(span, TIntLit(v, Char)))
+            _ -> Some(int_literal(cx, span, v, "", Some(*ty)))
+        _ -> None
+end const_parameter
 
 private a_consts(cx: &Analyzer) -> &Table[ValueDecl] = cx.an.tables.consts
 private a_vals(cx: &Analyzer) -> &Table[ValueDecl] = cx.an.tables.vals

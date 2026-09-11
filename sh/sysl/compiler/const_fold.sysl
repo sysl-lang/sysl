@@ -33,13 +33,33 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
     CharLit(c) -> Some(ConstChar(c))
     StrLit(s) -> Some(ConstStr(s))
 
+    // A **value parameter** is asked before a declared constant, and shadows one of the same name
+    // for the same reason a type parameter shadows a type: the nearer binding is the one written
+    // where the name is. During the walk that checks a generic body there is no argument bound yet,
+    // so the name simply is not in the substitution and falls through -- which a caller reads as
+    // awaiting instantiation, exactly as it already does for `sizeof(T)`.
+    //
     // A declared constant folds to what it was written equal to, read in its own file's terms.
-    Ident(name) -> const_of_name(cx, name)
+    Ident(name) ->
+        val bound = const_arg_bound(cx.subst, name)
 
-    // A module-qualified constant -- `c.limit`. A `const` is registered under its dotted path, so
-    // the same declaration is a constant whether it was imported unqualified or reached through its
-    // module.
-    Field(receiver, name) -> dotted_name(receiver, name).and_then(n -> const_of_name(cx, n))
+        if bound.is_some() then return bound
+
+        const_of_name(cx, name)
+
+    // `A.len` -- how many types a **pack** stands for, which is a compile-time integer and folds as
+    // one. It is here as well as in the analyzer because the range of a `for const` is read *before*
+    // anything is analyzed: the loop has to know how many copies to make before it can make one.
+    //
+    // A module-qualified constant -- `c.limit` -- is the other thing this shape is. A `const` is
+    // registered under its dotted path, so the same declaration is a constant whether it was
+    // imported unqualified or reached through its module.
+    Field(receiver, name) ->
+        val packed = pack_length(cx.subst, receiver, name)
+
+        if packed.is_some() then return packed
+
+        dotted_name(receiver, name).and_then(n -> const_of_name(cx, n))
 
     Unary(op, operand) -> const_unary(cx, op, operand)
     Binary(op, l, r) -> const_binary(cx, op, l, r)
@@ -59,6 +79,32 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
     TypeAttr(receiver, attr) -> const_type_attr(cx, receiver, attr)
 
     _ -> None
+
+// How many types the pack `A` stands for, where `A.len` is what was written.
+private pack_length(subst: Buf[Binding], receiver: Expr, name: string) -> Option[Const]
+    if name != "len" then return None
+
+    *receiver.kind match
+        Ident(n) -> bound_type(subst, n) match
+            Some(Pack(elems)) -> Some(ConstInt(from_int(long(elems.len()))))
+            _ -> None
+        _ -> None
+end pack_length
+
+// What a value parameter stands for, where the name is bound to one.
+//
+// The argument travels as a `BigInt` because that is what a type's identity needs -- something that
+// compares and mangles -- and the declared type is what says how to read it back. A `bool` whose
+// parameter folded to an integer would be a `0` where the body wrote `B`, so the type is not
+// decoration here: it is the half of the pair that makes the number mean something.
+private const_arg_bound(subst: Buf[Binding], name: string) -> Option[Const]
+    bound_type(subst, name) match
+        Some(ConstArg(v, ty)) -> underlying(*ty) match
+            Bool -> Some(ConstBool(v != from_int(0)))
+            Char -> Some(ConstChar(char(u32(v.to_long().unwrap_or(0)))))
+            _ -> Some(ConstInt(v))
+        _ -> None
+end const_arg_bound
 
 private const_of_name(cx: &Analyzer, name: string) -> Option[Const]
     if cx.lookup(name).is_some() then return None

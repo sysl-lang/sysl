@@ -1,0 +1,500 @@
+module sh.sysl.compiler
+
+import sysl.math.bigint.{BigInt, from_int, pow, sub as big_sub, to_string}
+
+// **What a `string` means once it is bytes**, as the hand-written blocks a module that reaches one
+// carries: how the bytes are written out, how two are compared, how a fresh one is made, and how a
+// value is rendered into one.
+//
+// Everything else about a string is somewhere else, because a `string` *is* an immutable validated
+// `[]u8` -- its ownership is the view's (`emit_arc.sysl`) and reaching an element or taking a
+// substring is the view's too (`emit_place.sysl`). What is here is the part where the bytes have a
+// meaning rather than a length.
+//
+// **Every block below is a function of the machine's word**, because a string's length is a `usize`
+// and these are the only places where a length is written as text rather than emitted from a type.
+
+// The three header words every `StrBuf` starts with -- a strong count of one, the hook that gives
+// the bytes back and does nothing else, and a share count of one. The header's own layout is
+// `%arc.header`, and its size is taken from that type rather than written down, so a target that
+// lays it out differently needs nothing changed here.
+//
+// **The hook cannot be null.** The free is the hook's, so a null one would mean a `StrBuf` whose
+// bytes are never given back; `arc.drop.plain` is exactly the hook for a payload that holds nothing,
+// and a module whose helpers reach the allocator is given one.
+private str_buf_header(word: string) -> string
+    s"""
+      %p = call ptr @${malloc_symbol()}($word %size)
+      store $word 1, ptr %p
+      %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
+      store ptr @arc.drop.plain, ptr %hook
+      %share = getelementptr %arc.header, ptr %p, i32 0, i32 2
+      store $word 1, ptr %share
+      %bytes = getelementptr %arc.header, ptr %p, i32 1
+    """
+
+// How `snprintf`'s answer becomes a length.
+//
+// It reports in an `int` and a string's length is a `usize`, so on a 64-bit machine there is a
+// widening to write and on a 32-bit one the two are already the same integer -- where
+// `sext i32 %n to i32` is not an instruction at all. So this answers with the line to emit, which
+// may be empty, and the name to read afterwards, which may be the original.
+private counted_line(word: string) -> string =
+    if word == "i32" then "" else s"  %n64 = sext i32 %n to $word\n"
+
+private counted_name(word: string) -> string = if word == "i32" then "%n" else "%n64"
+
+// Writing bytes out. `putchar` is declared here rather than beside `printf` because a module that
+// never prints a string never needs it.
+//
+// `printf`'s `%s` stops at a NUL, and so does `%.*s` -- a precision is a maximum, not a count -- so
+// a string that carries its own length is written a byte at a time instead. It goes through
+// `putchar` rather than `write`, so it shares stdio's buffer with the `printf` that carries the rest
+// of a `print` and the two cannot come out of order.
+str_write(word: string) -> string
+    s"""
+    declare i32 @putchar(i32)
+
+    define private void @sysl.str.write(ptr %p, $word %n) {
+    entry:
+      br label %cond
+    cond:
+      %i = phi $word [ 0, %entry ], [ %next, %body ]
+      %more = icmp ult $word %i, %n
+      br i1 %more, label %body, label %done
+    body:
+      %ep = getelementptr i8, ptr %p, $word %i
+      %b = load i8, ptr %ep
+      %c = zext i8 %b to i32
+      %w = call i32 @putchar(i32 %c)
+      %next = add $word %i, 1
+      br label %cond
+    done:
+      ret void
+    }
+    """
+
+// Byte comparison: the common prefix decides it, and if there is no difference there the shorter
+// string comes first. For well-formed UTF-8 the byte order is also codepoint order, which is the
+// ordering worth having.
+str_cmp_text(word: string) -> string
+    s"""
+    define private i32 @sysl.str.cmp(ptr %a, $word %an, ptr %b, $word %bn) {
+    entry:
+      %shorter = icmp ult $word %an, %bn
+      %n = select i1 %shorter, $word %an, $word %bn
+      br label %cond
+    cond:
+      %i = phi $word [ 0, %entry ], [ %next, %step ]
+      %more = icmp ult $word %i, %n
+      br i1 %more, label %body, label %tail
+    body:
+      %pa = getelementptr i8, ptr %a, $word %i
+      %pb = getelementptr i8, ptr %b, $word %i
+      %ba = load i8, ptr %pa
+      %bb = load i8, ptr %pb
+      %same = icmp eq i8 %ba, %bb
+      br i1 %same, label %step, label %diff
+    diff:
+      %lt = icmp ult i8 %ba, %bb
+      %d = select i1 %lt, i32 -1, i32 1
+      ret i32 %d
+    step:
+      %next = add $word %i, 1
+      br label %cond
+    tail:
+      %longer = icmp ugt $word %an, %bn
+      %t0 = select i1 %longer, i32 1, i32 0
+      %t1 = select i1 %shorter, i32 -1, i32 %t0
+      ret i32 %t1
+    }
+    """
+
+// Concatenation. A `StrBuf` sized for both halves is allocated the way every heap object is, with
+// the header size taken portably from `%arc.header` so a 32-bit target lays it out the same way.
+// The two halves are copied in a byte at a time, and the returned view names the buffer as its
+// owner, the first payload byte as its start, and the summed length. UTF-8 is closed under
+// concatenation, so the validity invariant needs no re-checking.
+str_concat_text(word: string, str: string) -> string
+    s"""
+    define private $str @sysl.str.concat(ptr %ap, $word %an, ptr %bp, $word %bn) {
+    entry:
+      %total = add $word %an, %bn
+      %hend = getelementptr %arc.header, ptr null, i32 1
+      %hsize = ptrtoint ptr %hend to $word
+      %size = add $word %hsize, %total
+    ${str_buf_header(word)}  br label %acond
+    acond:
+      %i = phi $word [ 0, %entry ], [ %inext, %abody ]
+      %amore = icmp ult $word %i, %an
+      br i1 %amore, label %abody, label %bcond
+    abody:
+      %asrc = getelementptr i8, ptr %ap, $word %i
+      %abyte = load i8, ptr %asrc
+      %adst = getelementptr i8, ptr %bytes, $word %i
+      store i8 %abyte, ptr %adst
+      %inext = add $word %i, 1
+      br label %acond
+    bcond:
+      %j = phi $word [ 0, %acond ], [ %jnext, %bbody ]
+      %bmore = icmp ult $word %j, %bn
+      br i1 %bmore, label %bbody, label %done
+    bbody:
+      %bsrc = getelementptr i8, ptr %bp, $word %j
+      %bbyte = load i8, ptr %bsrc
+      %off = add $word %an, %j
+      %bdst = getelementptr i8, ptr %bytes, $word %off
+      store i8 %bbyte, ptr %bdst
+      %jnext = add $word %j, 1
+      br label %bcond
+    done:
+      %v0 = insertvalue $str undef, ptr %p, 0
+      %v1 = insertvalue $str %v0, ptr %bytes, 1
+      %v2 = insertvalue $str %v1, $word %total, 2
+      ret $str %v2
+    }
+    """
+
+// Copies a run of bytes into a fresh owning string. Every `str(x)` that renders into a scratch
+// buffer finishes through here, so the allocation and the copy live in one place.
+str_from_bytes_text(word: string, str: string) -> string
+    s"""
+    define private $str @sysl.str.from_bytes(ptr %src, $word %n) {
+    entry:
+      %hend = getelementptr %arc.header, ptr null, i32 1
+      %hsize = ptrtoint ptr %hend to $word
+      %size = add $word %hsize, %n
+    ${str_buf_header(word)}  br label %cond
+    cond:
+      %i = phi $word [ 0, %entry ], [ %next, %body ]
+      %more = icmp ult $word %i, %n
+      br i1 %more, label %body, label %done
+    body:
+      %s = getelementptr i8, ptr %src, $word %i
+      %b = load i8, ptr %s
+      %d = getelementptr i8, ptr %bytes, $word %i
+      store i8 %b, ptr %d
+      %next = add $word %i, 1
+      br label %cond
+    done:
+      %v0 = insertvalue $str undef, ptr %p, 0
+      %v1 = insertvalue $str %v0, ptr %bytes, 1
+      %v2 = insertvalue $str %v1, $word %n, 2
+      ret $str %v2
+    }
+    """
+
+// One `char` as a string: its UTF-8 encoding, whose byte length follows from the codepoint's range.
+// The bytes are laid down by the same encoder printing a `char` uses, into a scratch buffer, then
+// copied out -- the length is computed from the range rather than read as a NUL-terminated run, so
+// `char(0)` becomes a one-byte string rather than an empty one.
+str_char_text(word: string, str: string) -> string
+    s"""
+    define private $str @sysl.str.char(i32 %cp) {
+    entry:
+      %buf = alloca [5 x i8]
+      call ptr @sysl.utf8(i32 %cp, ptr %buf)
+      %lt1 = icmp ult i32 %cp, 128
+      %lt2 = icmp ult i32 %cp, 2048
+      %lt3 = icmp ult i32 %cp, 65536
+      %l34 = select i1 %lt3, $word 3, $word 4
+      %l234 = select i1 %lt2, $word 2, $word %l34
+      %len = select i1 %lt1, $word 1, $word %l234
+      %r = call $str @sysl.str.from_bytes(ptr %buf, $word %len)
+      ret $str %r
+    }
+    """
+
+// The renderer's symbol at a given width. The 64-bit one keeps the unqualified name it has always
+// had, so the emitted text of every program that does not reach past 64 bits is unchanged.
+str_int_name(bits: int) -> string = if bits == 64 then "sysl.str.int" else s"sysl.str.int$bits"
+
+// Digits enough for the widest magnitude of `bits`, plus one for a sign.
+private digit_capacity(bits: int) -> int =
+    int(to_string(big_sub(pow(from_int(2), usize(bits)), from_int(1))).bytes.len) + 1
+
+// An integer as its decimal string, without libc. The digits are written from the end of a scratch
+// buffer wide enough for the largest magnitude of that width plus a sign, dividing by ten each step;
+// a negative signed value is turned into its magnitude first, which is correct even for the type's
+// minimum because the negation wraps to the right unsigned bit pattern and the division that follows
+// is unsigned. The `signed` flag distinguishes a two's-complement negative from a large unsigned
+// value that happens to have its top bit set.
+//
+// It is written once for every width because C's own formatting stops before the widest sysl integer
+// does: `printf` has no length modifier past `long long`, so a value wider than that has to be
+// rendered by the language rather than borrowed from libc.
+//
+// **The value's width and the machine's are different questions here, and both appear.** `ty` is the
+// integer being rendered, which is the caller's; `word` is the length of the string that comes out,
+// which is the machine's. A `u128` renders on a 32-bit machine, and neither width follows from the
+// other.
+//
+// **The buffer is the width's real cost, and it is a stack `alloca`.** Its size grows with the number
+// of decimal digits the width can produce, so a renderer near the widest integer allocates megabytes
+// of stack in one frame and will overflow it. Nothing reaches that by accident, so the size is left
+// as the honest consequence of the width rather than being capped into a wrong answer.
+str_int_text(bits: int, word: string, str: string) -> string
+    val ty = s"i$bits"
+    val cap = digit_capacity(bits)
+    val name = str_int_name(bits)
+
+    s"""
+    define private $str @$name($ty %v, i1 %signed) {
+    entry:
+      %isneg = icmp slt $ty %v, 0
+      %neg = and i1 %isneg, %signed
+      %negv = sub $ty 0, %v
+      %mag = select i1 %neg, $ty %negv, $ty %v
+      %buf = alloca [$cap x i8]
+      %end = getelementptr i8, ptr %buf, $word $cap
+      br label %loop
+    loop:
+      %cur = phi $ty [ %mag, %entry ], [ %q, %loop ]
+      %pos = phi ptr [ %end, %entry ], [ %pp, %loop ]
+      %pp = getelementptr i8, ptr %pos, $word -1
+      %q = udiv $ty %cur, 10
+      %r = urem $ty %cur, 10
+      %rb = trunc $ty %r to i8
+      %digit = add i8 %rb, 48
+      store i8 %digit, ptr %pp
+      %more = icmp ne $ty %q, 0
+      br i1 %more, label %loop, label %sign
+    sign:
+      br i1 %neg, label %addsign, label %finish
+    addsign:
+      %sp = getelementptr i8, ptr %pp, $word -1
+      store i8 45, ptr %sp
+      br label %finish
+    finish:
+      %start = phi ptr [ %pp, %sign ], [ %sp, %addsign ]
+      %si = ptrtoint ptr %start to $word
+      %ei = ptrtoint ptr %end to $word
+      %len = sub $word %ei, %si
+      %res = call $str @sysl.str.from_bytes(ptr %start, $word %len)
+      ret $str %res
+    }
+    """
+end str_int_text
+
+// A float as a string, rendered the way `print` renders one -- `snprintf` with `%g`, so the two
+// agree to the byte. A sizing call learns the length, then the digits are written into a `StrBuf` a
+// byte longer to hold the terminator `snprintf` insists on writing, which rides along uncounted
+// exactly as the NUL after a literal does. This is the one case that needs libc, and `print` already
+// does, so it adds no dependency in practice.
+str_float_text(word: string, str: string) -> string
+    val widen = counted_line(word)
+    val len = counted_name(word)
+
+    s"""
+    @sysl.str.g = private constant [3 x i8] c"%g\\00"
+
+    define private $str @sysl.str.float(double %v) {
+    entry:
+      %n = call i32 (ptr, $word, ptr, ...) @snprintf(ptr null, $word 0, ptr @sysl.str.g, double %v)
+    $widen  %cap = add $word $len, 1
+      %hend = getelementptr %arc.header, ptr null, i32 1
+      %hsize = ptrtoint ptr %hend to $word
+      %size = add $word %hsize, %cap
+    ${str_buf_header(word)}  %w = call i32 (ptr, $word, ptr, ...) @snprintf(ptr %bytes, $word %cap, ptr @sysl.str.g, double %v)
+      %v0 = insertvalue $str undef, ptr %p, 0
+      %v1 = insertvalue $str %v0, ptr %bytes, 1
+      %v2 = insertvalue $str %v1, $word $len, 2
+      ret $str %v2
+    }
+    """
+end str_float_text
+
+// An integer rendered through a printf specifier. The caller has widened the value to 64 bits and
+// the format carries the `ll` length modifier, so `snprintf` and the value agree.
+//
+// **The value stays an `i64` on every machine**, which is the one place here where a hardwired
+// sixty-four is right: it is the width `%lld` names, not the width of an address.
+str_fmt_int_text(word: string, str: string) -> string
+    val widen = counted_line(word)
+    val len = counted_name(word)
+
+    s"""
+    define private $str @sysl.str.fmt_i(ptr %fmt, i64 %v) {
+    entry:
+      %n = call i32 (ptr, $word, ptr, ...) @snprintf(ptr null, $word 0, ptr %fmt, i64 %v)
+    $widen  %cap = add $word $len, 1
+      %hend = getelementptr %arc.header, ptr null, i32 1
+      %hsize = ptrtoint ptr %hend to $word
+      %size = add $word %hsize, %cap
+    ${str_buf_header(word)}  %w = call i32 (ptr, $word, ptr, ...) @snprintf(ptr %bytes, $word %cap, ptr %fmt, i64 %v)
+      %v0 = insertvalue $str undef, ptr %p, 0
+      %v1 = insertvalue $str %v0, ptr %bytes, 1
+      %v2 = insertvalue $str %v1, $word $len, 2
+      ret $str %v2
+    }
+    """
+end str_fmt_int_text
+
+// A float rendered through a printf specifier, the same shape as the integer case with a `double`
+// argument the specifier expects directly.
+str_fmt_float_text(word: string, str: string) -> string
+    val widen = counted_line(word)
+    val len = counted_name(word)
+
+    s"""
+    define private $str @sysl.str.fmt_f(ptr %fmt, double %v) {
+    entry:
+      %n = call i32 (ptr, $word, ptr, ...) @snprintf(ptr null, $word 0, ptr %fmt, double %v)
+    $widen  %cap = add $word $len, 1
+      %hend = getelementptr %arc.header, ptr null, i32 1
+      %hsize = ptrtoint ptr %hend to $word
+      %size = add $word %hsize, %cap
+    ${str_buf_header(word)}  %w = call i32 (ptr, $word, ptr, ...) @snprintf(ptr %bytes, $word %cap, ptr %fmt, double %v)
+      %v0 = insertvalue $str undef, ptr %p, 0
+      %v1 = insertvalue $str %v0, ptr %bytes, 1
+      %v2 = insertvalue $str %v1, $word $len, 2
+      ret $str %v2
+    }
+    """
+end str_fmt_float_text
+
+// A string rendered through a printf `%s` specifier, so that width, precision and justification are
+// the C library's to apply. A sysl string carries a length rather than a terminator, so a
+// NUL-terminated copy is made for `snprintf` and freed after; an interior NUL therefore ends the
+// field, which is exactly `%s`'s own rule.
+str_fmt_str_text(word: string, str: string) -> string
+    val widen = counted_line(word)
+    val len = counted_name(word)
+
+    s"""
+    define private $str @sysl.str.fmt_s(ptr %fmt, ptr %src, $word %len) {
+    entry:
+      %ccap = add $word %len, 1
+      %cstr = call ptr @${malloc_symbol()}($word %ccap)
+      br label %ccond
+    ccond:
+      %i = phi $word [ 0, %entry ], [ %inext, %cbody ]
+      %more = icmp ult $word %i, %len
+      br i1 %more, label %cbody, label %cdone
+    cbody:
+      %sp = getelementptr i8, ptr %src, $word %i
+      %sb = load i8, ptr %sp
+      %dp = getelementptr i8, ptr %cstr, $word %i
+      store i8 %sb, ptr %dp
+      %inext = add $word %i, 1
+      br label %ccond
+    cdone:
+      %nulp = getelementptr i8, ptr %cstr, $word %len
+      store i8 0, ptr %nulp
+      %n = call i32 (ptr, $word, ptr, ...) @snprintf(ptr null, $word 0, ptr %fmt, ptr %cstr)
+    $widen  %cap = add $word $len, 1
+      %hend = getelementptr %arc.header, ptr null, i32 1
+      %hsize = ptrtoint ptr %hend to $word
+      %size = add $word %hsize, %cap
+    ${str_buf_header(word)}  %w = call i32 (ptr, $word, ptr, ...) @snprintf(ptr %bytes, $word %cap, ptr %fmt, ptr %cstr)
+      call void @${free_symbol()}(ptr %cstr)
+      %v0 = insertvalue $str undef, ptr %p, 0
+      %v1 = insertvalue $str %v0, ptr %bytes, 1
+      %v2 = insertvalue $str %v1, $word $len, 2
+      ret $str %v2
+    }
+    """
+end str_fmt_str_text
+
+// Whether a byte offset falls between characters rather than inside one. The caller has already
+// checked that the offset is within the string, so this only has to look at the byte it names: a
+// continuation byte is `10xxxxxx`, every other byte starts a character, and the offset one past the
+// last byte ends the string.
+str_boundary_text(word: string) -> string
+    s"""
+    define private i1 @sysl.str.boundary(ptr %p, $word %n, $word %i) {
+    entry:
+      %end = icmp eq $word %i, %n
+      br i1 %end, label %yes, label %check
+    check:
+      %ep = getelementptr i8, ptr %p, $word %i
+      %b = load i8, ptr %ep
+      %top = and i8 %b, -64
+      %cont = icmp eq i8 %top, -128
+      %ok = xor i1 %cont, true
+      ret i1 %ok
+    yes:
+      ret i1 true
+    }
+    """
+
+// The encoder a `char` is written out by, which is the one piece of the string runtime a module
+// carries for a reason other than a `string`: `str(ch)` lays the codepoint's bytes down with it.
+utf8_encoder() -> string
+    s"""
+    define private ptr @sysl.utf8(i32 %cp, ptr %buf) {
+    entry:
+      %ascii = icmp ult i32 %cp, 128
+      br i1 %ascii, label %one, label %wide
+    one:
+      %a0 = trunc i32 %cp to i8
+      store i8 %a0, ptr %buf
+      %a1 = getelementptr i8, ptr %buf, i32 1
+      store i8 0, ptr %a1
+      ret ptr %buf
+    wide:
+      %short = icmp ult i32 %cp, 2048
+      br i1 %short, label %two, label %wider
+    two:
+      %b0 = lshr i32 %cp, 6
+      %b1 = or i32 %b0, 192
+      %b2 = trunc i32 %b1 to i8
+      store i8 %b2, ptr %buf
+      %b3 = and i32 %cp, 63
+      %b4 = or i32 %b3, 128
+      %b5 = trunc i32 %b4 to i8
+      %b6 = getelementptr i8, ptr %buf, i32 1
+      store i8 %b5, ptr %b6
+      %b7 = getelementptr i8, ptr %buf, i32 2
+      store i8 0, ptr %b7
+      ret ptr %buf
+    wider:
+      %bmp = icmp ult i32 %cp, 65536
+      br i1 %bmp, label %three, label %four
+    three:
+      %c0 = lshr i32 %cp, 12
+      %c1 = or i32 %c0, 224
+      %c2 = trunc i32 %c1 to i8
+      store i8 %c2, ptr %buf
+      %c3 = lshr i32 %cp, 6
+      %c4 = and i32 %c3, 63
+      %c5 = or i32 %c4, 128
+      %c6 = trunc i32 %c5 to i8
+      %c7 = getelementptr i8, ptr %buf, i32 1
+      store i8 %c6, ptr %c7
+      %c8 = and i32 %cp, 63
+      %c9 = or i32 %c8, 128
+      %c10 = trunc i32 %c9 to i8
+      %c11 = getelementptr i8, ptr %buf, i32 2
+      store i8 %c10, ptr %c11
+      %c12 = getelementptr i8, ptr %buf, i32 3
+      store i8 0, ptr %c12
+      ret ptr %buf
+    four:
+      %d0 = lshr i32 %cp, 18
+      %d1 = or i32 %d0, 240
+      %d2 = trunc i32 %d1 to i8
+      store i8 %d2, ptr %buf
+      %d3 = lshr i32 %cp, 12
+      %d4 = and i32 %d3, 63
+      %d5 = or i32 %d4, 128
+      %d6 = trunc i32 %d5 to i8
+      %d7 = getelementptr i8, ptr %buf, i32 1
+      store i8 %d6, ptr %d7
+      %d8 = lshr i32 %cp, 6
+      %d9 = and i32 %d8, 63
+      %d10 = or i32 %d9, 128
+      %d11 = trunc i32 %d10 to i8
+      %d12 = getelementptr i8, ptr %buf, i32 2
+      store i8 %d11, ptr %d12
+      %d13 = and i32 %cp, 63
+      %d14 = or i32 %d13, 128
+      %d15 = trunc i32 %d14 to i8
+      %d16 = getelementptr i8, ptr %buf, i32 3
+      store i8 %d15, ptr %d16
+      %d17 = getelementptr i8, ptr %buf, i32 4
+      store i8 0, ptr %d17
+      ret ptr %buf
+    }
+
+    """

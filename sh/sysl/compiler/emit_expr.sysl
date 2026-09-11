@@ -19,6 +19,27 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TZero(ty) -> zero_of(e, ty)
     TCStrLit(s) -> string_global(e, s)
 
+    // Three words naming bytes that are never freed: the owner is null, so counting the value costs
+    // nothing at run time and there is nothing for the statement around it to release.
+    TStrLit(s) -> string_value(e, s)
+
+    // Rendering a value. A `string` is itself and everything else lands in a fresh buffer, which is
+    // why only the second case is a temporary the statement owns.
+    TStr(arg) ->
+        val v = gen_str(e, arg)
+
+        if underlying(texpr_type(arg)) == Str then v else own_temp(e, v, Str)
+
+    TFormat(arg, spec) -> own_temp(e, gen_format(e, arg, spec), Str)
+    TRender(value, method, spec, slot) -> gen_render(e, value, method, spec, slot)
+    TFromBytes(arg) -> gen_from_bytes(e, arg)
+
+    // A string and a `[]u8` are the same three words, so looking at one as the other is nothing at
+    // all -- the guarantee that was given up is the analyzer's business, not the machine's. Dropping
+    // the ability to write is a fact about the type in exactly the same way.
+    TBytes(receiver) -> gen_expr(e, receiver)
+    TConstView(arg) -> gen_expr(e, arg)
+
     // A float constant is the `double` bit pattern whatever the type is, so a narrower one is that
     // constant rounded down to it -- which costs nothing at run time.
     TFloatLit(bits, ty) ->
@@ -145,16 +166,48 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TArrayLit(elems, array_ty) ->
         if e.layout.indirect(array_ty) then return gap_at(e, "a large array literal")
 
-        var acc: Val = VZero
+        // **Every element is produced before any of them is laid in.** The two phases are what the
+        // register numbering says: an element that emits anything of its own would otherwise have
+        // its instructions interleaved with the chain that collects them.
+        var vals: Buf[Val] = buf()
 
         for i in 0..<elems.len()
-            val v = gen_expr(e, elems.at(i))
+            vals.push(gen_expr(e, elems.at(i)))
+
+        var acc: Val = VZero
+
+        for i in 0..<vals.len()
             val r = fresh_reg(e)
 
-            emit(e, InInsert(r, lty(e, array_ty), acc, lty(e, element(array_ty).unwrap_or(int_type())), v, index_list(int(i))))
+            emit(e, InInsert(r, lty(e, array_ty), acc,
+                             lty(e, element(array_ty).unwrap_or(int_type())), vals.at(i),
+                             index_list(int(i))))
             acc = r
 
         acc
+
+    // **Every element is a copy of one evaluation**, so the value is generated once, above the loop
+    // -- and generated even where there are no elements, because one evaluation is what the form
+    // promises and an empty array does not take that back.
+    //
+    // It is built in storage rather than as a chain of `insertvalue`, whatever its width: a loop is
+    // what makes `[0; 4096]` four instructions instead of four thousand, and there is no length at
+    // which the two forms would want to swap.
+    TArrayFill(value, array_ty) ->
+        if array_len_of(array_ty) == 0
+            gen_expr(e, value)
+            return VZero
+        end if
+
+        val slot = alloca(e, fresh_reg(e), lty(e, array_ty))
+        val v = gen_expr(e, value)
+
+        fill_array(e, slot, array_ty, v)
+
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, array_ty), slot, AccPlain, None))
+        r
 
     // The same two forms, sized and owned rather than laid out in a frame. Each element the buffer
     // takes is a share of its own -- the box holds them until its hook lets them go -- so the value
@@ -163,31 +216,7 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     // An empty view has no storage to make, so it is the zero value of its own representation:
     // `{owner = null, data = null, len = 0}`. It is not owned either -- there is no box for a
     // release to let go of, and a null owner is what a view that owns nothing already carries.
-    TBufLit(elems, slice_ty) ->
-        if elems.is_empty() then return VZero
-
-        val elem = element(slice_ty).unwrap_or(int_type())
-
-        var vals: Buf[Val] = buf()
-
-        for i in 0..<elems.len()
-            vals.push(gen_expr(e, elems.at(i)))
-
-        val n = VInt(from_int(long(vals.len())))
-        val made = gen_buffer(e, elem, n)
-
-        for i in 0..<vals.len()
-            retain_value(e, elem, vals.at(i))
-
-            val ep = fresh_reg(e)
-
-            var idx: Buf[IrArg] = buf()
-
-            idx.push(ir_arg(word_lty(e), VInt(from_int(long(i)))))
-            emit(e, InGep(ep, lty(e, elem), made.1, idx))
-            emit(e, InStore(lty(e, elem), vals.at(i), ep, AccPlain, None))
-
-        buffer_view(e, slice_ty, made.0, made.1, n)
+    TBufLit(elems, slice_ty) -> gen_buf_lit(e, elems, slice_ty)
 
     // The value is generated once, above the loop, which is what makes `[tick(); n]` one call whose
     // result lands in n places -- and the reason the count may be zero and the call still happen.
@@ -200,9 +229,41 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         fill_elements(e, elem, made.1, n, v)
         buffer_view(e, slice_ty, made.0, made.1, n)
 
+    // **A view of some of what a place holds.** A whole temporary array whose view *escapes* is the
+    // one case that is not a narrowing: the value the frame just computed is written into a buffer
+    // instead of into the slot it would otherwise have had, and the view counts against that buffer.
+    // The two literal forms are the same case done better -- built straight into the buffer rather
+    // than produced and copied -- and everything else has no such form, so the value is made and
+    // moved.
+    TSlice(base, lo, hi, inclusive, slice_ty) ->
+        if lo.is_none() && hi.is_none() && is_promoted_temp(e, x.span)
+            return gen_promoted_slice(e, base, slice_ty)
+
+        gen_slice(e, base, lo, hi, inclusive, slice_ty)
+
+    TTry(operand, ok, fail, ret_enum, ret_fail, _, convert) ->
+        gen_try(e, operand, ok, fail, ret_enum, ret_fail, convert)
+
+    TErase(operand, vtable, _) -> gen_erase(e, operand, vtable)
+    TVCall(receiver, slot, args, ty, _) -> gen_vcall(e, receiver, slot, args, ty)
+
     TEnumNew(enum_ty, variant, args) -> gen_enum_new(e, enum_ty, variant, args)
     TEnumFromInt(value, en) -> gen_expr(e, value)
     TStructNew(decl, args) -> gen_struct_new(e, decl, args)
+
+    TStructInvCheck(value, decl, inv_fn) ->
+        val v = gen_expr(e, value)
+
+        emit_inv_check(e, v, decl, inv_fn)
+        v
+
+    // The write or the call runs first, yielding the value the expression is, and then the struct it
+    // could have changed is re-read so the invariant sees the new fields.
+    TRecheck(after, recv, decl, inv_fn) ->
+        val v = gen_expr(e, after)
+
+        emit_inv_check(e, gen_expr(e, recv), decl, inv_fn)
+        v
     TMatch(scrutinee, arms, ty) -> gen_match(e, scrutinee, arms, ty)
 
     _ -> gap_at(e, texpr_kind_name(x))
@@ -302,6 +363,70 @@ private gen_len(e: *Emit, receiver: TExpr) -> Val = underlying(texpr_type(receiv
     Str -> view_len(e, receiver)
     other -> gap_at(e, s"length of ${type_show(other)}")
 
+private gen_buf_lit(e: *Emit, elems: Buf[TExpr], slice_ty: Type) -> Val
+    if elems.is_empty() then return VZero
+
+    val elem = element(slice_ty).unwrap_or(int_type())
+
+    var vals: Buf[Val] = buf()
+
+    for i in 0..<elems.len()
+        vals.push(gen_expr(e, elems.at(i)))
+
+    val n = VInt(from_int(long(vals.len())))
+    val made = gen_buffer(e, elem, n)
+
+    for i in 0..<vals.len()
+        retain_value(e, elem, vals.at(i))
+
+        val ep = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(word_lty(e), VInt(from_int(long(i)))))
+        emit(e, InGep(ep, lty(e, elem), made.1, idx))
+        emit(e, InStore(lty(e, elem), vals.at(i), ep, AccPlain, None))
+
+    buffer_view(e, slice_ty, made.0, made.1, n)
+end gen_buf_lit
+
+// A whole temporary array viewed where the view **escapes**: the storage is the buffer form's rather
+// than the frame's. Everything else about the node is unchanged -- it is the same elements at the
+// same slice type, laid somewhere that outlives the frame.
+//
+// The two literal forms are built straight into the buffer rather than produced and copied. Any
+// other whole array has no such form, so the value the frame just computed is written into a buffer
+// instead of into the slot it would otherwise have had -- the same three steps a promoted
+// *declaration* takes, with the retain that path takes and for the same reason: the value is still
+// the statement's to release, and the buffer is a second holder of whatever it counts.
+private gen_promoted_slice(e: *Emit, base: TExpr, slice_ty: Type) -> Val
+    *base.kind match
+        TArrayLit(elems, _) -> return gen_buf_lit(e, elems, slice_ty)
+        TArrayFill(value, array_ty) ->
+            val elem = element(slice_ty).unwrap_or(int_type())
+            val v = gen_expr(e, value)
+            val n = VInt(from_int(long(array_len_of(array_ty))))
+            val made = gen_buffer(e, elem, n)
+
+            fill_elements(e, elem, made.1, n, v)
+            return buffer_view(e, slice_ty, made.0, made.1, n)
+        _ -> ()
+
+    val base_ty = texpr_type(base)
+    val elem = element(base_ty).unwrap_or(int_type())
+    val n = VInt(from_int(long(array_len_of(base_ty))))
+    val v = gen_expr(e, base)
+    val made = gen_buffer(e, elem, n)
+
+    retain_value(e, base_ty, v)
+    emit(e, InStore(lty(e, base_ty), v, made.1, AccPlain, None))
+    buffer_view(e, slice_ty, made.0, made.1, n)
+end gen_promoted_slice
+
+private array_len_of(ty: Type) -> int = underlying(ty) match
+    Array(n, _) -> n
+    _ -> 0
+
 private view_len(e: *Emit, receiver: TExpr) -> Val
     val wty = lty(e, texpr_type(receiver))
     val v = gen_expr(e, receiver)
@@ -314,7 +439,8 @@ end view_len
 // -- arithmetic ---------------------------------------------------------------------------------
 
 private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type) -> Val
-    if underlying(ty) == Str then return gap_at(e, "string concatenation")
+    if underlying(ty) == Str then
+        return own_temp(e, str_concat(e, gen_expr(e, l), gen_expr(e, r)), Str)
 
     val lt = underlying(texpr_type(l))
 
@@ -487,8 +613,48 @@ end gen_compare
 // One comparison over two values the caller is holding: an instruction where the operand type has
 // one, the method its `Eq`/`Ord` supplies otherwise.
 comparison(e: *Emit, c: TCmp, ty: Type, av: Val, bv: Val) -> Val = c.dispatch match
-    Some(_) -> gap_at(e, "a comparison through a trait method")
+    Some(d) -> dispatch_value(e, d, ty, ty, av, bv, Bool)
     None -> compare_value(e, c.op, underlying(ty), av, bv)
+
+// **An operator the type supplies rather than the machine**: one call to the member its `impl`
+// lowered to, with the operands in the order the block declared them and the answer negated where
+// the operator is the mirror of the one that was written.
+dispatch_value(e: *Emit, d: TDispatch, aty: Type, bty: Type, av: Val, bv: Val,
+               result_ty: Type) -> Val
+    val left = if d.swap then bv else av
+    val left_ty = if d.swap then bty else aty
+    val right = if d.swap then av else bv
+    val right_ty = if d.swap then aty else bty
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(operand_arg(e, left_ty, left))
+    args.push(operand_arg(e, right_ty, right))
+
+    val res = gen_sysl_call(e, VGlobal(symbol_of(e, d.name)), args, result_ty)
+
+    if !d.negate then return res
+
+    val n = fresh_reg(e)
+
+    emit(e, InBin(n, OpXor, l_i1(), res, VBool(true)))
+    n
+end dispatch_value
+
+// One operand of a dispatched operator, in the form the callee receives it: itself where it is a
+// first-class value, and the address of a slot holding it where it is not.
+//
+// The slot is staging and nothing more -- the callee copies out of it at entry and takes its own
+// count there, exactly as it does for an argument whose address the caller already had, so nothing
+// here owns anything and nothing releases it.
+private operand_arg(e: *Emit, ty: Type, v: Val) -> IrArg
+    if !e.layout.indirect(ty) then return ir_arg(lty(e, ty), v)
+
+    val slot = alloca(e, fresh_reg(e), lty(e, ty))
+
+    emit(e, InStore(lty(e, ty), v, slot, AccPlain, None))
+    ir_arg(LPtr, slot)
+end operand_arg
 
 // -- writing --------------------------------------------------------------------------------------
 
@@ -507,13 +673,10 @@ end gen_store
 
 private gen_update(e: *Emit, place: TExpr, op: string, value: TExpr, ty: Type,
                    dispatch: Option[TDispatch], check: Option[Type]) -> Val
-    if dispatch.is_some() then return gap_at(e, "a compound assignment through a trait method")
-    if underlying(ty) == Str then return gap_at(e, "a string compound assignment")
-
     val p = place_addr(e, place)
     val cur = load_place(e, place, p)
     val v = gen_expr(e, value)
-    val updated = combine(e, op, ty, texpr_type(value), cur, v)
+    val updated = combine(e, op, ty, texpr_type(value), dispatch, cur, v)
 
     check match
         Some(c) -> emit_constraint_checks(e, updated, c)
@@ -542,7 +705,18 @@ end gen_inc_dec
 // What a compound assignment stores: what its operator makes of the place's current value and the
 // value on the right. A constrained slot is arithmetic at the type it is laid out as, and it detects
 // overflow on the same terms, so `a += e` computes what `a = a + e` computes.
-combine(e: *Emit, op: string, ty: Type, value_ty: Type, cur: Val, v: Val) -> Val
+combine(e: *Emit, op: string, ty: Type, value_ty: Type, dispatch: Option[TDispatch], cur: Val,
+        v: Val) -> Val
+    // The dispatched call owns its own result, the way every other call to sysl does -- an
+    // `own_temp` here as well would put one value in the region twice and release it twice.
+    dispatch match
+        Some(d) -> return dispatch_value(e, d, ty, value_ty, cur, v, ty)
+        None -> ()
+
+    // A slot that holds a count builds a fresh value the slot will take a count for; a slot of
+    // anything else is arithmetic.
+    if underlying(ty) == Str then return own_temp(e, str_concat(e, cur, v), Str)
+
     val bin = op[0..<(op.bytes.len - 1)]
     val bt = underlying(ty)
     val rv = if bin == "<<" || bin == ">>" then shift_amount(e, bt, value_ty, v) else v
@@ -876,3 +1050,164 @@ end zero_of
 // A range bound as a whole number. Every bound an integer type carries is one; a float base is a
 // gap rather than a rounding, since the check there compares in double precision.
 decimal_int(d: Decimal) -> BigInt = rescale(d, 0, Rounding.Down).coefficient()
+
+// -- `?` --------------------------------------------------------------------------------------------
+
+// **`expr?`** -- on success the payload becomes the expression's value; on failure the function
+// returns immediately with the failure re-wrapped in its own return type, carrying the error payload
+// across unchanged.
+private gen_try(e: *Emit, operand: TExpr, ok: EnumVariant, fail: EnumVariant, ret_enum: Type,
+                ret_fail: EnumVariant, convert: Option[string]) -> Val
+    val d = enum_decl(texpr_type(operand))
+    val rd = enum_decl(ret_enum)
+
+    if d.is_none() || rd.is_none() then return gap_at(e, "'?' on something that is not an enum")
+
+    val en = d.unwrap()
+    val v = gen_expr(e, operand)
+    val tag = fresh_reg(e)
+
+    emit(e, InExtract(tag, enum_lty(en), v, index_list(0)))
+
+    val is_ok = fresh_reg(e)
+
+    emit(e, InIntCmp(is_ok, IEq, l_i32(), tag, VInt(from_int(long(ok.tag)))))
+
+    val ok_l = fresh_label(e, "try.ok")
+    val fail_l = fresh_label(e, "try.fail")
+
+    emit_term(e, InCondBr(is_ok, ok_l, fail_l))
+    emit_label(e, fail_l)
+
+    // **The conversion happens here and nowhere else**, which is why `?` carries a name rather than
+    // a node: what it converts is the failure payload, and the payload exists only inside this
+    // branch. Everything else about the early return is unchanged.
+    val failed = convert match
+        None ->
+            val f = enum_value(e, ret_enum, rd.unwrap(), ret_fail,
+                               payload_values(e, en, fail, v))
+
+            // The payload was borrowed out of the operand, so the value leaving the function takes a
+            // count of its own.
+            retain_value(e, ret_enum, f)
+            f
+        Some(fn) ->
+            // **A converted failure arrives owned and is NOT retained again.** The conversion is a
+            // call, and a call's result is a share of its own -- so the count the early return
+            // carries out is the one `from` already took.
+            val payload = payload_values(e, en, fail, v)
+            val from_ty = type_arg_at(texpr_type(operand), 1)
+            val to_ty = type_arg_at(ret_enum, 1)
+
+            var made: Buf[Val] = buf()
+
+            made.push(gen_conversion(e, fn, payload.at(0), from_ty, to_ty))
+            enum_value(e, ret_enum, rd.unwrap(), ret_fail, made)
+
+    // **A large result leaves through the caller's storage, and `?` is a `return` like any other.**
+    // The convention has already made this function `void` and given it an out-pointer, so handing
+    // the value back directly would emit a `ret` of an aggregate out of a `void` function.
+    if e.layout.indirect(ret_enum)
+        emit(e, InStore(lty(e, ret_enum), failed, sret_param(), AccPlain, None))
+        release_all(e)
+        emit_term(e, InRet(None, None))
+    else
+        release_all(e)
+        emit_term(e, InRet(Some(lty(e, ret_enum)), Some(failed)))
+
+    emit_label(e, ok_l)
+
+    val got = payload_values(e, en, ok, v)
+
+    if got.is_empty() then VNothing else got.at(0)
+end gen_try
+
+// One type argument of a generic named type, where it has one.
+private type_arg_at(t: Type, i: usize) -> Type = underlying(t) match
+    Enum(d) -> if i < d.targs.len() then d.targs.at(i) else Unknown
+    Struct(d) -> if i < d.targs.len() then d.targs.at(i) else Unknown
+    _ -> Unknown
+
+// One call to a conversion function whose argument is a value already in hand.
+//
+// The ordinary call path takes typed **expressions**, so it can ask each argument for its address
+// where the convention wants one. Here the argument is a register, so a value passed indirectly has
+// to be given storage first -- which is the whole of what this does beyond the call itself.
+//
+// **Emitted rather than sent through `gen_sysl_call`, because the result must NOT be a temporary.** A
+// temporary is released where the surrounding statement ends, and this call happens inside the branch
+// that returns -- so the release would be emitted in a block the value does not reach.
+private gen_conversion(e: *Emit, fn: string, arg: Val, from: Type, to: Type) -> Val
+    val passed = if !e.layout.indirect(from) then
+            ir_arg(lty(e, from), arg)
+        else
+            val slot = alloca(e, fresh_reg(e), lty(e, from))
+
+            emit(e, InStore(lty(e, from), arg, slot, AccPlain, None))
+            ir_arg(LPtr, slot)
+
+    val callee = VGlobal(symbol_of(e, fn))
+
+    if e.layout.indirect(to)
+        val slot = alloca(e, fresh_reg(e), lty(e, to))
+
+        var args: Buf[IrArg] = buf()
+
+        args.push(IrArg(LPtr, slot, sret_attrs(lty(e, to), int(e.layout.align(to)))))
+        args.push(passed)
+        emit(e, InCall(None, LVoid, callee, args, no_ir_attrs(), None, no_fast_math(), false))
+
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lty(e, to), slot, AccPlain, None))
+        return r
+    end if
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(passed)
+
+    val r = fresh_reg(e)
+
+    emit(e, InCall(Some(r), lty(e, to), callee, args, c_extension(to, e.target), None,
+                   no_fast_math(), false))
+    r
+end gen_conversion
+
+// Runs the store once per element of an array laid down at `base`, with the element's address.
+private fill_array(e: *Emit, base: Val, array_ty: Type, v: Val)
+    val elem = element(array_ty).unwrap_or(int_type())
+    val i = alloca(e, fresh_reg(e), word_lty(e))
+    val cond_l = fresh_label(e, "fill.test")
+    val body_l = fresh_label(e, "fill.elem")
+    val end_l = fresh_label(e, "fill.done")
+
+    emit(e, InStore(word_lty(e), VInt(from_int(0)), i, AccPlain, None))
+    emit_term(e, InBr(cond_l))
+    emit_label(e, cond_l)
+
+    val iv = fresh_reg(e)
+
+    emit(e, InLoad(iv, word_lty(e), i, AccPlain, None))
+
+    val more = fresh_reg(e)
+
+    emit(e, InIntCmp(more, IUlt, word_lty(e), iv, VInt(from_int(long(array_len_of(array_ty))))))
+    emit_term(e, InCondBr(more, body_l, end_l))
+    emit_label(e, body_l)
+
+    val ep = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(word_lty(e), iv))
+    emit(e, InGep(ep, lty(e, elem), base, idx))
+    emit(e, InStore(lty(e, elem), v, ep, AccPlain, None))
+
+    val nxt = fresh_reg(e)
+
+    emit(e, InBin(nxt, OpAdd, word_lty(e), iv, VInt(from_int(1))))
+    emit(e, InStore(word_lty(e), nxt, i, AccPlain, None))
+    emit_term(e, InBr(cond_l))
+    emit_label(e, end_l)
+end fill_array

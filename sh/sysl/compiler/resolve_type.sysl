@@ -220,11 +220,36 @@ end is_resolving
 // second name -- which is what tells `return a, b` from `return (a, b)`.
 private resolve_tuple(a: &Analysis, scope: Scope, parts: Buf[TypeRef], results: bool,
                       subst: Buf[Binding]) -> Type
+    // `(..A)` -- the tuple of a pack. The pack is **looked up** rather than resolved, because what
+    // stands for it in the substitution is already the list of parts: for the walk that checks a
+    // generic body that is the stand-ins, and for an instantiation it is the parts the subject
+    // matched. Either way the tuple built here is an ordinary one, so nothing downstream of this
+    // point knows a pack was written.
+    val packed = sole_pack_name(parts)
+
+    if packed.is_some()
+        val ts = bound_type(subst, packed.unwrap()) match
+            Some(Pack(elems)) -> elems
+            _ -> buf()
+        val d = registered_tuple(a, ts)
+
+        return if results then Results(d) else Struct(d)
+    end if
+
     val ts = resolve_list(a, scope, parts, subst)
     val d = registered_tuple(a, ts)
 
     if results then Results(d) else Struct(d)
 end resolve_tuple
+
+// The pack a one-part tuple reference is written over, where that is what it is.
+private sole_pack_name(parts: Buf[TypeRef]) -> Option[string]
+    if parts.len() != 1 then return None
+
+    *parts.at(0).kind match
+        PackType(n) -> Some(n)
+        _ -> None
+end sole_pack_name
 
 // The struct a tuple of these types is: `$tupleN`, its arguments the parts, its fields numbered.
 tuple_type(ts: Buf[Type]) -> &StructType
