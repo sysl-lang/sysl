@@ -1442,6 +1442,140 @@ a_large_tail_call_argument_is_staged_in_a_slot()
               "}\n")
 end a_large_tail_call_argument_is_staged_in_a_slot
 
+// **A loop's value comes from its `break`s and its `else`**, so it views the frame when either of
+// those does -- a `break` of a frame-backed slice out of the loop is the same escape route as
+// returning one, and the array it names has to go on the heap. The two loops that walk a sequence
+// were missing from that rule, so a view of a local broken out of one came back pointing at a frame
+// that had gone.
+@test("a slice of a local broken out of a 'for' over a sequence promotes the local to the heap")
+a_view_broken_out_of_a_walk_promotes_what_it_views()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "held(xs: []const int) -> []const int\n" +
+                  "    var frame = [1]\n" +
+                  "\n" +
+                  "    for x in xs\n" +
+                  "        break frame\n" +
+                  "    else\n" +
+                  "        frame\n" +
+                  "end held\n" +
+                  "\n" +
+                  "main() = print(held([0]).len)\n",
+              "held"),
+              "define { ptr, ptr, i64 } @held({ ptr, ptr, i64 } %xs.param) {\n" +
+              "entry:\n" +
+              "  %xs.addr = alloca { ptr, ptr, i64 }\n" +
+              "  %frame.box = alloca ptr\n" +
+              "  %t24 = alloca i64\n" +
+              "  %t25 = alloca { ptr, ptr, i64 }\n" +
+              "  %x.addr = alloca i32\n" +
+              "  store { ptr, ptr, i64 } %xs.param, ptr %xs.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %xs.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  %t2 = insertvalue [1 x i32] zeroinitializer, i32 1, 0\n" +
+              "  %t3 = getelementptr i32, ptr null, i64 1\n" +
+              "  %t4 = ptrtoint ptr %t3 to i64\n" +
+              "  %t5 = getelementptr %arc.buf.int, ptr null, i32 0, i32 4\n" +
+              "  %t6 = ptrtoint ptr %t5 to i64\n" +
+              "  %t7 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 1, i64 %t4)\n" +
+              "  %t8 = extractvalue { i64, i1 } %t7, 0\n" +
+              "  %t9 = extractvalue { i64, i1 } %t7, 1\n" +
+              "  %t10 = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %t8, i64 %t6)\n" +
+              "  %t11 = extractvalue { i64, i1 } %t10, 0\n" +
+              "  %t12 = extractvalue { i64, i1 } %t10, 1\n" +
+              "  %t13 = or i1 %t9, %t12\n" +
+              "  %t14 = xor i1 %t13, true\n" +
+              "  br i1 %t14, label %size.ok1, label %size.bad2\n" +
+              "size.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "size.ok1:\n" +
+              "  %t15 = call ptr @malloc(i64 %t11)\n" +
+              "  %t16 = icmp ne ptr %t15, null\n" +
+              "  br i1 %t16, label %alloc.ok3, label %alloc.bad4\n" +
+              "alloc.bad4:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "alloc.ok3:\n" +
+              "  store i64 1, ptr %t15\n" +
+              "  %t17 = getelementptr %arc.buf.int, ptr %t15, i32 0, i32 1\n" +
+              "  store ptr @arc.drop.plain, ptr %t17\n" +
+              "  %t18 = getelementptr %arc.buf.int, ptr %t15, i32 0, i32 2\n" +
+              "  store i64 1, ptr %t18\n" +
+              "  %t19 = getelementptr %arc.buf.int, ptr %t15, i32 0, i32 3\n" +
+              "  store i64 1, ptr %t19\n" +
+              "  %t20 = getelementptr %arc.buf.int, ptr %t15, i32 0, i32 4\n" +
+              "  %frame.addr = getelementptr i32, ptr %t20, i64 0\n" +
+              "  store [1 x i32] %t2, ptr %frame.addr\n" +
+              "  store ptr %t15, ptr %frame.box\n" +
+              "  %t21 = load { ptr, ptr, i64 }, ptr %xs.addr\n" +
+              "  %t22 = extractvalue { ptr, ptr, i64 } %t21, 1\n" +
+              "  %t23 = extractvalue { ptr, ptr, i64 } %t21, 2\n" +
+              "  store i64 0, ptr %t24\n" +
+              "  br label %each.cond5\n" +
+              "each.cond5:\n" +
+              "  %t26 = load i64, ptr %t24\n" +
+              "  %t27 = icmp ult i64 %t26, %t23\n" +
+              "  br i1 %t27, label %each.body6, label %each.else9\n" +
+              "each.body6:\n" +
+              "  %t28 = getelementptr i32, ptr %t22, i64 %t26\n" +
+              "  %t29 = load i32, ptr %t28\n" +
+              "  store i32 %t29, ptr %x.addr\n" +
+              "  %t30 = icmp ule i64 0, 1\n" +
+              "  br i1 %t30, label %bounds.ok10, label %bounds.bad11\n" +
+              "bounds.bad11:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok10:\n" +
+              "  %t31 = getelementptr i32, ptr %frame.addr, i64 0\n" +
+              "  %t32 = sub i64 1, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t15)\n" +
+              "  %t33 = insertvalue { ptr, ptr, i64 } zeroinitializer, ptr %t15, 0\n" +
+              "  %t34 = insertvalue { ptr, ptr, i64 } %t33, ptr %t31, 1\n" +
+              "  %t35 = insertvalue { ptr, ptr, i64 } %t34, i64 %t32, 2\n" +
+              "  %t36 = extractvalue { ptr, ptr, i64 } %t35, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t36)\n" +
+              "  store { ptr, ptr, i64 } %t35, ptr %t25\n" +
+              "  %t37 = extractvalue { ptr, ptr, i64 } %t35, 0\n" +
+              "  call void @arc.release_maybe(ptr %t37)\n" +
+              "  br label %each.end8\n" +
+              "each.step7:\n" +
+              "  unreachable\n" +
+              "each.else9:\n" +
+              "  %t40 = icmp ule i64 0, 1\n" +
+              "  br i1 %t40, label %bounds.ok12, label %bounds.bad13\n" +
+              "bounds.bad13:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok12:\n" +
+              "  %t41 = getelementptr i32, ptr %frame.addr, i64 0\n" +
+              "  %t42 = sub i64 1, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t15)\n" +
+              "  %t43 = insertvalue { ptr, ptr, i64 } zeroinitializer, ptr %t15, 0\n" +
+              "  %t44 = insertvalue { ptr, ptr, i64 } %t43, ptr %t41, 1\n" +
+              "  %t45 = insertvalue { ptr, ptr, i64 } %t44, i64 %t42, 2\n" +
+              "  %t46 = extractvalue { ptr, ptr, i64 } %t45, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t46)\n" +
+              "  %t47 = extractvalue { ptr, ptr, i64 } %t45, 0\n" +
+              "  call void @arc.release_maybe(ptr %t47)\n" +
+              "  store { ptr, ptr, i64 } %t45, ptr %t25\n" +
+              "  br label %each.end8\n" +
+              "each.end8:\n" +
+              "  %t48 = load { ptr, ptr, i64 }, ptr %t25\n" +
+              "  %t49 = extractvalue { ptr, ptr, i64 } %t48, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t49)\n" +
+              "  %t50 = extractvalue { ptr, ptr, i64 } %t48, 0\n" +
+              "  call void @arc.release_maybe(ptr %t50)\n" +
+              "  %t51 = load ptr, ptr %frame.box\n" +
+              "  call void @arc.release(ptr %t51)\n" +
+              "  %t52 = load { ptr, ptr, i64 }, ptr %xs.addr\n" +
+              "  %t53 = extractvalue { ptr, ptr, i64 } %t52, 0\n" +
+              "  call void @arc.release_maybe(ptr %t53)\n" +
+              "  ret { ptr, ptr, i64 } %t48\n" +
+              "}\n")
+end a_view_broken_out_of_a_walk_promotes_what_it_views
+
 // A body with the number off each interned string it names, and everything else left alone.
 private without_form_str_ids(text: string) -> string
     var out: Buf[u8] = buf()
