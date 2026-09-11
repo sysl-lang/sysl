@@ -1,0 +1,170 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **The last step, which is somebody else's program.** Emission ends at LLVM text; what is asserted
+// here is which clang the text is handed to, what goes on its command line, and -- once -- that the
+// whole road from a source file to a running process is joined up.
+
+private library_present() -> bool = std_root().is_ok()
+
+private toolchain_present() -> bool = clang_available()
+
+private project_with(name: string, text: string) -> string
+    val root = make_temp_dir("sysl-build").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/$name", text).unwrap()
+    root
+end project_with
+
+// -- which clang, and what it is told ---------------------------------------------------------------
+
+// The name a back end is registered under is **not** the name a source file writes: LLVM spells the
+// 64-bit x86 back end `x86-64` where a source file says `x86_64`. Getting that wrong makes every
+// search for it fail on a clang that has it.
+@test("a processor's back end is named as LLVM registers it, not as a source file writes it")
+a_backend_is_named_as_llvm_registers_it()
+    assert_eq(cpu_backend(X86_64), "x86-64")
+    assert_eq(cpu_backend(Aarch64), "aarch64")
+    assert_eq(cpu_backend(Riscv32), "riscv32")
+    assert_eq(cpu_backend(Thumb), "thumb")
+    assert_eq(cpu_backend(Wasm32), "wasm32")
+    assert_eq(cpu_backend(Craft), "craft")
+end a_backend_is_named_as_llvm_registers_it
+
+// The triple goes on the command line as well as in the module because the two answer different
+// questions: the module's says what the code *is*, and the driver's decides which linker and which
+// system libraries it is linked against.
+@test("a link line names the triple, the level, and what the linker is to drop")
+a_link_line_names_the_machine()
+    var objects: Buf[string] = buf()
+
+    objects.push("side.o")
+
+    val line = link_command("clang", "p.ll", objects, "p", target_named("aarch64-macos").unwrap(),
+                            "1")
+
+    assert_eq(joined_with(line, " "),
+              "clang --target=arm64-apple-macosx -Wno-override-module -O1 -Wl,-dead_strip p.ll " +
+              "side.o -o p")
+end a_link_line_names_the_machine
+
+// The order is the linker's and not a style: an object is scanned left to right, so the C a tree
+// carried goes after the module that calls into it.
+@test("an ELF target is told to drop unreached sections by the other spelling")
+an_elf_link_drops_sections_by_its_own_name()
+    val line = link_command("clang", "p.ll", buf(), "p", target_named("x86_64-linux").unwrap(), "2")
+
+    assert_eq(joined_with(line, " "),
+              "clang --target=x86_64-unknown-linux-gnu -Wno-override-module -O2 -Wl,--gc-sections " +
+              "p.ll -o p")
+end an_elf_link_drops_sections_by_its_own_name
+
+// A person who wrote down which compiler to use is owed an error rather than a different one, so a
+// named clang is neither searched past nor fallen back from. The message is the reference's.
+@test("a named clang that has not got the back end is refused rather than searched past")
+a_named_clang_without_the_backend_is_refused()
+    if !toolchain_present() then return
+
+    find_clang(target_named("aarch64-macos").unwrap(), Some("/bin/echo")) match
+        Ok(_) -> assert(false, "'/bin/echo' is not a clang")
+        Err(why) ->
+            assert(why.index_of("has no 'aarch64' back end, so it cannot build for " +
+                                "'aarch64-macos'").is_some(), why)
+end a_named_clang_without_the_backend_is_refused
+
+@test("and a name nothing can run is refused before its back ends are asked for")
+a_named_clang_that_cannot_run_is_refused()
+    find_clang(target_named("aarch64-macos").unwrap(), Some("/no/such/clang")) match
+        Ok(_) -> assert(false, "there is no compiler at that path")
+        Err(why) ->
+            assert_eq(why, "cannot run '/no/such/clang' — --cc names the clang to build with")
+end a_named_clang_that_cannot_run_is_refused
+
+// **CRAFT is refused before anything is lowered.** The reader asked for a build of a machine that
+// cannot be built, which is one mistake with one answer, and a failure deep in the toolchain would
+// describe the last step rather than the first.
+@test("a machine with no C toolchain is refused with the commands that do work")
+a_machine_with_no_toolchain_is_refused()
+    val t = target_named("craft-freestanding").unwrap()
+
+    assert_eq(t.builds_with_clang(), false)
+    assert_eq(t.no_toolchain(),
+              "'craft-freestanding' has no C toolchain — its LLVM back end is out of tree, and the " +
+              "machine has no libc, no object format and no linker for sysl to drive. Write the " +
+              "LLVM with 'sysl emit-llvm --target craft-freestanding', then 'llc -march=craft' and " +
+              "'craft as'")
+    assert_eq(target_named("aarch64-macos").unwrap().builds_with_clang(), true)
+end a_machine_with_no_toolchain_is_refused
+
+// **A build sysl drives is several clang invocations**, so a flag that has to be on all of them
+// cannot be passed to one of them by hand. Nothing here validates what it says: whatever it says
+// goes to clang, and clang answers for it.
+@test("SYSL_EXTRA_CFLAGS is split on spaces and spliced into the link line")
+extra_flags_reach_the_link_line()
+    val flags = extra_cflags()
+
+    // The variable is the environment's and a test cannot set one, so what is pinned is the
+    // splitting rather than a value: with nothing set there is nothing to splice, and the link line
+    // is the one the tests above assert.
+    if flags.is_empty()
+        val line = link_command("clang", "p.ll", buf(), "p",
+                                target_named("aarch64-macos").unwrap(), "1")
+
+        assert_eq(line.len(), 8)
+    else
+        val line = link_command("clang", "p.ll", buf(), "p",
+                                target_named("aarch64-macos").unwrap(), "1")
+
+        assert_eq(line.len(), 8 + flags.len())
+end extra_flags_reach_the_link_line
+
+// -- the whole road ------------------------------------------------------------------------------
+
+// **A program built and run, which is the one claim nothing short of running can make.** It writes
+// an integer through C's own `printf` rather than through `print`: rendering a value is the string
+// runtime, which this compiler does not lower yet, so a program that used it would be gapped and
+// there would be nothing to link. What is exercised instead is every other part of the road -- a
+// variadic foreign call, an array in a frame, the address of one of its elements, the entry point,
+// the standard module's C compiled beside the program, and the link itself.
+@test("a program is compiled, linked and run, and says what it computed")
+a_program_is_built_and_run()
+    if !library_present() || !toolchain_present() then return
+
+    val root = project_with("main.sysl",
+                            "extern printf(fmt: *u8, ...) -> i32\n\n" +
+                            "var fmt: [4]u8 = [u8('%'), u8('d'), u8('\\n'), 0]\n\n" +
+                            "printf(&fmt[0], 6 * 7)\n")
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+        Ok(made) ->
+            assert_eq(made, exe)
+
+            val said = capture(exe, [], "", [], true)
+
+            remove_dir_all(root).unwrap_or(())
+
+            said match
+                Err(_) -> assert(false, "the program that was built could not be run")
+                Ok(out) ->
+                    assert(out.status.ok(), "the program did not exit cleanly")
+                    assert_eq(out.text, "42\n")
+end a_program_is_built_and_run
+
+private joined_with(xs: Buf[string], sep: string) -> string
+    var out = ""
+
+    for i in 0..<xs.len()
+        out = if i == 0 then xs.at(i) else s"$out$sep${xs.at(i)}"
+
+    out
+end joined_with

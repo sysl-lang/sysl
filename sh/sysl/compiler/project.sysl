@@ -140,6 +140,54 @@ private walk_tree(path: string, dir: Buf[string], os: Option[Os], within: Option
     Ok(())
 end walk_tree
 
+// **The C a tree carries**, with the same per-OS selection its sysl gets and the same rule about
+// what a module is: a directory the sysl walk claimed nothing from was never part of the tree, so
+// its `.c` files are compiled by nothing. Taking C out of one would compile whatever a build
+// directory or a vendored library happened to leave there.
+//
+// A root that names a **file** rather than a directory contributes nothing, which is the same rule
+// again: naming a file compiles that file alone, so there is no tree for C to have travelled with.
+c_sources(root: string, os: Option[Os]) -> Result[Buf[string], Selection]
+    var out: Buf[string] = buf()
+
+    if !is_directory(root) then return Ok(out)
+
+    walk_c(absolute_path(root), buf(), os, None, &out)?
+
+    Ok(out)
+end c_sources
+
+private walk_c(path: string, dir: Buf[string], os: Option[Os], within: Option[string],
+               out: *Buf[string]) -> Result[unit, Selection]
+    val here = contents(path, os, within)?
+
+    // The root is a module whatever it holds; every directory below it is one only where it holds
+    // sysl of its own.
+    var mine = dir.is_empty()
+
+    for i in 0..<here.files.len()
+        if is_sysl_file(here.files.at(i)) then mine = true
+
+    if mine
+        for i in 0..<here.files.len()
+            if here.files.at(i).ends_with(".c") then out.push(here.files.at(i))
+
+    for i in 0..<here.subs.len()
+        val sub = here.subs.at(i)
+
+        if !skipped_at_root(dir, sub.0)
+            var below: Buf[string] = buf()
+
+            for k in 0..<dir.len()
+                below.push(dir.at(k))
+
+            below.push(basename(sub.0))
+            walk_c(sub.0, below, os, sub.1, out)?
+        end if
+
+    Ok(())
+end walk_c
+
 // The root's `examples/` and `vendor/` are left out, and the `dir.is_empty()` test is what makes it
 // the *root's* one: everywhere else the name is ordinary.
 private skipped_at_root(dir: Buf[string], sub: string) -> bool

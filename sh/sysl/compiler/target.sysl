@@ -159,6 +159,15 @@ struct Target
     cpu: Cpu
     os: Os
 
+    // Whether a floating-point argument travels in an integer register here. It is a claim about the
+    // **convention** and not about the hardware: a machine may have a unit and still be built for
+    // the soft-float ABI, which is what a `-none-eabi` triple beside a `-none-eabihf` one says. Arm
+    // and RISC-V are the two families it decides anything for, and it decides one thing -- whether
+    // an aggregate of floating members has floating registers to travel in.
+    soft_float: bool
+
+    hard_float(self) -> bool = !self.soft_float
+
     // How wide an address is here, which is the processor's answer and every target on one agrees.
     pointer_bits(self) -> usize = cpu_bits(self.cpu)
 
@@ -174,6 +183,19 @@ struct Target
     // is worth naming: the diagnostic then says what is missing instead of leaving the name unknown,
     // which reads as a typo.
     supported(self) -> bool = cpu_symbol(self.cpu) != "x86"
+
+    // Whether a build for this machine is one sysl can drive at all. CRAFT's LLVM back end is out
+    // of tree and the machine has no libc, no object format and no linker, so there is nothing for a
+    // driver to run.
+    builds_with_clang(self) -> bool = self.cpu != Craft
+
+    // What to say to somebody who asked for a build sysl cannot drive -- the sentence, once, so that
+    // every command refusing does not invent its own half of it. The answer names what *does* work,
+    // since there is one.
+    no_toolchain(self) -> string =
+        s"'${self.name}' has no C toolchain — its LLVM back end is out of tree, and the machine has " +
+        "no libc, no object format and no linker for sysl to drive. Write the LLVM with 'sysl " +
+        s"emit-llvm --target ${self.name}', then 'llc -march=${cpu_backend(self.cpu)}' and 'craft as'"
 
     // What is missing, where something is. The reason is a **measured calling convention** and not
     // an address width: all three widths are built for, and a reader sent looking for a width limit
@@ -192,28 +214,28 @@ end Target
 all_targets() -> Buf[Target]
     var out: Buf[Target] = buf()
 
-    out.push(Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS))
-    out.push(Target("x86_64-macos", "x86_64-apple-macosx", X86_64, MacOS))
-    out.push(Target("aarch64-linux", "aarch64-unknown-linux-gnu", Aarch64, Linux))
-    out.push(Target("x86_64-linux", "x86_64-unknown-linux-gnu", X86_64, Linux))
-    out.push(Target("riscv64-linux", "riscv64-unknown-linux-gnu", Riscv64, Linux))
-    out.push(Target("x86_64-windows", "x86_64-pc-windows-msvc", X86_64, Windows))
-    out.push(Target("aarch64-android", "aarch64-linux-android24", Aarch64, Android))
-    out.push(Target("aarch64-freestanding", "aarch64-none-elf", Aarch64, Freestanding))
-    out.push(Target("x86_64-freestanding", "x86_64-unknown-none-elf", X86_64, Freestanding))
-    out.push(Target("riscv64-freestanding", "riscv64-unknown-elf", Riscv64, Freestanding))
-    out.push(Target("thumb-freestanding", "thumbv8m.main-none-eabihf", Thumb, Freestanding))
-    out.push(Target("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Thumb, Freestanding))
-    out.push(Target("thumb-freestanding-soft", "thumbv8m.main-none-eabi", Thumb, Freestanding))
-    out.push(Target("thumbv6m-freestanding", "thumbv6m-none-eabi", Thumb, Freestanding))
-    out.push(Target("thumbv7m-freestanding", "thumbv7m-none-eabi", Thumb, Freestanding))
-    out.push(Target("thumbv7em-freestanding", "thumbv7em-none-eabihf", Thumb, Freestanding))
-    out.push(Target("thumbv7em-freestanding-soft", "thumbv7em-none-eabi", Thumb, Freestanding))
-    out.push(Target("riscv32-freestanding", "riscv32-unknown-elf", Riscv32, Freestanding))
-    out.push(Target("wasm32-freestanding", "wasm32-unknown-unknown", Wasm32, Freestanding))
-    out.push(Target("wasm32-wasi", "wasm32-wasip1", Wasm32, Wasi))
-    out.push(Target("craft-freestanding", "craft", Craft, Freestanding))
-    out.push(Target("x86-linux", "i386-unknown-linux-gnu", X86, Linux))
+    out.push(Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false))
+    out.push(Target("x86_64-macos", "x86_64-apple-macosx", X86_64, MacOS, false))
+    out.push(Target("aarch64-linux", "aarch64-unknown-linux-gnu", Aarch64, Linux, false))
+    out.push(Target("x86_64-linux", "x86_64-unknown-linux-gnu", X86_64, Linux, false))
+    out.push(Target("riscv64-linux", "riscv64-unknown-linux-gnu", Riscv64, Linux, false))
+    out.push(Target("x86_64-windows", "x86_64-pc-windows-msvc", X86_64, Windows, false))
+    out.push(Target("aarch64-android", "aarch64-linux-android24", Aarch64, Android, false))
+    out.push(Target("aarch64-freestanding", "aarch64-none-elf", Aarch64, Freestanding, false))
+    out.push(Target("x86_64-freestanding", "x86_64-unknown-none-elf", X86_64, Freestanding, false))
+    out.push(Target("riscv64-freestanding", "riscv64-unknown-elf", Riscv64, Freestanding, true))
+    out.push(Target("thumb-freestanding", "thumbv8m.main-none-eabihf", Thumb, Freestanding, false))
+    out.push(Target("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Thumb, Freestanding, true))
+    out.push(Target("thumb-freestanding-soft", "thumbv8m.main-none-eabi", Thumb, Freestanding, true))
+    out.push(Target("thumbv6m-freestanding", "thumbv6m-none-eabi", Thumb, Freestanding, true))
+    out.push(Target("thumbv7m-freestanding", "thumbv7m-none-eabi", Thumb, Freestanding, true))
+    out.push(Target("thumbv7em-freestanding", "thumbv7em-none-eabihf", Thumb, Freestanding, false))
+    out.push(Target("thumbv7em-freestanding-soft", "thumbv7em-none-eabi", Thumb, Freestanding, true))
+    out.push(Target("riscv32-freestanding", "riscv32-unknown-elf", Riscv32, Freestanding, true))
+    out.push(Target("wasm32-freestanding", "wasm32-unknown-unknown", Wasm32, Freestanding, false))
+    out.push(Target("wasm32-wasi", "wasm32-wasip1", Wasm32, Wasi, false))
+    out.push(Target("craft-freestanding", "craft", Craft, Freestanding, true))
+    out.push(Target("x86-linux", "i386-unknown-linux-gnu", X86, Linux, false))
     out
 end all_targets
 
@@ -328,5 +350,5 @@ end host_cpu
 host_target() -> Target
     target_named(host_name(cpu_symbol(host_cpu()), os_symbol(host_os()))) match
         Some(t) -> t
-        None -> Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS)
+        None -> Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false)
 end host_target

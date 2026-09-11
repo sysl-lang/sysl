@@ -229,7 +229,89 @@ check_exports_emitted(a: &Analysis, p: TProgram, own: Buf[string])
         export_signature(a, exported.at(i))
 
     export_duplicates(a, exported)
+    export_names(a, exported)
 end check_exports_emitted
+
+// Two things in one header answering to one name.
+//
+// **This is the property `@export("...")` on a struct takes away, so it is the property this hands
+// back.** A derived name is the mangled instantiation, which is unique because a module path is in
+// it; a chosen one is a claim the author makes, and two of them may agree -- or one may land on
+// another struct's derived name. Both are the same mistake, and it is `export_duplicates` read at
+// the other kind of declaration.
+//
+// **A function is in the list too, because C has one namespace and not two.** At file scope a
+// `typedef` name and a function name are both ordinary identifiers, so a header carrying `typedef
+// struct { ... } add;` beside `add add(...)` is not two declarations that happen to rhyme -- it is
+// one name declared twice, and the consumer's compiler says so. Nothing on the sysl side suggests
+// it: the two are a type and a function, which collide nowhere here.
+//
+// The types are the ones that actually **reach the header** rather than every struct in the program,
+// because a name is only claimed where the type is in an exported signature: two modules may each
+// declare a `Point` and name it, and while only one of them is reachable there is nothing to
+// collide.
+//
+// A symbol claimed by two *functions* is left to `export_duplicates`, whose sentence is about the
+// linker and is the better one for that case -- hence a group having to hold a type to be reported
+// here.
+private export_names(a: &Analysis, exported: Buf[TFunc])
+    val types = header_aggregates(exported)
+
+    var names: Buf[string] = buf()
+    var what: Buf[Buf[string]] = buf()
+
+    for i in 0..<types.len()
+        claim(&names, &what, c_name(types.at(i)), s"the type '${type_show(types.at(i))}'")
+
+    var typed: Buf[string] = buf()
+
+    for i in 0..<names.len()
+        typed.push(names.at(i))
+
+    for i in 0..<exported.len()
+        val f = exported.at(i)
+
+        claim(&names, &what, f.exported.unwrap(), s"the function '${module_show(f.name)}'")
+
+    val order = sorted_names(names)
+
+    for i in 0..<order.len()
+        val name = order.at(i)
+
+        if holds_string(typed, name)
+            val group = claimants_of(names, what, name)
+
+            if group.len() > 1
+                val at = exported.at(0)
+
+                a.fault(func_home(a, at.name), at.span,
+                        s"'$name' is the C name of ${joined_and(sorted_names(group))} — a header " +
+                        "declares both in one namespace, so a C project including it would see " +
+                        "the name twice. Give each the name it should carry, '@export(\"...\")'")
+end export_names
+
+private claim(names: *Buf[string], what: *Buf[Buf[string]], name: string, said: string)
+    for i in 0..<names.len()
+        if names.at(i) == name
+            var group = what.at(i)
+
+            group.push(said)
+            what.set(i, group)
+            return
+
+    var group: Buf[string] = buf()
+
+    group.push(said)
+    names.push(name)
+    what.push(group)
+end claim
+
+private claimants_of(names: Buf[string], what: Buf[Buf[string]], name: string) -> Buf[string]
+    for i in 0..<names.len()
+        if names.at(i) == name then return what.at(i)
+
+    buf()
+end claimants_of
 
 // A parameter or a result C has no way to spell.
 //

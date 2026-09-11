@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Source
 import sysl.buf.{Buf, buf}
 import sysl.text.{str_builder, Search}
+import sysl.fs.remove_file
 
 // What one invocation compiles: the program's files, the packages it depends on, and the standard
 // module every program is compiled against.
@@ -272,3 +273,103 @@ private tables_text(c: Compilation) -> string
     read_decls(a, c.units)
     show_funcs_table_of(a, c.own)
 end tables_text
+
+// `sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path>` -- one program,
+// compiled and linked into something the machine will run.
+//
+// **Emission ends at LLVM text and a build does not.** What is decided here is the whole of the rest:
+// which clang, what C the tree carried, and what is on the link line. The text itself is exactly what
+// `emit-llvm` prints, so a build and a diff are the same lowering seen twice.
+//
+// The library's own C is compiled beside the program's, because this compiler defines the library's
+// functions rather than declaring them against an artifact somebody already built -- so whatever
+// those definitions call into has to be here too.
+build_native_program(path: string, named_target: Option[string], cc: Option[string], level: string,
+                     out: Option[string]) -> Result[string, Refusal]
+    val t = target_for(path, named_target)?
+
+    // Asked **before** anything is lowered: the reader asked for a build of a machine that cannot be
+    // built, which is one mistake with one answer, and a failure deep in the toolchain would
+    // describe the last step rather than the first.
+    if !t.builds_with_clang() then return Err(Refusal(t.no_toolchain()))
+
+    val emitted = emit_llvm_text(path, named_target)?
+
+    if !emitted.report.is_empty() then return Err(Refusal(analysis_report(emitted.report)))
+
+    val clang = find_clang(t, cc) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(found) -> found
+
+    val exe = out match
+        Some(named) -> named
+        None -> default_executable(path)
+
+    val objects = native_objects(clang, path, exe, t, level)?
+
+    build_native(clang, emitted.text, objects, exe, t, level) match
+        Err(why) ->
+            discard_objects(objects)
+            return Err(Refusal(why))
+        Ok(_) -> ()
+
+    discard_objects(objects)
+    Ok(exe)
+end build_native_program
+
+// Where a build puts what it made, when nothing said: the program is the product, so it is named for
+// the directory it was written in, and a single file for the file itself.
+private default_executable(path: string) -> string
+    val name = basename(path)
+
+    if !is_sysl_file(name) then return s"./$name"
+
+    var at = name.bytes.len
+
+    for i in 0..<name.bytes.len
+        if name.bytes[i] == u8('.') then at = i
+
+    s"./${name[0..<at]}"
+end default_executable
+
+// Every `.c` the library and the program carry, compiled for this machine.
+//
+// **The library's is here because this compiler defines what the reference declares.** A build the
+// reference drives links an artifact whose C was compiled when the artifact was, so its driver has
+// none of this to do for the standard module; here the library's definitions are in the module being
+// linked and the C they call is a file on disk.
+private native_objects(clang: string, path: string, exe: string, t: Target,
+                       level: string) -> Result[Buf[string], Refusal]
+    var trees: Buf[string] = buf()
+
+    std_root() match
+        Err(why) -> return Err(Refusal(why))
+        Ok(dir) -> trees.push(dir)
+
+    if is_directory(path) then trees.push(path)
+
+    var objects: Buf[string] = buf()
+    var n = 0
+
+    for i in 0..<trees.len()
+        val found = c_sources(trees.at(i), Some(t.os)) match
+            Err(e) -> return Err(Refusal(e.message))
+            Ok(cs) -> cs
+
+        for j in 0..<found.len()
+            val obj = s"$exe.$n.o"
+
+            n += 1
+
+            compile_c(clang, found.at(j), obj, t, level) match
+                Err(why) ->
+                    discard_objects(objects)
+                    return Err(Refusal(why))
+                Ok(_) -> objects.push(obj)
+
+    Ok(objects)
+end native_objects
+
+private discard_objects(objects: Buf[string])
+    for i in 0..<objects.len()
+        remove_file(objects.at(i))

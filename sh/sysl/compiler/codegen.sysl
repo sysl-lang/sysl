@@ -49,14 +49,23 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
         val f = p.funcs.at(i)
 
         if !f.ghost
-            if f.exported.is_some()
-                gaps.push((f.name, "an exported function's C-callable entry"))
-            else
-                set_promoted(e, pr.for_func(f.name))
+            set_promoted(e, pr.for_func(f.name))
 
-                gen_function(e, f) match
-                    Some(built) -> funcs.push(built)
-                    None -> gaps.push((f.name, gap_text(e)))
+            gen_function(e, f) match
+                Some(built) -> funcs.push(built)
+                None -> gaps.push((f.name, gap_text(e)))
+
+    // The C-callable entry each `@export` publishes, in front of the definition it calls. Every one
+    // of them is built after the definitions, which is the order the reference's text has them in.
+    var thunks: Buf[IrFunc] = buf()
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if !f.ghost && f.exported.is_some()
+            gen_export_thunk(e, f, symbol_of(e, f.name)) match
+                Some(built) -> thunks.push(built)
+                None -> gaps.push((s"${f.name} thunk", gap_text(e)))
 
     // Storage the linker supplies and storage this module lays down, held apart from the two words a
     // `bool` renders as -- which go in front of both and are not known to be needed until the last
@@ -149,7 +158,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
         globals.push(vtables.at(i))
 
     val m = IrModule(t.triple, declares(e, p), struct_defs(p, word_bits), enum_defs(p, layout),
-                     box_defs(e, word_bits), no_sigs(), globals, helpers, funcs, no_funcs(), entry,
+                     box_defs(e, word_bits), no_sigs(), globals, helpers, funcs, thunks, entry,
                      used_of(p, funcs), None)
 
     (m, gaps)
@@ -254,7 +263,8 @@ private gap_text(e: *Emit) -> string = e.gap match
     None -> "nothing"
 
 // What a call names, where the key and the emitted symbol are two different things: an `extern` under
-// a link name of its own, and the entry point, which is defined under a name of the compiler's.
+// a link name of its own, a definition displaced by an export that claimed its name, and the entry
+// point, which is defined under a name of the compiler's.
 private record_symbols(e: *Emit, p: TProgram)
     for i in 0..<p.externs.len()
         val x = p.externs.at(i)
@@ -263,10 +273,31 @@ private record_symbols(e: *Emit, p: TProgram)
 
         e.foreigns.push(x.name)
 
-        if x.variadic then e.variadics.push(x.name)
+        if x.variadic
+            e.variadics.push(x.name)
+            e.variadic_types.push((x.name, foreign_signature(e, x.ret_ty, x.params, true)))
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
+
+        f.exported match
+            Some(sym) -> e.export_symbols.push((f.name, sym))
+            None -> ()
+
+    // **A symbol C has claimed is not available to a sysl definition.** A key is normally
+    // `module$name`, which no exported symbol can be -- `$` is not a C identifier character. A
+    // function in the **root** module has no such qualification, so its key *is* the bare name, and
+    // an export under its own name there claims the very symbol the definition would be emitted
+    // under: two definitions of one symbol, which clang reports as an invalid redefinition of a
+    // function nobody wrote twice.
+    //
+    // **Renaming the definition rather than the thunk keeps the promise the right way round**: the
+    // exported symbol is the one somebody outside has written down, and a mangled key is this
+    // compiler's own business.
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if is_displaced(e, f.name) then e.symbols.push((f.name, s"${f.name}${ModuleSep}${ModuleSep}sysl"))
 
         if f.variadic then e.variadics.push(f.name)
 
@@ -275,12 +306,21 @@ private record_symbols(e: *Emit, p: TProgram)
         None -> ()
 end record_symbols
 
+// Whether an export elsewhere in the program has claimed this key as its symbol -- whoever else
+// wanted it.
+private is_displaced(e: *Emit, name: string) -> bool
+    for i in 0..<e.export_symbols.len()
+        if e.export_symbols.at(i).1 == name then return true
+
+    false
+end is_displaced
+
 // The declarations the module turned out to need: LLVM's own first, then the `extern`s, then the
 // intrinsics a body asked for by name.
 //
-// **An `extern` whose signature is not all scalars is not declared here yet.** How an aggregate
-// crosses to a foreign callee is the C convention's answer, measured per machine, and a declaration
-// composed without it would be a promise this compiler cannot keep.
+// **An aggregate does not cross to a foreign callee as itself**: the convention the other side was
+// compiled against says which registers it arrives in, so that is what the declaration names
+// (`emit_foreign.sysl`).
 private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     var out: Buf[IrFuncSig] = buf()
 
@@ -328,6 +368,15 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         write_params.push(ir_param(word_lty(e)))
         out.push(ir_sig("write", ir_fn_type(word_lty(e), write_params)))
 
+    if e.uses_memcpy
+        var copy_params: Buf[IrParam] = buf()
+
+        copy_params.push(ir_param(LPtr))
+        copy_params.push(ir_param(LPtr))
+        copy_params.push(ir_param(LInt(64)))
+        copy_params.push(ir_param(l_i1()))
+        out.push(ir_sig(memcpy_symbol(), ir_fn_type(LVoid, copy_params)))
+
     var seen: Buf[string] = buf()
 
     for i in 0..<p.funcs.len()
@@ -338,54 +387,15 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     for i in 0..<p.externs.len()
         val x = p.externs.at(i)
 
-        if !holds(seen, x.symbol) && all_scalar(x)
+        if !holds(seen, x.symbol)
             seen.push(x.symbol)
-            out.push(ir_sig(x.symbol, foreign_signature(e, x)))
+            out.push(ir_sig(x.symbol, foreign_signature(e, x.ret_ty, x.params, x.variadic)))
 
     for i in 0..<e.sat_decls.len()
         out.push(e.sat_decls.at(i))
 
     out
 end declares
-
-// Whether every type an `extern` names crosses in a register as itself.
-private all_scalar(x: TExtern) -> bool
-    if !crosses_plainly(x.ret_ty) then return false
-
-    for i in 0..<x.params.len()
-        if !crosses_plainly(x.params.at(i)) then return false
-
-    true
-end all_scalar
-
-private crosses_plainly(t: Type) -> bool = underlying(t) match
-    Integer(_, _, _) -> true
-    Floating(_) -> true
-    Bool -> true
-    Char -> true
-    Ptr(_) -> !erased(underlying(t))
-    CFn(_, _) -> true
-    Unit -> true
-    Never -> true
-    Enum(d) -> d.simple
-    _ -> false
-
-// What a foreign declaration says, for the signatures every part of which crosses as itself. A
-// narrow scalar carries the convention's extension on each side.
-private foreign_signature(e: *Emit, x: TExtern) -> IrFnType
-    var params: Buf[IrParam] = buf()
-
-    for i in 0..<x.params.len()
-        val p = x.params.at(i)
-
-        if !zero_sized(p) then params.push(IrParam(lty(e, p), c_extension(p, e.target), None))
-
-    val void = no_value(x.ret_ty)
-    val ret = if void then LVoid else lty(e, x.ret_ty)
-    val ret_attrs = if void then no_ir_attrs() else c_extension(x.ret_ty, e.target)
-
-    IrFnType(ret, params, x.variadic, ret_attrs)
-end foreign_signature
 
 // A whole module as LLVM text, which is what `emit-llvm` prints.
 codegen_text(p: TProgram, t: Target) -> string = ir_print_module(codegen_module(p, t))
@@ -480,7 +490,7 @@ private is_type_def(line: string) -> bool
 end is_type_def
 
 // Whether one string holds another.
-private holds_text(text: string, needle: string) -> bool
+holds_text(text: string, needle: string) -> bool
     val n = needle.bytes.len
 
     if n > text.bytes.len then return false
@@ -593,6 +603,39 @@ emit_func_text(text: string, symbol: string) -> string
     ""
 end emit_func_text
 
+// One source lowered **for a named machine**, and every `declare` line of the module -- which is
+// where a calling convention is written down, since a declaration is the whole of what one side of
+// a foreign call agrees to.
+//
+// The target is a name rather than a row because that is what a command line writes, and an unknown
+// one answers with a sentence rather than nothing at all. Every line comes back from one
+// compilation, so a test asking about both directions of one shape pays for one.
+emit_declare_lines(text: string, target_name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    val t = target_named(target_name) match
+        Some(row) -> row
+        None ->
+            out.push(s"no target named '$target_name'")
+            return out
+
+    val done = typed_of_target(text, t)
+
+    if !done.reported.is_empty()
+        out.push(done.reported.at(0).diag.message)
+        return out
+    end if
+
+    val p = strip_tests(program_of(done, done.main_module))
+    val lowered = codegen_with_gaps(p, t, check_escapes(done.an, p))
+    val lines = lines_of(ir_print_module(lowered.0))
+
+    for i in 0..<lines.len()
+        if holds_text(lines.at(i), "declare ") then out.push(lines.at(i))
+
+    out
+end emit_declare_lines
+
 // Why the function named was not lowered, or an empty string where it was.
 emit_gap_for(text: string, name: string) -> string
     val done = typed_of(text)
@@ -609,20 +652,24 @@ emit_gap_for(text: string, name: string) -> string
 end emit_gap_for
 
 // The symbols a program is left with once nothing it can reach has been dropped.
-emit_kept_funcs(text: string) -> Buf[string]
+emit_kept_funcs(text: string) -> Buf[string] = emit_kept_funcs_in(text, buf())
+
+// The same, for a compilation that names the modules it is answerable for -- which is what a driver
+// hands the walk, and what decides whether a root the program did not write counts at all.
+emit_kept_funcs_in(text: string, own: Buf[string]) -> Buf[string]
     val done = typed_of(text)
 
     var out: Buf[string] = buf()
 
     if !done.reported.is_empty() then return out
 
-    val p = prune(strip_tests(program_of(done, done.main_module)), buf())
+    val p = prune(strip_tests(program_of(done, done.main_module)), own)
 
     for i in 0..<p.funcs.len()
         out.push(p.funcs.at(i).name)
 
     out
-end emit_kept_funcs
+end emit_kept_funcs_in
 
 // What the checks between the analyzer and the lowering refuse, in the order they say it.
 //

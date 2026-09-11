@@ -130,7 +130,9 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TCall(name, args, ty, _) ->
         if e.tail_target != "" && is_tail_call(e.tail_calls, x.span) then gen_tail_self_call(e, args)
         else gen_call(e, name, args, ty)
-    TFuncAddr(_, entry, _) -> VGlobal(symbol_of(e, entry))
+    // An address is the C-callable entry rather than the definition, since a `*extern` may only
+    // hold something C can call.
+    TFuncAddr(_, entry, _) -> VGlobal(entry_of(e, entry))
 
     TBlockExpr(b) ->
         if zero_sized(b.ty)
@@ -918,7 +920,16 @@ private gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
 end gen_tail_self_call
 
 private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
-    if is_foreign(e, name) then return gap_at(e, "a call to an extern")
+    // A foreign result may be named by a type the sysl signature never mentions -- a coerced
+    // aggregate, or `void` where the value comes back through an out-parameter -- and a variadic
+    // callee is named by its whole function type, since the argument list alone does not say where
+    // the declared parameters stop and the ellipsis begins.
+    if is_foreign(e, name)
+        val form = foreign_result(e, ty)
+
+        return gen_foreign_call(e, CallForm(form.ret, form.ret_attrs, variadic_type_of(e, name)),
+                                VGlobal(symbol_of(e, name)), args, ty)
+
     if is_variadic(e, name) then return gap_at(e, "a call to a variadic function")
 
     var arg_vals: Buf[IrArg] = buf()

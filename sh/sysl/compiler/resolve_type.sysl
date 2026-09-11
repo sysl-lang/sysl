@@ -70,8 +70,7 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     AssocType(base, member) ->
         assoc_type(a, scope, t.span, resolve_type(a, scope, base, subst), member)
     AssocArgType(_, inner) -> resolve_type(a, scope, inner, subst)
-    ValueArgType(e) -> ConstArg(from_int(long(const_extent(a, scope, t.span, e, subst))),
-                               int_type())
+    ValueArgType(e) -> const_argument(a, scope, t.span, e, subst)
 
 // Every type of a list, in order.
 resolve_list(a: &Analysis, scope: Scope, ts: Buf[TypeRef], subst: Buf[Binding]) -> Buf[Type]
@@ -225,13 +224,10 @@ private resolve_tuple(a: &Analysis, scope: Scope, parts: Buf[TypeRef], results: 
     // generic body that is the stand-ins, and for an instantiation it is the parts the subject
     // matched. Either way the tuple built here is an ordinary one, so nothing downstream of this
     // point knows a pack was written.
-    val packed = sole_pack_name(parts)
+    val packed = sole_pack_parts(subst, parts)
 
     if packed.is_some()
-        val ts = bound_type(subst, packed.unwrap()) match
-            Some(Pack(elems)) -> elems
-            _ -> buf()
-        val d = registered_tuple(a, ts)
+        val d = registered_tuple(a, packed.unwrap())
 
         return if results then Results(d) else Struct(d)
     end if
@@ -242,14 +238,18 @@ private resolve_tuple(a: &Analysis, scope: Scope, parts: Buf[TypeRef], results: 
     if results then Results(d) else Struct(d)
 end resolve_tuple
 
-// The pack a one-part tuple reference is written over, where that is what it is.
-private sole_pack_name(parts: Buf[TypeRef]) -> Option[string]
+// The parts a one-part tuple reference stands for, where it is written over a pack and that pack is
+// bound. A name that stands for anything else is left to the ordinary walk, which reads it as the
+// stand-in it is -- a shape mentioning a parameter, and so one nothing lays out.
+private sole_pack_parts(subst: Buf[Binding], parts: Buf[TypeRef]) -> Option[Buf[Type]]
     if parts.len() != 1 then return None
 
     *parts.at(0).kind match
-        PackType(n) -> Some(n)
+        PackType(n) -> bound_type(subst, n) match
+            Some(Pack(elems)) -> Some(elems)
+            _ -> None
         _ -> None
-end sole_pack_name
+end sole_pack_parts
 
 // The struct a tuple of these types is: `$tupleN`, its arguments the parts, its fields numbered.
 tuple_type(ts: Buf[Type]) -> &StructType
@@ -335,6 +335,31 @@ private const_extent(a: &Analysis, scope: Scope, span: Span, e: Expr,
 
     usize(n)
 end const_extent
+
+// A written value argument, as the identity a type carries it in: the number it stands for and the
+// kind that says how to read it back.
+//
+// **A `bool` and a `char` are values a type's identity may hold** as much as an integer is -- each
+// compares and each mangles -- so folding one to a number and calling it a length would make
+// `Flag[true]` and `Flag[false]` one type. The kind is kept beside the number for the same reason
+// the declared type is kept beside a constant: it is the half that makes the number mean something.
+private const_argument(a: &Analysis, scope: Scope, span: Span, e: Expr,
+                       subst: Buf[Binding]) -> Type
+    val inner = analyzer_for(a, scope)
+
+    inner.subst = subst
+
+    val mark = a.complaints()
+    val folded = const_fold(inner, e)
+
+    a.restore_complaints(mark)
+
+    folded match
+        Some(ConstBool(b)) -> ConstArg(from_int(if b then 1 else 0), Bool)
+        Some(ConstChar(c)) -> ConstArg(from_int(long(int(u32(c)))), Char)
+        Some(ConstInt(v)) -> ConstArg(v, int_type())
+        _ -> ConstArg(from_int(long(const_extent(a, scope, span, e, subst))), int_type())
+end const_argument
 
 private digits_value(digits: string, base: int) -> usize
     var n: usize = 0
@@ -666,8 +691,13 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
 
     // **`@align` is part of what the layout IS**, so it is folded here rather than left for whoever
     // asks the size: it is fixed while compiling and is part of what the module publishes.
+    //
+    // **So is the name a C header declares the aggregate under**, which is what `@export("...")` on
+    // a struct chooses; where the attribute is written with no name of its own, the declaration's
+    // bare name is what it chose.
     val made: &StructType = StructType(key, targs, buf(), d.packed,
-                                       aligned_to(a, scope, span, written, d.alignment), None)
+                                       aligned_to(a, scope, span, written, d.alignment),
+                                       exported_c_name(d))
     val ty = Struct(made)
 
     a.tables.in_progress.put(inst, ty)
@@ -954,3 +984,11 @@ end range_end
 // Whether a `type` declaration is only another spelling for what it names -- no `is`, no range, no
 // predicate.
 is_plain_alias(d: TypeDecl) -> bool = !d.derived && d.range.is_none() && d.pred.is_none()
+
+// The name a C header declares a struct under, where the declaration asked for one -- the symbol it
+// wrote, or its own bare name where it named the attribute and nothing else.
+private exported_c_name(d: StructDecl) -> Option[string] = d.cname match
+    Some(e) -> e.symbol match
+        Some(sym) -> Some(sym)
+        None -> Some(module_bare(d.name))
+    None -> None

@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
 
 // **The substrate a body is written into**: registers, basic blocks, the entry-block prologue, and
 // the module-level constants a body lays down as it goes.
@@ -80,6 +81,16 @@ struct Emit
     symbols: Buf[(string, string)]
     foreigns: Buf[string]
     variadics: Buf[string]
+
+    // The whole LLVM function type of every `extern` whose parameter list is open at the end, which
+    // is what a call to one names instead of a result type: the argument list alone does not say
+    // where the declared parameters stop and the ellipsis begins.
+    variadic_types: Buf[(string, IrFnType)]
+
+    // The exported symbol of each function that has one, which is the **thunk's** rather than the
+    // definition's. It is what an *address* of the function names, since the thunk is the one entry
+    // point callable under the machine's C convention.
+    export_symbols: Buf[(string, string)]
 
     // The postconditions the function being lowered states, and what `result` stands for while one
     // of them is being emitted. A return owes nothing beyond the `ret` where there are none.
@@ -196,6 +207,29 @@ is_foreign(e: *Emit, name: string) -> bool
     false
 end is_foreign
 
+// The symbol an **address** of this function names -- the one entry point that is callable under
+// the machine's C convention, since that is the only thing a `*extern` may hold.
+//
+// For an ordinary function the two are the same and this is `symbol_of`: its signature is all
+// scalars, or the address would have been refused, and a scalar crosses as itself. For an exported
+// one they are not -- the definition keeps sysl's lowering and the thunk in front of it is what C
+// can call -- so the address is the thunk's, which is what makes `&f` on an exported function mean
+// anything.
+entry_of(e: *Emit, name: string) -> string
+    for i in 0..<e.export_symbols.len()
+        if e.export_symbols.at(i).0 == name then return e.export_symbols.at(i).1
+
+    symbol_of(e, name)
+end entry_of
+
+// The whole function type a call to a variadic callee names, where the callee is one.
+variadic_type_of(e: *Emit, name: string) -> Option[IrFnType]
+    for i in 0..<e.variadic_types.len()
+        if e.variadic_types.at(i).0 == name then return Some(e.variadic_types.at(i).1)
+
+    None
+end variadic_type_of
+
 // Whether a key names something whose parameter list is open at the end.
 is_variadic(e: *Emit, name: string) -> bool
     for i in 0..<e.variadics.len()
@@ -259,11 +293,13 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
     var promoted_boxes: Buf[(string, Val)] = buf()
     var promoted_temps: Buf[Span] = buf()
     var ref_places: Buf[(string, TExpr)] = buf()
+    var variadic_types: Buf[(string, IrFnType)] = buf()
+    var export_symbols: Buf[(string, string)] = buf()
 
     Emit(t, layout_for(t), int(t.pointer_bits()), globals, 0, sat_decls, false, false, false,
          false, false, false, 0,
          prologue, blocks, current, None, "entry", 0, 0, false, reached, loops, scratch, symbols,
-         foreigns, variadics, ensures, None, "", tail_calls, tail_params, destructors, false, false, false,
+         foreigns, variadics, variadic_types, export_symbols, ensures, None, "", tail_calls, tail_params, destructors, false, false, false,
          false, boxes, bufs, requested, queue, temps, temp_marks, owned_slots, owned_marks, defers,
          defer_marks, promoted, promoted_boxes, promoted_temps, ref_places, None)
 end emitter_for
@@ -345,6 +381,33 @@ end emit_alloca
 
 // A slot with whatever boundary the type it holds already asks for.
 alloca(e: *Emit, name: Val, ty: LType) -> Val = emit_alloca(e, name, ty, None)
+
+// The one overload of `llvm.memcpy` this compiler emits, so the two sites that name it -- the
+// declaration and the call -- cannot spell it differently. Both pointers are in the default address
+// space and the length is 64 bits on every target, whatever the machine's word is.
+memcpy_symbol() -> string = "llvm.memcpy.p0.p0.i64"
+
+// A block of storage copied, at a boundary both ends are known to satisfy.
+//
+// The one call in the module the intrinsic is declared for, so the flag that declares it is set here
+// rather than at each site that copies -- a caller that stops copying stops declaring it, and one
+// that starts brings the declaration with it.
+emit_memcpy(e: *Emit, dst: Val, src: Val, bytes: int, align: int)
+    e.uses_memcpy = true
+
+    var args: Buf[IrArg] = buf()
+    var dst_attrs: Buf[IrAttr] = buf()
+    var src_attrs: Buf[IrAttr] = buf()
+
+    dst_attrs.push(AttrAlign(align))
+    src_attrs.push(AttrAlign(align))
+    args.push(IrArg(LPtr, dst, dst_attrs))
+    args.push(IrArg(LPtr, src, src_attrs))
+    args.push(ir_arg(LInt(64), VInt(from_int(long(bytes)))))
+    args.push(ir_arg(LInt(1), VBool(false)))
+    emit(e, InCall(None, LVoid, VGlobal(memcpy_symbol()), args, no_ir_attrs(), None,
+                   no_fast_math(), false))
+end emit_memcpy
 
 // Emits a block terminator, marks the block closed, and records wherever it sends control -- which
 // is what makes the labels it names reachable.

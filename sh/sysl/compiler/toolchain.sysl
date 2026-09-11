@@ -1,0 +1,296 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.process.{capture, run, Status}
+import sysl.fs.{remove_file, write_text}
+import sysl.env.{get as env_var}
+
+// **The C toolchain a build drives**: which clang, what it is handed, and what comes back.
+//
+// Emission ends at LLVM text. Turning that text into something the machine will run is somebody
+// else's program, and the whole of what is decided here is *which* program and *what is on its
+// command line* -- the two things a cross build gets wrong silently.
+
+// The optimization level a build passes when nothing said otherwise.
+val DefaultOptimization: string = "1"
+
+// What a processor's back end is registered under, which is the name `-print-targets` prints and
+// **not** the name a source file writes: LLVM spells the 64-bit x86 back end `x86-64` where a
+// source file says `x86_64`.
+cpu_backend(cpu: Cpu) -> string = cpu match
+    Aarch64 -> "aarch64"
+    X86_64 -> "x86-64"
+    Riscv64 -> "riscv64"
+    Riscv32 -> "riscv32"
+    Thumb -> "thumb"
+    Wasm32 -> "wasm32"
+    X86 -> "x86"
+    // Registered by an **out-of-tree** back end rather than by any clang somebody installs, so this
+    // is the one name the search never goes looking for.
+    Craft -> "craft"
+
+// Where a clang is looked for, in order.
+//
+// The PATH first, since a toolchain installed to be used is on it. Then the places a package manager
+// puts an LLVM that it deliberately keeps *off* the PATH -- Homebrew does this so that its clang does
+// not shadow the system's.
+private clang_candidates() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("clang")
+    out.push("/opt/homebrew/opt/llvm/bin/clang")
+    out.push("/usr/local/opt/llvm/bin/clang")
+    out
+end clang_candidates
+
+// Whether a `clang` capable of consuming textual LLVM IR is on the PATH. Tests that link and run
+// gate on this so they skip cleanly on a machine without a toolchain.
+clang_available() -> bool = clang_runs("clang")
+
+private clang_runs(path: string) -> bool
+    capture(path, ["--version"], "", [], true) match
+        Err(_) -> false
+        Ok(out) -> out.status.ok()
+end clang_runs
+
+// The back ends a clang has, as `-print-targets` lists them -- or nothing at all where it cannot be
+// run, which the caller tells apart by there being no candidate that answers.
+//
+// Each line is `    name  - Description`, and the name is the first word.
+clang_backends(path: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    capture(path, ["-print-targets"], "", [], true) match
+        Err(_) -> return out
+        Ok(got) ->
+            if !got.status.ok() then return out
+
+            val lines = lines_of(got.text)
+
+            for i in 0..<lines.len()
+                val word = first_word(lines.at(i))
+
+                if word != "" then out.push(word)
+
+    out
+end clang_backends
+
+private first_word(line: string) -> string
+    var start: usize = 0
+
+    while start < line.bytes.len && is_space_byte(line.bytes[start])
+        start += 1
+
+    var at = start
+
+    while at < line.bytes.len && !is_space_byte(line.bytes[at])
+        at += 1
+
+    line[start..<at]
+end first_word
+
+private is_space_byte(b: u8) -> bool = b == u8(' ') || b == u8('\t') || b == u8('\r')
+
+// The clang to **build** for a machine with, or the sentence saying why there is none.
+//
+// **The PATH's clang is preferred and is nearly always the answer** -- a host build must not quietly
+// change compiler because some other LLVM happens to be installed. What sends the search further is
+// a target the PATH clang has no back end for, which on a Mac is every RISC-V one: a vendor's clang
+// is trimmed to that vendor's processors, so it can parse `-target riscv32-unknown-elf` and then
+// fail to produce an object for it. That failure is not a compiler bug and reads exactly like one.
+//
+// A **named** one is not searched past and not fallen back from: a person who wrote down which
+// compiler to use is owed an error rather than a different one.
+find_clang(target: Target, named: Option[string]) -> Result[string, string]
+    val want = cpu_backend(target.cpu)
+
+    named match
+        Some(path) ->
+            if !clang_runs(path)
+                return Err(s"cannot run '$path' — --cc names the clang to build with")
+
+            if !holds_string(clang_backends(path), want)
+                return Err(s"'$path' has no '$want' back end, so it cannot build for " +
+                           s"'${target.name}' — it registers ${shown_backends(path)}")
+
+            return Ok(path)
+        None -> ()
+
+    val candidates = clang_candidates()
+
+    for i in 0..<candidates.len()
+        val p = candidates.at(i)
+
+        if clang_runs(p) && holds_string(clang_backends(p), want) then return Ok(p)
+
+    for i in 0..<candidates.len()
+        val p = candidates.at(i)
+
+        if clang_runs(p)
+            return Err(s"no clang here has the '$want' back end that '${target.name}' needs. " +
+                       s"'$p' registers ${shown_backends(p)} — a vendor's clang is often trimmed " +
+                       "to that vendor's processors. Install LLVM ('brew install llvm'), or name " +
+                       "one with --cc")
+
+    Err("cannot find clang, which building needs — install LLVM, or name one with --cc")
+end find_clang
+
+private shown_backends(path: string) -> string
+    val bs = sort_names(clang_backends(path))
+
+    if bs.is_empty() then return "none"
+
+    var out = ""
+
+    for i in 0..<bs.len()
+        out = if i == 0 then bs.at(i) else s"$out, ${bs.at(i)}"
+
+    out
+end shown_backends
+
+// Extra flags spliced into every clang the build drives, read from `SYSL_EXTRA_CFLAGS`.
+//
+// **A build sysl drives is several clang invocations** -- the module's IR, each C file a package
+// carries, and the link -- so a flag that has to be on all of them cannot be passed to one of them
+// by hand. `-fsanitize=address` is the case this exists for: given to the link alone it brings in a
+// runtime that instruments nothing, and given to a C file alone it instruments the binding and not
+// the program.
+//
+// It is an environment variable rather than an option because it is a *developer's* seam -- a way to
+// reach the toolchain sysl is already driving -- and not a thing a project should be able to write
+// down. Nothing here validates it: whatever it says goes to clang, and clang answers for it.
+extra_cflags() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    env_var("SYSL_EXTRA_CFLAGS") match
+        None -> return out
+        Some(text) ->
+            val words = split_on_space(text)
+
+            for i in 0..<words.len()
+                if words.at(i) != "" then out.push(words.at(i))
+
+    out
+end extra_cflags
+
+private split_on_space(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var start: usize = 0
+
+    for i in 0..<text.bytes.len
+        if text.bytes[i] == u8(' ')
+            out.push(text[start..<i])
+            start = i + 1
+
+    out.push(text[start..<text.bytes.len])
+    out
+end split_on_space
+
+// The flag a level is passed as. A level is whatever was written -- `0`, `2`, `s`, `z`, `fast` are
+// all clang's -- and one clang does not have is clang's to complain about, since it is the authority
+// on its own levels and would say so better than a list here could.
+private level_flag(level: string) -> string = s"-O$level"
+
+// What the linker is told to drop, which is per operating system rather than per processor.
+private dead_strip(target: Target) -> string =
+    if target.os == MacOS then "-Wl,-dead_strip" else "-Wl,--gc-sections"
+
+// The whole of what is handed to the driver to link one program, as a list, so that what a target
+// decides about it can be asserted without a machine of that kind to link on.
+//
+// The order is the linker's and not a style: an object is scanned left to right, so the C a tree
+// carried goes **after** the module that calls into it. `-Wno-override-module` is the one warning
+// suppressed, and only because sysl states a target *family* -- `arm64-apple-macosx` -- where the
+// driver refines it to the installed SDK's version.
+link_command(cc: string, ll: string, objects: Buf[string], exe: string, target: Target,
+             level: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(cc)
+    out.push(s"--target=${target.triple}")
+    out.push("-Wno-override-module")
+    out.push(level_flag(level))
+
+    val extra = extra_cflags()
+
+    for i in 0..<extra.len()
+        out.push(extra.at(i))
+
+    out.push(dead_strip(target))
+    out.push(ll)
+
+    for i in 0..<objects.len()
+        out.push(objects.at(i))
+
+    out.push("-o")
+    out.push(exe)
+    out
+end link_command
+
+// One C file assembled into a relocatable object.
+//
+// `-ffunction-sections`/`-fdata-sections` give every definition a section of its own, which is what
+// lets the linker drop the ones a program never reaches. It is the *library* side of the pair
+// `dead_strip` is the linker side of, and on Mach-O it is redundant rather than wrong.
+compile_c(cc: string, src: string, obj: string, target: Target,
+          level: string) -> Result[unit, string]
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${target.triple}")
+    args.push("-c")
+    args.push(level_flag(level))
+    args.push("-ffunction-sections")
+    args.push("-fdata-sections")
+
+    val extra = extra_cflags()
+
+    for i in 0..<extra.len()
+        args.push(extra.at(i))
+
+    args.push(src)
+    args.push("-o")
+    args.push(obj)
+    told(cc, args, s"$cc failed on $src")
+end compile_c
+
+// Links a module's LLVM text, and whatever objects a tree carried, into a native executable.
+//
+// The triple goes on the command line as well as in the module because the two answer different
+// questions: the module's says what the code *is*, and the driver's decides which linker and which
+// system libraries it is linked against. Passing it is what makes naming a cross target fail
+// honestly at the link rather than silently produce a host binary.
+build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: Target,
+             level: string) -> Result[unit, string]
+    val ll = s"$exe.ll"
+
+    write_text(ll, ir) match
+        Err(_) -> return Err(s"cannot write $ll")
+        Ok(_) -> ()
+
+    val command = link_command(cc, ll, objects, exe, target, level)
+
+    var args: Buf[string] = buf()
+
+    for i in 1..<command.len()
+        args.push(command.at(i))
+
+    val said = told(command.at(0), args, s"${command.at(0)} failed")
+
+    remove_file(ll)
+    said
+end build_native
+
+// Runs one command, and answers with what it said where it failed. The child's own error stream is
+// collected rather than let through, so a tool reporting the failure has the reason to report.
+private told(program: string, args: Buf[string], what: string) -> Result[unit, string]
+    capture(program, args.view(), "", [], true) match
+        Err(_) -> Err(s"cannot run '$program'")
+        Ok(out) ->
+            if out.status.ok() then return Ok(())
+
+            val said = out.err match
+                Some(text) -> text
+                None -> ""
+
+            Err(s"$what:\n$said")
+end told

@@ -1,0 +1,273 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// **The two sides of the C boundary, as bodies rather than as declarations.** `tests_cabi.sysl` pins
+// what a signature says; these pin what the instructions do with it -- a call that converts each
+// argument into the registers the convention names, and the thunk that reads them back.
+//
+// **Every LLVM text here was read out of the reference compiler**, by handing the installed `sysl`
+// the same source and quoting `emit-llvm` -- never composed from the rule.
+
+private lowered(text: string, symbol: string) -> string = emit_func_text(text, symbol)
+
+// -- a call to a foreign function -------------------------------------------------------------------
+
+@test("a small aggregate crosses to C in the register the convention names, both ways")
+a_small_aggregate_crosses_in_a_register()
+    assert_eq(lowered("struct S\n    a: i32\n    b: i32\n\nextern give() -> S\nextern take(v: S)\n" +
+                      "\nroundtrip()\n    take(give())\n\nroundtrip()\n", "roundtrip"),
+              "define void @roundtrip() {\n" +
+              "entry:\n" +
+              "  %t2 = alloca i64\n" +
+              "  %t3 = alloca %struct.S\n" +
+              "  %t5 = alloca %struct.S\n" +
+              "  %t6 = alloca i64\n" +
+              "  %t1 = call i64 @give()\n" +
+              "  store i64 %t1, ptr %t2\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %t3, ptr align 1 %t2, i64 8, i1 false)\n" +
+              "  %t4 = load %struct.S, ptr %t3\n" +
+              "  store %struct.S %t4, ptr %t5\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %t6, ptr align 1 %t5, i64 8, i1 false)\n" +
+              "  %t7 = load i64, ptr %t6\n" +
+              "  call void @take(i64 %t7)\n" +
+              "  ret void\n" +
+              "}\n")
+end a_small_aggregate_crosses_in_a_register
+
+// The storage a big result is written into is the caller's, so it exists before the call and is
+// named in front of every argument.
+@test("an aggregate too big for registers goes through storage in both directions")
+a_big_aggregate_goes_through_storage()
+    assert_eq(lowered("struct Big\n    a: i64\n    b: i64\n    c: i64\n\n" +
+                      "extern shuffle(v: Big) -> Big\n\nbigcall() -> i64\n" +
+                      "    val r = shuffle(Big(1i64, 2i64, 3i64))\n\n    r.a\n\nbigcall()\n",
+                      "bigcall"),
+              "define i64 @bigcall() {\n" +
+              "entry:\n" +
+              "  %r.addr = alloca %struct.Big\n" +
+              "  %t1 = alloca %struct.Big\n" +
+              "  %t5 = alloca %struct.Big\n" +
+              "  %t2 = insertvalue %struct.Big undef, i64 1, 0\n" +
+              "  %t3 = insertvalue %struct.Big %t2, i64 2, 1\n" +
+              "  %t4 = insertvalue %struct.Big %t3, i64 3, 2\n" +
+              "  store %struct.Big %t4, ptr %t5\n" +
+              "  call void @shuffle(ptr sret(%struct.Big) align 8 %t1, ptr align 8 %t5)\n" +
+              "  %t6 = load %struct.Big, ptr %t1\n" +
+              "  store %struct.Big %t6, ptr %r.addr\n" +
+              "  %t7 = load %struct.Big, ptr %r.addr\n" +
+              "  %t8 = extractvalue %struct.Big %t7, 0\n" +
+              "  ret i64 %t8\n" +
+              "}\n")
+end a_big_aggregate_goes_through_storage
+
+// The extension is stated at the call as well as on the declaration, because it is the **caller's**
+// obligation and the call is where the caller is: it is that attribute which makes the back end
+// widen the value before it goes into the register.
+@test("a narrow scalar carries the convention's extension at the call and on the result")
+a_narrow_scalar_is_widened_at_the_call()
+    assert_eq(lowered("extern widen(b: bool, c: u8) -> u8\n\nnarrow() -> u8 = widen(true, 3)\n" +
+                      "\nnarrow()\n", "narrow"),
+              "define zeroext i8 @narrow() {\n" +
+              "entry:\n" +
+              "  %t1 = call zeroext i8 @widen(i1 zeroext 1, i8 zeroext 3)\n" +
+              "  ret i8 %t1\n" +
+              "}\n")
+end a_narrow_scalar_is_widened_at_the_call
+
+// A homogeneous floating aggregate comes back under its own type, so there is nothing to reinterpret
+// and the round trip through memory would be a copy for its own sake -- while the *argument* is
+// named as an array of the element and does need one.
+@test("a floating aggregate is coerced going out and read straight back coming in")
+a_floating_aggregate_crosses()
+    assert_eq(lowered("struct Pair\n    x: f32\n    y: f32\n\nextern spin(p: Pair) -> Pair\n\n" +
+                      "fpass() -> f32\n    val r = spin(Pair(1.0f32, 2.0f32))\n\n    r.x\n\nfpass()\n",
+                      "fpass"),
+              "define float @fpass() {\n" +
+              "entry:\n" +
+              "  %r.addr = alloca %struct.Pair\n" +
+              "  %t5 = alloca %struct.Pair\n" +
+              "  %t6 = alloca [2 x float]\n" +
+              "  %t1 = fptrunc double 0x3FF0000000000000 to float\n" +
+              "  %t2 = fptrunc double 0x4000000000000000 to float\n" +
+              "  %t3 = insertvalue %struct.Pair undef, float %t1, 0\n" +
+              "  %t4 = insertvalue %struct.Pair %t3, float %t2, 1\n" +
+              "  store %struct.Pair %t4, ptr %t5\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %t6, ptr align 1 %t5, i64 8, i1 false)\n" +
+              "  %t7 = load [2 x float], ptr %t6\n" +
+              "  %t8 = call %struct.Pair @spin([2 x float] %t7)\n" +
+              "  store %struct.Pair %t8, ptr %r.addr\n" +
+              "  %t9 = load %struct.Pair, ptr %r.addr\n" +
+              "  %t10 = extractvalue %struct.Pair %t9, 0\n" +
+              "  ret float %t10\n" +
+              "}\n")
+end a_floating_aggregate_crosses
+
+// -- the C-callable entry an `@export` publishes ------------------------------------------------------
+
+// A scalar crosses as itself under both lowerings, so the thunk is the call and nothing else -- and
+// the definition is under a mangled key, because the export claimed the bare name.
+@test("an exported function of scalars is a thunk that calls the definition and returns")
+an_exported_scalar_entry()
+    assert_eq(lowered("@export(\"twice\")\ntwice(n: i32) -> i32 = n * 2\n", "twice"),
+              "define i32 @twice(i32 %c.0) {\n" +
+              "entry:\n" +
+              "  %t1 = call i32 @twice$$sysl(i32 %c.0)\n" +
+              "  ret i32 %t1\n" +
+              "}\n")
+end an_exported_scalar_entry
+
+// The reported case for the boundary this exists to fix: eight bytes of three fields arrive in one
+// integer register under the convention, and sysl's own lowering wants the struct. Reading only the
+// low field would have coincided; reading a second one is what saw it.
+@test("an exported function taking an aggregate reassembles it before calling the definition")
+an_exported_aggregate_entry()
+    assert_eq(lowered("struct Id\n    index1: i32\n    world0: u16\n    generation: u16\n\n" +
+                      "@export(\"probe_one\")\n" +
+                      "one(a: Id) -> int = a.index1 * 1000 + int(a.world0) * 10 + int(a.generation)\n",
+                      "probe_one"),
+              "define i32 @probe_one(i64 %c.0) {\n" +
+              "entry:\n" +
+              "  %t1 = alloca i64\n" +
+              "  %t2 = alloca %struct.Id\n" +
+              "  store i64 %c.0, ptr %t1\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %t2, ptr align 1 %t1, i64 8, i1 false)\n" +
+              "  %t3 = load %struct.Id, ptr %t2\n" +
+              "  %t4 = call i32 @one(%struct.Id %t3)\n" +
+              "  ret i32 %t4\n" +
+              "}\n")
+end an_exported_aggregate_entry
+
+// Where **both** sides return through storage the caller supplies, C's is handed straight to sysl
+// and the value is never a first-class LLVM value at any point.
+@test("an exported function returning through storage hands C's slot straight to the definition")
+an_exported_entry_through_storage()
+    assert_eq(lowered("struct Big\n    a: i64\n    b: i64\n    c: i64\n\n@export(\"probe_big\")\n" +
+                      "big(v: Big) -> Big = Big(v.c, v.b, v.a)\n", "probe_big"),
+              "define void @probe_big(ptr sret(%struct.Big) align 8 %c.sret, ptr align 8 %c.0) {\n" +
+              "entry:\n" +
+              "  %t1 = load %struct.Big, ptr %c.0\n" +
+              "  %t2 = call %struct.Big @big(%struct.Big %t1)\n" +
+              "  store %struct.Big %t2, ptr %c.sret\n" +
+              "  ret void\n" +
+              "}\n")
+end an_exported_entry_through_storage
+
+@test("an exported function of a floating aggregate coerces its parameter and its result")
+an_exported_floating_entry()
+    assert_eq(lowered("struct Pair\n    x: f32\n    y: f32\n\n@export(\"probe_pair\")\n" +
+                      "pr(p: Pair) -> Pair = Pair(p.y, p.x)\n", "probe_pair"),
+              "define %struct.Pair @probe_pair([2 x float] %c.0) {\n" +
+              "entry:\n" +
+              "  %t1 = alloca [2 x float]\n" +
+              "  %t2 = alloca %struct.Pair\n" +
+              "  %t5 = alloca %struct.Pair\n" +
+              "  %t6 = alloca %struct.Pair\n" +
+              "  store [2 x float] %c.0, ptr %t1\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %t2, ptr align 1 %t1, i64 8, i1 false)\n" +
+              "  %t3 = load %struct.Pair, ptr %t2\n" +
+              "  %t4 = call %struct.Pair @pr(%struct.Pair %t3)\n" +
+              "  store %struct.Pair %t4, ptr %t5\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %t6, ptr align 1 %t5, i64 8, i1 false)\n" +
+              "  %t7 = load %struct.Pair, ptr %t6\n" +
+              "  ret %struct.Pair %t7\n" +
+              "}\n")
+end an_exported_floating_entry
+
+@test("an exported function with no result is the call and the return")
+an_exported_entry_with_no_result()
+    assert_eq(lowered("@export(\"probe_void\")\nnothing(n: i32) = ()\n", "probe_void"),
+              "define void @probe_void(i32 %c.0) {\n" +
+              "entry:\n" +
+              "  call void @nothing(i32 %c.0)\n" +
+              "  ret void\n" +
+              "}\n")
+end an_exported_entry_with_no_result
+
+// **A symbol C has claimed is not available to a sysl definition**, and it is the *definition* that
+// moves: the exported symbol is the one somebody outside has written down, and a mangled key is this
+// compiler's own business.
+@test("a definition whose name an export claimed is emitted under a key of the compiler's")
+a_displaced_definition_is_renamed()
+    assert_eq(lowered("@export(\"twice\")\ntwice(n: i32) -> i32 = n * 2\n",
+                      "twice$$sysl"),
+              "define i32 @twice$$sysl(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = mul i32 %t1, 2\n" +
+              "  ret i32 %t2\n" +
+              "}\n")
+end a_displaced_definition_is_renamed
+
+// **The root module's name is the empty string and is a name like any other.** A set that refuses one
+// leaves the root module out of the modules a compilation counts roots in, so a program's own
+// `@export` written with no module header is pruned before it can be emitted -- and nothing says so,
+// since a pruned function is exactly what a smaller module looks like.
+@test("an exported function nothing calls survives the walk, root module and all")
+an_uncalled_export_is_a_root()
+    var own: Buf[string] = buf()
+
+    own.push("m")
+
+    assert_eq(holds_string(emit_kept_funcs_in("@export(\"twice\")\ntwice(n: i32) -> i32 = n * 2\n",
+                                              own), "twice"), true)
+end an_uncalled_export_is_a_root
+
+// -- two things in one header answering to one name ---------------------------------------------------
+
+// C has one namespace and not two: at file scope a `typedef` name and a function name are both
+// ordinary identifiers, so a header carrying both is one name declared twice. Nothing on the sysl
+// side suggests it -- the two are a type and a function, which collide nowhere here.
+@test("a type and a function claiming one C name are refused, since a header has one namespace")
+a_type_and_a_function_may_not_share_a_c_name()
+    assert_eq(first_export_refusal("@export(\"Point\")\nstruct Point\n    x: i32\n    y: i32\n\n" +
+                                   "@export(\"Point\")\ntakes(p: Point) -> i32 = p.x\n"),
+              "'Point' is the C name of the function 'takes' and the type 'Point' — a header " +
+              "declares both in one namespace, so a C project including it would see the name " +
+              "twice. Give each the name it should carry, '@export(\"...\")'")
+end a_type_and_a_function_may_not_share_a_c_name
+
+// **The derived name is what `@export("...")` on a struct takes away, so it is what this hands
+// back.** A mangled instantiation is unique because a module path is in it; a chosen name is a claim
+// the author makes, and two of them may agree.
+@test("two structs claiming one C name are refused")
+two_structs_may_not_share_a_c_name()
+    assert_eq(first_export_refusal("@export(\"Same\")\nstruct A\n    x: i32\n\n" +
+                                   "@export(\"Same\")\nstruct B\n    y: i32\n\n" +
+                                   "@export(\"f\")\nf(a: A) -> i32 = a.x\n\n" +
+                                   "@export(\"g\")\ng(b: B) -> i32 = b.y\n"),
+              "'Same' is the C name of the type 'A' and the type 'B' — a header declares both in " +
+              "one namespace, so a C project including it would see the name twice. Give each the " +
+              "name it should carry, '@export(\"...\")'")
+end two_structs_may_not_share_a_c_name
+
+// The chosen name is only one of the two that can collide: a function's export may land on a
+// struct's **derived** name, which is the mangled instantiation and is what the header declares it
+// under when the author named nothing.
+@test("a function's symbol landing on a struct's derived C name is the same mistake")
+a_symbol_may_not_land_on_a_derived_c_name()
+    assert_eq(first_export_refusal("struct Point\n    x: i32\n\n@export(\"Point\")\n" +
+                                   "takes(p: Point) -> i32 = p.x\n"),
+              "'Point' is the C name of the function 'takes' and the type 'Point' — a header " +
+              "declares both in one namespace, so a C project including it would see the name " +
+              "twice. Give each the name it should carry, '@export(\"...\")'")
+end a_symbol_may_not_land_on_a_derived_c_name
+
+// A type only claims a name where it actually reaches the header, which is what makes the check ask
+// the same question the header does rather than looking at every struct in the program.
+@test("a named type no exported signature reaches claims nothing")
+an_unreached_type_claims_no_c_name()
+    assert_eq(emit_diagnostics("@export(\"Point\")\nstruct Point\n    x: i32\n\n" +
+                               "@export(\"Point\")\ntakes(n: i32) -> i32 = n\n").len(), 0)
+end an_unreached_type_claims_no_c_name
+
+private first_export_refusal(text: string) -> string
+    val said = emit_diagnostics(text)
+
+    if said.is_empty() then return ""
+
+    said.at(0)
+end first_export_refusal

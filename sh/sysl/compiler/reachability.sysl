@@ -337,6 +337,9 @@ private reached_modules(p: TProgram, own: Buf[string]) -> Option[Buf[string]]
     for i in 0..<own.len()
         add_module(&reached, own.at(i))
 
+    // **A supplied file with no module header is in the root module and is therefore treated as the
+    // program's own**, since the root module is the one name two trees can share -- the answer that
+    // keeps a symbol is the safe one to be wrong with.
     add_module(&reached, ModuleRoot)
 
     var i: usize = 0
@@ -356,14 +359,12 @@ private reached_modules(p: TProgram, own: Buf[string]) -> Option[Buf[string]]
     Some(reached)
 end reached_modules
 
-// A module added to the set once, **the anonymous root one included**.
-//
-// It cannot be `add_string`, which refuses the empty name: a *function* is never called nothing, so
-// dropping an empty name there is a guard against noise -- while `ModuleRoot` is the empty string on
-// purpose, and it is the module every declaration of a single-file program lives in. Refusing it
-// took the whole set of root kinds -- a destructor, an `@export`, a `@section`, an interrupt handler
-// -- out of a program that declares no module, which is a symbol the release hook calls and nothing
-// defines.
+// A module name added to a set, where **the root module's name is the empty string and is a name
+// like any other**. `add_string` refuses one, which is right for a call graph -- nothing is called
+// by no name -- and wrong here: refused, the root module is not among the ones a compilation counts
+// roots in, so a program's own destructor, `@export`, `@section` or interrupt handler written with
+// no module header is pruned before it can be emitted -- and a destructor pruned is a symbol the
+// release hook calls and nothing defines.
 private add_module(xs: *Buf[string], name: string) -> bool
     for i in 0..<xs.len()
         if xs.at(i) == name then return false

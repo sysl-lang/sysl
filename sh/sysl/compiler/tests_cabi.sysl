@@ -1,0 +1,666 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// **How an aggregate crosses the boundary to a C function, one convention at a time.**
+//
+// These are declaration tests, and they are exact strings rather than substring checks for a reason:
+// **every expectation here was read off `clang -S -emit-llvm` for the same triple**, from a C file
+// declaring the same shapes. That is what makes them an oracle rather than a record of what this
+// compiler happens to do -- an ABI is an agreement with code no compiler here built, so the only
+// test that means anything is one whose expected value came from the other side. Every one of them
+// is the reference compiler's own, quoted from the suite it keeps them in.
+//
+// They are also the tests that would catch the miscompile they were first written for. LLVM applies
+// no C classification to an aggregate of its own accord -- it assigns one register per element --
+// and for a handful of shapes that *coincides* with the convention: a homogeneous floating aggregate
+// on AAPCS64, and any sixteen-byte pair of integers. Every one of those coincidences is here too, so
+// a future change cannot pass by testing only the shapes that were never broken.
+
+// The two declarations a shape gets on one machine, in one compilation: a foreign function that
+// returns it, and one that takes it by value. Both directions matter and they disagree -- AAPCS64
+// hands back a five-byte struct in an `i40` and takes the same struct widened to a whole `i64`.
+private crossing(target: string, decls: string) -> string
+    val lines = emit_declare_lines(s"$decls\ntake(give())\n", target)
+
+    var give = ""
+    var take = ""
+
+    for i in 0..<lines.len()
+        if holds_text(lines.at(i), "@give(") then give = lines.at(i)
+        if holds_text(lines.at(i), "@take(") then take = lines.at(i)
+
+    s"$give\n$take"
+end crossing
+
+private shape(target: string, fields: string) -> string =
+    crossing(target, s"struct S\n$fields\nextern give() -> S\nextern take(v: S)")
+
+private shape_with(target: string, fields: string, before: string) -> string =
+    crossing(target, s"${before}struct S\n$fields\nextern give() -> S\nextern take(v: S)")
+
+// The same for a type that is not a struct declaration -- a view, a tuple, an enum.
+private spelled(target: string, ty: string) -> string =
+    crossing(target, s"extern give() -> $ty\nextern take(v: $ty)")
+
+private spelled_with(target: string, ty: string, before: string) -> string =
+    crossing(target, s"${before}extern give() -> $ty\nextern take(v: $ty)")
+
+private two(give: string, take: string) -> string = s"$give\n$take"
+
+private arm() -> string = "aarch64-macos"
+
+private arm_lnx() -> string = "aarch64-linux"
+
+private x64() -> string = "x86_64-linux"
+
+private rv() -> string = "riscv64-linux"
+
+private rv_bare() -> string = "riscv64-freestanding"
+
+private rv32() -> string = "riscv32-freestanding"
+
+private win() -> string = "x86_64-windows"
+
+private wasm() -> string = "wasm32-freestanding"
+
+private thumb() -> string = "thumb-freestanding"
+
+// -- AAPCS64 ---------------------------------------------------------------------------------------
+
+// The width a result comes back in is the struct's own, to the bit; the width it goes out in is the
+// register's. That asymmetry is the convention's, and getting it backwards is invisible for any
+// struct whose size happens to be eight.
+@test("AAPCS64 names a result by its exact width and an argument by the register's")
+aapcs64_names_a_result_by_its_width()
+    assert_eq(shape(arm(), "    a: u8"), two("declare i8 @give()", "declare void @take(i64)"))
+    assert_eq(shape(arm(), "    a: u8\n    b: u8"),
+              two("declare i16 @give()", "declare void @take(i64)"))
+    assert_eq(shape(arm(), "    a: u8\n    b: u8\n    c: u8"),
+              two("declare i24 @give()", "declare void @take(i64)"))
+    assert_eq(shape(arm(), "    a: i32"), two("declare i32 @give()", "declare void @take(i64)"))
+    assert_eq(shape(arm(), "    a: [5]u8"), two("declare i40 @give()", "declare void @take(i64)"))
+end aapcs64_names_a_result_by_its_width
+
+// The shape the miscompile was found on: two `i32`s are eight bytes, so both fields travel in one
+// register, and reading the second out of a second register got the caller's own argument.
+@test("two fields that fit one register travel in one register")
+aapcs64_two_fields_in_one_register()
+    assert_eq(shape(arm(), "    a: i32\n    b: i32"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape(arm(), "    a: f32\n    b: i32"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape(arm(), "    a: i32\n    b: u8"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+end aapcs64_two_fields_in_one_register
+
+// Nine to sixteen bytes is a pair of registers, named as an array of two rather than as two
+// parameters -- which is where AAPCS64 and System V part company over the same shape. The last of
+// these is the coincidence that hid the bug: LLVM's per-element assignment lands on the same two
+// registers, so a sixteen-byte pair of integers always worked.
+@test("past one register and up to two, AAPCS64 names an array of two")
+aapcs64_two_registers_are_an_array()
+    assert_eq(shape(arm(), "    a: i64\n    b: u8"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+    assert_eq(shape(arm(), "    a: i32\n    b: i32\n    c: i32"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+    assert_eq(shape(arm(), "    p: *u8\n    n: i64"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+    assert_eq(shape(arm(), "    a: f64\n    b: i64"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+    assert_eq(shape(arm(), "    a: i64\n    b: i64"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+end aapcs64_two_registers_are_an_array
+
+// A homogeneous floating aggregate is decided before size is even looked at, which is why four
+// doubles -- thirty-two bytes -- are still registers while five are not.
+@test("an aggregate of up to four members of one floating width goes in floating registers")
+aapcs64_a_floating_aggregate()
+    assert_eq(shape(arm(), "    a: f32"),
+              two("declare %struct.S @give()", "declare void @take([1 x float])"))
+    assert_eq(shape(arm(), "    a: f32\n    b: f32"),
+              two("declare %struct.S @give()", "declare void @take([2 x float])"))
+    assert_eq(shape(arm(), "    a: f32\n    b: f32\n    c: f32"),
+              two("declare %struct.S @give()", "declare void @take([3 x float])"))
+    assert_eq(shape(arm(), "    a: f64\n    b: f64"),
+              two("declare %struct.S @give()", "declare void @take([2 x double])"))
+    assert_eq(shape(arm(), "    a: f64\n    b: f64\n    c: f64\n    d: f64"),
+              two("declare %struct.S @give()", "declare void @take([4 x double])"))
+end aapcs64_a_floating_aggregate
+
+@test("an array of floats is a floating aggregate, and so is a struct of structs of them")
+aapcs64_a_nested_floating_aggregate()
+    assert_eq(shape(arm(), "    a: [4]f32"),
+              two("declare %struct.S @give()", "declare void @take([4 x float])"))
+    assert_eq(shape_with(arm(), "    p: Pair\n    q: Pair", "struct Pair\n    x: f32\n    y: f32\n"),
+              two("declare %struct.S @give()", "declare void @take([4 x float])"))
+end aapcs64_a_nested_floating_aggregate
+
+@test("a fifth member makes it an ordinary aggregate, and its size is then too much")
+aapcs64_a_fifth_member_ends_it()
+    assert_eq(shape(arm(), "    a: f64\n    b: f64\n    c: f64\n    d: f64\n    e: f64"),
+              two("declare void @give(ptr sret(%struct.S) align 8)",
+                  "declare void @take(ptr align 8)"))
+    // Twenty bytes, and aligned to four -- the aggregate's own alignment, not the register's.
+    assert_eq(shape(arm(), "    a: f32\n    b: f32\n    c: f32\n    d: f32\n    e: f32"),
+              two("declare void @give(ptr sret(%struct.S) align 4)",
+                  "declare void @take(ptr align 4)"))
+end aapcs64_a_fifth_member_ends_it
+
+@test("a mixture of two floating widths is never homogeneous")
+aapcs64_two_widths_are_not_homogeneous()
+    assert_eq(shape(arm(), "    a: f64\n    b: f32"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+end aapcs64_two_widths_are_not_homogeneous
+
+@test("half-width floats are homogeneous like any other one width")
+aapcs64_half_width_floats()
+    assert_eq(shape(arm(), "    a: f16\n    b: f16"),
+              two("declare %struct.S @give()", "declare void @take([2 x half])"))
+    assert_eq(shape(arm(), "    a: f16\n    b: f16\n    c: f16\n    d: f16"),
+              two("declare %struct.S @give()", "declare void @take([4 x half])"))
+end aapcs64_half_width_floats
+
+// Sixteen bytes is two registers either way; what decides how they are *named* is the alignment.
+@test("a sixteen-byte aggregate wanting sixteen-byte alignment is one wide integer")
+aapcs64_alignment_names_the_pair()
+    assert_eq(shape(arm(), "    a: u128"), two("declare i128 @give()", "declare void @take(i128)"))
+end aapcs64_alignment_names_the_pair
+
+// An argument every member of which is an address is named in addresses, so that whatever a pointer
+// carries beyond its bits survives the coercion. A *result* is not.
+@test("an AAPCS64 argument made only of addresses is named in addresses")
+aapcs64_addresses_are_named_as_addresses()
+    assert_eq(shape(arm(), "    p: *u8"), two("declare i64 @give()", "declare void @take(ptr)"))
+    assert_eq(shape(arm(), "    p: *u8\n    q: *u8"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x ptr])"))
+    // One non-address member is enough to end it.
+    assert_eq(shape(arm(), "    c: u8\n    p: *u8"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+    assert_eq(shape(arm(), "    d: f64\n    p: *u8"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+end aapcs64_addresses_are_named_as_addresses
+
+@test("a bool is the byte it occupies, not the bit it is written as")
+aapcs64_a_bool_is_a_byte()
+    assert_eq(shape(arm(), "    a: bool"), two("declare i8 @give()", "declare void @take(i64)"))
+end aapcs64_a_bool_is_a_byte
+
+@test("past two registers the caller supplies the storage")
+aapcs64_past_two_registers()
+    assert_eq(shape(arm(), "    a: i64\n    b: i64\n    c: i64"),
+              two("declare void @give(ptr sret(%struct.S) align 8)",
+                  "declare void @take(ptr align 8)"))
+end aapcs64_past_two_registers
+
+// Darwin's variant of AAPCS64 leaves this off and every other AAPCS64 system asks for it: a floating
+// aggregate that runs out of registers and lands on the stack is aligned to eight.
+@test("away from Darwin a floating aggregate says how far to align it on the stack")
+aapcs64_alignstack_away_from_darwin()
+    assert_eq(shape(arm_lnx(), "    a: f32\n    b: f32"),
+              two("declare %struct.S @give()", "declare void @take([2 x float] alignstack(8))"))
+    assert_eq(shape(arm_lnx(), "    a: i32\n    b: i32"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+end aapcs64_alignstack_away_from_darwin
+
+// -- System V x86-64 --------------------------------------------------------------------------------
+
+@test("System V names a single chunk by its exact width, up to the whole register")
+sysv_one_chunk_is_its_width()
+    assert_eq(shape(x64(), "    a: u8"), two("declare i8 @give()", "declare void @take(i8)"))
+    assert_eq(shape(x64(), "    a: u8\n    b: u8"),
+              two("declare i16 @give()", "declare void @take(i16)"))
+    assert_eq(shape(x64(), "    a: u8\n    b: u8\n    c: u8"),
+              two("declare i24 @give()", "declare void @take(i24)"))
+    assert_eq(shape(x64(), "    a: i32"), two("declare i32 @give()", "declare void @take(i32)"))
+    assert_eq(shape(x64(), "    a: [5]u8"), two("declare i40 @give()", "declare void @take(i40)"))
+    assert_eq(shape(x64(), "    a: i32\n    b: i32"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+end sysv_one_chunk_is_its_width
+
+// Two chunks are two *parameters*, where AAPCS64 passed one array of two -- the same registers,
+// spelled differently, and a difference no amount of reasoning about the documents would settle.
+@test("two chunks are two parameters and a literal struct of two")
+sysv_two_chunks_are_two_parameters()
+    assert_eq(shape(x64(), "    a: i64\n    b: i64"),
+              two("declare { i64, i64 } @give()", "declare void @take(i64, i64)"))
+    assert_eq(shape(x64(), "    a: i32\n    b: i32\n    c: i32"),
+              two("declare { i64, i32 } @give()", "declare void @take(i64, i32)"))
+end sysv_two_chunks_are_two_parameters
+
+// A chunk is named after the member that *starts* it when that member is all the chunk carries.
+@test("a chunk carrying one small member is named after it, and otherwise after its bytes")
+sysv_a_chunk_is_named_after_its_starter()
+    assert_eq(shape(x64(), "    a: i64\n    b: u8"),
+              two("declare { i64, i8 } @give()", "declare void @take(i64, i8)"))
+    assert_eq(shape(x64(), "    a: i16\n    b: u8"),
+              two("declare i32 @give()", "declare void @take(i32)"))
+    assert_eq(shape(x64(), "    a: i32\n    b: u8"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape(x64(), "    a: [13]u8"),
+              two("declare { i64, i40 } @give()", "declare void @take(i64, i40)"))
+end sysv_a_chunk_is_named_after_its_starter
+
+// Unlike AAPCS64, System V names an address chunk the same way in both directions.
+@test("a chunk that is exactly one address is named as one, in either direction")
+sysv_an_address_chunk()
+    assert_eq(shape(x64(), "    p: *u8"), two("declare ptr @give()", "declare void @take(ptr)"))
+    assert_eq(shape(x64(), "    p: *u8\n    n: i64"),
+              two("declare { ptr, i64 } @give()", "declare void @take(ptr, i64)"))
+    assert_eq(shape(x64(), "    p: *u8\n    q: *u8"),
+              two("declare { ptr, ptr } @give()", "declare void @take(ptr, ptr)"))
+    assert_eq(shape(x64(), "    p: *u8\n    f: f32"),
+              two("declare { ptr, float } @give()", "declare void @take(ptr, float)"))
+    assert_eq(shape(x64(), "    c: u8\n    p: *u8"),
+              two("declare { i8, ptr } @give()", "declare void @take(i8, ptr)"))
+end sysv_an_address_chunk
+
+@test("half-width floats share a System V chunk as a vector of however many fit")
+sysv_half_widths_share_a_chunk()
+    assert_eq(shape(x64(), "    a: f16\n    b: f16"),
+              two("declare <2 x half> @give()", "declare void @take(<2 x half>)"))
+    assert_eq(shape(x64(), "    a: f16\n    b: f16\n    c: f16\n    d: f16"),
+              two("declare <4 x half> @give()", "declare void @take(<4 x half>)"))
+end sysv_half_widths_share_a_chunk
+
+// Where AAPCS64 named this `i128`, System V splits it like any other sixteen bytes.
+@test("a wide integer is two System V chunks like anything else of that size")
+sysv_a_wide_integer_is_two_chunks()
+    assert_eq(shape(x64(), "    a: u128"),
+              two("declare { i64, i64 } @give()", "declare void @take(i64, i64)"))
+end sysv_a_wide_integer_is_two_chunks
+
+@test("a chunk of floating members is a floating register, and two floats share one as a vector")
+sysv_a_floating_chunk()
+    assert_eq(shape(x64(), "    a: f32"),
+              two("declare float @give()", "declare void @take(float)"))
+    assert_eq(shape(x64(), "    a: f64"),
+              two("declare double @give()", "declare void @take(double)"))
+    assert_eq(shape(x64(), "    a: f32\n    b: f32"),
+              two("declare <2 x float> @give()", "declare void @take(<2 x float>)"))
+    assert_eq(shape(x64(), "    a: f32\n    b: f32\n    c: f32"),
+              two("declare { <2 x float>, float } @give()",
+                  "declare void @take(<2 x float>, float)"))
+    assert_eq(shape(x64(), "    a: [4]f32"),
+              two("declare { <2 x float>, <2 x float> } @give()",
+                  "declare void @take(<2 x float>, <2 x float>)"))
+    assert_eq(shape(x64(), "    a: f64\n    b: f64"),
+              two("declare { double, double } @give()", "declare void @take(double, double)"))
+end sysv_a_floating_chunk
+
+@test("a chunk mixing a float with anything else is an integer register")
+sysv_a_mixed_chunk_is_an_integer()
+    assert_eq(shape(x64(), "    a: f32\n    b: i32"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape(x64(), "    a: i64\n    b: f64"),
+              two("declare { i64, double } @give()", "declare void @take(i64, double)"))
+    assert_eq(shape(x64(), "    a: f64\n    b: f32"),
+              two("declare { double, float } @give()", "declare void @take(double, float)"))
+end sysv_a_mixed_chunk_is_an_integer
+
+// System V is the one convention where the copy is made on the caller's stack rather than handed
+// over as an address, and `byval` is how LLVM is told to make it.
+@test("past two chunks the argument goes on the stack and the result into caller storage")
+sysv_past_two_chunks_is_memory()
+    assert_eq(shape(x64(), "    a: i64\n    b: i64\n    c: i64"),
+              two("declare void @give(ptr sret(%struct.S) align 8)",
+                  "declare void @take(ptr byval(%struct.S) align 8)"))
+    assert_eq(shape(x64(), "    a: f64\n    b: f64\n    c: f64"),
+              two("declare void @give(ptr sret(%struct.S) align 8)",
+                  "declare void @take(ptr byval(%struct.S) align 8)"))
+end sysv_past_two_chunks_is_memory
+
+// -- RISC-V -----------------------------------------------------------------------------------------
+
+// **One register is named by the aggregate's own width and not by the register's.** Two registers
+// are named in whole ones.
+@test("everything that fits two RISC-V registers is named in whole ones")
+riscv_two_registers()
+    assert_eq(shape(rv(), "    a: u8"), two("declare i8 @give()", "declare void @take(i8)"))
+    assert_eq(shape(rv(), "    a: u8\n    b: u8\n    c: u8"),
+              two("declare i24 @give()", "declare void @take(i24)"))
+    assert_eq(shape(rv(), "    a: i32\n    b: i32"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape(rv(), "    a: i64\n    b: u8"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+    assert_eq(shape(rv(), "    a: i64\n    b: i64"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+end riscv_two_registers
+
+@test("one or two floating members are passed as themselves")
+riscv_floats_flatten()
+    assert_eq(shape(rv(), "    a: f32"), two("declare float @give()", "declare void @take(float)"))
+    assert_eq(shape(rv(), "    a: f64"),
+              two("declare double @give()", "declare void @take(double)"))
+    assert_eq(shape(rv(), "    a: f32\n    b: f32"),
+              two("declare { float, float } @give()", "declare void @take(float, float)"))
+    assert_eq(shape(rv(), "    a: f64\n    b: f64"),
+              two("declare { double, double } @give()", "declare void @take(double, double)"))
+end riscv_floats_flatten
+
+@test("and so is one floating member beside one integer, in either order")
+riscv_a_float_beside_an_integer()
+    assert_eq(shape(rv(), "    a: f32\n    b: i32"),
+              two("declare { float, i32 } @give()", "declare void @take(float, i32)"))
+    assert_eq(shape(rv(), "    a: i32\n    b: f32"),
+              two("declare { i32, float } @give()", "declare void @take(i32, float)"))
+    assert_eq(shape(rv(), "    a: i64\n    b: f64"),
+              two("declare { i64, double } @give()", "declare void @take(i64, double)"))
+end riscv_a_float_beside_an_integer
+
+// Not every eight-byte member counts as the integer case. A pointer beside a float does not flatten,
+// which no reading of "one floating and one integer field" would have predicted.
+@test("a pointer beside a float does not flatten, and a pointer is never named as one")
+riscv_a_pointer_is_not_the_integer_case()
+    assert_eq(shape(rv(), "    p: *u8\n    b: f32"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+    assert_eq(shape(rv(), "    p: *u8"), two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape(rv(), "    p: *u8\n    q: *u8"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+end riscv_a_pointer_is_not_the_integer_case
+
+@test("half-width floats flatten in pairs and no further")
+riscv_half_widths_flatten_in_pairs()
+    assert_eq(shape(rv(), "    a: f16\n    b: f16"),
+              two("declare { half, half } @give()", "declare void @take(half, half)"))
+    assert_eq(shape(rv(), "    a: f16\n    b: f16\n    c: f16\n    d: f16"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+end riscv_half_widths_flatten_in_pairs
+
+@test("sixteen-byte alignment names two RISC-V registers as one wide integer")
+riscv_alignment_names_the_pair()
+    assert_eq(shape(rv(), "    a: u128"), two("declare i128 @give()", "declare void @take(i128)"))
+end riscv_alignment_names_the_pair
+
+@test("a third floating member ends the flattening")
+riscv_a_third_float_ends_it()
+    assert_eq(shape(rv(), "    a: f32\n    b: f32\n    c: f32"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+    assert_eq(shape(rv(), "    a: [4]f32"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+end riscv_a_third_float_ends_it
+
+// A bare-metal RISC-V target is not built for the floating extension, so there are no floating
+// registers to flatten into and the size rule is the whole of it.
+@test("a bare-metal RISC-V target flattens nothing, having no floating registers")
+riscv_bare_metal_flattens_nothing()
+    assert_eq(shape(rv_bare(), "    a: f64"), two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape(rv_bare(), "    a: f32\n    b: f32"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape(rv_bare(), "    a: f64\n    b: f64"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+end riscv_bare_metal_flattens_nothing
+
+// RV32 is not a second convention. It is the rule above with XLEN of four rather than eight -- one
+// function, two targets. What is asserted here is that the *rule* survives the substitution.
+@test("one RV32 word or less is one register, named by the aggregate's own width")
+rv32_one_word()
+    assert_eq(shape(rv32(), "    a: u8"), two("declare i8 @give()", "declare void @take(i8)"))
+    assert_eq(shape(rv32(), "    a: u8\n    b: u8\n    c: u8"),
+              two("declare i24 @give()", "declare void @take(i24)"))
+    assert_eq(shape(rv32(), "    a: i32"), two("declare i32 @give()", "declare void @take(i32)"))
+    assert_eq(shape(rv32(), "    p: *u8"), two("declare i32 @give()", "declare void @take(i32)"))
+end rv32_one_word
+
+@test("two RV32 words are named by the alignment, not by the size")
+rv32_two_words()
+    assert_eq(shape(rv32(), "    a: i32\n    b: i32"),
+              two("declare [2 x i32] @give()", "declare void @take([2 x i32])"))
+    assert_eq(shape(rv32(), "    p: *u8\n    q: *u8"),
+              two("declare [2 x i32] @give()", "declare void @take([2 x i32])"))
+    assert_eq(shape(rv32(), "    a: i64"), two("declare i64 @give()", "declare void @take(i64)"))
+end rv32_two_words
+
+@test("past two RV32 words it is memory, by address in both directions")
+rv32_past_two_words()
+    assert_eq(shape(rv32(), "    a: i64\n    b: u8"),
+              two("declare void @give(ptr sret(%struct.S) align 8)",
+                  "declare void @take(ptr align 8)"))
+    assert_eq(shape(rv32(), "    a: i32\n    b: i32\n    c: i32"),
+              two("declare void @give(ptr sret(%struct.S) align 4)",
+                  "declare void @take(ptr align 4)"))
+end rv32_past_two_words
+
+@test("a float is bytes on RV32, there being no floating registers on this core")
+rv32_a_float_is_bytes()
+    assert_eq(shape(rv32(), "    a: f32"), two("declare i32 @give()", "declare void @take(i32)"))
+    assert_eq(shape(rv32(), "    a: f64"), two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape(rv32(), "    a: f32\n    b: f32"),
+              two("declare [2 x i32] @give()", "declare void @take([2 x i32])"))
+end rv32_a_float_is_bytes
+
+// -- AAPCS32 ----------------------------------------------------------------------------------------
+
+// AAPCS32 is the one convention whose two directions disagree about **memory itself**: a result
+// larger than four bytes goes through `sret` always, while an argument goes in registers at any
+// size. A consequence worth stating, because it decides whether a code path is reachable at all: an
+// indirect parameter cannot happen on this target.
+@test("an AAPCS32 result of one word or less is an integer of its own width")
+aapcs32_a_small_result()
+    assert_eq(shape(thumb(), "    a: u8"),
+              two("declare i8 @give()", "declare void @take([1 x i32])"))
+    assert_eq(shape(thumb(), "    a: u8\n    b: u8"),
+              two("declare i16 @give()", "declare void @take([1 x i32])"))
+    assert_eq(shape(thumb(), "    a: u8\n    b: u8\n    c: u8"),
+              two("declare i32 @give()", "declare void @take([1 x i32])"))
+    assert_eq(shape(thumb(), "    a: i32"),
+              two("declare i32 @give()", "declare void @take([1 x i32])"))
+end aapcs32_a_small_result
+
+// Five bytes is already too much to return and nowhere near too much to pass. Reading only the
+// result would say "memory" about a call that puts every byte in a register.
+@test("one byte past a word is memory coming back and registers going out")
+aapcs32_split()
+    assert_eq(shape(thumb(), "    a: [5]u8"),
+              two("declare void @give(ptr sret(%struct.S) align 1)",
+                  "declare void @take([2 x i32])"))
+    assert_eq(shape(thumb(), "    a: i32\n    b: i32"),
+              two("declare void @give(ptr sret(%struct.S) align 4)",
+                  "declare void @take([2 x i32])"))
+    assert_eq(shape(thumb(), "    p: *u8\n    q: *u8"),
+              two("declare void @give(ptr sret(%struct.S) align 4)",
+                  "declare void @take([2 x i32])"))
+end aapcs32_split
+
+// The register *element* is the aggregate's alignment and not the machine's word, which is the
+// detail no document states: what LLVM is being given is the shape to copy rather than the registers
+// to use.
+@test("an eight-aligned aggregate is named in eights, on a machine whose registers are four")
+aapcs32_the_word_follows_the_alignment()
+    assert_eq(shape(thumb(), "    a: i64\n    b: i32"),
+              two("declare void @give(ptr sret(%struct.S) align 8)",
+                  "declare void @take([2 x i64])"))
+end aapcs32_the_word_follows_the_alignment
+
+// No size at all ends the register case, which is the sentence that separates this convention from
+// every other one here.
+@test("an aggregate far past any register file still goes out in registers")
+aapcs32_no_size_ends_the_register_case()
+    assert_eq(shape(thumb(), "    a: [64]u8"),
+              two("declare void @give(ptr sret(%struct.S) align 1)",
+                  "declare void @take([16 x i32])"))
+end aapcs32_no_size_ends_the_register_case
+
+// An HFA travels as the struct type itself in **both** directions -- the opposite of AAPCS64, which
+// coerces the argument to an array of its element.
+@test("an AAPCS32 floating aggregate is the struct type, going out and coming back")
+aapcs32_a_floating_aggregate()
+    assert_eq(shape(thumb(), "    a: f32"),
+              two("declare %struct.S @give()", "declare void @take(%struct.S)"))
+    assert_eq(shape(thumb(), "    a: f32\n    b: f32"),
+              two("declare %struct.S @give()", "declare void @take(%struct.S)"))
+    assert_eq(shape(thumb(), "    a: f64\n    b: f64\n    c: f64\n    d: f64"),
+              two("declare %struct.S @give()", "declare void @take(%struct.S)"))
+end aapcs32_a_floating_aggregate
+
+// -- the Microsoft convention -------------------------------------------------------------------------
+
+@test("an aggregate of exactly one, two, four or eight bytes goes in a Windows register")
+windows_one_register()
+    assert_eq(shape(win(), "    a: u8"), two("declare i8 @give()", "declare void @take(i8)"))
+    assert_eq(shape(win(), "    a: u8\n    b: u8"),
+              two("declare i16 @give()", "declare void @take(i16)"))
+    assert_eq(shape(win(), "    a: i32"), two("declare i32 @give()", "declare void @take(i32)"))
+    assert_eq(shape(win(), "    a: i32\n    b: i32"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+end windows_one_register
+
+// No floating case at all: two floats are eight bytes, so they go in an integer register, where both
+// other 64-bit conventions would have used the floating ones.
+@test("floating members get no special treatment on Windows")
+windows_no_floating_case()
+    assert_eq(shape(win(), "    a: f32"), two("declare i32 @give()", "declare void @take(i32)"))
+    assert_eq(shape(win(), "    a: f32\n    b: f32"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape(win(), "    a: f64\n    b: f64"),
+              two("declare void @give(ptr sret(%struct.S) align 8)",
+                  "declare void @take(ptr align 8)"))
+end windows_no_floating_case
+
+@test("any other size at all goes by address, three bytes as much as thirty")
+windows_everything_else_is_memory()
+    assert_eq(shape(win(), "    a: u8\n    b: u8\n    c: u8"),
+              two("declare void @give(ptr sret(%struct.S) align 1)",
+                  "declare void @take(ptr align 1)"))
+    assert_eq(shape(win(), "    a: i32\n    b: i32\n    c: i32"),
+              two("declare void @give(ptr sret(%struct.S) align 4)",
+                  "declare void @take(ptr align 4)"))
+    assert_eq(shape(win(), "    a: i64\n    b: i64"),
+              two("declare void @give(ptr sret(%struct.S) align 8)",
+                  "declare void @take(ptr align 8)"))
+    assert_eq(shape(win(), "    a: u128"),
+              two("declare void @give(ptr sret(%struct.S) align 16)",
+                  "declare void @take(ptr align 16)"))
+end windows_everything_else_is_memory
+
+@test("a Windows address is eight bytes and nothing more")
+windows_an_address_is_bytes()
+    assert_eq(shape(win(), "    p: *u8"), two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape(win(), "    p: *u8\n    q: *u8"),
+              two("declare void @give(ptr sret(%struct.S) align 8)",
+                  "declare void @take(ptr align 8)"))
+end windows_an_address_is_bytes
+
+// -- WebAssembly ------------------------------------------------------------------------------------
+
+@test("one scalar wrapped in a struct is that scalar, whatever it is")
+wasm_unwraps_a_lone_scalar()
+    assert_eq(shape(wasm(), "    a: u8"), two("declare i8 @give()", "declare void @take(i8)"))
+    assert_eq(shape(wasm(), "    a: i32"), two("declare i32 @give()", "declare void @take(i32)"))
+    assert_eq(shape(wasm(), "    a: i64"), two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(shape(wasm(), "    a: f32"),
+              two("declare float @give()", "declare void @take(float)"))
+    assert_eq(shape(wasm(), "    a: f64"),
+              two("declare double @give()", "declare void @take(double)"))
+end wasm_unwraps_a_lone_scalar
+
+// An address is named as one here, where the Microsoft convention calls it the eight bytes it
+// occupies -- because this convention never asks how many bytes anything is.
+@test("a WebAssembly address stays an address")
+wasm_an_address_stays_an_address()
+    assert_eq(shape(wasm(), "    p: *u8"), two("declare ptr @give()", "declare void @take(ptr)"))
+end wasm_an_address_stays_an_address
+
+// The whole of what separates this convention from every other one: eight bytes of two members is a
+// register or two everywhere else and is memory here. There is no threshold to be off by one about,
+// because there is no threshold.
+@test("two members are memory at any size, which no other convention says")
+wasm_two_members_are_memory()
+    assert_eq(shape(wasm(), "    a: i32\n    b: i32"),
+              two("declare void @give(ptr sret(%struct.S) align 4)",
+                  "declare void @take(ptr byval(%struct.S) align 4)"))
+    assert_eq(shape(wasm(), "    a: f32\n    b: f32"),
+              two("declare void @give(ptr sret(%struct.S) align 4)",
+                  "declare void @take(ptr byval(%struct.S) align 4)"))
+    assert_eq(shape(wasm(), "    a: u8\n    b: u8"),
+              two("declare void @give(ptr sret(%struct.S) align 1)",
+                  "declare void @take(ptr byval(%struct.S) align 1)"))
+end wasm_two_members_are_memory
+
+@test("a floating aggregate gets no floating case, there being none in this convention")
+wasm_no_floating_case()
+    assert_eq(shape(wasm(), "    a: f64\n    b: f64\n    c: f64\n    d: f64"),
+              two("declare void @give(ptr sret(%struct.S) align 8)",
+                  "declare void @take(ptr byval(%struct.S) align 8)"))
+end wasm_no_floating_case
+
+// The argument is a copy the caller makes, as on System V -- but the alignment rule is the other one.
+// System V floors a stack argument at eight; this states the type's own. Only the *argument* differs:
+// the `sret` alignment is the type's under both, which is the reminder that the floor is a fact about
+// the stack slot a caller writes and not about the aggregate.
+@test("the caller's copy is aligned to the type and not floored at a word")
+wasm_the_copy_is_aligned_to_the_type()
+    assert_eq(shape(wasm(), "    a: [64]u8"),
+              two("declare void @give(ptr sret(%struct.S) align 1)",
+                  "declare void @take(ptr byval(%struct.S) align 1)"))
+    assert_eq(shape(x64(), "    a: [64]u8"),
+              two("declare void @give(ptr sret(%struct.S) align 1)",
+                  "declare void @take(ptr byval(%struct.S) align 8)"))
+end wasm_the_copy_is_aligned_to_the_type
+
+// The unwrapping sees through nesting in both directions, and stops where the padding starts: a
+// five-byte array is five members, not one.
+@test("the unwrapping sees through nesting and through a one-element array")
+wasm_the_unwrapping_sees_through_nesting()
+    assert_eq(shape_with(wasm(), "    inner: Inner", "struct Inner\n    a: i32\n"),
+              two("declare i32 @give()", "declare void @take(i32)"))
+    assert_eq(shape(wasm(), "    a: [1]f64"),
+              two("declare double @give()", "declare void @take(double)"))
+    assert_eq(shape(wasm(), "    a: [5]u8"),
+              two("declare void @give(ptr sret(%struct.S) align 1)",
+                  "declare void @take(ptr byval(%struct.S) align 1)"))
+end wasm_the_unwrapping_sees_through_nesting
+
+// -- an aggregate that is not a struct declaration ------------------------------------------------
+
+// A view is three words, which is past what any of the conventions puts in registers. This is the
+// one place a view does *not* lower as it does everywhere else, and it is right: a C function
+// declared to take a matching three-word struct is the only one it can reach.
+@test("a view is three words and so travels by address")
+a_view_travels_by_address()
+    assert_eq(spelled(arm(), "[]u8"),
+              two("declare void @give(ptr sret({ ptr, ptr, i64 }) align 8)",
+                  "declare void @take(ptr align 8)"))
+    assert_eq(spelled(x64(), "string"),
+              two("declare void @give(ptr sret({ ptr, ptr, i64 }) align 8)",
+                  "declare void @take(ptr byval({ ptr, ptr, i64 }) align 8)"))
+end a_view_travels_by_address
+
+@test("a tuple is a struct and is classified as one")
+a_tuple_is_a_struct()
+    assert_eq(spelled(arm(), "(i32, i32)"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(spelled(x64(), "(f64, f64)"),
+              two("declare { double, double } @give()", "declare void @take(double, double)"))
+end a_tuple_is_a_struct
+
+// A data enum is a tag and a union, and a union has no member to name a chunk after -- so it is
+// classified as the integers it is emitted as, which is what makes it never homogeneous.
+@test("a data enum is its tag and the region its payloads share")
+a_data_enum_is_its_tag_and_region()
+    assert_eq(spelled_with(arm(), "E", "enum E\n    A(x: f32)\n    B(y: f32)\n"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+    assert_eq(spelled_with(x64(), "E", "enum E\n    A(x: f32)\n    B(y: f32)\n"),
+              two("declare i64 @give()", "declare void @take(i64)"))
+    // The tag is alone in the first chunk here, because the payload's alignment pushes it to the
+    // second -- so the chunk is named after the tag and not after the eight bytes it spans.
+    assert_eq(spelled_with(x64(), "E", "enum E\n    A(x: f64)\n    B(y: i64)\n"),
+              two("declare { i32, i64 } @give()", "declare void @take(i32, i64)"))
+    assert_eq(spelled_with(arm(), "E", "enum E\n    A(x: f64)\n    B(y: i64)\n"),
+              two("declare [2 x i64] @give()", "declare void @take([2 x i64])"))
+end a_data_enum_is_its_tag_and_region
+
+@test("a simple enum is its underlying integer and has nothing to classify")
+a_simple_enum_has_nothing_to_classify()
+    assert_eq(spelled_with(arm(), "Colour", "enum Colour\n    Red\n    Green\n"),
+              two("declare i32 @give()", "declare void @take(i32)"))
+end a_simple_enum_has_nothing_to_classify
+
+// C passes nothing for an empty struct and LLVM gives an empty aggregate no register either, so the
+// two already agree and there is nothing to coerce.
+@test("an aggregate that occupies nothing is left alone")
+an_empty_aggregate_is_left_alone()
+    assert_eq(shape(arm(), "    a: unit"),
+              two("declare %struct.S @give()", "declare void @take(%struct.S)"))
+end an_empty_aggregate_is_left_alone
