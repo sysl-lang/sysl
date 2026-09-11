@@ -1,0 +1,238 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **The seam with a foreign function**: what an `extern` is declared as, and what a call to one
+// emits.
+//
+// A call from sysl to sysl needs none of this. Both sides are this compiler, so whatever it does
+// with an aggregate is a convention like any other and the two agree by construction -- a small one
+// crosses as itself, a large one through memory -- and neither has to match what any other language
+// would have done. A foreign callee was compiled by somebody else against a published document, and
+// the document is then the only thing that can make the two agree: a declaration here names the
+// types **that** convention asks for (`cabi.sysl`) rather than the ones the sysl signature is
+// written in, and the call converts each value between the two.
+//
+// Every conversion goes **through memory**: the value is stored to a slot and the coerced shape is
+// read back over the same bytes. That is what clang does and it is what is available -- LLVM has no
+// instruction that reinterprets one aggregate as another, and the two shapes deliberately do not
+// agree field for field. The bytes copied are always the *sysl* type's own, so a coerced form wider
+// than the value leaves its surplus unspecified, exactly as the conventions say it is.
+
+// What a call names between the keyword and the callee: the result type, whatever attribute the
+// convention puts in front of it, and -- for a variadic callee alone -- the whole function type,
+// which is what LLVM reads there instead.
+//
+// It is a bundle rather than three values because three places hand it along, and splitting it would
+// make a caller that filled two of them and forgot the third representable.
+struct CallForm
+    ret: LType
+    ret_attrs: Buf[IrAttr]
+    whole: Option[IrFnType]
+end CallForm
+
+call_form(ret: LType, ret_attrs: Buf[IrAttr]) -> CallForm = CallForm(ret, ret_attrs, None)
+
+plain_form(ret: LType) -> CallForm = CallForm(ret, no_ir_attrs(), None)
+
+form_call(f: CallForm, dest: Option[Val], callee: Val, args: Buf[IrArg]) -> Inst =
+    InCall(dest, f.ret, callee, args, f.ret_attrs, f.whole, no_fast_math(), false)
+
+// The type a foreign declaration and every call to it name.
+//
+// It is one value rather than a result and a parameter list because that is what it is: a `declare`
+// is this plus a symbol, and a variadic **call** names the whole of it, so building the two out of
+// one thing is what keeps them from disagreeing.
+foreign_signature(e: *Emit, ret_ty: Type, params: Buf[Type], variadic: bool) -> IrFnType
+    var out: Buf[IrParam] = buf()
+
+    // The out-parameter goes in front of everything, which is how the callee finds it whatever else
+    // the signature holds.
+    c_result(e.layout, ret_ty, e.target) match
+        CrSret(ty, align) -> out.push(IrParam(LPtr, sret_attrs(ty, align), None))
+        _ -> ()
+
+    for i in 0..<params.len()
+        val p = params.at(i)
+
+        if !zero_sized(p) then foreign_params(e, p, &out)
+
+    val form = foreign_result(e, ret_ty)
+
+    IrFnType(form.ret, out, variadic, form.ret_attrs)
+end foreign_signature
+
+// What a call to a foreign function names as its result.
+foreign_result(e: *Emit, ret_ty: Type) -> CallForm = c_result(e.layout, ret_ty, e.target) match
+    // A narrow scalar is named as itself and carries the convention's extension in front of it, so
+    // that what the callee widened is what this side reads back.
+    CrPlain -> call_form(c_lty(e.layout, ret_ty), c_extension(ret_ty, e.target))
+    CrCoerced(l) -> plain_form(l)
+    CrSret(_, _) -> plain_form(LVoid)
+
+private foreign_params(e: *Emit, p: Type, out: *Buf[IrParam])
+    c_param(e.layout, p, e.target) match
+        CpPlain -> out.push(IrParam(c_lty(e.layout, p), c_extension(p, e.target), None))
+        CpCoerced(pieces) ->
+            for i in 0..<pieces.len()
+                out.push(pieces.at(i))
+        // **A pointer the callee is handed rather than a copy it is given carries the alignment
+        // too**, which is the half `byval` states as part of its own attribute. It is a claim about
+        // the pointer and not about where the bytes travel.
+        CpIndirect(ty, align, byval) ->
+            out.push(IrParam(LPtr, if byval then byval_attrs(ty, align) else align_attrs(align),
+                             None))
+end foreign_params
+
+// `byval`, which names the aggregate the caller's copy holds as well as the boundary it sits on.
+private byval_attrs(ty: LType, align: int) -> Buf[IrAttr]
+    var out: Buf[IrAttr] = buf()
+
+    out.push(AttrByVal(ty))
+    out.push(AttrAlign(align))
+    out
+end byval_attrs
+
+private align_attrs(align: int) -> Buf[IrAttr]
+    var out: Buf[IrAttr] = buf()
+
+    out.push(AttrAlign(align))
+    out
+end align_attrs
+
+// Lowers a call to a foreign function. `what` is what the `call` names between the keyword and the
+// callee -- the result type, or the callee's whole function type where it is variadic.
+gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Type) -> Val
+    val result = c_result(e.layout, ty, e.target)
+
+    // The storage a big result is written into is the caller's, so it exists before the call, and it
+    // is named in front of every argument.
+    var returned: Option[Val] = None
+    var arguments: Buf[IrArg] = buf()
+
+    result match
+        CrSret(sty, align) ->
+            val slot = alloca(e, fresh_reg(e), sty)
+
+            returned = Some(slot)
+            arguments.push(IrArg(LPtr, slot, sret_attrs(sty, align)))
+        _ -> ()
+
+    // An argument past the declared parameters is a variadic extra, and C classifies one exactly as
+    // it classifies a declared parameter -- so both take the same path, each at its own type.
+    for i in 0..<args.len()
+        val a = args.at(i)
+        val at = texpr_type(a)
+        val v = gen_expr(e, a)
+
+        if !zero_sized(at)
+            c_param(e.layout, at, e.target) match
+                // The extension is stated at the call as well as on the declaration, because it is
+                // the **caller's** obligation and the call is where the caller is.
+                CpPlain -> arguments.push(IrArg(c_lty(e.layout, at), v, c_extension(at, e.target)))
+                CpCoerced(pieces) -> spread(e, v, at, pieces, &arguments)
+                CpIndirect(cty, align, byval) ->
+                    val slot = alloca(e, fresh_reg(e), cty)
+
+                    emit(e, InStore(cty, v, slot, AccPlain, None))
+                    arguments.push(IrArg(LPtr, slot,
+                                         if byval then byval_attrs(cty, align)
+                                         else align_attrs(align)))
+
+    result match
+        CrSret(coerced, _) ->
+            emit(e, form_call(what, None, callee, arguments))
+
+            val r = fresh_reg(e)
+
+            emit(e, InLoad(r, coerced, returned.unwrap(), AccPlain, None))
+            own_temp(e, r, ty)
+
+        CrCoerced(coerced) ->
+            val r = fresh_reg(e)
+
+            emit(e, form_call(what, Some(r), callee, arguments))
+
+            // A homogeneous floating aggregate comes back under its own type, so there is nothing to
+            // reinterpret and the round trip through memory would be a copy for its own sake.
+            val same = l_render(coerced) == l_render(c_lty(e.layout, ty))
+
+            own_temp(e, if same then r else gather(e, r, coerced, ty), ty)
+
+        CrPlain ->
+            if no_value(ty)
+                emit(e, form_call(what, None, callee, arguments))
+
+                if ty == Never then emit_term(e, InUnreachable)
+
+                VNothing
+            else
+                val r = fresh_reg(e)
+
+                emit(e, form_call(what, Some(r), callee, arguments))
+                own_temp(e, r, ty)
+end gen_foreign_call
+
+// A value of `t`, spread into the registers the convention hands it over in. Several registers are
+// read back out of a literal struct of them, which lays each piece out at the offset of the
+// eightbyte it stands for.
+private spread(e: *Emit, v: Val, t: Type, pieces: Buf[IrParam], out: *Buf[IrArg])
+    val holder = if pieces.len() == 1 then pieces.at(0).ty else LStruct(piece_types(pieces))
+    val slot = reinterpret(e, v, c_lty(e.layout, t), holder, int(e.layout.size(t)))
+
+    if pieces.len() == 1
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, holder, slot, AccPlain, None))
+        out.push(IrArg(pieces.at(0).ty, r, pieces.at(0).attrs))
+        return
+
+    for i in 0..<pieces.len()
+        val p = pieces.at(i)
+        val at = fresh_reg(e)
+        val r = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(i)))))
+        emit(e, InGep(at, holder, slot, idx))
+        emit(e, InLoad(r, p.ty, at, AccPlain, None))
+        out.push(IrArg(p.ty, r, p.attrs))
+end spread
+
+piece_types(pieces: Buf[IrParam]) -> Buf[LType]
+    var out: Buf[LType] = buf()
+
+    for i in 0..<pieces.len()
+        out.push(pieces.at(i).ty)
+
+    out
+end piece_types
+
+// A value that arrived in the registers the convention names, read back as the `t` it stands for.
+private gather(e: *Emit, v: Val, coerced: LType, t: Type) -> Val
+    val slot = reinterpret(e, v, coerced, c_lty(e.layout, t), int(e.layout.size(t)))
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, c_lty(e.layout, t), slot, AccPlain, None))
+    r
+end gather
+
+// Writes `v` down as `from` and hands back a slot of `to` holding the same `bytes` bytes. The count
+// is the sysl type's own size in both directions, which is the only length both shapes are known to
+// have -- the coerced one is never narrower, and where it is wider the surplus is what the
+// convention leaves unspecified.
+//
+// Both operands are stated as byte-aligned, which is the one claim that is true of every pair a
+// coercion can produce: a coerced form may be an `i8`, whose slot LLVM aligns to one, and a *higher*
+// claim than the slot has would be a promise the emitted code does not keep.
+private reinterpret(e: *Emit, v: Val, from: LType, to: LType, bytes: int) -> Val
+    val src = alloca(e, fresh_reg(e), from)
+    val dst = alloca(e, fresh_reg(e), to)
+
+    emit(e, InStore(from, v, src, AccPlain, None))
+    emit_memcpy(e, dst, src, bytes, 1)
+    dst
+end reinterpret

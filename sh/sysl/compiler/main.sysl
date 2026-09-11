@@ -35,6 +35,7 @@ run_cli(args: []string, say: string -> unit) -> int
         "emit-ast" -> emit_ast_command(args, say)
         "emit-typed" -> emit_typed_command(args, say)
         "emit-llvm" -> emit_llvm_command(args, say)
+        "build" -> build_command(args, say)
         other ->
             say(s"sysl: `${other}` is not a command this compiler can carry out yet")
             say(usage())
@@ -180,9 +181,63 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
             Fine
 end emit_llvm_command
 
+// `sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path>` -- one program, made
+// into something the machine will run.
+//
+// **The text is exactly what `emit-llvm` prints**, so a build and a diff are the same lowering seen
+// twice; what this adds is the toolchain the text is handed to. `--cc` names the clang instead of
+// searching for one, and a person who wrote one down is owed an error rather than a different
+// compiler.
+private build_command(args: []string, say: string -> unit) -> int
+    var named: Option[string] = None
+    var cc: Option[string] = None
+    var out: Option[string] = None
+    var level = DefaultOptimization
+    var file = ""
+    var i: usize = 2
+
+    while i < args.len
+        if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o"
+            if i + 1 >= args.len
+                say(build_usage())
+                return Misused
+            end if
+
+            val flag = args[i]
+
+            i += 1
+
+            if flag == "--target" then named = Some(args[i])
+            else if flag == "--cc" then cc = Some(args[i])
+            else out = Some(args[i])
+        else if args[i].len > 2 && args[i].starts_with("-O")
+            level = args[i][2..<args[i].len]
+        else
+            file = args[i]
+
+        i += 1
+
+    if file == ""
+        say(build_usage())
+        return Misused
+    end if
+
+    build_native_program(file, named, cc, level, out) match
+        Err(refusal) ->
+            say(s"error: ${refusal.message}")
+            Failed
+        Ok(exe) ->
+            say(s"wrote $exe")
+            Fine
+end build_command
+
+private build_usage() -> string =
+    "usage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path>"
+
 usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <file> | " +
     "emit-typed [--no-spans] [--tables] [--target <name>] <path> | " +
-    "emit-llvm [--target <name>] <path>"
+    "emit-llvm [--target <name>] <path> | " +
+    "build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path>"
 
 main(args: []string)
     val code = run_cli(args, line -> print(line))

@@ -1,0 +1,99 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// **What a C header for this program's exports would declare.**
+//
+// Only the part two checks need is here: which named aggregates the exported signatures reach, and
+// what each is called in C. Rendering the file itself belongs to the command that writes one, and
+// nothing in `emit-llvm` does.
+
+// Every named aggregate the exported signatures reach, **innermost first**.
+//
+// A struct is reached through a parameter, a result, a pointer's pointee, a function pointer's own
+// signature, another struct's field, or an array's element -- so the walk follows all of them rather
+// than only the top level, and a type mentioned twice is defined once.
+//
+// It is here rather than inside the check that reads it because the header would ask the same
+// question -- which types land in the file -- and working that set out a second time is how the two
+// would come to disagree about what is in it.
+header_aggregates(exports: Buf[TFunc]) -> Buf[Type]
+    var seen: Buf[Type] = buf()
+    var named: Buf[Type] = buf()
+
+    for i in 0..<exports.len()
+        val f = exports.at(i)
+
+        for j in 0..<f.params.len()
+            header_walk(f.params.at(j).1, &seen, &named)
+
+        header_walk(f.ret_ty, &seen, &named)
+
+    named
+end header_aggregates
+
+private header_walk(t: Type, seen: *Buf[Type], named: *Buf[Type])
+    val r = repr(t)
+
+    for i in 0..<seen.len()
+        if type_eq(seen.at(i), r) then return
+
+    seen.push(r)
+
+    r match
+        // The fields go first, so that what this definition lays out is already complete where the
+        // C compiler reads it.
+        Struct(d) ->
+            val fields = d.stored()
+
+            for i in 0..<fields.len()
+                header_walk(fields.at(i).1, seen, named)
+
+            named.push(r)
+        Array(_, elem) -> header_walk(*elem, seen, named)
+        Ptr(inner) -> header_walk(*inner, seen, named)
+        CFn(params, ret) ->
+            for i in 0..<params.len()
+                header_walk(params.at(i), seen, named)
+
+            header_walk(*ret, seen, named)
+        _ -> ()
+end header_walk
+
+// The C name of a named type -- the one the author chose, or the derived one.
+//
+// **`@export("b2BodyId")` on the struct is what chooses it**, and it exists because everything else
+// in a header is either the author's spelling or a C fixed-width name: a binding mirroring a C
+// library wants to hand back that library's own type names. The choice is a claim, so the name check
+// holds it to the property the derived form gives away -- that no two types in one header answer to
+// one name.
+//
+// Derived, the mangled form is already unique per instantiation -- it is what the emitted module
+// names the aggregate -- and the separators it uses are not C identifier characters, so they are
+// replaced rather than the name being invented again here.
+//
+// **The replacement is where uniqueness stops, which is worth knowing before trusting the derived
+// form.** The mangling is injective and the map onto `_` is not: a `C` in module `a.b` and a `b_C`
+// in module `a` mangle apart and land on `a_b_C` together. The honest statement is that the derived
+// name is *ordinarily* unique and the collision rule is what guarantees it.
+c_name(t: Type) -> string = t match
+    Struct(d) -> d.cname match
+        Some(name) -> name
+        None -> c_header_name(mangled(d.base, d.targs))
+    _ -> "void"
+
+private c_header_name(name: string) -> string
+    var out: Buf[u8] = buf()
+
+    for i in 0..<name.bytes.len
+        val b = name.bytes[i]
+
+        out.push(if is_c_ident_byte(b) then b else u8('_'))
+
+    from_utf8_unchecked(out.view())
+end c_header_name
+
+private is_c_ident_byte(b: u8) -> bool =
+    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) ||
+    (b >= u8('0') && b <= u8('9'))

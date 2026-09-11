@@ -1,0 +1,597 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// **How an aggregate -- and a narrow scalar -- is handed to and from a C function.**
+//
+// A register-width scalar crosses the boundary as itself: an `i32` is one register on every machine
+// sysl lowers for, and nothing has to be decided. An aggregate does not. Each ABI says which
+// registers a struct arrives in, and **LLVM applies no such rule of its own** -- given a struct type
+// in a signature it assigns one register per element, which is not what a single one of the
+// conventions below asks for. So the declaration a call names has to be the *coerced* one the ABI
+// specifies, and the value converted into and out of that shape at the call.
+//
+// The **coercion** is not needed for a call from sysl to sysl. Both sides are this compiler, so a
+// struct handed over as a struct is a convention like any other and the two agree by construction.
+// It is only at the seam with a foreign function -- where the other side was compiled by somebody
+// else against a published document -- that the published answer is the only one that works.
+//
+// The **extension** does not divide that way, and it is the one answer here that a sysl-to-sysl
+// signature carries too: a definition cannot know that C is not on the other end of it, and widening
+// a result is what the *callee* owes. `c_extension` in `emit_sig.sysl` says which side owes what.
+//
+// Every rule below was read off `clang -S -emit-llvm` for the triple, which is the only method that
+// finds the parts no document states plainly: that AAPCS64 hands a small struct **back** in an
+// integer of its exact width while taking the same struct widened to a whole register; that System V
+// splits a sixteen-byte struct into two *separate* parameters where AAPCS64 passes one array of two;
+// and that RISC-V flattens a struct of one float and one integer into two registers but does **not**
+// flatten one of a pointer and a float.
+
+// What a call names as its result type, and how the value comes back.
+enum CResult
+    // Nothing to coerce -- the sysl type is already what the ABI asks for.
+    CrPlain
+
+    // An aggregate returned in registers, under a different LLVM type.
+    CrCoerced(ty: LType)
+
+    // An aggregate too big for registers: the caller supplies the storage and the callee fills it,
+    // so the declared result is `void` and an out-parameter goes in front of every argument.
+    CrSret(ty: LType, align: int)
+end CResult
+
+// What a call passes for one declared parameter. One register's worth of an argument is exactly a
+// declared parameter, so a coerced one is a list of `IrParam` -- the type it is named by and
+// whatever attribute the convention puts on it.
+enum CParam
+    // Nothing to coerce.
+    CpPlain
+
+    // An aggregate spread across registers, each its own parameter.
+    CpCoerced(pieces: Buf[IrParam])
+
+    // An aggregate passed by address. `byval` says the bytes go on the caller's stack and the
+    // pointer is how LLVM is told to put them there -- System V's answer, and WebAssembly's. The
+    // rest pass a real pointer in a register, and marking one `byval` there would be a different
+    // call.
+    CpIndirect(ty: LType, align: int, byval: bool)
+end CParam
+
+// The registers an aggregate occupies, named twice -- because a result and an argument may spell the
+// same registers differently, which is AAPCS64's case throughout and nobody else's.
+private enum CShape
+    CsMemory
+
+    CsRegisters(returned: LType, passed: Buf[IrParam])
+
+    // AAPCS32's case, and the reason `CsMemory` is not enough on its own: that convention returns
+    // anything wider than a register through storage while still passing the very same aggregate
+    // **in whole words**, at any size at all. A sixty-four-byte struct is an `sret` result and a
+    // `[16 x i32]` argument, so the two answers cannot be read off one verdict.
+    CsSplit(passed: Buf[IrParam])
+end CShape
+
+// Whether a type is one the ABI has an answer about -- that is, whether its LLVM form is something
+// other than a single register's worth of value.
+//
+// A trait object and a view are here because they *are* aggregates, whatever a C header would have
+// called them: a `string` is three words, and a C function declared to take a matching three-word
+// struct is the only C function it can correctly reach.
+//
+// A **zero-sized** aggregate is left alone. C passes nothing for one and LLVM assigns an empty
+// aggregate no register either, so the two already agree and there is nothing to coerce.
+c_aggregate(l: TargetLayout, t: Type) -> bool = underlying(t) match
+    Struct(_) -> l.size(t) > 0
+    Array(_, _) -> l.size(t) > 0
+    Slice(_, _) -> true
+    Str -> true
+    VaList -> true
+    Enum(d) -> !d.simple
+    p -> erased(p) || c_erased_weak(p)
+
+c_result(l: TargetLayout, t: Type, target: Target) -> CResult
+    if !c_aggregate(l, t) then return CrPlain
+
+    c_shape(l, t, target) match
+        CsMemory -> CrSret(c_lty(l, t), int(l.align(t)))
+        CsSplit(_) -> CrSret(c_lty(l, t), int(l.align(t)))
+        CsRegisters(returned, _) -> CrCoerced(returned)
+end c_result
+
+c_param(l: TargetLayout, t: Type, target: Target) -> CParam
+    if !c_aggregate(l, t) then return CpPlain
+
+    c_shape(l, t, target) match
+        CsMemory -> c_stack_copy(l, t, target) match
+            Some(align) -> CpIndirect(c_lty(l, t), align, true)
+            None -> CpIndirect(c_lty(l, t), int(l.align(t)), false)
+        CsRegisters(_, passed) -> CpCoerced(passed)
+        CsSplit(passed) -> CpCoerced(passed)
+end c_param
+
+// Whether an aggregate that goes in memory is a copy the **caller** makes -- LLVM's `byval` -- and
+// at what alignment the convention states the slot, or nothing where the callee is handed an address
+// it may not write.
+//
+// **Two conventions ask for the copy and they state its alignment by different rules.** System V
+// aligns an argument passed in memory to eight whatever the aggregate is made of; WebAssembly states
+// the type's own alignment and nothing more. CRAFT states the type's own for wasm's reason and not
+// System V's: there is no convention here declaring a floor, so the only honest number is what the
+// type itself needs.
+private c_stack_copy(l: TargetLayout, t: Type, target: Target) -> Option[int]
+    if target.cpu == X86_64 && target.os != Windows then return Some(max_int(int(l.align(t)), 8))
+    if target.cpu == Wasm32 then return Some(int(l.align(t)))
+    if target.cpu == Craft then return Some(int(l.align(t)))
+
+    None
+end c_stack_copy
+
+private c_shape(l: TargetLayout, t: Type, target: Target) -> CShape
+    val size = int(l.size(t))
+
+    target.cpu match
+        Aarch64 -> c_aapcs64(l, t, size, target.os == MacOS)
+        X86_64 -> if target.os == Windows then c_windows(size) else c_sysv(l, t, size)
+        Riscv64 -> c_riscv(l, t, size, target.hard_float(), 8)
+        Riscv32 -> c_riscv(l, t, size, target.hard_float(), 4)
+        Thumb -> c_aapcs32(l, t, size, target.hard_float())
+        Wasm32 -> c_wasm(l, t, size)
+        // **CRAFT has no C compiler, so there is no convention to agree with**, and that is the
+        // answer rather than a measurement nobody made. What is left is the back end's own lowering,
+        // and passing an aggregate through memory is what it does.
+        Craft -> c_craft(l, t, size)
+        // i386 is refused at the registry for want of exactly this, so nothing reaches here.
+        X86 -> CsMemory
+
+// Where a result and an argument name the same registers the same way, which is every convention but
+// AAPCS64: a result in two registers is a literal struct of them, and an argument in two is two
+// parameters.
+private c_alike(pieces: Buf[LType]) -> CShape
+    var passed: Buf[IrParam] = buf()
+
+    for i in 0..<pieces.len()
+        passed.push(ir_param(pieces.at(i)))
+
+    CsRegisters(if pieces.len() == 1 then pieces.at(0) else LStruct(pieces), passed)
+end c_alike
+
+private c_one_param(t: LType) -> Buf[IrParam]
+    var out: Buf[IrParam] = buf()
+
+    out.push(ir_param(t))
+    out
+end c_one_param
+
+// -- AAPCS64 --------------------------------------------------------------------------------------
+
+// AAPCS64, which asks first whether the aggregate is a **homogeneous floating aggregate** -- up to
+// four members that are all the same floating type, however deeply nested -- because those go in the
+// floating registers whatever their size, and only then falls back to size.
+//
+// This is the convention whose two directions differ everywhere. A result is named by the
+// aggregate's own width, down to the bit; an argument by the whole registers it travels in, whose
+// surplus bits the convention leaves unspecified. And an argument every one of whose members is an
+// address is named in addresses, so that what a pointer carries beyond its bits survives being
+// handed over.
+private c_aapcs64(l: TargetLayout, t: Type, size: int, mac_os: bool) -> CShape
+    val ls = c_leaf_types(l, t)
+    val addresses = !ls.is_empty() && c_all_addresses(ls)
+
+    c_hfa(l, ls) match
+        // Away from Darwin the convention says how far to align a floating aggregate that runs out
+        // of registers and lands on the stack. Darwin's variant does not ask for it.
+        Some(both) ->
+            var attrs: Buf[IrAttr] = buf()
+
+            if !mac_os then attrs.push(AttrAlignStack(8))
+
+            var passed: Buf[IrParam] = buf()
+
+            passed.push(IrParam(LArr(both.1, both.0), attrs, None))
+            return CsRegisters(c_lty(l, t), passed)
+        None -> ()
+
+    if size <= 8
+        return CsRegisters(LInt(size * 8), c_one_param(if addresses then LPtr else LInt(64)))
+
+    // Two registers, and what names them is the *alignment*: sixteen bytes wanting sixteen-byte
+    // alignment is one `i128`, which is a register pair, where eight-byte alignment is two of them.
+    if size <= 16 && l.align(t) >= 16 then return c_alike(l_one(LInt(128)))
+
+    if size <= 16
+        return CsRegisters(LArr(2, LInt(64)),
+                           c_one_param(LArr(2, if addresses then LPtr else LInt(64))))
+
+    CsMemory
+end c_aapcs64
+
+// The floating type and count of a homogeneous floating aggregate, or nothing. Four is the limit
+// because that is how many registers the convention sets aside for one; a fifth member makes the
+// whole thing an ordinary aggregate again, however small it is.
+private c_hfa(l: TargetLayout, ls: Buf[Type]) -> Option[(LType, int)]
+    if ls.is_empty() || ls.len() > 4 then return None
+
+    for i in 0..<ls.len()
+        if !c_floating(ls.at(i)) then return None
+        if !type_eq(ls.at(i), ls.at(0)) then return None
+
+    Some((c_lty(l, ls.at(0)), int(ls.len())))
+end c_hfa
+
+// -- AAPCS32 --------------------------------------------------------------------------------------
+
+// AAPCS32, the Cortex-M convention, in **both** of its float variants -- and the one that breaks the
+// shape every other convention here has, because **its two directions disagree about memory itself**
+// rather than merely about how to name the same registers.
+//
+// A result wider than one register goes through storage, at any size. An argument **never** does:
+// whatever its size, it is named as whole words and the back end puts the surplus on the stack
+// itself. The word an argument is counted in follows the aggregate's **alignment**, not its size,
+// and a result of four bytes or fewer is named by a whole power-of-two width.
+//
+// **The HFA rule is the hard-float variant's and belongs to it alone.** Under `softfp` there are no
+// floating registers for an aggregate to travel in, so a struct of floats is an ordinary aggregate
+// of its size and takes the rules below.
+private c_aapcs32(l: TargetLayout, t: Type, size: int, hard_float: bool) -> CShape
+    val ls = c_leaf_types(l, t)
+    val floats = if hard_float then c_hfa(l, ls) else None
+
+    floats match
+        // An HFA crosses as the struct type itself in both directions: one VFP register per member
+        // is what the convention asks for and what LLVM does with a struct unaided, so the two agree
+        // and there is nothing to coerce.
+        Some(_) -> return CsRegisters(c_lty(l, t), c_one_param(c_lty(l, t)))
+        None -> ()
+
+    val unit = if l.align(t) >= 8 then 8 else 4
+    val words = c_one_param(LArr(round_up_int(size, unit) / unit, LInt(unit * 8)))
+
+    if size <= 4 then return CsRegisters(if size <= 2 then LInt(size * 8) else LInt(32), words)
+
+    CsSplit(words)
+end c_aapcs32
+
+// -- System V x86-64 -------------------------------------------------------------------------------
+
+// System V, which classifies the aggregate **one eightbyte at a time**: a chunk whose every byte
+// belongs to a floating member travels in a floating register, anything else in an integer one. Past
+// two eightbytes there are no registers left for it and the whole thing goes in memory.
+private c_sysv(l: TargetLayout, t: Type, size: int) -> CShape
+    if size > 16 || c_misaligned(l, t, 0) then return CsMemory
+
+    val ls = c_leaves(l, t)
+    var pieces: Buf[LType] = buf()
+
+    for i in 0..<((size + 7) / 8)
+        val lo = i * 8
+        val hi = min_int(size, lo + 8)
+
+        var here: Buf[(usize, Type)] = buf()
+
+        for j in 0..<ls.len()
+            val off = int(ls.at(j).0)
+
+            if off < hi && off + int(l.size(ls.at(j).1)) > lo then here.push(ls.at(j))
+
+        if !here.is_empty() && c_all_floating_pairs(here) then pieces.push(c_floating_chunk(l, here))
+        else pieces.push(c_integer_chunk(l, ls, lo, hi, size))
+
+    c_alike(pieces)
+end c_sysv
+
+// Whether any member of the aggregate sits off its own alignment, which System V classifies as
+// **MEMORY whatever the size is** -- the one clause of the classification that is about the layout
+// rather than about the members' kinds, and the only thing `@packed` changes about a call.
+//
+// **A bitfield struct is never one of these**, and that is clang's answer rather than a choice made
+// here: its members are ranges of a container rather than objects with addresses, so there is
+// nothing for the clause to be about.
+private c_misaligned(l: TargetLayout, t: Type, at: int) -> bool = underlying(t) match
+    Struct(d) -> if bitfield_ranges(d).is_some() then false else c_struct_misaligned(l, d, at)
+    // Every element of an array is the stride from the one before it, so if the first is on its
+    // alignment they all are -- and if it is not, none of them is.
+    Array(n, elem) -> n > 0 && c_misaligned(l, *elem, at)
+    _ -> false
+
+private c_struct_misaligned(l: TargetLayout, d: &StructType, at: int) -> bool
+    var off = at
+    var bad = false
+    val fields = d.stored()
+
+    for i in 0..<fields.len()
+        val f = fields.at(i).1
+
+        if !d.packed then off = int(round_up(usize(off), l.align(f)))
+        if off % int(l.align(f)) != 0 || c_misaligned(l, f, off) then bad = true
+
+        off += int(l.size(f))
+
+    bad
+end c_struct_misaligned
+
+// Members that all fit in floating registers are named by what fills the chunk: several of one width
+// as a vector of that many, one on its own as itself. A chunk two *different* floating widths share
+// has no such name, and clang falls back to a whole `double`.
+private c_floating_chunk(l: TargetLayout, here: Buf[(usize, Type)]) -> LType
+    var kinds: Buf[LType] = buf()
+
+    for i in 0..<here.len()
+        val k = c_lty(l, underlying(here.at(i).1))
+
+        if !c_holds_lty(kinds, k) then kinds.push(k)
+
+    if kinds.len() > 1 then return LFloat(64)
+    if here.len() == 1 then return kinds.at(0)
+
+    LVec(int(here.len()), kinds.at(0))
+end c_floating_chunk
+
+// An integer chunk is named by **the member that starts it**, when that member is all the chunk
+// carries: a `u8` in the second eightbyte of `{i64, u8}` is an `i8`, not the whole register it will
+// travel in. When the chunk carries more than the member starting it, there is no one member to name
+// it after and it is the bytes that are left.
+private c_integer_chunk(l: TargetLayout, ls: Buf[(usize, Type)], lo: int, hi: int,
+                        size: int) -> LType
+    var starts: Option[Type] = None
+
+    for i in 0..<ls.len()
+        if starts.is_none() && int(ls.at(i).0) == lo then starts = Some(ls.at(i).1)
+
+    // Clamped to what is left of the aggregate, because a member's *allocation* may be wider than
+    // the storage it occupies here: a bitfield struct's three-byte container is an `i24`, whose
+    // stride standing alone is four.
+    val width = starts match
+        Some(m) -> min_int(int(l.size(m)), size - lo)
+        None -> 0
+
+    val edge = min_int(lo + 8, size)
+    var alone = true
+
+    for i in 0..<ls.len()
+        val off = int(ls.at(i).0)
+
+        if off >= lo + width && off < edge then alone = false
+
+    val is_address = starts match
+        Some(m) -> c_address(underlying(m))
+        None -> false
+
+    // An address fills its chunk and is named as one, which changes nothing about the call but keeps
+    // what a pointer carries beyond its bits.
+    if width == 8 && is_address then return LPtr
+    if alone && (width == 1 || width == 2 || width == 4) then return LInt(width * 8)
+
+    LInt((hi - lo) * 8)
+end c_integer_chunk
+
+// -- RISC-V, LP64D and ILP32 -----------------------------------------------------------------------
+
+// RISC-V's convention, which is **one rule with the register width in it** rather than two: every
+// threshold below is a count of `XLEN`, so LP64D and ILP32 are the same function with `xlen` at
+// eight and at four.
+//
+// The hardware-float variant **flattens** the narrow cases: an aggregate of one or two floating
+// members travels in floating registers, and one floating member beside one integer member travels
+// in one of each. Anything else falls back to size -- including a pointer beside a float, which the
+// convention does not count as the integer case.
+//
+// Two registers are named by the aggregate's **alignment**: a two-word span aligned to two words is
+// one double-width integer, and otherwise it is an array of two. One register is named by the
+// aggregate's own **width**, which is what clang writes and what sysl follows.
+private c_riscv(l: TargetLayout, t: Type, size: int, hard_float: bool, xlen: int) -> CShape
+    val ls = c_leaf_types(l, t)
+    var fps = 0
+    var ints = 0
+
+    for i in 0..<ls.len()
+        if c_floating(ls.at(i)) then fps += 1
+        if c_integral(ls.at(i)) && int(l.size(ls.at(i))) <= xlen then ints += 1
+
+    if hard_float && ls.len() <= 2 && fps >= 1 && fps + ints == int(ls.len())
+        var pieces: Buf[LType] = buf()
+
+        for i in 0..<ls.len()
+            val m = ls.at(i)
+
+            pieces.push(if c_floating(m) then c_lty(l, m) else LInt(int(l.size(m)) * 8))
+
+        return c_alike(pieces)
+
+    if size <= xlen then return c_alike(l_one(LInt(size * 8)))
+
+    if size <= xlen * 2
+        val wide = l.align(t) >= usize(xlen * 2)
+
+        return c_alike(l_one(if wide then LInt(xlen * 16) else LArr(2, LInt(xlen * 8))))
+
+    CsMemory
+end c_riscv
+
+// -- Windows x64 -----------------------------------------------------------------------------------
+
+// The Microsoft convention, the simplest of them: an aggregate whose size is exactly one register's
+// worth travels in one register as an integer of that width, and everything else -- a three-byte
+// struct as much as a thirty-byte one -- goes by address.
+private c_windows(size: int) -> CShape =
+    if size == 1 || size == 2 || size == 4 || size == 8 then c_alike(l_one(LInt(size * 8)))
+    else CsMemory
+
+// -- WebAssembly -------------------------------------------------------------------------------------
+
+// WebAssembly's convention, which is the only one that asks nothing about **size**. An aggregate that
+// is one scalar with structs and one-element arrays wrapped round it travels as that scalar;
+// everything else goes in memory, at any size at all.
+private c_wasm(l: TargetLayout, t: Type, size: int) -> CShape = c_only_scalar(l, t, size) match
+    Some(scalar) -> c_alike(l_one(c_lty(l, scalar)))
+    None -> CsMemory
+
+// -- CRAFT -------------------------------------------------------------------------------------------
+
+// CRAFT, whose rule reads like wasm's and is arrived at from the opposite direction. wasm flattens
+// nothing because the machine has no registers for an aggregate to be flattened *into*. CRAFT has
+// eight of them and they are **two bytes each**, so a rule that put an aggregate in registers would
+// be spending the whole register file on a struct of four fields.
+private c_craft(l: TargetLayout, t: Type, size: int) -> CShape = c_only_scalar(l, t, size) match
+    Some(scalar) -> c_alike(l_one(c_lty(l, scalar)))
+    None -> CsMemory
+
+// The one scalar an aggregate is made of, where it is made of exactly one and no padding was added
+// round it -- clang's single-element struct, which sees through nesting in both directions.
+//
+// **The size check is what stops an over-aligned wrapper from being unwrapped.** A struct of one
+// `i32` declared to align to eight is eight bytes with one member, and clang passes it in memory
+// rather than as an `i32`.
+private c_only_scalar(l: TargetLayout, t: Type, size: int) -> Option[Type]
+    val ls = c_leaves(l, t)
+
+    if ls.len() != 1 then return None
+    if int(ls.at(0).0) != 0 then return None
+    if int(l.size(ls.at(0).1)) != size then return None
+
+    Some(ls.at(0).1)
+end c_only_scalar
+
+// -- the members an aggregate is made of ------------------------------------------------------------
+
+// The scalars an aggregate is made of, flattened through every level of nesting, each paired with
+// the byte it starts at. This is what the homogeneity question, the flattening question and the
+// eightbyte question are all asked of, and it walks the layout the emitted module actually has
+// rather than the one a program wrote.
+c_leaves(l: TargetLayout, t: Type) -> Buf[(usize, Type)]
+    var acc: Buf[(usize, Type)] = buf()
+
+    c_walk(l, t, 0, &acc)
+    acc
+end c_leaves
+
+private c_walk(l: TargetLayout, t: Type, at: usize, acc: *Buf[(usize, Type)])
+    underlying(t) match
+        // A bitfield struct has one member however many fields were written -- the container its
+        // ranges are cut from -- so that is the one leaf. Walking the written fields instead would
+        // put each at a byte offset of its own and make a one-byte struct three bytes of members.
+        Struct(d) -> bitfield_ranges(d) match
+            Some(ranges) -> acc.push((at, Integer(bitfield_bits(ranges), false, false)))
+            None ->
+                var off = at
+                val fields = d.stored()
+
+                for i in 0..<fields.len()
+                    val f = fields.at(i).1
+
+                    off = round_up(off, l.align(f))
+                    c_walk(l, f, off, acc)
+                    off += l.size(f)
+
+        Array(n, elem) ->
+            val stride = l.size(*elem)
+
+            for i in 0..<n
+                c_walk(l, *elem, at + usize(i) * stride, acc)
+
+        // A data enum is the tag and the payload region, and the region is a union -- there is no
+        // member to name inside it, so it counts as the integers it is emitted as. That makes an
+        // enum never homogeneous and never all-floating, which is right: a union of a float and an
+        // integer has to travel somewhere both of them fit.
+        Enum(d) ->
+            if d.simple then acc.push((at, underlying(t)))
+            else
+                val unit = max_usize_c(1, l.payload_align(d))
+                val start = at + round_up(4, unit)
+
+                acc.push((at, Integer(32, true, false)))
+
+                for i in 0..<int((l.payload_size(d) + unit - 1) / unit)
+                    acc.push((start + usize(i) * unit, Integer(int(unit) * 8, false, false)))
+
+        // A view is the owner, the first element, and the count; a trait object is the table and the
+        // value. Both are addresses and, for the view, a number -- which is all the ABI needs of
+        // them. The strides are words rather than eights.
+        Slice(_, _) -> c_walk_view(l, at, acc)
+        Str -> c_walk_view(l, at, acc)
+
+        VaList ->
+            for i in 0..<4
+                acc.push((at + usize(i) * l.pointer_bytes(), Ptr(byte_type())))
+
+        p ->
+            if erased(p) || c_erased_weak(p)
+                acc.push((at, Ptr(byte_type())))
+                acc.push((at + l.pointer_bytes(), Ptr(byte_type())))
+            else acc.push((at, p))
+end c_walk
+
+private c_walk_view(l: TargetLayout, at: usize, acc: *Buf[(usize, Type)])
+    val w = l.pointer_bytes()
+
+    acc.push((at, Ptr(byte_type())))
+    acc.push((at + w, Ptr(byte_type())))
+    acc.push((at + w * 2, usize_type(int(l.word_bits))))
+end c_walk_view
+
+// -- what a leaf is ----------------------------------------------------------------------------------
+
+private c_erased_weak(t: Type) -> bool = t match
+    Weak(inner) -> is_trait(*inner)
+    _ -> false
+
+private c_floating(t: Type) -> bool = underlying(t) match
+    Floating(_) -> true
+    _ -> false
+
+private c_address(t: Type) -> bool = underlying(t) match
+    Ptr(_) -> true
+    Ref(_, _) -> true
+    Weak(_) -> true
+    CFn(_, _) -> true
+    _ -> false
+
+private c_integral(t: Type) -> bool = underlying(t) match
+    Integer(_, _, _) -> true
+    Bool -> true
+    Char -> true
+    _ -> false
+
+private c_all_addresses(ls: Buf[Type]) -> bool
+    for i in 0..<ls.len()
+        if !c_address(ls.at(i)) then return false
+
+    true
+end c_all_addresses
+
+private c_all_floating_pairs(here: Buf[(usize, Type)]) -> bool
+    for i in 0..<here.len()
+        if !c_floating(here.at(i).1) then return false
+
+    true
+end c_all_floating_pairs
+
+private c_leaf_types(l: TargetLayout, t: Type) -> Buf[Type]
+    val ls = c_leaves(l, t)
+    var out: Buf[Type] = buf()
+
+    for i in 0..<ls.len()
+        out.push(underlying(ls.at(i).1))
+
+    out
+end c_leaf_types
+
+private c_holds_lty(xs: Buf[LType], x: LType) -> bool
+    for i in 0..<xs.len()
+        if l_render(xs.at(i)) == l_render(x) then return true
+
+    false
+end c_holds_lty
+
+// The LLVM form of a type, asked of a layout rather than of an emitter -- the ABI is a question
+// about a machine and there need be no function being built to ask it.
+c_lty(l: TargetLayout, t: Type) -> LType = type_lty(t, int(l.word_bits)) match
+    Some(x) -> x
+    None -> LVoid
+
+private max_int(a: int, b: int) -> int = if a > b then a else b
+
+private min_int(a: int, b: int) -> int = if a < b then a else b
+
+private max_usize_c(a: usize, b: usize) -> usize = if a > b then a else b
+
+private round_up_int(n: int, to: int) -> int = (n + to - 1) / to * to

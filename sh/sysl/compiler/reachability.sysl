@@ -335,9 +335,12 @@ private reached_modules(p: TProgram, own: Buf[string]) -> Option[Buf[string]]
     var reached: Buf[string] = buf()
 
     for i in 0..<own.len()
-        add_string(&reached, own.at(i))
+        add_module(&reached, own.at(i))
 
-    add_string(&reached, ModuleRoot)
+    // **A supplied file with no module header is in the root module and is therefore treated as the
+    // program's own**, since the root module is the one name two trees can share -- the answer that
+    // keeps a symbol is the safe one to be wrong with.
+    add_module(&reached, ModuleRoot)
 
     var i: usize = 0
 
@@ -351,10 +354,23 @@ private reached_modules(p: TProgram, own: Buf[string]) -> Option[Buf[string]]
                 val to = p.module_deps.at(j).1
 
                 for k in 0..<to.len()
-                    add_string(&reached, to.at(k))
+                    add_module(&reached, to.at(k))
 
     Some(reached)
 end reached_modules
+
+// A module name added to a set, where **the root module's name is the empty string and is a name
+// like any other**. `add_string` refuses one, which is right for a call graph -- nothing is called
+// by no name -- and wrong here: refused, the root module is not among the ones a compilation counts
+// roots in, so a program's own `@export`, `@section` or interrupt handler written with no module
+// header is pruned before it can be emitted.
+private add_module(xs: *Buf[string], name: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == name then return false
+
+    xs.push(name)
+    true
+end add_module
 
 // -- one program with something taken out of it -------------------------------------------------------
 

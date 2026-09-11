@@ -1,0 +1,289 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// **The C-callable entry an `@export` publishes.**
+//
+// `@export` says the function is callable from C, and a rename is not that. A definition taking the
+// exported symbol while keeping sysl's own parameter lowering leaves a C caller passing its
+// arguments where its own convention says and the body reading them where sysl's says. For a scalar
+// those are the same register and the two agree by luck; for an aggregate they are not, and what
+// arrives is whatever had been in the registers sysl looked at -- a silent wrong answer at the one
+// boundary this compiler cannot check, since the other side of it was compiled by somebody else.
+//
+// So the symbol is a **thunk**: a function of its own, with the signature `cabi.sysl` says C uses,
+// which reassembles each parameter into the shape sysl's own lowering expects and calls the
+// definition normally. The definition keeps its name, its lowering and its sysl callers, and nothing
+// about a sysl-to-sysl call changes.
+//
+// **It is `emit_foreign.sysl` read backwards, and that is the point of writing it this way.** A call
+// *to* C classifies each argument with `c_param` and spreads it into the registers the convention
+// names; this classifies each parameter the same way and gathers it back. One classifier answers
+// both directions, so the two cannot drift.
+//
+// **Why a thunk rather than reshaping the definition.** Emitting the definition itself with a C
+// signature puts a second parameter lowering inside the frame every sysl function goes through, to
+// serve the handful that are exported. The extra call costs nothing anybody can measure -- it is a
+// static call to a known symbol in the same module, which every optimization level inlines -- and it
+// buys the one thing the reshaping does not: an address. `&f` on an exported function is the
+// thunk's, and the thunk genuinely has the convention that address is being handed over as.
+//
+// **Ownership does not arise here, and that is the export check doing it rather than luck.** That
+// rule recurs into an aggregate's fields, so every type reaching this boundary is plain data: no
+// `&T`, no slice, no trait object, nothing with a count. The thunk therefore takes no reference and
+// releases none, and a parameter is bytes to be put where the callee will look for them.
+
+// The symbol a sysl definition is emitted under belongs to the definition; its exported name now
+// belongs to the thunk in front of it, which calls the definition by that mangled key.
+gen_export_thunk(e: *Emit, f: TFunc, symbol: string) -> Option[IrFunc]
+    start_function(e)
+
+    val stored = stored_fields(f.params)
+
+    var types: Buf[Type] = buf()
+
+    for i in 0..<stored.len()
+        types.push(stored.at(i).1)
+
+    val c_type = foreign_signature(e, f.ret_ty, types, false)
+
+    // The out-pointer is in front of every declared parameter, so the names run one behind wherever
+    // there is one -- which is the same offset `foreign_signature` put it at.
+    val sret = c_result(e.layout, f.ret_ty, e.target) match
+        CrSret(_, _) -> Some(VReg("c.sret"))
+        _ -> None
+
+    val incoming = thunk_names(e, types)
+
+    var named: Buf[Val] = buf()
+
+    sret match
+        Some(v) -> named.push(v)
+        None -> ()
+
+    for i in 0..<incoming.len()
+        val group = incoming.at(i)
+
+        for j in 0..<group.len()
+            named.push(group.at(j))
+
+    var declared: Buf[IrParam] = buf()
+
+    for i in 0..<c_type.params.len()
+        val p = c_type.params.at(i)
+
+        declared.push(IrParam(p.ty, p.attrs, Some(named.at(i))))
+
+    var passed: Buf[IrArg] = buf()
+
+    for i in 0..<stored.len()
+        passed.push(thunk_argument(e, stored.at(i).1, incoming.at(i)))
+
+    gen_thunk_call(e, f, symbol, passed, sret)
+
+    if has_gap(e) then return None
+
+    Some(finish_func(e, ir_sig(f.exported.unwrap(),
+                               IrFnType(c_type.ret, declared, false, c_type.ret_attrs))))
+end gen_export_thunk
+
+// The LLVM name of each incoming parameter, grouped by the sysl parameter it belongs to -- one name
+// for most, several where the convention hands an aggregate over in more than one register.
+private thunk_names(e: *Emit, params: Buf[Type]) -> Buf[Buf[Val]]
+    var out: Buf[Buf[Val]] = buf()
+
+    for i in 0..<params.len()
+        var group: Buf[Val] = buf()
+
+        c_param(e.layout, params.at(i), e.target) match
+            CpCoerced(pieces) ->
+                if pieces.len() > 1
+                    for j in 0..<pieces.len()
+                        group.push(VReg(s"c.$i.$j"))
+                else group.push(VReg(s"c.$i"))
+            _ -> group.push(VReg(s"c.$i"))
+
+        out.push(group)
+
+    out
+end thunk_names
+
+// One parameter, converted from the registers C put it in to what a sysl call passes.
+//
+// The two lowerings agree about a scalar and disagree about everything else, so the conversion is in
+// two steps rather than one: get the value into storage as the sysl type, then hand the callee
+// either that storage or the value in it, whichever its own convention asks for. Going through
+// memory is what a call *to* C does in the other direction and for the same reason -- LLVM has no
+// instruction that reinterprets one aggregate as another.
+private thunk_argument(e: *Emit, t: Type, incoming: Buf[Val]) -> IrArg
+    c_param(e.layout, t, e.target) match
+        // A scalar sysl also passes as itself: there is nothing to convert and no slot to make.
+        CpPlain ->
+            if !e.layout.indirect(t) then ir_arg(lty(e, t), incoming.at(0))
+            else ir_arg(LPtr, thunk_slot(e, t, incoming.at(0)))
+
+        // Already in storage, and it is storage this function may hand on: `byval` is C's promise
+        // that the copy is the callee's, and an indirect parameter without it is one the caller made
+        // for this call. Sysl's own indirect lowering copies at entry, exactly as the definition's
+        // prologue does for any other caller, so nothing here has to copy first.
+        CpIndirect(coerced, _, _) ->
+            if e.layout.indirect(t) then ir_arg(LPtr, incoming.at(0))
+            else
+                val v = fresh_reg(e)
+
+                emit(e, InLoad(v, coerced, incoming.at(0), AccPlain, None))
+                ir_arg(lty(e, t), v)
+
+        CpCoerced(pieces) -> thunk_gather(e, t, pieces, incoming)
+end thunk_argument
+
+private thunk_gather(e: *Emit, t: Type, pieces: Buf[IrParam], incoming: Buf[Val]) -> IrArg
+    val holder = if pieces.len() == 1 then pieces.at(0).ty else LStruct(piece_types(pieces))
+    val from = alloca(e, fresh_reg(e), holder)
+
+    if pieces.len() == 1
+        emit(e, InStore(holder, incoming.at(0), from, AccPlain, None))
+    else
+        for i in 0..<pieces.len()
+            val at = fresh_reg(e)
+
+            var idx: Buf[IrArg] = buf()
+
+            idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+            idx.push(ir_arg(l_i32(), VInt(from_int(long(i)))))
+            emit(e, InGep(at, holder, from, idx))
+            emit(e, InStore(pieces.at(i).ty, incoming.at(i), at, AccPlain, None))
+
+    val slot = alloca(e, fresh_reg(e), lty(e, t))
+
+    // The sysl type's own size in both directions, which is the only length both shapes are known to
+    // have: a coerced form is never narrower, and where it is wider the surplus is what the
+    // convention leaves unspecified.
+    emit_memcpy(e, slot, from, int(e.layout.size(t)), 1)
+
+    if e.layout.indirect(t) then return ir_arg(LPtr, slot)
+
+    val v = fresh_reg(e)
+
+    emit(e, InLoad(v, lty(e, t), slot, AccPlain, None))
+    ir_arg(lty(e, t), v)
+end thunk_gather
+
+// Storage holding an incoming scalar, for the case where sysl passes that type indirectly and C
+// hands it over in a register -- the two thresholds are different questions and may disagree.
+private thunk_slot(e: *Emit, t: Type, value: Val) -> Val
+    val slot = alloca(e, fresh_reg(e), lty(e, t))
+
+    emit(e, InStore(lty(e, t), value, slot, AccPlain, None))
+    slot
+end thunk_slot
+
+// The call to the definition, and the `ret` that hands its result back the way C reads one.
+private gen_thunk_call(e: *Emit, f: TFunc, symbol: string, passed: Buf[IrArg], sret: Option[Val])
+    // Where **both** sides return through storage the caller supplies, C's is handed straight to
+    // sysl and the value is never a first-class LLVM value at any point -- which is the whole of
+    // what an out-parameter buys, and copying it into a slot of this function's own to copy it back
+    // out would give that up for nothing.
+    var sysl_slot: Option[Val] = None
+
+    if e.layout.indirect(f.ret_ty)
+        sysl_slot = sret match
+            Some(s) -> Some(s)
+            None -> Some(alloca(e, fresh_reg(e), lty(e, f.ret_ty)))
+
+    var args: Buf[IrArg] = buf()
+
+    sysl_slot match
+        Some(s) ->
+            var attrs: Buf[IrAttr] = buf()
+
+            attrs.push(AttrNoAlias)
+
+            val sr = sret_attrs(lty(e, f.ret_ty), int(e.layout.align(f.ret_ty)))
+
+            for i in 0..<sr.len()
+                attrs.push(sr.at(i))
+
+            args.push(IrArg(LPtr, s, attrs))
+        None -> ()
+
+    for i in 0..<passed.len()
+        args.push(passed.at(i))
+
+    val what = sysl_result_form(e, f.ret_ty)
+
+    // A `never` result diverges, so the call does not come back and there is nothing after it. The
+    // `unreachable` is what says so to LLVM, exactly as a foreign call to one does.
+    if f.ret_ty == Never
+        emit(e, form_call(what, None, VGlobal(symbol), args))
+        emit_term(e, InUnreachable)
+        return
+
+    var returned: Option[Val] = None
+
+    if !no_value(f.ret_ty) && sysl_slot.is_none()
+        val v = fresh_reg(e)
+
+        emit(e, form_call(what, Some(v), VGlobal(symbol), args))
+        returned = Some(v)
+    else emit(e, form_call(what, None, VGlobal(symbol), args))
+
+    gen_thunk_return(e, f.ret_ty, returned, sysl_slot, sret)
+end gen_thunk_call
+
+// The `ret`, in the shape the convention says a C caller reads the result out of.
+//
+// A return attribute belongs on the signature rather than on the terminator -- `foreign_signature`
+// has already written it -- so what is named here is the bare type, which is the same rule a sysl
+// definition states.
+private gen_thunk_return(e: *Emit, ret_ty: Type, returned: Option[Val], sysl_slot: Option[Val],
+                         sret: Option[Val])
+    c_result(e.layout, ret_ty, e.target) match
+        CrSret(coerced, align) ->
+            // Where sysl returned into this very slot there is nothing left to do. Otherwise sysl
+            // handed a value back and C wants it in storage, so it is stored where C said.
+            returned match
+                Some(v) -> emit(e, InStore(coerced, v, sret.unwrap(), AccPlain, None))
+                None -> ()
+
+            sysl_slot match
+                Some(s) ->
+                    if !same_slot(sret, s)
+                        emit_memcpy(e, sret.unwrap(), s, int(e.layout.size(ret_ty)), align)
+                None -> ()
+
+            emit_term(e, InRet(None, None))
+
+        CrCoerced(coerced) ->
+            val from = sysl_slot match
+                Some(s) -> s
+                None -> thunk_slot(e, ret_ty, returned.unwrap())
+
+            val slot = alloca(e, fresh_reg(e), coerced)
+            val v = fresh_reg(e)
+
+            emit_memcpy(e, slot, from, int(e.layout.size(ret_ty)), 1)
+            emit(e, InLoad(v, coerced, slot, AccPlain, None))
+            emit_term(e, InRet(Some(coerced), Some(v)))
+
+        CrPlain ->
+            if no_value(ret_ty)
+                emit_term(e, InRet(None, None))
+            else
+                // Sysl may have returned a small aggregate through storage where C reads it from a
+                // register, so the value is loaded back rather than assumed to be in hand.
+                val v = returned match
+                    Some(r) -> r
+                    None ->
+                        val r = fresh_reg(e)
+
+                        emit(e, InLoad(r, lty(e, ret_ty), sysl_slot.unwrap(), AccPlain, None))
+                        r
+
+                emit_term(e, InRet(Some(lty(e, ret_ty)), Some(v)))
+end gen_thunk_return
+
+private same_slot(sret: Option[Val], s: Val) -> bool = sret match
+    Some(v) -> v_render(v) == v_render(s)
+    None -> false
