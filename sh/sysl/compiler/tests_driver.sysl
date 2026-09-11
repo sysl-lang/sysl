@@ -112,9 +112,14 @@ an_empty_directory_is_not_a_program()
     assert(said.message.index_of("holds no sysl source files").is_some(), said.message)
     remove_dir_all(root).unwrap_or(())
 
+// A capability the manifest does not mention is provided, so what a project asks for is unmet only
+// where the same file has taken it away -- which is the rule `unmet_requirement` is held to, tested
+// at its own seam in `tests_manifest.sysl`. What this adds is that the refusal stops the build
+// before a line of source is read.
 @test("what a package cannot be built without stops the build before a line of it is read")
 an_unmet_requirement_stops_a_build()
-    val root = project_of(pair("package.hocon", "requires { os = true }\n"))
+    val root = project_of(pair("package.hocon",
+                               "capabilities { os = false }\nrequires { os = true }\n"))
     val board = target_named("aarch64-freestanding").unwrap()
     val said = compilation_of(root, board).unwrap_err()
 
@@ -133,11 +138,17 @@ a_vendored_dependency_is_read()
     shape.push(("vendor/github.com/e/side/@v1.2.3/package.hocon",
                 "package { name = \"side\", version = \"1.2.3\" }\n"))
     shape.push(("vendor/github.com/e/side/@v1.2.3/side/side.sysl",
-                "module side\n\npub twice(n: int) -> int = n * 2\n"))
+                "module side\n\ntwice(n: int) -> int = n * 2\n"))
     shape.push(("main.sysl", "import side.twice\n\nmain()\n    print(twice(2))\n"))
 
     val root = project_of(shape)
-    val built = compilation_of(root, host_target()).unwrap()
+
+    val built = compilation_of(root, host_target()) match
+        Err(refusal) ->
+            assert(false, refusal.message)
+            return
+        Ok(got) -> got
+
     var found = false
 
     for i in 0..<built.units.len()
