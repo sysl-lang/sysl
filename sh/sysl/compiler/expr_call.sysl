@@ -941,6 +941,13 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
 
     if bound.is_none() then return bad_expr(span)
 
+    // An `extern` is declared in the output only if something reaches it, which is what keeps an
+    // unused one -- the library's `exit`, in a program that never panics -- out of the module.
+    //
+    // **Recorded before the arguments are analyzed**, which is what puts `take` in front of `give`
+    // in `take(give())`: this order is the order the `declare` lines come out in.
+    if cx.an.tables.externs.has(key) then cx.an.uses_extern(key)
+
     val slots = bound.unwrap()
     var ts: Buf[TExpr] = buf()
 
@@ -1086,6 +1093,10 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
         return cx.err(span, s"function '$written' takes ${quantity(d.params.len(), "argument")}, " +
                       s"but ${quantity(args.len(), "argument")} " +
                       s"${if args.len() == 1 then "was" else "were"} given")
+
+    // **Recorded before the arguments are analyzed**, which is what puts `take` in front of `give`
+    // in `take(give())`: this order is the order the `declare` lines come out in.
+    cx.an.uses_extern(key)
 
     for i in 0..<args.len()
         if i < d.params.len() then

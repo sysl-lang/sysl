@@ -1,0 +1,202 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int}
+
+// **The type attributes of a simple enum** -- `Pos`, `Val`, `Succ`, `Pred`, `Image` and `Value`, with
+// the `Range` the analyzer folds away before anything here sees it.
+//
+// They are one family and they lower one way: the variant list is known and small, so every
+// attribute is a **chain over it** rather than arithmetic. That is not a shortcut, it is forced -- a
+// simple enum's discriminants need not be contiguous and need not start at zero, so a tag is not its
+// own position and neither can be computed from the other. What can be done instead is to compare
+// against each tag in turn, which is a fold over at most as many entries as the author wrote.
+//
+// Four of them can be asked of a value that has no answer -- the successor of the last variant, the
+// name of no variant -- and those trap, exactly as a checked integer conversion does.
+
+gen_enum_attr(e: *Emit, kind: string, en: Type, arg: TExpr) -> Val
+    val d = enum_decl(en)
+
+    if d.is_none() then return gap_at(e, "an enum attribute of something that is not an enum")
+
+    val vs = d.unwrap().variants
+    val last = vs.len() - 1
+    val uw = lty(e, d.unwrap().underlying)
+    val v = gen_expr(e, arg)
+
+    kind match
+        "Pos" -> chain_tested(e, l_i32(), positions(vs), uw, v, tags(vs))
+        "Val" -> gen_attr_val(e, vs, uw, v)
+        "Succ" -> gen_attr_step(e, d.unwrap(), uw, v, 1)
+        "Pred" -> gen_attr_step(e, d.unwrap(), uw, v, -1)
+        "Image" -> gen_attr_image(e, vs, uw, v)
+        "Value" -> gen_attr_value(e, vs, uw, v)
+        other -> gap_at(e, s"the enum attribute '$other'")
+end gen_enum_attr
+
+// A `select` chain over the variant list, folded from the last entry back: entry `i`'s test selects
+// entry `i`'s result, and the last entry is the default reached when nothing earlier matched --
+// which for a valid operand means it *is* the last.
+//
+// **The register the `select` takes is allocated before the comparison feeding it**, and the
+// comparison is emitted first: a step is one whole unit of the fold, so the test is made where it is
+// used rather than all of them up front.
+private chain_tested(e: *Emit, width: LType, values: Buf[Val], cmp_ty: LType, v: Val,
+                     keys: Buf[Val]) -> Val
+    val last = values.len() - 1
+
+    var acc = values.at(last)
+    var k = last
+
+    while k > 0
+        k -= 1
+
+        val r = fresh_reg(e)
+        val hit = fresh_reg(e)
+
+        emit(e, InIntCmp(hit, IEq, cmp_ty, v, keys.at(k)))
+        emit(e, InSelect(r, hit, width, values.at(k), acc, LInt(1)))
+
+        acc = r
+
+    acc
+end chain_tested
+
+// The same fold where every test has already been made, which is what a chain over string
+// comparisons has: they were all needed before the trap that guards them.
+private attr_chain(e: *Emit, width: LType, values: Buf[Val], picks: Buf[Val]) -> Val
+    val last = values.len() - 1
+
+    var acc = values.at(last)
+    var k = last
+
+    while k > 0
+        k -= 1
+
+        val r = fresh_reg(e)
+
+        emit(e, InSelect(r, picks.at(k), width, values.at(k), acc, LInt(1)))
+
+        acc = r
+
+    acc
+end attr_chain
+
+private positions(vs: Buf[EnumVariant]) -> Buf[Val]
+    var out: Buf[Val] = buf()
+
+    for i in 0..<vs.len()
+        out.push(VInt(from_int(long(i))))
+
+    out
+end positions
+
+private tags(vs: Buf[EnumVariant]) -> Buf[Val]
+    var out: Buf[Val] = buf()
+
+    for i in 0..<vs.len()
+        out.push(VInt(from_int(long(vs.at(i).tag))))
+
+    out
+end tags
+
+// A position back to a value: the position is checked to name a variant, and the chain then reads
+// the tag off the entry it names.
+private gen_attr_val(e: *Emit, vs: Buf[EnumVariant], uw: LType, v: Val) -> Val
+    val ge_lo = compare_value(e, ">=", int_type(), v, VInt(from_int(0)))
+    val lt_hi = compare_value(e, "<", int_type(), v, VInt(from_int(long(vs.len()))))
+    val ok = fresh_reg(e)
+
+    emit(e, InBin(ok, OpAnd, LInt(1), ge_lo, lt_hi))
+    trap_unless(e, ok, "val")
+    chain_tested(e, uw, tags(vs), l_i32(), v, positions(vs))
+end gen_attr_val
+
+// The neighbouring value. Mapping each entry to the one `by` along from it: the entry at the end the
+// step runs off is the default the trap above keeps it from reaching.
+private gen_attr_step(e: *Emit, d: &EnumType, uw: LType, v: Val, by: int) -> Val
+    val vs = d.variants
+    val last = vs.len() - 1
+    val edge = if by > 0 then vs.at(last) else vs.at(0)
+
+    trap_unless(e, compare_value(e, "!=", d.underlying, v, VInt(from_int(long(edge.tag)))),
+                if by > 0 then "succ" else "pred")
+
+    var acc: Val = VInt(from_int(long(edge.tag)))
+
+    // Folded from the entry beside the edge back towards it, which is what leaves the edge as the
+    // default and every other entry as a `select` in front of it.
+    if by > 0
+        var k = last
+
+        while k > 0
+            k -= 1
+
+            val r = fresh_reg(e)
+            val hit = fresh_reg(e)
+
+            emit(e, InIntCmp(hit, IEq, uw, v, VInt(from_int(long(vs.at(k).tag)))))
+            emit(e, InSelect(r, hit, uw, VInt(from_int(long(vs.at(k + 1).tag))), acc, LInt(1)))
+
+            acc = r
+    else
+        for k in 1..<vs.len()
+            val r = fresh_reg(e)
+            val hit = fresh_reg(e)
+
+            emit(e, InIntCmp(hit, IEq, uw, v, VInt(from_int(long(vs.at(k).tag)))))
+            emit(e, InSelect(r, hit, uw, VInt(from_int(long(vs.at(k - 1).tag))), acc, LInt(1)))
+
+            acc = r
+
+    acc
+end gen_attr_step
+
+// A value to its name. The result is a string aggregate, so it is chosen through memory rather than
+// a `select`: each variant's block stores its name, and the default lands on the last.
+private gen_attr_image(e: *Emit, vs: Buf[EnumVariant], uw: LType, v: Val) -> Val
+    val slot = alloca(e, fresh_reg(e), lty(e, Str))
+    val end_l = fresh_label(e, "image.end")
+
+    var case_ls: Buf[string] = buf()
+
+    for i in 0..<vs.len()
+        case_ls.push(fresh_label(e, "image.case"))
+
+    var cases: Buf[(BigInt, string)] = buf()
+
+    for i in 0..<vs.len() - 1
+        cases.push((from_int(long(vs.at(i).tag)), case_ls.at(i)))
+
+    emit_term(e, InSwitch(uw, v, case_ls.at(vs.len() - 1), cases))
+
+    for i in 0..<vs.len()
+        emit_label(e, case_ls.at(i))
+        emit(e, InStore(lty(e, Str), string_const(e, vs.at(i).name), slot, AccPlain, None))
+        emit_term(e, InBr(end_l))
+
+    emit_label(e, end_l)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, Str), slot, AccPlain, None))
+    r
+end gen_attr_image
+
+// A name back to a value. Each variant contributes one string comparison; the value is the tag of
+// the one that matched, and no match at all traps.
+private gen_attr_value(e: *Emit, vs: Buf[EnumVariant], uw: LType, v: Val) -> Val
+    var eqs: Buf[Val] = buf()
+
+    for i in 0..<vs.len()
+        eqs.push(compare_value(e, "==", Str, v, string_value(e, vs.at(i).name)))
+
+    var any = eqs.at(0)
+
+    for i in 1..<eqs.len()
+        any = or_i1(e, any, eqs.at(i))
+
+    trap_unless(e, any, "value")
+    attr_chain(e, uw, tags(vs), eqs)
+end gen_attr_value

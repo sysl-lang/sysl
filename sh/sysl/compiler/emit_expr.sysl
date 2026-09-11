@@ -89,6 +89,19 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
 
     TAddrOf(place, _) -> address(e, place)
 
+    // `o::Id` -- the first word of the table the object points at. The table is a constant global, so
+    // this is a load from read-only storage and nothing else.
+    TTypeId(receiver, _) ->
+        val obj = gen_expr(e, receiver)
+        val table = fresh_reg(e)
+
+        emit(e, InExtract(table, l_fat(), obj, index_list(0)))
+
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, word_lty(e), table, AccPlain, None))
+        r
+
     // `&value` -- the storage a computed value has no address for. The slot is an ordinary alloca,
     // so it belongs to the **frame** rather than to the block that wrote it, and the count it takes
     // is the one a `var`'s slot takes: registered with the scope being emitted, released where that
@@ -147,6 +160,8 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         gen_for(e, name, var_ty, lo, hi, inclusive, body, else_block, ty)
     TCFor(init, cond, step, body, else_block, ty) ->
         gen_cfor(e, init, cond, step, body, else_block, ty)
+    TForEach(name, elem_ty, seq, body, else_block, ty) ->
+        gen_for_each(e, name, elem_ty, seq, body, else_block, ty)
     TDoWhile(body, cond, else_block, ty) -> gen_do_while(e, body, cond, else_block, ty)
 
     TConstrainedCheck(value, target) ->
@@ -163,10 +178,10 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TBox(value, ref_ty) -> gen_box(e, value, ref_ty)
 
     // An array literal is an `insertvalue` chain over the zero, which is what makes a literal of
-    // constants fold to one in the object file. A large one is built in storage instead, which
-    // nothing here writes yet.
+    // constants fold to one in the object file. A large one is built in storage instead and read
+    // back, since an aggregate that crosses by address has no business being a register at all.
     TArrayLit(elems, array_ty) ->
-        if e.layout.indirect(array_ty) then return gap_at(e, "a large array literal")
+        if e.layout.indirect(array_ty) then return through_slot(e, x)
 
         // **Every element is produced before any of them is laid in.** The two phases are what the
         // register numbering says: an element that emits anything of its own would otherwise have
@@ -248,6 +263,10 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
 
     TErase(operand, vtable, _) -> gen_erase(e, operand, vtable)
     TVCall(receiver, slot, args, ty, _) -> gen_vcall(e, receiver, slot, args, ty)
+
+    TDowngrade(value, weak_ty) -> gen_downgrade(e, value, weak_ty)
+    TUpgrade(value, opt_ty, some, none) -> gen_upgrade(e, value, opt_ty, some, none)
+    TEnumAttr(kind, en, arg, _) -> gen_enum_attr(e, kind, en, arg)
 
     TEnumNew(enum_ty, variant, args) -> gen_enum_new(e, enum_ty, variant, args)
     TEnumFromInt(value, en) -> gen_expr(e, value)
@@ -890,7 +909,7 @@ end gen_struct_new
 //
 // The jump is a `br` and the block ends there, which is all any caller needs to know: this returns
 // no register because there is no value.
-private gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
+gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
     var staged: Buf[Option[Val]] = buf()
 
     for i in 0..<e.tail_params.len()
@@ -955,9 +974,16 @@ arg_value(e: *Emit, a: TExpr, out: *Buf[IrArg])
 end arg_value
 
 // Emits a call from sysl to sysl and hands back the register holding its result.
-gen_sysl_call(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type) -> Val
+gen_sysl_call(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type) -> Val =
+    gen_sysl_call_into(e, callee, arg_vals, ty, None)
+
+// The same, where the caller has storage a **large** result is to land in -- its own, named in front
+// of every argument, so the value is never an LLVM value at either end. A caller with nowhere to put
+// one makes a slot here and reads the value back out of it, which is correct and is exactly the
+// shape `gen_into` exists to save the callers that *do* have somewhere.
+gen_sysl_call_into(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type, dest: Option[Val]) -> Val
     if e.layout.indirect(ty)
-        val slot = alloca(e, fresh_reg(e), lty(e, ty))
+        val slot = if dest.is_some() then dest.unwrap() else alloca(e, fresh_reg(e), lty(e, ty))
 
         var all: Buf[IrArg] = buf()
 
@@ -967,6 +993,8 @@ gen_sysl_call(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type) -> Val
             all.push(arg_vals.at(i))
 
         emit(e, InCall(None, LVoid, callee, all, no_ir_attrs(), None, no_fast_math(), false))
+
+        if dest.is_some() then return VNothing
 
         val r = fresh_reg(e)
 
@@ -985,7 +1013,7 @@ gen_sysl_call(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type) -> Val
     emit(e, InCall(Some(r), lty(e, ty), callee, arg_vals, c_extension(ty, e.target), None,
                    no_fast_math(), false))
     own_temp(e, r, ty)
-end gen_sysl_call
+end gen_sysl_call_into
 
 no_fast_math() -> Buf[FastMath]
     var out: Buf[FastMath] = buf()
@@ -1186,7 +1214,12 @@ private gen_conversion(e: *Emit, fn: string, arg: Val, from: Type, to: Type) -> 
 end gen_conversion
 
 // Runs the store once per element of an array laid down at `base`, with the element's address.
-private fill_array(e: *Emit, base: Val, array_ty: Type, v: Val)
+// The same, for storage a value is being written into rather than a slot made for it. An array of no
+// elements has nothing to walk, and the one evaluation the form promises has already happened.
+fill_at(e: *Emit, base: Val, array_ty: Type, v: Val)
+    if array_len_of(array_ty) > 0 then fill_array(e, base, array_ty, v)
+
+fill_array(e: *Emit, base: Val, array_ty: Type, v: Val)
     val elem = element(array_ty).unwrap_or(int_type())
     val i = alloca(e, fresh_reg(e), word_lty(e))
     val cond_l = fresh_label(e, "fill.test")

@@ -127,11 +127,10 @@ end extra_flags_reach_the_link_line
 // -- the whole road ------------------------------------------------------------------------------
 
 // **A program built and run, which is the one claim nothing short of running can make.** It writes
-// an integer through C's own `printf` rather than through `print`: rendering a value is the string
-// runtime, which this compiler does not lower yet, so a program that used it would be gapped and
-// there would be nothing to link. What is exercised instead is every other part of the road -- a
-// variadic foreign call, an array in a frame, the address of one of its elements, the entry point,
-// the standard module's C compiled beside the program, and the link itself.
+// an integer through C's own `printf`, which exercises a variadic foreign call, an array in a frame,
+// the address of one of its elements, the entry point, the standard module's C compiled beside the
+// program, and the link itself. The test after it takes the same road through `print`, which is the
+// language's own runtime rather than C's.
 @test("a program is compiled, linked and run, and says what it computed")
 a_program_is_built_and_run()
     if !library_present() || !toolchain_present() then return
@@ -160,23 +159,26 @@ a_program_is_built_and_run()
                     assert_eq(out.text, "42\n")
 end a_program_is_built_and_run
 
-// **And one that prints, which is the standard module's own runtime reached through the artifact.**
-// `print` is `sysl$prints` and `sysl$printi` and the rendering behind them; none of it is emitted
-// into this program, and all of it resolves at the link out of the `.syslib` this build compiled the
-// library into. It is the whole of `precompiled` seen from the end that matters: a program that says
-// something.
-@test("and one that prints says what the library rendered for it")
-a_program_that_prints_is_built_and_run()
+// **The same road through `print`, which is the language's own runtime and not C's.** Every symbol a
+// rendering reaches -- `sysl$prints`, `sysl$printi`, `sysl$printc` and the writer behind them -- is
+// *declared* in the module being linked and defined in the library's artifact, so this is the whole
+// of `precompiled` seen from the end that matters: a declaration nothing supplies would build, emit
+// and then fail at the link, which is exactly what this catches and what nothing short of linking
+// can.
+@test("a program that prints is compiled, linked and run, and says what it printed")
+a_printing_program_is_built_and_run()
     if !library_present() || !toolchain_present() then return
 
-    val root = project_with("main.sysl", "print(\"one\")\nprint(6 * 7)\n")
+    val root = project_with("main.sysl", "print(\"hello\")\nprint(6 * 7)\n")
     val exe = s"$root/printed"
 
     build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
         Err(refusal) ->
             remove_dir_all(root).unwrap_or(())
             assert(false, refusal.message)
-        Ok(_) ->
+        Ok(made) ->
+            assert_eq(made, exe)
+
             val said = capture(exe, [], "", [], true)
 
             remove_dir_all(root).unwrap_or(())
@@ -185,8 +187,8 @@ a_program_that_prints_is_built_and_run()
                 Err(_) -> assert(false, "the program that was built could not be run")
                 Ok(out) ->
                     assert(out.status.ok(), "the program did not exit cleanly")
-                    assert_eq(out.text, "one\n42\n")
-end a_program_that_prints_is_built_and_run
+                    assert_eq(out.text, "hello\n42\n")
+end a_printing_program_is_built_and_run
 
 private joined_with(xs: Buf[string], sep: string) -> string
     var out = ""

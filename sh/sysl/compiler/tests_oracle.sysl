@@ -893,10 +893,6 @@ struct TypeAgreement
     whole_other: usize
     first_bad_whole: string
 
-    // How many function bodies agree **without** the interned-string identifiers being normalised,
-    // which is what says whether that normalisation is still earning its place.
-    fn_exact: usize
-
     // Why the bodies that are absent are absent, most often first. It is the census a next stage
     // works down, and it is read out of the lowering itself rather than guessed at from the symbol.
     reasons: Buf[(string, usize)]
@@ -960,19 +956,25 @@ private compare_types(binary: string, path: string, label: string, found: *TypeA
 
             compare_boxes(theirs.text, mine.text, label, found)
             compare_funcs(theirs.text, mine.text, mine.gaps, label, found)
-            compare_whole(theirs.text, mine.text, label, found)
+            compare_whole_text(theirs.text, mine.text, label, found)
 end compare_types
 
-// The ownership runtime's own type definitions, matched by name. A box this compilation never built
-// is absent rather than wrong, exactly as an unlowered body is, so what is compared is the names
-// both texts define.
+// The ownership runtime's own type definitions, matched by name -- and **every** name the reference
+// defines, since the two modules now box the same set of payloads. It was the names both texts
+// defined while the reference declared the library's functions and this compiler defined them: the
+// two needed boxes for different payloads then, and `precompiled` is what closed it.
 private compare_boxes(theirs: string, mine: string, label: string, found: *TypeAgreement)
     val ours = box_lines(mine)
     val wanted = box_lines(theirs)
 
     for i in 0..<wanted.len()
         text_for(ours, wanted.at(i).0) match
-            None -> ()
+            None ->
+                found.box_mismatched += 1
+
+                if found.box_mismatched <= 4
+                    found.first_bad = s"${found.first_bad}\n$label: '${wanted.at(i).0}' is " +
+                        s"'${wanted.at(i).1}' theirs and is not defined here"
             Some(body) ->
                 if body == wanted.at(i).1 then found.box_matched += 1
                 else
@@ -1021,10 +1023,8 @@ private compare_funcs(theirs: string, mine: string, gaps: Buf[(string, string)],
                 found.fn_absent += 1
                 tally(&found.reasons, reason_for(gaps, name))
             Some(body) ->
-                if without_string_ids(body) == without_string_ids(wanted.at(i).1)
+                if body == wanted.at(i).1
                     found.fn_matched += 1
-
-                    if body == wanted.at(i).1 then found.fn_exact += 1
                 else
                     found.fn_mismatched += 1
 
@@ -1041,7 +1041,12 @@ end compare_funcs
 // programs differ for the reason the census already names -- a library body nothing here can lower
 // is a body the artifact cannot advertise -- and where it does not, the difference is a defect and
 // the first differing line is quoted.
-private compare_whole(theirs: string, ours: string, label: string, found: *TypeAgreement)
+private compare_whole_text(theirs: string, raw: string, label: string, found: *TypeAgreement)
+    // **Both sides are read to the same end**, which is the one thing about the two texts that is
+    // not the compilers' doing: the reference's arrives through a captured process and this one's as
+    // a string, so what a shell would have shown as the last line differs in whether it is there.
+    val ours = without_trailing_newlines(raw)
+
     if theirs == ours
         found.whole_matched += 1
         return
@@ -1069,7 +1074,7 @@ private compare_whole(theirs: string, ours: string, label: string, found: *TypeA
 
         found.first_bad_whole = s"${found.first_bad_whole}\n$label: " +
             s"${where.unwrap_or("the texts differ in length alone")}"
-end compare_whole
+end compare_whole_text
 
 // The symbols a text **declares**, which is every `declare` line it carries.
 private declared_symbols(text: string) -> Buf[string]
@@ -1138,47 +1143,6 @@ private holds_name(names: Buf[string], name: string) -> bool
 
     false
 end holds_name
-
-// A body with the **number** off each interned string it names, and everything else left alone.
-//
-// **The two compilations do not lay down the same set of constants**, and that is the precompiled
-// divergence rather than anything about a body: the reference declares the library's functions and
-// this compiler defines them, so every string a library body interns is in this module's numbering
-// and in none of the reference's. `print(true)` alone puts `"true"` and `"false"` in front of the
-// program's own literals and shifts every later id by two.
-//
-// It is the same reason the boxes are compared by name: what differs is which bodies each side
-// emitted, which is recorded and is the next stage's to close. Everything else about the text is
-// still compared exactly, so a body that names a *different* literal still differs.
-private without_string_ids(text: string) -> string
-    var out: Buf[u8] = buf()
-    val bytes = text.bytes
-    var i: usize = 0
-
-    while i < bytes.len
-        if starts_at(bytes, i, "@.str")
-            out.extend("@.str".bytes)
-
-            i += 5
-
-            while i < bytes.len && bytes[i] >= u8('0') && bytes[i] <= u8('9')
-                i += 1
-        else
-            out.push(bytes[i])
-
-            i += 1
-
-    from_utf8_unchecked(out.view())
-end without_string_ids
-
-private starts_at(bytes: []const u8, at: usize, what: string) -> bool
-    if at + what.bytes.len > bytes.len then return false
-
-    for k in 0..<what.bytes.len
-        if bytes[at + k] != what.bytes[k] then return false
-
-    true
-end starts_at
 
 // Why one symbol is absent, as the lowering recorded it. A symbol nothing recorded a gap for is one
 // the reference's own text has and this compilation never had a declaration of -- a runtime helper,
@@ -1286,7 +1250,7 @@ the_emitted_types_agree()
             val scratch = dir + "/block.sysl"
 
             var reasons: Buf[(string, usize)] = buf()
-            var found = TypeAgreement(0, 0, 0, 0, 0, "", 0, 0, 0, "", 0, 0, 0, 0, 0, 0, "", 0,
+            var found = TypeAgreement(0, 0, 0, 0, 0, "", 0, 0, 0, "", 0, 0, 0, 0, 0, 0, "",
                                       reasons)
 
             for item in walk(root)
@@ -1319,8 +1283,7 @@ the_emitted_types_agree()
             val whole_summary = s"whole files: ${found.whole_matched} identical, " +
                 s"${found.whole_absent} short a body this compiler has not built, " +
                 s"${found.whole_precompiled} differing only in what is declared rather than " +
-                s"defined, ${found.whole_other} otherwise; ${found.fn_exact} of the " +
-                s"${found.fn_matched} bodies agree with the interned string identifiers left alone"
+                s"defined, ${found.whole_other} otherwise"
 
             // **The census is taken ONCE.** Reading it consumes the counts -- each entry it names
             // is zeroed so the next-largest can be found -- so asking twice answers with the top of

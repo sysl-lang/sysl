@@ -144,7 +144,7 @@ private one_write(cx: &Analyzer, op: string, target: Expr, place: TExpr, part: O
             cx.fault(written.span, s"cannot assign ${type_show(texpr_type(tv))} to " +
                      s"${describe_target(target)} of type ${type_show(texpr_type(place))}")
 
-        return TWrite(place, op, tv, None, buf(), None)
+        return TWrite(place, op, tv, None, arm_checks(cx, place), None)
     end if
 
     val bin = op[0..<op.bytes.len - 1]
@@ -157,8 +157,23 @@ private one_write(cx: &Analyzer, op: string, target: Expr, place: TExpr, part: O
             cx.fault(written.span, s"'$op' would change the type of ${describe_target(target)}")
     end if
 
-    TWrite(place, op, tv, None, buf(), constraint_of(texpr_type(place)))
+    TWrite(place, op, tv, dispatch, arm_checks(cx, place),
+           constraint_of(texpr_type(place)))
 end one_write
+
+// The invariants this arm's place obliges a re-check of. A single assignment wraps its write in a
+// `TRecheck` for each of them; this form has no expression to wrap, so it carries them instead and
+// runs them all once every arm has landed.
+private arm_checks(cx: &Analyzer, place: TExpr) -> Buf[TInvCheck]
+    var out: Buf[TInvCheck] = buf()
+
+    val owed = inv_checks_for(cx, place)
+
+    for i in 0..<owed.len()
+        out.push(TInvCheck(owed.at(i).0, owed.at(i).1, inv_key(owed.at(i).1.base)))
+
+    out
+end arm_checks
 
 // The value one arm of a comma form is given: the part read out of the carrier, or the expression
 // written beside it.
