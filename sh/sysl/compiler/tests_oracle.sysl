@@ -4,7 +4,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.env.{get as env_var}
-import sysl.fs.{make_temp_dir, metadata, read_text, remove_file, walk, write_text}
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, walk, write_text}
 import sysl.process.capture
 import sysl.text.{from_utf8_unchecked, split, str_builder, Search}
 
@@ -659,7 +659,7 @@ end the_declaration_tables_agree
 private var library_cache: Buf[Program] = buf()
 private var library_read: bool = false
 
-private library_units() -> Buf[Program]
+library_units() -> Buf[Program]
     if library_read then return library_cache
 
     library_read = true
@@ -1185,7 +1185,7 @@ private census(counts: Buf[(string, usize)]) -> string
     out.finish()
 end census
 
-private text_for(items: Buf[(string, string)], name: string) -> Option[string]
+text_for(items: Buf[(string, string)], name: string) -> Option[string]
     for i in 0..<items.len()
         if items.at(i).0 == name then return Some(items.at(i).1)
 
@@ -1193,7 +1193,7 @@ private text_for(items: Buf[(string, string)], name: string) -> Option[string]
 end text_for
 
 // The first line of two bodies that disagrees, which is what a report of a mismatch is worth.
-private first_body_difference(theirs: string, ours: string) -> string
+first_body_difference(theirs: string, ours: string) -> string
     val a = lines_of(theirs)
     val b = lines_of(ours)
     val n = if a.len() < b.len() then a.len() else b.len()
@@ -1305,3 +1305,197 @@ the_emitted_types_agree()
             assert(found.whole_matched > 0, "the sweep found a program the two agree on whole")
             assert(found.whole_other == 0, s"$whole_summary${found.first_bad_whole}")
 end the_emitted_types_agree
+
+// -- this compiler's own tree, lowered by both ------------------------------------------------------
+
+// **The self-build's own differential proof.** Every sweep above compares the two compilers on a
+// corpus of small programs; this one compares them on the largest sysl program there is, which is
+// the one that has to be right before a stage-2 binary means anything.
+//
+// It runs on a **copy** of the tree with the manifest's `sysl` floor relaxed. The floor names the
+// oldest bootstrap that may build these sources and this compiler's own version is below it -- a
+// fact about who may build the tree rather than about what the text should say -- so a copy is the
+// honest way past it. `scripts/own_tree_census.sh` makes the same copy by hand and leaves the two
+// texts on disk, which is what a divergence is actually read out of.
+
+// Where the census copies the tree to, with the floor relaxed and everything else as written.
+tree_copy(root: string) -> Option[string]
+    val dir = make_temp_dir("sysl-own-tree") match
+        Err(_) -> return None
+        Ok(made) -> made
+
+    for item in walk(root)
+        item match
+            Err(_) -> ()
+            Ok(entry) ->
+                if is_sysl_source(entry.path)
+                    val to = dir + "/" + entry.path
+
+                    make_dir_all(parent_of(to).unwrap_or(dir)).unwrap_or(())
+
+                    read_text(entry.path) match
+                        Err(_) -> ()
+                        Ok(text) -> write_text(to, text).unwrap_or(())
+
+    val manifest = read_text(root + "/package.hocon") match
+        Err(_) -> return None
+        Ok(text) -> text
+
+    write_text(dir + "/package.hocon", with_the_floor_relaxed(manifest)).unwrap_or(())
+    Some(dir)
+end tree_copy
+
+// The manifest with the one line a copy cannot keep rewritten, and every other line as written.
+private with_the_floor_relaxed(manifest: string) -> string
+    var out = str_builder()
+
+    for line in split(manifest, "\n")
+        if line.starts_with("  sysl = ") then out.push("  sysl = \"0.0.1\"")
+        else out.push(line)
+
+        out.push_char('\n')
+
+    out.finish()
+end with_the_floor_relaxed
+
+// What the census found: how many definitions each text carries, and the bodies both carry that
+// disagree.
+struct OwnTree
+    theirs: usize
+    ours: usize
+    shared: usize
+    differing: usize
+    only_theirs: usize
+    only_ours: usize
+    first_bad: string
+
+    // Why the bodies only the reference emits are absent, most often first. It is the census a next
+    // stage works down, read out of the lowering rather than guessed at from the symbol.
+    reasons: Buf[(string, usize)]
+end OwnTree
+
+@test("the two compilers emit the same LLVM text for every body of this compiler's own tree")
+the_two_agree_on_this_compilers_own_tree()
+    oracle() match
+        None ->
+            print("skipped: SYSL_ORACLE names no reference compiler on this machine")
+            return
+        Some(binary) ->
+            if library_units().is_empty()
+                print("skipped: the standard module's source is not on this machine")
+                return
+            end if
+
+            val copy = tree_copy(".") match
+                None ->
+                    print("skipped: this compiler's own tree could not be copied")
+                    return
+                Some(dir) -> dir
+
+            val theirs = ask_oracle_llvm(binary, copy)
+
+            if !theirs.ok
+                remove_dir_all(copy).unwrap_or(())
+                print(s"skipped: the reference would not lower this tree: ${theirs.message}")
+                return
+            end if
+
+            val mine = emit_llvm_text(copy, None) match
+                Err(refusal) ->
+                    remove_dir_all(copy).unwrap_or(())
+                    assert(false, s"this compiler refused its own tree: ${refusal.message}")
+                    return
+                Ok(emitted) -> emitted
+
+            remove_dir_all(copy).unwrap_or(())
+            assert(mine.report.is_empty(),
+                   s"this compiler reported on its own tree: ${analysis_report(mine.report)}")
+
+            var reasons: Buf[(string, usize)] = buf()
+            var found = OwnTree(0, 0, 0, 0, 0, 0, "", reasons)
+
+            census_over(theirs.text, without_trailing_newlines(mine.text), mine.gaps, &found)
+
+            val summary = s"own tree: ${found.theirs} definitions theirs, ${found.ours} ours, " +
+                s"${found.shared} shared of which ${found.differing} differ, " +
+                s"${found.only_theirs} theirs alone, ${found.only_ours} ours alone"
+
+            val by_reason = census(found.reasons)
+
+            print(summary)
+            print(by_reason)
+            record_summary(s"$summary${found.first_bad}$by_reason")
+            assert(found.shared > 0, "the census compared something")
+            assert(found.differing == 0, s"$summary${found.first_bad}")
+end the_two_agree_on_this_compilers_own_tree
+
+// The two texts, matched by symbol: what each defines alone, and what both define and disagree on.
+//
+// **The interned strings are compared with their ids normalised, and that is the one thing this
+// census leaves out.** A body this compiler has not built interns nothing, so every constant below
+// it in the reference's numbering is one number further along -- a difference whose cause is the
+// absence already counted beside it, and not a defect in any body it renumbers. The whole-file sweep
+// above is what compares them exactly, and it does so on programs with no absences left.
+private census_over(theirs: string, ours: string, gaps: Buf[(string, string)], found: *OwnTree)
+    val wanted = func_texts(theirs)
+    val mine = func_texts(ours)
+
+    found.theirs = wanted.len()
+    found.ours = mine.len()
+
+    for i in 0..<wanted.len()
+        val name = wanted.at(i).0
+
+        text_for(mine, name) match
+            None ->
+                found.only_theirs += 1
+                tally(&found.reasons, reason_for(gaps, name))
+            Some(body) ->
+                found.shared += 1
+
+                val want = without_own_str_ids(wanted.at(i).1)
+                val got = without_own_str_ids(body)
+
+                if want != got
+                    found.differing += 1
+
+                    if found.differing <= 4
+                        found.first_bad = s"${found.first_bad}\n'@$name' differs" +
+                            s"${first_body_difference(want, got)}"
+
+    val theirs_names = defined_symbols(theirs)
+
+    for i in 0..<mine.len()
+        if !holds_name(theirs_names, mine.at(i).0) then found.only_ours += 1
+end census_over
+
+// A body with the number off each interned string it names, and everything else left alone.
+private without_own_str_ids(text: string) -> string
+    var out: Buf[u8] = buf()
+    val bytes = text.bytes
+    var i: usize = 0
+
+    while i < bytes.len
+        if own_starts_at(bytes, i, "@.str")
+            out.extend("@.str".bytes)
+
+            i += 5
+
+            while i < bytes.len && bytes[i] >= u8('0') && bytes[i] <= u8('9')
+                i += 1
+        else
+            out.push(bytes[i])
+
+            i += 1
+
+    from_utf8_unchecked(out.view())
+end without_own_str_ids
+
+private own_starts_at(bytes: []const u8, at: usize, what: string) -> bool
+    if at + what.bytes.len > bytes.len then return false
+
+    for k in 0..<what.bytes.len
+        if bytes[at + k] != what.bytes[k] then return false
+
+    true
+end own_starts_at

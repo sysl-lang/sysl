@@ -1,0 +1,91 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+
+// **The self-build's oracle: stage 1 and stage 2 must emit the same text for the same input.**
+//
+// Stage 1 is this compiler built by the reference; stage 2 is this compiler built by stage 1. They
+// are the same source, so a difference between their answers is not a difference of opinion -- it is
+// stage 1 having miscompiled itself, or something in here that is not deterministic. Either way it
+// is the one thing a self-build has to rule out before stage 3 is worth cutting.
+//
+// **The input is this compiler's own tree**, which is both the largest sysl program there is and the
+// program stage 2 was made out of, so a body that lowers differently is a body stage 3 would inherit
+// the difference through.
+//
+// `SYSL_STAGE2` names the binary; with the variable unset the test returns at once and says so,
+// exactly as `SYSL_ORACLE` makes the differential proof skip on a machine that has no reference.
+// `SYSL_LIB` is needed too, as it is for every whole-program sweep.
+
+// Where the stage-2 binary is, or nothing where this machine has not built one.
+private stage_two() -> Option[string] = env_var("SYSL_STAGE2")
+
+@test("stage 2 emits the text stage 1 does, over the whole of this compiler's own tree")
+stage_one_and_stage_two_emit_the_same_text()
+    stage_two() match
+        None ->
+            print("skipped: SYSL_STAGE2 names no stage-2 binary on this machine")
+            return
+        Some(binary) ->
+            if library_units().is_empty()
+                print("skipped: the standard module's source is not on this machine")
+                return
+            end if
+
+            val copy = tree_copy(".") match
+                None ->
+                    print("skipped: this compiler's own tree could not be copied")
+                    return
+                Some(dir) -> dir
+
+            val theirs = capture(binary, ["emit-llvm", copy], "", [], true) match
+                Err(_) ->
+                    remove_dir_all(copy).unwrap_or(())
+                    assert(false, "the stage-2 binary could not be run")
+                    return
+                Ok(answer) -> answer
+
+            val mine = emit_llvm_text(copy, None) match
+                Err(refusal) ->
+                    remove_dir_all(copy).unwrap_or(())
+                    assert(false, s"stage 1 refused this tree: ${refusal.message}")
+                    return
+                Ok(emitted) -> emitted
+
+            remove_dir_all(copy).unwrap_or(())
+            assert(theirs.status.ok(), s"stage 2 refused this tree: ${theirs.err.unwrap_or("")}")
+
+            val two = func_texts(theirs.text)
+            val one = func_texts(mine.text)
+            var differing: usize = 0
+            var first_bad = ""
+
+            for i in 0..<one.len()
+                val name = one.at(i).0
+
+                text_for(two, name) match
+                    None ->
+                        differing += 1
+
+                        if differing <= 4
+                            first_bad = s"$first_bad\nstage 2 defines no '@$name'"
+                    Some(body) ->
+                        if body != one.at(i).1
+                            differing += 1
+
+                            if differing <= 4
+                                first_bad = s"$first_bad\n'@$name' differs" +
+                                    s"${first_body_difference(one.at(i).1, body)}"
+
+            val summary = s"the two stages: ${one.len()} definitions from stage 1, " +
+                s"${two.len()} from stage 2, $differing differing"
+
+            print(summary)
+            assert(one.len() > 0, "stage 1 lowered something")
+            assert(two.len() == one.len(), s"$summary$first_bad")
+            assert(differing == 0, s"$summary$first_bad")
+end stage_one_and_stage_two_emit_the_same_text
