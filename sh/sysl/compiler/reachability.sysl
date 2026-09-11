@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 
 // **What a program can arrive at**, and the declarations that go when nothing can.
 //
@@ -162,6 +163,115 @@ private take_all(out: &Live, from: &Live, queue: *Buf[string])
     for i in 0..<from.calls.len()
         if add_string(&out.calls, from.calls.at(i)) then queue.push(from.calls.at(i))
 end take_all
+
+// Every function of a compilation that reads module storage, directly or through anything it calls.
+//
+// **It is the whole set at once rather than a question asked once per function**, and that is not a
+// convenience. The question is asked of every function a library declares, and each answer on its
+// own is a walk of the call graph from that function -- taken one at a time, the graph is walked
+// once per node in it. What this costs instead is one summary per body and then a sweep back along
+// the calls until nothing more changes, which is a handful of passes however deep the library is.
+//
+// The storage is what makes the question worth asking: a module-level `val` is filled by the entry
+// point, and a library has none, so a function that reads one cannot be compiled ahead of time and
+// is left to the program that will fill it.
+storage_reaching(p: TProgram) -> Buf[string]
+    var index: Map[string, usize] = map()
+
+    for i in 0..<p.funcs.len()
+        index.put(p.funcs.at(i).name, i)
+
+    var reaches: Buf[bool] = buf()
+    var edges: Buf[(usize, usize)] = buf()
+
+    for i in 0..<p.funcs.len()
+        reaches.push(false)
+
+    for i in 0..<p.funcs.len()
+        val refs = body_refs(p, p.funcs.at(i))
+
+        if !refs.vals.is_empty() then reaches.set(i, true)
+
+        for k in 0..<refs.calls.len()
+            index.get(refs.calls.at(k)) match
+                None -> ()
+                Some(j) -> edges.push((i, j))
+
+    var moved = true
+
+    while moved
+        moved = false
+
+        for e in 0..<edges.len()
+            val edge = edges.at(e)
+
+            if reaches.at(edge.1) && !reaches.at(edge.0)
+                reaches.set(edge.0, true)
+                moved = true
+
+    var out: Buf[string] = buf()
+
+    for i in 0..<p.funcs.len()
+        if reaches.at(i) then out.push(p.funcs.at(i).name)
+
+    out
+end storage_reaching
+
+// Every function a library artifact can neither define nor declare, grown from the ones its
+// lowering could not finish.
+//
+// A gapped body is not emitted, and where its symbol is **`internal`** it cannot be declared either:
+// internal linkage is the promise that no other object defines that name, so there is nothing for a
+// declaration of one to resolve to. Every caller of such a body is therefore uncompilable here as
+// well, and the set has to be closed under that -- a caller that is itself internal carries the
+// same problem to *its* callers, and one that is not is simply declared and left to the program.
+//
+// The calls are summarized once and the closure is a sweep back along them, for the reason
+// `storage_reaching` gives.
+gap_closure(p: TProgram, gapped: Buf[string]) -> Buf[string]
+    var index: Map[string, usize] = map()
+
+    for i in 0..<p.funcs.len()
+        index.put(p.funcs.at(i).name, i)
+
+    var absent: Buf[bool] = buf()
+    var deferred: Buf[bool] = buf()
+    var edges: Buf[(usize, usize)] = buf()
+
+    for i in 0..<p.funcs.len()
+        val gone = holds_string(gapped, p.funcs.at(i).name)
+
+        deferred.push(gone)
+        absent.push(gone && p.funcs.at(i).internal)
+
+        val refs = body_refs(p, p.funcs.at(i))
+
+        for k in 0..<refs.calls.len()
+            index.get(refs.calls.at(k)) match
+                None -> ()
+                Some(j) -> edges.push((i, j))
+
+    var moved = true
+
+    while moved
+        moved = false
+
+        for e in 0..<edges.len()
+            val edge = edges.at(e)
+
+            if absent.at(edge.1) && !deferred.at(edge.0)
+                deferred.set(edge.0, true)
+                moved = true
+
+                if p.funcs.at(edge.0).internal then absent.set(edge.0, true)
+
+    var out: Buf[string] = buf()
+
+    for i in 0..<p.funcs.len()
+        if deferred.at(i) then out.push(p.funcs.at(i).name)
+
+    out
+end gap_closure
 
 // What one body names, without following any of it.
 private body_refs(p: TProgram, f: TFunc) -> &Live

@@ -1,0 +1,204 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sh.sysl.parsing.source_of
+import sysl.text.Search
+
+// A **library** lowered on its own: what it can compile ahead of time, and what it has to leave to
+// whatever program links it.
+//
+// The split needs no analysis of its own, which is the pleasant part. A generic declaration is kept
+// untyped and monomorphized on demand, so analyzing a library alone yields typed functions for
+// exactly the declarations that were already determined -- a generic nothing called is simply not
+// there. Those are what an object file can hold; the generics travel as source and are compiled in
+// whatever program fixes their type arguments.
+//
+// Nothing is pruned. A program is lowered from its entry point outwards because anything it cannot
+// reach is dead, but a library has no entry point and every public declaration is a potential one --
+// so all of them are emitted, and it is the *linker* that discards what a given program never calls.
+
+// What a library compiled on its own came to.
+struct LibraryBuild
+    // The library, ready to be lowered: no entry point, and everything it must not define named in
+    // `precompiled`.
+    program: TProgram
+
+    promotions: Promotions
+
+    // The symbols the object half **defines and advertises**. A program linking the artifact
+    // declares these rather than emitting a second copy of them.
+    determined: Buf[string]
+
+    report: Buf[Placed]
+end LibraryBuild
+
+// A library analyzed, split, and ready to lower.
+//
+// **A library defines its own declarations and nobody else's.** A compilation of one reaches
+// whatever the compiler supplied on its behalf -- a library that prints reaches the printing surface
+// exactly as a program does -- and emitting *those* would put a copy of that surface into every
+// artifact, so two libraries that both print could not be linked into one program. They are declared
+// here and defined in the consuming program, which compiles them anyway and reaches them through the
+// very body that called for them.
+//
+// Which is which is read off the **module**, and that is exact rather than approximate: a library's
+// declarations are keyed under the module its directory names, and everything supplied on its behalf
+// is keyed somewhere else.
+//
+// **A closure this compilation lowered is this compilation's, and the module in its key does not say
+// so.** A closure's name begins with the module separator, so the key reads as the *root* module --
+// which is in nobody's own list, so it would be filed as something another library supplies. The
+// library would then declare it and never emit it, while an instantiation made at that closure,
+// whose key does carry a module, would be emitted *and* advertised: a program linking the artifact
+// would declare the instantiation instead of building one, and the artifact's copy would call back
+// into a closure body the program had defined for a closure of its own.
+library_build(units: Buf[Program], own: Buf[string], t: Target) -> LibraryBuild
+    val done = analyze_produced(units, t, file_names(units))
+    val whole = program_of(done, done.main_module)
+    val promotions = post_analysis_checks(done.an, whole, own)
+    val defers = storage_reaching(whole)
+
+    var determined: Buf[string] = buf()
+    var within: Buf[string] = buf()
+
+    for i in 0..<whole.funcs.len()
+        val f = whole.funcs.at(i)
+
+        if !holds_string(own, module_of(f.name)) && !closure_lowered(f.name)
+            within.push(f.name)
+        else if holds_string(defers, f.name)
+            // **A function that reads a module-level `val` is left out of the precompiled half**,
+            // and this is the honest boundary of what separate compilation reaches: the storage for
+            // a `val` is initialized by the entry point, and a library has none. Such a function is
+            // compiled in the program instead, where the initialization it depends on happens.
+            //
+            // **It has to be left out of what is EMITTED and not only out of what is advertised**,
+            // and getting that wrong is a duplicate definition rather than a missing one: the
+            // program compiles its own copy because nothing advertised it, and a definition here as
+            // well would put both in front of the linker.
+            within.push(f.name)
+        else if !f.internal
+            // **What is advertised is what the linker can reach**, so a file-private declaration is
+            // left out however ordinary it looks here. Its symbol is emitted `internal`, which is a
+            // promise that every caller is in this module -- and a program told the artifact holds
+            // it would declare it, call it, and find nothing at the link. Left out, the program
+            // compiles a copy of its own from the source, which is what it does with a generic.
+            //
+            // An `internal` function is still *emitted*, unlike a deferred one: internal linkage is
+            // what keeps the program's copy and this one from being one symbol, so there is no
+            // collision for them to have.
+            determined.push(f.name)
+
+    val library = whole with { precompiled = within, entry_point = false }
+
+    LibraryBuild(library, promotions, sorted_names(determined), errors_of(done.an.diagnostics()))
+end library_build
+
+// The files this compilation is producing, which is what makes it a build *of* the library rather
+// than a build against it: every body the library declares is typed, not only the ones its own
+// internal calls happen to reach.
+private file_names(units: Buf[Program]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<units.len()
+        out.push(units.at(i).src.name)
+
+    out
+end file_names
+
+// Whether a name is one the **lowering** made up rather than one a reader wrote -- a closure's body
+// or a nested function's. A name like that is a counter in the compilation that lowered it, so two
+// units each lowering a fourth closure produce one name for two different things.
+closure_lowered(name: string) -> bool =
+    name.starts_with(s"${ModuleSep}closure") || name.starts_with(s"${ModuleSep}env")
+
+// The advertised names in a settled order, so that an artifact built twice from one library holds
+// one list rather than whichever order the analysis happened to file them in.
+private sorted_names(names: Buf[string]) -> Buf[string]
+    var out = names
+
+    for i in 1..<out.len()
+        var j = i
+
+        while j > 0 && out.at(j) < out.at(j - 1)
+            val held = out.at(j)
+
+            out.set(j, out.at(j - 1))
+            out.set(j - 1, held)
+            j -= 1
+
+    out
+end sorted_names
+
+// The same library with every body the lowering could not finish taken out of it, and everything
+// that can no longer be compiled here taken out with it.
+//
+// **A body this compiler cannot lower yet is in exactly the position of one that reads module
+// storage**: it cannot be compiled here, so it is left to the program, which compiles the library's
+// source anyway and reaches it through the very body that called for it. What differs is that a
+// deferral has two shapes and only one of them is a declaration. An ordinary symbol is **declared**,
+// and its caller compiled here resolves to the program's definition at the link. An `internal` one
+// cannot be declared at all -- internal linkage is the promise that no other object defines that
+// name -- so it is **dropped**, and every caller of it has to go with it, which `gap_closure` is
+// what works out.
+//
+// It is a **second** lowering rather than a prediction, because which forms a body reaches is what
+// the lowering itself answers and nothing before it knows.
+library_deferring_gaps(p: TProgram, gaps: Buf[(string, string)]) -> TProgram
+    var gapped: Buf[string] = buf()
+
+    for i in 0..<gaps.len()
+        if !holds_string(gapped, gaps.at(i).0) then gapped.push(gaps.at(i).0)
+
+    val grown = gap_closure(p, gapped)
+
+    var kept: Buf[TFunc] = buf()
+    var out = p.precompiled
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if !holds_string(grown, f.name) then kept.push(f)
+        else if f.internal then continue
+        else
+            kept.push(f)
+
+            if !holds_string(out, f.name) then out.push(f.name)
+
+    p with { funcs = kept, precompiled = out }
+end library_deferring_gaps
+
+// The split one source comes to when it is read as a library of its own: what its object half would
+// advertise, in the order a metadata record holds them.
+//
+// It is the seam the split rule is asserted on. The source is read as the module its header names,
+// which is what makes a declaration one of the library's own -- the same question `library_build`
+// asks of a tree of them.
+library_determined_of(text: string) -> Buf[string]
+    val t = host_target()
+    val parsed = parse(source_of("lib.sysl", text), t)
+
+    if !parsed.ok()
+        var said: Buf[string] = buf()
+
+        said.push(parsed.first().message)
+        return said
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    var own: Buf[string] = buf()
+
+    own.push(module_written(parsed.program))
+
+    val built = library_build(units, own, t)
+
+    if !built.report.is_empty()
+        var said: Buf[string] = buf()
+
+        said.push(built.report.at(0).render())
+        return said
+
+    built.determined
+end library_determined_of

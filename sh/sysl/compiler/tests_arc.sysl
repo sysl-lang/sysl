@@ -692,3 +692,37 @@ an_implementation_that_keeps_what_it_borrowed()
               "borrowed for the call — it may be a view of the caller's stack, so copy what this " +
               "needs into storage of its own")
 end an_implementation_that_keeps_what_it_borrowed
+
+// **A term of an `&&` chain is reached only where the chain got that far**, so a count it takes has
+// to be given back before the branch it guards -- a release registered with the enclosing scope is
+// emitted on every path out of it, including the one where the term never ran. LLVM refuses that
+// outright, as a value that does not dominate its use, and the text below is the reference's answer.
+@test("a counted temporary a condition takes is given back at the end of its own term")
+a_condition_term_lets_go_before_it_branches()
+    assert_eq(lowered_arc("make(n: int) -> &int = n\n\n" +
+                          "ok(n: int) -> bool = n > 0\n\n" +
+                          "check(n: int) -> bool\n" +
+                          "    if ok(n) && *make(n) > 0 then return true\n\n" +
+                          "    false\n" +
+                          "end check\n", "check"),
+              "define zeroext i1 @check(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = call zeroext i1 @ok(i32 %t1)\n" +
+              "  br i1 %t2, label %cond.and4, label %if.end3\n" +
+              "cond.and4:\n" +
+              "  %t3 = load i32, ptr %n.addr\n" +
+              "  %t4 = call ptr @make(i32 %t3)\n" +
+              "  %t5 = getelementptr %arc.int, ptr %t4, i32 0, i32 3\n" +
+              "  %t6 = load i32, ptr %t5\n" +
+              "  %t7 = icmp sgt i32 %t6, 0\n" +
+              "  call void @arc.release(ptr %t4)\n" +
+              "  br i1 %t7, label %if.then1, label %if.end3\n" +
+              "if.then1:\n" +
+              "  ret i1 1\n" +
+              "if.end3:\n" +
+              "  ret i1 0\n" +
+              "}\n")
+end a_condition_term_lets_go_before_it_branches

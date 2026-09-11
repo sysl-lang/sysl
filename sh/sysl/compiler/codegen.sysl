@@ -48,7 +48,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
-        if !f.ghost
+        if !f.ghost && !declared_elsewhere(p, f)
             set_promoted(e, pr.for_func(f.name))
 
             gen_function(e, f) match
@@ -57,12 +57,16 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
 
     // The C-callable entry each `@export` publishes, in front of the definition it calls. Every one
     // of them is built after the definitions, which is the order the reference's text has them in.
+    //
+    // **Only this compilation's own functions get one**: a precompiled function's thunk was emitted
+    // into the artifact that defined it, and a second copy here would be the duplicate symbol every
+    // other cross-artifact declaration is careful to avoid.
     var thunks: Buf[IrFunc] = buf()
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
 
-        if !f.ghost && f.exported.is_some()
+        if !f.ghost && f.exported.is_some() && !declared_elsewhere(p, f)
             gen_export_thunk(e, f, symbol_of(e, f.name)) match
                 Some(built) -> thunks.push(built)
                 None -> gaps.push((s"${f.name} thunk", gap_text(e)))
@@ -158,8 +162,8 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
         globals.push(vtables.at(i))
 
     val m = IrModule(t.triple, declares(e, p), struct_defs(p, word_bits), enum_defs(p, layout),
-                     box_defs(e, word_bits), no_sigs(), globals, helpers, funcs, thunks, entry,
-                     used_of(p, funcs), None)
+                     box_defs(e, word_bits), imported_sigs(e, p), globals, helpers, funcs, thunks,
+                     entry, used_of(p, funcs), None)
 
     (m, gaps)
 end codegen_into
@@ -243,6 +247,39 @@ private allocates(f: IrFunc, symbol: string) -> bool
 
     false
 end allocates
+
+// Whether a function's body is in an artifact somebody already compiled, so that this module
+// declares it rather than defining it a second time -- which would be a duplicate symbol at the
+// link.
+//
+// **An `internal` one is never that, whatever the list says.** Internal linkage is the promise that
+// the symbol does not leave the object file, so there is nothing for a declaration of one to resolve
+// to and no duplicate for a definition of one to be. A declaration is therefore not the careful
+// choice here but the unsound one: it would be satisfied by whatever *other* object file happens to
+// define that name, which for a closure -- whose name is a counter in the compilation that lowered
+// it -- is a different closure's body under the same signature.
+private declared_elsewhere(p: TProgram, f: TFunc) -> bool =
+    !f.internal && holds_string(p.precompiled, f.name)
+
+// The declarations a library's already-compiled functions get, in the order the program filed them.
+//
+// They are **not** up with the `extern`s, and they have to be after the type definitions: a named
+// struct used before its `= type` line is opaque at that point, and an opaque type cannot be passed
+// by value. Their signatures are built the way the *definition* would have built them rather than
+// through the C convention, because these are sysl's convention and not C's -- getting that wrong
+// passes arguments the other way, which is a corrupt run rather than a link error.
+private imported_sigs(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
+    var out: Buf[IrFuncSig] = buf()
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if declared_elsewhere(p, f)
+            out.push(ir_sig(symbol_of(e, f.name),
+                            sysl_fn_type(e, f.ret_ty, f.params, f.variadic, None)))
+
+    out
+end imported_sigs
 
 // The symbols this module places by hand and nothing in it reads, which is what keeps a section a
 // linker script gathers from being discarded.
@@ -337,6 +374,28 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         free_params.push(ir_param(LPtr))
         out.push(ir_sig(free_symbol(), ir_fn_type(LVoid, free_params)))
 
+    // The two steps a buffer's size is computed in, which are the checked forms and carry their
+    // width in the **name** as well as in the signature. They are declared from the flag rather than
+    // asked for where they are called, so that they sit here -- among the declarations the module
+    // writes for itself -- rather than after the `extern`s a program wrote.
+    if e.checked
+        val w = word_lty(e)
+
+        var pair_fields: Buf[LType] = buf()
+
+        pair_fields.push(w)
+        pair_fields.push(l_i1())
+
+        var overflow_params: Buf[IrParam] = buf()
+
+        overflow_params.push(ir_param(w))
+        overflow_params.push(ir_param(w))
+
+        val both = LStruct(pair_fields)
+
+        out.push(ir_sig(llvm_with_overflow("mul", false, w), ir_fn_type(both, overflow_params)))
+        out.push(ir_sig(llvm_with_overflow("add", false, w), ir_fn_type(both, overflow_params)))
+
     // C's own formatting, which a float and a specifier are rendered through. Its size argument is
     // the machine's word rather than eight bytes, and it is open at the end.
     if e.uses_snprintf
@@ -377,7 +436,30 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         copy_params.push(ir_param(l_i1()))
         out.push(ir_sig(memcpy_symbol(), ir_fn_type(LVoid, copy_params)))
 
+    // **A symbol this module has already stated is not stated again**, whether the first statement
+    // was a declaration or a definition: LLVM refuses a second `declare` of a name at a signature of
+    // its own with `invalid redefinition of function`.
+    //
+    // The two ways that happens are different and both are here. **An `@export` in this same
+    // compilation counts as declaring it**: one module declares a symbol and another defines it, so
+    // a library lowered whole lands both, and the definition is the stronger statement to keep -- a
+    // caller reaching the `extern` resolves to it exactly as the linker would have. **And an
+    // `extern` may name something this module already declares for itself**: the library binds
+    // `snprintf` under its own name and a body that renders a float asks for the same symbol, which
+    // is one function and must be one line.
     var seen: Buf[string] = buf()
+
+    seen.push(llvm_trap())
+
+    if e.heap
+        seen.push(malloc_symbol())
+        seen.push(free_symbol())
+
+    if e.uses_snprintf then seen.push("snprintf")
+
+    if p.entry_point && !p.tests.is_empty() then seen.push("strcmp")
+
+    if dispatcher_marks(p) then seen.push("write")
 
     for i in 0..<p.funcs.len()
         p.funcs.at(i).exported match
@@ -450,13 +532,6 @@ private holds(names: Buf[string], name: string) -> bool
 
     false
 end holds
-
-// The empty lists a module that lowers no body still has to be built with.
-private no_sigs() -> Buf[IrFuncSig]
-    var out: Buf[IrFuncSig] = buf()
-
-    out
-end no_sigs
 
 private no_funcs() -> Buf[IrFunc]
     var out: Buf[IrFunc] = buf()
@@ -579,6 +654,80 @@ private define_symbol(line: string) -> string
     line[at..<line.bytes.len]
 end define_symbol
 
+// Every symbol a module **calls** and neither defines nor declares.
+//
+// **A module that names a symbol it never states is one the back end refuses**, in a message counted
+// in the lines of generated text rather than in anything a reader wrote. Asking here is what turns
+// that into a sentence naming the function -- and for a library artifact it is the difference
+// between a diagnostic and an archive that would not assemble.
+//
+// It is read off the text for the reason `func_texts` is: what a module states is the text it came
+// to, and a walk of the representation would be a second answer to hold in step with the first.
+undefined_calls(text: string) -> Buf[string]
+    var stated: Buf[string] = buf()
+    var called: Buf[string] = buf()
+
+    val all = lines_of(text)
+
+    for i in 0..<all.len()
+        val line = all.at(i)
+
+        if starts_with_text(line, "define ") || starts_with_text(line, "declare ")
+            val name = define_symbol(line)
+
+            if name != "" && !holds(stated, name) then stated.push(name)
+        else
+            val name = call_symbol(line)
+
+            if name != "" && !holds(called, name) then called.push(name)
+
+    var out: Buf[string] = buf()
+
+    for i in 0..<called.len()
+        if !holds(stated, called.at(i)) then out.push(called.at(i))
+
+    out
+end undefined_calls
+
+// The symbol a `call` names, which is the `@` after the last `call` on the line up to the
+// parenthesis that opens its arguments. A call through a register names no symbol and answers with
+// nothing.
+private call_symbol(line: string) -> string
+    val at = index_of_text(line, "call ")
+
+    if at.is_none() then return ""
+
+    var from = at.unwrap()
+    var found = false
+    var start: usize = 0
+
+    for i in from..<line.bytes.len
+        if !found && line.bytes[i] == u8('@')
+            start = i + 1
+            found = true
+
+    if !found then return ""
+
+    for i in start..<line.bytes.len
+        if line.bytes[i] == u8('(') then return line[start..<i]
+
+    ""
+end call_symbol
+
+private index_of_text(line: string, what: string) -> Option[usize]
+    if what.bytes.len > line.bytes.len then return None
+
+    for i in 0..<(line.bytes.len - what.bytes.len + 1)
+        var same = true
+
+        for k in 0..<what.bytes.len
+            if line.bytes[i + k] != what.bytes[k] then same = false
+
+        if same then return Some(i)
+
+    None
+end index_of_text
+
 // -- the seams a test asserts on ------------------------------------------------------------------
 
 // One source lowered, and the LLVM text of the function named -- the whole `define` line to the
@@ -635,6 +784,23 @@ emit_declare_lines(text: string, target_name: string) -> Buf[string]
 
     out
 end emit_declare_lines
+
+// One source lowered as a program compiled **against an artifact somebody else built**: the keys
+// named are the library's already-compiled half, so the module declares each of them and defines
+// neither the body nor the C-callable entry an `@export` on one would have published.
+//
+// It is the seam the `imports` section is asserted on, since what a declaration says is text and
+// nothing about the representation says whether it is the reference's.
+emit_imported_text(text: string, precompiled: Buf[string]) -> string
+    val done = typed_of(text)
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val p = strip_tests(program_of(done, done.main_module))
+    val linked = p with { precompiled = precompiled }
+
+    ir_print_module(codegen_with_gaps(linked, done.an.tables.target, check_escapes(done.an, p)).0)
+end emit_imported_text
 
 // Why the function named was not lowered, or an empty string where it was.
 emit_gap_for(text: string, name: string) -> string
