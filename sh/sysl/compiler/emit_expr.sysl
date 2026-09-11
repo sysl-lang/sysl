@@ -162,6 +162,8 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         gen_cfor(e, init, cond, step, body, else_block, ty)
     TForEach(name, elem_ty, seq, body, else_block, ty) ->
         gen_for_each(e, name, elem_ty, seq, body, else_block, ty)
+    TIterate(cursor, cursor_ty, init, next, bind, body, else_block, ty) ->
+        gen_iterate(e, cursor, cursor_ty, init, next, bind, body, else_block, ty)
     TDoWhile(body, cond, else_block, ty) -> gen_do_while(e, body, cond, else_block, ty)
 
     TConstrainedCheck(value, target) ->
@@ -1064,7 +1066,7 @@ convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
         (Floating(a_bits), Floating(b_bits)) ->
             cast_to(e, if b_bits > a_bits then CastFPExt else CastFPTrunc, from, ut, v)
         (Char, Integer(b_bits, _, _)) -> convert_int(e, 32, false, b_bits, v)
-        (Integer(_, _, _), Char) -> gap_at(e, "a checked conversion to char")
+        (Integer(a_bits, a_signed, _), Char) -> checked_char(e, a_bits, a_signed, v)
         (Enum(d), Integer(_, _, _)) -> convert(e, underlying(d.underlying), ut, v)
         (Ptr(_), Ptr(_)) -> v
         (Ptr(_), Integer(_, _, _)) -> cast_to(e, CastPtrToInt, from, ut, v)
@@ -1083,6 +1085,41 @@ private cast_to(e: *Emit, op: CastOp, from: Type, to: Type, v: Val) -> Val
     emit(e, InCast(r, op, lty(e, from), v, lty(e, to)))
     r
 end cast_to
+
+// `char(u)` -- the one conversion that can fail, and so the one that checks.
+//
+// A Unicode scalar value is at most `0x10FFFF` and is never a surrogate; anything else traps, in
+// the same runtime-safety category as a bounds check. **The test runs at 64 bits** so that a wider
+// source cannot smuggle a value past it.
+private checked_char(e: *Emit, from_bits: int, from_signed: bool, v: Val) -> Val
+    val wide = convert_int(e, from_bits, from_signed, 64, v)
+    val i64 = LInt(64)
+    val in_range = fresh_reg(e)
+
+    emit(e, InIntCmp(in_range, IUle, i64, wide, VInt(from_int(1114111))))
+
+    val below_low = fresh_reg(e)
+
+    emit(e, InIntCmp(below_low, IUlt, i64, wide, VInt(from_int(55296))))
+
+    val above_top = fresh_reg(e)
+
+    emit(e, InIntCmp(above_top, IUgt, i64, wide, VInt(from_int(57343))))
+
+    val scalar = fresh_reg(e)
+
+    emit(e, InBin(scalar, OpOr, l_i1(), below_low, above_top))
+
+    val ok = fresh_reg(e)
+
+    emit(e, InBin(ok, OpAnd, l_i1(), in_range, scalar))
+    trap_unless(e, ok, "char")
+
+    val r = fresh_reg(e)
+
+    emit(e, InCast(r, CastTrunc, i64, wide, LInt(32)))
+    r
+end checked_char
 
 // The zero value of a type: what a declaration with no initializer starts at.
 zero_of(e: *Emit, ty: Type) -> Val

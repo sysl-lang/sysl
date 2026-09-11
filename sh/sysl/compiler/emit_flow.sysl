@@ -369,6 +369,84 @@ gen_for_each(e: *Emit, name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt]
     gen_loop_result(e, slot, ty, else_l, end_l, else_block)
 end gen_for_each
 
+// The iterating loop -- a `for` over something that answers `next`, which is what `for c in s.chars`
+// is once the analyzer has desugared it.
+//
+// **The cursor gets a slot with a count of its own, taken before the loop is recorded** so that a
+// `break` -- which lets go of everything pushed *after* the record -- leaves it alone; the end label
+// is where every path meets, and the release goes there.
+//
+// **What `next` gives back is a temporary of its own each round, and the two edges out of the test
+// let go of it separately**: the body binds the element, retaining it into its own slot, and then
+// releases the option, while the exhausted path releases it with nothing taken out.
+gen_iterate(e: *Emit, cursor: string, cursor_ty: Type, init: TExpr, next: TExpr, bind: TPattern,
+            body: Buf[TStmt], else_block: Option[TBlock], ty: Type) -> Val
+    val iv = gen_expr(e, init)
+
+    push_owned(e)
+    alloca(e, VReg(s"$cursor.addr"), lty(e, cursor_ty))
+    retain_value(e, cursor_ty, iv)
+    emit(e, InStore(lty(e, cursor_ty), iv, VReg(s"$cursor.addr"), AccPlain, None))
+    own_slot(e, cursor, cursor_ty)
+
+    val cond_l = fresh_label(e, "iter.cond")
+    val body_l = fresh_label(e, "iter.body")
+    val done_l = fresh_label(e, "iter.done")
+    val end_l = fresh_label(e, "iter.end")
+    val else_l = if else_block.is_some() then fresh_label(e, "iter.else") else end_l
+    val slot = result_slot(e, ty)
+
+    emit_term(e, InBr(cond_l))
+    emit_label(e, cond_l)
+    push_temps(e)
+
+    // **`continue` goes back to the test**, which is where the next element comes from: an iterating
+    // loop has no step of its own, since advancing is what `next` did.
+    //
+    // Recorded **after** the frame the option lives in, and deliberately: the body was reached
+    // through the release below, so a `break` that unwound that frame as well would give the option
+    // back twice.
+    e.loops.push(GenLoop(end_l, cond_l, slot, !no_value(ty), e.owned_marks.len(),
+                         e.temp_marks.len()))
+
+    val opt = gen_expr(e, next)
+    val ok = pattern_test(e, bind, opt)
+
+    emit_term(e, InCondBr(ok, body_l, done_l))
+    emit_label(e, body_l)
+    push_owned(e)
+    pattern_bind(e, bind, opt)
+
+    // **The frame is emptied here, not merely released, and that is what a `return` from the body
+    // needs.** The releases are emitted on this edge and the region is left populated so that the
+    // exhausted edge below can give them back too -- but a `return` walks *every* temp region and so
+    // would give this one back a second time. A `break` is already safe: it stops at the depth the
+    // loop recorded, which is outside this frame. Clearing rather than popping keeps the stack the
+    // same height, so the depths `break` and `continue` were recorded against still mean what they
+    // meant.
+    val held = temps_here(e)
+
+    release_values(e, held)
+    clear_temps_here(e)
+    gen_stmts(e, body)
+    pop_owned(e)
+    emit_term(e, InBr(cond_l))
+    emit_label(e, done_l)
+
+    for i in 0..<held.len()
+        e.temps.push(held.at(i))
+
+    release_temps(e)
+    drop_temps(e)
+    emit_term(e, InBr(else_l))
+    e.loops.pop()
+
+    val result = gen_loop_result(e, slot, ty, else_l, end_l, else_block)
+
+    pop_owned(e)
+    result
+end gen_iterate
+
 // The pointer and the length a view carries, which is what a walk over one needs.
 private each_view_parts(e: *Emit, seq: TExpr) -> (Val, Val)
     val wty = lty(e, texpr_type(seq))

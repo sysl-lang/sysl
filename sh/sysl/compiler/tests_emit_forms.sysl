@@ -1230,6 +1230,111 @@ a_short_circuits_right_side_owns_its_own_temporaries()
               "}\n")
 end a_short_circuits_right_side_owns_its_own_temporaries
 
+// **The iterating loop**: a `for` over something that answers `next`, which is what `for c in
+// s.chars` becomes once the analyzer has desugared it. The cursor is a local with a count of its
+// own, taken before the loop is recorded so a `break` leaves it alone; what `next` gives back is a
+// temporary of its own each round, and the two edges out of the test let go of it separately.
+@test("a 'for' over a cursor advances by asking it, and the cursor is a local with a count")
+an_iterating_loop_asks_its_cursor_for_the_next_element()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "count(s: string) -> usize\n" +
+                  "    var n: usize = 0\n" +
+                  "\n" +
+                  "    for c in s.chars\n" +
+                  "        if c == 'a' then n += 1\n" +
+                  "\n" +
+                  "    n\n" +
+                  "end count\n" +
+                  "\n" +
+                  "main() = print(count(\"banana\"))\n",
+              "count"),
+              "define i64 @count({ ptr, ptr, i64 } %s.param) {\n" +
+              "entry:\n" +
+              "  %s.addr = alloca { ptr, ptr, i64 }\n" +
+              "  %n.addr = alloca i64\n" +
+              "  %iter.addr = alloca %struct.sysl.text$Chars\n" +
+              "  %t7 = alloca %enum.sysl$Option.char\n" +
+              "  %c.addr = alloca i32\n" +
+              "  store { ptr, ptr, i64 } %s.param, ptr %s.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %s.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  store i64 0, ptr %n.addr\n" +
+              "  %t2 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t3 = call %struct.sysl.text$Chars @sysl.text$chars_of({ ptr, ptr, i64 } %t2)\n" +
+              "  call void @arc.copy.sysl.text$Chars(%struct.sysl.text$Chars %t3)\n" +
+              "  store %struct.sysl.text$Chars %t3, ptr %iter.addr\n" +
+              "  br label %iter.cond1\n" +
+              "iter.cond1:\n" +
+              "  %t4 = call %enum.sysl$Option.char @sysl.text$Chars.next(ptr %iter.addr)\n" +
+              "  %t5 = extractvalue %enum.sysl$Option.char %t4, 0\n" +
+              "  %t6 = icmp eq i32 %t5, 0\n" +
+              "  br i1 %t6, label %iter.body2, label %iter.done3\n" +
+              "iter.body2:\n" +
+              "  store %enum.sysl$Option.char %t4, ptr %t7\n" +
+              "  %t8 = getelementptr %enum.sysl$Option.char, ptr %t7, i32 0, i32 1\n" +
+              "  %t9 = load %sysl$Option.char.Some, ptr %t8\n" +
+              "  %t10 = extractvalue %sysl$Option.char.Some %t9, 0\n" +
+              "  store i32 %t10, ptr %c.addr\n" +
+              "  %t11 = load i32, ptr %c.addr\n" +
+              "  %t12 = icmp eq i32 %t11, 97\n" +
+              "  br i1 %t12, label %if.then5, label %if.end7\n" +
+              "if.then5:\n" +
+              "  %t13 = load i64, ptr %n.addr\n" +
+              "  %t14 = add i64 %t13, 1\n" +
+              "  store i64 %t14, ptr %n.addr\n" +
+              "  br label %if.end7\n" +
+              "if.end7:\n" +
+              "  br label %iter.cond1\n" +
+              "iter.done3:\n" +
+              "  br label %iter.end4\n" +
+              "iter.end4:\n" +
+              "  %t15 = load %struct.sysl.text$Chars, ptr %iter.addr\n" +
+              "  call void @arc.dispose.sysl.text$Chars(%struct.sysl.text$Chars %t15)\n" +
+              "  call void @arc.dispose.sysl.text$Chars(%struct.sysl.text$Chars %t3)\n" +
+              "  %t16 = load i64, ptr %n.addr\n" +
+              "  %t17 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t18 = extractvalue { ptr, ptr, i64 } %t17, 0\n" +
+              "  call void @arc.release_maybe(ptr %t18)\n" +
+              "  ret i64 %t16\n" +
+              "}\n")
+end an_iterating_loop_asks_its_cursor_for_the_next_element
+
+// **`char(u)` is the one conversion that can fail, and so the one that checks.** A Unicode scalar
+// value is at most `0x10FFFF` and is never a surrogate; anything else traps, in the same
+// runtime-safety category as a bounds check. The test runs at 64 bits so a wider source cannot
+// smuggle a value past it.
+@test("'char(n)' checks the range and the surrogate hole at 64 bits, and traps where it fails")
+a_conversion_to_char_is_checked()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "letter(n: u32) -> char = char(n)\n" +
+                  "\n" +
+                  "main() = print(letter(97))\n",
+              "letter"),
+              "define i32 @letter(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = zext i32 %t1 to i64\n" +
+              "  %t3 = icmp ule i64 %t2, 1114111\n" +
+              "  %t4 = icmp ult i64 %t2, 55296\n" +
+              "  %t5 = icmp ugt i64 %t2, 57343\n" +
+              "  %t6 = or i1 %t4, %t5\n" +
+              "  %t7 = and i1 %t3, %t6\n" +
+              "  br i1 %t7, label %char.ok1, label %char.bad2\n" +
+              "char.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "char.ok1:\n" +
+              "  %t8 = trunc i64 %t2 to i32\n" +
+              "  ret i32 %t8\n" +
+              "}\n")
+end a_conversion_to_char_is_checked
+
 // A body with the number off each interned string it names, and everything else left alone.
 private without_form_str_ids(text: string) -> string
     var out: Buf[u8] = buf()
