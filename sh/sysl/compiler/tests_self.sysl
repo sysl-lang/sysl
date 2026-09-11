@@ -13,9 +13,10 @@ import sysl.process.capture
 // stage 1 having miscompiled itself, or something in here that is not deterministic. Either way it
 // is the one thing a self-build has to rule out before stage 3 is worth cutting.
 //
-// **The input is this compiler's own tree**, which is both the largest sysl program there is and the
-// program stage 2 was made out of, so a body that lowers differently is a body stage 3 would inherit
-// the difference through.
+// **The input is this compiler's own tree, in place**, which is both the largest sysl program there
+// is and the program stage 2 was made out of, so a body that lowers differently is a body stage 3
+// would inherit the difference through. The manifest states no `sysl` floor, so the working
+// directory is what both stages are asked about rather than a copy edited on the way past.
 //
 // `SYSL_STAGE2` names the binary; with the variable unset the test returns at once and says so,
 // exactly as `SYSL_ORACLE` makes the differential proof skip on a machine that has no reference.
@@ -36,27 +37,18 @@ stage_one_and_stage_two_emit_the_same_text()
                 return
             end if
 
-            val copy = tree_copy(".") match
-                None ->
-                    print("skipped: this compiler's own tree could not be copied")
-                    return
-                Some(dir) -> dir
-
-            val theirs = capture(binary, ["emit-llvm", copy], "", [], true) match
+            val theirs = capture(binary, ["emit-llvm", "."], "", [], true) match
                 Err(_) ->
-                    remove_dir_all(copy).unwrap_or(())
                     assert(false, "the stage-2 binary could not be run")
                     return
                 Ok(answer) -> answer
 
-            val mine = emit_llvm_text(copy, None) match
+            val mine = emit_llvm_text(".", None) match
                 Err(refusal) ->
-                    remove_dir_all(copy).unwrap_or(())
                     assert(false, s"stage 1 refused this tree: ${refusal.message}")
                     return
                 Ok(emitted) -> emitted
 
-            remove_dir_all(copy).unwrap_or(())
             assert(theirs.status.ok(), s"stage 2 refused this tree: ${theirs.err.unwrap_or("")}")
 
             val two = func_texts(theirs.text)

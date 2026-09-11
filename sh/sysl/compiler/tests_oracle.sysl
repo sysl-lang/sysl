@@ -1312,51 +1312,11 @@ end the_emitted_types_agree
 // corpus of small programs; this one compares them on the largest sysl program there is, which is
 // the one that has to be right before a stage-2 binary means anything.
 //
-// It runs on a **copy** of the tree with the manifest's `sysl` floor relaxed. The floor names the
-// oldest bootstrap that may build these sources and this compiler's own version is below it -- a
-// fact about who may build the tree rather than about what the text should say -- so a copy is the
-// honest way past it. `scripts/own_tree_census.sh` makes the same copy by hand and leaves the two
-// texts on disk, which is what a divergence is actually read out of.
-
-// Where the census copies the tree to, with the floor relaxed and everything else as written.
-tree_copy(root: string) -> Option[string]
-    val dir = make_temp_dir("sysl-own-tree") match
-        Err(_) -> return None
-        Ok(made) -> made
-
-    for item in walk(root)
-        item match
-            Err(_) -> ()
-            Ok(entry) ->
-                if is_sysl_source(entry.path)
-                    val to = dir + "/" + entry.path
-
-                    make_dir_all(parent_of(to).unwrap_or(dir)).unwrap_or(())
-
-                    read_text(entry.path) match
-                        Err(_) -> ()
-                        Ok(text) -> write_text(to, text).unwrap_or(())
-
-    val manifest = read_text(root + "/package.hocon") match
-        Err(_) -> return None
-        Ok(text) -> text
-
-    write_text(dir + "/package.hocon", with_the_floor_relaxed(manifest)).unwrap_or(())
-    Some(dir)
-end tree_copy
-
-// The manifest with the one line a copy cannot keep rewritten, and every other line as written.
-private with_the_floor_relaxed(manifest: string) -> string
-    var out = str_builder()
-
-    for line in split(manifest, "\n")
-        if line.starts_with("  sysl = ") then out.push("  sysl = \"0.0.1\"")
-        else out.push(line)
-
-        out.push_char('\n')
-
-    out.finish()
-end with_the_floor_relaxed
+// **It runs on the tree in place.** The manifest states no `sysl` floor, so neither compiler has
+// anything to turn the other's version away with, and the thing compared is the working directory
+// rather than a copy of it that has been edited on the way past.
+// `scripts/own_tree_census.sh` asks the same question by hand and leaves the two texts on disk,
+// which is what a divergence is actually read out of.
 
 // What the census found: how many definitions each text carries, and the bodies both carry that
 // disagree.
@@ -1386,28 +1346,19 @@ the_two_agree_on_this_compilers_own_tree()
                 return
             end if
 
-            val copy = tree_copy(".") match
-                None ->
-                    print("skipped: this compiler's own tree could not be copied")
-                    return
-                Some(dir) -> dir
-
-            val theirs = ask_oracle_llvm(binary, copy)
+            val theirs = ask_oracle_llvm(binary, ".")
 
             if !theirs.ok
-                remove_dir_all(copy).unwrap_or(())
                 print(s"skipped: the reference would not lower this tree: ${theirs.message}")
                 return
             end if
 
-            val mine = emit_llvm_text(copy, None) match
+            val mine = emit_llvm_text(".", None) match
                 Err(refusal) ->
-                    remove_dir_all(copy).unwrap_or(())
                     assert(false, s"this compiler refused its own tree: ${refusal.message}")
                     return
                 Ok(emitted) -> emitted
 
-            remove_dir_all(copy).unwrap_or(())
             assert(mine.report.is_empty(),
                    s"this compiler reported on its own tree: ${analysis_report(mine.report)}")
 

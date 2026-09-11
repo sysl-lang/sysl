@@ -6,9 +6,8 @@
 # which runs in the gate and counts.** What this adds is the two texts, which a census cannot hand
 # back and which is what a divergence is actually read out of.
 #
-# It works on a COPY of the tree with the manifest's `sysl` floor relaxed, because the floor names
-# the oldest bootstrap that may build these sources and this compiler's own version is below it --
-# the floor is a fact about who may build the tree, not about what the text should say.
+# It works on the tree IN PLACE. The manifest states no `sysl` floor, so neither compiler has a
+# version the other's manifest can turn away, and what is lowered is the working tree itself.
 #
 #   scripts/own_tree_census.sh <this compiler's binary> [<reference binary>]
 #
@@ -32,13 +31,8 @@ fi
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/sysl-census.XXXXXX")
 
-cp -R "$root/sh" "$root/sysl.sum" "$work/"
-
-awk '/^  sysl = /{ print "  sysl = \"0.0.1\""; next } { print }' \
-    "$root/package.hocon" > "$work/package.hocon"
-
-( cd "$work" && "$theirs_bin" emit-llvm . ) > "$work/theirs.ll"
-( cd "$work" && "$ours_bin"   emit-llvm . ) > "$work/ours.ll"
+( cd "$root" && "$theirs_bin" emit-llvm . ) > "$work/theirs.ll"
+( cd "$root" && "$ours_bin"   emit-llvm . ) > "$work/ours.ll"
 
 echo "the reference: $work/theirs.ll"
 echo "this compiler: $work/ours.ll"
