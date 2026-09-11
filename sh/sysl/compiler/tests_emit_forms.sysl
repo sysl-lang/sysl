@@ -1335,6 +1335,113 @@ a_conversion_to_char_is_checked()
               "}\n")
 end a_conversion_to_char_is_checked
 
+// **A counted argument to a tail call takes its count while the frame is still whole**, and the
+// frame gives up everything it holds only after that. Written the other way round, `go(next, list)`
+// would free the list at the moment the parameter holding it was reassigned, and hand the second
+// argument a dangling reference.
+@test("a counted argument to a tail call is retained before the old bindings let go")
+a_counted_tail_call_argument_is_retained_first()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "go(n: int, s: string) -> usize\n" +
+                  "    if n == 0 then return s.len\n" +
+                  "\n" +
+                  "    go(n - 1, s)\n" +
+                  "end go\n" +
+                  "\n" +
+                  "main() = print(go(3, \"abc\"))\n",
+              "go"),
+              "define i64 @go(i32 %n.param, { ptr, ptr, i64 } %s.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %s.addr = alloca { ptr, ptr, i64 }\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  store { ptr, ptr, i64 } %s.param, ptr %s.addr\n" +
+              "  %t1 = extractvalue { ptr, ptr, i64 } %s.param, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t1)\n" +
+              "  br label %tailrec1\n" +
+              "tailrec1:\n" +
+              "  %t2 = load i32, ptr %n.addr\n" +
+              "  %t3 = icmp eq i32 %t2, 0\n" +
+              "  br i1 %t3, label %if.then2, label %if.end4\n" +
+              "if.then2:\n" +
+              "  %t4 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t5 = extractvalue { ptr, ptr, i64 } %t4, 2\n" +
+              "  %t6 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t7 = extractvalue { ptr, ptr, i64 } %t6, 0\n" +
+              "  call void @arc.release_maybe(ptr %t7)\n" +
+              "  ret i64 %t5\n" +
+              "if.end4:\n" +
+              "  %t8 = load i32, ptr %n.addr\n" +
+              "  %t9 = sub i32 %t8, 1\n" +
+              "  %t10 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t11 = extractvalue { ptr, ptr, i64 } %t10, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t11)\n" +
+              "  %t12 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t13 = extractvalue { ptr, ptr, i64 } %t12, 0\n" +
+              "  call void @arc.release_maybe(ptr %t13)\n" +
+              "  store i32 %t9, ptr %n.addr\n" +
+              "  store { ptr, ptr, i64 } %t10, ptr %s.addr\n" +
+              "  br label %tailrec1\n" +
+              "}\n")
+end a_counted_tail_call_argument_is_retained_first
+
+// **A large one is staged in a slot of its own**, because that is how a large value moves at all
+// here -- and the slot is what makes it safe as well: the address of an argument that is simply a
+// parameter is that parameter's own slot, so writing straight through would have the first
+// argument's landing change what the second one reads. The count came with the bytes and stays with
+// them, so nothing is retained at the landing and nothing released.
+@test("a large argument to a tail call is staged in a slot and copied into the parameter after")
+a_large_tail_call_argument_is_staged_in_a_slot()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Big\n" +
+                  "    a: [20]i64\n" +
+                  "end Big\n" +
+                  "\n" +
+                  "go(n: int, b: Big) -> i64\n" +
+                  "    if n == 0 then return b.a[0]\n" +
+                  "\n" +
+                  "    go(n - 1, b)\n" +
+                  "end go\n" +
+                  "\n" +
+                  "main() = print(go(3, Big([7; 20])))\n",
+              "go"),
+              "define i64 @go(i32 %n.param, ptr %b.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %b.addr = alloca %struct.Big\n" +
+              "  %t9 = alloca %struct.Big\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %b.addr, ptr align 8 %b.param, i64 160, i1 false)\n" +
+              "  br label %tailrec1\n" +
+              "tailrec1:\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = icmp eq i32 %t1, 0\n" +
+              "  br i1 %t2, label %if.then2, label %if.end4\n" +
+              "if.then2:\n" +
+              "  %t3 = getelementptr %struct.Big, ptr %b.addr, i32 0, i32 0\n" +
+              "  %t4 = icmp ult i64 0, 20\n" +
+              "  br i1 %t4, label %bounds.ok5, label %bounds.bad6\n" +
+              "bounds.bad6:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok5:\n" +
+              "  %t5 = getelementptr i64, ptr %t3, i64 0\n" +
+              "  %t6 = load i64, ptr %t5\n" +
+              "  ret i64 %t6\n" +
+              "if.end4:\n" +
+              "  %t7 = load i32, ptr %n.addr\n" +
+              "  %t8 = sub i32 %t7, 1\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %t9, ptr align 8 %b.addr, i64 160, i1 false)\n" +
+              "  store i32 %t8, ptr %n.addr\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %b.addr, ptr align 8 %t9, i64 160, i1 false)\n" +
+              "  br label %tailrec1\n" +
+              "}\n")
+end a_large_tail_call_argument_is_staged_in_a_slot
+
 // A body with the number off each interned string it names, and everything else left alone.
 private without_form_str_ids(text: string) -> string
     var out: Buf[u8] = buf()

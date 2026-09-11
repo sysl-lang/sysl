@@ -933,38 +933,61 @@ end gen_struct_new
 //
 // **The order is the whole of the correctness, and it is the order a `return` already uses.** Each
 // argument is computed while the frame is still whole -- it may well read the very slots about to be
-// overwritten -- and only then do the new values land.
+// overwritten -- and a count is taken for it there, so what it names cannot reach zero when the old
+// bindings let go. Only then does the frame give up everything it holds, and only then do the new
+// values land. Written the other way round, `go(next, list)` would free the list at the moment the
+// parameter holding it was reassigned and pass the second argument a dangling reference.
 //
 // The jump is a `br` and the block ends there, which is all any caller needs to know: this returns
 // no register because there is no value.
 gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
-    var staged: Buf[Option[Val]] = buf()
+    // What each argument left behind for the landing below: `StagedNothing` where there was nothing
+    // to move, `StagedSlot` where it is bytes to copy, `StagedValue` where it is a register to
+    // store.
+    var staged: Buf[(int, Val)] = buf()
 
+    // A large argument is staged in a slot of its own rather than a register, because that is how a
+    // large value moves at all here. The staging slot is what makes it safe as well: the address of
+    // an argument that is simply a parameter is that parameter's own slot, so writing straight
+    // through would have the first argument's landing change what the second one reads.
     for i in 0..<e.tail_params.len()
         val ty = e.tail_params.at(i).1
 
         if zero_sized(ty)
             gen_expr(e, args.at(i))
-            staged.push(None)
+            staged.push((StagedNothing, VNothing))
         else if e.layout.indirect(ty)
-            gap_here(e, "a large argument staged for a tail call")
-            staged.push(None)
-        else if contains_counted(ty)
-            gap_here(e, "a counted argument staged for a tail call")
-            staged.push(None)
-        else staged.push(Some(gen_expr(e, args.at(i))))
+            val slot = alloca(e, fresh_reg(e), lty(e, ty))
+
+            gen_into(e, slot, args.at(i))
+            staged.push((StagedSlot, slot))
+        else
+            val v = gen_expr(e, args.at(i))
+
+            retain_value(e, ty, v)
+            staged.push((StagedValue, v))
+
+    release_all(e)
 
     for i in 0..<e.tail_params.len()
-        staged.at(i) match
-            Some(v) ->
-                val p = e.tail_params.at(i)
+        val p = e.tail_params.at(i)
+        val s = staged.at(i)
 
-                emit(e, InStore(lty(e, p.1), v, VReg(s"${p.0}.addr"), AccPlain, None))
-            None -> ()
+        // The count came with the bytes and stays with them: what the staging slot took is now the
+        // parameter's, so nothing is retained here and nothing released.
+        if s.0 == StagedSlot
+            emit_memcpy(e, VReg(s"${p.0}.addr"), s.1, int(e.layout.size(p.1)),
+                        int(e.layout.align(p.1)))
+        else if s.0 == StagedValue
+            emit(e, InStore(lty(e, p.1), s.1, VReg(s"${p.0}.addr"), AccPlain, None))
 
     emit_term(e, InBr(e.tail_target))
     VNothing
 end gen_tail_self_call
+
+const StagedNothing: int = 0
+const StagedSlot: int = 1
+const StagedValue: int = 2
 
 private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
     // A foreign result may be named by a type the sysl signature never mentions -- a coerced
