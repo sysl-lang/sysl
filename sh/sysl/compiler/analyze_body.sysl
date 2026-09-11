@@ -47,8 +47,13 @@ struct TypedBodies
 end TypedBodies
 
 // Reads a compilation's declarations and types every body it can.
-analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
-    val a = analysis_for(t)
+analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies = analyze_produced(written, t, buf())
+
+// The same, told which of the files it was handed are the library's own being **built** rather than
+// supplied. Every other caller hands nothing and gets the ordinary reading, where the library's
+// bodies are typed only as something reaches them.
+analyze_produced(written: Buf[Program], t: Target, producing: Buf[string]) -> TypedBodies
+    val a = analysis_producing(t, producing)
     val units = read_decls(a, written)
 
     var funcs: Buf[TFunc] = buf()
@@ -91,7 +96,7 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
     for i in 0..<units.len()
         val unit = units.at(i)
         val scope = scope_of_unit(unit)
-        val library = from_library(scope)
+        val library = from_library(a, scope)
         val is_entry = a.tables.entry_src != "" && unit.src.name == a.tables.entry_src
 
         for j in 0..<unit.body.len()
@@ -150,7 +155,7 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
         val m = lowered.at(i)
         val home = a.tables.members.decl_scope.get(m.name).unwrap_or(empty_scope())
 
-        if from_library(home) then held.push(HeldBody(m.name, home, span_zero(), m, Some(m)))
+        if from_library(a, home) then held.push(HeldBody(m.name, home, span_zero(), m, Some(m)))
         else funcs.push(analyze_instance(a, m.name, m))
 
     // The statements the program starts with, typed after every declaration's body and before the
@@ -213,7 +218,7 @@ analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies
 
     TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, ordered_vals(storage), a, units,
                 entry, started.0, started.1)
-end analyze_bodies
+end analyze_produced
 
 // The statements the file the program starts in carries, typed in that file's own terms.
 //
@@ -297,10 +302,13 @@ private held_named(held: Buf[HeldBody], name: string) -> Option[HeldBody]
     None
 end held_named
 
-// Whether a file is one the standard module supplied. A library file is named for its place in the
-// library rather than for the path it was read from, which is what makes the question answerable
-// wherever the library was installed.
-from_library(scope: Scope) -> bool = scope.src.name.starts_with(s"$StdPrefix/")
+// Whether a file is one the standard module **supplied**, which is not the same question as whether
+// it is the library's. A library file is named for its place in the library rather than for the
+// path it was read from, which is what makes the first half answerable wherever the library was
+// installed; the second half is what makes a build *of* the library compile all of it rather than
+// the fraction its own internal calls reach.
+from_library(a: &Analysis, scope: Scope) -> bool =
+    scope.src.name.starts_with(s"$StdPrefix/") && !holds_string(a.producing, scope.src.name)
 
 // The instantiations a walk asked for, typed until nothing more is asked. Typing one body may reach
 // a call that asks for another, so it runs to a fixpoint.

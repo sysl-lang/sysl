@@ -1,0 +1,544 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_var
+import sysl.fs.{make_temp_dir, read_bytes, remove_file, walk, write_text}
+import sysl.text.{from_utf8_unchecked, Search}
+
+// Separate compilation: which of a library's declarations its object half can hold, the file that
+// holds them, and the `imports` section a program compiled against one carries.
+//
+// **Every expected value here came from the reference compiler or from the machine**, never from the
+// rule: the metadata's shape is quoted from `LibraryArtifact`, the archive is one a real archiver
+// wrote, and the fingerprint is checked against the directory name the installed sysl gave its own
+// cache entry.
+
+private files_of(places: Buf[string], texts: Buf[string]) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    for i in 0..<places.len()
+        out.push((places.at(i), texts.at(i)))
+
+    out
+end files_of
+
+private two(a: string, b: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(a)
+    out.push(b)
+    out
+end two
+
+private just(a: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(a)
+    out
+end just
+
+// -- the fingerprint -------------------------------------------------------------------------
+
+@test("a library's fingerprint is over its files' places and texts, whatever order they arrive in")
+a_fingerprint_does_not_depend_on_order()
+    val forwards = files_of(two("a/x.sysl", "b/y.sysl"), two("one\n", "two\n"))
+    val backwards = files_of(two("b/y.sysl", "a/x.sysl"), two("two\n", "one\n"))
+
+    assert_eq(library_fingerprint(forwards), library_fingerprint(backwards))
+end a_fingerprint_does_not_depend_on_order
+
+@test("two files of one name in two modules are two files, so the place is what is hashed")
+a_fingerprint_is_over_the_place_and_not_the_name()
+    val here = files_of(two("a/read.sysl", "b/read.sysl"), two("one\n", "two\n"))
+    val swapped = files_of(two("a/read.sysl", "b/read.sysl"), two("two\n", "one\n"))
+
+    assert(library_fingerprint(here) != library_fingerprint(swapped),
+           "the two orders of one pair of texts hash apart")
+end a_fingerprint_is_over_the_place_and_not_the_name
+
+@test("a byte changed anywhere in a library changes its fingerprint")
+a_fingerprint_answers_for_every_byte()
+    val before = files_of(just("sysl/print.sysl"), just("f() -> int = 1\n"))
+    val after = files_of(just("sysl/print.sysl"), just("f() -> int = 2\n"))
+
+    assert(library_fingerprint(before) != library_fingerprint(after), "an edit is visible")
+end a_fingerprint_answers_for_every_byte
+
+@test("the fingerprint is 16 hexadecimal digits however the hash comes out")
+a_fingerprint_is_one_shape()
+    val fp = library_fingerprint(files_of(just("x.sysl"), just("")))
+
+    assert_eq(fp.bytes.len, 16)
+
+    for i in 0..<fp.bytes.len
+        val b = fp.bytes[i]
+
+        assert((b >= u8('0') && b <= u8('9')) || (b >= u8('a') && b <= u8('f')),
+               s"'$fp' is hexadecimal")
+end a_fingerprint_is_one_shape
+
+// **The one check here whose answer came from outside this compiler.** The reference names its cache
+// entries `<version>-<fingerprint>-<target>-<alloc>-<free>`, so a machine that has ever run an
+// installed sysl carries that compiler's own hash of the very library this one is reading. Agreeing
+// with it is a claim about UTF-16 code units, about which files count and about how a place is
+// spelled -- none of which this suite could otherwise hold to anything.
+@test("and it is the hash the installed compiler gave its own cache entry for this library")
+a_fingerprint_agrees_with_the_reference()
+    val root = std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return
+        Ok(dir) -> dir
+
+    val cache = cache_directory() match
+        None ->
+            print("skipped: this machine has no cache directory")
+            return
+        Some(dir) -> s"$dir/sysl"
+
+    val t = host_target()
+    val fp = std_fingerprint(root, t) match
+        Err(why) ->
+            print(s"skipped: $why")
+            return
+        Ok(answer) -> answer
+
+    var seen = false
+    var entries = 0
+
+    for item in walk(cache)
+        item match
+            Err(_) -> ()
+            Ok(entry) ->
+                entries += 1
+
+                if entry.path.index_of(s"-$fp-${t.name}-").is_some() then seen = true
+
+    if entries == 0
+        print("skipped: nothing has written a library artifact on this machine")
+        return
+    end if
+
+    assert(seen, s"a cache entry names '$fp' for ${t.name}")
+end a_fingerprint_agrees_with_the_reference
+
+// -- where an artifact lives -----------------------------------------------------------------
+
+@test("an artifact's path names the compiler, the library, the machine and the allocating pair")
+an_artifact_is_keyed_by_everything_it_is_a_function_of()
+    val here = std_artifact_path(host_target(), "0123456789abcdef")
+
+    assert(here.ends_with("/std.syslib"), s"'$here' names the artifact")
+
+    cache_directory() match
+        None -> ()
+        Some(_) ->
+            assert(here.index_of(s"/$Version-0123456789abcdef-${host_target().name}-").is_some(),
+                   s"'$here' carries the version, the fingerprint and the machine")
+            assert(here.index_of(s"-${malloc_symbol()}-${free_symbol()}/").is_some(),
+                   s"'$here' carries the allocating pair")
+end an_artifact_is_keyed_by_everything_it_is_a_function_of
+
+@test("two machines and two libraries are four entries rather than one file overwritten four times")
+an_artifact_path_separates_what_it_is_keyed_by()
+    val host = host_target()
+    val other = target_named("x86_64-linux").unwrap_or(host)
+
+    if other.name == host.name
+        print("skipped: this compiler has one target to compare with")
+        return
+    end if
+
+    assert(std_artifact_path(host, "aaaa") != std_artifact_path(other, "aaaa"), "the machine")
+    assert(std_artifact_path(host, "aaaa") != std_artifact_path(host, "bbbb"), "the library")
+end an_artifact_path_separates_what_it_is_keyed_by
+
+@test("a machine with no cache directory keeps one artifact beside the project")
+an_artifact_falls_back_to_the_project()
+    assert_eq(std_artifact_local(), ".sysl/std.syslib")
+    assert(is_artifact("x.syslib"), "a .syslib is an artifact")
+    assert(!is_artifact("library"), "a source root is not")
+end an_artifact_falls_back_to_the_project
+
+// -- the metadata ----------------------------------------------------------------------------
+
+private framed_archive(payload: Buf[u8]) -> Buf[u8] = ar_of(just(SyslibMetadataMember), payload)
+
+// One archive with one member, built the way an archiver writes one: the magic, then a header of
+// fixed-width fields, then the body padded to an even offset.
+private ar_of(names: Buf[string], body: Buf[u8]) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    push_text(&out, ArMagic)
+
+    for i in 0..<names.len()
+        push_padded(&out, names.at(i), 16)
+        push_padded(&out, "0", 12)
+        push_padded(&out, "0", 6)
+        push_padded(&out, "0", 6)
+        push_padded(&out, "644", 8)
+        push_padded(&out, s"${body.len()}", 10)
+        push_text(&out, "`\n")
+
+        for k in 0..<body.len()
+            out.push(body.at(k))
+
+        if body.len() % 2 == 1 then out.push(u8('\n'))
+
+    out
+end ar_of
+
+private push_text(out: *Buf[u8], text: string)
+    for i in 0..<text.bytes.len
+        out.push(text.bytes[i])
+end push_text
+
+private push_padded(out: *Buf[u8], text: string, width: usize)
+    push_text(out, text)
+
+    for i in text.bytes.len..<width
+        out.push(u8(' '))
+end push_padded
+
+@test("an artifact's metadata is framed by a marker, a version and a length in bytes")
+metadata_travels_inside_an_object_file()
+    val meta = "aarch64-macos\nmalloc free\nfeedfacecafebeef\n1\nsysl$f\n"
+    val bytes = framed_archive(syslib_frame(meta))
+
+    assert_eq(syslib_metadata_of("x.syslib", bytes.view()).unwrap_or("no"), meta)
+end metadata_travels_inside_an_object_file
+
+@test("and a payload whose bytes are not ASCII is found by its length rather than by its characters")
+metadata_is_measured_in_bytes()
+    val meta = "aarch64-macos\nmalloc free\nπ≈3\n0\n"
+    val bytes = framed_archive(syslib_frame(meta))
+
+    assert_eq(syslib_metadata_of("x.syslib", bytes.view()).unwrap_or("no"), meta)
+end metadata_is_measured_in_bytes
+
+@test("a container another sysl wrote is refused by version rather than read as this one's")
+metadata_of_another_version_is_refused()
+    val bytes = framed_archive(syslib_framed(s"syslib ${SyslibVersion + 1} 0", ""))
+
+    syslib_metadata_of("x.syslib", bytes.view()) match
+        Ok(_) -> assert(false, "a container from another sysl is refused")
+        Err(why) -> assert(why.index_of("was built by a different sysl").is_some(), why)
+end metadata_of_another_version_is_refused
+
+@test("a frame whose length overruns what is there is a truncated library")
+metadata_that_overruns_is_refused()
+    val bytes = framed_archive(syslib_framed(s"syslib $SyslibVersion 500", "short"))
+
+    syslib_metadata_of("x.syslib", bytes.view()) match
+        Ok(_) -> assert(false, "a truncated library is refused")
+        Err(why) -> assert(why.index_of("truncated").is_some(), why)
+end metadata_that_overruns_is_refused
+
+@test("and a file carrying no marker at all is not one of ours")
+metadata_absent_is_refused()
+    var plain: Buf[u8] = buf()
+
+    push_text(&plain, "nothing here\n")
+
+    val bytes = ar_of(just("other.o"), plain)
+
+    syslib_metadata_of("x.syslib", bytes.view()) match
+        Ok(_) -> assert(false, "a foreign archive is refused")
+        Err(why) -> assert(why.index_of("carries no metadata").is_some(), why)
+end metadata_absent_is_refused
+
+@test("bytes that are not an archive are refused before anything is scanned for")
+metadata_of_a_file_that_is_not_an_archive()
+    var plain: Buf[u8] = buf()
+
+    push_text(&plain, "#include <stdio.h>\n")
+
+    syslib_metadata_of("x.syslib", plain.view()) match
+        Ok(_) -> assert(false, "a text file is refused")
+        Err(why) -> assert(why.index_of("not an archive").is_some(), why)
+end metadata_of_a_file_that_is_not_an_archive
+
+// -- what the metadata says ------------------------------------------------------------------
+
+private meta_for(t: string, pair: string, fp: string, names: string) -> string =
+    s"$t\n$pair\n$fp\n1\n$names\n"
+
+@test("the metadata says the machine, the allocating pair, the library and what the object defines")
+metadata_hands_back_the_symbols_and_the_fingerprint()
+    val t = host_target()
+    val meta = meta_for(t.name, allocator_pair(), "feedfacecafebeef", "sysl$f")
+
+    syslib_read("x.syslib", meta, t) match
+        Err(why) -> assert(false, why)
+        Ok(answer) ->
+            assert_eq(answer.1, "feedfacecafebeef")
+            assert_eq(answer.0.len(), 1)
+            assert_eq(answer.0.at(0), "sysl$f")
+end metadata_hands_back_the_symbols_and_the_fingerprint
+
+@test("an artifact built for another machine is refused by name and not left to the linker")
+metadata_for_another_machine_is_refused()
+    val t = host_target()
+    val meta = meta_for("wasm32-freestanding", allocator_pair(), "feedfacecafebeef", "sysl$f")
+
+    syslib_read("x.syslib", meta, t) match
+        Ok(_) -> assert(false, "another machine's artifact is refused")
+        Err(why) ->
+            assert(why.index_of("was built for wasm32-freestanding").is_some(), why)
+            assert(why.index_of(s"--target ${t.name}").is_some(), why)
+end metadata_for_another_machine_is_refused
+
+// **A mismatched target is refused by the linker eventually and a mismatched allocator by nothing at
+// all**: both pairs resolve, the link succeeds, and the program hands one heap's storage back to
+// another every time an object the artifact allocated is released.
+@test("and one that allocates through another pair is refused for a sharper reason")
+metadata_for_another_allocator_is_refused()
+    val t = host_target()
+    val meta = meta_for(t.name, "pvPortMalloc vPortFree", "feedfacecafebeef", "sysl$f")
+
+    syslib_read("x.syslib", meta, t) match
+        Ok(_) -> assert(false, "another allocator's artifact is refused")
+        Err(why) ->
+            assert(why.index_of("pvPortMalloc / vPortFree").is_some(), why)
+            assert(why.index_of("a program has one heap").is_some(), why)
+end metadata_for_another_allocator_is_refused
+
+@test("a metadata record with no header is not a readable library")
+metadata_without_a_header_is_refused()
+    syslib_read("x.syslib", "aarch64-macos\n", host_target()) match
+        Ok(_) -> assert(false, "a header-less record is refused")
+        Err(why) -> assert(why.index_of("metadata header is missing").is_some(), why)
+end metadata_without_a_header_is_refused
+
+@test("and one promising more symbols than it carries is truncated rather than short")
+metadata_with_a_short_list_is_refused()
+    val t = host_target()
+    val meta = s"${t.name}\n${allocator_pair()}\nfeedfacecafebeef\n3\nsysl$$f\n"
+
+    syslib_read("x.syslib", meta, t) match
+        Ok(_) -> assert(false, "a short list is refused")
+        Err(why) -> assert(why.index_of("truncated").is_some(), why)
+end metadata_with_a_short_list_is_refused
+
+// -- the container ---------------------------------------------------------------------------
+
+// **The archive is one a real archiver wrote**, which is the only way to hold the reader to a format
+// nothing here defines: a fixture built by this file would agree with this file's own reading of it
+// whatever either of them said. A name longer than a header field is what exercises the long-name
+// conventions, and which of the two appears is the archiver's choice rather than ours.
+@test("the members of an archive a real archiver wrote are read back under their own names")
+an_archive_is_read_the_way_the_archiver_wrote_it()
+    val archiver = find_ar(None) match
+        Err(why) ->
+            print(s"skipped: $why")
+            return
+        Ok(found) -> found
+
+    val dir = make_temp_dir("sysl-ar-") match
+        Err(_) ->
+            print("skipped: this machine will not make a temporary directory")
+            return
+        Ok(made) -> made
+
+    val short = s"$dir/short.txt"
+    val lengthy = s"$dir/a_name_longer_than_sixteen.txt"
+    val out = s"$dir/bundle.a"
+
+    write_text(short, "one\n")
+    write_text(lengthy, "two\n")
+
+    var members: Buf[string] = buf()
+
+    members.push(short)
+    members.push(lengthy)
+
+    archive(archiver, members, out) match
+        Err(why) ->
+            print(s"skipped: $why")
+            return
+        Ok(_) -> ()
+
+    val bytes = read_bytes(out) match
+        Err(_) ->
+            print("skipped: the archive could not be read back")
+            return
+        Ok(b) -> b
+
+    remove_file(short)
+    remove_file(lengthy)
+    remove_file(out)
+
+    val found = ar_members(bytes.view()) match
+        Err(why) ->
+            assert(false, why)
+            return
+        Ok(ms) -> ms
+
+    var names: Buf[string] = buf()
+
+    for i in 0..<found.len()
+        names.push(found.at(i).name)
+
+    assert(holds_string(names, "short.txt"), s"a short name survives: ${names.len()} members")
+    assert(holds_string(names, "a_name_longer_than_sixteen.txt"), "a long name survives")
+end an_archive_is_read_the_way_the_archiver_wrote_it
+
+// -- the split ---------------------------------------------------------------------------------
+
+private determined_of(text: string) -> Buf[string] = library_determined_of(text)
+
+private advertises(text: string, name: string) -> bool = holds_string(determined_of(text), name)
+
+@test("a library's own declaration with nothing generic about it is compiled into its object half")
+a_determined_declaration_is_advertised()
+    assert(advertises("module lib\n\ndouble(n: int) -> int = n * 2\n", "lib$double"),
+           "an ordinary function is advertised")
+end a_determined_declaration_is_advertised
+
+// **What is advertised is what the linker can reach.** A file-private symbol is emitted `internal`,
+// which is a promise that every caller is in this module -- so a program told the artifact holds it
+// would declare it, call it, and find nothing at the link.
+@test("a file-private one is not, however ordinary it looks, because its symbol never leaves")
+a_private_declaration_is_not_advertised()
+    assert(!advertises("module lib\n\nprivate helper(n: int) -> int = n * 2\n", "lib$helper"),
+           "a private function is not advertised")
+end a_private_declaration_is_not_advertised
+
+// **The storage for a `val` is initialized by the entry point and a library has none**, so a
+// function that reads one is compiled in the program instead, where the initialization it depends on
+// actually happens.
+@test("a function that reads module storage is left to the program, and so is anything calling it")
+a_reader_of_storage_is_deferred()
+    val src = "module lib\n\nval room: int = 3\n\nreads() -> int = room\n\n" +
+        "calls() -> int = reads() + 1\n\nneither() -> int = 7\n"
+
+    assert(!advertises(src, "lib$reads"), "the reader is deferred")
+    assert(!advertises(src, "lib$calls"), "and its caller with it")
+    assert(advertises(src, "lib$neither"), "while everything else is compiled here")
+end a_reader_of_storage_is_deferred
+
+// **A generic has nothing to compile until a caller fixes its type arguments**, so it travels as
+// source and is monomorphized in the program that fixes them.
+@test("a generic declaration nothing in the library calls is not in the object half at all")
+a_generic_is_left_to_whoever_instantiates_it()
+    val names = determined_of("module lib\n\nfirst[T](xs: []T) -> T = xs[0]\n")
+
+    for i in 0..<names.len()
+        assert(names.at(i).index_of("first").is_none(), s"'${names.at(i)}' is not the generic")
+end a_generic_is_left_to_whoever_instantiates_it
+
+@test("the advertised names are sorted, so one library gives one list however it was read")
+the_advertised_names_are_ordered()
+    val names = determined_of("module lib\n\nb() -> int = 1\n\na() -> int = 2\n\nc() -> int = 3\n")
+
+    for i in 1..<names.len()
+        assert(names.at(i - 1) < names.at(i), s"'${names.at(i - 1)}' before '${names.at(i)}'")
+end the_advertised_names_are_ordered
+
+// -- the imports section -------------------------------------------------------------------------
+
+private imported(text: string, names: Buf[string]) -> string = emit_imported_text(text, names)
+
+// **The declaration is built the way the definition would have been built**, because these are
+// sysl's convention and not C's -- getting that wrong passes the arguments the other way, which is a
+// corrupt run rather than a link error.
+@test("a function an artifact already compiled is declared at the signature its definition had")
+a_precompiled_function_is_declared()
+    val text = imported("twice(n: int) -> int = n * 2\n", just("twice"))
+
+    assert(text.index_of("declare i32 @twice(i32)\n").is_some(), text)
+    assert(text.index_of("define i32 @twice(").is_none(), "and its body is not emitted here")
+end a_precompiled_function_is_declared
+
+@test("and the declarations come after the type definitions, since an opaque type has no layout")
+the_imports_come_after_the_types()
+    val src = "struct Point\n    x: int\n    y: int\nend Point\n\n" +
+        "flip(p: Point) -> Point = Point(p.y, p.x)\n"
+    val text = imported(src, just("flip"))
+
+    val types = text.index_of("%struct.Point = type ")
+    val imports = text.index_of("declare %struct.Point @flip(")
+
+    assert(types.is_some(), text)
+    assert(imports.is_some(), text)
+    assert(types.unwrap() < imports.unwrap(), "the layout is written before anything passes one")
+end the_imports_come_after_the_types
+
+// **An `internal` symbol is never declared, whatever the list says.** Internal linkage is the
+// promise that the symbol does not leave the object file, so there is nothing for a declaration of
+// one to resolve to -- and it would be satisfied by whatever other object happened to define that
+// name.
+@test("a file-private function is defined here even where it is named as already compiled")
+an_internal_function_is_not_declared()
+    val src = "private twice(n: int) -> int = n * 2\n"
+    val text = imported(src, just("twice"))
+
+    assert(text.index_of("define internal i32 @twice(").is_some(), text)
+    assert(text.index_of("declare i32 @twice(").is_none(), "and it is not declared")
+end an_internal_function_is_not_declared
+
+@test("a precompiled function publishes no second C-callable entry, which would be a duplicate")
+a_precompiled_export_gets_no_thunk()
+    val src = "@export\ntwice(n: int) -> int = n * 2\n"
+    val bare = imported(src, buf())
+    val linked = imported(src, just("twice"))
+
+    assert(bare.index_of("define i32 @twice(").is_some(), bare)
+    assert(linked.index_of("define i32 @twice(").is_none(), "the thunk goes with the definition")
+end a_precompiled_export_gets_no_thunk
+
+// -- what a module states once -----------------------------------------------------------------
+
+// **An `extern` may name something this module already declares for itself**, and LLVM refuses the
+// second statement of one name with `invalid redefinition of function`. The library binds `snprintf`
+// under its own name and a body that renders a float asks for the same symbol.
+@test("a symbol the compiler declares for itself is not declared a second time by an extern")
+one_symbol_is_declared_once()
+    val root = std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return
+        Ok(_) -> ()
+
+    val dir = make_temp_dir("sysl-decl-") match
+        Err(_) ->
+            print("skipped: this machine will not make a temporary directory")
+            return
+        Ok(made) -> made
+
+    val scratch = s"$dir/once.sysl"
+
+    write_text(scratch, "extern \"snprintf\" mine(buf: *u8, n: usize, fmt: *u8, ...) -> int\n\n" +
+        "show(x: real) -> string = s\"$x\"\n\nvar room: [32]u8 = [0; 32]\n\n" +
+        "print(show(1.5))\nmine(&room[0], 32, c\"hi\")\n")
+
+    val text = emit_llvm_text(scratch, None) match
+        Err(why) ->
+            remove_file(scratch)
+            assert(false, why.message)
+            return
+        Ok(emitted) -> emitted.text
+
+    remove_file(scratch)
+
+    var snprintfs = 0
+    val lines = lines_of(text)
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with("declare ") && lines.at(i).index_of("@snprintf(").is_some()
+            snprintfs += 1
+
+    assert_eq(snprintfs, 1)
+end one_symbol_is_declared_once
+
+@test("a module that names a symbol it never states is refused with the symbol quoted")
+a_module_names_what_it_states()
+    val text = "target triple = \"arm64-apple-macosx\"\n\ndeclare void @there()\n\n" +
+        "define void @here() {\nentry:\n  call void @there()\n  call void @missing()\n  ret void\n}\n"
+
+    val loose = undefined_calls(text)
+
+    assert_eq(loose.len(), 1)
+    assert_eq(loose.at(0), "missing")
+end a_module_names_what_it_states

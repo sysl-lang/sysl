@@ -1,0 +1,454 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_var
+import sysl.fs.{read_text, read_bytes}
+import sysl.text.{chars_of, from_utf8_unchecked, str_builder, Search}
+
+// A library as one **file**: the half that could be compiled ahead of time as an object file, and
+// the metadata a consuming compilation reads back out of it.
+//
+// **The split is the whole design, and it is the one Rust's `.rlib` makes.** A declaration with no
+// type parameters is compiled once, by whoever ships the library, and a program that calls it links
+// against the result rather than emitting a second copy. A generic has nothing to compile until a
+// caller fixes its type arguments, so it is left to the consuming program.
+//
+// **The container is a real `ar` archive**, which is what an `.rlib` is and for the same reason: the
+// linker already knows how to read one, so the object half needs no unwrapping and a member is
+// pulled in only to resolve a symbol something has left undefined. The metadata rides inside it
+// wrapped in a real object file, as one `private` constant in a section of its own -- a raw member
+// is silently dropped by macOS's `ranlib`, and forcing the index off only moves the failure to the
+// linker.
+//
+// **The metadata carries no trees, and that is the one place this differs from the reference's
+// artifact.** There the tree half travels so that a consumer can monomorphize a generic without the
+// library's source; here the library is always read from source beside the compiler (`std.sysl`), so
+// the trees are already in hand and a copy in the artifact would be a second answer to a question
+// that already has one. What the artifact is for here is the *symbol list* -- which of the library's
+// functions the object half defines, so that a program declares those rather than emitting them --
+// and the compiled code the linker takes them from.
+
+// What a library artifact is called.
+val SyslibExtension: string = ".syslib"
+
+// The two members an artifact is made of: the metadata, and the compiled half. Named rather than
+// left as whatever the temporary files happened to be called, so that an artifact holds the same
+// names wherever it was built.
+val SyslibMetadataMember: string = "sysl.smeta.o"
+
+val SyslibCodeMember: string = "sysl.code.o"
+
+// The container's version, refused on mismatch. It is not the compiler's version: a container this
+// reader cannot make sense of is a different failure from one built by a compiler that emitted
+// different code, and only the first has anything useful to say about the bytes.
+const SyslibVersion: usize = 1
+
+private const SyslibMagic: string = "syslib"
+
+// The byte string the metadata is found by, inside an object file nothing else can read.
+//
+// NUL-delimited rather than plain text because the only bytes of an artifact a user chooses are the
+// compiled half's string literals, and a library whose own source held the words `SYSL-METADATA`
+// would otherwise be a library whose metadata could not be found. A NUL is not something a literal
+// arrives at by being written; it has to be escaped deliberately, and the whole sequence with it.
+private syslib_marker() -> string = s"${char(0)}SYSL-METADATA${char(0)}"
+
+// The allocating pair an artifact is built against. A function compiled into the object half calls
+// them by name, so a program that frees through another pair would be giving one heap's storage back
+// to another -- which is why the pair is recorded and a mismatch is refused rather than linked.
+allocator_pair() -> string = s"${malloc_symbol()} ${free_symbol()}"
+
+// --- the fingerprint ------------------------------------------------------------------
+
+// The hash of a library's source: every file reduced to its **place** in the tree and its text,
+// sorted by place, run through FNV-1a and finished with `fmix64`.
+//
+// A file's place is its directory below the root and its own name, and not the name alone. A library
+// is a tree, so two of its modules may each hold a `read.sysl` -- and keying by the name would give
+// them one key between them, at which point the sort is deciding by input order what two files with
+// one name hash as, and the same library fingerprints two ways depending on the order it was read
+// in. Which is precisely the guard failing open: a stale artifact that hashed the other way would be
+// accepted.
+//
+// FNV-1a rather than a cryptographic digest, because the question is *did these files change*, not
+// *did someone forge them*. 64 bits, rendered to a fixed width, so a key is one shape whatever the
+// hash comes out as.
+//
+// **The units mixed are UTF-16 code units**, which is what the reference compiler's own hash mixes
+// and is the only reason to say so here: the two never share a cache entry, since the compiler's
+// version is in the key, but a fingerprint that agrees with the reference's is one more thing a test
+// can hold this to against an answer nothing here produced.
+library_fingerprint(files: Buf[(string, string)]) -> string
+    var h: u64 = 0xcbf29ce484222325
+    val order = by_first(files)
+
+    for i in 0..<order.len()
+        h = fnv_text(h, order.at(i).0)
+        h = fnv_unit(h, 0)
+        h = fnv_text(h, order.at(i).1)
+        h = fnv_unit(h, 0)
+
+    hex_lower(avalanche(h), 16)
+end library_fingerprint
+
+private fnv_text(start: u64, text: string) -> u64
+    var h = start
+
+    for c in chars_of(text.bytes)
+        val cp = u32(c)
+
+        if cp <= 0xFFFF then h = fnv_unit(h, u64(cp))
+        else
+            val rest = cp - 0x10000
+
+            h = fnv_unit(h, u64(0xD800 + (rest >> 10)))
+            h = fnv_unit(h, u64(0xDC00 + (rest & 0x3FF)))
+
+    h
+end fnv_text
+
+private fnv_unit(h: u64, unit: u64) -> u64 = (h ^ unit) * 0x100000001b3
+
+// The `fmix64` finalizer, which is what makes a small edit change the whole fingerprint rather than a
+// corner of it. FNV-1a's own diffusion is uneven -- its multiply carries a change upward but never
+// back down -- and this is MurmurHash3's finalizer as written there, both rounds.
+private avalanche(h: u64) -> u64
+    var x = h
+
+    x = x ^ (x >> 33)
+    x = x * 0xff51afd7ed558ccd
+    x = x ^ (x >> 33)
+    x = x * 0xc4ceb9fe1a85ec53
+    x = x ^ (x >> 33)
+    x
+end avalanche
+
+private by_first(files: Buf[(string, string)]) -> Buf[(string, string)]
+    var out = files
+
+    for i in 1..<out.len()
+        var j = i
+
+        while j > 0 && out.at(j).0 < out.at(j - 1).0
+            val held = out.at(j)
+
+            out.set(j, out.at(j - 1))
+            out.set(j - 1, held)
+            j -= 1
+
+    out
+end by_first
+
+// --- where an artifact lives ----------------------------------------------------------
+
+// The user's cache directory, or nothing on a machine that has none -- which is a real state for a
+// build container and is why the fallback below exists rather than a failure.
+cache_directory() -> Option[string]
+#if macos
+    env_var("HOME") match
+        Some(home) -> Some(s"$home/Library/Caches")
+        None -> None
+#else
+    env_var("XDG_CACHE_HOME") match
+        Some(dir) -> Some(dir)
+        None -> env_var("HOME") match
+            Some(home) -> Some(s"$home/.cache")
+            None -> None
+#endif
+end cache_directory
+
+// Where the standard module's artifact is kept.
+//
+// **The key names both the library and the compiler, because the artifact is a function of both.**
+// The fingerprint is over the library's file contents and their places, so a build with an edited
+// library gets a different path rather than a stale hit. That half alone is not enough, and the way
+// it is not enough is quiet: an artifact is *compiled* code, so a release that changes what the
+// library lowers to while touching none of its source produces different bytes at an identical
+// fingerprint, and the upgrade would read back the artifact its predecessor built.
+//
+// **The key names the TARGET too**, because an artifact is object code for one machine and a tree
+// parsed as that machine sees it -- and the ALLOCATOR, because the object half calls the pair by
+// name. Leaving either out is not a wrong answer but a rebuild-and-overwrite loop: each build
+// refuses the other's artifact and replaces it.
+//
+// Nothing here is ever evicted. Every distinct library leaves an artifact behind, which is what a
+// cache directory is for -- everything under it is derived, so removing the lot costs a rebuild.
+std_artifact_path(t: Target, fingerprint: string) -> string = cache_directory() match
+    Some(dir) -> s"$dir/sysl/${Version}-$fingerprint-${t.name}-${malloc_symbol()}-${free_symbol()}" +
+        s"/std$SyslibExtension"
+    None -> std_artifact_local()
+
+// The project-local artifact path, which is where a machine with no cache directory keeps one. It is
+// **not** keyed by target, because it is one file in one project rather than a cache with room for
+// entries.
+std_artifact_local() -> string = s".sysl/std$SyslibExtension"
+
+// Whether a path names an artifact rather than a source tree.
+is_artifact(path: string) -> bool = path.ends_with(SyslibExtension)
+
+// --- the metadata ---------------------------------------------------------------------
+
+// The metadata blob: the machine it was built for, the pair it allocates through, the source
+// fingerprint, how many symbols the object half defines, and those symbols.
+syslib_metadata(t: Target, fingerprint: string, symbols: Buf[string]) -> string
+    var b = str_builder()
+
+    b.push(t.name)
+    b.push("\n")
+    b.push(allocator_pair())
+    b.push("\n")
+    b.push(fingerprint)
+    b.push("\n")
+    b.push(s"${symbols.len()}")
+    b.push("\n")
+
+    for i in 0..<symbols.len()
+        b.push(symbols.at(i))
+        b.push("\n")
+
+    b.finish()
+end syslib_metadata
+
+// The metadata framed for burial in an object file: the marker, the format version and the payload's
+// length in bytes, then the payload.
+//
+// The length is in **bytes** and not characters, and this is the whole reason the frame exists: the
+// reader has an object file's worth of unrelated bytes on either side of it, and counting characters
+// would end the metadata somewhere inside the text.
+syslib_frame(meta: string) -> Buf[u8] =
+    syslib_framed(s"$SyslibMagic $SyslibVersion ${meta.bytes.len}", meta)
+
+// A frame built from a header given whole, which is how a test reaches the ones `syslib_frame` will
+// not produce -- a length that overruns, a version from another compiler, a header that is not one.
+syslib_framed(header: string, body: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    val opening = syslib_marker() + header
+
+    for i in 0..<opening.bytes.len
+        out.push(opening.bytes[i])
+
+    out.push(0)
+
+    for i in 0..<body.bytes.len
+        out.push(body.bytes[i])
+
+    out
+end syslib_framed
+
+// The IR for an object file whose only content is the framed metadata.
+//
+// Going through clang is what makes this one piece of code rather than a Mach-O writer, an ELF
+// writer and a COFF writer -- the compiler already requires a clang that can lower for the target,
+// and lowering a constant array into a named section is the least it can be asked to do.
+//
+// `private` is load-bearing twice over. It exports no symbol, so the linker never has a reason to
+// pull this member out of the archive; and a symbol here would be one every artifact defined, which
+// is a duplicate the moment two of them are linked into one program. `llvm.compiler.used` is what
+// keeps a global nothing refers to from being optimized away without putting a symbol back: it is
+// dropped before the object is written, so it holds the constant through the optimizer and leaves
+// nothing behind for the linker to see.
+syslib_metadata_ir(meta: string, t: Target) -> string
+    val blob = syslib_frame(meta)
+    var b = str_builder()
+
+    b.push(s"@sysl.metadata = private constant [${blob.len()} x i8] c\"")
+
+    for i in 0..<blob.len()
+        b.push(s"\\${hex_lower(u64(blob.at(i)), 2)}")
+
+    b.push(s"\", section \"${syslib_section(t)}\"\n")
+    b.push("@llvm.compiler.used = appending global [1 x ptr] [ptr @sysl.metadata], " +
+        "section \"llvm.metadata\"\n")
+    b.finish()
+end syslib_metadata_ir
+
+// Where the metadata sits in the object that carries it. Mach-O names a section by its segment as
+// well, and the others do not; nothing reads it back by name, so this only has to be a section name
+// the assembler for the target accepts and nothing else claims.
+private syslib_section(t: Target) -> string =
+    if t.os == MacOS then "__DATA,__sysl_meta" else ".sysl_meta"
+
+// The metadata read back out of an artifact, or why the file is not one of ours.
+//
+// **The member we named is looked at first, and every member after it.** Each half of that earns its
+// place. Preferring the name is what stops the marker being found somewhere it was never put: the
+// compiled half holds the library's own string literals, and a library whose source spelled the
+// marker out would otherwise have its metadata read out of the middle of its own text. Falling back
+// to a scan is what survives an archiver that recorded the name differently than we wrote it.
+syslib_metadata_of(name: string, archive: []const u8) -> Result[string, string]
+    val members = ar_members(archive) match
+        Err(why) -> return Err(s"$name is not a sysl library: $why")
+        Ok(found) -> found
+
+    var order: Buf[usize] = buf()
+
+    for i in 0..<members.len()
+        if members.at(i).name == SyslibMetadataMember then order.push(i)
+
+    for i in 0..<members.len()
+        if members.at(i).name != SyslibMetadataMember then order.push(i)
+
+    var marker: Buf[u8] = buf()
+    val text = syslib_marker()
+
+    for i in 0..<text.bytes.len
+        marker.push(text.bytes[i])
+
+    for i in 0..<order.len()
+        val body = members.at(order.at(i)).body
+
+        ar_index_of(body, marker) match
+            None -> ()
+            Some(at) -> return syslib_unframe(name, body, at + marker.len())
+
+    Err(s"$name is not a sysl library: it carries no metadata")
+end syslib_metadata_of
+
+// The framed payload, checked and decoded.
+private syslib_unframe(name: string, framed: Buf[u8], from: usize) -> Result[string, string]
+    var end = from
+
+    while end < framed.len() && framed.at(end) != 0
+        end += 1
+
+    if end >= framed.len()
+        return Err(s"$name is not a readable sysl library: its metadata header is damaged")
+
+    val header = bytes_text(framed, from, end)
+    val parts = header_words(header)
+
+    if parts.len() != 3 || parts.at(0) != SyslibMagic
+        return Err(s"$name is not a readable sysl library: its metadata header is damaged")
+
+    val version = whole_number(parts.at(1))
+    val length = whole_number(parts.at(2))
+
+    if version.is_none() || length.is_none()
+        return Err(s"$name is not a readable sysl library: its metadata header is damaged")
+
+    if version.unwrap() != SyslibVersion
+        return Err(s"$name was built by a different sysl (library format ${version.unwrap()}, " +
+            s"this one reads $SyslibVersion) -- rebuild it with 'sysl build-lib'")
+
+    if end + 1 + length.unwrap() > framed.len() then return Err(s"$name is a truncated sysl library")
+
+    Ok(bytes_text(framed, end + 1, end + 1 + length.unwrap()))
+end syslib_unframe
+
+private bytes_text(bytes: Buf[u8], from: usize, to: usize) -> string
+    var out: Buf[u8] = buf()
+    var i = from
+
+    while i < to
+        out.push(bytes.at(i))
+        i += 1
+
+    from_utf8_unchecked(out.view())
+end bytes_text
+
+// An allocating pair as a diagnostic names it, which is the two symbols with a slash between them.
+private spelled_pair(pair: string) -> string
+    val words = header_words(pair)
+
+    if words.len() != 2 then return pair
+
+    s"${words.at(0)} / ${words.at(1)}"
+end spelled_pair
+
+// A header split at its spaces, which is all the structure the three words of one have.
+private header_words(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var from: usize = 0
+
+    for i in 0..<text.bytes.len
+        if text.bytes[i] == u8(' ')
+            if i > from then out.push(text[from..<i])
+
+            from = i + 1
+
+    if from < text.bytes.len then out.push(text[from..<text.bytes.len])
+
+    out
+end header_words
+
+private whole_number(text: string) -> Option[usize]
+    if text.bytes.len == 0 then return None
+
+    var out: usize = 0
+
+    for i in 0..<text.bytes.len
+        if text.bytes[i] < u8('0') || text.bytes[i] > u8('9') then return None
+
+        out = out * 10 + usize(text.bytes[i] - u8('0'))
+
+    Some(out)
+end whole_number
+
+// What an artifact's metadata says, held to the two facts that make it this compilation's: the
+// machine it was built for and the pair it allocates through.
+//
+// **An artifact built for another machine is refused here**, and refused rather than handed back for
+// the caller to check, because every caller wants the same rule. **One built for another allocator
+// is refused for a sharper reason than the target**: a mismatched target is refused by the linker
+// eventually, and a mismatched allocator is refused by nothing at all -- both pairs resolve, the
+// link succeeds, and the program hands one heap's storage back to another.
+//
+// The fingerprint is handed back rather than checked, because only the caller knows what it should
+// be.
+syslib_read(name: string, meta: string, t: Target) -> Result[(Buf[string], string), string]
+    val lines = split_lines(meta)
+
+    if lines.len() < 4
+        return Err(s"$name is not a readable sysl library: its metadata header is missing")
+
+    val built = lines.at(0)
+    val pair = lines.at(1)
+    val fingerprint = lines.at(2)
+    val count = whole_number(lines.at(3))
+
+    if count.is_none() || fingerprint == ""
+        return Err(s"$name is not a readable sysl library: its metadata header is missing")
+
+    if built != t.name
+        return Err(s"$name was built for $built and this is a build for ${t.name} -- " +
+            s"rebuild it with --target ${t.name}")
+
+    if pair != allocator_pair()
+        return Err(s"$name allocates through ${spelled_pair(pair)} and this program allocates " +
+            s"through ${spelled_pair(allocator_pair())} -- a program has one heap, so a library " +
+            "compiled against another cannot be linked into it. Rebuild the library against this one")
+
+    var symbols: Buf[string] = buf()
+    var i: usize = 4
+
+    while i < lines.len() && symbols.len() < count.unwrap()
+        symbols.push(lines.at(i))
+        i += 1
+
+    if symbols.len() < count.unwrap() then return Err(s"$name is a truncated sysl library")
+
+    Ok((symbols, fingerprint))
+end syslib_read
+
+private split_lines(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var from: usize = 0
+
+    for i in 0..<text.bytes.len
+        if text.bytes[i] == u8('\n')
+            out.push(text[from..<i])
+            from = i + 1
+
+    if from < text.bytes.len then out.push(text[from..<text.bytes.len])
+
+    out
+end split_lines
+
+// The whole artifact's metadata, read off disk.
+syslib_metadata_at(path: string) -> Result[string, string]
+    val bytes = read_bytes(path) match
+        Err(_) -> return Err(s"cannot read $path")
+        Ok(b) -> b
+
+    syslib_metadata_of(path, bytes)
+end syslib_metadata_at

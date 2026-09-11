@@ -192,7 +192,16 @@ emit_llvm_text(path: string, named_target: Option[string]) -> Result[Emitted, Re
     // it safe to leave one beside the code it tests. Pruning is then the last thing that happens to
     // the tree and the only thing between the checks and the lowering.
     val kept = prune(strip_tests(whole), program.own)
-    val lowered = codegen_with_gaps(kept, t, promotions)
+
+    // **What the library already compiled**, so this module declares those rather than defining them
+    // a second time; their bodies arrive from the artifact at link time. It is asked after the
+    // pruning and not before: a library function this program never calls is dropped exactly as it
+    // was, and what `precompiled` changes is only what happens to the ones it does call.
+    val linked = std_artifact(t) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(found) -> found
+
+    val lowered = codegen_with_gaps(kept with { precompiled = linked.precompiled }, t, promotions)
 
     // Read back out of the analysis rather than off the snapshot the body pass answered with: the
     // checks above have just added to it.
@@ -307,7 +316,20 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
 
     val objects = native_objects(clang, path, exe, t, level)?
 
-    build_native(clang, emitted.text, objects, exe, t, level) match
+    // **The standard module is linked rather than compiled**, which is `precompiled` seen from the
+    // other end: the text above declares the library's determined half, and the archive is where
+    // those bodies -- and the library's own C, compiled when the artifact was -- come from. A
+    // `.syslib` **is** an archive, so it goes on the link line as it stands and the linker takes only
+    // the members that resolve something.
+    var link_with = objects
+
+    std_artifact(t) match
+        Err(why) ->
+            discard_objects(objects)
+            return Err(Refusal(why))
+        Ok(found) -> link_with.push(found.archive)
+
+    build_native(clang, emitted.text, link_with, exe, t, level) match
         Err(why) ->
             discard_objects(objects)
             return Err(Refusal(why))
@@ -332,19 +354,15 @@ private default_executable(path: string) -> string
     s"./${name[0..<at]}"
 end default_executable
 
-// Every `.c` the library and the program carry, compiled for this machine.
+// Every `.c` the program's own tree carries, compiled for this machine.
 //
-// **The library's is here because this compiler defines what the reference declares.** A build the
-// reference drives links an artifact whose C was compiled when the artifact was, so its driver has
-// none of this to do for the standard module; here the library's definitions are in the module being
-// linked and the C they call is a file on disk.
+// **The library's is not here, because the artifact carries it already compiled.** Each of a
+// library's C files is a member of its `.syslib`, put there when the artifact was built, so the
+// linker pulls one in the way it pulls anything else in: because something left its symbol
+// undefined.
 private native_objects(clang: string, path: string, exe: string, t: Target,
                        level: string) -> Result[Buf[string], Refusal]
     var trees: Buf[string] = buf()
-
-    std_root() match
-        Err(why) -> return Err(Refusal(why))
-        Ok(dir) -> trees.push(dir)
 
     if is_directory(path) then trees.push(path)
 

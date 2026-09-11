@@ -253,6 +253,101 @@ compile_c(cc: string, src: string, obj: string, target: Target,
     told(cc, args, s"$cc failed on $src")
 end compile_c
 
+// One module's LLVM text assembled into a relocatable object, which is what a library artifact's
+// halves are made of.
+//
+// `-x ir` is what makes clang read the text as LLVM rather than guess from an extension, so the
+// caller may name the temporary whatever suits it. The sectioning flags are `compile_c`'s and are
+// here for the same reason: a library is linked by programs that reach a fraction of it.
+compile_object(cc: string, ir: string, obj: string, target: Target,
+               level: string) -> Result[unit, string]
+    val ll = s"$obj.ll"
+
+    write_text(ll, ir) match
+        Err(_) -> return Err(s"cannot write $ll")
+        Ok(_) -> ()
+
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${target.triple}")
+    args.push("-Wno-override-module")
+    args.push("-c")
+    args.push("-x")
+    args.push("ir")
+    args.push(level_flag(level))
+    args.push("-ffunction-sections")
+    args.push("-fdata-sections")
+    args.push(ll)
+    args.push("-o")
+    args.push(obj)
+
+    val said = told(cc, args, s"$cc failed on $obj")
+
+    // **The text is left behind where clang refused it**, and only there. A back end that rejects
+    // generated IR is reporting a defect in the generator, and the one thing that diagnosis needs is
+    // the module the line numbers are counted in -- which a compiler that tidied it away has just
+    // thrown out.
+    if said.is_ok() then remove_file(ll)
+
+    said
+end compile_object
+
+// Where an archiver is looked for, in the order tried. The same list `clang_candidates` is and for
+// the same reason: Homebrew keeps its LLVM off the PATH so as not to shadow the system clang, so on
+// a Mac the capable archiver is commonly installed, working, and invisible to `which`.
+private ar_candidates() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("llvm-ar")
+    out.push("/opt/homebrew/opt/llvm/bin/llvm-ar")
+    out.push("/usr/local/opt/llvm/bin/llvm-ar")
+    out
+end ar_candidates
+
+// The archiver to use, or why there is none.
+//
+// A named one is **not** searched past and not fallen back from: someone who wrote down which
+// archiver to use is owed an error when it is not there, rather than a library quietly built with a
+// different one.
+//
+// **The platform's own `ar` is not a substitute**, which is why it is not in the list: it indexes
+// only its own object format, and drops the members of a library built for another machine without
+// failing -- so a cross-built artifact would archive, link, and be missing whatever the index never
+// named.
+find_ar(named: Option[string]) -> Result[string, string]
+    named match
+        Some(path) ->
+            if clang_runs(path) then return Ok(path)
+
+            return Err(s"cannot run '$path' -- --ar names the llvm-ar to build libraries with")
+        None -> ()
+
+    val tried = ar_candidates()
+
+    for i in 0..<tried.len()
+        if clang_runs(tried.at(i)) then return Ok(tried.at(i))
+
+    Err("cannot find llvm-ar, which building a library needs -- install LLVM, or name one with " +
+        "--ar. The platform's own 'ar' is not a substitute: it indexes only its own object format, " +
+        "and drops the members of a library built for another machine without failing")
+end find_ar
+
+// The members gathered into one archive, with the index a linker reads written beside them.
+//
+// The archive is **created** rather than added to: `ar r` replaces by name and leaves whatever was
+// already in the file, so building over a stale artifact would ship the members of two libraries.
+archive(archiver: string, members: Buf[string], out: string) -> Result[unit, string]
+    var args: Buf[string] = buf()
+
+    args.push("rcs")
+    args.push(out)
+
+    for i in 0..<members.len()
+        args.push(members.at(i))
+
+    told(archiver, args, s"$archiver failed on $out")
+end archive
+
 // Links a module's LLVM text, and whatever objects a tree carried, into a native executable.
 //
 // The triple goes on the command line as well as in the module because the two answer different

@@ -71,8 +71,21 @@ gen_cond(e: *Emit, terms: Buf[TCondTerm], success_l: string, fail_l: string)
         terms.at(i) match
             TCondTest(c) ->
                 val next_l = if last then success_l else fresh_label(e, "cond.and")
+
+                // **A term of its own is a region of its own, and both kinds of region are.** A
+                // term after the first is reached only where the chain got that far, while a
+                // release registered with the enclosing scope is emitted on every path out of it --
+                // so a temporary a later term takes would be let go of on an edge that never made
+                // it, which the back end refuses outright as a value that does not dominate its
+                // use. Closing both here puts every release on the edges the value it names
+                // actually reaches, and it is also what a term that materializes storage needs.
+                push_temps(e)
+                push_owned(e)
+
                 val v = gen_expr(e, c)
 
+                pop_owned(e)
+                pop_temps(e)
                 emit_term(e, InCondBr(v, next_l, fail_l))
                 emit_label(e, next_l)
             TCondIs(_, _, _) ->

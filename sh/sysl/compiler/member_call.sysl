@@ -319,7 +319,8 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Typ
     val params = sig.unwrap().params
     var ts: Buf[TExpr] = buf()
 
-    ts.push(build_receiver(cx, span, m.recv_mode().unwrap(), receiver, written))
+    ts.push(as_read_only(build_receiver(cx, span, m.recv_mode().unwrap(), receiver, written),
+                         if params.is_empty() then Unknown else params.at(0).1))
 
     for i in 0..<slots.unwrap().len()
         val want = if i + 1 < params.len() then params.at(i + 1).1 else Unknown
@@ -378,7 +379,8 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
 
     var ts: Buf[TExpr] = buf()
 
-    ts.push(build_receiver(cx, span, m.recv_mode().unwrap(), receiver, written))
+    ts.push(as_read_only(build_receiver(cx, span, m.recv_mode().unwrap(), receiver, written),
+                         if params.is_empty() then Unknown else params.at(0).1))
 
     for i in 0..<slots.unwrap().len()
         val want = if i + 1 < params.len() then params.at(i + 1).1 else Unknown
@@ -466,6 +468,27 @@ bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
 end bind_member_args
 
 // The receiver as the member's `self` asked for it: a copy, an address, or a counted reference.
+// The receiver **in the type the member's `self` was declared at**, which for a slice is the one
+// coercion that is not a change of mode: a `[]T` reaching a member of `[]const T` views its elements
+// read-only, exactly as an argument in that position does.
+//
+// It is here rather than left to the caller because the receiver is not among the arguments a call
+// writes, so nothing else looks at it -- and the two spellings lower identically, which is what kept
+// this invisible until a typed tree was diffed.
+private as_read_only(tr: TExpr, want: Type) -> TExpr
+    want match
+        Slice(welem, want_ro) ->
+            if !want_ro then return tr
+
+            texpr_type(tr) match
+                Slice(gelem, got_ro) ->
+                    if got_ro || !type_eq(*gelem, *welem) then return tr
+
+                    TExpr(tr.span, TConstView(tr))
+                _ -> tr
+        _ -> tr
+end as_read_only
+
 build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
                        member: string) -> TExpr = mode match
     ByValue -> texpr_type(tr) match

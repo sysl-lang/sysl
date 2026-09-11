@@ -1,0 +1,293 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, read_text, remove_file, rename}
+import sysl.text.{from_utf8_unchecked, Search}
+
+// The standard module's artifact: where it is, how it is built when it is not there, and what a
+// compilation reads out of it.
+//
+// **A program is compiled against the library's source and links its compiled half**, which is the
+// arrangement `precompiled` names. Every function the artifact's object half defines is one this
+// program declares rather than emits, so the printing surface is compiled once on this machine
+// instead of once per program -- and two programs that both print hold one copy between them.
+//
+// The artifact is a *derived* file: it is object code for one machine, it is not committed, and
+// every byte of it is computed from library source the compiler can already read. So the states it
+// can be found in -- absent on a cold cache, stale after a change to the container -- are not
+// questions to put to whoever ran the compiler. They have one answer and it is the same every time.
+// It is said on stderr rather than done invisibly: the work is a moment of someone's time and the
+// line is what makes a slow first build explicable instead of mysterious.
+
+// What one resolution came to: the symbols a program must declare rather than define, and the
+// archive the linker takes their bodies from.
+struct StdArtifact
+    precompiled: Buf[string]
+    archive: string
+end StdArtifact
+
+// **One answer is kept, keyed by the machine it was for.** A compilation asks this once and a test
+// sweep asks it for hundreds of programs in one process, so a resolution that read and parsed a
+// megabyte of archive each time would be most of what the sweep did.
+private var std_held_for: string = ""
+private var std_held: Buf[string] = buf()
+private var std_held_archive: string = ""
+private var std_held_ok: bool = false
+
+// The artifact for a machine, built at the path both ends agree on when what is there is not one.
+std_artifact(t: Target) -> Result[StdArtifact, string]
+    if std_held_ok && std_held_for == t.name then return Ok(StdArtifact(std_held, std_held_archive))
+
+    val root = std_root()?
+    val fingerprint = std_fingerprint(root, t)?
+    val path = std_artifact_path(t, fingerprint)
+
+    val symbols = match_at(path, fingerprint, t) match
+        Ok(found) -> found
+        Err(why) ->
+            eprints(s"building the standard module at $path ($why)\n")
+            write_std_artifact(root, path, fingerprint, t)?
+
+    std_held_for = t.name
+    std_held = symbols
+    std_held_archive = path
+    std_held_ok = true
+    Ok(StdArtifact(symbols, path))
+end std_artifact
+
+// What an artifact already on disk says, held to the library it was built from.
+//
+// **The fingerprint is checked here and not inside the reader**, because only a caller knows what it
+// should be: the reader is handed a file and can say whether it is one of ours and whether it is for
+// this machine, and what it cannot say is whether the source it was built from is the source in
+// front of this compilation.
+private match_at(path: string, fingerprint: string, t: Target) -> Result[Buf[string], string]
+    if !metadata(path).is_ok() then return Err(s"$path does not exist")
+
+    val meta = syslib_metadata_at(path)?
+    val answer = syslib_read(path, meta, t)?
+
+    if answer.1 != fingerprint
+        return Err(s"$path was built from other sources than the library this compiler found")
+
+    Ok(answer.0)
+end match_at
+
+// The library's fingerprint: every file it is made of -- its sysl and its C -- reduced to its place
+// in the tree and its text.
+//
+// **The C is fingerprinted with the sysl and not apart from it.** A library's shims are as much its
+// source as its modules are, and an artifact that did not change when one of them was edited is a
+// stale artifact nothing would notice was stale.
+//
+// **It is over every file, `@tests` files included**, while what the artifact holds is over the
+// shipping ones -- and the two are allowed to disagree because a fingerprint is a question about the
+// *source a library was built from*, which is what decides whether an artifact is stale. Editing a
+// library's tests correctly invalidates the artifact even though nothing in it would have changed.
+std_fingerprint(root: string, t: Target) -> Result[string, string]
+    var files: Buf[(string, string)] = buf()
+
+    val found = std_sources(root, Some(t.os))?
+
+    for i in 0..<found.len()
+        files.push((library_place(found.at(i)), from_utf8_unchecked(found.at(i).src.bytes)))
+
+    val carried = c_sources(root, Some(t.os)) match
+        Err(e) -> return Err(e.message)
+        Ok(cs) -> cs
+
+    for i in 0..<carried.len()
+        val text = read_text(carried.at(i)) match
+            Err(_) -> return Err(s"cannot read ${carried.at(i)}")
+            Ok(got) -> got
+
+        files.push((place_below(root, carried.at(i)), text))
+
+    Ok(library_fingerprint(files))
+end std_fingerprint
+
+// A sysl file's place: the module directories it sits under, then its own name. The same key
+// wherever the library was found, while its path is not.
+private library_place(found: Found) -> string
+    var out = ""
+
+    for i in 0..<found.dir.len()
+        out = out + found.dir.at(i) + "/"
+
+    out + basename(found.src.name)
+end library_place
+
+// The same key for a file named by its path: what is below the root, with the directories that
+// **select** for a machine taken out.
+//
+// A selector folder disappears from a module's name -- that is what platform selection means -- so it
+// has to disappear from a place as well, or the same file would key one way beside its module and
+// another way inside a `__macos__` beneath it.
+private place_below(root: string, path: string) -> string
+    val prefix = if root.ends_with("/") then root else root + "/"
+    val rest = if path.starts_with(prefix) then path[prefix.bytes.len..<path.bytes.len] else path
+
+    var out = ""
+    var from: usize = 0
+
+    for i in 0..<rest.bytes.len
+        if rest.bytes[i] == u8('/')
+            val part = rest[from..<i]
+
+            if !selects_a_machine(part) then out = out + part + "/"
+
+            from = i + 1
+
+    out + rest[from..<rest.bytes.len]
+end place_below
+
+private selects_a_machine(part: string) -> bool =
+    part.bytes.len > 4 && part.starts_with("__") && part.ends_with("__")
+
+// The artifact built: the library's object half, the metadata beside it, and one member for each C
+// file the library carries.
+//
+// **Each C file is its own member**, so the linker pulls a shim in the way it pulls anything else in:
+// because something left its symbol undefined. Archiving them here is what lets a program stop
+// compiling the library's C for itself -- the artifact carries it already compiled.
+//
+// The pending name is the staging directory's own, which the system has already made unique: two
+// builds racing for one artifact must not agree on a pending name either, or one of them would
+// publish the other's half-written archive.
+private write_std_artifact(root: string, out: string, fingerprint: string,
+                           t: Target) -> Result[Buf[string], string]
+    if !t.builds_with_clang() then return Err(t.no_toolchain())
+
+    val units = std_units(root, t)?
+    val built = library_build(units, modules_of(units), t)
+
+    if !built.report.is_empty()
+        return Err(s"the standard module does not analyze: ${first_message(built.report)}")
+
+    val clang = find_clang(t, None)?
+    val archiver = find_ar(None)?
+    val staging = make_temp_dir("sysl-std-") match
+        Err(_) -> return Err("cannot make a directory to build the standard module in")
+        Ok(dir) -> dir
+
+    val first = codegen_with_gaps(built.program, t, built.promotions)
+    val lowered = codegen_with_gaps(library_deferring_gaps(built.program, first.1), t,
+                                    built.promotions)
+    val defined = advertised(built.determined, lowered.0)
+
+    // **An artifact that would not assemble is refused here rather than by the back end**, which
+    // reports it in the lines of generated text and says nothing about which library function is
+    // missing. A symbol the compiled half names and neither defines nor declares is a defect in the
+    // split above, and the sentence a reader needs is the name.
+    val loose = undefined_calls(ir_print_module(lowered.0))
+
+    if !loose.is_empty()
+        return Err(s"the standard module's compiled half would name ${loose.len()} symbol(s) it " +
+            s"neither defines nor declares, the first of them '${loose.at(0)}'")
+
+    val meta = syslib_metadata(t, fingerprint, defined)
+
+    var members: Buf[string] = buf()
+
+    val made = build_members(clang, archiver, staging, root, out, ir_print_module(lowered.0),
+                             syslib_metadata_ir(meta, t), &members, t)
+
+    discard_members(members)
+
+    made match
+        Err(why) -> return Err(why)
+        Ok(_) -> ()
+
+    Ok(defined)
+end write_std_artifact
+
+// The steps that make the file, kept apart from the call above so that the staging members are
+// discarded whichever of them failed.
+private build_members(clang: string, archiver: string, staging: string, root: string, out: string,
+                      ir: string, meta_ir: string, members: *Buf[string],
+                      t: Target) -> Result[unit, string]
+    val code = s"$staging/$SyslibCodeMember"
+    val smeta = s"$staging/$SyslibMetadataMember"
+
+    compile_object(clang, ir, code, t, DefaultOptimization)?
+    members.push(code)
+    compile_object(clang, meta_ir, smeta, t, DefaultOptimization)?
+    members.push(smeta)
+
+    val carried = c_sources(root, Some(t.os)) match
+        Err(e) -> return Err(e.message)
+        Ok(cs) -> cs
+
+    for i in 0..<carried.len()
+        val obj = s"$staging/${native_member(root, carried.at(i))}"
+
+        compile_c(clang, carried.at(i), obj, t, DefaultOptimization)?
+        members.push(obj)
+
+    val pending = s"$out.${basename(staging)}"
+
+    make_dir_all(parent_of(out).unwrap_or("."))
+    archive(archiver, *members, pending)?
+
+    rename(pending, out) match
+        Err(_) -> Err(s"cannot put the standard module's artifact at $out")
+        Ok(_) -> Ok(())
+end build_members
+
+// What one of a library's C files is called inside the archive.
+//
+// Named after the path it was found at, with the directories kept, because a member name has to be
+// unique across the whole library and a basename is not: two modules may each hold a `util.c`, and
+// `ar r` **replaces by name**, so the second would silently evict the first and the library would
+// ship missing whatever only the first defined.
+native_member(root: string, path: string) -> string
+    val place = place_below(root, path)
+    var out = ""
+
+    for i in 0..<place.bytes.len
+        out = out + (if place.bytes[i] == u8('/') then "." else place[i..<(i + 1)])
+
+    if out.ends_with(".c") then out[0..<(out.bytes.len - 2)] + ".o" else out + ".o"
+end native_member
+
+// What the artifact actually advertises: the split's answer, less anything the lowering could not
+// write a definition for.
+//
+// **An advertised symbol the object half does not define is worse than an absent one.** A program
+// told the artifact holds it declares it and never emits it, and the link fails naming a symbol
+// nothing in the program mentions. What is left out here is compiled by the program instead, which
+// is what it does with a generic.
+private advertised(determined: Buf[string], m: IrModule) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<determined.len()
+        if defines(m, llvm_safe(determined.at(i))) then out.push(determined.at(i))
+
+    out
+end advertised
+
+private defines(m: IrModule, symbol: string) -> bool
+    for i in 0..<m.funcs.len()
+        if m.funcs.at(i).sig.name == symbol then return true
+
+    false
+end defines
+
+private modules_of(units: Buf[Program]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<units.len()
+        val name = module_written(units.at(i))
+
+        if !holds_string(out, name) then out.push(name)
+
+    out
+end modules_of
+
+private first_message(report: Buf[Placed]) -> string =
+    if report.is_empty() then "" else report.at(0).render()
+
+private discard_members(members: Buf[string])
+    for i in 0..<members.len()
+        remove_file(members.at(i))
+end discard_members
