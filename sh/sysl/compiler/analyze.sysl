@@ -56,7 +56,7 @@ read_decls(a: &Analysis, written: Buf[Program]) -> Buf[Program]
     var scopes: Buf[Scope] = buf()
 
     for i in 0..<units.len()
-        scopes.push(scope_of_unit(units.at(i)))
+        scopes.push(scope_of_unit(a, units.at(i)))
 
     // Every declaration exists now, so what an `import` claimed a module declares can be looked up.
     for i in 0..<units.len()
@@ -105,7 +105,11 @@ private check_imports(a: &Analysis, scope: Scope, body: Buf[Stmt])
             _ -> ()
 
 private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
-    val path = joined(d.path, ".")
+    // What was written is what a diagnostic quotes; what it *names* is that read through the
+    // package layer, so a file of a fetched package writes its own short names and a consumer
+    // writes the name its manifest gave the package.
+    val written = joined(d.path, ".")
+    val path = in_package(a, scope.pkg, written)
 
     if !a.tables.has_module(path) then
         // A path with no braces after it may name one declaration rather than a module, which is
@@ -119,7 +123,7 @@ private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
             return
         end if
 
-        a.fault(scope, span, s"no module is called '$path'")
+        a.fault(scope, span, s"no module is called '$written'")
         return
 
     // **An import IS a dependency**, whether or not anything below it names what was brought in: a
@@ -132,7 +136,8 @@ private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
         val key = module_qualify(path, s.name)
 
         if !declares(a, key) then
-            a.fault(scope, s.span, s"'$path' declares no '${s.name}' — there is no '$path.${s.name}'")
+            a.fault(scope, s.span,
+                    s"'$written' declares no '${s.name}' — there is no '$written.${s.name}'")
 
 // The entries a table took on since a mark, taken back out.
 rewind_registered(into: &Table[Type], mark: usize)
@@ -370,7 +375,7 @@ private scope_of_key(a: &Analysis, key: string) -> Scope
 
     if f.is_some() then return f.unwrap().scope
 
-    Scope(module_of(key), no_imports(), source_of("", ""))
+    Scope(module_of(key), no_imports(), source_of("", ""), no_packaging())
 end scope_of_key
 
 private resolve_value_types(a: &Analysis, from: &Table[ValueDecl])
@@ -612,7 +617,7 @@ resolve_written(text: string, written: string) -> (Type, Buf[string])
 
         return (Unknown, messages)
 
-    val answer = resolve_type(a, scope_of_unit(parsed.program), t.value, no_bindings())
+    val answer = resolve_type(a, scope_of_unit(a, parsed.program), t.value, no_bindings())
     val ds = a.diagnostics()
 
     for i in 0..<ds.len()

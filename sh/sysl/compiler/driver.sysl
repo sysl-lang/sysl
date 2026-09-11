@@ -37,7 +37,21 @@ struct Refusal
 end Refusal
 
 // Everything one invocation reads, given the path the command line named and the machine it is for.
-compilation_of(path: string, t: Target) -> Result[Compilation, Refusal]
+//
+// **A dependency's modules keep the names they were written with here**, which is what `emit-typed`
+// and `sysl prove` read: both stop at the typed tree, and what they are for is comparing what a
+// module *means* rather than what it links against. The canonical prefix is what `emit-llvm` and a
+// build read, and `packaged_compilation_of` is that.
+compilation_of(path: string, t: Target) -> Result[Compilation, Refusal] =
+    assembled(path, t, false)
+
+// The same, with each fetched package's modules under the canonical prefix its coordinate gives
+// them -- which is what makes two consumers naming one package differently link one copy of it, and
+// is therefore what everything that emits a symbol reads.
+packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Refusal] =
+    assembled(path, t, true)
+
+private assembled(path: string, t: Target, packaged: bool) -> Result[Compilation, Refusal]
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
     val manifest = manifest_at(root)?
 
@@ -73,10 +87,17 @@ compilation_of(path: string, t: Target) -> Result[Compilation, Refusal]
         units.push(std.at(i))
 
     // Then the packages, each read off disk from where a fetch would have put it.
-    val fetched = package_units(root, manifest, t)?
+    val fetched = package_units(root, manifest, t, packaged)?
 
     for i in 0..<fetched.len()
         units.push(fetched.at(i))
+
+    // What the project's own files mean by the paths at the head of their import lines. The project
+    // itself has no prefix -- its modules keep the names they were written with -- and what it has
+    // instead is the table its manifest's `dependencies` block built.
+    var mine_pkg = no_packaging()
+
+    if packaged then mine_pkg = Packaging("", package_mounts(root, manifest))
 
     var own: Buf[string] = buf()
 
@@ -90,11 +111,14 @@ compilation_of(path: string, t: Target) -> Result[Compilation, Refusal]
         if !parsed.ok()
             return Err(Refusal(s"${mine.at(i).src.name}:${parsed.at()}: ${parsed.first().message}"))
 
-        units.push(parsed.program)
-        own.push(module_written(parsed.program))
+        var unit = parsed.program
+
+        unit.pkg = mine_pkg
+        units.push(unit)
+        own.push(module_written(unit))
 
     Ok(Compilation(units, own, t))
-end compilation_of
+end assembled
 
 // The module a file contributes to: what its header says, or the anonymous root module where it
 // declares none.
@@ -177,7 +201,7 @@ end emit_typed_text
 // are empty, which is what makes the comparison one of a section rather than of a whole.
 emit_llvm_text(path: string, named_target: Option[string]) -> Result[Emitted, Refusal]
     val t = target_for(path, named_target)?
-    val program = compilation_of(path, t)?
+    val program = packaged_compilation_of(path, t)?
     val done = analyze_bodies(program.units, program.target)
 
     // Everything a program is held to on the way to being lowered runs on the **unpruned** tree: a

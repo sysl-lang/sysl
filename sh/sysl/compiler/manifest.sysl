@@ -183,7 +183,8 @@ package_directory(cache: string, coordinate: string, version: string) -> string 
 // **Nothing here reaches the network.** A dependency that is not on this machine is a refusal that
 // names the command which would bring it down, rather than a fetch nobody asked for -- the same
 // ruling `build-lib` makes for the same reason.
-package_units(root: string, m: Manifest, t: Target) -> Result[Buf[Program], Refusal]
+package_units(root: string, m: Manifest, t: Target,
+              packaged: bool) -> Result[Buf[Program], Refusal]
     var out: Buf[Program] = buf()
 
     if m.dependencies.is_empty() then return Ok(out)
@@ -207,6 +208,15 @@ package_units(root: string, m: Manifest, t: Target) -> Result[Buf[Program], Refu
         if found.is_empty()
             return Err(Refusal(s"'${dep.git}' holds no sysl source files"))
 
+        // **The package's own terms, not the consumer's.** Its modules sit under the prefix its
+        // coordinate gives them, and the paths its own files write at the head of an import line
+        // mean whatever *its* manifest bound -- which is what makes a package's source read the
+        // same whoever depends on it.
+        var theirs = no_packaging()
+
+        if packaged then theirs = Packaging(canonical_prefix(dep.git),
+                                            package_mounts(dir, manifest_at(dir)?))
+
         for j in 0..<found.len()
             val parsed = parse(found.at(j).src, t)
 
@@ -214,10 +224,44 @@ package_units(root: string, m: Manifest, t: Target) -> Result[Buf[Program], Refu
                 return Err(Refusal(s"${found.at(j).src.name}:${parsed.at()}: " +
                     s"${parsed.first().message}"))
 
-            out.push(parsed.program)
+            var unit = parsed.program
+
+            unit.pkg = theirs
+            out.push(unit)
 
     Ok(out)
 end package_units
+
+// What each name this project writes at the head of an import line means: the module path a
+// dependency offers, and the canonical name it stands for.
+//
+// **`package.name` is deliberately not consulted.** It names the *package*, which is a unit of
+// distribution, and what an import line writes is a *module*, which is a unit of code -- sqlite3's
+// package is called `sqlite3` and its module is `sqlite`, and a consumer reaching for the second
+// should not have to say the first.
+//
+// A dependency that is not on this machine offers nothing rather than refusing: whatever needed its
+// *source* has already said so, and a table with a hole in it produces a diagnostic at the import
+// that names the path the reader wrote.
+package_mounts(root: string, m: Manifest) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    if m.dependencies.is_empty() then return out
+
+    val cache = package_cache_root(root) match
+        Err(_) -> return out
+        Ok(dir) -> dir
+
+    for i in 0..<m.dependencies.len()
+        val dep = m.dependencies.at(i)
+        val prefix = canonical_prefix(dep.git)
+        val offered = package_modules(package_directory(cache, dep.git, dep.version))
+
+        for j in 0..<offered.len()
+            out.push((offered.at(j), package_qualify(prefix, offered.at(j))))
+
+    out
+end package_mounts
 
 // The directory each of this project's packages was fetched into.
 //

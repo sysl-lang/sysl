@@ -1,0 +1,271 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// A fetched package's canonical prefix, and what a written module path means under it.
+
+private pkg_library_here() -> bool = std_root().is_ok()
+
+// A tree of empty sysl files at the paths named, under a directory of its own.
+private pkg_tree(files: Buf[string]) -> string
+    val root = make_temp_dir("sysl-pkg").unwrap()
+
+    for i in 0..<files.len()
+        val at = s"$root/${files.at(i)}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, "").unwrap()
+
+    root
+end pkg_tree
+
+private pkg_one(a: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(a)
+    out
+end pkg_one
+
+// An analysis whose compilation has files for these modules and no others, which is the whole of
+// what the package layer asks the tables.
+private pkg_analysis(names: Buf[string]) -> &Analysis
+    val a = analysis_for(host_target())
+
+    for i in 0..<names.len()
+        a.tables.modules.push(names.at(i))
+
+    a
+end pkg_analysis
+
+private pkg_mounts(written: string, means: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push((written, means))
+    out
+end pkg_mounts
+
+@test("a package's canonical prefix is its coordinate, with the separators a module name may hold")
+a_prefix_is_the_coordinate()
+    assert_eq(canonical_prefix("github.com/sysl-lang/parsing"), "github.com.sysl-lang.parsing")
+    assert_eq(canonical_prefix("github.com/e/sysl-json"), "github.com.e.sysl-json")
+
+// A major above the first rides in the coordinate, so `github.com/e/json` and `github.com/e/json/v2`
+// are two packages rather than two versions of one -- and their prefixes say so. Nothing else about
+// a version reaches a name: two builds of one package at 1.2.0 and 1.4.0 emit the same symbols,
+// which is what lets an artifact built against either be linked with the other.
+@test("a major version rides in the prefix and nothing else about a version does")
+a_major_rides_in_the_prefix()
+    assert_eq(canonical_prefix("github.com/e/json/v2"), "github.com.e.json.v2")
+    assert(canonical_prefix("github.com/e/json") != canonical_prefix("github.com/e/json/v2"),
+           "two packages, not two versions of one")
+
+@test("the prefix and a module's own name are joined, and the project's name stands alone")
+the_prefix_and_the_module_are_joined()
+    assert_eq(package_qualify("github.com.e.sysl-json", "json"), "github.com.e.sysl-json.json")
+    assert_eq(package_qualify("", "json"), "json")
+    assert_eq(package_qualify("github.com.e.sysl-json", ""), "github.com.e.sysl-json")
+    assert_eq(no_packaging().prefix, "")
+    assert(no_packaging().mounts.is_empty(), "and it mounts nothing")
+
+// A package namespaced by reverse DNS puts its source at `sh/sysl/table/`, so `sh` and `sh/sysl`
+// hold nothing and the one name it offers is `sh.sysl.table`. Offering the top-level directory
+// instead would make every such package claim `sh`, which is not a name any of them declares.
+@test("a package offers the shallowest directory of its tree that holds source")
+a_package_offers_its_shallowest_module()
+    val root = pkg_tree(pkg_one("sh/sysl/table/table.sysl"))
+    val offered = package_modules(root)
+
+    assert_eq(offered.len(), 1)
+    assert_eq(offered.at(0), "sh.sysl.table")
+    remove_dir_all(root).unwrap_or(())
+
+// A binding covers a name and everything under it, so an entry for a module below one already
+// offered would say the same thing twice.
+@test("and not every module below it")
+and_not_every_module_below_it()
+    var files: Buf[string] = buf()
+
+    files.push("sh/sysl/table/table.sysl")
+    files.push("sh/sysl/table/sub/sub.sysl")
+
+    val root = pkg_tree(files)
+    val offered = package_modules(root)
+
+    assert_eq(offered.len(), 1)
+    assert_eq(offered.at(0), "sh.sysl.table")
+    remove_dir_all(root).unwrap_or(())
+
+// A file sitting at the package root belongs to the anonymous root module, which has no name to
+// import.
+@test("a file at the package root offers nothing to import")
+a_file_at_the_root_offers_nothing()
+    val root = pkg_tree(pkg_one("top.sysl"))
+
+    assert(package_modules(root).is_empty(), "nothing to name")
+    remove_dir_all(root).unwrap_or(())
+
+// `package.name` is deliberately not consulted: it names the *package*, which is a unit of
+// distribution, and what an import line writes is a *module*, which is a unit of code.
+@test("what a name at the head of an import line means is the package's module under its prefix")
+a_mount_is_the_module_under_its_prefix()
+    val root = make_temp_dir("sysl-proj").unwrap()
+    val here = s"$root/vendor/github.com/sysl-lang/table/@v0.1.2"
+
+    make_dir_all(s"$here/sh/sysl/table").unwrap()
+    write_text(s"$here/package.hocon", "package { name = \"table\" }\n").unwrap()
+    write_text(s"$here/sh/sysl/table/t.sysl", "module sh.sysl.table\n").unwrap()
+
+    val m = read_manifest("dependencies { table { git = \"github.com/sysl-lang/table\", " +
+                          "version = \"0.1.2\" } }").unwrap()
+    val mounts = package_mounts(root, m)
+
+    assert_eq(mounts.len(), 1)
+    assert_eq(mounts.at(0).0, "sh.sysl.table")
+    assert_eq(mounts.at(0).1, "github.com.sysl-lang.table.sh.sysl.table")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a dependency nobody brought down offers nothing rather than refusing")
+a_missing_dependency_offers_nothing()
+    val root = make_temp_dir("sysl-proj").unwrap()
+
+    make_dir_all(s"$root/vendor").unwrap()
+
+    val m = read_manifest("dependencies { gone { git = \"github.com/e/gone\", " +
+                          "version = \"9.9.9\" } }").unwrap()
+
+    assert(package_mounts(root, m).is_empty(), "nothing to offer")
+    remove_dir_all(root).unwrap_or(())
+
+// The match is by longest key, so a name reaches the most specific package that offers it and
+// anything under that name comes with it.
+@test("a written path reaches the most specific package offering it, and keeps its tail")
+a_mount_matches_by_longest_key()
+    var mounts: Buf[(string, string)] = buf()
+
+    mounts.push(("sh.sysl", "github.com.e.outer.sh.sysl"))
+    mounts.push(("sh.sysl.table", "github.com.sysl-lang.table.sh.sysl.table"))
+
+    val pkg = Packaging("", mounts)
+
+    assert_eq(mounted(pkg, "sh.sysl.table").unwrap(), "github.com.sysl-lang.table.sh.sysl.table")
+    assert_eq(mounted(pkg, "sh.sysl.table.sub").unwrap(),
+              "github.com.sysl-lang.table.sh.sysl.table.sub")
+    assert_eq(mounted(pkg, "sh.sysl.other").unwrap(), "github.com.e.outer.sh.sysl.other")
+    assert(mounted(pkg, "sysl.text").is_none(), "nothing offers it")
+
+// A path written inside a package means that package's own tree before it can mean anything else:
+// unlike an import, which a file wrote and can rename, the prefix is added on the way in and the
+// source has no spelling for it.
+@test("a path written inside a package means that package's own tree")
+a_path_inside_a_package_means_its_own_tree()
+    var names: Buf[string] = buf()
+
+    names.push("github.com.e.mine.sh.sysl.mine")
+    names.push("sysl.text")
+
+    val a = pkg_analysis(names)
+    val pkg = Packaging("github.com.e.mine", buf())
+
+    assert_eq(in_package(a, pkg, "sh.sysl.mine"), "github.com.e.mine.sh.sysl.mine")
+
+// The ownership claim is about a path that leads somewhere and not about a segment. A package laid
+// out at `sh/sysl/mine` owns the word `sh`, and its own dependencies are namespaced under it too --
+// so a path its tree has nothing at falls through to the manifest that named the dependency.
+@test("and a path its own tree has nothing at falls through to what its manifest named")
+a_path_its_tree_lacks_falls_through()
+    var names: Buf[string] = buf()
+
+    names.push("github.com.e.mine.sh.sysl.mine")
+    names.push("github.com.e.dep.sh.sysl.dep")
+
+    val a = pkg_analysis(names)
+    val pkg = Packaging("github.com.e.mine",
+                        pkg_mounts("sh.sysl.dep", "github.com.e.dep.sh.sysl.dep"))
+
+    assert_eq(in_package(a, pkg, "sh.sysl.dep"), "github.com.e.dep.sh.sysl.dep")
+
+@test("the project being built has no prefix, so a path it writes is read exactly as written")
+the_project_reads_a_path_as_written()
+    var names: Buf[string] = buf()
+
+    names.push("sysl.text")
+    names.push("geom.plane")
+
+    val a = pkg_analysis(names)
+
+    assert_eq(in_package(a, no_packaging(), "sysl.text"), "sysl.text")
+    assert_eq(in_package(a, no_packaging(), "geom.plane"), "geom.plane")
+
+// A path that leads nowhere under any of the three readings is handed back as written, so the
+// diagnostic quotes what the reader wrote rather than a rewriting of it.
+@test("a path that leads nowhere is handed back as it was written")
+a_path_that_leads_nowhere_is_handed_back()
+    val a = pkg_analysis(pkg_one("sysl.text"))
+
+    assert_eq(in_package(a, no_packaging(), "nope.at.all"), "nope.at.all")
+
+@test("a name is a module where it is one or begins one, and a path where it names a declaration")
+what_names_and_what_reaches()
+    var names: Buf[string] = buf()
+
+    names.push("sh.sysl.parsing")
+    names.push("sysl.text")
+
+    val a = pkg_analysis(names)
+
+    assert(names_module(a, "sh"), "the first segment of one")
+    assert(names_module(a, "sh.sysl.parsing"), "and the module itself")
+    assert(!names_module(a, "sh.sysl.parsingx"), "and not a longer word")
+    assert(reaches_module(a, "sysl.text.Ascii"), "a module and a name in it")
+    assert(!reaches_module(a, "sysl.nowhere.Ascii"), "and nothing where there is no module")
+
+// The end of the road: a package's modules carry the prefix in what a build reads, and carry the
+// names they were written with in the typed tree `emit-typed` and `sysl prove` stop at.
+@test("a fetched package's modules are prefixed in a build and written plainly in the typed tree")
+a_fetched_packages_modules_are_prefixed()
+    if !pkg_library_here() then return
+
+    val root = make_temp_dir("sysl-proj").unwrap()
+    val here = s"$root/vendor/github.com/e/geom/@v1.0.0"
+
+    make_dir_all(s"$here/geom").unwrap()
+    write_text(s"$here/package.hocon", "package { name = \"geom\" }\n").unwrap()
+    write_text(s"$here/geom/g.sysl", "module geom\n\nadd(a: int, b: int) -> int = a + b\n").unwrap()
+    val block = "dependencies { geom { git = \"github.com/e/geom\", version = \"1.0.0\" } }\n"
+
+    write_text(s"$root/package.hocon", block).unwrap()
+    write_text(s"$root/main.sysl", "import geom.add\n\nprint(add(1, 2))\n").unwrap()
+
+    val built = packaged_compilation_of(root, host_target()).unwrap()
+
+    assert(pkg_declares(built, "github.com.e.geom.geom"), "the name a build reads")
+    assert(!pkg_declares(built, "geom"), "and nothing keeps the written one")
+
+    val typed = compilation_of(root, host_target()).unwrap()
+
+    assert(pkg_declares(typed, "geom"), "the typed tree keeps the written name")
+    assert(!pkg_declares(typed, "github.com.e.geom.geom"), "and adds no prefix")
+
+    // And the import still resolves through the mount, which is the half nothing else proves: the
+    // consumer writes `geom` and means the module now called `github.com.e.geom.geom`.
+    val out = emit_llvm_text(root, None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    out match
+        Err(refusal) -> assert(false, refusal.message)
+        Ok(made) ->
+            assert(made.report.is_empty(), "nothing to report")
+            assert(made.text.index_of("github.com.e.geom.geom$add").is_some(),
+                   "the symbol carries the prefix")
+end a_fetched_packages_modules_are_prefixed
+
+private pkg_declares(c: Compilation, name: string) -> bool
+    for i in 0..<c.units.len()
+        if module_of_unit(c.units.at(i)) == name then return true
+
+    false
+end pkg_declares

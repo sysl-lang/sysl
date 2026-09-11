@@ -17,20 +17,40 @@ import sysl.buf.{Buf, buf}
 // The module the auto-import brings into scope with no `import` written.
 const AutoImportedModule: string = "sysl"
 
-// The module a file contributes to, which is what its header said or the root where it said nothing.
-module_of_unit(p: Program) -> string = p.module_name match
-    Some(m) -> m.show()
-    None -> ModuleRoot
+// The module a file contributes to: what its header said, or the anonymous root module where it
+// said nothing -- under the canonical prefix of the package it came from.
+//
+// The prefix is what keeps a dependency's `json` and this project's `json` apart, and it is added
+// *here* rather than being written in the file so that a package's source is the same source
+// whoever depends on it. A compilation with no dependencies has no prefixes, so this is the
+// header's own name and nothing has changed.
+module_of_unit(p: Program) -> string
+    val written = p.module_name match
+        Some(m) -> m.show()
+        None -> ModuleRoot
+
+    package_qualify(p.pkg.prefix, written)
+end module_of_unit
 
 // The terms one file's declarations are read in.
-scope_of_unit(p: Program) -> Scope =
-    Scope(module_of_unit(p), gather_imports(p.body, module_of_unit(p)), p.src)
+//
+// **Every module of the compilation has to be registered before this is asked**, because the
+// package layer decides what a written path means by asking which paths lead anywhere -- and a
+// table that is still filling would answer a path that is there with a no.
+scope_of_unit(a: &Analysis, p: Program) -> Scope =
+    Scope(module_of_unit(p), gather_imports(a, p), p.src, p.pkg)
 
 // What a file's `import` clauses bring into scope, together with the auto-import every file gets.
 //
 // **A wildcard is a module rather than a set of names**, because what a module declares is not
 // settled until every file has been read: the list is resolved at the point a name is looked up.
-gather_imports(body: Buf[Stmt], here: string) -> Imports
+//
+// **Every path is read through the package layer on the way in**, so that a file of a fetched
+// package writes its own short names and a consumer writes whatever its manifest called the
+// package. For a project with no dependencies the two are the same string.
+gather_imports(a: &Analysis, p: Program) -> Imports
+    val here = module_of_unit(p)
+    val body = p.body
     var names: Buf[(string, string)] = buf()
     var modules: Buf[(string, string)] = buf()
     var wildcards: Buf[string] = buf()
@@ -41,16 +61,15 @@ gather_imports(body: Buf[Stmt], here: string) -> Imports
 
     for i in 0..<body.len()
         *body.at(i).kind match
-            ImportDecl(d) -> read_import(&names, &modules, &wildcards, d)
+            ImportDecl(d) -> read_import(&names, &modules, &wildcards,
+                                         in_package(a, p.pkg, joined(d.path, ".")), d)
             _ -> ()
 
     Imports(names, modules, wildcards)
 end gather_imports
 
 private read_import(names: *Buf[(string, string)], modules: *Buf[(string, string)],
-                    wildcards: *Buf[string], d: ImportDecl)
-    val path = joined(d.path, ".")
-
+                    wildcards: *Buf[string], path: string, d: ImportDecl)
     if d.wildcard then
         wildcards.push(path)
         return
@@ -115,12 +134,17 @@ hoist_units(a: &Analysis, units: Buf[Program])
     for i in 0..<units.len()
         if units.at(i).test_only then a.tables.test_only_files.push(units.at(i).src.name)
 
+    // **Every module name is registered before a single scope is built**, because a scope reads its
+    // file's import paths through the package layer and that layer asks which paths lead anywhere.
+    // Registering as the scopes were made answered that question against a half-filled table, so a
+    // file's import of a module declared further down the list was read as naming nothing.
     for i in 0..<units.len()
-        val scope = scope_of_unit(units.at(i))
+        val name = module_of_unit(units.at(i))
 
-        scopes.push(scope)
+        if !a.tables.has_module(name) then a.tables.modules.push(name)
 
-        if !a.tables.has_module(scope.module_name) then a.tables.modules.push(scope.module_name)
+    for i in 0..<units.len()
+        scopes.push(scope_of_unit(a, units.at(i)))
 
     // The reserved shape is refused before anything is registered, so a declaration that tried to
     // take one is answered by that rather than by the consequences of a name the rest of the
