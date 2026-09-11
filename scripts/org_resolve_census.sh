@@ -90,10 +90,13 @@ for repo in "$org"/*/; do
         elif [ $theirs_ok -ne 0 ] || [ $ours_ok -ne 0 ]; then
             one_refused=$((one_refused + 1))
 
+            # **A refusal is written to standard output, not to standard error**, so that is where
+            # the sentence is read from -- both compilers print `error: …` on the stream the text
+            # would have gone to and exit non-zero.
             if [ $ours_ok -ne 0 ]; then
-                echo "REFUSED BY US    $label -- $(head -1 "$ours.err")"
+                echo "REFUSED BY US    $label -- $(head -1 "$ours")"
             else
-                echo "REFUSED BY THEM  $label -- $(head -1 "$theirs.err")"
+                echo "REFUSED BY THEM  $label -- $(head -1 "$theirs")"
             fi
         elif cmp -s "$theirs" "$ours"; then
             matched=$((matched + 1))

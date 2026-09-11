@@ -3,6 +3,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.env.{get as env_var}
+import sysl.process.capture
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.text.{join, Search}
 
@@ -877,3 +878,37 @@ a_brace_in_a_comment_closes_nothing()
 
     assert_eq(text[span.0..<span.1],
               "\n  // a } in here closes nothing\n  a { git = \"x/y/z\", version = \"1.0.0\" }\n")
+
+// -- the org ------------------------------------------------------------------------------------
+
+// **Every repository beside this one whose manifest names dependencies, read by both compilers and
+// their answers diffed.** A repository with a `dependencies` block exercises resolution, fetching,
+// version selection and the import tables by simply being read, so a matched row is the two
+// compilers agreeing about what a project's packages are and what its files mean by them.
+//
+// It is gated on `SYSL_ORG` naming a binary of this compiler, because it needs one to run beside the
+// reference and because it takes twenty-odd minutes -- it is the org's census rather than this
+// tree's, and the gate is not where an answer about other repositories belongs. The script is
+// `scripts/org_resolve_census.sh`, which is what a divergence is actually read out of.
+@test("both compilers read the org's packaged repositories the same way")
+the_org_reads_the_same_way()
+    val ours = env_var("SYSL_ORG") match
+        None ->
+            print("skipped: SYSL_ORG names no binary of this compiler")
+            return
+        Some(binary) -> binary
+
+    val reference = env_var("SYSL_ORACLE") match
+        None ->
+            print("skipped: SYSL_ORACLE names no reference compiler on this machine")
+            return
+        Some(binary) -> binary
+
+    capture("sh", ["scripts/org_resolve_census.sh", ours, reference], "", [], true) match
+        Err(_) -> assert(false, "the census script could not be run")
+        Ok(answer) ->
+            val said = answer.text + answer.err.unwrap_or("")
+
+            print(said)
+            assert(answer.status.ok(), said)
+end the_org_reads_the_same_way
