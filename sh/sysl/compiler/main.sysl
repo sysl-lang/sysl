@@ -1,7 +1,9 @@
 module sh.sysl.compiler
 
 import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
 import sysl.fs.read_text
+import sysl.prints
 import sysl.text.Search
 
 // The driver: what the shell asked for, and what it hears back.
@@ -36,6 +38,8 @@ run_cli(args: []string, say: string -> unit) -> int
         "emit-typed" -> emit_typed_command(args, say)
         "emit-llvm" -> emit_llvm_command(args, say)
         "build" -> build_command(args, say)
+        "run" -> run_command(args, say)
+        "test" -> test_command(args, say)
         other ->
             say(s"sysl: `${other}` is not a command this compiler can carry out yet")
             say(usage())
@@ -251,10 +255,169 @@ end build_command
 private build_usage() -> string =
     "usage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path>"
 
+// `sysl run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>]` -- one program, built and
+// then run, with whatever it exits with passed straight back to the shell.
+//
+// **Everything after `--` is the program's**, which is what keeps a program free to take an option
+// this compiler also takes. The program is handed its own path as its first argument, as a program
+// started any other way is.
+private run_command(args: []string, say: string -> unit) -> int
+    var named: Option[string] = None
+    var cc: Option[string] = None
+    var level = DefaultOptimization
+    var file = ""
+    var forwarding = false
+    var program_args: Buf[string] = buf()
+    var i: usize = 2
+
+    while i < args.len
+        if forwarding
+            program_args.push(args[i])
+        else if args[i] == "--"
+            forwarding = true
+        else if args[i] == "--target" || args[i] == "--cc"
+            if i + 1 >= args.len
+                say(run_usage())
+                return Misused
+            end if
+
+            val flag = args[i]
+
+            i += 1
+
+            if flag == "--target" then named = Some(args[i]) else cc = Some(args[i])
+        else if args[i].len > 2 && args[i].starts_with("-O")
+            level = args[i][2..<args[i].len]
+        else
+            file = args[i]
+
+        i += 1
+
+    if file == ""
+        say(run_usage())
+        return Misused
+    end if
+
+    run_native_program(file, named, cc, level, program_args) match
+        Err(refusal) ->
+            say(s"error: ${refusal.message}")
+            Failed
+        Ok(code) -> code
+end run_command
+
+private run_usage() -> string =
+    "usage: sysl run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>]"
+
+// `sysl test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path>` --
+// the `@test` functions of a tree, built into one binary and run one process each.
+//
+// **The report is written as the run goes rather than at the end**, which is why it does not go
+// through `say`: a suite that takes half an hour is watched from a log file while it runs, and a run
+// that is killed partway still has a report of everything up to the kill. Every decision the command
+// makes is still somewhere a test can reach -- `run_selected` takes the sink it writes through, and
+// the four pieces it writes are each a function of their own.
+private test_command(args: []string, say: string -> unit) -> int
+    var named: Option[string] = None
+    var cc: Option[string] = None
+    var filter: Option[string] = None
+    var fail_fast = false
+    var level = DefaultOptimization
+    var file = ""
+    var i: usize = 2
+
+    while i < args.len
+        if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter"
+            if i + 1 >= args.len
+                say(test_usage())
+                return Misused
+            end if
+
+            val flag = args[i]
+
+            i += 1
+
+            if flag == "--target" then named = Some(args[i])
+            else if flag == "--cc" then cc = Some(args[i])
+            else filter = Some(args[i])
+        else if args[i] == "--fail-fast"
+            fail_fast = true
+        else if args[i].len > 2 && args[i].starts_with("-O")
+            level = args[i][2..<args[i].len]
+        else
+            file = args[i]
+
+        i += 1
+
+    if file == ""
+        say(test_usage())
+        return Misused
+    end if
+
+    val build = test_build_of(file, named) match
+        Err(refusal) ->
+            say(s"error: ${refusal.message}")
+            return Failed
+        Ok(made) -> made
+
+    if !build.emitted.report.is_empty()
+        say(analysis_report(build.emitted.report))
+        return Failed
+    end if
+
+    // Nothing to run is not nothing to say. A tree with no tests at all and a filter that matched none
+    // of the tests there are lead to the same empty report and are different mistakes, so each is
+    // named. Neither is a failure: a program is allowed to have no tests.
+    if build.tests.is_empty()
+        say(s"no '@test' functions in $file")
+        return Fine
+    end if
+
+    val chosen = selected_tests(build.tests, filter)
+
+    if chosen.is_empty()
+        say(s"no test matches '${filter.unwrap_or("")}' — ${build.tests.len()} to choose from")
+        return Fine
+    end if
+
+    val exe = build_test_binary(file, build, cc, level) match
+        Err(refusal) ->
+            say(s"error: ${refusal.message}")
+            return Failed
+        Ok(built) -> built
+
+    val outcomes = run_selected(exe, chosen, TestOptions(filter, fail_fast),
+                                build.tests.len() - chosen.len(), piece -> stream_out(piece))
+
+    discard_test_binary(exe)
+
+    var failed: usize = 0
+
+    for j in 0..<outcomes.len()
+        if !outcomes.at(j).passed() then failed += 1
+
+    if failed == 0 then Fine else Failed
+end test_command
+
+private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fast] " +
+    "[--target <name>] [--cc <path>] [-O<level>] <path>"
+
+// One piece of a report, written and **flushed**, so that a run followed through a log file shows each
+// verdict as it lands rather than only once the process exits. The pieces carry their own newlines,
+// which is what makes the concatenation of them the whole report.
+private stream_out(piece: string)
+    prints(piece)
+    c_flush_all(null)
+
+// Standard output is buffered when it is not a terminal, which is exactly the case a streaming report
+// is for. There is no flush in the library's printing surface, so the C one is named here.
+private extern "fflush" c_flush_all(stream: *u8) -> int
+
 usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <file> | " +
     "emit-typed [--no-spans] [--tables] [--target <name>] <path> | " +
     "emit-llvm [--target <name>] <path> | " +
-    "build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path>"
+    "build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path> | " +
+    "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
+    "test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path>"
 
 main(args: []string)
     val code = run_cli(args, line -> print(line))

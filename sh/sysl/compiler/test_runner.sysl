@@ -1,0 +1,473 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.process.{capture, Status}
+import sysl.text.{from_utf8_unchecked, repeat, split, Search}
+import sysl.time.{monotonic, whole_millis}
+
+// `sysl test` -- the `@test` functions of a source tree, run, and what a reader is told about them.
+//
+// **One build, one process per test.** The whole tree is compiled once, into a binary whose entry
+// point takes a test's name and runs that test alone (`gen_test_main`); this then starts it once per
+// test. A test that fails does so by trapping, and a trap takes its process with it -- so a run that
+// shared one process would report the first failure and nothing after it. Paying for a process per
+// test buys every test a verdict, and it is the cheap half: the compile is the slow one and there is
+// only ever one of those.
+//
+// **The verdict is the exit status, and nothing else.** A test passes by returning. That is the whole
+// protocol, and it is what lets a test assert with the language it is testing rather than with a
+// framework: a broken `require`, a bounds violation, an `unwrap` of `None` -- each ends the process,
+// and none of them needed to know it was running under a test. `@test(should_trap)` inverts the
+// reading for a test whose subject *is* the check.
+//
+// **A module's hooks are read against that protocol rather than beside it.** `@setup` and `@teardown`
+// run in the test's own process, which is what lets a setup leave something for the test to find --
+// and is why a teardown after a test that trapped runs in a process of its own instead, there being
+// nothing left of the first one. `@setup_all` and `@teardown_all` are their own invocations, so a
+// module reaches its tests from one of them only through what outlives a process. Which part of a run
+// ended it cannot be read from an exit status, so the dispatcher marks each boundary it crosses.
+
+// What was asked of a run, beyond which tree to run.
+//
+// `filter` selects by substring against both the reported name and the key, so a module's tests can
+// be named by their module and one test by its own name. `fail_fast` stops at the first failure,
+// which is what someone iterating on one wants and the opposite of what someone reading a report
+// does -- hence a flag rather than a default either way.
+struct TestOptions
+    filter: Option[string]
+    fail_fast: bool
+end TestOptions
+
+// One test, run. `detail` is absent exactly when the test passed; `output` is everything the run
+// printed, on either stream, which a failure shows and a pass keeps to itself.
+//
+// **A row for a `@setup_all` or `@teardown_all` that did not come back is one of these too**, with
+// the hook standing in for the test: a hook that runs alone has no test to hang its failure on, and
+// what a row needs is a name, a file and a line, which a hook has. So the report grows a row rather
+// than a second kind of row, and the header counts the tests instead of counting the rows.
+struct Outcome
+    test: TTest
+    detail: Option[string]
+    output: string
+    millis: long
+
+    passed(self) -> bool = self.detail.is_none()
+end Outcome
+
+// Every selected test, run in the order it was written -- which is the order it is reported in, so
+// that a reader following a failure down a file finds the tests where the file put them.
+//
+// `fail_fast` stops the loop rather than the report: what has run is still reported, and the tests
+// that never ran are simply absent. Reporting them as skipped would be a third verdict for something
+// that is not a verdict at all.
+//
+// **`emit` is called as the run goes, not once at the end** -- the header first, then a file's
+// heading before its first row, then each row the moment its test or hook finishes, then the summary
+// once every test has. A suite that takes half an hour is watched from a log file while it runs
+// rather than staying silent until it exits, and a run that is killed partway still has a report of
+// everything up to the kill.
+run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
+             emit: string -> unit) -> Buf[Outcome]
+    var done: Buf[Outcome] = buf()
+    var stop = false
+    var shown = ""
+    var any_shown = false
+
+    // Fixed before the first test runs, from every name a row could carry -- a test's own, or the
+    // bare name of a hook that might stand in for one -- because the alternative is not printing a
+    // row until the last test is known to be the widest, which is the whole run.
+    val width = widest_row_name(tests)
+
+    emit(tests_header(tests.len(), filtered))
+
+    val groups = by_module_order(tests)
+
+    for g in 0..<groups.len()
+        if stop then break
+
+        val group = groups.at(g)
+        val hooks = group.at(0).hooks
+
+        // `@setup_all` is a run of its own, before anything else in the module. Where it does not
+        // come back it gets a row of its own and the module's tests do not run: there is no test to
+        // hang the failure on, and reporting tests that never started would be a third verdict for
+        // something that is not one.
+        var booted = true
+
+        hooks.setup_all match
+            Some(h) ->
+                val r = run_test_hook(exe, h)
+
+                if r.status != 0
+                    val outcome = hook_outcome(h, r)
+
+                    done.push(outcome)
+                    show_outcome(outcome, width, &shown, &any_shown, emit)
+                    booted = false
+
+                    if opts.fail_fast then stop = true
+            None -> ()
+
+        if booted
+            for i in 0..<group.len()
+                if stop then break
+
+                val outcome = run_one_test(exe, group.at(i))
+
+                done.push(outcome)
+                show_outcome(outcome, width, &shown, &any_shown, emit)
+
+                if opts.fail_fast && !outcome.passed() then stop = true
+
+        // `@teardown_all` runs whatever became of the tests, and whatever became of `@setup_all`:
+        // what it is for is releasing what the module took, and a module that failed halfway has
+        // taken some of it.
+        hooks.teardown_all match
+            Some(h) ->
+                val r = run_test_hook(exe, h)
+
+                if r.status != 0
+                    val outcome = hook_outcome(h, r)
+
+                    done.push(outcome)
+                    show_outcome(outcome, width, &shown, &any_shown, emit)
+
+                    if opts.fail_fast then stop = true
+            None -> ()
+
+    emit(tests_summary(done))
+    done
+end run_selected
+
+// One row, with its file's heading in front of it where this is the first row that file has had.
+private show_outcome(o: Outcome, width: usize, shown: *string, any_shown: *bool,
+                     emit: string -> unit)
+    if !*any_shown || *shown != o.test.file
+        emit(test_file_header(o.test.file))
+        *shown = o.test.file
+        *any_shown = true
+
+    emit(test_row(o, width))
+end show_outcome
+
+// The widest name a row in this run could carry, fixed before anything is run so the first row can be
+// emitted immediately. It covers both what the tests will show and the bare name of every hook their
+// modules declare, since a failing `@setup_all` or `@teardown_all` reports under that name instead --
+// so the padding a live row gets does not shift once a hook fails.
+private widest_row_name(tests: Buf[TTest]) -> usize
+    var width: usize = 0
+
+    for i in 0..<tests.len()
+        val t = tests.at(i)
+
+        if t.display.len > width then width = t.display.len
+
+        val hooks = t.hooks.all()
+
+        for j in 0..<hooks.len()
+            val name = module_bare(hooks.at(j).func)
+
+            if name.len > width then width = name.len
+
+    width
+end widest_row_name
+
+// The selected tests grouped by the module that declared them, in the order the modules were first
+// met.
+//
+// The grouping is what makes an `_all` hook run once, and the order is the tests' own so that a report
+// still follows the source. A module with no hooks pays nothing for this: the group runs exactly the
+// processes it would have run without one.
+private by_module_order(tests: Buf[TTest]) -> Buf[Buf[TTest]]
+    var names: Buf[string] = buf()
+    var groups: Buf[Buf[TTest]] = buf()
+
+    for i in 0..<tests.len()
+        val name = module_of(tests.at(i).func)
+
+        index_of_module(names, name) match
+            Some(at) ->
+                var group = groups.at(at)
+
+                group.push(tests.at(i))
+                groups.set(at, group)
+            None ->
+                var group: Buf[TTest] = buf()
+
+                group.push(tests.at(i))
+                names.push(name)
+                groups.push(group)
+
+    groups
+end by_module_order
+
+private index_of_module(names: Buf[string], name: string) -> Option[usize]
+    for i in 0..<names.len()
+        if names.at(i) == name then return Some(i)
+
+    None
+end index_of_module
+
+// One test, run -- and its module's per-test hooks around it.
+//
+// **`@setup` runs inside the test's process**, so what it leaves in module storage is what the test
+// finds. That is also why a fault in it cannot be told from a fault in the test by the exit status
+// alone, and why the dispatcher leaves a mark on its way past: no mark means the run never got out of
+// setup.
+//
+// **`@teardown` runs in that process where the test returned, and in one of its own where it did
+// not.** A trap takes the process with it, so there is nothing left there to run a teardown in -- and
+// honouring "teardown runs even when the test failed" any other way would mean not running it at all.
+// What a fresh process can release is what outlives a process, which is what the hook is documented
+// to be for.
+private run_one_test(exe: string, t: TTest) -> Outcome
+    val started = monotonic()
+    var raw = ""
+    var state = NotStarted
+
+    capture(exe, [t.func], "", [], true) match
+        Err(_) -> ()
+        Ok(o) ->
+            raw = o.text + o.err.unwrap_or("")
+            state = shell_status(o.status)
+
+    val took = whole_millis(monotonic() - started)
+    val output = unmarked_output(raw)
+    val setup_ran = t.hooks.setup.is_none() || raw.has_byte(setup_byte())
+    val entered_down = t.hooks.teardown.is_some() && raw.has_byte(test_byte())
+
+    var detail: Option[string] = None
+
+    if !setup_ran
+        detail = Some(guarded_by_setup(t.hooks.setup.unwrap(), state))
+    else if entered_down && state != 0
+        detail = Some(hook_did_not_return(t.hooks.teardown.unwrap(), state) +
+            ", after the test returned")
+    else
+        detail = test_verdict(t, state, output)
+
+    // The teardown the process could not reach. Its own output joins the test's, since a reader
+    // following one failure should not have to run the suite again to see the other.
+    var trailing = ""
+
+    if t.hooks.teardown.is_some() && !entered_down
+        val h = t.hooks.teardown.unwrap()
+        val r = run_test_hook(exe, h)
+
+        trailing = r.output
+
+        if r.status != 0 && detail.is_none() then detail = Some(hook_did_not_return(h, r.status))
+
+    Outcome(t, detail, output + trailing, took)
+end run_one_test
+
+// What one hook's own process did.
+struct HookRun
+    status: int
+    output: string
+    millis: long
+end HookRun
+
+private run_test_hook(exe: string, h: THook) -> HookRun
+    val started = monotonic()
+    var state = NotStarted
+    var output = ""
+
+    capture(exe, [h.func], "", [], true) match
+        Err(_) -> ()
+        Ok(o) ->
+            state = shell_status(o.status)
+            output = unmarked_output(o.text + o.err.unwrap_or(""))
+
+    HookRun(state, output, whole_millis(monotonic() - started))
+end run_test_hook
+
+// What a run reports where the binary could not be started at all. It is not a status any child left
+// behind -- a process that never ran left none -- and the number is the shell's own word for a command
+// it could not execute, so a reader who has seen one has already been told what it means.
+const NotStarted: int = 127
+
+// A hook's failure as a report row, since a hook that runs alone has no test to hang one on.
+//
+// It borrows `TTest` rather than growing the report a second kind of row: what a row needs is a name,
+// a file and a line, and a hook has all three. It is shown under the name it was declared with, which
+// is what a reader greps for.
+private hook_outcome(h: THook, r: HookRun) -> Outcome =
+    Outcome(TTest(h.func, module_bare(h.func), false, None, h.file, h.line, no_hooks()),
+            Some(hook_did_not_return(h, r.status)), r.output, r.millis)
+
+private hook_did_not_return(h: THook, state: int) -> string =
+    s"the module's '@${hook_word(h.kind)}', '${module_show(h.func)}', did not return — " +
+        s"exit status $state"
+
+private guarded_by_setup(h: THook, state: int) -> string =
+    s"${hook_did_not_return(h, state)}, so this test did not run"
+
+// Whether a test's run was what the test said it would be, and if not, what it was instead.
+//
+// The status is read as the platform leaves it: zero for a function that returned, and anything else
+// for a process that did not get there. **A trap is not told from an `exit`**, deliberately -- both
+// are a test that did not come back, the language offers no way to distinguish them from inside, and
+// a rule that read one as a pass and the other as a failure would rest on which signal a given
+// machine's trap happens to raise.
+test_verdict(t: TTest, state: int, output: string) -> Option[string]
+    if !t.should_trap
+        if state == 0 then return None
+
+        return Some(s"did not return — exit status $state")
+    end if
+
+    if state == 0 then return Some("returned, and was expected to trap")
+
+    t.expected match
+        None -> None
+        Some(want) ->
+            if output.contains(want) then None
+            else Some(s"trapped, but printed nothing holding \"$want\"")
+end test_verdict
+
+// A test is selected when the pattern is a substring of either name it has: the one a report shows
+// and the key its module gives it. Two, because the two are what a reader has to hand -- a name read
+// off a failing report, and a module named to run everything under it.
+test_matches(t: TTest, filter: Option[string]) -> bool = filter match
+    None -> true
+    Some(f) -> t.display.contains(f) || module_show(t.func).contains(f)
+
+// Those of a run's tests the filter keeps.
+selected_tests(tests: Buf[TTest], filter: Option[string]) -> Buf[TTest]
+    var out: Buf[TTest] = buf()
+
+    for i in 0..<tests.len()
+        if test_matches(tests.at(i), filter) then out.push(tests.at(i))
+
+    out
+end selected_tests
+
+// -- the report ---------------------------------------------------------------------------------------
+
+// The header counts the **tests** that were selected, which is not the number of rows below it: a hook
+// that did not come back gets a row of its own, and a module whose `@setup_all` failed has tests that
+// were selected and never ran. Reading the count off the rows would say "running 4 tests" over three
+// tests and a hook.
+tests_header(selected: usize, filtered: usize) -> string
+    val word = if selected == 1 then "test" else "tests"
+    val of = if filtered > 0 then s" of ${selected + filtered}" else ""
+
+    s"running $selected $word$of\n"
+end tests_header
+
+// The heading a file's rows are shown under -- once, before the first of them.
+test_file_header(file: string) -> string = s"\n$file\n"
+
+// One outcome's row, padded to `width` so every status column lines up regardless of which row's name
+// happens to be the widest. A failure's own line says what happened; anything the run printed follows
+// it, indented, and is shown **only** for a failure -- output from a test that passed is what the test
+// was doing, not something anyone asked to read.
+test_row(o: Outcome, width: usize) -> string
+    val mark = if o.passed() then "ok  " else "FAIL"
+    val pad = if o.test.display.len < width then repeat(" ", width - o.test.display.len) else ""
+
+    var out = s"  $mark  ${o.test.display}$pad  ${o.millis}ms\n"
+
+    o.detail match
+        None -> ()
+        Some(detail) ->
+            out = out + s"        $detail\n"
+            out = out + s"        at ${o.test.file}:${o.test.line}\n"
+
+            val lines = text_lines(o.output)
+
+            for i in 0..<lines.len()
+                out = out + s"        > ${lines.at(i)}\n"
+
+    out
+end test_row
+
+// The closing line: how many of the rows passed, against how long the whole run took.
+tests_summary(outcomes: Buf[Outcome]) -> string
+    var failed: usize = 0
+    var total: long = 0
+
+    for i in 0..<outcomes.len()
+        if !outcomes.at(i).passed() then failed += 1
+
+        total += outcomes.at(i).millis
+
+    s"\n${outcomes.len() - failed} passed, $failed failed — ${total}ms\n"
+end tests_summary
+
+// The whole report as one string, for a caller that wants the finished list rather than a run to
+// watch. Given the same outcomes in the same order it is exactly what the concatenation of a live
+// run's `emit` calls comes to, because both are built from these same four pieces.
+tests_rendered(outcomes: Buf[Outcome], selected: usize, filtered: usize) -> string
+    var width: usize = 0
+
+    for i in 0..<outcomes.len()
+        if outcomes.at(i).test.display.len > width then width = outcomes.at(i).test.display.len
+
+    var out = tests_header(selected, filtered)
+    var shown = ""
+    var any_shown = false
+
+    for i in 0..<outcomes.len()
+        val o = outcomes.at(i)
+
+        if !any_shown || shown != o.test.file
+            out = out + test_file_header(o.test.file)
+            shown = o.test.file
+            any_shown = true
+
+        out = out + test_row(o, width)
+
+    out + tests_summary(outcomes)
+end tests_rendered
+
+// -- what a run's output has in it --------------------------------------------------------------------
+
+// The byte the dispatcher writes once `@setup` has returned, and the one it writes once the test
+// itself has. **A dead process cannot report which part of it died**, and that is the whole of why a
+// byte is written at all: the three run in one process, a fault anywhere in it ends that process, and
+// the exit status is the same however far it got. So the dispatcher leaves a mark as it crosses each
+// boundary, and the runner reads how far the run reached off what arrived.
+//
+// Both are control characters no source text can hold -- neither survives the lexer, so a test's own
+// output cannot forge one -- and both are stripped from what a failure shows: they are the runner's
+// channel and not the test's.
+//
+// **Read off the marks the emitter writes rather than written down a second time here**, because two
+// statements of one byte is a byte the two halves will one day disagree about.
+private setup_byte() -> u8 = setup_mark().bytes[0]
+
+private test_byte() -> u8 = test_mark().bytes[0]
+
+// A run's output as a reader should see it: the marks above taken out.
+unmarked_output(output: string) -> string
+    val setup = setup_byte()
+    val test = test_byte()
+
+    if !output.has_byte(setup) && !output.has_byte(test) then return output
+
+    var out: Buf[u8] = buf()
+
+    for i in 0..<output.bytes.len
+        val b = output.bytes[i]
+
+        if b != setup && b != test then out.push(b)
+
+    from_utf8_unchecked(out.view())
+end unmarked_output
+
+// The lines a run printed, with no empty line invented for the newline the last one ended with.
+private text_lines(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if text == "" then return out
+
+    val parts = split(text, "\n")
+
+    for i in 0..<parts.len
+        if i + 1 == parts.len && parts[i] == "" then ()
+        else out.push(parts[i])
+
+    out
+end text_lines

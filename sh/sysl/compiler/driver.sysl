@@ -3,7 +3,8 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Source
 import sysl.buf.{Buf, buf}
 import sysl.text.{str_builder, Search}
-import sysl.fs.remove_file
+import sysl.fs.{make_temp_dir, remove_dir_all, remove_file}
+import sysl.process.{run as run_child, Status}
 
 // What one invocation compiles: the program's files, the packages it depends on, and the standard
 // module every program is compiled against.
@@ -330,13 +331,26 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
 
     if !emitted.report.is_empty() then return Err(Refusal(analysis_report(emitted.report)))
 
-    val clang = find_clang(t, cc) match
-        Err(why) -> return Err(Refusal(why))
-        Ok(found) -> found
-
     val exe = out match
         Some(named) -> named
         None -> default_executable(path)
+
+    link_lowered_text(path, emitted.text, t, cc, level, exe)?
+    Ok(exe)
+end build_native_program
+
+// The tail every command that produces a binary shares: the clang, the tree's own C, the standard
+// module's archive, and the link.
+//
+// **It is one function because a test build and an ordinary one have to link the same way.** A
+// package's tests are exactly what exercises the C it ships, so a test run that got a different link
+// line would fail on the one tree most likely to have one -- which is the tree whose author is
+// running `sysl test`.
+private link_lowered_text(path: string, text: string, t: Target, cc: Option[string], level: string,
+                          exe: string) -> Result[unit, Refusal]
+    val clang = find_clang(t, cc) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(found) -> found
 
     val objects = native_objects(clang, path, exe, t, level)?
 
@@ -353,15 +367,144 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
             return Err(Refusal(why))
         Ok(found) -> link_with.push(found.archive)
 
-    build_native(clang, emitted.text, link_with, exe, t, level) match
+    build_native(clang, text, link_with, exe, t, level) match
         Err(why) ->
             discard_objects(objects)
             return Err(Refusal(why))
         Ok(_) -> ()
 
     discard_objects(objects)
-    Ok(exe)
-end build_native_program
+    Ok(())
+end link_lowered_text
+
+// `sysl run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>]` -- one program, built and
+// then executed, with the shell hearing whatever the program exited with.
+//
+// **A build for a machine that is not this one is refused here rather than built and then found
+// unrunnable**: what the reader asked for cannot be carried out, and the answer names the command
+// that can.
+//
+// The binary is a temporary of this run. The reference keeps what it built in a cache keyed over
+// everything that can reach the bytes; this compiler rebuilds, which costs time and cannot hand back
+// a binary made by a compiler that has since changed.
+run_native_program(path: string, named_target: Option[string], cc: Option[string], level: string,
+                   args: Buf[string]) -> Result[int, Refusal]
+    val t = target_for(path, named_target)?
+
+    not_this_machine(t, "run")?
+
+    val emitted = emit_llvm_text(path, named_target)?
+
+    if !emitted.report.is_empty() then return Err(Refusal(analysis_report(emitted.report)))
+
+    val staging = make_temp_dir("sysl-run-") match
+        Err(_) -> return Err(Refusal("no directory to build in"))
+        Ok(dir) -> dir
+
+    val exe = join_path(staging, "program")
+
+    link_lowered_text(path, emitted.text, t, cc, level, exe) match
+        Err(why) ->
+            remove_dir_all(staging).unwrap_or(())
+            return Err(why)
+        Ok(_) -> ()
+
+    // `run` rather than `capture`, and the difference is the whole of what this command is for: the
+    // child shares this program's streams, so its input is the reader's and what it writes is read as
+    // it is written.
+    val state = run_child(exe, args.view(), "", []) match
+        Err(_) ->
+            remove_dir_all(staging).unwrap_or(())
+            return Err(Refusal(s"$exe could not be run"))
+        Ok(how) -> how
+
+    remove_dir_all(staging).unwrap_or(())
+    Ok(shell_status(state))
+end run_native_program
+
+// What a shell hears when a child ends. A signal has no exit status of its own, and `128 + n` is what
+// every shell reports for one -- so it is what a caller reading this number will already be
+// expecting.
+shell_status(state: Status) -> int = state match
+    Exited(code) -> code
+    Signalled(signal) -> 128 + signal
+
+// The refusal `run` and `test` share, and the reason they share it: both execute what they build, and
+// only this machine can execute anything.
+private not_this_machine(t: Target, command: string) -> Result[unit, Refusal]
+    if t.name == host_target().name then return Ok(())
+
+    val does = if command == "run" then "executes" else "runs"
+
+    Err(Refusal(s"'$command' $does what it builds, and '${t.name}' is not this machine — use " +
+        s"'sysl build --target ${t.name}'"))
+end not_this_machine
+
+// What a test build comes to: the text to link, the tests the binary can be asked for by name, and
+// the machine it was built for.
+struct TestBuild
+    emitted: Emitted
+    tests: Buf[TTest]
+    target: Target
+end TestBuild
+
+// `sysl test [--target <name>] <path>` -- the same program lowered as a **test build**.
+//
+// **It keeps the `@test` functions every other build drops, and it lowers a different entry point**:
+// the dispatcher that runs one test by name, which is what lets a runner pay one process per test and
+// so learn the verdict of every one of them rather than of the first that traps.
+//
+// The analysis in front of it is the analysis every other build gets, and that is deliberate: a test
+// is code somebody wrote and is held to the same rules.
+test_build_of(path: string, named_target: Option[string]) -> Result[TestBuild, Refusal]
+    val t = target_for(path, named_target)?
+
+    not_this_machine(t, "test")?
+
+    if !t.builds_with_clang() then return Err(Refusal(t.no_toolchain()))
+
+    val program = packaged_compilation_of(path, t)?
+    val done = analyze_bodies(program.units, program.target)
+    val whole = program_of(done, done.main_module)
+    val promotions = post_analysis_checks_of_tests(done.an, whole, program.own)
+    val kept = tests_only(whole, program.own)
+
+    val linked = std_artifact(t) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(found) -> found
+
+    val lowered = codegen_with_gaps(kept with { precompiled = linked.precompiled }, t, promotions)
+    val emitted = Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1)
+
+    Ok(TestBuild(emitted, kept.tests, t))
+end test_build_of
+
+// A test binary, linked exactly as a program is, in a directory of its own.
+//
+// **It is a temporary of this run and the runner outlives the link**, since a process is started per
+// test: what is handed back is the path, and `discard_test_binary` is what takes the directory away
+// once the last test has had its verdict.
+build_test_binary(path: string, build: TestBuild, cc: Option[string],
+                  level: string) -> Result[string, Refusal]
+    val staging = make_temp_dir("sysl-test-") match
+        Err(_) -> return Err(Refusal("no directory to build the tests in"))
+        Ok(dir) -> dir
+
+    val exe = join_path(staging, "tests")
+
+    link_lowered_text(path, build.emitted.text, build.target, cc, level, exe) match
+        Err(why) ->
+            remove_dir_all(staging).unwrap_or(())
+            return Err(why)
+        Ok(_) -> Ok(exe)
+end build_test_binary
+
+// The directory a test binary was built in, taken away. The binary is the only thing in it, so the
+// directory is what there is to remove.
+discard_test_binary(exe: string)
+    parent_of(exe) match
+        Some(dir) -> remove_dir_all(dir).unwrap_or(())
+        None -> remove_file(exe)
 
 // Where a build puts what it made, when nothing said: the program is the product, so it is named for
 // the directory it was written in, and a single file for the file itself.

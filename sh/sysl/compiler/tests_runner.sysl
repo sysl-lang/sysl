@@ -1,0 +1,435 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.Status
+import sysl.text.{from_utf8_unchecked, Search}
+
+// **What `sysl test` says, held to the reference compiler's own text.** Every string quoted here was
+// read off a run of the reference on a project written for the purpose; none of it is composed.
+//
+// The report is four pieces -- the header, a file's heading, a row, the summary -- and they are
+// separate functions so that each can be asserted on its own. The run that puts them in order is
+// asserted at the end, on a tree that is actually built and actually run, because the order a live
+// run emits them in is the one thing no pure function can answer for.
+
+private runner_library() -> bool = std_root().is_ok()
+
+private runner_toolchain() -> bool = clang_available()
+
+// A one-file project in a directory of its own. Public because the self-build's own cases build the
+// same shape and the two have to be reporting on one tree.
+runner_project(name: string, text: string) -> string
+    val root = make_temp_dir("sysl-runner").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/$name", text).unwrap()
+    root
+end runner_project
+
+private runner_test(display: string, file: string, line: int) -> TTest =
+    TTest(module_qualify("m", display), display, false, None, file, line, no_hooks())
+
+private runner_trapping(display: string, want: Option[string]) -> TTest =
+    TTest(module_qualify("m", display), display, true, want, "t.sysl", 1, no_hooks())
+
+private runner_hook(kind: HookKind, key: string, line: int) -> THook = THook(kind, key, "t.sysl", line)
+
+// Every `Nms` a row or a summary carries, so that a text can be compared against one taken from a
+// different run on a different machine. Public for the same reason `runner_project` is.
+runner_timeless(text: string) -> string
+    var out = ""
+    var i: usize = 0
+    val bytes = text.bytes
+
+    while i < bytes.len
+        if bytes[i] >= u8('0') && bytes[i] <= u8('9')
+            var j = i
+
+            while j < bytes.len && bytes[j] >= u8('0') && bytes[j] <= u8('9')
+                j += 1
+
+            if j + 2 <= bytes.len && bytes[j] == u8('m') && bytes[j + 1] == u8('s')
+                out = out + "Nms"
+                i = j + 2
+            else
+                out = out + from_utf8_unchecked(bytes[i..<j])
+                i = j
+        else
+            out = out + from_utf8_unchecked(bytes[i..<(i + 1)])
+            i += 1
+
+    out
+end runner_timeless
+
+// -- the header -------------------------------------------------------------------------------------
+
+@test("the header counts the tests, and says 'test' for one of them")
+the_header_counts_the_selected_tests()
+    assert_eq(tests_header(3, 0), "running 3 tests\n")
+    assert_eq(tests_header(1, 0), "running 1 test\n")
+    assert_eq(tests_header(0, 0), "running 0 tests\n")
+
+// The header counts the **tests** that were selected, which is not the number of rows below it: a
+// hook that did not come back gets a row of its own.
+@test("and where a filter left some out it says how many there were")
+the_header_says_how_many_a_filter_left()
+    assert_eq(tests_header(1, 2), "running 1 test of 3\n")
+    assert_eq(tests_header(2, 1), "running 2 tests of 3\n")
+
+@test("a file's heading is written once, with a blank line in front of it")
+a_files_heading_stands_alone()
+    assert_eq(test_file_header("/tmp/p/main.sysl"), "\n/tmp/p/main.sysl\n")
+
+// -- a row ------------------------------------------------------------------------------------------
+
+@test("a passing row is 'ok' and the name padded to the widest in the run")
+a_passing_row_lines_up()
+    val o = Outcome(runner_test("adds", "/tmp/p/main.sysl", 4), None, "", 1)
+
+    assert_eq(test_row(o, 12), "  ok    adds          1ms\n")
+    assert_eq(test_row(o, 4), "  ok    adds  1ms\n")
+
+// **A pass keeps its output to itself.** What a passing test printed is what the test was doing, not
+// something anyone asked to read.
+@test("and what a passing test printed is not shown")
+a_passing_row_hides_what_it_printed()
+    val o = Outcome(runner_test("two plus two", "/tmp/p/main.sysl", 8), None, "noise\n", 1)
+
+    assert_eq(test_row(o, 12), "  ok    two plus two  1ms\n")
+
+@test("a failing row says what happened, where the test is, and everything the run printed")
+a_failing_row_shows_the_reason_and_the_output()
+    val o = Outcome(runner_test("fails", "/tmp/p/main.sysl", 13),
+                    Some("did not return — exit status 1"), "panic: this one is meant to fail\n", 1)
+
+    assert_eq(test_row(o, 12),
+              "  FAIL  fails         1ms\n" +
+              "        did not return — exit status 1\n" +
+              "        at /tmp/p/main.sysl:13\n" +
+              "        > panic: this one is meant to fail\n")
+
+// The newline the last line ended with is a terminator and not a separator, so no empty line is
+// invented for it -- and a line in the middle that is empty is still a line.
+@test("the output's last newline does not become a line of its own")
+a_rows_output_ends_where_the_text_does()
+    val o = Outcome(runner_test("x", "t.sysl", 1), Some("why"), "one\n\nthree\n", 2)
+
+    assert_eq(test_row(o, 1),
+              "  FAIL  x  2ms\n        why\n        at t.sysl:1\n" +
+              "        > one\n        > \n        > three\n")
+
+// -- the summary ------------------------------------------------------------------------------------
+
+@test("the summary counts the rows and adds up how long they took")
+the_summary_counts_the_rows()
+    var outcomes: Buf[Outcome] = buf()
+
+    outcomes.push(Outcome(runner_test("a", "t.sysl", 1), None, "", 1))
+    outcomes.push(Outcome(runner_test("b", "t.sysl", 2), None, "", 1))
+    outcomes.push(Outcome(runner_test("c", "t.sysl", 3), Some("why"), "", 1))
+
+    assert_eq(tests_summary(outcomes), "\n2 passed, 1 failed — 3ms\n")
+    assert_eq(tests_summary(buf()), "\n0 passed, 0 failed — 0ms\n")
+
+// -- the verdict ------------------------------------------------------------------------------------
+
+// The status is read as the platform leaves it, and a trap is deliberately not told from an `exit`:
+// both are a test that did not come back.
+@test("a test's verdict is whether it returned, and a trap is not told from an exit")
+a_verdict_is_whether_the_test_returned()
+    val t = runner_test("adds", "t.sysl", 1)
+
+    assert(test_verdict(t, 0, "").is_none(), "returning is passing")
+    assert_eq(test_verdict(t, 1, "").unwrap(), "did not return — exit status 1")
+    assert_eq(test_verdict(t, 133, "").unwrap(), "did not return — exit status 133")
+
+@test("a test that was expected to trap and did not is the failure the other way round")
+a_should_trap_test_that_returned_fails()
+    assert_eq(test_verdict(runner_trapping("t", None), 0, "").unwrap(),
+              "returned, and was expected to trap")
+    assert(test_verdict(runner_trapping("t", None), 133, "").is_none(), "trapping is passing")
+
+@test("and one that named what it would print is held to printing it")
+a_should_trap_test_is_held_to_its_text()
+    val t = runner_trapping("t", Some("out of range"))
+
+    assert_eq(test_verdict(t, 133, "").unwrap(),
+              "trapped, but printed nothing holding \"out of range\"")
+    assert(test_verdict(t, 133, "index 5 out of range\n").is_none(), "the text was printed")
+
+// -- which tests a filter selects ---------------------------------------------------------------------
+
+// Two names, because the two are what a reader has to hand: a name read off a failing report, and a
+// module named to run everything under it.
+@test("a filter matches either the reported name or the key, as a substring of it")
+a_filter_reads_both_names()
+    val t = TTest(module_qualify("geom.plane", "meets"), "two lines meet", false, None, "t.sysl", 1,
+                  no_hooks())
+
+    assert(test_matches(t, None), "no filter takes everything")
+    assert(test_matches(t, Some("lines meet")), "the reported name")
+    assert(test_matches(t, Some("geom.plane")), "the module")
+    assert(test_matches(t, Some("geom.plane.meets")), "the whole key, written with dots")
+    assert(!test_matches(t, Some("circle")), "and nothing else")
+
+@test("and selecting leaves the tests in the order they were written")
+selecting_keeps_the_order()
+    var tests: Buf[TTest] = buf()
+
+    tests.push(runner_test("one", "t.sysl", 1))
+    tests.push(runner_test("two", "t.sysl", 2))
+    tests.push(runner_test("three", "t.sysl", 3))
+
+    val chosen = selected_tests(tests, Some("t"))
+
+    assert_eq(chosen.len(), 2)
+    assert_eq(chosen.at(0).display, "two")
+    assert_eq(chosen.at(1).display, "three")
+
+// -- the marks the dispatcher leaves --------------------------------------------------------------------
+
+// A dead process cannot report which part of it died, so the dispatcher leaves a mark as it crosses
+// each boundary. They are the runner's channel and not the test's, so a failure never shows them.
+@test("the marks the dispatcher writes are taken out of what a failure shows")
+the_marks_are_not_part_of_the_output()
+    assert_eq(unmarked_output(s"before${setup_mark()}after"), "beforeafter")
+    assert_eq(unmarked_output(s"${setup_mark()}a${test_mark()}b"), "ab")
+    assert_eq(unmarked_output("nothing to take out"), "nothing to take out")
+    assert_eq(unmarked_output(""), "")
+
+// -- a hook's row -----------------------------------------------------------------------------------
+
+// A hook that runs alone has no test to hang a failure on, so it borrows a row: what a row needs is a
+// name, a file and a line, and a hook has all three.
+@test("a hook that did not come back is reported under the name it was declared with")
+a_hook_reports_under_its_own_name()
+    var outcomes: Buf[Outcome] = buf()
+
+    outcomes.push(Outcome(TTest("beta$after_all", "after_all", false, None,
+                                "/tmp/p/beta/tests.sysl", 12, no_hooks()),
+                          Some("the module's '@teardown_all', 'beta.after_all', did not return — " +
+                               "exit status 1"), "panic: after_all refused\n", 2))
+
+    assert_eq(tests_rendered(outcomes, 1, 0),
+              "running 1 test\n" +
+              "\n/tmp/p/beta/tests.sysl\n" +
+              "  FAIL  after_all  2ms\n" +
+              "        the module's '@teardown_all', 'beta.after_all', did not return — " +
+              "exit status 1\n" +
+              "        at /tmp/p/beta/tests.sysl:12\n" +
+              "        > panic: after_all refused\n" +
+              "\n0 passed, 1 failed — 2ms\n")
+
+@test("the four hooks are shown by the word each is written as")
+a_hook_is_named_by_its_word()
+    assert_eq(hook_word(Setup), "setup")
+    assert_eq(hook_word(Teardown), "teardown")
+    assert_eq(hook_word(SetupAll), "setup_all")
+    assert_eq(hook_word(TeardownAll), "teardown_all")
+
+    val h = runner_hook(TeardownAll, module_qualify("beta", "after_all"), 12)
+
+    assert_eq(h.file, "t.sysl")
+    assert_eq(module_show(h.func), "beta.after_all")
+
+// -- a tree built, run, and reported -----------------------------------------------------------------
+
+// **The one claim nothing short of building and running can make.** The tree below is the one the
+// reference compiler was run on to write the text asserted here: three tests, one of which prints and
+// one of which fails, and the report is compared line for line with what the reference said.
+//
+// It also settles what no pure function can: that the pieces are emitted **as the run goes** and in
+// the order the tests were written, since what is compared is the concatenation of the sink's calls.
+@test("a tree's tests are built into one binary, run one process each, and reported as the reference reports them")
+a_tree_of_tests_is_built_and_run()
+    if !runner_library() || !runner_toolchain() then return
+
+    val root = runner_project("main.sysl",
+                              "main()\n    print(\"hello\")\n\n" +
+                              "@test\nadds()\n    assert(1 + 1 == 2, \"arithmetic\")\n\n" +
+                              "@test(\"two plus two\")\ntwo_and_two()\n" +
+                              "    print(\"noise from a passing test\")\n" +
+                              "    assert(2 + 2 == 4, \"arithmetic\")\n\n" +
+                              "@test\nfails()\n    assert(false, \"meant to fail\")\n")
+    val file = s"$root/main.sysl"
+
+    val build = test_build_of(file, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return
+        Ok(made) -> made
+
+    if !build.emitted.report.is_empty()
+        remove_dir_all(root).unwrap_or(())
+        assert(false, analysis_report(build.emitted.report))
+        return
+    end if
+
+    assert_eq(build.tests.len(), 3)
+
+    val exe = build_test_binary(file, build, None, DefaultOptimization) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return
+        Ok(built) -> built
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val outcomes = run_selected(exe, build.tests, TestOptions(None, false), 0,
+                                piece -> sink.push(piece))
+
+    discard_test_binary(exe)
+    remove_dir_all(root).unwrap_or(())
+
+    var streamed = ""
+
+    for i in 0..<said.len()
+        streamed = streamed + said.at(i)
+
+    // What the reference answered on this tree, with the temporary directory's name and the
+    // milliseconds the only things standing in for themselves. Both sides go through the same
+    // substitution so that a directory whose random name holds a number is not a difference.
+    assert_eq(runner_timeless(streamed),
+              runner_timeless("running 3 tests\n" +
+                              s"\n$file\n" +
+                              "  ok    adds          Nms\n" +
+                              "  ok    two plus two  Nms\n" +
+                              "  FAIL  fails         Nms\n" +
+                              "        did not return — exit status 1\n" +
+                              s"        at $file:13\n" +
+                              s"        > panic: meant to fail ($file:15)\n" +
+                              "\n2 passed, 1 failed — Nms\n"))
+
+    // The live run and the finished list are built from the same four pieces, so one is the other.
+    assert_eq(streamed, tests_rendered(outcomes, build.tests.len(), 0))
+    assert_eq(outcomes.len(), 3)
+    assert(outcomes.at(0).passed(), "the first test returned")
+    assert(!outcomes.at(2).passed(), "and the last did not")
+end a_tree_of_tests_is_built_and_run
+
+// **A test build keeps what every other build drops, and drops what every other build keeps.** The
+// program's own entry point is not lowered -- the dispatcher stands in its place -- and the `@test`
+// functions, which `strip_tests` takes out of a build that runs none, are the roots everything else
+// survives by.
+@test("a test build keeps its tests and puts the program's own entry point aside")
+a_test_build_keeps_its_tests()
+    if !runner_library() then return
+
+    val root = runner_project("main.sysl",
+                              "main()\n    only_main_reaches_this()\n\n" +
+                              "only_main_reaches_this()\n    print(\"ran\")\n\n" +
+                              "only_the_test_reaches_this() -> int = 7\n\n" +
+                              "@test\nchecks()\n" +
+                              "    assert(only_the_test_reaches_this() == 7, \"seven\")\n")
+    val file = s"$root/main.sysl"
+
+    val build = test_build_of(file, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return
+        Ok(made) -> made
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(build.tests.len(), 1)
+    assert_eq(build.tests.at(0).display, "checks")
+
+    // The dispatcher is what the entry point is, so the program's `main` is nowhere in the text and
+    // what only `main` reached went with it.
+    assert(build.emitted.text.index_of("checks").is_some(), "the test itself is defined")
+    assert(build.emitted.text.index_of("only_the_test_reaches_this").is_some(),
+           "and what the test calls")
+    assert(build.emitted.text.index_of("only_main_reaches_this").is_none(),
+           "what only the program's own entry point reached is not")
+end a_test_build_keeps_its_tests
+
+// A program is allowed to have no tests, and a filter that matched none of the tests there are is a
+// different mistake from a tree that has none -- so each is named and neither is a failure.
+@test("a tree with no tests is not a failure, and the filter that matched none is a different answer")
+a_tree_with_no_tests_says_so()
+    if !runner_library() then return
+
+    val root = runner_project("main.sysl", "main()\n    print(\"hello\")\n")
+    val file = s"$root/main.sysl"
+
+    val build = test_build_of(file, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return
+        Ok(made) -> made
+
+    remove_dir_all(root).unwrap_or(())
+    assert(build.tests.is_empty(), "there are no tests to run")
+
+    var tests: Buf[TTest] = buf()
+
+    tests.push(runner_test("adds", "t.sysl", 1))
+    assert(selected_tests(tests, Some("zzz")).is_empty(), "and a filter can select none of some")
+end a_tree_with_no_tests_says_so
+
+// **A cross target is refused before anything is built**, because both commands execute what they
+// make and only this machine can execute anything.
+@test("'run' and 'test' refuse a machine that is not this one")
+running_a_cross_target_is_refused()
+    if !runner_library() then return
+
+    val root = runner_project("main.sysl", "main()\n    print(\"hello\")\n")
+    val cross = if host_target().name == "aarch64-macos" then "x86_64-linux" else "aarch64-macos"
+
+    test_build_of(s"$root/main.sysl", Some(cross)) match
+        Ok(_) -> assert(false, "a test build for another machine was allowed")
+        Err(refusal) ->
+            assert(refusal.message.index_of(s"'test' runs what it builds, and '$cross' is not " +
+                                            "this machine").is_some(), refusal.message)
+            assert(refusal.message.index_of(s"use 'sysl build --target $cross'").is_some(),
+                   refusal.message)
+
+    var none: Buf[string] = buf()
+
+    run_native_program(s"$root/main.sysl", Some(cross), None, DefaultOptimization, none) match
+        Ok(_) -> assert(false, "a program for another machine was run")
+        Err(refusal) ->
+            assert(refusal.message.index_of(s"'run' executes what it builds, and '$cross' is not " +
+                                            "this machine").is_some(), refusal.message)
+
+    remove_dir_all(root).unwrap_or(())
+end running_a_cross_target_is_refused
+
+// **A program built and run, with what it exited with handed straight back.** A status is the one
+// thing a run reports that nothing else does, and a signal has none of its own -- `128 + n` is what
+// every shell says for one.
+//
+// The program exits with **how many arguments it was given**, which is what makes one number answer
+// both halves: three says the two written after `--` arrived, and that the program's own path arrived
+// in front of them as it does for a program started any other way.
+@test("'run' hands back what the program exited with, and its arguments to the program")
+running_a_program_forwards_its_arguments_and_status()
+    if !runner_library() || !runner_toolchain() then return
+
+    val root = runner_project("main.sysl", "main(args: []string)\n    exit(int(args.len))\n")
+
+    var args: Buf[string] = buf()
+
+    args.push("alpha")
+    args.push("beta")
+
+    val code = run_native_program(s"$root/main.sysl", None, None, DefaultOptimization, args) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return
+        Ok(state) -> state
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 3)
+
+    assert_eq(shell_status(Status.Exited(0)), 0)
+    assert_eq(shell_status(Status.Exited(3)), 3)
+    assert_eq(shell_status(Status.Signalled(5)), 133)
+end running_a_program_forwards_its_arguments_and_status

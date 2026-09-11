@@ -492,6 +492,61 @@ private with_declarations(p: TProgram, externs: Buf[TExtern], funcs: Buf[TFunc])
              p.main_module, p.tests, p.hooks, p.extern_vars, p.test_only, p.destructors,
              p.warnings, p.module_deps)
 
+// **The same program lowered AS a test build: the tests kept, and the program's own entry point put
+// aside.**
+//
+// A program's top-level statements and its `main` are what it does when it is run, and running it is
+// not what a test build does -- so they go, and what stands in their place is the dispatcher the
+// emitter lays down instead.
+//
+// **The tests are the roots**, in place of the `main` that is no longer there, so that everything one
+// of them calls survives and nothing else does. The hooks are roots beside them and for the same
+// reason: the dispatcher lays down an arm that calls each by name, so a hook nothing reaches from a
+// test -- which is every one of them, since nothing calls a hook -- would be pruned out from under
+// its own arm.
+//
+// **The roots nothing in the program names are roots here too.** A handler, an export and a
+// destructor are each reached from somewhere no walk can see, so replacing the roots does not make
+// them reachable from the tests instead: it makes them reachable from nothing, and a destructor
+// dropped that way leaves the release hook calling a function the tree no longer holds.
+tests_only(p: TProgram, own: Buf[string]) -> TProgram
+    val kept = without_program_entry(p)
+    val entries = entry_points(kept, own)
+    val root = roots_of(kept, entries, buf())
+
+    for i in 0..<kept.tests.len()
+        add_string(&root.calls, kept.tests.at(i).func)
+
+    for i in 0..<kept.hooks.len()
+        add_string(&root.calls, kept.hooks.at(i).func)
+
+    val live = reached_from(kept, root)
+
+    for i in 0..<entries.len()
+        add_string(&live.calls, entries.at(i).name)
+
+    var externs: Buf[TExtern] = buf()
+
+    for i in 0..<kept.externs.len()
+        if holds_string(live.calls, kept.externs.at(i).name) then externs.push(kept.externs.at(i))
+
+    var funcs: Buf[TFunc] = buf()
+
+    for i in 0..<kept.funcs.len()
+        if holds_string(live.calls, kept.funcs.at(i).name) then funcs.push(kept.funcs.at(i))
+
+    with_declarations(kept, externs, funcs)
+end tests_only
+
+// The same program with nothing left of what it does when it is run. The module-level `val`s stay:
+// they are storage the program reads rather than work it performs, and a test that reads one would
+// otherwise find it empty.
+private without_program_entry(p: TProgram) -> TProgram =
+    TProgram(p.structs, p.enums, p.vtables, p.externs, p.vals, p.funcs, buf(), None, p.precompiled,
+             p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
+             p.main_module, p.tests, p.hooks, p.extern_vars, p.test_only, p.destructors,
+             p.warnings, p.module_deps)
+
 // **The scaffolding a module's tests are written against, taken out of the build that runs none.**
 //
 // A hook goes with the tests it brackets, and is read from the program rather than from the tests

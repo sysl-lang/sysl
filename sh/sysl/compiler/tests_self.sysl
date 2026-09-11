@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 @tests
 
+import sysl.buf.{Buf, buf}
 import sysl.env.{get as env_var}
 import sysl.fs.remove_dir_all
 import sysl.process.capture
@@ -88,3 +89,79 @@ stage_one_and_stage_two_emit_the_same_text()
             assert(two.len() == one.len(), s"$summary$first_bad")
             assert(differing == 0, s"$summary$first_bad")
 end stage_one_and_stage_two_emit_the_same_text
+
+// **Stage 2 running a suite, which is the thing text identity was standing in for.**
+//
+// A stage that emits the same text is a stage that agrees about every body; a stage that *runs* a
+// suite is a stage whose own dispatcher, process-per-test protocol and report are the ones being
+// compared. This builds the same three tests both stages read, asks stage 2 for the report, and holds
+// it to what stage 1 says in process -- so the ordering of the rows, the padding of the names and the
+// two counts in the summary are all one answer or the comparison fails.
+@test("stage 2 runs a suite and reports it exactly as stage 1 does")
+stage_one_and_stage_two_report_a_suite_the_same_way()
+    stage_two() match
+        None ->
+            print("skipped: SYSL_STAGE2 names no stage-2 binary on this machine")
+            return
+        Some(binary) ->
+            if library_units().is_empty() || !clang_available()
+                print("skipped: the standard module or a C toolchain is not on this machine")
+                return
+            end if
+
+            val root = runner_project("main.sysl",
+                                      "main()\n    print(\"hello\")\n\n" +
+                                      "@test\nadds()\n    assert(1 + 1 == 2, \"arithmetic\")\n\n" +
+                                      "@test(\"two plus two\")\ntwo_and_two()\n" +
+                                      "    print(\"noise from a passing test\")\n" +
+                                      "    assert(2 + 2 == 4, \"arithmetic\")\n\n" +
+                                      "@test\nfails()\n    assert(false, \"meant to fail\")\n")
+            val file = s"$root/main.sysl"
+
+            val theirs = capture(binary, ["test", file], "", [], true) match
+                Err(_) ->
+                    remove_dir_all(root).unwrap_or(())
+                    assert(false, "the stage-2 binary could not be run")
+                    return
+                Ok(answer) -> answer
+
+            val mine = one_suite_report(file) match
+                Err(why) ->
+                    remove_dir_all(root).unwrap_or(())
+                    assert(false, why)
+                    return
+                Ok(text) -> text
+
+            remove_dir_all(root).unwrap_or(())
+
+            // A suite with a failing test in it exits non-zero, which is the runner working rather
+            // than the runner failing -- so what is read is the text and not the status.
+            assert_eq(runner_timeless(theirs.text + theirs.err.unwrap_or("")),
+                      runner_timeless(mine))
+end stage_one_and_stage_two_report_a_suite_the_same_way
+
+// One tree's suite, built and run in this process, as the whole report it comes to.
+private one_suite_report(file: string) -> Result[string, string]
+    val build = test_build_of(file, None) match
+        Err(refusal) -> return Err(refusal.message)
+        Ok(made) -> made
+
+    if !build.emitted.report.is_empty() then return Err(analysis_report(build.emitted.report))
+
+    val exe = build_test_binary(file, build, None, DefaultOptimization) match
+        Err(refusal) -> return Err(refusal.message)
+        Ok(built) -> built
+
+    var said: Buf[string] = buf()
+    val sink = &said
+
+    run_selected(exe, build.tests, TestOptions(None, false), 0, piece -> sink.push(piece))
+    discard_test_binary(exe)
+
+    var out = ""
+
+    for i in 0..<said.len()
+        out = out + said.at(i)
+
+    Ok(out)
+end one_suite_report
