@@ -1022,6 +1022,214 @@ an_enums_image_is_chosen_through_storage()
               "}\n")
 end an_enums_image_is_chosen_through_storage
 
+// **A large aggregate has no business being an LLVM value**, so one built where a caller asked for a
+// register is written into a slot and read back out -- the rule a large array literal has been under
+// since the frame was built, reaching the two forms that had been left out of it. `indirect` is the
+// whole of the test: over `DirectBytes`, and a struct, an array or an enum with more than a tag.
+@test("an enum too large for a register is built in storage, tag and payload, and read back")
+a_large_enum_is_built_through_storage()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Big\n" +
+                  "    a: [20]i64\n" +
+                  "end Big\n" +
+                  "\n" +
+                  "pick(n: int, b: Big) -> Option[Big] = n match\n" +
+                  "    0 -> Some(b)\n" +
+                  "    _ -> None\n" +
+                  "\n" +
+                  "main() = print(pick(0, Big([1; 20])).is_some())\n",
+              "pick"),
+              "define void @pick(ptr noalias sret(%enum.sysl$Option.Big) align 8 %sret.out, i32 %n.param, ptr %b.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %b.addr = alloca %struct.Big\n" +
+              "  %t2 = alloca %enum.sysl$Option.Big\n" +
+              "  %t4 = alloca %enum.sysl$Option.Big\n" +
+              "  %t8 = alloca %enum.sysl$Option.Big\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %b.addr, ptr align 8 %b.param, i64 160, i1 false)\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t3 = icmp eq i32 %t1, 0\n" +
+              "  br i1 %t3, label %match.arm2, label %match.next3\n" +
+              "match.arm2:\n" +
+              "  store i32 0, ptr %t4\n" +
+              "  %t5 = getelementptr %enum.sysl$Option.Big, ptr %t4, i32 0, i32 1\n" +
+              "  %t6 = getelementptr %sysl$Option.Big.Some, ptr %t5, i32 0, i32 0\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %t6, ptr align 8 %b.addr, i64 160, i1 false)\n" +
+              "  %t7 = load %enum.sysl$Option.Big, ptr %t4\n" +
+              "  store %enum.sysl$Option.Big %t7, ptr %t2\n" +
+              "  br label %match.end1\n" +
+              "match.next3:\n" +
+              "  br i1 true, label %match.arm4, label %match.next5\n" +
+              "match.arm4:\n" +
+              "  store i32 1, ptr %t8\n" +
+              "  %t9 = load %enum.sysl$Option.Big, ptr %t8\n" +
+              "  store %enum.sysl$Option.Big %t9, ptr %t2\n" +
+              "  br label %match.end1\n" +
+              "match.next5:\n" +
+              "  unreachable\n" +
+              "match.end1:\n" +
+              "  %t10 = load %enum.sysl$Option.Big, ptr %t2\n" +
+              "  store %enum.sysl$Option.Big %t10, ptr %sret.out\n" +
+              "  ret void\n" +
+              "}\n")
+end a_large_enum_is_built_through_storage
+
+// The same rule on the other aggregate, where a field is a place: a copy from one place to another
+// is a copy of bytes, and reading the value out first would make a first-class aggregate of it for
+// the length of one instruction, which is the whole cost.
+@test("a struct too large for a register is written field by field into a slot of its own")
+a_large_struct_is_built_through_storage()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Big\n" +
+                  "    a: [17]i64\n" +
+                  "end Big\n" +
+                  "\n" +
+                  "struct Wrap\n" +
+                  "    x: i64\n" +
+                  "    b: Big\n" +
+                  "end Wrap\n" +
+                  "\n" +
+                  "pick(n: int, g: Big) -> Wrap = n match\n" +
+                  "    0 -> Wrap(1, g)\n" +
+                  "    _ -> Wrap(2, g)\n" +
+                  "\n" +
+                  "main() = print(pick(0, Big([5; 17])).x)\n",
+              "pick"),
+              "define void @pick(ptr noalias sret(%struct.Wrap) align 8 %sret.out, i32 %n.param, ptr %g.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %g.addr = alloca %struct.Big\n" +
+              "  %t2 = alloca %struct.Wrap\n" +
+              "  %t4 = alloca %struct.Wrap\n" +
+              "  %t8 = alloca %struct.Wrap\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %g.addr, ptr align 8 %g.param, i64 136, i1 false)\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t3 = icmp eq i32 %t1, 0\n" +
+              "  br i1 %t3, label %match.arm2, label %match.next3\n" +
+              "match.arm2:\n" +
+              "  %t5 = getelementptr %struct.Wrap, ptr %t4, i32 0, i32 0\n" +
+              "  store i64 1, ptr %t5\n" +
+              "  %t6 = getelementptr %struct.Wrap, ptr %t4, i32 0, i32 1\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %t6, ptr align 8 %g.addr, i64 136, i1 false)\n" +
+              "  %t7 = load %struct.Wrap, ptr %t4\n" +
+              "  store %struct.Wrap %t7, ptr %t2\n" +
+              "  br label %match.end1\n" +
+              "match.next3:\n" +
+              "  br i1 true, label %match.arm4, label %match.next5\n" +
+              "match.arm4:\n" +
+              "  %t9 = getelementptr %struct.Wrap, ptr %t8, i32 0, i32 0\n" +
+              "  store i64 2, ptr %t9\n" +
+              "  %t10 = getelementptr %struct.Wrap, ptr %t8, i32 0, i32 1\n" +
+              "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %t10, ptr align 8 %g.addr, i64 136, i1 false)\n" +
+              "  %t11 = load %struct.Wrap, ptr %t8\n" +
+              "  store %struct.Wrap %t11, ptr %t2\n" +
+              "  br label %match.end1\n" +
+              "match.next5:\n" +
+              "  unreachable\n" +
+              "match.end1:\n" +
+              "  %t12 = load %struct.Wrap, ptr %t2\n" +
+              "  store %struct.Wrap %t12, ptr %sret.out\n" +
+              "  ret void\n" +
+              "}\n")
+end a_large_struct_is_built_through_storage
+
+// **A computed value has no address of its own**, so reaching into one means giving it a slot first
+// -- and a large one is written into that slot rather than produced and then stored into it, since
+// the slot is what it was going to end up in either way.
+@test("a large temporary reached into is given a slot and built where the slot is")
+a_large_temporary_is_given_a_slot()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Big\n" +
+                  "    a: [20]i64\n" +
+                  "end Big\n" +
+                  "\n" +
+                  "peek() -> i64 = Big([7; 20]).a[3]\n" +
+                  "\n" +
+                  "main() = print(peek())\n",
+              "peek"),
+              "define i64 @peek() {\n" +
+              "entry:\n" +
+              "  %t1 = alloca %struct.Big\n" +
+              "  %t3 = alloca i64\n" +
+              "  %t2 = getelementptr %struct.Big, ptr %t1, i32 0, i32 0\n" +
+              "  store i64 0, ptr %t3\n" +
+              "  br label %fill.test1\n" +
+              "fill.test1:\n" +
+              "  %t4 = load i64, ptr %t3\n" +
+              "  %t5 = icmp ult i64 %t4, 20\n" +
+              "  br i1 %t5, label %fill.elem2, label %fill.done3\n" +
+              "fill.elem2:\n" +
+              "  %t6 = getelementptr i64, ptr %t2, i64 %t4\n" +
+              "  store i64 7, ptr %t6\n" +
+              "  %t7 = add i64 %t4, 1\n" +
+              "  store i64 %t7, ptr %t3\n" +
+              "  br label %fill.test1\n" +
+              "fill.done3:\n" +
+              "  %t8 = getelementptr %struct.Big, ptr %t1, i32 0, i32 0\n" +
+              "  %t9 = icmp ult i64 3, 20\n" +
+              "  br i1 %t9, label %bounds.ok4, label %bounds.bad5\n" +
+              "bounds.bad5:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok4:\n" +
+              "  %t10 = getelementptr i64, ptr %t8, i64 3\n" +
+              "  %t11 = load i64, ptr %t10\n" +
+              "  ret i64 %t11\n" +
+              "}\n")
+end a_large_temporary_is_given_a_slot
+
+// **The right operand of a short-circuit is an ownership region of its own.** A value owned there is
+// made only on the edge the branch is taken, while the region it is registered with is released on
+// every path out of it -- so leaving it in the enclosing region emits the release after the merge,
+// naming a register that does not dominate it. The dispose belongs at the bottom of `sc.rhs`.
+@test("a temporary owned by a short-circuited operand is released on the edge that made it")
+a_short_circuits_right_side_owns_its_own_temporaries()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "enum Tok derives Eq\n" +
+                  "    Word(s: string)\n" +
+                  "    Colon\n" +
+                  "end Tok\n" +
+                  "\n" +
+                  "peek(n: int) -> Tok = if n == 0 then Colon else Word(\"x\")\n" +
+                  "\n" +
+                  "at_colon(c: bool, n: int) -> bool = c && peek(n) == Colon\n" +
+                  "\n" +
+                  "main() = print(at_colon(true, 0))\n",
+              "at_colon"),
+              "define zeroext i1 @at_colon(i1 %c.param, i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %c.addr = alloca i1\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %t2 = alloca i1\n" +
+              "  store i1 %c.param, ptr %c.addr\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i1, ptr %c.addr\n" +
+              "  store i1 %t1, ptr %t2\n" +
+              "  br i1 %t1, label %sc.rhs1, label %sc.end2\n" +
+              "sc.rhs1:\n" +
+              "  %t3 = load i32, ptr %n.addr\n" +
+              "  %t4 = call %enum.Tok @peek(i32 %t3)\n" +
+              "  %t5 = insertvalue %enum.Tok undef, i32 1, 0\n" +
+              "  %t6 = call zeroext i1 @Tok.eq(%enum.Tok %t4, %enum.Tok %t5)\n" +
+              "  store i1 %t6, ptr %t2\n" +
+              "  call void @arc.dispose.Tok(%enum.Tok %t4)\n" +
+              "  br label %sc.end2\n" +
+              "sc.end2:\n" +
+              "  %t7 = load i1, ptr %t2\n" +
+              "  ret i1 %t7\n" +
+              "}\n")
+end a_short_circuits_right_side_owns_its_own_temporaries
+
 // A body with the number off each interned string it names, and everything else left alone.
 private without_form_str_ids(text: string) -> string
     var out: Buf[u8] = buf()

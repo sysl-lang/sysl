@@ -268,9 +268,21 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TUpgrade(value, opt_ty, some, none) -> gen_upgrade(e, value, opt_ty, some, none)
     TEnumAttr(kind, en, arg, _) -> gen_enum_attr(e, kind, en, arg)
 
-    TEnumNew(enum_ty, variant, args) -> gen_enum_new(e, enum_ty, variant, args)
+    // A large one is built where it is going to live and read back out only because this caller
+    // asked for a value -- the same rule a large array literal is under, and for the same reason: an
+    // aggregate that crosses by address has no business being a register. A simple enum is an
+    // integer however many variants it has, so the rule never reaches one.
+    TEnumNew(enum_ty, variant, args) ->
+        if e.layout.indirect(enum_ty) then return through_slot(e, x)
+
+        gen_enum_new(e, enum_ty, variant, args)
+
     TEnumFromInt(value, en) -> gen_expr(e, value)
-    TStructNew(decl, args) -> gen_struct_new(e, decl, args)
+
+    TStructNew(decl, args) ->
+        if e.layout.indirect(Struct(decl)) then return through_slot(e, x)
+
+        gen_struct_new(e, decl, args)
 
     TStructInvCheck(value, decl, inv_fn) ->
         val v = gen_expr(e, value)
@@ -568,9 +580,23 @@ private gen_logical(e: *Emit, op: string, l: TExpr, r: TExpr) -> Val
 
     emit_label(e, rhs_l)
 
+    // **The right side gets a temp region of its own**: anything it makes is released before the
+    // merge, and where the branch is skipped that code never runs at all.
+    //
+    // **And an ownership region of its own, which is the half that is not tidiness.** A slot
+    // registered here is written only where the branch is taken, while the region it is registered
+    // with is released on every path out of it -- so a value owned in a short-circuited operand
+    // would have its release emitted on the edge its store never happened on, naming a register
+    // that does not dominate it. Where nothing is owned, which is nearly always, the pop emits
+    // nothing at all.
+    push_temps(e)
+    push_owned(e)
+
     val rv = gen_expr(e, r)
 
     emit(e, InStore(l_i1(), rv, slot, AccPlain, None))
+    pop_owned(e)
+    pop_temps(e)
     emit_term(e, InBr(end_l))
     emit_label(e, end_l)
 
