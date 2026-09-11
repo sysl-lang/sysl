@@ -35,12 +35,18 @@ struct Manifest
     // that could have named one.
     dev_dependencies: Buf[Dependency]
 
+    // What the project says its machines cannot do, and what one named machine says over the top of
+    // that. A capability neither mentions is provided.
+    capabilities: Buf[(string, bool)]
+    target_capabilities: Buf[(string, string, bool)]
+
     // A key this compiler does not understand is said out loud and then ignored, once per key.
     warnings: Buf[string]
 end Manifest
 
 // A project that said nothing, which is what a missing file means.
-empty_manifest() -> Manifest = Manifest("", "", "", "", buf(), buf(), buf(), buf())
+empty_manifest() -> Manifest =
+    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -59,7 +65,7 @@ end manifest_at
 // everything -- that is what every target did before there was a file to say otherwise -- so what is
 // checked here is only what the project said it needs.
 unmet_requirement(m: Manifest, t: Target) -> Option[string]
-    val given = target_provides(t)
+    val given = target_provides(m, t)
     var missing: Buf[string] = buf()
 
     for i in 0..<m.requires.len()
@@ -77,22 +83,43 @@ unmet_requirement(m: Manifest, t: Target) -> Option[string]
     Some(s"this package requires '${sorted.at(0)}', and '${t.name}' does not provide it")
 end unmet_requirement
 
-// The capabilities a machine has. A hosted system has all of them; a freestanding one has none of
-// the three an operating system supplies.
-private target_provides(t: Target) -> Buf[string]
+// The capabilities a machine provides, which is **what the project says rather than what the
+// registry knows**.
+//
+// A capability the manifest does not mention is provided. The prior is that a machine can do
+// everything -- that is what every target did before there was a file to say otherwise -- so what a
+// manifest records is what a machine *cannot* do, and a target block layers over the project's own
+// policy. Whether a heap exists is a project engineering decision, which is the whole reason this is
+// read out of the file rather than derived from the triple.
+private target_provides(m: &Manifest, t: Target) -> Buf[string]
     var out: Buf[string] = buf()
 
-    out.push("heap")
+    for i in 0..<CoreCapabilities.len
+        val cap = CoreCapabilities[i]
 
-    if os_hosted(t.os)
-        out.push("os")
-        out.push("threads")
-        out.push("float")
-    else
-        out.push("float")
+        if capability_given(m, t.name, cap) then out.push(cap)
 
     out
 end target_provides
+
+// The three a project may take away, which are the ones that gate whether a whole module exists at
+// all. `heap` changes what the language allows and the other two gate which of the standard
+// module's modules a program may name.
+val CoreCapabilities: []const string = ["heap", "os", "posix"]
+
+// Whether the manifest leaves a capability standing: the target's own word first, then the
+// project's, and standing where neither says anything.
+private capability_given(m: &Manifest, target: string, cap: string) -> bool
+    for i in 0..<m.target_capabilities.len()
+        val row = m.target_capabilities.at(i)
+
+        if row.0 == target && row.1 == cap then return row.2
+
+    for i in 0..<m.capabilities.len()
+        if m.capabilities.at(i).0 == cap then return m.capabilities.at(i).1
+
+    true
+end capability_given
 
 // Refuses a project whose manifest asks for a compiler newer than the one in hand.
 //
@@ -216,6 +243,28 @@ read_manifest(text: string) -> Result[Manifest, string]
         None -> buf()
         Some(block) -> conf_flags_set(block)
 
+    val capabilities = conf_at(root, "capabilities") match
+        None -> buf()
+        Some(block) -> conf_flags(block)
+
+    var target_capabilities: Buf[(string, string, bool)] = buf()
+
+    conf_at(root, "targets") match
+        None -> ()
+        Some(block) ->
+            val named = conf_keys(block)
+
+            for i in 0..<named.len()
+                val entry = conf_at(block, named.at(i)).unwrap()
+
+                conf_at(entry, "capabilities") match
+                    None -> ()
+                    Some(caps) ->
+                        val flags = conf_flags(caps)
+
+                        for j in 0..<flags.len()
+                            target_capabilities.push((named.at(i), flags.at(j).0, flags.at(j).1))
+
     val dependencies = read_dependencies(root, "dependencies")?
     val dev = read_dependencies(root, "dev_dependencies")?
 
@@ -228,7 +277,8 @@ read_manifest(text: string) -> Result[Manifest, string]
             warnings.push(s"$ManifestName: '${keys.at(i)}' is not a key this compiler understands, " +
                 "so it was ignored")
 
-    Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, warnings))
+    Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
+                target_capabilities, warnings))
 end read_manifest
 
 // What is wrong with a package's name, or the empty string where nothing is.

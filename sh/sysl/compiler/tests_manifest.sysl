@@ -123,15 +123,40 @@ an_unknown_package_key_is_reported_under_its_path()
     assert_eq(m.warnings.len(), 1)
     assert(m.warnings.at(0).index_of("'package.licence'").is_some(), m.warnings.at(0))
 
-@test("what a package cannot be built without is asked of the machine it is built for")
-a_requirement_is_asked_of_the_machine()
-    val m = read("requires { os = true }")
+// **What a machine provides is what the project says rather than what the registry knows.** A
+// capability the manifest does not mention is provided, whatever the triple -- the prior is that a
+// machine can do everything, so a manifest records what a machine *cannot* do. Whether a heap exists
+// is a project engineering decision, which is why it is read out of the file and not derived.
+@test("a capability the manifest does not mention is provided, whichever machine is asking")
+a_requirement_unmentioned_is_provided()
+    val m = read("requires { os = true, posix = true }")
     val board = target_named("aarch64-freestanding").unwrap()
     val mac = target_named("aarch64-macos").unwrap()
 
-    assert_eq(unmet_requirement(m, board).unwrap(),
-              "this package requires 'os', and 'aarch64-freestanding' does not provide it")
-    assert(unmet_requirement(m, mac).is_none(), "a hosted machine provides it")
+    assert(unmet_requirement(m, board).is_none(), "a bare-metal target the file said nothing about")
+    assert(unmet_requirement(m, mac).is_none(), "and a hosted one")
+
+@test("and a capabilities block is what takes one away, with a target's word over the project's")
+a_capabilities_block_takes_one_away()
+    val m = read("capabilities { os = false }\nrequires { os = true }")
+    val mac = target_named("aarch64-macos").unwrap()
+
+    assert_eq(unmet_requirement(m, mac).unwrap(),
+              "this package requires 'os', and 'aarch64-macos' does not provide it")
+
+    val layered = read("capabilities { os = false }\n" +
+                       "targets { aarch64-macos { capabilities { os = true } } }\n" +
+                       "requires { os = true }")
+
+    assert(unmet_requirement(layered, mac).is_none(), "the machine's own word wins")
+    assert_eq(unmet_requirement(layered, target_named("aarch64-linux").unwrap()).unwrap(),
+              "this package requires 'os', and 'aarch64-linux' does not provide it")
+
+@test("and a word that is not a capability at all is provided by nothing")
+a_requirement_that_names_nothing()
+    assert_eq(unmet_requirement(read("requires { threads = true }"),
+                                target_named("aarch64-macos").unwrap()).unwrap(),
+              "this package requires 'threads', and 'aarch64-macos' does not provide it")
 
 @test("a package at a version is the same bytes for every project, so it lives under the cache")
 a_package_lives_under_the_cache()

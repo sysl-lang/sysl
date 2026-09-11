@@ -204,8 +204,44 @@ private at_enum_variant(p: *Parser) -> bool
     if p.kw_at(2, "*") || p.kw_at(2, "&") || p.kw_at(2, "self") then return false
     if p.kw_at(2, ")") then return !p.kw_at(3, "->") && !p.kw_at(3, "=") && p.peek_at(3) != Newline
 
-    names_a_field(p.peek_at(2)) && (p.kw_at(3, ":") || p.kw_at(3, ")") || p.kw_at(3, ","))
+    if !names_a_field(p.peek_at(2)) then return false
+    if !(p.kw_at(3, ":") || p.kw_at(3, ")") || p.kw_at(3, ",")) then return false
+
+    // **A variant's named payload and an ASSOCIATED FUNCTION's parameter list are spelled the same
+    // as far as the closing bracket**, so what settles it is what comes after one: a result type, an
+    // `=`, or a block is a member, and anything else is a variant. `Circle(r: real)` ends the line
+    // and `of(code: i32) -> BodyKind` does not, which is the whole of the difference and cannot be
+    // seen without reading to the bracket.
+    val after = past_parameters(p, 1)
+
+    !p.kw_at(after, "->") && !p.kw_at(after, "=") &&
+        !(p.peek_at(after) == Newline && p.peek_at(after + 1) == Indent)
 end at_enum_variant
+
+// The index just past the bracket a parameter list opens at `at`, or `at` itself where nothing
+// closes it. A list may wrap inside its own brackets, so a newline is passed over rather than
+// stopped at.
+private past_parameters(p: *Parser, at: usize) -> usize
+    var depth: int = 0
+    var i = at
+
+    while i < at + ParameterLookahead
+        if p.peek_at(i) == Eof then return at
+
+        if p.kw_at(i, "(") then depth += 1
+        else if p.kw_at(i, ")")
+            depth -= 1
+
+            if depth == 0 then return i + 1
+
+        i += 1
+
+    at
+end past_parameters
+
+// How far the reading above will look for a closing bracket. A parameter list longer than this is
+// one nothing in any corpus writes, and a bound is what keeps the lookahead from walking a file.
+private const ParameterLookahead: usize = 256
 
 private parse_enum_variant(p: *Parser) -> EnumVariantDecl
     val start = p.here()
