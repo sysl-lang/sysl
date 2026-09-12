@@ -162,3 +162,53 @@ the_climb_finds_a_manifest()
 
     assert(found.0.is_some(), "the compiler's own tree carries a manifest")
     assert(found.1 <= 8, s"it took ${found.1} steps")
+
+// **A measured `c type` is a type of its own, and a hand-written alias is another spelling of its
+// base.** Both are the same declaration shape -- no range, no predicate, no `new` -- so what tells
+// them apart is the flag saying the compiler wrote this one. It matters where the name is read back:
+// a signature says `Tick` where a transparent alias would have said `uint`, which is the whole point
+// of writing one, the header owning the width and the program naming the typedef.
+//
+// Two blocks of `reference/ffi.md` are what caught it, in both the declaration-table sweep and the
+// whole-program one.
+private signature_of(text: string, name: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    for i in 0..<done.funcs.len()
+        val f = done.funcs.at(i)
+
+        if f.name == name
+            var out = ""
+
+            for j in 0..<f.params.len()
+                if j > 0 then out = out + ", "
+
+                out = out + type_show(f.params.at(j).1)
+
+            return s"($out) -> ${type_show(f.ret_ty)}"
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    s"no function named '$name'"
+end signature_of
+
+@test("a measured 'c type' keeps its name where a signature reads it back")
+a_measured_type_is_a_type_of_its_own()
+    if no_clang() then return
+
+    assert_eq(signature_of(probe("c type\n    Tick = \"uint32_t\"\n\nwait(ticks: Tick) -> Tick\n" +
+                                 "    ticks\n"), "wait"),
+              "(Tick) -> Tick")
+
+@test("and a hand-written alias with nothing narrowed is another spelling of its base")
+a_plain_alias_is_its_base()
+    assert_eq(signature_of("type Tock = uint\n\nf(x: Tock) -> Tock = x\n", "f"),
+              "(uint) -> uint")
