@@ -98,6 +98,10 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             end if
 
             cx.err(span, "this is not something that can be called")
+        // `.Circle(5)` -- the form below with the enum's own name left off, resolved against what
+        // the context expects.
+        ImplicitMember(name) -> implicit_call(cx, span, name, args, expected)
+
         // A member call. A module path folded into a name is a plain call under another spelling,
         // so it is asked about first.
         // `T::Attr(x)` -- a type attribute that carries an operand.
@@ -1421,3 +1425,22 @@ private old_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
     cx.olds = Some(held)
     TExpr(span, TOld(int(idx), texpr_type(te)))
 end old_call
+
+// A leading dot's call form: `.Circle(5)`, the qualified constructor with the enum's name left off.
+implicit_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
+              expected: Option[Type]) -> TExpr
+    if expected.is_none() || expected.unwrap() == Unknown
+        return cx.err(span, s"'.$name' is a member of whatever type the context expects, and " +
+                      "nothing here expects one — write the type's own name in front of the dot. " +
+                      "A trait object expects no single type either, since what may be erased into " +
+                      "one is whatever implements the trait")
+
+    val wanted = variant_from_expected(cx, name, expected)
+
+    if wanted.is_some() then return variant_call(cx, span, wanted.unwrap().0, wanted.unwrap().1, args)
+
+    enum_decl_of(cx, expected.unwrap()) match
+        Some(base) -> cx.err(span, s"enum '${module_show(base)}' has no variant '$name'")
+        None -> cx.err(span, s"'${type_show(expected.unwrap())}' is not an enum, and only a " +
+                       "variant is reached with the type's own name left off")
+end implicit_call

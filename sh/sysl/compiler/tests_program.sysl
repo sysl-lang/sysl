@@ -1603,3 +1603,57 @@ reading_a_declaration_lays_out_nothing()
     assert(found.is_none(), s"a type only a declaration named: ${found.unwrap_or("")}")
     assert(any_holding(names, "Env").is_some(), "the program's own struct is laid out")
 end reading_a_declaration_lays_out_nothing
+
+// **A trailing block is neutral about what it is**: an array of its lines at a collection parameter
+// and a closure over them at a callable one. What decides is the parameter it stands at, which is
+// the type the position expects — so `column(spacing = 3):` with three views under it is the array
+// literal the older form spelled out.
+@test("a trailing block at a collection parameter is the array its lines make")
+a_trailing_block_at_a_collection()
+    if no_library() then return
+
+    val src = "column(children: []int, spacing: int = 0) -> int\n" +
+              "    var n = 0\n\n" +
+              "    for c in children\n" +
+              "        n += c\n\n" +
+              "    n + spacing\n" +
+              "\n" +
+              "use() -> int = column(spacing = 3):\n" +
+              "    1\n" +
+              "    2\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("TBufLit"), out)
+
+@test("and a line of such a block that is not a value is refused by name")
+a_trailing_block_line_must_be_a_value()
+    if no_library() then return
+
+    val said = complaints("take(xs: []int) -> int = 1\n\nuse() -> int = take():\n    val q = 1\n")
+
+    assert(says(said, "every line of a trailing block filling a collection is one of its " +
+                      "elements, so it has to be a value — this one declares a name instead. A " +
+                      "binding goes outside the block, which is then given what it built"),
+           s"${said.len()} said")
+
+// **A leading dot leaves the type's own name off**, and what the position expects is the whole of
+// what resolves it.
+@test("a leading dot names a variant of whatever the position expects")
+a_leading_dot_names_a_variant()
+    if no_library() then return
+
+    val said = complaints("enum Role\n    Error\n    Ok\n\nname(r: Role) -> int = 1\n\n" +
+                          "use() -> int = name(.Error)\n")
+
+    assert_eq(said.len(), 0, if said.is_empty() then "" else said.at(0))
+
+@test("and a position that expects nothing has no type to look the name up in")
+a_leading_dot_with_nothing_expected()
+    if no_library() then return
+
+    val said = complaints("enum Role\n    Error\n    Ok\n\nuse()\n    val q = .Error\n\n    ()\n")
+
+    assert(says(said, "'.Error' is a member of whatever type the context expects, and nothing " +
+                      "here expects one — write the type's own name in front of the dot. A trait " +
+                      "object expects no single type either, since what may be erased into one is " +
+                      "whatever implements the trait"), s"${said.len()} said")

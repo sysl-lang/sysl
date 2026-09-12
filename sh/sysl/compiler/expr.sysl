@@ -171,11 +171,20 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     // whose one member is the body.
     Lambda(params, body, implicit) ->
         closure_expr(cx, e.span, params, body, implicit, expected)
+    // **A block is neutral about what it is**: an array of its lines at a collection parameter and a
+    // closure over them at a callable one. What decides is the parameter it stands at, which is what
+    // the position expects here -- so `column(spacing = 8):` with three views under it is the array
+    // literal the older form spelled out, and `each(xs):` with a body under it is the closure.
     BlockArg(body) ->
-        closure_expr(cx, e.span, buf(), body, true, expected)
+        if collection_expected(expected) then block_as_array(cx, e.span, body, expected)
+        else closure_expr(cx, e.span, buf(), body, true, expected)
 
     // `base with { bg = 9 }` -- the copy and the writes the reader would otherwise have spelled out.
     WithExpr(base, fields) -> with_expr(cx, e.span, base, fields, expected)
+
+    // `.Error`, `.Circle(5)` -- the forms below with the type's own name left off, resolved against
+    // what the context expects (`reference/expressions.md § A leading dot`).
+    ImplicitMember(name) -> implicit_member(cx, e.span, name, expected)
 
     // `T::Attr` -- what a type's own name offers, and `::Id` on an erased value.
     TypeAttr(subject, attr) -> type_attr_expr(cx, e.span, subject, attr)
@@ -1028,3 +1037,95 @@ private payload_free_generic_variant(cx: &Analyzer, name: string) -> bool
 
     false
 end payload_free_generic_variant
+
+// Whether the position a trailing block stands at is a collection, which is what makes the block an
+// array of its lines rather than a closure over them.
+//
+// **A mode says nothing about which reading is meant**, so `&[]T` and `[]T` answer alike.
+private collection_expected(expected: Option[Type]) -> bool
+    val want = expected match
+        None -> return false
+        Some(t) -> t
+
+    inner_of(want) match
+        Slice(_, _) -> true
+        Array(_, _) -> true
+        _ -> false
+end collection_expected
+
+private inner_of(t: Type) -> Type = t match
+    Ref(inner, _) -> inner_of(*inner)
+    Ptr(inner) -> inner_of(*inner)
+    Weak(inner) -> inner_of(*inner)
+    Volatile(inner) -> inner_of(*inner)
+    other -> other
+
+// A trailing block read as the array literal its lines make.
+//
+// **Every line has to be a value**, which is where the form stops short of Swift's result builders
+// and stops short of them deliberately: a binding declares a name rather than producing an element,
+// so it has nothing to contribute to a list. A **loop** is refused by name and it is the one refusal
+// here that is a choice rather than a consequence -- a loop in sysl *is* an expression, so one
+// written here would contribute the single `unit` it evaluates to, which is never what somebody
+// writing `for` inside a list of views meant.
+private block_as_array(cx: &Analyzer, span: Span, body: Buf[Stmt], expected: Option[Type]) -> TExpr
+    var elements: Buf[Expr] = buf()
+
+    for i in 0..<body.len()
+        val s = body.at(i)
+
+        *s.kind match
+            ExprStmt(inner) ->
+                if block_line_is_a_loop(inner)
+                    return cx.err(s.span, "a loop inside a trailing block filling a collection " +
+                                  "would contribute one element and not one per iteration, so it " +
+                                  "is refused rather than read that way — build the elements into " +
+                                  "a 'Buf' before the call and pass a view of it")
+
+                elements.push(inner)
+            _ ->
+                return cx.err(s.span, "every line of a trailing block filling a collection is one " +
+                              "of its elements, so it has to be a value — this one declares a name " +
+                              "instead. A binding goes outside the block, which is then given what " +
+                              "it built")
+
+    type_expr(cx, expr(span, ArrayLit(elements)), expected)
+end block_as_array
+
+private block_line_is_a_loop(e: Expr) -> bool = *e.kind match
+    For(_, _, _, _, _) -> true
+    ConstFor(_, _, _) -> true
+    While(_, _, _, _) -> true
+    DoWhile(_, _, _, _) -> true
+    Loop(_, _) -> true
+    CFor(_, _, _, _, _, _) -> true
+    _ -> false
+
+// `.Error` -- a member of whatever type the context expects, with the type's own name left off.
+//
+// **What the position expects is the whole of what resolves it**, which is why the refusal for a
+// position that expects nothing is a sentence of its own: a discarded statement, an unannotated
+// `var` and an argument of a generic parameter nothing has solved are the ordinary ways to reach it,
+// and none of them has a type to look the name up in.
+//
+// Only the variant reading is built. An associated function or a constant reached this way is the
+// same lookup one step further and is not written anywhere in the org.
+private implicit_member(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TExpr
+    if expected.is_none() || expected.unwrap() == Unknown
+        return cx.err(span, s"'.$name' is a member of whatever type the context expects, and " +
+                      "nothing here expects one — write the type's own name in front of the dot. " +
+                      "A trait object expects no single type either, since what may be erased into " +
+                      "one is whatever implements the trait")
+
+    if variant_of(cx, name, expected).is_some() then return variant_expr(cx, span, name, expected)
+
+    enum_decl_of(cx, expected.unwrap()) match
+        Some(base) -> cx.err(span, s"enum '${module_show(base)}' has no variant '$name'")
+        None -> cx.err(span, s"'${type_show(expected.unwrap())}' is not an enum, and only a " +
+                       "variant is reached with the type's own name left off")
+end implicit_member
+
+
+enum_decl_of(cx: &Analyzer, t: Type) -> Option[string] = underlying(t) match
+    Enum(d) -> Some(d.base)
+    _ -> None
