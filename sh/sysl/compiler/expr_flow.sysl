@@ -624,6 +624,14 @@ private iterated(cx: &Analyzer, span: Span, seq: TExpr, name: string, body: Buf[
     val key = catalog_key(cx.an, "Iterate")
 
     if key.is_none() then return None
+
+    // **A cursor may be a trait object**, and that is what `*Iterate[Item = string]` is for: one loop
+    // serving a terminal editor, a file and a string of test input, none of which the loop names. A
+    // trait object has forgotten which type it holds, so it conforms to nothing -- what it carries
+    // instead is the table, and `next` is a slot in it rather than a name.
+    if walks_through_a_table(cx, cty, key.unwrap())
+        return through_table(cx, span, seq, cty, name, body, expected, label, else_body, discarded)
+
     if !conforms(cx.an, Bound(key.unwrap(), buf()), cty) then return None
 
     val item = assoc_type_opt(cx.an, cty, "Item")
@@ -667,6 +675,81 @@ private iterated(cx: &Analyzer, span: Span, seq: TExpr, name: string, body: Buf[
 
     Some(checked_loop(ctx, span, TExpr(span, TIterate(slot, cty, seq, next, bind, tb, telse, ty))))
 end iterated
+
+// Whether a `for` walks its cursor through a table rather than by name: an erased pointer made
+// against `Iterate` itself.
+//
+// **A trait object made against some *other* trait is not walkable and falls through**, so the
+// refusal a reader gets names the trait they did not implement rather than this case.
+private walks_through_a_table(cx: &Analyzer, cty: Type, iterate: string) -> bool
+    val tr = erased_trait(cty)
+
+    if tr.is_none() then return false
+
+    trait_bound_of(tr.unwrap()).name == iterate
+end walks_through_a_table
+
+// The same walk, over a cursor whose `next` is a slot.
+//
+// The two paths differ in exactly two places and share the rest. The **call** is an index into the
+// table rather than a name, which is what `call_member` builds for a trait object. And the
+// **receiver** is the pointer itself rather than its address: a `*Iterate` already points at the
+// value, where a cursor held by value has to have `next` handed the slot's address.
+private through_table(cx: &Analyzer, span: Span, seq: TExpr, cty: Type, name: string,
+                      body: Buf[Stmt], expected: Option[Type], label: Option[string],
+                      else_body: Option[Buf[Stmt]], discarded: bool) -> Option[TExpr]
+    val item = erased_item(cty)
+
+    if item.is_none()
+        cx.fault(span, s"walking a '${type_show(cty)}' needs to know what it yields, and the " +
+                 "pointer does not say — an erased cursor is written '*Iterate[Item = T]'")
+        return Some(bad_expr(span))
+    end if
+
+    val answer = option_of(cx, span, item.unwrap())
+
+    if answer.is_none() then return Some(bad_expr(span))
+
+    val (opt_ty, some) = answer.unwrap()
+
+    cx.enter()
+
+    val slot = cx.bind_pattern("iter", cty)
+    var none_args: Buf[Expr] = buf()
+
+    val next = call_member(cx, span, TExpr(span, TLoad(slot, cty)), "next", none_args, Some(opt_ty))
+    val u = cx.bind(name, item.unwrap())
+    var captures: Buf[TPattern] = buf()
+
+    captures.push(TBindPattern(u, item.unwrap()))
+
+    val bind = TVariantPattern(opt_ty, some, captures)
+    val ctx = open_loop(cx, span, expected, label)
+    val tb = loop_stmts(cx, body)
+
+    close_loop(cx, ctx)
+    cx.leave()
+
+    val telse = else_body.map(b -> type_value_block(cx, b, expected, discarded))
+    val ty = loop_result_type(cx, span, ctx, telse)
+
+    Some(checked_loop(ctx, span, TExpr(span, TIterate(slot, cty, seq, next, bind, tb, telse, ty))))
+end through_table
+
+// What an erased cursor says it yields, which is the `Item` written out where the pointer was.
+private erased_item(cty: Type) -> Option[Type]
+    val tr = erased_trait(cty)
+
+    if tr.is_none() then return None
+
+    tr.unwrap() match
+        Trait(_, _, assocs) ->
+            for i in 0..<assocs.len()
+                if assocs.at(i).0 == "Item" then return Some(assocs.at(i).1)
+
+            None
+        _ -> None
+end erased_item
 
 // The `Option` of one type, with its `Some` variant -- what a cursor's `next` answers and what one
 // turn of the loop matches against.
