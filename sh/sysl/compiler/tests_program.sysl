@@ -366,6 +366,32 @@ a_type_with_no_cursor_is_refused()
 
     assert(says(said, "walking a 'Q' through 'Iterate' is not typed yet"), s"${said.len()} said")
 
+// **A type with a `Display` of its own writes itself into a buffer before a `%s` reaches it**, and
+// the bytes that land there are what the specifier's width and justification are applied to. Without
+// this the value reached the lowering as though it were already a string and the IR read its bytes
+// out of an enum, which clang refuses — three of the org's bindings died at exactly that line.
+@test("a '%s' over a type with a 'Display' renders it first, and the specifier applies to the bytes")
+a_string_specifier_renders_a_display_value()
+    if no_library() then return
+
+    val src = "enum Colour\n" +
+              "    Red\n" +
+              "    Green\n" +
+              "\n" +
+              "    message(self) -> string = self match\n" +
+              "        Red -> \"red\"\n" +
+              "        Green -> \"green\"\n" +
+              "\n" +
+              "impl Display for Colour\n" +
+              "    display(self, out: *Writer, fmt: FormatSpec) = " +
+              "display_str(self.message(), out, fmt)\n" +
+              "\n" +
+              "use(c: Colour) -> string = format(c, \"%s\")\n"
+    val out = shown(src, "use")
+
+    assert(out.contains("TRender"), out)
+    assert(out.contains("TFormat"), out)
+
 // **A cursor may be a trait object**, and that is what one is for: a console loop serving a terminal
 // editor, a file and a string of test input, none of which the loop names. A trait object conforms
 // to nothing -- it has forgotten which type it holds -- so the walk reads `next` out of the table

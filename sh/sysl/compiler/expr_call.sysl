@@ -307,8 +307,7 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
 
     if name == "format" && args.len() == 2 then
         *args.at(1).kind match
-            StrLit(spec) ->
-                return Some(TExpr(span, TFormat(type_expr_bare(cx, args.at(0)), spec)))
+            StrLit(spec) -> return Some(format_call(cx, span, args.at(0), spec))
             _ -> ()
 
     if name == "ptr_cast" && args.len() == 1 then
@@ -568,6 +567,35 @@ end enum_cast
 // A constrained subtype's name in call position wraps a base value into the subtype, checking it.
 // Unlike an implicit produce site, the cast is written, so it applies even where the base would not
 // flow in on its own.
+// **`format(x, "%…")`** -- one value rendered through a printf specifier, which is what a hole with
+// a specifier after it desugars to.
+//
+// **`%s` takes a string and nothing else, and the two ways of not being one are told apart.** A type
+// with a `Display` of its own writes itself into a buffer first and the bytes that land there are
+// what the specifier's width and justification are applied to -- so `${err}%s` over an error type
+// prints its sentence, which is the whole point of writing one. A **scalar** has a renderer of its
+// own and no `Display` to reach, so `${n}%s` over an integer is a mistake in the specifier rather
+// than a value to convert: printing `7` there would be answering a question nobody asked, and the
+// reader meant `%d`.
+//
+// Without the first half a `Display` value reached the lowering as though it were already a string
+// and the emitted IR read its bytes out of an enum, which clang refuses -- three of the org's
+// bindings died at exactly that line.
+private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string) -> TExpr
+    val v = type_expr_bare(cx, arg)
+    val ty = texpr_type(v)
+
+    if ty == Unknown then return TExpr(span, TFormat(v, spec))
+    if !spec_is_str(spec_conversion(spec)) then return TExpr(span, TFormat(v, spec))
+    if ty == Str then return TExpr(span, TFormat(v, spec))
+
+    if scalar_render(ty)
+        return cx.err(span, s"format '$spec' expects a string, but the value has type " +
+                      type_show(ty))
+
+    TExpr(span, TFormat(str_render(cx, span, v), spec))
+end format_call
+
 // What a plain alias stands for, where the resolution has already made it real.
 //
 // **A plain alias records the base type ITSELF** rather than a `Constrained` record over it, which
