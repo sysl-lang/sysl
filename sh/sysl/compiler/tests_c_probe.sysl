@@ -1,0 +1,132 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What the C compiler answers when a file asks it a question, and what a file that asked a bad one
+// is told.
+//
+// **Every one of these runs a real clang**, which is the only thing that could answer them: the
+// point of a `c const` is that the number is the machine's rather than the author's. They return
+// saying so where there is no toolchain.
+
+private no_clang() -> bool
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end no_clang
+
+private measured(text: string) -> Buf[string] = stmt_diagnostics(text)
+
+private probe(body: string) -> string =
+    s"@include(\"<stdint.h>\")\n@include(\"<stddef.h>\")\n\n$body"
+
+@test("a 'c const' holds the number the C compiler worked out, and an array may be that long")
+a_measured_constant_bounds_an_array()
+    if no_clang() then return
+
+    // The shape every C binding in the org writes: storage a caller places, sized by the header
+    // rather than by a comment saying which header to look in.
+    assert_eq(measured(probe("c const\n    WORDS: usize = \"sizeof(uint64_t)\"\n\n" +
+                             "f() -> usize\n    var xs: [WORDS]u8 = [0; WORDS]\n\n    xs.len\n")).len(), 0)
+
+@test("and the number is the machine's: an expression over macros is folded by C, not by hand")
+a_measured_constant_is_the_machines()
+    if no_clang() then return
+
+    assert_eq(measured(probe("c const\n    BITS: u32 = \"CHAR_BIT * sizeof(uint32_t)\"\n\n" +
+                             "f() -> u32 = BITS\n")).len(), 1)
+
+    assert_eq(measured(probe("@include(\"<limits.h>\")\nc const\n" +
+                             "    BITS: u32 = \"CHAR_BIT * sizeof(uint32_t)\"\n\n" +
+                             "f() -> u32 = BITS\n")).len(), 0)
+
+@test("a value the declared type cannot hold is refused with the number and the range")
+a_value_out_of_range_is_refused()
+    if no_clang() then return
+
+    val said = measured(probe("c const\n    N: u8 = \"300\"\n\nf() -> u8 = N\n"))
+
+    assert_eq(said.len(), 1)
+    assert_eq(said.at(0), "'300' is 300 here, which 'u8' cannot hold — it holds 0 to 255")
+
+@test("a negative number reaches a signed type and is refused by an unsigned one")
+a_negative_number_keeps_its_sign()
+    if no_clang() then return
+
+    assert_eq(measured(probe("c const\n    N: i32 = \"-5\"\n\nf() -> i32 = N\n")).len(), 0)
+
+    val said = measured(probe("c const\n    N: u16 = \"-5\"\n\nf() -> u16 = N\n"))
+
+    assert_eq(said.len(), 1)
+    assert(said.at(0).contains("cannot hold"), said.at(0))
+
+@test("a 'c const' reads a number, so a type that is not one is named")
+a_type_that_is_not_a_number()
+    if no_clang() then return
+
+    val said = measured(probe("c const\n    S: string = \"1\"\n\nf() -> string = S\n"))
+
+    assert(said.at(0).starts_with("'string' is not a number"), said.at(0))
+
+@test("a header the C compiler cannot find is its own words, not a paraphrase")
+a_header_that_is_not_there()
+    if no_clang() then return
+
+    val said = measured("@include(\"no_such_header_of_ours.h\")\n\n" +
+                        "c const\n    N: int = \"1\"\n\nf() -> int = N\n")
+
+    assert(said.at(0).starts_with("the C compiler refused this file's 'c const' block:"), said.at(0))
+    assert(said.at(0).contains("no_such_header_of_ours.h"), said.at(0))
+
+@test("a 'c type' is a transparent subtype of the integer C says the typedef is")
+a_measured_typedef()
+    if no_clang() then return
+
+    // `size_t` is unsigned and the machine's address width, and nothing in the file says so: what
+    // makes this a measurement rather than a guess is that the answer moves with the target.
+    assert_eq(measured(probe("c type\n    Size = \"size_t\"\n\nf(n: Size) -> usize = usize(n)\n")).len(),
+              0)
+
+    // A signed one is told from an unsigned one, which a same-width integer standing in for both
+    // would not have been.
+    assert_eq(measured(probe("c type\n    Off = \"int32_t\"\n\nf(n: Off) -> i32 = n\n")).len(), 0)
+    assert_eq(measured(probe("c type\n    Off = \"int32_t\"\n\nf(n: Off) -> u32 = n\n")).len(), 1)
+
+@test("a 'c type' names an integer, so a struct is refused by name")
+a_typedef_that_is_not_an_integer()
+    if no_clang() then return
+
+    val said = measured(probe("c type\n    D = \"struct { int a; }\"\n\nf(n: D) -> int = 1\n"))
+
+    assert(said.at(0).starts_with("the C compiler says"), said.at(0))
+    assert(said.at(0).contains("is not an integer type"), said.at(0))
+
+@test("a constant declared at a 'c type' is read at the width that same probe measured")
+a_constant_measured_against_a_measured_type()
+    if no_clang() then return
+
+    assert_eq(measured(probe("c type\n    Size = \"size_t\"\n\nc const\n" +
+                             "    N: Size = \"sizeof(uint32_t)\"\n\nf() -> Size = N\n")).len(), 0)
+
+@test("a file with no block anywhere asks the C compiler nothing")
+a_file_with_no_block_asks_nothing()
+    // It is the absence that is being pinned: `c_probe_wanted` is what keeps a feature for binding C
+    // from being a tax on programs that bind none, and nothing else here would notice it going.
+    val parsed = parse(source_of("test.sysl", "f() -> int = 1\n"))
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+    assert(!c_probe_wanted(units))
+
+    val asks = parse(source_of("test.sysl", "c const\n    N: int = \"1\"\n"))
+
+    var two: Buf[Program] = buf()
+
+    two.push(asks.program)
+    assert(c_probe_wanted(two))

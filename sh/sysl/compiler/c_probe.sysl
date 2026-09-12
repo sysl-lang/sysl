@@ -1,0 +1,835 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder, StrBuilder, parse_real}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, read_text}
+import sysl.process.capture
+
+// **A `c const` and a `c type` are questions put to the C compiler, and this is where they are
+// asked** (`reference/ffi.md § c const`). A block is lowered into ordinary declarations before
+// anything else reads the file: a `c const` becomes a `const` holding the number clang worked out,
+// and a `c type` becomes a transparent subtype of the integer clang says the typedef is.
+//
+// **What makes it worth having is that the alternative is a number somebody copied.** `sizeof(T)`,
+// a bit written as `1 << 14`, an enumerator's value: each is correct on the machine it was read off
+// and nothing checks it anywhere else. A `[c.ASYNC_WORDS]u8` field is the shape this exists for --
+// storage a caller places, sized by the header rather than by a comment saying which header to look
+// in.
+//
+// **A compilation with no block anywhere never looks for a clang**, which is what keeps a feature
+// for binding C from being a tax on programs that bind none.
+
+// The prefixes a probe's globals are named with. Long and unmistakable because they share a
+// translation unit with somebody else's headers, and a collision there would be a compile error
+// blaming the reader's C.
+private const ConstMarker: string = "__sysl_c_const_"
+private const KindMarker: string = "__sysl_c_type_kind_"
+private const SizeMarker: string = "__sysl_c_type_size_"
+private const ObjMarker: string = "__sysl_c_type_obj_"
+private const CharMarker: string = "__sysl_c_char_signed"
+
+// What a `c const`'s written type turns out to be, as far as the file alone can say -- which is all
+// of it for a primitive and half of it for one measured against a `c type` in the same file.
+//
+// **`KnownLater` is a knot untied.** A constant declared at a `c type` is circular against the
+// probe: the global has to be written before clang runs, and how wide it should be written is one of
+// the answers clang is being asked for. So it is carried at the full unsigned width and the same
+// probe's measurement says how to read it.
+private enum CDeclared
+    KnownNow(bits: int, signed: bool, floating: bool, written: string)
+    KnownLater(index: usize, c: string, written: string)
+end CDeclared
+
+// One C type as the probe describes it: which integer C says it is, and how wide that is here.
+private struct CMeasured
+    kind: int
+    size: int
+end CMeasured
+
+// One global the probe printed: which line it answers for, the carrier it crossed on, and the value
+// as LLVM wrote it.
+private struct CGlobal
+    index: usize
+    ty: string
+    operand: string
+end CGlobal
+
+// Whether any file of this compilation asks a question of the C compiler.
+c_probe_wanted(units: Buf[Program]) -> bool
+    for i in 0..<units.len()
+        val body = units.at(i).body
+
+        for j in 0..<body.len()
+            *body.at(j).kind match
+                CConstBlock(_) -> return true
+                CTypeBlock(_) -> return true
+                _ -> ()
+
+    false
+end c_probe_wanted
+
+// Every file's blocks lowered to ordinary declarations, with whatever could not be measured reported
+// on the analysis and its file emptied so that nothing downstream reads a block.
+c_probe_lower(a: &Analysis, units: Buf[Program], t: Target) -> Buf[Program]
+    if !c_probe_wanted(units) then return units
+
+    var out: Buf[Program] = buf()
+
+    for i in 0..<units.len()
+        val unit = units.at(i)
+
+        // **A probe is a C compilation, so a file carrying one asks for headers.** A file that also
+        // declares `@requires(posix)` has said which machines it is for, and a freestanding target
+        // is not one of them -- there is no `<regex.h>` for a bare Cortex-M and no reason there
+        // should be. The body has to go and not merely the blocks, a `c const` being what the
+        // declarations around it are written in terms of; **the header stays so the module goes on
+        // being answerable**, so that a program naming it on such a target is told what it requires
+        // rather than told the name does not exist.
+        if unmeasurable(unit, t) then out.push(unit with { body = buf() })
+        else out.push(lower_unit(a, unit, t))
+
+    out
+end c_probe_lower
+
+private unmeasurable(unit: Program, t: Target) -> bool
+    if os_hosted(t.os) then return false
+
+    for i in 0..<unit.capabilities.len()
+        val c = unit.capabilities.at(i)
+
+        c.direction match
+            Requires -> if c.name == CapOs || c.name == CapPosix then return true
+            _ -> ()
+
+    false
+end unmeasurable
+
+private lower_unit(a: &Analysis, unit: Program, t: Target) -> Program
+    var consts: Buf[CConstDecl] = buf()
+    var types: Buf[CTypeDecl] = buf()
+
+    for i in 0..<unit.body.len()
+        *unit.body.at(i).kind match
+            CConstBlock(cs) ->
+                for j in 0..<cs.len()
+                    consts.push(cs.at(j))
+            CTypeBlock(ts) ->
+                for j in 0..<ts.len()
+                    types.push(ts.at(j))
+            _ -> ()
+
+    if consts.is_empty() && types.is_empty() then return unit
+
+    var plan: Buf[CDeclared] = buf()
+
+    for i in 0..<consts.len()
+        plan.push(declared_type(a, unit, consts.at(i), types))
+
+    val answers = measure(a, unit, consts, plan, types, t) match
+        None -> return unit with { body = buf() }
+        Some(found) -> found
+
+    // Consumed **in order** rather than looked up by name. A file may declare the same name in two
+    // blocks -- which the analyzer refuses, and refuses on the merits -- and a lookup would have
+    // quietly given both lines the same answer first, so what got reported was a duplicate of a
+    // declaration one of them never had.
+    var folded: Buf[Stmt] = buf()
+
+    for i in 0..<consts.len()
+        folded.push(measured_const(a, consts.at(i), plan.at(i), answers, i))
+
+    var aliases: Buf[Stmt] = buf()
+
+    for i in 0..<types.len()
+        aliases.push(measured_type(a, types.at(i), answers.1.at(i), answers.2))
+
+    var body: Buf[Stmt] = buf()
+    var next_const: usize = 0
+    var next_type: usize = 0
+
+    for i in 0..<unit.body.len()
+        val s = unit.body.at(i)
+
+        *s.kind match
+            CConstBlock(cs) ->
+                for j in 0..<cs.len()
+                    body.push(folded.at(next_const))
+                    next_const += 1
+            CTypeBlock(ts) ->
+                for j in 0..<ts.len()
+                    body.push(aliases.at(next_type))
+                    next_type += 1
+            _ -> body.push(s)
+
+    unit with { body = body }
+end lower_unit
+
+// What the C compiler said, asked once for the whole file: the value of every constant as LLVM wrote
+// it, a measurement per type, and whether plain `char` is signed here.
+//
+// A header that will not compile is a real possibility -- the wrong `-D`, a missing sibling header --
+// so clang's own words are quoted rather than paraphrased, and the message says which kind of block
+// was being measured so that a reader knows which lines to look at.
+private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
+                types: Buf[CTypeDecl], t: Target) -> Option[(Buf[CGlobal], Buf[CMeasured], bool)]
+    val where = if !consts.is_empty() then consts.at(0).span
+    else if !types.is_empty() then types.at(0).span
+    else span_zero()
+
+    val clang = find_clang(t, None) match
+        Err(why) -> return probe_fault(a, where, why)
+        Ok(found) -> found
+
+    val dir = make_temp_dir("sysl-cprobe") match
+        Err(_) -> return probe_fault(a, where, "cannot make a directory to write a C probe in")
+        Ok(made) -> made
+
+    val src = join_path(dir, "probe.c")
+
+    write_text(src, probe_text(unit, consts, plan, types)) match
+        Err(_) ->
+            remove_dir_all(dir).unwrap_or(())
+            return probe_fault(a, where, s"cannot write $src")
+        Ok(_) -> ()
+
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${t.triple}")
+    args.push("-S")
+    args.push("-emit-llvm")
+    args.push("-O0")
+
+    // C resolves `#include "foo.h"` relative to the file doing the including, and the probe is a
+    // temporary file somewhere else entirely -- so without this a header the module carries beside
+    // its own source cannot be found at all.
+    //
+    // It goes **before** anything a probe answered, so a header the module carries wins over one of
+    // the same name elsewhere on the machine -- which is the C convention for a quoted include, and
+    // the answer a reader of the module would expect.
+    parent_of(unit.src.name) match
+        Some(beside) -> args.push(s"-I$beside")
+        None -> ()
+
+    // **And a binding whose header is the installed library's needs to be told where that is.**
+    // `uv.h` is not beside `libuv.sysl`; it is wherever this machine put libuv, which is the one
+    // thing the package's `pkg_config` block was written to find out.
+    val probed = probe_cflags_for(unit.src.name)
+
+    for i in 0..<probed.len()
+        args.push(probed.at(i))
+
+    args.push("-o")
+    args.push("-")
+    args.push(src)
+
+    val said = capture(clang, args.view(), "", [], true) match
+        Err(_) ->
+            remove_dir_all(dir).unwrap_or(())
+            return probe_fault(a, where, s"cannot run '$clang'")
+        Ok(got) -> got
+
+    remove_dir_all(dir).unwrap_or(())
+
+    if !said.status.ok()
+        val complaint = said.err.unwrap_or("")
+
+        return probe_fault(a, where, s"the C compiler refused this file's " +
+            s"${blocks_named(consts, types)}:\n${complaint.trim()}")
+
+    val globals = read_globals(said.text)
+
+    var values: Buf[CGlobal] = buf()
+
+    for i in 0..<consts.len()
+        marked(globals, ConstMarker, i) match
+            None -> return silent(a, consts.at(i).span, s"'${consts.at(i).c}'")
+            Some(g) -> values.push(g)
+
+    var measured: Buf[CMeasured] = buf()
+
+    for i in 0..<types.len()
+        val kind = marked(globals, KindMarker, i)
+        val size = marked(globals, SizeMarker, i)
+
+        if kind.is_none() || size.is_none() then return silent(a, types.at(i).span, s"'${types.at(i).c}'")
+
+        measured.push(CMeasured(int(decimal_of(kind.unwrap().operand)),
+                                int(decimal_of(size.unwrap().operand))))
+
+
+
+    var char_signed = false
+
+    for i in 0..<globals.len()
+        if globals.at(i).index == 0 && globals.at(i).ty == "char-signed"
+            char_signed = decimal_of(globals.at(i).operand) != 0
+
+    Some((values, measured, char_signed))
+end measure
+
+// Where the headers a file's probe includes live on this machine, asked of the package the file
+// belongs to.
+//
+// **It is asked of the file rather than of the build**, which is what makes it answerable here at
+// all: a probe runs inside the analysis, which holds no project, while a file's own path leads
+// straight up to the manifest that named the library. It is also the narrower reading and the right
+// one -- `uv.h` is libuv's package's business, and a consumer that happens to depend on something
+// else has nothing to say about where it is.
+//
+// A machine that cannot answer says nothing rather than refusing: the probe then fails on the
+// missing header, which is a message naming the file the reader has to go and find.
+private probe_cflags_for(file: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var dir = parent_of(file)
+
+    loop
+        val here = dir match
+            None -> return out
+            Some(found) -> found
+
+        if read_text(join_path(here, ManifestName)).is_ok()
+            manifest_at(here) match
+                Err(_) -> return out
+                Ok(m) ->
+                    for i in 0..<m.pkg_config.len()
+                        pkg_config_query(m.pkg_config.at(i).0) match
+                            Err(_) -> ()
+                            Ok(answer) ->
+                                for j in 0..<answer.cflags.len()
+                                    out.push(answer.cflags.at(j))
+
+            return out
+        end if
+
+        dir = parent_of(here)
+end probe_cflags_for
+
+private probe_fault(a: &Analysis, where: Span, why: string) -> Option[(Buf[CGlobal], Buf[CMeasured], bool)]
+    a.fault(empty_scope(), where, why)
+    None
+
+// The C compiled and the probe emitted nothing for a line, which is sysl's bug and not the
+// programmer's -- so the message says so rather than sending them back to their own C.
+private silent(a: &Analysis, where: Span, what: string) -> Option[(Buf[CGlobal], Buf[CMeasured], bool)]
+    a.fault(empty_scope(), where, s"the C compiler accepted $what and then emitted nothing for it, " +
+        "so there is no answer to read — this is a bug in sysl's probe rather than in what was " +
+        "written")
+    None
+
+// Whichever blocks this file actually wrote, for the refusal to name -- a message about a `c const`
+// block sends a reader to the wrong lines when what the file has is a `c type`.
+private blocks_named(consts: Buf[CConstDecl], types: Buf[CTypeDecl]) -> string =
+    if consts.is_empty() then "'c type' block"
+    else if types.is_empty() then "'c const' block"
+    else "'c const' and 'c type' blocks"
+
+// The translation unit put to clang.
+//
+// Every constant's global is **declared at the width the answer is read at** rather than at the
+// expression's own, which is what makes one reading enough: a `sizeof` is `size_t` and a macro may
+// be anything at all, and both become `i64` here. The cast is explicit so that narrowing is the C
+// compiler's decision and shows up in its own warnings rather than in sysl's parsing.
+//
+// **It is not cast through the C type**, though that reads as the faithful thing to do. C would
+// *narrow* -- `(uint8_t)800` is `32` -- and the value would then pass a range check it should have
+// failed, which is the one refusal this feature exists for. The declared type is a claim about the
+// value, so the value has to arrive whole enough to contradict it.
+//
+// A type is described through an **object of it**, because that is the one form that stays legal
+// whatever the typedef turns out to be: `_Generic` wants a complete type and nothing more, so a
+// struct reaches the `default` arm instead of failing to compile, while a cast would have been a C
+// error for exactly the types the refusal is written for.
+private probe_text(unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
+                   types: Buf[CTypeDecl]) -> string
+    var out = str_builder()
+
+    for i in 0..<unit.includes.len()
+        out.push(s"#include ${quoted_header(unit.includes.at(i).header)}\n")
+
+    for i in 0..<consts.len()
+        val carrier = plan.at(i) match
+            KnownNow(_, signed, floating, _) ->
+                if floating then "double" else if signed then "long long" else "unsigned long long"
+            // A constant declared at a `c type` is carried unsigned, because the signedness that
+            // would have chosen the carrier is one of the answers this same probe is being asked
+            // for. Nothing is lost: the IR prints an `i64` bit pattern whichever carrier is written.
+            KnownLater(_, _, _) -> "unsigned long long"
+
+        out.push(s"$carrier $ConstMarker$i = ($carrier)(${consts.at(i).c});\n")
+
+    for i in 0..<types.len()
+        val c = types.at(i).c
+
+        out.push(s"static $c $ObjMarker$i;\n")
+        out.push(s"long long $KindMarker$i = _Generic($ObjMarker$i,${generic_arms()});\n")
+        out.push(s"long long $SizeMarker$i = (long long)sizeof($c);\n")
+
+    // Asked once for the whole probe rather than once per type, since it is a fact about the machine
+    // and not about any typedef -- and asked at all only where a `c type` might read it.
+    if !types.is_empty() then out.push(s"long long $CharMarker = (char)-1 < 0;\n")
+
+    out.finish()
+end probe_text
+
+// The `_Generic` association list, and the numbering the answers are read back with. `0` is the
+// `default` arm, which is every type this feature does not resolve.
+private generic_arms() -> string =
+    " _Bool: 1, char: 2, signed char: 3, unsigned char: 4, short: 5, unsigned short: 6, int: 7," +
+    " unsigned int: 8, long: 9, unsigned long: 10, long long: 11, unsigned long long: 12, default: 0"
+
+// A header as C spells it. A name already carrying its own `<…>` or `"…"` is passed through, so
+// `@include("<stdint.h>")` reaches a system header and `@include("qcbor.h")` reaches one beside the
+// module -- which is the same choice a C file makes and is not sysl's to make for it.
+private quoted_header(header: string) -> string =
+    if header.starts_with("<") || header.starts_with("\"") then header else s"\"$header\""
+
+// -- reading the answers back ----------------------------------------------------------------
+
+// Every global the probe printed, as LLVM writes one:
+// `@__sysl_c_const_3 = dso_local global i64 80`.
+//
+// `dso_local` is on some targets and off on others, and `global` becomes `constant` depending on how
+// the definition is written -- so the line is read by finding whichever of those two words is there
+// and taking the two words after it. Reading the width as `i64` is not a guess: the probe declares
+// every integer global `long long` or `unsigned long long` precisely so that the IR has one width on
+// every machine and there is no per-target parsing to get wrong.
+private read_globals(ir: string) -> Buf[CGlobal]
+    var out: Buf[CGlobal] = buf()
+    val lines = lines_of(ir)
+
+    for i in 0..<lines.len()
+        val words = probe_words(lines.at(i))
+
+        if words.len() < 5 then continue
+        if !words.at(0).starts_with("@") then continue
+        if words.at(1) != "=" then continue
+
+        var at: usize = 2
+        var found = false
+
+        while at + 2 < words.len()
+            if words.at(at) == "global" || words.at(at) == "constant"
+                found = true
+                break
+
+            at += 1
+
+        if !found then continue
+
+        val name = words.at(0)[1..<words.at(0).bytes.len]
+        val ty = words.at(at + 1)
+        val operand = trimmed_comma(words.at(at + 2))
+
+        if name == CharMarker then out.push(CGlobal(0, "char-signed", operand))
+        else
+            numbered(name, ConstMarker) match
+                Some(n) -> out.push(CGlobal(n, ty, operand))
+                None -> numbered(name, KindMarker) match
+                    Some(n) -> out.push(CGlobal(n, s"kind-$ty", operand))
+                    None -> numbered(name, SizeMarker) match
+                        Some(n) -> out.push(CGlobal(n, s"size-$ty", operand))
+                        None -> ()
+
+    out
+end read_globals
+
+private numbered(name: string, marker: string) -> Option[usize]
+    if !name.starts_with(marker) then return None
+
+    val digits = name[marker.bytes.len..<name.bytes.len]
+
+    if digits == "" then return None
+
+    for i in 0..<digits.bytes.len
+        if digits.bytes[i] < u8('0') || digits.bytes[i] > u8('9') then return None
+
+    Some(usize(number_of(digits, 10)))
+end numbered
+
+private marked(globals: Buf[CGlobal], marker: string, index: usize) -> Option[CGlobal]
+    val want = if marker == KindMarker then "kind-" else if marker == SizeMarker then "size-" else ""
+
+    for i in 0..<globals.len()
+        val g = globals.at(i)
+
+        if g.index == index && g.ty.starts_with(want) && g.ty != "char-signed"
+            if want != "" || (g.ty == "i64" || g.ty == "double") then return Some(g)
+
+    None
+end marked
+
+private probe_words(line: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var start: usize = 0
+    var i: usize = 0
+
+    while i < line.bytes.len
+        if line.bytes[i] == u8(' ') || line.bytes[i] == u8('\t')
+            if i > start then out.push(line[start..<i])
+
+            start = i + 1
+
+        i += 1
+
+    if line.bytes.len > start then out.push(line[start..<line.bytes.len])
+
+    out
+end probe_words
+
+private trimmed_comma(word: string) -> string =
+    if word.ends_with(",") then word[0..<(word.bytes.len - 1)] else word
+
+// One decimal operand as a number. LLVM prints an `i64` as a signed decimal whatever the C type was,
+// so an unsigned value past the signed ceiling comes back negative and is reinterpreted where it is
+// read rather than here.
+private decimal_of(text: string) -> i64
+    if text.starts_with("-") then -number_of(text[1..<text.bytes.len], 10)
+    else number_of(text, 10)
+
+// -- what a line was declared at -------------------------------------------------------------
+
+// The declared type of a `c const`, held to being a number -- or a transparent subtype of one.
+//
+// **A name is followed rather than refused**, because a transparent subtype *is* its base: what is
+// followed is this file's own declarations, a `c type` the same probe measures or a `type` whose
+// base reaches an integer. **A name from another module is refused by name**: a block is one
+// question put to one file's headers, and a type measured against some other file's is not an answer
+// this one can use.
+private declared_type(a: &Analysis, unit: Program, c: CConstDecl,
+                      types: Buf[CTypeDecl]) -> CDeclared
+    var seen: Buf[string] = buf()
+    var written_ref = c.typ
+
+    loop
+        val name = *written_ref.kind match
+            NamedType(n, args) -> if args.is_empty() then n else ""
+            _ -> ""
+
+        if name == ""
+            return not_a_number(a, c)
+
+        scalar_named(name, int(a.tables.layout.word_bits)) match
+            Some(found) -> found match
+                Integer(bits, signed, _) -> return KnownNow(bits, signed, false, name)
+                Floating(bits) -> return floating_kind(a, c, bits, name)
+                _ -> return not_a_number(a, c)
+            None -> ()
+
+        plain_width(name) match
+            Some(found) -> found match
+                Integer(bits, signed, _) -> return KnownNow(bits, signed, false, name)
+                Floating(bits) -> return floating_kind(a, c, bits, name)
+                _ -> return not_a_number(a, c)
+            None -> ()
+
+        if holds_string(seen, name)
+            a.fault(empty_scope(), c.span,
+                    s"'$name' is declared in terms of itself, so which number it is has no answer")
+            return KnownNow(32, true, false, name)
+
+        seen.push(name)
+
+        var measured: Option[usize] = None
+
+        for i in 0..<types.len()
+            if measured.is_none() && types.at(i).name == name then measured = Some(i)
+
+        if measured.is_some()
+            return KnownLater(measured.unwrap(), types.at(measured.unwrap()).c, type_text(c.typ))
+
+        var base: Option[TypeRef] = None
+
+        for i in 0..<unit.body.len()
+            *unit.body.at(i).kind match
+                TypeDecl(d) -> if base.is_none() && d.name == name then base = Some(d.base)
+                _ -> ()
+
+        if base.is_none()
+            a.fault(empty_scope(), c.span, s"'$name' is not a type this file declares, and a " +
+                    "'c const' is measured against its own file — so its type is an integer or a " +
+                    "float, a 'c type' written beside it, or a subtype of one declared here")
+            return KnownNow(32, true, false, name)
+
+        written_ref = base.unwrap()
+end declared_type
+
+private not_a_number(a: &Analysis, c: CConstDecl) -> CDeclared
+    a.fault(empty_scope(), c.span, s"'${type_text(c.typ)}' is not a number, and a 'c const' " +
+            "reads a number — the value is read back out of the C compiler's own output, where a " +
+            "number is a number and a string is a block of storage. A string from C is not written " +
+            "this way")
+    KnownNow(32, true, false, type_text(c.typ))
+
+// Narrower than the widths a C constant expression is written at, and narrow enough that rounding
+// onto it is not something the value could survive being read back through.
+private floating_kind(a: &Analysis, c: CConstDecl, bits: int, name: string) -> CDeclared
+    if bits == 16
+        a.fault(empty_scope(), c.span, "'f16' is not a width a 'c const' is measured at — C writes " +
+                "a constant expression as a 'float', a 'double' or a 'long double', so the two " +
+                "widths that read back without guessing are 'f32' and 'f64'")
+        return KnownNow(32, true, false, name)
+
+    KnownNow(bits, true, true, name)
+end floating_kind
+
+// `i5`, `u32`, `f64` -- the systematic width spellings, which are a family rather than a list, read
+// here without complaining: a name that is not this shape simply is not a number, and the refusal
+// above says the useful thing.
+private plain_width(name: string) -> Option[Type]
+    val b = name.bytes
+
+    if b.len < 2 then return None
+    if b[0] != u8('i') && b[0] != u8('u') && b[0] != u8('f') then return None
+    if b[1] == u8('0') then return None
+
+    for i in 1..<b.len
+        if b[i] < u8('0') || b[i] > u8('9') then return None
+
+    val bits = int(number_of(name[1..<b.len], 10))
+
+    if b[0] == u8('f')
+        if bits == 16 || bits == 32 || bits == 64 then return Some(Floating(bits))
+
+        return None
+
+    if bits >= 1 && bits <= MaxIntegerBits then Some(Integer(bits, b[0] == u8('i'), false)) else None
+end plain_width
+
+// -- turning an answer into a declaration ------------------------------------------------------
+
+private measured_const(a: &Analysis, c: CConstDecl, d: CDeclared,
+                       answers: (Buf[CGlobal], Buf[CMeasured], bool), at: usize) -> Stmt
+    val raw = answers.0.at(at)
+
+    val kind = d match
+        KnownNow(bits, signed, floating, written) -> (bits, signed, floating, written)
+        KnownLater(i, c_type, written) ->
+            integer_kind(answers.1.at(i), answers.2) match
+                Some(found) -> (found.0, found.1, false, written)
+                None ->
+                    a.fault(empty_scope(), c.span, s"'$written' is what the C compiler calls " +
+                            s"'$c_type', which is not an integer here, and a 'c const' reads an " +
+                            "integer")
+                    return held(c, expr(c.span, IntLit("0", 10, "")))
+
+    if kind.2 then fraction(a, c, kind.0, kind.3, raw) else whole(a, c, kind.0, kind.1, kind.3, raw)
+end measured_const
+
+// The declaration a measured line becomes, which is an ordinary constant holding an ordinary
+// literal -- the same shape whichever carrier the value crossed on.
+private held(c: CConstDecl, value: Expr) -> Stmt =
+    stmt(c.span, ConstDecl(c.name, c.typ, value, c.vis))
+
+// One measured whole number, held to the range of the type it was asked for.
+//
+// A value out of range is the mistake this feature exists to catch, arriving one step earlier than
+// it used to: a macro read into a `u16` is the transcription error made against the real number
+// instead of against a remembered one. The message quotes both the C and the value, because neither
+// alone tells the reader which end was wrong.
+private whole(a: &Analysis, c: CConstDecl, bits: int, signed: bool, name: string,
+              raw: CGlobal) -> Stmt
+    if raw.ty != "i64"
+        a.fault(empty_scope(), c.span, s"the C compiler answered for '${c.c}' with a " +
+                s"'${raw.ty}', and this line asks for a whole number")
+        return held(c, expr(c.span, IntLit("0", 10, "")))
+
+    val printed = decimal_of(raw.operand)
+
+    if signed
+        // The whole of `i64` is in range at 64 bits, so only a narrower width has anything to check.
+        if bits < 64
+            val high = (1 << (i64(bits) - 1)) - 1
+            val low = -(1 << (i64(bits) - 1))
+
+            if printed < low || printed > high
+                return out_of_range(a, c, s"$printed", name, s"$low", s"$high")
+
+        val digits = if printed < 0 then s"${-printed}" else s"$printed"
+        val lit = expr(c.span, IntLit(digits, 10, ""))
+
+        return held(c, if printed < 0 then expr(c.span, Unary("-", lit)) else lit)
+    end if
+
+    // **The IR prints an `i64` as a signed decimal whatever the C type was**, so an unsigned value
+    // past the signed ceiling comes back negative. Reinterpreting the bits is what reads it back as
+    // the number the header meant; a genuinely negative value asked for as unsigned survives that
+    // and is refused by the range check below.
+    val value = unsigned_bits(printed)
+
+    if bits < 64
+        val high = u64((1 << i64(bits)) - 1)
+
+        if value > high then return out_of_range(a, c, s"$value", name, "0", s"$high")
+
+    held(c, expr(c.span, IntLit(s"$value", 10, "")))
+end whole
+
+private out_of_range(a: &Analysis, c: CConstDecl, value: string, name: string, low: string,
+                     high: string) -> Stmt
+    a.fault(empty_scope(), c.span,
+            s"'${c.c}' is $value here, which '$name' cannot hold — it holds $low to $high")
+    held(c, expr(c.span, IntLit("0", 10, "")))
+
+// One measured float, narrowed to the width it was asked for.
+//
+// **Rounding is allowed and silent, and that is the deliberate half of this.** A double-typed macro
+// asked for as an `f32` is the nearest `f32` to it, which is exactly what C does for
+// `float x = M_PI;`. What is refused is a value the width does not hold at all -- a measurement that
+// is not finite, or a finite one that narrows to an infinity or to a zero it was not, which has been
+// thrown away rather than rounded.
+private fraction(a: &Analysis, c: CConstDecl, bits: int, name: string, raw: CGlobal) -> Stmt
+    if raw.ty != "double"
+        a.fault(empty_scope(), c.span, s"the C compiler answered for '${c.c}' with a " +
+                s"'${raw.ty}', and this line asks for a float")
+        return held(c, expr(c.span, FloatLit("0.0", "")))
+
+    val value = float_operand(raw.operand) match
+        None -> return silent_float(a, c)
+        Some(found) -> found
+
+    if value != value
+        a.fault(empty_scope(), c.span, s"'${c.c}' is not a number here, and a 'c const' carries " +
+                "one — a value the C compiler settles as a NaN has no constant to be folded into a " +
+                "program")
+        return held(c, expr(c.span, FloatLit("0.0", "")))
+
+    if value > MaxFinite || value < -MaxFinite
+        a.fault(empty_scope(), c.span, s"'${c.c}' is $value here, and a 'c const' carries a finite " +
+                "number — either the C expression overflowed while it was being worked out, or it " +
+                "names an infinity outright")
+        return held(c, expr(c.span, FloatLit("0.0", "")))
+
+    // Only `f32` narrows -- a `double` measured at `f64` is already the value it will be.
+    val narrowed = if bits == 64 then value else real(f32(value))
+
+    if narrowed > MaxFinite || narrowed < -MaxFinite
+        a.fault(empty_scope(), c.span, s"'${c.c}' is $value here, which '$name' cannot hold — the " +
+                "largest it holds is 3.4028234663852886e38")
+        return held(c, expr(c.span, FloatLit("0.0", "")))
+
+    if narrowed == 0.0 && value != 0.0
+        a.fault(empty_scope(), c.span, s"'${c.c}' is $value here, which '$name' cannot tell from " +
+                "zero — the smallest it holds that is not zero is 1.401298464324817e-45")
+        return held(c, expr(c.span, FloatLit("0.0", "")))
+
+    held(c, expr(c.span, FloatLit(s"$narrowed", "")))
+end fraction
+
+private silent_float(a: &Analysis, c: CConstDecl) -> Stmt
+    a.fault(empty_scope(), c.span, s"the C compiler wrote '${c.c}' in a spelling sysl's probe does " +
+        "not read — this is a bug in sysl's probe rather than in what was written")
+    held(c, expr(c.span, FloatLit("0.0", "")))
+
+// The largest finite binary64, which is what tells an overflow from a number.
+private const MaxFinite: real = 1.7976931348623157e308
+
+// One `double` operand as LLVM printed it. It writes such a constant **two ways**: a short decimal
+// where that reads back as the same double, and the raw binary64 bits in hex where it does not --
+// with an `f` in front of the `0x` as of LLVM 23, the digits being the same either way.
+private float_operand(operand: string) -> Option[real]
+    val one: real = 1.0
+    val zero: real = 0.0
+
+    if operand == "+inf" then return Some(one / zero)
+    if operand == "-inf" then return Some(-one / zero)
+
+    if operand == "+qnan" || operand == "-qnan" || operand == "+snan" || operand == "-snan"
+        return Some(zero / zero)
+
+    val hex = if operand.starts_with("f0x") then operand[3..<operand.bytes.len]
+    else if operand.starts_with("0x") then operand[2..<operand.bytes.len]
+    else ""
+
+    if hex != ""
+        // A hex operand of some other width is a type this probe never asks for -- `0xH` is a half
+        // and `0xK` an x86 long double -- so it is left alone rather than read at the wrong width.
+        if hex.bytes.len != 16 then return None
+
+        return Some(real_bits(unsigned_bits(number_of(hex, 16))))
+
+    parse_real(operand).ok()
+end float_operand
+
+// **The bits of a signed 64-bit number, read as an unsigned one.** There is no reinterpreting
+// conversion in the language -- `u64(-1)` is a checked conversion and refuses -- so the bytes are
+// reached through their own address, which is the same road a float's bit pattern takes below.
+private unsigned_bits(v: i64) -> u64
+    var held = v
+    val p: *u64 = ptr_cast(&held)
+
+    *p
+end unsigned_bits
+
+// A binary64 bit pattern as the number it is, by the same road and for the same reason: sysl has no
+// float-bits primitive, so the eight bytes are written as an integer and read back as a float.
+private real_bits(bits: u64) -> real
+    var held = bits
+    val p: *real = ptr_cast(&held)
+
+    *p
+end real_bits
+
+// -- what a typedef becomes ---------------------------------------------------------------------
+
+// One measured typedef as the declaration it becomes: a transparent subtype of the integer C says it
+// is, carrying neither a range nor a predicate, which is precisely what a typedef means -- a second
+// name for one integer, interchangeable with it and checking nothing of its own.
+//
+// **A type C does not describe as an integer is refused by name rather than approximated.** A
+// pointer, a float, a struct and an array all reach the `default` arm, and each already has an
+// answer in sysl that is better than a same-width integer standing in for it.
+private measured_type(a: &Analysis, t: CTypeDecl, m: CMeasured, char_signed: bool) -> Stmt
+    // `_Bool` is the one answer that is not an integer and is still resolved, because sysl's `bool`
+    // *is* what C means by it.
+    if m.kind == 1 then return alias_to(t, "bool")
+
+    integer_kind(m, char_signed) match
+        Some(found) -> alias_to(t, s"${if found.1 then "i" else "u"}${found.0}")
+        None ->
+            a.fault(empty_scope(), t.span, s"the C compiler says '${t.c}' is not an integer type, " +
+                    "and a 'c type' names an integer — what comes back from one is a width and a " +
+                    "signedness, which a float, a pointer, a struct or an array has not got. An " +
+                    "address is written '*T', a float by name, and a struct arrives as an " +
+                    "'opaque struct'")
+            alias_to(t, "int")
+end measured_type
+
+private alias_to(t: CTypeDecl, name: string) -> Stmt =
+    stmt(t.span, TypeDecl(TypeDecl(t.name, type_ref(t.span, NamedType(name, buf())), false, None,
+                                   None, t.vis, true)))
+
+// Which integer a measurement is, and how wide. Nothing covers the two answers that are not one: a
+// `_Bool`, which a `c type` resolves and a constant cannot be read as, and the `default` arm, which
+// is every type this feature does not resolve at all.
+private integer_kind(m: CMeasured, char_signed: bool) -> Option[(int, bool)]
+    val bits = m.size * 8
+
+    if m.kind == 2 then return Some((bits, char_signed))
+    if m.kind == 3 || m.kind == 5 || m.kind == 7 || m.kind == 9 || m.kind == 11
+        return Some((bits, true))
+
+    if m.kind == 4 || m.kind == 6 || m.kind == 8 || m.kind == 10 || m.kind == 12
+        return Some((bits, false))
+
+    None
+end integer_kind
+
+// A run of digits as the number it spells, in base 10 or base 16. `digits_value` is the resolver's
+// and is file-private to it, and a second copy is cheaper than widening one file's helper into the
+// module's surface for the sake of two calls.
+private number_of(digits: string, base: i64) -> i64
+    var out: i64 = 0
+
+    for i in 0..<digits.bytes.len
+        val b = digits.bytes[i]
+
+        val d = if b >= u8('0') && b <= u8('9') then i64(b - u8('0'))
+        else if b >= u8('a') && b <= u8('f') then i64(b - u8('a')) + 10
+        else if b >= u8('A') && b <= u8('F') then i64(b - u8('A')) + 10
+        else 0
+
+        out = out * base + d
+
+    out
+end number_of
