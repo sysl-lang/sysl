@@ -1,0 +1,200 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.process.capture
+import sysl.text.Search
+
+// The one machine-side question a package is allowed to ask: **where does this library live here?**
+//
+// `reference/packages.md § No build scripts, ever` refuses build scripts, and nothing here is one.
+// The package contributes a **name** -- `sdl3` -- and the compiler asks a well-known tool what that
+// name means on this machine, in exactly the way it already asks clang what a `c const` measures to.
+// What a package may say is unchanged: *which* library it needs, never where it is.
+//
+// **Absent is not failed.** A machine with no `pkg-config`, or one whose `pkg-config` has never
+// heard of the module, is a machine exactly where it was before this existed: the declared
+// requirement goes unanswered and the build stops with a sentence naming it. The probe can
+// make a build succeed that would have failed; it can never make one fail that would have succeeded.
+
+// What `pkg-config` answered for one module: the flags its headers are compiled with, and the flags
+// its library is linked with.
+//
+// **Kept as the tokens the tool printed rather than parsed into directories**, which is deliberate.
+// `--cflags` is not only `-I`: SDL prints `-D_THREAD_SAFE` on some platforms and cairo's expands to
+// twelve include directories across five projects, and `--libs` carries `-L`, `-l` and the
+// `-Wl,-rpath` that decides whether a dynamically-linked program finds its library at *run* time.
+struct PkgAnswer
+    cflags: Buf[string]
+    ldflags: Buf[string]
+end PkgAnswer
+
+// What a compilation that asked nothing was told, which is what a build with no `pkg_config` block
+// anywhere hands the toolchain.
+no_probe() -> PkgAnswer = PkgAnswer(buf(), buf())
+
+// The tool, by name only. `pkg-config` on this machine is commonly `pkgconf` wearing the traditional
+// name, and the two are compatible in the two queries asked here -- so looking for a second spelling
+// would be looking for a program nobody has under a name nobody types.
+private const PkgTool: string = "pkg-config"
+
+// Whether the tool is on the PATH at all.
+//
+// **Separate from a module query because it is the difference between two diagnostics**: *this
+// machine has no pkg-config* is something the reader can act on with a `brew install`, where
+// *pkg-config does not know 'sdl3'* is about a library that is not installed. Answering both with
+// the second sentence would send somebody looking for a library they already have.
+pkg_config_available() -> bool
+    var none: Buf[string] = buf()
+
+    none.push("--version")
+    ran(none).is_some()
+end pkg_config_available
+
+// What this machine says about a `.pc` module, or why it could not say.
+pkg_config_query(pc: string) -> Result[PkgAnswer, string]
+    if !pkg_config_available() then return Err(s"there is no '$PkgTool' on this machine to ask")
+
+    var exists: Buf[string] = buf()
+
+    exists.push("--exists")
+    exists.push(pc)
+
+    if ran(exists).is_none() then return Err(s"'$PkgTool' knows no '$pc'")
+
+    val c = flags_of(pc, "--cflags")?
+    val l = flags_of(pc, "--libs")?
+
+    Ok(PkgAnswer(c, l))
+end pkg_config_query
+
+// One query's output, split the way a shell would split it.
+//
+// **A path holding a space is not handled and is refused rather than mangled.** pkg-config quotes
+// such a path in its output, and a splitter that ignored the quoting would hand clang two arguments
+// that are each half a directory -- which fails as a missing header, naming neither the space nor
+// this line. The reader is told to say the path themselves, which is a flag that takes it whole.
+private flags_of(pc: string, what: string) -> Result[Buf[string], string]
+    var args: Buf[string] = buf()
+
+    args.push(what)
+    args.push(pc)
+
+    val said = ran(args) match
+        None -> return Err(s"'$PkgTool $what $pc' failed")
+        Some(text) -> text
+
+    if said.index_of("\"").is_some() || said.index_of("'").is_some()
+        return Err(s"'$PkgTool' answered for '$pc' with a quoted path, which is one holding a " +
+            "space — say where it is on the command line instead, which takes a path whole")
+
+    Ok(words_of(said))
+end flags_of
+
+// What the tool printed, where it succeeded.
+private ran(args: Buf[string]) -> Option[string]
+    capture(PkgTool, args.view(), "", [], true) match
+        Err(_) -> None
+        Ok(out) -> if out.status.ok() then Some(out.text) else None
+
+// A run of text broken at whitespace, which is all the splitting a flag list needs once a quoted
+// path has been refused above.
+private words_of(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var start: usize = 0
+    var i: usize = 0
+
+    while i < text.bytes.len
+        if is_flag_space(text.bytes[i])
+            if i > start then out.push(text[start..<i])
+
+            start = i + 1
+
+        i += 1
+
+    if text.bytes.len > start then out.push(text[start..<text.bytes.len])
+
+    out
+end words_of
+
+private is_flag_space(b: u8) -> bool =
+    b == u8(' ') || b == u8('\t') || b == u8('\r') || b == u8('\n')
+
+// One package's declared need of an installed library: who declared it, the `.pc` name, and the
+// prose the refusal quotes back at whoever has to install it.
+struct LibNeed
+    who: string
+    pc: string
+    why: string
+end LibNeed
+
+// What this machine says about the libraries the packages named, or the one line the build stops on.
+//
+// **Asked only for the host.** `pkg-config` answers for the machine it runs on. A cross build's
+// headers and archives are the *target's*, and there is no sense in which this machine's
+// `/opt/homebrew` belongs in a compilation for a Cortex-M -- so a target that is not this machine
+// probes nothing and says so, since a freestanding program that compiled against the host's headers
+// would link and be wrong somewhere nobody can see.
+//
+// **One at a time, and the two failures are told apart**, because they send the reader to different
+// places: a machine with no `pkg-config` is one `brew install pkgconf` away and has nothing to do
+// with the library, where a `pkg-config` that does not know the module means the library itself is
+// not installed.
+probe_libs(needs: Buf[LibNeed], t: Target) -> Result[PkgAnswer, string]
+    var out = PkgAnswer(buf(), buf())
+
+    if needs.is_empty() then return Ok(out)
+
+    if t.name != host_target().name
+        val first = needs.at(0)
+
+        return Err(s"${first.who} needs the '${first.pc}' library and this is a build for " +
+            s"'${t.name}' rather than for this machine, so there is nothing to ask where it is — " +
+            s"${first.why}")
+    end if
+
+    for i in 0..<needs.len()
+        val need = needs.at(i)
+
+        val answer = pkg_config_query(need.pc) match
+            Ok(found) -> found
+            Err(why) ->
+                return Err(s"${need.who} needs the '${need.pc}' library and $why — " +
+                    s"${need.why}. " +
+                    (if pkg_config_available() then "Install it"
+                     else "Install pkg-config and sysl will ask it where the library is — 'brew " +
+                          "install pkgconf', or your system's package of that name"))
+
+        for j in 0..<answer.cflags.len()
+            out.cflags.push(answer.cflags.at(j))
+
+        for j in 0..<answer.ldflags.len()
+            out.ldflags.push(answer.ldflags.at(j))
+
+    Ok(out)
+end probe_libs
+
+// The `-L` a probe answered with, which go **before** everything they could affect.
+//
+// A search path is not an input being scanned in turn -- it is where the scan looks -- and `-L` is
+// order-sensitive on GNU ld, which does not apply one to a `-l` that appeared before it.
+probed_search_flags(a: PkgAnswer) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<a.ldflags.len()
+        if a.ldflags.at(i).starts_with("-L") then out.push(a.ldflags.at(i))
+
+    out
+end probed_search_flags
+
+// The rest of what a probe answered -- the `-l` for the library itself, and the `-Wl,-rpath` that
+// decides whether a dynamically-linked program finds it at run time. This half goes at the **end**
+// of the link line: a `-l` placed above the objects that need it is discarded by any linker
+// resolving an archive in one pass.
+probed_link_flags(a: PkgAnswer) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<a.ldflags.len()
+        if !a.ldflags.at(i).starts_with("-L") then out.push(a.ldflags.at(i))
+
+    out
+end probed_link_flags

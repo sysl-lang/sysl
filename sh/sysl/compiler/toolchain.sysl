@@ -202,8 +202,13 @@ private dead_strip(target: Target) -> string =
 // carried goes **after** the module that calls into it. `-Wno-override-module` is the one warning
 // suppressed, and only because sysl states a target *family* -- `arm64-apple-macosx` -- where the
 // driver refines it to the installed SDK's version.
+// **`links` and `probed` are where a binding's libraries arrive**, and their two positions are the
+// linker's rather than a style. A probe's `-L` goes before everything it could affect, since a search
+// path is where the scan looks rather than an input being scanned; a `-l`, whether it came from a
+// `@link` directive or from `pkg-config`, goes **after** the objects and archives that need it,
+// because a library named above them is discarded by any linker resolving an archive in one pass.
 link_command(cc: string, ll: string, objects: Buf[string], exe: string, target: Target,
-             level: string) -> Buf[string]
+             level: string, links: Buf[string], probed: PkgAnswer) -> Buf[string]
     var out: Buf[string] = buf()
 
     out.push(cc)
@@ -217,10 +222,26 @@ link_command(cc: string, ll: string, objects: Buf[string], exe: string, target: 
         out.push(extra.at(i))
 
     out.push(dead_strip(target))
+
+    val search = probed_search_flags(probed)
+
+    for i in 0..<search.len()
+        out.push(search.at(i))
+
     out.push(ll)
 
     for i in 0..<objects.len()
         out.push(objects.at(i))
+
+    val named = library_flags(links, target)
+
+    for i in 0..<named.len()
+        out.push(named.at(i))
+
+    val libs = probed_link_flags(probed)
+
+    for i in 0..<libs.len()
+        out.push(libs.at(i))
 
     out.push("-o")
     out.push(exe)
@@ -233,7 +254,7 @@ end link_command
 // lets the linker drop the ones a program never reaches. It is the *library* side of the pair
 // `dead_strip` is the linker side of, and on Mach-O it is redundant rather than wrong.
 compile_c(cc: string, src: string, obj: string, target: Target,
-          level: string) -> Result[unit, string]
+          level: string, probed: PkgAnswer) -> Result[unit, string]
     var args: Buf[string] = buf()
 
     args.push(s"--target=${target.triple}")
@@ -246,6 +267,13 @@ compile_c(cc: string, src: string, obj: string, target: Target,
 
     for i in 0..<extra.len()
         args.push(extra.at(i))
+
+    // **What a probe answered is what makes a shim compile at all.** A binding's own C includes the
+    // installed library's headers, and the directory they are in is the thing `pkg-config` was asked
+    // for -- so a `--cflags` that reached the link line and not this one would leave the package
+    // failing on a missing header rather than on a missing symbol.
+    for i in 0..<probed.cflags.len()
+        args.push(probed.cflags.at(i))
 
     args.push(src)
     args.push("-o")
@@ -355,14 +383,14 @@ end archive
 // system libraries it is linked against. Passing it is what makes naming a cross target fail
 // honestly at the link rather than silently produce a host binary.
 build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: Target,
-             level: string) -> Result[unit, string]
+             level: string, links: Buf[string], probed: PkgAnswer) -> Result[unit, string]
     val ll = s"$exe.ll"
 
     write_text(ll, ir) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 
-    val command = link_command(cc, ll, objects, exe, target, level)
+    val command = link_command(cc, ll, objects, exe, target, level, links, probed)
 
     var args: Buf[string] = buf()
 

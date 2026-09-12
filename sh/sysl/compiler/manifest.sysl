@@ -40,13 +40,20 @@ struct Manifest
     capabilities: Buf[(string, bool)]
     target_capabilities: Buf[(string, string, bool)]
 
+    // The `requires.pkg_config` sub-block: the installed libraries this package binds, each under
+    // the name `pkg-config` files it as, paired with the prose quoted back at whoever has to install
+    // it. **It is a requirement kind beside `headers` rather than a field on one**, because a
+    // package binding an installed library needs both halves of one fact -- its headers to compile
+    // and its archive to link -- and a consumer who answered one of them has not got a build.
+    pkg_config: Buf[(string, string)]
+
     // A key this compiler does not understand is said out loud and then ignored, once per key.
     warnings: Buf[string]
 end Manifest
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
-    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf())
+    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -243,6 +250,8 @@ read_manifest(text: string) -> Result[Manifest, string]
         None -> buf()
         Some(block) -> conf_flags_set(block)
 
+    val pkg_config = read_pkg_config(root)?
+
     val capabilities = conf_at(root, "capabilities") match
         None -> buf()
         Some(block) -> conf_flags(block)
@@ -278,8 +287,67 @@ read_manifest(text: string) -> Result[Manifest, string]
                 "so it was ignored")
 
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
-                target_capabilities, warnings))
+                target_capabilities, pkg_config, warnings))
 end read_manifest
+
+// The `requires.pkg_config` sub-block, in the order `pkg-config` will be asked.
+//
+// **The name is checked more widely than a header's**, and the widening is not a relaxation: a
+// `headers` name is invented by whoever writes the manifest, where a `.pc` name is what the world
+// already files the library under -- `yaml-0.1`, `glib-2.0`, `gtk+-3.0`. What still bounds it is the
+// flag a consumer overrides with, so a name may hold neither a separator nor an `=`.
+private read_pkg_config(root: &Conf) -> Result[Buf[(string, string)], string]
+    var out: Buf[(string, string)] = buf()
+
+    val requires = conf_at(root, "requires") match
+        None -> return Ok(out)
+        Some(block) -> block
+
+    val mods = conf_at(requires, "pkg_config") match
+        None -> return Ok(out)
+        Some(block) -> block
+
+    val names = conf_keys(mods)
+
+    for i in 0..<names.len()
+        val name = names.at(i)
+
+        if !pkg_config_name(name)
+            return Err(s"'requires.pkg_config.$name' is not usable as a pkg-config module's name " +
+                "— it is written on a command line as '--include-path <name>=<dir>', so it may " +
+                "hold neither a separator nor an '='")
+
+        // **The prose is the only part of a refusal nothing in the compiler could have written**,
+        // since it is what is quoted back at whoever has to install the library.
+        val why = conf_text(mods, name)
+
+        if why.trim() == ""
+            return Err(s"'requires.pkg_config.$name' says nothing about what it needs — the text " +
+                "is quoted back at whoever has to install the library, so an empty one helps nobody")
+
+        out.push((name, why))
+
+    Ok(out)
+end read_pkg_config
+
+// Whether a `.pc` module may be called this: a letter, then letters, digits, `_`, `-`, `.` and `+`.
+pkg_config_name(name: string) -> bool
+    if name == "" then return false
+
+    if !is_letter_byte(name.bytes[0]) then return false
+
+    for i in 0..<name.bytes.len
+        val b = name.bytes[i]
+
+        if !(is_letter_byte(b) || (b >= u8('0') && b <= u8('9')) || b == u8('_') || b == u8('-') ||
+             b == u8('.') || b == u8('+'))
+            return false
+
+    true
+end pkg_config_name
+
+private is_letter_byte(b: u8) -> bool =
+    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z'))
 
 // What is wrong with a package's name, or the empty string where nothing is.
 //

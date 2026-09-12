@@ -147,3 +147,45 @@ a_vector_literal_fills_its_width()
 a_read_only_view_does_not_widen()
     assert(only("f(xs: []const int) -> []int = xs\n").starts_with(
         "a '[]const int' views elements it may not write"))
+
+// Two modules of one compilation, and everything the body pass had to say about them -- which is
+// what a name reached through the module it belongs to needs, since one file cannot declare a
+// module and import it.
+private across(first: string, second: string) -> Buf[string]
+    var units: Buf[Program] = buf()
+    var out: Buf[string] = buf()
+
+    val a = parse(source_of("a.sysl", first))
+    val b = parse(source_of("b.sysl", second))
+
+    if !a.ok() then return one_message(a.report.at(0).message)
+    if !b.ok() then return one_message(b.report.at(0).message)
+
+    units.push(a.program)
+    units.push(b.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    for i in 0..<done.reported.len()
+        out.push(done.reported.at(i).diag.message)
+
+    out
+end across
+
+private one_message(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(text)
+    out
+end one_message
+
+@test("a type reached through the module it belongs to is the constructor the bare name would be")
+a_qualified_constructor()
+    // The shape every C binding in the org writes: a `c` module holding the ABI structs, and the
+    // pleasant layer above it naming one in call position.
+    assert_eq(across("module m.c\n\nstruct Buffer\n    p: usize\n    n: usize\n",
+                     "module m\n\nimport m.c\n\nf(n: usize) -> usize = c.Buffer(0, n).n\n").len(), 0)
+
+    // A simple enum's checked cast and a constrained type's, which take the same road.
+    assert_eq(across("module m.c\n\nenum Mode\n    Off\n    On\n",
+                     "module m\n\nimport m.c\n\nf(n: int) -> c.Mode = c.Mode(n)\n").len(), 0)

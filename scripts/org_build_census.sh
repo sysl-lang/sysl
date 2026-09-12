@@ -50,6 +50,14 @@ case $ours_bin in
     *) ours_bin=$(cd "$(dirname "$ours_bin")" && pwd)/$(basename "$ours_bin") ;;
 esac
 
+# **A suite that hangs is a failure, not a census that never finishes.** A miscompiled loop condition
+# is exactly the defect a census is run to find, and it presents as one repository's test binary
+# spinning for ever -- which stalls every row after it and reports nothing at all. macOS ships no
+# `timeout`, so the alarm is perl's, which every machine here has.
+limited() {
+    perl -e 'alarm shift; exec @ARGV' "${SYSL_CENSUS_TIMEOUT:-600}" "$@"
+}
+
 root=$(cd "$(dirname "$0")/.." && pwd)
 org=$(dirname "$root")
 work=$(mktemp -d "${TMPDIR:-/tmp}/sysl-org-build.XXXXXX")
@@ -149,7 +157,7 @@ for dir in "$org"/*/; do
     rows=$((rows + 1))
     ours_ok=0
 
-    ( cd "$here" && "$ours_bin" $command $flags ) > "$work/$name.out" 2>&1 || ours_ok=1
+    ( cd "$here" && limited "$ours_bin" $command $flags ) > "$work/$name.out" 2>&1 || ours_ok=1
 
     if [ $ours_ok -eq 0 ]; then
         case $label in
@@ -181,7 +189,7 @@ for dir in "$org"/*/; do
 
     theirs_ok=0
 
-    ( cd "$theirs" && "$theirs_bin" $command $flags ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
+    ( cd "$theirs" && limited "$theirs_bin" $command $flags ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
 
     if [ $theirs_ok -ne 0 ]; then
         both_refused=$((both_refused + 1))

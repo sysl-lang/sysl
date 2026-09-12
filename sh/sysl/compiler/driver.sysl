@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Source
 import sysl.buf.{Buf, buf}
 import sysl.text.{str_builder, Search}
-import sysl.fs.{make_temp_dir, remove_dir_all, remove_file}
+import sysl.fs.{make_temp_dir, remove_dir_all, remove_file, current_dir}
 import sysl.process.{run as run_child, Status}
 
 // What one invocation compiles: the program's files, the packages it depends on, and the standard
@@ -231,7 +231,8 @@ emit_typed_text(path: string, named_target: Option[string],
 
     val program = compilation_of(path, t)?
 
-    if tables then Ok(Emitted(tables_text(program), buf(), buf())) else Ok(typed_text(program))
+    if tables then Ok(Emitted(tables_text(program), buf(), buf(), buf()))
+    else Ok(typed_text(program))
 end emit_typed_text
 
 // `sysl emit-llvm [--target <name>] <path>` -- one program's LLVM text.
@@ -270,7 +271,8 @@ emit_llvm_text(path: string, named_target: Option[string]) -> Result[Emitted, Re
 
     // Read back out of the analysis rather than off the snapshot the body pass answered with: the
     // checks above have just added to it.
-    Ok(Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1))
+    Ok(Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1,
+              link_required(program.units)))
 end emit_llvm_text
 
 // The machine a command line asked for: the one it named, the manifest's default, or this host --
@@ -306,6 +308,13 @@ struct Emitted
     // partial lowering owes is a census of what it did not say, so that the differential proof can
     // tell an absence from a wrong answer.
     gaps: Buf[(string, string)]
+
+    // What the result has to be linked against: every `@link` directive of every unit that went in,
+    // the standard module's included. **It is here rather than inside the IR because it is not a
+    // property of the code** -- it is a property of the *build*, and the only pass that can answer it
+    // is the one holding every unit. A driver with the text alone could not work it out by reading
+    // it: an `extern` says which symbol it wants and never which library has it.
+    links: Buf[string]
 end Emitted
 
 // What the reader has to act on when a floor refuses a build: a package's name and version, or the
@@ -324,7 +333,8 @@ private who_of(m: Manifest, path: string) -> string =
 private typed_text(c: Compilation) -> Emitted
     val done = analyze_bodies(c.units, c.target)
 
-    Emitted(show_typed_program(program_of(done, done.main_module)), errors_of(done.reported), buf())
+    Emitted(show_typed_program(program_of(done, done.main_module)), errors_of(done.reported), buf(),
+            buf())
 end typed_text
 
 // Whether a body is one a program **emits**, which is the question a printed tree answers.
@@ -375,7 +385,21 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
         Some(named) -> named
         None -> default_executable(path)
 
-    link_lowered_text(path, emitted.text, t, cc, level, exe, false)?
+    // **The output being a directory is caught here rather than by the linker.** A project named for
+    // its own module directory is the obvious layout and reaches this without trying: the executable
+    // takes the package's name, the module directory has the same one, and `ld` answers
+    // `open() failed, errno=21 (Is a directory)` -- an errno naming neither the package nor the
+    // directory, from a tool the reader did not invoke.
+    if is_directory(exe)
+        if out.is_some() then return Err(Refusal(
+            s"'-o $exe' names a directory, and an executable cannot be written over one"))
+
+        return Err(Refusal(s"this project builds an executable named '${basename(exe)}', and " +
+            s"'$exe' is a directory — the two cannot both have that name. Rename the package or " +
+            "the directory, or say where the binary goes with '-o <path>'"))
+    end if
+
+    link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links)?
     Ok(exe)
 end build_native_program
 
@@ -387,12 +411,20 @@ end build_native_program
 // line would fail on the one tree most likely to have one -- which is the tree whose author is
 // running `sysl test`.
 private link_lowered_text(path: string, text: string, t: Target, cc: Option[string], level: string,
-                          exe: string, standalone: bool) -> Result[unit, Refusal]
+                          exe: string, standalone: bool,
+                          links: Buf[string]) -> Result[unit, Refusal]
     val clang = find_clang(t, cc) match
         Err(why) -> return Err(Refusal(why))
         Ok(found) -> found
 
-    val objects = native_objects(clang, path, exe, t, level)?
+    // **What this machine says about the libraries the packages named**, asked once for the whole
+    // build. It answers both halves of one fact: the `--cflags` a binding's own C is compiled with,
+    // and the `-L`, `-l` and `-Wl,-rpath` its archive is linked with.
+    val probed = probe_libs(pkg_config_needs(path)?, t) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(found) -> found
+
+    val objects = native_objects(clang, path, exe, t, level, probed)?
 
     // **The standard module is linked rather than compiled**, which is `precompiled` seen from the
     // other end: the text above declares the library's determined half, and the archive is where
@@ -411,7 +443,7 @@ private link_lowered_text(path: string, text: string, t: Target, cc: Option[stri
                 return Err(Refusal(why))
             Ok(found) -> link_with.push(found.archive)
 
-    build_native(clang, text, link_with, exe, t, level) match
+    build_native(clang, text, link_with, exe, t, level, links, probed) match
         Err(why) ->
             discard_objects(objects)
             return Err(Refusal(why))
@@ -469,7 +501,7 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
             staging = Some(dir)
             exe = join_path(dir, "program")
 
-    link_lowered_text(path, emitted.text, t, cc, level, exe, false) match
+    link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links) match
         Err(why) ->
             discard_staging(staging)
             return Err(why)
@@ -608,7 +640,8 @@ private test_build_from(program: Compilation, standalone: bool) -> Result[TestBu
             Ok(found) -> found.precompiled
 
     val lowered = codegen_with_gaps(kept with { precompiled = precompiled }, t, promotions)
-    val emitted = Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1)
+    val emitted = Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1,
+                          link_required(program.units))
 
     Ok(TestBuild(emitted, kept.tests, t, standalone))
 end test_build_from
@@ -626,7 +659,8 @@ build_test_binary(path: string, build: TestBuild, cc: Option[string],
 
     val exe = join_path(staging, "tests")
 
-    link_lowered_text(path, build.emitted.text, build.target, cc, level, exe, build.standalone) match
+    link_lowered_text(path, build.emitted.text, build.target, cc, level, exe, build.standalone,
+                      build.emitted.links) match
         Err(why) ->
             remove_dir_all(staging).unwrap_or(())
             return Err(why)
@@ -647,7 +681,7 @@ build_test_binary_cached(path: string, build: TestBuild, cc: Option[string], lev
     slot match
         Some(exe) ->
             link_lowered_text(path, build.emitted.text, build.target, cc, level, exe,
-                              build.standalone)?
+                              build.standalone, build.emitted.links)?
             Ok((exe, true))
         None ->
             val made = build_test_binary(path, build, cc, level)?
@@ -663,8 +697,23 @@ discard_test_binary(exe: string)
         None -> remove_file(exe)
 
 // Where a build puts what it made, when nothing said: the program is the product, so it is named for
-// the directory it was written in, and a single file for the file itself.
-private default_executable(path: string) -> string
+// the **package** and written inside the root that names it, and a single file for the file itself.
+//
+// **The root is the one place that names the program without depending on where the caller happened
+// to be standing**, which is why `sysl build .` in a project called `sqlite-repl` writes
+// `./sqlite-repl` rather than a binary named for a dot. The directory's own last segment is the
+// fallback where the manifest named nothing, since a directory with no manifest still has a name.
+default_executable(path: string) -> string
+    if is_directory(path)
+        val named = manifest_at(path) match
+            Ok(m) -> m.name
+            Err(_) -> ""
+
+        val name = if named != "" then named else directory_name(path)
+
+        return s"$path/$name"
+    end if
+
     val name = basename(path)
 
     if !is_sysl_file(name) then return s"./$name"
@@ -677,6 +726,16 @@ private default_executable(path: string) -> string
     s"./${name[0..<at]}"
 end default_executable
 
+// The last segment of a directory's path, with `.` and a trailing separator resolved against where
+// the caller is standing -- so that a project built as `.` is named for the directory it is in
+// rather than for the dot that named it.
+private directory_name(path: string) -> string
+    val here = if path == "." || path == "" then current_dir().unwrap_or(".") else path
+    val name = basename(here)
+
+    if name == "" || name == "." || name == ".." then "a.out" else name
+end directory_name
+
 // Every `.c` the program's own tree carries, compiled for this machine.
 //
 // **The library's is not here, because the artifact carries it already compiled.** Each of a
@@ -684,7 +743,7 @@ end default_executable
 // linker pulls one in the way it pulls anything else in: because something left its symbol
 // undefined.
 private native_objects(clang: string, path: string, exe: string, t: Target,
-                       level: string) -> Result[Buf[string], Refusal]
+                       level: string, probed: PkgAnswer) -> Result[Buf[string], Refusal]
     var trees: Buf[string] = buf()
 
     if is_directory(path) then trees.push(path)
@@ -716,7 +775,7 @@ private native_objects(clang: string, path: string, exe: string, t: Target,
 
             n += 1
 
-            compile_c(clang, found.at(j), obj, t, level) match
+            compile_c(clang, found.at(j), obj, t, level, probed) match
                 Err(why) ->
                     discard_objects(objects)
                     return Err(Refusal(why))
@@ -724,6 +783,37 @@ private native_objects(clang: string, path: string, exe: string, t: Target,
 
     Ok(objects)
 end native_objects
+
+// The installed libraries this build's packages named, the project's own first and then each
+// dependency's, in the order a refusal should mention them.
+//
+// **A dependency's need is the consumer's problem**, which is why it is collected here rather than
+// left to whoever wrote the package: the archive goes on *this* link line, so a machine without it
+// stops *this* build. Sorted within a manifest by the `.pc` name so that which library a build
+// complains about first does not depend on the order a HOCON block happened to be written in.
+private pkg_config_needs(path: string) -> Result[Buf[LibNeed], Refusal]
+    var out: Buf[LibNeed] = buf()
+
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+    val mine = manifest_at(root)?
+
+    add_needs(&out, "this project", mine)
+
+    val roots = package_roots(root, mine)
+
+    for i in 0..<roots.len()
+        manifest_at(roots.at(i)) match
+            Err(_) -> ()
+            Ok(m) -> add_needs(&out, if m.name == "" then roots.at(i) else s"'${m.name}'", m)
+
+    Ok(out)
+end pkg_config_needs
+
+private add_needs(out: *Buf[LibNeed], who: string, m: Manifest)
+    for i in 0..<m.pkg_config.len()
+        val row = m.pkg_config.at(i)
+
+        out.push(LibNeed(who, row.0, row.1))
 
 private discard_objects(objects: Buf[string])
     for i in 0..<objects.len()

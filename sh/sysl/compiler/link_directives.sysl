@@ -1,0 +1,117 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// `@link("z")` -- what a module of `extern`s tells the driver its symbols are resolved by
+// (`reference/ffi.md § @link`).
+//
+// **The directive names a library, and the flag is the target's business.** `@link("m")` says the
+// file needs the mathematics; whether that is `-lm`, or nothing because the host already links what
+// holds it, or nothing because the target has no such library at all, is decided on the command line
+// by `library_flags`. Writing `-lm` in a source file would be right on ELF and wrong on everything
+// else, and the file that wrote it could not be told so by any compiler on the machine that wrote it.
+//
+// **A requirement is a property of the file, not of the module.** That is the one place this differs
+// from the capability clause it is otherwise shaped like: a capability describes what the whole
+// module may do, and files that disagreed would describe different modules. A link requirement
+// describes what one file's `extern`s need, so the module's requirement is the union of its files'
+// and no agreement is asked for.
+//
+// **Nothing is pruned.** Every unit of the compilation contributes, whether or not the program
+// reaches it -- so a Linux program is handed `-lm` because `sysl.math` is in the standard module it
+// was compiled against. An unused `-l` costs a linker nothing: an archive is scanned only for
+// symbols already undefined, and one that resolves none of them contributes no members.
+
+// The libraries a compilation must be linked against, in the order they were first written.
+//
+// **Order is kept rather than sorted**, because it is the author's one lever over a link. A static
+// archive is scanned once, left to right, so a library that calls into another has to come first --
+// `-lpng -lz`, never the reverse. A repeat is dropped at its second appearance so the first one's
+// position is what survives, since that is the one that was placed deliberately.
+//
+// A malformed name is left out rather than passed on, which is what keeps a bad directive from
+// reaching a command line.
+link_required(units: Buf[Program]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<units.len()
+        val links = units.at(i).links
+
+        for j in 0..<links.len()
+            val name = links.at(j).name
+
+            if link_complaint(name) == "" && !holds(out, name) then out.push(name)
+
+    out
+end link_required
+
+private holds(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end holds
+
+// What is wrong with a library name, or the empty string where nothing is.
+//
+// The checks are about the *command line* rather than about any platform's naming: a name is pasted
+// onto a `-l`, so one that is empty, that carries whitespace, or that begins with a dash would
+// arrive at the linker as something other than a library. Everything else is allowed through
+// deliberately -- `stdc++` is a real library and not an identifier, `SDL2_ttf` is a real library and
+// not lowercase, and a compiler that ruled on which spellings the world is permitted would be wrong
+// about a platform it had never seen.
+link_complaint(name: string) -> string
+    if name == "" then return "a link directive names a library, and '' is not a name"
+
+    if name.starts_with("-")
+        return s"'$name' begins with a dash, so it is a linker flag rather than a library — a " +
+            "directive names the library itself and the target decides what that becomes on a " +
+            "command line"
+
+    for i in 0..<name.bytes.len
+        val b = name.bytes[i]
+
+        if b == u8(' ') || b == u8('\t') || b == u8('\r') || b == u8('\n')
+            return s"'$name' holds a space, so it is more than one word — a directive names one " +
+                "library, and a file needing two writes two of them"
+
+    ""
+end link_complaint
+
+// What a `@link` becomes on this machine's command line: `-l<name>`, unless the target already links
+// what holds it or has no such library at all.
+//
+// Three things can happen to a name and only two of them look alike from outside. **The target has
+// it, separately** -- `-lm` on ELF, the ordinary case and the one every name the compiler has never
+// heard of takes. **The target already links what holds it** -- Darwin keeps libc and libm in
+// `libSystem` and Windows keeps them in the CRT, both of which the driver passes unasked. **The
+// target does not have it at all** -- a freestanding build has no libc, so nothing can be passed for
+// one, and a program that then calls `sqrt` fails at the link naming `sqrt`, which is the honest
+// report.
+//
+// The set is deliberately small: it holds what the compiler can *defend* rather than every library a
+// platform might bundle. Guessing about `pthread` or `dl` would mean guessing wrong for some platform
+// nobody here has, and the cost of being wrong is a link that fails on a machine the author cannot
+// reach -- so an unknown name is passed through, where a wrong `-l` at least names itself.
+library_flags(links: Buf[string], t: Target) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<links.len()
+        if !target_provides(t.os, links.at(i)) then out.push(s"-l${links.at(i)}")
+
+    out
+end library_flags
+
+private target_provides(os: Os, name: string) -> bool = os match
+    // libSystem and the CRT carry both, and the driver links them without being asked.
+    MacOS -> name == "c" || name == "m"
+    Windows -> name == "c" || name == "m"
+    // clang links libc itself; the mathematics is a file of its own. Android is here rather than
+    // beside Darwin because Bionic keeps them apart the same way.
+    Linux -> name == "c"
+    Android -> name == "c"
+    // wasi-libc carries both and the driver links them.
+    Wasi -> name == "c" || name == "m"
+    // No libc exists here, so there is nothing to pass for one.
+    Freestanding -> name == "c" || name == "m"
