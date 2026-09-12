@@ -53,9 +53,26 @@ esac
 # **A suite that hangs is a failure, not a census that never finishes.** A miscompiled loop condition
 # is exactly the defect a census is run to find, and it presents as one repository's test binary
 # spinning for ever -- which stalls every row after it and reports nothing at all. macOS ships no
-# `timeout`, so the alarm is perl's, which every machine here has.
+# `timeout`, so the clock is perl's, which every machine here has.
+#
+# **It kills the process GROUP rather than the command, and that is the whole of why this is eight
+# lines rather than one.** `sysl test` runs the binary it built as a child, so an alarm that took
+# only the compiler down left the test binary orphaned at PPID 1 and still spinning at 100% -- and
+# every row after it then ran on a machine one core short. Three were found alive at once, the oldest
+# two hours and eleven minutes after the run that made it.
 limited() {
-    perl -e 'alarm shift; exec @ARGV' "${SYSL_CENSUS_TIMEOUT:-600}" "$@"
+    perl -e '
+        my $seconds = shift;
+        my $pid = fork();
+
+        if (!defined $pid) { exit 125 }
+        if ($pid == 0) { setpgrp(0, 0); exec @ARGV; exit 127 }
+
+        $SIG{ALRM} = sub { kill "KILL", -$pid };
+        alarm $seconds;
+        waitpid($pid, 0);
+        exit($? == 0 ? 0 : ($? >> 8 || 124));
+    ' "${SYSL_CENSUS_TIMEOUT:-600}" "$@"
 }
 
 root=$(cd "$(dirname "$0")/.." && pwd)
