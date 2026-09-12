@@ -142,9 +142,10 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
 
                 ts.push(t)
             None ->
-                val inner = analyzer_for(cx.an, cx.scope)
+                val inner = analyzer_for(cx.an, member_default_scope(cx, fname))
 
                 inner.reported = Some(span)
+                inner.here_src = caller_source(cx)
                 ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
 
     cx.an.uses(fname)
@@ -341,9 +342,10 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Typ
 
                 ts.push(t)
             None ->
-                val inner = analyzer_for(cx.an, cx.scope)
+                val inner = analyzer_for(cx.an, member_default_scope(cx, name))
 
                 inner.reported = Some(span)
+                inner.here_src = caller_source(cx)
                 ts.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
 
     cx.an.uses(name)
@@ -395,9 +397,10 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
 
                 ts.push(t)
             None ->
-                val inner = analyzer_for(cx.an, cx.scope)
+                val inner = analyzer_for(cx.an, member_default_scope(cx, fname))
 
                 inner.reported = Some(span)
+                inner.here_src = caller_source(cx)
                 ts.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
 
     cx.an.uses(fname)
@@ -1132,3 +1135,15 @@ callable_field(cx: &Analyzer, span: Span, rty: Type, name: string, recv: TExpr, 
 
     Some(call_member(cx, span, field, "call", args, expected))
 end callable_field
+
+// **A parameter's default is read in the DECLARATION's terms and not in the caller's**, which is
+// what makes it mean the same thing from every module that calls the member. A free function's
+// default already went through its own `f.scope`; a member's went through the caller's, so a default
+// naming anything the declaring file imported -- `kind: TextureType = TextureType.Plain` on a
+// binding's own canvas -- read as an undefined name in every consumer that left the argument out.
+//
+// `decl_scope` is where the member was written, which for an inherited default is the trait's source
+// rather than the block that took it: that is where its body came from and where the rest of its
+// signature was read.
+private member_default_scope(cx: &Analyzer, name: string) -> Scope =
+    cx.an.tables.members.decl_scope.get(name).unwrap_or(cx.scope)

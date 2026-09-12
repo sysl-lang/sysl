@@ -200,3 +200,26 @@ a_string_specifier_over_a_scalar()
     // A string is what it asks for, and every other conversion is left alone.
     assert_eq(count("f(s: string) -> string = format(s, \"%s\")\n"), 0)
     assert_eq(count("f(n: int) -> string = format(n, \"%d\")\n"), 0)
+
+@test("a member's default is read where the member was written, not where the call is")
+a_member_default_reads_its_own_module()
+    // The shape every binding with a defaulted enum parameter writes: the default names something
+    // the *declaring* file imported, and a consumer that leaves the argument out has never heard of
+    // it. Read in the caller's terms it is an undefined name in every module but the one it is in.
+    val lib = "module m.lib\n" +
+              "\n" +
+              "enum Kind\n" +
+              "    Plain\n" +
+              "    Fancy\n" +
+              "\n" +
+              "struct Canvas\n" +
+              "    n: int\n" +
+              "\n" +
+              "    paint(self, kind: Kind = Kind.Plain) -> int = self.n\n"
+
+    assert_eq(across(lib, "module m\n\nimport m.lib.Canvas\n\nf(c: Canvas) -> int = c.paint()\n").len(),
+              0)
+
+    // And the argument written out is unaffected, which is what says the two roads agree.
+    assert_eq(across(lib, "module m\n\nimport m.lib.{Canvas, Kind}\n\n" +
+                          "f(c: Canvas) -> int = c.paint(Kind.Fancy)\n").len(), 0)
