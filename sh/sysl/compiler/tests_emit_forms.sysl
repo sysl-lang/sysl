@@ -1335,6 +1335,47 @@ a_conversion_to_char_is_checked()
               "}\n")
 end a_conversion_to_char_is_checked
 
+// **A float read as an integer SATURATES**, which is why it is an intrinsic call rather than a cast.
+// `fptoui`/`fptosi` are poison for a value the integer cannot hold and poison for a NaN, so neither
+// is a thing a program may be lowered to; LLVM's `.sat` family clamps to the ends and answers zero
+// for a NaN. The name carries both widths, so a `u8` from a `double` and a `u8` from an `f32` are
+// two different intrinsics.
+@test("a float read as an integer saturates, through the intrinsic that carries both widths")
+a_conversion_from_a_float_saturates()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "clip(x: real) -> u8 = u8(x)\n" +
+                  "\n" +
+                  "main() = print(clip(1.5))\n",
+              "clip"),
+              "define zeroext i8 @clip(double %x.param) {\n" +
+              "entry:\n" +
+              "  %x.addr = alloca double\n" +
+              "  store double %x.param, ptr %x.addr\n" +
+              "  %t1 = load double, ptr %x.addr\n" +
+              "  %t2 = call i8 @llvm.fptoui.sat.i8.f64(double %t1)\n" +
+              "  ret i8 %t2\n" +
+              "}\n")
+
+@test("and a signed one takes the signed intrinsic, at whichever float width it was given")
+a_signed_conversion_from_a_float_saturates()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "clip(x: f32) -> i16 = i16(x)\n" +
+                  "\n" +
+                  "main() = print(int(clip(1.5)))\n",
+              "clip"),
+              "define signext i16 @clip(float %x.param) {\n" +
+              "entry:\n" +
+              "  %x.addr = alloca float\n" +
+              "  store float %x.param, ptr %x.addr\n" +
+              "  %t1 = load float, ptr %x.addr\n" +
+              "  %t2 = call i16 @llvm.fptosi.sat.i16.f32(float %t1)\n" +
+              "  ret i16 %t2\n" +
+              "}\n")
+
 // **A counted argument to a tail call takes its count while the frame is still whole**, and the
 // frame gives up everything it holds only after that. Written the other way round, `go(next, list)`
 // would free the list at the moment the parameter holding it was reassigned, and hand the second

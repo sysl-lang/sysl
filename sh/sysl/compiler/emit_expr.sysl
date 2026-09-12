@@ -1086,7 +1086,7 @@ convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
             convert_int(e, a_bits, a_signed, b_bits, v)
         (Integer(_, a_signed, _), Floating(_)) ->
             cast_to(e, if a_signed then CastSIToFP else CastUIToFP, from, ut, v)
-        (Floating(_), Integer(_, _, _)) -> gap_at(e, "a saturating float conversion")
+        (Floating(_), Integer(_, b_signed, _)) -> saturating_to_int(e, from, ut, b_signed, v)
         (Floating(a_bits), Floating(b_bits)) ->
             cast_to(e, if b_bits > a_bits then CastFPExt else CastFPTrunc, from, ut, v)
         (Char, Integer(b_bits, _, _)) -> convert_int(e, 32, false, b_bits, v)
@@ -1102,6 +1102,36 @@ convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
         (Integer(_, _, _), CFn(_, _)) -> cast_to(e, CastIntToPtr, from, ut, v)
         _ -> gap_at(e, s"a conversion from ${type_show(from)} to ${type_show(to)}")
 end convert
+
+// A float read as an integer, **saturating** rather than trapping or wrapping.
+//
+// `fptoui`/`fptosi` are poison for a value the integer cannot hold, and a NaN is poison for both --
+// so a conversion written in a program cannot be either of them. LLVM's `.sat` family is the whole
+// answer: it clamps to the widest and narrowest the target holds and answers zero for a NaN, which
+// is what every language that defines this conversion at all settles on.
+private saturating_to_int(e: *Emit, from: Type, to: Type, signed: bool, v: Val) -> Val
+    val ft = lty(e, from)
+    val it = lty(e, to)
+    val name = s"llvm.fpto${if signed then "si" else "ui"}.sat.${overload_name(it)}.${overload_name(ft)}"
+
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(ft))
+    request_intrinsic(e, ir_sig(name, ir_fn_type(it, params)))
+
+    var ops: Buf[IrArg] = buf()
+
+    ops.push(ir_arg(ft, v))
+
+    val r = fresh_reg(e)
+
+    emit(e, ir_call(Some(r), it, VGlobal(name), ops))
+    r
+end saturating_to_int
+
+private overload_name(t: LType) -> string = l_overload_suffix(t) match
+    Some(s) -> s
+    None -> l_render(t)
 
 private cast_to(e: *Emit, op: CastOp, from: Type, to: Type, v: Val) -> Val
     val r = fresh_reg(e)

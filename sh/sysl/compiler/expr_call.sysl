@@ -223,7 +223,21 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
             StructOf(_) -> return struct_call(cx, span, tkey.unwrap(), name, args, expected)
             // A simple enum's name in call position is a checked cast from an integer.
             EnumOf(_) -> return enum_cast(cx, span, tkey.unwrap(), name, args)
-            TypeOf(_) -> return constrained_call(cx, span, tkey.unwrap(), name, args)
+            // **A plain alias is another spelling for what it names, so a call through one is the
+            // call the base would have taken.** `type AudioSpec = c.AudioSpec` over a struct makes
+            // `AudioSpec(fmt, channels, freq)` that struct's constructor -- which the org's bindings
+            // write everywhere, since an alias is how a package names its own C layer's ABI types
+            // without moving them. A *constrained* subtype is a different thing and keeps the
+            // conversion it always had: it has a check to run, which is why it is worth writing.
+            TypeOf(d) ->
+                if is_plain_alias(d)
+                    behind_alias(cx, tkey.unwrap()) match
+                        Some(Struct(sd)) ->
+                            return struct_call(cx, span, sd.base, name, args, expected)
+                        Some(Enum(ed)) -> return enum_cast(cx, span, ed.base, name, args)
+                        _ -> ()
+
+                return constrained_call(cx, span, tkey.unwrap(), name, args)
             _ -> ()
 
     if !shadowed
@@ -554,6 +568,13 @@ end enum_cast
 // A constrained subtype's name in call position wraps a base value into the subtype, checking it.
 // Unlike an implicit produce site, the cast is written, so it applies even where the base would not
 // flow in on its own.
+// What a plain alias stands for, where the resolution has already made it real.
+//
+// **A plain alias records the base type ITSELF** rather than a `Constrained` record over it, which
+// is what makes it transparent: there is no check to carry and nothing to be a second name for.
+private behind_alias(cx: &Analyzer, key: string) -> Option[Type] =
+    cx.an.tables.constrained_insts.get(key)
+
 private constrained_call(cx: &Analyzer, span: Span, key: string, written: string,
                          args: Buf[Expr]) -> TExpr
     val inst = cx.an.tables.constrained_insts.get(instance_key(key, buf()))
