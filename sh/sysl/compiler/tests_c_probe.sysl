@@ -130,3 +130,35 @@ a_file_with_no_block_asks_nothing()
 
     two.push(asks.program)
     assert(c_probe_wanted(two))
+
+// **A climb that stops advancing has to answer rather than run for ever.** `parent_of("/")` is `"/"`
+// -- the root's parent is the root, which is the honest answer -- so a probe over a file in a
+// temporary directory reached the root in six steps and then spun. It cost three and a half hours of
+// a gate at 100% CPU with nothing to show and no diagnostic, and the test that carried it looked
+// slow rather than stuck.
+//
+// **The count is asserted rather than the termination**, because a test that only terminates is one
+// that hangs when it fails, and a hang is the one result nobody reads. A walk going nowhere returns
+// at the cap, and the cap is what this refuses to reach.
+@test("the climb to a file's manifest is bounded by the path and never by the cap")
+the_climb_for_a_manifest_is_bounded()
+    // A file at the root of the filesystem, where the climb has nowhere left to go on its first
+    // step: `parent_of` answers with the same directory it was given.
+    val at_root = manifest_above("/no-such-file-of-ours.sysl")
+
+    assert(at_root.1 <= 2, s"a file at the root took ${at_root.1} steps")
+
+    // And one under a directory nothing above it carries a manifest for, which walks the whole way
+    // up and stops at the root rather than at the cap.
+    val deep = manifest_above("/one/two/three/four/five/no-such-file-of-ours.sysl")
+
+    assert(deep.0.is_none(), "nothing above it declares a package")
+    assert(deep.1 <= 8, s"a five-deep path took ${deep.1} steps")
+
+@test("and it finds the manifest of the tree it is run in")
+the_climb_finds_a_manifest()
+    // This repository has one at its root, and this file sits three directories below it.
+    val found = manifest_above(__FILE__)
+
+    assert(found.0.is_some(), "the compiler's own tree carries a manifest")
+    assert(found.1 <= 8, s"it took ${found.1} steps")

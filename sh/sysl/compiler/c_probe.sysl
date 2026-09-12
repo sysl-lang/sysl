@@ -279,31 +279,65 @@ end measure
 //
 // A machine that cannot answer says nothing rather than refusing: the probe then fails on the
 // missing header, which is a message naming the file the reader has to go and find.
+// Where the headers a file's probe includes live on this machine, asked of the package the file
+// belongs to.
 private probe_cflags_for(file: string) -> Buf[string]
     var out: Buf[string] = buf()
+
+    manifest_above(file).0 match
+        None -> return out
+        Some(root) -> manifest_at(root) match
+            Err(_) -> return out
+            Ok(m) ->
+                for i in 0..<m.pkg_config.len()
+                    pkg_config_query(m.pkg_config.at(i).0) match
+                        Err(_) -> ()
+                        Ok(answer) ->
+                            for j in 0..<answer.cflags.len()
+                                out.push(answer.cflags.at(j))
+
+    out
+end probe_cflags_for
+
+// The nearest directory at or above a file that carries a manifest, and how many directories the
+// climb crossed getting there.
+//
+// **THE CLIMB STOPS WHERE IT STOPS ADVANCING, AND THAT IS NOT A BELT-AND-BRACES CHECK.**
+// `parent_of("/")` is `"/"` -- the root's parent is the root, which is the honest answer and an
+// endless walk. A probe over a file in a temporary directory reaches the root in six steps and then
+// spins for ever, which is what a differential sweep's own scratch file did: three and a half hours
+// at 100% with nothing to show, no diagnostic, and a test that looked slow rather than stuck.
+//
+// **The count comes back so that a test can assert the climb was bounded by the path rather than by
+// the cap.** A walk that stopped advancing would otherwise turn a hang into a slow answer, which is
+// the one result nobody reads.
+manifest_above(file: string) -> (Option[string], usize)
     var dir = parent_of(file)
+    var steps: usize = 0
 
     loop
+        steps += 1
+
+        if steps > ClimbCap then return (None, steps)
+
         val here = dir match
-            None -> return out
+            None -> return (None, steps)
             Some(found) -> found
 
-        if read_text(join_path(here, ManifestName)).is_ok()
-            manifest_at(here) match
-                Err(_) -> return out
-                Ok(m) ->
-                    for i in 0..<m.pkg_config.len()
-                        pkg_config_query(m.pkg_config.at(i).0) match
-                            Err(_) -> ()
-                            Ok(answer) ->
-                                for j in 0..<answer.cflags.len()
-                                    out.push(answer.cflags.at(j))
+        if read_text(join_path(here, ManifestName)).is_ok() then return (Some(here), steps)
 
-            return out
-        end if
+        val up = parent_of(here)
 
-        dir = parent_of(here)
-end probe_cflags_for
+        // The root is its own parent, so a walk that has arrived there has arrived nowhere new.
+        if up.is_none() || up.unwrap() == here then return (None, steps)
+
+        dir = up
+end manifest_above
+
+// How many directories a climb may cross before it is a walk that is going nowhere. No tree here is
+// anywhere near this deep; what it is for is that a climb which stopped advancing answers rather
+// than running for ever.
+const ClimbCap: usize = 64
 
 private probe_fault(a: &Analysis, where: Span, why: string) -> Option[(Buf[CGlobal], Buf[CMeasured], bool)]
     a.fault(empty_scope(), where, why)
