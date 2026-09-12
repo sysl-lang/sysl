@@ -223,3 +223,42 @@ a_member_default_reads_its_own_module()
     // And the argument written out is unaffected, which is what says the two roads agree.
     assert_eq(across(lib, "module m\n\nimport m.lib.{Canvas, Kind}\n\n" +
                           "f(c: Canvas) -> int = c.paint(Kind.Fancy)\n").len(), 0)
+
+// -- a special form written with a type argument --------------------------------------------------
+//
+// **`va_arg[int](ap)` is the one this exists for.** Everywhere else the annotation that stands in is
+// a word on a binding that was going to be written anyway, and a variadic body reading its tail
+// straight into `print` has no binding at all. `ptr_cast[T](p)` is the same shape from the raw tier:
+// both take their type from what receives the value, so writing it in the brackets is writing it
+// where the value is made.
+//
+// `gc` is the repository. `ptr_cast[*Obj](m.vals[1]).tag` was read as a call of something uncallable
+// -- and, being an argument of a generic call, the refusal was swallowed and the body left out, so
+// what a build reported was an undefined symbol at the C link rather than a diagnostic.
+@test("'ptr_cast' takes the type it is given in brackets")
+ptr_cast_with_a_written_type()
+    assert_eq(count("struct Obj\n    tag: int\n\nf(p: *u8) -> int = ptr_cast[*Obj](p).tag\n"), 0)
+
+@test("and a pointer to a pointer nests, since '*' is one spelling in both grammars")
+ptr_cast_to_a_pointer_to_a_pointer()
+    assert_eq(count("f(p: *u8) -> *u8 = ptr_cast[**u8](p)[0]\n"), 0)
+
+@test("a form that takes no type argument is told so, rather than reported as uncallable")
+a_special_form_with_no_type_arguments()
+    assert_eq(only("f(n: int)\n    print[int](n)\n"), "'print' takes no type arguments")
+
+@test("and a local of the name stands in front of the form, as it does without the brackets")
+a_local_shadows_a_special_form()
+    assert_eq(only("f(ptr_cast: int)\n    ptr_cast[int](1)\n"),
+              "this is not something that can be called")
+
+// A slice, a `weak`, a `volatile`, a vector and a callable have no spelling here at all -- their
+// syntax is the type grammar's and the brackets read the expression one, so most of them do not even
+// parse. What reaches the refusal is something that parses as an expression and is not a type.
+@test("a type argument has to be one the expression grammar can spell")
+a_type_argument_with_no_spelling()
+    assert_eq(only("g(n: int) -> int = n\n\nf(p: *u8)\n    val q = ptr_cast[g(1)](p)\n"),
+              "this is not a type — what is written in the brackets is a type argument, and they " +
+              "read it out of the expression grammar, so a slice, a 'weak', a 'volatile', a " +
+              "vector and a callable have no spelling here. Annotate what receives the result and " +
+              "let the call infer it instead")

@@ -97,6 +97,33 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                 return written_call(cx, span, head, targs, args, expected)
             end if
 
+            // **A special form written with a type argument, which `va_arg[int](ap)` is what this
+            // is for.** Everywhere else the annotation that stands in is a word on a binding that
+            // was going to be written anyway, and a variadic body reading its tail straight into
+            // `print` has no binding at all. `ptr_cast[T](p)` is the same shape from the raw tier:
+            // both take their type from what receives the value, so writing it in the brackets is
+            // writing it where the value is made.
+            //
+            // The rest take none, for the reason a non-generic function takes none -- there is
+            // nothing for an argument to be an argument *of* -- and are told so rather than being
+            // reported as uncallable.
+            if name.is_some() && cx.lookup(name.unwrap()).is_none() &&
+               special_form_name(cx, name.unwrap())
+                val written = name.unwrap()
+                val targ = Some(written_type_arg(cx, one))
+
+                if written == "va_arg"
+                    val va = va_form(cx, span, written, args, targ)
+
+                    if va.is_some() then return va.unwrap()
+                end if
+
+                if written == "ptr_cast" && args.len() == 1 then
+                    return ptr_cast_call(cx, span, args, targ)
+
+                return cx.err(span, s"'$written' takes no type arguments")
+            end if
+
             cx.err(span, "this is not something that can be called")
         // `.Circle(5)` -- the form below with the enum's own name left off, resolved against what
         // the context expects.
@@ -315,16 +342,30 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
             _ -> ()
 
     if name == "ptr_cast" && args.len() == 1 then
-        if expected.is_none() then
-            return Some(cx.err(span, "'ptr_cast' reads an address as a pointer to some type, and " +
-                                "nothing here says which"))
-
-        val t = type_expr_bare(cx, args.at(0))
-
-        return Some(TExpr(span, TCast(t, expected.unwrap())))
+        return Some(ptr_cast_call(cx, span, args, expected))
 
     None
 end special_form
+
+// `ptr_cast(p)` and `ptr_cast[T](p)` -- an address read as a pointer to some type, which is either
+// the type the position gives it or the one written in the brackets.
+private ptr_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Option[Type]) -> TExpr
+    if expected.is_none() then
+        return cx.err(span, "'ptr_cast' reads an address as a pointer to some type, and nothing " +
+                      "here says which")
+
+    val t = type_expr_bare(cx, args.at(0))
+
+    TExpr(span, TCast(t, expected.unwrap()))
+end ptr_cast_call
+
+// Whether a name is one the compiler answers itself rather than looking up. It is asked only to
+// decide what a **type argument** written after one means, so the atomics are in it too: they take
+// none either, and saying so is better than reporting the name as uncallable.
+private special_form_name(cx: &Analyzer, name: string) -> bool =
+    name == "print" || name == "str" || name == "format" || name == "str_cast" ||
+    name == "va_start" || name == "va_end" || name == "va_arg" || name == "va_copy" ||
+    name == "ptr_cast" || atomic_form(cx, name)
 
 // An explicit scalar conversion. Every pair that has a meaning is listed; nothing widens, narrows,
 // or changes representation without being written.

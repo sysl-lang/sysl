@@ -73,6 +73,34 @@ assigning_to_a_pattern_binding()
               "assignment would reach that copy rather than the value it came from. Where you " +
               "mean to change something, take a 'var' from the binding first")
 
+// **Being written once is a promise about the NAME, not about everything the name can reach**, and
+// the two element cases are what separate the readings. An array is the local's own bytes, so
+// writing an element of one is a second writing of the binding; a slice views elements somebody else
+// keeps, so writing one lands where the owner can see it and the `val` is untouched.
+//
+// This is `gc` and `qcbor` in the org: both write through a view bound by a `val` or captured by a
+// pattern, and both were refused here and accepted by the reference.
+@test("a 'val' holding an array is written once down to its elements")
+assigning_an_element_of_a_val_array()
+    assert_eq(first("f()\n    val a: [2]u8 = [0, 0]\n\n    a[0] = 1\n"),
+              "a 'val' is written once, so assignment has nothing to write through")
+
+@test("and a 'val' holding a view is not, the elements being somebody else's")
+assigning_an_element_of_a_val_slice()
+    assert_eq(complaints("f(xs: []u8)\n    val ys = xs\n\n    ys[0] = 1\n"), 0)
+
+@test("nor is a view a pattern bound, for the same reason")
+assigning_an_element_of_a_pattern_bound_slice()
+    assert_eq(complaints("f(o: Option[[]u8])\n    o match\n        Some(ys) -> ys[0] = 1\n" +
+                         "        None -> ()\n"), 0)
+
+@test("a field of a 'val' struct is the binding, and a field through a reference is not")
+assigning_a_field_of_a_val()
+    assert_eq(first("struct S\n    f: int\n\nf()\n    val s = S(1)\n\n    s.f = 2\n"),
+              "a 'val' is written once, so assignment has nothing to write through")
+
+    assert_eq(complaints("struct S\n    f: int\n\nf()\n    val r: &S = S(1)\n\n    r.f = 2\n"), 0)
+
 @test("an assignment's value has to be something the place can hold")
 assigning_the_wrong_type()
     assert_eq(first("f()\n    var x = 1\n\n    x = \"two\"\n"),

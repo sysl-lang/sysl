@@ -86,7 +86,7 @@ end written_generic_call
 
 // One type argument as a **call** writes it, which is an expression: brackets in an expression are
 // indexing, so what a reader writes between them here is read back as the type it names.
-private written_type_arg(cx: &Analyzer, e: Expr) -> Type = *e.kind match
+written_type_arg(cx: &Analyzer, e: Expr) -> Type = *e.kind match
     Ident(n) -> resolve_type(cx.an, cx.scope, named_type(e.span, n), cx.subst)
     // A **value** argument is written as the number it is, which is the one place the two grammars
     // agree without a conversion. It travels at the width a length does, so a copy the reader named
@@ -94,9 +94,70 @@ private written_type_arg(cx: &Analyzer, e: Expr) -> Type = *e.kind match
     IntLit(_, _, _) -> const_arg_at(cx, e)
     Index(head, one) -> applied_type_arg(cx, e.span, head, one_arg(one))
     TypeArgs(head, inner) -> applied_type_arg(cx, e.span, head, inner)
+    // The three the two grammars share a spelling for. `*T` and `&T` are a unary operator in an
+    // expression and a qualifier in a type; a tuple is parentheses either way. Everything else has
+    // no spelling here at all, which the refusal below is what says.
+    Unary(op, inner) ->
+        if op == "*" then resolve_type(cx.an, cx.scope, type_ref(e.span,
+            PtrType(written_type_ref(cx, inner))), cx.subst)
+        else if op == "&" then resolve_type(cx.an, cx.scope, type_ref(e.span,
+            RefType(written_type_ref(cx, inner), false)), cx.subst)
+        else not_a_type_arg(cx, e)
+    Tuple(parts) ->
+        var written: Buf[TypeRef] = buf()
+
+        for i in 0..<parts.len()
+            written.push(written_type_ref(cx, parts.at(i)))
+
+        resolve_type(cx.an, cx.scope, type_ref(e.span, TupleType(written, false)), cx.subst)
+    // A dotted path is one name to the type grammar, so `mod.Box` is read as the word it is.
+    Field(_, _) -> dotted_type_arg(cx, e)
+    _ -> not_a_type_arg(cx, e)
+
+private not_a_type_arg(cx: &Analyzer, e: Expr) -> Type
+    cx.fault(e.span, "this is not a type — what is written in the brackets is a type argument, " +
+             "and they read it out of the expression grammar, so a slice, a 'weak', a 'volatile', " +
+             "a vector and a callable have no spelling here. Annotate what receives the result and " +
+             "let the call infer it instead")
+
+    Unknown
+end not_a_type_arg
+
+// The same, stopped one step earlier: a written type rather than a resolved one, so that a pointer
+// to a pointer nests without each level being resolved on its own.
+private written_type_ref(cx: &Analyzer, e: Expr) -> TypeRef = *e.kind match
+    Ident(n) -> named_type(e.span, n)
+    Unary(op, inner) ->
+        if op == "*" then type_ref(e.span, PtrType(written_type_ref(cx, inner)))
+        else if op == "&" then type_ref(e.span, RefType(written_type_ref(cx, inner), false))
+        else
+            not_a_type_arg(cx, e)
+            named_type(e.span, "")
+    Field(_, _) ->
+        val path = dotted_path_of(e)
+
+        if path.is_none()
+            not_a_type_arg(cx, e)
+            named_type(e.span, "")
+        else named_type(e.span, path.unwrap())
     _ ->
-        cx.fault(e.span, "a type argument is a type, and this is not one")
-        Unknown
+        not_a_type_arg(cx, e)
+        named_type(e.span, "")
+
+private dotted_type_arg(cx: &Analyzer, e: Expr) -> Type
+    val path = dotted_path_of(e)
+
+    if path.is_none() then return not_a_type_arg(cx, e)
+
+    resolve_type(cx.an, cx.scope, named_type(e.span, path.unwrap()), cx.subst)
+end dotted_type_arg
+
+// The name a written type argument applies its own arguments to -- `Box` in `Box[int]`, and the
+// whole dotted path in `mod.Box[int]`, which is one name to the type grammar.
+private dotted_path_of(e: Expr) -> Option[string] = *e.kind match
+    Ident(n) -> Some(n)
+    Field(inner, n) -> dotted_path_of(inner).map(head -> s"$head.$n")
+    _ -> None
 
 // A written number as a value argument, at the width every other value argument travels at.
 private const_arg_at(cx: &Analyzer, e: Expr) -> Type

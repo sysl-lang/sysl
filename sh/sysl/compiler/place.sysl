@@ -124,11 +124,38 @@ writable_place(t: TExpr) -> bool = *t.kind match
 
 // The local a place bottoms out in, where it bottoms out in one at all -- the same descent
 // `writable_place` makes, kept apart from it because the refusal wants the *binding*.
+// The binding a place is a part of, where the walk out of it stays inside that binding's own
+// storage.
+//
+// **A step that lands in storage the name does not own ends the walk**, and that is what makes
+// "written once" a promise about the *name* rather than about everything it can reach. An index into
+// an array is the local's own bytes and an index into a slice is a view of elements somebody else
+// keeps -- so `val a: [4]u8` refuses `a[0] = 1` and a `val` holding a `[]u8` does not, the write
+// there landing where the owner can see it. A field of a struct value is the local; a field reached
+// through a `&T` is a field of the box.
+//
+// Getting it wrong the other way is what a `val` is *for*: `val s = S(1)` refuses `s.f = 3`, since
+// nothing else holds that struct and the write would be a second writing of the binding.
 private root_local(cx: &Analyzer, t: TExpr) -> Option[Local] = *t.kind match
     TLoad(name, _) -> local_named(cx, name)
-    TField(recv, _, _) -> root_local(cx, recv)
-    TIndex(recv, _, _) -> root_local(cx, recv)
+    TField(recv, _, _) -> if holds_an_address(texpr_type(recv)) then None else root_local(cx, recv)
+    TIndex(recv, _, _) -> if owns_its_elements(texpr_type(recv)) then root_local(cx, recv) else None
     _ -> None
+
+// Whether a value of this type is an address of storage kept elsewhere -- a counted box, a weak
+// reference, a raw pointer. A step through one leaves the binding behind.
+private holds_an_address(t: Type) -> bool = repr(t) match
+    Ref(_, _) -> true
+    Weak(_) -> true
+    Ptr(_) -> true
+    _ -> false
+
+// Whether this type's elements are its own storage, which an array's and a vector's are and a
+// slice's are not.
+private owns_its_elements(t: Type) -> bool = repr(t) match
+    Array(_, _) -> true
+    Vector(_, _) -> true
+    _ -> false
 
 private local_named(cx: &Analyzer, unique: string) -> Option[Local]
     for i in 0..<cx.locals.len()
