@@ -52,6 +52,46 @@ compilation_of(path: string, t: Target) -> Result[Compilation, Refusal] =
 packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Refusal] =
     assembled(path, t, true)
 
+// A compilation whose tree **is** the standard module, which is what `--std` says.
+//
+// **It is written down rather than inferred from the module names in the tree**, and that is the
+// reference's own rule: guessing it would turn a clear refusal -- you cannot add to the module every
+// program is compiled against -- into a compilation that succeeds and then collides with the
+// built-in copy at whatever link tried to use it.
+//
+// So nothing is prepended and nothing is fetched: there is no library beside this tree, because this
+// tree is the library, and a manifest is not read because the library has none. What the files
+// declare is what the compilation holds.
+std_compilation_of(path: string, t: Target) -> Result[Compilation, Refusal]
+    val files = std_sources(path, Some(t.os)) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(found) -> found
+
+    var units: Buf[Program] = buf()
+
+    for i in 0..<files.len()
+        val parsed = parse(files.at(i).src, t)
+
+        if !parsed.ok()
+            return Err(Refusal(s"${files.at(i).src.name}:${parsed.at()}: ${parsed.first().message}"))
+
+        units.push(parsed.program)
+
+    Ok(Compilation(units, modules_written(units), t))
+end std_compilation_of
+
+// The modules a set of files declares, each once.
+private modules_written(units: Buf[Program]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<units.len()
+        val name = module_written(units.at(i))
+
+        if !holds_string(out, name) then out.push(name)
+
+    out
+end modules_written
+
 private assembled(path: string, t: Target, packaged: bool) -> Result[Compilation, Refusal]
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
     val manifest = manifest_at(root)?
@@ -335,7 +375,7 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
         Some(named) -> named
         None -> default_executable(path)
 
-    link_lowered_text(path, emitted.text, t, cc, level, exe)?
+    link_lowered_text(path, emitted.text, t, cc, level, exe, false)?
     Ok(exe)
 end build_native_program
 
@@ -347,7 +387,7 @@ end build_native_program
 // line would fail on the one tree most likely to have one -- which is the tree whose author is
 // running `sysl test`.
 private link_lowered_text(path: string, text: string, t: Target, cc: Option[string], level: string,
-                          exe: string) -> Result[unit, Refusal]
+                          exe: string, standalone: bool) -> Result[unit, Refusal]
     val clang = find_clang(t, cc) match
         Err(why) -> return Err(Refusal(why))
         Ok(found) -> found
@@ -361,11 +401,15 @@ private link_lowered_text(path: string, text: string, t: Target, cc: Option[stri
     // the members that resolve something.
     var link_with = objects
 
-    std_artifact(t) match
-        Err(why) ->
-            discard_objects(objects)
-            return Err(Refusal(why))
-        Ok(found) -> link_with.push(found.archive)
+    // **Nothing is linked where the tree being built IS the library**, which is `--std`: its bodies
+    // are in the text above rather than in an archive, and an artifact on the line would put a
+    // second copy of every one of them in front of the linker.
+    if !standalone
+        std_artifact(t) match
+            Err(why) ->
+                discard_objects(objects)
+                return Err(Refusal(why))
+            Ok(found) -> link_with.push(found.archive)
 
     build_native(clang, text, link_with, exe, t, level) match
         Err(why) ->
@@ -384,43 +428,98 @@ end link_lowered_text
 // unrunnable**: what the reader asked for cannot be carried out, and the answer names the command
 // that can.
 //
-// The binary is a temporary of this run. The reference keeps what it built in a cache keyed over
-// everything that can reach the bytes; this compiler rebuilds, which costs time and cannot hand back
-// a binary made by a compiler that has since changed.
+// **What was built last time is what is run**, where the key over everything that can reach the
+// bytes matches (`run_cache.sysl`). The check is here rather than beside the link, and that is the
+// whole of what it buys: the lowering below is the expensive half, so a cache consulted after it
+// would have saved the linker's second and paid the analyzer's minutes.
 run_native_program(path: string, named_target: Option[string], cc: Option[string], level: string,
                    args: Buf[string]) -> Result[int, Refusal]
     val t = target_for(path, named_target)?
 
     not_this_machine(t, "run")?
 
+    val key = run_cache_key_for("run", path, named_target, level, cc)
+
+    key match
+        Some(one) -> run_cache_hit(one) match
+            Some(built) -> return started(built, args, None)
+            None -> ()
+        None -> ()
+
     val emitted = emit_llvm_text(path, named_target)?
 
     if !emitted.report.is_empty() then return Err(Refusal(analysis_report(emitted.report)))
 
-    val staging = make_temp_dir("sysl-run-") match
-        Err(_) -> return Err(Refusal("no directory to build in"))
-        Ok(dir) -> dir
+    // A slot in the cache where there is one, and a temporary of this run where there is not -- a
+    // machine with no cache directory, or a reader who turned the cache off.
+    val slot = key match
+        Some(one) -> run_cache_reserve(one)
+        None -> None
 
-    val exe = join_path(staging, "program")
+    var staging: Option[string] = None
+    var exe = ""
 
-    link_lowered_text(path, emitted.text, t, cc, level, exe) match
+    slot match
+        Some(kept) -> exe = kept
+        None ->
+            val dir = make_temp_dir("sysl-run-") match
+                Err(_) -> return Err(Refusal("no directory to build in"))
+                Ok(made) -> made
+
+            staging = Some(dir)
+            exe = join_path(dir, "program")
+
+    link_lowered_text(path, emitted.text, t, cc, level, exe, false) match
         Err(why) ->
-            remove_dir_all(staging).unwrap_or(())
+            discard_staging(staging)
             return Err(why)
         Ok(_) -> ()
 
-    // `run` rather than `capture`, and the difference is the whole of what this command is for: the
-    // child shares this program's streams, so its input is the reader's and what it writes is read as
-    // it is written.
+    started(exe, args, staging)
+end run_native_program
+
+// The child, with whatever this run has to take away once it has ended.
+//
+// `run` rather than `capture`, and the difference is the whole of what this command is for: the child
+// shares this program's streams, so its input is the reader's and what it writes is read as it is
+// written.
+private started(exe: string, args: Buf[string], staging: Option[string]) -> Result[int, Refusal]
     val state = run_child(exe, args.view(), "", []) match
         Err(_) ->
-            remove_dir_all(staging).unwrap_or(())
+            discard_staging(staging)
             return Err(Refusal(s"$exe could not be run"))
         Ok(how) -> how
 
-    remove_dir_all(staging).unwrap_or(())
+    discard_staging(staging)
     Ok(shell_status(state))
-end run_native_program
+end started
+
+private discard_staging(staging: Option[string])
+    staging match
+        Some(dir) -> remove_dir_all(dir).unwrap_or(())
+        None -> ()
+
+// `sysl build-lib <path> --std` -- the standard module built into an artifact for one machine.
+//
+// The machine is asked about before anything is read, because a library artifact is object code and
+// a target with no toolchain has nothing an artifact could be.
+build_std_artifact_of(path: string, named_target: Option[string],
+                      out: Option[string]) -> Result[string, Refusal]
+    val t = target_for(path, named_target)?
+
+    if !t.builds_with_clang() then return Err(Refusal(t.no_toolchain()))
+
+    build_std_library(path, t, out) match
+        Err(why) -> Err(Refusal(why))
+        Ok(where) -> Ok(where)
+end build_std_artifact_of
+
+// The key for one command over one tree, or nothing where the machine it names cannot be settled --
+// in which case the compilation this stands in front of is about to say so in its own words.
+run_cache_key_for(command: string, path: string, named_target: Option[string], level: string,
+                  cc: Option[string]) -> Option[string] = target_for(path, named_target) match
+    Ok(t) -> run_cache_key_of(command, path, t, level, cc)
+    Err(_) -> None
 
 // What a shell hears when a child ends. A signal has no exit status of its own, and `128 + n` is what
 // every shell reports for one -- so it is what a caller reading this number will already be
@@ -446,6 +545,10 @@ struct TestBuild
     emitted: Emitted
     tests: Buf[TTest]
     target: Target
+
+    // Whether the tree being tested is itself the standard module, in which case there is no
+    // artifact to link: the bodies the tests call are in the text above.
+    standalone: bool
 end TestBuild
 
 // `sysl test [--target <name>] <path>` -- the same program lowered as a **test build**.
@@ -457,27 +560,58 @@ end TestBuild
 // The analysis in front of it is the analysis every other build gets, and that is deliberate: a test
 // is code somebody wrote and is held to the same rules.
 test_build_of(path: string, named_target: Option[string]) -> Result[TestBuild, Refusal]
+    val t = test_target_of(path, named_target)?
+
+    test_build_from(packaged_compilation_of(path, t)?, false)
+end test_build_of
+
+// The same for a tree that **is** the standard module (`sysl test <root> --std`), which is how the
+// library's own tests are run: there is no library beside it and no artifact to link, because the
+// bodies the tests call are the ones being compiled.
+std_test_build_of(path: string, named_target: Option[string]) -> Result[TestBuild, Refusal]
+    val t = test_target_of(path, named_target)?
+
+    test_build_from(std_compilation_of(path, t)?, true)
+end std_test_build_of
+
+// What both ask of the machine before anything is read: it has to be this one, because a test run
+// executes what it builds, and it has to have a toolchain.
+private test_target_of(path: string, named_target: Option[string]) -> Result[Target, Refusal]
     val t = target_for(path, named_target)?
 
     not_this_machine(t, "test")?
 
     if !t.builds_with_clang() then return Err(Refusal(t.no_toolchain()))
 
-    val program = packaged_compilation_of(path, t)?
-    val done = analyze_bodies(program.units, program.target)
+    Ok(t)
+end test_target_of
+
+private test_build_from(program: Compilation, standalone: bool) -> Result[TestBuild, Refusal]
+    val t = program.target
+
+    // **Every body the library declares is typed when the library is what is being built**, not only
+    // the ones a test happens to reach. It is the same reading `library_build` asks for, and the
+    // reason is the same: a tree that declares `sysl` is a compilation *producing* those modules
+    // rather than one being handed them.
+    val done = if standalone then analyze_produced(program.units, t, file_names(program.units))
+    else analyze_bodies(program.units, t)
+
     val whole = program_of(done, done.main_module)
     val promotions = post_analysis_checks_of_tests(done.an, whole, program.own)
     val kept = tests_only(whole, program.own)
 
-    val linked = std_artifact(t) match
-        Err(why) -> return Err(Refusal(why))
-        Ok(found) -> found
+    var precompiled: Buf[string] = buf()
 
-    val lowered = codegen_with_gaps(kept with { precompiled = linked.precompiled }, t, promotions)
+    if !standalone
+        precompiled = std_artifact(t) match
+            Err(why) -> return Err(Refusal(why))
+            Ok(found) -> found.precompiled
+
+    val lowered = codegen_with_gaps(kept with { precompiled = precompiled }, t, promotions)
     val emitted = Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1)
 
-    Ok(TestBuild(emitted, kept.tests, t))
-end test_build_of
+    Ok(TestBuild(emitted, kept.tests, t, standalone))
+end test_build_from
 
 // A test binary, linked exactly as a program is, in a directory of its own.
 //
@@ -492,12 +626,34 @@ build_test_binary(path: string, build: TestBuild, cc: Option[string],
 
     val exe = join_path(staging, "tests")
 
-    link_lowered_text(path, build.emitted.text, build.target, cc, level, exe) match
+    link_lowered_text(path, build.emitted.text, build.target, cc, level, exe, build.standalone) match
         Err(why) ->
             remove_dir_all(staging).unwrap_or(())
             return Err(why)
         Ok(_) -> Ok(exe)
 end build_test_binary
+
+// The same, into the cache where this run has a slot in it -- with `true` for a binary that is a
+// cache entry and outlives the run, and `false` for a temporary the caller has to take away.
+//
+// **The link goes straight into the slot** rather than to a temporary that is copied afterwards: a
+// copy would have to reproduce the executable bit, which is one more thing to get wrong per platform.
+build_test_binary_cached(path: string, build: TestBuild, cc: Option[string], level: string,
+                         key: Option[string]) -> Result[(string, bool), Refusal]
+    val slot = key match
+        Some(one) -> run_cache_reserve(one)
+        None -> None
+
+    slot match
+        Some(exe) ->
+            link_lowered_text(path, build.emitted.text, build.target, cc, level, exe,
+                              build.standalone)?
+            Ok((exe, true))
+        None ->
+            val made = build_test_binary(path, build, cc, level)?
+
+            Ok((made, false))
+end build_test_binary_cached
 
 // The directory a test binary was built in, taken away. The binary is the only thing in it, so the
 // directory is what there is to remove.

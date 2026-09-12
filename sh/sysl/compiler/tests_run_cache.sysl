@@ -1,0 +1,169 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{remove_dir_all, remove_file, write_text}
+
+// **What a cache is held to is that it misses when it must**, which is the only failure it can have
+// that costs anything: a hit that should have been a miss is a stale binary, and a stale binary
+// reports about code nobody is running. So the cases below are mostly *inequalities* -- one thing
+// changed, a different key -- and the one equality is that an unchanged tree keys the same twice.
+//
+// The test list beside a cached test binary is the other half, and it is checked by round trip: what
+// a report needs and the executable does not carry is a name, a verdict's inversion, an expected
+// output and four hooks, and all of it has to survive a write and a read.
+
+// -- the test list -------------------------------------------------------------------------------
+
+@test("a test list survives being written and read back")
+a_plain_test_list_round_trips()
+    var tests: Buf[TTest] = buf()
+
+    tests.push(TTest(module_qualify("m", "adds"), "adds", false, None, "m/t.sysl", 4, no_hooks()))
+    tests.push(TTest(module_qualify("m", "two"), "two plus two", false, None, "m/t.sysl", 9,
+                     no_hooks()))
+
+    val read = decode_test_list(encode_test_list(tests)).unwrap()
+
+    assert_eq(read.len(), 2)
+    assert_eq(module_show(read.at(0).func), "m.adds")
+    assert_eq(read.at(0).display, "adds")
+    assert_eq(read.at(0).file, "m/t.sysl")
+    assert_eq(read.at(0).line, 4)
+    assert(!read.at(0).should_trap)
+    assert(read.at(0).expected.is_none())
+    assert_eq(read.at(1).display, "two plus two")
+    assert_eq(read.at(1).line, 9)
+
+// **The three fields the executable does not carry**, which is the whole reason there is a sidecar at
+// all: whether a test is meant to trap, what it should have printed on its way out, and the hooks a
+// module wrapped it in.
+@test("a trapping test, its expected output and its four hooks all survive the round trip")
+a_test_with_hooks_round_trips()
+    var hooks: Buf[THook] = buf()
+
+    hooks.push(THook(Setup, module_qualify("m", "before"), "m/t.sysl", 1))
+    hooks.push(THook(Teardown, module_qualify("m", "after"), "m/t.sysl", 2))
+    hooks.push(THook(SetupAll, module_qualify("m", "before_all"), "m/t.sysl", 3))
+    hooks.push(THook(TeardownAll, module_qualify("m", "after_all"), "m/t.sysl", 4))
+
+    var tests: Buf[TTest] = buf()
+
+    tests.push(TTest(module_qualify("m", "boom"), "boom", true, Some("index 3 is past the end"),
+                     "m/t.sysl", 12, hooks_of(hooks)))
+
+    val read = decode_test_list(encode_test_list(tests)).unwrap()
+
+    assert_eq(read.len(), 1)
+    assert(read.at(0).should_trap)
+    assert_eq(read.at(0).expected.unwrap(), "index 3 is past the end")
+    assert_eq(module_show(read.at(0).hooks.setup.unwrap().func), "m.before")
+    assert_eq(read.at(0).hooks.setup.unwrap().line, 1)
+    assert_eq(module_show(read.at(0).hooks.teardown.unwrap().func), "m.after")
+    assert_eq(module_show(read.at(0).hooks.setup_all.unwrap().func), "m.before_all")
+    assert_eq(module_show(read.at(0).hooks.teardown_all.unwrap().func), "m.after_all")
+    assert_eq(read.at(0).hooks.teardown_all.unwrap().line, 4)
+
+// An empty `expected` and no `expected` at all are two states of one field, and a round trip that
+// folded them together would report "printed nothing" as "printed anything".
+@test("a test expecting the empty string is not a test expecting nothing")
+an_empty_expectation_is_kept()
+    var wanting: Buf[TTest] = buf()
+
+    wanting.push(TTest(module_qualify("m", "quiet"), "quiet", true, Some(""), "m/t.sysl", 1,
+                       no_hooks()))
+
+    assert_eq(decode_test_list(encode_test_list(wanting)).unwrap().at(0).expected.unwrap(), "")
+
+    var silent: Buf[TTest] = buf()
+
+    silent.push(TTest(module_qualify("m", "quiet"), "quiet", true, None, "m/t.sysl", 1, no_hooks()))
+
+    assert(decode_test_list(encode_test_list(silent)).unwrap().at(0).expected.is_none())
+
+// **A list that will not read is no cache at all**, which is a rebuild rather than a guess at what
+// the missing fields were.
+@test("a line with the wrong number of fields is not a test list")
+a_malformed_list_is_refused()
+    assert(decode_test_list("only\u{0}two").is_none())
+    assert(decode_test_list("").is_some())
+    assert_eq(decode_test_list("").unwrap().len(), 0)
+
+// -- the key -------------------------------------------------------------------------------------
+
+@test("the key is a function of its parts, and every part reaches it")
+every_part_reaches_the_key()
+    val parts = cache_parts("run", "aarch64-macos", "-O2")
+
+    assert_eq(run_cache_key(parts), run_cache_key(cache_parts("run", "aarch64-macos", "-O2")))
+
+    // The command, because a test build keeps the `@test` functions an ordinary one drops.
+    assert(run_cache_key(parts) != run_cache_key(cache_parts("test", "aarch64-macos", "-O2")))
+
+    // The machine, because an executable is object code for one of them.
+    assert(run_cache_key(parts) != run_cache_key(cache_parts("run", "x86_64-linux", "-O2")))
+
+    // The optimization level, because it changes what is emitted.
+    assert(run_cache_key(parts) != run_cache_key(cache_parts("run", "aarch64-macos", "-O0")))
+
+private cache_parts(command: string, machine: string, level: string) -> Buf[string]
+    var parts: Buf[string] = buf()
+
+    parts.push(command)
+    parts.push("0.0.1")
+    parts.push(machine)
+    parts.push("malloc free")
+    parts.push(level)
+    parts.push("")
+    parts.push("source:abcdef0123456789")
+    parts.push("fedcba9876543210")
+    parts.push("")
+    parts
+end cache_parts
+
+// -- the key over a tree -------------------------------------------------------------------------
+
+// **The claim the whole cache rests on**: an unchanged tree keys the same, and a tree whose source
+// has been edited by one byte does not. Nothing short of taking the key over real files says this --
+// the file walk, the read and the fingerprint are all between an edit and the answer.
+@test("a tree keys the same twice, and differently once a source file is edited")
+an_edited_source_misses()
+    if !std_root().is_ok() then return
+
+    val root = runner_project("main.sysl", "main()\n    print(\"one\")\n")
+    val first = run_cache_key_of("run", root, host_target(), DefaultOptimization, None)
+
+    assert(first.is_some())
+    assert_eq(run_cache_key_of("run", root, host_target(), DefaultOptimization, None).unwrap(),
+              first.unwrap())
+
+    write_text(s"$root/main.sysl", "main()\n    print(\"two\")\n").unwrap()
+
+    val second = run_cache_key_of("run", root, host_target(), DefaultOptimization, None)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(second.is_some())
+    assert(second.unwrap() != first.unwrap())
+
+// **The C a tree carries is source too.** A binding is a sysl surface over C, so an edit to one of
+// its `.c` files changes what the program links against -- and a key over the sysl alone would replay
+// a binary built from the C as it was.
+@test("a tree keys differently once the C beside it is edited")
+an_edited_c_file_misses()
+    if !std_root().is_ok() then return
+
+    val root = runner_project("main.sysl", "main()\n    print(\"one\")\n")
+
+    write_text(s"$root/helper.c", "int helper(void) { return 1; }\n").unwrap()
+
+    val first = run_cache_key_of("run", root, host_target(), DefaultOptimization, None)
+
+    write_text(s"$root/helper.c", "int helper(void) { return 2; }\n").unwrap()
+
+    val second = run_cache_key_of("run", root, host_target(), DefaultOptimization, None)
+
+    remove_file(s"$root/helper.c").unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+    assert(first.is_some())
+    assert(second.is_some())
+    assert(second.unwrap() != first.unwrap())

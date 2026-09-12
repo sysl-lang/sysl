@@ -170,8 +170,11 @@ private module_path_of(receiver: Expr, name: string) -> Option[string] = *receiv
     Field(inner, mid) -> module_path_of(inner, mid).map(head -> s"$head.$name")
     _ -> None
 
+// **An `extern` is one too**, and leaving it out is what sent `c.surface_destroy(h)` down the
+// member-call road: the receiver `c` is a module rather than a value, so reading it as one reports
+// the module as an undefined name and says nothing about the call.
 private names_a_function(cx: &Analyzer, written: string) -> bool =
-    !function_keys(cx, written).is_empty()
+    !function_keys(cx, written).is_empty() || extern_key(cx, written).is_some()
 
 // A name in call position, in the order the reader's own bindings are consulted.
 private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: Buf[Expr],
@@ -795,6 +798,41 @@ private function_keys_of(cx: &Analyzer, written: string) -> Buf[string]
     overload_keys(cx.an, here)
 end function_keys_of
 
+// Every key a written **dotted** path could name, in the order a call asks them: the alias an
+// import bound, then the path written out in full, read through the package the file sits in.
+//
+// **It is here rather than beside the value tables because the call path is where these three
+// readings were worked out**, and a value read through a module has to ask exactly the same
+// questions -- `raw.eof` and `raw.thing()` differ in nothing but the parentheses. Splitting them
+// left a call resolving and a constant of the same module reported as an undefined name, which is
+// what every `c const` binding in the org tripped over.
+//
+// A name with no dot in it answers nothing, so an ordinary lookup pays for this in one comparison.
+module_qualified_keys(cx: &Analyzer, written: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    module_bound_key(cx, written) match
+        Some(key) -> out.push(key)
+        None -> ()
+
+    // **The cut is at the LAST dot**, because everything before it is the module and a module name
+    // holds as many dots as it likes.
+    val cut = last_dot_in(written)
+
+    if cut.is_some()
+        val head = written[0..<cut.unwrap()]
+        val tail = written[(cut.unwrap() + 1)..<written.bytes.len]
+
+        cx.scope.imports.module_as(head) match
+            Some(owner) -> out.push(module_qualify(owner, tail))
+            None -> ()
+
+        out.push(module_qualify(in_package(cx.an, cx.scope.pkg, head), tail))
+    end if
+
+    out
+end module_qualified_keys
+
 // The declarations of a set the reader's own file may name.
 private visible_keys(cx: &Analyzer, keys: Buf[string]) -> Buf[string]
     var out: Buf[string] = buf()
@@ -1067,6 +1105,14 @@ private extern_key(cx: &Analyzer, written: string) -> Option[string]
 
     if bound.is_some() && cx.an.tables.externs.has(bound.unwrap()) then return bound
 
+    // **A module written before the dot**, which a call to a *function* has always asked for and a
+    // call to an `extern` did not -- so `c.surface_destroy(h)`, which is what every binding in the
+    // org writes next door to its `c` module, reported the module as an undefined name.
+    val qualified = module_qualified_keys(cx, written)
+
+    for i in 0..<qualified.len()
+        if cx.an.tables.externs.has(qualified.at(i)) then return Some(qualified.at(i))
+
     val here = module_qualify(cx.scope.module_name, written)
 
     if cx.an.tables.externs.has(here) then return Some(here)
@@ -1117,12 +1163,18 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
     TExpr(span, TCall(key, ts, ret, false))
 end extern_call
 
-private extern_scope(cx: &Analyzer, key: string) -> Scope
-    for i in 0..<cx.an.tables.funcs.len()
-        if cx.an.tables.funcs.key_at(i) == key then return cx.an.tables.funcs.at(i).scope
-
-    cx.scope
-end extern_scope
+// The file an `extern` was written in, which is where the types in its signature mean what they
+// meant.
+//
+// **It used to be searched for in `funcs`, where an `extern` never is**, so every call resolved the
+// declaration's types in the CALLER's file and fell back to the caller's scope without saying so.
+// That was invisible while the only reachable extern was one of the caller's own module -- the two
+// scopes agree there -- and became `'x' of 'c.f' is *?` the moment a call could reach one next door,
+// since an opaque struct declared in the `c` module is not a name the layer above it can resolve.
+private extern_scope(cx: &Analyzer, key: string) -> Scope =
+    cx.an.tables.extern_scopes.get(key) match
+        Some(home) -> home.scope
+        None -> cx.scope
 
 // A local holding something callable, called through it.
 private call_through(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],

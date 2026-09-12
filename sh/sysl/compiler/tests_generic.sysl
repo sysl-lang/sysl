@@ -3,7 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.text.{str_builder, StrBuilder}
+import sysl.text.{str_builder, StrBuilder, Search}
 
 // What a generic declaration **becomes**, asked through the instantiations a program's calls made.
 //
@@ -156,3 +156,33 @@ private first_of(names: Buf[string]) -> string
 
     b.finish()
 end first_of
+
+// -- a result list a generic declares ---------------------------------------------------------------
+
+// **A result list is a tuple wearing a second name, and `declared_result_type` takes the name off** --
+// so an instantiation's signature says `(T, T)` where the declaration wrote `T, T`, and a generic
+// body typed from that table read its own `= a, b` as two values where one was wanted. The
+// non-generic form beside it was always right, which is what made this invisible: nothing in the
+// three corpora calls a generic that declares one, and `sysl.math.integer`'s `divmod` is reached by
+// nothing.
+@test("a generic function may declare a result list, at its definition and at an instantiation")
+a_generic_may_declare_a_result_list()
+    val text = "pair[T](a: T, b: T) -> T, T = a, b\n\n" +
+        "use() -> int\n    val x, y = pair(1, 2)\n\n    x\n"
+
+    assert_eq(joined_diagnostics(text), "")
+    assert(made_holds(made(text), "pair.int"))
+
+// And the refusal it must not swallow: one value declared and two written is still two values.
+@test("a generic declaring one result is still refused a list of values")
+a_generic_declaring_one_result_still_refuses_a_list()
+    assert(joined_diagnostics("one[T](a: T, b: T) -> T = a, b\n\nuse() -> int = one(1, 2)\n")
+               .contains("this function declares one result"))
+
+private joined_diagnostics(text: string) -> string
+    val ds = stmt_diagnostics(text)
+
+    if ds.is_empty() then return ""
+
+    ds.at(0)
+end joined_diagnostics

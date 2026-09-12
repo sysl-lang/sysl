@@ -1,0 +1,418 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_var
+import sysl.seq.Sequence
+import sysl.fs.{entries, is_file, make_dir_all, metadata, read_text, remove_file, write_text}
+import sysl.text.{from_utf8_unchecked, join, split, str_builder, StrBuilder}
+
+// The executable `sysl run` and `sysl test` built last time, kept so that running the same tree
+// twice costs the second one nothing.
+//
+// **The whole of a `run` or a `test` invocation's wall clock is the compile**, once the tree is any
+// size at all: this compiler's own suite takes three quarters of an hour to build and a second and a
+// half to run, and a reader who changed nothing between two invocations paid for both builds. The
+// binary is what a cache can hold, because it is a function of things that can all be named.
+//
+// ==What the key is over, and why it is long==
+//
+// **A wrong key is a stale binary, which is worse than a slow build**, so this errs toward
+// rebuilding: everything that can reach the bytes is in the key, and anything that cannot be
+// established cheaply is a miss rather than a guess.
+//
+//   - the **compiler**, by version -- an executable is compiled code, so a release that changes what
+//     a program lowers to while touching none of its source produces different bytes at an identical
+//     fingerprint. It is the same reason the standard module's own artifact is keyed by version.
+//   - the **target**, the **allocating pair** and the **optimization** level, each of which changes
+//     what is emitted, and the **`--cc`** a reader named, which is a different compiler.
+//   - every **source file the program is made of** -- its own tree's and every package's, the C
+//     each of those trees carries among them -- by place and text.
+//   - the **standard module** it is compiled against, by the fingerprint of the library it was read
+//     from.
+//   - the **environment that reaches the toolchain**: the extra clang flags and the variables naming
+//     a cross toolchain. This is the only part of the key that is neither the command line nor the
+//     tree, and leaving it out is the one omission that has actually cost something -- a run under
+//     `SYSL_EXTRA_CFLAGS="-fsanitize=address"` over an unchanged tree replays the *uninstrumented*
+//     binary the previous ordinary run left in the slot and reports green, which is a sanitizer
+//     answering about a binary it never reached.
+//
+// **What is deliberately not in it: the program's own arguments, and `--filter`.** `sysl run p -- a`
+// and `sysl run p -- b` are one binary run twice, which is the point; a filter selects among the
+// tests a binary already holds, so it is applied to a cached list exactly as it is to a fresh one.
+//
+// ==What it does not cover, stated rather than hidden==
+//
+// A **development tree**, where the compiler changes under a version that stands still. Nothing in a
+// cache can tell those apart without hashing the compiler itself, and it is the same hole the
+// standard module's artifact has and names. `SYSL_NO_CACHE` is the escape hatch. An **`#include`d
+// header** outside the trees this reads is the other, and has the same answer.
+//
+// **`sysl build` never consults this**, which is the reference's rule and not an omission here: a
+// build writes a binary somebody named and is expected to have built it.
+
+// The variable that turns the cache off. It is for working **on the compiler**, where the version in
+// the key stands still while the bytes it produces do not.
+private const CacheOff: string = "SYSL_NO_CACHE"
+
+// How many entries a program's cache holds before eviction is considered at all.
+//
+// The standard module's cache evicts nothing, which is right for it -- one entry per library per
+// release. This one takes an entry per *edit*, so a week's work on one tree leaves hundreds.
+private const Keep: usize = 256
+
+// How old an entry has to be before it is a candidate, in microseconds -- a week.
+//
+// **Age is what makes eviction safe beside a build that is running.** Several compilations share one
+// directory, and a hit is a stat and then an exec: an eviction that took a *fresh* entry could take
+// one another process was about to run. Nothing this old is in flight anywhere.
+private const Stale: long = 604800000000
+
+// The field separator inside the test list, which is the one character a `@test`'s display name
+// cannot hold: a name is read out of source, and a NUL does not survive the lexer.
+private const Nul: string = "\0"
+
+// How many separators a well-formed line of the test list has: seven fields for the test and three
+// for each of the four hooks.
+private const Marks: usize = 18
+
+// --- the key --------------------------------------------------------------------------
+
+// Everything above, mixed in a fixed order.
+//
+// The order is fixed rather than sorted because a key is not compared with anything but itself --
+// what it has to be is *the same* for the same inputs, and the sorting that matters is inside
+// `library_fingerprint`, which is over a set of files that may arrive in any order.
+run_cache_key(parts: Buf[string]) -> string
+    var numbered: Buf[(string, string)] = buf()
+
+    for i in 0..<parts.len()
+        numbered.push((s"$i", parts.at(i)))
+
+    library_fingerprint(numbered)
+end run_cache_key
+
+// The parts themselves, for one command over one tree at one machine.
+//
+// **It is asked before anything is analyzed**, which is the whole of what the cache buys: everything
+// here is settled by the command line and by files on disk, and the compile below it is the
+// expensive half. A cache consulted after the analysis would have saved the linker's second and paid
+// the analyzer's nine minutes.
+run_cache_parts(command: string, path: string, t: Target, level: string,
+                cc: Option[string]) -> Result[Buf[string], Refusal]
+    var parts: Buf[string] = buf()
+
+    parts.push(command)
+    parts.push(Version)
+    parts.push(t.name)
+    parts.push(allocator_pair())
+    parts.push(level)
+    parts.push(cc.unwrap_or(""))
+
+    val library = std_root() match
+        Err(why) -> return Err(Refusal(why))
+        Ok(dir) -> dir
+
+    val std = std_fingerprint(library, t) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(got) -> got
+
+    parts.push(s"source:$std")
+    parts.push(program_fingerprint(path, t)?)
+    parts.push(build_environment())
+    Ok(parts)
+end run_cache_parts
+
+// The key for one command over one tree, or nothing where it cannot be established.
+//
+// **A tree that will not read is a miss rather than a refusal**, and deliberately: whatever is wrong
+// with it is about to be reported by the compilation this was asked in front of, in the words that
+// compilation has for it. A cache has no business being the thing that names it.
+run_cache_key_of(command: string, path: string, t: Target, level: string,
+                 cc: Option[string]) -> Option[string] =
+    run_cache_parts(command, path, t, level, cc) match
+        Ok(parts) -> Some(run_cache_key(parts))
+        Err(_) -> None
+
+// Every file the program is made of, reduced to its place in the tree it came from and its text.
+//
+// The tree's **index** rather than its path is what a place is keyed under, so that a package fetched
+// into one machine's cache and another's hash the same. Order is the order the graph resolved them
+// in, which is a function of the manifests.
+private program_fingerprint(path: string, t: Target) -> Result[string, Refusal]
+    var files: Buf[(string, string)] = buf()
+    var trees: Buf[string] = buf()
+
+    trees.push(path)
+
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+
+    // A manifest that will not read is not a refusal here, for the same reason the C walk does not
+    // treat it as one: whatever needed it has already said so.
+    manifest_at(root) match
+        Ok(m) ->
+            val roots = package_roots(root, m)
+
+            for i in 0..<roots.len()
+                trees.push(roots.at(i))
+        Err(_) -> ()
+
+    for i in 0..<trees.len()
+        val found = collect(trees.at(i), Some(t.os)) match
+            Err(e) -> return Err(Refusal(e.message))
+            Ok(f) -> f
+
+        for j in 0..<found.len()
+            files.push((s"$i/${found_place(found.at(j))}",
+                        from_utf8_unchecked(found.at(j).src.bytes)))
+
+        // The C beside the sysl, on the same terms: a binding is a sysl surface over C, so an edit to
+        // one of its `.c` files changes what the program links against and must miss.
+        val carried = c_sources(trees.at(i), Some(t.os)) match
+            Err(e) -> return Err(Refusal(e.message))
+            Ok(cs) -> cs
+
+        for j in 0..<carried.len()
+            val text = read_text(carried.at(j)) match
+                Err(_) -> return Err(Refusal(s"cannot read ${carried.at(j)}"))
+                Ok(got) -> got
+
+            files.push((s"$i/${relative_to(trees.at(i), carried.at(j))}", text))
+
+    Ok(library_fingerprint(files))
+end program_fingerprint
+
+// A file's place: the module directories it was found under, then its own name.
+private found_place(found: Found) -> string
+    var out = ""
+
+    for i in 0..<found.dir.len()
+        out = out + found.dir.at(i) + "/"
+
+    out + basename(found.src.name)
+end found_place
+
+// Every environment variable that can change the bytes a build produces, as `NAME=value` for the
+// ones that are set.
+//
+// **`SYSL_LIB` is deliberately absent, and leaving it out is the more correct answer rather than an
+// omission.** It names where the library source *is*, and the key already carries that library's
+// fingerprint -- its contents. Adding the path would make two identical trees at two paths miss each
+// other's entry for no gain. `SYSL_NO_CACHE` is absent for a different reason: it turns the cache off
+// rather than selecting an entry in it.
+private build_environment() -> string
+    val names: []const string = ["SYSL_EXTRA_CFLAGS", "WASI_SDK_PATH", "ANDROID_NDK_ROOT",
+                                 "ANDROID_NDK_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT"]
+
+    join(names.filter((n) -> env_var(n).is_some()).map((n) -> s"$n=${env_var(n).unwrap()}"), " ")
+end build_environment
+
+// --- the slot -------------------------------------------------------------------------
+
+// Where a built program is kept, or nothing where this machine has no cache directory -- the same
+// condition the standard module's own path falls back on, and the same answer: behave as though there
+// were no cache.
+private run_cache_slot(key: string) -> Option[string]
+    if env_var(CacheOff).unwrap_or("") != "" then return None
+
+    cache_directory() match
+        Some(dir) -> Some(s"$dir/sysl/run/$key")
+        None -> None
+end run_cache_slot
+
+// The program built for this key, where one is there and is still executable.
+run_cache_hit(key: string) -> Option[string] = run_cache_slot(key) match
+    Some(path) -> if is_file(path) && is_executable(path) then Some(path) else None
+    None -> None
+
+// Where to link, for a build that is about to happen: a path in the cache with the directory already
+// made, or nothing where there is no cache to write into.
+//
+// **The build links straight into the slot** rather than to a temporary that is copied afterwards. A
+// copy would have to reproduce the executable bit, which is one more thing to get wrong per platform;
+// linking there gets it from the linker.
+run_cache_reserve(key: string) -> Option[string]
+    val path = run_cache_slot(key) match
+        Some(p) -> p
+        None -> return None
+
+    val dir = parent_of(path) match
+        Some(d) -> d
+        None -> return None
+
+    make_dir_all(dir) match
+        Err(_) -> return None
+        Ok(_) -> ()
+
+    evict_around(path)
+    Some(path)
+end run_cache_reserve
+
+// The test list beside a cached test binary, which is the one thing `sysl test` needs that the
+// executable does not carry: what to call, what to report it as, whether it should trap and what it
+// should have printed on its way out.
+//
+// A sidecar rather than a second cache, so the two cannot come apart -- the binary is written first,
+// and a hit needs both.
+run_cache_tests(key: string) -> Option[string] = run_cache_slot(key) match
+    Some(path) -> Some(s"$path.tests")
+    None -> None
+
+// The list written beside the binary. A write that fails is not a failure of the build: the worst it
+// costs is the next run's compile.
+write_test_list(key: string, tests: Buf[TTest])
+    run_cache_tests(key) match
+        Some(path) -> write_text(path, encode_test_list(tests)).unwrap_or(())
+        None -> ()
+
+// The list read back, or nothing where there is none or it will not read -- which is a rebuild.
+read_test_list(key: string) -> Option[Buf[TTest]] = run_cache_tests(key) match
+    Some(path) -> if is_file(path) then decode_from(path) else None
+    None -> None
+
+// A cached test build: the binary and what to call in it.
+//
+// **A hit is both or neither.** The executable does not carry what to report a test as, whether it
+// should trap or what it should have printed, so a binary with no list beside it is a rebuild.
+cached_test_build(key: Option[string]) -> Option[(string, Buf[TTest])]
+    val one = key match
+        Some(found) -> found
+        None -> return None
+
+    val exe = run_cache_hit(one) match
+        Some(built) -> built
+        None -> return None
+
+    read_test_list(one) match
+        Some(list) -> Some((exe, list))
+        None -> None
+end cached_test_build
+
+private decode_from(path: string) -> Option[Buf[TTest]] = read_text(path) match
+    Ok(text) -> decode_test_list(text)
+    Err(_) -> None
+
+// Whether a path names something this machine would run.
+private is_executable(path: string) -> bool = metadata(path) match
+    Ok(m) -> (m.mode & 0x49) != 0
+    Err(_) -> false
+
+// Entries past `Keep` that are also older than `Stale`, removed.
+//
+// A failure here is not a failure of the build: the worst an unevicted cache costs is disk, and the
+// worst a failed eviction costs is nothing at all. `now` is read from the newest entry rather than
+// from a clock, so a machine whose clock has moved evicts nothing rather than everything.
+private evict_around(fresh: string)
+    val dir = parent_of(fresh) match
+        Some(d) -> d
+        None -> return
+
+    val kept = entries(dir) match
+        Ok(names) -> names.map((n) -> join_path(dir, n)).filter((one) -> one != fresh)
+        Err(_) -> return
+
+    if kept.len < Keep then return
+
+    val start: long = 0
+    val now = kept.fold(start, (so_far, one) -> max_long(so_far, modified_at(one)))
+
+    kept.filter((one) -> now - modified_at(one) > Stale)
+        .each((one) -> remove_file(one).unwrap_or(()))
+end evict_around
+
+private max_long(a: long, b: long) -> long = if a > b then a else b
+
+// When a path was last written, in microseconds, or zero where it cannot be asked -- which evicts
+// nothing, since zero is older than every threshold read against the newest entry.
+private modified_at(path: string) -> long = metadata(path) match
+    Ok(m) -> m.modified.us
+    Err(_) -> 0
+
+// --- the test list --------------------------------------------------------------------
+
+// One line per test, with a NUL between the fields. Three flat fields per hook rather than one packed
+// one, because the separator is already spoken for and a second one would be a second character a
+// name must not hold.
+encode_test_list(tests: Buf[TTest]) -> string
+    var b = str_builder()
+
+    for i in 0..<tests.len()
+        val t = tests.at(i)
+
+        if i > 0 then b.push("\n")
+
+        b.push(t.func)
+        b.push(Nul)
+        b.push(t.display)
+        b.push(Nul)
+        b.push(if t.should_trap then "true" else "false")
+        b.push(Nul)
+        b.push(t.expected.unwrap_or(""))
+        b.push(Nul)
+        b.push(if t.expected.is_some() then "1" else "0")
+        b.push(Nul)
+        b.push(t.file)
+        b.push(Nul)
+        b.push(s"${t.line}")
+
+        push_hook(&b, t.hooks.setup)
+        push_hook(&b, t.hooks.teardown)
+        push_hook(&b, t.hooks.setup_all)
+        push_hook(&b, t.hooks.teardown_all)
+
+    b.finish()
+end encode_test_list
+
+private push_hook(b: *StrBuilder, hook: Option[THook])
+    b.push(Nul)
+
+    hook match
+        Some(h) ->
+            b.push(h.func)
+            b.push(Nul)
+            b.push(h.file)
+            b.push(Nul)
+            b.push(s"${h.line}")
+        None ->
+            b.push("")
+            b.push(Nul)
+            b.push("")
+            b.push(Nul)
+            b.push("")
+end push_hook
+
+// The list read back, or nothing where a line will not read -- which is treated as no cache at all.
+decode_test_list(text: string) -> Option[Buf[TTest]]
+    var out: Buf[TTest] = buf()
+
+    for line in split(text, "\n")
+        if line == "" then continue
+
+        val f = split(line, Nul)
+
+        if f.len != Marks + 1 then return None
+
+        val expected = if f[4] == "1" then Some(f[3]) else None
+
+        out.push(TTest(f[0], f[1], f[2] == "true", expected, f[5], read_line_number(f[6]),
+                       THooks(hook_from(Setup, f, 7), hook_from(Teardown, f, 10),
+                              hook_from(SetupAll, f, 13), hook_from(TeardownAll, f, 16))))
+
+    Some(out)
+end decode_test_list
+
+private hook_from(kind: HookKind, f: []string, at: usize) -> Option[THook] =
+    if f[at] == "" then None else Some(THook(kind, f[at], f[at + 1], read_line_number(f[at + 2])))
+
+// A line number written by `encode_test_list` and read back. A field that is not digits is a zero
+// rather than a refusal: what a caller does with the list is print it, and the sidecar is written by
+// this file alone.
+private read_line_number(text: string) -> int
+    var n = 0
+
+    for i in 0..<text.bytes.len
+        val c = text.bytes[i]
+
+        if c >= u8('0') && c <= u8('9') then n = n * 10 + int(c - u8('0'))
+
+    n
+end read_line_number

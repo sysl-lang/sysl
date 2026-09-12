@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.text.Search
 
 // What a whole program is made of, assembled once every body has been typed.
 //
@@ -310,16 +311,47 @@ reached_externs(a: &Analysis) -> Buf[TExtern]
             if d.unwrap().ret_type.is_some() then
                 ret = resolve_type(a, scope, d.unwrap().ret_type.unwrap(), no_bindings())
 
-            out.push(TExtern(key, extern_symbol(d.unwrap()), params, ret, d.unwrap().variadic))
+            out.push(TExtern(key, linked_symbol(a, extern_written(a, key), d.unwrap(), params, ret),
+                             params, ret, d.unwrap().variadic))
 
     out
 end reached_externs
 
+// The symbol an `extern` links against, which for the back end's own operations is not the name the
+// declaration wrote.
+//
+// **An LLVM intrinsic is overloaded on its operand type, and the width is part of the NAME** --
+// `llvm.fabs.f64`, never `llvm.fabs`. Emitting the base alone calls a function LLVM does not define,
+// so a program reaching `sysl.math`'s `abs` would not link; the library declares seven of these and
+// `json` and `toml` are the two repositories in the org that reach one.
+//
+// It is settled here, where the signature has just been resolved, rather than recomputed wherever
+// the symbol is wanted -- so everything downstream reads one field and needs to know nothing about
+// which kind of `extern` this was.
+private linked_symbol(a: &Analysis, home: ExternHome, d: ExternDecl, params: Buf[Type],
+                      ret: Type) -> string
+    val written = extern_symbol(d)
+
+    if !is_intrinsic_name(written) then return written
+
+    if d.variadic
+        a.fault(home.scope, home.span, "an intrinsic takes a fixed argument list, so it may not " +
+                "be declared with '...'")
+
+    resolve_intrinsic(written, params, ret) match
+        Ok(mangled) -> mangled
+        Err(why) ->
+            a.fault(home.scope, home.span, why)
+            written
+end linked_symbol
+
 
 // The file an `extern` was written in, which is where the types in its signature mean what they
 // meant.
-private extern_home(a: &Analysis, key: string) -> Scope =
-    a.tables.extern_scopes.get(key).unwrap_or(empty_scope())
+private extern_home(a: &Analysis, key: string) -> Scope = extern_written(a, key).scope
+
+private extern_written(a: &Analysis, key: string) -> ExternHome =
+    a.tables.extern_scopes.get(key).unwrap_or(ExternHome(empty_scope(), span_zero()))
 
 // The `@test` functions the sources declared, in the order they were written, each carrying the
 // hooks its own module declared.
@@ -461,3 +493,83 @@ private gives_up_heap(clauses: Buf[CapabilityClause]) -> bool
 
     false
 end gives_up_heap
+
+// -- the back end's own operations ------------------------------------------------------------------
+
+// The namespace LLVM reserves, which is the whole of how an intrinsic is told from a linked symbol.
+const IntrinsicPrefix: string = "llvm."
+
+is_intrinsic_name(symbol: string) -> bool = symbol.starts_with(IntrinsicPrefix)
+
+// The seven float operations the library declares an `extern` for, with what each takes.
+//
+// **What is validated here is a signature somebody WROTE** -- an `extern` in library source, which
+// can disagree with LLVM's and has to be held to it before the verifier is reached, where the
+// message names generated text rather than the line. The integer operations are not here and that is
+// not an omission: `sysl.math`'s `Bits` covers an open family of widths, so there was never a finite
+// set of `extern`s, and the compiler builds those calls from the receiver's own type.
+private intrinsic_arity(base: string) -> Option[usize] = base match
+    "llvm.sqrt" -> Some(1)
+    "llvm.fabs" -> Some(1)
+    "llvm.floor" -> Some(1)
+    "llvm.ceil" -> Some(1)
+    "llvm.trunc" -> Some(1)
+    "llvm.round" -> Some(1)
+    "llvm.copysign" -> Some(2)
+    _ -> None
+
+// The ones there are, in the order a refusal lists them.
+private intrinsics_supported() -> string =
+    "llvm.ceil, llvm.copysign, llvm.fabs, llvm.floor, llvm.round, llvm.sqrt, llvm.trunc"
+
+// The name to emit, or why the declaration cannot be honoured. The checks are the ones the LLVM
+// verifier would otherwise find.
+private resolve_intrinsic(base: string, params: Buf[Type], ret: Type) -> Result[string, string]
+    val arity = intrinsic_arity(base) match
+        Some(n) -> n
+        None -> return Err(s"'$base' is not an intrinsic sysl supports — it has " +
+                           s"${intrinsics_supported()}")
+
+    if params.len() != arity
+        return Err(s"'$base' takes ${quantity(arity, "argument")}, but ${params.len()} were declared")
+
+    // **The suffix is the width every one of them is at**, so a declaration mixing two, or naming
+    // anything that is not floating, has no name to be given.
+    var bits = 0
+
+    for i in 0..<params.len()
+        params.at(i) match
+            Floating(w) -> if bits == 0 then bits = w else if bits != w then bits = -1
+            _ -> bits = -1
+
+    ret match
+        Floating(w) -> if bits == 0 then bits = w else if bits != w then bits = -1
+        _ -> bits = -1
+
+    if bits <= 0
+        return Err(s"'$base' takes and returns one floating-point type, and this declaration " +
+                   s"states ${intrinsic_states(params, ret)}")
+
+    Ok(s"$base.f$bits")
+end resolve_intrinsic
+
+// The distinct types a declaration named, as the refusal lists them.
+private intrinsic_states(params: Buf[Type], ret: Type) -> string
+    var seen: Buf[string] = buf()
+
+    for i in 0..<params.len()
+        val one = type_show(params.at(i))
+
+        if !holds_string(seen, one) then seen.push(one)
+
+    val last = type_show(ret)
+
+    if !holds_string(seen, last) then seen.push(last)
+
+    var out = ""
+
+    for i in 0..<seen.len()
+        out = out + (if i == 0 then "" else " and ") + seen.at(i)
+
+    out
+end intrinsic_states

@@ -1227,3 +1227,113 @@ a_with_expression_changing_a_field_twice()
 
     assert(says(said, "'bg' is changed twice in one 'with', so the first change is thrown away — " +
                 "write the value it should end with, once"), listed_of(said))
+
+// -- a `@tests` file's own clauses, asked of a generic --------------------------------------------
+
+// **What made a declaration scaffolding was its emitted name, and an instantiation is filed under a
+// name no `@tests` file ever recorded.** So a generic helper written in a scaffolding file was held
+// to the module's own narrowing rather than to the one its `@tests` file had taken back -- and the
+// library's own `sysl.crypto` tests are exactly that shape, which is what found it. The question is
+// asked of the FILE the declaration was written in now.
+@test("a generic helper in a '@tests' file that took the narrowing back may allocate")
+a_generic_in_a_tests_file_may_allocate()
+    assert_eq(scaffolding_said("module mm\n@no_alloc\n\nkeep(x: []const u8) -> usize = x.len\n",
+                               "module mm\n@tests\n@requires(heap)\n\n" +
+                               "private room[T](n: T) -> usize\n    var out: []u8 = [0; 4]\n\n" +
+                               "    out.len\nend room\n\ncaller() -> usize = room(1)\n"),
+              "")
+
+// And the neighbour that must still be refused: the same generic in the module's OWN file, where
+// nothing took the narrowing back.
+@test("a generic in an allocator-free module's own file may not allocate")
+a_generic_in_the_module_may_not_allocate()
+    assert(scaffolding_said("module mm\n@no_alloc\n\nprivate room[T](n: T) -> usize\n" +
+                            "    var out: []u8 = [0; 4]\n\n    out.len\nend room\n\n" +
+                            "caller() -> usize = room(1)\n",
+                            "module mm\n@tests\n@requires(heap)\n\nspare() -> usize = 1\n")
+               .contains("declared '@no_alloc'"))
+
+// Two files of one module analyzed together, which is what a question about a `@tests` file's
+// override needs: what the scaffolding takes back is an override of what the module said, and one
+// file cannot say both.
+private scaffolding_said(shipped: string, scaffolding: string) -> string
+    var units: Buf[Program] = buf()
+
+    units.push(parse(source_of("m.sysl", shipped)).program)
+    units.push(parse(source_of("m_tests.sysl", scaffolding)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if done.reported.is_empty() then return ""
+
+    done.reported.at(0).diag.message
+end scaffolding_said
+
+// -- the back end's own operations --------------------------------------------------------------
+
+// **An LLVM intrinsic is overloaded on its operand type and the width is part of the NAME.**
+// Emitting the base alone names a function LLVM does not define, so a program reaching `sysl.math`'s
+// `abs` would not link -- and the two repositories in the org that reach one are how it was found.
+@test("an intrinsic's symbol carries the width it was declared at")
+an_intrinsic_symbol_carries_its_width()
+    if checks_no_library() then return
+
+    assert_eq(intrinsic_linked("private extern \"llvm.fabs\" mag(x: real) -> real\n\n" +
+                               "main()\n    print(mag(-1.0))\n"), "llvm.fabs.f64")
+
+// A name the back end does not have, which would otherwise be found by the verifier in generated
+// text rather than at the line somebody wrote.
+@test("an intrinsic sysl does not support is refused with the ones it has")
+an_unsupported_intrinsic_is_refused()
+    if checks_no_library() then return
+
+    assert(intrinsic_said("private extern \"llvm.wobble\" f(x: real) -> real\n\n" +
+                          "main()\n    print(f(1.0))\n")
+               .contains("'llvm.wobble' is not an intrinsic sysl supports"))
+
+@test("an intrinsic declared at the wrong arity is refused")
+an_intrinsic_at_the_wrong_arity_is_refused()
+    if checks_no_library() then return
+
+    assert(intrinsic_said("private extern \"llvm.fabs\" f(x: real, y: real) -> real\n\n" +
+                          "main()\n    print(f(1.0, 2.0))\n")
+               .contains("'llvm.fabs' takes 1 argument, but 2 were declared"))
+
+@test("an intrinsic declared over something that is not one floating type is refused")
+an_intrinsic_at_a_mixed_signature_is_refused()
+    if checks_no_library() then return
+
+    assert(intrinsic_said("private extern \"llvm.fabs\" f(x: int) -> real\n\n" +
+                          "main()\n    print(f(1))\n")
+               .contains("takes and returns one floating-point type"))
+
+// The symbol the program's `externs` records for the one declaration the text writes.
+private intrinsic_linked(text: string) -> string
+    val p = checks_program(text)
+
+    for i in 0..<p.externs.len()
+        if is_intrinsic_name(p.externs.at(i).symbol) then return p.externs.at(i).symbol
+
+    ""
+end intrinsic_linked
+
+// What building the program said, which is where a symbol that cannot be honoured is reported: the
+// symbol is settled where the signature has been resolved, and `stmt_diagnostics` stops before that.
+private intrinsic_said(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+    var units: Buf[Program] = buf()
+    val library = checks_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, done.main_module)
+    val said = errors_of(done.an.diagnostics())
+
+    if said.is_empty() then return ""
+
+    said.at(0).diag.message
+end intrinsic_said

@@ -38,6 +38,7 @@ run_cli(args: []string, say: string -> unit) -> int
         "emit-typed" -> emit_typed_command(args, say)
         "emit-llvm" -> emit_llvm_command(args, say)
         "build" -> build_command(args, say)
+        "build-lib" -> build_lib_command(args, say)
         "run" -> run_command(args, say)
         "test" -> test_command(args, say)
         "add" -> add_command(args, say)
@@ -322,6 +323,7 @@ private test_command(args: []string, say: string -> unit) -> int
     var cc: Option[string] = None
     var filter: Option[string] = None
     var fail_fast = false
+    var std = false
     var level = DefaultOptimization
     var file = ""
     var i: usize = 2
@@ -342,6 +344,8 @@ private test_command(args: []string, say: string -> unit) -> int
             else filter = Some(args[i])
         else if args[i] == "--fail-fast"
             fail_fast = true
+        else if args[i] == "--std"
+            std = true
         else if args[i].len > 2 && args[i].starts_with("-O")
             level = args[i][2..<args[i].len]
         else
@@ -354,7 +358,21 @@ private test_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
-    val build = test_build_of(file, named) match
+    // **What was built last time, where nothing that can reach the bytes has changed**
+    // (`run_cache.sysl`). It is asked before anything is analyzed, because the compile is the whole
+    // of what a second `sysl test` over an unchanged tree costs.
+    // A `--std` build keeps its own entries: the tree is compiled as the library rather than against
+    // one, so the same sources at the same machine come to different bytes.
+    val key = run_cache_key_for(if std then "test --std" else "test", file, named, level, cc)
+
+    cached_test_build(key) match
+        Some(hit) -> return tests_run(file, hit.0, hit.1, filter, fail_fast, false, say)
+        None -> ()
+
+    val made_build = if std then std_test_build_of(file, named)
+    else test_build_of(file, named)
+
+    val build = made_build match
         Err(refusal) ->
             say(s"error: ${refusal.message}")
             return Failed
@@ -365,31 +383,55 @@ private test_command(args: []string, say: string -> unit) -> int
         return Failed
     end if
 
-    // Nothing to run is not nothing to say. A tree with no tests at all and a filter that matched none
-    // of the tests there are lead to the same empty report and are different mistakes, so each is
-    // named. Neither is a failure: a program is allowed to have no tests.
-    if build.tests.is_empty()
-        say(s"no '@test' functions in $file")
-        return Fine
-    end if
+    // Asked before anything is linked, so a tree with nothing to run pays for no toolchain.
+    nothing_to_run(file, build.tests, filter, say) match
+        Some(code) -> return code
+        None -> ()
 
-    val chosen = selected_tests(build.tests, filter)
-
-    if chosen.is_empty()
-        say(s"no test matches '${filter.unwrap_or("")}' — ${build.tests.len()} to choose from")
-        return Fine
-    end if
-
-    val exe = build_test_binary(file, build, cc, level) match
+    val made = build_test_binary_cached(file, build, cc, level, key) match
         Err(refusal) ->
             say(s"error: ${refusal.message}")
             return Failed
         Ok(built) -> built
 
-    val outcomes = run_selected(exe, chosen, TestOptions(filter, fail_fast),
-                                build.tests.len() - chosen.len(), piece -> stream_out(piece))
+    // The list is written **after** the binary and read back before either is used, so a run that
+    // died between the two leaves a slot the next one rebuilds rather than one it half believes.
+    if made.1 then write_test_list(key.unwrap(), build.tests)
 
-    discard_test_binary(exe)
+    tests_run(file, made.0, build.tests, filter, fail_fast, !made.1, say)
+end test_command
+
+// Nothing to run is not nothing to say. A tree with no tests at all and a filter that matched none of
+// the tests there are lead to the same empty report and are different mistakes, so each is named.
+// Neither is a failure: a program is allowed to have no tests.
+private nothing_to_run(file: string, all: Buf[TTest], filter: Option[string],
+                       say: string -> unit) -> Option[int]
+    if all.is_empty()
+        say(s"no '@test' functions in $file")
+        return Some(Fine)
+    end if
+
+    if selected_tests(all, filter).is_empty()
+        say(s"no test matches '${filter.unwrap_or("")}' — ${all.len()} to choose from")
+        return Some(Fine)
+    end if
+
+    None
+end nothing_to_run
+
+// The chosen tests, run and reported. `discard` is false for a binary in the cache, which is the
+// whole point of it being there.
+private tests_run(file: string, exe: string, all: Buf[TTest], filter: Option[string],
+                  fail_fast: bool, discard: bool, say: string -> unit) -> int
+    nothing_to_run(file, all, filter, say) match
+        Some(code) -> return code
+        None -> ()
+
+    val chosen = selected_tests(all, filter)
+    val outcomes = run_selected(exe, chosen, TestOptions(filter, fail_fast),
+                                all.len() - chosen.len(), piece -> stream_out(piece))
+
+    if discard then discard_test_binary(exe)
 
     var failed: usize = 0
 
@@ -397,10 +439,66 @@ private test_command(args: []string, say: string -> unit) -> int
         if !outcomes.at(j).passed() then failed += 1
 
     if failed == 0 then Fine else Failed
-end test_command
+end tests_run
 
-private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fast] " +
+private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fast] [--std] " +
     "[--target <name>] [--cc <path>] [-O<level>] <path>"
+
+// `sysl build-lib [--std] [--target <name>] [-o <path>] <path>` -- a library compiled into an
+// artifact for one machine.
+//
+// **`--std` says the tree is sysl's own standard module**, which is the one thing an ordinary
+// compilation may not declare, and it is the only library this compiler builds an artifact of: the
+// split between what an artifact's object half defines and what a consumer compiles for itself
+// serves one library here, and a named artifact has nowhere to be read from yet.
+private build_lib_command(args: []string, say: string -> unit) -> int
+    var named: Option[string] = None
+    var out: Option[string] = None
+    var std = false
+    var file = ""
+    var i: usize = 2
+
+    while i < args.len
+        if args[i] == "--target" || args[i] == "-o"
+            if i + 1 >= args.len
+                say(build_lib_usage())
+                return Misused
+            end if
+
+            val flag = args[i]
+
+            i += 1
+
+            if flag == "--target" then named = Some(args[i]) else out = Some(args[i])
+        else if args[i] == "--std"
+            std = true
+        else
+            file = args[i]
+
+        i += 1
+
+    if file == ""
+        say(build_lib_usage())
+        return Misused
+    end if
+
+    if !std
+        say("error: this compiler builds an artifact of the standard module and of no other library " +
+            "yet — pass --std where the tree is sysl's own")
+        return Failed
+    end if
+
+    build_std_artifact_of(file, named, out) match
+        Err(refusal) ->
+            say(s"error: ${refusal.message}")
+            Failed
+        Ok(where) ->
+            say(s"wrote $where")
+            Fine
+end build_lib_command
+
+private build_lib_usage() -> string =
+    "usage: sysl build-lib [--std] [--target <name>] [-o <path>] <path>"
 
 // One piece of a report, written and **flushed**, so that a run followed through a log file shows each
 // verdict as it lands rather than only once the process exits. The pieces carry their own newlines,

@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
 import sysl.text.Search
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
@@ -276,3 +277,65 @@ private pkg_declares(c: Compilation, name: string) -> bool
 
     false
 end pkg_declares
+
+// -- a value read through the module written before the dot -----------------------------------------
+
+// **A call and a value read differ in nothing but the parentheses, and the two paths had drifted.**
+// `raw.thing()` consulted the alias an import bound and the path written out in full; `raw.eof` --
+// the same module, a constant instead of a function -- consulted neither, so it fell through to the
+// bare-name reading and was reported as `undefined name '<this module>.raw'`, naming the module the
+// reader had just imported.
+//
+// **Every `c const` block in the org is exactly this shape**: a binding keeps its C in a submodule
+// and the pleasant layer beside it writes `c.EOF`, so five packages could not be read at all.
+@test("a constant of another module is read through the name an import bound")
+a_constant_is_read_through_a_module_alias()
+    assert_eq(qualified_read_said("module m.raw\n\nconst eof: int = 7\n",
+                                  "module m\n\nimport m.raw\n\nat() -> int = raw.eof\n"), "")
+
+// The same written out in full rather than through the alias, which is the other reading a call
+// already had.
+@test("a constant of another module is read through the path written out in full")
+a_constant_is_read_through_a_written_path()
+    assert_eq(qualified_read_said("module m.raw\n\nconst eof: int = 7\n",
+                                  "module m\n\nat() -> int = m.raw.eof\n"), "")
+
+// **An `extern` reached the same way**, which is the form every binding in the org writes: the C is
+// kept in a submodule and the pleasant layer beside it calls `c.surface_destroy(h)`. A call to a
+// *function* had the three readings and a call to an `extern` had none of them.
+@test("an 'extern' of another module is called through the name an import bound")
+an_extern_is_called_through_a_module_alias()
+    assert_eq(qualified_read_said("module m.raw\n\nextern \"abs\" c_abs(x: int) -> int\n",
+                                  "module m\n\nimport m.raw\n\nat() -> int = raw.c_abs(-7)\n"), "")
+
+// **And its signature means what it meant in ITS file.** An opaque struct declared beside the
+// `extern` is not a name the layer above can resolve, so a parameter read in the caller's scope
+// comes out `*?` and every call disagrees with it.
+@test("an 'extern' reached through a module has its types read in the file that declared it")
+an_externs_types_are_read_where_it_was_written()
+    assert_eq(qualified_read_said("module m.raw\n\nopaque struct File\n\n" +
+                                  "extern \"fclose\" shut(f: *File) -> int\n",
+                                  "module m\n\nimport m.raw\n\n" +
+                                  "at(f: *raw.File) -> int = raw.shut(f)\n"), "")
+
+// And the refusal it must not swallow: a module that has no such name still says so.
+@test("a name the named module does not declare is still undefined")
+a_missing_name_in_a_module_is_still_undefined()
+    assert(qualified_read_said("module m.raw\n\nconst eof: int = 7\n",
+                               "module m\n\nimport m.raw\n\nat() -> int = raw.nope\n")
+               .contains("undefined name"))
+
+// Two files of two modules analyzed together, since a value read through a module needs a module to
+// read it from.
+private qualified_read_said(one: string, two: string) -> string
+    var units: Buf[Program] = buf()
+
+    units.push(parse(source_of("raw.sysl", one)).program)
+    units.push(parse(source_of("m.sysl", two)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if done.reported.is_empty() then return ""
+
+    done.reported.at(0).diag.message
+end qualified_read_said
