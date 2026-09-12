@@ -262,3 +262,43 @@ a_type_argument_with_no_spelling()
               "read it out of the expression grammar, so a slice, a 'weak', a 'volatile', a " +
               "vector and a callable have no spelling here. Annotate what receives the result and " +
               "let the call infer it instead")
+
+// -- an associated function reached through a generic type's name ---------------------------------
+//
+// **A generic type has no instance under its bare key**, an instance being keyed by its arguments
+// mangled on, so `Vector.zeros(n)` used to be reported as an undefined name -- which is about the
+// wrong thing entirely. The name is fine; what is missing is which `Vector`, and that is settled the
+// way a generic function's call settles it: by what the arguments say, and then by what receives the
+// result.
+//
+// `linalg` and `fft` are the repositories, and between them 124 diagnostics came from this one
+// reading.
+@test("an associated function on a generic type takes the instantiation from the arguments")
+an_associated_call_solved_by_its_arguments()
+    assert_eq(count("struct Gen[T]\n    v: T\n\n    of(v: T) -> Gen[T] = Gen(v)\n\n" +
+                    "f() -> int\n    val g = Gen.of(7)\n\n    g.v\n"), 0)
+
+@test("and from what receives the result, where the arguments say nothing")
+an_associated_call_solved_by_its_position()
+    assert_eq(count("struct Gen[T]\n    v: T\n\n    zero() -> Gen[int] = Gen(0)\n\n" +
+                    "f() -> Gen[int] = Gen.zero()\n"), 0)
+
+@test("and where neither says, the refusal is about the type argument rather than about the name")
+an_associated_call_nothing_settles()
+    assert_eq(only("struct Gen[T]\n    v: T\n\n    zero() -> Gen[int] = Gen(0)\n\n" +
+                   "f() -> int = Gen.zero().v\n"),
+              "cannot infer the type argument 'T' of 'Gen' here — annotate the expected type")
+
+// -- a conversion to a type parameter -------------------------------------------------------------
+//
+// **`T(b)` is `u8(x)` read the other way, and it is checked at the same moment.** A generic body is
+// read once at its definition with the parameter opaque, where nothing about the conversion can be
+// decided; every instantiation reads the body again with a type in place of the parameter, and that
+// reading is the ordinary check between two concrete types. So the parameter admits the conversion
+// here and the instantiation is what refuses a bad one.
+//
+// A parameter is asked about ahead of every declaration table, being the nearer binding: a name
+// cannot mean the parameter in type position and a declaration in call position.
+@test("a type parameter in call position is a conversion, as a written type name is")
+converting_to_a_type_parameter()
+    assert_eq(count("f[T](n: usize) -> T = T(n)\n"), 0)

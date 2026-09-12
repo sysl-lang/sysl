@@ -225,6 +225,21 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
 
     val shadowed = cx.lookup(name).is_some()
 
+    // **A conversion to a TYPE PARAMETER**, which every instantiation replaces with a type this same
+    // form would have accepted written out. That is what makes the two directions symmetric: `u8(x)`
+    // where `x` is a `T` was always ordinary code, checked once the width is concrete, and `T(b)` is
+    // the same check at the same moment.
+    //
+    // **A parameter is asked about ahead of every declaration table**, because it is the nearer
+    // binding: `var y: T` inside a `[T]` body already means the parameter whatever else is called
+    // `T`, and a name cannot mean the parameter in type position and a declaration in call position.
+    if !shadowed
+        val stands_for = bound_type(cx.subst, name)
+
+        if stands_for.is_some() then
+            return convert_call(cx, span, name, stands_for.unwrap(), args)
+    end if
+
     // **A variant the position asked for outright claims the name**, before a type of that name is
     // asked about: a variant and a struct may share a spelling, and `ImplDecl(d)` at a parameter
     // whose type is the enum is the variant however many structs are called that. Nothing else
@@ -404,7 +419,17 @@ private refusal(asked: Option[string], from: Type, to: Type) -> string = asked m
     None -> s"cannot convert ${type_show(from)} to ${type_show(to)}"
 
 private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
+    // **A type parameter standing in for itself admits every conversion, and the check is not
+    // skipped -- it is DEFERRED.** A generic body is read once at its definition with the parameter
+    // opaque, where nothing about `F(n)` can be decided; each instantiation reads the body again
+    // with a width in place of `F`, and that reading is this same function answering about two
+    // concrete types.
+    to match
+        Abstract(_, _) -> return true
+        _ -> ()
+
     from match
+        Abstract(_, _) -> return true
         Integer(_, _, _) -> to match
             Integer(_, _, _) -> return true
             Floating(_) -> return true

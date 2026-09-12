@@ -69,11 +69,19 @@ end lookup_trait_member
 // Nothing where the name is not a type, which is what leaves an ordinary member read to answer.
 associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: Buf[Expr],
                 expected: Option[Type]) -> Option[TExpr]
-    val subject = subject_named(cx, receiver)
+    val subject = subject_named(cx, receiver) match
+        Some(found) -> Some(found)
+        // **A GENERIC type has no instance under its bare name**, so the walk above answers nothing
+        // for `Vector.zeros(n)` and the name is reported undefined. What settles which instantiation
+        // is meant is the same thing that settles it for a generic function: what receives the
+        // result.
+        None -> generic_subject(cx, span, receiver, name, args, expected)
 
     if subject.is_none() then return None
 
     val ty = subject.unwrap()
+
+    if ty == Unknown then return Some(bad_expr(span))
 
     // A parameter standing in for itself answers off the bounds it carries, exactly as a value of it
     // does -- and this is the half that has no value to be read off.
@@ -151,6 +159,114 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
     cx.an.uses(fname)
     Some(TExpr(span, TCall(fname, ts, sig.unwrap().ret, false)))
 end associated_call
+
+// The instantiation a **generic** type's bare name stands for in `Vector.zeros(n)`, read off what
+// receives the result.
+//
+// A type with parameters has no instance under its bare key -- an instance is keyed by the arguments
+// mangled on -- so `subject_named` answers nothing and the reader is told the name is undefined,
+// which is about the wrong thing entirely. The name is fine; what is missing is which `Vector`.
+//
+// **Only where the type declares the member**, so a name that happens to be a generic type and a
+// member nobody wrote is left to the reading that reports it as an undefined name. And only where
+// the expected type is an instantiation of that very type: anything else is somebody else's
+// expectation and would silently pick an instantiation the reader did not write.
+private generic_subject(cx: &Analyzer, span: Span, receiver: Expr, name: string,
+                        args: Buf[Expr], expected: Option[Type]) -> Option[Type]
+    val written = *receiver.kind match
+        Ident(n) -> if cx.lookup(n).is_none() then Some(n) else None
+        _ -> None
+
+    if written.is_none() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+
+    if key.is_none() then return None
+    if concrete_instance(cx.an, key.unwrap()).is_some() then return None
+    if member_at(cx.an, key.unwrap(), name).is_none() then return None
+
+    expected match
+        Some(want) ->
+            if instantiation_of(want, key.unwrap()) then return Some(repr(want))
+        None -> ()
+
+    val solved = solved_subject(cx, span, key.unwrap(), name, args, expected)
+
+    if solved.is_some() then return solved
+
+    // The reference's own words, and the advice is what a reader can act on: there is nowhere else
+    // for the arguments to come from, a receiverless call carrying no value of the type.
+    cx.fault(span, s"cannot infer the type argument of " +
+             s"'${module_show(key.unwrap())}.$name' here — annotate the expected type")
+
+    Some(Unknown)
+end generic_subject
+
+// The instantiation the **arguments** settle, where the expected type did not.
+//
+// `Vector.of([1.0f32, 2.0f32])` says which `Vector` as plainly as an annotation would, and it is the
+// same reading a generic function's call gets: the member's written parameter types are unified
+// against what the arguments turned out to be, in the type's own parameters rather than the
+// member's.
+//
+// **Each argument is read in a sandbox and the reading thrown away**, which is what keeps a closure
+// among them from being lowered twice: the arguments are read again below at the parameters this
+// solve arrived at, and the second reading is the one the program gets.
+private solved_subject(cx: &Analyzer, span: Span, key: string, name: string, args: Buf[Expr],
+                       expected: Option[Type]) -> Option[Type]
+    val decl = cx.an.tables.types.get(key)
+
+    if decl.is_none() then return None
+
+    val owner = decl.unwrap()
+
+    val shape = owner.kind match
+        StructOf(d) -> Some((d.tparams, d.bounds))
+        EnumOf(d) -> Some((d.tparams, d.bounds))
+        _ -> None
+
+    if shape.is_none() then return None
+
+    val tparams = shape.unwrap().0
+
+    if tparams.is_empty() then return None
+
+    val m = member_at(cx.an, key, name)
+
+    if m.is_none() then return None
+
+    val member = m.unwrap()
+
+    // A member of its own is a second list of parameters to solve, and nothing here is solving it:
+    // what is wanted is the *type's* arguments, and the member's are settled where the call is read.
+    var param_refs: Buf[TypeRef] = buf()
+
+    for i in 0..<member.params.len()
+        param_refs.push(member.params.at(i).typ)
+
+    var arg_tys: Buf[Type] = buf()
+    var soft: Buf[bool] = buf()
+
+    for i in 0..<args.len()
+        arg_tys.push(texpr_type(sandboxed_arg(cx, args.at(i), None)))
+        soft.push(false)
+
+    val targs = solve(cx.an, owner.scope, span, module_show(key), tparams, param_refs, arg_tys,
+                      member.ret_type, expected, soft, shape.unwrap().1, buf())
+
+    if targs.len() != tparams.len() then return None
+
+    for i in 0..<targs.len()
+        if targs.at(i) == Unknown then return None
+
+    Some(instantiate(cx.an, cx.scope, span, module_show(key), key, targs))
+end solved_subject
+
+// Whether a type is an instantiation of the declaration a key names.
+private instantiation_of(t: Type, key: string) -> bool = repr(t) match
+    Struct(d) -> d.base == key
+    Enum(d) -> d.base == key
+    _ -> false
 
 // The type a name stands for where it stands for one: `Self`, a declared type at no arguments, or a
 // scalar spelled the way a program writes it.
