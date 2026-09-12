@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Source
 import sysl.buf.{Buf, buf}
 import sysl.text.{str_builder, Search}
-import sysl.fs.{make_temp_dir, remove_dir_all, remove_file, current_dir}
+import sysl.fs.{make_temp_dir, remove_dir_all, remove_file, current_dir, make_dir_all, write_text}
 import sysl.process.{run as run_child, Status}
 
 // What one invocation compiles: the program's files, the packages it depends on, and the standard
@@ -402,6 +402,202 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
     link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links)?
     Ok(exe)
 end build_native_program
+
+// `sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] <path>`
+// -- the static archive and the C header a C project is handed.
+//
+// **This is a build with a different ending.** The compilation is the ordinary one rather than a
+// library build, because what is wanted is a module lowered for *this* target with its calls
+// resolved, not a tree of declarations somebody else will compile. What differs from `build` is the
+// entry point, which is suppressed, and the ending: an archive rather than a link.
+//
+// **The standard module is compiled into the archive**, always, and this is the one thing `build-c`
+// decides differently from every other command. A `.syslib` is not something a C project can link:
+// an archive referring to code no reachable file contains fails at the C link naming `sysl$prints`,
+// which is a symbol its author has no way to place. So the archive stands alone or it is not an
+// artifact.
+//
+// **What is NOT in the archive is what this build's own libraries supply** -- `libm`, and whatever
+// `@link` named -- and the report says so rather than leaving it to be discovered at the C project's
+// link. Those are libraries the author chose and can be given to a linker, which is exactly the
+// distinction the standard module fails.
+build_c_archive(path: string, named_target: Option[string], cc: Option[string], level: string,
+                out: Option[string], header_at: Option[string],
+                say: string -> unit) -> Result[(string, string), Refusal]
+    val t = target_for(path, named_target)?
+
+    if !t.builds_with_clang() then return Err(Refusal(t.no_toolchain()))
+
+    // Before the compile rather than after: the archiver is not needed until the end, so discovering
+    // it late would make "there is no llvm-ar" a thing somebody waited the whole build for.
+    val archiver = find_ar(None) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(found) -> found
+
+    val lowered = lower_for_c(path, t)?
+
+    if !lowered.emitted.report.is_empty()
+        return Err(Refusal(analysis_report(lowered.emitted.report)))
+
+    val archive_at = out match
+        Some(named) -> named
+        None -> s"${default_executable(path)}.a"
+
+    val header_out = header_at match
+        Some(named) -> named
+        None -> s"$archive_at.h"
+
+    val clang = find_clang(t, cc) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(found) -> found
+
+    val probed = probe_libs(pkg_config_needs(path)?, t) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(found) -> found
+
+    val staging = make_temp_dir("sysl-c-") match
+        Err(_) -> return Err(Refusal("cannot make a directory to build the archive in"))
+        Ok(dir) -> dir
+
+    var members: Buf[string] = buf()
+
+    val made = build_c_members(clang, archiver, staging, path, archive_at, lowered.emitted.text,
+                               &members, t, level, probed)
+
+    discard_objects(members)
+    remove_dir_all(staging)
+
+    made match
+        Err(why) -> return Err(why)
+        Ok(_) -> ()
+
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+
+    val named = manifest_at(root) match
+        Ok(m) -> if m.name == "" then basename(archive_at) else m.name
+        Err(_) -> basename(archive_at)
+
+    write_text(header_out, c_header_render(lowered.exports, named)) match
+        Err(_) -> return Err(Refusal(s"cannot write $header_out"))
+        Ok(_) -> ()
+
+    // A build that exported nothing produced an archive with no way in, and the author almost
+    // certainly meant to mark something. It is a warning rather than a refusal because an archive of
+    // pure C shims is a real thing to want, and because the header says the same on its face.
+    if lowered.exports.is_empty()
+        say("sysl: warning: nothing in this module is marked '@export', so the archive has no C " +
+            "entry point")
+
+    // The libraries this object still needs, which the C project's link line has to carry. Said here
+    // because nothing downstream will say it: an unresolved sysl symbol at that link reads as a
+    // missing definition rather than as a missing archive.
+    if !lowered.emitted.links.is_empty()
+        say(s"sysl: link this against: ${joined(lowered.emitted.links, ", ")}")
+
+    Ok((archive_at, header_out))
+end build_c_archive
+
+// What the archive is made of, kept apart from the call above so that the staging members are
+// discarded whichever step failed.
+private build_c_members(clang: string, archiver: string, staging: string, path: string,
+                        out: string, ir: string, members: *Buf[string], t: Target, level: string,
+                        probed: PkgAnswer) -> Result[unit, Refusal]
+    val code = s"$staging/$SyslibCodeMember"
+
+    compile_object(clang, ir, code, t, level) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(_) -> ()
+
+    members.push(code)
+
+    // **Every tree the compilation walked, not the project's own.** A source root named with `--lib`
+    // and a package a `dependencies` block brought in answer the same way the project itself does:
+    // their C is compiled and reaches the link. The standard module's is here too, which an ordinary
+    // build takes from the artifact -- an object the archive left out is one the C author has no way
+    // to supply and no way to hear about, since the sysl half compiled cleanly and only the C
+    // project's linker ever notices.
+    val trees = c_trees_of(path)
+
+    for i in 0..<trees.len()
+        val root = trees.at(i)
+
+        val found = c_sources(root, Some(t.os)) match
+            Err(e) -> return Err(Refusal(e.message))
+            Ok(cs) -> cs
+
+        for j in 0..<found.len()
+            val obj = s"$staging/${native_member(root, found.at(j))}"
+
+            make_dir_all(parent_of(obj).unwrap_or("."))
+
+            compile_c(clang, found.at(j), obj, t, level, probed) match
+                Err(why) -> return Err(Refusal(why))
+                Ok(_) -> ()
+
+            members.push(obj)
+
+    make_dir_all(parent_of(out).unwrap_or("."))
+
+    archive(archiver, *members, out) match
+        Err(why) -> Err(Refusal(why))
+        Ok(_) -> Ok(())
+end build_c_members
+
+// Every tree whose C belongs in the archive: the project's own, each package it takes, and the
+// standard module's.
+private c_trees_of(path: string) -> Buf[string]
+    var trees: Buf[string] = buf()
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+
+    if is_directory(path) then trees.push(path)
+
+    manifest_at(root) match
+        Ok(m) ->
+            val roots = package_roots(root, m)
+
+            for i in 0..<roots.len()
+                trees.push(roots.at(i))
+        Err(_) -> ()
+
+    std_root() match
+        Ok(library) -> trees.push(library)
+        Err(_) -> ()
+
+    trees
+end c_trees_of
+
+// What a `build-c` lowering answers with: the text, and the exports the header is written from.
+struct LoweredForC
+    emitted: Emitted
+    exports: Buf[TFunc]
+end LoweredForC
+
+// The lowering an archive gets, which differs from a program's in exactly two places: there is no
+// entry point, and nothing is precompiled.
+//
+// **`c_artifact` is `!entry_point` here and only here.** A `.syslib` also has no entry point and is
+// not a C artifact: it is linked by a program that has one, and the library build has already
+// deferred every function reaching computed storage to it. An archive has nobody to defer to, so it
+// carries a constructor of its own where the platform runs one.
+private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Refusal]
+    val program = packaged_compilation_of(path, t)?
+
+    // **Told there is no entry point before a declaration is read, and that is not a detail.** A
+    // file with no `module` header holding a `val` is a program's entry file, whose declarations are
+    // that body's locals -- so an archive analyzed as an ordinary program has its `@export`s renamed
+    // into nested functions of a body nothing emits, and the header comes out empty. There is no
+    // beginning here for a binding to be local to.
+    val done = analyze_produced(program.units, program.target, buf(), false)
+    val whole = program_of(done, done.main_module)
+    val promotions = post_analysis_checks(done.an, whole, program.own)
+    val walked = prune(strip_tests(whole), program.own)
+    val kept = walked with { entry_point = false, c_artifact = true }
+    val lowered = codegen_with_gaps(kept, t, promotions)
+
+    Ok(LoweredForC(Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1,
+                           link_required(program.units)),
+                   exports_by_symbol(kept.funcs)))
+end lower_for_c
 
 // The tail every command that produces a binary shares: the clang, the tree's own C, the standard
 // module's archive, and the link.

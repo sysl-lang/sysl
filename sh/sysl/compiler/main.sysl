@@ -39,6 +39,7 @@ run_cli(args: []string, say: string -> unit) -> int
         "emit-llvm" -> emit_llvm_command(args, say)
         "build" -> build_command(args, say)
         "build-lib" -> build_lib_command(args, say)
+        "build-c" -> build_c_command(args, say)
         "run" -> run_command(args, say)
         "test" -> test_command(args, say)
         "add" -> add_command(args, say)
@@ -256,6 +257,61 @@ end build_command
 
 private build_usage() -> string =
     "usage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path>"
+
+// `sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] <path>`
+// -- a module compiled to a static archive and a C header, for a C project to link against.
+//
+// **It is what CMake and Gradle call**, which is why the two paths it writes are both reported: a
+// build script names one of them and has to be able to find the other.
+private build_c_command(args: []string, say: string -> unit) -> int
+    var named: Option[string] = None
+    var cc: Option[string] = None
+    var out: Option[string] = None
+    var header: Option[string] = None
+    var level = DefaultOptimization
+    var file = ""
+    var i: usize = 2
+
+    while i < args.len
+        if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o" || args[i] == "--header"
+            if i + 1 >= args.len
+                say(build_c_usage())
+                return Misused
+            end if
+
+            val flag = args[i]
+
+            i += 1
+
+            if flag == "--target" then named = Some(args[i])
+            else if flag == "--cc" then cc = Some(args[i])
+            else if flag == "--header" then header = Some(args[i])
+            else out = Some(args[i])
+        else if args[i].len > 2 && args[i].starts_with("-O")
+            level = args[i][2..<args[i].len]
+        else
+            file = args[i]
+
+        i += 1
+
+    if file == ""
+        say(build_c_usage())
+        return Misused
+    end if
+
+    build_c_archive(file, named, cc, level, out, header, say) match
+        Err(refusal) ->
+            say(s"error: ${refusal.message}")
+            Failed
+        Ok(written) ->
+            say(s"wrote ${written.0}")
+            say(s"wrote ${written.1}")
+            Fine
+end build_c_command
+
+private build_c_usage() -> string =
+    "usage: sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] " +
+    "[--header <path>] <path>"
 
 // `sysl run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>]` -- one program, built and
 // then run, with whatever it exits with passed straight back to the shell.
@@ -552,6 +608,8 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     "emit-typed [--no-spans] [--tables] [--target <name>] <path> | " +
     "emit-llvm [--target <name>] <path> | " +
     "build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path> | " +
+    "build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] " +
+    "<path> | " +
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
     "test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
     "add <coordinate>[@<version>] [<path>]"
