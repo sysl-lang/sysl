@@ -1947,3 +1947,92 @@ private form_starts_at(bytes: []const u8, at: usize, what: string) -> bool
 
     true
 end form_starts_at
+
+// **An atomic access is an ordinary access with a keyword on it**, which is why the ordering has to
+// be written at the call rather than held in a variable: it becomes part of the instruction rather
+// than an operand the instruction reads. The alignment is stated even though LLVM would default an
+// atomic access to the ABI one, because the reference states it.
+@test("an atomic load carries its ordering and its alignment into the instruction")
+an_atomic_load_carries_its_ordering()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "import sysl.sync.Ordering\n" +
+                  "\n" +
+                  "read(p: *int) -> int = atomic_load(p, Ordering.Acquire)\n" +
+                  "\n" +
+                  "main()\n" +
+                  "    var cell: int = 0\n" +
+                  "\n" +
+                  "    print(read(&cell))\n",
+              "read"),
+              "define i32 @read(ptr %p.param) {\n" +
+              "entry:\n" +
+              "  %p.addr = alloca ptr\n" +
+              "  store ptr %p.param, ptr %p.addr\n" +
+              "  %t1 = load ptr, ptr %p.addr\n" +
+              "  %t2 = load atomic i32, ptr %t1 acquire, align 4\n" +
+              "  ret i32 %t2\n" +
+              "}\n")
+
+@test("and a read-modify-write is one instruction naming the operation and the ordering")
+an_atomic_add_is_one_instruction()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "import sysl.sync.Ordering\n" +
+                  "\n" +
+                  "bump(p: *int, n: int) -> int = atomic_add(p, n, Ordering.SeqCst)\n" +
+                  "\n" +
+                  "main()\n" +
+                  "    var cell: int = 0\n" +
+                  "\n" +
+                  "    print(bump(&cell, 1))\n",
+              "bump"),
+              "define i32 @bump(ptr %p.param, i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %p.addr = alloca ptr\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store ptr %p.param, ptr %p.addr\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load ptr, ptr %p.addr\n" +
+              "  %t2 = load i32, ptr %n.addr\n" +
+              "  %t3 = atomicrmw add ptr %t1, i32 %t2 seq_cst\n" +
+              "  ret i32 %t3\n" +
+              "}\n")
+
+// **A call through a `*extern` pointer is a foreign call whose callee is a register**, so the
+// convention is the C one on both sides -- `zeroext` on the argument is the caller's obligation and
+// the call is where the caller is. A driver whose transport is a struct of function pointers is the
+// shape that wants it, and `st7796` is the org's.
+@test("a call through a C function pointer is the C convention with a register for a callee")
+a_call_through_a_function_pointer()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "struct Panel\n" +
+                  "    send: *extern(u8) -> unit\n" +
+                  "\n" +
+                  "cmd(p: *Panel, c: u8) = p.send(c)\n" +
+                  "\n" +
+                  "@export(\"noop\")\n" +
+                  "noop(c: u8) = ()\n" +
+                  "\n" +
+                  "main()\n" +
+                  "    var panel: Panel = Panel(&noop)\n" +
+                  "\n" +
+                  "    cmd(&panel, 1)\n",
+              "cmd"),
+              "define void @cmd(ptr %p.param, i8 %c.param) {\n" +
+              "entry:\n" +
+              "  %p.addr = alloca ptr\n" +
+              "  %c.addr = alloca i8\n" +
+              "  store ptr %p.param, ptr %p.addr\n" +
+              "  store i8 %c.param, ptr %c.addr\n" +
+              "  %t1 = load ptr, ptr %p.addr\n" +
+              "  %t2 = load %struct.Panel, ptr %t1\n" +
+              "  %t3 = extractvalue %struct.Panel %t2, 0\n" +
+              "  %t4 = load i8, ptr %c.addr\n" +
+              "  call void %t3(i8 zeroext %t4)\n" +
+              "  ret void\n" +
+              "}\n")

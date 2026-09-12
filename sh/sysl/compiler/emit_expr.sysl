@@ -143,6 +143,17 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TCall(name, args, ty, _) ->
         if e.tail_target != "" && is_tail_call(e.tail_calls, x.span) then gen_tail_self_call(e, args)
         else gen_call(e, name, args, ty)
+    TAtomic(op, addr, ops, ordering, at, ty) -> gen_atomic(e, op, addr, ops, ordering, at, ty)
+    TFence(ordering) -> gen_fence(e, ordering)
+
+    // **A call through a `*extern` pointer is a foreign call whose callee is a register.** The
+    // convention is the C one on both sides -- the value came from a `&f` or from C itself and may
+    // only hold something C can call -- so nothing about the argument classification differs from a
+    // call to a named `extern`, and the two go through one function. A driver whose transport is a
+    // struct of function pointers is the shape that wants it.
+    TCallPtr(callee, args, _, ty) ->
+        gen_foreign_call(e, foreign_result(e, ty), gen_expr(e, callee), args, ty)
+
     // An address is the C-callable entry rather than the definition, since a `*extern` may only
     // hold something C can call.
     TFuncAddr(_, entry, _) -> VGlobal(entry_of(e, entry))
@@ -1372,3 +1383,86 @@ fill_array(e: *Emit, base: Val, array_ty: Type, v: Val)
     emit_term(e, InBr(cond_l))
     emit_label(e, end_l)
 end fill_array
+
+// -- the atomics ---------------------------------------------------------------------------------
+
+// **An atomic access is an ordinary access with a keyword on it**, which is why the ordering has to
+// be written at the call rather than held in a variable: it becomes part of the instruction rather
+// than an operand the instruction reads. The analyzer has already held it to being one of
+// `sysl.sync.Ordering`'s variants written out, so what arrives here is a word.
+//
+// The alignment is the type's own and is stated: LLVM defaults an atomic access to the ABI alignment
+// anyway, and saying it is what makes the text the same as the reference's.
+private gen_atomic(e: *Emit, op: string, addr: TExpr, ops: Buf[TExpr], ordering: string, at: Type,
+                   ty: Type) -> Val
+    val ord = atomic_ordering_of(ordering)
+    val lt = lty(e, at)
+    val align = int(e.layout.align(at))
+    val p = gen_expr(e, addr)
+
+    if op == "atomic_load"
+        val r = fresh_reg(e)
+
+        emit(e, InLoad(r, lt, p, AccAtomic(ord), Some(align)))
+        return own_temp(e, r, ty)
+    end if
+
+    val v = gen_expr(e, ops.at(0))
+
+    if op == "atomic_store"
+        emit(e, InStore(lt, v, p, AccAtomic(ord), Some(align)))
+        return VNothing
+    end if
+
+    // **A compare-and-swap answers the value it FOUND**, which is what a caller loops on: the
+    // instruction gives back a pair of the old value and whether it was taken, and only the first
+    // half is the form's result. The ordering on a failed exchange is the success one weakened,
+    // since a failure performs no store and LLVM refuses a release on it.
+    if op == "atomic_cas"
+        val d = gen_expr(e, ops.at(1))
+        val pair = fresh_reg(e)
+
+        emit(e, InCmpXchg(pair, p, lt, v, d, ord))
+
+        var fields: Buf[LType] = buf()
+
+        fields.push(lt)
+        fields.push(l_i1())
+
+        val r = fresh_reg(e)
+
+        emit(e, InExtract(r, LStruct(fields), pair, index_list(0)))
+        return own_temp(e, r, ty)
+    end if
+
+    val r = fresh_reg(e)
+
+    emit(e, InAtomicRmw(r, rmw_of(op), p, lt, v, ord))
+    own_temp(e, r, ty)
+end gen_atomic
+
+// A barrier with no address, ordering everything around it rather than one access.
+private gen_fence(e: *Emit, ordering: string) -> Val
+    emit(e, InFence(atomic_ordering_of(ordering)))
+    VNothing
+end gen_fence
+
+// The variant a written ordering names. `SeqCst` is what an unrecognised word falls to, which cannot
+// happen: the analyzer refuses anything that is not one of the five by name, so this is the total
+// function the match needs rather than a decision.
+private atomic_ordering_of(ordering: string) -> IrOrdering =
+    if ordering == "Relaxed" then OrdRelaxed
+    else if ordering == "Acquire" then OrdAcquire
+    else if ordering == "Release" then OrdRelease
+    else if ordering == "AcqRel" then OrdAcqRel
+    else OrdSeqCst
+
+// Which read-modify-write a form names. `atomic_swap` is LLVM's `xchg`, and the four arithmetic ones
+// keep their own words.
+private rmw_of(op: string) -> RmwOp =
+    if op == "atomic_swap" then RmwXchg
+    else if op == "atomic_add" then RmwAdd
+    else if op == "atomic_sub" then RmwSub
+    else if op == "atomic_and" then RmwAnd
+    else if op == "atomic_or" then RmwOr
+    else RmwXor
