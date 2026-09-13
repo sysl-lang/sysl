@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.text.Search
 
@@ -11,6 +12,63 @@ import sysl.text.Search
 // message: a refusal this compiler composes rather than quotes is a refusal that has drifted.
 
 private lowered(text: string, symbol: string) -> string = emit_func_text(text, symbol)
+
+// The same, over a source compiled against the **real** standard module rather than the stub the
+// seam above uses -- which is what a body naming one of the library's own types needs. The reference
+// prunes what nothing reaches, so such a source ends with the statement that makes the function
+// under test reachable there.
+private var emit_library_cache: Buf[Program] = buf()
+private var emit_library_read: bool = false
+
+private emit_library() -> Buf[Program]
+    if emit_library_read then return emit_library_cache
+
+    emit_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> emit_library_cache = units
+
+    emit_library_cache
+end emit_library
+
+private emit_no_library() -> bool
+    if emit_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end emit_no_library
+
+private lowered_beside_library(text: string, symbol: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = emit_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), buf())
+    val fs = func_texts(ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0))
+
+    for i in 0..<fs.len()
+        if fs.at(i).0 == symbol then return fs.at(i).1
+
+    s"no function named '$symbol'"
+end lowered_beside_library
 
 private first_refusal(text: string) -> string
     val said = emit_diagnostics(text)
@@ -236,6 +294,43 @@ a_match_on_an_enum()
               "  ret i32 %t5\n" +
               "}\n")
 end a_match_on_an_enum
+
+@test("'try' tests membership at 64 bits and picks a branch, so a miss is a value rather than a trap")
+an_enum_read_through_try()
+    if emit_no_library() then return
+
+    assert_eq(lowered_beside_library("enum C\n    Red\n    Green\nend C\n\n" +
+                                     "t(n: int) -> Option[C] = C.try(n)\n\n" +
+                                     "print(t(1).is_some())\n", "t"),
+              "define %enum.sysl$Option.C @t(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %t6 = alloca %enum.sysl$Option.C\n" +
+              "  %t8 = alloca %enum.sysl$Option.C\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = sext i32 %t1 to i64\n" +
+              "  %t3 = icmp eq i64 %t2, 0\n" +
+              "  %t4 = icmp eq i64 %t2, 1\n" +
+              "  %t5 = or i1 %t3, %t4\n" +
+              "  br i1 %t5, label %try.some1, label %try.none2\n" +
+              "try.some1:\n" +
+              "  %t7 = insertvalue %sysl$Option.C.Some undef, i32 %t1, 0\n" +
+              "  store i32 0, ptr %t8\n" +
+              "  %t9 = getelementptr %enum.sysl$Option.C, ptr %t8, i32 0, i32 1\n" +
+              "  store %sysl$Option.C.Some %t7, ptr %t9\n" +
+              "  %t10 = load %enum.sysl$Option.C, ptr %t8\n" +
+              "  store %enum.sysl$Option.C %t10, ptr %t6\n" +
+              "  br label %try.end3\n" +
+              "try.none2:\n" +
+              "  %t11 = insertvalue %enum.sysl$Option.C undef, i32 1, 0\n" +
+              "  store %enum.sysl$Option.C %t11, ptr %t6\n" +
+              "  br label %try.end3\n" +
+              "try.end3:\n" +
+              "  %t12 = load %enum.sysl$Option.C, ptr %t6\n" +
+              "  ret %enum.sysl$Option.C %t12\n" +
+              "}\n")
+end an_enum_read_through_try
 
 @test("a self-call in tail position is a jump back to the entry rather than a second frame")
 a_tail_call_is_a_jump()

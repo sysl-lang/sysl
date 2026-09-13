@@ -89,6 +89,18 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
         Abstract(_, bounds) -> return Some(call_bound_associated(cx, span, ty, name, bounds, args))
         _ -> ()
 
+    // **`Colour.try(n)` is the checked cast that answers rather than traps**, which is what a
+    // program reading a number off a wire wants: `Colour(n)` is the same conversion and stops the
+    // program where the value is not a discriminant.
+    //
+    // It is asked **before** the variant and the member, so an enum's `try` is this form whatever
+    // else the enum declares -- which is what makes the spelling mean one thing on every enum.
+    if name == "try"
+        val tried = enum_try(cx, span, ty, args)
+
+        if tried.is_some() then return tried
+    end if
+
     // A **variant** named through its enum is not a member, and `Colour.Red(1)` is how one that
     // carries something is written -- so the enum's own names are left to the form that answers them.
     ty match
@@ -1097,6 +1109,58 @@ private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot:
 
     TExpr(span, TVCall(receiver, slot, ts, ret, false))
 end erased_call
+
+// `Colour.try(n)` — an integer read as a simple enum, answering `None` where it is not one of the
+// discriminants.
+//
+// **It is the same conversion `Colour(n)` is**, and the difference is only what happens to a value
+// the enum does not declare: the written cast traps, and this hands back an `Option`. A program
+// reading a byte off a wire wants the second, which is why the form exists at all.
+//
+// Nothing where the receiver is not an enum at all, so a struct's own `try` is left to the member
+// lookup; an enum that carries data is refused here rather than left, since the spelling is this
+// form on every enum.
+private enum_try(cx: &Analyzer, span: Span, ty: Type, args: Buf[Expr]) -> Option[TExpr]
+    val d = ty match
+        Enum(found) -> found
+        _ -> return None
+
+    if !d.simple
+        cx.fault(span, s"'${module_show(d.base)}' carries data, so only a simple enum converts to " +
+                 "and from an integer")
+        return Some(bad_expr(span))
+    end if
+
+    if args.len() != 1
+        cx.fault(span, s"'${module_show(d.base)}' takes exactly one integer argument")
+        return Some(bad_expr(span))
+    end if
+
+    val t = type_expr(cx, args.at(0), Some(d.underlying))
+
+    repr(texpr_type(t)) match
+        Integer(_, _, _) -> ()
+        _ ->
+            cx.fault(span, s"'${module_show(d.base)}' converts an integer, but the value has type " +
+                     s"${type_show(texpr_type(t))}")
+            return Some(bad_expr(span))
+
+    var targs: Buf[Type] = buf()
+
+    targs.push(ty)
+
+    val opt = reinstantiate(cx.an, library_key("Option"), targs)
+
+    opt match
+        Enum(od) ->
+            val some = od.variant("Some")
+            val none = od.variant("None")
+
+            if some.is_none() || none.is_none() then return Some(bad_expr(span))
+
+            Some(TExpr(span, TEnumTry(t, ty, opt, some.unwrap(), none.unwrap())))
+        _ -> Some(bad_expr(span))
+end enum_try
 
 // Everything about a weak reference is behind `get()`, including whether there still is one.
 private weak_get(cx: &Analyzer, span: Span, receiver: TExpr, inner: Type, name: string,

@@ -39,6 +39,74 @@ end enum_payload
 
 // Builds an enum value from already-lowered payload values: the tag, then the variant's payload
 // aggregate written into the region every variant shares.
+// Whether an integer is one of an enum's discriminants: one comparison per variant, or-ed together,
+// **at 64 bits** so that a value wider than the enum's own representation cannot wrap into a tag it
+// is not.
+enum_membership(e: *Emit, en: Type, vt: Type, v: Val) -> Val
+    val d = enum_decl(en)
+
+    if d.is_none() then return VBool(false)
+
+    val signed = vt match
+        Integer(_, s, _) -> s
+        _ -> true
+
+    val vs = d.unwrap().variants
+    val wide = convert(e, vt, Integer(64, signed, false), v)
+    var any = VBool(false)
+
+    for i in 0..<vs.len()
+        val eq = fresh_reg(e)
+
+        emit(e, InIntCmp(eq, IEq, LInt(64), wide, VInt(from_int(long(vs.at(i).tag)))))
+
+        any = if i == 0 then eq else or_i1(e, any, eq)
+
+    any
+end enum_membership
+
+// `Colour.try(n)` — the fallible conversion. The membership test picks the branch: a match builds
+// `Some(n as Colour)` and a miss builds `None`, so the result is an ordinary `Option[Colour]` whose
+// element carries no count and whose merge slot needs no ownership bookkeeping.
+gen_enum_try(e: *Emit, value: TExpr, en: Type, opt_ty: Type, some: EnumVariant,
+             none: EnumVariant) -> Val
+    val d = enum_decl(opt_ty)
+    val ed = enum_decl(en)
+
+    if d.is_none() || ed.is_none() then return gap_at(e, "a try whose option is not an enum")
+
+    val vt = repr(texpr_type(value))
+    val v = gen_expr(e, value)
+    val ok = enum_membership(e, en, vt, v)
+    val slot = alloca(e, fresh_reg(e), lty(e, opt_ty))
+    val some_l = fresh_label(e, "try.some")
+    val none_l = fresh_label(e, "try.none")
+    val end_l = fresh_label(e, "try.end")
+
+    emit_term(e, InCondBr(ok, some_l, none_l))
+    emit_label(e, some_l)
+
+    var carried: Buf[Val] = buf()
+
+    carried.push(convert(e, vt, ed.unwrap().underlying, v))
+    emit(e, InStore(lty(e, opt_ty), enum_value(e, opt_ty, d.unwrap(), some, carried), slot, AccPlain,
+                    None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, none_l)
+
+    var empty: Buf[Val] = buf()
+
+    emit(e, InStore(lty(e, opt_ty), enum_value(e, opt_ty, d.unwrap(), none, empty), slot, AccPlain,
+                    None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, end_l)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, opt_ty), slot, AccPlain, None))
+    r
+end gen_enum_try
+
 enum_value(e: *Emit, en: Type, d: &EnumType, v: EnumVariant, vals: Buf[Val]) -> Val
     if d.simple then return VInt(from_int(long(v.tag)))
 
