@@ -1136,7 +1136,42 @@ an_address_takes_written_type_arguments()
 
     val out = shown(src, "use")
 
-    assert(out.contains("sized.u16"), out)
+    // A copy is named by what its argument MANGLES to rather than by the width a program wrote, so
+    // `u16` reaches the symbol as `ushort` -- the reference's answer for the same source.
+    assert(out.contains("sized.ushort"), out)
+
+@test("a bound is read where the declaration wrote it, and not where the call is")
+a_bound_reads_in_the_declarations_scope()
+    if no_library() then return
+
+    // `sysl.math.is_power_of_two[T: Bits + Ord]` writes `Bits` bare, and a caller that imported the
+    // module has the module and not that name -- so a bound read in the caller's scope named nothing
+    // and every integer was refused for not implementing the trait the compiler supplies to all of
+    // them. `Ord` hid it, being auto-imported and so resolvable from either place. `fft` is the
+    // repository.
+    val said = complaints("import sysl.math\n\nuse(n: int) -> bool = math.is_power_of_two(n)\n\n" +
+                          "main() = print(use(8))\n")
+
+    assert(said.is_empty(), listed(said))
+
+@test("a module answers for the bodies it wrote, so an instantiation lowered under its type is not one")
+an_instantiation_is_not_its_receivers_conduct()
+    if no_library() then return
+
+    // An `impl` block written here for a library type lowers its members under the RECEIVER's
+    // symbol, so an instantiation of one reads as a body of `sysl.math.complex` -- which declares
+    // `@no_alloc`. A generic has no conduct until somebody else chooses a type, so the instantiation
+    // is passed over and the caller is what the clause is asked of. `linalg` is the repository.
+    val said = complaints("import sysl.buf.{Buf, buf}\nimport sysl.math.complex.Complex\n" +
+                          "import sysl.math.Float\n\n" +
+                          "trait Listy\n    listed(self) -> Buf[int]\n\n" +
+                          "impl[F: Float + Display] Listy for Complex[F]\n" +
+                          "    listed(self) -> Buf[int]\n" +
+                          "        var out: Buf[int] = buf()\n\n" +
+                          "        out.push(1)\n        out\n\n" +
+                          "main() = print(Complex(1.0, 2.0).listed().len())\n")
+
+    assert(said.is_empty(), listed(said))
 
 @test("a module bound to a name is written before a dot, and the call reaches through it")
 a_module_alias_qualifies_a_call()

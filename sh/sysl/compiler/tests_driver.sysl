@@ -326,6 +326,28 @@ two_private_helpers_of_one_name()
     assert(text.index_of("\"m$pick\"").is_some(), "the first file keeps the plain key")
     assert(text.index_of("\"m$pick.private1\"").is_some(), "and the second takes a slot of its own")
 
+@test("and a type in the slot still names itself as its file wrote it, so its members are hoisted")
+a_private_slot_type_carries_its_members()
+    var shape: Buf[(string, string)] = buf()
+
+    shape.push(("package.hocon", "package {\n  name = \"probe\"\n}\n"))
+    shape.push(("m/a.sysl", "module m\n\nprivate struct Log\n    n: int\n\n" +
+                            "    bump(*self) = self.n += 1\nend Log\n\n" +
+                            "from_a() -> int\n    var l = Log(1)\n\n    l.bump()\n    l.n\n"))
+    shape.push(("m/b.sysl", "module m\n\nprivate struct Log\n    s: string\n\n" +
+                            "    grow(*self) = self.s += \"!\"\nend Log\n\n" +
+                            "from_b() -> string\n    var l = Log(\"x\")\n\n    l.grow()\n    l.s\n"))
+
+    // The receiver of a member is written as the type's bare spelling, and the second file's `Log`
+    // is filed at `m$Log.private1` -- a key, and a name no file wrote. Written from the key, every
+    // member of that type was refused with `unknown type 'Log.private1'` and the file's own uses of
+    // them came back `?`. `llhttp` is the repository, whose two test files each keep a `Log`.
+    val said = emit_typed_text(project_of(shape), None, false) match
+        Err(refusal) -> refusal.message
+        Ok(_) -> ""
+
+    assert_eq(said, "")
+
 private text_head(text: string) -> string =
     if text.bytes.len < 400 then text else text[0..<400]
 
