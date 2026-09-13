@@ -27,6 +27,11 @@ run_cli(args: []string, say: string -> unit) -> int
         say(usage())
         return Misused
 
+    // **Where things are on this machine is read afresh for every command line.** One process
+    // answering two of them -- which is what a test does -- must not have the first's paths in the
+    // second, and nothing else in the compiler writes this.
+    reset_search_paths()
+
     args[1] match
         "--version" ->
             say(s"sysl ${Version}")
@@ -161,7 +166,16 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
     var i: usize = 2
 
     while i < args.len
-        if args[i] == "--target"
+        val took = took_search_flag(args, i)
+
+        if took == 0
+            say(emit_llvm_usage())
+            return Misused
+        end if
+
+        if took > 0
+            if took == 2 then i += 1
+        else if args[i] == "--target"
             if i + 1 >= args.len
                 say(emit_llvm_usage())
                 return Misused
@@ -203,7 +217,7 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
             Fine
 end emit_llvm_command
 
-private emit_llvm_usage() -> string = "usage: sysl emit-llvm [--gaps] [--target <name>] <path>"
+private emit_llvm_usage() -> string = "usage: sysl emit-llvm [--gaps] [--target <name>] " + where_flags() + " <path>"
 
 // `sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path>` -- one program, made
 // into something the machine will run.
@@ -221,7 +235,16 @@ private build_command(args: []string, say: string -> unit) -> int
     var i: usize = 2
 
     while i < args.len
-        if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o"
+        val took = took_search_flag(args, i)
+
+        if took == 0
+            say(build_usage())
+            return Misused
+        end if
+
+        if took > 0
+            if took == 2 then i += 1
+        else if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o"
             if i + 1 >= args.len
                 say(build_usage())
                 return Misused
@@ -256,7 +279,8 @@ private build_command(args: []string, say: string -> unit) -> int
 end build_command
 
 private build_usage() -> string =
-    "usage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path>"
+    "usage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] " + where_flags() +
+    " <path>"
 
 // `sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] <path>`
 // -- a module compiled to a static archive and a C header, for a C project to link against.
@@ -273,7 +297,16 @@ private build_c_command(args: []string, say: string -> unit) -> int
     var i: usize = 2
 
     while i < args.len
-        if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o" || args[i] == "--header"
+        val took = took_search_flag(args, i)
+
+        if took == 0
+            say(build_c_usage())
+            return Misused
+        end if
+
+        if took > 0
+            if took == 2 then i += 1
+        else if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o" || args[i] == "--header"
             if i + 1 >= args.len
                 say(build_c_usage())
                 return Misused
@@ -311,7 +344,7 @@ end build_c_command
 
 private build_c_usage() -> string =
     "usage: sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] " +
-    "[--header <path>] <path>"
+    "[--header <path>] " + where_flags() + " <path>"
 
 // `sysl run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>]` -- one program, built and
 // then run, with whatever it exits with passed straight back to the shell.
@@ -333,21 +366,31 @@ private run_command(args: []string, say: string -> unit) -> int
             program_args.push(args[i])
         else if args[i] == "--"
             forwarding = true
-        else if args[i] == "--target" || args[i] == "--cc"
-            if i + 1 >= args.len
+        else
+            val took = took_search_flag(args, i)
+
+            if took == 0
                 say(run_usage())
                 return Misused
             end if
 
-            val flag = args[i]
+            if took > 0
+                if took == 2 then i += 1
+            else if args[i] == "--target" || args[i] == "--cc"
+                if i + 1 >= args.len
+                    say(run_usage())
+                    return Misused
+                end if
 
-            i += 1
+                val flag = args[i]
 
-            if flag == "--target" then named = Some(args[i]) else cc = Some(args[i])
-        else if args[i].len > 2 && args[i].starts_with("-O")
-            level = args[i][2..<args[i].len]
-        else
-            file = args[i]
+                i += 1
+
+                if flag == "--target" then named = Some(args[i]) else cc = Some(args[i])
+            else if args[i].len > 2 && args[i].starts_with("-O")
+                level = args[i][2..<args[i].len]
+            else
+                file = args[i]
 
         i += 1
 
@@ -364,7 +407,13 @@ private run_command(args: []string, say: string -> unit) -> int
 end run_command
 
 private run_usage() -> string =
-    "usage: sysl run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>]"
+    "usage: sysl run [--target <name>] [--cc <path>] [-O<level>] " + where_flags() +
+    " <path> [-- <args>]"
+
+// The three flags every command that reaches a C compiler takes, written once so that six usage
+// lines cannot come to disagree about them.
+private where_flags() -> string =
+    "[--include-path <dir>|<name>=<dir>] [--link-path <dir>] [-D <macro>]"
 
 // `sysl test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path>` --
 // the `@test` functions of a tree, built into one binary and run one process each.
@@ -385,7 +434,16 @@ private test_command(args: []string, say: string -> unit) -> int
     var i: usize = 2
 
     while i < args.len
-        if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter"
+        val took = took_search_flag(args, i)
+
+        if took == 0
+            say(test_usage())
+            return Misused
+        end if
+
+        if took > 0
+            if took == 2 then i += 1
+        else if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter"
             if i + 1 >= args.len
                 say(test_usage())
                 return Misused
@@ -498,15 +556,18 @@ private tests_run(file: string, exe: string, all: Buf[TTest], filter: Option[str
 end tests_run
 
 private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fast] [--std] " +
-    "[--target <name>] [--cc <path>] [-O<level>] <path>"
+    "[--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " <path>"
 
 // `sysl build-lib [--std] [--target <name>] [-o <path>] <path>` -- a library compiled into an
 // artifact for one machine.
 //
 // **`--std` says the tree is sysl's own standard module**, which is the one thing an ordinary
-// compilation may not declare, and it is the only library this compiler builds an artifact of: the
-// split between what an artifact's object half defines and what a consumer compiles for itself
-// serves one library here, and a named artifact has nowhere to be read from yet.
+// compilation may not declare and is therefore written down rather than inferred: nothing is
+// prepended, no artifact is linked, and the artifact lands where a compilation looks for one.
+//
+// **Without it the tree is an ordinary library**, compiled against the standard module and written
+// beside itself. What the command is mostly run for is the analysis rather than the file: it type-
+// checks a package for a machine this one is not, which is the only check a board package gets.
 private build_lib_command(args: []string, say: string -> unit) -> int
     var named: Option[string] = None
     var out: Option[string] = None
@@ -515,7 +576,16 @@ private build_lib_command(args: []string, say: string -> unit) -> int
     var i: usize = 2
 
     while i < args.len
-        if args[i] == "--target" || args[i] == "-o"
+        val took = took_search_flag(args, i)
+
+        if took == 0
+            say(build_lib_usage())
+            return Misused
+        end if
+
+        if took > 0
+            if took == 2 then i += 1
+        else if args[i] == "--target" || args[i] == "-o"
             if i + 1 >= args.len
                 say(build_lib_usage())
                 return Misused
@@ -539,9 +609,13 @@ private build_lib_command(args: []string, say: string -> unit) -> int
     end if
 
     if !std
-        say("error: this compiler builds an artifact of the standard module and of no other library " +
-            "yet — pass --std where the tree is sysl's own")
-        return Failed
+        return build_library_of(file, named, out) match
+            Err(refusal) ->
+                say(s"error: ${refusal.message}")
+                Failed
+            Ok(where) ->
+                say(s"wrote $where")
+                Fine
     end if
 
     build_std_artifact_of(file, named, out) match
@@ -554,7 +628,7 @@ private build_lib_command(args: []string, say: string -> unit) -> int
 end build_lib_command
 
 private build_lib_usage() -> string =
-    "usage: sysl build-lib [--std] [--target <name>] [-o <path>] <path>"
+    "usage: sysl build-lib [--std] [--target <name>] [-o <path>] " + where_flags() + " <path>"
 
 // One piece of a report, written and **flushed**, so that a run followed through a log file shows each
 // verdict as it lands rather than only once the process exits. The pieces carry their own newlines,

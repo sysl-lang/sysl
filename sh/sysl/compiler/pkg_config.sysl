@@ -139,21 +139,29 @@ end LibNeed
 // places: a machine with no `pkg-config` is one `brew install pkgconf` away and has nothing to do
 // with the library, where a `pkg-config` that does not know the module means the library itself is
 // not installed.
+// **A supplied name is an answer, and stops the probe.** `--include-path <name>=<dir>` satisfies
+// this exactly as it satisfies a header requirement and takes precedence over anything a probe would
+// have found, which is what keeps a hermetic build, a hand-built prefix and a machine with a broken
+// `.pc` from being hostage to whatever happens to be installed.
 probe_libs(needs: Buf[LibNeed], t: Target) -> Result[PkgAnswer, string]
     var out = PkgAnswer(buf(), buf())
+    var wanted: Buf[LibNeed] = buf()
 
-    if needs.is_empty() then return Ok(out)
+    for i in 0..<needs.len()
+        if !supplied_include(needs.at(i).pc) then wanted.push(needs.at(i))
+
+    if wanted.is_empty() then return Ok(out)
 
     if t.name != host_target().name
-        val first = needs.at(0)
+        val first = wanted.at(0)
 
         return Err(s"${first.who} needs the '${first.pc}' library and this is a build for " +
             s"'${t.name}' rather than for this machine, so there is nothing to ask where it is — " +
             s"${first.why}")
     end if
 
-    for i in 0..<needs.len()
-        val need = needs.at(i)
+    for i in 0..<wanted.len()
+        val need = wanted.at(i)
 
         val answer = pkg_config_query(need.pc) match
             Ok(found) -> found

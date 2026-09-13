@@ -1,0 +1,324 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, make_dir_all, remove_dir_all}
+
+// **Where things are on this machine, and what a machine needs said beyond its triple.** Both are
+// read off a command line and both reach clang, so what is asserted here is the reading and the
+// command line -- neither of which needs a board, an SDK or a cross toolchain to check.
+
+// -- reading the flags -------------------------------------------------------------------------
+
+// The two forms share a flag, so the split has to be decidable by looking. A directory read as a
+// name would have to hold an `=`, be a single segment with no separator before it, and have a
+// non-empty remainder.
+@test("an include path is a name and a directory only where the name is one")
+an_include_path_splits_only_at_a_name()
+    assert_eq(named_include("pico_sdk=/opt/pico-sdk").unwrap().0, "pico_sdk")
+    assert_eq(named_include("pico_sdk=/opt/pico-sdk").unwrap().1, "/opt/pico-sdk")
+
+    // The wider of the two requirement kinds, because one flag serves both: a `.pc` name may hold a
+    // dot or a `+` where a `headers` name may not.
+    assert_eq(named_include("yaml-0.1=/usr/include").unwrap().0, "yaml-0.1")
+    assert_eq(named_include("gtk+-3.0=/usr/include").unwrap().0, "gtk+-3.0")
+
+    // Everything a directory can be.
+    assert(named_include("/opt/homebrew/include").is_none(), "an absolute path is a directory")
+    assert(named_include(".").is_none(), "a dot is a directory")
+    assert(named_include("../build").is_none(), "a relative path is a directory")
+    assert(named_include("/opt/a=b/include").is_none(), "a separator before the '=' is a directory")
+    assert(named_include("name=").is_none(), "an empty remainder names nothing")
+end an_include_path_splits_only_at_a_name
+
+// The flags are read once for every command that can reach a C compiler rather than in each
+// command's own loop, so the answer is how many arguments were taken.
+@test("the three where-it-is flags are read the same way by every command")
+the_where_flags_are_read_once()
+    reset_search_paths()
+
+    var args: Buf[string] = buf()
+
+    args.push("--include-path")
+    args.push("/opt/one")
+    args.push("--include-path")
+    args.push("pico_sdk=/opt/sdk")
+    args.push("--link-path")
+    args.push("/opt/lib")
+    args.push("-D")
+    args.push("CYW43_LWIP=1")
+    args.push("-DPICO_ON_DEVICE")
+    args.push("program")
+
+    var i: usize = 0
+    var took_any = 0
+
+    while i < args.len()
+        val took = took_search_flag(args.view(), i)
+
+        if took < 0
+            i += 1
+        else
+            took_any += 1
+            i += usize(took)
+
+    assert_eq(took_any, 5)
+    assert_eq(joined(include_flags(), " "), "-I/opt/one -I/opt/sdk")
+    assert_eq(joined(define_flags(), " "), "-DCYW43_LWIP=1 -DPICO_ON_DEVICE")
+    assert_eq(joined(link_search_flags(), " "), "-L/opt/lib")
+    assert(supplied_include("pico_sdk"), "a named include answers a requirement of that name")
+    assert(!supplied_include("/opt/one"), "a bare directory answers no requirement")
+
+    reset_search_paths()
+end the_where_flags_are_read_once
+
+// A flag whose operand is missing is the caller's usage error, and is told apart from an argument
+// that is none of these.
+@test("a where-it-is flag with no operand is a usage error rather than a path")
+a_where_flag_with_no_operand_is_misuse()
+    reset_search_paths()
+
+    var args: Buf[string] = buf()
+
+    args.push("--include-path")
+
+    assert_eq(took_search_flag(args.view(), 0), 0)
+
+    var plain: Buf[string] = buf()
+
+    plain.push("program")
+
+    assert_eq(took_search_flag(plain.view(), 0), -1)
+
+    reset_search_paths()
+end a_where_flag_with_no_operand_is_misuse
+
+// **Every command line is read afresh.** One process answering two of them -- which is what the
+// suite itself does -- must not carry the first's paths into the second.
+@test("nothing is remembered from the last command line")
+nothing_is_remembered_between_command_lines()
+    reset_search_paths()
+    add_include_path("first=/one")
+    assert(supplied_include("first"), "it was read")
+    reset_search_paths()
+    assert(!supplied_include("first"), "and it is gone")
+    assert(include_flags().is_empty(), "with nothing left behind")
+end nothing_is_remembered_between_command_lines
+
+// A run-time search path is for a loader, and a bare machine has none -- so a `-rpath` there would
+// be a search path for a thing that does not exist.
+@test("a link path becomes a run-time search path on a hosted machine and nothing on a bare one")
+a_link_path_is_an_rpath_only_where_there_is_a_loader()
+    reset_search_paths()
+    add_link_path("/opt/homebrew/lib")
+
+    assert_eq(joined(rpath_flags(target_named("aarch64-macos").unwrap()), " "),
+              "-Wl,-rpath,/opt/homebrew/lib")
+    assert(rpath_flags(target_named("thumbv6m-freestanding").unwrap()).is_empty(),
+           "a bare machine has no loader to give a search path to")
+
+    reset_search_paths()
+end a_link_path_is_an_rpath_only_where_there_is_a_loader
+
+// -- what a machine needs said beyond its triple -------------------------------------------------
+
+// A triple names an architecture and a calling convention, and on Arm those two leave the presence
+// of a floating-point unit unstated. **Both answers are given**, because leaving one to the default
+// left it to whichever clang was installed -- which is how one machine compiled a multiply to
+// `vmul.f32` and another to a call.
+@test("a Thumb target states both the float convention and the unit, and never one of them")
+a_thumb_target_states_the_pair()
+    assert_eq(joined(machine_flags(target_named("thumb-freestanding").unwrap()), " "),
+              "-mfloat-abi=hard -mfpu=fpv5-sp-d16")
+    assert_eq(joined(machine_flags(target_named("thumb-freestanding-softfp").unwrap()), " "),
+              "-mfloat-abi=softfp -mfpu=fpv5-sp-d16")
+    assert_eq(joined(machine_flags(target_named("thumb-freestanding-soft").unwrap()), " "),
+              "-mfloat-abi=soft -mfpu=none")
+    assert_eq(joined(machine_flags(target_named("thumbv6m-freestanding").unwrap()), " "),
+              "-mfloat-abi=soft -mfpu=none")
+    assert_eq(joined(machine_flags(target_named("thumbv7em-freestanding").unwrap()), " "),
+              "-mfloat-abi=hard -mfpu=fpv4-sp-d16")
+end a_thumb_target_states_the_pair
+
+// **No row claims both**, which is what makes the pair above readable as one decision rather than
+// two that have to be kept in step.
+@test("a target names a unit or names that there is none")
+a_target_never_claims_a_unit_and_no_unit()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        assert(!(t.no_fpu && t.fpu != ""), s"'${t.name}' claims both a unit and no unit")
+
+        if t.cpu != Thumb
+            assert(machine_flags(t).is_empty(),
+                   s"'${t.name}' is not Arm, whose triple is the silent one")
+end a_target_never_claims_a_unit_and_no_unit
+
+// It is Arm's flag because Arm is where the triple is silent. RISC-V says it in the triple, so
+// `riscv32-unknown-elf` is RV32IMAC and has no F extension to turn off.
+@test("a RISC-V target says its float answer in the triple and needs no flag")
+a_riscv_target_needs_no_float_flag()
+    assert(target_named("riscv32-freestanding").unwrap().no_fpu, "RV32IMAC has no F extension")
+    assert(machine_flags(target_named("riscv32-freestanding").unwrap()).is_empty(),
+           "and nothing is passed for it")
+end a_riscv_target_needs_no_float_flag
+
+// `wasm-ld` is not a variation on `ld`, and the driver's defaults for it are a hosted program's.
+// **`--entry=main` is the load-bearing half**: paired with `--gc-sections`, the obvious `--no-entry`
+// leaves nothing reachable from anywhere, so the linker drops the whole program and succeeds.
+@test("a bare wasm link is told there is no libc and where to start, and a WASI one is not")
+a_bare_wasm_link_is_told_what_it_has_not_got()
+    assert_eq(joined(linker_flags(target_named("wasm32-freestanding").unwrap()), " "),
+              "-nostdlib -Wl,--entry=main")
+
+    // The same processor with a libc under it: wasi-libc supplies the `_start` a runtime calls, so
+    // both halves would break it. The condition is the operating system and not the processor.
+    assert(linker_flags(target_named("wasm32-wasi").unwrap()).is_empty(),
+           "WASI has a libc, and naming 'main' would replace the '_start' a runtime looks for")
+    assert(linker_flags(target_named("aarch64-macos").unwrap()).is_empty(), "and nothing else asks")
+end a_bare_wasm_link_is_told_what_it_has_not_got
+
+// The embedded ABI's enums are as narrow as their values need, which is not the rule a hosted target
+// follows -- and a package's C is compiled *as* the target, so a header shared with a project built
+// the other way would disagree about the size of every enum in it.
+@test("an Arm embedded target compiles C with narrow enums")
+an_embedded_target_compiles_with_narrow_enums()
+    assert(target_named("thumbv6m-freestanding").unwrap().short_enums, "Armv6-M is the embedded ABI")
+    assert(!target_named("aarch64-macos").unwrap().short_enums, "and a hosted machine is not")
+    assert(!target_named("riscv32-freestanding").unwrap().short_enums, "nor is bare RISC-V")
+end an_embedded_target_compiles_with_narrow_enums
+
+// -- the command lines the two reach ------------------------------------------------------------
+
+// A search path is where a scan looks rather than an input being scanned, and `-L` is order-
+// sensitive on GNU ld -- which does not apply one to a `-l` that appeared before it. So a directory
+// a command line named goes **before** everything it could affect, and the run-time path goes after.
+@test("a link line carries the machine's flags, then the search paths, then the objects")
+a_link_line_puts_a_search_path_before_what_it_affects()
+    reset_search_paths()
+    add_link_path("/opt/homebrew/lib")
+
+    var links: Buf[string] = buf()
+
+    links.push("SDL3")
+
+    val line = link_command("clang", "p.ll", buf(), "p", target_named("aarch64-macos").unwrap(),
+                            "1", links, no_probe())
+
+    assert_eq(joined(line, " "),
+              "clang --target=arm64-apple-macosx -Wno-override-module -O1 -Wl,-dead_strip " +
+              "-L/opt/homebrew/lib p.ll -lSDL3 -Wl,-rpath,/opt/homebrew/lib -o p")
+
+    reset_search_paths()
+end a_link_line_puts_a_search_path_before_what_it_affects
+
+// A bare link is told what it has not got before anything else on the line, since the flags are
+// about the driver rather than about any one input.
+@test("a bare wasm link line carries what the driver would otherwise assume")
+a_bare_wasm_link_line_says_so()
+    reset_search_paths()
+
+    val line = link_command("clang", "p.ll", buf(), "p",
+                            target_named("wasm32-freestanding").unwrap(), "1", buf(), no_probe())
+
+    assert(joined(line, " ").contains("-nostdlib -Wl,--entry=main"),
+           s"the wasm link line is missing its driver flags: ${joined(line, " ")}")
+end a_bare_wasm_link_line_says_so
+
+// -- the two machines whose clang is a download rather than a back end ---------------------------
+
+// **A clang picked for having the back end carries no sysroot**, so both of these refuse rather than
+// hand one back. Each resolution takes its directories as arguments rather than reading the
+// environment, which is what lets the whole rule be asserted on a machine that has neither SDK.
+
+@test("building for WASI with nothing set names the variable to set")
+wasi_with_nothing_set_names_the_variable()
+    val said = wasi_clang_in(None).unwrap_err()
+
+    assert(said.contains("WASI_SDK_PATH"), s"the refusal does not name the variable: $said")
+    assert(said.contains("wasm32 back end"), s"the refusal does not say why a plain clang is no use: $said")
+end wasi_with_nothing_set_names_the_variable
+
+// The PATH rather than the variable, so a WASI_SDK_PATH pointing one directory too high or too low is
+// visible in the message rather than described.
+@test("a WASI_SDK_PATH holding no clang is quoted back")
+a_wasi_sdk_path_holding_no_clang_is_quoted()
+    val dir = make_temp_dir("sysl-wasi-sdk").unwrap()
+    val said = wasi_clang_in(Some(dir)).unwrap_err()
+
+    assert(said.contains(dir), s"the refusal does not quote what was set: $said")
+    assert(said.contains("bin/clang"), s"the refusal does not say what is missing: $said")
+
+    remove_dir_all(dir).unwrap()
+end a_wasi_sdk_path_holding_no_clang_is_quoted
+
+@test("building for Android with nothing set names the variable that is not deprecated")
+android_with_nothing_set_names_the_current_variable()
+    val said = android_clang_in(None, None).unwrap_err()
+
+    assert(said.contains("ANDROID_HOME"), s"the refusal does not name the SDK variable: $said")
+    assert(said.contains("ANDROID_NDK_ROOT"), s"the refusal does not offer the NDK directly: $said")
+
+    // `ANDROID_SDK_ROOT` is read and is deliberately not what the advice names: telling somebody to
+    // export a deprecated variable is advice that ages into a second problem.
+    assert(!said.contains("ANDROID_SDK_ROOT"), s"the refusal recommends the deprecated name: $said")
+end android_with_nothing_set_names_the_current_variable
+
+@test("an Android SDK with no NDK installed says the NDK is a separate download")
+an_android_sdk_with_no_ndk_says_so()
+    val sdk = make_temp_dir("sysl-android-sdk").unwrap()
+    val said = android_clang_in(None, Some(sdk)).unwrap_err()
+
+    assert(said.contains(sdk), s"the refusal does not quote the SDK: $said")
+    assert(said.contains("separate"), s"the refusal does not say the NDK is a separate download: $said")
+
+    remove_dir_all(sdk).unwrap()
+end an_android_sdk_with_no_ndk_says_so
+
+@test("a directory that is not an NDK says which part of one it lacks")
+a_directory_that_is_not_an_ndk_says_so()
+    val ndk = make_temp_dir("sysl-android-ndk").unwrap()
+    val said = android_clang_in(Some(ndk), None).unwrap_err()
+
+    assert(said.contains("toolchains/llvm/prebuilt"),
+           s"the refusal does not name what an NDK has: $said")
+
+    remove_dir_all(ndk).unwrap()
+end a_directory_that_is_not_an_ndk_says_so
+
+// **The version is compared as NUMBERS**, and this is the case that says so: `9.x` sorts above `30.x`
+// as text, so a plain sort of the names would pick the older NDK on a machine with both. Neither
+// holds a toolchain, so the refusal quotes the one that was chosen -- which is what makes the choice
+// observable without an NDK on the machine.
+@test("the newest NDK is taken, and newest is by number rather than by text")
+the_newest_ndk_is_taken_by_number()
+    val sdk = make_temp_dir("sysl-android-sdk").unwrap()
+
+    make_dir_all(s"$sdk/ndk/9.0.8790385").unwrap()
+    make_dir_all(s"$sdk/ndk/30.0.15729638").unwrap()
+
+    val said = android_clang_in(None, Some(sdk)).unwrap_err()
+
+    assert(said.contains("30.0.15729638"), s"the newer NDK was not the one taken: $said")
+    assert(!said.contains("9.0.8790385"), s"the older NDK was the one taken: $said")
+
+    remove_dir_all(sdk).unwrap()
+end the_newest_ndk_is_taken_by_number
+
+// An empty `ndk/` is an install that was started and did not finish, which is a different sentence
+// from having no `ndk/` at all.
+@test("an empty ndk directory is an unfinished install rather than a missing one")
+an_empty_ndk_directory_says_so()
+    val sdk = make_temp_dir("sysl-android-sdk").unwrap()
+
+    make_dir_all(s"$sdk/ndk").unwrap()
+
+    val said = android_clang_in(None, Some(sdk)).unwrap_err()
+
+    assert(said.contains("did not finish"), s"an empty 'ndk' is not reported as one: $said")
+
+    remove_dir_all(sdk).unwrap()
+end an_empty_ndk_directory_says_so

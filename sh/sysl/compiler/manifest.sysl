@@ -47,6 +47,21 @@ struct Manifest
     // and its archive to link -- and a consumer who answered one of them has not got a build.
     pkg_config: Buf[(string, string)]
 
+    // The `requires.headers` sub-block: the C headers this package's own C includes and does not
+    // carry, each under a name a consumer answers with `--include-path <name>=<dir>`, the prose the
+    // refusal quotes back at them, and the environment variable the ecosystem conventionally keeps
+    // the path in -- `""` where the package named none.
+    //
+    // **A name, never a path.** The file is committed and describes the *package*, and where a
+    // prefix lives on somebody's laptop is not a property of the package. A variable's *name* is not
+    // a path: `PICO_SDK_PATH` is the same string on every machine, and it is what the pico-sdk's own
+    // CMake reads.
+    //
+    // **The value is the reason, and it is what makes the refusal worth having.** A name alone would
+    // tell a consumer that something called `lwip` is unsatisfied and leave them to guess what that
+    // is and where it lives. It is prose for a person and nothing reads it as data.
+    headers: Buf[(string, string, string)]
+
     // The `defines` block: the macros this package's **own carried C** is compiled with, each path
     // written relative to the package root and paired with the macros as clang spells them.
     //
@@ -62,7 +77,7 @@ end Manifest
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
-    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
+    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -260,6 +275,7 @@ read_manifest(text: string) -> Result[Manifest, string]
         Some(block) -> conf_flags_set(block)
 
     val pkg_config = read_pkg_config(root)?
+    val headers = read_headers(root)?
     val defines = read_defines(root)?
 
     val capabilities = conf_at(root, "capabilities") match
@@ -297,7 +313,7 @@ read_manifest(text: string) -> Result[Manifest, string]
                 "so it was ignored")
 
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
-                target_capabilities, pkg_config, defines, warnings))
+                target_capabilities, pkg_config, headers, defines, warnings))
 end read_manifest
 
 // The `defines` block: what each C file this package carries is compiled with.
@@ -473,6 +489,106 @@ defines_for(m: &Manifest, src: string) -> Buf[string]
 
     buf()
 end defines_for
+
+// The `requires.headers` sub-block, in the order a refusal will name them -- sorted by the name a
+// consumer types, so which requirement a build stops on first does not depend on the order a HOCON
+// block happened to be written in.
+//
+// **A name is checked more narrowly than a `.pc` module's**, and the narrowing is the point: this
+// one is invented by whoever writes the manifest, so it can be held to letters, digits, `_` and `-`,
+// which is what keeps it tellable from the directory the same flag also takes.
+//
+// The entry is either the prose alone or a block carrying it beside the variable the path
+// conventionally lives in. **`note` is required and `env` is optional**, which is the way round that
+// keeps the refusal worth reading: a consumer with neither the variable set nor a flag to hand is
+// shown the prose, and a block supplying only a variable name would leave them nothing to look for.
+private read_headers(root: &Conf) -> Result[Buf[(string, string, string)], string]
+    var out: Buf[(string, string, string)] = buf()
+
+    val requires = conf_at(root, "requires") match
+        None -> return Ok(out)
+        Some(block) -> block
+
+    val declared = conf_at(requires, "headers") match
+        None -> return Ok(out)
+        Some(block) -> block
+
+    val names = sort_names(conf_keys(declared))
+
+    for i in 0..<names.len()
+        val name = names.at(i)
+
+        if !header_name(name)
+            return Err(s"'requires.headers.$name' is not usable as a name for a header requirement " +
+                "— it is written on a command line as '--include-path <name>=<dir>', so it may " +
+                "hold neither a separator nor an '=': letters, digits, '_' and '-', starting with " +
+                "a letter")
+
+        val entry = conf_at(declared, name).unwrap()
+        val keys = conf_keys(entry)
+        var why = ""
+        var env = ""
+
+        if keys.is_empty()
+            // The short form: the prose written straight against the name, which is what every
+            // manifest in the org writes today.
+            why = conf_text(declared, name)
+        else
+            for j in 0..<keys.len()
+                if keys.at(j) != "note" && keys.at(j) != "env"
+                    return Err(s"'requires.headers.$name' has no '${keys.at(j)}' — a headers block " +
+                        "takes 'note' and 'env'")
+
+            why = conf_text(entry, "note")
+            env = conf_text(entry, "env")
+
+        if why.trim() == ""
+            return Err(s"'requires.headers.$name' says nothing about what it needs — the text is " +
+                "quoted back at whoever has to supply the path, so an empty one helps nobody")
+
+        if env != "" && !env_name(env)
+            return Err(s"'requires.headers.$name's 'env' is '$env', which is not the name of an " +
+                "environment variable — letters, digits and '_', not starting with a digit")
+
+        out.push((name, why, env))
+
+    Ok(out)
+end read_headers
+
+// Whether a string is usable as the name of a header requirement: letters, digits, `_` and `-`,
+// starting with a letter. Narrower than a `.pc` module's name by a dot and a `+`, because this one
+// is the package author's to choose and that one is what the world already files the library under.
+header_name(name: string) -> bool
+    if name == "" then return false
+    if !is_name_letter(name.bytes[0]) then return false
+
+    for i in 1..<name.bytes.len
+        val b = name.bytes[i]
+
+        if !is_name_letter(b) && !is_name_digit(b) && b != u8('_') && b != u8('-') then return false
+
+    true
+end header_name
+
+// Whether a string is the name of an environment variable rather than a path or a value. Checked for
+// the same reason a header's name is: what the manifest carries has to be tellable from what it must
+// never carry, so the refusal can say which mistake was made.
+env_name(text: string) -> bool
+    if text == "" then return false
+    if is_name_digit(text.bytes[0]) then return false
+
+    for i in 0..<text.bytes.len
+        val b = text.bytes[i]
+
+        if !is_name_letter(b) && !is_name_digit(b) && b != u8('_') then return false
+
+    true
+end env_name
+
+private is_name_letter(b: u8) -> bool =
+    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z'))
+
+private is_name_digit(b: u8) -> bool = b >= u8('0') && b <= u8('9')
 
 // The `requires.pkg_config` sub-block, in the order `pkg-config` will be asked.
 //

@@ -20,11 +20,27 @@
 #   ok (test)            `sysl test .` -- a package
 #   ok (build)           `sysl build .` -- a program
 #   ok (build-c <dir>)   an archive somebody else's build links
+#   ok (build-lib <t>)   a board package type-checked and compiled for its target
+#   ok (build-c <d> <t>) a board program's archive, built for its target
+#   ok (type-check <t>)  the whole analysis passed and the C stopped at a header the SDK
+#                        GENERATES during a CMake configure, exactly where the reference stops
 #   FAILED               this compiler could not do it and the reference could
 #   refused by both      neither could, which is a fact about the repository
-#   needs cross target   built for a board against an SDK's headers; not sweepable here
-#   needs setup          needs a kernel tree or a west workspace this machine has not got
+#   needs SDK            a board repository and `PICO_SDK_PATH` is not set
+#   needs kernel tree    `FREERTOS_KERNEL` is not set, or a west workspace this machine has not got
 #   needs a server       the suite runs and its failures are all "no server at ..."
+#
+# **A board repository is RUN FOR ITS BOARD rather than skipped**, which is what a cross target is
+# for. Being named `rp2040*` is not the same as needing one: `rp2040`, `rp2350` and `rp2040blocks`
+# are constants and nothing else, so they are ordinary host `test` rows and calling all nine "cross"
+# hid three repositories that had always been sweepable.
+#
+# **`ok (type-check <t>)` is a pass and saying so is the point.** `pico/cyw43_arch.h` is written by
+# the SDK during a CMake configure, so no `-I` at a checkout's root can reach it -- and `build-lib`
+# and `build-c` both run the whole analysis before compiling a line of C, so a run that reaches
+# clang's complaint is a sysl type-check that passed. The reference stops in the same place on the
+# same command, and that agreement is what makes it a row rather than a defect: a stop anywhere else
+# is still `FAILED`.
 #
 # The counts at the end are reconciled against the number of rows printed: a total that does not
 # equal the rows is a script that counted something twice, which is how a census comes to claim more
@@ -82,9 +98,11 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/sysl-org-build.XXXXXX")
 ok_test=0
 ok_build=0
 ok_build_c=0
+ok_board=0
+ok_typecheck=0
 failed=0
 both_refused=0
-cross=0
+no_sdk=0
 setup=0
 serverless=0
 rows=0
@@ -96,25 +114,47 @@ for dir in "$org"/*/; do
     # test: a worktree is a second checkout of a repository this sweep has already read.
     [ -d "$dir/.git" ] || continue
 
+    # **`SYSL_CENSUS_ONLY` names the repositories to ask about**, space separated, so a row can be
+    # re-asked on its own. A census of eighty repositories is not the loop to iterate a single
+    # board's flags in, and the alternative -- running those commands by hand beside the script --
+    # proves the hand-written command rather than the one the census will run.
+    if [ -n "$SYSL_CENSUS_ONLY" ]; then
+        wanted=0
+
+        # Not `[ … ] && wanted=1`: under `set -e` a failing test is the list's status and the
+        # script exits on the first repository that is not the one asked for.
+        for only in $SYSL_CENSUS_ONLY; do
+            if [ "$only" = "$name" ]; then
+                wanted=1
+            fi
+        done
+
+        [ $wanted -eq 1 ] || continue
+    fi
+
     case $name in
         # The compiler's own trees, the site, and two directories that are not components.
         sysl|sysl.sh|sysl-bootstrap|harness|pico-scratch) continue ;;
     esac
 
-    # Said before anything is run, because the answer is a fact about the repository rather than
-    # something a command could discover: a board's project is compiled for `thumb*-freestanding`
-    # against an SDK's headers, which its own CMake supplies.
+    # **What a board repository is built for is a fact about the repository**, so it is said here
+    # rather than discovered: the target and the program directory are read off its own
+    # `CMakeLists.txt`, which is the build this row is standing in for. `board` is what tells the
+    # classification below that a stop at a generated SDK header is this row's pass.
+    board=""
+    board_target=""
+
     case $name in
-        pico|pico2|rp2040|rp2040blocks|rp2350|picokit|*-pico|*-pico2)
-            rows=$((rows + 1))
-            cross=$((cross + 1))
-            echo "needs cross target  $name"
-            continue
-            ;;
-        freertos|zephyr|zephyr-demo)
+        pico)         board=1; board_target=thumbv6m-freestanding ;;
+        pico2)        board=1; board_target=thumb-freestanding-softfp ;;
+        picokit)      board=1; board_target=thumbv6m-freestanding ;;
+        ogol-pico)    board=1; board_target=thumbv6m-freestanding ;;
+        ogol-pico2)   board=1; board_target=thumb-freestanding-softfp ;;
+        solder-pico2) board=1; board_target=thumb-freestanding-softfp ;;
+        zephyr|zephyr-demo)
             rows=$((rows + 1))
             setup=$((setup + 1))
-            echo "needs setup         $name -- a kernel tree or a west workspace, not on this machine"
+            echo "needs kernel tree   $name -- a west workspace, not on this machine"
             continue
             ;;
     esac
@@ -164,6 +204,64 @@ for dir in "$org"/*/; do
         quickjs-ng) flags="--include-path quickjs=/opt/homebrew/include --link-path /opt/homebrew/lib" ;;
     esac
 
+    # **A board repository's command is its CMake's, one flag at a time.** `pico` and `pico2` are
+    # packages, so the analysis is reached by `build-lib`; the four programs keep their project in a
+    # subdirectory and are reached by `build-c`. The SDK answers the `pico_sdk` headers the manifest
+    # asks for by name, which is what a named include is for.
+    if [ -n "$board" ]; then
+        if [ -z "$PICO_SDK_PATH" ]; then
+            rows=$((rows + 1))
+            no_sdk=$((no_sdk + 1))
+            echo "needs SDK           $name -- PICO_SDK_PATH names the SDK a board build reads"
+            continue
+        fi
+
+        case $name in
+            pico|pico2) command="build-lib . --target $board_target"; label="build-lib $board_target" ;;
+            *)          command="build-c $sub --target $board_target"; label="build-c $sub $board_target" ;;
+        esac
+
+        flags="--include-path pico_sdk=$PICO_SDK_PATH"
+    fi
+
+    # **`freertos` is sweepable and its kernel is the application's to build**, which is the whole
+    # reason the package declares `requires { headers { … } }` instead of vendoring one: a
+    # `FreeRTOSConfig.h` moves `TickType_t` between 16 and 32 bits. `FREERTOS_KERNEL` names a
+    # `FreeRTOS-Kernel` checkout; the nine objects its POSIX port needs are built once into this
+    # run's own directory, so the census stays offline and writes nothing anybody owns.
+    if [ "$name" = freertos ]; then
+        if [ -z "$FREERTOS_KERNEL" ]; then
+            rows=$((rows + 1))
+            setup=$((setup + 1))
+            echo "needs kernel tree   freertos -- FREERTOS_KERNEL names a FreeRTOS-Kernel checkout"
+            continue
+        fi
+
+        fr_port=$FREERTOS_KERNEL/portable/ThirdParty/GCC/Posix
+        fr_lib=$work/freertos-lib
+
+        if [ ! -f "$fr_lib/libfreertos.a" ]; then
+            mkdir -p "$fr_lib"
+            ( cd "$fr_lib" && cc -c \
+                -I "$dir/test-config" -I "$FREERTOS_KERNEL/include" -I "$fr_port" -I "$fr_port/utils" \
+                "$FREERTOS_KERNEL"/tasks.c "$FREERTOS_KERNEL"/queue.c "$FREERTOS_KERNEL"/list.c \
+                "$FREERTOS_KERNEL"/timers.c "$FREERTOS_KERNEL"/event_groups.c \
+                "$FREERTOS_KERNEL"/stream_buffer.c "$FREERTOS_KERNEL"/portable/MemMang/heap_4.c \
+                "$fr_port"/port.c "$fr_port"/utils/wait_for_event.c \
+              && ar rcs libfreertos.a ./*.o ) > "$work/freertos.kernel" 2>&1 || {
+                rows=$((rows + 1))
+                setup=$((setup + 1))
+                echo "needs kernel tree   freertos -- the kernel would not build: $(head -1 "$work/freertos.kernel")"
+                continue
+            }
+        fi
+
+        flags="--link-path $fr_lib \
+               --include-path freertos=$FREERTOS_KERNEL/include \
+               --include-path freertos-port=$fr_port \
+               --include-path freertos-config=$dir/test-config"
+    fi
+
     # **Read out of a copy**, because a build records what it fetched in `sysl.sum` and a census has
     # no business writing into a repository it does not own.
     here=$work/$name
@@ -180,7 +278,16 @@ for dir in "$org"/*/; do
         case $label in
             test) ok_test=$((ok_test + 1)) ;;
             build) ok_build=$((ok_build + 1)) ;;
-            *) ok_build_c=$((ok_build_c + 1)) ;;
+            *)
+                # Never `cond && (( a++ )) || (( b++ ))`: an arithmetic command reports its result
+                # as a status and `x++` yields the value before the increment, so the 0->1
+                # transition increments both counters.
+                if [ -n "$board" ]; then
+                    ok_board=$((ok_board + 1))
+                else
+                    ok_build_c=$((ok_build_c + 1))
+                fi
+                ;;
         esac
 
         echo "ok ($label)  $name"
@@ -208,6 +315,19 @@ for dir in "$org"/*/; do
 
     ( cd "$theirs" && limited "$theirs_bin" $command $flags ) > "$work/$name.theirs" 2>&1 || theirs_ok=1
 
+    # **A board row that stops where the reference stops is a PASS, and the row says so.** The
+    # header is one the SDK generates during a CMake configure, so neither compiler can reach it
+    # from a checkout -- and both run the whole analysis before a line of C, which is what the row
+    # is claiming. Both texts are required to name a missing header: a stop anywhere else, or a
+    # reference that got further, is still a failure.
+    if [ -n "$board" ] && [ $theirs_ok -ne 0 ] \
+       && grep -q "file not found" "$work/$name.out" \
+       && grep -q "file not found" "$work/$name.theirs"; then
+        ok_typecheck=$((ok_typecheck + 1))
+        echo "ok (type-check $board_target)  $name -- the analysis passed; $(grep -m1 -o "'[^']*' file not found" "$work/$name.out") is written by a CMake configure"
+        continue
+    fi
+
     if [ $theirs_ok -ne 0 ]; then
         both_refused=$((both_refused + 1))
         echo "refused by both     $name ($label) -- $(grep -m1 'error' "$work/$name.out" || head -1 "$work/$name.out")"
@@ -217,11 +337,12 @@ for dir in "$org"/*/; do
     fi
 done
 
-total=$((ok_test + ok_build + ok_build_c + failed + both_refused + cross + setup + serverless))
+total=$((ok_test + ok_build + ok_build_c + ok_board + ok_typecheck + failed + both_refused + no_sdk + setup + serverless))
 
 echo
-echo "ok(test) $ok_test, ok(build) $ok_build, ok(build-c) $ok_build_c, FAILED $failed,"
-echo "refused by both $both_refused, needs cross target $cross, needs setup $setup, needs a server $serverless"
+echo "ok(test) $ok_test, ok(build) $ok_build, ok(build-c) $ok_build_c, ok(board) $ok_board,"
+echo "ok(type-check) $ok_typecheck, FAILED $failed, refused by both $both_refused,"
+echo "needs SDK $no_sdk, needs kernel tree $setup, needs a server $serverless"
 echo "total $total over $rows rows"
 echo "output: $work"
 

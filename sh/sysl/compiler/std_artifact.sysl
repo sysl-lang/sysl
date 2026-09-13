@@ -55,6 +55,20 @@ std_artifact(t: Target) -> Result[StdArtifact, string]
     Ok(StdArtifact(symbols, path))
 end std_artifact
 
+// One library compiled into an artifact for one machine, which is what `sysl build-lib <root>`
+// writes for a package.
+//
+// **The whole analysis runs before a line of C is compiled**, which is what makes the command worth
+// running on a machine that cannot compile the C at all: a run for a board that reaches clang's
+// complaint about a missing SDK header is a sysl type-check that passed.
+build_library(root: string, t: Target, where: string, units: Buf[Program], own: Buf[string],
+              who: string, probed: PkgAnswer) -> Result[string, string]
+    val fingerprint = std_fingerprint(root, t)?
+
+    write_artifact(units, own, root, where, fingerprint, t, who, probed)?
+    Ok(where)
+end build_library
+
 // `sysl build-lib <root> --std` -- the standard module compiled into an artifact, written where a
 // compilation would look for it unless the caller named somewhere else.
 //
@@ -171,13 +185,29 @@ private selects_a_machine(part: string) -> bool =
 // publish the other's half-written archive.
 private write_std_artifact(root: string, out: string, fingerprint: string,
                            t: Target) -> Result[Buf[string], string]
+    val units = std_units(root, t)?
+
+    write_artifact(units, modules_of(units), root, out, fingerprint, t, "the standard module",
+                   no_probe())
+end write_std_artifact
+
+// The same for **any** library, which is what `sysl build-lib` on a package writes: the tree's own
+// declarations compiled ahead of time into an object half, the metadata beside it, and one member
+// for each C file the tree carries.
+//
+// **What differs between a library and the standard module is only which modules are its own.** The
+// split `library_build` makes is read off the module a declaration is keyed under, so handing it the
+// package's modules rather than the library's is the whole of the generalization -- everything the
+// compilation reached on the library's behalf is declared and left to whoever links this.
+private write_artifact(units: Buf[Program], own: Buf[string], root: string, out: string,
+                       fingerprint: string, t: Target, who: string,
+                       probed: PkgAnswer) -> Result[Buf[string], string]
     if !t.builds_with_clang() then return Err(t.no_toolchain())
 
-    val units = std_units(root, t)?
-    val built = library_build(units, modules_of(units), t)
+    val built = library_build(units, own, t)
 
     if !built.report.is_empty()
-        return Err(s"the standard module does not analyze: ${first_message(built.report)}")
+        return Err(s"$who does not analyze: ${first_message(built.report)}")
 
     val clang = find_clang(t, None)?
     val archiver = find_ar(None)?
@@ -197,7 +227,7 @@ private write_std_artifact(root: string, out: string, fingerprint: string,
     val loose = undefined_calls(ir_print_module(lowered.0))
 
     if !loose.is_empty()
-        return Err(s"the standard module's compiled half would name ${loose.len()} symbol(s) it " +
+        return Err(s"$who's compiled half would name ${loose.len()} symbol(s) it " +
             s"neither defines nor declares, the first of them '${loose.at(0)}'")
 
     val meta = syslib_metadata(t, fingerprint, defined)
@@ -205,7 +235,7 @@ private write_std_artifact(root: string, out: string, fingerprint: string,
     var members: Buf[string] = buf()
 
     val made = build_members(clang, archiver, staging, root, out, ir_print_module(lowered.0),
-                             syslib_metadata_ir(meta, t), &members, t)
+                             syslib_metadata_ir(meta, t), &members, t, probed)
 
     discard_members(members)
 
@@ -214,13 +244,13 @@ private write_std_artifact(root: string, out: string, fingerprint: string,
         Ok(_) -> ()
 
     Ok(defined)
-end write_std_artifact
+end write_artifact
 
 // The steps that make the file, kept apart from the call above so that the staging members are
 // discarded whichever of them failed.
 private build_members(clang: string, archiver: string, staging: string, root: string, out: string,
-                      ir: string, meta_ir: string, members: *Buf[string],
-                      t: Target) -> Result[unit, string]
+                      ir: string, meta_ir: string, members: *Buf[string], t: Target,
+                      probed: PkgAnswer) -> Result[unit, string]
     val code = s"$staging/$SyslibCodeMember"
     val smeta = s"$staging/$SyslibMetadataMember"
 
@@ -236,9 +266,10 @@ private build_members(clang: string, archiver: string, staging: string, root: st
     for i in 0..<carried.len()
         val obj = s"$staging/${native_member(root, carried.at(i))}"
 
-        // **The library names no installed library**, so there is nothing for a probe to have
-        // answered: its C is what a hosted target's libc already carries.
-        compile_c(clang, carried.at(i), obj, t, DefaultOptimization, no_probe())?
+        // **The standard module names no installed library**, so there is nothing for a probe to
+        // have answered there: its C is what a hosted target's libc already carries. A package's is
+        // another matter, which is why the answer arrives as an argument.
+        compile_c(clang, carried.at(i), obj, t, DefaultOptimization, probed)?
         members.push(obj)
 
     val pending = s"$out.${basename(staging)}"

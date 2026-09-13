@@ -166,6 +166,26 @@ struct Target
     // an aggregate of floating members has floating registers to travel in.
     soft_float: bool
 
+    // The floating-point unit this machine has, as clang's `-mfpu` names it, or `""` where the
+    // question does not arise -- every processor but Arm, whose triple says it.
+    //
+    // **A row states the unit or states that there is none, and never both.** A triple names an
+    // architecture and a calling convention and leaves the *presence* of a unit unstated, so what is
+    // left is clang's default for the architecture -- which differs between clangs, and did make one
+    // machine compile a multiply to `vmul.f32` where another emitted a call.
+    fpu: string
+
+    // Whether the unit is **absent** rather than merely unused: an Armv6-M or Armv7-M part, or an
+    // Armv8-M built without one. It is the other half of `fpu`, and what it buys beyond stopping the
+    // back end selecting VFP instructions is that `__ARM_FP` goes away -- which is what a header
+    // guarding on `__FPU_PRESENT` reads.
+    no_fpu: bool
+
+    // Whether an `enum` is as narrow as its values need, which is the Arm embedded ABI's rule and
+    // not the one a hosted target follows. A package's C is compiled *as* the target, so a header
+    // shared with a project built the other way disagrees about the size of every enum in it.
+    short_enums: bool
+
     hard_float(self) -> bool = !self.soft_float
 
     // How wide an address is here, which is the processor's answer and every target on one agrees.
@@ -214,28 +234,45 @@ end Target
 all_targets() -> Buf[Target]
     var out: Buf[Target] = buf()
 
-    out.push(Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false))
-    out.push(Target("x86_64-macos", "x86_64-apple-macosx", X86_64, MacOS, false))
-    out.push(Target("aarch64-linux", "aarch64-unknown-linux-gnu", Aarch64, Linux, false))
-    out.push(Target("x86_64-linux", "x86_64-unknown-linux-gnu", X86_64, Linux, false))
-    out.push(Target("riscv64-linux", "riscv64-unknown-linux-gnu", Riscv64, Linux, false))
-    out.push(Target("x86_64-windows", "x86_64-pc-windows-msvc", X86_64, Windows, false))
-    out.push(Target("aarch64-android", "aarch64-linux-android24", Aarch64, Android, false))
-    out.push(Target("aarch64-freestanding", "aarch64-none-elf", Aarch64, Freestanding, false))
-    out.push(Target("x86_64-freestanding", "x86_64-unknown-none-elf", X86_64, Freestanding, false))
-    out.push(Target("riscv64-freestanding", "riscv64-unknown-elf", Riscv64, Freestanding, true))
-    out.push(Target("thumb-freestanding", "thumbv8m.main-none-eabihf", Thumb, Freestanding, false))
-    out.push(Target("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Thumb, Freestanding, true))
-    out.push(Target("thumb-freestanding-soft", "thumbv8m.main-none-eabi", Thumb, Freestanding, true))
-    out.push(Target("thumbv6m-freestanding", "thumbv6m-none-eabi", Thumb, Freestanding, true))
-    out.push(Target("thumbv7m-freestanding", "thumbv7m-none-eabi", Thumb, Freestanding, true))
-    out.push(Target("thumbv7em-freestanding", "thumbv7em-none-eabihf", Thumb, Freestanding, false))
-    out.push(Target("thumbv7em-freestanding-soft", "thumbv7em-none-eabi", Thumb, Freestanding, true))
-    out.push(Target("riscv32-freestanding", "riscv32-unknown-elf", Riscv32, Freestanding, true))
-    out.push(Target("wasm32-freestanding", "wasm32-unknown-unknown", Wasm32, Freestanding, false))
-    out.push(Target("wasm32-wasi", "wasm32-wasip1", Wasm32, Wasi, false))
-    out.push(Target("craft-freestanding", "craft", Craft, Freestanding, true))
-    out.push(Target("x86-linux", "i386-unknown-linux-gnu", X86, Linux, false))
+    out.push(Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false, "", false, false))
+    out.push(Target("x86_64-macos", "x86_64-apple-macosx", X86_64, MacOS, false, "", false, false))
+    out.push(Target("aarch64-linux", "aarch64-unknown-linux-gnu", Aarch64, Linux, false, "", false,
+                    false))
+    out.push(Target("x86_64-linux", "x86_64-unknown-linux-gnu", X86_64, Linux, false, "", false,
+                    false))
+    out.push(Target("riscv64-linux", "riscv64-unknown-linux-gnu", Riscv64, Linux, false, "", false,
+                    false))
+    out.push(Target("x86_64-windows", "x86_64-pc-windows-msvc", X86_64, Windows, false, "", false,
+                    false))
+    out.push(Target("aarch64-android", "aarch64-linux-android24", Aarch64, Android, false, "", false,
+                    false))
+    out.push(Target("aarch64-freestanding", "aarch64-none-elf", Aarch64, Freestanding, false, "",
+                    false, false))
+    out.push(Target("x86_64-freestanding", "x86_64-unknown-none-elf", X86_64, Freestanding, false, "",
+                    false, false))
+    out.push(Target("riscv64-freestanding", "riscv64-unknown-elf", Riscv64, Freestanding, true, "",
+                    true, false))
+    out.push(Target("thumb-freestanding", "thumbv8m.main-none-eabihf", Thumb, Freestanding, false,
+                    "fpv5-sp-d16", false, true))
+    out.push(Target("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Thumb, Freestanding, true,
+                    "fpv5-sp-d16", false, true))
+    out.push(Target("thumb-freestanding-soft", "thumbv8m.main-none-eabi", Thumb, Freestanding, true,
+                    "", true, true))
+    out.push(Target("thumbv6m-freestanding", "thumbv6m-none-eabi", Thumb, Freestanding, true, "",
+                    true, true))
+    out.push(Target("thumbv7m-freestanding", "thumbv7m-none-eabi", Thumb, Freestanding, true, "",
+                    true, true))
+    out.push(Target("thumbv7em-freestanding", "thumbv7em-none-eabihf", Thumb, Freestanding, false,
+                    "fpv4-sp-d16", false, true))
+    out.push(Target("thumbv7em-freestanding-soft", "thumbv7em-none-eabi", Thumb, Freestanding, true,
+                    "", true, true))
+    out.push(Target("riscv32-freestanding", "riscv32-unknown-elf", Riscv32, Freestanding, true, "",
+                    true, false))
+    out.push(Target("wasm32-freestanding", "wasm32-unknown-unknown", Wasm32, Freestanding, false, "",
+                    false, false))
+    out.push(Target("wasm32-wasi", "wasm32-wasip1", Wasm32, Wasi, false, "", false, false))
+    out.push(Target("craft-freestanding", "craft", Craft, Freestanding, true, "", true, false))
+    out.push(Target("x86-linux", "i386-unknown-linux-gnu", X86, Linux, false, "", false, false))
     out
 end all_targets
 
@@ -350,5 +387,5 @@ end host_cpu
 host_target() -> Target
     target_named(host_name(cpu_symbol(host_cpu()), os_symbol(host_os()))) match
         Some(t) -> t
-        None -> Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false)
+        None -> Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false, "", false, false)
 end host_target

@@ -200,6 +200,17 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     args.push("-emit-llvm")
     args.push("-O0")
 
+    // **A block is measured as the target, which is what makes a probe worth anything on a cross
+    // build.** CMSIS's own `#error "Compiler generates FPU instructions for a device without an
+    // FPU"` refuses a translation unit at the `#include`, one step before anything has been
+    // measured, and an enum's width is what half of these blocks are asking about.
+    val machine = machine_flags(t)
+
+    for i in 0..<machine.len()
+        args.push(machine.at(i))
+
+    if t.short_enums then args.push("-fshort-enums")
+
     // C resolves `#include "foo.h"` relative to the file doing the including, and the probe is a
     // temporary file somewhere else entirely -- so without this a header the module carries beside
     // its own source cannot be found at all.
@@ -210,6 +221,14 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     parent_of(unit.src.name) match
         Some(beside) -> args.push(s"-I$beside")
         None -> ()
+
+    // **What a command line said, which on a cross build is the only thing there is to say.** A
+    // `c const` reading an SDK's header is measured against the SDK the consumer named, and nothing
+    // on this machine could have found it: `pkg-config` speaks for the host.
+    val given = supplied_cflags()
+
+    for i in 0..<given.len()
+        args.push(given.at(i))
 
     // **And a binding whose header is the installed library's needs to be told where that is.**
     // `uv.h` is not beside `libuv.sysl`; it is wherever this machine put libuv, which is the one

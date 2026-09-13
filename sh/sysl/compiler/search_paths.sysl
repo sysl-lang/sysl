@@ -1,0 +1,216 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Where on **this** machine a build is to look for what it was not given (`reference/packages.md §
+// Capabilities`, `reference/ffi.md § @link`).
+//
+// A package says *which* library it binds and never where the library is: the file is committed and
+// describes the package, and where a prefix lives on somebody's laptop is not a property of it. So
+// the two halves are asked for on the command line -- `--include-path <dir>` for a header the C
+// beside a module includes, `--link-path <dir>` for the archive a `@link` directive names, and
+// `-D <macro>` for the definitions the C project a shim joins is configured with.
+//
+// **Both halves, because half is unusable.** A binding to a library outside the default prefix needs
+// its headers to compile and its archive to link, and neither is reachable without a flag. Nothing
+// is guessed at either: `/opt/homebrew/lib` is the obvious candidate to add by default and is not
+// added, because a compiler that ruled on where a platform keeps its libraries would be wrong about
+// a machine nobody here has, and the cost of being wrong is a link that fails somewhere the author
+// cannot reach.
+//
+// ## Why this is module storage rather than a value carried down
+//
+// Every other decision a compilation makes is a value it carries, and this one is not, because of
+// **where it has to arrive**: a `c const` block is measured by clang from inside the analysis, which
+// holds no project and no command line. The reference threads a record through every call that can
+// reach a toolchain; the same threading here would put a parameter on some forty signatures and
+// then depend on nobody forgetting it at a call. What is stored is written **once**, by the command
+// that parsed the flags, before a line of source is read -- so nothing observes it changing, which
+// is the property that makes a global answerable at all.
+
+// Every directory a bare `--include-path` named, in the order they were written.
+private var sp_include: Buf[string] = buf()
+
+// Every directory a `--link-path` named.
+private var sp_link: Buf[string] = buf()
+
+// Every macro a `-D`/`--define` named, as written -- `NAME` or `NAME=value`.
+private var sp_defines: Buf[string] = buf()
+
+// The names a `--include-path <name>=<dir>` answered, paired with the directory. A name satisfies a
+// package's declared `headers` requirement or stands in for a `pkg_config` probe; the directory also
+// reaches the C compiler exactly as a bare one does, which is why both lists carry it.
+private var sp_named: Buf[(string, string)] = buf()
+
+// What a run that was given no flags looks for, which is what every command starts from.
+//
+// **Called by the CLI before each command's flags are read**, so that one process running two
+// commands -- a test does exactly this -- never inherits the first's paths.
+reset_search_paths()
+    sp_include = buf()
+    sp_link = buf()
+    sp_defines = buf()
+    sp_named = buf()
+end reset_search_paths
+
+// `--include-path` written as `<name>=<dir>`, which answers a package's declared header requirement,
+// or nothing where it is the ordinary bare directory.
+//
+// **The two forms share a flag, so the split has to be decidable by looking rather than by
+// guessing.** A name is what `pkg_config_name` allows -- letters, digits, `_`, `-`, `.` and `+`,
+// starting with a letter -- so a directory read as one would have to hold an `=`, be a single
+// segment with no separator before it, and have a non-empty remainder. Where the text before the
+// first `=` is not a name the whole string is a directory, which is what an absolute path, a
+// relative one and `.` all are.
+//
+// **The wider of the two requirement kinds, because the flag serves both.** A `headers` name is
+// invented by the package's author and a `.pc` name is not -- `yaml-0.1`, `glib-2.0`, `gtk+-3.0` --
+// so a flag reading only the narrow spelling would leave those requirements declarable and
+// unanswerable.
+named_include(text: string) -> Option[(string, string)]
+    var at: usize = 0
+    var found = false
+
+    for i in 0..<text.bytes.len
+        if !found && text.bytes[i] == u8('=')
+            at = i
+            found = true
+
+    if !found then return None
+
+    val name = text[0..<at]
+    val dir = text[at + 1..<text.bytes.len]
+
+    if dir == "" || !pkg_config_name(name) then return None
+
+    Some((name, dir))
+end named_include
+
+// One `--include-path`, in whichever of its two forms it was written.
+add_include_path(text: string)
+    named_include(text) match
+        None -> sp_include.push(text)
+        Some(pair) ->
+            sp_include.push(pair.1)
+            sp_named.push(pair)
+end add_include_path
+
+// One `--link-path`.
+add_link_path(dir: string) = sp_link.push(dir)
+
+// One `-D`/`--define`, as written.
+add_define(macro: string) = sp_defines.push(macro)
+
+// One argument of a command line, where it is one of the flags saying **where things are on this
+// machine**: `--include-path`, `--link-path` and `-D`/`--define`.
+//
+// Every command that can reach a C compiler takes all three and decides nothing about them, so they
+// are read here once rather than in each command's own loop. The answer is how many arguments were
+// taken -- `1` for `-DNAME`, `2` for a flag and its operand -- with `0` for a flag whose operand is
+// missing, which is the caller's usage error, and `-1` for an argument that is none of them.
+took_search_flag(args: []string, i: usize) -> int
+    val arg = args[i]
+
+    if arg == "-D" || arg == "--define" || arg == "--include-path" || arg == "--link-path"
+        if i + 1 >= args.len then return 0
+
+        if arg == "--include-path" then add_include_path(args[i + 1])
+        else if arg == "--link-path" then add_link_path(args[i + 1])
+        else add_define(args[i + 1])
+
+        return 2
+    end if
+
+    // The attached spelling, which is how a `-D` is written by hand and by most build systems.
+    if arg.len > 2 && arg.starts_with("-D")
+        add_define(arg[2..<arg.len])
+        return 1
+    end if
+
+    -1
+end took_search_flag
+
+// Whether a requirement of this name was answered on the command line -- a `headers` name or a
+// `pkg_config` module's, which the one flag serves.
+supplied_include(name: string) -> bool
+    for i in 0..<sp_named.len()
+        if sp_named.at(i).0 == name then return true
+
+    false
+end supplied_include
+
+// The directories a build's own C is compiled with, as clang spells them.
+//
+// **A header path is what makes a shim compile at all**, and it goes on every command line that
+// reads a header as this target: the objects a package carries, and the translation unit a `c const`
+// block is measured in.
+include_flags() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<sp_include.len()
+        out.push(s"-I${sp_include.at(i)}")
+
+    out
+end include_flags
+
+// The macros the C is compiled with, as clang spells them -- `-DNAME` or `-DNAME=value`.
+//
+// **A header path is not enough to compile a header**, which is why this is here beside the
+// directories. A C project of any size configures its own headers with macros, and one that has not
+// been given them does not miss quietly: pico-sdk's `pico/cyw43_arch.h` answers a build with no
+// `CYW43_LWIP` by `#error`ing on the spot. So a shim reachable at its path and compiled without the
+// definitions its project builds with is a shim that fails one step *after* the include path was
+// fixed.
+define_flags() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<sp_defines.len()
+        out.push(s"-D${sp_defines.at(i)}")
+
+    out
+end define_flags
+
+// Everything a command line said about where headers are, which is what a C compile and a probe are
+// both handed: the directories, then the macros.
+supplied_cflags() -> Buf[string]
+    var out = include_flags()
+    val macros = define_flags()
+
+    for i in 0..<macros.len()
+        out.push(macros.at(i))
+
+    out
+end supplied_cflags
+
+// Where the linker is told to look, as clang spells it. These go **before** everything they could
+// affect: a search path is where the scan looks rather than an input being scanned, and `-L` is
+// order-sensitive on GNU ld, which does not apply one to a `-l` that appeared before it.
+link_search_flags() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<sp_link.len()
+        out.push(s"-L${sp_link.at(i)}")
+
+    out
+end link_search_flags
+
+// A run-time search path for each directory `--link-path` named, so that a shared library found at
+// build time is found again when the program runs.
+//
+// **Not on a freestanding target.** `wasm-ld` and `ld.lld` accept `-rpath` for a bare-metal link
+// without complaint, and what they write is a run-time search path for a dynamic loader that does
+// not exist on such a machine -- there is nothing to find it, so there is nothing to say.
+//
+// The directory is made absolute, because a relative one would be resolved against whatever
+// directory the program was started in rather than the one it was built in.
+rpath_flags(t: Target) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if t.os == Freestanding then return out
+
+    for i in 0..<sp_link.len()
+        out.push(s"-Wl,-rpath,${absolute_path(sp_link.at(i))}")
+
+    out
+end rpath_flags
