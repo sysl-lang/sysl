@@ -1,0 +1,504 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_temp_dir, metadata, read_text, remove_dir_all, walk, write_text}
+import sysl.process.capture
+import sysl.text.{split, str_builder, Search}
+
+// The site's executable documentation, run against this compiler.
+//
+// **A page on sysl.sh is not a picture of a program, it is the program**, and the reference's
+// `DocsTests` proves that by compiling every `sysl` block the site shows: one followed by an
+// `output` block is run and its stdout compared, one followed by an `error` block is required to
+// fail with the diagnostic the page quotes, and one followed by neither is a fragment nobody
+// compiles. That is 1,220 executable blocks over 73 pages, and section 7 owes every one of them.
+//
+// **What this sweep is for is the half of the claim the differential sweeps cannot make.** They
+// agree with the reference on the pages' *trees*, which says the two parsers read the same program;
+// it does not say the program prints what the page says it prints, nor that a refusal this compiler
+// makes is the refusal the page quotes. Only running it says that.
+//
+// **The classification is `DocsSupport`'s, condition for condition** -- how a fence is read, which
+// claim attaches to which block, what `target=` and `build=c` change, and that a diagnostic has only
+// to *contain* the words the page quotes. A sweep that classified differently would be measuring a
+// different population and its number would mean nothing beside the reference's.
+//
+// It compiles and links about nine hundred programs, so it is gated: with `SYSL_DOCS` unset it
+// returns at once, which is what keeps `sysl test .` the length it is.
+
+// -- what a page says about a block ----------------------------------------------------------------
+
+// What a page claims about one of its `sysl` blocks, which is decided by what follows it.
+enum DocsClaim
+    PagePrints
+    PageRefuses
+    PageShows
+
+// A fenced block as the markdown holds it: the word after the backticks, whatever else was on that
+// line, and the body.
+struct DocsFence
+    lang: string
+    info: string
+    body: string
+
+// One `sysl` block, with where it came from -- a complaint has to name the page and the position on
+// it, a reader of the complaint having only the page to go and fix.
+//
+// `target` is the machine the block is *about*, from a `target=` on the fence, and is empty for the
+// ordinary case of a block about the language rather than about a processor. `archive` is `build=c`,
+// and says the block is about the artifact a C project links rather than about a program.
+struct DocsBlock
+    page: string
+    nth: int
+    source: string
+    claim: DocsClaim
+    expected: string
+    target: string
+    archive: bool
+end DocsBlock
+
+// What one page, one section or the whole site came to.
+struct DocsTally
+    run_ok: int
+    run_bad: int
+    ref_ok: int
+    ref_bad: int
+    shown: int
+
+    // Blocks carrying a `target=` or a `build=c`, which are honoured rather than skipped. It is
+    // counted so that a reader can see the number is not zero by accident.
+    attributed: int
+end DocsTally
+
+private docs_add(a: DocsTally, b: DocsTally) -> DocsTally =
+    DocsTally(a.run_ok + b.run_ok, a.run_bad + b.run_bad, a.ref_ok + b.ref_ok, a.ref_bad + b.ref_bad,
+              a.shown + b.shown, a.attributed + b.attributed)
+
+// -- reading a page --------------------------------------------------------------------------------
+
+private docs_is_space(b: u8) -> bool = b == u8(' ') || b == u8('\t')
+
+private docs_word_end(s: string) -> usize
+    var i: usize = 0
+
+    while i < s.len && !docs_is_space(s.bytes[i])
+        i += 1
+
+    i
+end docs_word_end
+
+// The value a fence's info string gives one key, or the empty string where it names none.
+//
+// **Anything that is not a `key=value` pair is ignored**, because the info string is also where a
+// highlighter's own words go.
+private docs_option(info: string, key: string) -> string
+    val head = key + "="
+
+    for word in split(info, " ")
+        for part in split(word, "\t")
+            if part.starts_with(head) then return part[head.len..]
+
+    ""
+end docs_option
+
+// The fenced blocks of a page, in order.
+//
+// **Only a fence at the left margin opens one.** An indented fence is inside a list item or a block
+// quote, where the prose around it owns the program rather than offering it to be run.
+private docs_fences(text: string) -> Buf[DocsFence]
+    var out: Buf[DocsFence] = buf()
+    var held = str_builder()
+    var open = false
+    var lang = ""
+    var info = ""
+
+    for line in split(text, "\n")
+        if line.starts_with("```")
+            if open
+                out.push(DocsFence(lang, info, held.finish()))
+
+                held = str_builder()
+                open = false
+            else
+                val head = line[3..].trim()
+                val cut = docs_word_end(head)
+
+                lang = head[0..<cut]
+                info = head[cut..].trim()
+                open = true
+        else if open
+            held.push(line)
+            held.push_char('\n')
+
+    out
+end docs_fences
+
+// What the fences after a `sysl` block say about it: the first `output` or `error` block to appear
+// before the next `sysl` block.
+//
+// Not simply the very next fence, because a page reads *program, how to run it, what it prints* --
+// with a `bash` block in the middle. What the rule does refuse is an `output` block belonging to a
+// *later* program: the search stops at the next `sysl` block, so a claim can never attach to the
+// wrong one.
+private docs_claim_after(fences: Buf[DocsFence], from: usize) -> (DocsClaim, string)
+    var i = from
+
+    while i < fences.len()
+        val f = fences.at(i)
+
+        if f.lang == "sysl" then break
+        if f.lang == "output" then return (DocsClaim.PagePrints, f.body)
+        if f.lang == "error" then return (DocsClaim.PageRefuses, f.body)
+
+        i += 1
+
+    (DocsClaim.PageShows, "")
+end docs_claim_after
+
+// Every `sysl` block of one page, each paired with what the page claims about it.
+//
+// **The number a complaint quotes counts the `sysl` fences alone**, not every fence, because that is
+// the number a reader counts scrolling down the page.
+private docs_blocks(page: string, text: string) -> Buf[DocsBlock]
+    val fences = docs_fences(text)
+    var out: Buf[DocsBlock] = buf()
+    var nth = 0
+
+    for i in 0..<fences.len()
+        val f = fences.at(i)
+
+        if f.lang == "sysl"
+            nth += 1
+
+            val said = docs_claim_after(fences, i + 1)
+
+            out.push(DocsBlock(page, nth, f.body, said.0, said.1, docs_option(f.info, "target"),
+                               docs_option(f.info, "build") == "c"))
+
+    out
+end docs_blocks
+
+// Trailing whitespace is not a claim a page is making: a markdown fence keeps a final newline the
+// author did not type and cannot see, so comparing raw text would fail every block for a reason no
+// reader could act on.
+private docs_normalize(text: string) -> string
+    var b = str_builder()
+    var first = true
+
+    for line in split(text, "\n")
+        if !first then b.push("\n")
+
+        b.push(line.trim_end())
+        first = false
+
+    b.finish().trim()
+end docs_normalize
+
+private docs_indent(text: string) -> string
+    var b = str_builder()
+
+    for line in split(text, "\n")
+        b.push("    ")
+        b.push(line)
+        b.push_char('\n')
+
+    b.finish()
+end docs_indent
+
+// -- compiling one block -----------------------------------------------------------------------------
+
+// The compilation a refusal is about: an ordinary program lowered as far as LLVM, or the artifact a
+// C project links.
+//
+// **`build=c` is a different axis from `target=`.** One says which machine, the other which
+// artifact, and a refusal about module storage belongs to the archive and to no other build --
+// compiled as a program it never happens, whatever the machine.
+private docs_compile(src: string, b: DocsBlock, archive_at: string) -> Result[unit, string]
+    val named: Option[string] = if b.target == "" then None else Some(b.target)
+
+    if b.archive
+        build_c_archive(src, named, None, DefaultOptimization, Some(archive_at), None, (m) -> ()) match
+            Err(why) -> return Err(why.message)
+            Ok(_) -> return Ok(())
+    end if
+
+    emit_llvm_text(src, named) match
+        Err(why) -> Err(why.message)
+        Ok(made) ->
+            if !made.report.is_empty() then return Err(analysis_report(made.report))
+
+            Ok(())
+end docs_compile
+
+// A block the page says prints: built, linked, run, and its standard output held against the
+// `output` block underneath it.
+private docs_prints(src: string, exe: string, b: DocsBlock, where: string) -> Option[string]
+    build_native_program(src, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> return Some(s"$where: expected it to run, but it did not compile:\n${why.message}")
+        Ok(_) -> ()
+
+    capture(exe, [], "", [], true) match
+        Err(_) -> return Some(s"$where: expected it to run, and the program could not be started")
+        Ok(said) ->
+            if !said.status.ok()
+                return Some(s"$where: expected it to run, but it exited with ${shell_status(said.status)}")
+
+            if docs_normalize(said.text) != docs_normalize(b.expected)
+                return Some(s"$where: what it printed is not what the page says.\npage:\n" +
+                            docs_indent(b.expected) + "program:\n" + docs_indent(said.text))
+
+    None
+end docs_prints
+
+// A block the page says is refused: compiled, required to fail, and the diagnostic required to
+// **contain** what the page quotes.
+//
+// The match is a substring because that is the reference's, and 327 of the site's `error` blocks
+// quote a single clause of a message rather than the whole of one.
+private docs_refuses(src: string, archive_at: string, b: DocsBlock, where: string) -> Option[string]
+    if b.target != "" && target_named(b.target).is_none()
+        return Some(s"$where: '${b.target}' is no machine this compiler has an entry for")
+
+    docs_compile(src, b, archive_at) match
+        Ok(_) -> Some(s"$where: the page says the compiler refuses this, and it compiled")
+        Err(said) ->
+            if said.contains(b.expected.trim()) then return None
+
+            Some(s"$where: the compiler refused it, but not in the words the page quotes.\npage:\n" +
+                 docs_indent(b.expected) + "compiler:\n" + docs_indent(said))
+end docs_refuses
+
+// One block checked, answering the complaint it has or nothing.
+//
+// **Every block answers rather than stopping the sweep**, so one run reports every page that has
+// drifted instead of the first: documentation breaks in groups, one language fact invalidating the
+// six pages that lean on it.
+private docs_check(src: string, exe: string, archive_at: string, b: DocsBlock) -> Option[string]
+    val where = s"${b.page}, sysl block ${b.nth}"
+
+    if b.archive && b.claim == DocsClaim.PagePrints
+        return Some(s"$where: a 'build=c' block cannot have an 'output' under it — there is no C " +
+                    "project here to link it")
+
+    // **A `build=c` block with no claim is compiled, where an ordinary fragment is not**, and that is
+    // the point of allowing one: what a page says about an archive is usually that some shape works
+    // there, and an archive does not run, so no `output` block is available to say so.
+    if b.archive && b.claim == DocsClaim.PageShows
+        docs_compile(src, b, archive_at) match
+            Ok(_) -> return None
+            Err(why) ->
+                return Some(s"$where: the page shows this as an archive that builds, and it did " +
+                            s"not:\n$why")
+
+    // A `target=` says the block is about another machine, and the only honest thing to do with one
+    // is compile it -- running it would need that machine.
+    if b.target != "" && b.claim != DocsClaim.PageRefuses
+        return Some(s"$where: 'target=' belongs on a block with an 'error' under it, which is " +
+                    "compiled and not run")
+
+    if b.claim == DocsClaim.PageShows then return None
+    if b.claim == DocsClaim.PagePrints then return docs_prints(src, exe, b, where)
+
+    docs_refuses(src, archive_at, b, where)
+end docs_check
+
+// -- the sweep -------------------------------------------------------------------------------------
+
+// Where the site is: what `SYSL_SITE` names, or the sibling checkout, and nothing where neither is
+// on this machine.
+private docs_root() -> string
+    val named = env_var("SYSL_SITE")
+    val root = if named.is_none() then "../sysl.sh/docs/content"
+    else named.unwrap() + "/docs/content"
+
+    if metadata(root).is_ok() then root else ""
+end docs_root
+
+// The pages somebody wrote, which is every page except the generated API section.
+//
+// **`content/api/` is excluded by path**, as the reference excludes it: those pages are generated
+// from the library's doc comments and are full of signature fragments a compiler correctly refuses.
+// Every block on one is a fragment, so not one of them was ever compiled there either.
+// **`SYSL_DOCS_ONLY` narrows the run to the pages whose name holds it**, which is what makes working
+// a failure down affordable: the whole site is nine hundred links and one page is a few seconds.
+private docs_pages(root: string) -> Buf[string]
+    val only = env_var("SYSL_DOCS_ONLY").unwrap_or("")
+    var out: Buf[string] = buf()
+
+    for item in walk(root)
+        item match
+            Err(_) -> ()
+            Ok(entry) ->
+                if entry.path.ends_with(".md") && !entry.path.contains("/api/") &&
+                   entry.path.contains(only)
+                    out.push(entry.path)
+
+    out
+end docs_pages
+
+// A page named the way the site names it, so a complaint quotes a path a reader recognises rather
+// than one machine's directory layout.
+private docs_short(root: string, page: string) -> string =
+    if page.starts_with(root + "/") then page[root.len + 1..] else page
+
+// The section a page belongs to -- `reference`, `tour`, `library`, `getting-started` -- which is the
+// first segment of its name.
+private docs_section(short: string) -> string
+    val at = short.index_of("/")
+
+    if at.is_none() then "." else short[0..<at.unwrap()]
+end docs_section
+
+private docs_counted(row: DocsTally, b: DocsBlock, ok: bool) -> DocsTally
+    var out = row
+
+    if b.target != "" || b.archive then out = out with { attributed = out.attributed + 1 }
+
+    // A `build=c` block is compiled rather than run, whatever it claims, so it is counted with the
+    // refusals: the sweep's two columns are "ran and printed" and "was compiled".
+    if b.claim == DocsClaim.PageShows && !b.archive then return out with { shown = out.shown + 1 }
+
+    if b.claim == DocsClaim.PagePrints && !b.archive
+        if ok then return out with { run_ok = out.run_ok + 1 }
+
+        return out with { run_bad = out.run_bad + 1 }
+    end if
+
+    if ok then return out with { ref_ok = out.ref_ok + 1 }
+
+    out with { ref_bad = out.ref_bad + 1 }
+end docs_counted
+
+private docs_line(name: string, t: DocsTally) -> string =
+    s"$name: runnable ${t.run_ok} ok ${t.run_bad} failed, refused ${t.ref_ok} ok ${t.ref_bad} " +
+    s"failed, ${t.shown} fragments, ${t.attributed} by attribute"
+
+// Where a run leaves its report, for a reader who wants the numbers rather than a verdict: the test
+// runner shows what a passing test says to nobody.
+private docs_record(report: Buf[string])
+    val where = env_var("SYSL_DOCS_SUMMARY")
+
+    if where.is_none() then return
+
+    var b = str_builder()
+
+    for i in 0..<report.len()
+        b.push(report.at(i))
+        b.push_char('\n')
+
+    write_text(where.unwrap(), b.finish()).unwrap_or(())
+end docs_record
+
+private docs_first_twenty(bad: Buf[string]) -> string
+    var b = str_builder()
+    val shown = if bad.len() < 20 then bad.len() else 20
+
+    b.push(s"${bad.len()} of the site's blocks disagree with this compiler; the first ${shown}:\n")
+
+    for i in 0..<shown
+        b.push("\n")
+        b.push(bad.at(i))
+        b.push_char('\n')
+
+    b.finish()
+end docs_first_twenty
+
+@test("every sysl block the site shows compiles here, and prints or refuses what the page says")
+the_sites_pages_run_here()
+    if env_var("SYSL_DOCS").unwrap_or("") != "1"
+        print("skipped: SYSL_DOCS is not set, so the site's pages were not run")
+        return
+    end if
+
+    val root = docs_root()
+
+    if root == ""
+        print("skipped: the site's pages are not on this machine")
+        return
+    end if
+
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return
+    end if
+
+    val dir = make_temp_dir("sysl-docs").unwrap()
+    val src = s"$dir/main.sysl"
+    val exe = s"$dir/program"
+    val archive_at = s"$dir/program.a"
+
+    val pages = docs_pages(root)
+
+    var report: Buf[string] = buf()
+    var bad: Buf[string] = buf()
+    var sections: Buf[string] = buf()
+    var section_tallies: Buf[DocsTally] = buf()
+    var total = DocsTally(0, 0, 0, 0, 0, 0)
+
+    for p in 0..<pages.len()
+        val page = pages.at(p)
+        val short = docs_short(root, page)
+        val blocks = docs_blocks(short, read_text(page).unwrap_or(""))
+
+        var row = DocsTally(0, 0, 0, 0, 0, 0)
+
+        for i in 0..<blocks.len()
+            val b = blocks.at(i)
+
+            write_text(src, b.source).unwrap()
+
+            val said = docs_check(src, exe, archive_at, b)
+
+            row = docs_counted(row, b, said.is_none())
+
+            if said.is_some() then bad.push(said.unwrap())
+
+        report.push(docs_line(short, row))
+        total = docs_add(total, row)
+
+        val name = docs_section(short)
+        var at = sections.len()
+
+        for k in 0..<sections.len()
+            if sections.at(k) == name then at = k
+
+        if at == sections.len()
+            sections.push(name)
+            section_tallies.push(row)
+        else
+            section_tallies.set(at, docs_add(section_tallies.at(at), row))
+
+    remove_dir_all(dir).unwrap_or(())
+
+    report.push("")
+
+    for k in 0..<sections.len()
+        report.push(docs_line(s"-- ${sections.at(k)}", section_tallies.at(k)))
+
+    report.push(docs_line("-- every page", total))
+
+    for i in 0..<report.len()
+        print(report.at(i))
+
+    // The complaints go into the summary rather than into the report the runner shows, which holds
+    // the first twenty: a sweep worked down one cause at a time needs all of them.
+    report.push("")
+
+    for i in 0..<bad.len()
+        report.push(bad.at(i))
+
+    docs_record(report)
+
+    // A floor, so that a sweep that read nothing cannot pass for one that agreed with everything. It
+    // is about the whole site, so a narrowed run states no floor -- what it is for is one page.
+    if env_var("SYSL_DOCS_ONLY").unwrap_or("") == ""
+        val compiled = total.run_ok + total.run_bad + total.ref_ok + total.ref_bad
+
+        assert(pages.len() >= 70, s"the site showed its pages: ${pages.len()} of them")
+        assert(compiled >= 1200, s"the pages showed the blocks a compiler is owed: only $compiled")
+    end if
+
+    assert(bad.is_empty(), docs_first_twenty(bad))
+end the_sites_pages_run_here
