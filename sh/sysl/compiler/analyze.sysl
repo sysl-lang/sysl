@@ -132,6 +132,17 @@ private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
 
             if cut.is_some() then depends_on_module(a, scope.module_name, path[0..<cut.unwrap()])
 
+            // **A declaration another file keeps to itself is refused where the import is
+            // written**, rather than at whatever later names it: the clause is the mistake, and it
+            // is the line a reader has to change. What the table is keyed on is the declaration's
+            // key rather than the dotted path the file wrote, which is the module and the name
+            // joined the way a key joins them.
+            val named = module_qualify(path[0..<cut.unwrap()],
+                                       path[(cut.unwrap() + 1)..<path.bytes.len])
+
+            if !reachable_key(a, named, scope)
+                a.fault(scope, span, out_of_reach(a, named))
+
             return
         end if
 
@@ -150,6 +161,9 @@ private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
         if !declares(a, key) then
             a.fault(scope, s.span,
                     s"'$written' declares no '${s.name}' — there is no '$written.${s.name}'")
+        elif !reachable_key(a, key, scope)
+            // A selector list points at the selector, which is the word that has to go.
+            a.fault(scope, s.span, out_of_reach(a, key))
 
 // The entries a table took on since a mark, taken back out.
 rewind_registered(into: &Table[Type], mark: usize)
