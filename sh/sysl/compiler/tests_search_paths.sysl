@@ -3,6 +3,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.text.Search
+import sysl.fs.{make_temp_dir, make_dir_all, remove_dir_all}
 
 // **Where things are on this machine, and what a machine needs said beyond its triple.** Both are
 // read off a command line and both reach clang, so what is asserted here is the reading and the
@@ -226,3 +227,98 @@ a_bare_wasm_link_line_says_so()
     assert(joined(line, " ").contains("-nostdlib -Wl,--entry=main"),
            s"the wasm link line is missing its driver flags: ${joined(line, " ")}")
 end a_bare_wasm_link_line_says_so
+
+// -- the two machines whose clang is a download rather than a back end ---------------------------
+
+// **A clang picked for having the back end carries no sysroot**, so both of these refuse rather than
+// hand one back. Each resolution takes its directories as arguments rather than reading the
+// environment, which is what lets the whole rule be asserted on a machine that has neither SDK.
+
+@test("building for WASI with nothing set names the variable to set")
+wasi_with_nothing_set_names_the_variable()
+    val said = wasi_clang_in(None).unwrap_err()
+
+    assert(said.contains("WASI_SDK_PATH"), s"the refusal does not name the variable: $said")
+    assert(said.contains("wasm32 back end"), s"the refusal does not say why a plain clang is no use: $said")
+end wasi_with_nothing_set_names_the_variable
+
+// The PATH rather than the variable, so a WASI_SDK_PATH pointing one directory too high or too low is
+// visible in the message rather than described.
+@test("a WASI_SDK_PATH holding no clang is quoted back")
+a_wasi_sdk_path_holding_no_clang_is_quoted()
+    val dir = make_temp_dir("sysl-wasi-sdk").unwrap()
+    val said = wasi_clang_in(Some(dir)).unwrap_err()
+
+    assert(said.contains(dir), s"the refusal does not quote what was set: $said")
+    assert(said.contains("bin/clang"), s"the refusal does not say what is missing: $said")
+
+    remove_dir_all(dir).unwrap()
+end a_wasi_sdk_path_holding_no_clang_is_quoted
+
+@test("building for Android with nothing set names the variable that is not deprecated")
+android_with_nothing_set_names_the_current_variable()
+    val said = android_clang_in(None, None).unwrap_err()
+
+    assert(said.contains("ANDROID_HOME"), s"the refusal does not name the SDK variable: $said")
+    assert(said.contains("ANDROID_NDK_ROOT"), s"the refusal does not offer the NDK directly: $said")
+
+    // `ANDROID_SDK_ROOT` is read and is deliberately not what the advice names: telling somebody to
+    // export a deprecated variable is advice that ages into a second problem.
+    assert(!said.contains("ANDROID_SDK_ROOT"), s"the refusal recommends the deprecated name: $said")
+end android_with_nothing_set_names_the_current_variable
+
+@test("an Android SDK with no NDK installed says the NDK is a separate download")
+an_android_sdk_with_no_ndk_says_so()
+    val sdk = make_temp_dir("sysl-android-sdk").unwrap()
+    val said = android_clang_in(None, Some(sdk)).unwrap_err()
+
+    assert(said.contains(sdk), s"the refusal does not quote the SDK: $said")
+    assert(said.contains("separate"), s"the refusal does not say the NDK is a separate download: $said")
+
+    remove_dir_all(sdk).unwrap()
+end an_android_sdk_with_no_ndk_says_so
+
+@test("a directory that is not an NDK says which part of one it lacks")
+a_directory_that_is_not_an_ndk_says_so()
+    val ndk = make_temp_dir("sysl-android-ndk").unwrap()
+    val said = android_clang_in(Some(ndk), None).unwrap_err()
+
+    assert(said.contains("toolchains/llvm/prebuilt"),
+           s"the refusal does not name what an NDK has: $said")
+
+    remove_dir_all(ndk).unwrap()
+end a_directory_that_is_not_an_ndk_says_so
+
+// **The version is compared as NUMBERS**, and this is the case that says so: `9.x` sorts above `30.x`
+// as text, so a plain sort of the names would pick the older NDK on a machine with both. Neither
+// holds a toolchain, so the refusal quotes the one that was chosen -- which is what makes the choice
+// observable without an NDK on the machine.
+@test("the newest NDK is taken, and newest is by number rather than by text")
+the_newest_ndk_is_taken_by_number()
+    val sdk = make_temp_dir("sysl-android-sdk").unwrap()
+
+    make_dir_all(s"$sdk/ndk/9.0.8790385").unwrap()
+    make_dir_all(s"$sdk/ndk/30.0.15729638").unwrap()
+
+    val said = android_clang_in(None, Some(sdk)).unwrap_err()
+
+    assert(said.contains("30.0.15729638"), s"the newer NDK was not the one taken: $said")
+    assert(!said.contains("9.0.8790385"), s"the older NDK was the one taken: $said")
+
+    remove_dir_all(sdk).unwrap()
+end the_newest_ndk_is_taken_by_number
+
+// An empty `ndk/` is an install that was started and did not finish, which is a different sentence
+// from having no `ndk/` at all.
+@test("an empty ndk directory is an unfinished install rather than a missing one")
+an_empty_ndk_directory_says_so()
+    val sdk = make_temp_dir("sysl-android-sdk").unwrap()
+
+    make_dir_all(s"$sdk/ndk").unwrap()
+
+    val said = android_clang_in(None, Some(sdk)).unwrap_err()
+
+    assert(said.contains("did not finish"), s"an empty 'ndk' is not reported as one: $said")
+
+    remove_dir_all(sdk).unwrap()
+end an_empty_ndk_directory_says_so
