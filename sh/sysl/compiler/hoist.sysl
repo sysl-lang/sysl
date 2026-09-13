@@ -176,6 +176,27 @@ hoist_units(a: &Analysis, units: Buf[Program])
             register_predicate(a, scopes.at(i), body.at(j))
 end hoist_units
 
+// What a trait's members may not carry a body for.
+//
+// **An ASSOCIATED FUNCTION may carry a default, exactly as a method may** -- a body with no receiver
+// still has something to work on, a constant or a `Self.other()`, and every implementation
+// inheriting one value is the reason a default *works* rather than an objection to one.
+//
+// What is refused is a **static property**, and its reason is its own: a property has no parameter
+// list and no receiver, so a default there is a value with nothing available to vary it. An
+// implementation could only take it or replace it whole, and a trait is the wrong place to write a
+// constant every type shares.
+private check_trait_defaults(a: &Analysis, scope: Scope, d: TraitDecl)
+    for i in 0..<d.methods.len()
+        val m = d.methods.at(i)
+
+        if m.recv_mode().is_none() && m.is_static && !m.body.is_empty()
+            a.fault(scope, m.span,
+                    s"'${d.name}.${m.name}' is a property of the type, so a default body would " +
+                    "give every implementation the same value — drop the body and let each one " +
+                    "supply it")
+end check_trait_defaults
+
 // Registers one top-level declaration.
 hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
     *s.kind match
@@ -188,6 +209,7 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         TraitDecl(d) ->
             hoist_type_name(a, scope, s.span, d.name, d.vis,
                             TraitOf(with_trait_call_bounds(d)))
+            check_trait_defaults(a, scope, d)
         TypeDecl(d) -> hoist_type_name(a, scope, s.span, d.name, d.vis, TypeOf(d))
         CTypeBlock(ts) ->
             for i in 0..<ts.len()
