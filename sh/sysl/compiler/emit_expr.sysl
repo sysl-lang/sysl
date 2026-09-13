@@ -1023,12 +1023,16 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
         return gen_foreign_call(e, CallForm(form.ret, form.ret_attrs, variadic_type_of(e, name)),
                                 VGlobal(symbol_of(e, name)), args, ty)
 
-    if is_variadic(e, name) then return gap_at(e, "a call to a variadic function")
-
     var arg_vals: Buf[IrArg] = buf()
 
     for i in 0..<args.len()
         arg_value(e, args.at(i), &arg_vals)
+
+    // A sysl definition's tail is named the way a foreign one's is: by the callee's whole function
+    // type, since the argument list alone does not say where the declared parameters stop.
+    if is_variadic(e, name) then
+        return gen_sysl_call_at(e, VGlobal(symbol_of(e, name)), arg_vals, ty,
+                                variadic_type_of(e, name))
 
     gen_sysl_call(e, VGlobal(symbol_of(e, name)), arg_vals, ty)
 end gen_call
@@ -1049,13 +1053,21 @@ end arg_value
 
 // Emits a call from sysl to sysl and hands back the register holding its result.
 gen_sysl_call(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type) -> Val =
-    gen_sysl_call_into(e, callee, arg_vals, ty, None)
+    gen_sysl_call_into(e, callee, arg_vals, ty, None, None)
+
+// The same, where the callee's parameter list is open at the end. **A variadic call names the whole
+// function type**, since the argument list alone does not say where the declared parameters stop and
+// the ellipsis begins -- and a call written without it is a call to a function of a different type.
+gen_sysl_call_at(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type,
+                 fnty: Option[IrFnType]) -> Val =
+    gen_sysl_call_into(e, callee, arg_vals, ty, None, fnty)
 
 // The same, where the caller has storage a **large** result is to land in -- its own, named in front
 // of every argument, so the value is never an LLVM value at either end. A caller with nowhere to put
 // one makes a slot here and reads the value back out of it, which is correct and is exactly the
 // shape `gen_into` exists to save the callers that *do* have somewhere.
-gen_sysl_call_into(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type, dest: Option[Val]) -> Val
+gen_sysl_call_into(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type, dest: Option[Val],
+                   fnty: Option[IrFnType]) -> Val
     if e.layout.indirect(ty)
         val slot = if dest.is_some() then dest.unwrap() else alloca(e, fresh_reg(e), lty(e, ty))
 
@@ -1066,7 +1078,7 @@ gen_sysl_call_into(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type, dest: 
         for i in 0..<arg_vals.len()
             all.push(arg_vals.at(i))
 
-        emit(e, InCall(None, LVoid, callee, all, no_ir_attrs(), None, no_fast_math(), false))
+        emit(e, InCall(None, LVoid, callee, all, no_ir_attrs(), fnty, no_fast_math(), false))
 
         if dest.is_some() then return VNothing
 
@@ -1076,7 +1088,7 @@ gen_sysl_call_into(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type, dest: 
         return own_temp(e, r, ty)
 
     if no_value(ty)
-        emit(e, InCall(None, LVoid, callee, arg_vals, no_ir_attrs(), None, no_fast_math(), false))
+        emit(e, InCall(None, LVoid, callee, arg_vals, no_ir_attrs(), fnty, no_fast_math(), false))
 
         if ty == Never then emit_term(e, InUnreachable)
 
@@ -1084,7 +1096,7 @@ gen_sysl_call_into(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type, dest: 
 
     val r = fresh_reg(e)
 
-    emit(e, InCall(Some(r), lty(e, ty), callee, arg_vals, c_extension(ty, e.target), None,
+    emit(e, InCall(Some(r), lty(e, ty), callee, arg_vals, c_extension(ty, e.target), fnty,
                    no_fast_math(), false))
     own_temp(e, r, ty)
 end gen_sysl_call_into

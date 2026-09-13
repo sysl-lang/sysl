@@ -1182,7 +1182,7 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
     // A generic call works its type arguments out from what it supplies, makes the instantiation
     // real, and checks the arguments against the signature that instantiation has.
     if !f.decl.tparams.is_empty() then
-        return generic_call(cx, span, shown, key, f, args, expected, report)
+        return generic_call(cx, span, shown, key, f, args, expected, report, buf())
 
     val bound = bind_arguments(cx, span, shown, f, args, report)
 
@@ -1221,6 +1221,12 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
                 inner.reported = Some(span)
                 inner.here_src = caller_source(cx)
                 ts.push(type_expr(inner, p.default.unwrap(), Some(want)))
+
+    // The tail of a variadic definition, which no parameter names: the body reads it with `va_arg`,
+    // so each argument is analyzed at whatever type it has and nothing here checks it against one.
+    if f.decl.variadic
+        for i in slots.len()..<args.len()
+            ts.push(type_expr_bare(cx, args.at(i)))
 
     val ret = declared_result(cx, f.scope, f.decl.ret_type)
 
@@ -1278,7 +1284,9 @@ bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, written_args
     for i in 0..<params.len()
         if slots.at(i).is_none() && params.at(i).default.is_none() then missing += 1
 
-    if missing > 0 || extra > 0
+    // A variadic definition reads whatever follows its parameters through `va_start`, so arguments
+    // past the last one are its tail rather than a miscount.
+    if missing > 0 || (extra > 0 && !f.decl.variadic)
         if report then
             cx.fault(span, arity_refusal(s"function '$written'", params, args, slots, named_seen,
                                          extra))
@@ -1342,17 +1350,18 @@ pack_rest(cx: &Analyzer, shown: string, params: Buf[Param], args: Buf[Expr],
                          "arguments are positional — a name picks out one parameter and this one " +
                          "takes as many as are left")
 
-    if positional.len() < usize(rest_at) then return args
-
+    // A call that gave every fixed parameter by name has left nothing positional at all, and still
+    // means the empty tail -- so the split is taken at whichever of the two comes first.
+    val fixed = if positional.len() < usize(rest_at) then positional.len() else usize(rest_at)
     var tail: Buf[Expr] = buf()
 
-    for i in usize(rest_at)..<positional.len()
+    for i in fixed..<positional.len()
         tail.push(positional.at(i))
 
     val packed = packed_tail(cx, rest, tail, report)
     var out: Buf[Expr] = buf()
 
-    for i in 0..<usize(rest_at)
+    for i in 0..<fixed
         out.push(positional.at(i))
 
     for i in 0..<named.len()
@@ -1373,12 +1382,19 @@ private packed_tail(cx: &Analyzer, rest: Param, tail: Buf[Expr], report: bool) -
             _ -> ()
     end if
 
-    if report
-        for i in 0..<tail.len()
-            if is_spread(tail.at(i)) then
-                cx.fault(tail.at(i).span, s"'...' hands the whole of '${rest.name}' over, so it is " +
-                         "the only argument there — a slice and a value cannot both be part of one " +
-                         "tail")
+    // **A spread among several is answered with the spread alone**, so what follows reads one slice
+    // rather than an array literal of a value and a view -- whose own complaint about two element
+    // types would arrive first and name neither the tail nor the parameter.
+    for i in 0..<tail.len()
+        if is_spread(tail.at(i))
+            if report then
+                cx.fault(tail.at(i).span, s"'...' hands the whole of '${rest.name}' over, so it " +
+                         "is the only argument there — a slice and a value cannot both be part " +
+                         "of one tail")
+
+            *tail.at(i).kind match
+                Spread(v) -> return v
+                _ -> ()
 
     val at = if tail.is_empty() then rest.span else tail.at(0).span
     val lit = expr(at, ArrayLit(tail))

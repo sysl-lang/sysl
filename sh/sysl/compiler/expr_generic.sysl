@@ -28,7 +28,8 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
     for i in 0..<keys.len()
         val f = cx.an.tables.funcs.get(keys.at(i))
 
-        if f.is_some() && f.unwrap().decl.tparams.len() == targ_exprs.len() then key = keys.at(i)
+        if f.is_some() && authored_tparams(f.unwrap().decl.tparams).len() == targ_exprs.len() then
+            key = keys.at(i)
 
     val f = cx.an.tables.funcs.get(key).unwrap()
     val decl = f.decl
@@ -37,14 +38,29 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
         return cx.err(span, s"'$written' is not generic, so it has no type arguments to write — " +
                       s"the call is '$written(…)'")
 
-    if decl.tparams.len() != targ_exprs.len() then
-        return cx.err(span, s"'$written' takes ${quantity(decl.tparams.len(), "type argument")}, " +
+    val authored = authored_tparams(decl.tparams)
+
+    if authored.len() != targ_exprs.len() then
+        return cx.err(span, s"'$written' takes ${quantity(authored.len(), "type argument")}, " +
                       s"but ${supplied_phrase(targ_exprs.len(), "type argument")}")
 
     var targs: Buf[Type] = buf()
 
     for i in 0..<targ_exprs.len()
         targs.push(written_type_arg(cx, targ_exprs.at(i)))
+
+    // **Where the declaration also carries the bare arrow's own parameters, the written ones are
+    // answered and the rest are solved from the arguments** -- which is the whole of what an
+    // explicit list is for on such a declaration, since a closure's type is one no program can
+    // write and inference is the only thing that ever settles it.
+    if authored.len() != decl.tparams.len()
+        var known: Buf[Binding] = buf()
+
+        for i in 0..<authored.len()
+            known.push(Binding(authored.at(i), targs.at(i)))
+
+        return generic_call(cx, span, written, key, f, args, expected, true, known)
+    end if
 
     // **A BOUND IS RESOLVED WHERE IT WAS WRITTEN, WHICH IS THE DECLARATION'S SCOPE AND NOT THE
     // CALLER'S.** `sysl.math.is_power_of_two[T: Bits + Ord]` writes `Bits` bare, and a caller that
@@ -205,7 +221,7 @@ end applied_type_arg
 
 // One call to a generic function.
 generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, args: Buf[Expr],
-             expected: Option[Type], report: bool) -> TExpr
+             expected: Option[Type], report: bool, known: Buf[Binding]) -> TExpr
     val bound = bind_arguments(cx, span, written, f, args, report)
 
     if bound.is_none() then return bad_expr(span)
@@ -239,7 +255,7 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
         param_refs.push(decl.params.at(i).typ)
 
     val targs = solve(cx.an, f.scope, span, key, decl.tparams, param_refs, prov.tys, decl.ret_type,
-                      expected, prov.soft, decl.bounds, buf())
+                      expected, prov.soft, decl.bounds, known)
 
     if !report
         for i in 0..<targs.len()

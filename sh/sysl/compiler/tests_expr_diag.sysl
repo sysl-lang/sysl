@@ -432,3 +432,45 @@ what_a_run_and_a_select_are_read_off()
     assert_eq(only("f(v: <4>f32, b: <4>f32) -> f32\n    val s: <4>f32 = v.select(b, b)\n\n    s[0]\n"),
               "'select' chooses between two vectors lane by lane, so it is read off a mask — the " +
                   "'<4>bool' a comparison yields, as in '(a < b).select(a, b)'. <4>f32 is not one")
+
+// **`xs: ...T` collects the rest of the call**, so a call writing three values where the declaration
+// writes one parameter is not a miscount; a call that supplies nothing for it gets the empty slice,
+// and `ys...` hands an existing slice straight through rather than making a slice of one slice.
+@test("a rest parameter takes as many arguments as are left, however many that is")
+a_rest_parameter_collects_the_call()
+    assert_eq(count("total(xs: ...int) -> usize = xs.len\n\nf() -> usize = total(1, 2, 3)\n"), 0)
+    assert_eq(count("total(xs: ...int) -> usize = xs.len\n\nf() -> usize = total()\n"), 0)
+    assert_eq(count("total(xs: ...int) -> usize = xs.len\n\n" +
+                    "f(ys: []const int) -> usize = total(ys...)\n"), 0)
+    assert_eq(count("label(tag: string, xs: ...int) -> usize = xs.len\n\n" +
+                    "f() -> usize = label(tag = \"none\")\n"), 0)
+
+// A spread is a word about a parameter that collects, a name picks out one parameter where this one
+// takes as many as are left, and a slice and a value cannot both be part of one tail.
+@test("the three ways a rest parameter is written wrongly are each named")
+a_rest_parameter_written_wrongly()
+    assert_eq(only("plain(a: int) -> int = a\n\nf(ys: []const int) -> int = plain(ys...)\n"),
+              "'...' says this argument is already the slice a '...T' parameter collects, and " +
+                  "function 'plain' has no such parameter")
+    assert_eq(only("total(xs: ...int) -> usize = xs.len\n\n" +
+                   "f(ys: []const int) -> usize = total(1, ys...)\n"),
+              "'...' hands the whole of 'xs' over, so it is the only argument there — a slice and " +
+                  "a value cannot both be part of one tail")
+    assert_eq(only("label(tag: string, xs: ...int) -> usize = xs.len\n\n" +
+                   "f() -> usize = label(\"a\", xs = 1)\n"),
+              "'xs' collects the rest of the call, so its arguments are positional — a name picks " +
+                  "out one parameter and this one takes as many as are left")
+
+// **A written type-argument list fills the parameters the declaration WROTE.** A bare-arrow
+// parameter adds one of its own, whose argument is the closure's anonymous type and which no list
+// could name, so a list that answered it would be a different arity from the declaration a reader
+// can see.
+@test("a written type-argument list answers the parameters that were written, not the sugar's own")
+a_written_list_over_a_bare_arrow()
+    if diag_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return
+    end if
+
+    assert_eq(beside_library("chain[A, B](x: int, f: int -> A, g: A -> B) -> B = g(f(x))\n\n" +
+                             "print(chain[int, int](3, n -> n * 2, n -> n + 1))\n"), "")
