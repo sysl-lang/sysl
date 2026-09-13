@@ -454,9 +454,10 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
 
     AsmStmt(arms) -> one_stmt(type_asm(cx, stmt.span, arms))
 
-    // An import binds a name for the statements after it and emits nothing. A block-scoped import
-    // is the declaration pass's to record, so what is left here is the empty statement it lowers to.
-    ImportDecl(_) -> one_stmt(TExprStmt(TExpr(stmt.span, TUnitLit)))
+    // An import binds a name for the statements after it and emits nothing. The declaration pass
+    // reads a **file's** imports, which is every one written at the top of it; one written inside a
+    // body is this walk's to bind, and the scope it was written in gives it back at the dedent.
+    ImportDecl(d) -> one_stmt(block_import(cx, stmt.span, d))
 
     // A `const` written at the top of a file is folded into its uses before anything runs, so it
     // never reaches the statement walk. One that reaches here was written **inside a body**, where
@@ -711,6 +712,38 @@ end returned_value
 
 // `become f(…)` -- `return f(…)` with the jump guaranteed. What is settled here is that there is a
 // call at all; whether the frame can be replaced needs the whole program and is a later pass.
+// An `import` written inside a body: bound for the statements after it, held to the same reach as
+// one at the top of the file, and lowered to nothing.
+//
+// **The refusal is here rather than at the use**, exactly as the file-level one is: the clause is
+// the mistake, and it is the line a reader has to change.
+private block_import(cx: &Analyzer, span: Span, d: ImportDecl) -> TStmt
+    val written = joined(d.path, ".")
+    val path = in_package(cx.an, cx.scope.pkg, written)
+
+    if !cx.an.tables.has_module(path) && d.selectors.is_empty() && !d.wildcard
+        val cut = last_dot_in(path)
+
+        if cut.is_some()
+            val named = module_qualify(path[0..<cut.unwrap()],
+                                       path[(cut.unwrap() + 1)..<path.bytes.len])
+
+            if declares(cx.an, named) && !reachable_key(cx.an, named, cx.scope)
+                cx.fault(span, out_of_reach(cx.an, named))
+                return TExprStmt(TExpr(span, TUnitLit))
+    end if
+
+    for i in 0..<d.selectors.len()
+        val sel = d.selectors.at(i)
+        val key = module_qualify(path, sel.name)
+
+        if declares(cx.an, key) && !reachable_key(cx.an, key, cx.scope)
+            cx.fault(sel.span, out_of_reach(cx.an, key))
+
+    bind_block_import(&cx.scope.imports, path, d)
+    TExprStmt(TExpr(span, TUnitLit))
+end block_import
+
 private become_stmt(cx: &Analyzer, span: Span, call: Expr) -> Buf[TStmt]
     val want = cx.ret_ty.unwrap_or(Unit)
     val t = type_expr(cx, call, Some(want))

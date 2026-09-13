@@ -538,3 +538,174 @@ a_declaration_whose_scope_named_nothing_still_stands()
 
     assert(!out.contains("undefined function 'scale'"), out)
 end a_declaration_whose_scope_named_nothing_still_stands
+
+// -- every declaration form takes one ---------------------------------------------------------------
+
+@test("a struct")
+a_private_struct_is_out_of_reach()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "var p: geom.Point = geom.Point(1, 2)\nprint(p.x)\n"),
+                       ("g.sysl", "module geom\nprivate struct Point\n    x: int\n    y: int\n")])
+
+    assert(out.contains("'geom.Point' is private to 'g.sysl'"), out)
+end a_private_struct_is_out_of_reach
+
+@test("an enum")
+a_private_enum_is_out_of_reach()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "var s: geom.Shape = geom.Shape.Dot\nprint(1)\n"),
+                       ("g.sysl", "module geom\nprivate enum Shape\n    Dot\n    Round\n")])
+
+    assert(out.contains("'geom.Shape' is private to 'g.sysl'"), out)
+end a_private_enum_is_out_of_reach
+
+@test("and its variants with it")
+a_private_enums_variants_go_with_it()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "import geom.Dot\nprint(1)\n"),
+                       ("g.sysl", "module geom\nprivate enum Shape\n    Dot\n    Round\n")])
+
+    assert(out.contains("'geom.Dot' is private to 'g.sysl'"), out)
+end a_private_enums_variants_go_with_it
+
+@test("a trait")
+a_private_trait_is_out_of_reach()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "loud[T: geom.Show](x: T) -> int = x.show()\nprint(1)\n"),
+                       ("g.sysl", "module geom\nprivate trait Show\n    show(self) -> int\n")])
+
+    assert(out.contains("'geom.Show' is private to 'g.sysl'"), out)
+end a_private_trait_is_out_of_reach
+
+@test("an extern")
+a_private_extern_is_out_of_reach()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(geom.abs(0 - 3))\n"),
+                       ("g.sysl", "module geom\nprivate extern abs(n: int) -> int\n")])
+
+    assert(out.contains("'geom.abs' is private to 'g.sysl'"), out)
+end a_private_extern_is_out_of_reach
+
+@test("a function")
+a_private_function_is_out_of_reach()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(geom.scale(21))\n"), ("g.sysl", vis_hidden())])
+
+    assert(out.contains("'geom.scale' is private"), out)
+end a_private_function_is_out_of_reach
+
+// The exception has a reason of its own, so the refusal carries the reason rather than the
+// grammar's complaint that the modifier was not followed by a name. It is the same refusal the
+// members *inside* an `impl` already get.
+@test("and an 'impl' does not, having no name for one to restrict")
+an_impl_carries_no_visibility_of_its_own()
+    if vis_no_library() then return
+
+    val rest = "impl Show for P\n    show(self) -> int = self.v\n\nprint(P(1).show())\n"
+    val head = "trait Show\n    show(self) -> int\n\nstruct P\n    v: int\n\n"
+    val out = vis_err([("main.sysl", s"${head}private $rest")])
+
+    assert(out.contains("an 'impl' block carries no visibility of its own"), out)
+    assert(!out.contains("identifier expected"), out)
+
+    val scoped = vis_err([("main.sysl", s"${head}private[geom] $rest")])
+
+    assert(scoped.contains("an 'impl' block carries no visibility of its own"), scoped)
+end an_impl_carries_no_visibility_of_its_own
+
+// -- what a restriction does not touch ---------------------------------------------------------------
+
+// An import binds a shorter spelling; visibility decides what may be spelled at all. A public
+// wrapper over a private helper is the whole point of the level, and it keeps working.
+@test("a public wrapper reaches its own module's private helper")
+a_public_wrapper_reaches_its_modules_private_helper()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "import geom.twice\nprint(twice(21))\n"),
+                       ("geom/g.sysl", vis_hidden())]), "42\n")
+
+@test("a private type is still a type its own file may use")
+a_private_type_is_still_a_type_its_own_file_may_use()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.area())\n"),
+                       ("geom/g.sysl",
+                        "module geom\nprivate struct Point\n    x: int\n    y: int\n" +
+                        "area() -> int = Point(3, 4).x * Point(3, 4).y\n")]), "12\n")
+
+@test("a private trait may still be implemented and used inside its file")
+a_private_trait_may_be_implemented_inside_its_file()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.go())\n"),
+                       ("geom/g.sysl",
+                        "module geom\nprivate trait Show\n    show(self) -> int\nstruct Tag\n    n: int\n" +
+                        "impl Show for Tag\n    show(self) -> int = self.n * 2\n" +
+                        "go() -> int = Tag(5).show()\n")]), "10\n")
+
+@test("an import inside a block is held to the same rule")
+an_import_inside_a_block_is_held_to_the_same_rule()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "f() -> int =\n    import geom.scale\n    scale(21)\nprint(f())\n"),
+                       ("g.sysl", vis_hidden())])
+
+    assert(out.contains("'geom.scale' is private to 'g.sysl', the file that declares it"), out)
+end an_import_inside_a_block_is_held_to_the_same_rule
+
+// -- a name a file cannot reach does not stand in the way of one it can -------------------------------
+
+// A name a file may not reach is not a candidate for it, so resolution goes on past it rather than
+// stopping there. Only where nothing else answers at all does the restriction get reported -- at
+// which point it is the whole story, and a better one than an undefined name.
+
+@test("an explicit import beats a sibling file's private declaration of the same name")
+an_explicit_import_beats_a_siblings_private_declaration()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.go())\n"),
+                       ("geom/g.sysl", "module geom\nprivate width(n: int) -> int = n * 2\n"),
+                       ("geom/h.sysl", "module geom\nimport text.width\ngo() -> int = width(21)\n"),
+                       ("text/t.sysl", "module text\nwidth(n: int) -> int = n + 1\n")]), "22\n")
+
+@test("a wildcard does too")
+a_wildcard_beats_a_siblings_private_declaration()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.go())\n"),
+                       ("geom/g.sysl", "module geom\nprivate width(n: int) -> int = n * 2\n"),
+                       ("geom/h.sysl", "module geom\nimport text.*\ngo() -> int = width(21)\n"),
+                       ("text/t.sysl", "module text\nwidth(n: int) -> int = n + 1\n")]), "22\n")
+
+@test("and so does one written inside a block")
+an_import_inside_a_block_beats_it_too()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.go())\n"),
+                       ("geom/g.sysl", "module geom\nprivate width(n: int) -> int = n * 2\n"),
+                       ("geom/h.sysl",
+                        "module geom\ngo() -> int =\n    import text.width\n    width(21)\n"),
+                       ("text/t.sysl", "module text\nwidth(n: int) -> int = n + 1\n")]), "22\n")
+
+@test("the library still answers where only a private declaration would have")
+the_library_answers_where_only_a_private_declaration_would_have()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.go())\n"),
+                       ("geom/g.sysl", "module geom\nprivate print(n: int) -> int = n\n"),
+                       ("geom/h.sysl", "module geom\ngo() -> int =\n    print(9)\n    1\n")]), "9\n1\n")
+
+@test("while the declaring file goes on getting its own")
+the_declaring_file_goes_on_getting_its_own()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.go())\n"),
+                       ("geom/g.sysl",
+                        "module geom\nprivate width(n: int) -> int = n * 2\ngo() -> int = width(21)\n"),
+                       ("text/t.sysl", "module text\nwidth(n: int) -> int = n + 1\n")]), "42\n")
