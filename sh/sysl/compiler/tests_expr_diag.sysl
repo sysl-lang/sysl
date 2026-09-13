@@ -338,3 +338,57 @@ an_associated_call_nothing_settles()
 @test("a type parameter in call position is a conversion, as a written type name is")
 converting_to_a_type_parameter()
     assert_eq(count("f[T](n: usize) -> T = T(n)\n"), 0)
+
+// -- a callee that is not the caller's own -----------------------------------------------------
+
+// The standard module's own trees, read once: a refusal naming a LIBRARY function is the one shape
+// a single-file source cannot produce, every function it declares being the caller's own.
+private var diag_library_cache: Buf[Program] = buf()
+private var diag_library_read: bool = false
+
+private diag_library() -> Buf[Program]
+    if diag_library_read then return diag_library_cache
+
+    diag_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> diag_library_cache = units
+
+    diag_library_cache
+end diag_library
+
+// The first thing the body pass had to say about a source compiled beside the library.
+private beside_library(text: string) -> string
+    var units: Buf[Program] = buf()
+    val library = diag_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parse(source_of("test.sysl", text)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if done.reported.is_empty() then return ""
+
+    done.reported.at(0).diag.message
+end beside_library
+
+// **The auto-import is what makes this necessary.** Every module below the standard one is offered
+// to every file, so the bare `from_utf8` a caller writes says nothing about which module answered --
+// and a reader handed the bare name has nowhere to go and read the signature the refusal is about.
+// The reference quotes the declaration, `sysl.text.from_utf8`, and this compiler quoted the
+// spelling; `sysl.sh`'s `library/text.md` is where the two disagreed.
+@test("a refusal about a library function names the module that declares it")
+a_library_callee_is_named_by_its_module()
+    if diag_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return
+    end if
+
+    assert_eq(beside_library("import sysl.text.from_utf8\n\nprint(from_utf8(\"hi\").unwrap())\n"),
+              "'b' of 'sysl.text.from_utf8' is []const byte, but string was given")
+end a_library_callee_is_named_by_its_module
