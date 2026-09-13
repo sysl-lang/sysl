@@ -122,6 +122,14 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
             return provided
         end if
 
+        // An enum's variants are reached through the type by the very spelling an associated
+        // function is, so a name that is neither is told about both rather than about half of what
+        // it could have been.
+        underlying(ty) match
+            Enum(_) -> return Some(cx.err(span, s"enum '${module_show(found.0)}' has no variant or " +
+                                          s"associated function '$name'"))
+            _ -> ()
+
         return Some(cx.err(span, s"type '${module_show(found.0)}' has no associated function " +
                            s"'$name'"))
     end if
@@ -961,7 +969,14 @@ private no_such_member(cx: &Analyzer, span: Span, rty: Type, base: string, name:
 
     if provided.is_some() then return provided.unwrap()
 
-    cx.err(span, s"'${module_show(base)}' has no field or property '$name'")
+    // What the reader is told turns on what the thing left of the dot could have had. A struct has
+    // fields and properties, an enum only properties, and a type with neither has no field of any
+    // name for the read to have missed -- so that one is told what it tried to read and of what,
+    // there being no declaration to name.
+    underlying(rty) match
+        Struct(_) -> cx.err(span, s"'${module_show(base)}' has no field or property '$name'")
+        Enum(_) -> cx.err(span, s"'${module_show(base)}' has no property '$name'")
+        _ -> cx.err(span, s"cannot read field '$name' of ${type_show(rty)}")
 end no_such_member
 
 private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, base: string,

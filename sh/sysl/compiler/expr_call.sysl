@@ -303,7 +303,12 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
 
         val v = variant_of(cx, name, expected)
 
-        if v.is_some() then return variant_call(cx, span, v.unwrap().0, v.unwrap().1, args)
+        if v.is_some()
+            val clash = ambiguous_variant(cx, span, name, expected)
+
+            if clash.is_some() then return clash.unwrap()
+
+            return variant_call(cx, span, v.unwrap().0, v.unwrap().1, args)
 
     // A local holding a callable is called through it, and it wins over a declaration of the same
     // name for the reason the nearest binding always does.
@@ -691,8 +696,13 @@ private enum_cast(cx: &Analyzer, span: Span, key: string, written: string,
                   args: Buf[Expr]) -> TExpr
     val inst = cx.an.tables.enum_insts.get(instance_key(key, buf()))
 
+    // A generic enum has no instantiation under an empty argument list, and the cast is a conversion
+    // into the storage the variants are laid in -- which the type arguments are part of choosing. So
+    // there is no one integer type for the name to convert into, and the reader is told that rather
+    // than told the name is uncallable.
     if inst.is_none() then
-        return cx.err(span, s"'$written' takes type arguments, and inferring them is not built yet")
+        return cx.err(span, s"'$written' is generic, so it has no single underlying integer type " +
+                      "to convert")
 
     val en = inst.unwrap()
 
@@ -703,11 +713,22 @@ private enum_cast(cx: &Analyzer, span: Span, key: string, written: string,
                               s"'${module_show(key)}' carries data")
 
             if args.len() != 1 then
-                return cx.err(span, s"a conversion to '$written' takes one value, and " +
-                              s"${quantity(args.len(), "argument")} " +
-                              s"${if args.len() == 1 then "was" else "were"} given")
+                return cx.err(span, s"'$written' takes exactly one integer argument")
 
-            TExpr(span, TEnumFromInt(type_expr(cx, args.at(0), Some(d.underlying)), en))
+            val v = type_expr(cx, args.at(0), Some(d.underlying))
+            val vt = texpr_type(v)
+
+            if vt == Unknown then return bad_expr(span)
+
+            // The cast reads a number and checks it against the variants, so a value that is not a
+            // number leaves it nothing to read. Without this the lowering stored the value into the
+            // enum's integer whatever it was, and clang refused the store rather than the program.
+            underlying(vt) match
+                Integer(_, _, _) -> ()
+                _ -> return cx.err(span, s"'$written' converts an integer, but the value has type " +
+                                   type_show(vt))
+
+            TExpr(span, TEnumFromInt(v, en))
         _ -> bad_expr(span)
 end enum_cast
 
@@ -780,6 +801,14 @@ end constrained_call
 // A variant with what it carries.
 private variant_call(cx: &Analyzer, span: Span, en: Type, v: EnumVariant,
                      args: Buf[Expr]) -> TExpr
+    // A variant that carries nothing is a name, not a call, so the mistake is the parentheses rather
+    // than the count inside them -- and saying "has 0 fields" would be answering a question about an
+    // arity the reader was never choosing. An empty pair is left alone: it names the variant.
+    if v.fields.is_empty() && !args.is_empty() then
+        return cx.err(span, s"variant '${v.name}' carries nothing, so it is written as a name on " +
+                      s"its own — drop the parentheses and the ${quantity(args.len(), "argument")} " +
+                      "inside them")
+
     if args.len() != v.fields.len() then
         return cx.err(span, s"variant '${v.name}' has ${quantity(v.fields.len(), "field")}, but " +
                       s"${quantity(args.len(), "value")} " +

@@ -626,6 +626,10 @@ variant_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) ->
     if found.is_none() then
         return cx.err(span, s"undefined name '${module_show(module_qualify(cx.scope.module_name, name))}'")
 
+    val clash = ambiguous_variant(cx, span, name, expected)
+
+    if clash.is_some() then return clash.unwrap()
+
     val (en, v) = found.unwrap()
 
     if v.carries then
@@ -674,6 +678,51 @@ variant_of(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[(Type,
 
     found
 end variant_of
+
+// The enums in scope that declare a variant of this name, by DECLARATION rather than by
+// instantiation -- `Option[int]` and `Option[string]` are one answer, since the question is which
+// enum was meant and not which of its instantiations.
+variant_homes(cx: &Analyzer, name: string) -> Buf[string]
+    var homes: Buf[string] = buf()
+
+    for i in 0..<cx.an.tables.enum_insts.len()
+        cx.an.tables.enum_insts.at(i) match
+            Enum(d) ->
+                if reachable_key(cx.an, d.base, cx.scope) && visible_here(cx, d.base) &&
+                        d.variant(name).is_some() && !holds_string(homes, d.base) then
+                    homes.push(d.base)
+            _ -> ()
+
+    homes
+end variant_homes
+
+// `'A'`, then `'A' and 'B'`, then `'A', 'B' and 'C'` -- a series a sentence can carry, with no comma
+// before the `and`.
+private named_series(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out += if i == names.len() - 1 then " and " else ", "
+
+        out += s"'${module_show(names.at(i))}'"
+
+    out
+end named_series
+
+// The refusal a bare variant name earns where more than one enum in scope declares it and nothing
+// here chose between them. Picking the first registered would make what the line means depend on
+// which file happened to name an enum first, which is not something a reader can see.
+ambiguous_variant(cx: &Analyzer, span: Span, name: string,
+                  expected: Option[Type]) -> Option[TExpr]
+    if variant_from_expected(cx, name, expected).is_some() then return None
+
+    val homes = variant_homes(cx, name)
+
+    if homes.len() < 2 then return None
+
+    Some(cx.err(span, s"'$name' is a variant of ${named_series(homes)}, and nothing here says " +
+                s"which — qualify it, as '${module_show(homes.at(0))}.$name'"))
+end ambiguous_variant
 
 // The type parameter a bare variant name leaves open, where the enum declaring it is generic and
 // nothing here settles it.
