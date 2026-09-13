@@ -26,6 +26,13 @@ field_expr(cx: &Analyzer, span: Span, receiver: Expr, name: string,
 
     if on_type.is_some() then return on_type.unwrap()
 
+    // A bare variant reached through the **module** that declares it rather than through its enum --
+    // `inflate.BadBlock`, which is the one spelling available to a file that imported the module and
+    // not the name.
+    val in_module = module_variant(cx, span, receiver, name)
+
+    if in_module.is_some() then return in_module.unwrap()
+
     val outer = type_expr_bare(cx, receiver)
 
     if texpr_type(outer) == Unknown then return outer
@@ -184,9 +191,7 @@ end field_visible
 // can do least with. Each arm below names the member instead and says where it is reached from.
 private type_member(cx: &Analyzer, span: Span, receiver: Expr, name: string,
                     expected: Option[Type]) -> Option[TExpr]
-    val written = *receiver.kind match
-        Ident(n) -> if cx.lookup(n).is_none() then Some(n) else None
-        _ -> None
+    val written = dotted_name_written(cx, receiver)
 
     if written.is_none() then return None
 
@@ -445,6 +450,58 @@ private module_key_of(cx: &Analyzer, written: string) -> string =
 private module_path(receiver: Expr, name: string) -> Option[string] = *receiver.kind match
     Ident(head) -> Some(s"$head.$name")
     Field(inner, mid) -> module_path(inner, mid).map(head -> s"$head.$name")
+    _ -> None
+
+// A bare variant reached through the module that declares it. A file that wrote `import <module>`
+// bound the module's own name and none of the names in it, so `inflate.BadBlock` is the whole of
+// what it can write -- the enum need not be named, and often is not exported under a name worth
+// writing.
+//
+// The module says which enum is meant, so the variant is read against that instantiation rather
+// than against whatever the position expected.
+private module_variant(cx: &Analyzer, span: Span, receiver: Expr, name: string) -> Option[TExpr]
+    val head = dotted_name_written(cx, receiver)
+
+    if head.is_none() then return None
+
+    val owner = module_owner(cx, head.unwrap())
+
+    if owner.is_none() then return None
+
+    for i in 0..<cx.an.tables.enum_insts.len()
+        val t = cx.an.tables.enum_insts.at(i)
+
+        t match
+            Enum(d) ->
+                if module_of(d.base) == owner.unwrap() && reachable_key(cx.an, d.base, cx.scope) &&
+                        d.variant(name).is_some() then
+                    return Some(variant_expr(cx, span, name, Some(t)))
+            _ -> ()
+
+    None
+end module_variant
+
+// The module a written head names: the one an import bound the name to, or the path itself read
+// through the package the file sits in. Nothing where no module answers to it.
+private module_owner(cx: &Analyzer, head: string) -> Option[string]
+    val bound = cx.scope.imports.module_as(head)
+
+    if bound.is_some() && cx.an.tables.has_module(bound.unwrap()) then return bound
+
+    val here = in_package(cx.an, cx.scope.pkg, head)
+
+    if cx.an.tables.has_module(here) then Some(here) else None
+end module_owner
+
+// A `Field` chain that spells a dotted path, where nothing binds its head as a value -- a value of
+// that name is a member read and never a path.
+//
+// **A dotted path is one name to the type grammar**, so `sdl3.PixelFormat` names a type the way
+// `PixelFormat` does; a file that wrote `import <module>` bound the module's name and none of the
+// names in it, so this is the only spelling it has for them.
+dotted_name_written(cx: &Analyzer, e: Expr) -> Option[string] = *e.kind match
+    Ident(head) -> if cx.lookup(head).is_none() then Some(head) else None
+    Field(inner, name) -> dotted_name_written(cx, inner).map(head -> s"$head.$name")
     _ -> None
 
 // **What a type declares of its own is looked up through `lookup_trait_member`**, which reads the
