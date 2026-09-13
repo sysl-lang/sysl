@@ -53,14 +53,24 @@ enum_membership(e: *Emit, en: Type, vt: Type, v: Val) -> Val
 
     val vs = d.unwrap().variants
     val wide = convert(e, vt, Integer(64, signed, false), v)
-    var any = VBool(false)
+
+    // **EVERY COMPARISON IS MADE BEFORE ANY OF THEM IS FOLDED**, which is the same rule an array
+    // literal and a bitfield struct are written to: the operands come first and the chain that
+    // collects them second. Interleaving them numbers the registers differently -- the reference's
+    // third `icmp` is `%t5` and the first `or` is `%t6`, where a fold as you go makes them `%t6` and
+    // `%t5` -- so the body is a mismatch in the differential sweep and identical as a program.
+    var eqs: Buf[Val] = buf()
 
     for i in 0..<vs.len()
         val eq = fresh_reg(e)
 
         emit(e, InIntCmp(eq, IEq, LInt(64), wide, VInt(from_int(long(vs.at(i).tag)))))
+        eqs.push(eq)
 
-        any = if i == 0 then eq else or_i1(e, any, eq)
+    var any = VBool(false)
+
+    for i in 0..<eqs.len()
+        any = if i == 0 then eqs.at(i) else or_i1(e, any, eqs.at(i))
 
     any
 end enum_membership
