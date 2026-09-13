@@ -1,0 +1,64 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// How far a declaration may be named from (`reference/modules.md § Visibility`).
+//
+// Public is the unmarked default, so every case here is about what a modifier takes away. The two
+// levels are one keyword and its argument: a bare `private` is the **file**, and `private[M]` widens
+// to a module the declaration is already inside and everything beneath it.
+
+// -- the modifiers parse -------------------------------------------------------------------------
+
+@test("a bare 'private' is the file")
+a_bare_private_is_the_file()
+    assert_eq(pf("private f() -> int = 1\n"), "(fn private f () -> int 1)")
+
+@test("'private[M]' carries the name as written")
+private_with_a_name_carries_it_as_written()
+    assert_eq(pf("private[geom] f() -> int = 1\n"), "(fn private[geom] f () -> int 1)")
+
+@test("an unmarked declaration is public")
+an_unmarked_declaration_is_public()
+    assert_eq(pf("f() -> int = 1\n"), "(fn f () -> int 1)")
+
+@test("a struct takes one")
+a_struct_takes_a_modifier()
+    assert_eq(pf("private struct P\n    x: int\nend P\n"), "(struct private P (x:int))")
+
+@test("an enum takes one")
+an_enum_takes_a_modifier()
+    assert_eq(pf("private[a] enum E\n    A\nend E\n"), "(enum private[a] E (A))")
+
+@test("a trait takes one")
+a_trait_takes_a_modifier()
+    assert_eq(pf("private trait T\n    show(self) -> int\nend T\n"),
+        "(trait private T (method self show () -> int))")
+
+@test("an extern takes one")
+an_extern_takes_a_modifier()
+    assert_eq(pf("private extern abs(n: int) -> int\n"), "(extern private abs (n:int) -> int)")
+
+// A `var` at the top of a file that names a module is that module's storage, and is the declaration
+// `static var` spells in the entry file -- so it takes a modifier for the same reason the `val`
+// beside it does.
+@test("and so does a 'var', which is module storage outside the entry file")
+a_var_takes_a_modifier()
+    assert_eq(pf("private var n: int = 1\n"), "(var private n : int 1)")
+
+@test("with the scoped spelling too")
+a_var_takes_the_scoped_spelling()
+    assert_eq(pf("private[m] var n: int\n"), "(var private[m] n : int)")
+
+@test("while an unmarked one is public, exactly as it was")
+an_unmarked_var_is_public()
+    assert_eq(pf("var n: int = 1\n"), "(var n : int 1)")
+
+// The argument is a simple name rather than a path: a visibility scope is always an enclosing
+// module, and there is no way to name an unrelated one. So the refusal is about the bracket, which
+// reads as a grammar fault in the surrounding line.
+@test("but the scope argument is one segment, not a path")
+the_scope_argument_is_one_segment()
+    assert(pf_err("private[a.b] f() -> int = 1\n").contains("']'"),
+        pf_err("private[a.b] f() -> int = 1\n"))

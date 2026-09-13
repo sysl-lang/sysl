@@ -69,6 +69,11 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
     for i in 0..<units.len()
         check_imports(a, scopes.at(i), units.at(i).body)
 
+    // A generic enum's pinned underlying type is refused before any of that, because it is the one
+    // mistake in an enum declaration no instantiation would find: a generic enum nothing names is
+    // never made real.
+    refuse_pinned_generic_enums(a)
+
     // A type that takes no arguments is instantiated whether or not anything uses it, so a field of
     // a type that does not exist is a mistake reported at the declaration rather than at whatever
     // first mentions it.
@@ -222,6 +227,21 @@ private is_variant_name(a: &Analysis, key: string) -> bool
 
     false
 end is_variant_name
+
+// A pinned underlying type says which one integer the discriminants are laid in. A generic enum has
+// an instantiation for every argument list rather than one, so there is no single storage for the
+// annotation to be about -- and the two cannot both be written.
+private refuse_pinned_generic_enums(a: &Analysis)
+    for i in 0..<a.tables.types.len()
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            EnumOf(d) ->
+                if !d.tparams.is_empty() && d.underlying.is_some() then
+                    a.fault(decl.scope, decl.span,
+                            s"a generic enum cannot pin an underlying type — '${d.name}' takes " +
+                            "type parameters")
+            _ -> ()
 
 // Every non-generic enum, then every non-generic struct.
 //

@@ -1,0 +1,688 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, Search}
+
+// What a refused program looks like on the way out: where the diagnostic points, how wide the
+// underline runs, and how many complaints one compilation yields.
+//
+// **Every rendering here was read out of the reference compiler**, by handing the installed `sysl`
+// the same source and quoting what came back -- never composed from the rule. The three claims are
+// separable: a diagnostic that quotes the wrong line is as useless as one that quotes none, and a
+// compiler that stops at the first mistake makes the other two matter less than they should.
+
+private var render_library_cache: Buf[Program] = buf()
+private var render_library_read: bool = false
+
+private render_library() -> Buf[Program]
+    if render_library_read then return render_library_cache
+
+    render_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> render_library_cache = units
+
+    render_library_cache
+end render_library
+
+private render_no_library() -> bool
+    if render_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end render_no_library
+
+// The whole report a compilation of one source yields, rendered the way a reader sees it.
+//
+// A parse that failed answers with the parser's own report, since nothing after it ran; anything
+// else answers with what the analysis had to say once every check over the whole tree had run.
+private rendered_as(name: string, text: string) -> string
+    val parsed = parse(source_of(name, text))
+
+    if !parsed.ok()
+        val said = parsed.report.render(parsed.src)
+
+        return if said.ends_with("\n") then said[0..<said.bytes.len - 1] else said
+
+    var units: Buf[Program] = buf()
+    val library = render_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end rendered_as
+
+private rendered(text: string) -> string = rendered_as("t.sysl", text)
+
+// How many separate errors a compilation reported.
+private how_many_errors(out: string) -> usize
+    val all = lines_of(out)
+    var n: usize = 0
+
+    for i in 0..<all.len()
+        if all.at(i).starts_with("error: ") then n += 1
+
+    n
+end how_many_errors
+
+// The source lines the errors point at, in the order they were reported.
+private pointed_at(out: string) -> Buf[usize]
+    val all = lines_of(out)
+    var found: Buf[usize] = buf()
+
+    for i in 0..<all.len()
+        val line = all.at(i)
+        val marker = "--> t.sysl:"
+
+        line.index_of(marker) match
+            None -> ()
+            Some(at) ->
+                var n: usize = 0
+                var j = at + marker.bytes.len
+
+                while j < line.bytes.len && line.bytes[j] >= u8('0') && line.bytes[j] <= u8('9')
+                    n = n * 10 + usize(line.bytes[j] - u8('0'))
+                    j += 1
+
+                found.push(n)
+
+    found
+end pointed_at
+
+// The underline of the one diagnostic `out` carries, as the reader sees it.
+private underline_of(out: string) -> string
+    val all = lines_of(out)
+    val last = all.at(all.len() - 1)
+
+    last.index_of("|") match
+        None -> ""
+        Some(at) -> last[at + 1..<last.bytes.len]
+end underline_of
+
+private listed(xs: Buf[usize]) -> string
+    var b = str_builder()
+
+    for i in 0..<xs.len()
+        if i > 0 then b.push(",")
+
+        b.push(str(xs.at(i)))
+
+    b.finish()
+end listed
+
+// -- rendering ---------------------------------------------------------------------------------
+
+@test("a diagnostic names the file, the line, and the column, and underlines the token")
+names_the_file_the_line_and_the_column()
+    if render_no_library() then return
+
+    assert_eq(rendered("var x = 1\nprint(nope)\n"),
+              "error: undefined name 'nope'\n" +
+              " --> t.sysl:2:7\n" +
+              "  |\n" +
+              "2 | print(nope)\n" +
+              "  |       ^^^^")
+
+@test("the gutter stays aligned when the line number takes two digits")
+the_gutter_stays_aligned()
+    if render_no_library() then return
+
+    var padding = str_builder()
+
+    for i in 1..<usize(10)
+        padding.push(s"var a${i} = ${i}\n")
+
+    assert_eq(rendered(padding.finish() + "print(nope)\n"),
+              "error: undefined name 'nope'\n" +
+              "  --> t.sysl:10:7\n" +
+              "   |\n" +
+              "10 | print(nope)\n" +
+              "   |       ^^^^")
+end the_gutter_stays_aligned
+
+@test("it carries whatever name the driver gave the source")
+it_carries_the_name_the_driver_gave()
+    if render_no_library() then return
+
+    assert(rendered_as("src/deep/thing.sysl", "print(nope)\n")
+        .contains("--> src/deep/thing.sysl:1:7"))
+
+@test("it survives a column past the end of its line")
+it_survives_a_column_past_the_end()
+    val src = source_of("t.sysl", "ab")
+
+    assert(placed_error(src, Span(98, 99), "boom").render().contains("|   ^"))
+
+// -- how far the underline runs ------------------------------------------------------------------
+//
+// The underline is as wide as what is being complained about and no wider -- a name, a literal, or a
+// whole expression where the expression is what is wrong.
+
+@test("the underline runs the whole of an identifier, however long")
+the_whole_of_an_identifier()
+    if render_no_library() then return
+
+    var carets = str_builder()
+
+    for _ in 0..<usize(28)
+        carets.push("^")
+
+    assert_eq(underline_of(rendered("print(a_rather_long_undefined_name)\n")),
+              "       " + carets.finish())
+end the_whole_of_an_identifier
+
+@test("the whole of a string literal, its quotes included")
+the_whole_of_a_string_literal()
+    if render_no_library() then return
+
+    assert_eq(underline_of(rendered("add(a: int, b: int) -> int = a + b\nprint(add(1, \"two\"))\n")),
+              "              ^^^^^")
+
+@test("the whole of a character literal, which is three columns and not one")
+the_whole_of_a_character_literal()
+    if render_no_library() then return
+
+    assert_eq(underline_of(rendered("takes(n: int) -> int = n\nprint(takes('x'))\n")),
+              "             ^^^")
+
+@test("one caret for a one-character token")
+one_caret_for_a_one_character_token()
+    assert_eq(underline_of(rendered("var a = 1\nvar = 5\n")), "     ^")
+
+@test("the whole of an expression, where the expression is what is wrong")
+the_whole_of_an_expression()
+    if render_no_library() then return
+
+    assert_eq(underline_of(rendered("takes(s: string) -> string = s\nprint(takes(1 + 2))\n")),
+              "             ^^^^^")
+
+@test("no further than the end of the line a span starts on")
+no_further_than_the_end_of_the_line()
+    if render_no_library() then return
+
+    assert_eq(underline_of(rendered("takes(n: int) -> int = n\nprint(takes(\"\"\"\nspanning\n\"\"\"))\n")),
+              "             ^^^")
+
+@test("one caret where the span covers nothing at all")
+one_caret_where_the_span_covers_nothing()
+    val src = source_of("t.sysl", "abcdef\n")
+
+    assert(placed_error(src, Span(2, 2), "boom").render().contains("|   ^"))
+
+@test("and one caret where a span ends before it begins")
+one_caret_where_a_span_ends_before_it_begins()
+    val src = source_of("t.sysl", "abcdef\n")
+
+    assert(placed_error(src, Span(3, 1), "boom").render().contains("|    ^"))
+
+// -- an offset becomes a line and a column ---------------------------------------------------------
+//
+// The lexer knows where a token ends as an **offset**, and everything that reports a position speaks
+// in lines and columns, so this conversion sits between the two.
+
+@test("an offset at the very beginning is line one, column one")
+an_offset_at_the_very_beginning()
+    assert_eq(source_of("t.sysl", "ab\ncde\n\nf").locate(0), Loc(1, 1))
+
+@test("an offset within the first line")
+an_offset_within_the_first_line()
+    assert_eq(source_of("t.sysl", "ab\ncde\n\nf").locate(1), Loc(1, 2))
+
+@test("an offset at a newline, which belongs to the line it ends")
+an_offset_at_a_newline()
+    assert_eq(source_of("t.sysl", "ab\ncde\n\nf").locate(2), Loc(1, 3))
+
+@test("an offset at the start of the line after it")
+an_offset_at_the_start_of_the_next_line()
+    assert_eq(source_of("t.sysl", "ab\ncde\n\nf").locate(3), Loc(2, 1))
+
+@test("an offset on an empty line")
+an_offset_on_an_empty_line()
+    assert_eq(source_of("t.sysl", "ab\ncde\n\nf").locate(7), Loc(3, 1))
+
+@test("an offset on the last line, which has no newline of its own")
+an_offset_on_the_last_line()
+    assert_eq(source_of("t.sysl", "ab\ncde\n\nf").locate(8), Loc(4, 1))
+
+@test("an offset past the end answers the place just past the last character")
+an_offset_past_the_end()
+    val src = source_of("t.sysl", "ab\ncde\n\nf")
+
+    assert_eq(src.locate(9), Loc(4, 2))
+    assert_eq(src.locate(9999), Loc(4, 2))
+
+@test("an offset in a file with no newline in it whatsoever")
+an_offset_in_a_file_with_no_newline()
+    assert_eq(source_of("t.sysl", "abc").locate(2), Loc(1, 3))
+
+@test("an offset in an empty file")
+an_offset_in_an_empty_file()
+    assert_eq(source_of("t.sysl", "").locate(0), Loc(1, 1))
+
+// -- where the caret lands ---------------------------------------------------------------------
+
+@test("not on the end of the file, when what ran out of input is the grammar and not the reader")
+not_on_the_end_of_the_file()
+    val out = rendered("print(,)")
+
+    assert(out.contains("expected"))
+    assert(!out.contains("end of input"))
+
+@test("on the argument that is wrong, not on the call")
+on_the_argument_that_is_wrong()
+    if render_no_library() then return
+
+    assert(rendered("add(a: int, b: int) -> int = a + b\nprint(add(1, \"two\"))\n")
+        .contains("--> t.sysl:2:14"))
+
+@test("on the callee, for a call that names nothing or takes other arguments")
+on_the_callee_for_a_call_that_names_nothing()
+    if render_no_library() then return
+
+    val out = rendered("add(a: int, b: int) -> int = a + b\nprint(missing())\nprint(add(1))\n")
+
+    assert(out.contains("--> t.sysl:2:7"))
+    assert(out.contains("--> t.sysl:3:7"))
+end on_the_callee_for_a_call_that_names_nothing
+
+@test("on the selection that names a missing field")
+on_the_selection_that_names_a_missing_field()
+    if render_no_library() then return
+
+    assert(rendered("struct P\n    x: int\nvar p = P(1)\nprint(p.y)\n")
+        .contains("--> t.sysl:4:9"))
+
+@test("on the construct that raised the error, not on the last thing it looked at")
+on_the_construct_that_raised_the_error()
+    if render_no_library() then return
+
+    val out = rendered("var x = 1\nvar y = if x > 0 then 1 else \"s\"\n")
+
+    assert(out.contains("if branches have different types"))
+    assert(out.contains("--> t.sysl:2:9"))
+end on_the_construct_that_raised_the_error
+
+@test("just after the '=' of a binding whose value was forgotten")
+just_after_the_equals_of_a_forgotten_value()
+    val out = rendered("var x =\nprint(str(1))\n")
+
+    assert(out.contains("--> t.sysl:1:8"))
+    assert(out.contains("expression expected"))
+end just_after_the_equals_of_a_forgotten_value
+
+@test("on the binding inside a body, and not on the declaration the body belongs to")
+on_the_binding_inside_a_body()
+    val out = rendered("f(a: int) -> int\n    val b =\n    a + 1\n\n    b\nend f\n\nprint(str(f(1)))\n")
+
+    assert(out.contains("--> t.sysl:2:"))
+
+@test("on the declaration that redeclares a name")
+on_the_declaration_that_redeclares_a_name()
+    if render_no_library() then return
+
+    assert(rendered("f() -> int = 1\nf() -> int = 2\n").contains("--> t.sysl:2:1"))
+
+@test("on the type reference that names nothing")
+on_the_type_reference_that_names_nothing()
+    if render_no_library() then return
+
+    assert(rendered("var x: Nope = 1\n").contains("--> t.sysl:1:8"))
+
+// -- other passes --------------------------------------------------------------------------------
+
+@test("a parse error renders like any other diagnostic")
+a_parse_error_renders_like_any_other()
+    assert_eq(rendered("var a = 1\nvar = 5\n"),
+              "error: identifier expected\n" +
+              " --> t.sysl:2:5\n" +
+              "  |\n" +
+              "2 | var = 5\n" +
+              "  |     ^")
+end a_parse_error_renders_like_any_other
+
+@test("a parse error that runs out of input still renders against the source")
+a_parse_error_that_runs_out_of_input()
+    val out = rendered("f(a: int")
+
+    assert(out.contains("--> t.sysl:"))
+    assert(out.contains("f(a: int"))
+end a_parse_error_that_runs_out_of_input
+
+// The reference's "an escape error points at the slice that leaves the frame" is not ported: it
+// asserts the column the caret lands on, `t.sysl:4:6`, which is the `[` of `s[..]` -- the anchor the
+// reference's `Positioned` carries beside its extent. Every node here carries the extent alone, so
+// the caret lands at the `s`. See CLAUDE.md's open divergences; the refusal's own wording is checked
+// by `tests_arc.sysl`.
+
+@test("a lexical error reports itself rather than the grammar's reaction to it")
+a_lexical_error_reports_itself()
+    assert_eq(rendered("print(\"oops\n"),
+              "error: unterminated string literal\n" +
+              " --> t.sysl:1:7\n" +
+              "  |\n" +
+              "1 | print(\"oops\n" +
+              "  |       ^")
+end a_lexical_error_reports_itself
+
+@test("an unclosed block comment says so, at the delimiter that opened it")
+an_unclosed_block_comment_says_so()
+    assert_eq(rendered("print(1)\n/* never closed\nprint(2)\n"),
+              "error: unclosed comment\n" +
+              " --> t.sysl:2:1\n" +
+              "  |\n" +
+              "2 | /* never closed\n" +
+              "  | ^")
+end an_unclosed_block_comment_says_so
+
+@test("an unterminated character literal reports itself too")
+an_unterminated_character_literal()
+    assert(rendered("var c = '1\n").contains("error: unterminated character literal"))
+
+@test("a nested comment left open reports the outer one")
+a_nested_comment_left_open()
+    val out = rendered("print(1)\n/* outer /* inner */\nprint(2)\n")
+
+    assert(out.contains("error: unclosed comment"))
+    assert(out.contains("--> t.sysl:2:1"))
+end a_nested_comment_left_open
+
+@test("indentation mixing tabs and spaces on one line is refused")
+indentation_mixing_tabs_and_spaces()
+    val out = rendered("f(n: int) -> int\n\tif n > 0 then\n    \tn\n\telse\n\t    0\n")
+
+    assert(out.contains("only tabs or spaces"))
+    assert(out.contains("--> t.sysl:3:1"))
+end indentation_mixing_tabs_and_spaces
+
+@test("an error about a library type still quotes the user's file")
+an_error_about_a_library_type()
+    if render_no_library() then return
+
+    val out = rendered("f() -> Option[int]\n    Some(\"x\")\n")
+
+    assert(out.contains("--> t.sysl:2:"))
+    assert(!out.contains("library/sysl"))
+end an_error_about_a_library_type
+
+// -- reporting more than one error ---------------------------------------------------------------
+
+@test("every independent mistake is reported, in source order")
+every_independent_mistake_is_reported()
+    if render_no_library() then return
+
+    val out = rendered("var a = nope1\nvar b = nope2\nvar c = nope3\n")
+
+    assert_eq(how_many_errors(out), 3)
+    assert_eq(listed(pointed_at(out)), "1,2,3")
+end every_independent_mistake_is_reported
+
+@test("one diagnostic is separated from the next by a blank line")
+one_diagnostic_is_separated_from_the_next()
+    if render_no_library() then return
+
+    assert(rendered("var a = nope1\nvar b = nope2\n").contains("^\n\nerror:"))
+
+@test("it keeps going through the statements of a single function body")
+it_keeps_going_through_the_statements_of_a_body()
+    if render_no_library() then return
+
+    val out = rendered("f() -> int\n    var a = nope1\n    var b = nope2\n    3\n")
+
+    assert_eq(how_many_errors(out), 2)
+    assert_eq(listed(pointed_at(out)), "2,3")
+end it_keeps_going_through_the_statements_of_a_body
+
+@test("it keeps going from one function to the next")
+it_keeps_going_from_one_function_to_the_next()
+    if render_no_library() then return
+
+    val out = rendered("f() -> int = nope1\ng() -> int = nope2\nh() -> int = 3\nprint(h())\n")
+
+    assert_eq(how_many_errors(out), 2)
+    assert_eq(listed(pointed_at(out)), "1,2")
+end it_keeps_going_from_one_function_to_the_next
+
+@test("it keeps going through declarations, so a bad one does not hide a later one")
+it_keeps_going_through_declarations()
+    if render_no_library() then return
+
+    val out = rendered("struct P\n    x: Nope\nstruct Q\n    y: AlsoNope\n")
+
+    assert_eq(how_many_errors(out), 2)
+    assert_eq(listed(pointed_at(out)), "2,4")
+end it_keeps_going_through_declarations
+
+@test("a whole file's worth of unrelated mistakes is reported at once")
+a_whole_files_worth_of_mistakes()
+    if render_no_library() then return
+
+    val out = rendered("add(a: int, b: int) -> int = a + b\n\nstruct Point\n    x: int\n    y: int\n" +
+                       "end Point\n\nvar p = Point(1, 2)\nprint(add(1, \"two\"))\nprint(p.zed)\n" +
+                       "print(other)\nprint(add(1))\n")
+
+    assert_eq(how_many_errors(out), 4)
+    assert_eq(listed(pointed_at(out)), "9,10,11,12")
+end a_whole_files_worth_of_mistakes
+
+// -- not reporting the consequences of an error twice --------------------------------------------
+
+@test("a name whose initializer failed is still bound, so later uses stay quiet")
+a_name_whose_initializer_failed_is_still_bound()
+    if render_no_library() then return
+
+    val out = rendered("f() -> int\n    var a = nope\n    var b = a + 1\n    var c = a * a\n    b + c\n")
+
+    assert_eq(how_many_errors(out), 1)
+    assert_eq(listed(pointed_at(out)), "2")
+end a_name_whose_initializer_failed_is_still_bound
+
+@test("but a different mistake after one is still reported")
+a_different_mistake_after_one_is_reported()
+    if render_no_library() then return
+
+    val out = rendered("f() -> int\n    var a = nope\n    var b = a + 1\n" +
+                       "    var c = alsoNope\n    b + c\n")
+
+    assert_eq(how_many_errors(out), 2)
+    assert_eq(listed(pointed_at(out)), "2,4")
+end a_different_mistake_after_one_is_reported
+
+@test("a parameter whose type does not resolve does not make its function undefined too")
+a_parameter_whose_type_does_not_resolve()
+    if render_no_library() then return
+
+    val out = rendered("f(a: Nope) -> int = 1\nprint(f(1))\nprint(f(2))\n")
+
+    assert_eq(how_many_errors(out), 1)
+    assert(out.contains("Nope"))
+    assert(!out.contains("undefined function"))
+end a_parameter_whose_type_does_not_resolve
+
+@test("one mistake in a generic body is one error however many times it is instantiated")
+one_mistake_in_a_generic_body_is_one_error()
+    if render_no_library() then return
+
+    val out = rendered("bad[T](x: T) -> int\n    nope\n\nprint(bad(1))\nprint(bad(\"s\"))\n" +
+                       "print(bad(true))\n")
+
+    assert_eq(how_many_errors(out), 1)
+    assert_eq(listed(pointed_at(out)), "2")
+end one_mistake_in_a_generic_body_is_one_error
+
+// -- how many errors are reported ----------------------------------------------------------------
+
+private eight_undefined() -> string
+    var b = str_builder()
+
+    for i in 1..<usize(9)
+        b.push(s"var v${i} = nope${i}\n")
+
+    b.finish()
+end eight_undefined
+
+@test("it stops at five, and says how many there were")
+it_stops_at_five()
+    if render_no_library() then return
+
+    val out = rendered(eight_undefined())
+
+    assert_eq(how_many_errors(out), 5)
+    assert_eq(listed(pointed_at(out)), "1,2,3,4,5")
+    assert(out.ends_with("showing the first 5 of 8 errors"))
+end it_stops_at_five
+
+@test("it keeps the earliest five, since an error early in a file is the one worth reading")
+it_keeps_the_earliest_five()
+    if render_no_library() then return
+
+    val out = rendered(eight_undefined())
+
+    assert(out.contains("undefined name 'nope1'"))
+    assert(!out.contains("nope6"))
+end it_keeps_the_earliest_five
+
+@test("it says nothing extra when the count is exactly at the limit")
+it_says_nothing_extra_at_the_limit()
+    if render_no_library() then return
+
+    var b = str_builder()
+
+    for i in 1..<usize(6)
+        b.push(s"var v${i} = nope${i}\n")
+
+    val out = rendered(b.finish())
+
+    assert_eq(how_many_errors(out), 5)
+    assert(!out.contains("showing the first"))
+end it_says_nothing_extra_at_the_limit
+
+@test("it caps escape errors the same way")
+it_caps_escape_errors_the_same_way()
+    if render_no_library() then return
+
+    var b = str_builder()
+
+    for i in 1..<usize(8)
+        b.push(s"f${i}(a${i}: [4]u8) -> []u8\n    a${i}[..]\n\n")
+
+    val out = rendered(b.finish())
+
+    assert_eq(how_many_errors(out), 5)
+    assert(out.ends_with("showing the first 5 of 7 errors"))
+end it_caps_escape_errors_the_same_way
+
+// -- counted things read as English --------------------------------------------------------------
+
+@test("one argument is an argument, not arguments")
+one_argument_is_an_argument()
+    if render_no_library() then return
+
+    assert(rendered("f(a: int) -> int = a\nprint(f(1, 2))\n")
+        .contains("takes 1 argument, but 2 arguments were given"))
+
+@test("one value given is 'was given', not 'were given'")
+one_value_given_was_given()
+    if render_no_library() then return
+
+    assert(rendered("struct P\n    x: int\n    y: int\nvar p = P(1)\n")
+        .contains("has 2 fields, but 1 value was given"))
+
+@test("and the plural forms still agree")
+the_plural_forms_still_agree()
+    if render_no_library() then return
+
+    assert(rendered("f(a: int, b: int) -> int = a\nprint(f(1))\n")
+        .contains("takes 2 arguments, but 1 argument was given"))
+
+// -- state left consistent by an abandoned region -------------------------------------------------
+
+@test("a field whose type does not resolve does not make later mentions look like a cycle")
+a_field_whose_type_does_not_resolve()
+    if render_no_library() then return
+
+    val out = rendered("struct P\n    x: Nope\n    y: int\nend P\n\nvar p = P(1, 2)\n" +
+                       "print(p.x)\nprint(p.y)\n")
+
+    assert_eq(how_many_errors(out), 1)
+    assert(out.contains("unknown type 'Nope'"))
+    assert(!out.contains("contains itself"))
+end a_field_whose_type_does_not_resolve
+
+@test("a block abandoned part-way does not leak its bindings to the statements after it")
+a_block_abandoned_part_way()
+    if render_no_library() then return
+
+    val out = rendered("f() -> int\n    var x = if true then\n        var hidden = 1\n" +
+                       "        nope\n    else 2\n    hidden\n")
+
+    assert_eq(how_many_errors(out), 2)
+    assert_eq(listed(pointed_at(out)), "4,6")
+    assert(out.contains("undefined name 'hidden'"))
+end a_block_abandoned_part_way
+
+@test("every function that lets a slice escape is reported, not just the first")
+every_function_that_lets_a_slice_escape()
+    if render_no_library() then return
+
+    val out = rendered("sum(bytes: []u8) -> int = 0\n\none(a: [4]u8) -> []u8\n    a[..]\n\n" +
+                       "two(b: [4]u8) -> []u8\n    b[..]\n")
+
+    assert_eq(how_many_errors(out), 2)
+    assert_eq(listed(pointed_at(out)), "4,7")
+end every_function_that_lets_a_slice_escape
+
+// -- carried rather than rendered -----------------------------------------------------------------
+//
+// A diagnostic is carried as a value and rendered at the edge, so the limit belongs to the renderer
+// and not to the list a caller reads as data.
+
+@test("the five-diagnostic limit is the renderer's rule and not the list's")
+the_limit_is_the_renderers_rule()
+    if render_no_library() then return
+
+    val parsed = parse(source_of("t.sysl", eight_undefined()))
+    var units: Buf[Program] = buf()
+    val library = render_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    assert_eq(errors_of(done.an.diagnostics()).len(), 8)
+    assert_eq(how_many_errors(analysis_report(errors_of(done.an.diagnostics()))), 5)
+end the_limit_is_the_renderers_rule
+
+@test("a report of one is that one, with nothing wrapped around it")
+a_report_of_one_is_that_one()
+    val src = source_of("t.sysl", "abc\n")
+    val one = placed_error(src, Span(1, 3), "boom")
+    var all: Buf[Placed] = buf()
+
+    all.push(one)
+
+    assert_eq(analysis_report(all),
+              "error: boom\n --> t.sysl:1:2\n  |\n1 | abc\n  |  ^^")
+end a_report_of_one_is_that_one
+
+@test("and a report of none is nothing at all")
+a_report_of_none_is_nothing()
+    var all: Buf[Placed] = buf()
+
+    assert_eq(analysis_report(all), "")
