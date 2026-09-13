@@ -228,6 +228,32 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                         !home.tparams.is_empty() && !home.bounds.is_empty(), assocs))
     a.tables.members.impls.put(impl_key_of(key.unwrap(), home.key), rows)
 
+    // What the trait **requires** is asked of the implementing type here, at the block that makes
+    // the promise, rather than at each bound that relies on it: the diagnostic belongs on the
+    // declaration that cannot keep its word, and a `&Sub` object's table needs a slot for every
+    // required trait's method. It is held, since the block supplying a required trait may be written
+    // below the one that needs it.
+    //
+    // A **generic** block covers a type it never instantiates, so the subject of the question is
+    // that type applied to the block's own parameters, each standing in for itself and carrying what
+    // the block asked of it -- which is what makes `impl[T: Named] Greet for Box[T]` answerable
+    // against `impl[T: Named] Named for Box[T]`.
+    var super_subst: Buf[Binding] = buf()
+    val super_self = self_binding(subject)
+
+    for i in 0..<super_self.len()
+        super_subst.push(super_self.at(i))
+
+    for i in 0..<tr.tparams.len()
+        if i < bound.args.len() then super_subst.push(Binding(tr.tparams.at(i), bound.args.at(i)))
+
+    for i in 0..<tr.supers.len()
+        val s = tr.supers.at(i)
+
+        a.tables.super_checks.push(SuperCheck(home.label, module_show(block.trait_name),
+                                              resolve_bound(a, scope, s.span, s, super_subst),
+                                              subject, span, scope))
+
     // A default the block left out is hoisted for this type exactly as a written method is, from the
     // body the trait supplied -- so everything downstream finds an ordinary member and needs to know
     // nothing about where it came from.
@@ -260,6 +286,36 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     hoist_member_list(a, home, supplied)
     Impl(block, span, scope)
 end hoist_impl
+
+// Whether each `impl` of a trait that requires others supplies those too.
+//
+// **A built-in membership counts**, because that is what a required trait means to a type the
+// compiler already made a member of -- `impl Word for u32` is asking `u32` for the arithmetic it has
+// always had, which is why the question goes through `satisfies` rather than through the table of
+// written blocks.
+check_impl_supers(a: &Analysis)
+    val held = a.tables.super_checks
+
+    a.tables.super_checks = buf()
+
+    for i in 0..<held.len()
+        val c = held.at(i)
+
+        if satisfies(a, c.sup, c.subject) then continue
+
+        val shown = show_bound(a, c.sup, c.subject)
+        val covers = type_show(c.subject)
+
+        // A generic block's subject carries its own parameters, so the advice names the type the
+        // block covers rather than a bare name that would send the reader to write a second
+        // implementation for one instantiation -- which is refused anyway.
+        var write = s"write an implementation of '$shown' for $covers"
+
+        if covers == c.label then write = s"write 'impl $shown for ${c.label}'"
+
+        a.fault(c.scope, c.span, s"'${c.required}' requires '$shown', so '${c.label}' has to " +
+                s"implement that too — $write")
+end check_impl_supers
 
 // The suffix an implementation's members carry, empty for the first.
 private suffix_of(nth: usize) -> string = if nth == 1 then "" else s".$nth"

@@ -552,6 +552,71 @@ a_module_with_no_clause()
 
     assert_eq(complaints_of("module mm\n\nmk() -> &int = 1\n").len(), usize(0))
 
+// -- the entry file's own statements -----------------------------------------------------------
+
+// **A clause at the top of a single-file program is about the statements under it**, which is the
+// only code such a program has. The body those statements make belongs to no declaration, so it
+// travels beside the list of functions rather than in it and has to be put back for these walks.
+
+@test("the entry file's statements are a body, so a clause at the top of one holds them too")
+the_entry_files_own_statements()
+    if checks_no_library() then return
+
+    val made = complaints_of("@no_alloc\n\nval r: &int = 3\n\nprint(*r)\n")
+
+    assert(says(made, needs_one("a reference")), listed_of(made))
+
+    val reached = complaints_of("@no_alloc\n\nprivate mk() -> &int = 1\n\nval x = mk()\n")
+
+    assert(says(reached, "this reaches 'mk', which makes heap storage, and this module declared " +
+                "'@no_alloc' — an allocator-free module may only call what is allocator-free itself"),
+           listed_of(reached))
+
+@test("and a declaration it reaches is held to what the entry file gave up")
+the_entry_file_reaches_a_declaration_that_needs_more()
+    if checks_no_library() then return
+
+    val out = complaints_of("@no_os\n\n@needs(os)\nfetch(block: int) -> int = block\n\n" +
+                            "print(fetch(1))\n")
+
+    assert(says(out, "this reaches 'fetch', which needs 'os', and this module declared '@no_os'"),
+           listed_of(out))
+
+@test("an entry file with no clause of its own is held to nothing")
+the_entry_file_with_no_clause()
+    if checks_no_library() then return
+
+    assert_eq(complaints_of("val r: &int = 3\n\nprint(*r)\n").len(), usize(0))
+
+// -- a member reached where its trait cannot be named ----------------------------------------------
+
+// **Visibility and scope are two questions and only the second is what an import changes.** Every
+// trait of the standard module is public everywhere, so a rule resting on visibility lets a file
+// call `trim` without naming `sysl.text.Search` — which is the whole of what the import line is for.
+
+@test("a member a trait gave a type needs the trait in scope, not merely visible")
+a_trait_member_needs_the_trait_named()
+    if checks_no_library() then return
+
+    val trimmed = complaints_of("import sysl.text.split\n\nprint(\"  x  \".trim())\n")
+
+    assert(says(trimmed, "string has 'trim' from sysl.text.Search, and that trait is not in scope " +
+                "here — import it to reach the member"), listed_of(trimmed))
+
+    val rooted = complaints_of("import sysl.math.pi\n\nvar x = 2.0\n\nprint(pi, x.sqrt())\n")
+
+    assert(says(rooted, "real has 'sqrt' from sysl.math.Float, and that trait is not in scope " +
+                "here — import it to reach the member"), listed_of(rooted))
+
+@test("and the import is the whole of what it wanted")
+a_trait_member_with_the_trait_named()
+    if checks_no_library() then return
+
+    assert_eq(complaints_of("import sysl.text.{split, Search}\n\nprint(\"  x  \".trim())\n").len(),
+              usize(0))
+    assert_eq(complaints_of("import sysl.math.{pi, Float}\n\nvar x = 2.0\n\n" +
+                            "print(pi, x.sqrt())\n").len(), usize(0))
+
 // -- a field holding something callable ------------------------------------------------------------
 
 @test("a field holding a callable is called through the selection that reads it")

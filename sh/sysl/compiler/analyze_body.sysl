@@ -215,7 +215,13 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
 
     // What a program is held to once everything it reaches has been typed. It runs here rather than
     // per body because every one of these questions is about the whole compilation.
-    whole_program_checks(a, funcs, ordered_vals(storage))
+    //
+    // **The entry file's statements are a body and are held to all of it**, which they are not by
+    // being in `funcs`: they belong to no declaration, so they travel beside the list rather than
+    // in it and have to be put back for the walk. Left out, a `@no_alloc` or a `@no_os` written at
+    // the top of a single-file program said nothing about the program's own statements -- the one
+    // place a reader of such a program writes anything at all.
+    whole_program_checks(a, with_entry_body(funcs, started), ordered_vals(storage))
 
     TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, ordered_vals(storage), a, units,
                 entry, started.0, started.1)
@@ -228,6 +234,35 @@ end analyze_produced
 // body rather than to the module. They arrive in **source order**, which is what makes a `val` there
 // an ordinary local: it is initialized where it is written, rather than before every statement in
 // the file the way a module member's is.
+// The key the entry file's body is filed under for the whole-program checks.
+//
+// **A space is what keeps it out of the way of everything else**: no identifier may hold one, so
+// nothing a program declares can land on this key, where `main` and any name of its own could. It
+// reaches no object file -- the body is emitted from `TypedBodies.entry` under the entry point's own
+// name, and this list is built for the checks and thrown away.
+entry_check_name(module_name: string) -> string = module_qualify(module_name, "entry file")
+
+// The bodies the whole-program checks walk: everything a declaration lowered to, and the entry
+// file's statements as one more.
+//
+// A fresh buffer rather than a push onto the caller's -- **a `Buf` assigned is a second name for one
+// buffer**, so growing the list in place would put a function nothing declared into the list the
+// emitter goes on to read.
+private with_entry_body(funcs: Buf[TFunc], started: (Buf[TStmt], string)) -> Buf[TFunc]
+    if started.0.is_empty() then return funcs
+
+    var out: Buf[TFunc] = buf()
+
+    for i in 0..<funcs.len()
+        out.push(funcs.at(i))
+
+    out.push(TFunc(span_zero(), entry_check_name(started.1), buf(), Unit,
+                   TBlock(started.0, None, Unit), false, buf(), buf(), buf(), false, None, false,
+                   None, false, false, None, None, None, None))
+
+    out
+end with_entry_body
+
 private entry_body(a: &Analysis, units: Buf[Program]) -> (Buf[TStmt], string)
     if a.tables.entry_src == "" then return (buf(), ModuleRoot)
 
@@ -239,6 +274,13 @@ private entry_body(a: &Analysis, units: Buf[Program]) -> (Buf[TStmt], string)
         val scope = scope_of_unit(a, unit)
         val cx = analyzer_for(a, scope)
         val written = entry_statements(unit, a.tables.entry_captures)
+
+        // The file the whole-program checks blame a statement of this body on. The body is not a
+        // declaration, so it has no key of its own to be filed under, and one is made here rather
+        // than left out -- `func_home` answers with an empty scope for a name it does not know, and
+        // a diagnostic anchored in no file is worse than none.
+        a.tables.homes.put(entry_check_name(scope.module_name), scope)
+
         var out: Buf[TStmt] = buf()
 
         cx.enter()
