@@ -1,0 +1,368 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, Search}
+
+// What a whole program's declarations are refused for: a call's arity, a struct's fields and how one
+// is built, an enum's variants, a generic's type arguments, and the conversions between a simple
+// enum and an integer.
+//
+// **Every message here was read out of the reference compiler**, by handing the installed `sysl` the
+// same source and quoting what came back -- never composed from the rule.
+
+private var decl_errors_library_cache: Buf[Program] = buf()
+private var decl_errors_library_read: bool = false
+
+private decl_errors_library() -> Buf[Program]
+    if decl_errors_library_read then return decl_errors_library_cache
+
+    decl_errors_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> decl_errors_library_cache = units
+
+    decl_errors_library_cache
+end decl_errors_library
+
+private decl_errors_no_library() -> bool
+    if decl_errors_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end decl_errors_no_library
+
+// The whole report one source is refused with, rendered the way a reader sees it.
+private refused(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.report.render(parsed.src)
+
+    var units: Buf[Program] = buf()
+    val library = decl_errors_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end refused
+
+// How many times one phrase appears in a report, which is what "reported once" is a claim about.
+private times_said(haystack: string, needle: string) -> usize
+    var found: usize = 0
+    var from: usize = 0
+
+    loop
+        haystack.index_of_from(needle, from) match
+            None -> break
+            Some(at) ->
+                found += 1
+                from = at + 1
+
+    found
+end times_said
+
+// -- calls, fields and construction ----------------------------------------------------------------
+
+@test("a call with the wrong number of arguments")
+a_call_with_the_wrong_number_of_arguments()
+    if decl_errors_no_library() then return
+
+    assert(refused("add(a: int, b: int) -> int = a + b\nprint(add(1))").contains("takes 2 arguments"))
+
+@test("reading an unknown struct field")
+reading_an_unknown_struct_field()
+    if decl_errors_no_library() then return
+
+    assert(refused("struct P\n    x: int\nvar p = P(1)\nprint(p.y)")
+        .contains("no field or property 'y'"))
+
+@test("reading a field of a non-struct")
+reading_a_field_of_a_non_struct()
+    if decl_errors_no_library() then return
+
+    assert(refused("var x = 5\nprint(x.foo)").contains("cannot read field 'foo'"))
+
+@test("constructing a struct with the wrong arity")
+constructing_a_struct_with_the_wrong_arity()
+    if decl_errors_no_library() then return
+
+    assert(refused("struct P\n    x: int\n    y: int\nvar p = P(1)").contains("has 2 fields"))
+
+// -- enums -----------------------------------------------------------------------------------------
+
+@test("a match on a data enum must cover every variant")
+a_match_on_a_data_enum_must_cover_every_variant()
+    if decl_errors_no_library() then return
+
+    val out = refused("enum Shape\n    Circle(r: int)\n    Empty\nf(s: Shape) -> int\n" +
+                      "    s match\n        Empty -> 0")
+
+    assert(out.contains("not exhaustive"))
+    assert(out.contains("Circle"))
+end a_match_on_a_data_enum_must_cover_every_variant
+
+@test("constructing a variant with the wrong arity")
+constructing_a_variant_with_the_wrong_arity()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Shape\n    Circle(r: int)\n    Empty\nvar s = Circle(1, 2)")
+        .contains("has 1 field, but 2 values were given"))
+
+@test("a nullary variant cannot take arguments")
+a_nullary_variant_cannot_take_arguments()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Shape\n    Circle(r: int)\n    Empty\nvar s = Empty(1)")
+        .contains("carries nothing, so it is written as a name on its own"))
+
+@test("matching an unknown variant")
+matching_an_unknown_variant()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Shape\n    Circle(r: int)\n    Empty\nf(s: Shape) -> int\n" +
+                   "    s match\n        Square(x) -> 0\n        else 1")
+        .contains("no variant 'Square'"))
+
+@test("a variant name shared by two enums is ambiguous where nothing settles it")
+a_variant_name_shared_by_two_enums()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum A\n    X\n    Y\nenum B\n    X\n    Z\nvar v = X\nprint(1)")
+        .contains("'X' is a variant of 'A' and 'B'"))
+
+@test("an enum value cannot be printed")
+an_enum_value_cannot_be_printed()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Color\n    Red\n    Green\nprint(Red)").contains("cannot print"))
+
+// -- generics ----------------------------------------------------------------------------------------
+
+@test("the wrong number of type arguments")
+the_wrong_number_of_type_arguments()
+    if decl_errors_no_library() then return
+
+    assert(refused("struct Box[T]\n    value: T\nf(b: Box[int, real])\n    print(1)")
+        .contains("takes 1 type argument, but 2 type arguments were given"))
+
+@test("type arguments on a type that takes none")
+type_arguments_on_a_type_that_takes_none()
+    if decl_errors_no_library() then return
+
+    assert(refused("var x: int[real] = 1").contains("does not take type arguments"))
+
+@test("a type argument that nothing determines")
+a_type_argument_that_nothing_determines()
+    if decl_errors_no_library() then return
+
+    assert(refused("var x = None").contains("cannot infer the type argument"))
+
+@test("an argument that does not match the instantiated parameter")
+an_argument_that_does_not_match_the_parameter()
+    if decl_errors_no_library() then return
+
+    assert(refused("pair[T](a: T, b: T) -> T = a\nvar x = pair(1, \"two\")\n")
+        .contains("'a' of 'pair' is string, but int was given"))
+
+@test("a type that contains itself has no finite size")
+a_type_that_contains_itself()
+    if decl_errors_no_library() then return
+
+    assert(refused("struct Node\n    next: Node\nvar n = Node(n)").contains("contains itself"))
+
+@test("a generic that holds its parameter by value still contains what it is given")
+a_generic_that_holds_its_parameter_by_value()
+    if decl_errors_no_library() then return
+
+    assert(refused("struct Wrap[T]\n    x: T\nstruct Node\n    w: Wrap[Node]\nvar n: Node\n")
+        .contains("type 'Node' contains itself"))
+
+@test("nor does a variant that holds its own enum")
+nor_does_a_variant_that_holds_its_own_enum()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum List\n    Cons(head: int, tail: List)\n    Nil\nvar l: List = Nil\n")
+        .contains("type 'List' contains itself"))
+
+// -- enum and integer, in both directions -----------------------------------------------------------
+
+@test("converting a data enum to an integer is rejected")
+converting_a_data_enum_to_an_integer()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Shape\n    Circle(radius: int)\n    Empty\nvar s = Circle(3)\nprint(int(s))")
+        .contains("only a simple enum converts to an integer"))
+
+@test("a checked cast into a data enum is rejected")
+a_checked_cast_into_a_data_enum()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Shape\n    Circle(radius: int)\n    Empty\nvar s = Shape(0)")
+        .contains("carries data"))
+
+@test("a checked cast on a generic enum is rejected")
+a_checked_cast_on_a_generic_enum()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Maybe[T]\n    Just(value: T)\n    Nothing\nvar m = Maybe(0)")
+        .contains("generic"))
+
+@test("a checked cast takes exactly one integer argument")
+a_checked_cast_takes_exactly_one_integer()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Color\n    Red\n    Green\nvar c = Color(1, 2)")
+        .contains("exactly one integer"))
+
+@test("a checked cast rejects a non-integer argument")
+a_checked_cast_rejects_a_non_integer()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Color\n    Red\n    Green\nvar c = Color(\"red\")")
+        .contains("converts an integer"))
+
+@test("the fallible constructor on a data enum is rejected")
+the_fallible_constructor_on_a_data_enum()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Shape\n    Circle(radius: int)\n    Empty\nvar s = Shape.try(0)")
+        .contains("carries data"))
+
+@test("an unknown member on an enum is still reported, not swallowed by try")
+an_unknown_member_on_an_enum_is_still_reported()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Color\n    Red\n    Green\nvar c = Color.Bogus(1)")
+        .contains("enum 'Color' has no variant or associated function 'Bogus'"))
+
+@test("an underlying-type annotation on a generic enum is rejected")
+an_underlying_type_on_a_generic_enum()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Maybe[T]: u8\n    Just(value: T)\n    Nothing")
+        .contains("generic enum cannot pin an underlying type"))
+
+@test("an underlying-type annotation on a data enum is rejected")
+an_underlying_type_on_a_data_enum()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Shape: u8\n    Circle(radius: int)\n    Empty")
+        .contains("only a simple enum has an underlying integer type"))
+
+@test("a non-integer underlying type is rejected")
+a_non_integer_underlying_type()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Color: string\n    Red\n    Green")
+        .contains("underlying type must be an integer"))
+
+@test("a discriminant that overflows the underlying type is rejected")
+a_discriminant_that_overflows()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Color: u8\n    Red\n    Big = 300").contains("does not fit"))
+
+@test("a negative discriminant under an unsigned underlying type is rejected")
+a_negative_discriminant_under_an_unsigned_type()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Color: u8\n    Red = -1").contains("does not fit"))
+
+@test("an auto-incremented discriminant that overflows the underlying type is rejected")
+an_auto_incremented_discriminant_that_overflows()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Small: u2\n    A = 3\n    B").contains("does not fit"))
+
+// -- two variants standing for one value ---------------------------------------------------------
+//
+// A simple enum's value is the whole of its identity, so two names for one value leave the language
+// unable to keep its own promises: `Pos` and `Image` stop being inverses, the second variant's arm
+// can never run, and the lowering is a switch with a repeated case.
+
+@test("two variants standing for one value are refused, and the message names both and the value")
+two_variants_standing_for_one_value()
+    if decl_errors_no_library() then return
+
+    val out = refused("enum Colour: int\n    Red = 1\n    Green = 1\n    Blue = 2")
+
+    assert(out.contains("'Red' and 'Green'"))
+    assert(out.contains("both stand for 1"))
+    assert(out.contains("a 'const'"))
+end two_variants_standing_for_one_value
+
+@test("including where an auto-incremented value lands on an explicit one")
+an_auto_incremented_value_landing_on_an_explicit_one()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Colour: int\n    Red = 1\n    Green\n    Blue = 2")
+        .contains("'Green' and 'Blue' both stand for 2"))
+
+@test("and a data enum cannot reach the case at all")
+a_data_enum_cannot_reach_the_case()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Shape\n    Circle(r: int)\n    Empty = 0")
+        .contains("cannot also have an explicit value"))
+
+@test("even where nothing in the program ever names the enum")
+even_where_nothing_names_the_enum()
+    if decl_errors_no_library() then return
+
+    assert(refused("enum Unused: int\n    Red = 1\n    Green = 1\nprint(\"nothing mentions it\")")
+        .contains("both stand for 1"))
+
+@test("and where one value reaches its number through a const")
+where_one_value_reaches_its_number_through_a_const()
+    if decl_errors_no_library() then return
+
+    assert(refused("const TOP: int = 1\nenum Colour: int\n    Red = TOP\n    Green = 1")
+        .contains("'Red' and 'Green' both stand for 1"))
+
+@test("a generic simple enum with two variants standing for one value")
+a_generic_simple_enum_with_two_variants_for_one_value()
+    if decl_errors_no_library() then return
+
+    val out = refused("enum Pair[T]\n    Left = 1\n    Right = 1\nvar p: Pair[int] = Pair[int].Left\n" +
+                      "var q: Pair[bool] = Pair[bool].Left")
+
+    assert(out.contains("'Left' and 'Right' both stand for 1"))
+    assert_eq(times_said(out, "both stand for"), 1)
+end a_generic_simple_enum_with_two_variants_for_one_value
+
+// -- a mistake in an enum declaration is reported once, at the declaration --------------------------
+
+@test("however many times the type is named afterwards")
+however_many_times_the_type_is_named()
+    if decl_errors_no_library() then return
+
+    val out = refused("enum Colour: int\n    Red = 1\n    Green = 1\nprint(Colour::Pos(Colour.Red))\n" +
+                      "print(Colour::Image(Colour.Green))\nprint(Colour::Pos(Colour.Red))")
+
+    assert_eq(times_said(out, "both stand for"), 1)
+    assert(out.contains("1 | enum Colour: int"))
+end however_many_times_the_type_is_named
+
+@test("and the same holds for a discriminant that does not fit")
+the_same_holds_for_a_discriminant_that_does_not_fit()
+    if decl_errors_no_library() then return
+
+    val out = refused("enum Colour: u8\n    Red = 1\n    Green = 300\nprint(Colour::Pos(Colour.Red))\n" +
+                      "print(Colour::Pos(Colour.Red))")
+
+    assert_eq(times_said(out, "does not fit"), 1)
+    assert(out.contains("1 | enum Colour: u8"))
+end the_same_holds_for_a_discriminant_that_does_not_fit
