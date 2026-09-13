@@ -1,0 +1,395 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// The six methods a vector answers to, the two a run of them in memory does, and the comparison
+// that yields a mask.
+//
+// None of it is a *lookup*: nothing declares `select` or `sum`, so there is no member to find and no
+// overload set to narrow -- the name is recognised, the lanes are checked, and one node is built.
+// The reductions divide on what they reduce rather than on their names, and the two memory forms
+// divide on which side of the slice the vector is.
+
+// The names a vector answers to. A different name on a vector falls through to the ordinary
+// complaint, which names the type and says no member of that name exists -- rather than being caught
+// here and answered with a list.
+is_vector_method(name: string) -> bool =
+    name == "select" || name == "sum" || name == "min" || name == "max" || name == "any" ||
+        name == "all"
+
+// The two names a slice or an array answers with a vector's lanes. They are the *receiver's* methods
+// and not the vector's, because what a load needs is an address and a length and a vector has
+// neither.
+is_vector_memory(name: string) -> bool = name == "load" || name == "store"
+
+// Whether the type is a vector, asked of a representation.
+is_vector(t: Type) -> bool = t match
+    Vector(_, _) -> true
+    _ -> false
+
+// Whether a type may be a lane.
+//
+// LLVM's vectors are of scalars: an integer or a float. `bool` is in because a comparison has to
+// produce a mask -- `<N>bool` is LLVM's `<N x i1>` -- and `char` is in because it lowers to `i32`
+// like any other integer. A constrained lane is allowed and a volatile one is not: a subtype is a
+// set of values and lays out as its base, where a `volatile` lane would be asking for per-lane
+// access ordering out of a load that is one instruction for the whole register.
+can_be_lane(t: Type) -> bool = underlying(t) match
+    Integer(_, _, _) -> true
+    Floating(_) -> true
+    Bool -> true
+    Char -> true
+    _ -> false
+
+// A scalar beside a vector is the same value in every lane, which is what the reader means and what
+// every SIMD API in any language provides. It runs after the literal has been read at the lane type,
+// so what arrives here is either already the lane type or a mismatch worth reporting in the
+// operator's own message rather than as a failed broadcast.
+//
+// Two vectors of different widths are left alone: the operator's own check reports them as the
+// mismatched types they are, which names both widths, where a splat here could only fail silently.
+balance_lanes(l: TExpr, r: TExpr) -> (TExpr, TExpr)
+    val lt = repr(texpr_type(l))
+    val rt = repr(texpr_type(r))
+
+    lt match
+        Vector(_, e) ->
+            if !is_vector(rt) && type_eq(rt, repr(*e)) then
+                return (l, TExpr(r.span, TSplat(r, lt)))
+        _ -> ()
+
+    rt match
+        Vector(_, e) ->
+            if !is_vector(lt) && type_eq(lt, repr(*e)) then
+                return (TExpr(l.span, TSplat(l, rt)), r)
+        _ -> ()
+
+    (l, r)
+end balance_lanes
+
+// A comparison where either side is a vector: one link, and a mask rather than a `bool`.
+//
+// **A chain is refused rather than lowered.** `a < b < c` on scalars is two comparisons joined by
+// `&&`, and `&&` short-circuits -- which is a thing no register does, since every lane is computed
+// either way. Reading the chain as a lane-wise `&` would give it the shape of the scalar spelling
+// and a different meaning, so the reader is told to write the `&` themselves and see it.
+vec_compare(cx: &Analyzer, span: Span, ts: Buf[TExpr], ops: Buf[string]) -> TExpr
+    if ts.len() > 2 then
+        return cx.err(span, "a comparison chain joins its links with '&&', which short-circuits " +
+                      "and so has no lane-wise form — compare two vectors at a time and combine " +
+                      "the masks with '&'")
+
+    val pair = balance_lanes(ts.at(0), ts.at(1))
+    val l = pair.0
+    val r = pair.1
+    val lty = repr(texpr_type(l))
+    val op = ops.at(0)
+
+    if !type_eq(lty, repr(texpr_type(r))) then
+        return cx.err(span, s"cannot compare ${type_show(texpr_type(l))} with " +
+                      s"${type_show(texpr_type(r))}")
+
+    val lanes = lty match
+        Vector(n, e) -> (n, underlying(*e))
+        other -> (0, other)
+
+    val equality = op == "==" || op == "!="
+    val ok = lanes.1 match
+        Integer(_, _, _) -> true
+        Floating(_) -> true
+        Bool -> equality
+        _ -> false
+
+    // A mask is `<N>bool`, which is what makes `(a < b).select(x, y)` and `(a < b) & (c < d)`
+    // ordinary values rather than a comparison's private business. `bool` lanes have equality and no
+    // ordering, exactly as a scalar `bool` does.
+    if !ok then return cx.err(span, s"'$op' is not defined for ${type_show(texpr_type(l))}")
+
+    TExpr(span, TVecCompare(op, l, r, Vector(lanes.0, Bool)))
+end vec_compare
+
+// One of the six, checked and lowered.
+//
+// The reductions divide on what they reduce rather than on their names: `sum`, `min` and `max` are
+// arithmetic and belong to a numeric lane, while `any` and `all` are a mask's and belong to a `bool`
+// one. `select` is the only one that is not a reduction at all -- it is the lane-wise `if`, so it is
+// a *mask's* method and yields a vector rather than a scalar.
+vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
+              args: Buf[Expr]) -> TExpr
+    val parts = v match
+        Vector(n, e) -> (n, *e)
+        _ -> (0, Unknown)
+
+    val elem = parts.1
+    val lane = underlying(elem)
+    val is_mask = lane == Bool
+
+    if name == "select"
+        if !is_mask then
+            return cx.err(span, s"'select' chooses between two vectors lane by lane, so it is " +
+                          s"read off a mask — the '<${parts.0}>bool' a comparison yields, as in " +
+                          s"'(a < b).select(a, b)'. ${type_show(v)} is not one")
+
+        return vector_select(cx, span, v, parts.0, tr, args)
+    end if
+
+    if !args.is_empty() then
+        cx.fault(span, s"'$name' takes no arguments — it reduces the ${type_show(v)} it is read off")
+
+    if name == "any" || name == "all"
+        if !is_mask then
+            return cx.err(span, s"'$name' asks whether any lane is true, so it is read off a mask " +
+                          s"— the '<${parts.0}>bool' a comparison yields. ${type_show(v)} is not one")
+
+        return TExpr(span, TReduce(if name == "any" then "or" else "and", tr, Bool))
+    end if
+
+    if is_mask then
+        return cx.err(span, s"'$name' adds or orders its lanes, and a mask's are 'bool' — 'any()' " +
+                      s"and 'all()' are what a ${type_show(v)} reduces with")
+
+    // The float minimum is `fmin` rather than `fminimum`: it is the one that matches `sysl.math`'s
+    // `min`, answering the other operand at a NaN instead of propagating it, so a program does not
+    // get two different answers depending on whether it reduced or folded.
+    val op = lane match
+        Floating(_) -> if name == "sum" then "fadd" else s"f$name"
+        Integer(_, signed, _) -> if name == "sum" then "add" else s"${signed_tag(signed)}$name"
+        _ -> ""
+
+    if op == "" then return cx.err(span, s"'$name' is not defined for ${type_show(v)}")
+
+    TExpr(span, TReduce(op, tr, elem))
+end vector_method
+
+// `m.select(a, b)` -- the lane-wise `if`, and the one vector method whose answer is a vector.
+//
+// **Either side may be a scalar, and nearly always one of them is** -- `(v > hi).select(hi, v)` is
+// what clamping looks like, and requiring a written construction on the constant would be a word in
+// front of the commonest use this method has. So the pair is read the way an operator's operands are
+// read: whichever side turns out to be a vector supplies the lane type, the other is re-read at it,
+// and `balance_lanes` splats.
+private vector_select(cx: &Analyzer, span: Span, v: Type, lanes: int, tr: TExpr,
+                      args: Buf[Expr]) -> TExpr
+    if args.len() != 2 then
+        return cx.err(span, "'select' takes the two vectors to choose between — " +
+                      s"'m.select(whenTrue, whenFalse)', and ${quantity(args.len(), "argument")} " +
+                      s"${if args.len() == 1 then "was" else "were"} given")
+
+    val first = type_expr(cx, args.at(0), None)
+    val second = type_expr(cx, args.at(1), None)
+    val found = vector_among(first, second)
+    val lane = found.and_then(v -> element(v))
+
+    var a = first
+    var b = second
+
+    if lane.is_some()
+        if !is_vector(repr(texpr_type(first))) then a = type_expr(cx, args.at(0), lane)
+        if !is_vector(repr(texpr_type(second))) then b = type_expr(cx, args.at(1), lane)
+
+    val pair = if lane.is_none() then (a, b) else balance_lanes(a, b)
+
+    val at = repr(texpr_type(pair.0))
+    val bt = repr(texpr_type(pair.1))
+
+    // Both sides are the same vector, at the mask's width: a mask of four lanes cannot choose
+    // between registers of eight, and the answer's type is the type being chosen between.
+    if !is_vector(at) || !is_vector(bt) || !type_eq(at, bt) then
+        return cx.err(span, s"'select' chooses between two vectors of one type, and this pair is " +
+                      s"${type_show(texpr_type(pair.0))} and ${type_show(texpr_type(pair.1))}")
+
+    val n = at match
+        Vector(k, _) -> k
+        _ -> 0
+
+    if n != lanes then
+        return cx.err(span, s"a ${type_show(v)} chooses between $lanes lanes, and " +
+                      s"${type_show(texpr_type(pair.0))} has $n")
+
+    TExpr(span, TSelect(tr, pair.0, pair.1, texpr_type(pair.0)))
+end vector_select
+
+// A string is a view of bytes that are valid UTF-8, and a run of them is bytes rather than lanes of
+// anything the string promises -- so the answer is where a program says it wants the bytes, not a
+// second spelling that quietly means the same.
+no_lanes_in_a_string(name: string) -> string
+    if name == "store" then
+        return "a string is immutable, so there is nothing to write lanes into"
+
+    "a string is a view of UTF-8 rather than of lanes — 's.bytes.load(i)' says that a run of bytes " +
+        "is what is wanted, and is what a '<N>u8' is a run of"
+end no_lanes_in_a_string
+
+// Which family of integer minimum and maximum the lane's signedness names.
+private signed_tag(signed: bool) -> string = if signed then "s" else "u"
+
+// Whichever of the two sides is a vector, which is what supplies the lane type the other is re-read
+// at.
+private vector_among(a: TExpr, b: TExpr) -> Option[Type]
+    val at = repr(texpr_type(a))
+
+    if is_vector(at) then return Some(at)
+
+    val bt = repr(texpr_type(b))
+
+    if is_vector(bt) then Some(bt) else None
+end vector_among
+
+// Whether `load` or `store` on this receiver is the compiler's rather than something a program
+// wrote.
+//
+// **A declared member wins.** These are two ordinary words, not spellings only the compiler could
+// mean -- `sysl.sync.Atomic.load` was in the library before either of these existed, and a builtin
+// that claimed the name unconditionally would refuse a retry loop somebody had already written. So
+// the builtin answers only where nothing else does, which is also the precedence a reader would
+// assume: their `impl` block is theirs.
+claims_lanes(cx: &Analyzer, rty: Type, name: string) -> bool
+    if !is_vector_memory(name) then return false
+
+    val found = member_key(cx.an, rty, name)
+
+    !has_member_at(cx.an, found.0, name) &&
+        !cx.an.tables.members.alts.has(member_key_of(found.0, name))
+end claims_lanes
+
+// A receiver that is a pointer at something a lane could be -- the shape somebody reaching for a
+// vector load would have, and nothing else. A `*Atomic[long]` points at a struct and so is not one.
+points_at_a_lane(t: Type) -> bool = repr(t) match
+    Ptr(inner) -> can_be_lane(*inner)
+    _ -> false
+
+// `xs.load(i)` and `xs.store(i, v)`, checked and lowered.
+//
+// **The two are asymmetric in where the width comes from, and deliberately.** A store is told by the
+// vector handed to it. A load has nothing to be told by -- a slice has whatever length it has -- so
+// the width is the *expected* type's. That is what makes the load writable from a
+// `[const W: usize]` body, where the annotation is `<W>f32` and no literal could stand in for the
+// parameter.
+vector_memory(cx: &Analyzer, span: Span, rty: Type, tr: TExpr, name: string, args: Buf[Expr],
+              expected: Option[Type]) -> TExpr
+    val declared = element(rty).unwrap_or(Unknown)
+    val elem = unqualified(declared)
+
+    // **A run of `volatile` elements is refused, and this is the one qualifier that matters here.**
+    // `volatile` says every access happens exactly as written, and a whole-register load is a
+    // different number of accesses from the `W` the elements were declared with. Dropping the
+    // qualifier silently is what the naive reading does, which is a program that reads a device once
+    // where it said `W` times.
+    if !type_eq(declared, elem) then
+        return cx.err(span, s"a run of '${type_show(declared)}' is one access per element and a " +
+                      "vector reaches memory once, so the qualifier cannot be kept — read the " +
+                      "elements one at a time, or hold them in a " +
+                      s"'[]${type_show(elem)}' where a whole register is what the program means " +
+                      "to move")
+
+    if name == "load" then return vector_load(cx, span, rty, tr, elem, args, expected)
+
+    vector_store(cx, span, rty, tr, elem, args)
+end vector_memory
+
+// How many arguments one of the two takes, and what it looks like written out.
+private run_arity(cx: &Analyzer, span: Span, name: string, n: usize, form: string, args: Buf[Expr])
+    if args.len() != n then
+        cx.fault(span, s"'$name' takes ${quantity(n, "argument")} — '$form', and " +
+                 s"${quantity(args.len(), "argument")} " +
+                 s"${if args.len() == 1 then "was" else "were"} given")
+end run_arity
+
+// The index, held to what a subscript holds one to -- this *is* a subscript, of `W` elements.
+private run_start(cx: &Analyzer, e: Expr) -> TExpr
+    val ti = type_expr(cx, e, Some(usize_type(word_bits(cx))))
+
+    repr(texpr_type(ti)) match
+        Integer(_, _, _) -> ti
+        other -> cx.err(e.span, s"the index a run starts at must be an integer, not " +
+                        s"${type_show(other)}")
+end run_start
+
+// What the elements have to be for a run of them to be a vector at all. The lane rule is the one the
+// type's own syntax is held to, asked here of a type nobody wrote as a vector.
+private lanes_or_err(cx: &Analyzer, span: Span, rty: Type, elem: Type, v: Type) -> bool
+    val vec_elem = element(v).unwrap_or(Unknown)
+
+    if !type_eq(repr(vec_elem), repr(elem))
+        cx.fault(span, s"a run of ${type_show(rty)} is a run of ${type_show(elem)}, and " +
+                 s"${type_show(v)} holds ${type_show(vec_elem)}")
+        return false
+    end if
+
+    if !can_be_lane(elem)
+        cx.fault(span, s"${type_show(elem)} cannot be a lane, so a run of ${type_show(rty)} is " +
+                 "not a vector")
+        return false
+    end if
+
+    true
+end lanes_or_err
+
+private vector_load(cx: &Analyzer, span: Span, rty: Type, tr: TExpr, elem: Type, args: Buf[Expr],
+                    expected: Option[Type]) -> TExpr
+    run_arity(cx, span, "load", 1, "xs.load(i)", args)
+
+    if args.is_empty() then return bad_expr(span)
+
+    val want = expected.map(t -> repr(t))
+
+    // Nothing in the expression says how wide the answer is, and guessing a width is the one thing
+    // this must not do -- a kernel's whole correctness is which run it took. So the complaint names
+    // the place the width belongs, which is where the reader would have put it anyway.
+    if want.is_none() then
+        return cx.err(span, "'load' answers a vector, and how many lanes it takes is the vector " +
+                      "type's to say — nothing here says which. Write it where the value is " +
+                      s"bound: 'val v: <4>${type_show(elem)} = xs.load(i)'")
+
+    val v = want.unwrap()
+
+    if !is_vector(v) then
+        return cx.err(span, s"'load' answers a vector, and ${type_show(v)} is what is wanted here")
+
+    lanes_or_err(cx, span, rty, elem, v)
+
+    TExpr(span, TVecLoad(tr, run_start(cx, args.at(0)), v))
+end vector_load
+
+private vector_store(cx: &Analyzer, span: Span, rty: Type, tr: TExpr, elem: Type,
+                     args: Buf[Expr]) -> TExpr
+    run_arity(cx, span, "store", 2, "xs.store(i, v)", args)
+
+    if args.len() != 2 then return bad_expr(span)
+
+    // Written before the index is looked at, because the index is the second thing a reader fixes
+    // and the first is that this run may not be written at all.
+    val probe = TExpr(span, TIndex(tr, TExpr(span, TIntLit(from_int(0), usize_type(word_bits(cx)))),
+                                   elem))
+
+    if read_only_view(rty) then
+        return cx.err(span, s"this run belongs to a '${type_show(rty)}', which views elements it " +
+                      "may not write, so there is nothing to store through. Lanes you may write " +
+                      s"are elements of your own: copy them into a '[]${type_show(elem)}' first")
+
+    if !writable_place(probe) then
+        return cx.err(span, s"'store' writes into the elements it is read off, and " +
+                      s"${type_show(rty)} has no address to write through")
+
+    if written_once_place(cx, probe) then
+        return cx.err(span, "a 'val' is written once, so 'store' has nothing to write through")
+
+    val index = run_start(cx, args.at(0))
+    val value = type_expr(cx, args.at(1), None)
+    val vt = repr(texpr_type(value))
+
+    // A value whose own reading failed has been complained about already, and a second complaint
+    // here would name the store for a mistake inside it.
+    if vt == Unknown then return bad_expr(span)
+
+    if !is_vector(vt) then
+        return cx.err(span, s"'store' writes a vector's lanes, and ${type_show(vt)} is not one — " +
+                      s"'val v: <4>${type_show(elem)} = …' is what a run of ${type_show(rty)} is " +
+                      "stored from")
+
+    lanes_or_err(cx, span, rty, elem, vt)
+
+    TExpr(span, TVecStore(tr, index, value))
+end vector_store

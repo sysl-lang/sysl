@@ -1,0 +1,177 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+import sysl.text.parse_real
+
+// **The register file.** A vector is a value with no address, so every form here is an instruction
+// over registers -- the two exceptions being `load` and `store`, which are the only vector
+// operations that reach memory and the only ones that can fail.
+
+// A vector built lane by lane with `insertelement`, which is the array literal's `insertvalue` chain
+// in the register file -- and never through a slot, however wide it is: a value that is not storage
+// cannot be built in storage. LLVM folds a chain of constant lanes into a literal, so a splat of
+// constants costs nothing at run time.
+gen_vector_lit(e: *Emit, lanes: Buf[TExpr], vec_ty: Type) -> Val
+    var vals: Buf[Val] = buf()
+
+    for i in 0..<lanes.len()
+        vals.push(gen_expr(e, lanes.at(i)))
+
+    val vty = lty(e, vec_ty)
+    val ety = lty(e, element(vec_ty).unwrap_or(Unknown))
+    var acc: Val = VZero
+
+    for i in 0..<vals.len()
+        val r = fresh_reg(e)
+
+        emit(e, InInsertElement(r, vty, acc, ety, vals.at(i),
+                                ir_arg(l_i32(), VInt(from_int(long(i))))))
+        acc = r
+
+    acc
+end gen_vector_lit
+
+// The splat, in LLVM's own idiom: put the value in lane zero and shuffle it across with an all-zero
+// mask. `shufflevector` with a zero mask is the pattern every back end recognises, and it lowers to
+// one broadcast instruction where the machine has one.
+gen_splat(e: *Emit, value: TExpr, vec_ty: Type) -> Val
+    val v = gen_expr(e, value)
+    val vty = lty(e, vec_ty)
+    val one = fresh_reg(e)
+
+    emit(e, InInsertElement(one, vty, VPoison, lty(e, element(vec_ty).unwrap_or(Unknown)), v,
+                            ir_arg(l_i32(), VInt(from_int(0)))))
+
+    val n = repr(vec_ty) match
+        Vector(k, _) -> k
+        _ -> 0
+
+    val r = fresh_reg(e)
+
+    emit(e, InShuffle(r, vty, one, VPoison, ir_arg(LVec(n, l_i32()), VZero)))
+    r
+end gen_splat
+
+// One lane, read straight out of the register. There is no address and so no bounds test: the index
+// was held to a constant in range where it was written.
+gen_lane(e: *Emit, receiver: TExpr, lane: int) -> Val
+    val v = gen_expr(e, receiver)
+    val r = fresh_reg(e)
+
+    emit(e, InExtractElement(r, lty(e, texpr_type(receiver)), v,
+                             ir_arg(l_i32(), VInt(from_int(long(lane))))))
+    r
+end gen_lane
+
+// A lane-wise comparison is the scalar instruction at the register's width -- `fcmp olt <4 x float>`
+// yields the `<4 x i1>` that is this language's `<4>bool`. The predicate is chosen exactly as the
+// scalar path chooses it, from the lane's own type and signedness.
+gen_vec_compare(e: *Emit, op: string, l: TExpr, r: TExpr) -> Val
+    val lv = gen_expr(e, l)
+    val rv = gen_expr(e, r)
+    val vty = lty(e, texpr_type(l))
+    val lane = underlying(element(repr(texpr_type(l))).unwrap_or(Unknown))
+    val res = fresh_reg(e)
+
+    lane match
+        Floating(_) -> emit(e, InFloatCmp(res, float_pred(e, op), vty, lv, rv))
+        _ -> emit(e, InIntCmp(res, int_pred(e, op, lane), vty, lv, rv))
+
+    res
+end gen_vec_compare
+
+// Both sides are evaluated and the mask picks between them, which is the whole difference from an
+// `if` and is why this is not one.
+gen_select(e: *Emit, mask: TExpr, when_true: TExpr, when_false: TExpr, ty: Type) -> Val
+    val m = gen_expr(e, mask)
+    val a = gen_expr(e, when_true)
+    val b = gen_expr(e, when_false)
+    val r = fresh_reg(e)
+
+    emit(e, InSelect(r, m, lty(e, ty), a, b, lty(e, texpr_type(mask))))
+    r
+end gen_select
+
+// A vector folded to one lane.
+//
+// **The float sum takes a starting accumulator and the others do not**, which is not a symmetry LLVM
+// chose lightly: floating addition is not associative, so the intrinsic makes you say what to start
+// from and whether the order may be changed. `-0.0` is the identity -- `0.0` would turn a sum of
+// nothing but negative zeros positive -- and `reassoc` is what licenses the tree that makes this
+// worth doing at all rather than a left fold in disguise.
+gen_reduce(e: *Emit, op: string, receiver: TExpr, ty: Type) -> Val
+    val v = gen_expr(e, receiver)
+    val vty = lty(e, texpr_type(receiver))
+    val ety = lty(e, element(repr(texpr_type(receiver))).unwrap_or(Unknown))
+    val rty = lty(e, ty)
+    val name = s"llvm.vector.reduce.$op.${vector_suffix(vty)}"
+
+    var params: Buf[IrParam] = buf()
+    var ops: Buf[IrArg] = buf()
+    var fast: Buf[FastMath] = buf()
+
+    if op == "fadd"
+        params.push(ir_param(ety))
+        ops.push(ir_arg(ety, VFloat(neg_zero_bits())))
+        fast.push(FmReassoc)
+    end if
+
+    params.push(ir_param(vty))
+    ops.push(ir_arg(vty, v))
+    request_intrinsic(e, ir_sig(name, ir_fn_type(rty, params)))
+
+    val r = fresh_reg(e)
+
+    emit(e, InCall(Some(r), rty, VGlobal(name), ops, no_ir_attrs(), None, fast, false))
+    r
+end gen_reduce
+
+// The overload suffix an intrinsic's name carries, which for a reduction is the **vector's** type
+// rather than the lane's.
+private vector_suffix(t: LType) -> string = l_overload_suffix(t) match
+    Some(s) -> s
+    None -> l_render(t)
+
+// The bit pattern of negative zero. There is no conversion from a float to its bits in the standard
+// library, so it is the reinterpretation `ptr_cast` already licenses -- and the value is read from
+// text rather than written as `-0.0`, which a fold is free to answer as a positive zero.
+private neg_zero_bits() -> long
+    var v = parse_real("-0.0").unwrap_or(0.0)
+    val p: *i64 = ptr_cast(&v)
+
+    *p
+end neg_zero_bits
+
+// **The alignment is the element's, not the register's, and that is what a slice can promise.** A
+// `[]f32` says its elements are four-byte-aligned and says nothing whatever about where the run
+// begins -- a slice of one is a slice of any of them. Claiming the vector's own alignment would be a
+// promise the type does not make, and an over-aligned `load` is not a slow load but undefined
+// behaviour the moment it is wrong. Every machine sysl targets has an unaligned vector load that
+// costs the same as the aligned one on aligned data, so the honest number is also the free one.
+gen_vec_load(e: *Emit, receiver: TExpr, index: TExpr, vec_ty: Type) -> Val
+    val elem = element(repr(vec_ty)).unwrap_or(Unknown)
+    val p = run_addr(e, receiver, index, vector_lanes(vec_ty))
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, vec_ty), p, AccPlain, Some(int(e.layout.align(elem)))))
+    r
+end gen_vec_load
+
+// The value first and the address second, which is the order an assignment uses -- this *is* an
+// assignment to a run of elements, and the two spellings must not differ in when a side effect in
+// the value happens relative to the bounds check on the run.
+gen_vec_store(e: *Emit, receiver: TExpr, index: TExpr, value: TExpr) -> Val
+    val vec_ty = texpr_type(value)
+    val elem = element(repr(vec_ty)).unwrap_or(Unknown)
+    val v = gen_expr(e, value)
+    val p = run_addr(e, receiver, index, vector_lanes(vec_ty))
+
+    emit(e, InStore(lty(e, vec_ty), v, p, AccPlain, Some(int(e.layout.align(elem)))))
+    VNothing
+end gen_vec_store
+
+// How many lanes a vector type has.
+private vector_lanes(t: Type) -> int = repr(t) match
+    Vector(n, _) -> n
+    _ -> 0

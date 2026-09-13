@@ -358,8 +358,37 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
                     cx.fault(span, "'copy' takes no arguments — it copies the string it is read off")
 
                 TExpr(span, TFromBytes(TExpr(span, TBytes(receiver))))
+            else if claims_lanes(cx, rty, name) then cx.err(span, no_lanes_in_a_string(name))
             else call_declared(cx, span, receiver, rty, name, args, expected)
-        _ -> call_declared(cx, span, receiver, rty, name, args, expected)
+
+        // The vector's own methods, which are the compiler's for the reason the intrinsic table is
+        // closed: each is one LLVM operation and none of them can be written in sysl.
+        Vector(_, _) ->
+            if is_vector_method(name) then vector_method(cx, span, rty, receiver, name, args)
+            else call_declared(cx, span, receiver, rty, name, args, expected)
+
+        // The two that move lanes between a register and memory. They are the slice's rather than
+        // the vector's because the receiver is what supplies the address and the length -- a vector
+        // has neither, which is the whole reason these had to exist.
+        Array(_, _) ->
+            if claims_lanes(cx, rty, name) then
+                vector_memory(cx, span, rty, auto_deref(cx, receiver), name, args, expected)
+            else call_declared(cx, span, receiver, rty, name, args, expected)
+        Slice(_, _) ->
+            if claims_lanes(cx, rty, name) then
+                vector_memory(cx, span, rty, auto_deref(cx, receiver), name, args, expected)
+            else call_declared(cx, span, receiver, rty, name, args, expected)
+        _ ->
+            // A `*T` is a bare address, and the unchecked tier is where a program that has one
+            // already is. What it does not have is a length, so there is nothing for a run to be
+            // checked against -- and a load that silently skipped the check would be the one vector
+            // operation that could read past the end of an object. Only where the pointee could be a
+            // lane, which is what keeps this from answering for every `*T` in the language.
+            if is_vector_memory(name) && points_at_a_lane(texpr_type(receiver)) then
+                cx.err(span, s"a '${type_show(texpr_type(receiver))}' carries no length, so a run " +
+                       "of its elements has nothing to be checked against — take a slice of them " +
+                       "first, with 'p[0..<n]'")
+            else call_declared(cx, span, receiver, rty, name, args, expected)
 end call_member
 
 // A member the tables hold, called.
@@ -580,7 +609,8 @@ private recheck_after(cx: &Analyzer, span: Span, recv_arg: TExpr, call: TExpr) -
 // Which written argument fills which of a member's parameters. The receiver is not among them, so
 // this is the free function's rule read one slot in.
 bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
-                         args: Buf[Expr]) -> Option[Buf[Option[Expr]]]
+                         written_args: Buf[Expr]) -> Option[Buf[Option[Expr]]]
+    val args = pack_rest(cx, shown, m.params, written_args, true)
     var slots: Buf[Option[Expr]] = buf()
 
     for i in 0..<m.params.len()
