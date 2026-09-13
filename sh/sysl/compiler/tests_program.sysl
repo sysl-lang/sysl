@@ -1055,6 +1055,36 @@ an_enum_reads_an_integer_through_try()
                 "'Shape' carries data, so only a simple enum converts to and from an integer"),
            listed(complaints(carrying)))
 
+@test("a trait default a generic type's implementation left out is produced for each instantiation")
+an_inherited_default_on_a_generic_type()
+    if no_library() then return
+
+    val src = "trait P\n" +
+              "    fill(*self, n: int)\n\n" +
+              "    twice(*self, n: int) = self.fill(n + n)\n\n" +
+              "struct Counter\n" +
+              "    total: int\n\n" +
+              "    add(*self, n: int) = self.total += n\n\n" +
+              "impl P for Counter\n" +
+              "    fill(*self, n: int) = self.add(n)\n\n" +
+              "struct Wrap[M: P]\n" +
+              "    inner: M\n\n" +
+              "impl[M: P] P for Wrap[M]\n" +
+              "    fill(*self, n: int) = self.inner.fill(n)\n\n" +
+              "var w = Wrap(Counter(0))\n\n" +
+              "w.twice(3)\n"
+
+    assert_eq(listed(complaints(src)), "")
+
+    // **The receiver is the instantiation rather than an unresolved `Self`.** The copy's own `Self`
+    // is the trait's spelling and is read through the binding the instantiation makes, so a binding
+    // that resolved to nothing left the whole body untyped — a symbol the linker asks for and
+    // nothing defines, which no analysis complains about.
+    val out = shown(src, "Wrap.twice.Counter")
+
+    assert(out.contains("_2: *Wrap[Counter]"), out)
+    assert(out.contains("name: \"Wrap.fill.Counter\""), out)
+
 @test("a module written before the dot names a variant in it, and an enum in it")
 a_module_qualifies_what_it_declares()
     if no_library() then return
