@@ -47,13 +47,22 @@ struct Manifest
     // and its archive to link -- and a consumer who answered one of them has not got a build.
     pkg_config: Buf[(string, string)]
 
+    // The `defines` block: the macros this package's **own carried C** is compiled with, each path
+    // written relative to the package root and paired with the macros as clang spells them.
+    //
+    // **A package says this and a consumer does not.** Which of miniz's four `MINIZ_NO_*` switches
+    // are set decides what that package *is*, and it changes the size of a state its own `c const`
+    // block measures — so the options are the author's and the consumer should no more be typing
+    // them than choosing its warning flags.
+    defines: Buf[(string, Buf[string])]
+
     // A key this compiler does not understand is said out loud and then ignored, once per key.
     warnings: Buf[string]
 end Manifest
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
-    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf())
+    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -251,6 +260,7 @@ read_manifest(text: string) -> Result[Manifest, string]
         Some(block) -> conf_flags_set(block)
 
     val pkg_config = read_pkg_config(root)?
+    val defines = read_defines(root)?
 
     val capabilities = conf_at(root, "capabilities") match
         None -> buf()
@@ -287,8 +297,182 @@ read_manifest(text: string) -> Result[Manifest, string]
                 "so it was ignored")
 
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
-                target_capabilities, pkg_config, warnings))
+                target_capabilities, pkg_config, defines, warnings))
 end read_manifest
+
+// The `defines` block: what each C file this package carries is compiled with.
+//
+// **A key is a path this package's own tree holds**, written with `/` and relative to the package
+// root. It is not a general flags channel — it cannot reach an installed library's headers, add an
+// include path, or pass anything that is not a macro.
+private read_defines(root: &Conf) -> Result[Buf[(string, Buf[string])], string]
+    var out: Buf[(string, Buf[string])] = buf()
+
+    val block = conf_at(root, "defines") match
+        None -> return Ok(out)
+        Some(found) -> found
+
+    val keys = conf_keys(block)
+
+    for i in 0..<keys.len()
+        val key = keys.at(i)
+        val sub = conf_at(block, key).unwrap()
+        val named = *sub match
+            Block(_) -> conf_keys(sub)
+            _ -> return Err(s"'defines.\"$key\"' is not a block of macros — a key is the C this " +
+                     "package carries and what follows it is what that C is compiled with")
+
+        var macros: Buf[string] = buf()
+
+        for j in 0..<named.len()
+            macros.push(macro_of(key, named.at(j), conf_at(sub, named.at(j)).unwrap())?)
+
+        val paths = expand_alternatives(key)?
+
+        for j in 0..<paths.len()
+            c_source_key(paths.at(j))?
+
+            // A file configured from two blocks has no sensible merge: the later would silently
+            // win, which is the one outcome nobody could have intended by writing both.
+            for k in 0..<out.len()
+                if out.at(k).0 == paths.at(j) then
+                    return Err(s"'defines' configures '${paths.at(j)}' from more than one block — " +
+                               "a file is compiled once, so it is said in one place")
+
+            out.push((paths.at(j), macros))
+
+    Ok(out)
+end read_defines
+
+// A key's alternatives, as a shell writes them: `a/{x,y}.c` is `a/x.c` and `a/y.c`, and several
+// groups give the cross product.
+//
+// **A brace and not a glob.** A `*` would pick up a `.c` added later without anybody deciding, and
+// these are macros that change a struct's layout — a file joining the set by accident is the exact
+// failure this block exists to prevent, and it would fail the way the others do, silently.
+expand_alternatives(key: string) -> Result[Buf[string], string]
+    val start = key.index_of("{")
+
+    if start.is_none()
+        if key.index_of("}").is_some() then return Err(unbalanced_brace(key))
+
+        var one: Buf[string] = buf()
+
+        one.push(key)
+        return Ok(one)
+    end if
+
+    val at = start.unwrap()
+    val closed = key[at..].index_of("}")
+
+    if closed.is_none() then return Err(unbalanced_brace(key))
+
+    val end_at = at + closed.unwrap()
+    val group = key[(at + 1)..<end_at]
+
+    if group.index_of("{").is_some() then
+        return Err(s"'defines.\"$key\"' nests one group of alternatives inside another, which " +
+                   "says nothing a flat list does not")
+
+    val parts = split_alternatives(group)
+    var out: Buf[string] = buf()
+
+    for i in 0..<parts.len()
+        if parts.at(i) == "" then
+            return Err(s"'defines.\"$key\"' has an empty alternative — whichever was meant can be " +
+                       "written out, and a group naming nothing configures nothing")
+
+        val rest = expand_alternatives(key[0..<at] + parts.at(i) + key[(end_at + 1)..])?
+
+        for j in 0..<rest.len()
+            out.push(rest.at(j))
+
+    Ok(out)
+end expand_alternatives
+
+private unbalanced_brace(key: string) -> string =
+    s"'defines.\"$key\"' has an unbalanced brace — alternatives are written '{one,two}', as a " +
+    "shell writes them"
+
+// One group's alternatives, which is a split on commas that keeps an empty one so it can be refused.
+private split_alternatives(group: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var start: usize = 0
+
+    for i in 0..<group.bytes.len
+        if group.bytes[i] == u8(',')
+            out.push(group[start..<i])
+            start = i + 1
+
+    out.push(group[start..])
+    out
+end split_alternatives
+
+// One `NAME = value` line, as clang spells it.
+//
+// **`false` is refused**: a reader would have to guess between "do not define this" and `-DNAME=0`,
+// and those differ under `#ifdef`. Whichever was meant can be said exactly.
+private macro_of(path: string, name: string, value: &Conf) -> Result[string, string]
+    if !macro_name(name) then
+        return Err(s"'defines.\"$path\".$name' is not a name a C macro can have — letters, digits " +
+                   "and '_', not starting with a digit")
+
+    *value match
+        Flag(true) -> Ok(name)
+        Flag(false) -> Err(s"'defines.\"$path\".$name' is false, which does not say which of two " +
+                           "things is meant — leave the line out to not define it, or write '0' " +
+                           "to define it as zero, which '#ifdef' still sees")
+        Text(v) -> Ok(s"$name=$v")
+        _ -> Err(s"'defines.\"$path\".$name' must be true or a scalar — a macro is text the C " +
+                 "preprocessor substitutes, so there is nothing a block or a list could mean")
+end macro_of
+
+// Whether a name is one the C preprocessor could carry.
+private macro_name(name: string) -> bool
+    if name == "" then return false
+
+    for i in 0..<name.bytes.len
+        val b = name.bytes[i]
+        val letter = (b >= u8('A') && b <= u8('Z')) || (b >= u8('a') && b <= u8('z')) || b == u8('_')
+        val digit = b >= u8('0') && b <= u8('9')
+
+        if !letter && !(digit && i > 0) then return false
+
+    true
+end macro_name
+
+// Whether a `defines` key names a C file this package could be carrying. The three refusals are the
+// three ways a path could name something that is not this package's to configure.
+private c_source_key(path: string) -> Result[unit, string]
+    if !path.ends_with(".c") then
+        return Err(s"'defines.\"$path\"' does not name a '.c' file — a macro is given to a " +
+                   "translation unit, and only the C this package carries is one it compiles")
+
+    if path.starts_with("/") then
+        return Err(s"'defines.\"$path\"' is an absolute path — a key names the C this package " +
+                   "carries, which is written relative to the package's own root")
+
+    if path == ".." || path.starts_with("../") || path.index_of("/../").is_some() then
+        return Err(s"'defines.\"$path\"' climbs out of the package — a key names the C this " +
+                   "package carries, and nothing above it is this package's to configure")
+
+    Ok(())
+end c_source_key
+
+// The macros the C at `src` is compiled with, where the tree it was found in declared any.
+//
+// **The declared path is matched against the file the walk actually returned** rather than joined to
+// the root: a walk answers an absolute, canonical path whatever the reader typed, so `sysl test .`
+// yields `/private/tmp/…/miniz.c` for a root of `.` and a joined `./sh/…/miniz.c` is the same file
+// and not the same string — reaching nothing, and reaching it quietly.
+defines_for(m: &Manifest, src: string) -> Buf[string]
+    for i in 0..<m.defines.len()
+        val declared = m.defines.at(i).0
+
+        if src == declared || src.ends_with(s"/$declared") then return m.defines.at(i).1
+
+    buf()
+end defines_for
 
 // The `requires.pkg_config` sub-block, in the order `pkg-config` will be asked.
 //

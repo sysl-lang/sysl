@@ -208,3 +208,83 @@ a_packages_directory_is_where_its_c_is_found()
     assert(found.at(0).ends_with("side.c"), found.at(0))
     remove_dir_all(root).unwrap_or(())
 end a_packages_directory_is_where_its_c_is_found
+
+// -- what a package's own carried C is compiled with -----------------------------------------------
+
+@test("a 'defines' block says what each carried C file is compiled with")
+a_defines_block()
+    val m = read("defines {\n  \"c/one.c\" {\n    LESS_MEMORY = 1\n    NO_STDIO    = true\n  }\n}\n")
+
+    assert_eq(m.defines.len(), 1)
+    assert_eq(m.defines.at(0).0, "c/one.c")
+    assert_eq(m.defines.at(0).1.len(), 2)
+
+    // **`true` is a bare `-DNAME`** — what a `#ifdef` wants — and anything else scalar is
+    // `-DNAME=value`, which is what a `#if` wants.
+    assert_eq(m.defines.at(0).1.at(0), "LESS_MEMORY=1")
+    assert_eq(m.defines.at(0).1.at(1), "NO_STDIO")
+
+@test("a key's braces are alternatives, so one list configures every file that shares it")
+a_braced_key_expands()
+    val m = read("defines {\n  \"c/{one,two}.c\" {\n    OPT = true\n  }\n}\n")
+
+    assert_eq(m.defines.len(), 2)
+    assert_eq(m.defines.at(0).0, "c/one.c")
+    assert_eq(m.defines.at(1).0, "c/two.c")
+    assert_eq(m.defines.at(1).1.at(0), "OPT")
+
+    val two = read("defines {\n  \"{a,b}/{x,y}.c\" {\n    OPT = true\n  }\n}\n")
+
+    assert_eq(two.defines.len(), 4)
+    assert_eq(two.defines.at(0).0, "a/x.c")
+    assert_eq(two.defines.at(3).0, "b/y.c")
+
+@test("'false' does not say which of two things is meant, and neither does a brace with no pair")
+a_defines_block_refused()
+    assert_eq(refused("defines {\n  \"c/one.c\" {\n    OPT = false\n  }\n}\n"),
+              "'defines.\"c/one.c\".OPT' is false, which does not say which of two things is " +
+              "meant — leave the line out to not define it, or write '0' to define it as zero, " +
+              "which '#ifdef' still sees")
+    assert_eq(refused("defines {\n  \"c/{one.c\" {\n    OPT = true\n  }\n}\n"),
+              "'defines.\"c/{one.c\"' has an unbalanced brace — alternatives are written " +
+              "'{one,two}', as a shell writes them")
+    assert_eq(refused("defines {\n  \"c/{one,}.c\" {\n    OPT = true\n  }\n}\n"),
+              "'defines.\"c/{one,}.c\"' has an empty alternative — whichever was meant can be " +
+              "written out, and a group naming nothing configures nothing")
+
+@test("a key names a '.c' file this package carries, and nothing above it")
+a_defines_key_names_carried_c()
+    assert_eq(refused("defines {\n  \"c/one.h\" {\n    OPT = true\n  }\n}\n"),
+              "'defines.\"c/one.h\"' does not name a '.c' file — a macro is given to a " +
+              "translation unit, and only the C this package carries is one it compiles")
+    assert(refused("defines {\n  \"/tmp/one.c\" {\n    OPT = true\n  }\n}\n")
+               .ends_with("which is written relative to the package's own root"),
+           refused("defines {\n  \"/tmp/one.c\" {\n    OPT = true\n  }\n}\n"))
+    assert(refused("defines {\n  \"../one.c\" {\n    OPT = true\n  }\n}\n")
+               .ends_with("and nothing above it is this package's to configure"),
+           refused("defines {\n  \"../one.c\" {\n    OPT = true\n  }\n}\n"))
+
+@test("a file configured from two blocks is refused, a file being compiled once")
+a_file_configured_twice()
+    assert_eq(refused("defines {\n  \"c/{one,two}.c\" {\n    A = true\n  }\n" +
+                      "  \"c/two.c\" {\n    B = true\n  }\n}\n"),
+              "'defines' configures 'c/two.c' from more than one block — a file is compiled once, " +
+              "so it is said in one place")
+
+@test("the declared path is matched against the path the walk found the file at")
+defines_reach_the_file_the_walk_found()
+    // A walk answers an absolute, canonical path whatever the reader typed, so joining the root to
+    // the declared path gives the same file under a different string — which reaches nothing, and
+    // reaches it quietly.
+    val m = read("defines {\n  \"sh/sysl/miniz/c/miniz.c\" {\n    TDEFL_LESS_MEMORY = 1\n  }\n}\n")
+
+    assert_eq(defines_for(m, "/tmp/pkg/sh/sysl/miniz/c/miniz.c").len(), 1)
+    assert_eq(defines_for(m, "/tmp/pkg/sh/sysl/miniz/c/miniz.c").at(0), "TDEFL_LESS_MEMORY=1")
+    assert_eq(defines_for(m, "sh/sysl/miniz/c/miniz.c").len(), 1)
+    assert_eq(defines_for(m, "/tmp/pkg/sh/sysl/miniz/c/shim.c").len(), 0)
+
+    // A name that is not one the preprocessor could carry is refused where it is written.
+    assert(refused("defines {\n  \"c/one.c\" {\n    \"1BAD\" = true\n  }\n}\n")
+               .starts_with("'defines.\"c/one.c\".1BAD' is not a name a C macro can have"),
+           refused("defines {\n  \"c/one.c\" {\n    \"1BAD\" = true\n  }\n}\n"))
+end defines_reach_the_file_the_walk_found
