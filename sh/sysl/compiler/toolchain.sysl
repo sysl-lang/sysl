@@ -223,6 +223,21 @@ link_command(cc: string, ll: string, objects: Buf[string], exe: string, target: 
 
     out.push(dead_strip(target))
 
+    val machine = machine_flags(target)
+
+    for i in 0..<machine.len()
+        out.push(machine.at(i))
+
+    val linker = linker_flags(target)
+
+    for i in 0..<linker.len()
+        out.push(linker.at(i))
+
+    val given = link_search_flags()
+
+    for i in 0..<given.len()
+        out.push(given.at(i))
+
     val search = probed_search_flags(probed)
 
     for i in 0..<search.len()
@@ -243,10 +258,70 @@ link_command(cc: string, ll: string, objects: Buf[string], exe: string, target: 
     for i in 0..<libs.len()
         out.push(libs.at(i))
 
+    val rpaths = rpath_flags(target)
+
+    for i in 0..<rpaths.len()
+        out.push(rpaths.at(i))
+
     out.push("-o")
     out.push(exe)
     out
 end link_command
+
+// What the machine needs said to clang **beyond its triple**, on every command line that produces
+// code for it or reads a header as it.
+//
+// There is one such thing today and it is the floating-point unit. A triple names an architecture
+// and a calling convention, and on Arm those two leave the *presence* of the unit unstated: the
+// `eabi` suffix was only ever a statement about where arguments travel, so what is left is clang's
+// default for the architecture. **Both answers are given, because leaving one of them to the default
+// left it to the toolchain** -- `thumbv8m.main-none-eabi` defines `__ARM_FP` under one clang and
+// nothing at all under another, so one machine compiled a multiply to `vmul.f32` and another to
+// `__aeabi_fmul`.
+//
+// **`-mfloat-abi` goes with `-mfpu`, because `soft` overrides it.** A Thumb row states the pair --
+// `soft`+`none`, `softfp`+its unit, or `hard`+its unit -- and none of the three is left for a
+// default to decide. It is Arm's flag because Arm is where the triple is silent: RISC-V says it in
+// the triple, so `riscv32-unknown-elf` has no F extension to turn off and nothing is passed.
+machine_flags(t: Target) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if t.cpu != Thumb then return out
+
+    if t.no_fpu
+        out.push("-mfloat-abi=soft")
+        out.push("-mfpu=none")
+        return out
+    end if
+
+    if t.fpu == "" then return out
+
+    out.push(if t.soft_float then "-mfloat-abi=softfp" else "-mfloat-abi=hard")
+    out.push(s"-mfpu=${t.fpu}")
+    out
+end machine_flags
+
+// What a target needs said to the **linker** beyond its triple, which today is WebAssembly's and
+// nobody else's.
+//
+// `wasm-ld` is not a variation on `ld` and the driver's defaults for it are a hosted program's:
+// without `-nostdlib` the link opens with `crt1.o`, `-lc` and a wasm builtins archive, none of which
+// exists for `wasm32-unknown-unknown`. **`--entry=main` is the load-bearing half, and the reason is a
+// link that SUCCEEDS**: the obvious `--no-entry` paired with `--gc-sections` leaves nothing reachable
+// from anywhere, so the linker drops the whole program and reports success.
+//
+// **None of it applies to `wasm32-wasi`**, which is the same processor with a libc under it: wasi-libc
+// supplies the `_start` a runtime calls. The condition is therefore the operating system and not the
+// processor.
+linker_flags(t: Target) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if t.cpu == Wasm32 && t.os == Freestanding
+        out.push("-nostdlib")
+        out.push("-Wl,--entry=main")
+
+    out
+end linker_flags
 
 // One C file assembled into a relocatable object.
 //
@@ -263,10 +338,25 @@ compile_c(cc: string, src: string, obj: string, target: Target,
     args.push("-ffunction-sections")
     args.push("-fdata-sections")
 
+    val machine = machine_flags(target)
+
+    for i in 0..<machine.len()
+        args.push(machine.at(i))
+
+    if target.short_enums then args.push("-fshort-enums")
+
     val extra = extra_cflags()
 
     for i in 0..<extra.len()
         args.push(extra.at(i))
+
+    // **Where a command line said the headers are, which is the only answer a cross build has.**
+    // `pkg-config` speaks for this machine, so a compilation for a board is told by the flags or is
+    // told by nothing.
+    val given = supplied_cflags()
+
+    for i in 0..<given.len()
+        args.push(given.at(i))
 
     // **What a probe answered is what makes a shim compile at all.** A binding's own C includes the
     // installed library's headers, and the directory they are in is the thing `pkg-config` was asked
@@ -305,6 +395,12 @@ compile_object(cc: string, ir: string, obj: string, target: Target,
     args.push(level_flag(level))
     args.push("-ffunction-sections")
     args.push("-fdata-sections")
+
+    val machine = machine_flags(target)
+
+    for i in 0..<machine.len()
+        args.push(machine.at(i))
+
     args.push(ll)
     args.push("-o")
     args.push(obj)

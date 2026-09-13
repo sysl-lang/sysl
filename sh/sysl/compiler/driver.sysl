@@ -5,6 +5,7 @@ import sysl.buf.{Buf, buf}
 import sysl.text.{str_builder, Search}
 import sysl.fs.{make_temp_dir, remove_dir_all, remove_file, current_dir, make_dir_all, write_text}
 import sysl.process.{run as run_child, Status}
+import sysl.env.{get as env_var}
 
 // What one invocation compiles: the program's files, the packages it depends on, and the standard
 // module every program is compiled against.
@@ -263,9 +264,17 @@ emit_llvm_text(path: string, named_target: Option[string]) -> Result[Emitted, Re
     // a second time; their bodies arrive from the artifact at link time. It is asked after the
     // pruning and not before: a library function this program never calls is dropped exactly as it
     // was, and what `precompiled` changes is only what happens to the ones it does call.
-    val linked = std_artifact(t) match
-        Err(why) -> return Err(Refusal(why))
-        Ok(found) -> found
+    // **A machine with no toolchain has no artifact, and that is the one target this command is the
+    // whole story for.** CRAFT's back end is out of tree, so `sysl emit-llvm --target
+    // craft-freestanding` is how a program for it is produced at all -- refusing here for want of an
+    // archive nothing was going to link would refuse the command in the only case it is essential.
+    // Nothing is precompiled, so the library's bodies are lowered into the text with the program's.
+    var linked = StdArtifact(buf(), "")
+
+    if t.builds_with_clang()
+        linked = std_artifact(t) match
+            Err(why) -> return Err(Refusal(why))
+            Ok(found) -> found
 
     val lowered = codegen_with_gaps(kept with { precompiled = linked.precompiled }, t, promotions)
 
@@ -451,9 +460,7 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
         Err(why) -> return Err(Refusal(why))
         Ok(found) -> found
 
-    val probed = probe_libs(pkg_config_needs(path)?, t) match
-        Err(why) -> return Err(Refusal(why))
-        Ok(found) -> found
+    val probed = supplied_or_refused(path, t)?
 
     val staging = make_temp_dir("sysl-c-") match
         Err(_) -> return Err(Refusal("cannot make a directory to build the archive in"))
@@ -616,9 +623,7 @@ private link_lowered_text(path: string, text: string, t: Target, cc: Option[stri
     // **What this machine says about the libraries the packages named**, asked once for the whole
     // build. It answers both halves of one fact: the `--cflags` a binding's own C is compiled with,
     // and the `-L`, `-l` and `-Wl,-rpath` its archive is linked with.
-    val probed = probe_libs(pkg_config_needs(path)?, t) match
-        Err(why) -> return Err(Refusal(why))
-        Ok(found) -> found
+    val probed = supplied_or_refused(path, t)?
 
     val objects = native_objects(clang, path, exe, t, level, probed)?
 
@@ -731,6 +736,51 @@ private discard_staging(staging: Option[string])
 //
 // The machine is asked about before anything is read, because a library artifact is object code and
 // a target with no toolchain has nothing an artifact could be.
+// `sysl build-lib [--target <name>] <path>` -- one library compiled ahead of time into the artifact
+// a program links instead of compiling it again.
+//
+// **It compiles the tree it is given and fetches nothing**, which is the one thing about the command
+// a reader has to be told: a `dependencies` block every other command honours is refused here by
+// name, because there is no program to resolve a graph for and the artifact would be keyed to a
+// resolution nobody made.
+build_library_of(path: string, named_target: Option[string],
+                 out: Option[string]) -> Result[string, Refusal]
+    val t = target_for(path, named_target)?
+
+    if !t.builds_with_clang() then return Err(Refusal(t.no_toolchain()))
+
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+    val manifest = manifest_at(root)?
+
+    if !manifest.dependencies.is_empty()
+        var labels = ""
+
+        for i in 0..<manifest.dependencies.len()
+            if i > 0 then labels = labels + ", "
+
+            labels = labels + s"'${manifest.dependencies.at(i).label}'"
+
+        return Err(Refusal("build-lib compiles the tree it is given and fetches nothing, so this " +
+            s"package's dependencies reach it through --lib rather than through 'dependencies' — " +
+            s"supply $labels as a source root or as a '.syslib' built from one"))
+    end if
+
+    // The two requirements a command line answers, asked before anything is compiled: a package
+    // whose C cannot be reached has nothing to gain from the ten seconds of analysis in front of it.
+    val probed = supplied_or_refused(path, t)?
+    val c = packaged_compilation_of(path, t)?
+    val named = if manifest.name == "" then basename(root) else manifest.name
+
+    // Named after the root it was built from and written inside it, which is the rule a build's
+    // executable follows and for the same reason: the root is the one place that names the library
+    // without depending on where the caller happened to be standing.
+    val where = out.unwrap_or(s"${default_executable(path)}$SyslibExtension")
+
+    build_library(root, t, where, c.units, c.own, s"'$named'", probed) match
+        Err(why) -> Err(Refusal(why))
+        Ok(where) -> Ok(where)
+end build_library_of
+
 build_std_artifact_of(path: string, named_target: Option[string],
                       out: Option[string]) -> Result[string, Refusal]
     val t = target_for(path, named_target)?
@@ -995,12 +1045,12 @@ private pkg_config_needs(path: string) -> Result[Buf[LibNeed], Refusal]
 
     add_needs(&out, "this project", mine)
 
-    val roots = package_roots(root, mine)
+    val places = package_places(root, mine)
 
-    for i in 0..<roots.len()
-        manifest_at(roots.at(i)) match
+    for i in 0..<places.len()
+        manifest_at(places.at(i).1) match
             Err(_) -> ()
-            Ok(m) -> add_needs(&out, if m.name == "" then roots.at(i) else s"'${m.name}'", m)
+            Ok(m) -> add_needs(&out, places.at(i).0, m)
 
     Ok(out)
 end pkg_config_needs
@@ -1010,6 +1060,110 @@ private add_needs(out: *Buf[LibNeed], who: string, m: Manifest)
         val row = m.pkg_config.at(i)
 
         out.push(LibNeed(who, row.0, row.1))
+
+// One package's declared need of headers it does not carry: who declared it, the name a consumer
+// answers under, the prose quoted back at them, and the variable the path conventionally lives in.
+struct HeaderNeed
+    who: string
+    name: string
+    why: string
+    env: string
+end HeaderNeed
+
+// Every header requirement this compilation is answerable for -- this project's, then each package
+// it reaches. **A dependency's need is the consumer's problem** for the same reason a library's is:
+// the header is included by C compiled into *this* build, so a machine without it stops this build.
+header_needs(path: string) -> Result[Buf[HeaderNeed], Refusal]
+    var out: Buf[HeaderNeed] = buf()
+
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+    val mine = manifest_at(root)?
+
+    add_header_needs(&out, "this project", mine)
+
+    val places = package_places(root, mine)
+
+    for i in 0..<places.len()
+        manifest_at(places.at(i).1) match
+            Err(_) -> ()
+            Ok(m) -> add_header_needs(&out, places.at(i).0, m)
+
+    Ok(out)
+end header_needs
+
+private add_header_needs(out: *Buf[HeaderNeed], who: string, m: Manifest)
+    for i in 0..<m.headers.len()
+        val row = m.headers.at(i)
+
+        out.push(HeaderNeed(who, row.0, row.1, row.2))
+
+// The header requirements answered by an environment variable the package named, taken as the
+// include paths a `--include-path` would have added.
+//
+// **This is not reading the consumer's shell.** A variable is consulted only where nothing on the
+// command line named that requirement, and where it is unset the build stops with the refusal it
+// stopped with before -- so the environment can turn a failure into a success and can never turn one
+// success into a different one. An explicit flag wins, always.
+//
+// **An empty variable is unset.** `PICO_SDK_PATH=` in a shell profile is somebody clearing it, not
+// somebody naming the root directory; treating it as a path would hand clang an empty `-I` and fail
+// somewhere with no connection to the variable.
+answer_headers_from_env(needs: Buf[HeaderNeed])
+    for i in 0..<needs.len()
+        val need = needs.at(i)
+
+        if need.env != "" && !supplied_include(need.name)
+            env_var(need.env) match
+                None -> ()
+                Some(dir) -> if dir.trim() != "" then add_include_path(s"${need.name}=${dir.trim()}")
+
+// The header requirement nothing on this command line answered, as the one line a build stops on.
+//
+// **Why the message is this long.** Every other requirement in a manifest is answered by something
+// the reader already has: a capability is provided by the target or it is not, and there is nothing
+// to go and do. This one is answered by a path on a machine the package has never seen, so the
+// reader is being asked to find something -- and a refusal that only names what is missing leaves
+// them to work out *what* it is, *where* it lives and *how* to say so. All three are known here.
+//
+// **One at a time, in the order they were declared.** A consumer satisfying them one flag at a time
+// is the same walk either way, and a list of four would be four things to look up before anything
+// can be tried.
+unmet_headers(needs: Buf[HeaderNeed]) -> Option[string]
+    for i in 0..<needs.len()
+        val need = needs.at(i)
+
+        if supplied_include(need.name) then continue
+
+        // **Where the package named a variable, that is the thing to say first.** Setting it is
+        // done once and answers every build in that tree; the flag is what somebody types every
+        // time. A reader who has arrived here has neither, so they are owed both and in that order.
+        val how = if need.env == ""
+            s"Say where they are with '--include-path ${need.name}=<dir>'"
+        else
+            s"Set ${need.env}, which is where this package's own ecosystem looks for it, or say " +
+            s"where they are with '--include-path ${need.name}=<dir>'"
+
+        return Some(s"${need.who} needs the '${need.name}' headers and nothing supplied them — " +
+            s"${need.why}. $how")
+
+    None
+end unmet_headers
+
+// The two requirements a command line answers, checked together and in the order a reader can act
+// on: the headers a package's C includes, then the installed libraries it links.
+private supplied_or_refused(path: string, t: Target) -> Result[PkgAnswer, Refusal]
+    val headers = header_needs(path)?
+
+    answer_headers_from_env(headers)
+
+    unmet_headers(headers) match
+        Some(why) -> return Err(Refusal(why))
+        None -> ()
+
+    probe_libs(pkg_config_needs(path)?, t) match
+        Err(why) -> Err(Refusal(why))
+        Ok(found) -> Ok(found)
+end supplied_or_refused
 
 private discard_objects(objects: Buf[string])
     for i in 0..<objects.len()
