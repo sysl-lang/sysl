@@ -38,6 +38,27 @@ struct Refusal
     message: string
 end Refusal
 
+// Why a whole command could not finish, and the two are two because they PRINT differently.
+//
+// A `Refusal` is a sentence about the project with no `error: ` on it, so the command line puts one
+// there. An analysis report is already rendered -- every diagnostic in it carries its own `error: `,
+// its source line and its caret -- so a second one in front of it is a word the reference does not
+// print. Carrying both as one string is what put it there, and no amount of reading the string tells
+// the two apart afterwards.
+enum Failure
+    Said(refusal: Refusal)
+    Reported(report: string)
+end Failure
+
+// A step's refusal on its way out of a command, which is what `.map_err(said)?` writes.
+said(r: Refusal) -> Failure = Said(r)
+
+// What a failure has to say, with no decision about a prefix in it: the command line adds the word
+// where it is owed, and this is what anything else -- a test, the documentation sweep -- reads.
+failure_text(f: Failure) -> string = f match
+    Said(r) -> r.message
+    Reported(report) -> report
+
 // Everything one invocation reads, given the path the command line named and the machine it is for.
 //
 // **A dependency's modules keep the names they were written with here**, which is what `emit-typed`
@@ -378,17 +399,17 @@ end tables_text
 // functions rather than declaring them against an artifact somebody already built -- so whatever
 // those definitions call into has to be here too.
 build_native_program(path: string, named_target: Option[string], cc: Option[string], level: string,
-                     out: Option[string]) -> Result[string, Refusal]
-    val t = target_for(path, named_target)?
+                     out: Option[string]) -> Result[string, Failure]
+    val t = target_for(path, named_target).map_err(said)?
 
     // Asked **before** anything is lowered: the reader asked for a build of a machine that cannot be
     // built, which is one mistake with one answer, and a failure deep in the toolchain would
     // describe the last step rather than the first.
-    if !t.builds_with_clang() then return Err(Refusal(t.no_toolchain()))
+    if !t.builds_with_clang() then return Err(Said(Refusal(t.no_toolchain())))
 
-    val emitted = emit_llvm_text(path, named_target)?
+    val emitted = emit_llvm_text(path, named_target).map_err(said)?
 
-    if !emitted.report.is_empty() then return Err(Refusal(analysis_report(emitted.report)))
+    if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
 
     val exe = out match
         Some(named) -> named
@@ -400,15 +421,15 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
     // `open() failed, errno=21 (Is a directory)` -- an errno naming neither the package nor the
     // directory, from a tool the reader did not invoke.
     if is_directory(exe)
-        if out.is_some() then return Err(Refusal(
-            s"'-o $exe' names a directory, and an executable cannot be written over one"))
+        if out.is_some() then return Err(Said(Refusal(
+            s"'-o $exe' names a directory, and an executable cannot be written over one")))
 
-        return Err(Refusal(s"this project builds an executable named '${basename(exe)}', and " +
+        return Err(Said(Refusal(s"this project builds an executable named '${basename(exe)}', and " +
             s"'$exe' is a directory — the two cannot both have that name. Rename the package or " +
-            "the directory, or say where the binary goes with '-o <path>'"))
+            "the directory, or say where the binary goes with '-o <path>'")))
     end if
 
-    link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links)?
+    link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links).map_err(said)?
     Ok(exe)
 end build_native_program
 
@@ -432,21 +453,21 @@ end build_native_program
 // distinction the standard module fails.
 build_c_archive(path: string, named_target: Option[string], cc: Option[string], level: string,
                 out: Option[string], header_at: Option[string],
-                say: string -> unit) -> Result[(string, string), Refusal]
-    val t = target_for(path, named_target)?
+                say: string -> unit) -> Result[(string, string), Failure]
+    val t = target_for(path, named_target).map_err(said)?
 
-    if !t.builds_with_clang() then return Err(Refusal(t.no_toolchain()))
+    if !t.builds_with_clang() then return Err(Said(Refusal(t.no_toolchain())))
 
     // Before the compile rather than after: the archiver is not needed until the end, so discovering
     // it late would make "there is no llvm-ar" a thing somebody waited the whole build for.
     val archiver = find_ar(None) match
-        Err(why) -> return Err(Refusal(why))
+        Err(why) -> return Err(Said(Refusal(why)))
         Ok(found) -> found
 
-    val lowered = lower_for_c(path, t)?
+    val lowered = lower_for_c(path, t).map_err(said)?
 
     if !lowered.emitted.report.is_empty()
-        return Err(Refusal(analysis_report(lowered.emitted.report)))
+        return Err(Reported(analysis_report(lowered.emitted.report)))
 
     val archive_at = out match
         Some(named) -> named
@@ -457,13 +478,13 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
         None -> s"$archive_at.h"
 
     val clang = find_clang(t, cc) match
-        Err(why) -> return Err(Refusal(why))
+        Err(why) -> return Err(Said(Refusal(why)))
         Ok(found) -> found
 
-    val probed = supplied_or_refused(path, t)?
+    val probed = supplied_or_refused(path, t).map_err(said)?
 
     val staging = make_temp_dir("sysl-c-") match
-        Err(_) -> return Err(Refusal("cannot make a directory to build the archive in"))
+        Err(_) -> return Err(Said(Refusal("cannot make a directory to build the archive in")))
         Ok(dir) -> dir
 
     var members: Buf[string] = buf()
@@ -475,7 +496,7 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
     remove_dir_all(staging)
 
     made match
-        Err(why) -> return Err(why)
+        Err(why) -> return Err(Said(why))
         Ok(_) -> ()
 
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
@@ -485,7 +506,7 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
         Err(_) -> basename(archive_at)
 
     write_text(header_out, c_header_render(lowered.exports, named)) match
-        Err(_) -> return Err(Refusal(s"cannot write $header_out"))
+        Err(_) -> return Err(Said(Refusal(s"cannot write $header_out")))
         Ok(_) -> ()
 
     // A build that exported nothing produced an archive with no way in, and the author almost
@@ -669,22 +690,22 @@ end link_lowered_text
 // whole of what it buys: the lowering below is the expensive half, so a cache consulted after it
 // would have saved the linker's second and paid the analyzer's minutes.
 run_native_program(path: string, named_target: Option[string], cc: Option[string], level: string,
-                   args: Buf[string]) -> Result[int, Refusal]
-    val t = target_for(path, named_target)?
+                   args: Buf[string]) -> Result[int, Failure]
+    val t = target_for(path, named_target).map_err(said)?
 
-    not_this_machine(t, "run")?
+    not_this_machine(t, "run").map_err(said)?
 
     val key = run_cache_key_for("run", path, named_target, level, cc)
 
     key match
         Some(one) -> run_cache_hit(one) match
-            Some(built) -> return started(built, args, None)
+            Some(built) -> return started(built, args, None).map_err(said)
             None -> ()
         None -> ()
 
-    val emitted = emit_llvm_text(path, named_target)?
+    val emitted = emit_llvm_text(path, named_target).map_err(said)?
 
-    if !emitted.report.is_empty() then return Err(Refusal(analysis_report(emitted.report)))
+    if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
 
     // A slot in the cache where there is one, and a temporary of this run where there is not -- a
     // machine with no cache directory, or a reader who turned the cache off.
@@ -699,7 +720,7 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
         Some(kept) -> exe = kept
         None ->
             val dir = make_temp_dir("sysl-run-") match
-                Err(_) -> return Err(Refusal("no directory to build in"))
+                Err(_) -> return Err(Said(Refusal("no directory to build in")))
                 Ok(made) -> made
 
             staging = Some(dir)
@@ -708,10 +729,10 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
     link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links) match
         Err(why) ->
             discard_staging(staging)
-            return Err(why)
+            return Err(Said(why))
         Ok(_) -> ()
 
-    started(exe, args, staging)
+    started(exe, args, staging).map_err(said)
 end run_native_program
 
 // The child, with whatever this run has to take away once it has ended.
