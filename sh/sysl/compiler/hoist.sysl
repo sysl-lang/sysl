@@ -414,6 +414,42 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
 
+    if d.test.is_some() then runner_signature(a, scope, d.test.unwrap().span, d, "test")
+
+    if d.hook.is_some()
+        val h = d.hook.unwrap()
+
+        runner_signature(a, scope, h.span, d, hook_word(h.kind))
+end hoist_func
+
+// What a `@test` -- and each of the four hooks, held to the same rules for the same reason -- has to
+// look like, checked at the declaration.
+//
+// **The runner calls it with nothing and reads the answer off whether it came back**, which is what
+// both of these say from different sides: a parameter is something the runner has no value for, and
+// a type parameter leaves nothing to call at all, a generic having no compiled form until a caller
+// fixes its arguments.
+//
+// A variadic tail needs no case of its own -- a function that could take one has taken a named
+// parameter in front of it and is refused by the first.
+//
+// **Reported at the ATTRIBUTE rather than at the signature**, because the attribute is the part that
+// is wrong: the function is a perfectly good function, and `@test` is what made a promise about it
+// that it cannot keep.
+private runner_signature(a: &Analysis, scope: Scope, at: Span, d: FuncDecl, what: string)
+    if !d.params.is_empty()
+        a.fault(scope, at, s"a '@$what' function takes no parameters, and '${d.name}' takes " +
+                (if d.params.len() == 1 then "one" else str(d.params.len())) +
+                " — 'sysl test' calls it with nothing, so there is nowhere for an argument to " +
+                "come from")
+        return
+    end if
+
+    if !d.tparams.is_empty()
+        a.fault(scope, at, s"a '@$what' function has no type parameters, and '${d.name}' declares " +
+                s"'${joined(d.tparams, ", ")}' — a generic is compiled for the arguments a caller " +
+                "fixes, and the runner supplies none")
+
 // The key a declaration is filed under, where a SIBLING FILE already holds the plain one privately.
 //
 // **Two files may each keep a helper of one spelling to themselves.** Neither is ever a candidate at
