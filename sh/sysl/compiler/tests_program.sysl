@@ -841,6 +841,100 @@ a_bare_none_is_held_over_for_its_sibling()
 
     assert(out.contains("sysl.Option[string]"), out)
 
+// -- an operand whose own reading failed -------------------------------------------------------------
+
+// The top tier reads each operand alone in a sandbox, and coming back is not the same as succeeding:
+// a reading that complained hands back `Unknown`, which agrees with everything, so a tier keeping the
+// answer and dropping the complaint keeps a reading built out of a mistake nobody is told about. The
+// operator then refuses the pair with no diagnostic at all and the body becomes a lowering gap.
+private boxed_one() -> string =
+    "struct M[T: Mul + One]\n" +
+    "    v: T\n" +
+    "\n" +
+    "    one() -> M[T] = M(T.one())\n" +
+    "end M\n" +
+    "\n" +
+    "impl[T: Mul + One] Mul for M[T]\n" +
+    "    mul(self, rhs: M[T]) -> M[T] = M(self.v * rhs.v)\n" +
+    "\n"
+
+@test("an associated function's type argument is solved from the operator's other operand")
+an_operand_takes_its_type_argument_from_its_sibling()
+    if no_library() then return
+
+    val src = boxed_one() + "use() -> int\n    val a = M(3)\n\n    (a * M.one()).v\n"
+    val said = complaints(src)
+
+    assert(said.is_empty(), listed(said))
+    assert(shown(src, "use").contains("M[int]"), shown(src, "use"))
+
+@test("and where nothing settles it, it is a refusal rather than a silent gap")
+an_unsolved_type_argument_is_a_refusal()
+    if no_library() then return
+
+    val said = complaints(boxed_one() + "use() -> int = (M.one() * M.one()).v\n")
+
+    assert(says(said, "cannot infer the type argument 'T' of 'M.one' here — annotate the expected " +
+                "type"), listed(said))
+
+// -- a range, and an operator's method, written out ---------------------------------------------------
+
+@test("a range with both ends written is a value, and it is sysl.Range")
+a_range_is_a_value()
+    if no_library() then return
+
+    val out = shown("use() -> sysl.Range[int] = 0..<4\n", "use")
+
+    assert(out.contains("sysl.Range[int]"), out)
+    assert(out.contains("TStructNew"), out)
+
+@test("and one with an open end stays a form, which only a slice index reads")
+an_open_range_is_not_a_value()
+    if no_library() then return
+
+    val said = complaints("use(n: int) -> int\n    val r = ..n\n\n    3\n")
+
+    assert(says(said, "a range with an open end is only allowed in a slice index — as a value it " +
+                "would have to say what the missing bound is, and only the thing being indexed " +
+                "knows that. Write both ends"), listed(said))
+
+// A membership the compiler provides is still a membership, so the one method an operator's trait
+// requires is writable on a built-in — and it lowers to the operator, since a provided membership
+// changes what a type has and never what a call costs.
+@test("the method an operator's trait requires is writable on a built-in, and is the operator")
+an_operators_method_is_writable_on_a_builtin()
+    if no_library() then return
+
+    val said = complaints("use() -> int = 5.mul(2)\n")
+
+    assert(said.is_empty(), listed(said))
+
+    val out = shown("use() -> int = 5.mul(2)\n", "use")
+
+    assert(out.contains("TBinary") && out.contains("\"*\""), out)
+    assert(shown("use() -> bool = 5.eq(5)\n", "use").contains("TCompare"),
+           shown("use() -> bool = 5.eq(5)\n", "use"))
+    assert(shown("use() -> int = 5.neg()\n", "use").contains("TUnary"),
+           shown("use() -> int = 5.neg()\n", "use"))
+
+// -- a specifier at a value that renders itself -------------------------------------------------------
+
+// The whole specifier is the value's to apply. Rendering with an empty one and applying the written
+// one to the bytes that came out truncates instead: `%.3s` over a vector answered three characters of
+// the text where the reference answers three digits of each of its numbers.
+@test("a width and a precision reach a Display implementation rather than the bytes it produced")
+a_specifier_is_handed_to_the_renderer()
+    if no_library() then return
+
+    val out = shown("struct V\n    a: real\n\n" +
+                    "impl Display for V\n" +
+                    "    display(self, out: *Writer, fmt: FormatSpec) = self.a.display(out, fmt)\n\n" +
+                    "use(v: V) -> string = f\"${v}%-12.3s\"\n", "use")
+
+    assert(out.contains("TRender"), out)
+    assert(!out.contains("TFormat"), out)
+    assert(out.contains("value: 12") && out.contains("value: 3") && out.contains("value: true"), out)
+
 // -- what 'derives' writes ----------------------------------------------------------------------
 
 @test("'derives Eq' walks a struct's fields, and the first disagreement decides")

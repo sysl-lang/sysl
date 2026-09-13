@@ -202,14 +202,22 @@ private generic_subject(cx: &Analyzer, span: Span, receiver: Expr, name: string,
             if instantiation_of(want, key.unwrap()) then return Some(repr(want))
         None -> ()
 
+    val said = cx.an.complaints()
     val solved = solved_subject(cx, span, key.unwrap(), name, args, expected)
 
     if solved.is_some() then return solved
 
     // The reference's own words, and the advice is what a reader can act on: there is nowhere else
     // for the arguments to come from, a receiverless call carrying no value of the type.
-    cx.fault(span, s"cannot infer the type argument of " +
-             s"'${module_show(key.unwrap())}.$name' here — annotate the expected type")
+    //
+    // **Only where the solve itself said nothing**, which is the ordinary case for a type the walk
+    // above never reached. `solve` reports per unsolved parameter and NAMES it, which is the better
+    // message and the reference's; composing a second one here beside it would report one mistake
+    // twice and, where the solve stayed deliberately quiet over a poisoned argument, would report a
+    // consequence somebody has already been told the cause of.
+    if cx.an.complaints() == said then
+        cx.fault(span, s"cannot infer the type argument of " +
+                 s"'${module_show(key.unwrap())}.$name' here — annotate the expected type")
 
     Some(Unknown)
 end generic_subject
@@ -263,8 +271,10 @@ private solved_subject(cx: &Analyzer, span: Span, key: string, name: string, arg
         arg_tys.push(texpr_type(sandboxed_arg(cx, args.at(i), None)))
         soft.push(false)
 
-    val targs = solve(cx.an, owner.scope, span, module_show(key), tparams, param_refs, arg_tys,
-                      member.ret_type, expected, soft, shape.unwrap().1, buf())
+    // **The call is what the refusal names, not the type** -- `M.one`, since a reader told the
+    // argument of `M` could not be inferred has nowhere to write one, `M` not being what they wrote.
+    val targs = solve(cx.an, owner.scope, span, s"${module_show(key)}.$name", tparams, param_refs,
+                      arg_tys, member.ret_type, expected, soft, shape.unwrap().1, buf())
 
     if targs.len() != tparams.len() then return None
 
@@ -1199,6 +1209,10 @@ end weak_get
 // sign, and a hash.
 private builtin_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type,
                        name: string, args: Buf[Expr]) -> Option[TExpr]
+    val operator = builtin_operator_method(cx, span, receiver, rty, name, args)
+
+    if operator.is_some() then return operator
+
     val numeric = core_numeric(name)
 
     if numeric.is_none() then return None
@@ -1245,6 +1259,62 @@ private builtin_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type,
 
     Some(TExpr(span, TIntOp(name, receiver, amount, op_subject(rty), ret)))
 end builtin_method
+
+// `5.mul(2)`, `x.eq(y)`, `n.neg()` -- the ONE METHOD an operator's trait requires, written out on a
+// built-in whose membership the compiler provides rather than a library `impl`.
+//
+// **It lowers to the operator and nothing else**, which is the promise a provided membership makes:
+// a membership changes what a type *has*, never what a call *costs*. It is also what a monomorphized
+// `[T: Add]` body lands on the moment `T` turns out to be a scalar, so the spelling has to reach the
+// machine operation or a generic body would pay for a call the operator form does not.
+//
+// A built-in's membership is homogeneous (`reference/expressions.md § Operator dispatch`), so the
+// trait's own parameter is the receiver's own type: `5.add(3)` is the `Add[int]` an `int` has, and it
+// has no other.
+private builtin_operator_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type,
+                                name: string, args: Buf[Expr]) -> Option[TExpr]
+    val declaring = core_declaring(name)
+
+    if declaring.is_none() then return None
+    if !core_builtin(declaring.unwrap(), rty) then return None
+
+    val required = core_required(declaring.unwrap())
+
+    if required.is_none() then return None
+
+    val op = required.unwrap().1
+    val kind = required.unwrap().2
+    val wanted: usize = kind match
+        Prefix -> 0
+        _ -> 1
+
+    if args.len() != wanted
+        cx.fault(span, s"method '${declaring.unwrap()}.$name' takes " +
+                 s"${quantity(wanted, "argument")}, but " +
+                 s"${supplied_phrase(args.len(), "argument")}")
+        return Some(bad_expr(span))
+    end if
+
+    if kind == Prefix then return Some(produced(TExpr(span, TUnary(op, receiver, unary_type(rty)))))
+
+    val rhs = type_expr(cx, args.at(0), Some(rty))
+
+    if kind == Compare
+        var ts: Buf[TExpr] = buf()
+        var cmps: Buf[TCmp] = buf()
+
+        ts.push(receiver)
+        ts.push(rhs)
+        cmps.push(TCmp(op, None))
+        return Some(TExpr(span, TCompare(ts, cmps)))
+    end if
+
+    val ty = arith_type(cx, span, op, rty, texpr_type(rhs), args.at(0).span)
+
+    if ty == Unknown then return Some(bad_expr(span))
+
+    Some(produced(TExpr(span, TBinary(op, receiver, rhs, ty))))
+end builtin_operator_method
 
 // A receiverless member the compiler provides, read through a type rather than off a value: the two
 // identities, whose value is stated in the catalog, and a width, whose answer is read off the type.

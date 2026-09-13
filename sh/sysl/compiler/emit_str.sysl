@@ -328,6 +328,52 @@ end one_of
 
 spec_is_str(c: char) -> bool = c == 's'
 
+// The three parts of a specifier a `Display` implementation is handed: the minimum field width, the
+// precision, and whether the field is left-justified (`library/core.md § A specifier is the whole
+// value's field`).
+//
+// **A width of `0` and a precision of `-1` mean neither was written**, which is the reading `%s` and
+// `%.0s` would otherwise be confused by. Only these three cross the boundary: the numeric flags
+// belong to a conversion the library's own renderers apply, and a type rendering itself has no
+// conversion letter to interpret.
+//
+// A `0` is a flag and a digit both, and the flags are taken first, so `%08.2f` is width 8 rather
+// than width zero followed by an 8 -- which is the reading the reference's `takeWhile` gives it.
+spec_parts(spec: string) -> (int, int, bool)
+    val b = spec.bytes
+    val last = if b.len > 0 then b.len - 1 else 0
+    var i: usize = if b.len > 0 then 1 else 0
+    var left = false
+
+    while i < last && is_spec_flag(b[i])
+        if b[i] == u8('-') then left = true
+
+        i += 1
+
+    var width = 0
+
+    while i < last && is_spec_digit(b[i])
+        width = width * 10 + int(b[i] - u8('0'))
+        i += 1
+
+    if i >= last || b[i] != u8('.') then return (width, -1, left)
+
+    i += 1
+
+    var prec = 0
+
+    while i < last && is_spec_digit(b[i])
+        prec = prec * 10 + int(b[i] - u8('0'))
+        i += 1
+
+    (width, prec, left)
+end spec_parts
+
+private is_spec_flag(c: u8) -> bool =
+    c == u8('-') || c == u8('+') || c == u8('0') || c == u8(' ') || c == u8('#')
+
+private is_spec_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
+
 // The C format string for the same specifier. An integer conversion is fed a 64-bit value, so its
 // conversion gains the `ll` length modifier; a float (a `double`) and a string (a C pointer) pass
 // through unchanged.

@@ -302,19 +302,38 @@ private erased_bound_name(ty: Type) -> string = erased_trait(ty) match
 
 // The specifier a bare rendering carries: no width, no precision, not left-aligned. A `f"…"` hole
 // is the same node with the three the reader wrote.
-private format_spec(cx: &Analyzer, span: Span) -> TExpr
+private format_spec(cx: &Analyzer, span: Span) -> TExpr = spec_value(cx, span, 0, -1, false)
+
+// The `FormatSpec` a rendering is handed, built from the three parts that cross the boundary.
+//
+// **The whole specifier is the value's to apply, not the string's**, which is what makes a width and
+// a precision mean anything on a type that renders itself: a vector pads once around all of its
+// components and hands the precision to each of them. Rendering with an empty specifier and applying
+// the written one to the bytes that came out is the other reading, and it truncates -- `%.3s` over a
+// vector answered `(0.` rather than `(0.333, -0.667)`, three characters of the text instead of three
+// digits of each number.
+spec_value(cx: &Analyzer, span: Span, width: int, prec: int, left: bool) -> TExpr
     val spec = reinstantiate(cx.an, library_key("FormatSpec"), buf())
 
     spec match
         Struct(d) ->
             var args: Buf[TExpr] = buf()
 
-            args.push(TExpr(span, TIntLit(from_int(0), d.fields.at(0).1)))
-            args.push(TExpr(span, TIntLit(from_int(-1), d.fields.at(1).1)))
-            args.push(TExpr(span, TBoolLit(false)))
+            args.push(TExpr(span, TIntLit(from_int(long(width)), d.fields.at(0).1)))
+            args.push(TExpr(span, TIntLit(from_int(long(prec)), d.fields.at(1).1)))
+            args.push(TExpr(span, TBoolLit(left)))
             TExpr(span, TStructNew(d, args))
         _ -> bad_expr(span)
-end format_spec
+end spec_value
+
+// `str(x)` with a specifier of the reader's own -- the node `str_render` makes, at a `f"…"` hole's
+// width, precision and justification instead of at none.
+spec_render(cx: &Analyzer, span: Span, t: TExpr, spec: string) -> TExpr
+    val found = renderer(cx, span, t, "make a string of")
+    val parts = spec_parts(spec)
+
+    TExpr(span, TRender(t, found.0, spec_value(cx, span, parts.0, parts.1, parts.2), found.1))
+end spec_render
 
 // The separator and the terminator `print` puts around its values.
 private print_char(cx: &Analyzer, span: Span, c: char) -> TExpr =

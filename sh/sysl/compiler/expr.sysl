@@ -189,9 +189,68 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     // `T::Attr` -- what a type's own name offers, and `::Id` on an erased value.
     TypeAttr(subject, attr) -> type_attr_expr(cx, e.span, subject, attr)
 
+    // `lo..hi` and `lo..<hi` standing where a value is wanted, which is `sysl.Range[T]`.
+    RangeExpr(lo, hi, inclusive) -> range_value(cx, e.span, lo, hi, inclusive)
+
     Bad -> bad_expr(e.span)
 
     _ -> cx.err(e.span, deferred_form(e))
+
+// A range **with both ends written** is a value: `sysl.Range[T]`, three fields, built here.
+//
+// The four positions that read a range as a *form* -- a `for` header, a slice index, a `match`
+// pattern and a quantifier -- never reach this arm, because each matches the `RangeExpr` node itself
+// and reads the bounds directly. That is what keeps the counted `for` a counter and a comparison
+// with no struct, no `Option` a step and no call in it; the value is for every other position.
+//
+// **An open end stays a form.** `..`, `lo..` and `..hi` mean something in an index and nothing on
+// their own -- what an absent bound *is* depends on what is being indexed -- so they keep the
+// refusal, which names the one place they are legal rather than all four.
+private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr],
+                    inclusive: bool) -> TExpr
+    if lo.is_none() || hi.is_none() then
+        return cx.err(span, "a range with an open end is only allowed in a slice index — as a " +
+                      "value it would have to say what the missing bound is, and only the thing " +
+                      "being indexed knows that. Write both ends")
+
+    var ends: Buf[Expr] = buf()
+
+    ends.push(lo.unwrap())
+    ends.push(hi.unwrap())
+
+    // The same two questions the `for` header asks of its bounds, in the same order and the same
+    // words: a range value and a counted loop must not come to disagree about what a range is.
+    val ts = analyze_operands(cx, ends, None)
+    val tlo = ts.at(0)
+    val thi = ts.at(1)
+
+    if disagree(texpr_type(tlo), texpr_type(thi)) then
+        cx.fault(span, s"a range needs matching bounds, got ${type_show(texpr_type(tlo))} and " +
+                 s"${type_show(texpr_type(thi))}")
+
+    val vty = texpr_type(tlo) match
+        Integer(_, _, _) -> texpr_type(tlo)
+        Unknown -> Unknown
+        other ->
+            cx.fault(span, s"a range runs between integer bounds, not ${type_show(other)}")
+            Unknown
+
+    if vty == Unknown then return bad_expr(span)
+
+    var targs: Buf[Type] = buf()
+
+    targs.push(vty)
+
+    reinstantiate(cx.an, library_key("Range"), targs) match
+        Struct(d) ->
+            var fields: Buf[TExpr] = buf()
+
+            fields.push(tlo)
+            fields.push(thi)
+            fields.push(TExpr(span, TBoolLit(inclusive)))
+            TExpr(span, TStructNew(d, fields))
+        _ -> bad_expr(span)
+end range_value
 
 // `a, b` where a function's result list is what is being produced. It builds the aggregate the
 // caller takes apart -- the same one a tuple builds, since a result list is a tuple's layout
@@ -233,7 +292,6 @@ end result_list
 private deferred_form(e: Expr) -> string = *e.kind match
     Lambda(_, _, _) -> "a closure is not typed yet"
     BlockArg(_) -> "a trailing block is not typed yet"
-    RangeExpr(_, _, _) -> "a range used as a value is not typed yet"
     _ -> "this expression is not typed yet"
 
 private has_nul(s: string) -> bool
@@ -905,7 +963,7 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type]) -> 
         val e = operands.at(i)
 
         if is_literal(e) || typed_by_position(cx, e) then own.push(None)
-        else own.push(Some(sandboxed_read(cx, e, expected)))
+        else own.push(attempt_operand(cx, e, expected))
 
     val settled = firmest(operands, own).or_else(() -> expected)
     var told: Buf[Option[TExpr]] = buf()
@@ -927,6 +985,34 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type]) -> 
 
     out
 end analyze_operands
+
+// One reading of an operand for the TOP TIER, answering nothing where the reading failed.
+//
+// **Coming back is not the same as succeeding**, and the difference is the whole of why this is not
+// `sandboxed_read`. An operand that could not be worked out alone hands back a fallback of `Unknown`
+// *and* records why, so a tier keeping the answer and dropping the complaint keeps a reading built
+// out of a mistake nobody will ever be told about. `Unknown` agrees with everything, so the reading
+// then survives the re-reading below and the operator refuses the pair with `bad_expr` and no
+// diagnostic at all.
+//
+// Answering `None` puts the operand back where it belongs: read again at what its sibling settled,
+// which is where a `M.one()` beside an `M[int]` gets the argument its own call could not supply --
+// and read again at nothing where the pair settled nothing, so the complaint is made for real.
+private attempt_operand(cx: &Analyzer, e: Expr, expected: Option[Type]) -> Option[TExpr]
+    val said = cx.an.complaints()
+    val mark = cx.an.sandboxed()
+    val t = analyze_expected(cx, e, expected)
+
+    if cx.an.complaints() > said
+        cx.an.release(mark)
+        cx.an.restore_complaints(said)
+
+        return None
+    end if
+
+    cx.an.keep()
+    Some(t)
+end attempt_operand
 
 // One reading of an operand with everything it said put back, which is what lets the top tier come
 // back empty rather than complaining on behalf of a tier that had nothing to offer it.
