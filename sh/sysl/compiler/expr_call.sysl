@@ -530,20 +530,22 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
 
     inst.unwrap() match
         Struct(d) ->
-            if args.len() != d.fields.len() then
-                return cx.err(span, s"struct '$written' has " +
-                              s"${quantity(d.fields.len(), "field")}, but " +
-                              s"${quantity(args.len(), "value")} " +
-                              s"${if args.len() == 1 then "was" else "were"} given")
+            // **A field's name says which slot a value fills**, exactly as a parameter's does: a
+            // construction of a dozen fields reads by the names rather than by counting commas,
+            // which is what `syslui`'s themes are written as.
+            val slots = bind_field_args(cx, span, written, d, args)
+
+            if slots.is_none() then return bad_expr(span)
 
             var ts: Buf[TExpr] = buf()
 
-            for i in 0..<args.len()
+            for i in 0..<d.fields.len()
                 val want = d.fields.at(i).1
-                val t = type_expr(cx, args.at(i), Some(want))
+                val e = slots.unwrap().at(i).unwrap()
+                val t = type_expr(cx, e, Some(want))
 
                 if disagree(texpr_type(t), want) then
-                    cx.fault(args.at(i).span, s"'${d.fields.at(i).0}' of '$written' is " +
+                    cx.fault(e.span, s"'${d.fields.at(i).0}' of '$written' is " +
                              s"${type_show(want)}, but ${type_show(texpr_type(t))} was given")
 
                 ts.push(t)
@@ -555,6 +557,81 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
             checked_new(cx, span, TExpr(span, TStructNew(d, ts)), d)
         _ -> bad_expr(span)
 end struct_call
+
+// Which written value fills which field. The rule is the parameter list's, read over a record: a
+// name chooses its slot, everything else takes the next one, and a field is filled once.
+//
+// **Every field is required**, a field having no default to fall back on, so the count message is
+// what a construction that named nothing is told -- it says the whole of what is wrong.
+private bind_field_args(cx: &Analyzer, span: Span, written: string, d: &StructType,
+                        args: Buf[Expr]) -> Option[Buf[Option[Expr]]]
+    var slots: Buf[Option[Expr]] = buf()
+
+    for i in 0..<d.fields.len()
+        slots.push(None)
+
+    var next: usize = 0
+    var extra: usize = 0
+    var named_seen = false
+    var refused = false
+
+    for i in 0..<args.len()
+        val a = args.at(i)
+
+        *a.kind match
+            NamedArg(name, value) ->
+                named_seen = true
+
+                val idx = d.field_index(name)
+
+                if idx < 0
+                    cx.fault(a.span, s"struct '$written' declares no parameter named '$name' — " +
+                             s"it takes ${field_name_list(d)}")
+                    refused = true
+                else if slots.at(usize(idx)).is_some()
+                    cx.fault(a.span, s"'$name' is given twice")
+                    refused = true
+                else slots.set(usize(idx), Some(value))
+            _ ->
+                if next >= d.fields.len() then extra += 1
+                else
+                    slots.set(next, Some(a))
+                    next += 1
+
+    if refused then return None
+
+    var missing_at: int = -1
+
+    for i in 0..<d.fields.len()
+        if missing_at < 0 && slots.at(i).is_none() then missing_at = int(i)
+
+    if extra > 0 || missing_at >= 0
+        if named_seen && extra == 0
+            cx.fault(span, s"struct '$written' was given no value for " +
+                     s"'${d.fields.at(usize(missing_at)).0}', and that parameter declares no " +
+                     "default")
+        else
+            cx.fault(span, s"struct '$written' has ${quantity(d.fields.len(), "field")}, but " +
+                     s"${quantity(args.len(), "value")} " +
+                     s"${if args.len() == 1 then "was" else "were"} given")
+
+        return None
+    end if
+
+    Some(slots)
+end bind_field_args
+
+// The fields of a record, as a refusal lists them.
+private field_name_list(d: &StructType) -> string
+    var out = ""
+
+    for i in 0..<d.fields.len()
+        if i > 0 then out = out + (if i + 1 == d.fields.len() then " and " else ", ")
+
+        out = out + s"'${d.fields.at(i).0}'"
+
+    out
+end field_name_list
 
 // A construction with the invariant check its type owes wrapped around it, where it states one.
 private checked_new(cx: &Analyzer, span: Span, made: TExpr, d: &StructType) -> TExpr
@@ -1162,12 +1239,15 @@ bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, args: Buf[Ex
     var next: usize = 0
     var unknown_name = false
     var extra: usize = 0
+    var named_seen = false
 
     for i in 0..<args.len()
         val a = args.at(i)
 
         *a.kind match
             NamedArg(name, value) ->
+                named_seen = true
+
                 val idx = param_index(params, name)
 
                 if idx < 0
@@ -1195,9 +1275,8 @@ bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, args: Buf[Ex
 
     if missing > 0 || extra > 0
         if report then
-            cx.fault(span, s"function '$written' takes ${quantity(params.len(), "argument")}, but " +
-                     s"${quantity(args.len(), "argument")} " +
-                     s"${if args.len() == 1 then "was" else "were"} given")
+            cx.fault(span, arity_refusal(s"function '$written'", params, args, slots, named_seen,
+                                         extra))
         else
             cx.fault(span, "wrong arity")
 
@@ -1214,7 +1293,43 @@ private param_index(params: Buf[Param], name: string) -> int
     -1
 end param_index
 
-private name_list(params: Buf[Param]) -> string
+// How many arguments a parameter list takes, as a refusal words it. **A defaulted parameter makes it
+// a range rather than a number**, since a call may leave one out and still be a call.
+arity_phrase(params: Buf[Param]) -> string
+    var least: usize = 0
+
+    for i in 0..<params.len()
+        if params.at(i).default.is_none() then least += 1
+
+    if least == params.len() then return s"takes ${quantity(params.len(), "argument")}"
+
+    s"takes between $least and ${params.len()} arguments"
+end arity_phrase
+
+// What a call that did not fill a parameter list is told, for a function and for a member alike.
+//
+// **A count answers where nothing is optional and every argument was positional** — the number says
+// the whole of it. Anywhere else the empty parameter is NAMED: a reader looking at a defaulted list,
+// or at arguments that chose their own slots, cannot tell from a count which one was left out.
+arity_refusal(subject: string, params: Buf[Param], args: Buf[Expr], slots: Buf[Option[Expr]],
+              named_seen: bool, extra: usize) -> string
+    var optional = false
+    var missing_at: int = -1
+
+    for i in 0..<params.len()
+        if params.at(i).default.is_some() then optional = true
+
+        if missing_at < 0 && slots.at(i).is_none() && params.at(i).default.is_none() then
+            missing_at = int(i)
+
+    if extra == 0 && missing_at >= 0 && (named_seen || optional) then
+        return s"$subject was given no value for '${params.at(usize(missing_at)).name}', and that " +
+               "parameter declares no default"
+
+    s"$subject ${arity_phrase(params)}, but ${supplied_phrase(args.len(), "argument")}"
+end arity_refusal
+
+name_list(params: Buf[Param]) -> string
     var out = ""
 
     for i in 0..<params.len()

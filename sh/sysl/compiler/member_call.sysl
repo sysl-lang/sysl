@@ -448,8 +448,13 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Typ
                 // then: reading it again would lower a second closure for the one a program wrote.
                 var t = bad_expr(e.span)
 
-                if i < prov.kept.len() && prov.kept.at(i).is_some() then
+                if i < prov.kept.len() && prov.kept.at(i).is_some()
+                    // Read against the BOUND, which says nothing about how the parameter holds
+                    // what met it: a written `&Fn(…)` is a trait object, and putting the closure
+                    // behind the table is what the position does.
                     t = prov.kept.at(i).unwrap()
+
+                    if disagree(texpr_type(t), want) then t = coerce(cx, t, want)
                 else t = type_expr(cx, e, Some(want))
 
                 if disagree(texpr_type(t), want) then
@@ -550,19 +555,23 @@ bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
 
     var next: usize = 0
     var extra: usize = 0
+    var named_seen = false
 
     for i in 0..<args.len()
         val a = args.at(i)
 
         *a.kind match
             NamedArg(name, value) ->
+                named_seen = true
+
                 var idx: int = -1
 
                 for j in 0..<m.params.len()
                     if m.params.at(j).name == name then idx = int(j)
 
                 if idx < 0
-                    cx.fault(a.span, s"$shown declares no parameter named '$name'")
+                    cx.fault(a.span, s"$shown declares no parameter named '$name' — it takes " +
+                             s"${name_list(m.params)}")
                     return None
 
                 slots.set(usize(idx), Some(value))
@@ -578,8 +587,7 @@ bind_member_args(cx: &Analyzer, span: Span, shown: string, m: MethodDecl,
         if slots.at(i).is_none() && m.params.at(i).default.is_none() then missing += 1
 
     if (missing > 0 || extra > 0) && !m.variadic
-        cx.fault(span, s"$shown takes ${quantity(m.params.len(), "argument")}, but " +
-                 s"${supplied_phrase(args.len(), "argument")}")
+        cx.fault(span, arity_refusal(shown, m.params, args, slots, named_seen, extra))
         return None
     end if
 
@@ -1060,14 +1068,28 @@ private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot:
         for i in 0..<d.unwrap().tparams.len()
             if i < tr.args.len() then subst.push(Binding(d.unwrap().tparams.at(i), tr.args.at(i)))
 
+    // **A slot is a member like any other**, so a call through the table binds what was written the
+    // way a call to a member of a type does: a name says which parameter it fills, and a parameter
+    // nothing filled takes the default -- which for a trait is written in the trait's own scope.
+    val slots = bind_member_args(cx, span, s"method '${type_show(rty)}.${m.name}'", m, args)
+
+    if slots.is_none() then return bad_expr(span)
+
     var ts: Buf[TExpr] = buf()
 
-    for i in 0..<args.len()
+    for i in 0..<slots.unwrap().len()
         val want = if i < m.params.len() then
                        Some(resolve_type(cx.an, scope, m.params.at(i).typ, subst))
                    else None
 
-        ts.push(type_expr(cx, args.at(i), want))
+        slots.unwrap().at(i) match
+            Some(e) -> ts.push(type_expr(cx, e, want))
+            None ->
+                val inner = analyzer_for(cx.an, scope)
+
+                inner.reported = Some(span)
+                inner.here_src = caller_source(cx)
+                ts.push(type_expr(inner, m.params.at(i).default.unwrap(), want))
 
     val ret = if m.ret_type.is_some() then
                   declared_result_type(Some(resolve_type(cx.an, scope, m.ret_type.unwrap(), subst)))

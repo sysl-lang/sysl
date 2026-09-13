@@ -919,6 +919,134 @@ a_closure_at_a_boxed_callable_is_erased()
 
     assert(out.contains("TErase") || out.contains("vtable"), out)
 
+@test("a type parameter the call's own position settles is what a callable is read against")
+a_callable_reads_against_what_the_position_settled()
+    if no_library() then return
+
+    // `U` is named by the result alone, so nothing but the position says what it is -- and a
+    // closure read before that is known decides one from its body. `[]string` against a body that
+    // writes `["a", "b"]` is the case that shows it: the array is a view where a view is asked for,
+    // and `sysl.seq.generate` is where `syslui-demo` met it.
+    val src = "gen[U](n: usize, f: usize -> U) -> U = f(n)\n\n" +
+              "use() -> usize\n    val a: []string = gen(1, i -> [\"a\", \"b\"])\n\n    a.len\n"
+
+    assert_eq(listed(complaints(src)), "")
+
+@test("a closure at a boxed callable whose result is the declaration's own parameter is erased too")
+a_closure_at_a_generic_boxed_callable_is_erased()
+    if no_library() then return
+
+    // A callable is read against the BOUND its parameter states, so what comes back is the
+    // closure's own struct; a parameter written `&Fn(…) -> T` holds it behind the trait's table,
+    // and the position is what puts it there. Read otherwise it is refused as "'f' of 'derived' is
+    // &Fn() -> int, but a closure was given" -- five of the org's repositories at once.
+    val src = "derived[T](f: &Fn() -> T) -> T = f()\n\n" +
+              "after[T](x: T, f: &Fn() -> T) -> T = f()\n\n" +
+              "use() -> int = derived(() -> 3) + after(0, () -> 4)\n"
+
+    assert_eq(listed(complaints(src)), "")
+
+    val out = shown(src, "use")
+
+    assert(out.contains("TErase") || out.contains("vtable"), out)
+
+@test("a call through a trait object binds a named argument and takes the trait's own default")
+a_slot_call_binds_names_and_defaults()
+    if no_library() then return
+
+    // A slot is a member like any other. Read positionally, `grown(b = 2)` reaches the argument
+    // reader as an expression and is refused with "'b:' names an argument, and there is nothing
+    // being called here" -- which is what `syslui`'s `.pad(bottom = 12)` was told.
+    val trait_src = "trait Shape\n    size(&self) -> int\n\n" +
+                    "    grown(&self, a: int = 0, b: int = 0) -> int = self.size() + a + b\n\n" +
+                    "struct Box\n    v: int\n\n" +
+                    "impl Shape for Box\n    size(&self) -> int = self.v\n\n" +
+                    "made(v: int) -> &Shape = Box(v)\n\n"
+
+    assert_eq(listed(complaints(trait_src + "use() -> int = made(1).grown(b = 2)\n")), "")
+
+    assert(says(complaints(trait_src + "use() -> int = made(1).grown(c = 2)\n"),
+                "method 'Shape.grown' declares no parameter named 'c' — it takes 'a' and 'b'"),
+           listed(complaints(trait_src + "use() -> int = made(1).grown(c = 2)\n")))
+
+    assert(says(complaints(trait_src + "use() -> int = made(1).grown(1, 2, 3)\n"),
+                "method 'Shape.grown' takes between 0 and 2 arguments, but 3 arguments were given"),
+           listed(complaints(trait_src + "use() -> int = made(1).grown(1, 2, 3)\n")))
+
+// The whole module a source lowers to, beside the library: what a reading left behind is visible
+// here and nowhere earlier, a type definition being written from what the program made real while a
+// body is written from what it reached.
+private module_text(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+    var units: Buf[Program] = buf()
+    val library = library_trees()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), buf())
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end module_text
+
+@test("a closure lowered by a default's trial reading leaves no type for a table to index")
+a_trial_closure_leaves_nothing_behind()
+    if no_library() then return
+
+    // The trial spends the closure's number and is thrown away. Left in the program, its method
+    // table keeps the body reachable while its struct has been rewound out from under it, and the
+    // adapter comes out as `getelementptr %arc.$closureN` over a type nothing defines — which
+    // clang refuses. `syslui-sdl`'s `on_event: &Fn(Event) -> bool = e -> false` is the shape.
+    val text = module_text("run(on_event: &Fn(int) -> bool = e -> false) -> bool = on_event(1)\n\n" +
+                           "use() -> bool = run()\n")
+    val all = lines_of(text)
+
+    for i in 0..<all.len()
+        val line = all.at(i)
+
+        if line.starts_with("%arc.$closure")
+            val at = line.index_of(" = type")
+
+            if at.is_some()
+                val name = line[5..<at.unwrap()]
+
+                assert(holds_text(text, s"%struct.$name = type"),
+                       s"'$name' is indexed and never defined")
+
+@test("a field's name chooses the slot it fills, whatever order the values were written in")
+a_construction_binds_field_names()
+    if no_library() then return
+
+    val out = shown("struct T\n    a: int\n    b: int\n\nuse() -> T = T(b = 88, a = 77)\n", "use")
+
+    assert(out.index_of("value: 77").is_some(), out)
+    assert(out.index_of("value: 88").is_some(), out)
+    assert(out.index_of("value: 77").unwrap() < out.index_of("value: 88").unwrap(), out)
+
+@test("a generic function's address says which copy it is of, in brackets of its own")
+an_address_takes_written_type_arguments()
+    if no_library() then return
+
+    // The refusal that asks for it -- "write them, as '&sized[T]'" -- named a spelling nothing
+    // read, so a callback surface written that way (`&handle_closed[Self]`) had no address at all.
+    val src = "sized[T](n: int) -> int = n + int(sizeof(T))\n\n" +
+              "run(f: *extern(int) -> int, n: int) -> int = f(n)\n\n" +
+              "use() -> int = run(&sized[u16], 5)\n"
+
+    assert_eq(listed(complaints(src)), "")
+
+    val out = shown(src, "use")
+
+    assert(out.contains("sized.u16"), out)
+
 @test("a module bound to a name is written before a dot, and the call reaches through it")
 a_module_alias_qualifies_a_call()
     if no_library() then return

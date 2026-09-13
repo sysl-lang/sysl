@@ -226,7 +226,7 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
         return bad_expr(span)
     end if
 
-    val prov = provisional_args(cx, span, f, slots)
+    val prov = provisional_args(cx, span, f, slots, expected)
     var param_refs: Buf[TypeRef] = buf()
 
     for i in 0..<decl.params.len()
@@ -271,7 +271,15 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
                 // closure for the one a program wrote.
                 var t = bad_expr(e.span)
 
-                if i < prov.kept.len() && prov.kept.at(i).is_some() then t = prov.kept.at(i).unwrap()
+                if i < prov.kept.len() && prov.kept.at(i).is_some()
+                    // **A callable is read against the BOUND its parameter states, which says
+                    // nothing about how the parameter holds it.** A written `&Fn(…) -> T` is a
+                    // trait object, so what came back is the closure's own struct and the position
+                    // is what puts it behind the table -- exactly as it would for a parameter
+                    // naming no type of the declaration's.
+                    t = prov.kept.at(i).unwrap()
+
+                    if disagree(texpr_type(t), want) then t = coerce(cx, t, want)
                 else t = argument_at(cx, decl, i, e, want)
 
                 if disagree(texpr_type(t), want)
@@ -285,7 +293,10 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
             // reading it again would lower a second closure for the one the declaration wrote.
             None ->
                 if i < prov.kept.len() && prov.kept.at(i).is_some()
-                    ts.push(prov.kept.at(i).unwrap())
+                    val kept = prov.kept.at(i).unwrap()
+
+                    if disagree(texpr_type(kept), want) then ts.push(coerce(cx, kept, want))
+                    else ts.push(kept)
                 else
                     val inner = analyzer_for(cx.an, f.scope)
 
@@ -406,10 +417,14 @@ end quoted_and
 // read against that type, exactly as a call to something non-generic reads it. Everything else is
 // read on its own, with what it said put back: the reading is a guess made to solve with, and a
 // complaint about a guess is one nobody asked for.
-private provisional_args(cx: &Analyzer, span: Span, f: Func,
-                         slots: Buf[Option[Expr]]) -> Provisional =
+// **What the call's own position asks for is part of the reading**, and not only of the solve after
+// it: a parameter named by the result alone is settled by nothing else, and a callable standing at a
+// bound over it is then read with a result nothing fixed — so its body decides one, and the closure
+// implements a call trait the declaration did not ask for.
+private provisional_args(cx: &Analyzer, span: Span, f: Func, slots: Buf[Option[Expr]],
+                         expected: Option[Type]) -> Provisional =
     provisional_of(cx, span, f.scope, f.decl.tparams, f.decl.params, f.decl.ret_type, f.decl.bounds,
-                   slots, no_bindings(), None)
+                   slots, no_bindings(), expected)
 
 // What a first reading of a call's arguments settled: the type each one came to, whether it was a
 // literal's default, and the node itself where the argument is one that was **kept**.

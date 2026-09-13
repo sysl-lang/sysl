@@ -55,20 +55,27 @@ private read_defaults(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: 
 
         cx.subst = subst
 
-        // **The reading is thrown away and the closure it lowered is not.** What this pass is for is
+        // **The reading is thrown away and the COUNTER it moved is not.** What this pass is for is
         // holding the expression to being one -- the types it makes real are the ones the CALLS that
         // take it make real, and registering them here would put a shape in the record of what the
-        // program laid out that no call asked for. A closure is the exception because its name is a
-        // counter over the whole compilation: the number is part of the symbol, so the body stays
-        // and only the registrations go.
+        // program laid out that no call asked for. A closure's number is the exception: it counts
+        // over the whole compilation and is part of a symbol, so the numbers a call's own reading
+        // arrives at are the ones the reference arrives at only if this reading spends one too.
+        //
+        // **Everything else the reading built goes with it, the closure's own table included.** A
+        // method table is what keeps a body reachable, so one left behind holds the trial's closure
+        // in the program -- and its struct has been rewound out from under it, which is a vtable
+        // adapter indexing a type nothing defines.
         val trial = a.sandboxed()
+        val queued = a.tables.members.pending.len()
+        val tables = a.tables.members.vtables.len()
         val structs = a.tables.struct_insts.len()
         val enums = a.tables.enum_insts.len()
         val constrained = a.tables.constrained_insts.len()
+        val lowered = a.closure_funcs.len()
 
         type_expr(cx, p.default.unwrap(), Some(want))
 
         a.release(trial)
-        rewind_registered(a.tables.struct_insts, structs)
-        rewind_registered(a.tables.enum_insts, enums)
-        rewind_registered(a.tables.constrained_insts, constrained)
+        a.closure_funcs.truncate(lowered)
+        rewind_instantiations(a, queued, tables, structs, enums, constrained)

@@ -17,10 +17,27 @@ names_a_declared_function(cx: &Analyzer, operand: Expr) -> Option[string] = *ope
         if cx.lookup(n).is_some() then None
         else if function_keys(cx, n).is_empty() then None
         else Some(n)
+    // **`&f[T]` is the spelling the refusal below tells a reader to write**, and brackets in an
+    // expression are indexing, so a generic function addressed at written type arguments arrives
+    // as an index over its own name. A name that is a place indexes as one, the `Ident` arm above
+    // being what says which of the two this is.
+    Index(head, _) -> names_a_declared_function(cx, head)
+    TypeArgs(head, _) -> names_a_declared_function(cx, head)
     _ -> None
 
+// The type arguments `&f[…]` wrote, as the expressions the bracket grammar read.
+addressed_type_args(operand: Expr) -> Buf[Expr] = *operand.kind match
+    Index(_, one) ->
+        var out: Buf[Expr] = buf()
+
+        out.push(one)
+        out
+    TypeArgs(_, inner) -> inner
+    _ -> buf()
+
 // The address itself.
-function_address(cx: &Analyzer, span: Span, written: string, expected: Option[Type]) -> TExpr
+function_address(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf[Expr],
+                 expected: Option[Type]) -> TExpr
     val key = addressed_overload(cx, span, written, expected)
 
     if key == "" then return bad_expr(span)
@@ -36,8 +53,19 @@ function_address(cx: &Analyzer, span: Span, written: string, expected: Option[Ty
     // one, exactly as a call's arguments do.
     var inst = key
 
+    if decl.tparams.is_empty() && !targ_exprs.is_empty() then
+        return cx.err(span, s"'$written' is not generic, so it has no type arguments to write — " +
+                      s"the address is '&$written'")
+
     if !decl.tparams.is_empty()
-        val made = addressed_instantiation(cx, span, written, f.unwrap(), expected)
+        // **Written arguments say which copy outright**, which is what the refusal below asks for
+        // where nothing else does; with none written the type the context wants is what settles
+        // them, exactly as a call's arguments would.
+        var made = ""
+
+        if targ_exprs.is_empty()
+            made = addressed_instantiation(cx, span, written, f.unwrap(), expected)
+        else made = written_instantiation(cx, span, written, key, f.unwrap(), targ_exprs)
 
         if made == "" then return bad_expr(span)
 
@@ -160,6 +188,31 @@ private addressed_overload(cx: &Analyzer, span: Span, written: string,
              s"match '${type_show(expected.unwrap())}'")
     ""
 end addressed_overload
+
+// Which copy of a generic function this address names, said outright.
+//
+// It is the same reading a call's own `f[T](…)` gets -- the arguments are expressions, since that is
+// what a bracket holds, and each is read back as the type it names.
+private written_instantiation(cx: &Analyzer, span: Span, written: string, key: string, f: Func,
+                              targ_exprs: Buf[Expr]) -> string
+    val decl = f.decl
+
+    if decl.tparams.len() != targ_exprs.len()
+        cx.fault(span, s"'$written' takes ${quantity(decl.tparams.len(), "type argument")}, " +
+                 s"but ${supplied_phrase(targ_exprs.len(), "type argument")}")
+        return ""
+    end if
+
+    var targs: Buf[Type] = buf()
+
+    for i in 0..<targ_exprs.len()
+        targs.push(written_type_arg(cx, targ_exprs.at(i)))
+
+    if !check_param_bounds(cx.an, cx.scope, span, key, decl.tparams, decl.bounds, targs, buf(),
+                           "type parameter") then return ""
+
+    instantiate_func(cx.an, f.scope, decl, targs, false)
+end written_instantiation
 
 // Which copy of a generic function this address names, read off the type the context wants.
 //
