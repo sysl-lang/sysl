@@ -121,6 +121,54 @@ element_addr(e: *Emit, receiver: TExpr, index: TExpr) -> Val
     r
 end element_addr
 
+// The address a run of `lanes` elements starts at, after checking that the whole run exists.
+//
+// **It is checked as a whole run rather than element by element.** `xs.load(3)` on a five-element
+// array traps even though element 3 is there, because elements 3 through 6 are not -- so the test is
+// that there is room for a run at all and that this one starts early enough to fit. The subtraction
+// is safe under the first half: a length shorter than the width has already failed.
+run_addr(e: *Emit, receiver: TExpr, index: TExpr, lanes: int) -> Val
+    val rty = texpr_type(receiver)
+
+    val parts = rty match
+        Array(n, elem) -> (address(e, receiver), VInt(from_int(long(n))), *elem)
+        Slice(elem, _) ->
+            val v = view_parts(e, receiver, *elem)
+
+            (v.0, v.1.unwrap_or(VZero), v.2)
+        other ->
+            gap_here(e, s"a run of ${type_show(other)}")
+            (VUndef, VZero, int_type())
+
+    val i = widen_index(e, index)
+    val wty = word_lty(e)
+    val width = VInt(from_int(long(lanes)))
+    val room = fresh_reg(e)
+
+    emit(e, InIntCmp(room, IUge, wty, parts.1, width))
+
+    val last = fresh_reg(e)
+
+    emit(e, InBin(last, OpSub, wty, parts.1, width))
+
+    val here = fresh_reg(e)
+
+    emit(e, InIntCmp(here, IUle, wty, i, last))
+
+    val ok = fresh_reg(e)
+
+    emit(e, InBin(ok, OpAnd, l_i1(), room, here))
+    trap_unless(e, ok, "bounds")
+
+    val r = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(wty, i))
+    emit(e, InGep(r, lty(e, parts.2), parts.0, idx))
+    r
+end run_addr
+
 // A view's pointer and its length, lifted out of the three words it is.
 private view_parts(e: *Emit, receiver: TExpr, elem: Type) -> (Val, Option[Val], Type)
     val wty = lty(e, texpr_type(receiver))

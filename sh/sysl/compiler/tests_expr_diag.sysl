@@ -392,3 +392,43 @@ a_library_callee_is_named_by_its_module()
     assert_eq(beside_library("import sysl.text.from_utf8\n\nprint(from_utf8(\"hi\").unwrap())\n"),
               "'b' of 'sysl.text.from_utf8' is []const byte, but string was given")
 end a_library_callee_is_named_by_its_module
+
+// **A store is told its width by the vector handed to it and a load has nothing to be told by**, a
+// slice having whatever length it has -- so the complaint names the place the width belongs rather
+// than guessing one, which is the mistake that would silently take the wrong run.
+@test("a load with nothing to say how wide it is names the binding the width belongs on")
+a_load_with_no_width()
+    assert_eq(only("f(xs: []const f32, out: []f32)\n    out.store(0, xs.load(0))\n"),
+              "'load' answers a vector, and how many lanes it takes is the vector type's to say — " +
+                  "nothing here says which. Write it where the value is bound: " +
+                  "'val v: <4>f32 = xs.load(i)'")
+
+// `volatile` says every access happens exactly as written, and a whole-register load is a different
+// number of accesses from the `W` the elements were declared with. `volatile <N>T` is the shape that
+// can be honoured, and it is spelled the other way round.
+@test("a run of volatile elements is refused rather than quietly widened")
+a_run_of_volatile_elements()
+    assert_eq(only("f(regs: []volatile u32) -> u32\n    val v: <4>u32 = regs.load(0)\n\n    v[0]\n"),
+              "a run of 'volatile uint' is one access per element and a vector reaches memory " +
+                  "once, so the qualifier cannot be kept — read the elements one at a time, or " +
+                  "hold them in a '[]uint' where a whole register is what the program means to move")
+
+// A chain joins its links with `&&`, which short-circuits, and there is no such thing per lane.
+// Reading it as an `&` would give it the shape of the scalar spelling and a different meaning.
+@test("a comparison chain over vectors is refused, and the reader is told to write the '&'")
+a_comparison_chain_over_vectors()
+    assert_eq(only("f(a: <4>int) -> unit\n    val m = 1 < a < 4\n"),
+              "a comparison chain joins its links with '&&', which short-circuits and so has no " +
+                  "lane-wise form — compare two vectors at a time and combine the masks with '&'")
+
+// The store needs elements it may write, exactly as `xs[i] = v` does, and `select` is a mask's
+// method rather than a vector's -- the whole point of it being that the choice is per lane.
+@test("a run may not be stored through a read-only view, and 'select' is read off a mask")
+what_a_run_and_a_select_are_read_off()
+    assert_eq(only("f(xs: []const f32, v: <4>f32) -> unit\n    xs.store(0, v)\n"),
+              "this run belongs to a '[]const f32', which views elements it may not write, so " +
+                  "there is nothing to store through. Lanes you may write are elements of your " +
+                  "own: copy them into a '[]f32' first")
+    assert_eq(only("f(v: <4>f32, b: <4>f32) -> f32\n    val s: <4>f32 = v.select(b, b)\n\n    s[0]\n"),
+              "'select' chooses between two vectors lane by lane, so it is read off a mask — the " +
+                  "'<4>bool' a comparison yields, as in '(a < b).select(a, b)'. <4>f32 is not one")

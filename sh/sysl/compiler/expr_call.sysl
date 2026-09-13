@@ -1232,9 +1232,10 @@ end call_key
 //
 // **A named argument may be written for any parameter, not only one with a default**, and a
 // parameter left unfilled is an error unless it has one.
-bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, args: Buf[Expr],
+bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, written_args: Buf[Expr],
                        report: bool) -> Option[Buf[Option[Expr]]]
     val params = f.decl.params
+    val args = pack_rest(cx, s"function '$written'", params, written_args, report)
     var slots: Buf[Option[Expr]] = buf()
 
     for i in 0..<params.len()
@@ -1289,6 +1290,113 @@ bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, args: Buf[Ex
 
     Some(slots)
 end bind_arguments
+
+// The trailing arguments a `...T` parameter collects, packed into the slice it takes.
+//
+// **It is a rewrite of the call rather than a shape the binder understands**: the tail becomes an
+// array literal viewed whole, which is the `[]const T` the parameter declares, so nothing after this
+// has to know that one parameter took several arguments.
+//
+// **`xs...` hands an existing slice straight through**, which is the case a rewrite cannot cover: a
+// function forwarding its own tail to another has a slice and not a list of values, and packing it
+// would make a slice of one slice.
+pack_rest(cx: &Analyzer, shown: string, params: Buf[Param], args: Buf[Expr],
+          report: bool) -> Buf[Expr]
+    var rest_at: int = -1
+
+    for i in 0..<params.len()
+        if rest_at < 0 && params.at(i).rest then rest_at = int(i)
+
+    // A spread outside a call that collects anything is a word about a parameter that is not there,
+    // so it is refused here rather than reaching the type checker as an argument of a shape nothing
+    // takes.
+    if rest_at < 0
+        if report then
+            for i in 0..<args.len()
+                if is_spread(args.at(i)) then
+                    cx.fault(args.at(i).span, s"'...' says this argument is already the slice a " +
+                             s"'...T' parameter collects, and $shown has no such parameter")
+
+        return args
+    end if
+
+    val rest = params.at(usize(rest_at))
+
+    // **The split is over the POSITIONAL arguments alone.** A name is written after them, so a call
+    // that gives every fixed parameter by name has left nothing positional at all.
+    var positional: Buf[Expr] = buf()
+    var named: Buf[Expr] = buf()
+    var seen_named = false
+
+    for i in 0..<args.len()
+        if named_argument(args.at(i)).is_some() then seen_named = true
+
+        if seen_named then named.push(args.at(i)) else positional.push(args.at(i))
+
+    // A rest parameter has one name and any number of arguments, so there is nothing for a name to
+    // pick out. The fixed parameters in front of it may still be named.
+    if report
+        for i in 0..<named.len()
+            if named_argument(named.at(i)).unwrap_or("") == rest.name then
+                cx.fault(named.at(i).span, s"'${rest.name}' collects the rest of the call, so its " +
+                         "arguments are positional — a name picks out one parameter and this one " +
+                         "takes as many as are left")
+
+    if positional.len() < usize(rest_at) then return args
+
+    var tail: Buf[Expr] = buf()
+
+    for i in usize(rest_at)..<positional.len()
+        tail.push(positional.at(i))
+
+    val packed = packed_tail(cx, rest, tail, report)
+    var out: Buf[Expr] = buf()
+
+    for i in 0..<usize(rest_at)
+        out.push(positional.at(i))
+
+    for i in 0..<named.len()
+        out.push(named.at(i))
+
+    // **Placed by NAME rather than by position**, which is what lets a fixed parameter be given by
+    // name in front of it: a positional argument may not follow a named one, and the packed slice is
+    // written after whatever the call wrote.
+    out.push(expr(packed.span, NamedArg(rest.name, packed)))
+    out
+end pack_rest
+
+// The one expression a `...T` parameter is given, out of however many the call wrote.
+private packed_tail(cx: &Analyzer, rest: Param, tail: Buf[Expr], report: bool) -> Expr
+    if tail.len() == 1 && is_spread(tail.at(0))
+        *tail.at(0).kind match
+            Spread(v) -> return v
+            _ -> ()
+    end if
+
+    if report
+        for i in 0..<tail.len()
+            if is_spread(tail.at(i)) then
+                cx.fault(tail.at(i).span, s"'...' hands the whole of '${rest.name}' over, so it is " +
+                         "the only argument there — a slice and a value cannot both be part of one " +
+                         "tail")
+
+    val at = if tail.is_empty() then rest.span else tail.at(0).span
+    val lit = expr(at, ArrayLit(tail))
+
+    // An empty tail cannot be sliced: `[]` inside a subscript has no context to read its element
+    // type from, where the bare literal is answered by the parameter's own `[]const T`.
+    if tail.is_empty() then return lit
+
+    expr(at, Index(lit, expr(at, RangeExpr(None, None, true))))
+end packed_tail
+
+private is_spread(e: Expr) -> bool = *e.kind match
+    Spread(_) -> true
+    _ -> false
+
+private named_argument(e: Expr) -> Option[string] = *e.kind match
+    NamedArg(n, _) -> Some(n)
+    _ -> None
 
 private param_index(params: Buf[Param], name: string) -> int
     for i in 0..<params.len()
