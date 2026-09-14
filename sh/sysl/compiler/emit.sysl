@@ -47,6 +47,12 @@ struct Emit
     char_buf: bool
     uses_snprintf: bool
 
+    // Whether a body began or ended a varargs walk, and whether one duplicated a walk. They are two
+    // flags because the pair and the copy are declared separately -- a program that never writes
+    // `va_copy` should not carry its declaration.
+    uses_varargs: bool
+    uses_va_copy: bool
+
     // How many assembly blocks the module has emitted, which is what lets each one's labels be its
     // own.
     asm_site: int
@@ -110,6 +116,16 @@ struct Emit
     // The parameters a jump rebinds, in declaration order -- every one of them, so that they line up
     // with the arguments a call was written with.
     tail_params: Buf[(string, Type)]
+
+    // What the function being emitted is called, what its parameters are, and the `variant` it
+    // declared -- the three things a self-call needs to check the measure.
+    self_name: string
+    self_params: Buf[(string, Type)]
+    self_variant: Option[TExpr]
+
+    // The `@ghost` functions of this program, which nothing emitted may name. A clause that calls one
+    // is a proof obligation rather than something to lay down, and is dropped whole.
+    ghost_funcs: Buf[string]
 
     // -- the ownership runtime ---------------------------------------------------------------
 
@@ -277,6 +293,8 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
     var variadics: Buf[string] = buf()
     var tail_calls: Buf[Span] = buf()
     var tail_params: Buf[(string, Type)] = buf()
+    var self_params: Buf[(string, Type)] = buf()
+    var ghost_funcs: Buf[string] = buf()
     var ensures: Buf[TClause] = buf()
 
     var boxes: Buf[(string, Type)] = buf()
@@ -297,9 +315,10 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
     var export_symbols: Buf[(string, string)] = buf()
 
     Emit(t, layout_for(t), int(t.pointer_bits()), globals, 0, sat_decls, false, false, false,
-         false, false, false, 0,
+         false, false, false, false, false, 0,
          prologue, blocks, current, None, "entry", 0, 0, false, reached, loops, scratch, symbols,
-         foreigns, variadics, variadic_types, export_symbols, ensures, None, "", tail_calls, tail_params, destructors, false, false, false,
+         foreigns, variadics, variadic_types, export_symbols, ensures, None, "", tail_calls, tail_params,
+         "", self_params, None, ghost_funcs, destructors, false, false, false,
          false, boxes, bufs, requested, queue, temps, temp_marks, owned_slots, owned_marks, defers,
          defer_marks, promoted, promoted_boxes, promoted_temps, ref_places, None)
 end emitter_for
@@ -342,6 +361,9 @@ start_function(e: *Emit)
     e.tail_target = ""
     e.tail_calls.clear()
     e.tail_params.clear()
+    e.self_name = ""
+    e.self_params.clear()
+    e.self_variant = None
     e.temps.clear()
     e.temp_marks.clear()
     e.owned_slots.clear()

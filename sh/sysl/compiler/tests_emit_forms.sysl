@@ -4,6 +4,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.text.from_utf8_unchecked
+import sysl.text.Search
 
 // The forms a body can reach that nothing else here has a file for: the loop over a sequence, the
 // comma assignment, the weak edge, the type attributes of a simple enum, a type's identity read off
@@ -81,6 +82,52 @@ private form_lowered(text: string, symbol: string) -> string
 
     s"no definition of '$symbol'"
 end form_lowered
+
+// The whole module text, for a claim about a line that belongs to no function.
+private form_module(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = form_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, done.main_module)
+
+    var own: Buf[string] = buf()
+
+    own.push(module_written(parsed.program))
+
+    val promotions = post_analysis_checks(done.an, whole, own)
+    val kept = prune(strip_tests(whole), own)
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end form_module
+
+// Storage the linker supplies is **declared** rather than laid down, and only what a body reaches is
+// declared -- so the read is what puts the line in the module, and an `extern` variable nothing
+// touches contributes nothing.
+@test("an 'extern' variable something reads is an 'external global' and one nothing reads is not")
+an_extern_variable_read_is_declared()
+    if no_form_library() then return
+
+    val text = form_module("extern optind: i32\n" +
+                           "extern environ: **u8\n" +
+                           "\n" +
+                           "print(optind)\n")
+
+    assert(text.contains("@optind = external global i32\n"))
+    assert(!text.contains("@environ"))
+end an_extern_variable_read_is_declared
 
 // The `declare` lines of the externs a program reaches, in the order the module writes them down.
 private form_declares(text: string) -> Buf[string]
@@ -2225,3 +2272,285 @@ a_vector_literal_and_its_lanes()
               "  ret i32 %t22\n" +
               "}\n")
 end a_vector_literal_and_its_lanes
+
+// A quantifier walks until the first element settles the answer, which is held in a slot so both
+// exits read one place. It registers no loop of its own: a `break` written inside a predicate belongs
+// to whatever loop encloses the quantifier, so there is no `else`, no label and no result slot.
+@test("'for some' stops at the element that settles it and answers out of its own slot")
+a_quantifier_stops_at_the_element_that_settles_it()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "anyneg(a: [3]int) -> bool = for some k in 0..<3 do a[k] < 0\n" +
+                  "\n" +
+                  "main() = print(anyneg([1, 2, 3]))\n",
+              "anyneg"),
+              "define zeroext i1 @anyneg([3 x i32] %a.param) {\n" +
+              "entry:\n" +
+              "  %a.addr = alloca [3 x i32]\n" +
+              "  %t1 = alloca i1\n" +
+              "  %k.addr = alloca i32\n" +
+              "  store [3 x i32] %a.param, ptr %a.addr\n" +
+              "  store i1 0, ptr %t1\n" +
+              "  store i32 0, ptr %k.addr\n" +
+              "  br label %quant.cond1\n" +
+              "quant.cond1:\n" +
+              "  %t2 = load i32, ptr %k.addr\n" +
+              "  %t3 = icmp slt i32 %t2, 3\n" +
+              "  br i1 %t3, label %quant.body2, label %quant.end5\n" +
+              "quant.body2:\n" +
+              "  %t4 = load i32, ptr %k.addr\n" +
+              "  %t5 = sext i32 %t4 to i64\n" +
+              "  %t6 = icmp ult i64 %t5, 3\n" +
+              "  br i1 %t6, label %bounds.ok6, label %bounds.bad7\n" +
+              "bounds.bad7:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok6:\n" +
+              "  %t7 = getelementptr i32, ptr %a.addr, i64 %t5\n" +
+              "  %t8 = load i32, ptr %t7\n" +
+              "  %t9 = icmp slt i32 %t8, 0\n" +
+              "  br i1 %t9, label %quant.done4, label %quant.step3\n" +
+              "quant.done4:\n" +
+              "  store i1 1, ptr %t1\n" +
+              "  br label %quant.end5\n" +
+              "quant.step3:\n" +
+              "  %t10 = load i32, ptr %k.addr\n" +
+              "  %t11 = add i32 %t10, 1\n" +
+              "  store i32 %t11, ptr %k.addr\n" +
+              "  br label %quant.cond1\n" +
+              "quant.end5:\n" +
+              "  %t12 = load i1, ptr %t1\n" +
+              "  ret i1 %t12\n" +
+              "}\n")
+end a_quantifier_stops_at_the_element_that_settles_it
+
+// A `variant` on a loop sets its two slots up **where the loop is entered** rather than in the
+// function's prologue: a loop nested inside another is entered many times, and a flag armed once per
+// call would compare the second entry's first measure against the first entry's last.
+@test("a 'while' with a 'variant' arms its measure at the loop rather than in the prologue")
+a_checked_loop_arms_its_measure_where_it_is_entered()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "sum_to(n: int) -> int\n" +
+                  "    var i = 0\n" +
+                  "    var s = 0\n" +
+                  "\n" +
+                  "    while i < n\n" +
+                  "        invariant i >= 0 && i <= n\n" +
+                  "        variant n - i\n" +
+                  "        s += i\n" +
+                  "        i += 1\n" +
+                  "\n" +
+                  "    s\n" +
+                  "end sum_to\n" +
+                  "\n" +
+                  "main() = print(sum_to(5))\n",
+              "sum_to"),
+              "define i32 @sum_to(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %i.addr = alloca i32\n" +
+              "  %s.addr = alloca i32\n" +
+              "  %variant1.prev = alloca i32\n" +
+              "  %variant1.armed = alloca i1\n" +
+              "  %t6 = alloca i1\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  store i32 0, ptr %i.addr\n" +
+              "  store i32 0, ptr %s.addr\n" +
+              "  store i1 0, ptr %variant1.armed\n" +
+              "  br label %while.cond1\n" +
+              "while.cond1:\n" +
+              "  %t1 = load i32, ptr %i.addr\n" +
+              "  %t2 = load i32, ptr %n.addr\n" +
+              "  %t3 = icmp slt i32 %t1, %t2\n" +
+              "  br i1 %t3, label %while.body2, label %while.end3\n" +
+              "while.body2:\n" +
+              "  %t4 = load i32, ptr %i.addr\n" +
+              "  %t5 = icmp sge i32 %t4, 0\n" +
+              "  store i1 %t5, ptr %t6\n" +
+              "  br i1 %t5, label %sc.rhs4, label %sc.end5\n" +
+              "sc.rhs4:\n" +
+              "  %t7 = load i32, ptr %i.addr\n" +
+              "  %t8 = load i32, ptr %n.addr\n" +
+              "  %t9 = icmp sle i32 %t7, %t8\n" +
+              "  store i1 %t9, ptr %t6\n" +
+              "  br label %sc.end5\n" +
+              "sc.end5:\n" +
+              "  %t10 = load i1, ptr %t6\n" +
+              "  br i1 %t10, label %invariant.ok6, label %invariant.bad7\n" +
+              "invariant.bad7:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "invariant.ok6:\n" +
+              "  %t11 = load i32, ptr %n.addr\n" +
+              "  %t12 = load i32, ptr %i.addr\n" +
+              "  %t13 = sub i32 %t11, %t12\n" +
+              "  %t14 = load i1, ptr %variant1.armed\n" +
+              "  br i1 %t14, label %variant.cmp8, label %variant.set9\n" +
+              "variant.cmp8:\n" +
+              "  %t15 = load i32, ptr %variant1.prev\n" +
+              "  %t16 = icmp slt i32 %t13, %t15\n" +
+              "  br i1 %t16, label %variant.ok10, label %variant.bad11\n" +
+              "variant.bad11:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "variant.ok10:\n" +
+              "  br label %variant.set9\n" +
+              "variant.set9:\n" +
+              "  store i32 %t13, ptr %variant1.prev\n" +
+              "  store i1 1, ptr %variant1.armed\n" +
+              "  %t17 = load i32, ptr %s.addr\n" +
+              "  %t18 = load i32, ptr %i.addr\n" +
+              "  %t19 = add i32 %t17, %t18\n" +
+              "  store i32 %t19, ptr %s.addr\n" +
+              "  %t20 = load i32, ptr %i.addr\n" +
+              "  %t21 = add i32 %t20, 1\n" +
+              "  store i32 %t21, ptr %i.addr\n" +
+              "  br label %while.cond1\n" +
+              "while.end3:\n" +
+              "  %t22 = load i32, ptr %s.addr\n" +
+              "  ret i32 %t22\n" +
+              "}\n")
+end a_checked_loop_arms_its_measure_where_it_is_entered
+
+// A self-call the compiler can see is a jump back to the frame's own entry, and a `variant` is
+// checked **before** the jump, while the frame is still whole: the arguments are put into the
+// parameters' slots, the measure is taken again, the parameters are put back, and only then do the
+// new values land for good. A tail call survives this where an `ensure` does not, because a tail
+// call never returns.
+@test("a '@tailrec' frame checks its measure by swapping the arguments in and the parameters back")
+a_tail_recursive_frame_checks_its_measure_before_the_jump()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "@tailrec\n" +
+                  "walk(n: int, acc: int) -> int\n" +
+                  "    variant n\n" +
+                  "    if n == 0 then acc\n" +
+                  "    else walk(n - 1, acc + n)\n" +
+                  "\n" +
+                  "print(walk(4, 0))\n",
+              "walk"),
+              "define i32 @walk(i32 %n.param, i32 %acc.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  %acc.addr = alloca i32\n" +
+              "  %t1 = alloca i32\n" +
+              "  %t11 = alloca i32\n" +
+              "  %t13 = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  store i32 %acc.param, ptr %acc.addr\n" +
+              "  br label %tailrec1\n" +
+              "tailrec1:\n" +
+              "  %t2 = load i32, ptr %n.addr\n" +
+              "  %t3 = icmp eq i32 %t2, 0\n" +
+              "  br i1 %t3, label %if.then2, label %if.else3\n" +
+              "if.then2:\n" +
+              "  %t4 = load i32, ptr %acc.addr\n" +
+              "  store i32 %t4, ptr %t1\n" +
+              "  br label %if.end4\n" +
+              "if.else3:\n" +
+              "  %t5 = load i32, ptr %n.addr\n" +
+              "  %t6 = sub i32 %t5, 1\n" +
+              "  %t7 = load i32, ptr %acc.addr\n" +
+              "  %t8 = load i32, ptr %n.addr\n" +
+              "  %t9 = add i32 %t7, %t8\n" +
+              "  %t10 = load i32, ptr %n.addr\n" +
+              "  %t12 = load i32, ptr %n.addr\n" +
+              "  store i32 %t12, ptr %t11\n" +
+              "  store i32 %t6, ptr %n.addr\n" +
+              "  %t14 = load i32, ptr %acc.addr\n" +
+              "  store i32 %t14, ptr %t13\n" +
+              "  store i32 %t9, ptr %acc.addr\n" +
+              "  %t15 = load i32, ptr %n.addr\n" +
+              "  %t16 = load i32, ptr %t11\n" +
+              "  store i32 %t16, ptr %n.addr\n" +
+              "  %t17 = load i32, ptr %t13\n" +
+              "  store i32 %t17, ptr %acc.addr\n" +
+              "  %t18 = icmp slt i32 %t15, %t10\n" +
+              "  br i1 %t18, label %variant.ok5, label %variant.bad6\n" +
+              "variant.bad6:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "variant.ok5:\n" +
+              "  store i32 %t6, ptr %n.addr\n" +
+              "  store i32 %t9, ptr %acc.addr\n" +
+              "  br label %tailrec1\n" +
+              "if.end4:\n" +
+              "  %t19 = load i32, ptr %t1\n" +
+              "  ret i32 %t19\n" +
+              "}\n")
+end a_tail_recursive_frame_checks_its_measure_before_the_jump
+
+// `become` hands the arguments to a **different** function, whose frame replaces this one. LLVM
+// refuses a `musttail` that is not immediately followed by a return of its own result, so the call
+// and the `ret` are laid down together.
+@test("'become' is a 'musttail' call and the return that has to follow it")
+a_become_is_a_musttail_call_and_its_return()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "even(n: int) -> bool\n" +
+                  "    if n == 0 then return true\n" +
+                  "\n" +
+                  "    become odd(n - 1)\n" +
+                  "\n" +
+                  "odd(n: int) -> bool\n" +
+                  "    if n == 0 then return false\n" +
+                  "\n" +
+                  "    become even(n - 1)\n" +
+                  "\n" +
+                  "print(even(1000000), odd(1000000))\n",
+              "even"),
+              "define zeroext i1 @even(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = icmp eq i32 %t1, 0\n" +
+              "  br i1 %t2, label %if.then1, label %if.end3\n" +
+              "if.then1:\n" +
+              "  ret i1 1\n" +
+              "if.end3:\n" +
+              "  %t3 = load i32, ptr %n.addr\n" +
+              "  %t4 = sub i32 %t3, 1\n" +
+              "  %t5 = musttail call zeroext i1 @odd(i32 %t4)\n" +
+              "  ret i1 %t5\n" +
+              "}\n")
+end a_become_is_a_musttail_call_and_its_return
+
+// A clause naming a `@ghost` function states a proof obligation rather than something to lay down:
+// the callee is deliberately never emitted, so laying the clause down would be a call to a symbol
+// that is not there. The clause beside it, which names nothing ghostly, is laid down as always.
+@test("a 'require' naming a '@ghost' function is erased, and the one beside it is not")
+a_ghostly_clause_is_erased()
+    if no_form_library() then return
+
+    assert_eq(form_lowered(
+                  "@ghost\n" +
+                  "positive(n: int) -> bool = n > 0\n" +
+                  "\n" +
+                  "f(n: int) -> int\n" +
+                  "    require n >= 0\n" +
+                  "    require positive(n)\n" +
+                  "    n\n" +
+                  "\n" +
+                  "print(f(3))\n",
+              "f"),
+              "define i32 @f(i32 %n.param) {\n" +
+              "entry:\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store i32 %n.param, ptr %n.addr\n" +
+              "  %t1 = load i32, ptr %n.addr\n" +
+              "  %t2 = icmp sge i32 %t1, 0\n" +
+              "  br i1 %t2, label %require.ok1, label %require.bad2\n" +
+              "require.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "require.ok1:\n" +
+              "  %t3 = load i32, ptr %n.addr\n" +
+              "  ret i32 %t3\n" +
+              "}\n")
+end a_ghostly_clause_is_erased

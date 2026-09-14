@@ -177,6 +177,57 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         gen_iterate(e, cursor, cursor_ty, init, next, bind, body, else_block, ty)
     TDoWhile(body, cond, else_block, ty) -> gen_do_while(e, body, cond, else_block, ty)
 
+    // The tail walk is the ABI's, so all three are LLVM's own: two intrinsic calls and the one
+    // instruction whose lowering every back end supplies for it.
+    TVaStart(ap) -> gen_va_intrinsic(e, llvm_va_start(), ap)
+    TVaEnd(ap) -> gen_va_intrinsic(e, llvm_va_end(), ap)
+
+    TVaArg(ap, ty) ->
+        val r = fresh_reg(e)
+
+        emit(e, InVaArg(r, gen_expr(e, ap), lty(e, ty)))
+        r
+
+    // The one place the C ABI is not the same on every machine, so the one place codegen reads the
+    // target. All three answers are a `ptr`, and all three start from the address of the walk -- what
+    // differs is whether the callee is handed that address, the value in it, or the address of a copy
+    // of it.
+    TVaPass(ap) ->
+        val addr = gen_expr(e, ap)
+
+        e.target.va_list match
+            VaAddress -> addr
+            VaLoaded ->
+                val r = fresh_reg(e)
+
+                emit(e, InLoad(r, LPtr, addr, AccPlain, None))
+                r
+            VaCopied ->
+                val copy = alloca(e, fresh_reg(e), lty(e, VaList))
+
+                emit_memcpy(e, copy, addr, e.target.va_list_bytes, 8)
+                copy
+
+    TVaCopy(dst, src) ->
+        e.uses_va_copy = true
+
+        // Both addresses are produced before either is used, so a copy onto a list read out of the
+        // same expression cannot see a half-written destination.
+        val d = gen_expr(e, dst)
+        val s = gen_expr(e, src)
+
+        var args: Buf[IrArg] = buf()
+
+        args.push(ir_arg(LPtr, d))
+        args.push(ir_arg(LPtr, s))
+        emit(e, InCall(None, LVoid, VGlobal(llvm_va_copy()), args, no_ir_attrs(), None,
+                       no_fast_math(), false))
+        VNothing
+
+    TQuantifier(universal, name, var_ty, lo, hi, inclusive, pred) ->
+        gen_quantifier(e, universal, name, var_ty, lo, hi, inclusive, pred)
+    TCheckedLoop(slot, var_ty, loop_expr) -> gen_checked_loop(e, slot, var_ty, loop_expr)
+
     TConstrainedCheck(value, target) ->
         val v = gen_expr(e, value)
 
@@ -990,6 +1041,11 @@ gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
             retain_value(e, ty, v)
             staged.push((StagedValue, v))
 
+    // The measure is checked while the frame is still whole, since it reads the parameters and the
+    // jump below is about to overwrite them. A tail call survives this where an `ensure` does not:
+    // the check happens *before* the call, and a tail call's problem is that it never returns.
+    if checks_variant(e, e.self_name) then gen_variant_at_call(e, staged)
+
     release_all(e)
 
     for i in 0..<e.tail_params.len()
@@ -1024,9 +1080,12 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
                                 VGlobal(symbol_of(e, name)), args, ty)
 
     var arg_vals: Buf[IrArg] = buf()
+    val staged = staged_args(e, args, &arg_vals)
 
-    for i in 0..<args.len()
-        arg_value(e, args.at(i), &arg_vals)
+    // A call the compiler can see is a call to the same body checks that the measure has gone down.
+    // It sits before the call rather than inside the callee, which is what lets it be made out of
+    // values already in hand.
+    if checks_variant(e, name) then gen_variant_at_call(e, staged)
 
     // A sysl definition's tail is named the way a foreign one's is: by the callee's whole function
     // type, since the argument list alone does not say where the declared parameters stop.
@@ -1036,6 +1095,44 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
 
     gen_sysl_call(e, VGlobal(symbol_of(e, name)), arg_vals, ty)
 end gen_call
+
+// One end of a varargs walk: the intrinsic call, and the flag that declares the pair.
+private gen_va_intrinsic(e: *Emit, symbol: string, ap: TExpr) -> Val
+    e.uses_varargs = true
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, gen_expr(e, ap)))
+    emit(e, InCall(None, LVoid, VGlobal(symbol), args, no_ir_attrs(), None, no_fast_math(), false))
+    VNothing
+end gen_va_intrinsic
+
+// One call's arguments, in step with the parameters: what each one came out as, beside the list the
+// call itself is written with. The two differ exactly where a parameter is zero-sized, which is an
+// argument evaluated and not passed -- so a check reading the parameters needs the first and the call
+// needs the second.
+staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg]) -> Buf[(int, Val)]
+    var staged: Buf[(int, Val)] = buf()
+
+    for i in 0..<args.len()
+        val a = args.at(i)
+        val aty = texpr_type(a)
+
+        if e.layout.indirect(aty)
+            val addr = address(e, a)
+
+            out.push(ir_arg(LPtr, addr))
+            staged.push((StagedSlot, addr))
+        else
+            val v = gen_expr(e, a)
+
+            if zero_sized(aty) then staged.push((StagedNothing, VNothing))
+            else
+                out.push(ir_arg(lty(e, aty), v))
+                staged.push((StagedValue, v))
+
+    staged
+end staged_args
 
 // One argument, in whatever form the boundary takes it: a large value crosses as the address of
 // storage the caller holds, and a zero-sized one is evaluated and not passed.

@@ -145,6 +145,15 @@ all_cpus() -> Buf[Cpu]
     out
 end all_cpus
 
+// How a `va_list` reaches a callee that takes one. All three answers are a pointer and all three
+// start from the address of the walk; what differs is whether the callee is handed that address, the
+// value in it, or the address of a copy of it.
+enum VaListAbi
+    VaAddress
+    VaLoaded
+    VaCopied
+end VaListAbi
+
 // One machine the compiler knows how to be asked about.
 struct Target
     // What a command line writes, and what a diagnostic quotes back. `<processor>-<system>`, with a
@@ -185,6 +194,12 @@ struct Target
     // not the one a hosted target follows. A package's C is compiled *as* the target, so a header
     // shared with a project built the other way disagrees about the size of every enum in it.
     short_enums: bool
+
+    // How a `va_list` crosses to a callee that takes one, and how many bytes the object is. This is
+    // the one place the C ABI is not the same on every machine, so it is a measured row here rather
+    // than a rule anywhere.
+    va_list: VaListAbi
+    va_list_bytes: int
 
     hard_float(self) -> bool = !self.soft_float
 
@@ -234,45 +249,50 @@ end Target
 all_targets() -> Buf[Target]
     var out: Buf[Target] = buf()
 
-    out.push(Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false, "", false, false))
-    out.push(Target("x86_64-macos", "x86_64-apple-macosx", X86_64, MacOS, false, "", false, false))
+    out.push(Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false, "", false, false,
+                    VaLoaded, 8))
+    out.push(Target("x86_64-macos", "x86_64-apple-macosx", X86_64, MacOS, false, "", false, false,
+                    VaAddress, 24))
     out.push(Target("aarch64-linux", "aarch64-unknown-linux-gnu", Aarch64, Linux, false, "", false,
-                    false))
+                    false, VaCopied, 32))
     out.push(Target("x86_64-linux", "x86_64-unknown-linux-gnu", X86_64, Linux, false, "", false,
-                    false))
+                    false, VaAddress, 24))
     out.push(Target("riscv64-linux", "riscv64-unknown-linux-gnu", Riscv64, Linux, false, "", false,
-                    false))
+                    false, VaLoaded, 8))
     out.push(Target("x86_64-windows", "x86_64-pc-windows-msvc", X86_64, Windows, false, "", false,
-                    false))
+                    false, VaLoaded, 8))
     out.push(Target("aarch64-android", "aarch64-linux-android24", Aarch64, Android, false, "", false,
-                    false))
+                    false, VaCopied, 32))
     out.push(Target("aarch64-freestanding", "aarch64-none-elf", Aarch64, Freestanding, false, "",
-                    false, false))
+                    false, false, VaCopied, 32))
     out.push(Target("x86_64-freestanding", "x86_64-unknown-none-elf", X86_64, Freestanding, false, "",
-                    false, false))
+                    false, false, VaAddress, 24))
     out.push(Target("riscv64-freestanding", "riscv64-unknown-elf", Riscv64, Freestanding, true, "",
-                    true, false))
+                    true, false, VaLoaded, 8))
     out.push(Target("thumb-freestanding", "thumbv8m.main-none-eabihf", Thumb, Freestanding, false,
-                    "fpv5-sp-d16", false, true))
+                    "fpv5-sp-d16", false, true, VaLoaded, 4))
     out.push(Target("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Thumb, Freestanding, true,
-                    "fpv5-sp-d16", false, true))
+                    "fpv5-sp-d16", false, true, VaLoaded, 4))
     out.push(Target("thumb-freestanding-soft", "thumbv8m.main-none-eabi", Thumb, Freestanding, true,
-                    "", true, true))
+                    "", true, true, VaLoaded, 4))
     out.push(Target("thumbv6m-freestanding", "thumbv6m-none-eabi", Thumb, Freestanding, true, "",
-                    true, true))
+                    true, true, VaLoaded, 4))
     out.push(Target("thumbv7m-freestanding", "thumbv7m-none-eabi", Thumb, Freestanding, true, "",
-                    true, true))
+                    true, true, VaLoaded, 4))
     out.push(Target("thumbv7em-freestanding", "thumbv7em-none-eabihf", Thumb, Freestanding, false,
-                    "fpv4-sp-d16", false, true))
+                    "fpv4-sp-d16", false, true, VaLoaded, 4))
     out.push(Target("thumbv7em-freestanding-soft", "thumbv7em-none-eabi", Thumb, Freestanding, true,
-                    "", true, true))
+                    "", true, true, VaLoaded, 4))
     out.push(Target("riscv32-freestanding", "riscv32-unknown-elf", Riscv32, Freestanding, true, "",
-                    true, false))
+                    true, false, VaLoaded, 4))
     out.push(Target("wasm32-freestanding", "wasm32-unknown-unknown", Wasm32, Freestanding, false, "",
-                    false, false))
-    out.push(Target("wasm32-wasi", "wasm32-wasip1", Wasm32, Wasi, false, "", false, false))
-    out.push(Target("craft-freestanding", "craft", Craft, Freestanding, true, "", true, false))
-    out.push(Target("x86-linux", "i386-unknown-linux-gnu", X86, Linux, false, "", false, false))
+                    false, false, VaLoaded, 4))
+    out.push(Target("wasm32-wasi", "wasm32-wasip1", Wasm32, Wasi, false, "", false, false, VaLoaded,
+                    4))
+    out.push(Target("craft-freestanding", "craft", Craft, Freestanding, true, "", true, false,
+                    VaLoaded, 2))
+    out.push(Target("x86-linux", "i386-unknown-linux-gnu", X86, Linux, false, "", false, false,
+                    VaAddress, 4))
     out
 end all_targets
 
@@ -387,5 +407,6 @@ end host_cpu
 host_target() -> Target
     target_named(host_name(cpu_symbol(host_cpu()), os_symbol(host_os()))) match
         Some(t) -> t
-        None -> Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false, "", false, false)
+        None -> Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false, "", false, false,
+                       VaLoaded, 8)
 end host_target
