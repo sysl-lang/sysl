@@ -1,0 +1,742 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The `derives` clause -- `struct Size derives Eq, Ord, Hash, Display`.
+//
+// **What the clause promises is that the compiler writes the block a person would have written out
+// field by field**, so what is asserted here is the *behaviour* of the four traits rather than the
+// shape of what was synthesized: that equality is field by field, that ordering is lexicographic in
+// declaration order, that the hash depends on which field holds which value, and that a value
+// renders as its own name and its fields. Nothing short of running says any of that.
+//
+// The second half is the clause's own refusals, which are about the words in front of the reader
+// rather than about the type's fields, and are raised before any block is built.
+//
+// **Every refusal quoted here was obtained by running the reference compiler on the same source.**
+
+private var dv_library_cache: Buf[Program] = buf()
+private var dv_library_read: bool = false
+
+private dv_library() -> Buf[Program]
+    if dv_library_read then return dv_library_cache
+
+    dv_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> dv_library_cache = units
+
+    dv_library_cache
+end dv_library
+
+private dv_no_library() -> bool
+    if dv_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end dv_no_library
+
+// Everything a source read beside the library has to say about itself, joined.
+private dv_err(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = dv_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    var out = str_builder()
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/")
+            out.push(done.reported.at(i).diag.message)
+            out.push_char('\n')
+
+    out.finish()
+end dv_err
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private dv_ran(text: string) -> string
+    val root = make_temp_dir("sysl-derive").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end dv_ran
+
+private dv_can_run() -> bool
+    if dv_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end dv_can_run
+
+// -- a struct --------------------------------------------------------------------------------------
+
+private dv_sized() -> string = raw"""
+    struct Size derives Eq, Ord, Hash, Display
+        w: int
+        h: int
+    end Size
+
+    """
+
+@test("equality is field by field")
+equality_is_field_by_field()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_sized() + raw"""
+        print(Size(3, 4) == Size(3, 4))
+        print(Size(3, 4) == Size(3, 5))
+        print(Size(3, 4) != Size(4, 4))
+        """), "true\nfalse\ntrue\n")
+
+// The first field decides, and the second is only reached where the first agrees -- which is what
+// makes this lexicographic rather than four independent comparisons.
+@test("ordering is lexicographic, first field first")
+ordering_is_lexicographic_first_field_first()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_sized() + raw"""
+        print(Size(3, 4) < Size(3, 5))
+        print(Size(3, 9) < Size(4, 0))
+        print(Size(3, 4) < Size(3, 4))
+        print(Size(4, 0) < Size(3, 9))
+        """), "true\ntrue\nfalse\nfalse\n")
+
+@test("the derived comparisons reach '>' and '<=' too, which Ord derives from 'lt'")
+the_derived_comparisons_reach_greater_and_le_too()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_sized() + raw"""
+        print(Size(4, 0) > Size(3, 9))
+        print(Size(3, 4) <= Size(3, 4))
+        """), "true\ntrue\n")
+
+@test("equal values hash equal")
+equal_values_hash_equal()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_sized() + "print(Size(3, 4).hash() == Size(3, 4).hash())\n"), "true\n")
+
+// A plain XOR of the fields would make these one key. The FNV prime between them is what carries the
+// position, exactly as it does for a tuple.
+@test("which field holds which value changes the hash")
+which_field_holds_which_value_changes_the_hash()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_sized() + "print(Size(3, 4).hash() == Size(4, 3).hash())\n"), "false\n")
+
+@test("a value renders as its own name and its fields")
+a_value_renders_as_its_own_name_and_its_fields()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_sized() + "print(Size(3, 4))\n"), "Size(3, 4)\n")
+
+// A specifier describes the field the *whole* value occupies, so a width pads the rendering rather
+// than its first field.
+@test("a width pads the whole rendering")
+a_width_pads_the_whole_rendering()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_sized() + raw"""
+        val s = Size(3, 4)
+
+        print(f"[${s}%12s]")
+        """), "[  Size(3, 4)]\n")
+
+// Left-justified is the other half of the same padding, and it is the one that would go wrong if the
+// measuring pass and the writing pass ever disagreed about how wide the value came out.
+@test("and a left-justified width pads on the other side")
+a_left_justified_width_pads_on_the_other_side()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_sized() + raw"""
+        val s = Size(3, 4)
+
+        print(f"[${s}%-12s]")
+        print(f"[${s}%2s]")
+        """), "[Size(3, 4)  ]\n[Size(3, 4)]\n")
+
+// The rendering runs twice under a width -- once into the counter and once for real -- so a field the
+// value owns is read twice and released once. A `string` field is what makes that visible: an owned
+// one released by the measuring pass would leave the second pass reading freed bytes.
+@test("a value the rendering owns survives being rendered twice")
+a_value_the_rendering_owns_survives_being_rendered_twice()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Named derives Display
+            name: string
+            n: int
+        end Named
+
+        val v = Named("abc", 1)
+
+        print(f"[${v}%14s]")
+        print(f"[${v}%14s]")
+        print(v)
+        """), "[ Named(abc, 1)]\n[ Named(abc, 1)]\nNamed(abc, 1)\n")
+
+// The inner value is a part of the outer rendering, so it is written through the same sink the outer
+// one was pointed at -- which is what makes the measuring pass see the whole thing.
+@test("a width over a nesting measures the whole nesting")
+a_width_over_a_nesting_measures_the_whole_nesting()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Point derives Display
+            x: int
+            y: int
+        end Point
+
+        struct Line derives Display
+            a: Point
+            b: Point
+        end Line
+
+        print(f"[${Line(Point(1, 2), Point(3, 4))}%32s]")
+        """), "[  Line(Point(1, 2), Point(3, 4))]\n")
+
+@test("one field")
+one_field()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Wrap derives Eq, Ord, Display
+            v: int
+        end Wrap
+
+        print(Wrap(1) == Wrap(1), Wrap(1) < Wrap(2), Wrap(7))
+        """), "true true Wrap(7)\n")
+
+// A struct with no fields is one value, so it equals itself, is not less than itself, and has
+// nothing to put in brackets.
+@test("no fields at all")
+no_fields_at_all()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Unit derives Eq, Ord, Hash, Display
+        end Unit
+
+        print(Unit() == Unit(), Unit() < Unit(), Unit())
+        """), "true false Unit\n")
+
+@test("a field whose own type derives")
+a_field_whose_own_type_derives()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Point derives Eq, Display
+            x: int
+            y: int
+        end Point
+
+        struct Line derives Eq, Display
+            a: Point
+            b: Point
+        end Line
+
+        print(Line(Point(1, 2), Point(3, 4)))
+        print(Line(Point(1, 2), Point(3, 4)) == Line(Point(1, 2), Point(3, 4)))
+        print(Line(Point(1, 2), Point(3, 4)) == Line(Point(1, 2), Point(3, 5)))
+        """), "Line(Point(1, 2), Point(3, 4))\ntrue\nfalse\n")
+
+@test("a string field")
+a_string_field()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Named derives Eq, Ord, Display
+            name: string
+            n: int
+        end Named
+
+        print(Named("a", 1) < Named("b", 0), Named("a", 1))
+        """), "true Named(a, 1)\n")
+
+@test("a derived membership satisfies a bound")
+a_derived_membership_satisfies_a_bound()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Size derives Eq
+            w: int
+        end Size
+
+        same[T: Eq](a: T, b: T) -> bool = a == b
+
+        print(same(Size(1), Size(1)))
+        """), "true\n")
+
+// -- a generic type derives conditionally -----------------------------------------------------------
+
+@test("the parts have the trait, so the whole does")
+the_parts_have_the_trait_so_the_whole_does()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Box[T] derives Eq, Display
+            v: T
+        end Box
+
+        print(Box(1) == Box(1), Box(1) == Box(2), Box("x"))
+        """), "true false Box(x)\n")
+
+// The bound is on the block, so an instantiation whose argument lacks the trait simply is not a
+// member -- and says so where the membership is asked for, not where the type was declared.
+@test("an argument without the trait leaves that instantiation out")
+an_argument_without_the_trait_leaves_that_instantiation_out()
+    if dv_no_library() then return
+
+    assert(dv_err(raw"""
+        struct Opaque
+            v: int
+        end Opaque
+
+        struct Box[T] derives Eq
+            v: T
+        end Box
+
+        print(Box(Opaque(1)) == Box(Opaque(1)))
+        """).contains("Eq"), "the refusal names the trait the instantiation is not a member of")
+
+@test("the type's own bounds are kept")
+the_types_own_bounds_are_kept()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Sorted[T: Ord] derives Eq
+            v: T
+        end Sorted
+
+        print(Sorted(1) == Sorted(1))
+        """), "true\n")
+
+// -- a simple enum ----------------------------------------------------------------------------------
+
+// Every variant is dataless, so `Ord` is the discriminants' order -- and the discriminants are in
+// declaration order unless the enum said otherwise.
+@test("orders by declaration order")
+orders_by_declaration_order()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        enum Colour derives Ord
+            Red
+            Green
+            Blue
+        end Colour
+
+        print(Red < Green, Blue < Green, Red < Red)
+        """), "true false false\n")
+
+@test("an explicit discriminant is what is ordered")
+an_explicit_discriminant_is_what_is_ordered()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        enum Level derives Ord
+            Low = 10
+            High = 2
+        end Level
+
+        print(Low < High)
+        """), "false\n")
+
+@test("renders as the variant's name")
+renders_as_the_variants_name()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        enum Colour derives Display
+            Red
+            Green
+        end Colour
+
+        print(Red, Green)
+        """), "Red Green\n")
+
+@test("hashes, and two variants differ")
+hashes_and_two_variants_differ()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        enum Colour derives Hash
+            Red
+            Green
+        end Colour
+
+        print(Red.hash() == Red.hash(), Red.hash() == Green.hash())
+        """), "true false\n")
+
+// `Eq` is the one trait a simple enum already has, by the rule that its value *is* its discriminant
+// -- so the clause is told to drop it rather than the block being refused later.
+@test("'Eq' is refused, at the word the reader wrote")
+eq_is_refused_at_the_word_the_reader_wrote()
+    if dv_no_library() then return
+
+    val said = dv_err("enum Colour derives Eq\n    Red\nend Colour\n")
+
+    assert(said.contains("a simple enum is already 'Eq'"), s"the refusal says why: $said")
+    assert(said.contains("Remove 'Eq' from the 'derives' clause"), "and what to do about it")
+
+@test("and the enum is Eq anyway, with the clause not naming it")
+and_the_enum_is_eq_anyway_with_the_clause_not_naming_it()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        enum Colour derives Display
+            Red
+            Green
+        end Colour
+
+        print(Red == Red, Red == Green)
+        """), "true false\n")
+
+// -- a data enum --------------------------------------------------------------------------------------
+
+private dv_shape() -> string = raw"""
+    enum Shape derives Eq, Ord, Hash, Display
+        Circle(r: int)
+        Rect(w: int, h: int)
+        Empty
+    end Shape
+
+    """
+
+@test("equality is by variant, then field by field")
+equality_is_by_variant_then_field_by_field()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_shape() + raw"""
+        print(Circle(1) == Circle(1))
+        print(Circle(1) == Circle(2))
+        print(Circle(1) == Rect(1, 2))
+        print(Rect(1, 2) == Rect(1, 2))
+        print(Empty == Empty)
+        print(Empty == Circle(0))
+        """), "true\nfalse\nfalse\ntrue\ntrue\nfalse\n")
+
+// Variants first, in declaration order, and the fields only where the variants agree.
+@test("ordering puts the variants first, then their fields")
+ordering_puts_the_variants_first_then_their_fields()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_shape() + raw"""
+        print(Circle(9) < Rect(0, 0))
+        print(Rect(0, 0) < Empty)
+        print(Circle(1) < Circle(2))
+        print(Rect(1, 5) < Rect(1, 6))
+        print(Rect(2, 0) < Rect(1, 9))
+        print(Empty < Empty)
+        """), "true\ntrue\ntrue\ntrue\nfalse\nfalse\n")
+
+@test("a variant renders under its own name")
+a_variant_renders_under_its_own_name()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_shape() + raw"""
+        print(Circle(2))
+        print(Rect(3, 4))
+        print(Empty)
+        """), "Circle(2)\nRect(3, 4)\nEmpty\n")
+
+// Every arm goes through one renderer, so the width is measured over whichever arm was taken --
+// including the one that carries nothing, whose rendering is its name and no brackets.
+@test("and a width pads whichever variant was taken")
+and_a_width_pads_whichever_variant_was_taken()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_shape() + raw"""
+        print(f"[${Circle(2)}%12s]")
+        print(f"[${Rect(3, 4)}%-12s]")
+        print(f"[${Empty}%8s]")
+        """), "[   Circle(2)]\n[Rect(3, 4)  ]\n[   Empty]\n")
+
+@test("equal values hash equal")
+a_data_enums_equal_values_hash_equal()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(dv_shape() + "print(Rect(1, 2).hash() == Rect(1, 2).hash())\n"), "true\n")
+
+// The tag is mixed before the payload, so two variants carrying equal payloads are not one key.
+@test("the variant is part of the hash")
+the_variant_is_part_of_the_hash()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        enum Two derives Hash
+            A(v: int)
+            B(v: int)
+        end Two
+
+        print(A(1).hash() == B(1).hash())
+        """), "false\n")
+
+@test("one variant, so there is no pair the match does not cover")
+one_variant_so_there_is_no_pair_the_match_does_not_cover()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        enum Only derives Eq, Ord, Display
+            Just(v: int)
+        end Only
+
+        print(Just(1) == Just(1), Just(1) < Just(2), Just(3))
+        """), "true true Just(3)\n")
+
+@test("a generic data enum derives conditionally")
+a_generic_data_enum_derives_conditionally()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        enum Maybe[T] derives Eq, Display
+            Yes(v: T)
+            No
+        end Maybe
+
+        val a: Maybe[int] = Yes(1)
+        val b: Maybe[int] = No
+
+        print(a == Yes(1), a == b, a, b)
+        """), "true false Yes(1) No\n")
+
+// -- what a derived block sits beside -----------------------------------------------------------------
+
+// The clause is part of the declaration, so the block it writes is in the module that declares the
+// type and every field is in scope there. That is the whole of why visibility never became a question
+// this feature had to answer.
+@test("a private field is walked, because the block is written where the type is")
+a_private_field_is_walked_because_the_block_is_written_where_the_type_is()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct P derives Eq, Display
+            private x: int
+        end P
+
+        print(P(1) == P(1), P(1))
+        """), "true P(1)\n")
+
+@test("a type's own members are untouched by it")
+a_types_own_members_are_untouched_by_it()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct P derives Eq, Display
+            x: int
+
+            twice(self) -> int = self.x * 2
+        end P
+
+        print(P(2).twice(), P(2))
+        """), "4 P(2)\n")
+
+// A counted field is `Eq` by address, which is what `&` already means for `==` -- deriving adds no
+// rule of its own about what a field's equality is.
+@test("a counted field compares as one does anywhere else")
+a_counted_field_compares_as_one_does_anywhere_else()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Node derives Eq
+            v: int
+        end Node
+
+        struct Holder derives Eq
+            n: &Node
+        end Holder
+
+        val a: &Node = Node(1)
+
+        print(Holder(a) == Holder(a))
+        """), "true\n")
+
+// A derived block reports the way a written one does, which is what carrying the synthesis in
+// source-level tree buys -- so a field that cannot do the work says so in the ordinary words, at the
+// trait in the clause that asked for it.
+@test("a field the trait cannot be written over says so at the clause")
+a_field_the_trait_cannot_be_written_over_says_so_at_the_clause()
+    if dv_no_library() then return
+
+    val said = dv_err(raw"""
+        struct Opaque
+            v: int
+        end Opaque
+
+        struct S derives Hash
+            a: Opaque
+        end S
+
+        print(S(Opaque(1)).hash())
+        """)
+
+    assert(said.contains("'Opaque' has no method 'hash'"), s"the refusal is the ordinary one: $said")
+
+// -- two claims the reference makes that nothing else here runs ---------------------------------------
+
+// A compiler-*provided* membership has no method to put in a table, so a value holding one cannot be
+// erased. A derived block is an ordinary block with an ordinary method, so it can.
+@test("a derived implementation can be erased to a trait object")
+a_derived_implementation_can_be_erased_to_a_trait_object()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Size derives Display
+            w: int
+            h: int
+        end Size
+
+        show(d: *Display)
+            print(d)
+
+        var s = Size(3, 4)
+
+        show(&s)
+        """), "Size(3, 4)\n")
+
+// A value parameter is not a type and has no membership to ask for, so it gains no bound -- which is
+// only observable on a type that has one, since a bound on a `const` would not resolve.
+@test("a const value parameter gains no bound")
+a_const_value_parameter_gains_no_bound()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Buf[const N: usize] derives Eq, Display
+            n: usize
+        end Buf
+
+        val a: Buf[4] = Buf(1)
+
+        print(a == Buf[4](1), a)
+        """), "true Buf(1)\n")
+
+// The renderer a derived `Display` writes beside the block carries the type's parameters, value ones
+// included, so it is instantiated at whatever the value was -- and a width goes through it twice at
+// that instantiation.
+@test("and a rendering under a width still reaches a value-parameterised type")
+a_rendering_under_a_width_still_reaches_a_value_parameterised_type()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Buf[const N: usize] derives Display
+            n: usize
+        end Buf
+
+        val a: Buf[4] = Buf(1)
+        val b: Buf[8] = Buf(2)
+
+        print(f"[${a}%10s]", f"[${b}%-10s]")
+        """), "[    Buf(1)] [Buf(2)    ]\n")
+
+// And a type parameter, where the renderer is generic over it and the bound the clause added is what
+// lets the part be written at all.
+@test("and a generic one is rendered at each argument it is used at")
+a_generic_one_is_rendered_at_each_argument_it_is_used_at()
+    if !dv_can_run() then return
+
+    assert_eq(dv_ran(raw"""
+        struct Box[T] derives Display
+            v: T
+        end Box
+
+        print(f"[${Box(1)}%8s]", f"[${Box("ab")}%-8s]")
+        """), "[  Box(1)] [Box(ab) ]\n")
+
+// -- the clause's own refusals ------------------------------------------------------------------------
+
+@test("a trait the compiler cannot write")
+a_trait_the_compiler_cannot_write()
+    if dv_no_library() then return
+
+    val said = dv_err(raw"""
+        trait Show
+            show(self) -> string
+
+        struct P derives Show
+            x: int
+        end P
+        """)
+
+    assert(said.contains("is not a trait the compiler knows how to write"), s"the refusal: $said")
+
+@test("the four are named")
+the_four_are_named()
+    if dv_no_library() then return
+
+    assert(dv_err("struct P derives Nope\n    x: int\nend P\n").contains("Eq, Ord, Hash or Display"),
+           "the refusal lists the four")
+
+@test("trait arguments")
+trait_arguments()
+    if dv_no_library() then return
+
+    assert(dv_err("struct P derives Eq[int]\n    x: int\nend P\n")
+               .contains("a derived implementation takes none"),
+           "the refusal says a derived implementation takes no trait arguments")
+
+// C's incomplete type: nothing here knows its shape, so a derived block would answer `true` for every
+// pair with nothing to tell the reader it had done so.
+@test("an opaque struct with no fields")
+an_opaque_struct_with_no_fields()
+    if dv_no_library() then return
+
+    assert(dv_err("opaque struct Handle derives Eq\n\nprint(1)\n").contains("opaque and declares no fields"),
+           "the refusal names what an opaque struct has not got")
+
+@test("the same trait twice")
+the_same_trait_twice()
+    if dv_no_library() then return
+
+    assert(dv_err("struct P derives Eq, Eq\n    x: int\nend P\n").contains("is named twice"),
+           "the refusal names the repetition")
+
+// Deriving is all-or-nothing per trait: there is no writing the block and then replacing one method
+// of it, and the duplicate-implementation rule is what says so.
+@test("a derived block and a hand-written one for the same trait collide")
+a_derived_block_and_a_hand_written_one_collide()
+    if dv_no_library() then return
+
+    assert(dv_err(raw"""
+        struct P derives Eq
+            x: int
+        end P
+
+        impl Eq for P
+            eq(self, rhs: Self) -> bool = true
+        """).contains("Eq"), "the refusal names the trait implemented twice")
