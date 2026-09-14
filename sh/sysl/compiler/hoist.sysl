@@ -480,6 +480,63 @@ private hoist_extern(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
     a.tables.externs.put(key, d)
     a.tables.extern_scopes.put(key, ExternHome(scope, span))
     record_access(a, scope, span, key, d.vis)
+    check_signature_rules(a, scope, span, d.name, d.params, d.ret_type, d.variadic, true)
+
+// The rules a declared signature must satisfy whichever declaration form it came from, checked after
+// the name is registered so a failure reports the mistake without also erasing the declaration it is
+// about.
+//
+// C reads a variadic call's arguments relative to the last named parameter, so there has to be one;
+// `f(...)` is not a callable declaration in any C either.
+private check_signature_rules(a: &Analysis, scope: Scope, span: Span, name: string,
+                              params: Buf[Param], ret: Option[TypeRef], variadic: bool,
+                              foreign: bool)
+    if variadic && params.is_empty() then
+        a.fault(scope, span, s"'$name' needs at least one named parameter before '...'")
+
+    check_va_list_positions(a, scope, name, params, ret, foreign)
+end check_signature_rules
+
+// Where a `va_list` may stand in a signature (`reference/ffi.md § A variadic reads its tail`).
+//
+// In a **sysl** signature a walk is handed on **by address**: `*va_list` is the parameter type, and
+// `&ap` is what the caller writes. A bare `va_list` parameter is refused because a parameter is a
+// by-value binding and a copy of a walk is not a walk -- advancing it would advance nothing the
+// caller could see, which is the one thing the form exists to do.
+//
+// An **`extern`** transcribes a C header, so it is written in C's spellings and both are allowed:
+// `va_list` is C's by-value parameter, the one `vprintf` takes, and `*va_list` is C's `va_list *`.
+// What a call hands the first of those is a different thing on every target and is `TVaPass`'s
+// business; the call writes `&ap` for either, because the address is the only thing sysl has and it
+// is what both are formed from.
+//
+// **Returning a bare `va_list` is refused everywhere**, foreign or not: sysl has no by-value
+// `va_list` at all -- the type names the storage a walk lives in -- so there would be nothing to put
+// the result in. A `*va_list` return is an ordinary pointer and is allowed.
+private check_va_list_positions(a: &Analysis, scope: Scope, name: string, params: Buf[Param],
+                                ret: Option[TypeRef], foreign: bool)
+    if !foreign
+        for p in params.view()
+            if written_va_list(p.typ) then
+                a.fault(scope, p.span, "a va_list is a parameter as '*va_list', not as 'va_list' " +
+                        "— a parameter is a by-value binding, and a copy of a walk advances " +
+                        s"nothing '$name''s caller can see, so the walk is handed over by address " +
+                        "and the call writes '&ap'")
+
+    ret match
+        None -> ()
+        Some(r) ->
+            if written_va_list(r) then
+                a.fault(scope, r.span, s"a va_list cannot be returned from '$name' — the type " +
+                        "names the storage a walk lives in, and there is no value of it to hand " +
+                        "back")
+end check_va_list_positions
+
+// A type written as the bare word `va_list`, which is the one spelling either rule is about: a
+// `*va_list` is an ordinary raw pointer and is refused nowhere.
+written_va_list(t: TypeRef) -> bool = *t.kind match
+    NamedType(n, args) -> n == "va_list" && args.is_empty()
+    _ -> false
 
 // The symbol an `extern` names, which is its link name where it gave one and its own name otherwise.
 extern_symbol(d: ExternDecl) -> string = d.link match
@@ -541,6 +598,7 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
     a.tables.overloads.put(base, set)
     a.tables.funcs.put(key, Func(d, span, scope))
     record_access(a, scope, span, key, d.vis)
+    check_signature_rules(a, scope, span, d.name, d.params, d.ret_type, d.variadic, false)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
 

@@ -2554,3 +2554,49 @@ a_ghostly_clause_is_erased()
               "  ret i32 %t3\n" +
               "}\n")
 end a_ghostly_clause_is_erased
+
+// **An `extern` is written in C's spellings and takes either**: `va_list` is C's by-value parameter,
+// the one `vprintf` takes, and `*va_list` is C's `va_list *`. The call writes `&ap` for both, the
+// address being the only thing sysl has, and what actually crosses for the by-value one is the
+// target's answer -- here the pointer the walk's storage holds.
+@test("a C 'va_list' parameter is declared as a pointer and the call hands over what the target passes")
+a_by_value_va_list_crosses_as_the_target_passes_it()
+    if no_form_library() then return
+
+    val text = "extern vprintf(fmt: *u8, ap: va_list) -> i32\n" +
+               "\n" +
+               "log(fmt: *u8, ...) -> i32\n" +
+               "    var ap: va_list\n" +
+               "\n" +
+               "    va_start(ap)\n" +
+               "\n" +
+               "    var n = vprintf(fmt, &ap)\n" +
+               "\n" +
+               "    va_end(ap)\n" +
+               "\n" +
+               "    n\n" +
+               "\n" +
+               "var msg: [2]u8 = [u8(37), u8(0)]\n" +
+               "\n" +
+               "print(log(&msg[0]))\n"
+
+    assert_eq(form_lowered(text, "log"),
+              "define i32 @log(ptr %fmt.param, ...) {\n" +
+              "entry:\n" +
+              "  %fmt.addr = alloca ptr\n" +
+              "  %ap.addr = alloca [4 x ptr]\n" +
+              "  %n.addr = alloca i32\n" +
+              "  store ptr %fmt.param, ptr %fmt.addr\n" +
+              "  store [4 x ptr] zeroinitializer, ptr %ap.addr\n" +
+              "  call void @llvm.va_start.p0(ptr %ap.addr)\n" +
+              "  %t1 = load ptr, ptr %fmt.addr\n" +
+              "  %t2 = load ptr, ptr %ap.addr\n" +
+              "  %t3 = call i32 @vprintf(ptr %t1, ptr %t2)\n" +
+              "  store i32 %t3, ptr %n.addr\n" +
+              "  call void @llvm.va_end.p0(ptr %ap.addr)\n" +
+              "  %t4 = load i32, ptr %n.addr\n" +
+              "  ret i32 %t4\n" +
+              "}\n")
+
+    assert(form_module(text).contains("declare i32 @vprintf(ptr, ptr)"))
+end a_by_value_va_list_crosses_as_the_target_passes_it
