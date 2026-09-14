@@ -1,0 +1,159 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// What an object reached through an atomic reference may contain.
+//
+// **`&sync T` makes the REFERENCE safe to hold in two concurrency domains at once.** That is a
+// promise about the count in `T`'s own box and about nothing else, so it is sound only where every
+// count the object reaches is atomic too: a domain holding the object holds everything the object
+// holds, and one ordinary count anywhere inside it is the same race one level down.
+//
+// **The walk stops at two things.** A `&sync U` is a leaf, because whatever *that* type reaches was
+// settled where it was written -- the same argument that makes a `&T` a leaf for ARC. A `*U` is a
+// leaf because it carries no count at all: it is the unsafe tier, and sharing through one is
+// something a reader wrote on purpose.
+//
+// The strict half of the rule is asked where a `&sync T` is formed, and again at a `@crossing`
+// parameter, where a facility says that what is passed there reaches another domain. The strict
+// half is the right one to ask at a parameter, because a parameter copies nothing: the leniency the
+// crossable list shows a view is about a channel that copies its bytes, and its leniency towards a
+// `*T` is exactly what the annotation suspends.
+
+// What stops an object being shareable: the field path that reaches it, and its type. An empty path
+// means the object asked about is itself the thing in the way.
+struct Unshareable
+    path: Buf[string]
+    ty: Type
+end Unshareable
+
+// The part of a type that may not be shared, or nothing where every count it reaches is atomic.
+unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf())
+
+private share_walk(t: Type, path: Buf[string]) -> Option[Unshareable] = t match
+    Ref(_, sync) -> if sync then None else Some(Unshareable(path, t))
+    Ptr(_) -> None
+    Weak(_) -> Some(Unshareable(path, t))
+    Slice(_, _) -> Some(Unshareable(path, t))
+    Str -> Some(Unshareable(path, t))
+
+    // An array *is* its elements, so sharing one shares each of them; the path stops at the field,
+    // since naming the element is what the reported type already does.
+    Array(_, elem) -> share_walk(*elem, path)
+
+    Constrained(d) -> share_walk(d.base, path)
+    Struct(d) -> share_walk_fields(d.fields, path, "")
+
+    // A data enum shares one payload region, so every variant's fields are reachable from it.
+    Enum(d) -> share_walk_variants(d.variants, path)
+
+    // A type parameter promises nothing about its counts, and nothing is decided here: the
+    // instantiation resolves this type again with an argument in its place, and that is where the
+    // question has an answer. A trait object is the same case one step further -- the type it forgot
+    // is known where a value is erased into one, and that is where it is asked.
+    _ -> None
+
+private share_walk_fields(fields: Buf[(string, Type)], path: Buf[string],
+                          prefix: string) -> Option[Unshareable]
+    for i in 0..<fields.len()
+        val named = if prefix == "" then fields.at(i).0 else s"$prefix(${fields.at(i).0})"
+        val found = share_walk(fields.at(i).1, extended_path(path, named))
+
+        if found.is_some() then return found
+
+    None
+end share_walk_fields
+
+private share_walk_variants(variants: Buf[EnumVariant], path: Buf[string]) -> Option[Unshareable]
+    for i in 0..<variants.len()
+        val found = share_walk_fields(variants.at(i).fields, path, variants.at(i).name)
+
+        if found.is_some() then return found
+
+    None
+end share_walk_variants
+
+// A path with one more step on the end. **Built fresh rather than pushed onto**, since a `Buf`
+// handed on is a second name for one buffer and the walk hands the same path to every field.
+private extended_path(path: Buf[string], name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<path.len()
+        out.push(path.at(i))
+
+    out.push(name)
+    out
+end extended_path
+
+// Why a value may not be handed to a `@crossing` parameter, or nothing where it may.
+//
+// `subject` is the caller's words for what is crossing -- the argument, or what the argument points
+// at -- because the two shapes a boundary takes are worth telling apart at the call and are not
+// something this walk can see. Everything after it is the same sentence a `&sync T` gets, and
+// deliberately so: the question is the same one, and the answer a reader needs is the spelling that
+// would have been sound.
+crossing_complaint(subject: string, crossed: Type) -> Option[string]
+    val part = unshareable(crossed)
+
+    if part.is_none() then return None
+
+    val p = part.unwrap()
+
+    Some(share_remedy(s"$subject reaches another concurrency domain, so every count inside it has " +
+                      s"to be atomic — ${share_where(p, crossed)}, ", p.ty))
+end crossing_complaint
+
+// Which part is in the way, said three ways: the object itself, something it holds directly, and
+// something a named path inside it reaches.
+private share_where(p: Unshareable, whole: Type) -> string
+    if p.path.is_empty() && p.ty == whole then return s"but it is a '${type_show(p.ty)}'"
+    if p.path.is_empty() then return s"but it holds a '${type_show(p.ty)}'"
+
+    s"but its '${joined(p.path, ".")}' reaches a '${type_show(p.ty)}'"
+end share_where
+
+// What to do about the part in the way: a plain reference has an atomic spelling to reach for, a
+// weak one has none yet, and a view has a distinction the language cannot draw.
+private share_remedy(head: string, ty: Type) -> string = ty match
+    Ref(inner, _) -> head + s"whose count is not. Hold it as a '&sync ${type_show(*inner)}' ('06')"
+    Weak(_) -> head + "and a weak count has no atomic form yet"
+    _ -> head + share_view_remedy(if ty == Str then "bytes" else "elements")
+
+private share_view_remedy(what: string) -> string =
+    s"which owns its $what through a count that is not atomic. A literal's $what are immortal and " +
+    s"would be safe to share, but nothing in the type says whether these are, so a shared object " +
+    "holds no view at all ('06')"
+
+// Holds each `@crossing` argument of one call to the rule about what may reach another domain.
+//
+// **The check is made at the CALL and reads the instantiated signature**, which is what makes it
+// reach a facility the language does not own: a package's `task(…)` and the library's `spawn` are
+// one shape here, and a generic parameter has a concrete type by the time this runs.
+//
+// **A `*T` parameter is looked *through*, and that is the whole of what the annotation buys.** A raw
+// pointer is shareable because it carries no count of its own -- which says nothing about the object
+// at the far end, and the object at the far end is what crossed. Everything else is asked about the
+// parameter's own type, a parameter copying no buffer and sharing whatever it names.
+//
+// Reported at the **argument**, that being the thing that could have been written differently. A
+// receiver among the parameters is skipped by construction: `@crossing` names a member's own
+// parameters and `self` is not one of them.
+check_crossings(cx: &Analyzer, crossing: Buf[string], shown: string, params: Buf[(string, Type)],
+                args: Buf[TExpr])
+    if crossing.is_empty() then return
+
+    for i in 0..<params.len()
+        if i >= args.len() then break
+        if !holds_string(crossing, params.at(i).0) then continue
+
+        check_crossing(cx, args.at(i).span, params.at(i).0, shown, params.at(i).1)
+end check_crossings
+
+private check_crossing(cx: &Analyzer, span: Span, pname: string, shown: string, pty: Type)
+    val why = pty match
+        Ptr(inner) -> crossing_complaint(s"what '$pname' of '$shown' points at", *inner)
+        _ -> crossing_complaint(s"'$pname' of '$shown'", pty)
+
+    if why.is_some() then cx.fault(span, why.unwrap())
+end check_crossing
