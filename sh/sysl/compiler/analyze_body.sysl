@@ -506,11 +506,28 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl)
     val split = contract_length(d.body)
 
     analyze_contract(cx, d.body, split, ret)
-    body_block(cx, statements_from(d.body, split), ret)
+
+    val body = body_block(cx, statements_from(d.body, split), ret)
+    var params: Buf[(string, Type)] = buf()
+
+    for i in 0..<d.params.len()
+        params.push((d.params.at(i).name, resolve_type(a, scope, d.params.at(i).typ, subst)))
 
     a.release(trial)
     a.restore_complaints(mark)
     rewind_instantiations(a, queued, tables, structs, enums, constrained)
+
+    // **The tree is kept although everything the reading registered is not**, and the two are not in
+    // tension: a whole-program check about a module's own conduct is answered by the body a generic
+    // was WRITTEN as, and this is the only walk that types one -- an instantiation belongs to
+    // whoever chose the type, in a module of their own. Nothing here is lowered, so the
+    // instantiations the rewind took back out are names these trees mention and nobody emits.
+    //
+    // Recorded after the rewind so that neither the entry nor the file it names can be taken back.
+    a.tables.homes.put(d.name, scope)
+    a.tables.abstracts.push(TFunc(span_zero(), d.name, params, ret, body, d.variadic, buf(), buf(),
+                                  buf(), true, d.conv, false, None, d.pure, d.ghost, None, None,
+                                  None, None))
 end check_abstract_body
 
 // The instantiations this reading asked for, taken back out.

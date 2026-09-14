@@ -389,3 +389,60 @@ a_hook_is_held_to_the_same_rules()
 
     assert(refused("@setup\nopens(n: int)\n    print(n)\n")
         .contains("a '@setup' function takes no parameters, and 'opens' takes one"))
+
+// -- where an 'impl' may live ----------------------------------------------------------------------
+
+@test("a foreign trait for a foreign type has no home, and the block naming a tuple is the case")
+an_impl_naming_nothing_of_its_own()
+    if decl_errors_no_library() then return
+
+    assert(refused("impl Eq for (int, string)\n" +
+                   "    eq(self, rhs: (int, string)) -> bool = true\n\nprint(1)\n")
+        .contains("an 'impl' may be written only in the module that declares the trait or in one " +
+                  "that declares a type the block names, and 'sysl.Eq' is the library's while " +
+                  "nothing in '(int, string)' is declared outside the library — so this one has no " +
+                  "home. A trait of your own, or a type of your own in what it is written for or " +
+                  "in the trait's arguments, gives it one"))
+
+@test("a trait that takes arguments is told the block names nothing, since either place could carry one")
+an_impl_whose_trait_takes_arguments()
+    if decl_errors_no_library() then return
+
+    assert(refused("impl Mul[real, real] for real\n    mul(self, k: real) -> real = self\n\n" +
+                   "print(1)\n")
+        .contains("and 'sysl.Mul' is the library's while nothing this block names is declared " +
+                  "outside the library — so this one has no home"))
+
+@test("a type of your own in what the block is written for gives it a home")
+an_impl_for_a_type_of_your_own()
+    if decl_errors_no_library() then return
+
+    assert(!refused("struct P\n    x: int\n\nimpl Display for P\n" +
+                    "    display(self, out: &Sink) -> Result[unit, Fault] = out.write_str(\"P\")\n\n" +
+                    "print(1)\n").contains("has no home"))
+
+@test("and so does a type of your own inside a composed one, since a slice belongs where its element does")
+an_impl_for_a_slice_of_a_type_of_your_own()
+    if decl_errors_no_library() then return
+
+    assert(!refused("struct P\n    x: int\n\nimpl Display for []P\n" +
+                    "    display(self, out: &Sink) -> Result[unit, Fault] = out.write_str(\"Ps\")\n\n" +
+                    "print(1)\n").contains("has no home"))
+
+@test("a trait of your own may be implemented for a type that is not")
+an_impl_of_a_trait_of_your_own()
+    if decl_errors_no_library() then return
+
+    assert(!refused("trait Show\n    show(self) -> int\n\nimpl Show for int\n" +
+                    "    show(self) -> int = self\n\nprint(1)\n").contains("has no home"))
+
+// -- a generic answers for the body it was written as ------------------------------------------------
+
+@test("a generic that boxes is refused where it is written, not only where it is called")
+a_generic_that_allocates_is_refused_at_its_declaration()
+    if decl_errors_no_library() then return
+
+    val said = refused("@no_alloc\n\nboxed[T](x: T) -> &T = x\n\nprint(*boxed(3))\n")
+
+    assert(said.contains("a reference needs an allocator, and this module declared '@no_alloc'"))
+    assert(said.contains("this reaches 'boxed.int', which makes heap storage"))

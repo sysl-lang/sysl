@@ -121,6 +121,27 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         scan_allocations(a, scope, f.body, why)
         blame_block(a, walk, scope, f.body, why)
 
+    // **And the generic declarations, by the body each was written as.** The loop above passed every
+    // instantiation over, so without this a module could give the allocator up and then box a value
+    // in a one-line generic of its own, with the only refusal landing on whoever called it.
+    //
+    // **Asked of the FILE the declaration was written in rather than of its key**, which is the one
+    // place the two part company: a member of a structural type is hoisted under a bare
+    // `tuple.display`, whose key names no module -- so reading the key puts the library's own tuple
+    // renderer in the anonymous module, which is the program's.
+    for i in 0..<a.tables.abstracts.len()
+        val f = a.tables.abstracts.at(i)
+        val scope = func_home(a, f.name)
+        val module_name = scope.module_name
+        val scaffolding = test_only_file(a, scope.src.name)
+
+        if !no_alloc_here(a, module_name, scaffolding) then continue
+
+        val why = because(a, module_name, scaffolding)
+
+        scan_allocations(a, scope, f.body, why)
+        blame_block(a, walk, scope, f.body, why)
+
     // The module storage is code like any other: an initializer that makes heap storage makes it in
     // the module that wrote the declaration.
     for i in 0..<vals.len()
