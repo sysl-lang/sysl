@@ -90,9 +90,72 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
         return Slice(under_indirection(a, () -> resolve_type(a, scope, elem, subst)), read_only)
 
     val e = resolve_type(a, scope, elem, subst)
+    val written = length.unwrap()
 
-    Array(int(const_extent(a, scope, span, length.unwrap(), subst)), e)
+    // A length over a type parameter has no value during the walk that checks the generic body
+    // itself, there being no `T` yet — and that is not a mistake to report, since the body is
+    // analyzed again for each instantiation with the parameter bound. The array stands at length
+    // zero for that one walk. Anything else that will not fold is a length settled while the
+    // program runs, which an array's cannot be.
+    if !folds_to_extent(a, scope, span, written, subst) && !awaits_instantiation(a, scope, written,
+                                                                                 subst) then
+        a.fault(scope, span,
+                "an array length must be a constant — a literal, or a 'const' naming one")
+
+    Array(int(const_extent(a, scope, span, written, subst)), e)
 end resolve_array
+
+// Whether this length reads as a constant at all, asked without leaving a complaint behind: the walk
+// that answers it is the same one `const_extent` makes, and a length that does not fold is either a
+// parameter awaiting its instantiation or the refusal above.
+private folds_to_extent(a: &Analysis, scope: Scope, span: Span, e: Expr,
+                        subst: Buf[Binding]) -> bool
+    *e.kind match
+        IntLit(_, _, _) -> return true
+        _ -> ()
+
+    val inner = analyzer_for(a, scope)
+
+    inner.subst = subst
+
+    val mark = a.complaints()
+    val folded = const_int(inner, e)
+
+    a.restore_complaints(mark)
+
+    folded.is_some()
+end folds_to_extent
+
+// Whether a length stands over a type parameter that has not been given a type yet. A value
+// parameter is bound to the same `Abstract` stand-in a type parameter gets, so it does not fold and
+// is not an error either; a name bound to a value is not here, because that one folds.
+private awaits_instantiation(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> bool =
+    *e.kind match
+        Ident(n) -> bound_type(subst, n) match
+            Some(t) -> t match
+                Abstract(_, _) -> true
+                _ -> false
+            None -> false
+        LayoutOf(_, tr) -> abstract_operand(a, scope, tr, subst)
+        OffsetOf(tr, _) -> abstract_operand(a, scope, tr, subst)
+        Unary(_, operand) -> awaits_instantiation(a, scope, operand, subst)
+        Binary(_, l, r) ->
+            awaits_instantiation(a, scope, l, subst) || awaits_instantiation(a, scope, r, subst)
+        Compare(operands, _) ->
+            operands.len() == 2 && (awaits_instantiation(a, scope, operands.at(0), subst) ||
+                                    awaits_instantiation(a, scope, operands.at(1), subst))
+        Call(callee, args) -> *callee.kind match
+            Ident(_) ->
+                args.len() == 1 && awaits_instantiation(a, scope, args.at(0), subst)
+            _ -> false
+        _ -> false
+
+// Whether a measurement's subject is a type parameter standing for itself, which is what makes
+// `sizeof(T)` a number this walk cannot have.
+private abstract_operand(a: &Analysis, scope: Scope, tr: TypeRef, subst: Buf[Binding]) -> bool =
+    underlying(resolve_type(a, scope, tr, subst)) match
+        Abstract(_, _) -> true
+        _ -> false
 
 // A resolution run one hop further out than the one around it.
 under_indirection(a: &Analysis, resolve: &Fn() -> Type) -> Type
@@ -378,6 +441,25 @@ private digits_value(digits: string, base: int) -> usize
     n
 end digits_value
 
+// Whether a plain decimal digit string parses as a 32-bit signed int the way the reference's own
+// `String.toIntOption` would -- the bootstrap tells a width that merely exceeds the back end's
+// ceiling from one so large it never became a number at all, and this is that same line.
+private fits_i32(digits: string) -> bool
+    val max_i32 = "2147483647"
+    val b = digits.bytes
+
+    if b.len < max_i32.len then return true
+    if b.len > max_i32.len then return false
+
+    val m = max_i32.bytes
+
+    for i in 0..<b.len
+        if b[i] < m[i] then return true
+        if b[i] > m[i] then return false
+
+    true
+end fits_i32
+
 // -- a name -------------------------------------------------------------------------------------
 
 private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args: Buf[TypeRef],
@@ -464,6 +546,10 @@ width_type(a: &Analysis, scope: Scope, span: Span, name: string) -> Option[Type]
             a.fault(scope, span, s"'$name' has a leading zero — a width is written plainly, as " +
                     s"'$head${without_leading_zeros(digits)}'")
 
+        return Some(Unknown)
+
+    if !fits_i32(digits) then
+        a.fault(scope, span, s"'$name' is far wider than anything can hold")
         return Some(Unknown)
 
     val bits = int(digits_value(digits, 10))

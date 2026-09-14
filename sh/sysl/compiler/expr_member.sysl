@@ -89,8 +89,7 @@ private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name:
 
     if idx >= 0 then
         if !field_visible(cx, d.base, name) then
-            return cx.err(span, s"'$name' is private to the file that declares " +
-                          s"'${module_show(d.base)}'")
+            return cx.err(span, field_out_of_reach(cx, d.base, name))
 
         // Whatever qualifier the field was declared with stays in the struct's field list and comes
         // off here: reading a register yields an ordinary value.
@@ -164,24 +163,15 @@ end all_digits
 //
 // **`private` is file-private**, so a field declared private is read only inside the file that
 // declares the struct -- the same rule every other declaration follows.
-field_visible(cx: &Analyzer, base: string, field: string) -> bool
-    val decl = cx.an.tables.types.get(base)
+field_visible(cx: &Analyzer, base: string, field: string) -> bool =
+    member_in_reach(cx.an, base, field, cx.scope)
 
-    if decl.is_none() then return true
-
-    decl.unwrap().kind match
-        StructOf(d) ->
-            for i in 0..<d.fields.len()
-                val f = d.fields.at(i)
-
-                if f.name == field then
-                    return f.vis match
-                        File -> decl.unwrap().scope.src.name == cx.scope.src.name
-                        _ -> true
-
-            true
-        _ -> true
-end field_visible
+// Why a field may not be read here, as a diagnostic says it. The complaint is about the FIELD and
+// not about the struct: the type itself is perfectly nameable, so an "undefined name" or a "no such
+// field" would both send the reader somewhere else.
+field_out_of_reach(cx: &Analyzer, base: string, field: string) -> string =
+    s"field '$field' of '${module_show(base)}' is " +
+    member_restriction(cx.an, base, field)
 
 // A member read off a **type** rather than off a value: an enum's variant, a static property, and
 // the refusals that say which of the readings a name standing for a type could have meant.

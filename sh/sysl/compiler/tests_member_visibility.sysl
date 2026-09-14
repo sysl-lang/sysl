@@ -1,0 +1,618 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A field's and a member's visibility (`reference/modules.md § Visibility`) -- the top-level rule's
+// four reaches, one level down.
+//
+// Two things make this more than a re-use of that rule, and most of what is below is about one or
+// the other. **Silence means the type's reach, not public**, so a member of a restricted type is
+// restricted without having said anything and a modifier may only narrow. And **the positional
+// constructor reads every field**, so a restricted field puts `Point(1, 2)` out of reach from
+// outside -- which is the whole of what makes a private field worth writing.
+//
+// **Every message here was read out of the reference compiler**, by handing the installed `sysl` the
+// same tree and quoting what came back -- never composed from the rule.
+
+// -- a program of several files ------------------------------------------------------------------
+
+private var mv_library_cache: Buf[Program] = buf()
+private var mv_library_read: bool = false
+
+private mv_library() -> Buf[Program]
+    if mv_library_read then return mv_library_cache
+
+    mv_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> mv_library_cache = units
+
+    mv_library_cache
+end mv_library
+
+private mv_no_library() -> bool
+    if mv_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end mv_no_library
+
+// The files of one program, each named the way a diagnostic about it will be: a bare file name,
+// since the module a file contributes to is whatever its header says.
+private mv_parsed(files: []const (string, string)) -> Result[Buf[Program], string]
+    var units: Buf[Program] = buf()
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return Err(parsed.report.at(0).message)
+
+        units.push(parsed.program)
+
+    Ok(units)
+end mv_parsed
+
+private mv_units(files: []const (string, string)) -> Result[Buf[Program], string]
+    var units: Buf[Program] = buf()
+    val library = mv_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    val rest = mv_parsed(files)?
+
+    for i in 0..<rest.len()
+        units.push(rest.at(i))
+
+    Ok(units)
+end mv_units
+
+// The whole report a program is refused with, rendered the way a reader sees it.
+private mv_report(units: Buf[Program]) -> string
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end mv_report
+
+private mv_err(files: []const (string, string)) -> string
+    mv_units(files) match
+        Err(why) -> why
+        Ok(us) -> mv_report(us)
+
+// A single-file program, which is what every case about the declaring file's own reach is.
+private mv_one_err(text: string) -> string = mv_err([("main.sysl", text)])
+
+// A module in two files, one declaring a type with something kept back and the other a sibling that
+// may name the type but not that. Every case built on this differs only in what it tries to write.
+private mv_pair_err(decl: string, use: string) -> string =
+    mv_err([("main.sysl", "print(1)\n"),
+            ("g.sysl", s"module geom\n$decl\n"),
+            ("h.sysl", s"module geom\n$use\n")])
+
+// What a program of several files **prints**, which is the one claim nothing short of running can
+// make. The tree goes on disk, since a module is a directory and a build reads one.
+private mv_built(files: []const (string, string)) -> Result[(int, string), string]
+    val root = make_temp_dir("sysl-mv").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return Err(failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> Err("the program that was built could not be run")
+        Ok(out) -> Ok((if out.status.ok() then 0 else 1, out.text))
+end mv_built
+
+private mv_ran(files: []const (string, string)) -> string
+    mv_built(files) match
+        Err(why) -> why
+        Ok(pair) -> pair.1
+
+private mv_one_ran(text: string) -> string = mv_ran([("main.sysl", text)])
+
+// Whether the program came back at all, which is all a trap has to say. A failed invariant traps, so
+// the claim is about the status rather than about anything printed.
+private mv_exits(text: string) -> bool =
+    mv_built([("main.sysl", text)]) match
+        Err(_) -> false
+        Ok(pair) -> pair.0 != 0
+
+// -- the modifiers parse where a member and a field are written ------------------------------------
+
+@test("a field takes one")
+mv_a_field_takes_one()
+    assert_eq(pf("struct P\n    private x: int\nend P\n"), "(struct P (private x:int))")
+
+@test("a field takes the scoped form too")
+mv_a_field_takes_the_scoped_form_too()
+    assert_eq(pf("struct P\n    private[geom] x: int\nend P\n"), "(struct P (private[geom] x:int))")
+
+@test("a method takes one")
+mv_a_method_takes_one()
+    assert_eq(pf("struct P\n    private step(self) -> int = 1\nend P\n"),
+        "(struct P () (method private self step () -> int 1))")
+
+@test("a property takes one")
+mv_a_property_takes_one()
+    assert_eq(pf("struct P\n    private twice -> int = 2\nend P\n"),
+        "(struct P () (prop private twice -> int 2))")
+
+@test("an enum's member takes one")
+mv_an_enums_member_takes_one()
+    assert_eq(pf("enum E\n    A\n    private step(self) -> int = 1\nend E\n"),
+        "(enum E (A) (method private self step () -> int 1))")
+
+// An unmarked field and an unmarked member say nothing, which is what lets the default mean the
+// type's reach rather than public.
+@test("and an unmarked one says nothing")
+mv_an_unmarked_one_says_nothing()
+    assert_eq(pf("struct P\n    x: int\nend P\n"), "(struct P (x:int))")
+
+// `invariant` declares no name, so there is nothing for a modifier to restrict -- and a field may
+// still be called `invariant`, which is what the ordering in the grammar is for.
+@test("an 'invariant' clause is still told from a field beneath a modifier")
+mv_an_invariant_clause_is_told_from_a_field()
+    assert_eq(pf("struct P\n    private invariant: int\nend P\n"),
+        "(struct P (private invariant:int))")
+
+// -- a field is read by selecting it, and a modifier decides who may --------------------------------
+
+@test("the declaring file may")
+mv_the_declaring_file_may_read_a_private_field()
+    if mv_no_library() then return
+
+    assert_eq(mv_one_ran("struct Counter\n    private n: int\n    value(self) -> int = self.n\n" +
+                         "end Counter\nprint(Counter(3).value())\n"), "3\n")
+
+@test("a sibling file of the same module may not")
+mv_a_sibling_file_may_not_read_a_private_field()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    private x: int", "read(p: P) -> int = p.x")
+
+    assert(out.contains("field 'x' of 'geom.P' is private to 'g.sysl', the file that declares it"),
+        out)
+
+// A write is the same selection, so one modifier covers both -- a field nobody outside may read is
+// not one they may write.
+@test("and writing it is the same selection")
+mv_writing_a_private_field_is_the_same_selection()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    private x: int\n    make() -> P = P(1)",
+                          "bump(p: *P) = p.x = 9")
+
+    assert(out.contains("field 'x' of 'geom.P' is private"), out)
+
+@test("a compound assignment to it is refused too")
+mv_a_compound_assignment_to_a_private_field_is_refused()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    private x: int\n    make() -> P = P(1)",
+                          "bump(p: *P) = p.x += 1")
+
+    assert(out.contains("field 'x' of 'geom.P' is private"), out)
+
+@test("'private[M]' opens it to the whole module")
+mv_scoped_opens_a_field_to_the_whole_module()
+    if mv_no_library() then return
+
+    assert_eq(mv_ran([("main.sysl", "import geom.{P, read}\nprint(read(P.make()))\n"),
+                      ("geom/g.sysl",
+                       "module geom\nstruct P\n    private[geom] x: int\n    make() -> P = P(4)\n"),
+                      ("geom/h.sysl", "module geom\nread(p: P) -> int = p.x\n")]), "4\n")
+
+@test("and keeps it out of everything above that module")
+mv_scoped_keeps_a_field_out_of_everything_above()
+    if mv_no_library() then return
+
+    val out = mv_err([("main.sysl", "import geom.P\nread(p: P) -> int = p.x\nprint(1)\n"),
+                      ("g.sysl", "module geom\nstruct P\n    private[geom] x: int\n")])
+
+    assert(out.contains("field 'x' of 'geom.P' is private to module 'geom'"), out)
+
+// The complaint is about the field, not about the struct: `P` itself is perfectly nameable, so an
+// "undefined name" or a "no such field" would both send the reader somewhere else.
+@test("a field the reader cannot see is not reported as a field that is not there")
+mv_a_hidden_field_is_not_reported_as_absent()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    private x: int\n    y: int",
+                          "read(p: P) -> int = p.y + p.x")
+
+    assert(out.contains("field 'x' of 'geom.P' is private"), out)
+
+// -- the positional forms name every field, so they need every field --------------------------------
+
+@test("the constructor is refused from outside")
+mv_the_constructor_is_refused_from_outside()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    private x: int\n    y: int", "make() -> P = P(1, 2)")
+
+    assert(out.contains("the constructor names every field of 'geom.P' in order, and 'x' is " +
+                        "private to 'g.sysl', the file that declares it — build it through an " +
+                        "associated function of its own"), out)
+
+// Which is exactly what the associated function is for, and what the diagnostic points at.
+@test("and an associated function is how the type offers one instead")
+mv_an_associated_function_offers_a_constructor_instead()
+    if mv_no_library() then return
+
+    assert_eq(mv_ran([("main.sysl", "import geom.P\nprint(P.of(7).doubled())\n"),
+                      ("geom/g.sysl",
+                       "module geom\nstruct P\n    private x: int\n    of(n: int) -> P = P(n)\n" +
+                       "    doubled(self) -> int = self.x * 2\n")]), "14\n")
+
+@test("the positional pattern is refused the same way")
+mv_the_positional_pattern_is_refused_the_same_way()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    private x: int\n    y: int\n    make() -> P = P(1, 2)",
+                          "flat(p: P) -> int\n    p match\n        P(a, b) -> a + b\n")
+
+    assert(out.contains("this pattern names every field of 'geom.P' in order, and 'x' is private"),
+        out)
+
+// The named form reads only what it writes, so it is the one that still works -- and saying so is
+// the useful half of the positional form's complaint.
+@test("and the named pattern needs only the fields it names")
+mv_the_named_pattern_needs_only_what_it_names()
+    if mv_no_library() then return
+
+    assert_eq(mv_ran([("main.sysl", "import geom.{P, flat}\nprint(flat(P.make()))\n"),
+                      ("geom/g.sysl",
+                       "module geom\nstruct P\n    private x: int\n    y: int\n" +
+                       "    make() -> P = P(1, 2)\n"),
+                      ("geom/h.sysl",
+                       "module geom\nflat(p: P) -> int\n    p match\n        P{y} -> y\n")]), "2\n")
+
+@test("a named pattern that names a restricted field is refused")
+mv_a_named_pattern_naming_a_restricted_field_is_refused()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    private x: int\n    y: int\n    make() -> P = P(1, 2)",
+                          "flat(p: P) -> int\n    p match\n        P{x} -> x\n")
+
+    assert(out.contains("field 'x' of 'geom.P' is private"), out)
+
+@test("the declaring file may still write both forms")
+mv_the_declaring_file_may_write_both_forms()
+    if mv_no_library() then return
+
+    assert_eq(mv_one_ran("struct P\n    private x: int\n    y: int\n    sum(self) -> int\n" +
+                         "        self match\n            P(a, b) -> a + b\n    end sum\nend P\n" +
+                         "print(P(3, 4).sum())\n"), "7\n")
+
+// -- a member is reached by naming it, and every kind of member is ----------------------------------
+
+@test("a method")
+mv_a_private_method_is_out_of_reach()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    x: int\n    private step(self) -> int = self.x",
+                          "go(p: P) -> int = p.step()")
+
+    assert(out.contains("method 'step' of 'geom.P' is private to 'g.sysl'"), out)
+
+@test("a property")
+mv_a_private_property_is_out_of_reach()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    x: int\n    private twice -> int = self.x * 2",
+                          "go(p: P) -> int = p.twice")
+
+    assert(out.contains("property 'twice' of 'geom.P' is private to 'g.sysl'"), out)
+
+@test("an associated function")
+mv_a_private_associated_function_is_out_of_reach()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    x: int\n    private of(n: int) -> P = P(n)",
+                          "go() -> P = P.of(1)")
+
+    assert(out.contains("associated function 'of' of 'geom.P' is private to 'g.sysl'"), out)
+
+@test("a generic type's method")
+mv_a_generic_types_private_method_is_out_of_reach()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct Box[T]\n    v: T\n    private peek(self) -> T = self.v",
+                          "go(b: Box[int]) -> int = b.peek()")
+
+    assert(out.contains("method 'peek' of 'geom.Box' is private"), out)
+
+@test("an enum's member")
+mv_an_enums_private_member_is_out_of_reach()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("enum E\n    A\n    B\n    private step(self) -> int = 1",
+                          "go(e: E) -> int = e.step()")
+
+    assert(out.contains("method 'step' of 'geom.E' is private"), out)
+
+@test("and a member of a generic type reached through its own type parameter")
+mv_a_generic_members_reach_through_its_own_parameter()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct Box[T]\n    v: T\n    private make(x: T) -> Box[T] = Box(x)",
+                          "go() -> Box[int] = Box.make(1)")
+
+    assert(out.contains("associated function 'make' of 'geom.Box' is private"), out)
+
+// -- an unmarked member inherits its type's reach ---------------------------------------------------
+//
+// The rule that is not a re-use of the top-level one: an unmarked member sits at its type's reach, so
+// a restricted type restricts everything in it without anything in it saying so.
+
+@test("a public member of a file-private struct stays inside that file")
+mv_a_public_member_of_a_private_struct_stays_inside()
+    if mv_no_library() then return
+
+    val out = mv_err([("main.sysl", "print(1)\n"),
+                      ("g.sysl",
+                       "module geom\nprivate struct P\n    x: int\n    of(n: int) -> P = P(n)\n"),
+                      ("h.sysl", "module geom\ngo() -> int = P.of(1).x\n")])
+
+    assert(out.contains("'geom.P' is private to 'g.sysl'"), out)
+
+// And it is what lets a restricted member name a restricted type: the leak rule asks each member at
+// its own reach, so the one that goes nowhere may say anything.
+@test("a private member may name a private type")
+mv_a_private_member_may_name_a_private_type()
+    if mv_no_library() then return
+
+    assert_eq(mv_one_ran("private struct Secret\n    n: int\nstruct Box\n    v: int\n" +
+                         "    private hide(self) -> Secret = Secret(self.v)\n" +
+                         "    show(self) -> int = self.hide().n\nend Box\nprint(Box(5).show())\n"),
+        "5\n")
+
+@test("a private field may name a private type")
+mv_a_private_field_may_name_a_private_type()
+    if mv_no_library() then return
+
+    assert_eq(mv_one_ran("private struct Secret\n    n: int\nstruct Box\n    private s: Secret\n" +
+                         "    of(n: int) -> Box = Box(Secret(n))\n" +
+                         "    show(self) -> int = self.s.n\nend Box\nprint(Box.of(6).show())\n"),
+        "6\n")
+
+@test("while a public one beside it may not")
+mv_a_public_field_may_not_name_a_private_type()
+    if mv_no_library() then return
+
+    val out = mv_one_err("private struct Secret\n    n: int\nstruct Box\n    s: Secret\nprint(1)\n")
+
+    assert(out.contains("'Box.s' is public, but its type names 'Secret'"), out)
+
+@test("and a public method beside it may not either")
+mv_a_public_method_may_not_name_a_private_type()
+    if mv_no_library() then return
+
+    val out = mv_one_err("private struct Secret\n    n: int\nstruct Box\n    v: int\n" +
+                         "    hide(self) -> Secret = Secret(self.v)\nprint(1)\n")
+
+    assert(out.contains("'Box.hide' is public, but its result names 'Secret'"), out)
+
+// -- a modifier may only narrow ---------------------------------------------------------------------
+
+@test("a member wider than the module its type is scoped to is refused")
+mv_a_member_wider_than_its_types_module_is_refused()
+    if mv_no_library() then return
+
+    val out = mv_err([("main.sysl", "print(1)\n"),
+                      ("x.sysl", "module a.b\nprivate[b] struct P\n    private[a] x: int\n")])
+
+    assert(out.contains("'P.x' is visible throughout module 'a', but 'a.b.P' is private to module " +
+                        "'a.b' — a member cannot be more visible than the type it belongs to"), out)
+
+@test("a member wider than a file-private type is refused")
+mv_a_member_wider_than_a_file_private_type_is_refused()
+    if mv_no_library() then return
+
+    val out = mv_err([("main.sysl", "print(1)\n"),
+                      ("x.sysl", "module a\nprivate struct P\n    private[a] x: int\n")])
+
+    assert(out.contains("'P.x' is visible throughout module 'a', but 'a.P' is private to " +
+                        "'x.sysl', the file that declares it"), out)
+
+@test("narrowing in the same direction is fine")
+mv_narrowing_in_the_same_direction_is_fine()
+    if mv_no_library() then return
+
+    val out = mv_err([("main.sysl", "import a.P\nread(p: P) -> int = p.x\nprint(1)\n"),
+                      ("x.sysl", "module a\nprivate[a] struct P\n    private x: int\n")])
+
+    assert(out.contains("'a.P' is private to module 'a'"), out)
+
+@test("and a modifier equal to its type's is fine")
+mv_a_modifier_equal_to_its_types_is_fine()
+    if mv_no_library() then return
+
+    assert_eq(mv_ran([("main.sysl", "print(1)\n"),
+                      ("a/x.sysl",
+                       "module a\nprivate[a] struct P\n    private[a] x: int\n" +
+                       "    of(n: int) -> P = P(n)\n"),
+                      ("a/y.sysl", "module a\nread() -> int = P.of(2).x\n")]), "1\n")
+
+// -- a member a trait declares carries no modifier --------------------------------------------------
+
+@test("a modifier on a trait's default body is refused too")
+mv_a_modifier_on_a_traits_default_body_is_refused()
+    assert(pf_err("trait Show\n    private show(self) -> int = 1\nend Show\n")
+        .contains("carry no visibility of their own"), "the refusal says why")
+
+@test("a modifier on a trait's property signature is refused")
+mv_a_modifier_on_a_traits_property_signature_is_refused()
+    assert(pf_err("trait Wide\n    private width -> int\nend Wide\n")
+        .contains("carry no visibility of their own"), "the refusal says why")
+
+// What a trait asks for stays reachable wherever the trait is, which is the reason for the refusal
+// rather than a separate rule: a `private` method and a trait's method of the same name are two
+// members, and it is the trait's that answers a bound.
+@test("a trait's method is reached at the trait's reach, whatever the type keeps back")
+mv_a_traits_method_is_reached_at_the_traits_reach()
+    if mv_no_library() then return
+
+    assert_eq(mv_ran([("main.sysl", "import geom.{P, loud}\nprint(loud(P.of(3)))\n"),
+                      ("geom/g.sysl",
+                       "module geom\ntrait Show\n    show(self) -> int\nstruct P\n" +
+                       "    private x: int\n    of(n: int) -> P = P(n)\nimpl Show for P\n" +
+                       "    show(self) -> int = self.x * 10\n"),
+                      ("geom/h.sysl",
+                       "module geom\nloud[T: Show](v: T) -> int = v.show()\n")]), "30\n")
+
+// -- the places a restricted field is still one -----------------------------------------------------
+//
+// The ways of arriving at a field that are not a bare `p.x`, and the two places a restricted member
+// could have leaked out through something other than its own name.
+
+@test("through a memory mode, which selection reaches through and the modifier still covers")
+mv_a_restricted_field_through_a_memory_mode()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    private x: int\n    of(n: int) -> &P = P(n)",
+                          "read(p: &P) -> int = p.x")
+
+    assert(out.contains("field 'x' of 'geom.P' is private"), out)
+
+@test("through a pointer")
+mv_a_restricted_field_through_a_pointer()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    private x: int", "read(p: *P) -> int = p.x")
+
+    assert(out.contains("field 'x' of 'geom.P' is private"), out)
+
+@test("on an element of an array")
+mv_a_restricted_field_on_an_array_element()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    private x: int\n    of(n: int) -> P = P(n)",
+                          "read(ps: [4]P) -> int = ps[0].x")
+
+    assert(out.contains("field 'x' of 'geom.P' is private"), out)
+
+@test("on a generic type, whose fields belong to the declaration rather than the instantiation")
+mv_a_restricted_field_on_a_generic_type()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct Box[T]\n    private v: T\n    of(x: T) -> Box[T] = Box(x)",
+                          "read(b: Box[int]) -> int = b.v")
+
+    assert(out.contains("field 'v' of 'geom.Box' is private"), out)
+
+// An `impl` written in another file of the module is another file, so it is held to the same line --
+// which is what makes the file level mean something rather than being about the type.
+@test("and an 'impl' in a sibling file may not reach one either")
+mv_an_impl_in_a_sibling_file_may_not_reach_one()
+    if mv_no_library() then return
+
+    val out = mv_pair_err("struct P\n    private x: int\ntrait Wide\n    width(self) -> int",
+                          "impl Wide for P\n    width(self) -> int = self.x")
+
+    assert(out.contains("field 'x' of 'geom.P' is private"), out)
+
+// The other direction, and the reason the level is the *file* rather than the type: everything
+// written beside the declaration may read it, whether or not it belongs to that type.
+@test("while anything else in the declaring file may")
+mv_anything_else_in_the_declaring_file_may()
+    if mv_no_library() then return
+
+    assert_eq(mv_one_ran("struct P\n    private x: int\nstruct Q\n    p: P\n" +
+                         "    inner(self) -> int = self.p.x\nend Q\nprint(Q(P(8)).inner())\n"),
+        "8\n")
+
+// -- a restricted member has no second way in -------------------------------------------------------
+//
+// Two negatives worth pinning, because either failing would be a hole rather than a diagnostic: a
+// restricted member must not become reachable by some route that does not spell its name.
+
+@test("it cannot be shadowed by a trait's member of the same name")
+mv_a_restricted_member_cannot_be_shadowed_by_a_traits()
+    if mv_no_library() then return
+
+    val out = mv_one_err("trait Show\n    show(self) -> int\nstruct P\n" +
+                         "    private show(self) -> int = 1\nimpl Show for P\n" +
+                         "    show(self) -> int = 2\nprint(1)\n")
+
+    assert(out.contains("type 'P' already has a member named 'show'"), out)
+
+@test("and it does not answer a trait requirement on its own, so no bound reaches it")
+mv_a_restricted_member_does_not_answer_a_requirement()
+    if mv_no_library() then return
+
+    val out = mv_one_err("trait Show\n    show(self) -> int\nstruct P\n" +
+                         "    private show(self) -> int = 1\nimpl Show for P\nprint(1)\n")
+
+    assert(out.contains("'P' does not implement 'Show': method 'show' is missing"), out)
+
+// -- what a restricted field does not change --------------------------------------------------------
+
+// Visibility is about naming, never about layout or storage -- a private field is a field.
+@test("the struct is laid out and copied exactly as it was")
+mv_a_restricted_field_does_not_change_the_layout()
+    if mv_no_library() then return
+
+    assert_eq(mv_one_ran("struct P\n    private a: int\n    private b: int\n" +
+                         "    of(x: int, y: int) -> P = P(x, y)\n" +
+                         "    sum(self) -> int = self.a + self.b\nend P\nvar p = P.of(2, 3)\n" +
+                         "var q = p\nprint(p.sum(), q.sum())\n"), "5 5\n")
+
+// A restriction is about naming a *field*, so the type itself travels as freely as ever -- which is
+// the difference between this and restricting the type.
+@test("the type may still be held, passed, and used as a type argument")
+mv_a_type_with_a_restricted_field_still_travels()
+    if mv_no_library() then return
+
+    assert_eq(mv_ran([("main.sysl",
+                       "import geom.P\nvar xs: []P = [P.of(1), P.of(2)]\n" +
+                       "var one: Option[P] = Some(xs[1])\none match\n" +
+                       "    Some(p) -> print(p.doubled())\n    None -> print(0)\n"),
+                      ("geom/g.sysl",
+                       "module geom\nstruct P\n    private x: int\n    of(n: int) -> P = P(n)\n" +
+                       "    doubled(self) -> int = self.x * 2\n")]), "4\n")
+
+@test("a counted field behind a modifier is still counted")
+mv_a_counted_field_behind_a_modifier_is_still_counted()
+    if mv_no_library() then return
+
+    assert_eq(mv_one_ran("struct Node\n    private tag: string\n" +
+                         "    of(s: string) -> &Node = Node(s)\n" +
+                         "    name(&self) -> string = self.tag\nend Node\nvar i = 0\n" +
+                         "while i < 20000\n    var n = Node.of(\"x\")\n    i += 1\n" +
+                         "print(\"done\")\n"), "done\n")
+
+@test("and an invariant over private fields is still checked")
+mv_an_invariant_over_private_fields_is_still_checked()
+    if mv_no_library() then return
+
+    assert(mv_exits("struct Span\n    private lo: int\n    private hi: int\n" +
+                    "    invariant lo <= hi\n    of(a: int, b: int) -> Span = Span(a, b)\n" +
+                    "    low(self) -> int = self.lo\nend Span\nprint(Span.of(5, 1).low())\n"),
+        "the program did not come back")
