@@ -1,0 +1,327 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A trait's members are resolved where the TRAIT is written, not where something implements it.**
+//
+// Every other kind of member lowers to a function, and a function's signature is resolved when it is
+// hoisted -- so an unknown type in one is reported at the declaration. A trait's members lower to
+// nothing: they are a promise, and the only thing that used to read them was the conformance check an
+// `impl` runs. A trait nobody implemented could therefore promise a type that does not exist.
+//
+// `Self` and the trait's own parameters stand in for themselves here, which is what the signature
+// means -- it holds for every implementing type. So the NAMES are what this checks, and everything
+// depending on knowing *which* type `Self` is stays with the conformance check.
+//
+// **Every refusal quoted here was obtained by running the reference compiler on the same source.**
+
+private var sig_library_cache: Buf[Program] = buf()
+private var sig_library_read: bool = false
+
+private sig_library() -> Buf[Program]
+    if sig_library_read then return sig_library_cache
+
+    sig_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> sig_library_cache = units
+
+    sig_library_cache
+end sig_library
+
+private sig_no_library() -> bool
+    if sig_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end sig_no_library
+
+private sig_units(parsed: Parsed) -> Buf[Program]
+    var units: Buf[Program] = buf()
+    val library = sig_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+    units
+end sig_units
+
+// Everything a source read beside the library has to say about itself, joined.
+private sig_err(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    val done = analyze_bodies(sig_units(parsed), host_target())
+    var out = str_builder()
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/")
+            out.push(done.reported.at(i).diag.message)
+            out.push_char('\n')
+
+    out.finish()
+end sig_err
+
+// The whole report, rendered the way a reader sees it -- which is what a claim about *where* a
+// complaint lands has to be made against.
+private sig_rendered(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.report.render(parsed.src)
+
+    val done = analyze_bodies(sig_units(parsed), host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end sig_rendered
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private sig_ran(text: string) -> string
+    val root = make_temp_dir("sysl-tsig").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end sig_ran
+
+private sig_can_run() -> bool
+    if sig_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end sig_can_run
+
+// -- a name that stands for nothing is reported at the trait ------------------------------------------
+
+@test("in a parameter, with nothing implementing the trait")
+in_a_parameter_with_nothing_implementing_the_trait()
+    if sig_no_library() then return
+
+    assert(sig_err("trait R\n    put(self, h: Nope) -> int\nprint(1)").contains("unknown type 'Nope'"),
+           "the refusal names the type nothing declares")
+
+@test("in the result")
+in_the_result()
+    if sig_no_library() then return
+
+    assert(sig_err("trait R\n    take(self) -> Nope\nprint(1)").contains("unknown type 'Nope'"),
+           "a result is walked as a parameter is")
+
+@test("inside a type argument, where a shallower walk would miss it")
+inside_a_type_argument_where_a_shallower_walk_would_miss_it()
+    if sig_no_library() then return
+
+    assert(sig_err("trait R\n    all(self) -> Option[Nope]\nprint(1)").contains("unknown type 'Nope'"),
+           "the walk goes into a type argument")
+
+@test("behind a memory mode")
+behind_a_memory_mode()
+    if sig_no_library() then return
+
+    assert(sig_err("trait R\n    borrow(self, h: &Nope) -> int\nprint(1)")
+               .contains("unknown type 'Nope'"),
+           "a '&' is a qualifier the walk goes through")
+
+@test("in a property, which has a result and no parameters at all")
+in_a_property_which_has_a_result_and_no_parameters()
+    if sig_no_library() then return
+
+    assert(sig_err("trait R\n    size -> Nope\nprint(1)").contains("unknown type 'Nope'"),
+           "a property is a signature too")
+
+// The position is the whole point: a reader is sent to the type they wrote, not to the trait's first
+// line and not to some `impl` in another file.
+@test("and the report lands on the name that was written")
+the_report_lands_on_the_name_that_was_written()
+    if sig_no_library() then return
+
+    val said = sig_rendered("trait R\n    put(self, h: Nope) -> int\nprint(1)\n")
+
+    assert(said.contains("--> t.sysl:2:18"), s"the caret is on the written name: $said")
+
+// -- what stands for itself is left alone --------------------------------------------------------------
+
+// Each of these would resolve to nothing if the substitution were wrong, so together they are the
+// check that this pass asks only about names.
+@test("`Self`, alone and inside a type argument and as a result")
+self_alone_and_inside_a_type_argument_and_as_a_result()
+    if !sig_can_run() then return
+
+    assert_eq(sig_ran(raw"""
+        trait Cloneable
+            dup(self) -> Self
+            maybe(self) -> Option[Self]
+            take(self, other: Self) -> int
+        struct P
+            v: int
+        impl Cloneable for P
+            dup(self) -> P = self
+            maybe(self) -> Option[P] = Some(self)
+            take(self, other: P) -> int = self.v + other.v
+        print(P(2).take(P(3)))
+        """), "5\n")
+
+@test("the trait's own type parameters")
+the_traits_own_type_parameters()
+    if !sig_can_run() then return
+
+    assert_eq(sig_ran(raw"""
+        trait Sink[T]
+            push(*self, x: T) -> int
+            peek(self) -> Option[T]
+        struct Box
+            n: int
+        impl Sink[int] for Box
+            push(*self, x: int) -> int
+                self.n = self.n + x
+                self.n
+            peek(self) -> Option[int] = Some(self.n)
+        var b = Box(1)
+        print(b.push(4))
+        """), "5\n")
+
+// A trait object formed from a signature whose `Self` is not yet known is the one shape the resolver
+// refuses erasure for, so a trait returning `&OtherTrait` is the case that would break if this pass
+// asked for more than the names.
+@test("a trait object in a trait's own signature")
+a_trait_object_in_a_traits_own_signature()
+    if !sig_can_run() then return
+
+    assert_eq(sig_ran(raw"""
+        trait Show
+            show(self) -> string
+        trait Render
+            render(self) -> &Show
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> string = "p"
+        f(s: &Show) -> string = s.show()
+        print(f(P(1)))
+        """), "p\n")
+
+// A result list is a signature form and not a type, so it goes through the return resolver rather
+// than the type resolver -- the one shape that would have been refused if this pass had reached for
+// the type resolver on everything.
+@test("a result list, which is a signature form and not a type")
+a_result_list_which_is_a_signature_form_and_not_a_type()
+    if !sig_can_run() then return
+
+    assert_eq(sig_ran(raw"""
+        trait Split
+            halves(self) -> int, int
+        struct P
+            v: int
+        impl Split for P
+            halves(self) -> int, int = self.v / 2, self.v - self.v / 2
+        show(p: P)
+            val a, b = p.halves()
+            print(a, b)
+        show(P(7))
+        """), "3 4\n")
+
+@test("a required trait's parameters, read through the requirement")
+a_required_traits_parameters_read_through_the_requirement()
+    if !sig_can_run() then return
+
+    assert_eq(sig_ran(raw"""
+        trait Show
+            show(self) -> string
+        trait Word: Show
+            word(self) -> string
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> string = "p"
+        impl Word for P
+            word(self) -> string = self.show() + "!"
+        print(P(1).word())
+        """), "p!\n")
+
+// -- what the pass instantiates does not outlive it ------------------------------------------------------
+
+// **What this pass resolves, it must not leave behind**, and an abstract type is identified by its
+// NAME -- so a trait's `T` and an unrelated declaration's `T` are one type as far as a cache key is
+// concerned. Resolving a promise of `Maybe[T]` here registers a `Maybe` instantiated at *this trait's*
+// stand-in, and every later walk asking for `Maybe[T]` was handed that one.
+@test("so a trait promising a generic type leaves that type's own 'impl' bounds alone")
+a_trait_promising_a_generic_type_leaves_impl_bounds_alone()
+    if !sig_can_run() then return
+
+    assert_eq(sig_ran(raw"""
+        enum Maybe[T]
+            Just(v: T)
+            Nothing
+        impl[T: Display] Display for Maybe[T]
+            display(self, out: *Writer, fmt: FormatSpec)
+                self match
+                    Just(v) -> v.display(out, fmt)
+                    Nothing -> out.write("Nothing".bytes)
+            end display
+        end Maybe[T]
+        trait Sink[T]
+            peek(self) -> Maybe[T]
+        var m: Maybe[int] = Just(3)
+        print(str(m))
+        """), "3\n")
+
+// The same shape against the library's own, which is where it was found: `Option` carries `Eq` and
+// `Display` blocks of exactly that form, so any trait promising an `Option[T]` used to report four
+// complaints from inside the library's own file.
+@test("including the library's, which is where this was found")
+including_the_librarys_which_is_where_this_was_found()
+    if !sig_can_run() then return
+
+    assert_eq(sig_ran(raw"""
+        trait Sink[T]
+            peek(self) -> Option[T]
+        var o: Option[int] = Some(3)
+        print(str(o), o == Some(3))
+        """), "Some(3) true\n")
+
+// The conformance check still resolves both sides against a concrete `Self`, so a trait whose
+// signature is fine and an `impl` that disagrees with it is reported exactly as before.
+@test("the conformance check is untouched")
+the_conformance_check_is_untouched()
+    if sig_no_library() then return
+
+    assert(sig_err(raw"""
+        trait Doubler
+            twice(self) -> Self
+        struct P
+            v: int
+        impl Doubler for P
+            twice(self) -> int = 1
+        """).contains("but trait 'Doubler' declares"),
+           "the conformance refusal names the trait")
