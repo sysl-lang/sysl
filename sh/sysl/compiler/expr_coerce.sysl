@@ -161,7 +161,13 @@ coerce(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
                               s"'[]${type_show(*want)}' of your own, or take the parameter as " +
                               s"'[]const ${type_show(*want)}' if it is only read")
 
-            array_view(cx, t, *want, read_only).unwrap_or(t)
+            // The view an array coerces to may be read-only when the position asked for a writable
+            // one, the array having been bound by a `val` — so the view is put back through the
+            // same position rather than handed over. That is what reaches the refusal above, whose
+            // words are about the two view types and not about the array.
+            array_view(cx, t, *want, read_only) match
+                Some(view) -> coerce(cx, view, expected)
+                None -> t
         Vector(_, elem) ->
             if type_eq(repr(got), repr(*elem)) then TExpr(t.span, TSplat(t, expected)) else t
         _ -> t
@@ -178,7 +184,11 @@ private array_view(cx: &Analyzer, t: TExpr, want: Type, read_only: bool) -> Opti
     if elem.is_none() then return None
     if !type_eq(elem.unwrap(), want) then return None
 
-    val view = Slice(want, read_only)
+    // **A view of read-only storage is read-only whatever the position asked for.** An array bound
+    // by a `val` is written once, so a writable view of it would be a licence the binding never
+    // gave; the position's own demand is answered afterwards, where the refusal can name both view
+    // types.
+    val view = Slice(want, read_only || written_once_place(cx, t))
 
     // A view that may be written is an alias like any other, and the array it is taken of may sit
     // inside a struct whose invariant reads it.

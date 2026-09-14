@@ -749,19 +749,38 @@ end enum_cast
 // Without the first half a `Display` value reached the lowering as though it were already a string
 // and the emitted IR read its bytes out of an enum, which clang refuses -- three of the org's
 // bindings died at exactly that line.
+// A conversion is applied to the type the program WROTE rather than to what that type stands for: a
+// constrained alias over an integer is a type of its own, and `%d` over one is the same confusion
+// about which value is in the hole that `%d` over a string is.
+private written_integer(t: Type) -> bool = t match
+    Integer(_, _, _) -> true
+    _ -> false
+
+private written_floating(t: Type) -> bool = t match
+    Floating(_) -> true
+    _ -> false
+
 private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string) -> TExpr
     val v = type_expr_bare(cx, arg)
     val ty = texpr_type(v)
 
     if ty == Unknown then return TExpr(span, TFormat(v, spec))
-    if !spec_is_str(spec_conversion(spec)) then return TExpr(span, TFormat(v, spec))
-    if ty == Str then return TExpr(span, TFormat(v, spec))
 
-    if scalar_render(ty)
-        return cx.err(span, s"format '$spec' expects a string, but the value has type " +
-                      type_show(ty))
+    val c = spec_conversion(spec)
 
-    spec_render(cx, span, v, spec)
+    // A conversion says what kind of value it renders, and a value of another kind is a mistake in
+    // the specifier rather than something to convert: `%d` is applied by C's formatting, which
+    // reads whatever bytes the argument put in the slot.
+    val fits = if spec_is_int(c) then written_integer(ty)
+    else if spec_is_float(c) then written_floating(ty)
+    else ty == Str
+
+    if fits then return TExpr(span, TFormat(v, spec))
+
+    if spec_is_str(c) && !scalar_render(ty) then return spec_render(cx, span, v, spec)
+
+    cx.err(span, s"format '$spec' expects ${spec_expects(c)}, but the value has type " +
+           type_show(ty))
 end format_call
 
 // What a plain alias stands for, where the resolution has already made it real.
