@@ -1,0 +1,233 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+
+// Diagnostics for a trait's **default bodies**.
+//
+// The half that matters is where a bad default is *reported*. A default body may assume of its
+// receiver exactly what its own trait declares, and that is checked once **at the trait** -- so a
+// mistake in one lands on the line that made it even when nothing implements the trait at all,
+// rather than on each implementing type in turn.
+//
+// **Every refusal quoted here was obtained by running the reference compiler on the same source.**
+
+private var def_library_cache: Buf[Program] = buf()
+private var def_library_read: bool = false
+
+private def_library() -> Buf[Program]
+    if def_library_read then return def_library_cache
+
+    def_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> def_library_cache = units
+
+    def_library_cache
+end def_library
+
+private def_no_library() -> bool
+    if def_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end def_no_library
+
+private def_analyzed(text: string) -> TypedBodies
+    val parsed = parse(source_of("test.sysl", text))
+    var units: Buf[Program] = buf()
+    val library = def_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+    analyze_bodies(units, host_target())
+end def_analyzed
+
+// Everything a source read beside the library has to say about itself, joined.
+private def_err(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    val done = def_analyzed(text)
+    var out = str_builder()
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/")
+            out.push(done.reported.at(i).diag.message)
+            out.push_char('\n')
+
+    out.finish()
+end def_err
+
+// The whole module a source lowers to: what a default was materialized as is visible here and
+// nowhere earlier.
+private def_ir(text: string) -> string
+    val done = def_analyzed(text)
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), buf())
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end def_ir
+
+// -- a default is checked at the trait ------------------------------------------------------------
+//
+// **SIX OF THIS SUITE'S CASES ARE NOT HERE, and they are one absence rather than six.** The reference
+// walks a trait's default bodies **at the trait**, with `Self` standing in for itself and the trait's
+// own declarations as the whole of what the body may assume -- so a default reading a field, calling
+// a method the trait never promised, or needing an operator's bound is refused on the line that made
+// it with nothing implementing the trait at all, and once however many types inherit it. This
+// compiler has no such walk: those bodies are read only as they are materialized for an implementing
+// type, so a trait nobody implements is never read and a trait two types implement is read twice.
+// The cases owed are `what a default needs a bound for is asked in an expression that also calls an
+// import`, `a default calling a method the trait does not declare is refused with no impl in sight`,
+// `a default may not read a field of its receiver, which the trait does not promise`, `a default
+// using an operator asks for the bound that supplies it`, `a default printing its receiver asks for
+// Display` and `a bad default is reported once, not once per implementing type`.
+
+@test("and one calling an imported function correctly is accepted with no impl in sight")
+one_calling_an_imported_function_correctly_is_accepted()
+    if def_no_library() then return
+
+    assert(def_ir("import sysl.text.cstring\n\ntrait Greet\n" +
+                  "    greet(self) -> usize = cstring(\"hi\").len\n\nmain()\n    print(1)\n")
+               .contains("define"),
+           "the program lowers")
+
+// Not every mistake in a default is one the trait's own promises can settle: this one needs the
+// types the body works with, and those are the implementing type's. So it is caught where every
+// other concrete mistake in a generic body is, at each type the body is materialized for.
+@test("a mistake the bounds cannot settle is caught at the implementing type")
+a_mistake_the_bounds_cannot_settle_is_caught_at_the_implementing_type()
+    if def_no_library() then return
+
+    assert(def_err(raw"""
+        trait Greet
+            name(self) -> string
+            tag(self) -> int = self.name()
+        struct Cat
+            n: string
+        impl Greet for Cat
+            name(self) -> string = self.n
+        """).contains("should return int"), "the refusal is the ordinary one about the result")
+
+// -- what a trait may declare -----------------------------------------------------------------------
+
+// An **associated function** may carry one. A property of the *type* may not, and the reason is its
+// own rather than a receiver rule: it has no parameter list and no receiver, so nothing is available
+// to vary the value it would hand every implementation.
+@test("a default on a property of the type would be one value for everybody")
+a_default_on_a_property_of_the_type_would_be_one_value_for_everybody()
+    if def_no_library() then return
+
+    assert(def_err("trait Maker\n    static size -> int = 1\n")
+               .contains("would give every implementation the same value"),
+           "the refusal says why a static property may not carry one")
+
+// A member declaring type parameters of its own is ordinary, default body and all -- it gives up its
+// table slot and nothing else. Two calls at two argument types, so the default is seen to
+// instantiate rather than merely to compile.
+@test("a generic trait method is ordinary, and may carry a default body")
+a_generic_trait_method_is_ordinary_and_may_carry_a_default_body()
+    if def_no_library() then return
+
+    val out = def_ir(raw"""
+        trait Store
+            put[T](self, item: T) -> int = 1
+        struct Bin
+            n: int
+        impl Store for Bin
+        print(Bin(0).put("x"), Bin(0).put(2))
+        """)
+
+    assert(out.contains("@Bin.put.string("), s"the default instantiated at a string: $out")
+    assert(out.contains("@Bin.put.int("), "and at an int")
+
+// -- conformance still holds --------------------------------------------------------------------------
+
+@test("a method with no default is still required")
+a_method_with_no_default_is_still_required()
+    if def_no_library() then return
+
+    assert(def_err(raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = self.name()
+        struct Cat
+            n: string
+        impl Greet for Cat
+        """).contains("method 'name' is missing"), "the refusal names what the block owes")
+
+@test("an impl may not define a method the trait does not declare, default or not")
+an_impl_may_not_define_a_method_the_trait_does_not_declare()
+    if def_no_library() then return
+
+    assert(def_err(raw"""
+        trait Greet
+            greet(self) -> string = "hi"
+        struct Cat
+            n: string
+        impl Greet for Cat
+            shout(self) -> string = "HI"
+        """).contains("declares no method 'shout'"), "the refusal names the method nobody promised")
+
+@test("an override is held to the trait's signature")
+an_override_is_held_to_the_traits_signature()
+    if def_no_library() then return
+
+    assert(def_err(raw"""
+        trait Greet
+            greet(self) -> string = "hi"
+        struct Cat
+            n: string
+        impl Greet for Cat
+            greet(self) -> int = 1
+        """).contains("but trait 'Greet' declares"), "the refusal quotes what the trait promised")
+
+// Two defaults of one name are two bodies, and a default is filed exactly as a written method is --
+// so this is the visibility rule's case and not a collision: both blocks stand, and it is a *use*
+// reaching both that has nothing to say which was meant.
+@test("two traits whose defaults share a name may both be implemented for one type")
+two_traits_whose_defaults_share_a_name_may_both_be_implemented()
+    if def_no_library() then return
+
+    val both = raw"""
+        trait A
+            tag(self) -> int = 1
+        trait B
+            tag(self) -> int = 2
+        struct C
+            n: int
+        impl A for C
+        impl B for C
+        """
+
+    assert(def_ir(both + "main()\n    print(1)\n").contains("define"), "both blocks stand")
+    assert(def_err(both + "main()\n    print(C(1).tag())\n").contains("which was meant"),
+           "and a use reaching both is what is refused")
+
+@test("an inherited default may not collide with a member the type already has")
+an_inherited_default_may_not_collide_with_a_member_the_type_already_has()
+    if def_no_library() then return
+
+    assert(def_err(raw"""
+        trait Greet
+            greet(self) -> string = "hi"
+        struct Cat
+            n: string
+            greet(self) -> string = "own"
+        impl Greet for Cat
+        """).contains("already has a member named 'greet'"),
+           "the refusal names the member the type already had")
