@@ -1,0 +1,572 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Diagnostics for types: plain mismatches, the scalar widths, the memory modes (`*T` / `&T`), and
+// the aggregate types -- arrays, slices, strings -- along with `str` and format specifiers.
+//
+// **Every message here was read out of the reference compiler**, by handing the installed `sysl` the
+// same source and quoting what came back -- never composed from the rule.
+
+private var type_errors_library_cache: Buf[Program] = buf()
+private var type_errors_library_read: bool = false
+
+private type_errors_library() -> Buf[Program]
+    if type_errors_library_read then return type_errors_library_cache
+
+    type_errors_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> type_errors_library_cache = units
+
+    type_errors_library_cache
+end type_errors_library
+
+private type_errors_no_library() -> bool
+    if type_errors_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end type_errors_no_library
+
+// The whole report one source is refused with, rendered the way a reader sees it.
+private err(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+    var units: Buf[Program] = buf()
+    val library = type_errors_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end err
+
+// The LLVM text of the whole module a source lowers to, for a claim about the type table rather
+// than about one function.
+private ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+    var units: Buf[Program] = buf()
+    val library = type_errors_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), buf())
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    ir_print_module(lowered.0)
+end ir
+
+@test("an argument of the wrong type")
+te_an_argument_of_the_wrong_type()
+    if type_errors_no_library() then return
+
+    val a = err("f(x: int) -> int = x\nprint(f(1.5))")
+
+    assert(a.contains("is int, but real was given"), a)
+
+@test("a return value of the wrong type")
+te_a_return_value_of_the_wrong_type()
+    if type_errors_no_library() then return
+
+    val a = err("f() -> int\n    return 1.5")
+
+    assert(a.contains("return type mismatch"), a)
+
+@test("an unknown type in a signature")
+te_an_unknown_type_in_a_signature()
+    if type_errors_no_library() then return
+
+    val a = err("f(x: Widget) -> int = 0")
+
+    assert(a.contains("unknown type 'Widget'"), a)
+
+@test("a literal too large for the width it landed in")
+te_a_literal_too_large_for_the_width_it_landed_in()
+    if type_errors_no_library() then return
+
+    val a = err("var x: byte = 300")
+    val b = err("print(5000000000)")
+
+    assert(a.contains("does not fit byte"), a)
+    assert(b.contains("does not fit int"), b)
+
+@test("an integer literal does not quietly become a float")
+te_an_integer_literal_does_not_quietly_become_a_float()
+    if type_errors_no_library() then return
+
+    val a = err("var x: real = 1")
+
+    assert(a.contains("declared real but the value is int"), a)
+
+@test("mixed widths need a conversion rather than promoting")
+te_mixed_widths_need_a_conversion_rather_than_promoting()
+    if type_errors_no_library() then return
+
+    val a = err("var a: byte = 1\nvar b: int = 2\nprint(a + b)")
+
+    assert(a.contains("'+' needs matching types, got byte and int"), a)
+
+@test("an unsupported width is named as such")
+te_an_unsupported_width_is_named_as_such()
+    if type_errors_no_library() then return
+
+    val a = err("var x: i8388608 = 1")
+    val b = err("var x: f128 = 1.0")
+
+    assert(a.contains("wider than the 8388607 bits"), a)
+    assert(b.contains("'f128' is not lowered yet"), b)
+
+@test("a width beyond counting is its own complaint")
+te_a_width_beyond_counting_is_its_own_complaint()
+    if type_errors_no_library() then return
+
+    val a = err("var x: i99999999999999999999 = 1")
+
+    assert(a.contains("far wider than anything can hold"), a)
+
+@test("char has no arithmetic")
+te_char_has_no_arithmetic()
+    if type_errors_no_library() then return
+
+    val a = err("print('a' + 'b')")
+    val b = err("print('a' + 1)")
+
+    assert(a.contains("'+' is not defined for char"), a)
+    assert(b.contains("needs matching types, got char and int"), b)
+
+@test("a conversion that has no meaning")
+te_a_conversion_that_has_no_meaning()
+    if type_errors_no_library() then return
+
+    val a = err("print(int(true))")
+    val b = err("print(char('a'), char(1, 2))")
+
+    assert(a.contains("cannot convert bool to int"), a)
+    assert(b.contains("takes exactly one value"), b)
+
+@test("unary minus needs a type that has a sign")
+te_unary_minus_needs_a_type_that_has_a_sign()
+    if type_errors_no_library() then return
+
+    val a = err("var b: byte = 1\nprint(-b)")
+
+    assert(a.contains("unsigned type byte"), a)
+
+@test("a built-in type name may not be redeclared")
+te_a_built_in_type_name_may_not_be_redeclared()
+    if type_errors_no_library() then return
+
+    val a = err("struct byte\n    x: int")
+
+    assert(a.contains("already declared"), a)
+
+@test("a cycle through a value field still has no finite size")
+te_a_cycle_through_a_value_field_still_has_no_finite_size()
+    if type_errors_no_library() then return
+
+    val a = err("struct A\n    b: B\nstruct B\n    a: A\nvar x = A(B(x))")
+
+    assert(a.contains("contains itself"), a)
+
+@test("a cycle is fine as soon as one edge is an indirection")
+te_a_cycle_is_fine_as_soon_as_one_edge_is_an_indirection()
+    if type_errors_no_library() then return
+
+    val a = ir("struct A\n    b: B\nstruct B\n    a: *A\nvar b = B(null)\nvar a = A(b)")
+
+    assert(a.contains("%struct.A = type { %struct.B }"), a)
+
+@test("'&' needs something with an address, where what was written is a name")
+te_amp_needs_something_with_an_address()
+    if type_errors_no_library() then return
+
+    val a = err("const cap: int = 8\nvar p = &cap")
+    val b = err("val v = 3\nvar p = &v")
+
+    assert(a.contains("needs a variable, a field, an element, or a dereference"), a)
+    assert(b.contains("written once"), b)
+
+@test("'*' needs a pointer or a reference")
+te_star_needs_a_pointer_or_a_reference()
+    if type_errors_no_library() then return
+
+    val a = err("var n = 1\nprint(*n)")
+
+    assert(a.contains("'*' needs a pointer or a reference, not int"), a)
+
+@test("assigning through a pointer checks the pointee type")
+te_assigning_through_a_pointer_checks_the_pointee_type()
+    if type_errors_no_library() then return
+
+    val a = err("var n = 1\nvar p = &n\n*p = 1.5")
+
+    assert(a.contains("cannot assign real"), a)
+
+@test("a pointer cannot be printed")
+te_a_pointer_cannot_be_printed()
+    if type_errors_no_library() then return
+
+    val a = err("var n = 1\nprint(&n)")
+
+    assert(a.contains("cannot print a *int value"), a)
+
+@test("null must know which pointer it is")
+te_null_must_know_which_pointer_it_is()
+    if type_errors_no_library() then return
+
+    val a = err("var p = null")
+    val b = err("var n: int = null")
+
+    assert(a.contains("takes its type from its context"), a)
+    assert(b.contains("'null' is a raw pointer"), b)
+
+@test("a pointer has equality but no ordering")
+te_a_pointer_has_equality_but_no_ordering()
+    if type_errors_no_library() then return
+
+    val a = err("var n = 1\nvar p = &n\nprint(p < p)")
+
+    assert(a.contains("'<' is not defined for *int"), a)
+
+@test("the two reference modes are distinct types")
+te_the_two_reference_modes_are_distinct_types()
+    if type_errors_no_library() then return
+
+    val a = err("f(p: &int) -> &int = p\ng(p: &sync int) -> &int = f(p)")
+    val b = err("f(p: &sync int) -> int = 1\ng(p: &int) -> int = f(p)")
+
+    assert(a.contains("'&int' and '&sync int' are distinct types, and neither converts to the other"), a)
+    assert(b.contains("Allocate int as a '&sync int' where it is constructed"), b)
+
+@test("a reference is never null, so an absent one is an Option")
+te_a_reference_is_never_null_so_an_absent_one_is_an_option()
+    if type_errors_no_library() then return
+
+    val a = err("var p: &int = null")
+
+    assert(a.contains("Option[&int]"), a)
+
+@test("a value of an unrelated type is still a mismatch, not a box")
+te_a_value_of_an_unrelated_type_is_still_a_mismatch_not_a_box()
+    if type_errors_no_library() then return
+
+    val a = err("struct P\n    x: int\nvar p: &P = 5")
+
+    assert(a.contains("declared &P but the value is int"), a)
+
+@test("a reference cannot be printed")
+te_a_reference_cannot_be_printed()
+    if type_errors_no_library() then return
+
+    val a = err("struct P\n    x: int\nvar p: &P = P(1)\nprint(p)")
+
+    assert(a.contains("cannot print a &P value"), a)
+
+@test("references have equality but no ordering")
+te_references_have_equality_but_no_ordering()
+    if type_errors_no_library() then return
+
+    val src = "struct P\n    x: int\nvar a: &P = P(1)\nvar b: &P = P(2)\nprint(a < b)"
+    val a = err(src)
+
+    assert(a.contains("'<' is not defined for &P"), a)
+
+@test("a reference is not a raw pointer")
+te_a_reference_is_not_a_raw_pointer()
+    if type_errors_no_library() then return
+
+    val a = err("f(p: *int)\n    print(1)\ng(r: &int)\n    f(r)")
+
+    assert(a.contains("is *int, but &int was given"), a)
+
+@test("arrays have a length settled before the program runs, not while it does")
+te_arrays_have_a_length_settled_before_the_program_runs()
+    if type_errors_no_library() then return
+
+    val a = err("var n = 4\nvar a: [n]int\nprint(a[0])")
+
+    assert(a.contains("must be a constant"), a)
+
+@test("arrays hold one element type")
+te_arrays_hold_one_element_type()
+    if type_errors_no_library() then return
+
+    val a = err("var a = [1, 2.5]")
+
+    assert(a.contains("needs one element type"), a)
+
+@test("arrays cannot be empty without a context to take an element type from")
+te_arrays_cannot_be_empty_without_a_context()
+    if type_errors_no_library() then return
+
+    val a = err("var a = []")
+
+    assert(a.contains("takes its element type from its context"), a)
+
+@test("arrays cannot hold themselves by value")
+te_arrays_cannot_hold_themselves_by_value()
+    if type_errors_no_library() then return
+
+    val a = err("struct Tree\n    kids: [4]Tree\nvar t: Tree\n")
+
+    assert(a.contains("contains itself"), a)
+
+@test("arrays index with an integer")
+te_arrays_index_with_an_integer()
+    if type_errors_no_library() then return
+
+    val a = err("var a = [1, 2]\nprint(a[true])")
+
+    assert(a.contains("index must be an integer"), a)
+
+@test("arrays are not indexable when they are not sequences")
+te_arrays_are_not_indexable_when_they_are_not_sequences()
+    if type_errors_no_library() then return
+
+    val a = err("var n = 1\nprint(n[0])")
+
+    assert(a.contains("cannot index int"), a)
+
+@test("arrays have no field but their length")
+te_arrays_have_no_field_but_their_length()
+    if type_errors_no_library() then return
+
+    val a = err("var a = [1, 2]\nprint(a.size)")
+
+    assert(a.contains("cannot read field 'size'"), a)
+
+@test("print an array of anything printable, and name the element when they do not")
+te_print_an_array_names_the_element_when_it_does_not_implement_display()
+    if type_errors_no_library() then return
+
+    val a = err("struct P\n    v: int\nvar a: [2]P = [P(1), P(2)]\nprint(a)")
+
+    assert(a.contains("which does not implement it"), a)
+
+@test("arrays have no zero value when their elements have none")
+te_arrays_have_no_zero_value_when_their_elements_have_none()
+    if type_errors_no_library() then return
+
+    val a = err("struct P\n    x: int\nvar a: [2]&P")
+
+    assert(a.contains("has no zero value"), a)
+
+@test("arrays need one or the other -- a type, or something to infer it from")
+te_arrays_need_a_type_or_something_to_infer_it_from()
+    if type_errors_no_library() then return
+
+    val a = err("var a")
+
+    assert(a.contains("needs either a type or an initial value"), a)
+
+@test("slices cannot carry an owner whose count is atomic")
+te_slices_cannot_carry_an_owner_whose_count_is_atomic()
+    if type_errors_no_library() then return
+
+    val a = err("var b: &sync [4]int = [1, 2, 3, 4]\nvar s = b[..]")
+
+    assert(a.contains("'&sync' array cannot be sliced"), a)
+
+@test("slices are written with '..' when the high end is left off")
+te_slices_are_written_with_dotdot_when_the_high_end_is_left_off()
+    if type_errors_no_library() then return
+
+    val a = err("var b: &[4]int = [1, 2, 3, 4]\nvar s = b[1..<]")
+
+    assert(a.contains("written 'a[lo..]'"), a)
+
+@test("slices have integer bounds")
+te_slices_have_integer_bounds()
+    if type_errors_no_library() then return
+
+    val a = err("var b: &[4]int = [1, 2, 3, 4]\nvar s = b[true..<2]")
+
+    assert(a.contains("bound must be an integer"), a)
+
+@test("slices are taken of something with elements")
+te_slices_are_taken_of_something_with_elements()
+    if type_errors_no_library() then return
+
+    val a = err("var n = 1\nvar s = n[..]")
+
+    assert(a.contains("cannot slice int"), a)
+
+@test("slices do not accept an array whose elements are not the ones asked for")
+te_slices_do_not_accept_an_array_whose_elements_are_not_the_ones_asked_for()
+    if type_errors_no_library() then return
+
+    val a = err("f(s: []int) -> usize = s.len\nvar a: [2]long = [1, 2]\nprint(f(a))")
+
+    assert(a.contains("is []int, but [2]long was given"), a)
+
+@test("and do not accept a 'val' array where one that may be written was asked for")
+te_slices_do_not_accept_a_val_array_where_write_access_was_asked_for()
+    if type_errors_no_library() then return
+
+    val a = err("f(s: []int) -> usize = s.len\nval a = [1, 2]\nprint(f(a))")
+
+    assert(a.contains("views elements it may not write"), a)
+
+@test("strings cannot be written through, since a string is immutable")
+te_strings_cannot_be_written_through()
+    if type_errors_no_library() then return
+
+    val a = err("var s = \"ab\"\ns[0] = 65")
+
+    assert(a.contains("a string is immutable"), a)
+
+@test("strings cannot have their bytes pointed at either")
+te_strings_cannot_have_their_bytes_pointed_at()
+    if type_errors_no_library() then return
+
+    val a = err("var s = \"ab\"\nvar p = &s[0]")
+
+    assert(a.contains("a string is immutable"), a)
+
+@test("strings say which granularity a loop wants rather than choosing one")
+te_strings_say_which_granularity_a_loop_wants()
+    if type_errors_no_library() then return
+
+    val a = err("var s = \"ab\"\nfor c in s do print(c)")
+
+    assert(a.contains("iterated as 's.bytes'"), a)
+
+@test("strings have a length, their bytes and their characters, and no other field yet")
+te_strings_have_a_length_bytes_and_characters_and_no_other_field()
+    if type_errors_no_library() then return
+
+    val a = err("print(\"ab\".graphemes)")
+
+    assert(a.contains("cannot read field 'graphemes'"), a)
+
+@test("strings are not a []u8 where one was asked for")
+te_strings_are_not_a_byte_slice_where_one_was_asked_for()
+    if type_errors_no_library() then return
+
+    val a = err("f(b: []u8) -> usize = b.len\nprint(f(\"ab\"))")
+
+    assert(a.contains("is []byte, but string was given"), a)
+
+@test("strings join with '+' only, not the other arithmetic operators")
+te_strings_join_with_plus_only()
+    if type_errors_no_library() then return
+
+    val a = err("print(\"a\" - \"b\")")
+    val b = err("print(\"a\" * \"b\")")
+
+    assert(a.contains("operator '-' is not defined for string"), a)
+    assert(b.contains("operator '*' is not defined for string"), b)
+
+@test("strings do not coerce a number across '+'")
+te_strings_do_not_coerce_a_number_across_plus()
+    if type_errors_no_library() then return
+
+    val a = err("print(\"n=\" + 5)")
+    val b = err("print(5 + \"n\")")
+
+    assert(a.contains("'+' needs matching types, got string and int"), a)
+    assert(b.contains("'+' needs matching types, got int and string"), b)
+
+@test("strings need a string on the right of '+=' too")
+te_strings_need_a_string_on_the_right_of_plus_equals()
+    if type_errors_no_library() then return
+
+    val a = err("var s = \"a\"\ns += 5")
+
+    assert(a.contains("'+' needs matching types, got string and int"), a)
+
+@test("str will not render a struct, an enum, or a container")
+te_str_will_not_render_a_struct_an_enum_or_a_container()
+    if type_errors_no_library() then return
+
+    val a = err("struct P\n    x: int\nend P\nprint(str(P(1)))")
+    val b = err("enum E\n    A\n    B\nend E\nprint(str(A))")
+    val c = err("struct Q\n    v: int\nvar a: [3]Q = [Q(1), Q(2), Q(3)]\nprint(str(a))")
+
+    assert(a.contains("cannot make a string of a P value"), a)
+    assert(b.contains("cannot make a string of a"), b)
+    assert(c.contains("which does not implement it"), c)
+
+@test("str will not render a reference or a raw pointer")
+te_str_will_not_render_a_reference_or_a_raw_pointer()
+    if type_errors_no_library() then return
+
+    val a = err("var r: &int = 5\nprint(str(r))")
+    val b = err("var n = 5\nvar p = &n\nprint(str(p))")
+
+    assert(a.contains("cannot make a string of a"), a)
+    assert(b.contains("cannot make a string of a"), b)
+
+@test("str will not render a unit value")
+te_str_will_not_render_a_unit_value()
+    if type_errors_no_library() then return
+
+    val a = err("print(str(print(1)))")
+
+    assert(a.contains("cannot make a string of a unit value"), a)
+
+@test("str takes exactly one value")
+te_str_takes_exactly_one_value()
+    if type_errors_no_library() then return
+
+    val a = err("print(str(1, 2))")
+    val b = err("print(str())")
+
+    assert(a.contains("str takes exactly one value"), a)
+    assert(b.contains("str takes exactly one value"), b)
+
+@test("an integer conversion rejects a non-integer")
+te_an_integer_format_conversion_rejects_a_non_integer()
+    if type_errors_no_library() then return
+
+    val a = err("var s = \"hi\"\nprint(f\"${s}%d\")")
+    val b = err("print(f\"${3.5}%x\")")
+
+    assert(a.contains("format '%d' expects an integer, but the value has type string"), a)
+    assert(b.contains("format '%x' expects an integer"), b)
+
+@test("a float conversion rejects a non-float")
+te_a_float_format_conversion_rejects_a_non_float()
+    if type_errors_no_library() then return
+
+    val a = err("print(f\"${5}%f\")")
+
+    assert(a.contains("format '%f' expects a float, but the value has type int"), a)
+
+@test("a string conversion rejects a non-string")
+te_a_string_format_conversion_rejects_a_non_string()
+    if type_errors_no_library() then return
+
+    val a = err("print(f\"${5}%s\")")
+
+    assert(a.contains("format '%s' expects a string, but the value has type int"), a)
