@@ -588,6 +588,56 @@ the_entry_file_with_no_clause()
 
     assert_eq(complaints_of("val r: &int = 3\n\nprint(*r)\n").len(), usize(0))
 
+// -- what a module that gave up an environment capability may not reach ----------------------------
+
+// **`os` and `posix` gate which modules EXIST**, where `alloc` gates what a body may do -- so this
+// is asked of the module graph and reported at the reference that made the edge, which is the line
+// a reader has to change.
+
+private gated(of: string, cap: string, by: string) -> string =
+    s"this reaches '$of', which requires '$cap', and $by declared 'no $cap' — an environment " +
+    "capability gates which modules exist, so a module that gave one up may not reach one that " +
+    "needs it"
+
+@test("a module that gave up an environment capability may not reach one that needs it")
+a_gated_module_is_out_of_reach()
+    if checks_no_library() then return
+
+    val out = complaints_of("@no_os\n\nimport sysl.fs.exists\n\nprint(exists(\"/tmp\"))\n")
+
+    assert(says(out, gated("sysl.fs", "os", "this module")), listed_of(out))
+
+@test("and the module that gave it up is the one the refusal names")
+a_gated_module_names_the_module_that_narrowed()
+    if checks_no_library() then return
+
+    val out = complaints_of("module mm\n@no_os\n\nimport sysl.fs.exists\n\n" +
+                            "seen() -> bool = exists(\"/tmp\")\n")
+
+    assert(says(out, gated("sysl.fs", "os", "'mm'")), listed_of(out))
+
+@test("a requirement carries what comes with it, so 'no os' refuses a module requiring 'posix'")
+a_gated_module_is_refused_for_an_implied_capability()
+    if checks_no_library() then return
+
+    val out = complaints_of("@no_os\n\nimport sysl.posix.threads.spawn\n\nprint(1)\n")
+
+    assert(says(out, gated("sysl.posix.threads", "os", "this module")), listed_of(out))
+
+@test("a module reaching one that requires nothing is left alone")
+an_ungated_module_is_left_alone()
+    if checks_no_library() then return
+
+    assert_eq(complaints_of("@no_os\n\nimport sysl.text.split\n\nprint(split(\"a b\", \" \").len)\n")
+                  .len(),
+              usize(0))
+
+@test("and a module that gave nothing up may reach whatever it likes")
+a_module_that_narrowed_nothing_reaches_anything()
+    if checks_no_library() then return
+
+    assert_eq(complaints_of("import sysl.fs.exists\n\nprint(exists(\"/tmp\"))\n").len(), usize(0))
+
 // -- a member reached where its trait cannot be named ----------------------------------------------
 
 // **Visibility and scope are two questions and only the second is what an import changes.** Every

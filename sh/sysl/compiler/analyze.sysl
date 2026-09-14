@@ -130,7 +130,7 @@ private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
             // The path is a module and a name in it, so the edge is to the module half.
             val cut = last_dot_in(path)
 
-            if cut.is_some() then depends_on_module(a, scope.module_name, path[0..<cut.unwrap()])
+            if cut.is_some() then depends_on_module(a, scope, path[0..<cut.unwrap()], span)
 
             // **A declaration another file keeps to itself is refused where the import is
             // written**, rather than at whatever later names it: the clause is the mistake, and it
@@ -152,7 +152,7 @@ private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
     // **An import IS a dependency**, whether or not anything below it names what was brought in: a
     // file that writes the clause has said its module reaches the other one, and the graph is what
     // that statement is held to.
-    depends_on_module(a, scope.module_name, path)
+    depends_on_module(a, scope, path, span)
 
     for i in 0..<d.selectors.len()
         val s = d.selectors.at(i)
@@ -194,10 +194,17 @@ end names_a_declaration
 // and not one, and the edges OUT of the root are ordinary edges. A path that names no
 // module this compilation has files for is not an edge either -- an import may be written for one
 // that does not exist, and the diagnostic for that says so far better than a graph could.
-depends_on(a: &Analysis, from: string, key: string) = depends_on_module(a, from, module_of(key))
+depends_on(a: &Analysis, scope: Scope, key: string, span: Span) =
+    depends_on_module(a, scope, module_of(key), span)
 
 // The same, where the module is already known rather than read off a key.
-depends_on_module(a: &Analysis, from: string, to: string)
+//
+// **Where the reference was written is recorded beside the edge**, because a diagnostic about an
+// edge lands at the line that made it rather than anywhere either module states anything. A bare
+// name resolving to another module carries no span of its own, so such a reference records the file
+// and nothing more, and a later reference that does have one fills the position in.
+depends_on_module(a: &Analysis, scope: Scope, to: string, span: Span)
+    val from = scope.module_name
 
     if to == from || to == ModuleRoot || !a.tables.has_module(to) then return
 
@@ -205,18 +212,31 @@ depends_on_module(a: &Analysis, from: string, to: string)
         if a.tables.module_deps.at(i).0 == from
             val reached = a.tables.module_deps.at(i).1
 
-            if holds_string(reached, to) then return
+            if holds_string(reached, to)
+                if !span.is_empty() then position_edge(a, from, to, scope, span)
+                return
 
             var grown = reached
 
             grown.push(to)
             a.tables.module_deps.set(i, (from, grown))
+            a.tables.module_edges.push(ModuleEdge(from, to, scope, span))
             return
 
     var first: Buf[string] = buf()
 
     first.push(to)
     a.tables.module_deps.push((from, first))
+    a.tables.module_edges.push(ModuleEdge(from, to, scope, span))
+
+// Fills in the position of an edge already recorded, where the first reference to make it had none.
+private position_edge(a: &Analysis, from: string, to: string, scope: Scope, span: Span)
+    for i in 0..<a.tables.module_edges.len()
+        val e = a.tables.module_edges.at(i)
+
+        if e.from == from && e.to == to
+            if e.span.is_empty() then a.tables.module_edges.set(i, ModuleEdge(from, to, scope, span))
+            return
 
 // Whether this compilation has any declaration under a key, of any kind.
 declares(a: &Analysis, key: string) -> bool =
