@@ -152,6 +152,11 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
             a.tables.members.written_shapes.put(impl_key_of(key.unwrap(), h),
                                                 (home.label, block.overrides))
 
+    // Last of the checks about the block as a whole, because every one above it is more specific: a
+    // block with no home is often also one the library has already written, and being told which
+    // implementation already covers the type is the more useful half of that.
+    check_coherence(a, scope, span, block, home.label)
+
     if a.complaints() > before then return Impl(block, span, scope)
 
     // The first implementation of a trait for a type files its members under the names they were
@@ -899,3 +904,168 @@ private with_trait_defaults(tr: TraitDecl, im: MethodDecl) -> MethodDecl
     out.params = ps
     out
 end with_trait_defaults
+
+// Where an `impl` may be written: only in the module that declares the trait, or in one that
+// declares a type the block names (`reference/traits.md § Where an impl may live`).
+//
+// What the rule forbids is the block with no home -- a foreign trait implemented for a foreign
+// type, where two unrelated modules could each supply a different implementation and no rule picks
+// one.
+private check_coherence(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, label: string)
+    val here = whose_module(scope.module_name)
+    val declarer = declaring_whose(block.trait_name)
+    var roots: Buf[TypeRef] = buf()
+
+    roots.push(block.for_type)
+
+    for i in 0..<block.trait_args.len()
+        roots.push(block.trait_args.at(i))
+
+    val subject = subject_homes(a, scope, roots)
+
+    if here == declarer || holds_string(subject, here) then return
+
+    a.fault(scope, span,
+            "an 'impl' may be written only in the module that declares the trait or in one that " +
+            s"declares a type the block names, and '${module_show(block.trait_name)}' $declarer " +
+            s"while ${subject_phrase(subject, label, !block.trait_args.is_empty())} — so this one " +
+            "has no home. A trait of your own, or a type of your own in what it is written for or " +
+            "in the trait's arguments, gives it one")
+end check_coherence
+
+// What a diagnostic calls the library, which is named as a module rather than as the mechanism that
+// supplies it: a reader told a membership comes from the compiler goes looking for something they
+// cannot write, where the library is a module they can name and import.
+private library_whose() -> string = "is the library's"
+
+// What a diagnostic calls the module a declaration was written in.
+private whose_module(module_name: string) -> string
+    if starts_with_module(module_name, AutoImportedModule) then library_whose()
+    else if module_name == ModuleRoot then "is declared at the project root"
+    else s"is declared in module '$module_name'"
+
+// The same question asked of a key rather than of a module name.
+private declaring_whose(key: string) -> string = whose_module(module_of(key))
+
+// What the block names, and where those names live.
+//
+// **It names the subject where the block wrote no trait arguments, and the block where it did.** A
+// trait taking no arguments has nothing but the subject to name, so "nothing in `[]int` is declared
+// outside the library" is the whole truth and is the more useful half of it -- the reader is
+// looking at that type. A trait that *does* take arguments has two places a local name could have
+// gone, and a phrase naming only the `for` type would send a reader to the one the fix is less
+// likely to be in.
+private subject_phrase(homes: Buf[string], label: string, args: bool) -> string
+    val what = if args then "this block names" else s"in '$label'"
+
+    if homes.len() == 1 && homes.at(0) == library_whose() then
+        return s"nothing $what is declared outside the library"
+
+    val listed = joined_homes(homes)
+
+    if args then s"it names only what $listed" else s"'$label' names only what $listed"
+end subject_phrase
+
+// Every module the **subject** of an `impl` belongs to: its own where it is a declared type, and
+// every one its parts belong to where it is composed.
+//
+// A composed type is the module's when anything named in it is -- `[]Point` belongs where `Point`
+// does, `[]int` to nobody. Without that a module could not so much as print a slice of its own
+// struct, and the compiler's own advice ("write an `impl Display for []Point`") would name a block
+// the rule then refused.
+//
+// It reads the types **as written** rather than as resolved, because a generic subject has no one
+// instantiation to be: the arguments -- which are exactly what may carry a local type -- would be
+// lost with it.
+private subject_homes(a: &Analysis, scope: Scope, roots: Buf[TypeRef]) -> Buf[string]
+    var out: Buf[string] = buf()
+    var work: Buf[TypeRef] = buf()
+
+    for i in 0..<roots.len()
+        work.push(roots.at(i))
+
+    var at: usize = 0
+
+    while at < work.len()
+        val here = work.at(at)
+
+        at += 1
+
+        *here.kind match
+            NamedType(written, args) ->
+                val key = lookup_type_key(a, scope, written)
+                // A name nothing declares is a built-in, which has no module of its own and is the
+                // library's.
+                val home = if key.is_some() then declaring_whose(key.unwrap()) else library_whose()
+
+                if !holds_string(out, home) then out.push(home)
+
+                for i in 0..<args.len()
+                    work.push(args.at(i))
+            PtrType(inner) -> work.push(inner)
+            RefType(inner, _) -> work.push(inner)
+            WeakType(inner) -> work.push(inner)
+            VolatileType(inner) -> work.push(inner)
+            ArrayType(_, elem, _) -> work.push(elem)
+            VectorType(_, elem) -> work.push(elem)
+            // A projection's home is its subject's: `T::Item` is written wherever `T` is, and the
+            // type it names belongs to whoever implemented the trait rather than to whoever wrote
+            // this. An object's binding names a type like any other.
+            AssocType(base, _) -> work.push(base)
+            AssocArgType(_, typ) -> work.push(typ)
+            // A tuple has no declaration and so no module of its own; its parts may have one.
+            TupleType(parts, _) ->
+                if !holds_string(out, library_whose()) then out.push(library_whose())
+
+                for i in 0..<parts.len()
+                    work.push(parts.at(i))
+            // A function type is the library's `Fn` trait over its parts, and a function pointer
+            // belongs to no module -- either way the parts are what is asked.
+            FnType(params, ret, _) ->
+                if !holds_string(out, library_whose()) then out.push(library_whose())
+
+                for i in 0..<params.len()
+                    work.push(params.at(i))
+
+                work.push(ret)
+            CFnType(params, ret) ->
+                if !holds_string(out, library_whose()) then out.push(library_whose())
+
+                for i in 0..<params.len()
+                    work.push(params.at(i))
+
+                work.push(ret)
+            // A value names no type, so it declares nothing and gives a block no home; a pack is the
+            // block's own parameter, which is not a local type; and a `some` result stands in a
+            // member's result rather than in an `impl`'s subject.
+            _ ->
+                if !holds_string(out, library_whose()) then out.push(library_whose())
+
+    out
+end subject_homes
+
+// The phrases joined in a fixed order, so a block naming two modules reads the same way whichever
+// order the walk reached them in.
+private joined_homes(homes: Buf[string]) -> string
+    var sorted: Buf[string] = buf()
+
+    for i in 0..<homes.len()
+        sorted.push(homes.at(i))
+
+    for i in 0..<sorted.len()
+        for j in (i + 1)..<sorted.len()
+            if sorted.at(j) < sorted.at(i)
+                val t = sorted.at(i)
+
+                sorted.set(i, sorted.at(j))
+                sorted.set(j, t)
+
+    var text = ""
+
+    for i in 0..<sorted.len()
+        if i > 0 then text = s"$text and "
+
+        text = s"$text${sorted.at(i)}"
+
+    text
+end joined_homes
