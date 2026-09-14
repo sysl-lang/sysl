@@ -461,6 +461,101 @@ private each_view_parts(e: *Emit, seq: TExpr) -> (Val, Val)
     (p, l)
 end each_view_parts
 
+// `for all` / `for some` over a range: a walk that stops at the first element to settle the answer,
+// with the answer itself held in a slot so both exits read one place.
+//
+// **The predicate's temporaries are released per iteration**, which is what `push_temps` is doing
+// here: a condition that allocates on its way to a `bool` would otherwise accumulate one allocation
+// per element in the enclosing statement's region, and the region is not the loop's to keep.
+//
+// This is not `gen_for` with a different body. A quantifier carries no `break`, no `else` and no
+// label, so it registers no `GenLoop` -- a `break` written inside a predicate belongs to whatever
+// loop encloses the quantifier, which is what the reader of that line means.
+gen_quantifier(e: *Emit, universal: bool, name: string, var_ty: Type, lo: TExpr, hi: TExpr,
+               inclusive: bool, pred: TExpr) -> Val
+    val w = lty(e, var_ty)
+    val lo_v = gen_expr(e, lo)
+    val hi_v = gen_expr(e, hi)
+    val cond_l = fresh_label(e, "quant.cond")
+    val body_l = fresh_label(e, "quant.body")
+    val step_l = fresh_label(e, "quant.step")
+    val done_l = fresh_label(e, "quant.done")
+    val end_l = fresh_label(e, "quant.end")
+    val acc = alloca(e, fresh_reg(e), l_i1())
+
+    emit(e, InStore(l_i1(), VInt(from_int(if universal then 1 else 0)), acc, AccPlain, None))
+    alloca(e, VReg(s"$name.addr"), w)
+    emit(e, InStore(w, lo_v, VReg(s"$name.addr"), AccPlain, None))
+    emit_term(e, InBr(cond_l))
+    emit_label(e, cond_l)
+
+    val iv = fresh_reg(e)
+
+    emit(e, InLoad(iv, w, VReg(s"$name.addr"), AccPlain, None))
+
+    val cmp = fresh_reg(e)
+
+    emit(e, InIntCmp(cmp, int_pred(e, if inclusive then "<=" else "<", underlying(var_ty)), w, iv,
+                     hi_v))
+    emit_term(e, InCondBr(cmp, body_l, end_l))
+    emit_label(e, body_l)
+    push_temps(e)
+
+    val p = gen_expr(e, pred)
+
+    pop_temps(e)
+
+    // A true predicate continues a `for all` and settles a `for some`; a false one does the reverse.
+    if universal then emit_term(e, InCondBr(p, step_l, done_l))
+    else emit_term(e, InCondBr(p, done_l, step_l))
+
+    emit_label(e, done_l)
+    emit(e, InStore(l_i1(), VInt(from_int(if universal then 0 else 1)), acc, AccPlain, None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, step_l)
+
+    val cur = fresh_reg(e)
+
+    emit(e, InLoad(cur, w, VReg(s"$name.addr"), AccPlain, None))
+
+    // The same wrap `gen_for` guards against, at the same place and for the same reason: without
+    // this, `for all i in 0..255u8 do p` never finishes, and a quantifier that does not finish is
+    // worse than a loop that does not -- it is a *question* the program hangs on.
+    if inclusive
+        val done = fresh_reg(e)
+        val more = fresh_label(e, "quant.more")
+
+        emit(e, InIntCmp(done, int_pred(e, "==", underlying(var_ty)), w, cur, hi_v))
+        emit_term(e, InCondBr(done, end_l, more))
+        emit_label(e, more)
+
+    val nxt = fresh_reg(e)
+
+    emit(e, InBin(nxt, OpAdd, w, cur, VInt(from_int(1))))
+    emit(e, InStore(w, nxt, VReg(s"$name.addr"), AccPlain, None))
+    emit_term(e, InBr(cond_l))
+    emit_label(e, end_l)
+
+    val res = fresh_reg(e)
+
+    emit(e, InLoad(res, l_i1(), acc, AccPlain, None))
+    res
+end gen_quantifier
+
+// A `while` carrying a `variant`: the two slots the measure is compared through, set up where the
+// loop is entered rather than in the function's prologue.
+//
+// The `armed` flag starts false, which is what lets the first iteration pass with nothing to compare
+// against. It is stored **here** because a loop nested inside another is entered many times: a flag
+// armed once per call would compare the second entry's first measure against the first entry's last,
+// and trap on a loop that was decreasing perfectly well.
+gen_checked_loop(e: *Emit, slot: string, var_ty: Type, loop_expr: TExpr) -> Val
+    alloca(e, VReg(s"$slot.prev"), lty(e, var_ty))
+    alloca(e, VReg(s"$slot.armed"), l_i1())
+    emit(e, InStore(l_i1(), VInt(from_int(0)), VReg(s"$slot.armed"), AccPlain, None))
+    gen_expr(e, loop_expr)
+end gen_checked_loop
+
 // The counted loop.
 //
 // **An inclusive one stops at its bound rather than stepping past it**, and that is not a nicety: at

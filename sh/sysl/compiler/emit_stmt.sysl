@@ -56,6 +56,7 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
     TMultiAssign(writes) -> gen_multi_assign(e, writes)
 
     TReturn(opt) -> gen_return(e, opt)
+    TBecome(call) -> gen_become(e, call)
 
     // A `break`/`continue` leaves the body from the middle, so it unwinds the body's ownership
     // regions before jumping -- the same discipline as `return`, bounded to the loop. `break v`
@@ -86,10 +87,12 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
     TDefer(stmts) -> defer_stmts(e, stmts)
 
     // A loop's `invariant` is a condition that traps on false, which is every other clause the
-    // verification chapter states.
-    TInvariant(cond, _) -> emit_contract(e, cond, "invariant")
+    // verification chapter states -- unless it names a `@ghost` function, in which case it states a
+    // proof obligation and there is nothing to lay down.
+    TInvariant(cond, _) -> if !ghostly(e, cond) then emit_contract(e, cond, "invariant")
 
-    TVariantCheck(slot, var_ty, expr) -> gen_variant_check(e, slot, var_ty, expr)
+    TVariantCheck(slot, var_ty, expr) ->
+        if !ghostly(e, expr) then gen_variant_check(e, slot, var_ty, expr)
 
     // One architecture's instructions arrived here; the arms that answered for the others were
     // chosen between in the analyzer and are not represented.
@@ -138,11 +141,11 @@ gen_into(e: *Emit, dest: Val, x: TExpr)
             // A result already arrives with its count taken, and the out-pointer is what says where.
             // This is the case the whole mechanism is for: `val k = kernel()` writes the callee's
             // work straight into `k`'s slot, and no aggregate is ever an LLVM value.
-            if !is_foreign(e, name) && !is_variadic(e, name)
+            if !is_foreign(e, name)
                 var arg_vals: Buf[IrArg] = buf()
+                val staged = staged_args(e, args, &arg_vals)
 
-                for i in 0..<args.len()
-                    arg_value(e, args.at(i), &arg_vals)
+                if checks_variant(e, name) then gen_variant_at_call(e, staged)
 
                 gen_sysl_call_into(e, VGlobal(symbol_of(e, name)), arg_vals, ty, Some(dest),
                                    variadic_type_of(e, name))
@@ -435,7 +438,177 @@ private gen_return(e: *Emit, opt: Option[TExpr])
             emit_term(e, InRet(None, None))
 end gen_return
 
+// `become f(…)` -- the call is emitted with `musttail`, and the `ret` it requires goes with it.
+//
+// **The order is the tail self-call's, for the same reason and one step further.** Each argument is
+// computed while the frame is still whole; only then does the frame give up everything it holds; only
+// then does the call happen. What the self-jump does after that is store into its own parameter slots
+// and branch, because the frame is being reused; what this does is hand the arguments to a
+// **different** function, whose frame replaces this one.
+//
+// **Nothing is retained here and that is a rule rather than an omission.** A callee takes its own
+// count on every parameter at entry, so a retain on this side would be a second count nobody
+// releases. What makes the release below safe without one is the restriction the analyzer holds a
+// `become` to: no parameter carries a count at all, so there is nothing in the frame the release
+// could free that an argument still names.
+//
+// **`musttail` and the `ret` are one instruction as far as a reader is concerned** -- LLVM refuses a
+// `musttail` that is not immediately followed by a return of its own result -- so both are emitted
+// here rather than left to whatever comes next.
+private gen_become(e: *Emit, call: TExpr)
+    val ty = texpr_type(call)
+
+    var arg_vals: Buf[IrArg] = buf()
+    var what = plain_form(LVoid)
+    var callee: Val = VNothing
+    var found = false
+
+    *call.kind match
+        TCall(name, args, cty, _) ->
+            val form = call_form_of(e, name, cty)
+
+            for i in 0..<args.len()
+                arg_value(e, args.at(i), &arg_vals)
+
+            what = form
+            callee = VGlobal(symbol_of(e, name))
+            found = true
+        TCallPtr(fn, args, _, cty) ->
+            val v = gen_expr(e, fn)
+
+            for i in 0..<args.len()
+                arg_value(e, args.at(i), &arg_vals)
+
+            what = sysl_result_form(e, cty)
+            callee = v
+            found = true
+        _ -> ()
+
+    if !found
+        gap_here(e, "a 'become' of something that is not a call")
+        return
+    end if
+
+    release_all(e)
+
+    if no_value(ty)
+        emit(e, InCall(None, what.ret, callee, arg_vals, what.ret_attrs, what.whole, no_fast_math(),
+                       true))
+        emit_term(e, InRet(None, None))
+    else
+        val r = fresh_reg(e)
+
+        emit(e, InCall(Some(r), what.ret, callee, arg_vals, what.ret_attrs, what.whole,
+                       no_fast_math(), true))
+        emit_term(e, InRet(Some(lty(e, ty)), Some(r)))
+end gen_become
+
+// What a call to a named callee states as its result, and the whole function type where the callee's
+// parameter list is open at the end. A foreign result may be named by a type the sysl signature never
+// mentions; a sysl one may be `void` where the value comes back through an out-parameter.
+private call_form_of(e: *Emit, name: string, ty: Type) -> CallForm
+    val form = if is_foreign(e, name) then foreign_result(e, ty) else sysl_result_form(e, ty)
+
+    CallForm(form.ret, form.ret_attrs, variadic_type_of(e, name))
+end call_form_of
+
 // -- contracts ---------------------------------------------------------------------------------------
+
+// Whether a clause is a proof obligation rather than something to lay down: it names a `@ghost`
+// function, which will not be there.
+//
+// The question is asked of the **whole** clause rather than of the part that mentions the ghost,
+// because a clause is one condition -- half of a conjunction is not a condition anybody wrote.
+ghostly(e: *Emit, x: TExpr) -> bool
+    if e.ghost_funcs.is_empty() then return false
+
+    var hits: Buf[bool] = buf()
+    val sink = &hits
+    val named = e.ghost_funcs
+
+    walk_texpr(x, expr_walk(true, k -> note_ghost_call(sink, named, k)))
+    !hits.is_empty()
+end ghostly
+
+private note_ghost_call(sink: *Buf[bool], ghost: Buf[string], x: TExpr)
+    *x.kind match
+        TCall(name, _, _, _) -> if holds_string(ghost, name) then sink.push(true)
+        _ -> ()
+
+// Whether a call to `name` is the self-call a `variant` is checked at.
+checks_variant(e: *Emit, name: string) -> bool =
+    e.self_variant.is_some() && name == e.self_name
+
+// The measure check at a direct recursive call.
+//
+// **It reads no state and threads nothing through the call**, which is what the restriction of a
+// function's `variant` to its parameters buys. The arguments about to be passed are the values the
+// parameters are about to hold, so the "next" measure is this same expression evaluated with those
+// values in the parameters' own slots: take the measure as it stands, put the arguments in, take it
+// again, put the parameters back, and compare. Nothing is retained or released across the swap --
+// the slots end holding exactly what they held -- so the ownership bookkeeping is untouched.
+//
+// `staged` is in step with the parameters and carries what each argument came out as, which is the
+// shape both call paths already produce: an address for a large value, a register for the rest, and
+// nothing at all for a zero-sized parameter.
+gen_variant_at_call(e: *Emit, staged: Buf[(int, Val)])
+    val variant = e.self_variant.unwrap()
+
+    push_temps(e)
+
+    val cur = gen_expr(e, variant)
+
+    pop_temps(e)
+
+    // Every save is laid down before any argument lands, since a measure over two parameters must
+    // see both of the call's values and neither of the frame's.
+    var saved: Buf[(string, Type, Val)] = buf()
+
+    for i in 0..<e.self_params.len()
+        val p = e.self_params.at(i)
+        val s = staged.at(i)
+
+        if s.0 != StagedNothing
+            val w = lty(e, p.1)
+            val keep = alloca(e, fresh_reg(e), w)
+            val addr = VReg(s"${p.0}.addr")
+
+            if s.0 == StagedSlot
+                emit_memcpy(e, keep, addr, int(e.layout.size(p.1)), int(e.layout.align(p.1)))
+                emit_memcpy(e, addr, s.1, int(e.layout.size(p.1)), int(e.layout.align(p.1)))
+            else
+                val old = fresh_reg(e)
+
+                emit(e, InLoad(old, w, addr, AccPlain, None))
+                emit(e, InStore(w, old, keep, AccPlain, None))
+                emit(e, InStore(w, s.1, addr, AccPlain, None))
+
+            saved.push((p.0, p.1, keep))
+
+    push_temps(e)
+
+    val nxt = gen_expr(e, variant)
+
+    pop_temps(e)
+
+    for i in 0..<saved.len()
+        val sv = saved.at(i)
+        val addr = VReg(s"${sv.0}.addr")
+
+        if e.layout.indirect(sv.1)
+            emit_memcpy(e, addr, sv.2, int(e.layout.size(sv.1)), int(e.layout.align(sv.1)))
+        else
+            val back = fresh_reg(e)
+
+            emit(e, InLoad(back, lty(e, sv.1), sv.2, AccPlain, None))
+            emit(e, InStore(lty(e, sv.1), back, addr, AccPlain, None))
+
+    val vty = texpr_type(variant)
+    val ok = fresh_reg(e)
+
+    emit(e, InIntCmp(ok, int_pred(e, "<", underlying(vty)), lty(e, vty), nxt, cur))
+    trap_unless(e, ok, "variant")
+end gen_variant_at_call
 
 // A clause that traps on false, which is what every contract clause is at run time. The condition's
 // own temporaries are given back before the trap, so the checked path stays leak-free.
@@ -465,7 +638,13 @@ end emit_ensures
 // type.
 private gen_variant_check(e: *Emit, slot: string, var_ty: Type, expr: TExpr)
     val w = lty(e, var_ty)
+
+    push_temps(e)
+
     val cur = gen_expr(e, expr)
+
+    pop_temps(e)
+
     val armed_v = fresh_reg(e)
 
     emit(e, InLoad(armed_v, l_i1(), VReg(s"$slot.armed"), AccPlain, None))

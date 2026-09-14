@@ -40,6 +40,11 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
     record_symbols(e, p)
     set_promotions(e, pr)
 
+    // The `@ghost` functions of this program, read once: nothing emitted may name one, and a clause
+    // that does is dropped whole rather than laid down against a symbol that will not be there.
+    for i in 0..<p.funcs.len()
+        if p.funcs.at(i).ghost then e.ghost_funcs.push(p.funcs.at(i).name)
+
     var funcs: Buf[IrFunc] = buf()
     var gaps: Buf[(string, string)] = buf()
 
@@ -321,6 +326,13 @@ private record_symbols(e: *Emit, p: TProgram)
             Some(sym) -> e.export_symbols.push((f.name, sym))
             None -> ()
 
+        // A sysl definition's tail is named the way a foreign one's is: a call to it names the whole
+        // function type, since the argument list alone does not say where the declared parameters
+        // stop and the ellipsis begins.
+        if f.variadic
+            e.variadics.push(f.name)
+            e.variadic_types.push((f.name, sysl_fn_type(e, f.ret_ty, f.params, true, None)))
+
     // **A symbol C has claimed is not available to a sysl definition.** A key is normally
     // `module$name`, which no exported symbol can be -- `$` is not a C identifier character. A
     // function in the **root** module has no such qualification, so its key *is* the bare name, and
@@ -428,6 +440,21 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         write_params.push(ir_param(LPtr))
         write_params.push(ir_param(word_lty(e)))
         out.push(ir_sig("write", ir_fn_type(word_lty(e), write_params)))
+
+    // The varargs walk: the pair a `...` body always writes, and the duplication it may not.
+    if e.uses_varargs
+        var walk_params: Buf[IrParam] = buf()
+
+        walk_params.push(ir_param(LPtr))
+        out.push(ir_sig(llvm_va_start(), ir_fn_type(LVoid, walk_params)))
+        out.push(ir_sig(llvm_va_end(), ir_fn_type(LVoid, walk_params)))
+
+    if e.uses_va_copy
+        var dup_params: Buf[IrParam] = buf()
+
+        dup_params.push(ir_param(LPtr))
+        dup_params.push(ir_param(LPtr))
+        out.push(ir_sig(llvm_va_copy(), ir_fn_type(LVoid, dup_params)))
 
     if e.uses_memcpy
         var copy_params: Buf[IrParam] = buf()
