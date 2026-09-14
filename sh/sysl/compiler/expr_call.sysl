@@ -124,6 +124,17 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                 return cx.err(span, s"'$written' takes no type arguments")
             end if
 
+            // `Buf[4](1)` -- a constructor at the instantiation the reader named. Brackets on a
+            // **type** are a type application wherever they are written, and this is the one place
+            // a call carries them for a type rather than for a function.
+            if name.is_some() && cx.lookup(name.unwrap()).is_none() &&
+               lookup_type_key(cx.an, cx.scope, name.unwrap()).is_some()
+                var one_targ: Buf[Expr] = buf()
+
+                one_targ.push(one)
+                return applied_type_call(cx, span, name.unwrap(), one_targ, args, expected)
+            end if
+
             cx.err(span, "this is not something that can be called")
         // `.Circle(5)` -- the form below with the enum's own name left off, resolved against what
         // the context expects.
@@ -186,7 +197,7 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             // **The receiver is handed over as it stands.** A call reaches through one level of
             // indirection and only one, exactly as selection does, and what is left after that is a
             // type the reader never wrote -- so the lookup sees the mode and the message can name it.
-            call_member(cx, span, tr, member, args, expected)
+            call_member(cx, span, tr, member, args, expected, receiver_bound(cx, receiver))
         _ -> cx.err(span, "this is not something that can be called")
 end call_expr
 
@@ -202,8 +213,33 @@ private written_call(cx: &Analyzer, span: Span, head: Expr, targs: Buf[Expr], ar
 
     if name.is_none() then return cx.err(span, "this is not something that can be called")
 
+    // A type wearing the same brackets: `Pair[int, string](1, "a")` names its instantiation as
+    // plainly as an annotation on what receives it would.
+    if cx.lookup(name.unwrap()).is_none() && !names_a_function(cx, name.unwrap()) &&
+       lookup_type_key(cx.an, cx.scope, name.unwrap()).is_some() then
+        return applied_type_call(cx, span, name.unwrap(), targs, args, expected)
+
     written_generic_call(cx, span, name.unwrap(), targs, args, expected)
 end written_call
+
+// A type application in call position: the type's own arguments are what the reader wrote, and what
+// is called is the constructor those arguments name.
+private applied_type_call(cx: &Analyzer, span: Span, name: string, targ_exprs: Buf[Expr],
+                          args: Buf[Expr], expected: Option[Type]) -> TExpr
+    val key = lookup_type_key(cx.an, cx.scope, name).unwrap()
+    var targs: Buf[Type] = buf()
+
+    for i in 0..<targ_exprs.len()
+        targs.push(written_type_arg(cx, targ_exprs.at(i)))
+
+    cx.an.tables.types.get(key).unwrap().kind match
+        StructOf(_) -> struct_call(cx, span, key, name, args, expected, targs)
+        _ -> cx.err(span, "this is not something that can be called")
+end applied_type_call
+
+// No written list at all, named so that a default argument can say which kind of run of types it
+// means.
+no_written_targs() -> Buf[Type] = buf()
 
 private module_path_of(receiver: Expr, name: string) -> Option[string] = *receiver.kind match
     Ident(head) -> Some(s"$head.$name")
@@ -508,7 +544,7 @@ end encode_string
 
 // A struct's name in call position is its positional constructor.
 private struct_call(cx: &Analyzer, span: Span, key: string, written: string, args: Buf[Expr],
-                    expected: Option[Type]) -> TExpr
+                    expected: Option[Type], named_targs: Buf[Type] = no_written_targs()) -> TExpr
     val decl = cx.an.tables.types.get(key)
     var sd: Option[StructDecl] = None
 
@@ -523,7 +559,11 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
     // out what it is being built at -- from the type the position expects where that says, and from
     // the values otherwise.
     if sd.is_some() && !sd.unwrap().tparams.is_empty()
-        val targs = struct_targs(cx, span, key, decl.unwrap().scope, sd.unwrap(), args, expected)
+        // **A written list is the answer and nothing is inferred**, which is the whole of why a
+        // reader writes one: `Buf[4](1)` says which instantiation where neither the values nor what
+        // receives them could.
+        val targs = if !named_targs.is_empty() then named_targs
+        else struct_targs(cx, span, key, decl.unwrap().scope, sd.unwrap(), args, expected)
 
         reinstantiate(cx.an, key, targs) match
             Struct(d) -> inst = Some(Struct(d))
