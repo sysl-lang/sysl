@@ -101,6 +101,7 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
     // How far each declaration reaches is settled after them, since the question is about two
     // declarations at a time -- and because a signature naming something the file may not reach is
     // told that outright rather than told it is more visible than what it names.
+    check_const_scalars(a)
     check_exposed_types(a)
 
     // Then the members: every type's own, and the ones an `impl` block gives it. It runs after the
@@ -524,6 +525,49 @@ private self_type(a: &Analysis, scope: Scope, owner: string, tparams: Buf[string
         _ -> Unknown
 end self_type
 
+// -- what a constant may be --------------------------------------------------------------------
+
+// **A constant is a scalar**, so the three declaration forms that are not one are refused here,
+// which is a step before anything asks how far the type reaches. A transparent subtype is a scalar
+// and is the one form that goes on to be asked that.
+private check_const_scalars(a: &Analysis)
+    for i in 0..<a.tables.consts.len()
+        val v = a.tables.consts.at(i)
+
+        if v.typ.is_some() then
+            val t = v.typ.unwrap()
+
+            *t.kind match
+                NamedType(name, _) -> check_const_named(a, v, t.span, name)
+                _ -> ()
+
+private check_const_named(a: &Analysis, v: ValueDecl, span: Span, written: string)
+    val key = lookup_type_key(a, v.scope, written)
+
+    if key.is_none() then return
+
+    val decl = a.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return
+
+    // The two halves of the rule read differently: a struct is **storage**, and is told which
+    // keyword holds it, where an enum is simply not a scalar.
+    decl.unwrap().kind match
+        StructOf(_) ->
+            a.fault(v.scope, span,
+                    s"a constant is a scalar, and $written is storage — write '${v.name}' as a " +
+                    "'val', which is laid into the object file as constant data")
+        EnumOf(_) -> a.fault(v.scope, span, s"a constant is a scalar, and $written is not — " +
+                             s"'${v.name}'")
+        TypeOf(d) ->
+            if d.derived then
+                a.fault(v.scope, span,
+                        s"'${v.name}' is declared $written, which is a 'new' type — reaching one " +
+                        "from its base is a written conversion, and a constant is the value it is " +
+                        "written as, so there is nowhere here to write it")
+        _ -> ()
+end check_const_named
+
 // -- how far a signature may reach ---------------------------------------------------------------
 
 // A declaration may not be more visible than the types it names.
@@ -535,36 +579,116 @@ private check_exposed_types(a: &Analysis)
     for i in 0..<a.tables.funcs.len()
         val f = a.tables.funcs.at(i)
 
-        if !is_private_reach(f.decl.vis) then
-            for j in 0..<f.decl.params.len()
-                val p = f.decl.params.at(j)
+        check_exposed_signature(a, f.scope, f.decl.name, f.decl.vis, f.decl.params, f.decl.ret_type,
+                                f.decl.bounds, f.decl.tparams)
 
-                check_exposed(a, f.scope, f.decl.name, f.decl.vis, s"parameter '${p.name}'", p.typ,
-                              f.decl.tparams)
+    // **An `extern` is held to the rule all the same**: what the linker resolves is beside the
+    // point, since the hole is a module holding a value whose type it cannot write.
+    for i in 0..<a.tables.externs.len()
+        val key = a.tables.externs.key_at(i)
+        val d = a.tables.externs.get(key).unwrap()
 
-            if f.decl.ret_type.is_some() then
-                check_exposed(a, f.scope, f.decl.name, f.decl.vis, "its result",
-                              f.decl.ret_type.unwrap(), f.decl.tparams)
+        check_exposed_signature(a, scope_of_key(a, key), d.name, d.vis, d.params, d.ret_type, buf(),
+                                buf())
+
+    // The declarations that are a **name and one type**. They carry no signature, so the hole is
+    // reached by a shorter route than a function's, and it is the same hole. A `const` cannot
+    // ordinarily get this far -- a constant is a scalar and every scalar is a builtin nobody may
+    // restrict -- but a transparent subtype is one, so it is asked like the other two rather than
+    // left to a widening of what a constant may hold to quietly reopen this.
+    check_exposed_storage(a, a.tables.consts)
+    check_exposed_storage(a, a.tables.vals)
+    check_exposed_storage(a, a.tables.extern_vars)
 
     for i in 0..<a.tables.types.len()
         val decl = a.tables.types.at(i)
 
         decl.kind match
             StructOf(d) ->
-                if !is_private_reach(d.vis) then
-                    for j in 0..<d.fields.len()
-                        val f = d.fields.at(j)
+                for j in 0..<d.fields.len()
+                    val f = d.fields.at(j)
 
-                        // **A field of its own may be private**, and one that is reaches exactly as
-                        // far as the type it names -- so there is nothing here to find.
-                        if !is_private_reach(f.vis) then
-                            check_exposed(a, decl.scope, d.name, d.vis, s"the field '${f.name}'",
-                                          f.typ, d.tparams)
+                    // **A field carries its own reach**, so it is named as one and asked at its
+                    // own -- a private field reaches exactly as far as the type it names, and there
+                    // is nothing there to find.
+                    check_exposed(a, decl.scope, s"${d.name}.${f.name}", member_reach(d.vis, f.vis),
+                                  "its type", f.typ, d.tparams)
+
+                check_exposed_members(a, decl.scope, d.name, d.vis, d.members, d.tparams)
+            EnumOf(d) ->
+                for j in 0..<d.variants.len()
+                    val v = d.variants.at(j)
+
+                    for k in 0..<v.fields.len()
+                        val f = v.fields.at(k)
+
+                        check_exposed(a, decl.scope, d.name, d.vis,
+                                      s"the '${f.name}' of variant '${v.name}'", f.typ, d.tparams)
+
+                check_exposed_members(a, decl.scope, d.name, d.vis, d.members, d.tparams)
+            TraitOf(d) -> check_exposed_members(a, decl.scope, d.name, d.vis, d.methods, d.tparams)
             _ -> ()
+end check_exposed_types
 
 private is_private_reach(v: Visibility) -> bool = v match
     File -> true
     _ -> false
+
+// **A member carries no modifier of its own**, so it is as visible as the type it belongs to; one
+// that says something of its own is held to that instead.
+private member_reach(owner: Visibility, own: Visibility) -> Visibility = own match
+    Public -> owner
+    _ -> own
+
+private check_exposed_storage(a: &Analysis, from: &Table[ValueDecl])
+    for i in 0..<from.len()
+        val v = from.at(i)
+
+        if !is_private_reach(v.vis) && v.typ.is_some() then
+            check_exposed(a, v.scope, v.name, v.vis, "its type", v.typ.unwrap(), buf())
+
+private check_exposed_members(a: &Analysis, scope: Scope, owner: string, owner_vis: Visibility,
+                              ms: Buf[MethodDecl], tparams: Buf[string])
+    for i in 0..<ms.len()
+        val m = ms.at(i)
+        var skip: Buf[string] = buf()
+
+        for j in 0..<tparams.len()
+            skip.push(tparams.at(j))
+
+        for j in 0..<m.tparams.len()
+            skip.push(m.tparams.at(j))
+
+        check_exposed_signature(a, scope, s"$owner.${m.name}", member_reach(owner_vis, m.vis),
+                                m.params, m.ret_type, m.bounds, skip)
+end check_exposed_members
+
+// **A bound is part of what a caller has to satisfy**, so a trait it cannot name leaves it unable to
+// say what the declaration is asking of it -- which makes a bound a name the signature carries.
+private check_exposed_signature(a: &Analysis, scope: Scope, label: string, vis: Visibility,
+                                params: Buf[Param], ret: Option[TypeRef], bounds: Buf[NamedBounds],
+                                skip: Buf[string])
+    if is_private_reach(vis) then return
+
+    for i in 0..<params.len()
+        val p = params.at(i)
+
+        check_exposed(a, scope, label, vis, s"parameter '${p.name}'", p.typ, skip)
+
+    if ret.is_some() then check_exposed(a, scope, label, vis, "its result", ret.unwrap(), skip)
+
+    for i in 0..<bounds.len()
+        val nb = bounds.at(i)
+        val what = s"the bound on '${nb.name}'"
+
+        for j in 0..<nb.bounds.len()
+            val b = nb.bounds.at(j)
+
+            check_exposed_name(a, scope, label, vis, what, b.name, b.span, skip)
+
+            for k in 0..<b.args.len()
+                check_exposed(a, scope, label, vis, what, b.args.at(k), skip)
+end check_exposed_signature
 
 private check_exposed(a: &Analysis, scope: Scope, label: string, vis: Visibility, what: string,
                       t: TypeRef, skip: Buf[string])
@@ -573,24 +697,66 @@ private check_exposed(a: &Analysis, scope: Scope, label: string, vis: Visibility
     names_in(&names, t, skip)
 
     for i in 0..<names.len()
-        val key = lookup_type_key(a, scope, names.at(i).0)
+        check_exposed_name(a, scope, label, vis, what, names.at(i).0, names.at(i).1, skip)
 
-        if key.is_some() && !reachable_key(a, key.unwrap(), scope_of_key(a, key.unwrap())) then ()
+private check_exposed_name(a: &Analysis, scope: Scope, label: string, vis: Visibility, what: string,
+                           name: string, span: Span, skip: Buf[string])
+    // **A file-private declaration owes nothing here**: it reaches one file, and every type it names
+    // is visible there or the signature would not have resolved. It is asked at this end rather than
+    // at each caller's, since a field and a piece of module storage arrive with no signature.
+    if is_private_reach(vis) || holds(skip, name) then return
 
-        if key.is_some() then
-            val acc = a.tables.access.get(key.unwrap())
+    val key = lookup_type_key(a, scope, name)
 
-            if acc.is_some() && is_private_reach(acc.unwrap().vis) then
-                a.fault(scope, names.at(i).1,
-                        s"'$label' is ${reach_phrase(vis)}, but $what names " +
-                        s"'${module_show(key.unwrap())}', which is " +
-                        s"${private_to_phrase(acc.unwrap().file)} — a declaration may not be more " +
-                        "visible than the types it names")
+    if key.is_none() then return
+
+    // **A name the declaration cannot reach at all is one mistake, not two** -- it is refused where
+    // it is written, and saying a second time that the signature is too visible for it would be a
+    // second complaint about the same word.
+    if !reachable_key(a, key.unwrap(), scope) then return
+
+    val acc = a.tables.access.get(key.unwrap())
+
+    if acc.is_none() || reaches_as_far(vis, scope.module_name, acc.unwrap()) then return
+
+    a.fault(scope, span,
+            s"'$label' is ${reach_phrase(vis)}, but $what names '${module_show(key.unwrap())}', " +
+            s"which is ${no_further_than(acc.unwrap())} — a declaration may not be more visible " +
+            "than the types it names")
+end check_exposed_name
+
+// Whether every reader of a declaration at this reach is also a reader of a type at that one. The
+// file level is not asked: a file-private declaration is read in one file, and every type it names
+// is visible there or the signature would not have resolved.
+private reaches_as_far(vis: Visibility, in_module: string, acc: Access) -> bool = acc.vis match
+    Public -> true
+    File -> false
+    Scoped(name) ->
+        val top = widened_to(acc.module_name, name)
+
+        // A scope naming nothing is refused where it is written, and the declaration it was written
+        // on still stands: one mistake is one diagnostic.
+        if top.is_none() then return true
+
+        vis match
+            Scoped(mine) ->
+                val from = widened_to(in_module, mine)
+
+                from.is_none() || beneath(from.unwrap(), top.unwrap())
+            _ -> false
 
 private reach_phrase(v: Visibility) -> string = v match
     Public -> "public"
     Scoped(m) -> s"visible throughout module '$m'"
     File -> "private"
+
+// The two levels read differently: the file form names the file, the wider one the module it
+// widened to.
+private no_further_than(acc: Access) -> string = acc.vis match
+    Scoped(name) -> widened_to(acc.module_name, name) match
+        None -> private_to_phrase(acc.file)
+        Some(m) -> s"private to module '$m'"
+    _ -> private_to_phrase(acc.file)
 
 private private_to_phrase(file: string) -> string = s"private to '$file', the file that declares it"
 

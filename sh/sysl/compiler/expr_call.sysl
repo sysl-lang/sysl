@@ -953,6 +953,16 @@ end qualified_variant
 
 // -- a call of a declared function ----------------------------------------------------------------
 
+// The key of a variant the standard module declares and keeps to itself, where a bare name reached
+// nothing else. It is the enum's reach the variant is held to, which `access_for` already answers.
+private library_variant(cx: &Analyzer, written: string) -> Option[string]
+    val key = module_qualify(AutoImportedModule, written)
+
+    if enum_of_variant(cx.an, key).is_none() || reachable_key(cx.an, key, cx.scope) then return None
+
+    Some(key)
+end library_variant
+
 // The keys the declarations of one written name are filed under, in the reader's own terms.
 function_keys(cx: &Analyzer, written: string) -> Buf[string]
     val found = function_keys_of(cx, written)
@@ -996,11 +1006,23 @@ private function_keys_of(cx: &Analyzer, written: string) -> Buf[string]
 
     if !mine.is_empty() then return mine
 
+    // **THE LIBRARY IS THE ONE WILDCARD WHOSE RESTRICTION IS REPORTED.** It is reached without an
+    // import and searched after everything else, so a bare name that resolved is a name nothing
+    // questioned -- and where the standard module is what declares the spelling and keeps it,
+    // saying so is a better answer than saying the name does not exist. Every other wildcard offers
+    // only what the reader may name, so a name it keeps is simply not there: `import geom.*` over a
+    // helper `geom` keeps answers `undefined function`, which is the reference's own answer.
+    var kept: Option[string] = None
+
     for i in 0..<cx.scope.imports.wildcards.len()
-        val key = module_qualify(cx.scope.imports.wildcards.at(i), written)
+        val at = cx.scope.imports.wildcards.at(i)
+        val key = module_qualify(at, written)
         val set = overload_keys(cx.an, key)
 
-        if !set.is_empty() && reachable_key(cx.an, set.at(0), cx.scope) then return set
+        if !set.is_empty()
+            if reachable_key(cx.an, set.at(0), cx.scope) then return set
+
+            if at == AutoImportedModule && kept.is_none() then kept = Some(key)
 
     // A written module path is already a key.
     val dotted = overload_keys(cx.an, written)
@@ -1029,7 +1051,11 @@ private function_keys_of(cx: &Analyzer, written: string) -> Buf[string]
         if !set.is_empty() then return set
     end if
 
-    overload_keys(cx.an, here)
+    val last = overload_keys(cx.an, here)
+
+    if !last.is_empty() || kept.is_none() then return last
+
+    overload_keys(cx.an, kept.unwrap())
 end function_keys_of
 
 // Every key a written **dotted** path could name, in the order a call asks them: the alias an
@@ -1116,6 +1142,14 @@ private function_call(cx: &Analyzer, span: Span, written: string, args: Buf[Expr
         val ext = extern_key(cx, written)
 
         if ext.is_some() then return extern_call(cx, span, written, ext.unwrap(), args)
+
+        // **A variant of an enum the library keeps is out of reach rather than undefined**, the
+        // same asymmetry a function or a type it keeps has: a variant is named without naming its
+        // enum, and the library is searched after everything else, so nothing else can have
+        // answered.
+        val kept = library_variant(cx, written)
+
+        if kept.is_some() then return cx.err(span, out_of_reach(cx.an, kept.unwrap()))
 
         return cx.err(span, s"undefined function '$written'")
 
