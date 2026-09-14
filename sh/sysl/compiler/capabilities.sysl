@@ -579,3 +579,98 @@ private blame_needs_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, ca
     a.fault(scope, e.span, s"this reaches '${module_show(mine.unwrap())}', which needs '$cap', " +
             s"and $why")
 end blame_needs_one
+
+// -- what a module that gave up an environment capability may not reach ----------------------------
+
+// The two capabilities that gate whether a MODULE exists, as against what a body may do.
+//
+// `heap` changes what the *language* allows, so it is checked at each construction that makes heap
+// storage and at each call arriving at one -- it has to be, the standard module being one module of
+// which half allocates. `os` and `posix` gate which modules exist at all, which is a statement about
+// a module rather than about any declaration in it: a program either may name `sysl.fs` or may not,
+// and every declaration in that module is equally out of reach.
+private is_environment(cap: string) -> bool = cap == CapOs || cap == CapPosix
+
+// What each module needs an operating system for: its own clause plus everything it reaches.
+//
+// **A requirement is transitive**, since what a module offers is only reachable because the module
+// is -- so a module that gave `os` up may not get at `sysl.fs` by going through something else that
+// can. The answer is taken as a FIXPOINT over the edges rather than by a walk, because a program
+// whose module graph has a cycle is a diagnostic of its own and must not also be a walk that never
+// ends.
+private environment_requirements(a: &Analysis) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    for i in 0..<a.tables.module_requires.len()
+        val pair = a.tables.module_requires.at(i)
+
+        if is_environment(pair.1) && !holds_pair(out, pair.0, pair.1) then out.push(pair)
+
+    var grew = true
+
+    while grew
+        grew = false
+
+        for i in 0..<a.tables.module_deps.len()
+            val from = a.tables.module_deps.at(i).0
+            val reached = a.tables.module_deps.at(i).1
+
+            for j in 0..<reached.len()
+                for k in 0..<out.len()
+                    if out.at(k).0 != reached.at(j) || holds_pair(out, from, out.at(k).1) then
+                        continue
+
+                    out.push((from, out.at(k).1))
+                    grew = true
+
+    out
+end environment_requirements
+
+// The capability an edge is refused for, which is the least by name where it is refused for more
+// than one -- so the message does not vary between runs with the order a table happens to be in.
+private gating_capability(a: &Analysis, from: string, to: string,
+                          needed: Buf[(string, string)]) -> Option[string]
+    val core = capability_core()
+
+    for i in 0..<core.len()
+        val cap = core.at(i)
+
+        if !is_environment(cap) then continue
+        if !module_narrowed(a, from, cap) then continue
+        if holds_pair(needed, to, cap) then return Some(cap)
+
+    None
+end gating_capability
+
+// Reports every reference into a module that requires an environment capability the reaching module
+// gave up.
+//
+// **The edge is the unit, and the diagnostic lands at the reference that made it** -- the place a
+// reader has to change -- rather than at the clause, which is where it would land if the check were
+// about a module's own text. It runs beside the other whole-program checks, over the settled module
+// graph, because an edge is made by a reference and a reference may be anywhere a body is.
+check_gated_modules(a: &Analysis)
+    var any = false
+
+    for i in 0..<a.tables.module_narrows.len()
+        if is_environment(a.tables.module_narrows.at(i).1) then any = true
+
+    // Nothing narrowed anything, which is almost every compilation: the walk below reads every edge,
+    // and one with no question to ask should pay nothing at all for it.
+    if !any then return
+
+    val needed = environment_requirements(a)
+
+    for i in 0..<a.tables.module_edges.len()
+        val e = a.tables.module_edges.at(i)
+        val cap = gating_capability(a, e.from, e.to, needed)
+
+        if cap.is_none() then continue
+
+        val here = if e.from == "" then "this module" else s"'${e.from}'"
+
+        a.fault(e.scope, e.span,
+                s"this reaches '${module_show(e.to)}', which requires '${cap.unwrap()}', and " +
+                s"$here declared 'no ${cap.unwrap()}' — an environment capability gates which " +
+                "modules exist, so a module that gave one up may not reach one that needs it")
+end check_gated_modules

@@ -990,7 +990,7 @@ end library_variant
 function_keys(cx: &Analyzer, written: string) -> Buf[string]
     val found = function_keys_of(cx, written)
 
-    if !found.is_empty() then depends_on(cx.an, cx.scope.module_name, found.at(0))
+    if !found.is_empty() then depends_on(cx.an, cx.scope, found.at(0), span_zero())
 
     found
 end function_keys
@@ -1320,6 +1320,19 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
     if f.decl.variadic
         for i in slots.len()..<args.len()
             ts.push(type_expr_bare(cx, args.at(i)))
+
+    // **`@crossing` says a parameter hands what it is given to another domain**, so the rule about
+    // what may cross is asked at the CALL: the argument is the thing that could have been written
+    // differently. The list is built only where there is an annotation, since it is otherwise a
+    // walk over every parameter of every call in the program for nothing.
+    if !f.decl.crossing.is_empty()
+        var pts: Buf[(string, Type)] = buf()
+
+        for i in 0..<f.decl.params.len()
+            pts.push((f.decl.params.at(i).name, param_type(cx, f, f.decl.params.at(i))))
+
+        check_crossings(cx, f.decl.crossing, shown, pts, ts)
+    end if
 
     val ret = declared_result(cx, f.scope, f.decl.ret_type)
 

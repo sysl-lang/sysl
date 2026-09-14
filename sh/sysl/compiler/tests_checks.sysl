@@ -588,6 +588,97 @@ the_entry_file_with_no_clause()
 
     assert_eq(complaints_of("val r: &int = 3\n\nprint(*r)\n").len(), usize(0))
 
+// -- what a module that gave up an environment capability may not reach ----------------------------
+
+// **`os` and `posix` gate which modules EXIST**, where `alloc` gates what a body may do -- so this
+// is asked of the module graph and reported at the reference that made the edge, which is the line
+// a reader has to change.
+
+private gated(of: string, cap: string, by: string) -> string =
+    s"this reaches '$of', which requires '$cap', and $by declared 'no $cap' — an environment " +
+    "capability gates which modules exist, so a module that gave one up may not reach one that " +
+    "needs it"
+
+@test("a module that gave up an environment capability may not reach one that needs it")
+a_gated_module_is_out_of_reach()
+    if checks_no_library() then return
+
+    val out = complaints_of("@no_os\n\nimport sysl.fs.exists\n\nprint(exists(\"/tmp\"))\n")
+
+    assert(says(out, gated("sysl.fs", "os", "this module")), listed_of(out))
+
+@test("and the module that gave it up is the one the refusal names")
+a_gated_module_names_the_module_that_narrowed()
+    if checks_no_library() then return
+
+    val out = complaints_of("module mm\n@no_os\n\nimport sysl.fs.exists\n\n" +
+                            "seen() -> bool = exists(\"/tmp\")\n")
+
+    assert(says(out, gated("sysl.fs", "os", "'mm'")), listed_of(out))
+
+@test("a requirement carries what comes with it, so 'no os' refuses a module requiring 'posix'")
+a_gated_module_is_refused_for_an_implied_capability()
+    if checks_no_library() then return
+
+    val out = complaints_of("@no_os\n\nimport sysl.posix.threads.spawn\n\nprint(1)\n")
+
+    assert(says(out, gated("sysl.posix.threads", "os", "this module")), listed_of(out))
+
+@test("a module reaching one that requires nothing is left alone")
+an_ungated_module_is_left_alone()
+    if checks_no_library() then return
+
+    assert_eq(complaints_of("@no_os\n\nimport sysl.text.split\n\nprint(split(\"a b\", \" \").len)\n")
+                  .len(),
+              usize(0))
+
+@test("and a module that gave nothing up may reach whatever it likes")
+a_module_that_narrowed_nothing_reaches_anything()
+    if checks_no_library() then return
+
+    assert_eq(complaints_of("import sysl.fs.exists\n\nprint(exists(\"/tmp\"))\n").len(), usize(0))
+
+// -- what may reach another concurrency domain -----------------------------------------------------
+
+// **`@crossing` says WHERE the rule is asked**, and the rule is that every count the crossing object
+// reaches has to be atomic -- so it is asked at the call, about the argument, which is the thing
+// that could have been written differently.
+
+private crossing_state() -> string =
+    "struct Cell\n    n: int\n\nstruct State\n    cell: &Cell\n\n@crossing(s)\n" +
+    "start(s: *State) -> int = s.cell.n\n\n"
+
+@test("a '@crossing' parameter is held to what may reach another concurrency domain")
+a_crossing_argument_reaching_an_ordinary_count()
+    if checks_no_library() then return
+
+    val out = complaints_of(crossing_state() + "var c: &Cell = Cell(1)\nvar st = State(c)\n\n" +
+                            "print(start(&st))\n")
+
+    assert(says(out, "what 's' of 'start' points at reaches another concurrency domain, so every " +
+                "count inside it has to be atomic — but its 'cell' reaches a '&Cell', whose count " +
+                "is not. Hold it as a '&sync Cell' ('06')"), listed_of(out))
+
+@test("and the atomic spelling the refusal names is accepted")
+a_crossing_argument_reaching_an_atomic_count()
+    if checks_no_library() then return
+
+    val ok = "struct Cell\n    n: int\n\nstruct State\n    cell: &sync Cell\n\n@crossing(s)\n" +
+             "start(s: *State) -> int = s.cell.n\n\nvar c: &sync Cell = Cell(1)\n" +
+             "var st = State(c)\n\nprint(start(&st))\n"
+
+    assert_eq(complaints_of(ok).len(), usize(0))
+
+@test("a parameter the annotation does not name is left alone")
+a_parameter_outside_the_crossing_list()
+    if checks_no_library() then return
+
+    val out = complaints_of("struct Cell\n    n: int\n\nstruct State\n    cell: &Cell\n\n" +
+                            "start(s: *State) -> int = s.cell.n\n\nvar c: &Cell = Cell(1)\n" +
+                            "var st = State(c)\n\nprint(start(&st))\n")
+
+    assert_eq(out.len(), usize(0))
+
 // -- a member reached where its trait cannot be named ----------------------------------------------
 
 // **Visibility and scope are two questions and only the second is what an import changes.** Every
