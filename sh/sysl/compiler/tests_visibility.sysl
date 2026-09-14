@@ -1,6 +1,10 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
 import sysl.text.Search
 
 // How far a declaration may be named from (`reference/modules.md § Visibility`).
@@ -8,6 +12,127 @@ import sysl.text.Search
 // Public is the unmarked default, so every case here is about what a modifier takes away. The two
 // levels are one keyword and its argument: a bare `private` is the **file**, and `private[M]` widens
 // to a module the declaration is already inside and everything beneath it.
+//
+// **Everything past the parsing section is a whole program of several files**, because reach is not
+// a property of a declaration but of the distance between it and the name that tries to use it. A
+// file is the unit the bare form scopes to, so nothing shorter than two files can pose the question
+// at all.
+//
+// **Every message here was read out of the reference compiler**, by handing the installed `sysl` the
+// same tree and quoting what came back -- never composed from the rule.
+
+// -- a program of several files --------------------------------------------------------------------
+
+private var vis_library_cache: Buf[Program] = buf()
+private var vis_library_read: bool = false
+
+private vis_library() -> Buf[Program]
+    if vis_library_read then return vis_library_cache
+
+    vis_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> vis_library_cache = units
+
+    vis_library_cache
+end vis_library
+
+private vis_no_library() -> bool
+    if vis_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end vis_no_library
+
+// The files of one program, each named the way a diagnostic about it will be: a bare file name,
+// since the module a file contributes to is whatever its header says and the directory around it is
+// the driver's business rather than the analyzer's.
+private vis_units(files: []const (string, string)) -> Result[Buf[Program], string]
+    var units: Buf[Program] = buf()
+    val library = vis_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return Err(parsed.report.at(0).message)
+
+        units.push(parsed.program)
+
+    Ok(units)
+end vis_units
+
+// The whole report a program is refused with, rendered the way a reader sees it.
+private vis_err(files: []const (string, string)) -> string
+    val units = vis_units(files) match
+        Err(why) -> return why
+        Ok(us) -> us
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end vis_err
+
+// The LLVM text of a program of several files, which is what a claim about linkage or about a
+// mangled symbol is read out of.
+private vis_ir(files: []const (string, string)) -> string
+    val units = vis_units(files) match
+        Err(why) -> return why
+        Ok(us) -> us
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    if !errors_of(done.an.diagnostics()).is_empty()
+        return analysis_report(errors_of(done.an.diagnostics()))
+
+    val kept = prune(strip_tests(whole), buf())
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end vis_ir
+
+// What a program of several files **prints**, which is the one claim nothing short of running can
+// make. The tree goes on disk, since a module is a directory and a build reads one.
+private vis_ran(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-vis").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vis_ran
+
+// A module in two files, one of which keeps a helper to itself. Every case below differs only in
+// where it tries to name `scale` from.
+private vis_hidden() -> string =
+    "module geom\nprivate scale(n: int) -> int = n * 2\ntwice(n: int) -> int = scale(n)\n"
 
 // -- the modifiers parse -------------------------------------------------------------------------
 
@@ -62,3 +187,525 @@ an_unmarked_var_is_public()
 the_scope_argument_is_one_segment()
     assert(pf_err("private[a.b] f() -> int = 1\n").contains("']'"),
         pf_err("private[a.b] f() -> int = 1\n"))
+
+// -- a bare 'private' is the file that declares it ---------------------------------------------------
+
+@test("which may use it freely")
+the_declaring_file_may_use_it_freely()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.twice(21))\n"),
+                       ("geom/g.sysl", vis_hidden())]), "42\n")
+
+@test("a sibling file of its own module may not")
+a_sibling_file_may_not_use_it()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(1)\n"),
+                       ("g.sysl", vis_hidden()),
+                       ("h.sysl", "module geom\nquad(n: int) -> int = scale(scale(n))\n")])
+
+    assert(out.contains("'geom.scale' is private to 'g.sysl', the file that declares it"), out)
+
+@test("another module may not name it in full")
+another_module_may_not_name_it_in_full()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(geom.scale(21))\n"), ("g.sysl", vis_hidden())])
+
+    assert(out.contains("'geom.scale' is private to 'g.sysl', the file that declares it"), out)
+
+@test("and importing it is refused at the import")
+importing_it_is_refused_at_the_import()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "import geom.scale\nprint(1)\n"), ("g.sysl", vis_hidden())])
+
+    assert(out.contains("'geom.scale' is private to 'g.sysl', the file that declares it"), out)
+
+@test("including a selector list, which points at the selector")
+a_selector_list_points_at_the_selector()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "import geom.{twice, scale}\nprint(1)\n"), ("g.sysl", vis_hidden())])
+
+    assert(out.contains("'geom.scale' is private to 'g.sysl'"), out)
+
+// A wildcard offers what it can see, so a private helper is not among what it brings in -- which is
+// a different answer from being told the import cannot have it.
+@test("a wildcard does not offer it at all")
+a_wildcard_does_not_offer_it_at_all()
+    if vis_no_library() then return
+
+    assert(vis_err([("main.sysl", "import geom.*\nprint(scale(21))\n"), ("g.sysl", vis_hidden())])
+        .contains("undefined function 'scale'"))
+
+@test("so it cannot make a name from a second wildcard ambiguous")
+it_cannot_make_a_second_wildcards_name_ambiguous()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "import geom.*\nimport text.*\nprint(scale(21))\n"),
+                       ("geom/g.sysl", vis_hidden()),
+                       ("text/t.sysl", "module text\nscale(n: int) -> int = n + 1\n")]), "22\n")
+
+// -- a file scopes a private name, and only a private one ------------------------------------------
+
+// **A file-private name is scoped to its file, and a public one is not.**
+//
+// This is the half that did not move when a file became a namespace as well as a reach: a private
+// declaration against a sibling's public one is a real ambiguity for that sibling's own references,
+// and is still refused.
+@test("a private declaration still collides with a sibling file's public one")
+a_private_declaration_collides_with_a_siblings_public_one()
+    if vis_no_library() then return
+
+    assert(vis_err([("main.sysl", "print(1)\n"),
+                    ("g.sysl", "module geom\nprivate scale(n: int) -> int = n * 2\n"),
+                    ("h.sysl", "module geom\nscale(n: int) -> int = n + 1\n")])
+        .contains("function 'scale' is already declared"))
+
+// Two files that each keep a `scale` to themselves have written two declarations no call site can
+// confuse, since neither is ever a candidate where the other is.
+@test("but a second file's private one is its own, and both are named from their own file")
+two_files_may_each_keep_one_of_the_same_name()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.from_g(), geom.from_h())\n"),
+                       ("geom/g.sysl",
+                        "module geom\nprivate scale(n: int) -> int = n * 2\nfrom_g() -> int = scale(10)\n"),
+                       ("geom/h.sysl",
+                        "module geom\nprivate scale(n: int) -> int = n + 1\nfrom_h() -> int = scale(10)\n")]),
+              "20 11\n")
+
+@test("and two modules may each keep one of the same name")
+two_modules_may_each_keep_one_of_the_same_name()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.twice(10) + text.twice(10))\n"),
+                       ("geom/g.sysl", vis_hidden()),
+                       ("text/t.sysl",
+                        "module text\nprivate scale(n: int) -> int = n * 3\ntwice(n: int) -> int = scale(n)\n")]),
+              "50\n")
+
+// The two of them land in one LLVM module, so what keeps them apart is the module segment in the
+// symbol and nothing else. Drop the segment for a file-private name and these two definitions
+// collide.
+@test("which they can only do because the symbol still carries the module")
+a_file_private_symbol_still_carries_its_module()
+    if vis_no_library() then return
+
+    val out = vis_ir([("main.sysl", "print(geom.twice(10) + text.twice(10))\n"),
+                      ("g.sysl", vis_hidden()),
+                      ("t.sysl",
+                       "module text\nprivate scale(n: int) -> int = n * 3\ntwice(n: int) -> int = scale(n)\n")])
+
+    assert(out.contains("@geom$scale("), out)
+    assert(out.contains("@text$scale("), out)
+    assert(!out.contains("@scale("), out)
+end a_file_private_symbol_still_carries_its_module
+
+// A collision is one mistake, so it is one diagnostic. The losing declaration is still registered
+// under the name, so without care the file that wrote it is then told the name belongs to its
+// sibling -- a name it declares itself, three lines up.
+@test("and the file that loses the collision is not also told the name is not its own")
+the_loser_of_a_collision_is_not_also_told_the_name_is_not_its_own()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(1)\n"),
+                       ("g.sysl", "module geom\nscale(n: int) -> int = n * 2\n"),
+                       ("h.sysl",
+                        "module geom\nprivate scale(n: int) -> int = n + 1\ntwice(n: int) -> int = scale(n)\n")])
+
+    assert(out.contains("function 'scale' is already declared"), out)
+    assert(!out.contains("private to"), out)
+end the_loser_of_a_collision_is_not_also_told_the_name_is_not_its_own
+
+// -- a file-private declaration is internal to the module that defines it --------------------------
+
+// A bare `private` is the one reach that provably never crosses a file boundary, and every file of a
+// compilation is emitted into one LLVM module -- so a declaration at that reach has all of its
+// callers in the module that defines it, which is what `internal` linkage states. Nothing wider
+// qualifies: a `private[M]` reaches a whole subtree, and public reaches anyone.
+
+@test("a bare 'private' function")
+a_bare_private_function_is_internal()
+    if vis_no_library() then return
+
+    assert(vis_ir([("main.sysl", "print(geom.twice(10))\n"), ("g.sysl", vis_hidden())])
+        .contains("define internal i32 @geom$scale("))
+
+@test("while the public one beside it keeps external linkage")
+the_public_one_beside_it_keeps_external_linkage()
+    if vis_no_library() then return
+
+    assert(vis_ir([("main.sysl", "print(geom.twice(10))\n"), ("g.sysl", vis_hidden())])
+        .contains("define i32 @geom$twice("))
+
+// The discriminating half: a scoped-private declaration is reachable from every file of the subtree,
+// so its reach is not the file and the linkage is unchanged.
+@test("a 'private[M]' one does not qualify, however narrow the subtree")
+a_scoped_private_one_does_not_qualify()
+    if vis_no_library() then return
+
+    val out = vis_ir([("main.sysl", "print(geom.twice(10))\n"),
+                      ("g.sysl", "module geom\nprivate[geom] scale(n: int) -> int = n * 2\n"),
+                      ("h.sysl", "module geom\ntwice(n: int) -> int = scale(n)\n")])
+
+    assert(out.contains("define i32 @geom$scale("), out)
+    assert(!out.contains("define internal i32 @geom$scale("), out)
+end a_scoped_private_one_does_not_qualify
+
+// An unmarked member sits at its type's reach, so a member of a file-private type is file-private
+// without saying so.
+@test("an unmarked member of a file-private type")
+an_unmarked_member_of_a_file_private_type_is_internal()
+    if vis_no_library() then return
+
+    assert(vis_ir([("main.sysl",
+                    "private struct Hidden\n    n: int\n    scale(self, k: int) -> int = self.n * k\n" +
+                    "end Hidden\nprivate val h: Hidden = Hidden(3)\nprint(h.scale(2))\n")])
+        .contains("define internal i32 @Hidden.scale("))
+
+@test("a private member of a public type")
+a_private_member_of_a_public_type_is_internal()
+    if vis_no_library() then return
+
+    val out = vis_ir([("main.sysl",
+                       "struct Shown\n    n: int\n    private secret(self) -> int = self.n + 1\n" +
+                       "    visible(self) -> int = self.secret()\nend Shown\n" +
+                       "val s: Shown = Shown(4)\nprint(s.visible())\n")])
+
+    assert(out.contains("define internal i32 @Shown.secret("), out)
+    assert(out.contains("define i32 @Shown.visible("), out)
+end a_private_member_of_a_public_type_is_internal
+
+// An instantiation is emitted under a name of its own -- `geom$pick.int` -- and that name has no
+// visibility of its own, because it is not what anyone wrote. The answer comes from the declaration
+// it was made from, or a private generic helper in a library would go on exporting one symbol per
+// instantiation.
+@test("an instantiation of a file-private generic, which is emitted under another name")
+an_instantiation_of_a_file_private_generic_is_internal()
+    if vis_no_library() then return
+
+    val out = vis_ir([("main.sysl", "print(geom.larger(3, 9))\n"),
+                      ("g.sysl",
+                       "module geom\nprivate pick[T: Ord](a: T, b: T) -> T = if a < b then b else a\n" +
+                       "larger(a: int, b: int) -> int = pick(a, b)\n")])
+
+    assert(out.contains("define internal i32 @geom$pick.int("), out)
+    assert(out.contains("define i32 @geom$larger("), out)
+end an_instantiation_of_a_file_private_generic_is_internal
+
+// The entry point is the one symbol the platform resolves, so it stays external whatever the program
+// said about the function behind it -- which is a different symbol, and does not.
+@test("a private 'main', whose own symbol is not the entry point")
+a_private_main_is_internal_and_the_entry_point_is_not()
+    if vis_no_library() then return
+
+    val out = vis_ir([("main.sysl", "private main() -> unit = print(\"hi\")\n")])
+
+    assert(out.contains("define internal void @$$main("), out)
+    assert(out.contains("define i32 @main(i32 %argc, ptr %argv)"), out)
+end a_private_main_is_internal_and_the_entry_point_is_not
+
+@test("and it still runs")
+a_private_main_still_runs()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "private main() -> unit = print(\"hi\")\n")]), "hi\n")
+
+@test("and the program still runs")
+a_program_with_a_file_private_helper_still_runs()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.twice(10))\n"), ("geom/g.sysl", vis_hidden())]), "20\n")
+
+// -- 'private[M]' widens to a module and its subtree -----------------------------------------------
+
+@test("every file of the declaring module may use it")
+every_file_of_the_declaring_module_may_use_a_scoped_one()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.quad(5))\n"),
+                       ("geom/g.sysl", "module geom\nprivate[geom] scale(n: int) -> int = n * 2\n"),
+                       ("geom/h.sysl", "module geom\nquad(n: int) -> int = scale(scale(n))\n")]),
+              "20\n")
+
+@test("but a module outside it may not")
+a_module_outside_the_scope_may_not()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(geom.scale(5))\n"),
+                       ("g.sysl", "module geom\nprivate[geom] scale(n: int) -> int = n * 2\n")])
+
+    assert(out.contains("'geom.scale' is private to module 'geom'"), out)
+end a_module_outside_the_scope_may_not
+
+@test("an ancestor reaches every module beneath it")
+an_ancestor_reaches_every_module_beneath_it()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(oskit.mm.reserve(3))\n"),
+                       ("oskit/arch/cpu.sysl",
+                        "module oskit.arch\nprivate[oskit] frames(n: int) -> int = n * 4\n"),
+                       ("oskit/mm/mm.sysl",
+                        "module oskit.mm\nreserve(n: int) -> int = oskit.arch.frames(n)\n")]),
+              "12\n")
+
+@test("and the ancestor itself")
+the_ancestor_itself_reaches_it()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(oskit.pages(3))\n"),
+                       ("oskit/arch/cpu.sysl",
+                        "module oskit.arch\nprivate[oskit] frames(n: int) -> int = n * 4\n"),
+                       ("oskit/k.sysl", "module oskit\npages(n: int) -> int = oskit.arch.frames(n)\n")]),
+              "12\n")
+
+@test("but nothing outside that subtree")
+nothing_outside_the_subtree_reaches_it()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(oskit.arch.frames(3))\n"),
+                       ("cpu.sysl", "module oskit.arch\nprivate[oskit] frames(n: int) -> int = n * 4\n")])
+
+    assert(out.contains("'oskit.arch.frames' is private to module 'oskit'"), out)
+end nothing_outside_the_subtree_reaches_it
+
+// Read outward from the declaration, first hit winning, so the nearer `geom` is the one meant.
+@test("a repeated segment binds to the innermost one")
+a_repeated_segment_binds_to_the_innermost_one()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(geom.reach(1))\n"),
+                       ("t.sysl",
+                        "module geom.mesh.geom.tri\nprivate[geom] area(n: int) -> int = n * 2\n"),
+                       ("g.sysl",
+                        "module geom\nreach(n: int) -> int = geom.mesh.geom.tri.area(n)\n")])
+
+    assert(out.contains("is private to module 'geom.mesh.geom'"), out)
+end a_repeated_segment_binds_to_the_innermost_one
+
+@test("and the module the declaration is in counts as enclosing itself")
+the_declarations_own_module_counts_as_enclosing_itself()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(a.b.go(4))\n"),
+                       ("a/b/x.sysl", "module a.b\nprivate[b] step(n: int) -> int = n + 1\n"),
+                       ("a/b/y.sysl", "module a.b\ngo(n: int) -> int = step(n)\n")]),
+              "5\n")
+
+// -- a scope that names nothing --------------------------------------------------------------------
+
+@test("a module the declaration is not inside")
+a_scope_naming_a_module_the_declaration_is_not_inside()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(1)\n"),
+                       ("g.sysl", "module geom\nprivate[text] scale(n: int) -> int = n * 2\n"),
+                       ("t.sysl", "module text\nwrap(n: int) -> int = n\n")])
+
+    assert(out.contains("'text' is not 'geom' or one of its ancestors"), out)
+end a_scope_naming_a_module_the_declaration_is_not_inside
+
+@test("a descendant of it, which is inside-out")
+a_scope_naming_a_descendant_is_inside_out()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(1)\n"),
+                       ("k.sysl", "module oskit\nprivate[arch] pages(n: int) -> int = n\n"),
+                       ("cpu.sysl", "module oskit.arch\nframes(n: int) -> int = n\n")])
+
+    assert(out.contains("'arch' is not 'oskit' or one of its ancestors"), out)
+end a_scope_naming_a_descendant_is_inside_out
+
+@test("a file at the project root, whose module has no name")
+a_scope_written_in_a_file_at_the_project_root()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "private[root] scale(n: int) -> int = n * 2\nprint(1)\n")])
+
+    assert(out.contains("this file is at the project root, whose module has no name"), out)
+end a_scope_written_in_a_file_at_the_project_root
+
+// The declaration still exists: one mistake is one diagnostic, and the uses of a name whose scope
+// could not be worked out are not each a second complaint about it.
+@test("and the declaration it was written on still stands")
+a_declaration_whose_scope_named_nothing_still_stands()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "private[root] scale(n: int) -> int = n * 2\nprint(scale(21))\n")])
+
+    assert(!out.contains("undefined function 'scale'"), out)
+end a_declaration_whose_scope_named_nothing_still_stands
+
+// -- every declaration form takes one ---------------------------------------------------------------
+
+@test("a struct")
+a_private_struct_is_out_of_reach()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "var p: geom.Point = geom.Point(1, 2)\nprint(p.x)\n"),
+                       ("g.sysl", "module geom\nprivate struct Point\n    x: int\n    y: int\n")])
+
+    assert(out.contains("'geom.Point' is private to 'g.sysl'"), out)
+end a_private_struct_is_out_of_reach
+
+@test("an enum")
+a_private_enum_is_out_of_reach()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "var s: geom.Shape = geom.Shape.Dot\nprint(1)\n"),
+                       ("g.sysl", "module geom\nprivate enum Shape\n    Dot\n    Round\n")])
+
+    assert(out.contains("'geom.Shape' is private to 'g.sysl'"), out)
+end a_private_enum_is_out_of_reach
+
+@test("and its variants with it")
+a_private_enums_variants_go_with_it()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "import geom.Dot\nprint(1)\n"),
+                       ("g.sysl", "module geom\nprivate enum Shape\n    Dot\n    Round\n")])
+
+    assert(out.contains("'geom.Dot' is private to 'g.sysl'"), out)
+end a_private_enums_variants_go_with_it
+
+@test("a trait")
+a_private_trait_is_out_of_reach()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "loud[T: geom.Show](x: T) -> int = x.show()\nprint(1)\n"),
+                       ("g.sysl", "module geom\nprivate trait Show\n    show(self) -> int\n")])
+
+    assert(out.contains("'geom.Show' is private to 'g.sysl'"), out)
+end a_private_trait_is_out_of_reach
+
+@test("an extern")
+a_private_extern_is_out_of_reach()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(geom.abs(0 - 3))\n"),
+                       ("g.sysl", "module geom\nprivate extern abs(n: int) -> int\n")])
+
+    assert(out.contains("'geom.abs' is private to 'g.sysl'"), out)
+end a_private_extern_is_out_of_reach
+
+@test("a function")
+a_private_function_is_out_of_reach()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(geom.scale(21))\n"), ("g.sysl", vis_hidden())])
+
+    assert(out.contains("'geom.scale' is private"), out)
+end a_private_function_is_out_of_reach
+
+// The exception has a reason of its own, so the refusal carries the reason rather than the
+// grammar's complaint that the modifier was not followed by a name. It is the same refusal the
+// members *inside* an `impl` already get.
+@test("and an 'impl' does not, having no name for one to restrict")
+an_impl_carries_no_visibility_of_its_own()
+    if vis_no_library() then return
+
+    val rest = "impl Show for P\n    show(self) -> int = self.v\n\nprint(P(1).show())\n"
+    val head = "trait Show\n    show(self) -> int\n\nstruct P\n    v: int\n\n"
+    val out = vis_err([("main.sysl", s"${head}private $rest")])
+
+    assert(out.contains("an 'impl' block carries no visibility of its own"), out)
+    assert(!out.contains("identifier expected"), out)
+
+    val scoped = vis_err([("main.sysl", s"${head}private[geom] $rest")])
+
+    assert(scoped.contains("an 'impl' block carries no visibility of its own"), scoped)
+end an_impl_carries_no_visibility_of_its_own
+
+// -- what a restriction does not touch ---------------------------------------------------------------
+
+// An import binds a shorter spelling; visibility decides what may be spelled at all. A public
+// wrapper over a private helper is the whole point of the level, and it keeps working.
+@test("a public wrapper reaches its own module's private helper")
+a_public_wrapper_reaches_its_modules_private_helper()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "import geom.twice\nprint(twice(21))\n"),
+                       ("geom/g.sysl", vis_hidden())]), "42\n")
+
+@test("a private type is still a type its own file may use")
+a_private_type_is_still_a_type_its_own_file_may_use()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.area())\n"),
+                       ("geom/g.sysl",
+                        "module geom\nprivate struct Point\n    x: int\n    y: int\n" +
+                        "area() -> int = Point(3, 4).x * Point(3, 4).y\n")]), "12\n")
+
+@test("a private trait may still be implemented and used inside its file")
+a_private_trait_may_be_implemented_inside_its_file()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.go())\n"),
+                       ("geom/g.sysl",
+                        "module geom\nprivate trait Show\n    show(self) -> int\nstruct Tag\n    n: int\n" +
+                        "impl Show for Tag\n    show(self) -> int = self.n * 2\n" +
+                        "go() -> int = Tag(5).show()\n")]), "10\n")
+
+@test("an import inside a block is held to the same rule")
+an_import_inside_a_block_is_held_to_the_same_rule()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "f() -> int =\n    import geom.scale\n    scale(21)\nprint(f())\n"),
+                       ("g.sysl", vis_hidden())])
+
+    assert(out.contains("'geom.scale' is private to 'g.sysl', the file that declares it"), out)
+end an_import_inside_a_block_is_held_to_the_same_rule
+
+// -- a name a file cannot reach does not stand in the way of one it can -------------------------------
+
+// A name a file may not reach is not a candidate for it, so resolution goes on past it rather than
+// stopping there. Only where nothing else answers at all does the restriction get reported -- at
+// which point it is the whole story, and a better one than an undefined name.
+
+@test("an explicit import beats a sibling file's private declaration of the same name")
+an_explicit_import_beats_a_siblings_private_declaration()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.go())\n"),
+                       ("geom/g.sysl", "module geom\nprivate width(n: int) -> int = n * 2\n"),
+                       ("geom/h.sysl", "module geom\nimport text.width\ngo() -> int = width(21)\n"),
+                       ("text/t.sysl", "module text\nwidth(n: int) -> int = n + 1\n")]), "22\n")
+
+@test("a wildcard does too")
+a_wildcard_beats_a_siblings_private_declaration()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.go())\n"),
+                       ("geom/g.sysl", "module geom\nprivate width(n: int) -> int = n * 2\n"),
+                       ("geom/h.sysl", "module geom\nimport text.*\ngo() -> int = width(21)\n"),
+                       ("text/t.sysl", "module text\nwidth(n: int) -> int = n + 1\n")]), "22\n")
+
+@test("and so does one written inside a block")
+an_import_inside_a_block_beats_it_too()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.go())\n"),
+                       ("geom/g.sysl", "module geom\nprivate width(n: int) -> int = n * 2\n"),
+                       ("geom/h.sysl",
+                        "module geom\ngo() -> int =\n    import text.width\n    width(21)\n"),
+                       ("text/t.sysl", "module text\nwidth(n: int) -> int = n + 1\n")]), "22\n")
+
+@test("the library still answers where only a private declaration would have")
+the_library_answers_where_only_a_private_declaration_would_have()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.go())\n"),
+                       ("geom/g.sysl", "module geom\nprivate print(n: int) -> int = n\n"),
+                       ("geom/h.sysl", "module geom\ngo() -> int =\n    print(9)\n    1\n")]), "9\n1\n")
+
+@test("while the declaring file goes on getting its own")
+the_declaring_file_goes_on_getting_its_own()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.go())\n"),
+                       ("geom/g.sysl",
+                        "module geom\nprivate width(n: int) -> int = n * 2\ngo() -> int = width(21)\n"),
+                       ("text/t.sysl", "module text\nwidth(n: int) -> int = n + 1\n")]), "42\n")

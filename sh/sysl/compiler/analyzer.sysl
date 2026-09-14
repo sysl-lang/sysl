@@ -63,6 +63,11 @@ struct Analyzer
     locals: Buf[Local]
     marks: Buf[usize]
 
+    // Where each open scope found the file's imports. An `import` written inside a block binds for
+    // the statements after it and no further, so what a block took on is taken back off at the
+    // dedent -- three lengths, the three lists `Imports` is made of.
+    import_marks: Buf[(usize, usize, usize)]
+
     // What a type parameter stands for while a generic body is read.
     subst: Buf[Binding]
 
@@ -184,8 +189,11 @@ struct Analyzer
     // Opens a scope.
     enter(*self)
         self.marks.push(self.locals.len())
+        self.import_marks.push((self.scope.imports.names.len(),
+                                self.scope.imports.modules.len(),
+                                self.scope.imports.wildcards.len()))
 
-    // Closes the innermost scope, taking its bindings with it.
+    // Closes the innermost scope, taking its bindings and whatever it imported with it.
     leave(*self)
         if self.marks.is_empty() then return
 
@@ -193,6 +201,16 @@ struct Analyzer
 
         self.marks.truncate(self.marks.len() - 1)
         self.locals.truncate(mark)
+
+        if self.import_marks.is_empty() then return
+
+        val at = self.import_marks.at(self.import_marks.len() - 1)
+
+        self.import_marks.truncate(self.import_marks.len() - 1)
+        self.scope.imports.names.truncate(at.0)
+        self.scope.imports.modules.truncate(at.1)
+        self.scope.imports.wildcards.truncate(at.2)
+    end leave
 
     // Binds a name in the innermost scope, under a unique name of its own.
     bind(*self, name: string, ty: Type) -> string
@@ -297,7 +315,7 @@ bad_expr(span: Span) -> TExpr = TExpr(span, TZero(Unknown))
 
 // An analyzer over a compilation's tables, reading a file in its own terms.
 analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
-    Analyzer(an, scope, buf(), buf(), buf(), "", None, None, false, buf(), buf(), false, false,
+    Analyzer(an, scope, buf(), buf(), buf(), buf(), "", None, None, false, buf(), buf(), false, false,
              None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
              empty_names(), false, buf())
 

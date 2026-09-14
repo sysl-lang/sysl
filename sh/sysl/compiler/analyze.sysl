@@ -132,6 +132,17 @@ private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
 
             if cut.is_some() then depends_on_module(a, scope.module_name, path[0..<cut.unwrap()])
 
+            // **A declaration another file keeps to itself is refused where the import is
+            // written**, rather than at whatever later names it: the clause is the mistake, and it
+            // is the line a reader has to change. What the table is keyed on is the declaration's
+            // key rather than the dotted path the file wrote, which is the module and the name
+            // joined the way a key joins them.
+            val named = module_qualify(path[0..<cut.unwrap()],
+                                       path[(cut.unwrap() + 1)..<path.bytes.len])
+
+            if !reachable_key(a, named, scope)
+                a.fault(scope, span, out_of_reach(a, named))
+
             return
         end if
 
@@ -150,6 +161,9 @@ private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
         if !declares(a, key) then
             a.fault(scope, s.span,
                     s"'$written' declares no '${s.name}' — there is no '$written.${s.name}'")
+        elif !reachable_key(a, key, scope)
+            // A selector list points at the selector, which is the word that has to go.
+            a.fault(scope, s.span, out_of_reach(a, key))
 
 // The entries a table took on since a mark, taken back out.
 rewind_registered(into: &Table[Type], mark: usize)
@@ -211,7 +225,14 @@ declares(a: &Analysis, key: string) -> bool =
         a.tables.overloads.has(key) || is_variant_name(a, key)
 
 // Whether a key names a variant of an enum, which an import may name as well as the enum itself.
-private is_variant_name(a: &Analysis, key: string) -> bool
+private is_variant_name(a: &Analysis, key: string) -> bool = enum_of_variant(a, key).is_some()
+
+// The enum a key names a variant of, where it names one.
+//
+// **A variant is not a declaration of its own**, so it has no reach written on it and no row in the
+// access table: what it is worth is the enum's, which is what makes `private enum Shape` keep `Dot`
+// as well.
+enum_of_variant(a: &Analysis, key: string) -> Option[string]
     val here = module_of(key)
     val name = module_bare(key)
 
@@ -222,11 +243,12 @@ private is_variant_name(a: &Analysis, key: string) -> bool
             decl.kind match
                 EnumOf(e) ->
                     for j in 0..<e.variants.len()
-                        if e.variants.at(j).name == name then return true
+                        if e.variants.at(j).name == name then
+                            return Some(a.tables.types.key_at(i))
                 _ -> ()
 
-    false
-end is_variant_name
+    None
+end enum_of_variant
 
 // A pinned underlying type says which one integer the discriminants are laid in. A generic enum has
 // an instantiation for every argument list rather than one, so there is no single storage for the

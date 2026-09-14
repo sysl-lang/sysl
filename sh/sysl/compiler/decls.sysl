@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
+import sysl.text.Search
 
 // What the program is made of, as the analyzer holds it.
 //
@@ -110,6 +111,12 @@ end ExternHome
 struct Access
     vis: Visibility
     file: string
+
+    // The module the declaration was written in. A `private[M]` names a module the declaration is
+    // already inside, so what `M` stands for cannot be read off `M` alone -- it is resolved
+    // outward from here, and the same word may name two of the ancestors. Spelled `module_name`
+    // because `module` is a reserved word and may not name a field.
+    module_name: string
 end Access
 
 // A declaration of a type: which kind it is, and enough of it to answer a question about the name
@@ -536,8 +543,69 @@ analysis_producing(t: Target, producing: Buf[string]) -> &Analysis =
 reachable(a: Access, from: Scope) -> bool = a.vis match
     Public -> true
     File -> a.file == from.src.name
-    Scoped(_) -> true
+    Scoped(name) -> widened_to(a.module_name, name) match
+        // A scope naming nothing is refused where it is written, and the declaration it was written
+        // on still stands: one mistake is one diagnostic, so every use of the name goes on being
+        // read rather than each becoming a second complaint about it.
+        None -> true
+        Some(m) -> beneath(from.module_name, m)
+
+// The module a `private[M]` widens to, read OUTWARD from the module the declaration is in with the
+// first hit winning -- so a segment written twice binds to the innermost one, and the declaration's
+// own module counts as enclosing itself.
+widened_to(declared_in: string, name: string) -> Option[string]
+    if declared_in == ModuleRoot then return None
+
+    var at = declared_in
+
+    loop
+        val cut = last_dot_in(at)
+        val leaf = cut match
+            None -> at
+            Some(i) -> at[(i + 1)..<at.bytes.len]
+
+        if leaf == name then return Some(at)
+
+        cut match
+            None -> return None
+            Some(i) -> at = at[0..<i]
+end widened_to
+
+// Whether a module is the one named or somewhere under it.
+beneath(here: string, top: string) -> bool =
+    here == top || here.starts_with(s"$top.")
 
 // What a diagnostic says about a name the reader may not reach.
 private_to(key: string, file: string) -> string =
     s"'${module_show(key)}' is private to '$file', the file that declares it"
+
+// The same for the wider form, which names a module rather than a file.
+private_to_module(key: string, at: string) -> string =
+    s"'${module_show(key)}' is private to module '$at'"
+
+// How far a name reaches, which for a variant is its enum's and for everything else its own.
+access_for(a: &Analysis, key: string) -> Option[Access] = a.tables.access.get(key) match
+    Some(acc) -> Some(acc)
+    None -> enum_of_variant(a, key) match
+        None -> None
+        Some(owner) -> a.tables.access.get(owner)
+
+// What a reader is told about a name it may not reach, which is a different sentence at each of the
+// two levels: the file form names the file, the wider one the module it widened to.
+out_of_reach(a: &Analysis, key: string) -> string
+    val acc = access_for(a, key).unwrap()
+
+    acc.vis match
+        Scoped(name) -> widened_to(acc.module_name, name) match
+            None -> private_to(key, acc.file)
+            Some(m) -> private_to_module(key, m)
+        _ -> private_to(key, acc.file)
+end out_of_reach
+
+// What a `private[M]` naming no enclosing module is told, at the declaration that wrote it.
+scope_names_nothing(name: string, declared_in: string) -> string =
+    if declared_in == ModuleRoot then
+        s"this file is at the project root, whose module has no name, so there is no '$name' to " +
+        "widen to — 'private' on its own is this file"
+    else s"'$name' is not '$declared_in' or one of its ancestors, and 'private[M]' widens to a " +
+         "module the declaration is already inside"

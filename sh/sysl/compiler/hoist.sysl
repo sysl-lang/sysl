@@ -68,8 +68,14 @@ gather_imports(a: &Analysis, p: Program) -> Imports
     Imports(names, modules, wildcards)
 end gather_imports
 
-private read_import(names: *Buf[(string, string)], modules: *Buf[(string, string)],
-                    wildcards: *Buf[string], path: string, d: ImportDecl)
+// The same for an `import` written **inside a body**, which binds for the statements after it and
+// is taken back off at the dedent. It is the file's own reading with a narrower life, so it goes
+// through the same function rather than a second one that could drift from it.
+bind_block_import(into: *Imports, path: string, d: ImportDecl) =
+    read_import(&into.names, &into.modules, &into.wildcards, path, d)
+
+read_import(names: *Buf[(string, string)], modules: *Buf[(string, string)],
+            wildcards: *Buf[string], path: string, d: ImportDecl)
     if d.wildcard then
         wildcards.push(path)
         return
@@ -255,6 +261,22 @@ private hoist_storage(a: &Analysis, scope: Scope, span: Span, name: string, typ:
     a.tables.writable.push(file_private_key(a, scope.src.name,
                                             module_qualify(scope.module_name, name)))
 
+// Files what a declaration may be named from, and refuses a `private[M]` naming a module the
+// declaration is not inside.
+//
+// **The scope is checked HERE rather than where the name is used**, because the mistake is the
+// modifier: one wrong word is one diagnostic, and the declaration it was written on still stands so
+// that every call of it goes on being read.
+private record_access(a: &Analysis, scope: Scope, span: Span, key: string, vis: Visibility)
+    vis match
+        Scoped(name) ->
+            if widened_to(scope.module_name, name).is_none()
+                a.fault(scope, span, scope_names_nothing(name, scope.module_name))
+        _ -> ()
+
+    a.tables.access.put(key, Access(vis, scope.src.name, scope.module_name))
+end record_access
+
 // Registers a name that stands for a type.
 private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vis: Visibility,
                         kind: DeclKind)
@@ -266,7 +288,7 @@ private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vi
         return
 
     a.tables.types.put(key, Decl(kind, span, scope))
-    a.tables.access.put(key, Access(vis, scope.src.name))
+    record_access(a, scope, span, key, vis)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
 
@@ -307,7 +329,7 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
         return
 
     into.put(key, ValueDecl(name, typ, vis, span, scope, init, align, section))
-    a.tables.access.put(key, Access(vis, scope.src.name))
+    record_access(a, scope, span, key, vis)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
 
@@ -371,7 +393,7 @@ private hoist_extern(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
 
     a.tables.externs.put(key, d)
     a.tables.extern_scopes.put(key, ExternHome(scope, span))
-    a.tables.access.put(key, Access(d.vis, scope.src.name))
+    record_access(a, scope, span, key, d.vis)
 
 // The symbol an `extern` names, which is its link name where it gave one and its own name otherwise.
 extern_symbol(d: ExternDecl) -> string = d.link match
@@ -432,7 +454,7 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
     set.push(key)
     a.tables.overloads.put(base, set)
     a.tables.funcs.put(key, Func(d, span, scope))
-    a.tables.access.put(key, Access(d.vis, scope.src.name))
+    record_access(a, scope, span, key, d.vis)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
 
