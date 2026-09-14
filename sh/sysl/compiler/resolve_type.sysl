@@ -378,6 +378,25 @@ private digits_value(digits: string, base: int) -> usize
     n
 end digits_value
 
+// Whether a plain decimal digit string parses as a 32-bit signed int the way the reference's own
+// `String.toIntOption` would -- the bootstrap tells a width that merely exceeds the back end's
+// ceiling from one so large it never became a number at all, and this is that same line.
+private fits_i32(digits: string) -> bool
+    val max_i32 = "2147483647"
+    val b = digits.bytes
+
+    if b.len < max_i32.len then return true
+    if b.len > max_i32.len then return false
+
+    val m = max_i32.bytes
+
+    for i in 0..<b.len
+        if b[i] < m[i] then return true
+        if b[i] > m[i] then return false
+
+    true
+end fits_i32
+
 // -- a name -------------------------------------------------------------------------------------
 
 private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args: Buf[TypeRef],
@@ -464,6 +483,10 @@ width_type(a: &Analysis, scope: Scope, span: Span, name: string) -> Option[Type]
             a.fault(scope, span, s"'$name' has a leading zero — a width is written plainly, as " +
                     s"'$head${without_leading_zeros(digits)}'")
 
+        return Some(Unknown)
+
+    if !fits_i32(digits) then
+        a.fault(scope, span, s"'$name' is far wider than anything can hold")
         return Some(Unknown)
 
     val bits = int(digits_value(digits, 10))
