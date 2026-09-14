@@ -4,6 +4,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.text.from_utf8_unchecked
+import sysl.text.Search
 
 // The forms a body can reach that nothing else here has a file for: the loop over a sequence, the
 // comma assignment, the weak edge, the type attributes of a simple enum, a type's identity read off
@@ -81,6 +82,52 @@ private form_lowered(text: string, symbol: string) -> string
 
     s"no definition of '$symbol'"
 end form_lowered
+
+// The whole module text, for a claim about a line that belongs to no function.
+private form_module(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = form_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, done.main_module)
+
+    var own: Buf[string] = buf()
+
+    own.push(module_written(parsed.program))
+
+    val promotions = post_analysis_checks(done.an, whole, own)
+    val kept = prune(strip_tests(whole), own)
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end form_module
+
+// Storage the linker supplies is **declared** rather than laid down, and only what a body reaches is
+// declared -- so the read is what puts the line in the module, and an `extern` variable nothing
+// touches contributes nothing.
+@test("an 'extern' variable something reads is an 'external global' and one nothing reads is not")
+an_extern_variable_read_is_declared()
+    if no_form_library() then return
+
+    val text = form_module("extern optind: i32\n" +
+                           "extern environ: **u8\n" +
+                           "\n" +
+                           "print(optind)\n")
+
+    assert(text.contains("@optind = external global i32\n"))
+    assert(!text.contains("@environ"))
+end an_extern_variable_read_is_declared
 
 // The `declare` lines of the externs a program reaches, in the order the module writes them down.
 private form_declares(text: string) -> Buf[string]
