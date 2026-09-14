@@ -51,12 +51,8 @@ end vis_no_library
 // The files of one program, each named the way a diagnostic about it will be: a bare file name,
 // since the module a file contributes to is whatever its header says and the directory around it is
 // the driver's business rather than the analyzer's.
-private vis_units(files: []const (string, string)) -> Result[Buf[Program], string]
+private vis_parsed(files: []const (string, string)) -> Result[Buf[Program], string]
     var units: Buf[Program] = buf()
-    val library = vis_library()
-
-    for i in 0..<library.len()
-        units.push(library.at(i))
 
     for i in 0..<files.len
         val parsed = parse(source_of(files[i].0, files[i].1))
@@ -66,29 +62,63 @@ private vis_units(files: []const (string, string)) -> Result[Buf[Program], strin
         units.push(parsed.program)
 
     Ok(units)
+end vis_parsed
+
+private vis_units(files: []const (string, string)) -> Result[Buf[Program], string]
+    var units: Buf[Program] = buf()
+    val library = vis_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    val rest = vis_parsed(files)?
+
+    for i in 0..<rest.len()
+        units.push(rest.at(i))
+
+    Ok(units)
 end vis_units
 
-// The whole report a program is refused with, rendered the way a reader sees it.
-private vis_err(files: []const (string, string)) -> string
-    val units = vis_units(files) match
-        Err(why) -> return why
-        Ok(us) -> us
+// A **stand-in standard module**, written by the test rather than read from `library/sysl`.
+//
+// Some questions are about the library's *position* rather than about what it happens to declare --
+// that a program reaches its members without importing them, that it is searched after a file's
+// imports, that what it keeps to itself is out of reach. Asking those of the real library means the
+// answer changes whenever the library does, and a question it has no case for cannot be asked at
+// all: nothing in `library/sysl` is private, so nothing there can show what a private member of the
+// library does.
+//
+// A program compiled this way has **only** what the stand-in declares, so these fixtures state
+// everything they use.
+private vis_stand_in(lib: []const (string, string),
+                     files: []const (string, string)) -> Result[Buf[Program], string]
+    var units = vis_parsed(lib)?
+    val rest = vis_parsed(files)?
 
+    for i in 0..<rest.len()
+        units.push(rest.at(i))
+
+    Ok(units)
+end vis_stand_in
+
+// The whole report a program is refused with, rendered the way a reader sees it.
+private vis_report(units: Buf[Program]) -> string
     val done = analyze_bodies(units, host_target())
     val whole = program_of(done, "")
 
     post_analysis_checks(done.an, whole, buf())
 
     analysis_report(errors_of(done.an.diagnostics()))
-end vis_err
+end vis_report
+
+private vis_err(files: []const (string, string)) -> string
+    vis_units(files) match
+        Err(why) -> why
+        Ok(us) -> vis_report(us)
 
 // The LLVM text of a program of several files, which is what a claim about linkage or about a
 // mangled symbol is read out of.
-private vis_ir(files: []const (string, string)) -> string
-    val units = vis_units(files) match
-        Err(why) -> return why
-        Ok(us) -> us
-
+private vis_ir_of(units: Buf[Program]) -> string
     val done = analyze_bodies(units, host_target())
     val whole = program_of(done, "")
     val promotions = post_analysis_checks(done.an, whole, buf())
@@ -99,7 +129,23 @@ private vis_ir(files: []const (string, string)) -> string
     val kept = prune(strip_tests(whole), buf())
 
     ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
-end vis_ir
+end vis_ir_of
+
+private vis_ir(files: []const (string, string)) -> string
+    vis_units(files) match
+        Err(why) -> why
+        Ok(us) -> vis_ir_of(us)
+
+// The same two answers, of a program compiled against a stand-in standard module.
+private vis_lib_err(lib: []const (string, string), files: []const (string, string)) -> string
+    vis_stand_in(lib, files) match
+        Err(why) -> why
+        Ok(us) -> vis_report(us)
+
+private vis_lib_ir(lib: []const (string, string), files: []const (string, string)) -> string
+    vis_stand_in(lib, files) match
+        Err(why) -> why
+        Ok(us) -> vis_ir_of(us)
 
 // What a program of several files **prints**, which is the one claim nothing short of running can
 // make. The tree goes on disk, since a module is a directory and a build reads one.
@@ -128,6 +174,20 @@ private vis_ran(files: []const (string, string)) -> string
         Err(_) -> "the program that was built could not be run"
         Ok(out) -> out.text
 end vis_ran
+
+// How many times a report says something, which is what a claim about a name being reported ONCE is
+// read out of: resolving a trait twice must not complain twice.
+private vis_times(text: string, needle: string) -> usize
+    var seen: usize = 0
+    var at: usize = 0
+
+    loop
+        text.index_of_from(needle, at) match
+            None -> return seen
+            Some(i) ->
+                seen += 1
+                at = i + 1
+end vis_times
 
 // A module in two files, one of which keeps a helper to itself. Every case below differs only in
 // where it tries to name `scale` from.
@@ -709,3 +769,463 @@ the_declaring_file_goes_on_getting_its_own()
                        ("geom/g.sysl",
                         "module geom\nprivate width(n: int) -> int = n * 2\ngo() -> int = width(21)\n"),
                        ("text/t.sysl", "module text\nwidth(n: int) -> int = n + 1\n")]), "42\n")
+
+// -- a member the library keeps to itself -------------------------------------------------------
+
+// The library is reached without an import and searched after everything else, which is what makes
+// it the one step where a restriction could go unasked: a program writes its members bare, and a
+// bare name that resolved is a name nothing questioned. These are asked of a stand-in standard
+// module because the real one declares nothing private, so the real one cannot pose the question.
+
+// The stand-in itself: a scoped-private helper the module's own public wrapper reaches.
+private vis_lib() -> string =
+    "module sysl\nprivate[sysl] carry(n: int) -> int = n * 2\ntwice(n: int) -> int = carry(n)\n"
+
+@test("is not what a program's bare name resolves to")
+a_library_member_it_keeps_is_not_what_a_bare_name_resolves_to()
+    val out = vis_lib_err([("std.sysl", vis_lib())], [("main.sysl", "carry(21)\n")])
+
+    assert(out.contains("'sysl.carry' is private to module 'sysl'"), out)
+end a_library_member_it_keeps_is_not_what_a_bare_name_resolves_to
+
+@test("and the qualified spelling says the same thing, which is the point")
+the_qualified_spelling_of_a_kept_library_member_says_the_same_thing()
+    val out = vis_lib_err([("std.sysl", vis_lib())], [("main.sysl", "sysl.carry(21)\n")])
+
+    assert(out.contains("'sysl.carry' is private to module 'sysl'"), out)
+end the_qualified_spelling_of_a_kept_library_member_says_the_same_thing
+
+@test("while what the library does offer is reached with no import at all")
+what_the_library_offers_is_reached_with_no_import_at_all()
+    val out = vis_lib_ir([("std.sysl", vis_lib())], [("main.sysl", "twice(21)\n")])
+
+    assert(out.contains("call i32 @sysl$twice"), out)
+end what_the_library_offers_is_reached_with_no_import_at_all
+
+@test("and the library's own files go on reaching it")
+the_librarys_own_files_go_on_reaching_what_it_keeps()
+    val out = vis_lib_ir([("std.sysl", vis_lib())], [("main.sysl", "twice(21)\n")])
+
+    assert(out.contains("call i32 @sysl$carry"), out)
+end the_librarys_own_files_go_on_reaching_what_it_keeps
+
+@test("a program may declare the name the library kept, and mean its own")
+a_program_may_declare_the_name_the_library_kept()
+    val out = vis_lib_ir([("std.sysl", vis_lib())],
+                         [("main.sysl", "carry(n: int) -> int = n + 1\ncarry(21)\n")])
+
+    assert(out.contains("call i32 @carry"), out)
+end a_program_may_declare_the_name_the_library_kept
+
+@test("a file-private one is out of reach the same way")
+a_file_private_library_member_is_out_of_reach_the_same_way()
+    val out = vis_lib_err([("std.sysl",
+                            "module sysl\nprivate carry(n: int) -> int = n * 2\n" +
+                            "twice(n: int) -> int = carry(n)\n")],
+                          [("main.sysl", "carry(21)\n")])
+
+    assert(out.contains("private to 'std.sysl', the file that declares it"), out)
+end a_file_private_library_member_is_out_of_reach_the_same_way
+
+@test("and a second library file may not reach that one either")
+a_second_library_file_may_not_reach_a_file_private_one_either()
+    val out = vis_lib_err([("a.sysl", "module sysl\nprivate carry(n: int) -> int = n * 2\n"),
+                           ("b.sysl", "module sysl\ntwice(n: int) -> int = carry(n)\n")],
+                          [("main.sysl", "twice(21)\n")])
+
+    assert(out.contains("private to 'a.sysl', the file that declares it"), out)
+end a_second_library_file_may_not_reach_a_file_private_one_either
+
+// The tables are asked separately -- a spelling may be a type in one module and a function in
+// another -- so a restriction that held for one of them says nothing about the rest.
+@test("a type it keeps is out of reach the same way")
+a_type_the_library_keeps_is_out_of_reach_the_same_way()
+    val out = vis_lib_err([("std.sysl", "module sysl\nprivate[sysl] struct Cell\n    n: int\n")],
+                          [("main.sysl", "f(c: Cell) -> int = c.n\n")])
+
+    assert(out.contains("'sysl.Cell' is private to module 'sysl'"), out)
+end a_type_the_library_keeps_is_out_of_reach_the_same_way
+
+@test("and so is a trait it keeps")
+a_trait_the_library_keeps_is_out_of_reach_too()
+    val out = vis_lib_err([("std.sysl", "module sysl\nprivate[sysl] trait Carry\n    carry(self) -> int\n")],
+                          [("main.sysl", "f[T: Carry](x: T) -> int = x.carry()\n")])
+
+    assert(out.contains("'sysl.Carry' is private to module 'sysl'"), out)
+end a_trait_the_library_keeps_is_out_of_reach_too
+
+@test("and a variant of an enum it keeps, which is named without naming the enum")
+a_variant_of_an_enum_the_library_keeps_goes_with_it()
+    val out = vis_lib_err([("std.sysl", "module sysl\nprivate[sysl] enum Step\n    Go(n: int)\n    Stop\n")],
+                          [("main.sysl", "f() -> int = 1\nvar s = Go(3)\n")])
+
+    assert(out.contains("private to module 'sysl'"), out)
+end a_variant_of_an_enum_the_library_keeps_goes_with_it
+
+@test("naming it in an import is refused where the import is written")
+naming_a_kept_library_member_in_an_import_is_refused_at_the_import()
+    val out = vis_lib_err([("std.sysl", vis_lib())], [("main.sysl", "import sysl.carry\ncarry(21)\n")])
+
+    assert(out.contains("'sysl.carry' is private to module 'sysl'"), out)
+end naming_a_kept_library_member_in_an_import_is_refused_at_the_import
+
+@test("and a wildcard over the library does not offer it")
+a_wildcard_over_the_library_does_not_offer_what_it_keeps()
+    val out = vis_lib_err([("std.sysl", vis_lib())], [("main.sysl", "import sysl.*\ncarry(21)\n")])
+
+    assert(out.contains("'sysl.carry' is private to module 'sysl'"), out)
+end a_wildcard_over_the_library_does_not_offer_what_it_keeps
+
+// -- the rest of the surface it reaches ------------------------------------------------------------
+
+@test("a module brought in by name, whose member is private")
+a_module_brought_in_by_name_whose_member_is_private()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "import text.util\nprint(util.width(4))\n"),
+                       ("u.sysl", "module text.util\nprivate width(n: int) -> int = n + 1\n")])
+
+    assert(out.contains("'text.util.width' is private to 'u.sysl'"), out)
+end a_module_brought_in_by_name_whose_member_is_private
+
+// A directory holding only sub-directories is a module's parent without being a module itself, and
+// `private[M]` names an enclosing *path* -- so it is a scope like any other.
+@test("an ancestor that holds no source of its own")
+an_ancestor_that_holds_no_source_of_its_own()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(a.b.c.go())\n"),
+                       ("a/b/c/c.sysl",
+                        "module a.b.c\nprivate[b] step(n: int) -> int = n + 1\ngo() -> int = step(4)\n")]),
+              "5\n")
+
+@test("which still keeps everything outside it out")
+an_ancestor_holding_no_source_still_keeps_everything_outside_it_out()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(a.b.c.step(4))\n"),
+                       ("c.sysl", "module a.b.c\nprivate[b] step(n: int) -> int = n + 1\n")])
+
+    assert(out.contains("'a.b.c.step' is private to module 'a.b'"), out)
+end an_ancestor_holding_no_source_still_keeps_everything_outside_it_out
+
+@test("a sibling module under the same ancestor may reach it, and one outside may not")
+a_sibling_under_the_same_ancestor_may_reach_it_and_one_outside_may_not()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(1)\n"),
+                       ("x.sysl", "module a.b\nprivate[a] step(n: int) -> int = n\n"),
+                       ("y.sysl", "module a.c\ngo() -> int = a.b.step(1)\n"),
+                       ("z.sysl", "module d\nreach() -> int = a.b.step(1)\n")])
+
+    assert(out.contains("'a.b.step' is private to module 'a'"), out)
+end a_sibling_under_the_same_ancestor_may_reach_it_and_one_outside_may_not
+
+@test("a private declaration may name itself")
+a_private_declaration_may_name_itself()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl",
+                        "private down(n: int) -> int =\n    if n <= 0 then 0 else down(n - 1) + 1\n" +
+                        "print(down(5))\n")]), "5\n")
+
+// Naming a trait is resolved twice -- once where the bound is written, once by the definition-time
+// walk -- and one unreachable name is one mistake, not two.
+@test("a private trait in a bound is reported once")
+a_private_trait_in_a_bound_is_reported_once()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "loud[T: geom.Show](x: T) -> int = 1\nprint(1)\n"),
+                       ("g.sysl", "module geom\nprivate trait Show\n    show(self) -> int\n")])
+
+    assert(out.contains("'geom.Show' is private to 'g.sysl'"), out)
+    assert_eq(vis_times(out, "is private to"), 1, out)
+end a_private_trait_in_a_bound_is_reported_once
+
+// -- a declaration may not be more visible than the types it names ---------------------------------
+
+// A restriction a signature could carry a value out of would hardly be one: another module could
+// hold a value of a type it cannot name, pass it on, and read its fields. So what a declaration says
+// about itself has to be as nameable as the declaration is.
+
+// The tail every one of these refusals carries, quoted once rather than at each of the seventeen.
+private vis_no_wider() -> string =
+    "which is private to 'main.sysl', the file that declares it — a declaration may not be more " +
+    "visible than the types it names"
+
+// A file declaring a private `Point` and one public declaration that names it.
+private vis_leaks(rest: string) -> string = s"private struct Point\n    x: int\n${rest}print(1)\n"
+
+@test("a public function's result")
+a_public_functions_result_may_not_name_a_private_type()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", vis_leaks("make() -> Point = Point(1)\n"))])
+
+    assert(out.contains(s"'make' is public, but its result names 'Point', ${vis_no_wider()}"), out)
+end a_public_functions_result_may_not_name_a_private_type
+
+@test("a public function's parameter")
+a_public_functions_parameter_may_not_name_a_private_type()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", vis_leaks("read(p: Point) -> int = p.x\n"))])
+
+    assert(out.contains(s"'read' is public, but parameter 'p' names 'Point', ${vis_no_wider()}"), out)
+end a_public_functions_parameter_may_not_name_a_private_type
+
+@test("and a type reached through a slice or a memory mode is named just as much")
+a_type_reached_through_a_slice_is_named_just_as_much()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", vis_leaks("count(ps: []Point) -> int = 0\n"))])
+
+    assert(out.contains("'count' is public, but parameter 'ps' names 'Point'"), out)
+end a_type_reached_through_a_slice_is_named_just_as_much
+
+// A bound is part of what a caller has to satisfy, so a trait it cannot name leaves it unable to say
+// what the declaration is asking of it.
+@test("a bound naming a private trait")
+a_bound_naming_a_private_trait_is_refused()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl",
+                        "private trait Show\n    show(self) -> int\n" +
+                        "loud[T: Show](x: T) -> int = x.show()\nprint(1)\n")])
+
+    assert(out.contains("'loud' is public, but the bound on 'T' names 'Show', which is private to " +
+                        "'main.sysl'"), out)
+end a_bound_naming_a_private_trait_is_refused
+
+// A field carries its own reach, so it is named as one and asked at its own -- public here, since it
+// said nothing and the struct it belongs to is public.
+@test("a field of a public struct")
+a_field_of_a_public_struct_may_not_name_a_private_type()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", vis_leaks("struct Line\n    a: Point\n"))])
+
+    assert(out.contains("'Line.a' is public, but its type names 'Point'"), out)
+end a_field_of_a_public_struct_may_not_name_a_private_type
+
+@test("the payload of a public enum's variant")
+the_payload_of_a_public_enums_variant_may_not_name_a_private_type()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", vis_leaks("enum Shape\n    Dot(at: Point)\n    Round\n"))])
+
+    assert(out.contains("'Shape' is public, but the 'at' of variant 'Dot' names 'Point'"), out)
+end the_payload_of_a_public_enums_variant_may_not_name_a_private_type
+
+// A member carries no modifier of its own, so it is as visible as the type it belongs to.
+@test("a member of a public struct")
+a_member_of_a_public_struct_may_not_name_a_private_type()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl",
+                        vis_leaks("struct Line\n    n: int\n    tip(self) -> Point = Point(self.n)\n"))])
+
+    assert(out.contains("'Line.tip' is public, but its result names 'Point'"), out)
+end a_member_of_a_public_struct_may_not_name_a_private_type
+
+@test("a method a public trait declares")
+a_method_a_public_trait_declares_may_not_name_a_private_type()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", vis_leaks("trait Tip\n    tip(self) -> Point\n"))])
+
+    assert(out.contains("'Tip.tip' is public, but its result names 'Point'"), out)
+end a_method_a_public_trait_declares_may_not_name_a_private_type
+
+@test("an extern, which the linker resolves and the rule reaches all the same")
+an_extern_is_held_to_the_rule_all_the_same()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl",
+                        "private enum Mode\n    On\n    Off\nextern pick() -> Mode\nprint(1)\n")])
+
+    assert(out.contains("'pick' is public, but its result names 'Mode'"), out)
+end an_extern_is_held_to_the_rule_all_the_same
+
+@test("a type argument, which is named as much as the type it is applied to")
+a_type_argument_is_named_as_much_as_the_type_it_is_applied_to()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl",
+                        vis_leaks("struct Box[T]\n    value: T\nmake() -> Box[Point] = Box(Point(1))\n"))])
+
+    assert(out.contains("'make' is public, but its result names 'Point'"), out)
+end a_type_argument_is_named_as_much_as_the_type_it_is_applied_to
+
+@test("a trait behind a memory mode, which is an object over it")
+a_trait_behind_a_memory_mode_is_named_just_as_much()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl",
+                        "private trait Show\n    show(self) -> int\n" +
+                        "render(s: &Show) -> int = s.show()\nprint(1)\n")])
+
+    assert(out.contains("'render' is public, but parameter 's' names 'Show'"), out)
+end a_trait_behind_a_memory_mode_is_named_just_as_much
+
+// The diagnostic names the type by the path a reader would have to be able to write, not by the
+// shorter spelling this file gave it -- the alias is exactly what they do not have.
+@test("and an alias does not hide which type is meant")
+an_alias_does_not_hide_which_type_is_meant()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(1)\n"),
+                       ("g.sysl", "module geom\nprivate[geom] struct P\n    x: int\n"),
+                       ("h.sysl", "module geom\nimport geom.{P as Q}\nmake() -> Q = Q(1)\n")])
+
+    assert(out.contains("'make' is public, but its result names 'geom.P', which is private to " +
+                        "module 'geom'"), out)
+end an_alias_does_not_hide_which_type_is_meant
+
+// The declarations that are a **name and one type**. They carry no signature, so the hole is reached
+// by a shorter route than a function's -- a module that may write the name holds a value whose type
+// it cannot write, which is the same hole and not a smaller one.
+@test("a public module-level 'val'")
+a_public_module_level_val_may_not_name_a_private_type()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", vis_leaks("static val here: Point = Point(1)\n"))])
+
+    assert(out.contains("'here' is public, but its type names 'Point'"), out)
+end a_public_module_level_val_may_not_name_a_private_type
+
+@test("and a public 'extern' variable, whose storage the linker supplies")
+a_public_extern_variable_may_not_name_a_private_type()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", vis_leaks("extern there: Point\n"))])
+
+    assert(out.contains("'there' is public, but its type names 'Point'"), out)
+end a_public_extern_variable_may_not_name_a_private_type
+
+// A `const` is the third of them and cannot reach this rule at all: a constant is held to being a
+// scalar, and every scalar is a builtin nobody may restrict. The case below is what says so, and the
+// check covers `const` anyway so that widening what a constant may hold cannot quietly reopen what
+// these two had.
+@test("while a 'const' naming a type that is not one is refused before the question arises")
+a_const_naming_a_type_that_is_not_one_is_refused_first()
+    if vis_no_library() then return
+
+    val storage = vis_err([("main.sysl", "struct Point\n    x: int\nconst c: Point = 5\nprint(1)\n")])
+
+    assert(storage.contains("a constant is a scalar, and Point is storage"), storage)
+
+    val not_scalar = vis_err([("main.sysl",
+                               "enum Mode\n    On\n    Off\nconst c: Mode = 5\nprint(1)\n")])
+
+    assert(not_scalar.contains("a constant is a scalar, and Mode is not"), not_scalar)
+
+    val made = vis_err([("main.sysl", "type Tag = new int\nconst c: Tag = 5\nprint(1)\n")])
+
+    assert(made.contains("is a 'new' type"), made)
+end a_const_naming_a_type_that_is_not_one_is_refused_first
+
+@test("and a 'const' at a transparent subtype, which is the one form that does reach the question")
+a_const_at_a_transparent_subtype_reaches_the_question()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl",
+                        "private type Small = int within 0..<10\nconst c: Small = 5\nprint(1)\n")])
+
+    assert(out.contains("'c' is public, but its type names 'Small'"), out)
+end a_const_at_a_transparent_subtype_reaches_the_question
+
+// Both are restricted; what fails is that one subtree does not contain the other.
+@test("a 'private[M]' signature naming a type scoped more narrowly than it is")
+a_scoped_signature_naming_a_type_scoped_more_narrowly()
+    if vis_no_library() then return
+
+    val out = vis_err([("main.sysl", "print(1)\n"),
+                       ("x.sysl",
+                        "module a.b\nprivate[b] struct P\n    x: int\n" +
+                        "private[a] make() -> P = P(1)\n")])
+
+    assert(out.contains("'make' is visible throughout module 'a', but its result names 'a.b.P', " +
+                        "which is private to module 'a.b'"), out)
+end a_scoped_signature_naming_a_type_scoped_more_narrowly
+
+// -- but a signature naming a type that reaches at least as far is fine -----------------------------
+
+// The one level that never needs checking: a file-private declaration is read in one file, and every
+// type it names is visible there or the signature would not have resolved.
+@test("a private function may name a private type")
+a_private_function_may_name_a_private_type()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(geom.read())\n"),
+                       ("geom/g.sysl",
+                        "module geom\nprivate struct P\n    x: int\nprivate make() -> P = P(7)\n" +
+                        "read() -> int = make().x\n")]), "7\n")
+
+@test("and a narrower scope may name a type its ancestor keeps")
+a_narrower_scope_may_name_a_type_its_ancestor_keeps()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(a.b.go())\n"),
+                       ("a/b/x.sysl",
+                        "module a.b\nprivate[a] struct P\n    x: int\nprivate[b] make() -> P = P(7)\n" +
+                        "go() -> int = make().x\n")]), "7\n")
+
+@test("and one private type may be another's field, in the file that has both")
+one_private_type_may_be_anothers_field_in_the_file_that_has_both()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl",
+                        "private struct Point\n    x: int\nprivate struct Line\n    a: Point\n" +
+                        "print(Line(Point(6)).a.x)\n")]), "6\n")
+
+// The rule is about names, and a signature's type parameters are not names of declarations -- even
+// where the module happens to declare something spelled the same way.
+@test("a type parameter is not the private type it shares a spelling with")
+a_type_parameter_is_not_the_private_type_it_shares_a_spelling_with()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl",
+                        "private struct T\n    x: int\nid[T](x: T) -> T = x\nprint(id(5))\n")]), "5\n")
+
+// The same exemption the function form gets, asked of the name-and-one-type declarations: restricted
+// to the file that declares the type, there is nobody who could hold the value and be unable to name
+// it.
+@test("a private 'val' and 'extern' variable may each name a private type")
+a_private_val_and_extern_variable_may_each_name_a_private_type()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl",
+                        "private struct Point\n    x: int\nprivate val here: Point = Point(6)\n" +
+                        "private extern there: Point\nprint(here.x)\n")]), "6\n")
+
+@test("and a scoped one may name a type its ancestor keeps")
+a_scoped_val_may_name_a_type_its_ancestor_keeps()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl", "print(a.b.go())\n"),
+                       ("a/b/x.sysl",
+                        "module a.b\nprivate[a] struct P\n    x: int\nprivate[b] val kept: P = P(7)\n" +
+                        "go() -> int = kept.x\n")]), "7\n")
+
+// -- an 'impl' is outside the rule, in both directions -----------------------------------------------
+
+// An `impl` names no type of its own, so neither half of it is a leak: the members' signatures are
+// the trait's, and a mismatch is refused as non-conformance rather than reaching this rule at all.
+@test("a private trait may be implemented for a public type")
+a_private_trait_may_be_implemented_for_a_public_type()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl",
+                        "private trait Show\n    show(self) -> int\nstruct Tag\n    n: int\n" +
+                        "impl Show for Tag\n    show(self) -> int = self.n\nprint(Tag(5).show())\n")]),
+              "5\n")
+
+@test("and a public trait for a private type")
+a_public_trait_may_be_implemented_for_a_private_type()
+    if vis_no_library() then return
+
+    assert_eq(vis_ran([("main.sysl",
+                        "trait Show\n    show(self) -> int\nprivate struct Tag\n    n: int\n" +
+                        "impl Show for Tag\n    show(self) -> int = self.n\nprint(Tag(5).show())\n")]),
+              "5\n")
