@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.from_int
-import sysl.text.{str_builder, StrBuilder}
+import sysl.text.{str_builder, Search, StrBuilder}
 
 // Reaching a member: what a type declares of its own, what a trait gave it, and what a table
 // dispatches to when the value has forgotten which type it holds.
@@ -952,13 +952,23 @@ private member_reachable(cx: &Analyzer, base: string, filed: string) -> bool
     // A member that arrives with its type is reachable wherever the type is.
     if from.is_none() then return true
 
-    reachable_key(cx.an, from.unwrap(), cx.scope) || names_trait(cx, from.unwrap())
+    // **A member an `impl` brought is reached where its trait can be NAMED, not merely where the
+    // trait is visible.** The two are different questions and only the first is what an import
+    // changes: `sysl.text.Search` is public everywhere, so a visibility test answers yes in a file
+    // that never imported it and `"  x  ".trim()` compiles where the reference refuses it.
+    names_trait(cx, from.unwrap())
 end member_reachable
 
 // Whether the file the expression is written in can name a trait: its own module's, one it imported,
 // or one a bound in force promised.
 private names_trait(cx: &Analyzer, key: string) -> bool
-    if module_of(key) == cx.scope.module_name then return true
+    val home = module_of(key)
+
+    if home == cx.scope.module_name then return true
+
+    // A module below the one that declares the trait names it too, which is what makes a module
+    // split across a directory one thing to its own files.
+    if cx.scope.module_name.starts_with(s"$home.") then return true
 
     for i in 0..<cx.subst.len()
         cx.subst.at(i).ty match
