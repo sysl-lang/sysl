@@ -277,6 +277,91 @@ private record_access(a: &Analysis, scope: Scope, span: Span, key: string, vis: 
     a.tables.access.put(key, Access(vis, scope.src.name, scope.module_name))
 end record_access
 
+// Files how far each field and member of a type may be named from.
+//
+// **Silence is not "public" here**: an unmarked member is as visible as the type it belongs to, so
+// the owner's own answer is copied onto it and a member of a restricted type is restricted without
+// having said anything. A trait's members carry no modifier of their own and are filed the same way,
+// which is what puts a private trait's methods out of reach with it.
+private record_members_access(a: &Analysis, scope: Scope, key: string, written: string,
+                              vis: Visibility, kind: DeclKind)
+    kind match
+        StructOf(d) ->
+            for i in 0..<d.fields.len()
+                val f = d.fields.at(i)
+
+                record_member_access(a, scope, key, written, vis, f.name, f.vis, f.span)
+
+            for i in 0..<d.members.len()
+                val m = d.members.at(i)
+
+                record_member_access(a, scope, key, written, vis, m.name, m.vis, m.span)
+        EnumOf(d) ->
+            for i in 0..<d.members.len()
+                val m = d.members.at(i)
+
+                record_member_access(a, scope, key, written, vis, m.name, m.vis, m.span)
+        TraitOf(d) ->
+            for i in 0..<d.methods.len()
+                val m = d.methods.at(i)
+
+                record_member_access(a, scope, key, written, vis, m.name, Public, m.span)
+        _ -> ()
+end record_members_access
+
+// One field's or member's reach. A written modifier may only NARROW: a member reachable where its
+// type is not is a member nothing can name anyway, so the claim would be false rather than merely
+// useless, and it is reported at the modifier rather than clamped in silence.
+private record_member_access(a: &Analysis, scope: Scope, owner: string, written: string,
+                             owner_vis: Visibility, name: string, vis: Visibility, span: Span)
+    val at = member_access_key(owner, name)
+    val label = s"$written.$name"
+
+    vis match
+        Public ->
+            a.tables.access.get(owner) match
+                Some(acc) -> a.tables.access.put(at, acc)
+                None -> ()
+        File -> a.tables.access.put(at, Access(File, scope.src.name, scope.module_name))
+        Scoped(m) ->
+            val sub = widened_to(scope.module_name, m)
+
+            if sub.is_none()
+                a.fault(scope, span, scope_names_nothing(m, scope.module_name))
+                return
+            end if
+
+            if wider_than_owner(scope, owner_vis, sub.unwrap())
+                a.fault(scope, span,
+                        s"'$label' is visible throughout module '${sub.unwrap()}', but " +
+                        s"'${module_show(owner)}' is ${out_of_reach_tail(scope, owner_vis)} — a " +
+                        "member cannot be more visible than the type it belongs to")
+
+                a.tables.access.get(owner) match
+                    Some(acc) -> a.tables.access.put(at, acc)
+                    None -> ()
+
+                return
+            end if
+
+            a.tables.access.put(at, Access(vis, scope.src.name, scope.module_name))
+end record_member_access
+
+// Whether a member widened to `sub` would reach past the type it belongs to.
+private wider_than_owner(scope: Scope, owner_vis: Visibility, sub: string) -> bool = owner_vis match
+    Public -> false
+    File -> true
+    Scoped(m) -> widened_to(scope.module_name, m) match
+        None -> false
+        Some(top) -> !beneath(sub, top)
+
+// How far the owning type reaches, in the words the refusal above quotes.
+private out_of_reach_tail(scope: Scope, vis: Visibility) -> string = vis match
+    Scoped(m) -> widened_to(scope.module_name, m) match
+        None -> s"private to '${scope.src.name}', the file that declares it"
+        Some(top) -> s"private to module '$top'"
+    _ -> s"private to '${scope.src.name}', the file that declares it"
+
 // Registers a name that stands for a type.
 private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vis: Visibility,
                         kind: DeclKind)
@@ -289,6 +374,7 @@ private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vi
 
     a.tables.types.put(key, Decl(kind, span, scope))
     record_access(a, scope, span, key, vis)
+    record_members_access(a, scope, key, name, vis, kind)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
 

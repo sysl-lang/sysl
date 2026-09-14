@@ -991,15 +991,13 @@ private check_member_visible(cx: &Analyzer, span: Span, base: string, filed: str
         return
     end if
 
-    m.vis match
-        File ->
-            val decl_at = cx.an.tables.members.decl_scope.get(
-                cx.an.tables.members.funcs.get(member_key_of(base, filed)).unwrap_or(""))
+    // **Silence is not "public"**: an unmarked member sits at its type's reach, so the answer comes
+    // out of the access table the hoist filed it in rather than off the modifier alone.
+    val name = source_member_name(filed)
 
-            if decl_at.is_some() && decl_at.unwrap().src.name != cx.scope.src.name then
-                cx.fault(span, s"${member_kind(m)} '${source_member_name(filed)}' of " +
-                         s"'${module_show(base)}' is private to the file that declares it")
-        _ -> ()
+    if !member_in_reach(cx.an, base, name, cx.scope) then
+        cx.fault(span, s"${member_kind(m)} '$name' of '${module_show(base)}' is " +
+                 member_restriction(cx.an, base, name))
 end check_member_visible
 
 // -- the answers when nothing is filed ----------------------------------------------------------------
@@ -1438,8 +1436,7 @@ callable_field(cx: &Analyzer, span: Span, rty: Type, name: string, recv: TExpr, 
     if !is_cfn && callable_of(cx.an, fty).is_none() then return None
 
     if !field_visible(cx, d.unwrap().base, name) then
-        return Some(cx.err(span, s"'$name' is private to the file that declares " +
-                           s"'${module_show(d.unwrap().base)}'"))
+        return Some(cx.err(span, field_out_of_reach(cx, d.unwrap().base, name)))
 
     val field = TExpr(span, TField(auto_deref(cx, recv), idx, fty))
 

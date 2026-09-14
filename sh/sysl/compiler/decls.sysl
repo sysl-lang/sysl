@@ -583,6 +583,29 @@ private_to(key: string, file: string) -> string =
 private_to_module(key: string, at: string) -> string =
     s"'${module_show(key)}' is private to module '$at'"
 
+// The key a **field or a member** of `owner` is filed under, in the same table a top-level
+// declaration's reach is. A declaration's own name never holds a dot, so no top-level key can
+// collide with one of these.
+member_access_key(owner: string, name: string) -> string = s"$owner.$name"
+
+// Whether a field or a member of `owner` is one this scope may name.
+member_in_reach(a: &Analysis, owner: string, name: string, from: Scope) -> bool =
+    a.tables.access.get(member_access_key(owner, name)) match
+        None -> true
+        Some(acc) -> reachable(acc, from)
+
+// Why a member may not be named here -- the tail of the sentence, the head being what kind of member
+// it is and whose. The two levels read differently: the file form names the file, the wider one the
+// module it widened to.
+member_restriction(a: &Analysis, owner: string, name: string) -> string =
+    a.tables.access.get(member_access_key(owner, name)) match
+        None -> "private"
+        Some(acc) -> acc.vis match
+            Scoped(scoped) -> widened_to(acc.module_name, scoped) match
+                None -> s"private to '${acc.file}', the file that declares it"
+                Some(m) -> s"private to module '$m'"
+            _ -> s"private to '${acc.file}', the file that declares it"
+
 // How far a name reaches, which for a variant is its enum's and for everything else its own.
 access_for(a: &Analysis, key: string) -> Option[Access] = a.tables.access.get(key) match
     Some(acc) -> Some(acc)
