@@ -1,0 +1,247 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A trait's members are reached where the TRAIT can be named, not wherever its implementing type
+// can.** Two traits may each give one type a member of the same name, and which one a use means is
+// read off what the file imported — so the claims here are about a whole program, and most of them
+// are what it PRINTS. Nothing short of running says that.
+//
+// **Every refusal quoted here was obtained by running the reference compiler on the same source.**
+
+private var tr_library_cache: Buf[Program] = buf()
+private var tr_library_read: bool = false
+
+private tr_library() -> Buf[Program]
+    if tr_library_read then return tr_library_cache
+
+    tr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tr_library_cache = units
+
+    tr_library_cache
+end tr_library
+
+private tr_no_library() -> bool
+    if tr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end tr_no_library
+
+// Everything a source read beside the library has to say about itself, joined — the library's own
+// complaints left out, since they are not what a test about a program is asking.
+private tr_err(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = tr_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    var out = str_builder()
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/")
+            out.push(done.reported.at(i).diag.message)
+            out.push_char('\n')
+
+    out.finish()
+end tr_err
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private tr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-trait").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tr_ran
+
+private tr_can_run() -> bool
+    if tr_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end tr_can_run
+
+// -- two traits, one member name ------------------------------------------------------------------
+
+private tr_two_zeros() -> string = raw"""
+    trait Zero
+        zero() -> Self
+
+    trait Blank
+        zero() -> Self
+
+    impl Zero for int
+        zero() -> int = 0
+
+    impl Blank for int
+        zero() -> int = -1
+
+    """
+
+@test("two traits may each give one type a member of the same name")
+two_traits_may_each_name_one_member()
+    if !tr_can_run() then return
+
+    assert_eq(tr_ran(tr_two_zeros() + "main()\n    print(\"ok\")\n"), "ok\n")
+
+// What the whole rule rests on: a submodule is reached by naming or importing it, so a library trait
+// is out of scope in a file that did not ask for it — which is what leaves its member names free.
+@test("a submodule's trait is not nameable without its import")
+a_submodules_trait_needs_its_import()
+    if tr_no_library() then return
+
+    assert(tr_err("impl Float for f64\n    sqrt(self) -> f64 = 0.0\n").contains("unknown trait 'Float'"),
+           "the refusal names the trait")
+
+// The second axis crossing the first: two implementations of one parameterized trait are told apart
+// by their arguments, a third trait's member of the same name by scope — three members, one name.
+private tr_three_ofs(blank_param: string) -> string =
+    "trait Of[T]\n    of(x: T) -> Self\n\n" +
+    s"trait Blank\n    of(x: $blank_param) -> Self\n\n" +
+    "struct P\n    n: int\n\n" +
+    "impl Of[int] for P\n    of(x: int) -> P = P(x)\n\n" +
+    "impl Of[string] for P\n    of(x: string) -> P = P(1)\n\n" +
+    s"impl Blank for P\n    of(x: $blank_param) -> P = P(99)\n\n" +
+    "main()\n    print(P.of(7).n)\n"
+
+@test("a third trait may name what two implementations of one already share")
+a_third_trait_may_name_what_two_share()
+    if !tr_can_run() then return
+
+    assert_eq(tr_ran(tr_three_ofs("bool")), "7\n")
+
+// A default the block left out is hoisted for the implementing type exactly as a written method is,
+// and the block it lands in is the suffixed one — so the copy is filed under the same suffix.
+@test("a default is inherited into the block that took the suffix")
+a_default_is_inherited_into_the_suffixed_block()
+    if !tr_can_run() then return
+
+    assert_eq(tr_ran(raw"""
+        trait Zero
+            zero() -> Self
+
+        trait Blank
+            zero() -> Self
+            twice(self) -> int = 2
+
+        impl Zero for int
+            zero() -> int = 0
+
+        impl Blank for int
+            zero() -> int = -1
+
+        main()
+            var n = 7
+            print(n.twice())
+        """), "2\n")
+
+@test("and so is a method only the suffixed block declares")
+a_method_only_the_suffixed_block_declares()
+    if !tr_can_run() then return
+
+    assert_eq(tr_ran(raw"""
+        trait Zero
+            zero() -> Self
+
+        trait Blank
+            zero() -> Self
+            thrice(self) -> int
+
+        impl Zero for int
+            zero() -> int = 0
+
+        impl Blank for int
+            zero() -> int = -1
+            thrice(self) -> int = 3
+
+        main()
+            var n = 7
+            print(n.thrice())
+        """), "3\n")
+
+// An object forgets its type, so a call through one is answered by the table rather than by the
+// member lookup — and the slot has to hold the implementation the object's own trait supplied.
+@test("a trait object calls its own trait's member, not the other's")
+a_trait_object_calls_its_own_traits_member()
+    if !tr_can_run() then return
+
+    assert_eq(tr_ran(raw"""
+        trait Zero
+            id(self) -> int
+
+        trait Blank
+            id(self) -> int
+
+        struct P
+            n: int
+
+        impl Zero for P
+            id(self) -> int = 1
+
+        impl Blank for P
+            id(self) -> int = 2
+
+        tell(z: &Zero) -> int = z.id()
+
+        main()
+            var z: &Zero = P(0)
+            print(tell(z))
+        """), "1\n")
+
+@test("the type's own member still collides, because nothing scopes it")
+the_types_own_member_still_collides()
+    if tr_no_library() then return
+
+    assert(tr_err(raw"""
+        trait Zero
+            zero() -> Self
+
+        struct P
+            x: int
+            zero(self) -> int = 0
+
+        impl Zero for P
+            zero() -> P = P(0)
+
+        main()
+            print(1)
+        """).contains("already has a member named 'zero'"),
+           "the refusal names the member the type already had")
