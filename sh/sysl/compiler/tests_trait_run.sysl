@@ -122,6 +122,98 @@ two_traits_may_each_name_one_member()
 
     assert_eq(tr_ran(tr_two_zeros() + "main()\n    print(\"ok\")\n"), "ok\n")
 
+// **A bound says which of the two a generic body means.** Inside `[T: Zero]` the written `T.zero()`
+// is the one the bound promised, and at the instantiation the parameter has become an ordinary `int`
+// whose table holds both — so the traits the parameter was bounded by narrow the candidates before
+// scope does. Without it the body is answered by whichever the file happens to reach.
+@test("a bound says which of the two a generic body means")
+a_bound_says_which_a_generic_body_means()
+    if !tr_can_run() then return
+
+    assert_eq(tr_ran(tr_two_zeros() + raw"""
+        start[T: Zero]() -> T = T.zero()
+        blank[T: Blank]() -> T = T.zero()
+
+        main()
+            var a: int = start()
+            var b: int = blank()
+            print(a, b)
+        """), "0 -1\n")
+
+@test("a call reaching both in scope is refused, and the message names them")
+a_call_reaching_both_in_scope_is_refused()
+    if tr_no_library() then return
+
+    val said = tr_err(tr_two_zeros() + "main()\n    print(int.zero())\n")
+
+    assert(said.contains("'zero'"), s"the refusal names the member: $said")
+    assert(said.contains("which was meant"), "and says nothing in the call chose between them")
+
+// A program's own trait for a built-in stands beside the library's of the same name, and a bound
+// naming the program's is what says so — `sysl.Zero` is in scope everywhere and would otherwise take
+// every `T.zero()` written against a float width.
+@test("a program may declare a name the library already gave a built-in")
+a_program_may_declare_a_name_the_library_gave()
+    if !tr_can_run() then return
+
+    assert_eq(tr_ran(raw"""
+        trait Zero
+            zero() -> Self
+
+        impl Zero for real
+            zero() -> real = 0.0
+
+        sum[T: Add + Zero](xs: []const T) -> T
+            var total = T.zero()
+            for i in 0..<xs.len do total += xs[i]
+            total
+        end sum
+
+        main()
+            var xs: [3]real = [1.5, 2.5, 3.0]
+            print(sum(xs[..]))
+        """), "7\n")
+
+// The bound answers for a method as well as for an associated function, and the two need different
+// machinery to get there. `T.zero()` still has the `T` written in it; `x.id()` does not, and at an
+// instantiation the analyzed receiver is an `int` with no memory of the parameter it was written as
+// — so the question is put to the source expression rather than to the receiver's type.
+@test("a method on a bounded parameter resolves through the bound too")
+a_method_on_a_bounded_parameter_resolves_through_the_bound()
+    if !tr_can_run() then return
+
+    assert_eq(tr_ran(raw"""
+        trait Zero
+            id(self) -> int
+
+        trait Blank
+            id(self) -> int
+
+        impl Zero for int
+            id(self) -> int = 1
+
+        impl Blank for int
+            id(self) -> int = 2
+
+        tell[T: Zero](x: T) -> int = x.id()
+
+        main()
+            print(tell(7))
+        """), "1\n")
+
+// The error path of the crossing: the arguments narrow first, and what they leave decides which
+// complaint this is. Two survivors from two traits is not a question about arguments — both take an
+// `int` — so the message names the traits rather than the argument types.
+@test("and where the arguments leave two traits standing, the traits are what is named")
+where_the_arguments_leave_two_traits_standing()
+    if tr_no_library() then return
+
+    val said = tr_err(tr_three_ofs("int"))
+
+    assert(said.contains("Of"), s"the refusal names the parameterized trait: $said")
+    assert(said.contains("Blank"), "and the other one")
+    assert(said.contains("which was meant"), "and says nothing in the call chose between them")
+
 // What the whole rule rests on: a submodule is reached by naming or importing it, so a library trait
 // is out of scope in a file that did not ask for it — which is what leaves its member names free.
 @test("a submodule's trait is not nameable without its import")

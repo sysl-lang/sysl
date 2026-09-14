@@ -488,6 +488,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl)
     val cx = analyzer_for(a, scope)
 
     cx.subst = subst
+    remember_bounds(cx, d)
 
     for i in 0..<d.params.len()
         val p = d.params.at(i)
@@ -565,6 +566,41 @@ rewind_instantiations(a: &Analysis, queued: usize, tables: usize, structs: usize
     if constrained > 0 then rewind_registered(a.tables.constrained_insts, constrained)
 end rewind_instantiations
 
+// What the declaration asked of its type parameters, and which of its own names hold one.
+//
+// **It is read off the DECLARATION rather than off the substitution**, which is the whole of what it
+// is for: at an instantiation `subst` says `T` has become an `int` and nothing left in the body
+// remembers that the signature asked that `int` for a `Zero`. Two traits may give one type a member
+// of one name, so without this record the body is refused for an ambiguity its own signature
+// settled -- and settled somewhere the call has no way to speak to.
+//
+// Only a parameter written as the **bare** type parameter is recorded: a `Box[T]` is a `Box`, and
+// what its members mean is the `Box`'s question rather than the `T`'s.
+private remember_bounds(cx: &Analyzer, d: FuncDecl)
+    cx.tbounds = d.bounds
+
+    var held: Buf[(string, string)] = buf()
+
+    for i in 0..<d.params.len()
+        val p = d.params.at(i)
+
+        *p.typ.kind match
+            NamedType(w, args) ->
+                if args.is_empty() && named_bounds_of(d.bounds, w).is_some() then held.push((p.name, w))
+            _ -> ()
+
+    cx.pbounds = held
+end remember_bounds
+
+// The bounds a declaration wrote for one of its type parameters, and nothing for a name that is not
+// one of them.
+named_bounds_of(bounds: Buf[NamedBounds], written: string) -> Option[Buf[BoundRef]]
+    for i in 0..<bounds.len()
+        if bounds.at(i).name == written then return Some(bounds.at(i).bounds)
+
+    None
+end named_bounds_of
+
 // One function whose signature the tables already hold, under the name they hold it by: a member
 // lowered from a type's body or from an `impl` block, or one instantiation of a generic.
 //
@@ -588,6 +624,8 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     if sig.is_none() then return TFunc(span_zero(), name, buf(), Unit, empty_block(), false, buf(),
                                        buf(), buf(), false, None, false, None, false, false, None,
                                        None, None, None)
+
+    remember_bounds(cx, d)
 
     var params: Buf[(string, Type)] = buf()
 

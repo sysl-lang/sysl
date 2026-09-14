@@ -17,7 +17,7 @@ import sysl.text.{str_builder, Search, StrBuilder}
 // The reader wrote no parentheses, so what answers is a property; everything else is told what it is
 // and how to write it, which is the whole of what a message about a member owes.
 lookup_trait_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr],
-                    expected: Option[Type]) -> TExpr
+                    expected: Option[Type], via: Buf[string] = no_bound_traits()) -> TExpr
     val rty = receiver_type(texpr_type(receiver))
 
     rty match
@@ -28,7 +28,7 @@ lookup_trait_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, ar
         Trait(_, _, _) -> read_erased(cx, span, receiver, rty, name)
         _ ->
             val found = member_key(cx.an, rty, name)
-            val chosen = chosen_member(cx, rty, found.0, name, span, buf())
+            val chosen = chosen_member(cx, rty, found.0, name, span, buf(), via)
 
             if chosen.is_none() then return bad_expr(span)
 
@@ -49,7 +49,7 @@ lookup_trait_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, ar
 
             if decl.is_property then
                 return member_dispatch(cx, span, receiver, rty, found.0, chosen.unwrap(), decl,
-                                       buf(), expected, name)
+                                       buf(), expected, name, via)
 
             if decl.recv_mode().is_some() then
                 return cx.err(span, s"'$name' is a method of '${type_show(rty)}' — call it " +
@@ -108,7 +108,22 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
         _ -> ()
 
     val found = member_key(cx.an, ty, name)
-    val m = member_at(cx.an, found.0, name)
+
+    // **The traits the WRITTEN name was bounded by.** `T.zero()` still has the `T` in it, so a body
+    // whose signature asked `T` for a `Zero` reaches that trait's `zero` even where the file that
+    // instantiated it imported another trait declaring one for the very same type.
+    val via = written_bound(cx, receiver)
+    var picked = name
+
+    if member_at(cx.an, found.0, name).is_some()
+        val chosen = chosen_member(cx, ty, found.0, name, span, args, via)
+
+        if chosen.is_none() then return Some(bad_expr(span))
+
+        picked = chosen.unwrap()
+    end if
+
+    val m = member_at(cx.an, found.0, picked)
 
     if m.is_none()
         // A receiverless member the compiler provides is reached through the type, which is exactly
@@ -140,7 +155,7 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
         return Some(cx.err(span, s"'$name' is a method of '${module_show(found.0)}' — call it on a " +
                            s"value of ${type_show(ty)}, not on the type itself"))
 
-    val fname = member_func_name(cx, span, ty, name)
+    val fname = member_func_name(cx, span, ty, picked)
 
     if fname == "" then return Some(bad_expr(span))
 
@@ -148,9 +163,9 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
 
     if sig.is_none() then return Some(bad_expr(span))
 
-    check_member_visible(cx, span, found.0, name, decl)
+    check_member_visible(cx, span, found.0, picked, decl, via)
 
-    val shown = s"associated function '${module_show(found.0)}.$name'"
+    val shown = s"associated function '${module_show(found.0)}.$picked'"
     val slots = bind_member_args(cx, span, shown, decl, args)
 
     if slots.is_none() then return Some(bad_expr(span))
@@ -336,7 +351,7 @@ end subject_named
 
 // `value.member(args)` -- a call, which is what the parentheses said.
 call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr],
-            expected: Option[Type]) -> TExpr
+            expected: Option[Type], via: Buf[string] = no_bound_traits()) -> TExpr
     val rty = receiver_type(texpr_type(receiver))
 
     if rty == Unknown then return bad_expr(span)
@@ -360,13 +375,13 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
 
                 TExpr(span, TFromBytes(TExpr(span, TBytes(receiver))))
             else if claims_lanes(cx, rty, name) then cx.err(span, no_lanes_in_a_string(name))
-            else call_declared(cx, span, receiver, rty, name, args, expected)
+            else call_declared(cx, span, receiver, rty, name, args, expected, via)
 
         // The vector's own methods, which are the compiler's for the reason the intrinsic table is
         // closed: each is one LLVM operation and none of them can be written in sysl.
         Vector(_, _) ->
             if is_vector_method(name) then vector_method(cx, span, rty, receiver, name, args)
-            else call_declared(cx, span, receiver, rty, name, args, expected)
+            else call_declared(cx, span, receiver, rty, name, args, expected, via)
 
         // The two that move lanes between a register and memory. They are the slice's rather than
         // the vector's because the receiver is what supplies the address and the length -- a vector
@@ -374,11 +389,11 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
         Array(_, _) ->
             if claims_lanes(cx, rty, name) then
                 vector_memory(cx, span, rty, auto_deref(cx, receiver), name, args, expected)
-            else call_declared(cx, span, receiver, rty, name, args, expected)
+            else call_declared(cx, span, receiver, rty, name, args, expected, via)
         Slice(_, _) ->
             if claims_lanes(cx, rty, name) then
                 vector_memory(cx, span, rty, auto_deref(cx, receiver), name, args, expected)
-            else call_declared(cx, span, receiver, rty, name, args, expected)
+            else call_declared(cx, span, receiver, rty, name, args, expected, via)
         _ ->
             // A `*T` is a bare address, and the unchecked tier is where a program that has one
             // already is. What it does not have is a length, so there is nothing for a run to be
@@ -389,19 +404,20 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
                 cx.err(span, s"a '${type_show(texpr_type(receiver))}' carries no length, so a run " +
                        "of its elements has nothing to be checked against — take a slice of them " +
                        "first, with 'p[0..<n]'")
-            else call_declared(cx, span, receiver, rty, name, args, expected)
+            else call_declared(cx, span, receiver, rty, name, args, expected, via)
 end call_member
 
 // A member the tables hold, called.
 private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string,
-                      args: Buf[Expr], expected: Option[Type]) -> TExpr
+                      args: Buf[Expr], expected: Option[Type],
+                      via: Buf[string] = no_bound_traits()) -> TExpr
     val found = member_key(cx.an, rty, name)
 
     if !has_member_at(cx.an, found.0, name) &&
        !cx.an.tables.members.alts.has(member_key_of(found.0, name)) then
         return no_such_method(cx, span, receiver, rty, found.0, name, args)
 
-    val chosen = chosen_member(cx, rty, found.0, name, span, args)
+    val chosen = chosen_member(cx, rty, found.0, name, span, args, via)
 
     if chosen.is_none() then return bad_expr(span)
 
@@ -431,7 +447,8 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
         return call_generic_member(cx, span, receiver, rty, found.0, decl, generic.unwrap(),
                                    found.1, args, expected, name)
 
-    member_dispatch(cx, span, receiver, rty, found.0, chosen.unwrap(), decl, args, expected, name)
+    member_dispatch(cx, span, receiver, rty, found.0, chosen.unwrap(), decl, args, expected, name,
+                    via)
 end call_declared
 
 // `o.map(f)` -- a member declaring type parameters of its own, instantiated from the call.
@@ -542,8 +559,8 @@ end call_generic_member
 // member was lowered to.
 private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, base: string,
                         chosen: string, m: MethodDecl, args: Buf[Expr], expected: Option[Type],
-                        written: string) -> TExpr
-    check_member_visible(cx, span, base, chosen, m)
+                        written: string, via: Buf[string] = no_bound_traits()) -> TExpr
+    check_member_visible(cx, span, base, chosen, m, via)
 
     val shown = s"method '${type_show(rty)}.$chosen'"
     val fname = member_func_name(cx, span, rty, chosen)
@@ -750,12 +767,12 @@ end member_func_name
 //
 // Nothing where the name settles nothing, which is what tells the caller to stop.
 private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, span: Span,
-                      args: Buf[Expr]) -> Option[string]
+                      args: Buf[Expr], via: Buf[string] = no_bound_traits()) -> Option[string]
     val alts = cx.an.tables.members.alts.get(member_key_of(base, mname))
     val subject = type_show(rty)
 
     if alts.is_none()
-        if member_reachable(cx, base, mname) then return Some(mname)
+        if member_reachable(cx, base, mname, via) then return Some(mname)
 
         var one: Buf[string] = buf()
 
@@ -766,11 +783,26 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
 
     // **A bound answers ahead of everything else.** Inside a generic body a member means the one the
     // bound promised, and at an instantiation the parameter has become an ordinary type whose table
-    // may hold several -- so the traits the parameter was bounded by narrow the candidates first.
+    // may hold several -- so the traits the parameter was bounded by are what the candidates are
+    // narrowed to first. Without it a body is refused for an ambiguity its own signature already
+    // settled, and which the caller has no way to speak to.
+    var named: Buf[string] = buf()
+
+    if !via.is_empty()
+        for i in 0..<alts.unwrap().len()
+            val tr = cx.an.tables.members.from_trait.get(member_key_of(base, alts.unwrap().at(i)))
+
+            if tr.is_some() && holds_string(via, tr.unwrap()) then named.push(alts.unwrap().at(i))
+
+    val all = if named.is_empty() then alts.unwrap() else named
+
+    // **Scope decides before the arguments do**, because two implementations of one trait differ in
+    // their argument lists while two *different traits* may declare one name at one parameter list,
+    // and nothing in a call could tell those apart.
     var cands: Buf[string] = buf()
 
-    for i in 0..<alts.unwrap().len()
-        if member_reachable(cx, base, alts.unwrap().at(i)) then cands.push(alts.unwrap().at(i))
+    for i in 0..<all.len()
+        if member_reachable(cx, base, all.at(i), via) then cands.push(all.at(i))
 
     if cands.is_empty()
         out_of_scope(cx, span, base, mname, alts.unwrap(), subject)
@@ -949,11 +981,17 @@ end member_func_name_quiet
 // Whether a member a trait brought is one this file may name. A trait's member is reachable only
 // where the trait can be named, which is what keeps the first library to implement a wide trait for
 // a built-in from claiming those names from everybody.
-private member_reachable(cx: &Analyzer, base: string, filed: string) -> bool
+private member_reachable(cx: &Analyzer, base: string, filed: string,
+                         via: Buf[string] = no_bound_traits()) -> bool
     val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed))
 
     // A member that arrives with its type is reachable wherever the type is.
     if from.is_none() then return true
+
+    // **A bound has said which trait at least as plainly as an import would.** A signature naming
+    // one is what an instantiated body reaches its member through, the file the instantiation is
+    // read in having imported nothing on the body's behalf.
+    if holds_string(via, from.unwrap()) then return true
 
     // **A member an `impl` brought is reached where its trait can be NAMED, not merely where the
     // trait is visible.** The two are different questions and only the first is what an import
@@ -983,9 +1021,53 @@ private names_trait(cx: &Analyzer, key: string) -> bool
     lookup_trait_key(cx.an, cx.scope, module_bare(key)).unwrap_or("") == key
 end names_trait
 
+// The traits a receiver's own **bound** promised, read off the expression as written.
+//
+// This is the one thing the analyzed receiver cannot be asked for. An `x` of a `[T: Zero]` body has
+// become an `int` by the time an instantiation looks at it, so the question is put to the source --
+// where the name is still `x`, and `pbounds` still knows `x` was written as a `T`.
+receiver_bound(cx: &Analyzer, recv: Expr) -> Buf[string]
+    val written = *recv.kind match
+        Ident(n) -> n
+        _ -> ""
+
+    if written == "" then return no_bound_traits()
+
+    for i in 0..<cx.pbounds.len()
+        if cx.pbounds.at(i).0 == written then return bound_traits(cx, cx.pbounds.at(i).1)
+
+    no_bound_traits()
+end receiver_bound
+
+// The same for a **type** written in the position `T.zero()` puts one: the name is the parameter's
+// own, so the bound is read straight off it rather than off a value that was written as one.
+private written_bound(cx: &Analyzer, recv: Expr) -> Buf[string] = *recv.kind match
+    Ident(n) -> bound_traits(cx, n)
+    _ -> no_bound_traits()
+
+// The traits a type parameter was bounded by, as keys -- what a use inside the body may reach
+// through it whether or not the file also imported them, the signature having named them.
+bound_traits(cx: &Analyzer, written: string) -> Buf[string]
+    var keys: Buf[string] = buf()
+    val bounds = named_bounds_of(cx.tbounds, written)
+
+    if bounds.is_none() then return keys
+
+    for i in 0..<bounds.unwrap().len()
+        val key = lookup_trait_key(cx.an, cx.scope, bounds.unwrap().at(i).name)
+
+        if key.is_some() then keys.push(key.unwrap())
+
+    keys
+end bound_traits
+
+// No bound at all, named so that a default argument can say which kind of run of names it means.
+no_bound_traits() -> Buf[string] = buf()
+
 // Whether a member the reader named is one their file may reach.
-private check_member_visible(cx: &Analyzer, span: Span, base: string, filed: string, m: MethodDecl)
-    if !member_reachable(cx, base, filed)
+private check_member_visible(cx: &Analyzer, span: Span, base: string, filed: string, m: MethodDecl,
+                             via: Buf[string] = no_bound_traits())
+    if !member_reachable(cx, base, filed, via)
         val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed)).unwrap_or("")
 
         cx.fault(span, s"'${source_member_name(filed)}' is a member '${module_show(from)}' gave " +

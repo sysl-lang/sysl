@@ -39,13 +39,16 @@ field_expr(cx: &Analyzer, span: Span, receiver: Expr, name: string,
 
     val tr = auto_deref(cx, outer)
     val rt = texpr_type(tr)
+    // What the receiver's own bound promised, read off the expression as written -- the one thing
+    // the analyzed receiver cannot be asked for, an instantiation's `x` having become an `int`.
+    val via = receiver_bound(cx, receiver)
 
     // A trait object has no fields: the layout is exactly what it forgot.
     if erased(rt) then
-        return lookup_trait_member(cx, span, tr, name, buf(), expected)
+        return lookup_trait_member(cx, span, tr, name, buf(), expected, via)
 
     rt match
-        Struct(d) -> struct_field(cx, span, tr, d, name, expected)
+        Struct(d) -> struct_field(cx, span, tr, d, name, expected, via)
         Str ->
             // **A string's length is layout and not a trait member**, which is why `Search`
             // deliberately declares none: what a `[]const u8` and a `string` each answer is the
@@ -60,31 +63,31 @@ field_expr(cx: &Analyzer, span: Span, receiver: Expr, name: string,
             else if name == "copy" then
                 cx.err(span, "'copy' is a method of 'string' — call it with 'copy()', since it " +
                        "allocates and copies the bytes rather than naming what is already there")
-            else lookup_trait_member(cx, span, tr, name, buf(), expected)
+            else lookup_trait_member(cx, span, tr, name, buf(), expected, via)
         Array(_, _) ->
             if name == "len" then TExpr(span, TLen(tr, usize_type(word_bits(cx))))
-            else lookup_trait_member(cx, span, tr, name, buf(), expected)
+            else lookup_trait_member(cx, span, tr, name, buf(), expected, via)
         Slice(_, _) ->
             if name == "len" then TExpr(span, TLen(tr, usize_type(word_bits(cx))))
-            else lookup_trait_member(cx, span, tr, name, buf(), expected)
+            else lookup_trait_member(cx, span, tr, name, buf(), expected, via)
         // A vector's `len` is its lane count, which is part of its type -- so this is a constant
         // folded here rather than anything read.
         Vector(lanes, _) ->
             if name == "len" then
                 TExpr(span, TIntLit(from_int(long(lanes)), usize_type(word_bits(cx))))
-            else lookup_trait_member(cx, span, tr, name, buf(), expected)
+            else lookup_trait_member(cx, span, tr, name, buf(), expected, via)
         // Everything about the object is behind `get()`, including whether there still is one.
         Weak(inner) ->
             cx.err(span, s"a ${type_show(rt)} may be gone, so nothing is read off one directly — " +
                    s"'get()' hands back 'Option[&${type_show(*inner)}]', and '$name' is read off " +
                    "what is inside it")
-        _ -> lookup_trait_member(cx, span, tr, name, buf(), expected)
+        _ -> lookup_trait_member(cx, span, tr, name, buf(), expected, via)
 end field_expr
 
 // A struct's field, by the index the declaration gave it. A tuple's parts are named for their
 // positions, so `t.0` arrives here as an ordinary field selection.
 private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name: string,
-                     expected: Option[Type]) -> TExpr
+                     expected: Option[Type], via: Buf[string] = no_bound_traits()) -> TExpr
     val idx = d.field_index(name)
 
     if idx >= 0 then
@@ -117,7 +120,7 @@ private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name:
                           s"${quantity(d.fields.len(), "part")}, so there is no '.$name' — the " +
                           "parts are numbered from 0")
 
-        return lookup_trait_member(cx, span, tr, name, buf(), expected)
+        return lookup_trait_member(cx, span, tr, name, buf(), expected, via)
 
     // A struct's fields have names, and a number does not address one -- so a compile-time index is
     // refused here rather than falling through to a complaint about a missing property, which would
@@ -127,7 +130,7 @@ private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name:
                       "struct — its fields are reached by name, and a position addresses the parts " +
                       "of a tuple")
 
-    lookup_trait_member(cx, span, tr, name, buf(), expected)
+    lookup_trait_member(cx, span, tr, name, buf(), expected, via)
 end struct_field
 
 // The value a selector stands for where it names a **compile-time constant** rather than a field --
