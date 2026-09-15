@@ -46,6 +46,15 @@ struct TypedBodies
     main_module: string
 end TypedBodies
 
+// Whether a lowered member is a copy of a trait default the walk at the trait refused.
+private refused_default(a: &Analysis, name: string) -> bool
+    val origin = a.tables.members.default_origin.get(name)
+
+    if origin.is_none() then return false
+
+    holds_string(a.tables.members.bad_defaults, origin.unwrap())
+end refused_default
+
 // Reads a compilation's declarations and types every body it can.
 analyze_bodies(written: Buf[Program], t: Target) -> TypedBodies = analyze_produced(written, t, buf())
 
@@ -155,6 +164,11 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     for i in 0..<lowered.len()
         val m = lowered.at(i)
         val home = a.tables.members.decl_scope.get(m.name).unwrap_or(empty_scope())
+
+        // **A copy of a default the trait refused is not read again.** The body is one body, so its
+        // mistake is one diagnostic -- the one the walk at the trait already made -- and reading the
+        // copies would say it once per implementing type, in terms the reader never wrote.
+        if refused_default(a, m.name) then continue
 
         if from_library(a, home) then held.push(HeldBody(m.name, home, span_zero(), m, Some(m)))
         else funcs.push(analyze_instance(a, m.name, m))
@@ -462,10 +476,101 @@ private check_generic_bodies(a: &Analysis, units: Buf[Program])
             val scope = a.tables.members.decl_scope.get(fd.name).unwrap_or(empty_scope())
 
             check_abstract_body(a, scope, fd)
+
+    check_trait_default_bodies(a)
 end check_generic_bodies
 
+// Every trait's default bodies, read **at the trait**.
+//
+// A default may assume of its receiver exactly what its own trait declares, so `Self` stands for
+// itself under one bound -- the trait, at its own parameters -- and the supertraits that bound
+// reaches. That is the whole of what the body may take for granted wherever it is copied to, which
+// is what makes this the place to read it: a mistake lands on the line that made it with nothing
+// implementing the trait at all, and once however many types inherit it.
+//
+// **The copies are then not read again.** A default the trait refused is left out of the walk over
+// lowered members, or one body's mistake would be reported once per implementing type.
+private check_trait_default_bodies(a: &Analysis)
+    val types = a.tables.types
+
+    for i in 0..<types.len()
+        val key = types.key_at(i)
+        val decl = types.at(i)
+
+        decl.kind match
+            TraitOf(td) -> check_defaults_of(a, decl.scope, key, td)
+            _ -> ()
+end check_trait_default_bodies
+
+// One trait's, each in the terms of the file that wrote it.
+private check_defaults_of(a: &Analysis, scope: Scope, key: string, td: TraitDecl)
+    for i in 0..<td.methods.len()
+        val m = td.methods.at(i)
+
+        // A static property carrying one is refused where the trait is hoisted, and reading the body
+        // would say a second thing about a declaration that is already wrong.
+        if m.body.is_empty() || (m.recv_mode().is_none() && m.is_static) then continue
+
+        val said = a.kept.len()
+
+        check_abstract_body(a, scope, trait_default_decl(td, m), false)
+
+        if a.kept.len() > said then a.tables.members.bad_defaults.push(s"$key.${m.name}")
+end check_defaults_of
+
+// The function a trait's default reads as: the receiver becomes a `self` at `Self`, and `Self` is a
+// type parameter in front of the trait's own, bounded by the trait at those parameters.
+private trait_default_decl(td: TraitDecl, m: MethodDecl) -> FuncDecl
+    var params: Buf[Param] = buf()
+    val recv = receiver_param(m, named_type(m.span, "Self"))
+
+    if recv.is_some() then params.push(recv.unwrap())
+
+    for i in 0..<m.params.len()
+        params.push(m.params.at(i))
+
+    var tparams: Buf[string] = buf()
+
+    tparams.push("Self")
+
+    for i in 0..<td.tparams.len()
+        tparams.push(td.tparams.at(i))
+
+    for i in 0..<m.tparams.len()
+        tparams.push(m.tparams.at(i))
+
+    // The trait applied to its own parameters, which is what a bound on `Self` has to say for an
+    // `Add[T]` to give `self.value() + x` the result the trait promised.
+    var args: Buf[TypeRef] = buf()
+
+    for i in 0..<td.tparams.len()
+        args.push(named_type(m.span, td.tparams.at(i)))
+
+    var on_self: Buf[BoundRef] = buf()
+
+    on_self.push(BoundRef(m.span, td.name, args))
+
+    var bounds: Buf[NamedBounds] = buf()
+
+    bounds.push(NamedBounds("Self", on_self))
+
+    for i in 0..<td.bounds.len()
+        bounds.push(td.bounds.at(i))
+
+    for i in 0..<m.bounds.len()
+        bounds.push(m.bounds.at(i))
+
+    FuncDecl(s"${td.name}.${m.name}", tparams, params, m.ret_type, m.body, bounds, m.variadic, File,
+             buf(), m.tvalues, m.tpacks, None, None, None, false, false, false, m.reads, m.writes,
+             None, None, m.crossing, buf())
+end trait_default_decl
+
 // One such body, in a region everything but a kept complaint is rewound out of.
-private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl)
+//
+// **A trait's default is read with `keep` off**: the two records below are about a *declaration* the
+// program holds, and a default is one body the implementing types carry copies of -- so filing the
+// trait's reading beside them would put a function in the tables under a name nothing lowers.
+private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool = true)
     if d.body.is_empty() then return
 
     val mark = a.complaints()
@@ -525,6 +630,8 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl)
     // instantiations the rewind took back out are names these trees mention and nobody emits.
     //
     // Recorded after the rewind so that neither the entry nor the file it names can be taken back.
+    if !keep then return
+
     a.tables.homes.put(d.name, scope)
     a.tables.abstracts.push(TFunc(span_zero(), d.name, params, ret, body, d.variadic, buf(), buf(),
                                   buf(), true, d.conv, false, None, d.pure, d.ghost, None, None,

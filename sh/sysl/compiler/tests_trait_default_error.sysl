@@ -82,20 +82,40 @@ private def_ir(text: string) -> string
     ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
 end def_ir
 
+// How many complaints a source read beside the library drew.
+private def_faults(text: string) -> usize
+    val done = def_analyzed(text)
+    var n: usize = 0
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/") then n += 1
+
+    n
+end def_faults
+
 // -- a default is checked at the trait ------------------------------------------------------------
 //
-// **SIX OF THIS SUITE'S CASES ARE NOT HERE, and they are one absence rather than six.** The reference
-// walks a trait's default bodies **at the trait**, with `Self` standing in for itself and the trait's
-// own declarations as the whole of what the body may assume -- so a default reading a field, calling
-// a method the trait never promised, or needing an operator's bound is refused on the line that made
-// it with nothing implementing the trait at all, and once however many types inherit it. This
-// compiler has no such walk: those bodies are read only as they are materialized for an implementing
-// type, so a trait nobody implements is never read and a trait two types implement is read twice.
-// The cases owed are `what a default needs a bound for is asked in an expression that also calls an
-// import`, `a default calling a method the trait does not declare is refused with no impl in sight`,
-// `a default may not read a field of its receiver, which the trait does not promise`, `a default
-// using an operator asks for the bound that supplies it`, `a default printing its receiver asks for
-// Display` and `a bad default is reported once, not once per implementing type`.
+// A default's body is read **at the trait**, with `Self` standing in for itself under one bound --
+// the trait, at its own parameters -- and nothing else assumed of it. So a default reading a field,
+// calling a method the trait never promised, or needing an operator's bound is refused on the line
+// that made it with nothing implementing the trait at all, and once however many types inherit it.
+
+// **The default is read in its trait's file**, which is not something the declaration carries: it is
+// synthesized rather than hoisted, so a reading that had not filed where it was written would stop
+// at the body's first imported name and take the rest of the walk with it -- and what that walk is
+// *for* is the complaints nothing else makes, so a bound the body needed after that line would be
+// asked for by nobody.
+@test("what a default needs a bound for is asked in an expression that also calls an import")
+what_a_default_needs_a_bound_for_is_asked_beside_an_import()
+    if def_no_library() then return
+
+    assert(def_err(raw"""
+        import sysl.text.cstring
+
+        trait Loud
+            say(self) -> string = s"${cstring("x").len} $self"
+        """).contains("'Self: sysl.Display'"),
+           "the bound is asked for although the line also calls an import")
 
 @test("and one calling an imported function correctly is accepted with no impl in sight")
 one_calling_an_imported_function_correctly_is_accepted()
@@ -105,6 +125,72 @@ one_calling_an_imported_function_correctly_is_accepted()
                   "    greet(self) -> usize = cstring(\"hi\").len\n\nmain()\n    print(1)\n")
                .contains("define"),
            "the program lowers")
+
+// Nothing implements `Greet`, so there is no instantiation to catch this -- the trait is the only
+// place it can be reported, which is the whole point of reading it there.
+@test("a default calling a method the trait does not declare is refused with no impl in sight")
+a_default_calling_a_method_the_trait_does_not_declare_is_refused()
+    if def_no_library() then return
+
+    assert(def_err(raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = self.shout()
+        """).contains("'shout'"), "the refusal names the method no bound could license")
+
+// A trait promises methods, so a field is the one thing no bound could ever license -- which is why
+// it is answered here rather than deferred to whatever types turn up.
+@test("a default may not read a field of its receiver, which the trait does not promise")
+a_default_may_not_read_a_field_of_its_receiver()
+    if def_no_library() then return
+
+    assert(def_err(raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = self.n
+        """).contains("has no fields to read"), "the refusal says a field is layout")
+
+@test("a default using an operator asks for the bound that supplies it")
+a_default_using_an_operator_asks_for_the_bound_that_supplies_it()
+    if def_no_library() then return
+
+    assert(def_err(raw"""
+        trait Doubler
+            value(self) -> Self
+            twice(self) -> Self = self.value() + self.value()
+        """).contains("'Self: sysl.Add'"), "the refusal names the bound '+' wanted")
+
+@test("a default printing its receiver asks for Display")
+a_default_printing_its_receiver_asks_for_display()
+    if def_no_library() then return
+
+    assert(def_err(raw"""
+        trait Loud
+            say(self) = print(self)
+        """).contains("'Self: sysl.Display'"), "the refusal names the bound 'print' wanted")
+
+// The default's body is one body however many types inherit it, so its mistake is one diagnostic --
+// not one per implementing type.
+@test("a bad default is reported once, not once per implementing type")
+a_bad_default_is_reported_once_not_once_per_implementing_type()
+    if def_no_library() then return
+
+    val text = raw"""
+        trait Greet
+            name(self) -> string
+            greet(self) -> string = self.shout()
+        struct Cat
+            n: string
+        struct Dog
+            n: string
+        impl Greet for Cat
+            name(self) -> string = self.n
+        impl Greet for Dog
+            name(self) -> string = self.n
+        """
+
+    assert(def_err(text).contains("'shout'"), "the refusal is the one the trait's own walk made")
+    assert_eq(def_faults(text), 1)
 
 // Not every mistake in a default is one the trait's own promises can settle: this one needs the
 // types the body works with, and those are the implementing type's. So it is caught where every
