@@ -62,7 +62,7 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     PackType(name) -> bound_type(subst, name).unwrap_or(Pack(buf()))
     CFnType(params, ret) ->
         CFn(resolve_list(a, scope, params, subst), resolve_type(a, scope, ret, subst))
-    FnType(params, ret, _) -> resolve_fn_trait(a, scope, params, ret, subst)
+    FnType(params, ret, bare) -> resolve_fn_trait(a, scope, t.span, params, ret, bare, subst)
     SomeType(_) -> Unknown
     // `T::Item` -- the associated type, which the member tables are what answer. It resolves like
     // anything else the moment the subject is known: the subject is resolved first, and a parameter
@@ -344,13 +344,51 @@ registered_tuple(a: &Analysis, ts: Buf[Type]) -> &StructType
     made
 end registered_tuple
 
+// `int -> unit`, `(int, int) -> int` -- a callable as the arrow spelling writes it, for a message
+// about the spelling. The result is last, as it is everywhere a call trait's arguments are held.
+private bare_arrow_show(args: Buf[Type]) -> string
+    val ret = type_show(args.at(args.len() - 1))
+
+    if args.len() == 2 then return s"${type_show(args.at(0))} -> $ret"
+
+    var out = "("
+
+    for i in 0..<args.len() - 1
+        if i > 0 then out = out + ", "
+
+        out = out + type_show(args.at(i))
+
+    s"$out) -> $ret"
+end bare_arrow_show
+
 // A written `Fn(a, b) -> r` is the callable trait of that arity, its arguments the parameters with
 // the result last.
-private resolve_fn_trait(a: &Analysis, scope: Scope, params: Buf[TypeRef], ret: TypeRef,
-                         subst: Buf[Binding]) -> Type
+private resolve_fn_trait(a: &Analysis, scope: Scope, span: Span, params: Buf[TypeRef],
+                         ret: TypeRef, bare: bool, subst: Buf[Binding]) -> Type
+    // **The library declares four of them and no more**, so a wider one names a trait that is not
+    // there — which would be reported as a missing name rather than as the limit it is.
+    if params.len() > MaxCallableParams
+        a.fault(scope, span, s"a callable takes up to $MaxCallableParams parameters and this one " +
+                s"takes ${params.len()} — a call this wide reads better with the arguments named, " +
+                "so pass a struct of them")
+        return Unknown
+    end if
+
     var args = resolve_list(a, scope, params, subst)
 
     args.push(resolve_type(a, scope, ret, subst))
+
+    // **A bare arrow is a parameter's form and nothing else**, and by the time a type is resolved
+    // every parameter that wrote one has been rewritten into the bound it is sugar for — so an arrow
+    // arriving here stands somewhere a concrete type is required, where a callable is a box.
+    if bare
+        val boxed = s"&${type_show(Trait(fn_base(params.len()), args, buf()))}"
+
+        a.fault(scope, span, s"'${bare_arrow_show(args)}' is a callable a function is passed and " +
+                "does not keep, which only a parameter may be — anywhere a concrete type is " +
+                s"required, a callable is boxed, so write '$boxed'")
+        return Unknown
+    end if
 
     // **The trait is FOUND rather than composed.** `Fn0` is `sysl$Fn0`, and a trait written under
     // its bare spelling would answer no to every question asked of the key -- so a closure standing

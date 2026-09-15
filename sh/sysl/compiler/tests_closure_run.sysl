@@ -1,0 +1,1019 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What a closure *does* (`reference/expressions.md § Closures`--`§8`): the two representations, what
+// a body captures, and the cases where the answer would be the same under a weaker rule and is not.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `ClosureRunTests` these
+// are.
+
+private var cr_library_cache: Buf[Program] = buf()
+private var cr_library_read: bool = false
+
+private cr_library() -> Buf[Program]
+    if cr_library_read then return cr_library_cache
+
+    cr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> cr_library_cache = units
+
+    cr_library_cache
+end cr_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private cr_ready() -> bool
+    if cr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end cr_ready
+
+// The one-argument caller most of these go through.
+private cr_apply() -> string = "apply(f: int -> int, x: int) -> int = f(x)\n\n"
+
+private cr_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private cr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-closure-run").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end cr_ran
+
+// **That a program STOPS ITSELF**, which is all a trap has to say: the status is not zero. Answers
+// what is wrong, or the empty string.
+private cr_exits(text: string) -> string
+    val root = make_temp_dir("sysl-closure-run").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then s"it exited cleanly: ${out.text}" else ""
+end cr_exits
+
+// Everything a source has to say for itself, taken the whole way the reference's own `err` takes it
+// -- through the lowering, so a refusal a pass after the analysis makes is one of these too.
+private cr_err(text: string) -> string
+    val root = make_temp_dir("sysl-closure-run").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cr_err
+
+// The LLVM text of a program that must compile.
+private cr_ir(text: string) -> string
+    val root = make_temp_dir("sysl-closure-run").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cr_ir
+
+// Every closure environment in some text, as `name` and the fields between its braces. A
+// `type {  }` yields an empty field list, which is a closure over nothing.
+private cr_env_rows(text: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+    val lines = lines_of(text)
+    val marker = " = type {"
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.starts_with("%struct.$closure") && line.ends_with("}")
+            line.index_of(marker) match
+                None -> ()
+                Some(at) ->
+                    val name = line[0..<at]
+                    val body = line[(at + marker.bytes.len)..<(line.bytes.len - 1)]
+
+                    out.push((name, body.trim()))
+
+    out
+end cr_env_rows
+
+// The closures the library lowers before a program's own, measured from a program that declares
+// none. Read once -- it is the slowest thing here, and every call wants the same answer.
+private var cr_base_names: Buf[string] = buf()
+private var cr_base_read: bool = false
+
+private cr_baseline() -> Buf[string]
+    if cr_base_read then return cr_base_names
+
+    cr_base_read = true
+
+    val rows = cr_env_rows(cr_ir("print(1)\n"))
+    var names: Buf[string] = buf()
+
+    for i in 0..<rows.len()
+        names.push(rows.at(i).0)
+
+    cr_base_names = names
+    cr_base_names
+end cr_baseline
+
+private cr_known(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end cr_known
+
+// **The environment structs THIS program declared**, each as its field list in brackets, joined.
+// Never assert a `$closure0`: the counter runs over the whole compilation and the library is
+// lowered first.
+private cr_envs(text: string) -> string
+    val rows = cr_env_rows(text)
+    val base = cr_baseline()
+    var out = ""
+    var n = 0
+
+    for i in 0..<rows.len()
+        if !cr_known(base, rows.at(i).0)
+            out = s"$out${if n > 0 then ", " else ""}[${rows.at(i).1}]"
+            n += 1
+
+    out
+end cr_envs
+
+// -- a closure is passed to a parameter that calls it ---------------------------------------------
+
+@test("the bare arrow takes a closure and calls it")
+cr_the_bare_arrow_takes_a_closure()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        apply(f: int -> int, x: int) -> int = f(x)
+
+        print(apply(x -> x + 1, 5))
+        """), "6\n")
+
+@test("the parameter may be called more than once")
+cr_the_parameter_may_be_called_more_than_once()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        twice(f: int -> int, x: int) -> int = f(f(x))
+
+        print(twice(x -> x * 2, 3))
+        """), "12\n")
+
+@test("two parameters are parenthesized, and none is the empty pair")
+cr_two_parameters_and_none()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        pair(f: (int, int) -> int, a: int, b: int) -> int = f(a, b)
+        now(f: () -> int) -> int = f()
+
+        print(pair((a, b) -> a * b, 6, 7))
+        print(now(() -> 41 + 1))
+        """), "42\n42\n")
+
+@test("a closure yielding nothing is an ordinary one")
+cr_a_closure_yielding_nothing()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        each3(f: int -> unit)
+            for i in 0..<3 do f(i)
+
+        each3(i -> print("i", i))
+        """), "i 0\ni 1\ni 2\n")
+
+@test("a method takes one the same way a function does")
+cr_a_method_takes_one()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        struct Counter
+            n: int
+
+            each(self, f: int -> unit)
+                for i in 0..<self.n do f(i)
+
+        var c = Counter(3)
+
+        c.each(x -> print("x", x * x))
+        """), "x 0\nx 1\nx 4\n")
+
+// `A` and `B` come from the two slices, and only then is `A -> B` something the closure can be read
+// against -- which is why the arguments are analyzed in two passes rather than one.
+@test("the parameter and result types may be a generic caller's, solved from its other arguments")
+cr_the_types_may_be_a_generic_callers()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        map_into[A, B](xs: []A, out: []B, f: A -> B)
+            for i in 0..<xs.len do out[i] = f(xs[i])
+
+        var src = [1, 2, 3]
+        var dst = [0u8; 3]
+
+        map_into(src[..], dst[..], x -> u8(x * 10))
+        print(dst[0], dst[1], dst[2])
+        """), "10 20 30\n")
+
+@test("a declared function is the capture-free closure")
+cr_a_declared_function_is_the_capture_free_closure()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        double(x: int) -> int = x * 2
+        apply(f: int -> int, x: int) -> int = f(x)
+
+        print(apply(double, 5))
+        """), "10\n")
+
+@test("and a closure and a function reach the same parameter in one program")
+cr_a_closure_and_a_function_reach_one_parameter()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        double(x: int) -> int = x * 2
+        apply(f: int -> int, x: int) -> int = f(x)
+
+        print(apply(double, 5), apply(x -> x + 1, 5))
+        """), "10 6\n")
+
+// -- a declared function is erased into a &Fn -----------------------------------------------------
+//
+// The other half of `§6`'s static/dynamic pair. The bare arrow above is the bound; these are the
+// positions where a concrete type is required and a callable is therefore a `&Fn` -- an annotated
+// `var`, a parameter, a struct field, a return type, and an element of a collection. `§5`'s claim is
+// that a declared function reaches all of them, being the capture-free closure.
+
+@test("an annotated var holds one, and calling the name calls the function")
+cr_an_annotated_var_holds_one()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        twice(a: int) -> int = a * 2
+
+        var f: &Fn(int) -> int = twice
+        print(f(21))
+        """), "42\n")
+
+@test("a parameter typed as the object takes one")
+cr_a_parameter_typed_as_the_object()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        twice(a: int) -> int = a * 2
+        apply(f: &Fn(int) -> int, x: int) -> int = f(x)
+
+        print(apply(twice, 21))
+        """), "42\n")
+
+// The static and dynamic halves of `§6` meet, in the direction that used to be closed: a bare-arrow
+// parameter **is** the bound, and a bound is satisfied by the table a trait object carries. Both
+// arguments in one program, so the only difference between the two lines is what was passed.
+@test("and a bare-arrow parameter -- which is that bound -- takes the object as well")
+cr_a_bare_arrow_parameter_takes_the_object()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        twice(a: int) -> int = a * 2
+        apply(f: int -> int, x: int) -> int = f(x)
+
+        var boxed: &Fn(int) -> int = twice
+        print(apply(twice, 21))
+        print(apply(boxed, 21))
+        """), "42\n42\n")
+
+// A closure that captured is a struct with an implementation rather than a declared function, and it
+// reaches the same parameter through the same bound once it has been boxed.
+@test("including one the erasure boxed out of a capturing closure")
+cr_one_the_erasure_boxed()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        apply(f: int -> int, x: int) -> int = f(x)
+
+        var k = 3
+        var boxed: &Fn(int) -> int = n -> n * k
+        print(apply(boxed, 14))
+        """), "42\n")
+
+// `§6`'s own example of the stored case, down to the field name.
+@test("a struct field holds one")
+cr_a_struct_field_holds_one()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        greet()
+            print("clicked")
+
+        struct Button
+            on_click: &Fn() -> unit
+
+        var b = Button(greet)
+        b.on_click()
+        """), "clicked\n")
+
+@test("a function returns one")
+cr_a_function_returns_one()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        twice(a: int) -> int = a * 2
+        pick() -> &Fn(int) -> int = twice
+
+        print(pick()(21))
+        """), "42\n")
+
+// Two of them in one array is what tells a per-function wrapper from a shared one: a single struct
+// standing for both would call whichever was built last, twice.
+@test("an array holds several, and each one calls its own function")
+cr_an_array_holds_several()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        inc(a: int) -> int = a + 1
+        dec(a: int) -> int = a - 1
+
+        var fs: [2]&Fn(int) -> int = [inc, dec]
+        print(fs[0](10), fs[1](10))
+        """), "11 9\n")
+
+// The object's arguments are the only thing that says which instantiation is wanted, since a
+// generic function's name stands for no single one.
+@test("a generic function is instantiated by what the object asks for")
+cr_a_generic_function_is_instantiated()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        ident[T](x: T) -> T = x
+
+        var f: &Fn(int) -> int = ident
+        print(f(7))
+        """), "7\n")
+
+@test("an extern is one as well")
+cr_an_extern_is_one_as_well()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        extern "abs" c_abs(x: i32) -> i32
+
+        var f: &Fn(i32) -> i32 = c_abs
+        print(f(-5i32))
+        """), "5\n")
+
+// A generic type's argument is a concrete slot like any other, so a callable goes into one and comes
+// back out callable -- including through the library's own enums, where it also has to survive being
+// taken apart by a pattern.
+@test("a generic type holds one, and so does an Option")
+cr_a_generic_type_holds_one()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        inc(a: int) -> int = a + 1
+
+        struct Holder[T]
+            item: T
+
+        var h: Holder[&Fn(int) -> int] = Holder(inc)
+        print(h.item(41))
+        """), "42\n")
+
+    assert_eq(cr_ran(raw"""
+        inc(a: int) -> int = a + 1
+
+        var o: Option[&Fn(int) -> int] = Some(inc)
+        o match
+            Some(f) -> print(f(41))
+            None -> print("none")
+        """), "42\n")
+
+@test("the boxed and the inlined form take the same function in one program")
+cr_the_boxed_and_the_inlined_form()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        twice(a: int) -> int = a * 2
+        apply(f: int -> int, x: int) -> int = f(x)
+
+        var boxed: &Fn(int) -> int = twice
+        print(apply(twice, 5), boxed(5))
+        """), "10 10\n")
+
+@test("a signature that does not fit the object is refused, and the message names the function")
+cr_a_signature_that_does_not_fit()
+    if !cr_ready() then return
+
+    val arity = cr_err(raw"""
+        twice(a: int) -> int = a * 2
+        var f: &Fn(int, int) -> int = twice
+        """)
+
+    assert(cr_says(arity, "'twice' takes 1 argument, but 2 arguments were given"), arity)
+
+    val param = cr_err(raw"""
+        twice(a: int) -> int = a * 2
+        var f: &Fn(string) -> int = twice
+        """)
+
+    assert(cr_says(param, "'a' of 'twice' is int, but string was given"), param)
+
+    val result = cr_err(raw"""
+        twice(a: int) -> int = a * 2
+        var f: &Fn(int) -> string = twice
+        """)
+
+    assert(cr_says(result, "should yield string, but its body yields int"), result)
+
+// Two refusals that must survive the rule above, since it turns on a context pushing its own type
+// down onto a name: a trait object that is not a call trait has nothing to ask a function for, and a
+// nested function is not a value however it is asked (`§5a`).
+@test("a trait object that is not a call trait still takes an ordinary value, not a function")
+cr_a_trait_object_that_is_not_a_call_trait()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        trait Show
+            show(self) -> string
+
+        struct P
+            x: int
+
+        impl Show for P
+            show(self) -> string = "P!"
+
+        var s: &Show = P(1)
+        print(s.show())
+        """), "P!\n")
+
+@test("and a nested function is refused with the reason its environment gives")
+cr_a_nested_function_is_refused()
+    if !cr_ready() then return
+
+    val said = cr_err(raw"""
+        main()
+            twice(a: int) -> int = a * 2
+            var f: &Fn(int) -> int = twice
+        """)
+
+    assert(cr_says(said, "is a nested function, so it is called where it is written"), said)
+
+// A function named where nothing wants a callable. The name is not undefined -- the declaration is
+// on the line above -- and reporting it as such sends the reader after a typo instead of at what is
+// missing, which is a context saying which call trait to build it into.
+@test("a function named where nothing wants a callable says what is missing, not that it is undefined")
+cr_a_function_where_nothing_wants_a_callable()
+    if !cr_ready() then return
+
+    var sources: Buf[string] = buf()
+
+    sources.push("twice(a: int) -> int = a * 2\nprint(twice)\n")
+    sources.push("twice(a: int) -> int = a * 2\nvar n: int = twice\n")
+    sources.push("trait Show\n    show(self) -> string\n\ntwice(a: int) -> int = a * 2\n" +
+        "var s: &Show = twice\n")
+
+    for i in 0..<sources.len()
+        val said = cr_err(sources.at(i))
+
+        assert(cr_says(said, "'twice' is a function"), said)
+        assert(cr_says(said, "becomes a value only where a callable is wanted"), said)
+        assert(cr_says(said, "that is written '&twice'"), said)
+        assert(!cr_says(said, "undefined name"), said)
+
+// The address is the **other** thing a bare name may have been reaching for, and where the context
+// asks for one outright the missing `&` is the whole of the mistake -- so the message drops the two
+// callable forms the reader did not want and names it (`reference/ffi.md § A function's address`).
+@test("while a context that wants C's function pointer names the '&' rather than the callable forms")
+cr_a_context_that_wants_a_function_pointer()
+    if !cr_ready() then return
+
+    val said = cr_err(raw"""
+        extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
+
+        compare(a: *u8, b: *u8) -> i32 = 0i32
+
+        var xs = [30i32, 10i32]
+
+        qsort(ptr_cast(&xs[0]), 2usize, 4usize, compare)
+        """)
+
+    assert(cr_says(said, "what is wanted here is the address of one — write '&compare'"), said)
+    assert(cr_says(said, "capture-free closure"), said)
+    assert(!cr_says(said, "'&Fn'"), said)
+
+// -- what a body captures -------------------------------------------------------------------------
+
+@test("a value is copied in when the closure is formed")
+cr_a_value_is_copied_in()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(cr_apply() + raw"""
+        var n = 10
+
+        print(apply(x -> x + n, 5))
+        """), "15\n")
+
+// The whole of `§7`'s "the closure carries its own" is this line, and a capture that read the
+// variable instead of a copy of it would print 200.
+@test("a later change to the outer variable does not reach a closure already formed")
+cr_a_later_change_does_not_reach()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        struct Held
+            f: &Fn(int) -> int
+
+        var n = 100
+        var h = Held(x -> x + n)
+
+        n = 200
+        print(h.f(0))
+        """), "100\n")
+
+@test("a counted reference is retained, so it outlives the scope that made it")
+cr_a_counted_reference_is_retained()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        struct Node
+            v: int
+
+        made() -> &Fn(int) -> int
+            var node: &Node = Node(9)
+
+            x -> x + node.v
+
+        var f = made()
+
+        print(f(1))
+        """), "10\n")
+
+@test("a parameter shadows an outer name of the same spelling")
+cr_a_parameter_shadows_an_outer_name()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(cr_apply() + raw"""
+        var x = 999
+
+        print(apply(x -> x + 1, 7))
+        """), "8\n")
+
+@test("a local of the body's own shadows it too, and the initializer still reads the outer one")
+cr_a_local_of_the_bodys_own_shadows_it()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        var n = 5
+        var f: &Fn(int) -> int = k ->
+            var n = n * 2
+            k + n
+
+        print(f(1))
+        """), "11\n")
+
+@test("capture reaches through a closure inside a closure")
+cr_capture_reaches_through_a_closure()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(cr_apply() + raw"""
+        var k = 100
+
+        print(apply(x -> apply(y -> y + k, x), 5))
+        """), "105\n")
+
+// A closure over no names is an empty struct, so the call passes an environment with nothing in it
+// -- the degenerate case `§5` says a named function already is.
+@test("a body that captures nothing captures nothing")
+cr_a_body_that_captures_nothing()
+    if !cr_ready() then return
+
+    assert_eq(cr_envs(cr_ir(cr_apply() + "print(apply(x -> x + 1, 5))\n")), "[]")
+
+// Two calls, and the second sees what the first left -- the reading `§ Open c` prefers, where a
+// mutating closure is an ordinary one whose captures happen to be mutable.
+@test("a write through a captured name reaches the closure's own field")
+cr_a_write_through_a_captured_name()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        var n = 0
+        var f: &Fn() -> int = () ->
+            n = n + 1
+            n
+
+        print(f() + f())
+        """), "3\n")
+
+// -- where a concrete type is required, the callable is boxed --------------------------------------
+
+@test("a closure is returned")
+cr_a_closure_is_returned()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        make_adder(n: int) -> &Fn(int) -> int
+            x -> x + n
+
+        var add5 = make_adder(5)
+
+        print(add5(3))
+        """), "8\n")
+
+@test("a closure is stored in a field and called through it")
+cr_a_closure_is_stored_in_a_field()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        struct Button
+            on_click: &Fn(int) -> unit
+
+        var b = Button(x -> print("clicked", x))
+
+        b.on_click(7)
+        """), "clicked 7\n")
+
+@test("an annotated local holds one")
+cr_an_annotated_local_holds_one()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        var f: &Fn(int) -> int = x -> x * 3
+
+        print(f(4))
+        """), "12\n")
+
+// The discriminating pair: both programs call a closure once, and what tells them apart is whether
+// the call goes through a slot. A bare-arrow parameter that boxed would emit the `load` and the
+// indirect `call` this one has, and the assertion would not hold.
+@test("a boxed callable dispatches through a table, and an inlined one does not")
+cr_a_boxed_callable_dispatches()
+    if !cr_ready() then return
+
+    val direct = cr_ir(cr_apply() + "print(apply(x -> x + 1, 5))\n")
+    val boxed = cr_ir(raw"""
+        var f: &Fn(int) -> int = x -> x + 1
+
+        print(f(5))
+        """)
+
+    assert(!cr_says(direct, "@vt."), direct)
+    assert(cr_says(boxed, "@vt."), boxed)
+
+@test("several closures of one shape are several types")
+cr_several_closures_of_one_shape()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(cr_apply() + "print(apply(x -> x + 1, 10), apply(x -> x * 2, 10))\n"), "11 20\n")
+
+// Ten thousand of them, each dropped at the end of its iteration: a closure whose box leaked would
+// grow the heap without bound rather than print.
+@test("a boxed one is released with the last reference to it")
+cr_a_boxed_one_is_released()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        make(n: int) -> &Fn(int) -> int
+            x -> x + n
+
+        var total = 0
+
+        for i in 0..<10000
+            var f = make(i)
+            total += f(1)
+
+        print(total)
+        """), "50005000\n")
+
+// -- what a closure may not quietly be -------------------------------------------------------------
+
+@test("a parameter with nothing to infer it from is reported at the parameter")
+cr_a_parameter_with_nothing_to_infer_it()
+    if !cr_ready() then return
+
+    val said = cr_err("var f = x -> x + 1\n")
+
+    assert(cr_says(said, "'x' has no type here"), said)
+
+@test("and writing the annotation is what the message says to do")
+cr_writing_the_annotation_is_the_fix()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        var f: &Fn(int) -> int = (x: int) -> x + 1
+
+        print(f(1))
+        """), "2\n")
+
+@test("a closure of the wrong arity is refused against what it is used as")
+cr_a_closure_of_the_wrong_arity()
+    if !cr_ready() then return
+
+    val said = cr_err(cr_apply() + "print(apply((a, b) -> a + b, 5))\n")
+
+    assert(cr_says(said, "takes 2 parameters, and what it is being used as takes 1"), said)
+
+@test("a body yielding the wrong type is refused against the callable's result")
+cr_a_body_yielding_the_wrong_type()
+    if !cr_ready() then return
+
+    val said = cr_err("var f: &Fn(int) -> int = x -> \"no\"\n")
+
+    assert(cr_says(said, "should yield int"), said)
+
+@test("a bare arrow in a concrete slot names the box it should have been")
+cr_a_bare_arrow_in_a_concrete_slot()
+    if !cr_ready() then return
+
+    val said = cr_err("struct Button\n    on_click: int -> unit\n")
+
+    assert(cr_says(said, "write '&Fn(int) -> unit'"), said)
+
+@test("a bare arrow as a result is the same refusal")
+cr_a_bare_arrow_as_a_result()
+    if !cr_ready() then return
+
+    val said = cr_err("make() -> int -> int\n    x -> x\n")
+
+    assert(cr_says(said, "&Fn(int) -> int"), said)
+
+@test("'Fn' without a mode is a trait, and a trait is not a type")
+cr_fn_without_a_mode_is_a_trait()
+    if !cr_ready() then return
+
+    val said = cr_err("var f: Fn(int) -> int = x -> x\n")
+
+    assert(cr_says(said, "write '&Fn(int) -> int'"), said)
+
+@test("a callable wider than the library declares says where to go instead")
+cr_a_callable_wider_than_the_library()
+    if !cr_ready() then return
+
+    val said = cr_err("f(g: (int, int, int, int, int) -> int) -> int = 0\n")
+
+    assert(cr_says(said, "pass a struct of them"), said)
+
+@test("and four is the widest one that is not")
+cr_four_is_the_widest_one_that_is_not()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        four(f: (int, int, int, int) -> int) -> int = f(1, 2, 3, 4)
+
+        print(four((a, b, c, d) -> a + b + c + d))
+        """), "10\n")
+
+// `§10` says a bare arrow type has a single domain, and the inner arrow here is a *result* -- a
+// concrete slot -- so the one rule about where a bare arrow may stand covers it.
+@test("a chained bare arrow is refused by the rule that has no currying")
+cr_a_chained_bare_arrow()
+    if !cr_ready() then return
+
+    val said = cr_err("curry(f: int -> int -> int) -> int = 0\n")
+
+    assert(cr_says(said, "write '&Fn(int) -> int'"), said)
+
+@test("a local that is not callable, called anyway, is its own mistake")
+cr_a_local_that_is_not_callable()
+    if !cr_ready() then return
+
+    val said = cr_err(raw"""
+        var n = 5
+
+        print(n(1))
+        """)
+
+    assert(cr_says(said, "'n' is int and is not callable"), said)
+
+@test("a closure is not a value where an ordinary type is wanted")
+cr_a_closure_is_not_a_value()
+    if !cr_ready() then return
+
+    val said = cr_err(raw"""
+        take(n: int) -> int = n
+
+        print(take(x -> x))
+        """)
+
+    assert(cr_says(said, "'x' has no type here"), said)
+
+// -- a closure is a function, so what a function's body may hold it may hold -----------------------
+
+@test("a match is a body")
+cr_a_match_is_a_body()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        var m: &Fn(int) -> int = x -> x match
+            0 -> 100
+            else x
+
+        print(m(0), m(4))
+        """), "100 4\n")
+
+@test("a name bound by a match arm is captured like any other")
+cr_a_name_bound_by_a_match_arm()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(cr_apply() + raw"""
+        enum Shape
+            Circle(r: int)
+            Square(s: int)
+
+        var sh = Circle(3)
+
+        sh match
+            Circle(r) -> print(apply(x -> x + r, 1))
+            Square(s) -> print(s)
+        """), "4\n")
+
+@test("'return' leaves the closure, not the function around it")
+cr_return_leaves_the_closure()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        var g: &Fn(int) -> int = x ->
+            if x > 0 then return 1
+            0
+
+        print(g(5), g(-5))
+        """), "1 0\n")
+
+// The loops a body may name are the ones it opened. A closure written inside a loop is still a
+// function, and `break` in a function that is not looping is the mistake it always was.
+@test("'break' does not reach a loop outside it")
+cr_break_does_not_reach_an_outer_loop()
+    if !cr_ready() then return
+
+    val said = cr_err(cr_apply() + raw"""
+        for i in 0..<3
+            print(apply(x -> if x > 1 then break else x, i))
+        """)
+
+    assert(cr_says(said, "'break' is only allowed inside a loop"), said)
+
+@test("leading contract clauses are its own")
+cr_leading_contract_clauses()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        var f: &Fn(int) -> int = x ->
+            require x > 0, "positive"
+            ensure result > x, "grew"
+            x * 2
+
+        print(f(3))
+        """), "6\n")
+
+@test("and a broken one stops the program")
+cr_a_broken_contract_stops_the_program()
+    if !cr_ready() then return
+
+    assert_eq(cr_exits(raw"""
+        var f: &Fn(int) -> int = x ->
+            require x > 0, "positive"
+            x * 2
+
+        print(f(-1))
+        """), "")
+
+@test("a closure formed inside a loop is a fresh one each time round")
+cr_a_closure_formed_inside_a_loop()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        var total = 0
+
+        for i in 0..<3
+            var h: &Fn(int) -> int = x -> x + i
+            total += h(0)
+
+        print(total)
+        """), "3\n")
+
+// The array is promoted to the heap by the escape analysis, and the closure's capture is a view of
+// what moved -- so the slice is still good after the frame that declared it is gone. Nothing here is
+// closure machinery; that it composes is the point.
+@test("an escaping closure over a local array's slice keeps the elements alive")
+cr_an_escaping_closure_over_a_slice()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        made() -> &Fn(int) -> int
+            var a = [1, 2, 3]
+            var v = a[..]
+
+            x -> x + v[1]
+
+        var f = made()
+
+        print(f(10))
+        """), "12\n")
+
+// -- a program may make a type of its own callable -------------------------------------------------
+
+@test("written with the arrow, like every other callable type")
+cr_written_with_the_arrow()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        struct Doubler
+            k: int
+
+        impl Fn(int) -> int for Doubler
+            call(*self, a: int) -> int = a * self.k
+
+        var d = Doubler(3)
+
+        print(d(5))
+        """), "15\n")
+
+@test("and it reaches both of the places a closure does")
+cr_it_reaches_both_places()
+    if !cr_ready() then return
+
+    assert_eq(cr_ran(raw"""
+        struct Doubler
+            k: int
+
+        impl Fn(int) -> int for Doubler
+            call(*self, a: int) -> int = a * self.k
+
+        apply(f: int -> int, x: int) -> int = f(x)
+
+        var d = Doubler(3)
+        var boxed: &Fn(int) -> int = d
+
+        print(apply(d, 5), boxed(5))
+        """), "15 15\n")
+
+// The trait is filed under a name carrying its arity, and no diagnostic ever spells that.
+@test("the callable's type reads as one wherever it is named")
+cr_the_callables_type_reads_as_one()
+    if !cr_ready() then return
+
+    val said = cr_err("var f: &Fn(int) -> bool = 5\n")
+
+    assert(cr_says(said, "&Fn(int) -> bool"), said)
+    assert(!cr_says(said, "Fn1"), said)

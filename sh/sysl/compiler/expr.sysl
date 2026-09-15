@@ -418,7 +418,28 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
         if want.is_some() then
             return function_as_callable(cx, span, name, want.unwrap().0, want.unwrap().1)
 
-        return cx.err(span, s"'$name' is a function, and a function value is not typed yet")
+        // **The name is not undefined**, the declaration being in front of the reader, so what the
+        // message owes is the context that is missing rather than a typo to go looking for. Where
+        // the position asks for C's function pointer outright, the missing `&` is the whole of the
+        // mistake and the two callable forms are dropped from the advice.
+        var wants_address = false
+
+        if expected.is_some()
+            expected.unwrap() match
+                CFn(_, _) -> wants_address = true
+                _ -> ()
+        end if
+
+        if wants_address
+            return cx.err(span, s"'$name' is a function, and what is wanted here is the address " +
+                                s"of one — write '&$name'. A bare name is the capture-free " +
+                                "closure, which has no address a C interface could call")
+        end if
+
+        return cx.err(span, s"'$name' is a function, and a function becomes a value only where a " +
+                            "callable is wanted — a bare-arrow parameter, or a '&Fn' where a " +
+                            "concrete type is required. Nothing here asks for one; where the " +
+                            s"address of code is what is wanted, that is written '&$name'")
     end if
 
     variant_expr(cx, span, name, expected)

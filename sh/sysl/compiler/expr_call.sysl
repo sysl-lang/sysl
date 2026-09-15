@@ -135,7 +135,7 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                 return applied_type_call(cx, span, name.unwrap(), one_targ, args, expected)
             end if
 
-            cx.err(span, "this is not something that can be called")
+            call_value(cx, span, callee, args, expected)
         // `.Circle(5)` -- the form below with the enum's own name left off, resolved against what
         // the context expects.
         ImplicitMember(name) -> implicit_call(cx, span, name, args, expected)
@@ -198,8 +198,39 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             // indirection and only one, exactly as selection does, and what is left after that is a
             // type the reader never wrote -- so the lookup sees the mode and the message can name it.
             call_member(cx, span, tr, member, args, expected, receiver_bound(cx, receiver))
-        _ -> cx.err(span, "this is not something that can be called")
+        _ -> call_value(cx, span, callee, args, expected)
 end call_expr
+
+// **The head of a call may be any expression whose type says it is callable** — the result of
+// another call, an element of an array of them, an item read out of a container. `reference/types.md
+// § Function types` lists those positions, and none of them passes through a name, so there is
+// nothing to look up: the expression is read as a value and the dispatch is the call trait's, which
+// is what a local holding one already goes through.
+private call_value(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
+                   expected: Option[Type]) -> TExpr
+    val recv = type_expr_bare(cx, callee)
+    val ty = texpr_type(recv)
+
+    if ty == Unknown then return recv
+
+    ty match
+        // A C function pointer is called through the pointer rather than through a table.
+        CFn(params, ret) ->
+            var ts: Buf[TExpr] = buf()
+
+            for i in 0..<args.len()
+                val want = if i < params.len() then Some(params.at(i)) else None
+
+                ts.push(type_expr(cx, args.at(i), want))
+
+            TExpr(span, TCallPtr(recv, ts, params, *ret))
+        _ ->
+            if callable_of(cx.an, ty).is_none() then
+                return cx.err(span, "the thing being called must be a name, or something whose " +
+                              "type says it is callable")
+
+            call_member(cx, span, recv, "call", args, expected)
+end call_value
 
 // The name a written type application was made on, where it is one a call could be written through.
 private written_name_of(head: Expr) -> Option[string] = *head.kind match
@@ -1725,8 +1756,9 @@ private call_through(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
         // exactly as it does everywhere.
         _ ->
             if callable_of(cx.an, local.ty).is_none() then
-                return cx.err(span, s"'$name' holds ${type_show(local.ty)}, which is not " +
-                              "something that can be called")
+                return cx.err(span, s"'$name' is ${type_show(local.ty)} and is not callable — a " +
+                              "callable is a closure, or a value of a type that implements the " +
+                              "call trait")
 
             val read = cx.capture_read(local.unique)
             var recv = TExpr(span, TLoad(local.unique, local.ty))

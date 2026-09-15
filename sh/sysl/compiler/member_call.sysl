@@ -463,7 +463,7 @@ end call_declared
 private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, base: string,
                             m: MethodDecl, fd: FuncDecl, owner_args: Buf[Type], args: Buf[Expr],
                             expected: Option[Type], written: string) -> TExpr
-    val shown = s"method '${type_show(rty)}.${source_member_name(m.name)}'"
+    val shown = member_subject(cx, rty, source_member_name(m.name))
     val home = cx.an.tables.members.generic_scope.get(fd.name).unwrap_or(cx.scope)
     val slots = bind_member_args(cx, span, shown, m, args)
 
@@ -554,6 +554,13 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Typ
     recheck_after(cx, span, ts.at(0), TExpr(span, TCall(name, ts, sig.unwrap().ret, false)))
 end call_generic_member
 
+// What a message about a member's arguments calls it. **A call through the call trait is written as
+// a call and reads as one**, so it is `this callable` rather than a member no program wrote, on a
+// trait filed under its arity: nothing a reader could have typed is `Fn1`.
+private member_subject(cx: &Analyzer, rty: Type, name: string) -> string =
+    if name == "call" && callable_of(cx.an, rty).is_some() then "this callable"
+    else s"method '${type_show(rty)}.$name'"
+
 // The call itself, once the member is known: the receiver in the mode its `self` asked for, the
 // arguments bound and checked against the instantiated signature, and a call to the function the
 // member was lowered to.
@@ -562,7 +569,7 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
                         written: string, via: Buf[string] = no_bound_traits()) -> TExpr
     check_member_visible(cx, span, base, chosen, m, via)
 
-    val shown = s"method '${type_show(rty)}.$chosen'"
+    val shown = member_subject(cx, rty, chosen)
     val fname = member_func_name(cx, span, rty, chosen)
 
     if fname == "" then return bad_expr(span)
@@ -1238,10 +1245,14 @@ private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot:
     // **A slot is a member like any other**, so a call through the table binds what was written the
     // way a call to a member of a type does: a name says which parameter it fills, and a parameter
     // nothing filled takes the default -- which for a trait is written in the trait's own scope.
-    val slots = bind_member_args(cx, span, s"method '${type_show(rty)}.${m.name}'", m, args)
+    val shown = member_subject(cx, rty, m.name)
+    val slots = bind_member_args(cx, span, shown, m, args)
 
     if slots.is_none() then return bad_expr(span)
 
+    // **A call trait's parameters are named `a`, `b` and `c`** — names the trait's own declaration
+    // chose and no reader wrote — so what a message about one can say is where it stood.
+    val by_position = shown == "this callable"
     var ts: Buf[TExpr] = buf()
 
     for i in 0..<slots.unwrap().len()
@@ -1250,7 +1261,15 @@ private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot:
                    else None
 
         slots.unwrap().at(i) match
-            Some(e) -> ts.push(type_expr(cx, e, want))
+            Some(e) ->
+                val t = type_expr(cx, e, want)
+
+                if by_position && want.is_some() && disagree(texpr_type(t), want.unwrap()) then
+                    cx.fault(e.span, s"the ${ordinal(i + 1)} argument of this callable is " +
+                             s"${type_show(want.unwrap())}, but ${type_show(texpr_type(t))} was " +
+                             "given")
+
+                ts.push(t)
             None ->
                 val inner = analyzer_for(cx.an, scope)
 

@@ -62,6 +62,15 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
     // regions before jumping -- the same discipline as `return`, bounded to the loop. `break v`
     // hands its value over with a count taken, so that it survives the unwind.
     TBreak(opt, depth) ->
+        // **A jump out of no loop is a refusal that has already been made**, and the analysis goes
+        // on after one so that a reader is told everything at once -- so what arrives here is a
+        // statement no body will run, and reading past the end of the stack is the only way it can
+        // go wrong.
+        if e.loops.is_empty()
+            gap_here(e, "TBreak")
+            return
+        end if
+
         val enclosing = loop_at(e, depth)
 
         opt match
@@ -76,6 +85,11 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
         emit_term(e, InBr(enclosing.break_label))
 
     TContinue(depth) ->
+        if e.loops.is_empty()
+            gap_here(e, "TContinue")
+            return
+        end if
+
         val enclosing = loop_at(e, depth)
 
         release_to_depth(e, enclosing.owned_depth, enclosing.temp_depth)
