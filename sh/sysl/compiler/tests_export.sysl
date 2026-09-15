@@ -1,7 +1,9 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
 
 // **The two sides of the C boundary, as bodies rather than as declarations.** `tests_cabi.sysl` pins
 // what a signature says; these pin what the instructions do with it -- a call that converts each
@@ -271,3 +273,997 @@ private first_export_refusal(text: string) -> string
 
     said.at(0)
 end first_export_refusal
+
+// -- a whole compilation, which is what the rest of these ask --------------------------------------
+
+// **An exported signature is spelled in types the standard module declares**, and every source below
+// prints or returns one, so these go through the library rather than through `typed_of`. Each
+// returns and says so where the library is not on the machine.
+
+private var ex_library_cache: Buf[Program] = buf()
+private var ex_library_read: bool = false
+
+private ex_library() -> Buf[Program]
+    if ex_library_read then return ex_library_cache
+
+    ex_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> ex_library_cache = units
+
+    ex_library_cache
+end ex_library
+
+private ex_no_library() -> bool
+    if ex_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end ex_no_library
+
+// What a compilation came to: the first thing it had to say, or the text it emitted and the
+// functions a header would be written from.
+private struct ExBuild
+    said: string
+    text: string
+    funcs: Buf[TFunc]
+
+// The library's own complaints are not what a question about a program is asking.
+private ex_first_of(said: Buf[Placed]) -> string
+    for i in 0..<said.len()
+        if !said.at(i).src.name.starts_with("library/") then return said.at(i).diag.message
+
+    ""
+end ex_first_of
+
+private ex_one(name: string, text: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push((name, text))
+    out
+end ex_one
+
+// The files of one compilation, read for a machine, with or without an entry point of its own, and
+// as an ordinary build or as the one build that keeps its tests.
+private ex_build_files(files: Buf[(string, string)], t: Target, has_entry: bool,
+                       as_tests: bool) -> ExBuild
+    var units: Buf[Program] = buf()
+    val library = ex_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len()
+        val parsed = parse(source_of(files.at(i).0, files.at(i).1), t)
+
+        if !parsed.ok() then return ExBuild(parsed.report.at(0).message, "", buf())
+
+        units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), has_entry)
+    val early = ex_first_of(done.reported)
+
+    if early != "" then return ExBuild(early, "", buf())
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+    own.push("demo")
+
+    val pr = if as_tests then post_analysis_checks_of_tests(done.an, whole, own)
+    else post_analysis_checks(done.an, whole, own)
+
+    val late = ex_first_of(done.an.diagnostics())
+
+    if late != "" then return ExBuild(late, "", buf())
+
+    val kept = if as_tests then tests_only(whole, own)
+    else prune(strip_tests(whole), own)
+
+    ExBuild("", ir_print_module(codegen_with_gaps(kept, t, pr).0), kept.funcs)
+end ex_build_files
+
+private ex_build(text: string, t: Target, has_entry: bool, as_tests: bool) -> ExBuild =
+    ex_build_files(ex_one("test.sysl", text), t, has_entry, as_tests)
+
+// The LLVM text of an ordinary build, or what it refused -- so a test asserting on the text says
+// what went wrong rather than failing on an empty string.
+private ex_ir(text: string) -> string
+    val b = ex_build(text, host_target(), true, false)
+
+    if b.said != "" then return b.said
+
+    b.text
+end ex_ir
+
+private ex_err(text: string) -> string = ex_build(text, host_target(), true, false).said
+
+private ex_test_ir(text: string) -> string
+    val b = ex_build(text, host_target(), true, true)
+
+    if b.said != "" then return b.said
+
+    b.text
+end ex_test_ir
+
+private ex_test_err(text: string) -> string = ex_build(text, host_target(), true, true).said
+
+private ex_header(text: string) -> string
+    val b = ex_build(text, host_target(), true, false)
+
+    if b.said != "" then return b.said
+
+    c_header_render(exports_by_symbol(b.funcs), "demo")
+end ex_header
+
+// **A module compiled the way `build-c` compiles one**: no entry point of its own, because the
+// artifact is linked into a C project that supplies the `main`.
+private ex_archive_ir(text: string) -> string
+    val b = ex_build(text, host_target(), false, false)
+
+    if b.said != "" then return b.said
+
+    b.text
+end ex_archive_ir
+
+// -- the symbol -----------------------------------------------------------------------------------
+
+@test("the exported symbol is the bare name, with no module path")
+ex_the_symbol_is_the_bare_name()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\n@export\nadd(a: i32, b: i32) -> i32 = a + b\n")
+
+    assert(out.contains("define i32 @add("), out)
+
+@test("and the symbol it names, where it names one")
+ex_the_symbol_it_names()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\n@export(\"mylib_add\")\nadd(a: i32, b: i32) -> i32 = a + b\n")
+
+    assert(out.contains("define i32 @mylib_add("), out)
+
+// **The symbol is a thunk in front of the definition rather than the definition renamed**: an export
+// has to be lowered the way the machine's C convention says, which is not what sysl does with its
+// own definitions. The definition therefore keeps its mangled key and the exported symbol is a
+// function of its own that calls it.
+@test("and it is a thunk, so the definition is still there under its own key")
+ex_the_symbol_is_a_thunk()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\n@export(\"mylib_add\")\nadd(a: i32, b: i32) -> i32 = a + b\n")
+
+    assert(out.contains("define i32 @mylib_add("), out)
+    assert(out.contains("define i32 @demo$add("), out)
+    assert(out.contains("call i32 @demo$add("), out)
+end ex_the_symbol_is_a_thunk
+
+// **The root module is where the thunk and the definition would claim one symbol.** A key is normally
+// `module$name`, which no exported symbol can be -- a C identifier holds no `$` -- but a function in
+// the root module has no qualification, so `@export` under its own name asks for exactly the name the
+// definition would take. The **definition** is what moves: the exported symbol is what somebody
+// outside has written down, and a mangled key is the compiler's own business.
+@test("and in the root module the definition moves aside, so the two do not collide")
+ex_the_definition_moves_aside()
+    if ex_no_library() then return
+
+    val out = ex_ir("@export\nproduct(a: f32, b: f32) -> f32 = a * b\n\nprint(1)\n")
+
+    assert(out.contains("define float @product("), out)
+    assert(out.contains("define float @product$$sysl("), out)
+    assert(out.contains("call float @product$$sysl("), out)
+end ex_the_definition_moves_aside
+
+// The export is what a real C API needs, since its symbols carry a prefix the sysl side gets from its
+// module path -- so the function stays `add` to everything inside sysl, and a sysl caller reaches the
+// definition rather than paying for a conversion at a call that never leaves sysl.
+@test("a sysl caller reaches the definition, not the thunk")
+ex_a_sysl_caller_reaches_the_definition()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\n@export(\"mylib_add\")\nadd(a: i32, b: i32) -> i32 = a + b\n\n" +
+                    "print(demo.add(1, 2))\n")
+
+    assert(out.contains("call i32 @demo$add("), out)
+end ex_a_sysl_caller_reaches_the_definition
+
+@test("an unmangled export is not 'internal', so a linker outside can resolve it")
+ex_an_unmangled_export_is_not_internal()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\n@export\nadd(a: i32, b: i32) -> i32 = a + b\n")
+
+    assert(out.contains("define i32 @add("), out)
+
+// -- an export is a root for reachability -----------------------------------------------------------
+
+@test("and so does what an exported function calls")
+ex_what_an_export_calls_survives()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\nhelper(a: i32) -> i32 = a * 2\n\n@export\n" +
+                    "doubled(a: i32) -> i32 = helper(a)\n\nprint(1)\n")
+
+    assert(out.contains("define i32 @doubled("), out)
+    assert(out.contains("@demo$helper("), out)
+end ex_what_an_export_calls_survives
+
+// A test build replaces the roots with the tests, so an export -- which nothing in the program names,
+// that being the point of one -- was reachable from nothing and went. It goes **quietly**, unlike a
+// destructor: there is no generated call site to be left dangling, so the suite links and the
+// package's own C is what finds out.
+@test("and a test build keeps an export, though no test names it")
+ex_a_test_build_keeps_an_export()
+    if ex_no_library() then return
+
+    val out = ex_test_ir("module demo\n\n@export\nunused(a: i32) -> i32 = a + 1\n\n" +
+                         "@test(\"something else\")\nother() = assert_eq(1 + 1, 2)\n")
+
+    assert(out.contains("define i32 @unused("), out)
+end ex_a_test_build_keeps_an_export
+
+// -- what C cannot spell ----------------------------------------------------------------------------
+
+@test("a slice parameter is refused, since C has no way to spell one")
+ex_a_slice_parameter()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export\nsum(xs: []i32) -> i32 = 0\n")
+
+    assert(said.contains("which C has no way to spell"), said)
+    assert(said.contains("a pointer and a 'usize'"), said)
+end ex_a_slice_parameter
+
+@test("a string parameter is refused too")
+ex_a_string_parameter()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export\nlen_of(s: string) -> i32 = 0\n")
+
+    assert(said.contains("which C has no way to spell"), said)
+
+// A struct of scalars **is** a C declaration, so it is not refused. What an aggregate needed was
+// never a refusal -- it was for somebody to apply the convention, which is what the exported entry
+// goes through. Here it is only that the rule lets it past.
+@test("a struct of scalars is not refused, since C declares one")
+ex_a_struct_of_scalars_is_not_refused()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\nstruct P\n    x: i32\n    y: i32\n@export\nf(p: P) -> i32 = p.x\n")
+
+    assert(out.contains("define i32 @f("), out)
+
+@test("nor a struct of scalars returned")
+ex_a_struct_returned_is_not_refused()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\nstruct P\n    x: i32\n@export\nf() -> P = P(1)\n")
+
+    assert(out.contains("@f("), out)
+
+// **An aggregate is asked about its fields**, which is what keeps this apart from the rule above it:
+// the struct is a shape C has, and a `&T` inside it is a counted box that C would be handed the
+// refcount of. The refusal names the *field*, because the declaration the reader is looking at does
+// not mention it.
+@test("a struct holding something C has no declaration for is refused, by field")
+ex_a_struct_holding_a_box_is_refused()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\nstruct Node\n    x: i32\n\nstruct P\n    x: i32\n    n: &Node\n" +
+                      "@export\nf(p: P) -> i32 = p.x\n")
+
+    assert(said.contains("'n' of demo.P is &demo.Node"), said)
+    assert(said.contains("Hand out a raw pointer"), said)
+end ex_a_struct_holding_a_box_is_refused
+
+@test("and so is an array of what C cannot spell")
+ex_an_array_of_them_is_refused()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export\nf(xs: [3]string) -> i32 = 0\n")
+
+    assert(said.contains("its element is string"), said)
+
+// A data enum is a tag beside a union sysl laid out, which is not the shape a C union has -- so it
+// stays refused where a *simple* one, which is its underlying integer and nothing else, does not.
+@test("a data enum is refused, and a simple one is not")
+ex_a_data_enum_is_refused()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\nenum E\n    A(n: i32)\n    B\n\n@export\nf(e: E) -> i32 = 0\n")
+
+    assert(said.contains("A data enum is a tag beside a union"), said)
+
+    val out = ex_ir("module demo\n\nenum Colour\n    Red\n    Green\n\n@export\nf(c: Colour) -> i32 = 0\n")
+
+    assert(out.contains("@f("), out)
+end ex_a_data_enum_is_refused
+
+// A pointer to a struct is fine, and it is the check that the rule is about the *shape* rather than
+// about the type being one the module declared, which a rule keyed on "is it named" would have got
+// wrong.
+@test("and a pointer to a struct is not refused either")
+ex_a_pointer_to_a_struct_is_fine()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\nstruct P\n    x: i32\n@export\nf(p: *P) -> i32 = p.x\n")
+
+    assert(out.contains("define i32 @f("), out)
+
+// A pointer to a **trait** is not one word: it is the value beside its method table, so it is a pair,
+// and it reached here as an ordinary pointer until it was refused -- accepted, and lowered as
+// something no C header could declare.
+@test("but a pointer to a trait is refused, since it is two words rather than one")
+ex_a_pointer_to_a_trait_is_refused()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\ntrait Show\n    show(self) -> i32\n\n" +
+                      "@export\nf(p: *Show) -> i32 = 0\n")
+
+    assert(said.contains("which C has no way to spell"), said)
+end ex_a_pointer_to_a_trait_is_refused
+
+// -- what a definition cannot be and stay C-callable -------------------------------------------------
+
+@test("an exported definition may not be generic")
+ex_a_generic_export_is_refused()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export\nid[T](x: T) -> T = x\n")
+
+    assert(said.contains("cannot be generic"), said)
+
+// Not an export rule at all: a member may carry only the three annotations that are about a
+// **parameter**, and `@export` is about a symbol. Pinned because it decides the shape a binding is
+// written in: the boundary layer is free functions, and a method is reached by exporting one that
+// takes the receiver.
+@test("nor a member, which the grammar refuses before any export rule is reached")
+ex_a_member_export_is_refused()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\nstruct P\n    x: i32\n    @export\n    get(self) -> i32 = self.x\n")
+
+    assert(said.contains("the only annotations a member may carry are the ones about a parameter"),
+           said)
+end ex_a_member_export_is_refused
+
+@test("nor private, which is the two promises a definition cannot both make")
+ex_a_private_export_is_refused()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export\nprivate add(a: i32, b: i32) -> i32 = a + b\n")
+
+    assert(said.contains("cannot make both claims"), said)
+
+@test("nor variadic")
+ex_a_variadic_export_is_refused()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export\nf(n: i32, ...) -> i32 = n\n")
+
+    assert(said.contains("take a 'va_list' parameter instead"), said)
+
+@test("nor '@ghost', which is erased before there is a symbol at all")
+ex_a_ghost_export_is_refused()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export\n@ghost\nf(a: i32) -> bool = a > 0\n")
+
+    assert(said.contains("erased before codegen"), said)
+
+@test("nor a symbol C could not name")
+ex_a_symbol_c_could_not_name()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export(\"my lib\")\nf(a: i32) -> i32 = a\n")
+
+    assert(said.contains("is not a name C can call"), said)
+
+@test("and a backticked name exported under itself is the same rule from the other end")
+ex_a_backticked_name_exported_under_itself()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export\n`add two`(a: i32) -> i32 = a + 2\n")
+
+    assert(said.contains("name the symbol instead"), said)
+
+@test("two definitions claiming one symbol are refused")
+ex_two_definitions_of_one_symbol()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export(\"f\")\na(x: i32) -> i32 = x\n\n" +
+                      "@export(\"f\")\nb(x: i32) -> i32 = x\n")
+
+    assert(said.contains("one symbol is one definition"), said)
+end ex_two_definitions_of_one_symbol
+
+// **But not one this build is about to discard.** The check reads the tree that is going to be
+// emitted, which is the one the test strip has been over -- so an `@export` in a `@tests` file is not
+// a definition in an ordinary build, because it is not in an ordinary build at all.
+//
+// Both halves are asserted together on purpose. A case pinning only the first would go on passing
+// against a check that had been deleted outright.
+@test("but a @tests file's export is not a second definition, while two real ones still are")
+ex_a_tests_files_export_is_not_a_definition()
+    if ex_no_library() then return
+
+    val tests = "module demo\n\n@tests\n\n@export(\"f\")\ntheirs(x: i32) -> i32 = x\n\n" +
+                "@test(\"it runs\")\nit_runs() = assert(1 == 1, \"one\")\n"
+    val program = "module demo\n\n@export(\"f\")\nmine(x: i32) -> i32 = x\n"
+
+    var discarded: Buf[(string, string)] = buf()
+
+    discarded.push(("tests.sysl", tests))
+    discarded.push(("demo.sysl", program))
+
+    val kept = ex_build_files(discarded, host_target(), true, false)
+
+    assert_eq(kept.said, "")
+    assert(kept.text.contains("define i32 @f("), kept.text)
+
+    // The same two exports with the `@tests` header gone are two definitions, and are refused.
+    var both: Buf[(string, string)] = buf()
+
+    both.push(("tests.sysl", replace_all(tests, "@tests\n\n", "")))
+    both.push(("demo.sysl", program))
+
+    val said = ex_build_files(both, host_target(), true, false).said
+
+    assert(said.contains("one symbol is one definition"), said)
+end ex_a_tests_files_export_is_not_a_definition
+
+// -- module storage -----------------------------------------------------------------------------------
+
+private ex_computed_storage() -> string =
+    "module demo\n\ncounter() -> i32 = 7\n\nval start: i32 = counter()\n\n" +
+    "@export\nbegin() -> i32 = start\n"
+
+// **A build with an entry point lays its `val`s down there**, and gets no constructor beside it --
+// which would take a second count of every reference among them.
+@test("while a build with an entry point of its own gets no constructor")
+ex_a_program_gets_no_constructor()
+    if ex_no_library() then return
+
+    val out = ex_ir(ex_computed_storage())
+
+    assert(!out.contains("@llvm.global_ctors"), out)
+    assert(!out.contains("@sysl.module_init"), out)
+end ex_a_program_gets_no_constructor
+
+// A module with nothing computed at module scope gets no constructor at all -- an empty one would be
+// a symbol on every archive's pre-`main` list doing nothing.
+@test("an archive with nothing computed carries no constructor")
+ex_an_archive_with_nothing_computed()
+    if ex_no_library() then return
+
+    val out = ex_archive_ir("module demo\n\n@export\nbegin() -> i32 = 7\n")
+
+    assert(!out.contains("@llvm.global_ctors"), out)
+
+// **A library artifact gets no constructor either, and that is the third answer rather than the
+// archive's read loosely.** A library artifact has no entry point, so "no entry point" would have
+// caught it -- and it must not, because the thing that links one is a sysl **program**, which has
+// one. A constructor here would fill a copy of the storage nothing reads, and run the initializer a
+// second time to do it.
+@test("and a library artifact gets none, because the program that links it has an entry point")
+ex_a_library_artifact_gets_no_constructor()
+    val parsed = parse(source_of("lib.sysl", ex_computed_storage()))
+
+    assert(parsed.ok(), "the library source parses")
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    var own: Buf[string] = buf()
+
+    own.push("demo")
+
+    val built = library_build(units, own, host_target())
+    val out = ir_print_module(codegen_with_gaps(built.program, host_target(), built.promotions).0)
+
+    assert(!out.contains("@llvm.global_ctors"), out)
+    assert(!out.contains("@sysl.module_init"), out)
+end ex_a_library_artifact_gets_no_constructor
+
+// The other half of the ruling, and the reason it is not simply "no module storage": a constant
+// initializer is laid straight into the object file and nothing runs to fill it, which is the rule C
+// already has for static storage.
+@test("a 'val' whose initializer is constant data is fine")
+ex_a_constant_val_is_fine()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\nval start: i32 = 7\n\n@export\nbegin() -> i32 = start\n")
+
+    assert(out.contains("define i32 @begin("), out)
+
+@test("and a 'const', which has no storage at all")
+ex_a_const_is_fine()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\nconst start: i32 = 7\n\n@export\nbegin() -> i32 = start\n")
+
+    assert(out.contains("define i32 @begin("), out)
+
+// -- the generated header ------------------------------------------------------------------------------
+
+@test("the header declares each export once, in a guard, with the C fixed-width names")
+ex_the_header_is_guarded()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export\nadd(a: i32, b: u8) -> i64 = 0i64\n")
+
+    assert(h.contains("#ifndef SYSL_DEMO_H"), h)
+    assert(h.contains("#include <stdint.h>"), h)
+    assert(h.contains("int64_t add(int32_t a, uint8_t b);"), h)
+    assert(h.contains("#endif /* SYSL_DEMO_H */"), h)
+end ex_the_header_is_guarded
+
+@test("it spells a function taking nothing as C does, which is 'void' and not an empty list")
+ex_the_header_spells_no_parameters()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export\ntick() -> i32 = 0\n")
+
+    assert(h.contains("int32_t tick(void);"), h)
+
+@test("and a function yielding nothing as 'void'")
+ex_the_header_spells_no_result()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export\ntick(a: i32)\n    print(a)\n")
+
+    assert(h.contains("void tick(int32_t a);"), h)
+
+// `never` and `unit` both spell as `void`, so the annotation is the only thing carrying the
+// difference across -- that control does not come back, rather than merely that no value does.
+@test("and annotates a function that does not return, which a bare 'void' would not say")
+ex_the_header_annotates_never()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export\nspin() -> never =\n    loop\n        print(1)\n")
+
+    assert(h.contains("SYSL_NORETURN void spin(void);"), h)
+    assert(h.contains("#define SYSL_NORETURN _Noreturn"), h)
+    assert(h.contains("[[noreturn]]"), h)
+end ex_the_header_annotates_never
+
+@test("and the macro is absent from a header with nothing that diverges")
+ex_the_header_omits_the_macro()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export\ntick(a: i32)\n    print(a)\n")
+
+    assert(!h.contains("SYSL_NORETURN"), h)
+
+@test("it spells a pointer as a pointer")
+ex_the_header_spells_a_pointer()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export\nhead(p: *u8) -> *u8 = p\n")
+
+    assert(h.contains("uint8_t * head(uint8_t * p);"), h)
+
+@test("and a 'bool' as C's, which is why <stdbool.h> is included")
+ex_the_header_spells_a_bool()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export\npositive(a: i32) -> bool = a > 0\n")
+
+    assert(h.contains("bool positive(int32_t a);"), h)
+
+@test("and the two float widths as C's own names")
+ex_the_header_spells_the_floats()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export\nf(a: f32) -> f64 = f64(a)\n")
+
+    assert(h.contains("double f(float a);"), h)
+
+// A `char` is a Unicode scalar value and four bytes wide, so C's `char` would be wrong by a factor of
+// four -- which is a silently corrupt call rather than a compile error.
+@test("and a 'char' as the 32-bit integer it is, never as C's 'char'")
+ex_the_header_spells_a_char()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export\nf(c: char) -> i32 = 0\n")
+
+    assert(h.contains("uint32_t c"), h)
+
+@test("and a module exporting nothing says so, rather than being an empty file")
+ex_the_header_of_a_module_exporting_nothing()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\nadd(a: i32) -> i32 = a\n\nprint(1)\n")
+
+    assert(h.contains("exports nothing"), h)
+
+// An aggregate is a spelling **and a definition**: a prototype naming `Id` is useless to a consumer
+// that has not been told what an `Id` is, and a by-value member is exactly the case a forward
+// declaration does not serve. So the header defines each one before it is used.
+@test("it defines each struct it names, before the prototype that names it")
+ex_the_header_defines_a_struct_first()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\nstruct Id\n    index1: i32\n    generation: u16\n\n" +
+                      "@export\nbump(a: Id) -> Id = a\n")
+
+    assert(h.contains("typedef struct {"), h)
+    assert(h.contains("int32_t index1;"), h)
+    assert(h.contains("uint16_t generation;"), h)
+    assert(h.index_of("typedef struct").unwrap() < h.index_of("bump(").unwrap(), h)
+end ex_the_header_defines_a_struct_first
+
+@test("and a struct a struct holds, before the struct that holds it")
+ex_the_header_defines_an_inner_struct_first()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\nstruct Inner\n    x: i32\n\nstruct Outer\n    a: Inner\n\n" +
+                      "@export\nf(o: Outer) -> i32 = o.a.x\n")
+
+    assert(h.index_of("demo_Inner;").unwrap() < h.index_of("demo_Outer;").unwrap(), h)
+end ex_the_header_defines_an_inner_struct_first
+
+@test("and defines one named twice only once")
+ex_the_header_defines_one_struct_once()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\nstruct Id\n    x: i32\n\n@export\nf(a: Id, b: Id) -> i32 = a.x\n")
+
+    assert_eq(ex_occurrences(h, "} demo_Id;"), 1)
+end ex_the_header_defines_one_struct_once
+
+// A field's brackets go after the name, so a member is not its type followed by its name the way a
+// parameter is -- which is the one place the declarator syntax shows through.
+@test("and spells an array field with its brackets after the name")
+ex_the_header_spells_an_array_field()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\nstruct Buf\n    bytes: [4]u8\n\n@export\nf(b: Buf) -> i32 = 0\n")
+
+    assert(h.contains("uint8_t bytes[4];"), h)
+
+// C's own `enum` has an implementation-defined width, so naming the integer is what states the same
+// contract the rest of the header states.
+@test("and spells a simple enum as the integer it is")
+ex_the_header_spells_a_simple_enum()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\nenum Colour: u8\n    Red\n    Green\n\n" +
+                      "@export\nf(c: Colour) -> i32 = 0\n")
+
+    assert(h.contains("int32_t f(uint8_t c);"), h)
+end ex_the_header_spells_a_simple_enum
+
+private ex_occurrences(text: string, what: string) -> usize
+    var seen: usize = 0
+    var rest = text
+
+    loop
+        rest.index_of(what) match
+            None -> break
+            Some(at) ->
+                seen += 1
+                rest = rest[(at + what.bytes.len)..<rest.bytes.len]
+
+    seen
+end ex_occurrences
+
+// -- the name a struct carries in the header -----------------------------------------------------------
+
+// **The name a struct carries in the header used to be derived and nothing else.** A function's
+// symbol was given `@export("mylib_add")` because a C library's names are its own and sysl's module
+// path is doing that job already. Once an aggregate crossed, a header began carrying *type* names
+// too, and those had no such control: the name is the mangled instantiation with everything C would
+// not accept replaced. `@export` on the struct is that same rename read at the other kind of
+// declaration.
+@test("the name a struct carries in the header is the one the attribute chose")
+ex_a_struct_name_is_chosen()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export(\"b2BodyId\")\nstruct Id\n    index1: i32\n\n" +
+                      "@export\nbump(a: Id) -> Id = a\n")
+
+    assert(h.contains("} b2BodyId;"), h)
+    assert(h.contains("b2BodyId bump(b2BodyId a);"), h)
+    assert(!h.contains("demo_Id"), h)
+end ex_a_struct_name_is_chosen
+
+// The same reading `@export` has on a function, where the bare form publishes the declared name
+// rather than the mangled key -- which is the whole of what a reader would expect it to mean.
+@test("and the bare form is the declared name, with the module path gone")
+ex_a_struct_name_bare_is_the_declared_name()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export\nstruct Id\n    index1: i32\n\n" +
+                      "@export\nbump(a: Id) -> Id = a\n")
+
+    assert(h.contains("} Id;"), h)
+    assert(h.contains("Id bump(Id a);"), h)
+end ex_a_struct_name_bare_is_the_declared_name
+
+@test("while a struct that names itself nothing keeps the derived name")
+ex_a_struct_keeps_its_derived_name()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\nstruct Id\n    index1: i32\n\n@export\nbump(a: Id) -> Id = a\n")
+
+    assert(h.contains("} demo_Id;"), h)
+
+// The name is used wherever the type is spelled, not only at the definition -- a field, a pointee and
+// a function pointer's signature all go through the one renderer.
+@test("and it is what a field, a pointer and a callback spell too")
+ex_a_struct_name_reaches_every_spelling()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export(\"b2Vec2\")\nstruct V\n    x: f32\n\n" +
+                      "struct Body\n    at: V\n\n" +
+                      "@export\nshift(b: *Body, cb: *extern(V) -> unit) -> V = b.at\n")
+
+    assert(h.contains("\tb2Vec2 at;"), h)
+    assert(h.contains("b2Vec2 shift(demo_Body * b, void (*)(b2Vec2) cb);"), h)
+end ex_a_struct_name_reaches_every_spelling
+
+// The layout pair and the name are three facts about one struct, so they compose -- which is the
+// combination a mirrored C struct actually wants.
+@test("and it composes with the layout attributes, which describe the same declaration")
+ex_a_struct_name_composes_with_packed()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@packed\n@export(\"wire_hdr\")\nstruct H\n    a: u8\n    b: u32\n\n" +
+                      "@export\nf(h: H) -> u8 = h.a\n")
+
+    assert(h.contains("} wire_hdr;"), h)
+    assert(h.contains("uint8_t f(wire_hdr h);"), h)
+end ex_a_struct_name_composes_with_packed
+
+// `@align` is the other half of that pair and is folded by a different line, so it is asserted rather
+// than assumed to follow from `@packed` working.
+@test("including the other one, which is folded separately")
+ex_a_struct_name_composes_with_align()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@align(16)\n@export(\"aligned_hdr\")\nstruct H\n    a: u32\n\n" +
+                      "@export\nf(h: H) -> u32 = h.a\n")
+
+    assert(h.contains("} aligned_hdr;"), h)
+end ex_a_struct_name_composes_with_align
+
+// The rule that catches an annotation written twice is above the struct reading and so covers it --
+// two names for one type say nothing the one does, and worse could disagree.
+@test("and writing it twice is refused, as it is above a function")
+ex_a_struct_export_written_twice()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export(\"a\")\n@export(\"b\")\nstruct H\n    x: i32\n")
+
+    assert(said.contains("is written twice above one declaration"), said)
+
+// **The chosen name reaches the header and nothing else.** The emitted aggregate keeps the mangled
+// name, which is what every other part of the compiler keys on, and C links nothing on a type name --
+// so this is a spelling for a reader rather than a fact anything depends on.
+@test("and the emitted aggregate is untouched, since nothing links on a type name")
+ex_the_emitted_aggregate_is_untouched()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\n@export(\"b2BodyId\")\nstruct Id\n    index1: i32\n\n" +
+                    "@export\nbump(a: Id) -> Id = a\n")
+
+    assert(out.contains("%struct.demo$Id"), out)
+end ex_the_emitted_aggregate_is_untouched
+
+// **A private struct is refused, and not for the reason a private function is.** A `typedef` has no
+// linkage to contradict, so the function's argument does not reach. The visibility rule gets there
+// first: a public declaration may not name a type less visible than itself, an exported function is
+// public, so a private struct is in no signature a header carries and there is no name in one for it
+// to take.
+@test("a private struct is refused, because no export could name it in the first place")
+ex_a_private_struct_export_is_refused()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export(\"b2BodyId\")\nprivate struct Id\n    index1: i32\n")
+
+    assert(said.contains("No header can carry this type at all"), said)
+end ex_a_private_struct_export_is_refused
+
+// The rule the one above defers to, asserted here so that the refusal and its reason cannot drift
+// apart: it is what makes a private struct unreachable from a header.
+@test("which is the rule that already stops a public export naming one")
+ex_a_public_export_may_not_name_a_private_type()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\nprivate struct Id\n    index1: i32\n\n" +
+                      "@export\nbump(a: Id) -> Id = a\n")
+
+    assert(said.contains("may not be more visible than the types it names"), said)
+end ex_a_public_export_may_not_name_a_private_type
+
+@test("a struct name C could not declare is refused")
+ex_a_struct_name_c_cannot_declare()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export(\"2bad\")\nstruct Id\n    x: i32\n")
+
+    assert(said.contains("is not a name C can declare"), said)
+
+@test("and a backticked struct named after itself, which is the same rule from the other end")
+ex_a_backticked_struct_named_after_itself()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export\nstruct `an id`\n    x: i32\n")
+
+    assert(said.contains("name it instead"), said)
+
+// Every instantiation is a struct of its own, so one written name would be claimed by all of them at
+// once -- the argument that refuses an exported generic function, one step shorter.
+@test("a generic struct is refused, because each instantiation would claim the one name")
+ex_a_generic_struct_export_is_refused()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export(\"Box\")\nstruct Box[T]\n    v: T\n")
+
+    assert(said.contains("cannot be generic"), said)
+
+// The collision a reader would never look for: a chosen name landing on what another struct's
+// **derived** one already is. It is the same mistake and gets the same refusal.
+@test("and a chosen struct name landing on another struct's derived one is the same refusal")
+ex_a_chosen_name_on_a_derived_one()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\nstruct Id\n    x: i32\n\n@export(\"demo_Id\")\nstruct Other\n" +
+                      "    y: i32\n\n@export\nf(a: Id, b: Other) -> i32 = a.x\n")
+
+    assert(said.contains("'demo_Id' is the C name of"), said)
+end ex_a_chosen_name_on_a_derived_one
+
+// Two functions claiming one symbol stay the duplicate case, whose sentence is about the linker and
+// two definitions -- the better one there, and the reason the collision check needs a type in the
+// group.
+@test("while two functions claiming one symbol keep the refusal that is about the linker")
+ex_two_functions_of_one_symbol_keep_their_refusal()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export(\"go\")\na() -> i32 = 1\n\n@export(\"go\")\nb() -> i32 = 2\n")
+
+    assert(said.contains("one symbol is one definition"), said)
+end ex_two_functions_of_one_symbol_keep_their_refusal
+
+// Only what reaches the header claims a name, which is the aggregates' set rather than every struct
+// in the program: two types nobody exported cannot collide in a file neither is in.
+@test("while two agreeing names neither of which reaches the header are not a collision")
+ex_two_names_that_reach_no_header()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export(\"Handle\")\nstruct A\n    x: i32\n\n" +
+                      "@export(\"Handle\")\nstruct B\n    y: i32\n\n@export\nf(n: i32) -> i32 = n\n")
+
+    assert(h.contains("int32_t f(int32_t n);"), h)
+end ex_two_names_that_reach_no_header
+
+// -- a test build is held to the export rules too ----------------------------------------------------
+
+// A test build ran the escape and tail-call checks and never the export ones, so every rule above was
+// silent under `sysl test` -- the loop a package's author actually runs. The same source a `sysl
+// build` refused compiled, linked and ran, reporting a pass.
+
+@test("a test build refuses a private export, which is the two promises a definition cannot both make")
+ex_a_test_build_refuses_a_private_export()
+    if ex_no_library() then return
+
+    val said = ex_test_err("module demo\n\n@export\nprivate add(a: i32) -> i32 = a\n\n" +
+                           "@test(\"one\")\nt() = assert(1 == 1, \"one\")\n")
+
+    assert(said.contains("cannot make both claims"), said)
+end ex_a_test_build_refuses_a_private_export
+
+@test("and a variadic one")
+ex_a_test_build_refuses_a_variadic_export()
+    if ex_no_library() then return
+
+    val said = ex_test_err("module demo\n\n@export\nf(n: i32, ...) -> i32 = n\n\n" +
+                           "@test(\"one\")\nt() = assert(1 == 1, \"one\")\n")
+
+    assert(said.contains("take a 'va_list' parameter instead"), said)
+end ex_a_test_build_refuses_a_variadic_export
+
+@test("and a parameter C has no declaration for")
+ex_a_test_build_refuses_an_unspellable_parameter()
+    if ex_no_library() then return
+
+    val said = ex_test_err("module demo\n\n@export\nf(s: string) -> i32 = 0\n\n" +
+                           "@test(\"one\")\nt() = assert(1 == 1, \"one\")\n")
+
+    assert(said.contains("which C has no way to spell"), said)
+end ex_a_test_build_refuses_an_unspellable_parameter
+
+// **A test build fills its own module storage, so this is one refusal it does NOT inherit.** The test
+// entry point lays the computed `val`s down exactly as an ordinary one does, so a test binary reads
+// filled storage and always did. The refusal that remains is a freestanding archive's, which no test
+// build can be: a test runs on the machine that built it.
+@test("while an export reaching computed module storage is fine, because a test build fills it")
+ex_a_test_build_fills_its_storage()
+    if ex_no_library() then return
+
+    val out = ex_test_ir(ex_computed_storage() + "\n@test(\"one\")\nt() = assert(1 == 1, \"one\")\n")
+
+    assert(out.contains("define i32 @begin("), out)
+end ex_a_test_build_fills_its_storage
+
+// And the export a test build legitimately has stays legitimate: a `@tests` file's `@export` is a
+// definition *here*, which is the whole reason the tree read keeps them.
+@test("while a @tests file's own export is fine, because this is the build that emits it")
+ex_a_test_builds_own_export_is_fine()
+    if ex_no_library() then return
+
+    val out = ex_test_ir("module demo\n\n@tests\n\n@export(\"probe\")\nprobe(a: i32) -> i32 = a\n\n" +
+                         "@test(\"one\")\nt() = assert(1 == 1, \"one\")\n")
+
+    assert(out.contains("define i32 @probe("), out)
+end ex_a_test_builds_own_export_is_fine
+
+// -- the attribute itself ------------------------------------------------------------------------------
+
+@test("a malformed export argument is told what the form is")
+ex_a_malformed_export_argument()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export(mylib_add)\nadd(a: i32) -> i32 = a\n")
+
+    assert(said.contains("names the C symbol as a string"), said)
+
+@test("and the unknown-annotation list mentions it, so it is discoverable")
+ex_the_unknown_annotation_list_mentions_export()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@exprot\nadd(a: i32) -> i32 = a\n")
+
+    assert(said.contains("'@export'"), said)
+
+// `@export` marks two kinds of declaration and neither of them is a binding, so the refusal says
+// which two rather than leaving the grammar to complain about the word after it.
+@test("above a binding, which is neither of the two things it names")
+ex_an_export_above_a_binding()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export(\"x\")\nvar count: i32 = 0\n")
+
+    assert(said.contains("names what C sees"), said)
+
+// The layout pair settles it: `@packed` cannot mark a function, so the pair together can only be
+// about a struct and the refusal need not offer the function reading at all.
+@test("and beside a layout attribute above one, where only the struct reading is left")
+ex_an_export_beside_a_layout_attribute()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@packed\n@export(\"x\")\nvar count: i32 = 0\n")
+
+    assert(said.contains("together they mark a struct"), said)
+end ex_an_export_beside_a_layout_attribute
+
+// A simple enum is spelled as its underlying integer, so there is no name in the header for the
+// attribute to be about -- which is the mistake worth naming, since a simple enum does cross.
+@test("and above an enum, which is spelled as an integer and so has no name to choose")
+ex_an_export_above_an_enum()
+    if ex_no_library() then return
+
+    val said = ex_err("module demo\n\n@export(\"Colour\")\nenum Colour: u8\n    Red\n    Green\n")
+
+    assert(said.contains("no name in the header to choose"), said)
+end ex_an_export_above_an_enum
+
+// The mix that has always meant a function still does: `@export` composes with the function
+// attributes exactly as before, and the struct reading is reached only by the layout pair.
+@test("while an export beside a function attribute is still a function")
+ex_an_export_beside_a_function_attribute()
+    if ex_no_library() then return
+
+    val out = ex_ir("module demo\n\n@pure\n@export(\"mylib_add\")\nadd(a: i32, b: i32) -> i32 = a + b\n")
+
+    assert(out.contains("define i32 @mylib_add("), out)
+end ex_an_export_beside_a_function_attribute

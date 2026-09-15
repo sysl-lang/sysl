@@ -1,0 +1,898 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **`import` shortens a path that already works, and grants nothing.** Every case here has a
+// longhand that compiles without it, so what is under test is which shorter spelling means what, and
+// which shorter spellings are refused for meaning two things.
+//
+// The claims are about whole programs spread over several modules -- a module is a directory, so a
+// tree is what an import is read against -- and most of them are what such a program PRINTS. Nothing
+// short of building and running says that.
+//
+// **Every refusal quoted here was obtained by running the reference compiler on the same source.**
+
+// A module whose members most of the cases reach for, so each one differs only in how it names them.
+private im_geom() -> string =
+    "module geom\ntwice(n: int) -> int = n * 2\nthrice(n: int) -> int = n * 3\n" +
+    "struct Point\n    x: int\n    y: int\nenum Shape\n    Dot\n    Round(r: int)\n" +
+    "trait Show\n    show(self) -> int\npair[T](a: T) -> T = a\nextern abs(n: int) -> int\n"
+
+// A file of a program: the module it belongs to, its name, and its text. The module is a **directory**
+// path, which is what makes a written import mean anything at all.
+private im_files() -> Buf[(string, string, string)] = buf()
+
+private im_with_geom(main: string) -> Buf[(string, string, string)]
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    fs.push(("geom", "g.sysl", im_geom()))
+    fs
+end im_with_geom
+
+private im_can_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end im_can_run
+
+private im_write(files: Buf[(string, string, string)]) -> string
+    val root = make_temp_dir("sysl-import").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for i in 0..<files.len()
+        val f = files.at(i)
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    root
+end im_write
+
+// **What a program of these files PRINTS**, or what the build had to say about it -- one function,
+// since a case that expects a refusal and one that expects output are asking the same thing of the
+// same machinery and only the assertion differs.
+//
+// **What is handed over is the project ROOT rather than the entry file**, a module being a directory:
+// a lone file is a compilation of one file, and every import below would name a module nothing in it
+// declares. Which file the statements are in is then the driver's two-pass question, not a
+// parameter here.
+private im_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end im_out
+
+private im_ran(main: string) -> string = im_out(im_with_geom(main))
+
+// The LLVM text of a program, for the one claim that is about what was emitted rather than what ran.
+private im_ir(files: Buf[(string, string, string)]) -> string
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> return "no library"
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> return "no library"
+            Ok(lib) ->
+                for i in 0..<lib.len()
+                    units.push(lib.at(i))
+
+    for i in 0..<files.len()
+        val f = files.at(i)
+        val parsed = parse(source_of(f.1, f.2))
+
+        if !parsed.ok() then return parsed.report.at(0).message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/")
+            return done.reported.at(i).diag.message
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val kept = prune(strip_tests(whole), own)
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), pr).0)
+end im_ir
+
+// -- the forms parse -----------------------------------------------------------------------------------
+
+// A single segment is a module or it is nothing: there is no member for it to be naming, the path
+// having no module in front of it.
+@test("an import of a single segment parses, the segment being a module")
+im_a_single_segment_parses()
+    assert_eq(pf("import geom\n"), "(import geom)")
+
+@test("and a rename on a single segment renames the module")
+im_a_single_segment_renamed()
+    assert_eq(pf("import geom as g\n"), "(import geom as g)")
+
+// An import is a statement, so it sits among them rather than in a preamble above them -- which is
+// what lets one sit inside a block.
+@test("an import sits among the statements, not above them")
+im_an_import_sits_among_the_statements()
+    assert_eq(pf("print(1)\nimport geom.twice\n"), "(print 1) (import geom.twice)")
+
+// -- an import shortens ----------------------------------------------------------------------------------
+
+@test("an import shortens one member")
+im_one_member()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.twice\nprint(twice(21))"), "42\n")
+
+@test("and several at once")
+im_several_members()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.{twice, thrice}\nprint(twice(3) + thrice(4))"), "18\n")
+
+@test("and every member of a module")
+im_every_member()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.*\nprint(twice(3) + thrice(4))"), "18\n")
+
+@test("and a member under another name")
+im_a_member_renamed()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.{twice as double}\nprint(double(21))"), "42\n")
+
+// The same binding by the unbraced spelling, so the two forms are one feature rather than two that
+// happen to agree.
+@test("the same, written without the braces")
+im_a_member_renamed_unbraced()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.twice as double\nprint(double(21))"), "42\n")
+
+// And the old name is gone, which is what makes it a rename rather than a second binding.
+@test("and the name a rename replaced is not also bound")
+im_a_rename_replaces_the_name()
+    if im_can_run() then return
+
+    val said = im_ran("import geom.twice as double\nprint(twice(21))")
+
+    assert(said.contains("twice"), said)
+end im_a_rename_replaces_the_name
+
+// A module renamed by the unbraced form, which the braced one cannot express at the top level:
+// `import text.util as u` has no selector list to hang the rename on.
+@test("a module under a shorter name, which only the unbraced form can say")
+im_a_module_under_a_shorter_name()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import text.util as u\nprint(u.width(4))"))
+    fs.push(("text.util", "u.sysl", "module text.util\nwidth(n: int) -> int = n + 1"))
+
+    assert_eq(im_out(fs), "5\n")
+end im_a_module_under_a_shorter_name
+
+@test("a module, so its members are reached by its last segment")
+im_a_module_by_its_last_segment()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import text.util\nprint(util.width(4))"))
+    fs.push(("text.util", "u.sysl", "module text.util\nwidth(n: int) -> int = n + 1"))
+
+    assert_eq(im_out(fs), "5\n")
+end im_a_module_by_its_last_segment
+
+@test("a module named among the selectors, which is the same import")
+im_a_module_among_the_selectors()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import text.{util}\nprint(util.width(4))"))
+    fs.push(("text", "t.sysl", "module text\nwrap(n: int) -> int = n"))
+    fs.push(("text.util", "u.sysl", "module text.util\nwidth(n: int) -> int = n + 1"))
+
+    assert_eq(im_out(fs), "5\n")
+end im_a_module_among_the_selectors
+
+// The directory a sub-module sits in need not be a module itself: a `text/` holding only `util/` has
+// no members of its own, and a selector list over it reaches the one it does have.
+@test("a sub-module of a directory that holds no source of its own")
+im_a_sub_module_of_a_bare_directory()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import text.{util}\nprint(util.width(4))"))
+    fs.push(("text.util", "u.sysl", "module text.util\nwidth(n: int) -> int = n + 1"))
+
+    assert_eq(im_out(fs), "5\n")
+end im_a_sub_module_of_a_bare_directory
+
+// A wildcard is over a module's members, so a directory that is not one has none to offer.
+@test("but a wildcard over such a directory has no members to bring in")
+im_a_wildcard_over_a_bare_directory()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import text.*\nprint(1)"))
+    fs.push(("text.util", "u.sysl", "module text.util\nwidth(n: int) -> int = n + 1"))
+
+    val said = im_out(fs)
+
+    assert(said.contains("no module is called 'text'"), said)
+end im_a_wildcard_over_a_bare_directory
+
+@test("a module under another name")
+im_a_module_under_another_name()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import text.{util as u}\nprint(u.width(4))"))
+    fs.push(("text.util", "u.sysl", "module text.util\nwidth(n: int) -> int = n + 1"))
+
+    assert_eq(im_out(fs), "5\n")
+end im_a_module_under_another_name
+
+// -- an imported name works wherever the path did -----------------------------------------------------
+
+@test("an imported type works in an annotation and in a construction")
+im_an_imported_type()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.Point\nvar p: Point = Point(3, 4)\nprint(p.x + p.y)"), "7\n")
+
+@test("an imported enum, reached by name")
+im_an_imported_enum()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.Shape\nvar s: Shape = Shape.Round(7)\ns match\n" +
+                     "    Dot -> print(0)\n    Round(r) -> print(r)"), "7\n")
+
+@test("an imported variant, constructed unqualified")
+im_an_imported_variant()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.{Shape, Round}\nvar s: Shape = Round(7)\ns match\n" +
+                     "    Dot -> print(0)\n    Round(r) -> print(r)"), "7\n")
+
+@test("an imported trait, as a bound")
+im_an_imported_trait_as_a_bound()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.Show\nloud[T: Show](x: T) -> int = x.show()\nstruct Tag\n    n: int\n" +
+                     "impl Show for Tag\n    show(self) -> int = self.n * 2\nprint(loud(Tag(5)))"), "10\n")
+
+@test("an imported trait, as an object")
+im_an_imported_trait_as_an_object()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.Show\nstruct Tag\n    n: int\nimpl Show for Tag\n" +
+                     "    show(self) -> int = self.n * 2\nvar s: &Show = Tag(5)\nprint(s.show())"), "10\n")
+
+@test("an associated function, reached through the imported type")
+im_an_associated_function()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import geom.Point\nprint(Point.zero().x)"))
+    fs.push(("geom", "g.sysl",
+             "module geom\nstruct Point\n    x: int\n    y: int\n\n    zero() -> Point = Point(0, 0)"))
+
+    assert_eq(im_out(fs), "0\n")
+end im_an_associated_function
+
+@test("and the full path still works, alongside the short one")
+im_the_full_path_still_works()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.twice\nprint(twice(1) + geom.twice(2))"), "6\n")
+
+// -- which name wins ------------------------------------------------------------------------------------
+
+// The order is this module, then the imports, then the library.
+@test("a declaration of this module beats an import of the same name")
+im_this_module_beats_an_import()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.twice\ntwice(n: int) -> int = n * 10\nprint(twice(4))"), "40\n")
+
+@test("a selective import beats a wildcard that also offers the name")
+im_a_selective_import_beats_a_wildcard()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import a.*\nimport b.f\nprint(f())"))
+    fs.push(("a", "a.sysl", "module a\nf() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\nf() -> int = 2"))
+
+    assert_eq(im_out(fs), "2\n")
+end im_a_selective_import_beats_a_wildcard
+
+@test("a local binding shadows a module a file imported under its name")
+im_a_local_binding_shadows_a_module()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl",
+             "import text.util\nstruct Box\n    width: int\nvar util: Box = Box(9)\nprint(util.width)"))
+    fs.push(("text.util", "u.sysl", "module text.util\nwidth(n: int) -> int = n + 1"))
+
+    assert_eq(im_out(fs), "9\n")
+end im_a_local_binding_shadows_a_module
+
+@test("an import does not hide a library name unless it offers one")
+im_an_import_does_not_hide_the_library()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.*\nprint(twice(21))"), "42\n")
+
+// -- an import belongs to the file that wrote it --------------------------------------------------------
+
+@test("a sibling file of the same module does not get an import")
+im_a_sibling_file_does_not_get_it()
+    if im_can_run() then return
+
+    var fs = im_with_geom("print(m.use())")
+
+    fs.push(("m", "a.sysl", "module m\nimport geom.twice\nuse() -> int = twice(2)"))
+    fs.push(("m", "b.sysl", "module m\nalso() -> int = twice(3)"))
+
+    val said = im_out(fs)
+
+    assert(said.contains("undefined function 'twice'"), said)
+end im_a_sibling_file_does_not_get_it
+
+@test("a body reads the imports of the file it was written in, not the caller's")
+im_a_body_reads_its_own_files_imports()
+    if im_can_run() then return
+
+    var fs = im_with_geom("print(m.use())")
+
+    fs.push(("m", "a.sysl", "module m\nimport geom.twice\nuse() -> int = twice(21)"))
+
+    assert_eq(im_out(fs), "42\n")
+end im_a_body_reads_its_own_files_imports
+
+@test("and a member's signature is read there too")
+im_a_members_signature_is_read_there()
+    if im_can_run() then return
+
+    var fs = im_with_geom("print(m.Wrap(geom.Point(3, 4)).sum())")
+
+    fs.push(("m", "a.sysl", "module m\nimport geom.Point\nstruct Wrap\n    p: Point\n\n" +
+                            "    sum(self) -> int = self.p.x + self.p.y"))
+
+    assert_eq(im_out(fs), "7\n")
+end im_a_members_signature_is_read_there
+
+@test("two files of one module may each bind the same name to a different thing")
+im_two_files_bind_one_name_differently()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "print(m.one() + m.two())"))
+    fs.push(("m", "a.sysl", "module m\nimport x.f\none() -> int = f()"))
+    fs.push(("m", "b.sysl", "module m\nimport y.{g as f}\ntwo() -> int = f()"))
+    fs.push(("x", "x.sysl", "module x\nf() -> int = 1"))
+    fs.push(("y", "y.sysl", "module y\ng() -> int = 2"))
+
+    assert_eq(im_out(fs), "3\n")
+end im_two_files_bind_one_name_differently
+
+// A trait's default is copied into every implementing type, and it means what it meant at the trait
+// -- including which module its file imported names from.
+@test("and so is a default a trait supplies")
+im_a_trait_default_reads_its_own_imports()
+    if im_can_run() then return
+
+    var fs = im_with_geom("import t.Loud\nstruct Tag\n    n: int\nimpl Loud for Tag\n" +
+                          "    base(self) -> int = self.n\nprint(Tag(5).noise())")
+
+    fs.push(("t", "t.sysl", "module t\nimport geom.twice\ntrait Loud\n    base(self) -> int\n" +
+                            "    noise(self) -> int = twice(self.base())"))
+
+    assert_eq(im_out(fs), "10\n")
+end im_a_trait_default_reads_its_own_imports
+
+// -- an import inside a block ----------------------------------------------------------------------------
+
+@test("an import inside a block binds for the rest of that block")
+im_an_import_in_a_block()
+    if im_can_run() then return
+
+    assert_eq(im_ran("use() -> int =\n    import geom.twice\n    twice(21)\nprint(use())"), "42\n")
+
+@test("and not for the function beside it")
+im_an_import_in_a_block_is_not_for_a_sibling()
+    if im_can_run() then return
+
+    val said = im_ran("one() -> int =\n    import geom.twice\n    twice(1)\ntwo() -> int = twice(2)")
+
+    assert(said.contains("undefined function 'twice'"), said)
+end im_an_import_in_a_block_is_not_for_a_sibling
+
+@test("and not after the block it is in closes")
+im_an_import_in_a_block_closes_with_it()
+    if im_can_run() then return
+
+    val said = im_ran("use() -> int =\n    if true\n        import geom.twice\n" +
+                      "        print(twice(1))\n    twice(2)")
+
+    assert(said.contains("undefined function 'twice'"), said)
+end im_an_import_in_a_block_closes_with_it
+
+@test("shadowing what the file imported under the same name")
+im_an_import_in_a_block_shadows_the_files()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.{twice as f}\nuse() -> int =\n    import geom.{thrice as f}\n" +
+                     "    f(4)\nprint(use() + f(4))"), "20\n")
+
+// -- an import runs nothing ------------------------------------------------------------------------------
+
+@test("so two files may each import and neither becomes the one that starts the program")
+im_an_import_does_not_start_a_program()
+    if im_can_run() then return
+
+    var fs = im_with_geom("import geom.twice\nprint(twice(21))")
+
+    fs.push(("m", "a.sysl", "module m\nimport geom.thrice\nuse() -> int = thrice(1)"))
+
+    assert_eq(im_out(fs), "42\n")
+end im_an_import_does_not_start_a_program
+
+@test("and a program of imports and declarations alone is a program that does nothing")
+im_a_program_of_declarations_alone()
+    val out = im_ir(im_with_geom("import geom.twice\nuse() -> int = twice(1)"))
+
+    if out == "no library" then return
+
+    assert(out.contains("define i32 @main("), out)
+end im_a_program_of_declarations_alone
+
+// -- a path that names nothing ---------------------------------------------------------------------------
+
+@test("an import of no module of that name at all")
+im_no_module_of_that_name()
+    if im_can_run() then return
+
+    val said = im_ran("import nope.thing\nprint(1)")
+
+    assert(said.contains("no module is called 'nope.thing', and nothing declares it"), said)
+end im_no_module_of_that_name
+
+@test("a wildcard on something that is not a module")
+im_a_wildcard_on_a_non_module()
+    if im_can_run() then return
+
+    val said = im_ran("import nope.*\nprint(1)")
+
+    assert(said.contains("no module is called 'nope'"), said)
+end im_a_wildcard_on_a_non_module
+
+@test("a selector list on something that is not a module")
+im_a_selector_list_on_a_non_module()
+    if im_can_run() then return
+
+    val said = im_ran("import geom.twice.{a}\nprint(1)")
+
+    assert(said.contains("no module is called 'geom.twice'"), said)
+end im_a_selector_list_on_a_non_module
+
+@test("a single segment, which can only ever be a module")
+im_a_single_segment_that_is_nothing()
+    if im_can_run() then return
+
+    val said = im_ran("import geom2\nprint(1)")
+
+    assert(said.contains("no module is called 'geom2', and nothing declares it"), said)
+end im_a_single_segment_that_is_nothing
+
+@test("a module that declares no such name")
+im_a_module_declaring_no_such_name()
+    if im_can_run() then return
+
+    val said = im_ran("import geom.nope\nprint(1)")
+
+    assert(said.contains("'geom' declares no 'nope' — there is no 'geom.nope'"), said)
+end im_a_module_declaring_no_such_name
+
+@test("a selector that names no member")
+im_a_selector_naming_no_member()
+    if im_can_run() then return
+
+    val said = im_ran("import geom.{twice, nope}\nprint(1)")
+
+    assert(said.contains("'geom' declares no 'nope'"), said)
+end im_a_selector_naming_no_member
+
+// The rename is what the file calls it; the mistake is still in what it asked the module for.
+@test("a rename of a member that is not there")
+im_a_rename_of_an_absent_member()
+    if im_can_run() then return
+
+    val said = im_ran("import geom.{nope as n}\nprint(1)")
+
+    assert(said.contains("'geom' declares no 'nope'"), said)
+end im_a_rename_of_an_absent_member
+
+// -- a name an import may not bind -------------------------------------------------------------------------
+
+@test("a name already imported")
+im_a_name_already_imported()
+    if im_can_run() then return
+
+    val said = im_ran("import geom.twice\nimport geom.{thrice as twice}\nprint(1)")
+
+    assert(said.contains("'twice' is already imported"), said)
+end im_a_name_already_imported
+
+@test("and one already imported by the same statement")
+im_a_name_already_imported_by_one_statement()
+    if im_can_run() then return
+
+    val said = im_ran("import geom.{twice, thrice as twice}\nprint(1)")
+
+    assert(said.contains("'twice' is already imported"), said)
+end im_a_name_already_imported_by_one_statement
+
+@test("one that is a module, which a dotted reference would then read two ways")
+im_a_name_that_is_a_module()
+    if im_can_run() then return
+
+    var fs = im_with_geom("import geom.{twice as text}\nprint(1)")
+
+    fs.push(("text.util", "u.sysl", "module text.util\nwidth(n: int) -> int = n"))
+
+    val said = im_out(fs)
+
+    assert(said.contains("'text' is a module, so importing something else under that name would " +
+                         "hide it"), said)
+end im_a_name_that_is_a_module
+
+@test("and a module imported under a module's name is refused the same way")
+im_a_module_under_a_modules_name()
+    if im_can_run() then return
+
+    var fs = im_with_geom("import text.{util as geom}\nprint(1)")
+
+    fs.push(("text", "t.sysl", "module text\nwrap(n: int) -> int = n"))
+    fs.push(("text.util", "u.sysl", "module text.util\nwidth(n: int) -> int = n"))
+
+    val said = im_out(fs)
+
+    assert(said.contains("'geom' is a module"), said)
+end im_a_module_under_a_modules_name
+
+// Asking for what is already true is not a collision with itself.
+@test("though importing a module under the name it already has is allowed and does nothing")
+im_a_module_under_its_own_name()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom\nprint(geom.twice(21))"), "42\n")
+
+// -- a module alias is a prefix wherever a written path is ----------------------------------------------------
+
+@test("a module alias works in a type annotation and a construction")
+im_an_alias_in_an_annotation()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import text.util\nvar p: util.Point = util.Point(3, 4)\nprint(p.x + p.y)"))
+    fs.push(("text.util", "u.sysl", "module text.util\nstruct Point\n    x: int\n    y: int"))
+
+    assert_eq(im_out(fs), "7\n")
+end im_an_alias_in_an_annotation
+
+@test("and reaching a variant through its enum")
+im_an_alias_reaching_a_variant()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import text.util\nvar s: util.Shape = util.Shape.Round(7)\ns match\n" +
+                              "    Dot -> print(0)\n    Round(r) -> print(r)"))
+    fs.push(("text.util", "u.sysl", "module text.util\nenum Shape\n    Dot\n    Round(r: int)"))
+
+    assert_eq(im_out(fs), "7\n")
+end im_an_alias_reaching_a_variant
+
+@test("and as a bound, and as the trait an 'impl' is for")
+im_an_alias_as_a_bound()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import text.util\nloud[T: util.Show](x: T) -> int = x.show()\n" +
+                              "struct Tag\n    n: int\nimpl util.Show for Tag\n" +
+                              "    show(self) -> int = self.n * 2\nprint(loud(Tag(5)))"))
+    fs.push(("text.util", "u.sysl", "module text.util\ntrait Show\n    show(self) -> int"))
+
+    assert_eq(im_out(fs), "10\n")
+end im_an_alias_as_a_bound
+
+@test("and a module several segments deep is reached by its last one")
+im_an_alias_several_segments_deep()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import a.b.c\nprint(c.f(21))"))
+    fs.push(("a.b.c", "c.sysl", "module a.b.c\nf(n: int) -> int = n * 2"))
+
+    assert_eq(im_out(fs), "42\n")
+end im_an_alias_several_segments_deep
+
+// The two are told apart by what is being named: a member is reached by the module's own path, a
+// sub-module by the name the import gave it.
+@test("even where the parent module declares a member of the same name")
+im_an_alias_beside_a_member_of_that_name()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import a.b\nprint(b.f() + a.b())"))
+    fs.push(("a", "a.sysl", "module a\nb() -> int = 1"))
+    fs.push(("a.b", "b.sysl", "module a.b\nf() -> int = 2"))
+
+    assert_eq(im_out(fs), "3\n")
+end im_an_alias_beside_a_member_of_that_name
+
+// -- an import reaches whatever the module declares ------------------------------------------------------------
+
+@test("a generic function, instantiated at the call")
+im_a_generic_function()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import geom.pair\nprint(pair(41) + 1)"))
+    fs.push(("geom", "g.sysl", "module geom\npair[T](a: T) -> T = a"))
+
+    assert_eq(im_out(fs), "42\n")
+end im_a_generic_function
+
+// An extern's symbol is the linker's and carries no module, but the name a program calls it by is a
+// name of its module like any other.
+@test("an extern, whose symbol the linker still resolves unqualified")
+im_an_extern()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import geom.abs\nprint(abs(0 - 42))"))
+    fs.push(("geom", "g.sysl", "module geom\nextern abs(n: int) -> int"))
+
+    assert_eq(im_out(fs), "42\n")
+end im_an_extern
+
+@test("an imported type used in a struct pattern")
+im_an_imported_type_in_a_pattern()
+    if im_can_run() then return
+
+    assert_eq(im_ran("import geom.Point\nvar p: Point = Point(3, 4)\np match\n" +
+                     "    Point{x, y} -> print(x + y)"), "7\n")
+
+// The same spelling may be a type in one module and a function in another, and one import binds a
+// name rather than a kind -- which of the two a use means is settled by where it is written.
+@test("a type from one module beside a function of the same name from another")
+im_a_type_beside_a_function_of_one_name()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import a.X\nimport b.{X as X2}\nvar v: X = X(3)\nprint(v.n + X2(4))"))
+    fs.push(("a", "a.sysl", "module a\nstruct X\n    n: int"))
+    fs.push(("b", "b.sysl", "module b\nX(n: int) -> int = n * 10"))
+
+    assert_eq(im_out(fs), "43\n")
+end im_a_type_beside_a_function_of_one_name
+
+// -- the wildcard's own edges ----------------------------------------------------------------------------------
+
+@test("a wildcard over the module the file is itself in, which changes nothing")
+im_a_wildcard_over_its_own_module()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("geom", "g2.sysl", "module geom\nimport geom.*\nprint(twice(21))"))
+    fs.push(("geom", "g.sysl", im_geom()))
+
+    assert_eq(im_out(fs), "42\n")
+end im_a_wildcard_over_its_own_module
+
+// A wildcard offers rather than binds, so it neither collides with a selective import of the same
+// name nor with a second wildcard over the same module.
+@test("beside a selective import of a name it also offers")
+im_a_wildcard_beside_a_selective_import()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import a.*\nimport a.f\nprint(f())"))
+    fs.push(("a", "a.sysl", "module a\nf() -> int = 7"))
+
+    assert_eq(im_out(fs), "7\n")
+end im_a_wildcard_beside_a_selective_import
+
+@test("and written twice over the one module")
+im_a_wildcard_written_twice()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import a.*\nimport a.*\nprint(f())"))
+    fs.push(("a", "a.sysl", "module a\nf() -> int = 7"))
+
+    assert_eq(im_out(fs), "7\n")
+end im_a_wildcard_written_twice
+
+// A written wildcard offering a name the standard module also offers is the two-wildcard case, not a
+// shadowing one -- the standard module is auto-imported, and an auto-import is exactly a wildcard
+// every file starts with, so the pair is ambiguous and the message names both.
+@test("and a wildcard offering a library name is ambiguous rather than shadowing it")
+im_a_wildcard_offering_a_library_name()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "print(m.use())"))
+    fs.push(("m", "m.sysl", "module m\nimport a.*\nuse() -> int =\n    var o: Option = Option(7)\n    o.n"))
+    fs.push(("a", "a.sysl", "module a\nstruct Option\n    n: int"))
+
+    val said = im_out(fs)
+
+    assert(said.contains("'Option' is offered by"), said)
+    assert(said.contains("and 'a.*'"), said)
+end im_a_wildcard_offering_a_library_name
+
+// And both stated fixes work, which is what makes the ambiguity a nuisance rather than a wall: name
+// the module, or import the one you meant selectively.
+@test("which either of the fixes it names resolves")
+im_either_fix_for_an_ambiguous_wildcard()
+    if im_can_run() then return
+
+    var named = im_files()
+
+    named.push(("", "main.sysl", "print(m.use())"))
+    named.push(("m", "m.sysl", "module m\nimport a.*\nuse() -> int =\n" +
+                               "    var o: a.Option = a.Option(7)\n    o.n"))
+    named.push(("a", "a.sysl", "module a\nstruct Option\n    n: int"))
+
+    assert_eq(im_out(named), "7\n")
+
+    var selective = im_files()
+
+    selective.push(("", "main.sysl", "print(m.use())"))
+    selective.push(("m", "m.sysl", "module m\nimport a.Option\nuse() -> int =\n" +
+                                   "    var o: Option = Option(7)\n    o.n"))
+    selective.push(("a", "a.sysl", "module a\nstruct Option\n    n: int"))
+
+    assert_eq(im_out(selective), "7\n")
+end im_either_fix_for_an_ambiguous_wildcard
+
+// -- a mistake in an import costs the import and no more -----------------------------------------------------
+
+@test("the rest of the file is still read")
+im_the_rest_of_the_file_is_read()
+    if im_can_run() then return
+
+    val said = im_ran("import nope.thing\nimport geom.twice\nprint(twice(21))\nprint(gone())")
+
+    assert(said.contains("undefined function 'gone'"), said)
+end im_the_rest_of_the_file_is_read
+
+@test("and so is the rest of a block")
+im_the_rest_of_the_block_is_read()
+    if im_can_run() then return
+
+    val said = im_ran("use() -> int =\n    import nope.thing\n    gone()\nprint(use())")
+
+    assert(said.contains("undefined function 'gone'"), said)
+end im_the_rest_of_the_block_is_read
+
+@test("an imported name that is not a trait is still told it is not one")
+im_an_imported_name_that_is_not_a_trait()
+    if im_can_run() then return
+
+    val said = im_ran("import geom.Point\nf[T: Point](x: T) -> int = 1\nprint(1)")
+
+    assert(said.contains("names 'Point', which is not a trait"), said)
+end im_an_imported_name_that_is_not_a_trait
+
+// The refusal is inside the braces, where a name would have gone, rather than at the end of the line
+// the braces are on.
+@test("an empty selector list does not parse")
+im_an_empty_selector_list()
+    assert(pf_err("import geom.{}\nprint(1)\n").contains("identifier expected"),
+           "an empty selector list is refused where a name would have gone")
+
+// -- two wildcards offering one name --------------------------------------------------------------------------
+
+@test("two wildcards offering one name make an unqualified use of it ambiguous")
+im_two_wildcards_are_ambiguous()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import a.*\nimport b.*\nprint(f())"))
+    fs.push(("a", "a.sysl", "module a\nf() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\nf() -> int = 2"))
+
+    val said = im_out(fs)
+
+    assert(said.contains("'f' is offered by 'a.*' and 'b.*'"), said)
+end im_two_wildcards_are_ambiguous
+
+@test("and the fix is to name the module, which the wildcards never took away")
+im_naming_the_module_fixes_two_wildcards()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import a.*\nimport b.*\nprint(a.f() + b.f())"))
+    fs.push(("a", "a.sysl", "module a\nf() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\nf() -> int = 2"))
+
+    assert_eq(im_out(fs), "3\n")
+end im_naming_the_module_fixes_two_wildcards
+
+// Only a name they *both* declare is ambiguous; the rest of each module comes through.
+@test("while a name only one of them has is not ambiguous at all")
+im_a_name_only_one_wildcard_has()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import a.*\nimport b.*\nprint(g() + h())"))
+    fs.push(("a", "a.sysl", "module a\ng() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\nh() -> int = 2"))
+
+    assert_eq(im_out(fs), "3\n")
+end im_a_name_only_one_wildcard_has
