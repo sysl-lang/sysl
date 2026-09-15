@@ -131,8 +131,16 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
         val provided = builtin_constant_read(cx, span, ty, name)
 
         if provided.is_some()
-            if !args.is_empty() then
-                cx.fault(span, s"'${module_show(found.0)}.$name' takes no arguments")
+            // **The refusal names the TRAIT that declares the member, not the receiver's key.** A
+            // width is `Bits`' and an identity is `Zero`'s or `One`'s, and a reader told
+            // `'uint.width'` is being sent to a declaration no file wrote.
+            if !args.is_empty()
+                val given = if args.len() == 1 then "1 argument was"
+                else s"${args.len()} arguments were"
+
+                cx.fault(span, s"associated function '${provider_of(name)}.$name' takes no " +
+                         s"arguments, but $given given")
+            end if
 
             return provided
         end if
@@ -498,7 +506,7 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Typ
     // lowered signature's bounds here would sweep the type's own in as well and report anything
     // unmet a second time, having already said it where the receiver's type was made.
     if !check_param_bounds(cx.an, home, span, fd.name, m.tparams, m.bounds, own, seed,
-                           "type parameter") then return bad_expr(span)
+                           "type parameter", cx.scope) then return bad_expr(span)
 
     var targs: Buf[Type] = buf()
 
@@ -1457,6 +1465,16 @@ private builtin_operator_method(cx: &Analyzer, span: Span, receiver: TExpr, rty:
 
     Some(produced(TExpr(span, TBinary(op, receiver, rhs, ty))))
 end builtin_operator_method
+
+// The trait a compiler-provided receiverless member is declared by, as a diagnostic spells it —
+// `Zero` and `One` for the identities, `Bits` for a width.
+private provider_of(name: string) -> string
+    val constant = core_constant(name)
+
+    if constant.is_some() then return constant.unwrap().0
+
+    core_measure_trait(name).unwrap_or(name)
+end provider_of
 
 // A receiverless member the compiler provides, read through a type rather than off a value: the two
 // identities, whose value is stated in the catalog, and a width, whose answer is read off the type.

@@ -1,0 +1,892 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Integer widths above 64 bits, ported from the reference's `WideIntegerTests.scala` case for case.
+//
+// `reference/types.md § Integers are an open family` states that `iN` / `uN` is an open family over
+// any positive width and names `i128` among its examples, on the grounds that a width is "a
+// capability of the target, not something sysl emulates" — so the semantics here are not new rules,
+// they are the existing ones at a width that needs two registers.
+//
+// The load-bearing tests are the ones whose value does not fit in 64 bits. A width that merely
+// *parses* proves nothing: every operation on the way to the screen could narrow to 64 bits, and a
+// `u128` would print the low half of itself and look right for every small value.
+
+private var wi_library_cache: Buf[Program] = buf()
+private var wi_library_read: bool = false
+
+private wi_library() -> Buf[Program]
+    if wi_library_read then return wi_library_cache
+
+    wi_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> wi_library_cache = units
+
+    wi_library_cache
+end wi_library
+
+private wi_no_library() -> bool
+    if wi_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end wi_no_library
+
+private wi_can_run() -> bool
+    if wi_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end wi_can_run
+
+// Everything a source read beside the library has to say about itself, joined.
+private wi_err(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = wi_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    var out = str_builder()
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/")
+            out.push(done.reported.at(i).diag.message)
+            out.push_char('\n')
+
+    out.finish()
+end wi_err
+
+// **What a program PRINTS.** A wide value's digits are the one thing nothing short of running it
+// says, every intermediate step having a plausible low-half answer available to it.
+private wi_ran(text: string) -> string
+    val root = make_temp_dir("sysl-wide").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end wi_ran
+
+// **What a program that is meant to STOP exits with.** A trap is `128 + n` and a panic is `1`, so a
+// positive status is the claim; `-1` is a program that did not build, which must not read as a stop.
+private wi_stopped(text: string) -> int
+    val root = make_temp_dir("sysl-wide-stop").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var args: Buf[string] = buf()
+
+    val code = run_native_program(s"$root/main.sysl", None, None, DefaultOptimization, args) match
+        Err(_) -> -1
+        Ok(state) -> state
+
+    remove_dir_all(root).unwrap_or(())
+    code
+end wi_stopped
+
+// -- a width above 64 is a type -------------------------------------------------------------------
+
+@test("the width the reference names as its example resolves")
+wi_the_width_the_reference_names_resolves()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var x: i128 = 1\nprint(x)"), "1\n")
+
+@test("so does its unsigned counterpart, and a width between the two registers")
+wi_so_does_its_unsigned_counterpart()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u128 = 7\nvar b: u96 = 8\nvar c: i65 = 9\nprint(a, b, c)"), "7 8 9\n")
+
+// Past 128 is ordinary. What made 128 the ceiling was two claims about the toolchain, and neither
+// held: a wide division needs no compiler-rt routine (the back end expands it inline), and the
+// decimal renderer is generated per width rather than written once.
+@test("a width past the old 128-bit ceiling is an ordinary type")
+wi_a_width_past_the_old_ceiling()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u256 = 7\nvar b: i256 = -9\nvar c: u512 = 11\nprint(a, b, c)"),
+              "7 -9 11\n")
+
+// The value that proves the renderer is generated at the value's own width rather than clamped to
+// 128: every digit here lives above the 128th bit, so a clamped renderer prints zero.
+@test("a value living entirely above 128 bits prints its real digits")
+wi_a_value_living_entirely_above_128_bits()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var x: u256 = 1
+        var i = 0
+
+        while i < 200 do
+            x = x * 2u256
+            i = i + 1
+
+        print(x)
+        """),
+        "1606938044258990275541962092341162602522202993782792835301376\n")
+
+@test("arithmetic above 128 bits carries, rather than wrapping at 128")
+wi_arithmetic_above_128_bits_carries()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: u256 = 340282366920938463463374607431768211456
+        var b: u256 = 340282366920938463463374607431768211456
+        print(a + b)
+        """), "680564733841876926926749214863536422912\n")
+
+@test("the ceiling is the back end's own, and the diagnostic names it")
+wi_the_ceiling_is_the_back_ends_own()
+    if wi_no_library() then return
+
+    val said = wi_err("var x: i8388608 = 1")
+
+    assert(said.contains("8388607"), said)
+
+// -- the narrowest widths -------------------------------------------------------------------------
+//
+// `N >= 1` has no exception at its low end either, and `i1` is the degenerate case worth pinning:
+// one bit of two's complement is the sign bit, so the type holds `{-1, 0}`. Nothing about it is
+// special-cased, which is the assertion.
+
+@test("u1 is a single binary digit")
+wi_u1_is_a_single_binary_digit()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u1 = 1\nvar b: u1 = 0\nprint(a, b, a + a)"), "1 0 0\n")
+
+@test("i1 holds minus one and zero, the sign bit being the only bit")
+wi_i1_holds_minus_one_and_zero()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: i1 = 0\nvar b: i1 = -1\nprint(a, b, a + b, b + b)"), "0 -1 -1 0\n")
+
+@test("i1's abs and signum follow the general rule with no carve-out")
+wi_i1s_abs_and_signum()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        import sysl.math.*
+
+        var a: i1 = 0
+        var b: i1 = -1
+
+        print(b.abs(), b.signum(), a.signum())
+        """), "-1 -1 0\n")
+
+// Zero is the one width the shape admits and the family does not, so it is a diagnostic about the
+// number rather than "unknown type" — which would send a reader looking for a declaration they never
+// wrote.
+@test("a zero width says it has no bits, rather than reading as a missing declaration")
+wi_a_zero_width_says_it_has_no_bits()
+    if wi_no_library() then return
+
+    assert(wi_err("var x: i0 = 0").contains("has no bits"), wi_err("var x: i0 = 0"))
+    assert(wi_err("var x: u0 = 0").contains("has no bits"), wi_err("var x: u0 = 0"))
+    assert(wi_err("var x: i000 = 0").contains("has no bits"), wi_err("var x: i000 = 0"))
+
+@test("a leading zero says how to write the width plainly")
+wi_a_leading_zero_says_how_to_write_it()
+    if wi_no_library() then return
+
+    assert(wi_err("var x: i01 = 0").contains("leading zero"), wi_err("var x: i01 = 0"))
+    assert(wi_err("var x: u008 = 0").contains("'u8'"), wi_err("var x: u008 = 0"))
+
+// The shape is a family letter and digits only. Anything else is an ordinary identifier and must
+// stay available to a program that declares one.
+@test("a name that only looks like a width is left to the program")
+wi_a_name_that_only_looks_like_a_width()
+    if wi_no_library() then return
+
+    val said = wi_err("var x: i5x = 0")
+
+    assert(said.contains("unknown type 'i5x'"), said)
+
+@test("and the bit surface counts against a width of one")
+wi_and_the_bit_surface_counts_against_a_width_of_one()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        import sysl.math.*
+
+        var a: i1 = -1
+        var b: u1 = 0
+
+        print(a.count_ones(), b.count_zeros(), a.leading_zeros())
+        """), "1 1 0\n")
+
+// -- arithmetic wraps at the declared width -------------------------------------------------------
+
+@test("a sum carries past what 64 bits could hold")
+wi_a_sum_carries_past_64_bits()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u128 = 18446744073709551615\nprint(a + 1)"),
+              "18446744073709551616\n")
+
+@test("a product of two values that each fit lands somewhere neither does")
+wi_a_product_of_two_values_that_each_fit()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u128 = 4294967296\nprint(a * a * a)"),
+              "79228162514264337593543950336\n")
+
+@test("the unsigned maximum is writable and prints every digit")
+wi_the_unsigned_maximum_is_writable()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u128 = 340282366920938463463374607431768211455\nprint(a)"),
+              "340282366920938463463374607431768211455\n")
+
+@test("and wraps to zero one past it")
+wi_and_wraps_to_zero_one_past_it()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u128 = 340282366920938463463374607431768211455\nprint(a + 1)"), "0\n")
+
+@test("the signed extremes print unmangled")
+wi_the_signed_extremes_print_unmangled()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var hi: i128 = 170141183460469231731687303715884105727
+        var lo: i128 = -170141183460469231731687303715884105728
+        print(hi)
+        print(lo)
+        """),
+        "170141183460469231731687303715884105727\n-170141183460469231731687303715884105728\n")
+
+@test("a signed minimum negates by wrapping, as it does at 64 bits")
+wi_a_signed_minimum_negates_by_wrapping()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var lo: i128 = -170141183460469231731687303715884105728
+        print(0 - lo)
+        """), "-170141183460469231731687303715884105728\n")
+
+// -- division and remainder pick the instruction from the signedness ------------------------------
+
+@test("an unsigned division of a value with its top bit set is not a negative one")
+wi_an_unsigned_division_is_not_negative()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: u128 = 340282366920938463463374607431768211455
+        print(a / 3)
+        print(a % 7)
+        """), "113427455640312821154458202477256070485\n3\n")
+
+@test("a signed division truncates toward zero at this width too")
+wi_a_signed_division_truncates_toward_zero()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: i128 = -170141183460469231731687303715884105727
+        print(a / 2)
+        print(a % 10)
+        """), "-85070591730234615865843651857942052863\n-7\n")
+
+@test("the right shift keeps the sign only when the type has one")
+wi_the_right_shift_keeps_the_sign()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var s: i128 = -256
+        var u: u128 = 340282366920938463463374607431768211455
+        print(s >> 4)
+        print(u >> 120)
+        """), "-16\n255\n")
+
+@test("a left shift moves a bit into the upper half")
+wi_a_left_shift_moves_a_bit_into_the_upper_half()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u128 = 1\nprint(a << 100)"), "1267650600228229401496703205376\n")
+
+// -- multiplication and the rest wrap at the type's width, not the container's --------------------
+//
+// A value of an odd width is held in a container wider than the type — a `u5` in eight bits, a `u12`
+// in sixteen — so every one of these has a *plausible* wrong answer available to it: the one the
+// container would give. The operand pairs are chosen so the two answers differ.
+
+@test("a product wraps at an odd unsigned width")
+wi_a_product_wraps_at_an_odd_unsigned_width()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u5 = 7\nvar b: u5 = 9\nprint(a * b)"), "31\n")
+
+// Both operands at the type's maximum, so the true product needs ten bits and the answer is one.
+@test("the largest pair of a width multiplies to something small")
+wi_the_largest_pair_multiplies_to_something_small()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u5 = 31\nvar b: u5 = 31\nprint(a * b)"), "1\n")
+
+@test("a signed product wraps into the signed range, keeping the two's-complement meaning")
+wi_a_signed_product_wraps_into_the_signed_range()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: i5 = -13\nvar b: i5 = 5\nprint(a * b)"), "-1\n")
+    assert_eq(wi_ran("var a: i3 = 3\nvar b: i3 = 3\nprint(a * b)"), "1\n")
+
+@test("a width between two byte sizes multiplies at its own width")
+wi_a_width_between_two_byte_sizes_multiplies()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u12 = 4000\nvar b: u12 = 3\nprint(a * b)"), "3808\n")
+
+// The identity `(2^n - 1)^2 = 1 (mod 2^n)`, at a wide width that is not a multiple of 64.
+@test("the widest value of an odd wide width squares to one")
+wi_the_widest_value_of_an_odd_wide_width()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u96 = 79228162514264337593543950335\n\nprint(a * a)"), "1\n")
+
+@test("addition and subtraction wrap at the same width")
+wi_addition_and_subtraction_wrap()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u5 = 30\nvar b: u5 = 5\nprint(a + b, b - a)"), "3 7\n")
+
+// Negating the most negative value has no representable answer and wraps to itself — the same rule
+// `abs` follows, and the reason `abs` follows it.
+@test("negating an odd width's minimum answers the minimum")
+wi_negating_an_odd_widths_minimum()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: i3 = -4\nprint(-a)"), "-4\n")
+
+@test("shifts move within the width and off the end of it")
+wi_shifts_move_within_the_width()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u5 = 1\nprint(a << 4u5, (a << 4u5) << 1u5)"), "16 0\n")
+
+@test("a signed right shift carries the sign at an odd width")
+wi_a_signed_right_shift_carries_the_sign()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: i5 = -16\nprint(a >> 1i5, a >> 4i5)"), "-8 -1\n")
+
+// -- division and remainder at widths that are neither a register nor a byte ----------------------
+//
+// These are where a division goes wrong quietly rather than loudly: the value is stored in a
+// container wider than the type, so an operand that was not narrowed to its own width first divides
+// as the wrong number, and the answer is plausible instead of absent.
+
+@test("a narrow signed width truncates toward zero and keeps the dividend's sign")
+wi_a_narrow_signed_width_truncates()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: i5 = -13
+        var b: i5 = 4
+
+        print(a / b, a % b, (-a) / b, (-a) % b)
+        """), "-3 -1 3 1\n")
+
+@test("the narrowest signed width that can divide at all")
+wi_the_narrowest_signed_width_that_can_divide()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: i3 = -4\nvar b: i3 = 3\nprint(a / b, a % b)"), "-1 -1\n")
+
+// The top bit is set, so a division that read the value as signed would answer a negative one.
+@test("an unsigned width with its top bit set is not read as negative")
+wi_an_unsigned_width_with_its_top_bit_set()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u5 = 31\nvar b: u5 = 4\nprint(a / b, a % b)"), "7 3\n")
+
+@test("a width between two byte sizes")
+wi_a_width_between_two_byte_sizes()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u12 = 4000\nvar b: u12 = 7\nprint(a / b, a % b)"), "571 3\n")
+
+// Wide, and not a multiple of 64, so the value straddles its registers unevenly — the case an
+// implementation that assumed whole limbs would get wrong.
+@test("a wide width that does not fill its last register")
+wi_a_wide_width_that_does_not_fill_its_last_register()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: u96 = 79228162514264337593543950335
+        var b: u96 = 1000000007
+
+        print(a / b, a % b)
+        """), "79228161959667203875 873523210\n")
+
+@test("and the same, signed and negative")
+wi_and_the_same_signed_and_negative()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: i100 = -633825300114114700748351602687
+        var b: i100 = 12345
+
+        print(a / b, a % b)
+        """), "-51342673156266885439315642 -2197\n")
+
+// -- a division with no representable answer stops the program ------------------------------------
+//
+// **The overflow guard is computed at the operand's own width.** A guard written against the wrong
+// width would simply not fire at a narrow one, and `sdiv` overflow is poison — so the failure would
+// be a plausible wrong number rather than a stop. arm64 makes this sharper than it looks: its `sdiv`
+// answers the minimum silently for this case and never faults.
+
+@test("the most negative value over minus one, at a narrow width")
+wi_the_most_negative_value_over_minus_one()
+    if !wi_can_run() then return
+
+    assert(wi_stopped("var a: i4 = -8\nvar b: i4 = -1\nprint(a / b)") > 0,
+           "the program is meant to stop")
+
+// **The remainder does not, and the asymmetry is the right one.** `min / -1` has no representable
+// answer and must stop; `min % -1` is `0`, which every width can hold. LLVM calls both undefined, so
+// the divisor is replaced by `1` when it is `-1`, and since `x % 1` and `x % -1` are both zero for
+// every `x`, that is the same answer with the undefined case never reached.
+@test("while the remainder of the same pair is zero, which is representable")
+wi_while_the_remainder_of_the_same_pair_is_zero()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: i4 = -8\nvar b: i4 = -1\nprint(a % b)"), "0\n")
+
+@test("and that substitution is the answer at every width, not a narrow-width special case")
+wi_and_that_substitution_is_the_answer_at_every_width()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: i100 = -633825300114114700748351602688
+        var b: i100 = -1
+        var c: int = -2147483648
+        var d: int = -1
+
+        print(a % b, c % d)
+        """), "0 0\n")
+
+@test("the same at an odd wide width, where the minimum is a bignum")
+wi_the_same_at_an_odd_wide_width()
+    if !wi_can_run() then return
+
+    assert(wi_stopped(raw"""
+        var a: i100 = -633825300114114700748351602688
+        var b: i100 = -1
+
+        print(a / b)
+        """) > 0, "the program is meant to stop")
+
+// One below the minimum divides perfectly well, which is what says the guard is testing the right
+// value rather than refusing every negative division.
+@test("while one step away from the minimum divides normally")
+wi_while_one_step_away_from_the_minimum()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: i4 = -7\nvar b: i4 = -1\nprint(a / b)"), "7\n")
+
+@test("an unsigned width has no overflow to guard, only the zero")
+wi_an_unsigned_width_has_no_overflow_to_guard()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u4 = 15\nvar b: u4 = 1\nprint(a / b)"), "15\n")
+    assert(wi_stopped("var a: u4 = 15\nvar b: u4 = 0\nprint(a / b)") > 0,
+           "a division by zero is meant to stop")
+
+@test("division by zero stops it at a narrow width too")
+wi_division_by_zero_stops_it_at_a_narrow_width()
+    if !wi_can_run() then return
+
+    assert(wi_stopped("var a: i5 = 7\nvar b: i5 = 0\nprint(a / b)") > 0, "the division stops")
+    assert(wi_stopped("var a: u12 = 7\nvar b: u12 = 0\nprint(a % b)") > 0, "the remainder stops")
+
+// -- comparison sees the whole value, not its low half --------------------------------------------
+
+@test("two values that agree in their low 64 bits still order correctly")
+wi_two_values_that_agree_in_their_low_64_bits()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: u128 = 18446744073709551616
+        var b: u128 = 0
+        print(a > b, a == b, a != b)
+        """), "true false true\n")
+
+@test("a signed comparison across zero")
+wi_a_signed_comparison_across_zero()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: i128 = -170141183460469231731687303715884105728
+        var b: i128 = 1
+        print(a < b, a >= b)
+        """), "true false\n")
+
+// -- conversions are written, and each is the one the reference describes --------------------------
+
+@test("narrowing to 64 bits keeps the low half")
+wi_narrowing_to_64_bits_keeps_the_low_half()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var a: u128 = 18446744073709551617\nprint(u64(a))"), "1\n")
+
+@test("widening from a signed 64-bit value sign-extends")
+wi_widening_from_a_signed_64_bit_value()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var n: i64 = -1\nvar w: i128 = i128(n)\nprint(w)"), "-1\n")
+
+@test("widening from an unsigned one does not")
+wi_widening_from_an_unsigned_one_does_not()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var n: u64 = 18446744073709551615\nvar w: u128 = u128(n)\nprint(w)"),
+              "18446744073709551615\n")
+
+// The digits below are `1.5e30`'s own — the nearest `f64` to it is 1499999999999999889089448902656
+// — so this also shows the conversion reaching past 64 bits rather than saturating at one.
+@test("a float is reachable in both directions")
+wi_a_float_is_reachable_in_both_directions()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: u128 = 1099511627776
+        print(real(a))
+        print(u128(1.5e30))
+        """), "1.09951e+12\n1499999999999999889089448902656\n")
+
+// -- rendering agrees with printing, because both go through one routine --------------------------
+
+@test("`str` of a wide value is the digits `print` writes")
+wi_str_of_a_wide_value()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: u128 = 340282366920938463463374607431768211455
+        print(str(a) == "340282366920938463463374607431768211455")
+        print(str(a).len)
+        """), "true\n39\n")
+
+@test("a negative one carries its sign into the string")
+wi_a_negative_one_carries_its_sign()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: i128 = -170141183460469231731687303715884105728
+        print(str(a).len, str(a) == "-170141183460469231731687303715884105728")
+        """), "40 true\n")
+
+@test("interpolation reaches it the same way")
+wi_interpolation_reaches_it_the_same_way()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: u128 = 18446744073709551616
+        print(s"a=$a")
+        """), "a=18446744073709551616\n")
+
+// -- a wide integer is stored like any other value of its size ------------------------------------
+
+@test("as a struct field, read back at full width")
+wi_as_a_struct_field()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        struct Counter
+            total: u128
+            step: u64
+        end Counter
+        var c = Counter(340282366920938463463374607431768211455, 3)
+        print(c.total, c.step)
+        """), "340282366920938463463374607431768211455 3\n")
+
+@test("as an array element, so the stride is right")
+wi_as_an_array_element()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var xs: [3]u128 = [0; 3]
+        xs[0] = 18446744073709551616
+        xs[1] = 340282366920938463463374607431768211455
+        xs[2] = 1
+        print(xs[0], xs[1], xs[2])
+        """), "18446744073709551616 340282366920938463463374607431768211455 1\n")
+
+@test("inside a data enum, where the payload width is written into the emitted text")
+wi_inside_a_data_enum()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        enum Load
+            Wide(v: u128)
+            Narrow(v: u8)
+
+        var l = Wide(340282366920938463463374607431768211455)
+        l match
+            Wide(v) -> print("wide", v)
+            Narrow(v) -> print("narrow", v)
+        """), "wide 340282366920938463463374607431768211455\n")
+
+@test("a literal that does not fit is refused, at this width as at every other")
+wi_a_literal_that_does_not_fit_is_refused()
+    if wi_no_library() then return
+
+    val said = wi_err("var x: u128 = 340282366920938463463374607431768211456")
+
+    assert(said.contains("does not fit"), said)
+
+// -- a width past 64 bits is an index like any other ----------------------------------------------
+//
+// Reaching an element happens at `usize`, so a wider index has to be narrowed to get there — and the
+// order is the whole of it. Narrowing first makes the bounds test lie: `2^64 + 5` arrives as 5 and
+// passes on a six-element array. Nothing holds more than `usize` elements, so an index that does not
+// fit names no element at all, which makes it an ordinary index out of range.
+
+@test("reading an element with one lands where it says")
+wi_reading_an_element_with_one()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var xs: [6]int = [7; 6]\nvar i: u128 = 5\nprint(xs[i])"), "7\n")
+
+// The case the old refusal existed for, and the one that says the test happens before the
+// narrowing: 2^64 + 5 truncated to an address is 5, which this array has.
+@test("and one past what an address can name traps rather than wrapping onto a valid one")
+wi_and_one_past_what_an_address_can_name()
+    if !wi_can_run() then return
+
+    assert(wi_stopped(raw"""
+        var xs: [6]int = [7; 6]
+        var i: u128 = 18446744073709551621
+        print(xs[i])
+        """) > 0, "the read is meant to trap")
+
+@test("writing through one goes the same way, since a place and a read take one selection")
+wi_writing_through_one_goes_the_same_way()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var xs: [6]int = [7; 6]
+        var i: u128 = 5
+        xs[i] = 42
+        print(xs[i], xs[0])
+        """), "42 7\n")
+
+@test("and a write past the width traps too")
+wi_and_a_write_past_the_width_traps_too()
+    if !wi_can_run() then return
+
+    assert(wi_stopped(raw"""
+        var xs: [6]int = [7; 6]
+        var i: u128 = 18446744073709551621
+        xs[i] = 0
+        """) > 0, "the write is meant to trap")
+
+@test("a slice bound is one at either end")
+wi_a_slice_bound_is_one_at_either_end()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var xs: [6]int = [7; 6]
+        var lo: u128 = 1
+        var hi: u128 = 3
+        print(xs[lo..<3usize].len, xs[0usize..<hi].len)
+        """), "2 3\n")
+
+@test("and a bound past the width traps")
+wi_and_a_bound_past_the_width_traps()
+    if !wi_can_run() then return
+
+    assert(wi_stopped(raw"""
+        var xs: [6]int = [7; 6]
+        var hi: u128 = 18446744073709551621
+        var v = xs[0usize..<hi]
+        """) > 0, "the bound is meant to trap")
+
+// A count reaches the same narrowing as an index, so it needs no rule of its own — and what it would
+// cost to get this wrong is storage sized by a number nobody wrote.
+@test("a repeat count reaches the same check")
+wi_a_repeat_count_reaches_the_same_check()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran("var n: u128 = 3\nvar xs: []int = [0; n]\nprint(xs.len)"), "3\n")
+
+@test("and one past the width traps rather than sizing storage by its low half")
+wi_and_one_past_the_width_traps_rather_than_sizing_storage()
+    if !wi_can_run() then return
+
+    assert(wi_stopped(raw"""
+        var n: u128 = 18446744073709551616
+        var xs: []int = [0; n]
+        """) > 0, "the count is meant to trap")
+
+// Read unsigned for the fit exactly as for the bounds test, so -1 is above everything an address can
+// name and fails at the first of the two rather than by luck at the second.
+@test("a negative index of a wider type fails, and at the same test as always")
+wi_a_negative_index_of_a_wider_type_fails()
+    if !wi_can_run() then return
+
+    assert(wi_stopped(raw"""
+        var xs: [6]int = [7; 6]
+        var i: i128 = -1
+        print(xs[i])
+        """) > 0, "the index is meant to trap")
+
+@test("the narrowing written out is still ordinary, and still lands where it says")
+wi_the_narrowing_written_out_is_still_ordinary()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var xs: [6]int = [7; 6]
+        var i: u128 = 5
+        xs[usize(i)] = 42
+        print(xs[usize(i)], xs[0])
+        """), "42 7\n")
+
+@test("a narrower index widens with nothing written, which is the other half of the rule")
+wi_a_narrower_index_widens_with_nothing_written()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var xs: [6]int = [7; 6]
+        var i: u8 = 5
+        xs[i] = 42
+        print(xs[i])
+        """), "42\n")
+
+// -- the trait surface sees the whole value -------------------------------------------------------
+//
+// The paths that reach a value through a trait rather than through `print`. Each of these could
+// widen the receiver to 64 bits on the way in, so a wide value would render or hash as its low half
+// — right for every value small enough to test with, and wrong for the values the width exists for.
+
+@test("a `Display` reached through a bound renders every digit")
+wi_a_display_reached_through_a_bound()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        show[T: Display](x: T) = print(x)
+        var a: u128 = 340282366920938463463374607431768211455
+        show(a)
+        """), "340282366920938463463374607431768211455\n")
+
+// The field forwards to the width's **own** `display`, which is the blanket instantiated at `u128` —
+// so a wide field is written exactly the way a narrow one is, with no renderer named and no `str` in
+// the middle.
+@test("a struct's own `Display` renders a wide field through the sink")
+wi_a_structs_own_display_renders_a_wide_field()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        struct Id
+            v: u128
+
+        impl Display for Id
+            display(self, out: *Writer, fmt: FormatSpec) = self.v.display(out, fmt)
+
+        print(Id(340282366920938463463374607431768211455))
+        """), "340282366920938463463374607431768211455\n")
+
+// The specifier reaches the blanket the way it reaches any renderer that forwards it: through a type
+// that renders itself, since a number keeps the strict conversion check.
+@test("and the specifier it is handed pads the digits like any other number's")
+wi_and_the_specifier_it_is_handed_pads_the_digits()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        struct Id
+            v: u128
+
+        impl Display for Id
+            display(self, out: *Writer, fmt: FormatSpec) = self.v.display(out, fmt)
+
+        var a: u128 = 18446744073709551616
+        print(f"[${Id(a)}%25s]")
+        print(f"[${Id(a)}%-25s]")
+        """), "[     18446744073709551616]\n[18446744073709551616     ]\n")
+
+@test("two values differing only above the 64th bit do not hash alike")
+wi_two_values_differing_above_the_64th_bit()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: u128 = 0
+        var b: u128 = 18446744073709551616
+        var c: u128 = 36893488147419103232
+        print(a.hash() == b.hash(), b.hash() == c.hash())
+        """), "false false\n")
+
+@test("and equal values still hash equal, which is the law the mixing must keep")
+wi_and_equal_values_still_hash_equal()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: u128 = 340282366920938463463374607431768211455
+        var b: u128 = 340282366920938463463374607431768211455
+        print(a.hash() == b.hash())
+        """), "true\n")
+
+// -- a printf specifier is refused, because C has no conversion this wide --------------------------
+
+@test("a decimal one names the width and points at `str`")
+wi_a_decimal_specifier_names_the_width()
+    if wi_no_library() then return
+
+    val said = wi_err("var a: u128 = 1\nprint(f\"${a}%d\")")
+
+    assert(said.contains("128 bits"), said)
+    assert(said.contains("'str'"), said)
+
+@test("so does a hexadecimal one, since the argument is the problem and not the letter")
+wi_so_does_a_hexadecimal_one()
+    if wi_no_library() then return
+
+    val said = wi_err("var a: u128 = 1\nprint(f\"${a}%x\")")
+
+    assert(said.contains("no conversion"), said)
+
+@test("a width at or below 64 bits still formats, so the refusal is about the width alone")
+wi_a_width_at_or_below_64_bits_still_formats()
+    if !wi_can_run() then return
+
+    assert_eq(wi_ran(raw"""
+        var a: u64 = 255
+        print(f"${a}%04x")
+        """), "00ff\n")

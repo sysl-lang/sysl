@@ -50,8 +50,7 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     // **A hop is what makes a cycle finite**, so the four forms that point rather than hold are
     // counted -- and the count is what a type reached again is judged against.
     PtrType(inner) -> Ptr(under_indirection(a, () -> resolve_type(a, scope, inner, subst)))
-    RefType(inner, sync) -> Ref(under_indirection(a, () -> resolve_type(a, scope, inner, subst)),
-                                sync)
+    RefType(inner, sync) -> resolve_ref(a, scope, inner, sync, subst)
     WeakType(inner) -> Weak(under_indirection(a, () -> resolve_type(a, scope, inner, subst)))
     VolatileType(inner) -> Volatile(resolve_type(a, scope, inner, subst))
     ArrayType(length, elem, read_only) ->
@@ -71,6 +70,72 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
         assoc_type(a, scope, t.span, resolve_type(a, scope, base, subst), member)
     AssocArgType(_, inner) -> resolve_type(a, scope, inner, subst)
     ValueArgType(e) -> const_argument(a, scope, t.span, e, subst)
+
+// `&T` — and where `T` is a trait, the one place a trait object is formed, so the one place its
+// formability is asked about.
+private resolve_ref(a: &Analysis, scope: Scope, inner: TypeRef, sync: bool,
+                    subst: Buf[Binding]) -> Type
+    val ty = under_indirection(a, () -> resolve_type(a, scope, inner, subst))
+
+    ty match
+        Trait(key, _, _) ->
+            val blocker = no_object_over(a, key, buf())
+
+            if blocker.is_some()
+                val where_declared = blocker.unwrap().0
+                val member = blocker.unwrap().1
+
+                a.fault(scope, inner.span, s"'${module_show(where_declared)}' declares the " +
+                        s"associated function '$member', which has no receiver to dispatch on — " +
+                        s"so there is no '&${module_show(key)}' to form")
+            end if
+        _ -> ()
+
+    Ref(ty, sync)
+end resolve_ref
+
+// **A trait object is formable only where every member has a receiver to dispatch on.** An
+// associated function is reached through the TYPE, and an erased value has forgotten which type it
+// was, so there is nothing for such a call to dispatch on — and a trait that *requires* one carries
+// the same promise, which is why the walk goes through the supertraits.
+//
+// The answer names the trait that DECLARES the member rather than the one that was written, since
+// that is where a reader has to look; `&Float` is refused over `sysl.Zero`'s `zero`.
+private no_object_over(a: &Analysis, key: string, seen: Buf[string]) -> Option[(string, string)]
+    for i in 0..<seen.len()
+        if seen.at(i) == key then return None
+
+    val found = trait_decl_at(a, key)
+
+    if found.is_none() then return None
+
+    val decl = found.unwrap()
+
+    for i in 0..<decl.methods.len()
+        val m = decl.methods.at(i)
+
+        if !m.is_property && m.recv_mode().is_none() then return Some((key, m.name))
+
+    // A fresh list each level rather than a push into the one handed down, a `Buf` passed by value
+    // being a second name for one buffer.
+    var walked: Buf[string] = buf()
+
+    for i in 0..<seen.len()
+        walked.push(seen.at(i))
+
+    walked.push(key)
+
+    val inner_scope = trait_scope_of(a, key)
+
+    for i in 0..<decl.supers.len()
+        val want = decl.supers.at(i)
+        val deeper = no_object_over(a, resolve_bound(a, inner_scope, want.span, want, buf()).name,
+                                    walked)
+
+        if deeper.is_some() then return deeper
+
+    None
+end no_object_over
 
 // Every type of a list, in order.
 resolve_list(a: &Analysis, scope: Scope, ts: Buf[TypeRef], subst: Buf[Binding]) -> Buf[Type]

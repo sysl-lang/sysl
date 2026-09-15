@@ -821,6 +821,19 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string) -> TExpr
     else if spec_is_float(c) then written_floating(ty)
     else ty == Str
 
+    // **C's formatting stops at a `long long`, so a wider integer has no conversion to be applied
+    // by.** The value would be widened into a slot the conversion does not read, and what came out
+    // would be the low half of it rather than a refusal — so the program is sent to `str`, which
+    // renders at the value's own width.
+    if fits && spec_is_int(c)
+        val bits = core_measure("width", ty)
+
+        if bits.is_some() && bits.unwrap() > 64
+            return cx.err(span, s"'$spec' is applied by C's formatting, which has no conversion " +
+                          s"for the ${bits.unwrap()} bits of ${type_show(ty)} — render it with " +
+                          "'str' instead")
+    end if
+
     if fits then return TExpr(span, TFormat(v, spec))
 
     if spec_is_str(c) && !scalar_render(ty) then return spec_render(cx, span, v, spec)
