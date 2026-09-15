@@ -510,8 +510,43 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
                                  resolve_list(a, scope, positional, subst), named)
     end if
 
-    instantiate(a, scope, span, name, key.unwrap(), targs)
+    instantiate(a, scope, span, name, key.unwrap(),
+                at_declared_widths(a, key.unwrap(), targs))
 end resolve_named
+
+// A written argument list, read **against the declaration whose parameters it fills** — which
+// argument is a value is the declaration's fact and nothing the grammar can see, `Buf[4]` and
+// `Buf[int]` being the same shape to a parser. So a value argument carries the type the declaration
+// wrote for its parameter rather than the one a literal falls to on its own, and a member reading
+// the parameter reads an ordinary value of that type.
+private at_declared_widths(a: &Analysis, key: string, targs: Buf[Type]) -> Buf[Type]
+    val pair = declared_values(a, key)
+
+    if pair.1.is_empty() then return targs
+
+    var out: Buf[Type] = buf()
+    val home = a.tables.types.get(key).unwrap().scope
+
+    for i in 0..<targs.len()
+        val written = if i < pair.0.len() then binding_named(pair.1, pair.0.at(i)) else None
+
+        targs.at(i) match
+            ConstArg(v, ty) ->
+                if written.is_none() then out.push(ConstArg(v, *ty))
+                else out.push(ConstArg(v, resolve_type(a, home, written.unwrap(), no_bindings())))
+            other -> out.push(other)
+
+    out
+end at_declared_widths
+
+// A nominal declaration's type parameters and the ones of them it wrote a `const` type for.
+private declared_values(a: &Analysis, key: string) -> (Buf[string], Buf[TypeBinding]) =
+    a.tables.types.get(key) match
+        None -> (buf(), buf())
+        Some(d) -> d.kind match
+            StructOf(sd) -> (sd.tparams, sd.tvalues)
+            EnumOf(ed) -> (ed.tparams, ed.tvalues)
+            _ -> (buf(), buf())
 
 // A type that takes no arguments, told so where any were written.
 private plain_type(a: &Analysis, scope: Scope, span: Span, name: string, targs: Buf[Type],

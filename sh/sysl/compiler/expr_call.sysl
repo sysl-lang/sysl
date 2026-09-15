@@ -1667,14 +1667,21 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
 
     for i in 0..<args.len()
         if i < d.params.len() then
-            val want = resolve_type(cx.an, scope, d.params.at(i).typ, no_bindings())
+            // **A C `va_list` parameter takes the address of the walk**, since that is what sysl has
+            // to give and what every target's answer is formed from -- so the argument is checked as
+            // a `*va_list` whichever of C's two spellings the header used, and the difference
+            // between them, whether the callee receives the walk or a pointer to it, is carried by
+            // `TVaPass` rather than by the parameter's type.
+            val by_value = written_va_list(d.params.at(i).typ)
+            val declared = resolve_type(cx.an, scope, d.params.at(i).typ, no_bindings())
+            val want = if by_value then Ptr(VaList) else declared
             val t = type_expr(cx, args.at(i), Some(want))
 
             if disagree(texpr_type(t), want) then
                 cx.fault(args.at(i).span, s"'${d.params.at(i).name}' of '$written' is " +
                          s"${type_show(want)}, but ${type_show(texpr_type(t))} was given")
 
-            ts.push(t)
+            ts.push(if by_value then TExpr(args.at(i).span, TVaPass(t)) else t)
         else
             ts.push(type_expr_bare(cx, args.at(i)))
 

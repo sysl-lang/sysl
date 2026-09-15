@@ -1,0 +1,145 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What a generic declaration means **beside the standard module**, which is the only place some of
+// it can be asked at all.
+//
+// A bare arrow is sugar for a parameter bounded by a call trait, and the call traits are ordinary
+// declarations of the library -- so a source carrying one cannot even be analyzed without it, and a
+// harness that compiles a text on its own fails every such claim for the harness rather than for the
+// code. `tests_generic.sysl` asks everything that needs no library; this file is the rest.
+//
+// **Every message here was read out of the reference page it comes from**, `reference/generics.md`,
+// rather than composed from the rule.
+
+private var generic_lib_cache: Buf[Program] = buf()
+private var generic_lib_read: bool = false
+
+private generic_lib() -> Buf[Program]
+    if generic_lib_read then return generic_lib_cache
+
+    generic_lib_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> generic_lib_cache = units
+
+    generic_lib_cache
+end generic_lib
+
+private generic_lib_absent() -> bool
+    if generic_lib().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end generic_lib_absent
+
+// Everything a source has to say for itself when it is read beside the library, less whatever the
+// library says about itself.
+private generic_lib_complaints(text: string) -> Buf[string]
+    val parsed = parse(source_of("test.sysl", text))
+    var out: Buf[string] = buf()
+
+    if !parsed.ok()
+        out.push(parsed.report.at(0).message)
+        return out
+    end if
+
+    var units: Buf[Program] = buf()
+    val library = generic_lib()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/") then
+            out.push(done.reported.at(i).diag.message)
+
+    out
+end generic_lib_complaints
+
+// The first of them, and the empty string where the source was accepted.
+private generic_lib_said(text: string) -> string
+    val out = generic_lib_complaints(text)
+
+    if out.is_empty() then return ""
+
+    out.at(0)
+end generic_lib_said
+
+// -- a written type-argument list over a bare arrow --------------------------------------------
+
+// Two arrows, so the declaration carries four type parameters where a reader wrote two.
+private generic_lib_chain() -> string =
+    "module m\n\nchain[A, B](x: int, f: int -> A, g: A -> B) -> B = g(f(x))\n\n"
+
+@test("a written type-argument list fills the parameters the declaration wrote, not the ones a bare arrow added")
+generic_lib_written_list_fills_the_authored_parameters()
+    if generic_lib_absent() then return
+
+    assert_eq(generic_lib_said(generic_lib_chain() +
+                               "use() -> int = chain[int, int](3, n -> n * 2, n -> n + 1)\n"), "")
+
+// And the count is still checked, against the ones that were written.
+@test("a list of the wrong length is refused by the count of the parameters that were written")
+generic_lib_written_list_is_counted_against_the_authored_parameters()
+    if generic_lib_absent() then return
+
+    assert_eq(generic_lib_said(generic_lib_chain() +
+                               "use() -> int = chain[int](3, n -> n * 2, n -> n + 1)\n"),
+              "'chain' takes 2 type arguments, but 1 type argument was given")
+
+// **A parameter only a bound mentions is what the list is for**: inference does not reach `T`, so
+// nothing but a written list can settle it, and the bare arrow beside it still comes from the
+// argument.
+@test("a written list answers a parameter only a bound mentions, beside an arrow it does not name")
+generic_lib_written_list_answers_a_parameter_only_a_bound_mentions()
+    if generic_lib_absent() then return
+
+    val src = "module m\n\ntrait Has[T]\n    get(self) -> T\n\n" +
+              "struct Crate\n    v: int\n\n" +
+              "impl Has[int] for Crate\n    get(self) -> int = self.v\n\n" +
+              "pick[B: Has[T], T, N](b: B, f: T -> N) -> N = f(b.get())\n\n" +
+              "use() -> int = pick[Crate, int, int](Crate(4), n -> n + 1)\n"
+
+    assert_eq(generic_lib_said(src), "")
+
+// **An address is the one position with no answer**: there are no arguments to read the callable's
+// type off and no way to write it, so the refusal names that rather than counting anything.
+@test("an address of a declaration taking a bare arrow is refused by name, not by a count")
+generic_lib_address_of_a_bare_arrow_declaration_is_refused_by_name()
+    if generic_lib_absent() then return
+
+    assert_eq(generic_lib_said(generic_lib_chain() +
+                               "use() -> int\n    val p = &chain[int, int]\n\n    1\n"),
+              "'chain' takes a bare arrow, so it is generic in the callable's own type — and an " +
+              "address has no arguments to read that from, nor any way to write it. Declare the " +
+              "parameter as a counted callable, '&Fn(…) -> …', to give it a type that can be named")
+
+// -- a value parameter's declared width --------------------------------------------------------
+
+// **Which argument is a value is the declaration's fact**, `Room[4]` and `Room[int]` being one shape
+// to a parser -- so a value argument carries the type the declaration wrote for its parameter rather
+// than the one the literal would have fallen to, and a member reads an ordinary value of it.
+@test("a value type argument is read at the width its declaration wrote, in a member's body")
+generic_lib_value_argument_is_read_at_its_declared_width()
+    if generic_lib_absent() then return
+
+    val src = "module m\n\nstruct Room[const N: usize]\n    used: usize\n\n" +
+              "    room(self) -> usize = N - self.used\n\n" +
+              "    cap(self) -> usize = N\n\n" +
+              "use() -> usize\n    var a: Room[8] = Room(3)\n    var b: Room[2] = Room(1)\n\n" +
+              "    a.room() + b.room() + a.cap()\n"
+
+    assert_eq(generic_lib_said(src), "")

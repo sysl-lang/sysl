@@ -28,18 +28,32 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
     for i in 0..<keys.len()
         val f = cx.an.tables.funcs.get(keys.at(i))
 
-        if f.is_some() && f.unwrap().decl.tparams.len() == targ_exprs.len() then key = keys.at(i)
+        if f.is_some() && authored_tparams(f.unwrap().decl.tparams).len() == targ_exprs.len() then
+            key = keys.at(i)
 
     val f = cx.an.tables.funcs.get(key).unwrap()
     val decl = f.decl
+    val authored = authored_tparams(decl.tparams)
 
     if decl.tparams.is_empty() then
         return cx.err(span, s"'$written' is not generic, so it has no type arguments to write — " +
                       s"the call is '$written(…)'")
 
-    if decl.tparams.len() != targ_exprs.len() then
-        return cx.err(span, s"'$written' takes ${quantity(decl.tparams.len(), "type argument")}, " +
+    if authored.len() != targ_exprs.len() then
+        return cx.err(span, s"'$written' takes ${quantity(authored.len(), "type argument")}, " +
                       s"but ${supplied_phrase(targ_exprs.len(), "type argument")}")
+
+    // **A bare arrow is sugar for a bounded type parameter the compiler added and no program wrote**,
+    // so a declaration carries more parameters than were written on it. The list fills the ones that
+    // were, and the sugar's own stay where they have always come from, which is the arguments.
+    if authored.len() != decl.tparams.len()
+        var known: Buf[Binding] = buf()
+
+        for i in 0..<authored.len()
+            known.push(Binding(authored.at(i), written_type_arg(cx, targ_exprs.at(i))))
+
+        return generic_call_with(cx, span, written, key, f, args, expected, true, known)
+    end if
 
     var targs: Buf[Type] = buf()
 
@@ -205,7 +219,14 @@ end applied_type_arg
 
 // One call to a generic function.
 generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, args: Buf[Expr],
-             expected: Option[Type], report: bool) -> TExpr
+             expected: Option[Type], report: bool) -> TExpr =
+    generic_call_with(cx, span, written, key, f, args, expected, report, no_bindings())
+
+// The same, where a written type-argument list has already answered some of the parameters. That is
+// the bare-arrow case and only that one: the list fills what the declaration wrote and the sugar's
+// own parameters are solved from the arguments, so `known` is never the whole set.
+generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Func, args: Buf[Expr],
+                  expected: Option[Type], report: bool, known: Buf[Binding]) -> TExpr
     val bound = bind_arguments(cx, span, written, f, args, report)
 
     if bound.is_none() then return bad_expr(span)
@@ -215,8 +236,9 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
 
     // **Asked before the solve rather than left to it**, because the solve can only report what it
     // failed to find and the answer here is that it was never going to find it: a parameter named in
-    // neither the parameters nor the result is one nothing in a call could settle.
-    val stuck = unsettleable(decl)
+    // neither the parameters nor the result is one nothing in a call could settle. A parameter the
+    // reader has just written out is not stuck, whatever the declaration says about where it appears.
+    val stuck = not_bound(unsettleable(decl), known)
 
     if !stuck.is_empty()
         if report
@@ -232,14 +254,15 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
         return bad_expr(span)
     end if
 
-    val prov = provisional_args(cx, span, f, slots, expected)
+    val prov = provisional_of(cx, span, f.scope, decl.tparams, decl.params, decl.ret_type,
+                              decl.bounds, slots, known, expected)
     var param_refs: Buf[TypeRef] = buf()
 
     for i in 0..<decl.params.len()
         param_refs.push(decl.params.at(i).typ)
 
     val targs = solve(cx.an, f.scope, span, key, decl.tparams, param_refs, prov.tys, decl.ret_type,
-                      expected, prov.soft, decl.bounds, buf())
+                      expected, prov.soft, decl.bounds, known)
 
     if !report
         for i in 0..<targs.len()
@@ -313,7 +336,30 @@ generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, a
     check_crossings(cx, decl.crossing, written, sig.unwrap().params, ts)
     cx.an.uses(name)
     TExpr(span, TCall(name, ts, sig.unwrap().ret, false))
-end generic_call
+end generic_call_with
+
+// The type parameters somebody **wrote**, which are the ones an explicit list fills. A bare arrow is
+// sugar for a bounded parameter, and those are named with a character no identifier may hold,
+// precisely so that no program can write one -- there being nothing to write anyway, the argument
+// being the closure's own anonymous type.
+authored_tparams(tparams: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<tparams.len()
+        if !is_call_bound(tparams.at(i)) then out.push(tparams.at(i))
+
+    out
+end authored_tparams
+
+// The names of `these` that a written list has not already answered.
+private not_bound(names: Buf[string], known: Buf[Binding]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<names.len()
+        if bound_type(known, names.at(i)).is_none() then out.push(names.at(i))
+
+    out
+end not_bound
 
 // One argument of a generic call, read at the parameter the solve arrived at.
 //
@@ -428,11 +474,7 @@ end quoted_and
 // it: a parameter named by the result alone is settled by nothing else, and a callable standing at a
 // bound over it is then read with a result nothing fixed — so its body decides one, and the closure
 // implements a call trait the declaration did not ask for.
-private provisional_args(cx: &Analyzer, span: Span, f: Func, slots: Buf[Option[Expr]],
-                         expected: Option[Type]) -> Provisional =
-    provisional_of(cx, span, f.scope, f.decl.tparams, f.decl.params, f.decl.ret_type, f.decl.bounds,
-                   slots, no_bindings(), expected)
-
+//
 // What a first reading of a call's arguments settled: the type each one came to, whether it was a
 // literal's default, and the node itself where the argument is one that was **kept**.
 //
