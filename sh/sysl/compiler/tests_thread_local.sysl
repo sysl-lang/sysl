@@ -1,0 +1,111 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.Search
+
+// `@thread_local` -- one copy of a module `var`'s storage per thread
+// (`reference/attributes.md § @thread_local`) -- and `@export` above a `type`
+// (`reference/ffi.md § Naming a type`), as far as the grammar and the untyped tree go: which
+// declarations may carry them, and that each lands on the node the reference's `emit-ast` prints.
+
+// The untyped tree of a file as `emit-ast --no-spans` prints it.
+private tl_tree(text: string) -> string
+    val r = parse(source_of("t.sysl", text))
+
+    if !r.ok() then return s"!${r.first().message}"
+
+    emit_ast(r.program, false)
+end tl_tree
+
+@test("the mark lands on the 'var' it was written above")
+tl_the_mark_lands_on_the_var()
+    val t = tl_tree("@thread_local\nstatic var n: int = 1\n")
+
+    assert(t.contains("threadLocal: true"), t)
+
+@test("and a 'var' nobody marked says so")
+tl_an_unmarked_var_says_false()
+    val t = tl_tree("static var n: int = 1\n")
+
+    assert(t.contains("threadLocal: false"), t)
+    assert(!t.contains("threadLocal: true"), t)
+
+@test("it composes with the other two about storage, in either order")
+tl_composes_with_align_and_section()
+    for text in ["@thread_local\n@align(64)\n@section(\".tdata\")\nstatic var n: int = 1\n",
+                 "@section(\".tdata\")\n@align(64)\n@thread_local\nstatic var n: int = 1\n"]
+        val t = tl_tree(text)
+
+        assert(t.contains("threadLocal: true"), t)
+        assert(t.contains("section: \".tdata\""), t)
+        assert(t.contains("value: 64"), t)
+
+@test("a 'val' never changes, so one copy of it is already every thread's")
+tl_a_val_is_refused()
+    val e = pf_err("@thread_local\nstatic val n: int = 1\nprint(n)")
+
+    assert(e.contains("a 'val' never changes"), e)
+    assert(e.contains("a per-thread constant is a constant"), e)
+
+@test("a 'const' is folded into every use and declares no storage at all")
+tl_a_const_is_refused()
+    assert(pf_err("@thread_local\nconst N: int = 4\nprint(N)").contains("declares no storage at all"))
+
+@test("an 'extern' names storage this program does not lay down")
+tl_an_extern_is_refused()
+    assert(pf_err("@thread_local\nextern errno: int\nprint(errno)").contains("declares no storage at all"))
+
+@test("a function is code every thread runs the one copy of")
+tl_a_function_is_refused()
+    assert(pf_err("@thread_local\nf() -> int = 1\nprint(f())").contains("declares no storage at all"))
+
+@test("a struct is a type rather than an object")
+tl_a_struct_is_refused()
+    assert(pf_err("@thread_local\nstruct S\n    a: int\n").contains("declares no storage at all"))
+
+@test("and a binding that names several has no one object to be about")
+tl_several_names_are_refused()
+    assert(pf_err("@thread_local\nstatic var a, b = 1, 2\nprint(a)").contains("names several"))
+
+@test("it does not stand beside an annotation about a function")
+tl_not_beside_a_function_annotation()
+    assert(pf_err("@thread_local\n@pure\nf() -> int = 1\nprint(f())").contains("the other two about storage"))
+
+@test("nor beside one about a layout")
+tl_not_beside_a_layout_annotation()
+    assert(pf_err("@thread_local\n@packed\nstruct S\n    a: int\n").contains("the other two about storage"))
+
+@test("one written twice is refused, as any repeated attribute is")
+tl_written_twice()
+    assert(pf_err("@thread_local\n@thread_local\nstatic var n: int = 1\nprint(n)").contains("written twice"))
+
+@test("'@align' alone above several names keeps its own sentence, and anything else takes the section's")
+tl_the_several_sentence_is_chosen_by_the_whole_set()
+    assert(pf_err("@align(8)\nstatic var a, b = 1, 2\n").starts_with("'@align(n)' is the boundary"))
+    assert(pf_err("@align(8)\n@section(\".x\")\nstatic var a, b = 1, 2\n").starts_with("'@section(\"...\")' places one object"))
+
+// -- `@export` above a `type` -------------------------------------------------------------------
+
+@test("'@export' above a type records the C name on the declaration")
+tl_an_exported_type_carries_its_name()
+    val t = tl_tree("module demo\n\n@export(\"slate_value\")\ntype Handle = u64\n")
+
+    assert(t.contains("cname: ExportAttr"), t)
+    assert(t.contains("symbol: \"slate_value\""), t)
+
+@test("and the bare form records one with no symbol, as a struct's does")
+tl_the_bare_form_records_no_symbol()
+    val t = tl_tree("module demo\n\n@export\ntype Handle = u64\n")
+
+    assert(t.contains("cname: ExportAttr"), t)
+    assert(t.contains("symbol: None"), t)
+
+@test("while a type nobody exported carries none")
+tl_an_unexported_type_carries_none()
+    assert(tl_tree("module demo\n\ntype Handle = u64\n").contains("cname: None"))
+
+@test("a type takes '@export' alone, and a layout beside it is refused")
+tl_a_type_takes_export_alone()
+    assert_eq(pf_err("module demo\n\n@export(\"h\")\n@packed\ntype H = u64\n"),
+        "'@packed' and '@align(n)' lay out a struct and '@export(\"...\")' names one in a generated header, so together they mark a struct — and this declares none")
