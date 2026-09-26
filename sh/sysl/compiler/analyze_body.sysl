@@ -272,7 +272,7 @@ private with_entry_body(funcs: Buf[TFunc], started: (Buf[TStmt], string)) -> Buf
 
     out.push(TFunc(span_zero(), entry_check_name(started.1), buf(), Unit,
                    TBlock(started.0, None, Unit), false, buf(), buf(), buf(), false, None, false,
-                   None, false, false, None, None, None, None, no_marks()))
+                   None, false, false, None, None, None, None, no_marks(), started.1))
 
     out
 end with_entry_body
@@ -401,6 +401,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     val name = if key == "" then func_key(a, scope, span, d) else key
 
     cx.in_variadic = d.variadic
+    cx.owner = owner_of(a, d.name, scope)
 
     var params: Buf[(string, Type)] = buf()
 
@@ -440,8 +441,17 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
           contract.2, file_local(d.vis), d.conv, d.tailrec, contract.3, d.pure, d.ghost,
           frame_symbols(cx, span, name, d.reads, "reads"),
           frame_symbols(cx, span, name, d.writes, "writes"),
-          exported_symbol(d), d.section, d.marks)
+          exported_symbol(d), d.section, d.marks, cx.owner)
 end analyze_body
+
+// The module that declared `name`, which is the module whose compilation owns its definition.
+//
+// It is read off the declaration rather than off the key, and the key cannot answer it: a member of
+// a built-in type (`char.is_digit`, `real.nan`) is keyed under the type and names no module at all,
+// and an `impl` in one module may be written for a type in another. `scope` is the terms the body is
+// read in, whose module is the answer for everything but a trait default copied onto a type.
+owner_of(a: &Analysis, name: string, scope: Scope) -> string =
+    a.tables.members.decl_owner.get(name).unwrap_or(scope.module_name)
 
 // Every generic declaration's body, read once with its parameters standing in for themselves.
 //
@@ -600,6 +610,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     val cx = analyzer_for(a, scope)
 
     cx.subst = subst
+    cx.owner = owner_of(a, d.name, scope)
     remember_bounds(cx, d)
 
     for i in 0..<d.params.len()
@@ -642,7 +653,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     a.tables.homes.put(d.name, scope)
     a.tables.abstracts.push(TFunc(span_zero(), d.name, params, ret, body, d.variadic, buf(), buf(),
                                   buf(), true, d.conv, false, None, d.pure, d.ghost, None, None,
-                                  None, None, no_marks()))
+                                  None, None, no_marks(), cx.owner))
 end check_abstract_body
 
 // The instantiations this reading asked for, taken back out.
@@ -735,9 +746,13 @@ end analyze_instance
 analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> TFunc
     val sig = a.tables.members.func_insts.get(name)
 
+    // Who declared it is read off the declaration too, so an instantiation belongs to the module of
+    // the generic it was made from rather than to whichever module's call asked for it.
+    cx.owner = owner_of(a, d.name, cx.scope)
+
     if sig.is_none() then return TFunc(span_zero(), name, buf(), Unit, empty_block(), false, buf(),
                                        buf(), buf(), false, None, false, None, false, false, None,
-                                       None, None, None, no_marks())
+                                       None, None, None, no_marks(), cx.owner)
 
     remember_bounds(cx, d)
 
@@ -775,7 +790,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
           d.conv, d.tailrec, contract.3, d.pure, d.ghost,
           frame_symbols(cx, span, name, d.reads, "reads"),
           frame_symbols(cx, span, name, d.writes, "writes"),
-          exported_symbol(d), d.section, d.marks)
+          exported_symbol(d), d.section, d.marks, cx.owner)
 end analyze_instance_in
 
 // The key a declaration was filed under, for a diagnostic naming the declaration an instantiation
