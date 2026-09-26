@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 
 // How much room a value takes, and on what boundary it sits.
 //
@@ -78,13 +79,34 @@ end bitfield_bits
 // The most bytes a value may be handed to a function in before it goes by address instead.
 const DirectBytes: usize = 128
 
+// What one target has already measured, keyed by the address of the declaration record.
+//
+// **A struct's size is asked of every struct holding it, so without this the work grows as three to
+// the power of the nesting depth** -- each member is asked for its alignment and its size, and each
+// answer rebuilds the member's own layout from its fields. Each entry holds the record itself, so
+// the record cannot be freed and its address handed to a different one while the entry stands.
+//
+// **It is only safe once the records are finished**: a record's fields are filled in after it is
+// registered, so the analysis measures without one and code generation, which runs over a finished
+// program, measures with one. `computed` counts the layouts worked out from their fields.
+struct LayoutMemo
+    structs: Map[usize, (&StructType, usize, usize)]
+    enums: Map[usize, (&EnumType, usize, usize)]
+    computed: usize
+end LayoutMemo
+
+// A memo with nothing measured in it.
+layout_memo() -> &LayoutMemo = LayoutMemo(map(), map(), 0)
+
 // The measurements one target makes.
 //
 // **It is `TargetLayout` and not `Layout`, which is the one name in this compiler that its
 // reference does not share**: `sh.sysl.parsing.Layout` is the lexer's indentation state, this module
-// imports that package wholesale, and the two would collide.
+// imports that package wholesale, and the two would collide. A memo belongs to the one target it
+// was made for, so two targets never share an answer.
 struct TargetLayout
     word_bits: usize
+    memo: Option[&LayoutMemo]
 
     pointer_bytes(self) -> usize = self.word_bits / 8
 
@@ -158,14 +180,34 @@ struct TargetLayout
 
         for i in 0..<members.len()
             val m = members.at(i)
+            val a = self.align(m)
 
-            widest = max_usize(widest, self.align(m))
-            offset = round_up(offset, self.align(m)) + self.size(m)
+            widest = max_usize(widest, a)
+            offset = round_up(offset, a) + self.size(m)
 
         (round_up(offset, widest), widest)
     end aggregate
 
     private struct_layout(self, s: &StructType) -> (usize, usize)
+        val memo = self.memo match
+            Some(m) -> m
+            None -> return self.struct_computed(s)
+
+        val p: *StructType = &*s
+        val key = usize(p)
+
+        memo.structs.get(key) match
+            Some(hit) -> return (hit.1, hit.2)
+            None -> ()
+
+        val both = self.struct_computed(s)
+
+        memo.computed += 1
+        memo.structs.put(key, (s, both.0, both.1))
+        both
+    end struct_layout
+
+    private struct_computed(self, s: &StructType) -> (usize, usize)
         var members: Buf[Type] = buf()
         val fields = s.stored()
 
@@ -197,7 +239,7 @@ struct TargetLayout
         s.min_align match
             Some(n) -> if n > alignment then (max_usize(round_up(bytes, n), n), n) else (bytes, alignment)
             None -> (bytes, alignment)
-    end struct_layout
+    end struct_computed
 
     // Where a field begins inside its struct.
     field_offset(self, s: &StructType, field: string) -> Option[usize]
@@ -218,27 +260,45 @@ struct TargetLayout
     end field_offset
 
     // How much room the widest variant of an enum needs, and on what boundary it sits.
-    payload_size(self, e: &EnumType) -> usize
-        var widest: usize = 0
+    payload_size(self, e: &EnumType) -> usize = self.payload(e).0
 
-        for i in 0..<e.variants.len()
-            if e.variants.at(i).carries then
-                widest = max_usize(widest, self.variant_aggregate(e.variants.at(i)).0)
+    payload_align(self, e: &EnumType) -> usize = self.payload(e).1
 
-        widest
-    end payload_size
+    // The payload's size and alignment, measured once per enum where there is a memo.
+    private payload(self, e: &EnumType) -> (usize, usize)
+        val memo = self.memo match
+            Some(m) -> m
+            None -> return self.payload_computed(e)
 
-    payload_align(self, e: &EnumType) -> usize
+        val p: *EnumType = &*e
+        val key = usize(p)
+
+        memo.enums.get(key) match
+            Some(hit) -> return (hit.1, hit.2)
+            None -> ()
+
+        val both = self.payload_computed(e)
+
+        memo.computed += 1
+        memo.enums.put(key, (e, both.0, both.1))
+        both
+    end payload
+
+    // Every carrying variant's members laid end to end, the widest size and the widest alignment
+    // among them. An enum where no variant carries anything has a payload of nothing, aligned to one.
+    private payload_computed(self, e: &EnumType) -> (usize, usize)
+        var bytes: usize = 0
         var widest: usize = 1
-        var any = false
 
         for i in 0..<e.variants.len()
             if e.variants.at(i).carries then
-                any = true
-                widest = max_usize(widest, self.variant_aggregate(e.variants.at(i)).1)
+                val both = self.variant_aggregate(e.variants.at(i))
 
-        if any then widest else 1
-    end payload_align
+                bytes = max_usize(bytes, both.0)
+                widest = max_usize(widest, both.1)
+
+        (bytes, widest)
+    end payload_computed
 
     private variant_aggregate(self, v: EnumVariant) -> (usize, usize)
         var members: Buf[Type] = buf()
@@ -251,16 +311,21 @@ struct TargetLayout
     end variant_aggregate
 
     private enum_size(self, e: &EnumType) -> usize
-        val a = self.enum_align(e)
+        val both = self.payload(e)
 
-        round_up(round_up(4, self.payload_align(e)) + self.payload_size(e), a)
+        round_up(round_up(4, both.1) + both.0, max_usize(4, both.1))
     end enum_size
 
     private enum_align(self, e: &EnumType) -> usize = max_usize(4, self.payload_align(e))
 end TargetLayout
 
-// The layout a target measures with.
-layout_for(t: Target) -> TargetLayout = TargetLayout(t.pointer_bits())
+// The layout a target measures with, remembering nothing: the one the analysis uses, while the
+// records it measures are still being filled in.
+layout_for(t: Target) -> TargetLayout = TargetLayout(t.pointer_bits(), None)
+
+// The layout a target measures with over a finished program, remembering every struct and enum it
+// has measured.
+memo_layout_for(t: Target) -> TargetLayout = TargetLayout(t.pointer_bits(), Some(layout_memo()))
 
 // An integer's alignment: the next power of two at or above its byte count, capped at sixteen.
 int_align(bits: int) -> usize
