@@ -461,6 +461,13 @@ private check_generic_bodies(a: &Analysis, units: Buf[Program])
                     val d = with_call_bounds(written)
 
                     if !d.tparams.is_empty() then check_abstract_body(a, scope, d)
+                // A generic struct's clauses are a generic function, read at its definition as
+                // one is -- so a clause its bounds do not license is refused once, at the struct.
+                StructDecl(d) ->
+                    if !d.invariants.is_empty() && !d.tparams.is_empty()
+                        val f = a.tables.funcs.get(inv_key(module_qualify(scope.module_name, d.name)))
+
+                        if f.is_some() then check_abstract_body(a, scope, f.unwrap().decl)
                 _ -> ()
 
     // A generic type's members and a generic `impl`'s are checkable before anything instantiates
@@ -1276,6 +1283,13 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                 var init: Option[TExpr] = None
 
                 if d.init.is_some() then init = Some(type_expr(cx, d.init.unwrap(), Some(ty)))
+                else if !zero_sized(ty) && has_zero(ty)
+                    // A zero that holds a struct carrying clauses is checked as a construction is,
+                    // which makes it an initializer that runs rather than an image the object file
+                    // carries -- exactly what storage initialized by `Window(2, 10)` already is.
+                    val zero = checked_zero(cx, d.span, ty)
+
+                    if !is_zero_expr(zero) then init = Some(zero)
 
                 val computed = init.is_some() && !laid_down(init.unwrap())
 
@@ -1283,6 +1297,10 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
     out
 end module_storage
+
+private is_zero_expr(e: TExpr) -> bool = *e.kind match
+    TZero(_) -> true
+    _ -> false
 
 // The boundary a declaration asked its storage to start on, where it asked for one.
 private storage_align(cx: &Analyzer, d: ValueDecl) -> Option[usize]
