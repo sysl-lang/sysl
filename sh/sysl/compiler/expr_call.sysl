@@ -290,7 +290,13 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
     val tkey = if shadowed then None else lookup_type_key(cx.an, cx.scope, name)
 
     // A conversion, where no declaration claims the name.
-    if !shadowed && tkey.is_none() then
+    //
+    // **A declared FUNCTION claims the name too**, exactly as a declared type does: otherwise
+    // `unit`, `int` and `byte` would be words a module could take for a type and not for a
+    // function, and a nullary `unit()` would be told *"a 'unit' conversion takes exactly one
+    // value"* about a built-in the reader never reached for. The conversion is still what the name
+    // means wherever no declaration of it is in reach.
+    if !shadowed && tkey.is_none() && !function_in_scope(cx, name) then
         val scalar = scalar_type_named(cx, span, name)
 
         if scalar.is_some() then return convert_call(cx, span, name, scalar.unwrap(), args)
@@ -1029,6 +1035,33 @@ function_keys(cx: &Analyzer, written: string) -> Buf[string]
 
     found
 end function_keys
+
+// Whether a **function** of this name can be named from here. It decides which rule reads a call
+// rather than resolving one, so it answers without reporting and files no module dependency on a
+// declaration the program may never reach.
+//
+// **It asks only the places a file's own names come from** -- an import, the file's own module, a
+// wildcard -- and not the written-out-path fallbacks `function_keys_of` ends on: a scalar's name
+// has no dot, and read as a path it would be the ROOT module's key, which would let a program's
+// `int` claim the name inside every library module too.
+private function_in_scope(cx: &Analyzer, written: string) -> bool
+    val bound = cx.scope.imports.name_key(written)
+
+    if bound.is_some() && !visible_keys(cx, overload_keys(cx.an, bound.unwrap())).is_empty()
+        return true
+
+    val here = file_private_key(cx.an, cx.scope.src.name, module_qualify(cx.scope.module_name,
+                                                                        written))
+
+    if !visible_keys(cx, overload_keys(cx.an, here)).is_empty() then return true
+
+    for i in 0..<cx.scope.imports.wildcards.len()
+        val key = module_qualify(cx.scope.imports.wildcards.at(i), written)
+
+        if !visible_keys(cx, overload_keys(cx.an, key)).is_empty() then return true
+
+    false
+end function_in_scope
 
 private function_keys_of(cx: &Analyzer, written: string) -> Buf[string]
     // A module bound to a name is written before a dot, so `unicode.is_alpha` is the module's key

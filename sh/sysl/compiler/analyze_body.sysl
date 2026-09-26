@@ -1308,10 +1308,43 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
                 val computed = init.is_some() && !laid_down(init.unwrap())
 
-                out.push(TVal(key, ty, init, computed, writable, storage_align(cx, d), d.section))
+                if d.thread_local then check_per_thread(cx, d.span, key, computed)
+
+                out.push(TVal(key, ty, init, computed, writable, storage_align(cx, d), d.section,
+                              d.thread_local))
 
     out
 end module_storage
+
+// The two things `@thread_local` asks that a plain module `var` does not
+// (`reference/attributes.md § @thread_local`).
+//
+// **The initializer has to be a constant**: every thread's copy is made from one image the object
+// file carries, and there is no per-thread prologue for anything else to run in. A thread started
+// later never passes through `main`'s, so an initializer that was code would fill exactly one copy
+// and leave every other thread reading zeroes.
+//
+// **And the target has to have thread-local storage at all.** Every target LLVM knows *accepts*
+// the keyword, and a freestanding one silently gets the local-exec model, whose offset is read from
+// a register nothing on a bare machine has written -- so the alternative to this refusal is a
+// program that reads a wild address.
+private check_per_thread(cx: &Analyzer, span: Span, key: string, computed: bool)
+    val t = cx.an.tables.target
+
+    if !t.thread_local_storage()
+        cx.fault(span, s"'${qualified_name(key)}' cannot be '@thread_local' on '${t.name}': there " +
+                 "is no loader and no libc on this target, so nothing lays a thread's storage down " +
+                 "and nothing writes the thread pointer the offset would be read from. Declare it " +
+                 "as a plain module 'var' and let the port's scheduler answer for which task is " +
+                 "running, which is what the ownership runtime's reaper slot does")
+    else if computed
+        cx.fault(span, s"'${qualified_name(key)}' is '@thread_local', so its value has to be one " +
+                 "the compiler can write down: every thread gets a copy of the initial value, and " +
+                 "the copies are made from a single image in the object file rather than by code " +
+                 "that runs per thread. A literal, 'null', a 'const' and the arrays and structs " +
+                 "built from them are all values; a call is not. Leave the value off to start " +
+                 "every thread at the type's zero, and do the work in each thread instead")
+end check_per_thread
 
 private is_zero_expr(e: TExpr) -> bool = *e.kind match
     TZero(_) -> true
