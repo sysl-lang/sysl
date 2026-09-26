@@ -1,0 +1,506 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What a contract tells the **optimizer**, which is a different question from what it checks
+// (`contract_assume.sysl`).
+//
+// **A postcondition used to stop at the frame that declared it.** `grow` promises room and traps if it
+// did not deliver it, and the store on the line after the call still carried a bounds test -- because
+// LLVM saw a call to a function it was told not to inline, then a subscript, and had nothing joining
+// the two. The clause is now said again at the call site as an `llvm.assume`, which emits no code and
+// lets the test fold. **A struct's `invariant` is said the same way at the entry of every member**, so
+// a member does not test twice what the clause already settles.
+//
+// Most cases are asked of a real optimizer rather than of the emitted text, because the claim is about
+// what survives `-O2`; the negative control beside each positive is what makes the answer mean
+// anything.
+
+private var ca_library_cache: Buf[Program] = buf()
+private var ca_library_read: bool = false
+
+private ca_library() -> Buf[Program]
+    if ca_library_read then return ca_library_cache
+
+    ca_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> ca_library_cache = units
+
+    ca_library_cache
+end ca_library
+
+private ca_no_library() -> bool
+    if ca_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end ca_no_library
+
+// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
+private ca_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+    val library = ca_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), buf())
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    ir_print_module(lowered.0)
+end ca_ir
+
+// What clang's `-O2` leaves of a program, or `None` where there is no clang to ask.
+private ca_optimized(text: string) -> Option[string]
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return None
+    end if
+
+    val dir = make_temp_dir("sysl-assume").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, ca_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end ca_optimized
+
+// The lines of the function whose symbol holds `name`, from its `define` to the brace closing it --
+// what a claim about *where* a trap went has to be asked of, since a module always has traps somewhere.
+private ca_body(out: string, name: string) -> string
+    val lines = lines_of(out)
+    var body = ""
+    var inside = false
+
+    for i in 0..<lines.len()
+        val l = lines.at(i)
+
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            body = body + l + "\n"
+
+            if l == "}" then return body
+        end if
+
+    assert(inside, s"nothing defines a function named '$name':\n$out")
+    body
+end ca_body
+
+// How many integer compares a body makes, not counting the ones whose only use is an `llvm.assume`:
+// such a compare is dropped when instructions are selected, so it is the one that costs nothing.
+private ca_compares(body: string) -> int
+    val lines = lines_of(body)
+    var n = 0
+
+    for i in 0..<lines.len()
+        val l = lines.at(i).trim()
+        val at = l.index_of(" = icmp ")
+
+        if at.is_some() && l.starts_with("%")
+            val reg = l[0..<at.unwrap()]
+
+            if !body.contains(s"@llvm.assume(i1 $reg)") then n += 1
+        end if
+
+    n
+end ca_compares
+
+// How many times a body names the trap.
+private ca_traps(body: string) -> int
+    val lines = lines_of(body)
+    var n = 0
+
+    for i in 0..<lines.len()
+        if lines.at(i).contains("@llvm.trap") then n += 1
+
+    n
+end ca_traps
+
+// -- a postcondition reaches the caller ---------------------------------------------------------------
+
+// The shape the feature exists for: growth behind a name that is deliberately not inlined, and a
+// store on the line after it whose index the growth is what makes valid.
+private grower(clause: string) -> string =
+    "struct Store\n    elems: []i32\n    count: usize\n\n    @noinline\n    @cold\n    private grow(*self)\n" +
+    clause + "        self.elems = [0; self.count + 8usize]\n\n    @noinline\n    store(*self, v: i32)\n" +
+    "        self.grow()\n\n        self.elems[self.count] = v\n\nvar s = Store([0; 4], 0usize)\n" +
+    "s.store(7)\nprint(s.count)\n"
+
+private grown_clause() -> string = "        ensure self.count < self.elems.len\n"
+
+@test("the bounds test after the call is folded away")
+ca_the_bounds_test_after_the_call_is_folded_away()
+    if ca_no_library() then return
+
+    ca_optimized(grower(grown_clause())) match
+        None -> ()
+        Some(out) ->
+            val body = ca_body(out, "Store.store")
+
+            assert(!body.contains("@llvm.trap"), body)
+
+@test("and is still there without the clause")
+ca_and_is_still_there_without_the_clause()
+    if ca_no_library() then return
+
+    ca_optimized(grower("")) match
+        None -> ()
+        Some(out) ->
+            val body = ca_body(out, "Store.store")
+
+            assert(body.contains("@llvm.trap"), body)
+
+@test("the clause is laid down as an assume at the call site")
+ca_the_clause_is_laid_down_as_an_assume_at_the_call_site()
+    if ca_no_library() then return
+
+    val out = ca_ir(grower(grown_clause()))
+
+    assert(ca_body(out, "Store.store").contains("call void @llvm.assume(i1 "), out)
+    assert(out.contains("declare void @llvm.assume(i1)"), out)
+
+@test("a module that assumes nothing declares nothing")
+ca_a_module_that_assumes_nothing_declares_nothing()
+    if ca_no_library() then return
+
+    val out = ca_ir(grower(""))
+
+    assert(!out.contains("llvm.assume"), out)
+
+// -- a precondition is already a fact inside its own body ---------------------------------------------
+
+private covered() -> string =
+    "@noinline\nat(xs: []const i32, i: usize) -> i32\n    require i < xs.len\n    xs[i]\n\n" +
+    "val ns: []i32 = [1, 2, 3]\nprint(at(ns, 1usize))\n"
+
+@test("the compiler emits the precondition's check and the subscript's")
+ca_the_compiler_emits_the_preconditions_check_and_the_subscripts()
+    if ca_no_library() then return
+
+    val body = ca_body(ca_ir(covered()), "@at")
+
+    assert(body.contains("require.bad"), body)
+    assert(body.contains("bounds.bad"), body)
+    assert(!body.contains("llvm.assume"), body)
+
+@test("and the optimizer folds them into one")
+ca_and_the_optimizer_folds_them_into_one()
+    if ca_no_library() then return
+
+    ca_optimized(covered()) match
+        None -> ()
+        Some(out) ->
+            val body = ca_body(out, "@at")
+
+            assert(ca_traps(body) == 1, body)
+
+// -- a clause that cannot be moved is not repeated ----------------------------------------------------
+
+@test("a clause that calls something is not repeated")
+ca_one_that_calls_something()
+    if ca_no_library() then return
+
+    val out = ca_ir("@noinline\nfloor() -> usize = 3usize\n\n@noinline\nwide(n: usize) -> usize\n" +
+                    "    ensure result >= floor()\n    n + 8usize\n\nprint(wide(1usize))\n")
+
+    assert(!out.contains("@llvm.assume"), out)
+
+@test("a clause that reads 'old' is not repeated")
+ca_one_that_reads_old()
+    if ca_no_library() then return
+
+    val out = ca_ir("@noinline\nbump(p: *usize)\n    ensure *p > old(*p)\n    *p += 1usize\n\n" +
+                    "var n: usize = 1usize\nbump(&n)\nprint(n)\n")
+
+    assert(!out.contains("@llvm.assume"), out)
+
+@test("a clause that subscripts is not repeated")
+ca_one_that_subscripts()
+    if ca_no_library() then return
+
+    val out = ca_ir("@noinline\nfirst(xs: []const i32) -> i32\n    ensure result == xs[0]\n    xs[0]\n\n" +
+                    "val ns: []i32 = [4, 5]\nprint(first(ns))\n")
+
+    assert(!out.contains("@llvm.assume"), out)
+
+// The only way a clause does not run is `@ghost`, and the assume follows that switch rather than a
+// second test of its own.
+@test("a ghostly clause is neither checked nor assumed")
+ca_a_ghostly_clause_is_neither_checked_nor_assumed()
+    if ca_no_library() then return
+
+    val out = ca_ir("@ghost\nbig_enough(n: usize) -> bool = n >= 8usize\n\n@noinline\n" +
+                    "wide(n: usize) -> usize\n    ensure big_enough(result)\n    n + 8usize\n\n" +
+                    "print(wide(1usize))\n")
+
+    assert(!out.contains("@llvm.assume"), out)
+    assert(!ca_body(out, "@wide").contains("@llvm.trap"), out)
+
+// -- an argument is substituted only where reading it twice is reading the same thing -----------------
+
+@test("an argument that is itself a call is not substituted")
+ca_an_argument_that_is_itself_a_call()
+    if ca_no_library() then return
+
+    val out = ca_ir("@noinline\nn() -> usize = 2usize\n\n@noinline\nwide(k: usize) -> usize\n" +
+                    "    ensure result >= k\n    k + 8usize\n\nprint(wide(n()))\n")
+
+    assert(!out.contains("@llvm.assume"), out)
+
+// The dangerous case: the callee is handed a pointer to the very variable the other argument reads,
+// and writes through it before it returns.
+@test("an argument the call itself can write is not substituted")
+ca_an_argument_the_call_itself_can_write()
+    if ca_no_library() then return
+
+    val out = ca_ir("@noinline\nbump(p: *usize, k: usize) -> usize\n    ensure result >= k\n" +
+                    "    *p = 99usize\n    k + 8usize\n\nfn(n: *usize) -> usize = bump(n, *n)\n\n" +
+                    "var m: usize = 1usize\nprint(fn(&m))\n")
+
+    assert(!out.contains("@llvm.assume"), out)
+
+@test("an argument read out of a global is not substituted")
+ca_an_argument_read_out_of_a_global()
+    if ca_no_library() then return
+
+    val out = ca_ir("@noinline\nwide(k: usize) -> usize\n    ensure result >= k\n    k + 8usize\n\n" +
+                    "static var g: usize = 2usize\nprint(wide(g))\n")
+
+    assert(!out.contains("@llvm.assume"), out)
+
+@test("an argument that is a local is substituted")
+ca_an_argument_that_is_a_local()
+    if ca_no_library() then return
+
+    val out = ca_ir("@noinline\nwide(k: usize) -> usize\n    ensure result >= k\n    k + 8usize\n\n" +
+                    "@noinline\nuse(m: usize) -> usize = wide(m)\n\nprint(use(2usize))\n")
+
+    assert(ca_body(out, "@use").contains("call void @llvm.assume(i1 "), out)
+
+// A parameter the callee assigns before its check is not the value the caller passed, so the clause
+// cannot be read over the caller's argument.
+@test("a parameter the callee rebinds is not substituted")
+ca_a_parameter_the_callee_rebinds()
+    if ca_no_library() then return
+
+    val out = ca_ir("@noinline\nwide(k: usize) -> usize\n    ensure result >= k\n    val q = &k\n" +
+                    "    *q + 8usize\n\n@noinline\nuse(m: usize) -> usize = wide(m)\n\nprint(use(2usize))\n")
+
+    assert(!out.contains("@llvm.assume"), out)
+
+// -- a receiver's clause reaches the member -----------------------------------------------------------
+
+// A buffer's reading half, generic as `Buf` is, with the clause supplied by the case.
+private seq(clause: string) -> string =
+    "struct Seq[T]\n    elems: []T\n    count: usize\n" + clause + "\n    @noinline\n" +
+    "    at(self, i: usize) -> T\n        if i >= self.count then exit(3)\n\n        self.elems[i]\n\n" +
+    "var s = Seq([1, 2, 3], 2usize)\nprint(s.at(1usize))\n"
+
+private seq_clause() -> string = "    invariant count <= elems.len\n"
+
+@test("the element read is one compare")
+ca_the_element_read_is_one_compare()
+    if ca_no_library() then return
+
+    ca_optimized(seq(seq_clause())) match
+        None -> ()
+        Some(out) ->
+            val body = ca_body(out, "Seq.at")
+
+            assert(ca_compares(body) == 1, body)
+
+@test("and is two without the clause")
+ca_and_is_two_without_the_clause()
+    if ca_no_library() then return
+
+    ca_optimized(seq("")) match
+        None -> ()
+        Some(out) ->
+            val body = ca_body(out, "Seq.at")
+
+            assert(ca_compares(body) == 2, body)
+
+@test("the clause is laid down as an assume at the member's entry")
+ca_the_clause_is_laid_down_as_an_assume_at_the_members_entry()
+    if ca_no_library() then return
+
+    val body = ca_body(ca_ir(seq(seq_clause())), "Seq.at")
+
+    assert(body.contains("call void @llvm.assume(i1 "), body)
+
+@test("and through a pointer receiver")
+ca_and_through_a_pointer_receiver()
+    if ca_no_library() then return
+
+    val src = "struct Seq\n    elems: []int\n    count: usize\n    invariant count <= elems.len\n\n" +
+        "    @noinline\n    put(*self, i: usize, v: int)\n        if i >= self.count then exit(3)\n\n" +
+        "        self.elems[i] = v\n\nvar s = Seq([1, 2, 3], 2usize)\ns.put(1usize, 7)\n" +
+        "print(s.elems[1])\n"
+    val emitted = ca_body(ca_ir(src), "Seq.put")
+
+    assert(emitted.contains("call void @llvm.assume(i1 "), emitted)
+
+    ca_optimized(src) match
+        None -> ()
+        Some(out) ->
+            val body = ca_body(out, "Seq.put")
+
+            assert(ca_compares(body) == 1, body)
+
+// The library's own: `Buf.at` is the member the whole feature was for.
+@test("Buf.at is one compare")
+ca_buf_at_is_one_compare()
+    if ca_no_library() then return
+
+    ca_optimized("import sysl.buf.{Buf, buf}\n\n@noinline\nread(b: Buf[int], i: usize) -> int = b.at(i)\n\n" +
+                 "var b: Buf[int] = buf()\nb.push(1)\nprint(read(b, 0usize))\n") match
+        None -> ()
+        Some(out) ->
+            val body = ca_body(out, "@read")
+
+            assert(ca_compares(body) == 1, body)
+
+// Every write of `count` or `elems` re-checks the clause, and in the members that write them the
+// re-check is settled by what the member already knows. A trap left in any of these is a compare every
+// append, pop or truncate would pay for the clause.
+@test("Buf's own writers keep no re-check the optimizer could not settle")
+ca_bufs_own_writers_keep_no_recheck()
+    if ca_no_library() then return
+
+    ca_optimized("import sysl.buf.{Buf, buf}\n\n@noinline\nchurn(n: int, xs: []const int) -> int\n" +
+                 "    var b: Buf[int] = buf()\n    var i = 0\n\n    while i < n\n        b.push(i)\n" +
+                 "        i += 1\n\n    b.extend(xs)\n    b.truncate(3usize)\n    b.pop()\n\n" +
+                 "    int(b.len())\n\nprint(churn(10, [1, 2, 3]))\n") match
+        None -> ()
+        Some(out) ->
+            val body = ca_body(out, "@churn")
+
+            assert(!body.contains("invariant.bad"), body)
+
+@test("a truncate through a pointer keeps no re-check")
+ca_a_truncate_through_a_pointer_keeps_no_recheck()
+    if ca_no_library() then return
+
+    ca_optimized("import sysl.buf.{Buf, buf}\n\n@noinline\ndrop(b: *Buf[int])\n    b.truncate(b.len() - 1)\n\n" +
+                 "var b: Buf[int] = buf()\nb.push(1)\ndrop(&b)\nprint(b.len())\n") match
+        None -> ()
+        Some(out) ->
+            val body = ca_body(out, "@drop")
+
+            assert(!body.contains("invariant.bad"), body)
+
+// -- an append never reads the count back after writing the element -----------------------------------
+
+// The blocks of `body` that store an `int` element and then load the field at offset 24 of `b` -- the
+// count, in `Buf[int]` and in the control's struct alike.
+private reads_back(body: string) -> int
+    val lines = lines_of(body)
+    var counts: Buf[string] = buf()
+
+    for i in 0..<lines.len()
+        val l = lines.at(i).trim()
+        val at = l.index_of(" = getelementptr inbounds nuw i8, ptr %b.param, i64 24")
+
+        if at.is_some() && l.starts_with("%") then counts.push(l[0..<at.unwrap()])
+
+    var found = 0
+    var stored = false
+
+    for i in 0..<lines.len()
+        val l = lines.at(i).trim()
+
+        if l == "" then stored = false
+        elif l.starts_with("store i32 ") then stored = true
+        elif stored
+            for j in 0..<counts.len()
+                if l.contains(s"= load i64, ptr ${counts.at(j)},") then found += 1
+
+    found
+end reads_back
+
+@test("through a pointer, on the arm that does not grow")
+ca_an_append_through_a_pointer_does_not_read_back()
+    if ca_no_library() then return
+
+    ca_optimized("import sysl.buf.{Buf, buf}\n\n@noinline\nappend(b: *Buf[int], v: int)\n    b.push(v)\n" +
+                 "    b.push(v + 1)\n\nvar b: Buf[int] = buf()\nappend(&b, 1)\nprint(b.len())\n") match
+        None -> ()
+        Some(out) ->
+            val body = ca_body(out, "@append")
+
+            assert(reads_back(body) == 0, body)
+
+// The control: the same layout, with the count raised by a statement that reads it after the element
+// store -- which the test has to see, or its silence above means nothing.
+@test("and the read-back is seen where it is written")
+ca_and_the_read_back_is_seen_where_it_is_written()
+    if ca_no_library() then return
+
+    ca_optimized("struct Seq\n    elems: []int\n    count: usize\n\n@noinline\nappend(b: *Seq, v: int)\n" +
+                 "    b.elems[b.count] = v\n    b.count += 1\n\nvar s = Seq([0, 0, 0], 0usize)\n" +
+                 "append(&s, 1)\nprint(s.count)\n") match
+        None -> ()
+        Some(out) ->
+            val body = ca_body(out, "@append")
+
+            assert(reads_back(body) > 0, body)
+
+// -- a clause that cannot be repeated is not assumed ----------------------------------------------------
+
+// A division is not something an assume may introduce: a zero divisor is undefined behaviour the
+// source never wrote at the entry.
+@test("an invariant that divides is not assumed")
+ca_an_invariant_that_divides()
+    if ca_no_library() then return
+
+    val body = ca_body(ca_ir(seq("    invariant count / 2usize <= elems.len\n")), "Seq.at")
+
+    assert(!body.contains("@llvm.assume"), body)
+
+@test("an invariant that calls something is not assumed")
+ca_an_invariant_that_calls_something()
+    if ca_no_library() then return
+
+    val src = "@noinline\nroom(n: usize) -> usize = n\n\n" + seq("    invariant count <= room(elems.len)\n")
+    val body = ca_body(ca_ir(src), "Seq.at")
+
+    assert(!body.contains("@llvm.assume"), body)
+
+@test("a struct without clauses is told nothing")
+ca_a_struct_without_clauses_is_told_nothing()
+    if ca_no_library() then return
+
+    val body = ca_body(ca_ir(seq("")), "Seq.at")
+
+    assert(!body.contains("@llvm.assume"), body)
