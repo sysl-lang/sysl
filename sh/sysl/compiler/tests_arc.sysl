@@ -95,31 +95,42 @@ private lowered_whole(text: string, symbol: string) -> string
     ""
 end lowered_whole
 
+// A parameter is read through the caller's count unless the body rebinds its slot, so `n` -- the
+// one assigned to -- is the parameter the frame owns, and `m` beside it is borrowed.
 @test("a counted parameter is retained at entry and released at every return")
 a_counted_parameter_is_owned_by_the_frame()
     assert_eq(lowered_arc("struct Node\n" +
                            "    v: int\n" +
                            "end Node\n" +
                            "\n" +
-                           "take(n: &Node) -> int = n.v\n" +
+                           "take(n: &Node, m: &Node) -> int\n" +
+                           "    n = m\n" +
+                           "    n.v\n" +
                            "\n" +
                            "var r: &Node = Node(1)\n" +
                            "var got: int = 0\n" +
                            "\n" +
-                           "got = take(r)\n",
+                           "got = take(r, r)\n",
                           "take"),
-              "define i32 @take(ptr %n.param) {\n" +
+              "define i32 @take(ptr %n.param, ptr %m.param) {\n" +
               "entry:\n" +
               "  %n.addr = alloca ptr\n" +
+              "  %m.addr = alloca ptr\n" +
               "  store ptr %n.param, ptr %n.addr\n" +
               "  call void @arc.retain(ptr %n.param)\n" +
-              "  %t1 = load ptr, ptr %n.addr\n" +
-              "  %t2 = getelementptr %arc.Node, ptr %t1, i32 0, i32 3\n" +
-              "  %t3 = load %struct.Node, ptr %t2\n" +
-              "  %t4 = extractvalue %struct.Node %t3, 0\n" +
-              "  %t5 = load ptr, ptr %n.addr\n" +
-              "  call void @arc.release(ptr %t5)\n" +
-              "  ret i32 %t4\n" +
+              "  store ptr %m.param, ptr %m.addr\n" +
+              "  %t1 = load ptr, ptr %m.addr\n" +
+              "  %t2 = load ptr, ptr %n.addr\n" +
+              "  call void @arc.retain(ptr %t1)\n" +
+              "  store ptr %t1, ptr %n.addr\n" +
+              "  call void @arc.release(ptr %t2)\n" +
+              "  %t3 = load ptr, ptr %n.addr\n" +
+              "  %t4 = getelementptr %arc.Node, ptr %t3, i32 0, i32 3\n" +
+              "  %t5 = load %struct.Node, ptr %t4\n" +
+              "  %t6 = extractvalue %struct.Node %t5, 0\n" +
+              "  %t7 = load ptr, ptr %n.addr\n" +
+              "  call void @arc.release(ptr %t7)\n" +
+              "  ret i32 %t6\n" +
               "}\n")
 end a_counted_parameter_is_owned_by_the_frame
 
