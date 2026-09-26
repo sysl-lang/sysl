@@ -47,7 +47,7 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         else
             val r = fresh_reg(e)
 
-            emit(e, InCast(r, CastFPTrunc, LFloat(64), VFloat(bits), lty(e, ty)))
+            emit(e, InCast(r, CastFPTrunc, LFloat(64, false), VFloat(bits), lty(e, ty)))
             r
 
     // A constrained operand converts from its base representation.
@@ -628,7 +628,7 @@ private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type) -> Val
                 underlying(ty) match
                     Vector(_, _) -> emit(e, InBin(r, OpSub, ety, VZero, v))
                     _ -> emit(e, InBin(r, OpSub, ety, VInt(from_int(0)), v))
-            Floating(_) -> emit(e, InNeg(r, ety, v))
+            Floating(_, _) -> emit(e, InNeg(r, ety, v))
             other -> gap_here(e, s"negation of ${type_show(other)}")
 
         return r
@@ -866,7 +866,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
             val base = underlying(d.base)
 
             base match
-                Floating(_) ->
+                Floating(_, _) ->
                     if d.lo.is_some() || d.hi.is_some() then gap_here(e, "a float range check")
                 _ ->
                     d.lo match
@@ -1215,10 +1215,19 @@ convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
     (from, ut) match
         (Integer(a_bits, a_signed, _), Integer(b_bits, _, _)) ->
             convert_int(e, a_bits, a_signed, b_bits, v)
-        (Integer(_, a_signed, _), Floating(_)) ->
+        (Integer(_, a_signed, _), Floating(_, _)) ->
             cast_to(e, if a_signed then CastSIToFP else CastUIToFP, from, ut, v)
-        (Floating(_), Integer(_, b_signed, _)) -> saturating_to_int(e, from, ut, b_signed, v)
-        (Floating(a_bits), Floating(b_bits)) ->
+        (Floating(_, _), Integer(_, b_signed, _)) -> saturating_to_int(e, from, ut, b_signed, v)
+        // `f16` and `bf16` are the one pair of floating types neither of which is wider, and LLVM
+        // has no instruction turning one into the other -- `fptrunc` and `fpext` both require the
+        // widths to differ. So the pair goes through `f32`, which holds both exactly: the
+        // intermediate rounds nothing and the only rounding is the destination's own.
+        (Floating(a_bits, _), Floating(b_bits, _)) ->
+            if a_bits == b_bits
+                val wide = Floating(32, false)
+
+                return convert(e, wide, ut, convert(e, from, wide, v))
+
             cast_to(e, if b_bits > a_bits then CastFPExt else CastFPTrunc, from, ut, v)
         (Char, Integer(b_bits, _, _)) -> convert_int(e, 32, false, b_bits, v)
         (Integer(a_bits, a_signed, _), Char) -> checked_char(e, a_bits, a_signed, v)
@@ -1317,7 +1326,7 @@ zero_of(e: *Emit, ty: Type) -> Val
 
     underlying(ty) match
         Integer(_, _, _) -> VInt(from_int(0))
-        Floating(_) -> v_float(0.0)
+        Floating(_, _) -> v_float(0.0)
         Char -> VInt(from_int(0))
         Bool -> VInt(from_int(0))
         Ptr(_) -> if erased(underlying(ty)) then VZero else VNull

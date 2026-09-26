@@ -473,12 +473,12 @@ private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
         Abstract(_, _) -> return true
         Integer(_, _, _) -> to match
             Integer(_, _, _) -> return true
-            Floating(_) -> return true
+            Floating(_, _) -> return true
             Char -> return true
             _ -> return false
-        Floating(_) -> to match
+        Floating(_, _) -> to match
             Integer(_, _, _) -> return true
-            Floating(_) -> return true
+            Floating(_, _) -> return true
             _ -> return false
         Char -> to match
             Integer(_, _, _) -> return true
@@ -803,7 +803,7 @@ private written_integer(t: Type) -> bool = t match
     _ -> false
 
 private written_floating(t: Type) -> bool = t match
-    Floating(_) -> true
+    Floating(_, _) -> true
     _ -> false
 
 private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string) -> TExpr
@@ -1356,10 +1356,10 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
                 ts.push(type_expr(inner, p.default.unwrap(), Some(want)))
 
     // The tail of a variadic definition, which no parameter names: the body reads it with `va_arg`,
-    // so each argument is analyzed at whatever type it has and nothing here checks it against one.
+    // so each argument is analyzed at whatever type it has and passed as C's promotions leave it.
     if f.decl.variadic
         for i in slots.len()..<args.len()
-            ts.push(type_expr_bare(cx, args.at(i)))
+            ts.push(variadic_extra(cx, args.at(i)))
 
     // **`@crossing` says a parameter hands what it is given to another domain**, so the rule about
     // what may cross is asked at the CALL: the argument is the thing that could have been written
@@ -1683,13 +1683,29 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
 
             ts.push(if by_value then TExpr(args.at(i).span, TVaPass(t)) else t)
         else
-            ts.push(type_expr_bare(cx, args.at(i)))
+            ts.push(variadic_extra(cx, args.at(i)))
 
     val ret = declared_result(cx, scope, d.ret_type)
 
     cx.an.uses(key)
     TExpr(span, TCall(key, ts, ret, false))
 end extern_call
+
+// One argument in a variadic tail, **passed already widened**. LLVM applies no default argument
+// promotions of its own -- an `i8` or an `f32` handed over as written is read back as garbage -- so
+// the widening happens here, in the tree: an integer narrower than 32 bits becomes a 32-bit one of
+// its own signedness, and every floating width narrower than `real` becomes a `real`, both
+// sixteen-bit formats included.
+private variadic_extra(cx: &Analyzer, a: Expr) -> TExpr
+    val t = type_expr_bare(cx, a)
+    val ty = texpr_type(t)
+
+    ty match
+        Integer(bits, signed, _) ->
+            if bits < 32 then TExpr(a.span, TCast(t, Integer(32, signed, false))) else t
+        Floating(bits, _) -> if bits < 64 then TExpr(a.span, TCast(t, real_type())) else t
+        _ -> t
+end variadic_extra
 
 // The file an `extern` was written in, which is where the types in its signature mean what they
 // meant.

@@ -591,14 +591,14 @@ private declared_type(a: &Analysis, unit: Program, c: CConstDecl,
         scalar_named(name, int(a.tables.layout.word_bits)) match
             Some(found) -> found match
                 Integer(bits, signed, _) -> return KnownNow(bits, signed, false, name)
-                Floating(bits) -> return floating_kind(a, c, bits, name)
+                Floating(bits, _) -> return floating_kind(a, c, bits, name)
                 _ -> return not_a_number(a, c)
             None -> ()
 
         plain_width(name) match
             Some(found) -> found match
                 Integer(bits, signed, _) -> return KnownNow(bits, signed, false, name)
-                Floating(bits) -> return floating_kind(a, c, bits, name)
+                Floating(bits, _) -> return floating_kind(a, c, bits, name)
                 _ -> return not_a_number(a, c)
             None -> ()
 
@@ -643,8 +643,10 @@ private not_a_number(a: &Analysis, c: CConstDecl) -> CDeclared
 // Narrower than the widths a C constant expression is written at, and narrow enough that rounding
 // onto it is not something the value could survive being read back through.
 private floating_kind(a: &Analysis, c: CConstDecl, bits: int, name: string) -> CDeclared
+    // Both sixteen-bit formats are refused, and by the written name rather than by a shared one: the
+    // reader who wrote `bf16` is not helped by a message about `f16`.
     if bits == 16
-        a.fault(empty_scope(), c.span, "'f16' is not a width a 'c const' is measured at — C writes " +
+        a.fault(empty_scope(), c.span, s"'$name' is not a width a 'c const' is measured at — C writes " +
                 "a constant expression as a 'float', a 'double' or a 'long double', so the two " +
                 "widths that read back without guessing are 'f32' and 'f64'")
         return KnownNow(32, true, false, name)
@@ -668,7 +670,7 @@ private plain_width(name: string) -> Option[Type]
     val bits = int(number_of(name[1..<b.len], 10))
 
     if b[0] == u8('f')
-        if bits == 16 || bits == 32 || bits == 64 then return Some(Floating(bits))
+        if bits == 16 || bits == 32 || bits == 64 then return Some(Floating(bits, false))
 
         return None
 
