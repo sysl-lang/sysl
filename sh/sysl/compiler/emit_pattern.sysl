@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.from_int
+import sysl.math.bigint.{BigInt, from_int}
 
 // **What a pattern tests, and what it binds** -- the two halves of an arm, kept apart because they
 // happen at different moments: a binding is established only once the arm has been taken, and a
@@ -192,13 +192,185 @@ end any_refutable
 
 // -- a whole `match` ---------------------------------------------------------------------------------
 
-// Every arm in turn: the pattern decides whether the arm is entered, the bindings are made once it
-// is, and a guard runs between the two.
+// A `match`: one `switch` where the scrutinee's tag alone decides the arm, and every arm tested in
+// turn otherwise.
 gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type) -> Val
     val sv = gen_expr(e, scrutinee)
     val end_l = fresh_label(e, "match.end")
     val slot = if no_value(ty) then VNothing else alloca(e, fresh_reg(e), lty(e, ty))
 
+    tag_switch(arms) match
+        Some(d) -> gen_tag_switch(e, d, sv, ty, slot, end_l)
+        None -> gen_arm_chain(e, arms, sv, ty, slot, end_l)
+
+    emit_label(e, end_l)
+    ends_nowhere(e, ty)
+
+    if no_value(ty) then return VNothing
+
+    val r = fresh_reg(e)
+
+    // The arms each took a count for what they stored, so what comes out of the slot is a value the
+    // enclosing statement owns and releases where its region ends.
+    emit(e, InLoad(r, lty(e, ty), slot, AccPlain, None))
+    own_temp(e, r, ty)
+end gen_match
+
+// What a `match` is when the scrutinee's discriminant alone decides the arm: the enum it is read
+// off, each arm with the tags that select it, and a trailing catch-all where there is one.
+struct TagDispatch
+    en: &EnumType
+    arms: Buf[(TArm, Buf[int])]
+    catch_all: Option[TArm]
+end TagDispatch
+
+// Recognises the `match` that lowers to ONE `switch`, and answers `None` for every other shape --
+// which then goes through `gen_arm_chain`.
+//
+// The chain tests one arm at a time, so the arm an input selects is decided by a run of comparisons
+// whose length is the arm's position in the source. For a match over a tag that is not even true --
+// the tag names the arm outright -- and folding the chain back into a `switch` is left to an
+// optimizer with a budget, so an arm written late enough pays an extra unpredictable branch on
+// every execution. Emitting the `switch` outright says what the match means in one instruction.
+//
+// **The form is recognised rather than assumed, and the conditions are what make the tag
+// sufficient.** Every arm must test a variant's tag and nothing else, so that no arm can fail after
+// the switch has branched to it -- a refutable payload pattern or a guard can, and those need the
+// chain's fall-through. Two arms claiming one tag would need source order to break the tie. Any of
+// the three falls back to the chain.
+private tag_switch(arms: Buf[TArm]) -> Option[TagDispatch]
+    if arms.is_empty() then return None
+
+    for i in 0..<arms.len()
+        if arms.at(i).guard.is_some() then return None
+
+    val last = arms.at(arms.len() - 1)
+    val catch_all = if last.patterns.len() == 1 && !refutable(last.patterns.at(0)) then Some(last)
+    else None
+
+    val tagged_n = if catch_all.is_some() then arms.len() - 1 else arms.len()
+
+    if tagged_n == 0 then return None
+
+    var en: Option[Type] = None
+    var seen: Buf[int] = buf()
+    var out: Buf[(TArm, Buf[int])] = buf()
+
+    for i in 0..<tagged_n
+        val arm = arms.at(i)
+        var tags: Buf[int] = buf()
+
+        for j in 0..<arm.patterns.len()
+            val v = switch_variant(arm.patterns.at(j)) match
+                Some(found) -> found
+                None -> return None
+
+            if en.is_none() then en = Some(v.0)
+            else if en.unwrap() != v.0 then return None
+
+            for k in 0..<seen.len()
+                if seen.at(k) == v.1 then return None
+
+            seen.push(v.1)
+            tags.push(v.1)
+
+        out.push((arm, tags))
+
+    val d = enum_decl(en.unwrap()) match
+        Some(decl) -> decl
+        None -> return None
+
+    Some(TagDispatch(d, out, catch_all))
+end tag_switch
+
+// The enum and tag a pattern decides on, where the tag is the whole of the test. `n @ V(x)` decides
+// on the same tag `V(x)` does; the outer name is bound off the whole value after the branch.
+private switch_variant(p: TPattern) -> Option[(Type, int)] = p match
+    TVariantPattern(enum_ty, variant, args) ->
+        if any_refutable(args) then None else Some((enum_ty, variant.tag))
+    TAtPattern(_, inner) -> switch_variant(*inner)
+    _ -> None
+
+// One `switch` on the discriminant, and one block per arm. The default edge carries what the chain's
+// fallthrough carried: the catch-all arm where the match has one, and otherwise the `unreachable` an
+// exhaustive match ends in -- for a statement match too, wherever the table names every variant.
+private gen_tag_switch(e: *Emit, d: TagDispatch, sv: Val, ty: Type, slot: Val, end_l: string)
+    val tag_val = tag_of(e, d.en, sv)
+
+    var arm_ls: Buf[string] = buf()
+
+    for i in 0..<d.arms.len()
+        arm_ls.push(fresh_label(e, "match.arm"))
+
+    val none_l = if d.catch_all.is_some() then fresh_label(e, "match.arm")
+    else if no_value(ty) && !every_variant(d) then end_l
+    else fresh_label(e, "match.none")
+
+    var table: Buf[(BigInt, string)] = buf()
+
+    for i in 0..<d.arms.len()
+        val tags = d.arms.at(i).1
+
+        for j in 0..<tags.len()
+            table.push((from_int(long(tags.at(j))), arm_ls.at(i)))
+
+    emit_term(e, InSwitch(enum_tag_lty(d.en, e.word_bits), tag_val, none_l, table))
+
+    for i in 0..<d.arms.len()
+        emit_label(e, arm_ls.at(i))
+        gen_arm_body(e, d.arms.at(i).0, sv, ty, slot, end_l)
+
+    d.catch_all match
+        Some(arm) ->
+            emit_label(e, none_l)
+            gen_arm_body(e, arm, sv, ty, slot, end_l)
+        None ->
+            if none_l != end_l
+                emit_label(e, none_l)
+                emit_term(e, InUnreachable)
+end gen_tag_switch
+
+// Whether the switch has a case for every variant of its enum, so that its default edge can only be
+// taken by a value holding no variant at all. A match over an enum is held to exhaustiveness
+// wherever it stands, so a statement match with no catch-all names every variant and its default is
+// exactly as impossible as a value match's. The coverage is read off the table rather than trusted,
+// so a switch that somehow lacks a variant keeps its fall-through.
+private every_variant(d: TagDispatch) -> bool
+    if d.en.variants.is_empty() then return false
+
+    for i in 0..<d.en.variants.len()
+        val tag = d.en.variants.at(i).tag
+        var covered = false
+
+        for j in 0..<d.arms.len()
+            val tags = d.arms.at(j).1
+
+            for k in 0..<tags.len()
+                if tags.at(k) == tag then covered = true
+
+        if !covered then return false
+
+    true
+end every_variant
+
+// An arm's bindings and body, in the block the branch to it has already opened. Only a single
+// pattern may bind, which is what makes one block serve several tags.
+private gen_arm_body(e: *Emit, arm: TArm, sv: Val, ty: Type, slot: Val, end_l: string)
+    push_owned(e)
+
+    if arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
+
+    if no_value(ty) then gen_block_void(e, arm.body)
+    else store_arm_value(e, arm.body, ty, slot)
+
+    pop_owned(e)
+    emit_term(e, InBr(end_l))
+end gen_arm_body
+
+// Every other `match`: each arm tested in turn, falling through to the next one when its pattern or
+// its guard says no. The pattern decides whether the arm is entered, the bindings are made once it
+// is, and a guard runs between the two.
+private gen_arm_chain(e: *Emit, arms: Buf[TArm], sv: Val, ty: Type, slot: Val, end_l: string)
     for i in 0..<arms.len()
         val arm = arms.at(i)
         val body_l = fresh_label(e, "match.arm")
@@ -254,19 +426,7 @@ gen_match(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], ty: Type) -> Val
     // Fallthrough with no matching arm: a value or enum match is exhaustive, so this point is
     // unreachable; a plain scalar statement match simply proceeds.
     if no_value(ty) then emit_term(e, InBr(end_l)) else emit_term(e, InUnreachable)
-
-    emit_label(e, end_l)
-    ends_nowhere(e, ty)
-
-    if no_value(ty) then return VNothing
-
-    val r = fresh_reg(e)
-
-    // The arms each took a count for what they stored, so what comes out of the slot is a value the
-    // enclosing statement owns and releases where its region ends.
-    emit(e, InLoad(r, lty(e, ty), slot, AccPlain, None))
-    own_temp(e, r, ty)
-end gen_match
+end gen_arm_chain
 
 private store_arm_value(e: *Emit, b: TBlock, ty: Type, slot: Val)
     if b.ty == Never then gen_block_void(e, b)

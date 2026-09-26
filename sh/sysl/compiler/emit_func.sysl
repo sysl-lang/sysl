@@ -28,6 +28,17 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
     e.self_variant = f.variant
 
+    // What this body lets the address of out, which is what a call it makes could change under it.
+    var none: Buf[TVal] = buf()
+
+    e.caller_exposed = exposed_in(f.body.stmts, f.body.result, none)
+
+    // Which parameters this function keeps a count of its own for, and which it reads through the
+    // one its caller is holding for the length of the call (`borrowing.sysl`). The slot is written
+    // either way, because the body addresses it like any other local.
+    val found = tail_calls_of(f)
+    val owns = owning(f, e.address_taken.has(f.name), !found.is_empty())
+
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep, so
     // it takes no slot and the emitted signature does not mention it.
     for i in 0..<f.params.len()
@@ -35,6 +46,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
         if !zero_sized(p.1)
             val ty = p.1
+            val owned = owns.has(p.0)
 
             alloca(e, VReg(s"${p.0}.addr"), lty(e, ty))
 
@@ -44,13 +56,15 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
             if e.layout.indirect(ty)
                 emit_memcpy(e, VReg(s"${p.0}.addr"), VReg(s"${p.0}.param"), int(e.layout.size(ty)),
                             int(e.layout.align(ty)))
-                retain_at(e, ty, VReg(s"${p.0}.addr"))
+
+                if owned then retain_at(e, ty, VReg(s"${p.0}.addr"))
             else
                 emit(e, InStore(lty(e, ty), VReg(s"${p.0}.param"), VReg(s"${p.0}.addr"), AccPlain,
                                 None))
-                retain_value(e, ty, VReg(s"${p.0}.param"))
 
-            own_slot(e, p.0, ty)
+                if owned then retain_value(e, ty, VReg(s"${p.0}.param"))
+
+            if owned then own_slot(e, p.0, ty)
 
     // Where the function calls itself as the last thing it does, that call is a jump to here rather
     // than a second frame. The target sits *after* the parameter slots are written and *before*
@@ -61,7 +75,6 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     // The slots themselves are the entry block's and are not re-entered, which is what makes the
     // jump free: every one of them is hoisted, so going round again reuses the frame instead of
     // growing it.
-    val found = tail_calls_of(f)
 
     if !found.is_empty()
         val l = fresh_label(e, "tailrec")

@@ -1,0 +1,576 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **Who holds a count for a by-value argument while the call runs** (`borrowing.sysl`): a caller
+// guarantees the argument stays alive for the length of the call, and a callee reads its parameters
+// through that guarantee and takes nothing at entry -- except where its body rebinds one, jumps back
+// to its own top, or can be called from outside sysl's convention.
+//
+// **The negative cases are the ones that matter**, because a missing count is a use-after-free and
+// not a slow program. Each shape is asserted twice: in the emitted text, which says what was decided,
+// and by running a program whose destructor prints, which says what the decision cost.
+//
+// Ported from the reference's `BorrowedParamTests` and `CallOwnershipTests`, whose sources and
+// expected outputs these are.
+
+private var cc_library_cache: Buf[Program] = buf()
+private var cc_library_read: bool = false
+
+private cc_library() -> Buf[Program]
+    if cc_library_read then return cc_library_cache
+
+    cc_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> cc_library_cache = units
+
+    cc_library_cache
+end cc_library
+
+private cc_no_library() -> bool
+    if cc_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end cc_no_library
+
+private cc_can_run() -> bool
+    if cc_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end cc_can_run
+
+// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
+private cc_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+    val library = cc_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), buf())
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    ir_print_module(lowered.0)
+end cc_ir
+
+// One function's emitted text, from its `define` to the brace that closes it. A function reaching
+// module-level storage is lowered with an environment and carries its name as a suffix
+// (`@$env0.clobber`), so the match is on the tail of the symbol rather than on the whole of it.
+//
+// A module-wide assertion cannot ask this question: `arc.copy.Holder` is what an ordinary assignment
+// emits too, so the answer would be about the whole program rather than the function under test.
+private cc_body(out: string, name: string) -> string
+    val lines = lines_of(out)
+    var b = str_builder()
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !inside && line.starts_with("define ") && cc_names(line, name) then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name'"
+end cc_body
+
+private cc_names(line: string, name: string) -> bool =
+    line.contains("@" + name + "(") || line.contains("." + name + "(") ||
+    line.contains("$" + name + "(")
+
+// How many times `sub` occurs in `s`.
+private cc_count(s: string, sub: string) -> int = int(s.count_of(sub))
+
+// What a program PRINTS, built at the level given.
+private cc_ran(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-convention").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end cc_ran
+
+private cc_run(text: string) -> string = cc_ran(text, DefaultOptimization)
+
+// A payload whose destructor says so, which is how a run test sees a count reach zero.
+private cc_node() -> string = raw"""
+    struct Node
+        v: int
+    impl Drop for Node
+        drop(self) = print("dropped", self.v)
+    struct Holder
+        r: &Node
+    """
+
+// The same, with a one-field wrapper around the holder, for a field to be passed.
+private cc_pair_node() -> string = cc_node() + "struct Pair\n    h: Holder\n"
+
+// A callee that writes memory, which is the whole of what used to forbid the borrow.
+private cc_sink() -> string = raw"""
+    var sink: Holder = Holder(Node(9))
+    take(h: Holder) -> int
+        sink = Holder(Node(8))
+        h.r.v
+    """
+
+// The retain a callee would emit for `h` at entry -- spelled precisely, because a bare
+// `arc.copy.Holder` also matches what an assignment inside the body emits.
+private cc_entry_retain() -> string = "@arc.copy.Holder(%struct.Holder %h.param)"
+
+// -- the callee: a body that can release nothing ---------------------------------------------------
+
+@test("a reader that can release nothing takes no count of its own")
+cc_a_leaf_reader_takes_nothing()
+    if cc_no_library() then return
+
+    val out = cc_body(cc_ir(cc_node() + "peek(h: Holder) -> int = h.r.v\nvar n: &Node = Node(1)\n" +
+                            "print(peek(Holder(n)))"), "peek")
+
+    assert(!out.contains("arc.copy"), out)
+    assert(!out.contains("arc.dispose"), out)
+    assert(!out.contains("arc.release"), out)
+end cc_a_leaf_reader_takes_nothing
+
+@test("and the object it borrowed is still released exactly once")
+cc_a_borrowed_object_is_released_once()
+    if !cc_can_run() then return
+
+    assert_eq(cc_run(cc_node() + "peek(h: Holder) -> int = h.r.v\nreport()\n" +
+                     "    var n: &Node = Node(1)\n    print(\"read\", peek(Holder(n)))\n" +
+                     "    print(\"returning\")\nreport()\n"),
+              "read 1\nreturning\ndropped 1\n")
+end cc_a_borrowed_object_is_released_once
+
+@test("a call that does not return leaves the borrow in place")
+cc_a_call_that_does_not_return_keeps_the_borrow()
+    if !cc_can_run() then return
+
+    val src = cc_node() + raw"""
+        gone(v: int) -> never
+            print("past the end", v)
+            exit(1)
+        peek(h: Holder, i: int) -> int
+            if i > 0 then gone(i)
+            h.r.v
+        var n: &Node = Node(1)
+        print(peek(Holder(n), 0))
+        """
+
+    assert(!cc_body(cc_ir(src), "peek").contains("arc.copy"))
+    assert_eq(cc_run(src), "1\ndropped 1\n")
+end cc_a_call_that_does_not_return_keeps_the_borrow
+
+@test("a parameter handed straight back still reaches the caller with a count")
+cc_a_parameter_handed_back_keeps_a_count()
+    if !cc_can_run() then return
+
+    val src = cc_node() + raw"""
+        same(h: Holder) -> Holder = h
+        report()
+            var n: &Node = Node(1)
+            var k = same(Holder(n))
+            print("held", k.r.v)
+        report()
+        print("gone")
+        """
+
+    assert(!cc_body(cc_ir(src), "same").contains("arc.dispose"))
+    assert_eq(cc_run(src), "held 1\ndropped 1\ngone\n")
+end cc_a_parameter_handed_back_keeps_a_count
+
+@test("a parameter holding several references is borrowed as one")
+cc_several_references_are_borrowed_as_one()
+    if !cc_can_run() then return
+
+    val src = raw"""
+        struct Node
+            v: int
+        impl Drop for Node
+            drop(self) = print("dropped", self.v)
+        struct Pair
+            a: &Node
+            b: &Node
+        total(p: Pair) -> int = p.a.v + p.b.v
+        report()
+            var x: &Node = Node(1)
+            var y: &Node = Node(2)
+            print(total(Pair(x, y)))
+        report()
+        print("gone")
+        """
+
+    // `arc.` alone would match the box type `%arc.Node` a field read goes through, which is not a
+    // count at all -- the two calls are what a count costs.
+    val body = cc_body(cc_ir(src), "total")
+
+    assert(!body.contains("arc.copy"), body)
+    assert(!body.contains("arc.dispose"), body)
+    assert_eq(cc_run(src), "3\ndropped 2\ndropped 1\ngone\n")
+end cc_several_references_are_borrowed_as_one
+
+@test("a generic reader is borrowed at the instantiation whose argument is a reference")
+cc_a_generic_reader_is_borrowed()
+    if cc_no_library() then return
+
+    val src = cc_node() + raw"""
+        first[T](xs: []T) -> T = xs[0]
+        var n: &Node = Node(1)
+        var xs: []&Node = [n]
+        print(first(xs).v)
+        """
+
+    // The instantiation for a reference element is the one that would have retained; the returned
+    // element still does, because the caller owns what comes back.
+    assert(!cc_body(cc_ir(src), "first.ref.Node").contains("arc.dispose"))
+end cc_a_generic_reader_is_borrowed
+
+@test("the buffer's own accessor reads its storage without touching a count")
+cc_the_buffer_accessor_touches_no_count()
+    if cc_no_library() then return
+
+    val out = cc_ir("import sysl.buf.buf\nvar b = buf[int]()\nb.push(3)\nprint(b.at(0))\n")
+
+    assert(!cc_body(out, "sysl.buf$Buf.at.int").contains("arc."))
+
+    // The report is a call that does not return rather than a dozen inline ones, which is what
+    // leaves the accessor small enough for a caller to absorb.
+    assert(out.contains("define internal void @sysl.buf$past_end("))
+end cc_the_buffer_accessor_touches_no_count
+
+// The hazard a count exists for at all: the only share of what the parameter refers to is the one the
+// assignment inside gives back. The count is the CALLER's -- `g` is module storage, which the call can
+// write -- and the callee still takes none.
+private cc_clobber() -> string = cc_node() + raw"""
+    var g: Holder = Holder(Node(1))
+    clobber(h: Holder) -> int
+        g = Holder(Node(2))
+        h.r.v
+    print(clobber(g))
+    """
+
+@test("so nothing is taken at entry")
+cc_a_module_writer_takes_nothing_at_entry()
+    if cc_no_library() then return
+
+    assert(!cc_body(cc_ir(cc_clobber()), "clobber").contains(cc_entry_retain()))
+end cc_a_module_writer_takes_nothing_at_entry
+
+@test("and what it read is the object it was given")
+cc_a_module_writer_reads_what_it_was_given()
+    if !cc_can_run() then return
+
+    assert(cc_run(cc_clobber()).contains("1\n"))
+end cc_a_module_writer_reads_what_it_was_given
+
+@test("a reader that reassigns its own parameter keeps its count, because the assignment gives one back")
+cc_a_reassigned_parameter_keeps_its_count()
+    if cc_no_library() then return
+
+    val src = cc_node() + raw"""
+        peek(h: Holder) -> int
+            h = Holder(Node(2))
+            h.r.v
+        var n: &Node = Node(1)
+        print(peek(Holder(n)))
+        """
+
+    assert(cc_body(cc_ir(src), "peek").contains(cc_entry_retain()))
+end cc_a_reassigned_parameter_keeps_its_count
+
+@test("a reader that calls something")
+cc_a_reader_that_calls_takes_nothing()
+    if !cc_can_run() then return
+
+    val src = cc_node() + raw"""
+        side() = print("side")
+        peek(h: Holder) -> int
+            side()
+            h.r.v
+        var n: &Node = Node(1)
+        print(peek(Holder(n)))
+        """
+
+    assert(!cc_body(cc_ir(src), "peek").contains(cc_entry_retain()))
+    assert_eq(cc_run(src), "side\n1\ndropped 1\n")
+end cc_a_reader_that_calls_takes_nothing
+
+@test("a reader that captures its parameter in a closure")
+cc_a_reader_that_captures_takes_nothing()
+    if !cc_can_run() then return
+
+    val src = cc_node() + raw"""
+        peek(h: Holder) -> int
+            var f = () -> h.r.v
+            f()
+        var n: &Node = Node(1)
+        print(peek(Holder(n)))
+        """
+
+    assert(!cc_body(cc_ir(src), "peek").contains(cc_entry_retain()))
+    assert_eq(cc_run(src), "1\ndropped 1\n")
+end cc_a_reader_that_captures_takes_nothing
+
+@test("a reader with a contract")
+cc_a_reader_with_a_contract_takes_nothing()
+    if !cc_can_run() then return
+
+    val src = cc_node() + raw"""
+        peek(h: Holder) -> int
+            require h.r.v > 0
+            h.r.v
+        var n: &Node = Node(1)
+        print(peek(Holder(n)))
+        """
+
+    assert(!cc_body(cc_ir(src), "peek").contains(cc_entry_retain()))
+    assert_eq(cc_run(src), "1\ndropped 1\n")
+end cc_a_reader_with_a_contract_takes_nothing
+
+@test("a reader that writes through a pointer at what it was passed")
+cc_a_reader_writing_through_a_pointer()
+    if !cc_can_run() then return
+
+    val src = cc_node() + raw"""
+        swap(h: Holder, out: *Holder) -> int
+            *out = Holder(Node(2))
+            h.r.v
+        var g: Holder = Holder(Node(1))
+        print(swap(g, &g))
+        """
+
+    assert(!cc_body(cc_ir(src), "swap").contains(cc_entry_retain()))
+    assert(cc_run(src).contains("1\n"))
+end cc_a_reader_writing_through_a_pointer
+
+// -- the caller: which argument costs a count --------------------------------------------------------
+
+// `outer`'s own parameter is a slot no callee has a name for, so passing it on asks nothing of this
+// frame -- and `take` writes module storage, the body the old callee-side rule refused the borrow to.
+private cc_local_src() -> string =
+    cc_pair_node() + cc_sink() + "outer(h: Holder) -> int = take(h)\nvar n: &Node = Node(1)\n" +
+    "print(outer(Holder(n)))\nprint(\"end\")\n"
+
+@test("nothing at the call site")
+cc_a_local_argument_costs_nothing_at_the_call()
+    if cc_no_library() then return
+
+    assert(!cc_body(cc_ir(cc_local_src()), "outer").contains("arc."))
+end cc_a_local_argument_costs_nothing_at_the_call
+
+@test("nothing in the callee's prologue")
+cc_a_local_argument_costs_nothing_in_the_callee()
+    if cc_no_library() then return
+
+    assert(!cc_body(cc_ir(cc_local_src()), "take").contains(cc_entry_retain()))
+end cc_a_local_argument_costs_nothing_in_the_callee
+
+@test("and the object it was given is the one it read, let go of exactly once")
+cc_a_local_argument_is_let_go_once()
+    if !cc_can_run() then return
+
+    assert_eq(cc_run(cc_local_src()), "dropped 9\n1\nend\ndropped 1\ndropped 8\n")
+end cc_a_local_argument_is_let_go_once
+
+// The count is on the LOADED VALUE, not at the field, which is what makes it a snapshot: the call is
+// free to overwrite `p.h` and the release afterwards still reaches what was passed.
+private cc_field_src() -> string =
+    cc_pair_node() + cc_sink() + "via(p: Pair) -> int = take(p.h)\nvar n: &Node = Node(1)\n" +
+    "print(via(Pair(Holder(n))))\nprint(\"end\")\n"
+
+@test("exactly one retain and one release, both in the caller")
+cc_a_field_argument_costs_one_pair()
+    if cc_no_library() then return
+
+    val out = cc_body(cc_ir(cc_field_src()), "via")
+
+    assert_eq(cc_count(out, "@arc.copy.Holder("), 1)
+    assert_eq(cc_count(out, "@arc.dispose.Holder("), 1)
+end cc_a_field_argument_costs_one_pair
+
+@test("and still nothing in the callee")
+cc_a_field_argument_costs_nothing_in_the_callee()
+    if cc_no_library() then return
+
+    assert(!cc_body(cc_ir(cc_field_src()), "take").contains(cc_entry_retain()))
+end cc_a_field_argument_costs_nothing_in_the_callee
+
+@test("and everything is let go of exactly once")
+cc_a_field_argument_is_let_go_once()
+    if !cc_can_run() then return
+
+    assert_eq(cc_run(cc_field_src()), "dropped 9\n1\nend\ndropped 1\ndropped 8\n")
+end cc_a_field_argument_is_let_go_once
+
+private cc_temp_src() -> string =
+    cc_pair_node() + cc_sink() + "make() -> &Node = Node(2)\nreport()\n" +
+    "    print(take(Holder(make())))\nreport()\nprint(\"end\")\n"
+
+@test("nothing is retained at the call site")
+cc_a_temporary_is_not_retained()
+    if cc_no_library() then return
+
+    assert(!cc_body(cc_ir(cc_temp_src()), "report").contains("@arc.copy.Holder("))
+end cc_a_temporary_is_not_retained
+
+// The one release is the temporary's own, at the end of the statement that made it.
+@test("and the single release is the caller's, after the call")
+cc_a_temporary_is_released_once()
+    if cc_no_library() then return
+
+    assert_eq(cc_count(cc_body(cc_ir(cc_temp_src()), "report"), "@arc.release("), 1)
+end cc_a_temporary_is_released_once
+
+@test("and the temporary is destroyed exactly once, after the call returns")
+cc_a_temporary_is_destroyed_once()
+    if !cc_can_run() then return
+
+    assert_eq(cc_run(cc_temp_src()), "dropped 9\n2\ndropped 2\nend\ndropped 8\n")
+end cc_a_temporary_is_destroyed_once
+
+// The shape the old rule could not be widened to: the only count for what `v` refers to lives in
+// `s.v`, and the callee overwrites `s.v` before reading `v`. The caller's count is what makes it legal.
+private cc_zap_src() -> string = cc_node() + raw"""
+    struct S
+        v: Holder
+        w: Holder
+    zap(v: Holder, s: *S) -> int
+        s.v = Holder(Node(2))
+        v.r.v
+    report()
+        var s = S(Holder(Node(1)), Holder(Node(3)))
+        print(zap(s.v, &s))
+    report()
+    print("end")
+    """
+
+private cc_dropped_lines(out: string) -> int
+    val lines = lines_of(out)
+    var n = 0
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with("dropped") then n += 1
+
+    n
+end cc_dropped_lines
+
+@test("the shape a callee-side rule could never allow: the call frees the place it was passed")
+cc_the_call_frees_the_place_it_was_passed()
+    if !cc_can_run() then return
+
+    val out = cc_run(cc_zap_src())
+
+    assert(out.starts_with("1\n"), out)
+    assert_eq(cc_dropped_lines(out), 3)
+    assert(out.ends_with("end\n"), out)
+end cc_the_call_frees_the_place_it_was_passed
+
+// A store takes a count of its own, which is what makes a borrowed parameter safe to keep.
+@test("a callee that stores its parameter keeps what it stored alive")
+cc_a_stored_parameter_stays_alive()
+    if !cc_can_run() then return
+
+    val src = cc_node() + raw"""
+        var kept: Holder = Holder(Node(9))
+        keep(h: Holder) = kept = h
+        report()
+            var n: &Node = Node(5)
+            keep(Holder(n))
+        report()
+        print("still", kept.r.v)
+        print("end")
+        """
+
+    assert_eq(cc_run(src), "dropped 9\nstill 5\nend\ndropped 5\n")
+end cc_a_stored_parameter_stays_alive
+
+@test("an early return")
+cc_an_early_return_neither_leaks_nor_double_frees()
+    if !cc_can_run() then return
+
+    val src = cc_node() + raw"""
+        early(h: Holder, k: int) -> int
+            if k > 0 then return 7
+            h.r.v
+        report()
+            print(early(Holder(Node(1)), 1))
+            print(early(Holder(Node(2)), 0))
+        report()
+        print("end")
+        """
+
+    assert_eq(cc_run(src), "7\ndropped 1\n2\ndropped 2\nend\n")
+end cc_an_early_return_neither_leaks_nor_double_frees
+
+@test("a path that does not come back")
+cc_a_path_that_does_not_come_back()
+    if !cc_can_run() then return
+
+    val src = cc_node() + raw"""
+        gone(v: int) -> never
+            print("past the end", v)
+            exit(0)
+        edge(h: Holder, k: int) -> int
+            if k > 0 then gone(h.r.v)
+            h.r.v
+        var n: &Node = Node(4)
+        print(edge(Holder(n), 1))
+        """
+
+    assert_eq(cc_run(src), "past the end 4\n")
+end cc_a_path_that_does_not_come_back
+
+@test("the freed-place shape is still right once the optimizer has had its turn")
+cc_the_freed_place_shape_survives_the_optimizer()
+    if !cc_can_run() then return
+
+    val out = cc_ran(cc_zap_src(), "2")
+
+    assert(out.starts_with("1\n"), out)
+    assert_eq(cc_dropped_lines(out), 3)
+end cc_the_freed_place_shape_survives_the_optimizer
