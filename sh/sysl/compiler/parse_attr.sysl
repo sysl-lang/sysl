@@ -95,7 +95,8 @@ parse_attr_list(p: *Parser) -> Buf[Attr]
     out
 end parse_attr_list
 
-// The annotations a member may carry, which are the ones about a parameter.
+// The annotations a member may carry: the ones about a parameter, and the three about the function
+// the member lowers to.
 parse_member_attrs(p: *Parser) -> Buf[Attr]
     var out: Buf[Attr] = buf()
 
@@ -114,7 +115,7 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
             if word == "assert"
                 p.fault(at, "'@assert' stands where a declaration stands, and a type's body holds its members — write it beside the type rather than inside it, where 'sizeof' and 'offsetof' still name what it is about")
             else
-                p.fault(at, "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@reads' and '@writes'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')")
+                p.fault(at, "the only annotations a member may carry are the ones about a parameter — '@crossing', '@borrows', '@reads' and '@writes' — and the three about the function it lowers to, '@noinline', '@inline' and '@cold'. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')")
 
             skip_line(p)
             break
@@ -131,7 +132,7 @@ parse_member_attrs(p: *Parser) -> Buf[Attr]
 end parse_member_attrs
 
 private member_attr_word(w: string) -> bool
-    for word in ["crossing", "borrows", "reads", "writes"]
+    for word in ["crossing", "borrows", "reads", "writes", "noinline", "inline", "cold"]
         if word == w then return true
 
     false
@@ -194,11 +195,26 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "crossing" then return Some(Crossing(parse_named_list(p, "crossing")))
     if word == "borrows" then return Some(Borrows(parse_named_list(p, "borrows")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
+    if word == "noinline" then return no_inlining_args(p, NoInline, "whether a call stays a call is the whole of what it says")
+    if word == "inline" then return no_inlining_args(p, Inline, "it raises what the inliner will spend on this definition rather than naming a number")
+    if word == "cold" then return no_inlining_args(p, Cold, "how rare a rare path is is not a number a program has")
 
-    p.fault(at, s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, '@packed' and '@align(n)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
+    p.fault(at, s"'${word}' is not an annotation a declaration takes — '@test', '@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', '@ghost', '@export', '@noinline', '@inline', '@cold', '@reads(...)', '@writes(...)' and '@crossing(...)' mark a function, '@packed' and '@align(n)' mark a struct's layout, '@export(\"...\")' names a struct in a generated C header, '@section(\"...\")' marks either a binding or a function, and '@needs(...)' marks a function or an 'extern'. '@no_<capability>', '@requires(...)', '@link(\"...\")' and '@tests' belong in the file's header")
     skip_line(p)
     None
 end parse_attribute
+
+// `@noinline`, `@inline` or `@cold`, none of which takes an argument (`reference/attributes.md §
+// @noinline, @inline and @cold`). A `(` after one is a sentence rather than a parse failure for the
+// reason a hook's is: the word has been read, so there is nothing else the line could have been.
+private no_inlining_args(p: *Parser, a: Attr, because: string) -> Option[Attr]
+    if p.at_kw("(")
+        p.fault(p.here(), s"'@${attr_word(a)}' takes no arguments — ${because}")
+        skip_line(p)
+    end if
+
+    Some(a)
+end no_inlining_args
 
 private hook_attr(p: *Parser, at: Span, kind: HookKind) -> Attr
     if p.at_kw("(")
@@ -378,6 +394,9 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Section(s) -> f.section = Some(s)
             Crossing(ns) -> f.crossing = ns
             Needs(cs) -> f.needs = cs
+            NoInline -> f.marks.noinline = true
+            Inline -> f.marks.inline = true
+            Cold -> f.marks.cold = true
             _ -> ()
 end apply_func_attrs
 
@@ -388,6 +407,9 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Borrows(ns) -> m.borrows = ns
             Reads(ns) -> m.reads = Some(ns)
             Writes(ns) -> m.writes = Some(ns)
+            NoInline -> m.marks.noinline = true
+            Inline -> m.marks.inline = true
+            Cold -> m.marks.cold = true
             _ -> ()
 end apply_member_attrs
 
@@ -482,6 +504,10 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     var frame = false
     var packed = false
     var section = false
+    var ghost = false
+    var noinline = false
+    var inline = false
+    var marks = ""
 
     for i in 0..<attrs.len()
         attrs.at(i) match
@@ -492,7 +518,12 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
             Writes(_) -> frame = true
             Packed -> packed = true
             Section(_) -> section = true
+            Ghost -> ghost = true
+            NoInline -> noinline = true
+            Inline -> inline = true
             _ -> ()
+
+        if is_inlining(attrs.at(i)) then marks = joined(marks, attr_word(attrs.at(i)))
 
     // `@test` and the four hooks each say *when* `sysl test` calls the function, and they name four
     // different moments. Two of them above one declaration is two requests, not a stricter one.
@@ -506,12 +537,30 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
                 _ -> ()
 
         p.fault(p.here(), s"${named} each say when 'sysl test' calls this function, and they name different moments — a function is a test or one of the hooks around one, and it is called once")
+        return
     end if
 
     // `@pure` *is* `@reads() @writes()` plus its further bans, so the two together say one thing
     // twice -- and could be made to disagree, leaving nothing to say which claim was held to.
     if pure && frame
         p.fault(p.here(), "'@pure' already says '@reads()' and '@writes()', so a frame beside it says one thing twice — write the frame alone if the function touches module storage, and '@pure' alone if it touches none")
+        return
+    end if
+
+    // `@noinline` forbids inlining and `@inline` asks for it, so the two above one declaration are
+    // contradictory requests rather than a stronger one. Answered before `@ghost` is looked at,
+    // because the pair is wrong whatever else stands beside it.
+    if noinline && inline
+        p.fault(p.here(), "'@noinline' forbids inlining and '@inline' asks for it, so they contradict above one declaration — write the one the definition is for, and '@cold' beside it if it is also reached rarely, which is a different thing to say")
+        return
+    end if
+
+    // `@ghost` erases the function before codegen, so there is no definition for the optimizer to be
+    // told anything about.
+    if ghost && marks != ""
+        p.fault(p.here(), s"${marks} tell the optimizer about a definition, and '@ghost' means there is none — a ghost function is erased before anything is emitted, so nothing is left to keep out of line, to absorb into a caller, or to place away from the hot path")
+        return
+    end if
 
     // `@packed` describes the arrangement of fields within a type and `@section` places one object,
     // so the two cannot be about the same declaration whichever kind it turns out to be.
@@ -524,6 +573,15 @@ private joined(so_far: string, word: string) -> string
 
     s"${so_far} and '@${word}'"
 end joined
+
+// Whether an attribute tells the optimizer how a definition is reached -- `@noinline`, `@inline` and
+// `@cold`. One category because the one thing any of them needs is a definition to be about, which
+// is what `@ghost` takes away.
+private is_inlining(a: Attr) -> bool = a match
+    NoInline -> true
+    Inline -> true
+    Cold -> true
+    _ -> false
 
 private is_layout(a: Attr) -> bool = a match
     Packed -> true

@@ -190,6 +190,26 @@ enum RecvMode
     ByRef(sync: bool)
 end RecvMode
 
+// `@noinline`, `@inline` and `@cold` -- what the optimizer is told about a definition
+// (`reference/attributes.md § @noinline, @inline and @cold`). Each lowers to one of LLVM's bare
+// function attributes on the `define` line and reaches nothing else.
+//
+// **Two of the three are one axis and the third is another.** `noinline` forbids inlining and
+// `inline` asks for it (LLVM's `inlinehint`, a raised budget rather than an instruction), so the
+// pair is refused where it is written; `cold` states a frequency and composes with either. They
+// belong to the **declaration**, so every instantiation of a generic carries them.
+struct FuncMarks
+    noinline: bool
+    cold: bool
+    inline: bool
+
+    // Whether any of the three was written.
+    any(self) -> bool = self.noinline || self.cold || self.inline
+end FuncMarks
+
+// A definition nothing was said about.
+no_marks() -> FuncMarks = FuncMarks(false, false, false)
+
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
     span: Span
@@ -212,6 +232,9 @@ struct MethodDecl
     writes: Option[Buf[string]]
     borrows: Buf[string]
     is_static: bool
+    // `@noinline`, `@cold`, `@inline` -- about the function the member lowers to, so they travel
+    // to the lowered declaration unchanged.
+    marks: FuncMarks
 
     // A property with no written receiver takes one by value, which is what makes `x.area` reach a
     // method the way a field reads.
@@ -254,6 +277,7 @@ struct FuncDecl
     section: Option[string]
     crossing: Buf[string]
     needs: Buf[string]
+    marks: FuncMarks
 end FuncDecl
 
 // `@export` -- the symbol a function is visible under from C.
@@ -306,6 +330,9 @@ enum Attr
     Crossing(names: Buf[string])
     Borrows(names: Buf[string])
     Needs(caps: Buf[string])
+    NoInline
+    Inline
+    Cold
 end Attr
 
 // The word an attribute is written as, which is what a complaint about it names.
@@ -324,6 +351,9 @@ attr_word(a: Attr) -> string = a match
     Crossing(_) -> "crossing"
     Borrows(_) -> "borrows"
     Needs(_) -> "needs"
+    NoInline -> "noinline"
+    Inline -> "inline"
+    Cold -> "cold"
 
 // A foreign function's declaration.
 struct ExternDecl
