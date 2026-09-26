@@ -432,8 +432,8 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
     MultiDecl(names, mutable, values) -> multi_decl(cx, stmt.span, names, mutable, values)
     PatternDecl(pat, mutable, value) -> pattern_decl(cx, stmt.span, pat, mutable, value)
 
-    VarDecl(name, typ, init, _, align, section, _) ->
-        var_decl(cx, stmt.span, name, typ, init, align, section)
+    VarDecl(name, typ, init, _, align, section, thread_local) ->
+        var_decl(cx, stmt.span, name, typ, init, align, section, thread_local)
 
     // A local `val` is a `var` that may not be assigned to again -- same frame, same lifetime, same
     // code. Only the binding differs, so the read-only half is enforced where an assignment target
@@ -564,8 +564,12 @@ push_all(out: *Buf[TStmt], xs: Buf[TStmt])
 // -- the bindings ---------------------------------------------------------------------------------
 
 private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
-                 init: Option[Expr], align: Option[Expr], section: Option[string]) -> Buf[TStmt]
+                 init: Option[Expr], align: Option[Expr], section: Option[string],
+                 thread_local: bool) -> Buf[TStmt]
     no_section(cx, span, name, section)
+
+    // One refusal per declaration, as the reference's first one ends the statement.
+    if section.is_none() then no_thread_local(cx, span, name, thread_local)
 
     val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
 
@@ -651,6 +655,18 @@ private no_section(cx: &Analyzer, span: Span, name: string, section: Option[stri
              s"\"${section.unwrap()}\" — its storage is the frame of whichever call is running, " +
              "and a section is a region of the image the linker decides once. Declare it as " +
              "module storage, outside every function, for a section to be about")
+
+// `@thread_local` above a **local**, refused here for `no_section`'s reason: the grammar cannot
+// tell module storage from a local, and this is the first place that can. A local already belongs
+// to one thread -- its storage is the frame of whichever call is running, and a frame is one
+// thread's stack -- so the attribute asks for something the declaration already has.
+private no_thread_local(cx: &Analyzer, span: Span, name: string, thread_local: bool)
+    if !thread_local then return
+
+    cx.fault(span, s"'$name' is a local, and a local is already one thread's: its storage is the " +
+             "frame of whichever call is running, and every thread has a stack of its own. " +
+             "'@thread_local' marks module storage, which is otherwise one object the whole " +
+             "program shares — declare it outside every function for the attribute to say anything")
 
 // `@align(n)` above a binding, folded to the boundary it named. A refusal costs the annotation and
 // not the declaration, which is what lets the rest of the function still be read.

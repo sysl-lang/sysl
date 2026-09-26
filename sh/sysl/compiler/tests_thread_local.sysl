@@ -2,12 +2,19 @@ module sh.sysl.compiler
 @tests
 
 import sh.sysl.parsing.*
-import sysl.text.Search
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
 
 // `@thread_local` -- one copy of a module `var`'s storage per thread
 // (`reference/attributes.md § @thread_local`) -- and `@export` above a `type`
-// (`reference/ffi.md § Naming a type`), as far as the grammar and the untyped tree go: which
-// declarations may carry them, and that each lands on the node the reference's `emit-ast` prints.
+// (`reference/ffi.md § Naming a type`): which declarations may carry them, that each lands on the
+// node the reference's `emit-ast` prints, and -- for `@thread_local` -- what the analysis refuses,
+// what the back end is told, and what two threads running the program actually see.
+//
+// The two frictions the same change fixed are here too: two string literals joined fold to a
+// constant, and a declared function claims its name in call position ahead of a conversion.
 
 // The untyped tree of a file as `emit-ast --no-spans` prints it.
 private tl_tree(text: string) -> string
@@ -84,6 +91,424 @@ tl_written_twice()
 tl_the_several_sentence_is_chosen_by_the_whole_set()
     assert(pf_err("@align(8)\nstatic var a, b = 1, 2\n").starts_with("'@align(n)' is the boundary"))
     assert(pf_err("@align(8)\n@section(\".x\")\nstatic var a, b = 1, 2\n").starts_with("'@section(\"...\")' places one object"))
+
+// -- what the analysis and the back end make of it ------------------------------------------------
+
+private var tl_library_cache: Buf[Program] = buf()
+private var tl_library_read: bool = false
+
+// The standard library's units for the host, read once.
+private tl_library() -> Buf[Program]
+    if tl_library_read then return tl_library_cache
+
+    tl_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tl_library_cache = units
+
+    tl_library_cache
+end tl_library
+
+private tl_no_library() -> bool
+    if tl_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end tl_no_library
+
+private tl_can_run() -> bool
+    if tl_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end tl_can_run
+
+// The library's units for a target other than the host, read for it afresh.
+private tl_library_for(t: Target) -> Buf[Program]
+    if t.name == host_target().name then return tl_library()
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end tl_library_for
+
+// The whole module these files lower to for a target beside the real library -- or, where anything
+// was said about them, every message, one to a line.
+private tl_ir_for(t: Target, files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+    val library = tl_library_for(t)
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return parsed.report.at(0).message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    if !done.reported.is_empty()
+        var said = str_builder()
+
+        for i in 0..<done.reported.len()
+            said.push(done.reported.at(i).diag.message)
+            said.push("\n")
+
+        return said.finish()
+    end if
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), buf())
+
+    ir_print_module(codegen_with_gaps(kept, t, promotions).0)
+end tl_ir_for
+
+private tl_ir(text: string) -> string = tl_ir_for(host_target(), [("main.sysl", text)])
+
+private tl_on(name: string, text: string) -> string =
+    tl_ir_for(target_named(name).unwrap(), [("main.sysl", text)])
+
+// What a program built from these files does: what it printed, and whether it exited zero.
+private tl_outcome(files: []const (string, string)) -> (string, bool)
+    val root = make_temp_dir("sysl-thread-local").unwrap()
+
+    make_dir_all(root).unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end tl_outcome
+
+// **What a program PRINTS**, where it runs to the end.
+private tl_ran_files(files: []const (string, string)) -> string
+    val out = tl_outcome(files)
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+end tl_ran_files
+
+private tl_ran(text: string) -> string = tl_ran_files([("main.sysl", text)])
+
+private tl_threading() -> string = "import sysl.posix.threads.*\n\n"
+
+@test("a 'static var' becomes a thread-local global")
+tl_a_static_var_becomes_thread_local()
+    if tl_no_library() then return
+
+    val out = tl_ir("@thread_local\nstatic var n: u32 = 7u32\nprint(n)")
+
+    assert(out.contains("thread_local global i32 7"), out)
+
+// Asserted against the object's own line rather than the whole text, the ownership runtime's reaper
+// slot being a `thread_local` of its own in every hosted program.
+@test("one that asks for nothing is an ordinary global, which is what makes that a claim")
+tl_an_unmarked_var_is_an_ordinary_global()
+    if tl_no_library() then return
+
+    val out = tl_ir("static var n: u32 = 7u32\nprint(n)")
+
+    assert(out.contains("global i32 7"), out)
+    assert(!out.contains("thread_local global i32 7"), out)
+
+@test("and so does a plain 'var' in any other file, the two being one declaration")
+tl_a_plain_var_in_another_file()
+    if tl_no_library() then return
+
+    val out = tl_ir_for(host_target(), [("m/m.sysl", "module m\n\n@thread_local\nvar slot: u32 = 0u32\n"),
+                                        ("main.sysl", "print(m.slot)\n")])
+
+    assert(out.contains("thread_local global i32 0"), out)
+
+@test("no thread-local model is written, which leaves the choice to the back end")
+tl_no_model_is_written()
+    if tl_no_library() then return
+
+    val out = tl_ir("@thread_local\nstatic var n: u32 = 0u32\nprint(n)")
+
+    assert(out.contains("thread_local global"), out)
+    assert(!out.contains("thread_local("), out)
+
+@test("a 'var' with no initializer starts every thread at the type's zero")
+tl_no_initializer_is_zero()
+    if tl_no_library() then return
+
+    val out = tl_ir("@thread_local\nstatic var page: [8]u8\nprint(page[0])")
+
+    assert(out.contains("thread_local global [8 x i8] zeroinitializer"), out)
+
+@test("beside '@align(n)'")
+tl_beside_align()
+    if tl_no_library() then return
+
+    val out = tl_ir("@thread_local\n@align(64)\nstatic var page: [8]u8\nprint(page[0])")
+
+    assert(out.contains("thread_local global [8 x i8] zeroinitializer, align 64"), out)
+
+@test("beside '@section(\"...\")'")
+tl_beside_section()
+    if tl_no_library() then return
+
+    val out = tl_ir("@thread_local\n@section(\".tdata\")\nstatic var n: u32 = 0u32\nprint(n)")
+
+    assert(out.contains("thread_local global i32 0, section \".tdata\""), out)
+
+@test("and the order they are written in does not matter")
+tl_the_order_does_not_matter()
+    if tl_no_library() then return
+
+    val out = tl_ir("@section(\".tdata\")\n@align(16)\n@thread_local\nstatic var n: u32 = 0u32\nprint(n)")
+
+    assert(out.contains("thread_local global i32 0, section \".tdata\", align 16"), out)
+
+// The discriminating run for the whole feature: a shared counter reaches ten across the two workers
+// and main reads ten, where a per-thread one leaves each worker at five and main -- which never ran
+// the loop -- at nought.
+@test("each thread counts its own, and the main thread's copy is untouched")
+tl_each_thread_counts_its_own()
+    if !tl_can_run() then return
+
+    assert_eq(tl_ran(tl_threading() +
+                     "@thread_local\nstatic var count: int = 0\n\n" +
+                     "bump(p: *int)\n    var i = 0\n\n    while i < 5\n        count++\n        i++\n\n" +
+                     "    *p = count\n\n" +
+                     "var a = 0\nvar b = 0\nvar one = spawn(&bump, &a).unwrap()\n" +
+                     "var two = spawn(&bump, &b).unwrap()\n\none.join()\ntwo.join()\n" +
+                     "print(a, b, count)"),
+              "5 5 0\n")
+
+@test("a thread-local pointer a worker sets is still null on the thread that never set one")
+tl_a_pointer_set_by_a_worker()
+    if !tl_can_run() then return
+
+    assert_eq(tl_ran(tl_threading() +
+                     "struct Machine\n    id: int\n\n" +
+                     "@thread_local\nstatic var running: *Machine = null\n\n" +
+                     "enter(p: *bool)\n    var m = Machine(9)\n\n    running = &m\n" +
+                     "    *p = running != null && running.id == 9\n\n" +
+                     "var saw = false\n\nspawn(&enter, &saw).unwrap().join()\n" +
+                     "print(saw, running == null)"),
+              "true true\n")
+
+@test("'&name' answers the address of this thread's copy")
+tl_the_address_is_this_threads()
+    if !tl_can_run() then return
+
+    assert_eq(tl_ran(tl_threading() +
+                     "@thread_local\nstatic var slot: int = 0\n\n" +
+                     "fill(p: *bool)\n    var here = &slot\n\n    *here = 42\n    *p = slot == 42\n\n" +
+                     "var wrote = false\n\nspawn(&fill, &wrote).unwrap().join()\n" +
+                     "print(wrote, slot)"),
+              "true 0\n")
+
+@test("a counted value may be held, the storage belonging to one thread by construction")
+tl_a_counted_value_may_be_held()
+    if !tl_can_run() then return
+
+    assert_eq(tl_ran(tl_threading() +
+                     "struct Node\n    value: int\n\n" +
+                     "@thread_local\nstatic var held: Option[&Node] = None\n\n" +
+                     "keep(p: *int)\n    held = Some(Node(3))\n    *p = held.unwrap().value\n\n" +
+                     "var got = 0\n\nspawn(&keep, &got).unwrap().join()\n" +
+                     "print(got, held.is_none())"),
+              "3 true\n")
+
+@test("a call is not one")
+tl_a_call_is_not_a_value()
+    if tl_no_library() then return
+
+    val e = tl_ir("@thread_local\nstatic var n: int = size()\n\nsize() -> int = 4\n\nprint(n)")
+
+    assert(e.contains("every thread gets a copy of the initial value"), e)
+    assert(e.contains("rather than by code that runs per thread"), e)
+
+@test("a literal is")
+tl_a_literal_is_a_value()
+    if tl_no_library() then return
+
+    val out = tl_ir("@thread_local\nstatic var n: int = 4\nprint(n)")
+
+    assert(out.contains("thread_local global"), out)
+
+@test("and so is a 'const', which folds to one")
+tl_a_const_is_a_value()
+    if tl_no_library() then return
+
+    val out = tl_ir("const Start: int = 9\n@thread_local\nstatic var n: int = Start\nprint(n)")
+
+    assert(out.contains("thread_local global i32 9"), out)
+
+@test("and so is a struct of constants")
+tl_a_struct_of_constants_is_a_value()
+    if tl_no_library() then return
+
+    val out = tl_ir("struct Point\n    x: int\n    y: int\n\n" +
+                    "@thread_local\nstatic var origin: Point = Point(1, 2)\nprint(origin.x)")
+
+    assert(out.contains("thread_local global"), out)
+
+@test("the same initializer is fine without the attribute, which is what makes this the rule's own")
+tl_a_call_is_fine_without_the_attribute()
+    if tl_no_library() then return
+
+    val out = tl_ir("static var n: int = size()\n\nsize() -> int = 4\n\nprint(n)")
+
+    assert(out.contains("@n"), out)
+
+@test("a freestanding target names itself")
+tl_a_freestanding_target_names_itself()
+    if tl_no_library() then return
+
+    val e = tl_on("craft-freestanding", "@thread_local\nstatic var n: u32 = 0u32\nprint(n)")
+
+    assert(e.contains("cannot be '@thread_local'"), e)
+    assert(e.contains("craft-freestanding"), e)
+
+@test("and points at the pattern a bare target actually has")
+tl_a_bare_target_points_at_the_port()
+    if tl_no_library() then return
+
+    val e = tl_on("riscv32-freestanding", "@thread_local\nstatic var n: u32 = 0u32\nprint(n)")
+
+    assert(e.contains("let the port's scheduler answer for which task is running"), e)
+
+@test("wasm is freestanding too, the keyword being accepted there and silently meaningless")
+tl_wasm_is_freestanding_too()
+    if tl_no_library() then return
+
+    val e = tl_on("wasm32-freestanding", "@thread_local\nstatic var n: u32 = 0u32\nprint(n)")
+
+    assert(e.contains("cannot be '@thread_local'"), e)
+
+@test("and the same declaration compiles for the target this suite runs on")
+tl_the_host_compiles_it()
+    if tl_no_library() then return
+
+    val out = tl_ir("@thread_local\nstatic var n: u32 = 0u32\nprint(n)")
+
+    assert(out.contains("thread_local global"), out)
+
+@test("a 'var' inside a function")
+tl_a_local_var_is_refused()
+    if tl_no_library() then return
+
+    val e = tl_ir("f() -> int\n    @thread_local\n    var n: int = 1\n    n\n\nprint(f())")
+
+    assert(e.contains("is a local, and a local is already one thread's"), e)
+    assert(e.contains("every thread has a stack of its own"), e)
+
+// The entry file is the case worth pinning: a top-level `var` there is a local of the entry point,
+// which is exactly why the grammar cannot answer this.
+@test("and a top-level 'var' in the file the program starts in, which is one")
+tl_an_entry_file_var_is_refused()
+    if tl_no_library() then return
+
+    val e = tl_ir("@thread_local\nvar n: int = 1\nprint(n)")
+
+    assert(e.contains("is a local, and a local is already one thread's"), e)
+
+@test("while the 'static' spelling beside it is module storage and is accepted")
+tl_the_static_spelling_is_accepted()
+    if tl_no_library() then return
+
+    val out = tl_ir("@thread_local\nstatic var n: int = 1\nprint(n)")
+
+    assert(out.contains("thread_local global"), out)
+
+// -- two string literals joined are a constant ----------------------------------------------------
+
+@test("two string literals joined, which is what lets a long constant be written in pieces")
+tl_two_string_literals_joined()
+    if !tl_can_run() then return
+
+    assert_eq(tl_ran("const greeting: string = \"hello\" + \", \" + \"world\"\nprint(greeting)\n"),
+              "hello, world\n")
+
+@test("including one built out of other constants")
+tl_a_string_constant_of_constants()
+    if !tl_can_run() then return
+
+    assert_eq(tl_ran("const head: string = \"usage: \"\nconst tail: string = \"sysl <command>\"\n" +
+                     "const usage: string = head + tail\nprint(usage)\n"),
+              "usage: sysl <command>\n")
+
+// Folded rather than concatenated at run time, which is what makes it a *constant* expression: a
+// value that had to be built could not stand where a constant stands, and a pattern is one place.
+@test("and it is folded, so the joined value may stand as a pattern")
+tl_a_joined_string_is_a_pattern()
+    if !tl_can_run() then return
+
+    assert_eq(tl_ran("const tag: string = \"ab\" + \"cd\"\ndescribe(s: string) -> string =\n" +
+                     "    s match\n        tag -> \"the tag\"\n        else \"something else\"\n" +
+                     "print(s\"${describe(\"abcd\")} ${describe(\"ab\")}\")\n"),
+              "the tag something else\n")
+
+// -- a declared function claims its name ahead of a conversion ------------------------------------
+
+@test("a nullary one, which is the shape the old diagnostic made unwriteable")
+tl_a_nullary_function_named_for_a_type()
+    if !tl_can_run() then return
+
+    assert_eq(tl_ran("unit() -> int = 7\nprint(unit())\n"), "7\n")
+
+@test("one taking an argument, where the conversion would have been reached with the right count")
+tl_a_function_named_for_a_type_with_an_argument()
+    if !tl_can_run() then return
+
+    assert_eq(tl_ran("int(n: int) -> int = n * 2\nprint(int(21))\n"), "42\n")
+
+@test("and the conversion is untouched wherever the name is nobody's declaration")
+tl_the_conversion_is_untouched()
+    if !tl_can_run() then return
+
+    assert_eq(tl_ran("print(int(3.9), byte(300u32))"), "3 44\n")
+
+// A function in another module takes the name there and nowhere else, so a file that never
+// imported it still writes the conversion.
+@test("a module taking the name does not take it from a file that has not imported the function")
+tl_a_module_function_does_not_take_the_name_elsewhere()
+    if !tl_can_run() then return
+
+    assert_eq(tl_ran_files([("m/m.sysl", "module m\n\nbyte(n: int) -> int = n + 1\n"),
+                            ("main.sysl", "print(m.byte(1), byte(300u32))\n")]),
+              "2 44\n")
 
 // -- `@export` above a `type` -------------------------------------------------------------------
 
