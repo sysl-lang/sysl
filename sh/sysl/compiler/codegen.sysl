@@ -93,11 +93,6 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
         declared_globals.push(ir_extern_global(p.extern_vars.at(i).symbol,
                                                lty(e, p.extern_vars.at(i).ty)))
 
-    val vals = gen_vals(e, p.vals)
-
-    for i in 0..<vals.len()
-        declared_globals.push(vals.at(i))
-
     // A library has no entry point. Emitting one would put a second `main` in every program that
     // linked against it, which the linker reports as a duplicate symbol and nothing else explains.
     // It is built **before** the helpers are, because it is a body like any other and may ask for
@@ -156,10 +151,21 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
         helpers.push(built_helpers.at(i))
 
     // The two words a `bool` renders as, laid down once for the whole module and in front of
-    // everything else it stores.
+    // everything else it stores -- asked for by what the bodies and helpers wrote, so settled before
+    // the storage below is.
     var globals: Buf[IrGlobal] = buf()
+    val bools = e.bool_strs
 
-    if e.bool_strs
+    // **Module storage is laid down LAST, after every body, the entry point and the drain**: a
+    // `val`'s initializer interns its strings as it is written, and the reference writes it once the
+    // helpers are finished, so a string a `val` holds is numbered after every string any body or
+    // helper uses. Built earlier, the entry point's strings are numbered past them instead.
+    val vals = gen_vals(e, p.vals)
+
+    for i in 0..<vals.len()
+        declared_globals.push(vals.at(i))
+
+    if bools
         globals.push(bool_constant("true"))
         globals.push(bool_constant("false"))
 

@@ -3,6 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.text.Search
 
 // What a `string`, a view, a method table, a sink, a `?` and an invariant become.
 //
@@ -1105,3 +1106,79 @@ private shown_parts(spec: string) -> string
 
     s"${p.0}/${p.1}/${p.2}"
 end shown_parts
+
+// -- which strings are numbered first ---------------------------------------------------------------
+
+// A program of two files -- one laying down module storage, one the entry file whose statements are
+// the body of `main` -- lowered the way the driver lowers it, and the whole module's text.
+private str_program_text(defs: string, entry: string) -> string
+    val first = parse(source_of("sh/app/defs.sysl", defs))
+    val second = parse(source_of("sh/app/main.sysl", entry))
+
+    if !first.ok() then return first.report.at(0).message
+    if !second.ok() then return second.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = str_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(first.program)
+    units.push(second.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, done.main_module)
+
+    var own: Buf[string] = buf()
+
+    own.push(module_written(first.program))
+
+    val promotions = post_analysis_checks(done.an, whole, own)
+    val kept = prune(strip_tests(whole), own)
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end str_program_text
+
+// **Module storage is laid down after every body, the entry point and the helpers**, so the string a
+// `val` holds is numbered after every string any of them uses -- `main`'s "one" is `.str1` though
+// `greeting` was declared first. Read out of the reference: `sysl emit-llvm .` over the same two
+// files.
+@test("a val's string is numbered after the entry point's")
+a_vals_string_is_numbered_after_the_entry_points()
+    if no_str_library() then return
+
+    val text = str_program_text("module sh.app\n\nval greeting: string = \"hello\"\n",
+                                "module sh.app\n\nprint(\"one\")\nprint(greeting)\n")
+
+    assert(text.contains(
+               "@sh.app$greeting = private constant { ptr, ptr, i64 } { ptr null, ptr @.str2, i64 5 }\n"),
+           text)
+    assert(text.contains("@.str1 = private constant [4 x i8] c\"one\\00\"\n" +
+                         "@.str2 = private constant [6 x i8] c\"hello\\00\"\n"), text)
+
+    var main_text = ""
+    val texts = func_texts(text)
+
+    for i in 0..<texts.len()
+        if texts.at(i).0 == "main" then main_text = texts.at(i).1
+
+    assert_eq(main_text,
+              "define i32 @main(i32 %argc, ptr %argv) {\n" +
+              "entry:\n" +
+              "  call void @sysl_install_stack_guard()\n" +
+              "  call void @sysl$prints({ ptr, ptr, i64 } { ptr null, ptr @.str1, i64 3 })\n" +
+              "  call void @sysl$printc(i32 10)\n" +
+              "  %t1 = load { ptr, ptr, i64 }, ptr @sh.app$greeting\n" +
+              "  %t2 = extractvalue { ptr, ptr, i64 } %t1, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t2)\n" +
+              "  call void @sysl$prints({ ptr, ptr, i64 } %t1)\n" +
+              "  call void @sysl$printc(i32 10)\n" +
+              "  %t3 = extractvalue { ptr, ptr, i64 } %t1, 0\n" +
+              "  call void @arc.release_maybe(ptr %t3)\n" +
+              "  ret i32 0\n" +
+              "}\n")
+end a_vals_string_is_numbered_after_the_entry_points
