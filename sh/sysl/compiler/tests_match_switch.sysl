@@ -1,0 +1,524 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A `match` decided by a discriminant lowers to ONE `switch`**, whatever order its arms are written
+// in and however many there are (`emit_pattern.sysl`'s `tag_switch`).
+//
+// A chain of `icmp`/`br` reaches the arm an input selects by a run of comparisons as long as the
+// arm's position in the source, and only the optimizer's folding budget stands between that and the
+// program's speed. So every case asks its question of two spellings of one program -- the arms in
+// declaration order, and the arms shuffled. A chain passes the first and fails the second.
+//
+// Ported from the reference's `MatchSwitchTests`, whose sources and expected outputs these are.
+
+private var ms_library_cache: Buf[Program] = buf()
+private var ms_library_read: bool = false
+
+private ms_library() -> Buf[Program]
+    if ms_library_read then return ms_library_cache
+
+    ms_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> ms_library_cache = units
+
+    ms_library_cache
+end ms_library
+
+private ms_no_library() -> bool
+    if ms_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end ms_no_library
+
+private ms_can_run() -> bool
+    if ms_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end ms_can_run
+
+// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
+private ms_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+    val library = ms_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), buf())
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    ir_print_module(lowered.0)
+end ms_ir
+
+// The IR clang's `-O2` leaves of a program.
+private ms_optimized(text: string) -> string
+    val dir = make_temp_dir("sysl-switch").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, ms_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    got.text
+end ms_optimized
+
+// What a program PRINTS.
+private ms_run(text: string) -> string
+    val root = make_temp_dir("sysl-switch-run").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ms_run
+
+// One function's text, from its `define` to the brace that closes it, matched on the tail of the
+// symbol since a function of the entry file may carry an environment's prefix.
+private ms_body(out: string, name: string) -> string
+    val lines = lines_of(out)
+    var b = str_builder()
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !inside && line.starts_with("define ") &&
+           (line.contains("@" + name + "(") || line.contains("." + name + "(") ||
+            line.contains("$" + name + "("))
+            inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line.trim())
+            b.push_char('\n')
+
+    b.finish()
+end ms_body
+
+// Every `switch` in one function, as its case count. The emitter writes a switch on one line and an
+// optimizer across several, so the entries are counted off the bracketed table rather than off lines.
+private ms_switches(out: string, name: string) -> Buf[int]
+    val body = ms_body(out, name)
+    var found: Buf[int] = buf()
+    var from: usize = 0
+
+    loop
+        val at = body.index_of_from("switch ", from) match
+            Some(x) -> x
+            None -> break
+
+        val open = body.index_of_from("[", at).unwrap()
+        val close = body.index_of_from("]", open).unwrap()
+
+        found.push(int(body[open..<close].count_of(", label %")))
+        from = close
+
+    found
+end ms_switches
+
+// The tag comparisons a chain emits, which a switch emits none of.
+private ms_tag_tests(out: string, name: string) -> int = int(ms_body(out, name).count_of("icmp eq i32"))
+
+// Where one function's switch sends a tag no arm names: the first instruction of its default block.
+// The block's label is matched as a prefix, since an optimizer writes `; preds = ...` after it.
+private ms_default(out: string, name: string) -> string
+    val lines = lines_of(ms_body(out, name))
+    var label = ""
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if label == "" && line.starts_with("switch ")
+            val at = line.index_of(", label %").unwrap() + 9
+            var stop = at
+
+            while stop < line.len && line.bytes[stop] != u8(' ') && line.bytes[stop] != u8(',')
+                stop += 1
+
+            label = line[at..<stop]
+
+    if label == "" then return "no switch"
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with(label + ":") && i + 1 < lines.len() then return lines.at(i + 1)
+
+    "no such block"
+end ms_default
+
+// An `n`-variant dataless enum and a function matching every variant, the arms visited in `order`,
+// each yielding `a + 1000 + i` -- or, with `work`, arithmetic that differs per arm, so there is no
+// table of constants for an optimizer to collapse the dispatch into.
+private ms_dispatch(n: int, order: Buf[int], work: bool) -> string
+    var b = str_builder()
+
+    b.push("enum Op\n")
+
+    for i in 0..<n
+        b.push(s"    V$i\n")
+
+    b.push("run(o: Op, a: int) -> int\n    o match\n")
+
+    for k in 0..<order.len()
+        val i = order.at(k)
+
+        if work then b.push(s"        V$i -> (a * ${3 + i % 5} + $i) % 9973\n")
+        else b.push(s"        V$i -> a + ${1000 + i}\n")
+
+    b.push("print(run(V3, 0))\n")
+    b.finish()
+end ms_dispatch
+
+private ms_in_order(n: int) -> Buf[int]
+    var out: Buf[int] = buf()
+
+    for i in 0..<n
+        out.push(i)
+
+    out
+end ms_in_order
+
+private ms_reversed(n: int) -> Buf[int]
+    var out: Buf[int] = buf()
+    var i = n
+
+    while i > 0
+        i -= 1
+        out.push(i)
+
+    out
+end ms_reversed
+
+// The arms sorted by `(i * 37) % 61`, an order that follows nothing.
+private ms_scrambled(n: int) -> Buf[int]
+    var out: Buf[int] = buf()
+
+    for key in 0..<61
+        for i in 0..<n
+            if (i * 37) % 61 == key then out.push(i)
+
+    out
+end ms_scrambled
+
+private ms_one(n: int) -> Buf[int]
+    var out: Buf[int] = buf()
+
+    out.push(n)
+    out
+end ms_one
+
+// -- a match over an enum ----------------------------------------------------------------------------
+
+@test("lowers to one switch carrying every arm")
+ms_one_switch_carries_every_arm()
+    if ms_no_library() then return
+
+    assert_eq(ms_switches(ms_ir(ms_dispatch(60, ms_in_order(60), false)), "run"), ms_one(60))
+end ms_one_switch_carries_every_arm
+
+@test("lowers to the same one switch with its arms reversed")
+ms_reversed_arms_are_one_switch()
+    if ms_no_library() then return
+
+    assert_eq(ms_switches(ms_ir(ms_dispatch(60, ms_reversed(60), false)), "run"), ms_one(60))
+end ms_reversed_arms_are_one_switch
+
+@test("and with its arms in an order that follows nothing")
+ms_scrambled_arms_are_one_switch()
+    if ms_no_library() then return
+
+    assert_eq(ms_switches(ms_ir(ms_dispatch(60, ms_scrambled(60), false)), "run"), ms_one(60))
+end ms_scrambled_arms_are_one_switch
+
+// Forty-two was the number of arms the optimizer's fold reached on one real interpreter, so the arm
+// on either side of it is where a budget would show itself.
+@test("at 42 arms and at 43, which a folding budget would tell apart")
+ms_either_side_of_a_folding_budget()
+    if ms_no_library() then return
+
+    assert_eq(ms_switches(ms_ir(ms_dispatch(42, ms_in_order(42), false)), "run"), ms_one(42))
+    assert_eq(ms_switches(ms_ir(ms_dispatch(43, ms_in_order(43), false)), "run"), ms_one(43))
+end ms_either_side_of_a_folding_budget
+
+@test("and emits no tag comparison at all")
+ms_no_tag_comparison()
+    if ms_no_library() then return
+
+    assert_eq(ms_tag_tests(ms_ir(ms_dispatch(60, ms_in_order(60), false)), "run"), 0)
+end ms_no_tag_comparison
+
+@test("which survives -O2 as one switch, in any arm order")
+ms_one_switch_survives_the_optimizer()
+    if !ms_can_run() then return
+
+    assert_eq(ms_switches(ms_optimized(ms_dispatch(60, ms_in_order(60), true)), "run"), ms_one(60))
+    assert_eq(ms_switches(ms_optimized(ms_dispatch(60, ms_reversed(60), true)), "run"), ms_one(60))
+end ms_one_switch_survives_the_optimizer
+
+@test("a data enum's match switches on the tag read out of the value")
+ms_a_data_enum_switches_on_its_tag()
+    if !ms_can_run() then return
+
+    val src = raw"""
+        enum Shape
+            Circle(r: int)
+            Square(s: int)
+            Point
+        area(x: Shape) -> int
+            x match
+                Circle(r) -> r * 3
+                Square(s) -> s * s
+                Point -> 0
+        print(area(Square(4)))
+        """
+
+    assert_eq(ms_switches(ms_ir(src), "area"), ms_one(3))
+    assert_eq(ms_run(src), "16\n")
+end ms_a_data_enum_switches_on_its_tag
+
+@test("an arm serving two variants is two entries pointing at one block")
+ms_an_arm_serving_two_variants()
+    if !ms_can_run() then return
+
+    val src = raw"""
+        enum Op
+            A
+            B
+            C
+        code(o: Op) -> int
+            o match
+                A | B -> 1
+                C -> 2
+        print(code(B))
+        """
+
+    assert_eq(ms_switches(ms_ir(src), "code"), ms_one(3))
+    assert_eq(ms_run(src), "1\n")
+end ms_an_arm_serving_two_variants
+
+@test("a catch-all arm becomes the switch's default")
+ms_a_catch_all_is_the_default()
+    if !ms_can_run() then return
+
+    val src = raw"""
+        enum Op
+            A
+            B
+            C
+        code(o: Op) -> int
+            o match
+                A -> 1
+                _ -> 2
+        print(code(C))
+        """
+
+    assert_eq(ms_switches(ms_ir(src), "code"), ms_one(1))
+    assert_eq(ms_run(src), "2\n")
+end ms_a_catch_all_is_the_default
+
+@test("a named catch-all still binds the whole value")
+ms_a_named_catch_all_binds()
+    if !ms_can_run() then return
+
+    val src = raw"""
+        enum Op
+            A
+            B
+        code(o: Op) -> int
+            o match
+                A -> 1
+                other -> int(other) + 10
+        print(code(B))
+        """
+
+    assert_eq(ms_switches(ms_ir(src), "code"), ms_one(1))
+    assert_eq(ms_run(src), "11\n")
+end ms_a_named_catch_all_binds
+
+// -- the shapes that keep the chain, because the tag alone does not decide them -------------------------
+
+@test("a guarded arm")
+ms_a_guarded_arm_keeps_the_chain()
+    if !ms_can_run() then return
+
+    val src = raw"""
+        enum Op
+            Add(n: int)
+            Nop
+        code(o: Op) -> int
+            o match
+                Add(n) if n > 10 -> 1
+                Add(n) -> 2
+                Nop -> 3
+        print(code(Add(4)))
+        """
+
+    assert(ms_switches(ms_ir(src), "code").is_empty())
+    assert_eq(ms_run(src), "2\n")
+    assert_eq(ms_run(replace_all(src, "Add(4)", "Add(40)")), "1\n")
+end ms_a_guarded_arm_keeps_the_chain
+
+@test("an arm whose payload is itself tested")
+ms_a_tested_payload_keeps_the_chain()
+    if !ms_can_run() then return
+
+    val src = raw"""
+        enum Op
+            Add(n: int)
+            Nop
+        code(o: Op) -> int
+            o match
+                Add(0) -> 1
+                Add(n) -> 2
+                Nop -> 3
+        print(code(Add(0)))
+        """
+
+    assert(ms_switches(ms_ir(src), "code").is_empty())
+    assert_eq(ms_run(src), "1\n")
+    assert_eq(ms_run(replace_all(src, "Add(0))", "Add(6))")), "2\n")
+end ms_a_tested_payload_keeps_the_chain
+
+// Sixty arms, every one of them taken, through a switch whose entries are in no useful order.
+@test("every arm of a sixty-arm match answers for its own variant")
+ms_every_arm_of_sixty_answers()
+    if !ms_can_run() then return
+
+    var src = replace_all(ms_dispatch(60, ms_scrambled(60), false), "print(run(V3, 0))\n", "")
+    var want = str_builder()
+
+    for i in 0..<60
+        src = src + s"print(run(V$i, 0))\n"
+        want.push(s"${1000 + i}\n")
+
+    assert_eq(ms_run(src), want.finish())
+end ms_every_arm_of_sixty_answers
+
+// -- a statement match naming every variant ----------------------------------------------------------
+
+// Every arm writes a local and none yields anything, which is the shape of an interpreter's dispatch.
+// A catch-all takes the last variant's place, so that it has something left to cover.
+private ms_statement_dispatch(n: int, catch_all: bool) -> string
+    var b = str_builder()
+
+    b.push("enum Op\n")
+
+    for i in 0..<n
+        b.push(s"    V$i\n")
+
+    b.push("run(o: Op, a: int) -> int\n    var r = a\n    o match\n")
+
+    val named = if catch_all then n - 1 else n
+
+    for i in 0..<named
+        b.push(s"        V$i -> r = r * ${3 + i % 5} + $i\n")
+
+    if catch_all then b.push("        _ -> r = 0\n")
+
+    b.push("    r\nprint(run(V3, 1))\n")
+    b.finish()
+end ms_statement_dispatch
+
+@test("sends the default to unreachable, not to the merge")
+ms_a_statement_match_default_is_unreachable()
+    if ms_no_library() then return
+
+    assert_eq(ms_default(ms_ir(ms_statement_dispatch(60, false)), "run"), "unreachable")
+end ms_a_statement_match_default_is_unreachable
+
+@test("and the optimizer keeps it unreachable, so no range check survives")
+ms_the_optimizer_keeps_it_unreachable()
+    if !ms_can_run() then return
+
+    assert_eq(ms_default(ms_optimized(ms_statement_dispatch(60, false)), "run"), "unreachable")
+end ms_the_optimizer_keeps_it_unreachable
+
+@test("for a data enum's tag too")
+ms_a_data_enum_statement_default_is_unreachable()
+    if !ms_can_run() then return
+
+    val src = raw"""
+        enum Shape
+            Circle(r: int)
+            Square(s: int)
+            Point
+        area(x: Shape) -> int
+            var a = 0
+            x match
+                Circle(r) -> a = r * 3
+                Square(s) -> a = s * s
+                Point -> a = 7
+            a
+        print(area(Square(4)))
+        print(area(Point))
+        """
+
+    assert_eq(ms_default(ms_ir(src), "area"), "unreachable")
+    assert_eq(ms_run(src), "16\n7\n")
+end ms_a_data_enum_statement_default_is_unreachable
+
+@test("and every arm still answers for its own variant")
+ms_every_statement_arm_answers()
+    if !ms_can_run() then return
+
+    var src = replace_all(ms_statement_dispatch(60, false), "print(run(V3, 1))\n", "")
+    var want = str_builder()
+
+    for i in 0..<60
+        src = src + s"print(run(V$i, 1))\n"
+        want.push(s"${3 + i % 5 + i}\n")
+
+    assert_eq(ms_run(src), want.finish())
+end ms_every_statement_arm_answers
+
+// A catch-all is what the default is for, so it keeps its block whatever the other arms cover.
+@test("but a catch-all arm is still the default")
+ms_a_catch_all_keeps_its_block()
+    if ms_no_library() then return
+
+    assert(ms_default(ms_ir(ms_statement_dispatch(4, true)), "run") != "unreachable")
+end ms_a_catch_all_keeps_its_block

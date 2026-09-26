@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.math.bigint.from_int
 
 // **The substrate a body is written into**: registers, basic blocks, the entry-block prologue, and
@@ -179,6 +180,14 @@ struct Emit
     // the declaration is out of sight.
     ref_places: Buf[(string, TExpr)]
 
+    // The two sides of the argument convention (`borrowing.sysl`). What the body being lowered let
+    // the address of out, which is what a call it makes could change under it; the functions whose
+    // bodies can release nothing, so a place handed to one needs no count; and the functions whose
+    // address the program takes, which a caller outside sysl's convention may reach.
+    caller_exposed: Set[string]
+    inert: Set[string]
+    address_taken: Set[string]
+
     // The first form this body reached that nothing here lowers. A body that has one is not emitted.
     gap: Option[string]
 end Emit
@@ -320,7 +329,8 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          foreigns, variadics, variadic_types, export_symbols, ensures, None, "", tail_calls, tail_params,
          "", self_params, None, ghost_funcs, destructors, false, false, false,
          false, boxes, bufs, requested, queue, temps, temp_marks, owned_slots, owned_marks, defers,
-         defer_marks, promoted, promoted_boxes, promoted_temps, ref_places, None)
+         defer_marks, promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
+         set(), set(), None)
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -372,6 +382,7 @@ start_function(e: *Emit)
     e.defer_marks.clear()
     e.promoted_boxes.clear()
     e.ref_places.clear()
+    e.caller_exposed = exposed_unknown()
     e.gap = None
 end start_function
 
