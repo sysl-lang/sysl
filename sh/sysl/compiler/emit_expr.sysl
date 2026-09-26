@@ -1094,11 +1094,20 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
 
     // A sysl definition's tail is named the way a foreign one's is: by the callee's whole function
     // type, since the argument list alone does not say where the declared parameters stop.
-    if is_variadic(e, name) then
-        return gen_sysl_call_at(e, VGlobal(symbol_of(e, name)), arg_vals, ty,
-                                variadic_type_of(e, name))
+    val r = if is_variadic(e, name) then
+        gen_sysl_call_at(e, VGlobal(symbol_of(e, name)), arg_vals, ty, variadic_type_of(e, name))
+    else
+        gen_sysl_call(e, VGlobal(symbol_of(e, name)), arg_vals, ty)
 
-    gen_sysl_call(e, VGlobal(symbol_of(e, name)), arg_vals, ty)
+    // What the callee promised, said again where the caller's own code can be folded against it
+    // (`contract_assume.sysl`). It goes after the call because a postcondition is about the state the
+    // call left behind.
+    val answered = r match
+        VNothing -> None
+        _ -> Some(r)
+
+    assume_ensures(e, name, args, answered)
+    r
 end gen_call
 
 // One end of a varargs walk: the intrinsic call, and the flag that declares the pair.
