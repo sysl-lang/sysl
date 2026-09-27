@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.container.{Map, map}
+import sysl.container.{Map, map, Set, set}
 import sysl.text.Search
 
 // What the program is made of, as the analyzer holds it.
@@ -363,16 +363,42 @@ end SuperCheck
 
 // The names a compilation has produced, held behind a reference so that the undo log can put a
 // trial's back.
+//
+// **The list is the order and the set is the question**: a walk over what was reached reads the
+// names in the order they were first produced, and "was this one produced" is asked at every call
+// the analysis types, so it has to be one lookup rather than a scan of everything produced so far.
+// The two hold exactly the same names, and `forget_past` is what keeps them so across a rewind.
 struct Reached
     names: Buf[string]
+    seen: Set[string]
 
-    holds(self, name: string) -> bool
-        for i in 0..<self.names.len()
-            if self.names.at(i) == name then return true
+    holds(self, name: string) -> bool = self.seen.has(name)
 
-        false
-    end holds
+    // Puts the names back to the first `mark`, taking the ones past it out of the set as well -- a
+    // rewound reading that left one in the set would have a later reading find a name reached that no
+    // reading reached.
+    forget_past(*self, mark: usize)
+        for i in mark..<self.names.len()
+            self.seen.remove(self.names.at(i))
+
+        self.names.truncate(mark)
+    end forget_past
 end Reached
+
+// Nothing reached yet.
+private reached_none() -> &Reached = Reached(buf(), set())
+
+// Records a name in one of the reached sets, through the undo log when a trial is open. A name is
+// kept once.
+private note_reached(names: &Reached, journal: &Journal, name: string)
+    if !names.seen.add(name) then return
+
+    val mark = names.names.len()
+
+    if journal.recording() then journal.record(() -> names.forget_past(mark))
+
+    names.names.push(name)
+end note_reached
 
 // The analyzer's state while the declarations are being read: the tables, what it has to say, and
 // the undo log a speculative walk rewinds through.
@@ -457,40 +483,13 @@ struct Analysis
 
     // Records a name as produced. The set is what matters and not the order, but the order is what
     // a walk over it reads, so a name is kept once.
-    uses(*self, name: string)
-        if self.reached.holds(name) then return
-
-        val set = self.reached
-        val mark = set.names.len()
-
-        if self.journal.recording() then self.journal.record(() -> set.names.truncate(mark))
-
-        set.names.push(name)
-    end uses
+    uses(*self, name: string) = note_reached(self.reached, self.journal, name)
 
     // Records an `extern` as reached, on the same terms and through the same undo log.
-    uses_extern(*self, name: string)
-        if self.externs_reached.holds(name) then return
-
-        val set = self.externs_reached
-        val mark = set.names.len()
-
-        if self.journal.recording() then self.journal.record(() -> set.names.truncate(mark))
-
-        set.names.push(name)
-    end uses_extern
+    uses_extern(*self, name: string) = note_reached(self.externs_reached, self.journal, name)
 
     // Records an `extern` variable as reached, on the same terms and through the same undo log.
-    uses_extern_var(*self, name: string)
-        if self.extern_vars_reached.holds(name) then return
-
-        val set = self.extern_vars_reached
-        val mark = set.names.len()
-
-        if self.journal.recording() then self.journal.record(() -> set.names.truncate(mark))
-
-        set.names.push(name)
-    end uses_extern_var
+    uses_extern_var(*self, name: string) = note_reached(self.extern_vars_reached, self.journal, name)
 
     // The externs reached so far, in the order they were first reached.
     externs_used(self) -> Buf[string] = self.externs_reached.names
@@ -586,7 +585,7 @@ analysis_for(t: Target) -> &Analysis = analysis_producing(t, buf())
 // `Analysis.producing`.
 analysis_producing(t: Target, producing: Buf[string]) -> &Analysis =
     Analysis(tables_for(t), buf(), buf(), journal(), buf(), 0, 0, 0, 0, buf(), buf(), buf(),
-             Reached(buf()), producing, Reached(buf()), Reached(buf()))
+             reached_none(), producing, reached_none(), reached_none())
 
 // -- how far a declaration reaches ---------------------------------------------------------------
 

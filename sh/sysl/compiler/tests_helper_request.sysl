@@ -1,0 +1,71 @@
+module sh.sysl.compiler
+@tests
+
+// What asking for a runtime helper costs as a program grows.
+//
+// **The check has to be no worse than linear in the helpers already asked for**, because a helper is
+// named once per distinct type at the retain/release site that first needs it, and a program with
+// many distinct counted types asks for many of them -- scanning the growing list of names already
+// requested, once per ask, is quadratic in the number of distinct types a large program declares.
+//
+// The claim is a ratio rather than a bound, so it holds on a slow machine as well as a fast one: a
+// program four times larger may cost four times as much to emit and not sixteen times.
+
+import sysl.buf.{Buf, buf}
+import sysl.time.{monotonic, whole_micros}
+
+// `n` distinct struct types, each with a counted field, each walked through a function that forces
+// a retain at its one call site -- so a distinct helper is requested once per type, and the program
+// grows the requested list to `n` entries by the time it is done.
+private helper_program(n: usize) -> string
+    var lines: Buf[string] = buf()
+
+    for i in 0..<n
+        lines.push(s"struct T$i\n    name: string\nend T$i\n\n")
+        lines.push(s"hold$i(p: T$i) -> string = p.name\n\n")
+
+    lines.push("var got: string = \"\"\n\n")
+
+    for i in 0..<n
+        lines.push(s"var v$i = T$i(\"a\")\n")
+        lines.push(s"got = hold$i(v$i)\n")
+
+    var text = ""
+
+    for i in 0..<lines.len()
+        text = text + lines.at(i)
+
+    text
+end helper_program
+
+// The best of three lowerings of one program, in microseconds.
+private helper_emit_cost(n: usize) -> long
+    val done = typed_of(helper_program(n))
+
+    assert(done.reported.is_empty(), "the generated program is sound")
+
+    val p = strip_tests(program_of(done, done.main_module))
+    val promotions = check_escapes(done.an, p)
+
+    var best: long = -1
+
+    for round in 0..<3
+        val started = monotonic()
+        codegen_with_gaps(p, done.an.tables.target, promotions)
+        val took = whole_micros(monotonic() - started)
+
+        if best < 0 || took < best then best = took
+
+    best
+end helper_emit_cost
+
+@test("emitting a program with four times as many distinct counted types costs about four times as much, not sixteen")
+requesting_a_helper_is_not_quadratic()
+    val small = helper_emit_cost(300)
+    val large = helper_emit_cost(1200)
+
+    val ratio = large / (if small > 0 then small else 1)
+
+    assert(ratio < 9,
+           s"a 4x program took ${ratio}x as long to emit its helpers (${small} us, then ${large} us)")
+end requesting_a_helper_is_not_quadratic
