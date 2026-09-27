@@ -1,0 +1,369 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set}
+import sysl.text.Search
+
+// What a contract tells the optimizer (`reference/verification.md § What the optimizer is told`).
+//
+// **A callee's `ensure` is repeated at each call site as an `llvm.assume`**, the caller's arguments in
+// place of the parameters and the returned register in place of `result`, so what a function promised
+// is available where the caller's own code can be folded against it. **And a struct's `invariant` is
+// laid down the same way on entry to every member whose receiver is that struct.** Neither costs the
+// program anything at run time: `llvm.assume` emits no code.
+//
+// **Three things make repeating a postcondition sound, and all three are load-bearing:**
+//
+//  - The callee checks the same condition **before every return**, and the two ways a function can
+//    leave without reaching one -- a tail call and a `become` -- are both refused on a function that
+//    has an `ensures`. So control arriving after the call is control that passed the check.
+//  - Nothing strips that check. The only clause that does not run is one naming a `@ghost` function
+//    (`ghostly`), and those are skipped here by the same test rather than by a second one that could
+//    drift from it.
+//  - The clause reads the same values in both places, which is the rewriting half below: an argument
+//    the call itself can change is not a name the promise was made about.
+//
+// **The clause is written in the callee's vocabulary**, so it is rewritten into the caller's: each
+// parameter becomes the argument that filled it, and `result` stays as it is because the emitter binds
+// it to the returned register while lowering. Re-evaluating an expression somewhere else is sound only
+// where the two readings agree, and three things break that:
+//
+//   1. The clause may not be re-runnable at all -- it may call something, allocate, or trap. That is
+//      decided by lowering it and reading the *instructions* (`assume_clause`), which is a stronger
+//      test than any list of node kinds and cannot go stale. What `port` rules out are the two shapes
+//      that would not even lower in a caller's frame: `old(e)`, whose snapshot slot belongs to the
+//      callee, and `result` where the call left no register to bind it to.
+//   2. An argument may not read the same thing twice -- `f(next())` passes one value and would compute
+//      a second one here, and `f(&n, n)` passes a value the call is then free to overwrite. So an
+//      argument is substituted only where it is `stable`.
+//   3. **The callee may have changed its own copy of a parameter before the check ran.** Where the
+//      body assigns to a parameter, or to a field or element of one, or takes its address, the two
+//      readings are different values; `rebound_body` finds those and they are left alone. Writing
+//      **through** a parameter does not disqualify it, and it is the case the feature exists for:
+//      `self.count = n` through a `*self` writes the caller's own object.
+//
+// A clause that cannot be rewritten, or whose lowering turns out to do anything at all, is simply not
+// repeated -- the program is then exactly what it was before, which is the failure mode this is
+// allowed to have.
+
+// The symbol of the intrinsic, so the declaration and every call spell it the same way.
+llvm_assume() -> string = "llvm.assume"
+
+// Reads the program once for what the two assumes below consult: every function declaring a
+// postcondition worth repeating, with the parameters its **body** may have rebound -- worked out once
+// per function rather than once per call site, the library having call sites in the hundreds -- and
+// every struct's synthesised `invariant` function by the name it is emitted under.
+//
+// A `@ghost` function is not in the first because nothing executable calls one.
+record_contracts(e: *Emit, p: TProgram)
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if !f.ensures.is_empty() && !f.ghost then e.contracted.put(f.name, (f, rebound_body(f.body)))
+
+        if f.name.contains("$inv") then e.inv_funcs.put(f.name, f)
+end record_contracts
+
+// **What a caller is told a call established** -- an `llvm.assume` per postcondition of `name`, laid
+// down after the call has returned. `result` is the register the call answered with, where it left
+// one: a large result never becomes an LLVM value, and a clause mentioning `result` is then left alone.
+assume_ensures(e: *Emit, name: string, args: Buf[TExpr], result: Option[Val])
+    val found = e.contracted.get(name)
+
+    if found.is_none() then return
+
+    val f = found.unwrap().0
+    val written = found.unwrap().1
+
+    for i in 0..<f.ensures.len()
+        val clause = f.ensures.at(i).cond
+
+        if !ghostly(e, clause)
+            val ported = at_call(e, clause, f.params, args, written, result.is_some())
+
+            if ported.is_some()
+                val saved = e.result_ssa
+
+                e.result_ssa = result
+                assume_clause(e, ported.unwrap())
+                e.result_ssa = saved
+end assume_ensures
+
+// **What a member is told about its receiver** -- the struct's `invariant`, laid down on entry to
+// every function whose receiver is a struct that carries clauses.
+//
+// A clause is checked at every write of the struct, at its construction and at its zero, so every
+// value of the type a member can be handed is one that passed the check. What the fact buys is a test
+// the member does not have to make twice -- `Buf.at` compares the index with `count` to panic with the
+// length, and the slice under it compares it with `elems.len`; told `count <= elems.len`, the second
+// compare is implied by the first and folds.
+//
+// **What it rests on is the checking, so what the checking cannot reach is outside it**: bytes written
+// into the struct through a `*T` of another type, or by C, are the writer's promise to keep. Only a
+// clause that lowers to arithmetic and comparisons over the receiver's fields is repeated.
+assume_receiver_invariant(e: *Emit, f: TFunc)
+    if f.params.is_empty() || f.params.at(0).0 != "self" then return
+
+    val ty = f.params.at(0).1
+
+    unqualified(ty) match
+        Struct(d) -> assume_invariant_of(e, f.span, TExpr(f.span, TLoad("self", ty)), *d)
+        Ptr(inner) ->
+            val target = unqualified(*inner)
+
+            target match
+                Struct(d) ->
+                    val recv = TExpr(f.span, TDeref(TExpr(f.span, TLoad("self", ty)), target))
+
+                    assume_invariant_of(e, f.span, recv, *d)
+                _ -> ()
+        _ -> ()
+end assume_receiver_invariant
+
+private assume_invariant_of(e: *Emit, at: Span, recv: TExpr, s: StructType)
+    val found = e.inv_funcs.get(mangled(inv_key(s.base), s.targs))
+
+    if found.is_none() then return
+
+    val inv = found.unwrap()
+
+    if !inv.body.stmts.is_empty() || inv.params.len() != s.fields.len() then return
+    if inv.body.result.is_none() then return
+
+    val clause = inv.body.result.unwrap()
+
+    if ghostly(e, clause) then return
+
+    var sub: Buf[(string, TExpr)] = buf()
+
+    for i in 0..<s.fields.len()
+        sub.push((inv.params.at(i).0, TExpr(at, TField(recv, int(i), s.fields.at(i).1))))
+
+    // **A module-level name is refused here where a postcondition keeps it**, because the two facts
+    // are about different moments: an invariant is assumed at a member's entry, arbitrarily long after
+    // the write that checked it, and a `var` the clause read may have moved in between.
+    val ported = port(clause, sub, false, false)
+
+    if ported.is_some() then assume_clause(e, ported.unwrap())
+end assume_invariant_of
+
+// -- lowering a clause that may do nothing -------------------------------------------------------------
+
+// Lowers `clause` and keeps what it emitted, followed by the `llvm.assume` of its value, **only if
+// every instruction of it is one the program could equally not have run** -- no call, no store, no
+// allocation, no branch, no trap. On anything else the emitted text is taken back out, leaving the
+// function exactly as it was down to the register counter.
+//
+// **The test is on the instructions rather than on the node kinds, which is what keeps it honest.** A
+// whitelist of safe tree shapes is a second copy of what every lowering does, and it goes stale the
+// first time one of them grows a check -- silently, and in the direction that assumes something the
+// callee never established.
+private assume_clause(e: *Emit, clause: TExpr)
+    val hoisted = e.prologue.len()
+    val filed = e.blocks.len()
+    val here = e.current.len()
+    val end_was = e.current_end
+    val label_was = e.current_label
+    val closed = e.terminated
+    val edges = e.reached.len()
+    val scratches = e.scratch.len()
+    val regs = e.temp
+    val labels = e.label
+    val gapped = has_gap(e)
+
+    push_temps(e)
+
+    val ok = gen_expr(e, clause)
+
+    pop_temps(e)
+
+    var pure = !closed && !e.terminated && e.blocks.len() == filed &&
+        e.prologue.len() == hoisted && has_gap(e) == gapped
+
+    if pure
+        for i in here..<e.current.len()
+            if !effect_free(e.current.at(i)) then pure = false
+
+    if pure
+        ok match
+            VNothing -> ()
+            _ ->
+                e.uses_assume = true
+
+                var args: Buf[IrArg] = buf()
+
+                args.push(ir_arg(l_i1(), ok))
+                emit(e, ir_call(None, LVoid, VGlobal(llvm_assume()), args))
+        return
+    end if
+
+    e.prologue.truncate(hoisted)
+
+    // A block filed since is the one that was open, with everything after it: its first `here`
+    // instructions are the ones the open block held.
+    if e.blocks.len() > filed
+        val first = e.blocks.at(filed)
+
+        e.current.clear()
+
+        for i in 0..<here
+            e.current.push(first.instrs.at(i))
+
+        e.blocks.truncate(filed)
+    else
+        e.current.truncate(here)
+
+    e.current_end = end_was
+    e.current_label = label_was
+    e.terminated = closed
+    e.reached.truncate(edges)
+    e.scratch.truncate(scratches)
+    e.temp = regs
+    e.label = labels
+
+    if !gapped then e.gap = None
+end assume_clause
+
+// Whether an instruction computes a value and does nothing else.
+//
+// **Integer division and remainder are excluded although LLVM calls them side-effect free**, because a
+// zero divisor is undefined behaviour: emitting one at a call site introduces a way for the program to
+// be wrong that the source never wrote. Every other arithmetic instruction sysl emits is total.
+private effect_free(i: Inst) -> bool = i match
+    InBin(_, op, _, _, _) -> op != OpSDiv && op != OpUDiv && op != OpSRem && op != OpURem
+    InNeg(_, _, _) -> true
+    InIntCmp(_, _, _, _, _) -> true
+    InFloatCmp(_, _, _, _, _) -> true
+    InCast(_, _, _, _, _) -> true
+    InLoad(_, _, _, _, _) -> true
+    InGep(_, _, _, _) -> true
+    InExtract(_, _, _, _) -> true
+    InInsert(_, _, _, _, _, _) -> true
+    InSelect(_, _, _, _, _, _) -> true
+    InExtractElement(_, _, _, _) -> true
+    InInsertElement(_, _, _, _, _, _) -> true
+    InShuffle(_, _, _, _, _) -> true
+    _ -> false
+
+// -- the clause in the caller's terms ------------------------------------------------------------------
+
+// One clause of a function taking `params`, rewritten for a caller that passed `args`, or nothing where
+// it cannot be. `written` is what the callee's body may have rebound, and `has_result` whether the call
+// left a register for `result` to name.
+private at_call(e: *Emit, clause: TExpr, params: Buf[(string, Type)], args: Buf[TExpr],
+                written: Set[string], has_result: bool) -> Option[TExpr]
+    if written.has(OPAQUE) then return None
+
+    var sub: Buf[(string, TExpr)] = buf()
+    val n = if params.len() < args.len() then params.len() else args.len()
+
+    for i in 0..<n
+        val name = params.at(i).0
+
+        if !written.has(name) && stable(e, args.at(i)) then sub.push((name, args.at(i)))
+
+    port(clause, sub, has_result, true)
+end at_call
+
+// The clause over `sub`'s values, or nothing. A name the substitution has no entry for is one whose
+// argument could not be moved here, and a clause naming it cannot be repeated at all.
+private port(x: TExpr, sub: Buf[(string, TExpr)], has_result: bool, globals: bool) -> Option[TExpr] =
+    *x.kind match
+        TIntLit(_, _) -> Some(x)
+        TFloatLit(_, _) -> Some(x)
+        TBoolLit(_) -> Some(x)
+        TNullLit(_) -> Some(x)
+        TUnitLit -> Some(x)
+        TStrLit(_) -> Some(x)
+        TGlobal(_, _, _) -> if globals then Some(x) else None
+        TResult(_) -> if has_result then Some(x) else None
+
+        // The one node that cannot be moved: the snapshot is a slot in the callee's frame, and a
+        // caller has neither the slot nor the entry value it was taken from.
+        TOld(_, _) -> None
+
+        TLoad(name, _) -> sub_for(sub, name)
+        TField(r, i, ty) -> rebuilt(x.span, port(r, sub, has_result, globals), p -> TField(p, i, ty))
+        TDeref(o, ty) -> rebuilt(x.span, port(o, sub, has_result, globals), p -> TDeref(p, ty))
+        TLen(r, ty) -> rebuilt(x.span, port(r, sub, has_result, globals), p -> TLen(p, ty))
+        TCast(o, ty) -> rebuilt(x.span, port(o, sub, has_result, globals), p -> TCast(p, ty))
+        TAddrOf(p, ty) -> rebuilt(x.span, port(p, sub, has_result, globals), q -> TAddrOf(q, ty))
+        TUnary(op, o, ty) -> rebuilt(x.span, port(o, sub, has_result, globals), p -> TUnary(op, p, ty))
+        TBinary(op, l, r, ty) ->
+            both(x.span, port(l, sub, has_result, globals), port(r, sub, has_result, globals),
+                 (a, b) -> TBinary(op, a, b, ty))
+        TLogical(op, l, r) ->
+            both(x.span, port(l, sub, has_result, globals), port(r, sub, has_result, globals),
+                 (a, b) -> TLogical(op, a, b))
+        TCompare(operands, cmps) -> port_compare(x.span, operands, cmps, sub, has_result, globals)
+        _ -> None
+
+private port_compare(at: Span, operands: Buf[TExpr], cmps: Buf[TCmp], sub: Buf[(string, TExpr)],
+                     has_result: bool, globals: bool) -> Option[TExpr]
+    var ported: Buf[TExpr] = buf()
+
+    for i in 0..<operands.len()
+        val p = port(operands.at(i), sub, has_result, globals)
+
+        if p.is_none() then return None
+
+        ported.push(p.unwrap())
+
+    Some(TExpr(at, TCompare(ported, cmps)))
+end port_compare
+
+private sub_for(sub: Buf[(string, TExpr)], name: string) -> Option[TExpr]
+    for i in 0..<sub.len()
+        if sub.at(i).0 == name then return Some(sub.at(i).1)
+
+    None
+end sub_for
+
+private rebuilt(at: Span, inner: Option[TExpr], k: &Fn(TExpr) -> TExprKind) -> Option[TExpr] =
+    inner match
+        Some(p) -> Some(TExpr(at, k(p)))
+        None -> None
+
+private both(at: Span, l: Option[TExpr], r: Option[TExpr],
+             k: &Fn(TExpr, TExpr) -> TExprKind) -> Option[TExpr]
+    if l.is_none() || r.is_none() then return None
+
+    Some(TExpr(at, k(l.unwrap(), r.unwrap())))
+end both
+
+// Whether reading this argument again, on the instruction after the call it was passed to, reads what
+// the callee was handed.
+//
+// **It is a list of what is allowed rather than of what is not, because the dangerous case is the
+// ordinary-looking one.** `f(&n, n)` hands over a pointer and a value, and the callee is free to write
+// through the pointer before it returns -- so re-reading `n` here yields a number the promise was
+// never made about. The same is true of a global, which any call may write, and of a `ref`, which is
+// somebody else's storage wearing a local's name. What is left is a constant, a local whose address
+// the caller never let out, the address of a slot, and arithmetic over those.
+private stable(e: *Emit, x: TExpr) -> bool = *x.kind match
+    TIntLit(_, _) -> true
+    TFloatLit(_, _) -> true
+    TBoolLit(_) -> true
+    TNullLit(_) -> true
+    TUnitLit -> true
+    TStrLit(_) -> true
+    TLoad(name, _) ->
+        !e.caller_exposed.has(OPAQUE) && !e.caller_exposed.has(name) && !is_promoted(e, name)
+    TAddrOf(p, _) -> *p.kind match
+        TLoad(_, _) -> true
+        TGlobal(_, _, _) -> true
+        _ -> false
+    TCast(o, _) -> stable(e, o)
+    TUnary(_, o, _) -> stable(e, o)
+    TBinary(_, l, r, _) -> stable(e, l) && stable(e, r)
+    TLogical(_, l, r) -> stable(e, l) && stable(e, r)
+    TCompare(operands, _) -> all_stable(e, operands)
+    _ -> false
+
+private all_stable(e: *Emit, xs: Buf[TExpr]) -> bool
+    for i in 0..<xs.len()
+        if !stable(e, xs.at(i)) then return false
+
+    true
+end all_stable

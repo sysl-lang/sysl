@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 
 // Which trees can arrive at one of a named set of functions, and the smallest sub-tree that still
 // can -- the walk a capability check is written in terms of.
@@ -187,12 +188,15 @@ reached_seeds(r: &Reaches, root: &Refs) -> Buf[string]
     if r.seeds.is_empty() then return found
 
     var called: Buf[string] = buf()
+    var called_seen: Set[string] = set()
     var erased: Buf[string] = buf()
+    var erased_seen: Set[string] = set()
     var sites: Buf[(string, int)] = buf()
+    var sites_seen: Set[(string, int)] = set()
     var queue: Buf[string] = buf()
 
-    take_refs(root, &called, &erased, &sites, &queue)
-    drain_calls(r, &called, &erased, &sites, &queue)
+    take_refs(root, &called, &called_seen, &erased, &erased_seen, &sites, &sites_seen, &queue)
+    drain_calls(r, &called, &called_seen, &erased, &erased_seen, &sites, &sites_seen, &queue)
 
     var growing = true
 
@@ -205,16 +209,16 @@ reached_seeds(r: &Reaches, root: &Refs) -> Buf[string]
             for j in 0..<r.vtables.len()
                 val t = r.vtables.at(j)
 
-                if t.name == "" || !holds_string(erased, t.name) then continue
+                if t.name == "" || !erased_seen.has(t.name) then continue
                 if t.trait_name != site.0 || usize(site.1) >= t.slots.len() then continue
 
                 val target = t.slots.at(usize(site.1)).target
 
-                if !holds_string(called, target)
+                if called_seen.add(target)
                     called.push(target)
                     queue.push(target)
 
-        drain_calls(r, &called, &erased, &sites, &queue)
+        drain_calls(r, &called, &called_seen, &erased, &erased_seen, &sites, &sites_seen, &queue)
 
         growing = called.len() != before
 
@@ -224,28 +228,29 @@ reached_seeds(r: &Reaches, root: &Refs) -> Buf[string]
     found
 end reached_seeds
 
-private take_refs(refs: &Refs, called: *Buf[string], erased: *Buf[string],
-                  sites: *Buf[(string, int)], queue: *Buf[string])
+// Each of `called`, `erased` and `sites` keeps a set beside it, so a name already on the list
+// answers "seen" without a scan of the list itself -- the whole point of the sets: the list is what
+// keeps the order the output is read in, the set is what keeps the walk linear.
+private take_refs(refs: &Refs, called: *Buf[string], called_seen: *Set[string],
+                  erased: *Buf[string], erased_seen: *Set[string],
+                  sites: *Buf[(string, int)], sites_seen: *Set[(string, int)],
+                  queue: *Buf[string])
     for i in 0..<refs.erased.len()
-        if !holds_string(*erased, refs.erased.at(i)) then erased.push(refs.erased.at(i))
+        if erased_seen.add(refs.erased.at(i)) then erased.push(refs.erased.at(i))
 
     for i in 0..<refs.sites.len()
-        var have = false
-
-        for j in 0..<sites.len()
-            if sites.at(j).0 == refs.sites.at(i).0 && sites.at(j).1 == refs.sites.at(i).1 then
-                have = true
-
-        if !have then sites.push(refs.sites.at(i))
+        if sites_seen.add(refs.sites.at(i)) then sites.push(refs.sites.at(i))
 
     for i in 0..<refs.calls.len()
-        if !holds_string(*called, refs.calls.at(i))
+        if called_seen.add(refs.calls.at(i))
             called.push(refs.calls.at(i))
             queue.push(refs.calls.at(i))
 end take_refs
 
-private drain_calls(r: &Reaches, called: *Buf[string], erased: *Buf[string],
-                    sites: *Buf[(string, int)], queue: *Buf[string])
+private drain_calls(r: &Reaches, called: *Buf[string], called_seen: *Set[string],
+                    erased: *Buf[string], erased_seen: *Set[string],
+                    sites: *Buf[(string, int)], sites_seen: *Set[(string, int)],
+                    queue: *Buf[string])
     while !queue.is_empty()
         val name = queue.at(queue.len() - 1)
 
@@ -253,7 +258,8 @@ private drain_calls(r: &Reaches, called: *Buf[string], erased: *Buf[string],
 
         val body = summary_of(r, name)
 
-        if body.is_some() then take_refs(body.unwrap(), called, erased, sites, queue)
+        if body.is_some() then
+            take_refs(body.unwrap(), called, called_seen, erased, erased_seen, sites, sites_seen, queue)
 end drain_calls
 
 // Whether this tree arrives at a seed at all.

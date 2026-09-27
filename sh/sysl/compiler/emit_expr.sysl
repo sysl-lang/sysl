@@ -40,6 +40,11 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
     TBytes(receiver) -> gen_expr(e, receiver)
     TConstView(arg) -> gen_expr(e, arg)
 
+    // The raw tier's other direction: the same three words taken as a string, sharing the slice's
+    // owner. Nothing to emit, exactly as for `s.bytes` -- a string that is kept takes its own share
+    // of that owner where it is stored, as any view does.
+    TStrView(arg) -> gen_expr(e, arg)
+
     // A float constant is the `double` bit pattern whatever the type is, so a narrower one is that
     // constant rounded down to it -- which costs nothing at run time.
     TFloatLit(bits, ty) ->
@@ -47,7 +52,7 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         else
             val r = fresh_reg(e)
 
-            emit(e, InCast(r, CastFPTrunc, LFloat(64), VFloat(bits), lty(e, ty)))
+            emit(e, InCast(r, CastFPTrunc, LFloat(64, false), VFloat(bits), lty(e, ty)))
             r
 
     // A constrained operand converts from its base representation.
@@ -628,7 +633,7 @@ private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type) -> Val
                 underlying(ty) match
                     Vector(_, _) -> emit(e, InBin(r, OpSub, ety, VZero, v))
                     _ -> emit(e, InBin(r, OpSub, ety, VInt(from_int(0)), v))
-            Floating(_) -> emit(e, InNeg(r, ety, v))
+            Floating(_, _) -> emit(e, InNeg(r, ety, v))
             other -> gap_here(e, s"negation of ${type_show(other)}")
 
         return r
@@ -866,7 +871,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
             val base = underlying(d.base)
 
             base match
-                Floating(_) ->
+                Floating(_, _) ->
                     if d.lo.is_some() || d.hi.is_some() then gap_here(e, "a float range check")
                 _ ->
                     d.lo match
@@ -1080,7 +1085,7 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
                                 VGlobal(symbol_of(e, name)), args, ty)
 
     var arg_vals: Buf[IrArg] = buf()
-    val staged = staged_args(e, args, &arg_vals)
+    val staged = staged_args(e, args, &arg_vals, e.inert.has(name))
 
     // A call the compiler can see is a call to the same body checks that the measure has gone down.
     // It sits before the call rather than inside the callee, which is what lets it be made out of
@@ -1089,11 +1094,20 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
 
     // A sysl definition's tail is named the way a foreign one's is: by the callee's whole function
     // type, since the argument list alone does not say where the declared parameters stop.
-    if is_variadic(e, name) then
-        return gen_sysl_call_at(e, VGlobal(symbol_of(e, name)), arg_vals, ty,
-                                variadic_type_of(e, name))
+    val r = if is_variadic(e, name) then
+        gen_sysl_call_at(e, VGlobal(symbol_of(e, name)), arg_vals, ty, variadic_type_of(e, name))
+    else
+        gen_sysl_call(e, VGlobal(symbol_of(e, name)), arg_vals, ty)
 
-    gen_sysl_call(e, VGlobal(symbol_of(e, name)), arg_vals, ty)
+    // What the callee promised, said again where the caller's own code can be folded against it
+    // (`contract_assume.sysl`). It goes after the call because a postcondition is about the state the
+    // call left behind.
+    val answered = r match
+        VNothing -> None
+        _ -> Some(r)
+
+    assume_ensures(e, name, args, answered)
+    r
 end gen_call
 
 // One end of a varargs walk: the intrinsic call, and the flag that declares the pair.
@@ -1111,25 +1125,22 @@ end gen_va_intrinsic
 // call itself is written with. The two differ exactly where a parameter is zero-sized, which is an
 // argument evaluated and not passed -- so a check reading the parameters needs the first and the call
 // needs the second.
-staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg]) -> Buf[(int, Val)]
+staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg],
+            callee_inert: bool) -> Buf[(int, Val)]
     var staged: Buf[(int, Val)] = buf()
 
     for i in 0..<args.len()
         val a = args.at(i)
         val aty = texpr_type(a)
+        val v = guaranteed_arg(e, a, callee_inert)
 
         if e.layout.indirect(aty)
-            val addr = address(e, a)
-
-            out.push(ir_arg(LPtr, addr))
-            staged.push((StagedSlot, addr))
+            out.push(ir_arg(LPtr, v))
+            staged.push((StagedSlot, v))
+        else if zero_sized(aty) then staged.push((StagedNothing, VNothing))
         else
-            val v = gen_expr(e, a)
-
-            if zero_sized(aty) then staged.push((StagedNothing, VNothing))
-            else
-                out.push(ir_arg(lty(e, aty), v))
-                staged.push((StagedValue, v))
+            out.push(ir_arg(lty(e, aty), v))
+            staged.push((StagedValue, v))
 
     staged
 end staged_args
@@ -1138,15 +1149,41 @@ end staged_args
 // storage the caller holds, and a zero-sized one is evaluated and not passed.
 arg_value(e: *Emit, a: TExpr, out: *Buf[IrArg])
     val ty = texpr_type(a)
+    val v = guaranteed_arg(e, a, false)
+
+    if e.layout.indirect(ty) then out.push(ir_arg(LPtr, v))
+    else if !zero_sized(ty) then out.push(ir_arg(lty(e, ty), v))
+end arg_value
+
+// One argument evaluated, with the caller's side of the convention discharged (`borrowing.sysl`):
+// the callee reads it through a count somebody holds for the length of the call, and where that is
+// not already this frame -- a field, a global, a local whose address got out -- a count is taken
+// here. What it is taken AT is the only difference between the two forms: a small one's loaded
+// value is already a snapshot, so the count goes on it and comes back with the statement's other
+// temporaries; a large one never becomes a register, so the snapshot is a slot of this frame's,
+// written with counts taken and released where the scope holding it ends.
+private guaranteed_arg(e: *Emit, a: TExpr, callee_inert: bool) -> Val
+    val ty = texpr_type(a)
+    val guarantee = contains_counted(ty) && !callee_inert && !held(e, a)
 
     if e.layout.indirect(ty)
-        out.push(ir_arg(LPtr, address(e, a)))
-        return
+        if !guarantee then return address(e, a)
+
+        val slot = alloca(e, fresh_reg(e), lty(e, ty))
+
+        gen_into(e, slot, a)
+        own_at(e, slot, ty)
+        return slot
+    end if
 
     val v = gen_expr(e, a)
 
-    if !zero_sized(ty) then out.push(ir_arg(lty(e, ty), v))
-end arg_value
+    if guarantee
+        retain_value(e, ty, v)
+        own_temp(e, v, ty)
+
+    v
+end guaranteed_arg
 
 // Emits a call from sysl to sysl and hands back the register holding its result.
 gen_sysl_call(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type) -> Val =
@@ -1215,10 +1252,19 @@ convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
     (from, ut) match
         (Integer(a_bits, a_signed, _), Integer(b_bits, _, _)) ->
             convert_int(e, a_bits, a_signed, b_bits, v)
-        (Integer(_, a_signed, _), Floating(_)) ->
+        (Integer(_, a_signed, _), Floating(_, _)) ->
             cast_to(e, if a_signed then CastSIToFP else CastUIToFP, from, ut, v)
-        (Floating(_), Integer(_, b_signed, _)) -> saturating_to_int(e, from, ut, b_signed, v)
-        (Floating(a_bits), Floating(b_bits)) ->
+        (Floating(_, _), Integer(_, b_signed, _)) -> saturating_to_int(e, from, ut, b_signed, v)
+        // `f16` and `bf16` are the one pair of floating types neither of which is wider, and LLVM
+        // has no instruction turning one into the other -- `fptrunc` and `fpext` both require the
+        // widths to differ. So the pair goes through `f32`, which holds both exactly: the
+        // intermediate rounds nothing and the only rounding is the destination's own.
+        (Floating(a_bits, _), Floating(b_bits, _)) ->
+            if a_bits == b_bits
+                val wide = Floating(32, false)
+
+                return convert(e, wide, ut, convert(e, from, wide, v))
+
             cast_to(e, if b_bits > a_bits then CastFPExt else CastFPTrunc, from, ut, v)
         (Char, Integer(b_bits, _, _)) -> convert_int(e, 32, false, b_bits, v)
         (Integer(a_bits, a_signed, _), Char) -> checked_char(e, a_bits, a_signed, v)
@@ -1317,7 +1363,7 @@ zero_of(e: *Emit, ty: Type) -> Val
 
     underlying(ty) match
         Integer(_, _, _) -> VInt(from_int(0))
-        Floating(_) -> v_float(0.0)
+        Floating(_, _) -> v_float(0.0)
         Char -> VInt(from_int(0))
         Bool -> VInt(from_int(0))
         Ptr(_) -> if erased(underlying(ty)) then VZero else VNull

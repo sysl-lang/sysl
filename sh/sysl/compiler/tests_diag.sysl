@@ -4,6 +4,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.text.Search
+import sysl.time.{monotonic, whole_micros}
 
 // What a compilation's worth of diagnostics looks like, and the undo log a speculative walk rewinds
 // through.
@@ -207,6 +208,75 @@ the_log_is_emptied_when_the_outermost_closes()
     assert_eq(j.enter(), 0)
 
     j.leave()
+
+// -- what a compilation has reached ---------------------------------------------------------------
+
+@test("a rewound trial un-reaches what it reached, and a later reading reaches it afresh")
+a_rewound_trial_reaches_nothing()
+    val a = analysis_for(host_target())
+
+    a.uses("kept")
+    a.uses_extern("puts")
+
+    val mark = a.journal.enter()
+
+    a.uses("tried")
+    a.uses("kept")
+    a.uses("tried")
+    a.uses_extern("tried_extern")
+    a.uses_extern_var("tried_var")
+
+    assert(a.used("tried"))
+    assert_eq(a.funcs_used().len(), 2)
+
+    a.journal.rewind(mark)
+    a.journal.leave()
+
+    assert(a.used("kept"))
+    assert(!a.used("tried"))
+    assert_eq(a.funcs_used().len(), 1)
+    assert_eq(a.externs_used().len(), 1)
+    assert_eq(a.externs_used().at(0), "puts")
+    assert(a.extern_vars_used().is_empty())
+
+    a.uses("tried")
+    assert(a.used("tried"))
+    assert_eq(a.funcs_used().len(), 2)
+    assert_eq(a.funcs_used().at(1), "tried")
+
+    a.uses_extern("tried_extern")
+    assert_eq(a.externs_used().len(), 2)
+
+// The best of three: reaching `n` distinct names and then asking about each, in microseconds.
+private reach_cost(n: usize) -> long
+    var best: long = -1
+
+    for round in 0..<3
+        val a = analysis_for(host_target())
+        val started = monotonic()
+
+        for i in 0..<n
+            a.uses(s"f$i")
+
+        for i in 0..<n
+            assert(a.used(s"f$i"))
+
+        val took = whole_micros(monotonic() - started)
+
+        assert_eq(a.funcs_used().len(), n)
+
+        if best < 0 || took < best then best = took
+
+    best
+end reach_cost
+
+@test("reaching four times as many names costs about four times as much, not sixteen")
+reaching_is_linear()
+    val small = reach_cost(2000)
+    val large = reach_cost(8000)
+    val ratio = large / (if small > 0 then small else 1)
+
+    assert(ratio < 9, s"4x the names took ${ratio}x as long to reach (${small} us, then ${large} us)")
 
 private one_complaint(d: Placed) -> Buf[Placed]
     var out: Buf[Placed] = buf()

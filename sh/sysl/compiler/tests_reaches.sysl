@@ -1,0 +1,62 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.time.{monotonic, whole_micros}
+
+// What folding one body's own calls and erasures into a walk costs, as their count grows.
+//
+// `take_refs` is where every call and every erasure a body names is folded into the walk's running
+// lists, and each fold used to be a scan of the list built so far -- the list is what a seed answer
+// is read out of in the order names were first reached, and the set beside it is what keeps a fold
+// from costing the length of everything already seen.
+//
+// The claim is a ratio rather than a bound, so it holds on a slow machine as well as a fast one: a
+// body naming four times as many calls and tables may cost about four times as much to fold and not
+// sixteen times.
+
+// One body's own refs: `n` distinct calls and `n` distinct erasures, none of them the seed being
+// searched for.
+private fanout_refs(n: usize) -> &Refs
+    var calls: Buf[string] = buf()
+    var erased: Buf[string] = buf()
+
+    for i in 0..<n
+        calls.push(s"callee$i")
+        erased.push(s"table$i")
+
+    Refs(calls, erased, buf())
+end fanout_refs
+
+// The best of three folds of one body's refs, in microseconds.
+private fold_cost(n: usize) -> long
+    var seeds: Buf[string] = buf()
+
+    seeds.push("needle")
+
+    val walk = reaches_over(buf(), buf(), seeds)
+    val root = fanout_refs(n)
+
+    var best: long = -1
+
+    for round in 0..<3
+        val started = monotonic()
+        val found = reached_seeds(walk, root)
+        val took = whole_micros(monotonic() - started)
+
+        assert(found.is_empty(), "none of the fan-out's names is the seed being searched for")
+
+        if best < 0 || took < best then best = took
+
+    best
+end fold_cost
+
+@test("folding a body's calls and erasures four times larger costs about four times as much, not sixteen")
+folding_refs_is_linear()
+    val small = fold_cost(8000)
+    val large = fold_cost(32000)
+
+    val ratio = large / (if small > 0 then small else 1)
+
+    assert(ratio < 9, s"a 4x fan-out took ${ratio}x as long to fold (${small} us, then ${large} us)")
+end folding_refs_is_linear

@@ -16,17 +16,58 @@ import sysl.buf.{Buf, buf}
 // can reach. Nothing here costs a program that declares no invariants anything -- every entry point
 // answers with nothing before it looks at a clause.
 
-// Whether a struct type carries clauses this machinery has to honour. A generic one is refused where
-// it is declared, so it never reaches a check that would have to be instantiated first.
-private bears_invariants(a: &Analysis, base: string) -> bool
+// Whether a struct type carries clauses this machinery has to honour.
+bears_invariants(a: &Analysis, base: string) -> bool
     val decl = a.tables.types.get(base)
 
     if decl.is_none() then return false
 
     decl.unwrap().kind match
-        StructOf(d) -> !d.invariants.is_empty() && d.tparams.is_empty()
+        StructOf(d) -> !d.invariants.is_empty()
         _ -> false
 end bears_invariants
+
+// Whether an element reached by indexing a value of this type is on the far side of it -- a view's
+// element, which has an identity of its own -- rather than storage the value holds, as an array's
+// element is.
+far_side(t: Type) -> bool = underlying(unqualified(t)) match
+    Slice(_, _) -> true
+    _ -> false
+
+// The function a check of this struct calls -- the synthesised `<Struct>$inv`, made real at the
+// struct's own type arguments where the struct is generic.
+//
+// **A generic struct's read rule is asked here rather than at its declaration**, because whether a
+// clause reads through something the struct does not own depends on what the parameters are: a
+// field of type `T` is the struct's own storage at `int` and a pointer's far side at `*Inner`. So
+// each instantiation's field types are held to the rule a non-generic struct's are held to where it
+// is declared, and the diagnostic is the same one, at the clause.
+inv_fn_for(a: &Analysis, s: &StructType) -> string
+    val key = inv_key(s.base)
+    val decl = a.tables.types.get(s.base)
+
+    if decl.is_none() then return key
+
+    val home = decl.unwrap()
+
+    home.kind match
+        StructOf(d) ->
+            if d.tparams.is_empty() then return key
+
+            val f = a.tables.funcs.get(key)
+
+            if f.is_none() then return key
+
+            // The first ask registers the instantiation, which is what says it is the first.
+            val known = a.tables.members.func_insts.len()
+            val name = instantiate_func(a, f.unwrap().scope, f.unwrap().decl, s.targs, false)
+
+            if a.tables.members.func_insts.len() > known then
+                check_invariant_reads(a, home.scope, home.span, d, s)
+
+            name
+        _ -> key
+end inv_fn_for
 
 // The declaration a struct type was made from, where this compilation has one.
 private struct_decl_of(a: &Analysis, base: string) -> Option[StructDecl]
@@ -38,6 +79,49 @@ private struct_decl_of(a: &Analysis, base: string) -> Option[StructDecl]
         StructOf(d) -> Some(d)
         _ -> None
 end struct_decl_of
+
+// The zero value a declaration with no initializer starts at, checked against every clause it holds
+// (`reference/errors.md § Struct invariants`).
+//
+// **A zero is a construction the program did not spell**, and a struct whose clause the zero does not
+// satisfy -- `invariant lo < hi` -- would otherwise begin its life broken with nothing having checked
+// it. So each struct carrying clauses that lies inside the zero -- the type itself, a field of it, an
+// element of an array -- is checked once, at its own zero. The check is of a constant and folds away
+// wherever the zero satisfies it.
+checked_zero(cx: &Analyzer, span: Span, ty: Type) -> TExpr
+    var owes: Buf[&StructType] = buf()
+
+    zero_owes(cx.an, ty, &owes)
+
+    if owes.is_empty() then return TExpr(span, TZero(ty))
+
+    var checks: Buf[TStmt] = buf()
+
+    for i in 0..<owes.len()
+        val s = owes.at(i)
+        val check = TExpr(span, TStructInvCheck(TExpr(span, TZero(Struct(s))), s, inv_fn_for(cx.an, s)))
+
+        checks.push(TExprStmt(check))
+
+    TExpr(span, TBlockExpr(TBlock(checks, Some(TExpr(span, TZero(ty))), ty)))
+end checked_zero
+
+// The structs carrying clauses a zero of this type holds, outermost first, each once.
+private zero_owes(a: &Analysis, t: Type, out: *Buf[&StructType])
+    unqualified(t) match
+        Struct(s) ->
+            if bears_invariants(a, s.base)
+                var seen = false
+
+                for i in 0..<out.len()
+                    if out.at(i).name() == s.name() then seen = true
+
+                if !seen then out.push(s)
+
+            for i in 0..<s.fields.len()
+                zero_owes(a, s.fields.at(i).1, out)
+        Array(n, e) -> if n > 0 then zero_owes(a, *e, out)
+        _ -> ()
 
 // Which enclosing structs an alias of this place would be typed **below**, each with the field path
 // from that struct down to the place.
@@ -74,7 +158,9 @@ private sever_walk(a: &Analysis, e: TExpr, below: Buf[string],
 
                         sever_walk(a, recv, path, out)
                 _ -> ()
-        TIndex(recv, _, _) -> sever_walk(a, recv, below, out)
+        // An alias of a view's element is an alias of the far side, which no struct holding the view
+        // owns -- `&b.elems[0]` names storage no clause may read, so it is below no promise.
+        TIndex(recv, _, _) -> if !far_side(texpr_type(recv)) then sever_walk(a, recv, below, out)
         _ -> ()
 
 // The field paths a struct's clauses read, as a clause spells them.
@@ -330,7 +416,9 @@ private check_packed_field(cx: &Analyzer, span: Span, place: TExpr)
 // that may be written. A `[]const T` is left alone, since giving up the write is exactly what makes
 // the alias carry no promise it could break.
 check_sliceable(cx: &Analyzer, span: Span, base: TExpr, view: Type)
-    if read_only_view(view) then return
+    // Slicing a view makes a view of **its** storage, which is on the far side and no clause's to
+    // read -- `self.elems[..<self.count]` shares the buffer's elements and leaves its length alone.
+    if read_only_view(view) || far_side(texpr_type(base)) then return
 
     val cut = severed(cx.an, base)
 
@@ -460,14 +548,10 @@ private refuse_indirect(a: &Analysis, scope: Scope, span: Span, t: Type, what: s
 
 // A struct's `invariant` clauses, held to what they may read.
 //
-// A **generic** struct carries none: the clause is written once and every instantiation would need a
-// predicate of its own, which is not something the declaration can answer.
+// A **generic** struct's are asked per instantiation instead (`inv_fn_for`), since what a field of
+// type `T` reaches depends on what `T` turns out to be.
 check_invariants_of(a: &Analysis, scope: Scope, span: Span, key: string, d: StructDecl)
-    if d.invariants.is_empty() then return
-
-    if !d.tparams.is_empty()
-        a.fault(scope, span, s"invariants on generic structs are not supported yet — '${d.name}'")
-        return
+    if d.invariants.is_empty() || !d.tparams.is_empty() then return
 
     val inst = a.tables.struct_insts.get(instance_key(key, buf()))
 

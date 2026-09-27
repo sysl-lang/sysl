@@ -1,0 +1,81 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The library fixpoint's queue: the bodies held back until something reaches them, handed out in
+// the order the names were reached, and each reached name read once however many rounds there are.
+
+@test("a fixpoint of many rounds reads each reached name once, not once per round")
+the_fixpoint_reads_each_name_once()
+    var q: HeldQueue[int] = held_queue()
+
+    for i in 0..<3000
+        if i % 2 == 0 then q.hold(s"f$i", i)
+
+    var names: Buf[string] = buf()
+    var taken: Buf[int] = buf()
+
+    for i in 0..<3000
+        names.push(s"f$i")
+
+        val round = q.take_reached(names)
+
+        for j in 0..<round.len()
+            taken.push(round.at(j))
+
+    assert_eq(q.looked, 3000)
+    assert_eq(taken.len(), 1500)
+
+    for i in 0..<taken.len()
+        assert_eq(taken.at(i), 2 * int(i))
+end the_fixpoint_reads_each_name_once
+
+@test("the bodies come out in the order their names were reached, not the order they were held")
+the_order_is_the_order_reached()
+    var q: HeldQueue[string] = held_queue()
+
+    q.hold("a", "A")
+    q.hold("b", "B")
+    q.hold("c", "C")
+
+    var names: Buf[string] = buf()
+
+    names.push("c")
+    names.push("x")
+    names.push("a")
+
+    val first = q.take_reached(names)
+
+    assert_eq(first.len(), 2)
+    assert_eq(first.at(0), "C")
+    assert_eq(first.at(1), "A")
+
+    names.push("b")
+
+    val second = q.take_reached(names)
+
+    assert_eq(second.len(), 1)
+    assert_eq(second.at(0), "B")
+    assert(q.take_reached(names).is_empty(), "a round that reached nothing new hands out nothing")
+end the_order_is_the_order_reached
+
+@test("the first body held under a name is the one kept, and it is handed out once")
+the_first_body_held_is_kept()
+    var q: HeldQueue[int] = held_queue()
+
+    q.hold("f", 1)
+    q.hold("f", 2)
+
+    var names: Buf[string] = buf()
+
+    names.push("f")
+
+    val round = q.take_reached(names)
+
+    assert_eq(round.len(), 1)
+    assert_eq(round.at(0), 1)
+
+    names.push("f")
+    assert(q.take_reached(names).is_empty(), "a body already handed out is not handed out again")
+end the_first_body_held_is_kept

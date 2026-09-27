@@ -1,0 +1,692 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@noinline`, `@inline` and `@cold` -- what a definition tells the optimizer about itself
+// (`reference/attributes.md § @noinline, @inline and @cold`), and every way of writing one that
+// means nothing.
+//
+// `noinline` and `inline` are one axis and contradict; `cold` is another and composes with either.
+// The point of the group is a library deciding which of its members a caller absorbs, which the
+// emitted text cannot show -- so the cases about that ask clang's `-O2` output rather than ours.
+
+private var inl_library_cache: Buf[Program] = buf()
+private var inl_library_read: bool = false
+
+private inl_library() -> Buf[Program]
+    if inl_library_read then return inl_library_cache
+
+    inl_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> inl_library_cache = units
+
+    inl_library_cache
+end inl_library
+
+private inl_no_library() -> bool
+    if inl_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end inl_no_library
+
+// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
+private inl_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+    val library = inl_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), buf())
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    ir_print_module(lowered.0)
+end inl_ir
+
+// The IR a real optimizer leaves of a program: some claims are only about what survives `-O2`,
+// and nothing in the unoptimized text can answer one. `None` where there is no clang to ask.
+private optimized_ir(text: string) -> Option[string]
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return None
+    end if
+
+    val dir = make_temp_dir("sysl-optimized").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, inl_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end optimized_ir
+
+// Whether some IR defines a function whose symbol holds `name`.
+private defines(out: string, name: string) -> bool
+    val lines = lines_of(out)
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with("define") && lines.at(i).contains(name) then return true
+
+    false
+end defines
+
+// The `define` line of the function whose symbol holds `name`, or "" where nothing defines one.
+private define_line(out: string, name: string) -> string
+    val lines = lines_of(out)
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with("define") && lines.at(i).contains(name) then return lines.at(i)
+
+    ""
+end define_line
+
+// Every `define` line naming `name`.
+private define_lines(out: string, name: string) -> Buf[string]
+    val lines = lines_of(out)
+    var found: Buf[string] = buf()
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with("define") && lines.at(i).contains(name) then found.push(lines.at(i))
+
+    found
+end define_lines
+
+// Whether some IR still calls the function whose symbol holds `name`.
+private calls(out: string, name: string) -> bool
+    val lines = lines_of(out)
+
+    for i in 0..<lines.len()
+        if lines.at(i).contains("call ") && lines.at(i).contains(name) then return true
+
+    false
+end calls
+
+// The attribute group a `define` line refers to, resolved: optimized IR gathers a definition's
+// attributes into an `attributes #N = { … }` at the foot of the module and leaves `#N` behind.
+private attributes_on(out: string, name: string) -> string
+    val line = define_line(out, name)
+    val hash = line.last_index_of("#")
+
+    if hash.is_none() then return ""
+
+    var end_at = hash.unwrap() + 1
+
+    while end_at < line.len && line.bytes[end_at] >= u8('0') && line.bytes[end_at] <= u8('9')
+        end_at += 1
+
+    val group = line[hash.unwrap()..<end_at]
+    val lines = lines_of(out)
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with(s"attributes $group = ") then return lines.at(i)
+
+    ""
+end attributes_on
+
+// The lines of one definition, for a claim about what is inside a function. A `}` alone on a line
+// ends a definition in LLVM's text.
+private function_body(out: string, name: string) -> string
+    val lines = lines_of(out)
+    var body = ""
+    var inside = false
+
+    for i in 0..<lines.len()
+        val l = lines.at(i)
+
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end function_body
+
+// -- the bare keywords reach the `define` line ------------------------------------------------------
+
+@test("'@noinline' on a function")
+ia_noinline_on_a_function()
+    if inl_no_library() then return
+
+    val line = define_line(inl_ir("@noinline\nslow(n: i32) -> i32 = n + 1\n\nprint(slow(1))\n"), "@slow")
+
+    assert(line.contains("noinline"), line)
+
+@test("'@cold' on a function")
+ia_cold_on_a_function()
+    if inl_no_library() then return
+
+    val line = define_line(inl_ir("@cold\nrare(n: i32) -> i32 = n + 1\n\nprint(rare(1))\n"), "@rare")
+
+    assert(line.contains("cold"), line)
+
+// LLVM's name for the hint is not the language's word: `@inline` is a request and `inlinehint` is
+// what LLVM calls one, while `alwaysinline` is an instruction the language does not offer.
+@test("'@inline' on a function, which LLVM spells 'inlinehint'")
+ia_inline_on_a_function()
+    if inl_no_library() then return
+
+    val line = define_line(inl_ir("@inline\nsmall(n: i32) -> i32 = n + 1\n\nprint(small(1))\n"), "@small")
+
+    assert(line.contains("inlinehint"), line)
+    assert(!line.contains("alwaysinline"), line)
+
+@test("'@inline' and '@cold' together, which LLVM accepts")
+ia_inline_and_cold_together()
+    if inl_no_library() then return
+
+    val line = define_line(inl_ir("@inline\n@cold\nrare(n: i32) -> i32 = n + 1\n\nprint(rare(1))\n"), "@rare")
+
+    assert(line.contains("inlinehint cold"), line)
+
+@test("and both together, in LLVM's own order")
+ia_noinline_and_cold_together()
+    if inl_no_library() then return
+
+    val line = define_line(inl_ir("@noinline\n@cold\nrare(n: i32) -> i32 = n + 1\n\nprint(rare(1))\n"), "@rare")
+
+    assert(line.contains("noinline cold"), line)
+
+// The order above a declaration is the writer's and the order on the line is LLVM's.
+@test("whichever order they were written in")
+ia_whichever_order_they_were_written_in()
+    if inl_no_library() then return
+
+    val line = define_line(inl_ir("@cold\n@noinline\nrare(n: i32) -> i32 = n + 1\n\nprint(rare(1))\n"), "@rare")
+
+    assert(line.contains("noinline cold"), line)
+
+// A generic member's mark belongs to the declaration, so every instantiation carries it.
+@test("on a generic method, at each instantiation")
+ia_on_a_generic_method()
+    if inl_no_library() then return
+
+    val out = inl_ir(raw"""
+        struct Box[T]
+            value: T
+
+            @noinline
+            @cold
+            grow(self) -> T = self.value
+
+        var a = Box(1i32)
+        var b = Box(2i64)
+        print(a.grow(), b.grow())
+        """)
+    val lines = define_lines(out, "Box.grow")
+
+    assert_eq(lines.len(), 2)
+
+    for i in 0..<lines.len()
+        assert(lines.at(i).contains("noinline cold"), lines.at(i))
+
+@test("and '@inline' on a generic method, at each instantiation")
+ia_inline_on_a_generic_method()
+    if inl_no_library() then return
+
+    val out = inl_ir(raw"""
+        struct Box[T]
+            value: T
+
+            @inline
+            read(self) -> T = self.value
+
+        var a = Box(1i32)
+        var b = Box(2i64)
+        print(a.read(), b.read())
+        """)
+    val lines = define_lines(out, "Box.read")
+
+    assert_eq(lines.len(), 2)
+
+    for i in 0..<lines.len()
+        assert(lines.at(i).contains("inlinehint"), lines.at(i))
+
+@test("and on a generic free function")
+ia_on_a_generic_free_function()
+    if inl_no_library() then return
+
+    val out = inl_ir("@noinline\ntwice[T: sysl.Add](x: T) -> T = x + x\n\nprint(twice(1i32), twice(2i64))\n")
+    val lines = define_lines(out, "@twice")
+
+    assert_eq(lines.len(), 2)
+
+    for i in 0..<lines.len()
+        assert(lines.at(i).contains("noinline"), lines.at(i))
+
+// Nothing is written where nothing was asked for, which keeps the cases above from passing on a
+// `define` line that says `noinline` about everything.
+@test("and nothing at all where none was written")
+ia_nothing_where_none_was_written()
+    if inl_no_library() then return
+
+    val line = define_line(inl_ir("slow(n: i32) -> i32 = n + 1\n\nprint(slow(1))\n"), "@slow")
+
+    assert(line != "", "the function is defined")
+    assert(!line.contains("noinline"), line)
+    assert(!line.contains("inlinehint"), line)
+
+// -- a marked private callee survives -O2 with one call site ---------------------------------------
+
+// A hot exported function and the one private helper it calls -- the shape a buffer's grow has.
+private hot_and_rare(marks: string) -> string =
+    s"module demo\n\n@export\nhot(n: i32) -> i32 = n + rare(n)\n\n${marks}private rare(n: i32) -> i32 = n * 3 - 7\n"
+
+// The control: the same program without the annotation loses the definition entirely, so a run in
+// which the cases below passed and this did too is one where clang inlined nothing at all.
+@test("the unmarked one is folded away, which is the control")
+ia_the_unmarked_one_is_folded_away()
+    if inl_no_library() then return
+
+    optimized_ir(hot_and_rare("")) match
+        None -> ()
+        Some(out) ->
+            assert(!defines(out, "rare"), out)
+            assert(!calls(out, "demo$rare"), out)
+
+@test("and the marked one is still a definition, and still a call")
+ia_the_marked_one_is_still_a_call()
+    if inl_no_library() then return
+
+    optimized_ir(hot_and_rare("@noinline\n")) match
+        None -> ()
+        Some(out) ->
+            assert(defines(out, "rare"), out)
+            assert(calls(out, "demo$rare"), out)
+            assert(attributes_on(out, "rare").contains("noinline"), out)
+
+// `@cold` alone is a frequency and not a prohibition.
+@test("while '@cold' alone does not keep it out of line")
+ia_cold_alone_does_not_keep_it_out_of_line()
+    if inl_no_library() then return
+
+    optimized_ir(hot_and_rare("@cold\n")) match
+        None -> ()
+        Some(out) -> assert(!defines(out, "rare"), out)
+
+@test("and the two together keep it out of line and say it is rare")
+ia_the_two_together()
+    if inl_no_library() then return
+
+    optimized_ir(hot_and_rare("@noinline\n@cold\n")) match
+        None -> ()
+        Some(out) ->
+            assert(calls(out, "demo$rare"), out)
+            assert(attributes_on(out, "rare").contains("noinline"), out)
+            assert(attributes_on(out, "rare").contains("cold"), out)
+
+// -- the marks stand beside what they have nothing to do with -------------------------------------
+
+// `@tailrec` is about this function's call to itself becoming a jump; `@noinline` is about the
+// call into it from elsewhere staying a call. Two different calls.
+@test("'@tailrec', which is about a different call")
+ia_beside_tailrec()
+    if inl_no_library() then return
+
+    val out = inl_ir(raw"""
+        @tailrec
+        @noinline
+        count(n: i32, acc: i32) -> i32 =
+            if n == 0i32
+                return acc
+            return count(n - 1i32, acc + 1i32)
+
+        print(count(3i32, 0i32))
+        """)
+
+    assert(define_line(out, "@count").contains("noinline"), out)
+
+// A test is an ordinary function with a caller nothing else has; compiling at all is the assertion.
+@test("'@test', which only says who calls it")
+ia_beside_test()
+    if inl_no_library() then return
+
+    val out = inl_ir("@test(\"it holds\")\n@noinline\nholds() =\n    assert(1 == 1)\n\nprint(1)\n")
+
+    assert(out.contains("define"), out)
+
+@test("and '@inline' beside either of them")
+ia_inline_beside_either()
+    if inl_no_library() then return
+
+    val out = inl_ir(raw"""
+        @tailrec
+        @inline
+        count(n: i32, acc: i32) -> i32 =
+            if n == 0i32
+                return acc
+            return count(n - 1i32, acc + 1i32)
+
+        print(count(3i32, 0i32))
+        """)
+
+    assert(define_line(out, "@count").contains("inlinehint"), out)
+
+    val tested = inl_ir("@test(\"it holds\")\n@inline\nholds() =\n    assert(1 == 1)\n\nprint(1)\n")
+
+    assert(tested.contains("define"), tested)
+
+// -- a buffer's push is absorbed by its caller and its growth is not ------------------------------
+
+// A hot loop over a `Buf[int]`, reading the elements back so that nothing in it is dead.
+private plain_buffer() -> string = raw"""
+    module demo
+
+    import sysl.buf.*
+
+    @export
+    total(n: int) -> int
+        var b: Buf[int] = buf()
+        var i = 0
+
+        while i < n
+            b.push(i * 3)
+            i += 1
+
+        var sum = 0
+
+        for x in b.view() do sum += x
+
+        sum
+    """
+
+// A `Buf` of a struct carrying a reference, which is the case that pays for a release.
+private counted_buffer() -> string = raw"""
+    module demo
+
+    import sysl.buf.*
+
+    struct Node
+        x: int
+
+    struct Cell
+        tag: i64
+        node: &Node
+
+    @export
+    gather(n: i64) -> usize
+        var node: &Node = Node(7)
+        var b: Buf[Cell] = buf()
+        var i = 0i64
+
+        while i < n
+            b.push(Cell(i, node))
+            i += 1
+
+        b.len()
+    """
+
+// A nine-word element carrying one reference: a call at the default budget and a store at the
+// raised one, which is the whole of what the mark on `push` buys.
+private wide_buffer() -> string = raw"""
+    module demo
+
+    import sysl.buf.*
+
+    struct Node
+        x: int
+
+    struct Reading
+        at: i64
+        seq: i64
+        lo: i64
+        hi: i64
+        sum: i64
+        count: i64
+        flags: i64
+        mask: i64
+        source: &Node
+
+    @export
+    collect(n: i64) -> usize
+        var source: &Node = Node(7)
+        var b: Buf[Reading] = buf()
+        var i = 0i64
+
+        while i < n
+            b.push(Reading(i, i+1i64, i+2i64, i+3i64, i+4i64, i+5i64, i+6i64, i+7i64, source))
+            i += 1
+
+        b.len()
+    """
+
+@test("for a plain element, the caller holds the push and calls the growth")
+ia_plain_push_is_absorbed()
+    if inl_no_library() then return
+
+    optimized_ir(plain_buffer()) match
+        None -> ()
+        Some(out) ->
+            val body = function_body(out, "demo$total")
+
+            assert(!calls(body, "Buf.push.int"), body)
+            assert(calls(body, "Buf.grow_store.int"), body)
+            assert(defines(out, "Buf.grow_store.int"), out)
+            assert(attributes_on(out, "Buf.grow_store.int").contains("noinline"), out)
+            assert(defines(out, "Buf.grow.int"), out)
+
+@test("and for an element carrying a count, which is the case that pays for a release")
+ia_counted_push_is_absorbed()
+    if inl_no_library() then return
+
+    optimized_ir(counted_buffer()) match
+        None -> ()
+        Some(out) ->
+            val body = function_body(out, "demo$gather")
+
+            assert(!calls(body, "Buf.push.demo$Cell"), body)
+            assert(calls(body, "Buf.grow_store.demo$Cell"), body)
+            assert(!body.contains("@llvm.trap"), body)
+
+@test("and for a wider element, which the default budget refuses")
+ia_wide_push_is_absorbed()
+    if inl_no_library() then return
+
+    optimized_ir(wide_buffer()) match
+        None -> ()
+        Some(out) ->
+            val body = function_body(out, "demo$collect")
+
+            assert(!calls(body, "Buf.push.demo$Reading"), body)
+            assert(calls(body, "Buf.grow_store.demo$Reading"), body)
+            assert(attributes_on(out, "Buf.grow_store.demo$Reading").contains("noinline"), out)
+
+// -- the reaper's drain is not copied into the code that releases ---------------------------------
+
+@test("so a push over a counted slot reaches it by a call")
+ia_reap_is_a_call()
+    if inl_no_library() then return
+
+    optimized_ir(counted_buffer()) match
+        None -> ()
+        Some(out) ->
+            val body = function_body(out, "demo$gather")
+
+            assert(body.contains("void @arc.reap("), body)
+            assert(!body.contains("arc.reaper"), body)
+            assert(!body.contains("drain"), body)
+
+@test("and the drain is still a definition, kept out of line and declared rare")
+ia_reap_is_kept_out_of_line()
+    if inl_no_library() then return
+
+    optimized_ir(counted_buffer()) match
+        None -> ()
+        Some(out) ->
+            assert(defines(out, "@arc.reap"), out)
+            assert(attributes_on(out, "@arc.reap").contains("noinline"), out)
+            assert(attributes_on(out, "@arc.reap").contains("cold"), out)
+
+@test("while the growth for a counted element is out of line as well")
+ia_counted_growth_is_out_of_line()
+    if inl_no_library() then return
+
+    optimized_ir(counted_buffer()) match
+        None -> ()
+        Some(out) ->
+            assert(defines(out, "Buf.grow.demo$Cell"), out)
+            assert(calls(out, "Buf.grow.demo$Cell"), out)
+
+// The drain is the rare half of a release: kept out of line, and declared cold so that the branch
+// reaching it is laid out as the one not taken.
+@test("and the drain itself is kept out of line and declared rare")
+ia_the_emitted_drain_is_noinline_cold()
+    if inl_no_library() then return
+
+    val out = inl_ir("struct Node\n    x: int\n\nvar p: &Node = Node(1)\nprint(p.x)\n")
+
+    assert(out.contains("define private void @arc.reap(ptr %p) noinline cold"), out)
+
+// -- the refusals ---------------------------------------------------------------------------------
+
+// The parenthesis is answered rather than left unread: the word has been read, so there is nothing
+// else the line could have been.
+@test("'@noinline(3)'")
+ia_noinline_takes_no_arguments()
+    val e = pf_err("@noinline(3)\nf() -> int = 1\n")
+
+    assert(e.contains("'@noinline' takes no arguments — whether a call stays a call is the whole of what it says"), e)
+
+@test("'@cold(1)'")
+ia_cold_takes_no_arguments()
+    val e = pf_err("@cold(1)\nf() -> int = 1\n")
+
+    assert(e.contains("'@cold' takes no arguments — how rare a rare path is is not a number a program has"), e)
+
+@test("'@inline(200)'")
+ia_inline_takes_no_arguments()
+    val e = pf_err("@inline(200)\nf() -> int = 1\n")
+
+    assert(e.contains("'@inline' takes no arguments — it raises what the inliner will spend on this definition rather than naming a number"), e)
+
+@test("and an empty pair is not the shorter form of any of them")
+ia_an_empty_pair_is_refused()
+    assert(pf_err("@noinline()\nf() -> int = 1\n").contains("'@noinline' takes no arguments"))
+    assert(pf_err("@inline()\nf() -> int = 1\n").contains("'@inline' takes no arguments"))
+    assert(pf_err("@cold()\nf() -> int = 1\n").contains("'@cold' takes no arguments"))
+
+@test("one written twice says nothing the once does not")
+ia_one_written_twice()
+    assert(pf_err("@noinline\n@noinline\nf() -> int = 1\n").contains("'@noinline' is written twice above one declaration"))
+    assert(pf_err("@inline\n@inline\nf() -> int = 1\n").contains("'@inline' is written twice above one declaration"))
+    assert(pf_err("@cold\n@cold\nf() -> int = 1\n").contains("'@cold' is written twice above one declaration"))
+
+@test("written either way round")
+ia_noinline_beside_inline()
+    val e = pf_err("@noinline\n@inline\nf() -> int = 1\n")
+
+    assert(e.contains("'@noinline' forbids inlining and '@inline' asks for it, so they contradict above one declaration"), e)
+    assert(pf_err("@inline\n@noinline\nf() -> int = 1\n").contains("so they contradict above one declaration"))
+
+@test("and the sentence names '@cold', which is the different thing they may have meant")
+ia_the_contradiction_names_cold()
+    val e = pf_err("@noinline\n@inline\nf() -> int = 1\n")
+
+    assert(e.contains("'@cold' beside it if it is also reached rarely"), e)
+
+@test("not a struct")
+ia_not_a_struct()
+    val e = pf_err("@noinline\nstruct S\n    a: int\n")
+
+    assert(e.contains("an annotation marks a function"), e)
+
+@test("not a binding")
+ia_not_a_binding()
+    val e = pf_err("@cold\nstatic var n: int = 1\nprint(n)\n")
+
+    assert(e.contains("an annotation marks a function"), e)
+
+@test("and not a struct with '@inline' above it either")
+ia_not_a_struct_with_inline()
+    val e = pf_err("@inline\nstruct S\n    a: int\n")
+
+    assert(e.contains("an annotation marks a function"), e)
+
+// An `extern` is a name and a signature: the definition is in somebody else's object file.
+@test("and not an 'extern', whose definition is not here")
+ia_not_an_extern()
+    val e = pf_err("@noinline\nextern exit(code: int)\nprint(1)\n")
+
+    assert(e.contains("an annotation marks a function"), e)
+
+@test("with '@noinline'")
+ia_ghost_with_noinline()
+    val e = pf_err("@ghost\n@noinline\nsorted(n: int) -> bool = n > 0\n\nprint(1)\n")
+
+    assert(e.contains("'@noinline' tell the optimizer about a definition, and '@ghost' means there is none"), e)
+    assert(e.contains("erased before anything is emitted"), e)
+
+@test("with '@cold'")
+ia_ghost_with_cold()
+    val e = pf_err("@ghost\n@cold\nsorted(n: int) -> bool = n > 0\n\nprint(1)\n")
+
+    assert(e.contains("'@cold' tell the optimizer about a definition"), e)
+
+@test("with '@inline'")
+ia_ghost_with_inline()
+    val e = pf_err("@ghost\n@inline\nsorted(n: int) -> bool = n > 0\n\nprint(1)\n")
+
+    assert(e.contains("'@inline' tell the optimizer about a definition"), e)
+    assert(e.contains("to absorb into a caller"), e)
+
+@test("and with two of them, which the sentence names together")
+ia_ghost_with_two()
+    val a = pf_err("@ghost\n@noinline\n@cold\nsorted(n: int) -> bool = n > 0\n\nprint(1)\n")
+    val b = pf_err("@ghost\n@inline\n@cold\nsorted(n: int) -> bool = n > 0\n\nprint(1)\n")
+
+    assert(a.contains("'@noinline' and '@cold' tell the optimizer about a definition"), a)
+    assert(b.contains("'@inline' and '@cold' tell the optimizer about a definition"), b)
+
+@test("a misspelling is answered with a list that holds them")
+ia_a_misspelling_lists_them()
+    val e = pf_err("@noinlne\nf() -> int = 1\n")
+
+    assert(e.contains("'@noinline'"), e)
+    assert(e.contains("'@inline'"), e)
+    assert(e.contains("'@cold'"), e)
+
+@test("and the member refusal names them among what a member may carry")
+ia_the_member_refusal_names_them()
+    val e = pf_err("struct S\n    v: int\n\n    @tailrec\n    take(self, n: int) -> int = n\n\nprint(1)\n")
+
+    assert(e.contains("'@noinline', '@inline' and '@cold'"), e)
+
+// And a member carries them: they are about the function it lowers to.
+@test("a member carries the three, and the test spelling shows them")
+ia_a_member_carries_them()
+    val shown = pf("struct S\n    v: int\n\n    @noinline\n    @cold\n    take(self) -> int = 1\n")
+
+    assert(shown.contains("@noinline @cold"), shown)
+    assert_eq(pf("@inline\nf() = 1\n"), "(fn @inline f () 1)")
