@@ -704,6 +704,48 @@ an_implementation_that_keeps_what_it_borrowed()
               "needs into storage of its own")
 end an_implementation_that_keeps_what_it_borrowed
 
+// **Which parameters a function keeps is a fixpoint, and it looks at a function again only when
+// something it consulted has grown.** Two chains of 200 functions each hand a slice down to one that
+// stores it, one written caller-first and one callee-first, so whichever order the program lists its
+// functions in, one chain runs against it: a fixpoint that re-walked every function on every round
+// would take a round per link of that chain, some eighty thousand walks, where one that wakes only
+// the callers of what grew takes a few hundred -- and every link keeps what it was handed either way.
+@test("the kept-parameter fixpoint wakes only the callers of what grew")
+the_kept_parameter_fixpoint_wakes_only_callers()
+    if arc_no_library() then return
+
+    val n: usize = 200
+    var text = "var held: []const u8\n\n"
+
+    for i in 0..<n
+        text = text + s"a$i(b: []const u8)\n"
+        text = text + (if i == n - 1 then "    held = b\n\n" else s"    a${i + 1}(b)\n\n")
+        text = text + s"b$i(b: []const u8)\n"
+        text = text + (if i == 0 then "    held = b\n\n" else s"    b${i - 1}(b)\n\n")
+
+    text = text + s"var store: [8]u8\n\na0(store[0..<4])\nb${n - 1}(store[0..<4])\n"
+
+    val parsed = parse(source_of("test.sysl", text))
+    var units: Buf[Program] = buf()
+    val library = arc_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    assert(done.reported.is_empty())
+
+    val cost = settle_cost(program_of(done, ""))
+
+    // Every link keeps its slice, and the walks stay linear in the length of the chains: a walk per
+    // link to start with, and one more for each link woken when the link below it grew. It is 599.
+    assert_eq(cost.1, 2 * n)
+    assert(cost.0 <= 4 * n)
+end the_kept_parameter_fixpoint_wakes_only_callers
+
 // **A term of an `&&` chain is reached only where the chain got that far**, so a count it takes has
 // to be given back before the branch it guards -- a release registered with the enclosing scope is
 // emitted on every path out of it, including the one where the term never ran. LLVM refuses that

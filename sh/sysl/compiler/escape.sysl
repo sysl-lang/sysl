@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, map_with_capacity, Set, set}
 
 // **Escape analysis for slices.**
 //
@@ -188,7 +189,7 @@ end push_name
 // Analyzes a whole program: the promotions to make, with every escape that has nowhere to go
 // reported against the view that causes it.
 check_escapes(a: &Analysis, p: TProgram) -> Promotions
-    val keeps: &KeptParams = KeptParams(buf())
+    val keeps = kept_params(p)
 
     settle_summaries(p, keeps)
     refuse_borrowed(a, p, keeps)
@@ -220,34 +221,102 @@ end check_escapes
 // For each function, which of its slice-carrying parameters it lets outlive the call. Starts
 // optimistic -- nothing is kept -- and grows until it stops changing, which is what makes a
 // recursive function converge on its real behaviour.
+//
+// A function is known by its index in `p.funcs` -- the first one of its name, which is the one a
+// lookup by name always found -- so a pair is two numbers and asking about one is a hash lookup
+// rather than a walk over every function. `asked` records which functions' answers the walk under
+// way consulted, which is what tells the fixpoint whom to wake when an answer grows.
 struct KeptParams
-    pairs: Buf[(string, usize)]
+    index: Map[string, usize]
+    pairs: Set[(usize, usize)]
+    asked: Buf[usize]
+    examined: usize
 
-    holds(self, name: string, i: usize) -> bool
-        for k in 0..<self.pairs.len()
-            if self.pairs.at(k).0 == name && self.pairs.at(k).1 == i then return true
-
-        false
-    end holds
+    holds(self, name: string, i: usize) -> bool = self.index.get(name) match
+        Some(id) -> self.pairs.has((id, i))
+        None -> false
 end KeptParams
 
+private kept_params(p: TProgram) -> &KeptParams
+    var index: Map[string, usize] = map_with_capacity(p.funcs.len() * 2)
+
+    for i in 0..<p.funcs.len()
+        val name = p.funcs.at(i).name
+
+        if !index.has(name) then index.put(name, i)
+
+    KeptParams(index, set(), buf(), 0)
+end kept_params
+
+// The pairs grow until nothing changes, and a function is looked at again only when something it
+// consulted last time -- a callee's answer, its own among them -- has grown since. Every walk only
+// ever turns more of its answer on as the pairs grow, so the order the functions are looked at in
+// does not change where the growth stops.
 private settle_summaries(p: TProgram, keeps: &KeptParams)
-    var changed = true
+    val n = p.funcs.len()
+    var queue: Buf[usize] = buf()
+    var queued: Buf[bool] = buf()
+    var callers: Map[usize, Buf[usize]] = map()
+    var edges: Set[(usize, usize)] = set()
 
-    while changed
-        changed = false
+    for i in 0..<n
+        queue.push(i)
+        queued.push(true)
 
-        for i in 0..<p.funcs.len()
-            val f = p.funcs.at(i)
+    var head: usize = 0
 
-            for j in 0..<f.params.len()
-                if !carries_view(f.params.at(j).1) then continue
-                if keeps.holds(f.name, j) then continue
+    while head < queue.len()
+        val fi = queue.at(head)
 
-                if kepts(p, keeps, f, f.params.at(j).0)
-                    keeps.pairs.push((f.name, j))
-                    changed = true
+        head += 1
+        queued.set(fi, false)
+
+        val f = p.funcs.at(fi)
+        var grew = false
+
+        keeps.asked.clear()
+
+        for j in 0..<f.params.len()
+            if !carries_view(f.params.at(j).1) then continue
+            if keeps.pairs.has((fi, j)) then continue
+
+            keeps.examined += 1
+
+            if kepts(p, keeps, f, f.params.at(j).0)
+                keeps.pairs.add((fi, j))
+                grew = true
+
+        for k in 0..<keeps.asked.len()
+            val callee = keeps.asked.at(k)
+
+            if edges.add((callee, fi))
+                var list = callers.get_or(callee, buf())
+
+                list.push(fi)
+                callers.put(callee, list)
+
+        if !grew then continue
+
+        // Its own answer grew, so it is among those to look at again when it consulted itself.
+        callers.get(fi) match
+            None -> ()
+            Some(list) ->
+                for k in 0..<list.len()
+                    val c = list.at(k)
+
+                    if !queued.at(c)
+                        queued.set(c, true)
+                        queue.push(c)
 end settle_summaries
+
+// How many parameter walks it took the fixpoint to settle `p`, and how many pairs it settled on --
+// the measure of whether it looked at a function again only when it had to.
+settle_cost(p: TProgram) -> (usize, usize)
+    val keeps = kept_params(p)
+
+    settle_summaries(p, keeps)
+    (keeps.examined, keeps.pairs.len())
+end settle_cost
 
 // Whether a function lets a parameter outlive the *call* -- which returning a view of it does not.
 private kepts(p: TProgram, keeps: &KeptParams, f: TFunc, param: string) -> bool
@@ -263,17 +332,12 @@ end kepts
 // A function whose body is not here keeps everything, since nothing can tell whether the foreign
 // side holds on to what it was handed.
 private kept_by(p: TProgram, keeps: &KeptParams, name: string, i: usize) -> bool
-    if !declares_body(p, name) then return true
-
-    keeps.holds(name, i)
+    keeps.index.get(name) match
+        None -> true
+        Some(id) ->
+            keeps.asked.push(id)
+            keeps.pairs.has((id, i))
 end kept_by
-
-private declares_body(p: TProgram, name: string) -> bool
-    for i in 0..<p.funcs.len()
-        if p.funcs.at(i).name == name then return true
-
-    false
-end declares_body
 
 // -- one body ----------------------------------------------------------------------------------------
 
@@ -925,7 +989,7 @@ private refuse_borrowed(a: &Analysis, p: TProgram, keeps: &KeptParams)
 
                 seen.push(key)
 
-                val at = target_span(p, slot.target)
+                val at = target_span(p, keeps, slot.target)
 
                 if at.is_none() then continue
 
@@ -939,12 +1003,10 @@ private refuse_borrowed(a: &Analysis, p: TProgram, keeps: &KeptParams)
                     "storage of its own")
 end refuse_borrowed
 
-private target_span(p: TProgram, name: string) -> Option[Span]
-    for i in 0..<p.funcs.len()
-        if p.funcs.at(i).name == name then return Some(p.funcs.at(i).span)
-
-    None
-end target_span
+private target_span(p: TProgram, keeps: &KeptParams, name: string) -> Option[Span]
+    keeps.index.get(name) match
+        None -> None
+        Some(id) -> Some(p.funcs.at(id).span)
 
 // Which of a trait object call's arguments the trait promised to borrow, by **argument** position --
 // one less than the parameter position, since a call site's list has no receiver in it.
