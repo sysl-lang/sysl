@@ -1,0 +1,207 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **The two sixteen-bit floating formats**, `f16` and `bf16`: the same width divided two ways, so
+// most of what is claimed here is what a program PRINTS, which nothing short of running it says.
+// The LLVM texts were read out of the reference compiler on the same source.
+
+private var ff_library_cache: Buf[Program] = buf()
+private var ff_library_read: bool = false
+
+private ff_library() -> Buf[Program]
+    if ff_library_read then return ff_library_cache
+
+    ff_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> ff_library_cache = units
+
+    ff_library_cache
+end ff_library
+
+private ff_no_library() -> bool
+    if ff_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end ff_no_library
+
+private ff_can_run() -> bool
+    if ff_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end ff_can_run
+
+// The whole module a source lowers to beside the real library, or the first thing said about it.
+private ff_ir(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = ff_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), buf())
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end ff_ir
+
+// **What a program PRINTS.**
+private ff_ran(text: string) -> string
+    val root = make_temp_dir("sysl-float").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ff_ran
+
+// -- the IR --------------------------------------------------------------------------------------
+
+@test("a narrow float is widened to double, whichever narrow float it is")
+a_narrow_float_is_widened_to_double()
+    if ff_no_library() then return
+
+    val single = ff_ir("extern f(n: int, ...)\n\nmain()\n    var x: f32 = 1.5f32\n    f(1, x)\n")
+
+    assert(single.contains("fpext float"), single)
+
+    val half = ff_ir("extern f(n: int, ...)\n\nmain()\n    var x: f16 = 1.5f16\n    f(1, x)\n")
+
+    assert(half.contains("fpext half"), half)
+
+    val brain = ff_ir("extern f(n: int, ...)\n\nmain()\n    var x: bf16 = 1.5bf16\n    f(1, x)\n")
+
+    assert(brain.contains("fpext bfloat"), brain)
+
+// LLVM applies no default argument promotions of its own, so a narrow value handed over as written
+// would be read back as garbage. Signedness decides which widening.
+@test("a narrow integer is widened to 32 bits, by its own signedness")
+a_narrow_integer_is_widened_to_32_bits()
+    if ff_no_library() then return
+
+    val out = ff_ir("extern f(n: int, ...)\n\nmain()\n    var a: u8 = 200\n    var b: i8 = -5\n" +
+                    "    f(1, a, b)\n")
+
+    assert(out.contains("zext i8"), out)
+    assert(out.contains("sext i8"), out)
+
+// 32- and 64-bit values are already what C would promote them to, and a `char` is an `i32` already,
+// so each is passed as it stands.
+@test("what is already wide enough is passed as it stands")
+what_is_already_wide_enough_is_passed_as_it_stands()
+    if ff_no_library() then return
+
+    val out = ff_ir("extern f(n: int, ...)\n\nmain()\n    var a: i64 = 7i64\n    var b: real = 2.5\n" +
+                    "    f(1, a, b, 'A', 3)\n")
+
+    assert(out.contains("call void (i32, ...) @f(i32 1, i64 %t"), out)
+    assert(out.contains(", i32 65, i32 3)"), out)
+
+// The suffix comes off the type rather than off the bit count, so `bf16` names its own intrinsic
+// instead of `f16`'s.
+@test("the other format at that width names its own intrinsic")
+bf16_names_its_own_intrinsic()
+    if ff_no_library() then return
+
+    val half = ff_ir("private extern \"llvm.fabs\" mag(x: f16) -> f16\n\n" +
+                     "main()\n    print(mag(-1.5f16))\n")
+
+    assert(half.contains("declare half @llvm.fabs.f16(half)"), half)
+
+    val brain = ff_ir("private extern \"llvm.fabs\" mag(x: bf16) -> bf16\n\n" +
+                      "main()\n    print(mag(-1.5bf16))\n")
+
+    assert(brain.contains("declare bfloat @llvm.fabs.bf16(bfloat)"), brain)
+
+// -- what a program prints -----------------------------------------------------------------------
+
+@test("bf16 holds a value it can represent exactly")
+bf16_holds_an_exact_value()
+    if !ff_can_run() then return
+
+    assert_eq(ff_ran("var b: bf16 = 0.5\nprint(b + 0.25)\n"), "0.75\n")
+
+// **The two formats differ, and a tenth is the shortest input that says how.** `f16` keeps ten bits
+// of significand and `bf16` seven, so the nearest each holds to a tenth is a different number. A
+// compiler treating `bf16` as a second name for `f16` would print one answer twice.
+@test("f16 and bf16 round a tenth to different values")
+f16_and_bf16_round_a_tenth_differently()
+    if !ff_can_run() then return
+
+    assert_eq(ff_ran("var h: f16 = 0.1\nvar b: bf16 = 0.1\nprint(h, b)\n"), "0.0999756 0.100098\n")
+
+// **And the precision `bf16` gives up buys range.** Its exponent is binary32's, so the largest finite
+// `f16` doubles to an ordinary `bf16` where at `f16` it is past the end of the format.
+@test("bf16 reaches where f16 overflows")
+bf16_reaches_where_f16_overflows()
+    if !ff_can_run() then return
+
+    assert_eq(ff_ran("var h: f16 = 65504.0\nvar b: bf16 = 65504.0\nprint(h * 2.0, b * 2.0)\n"),
+              "inf 131072\n")
+
+// `sysl.math`'s `Float` reaches both of them: every body widens to `f32`, calls what `f32` binds, and
+// narrows back.
+@test("the Float trait reaches both sixteen-bit widths")
+the_float_trait_reaches_both_sixteen_bit_widths()
+    if !ff_can_run() then return
+
+    assert_eq(ff_ran(raw"""
+        import sysl.math.Float
+
+        var h: f16 = 9.0
+        var b: bf16 = 9.0
+
+        print(h.sqrt(), b.sqrt())
+        print(f16.max_value(), bf16.epsilon())
+        """), "3 3\n65504 0.0078125\n")
+
+// **`f16` and `bf16` are the one pair where neither conversion widens or narrows**, and LLVM has no
+// instruction for it. The conversion goes through `f32`, which holds both exactly: a quarter survives
+// both directions, and a tenth comes back as the destination's nearest rather than the source's.
+@test("carry a value between the two sixteen-bit formats")
+carry_a_value_between_the_sixteen_bit_formats()
+    if !ff_can_run() then return
+
+    assert_eq(ff_ran("var h: f16 = 0.25\nvar b: bf16 = 0.1\n" +
+                     "print(bf16(h), f16(b), f16(bf16(0.1f16)))\n"),
+              "0.25 0.100098 0.100098\n")

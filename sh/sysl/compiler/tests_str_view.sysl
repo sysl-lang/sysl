@@ -1,0 +1,368 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `str_alias` and its library spelling `sysl.text.str_view`: the bytes of a `[]u8` taken as a
+// `string` in place, the three words shared rather than copied.
+//
+// **Every LLVM text and every refusal here was read out of the reference compiler** on the same
+// source, never composed from the rule. What a program prints is the reference's own expectation.
+
+private var sv_library_cache: Buf[Program] = buf()
+private var sv_library_read: bool = false
+
+private sv_library() -> Buf[Program]
+    if sv_library_read then return sv_library_cache
+
+    sv_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> sv_library_cache = units
+
+    sv_library_cache
+end sv_library
+
+private sv_no_library() -> bool
+    if sv_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end sv_no_library
+
+private sv_can_run() -> bool
+    if sv_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end sv_can_run
+
+private sv_units(parsed: Program) -> Buf[Program]
+    var units: Buf[Program] = buf()
+    val library = sv_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed)
+    units
+end sv_units
+
+// What the source is refused with, the whole-program checks included -- which is where an escape
+// that has nowhere to go is reported. An empty answer is a program that was accepted.
+private sv_refusal(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    val done = analyze_bodies(sv_units(parsed.program), host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    post_analysis_checks(done.an, program_of(done, ""), buf())
+
+    val said = errors_of(done.an.diagnostics())
+
+    if said.is_empty() then "" else said.at(0).diag.message
+end sv_refusal
+
+// The LLVM text of one function, the program lowered beside the library and pruned the way the
+// driver does it.
+private sv_lowered(text: string, symbol: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    val done = analyze_bodies(sv_units(parsed.program), host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push(module_written(parsed.program))
+
+    val promotions = post_analysis_checks(done.an, whole, own)
+    val kept = prune(strip_tests(whole), own)
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+    val texts = func_texts(ir_print_module(lowered.0))
+
+    for i in 0..<texts.len()
+        if texts.at(i).0 == symbol then return texts.at(i).1
+
+    for i in 0..<lowered.1.len()
+        if llvm_safe(lowered.1.at(i).0) == symbol then
+            return s"not lowered: ${lowered.1.at(i).1}"
+
+    s"no definition of '$symbol'"
+end sv_lowered
+
+// **What a program PRINTS**, built and run at the level named.
+private sv_ran(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-str-view").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end sv_ran
+
+// -- StringCodegenTests: viewing bytes as a string in place ----------------------------------------
+
+// `str_cast` copies (`TFromBytes` -> `sysl.str.from_bytes`); its in-place sibling is the three words
+// it was given, so nothing is called and nothing allocated where it is made.
+@test("the raw form emits no copy and no allocation")
+the_raw_form_emits_no_copy_and_no_allocation()
+    if sv_no_library() then return
+
+    val out = sv_lowered("var store: []u8 = [0; 16]\n" +
+                         "val s = str_alias(store[0..<10])\n" +
+                         "print(s.len)\n", "main")
+    val plain = sv_lowered("var store: []u8 = [0; 16]\n" +
+                           "val s = store[0..<10]\n" +
+                           "print(s.len)\n", "main")
+
+    assert(out.starts_with("define"))
+    assert(!out.contains("@sysl.str.from_bytes"))
+    assert_eq(out.count_of("@malloc"), plain.count_of("@malloc"))
+    assert_eq(out.count_of("@malloc"), 1)
+end the_raw_form_emits_no_copy_and_no_allocation
+
+@test("while the copying form next to it does call the copy")
+while_the_copying_form_next_to_it_does_call_the_copy()
+    if sv_no_library() then return
+
+    assert(sv_lowered("var store: []u8 = [0; 16]\n" +
+                      "val s = str_cast(store[0..<10])\n" +
+                      "print(s.len)\n", "main").contains("@sysl.str.from_bytes"))
+
+@test("and the library's spelling, sysl.text.str_view, has no copy in its body")
+the_librarys_spelling_has_no_copy_in_its_body()
+    if sv_no_library() then return
+
+    val body = sv_lowered("import sysl.text.str_view\n" +
+                          "var store: []u8 = [0; 16]\n" +
+                          "val s = str_view(store[0..<10])\n" +
+                          "print(s.len)\n", "sysl.text$str_view")
+
+    assert(body.starts_with("define"))
+    assert(!body.contains("@sysl.str.from_bytes"))
+end the_librarys_spelling_has_no_copy_in_its_body
+
+@test("a value that is not bytes is refused, by the raw form and by the library's")
+a_value_that_is_not_bytes_is_refused()
+    if sv_no_library() then return
+
+    assert_eq(sv_refusal("print(str_alias(5))\n"),
+              "'str_alias' takes a []u8, but the value has type int")
+    assert_eq(sv_refusal("import sysl.text.str_view\nprint(str_view(5))\n"),
+              "'b' of 'sysl.text.str_view' is []byte, but int was given")
+end a_value_that_is_not_bytes_is_refused
+
+@test("a string is refused rather than passed through")
+a_string_is_refused_rather_than_passed_through()
+    if sv_no_library() then return
+
+    assert_eq(sv_refusal("print(str_alias(\"hi\"))\n"),
+              "'str_alias' makes a string out of bytes, and this value is already a string")
+
+// The library's form asks for bytes it could be written through, which is the case it exists for; a
+// read-only view is `from_utf8_unchecked`'s, or needs no conversion at all.
+@test("the library's form takes a writable slice, so a read-only one is refused")
+the_librarys_form_takes_a_writable_slice()
+    if sv_no_library() then return
+
+    assert_eq(sv_refusal("import sysl.text.str_view\nprint(str_view(\"hi\".bytes))\n"),
+              "a '[]const byte' views elements it may not write, and a '[]byte' is a licence to " +
+              "write them — so the one does not become the other. Copy what you need into a " +
+              "'[]byte' of your own, or take the parameter as '[]const byte' if it is only read")
+end the_librarys_form_takes_a_writable_slice
+
+@test("the raw form takes exactly one value")
+the_raw_form_takes_exactly_one_value()
+    if sv_no_library() then return
+
+    assert_eq(sv_refusal("var b: []u8 = [0; 4]\nprint(str_alias(b, b))\n"),
+              "'str_alias' takes exactly one value, the bytes to view as a string")
+
+// -- EscapePromotionTests ---------------------------------------------------------------------------
+
+// A string outlives every frame, so bytes made into one in place have left the frame where they
+// became one -- even though the string itself is never returned or stored anywhere. The reference
+// says so in an `--explain` note this compiler has no printer for; the same escape site and its
+// reason are read here from the refusal an aligned array earns, and the move itself from the
+// lowering, which is the reference's text.
+@test("a view made into a string in place moves the array, and says why")
+a_view_made_into_a_string_in_place_moves_the_array()
+    if sv_no_library() then return
+
+    assert_eq(sv_refusal("first() -> usize\n" +
+                         "    @align(64)\n" +
+                         "    var buf: [8]u8\n" +
+                         "    val s = str_alias(buf[0..<3])\n" +
+                         "    s.len\n" +
+                         "end first\n" +
+                         "print(first())\n"),
+              "this view of 'buf' is made into a string, which outlives the frame, so the array " +
+              "would move to the heap to outlive the frame — and 'buf' asked to begin on a 64-byte " +
+              "boundary, which is the allocator's to answer there rather than this declaration's. " +
+              "Keep the view inside the frame, or put the boundary on a struct with '@align', " +
+              "which every value of that type carries wherever its storage is")
+
+    assert_eq(sv_lowered("first() -> usize\n" +
+                         "    var buf: [8]u8\n" +
+                         "    val s = str_alias(buf[0..<3])\n" +
+                         "    s.len\n" +
+                         "end first\n" +
+                         "print(first())\n", "first"),
+              "define i64 @first() {\n" +
+              "entry:\n" +
+              "  %buf.box = alloca ptr\n" +
+              "  %s.addr = alloca { ptr, ptr, i64 }\n" +
+              "  %t1 = getelementptr i8, ptr null, i64 1\n" +
+              "  %t2 = ptrtoint ptr %t1 to i64\n" +
+              "  %t3 = getelementptr %arc.buf.byte, ptr null, i32 0, i32 4\n" +
+              "  %t4 = ptrtoint ptr %t3 to i64\n" +
+              "  %t5 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 8, i64 %t2)\n" +
+              "  %t6 = extractvalue { i64, i1 } %t5, 0\n" +
+              "  %t7 = extractvalue { i64, i1 } %t5, 1\n" +
+              "  %t8 = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %t6, i64 %t4)\n" +
+              "  %t9 = extractvalue { i64, i1 } %t8, 0\n" +
+              "  %t10 = extractvalue { i64, i1 } %t8, 1\n" +
+              "  %t11 = or i1 %t7, %t10\n" +
+              "  %t12 = xor i1 %t11, true\n" +
+              "  br i1 %t12, label %size.ok1, label %size.bad2\n" +
+              "size.bad2:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "size.ok1:\n" +
+              "  %t13 = call ptr @malloc(i64 %t9)\n" +
+              "  %t14 = icmp ne ptr %t13, null\n" +
+              "  br i1 %t14, label %alloc.ok3, label %alloc.bad4\n" +
+              "alloc.bad4:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "alloc.ok3:\n" +
+              "  store i64 1, ptr %t13\n" +
+              "  %t15 = getelementptr %arc.buf.byte, ptr %t13, i32 0, i32 1\n" +
+              "  store ptr @arc.drop.plain, ptr %t15\n" +
+              "  %t16 = getelementptr %arc.buf.byte, ptr %t13, i32 0, i32 2\n" +
+              "  store i64 1, ptr %t16\n" +
+              "  %t17 = getelementptr %arc.buf.byte, ptr %t13, i32 0, i32 3\n" +
+              "  store i64 8, ptr %t17\n" +
+              "  %t18 = getelementptr %arc.buf.byte, ptr %t13, i32 0, i32 4\n" +
+              "  %buf.addr = getelementptr i8, ptr %t18, i64 0\n" +
+              "  store [8 x i8] zeroinitializer, ptr %buf.addr\n" +
+              "  store ptr %t13, ptr %buf.box\n" +
+              "  %t19 = icmp ule i64 3, 8\n" +
+              "  br i1 %t19, label %bounds.ok5, label %bounds.bad6\n" +
+              "bounds.bad6:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok5:\n" +
+              "  %t20 = icmp ule i64 0, 3\n" +
+              "  br i1 %t20, label %bounds.ok7, label %bounds.bad8\n" +
+              "bounds.bad8:\n" +
+              "  call void @llvm.trap()\n" +
+              "  unreachable\n" +
+              "bounds.ok7:\n" +
+              "  %t21 = getelementptr i8, ptr %buf.addr, i64 0\n" +
+              "  %t22 = sub i64 3, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t13)\n" +
+              "  %t23 = insertvalue { ptr, ptr, i64 } zeroinitializer, ptr %t13, 0\n" +
+              "  %t24 = insertvalue { ptr, ptr, i64 } %t23, ptr %t21, 1\n" +
+              "  %t25 = insertvalue { ptr, ptr, i64 } %t24, i64 %t22, 2\n" +
+              "  %t26 = extractvalue { ptr, ptr, i64 } %t25, 0\n" +
+              "  call void @arc.retain_maybe(ptr %t26)\n" +
+              "  store { ptr, ptr, i64 } %t25, ptr %s.addr\n" +
+              "  %t27 = extractvalue { ptr, ptr, i64 } %t25, 0\n" +
+              "  call void @arc.release_maybe(ptr %t27)\n" +
+              "  %t28 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t29 = extractvalue { ptr, ptr, i64 } %t28, 2\n" +
+              "  %t30 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
+              "  %t31 = extractvalue { ptr, ptr, i64 } %t30, 0\n" +
+              "  call void @arc.release_maybe(ptr %t31)\n" +
+              "  %t32 = load ptr, ptr %buf.box\n" +
+              "  call void @arc.release(ptr %t32)\n" +
+              "  ret i64 %t29\n" +
+              "}\n")
+end a_view_made_into_a_string_in_place_moves_the_array
+
+// -- StringRunTests: a string viewed in place over bytes -------------------------------------------
+
+// Optimized, since what could go wrong is the optimizer taking a `string`'s bytes for ones nothing
+// writes and folding the second read into the first.
+@test("sees a write made through the slice after it, optimized")
+sees_a_write_made_through_the_slice_after_it_optimized()
+    if !sv_can_run() then return
+
+    assert_eq(sv_ran("import sysl.text.str_view\n" +
+                     "var store: []u8 = [0; 1048576]\n" +
+                     "store[0] = 104\n" +
+                     "store[1] = 105\n" +
+                     "val s = str_view(store[0..<2])\n" +
+                     "print(s)\n" +
+                     "store[1] = 97\n" +
+                     "print(s, s.len)\n", "2"),
+              "hi\nha 2\n")
+end sees_a_write_made_through_the_slice_after_it_optimized
+
+// A string outlives every frame, so a view of an array the frame owns moves the array to the heap
+// rather than leaving the string pointing at a stack that has been popped.
+@test("of an array the frame owns moves the array to the heap")
+of_an_array_the_frame_owns_moves_the_array_to_the_heap()
+    if !sv_can_run() then return
+
+    assert_eq(sv_ran("import sysl.text.str_view\n" +
+                     "made() -> string\n" +
+                     "    var a: [2]u8 = [111, 107]\n" +
+                     "    str_view(a[0..<2])\n" +
+                     "deeper(n: int) -> int\n" +
+                     "    var pad: [64]u8 = [0; 64]\n" +
+                     "    if n == 0 then int(pad[0]) else deeper(n - 1) + int(pad[1])\n" +
+                     "val s = made()\n" +
+                     "print(deeper(8), s)\n", DefaultOptimization),
+              "0 ok\n")
+end of_an_array_the_frame_owns_moves_the_array_to_the_heap
+
+@test("of a slice a function was handed moves its caller's array too")
+of_a_slice_a_function_was_handed_moves_its_callers_array_too()
+    if !sv_can_run() then return
+
+    assert_eq(sv_ran("import sysl.text.str_view\n" +
+                     "keep(b: []u8) -> string = str_view(b)\n" +
+                     "made() -> string\n" +
+                     "    var a: [2]u8 = [111, 107]\n" +
+                     "    keep(a[0..<2])\n" +
+                     "deeper(n: int) -> int\n" +
+                     "    var pad: [64]u8 = [0; 64]\n" +
+                     "    if n == 0 then int(pad[0]) else deeper(n - 1) + int(pad[1])\n" +
+                     "val s = made()\n" +
+                     "print(deeper(8), s)\n", DefaultOptimization),
+              "0 ok\n")
+end of_a_slice_a_function_was_handed_moves_its_callers_array_too

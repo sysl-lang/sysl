@@ -1,0 +1,331 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{split, Search}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A **generic** struct's `invariant` is checked exactly where a non-generic one's is -- at the
+// construction, at every field write, at a whole-struct assignment -- with its clauses made real at
+// each instantiation's own type arguments (`reference/errors.md § Generic structs`).
+//
+// And a **zero** is a construction the program did not spell: a declaration with no initializer is
+// checked against every clause its zero holds, since a struct that began its life broken is a value
+// no write ever checked.
+//
+// Most of what is claimed here is what a program DOES -- prints, or traps -- which nothing short of
+// running it says.
+
+private var si_library_cache: Buf[Program] = buf()
+private var si_library_read: bool = false
+
+private si_library() -> Buf[Program]
+    if si_library_read then return si_library_cache
+
+    si_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> si_library_cache = units
+
+    si_library_cache
+end si_library
+
+private si_no_library() -> bool
+    if si_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end si_no_library
+
+private si_can_run() -> bool
+    if si_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end si_can_run
+
+// The whole module a source lowers to beside the real library, or the first thing said about it.
+private si_ir(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = si_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), buf())
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end si_ir
+
+// What a program built from these files does: what it printed, and whether it exited zero. The
+// directory holding them is what is built, so a module file beside the entry file is part of the
+// program; a failure to build is its message and a non-zero exit.
+private si_outcome(files: []const (string, string)) -> (string, bool)
+    val root = make_temp_dir("sysl-invariant").unwrap()
+
+    make_dir_all(root).unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end si_outcome
+
+// **What a program PRINTS**, where it runs to the end.
+private si_ran(text: string) -> string
+    val out = si_outcome([("main.sysl", text)])
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+end si_ran
+
+// Whether a program that BUILT stopped short of exiting zero -- a check that failed.
+private si_exits(files: []const (string, string)) -> bool
+    val out = si_outcome(files)
+
+    !out.1 && !out.0.contains("error:")
+end si_exits
+
+private si_exits_one(text: string) -> bool = si_exits([("main.sysl", text)])
+
+private si_range() -> string = "struct Range[T: Ord]\n    lo: T\n    hi: T\n    invariant lo <= hi\n"
+
+// -- a generic struct's clause is checked at its construction --------------------------------------
+
+@test("a generic struct's construction that holds proceeds")
+sig_one_that_holds_proceeds()
+    if !si_can_run() then return
+
+    assert_eq(si_ran(si_range() + "var r = Range(1, 5)\nprint(r.lo, r.hi)"), "1 5\n")
+
+@test("a generic struct's construction that does not hold traps")
+sig_one_that_does_not_traps()
+    if !si_can_run() then return
+
+    assert(si_exits_one(si_range() + "var r = Range(5, 1)\nprint(r.lo)"))
+
+// Two instantiations are two functions, and each is the clause at its own type: a float range is
+// compared as floats, not through whatever the first instantiation happened to be.
+@test("a generic struct's clause is checked at each instantiation's own type")
+sig_at_each_instantiations_own_type()
+    if !si_can_run() then return
+
+    assert_eq(si_ran(si_range() + "var a = Range(1, 5)\nvar b = Range(0.5, 2.5)\nprint(a.hi, b.hi)"),
+              "5 2.5\n")
+    assert(si_exits_one(si_range() + "var a = Range(1, 5)\nvar b = Range(2.5, 0.5)\nprint(a.hi, b.hi)"))
+
+// -- and at every field write ----------------------------------------------------------------------
+
+@test("a generic struct's field write that holds proceeds")
+sig_a_write_that_holds_proceeds()
+    if !si_can_run() then return
+
+    assert_eq(si_ran(si_range() + "var r = Range(1, 5)\nr.hi = 9\nr.lo += 2\nprint(r.lo, r.hi)"), "3 9\n")
+
+@test("a generic struct's field write that breaks it traps at that write")
+sig_a_write_that_breaks_it_traps()
+    if !si_can_run() then return
+
+    assert(si_exits_one(si_range() + "var r = Range(1, 5)\nr.hi = 0\nprint(r.hi)"))
+
+@test("a generic struct's field write through a pointer traps")
+sig_a_write_through_a_pointer_traps()
+    if !si_can_run() then return
+
+    assert(si_exits_one(si_range() + "var r = Range(1, 5)\nvar p = &r\np.lo = 7\nprint(r.lo)"))
+
+@test("a generic struct's field write from inside a member is checked")
+sig_a_write_from_inside_a_member()
+    if !si_can_run() then return
+
+    val stretch = "struct Span[T: Ord]\n    lo: T\n    hi: T\n    invariant lo <= hi\n\n" +
+                  "    set_hi(*self, v: T)\n        self.hi = v\n"
+
+    assert_eq(si_ran(stretch + "var s = Span(1, 5)\ns.set_hi(8)\nprint(s.hi)"), "8\n")
+    assert(si_exits_one(stretch + "var s = Span(1, 5)\ns.set_hi(0)\nprint(s.hi)"))
+
+// -- a view's element is on its far side -----------------------------------------------------------
+
+// A view's elements are on its far side, which no clause may read, so writing one is owed no
+// re-check -- and the program that relies on that is the ordinary one: a clause over the view's
+// length, and elements written freely underneath it.
+@test("a write to a view's element owes the clause over its length nothing")
+sig_a_views_element_owes_nothing()
+    if !si_can_run() then return
+
+    val seq = "struct Seq\n    elems: []int\n    count: usize\n    invariant count <= elems.len\n"
+
+    assert_eq(si_ran(seq + "var s = Seq([1, 2, 3], 2)\ns.elems[2] = 9\nvar p = &s.elems[0]\n*p = 4\n" +
+                     "var v = s.elems[..<s.count]\nv[1] = 5\nprint(s.elems[0], s.elems[1], s.elems[2])"),
+              "4 5 9\n")
+
+// The construction is the one check either way: an element write adds none, where a write of the
+// count adds one.
+@test("a write to a view's element is not re-checked, where a write of the count is")
+sig_a_views_element_is_not_rechecked()
+    if si_no_library() then return
+
+    val seq = "struct Seq\n    elems: []int\n    count: usize\n    invariant count <= elems.len\n\n" +
+              "var s = Seq([1, 2, 3], 2)\n"
+
+    assert_eq(si_inv_calls(si_ir(seq + "s.elems[0] = 5\nprint(s.elems[0])\n")), 1)
+    assert_eq(si_inv_calls(si_ir(seq + "s.count = 1\nprint(s.elems[0])\n")), 2)
+
+// The calls to a `$inv` function in the entry body.
+private si_inv_calls(ir: string) -> int
+    var n = 0
+    var inside = false
+
+    for line in split(ir, "\n")
+        if line.starts_with("define") then inside = line.contains("@main(")
+        else if inside && line == "}" then inside = false
+        else if inside && line.contains("call i1 @") && line.contains("$inv") then n += 1
+
+    n
+end si_inv_calls
+
+// -- a zero is checked as the construction it is ---------------------------------------------------
+
+private si_window() -> string = "struct Window\n    lo: int\n    hi: int\n    invariant lo < hi\n"
+
+@test("a zero that breaks the clause traps where it is declared")
+sig_a_zero_that_breaks_the_clause_traps()
+    if !si_can_run() then return
+
+    assert(si_exits_one(si_window() + "var w: Window\nprint(w.lo)"))
+
+@test("a zero that satisfies the clause is the ordinary declaration")
+sig_a_zero_that_satisfies_it()
+    if !si_can_run() then return
+
+    assert_eq(si_ran("struct Count\n    n: int\n    invariant n >= 0\nvar c: Count\nc.n += 2\nprint(c.n)"),
+              "2\n")
+
+@test("a zero inside an array is checked")
+sig_a_zero_inside_an_array()
+    if !si_can_run() then return
+
+    assert(si_exits_one(si_window() + "var ws: [2]Window\nprint(ws[0].lo)"))
+
+@test("a zero inside another struct's field is checked")
+sig_a_zero_inside_a_field()
+    if !si_can_run() then return
+
+    assert(si_exits_one(si_window() + "struct Frame\n    w: Window\n    k: int\nvar f: Frame\nprint(f.k)"))
+
+// Storage a module declares with no initializer is zeroed in the object file unless something has
+// to run, and a zero holding a clause is exactly something that has to run.
+private si_frame(clause: string) -> [2](string, string) =
+    [("main.sysl", "import frame.width\n\nprint(width())\n"),
+     ("frame.sysl", s"module frame\n\nstruct Window\n    lo: int\n    hi: int\n    invariant $clause\n\n" +
+                    "var w: Window\n\nwidth() -> int = w.hi - w.lo\n")]
+
+@test("module storage whose zero breaks the clause stops the program")
+sig_module_storage_zero_breaks()
+    if !si_can_run() then return
+
+    assert(si_exits(si_frame("lo < hi")))
+
+@test("and module storage whose zero satisfies it runs")
+sig_module_storage_zero_holds()
+    if !si_can_run() then return
+
+    val out = si_outcome(si_frame("lo <= hi"))
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "0\n")
+
+@test("a generic struct's zero is checked at its instantiation")
+sig_a_generic_zero()
+    if !si_can_run() then return
+
+    assert(si_exits_one("struct Gap[T: Ord]\n    lo: T\n    hi: T\n    invariant lo < hi\n\n" +
+                        "var g: Gap[int]\nprint(g.lo)"))
+    assert_eq(si_ran("struct Gap[T: Ord]\n    lo: T\n    hi: T\n    invariant lo <= hi\n\n" +
+                     "var g: Gap[int]\nprint(g.lo)"), "0\n")
+
+// -- the bounded clause compiles -------------------------------------------------------------------
+
+@test("a generic struct's bounded clause compiles to a function")
+sig_the_bounded_one_compiles()
+    if si_no_library() then return
+
+    val ir = si_ir("struct Span[T: Ord]\n    lo: T\n    hi: T\n    invariant lo <= hi\n" +
+                   "var s = Span(1, 2)\nprint(s.lo)")
+
+    assert(ir.contains("$inv"), ir)
+
+// -- a Buf behaves as it did before it carried a clause --------------------------------------------
+
+private si_buf() -> string = "import sysl.buf.{Buf, buf}\n\n"
+
+@test("a zero Buf is the empty one, and grows")
+sig_a_zero_buf_grows()
+    if !si_can_run() then return
+
+    assert_eq(si_ran(si_buf() + "var b: Buf[int]\nb.push(4)\nb.push(5)\nprint(b.len(), b.at(1))"), "2 5\n")
+
+@test("reading past a Buf's count still panics with the length, though storage is there")
+sig_a_buf_read_past_the_count_panics()
+    if !si_can_run() then return
+
+    val out = si_outcome([("main.sysl", si_buf() + "var b: Buf[int] = buf()\nb.extend([1, 2, 3])\n" +
+                                        "b.truncate(1)\nprint(b.at(1))")])
+
+    assert(!out.1, out.0)
+    assert(out.0.contains("panic: index 1 past the 1 elements of a Buf"), out.0)
+
+@test("a Buf's count may be moved within the storage")
+sig_a_buf_count_moves_within()
+    if !si_can_run() then return
+
+    assert_eq(si_ran(si_buf() + "var b: Buf[int] = buf()\nb.extend([1, 2, 3])\nb.truncate(1)\n" +
+                     "b.count = 3\nprint(b.at(2))"), "3\n")
+
+@test("but not past it")
+sig_a_buf_count_not_past()
+    if !si_can_run() then return
+
+    assert(si_exits_one(si_buf() + "var b: Buf[int] = buf()\nb.push(1)\nb.count = b.elems.len + 1\n" +
+                        "print(b.len())"))

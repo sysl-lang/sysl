@@ -37,7 +37,7 @@ register_predicate(a: &Analysis, scope: Scope, s: Stmt)
                                Func(bool_func(pred_key(key), params, d.pred.unwrap(), s.span),
                                     s.span, scope))
         StructDecl(d) ->
-            if d.invariants.is_empty() || !d.tparams.is_empty() then return
+            if d.invariants.is_empty() then return
 
             val key = module_qualify(scope.module_name, d.name)
             var params: Buf[Param] = buf()
@@ -50,9 +50,16 @@ register_predicate(a: &Analysis, scope: Scope, s: Stmt)
                 // register is read. A clause that reads one is refused where the struct is declared.
                 params.push(Param(f.span, f.name, unqualified_ref(f.typ), Public, None, false, false))
 
-            a.tables.funcs.put(inv_key(key),
-                               Func(bool_func(inv_key(key), params, all_of(d.invariants), s.span),
-                                    s.span, scope))
+            // A **generic** struct's clauses are a generic function over the struct's own
+            // parameters, with its bounds -- so the body is checked once against the bounds by the
+            // definition-time pass, as any generic body is, and made real per instantiation by the
+            // check site (`inv_fn_for`).
+            var f = bool_func(inv_key(key), params, all_of(d.invariants), s.span)
+
+            f.tparams = d.tparams
+            f.bounds = d.bounds
+            f.tvalues = d.tvalues
+            a.tables.funcs.put(inv_key(key), Func(f, s.span, scope))
         _ -> ()
 
 // The declaration one of these lowers to: a plain function of the values, answering a `bool`.
@@ -63,7 +70,7 @@ private bool_func(name: string, params: Buf[Param], cond: Expr, span: Span) -> F
 
     FuncDecl(name, buf(), params, Some(named_type(span, "bool")), body, buf(), false, Public, buf(),
              buf(), buf(), None, None, None, false, false, false, None, None, None, None, buf(),
-             buf())
+             buf(), no_marks())
 end bool_func
 
 // A run of clauses as the one condition they amount to.

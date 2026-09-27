@@ -661,40 +661,52 @@ variant_from_expected(cx: &Analyzer, name: string,
         _ -> None
 end variant_from_expected
 
+// Whether any enum this compilation has registered carries a variant of this name. A `false` means
+// every walk below would come back empty, so a call or a bare name that is no variant at all -- which
+// is nearly every one -- pays one lookup rather than a pass over every declared type.
+may_name_variant(cx: &Analyzer, name: string) -> bool = cx.an.tables.variant_names.has(name)
+
 // The enum a bare variant name belongs to, preferring the one the position asked for.
 variant_of(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[(Type, EnumVariant)]
     val settled = variant_from_expected(cx, name, expected)
 
     if settled.is_some() then return settled
 
-    var found: Option[(Type, EnumVariant)] = None
+    if !may_name_variant(cx, name) then return None
 
+    // The first instantiation in registration order whose enum declares the name and may be named
+    // here. Every test is a question with no side effect, so the cheap one -- does this enum have a
+    // variant of that name at all -- is asked first, and the visibility lookups are paid only for
+    // the few enums that could answer.
     for i in 0..<cx.an.tables.enum_insts.len()
         val t = cx.an.tables.enum_insts.at(i)
 
         t match
             Enum(d) ->
-                if found.is_none() && reachable_key(cx.an, d.base, cx.scope) &&
-                        visible_here(cx, d.base) then
-                    val v = d.variant(name)
+                val v = d.variant(name)
 
-                    if v.is_some() then found = Some((t, v.unwrap()))
+                if v.is_some() && reachable_key(cx.an, d.base, cx.scope) &&
+                        visible_here(cx, d.base) then
+                    return Some((t, v.unwrap()))
             _ -> ()
 
-    found
+    None
 end variant_of
 
 // The enums in scope that declare a variant of this name, by DECLARATION rather than by
 // instantiation -- `Option[int]` and `Option[string]` are one answer, since the question is which
-// enum was meant and not which of its instantiations.
+// enum was meant and not which of its instantiations. In the order their first instantiation was
+// registered, which is the order the refusal names them in.
 variant_homes(cx: &Analyzer, name: string) -> Buf[string]
     var homes: Buf[string] = buf()
+
+    if !may_name_variant(cx, name) then return homes
 
     for i in 0..<cx.an.tables.enum_insts.len()
         cx.an.tables.enum_insts.at(i) match
             Enum(d) ->
-                if reachable_key(cx.an, d.base, cx.scope) && visible_here(cx, d.base) &&
-                        d.variant(name).is_some() && !holds_string(homes, d.base) then
+                if d.variant(name).is_some() && !holds_string(homes, d.base) &&
+                        reachable_key(cx.an, d.base, cx.scope) && visible_here(cx, d.base) then
                     homes.push(d.base)
             _ -> ()
 
@@ -736,6 +748,8 @@ end ambiguous_variant
 // and reaching for whichever instantiation some other file happened to register first would make
 // the answer depend on what the rest of the program does.
 private unsettled_variant(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[string]
+    if !may_name_variant(cx, name) then return None
+
     if variant_from_expected(cx, name, expected).is_some() then return None
 
     for i in 0..<cx.an.tables.types.len()
@@ -853,7 +867,7 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
                                   s"${type_show(ty)}")
 
                 return produced(TExpr(e.span, TUnary("-", t, unary_type(ty))))
-            Floating(_) -> return produced(TExpr(e.span, TUnary("-", t, unary_type(ty))))
+            Floating(_, _) -> return produced(TExpr(e.span, TUnary("-", t, unary_type(ty))))
             _ -> return cx.err(e.span, s"unary '-' is not defined for ${type_show(ty)}")
 
     if op == "~" then
@@ -1186,6 +1200,8 @@ typed_by_position(cx: &Analyzer, e: Expr) -> bool = *e.kind match
 // an answer rather than a question. One that **carries** something derives its arguments from what
 // it was given, which is what makes `Some(3)` a type its sibling can be read against.
 private payload_free_generic_variant(cx: &Analyzer, name: string) -> bool
+    if !may_name_variant(cx, name) then return false
+
     for i in 0..<cx.an.tables.types.len()
         val key = cx.an.tables.types.key_at(i)
 

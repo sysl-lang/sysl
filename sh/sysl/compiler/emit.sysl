@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
 import sysl.math.bigint.from_int
 
 // **The substrate a body is written into**: registers, basic blocks, the entry-block prologue, and
@@ -148,8 +149,11 @@ struct Emit
     bufs: Buf[(string, Type)]
 
     // The runtime helpers asked for, by name, and what each is to be built from. A helper is named
-    // where it is called and generated afterwards, because generating one may ask for another.
+    // where it is called and generated afterwards, because generating one may ask for another. The
+    // list keeps the order helpers are drained in, which is part of the output; the set beside it is
+    // what membership is asked against.
     requested: Buf[string]
+    requested_set: Set[string]
     queue: Buf[HelperReq]
 
     // The scopes a value's count is given back at: the slots a lexical block owns, the values a
@@ -178,6 +182,22 @@ struct Emit
     // that storage alive is whatever the place was rooted at -- which is a question asked long after
     // the declaration is out of sight.
     ref_places: Buf[(string, TExpr)]
+
+    // The two sides of the argument convention (`borrowing.sysl`). What the body being lowered let
+    // the address of out, which is what a call it makes could change under it; the functions whose
+    // bodies can release nothing, so a place handed to one needs no count; and the functions whose
+    // address the program takes, which a caller outside sysl's convention may reach.
+    caller_exposed: Set[string]
+    inert: Set[string]
+    address_taken: Set[string]
+
+    // What a contract tells the optimizer (`contract_assume.sysl`): every function whose `ensure` a
+    // call site may repeat, with the parameters its own body may have rebound before the check ran;
+    // every struct's synthesised `invariant` function by the name it is emitted under; and whether
+    // anything was said, which is what `llvm.assume` is declared for.
+    contracted: Map[string, (TFunc, Set[string])]
+    inv_funcs: Map[string, TFunc]
+    uses_assume: bool
 
     // The first form this body reached that nothing here lowers. A body that has one is not emitted.
     gap: Option[string]
@@ -300,6 +320,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
     var boxes: Buf[(string, Type)] = buf()
     var bufs: Buf[(string, Type)] = buf()
     var requested: Buf[string] = buf()
+    var requested_set: Set[string] = set()
     var queue: Buf[HelperReq] = buf()
     var temps: Buf[(Val, Type)] = buf()
     var temp_marks: Buf[usize] = buf()
@@ -314,13 +335,14 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
     var variadic_types: Buf[(string, IrFnType)] = buf()
     var export_symbols: Buf[(string, string)] = buf()
 
-    Emit(t, layout_for(t), int(t.pointer_bits()), globals, 0, sat_decls, false, false, false,
+    Emit(t, memo_layout_for(t), int(t.pointer_bits()), globals, 0, sat_decls, false, false, false,
          false, false, false, false, false, 0,
          prologue, blocks, current, None, "entry", 0, 0, false, reached, loops, scratch, symbols,
          foreigns, variadics, variadic_types, export_symbols, ensures, None, "", tail_calls, tail_params,
          "", self_params, None, ghost_funcs, destructors, false, false, false,
-         false, boxes, bufs, requested, queue, temps, temp_marks, owned_slots, owned_marks, defers,
-         defer_marks, promoted, promoted_boxes, promoted_temps, ref_places, None)
+         false, boxes, bufs, requested, requested_set, queue, temps, temp_marks, owned_slots, owned_marks, defers,
+         defer_marks, promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
+         set(), set(), map(), map(), false, None)
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -372,6 +394,7 @@ start_function(e: *Emit)
     e.defer_marks.clear()
     e.promoted_boxes.clear()
     e.ref_places.clear()
+    e.caller_exposed = exposed_unknown()
     e.gap = None
 end start_function
 

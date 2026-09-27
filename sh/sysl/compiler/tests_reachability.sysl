@@ -1,0 +1,74 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.time.{monotonic, whole_micros}
+
+// What pruning costs as a program grows.
+//
+// **The walk has to be linear in the functions it reaches**, because every program is pruned and a
+// large one is exactly the program somebody is waiting on. Each reached name is looked up once and
+// each "have I seen this" is one set lookup; a walk that scans the function list per reached name,
+// or scans its visited list per name a body holds, is quadratic, and on a hundred-thousand-line
+// program that was most of the compile.
+//
+// The claim is a ratio rather than a bound, so it holds on a slow machine as well as a fast one: a
+// program four times larger may cost four times as much to prune and not sixteen times.
+
+// A chain of `n` functions `main` reaches, beside a chain of `n` nothing reaches.
+private chain_program(n: usize) -> string
+    var lines: Buf[string] = buf()
+
+    lines.push("main()\n    val n = f0(1)\n\n")
+
+    for i in 0..<n
+        if i + 1 < n
+            lines.push(s"f$i(n: int) -> int = f${i + 1}(n + 1)\n\n")
+            lines.push(s"g$i(n: int) -> int = g${i + 1}(n + 1)\n\n")
+        else
+            lines.push(s"f$i(n: int) -> int = n\n\n")
+            lines.push(s"g$i(n: int) -> int = n\n\n")
+
+    var text = ""
+
+    for i in 0..<lines.len()
+        text = text + lines.at(i)
+
+    text
+end chain_program
+
+// The best of three prunes of one program, in microseconds, and how many functions survived.
+private prune_cost(n: usize) -> (long, usize)
+    val done = typed_of(chain_program(n))
+
+    assert(done.reported.is_empty(), "the generated program is sound")
+
+    val p = strip_tests(program_of(done, done.main_module))
+
+    var best: long = -1
+    var kept: usize = 0
+
+    for round in 0..<3
+        val started = monotonic()
+        val q = prune(p, buf())
+        val took = whole_micros(monotonic() - started)
+
+        kept = q.funcs.len()
+
+        if best < 0 || took < best then best = took
+
+    (best, kept)
+end prune_cost
+
+@test("pruning a program four times larger costs about four times as much, not sixteen")
+pruning_is_linear()
+    val small = prune_cost(500)
+    val large = prune_cost(2000)
+
+    assert_eq(small.1, 501)
+    assert_eq(large.1, 2001)
+
+    val ratio = large.0 / (if small.0 > 0 then small.0 else 1)
+
+    assert(ratio < 9, s"a 4x program took ${ratio}x as long to prune (${small.0} us, then ${large.0} us)")
+end pruning_is_linear

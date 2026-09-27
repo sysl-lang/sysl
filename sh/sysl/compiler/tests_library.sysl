@@ -3,7 +3,8 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.env.get as env_var
-import sysl.fs.{make_temp_dir, read_bytes, remove_file, walk, write_text}
+import sysl.fs.{make_temp_dir, read_bytes, remove_dir_all, remove_file, walk, write_text}
+import sysl.process.capture
 import sysl.text.{from_utf8_unchecked, Search}
 
 // Separate compilation: which of a library's declarations its object half can hold, the file that
@@ -428,6 +429,19 @@ a_generic_is_left_to_whoever_instantiates_it()
         assert(names.at(i).index_of("first").is_none(), s"'${names.at(i)}' is not the generic")
 end a_generic_is_left_to_whoever_instantiates_it
 
+// **A library owns the functions its modules declared, and a member of a built-in type is one of
+// them.** `int.twice` is keyed under `int` and names no module, but the `impl` that wrote it is this
+// library's -- so read off the key it was filed as somebody else's, its callers were compiled here
+// and the callee was defined by nobody, which only dead-stripping hid.
+@test("a member of a built-in type a library's impl writes is the library's own, and advertised")
+a_builtin_member_is_the_librarys_own()
+    val src = "module lib\n\ntrait Twice\n    twice(self) -> int\n\nimpl Twice for int\n" +
+        "    twice(self) -> int = self * 2\n\nquad(n: int) -> int = n.twice().twice()\n"
+
+    assert(advertises(src, "int.twice"), s"the member is advertised: ${determined_of(src).len()} names")
+    assert(advertises(src, "lib$quad"), "and so is the function that calls it")
+end a_builtin_member_is_the_librarys_own
+
 @test("the advertised names are sorted, so one library gives one list however it was read")
 the_advertised_names_are_ordered()
     val names = determined_of("module lib\n\nb() -> int = 1\n\na() -> int = 2\n\nc() -> int = 3\n")
@@ -542,3 +556,176 @@ a_module_names_what_it_states()
     assert_eq(loose.len(), 1)
     assert_eq(loose.at(0), "missing")
 end a_module_names_what_it_states
+
+// -- the standard module's built-in-type members ---------------------------------------------------
+
+// What the standard module's artifact advertises on this machine, or nothing where its source is not
+// here to build one from.
+private std_advertised() -> Option[Buf[string]]
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+
+    std_artifact(host_target()) match
+        Err(why) ->
+            assert(false, why)
+            None
+        Ok(found) -> Some(found.precompiled)
+end std_advertised
+
+// A program's emitted text, compiled against the standard module's artifact as a build would be.
+private std_program_text(src: string) -> Option[string]
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+
+    val dir = make_temp_dir("sysl-members-") match
+        Err(_) ->
+            print("skipped: this machine will not make a temporary directory")
+            return None
+        Ok(made) -> made
+
+    val scratch = s"$dir/main.sysl"
+
+    write_text(scratch, src).unwrap_or(())
+
+    val out = emit_llvm_text(scratch, None)
+
+    remove_dir_all(dir).unwrap_or(())
+
+    out match
+        Err(why) ->
+            assert(false, why.message)
+            None
+        Ok(emitted) -> Some(emitted.text)
+end std_program_text
+
+// Whether a line opening with `head` -- `define ` or `declare ` -- names `symbol` as its function.
+private names_function(text: string, head: string, symbol: string) -> bool
+    val lines = lines_of(text)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.starts_with(head) &&
+                (line.index_of(s"@$symbol(").is_some() || line.index_of(s"@\"$symbol\"(").is_some())
+            return true
+
+    false
+end names_function
+
+// Every function a text defines whose symbol begins with `prefix`.
+private defined_with_prefix(text: string, prefix: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val lines = lines_of(text)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+        val at = line.index_of(s"@$prefix")
+
+        if line.starts_with("define ") && at.is_some()
+            val rest = line[at.unwrap() + 1..<line.len]
+            val open = rest.index_of("(")
+
+            if open.is_some() then out.push(rest[0..<open.unwrap()])
+
+    out
+end defined_with_prefix
+
+// **A library owns the functions its modules declared, and a member of a built-in type is one of
+// them.** `char.is_digit` is keyed under `char` and names no module, but `impl Ascii for char` is
+// written in `sysl.text` -- so the standard module's object is where it is defined, with external
+// linkage, and advertised like any other of its functions. `u32.round_key` reads `k256`, so it is the
+// program's to compile, and so is every caller of it.
+@test("and it defines and advertises every member of a built-in type its own functions call")
+the_std_advertises_its_builtin_members()
+    val names = std_advertised() match
+        None -> return
+        Some(found) -> found
+
+    val found = ["char.is_hex_digit", "char.is_digit", "real.nan", "f32.abs",
+                 "constslice.byte.last_index_of_byte", "arr.eq.c16.byte"]
+
+    for i in 0..<found.len
+        assert(holds_string(names, found[i]), s"'${found[i]}' is advertised")
+
+    assert(!holds_string(names, "u32.round_key"), "a member reading module storage is not")
+
+    // A closure is the library's too, and internal: its name is a counter in the unit that lowered
+    // it, so it is never advertised.
+    for i in 0..<names.len()
+        assert(!mentions_closure(names.at(i)), s"'${names.at(i)}' names a closure")
+end the_std_advertises_its_builtin_members
+
+@test("and a program that calls one declares it and links against the library's copy")
+a_program_declares_the_std_member()
+    val text = std_program_text("import sysl.path.{extension}\n\nmain()\n" +
+        "    prints(extension(\"a.txt\").unwrap_or(\"\"))\n") match
+        None -> return
+        Some(t) -> t
+
+    assert(names_function(text, "declare ", "constslice.byte.last_index_of_byte"), "it is declared")
+    assert(!names_function(text, "define ", "constslice.byte.last_index_of_byte"),
+           "and not defined a second time")
+end a_program_declares_the_std_member
+
+// `arr.eq` is a generic default brought to every fixed-size array, and the library reached it at
+// sixteen bytes. At three `int`s it did not, so the program builds that one itself -- as it does for
+// every generic -- and the pair is the discriminating part.
+@test("while one the library never instantiated is still the program's to compile")
+an_uninstantiated_member_is_the_programs()
+    val names = std_advertised() match
+        None -> return
+        Some(found) -> found
+
+    val text = std_program_text("var a = [1, 2, 3]\nvar b = [1, 2, 4]\nprint(a == b)\n") match
+        None -> return
+        Some(t) -> t
+
+    var advertised_eqs = 0
+
+    for i in 0..<names.len()
+        if names.at(i).starts_with("arr.eq.") then advertised_eqs += 1
+
+    val eqs = defined_with_prefix(text, "arr.eq.")
+
+    assert(advertised_eqs > 0, "the library advertises an 'arr.eq' of its own")
+    assert(!eqs.is_empty(), "the program defines the one it asked for")
+
+    for i in 0..<eqs.len()
+        assert(!holds_string(names, eqs.at(i)), s"'${eqs.at(i)}' is not also the library's")
+end an_uninstantiated_member_is_the_programs
+
+// `char.is_digit` has no module in its name and one declaring module, so the program declares it
+// rather than compiling a copy, and the link resolves it to the standard module's.
+@test("and a member of a built-in type the library supplies comes from its object file too")
+a_std_member_links_from_the_artifact()
+    val src = "import sysl.text.Ascii\n\nprint('7'.is_digit(), 'x'.is_digit())\n"
+    val text = std_program_text(src) match
+        None -> return
+        Some(t) -> t
+
+    assert(names_function(text, "declare ", "char.is_digit"), "it is declared")
+    assert(!names_function(text, "define ", "char.is_digit"), "and not defined")
+
+    val root = make_temp_dir("sysl-members-run").unwrap()
+
+    write_text(s"$root/main.sysl", src).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) -> assert_eq(out.text, "true false\n")
+end a_std_member_links_from_the_artifact

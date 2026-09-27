@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.container.{Map, map}
+import sysl.container.{Map, map, Set, set}
 
 // **What a program can arrive at**, and the declarations that go when nothing can.
 //
@@ -17,10 +17,18 @@ import sysl.container.{Map, map}
 // imports, so an unconditional root would put an unimported module's contribution into the output.
 
 // What one walk found: every function it can arrive at and every `val` it reads.
+//
+// Each list is in the order its names first arrived, and each has a set beside it that answers
+// membership. **The set is what keeps a walk linear**: a program of `n` functions asks "have I seen
+// this one" once per name every body holds, and a scan of the list for each of those is the whole
+// walk again per name.
 struct Live
     calls: Buf[string]
     vals: Buf[string]
     erased: Buf[string]
+    call_set: Set[string]
+    val_set: Set[string]
+    erased_set: Set[string]
 end Live
 
 // The program with everything nothing can reach dropped.
@@ -30,12 +38,12 @@ prune(p: TProgram, own: Buf[string]) -> TProgram
     var externs: Buf[TExtern] = buf()
 
     for i in 0..<p.externs.len()
-        if holds_string(live.calls, p.externs.at(i).name) then externs.push(p.externs.at(i))
+        if live.call_set.has(p.externs.at(i).name) then externs.push(p.externs.at(i))
 
     var funcs: Buf[TFunc] = buf()
 
     for i in 0..<p.funcs.len()
-        if holds_string(live.calls, p.funcs.at(i).name) then funcs.push(p.funcs.at(i))
+        if live.call_set.has(p.funcs.at(i).name) then funcs.push(p.funcs.at(i))
 
     with_declarations(p, externs, funcs)
 end prune
@@ -49,28 +57,34 @@ end prune
 // module answers no for precisely the case the seam exists to serve.
 private walk_program(p: TProgram, own: Buf[string]) -> &Live
     val entries = entry_points(p, own)
+    val index = func_index(p)
+
+    var exports: Buf[TFunc] = buf()
+
+    for i in 0..<p.funcs.len()
+        if p.funcs.at(i).exported.is_some() then exports.push(p.funcs.at(i))
 
     var extra: Buf[TFunc] = buf()
     var live = no_reached()
     var more = true
 
     while more
-        live = reached_from(p, roots_of(p, entries, extra))
+        live = reached_from(p, index, roots_of(p, entries, extra))
 
         for i in 0..<entries.len()
-            add_string(&live.calls, entries.at(i).name)
+            add_call(live, entries.at(i).name)
 
         for i in 0..<extra.len()
-            add_string(&live.calls, extra.at(i).name)
+            add_call(live, extra.at(i).name)
 
         more = false
 
         for i in 0..<p.externs.len()
             val x = p.externs.at(i)
 
-            if holds_string(live.calls, x.name)
-                for j in 0..<p.funcs.len()
-                    val f = p.funcs.at(j)
+            if live.call_set.has(x.name)
+                for j in 0..<exports.len()
+                    val f = exports.at(j)
 
                     if f.exported == Some(x.symbol) && !holds_func(extra, f.name)
                         extra.push(f)
@@ -102,26 +116,26 @@ private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc]) -> &Live
         val t = p.vtables.at(i)
 
         for j in 0..<t.slots.len()
-            add_string(&out.calls, t.slots.at(j).target)
+            add_call(out, t.slots.at(j).target)
 
     p.entry match
         Some(en) ->
-            add_string(&out.calls, en.func)
+            add_call(out, en.func)
 
             en.args_fn match
-                Some(n) -> add_string(&out.calls, n)
+                Some(n) -> add_call(out, n)
                 None -> ()
 
             en.result_fn match
-                Some(n) -> add_string(&out.calls, n)
+                Some(n) -> add_call(out, n)
                 None -> ()
         None -> ()
 
     for i in 0..<entries.len()
-        add_string(&out.calls, entries.at(i).name)
+        add_call(out, entries.at(i).name)
 
     for i in 0..<extra.len()
-        add_string(&out.calls, extra.at(i).name)
+        add_call(out, extra.at(i).name)
 
     out
 end roots_of
@@ -132,8 +146,9 @@ end roots_of
 // function already visited adds nothing a second time. A **dynamic** call is answered with every
 // table for the trait, since a table is a constant the program can read a function out of and a
 // definition it points at has to survive.
-private reached_from(p: TProgram, root: &Live) -> &Live
+private reached_from(p: TProgram, index: FuncIndex, root: &Live) -> &Live
     val out = no_reached()
+    val none = p.funcs.len()
 
     var queue: Buf[string] = buf()
 
@@ -144,24 +159,57 @@ private reached_from(p: TProgram, root: &Live) -> &Live
 
         queue.truncate(queue.len() - 1)
 
-        for i in 0..<p.funcs.len()
-            if p.funcs.at(i).name == name
-                val body = body_refs(p, p.funcs.at(i))
+        var at = index.first.get_or(name, none)
 
-                take_all(out, body, &queue)
+        while at < none
+            take_all(out, body_refs(p, p.funcs.at(at)), &queue)
+
+            at = index.next.at(at)
 
     out
 end reached_from
 
+// Where each function of a program is, by name: the first index holding a name, and from each index
+// the next one holding the same name, so a name held twice is visited at both places and in the
+// order the program lists them.
+private struct FuncIndex
+    first: Map[string, usize]
+    next: Buf[usize]
+
+private func_index(p: TProgram) -> FuncIndex
+    val n = p.funcs.len()
+
+    var first: Map[string, usize] = map()
+    var next: Buf[usize] = buf()
+
+    for i in 0..<n
+        next.push(n)
+
+    var i = n
+
+    while i > 0
+        i -= 1
+
+        val name = p.funcs.at(i).name
+
+        first.get(name) match
+            Some(j) -> next.set(i, j)
+            None -> ()
+
+        first.put(name, i)
+
+    FuncIndex(first, next)
+end func_index
+
 private take_all(out: &Live, from: &Live, queue: *Buf[string])
     for i in 0..<from.vals.len()
-        add_string(&out.vals, from.vals.at(i))
+        add_val(out, from.vals.at(i))
 
     for i in 0..<from.erased.len()
-        add_string(&out.erased, from.erased.at(i))
+        add_erased(out, from.erased.at(i))
 
     for i in 0..<from.calls.len()
-        if add_string(&out.calls, from.calls.at(i)) then queue.push(from.calls.at(i))
+        if add_call(out, from.calls.at(i)) then queue.push(from.calls.at(i))
 end take_all
 
 // Every function of a compilation that reads module storage, directly or through anything it calls.
@@ -304,13 +352,13 @@ private take_node_of(p: TProgram, out: &Live, e: TExpr) = node_names(out, e, Som
 // any other string.
 private node_names(out: &Live, e: TExpr, tables: Option[Buf[TVtable]])
     *e.kind match
-        TGlobal(symbol, _, _) -> add_string(&out.vals, symbol)
-        TCall(name, _, _, _) -> add_string(&out.calls, name)
-        TFuncAddr(name, _, _) -> add_string(&out.calls, name)
+        TGlobal(symbol, _, _) -> add_val(out, symbol)
+        TCall(name, _, _, _) -> add_call(out, name)
+        TFuncAddr(name, _, _) -> add_call(out, name)
         TTry(_, _, _, _, _, _, convert) ->
-            if convert.is_some() then add_string(&out.calls, convert.unwrap())
-        TStructInvCheck(_, _, inv_fn) -> add_string(&out.calls, inv_fn)
-        TRecheck(_, _, _, inv_fn) -> add_string(&out.calls, inv_fn)
+            if convert.is_some() then add_call(out, convert.unwrap())
+        TStructInvCheck(_, _, inv_fn) -> add_call(out, inv_fn)
+        TRecheck(_, _, _, inv_fn) -> add_call(out, inv_fn)
         TConstrainedCheck(_, target) -> take_predicate(out, target)
         TUpdate(_, _, _, _, dispatch, check) ->
             take_dispatch(out, dispatch)
@@ -320,11 +368,11 @@ private node_names(out: &Live, e: TExpr, tables: Option[Buf[TVtable]])
         TCompare(_, cmps) ->
             for i in 0..<cmps.len()
                 take_dispatch(out, cmps.at(i).dispatch)
-        TErase(_, vtable, _) -> add_string(&out.erased, vtable)
+        TErase(_, vtable, _) -> add_erased(out, vtable)
         TVCall(receiver, slot, _, _, _) -> take_dynamic(out, tables, texpr_type(receiver), slot)
         TRender(value, method, _, slot) ->
             if slot.is_some() then take_dynamic(out, tables, texpr_type(value), slot.unwrap())
-            else add_string(&out.calls, method)
+            else add_call(out, method)
         _ -> ()
 end node_names
 
@@ -332,17 +380,17 @@ private take_write(out: &Live, w: TWrite)
     take_dispatch(out, w.dispatch)
 
     for i in 0..<w.check.len()
-        add_string(&out.calls, w.check.at(i).inv_fn)
+        add_call(out, w.check.at(i).inv_fn)
 
     if w.constraint.is_some() then take_predicate(out, w.constraint.unwrap())
 end take_write
 
 private take_dispatch(out: &Live, d: Option[TDispatch])
-    if d.is_some() then add_string(&out.calls, d.unwrap().name)
+    if d.is_some() then add_call(out, d.unwrap().name)
 
 private take_predicate(out: &Live, t: Type) = t match
     Constrained(d) ->
-        if d.pred_fn.is_some() then add_string(&out.calls, d.pred_fn.unwrap())
+        if d.pred_fn.is_some() then add_call(out, d.pred_fn.unwrap())
     _ -> ()
 
 // A call at a slot is answered with the functions every implementation of the trait put there.
@@ -362,25 +410,28 @@ private take_dynamic(out: &Live, tables: Option[Buf[TVtable]], recv: Type, slot:
         val t = ts.at(i)
 
         if t.trait_name == name.unwrap() && usize(slot) < t.slots.len()
-            add_string(&out.calls, t.slots.at(usize(slot)).target)
+            add_call(out, t.slots.at(usize(slot)).target)
 end take_dynamic
 
 private trait_name_of(t: Type) -> Option[string] = t match
     Trait(n, _, _) -> Some(n)
     _ -> None
 
-private no_reached() -> &Live = Live(buf(), buf(), buf())
+private no_reached() -> &Live = Live(buf(), buf(), buf(), set(), set(), set())
 
-// Adds a name to a set, answering whether it was new.
-private add_string(xs: *Buf[string], name: string) -> bool
-    if name == "" then return false
+private add_call(out: &Live, name: string) -> bool = add_named(&out.calls, &out.call_set, name)
 
-    for i in 0..<xs.len()
-        if xs.at(i) == name then return false
+private add_val(out: &Live, name: string) -> bool = add_named(&out.vals, &out.val_set, name)
+
+private add_erased(out: &Live, name: string) -> bool = add_named(&out.erased, &out.erased_set, name)
+
+// Adds a name to a list and the set beside it, answering whether it was new.
+private add_named(xs: *Buf[string], seen: *Set[string], name: string) -> bool
+    if name == "" || !seen.add(name) then return false
 
     xs.push(name)
     true
-end add_string
+end add_named
 
 // -- the roots nothing in the program names -----------------------------------------------------------
 
@@ -393,12 +444,17 @@ end add_string
 entry_points(p: TProgram, own: Buf[string]) -> Buf[TFunc]
     val reached = reached_modules(p, own)
 
+    var destructors: Set[string] = set()
+
+    for i in 0..<p.destructors.len()
+        destructors.add(p.destructors.at(i).1)
+
     var out: Buf[TFunc] = buf()
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
         val kind = f.conv.is_some() || f.exported.is_some() || f.section.is_some() ||
-                   is_destructor(p, f.name)
+                   destructors.has(f.name)
 
         if kind && contributes(reached, f.name) then out.push(f)
 
@@ -417,45 +473,39 @@ exported_funcs(p: TProgram, own: Buf[string]) -> Buf[TFunc]
         val f = p.funcs.at(i)
 
         if f.exported.is_some() && (contributes(reached, f.name) ||
-                                    holds_string(supplies.calls, f.name))
+                                    supplies.call_set.has(f.name))
             out.push(f)
 
     out
 end exported_funcs
 
-private is_destructor(p: TProgram, name: string) -> bool
-    for i in 0..<p.destructors.len()
-        if p.destructors.at(i).1 == name then return true
-
-    false
-end is_destructor
-
 // Whether the module a function is in contributes roots to this compilation at all.
-private contributes(reached: Option[Buf[string]], name: string) -> bool
+private contributes(reached: Option[Set[string]], name: string) -> bool
     if reached.is_none() then return true
 
-    holds_string(reached.unwrap(), module_of(name))
+    reached.unwrap().has(module_of(name))
 end contributes
 
 // Which modules a root in counts, or nothing where every module's does. The referring is asked of
 // the graph name resolution built, which records an `import` as readily as a call.
-private reached_modules(p: TProgram, own: Buf[string]) -> Option[Buf[string]]
+private reached_modules(p: TProgram, own: Buf[string]) -> Option[Set[string]]
     if own.is_empty() then return None
 
-    var reached: Buf[string] = buf()
+    var order: Buf[string] = buf()
+    var reached: Set[string] = set()
 
     for i in 0..<own.len()
-        add_module(&reached, own.at(i))
+        add_module(&order, &reached, own.at(i))
 
     // **A supplied file with no module header is in the root module and is therefore treated as the
     // program's own**, since the root module is the one name two trees can share -- the answer that
     // keeps a symbol is the safe one to be wrong with.
-    add_module(&reached, ModuleRoot)
+    add_module(&order, &reached, ModuleRoot)
 
     var i: usize = 0
 
-    while i < reached.len()
-        val from = reached.at(i)
+    while i < order.len()
+        val from = order.at(i)
 
         i += 1
 
@@ -464,24 +514,19 @@ private reached_modules(p: TProgram, own: Buf[string]) -> Option[Buf[string]]
                 val to = p.module_deps.at(j).1
 
                 for k in 0..<to.len()
-                    add_module(&reached, to.at(k))
+                    add_module(&order, &reached, to.at(k))
 
     Some(reached)
 end reached_modules
 
 // A module name added to a set, where **the root module's name is the empty string and is a name
-// like any other**. `add_string` refuses one, which is right for a call graph -- nothing is called
+// like any other**. `add_named` refuses one, which is right for a call graph -- nothing is called
 // by no name -- and wrong here: refused, the root module is not among the ones a compilation counts
 // roots in, so a program's own destructor, `@export`, `@section` or interrupt handler written with
 // no module header is pruned before it can be emitted -- and a destructor pruned is a symbol the
 // release hook calls and nothing defines.
-private add_module(xs: *Buf[string], name: string) -> bool
-    for i in 0..<xs.len()
-        if xs.at(i) == name then return false
-
-    xs.push(name)
-    true
-end add_module
+private add_module(order: *Buf[string], seen: *Set[string], name: string)
+    if seen.add(name) then order.push(name)
 
 // -- one program with something taken out of it -------------------------------------------------------
 
@@ -515,25 +560,25 @@ tests_only(p: TProgram, own: Buf[string]) -> TProgram
     val root = roots_of(kept, entries, buf())
 
     for i in 0..<kept.tests.len()
-        add_string(&root.calls, kept.tests.at(i).func)
+        add_call(root, kept.tests.at(i).func)
 
     for i in 0..<kept.hooks.len()
-        add_string(&root.calls, kept.hooks.at(i).func)
+        add_call(root, kept.hooks.at(i).func)
 
-    val live = reached_from(kept, root)
+    val live = reached_from(kept, func_index(kept), root)
 
     for i in 0..<entries.len()
-        add_string(&live.calls, entries.at(i).name)
+        add_call(live, entries.at(i).name)
 
     var externs: Buf[TExtern] = buf()
 
     for i in 0..<kept.externs.len()
-        if holds_string(live.calls, kept.externs.at(i).name) then externs.push(kept.externs.at(i))
+        if live.call_set.has(kept.externs.at(i).name) then externs.push(kept.externs.at(i))
 
     var funcs: Buf[TFunc] = buf()
 
     for i in 0..<kept.funcs.len()
-        if holds_string(live.calls, kept.funcs.at(i).name) then funcs.push(kept.funcs.at(i))
+        if live.call_set.has(kept.funcs.at(i).name) then funcs.push(kept.funcs.at(i))
 
     with_declarations(kept, externs, funcs)
 end tests_only
