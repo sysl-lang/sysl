@@ -290,7 +290,13 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
     val tkey = if shadowed then None else lookup_type_key(cx.an, cx.scope, name)
 
     // A conversion, where no declaration claims the name.
-    if !shadowed && tkey.is_none() then
+    //
+    // **A declared FUNCTION claims the name too**, exactly as a declared type does: otherwise
+    // `unit`, `int` and `byte` would be words a module could take for a type and not for a
+    // function, and a nullary `unit()` would be told *"a 'unit' conversion takes exactly one
+    // value"* about a built-in the reader never reached for. The conversion is still what the name
+    // means wherever no declaration of it is in reach.
+    if !shadowed && tkey.is_none() && !function_in_scope(cx, name) then
         val scalar = scalar_type_named(cx, span, name)
 
         if scalar.is_some() then return convert_call(cx, span, name, scalar.unwrap(), args)
@@ -376,6 +382,7 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
     if atomic_form(cx, name) then return Some(atomic_call(cx, span, name, args))
 
     if name == "str_cast" then return Some(str_cast_call(cx, span, args))
+    if name == "str_alias" then return Some(str_alias_call(cx, span, args))
 
     if name == "va_start" || name == "va_end" || name == "va_copy" || name == "va_arg"
         val va = va_form(cx, span, name, args, expected)
@@ -422,7 +429,8 @@ end ptr_cast_call
 // none either, and saying so is better than reporting the name as uncallable.
 private special_form_name(cx: &Analyzer, name: string) -> bool =
     name == "print" || name == "str" || name == "format" || name == "str_cast" ||
-    name == "va_start" || name == "va_end" || name == "va_arg" || name == "va_copy" ||
+    name == "str_alias" || name == "va_start" || name == "va_end" || name == "va_arg" ||
+    name == "va_copy" ||
     name == "ptr_cast" || atomic_form(cx, name)
 
 // An explicit scalar conversion. Every pair that has a meaning is listed; nothing widens, narrows,
@@ -473,12 +481,12 @@ private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
         Abstract(_, _) -> return true
         Integer(_, _, _) -> to match
             Integer(_, _, _) -> return true
-            Floating(_) -> return true
+            Floating(_, _) -> return true
             Char -> return true
             _ -> return false
-        Floating(_) -> to match
+        Floating(_, _) -> to match
             Integer(_, _, _) -> return true
-            Floating(_) -> return true
+            Floating(_, _) -> return true
             _ -> return false
         Char -> to match
             Integer(_, _, _) -> return true
@@ -684,18 +692,11 @@ private field_name_list(d: &StructType) -> string
     out
 end field_name_list
 
-// A construction with the invariant check its type owes wrapped around it, where it states one.
-private checked_new(cx: &Analyzer, span: Span, made: TExpr, d: &StructType) -> TExpr
-    val decl = cx.an.tables.types.get(d.base)
-
-    if decl.is_none() then return made
-
-    decl.unwrap().kind match
-        StructOf(sd) ->
-            if sd.invariants.is_empty() || !sd.tparams.is_empty() then made
-            else TExpr(span, TStructInvCheck(made, d, inv_key(d.base)))
-        _ -> made
-end checked_new
+// A construction with the invariant check its type owes wrapped around it, where it states one. A
+// generic one is checked by its clauses made real at this construction's type arguments.
+private checked_new(cx: &Analyzer, span: Span, made: TExpr, d: &StructType) -> TExpr =
+    if bears_invariants(cx.an, d.base) then TExpr(span, TStructInvCheck(made, d, inv_fn_for(cx.an, d)))
+    else made
 
 // The arguments a generic struct is built at: the ones the position already names, where it names a
 // struct of this very declaration, and otherwise the ones the field values determine.
@@ -803,7 +804,7 @@ private written_integer(t: Type) -> bool = t match
     _ -> false
 
 private written_floating(t: Type) -> bool = t match
-    Floating(_) -> true
+    Floating(_, _) -> true
     _ -> false
 
 private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string) -> TExpr
@@ -820,6 +821,19 @@ private format_call(cx: &Analyzer, span: Span, arg: Expr, spec: string) -> TExpr
     val fits = if spec_is_int(c) then written_integer(ty)
     else if spec_is_float(c) then written_floating(ty)
     else ty == Str
+
+    // **C's formatting stops at a `long long`, so a wider integer has no conversion to be applied
+    // by.** The value would be widened into a slot the conversion does not read, and what came out
+    // would be the low half of it rather than a refusal — so the program is sent to `str`, which
+    // renders at the value's own width.
+    if fits && spec_is_int(c)
+        val bits = core_measure("width", ty)
+
+        if bits.is_some() && bits.unwrap() > 64
+            return cx.err(span, s"'$spec' is applied by C's formatting, which has no conversion " +
+                          s"for the ${bits.unwrap()} bits of ${type_show(ty)} — render it with " +
+                          "'str' instead")
+    end if
 
     if fits then return TExpr(span, TFormat(v, spec))
 
@@ -898,6 +912,8 @@ end variant_call
 // there the registered instantiation is the only one there could be.
 private variant_solved(cx: &Analyzer, span: Span, name: string,
                        args: Buf[Expr]) -> Option[(Type, EnumVariant)]
+    if !may_name_variant(cx, name) then return None
+
     for i in 0..<cx.an.tables.types.len()
         val key = cx.an.tables.types.key_at(i)
         val decl = cx.an.tables.types.at(i)
@@ -1034,6 +1050,33 @@ function_keys(cx: &Analyzer, written: string) -> Buf[string]
 
     found
 end function_keys
+
+// Whether a **function** of this name can be named from here. It decides which rule reads a call
+// rather than resolving one, so it answers without reporting and files no module dependency on a
+// declaration the program may never reach.
+//
+// **It asks only the places a file's own names come from** -- an import, the file's own module, a
+// wildcard -- and not the written-out-path fallbacks `function_keys_of` ends on: a scalar's name
+// has no dot, and read as a path it would be the ROOT module's key, which would let a program's
+// `int` claim the name inside every library module too.
+private function_in_scope(cx: &Analyzer, written: string) -> bool
+    val bound = cx.scope.imports.name_key(written)
+
+    if bound.is_some() && !visible_keys(cx, overload_keys(cx.an, bound.unwrap())).is_empty()
+        return true
+
+    val here = file_private_key(cx.an, cx.scope.src.name, module_qualify(cx.scope.module_name,
+                                                                        written))
+
+    if !visible_keys(cx, overload_keys(cx.an, here)).is_empty() then return true
+
+    for i in 0..<cx.scope.imports.wildcards.len()
+        val key = module_qualify(cx.scope.imports.wildcards.at(i), written)
+
+        if !visible_keys(cx, overload_keys(cx.an, key)).is_empty() then return true
+
+    false
+end function_in_scope
 
 private function_keys_of(cx: &Analyzer, written: string) -> Buf[string]
     // A module bound to a name is written before a dot, so `unicode.is_alpha` is the module's key
@@ -1356,10 +1399,10 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
                 ts.push(type_expr(inner, p.default.unwrap(), Some(want)))
 
     // The tail of a variadic definition, which no parameter names: the body reads it with `va_arg`,
-    // so each argument is analyzed at whatever type it has and nothing here checks it against one.
+    // so each argument is analyzed at whatever type it has and passed as C's promotions leave it.
     if f.decl.variadic
         for i in slots.len()..<args.len()
-            ts.push(type_expr_bare(cx, args.at(i)))
+            ts.push(variadic_extra(cx, args.at(i)))
 
     // **`@crossing` says a parameter hands what it is given to another domain**, so the rule about
     // what may cross is asked at the CALL: the argument is the thing that could have been written
@@ -1683,13 +1726,29 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
 
             ts.push(if by_value then TExpr(args.at(i).span, TVaPass(t)) else t)
         else
-            ts.push(type_expr_bare(cx, args.at(i)))
+            ts.push(variadic_extra(cx, args.at(i)))
 
     val ret = declared_result(cx, scope, d.ret_type)
 
     cx.an.uses(key)
     TExpr(span, TCall(key, ts, ret, false))
 end extern_call
+
+// One argument in a variadic tail, **passed already widened**. LLVM applies no default argument
+// promotions of its own -- an `i8` or an `f32` handed over as written is read back as garbage -- so
+// the widening happens here, in the tree: an integer narrower than 32 bits becomes a 32-bit one of
+// its own signedness, and every floating width narrower than `real` becomes a `real`, both
+// sixteen-bit formats included.
+private variadic_extra(cx: &Analyzer, a: Expr) -> TExpr
+    val t = type_expr_bare(cx, a)
+    val ty = texpr_type(t)
+
+    ty match
+        Integer(bits, signed, _) ->
+            if bits < 32 then TExpr(a.span, TCast(t, Integer(32, signed, false))) else t
+        Floating(bits, _) -> if bits < 64 then TExpr(a.span, TCast(t, real_type())) else t
+        _ -> t
+end variadic_extra
 
 // The file an `extern` was written in, which is where the types in its signature mean what they
 // meant.

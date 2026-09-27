@@ -91,7 +91,9 @@ coverage_gap(scrut: Type, arms: Buf[TArm]) -> Option[Gap]
 
     tys.push(scrut)
 
-    val ws = witnesses(rows, tys, 0)
+    if covers(rows, tys, 0) then return None
+
+    val ws = witnesses(rows, tys, 0, WitnessLimit + 1)
 
     if ws.is_empty() then return None
 
@@ -319,9 +321,127 @@ private join_types_list(a: Buf[Type], b: Buf[Type]) -> Buf[Type]
     out
 end join_types_list
 
-// Witnesses for a matrix: value vectors of the given types that no row matches. An empty list means
-// the rows cover the types between them.
-private witnesses(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int) -> Buf[Buf[Wit]]
+// Whether the rows cover the types between them -- exactly when `witnesses` would answer an empty
+// list, split cap included, but without naming anything.
+//
+// A constructor no row heads is not split on. Every row it keeps is a wildcard row, so its fields
+// arrive as wildcard columns, and a wildcard column rules nothing out: all it can change is the
+// depth the rest of the columns are read at, since each column read counts toward the split cap.
+// Reading deeper only ever takes rows away, so the question for every such constructor at once is
+// one question -- the wildcard rows' tails, read at the deepest point any of those constructors
+// reaches. That is the default matrix, and it is what keeps a column nobody narrowed from
+// multiplying the work by every value of its type.
+private covers(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int) -> bool
+    if tys.is_empty() then return !rows.is_empty()
+
+    if rows.is_empty() then return false
+
+    val rest = tail_types(tys)
+    val cons = if depth < MaxSplitDepth then space(tys.at(0)) else None
+
+    if cons.is_none() then return covers(wild_tails(rows), rest, depth + 1)
+
+    val list = cons.unwrap()
+    var absent = false
+    var reach = -1
+
+    for i in 0..<list.len()
+        val c = list.at(i)
+
+        if heads_with(rows, c.con)
+            if !covers(narrow(c, rows), join_types_list(c.args, rest), depth + 1) then return false
+        else
+            absent = true
+
+            if !rest.is_empty()
+                val e = seq_end(c.args, depth + 1)
+
+                if e.is_some() && e.unwrap() > reach then reach = e.unwrap()
+
+    if !absent then return true
+
+    val wild = wild_tails(rows)
+
+    if wild.is_empty() then return false
+
+    // With nothing after this column a surviving row is the whole answer; and where every missing
+    // constructor has a field with no value at all, a wildcard row is never tested against anything.
+    if rest.is_empty() || reach < 0 then return true
+
+    covers(wild, rest, reach)
+end covers
+
+// The depth the column after one of type `t` is read at, when `t`'s column holds only wildcards and
+// is read at `depth` -- the deepest over every way the split can descend -- or none where every way
+// meets a closed type with no constructors, which no value reaches.
+private end_of(t: Type, depth: int) -> Option[int]
+    val cons = if depth < MaxSplitDepth then space(t) else None
+
+    if cons.is_none() then return Some(depth + 1)
+
+    val list = cons.unwrap()
+    var best: Option[int] = None
+
+    for i in 0..<list.len()
+        val e = seq_end(list.at(i).args, depth + 1)
+
+        if e.is_some() && (best.is_none() || e.unwrap() > best.unwrap()) then best = e
+
+    best
+end end_of
+
+private seq_end(tys: Buf[Type], depth: int) -> Option[int]
+    var at = depth
+
+    for i in 0..<tys.len()
+        // Past the cap nothing is split, so no column is empty and every depth reads the same.
+        if at >= MaxSplitDepth then return Some(at)
+
+        val e = end_of(tys.at(i), at)
+
+        if e.is_none() then return None
+
+        at = e.unwrap()
+
+    Some(at)
+end seq_end
+
+// Whether any row is headed by this constructor.
+private heads_with(rows: Buf[Buf[TPattern]], c: Con) -> bool
+    for j in 0..<rows.len()
+        if matches_head(rows.at(j).at(0), c) then return true
+
+    false
+end heads_with
+
+// The rows a constructor's split keeps.
+private narrow(c: Ctor, rows: Buf[Buf[TPattern]]) -> Buf[Buf[TPattern]]
+    var out: Buf[Buf[TPattern]] = buf()
+
+    for j in 0..<rows.len()
+        val kept = specialize(c.con, c.args, rows.at(j))
+
+        if kept.is_some() then out.push(kept.unwrap())
+
+    out
+end narrow
+
+// The tails of the rows that match whatever heads them -- the default matrix.
+private wild_tails(rows: Buf[Buf[TPattern]]) -> Buf[Buf[TPattern]]
+    var out: Buf[Buf[TPattern]] = buf()
+
+    for j in 0..<rows.len()
+        if head_con(rows.at(j).at(0)).is_none() then out.push(tail_of(rows.at(j)))
+
+    out
+end wild_tails
+
+// Witnesses for a matrix: value vectors of the given types that no row matches, the first `room` of
+// them in the order the split enumerates. An empty list means the rows cover the types between them.
+//
+// A constructor whose narrowed matrix `covers` is passed over without descending into it, so the
+// search only walks the branches that answer something, and stops once it has `room` answers.
+private witnesses(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int, room: usize) -> Buf[Buf[Wit]]
     var out: Buf[Buf[Wit]] = buf()
 
     if tys.is_empty()
@@ -347,20 +467,18 @@ private witnesses(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int) -> Buf[B
         val list = cons.unwrap()
 
         for i in 0..<list.len()
-            if out.len() > WitnessLimit then break
+            if out.len() >= room then break
 
             val c = list.at(i)
-            var narrowed: Buf[Buf[TPattern]] = buf()
+            val narrowed = narrow(c, rows)
+            val wider = join_types_list(c.args, rest)
 
-            for j in 0..<rows.len()
-                val kept = specialize(c.con, c.args, rows.at(j))
+            if covers(narrowed, wider, depth + 1) then continue
 
-                if kept.is_some() then narrowed.push(kept.unwrap())
-
-            val deeper = witnesses(narrowed, join_types_list(c.args, rest), depth + 1)
+            val deeper = witnesses(narrowed, wider, depth + 1, room - out.len())
 
             for j in 0..<deeper.len()
-                if out.len() <= WitnessLimit then out.push(lift(c.name, c.args.len(), deeper.at(j)))
+                if out.len() < room then out.push(lift(c.name, c.args.len(), deeper.at(j)))
 
         return out
     end if
@@ -373,12 +491,7 @@ private witnesses(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int) -> Buf[B
     for j in 0..<rows.len()
         if head_con(rows.at(j).at(0)).is_some() then gap = WitUnknown
 
-    var kept: Buf[Buf[TPattern]] = buf()
-
-    for j in 0..<rows.len()
-        if head_con(rows.at(j).at(0)).is_none() then kept.push(tail_of(rows.at(j)))
-
-    val deeper = witnesses(kept, rest, depth + 1)
+    val deeper = witnesses(wild_tails(rows), rest, depth + 1, room)
 
     for j in 0..<deeper.len()
         var row: Buf[Wit] = buf()

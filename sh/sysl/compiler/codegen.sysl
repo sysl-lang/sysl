@@ -34,16 +34,24 @@ codegen_with_gaps(p: TProgram, t: Target, pr: Promotions) -> (IrModule, Buf[(str
 end codegen_with_gaps
 
 private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrModule, Buf[(string, string)])
-    val layout = layout_for(t)
+    val layout = e.layout
     val word_bits = int(t.pointer_bits())
 
     record_symbols(e, p)
     set_promotions(e, pr)
 
+    // Both sides of the argument convention ask these about the whole program, so they are read once.
+    e.inert = inert_callees(p)
+    e.address_taken = addressed_funcs(p)
+
     // The `@ghost` functions of this program, read once: nothing emitted may name one, and a clause
     // that does is dropped whole rather than laid down against a symbol that will not be there.
     for i in 0..<p.funcs.len()
         if p.funcs.at(i).ghost then e.ghost_funcs.push(p.funcs.at(i).name)
+
+    // What a call site may repeat of its callee's `ensure`, and what a member may assume of its
+    // receiver (`contract_assume.sysl`).
+    record_contracts(e, p)
 
     var funcs: Buf[IrFunc] = buf()
     var gaps: Buf[(string, string)] = buf()
@@ -84,11 +92,6 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
     for i in 0..<p.extern_vars.len()
         declared_globals.push(ir_extern_global(p.extern_vars.at(i).symbol,
                                                lty(e, p.extern_vars.at(i).ty)))
-
-    val vals = gen_vals(e, p.vals)
-
-    for i in 0..<vals.len()
-        declared_globals.push(vals.at(i))
 
     // A library has no entry point. Emitting one would put a second `main` in every program that
     // linked against it, which the linker reports as a duplicate symbol and nothing else explains.
@@ -148,10 +151,21 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
         helpers.push(built_helpers.at(i))
 
     // The two words a `bool` renders as, laid down once for the whole module and in front of
-    // everything else it stores.
+    // everything else it stores -- asked for by what the bodies and helpers wrote, so settled before
+    // the storage below is.
     var globals: Buf[IrGlobal] = buf()
+    val bools = e.bool_strs
 
-    if e.bool_strs
+    // **Module storage is laid down LAST, after every body, the entry point and the drain**: a
+    // `val`'s initializer interns its strings as it is written, and the reference writes it once the
+    // helpers are finished, so a string a `val` holds is numbered after every string any body or
+    // helper uses. Built earlier, the entry point's strings are numbered past them instead.
+    val vals = gen_vals(e, p.vals)
+
+    for i in 0..<vals.len()
+        declared_globals.push(vals.at(i))
+
+    if bools
         globals.push(bool_constant("true"))
         globals.push(bool_constant("false"))
 
@@ -464,6 +478,13 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         copy_params.push(ir_param(LInt(64)))
         copy_params.push(ir_param(l_i1()))
         out.push(ir_sig(memcpy_symbol(), ir_fn_type(LVoid, copy_params)))
+
+    // What a call site was told its callee's `ensure` established (`contract_assume.sysl`).
+    if e.uses_assume
+        var fact_params: Buf[IrParam] = buf()
+
+        fact_params.push(ir_param(l_i1()))
+        out.push(ir_sig(llvm_assume(), ir_fn_type(LVoid, fact_params)))
 
     // **A symbol this module has already stated is not stated again**, whether the first statement
     // was a declaration or a definition: LLVM refuses a second `declare` of a name at a signature of

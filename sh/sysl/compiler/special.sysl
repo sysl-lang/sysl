@@ -51,7 +51,7 @@ private print_one(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
 
             if signed then library_call(cx, span, "printi", widened(span, t, Integer(64, true, false)))
             else library_call(cx, span, "printu", widened(span, t, Integer(64, false, false)))
-        Floating(_) -> library_call(cx, span, "printr", widened(span, t, Floating(64)))
+        Floating(_, _) -> library_call(cx, span, "printr", widened(span, t, Floating(64, false)))
         Bool -> library_call(cx, span, "printb", t)
         Char -> library_call(cx, span, "printc", t)
         Str -> library_call(cx, span, "prints", t)
@@ -105,7 +105,7 @@ end stdout_call
 // the library has a renderer of its own for.
 scalar_render(t: Type) -> bool = t match
     Integer(_, _, _) -> true
-    Floating(_) -> true
+    Floating(_, _) -> true
     Bool -> true
     Char -> true
     Str -> true
@@ -441,6 +441,43 @@ str_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
         other -> cx.err(span, s"'str_cast' takes a []u8, but the value has type ${type_show(other)}")
 end str_cast_call
 
+// `str_alias(bytes)` -- a `[]u8` taken as a `string` without looking at it **and without copying
+// it**: the string is the slice's three words, sharing its owner the way `s[a..b]` shares a string's.
+//
+// `str_cast` copies because a `[]u8` can be written afterwards; this is the form for the program
+// that needs the string to see those writes -- a buffer grown in place, whose text is read back as a
+// `string` at every step without paying for a copy of the whole of it each time. What it gives up is
+// therefore more than `str_cast` does: the caller also owes that nothing writes the viewed bytes
+// while the string is alive. **A program does not write this either; it writes
+// `sysl.text.str_view`**, which says so where a reader will look.
+//
+// The storage is still the compiler's business. A string outlives every frame, so a view of an array
+// the frame owns moves that array to the heap (`escape.sysl`), and a view with no counted owner -- a
+// `*T` region -- is the programmer's problem exactly as every `*T` is.
+str_alias_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
+    if args.len() != 1
+        return cx.err(span, "'str_alias' takes exactly one value, the bytes to view as a string")
+
+    val t = type_expr_bare(cx, args.at(0))
+
+    underlying(texpr_type(t)) match
+        Slice(inner, _) ->
+            if *inner != byte_type()
+                return cx.err(span, s"'str_alias' takes a []u8, but the value has type " +
+                              s"${type_show(texpr_type(t))}")
+
+            TExpr(span, TStrView(t))
+        Array(_, elem) ->
+            if *elem != byte_type()
+                return cx.err(span, s"'str_alias' takes a []u8, but the value has type " +
+                              s"${type_show(texpr_type(t))}")
+
+            TExpr(span, TStrView(coerce(cx, t, Slice(elem, true))))
+        Str -> cx.err(span, "'str_alias' makes a string out of bytes, and this value is already a " +
+                      "string")
+        other -> cx.err(span, s"'str_alias' takes a []u8, but the value has type ${type_show(other)}")
+end str_alias_call
+
 // `va_start(ap)`, `va_end(ap)`, `va_copy(dst, src)` and `va_arg(ap)` -- the C variadic cursor, which
 // no sysl body could implement and which the language therefore spells as forms.
 va_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
@@ -506,7 +543,7 @@ private va_arg_type(cx: &Analyzer, span: Span, ty: Type) -> Type
                      s"read as ${type_show(ty)} — read it as " +
                      s"${if signed then "'int'" else "'uint'"} and convert")
             ty
-        Floating(bits) ->
+        Floating(bits, _) ->
             if bits == 64 then return ty
 
             cx.fault(span, s"a variadic argument is promoted to double, so it cannot be read as " +

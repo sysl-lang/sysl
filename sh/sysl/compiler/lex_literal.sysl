@@ -132,7 +132,10 @@ scan_number(s: *Scanner, out: *Buf[Spanned[Tok]], m: usize) -> Result[unit, Diag
         Err(why) -> return Err(error(point(m), why))
         Ok(d) -> d
 
-    val float_suffix = suffix.len > 0 && suffix.bytes[0] == u8('f')
+    // `bf16` is the one floating suffix that does not start with the family letter, because it is a
+    // name rather than a width. Reading the family letter alone would send it down the integer arm
+    // and report it as an integer suffix, which is the opposite of what it is.
+    val float_suffix = (suffix.len > 0 && suffix.bytes[0] == u8('f')) || suffix == "bf16"
 
     if suffix.len > 0 && !valid_suffix(suffix)
         return Err(error(point(m), s"invalid literal suffix '${suffix}'"))
@@ -202,11 +205,14 @@ private clean_digits(run: []const u8, allow_leading: bool) -> Result[string, str
     if digits.len == 0 then Err("missing digits") else Ok(digits)
 end clean_digits
 
-// A suffix names a **canonical** primitive: the systematic `iN` / `uN` / `fN` forms plus the two
-// pointer-width types. The friendly aliases -- `int`, `byte`, `real` -- are not suffixes; a literal
-// reaches one of those through a type context or a cast.
+// A suffix names a **canonical** primitive: the systematic `iN` / `uN` / `fN` forms, the two
+// pointer-width types, and `bf16`. The friendly aliases -- `int`, `byte`, `real` -- are not
+// suffixes; a literal reaches one of those through a type context or a cast.
+//
+// `bf16` is here rather than in the systematic form because it is `f16`'s width and not its format,
+// so no `fN` spelling could name it.
 private valid_suffix(w: string) -> bool
-    if w == "usize" || w == "isize" then return true
+    if w == "usize" || w == "isize" || w == "bf16" then return true
     if w.len < 2 then return false
 
     val b = w.bytes

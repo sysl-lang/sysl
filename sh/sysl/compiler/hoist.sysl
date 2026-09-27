@@ -237,8 +237,8 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // **A top-level `var` is the module's storage**, wherever it was written. The one file
         // where it is a local instead is the one the program starts in, and that file's bindings
         // never reach this walk.
-        VarDecl(name, typ, init, vis, align, section) ->
-            hoist_storage(a, scope, s.span, name, typ, vis, init, align, section)
+        VarDecl(name, typ, init, vis, align, section, thread_local) ->
+            hoist_storage(a, scope, s.span, name, typ, vis, init, align, section, thread_local)
         ExternVarDecl(name, typ, _, vis) ->
             hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.extern_vars,
                         "'extern' variable", None)
@@ -256,8 +256,9 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
 // Module storage: a `val` that may be written to, which is what a top-level `var` declares.
 private hoist_storage(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
                       vis: Visibility, init: Option[Expr], align: Option[Expr],
-                      section: Option[string])
-    hoist_value(a, scope, span, name, typ, vis, a.tables.vals, "'var'", init, align, section)
+                      section: Option[string], thread_local: bool)
+    hoist_value(a, scope, span, name, typ, vis, a.tables.vals, "'var'", init, align, section,
+                thread_local)
     a.tables.writable.push(file_private_key(a, scope.src.name,
                                             module_qualify(scope.module_name, name)))
 
@@ -373,6 +374,13 @@ private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vi
         return
 
     a.tables.types.put(key, Decl(kind, span, scope))
+
+    kind match
+        EnumOf(d) ->
+            for i in 0..<d.variants.len()
+                a.tables.variant_names.put(d.variants.at(i).name, true)
+        _ -> ()
+
     record_access(a, scope, span, key, vis)
     record_members_access(a, scope, key, name, vis, kind)
 
@@ -405,7 +413,8 @@ type_name_taken(a: &Analysis, key: string, written: string) -> bool =
 // Registers a name that stands for storage.
 private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
                     vis: Visibility, into: &Table[ValueDecl], what: string, init: Option[Expr],
-                    align: Option[Expr] = None, section: Option[string] = None)
+                    align: Option[Expr] = None, section: Option[string] = None,
+                    thread_local: bool = false)
     val plain = module_qualify(scope.module_name, name)
     val key = decl_key(a, scope, plain, vis, value_scope_of(a, plain).is_some())
     val holder = if contested(a, scope, vis, key) then value_name_holder(a, key) else None
@@ -414,7 +423,8 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
         a.fault(scope, span, s"'$name' is already declared as ${holder.unwrap()}")
         return
 
-    into.put(key, ValueDecl(name, typ, vis, span, scope, init, align, section))
+    into.put(key, ValueDecl(name, typ, vis, span, scope, init, align, section,
+                                  thread_local))
     record_access(a, scope, span, key, vis)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)

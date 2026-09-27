@@ -101,7 +101,7 @@ rechecked(cx: &Analyzer, span: Span, place: TExpr, written: TExpr) -> TExpr
     val owed = inv_checks_for(cx, place)
 
     for i in 0..<owed.len()
-        out = TExpr(span, TRecheck(out, owed.at(i).0, owed.at(i).1, inv_key(owed.at(i).1.base)))
+        out = TExpr(span, TRecheck(out, owed.at(i).0, owed.at(i).1, inv_fn_for(cx.an, owed.at(i).1)))
 
     out
 end rechecked
@@ -122,27 +122,18 @@ inv_checks_for(cx: &Analyzer, place: TExpr) -> Buf[(TExpr, &StructType)]
 
             for i in 0..<outer.len()
                 out.push(outer.at(i))
-        TIndex(recv, _, _) -> out = inv_checks_for(cx, recv)
+        // A view's element is on its far side, which no clause may read, so writing one can break
+        // nothing the struct holding the view promised and is owed no re-check. `self.elems[i] = v`
+        // in a buffer whose clause reads `elems.len` changes an element and leaves the length alone.
+        TIndex(recv, _, _) -> if !far_side(texpr_type(recv)) then out = inv_checks_for(cx, recv)
         _ -> ()
 
     out
 end inv_checks_for
 
 // The struct a type is, where its declaration carries invariants a write owes a re-check of.
-//
-// A **generic** struct carries none for this purpose: the clause is written once and every
-// instantiation would need its own predicate, which is the instantiation's business rather than the
-// write's.
 private invariant_bearing(cx: &Analyzer, t: Type) -> Option[&StructType] = t match
-    Struct(d) ->
-        val decl = cx.an.tables.types.get(d.base)
-
-        if decl.is_none() then return None
-
-        decl.unwrap().kind match
-            StructOf(sd) ->
-                if sd.invariants.is_empty() || !sd.tparams.is_empty() then None else Some(d)
-            _ -> None
+    Struct(d) -> if bears_invariants(cx.an, d.base) then Some(d) else None
     _ -> None
 
 // The function a struct's invariants are checked by.

@@ -6,7 +6,7 @@ import sysl.buf.{Buf, buf}
 import sysl.env.{get as env_var}
 import sysl.fs.{make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, remove_file, walk, write_text}
 import sysl.process.capture
-import sysl.text.{from_utf8_unchecked, split, str_builder, Search}
+import sysl.text.{split, str_builder, Search}
 
 // The differential proof: this parser's tree against the reference compiler's, on the same input.
 //
@@ -1382,11 +1382,10 @@ end the_two_agree_on_this_compilers_own_tree
 
 // The two texts, matched by symbol: what each defines alone, and what both define and disagree on.
 //
-// **The interned strings are compared with their ids normalised, and that is the one thing this
-// census leaves out.** A body this compiler has not built interns nothing, so every constant below
-// it in the reference's numbering is one number further along -- a difference whose cause is the
-// absence already counted beside it, and not a defect in any body it renumbers. The whole-file sweep
-// above is what compares them exactly, and it does so on programs with no absences left.
+// **Every body is compared exactly, the interned strings' numbers included.** A string is numbered
+// in the order the lowering reached it, so a phase that moves -- module storage laid down before the
+// entry point rather than after the drain -- renumbers a whole body, and that is the difference this
+// census is here to catch.
 private census_over(theirs: string, ours: string, gaps: Buf[(string, string)], found: *OwnTree)
     val wanted = func_texts(theirs)
     val mine = func_texts(ours)
@@ -1404,8 +1403,8 @@ private census_over(theirs: string, ours: string, gaps: Buf[(string, string)], f
             Some(body) ->
                 found.shared += 1
 
-                val want = without_own_str_ids(wanted.at(i).1)
-                val got = without_own_str_ids(body)
+                val want = wanted.at(i).1
+                val got = body
 
                 if want != got
                     found.differing += 1
@@ -1419,34 +1418,3 @@ private census_over(theirs: string, ours: string, gaps: Buf[(string, string)], f
     for i in 0..<mine.len()
         if !holds_name(theirs_names, mine.at(i).0) then found.only_ours += 1
 end census_over
-
-// A body with the number off each interned string it names, and everything else left alone.
-private without_own_str_ids(text: string) -> string
-    var out: Buf[u8] = buf()
-    val bytes = text.bytes
-    var i: usize = 0
-
-    while i < bytes.len
-        if own_starts_at(bytes, i, "@.str")
-            out.extend("@.str".bytes)
-
-            i += 5
-
-            while i < bytes.len && bytes[i] >= u8('0') && bytes[i] <= u8('9')
-                i += 1
-        else
-            out.push(bytes[i])
-
-            i += 1
-
-    from_utf8_unchecked(out.view())
-end without_own_str_ids
-
-private own_starts_at(bytes: []const u8, at: usize, what: string) -> bool
-    if at + what.bytes.len > bytes.len then return false
-
-    for k in 0..<what.bytes.len
-        if bytes[at + k] != what.bytes[k] then return false
-
-    true
-end own_starts_at

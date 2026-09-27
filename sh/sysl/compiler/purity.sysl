@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.text.Search
 
 // What a `@pure` function may do, and what a declaration only a `@tests` file keeps may be named by.
@@ -154,16 +155,17 @@ private own_storage_of(place: TExpr) -> bool = *place.kind match
 // the method it lowers to as data. Both reach a function only through a method table, and every
 // entry in one is put there by an `impl` -- which a `@tests` file may not write.
 check_test_scope(a: &Analysis, funcs: Buf[TFunc])
-    val test_only = a.tables.test_only
+    if a.tables.test_only.is_empty() then return
 
-    if test_only.is_empty() then return
+    // Asked at every call, address and read in every body, so asked of a set rather than a list.
+    val test_only = string_set(a.tables.test_only)
 
     val said: &Skipped = Skipped(buf())
 
     for i in 0..<funcs.len()
         val f = funcs.at(i)
 
-        if holds_string(test_only, f.name) then continue
+        if test_only.has(f.name) then continue
 
         val scope = func_home(a, f.name)
 
@@ -178,7 +180,7 @@ check_test_scope(a: &Analysis, funcs: Buf[TFunc])
                        expr_walk(false, e -> test_scope_one(a, scope, said, test_only, e)))
 end check_test_scope
 
-private test_scope_one(a: &Analysis, scope: Scope, said: &Skipped, test_only: Buf[string], e: TExpr)
+private test_scope_one(a: &Analysis, scope: Scope, said: &Skipped, test_only: Set[string], e: TExpr)
     val key = test_scope_named(test_only, e)
 
     if key.is_none() || said.covers(e.span) then return
@@ -195,14 +197,25 @@ end test_scope_one
 // A **lowered** closure is in the set and is not reportable: an instantiation keyed on a test's
 // closure type can only have been demanded by that test, so it goes when the test does. What is left
 // is exactly the names a reader wrote.
-private test_scope_named(test_only: Buf[string], e: TExpr) -> Option[string] = *e.kind match
+private test_scope_named(test_only: Set[string], e: TExpr) -> Option[string] = *e.kind match
     TCall(name, _, _, _) -> reportable_test_name(test_only, name)
     TFuncAddr(name, _, _) -> reportable_test_name(test_only, name)
     TGlobal(symbol, _, _) -> reportable_test_name(test_only, symbol)
     _ -> None
 
-private reportable_test_name(test_only: Buf[string], name: string) -> Option[string]
-    if !holds_string(test_only, name) || mentions_closure(name) then return None
+// A list of names as a set, for a pass that asks whether a name is in it once per node or per
+// function; the list stays where it is wherever its order is what gets written out.
+string_set(xs: Buf[string]) -> Set[string]
+    var out: Set[string] = set()
+
+    for i in 0..<xs.len()
+        out.add(xs.at(i))
+
+    out
+end string_set
+
+private reportable_test_name(test_only: Set[string], name: string) -> Option[string]
+    if !test_only.has(name) || mentions_closure(name) then return None
 
     Some(name)
 end reportable_test_name

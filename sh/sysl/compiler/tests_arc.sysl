@@ -95,31 +95,42 @@ private lowered_whole(text: string, symbol: string) -> string
     ""
 end lowered_whole
 
+// A parameter is read through the caller's count unless the body rebinds its slot, so `n` -- the
+// one assigned to -- is the parameter the frame owns, and `m` beside it is borrowed.
 @test("a counted parameter is retained at entry and released at every return")
 a_counted_parameter_is_owned_by_the_frame()
     assert_eq(lowered_arc("struct Node\n" +
                            "    v: int\n" +
                            "end Node\n" +
                            "\n" +
-                           "take(n: &Node) -> int = n.v\n" +
+                           "take(n: &Node, m: &Node) -> int\n" +
+                           "    n = m\n" +
+                           "    n.v\n" +
                            "\n" +
                            "var r: &Node = Node(1)\n" +
                            "var got: int = 0\n" +
                            "\n" +
-                           "got = take(r)\n",
+                           "got = take(r, r)\n",
                           "take"),
-              "define i32 @take(ptr %n.param) {\n" +
+              "define i32 @take(ptr %n.param, ptr %m.param) {\n" +
               "entry:\n" +
               "  %n.addr = alloca ptr\n" +
+              "  %m.addr = alloca ptr\n" +
               "  store ptr %n.param, ptr %n.addr\n" +
               "  call void @arc.retain(ptr %n.param)\n" +
-              "  %t1 = load ptr, ptr %n.addr\n" +
-              "  %t2 = getelementptr %arc.Node, ptr %t1, i32 0, i32 3\n" +
-              "  %t3 = load %struct.Node, ptr %t2\n" +
-              "  %t4 = extractvalue %struct.Node %t3, 0\n" +
-              "  %t5 = load ptr, ptr %n.addr\n" +
-              "  call void @arc.release(ptr %t5)\n" +
-              "  ret i32 %t4\n" +
+              "  store ptr %m.param, ptr %m.addr\n" +
+              "  %t1 = load ptr, ptr %m.addr\n" +
+              "  %t2 = load ptr, ptr %n.addr\n" +
+              "  call void @arc.retain(ptr %t1)\n" +
+              "  store ptr %t1, ptr %n.addr\n" +
+              "  call void @arc.release(ptr %t2)\n" +
+              "  %t3 = load ptr, ptr %n.addr\n" +
+              "  %t4 = getelementptr %arc.Node, ptr %t3, i32 0, i32 3\n" +
+              "  %t5 = load %struct.Node, ptr %t4\n" +
+              "  %t6 = extractvalue %struct.Node %t5, 0\n" +
+              "  %t7 = load ptr, ptr %n.addr\n" +
+              "  call void @arc.release(ptr %t7)\n" +
+              "  ret i32 %t6\n" +
               "}\n")
 end a_counted_parameter_is_owned_by_the_frame
 
@@ -692,6 +703,48 @@ an_implementation_that_keeps_what_it_borrowed()
               "borrowed for the call — it may be a view of the caller's stack, so copy what this " +
               "needs into storage of its own")
 end an_implementation_that_keeps_what_it_borrowed
+
+// **Which parameters a function keeps is a fixpoint, and it looks at a function again only when
+// something it consulted has grown.** Two chains of 200 functions each hand a slice down to one that
+// stores it, one written caller-first and one callee-first, so whichever order the program lists its
+// functions in, one chain runs against it: a fixpoint that re-walked every function on every round
+// would take a round per link of that chain, some eighty thousand walks, where one that wakes only
+// the callers of what grew takes a few hundred -- and every link keeps what it was handed either way.
+@test("the kept-parameter fixpoint wakes only the callers of what grew")
+the_kept_parameter_fixpoint_wakes_only_callers()
+    if arc_no_library() then return
+
+    val n: usize = 200
+    var text = "var held: []const u8\n\n"
+
+    for i in 0..<n
+        text = text + s"a$i(b: []const u8)\n"
+        text = text + (if i == n - 1 then "    held = b\n\n" else s"    a${i + 1}(b)\n\n")
+        text = text + s"b$i(b: []const u8)\n"
+        text = text + (if i == 0 then "    held = b\n\n" else s"    b${i - 1}(b)\n\n")
+
+    text = text + s"var store: [8]u8\n\na0(store[0..<4])\nb${n - 1}(store[0..<4])\n"
+
+    val parsed = parse(source_of("test.sysl", text))
+    var units: Buf[Program] = buf()
+    val library = arc_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    assert(done.reported.is_empty())
+
+    val cost = settle_cost(program_of(done, ""))
+
+    // Every link keeps its slice, and the walks stay linear in the length of the chains: a walk per
+    // link to start with, and one more for each link woken when the link below it grew. It is 599.
+    assert_eq(cost.1, 2 * n)
+    assert(cost.0 <= 4 * n)
+end the_kept_parameter_fixpoint_wakes_only_callers
 
 // **A term of an `&&` chain is reached only where the chain got that far**, so a count it takes has
 // to be given back before the branch it guards -- a release registered with the enclosing scope is

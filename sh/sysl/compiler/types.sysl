@@ -140,8 +140,17 @@ enum Type
     // and is what lets a diagnostic call one `usize` instead of `u64`.
     Integer(bits: int, signed: bool, pointer_width: bool)
 
-    // `real`, `f32` -- a binary floating-point number of a width.
-    Floating(bits: int)
+    // `real`, `f32`, `bf16` -- a binary floating-point number of a width.
+    //
+    // `brain` marks `bf16`, and it rides along with the width rather than being a variant of its
+    // own because **width alone no longer identifies a format**: `bf16` is sixteen bits like `f16`
+    // and divides them differently -- eight of exponent and seven of significand, binary32's range
+    // at a quarter of its precision. Nearly every question asked of a float is about its width (its
+    // size, whether a conversion widens, which register class carries it), so only the few places
+    // that spell the format out read the flag. The one place the width stops answering is a
+    // conversion between the two sixteen-bit formats, which goes through `f32`. `brain` is set only
+    // at sixteen bits.
+    Floating(bits: int, brain: bool)
 
     // `char` -- one Unicode scalar value.
     Char
@@ -231,7 +240,7 @@ end Type
 int_type() -> Type = Integer(32, true, false)
 
 // `real`.
-real_type() -> Type = Floating(64)
+real_type() -> Type = Floating(64, false)
 
 // `byte` -- the element of every slice of bytes.
 byte_type() -> Type = Integer(8, false, false)
@@ -254,7 +263,11 @@ scalar_named(name: string, word_bits: int) -> Option[Type] = name match
     "ushort" -> Some(Integer(16, false, false))
     "uint" -> Some(Integer(32, false, false))
     "ulong" -> Some(Integer(64, false, false))
-    "real" -> Some(Floating(64))
+    "real" -> Some(Floating(64, false))
+    // `bf16` is the one floating-point type whose name is not a width, because no width tells it
+    // apart from `f16` -- so it is a name here rather than a shape the width families recognise,
+    // and a type annotation, a cast and a literal suffix all find it the same way.
+    "bf16" -> Some(Floating(16, true))
     "va_list" -> Some(VaList)
     "usize" -> Some(usize_type(word_bits))
     "isize" -> Some(isize_type(word_bits))
@@ -294,8 +307,8 @@ type_eq(a: Type, b: Type) -> bool = a match
     Integer(ab, asg, apw) -> b match
         Integer(bb, bsg, bpw) -> ab == bb && asg == bsg && apw == bpw
         _ -> false
-    Floating(ab) -> b match
-        Floating(bb) -> ab == bb
+    Floating(ab, abr) -> b match
+        Floating(bb, bbr) -> ab == bb && abr == bbr
         _ -> false
     Char -> b match
         Char -> true

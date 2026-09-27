@@ -237,6 +237,14 @@ symbols_listed() -> string
     out
 end symbols_listed
 
+// The symbol a package's feature is named by in a condition: `server` is `feature_server`. The
+// prefix keeps the two vocabularies apart, so a package cannot declare a feature called `linux` and
+// gate on a word that means something else.
+feature_symbol(name: string) -> string = "feature_" + name
+
+// Whether a condition's word names a feature rather than a fact about the machine.
+is_feature_symbol(word: string) -> bool = word.starts_with("feature_")
+
 // Whether a list of symbols holds one.
 has(xs: Buf[string], s: string) -> bool
     for i in 0..<xs.len()
@@ -474,9 +482,12 @@ private cond_atom(c: *Cond) -> Result[bool, Diagnostic]
     if kind == "name"
         c.i += 1
 
-        if !has(symbols(), tok.text)
+        // **The feature family is open where the target's symbols are closed**: a feature exists
+        // because the manifest of the file being gated says so, so `feature_x` in a package that
+        // declares no `x` is false rather than refused.
+        if !has(symbols(), tok.text) && !is_feature_symbol(tok.text)
             return Err(fail_at(c.src, c.line, tok.col,
-                s"'${tok.text}' is not something a target says about itself — sysl knows ${symbols_listed()}"))
+                s"'${tok.text}' is not something a target says about itself — sysl knows ${symbols_listed()}. A feature this package's manifest declares is named '${feature_symbol(tok.text)}'"))
 
         return Ok(has(c.on, tok.text))
 

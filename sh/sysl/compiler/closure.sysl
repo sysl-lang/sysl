@@ -219,6 +219,7 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
 
     inner.subst = cx.subst
     inner.func_name = cx.func_name
+    inner.owner = nested_owner(cx)
 
     val self_ty = Ptr(Struct(st))
 
@@ -273,8 +274,12 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     cx.an.tables.homes.put(fname, cx.scope)
 
     TFunc(span, fname, params, ret, block, false, contract.0, contract.1, contract.2, true, None,
-          false, contract.3, false, false, None, None, None, None)
+          false, contract.3, false, false, None, None, None, None, no_marks(), inner.owner)
 end closure_body
+
+// Who declared a body written inside another: whatever declared the body it is written in, or --
+// outside any body, in a module `val`'s initializer -- the module being read.
+nested_owner(cx: &Analyzer) -> string = if cx.owner != "" then cx.owner else cx.scope.module_name
 
 // Files the closure's struct as an implementation of the call trait for its arity, so a bound over
 // `Fn(A) -> R` is met by it and a `&Fn(A) -> R` may be built out of it.
@@ -320,7 +325,7 @@ private register_call_trait(cx: &Analyzer, span: Span, st: &StructType, ptypes: 
     cx.an.tables.members.decls.put(member_key_of(st.base, "call"),
                                    MethodDecl(span, "call", Some(ByPtr), false, buf(), mparams,
                                               None, buf(), buf(), buf(), Public, false, false,
-                                              buf(), buf(), buf(), None, None, buf(), false))
+                                              buf(), buf(), buf(), None, None, buf(), false, no_marks()))
     cx.an.tables.members.funcs.put(member_key_of(st.base, "call"), s"${st.base}.call")
 end register_call_trait
 
@@ -384,7 +389,7 @@ end read_block
 private read_stmt(keep: &Fn(string) -> bool, s: Stmt, bound: *Buf[string], found: *Buf[string])
     *s.kind match
         ExprStmt(e) -> read_expr(keep, e, *bound, found)
-        VarDecl(name, _, init, _, _, _) ->
+        VarDecl(name, _, init, _, _, _, _) ->
             read_opt(keep, init, *bound, found)
             bound.push(name)
         ValDecl(name, _, value, _, _, _) ->
@@ -665,7 +670,7 @@ with_call_bounds(d: FuncDecl) -> FuncDecl
 
     FuncDecl(d.name, tparams, params, d.ret_type, d.body, joined_bounds(d.bounds, bounds),
              d.variadic, d.vis, d.tdefaults, d.tvalues, d.tpacks, d.test, d.hook, d.conv, d.tailrec,
-             d.pure, d.ghost, d.reads, d.writes, d.exported, d.section, d.crossing, d.needs)
+             d.pure, d.ghost, d.reads, d.writes, d.exported, d.section, d.crossing, d.needs, d.marks)
 end with_call_bounds
 
 // The same for a member, which writes the sugar wherever a function does.
@@ -678,7 +683,7 @@ with_member_call_bounds(m: MethodDecl) -> MethodDecl
 
     MethodDecl(m.span, m.name, m.receiver, m.is_property, tparams, params, m.ret_type, m.body,
                joined_bounds(m.bounds, bounds), m.tdefaults, m.vis, m.variadic, m.overrides,
-               m.tvalues, m.tpacks, m.crossing, m.reads, m.writes, m.borrows, m.is_static)
+               m.tvalues, m.tpacks, m.crossing, m.reads, m.writes, m.borrows, m.is_static, m.marks)
 end with_member_call_bounds
 
 // The added parameters, the parameter list with each arrow replaced by the name that stands for it,

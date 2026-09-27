@@ -1,0 +1,396 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+
+// Who is holding a count for a by-value argument while the call it was passed to runs.
+//
+// **A caller guarantees that every by-value argument it hands over stays alive for the whole of the
+// call, and a callee reads its parameters through that guarantee without taking a count of its
+// own.** That is Swift's `guaranteed` convention and Rust's `&self` borrow, and it is the cheap half
+// of a call: `push(*self, v: T)` with a local `v` costs no reference traffic at either end, however
+// much memory the body writes.
+//
+// **The guarantee is one-sided, which is what makes it work across a compilation boundary.** The
+// caller's obligation is the same whatever the callee turns out to do, so it can be discharged
+// against a name, a table slot or a function the compiler has never seen. A callee that takes a
+// count anyway is still correct -- an extra count held by a frame that gives it back is invisible --
+// so `owning` is free to be conservative without the caller having to know.
+//
+// The caller discharges its side by looking at the argument alone (`held`): a temporary is a count
+// this frame took and gives back after the call returns; a local or parameter whose address was
+// never let out holds its count in a slot no callee can name; anything else -- a field, an element,
+// a dereference, a global, a `ref`, a local whose address escaped -- keeps its count in memory the
+// callee may write, so the caller takes one of its own for the value it hands over.
+//
+// What the callee still owns, each for a reason that is not an exception: a parameter whose own
+// slot the body rebinds (the assignment gives back a count, and under a borrow that count is the
+// caller's); every parameter of a function with a tail self-call (the jump carries each value across
+// the release of the whole frame with a count the slot then has to give back); and every parameter
+// of a function something outside the program may call -- `@export`, a `@section`, a foreign
+// convention, or an address taken, since a `*fn` is called under C's convention and nothing on that
+// side discharges a caller's obligation.
+//
+// **And a body that can release nothing at all keeps the borrow in every one of those cases**
+// (`borrows`): with no call that comes back and no write to memory, it cannot reach a release however
+// it was entered. That is also what lets a caller skip its own count on a place argument at a call
+// to such a function.
+
+// The name that stands for "something was reached that could have written anything", which no local
+// can be called -- a module key always has a separator in it.
+const OPAQUE: string = "*"
+
+// A set of names a walk adds to through the box it captured.
+struct NameSink
+    names: Set[string]
+
+    add(*self, name: string)
+        self.names.add(name)
+end NameSink
+
+private name_sink() -> &NameSink = NameSink(set())
+
+// A flag a walk lowers through the box it captured.
+struct Verdict
+    ok: bool
+
+    refuse(*self)
+        self.ok = false
+end Verdict
+
+// -- the callee: a body that can release nothing ------------------------------------------------------
+
+// Whether this function's by-value parameters may be read through the caller's count whatever the
+// caller handed over.
+//
+// **The test is deliberately crude, because what it has to be is obviously right.** A retain is
+// dropped only where the body cannot, by any path that comes back, release anything at all: no call
+// that returns, and no write to memory. A call that cannot return is not an exception but an
+// application of the rule: control never comes back to the release. A contract clause is code too,
+// emitted around the body rather than inside it, so a function carrying one is left alone.
+borrows(f: TFunc) -> bool
+    if !f.requires.is_empty() || !f.ensures.is_empty() || !f.olds.is_empty() then return false
+
+    if f.variant.is_some() then return false
+
+    // Boxed, because a closure captures by value: a flag lowered in a copy says nothing here.
+    val v: &Verdict = Verdict(true)
+
+    walk_block_stmts(f.body, TWalk(true, x -> if !inert_node(x) then v.refuse(), w -> v.refuse(),
+                                   s -> if !inert_stmt(s) then v.refuse()))
+    v.ok
+end borrows
+
+// A statement a body that releases nothing may hold. A local's own storage is the function's, and
+// the count it holds is one the function took, so giving it back at the end of the block gives back
+// nothing the caller was relying on.
+private inert_stmt(s: TStmt) -> bool = s match
+    TVarDecl(_, _, _, _) -> true
+    TRefDecl(_, _, _) -> true
+    TExprStmt(_) -> true
+    TReturn(_) -> true
+    TBreak(_, _) -> true
+    TContinue(_) -> true
+    _ -> false
+
+// Whether this node, on its own, can neither hand control to code that returns nor write to memory.
+//
+// **The default is `false`, which is the whole reason this is a list of what is allowed.** A node
+// added later is unknown to it, and unknown has to mean "keep the retain" -- the other way round, a
+// new way of reaching arbitrary code would silently start dropping counts that were holding
+// something up.
+private inert_node(x: TExpr) -> bool = *x.kind match
+    // A call that does not come back never reaches the release this is deciding about.
+    TCall(_, _, ty, _) -> ty == Never
+
+    TIntLit(_, _) -> true
+    TFloatLit(_, _) -> true
+    TStrLit(_) -> true
+    TBoolLit(_) -> true
+    TUnitLit -> true
+    TNullLit(_) -> true
+    TZero(_) -> true
+    TCStrLit(_) -> true
+    TLoad(_, _) -> true
+    TGlobal(_, _, _) -> true
+    TFuncAddr(_, _, _) -> true
+
+    TCast(_, _) -> true
+    TDeref(_, _) -> true
+    TAddrOf(_, _) -> true
+    TTypeId(_, _) -> true
+    TTempAddr(_, _) -> true
+
+    TBinary(_, _, _, _) -> true
+    TUnary(_, _, _) -> true
+    TIntOp(_, _, _, _, _) -> true
+    TLogical(_, _, _) -> true
+    TCompare(_, _) -> true
+    TSeq(_) -> true
+
+    TField(_, _, _) -> true
+    TIndex(_, _, _) -> true
+    TLen(_, _) -> true
+    TBytes(_) -> true
+    TConstView(_) -> true
+    TSlice(_, _, _, _, _) -> true
+    TStrView(_) -> true
+
+    TIf(_, _, _, _) -> true
+    TMatch(_, _, _) -> true
+    TBlockExpr(_) -> true
+
+    TWhile(_, _, _, _) -> true
+    TDoWhile(_, _, _, _) -> true
+    TLoop(_, _) -> true
+    TFor(_, _, _, _, _, _, _, _) -> true
+
+    TVectorLit(_, _) -> true
+    TSplat(_, _) -> true
+    TVecCompare(_, _, _, _) -> true
+    TSelect(_, _, _, _) -> true
+    TReduce(_, _, _) -> true
+    TLane(_, _, _) -> true
+    TVecLoad(_, _, _) -> true
+
+    // Building a value takes shares of what goes into it and gives none back, so none of these can
+    // be the release the rule is looking for.
+    TStructNew(_, _) -> true
+    TEnumNew(_, _, _) -> true
+    TEnumFromInt(_, _) -> true
+    TEnumTry(_, _, _, _, _) -> true
+    TErase(_, _, _) -> true
+    TDowngrade(_, _) -> true
+
+    _ -> false
+
+// The functions whose bodies can release nothing at all, so a caller handing one of them a place
+// needs no count of its own for the length of the call.
+inert_callees(p: TProgram) -> Set[string]
+    var out: Set[string] = set()
+
+    for i in 0..<p.funcs.len()
+        if borrows(p.funcs.at(i)) then out.add(p.funcs.at(i).name)
+
+    out
+end inert_callees
+
+// -- the callee: which parameters it keeps a count of its own for ------------------------------------
+
+// The parameters of `f` that it takes a count for at entry and gives back at each return.
+//
+// A self-jump is checked before anything else, because the count it takes to carry an argument
+// across the release of the whole frame has to be one the slot gives back afterwards -- true even of
+// a body a borrow would otherwise be sound for. A body that can release nothing keeps the borrow
+// whoever entered it, which is what makes it stronger than every condition after it.
+owning(f: TFunc, addressed: bool, jumps: bool) -> Set[string]
+    var every: Set[string] = set()
+
+    for i in 0..<f.params.len()
+        every.add(f.params.at(i).0)
+
+    if jumps then return every
+
+    if borrows(f) then return set()
+
+    if addressed || f.exported.is_some() || f.section.is_some() || f.conv.is_some() then
+        return every
+
+    val bound = rebound(f)
+
+    if bound.has(OPAQUE) then return every
+
+    var out: Set[string] = set()
+
+    for i in 0..<f.params.len()
+        if bound.has(f.params.at(i).0) then out.add(f.params.at(i).0)
+
+    out
+end owning
+
+// Every parameter whose own storage a body may have changed, plus `OPAQUE` where something was
+// reached that cannot be reasoned about at all: an assignment, a compound one or an increment rooted
+// at it, an address taken of it, a `ref` bound to it. **Writing THROUGH a parameter does not
+// disqualify it** -- `*p = 1` writes what `p` points at, not the slot -- which is why the walk out of
+// a place stops at a dereference.
+rebound(f: TFunc) -> Set[string]
+    val out = name_sink()
+    val v = rebound_walk(out)
+
+    walk_block_stmts(f.body, v)
+
+    for i in 0..<f.requires.len()
+        walk_texpr(f.requires.at(i).cond, v)
+
+    for i in 0..<f.ensures.len()
+        walk_texpr(f.ensures.at(i).cond, v)
+
+    for i in 0..<f.olds.len()
+        walk_texpr(f.olds.at(i), v)
+
+    if f.variant.is_some() then walk_texpr(f.variant.unwrap(), v)
+
+    out.names
+end rebound
+
+// The same over the body alone, which is what a postcondition repeated at a call site asks
+// (`contract_assume.sysl`): the clauses are what is being repeated, and they read the parameters
+// rather than rebinding them.
+rebound_body(b: TBlock) -> Set[string]
+    val out = name_sink()
+
+    walk_block_stmts(b, rebound_walk(out))
+    out.names
+end rebound_body
+
+private rebound_walk(out: &NameSink) -> &TWalk =
+    TWalk(true, x -> rebound_node(out, x), w -> add_root(out, w.place), s -> rebound_stmt(out, s))
+
+private rebound_node(out: &NameSink, x: TExpr) = *x.kind match
+    TStore(place, _, _) -> add_root(out, place)
+    TUpdate(place, _, _, _, _, _) -> add_root(out, place)
+    TIncDec(place, _, _, _, _) -> add_root(out, place)
+    TAddrOf(place, _) -> add_root(out, place)
+    _ -> ()
+
+private rebound_stmt(out: &NameSink, s: TStmt) = s match
+    TRefDecl(_, _, place) -> add_root(out, place)
+    // A block of assembly names its operands' storage directly and says what it does to them in a
+    // constraint string, which is not something to parse for this.
+    TAsm(_, _, _) -> out.add(OPAQUE)
+    _ -> ()
+
+// The local whose storage a place reaches, where it reaches one. **It stops at a dereference on
+// purpose**: `*p = 1` writes the pointee, and only `p = q` writes the slot.
+private add_root(out: &NameSink, place: TExpr) = *place.kind match
+    TLoad(name, _) -> out.add(name)
+    TField(r, _, _) -> add_root(out, r)
+    TIndex(r, _, _) -> add_root(out, r)
+    TLane(r, _, _) -> add_root(out, r)
+    _ -> ()
+
+// Every function whose address the program takes, which is a caller this side cannot reason about: a
+// `*fn` is called under C's convention, so nothing at that call site takes a count for what it hands
+// over. Both the definition's name and the entry an address names are in it.
+addressed_funcs(p: TProgram) -> Set[string]
+    val out = name_sink()
+    val v = TWalk(true, x -> addressed_node(out, x), w -> (), s -> ())
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        walk_block_stmts(f.body, v)
+
+        for j in 0..<f.requires.len()
+            walk_texpr(f.requires.at(j).cond, v)
+
+        for j in 0..<f.ensures.len()
+            walk_texpr(f.ensures.at(j).cond, v)
+
+        for j in 0..<f.olds.len()
+            walk_texpr(f.olds.at(j), v)
+
+        if f.variant.is_some() then walk_texpr(f.variant.unwrap(), v)
+
+    for i in 0..<p.vals.len()
+        if p.vals.at(i).init.is_some() then walk_texpr(p.vals.at(i).init.unwrap(), v)
+
+    walk_stmts(p.main, v)
+    out.names
+end addressed_funcs
+
+private addressed_node(out: &NameSink, x: TExpr) = *x.kind match
+    TFuncAddr(name, entry, _) ->
+        out.add(name)
+        out.add(entry)
+    _ -> ()
+
+// -- the caller: which locals a call it makes could change under it ----------------------------------
+
+// Every local of a caller whose value a call it makes could change under it, plus `OPAQUE` where
+// something was reached that cannot be reasoned about at all. A callee reaches a caller's local only
+// through an address the caller let out, so taking one is what puts a name in here -- and a `ref` is
+// in for the same reason under a different spelling, the name standing for storage the caller does
+// not own.
+exposed_in(stmts: Buf[TStmt], result: Option[TExpr], vals: Buf[TVal]) -> Set[string]
+    val out = name_sink()
+    val v = TWalk(true, x -> exposed_node(out, x), w -> (), s -> exposed_stmt(out, s))
+
+    for i in 0..<vals.len()
+        if vals.at(i).init.is_some() then walk_texpr(vals.at(i).init.unwrap(), v)
+
+    walk_stmts(stmts, v)
+
+    if result.is_some() then walk_texpr(result.unwrap(), v)
+
+    out.names
+end exposed_in
+
+private exposed_node(out: &NameSink, x: TExpr) = *x.kind match
+    TAddrOf(place, _) -> add_root(out, place)
+    _ -> ()
+
+private exposed_stmt(out: &NameSink, s: TStmt) = s match
+    TRefDecl(name, _, place) ->
+        out.add(name)
+        add_root(out, place)
+    TAsm(_, _, _) -> out.add(OPAQUE)
+    _ -> ()
+
+// What a body that has not said which of its locals a call can reach exposes: everything.
+exposed_unknown() -> Set[string]
+    var out: Set[string] = set()
+
+    out.add(OPAQUE)
+    out
+end exposed_unknown
+
+// Whether the caller already holds a count for this argument that outlives the call.
+//
+// **The default is `false`, which is why this is a list of what is allowed.** Every node here is one
+// whose value is either a temporary the enclosing region releases *after* the call, or a slot the
+// callee has no way to name; anything else keeps its count somewhere a callee can reach, and guessing
+// wrong about a new node is a use-after-free rather than a slow program.
+held(e: *Emit, a: TExpr) -> bool = *a.kind match
+    // A local or parameter the caller never let the address of out.
+    TLoad(name, _) ->
+        !e.caller_exposed.has(OPAQUE) && !e.caller_exposed.has(name) && !is_promoted(e, name)
+
+    // A result, a box and a branch's value all arrive with a count already taken, registered in the
+    // region the enclosing statement closes -- which is after the call this is an argument to.
+    TCall(_, _, _, _) -> true
+    TVCall(_, _, _, _, _) -> true
+    TCallPtr(_, _, _, _) -> true
+    TBox(_, _) -> true
+    TIf(_, _, _, _) -> true
+    TMatch(_, _, _) -> true
+    TBlockExpr(_) -> true
+
+    // Building a value takes no count of its own, so what it stands on is what has to be held.
+    TStructNew(_, args) -> all_held(e, args)
+    TEnumNew(_, _, args) -> all_held(e, args)
+
+    // Neither changes what is counted or where the count is.
+    TCast(o, _) -> held(e, o)
+    TErase(o, _, _) -> held(e, o)
+
+    // A literal owns nothing and outlives everything. A string's is a view whose owner word is null,
+    // so there is no count to lose, and taking one would pull the whole runtime into a program whose
+    // only reference is the text inside a `print`.
+    TIntLit(_, _) -> true
+    TFloatLit(_, _) -> true
+    TBoolLit(_) -> true
+    TUnitLit -> true
+    TNullLit(_) -> true
+    TZero(_) -> true
+    TStrLit(_) -> true
+    TCStrLit(_) -> true
+
+    _ -> false
+
+private all_held(e: *Emit, args: Buf[TExpr]) -> bool
+    for i in 0..<args.len()
+        if !held(e, args.at(i)) then return false
+
+    true
+end all_held
