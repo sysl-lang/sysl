@@ -297,6 +297,22 @@ private ex_library() -> Buf[Program]
     ex_library_cache
 end ex_library
 
+// The library's units for a target other than the host, read for it afresh -- a per-OS directory is
+// taken or left by the target, so the host's reading is not another machine's.
+private ex_library_for(t: Target) -> Buf[Program]
+    if t.name == host_target().name then return ex_library()
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end ex_library_for
+
 private ex_no_library() -> bool
     if ex_library().is_empty()
         print("skipped: the standard module's source is not on this machine")
@@ -332,7 +348,7 @@ end ex_one
 private ex_build_files(files: Buf[(string, string)], t: Target, has_entry: bool,
                        as_tests: bool) -> ExBuild
     var units: Buf[Program] = buf()
-    val library = ex_library()
+    val library = ex_library_for(t)
 
     for i in 0..<library.len()
         units.push(library.at(i))
@@ -349,7 +365,9 @@ private ex_build_files(files: Buf[(string, string)], t: Target, has_entry: bool,
 
     if early != "" then return ExBuild(early, "", buf())
 
-    val whole = program_of(done, done.main_module)
+    // An archive is told so before the checks read the tree, exactly as `lower_for_c` tells it.
+    val read = program_of(done, done.main_module)
+    val whole = if has_entry then read else read with { entry_point = false, c_artifact = true }
     var own: Buf[string] = buf()
 
     own.push("")
@@ -723,6 +741,57 @@ end ex_a_tests_files_export_is_not_a_definition
 private ex_computed_storage() -> string =
     "module demo\n\ncounter() -> i32 = 7\n\nval start: i32 = counter()\n\n" +
     "@export\nbegin() -> i32 = start\n"
+
+// **A hosted archive fills its storage from a constructor.** A C project supplies its own `main`, so
+// nothing else runs to fill storage a computed initializer would have written; the platform's
+// pre-`main` list does, which LLVM lowers to `.init_array`, `__mod_init_func` or `.CRT$XCU`.
+@test("a computed 'val' an export reaches is filled by a constructor on a hosted target")
+ex_a_hosted_archive_gets_a_constructor()
+    if ex_no_library() then return
+
+    val out = ex_archive_ir(ex_computed_storage())
+
+    assert(out.contains("define internal void @sysl.module_init()"), out)
+    assert(out.contains("@llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] " +
+                        "[{ i32, ptr, ptr } { i32 65535, ptr @sysl.module_init, ptr null }]"), out)
+    // The storage really is filled there, rather than the constructor being an empty gesture.
+    assert(out.contains("call i32 @demo$counter()"), out)
+end ex_a_hosted_archive_gets_a_constructor
+
+// Why an archive for a machine was refused, or the text it lowered to where it was not.
+private ex_archive_err(text: string, target: string) -> string
+    val t = target_named(target)
+
+    if t.is_none() then return s"there is no target '$target'"
+
+    val b = ex_build(text, t.unwrap(), false, false)
+
+    if b.said != "" then b.said else b.text
+end ex_archive_err
+
+// **A freestanding archive is still refused, because nothing there walks the list**: bare metal has
+// no loader, so a constructor would be a function nobody calls and the storage would read whatever
+// the image left.
+@test("but a freestanding one is refused, and the diagnostic names the target")
+ex_a_freestanding_archive_is_refused()
+    if ex_no_library() then return
+
+    val said = ex_archive_err(ex_computed_storage(), "thumbv7em-freestanding")
+
+    assert(said.contains("module storage an initializer fills"), said)
+    assert(said.contains("thumbv7em-freestanding"), said)
+end ex_a_freestanding_archive_is_refused
+
+@test("reached transitively, which is what the walk is for")
+ex_storage_reached_transitively()
+    if ex_no_library() then return
+
+    val said = ex_archive_err("module demo\n\ncounter() -> i32 = 7\n\nval start: i32 = counter()\n\n" +
+                              "inner() -> i32 = start\n\n@export\nbegin() -> i32 = inner()\n",
+                              "thumbv7em-freestanding")
+
+    assert(said.contains("module storage an initializer fills"), said)
+end ex_storage_reached_transitively
 
 // **A build with an entry point lays its `val`s down there**, and gets no constructor beside it --
 // which would take a second count of every reference among them.

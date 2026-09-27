@@ -95,6 +95,61 @@ gen_main(e: *Emit, p: TProgram) -> Option[IrFunc]
     Some(finish_func(e, entry_sig(e.target)))
 end gen_main
 
+// **What a C archive gets instead of an entry point**: a constructor the platform runs before the C
+// project's own `main`, filling the storage `@main` would have filled.
+//
+// The platform's pre-`main` list is spelled once and lowered three ways -- `.init_array` on ELF,
+// `__mod_init_func` on Mach-O, `.CRT$XCU` on COFF -- and a C `main` runs after every constructor either
+// way. **The body is `gen_main`'s prologue and nothing else**, region for region, and it is `internal`
+// so two archives may each carry one: the list is `appending`, and registering the function on it is
+// also what keeps it, since nothing here calls it.
+gen_module_init(e: *Emit, p: TProgram) -> Option[IrInit]
+    start_function(e)
+    e.caller_exposed = exposed_in(buf(), None, p.vals)
+    push_temps(e)
+    push_owned(e)
+    gen_computed_vals(e, p.vals)
+    release_all(e)
+    emit_term(e, InRet(None, None))
+
+    if has_gap(e) then return None
+
+    val sig = ir_sig(module_init_symbol(), ir_fn_type(LVoid, buf())) with { linkage = LinkInternal }
+
+    // LLVM's own element type for the list: a priority, the function, and the global the entry is
+    // tied to the liveness of -- nothing here, so the entry lives as long as the object does.
+    var parts: Buf[LType] = buf()
+
+    parts.push(l_i32())
+    parts.push(LPtr)
+    parts.push(LPtr)
+
+    val slot = LStruct(parts)
+
+    var fields: Buf[IrArg] = buf()
+
+    fields.push(ir_arg(l_i32(), VInt(from_int(module_init_priority()))))
+    fields.push(ir_arg(LPtr, VGlobal(module_init_symbol())))
+    fields.push(ir_arg(LPtr, VNull))
+
+    var entries: Buf[IrArg] = buf()
+
+    entries.push(ir_arg(slot, VAgg(fields)))
+
+    Some(IrInit(finish_func(e, sig),
+                IrGlobal("llvm.global_ctors", false, LArr(1, slot), Some(VArray(entries)),
+                         LinkAppending, None, None, false)))
+end gen_module_init
+
+// The constructor's symbol: a runtime helper's spelling, dots rather than the module separator, so
+// nothing a module could declare lands on it.
+module_init_symbol() -> string = "sysl.module_init"
+
+// Where the constructor sits among the platform's own. `65535` is the default clang gives a C
+// `__attribute__((constructor))` with no priority, so sysl's storage is filled alongside the C the
+// archive carries rather than deliberately before or after it.
+private module_init_priority() -> int = 65535
+
 // Each computed `val`, filled in a region of its own.
 //
 // **The storage takes a count of its own for what it is given, and releases nothing.** Both halves

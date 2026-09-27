@@ -734,31 +734,39 @@ end returned_value
 // **The refusal is here rather than at the use**, exactly as the file-level one is: the clause is
 // the mistake, and it is the line a reader has to change.
 private block_import(cx: &Analyzer, span: Span, d: ImportDecl) -> TStmt
-    val written = joined(d.path, ".")
-    val path = in_package(cx.an, cx.scope.pkg, written)
+    val path = in_package(cx.an, cx.scope.pkg, joined(d.path, "."))
 
-    if !cx.an.tables.has_module(path) && d.selectors.is_empty() && !d.wildcard
-        val cut = last_dot_in(path)
+    // **What it may not collide with is what THIS block has imported**, not the file: an import in a
+    // block shadows whatever the file bound under the same name, for the rest of the block.
+    var taken = block_imported(cx)
+    val said = import_refusals(cx.an, cx.scope, span, d, &taken)
 
-        if cut.is_some()
-            val named = module_qualify(path[0..<cut.unwrap()],
-                                       path[(cut.unwrap() + 1)..<path.bytes.len])
+    for i in 0..<said.len()
+        cx.fault(said.at(i).0, said.at(i).1)
 
-            if declares(cx.an, named) && !reachable_key(cx.an, named, cx.scope)
-                cx.fault(span, out_of_reach(cx.an, named))
-                return TExprStmt(TExpr(span, TUnitLit))
-    end if
+    // A refused import costs itself and no more, so the rest of the block is still read.
+    if said.is_empty() then bind_block_import(cx.an, &cx.scope.imports, path, d)
 
-    for i in 0..<d.selectors.len()
-        val sel = d.selectors.at(i)
-        val key = module_qualify(path, sel.name)
-
-        if declares(cx.an, key) && !reachable_key(cx.an, key, cx.scope)
-            cx.fault(sel.span, out_of_reach(cx.an, key))
-
-    bind_block_import(&cx.scope.imports, path, d)
     TExprStmt(TExpr(span, TUnitLit))
 end block_import
+
+// The names the innermost open block has imported so far.
+private block_imported(cx: &Analyzer) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if cx.import_marks.is_empty() then return out
+
+    val at = cx.import_marks.at(cx.import_marks.len() - 1)
+
+    for i in at.0..<cx.scope.imports.names.len()
+        out.push(cx.scope.imports.names.at(i).0)
+
+    for i in at.1..<cx.scope.imports.modules.len()
+        if !holds_string(out, cx.scope.imports.modules.at(i).0)
+            out.push(cx.scope.imports.modules.at(i).0)
+
+    out
+end block_imported
 
 private become_stmt(cx: &Analyzer, span: Span, call: Expr) -> Buf[TStmt]
     val want = cx.ret_ty.unwrap_or(Unit)

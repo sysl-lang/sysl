@@ -553,7 +553,11 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
     val key = lookup_type_key(a, scope, name)
 
     if key.is_none() then
-        a.fault(scope, span, s"unknown type '$name'")
+        val rivals = offered_by(a, scope, name, k -> a.tables.types.has(k))
+
+        if rivals.len() > 1 then a.fault(scope, span, ambiguous_offer(name, rivals))
+        else a.fault(scope, span, s"unknown type '$name'")
+
         return Unknown
 
     // **An argument that binds an associated type by name is not a type argument**, so it is taken
@@ -711,15 +715,21 @@ private type_key_of(a: &Analysis, scope: Scope, name: string) -> Option[string]
 
     if dotted.is_some() then return lookup_qualified(a, scope, name, dotted.unwrap())
 
-    val bound = scope.imports.name_key(name)
-
-    if bound.is_some() && a.tables.types.has(bound.unwrap()) then return bound
-
     // This file's own file-private declaration of the spelling comes before the module's plain key,
     // where a sibling file took that one first.
     val here = file_private_key(a, scope.src.name, module_qualify(scope.module_name, name))
 
     if a.tables.types.has(here) && reachable_key(a, here, scope) then return Some(here)
+
+    // **The reader's own module beats an import of the same name**, and a name imported by name beats
+    // one a wildcard merely offers.
+    val bound = scope.imports.name_key(name)
+
+    if bound.is_some() && a.tables.types.has(bound.unwrap()) then return bound
+
+    // Two wildcards offering the spelling make it ambiguous rather than the first one's; the use
+    // reports which.
+    if offered_by(a, scope, name, k -> a.tables.types.has(k)).len() > 1 then return None
 
     var found: Option[string] = None
 

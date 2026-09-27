@@ -61,7 +61,7 @@ gather_imports(a: &Analysis, p: Program) -> Imports
 
     for i in 0..<body.len()
         *body.at(i).kind match
-            ImportDecl(d) -> read_import(&names, &modules, &wildcards,
+            ImportDecl(d) -> read_import(a, &names, &modules, &wildcards,
                                          in_package(a, p.pkg, joined(d.path, ".")), d)
             _ -> ()
 
@@ -71,10 +71,10 @@ end gather_imports
 // The same for an `import` written **inside a body**, which binds for the statements after it and
 // is taken back off at the dedent. It is the file's own reading with a narrower life, so it goes
 // through the same function rather than a second one that could drift from it.
-bind_block_import(into: *Imports, path: string, d: ImportDecl) =
-    read_import(&into.names, &into.modules, &into.wildcards, path, d)
+bind_block_import(a: &Analysis, into: *Imports, path: string, d: ImportDecl) =
+    read_import(a, &into.names, &into.modules, &into.wildcards, path, d)
 
-read_import(names: *Buf[(string, string)], modules: *Buf[(string, string)],
+read_import(a: &Analysis, names: *Buf[(string, string)], modules: *Buf[(string, string)],
             wildcards: *Buf[string], path: string, d: ImportDecl)
     if d.wildcard then
         wildcards.push(path)
@@ -94,10 +94,15 @@ read_import(names: *Buf[(string, string)], modules: *Buf[(string, string)],
 
         return
 
+    // **A selector may name a module beneath the path rather than a member of it**, which is the same
+    // import `import a.b.c` would have made -- so it binds the module, and a directory holding no
+    // source of its own can still have its sub-modules listed.
     for i in 0..<d.selectors.len()
         val s = d.selectors.at(i)
+        val sub = s"$path.${s.name}"
 
-        names.push((selector_bound(s), module_qualify(path, s.name)))
+        if a.tables.has_module(sub) then modules.push((selector_bound(s), sub))
+        else names.push((selector_bound(s), module_qualify(path, s.name)))
 
 // Where the last dot of a path is, which is what separates a module from a name in it.
 last_dot_in(name: string) -> Option[usize]

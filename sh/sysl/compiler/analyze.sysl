@@ -111,60 +111,126 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
 end read_decls
 
 // What an `import` claimed a module declares.
+//
+// **The file's imports are read in order**, so a later one sees the names an earlier one bound and can
+// be told it collides with them.
 private check_imports(a: &Analysis, scope: Scope, body: Buf[Stmt])
+    var taken: Buf[string] = buf()
+
     for i in 0..<body.len()
         *body.at(i).kind match
-            ImportDecl(d) -> check_import(a, scope, body.at(i).span, d)
+            ImportDecl(d) ->
+                val said = import_refusals(a, scope, body.at(i).span, d, &taken)
+
+                for k in 0..<said.len()
+                    a.fault(scope, said.at(k).0, said.at(k).1)
             _ -> ()
 
-private check_import(a: &Analysis, scope: Scope, span: Span, d: ImportDecl)
-    // What was written is what a diagnostic quotes; what it *names* is that read through the
-    // package layer, so a file of a fetched package writes its own short names and a consumer
-    // writes the name its manifest gave the package.
+// Everything one `import` is refused for, each with the place to point at, and the names it bound
+// added to `taken`.
+//
+// **An import never grants access**: everything it names is reachable by its full path already, so
+// what is decided here is which shorter spellings mean what -- and which would mean two things.
+//
+// What was written is what a diagnostic quotes; what it *names* is that read through the package
+// layer, so a file of a fetched package writes its own short names and a consumer writes the name
+// its manifest gave the package.
+import_refusals(a: &Analysis, scope: Scope, span: Span, d: ImportDecl,
+                taken: *Buf[string]) -> Buf[(Span, string)]
+    var out: Buf[(Span, string)] = buf()
     val written = joined(d.path, ".")
     val path = in_package(a, scope.pkg, written)
 
-    if !a.tables.has_module(path) then
-        // A path with no braces after it may name one declaration rather than a module, which is
-        // what `import sysl.text.Ascii` does.
-        if d.selectors.is_empty() && !d.wildcard && names_a_declaration(a, path)
-            // The path is a module and a name in it, so the edge is to the module half.
-            val cut = last_dot_in(path)
+    // **A wildcard is over a module's members**, so there has to be a module to have them. An import
+    // IS a dependency, whether or not anything below it names what was brought in.
+    if d.wildcard
+        if a.tables.has_module(path) then depends_on_module(a, scope, path, span)
+        else out.push((span, s"no module is called '$written'"))
 
-            if cut.is_some() then depends_on_module(a, scope, path[0..<cut.unwrap()], span)
+        return out
 
-            // **A declaration another file keeps to itself is refused where the import is
-            // written**, rather than at whatever later names it: the clause is the mistake, and it
-            // is the line a reader has to change. What the table is keyed on is the declaration's
-            // key rather than the dotted path the file wrote, which is the module and the name
-            // joined the way a key joins them.
-            val named = module_qualify(path[0..<cut.unwrap()],
-                                       path[(cut.unwrap() + 1)..<path.bytes.len])
+    // **A selector list may reach a sub-module of a directory that holds no source of its own**,
+    // which is a module's parent without being one -- so it asks only that the path lead somewhere,
+    // and each selector is a module beneath it or a member of it.
+    if !d.selectors.is_empty()
+        if !names_module(a, path)
+            out.push((span, s"no module is called '$written'"))
+            return out
 
-            if !reachable_key(a, named, scope)
-                a.fault(scope, span, out_of_reach(a, named))
+        for i in 0..<d.selectors.len()
+            val s = d.selectors.at(i)
+            val sub = s"$path.${s.name}"
 
-            return
-        end if
-
-        a.fault(scope, span, s"no module is called '$written'")
-        return
-
-    // **An import IS a dependency**, whether or not anything below it names what was brought in: a
-    // file that writes the clause has said its module reaches the other one, and the graph is what
-    // that statement is held to.
-    depends_on_module(a, scope, path, span)
-
-    for i in 0..<d.selectors.len()
-        val s = d.selectors.at(i)
-        val key = module_qualify(path, s.name)
-
-        if !declares(a, key) then
-            a.fault(scope, s.span,
-                    s"'$written' declares no '${s.name}' — there is no '$written.${s.name}'")
-        elif !reachable_key(a, key, scope)
             // A selector list points at the selector, which is the word that has to go.
-            a.fault(scope, s.span, out_of_reach(a, key))
+            if a.tables.has_module(sub) then import_module(a, scope, s.span, selector_bound(s), sub,
+                                                           taken, &out)
+            else import_name(a, scope, s.span, selector_bound(s), path, s.name, taken, &out)
+
+        return out
+
+    // **The longest prefix that names a module wins**, exactly as a qualified reference is read: the
+    // module where there is one, and a member of the module in front of it otherwise.
+    if a.tables.has_module(path)
+        import_module(a, scope, span, import_bound(d), path, taken, &out)
+        return out
+
+    val cut = last_dot_in(written)
+    val module = if cut.is_some() then in_package(a, scope.pkg, written[0..<cut.unwrap()]) else ""
+
+    if cut.is_none() || !a.tables.has_module(module)
+        out.push((span, s"no module is called '$written', and nothing declares it"))
+        return out
+
+    import_name(a, scope, span, import_bound(d), module, written[cut.unwrap() + 1..<written.bytes.len],
+                taken, &out)
+    out
+end import_refusals
+
+// A module bound to a shorter name. **Binding it to the name it already answers to asks for what is
+// already true**, so it is left alone rather than reported as the collision with itself it is.
+private import_module(a: &Analysis, scope: Scope, at: Span, bound: string, module: string,
+                      taken: *Buf[string], out: *Buf[(Span, string)])
+    depends_on_module(a, scope, module, at)
+
+    if bound != module then import_name_free(a, at, bound, taken, out)
+
+// One name brought in from a module, which is already a dependency on that module.
+//
+// **A declaration another file keeps to itself is refused where the import is written**, rather than
+// at whatever later names it: the clause is the mistake, and it is the line a reader has to change.
+private import_name(a: &Analysis, scope: Scope, at: Span, bound: string, module: string, name: string,
+                    taken: *Buf[string], out: *Buf[(Span, string)])
+    depends_on_module(a, scope, module, at)
+
+    if !import_name_free(a, at, bound, taken, out) then return
+
+    val key = module_qualify(module, name)
+
+    if !declares(a, key) then out.push((at, s"'$module' declares no '$name' — there is no '$module.$name'"))
+    elif !reachable_key(a, key, scope) then out.push((at, out_of_reach(a, key)))
+end import_name
+
+// What an import may not be called here, and whether it may be called this.
+//
+// **A name that already begins a module path is refused outright** rather than resolved by a rule: a
+// binding that was both would make `fs.read` mean one thing in a file that imported `fs` and another
+// in the file beside it, and the import can be given any other name with `as`. Binding one name twice
+// is the plainer mistake, reported at the second import rather than at whichever use found two
+// answers.
+private import_name_free(a: &Analysis, at: Span, bound: string, taken: *Buf[string],
+                         out: *Buf[(Span, string)]) -> bool
+    if names_module(a, bound)
+        out.push((at, s"'$bound' is a module, so importing something else under that name would hide " +
+                      "it — import it as another name with 'as'"))
+        return false
+
+    if holds_string(*taken, bound)
+        out.push((at, s"'$bound' is already imported"))
+        return false
+
+    taken.push(bound)
+    true
+end import_name_free
 
 // The entries a table took on since a mark, taken back out.
 rewind_registered(into: &Table[Type], mark: usize)
@@ -175,17 +241,6 @@ rewind_registered(into: &Table[Type], mark: usize)
 
     for i in 0..<made.len()
         into.remove(made.at(i))
-
-// Whether a dotted path names one declaration of a module rather than a module.
-private names_a_declaration(a: &Analysis, path: string) -> bool
-    val cut = last_dot_in(path)
-
-    if cut.is_none() then return false
-
-    val here = path[0..<cut.unwrap()]
-
-    a.tables.has_module(here) && declares(a, module_qualify(here, path[cut.unwrap() + 1..<path.bytes.len]))
-end names_a_declaration
 
 // Records that a module reached into another, which is what resolving a name to a key *makes*.
 //
@@ -244,6 +299,36 @@ declares(a: &Analysis, key: string) -> bool =
     a.tables.types.has(key) || a.tables.funcs.has(key) || a.tables.consts.has(key) ||
         a.tables.vals.has(key) || a.tables.externs.has(key) || a.tables.extern_vars.has(key) ||
         a.tables.overloads.has(key) || is_variant_name(a, key)
+
+// The keys the scope's wildcards offer for one written name, each once -- where there are two or more,
+// an unqualified use of the name is **ambiguous** rather than the first wildcard's.
+//
+// **A wildcard offers only what is visible here**, which is what keeps a module's private helper from
+// making a name from elsewhere ambiguous; `has` is the table the use site is asking, since one
+// spelling may be a type in one module and a function in another. The standard module is a wildcard
+// like any other in this, the auto-import being exactly a wildcard every file starts with.
+offered_by(a: &Analysis, scope: Scope, name: string, has: &Fn(string) -> bool) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<scope.imports.wildcards.len()
+        val key = module_qualify(scope.imports.wildcards.at(i), name)
+
+        if !holds_string(out, key) && has(key) && reachable_key(a, key, scope) then out.push(key)
+
+    out
+end offered_by
+
+// What an ambiguous wildcard offer is refused with, naming each wildcard it came through.
+ambiguous_offer(name: string, keys: Buf[string]) -> string
+    var from = ""
+
+    for i in 0..<keys.len()
+        if i > 0 then from = from + " and "
+
+        from = from + s"'${module_of(keys.at(i))}.*'"
+
+    s"'$name' is offered by $from — import it selectively, or write the module it comes from"
+end ambiguous_offer
 
 // Whether a key names a variant of an enum, which an import may name as well as the enum itself.
 private is_variant_name(a: &Analysis, key: string) -> bool = enum_of_variant(a, key).is_some()
