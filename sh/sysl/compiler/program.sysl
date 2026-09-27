@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
 import sysl.text.Search
 
 // What a whole program is made of, assembled once every body has been typed.
@@ -164,11 +165,13 @@ end a_library_key
 // Everything one compilation amounts to, once every body it reaches has been typed.
 program_of(done: TypedBodies, main_module: string) -> TProgram
     val a = done.an
+    val analyzed = analyzed_bodies(done.funcs)
+    val hooks = declared_hooks(done, analyzed)
 
     TProgram(reached_structs(a), reached_enums(a), reached_vtables(a), reached_externs(a),
              done.vals, emitted_funcs(done.funcs), done.main, done.entry, buf(), true, false,
              no_alloc_modules(done.units, false), no_alloc_modules(done.units, true), main_module,
-             declared_tests(done), declared_hooks(done), reached_extern_vars(a),
+             declared_tests(done, analyzed, hooks), hooks, reached_extern_vars(a),
              a.tables.test_only, destructors_of(a), a.warnings(), a.tables.module_deps)
 end program_of
 
@@ -384,8 +387,7 @@ private extern_written(a: &Analysis, key: string) -> ExternHome =
 // **Only the ones whose bodies survived analysis.** A test that was reported is not one a runner
 // could run, and listing it would put a name in the report that no dispatcher arm matches -- which
 // reads as a test that vanished rather than as the error already printed.
-private declared_tests(done: TypedBodies) -> Buf[TTest]
-    val hooks = declared_hooks(done)
+private declared_tests(done: TypedBodies, analyzed: Set[string], hooks: Buf[THook]) -> Buf[TTest]
     var out: Buf[TTest] = buf()
 
     for i in 0..<done.units.len()
@@ -403,7 +405,7 @@ private declared_tests(done: TypedBodies) -> Buf[TTest]
                         val key = func_key(done.an, scope, s.span, d)
                         val attr = d.test.unwrap()
 
-                        if analyzed_body(done.funcs, key)
+                        if analyzed.has(key)
                             out.push(TTest(key, attr.display.unwrap_or(module_bare(key)),
                                            attr.should_trap, attr.expected, unit.src.name,
                                            int(unit.src.locate(attr.span.start).line),
@@ -414,7 +416,7 @@ private declared_tests(done: TypedBodies) -> Buf[TTest]
 end declared_tests
 
 // The hooks every module declared, on the same terms.
-private declared_hooks(done: TypedBodies) -> Buf[THook]
+private declared_hooks(done: TypedBodies, analyzed: Set[string]) -> Buf[THook]
     var out: Buf[THook] = buf()
 
     for i in 0..<done.units.len()
@@ -432,7 +434,7 @@ private declared_hooks(done: TypedBodies) -> Buf[THook]
                         val key = func_key(done.an, scope, s.span, d)
                         val attr = d.hook.unwrap()
 
-                        if analyzed_body(done.funcs, key)
+                        if analyzed.has(key)
                             out.push(THook(attr.kind, key, unit.src.name,
                                            int(unit.src.locate(attr.span.start).line)))
                 _ -> ()
@@ -451,12 +453,16 @@ private module_hooks(hooks: Buf[THook], module_name: string) -> THooks
     hooks_of(mine)
 end module_hooks
 
-private analyzed_body(funcs: Buf[TFunc], name: string) -> bool
-    for i in 0..<funcs.len()
-        if funcs.at(i).name == name then return true
+// The names of every body that survived analysis, asked once per test and hook -- a set, so that
+// asking costs the same however many functions the program has.
+private analyzed_bodies(funcs: Buf[TFunc]) -> Set[string]
+    var out: Set[string] = set()
 
-    false
-end analyzed_body
+    for i in 0..<funcs.len()
+        out.add(funcs.at(i).name)
+
+    out
+end analyzed_bodies
 
 // The modules that gave the allocator up, and the same asked of what each module's TESTS may do --
 // two lists, because a `@tests` file may take the allocator back for the scaffolding alone.
