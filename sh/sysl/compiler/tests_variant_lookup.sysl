@@ -1,0 +1,84 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.time.{monotonic, whole_micros}
+
+// What resolving a bare name costs as a program grows in both calls and types.
+//
+// **A call, or a bare name read as an operand, may be a variant of an enum**, and finding out used to
+// mean walking every declared type and every enum instantiation -- once per call and once per name,
+// so a program with twice the functions and twice the types cost four times as much to type. Nearly
+// no name is a variant, and a set of every variant name registered answers that in one lookup.
+//
+// The claim is a ratio rather than a bound, as `tests_reachability.sysl`'s is: a program four times
+// larger may cost four times as much to type and not sixteen.
+
+// `n` structs nothing uses, which is what makes the type table large, and a chain of `n` functions
+// each calling the next and reading its parameter as an operand. One generic enum is used a fixed
+// number of times, so the variant path is still taken and still has to answer.
+private many_types_program(n: usize) -> string
+    var lines: Buf[string] = buf()
+
+    lines.push("enum Maybe[T]\n    Nothing\n    Just(T)\n\n")
+    lines.push("pick(m: Maybe[int]) -> int = m match\n    Just(v) -> v\n    Nothing -> 0\n\n")
+    lines.push("main()\n    val a = f0(1) + pick(Just(2)) + pick(Nothing)\n\n")
+
+    for i in 0..<n
+        lines.push(s"struct S$i\n    v: int\n\n")
+
+        if i + 1 < n then lines.push(s"f$i(x: int) -> int = f${i + 1}(x) + x\n\n")
+        else lines.push(s"f$i(x: int) -> int = x\n\n")
+
+    var text = ""
+
+    for i in 0..<lines.len()
+        text = text + lines.at(i)
+
+    text
+end many_types_program
+
+// The best of three analyses of one program, in microseconds, and how many bodies were typed.
+private typing_cost(n: usize) -> (long, usize)
+    val text = many_types_program(n)
+
+    var best: long = -1
+    var typed: usize = 0
+
+    for round in 0..<3
+        val started = monotonic()
+        val done = typed_of(text)
+        val took = whole_micros(monotonic() - started)
+
+        assert(done.reported.is_empty(), "the generated program is sound")
+
+        typed = done.funcs.len()
+
+        if best < 0 || took < best then best = took
+
+    (best, typed)
+end typing_cost
+
+@test("typing a program with four times the calls and four times the types costs about four times as much")
+name_resolution_is_linear_in_types()
+    val small = typing_cost(300)
+    val large = typing_cost(1200)
+
+    assert(large.1 > small.1, "the larger program types more bodies")
+
+    val ratio = large.0 / (if small.0 > 0 then small.0 else 1)
+
+    assert(ratio < 9, s"a 4x program took ${ratio}x as long to type (${small.0} us, then ${large.0} us)")
+end name_resolution_is_linear_in_types
+
+@test("a bare variant still resolves, and a name no enum declares is still undefined")
+variant_names_still_resolve()
+    val done = typed_of("enum Maybe[T]\n    Nothing\n    Just(T)\n\n" +
+                        "f() -> Maybe[int] = Just(3)\n\n" +
+                        "g() -> Maybe[int] = Nothing\n\n" +
+                        "h() -> int = Absent(3)\n")
+
+    assert_eq(done.reported.len(), 1)
+    assert(done.reported.at(0).diag.message.contains("Absent"), done.reported.at(0).diag.message)
+end variant_names_still_resolve

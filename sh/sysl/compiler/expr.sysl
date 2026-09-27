@@ -661,11 +661,18 @@ variant_from_expected(cx: &Analyzer, name: string,
         _ -> None
 end variant_from_expected
 
+// Whether any enum this compilation has registered carries a variant of this name. A `false` means
+// every walk below would come back empty, so a call or a bare name that is no variant at all -- which
+// is nearly every one -- pays one lookup rather than a pass over every declared type.
+may_name_variant(cx: &Analyzer, name: string) -> bool = cx.an.tables.variant_names.has(name)
+
 // The enum a bare variant name belongs to, preferring the one the position asked for.
 variant_of(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[(Type, EnumVariant)]
     val settled = variant_from_expected(cx, name, expected)
 
     if settled.is_some() then return settled
+
+    if !may_name_variant(cx, name) then return None
 
     // The first instantiation in registration order whose enum declares the name and may be named
     // here. Every test is a question with no side effect, so the cheap one -- does this enum have a
@@ -692,6 +699,8 @@ end variant_of
 // registered, which is the order the refusal names them in.
 variant_homes(cx: &Analyzer, name: string) -> Buf[string]
     var homes: Buf[string] = buf()
+
+    if !may_name_variant(cx, name) then return homes
 
     for i in 0..<cx.an.tables.enum_insts.len()
         cx.an.tables.enum_insts.at(i) match
@@ -739,6 +748,8 @@ end ambiguous_variant
 // and reaching for whichever instantiation some other file happened to register first would make
 // the answer depend on what the rest of the program does.
 private unsettled_variant(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[string]
+    if !may_name_variant(cx, name) then return None
+
     if variant_from_expected(cx, name, expected).is_some() then return None
 
     for i in 0..<cx.an.tables.types.len()
@@ -1189,6 +1200,8 @@ typed_by_position(cx: &Analyzer, e: Expr) -> bool = *e.kind match
 // an answer rather than a question. One that **carries** something derives its arguments from what
 // it was given, which is what makes `Some(3)` a type its sibling can be read against.
 private payload_free_generic_variant(cx: &Analyzer, name: string) -> bool
+    if !may_name_variant(cx, name) then return false
+
     for i in 0..<cx.an.tables.types.len()
         val key = cx.an.tables.types.key_at(i)
 
