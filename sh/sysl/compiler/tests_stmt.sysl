@@ -3,6 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.time.{monotonic, whole_millis}
 
 // What a statement, a pattern and a branch **are**, asked through the type each settles.
 //
@@ -363,6 +364,52 @@ a_literal_does_not_discharge_a_variant()
         "    Nothing -> 0\n    Just(0) -> 1\n"
 
     assert_eq(ty(src), "match on 'Maybe' is not exhaustive; missing Just (add an 'else' arm)")
+
+// Eight columns of a two-level enum, which a split over every column nobody narrowed multiplies into
+// millions of rows -- the shape that once took seconds per match.
+private wide_row(arms: string) -> string =
+    "enum Leaf\n    L0\n    L1\n    L2\n    L3\n\n" +
+    "enum Mid\n    M0(a: Leaf)\n    M1(a: Leaf)\n    M2(a: Leaf)\n    M3(a: Leaf)\n\n" +
+    "struct Row\n    a: Mid\n    b: Mid\n    c: Mid\n    d: Mid\n    e: Mid\n    f: Mid\n" +
+    "    g: Mid\n    h: Mid\n\nf(r: Row) -> int = r match\n" + arms
+
+@test("a column no arm narrowed is not split, so a wide nested match is checked at once")
+a_wide_nested_match_is_cheap()
+    val started = monotonic()
+
+    assert_eq(ty(wide_row("    Row(M0(_), _, _, _, _, _, _, _) -> 0\n" +
+                          "    Row(_, M3(_), _, _, _, _, _, _) -> 1\n" +
+                          "    Row(_, _, _, _, _, _, _, _) -> 2\n")), "int")
+
+    assert_eq(ty(wide_row("    Row(M0(_), _, _, _, _, _, _, _) -> 0\n" +
+                          "    Row(_, M3(_), _, _, _, _, _, _) -> 1\n")),
+              "match on 'Row' is not exhaustive; missing Row(M1(L0), M0, _, _, _, _, _, _), " +
+              "Row(M1(L0), M1, _, _, _, _, _, _), Row(M1(L0), M2, _, _, _, _, _, _), " +
+              "Row(M1(L1), M0, _, _, _, _, _, _), Row(M1(L1), M1, _, _, _, _, _, _), " +
+              "Row(M1(L1), M2, _, _, _, _, _, _), Row(M1(L2), M0, _, _, _, _, _, _), " +
+              "Row(M1(L2), M1, _, _, _, _, _, _), and more (add an 'else' arm)")
+
+    assert(whole_millis(monotonic() - started) < 1000, "two wide matches checked within a second")
+
+@test("and the split cap still reads each column at the depth the split would have reached it")
+the_split_cap_is_kept()
+    // The last column is read past the cap, so its constructors are not split and nothing names it.
+    assert_eq(ty(wide_row("    Row(_, _, _, _, _, _, _, M0(_)) -> 0\n" +
+                          "    Row(_, _, _, _, _, _, _, M1(_)) -> 1\n" +
+                          "    Row(_, _, _, _, _, _, _, M2(_)) -> 2\n" +
+                          "    Row(_, _, _, _, _, _, _, M3(_)) -> 3\n")),
+              "a 'match' that yields a value must be exhaustive — add an 'else' arm")
+
+    // One variant of a column nobody narrowed carrying a field is what pushes the last column past
+    // the cap: the deepest way through a column decides, not the first.
+    val mix = "enum Leaf\n    L0\n    L1\n\nenum Mid\n    M0(a: Leaf)\n    M1(a: Leaf)\n\n" +
+        "struct Row\n    a: Mix\n    b: Mid\n    c: Mid\n    d: Mid\n    e: Mid\n    g: bool\n" +
+        "    f: Mid\n\nf(r: Row) -> int = r match\n    Row(_, _, _, _, _, _, M0(_)) -> 0\n" +
+        "    Row(_, _, _, _, _, _, M1(_)) -> 1\n"
+
+    assert_eq(ty("enum Mix\n    K0\n    K1\n\n" + mix), "int")
+    assert_eq(ty("enum Mix\n    K0\n    K1(a: Leaf)\n\n" + mix),
+              "a 'match' that yields a value must be exhaustive — add an 'else' arm")
 
 // -- a converting position over a branching form ---------------------------------------------------
 
