@@ -106,21 +106,31 @@ end mt_ran_plain
 private mt_ran(text: string) -> string = mt_ran_plain(mt_import() + text)
 
 // The emitted text of a whole program, for the two claims that are about what was lowered rather
-// than about what it computes.
+// than about what it computes. The library is lowered into the text beside the program, as the
+// reference's `compileToLlvm` does, rather than declared from a precompiled artifact: a claim about
+// how a library default is materialized has to see the library's bodies.
 private mt_llvm(text: string) -> string
-    val dir = make_temp_dir("sysl-math-ir").unwrap()
-    val scratch = s"$dir/main.sysl"
+    val parsed = parse(source_of("test.sysl", mt_import() + text))
 
-    write_text(scratch, mt_import() + text).unwrap()
+    if !parsed.ok() then return parsed.report.at(0).message
 
-    val out = emit_llvm_text(scratch, None) match
-        Err(why) ->
-            remove_dir_all(dir).unwrap_or(())
-            return why.message
-        Ok(emitted) -> emitted.text
+    var units: Buf[Program] = buf()
+    val library = mt_library()
 
-    remove_dir_all(dir).unwrap_or(())
-    out
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), buf())
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
 end mt_llvm
 
 private mt_can_run() -> bool
