@@ -65,8 +65,38 @@ struct Imports
     modules: Buf[(string, string)]
     wildcards: Buf[string]
 
+    // **Where each open block's imports begin in the three lists, outermost first** -- only a block
+    // that has imported something has one. A name is asked of each block's imports, innermost first,
+    // and of the file's last, so a block's wildcard is asked before a name the file imported by name.
+    levels: Buf[(usize, usize, usize)]
+
     is_empty(self) -> bool =
         self.names.is_empty() && self.modules.is_empty() && self.wildcards.is_empty()
+
+    // How many levels a name is asked of: every block that has imported, and then the file.
+    depth(self) -> usize = self.levels.len() + 1
+
+    // The imports of one level on their own, 0 being the innermost block's and the last the file's.
+    level(self, i: usize) -> Imports
+        if self.levels.is_empty() then return self
+
+        val from = self.level_start(self.levels.len() - i)
+        val to = self.level_start(self.levels.len() - i + 1)
+        var names: Buf[(string, string)] = buf()
+        var modules: Buf[(string, string)] = buf()
+        var wildcards: Buf[string] = buf()
+
+        names.extend(self.names.view()[from.0..<to.0])
+        modules.extend(self.modules.view()[from.1..<to.1])
+        wildcards.extend(self.wildcards.view()[from.2..<to.2])
+        Imports(names, modules, wildcards, buf())
+    end level
+
+    // Where the k-th level counted from the file's begins, the one past the innermost ending the lists.
+    private level_start(self, k: usize) -> (usize, usize, usize) =
+        if k == 0 then (0, 0, 0)
+        else if k <= self.levels.len() then self.levels.at(k - 1)
+        else (self.names.len(), self.modules.len(), self.wildcards.len())
 
     // The key a bound name stands for.
     name_key(self, name: string) -> Option[string] = lookup_pair(self.names, name)
@@ -93,7 +123,7 @@ private lookup_pair(pairs: Buf[(string, string)], name: string) -> Option[string
 end lookup_pair
 
 // Nothing imported.
-no_imports() -> Imports = Imports(buf(), buf(), buf())
+no_imports() -> Imports = Imports(buf(), buf(), buf(), buf())
 
 // The terms one file's declarations are read in: the module they contribute to, what the file
 // imported, and the file itself -- which is what `private` is measured against, since **`private` is

@@ -314,16 +314,45 @@ declares(a: &Analysis, key: string) -> bool =
 // making a name from elsewhere ambiguous; `has` is the table the use site is asking, since one
 // spelling may be a type in one module and a function in another. The standard module is a wildcard
 // like any other in this, the auto-import being exactly a wildcard every file starts with.
+//
+// **Only the level that answers is asked** -- see `answering_imports` -- so a block's wildcard is not
+// made ambiguous by a file's, and a name the level imported by name offers nothing to be ambiguous.
 offered_by(a: &Analysis, scope: Scope, name: string, has: &Fn(string) -> bool) -> Buf[string]
+    val im = answering_imports(a, scope, name, has)
+    val bound = im.name_key(name)
     var out: Buf[string] = buf()
 
-    for i in 0..<scope.imports.wildcards.len()
-        val key = module_qualify(scope.imports.wildcards.at(i), name)
+    if bound.is_some() && has(bound.unwrap()) then return out
+
+    for i in 0..<im.wildcards.len()
+        val key = module_qualify(im.wildcards.at(i), name)
 
         if !holds_string(out, key) && has(key) && reachable_key(a, key, scope) then out.push(key)
 
     out
 end offered_by
+
+// **The imports a written name is answered from: the innermost level that binds it or offers it.**
+// A block's imports are asked before an outer block's and those before the file's, and within one
+// level a name imported by name beats a wildcard -- so a block's wildcard beats the file's selector,
+// the reference's order. Where no level answers, every import is handed back, which is what a use
+// that finds nothing has always been read against.
+answering_imports(a: &Analysis, scope: Scope, name: string, has: &Fn(string) -> bool) -> Imports
+    if scope.imports.levels.is_empty() then return scope.imports
+
+    for i in 0..<scope.imports.depth()
+        val im = scope.imports.level(i)
+        val bound = im.name_key(name)
+
+        if bound.is_some() && has(bound.unwrap()) then return im
+
+        for j in 0..<im.wildcards.len()
+            val key = module_qualify(im.wildcards.at(j), name)
+
+            if has(key) && reachable_key(a, key, scope) then return im
+
+    scope.imports
+end answering_imports
 
 // What an ambiguous wildcard offer is refused with, naming each wildcard it came through.
 ambiguous_offer(name: string, keys: Buf[string]) -> string
