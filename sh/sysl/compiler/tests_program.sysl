@@ -1460,6 +1460,58 @@ storage_types_come_after_the_members()
     assert(storage.unwrap() > member.unwrap(),
            s"storage at ${storage.unwrap()}, member at ${member.unwrap()}")
 
+@test("a member that is a shape makes its types real where a call asks, after every concrete member's")
+shape_members_make_nothing_real_at_the_declaration()
+    if no_library() then return
+
+    // Every shape is declared ahead of the concrete member, so reading one at its declaration puts
+    // its result first: a bare-arrow parameter, a member's own parameter, a generic type's member and
+    // a trait's.
+    val text = "module m\n\n" +
+        "struct Held\n    n: int\nend Held\n\n" +
+        "struct Kept\n    n: int\nend Kept\n\n" +
+        "struct Owned\n    n: int\nend Owned\n\n" +
+        "struct Promised\n    n: int\nend Promised\n\n" +
+        "struct Plain\n    n: int\nend Plain\n\n" +
+        "trait Promise\n    promise(self) -> Option[Promised]\nend Promise\n\n" +
+        "struct Wrap[T]\n    item: T\n\n    owned(self) -> Option[Owned] = None\nend Wrap\n\n" +
+        "struct Walker\n    n: int\n\n" +
+        "    pick(self, keep: int -> bool) -> Option[Held] = if keep(self.n) then Some(Held(self.n)) else None\n\n" +
+        "    kept[T](self, x: T) -> Option[Kept] = None\n\n" +
+        "    plain(self) -> Option[Plain] = None\nend Walker\n\n" +
+        "impl Promise for Walker\n    promise(self) -> Option[Promised] = None\n\n" +
+        "use() -> bool\n    val w = Walker(1)\n" +
+        "    val shapes = w.pick((n) -> n > 0).is_some() && w.kept(2).is_some() && Wrap(3).owned().is_some()\n" +
+        "    shapes && w.plain().is_some() && w.promise().is_some()\n"
+    val p = program_of_text(text)
+    val plain = made_real_at(p, "sysl.Option[m.Plain]")
+
+    assert(plain.is_some(), "the concrete member's result was never made real")
+
+    val shapes = ["Held", "Kept", "Owned", "Promised"]
+
+    for i in 0..<shapes.len
+        val at = made_real_at(p, s"sysl.Option[m.${shapes[i]}]")
+
+        assert(at.is_some(), s"Option[${shapes[i]}] was never made real")
+        assert(at.unwrap() > plain.unwrap(),
+               s"Option[${shapes[i]}] at ${at.unwrap()}, the concrete member's at ${plain.unwrap()}")
+
+@test("a module's asserts make their types real ahead of the eager instantiation of the library's")
+module_asserts_come_before_the_eager_types()
+    if no_library() then return
+
+    val text = "module m\n\nstruct Cell\n    a: i32\n    b: i32\nend Cell\n\n" +
+        "@assert(sizeof(Option[Cell]) == 12, \"a cell and its tag\")\n"
+    val p = program_of_text(text)
+    val asserted = made_real_at(p, "sysl.Option[m.Cell]")
+    val eager = made_real_at(p, "sysl.Option[char]")
+
+    assert(asserted.is_some(), "the assert's type was never made real")
+    assert(eager.is_some(), "the library's eager types were never made real")
+    assert(asserted.unwrap() < eager.unwrap(),
+           s"the assert's type at ${asserted.unwrap()}, the library's at ${eager.unwrap()}")
+
 @test("and the type is still read where nothing names the storage, so a mistake in one is reported")
 storage_of_a_type_that_is_not_there()
     if no_library() then return

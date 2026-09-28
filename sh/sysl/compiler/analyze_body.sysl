@@ -94,9 +94,9 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     // checked where it is written and whether or not any call takes it.
     check_value_defaults(a)
 
-    // The asserts a file declared beside its declarations, once every constant has been folded: a
-    // condition may name one wherever it was declared.
-    check_top_level_asserts(a, units)
+    // The entry file's asserts, once every constant has been folded; every other file's were settled
+    // before the eager instantiation.
+    check_top_level_asserts(a, units, true)
 
     // **The library's own functions are held back**: they are analyzed below, and only if
     // something reaches them. That is what keeps a program that never prints from carrying the
@@ -326,10 +326,19 @@ private type_lowered(a: &Analysis, funcs: *Buf[TFunc], held: *HeldQueue[HeldBody
     else funcs.push(analyze_body(a, scope, span, at.unwrap().decl, key))
 
 // Every `@assert` written where a declaration stands, settled in the terms of the file that wrote
-// it.
-private check_top_level_asserts(a: &Analysis, units: Buf[Program])
+// it. A condition may name a constant wherever it was declared, a constant being folded as it is read.
+//
+// **The entry file's are settled apart from every other file's**, `entry` choosing which: that file
+// is a body, so its asserts are settled with the bodies rather than with the declarations, and what
+// they make real lands there -- `sizeof(Pair)` in a one-file program puts `Pair` after the library's
+// types, where the same assert in a module puts its type ahead of them.
+check_top_level_asserts(a: &Analysis, units: Buf[Program], entry: bool)
     for i in 0..<units.len()
         val unit = units.at(i)
+        val is_entry = a.tables.entry_src != "" && unit.src.name == a.tables.entry_src
+
+        if is_entry != entry then continue
+
         val scope = scope_of_unit(a, unit)
         val cx = analyzer_for(a, scope)
 

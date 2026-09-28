@@ -74,6 +74,13 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
     // never made real.
     refuse_pinned_generic_enums(a)
 
+    // **The asserts a module file declared beside its declarations are settled BEFORE the eager
+    // instantiation**, and the order is observable: `@assert(sizeof(Cell) <= 32)` makes `Cell` real,
+    // and every type its variants name with it, ahead of every other type the compilation has. The
+    // record of what was laid out is in the order things were made real, so settling them later
+    // moves those types behind the whole standard library's. The entry file's wait for the bodies.
+    check_top_level_asserts(a, units, false)
+
     // A type that takes no arguments is instantiated whether or not anything uses it, so a field of
     // a type that does not exist is a mistake reported at the declaration rather than at whatever
     // first mentions it.
@@ -426,7 +433,7 @@ private resolve_signatures(a: &Analysis)
                 resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.members)
             TraitOf(d) ->
                 check_bound_names(a, decl.scope, d.name, d.bounds)
-                resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.methods)
+                resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.methods, true)
             _ -> ()
 
     // **An `impl` block's signatures are resolved where its members are lowered**, which is the
@@ -489,14 +496,52 @@ private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string],
 
     if ret.is_some() then resolve_type(a, scope, ret.unwrap(), subst)
 
+// **Only a concrete member of a concrete type keeps what its signature makes real**, the rule the
+// free functions above follow and for the same reason: a member of a trait, a member of a generic
+// type and a member generic in its own right -- a bare-arrow parameter makes it one -- are shapes,
+// made real per call, and the types a program lays out are the ones those calls ask for. Keeping
+// the reading here would move `Option[Span]` from where the first body asking for it is typed to
+// the declaration of `read(*self, start: u8 -> bool) -> Option[Span]`, ahead of every type the
+// library's bodies make real.
 private resolve_members(a: &Analysis, scope: Scope, owner: string, tparams: Buf[string],
-                        bounds: Buf[NamedBounds], members: Buf[MethodDecl])
+                        bounds: Buf[NamedBounds], members: Buf[MethodDecl], is_trait: bool = false)
+    val shape = is_trait || !tparams.is_empty()
+    val whole = if shape then Some(registration_mark(a)) else None
     var subst = abstract_subst(a, scope, tparams, bounds, buf(), buf(), buf())
 
     subst.push(Binding("Self", self_type(a, scope, owner, tparams, bounds)))
 
     for i in 0..<members.len()
-        resolve_method(a, scope, members.at(i), subst)
+        val m = members.at(i)
+        val generic = !shape && !with_member_call_bounds(m).tparams.is_empty()
+        val own = if generic then Some(registration_mark(a)) else None
+
+        resolve_method(a, scope, m, subst)
+
+        if own.is_some() then rewind_to(a, own.unwrap())
+
+    if whole.is_some() then rewind_to(a, whole.unwrap())
+end resolve_members
+
+// How far each instantiation table had been filled when a reading at stand-ins began, and the trial
+// that reading runs in: what it rewinds to.
+private struct RegistrationMark
+    trial: usize
+    structs: usize
+    enums: usize
+    constrained: usize
+
+private registration_mark(a: &Analysis) -> RegistrationMark
+    val trial = a.sandboxed()
+
+    RegistrationMark(trial, a.tables.struct_insts.len(), a.tables.enum_insts.len(),
+                     a.tables.constrained_insts.len())
+
+private rewind_to(a: &Analysis, m: RegistrationMark)
+    a.release(m.trial)
+    rewind_registered(a.tables.struct_insts, m.structs)
+    rewind_registered(a.tables.enum_insts, m.enums)
+    rewind_registered(a.tables.constrained_insts, m.constrained)
 
 private resolve_method(a: &Analysis, scope: Scope, m: MethodDecl, outer: Buf[Binding])
     var subst: Buf[Binding] = buf()
