@@ -126,14 +126,22 @@ private place_by_name(cx: &Analyzer, subject: string, names: Buf[string], args: 
     for i in 0..<names.len()
         slots.push(None)
 
+    // **A trailing block is a written argument with no position of its own**, so it is set aside
+    // before any rule below reads a position: a name written before it must not strand it, since
+    // `column(spacing = 4):` is exactly what a caller reaches for. It is placed last, below.
+    var n = args.len()
+    val has_block = n > 0 && is_block(args.at(n - 1))
+
+    if has_block then n -= 1
+
     // A named argument gives up its position, so nothing after one has a position left to mean
     // anything. Told at the positional argument, since that is the one to move.
-    var first_named = args.len()
+    var first_named = n
 
-    for i in 0..<args.len()
-        if first_named == args.len() && is_named(args.at(i)) then first_named = i
+    for i in 0..<n
+        if first_named == n && is_named(args.at(i)) then first_named = i
 
-    for i in first_named..<args.len()
+    for i in first_named..<n
         if !is_named(args.at(i))
             cx.fault(args.at(i).span, if !report then "misplaced argument" else
                      "this argument comes after one written by name, so there is no position left " +
@@ -146,7 +154,7 @@ private place_by_name(cx: &Analyzer, subject: string, names: Buf[string], args: 
     for i in 0..<first_named
         if i < names.len() then slots.set(i, Some(args.at(i))) else extra += 1
 
-    for i in first_named..<args.len()
+    for i in first_named..<n
         val a = args.at(i)
 
         *a.kind match
@@ -174,6 +182,18 @@ private place_by_name(cx: &Analyzer, subject: string, names: Buf[string], args: 
                 slots.set(usize(idx), Some(value))
             _ -> ()
 
+    // **The block fills the first parameter no written argument filled** — the last argument
+    // wherever the call wrote no names. With every parameter already written it is one argument
+    // too many, and the arity refusal says so.
+    if has_block
+        var free: int = -1
+
+        for i in 0..<slots.len()
+            if free < 0 && slots.at(i).is_none() then free = int(i)
+
+        if free < 0 then extra += 1 else slots.set(usize(free), Some(args.at(n)))
+    end if
+
     Some(extra)
 end place_by_name
 
@@ -194,6 +214,10 @@ end names_phrase
 
 private is_named(e: Expr) -> bool = *e.kind match
     NamedArg(_, _) -> true
+    _ -> false
+
+private is_block(e: Expr) -> bool = *e.kind match
+    BlockArg(_) -> true
     _ -> false
 
 private index_of_name(names: Buf[string], name: string) -> int
