@@ -1,0 +1,97 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+
+// A file that does not parse is reported in the shape every other error is: `error:` and the
+// message, the `-->` line, the quoted line and a one-column caret. Every expected text here is the
+// reference's own output for the same file, with the scratch directory put back in for its path.
+
+private pdf_ready() -> bool = std_root().is_ok()
+
+// What `sysl <command> <dir>` says about a project holding one `main.sysl`, and the directory.
+private pdf_run(command: string, text: string) -> (string, string, int)
+    val root = make_temp_dir("sysl-pdf").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", command, root], (line) -> sink.push(line))
+    val out = if lines.is_empty() then "" else lines.at(0)
+
+    remove_dir_all(root).unwrap_or(())
+    (out, root, code)
+
+private pdf_expect(command: string, text: string, want: string -> string)
+    val (out, root, code) = pdf_run(command, text)
+
+    assert_eq(code, 1)
+    assert_eq(out, want(root))
+
+@test("a missing ')' is reported with its location line, the quoted line and a caret")
+pdf_a_missing_paren()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "main() -> unit\n    print(1\n", (root) ->
+        s"error: ')' expected\n --> $root/main.sysl:3:1\n  |\n3 | \n  | ^")
+
+@test("an indented line where a dedent was wanted")
+pdf_a_bad_indentation()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "main() -> unit\n    val x = 1\n      val y = 2\n", (root) ->
+        s"error: dedent expected\n --> $root/main.sysl:3:7\n  |\n3 |       val y = 2\n  |       ^")
+
+@test("a dotted path in a visibility bracket is ']' expected, pointing at the first dot")
+pdf_a_bracket_expected()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "private[sysl.math] f() -> int = 1\n\nmain() -> unit\n    print(f())\n", (root) ->
+        s"error: ']' expected\n --> $root/main.sysl:1:13\n  |\n" +
+        s"1 | private[sysl.math] f() -> int = 1\n  |             ^")
+
+@test("an unterminated string is a lexical error, and its caret is one column wide")
+pdf_an_unterminated_string()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "main() -> unit\n    print(\"abc)\n", (root) ->
+        s"error: unterminated string literal\n --> $root/main.sysl:2:11\n  |\n" +
+        s"2 |     print(\"abc)\n  |           ^")
+
+@test("a 'const' array is refused while the type is read, in the same shape")
+pdf_a_const_array()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "main() -> unit\n    val a: [4]const int = [1, 2, 3, 4]\n    print(a[0])\n", (root) ->
+        s"error: 'const' says a view refuses writes, and an array is storage rather than a view of " +
+        s"one — read-only storage is declared with 'val', as 'val name: [N]int'\n" +
+        s" --> $root/main.sysl:2:25\n  |\n2 |     val a: [4]const int = [1, 2, 3, 4]\n" +
+        s"  |                         ^")
+
+@test("every command that parses reports the same way: emit-llvm, emit-typed and test")
+pdf_every_command_the_same()
+    if !pdf_ready() then return
+
+    val text = "main() -> unit\n    print(1\n"
+    val want = (root: string) -> s"error: ')' expected\n --> $root/main.sysl:3:1\n  |\n3 | \n  | ^"
+
+    pdf_expect("emit-llvm", text, want)
+    pdf_expect("emit-typed", text, want)
+    pdf_expect("test", text, want)
+
+@test("emit-ast names the file as it was given, in the same shape")
+pdf_emit_ast()
+    val root = make_temp_dir("sysl-pdf").unwrap()
+    val file = s"$root/main.sysl"
+
+    write_text(file, "main() -> unit\n    print(1\n").unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "emit-ast", file], (line) -> sink.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 1)
+    assert_eq(lines.at(0), s"error: ')' expected\n --> $file:3:1\n  |\n3 | \n  | ^")
