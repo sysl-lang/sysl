@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.text.Search
 
 // What a place is, and what a `?` anywhere inside a statement means for a `defer`.
 //
@@ -127,6 +128,61 @@ writable_place(t: TExpr) -> bool = *t.kind match
 written_once_place(cx: &Analyzer, t: TExpr) -> bool = root_local(cx, t) match
     Some(l) -> l.read_only
     None -> false
+
+// **A `*self` receiver is an `&` the caller did not write, and it is asked the same question** an
+// assignment and an explicit `&` are: a method that takes the address of a `val` to write through it
+// is refused, or `val` says read-only and means nothing -- and a module-level `val`, laid down as
+// `constant`, would have a store aimed into read-only storage.
+//
+// The message names the MEMBER, the write being a line inside somebody else's body. **A closure that
+// only reads its captures is called on a `val`**, the address `call` takes being used for nothing but
+// reading (`Analysis.read_only_closures`); asked of the concrete receiver, since a call through
+// `&Fn(...)` is dispatched on the trait, where the box supplies the place.
+refuse_written_once_receiver(cx: &Analyzer, span: Span, place: TExpr, member: string)
+    if member == "call"
+        texpr_type(place) match
+            Struct(st) -> if cx.an.read_only_closures.has(st.base) then return
+            _ -> ()
+    end if
+
+    val root = root_local(cx, place)
+
+    if root.is_some() && root.unwrap().read_only
+        if root.unwrap().from_pattern
+            cx.fault(span, s"'$member' takes '*self', so it writes through what it is called on — " +
+                     "and a pattern binding holds a copy of what it matched, so the write would " +
+                     "reach that copy rather than the value it came from. Copy it into a 'var' and " +
+                     "call this on that")
+            return
+        end if
+
+        cx.fault(span, s"'$member' takes '*self', so it writes through what it is called on, and a " +
+                 s"'val' is written once${var_fix(place)}")
+        return
+    end if
+
+    if global_written_once(place)
+        cx.fault(span, s"'$member' takes '*self', so it writes through what it is called on, and a " +
+                 s"'val' is written once${var_fix(place)}")
+end refuse_written_once_receiver
+
+// The advice, naming the binding where the receiver IS one -- one `val` produces one of these per
+// mutating call, and naming it is what makes the fix findable from any of them.
+private var_fix(place: TExpr) -> string = *place.kind match
+    TLoad(name, _) ->
+        val dot = name.index_of(".")
+
+        s" — write 'var ${if dot.is_some() then name[0..<dot.unwrap()] else name}' if it is meant " +
+            "to change"
+    _ -> " — write 'var' if it is meant to change"
+
+// Whether a place bottoms out in module storage bound by a `val`. An `extern` variable is the one
+// global that is not, its storage belonging to whoever laid it down.
+private global_written_once(t: TExpr) -> bool = *t.kind match
+    TGlobal(_, _, writable) -> !writable
+    TField(recv, _, _) -> !holds_an_address(texpr_type(recv)) && global_written_once(recv)
+    TIndex(recv, _, _) -> owns_its_elements(texpr_type(recv)) && global_written_once(recv)
+    _ -> false
 
 // The local a place bottoms out in, where it bottoms out in one at all -- the same descent
 // `writable_place` makes, kept apart from it because the refusal wants the *binding*.

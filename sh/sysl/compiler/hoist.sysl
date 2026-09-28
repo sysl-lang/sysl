@@ -237,6 +237,13 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
             hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.consts, "constant",
                         Some(value))
         ValDecl(name, typ, value, vis, align, section) ->
+            // What is visible outside its file states its types, and a module member always could
+            // be (`reference/modules.md § Visibility`). Reported, and registered all the same, so the
+            // one line that is wrong is the one line reported.
+            if typ.is_none() then
+                a.fault(scope, s.span, s"a module-level 'val' states its type, so '$name' needs one " +
+                        s"— 'val $name: T = …'")
+
             hoist_value(a, scope, s.span, name, typ, vis, a.tables.vals, "'val'", Some(value), align,
                         section)
         // **A top-level `var` is the module's storage**, wherever it was written. The one file
@@ -262,6 +269,12 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
 private hoist_storage(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
                       vis: Visibility, init: Option[Expr], align: Option[Expr],
                       section: Option[string], thread_local: bool)
+    // The rule a module `val` meets, biting harder: module storage written with `var` may have no
+    // initializer at all for a type to be read off.
+    if typ.is_none() then
+        a.fault(scope, span, s"'$name' is module storage, and module storage states its type — " +
+                s"write '$name: T'")
+
     hoist_value(a, scope, span, name, typ, vis, a.tables.vals, "'var'", init, align, section,
                 thread_local)
     a.tables.writable.push(file_private_key(a, scope.src.name,

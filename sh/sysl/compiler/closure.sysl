@@ -41,6 +41,9 @@ mentions_closure(name: string) -> bool
     var at: usize = 0
     val bytes = name.bytes
     val prefix = s"${ModuleSep}closure"
+    // A nested function's environment is named by the same kind of counter, so a body filed under
+    // it is the same hazard.
+    val env = s"${ModuleSep}env"
 
     while at <= bytes.len
         var end = at
@@ -50,6 +53,8 @@ mentions_closure(name: string) -> bool
 
         if end - at >= prefix.bytes.len && name[at..<(at + prefix.bytes.len)] == prefix then
             return true
+
+        if end - at >= env.bytes.len && name[at..<(at + env.bytes.len)] == env then return true
 
         if end >= bytes.len then return false
 
@@ -96,6 +101,10 @@ closure_expr(cx: &Analyzer, span: Span, written: Buf[LambdaParam], body: Buf[Stm
             ptypes.push(resolve_type(cx.an, cx.scope, p.typ.unwrap(), cx.subst))
         else if want.is_some() && i < want.unwrap().0.len()
             ptypes.push(want.unwrap().0.at(i))
+        // A position whose own type was refused has already said what is wrong, and the closure at
+        // it is not a second mistake.
+        else if expected.is_some() && expected.unwrap() == Unknown
+            ptypes.push(Unknown)
         else
             cx.fault(p.span, missing_parameter_type(p.name))
             ptypes.push(Unknown)
@@ -190,6 +199,10 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     cx.an.tables.members.func_insts.put(fname, FuncSig(lowered.params, lowered.ret_ty))
     cx.an.closure_funcs.push(lowered)
 
+    // **A reading thrown away rewinds the counter**, so the name may already be on the list from a
+    // body that is gone; the entry is the answer about THIS body or nothing.
+    note_read_only(cx.an, base, !writes_environment(lowered.body))
+
     register_call_trait(cx, span, st, ptypes, lowered.ret_ty)
 
     // Every capture is read where the closure is **formed**, so a value is copied in and a `&T`
@@ -202,6 +215,42 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
 
     TExpr(span, TStructNew(st, args))
 end lower_closure
+
+// Whether a closure's body writes through its own environment -- a store, a compound assignment, an
+// increment or a lane store whose place reaches `self`. **Asked of the typed tree**, since a write is
+// a node and these four are all of them. A closure written inside this one is a body of its own with
+// its own `self`, reached here only as the struct that builds it, so its writes are its own.
+private writes_environment(body: TBlock) -> bool
+    val seen: &EnvWrites = EnvWrites(false)
+
+    walk_block_stmts(body, expr_walk(true, e -> note_env_write(seen, e)))
+    seen.found
+end writes_environment
+
+private struct EnvWrites
+    found: bool
+
+private note_read_only(a: &Analysis, base: string, reads_only: bool)
+    if reads_only then a.read_only_closures.add(base)
+    else a.read_only_closures.remove(base)
+
+private note_env_write(seen: &EnvWrites, e: TExpr)
+    val hit = *e.kind match
+        TStore(place, _, _) -> reaches_self(place)
+        TUpdate(place, _, _, _, _, _) -> reaches_self(place)
+        TIncDec(place, _, _, _, _) -> reaches_self(place)
+        TVecStore(recv, _, _) -> reaches_self(recv)
+        _ -> false
+
+    if hit then seen.found = true
+
+private reaches_self(place: TExpr) -> bool = *place.kind match
+    TLoad(name, _) -> name == "self"
+    TDeref(inner, _) -> reaches_self(inner)
+    TField(recv, _, _) -> reaches_self(recv)
+    TIndex(recv, _, _) -> reaches_self(recv)
+    TSlice(base, _, _, _, _) -> reaches_self(base)
+    _ -> false
 
 // The body itself, read in a frame of its own.
 //
