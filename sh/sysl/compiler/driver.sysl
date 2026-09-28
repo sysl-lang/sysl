@@ -292,9 +292,11 @@ emit_llvm_text(path: string, named_target: Option[string]) -> Result[Emitted, Re
     // craft-freestanding` is how a program for it is produced at all -- refusing here for want of an
     // archive nothing was going to link would refuse the command in the only case it is essential.
     // Nothing is precompiled, so the library's bodies are lowered into the text with the program's.
+    // **`--no-std-lib` is the same answer asked for on purpose**: nothing is looked for, and the
+    // library's bodies are lowered here while its C is compiled beside the program's.
     var linked = StdArtifact(buf(), "")
 
-    if t.builds_with_clang()
+    if t.builds_with_clang() && !std_from_source()
         linked = std_artifact(t) match
             Err(why) -> return Err(Refusal(why))
             Ok(found) -> found
@@ -722,7 +724,9 @@ private link_lowered_text(path: string, text: string, t: Target, cc: Option[stri
     // **Nothing is linked where the tree being built IS the library**, which is `--std`: its bodies
     // are in the text above rather than in an archive, and an artifact on the line would put a
     // second copy of every one of them in front of the linker.
-    if !standalone
+    // **Nor where the build was told to compile it from source** (`--no-std-lib`): its bodies are in
+    // the text too, and its C is among the objects above.
+    if !standalone && !std_from_source()
         std_artifact(t) match
             Err(why) ->
                 discard_objects(objects)
@@ -969,7 +973,7 @@ private test_build_from(program: Compilation, standalone: bool) -> Result[TestBu
 
     var precompiled: Buf[string] = buf()
 
-    if !standalone
+    if !standalone && !std_from_source()
         precompiled = std_artifact(t) match
             Err(why) -> return Err(Refusal(why))
             Ok(found) -> found.precompiled
@@ -1096,6 +1100,14 @@ private native_objects(clang: string, path: string, exe: string, t: Target,
             for i in 0..<roots.len()
                 trees.push(roots.at(i))
         Err(_) -> ()
+
+    // And the standard module's, where it is compiled from source rather than linked from an
+    // artifact, whose C would otherwise have come with it. A tree that **is** the library already
+    // stands first in the list.
+    if std_from_source()
+        std_root() match
+            Ok(library) -> if library != path then trees.push(library)
+            Err(_) -> ()
 
     var objects: Buf[string] = buf()
     var n = 0

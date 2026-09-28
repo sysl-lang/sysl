@@ -71,6 +71,30 @@ pkgcli_no_config_builds()
     assert_eq(got.0, 0)
     remove_dir_all(root).unwrap_or(())
 
+// **`--no-std-lib` compiles the standard module from its source into the build**, so nothing is
+// looked for in the cache. What is observable of that is the text: the library's `printi` is
+// *defined* in the program rather than declared against an artifact, which is what the reference's
+// own `emit-llvm --no-std-lib` prints for the same program -- and the build, which then has to
+// compile the library's C itself, still links.
+@test("and builds it without going looking for a standard module to link")
+pkgcli_no_std_lib_looks_for_nothing()
+    if !pkgcli_library_here() then return
+
+    val root = pkgcli_project(pkgcli_hello, "")
+    val built = pkgcli_run(["sysl", "build", "--no-std-lib", root, "-o", s"$root/out"])
+
+    assert_eq(built.0, 0)
+    assert(metadata(s"$root/out").is_ok(), "the program was linked")
+
+    val alone = pkgcli_run(["sysl", "emit-llvm", "--no-std-lib", root])
+    val linked = pkgcli_run(["sysl", "emit-llvm", root])
+
+    assert(pkgcli_has(alone.1, "define void @sysl$printi(i64 %n.param) {"), "defined from source")
+    assert(pkgcli_has(linked.1, "declare void @sysl$printi(i64)"), "declared against the artifact")
+    assert(!pkgcli_has(linked.1, "define void @sysl$printi("), "and not defined a second time")
+    remove_dir_all(root).unwrap_or(())
+end pkgcli_no_std_lib_looks_for_nothing
+
 // `run` rather than `build`, because it is the **driver** that refuses to run what it cannot
 // execute, before any of this reaches clang -- so the refusal is worded by the driver and names the
 // target, where a failed cross link is worded by whatever linker the machine has. What discriminates
