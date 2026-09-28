@@ -76,9 +76,11 @@ bind_params(cx: &Analyzer, span: Span, subject: string, params: Buf[Param], vari
 end bind_params
 
 // A variant's payload fields, which a call may name as it names a function's parameters: the
-// arguments put back into the order the fields were declared in. A field nothing filled is left out,
-// so the count the caller checks next is what says one is missing.
-by_field_name(cx: &Analyzer, subject: string, fields: Buf[(string, Type)],
+// arguments put back into the order the fields were declared in. **A field nothing filled is NAMED**,
+// as a function's parameter is where the arguments chose their own slots — a count would not say
+// which one was left out. Where arguments also ran past the end, the count the caller checks next is
+// what answers.
+by_field_name(cx: &Analyzer, span: Span, subject: string, fields: Buf[(string, Type)],
               args: Buf[Expr]) -> Option[Buf[Expr]]
     var any = false
 
@@ -94,7 +96,17 @@ by_field_name(cx: &Analyzer, subject: string, fields: Buf[(string, Type)],
 
     var slots: Buf[Option[Expr]] = buf()
 
-    if place_by_name(cx, subject, names, args, true, &slots).is_none() then return None
+    val extra = place_by_name(cx, subject, names, args, true, &slots)
+
+    if extra.is_none() then return None
+
+    if extra.unwrap() == 0
+        for i in 0..<slots.len()
+            if slots.at(i).is_none()
+                cx.fault(span, s"$subject was given no value for '${names.at(i)}', and that parameter " +
+                         "declares no default")
+                return None
+    end if
 
     var out: Buf[Expr] = buf()
 
