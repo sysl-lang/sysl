@@ -525,6 +525,74 @@ private check_signature_rules(a: &Analysis, scope: Scope, span: Span, name: stri
     check_va_list_positions(a, scope, name, params, ret, foreign)
 end check_signature_rules
 
+// A name spread as a pack has to have been DECLARED as one, and a pack may only be written as the
+// whole of a tuple (`reference/generics.md § A parameter may stand for a list of types`) -- asked
+// of the signature as written, with no substitution. Left to resolution it is never said at all:
+// inference binds whatever `(..T)` matched, so a `T` declared as one type quietly starts standing
+// for a list, and a signature nothing ever calls is never resolved.
+check_pack_spellings(a: &Analysis, scope: Scope, span: Span, tparams: Buf[string],
+                     packs: Buf[string], params: Buf[Param], ret: Option[TypeRef])
+    for i in 0..<params.len()
+        walk_pack_spellings(a, scope, span, tparams, packs, params.at(i).typ)
+
+    if ret.is_some() then walk_pack_spellings(a, scope, span, tparams, packs, ret.unwrap())
+end check_pack_spellings
+
+private walk_pack_spellings(a: &Analysis, scope: Scope, span: Span, tparams: Buf[string],
+                            packs: Buf[string], t: TypeRef)
+    *t.kind match
+        NamedType(_, args) ->
+            for i in 0..<args.len()
+                walk_pack_spellings(a, scope, span, tparams, packs, args.at(i))
+        PtrType(inner) -> walk_pack_spellings(a, scope, span, tparams, packs, inner)
+        RefType(inner, _) -> walk_pack_spellings(a, scope, span, tparams, packs, inner)
+        WeakType(inner) -> walk_pack_spellings(a, scope, span, tparams, packs, inner)
+        VolatileType(inner) -> walk_pack_spellings(a, scope, span, tparams, packs, inner)
+        ArrayType(_, elem, _) -> walk_pack_spellings(a, scope, span, tparams, packs, elem)
+        VectorType(_, elem) -> walk_pack_spellings(a, scope, span, tparams, packs, elem)
+        TupleType(parts, _) ->
+            if parts.len() == 1
+                *parts.at(0).kind match
+                    PackType(n) ->
+                        declared_pack(a, scope, span, tparams, packs, n)
+                        return
+                    _ -> ()
+            end if
+
+            for i in 0..<parts.len()
+                walk_pack_spellings(a, scope, span, tparams, packs, parts.at(i))
+        // A pack reached anywhere else is one written outside the tuple that is the only place for it.
+        PackType(n) ->
+            declared_pack(a, scope, span, tparams, packs, n)
+            a.fault(scope, span, s"'..$n' is a type pack and not a type — the only place one may be " +
+                    s"written is inside a tuple, as '(..$n)'")
+        FnType(ps, r, _) ->
+            for i in 0..<ps.len()
+                walk_pack_spellings(a, scope, span, tparams, packs, ps.at(i))
+
+            walk_pack_spellings(a, scope, span, tparams, packs, r)
+        CFnType(ps, r) ->
+            for i in 0..<ps.len()
+                walk_pack_spellings(a, scope, span, tparams, packs, ps.at(i))
+
+            walk_pack_spellings(a, scope, span, tparams, packs, r)
+        AssocType(base, _) -> walk_pack_spellings(a, scope, span, tparams, packs, base)
+        AssocArgType(_, inner) -> walk_pack_spellings(a, scope, span, tparams, packs, inner)
+        _ -> ()
+end walk_pack_spellings
+
+private declared_pack(a: &Analysis, scope: Scope, span: Span, tparams: Buf[string],
+                      packs: Buf[string], n: string)
+    if holds_string(packs, n) then return
+
+    if holds_string(tparams, n)
+        a.fault(scope, span, s"'$n' stands for one type, and '(..$n)' spreads a list of them — a " +
+                s"parameter that stands for a list is declared '..$n'")
+    else
+        a.fault(scope, span, s"'..$n' names no type pack — a pack is declared in the parameter " +
+                s"list, as '[..$n]'")
+end declared_pack
+
 // Where a `va_list` may stand in a signature (`reference/ffi.md § A variadic reads its tail`).
 //
 // In a **sysl** signature a walk is handed on **by address**: `*va_list` is the parameter type, and
@@ -627,6 +695,7 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
     a.tables.funcs.put(key, Func(d, span, scope))
     record_access(a, scope, span, key, d.vis)
     check_signature_rules(a, scope, span, d.name, d.params, d.ret_type, d.variadic, false)
+    check_pack_spellings(a, scope, span, d.tparams, d.tpacks, d.params, d.ret_type)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
 
