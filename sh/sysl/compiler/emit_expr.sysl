@@ -871,8 +871,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
             val base = underlying(d.base)
 
             base match
-                Floating(_, _) ->
-                    if d.lo.is_some() || d.hi.is_some() then gap_here(e, "a float range check")
+                Floating(_, _) -> if d.lo.is_some() || d.hi.is_some() then float_range_check(e, v, base, d)
                 _ ->
                     d.lo match
                         Some(lo) ->
@@ -900,6 +899,31 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                 None -> ()
         _ -> ()
 end emit_constraint_checks
+
+// A float range is compared in double precision whatever the base's width, so a narrower value is
+// widened once and both bounds are read against that -- a bound is a decimal the reference holds as
+// the nearest `double`, which is what the literal's own text rounds to.
+private float_range_check(e: *Emit, v: Val, base: Type, d: &ConstrainedType)
+    var at = v
+
+    if base != real_type()
+        val wide = fresh_reg(e)
+
+        emit(e, InCast(wide, CastFPExt, lty(e, base), v, lty(e, real_type())))
+        at = wide
+
+    d.lo match
+        Some(lo) -> trap_unless(e, compare_value(e, ">=", real_type(), at, VFloat(double_bits(s"$lo"))),
+                                "within")
+        None -> ()
+
+    d.hi match
+        Some(hi) ->
+            val op = if d.exclusive_hi then "<" else "<="
+
+            trap_unless(e, compare_value(e, op, real_type(), at, VFloat(double_bits(s"$hi"))), "within")
+        None -> ()
+end float_range_check
 
 private gen_constrained_valid(e: *Emit, value: TExpr, c: Type) -> Val
     val v = gen_expr(e, value)
@@ -1380,8 +1404,8 @@ zero_of(e: *Emit, ty: Type) -> Val
         other -> gap_at(e, s"the zero of ${type_show(other)}")
 end zero_of
 
-// A range bound as a whole number. Every bound an integer type carries is one; a float base is a
-// gap rather than a rounding, since the check there compares in double precision.
+// A range bound as a whole number. Every bound an integer type carries is one; a float base's
+// bounds are read by `float_range_check` instead, in double precision.
 decimal_int(d: Decimal) -> BigInt = rescale(d, 0, Rounding.Down).coefficient()
 
 // -- `?` --------------------------------------------------------------------------------------------

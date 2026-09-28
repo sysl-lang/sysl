@@ -126,6 +126,25 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                     s"'${show_bound(a, bound, subject)}'" +
                     second_implementation(key.unwrap(), tr, already.at(i)))
 
+    // **A blanket block covering the subject is an implementation the subject already has**, and the
+    // list above cannot see it: a blanket is filed under its bound's key rather than under any
+    // type's. The case is a subtype of a built-in -- `type Stamp = new i64` is the program's own type,
+    // so coherence gives an `impl` for it a home, while a derivation has its base's memberships
+    // (`reference/errors.md § A derivation inherits its base's behaviour`), so the library's blanket
+    // covers it too and two blocks would cover one type with nothing to pick between them.
+    val blankets = blanket_owners(a, ty)
+
+    for i in 0..<blankets.len()
+        if !block.overrides && impl_at(a, bound, blankets.at(i).0, ty, blankets.at(i).1).is_some()
+            // The subtype half is said only where there is a subtype: on a built-in written out in
+            // full the clause would be about a type that is not there.
+            val inherited = if underlying(ty) == ty then ""
+            else ", and a subtype has its base's memberships"
+
+            a.fault(scope, span, s"'${home.label}' already implements '${show_bound(a, bound, subject)}' — " +
+                    s"${every_shape(blankets.at(i).0)} does, through one block written over the family" +
+                    inherited)
+
     // A shape and a type of that shape written out in full would both implement the trait for that
     // type. By default the second one written is refused, in whichever order the file put them,
     // because two overlapping blocks are usually a mistake. **What lifts the refusal is `override`
