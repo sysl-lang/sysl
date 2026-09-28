@@ -1,0 +1,82 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// What a compilation says when the standard module cannot be found or built, one test per cause,
+// each asserting the whole message the reference prints for it.
+
+// A library root holding a 'sysl' directory with the given files in it.
+private sbf_library(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-sbf").unwrap()
+
+    make_dir_all(s"$root/$StdModule").unwrap()
+
+    for i in 0..<files.len
+        write_text(s"$root/$StdModule/${files[i].0}", files[i].1).unwrap()
+
+    root
+end sbf_library
+
+private sbf_advice(cause: string) -> string =
+    s"cannot find or build the standard module — build it with 'sysl build-lib library --std', " +
+        s"or pass --no-std-lib to compile against the copy built into the compiler ($cause)"
+
+@test("a SYSL_LIB naming a directory that is not there says which directory it should have been")
+sbf_a_sysl_lib_that_is_not_there()
+    assert_eq(std_root_of(Some("/nonexistent"), None).unwrap_err(),
+              "SYSL_LIB names '/nonexistent', which does not hold a 'sysl' directory — it should be " +
+              "the library root, which is the directory *above* 'sysl' rather than 'sysl' itself")
+
+@test("no library anywhere lists every place it looked, unwrapped by the rebuild advice")
+sbf_no_library_anywhere()
+    assert_eq(std_root_of(None, Some("/nowhere/bin/sysl")).unwrap_err(),
+              "cannot find the standard module's source, which every program is compiled against. " +
+              "Looked for a library root holding 'sysl' at:\n" +
+              "  /nowhere/share/sysl/library (beside this compiler)\n" +
+              "  /nowhere/share/sysl/lib (beside this compiler)\n" +
+              "  library (from the working directory)\n" +
+              "  ../library (from the working directory)\n" +
+              "  ../../library (from the working directory)\n" +
+              "  lib (from the working directory)\n" +
+              "  ../lib (from the working directory)\n" +
+              "  ../../lib (from the working directory)\n" +
+              "\nA sysl installed from a package has it beside the binary; one run out of a checkout " +
+              "finds it in the tree. Set SYSL_LIB to the library root to name it outright.")
+
+@test("a library whose source does not parse is a rebuild that failed, and says the two ways out")
+sbf_a_library_that_does_not_parse()
+    val root = sbf_library([("std.sysl", "module sysl\n\nthis is not sysl ((\n")])
+    val t = host_target()
+    val said = std_artifact_at(root, s"$root/out/std.syslib", "0", t, "1").unwrap_err()
+
+    assert_eq(said, sbf_advice("the standard module does not parse: library/sysl/std.sysl:4:1: " +
+                               "a pattern expected"))
+    remove_dir_all(root).unwrap_or(())
+
+@test("a clang failure while building the archive is wrapped, the cause kept whole and last")
+sbf_a_clang_failure_while_building()
+    val root = sbf_library([("std.sysl", "module sysl\n"), ("broken.c", "#error sbf\n")])
+    val t = host_target()
+    val said = std_artifact_at(root, s"$root/out/std.syslib", "0", t, "1").unwrap_err()
+
+    val c = s"${absolute_path(root)}/sysl/broken.c"
+
+    assert_eq(said, sbf_advice(s"clang failed on $c:\n" +
+                               s"$c:1:2: error: sbf\n" +
+                               "    1 | #error sbf\n" +
+                               "      |  ^\n" +
+                               "1 error generated."))
+    remove_dir_all(root).unwrap_or(())
+
+@test("reports the toolchain's own sentence, with none of the standard module's advice")
+sbf_no_toolchain_is_the_toolchains_sentence()
+    val why = std_rebuild_failure("the artifact did not build", Err("no clang for this machine"))
+
+    assert_eq(why, "no clang for this machine")
+
+@test("and keeps that advice where there is a compiler and something else went wrong")
+sbf_a_compiler_keeps_the_advice()
+    val why = std_rebuild_failure("the artifact did not build", Ok("/usr/bin/clang"))
+
+    assert_eq(why, sbf_advice("the artifact did not build"))

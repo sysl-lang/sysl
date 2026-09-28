@@ -47,12 +47,7 @@ std_artifact(t: Target, level: string = DefaultOptimization) -> Result[StdArtifa
     val root = std_root()?
     val fingerprint = std_fingerprint(root, t)?
     val path = std_artifact_path(t, fingerprint, level)
-
-    val symbols = match_at(path, fingerprint, t) match
-        Ok(found) -> found
-        Err(why) ->
-            eprints(s"building the standard module at $path ($why)\n")
-            write_std_artifact(root, path, fingerprint, t, level)?
+    val symbols = std_artifact_at(root, path, fingerprint, t, level)?
 
     std_held_for = held_for
     std_held = symbols
@@ -60,6 +55,38 @@ std_artifact(t: Target, level: string = DefaultOptimization) -> Result[StdArtifa
     std_held_ok = true
     Ok(StdArtifact(symbols, path))
 end std_artifact
+
+// The artifact for the library at `root`, read from `path` where what is there was built from it and
+// built there first where it was not.
+std_artifact_at(root: string, path: string, fingerprint: string, t: Target,
+                level: string) -> Result[Buf[string], string] = match_at(path, fingerprint, t) match
+    Ok(found) -> Ok(found)
+    Err(why) ->
+        eprints(s"building the standard module at $path ($why)\n")
+
+        write_std_artifact(root, path, fingerprint, t, level) match
+            Ok(made) -> Ok(made)
+            Err(err) -> Err(std_rebuild_failure(err, std_toolchain(t)))
+
+// What a compilation is told when the artifact it needed was not there and could not be built: the
+// cause, wrapped in the two ways out -- build it by hand, or compile the library from its source.
+//
+// **Except where there is no compiler for this machine at all, and then the toolchain's own sentence
+// is the whole answer.** Both ways out need the very thing that is missing: `build-lib --std` reaches
+// the same toolchain, and `--no-std-lib` still has to compile the library's C and link it. Offering
+// them would bury the one sentence that fixes the problem inside two that cannot.
+//
+// **The toolchain is asked rather than read off the message**, and the question is separate from the
+// build so both answers can be asserted on a machine where every target has a clang.
+std_rebuild_failure(err: string, toolchain: Result[string, string]) -> string = toolchain match
+    Err(none) -> none
+    Ok(_) -> s"cannot find or build the standard module — build it with 'sysl build-lib library " +
+        s"--std', or pass --no-std-lib to compile against the copy built into the compiler " +
+        s"(${err.trim_end()})"
+
+// Whether this machine has a clang to build for the target with, or the sentence saying why not.
+private std_toolchain(t: Target) -> Result[string, string] =
+    if !t.builds_with_clang() then Err(t.no_toolchain()) else find_clang(t, None)
 
 // One library compiled into an artifact for one machine, which is what `sysl build-lib <root>`
 // writes for a package.
