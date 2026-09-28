@@ -2,7 +2,10 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, add, cmp, div_rem, from_int, mul, negate, pow, sub, to_string}
+import sysl.math.bigint.{BigInt, add, cmp, div_rem, from_int, mul, negate, pow, sub, to_string,
+                         and as big_and, or as big_or, xor as big_xor, not as big_not,
+                         from_real as big_of_real, to_real as big_to_real, zero as big_zero}
+import sysl.text.parse_real
 
 // What an expression comes to while compiling, where it comes to anything.
 //
@@ -17,6 +20,7 @@ enum Const
     ConstBool(value: bool)
     ConstChar(value: char)
     ConstStr(value: string)
+    ConstFloat(value: real)
 end Const
 
 // The integer an expression comes to, where it comes to one.
@@ -32,6 +36,7 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
     BoolLit(v) -> Some(ConstBool(v))
     CharLit(c) -> Some(ConstChar(c))
     StrLit(s) -> Some(ConstStr(s))
+    FloatLit(text, _) -> Some(ConstFloat(parse_real(text).unwrap_or(0.0)))
 
     // A **value parameter** is asked before a declared constant, and shadows one of the same name
     // for the same reason a type parameter shadows a type: the nearer binding is the one written
@@ -62,12 +67,16 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
         dotted_name(receiver, name).and_then(n -> const_of_name(cx, n))
 
     Unary(op, operand) -> const_unary(cx, op, operand)
-    Binary(op, l, r) -> const_binary(cx, op, l, r)
+    Binary(op, l, r) -> const_binary(cx, e.span, op, l, r)
     Compare(operands, ops) ->
         if operands.len() == 2 && ops.len() == 1 then
-            const_binary(cx, ops.at(0), operands.at(0), operands.at(1))
+            const_binary(cx, e.span, ops.at(0), operands.at(0), operands.at(1))
         else
             None
+
+    // A conversion is written, so what it does while compiling is what it does while running: a
+    // narrowing wraps and a float-to-integer truncates toward zero.
+    Call(callee, args) -> const_conversion(cx, e.span, callee, args)
 
     // `sizeof(T)` and `alignof(T)` are compile-time constants, so they fold exactly as a literal
     // does -- which is what makes them usable in an array bound and in a `const`.
@@ -144,13 +153,14 @@ private const_unary(cx: &Analyzer, op: string, operand: Expr) -> Option[Const]
     v.unwrap() match
         ConstInt(n) ->
             if op == "-" then Some(ConstInt(negate(n)))
+            else if op == "~" then Some(ConstInt(big_not(n)))
             else None
+        ConstFloat(f) -> if op == "-" then Some(ConstFloat(0.0 - f)) else None
         ConstBool(b) -> if op == "!" then Some(ConstBool(!b)) else None
         _ -> None
 end const_unary
 
-// A conversion is written, so what it does while compiling is what it does while running.
-private const_binary(cx: &Analyzer, op: string, l: Expr, r: Expr) -> Option[Const]
+private const_binary(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr) -> Option[Const]
     val a = const_fold(cx, l)
     val b = const_fold(cx, r)
 
@@ -158,16 +168,33 @@ private const_binary(cx: &Analyzer, op: string, l: Expr, r: Expr) -> Option[Cons
 
     a.unwrap() match
         ConstInt(x) -> b.unwrap() match
-            ConstInt(y) -> int_binary(op, x, y)
+            ConstInt(y) -> int_binary(cx, span, op, x, y)
+            _ -> None
+        ConstFloat(x) -> b.unwrap() match
+            ConstFloat(y) -> float_binary(op, x, y)
             _ -> None
         ConstBool(x) -> b.unwrap() match
             ConstBool(y) -> bool_binary(op, x, y)
             _ -> None
+        ConstChar(x) -> b.unwrap() match
+            ConstChar(y) -> compared(op, cmp(from_int(long(u32(x))), from_int(long(u32(y)))))
+            _ -> None
         ConstStr(x) -> b.unwrap() match
             ConstStr(y) -> str_binary(op, x, y)
             _ -> None
-        _ -> None
 end const_binary
+
+// A comparison's verdict from the sign of the difference, where the operator is a comparison.
+private compared(op: string, sign: int) -> Option[Const]
+    if op == "==" then return Some(ConstBool(sign == 0))
+    if op == "!=" then return Some(ConstBool(sign != 0))
+    if op == "<" then return Some(ConstBool(sign < 0))
+    if op == "<=" then return Some(ConstBool(sign <= 0))
+    if op == ">" then return Some(ConstBool(sign > 0))
+    if op == ">=" then return Some(ConstBool(sign >= 0))
+
+    None
+end compared
 
 // Two string literals joined are a third, which is the one operator on strings that produces a
 // value rather than a verdict -- and at compile time it is text beside text, with none of the
@@ -175,34 +202,46 @@ end const_binary
 // in pieces, one line per source line; without it such a value could not be a `const` at all.
 private str_binary(op: string, x: string, y: string) -> Option[Const]
     if op == "+" then return Some(ConstStr(x + y))
+    if op == "==" then return Some(ConstBool(x == y))
+    if op == "!=" then return Some(ConstBool(x != y))
 
     None
 end str_binary
 
-private int_binary(op: string, x: BigInt, y: BigInt) -> Option[Const]
+// Floating-point arithmetic is the machine's, done once while compiling.
+private float_binary(op: string, x: real, y: real) -> Option[Const]
+    if op == "+" then return Some(ConstFloat(x + y))
+    if op == "-" then return Some(ConstFloat(x - y))
+    if op == "*" then return Some(ConstFloat(x * y))
+    if op == "/" then return Some(ConstFloat(x / y))
+
+    compared(op, if x < y then -1 else if x > y then 1 else 0)
+end float_binary
+
+private int_binary(cx: &Analyzer, span: Span, op: string, x: BigInt, y: BigInt) -> Option[Const]
     if op == "+" then return Some(ConstInt(add(x, y)))
     if op == "-" then return Some(ConstInt(sub(x, y)))
     if op == "*" then return Some(ConstInt(mul(x, y)))
-    if op == "==" then return Some(ConstBool(cmp(x, y) == 0))
-    if op == "!=" then return Some(ConstBool(cmp(x, y) != 0))
-    if op == "<" then return Some(ConstBool(cmp(x, y) < 0))
-    if op == "<=" then return Some(ConstBool(cmp(x, y) <= 0))
-    if op == ">" then return Some(ConstBool(cmp(x, y) > 0))
-    if op == ">=" then return Some(ConstBool(cmp(x, y) >= 0))
+    if op == "&" then return Some(ConstInt(big_and(x, y)))
+    if op == "|" then return Some(ConstInt(big_or(x, y)))
+    if op == "^" then return Some(ConstInt(big_xor(x, y)))
 
-    // A division by zero is a mistake in what was written rather than something to answer, and it
-    // is left to the reading that asked for the fold to say so.
-    if op == "/" then
-        if cmp(y, from_int(0)) == 0 then return None
-        else return Some(ConstInt(div_rem(x, y).0))
+    // A division by zero is a mistake in what was written rather than something to answer, and the
+    // compiler is the one dividing, so it is the one to say so.
+    if op == "/" || op == "%"
+        if cmp(y, from_int(0)) == 0
+            cx.fault(span, "a constant divided by zero")
+            return None
+        end if
 
-    if op == "%" then
-        if cmp(y, from_int(0)) == 0 then return None
-        else return Some(ConstInt(div_rem(x, y).1))
+        val q = div_rem(x, y)
 
-    if op == "<<" || op == ">>" then return shifted(op, x, y)
+        return Some(ConstInt(if op == "/" then q.0 else q.1))
+    end if
 
-    None
+    if op == "<<" || op == ">>" then return shifted(cx, span, op, x, y)
+
+    compared(op, cmp(x, y))
 end int_binary
 
 // A constant shift, done as a multiplication or a division by a power of two, since these are
@@ -212,9 +251,11 @@ end int_binary
 // past 64 places is meaningful the moment a type is wider than that: `1 << 200` is an ordinary
 // constant at `u256`. A distance beyond every possible width is refused -- it cannot be a shift of
 // anything, and the number it would produce is unbounded.
-private shifted(op: string, x: BigInt, places: BigInt) -> Option[Const]
-    if cmp(places, from_int(0)) < 0 || cmp(places, from_int(long(MaxIntegerBits))) > 0 then
+private shifted(cx: &Analyzer, span: Span, op: string, x: BigInt, places: BigInt) -> Option[Const]
+    if cmp(places, from_int(0)) < 0 || cmp(places, from_int(long(MaxIntegerBits))) > 0
+        cx.fault(span, s"a constant shifted by ${to_string(places)} places")
         return None
+    end if
 
     val n = places.to_long()
 
@@ -288,6 +329,52 @@ private const_type_attr(cx: &Analyzer, receiver: Expr, attr: string) -> Option[C
             else None
         _ -> None
 end const_type_attr
+
+// A written conversion to a scalar -- `u8(300)`, `real(3)`, `char(65)` -- over a value that folds.
+private const_conversion(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr]) -> Option[Const]
+    if args.len() != 1 then return None
+
+    val written = *callee.kind match
+        Ident(n) -> Some(n)
+        _ -> None
+
+    if written.is_none() || cx.lookup(written.unwrap()).is_some() then return None
+
+    val name = written.unwrap()
+    val target = scalar_named(name, word_bits(cx)).or_else(() -> width_of(cx, name))
+
+    if target.is_none() then return None
+
+    val value = const_fold(cx, args.at(0))
+
+    if value.is_none() then return None
+
+    converted(cx, span, value.unwrap(), target.unwrap())
+end const_conversion
+
+private converted(cx: &Analyzer, span: Span, v: Const, target: Type) -> Option[Const] = v match
+    ConstInt(n) -> target match
+        Integer(bits, signed, _) -> Some(ConstInt(wrap(n, bits, signed)))
+        Floating(_, _) -> Some(ConstFloat(big_to_real(n)))
+        Char ->
+            val max = from_int(0x10FFFF)
+
+            if cmp(n, from_int(0)) < 0 || cmp(n, max) > 0 ||
+               (cmp(n, from_int(0xD800)) >= 0 && cmp(n, from_int(0xDFFF)) <= 0)
+                cx.fault(span, s"${to_string(n)} is not a Unicode scalar value")
+                return None
+            end if
+
+            Some(ConstChar(char(u32(n.to_long().unwrap_or(0)))))
+        _ -> None
+    ConstFloat(f) -> target match
+        Integer(bits, signed, _) -> Some(ConstInt(wrap(big_of_real(f).unwrap_or(big_zero()), bits, signed)))
+        Floating(_, _) -> Some(ConstFloat(f))
+        _ -> None
+    ConstChar(c) -> target match
+        Integer(bits, signed, _) -> Some(ConstInt(wrap(from_int(long(u32(c))), bits, signed)))
+        _ -> None
+    _ -> None
 
 // -- `@assert` -----------------------------------------------------------------------------------
 
@@ -372,13 +459,15 @@ private const_text(v: Const) -> string = v match
     ConstBool(b) -> if b then "true" else "false"
     ConstChar(c) -> s"'$c'"
     ConstStr(s) -> s"\"$s\""
+    ConstFloat(f) -> str(f)
 
 // What a value that is not a condition is, said the way the refusal names it.
-private const_kind(v: Const) -> string = v match
+const_kind(v: Const) -> string = v match
     ConstInt(_) -> "an integer"
     ConstBool(_) -> "a boolean"
     ConstChar(_) -> "a character"
     ConstStr(_) -> "a string"
+    ConstFloat(_) -> "a float"
 
 // Whether the condition is one a later instantiation settles rather than one that cannot settle at
 // all: a measurement of a type parameter, or a value parameter standing in for itself.
