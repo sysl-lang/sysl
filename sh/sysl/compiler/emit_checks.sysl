@@ -241,7 +241,64 @@ check_exports_emitted(a: &Analysis, p: TProgram, own: Buf[string])
 
     export_duplicates(a, exported)
     export_names(a, exported)
+    export_storage(a, p, exported)
 end check_exports_emitted
+
+// An exported function reaching **computed** module storage on a build with nowhere to fill it.
+//
+// There are three builds with three answers: one with an entry point lays the `val`s down at the top
+// of it, a `.syslib` defers every function reaching one to the program that links it, and a C archive
+// registers a constructor on the platform's pre-`main` list. **What is left, and all this refuses, is
+// a C archive for a freestanding target**: there is no loader on bare metal, so a constructor would be
+// a function nobody calls and the storage would read whatever the image left -- a silent wrong answer
+// rather than a link error.
+//
+// A `val` whose initializer is constant data is not looked at, being laid straight into the object
+// file -- the rule C already has for a static-storage initializer. The walk is the reachability one,
+// so the storage may be several calls down and the function that is named is the one exported.
+private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
+    val t = a.tables.target
+
+    if !p.c_artifact || t.runs_initializers() || exported.is_empty() then return
+
+    var computed: Buf[string] = buf()
+
+    for i in 0..<p.vals.len()
+        if p.vals.at(i).computed then computed.push(p.vals.at(i).symbol)
+
+    if computed.is_empty() then return
+
+    for i in 0..<exported.len()
+        val f = exported.at(i)
+        val reached = vals_reached_from(p, f)
+
+        var named: Buf[string] = buf()
+
+        for k in 0..<reached.len()
+            if holds_string(computed, reached.at(k)) then named.push(s"'${module_show(reached.at(k))}'")
+
+        if !named.is_empty()
+            a.fault(func_home(a, f.name), f.span,
+                    s"'${module_show(f.name)}' is exported and reaches " +
+                    s"${joined_list(sorted_names(named))}, which is module storage an initializer " +
+                    "fills before the program's own statements run. This artifact has no entry point " +
+                    s"to fill it in, and '${t.name}' is freestanding — there is no loader to run a " +
+                    "constructor either, so the function would read whatever the image left. Build " +
+                    "for a hosted target, where the storage is filled before any export can run, or " +
+                    "make the initializer constant data, which is laid straight into the object file")
+end export_storage
+
+// Names joined the way a sentence lists them after a colon: with commas and nothing else.
+private joined_list(xs: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<xs.len()
+        if i > 0 then out = out + ", "
+
+        out = out + xs.at(i)
+
+    out
+end joined_list
 
 // Two things in one header answering to one name.
 //

@@ -484,10 +484,6 @@ lookup_value_key(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Option
 end lookup_value_key
 
 private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Option[string]
-    val bound = cx.scope.imports.name_key(name)
-
-    if bound.is_some() && from.has(bound.unwrap()) then return bound
-
     // **A module written before the dot**, which is the value side of what a call already asked.
     // `raw.thing()` resolved and `raw.eof` did not, so a constant declared in a submodule -- which is
     // what every `c const` block in a binding is -- was an undefined name naming the module.
@@ -503,6 +499,14 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
                                 module_qualify(cx.scope.module_name, name))
 
     if from.has(here) && reachable_key(cx.an, here, cx.scope) then return Some(here)
+
+    // **The reader's own module beats an import of the same name**, and a name imported by name beats
+    // one a wildcard merely offers -- of which two offering the spelling is an ambiguity, not a pick.
+    val bound = cx.scope.imports.name_key(name)
+
+    if bound.is_some() && from.has(bound.unwrap()) then return bound
+
+    if offered_by(cx.an, cx.scope, name, k -> from.has(k)).len() > 1 then return None
 
     var found: Option[string] = None
 

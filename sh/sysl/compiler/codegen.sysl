@@ -108,6 +108,21 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
             Some(f) -> entry = Some(f)
             None -> gaps.push(("main", gap_text(e)))
 
+    // What a C archive gets instead: a constructor filling the storage `@main` would have filled. A
+    // program never gets one -- its entry point already lays the same `val`s down, and a second
+    // filling would take a second count of every reference among them -- and **a `.syslib` never
+    // does either**, which is `c_artifact` rather than `!entry_point`: it is linked by a program that
+    // has an entry point. A freestanding target gets none, nothing there walking the list; an export
+    // reaching such storage is refused for it instead.
+    var init: Option[IrInit] = None
+
+    if p.c_artifact && t.runs_initializers() && has_computed_val(p.vals)
+        set_promoted(e, pr.for_func(""))
+
+        gen_module_init(e, p) match
+            Some(built) -> init = Some(built)
+            None -> gaps.push((module_init_symbol(), gap_text(e)))
+
     // The tables come after the bodies because a table only exists for a type something erased, and
     // it may ask for an adapter, which the drain below is what emits.
     var vtables: Buf[IrGlobal] = buf()
@@ -182,10 +197,18 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions) -> (IrMod
 
     val m = IrModule(t.triple, declares(e, p), struct_defs(p, word_bits), enum_defs(p, layout),
                      box_defs(e, word_bits), imported_sigs(e, p), globals, helpers, funcs, thunks,
-                     entry, used_of(p, funcs), None)
+                     entry, used_of(p, funcs), init)
 
     (m, gaps)
 end codegen_into
+
+// Whether any of a program's storage is filled at run time rather than laid into the object file.
+private has_computed_val(vals: Buf[TVal]) -> bool
+    for i in 0..<vals.len()
+        if vals.at(i).computed then return true
+
+    false
+end has_computed_val
 
 // A box is the strong count, the function that destroys it, the weak count, and the payload -- so
 // ARC works the same everywhere, and an object frees itself into whichever heap made it. The two

@@ -1198,13 +1198,6 @@ private function_keys_of(cx: &Analyzer, written: string) -> Buf[string]
         if !set.is_empty() then return set
     end if
 
-    val bound = cx.scope.imports.name_key(written)
-
-    if bound.is_some() then
-        val set = overload_keys(cx.an, bound.unwrap())
-
-        if !set.is_empty() then return set
-
     // The reader's own module, and only the declarations of it the reader's file may name.
     //
     // **A file-private declaration of ANOTHER file is not in the set at all**, which is what keeps a
@@ -1219,6 +1212,21 @@ private function_keys_of(cx: &Analyzer, written: string) -> Buf[string]
     val mine = visible_keys(cx, overload_keys(cx.an, here))
 
     if !mine.is_empty() then return mine
+
+    // **The order is this module, then the imports, then the library**: a declaration of the reader's
+    // own module beats an import of the same name, and a name imported by name beats one a wildcard
+    // merely offers.
+    val bound = cx.scope.imports.name_key(written)
+
+    if bound.is_some() then
+        val set = overload_keys(cx.an, bound.unwrap())
+
+        if !set.is_empty() then return set
+
+    // **Two wildcards offering one name make it ambiguous** rather than silently the first one's;
+    // the call reports which.
+    if offered_by(cx.an, cx.scope, written, k -> !overload_keys(cx.an, k).is_empty()).len() > 1
+        return buf()
 
     // **THE LIBRARY IS THE ONE WILDCARD WHOSE RESTRICTION IS REPORTED.** It is reached without an
     // import and searched after everything else, so a bare name that resolved is a name nothing
@@ -1364,6 +1372,11 @@ private function_call(cx: &Analyzer, span: Span, written: string, args: Buf[Expr
         val kept = library_variant(cx, written)
 
         if kept.is_some() then return cx.err(span, out_of_reach(cx.an, kept.unwrap()))
+
+        val rivals = offered_by(cx.an, cx.scope, written,
+                                k -> !overload_keys(cx.an, k).is_empty() || cx.an.tables.types.has(k))
+
+        if rivals.len() > 1 then return cx.err(span, ambiguous_offer(written, rivals))
 
         return cx.err(span, s"undefined function '$written'")
 
@@ -1769,10 +1782,6 @@ end name_list
 // -- the calls a later stage resolves --------------------------------------------------------------
 
 private extern_key(cx: &Analyzer, written: string) -> Option[string]
-    val bound = cx.scope.imports.name_key(written)
-
-    if bound.is_some() && cx.an.tables.externs.has(bound.unwrap()) then return bound
-
     // **A module written before the dot**, which a call to a *function* has always asked for and a
     // call to an `extern` did not -- so `c.surface_destroy(h)`, which is what every binding in the
     // org writes next door to its `c` module, reported the module as an undefined name.
@@ -1784,6 +1793,11 @@ private extern_key(cx: &Analyzer, written: string) -> Option[string]
     val here = module_qualify(cx.scope.module_name, written)
 
     if cx.an.tables.externs.has(here) then return Some(here)
+
+    // The reader's own module first, then a name imported by name, then what a wildcard offers.
+    val bound = cx.scope.imports.name_key(written)
+
+    if bound.is_some() && cx.an.tables.externs.has(bound.unwrap()) then return bound
 
     var found: Option[string] = None
 
