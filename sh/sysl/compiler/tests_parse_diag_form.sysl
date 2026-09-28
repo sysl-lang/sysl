@@ -27,13 +27,12 @@ private pdf_run(command: string, text: string) -> (string, string, int)
     // taken out, and that is the name a diagnostic quotes.
     (out, absolute_path(root), code)
 
-// `message` is what follows `error: `, and `tail` everything after the scratch directory -- the
-// file, its line and column, the quoted line and the caret.
-private pdf_expect(command: string, text: string, message: string, tail: string)
+// `want` is the whole rendering, given the scratch directory the file was written in.
+private pdf_expect(command: string, text: string, want: string -> string)
     val (out, root, code) = pdf_run(command, text)
 
     assert_eq(code, 1)
-    assert_eq(out, s"error: $message\n --> $root$tail")
+    assert_eq(out, want(root))
 
 private pdf_unclosed() -> string = "main() -> unit\n    print(1\n"
 
@@ -43,51 +42,101 @@ private pdf_unclosed_tail() -> string = "/main.sysl:3:1\n  |\n3 | \n  | ^"
 pdf_a_missing_paren()
     if !pdf_ready() then return
 
-    pdf_expect("build", pdf_unclosed(), "')' expected", pdf_unclosed_tail())
+    pdf_expect("build", pdf_unclosed(), (root) ->
+        s"error: ')' expected\n --> $root${pdf_unclosed_tail()}")
 
 @test("an indented line where a dedent was wanted")
 pdf_a_bad_indentation()
     if !pdf_ready() then return
 
-    pdf_expect("build", "main() -> unit\n    val x = 1\n      val y = 2\n", "dedent expected",
-               "/main.sysl:3:7\n  |\n3 |       val y = 2\n  |       ^")
+    pdf_expect("build", "main() -> unit\n    val x = 1\n      val y = 2\n", (root) ->
+        s"error: dedent expected\n --> $root/main.sysl:3:7\n  |\n3 |       val y = 2\n  |       ^")
 
 @test("a dotted path in a visibility bracket is ']' expected, pointing at the first dot")
 pdf_a_bracket_expected()
     if !pdf_ready() then return
 
-    pdf_expect("build", "private[sysl.math] f() -> int = 1\n\nmain() -> unit\n    print(f())\n",
-               "']' expected",
-               "/main.sysl:1:13\n  |\n1 | private[sysl.math] f() -> int = 1\n  |             ^")
+    pdf_expect("build", "private[sysl.math] f() -> int = 1\n\nmain() -> unit\n    print(f())\n", (root) ->
+        s"error: ']' expected\n --> $root/main.sysl:1:13\n  |\n" +
+        s"1 | private[sysl.math] f() -> int = 1\n  |             ^")
 
 @test("an unterminated string is a lexical error, and its caret is one column wide")
 pdf_an_unterminated_string()
     if !pdf_ready() then return
 
-    pdf_expect("build", "main() -> unit\n    print(\"abc)\n", "unterminated string literal",
-               "/main.sysl:2:11\n  |\n2 |     print(\"abc)\n  |           ^")
+    pdf_expect("build", "main() -> unit\n    print(\"abc)\n", (root) ->
+        s"error: unterminated string literal\n --> $root/main.sysl:2:11\n  |\n" +
+        s"2 |     print(\"abc)\n  |           ^")
 
-// The one place the two compilers point differently: the reference reports this where its type
-// reader stopped, at the `=` in column 25, and this compiler at the type the message is about, the
-// `[` in column 12. The shape and the words are the reference's.
-@test("a 'const' array is refused while the type is read, in the same shape")
+@test("a token that was not wanted is underlined whole")
+pdf_an_unwanted_token_underlined()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "main() -> unit\n    print(1 foobar)\n", (root) ->
+        s"error: ')' expected\n --> $root/main.sysl:2:13\n  |\n" +
+        s"2 |     print(1 foobar)\n  |             ^^^^^^")
+
+// A type the grammar reads whole and then refuses is refused at the token it begins on, rather than
+// wherever the type reader stopped.
+@test("a 'const' array is refused at its '['")
 pdf_a_const_array()
     if !pdf_ready() then return
 
-    pdf_expect("build", "main() -> unit\n    val a: [4]const int = [1, 2, 3, 4]\n    print(a[0])\n",
-               "'const' says a view refuses writes, and an array is storage rather than a view of " +
-               "one — read-only storage is declared with 'val', as 'val name: [N]int'",
-               "/main.sysl:2:12\n  |\n2 |     val a: [4]const int = [1, 2, 3, 4]\n" +
-               "  |            ^")
+    pdf_expect("build", "main() -> unit\n    val a: [4]const int = [1, 2, 3, 4]\n    print(a[0])\n", (root) ->
+        "error: 'const' says a view refuses writes, and an array is storage rather than a view of " +
+        "one — read-only storage is declared with 'val', as 'val name: [N]int'\n" +
+        s" --> $root/main.sysl:2:12\n  |\n2 |     val a: [4]const int = [1, 2, 3, 4]\n" +
+        "  |            ^")
+
+@test("and one nested in a slice at its own '[', not the slice's")
+pdf_a_nested_const_array()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "main() -> unit\n    val x: []const [4]const u8 = []\n    print(1)\n", (root) ->
+        "error: 'const' says a view refuses writes, and an array is storage rather than a view of " +
+        "one — read-only storage is declared with 'val', as 'val name: [N]u8'\n" +
+        s" --> $root/main.sysl:2:20\n  |\n2 |     val x: []const [4]const u8 = []\n" +
+        "  |                    ^")
+
+@test("a vector with no lane count at its '<'")
+pdf_a_laneless_vector()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "main() -> unit\n    val v: <>f32 = 1.0\n    print(1)\n", (root) ->
+        "error: a vector's lane count is part of its type, so '<>f32' has no meaning — a slice " +
+        "drops its length because it carries one at run time, and a register's width is settled " +
+        "when the code is generated; write '<4>f32' for four lanes\n" +
+        s" --> $root/main.sysl:2:12\n  |\n2 |     val v: <>f32 = 1.0\n  |            ^")
+
+@test("a 'some' outside a result at the 'some', underlined whole")
+pdf_a_some_in_a_field()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "struct S\n    d: some Display\n\nmain() -> unit\n    print(1)\n", (root) ->
+        "error: 'some Display' is a result whose type is read off the body that produced it, so it " +
+        "may stand only as the result of a member of an 'impl' block — everywhere else the type " +
+        "has to be named\n" +
+        s" --> $root/main.sysl:2:8\n  |\n2 |     d: some Display\n  |        ^^^^")
+
+@test("and 'weak sync' at the 'weak', not at the type after it")
+pdf_a_weak_sync()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "main() -> unit\n    val w: weak sync int = 1\n    print(1)\n", (root) ->
+        "error: an atomic reference has no weak form yet — 'weak sync T' wants the concurrency " +
+        "model of '06', which is not built\n" +
+        s" --> $root/main.sysl:2:12\n  |\n2 |     val w: weak sync int = 1\n  |            ^^^^")
 
 @test("every command that parses reports the same way: emit-llvm, emit-typed, test and build-lib")
 pdf_every_command_the_same()
     if !pdf_ready() then return
 
-    pdf_expect("emit-llvm", pdf_unclosed(), "')' expected", pdf_unclosed_tail())
-    pdf_expect("emit-typed", pdf_unclosed(), "')' expected", pdf_unclosed_tail())
-    pdf_expect("test", pdf_unclosed(), "')' expected", pdf_unclosed_tail())
-    pdf_expect("build-lib", pdf_unclosed(), "')' expected", pdf_unclosed_tail())
+    val want = (root: string) -> s"error: ')' expected\n --> $root${pdf_unclosed_tail()}"
+
+    pdf_expect("emit-llvm", pdf_unclosed(), want)
+    pdf_expect("emit-typed", pdf_unclosed(), want)
+    pdf_expect("test", pdf_unclosed(), want)
+    pdf_expect("build-lib", pdf_unclosed(), want)
 
 @test("emit-ast names the file as it was given, in the same shape")
 pdf_emit_ast()

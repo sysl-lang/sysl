@@ -1,0 +1,97 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// A generic is instantiated under a mangled name no file wrote, so the rule about what a `@tests`
+// file declared has to follow the declaration the instantiation was made from. Both directions are
+// pinned: the generic's own body may name the helper beside it, and an ordinary file naming the
+// generic is still refused -- at its own call. Every expected text is the reference's for the same
+// tree.
+
+private tfg_ready() -> bool = std_root().is_ok()
+
+// A program whose `main.sysl` imports module `m`, made of `m/m.sysl` and the test file
+// `m/tests.sysl`, run through `sysl <command>`: what it said, the tree's root, and the exit status.
+private tfg_run(command: string, main: string, ordinary: string, tests: string) -> (string, string, int)
+    val root = make_temp_dir("sysl-tfg").unwrap()
+
+    make_dir_all(s"$root/m").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    write_text(s"$root/m/m.sysl", ordinary).unwrap()
+    write_text(s"$root/m/tests.sysl", tests).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", command, root], (line) -> sink.push(line))
+    var out = ""
+
+    for i in 0..<lines.len()
+        out = out + lines.at(i)
+
+    remove_dir_all(root).unwrap_or(())
+    (out, absolute_path(root), code)
+end tfg_run
+
+private tfg_refusal(name: string) -> string =
+    s"error: '$name' is declared in a file that said '@tests', so it is there for the module's " +
+    "tests and no build but 'sysl test' keeps it — only another such file, or a '@test' " +
+    "function, may name it\n"
+
+private tfg_doubling() -> string = "module m\n\ndouble(n: int) -> int = n * 2"
+
+@test("a helper taking a bare-arrow callable may call the helper beside it")
+tfg_a_bare_arrow_helper()
+    if !tfg_ready() then return
+
+    val (out, _, code) = tfg_run("test", "import m.*\nprint(double(21))", tfg_doubling(),
+                                 "module m\n@tests\n\nshout(s: string) -> string = s + \"!\"\n\n" +
+                                 "with_shout(f: string -> unit) = f(shout(\"hi\"))\n\n" +
+                                 "@test\nhanded_the_shout() =\n" +
+                                 "    with_shout((s) -> assert(s == \"hi!\"))\n")
+
+    assert_eq(code, 0, out)
+    assert(out.contains("  ok    handed_the_shout  "), out)
+    assert(out.contains("1 passed, 0 failed"), out)
+
+@test("and so may one with an explicit type parameter")
+tfg_an_explicit_type_parameter()
+    if !tfg_ready() then return
+
+    val (out, _, code) = tfg_run("test", "import m.*\nprint(double(21))", tfg_doubling(),
+                                 "module m\n@tests\n\nquadruple(n: int) -> int = double(double(n))\n\n" +
+                                 "first_quadrupled[T](n: int, x: T) -> int = quadruple(n)\n\n" +
+                                 "@test\nthrough_a_generic() =\n" +
+                                 "    assert(first_quadrupled(3, \"x\") == 12)\n")
+
+    assert_eq(code, 0, out)
+    assert(out.contains("  ok    through_a_generic  "), out)
+    assert(out.contains("1 passed, 0 failed"), out)
+
+@test("while an ordinary file calling the generic is refused, and told at its own call")
+tfg_an_ordinary_call_to_the_generic()
+    if !tfg_ready() then return
+
+    val (out, root, code) = tfg_run("build", "import m.*\nprint(use_it(21))",
+                                    tfg_doubling() + "\n\nuse_it(n: int) -> int = first_quadrupled(n, 1)",
+                                    "module m\n@tests\n\nquadruple(n: int) -> int = double(double(n))\n\n" +
+                                    "first_quadrupled[T](n: int, x: T) -> int = quadruple(n)")
+
+    assert_eq(code, 1)
+    assert(out.starts_with(tfg_refusal("m.first_quadrupled") + s" --> $root/m/m.sysl:5:25\n  |\n" +
+                           "5 | use_it(n: int) -> int = first_quadrupled(n, 1)\n"), out)
+    assert(!out.contains("'m.quadruple'"), out)
+
+@test("and an ordinary generic calling a helper is refused exactly as a plain function is")
+tfg_an_ordinary_generic_calling_a_helper()
+    if !tfg_ready() then return
+
+    val (out, root, code) = tfg_run("build", "import m.*\nprint(use_it(21, 1))",
+                                    tfg_doubling() + "\n\nuse_it[T](n: int, x: T) -> int = quadruple(n)",
+                                    "module m\n@tests\n\nquadruple(n: int) -> int = double(double(n))")
+
+    assert_eq(code, 1)
+    assert(out.starts_with(tfg_refusal("m.quadruple") + s" --> $root/m/m.sysl:5:34\n  |\n" +
+                           "5 | use_it[T](n: int, x: T) -> int = quadruple(n)\n"), out)
