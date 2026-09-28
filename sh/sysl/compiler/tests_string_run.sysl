@@ -1,0 +1,874 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What a `string` does as a program runs (`reference/types.md § Strings`): a string is an immutable,
+// validated `[]u8`, so what is worth checking is the part a slice does not already cover -- that a
+// length is in bytes, that comparison is by bytes, that a substring shares rather than copies, and
+// that the UTF-8 guarantee survives every way of taking one apart.
+//
+// **Every output quoted here was read out of the reference compiler**, whose `StringRunTests` these
+// are.
+
+private var sr_library_cache: Buf[Program] = buf()
+private var sr_library_read: bool = false
+
+private sr_library() -> Buf[Program]
+    if sr_library_read then return sr_library_cache
+
+    sr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> sr_library_cache = units
+
+    sr_library_cache
+end sr_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private sr_ready() -> bool
+    if sr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end sr_ready
+
+// Builds a program and runs it, answering what it printed and whether it exited cleanly -- or why
+// it could not be built or run.
+private sr_build_run(text: string) -> Result[(string, bool), string]
+    val root = make_temp_dir("sysl-string-run").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return Err(failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> Err("the program that was built could not be run")
+        Ok(out) -> Ok((out.text, out.status.ok()))
+end sr_build_run
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private sr_ran(text: string) -> string
+    sr_build_run(text) match
+        Err(why) -> why
+        Ok((out, _)) -> out
+
+// **That a program STOPS ITSELF**, which is all a trap has to say: the status is not zero. Answers
+// what is wrong, or the empty string.
+private sr_exits(text: string) -> string
+    sr_build_run(text) match
+        Err(why) -> why
+        Ok((out, clean)) -> if clean then s"it exited cleanly: $out" else ""
+
+// ---- length and indexing ----
+
+@test("a length counts bytes, not characters")
+sr_a_length_counts_bytes()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print("hello".len, "héllo".len, "".len)
+        """), "5 6 0\n")
+
+@test("an index reads one byte")
+sr_an_index_reads_one_byte()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "AB"
+        print(s[0], s[1])
+        """), "65 66\n")
+
+@test("the bytes of a non-ASCII character are the ones UTF-8 gives it")
+sr_the_bytes_of_a_non_ascii_character()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "é"
+        print(s.len, s[0], s[1])
+        """), "2 195 169\n")
+
+@test("an index past the end stops the program")
+sr_an_index_past_the_end_stops()
+    if !sr_ready() then return
+
+    assert_eq(sr_exits(raw"""
+        var s = "ab"
+        var i = 2
+        print(s[i])
+        """), "")
+
+// ---- substrings ----
+
+@test("every range form takes the bytes it names")
+sr_every_range_form()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "abcdef"
+        print(s[..], s[0..<3], s[0..3], s[3..], s[..<2])
+        """), "abcdef abc abcd def ab\n")
+
+@test("a substring of a substring is relative to the substring")
+sr_a_substring_of_a_substring()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "abcdef"
+        var t = s[1..<5]
+        print(t, t[1..<3])
+        """), "bcde cd\n")
+
+@test("an empty substring is legal, at the end and in the middle")
+sr_an_empty_substring_is_legal()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "abc"
+        print(s[3..].len, s[1..<1].len)
+        """), "0 0\n")
+
+@test("a substring shares its parent's bytes rather than copying them")
+sr_a_substring_shares_its_parents_bytes()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        tail(s: string) -> string
+            s[1..]
+        end tail
+        var s = "hello"
+        print(tail(s), tail(tail(s)))
+        """), "ello llo\n")
+
+@test("a bound past the end stops the program")
+sr_a_bound_past_the_end_stops()
+    if !sr_ready() then return
+
+    assert_eq(sr_exits(raw"""
+        var s = "abc"
+        var n = 4
+        print(s[0..<n].len)
+        """), "")
+
+@test("a cut inside a character stops the program")
+sr_a_cut_inside_a_character_stops()
+    if !sr_ready() then return
+
+    assert_eq(sr_exits(raw"""
+        var s = "é"
+        var n = 1
+        print(s[0..<n].len)
+        """), "")
+
+@test("a cut at the start of a character is fine")
+sr_a_cut_at_the_start_of_a_character()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "aéb"
+        print(s[0..<1], s[1..<3], s[3..])
+        """), "a é b\n")
+
+// ---- concatenation ----
+
+@test("two strings join into one")
+sr_two_strings_join()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print("foo" + "bar")
+        """), "foobar\n")
+
+@test("concatenation chains left to right")
+sr_concatenation_chains()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print("a" + "b" + "c" + "d")
+        """), "abcd\n")
+
+@test("a literal joins with a variable, in either order")
+sr_a_literal_joins_with_a_variable()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var name = "ada"
+        print("hi " + name, name + "!")
+        """), "hi ada ada!\n")
+
+// The empty string is the identity on both sides, and the join of two empties is empty.
+@test("the empty string is the identity")
+sr_the_empty_string_is_the_identity()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "xy"
+        print(s + "" == s, "" + s == s, ("" + "").len)
+        """), "true true 0\n")
+
+@test("the joined length is the sum of the byte lengths, multibyte included")
+sr_the_joined_length_is_the_sum()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "é" + "☃"
+        print(s.len, s == "é☃")
+        """), "5 true\n")
+
+// The result owns its own buffer rather than viewing an operand: it can be sliced, indexed,
+// compared, and its bytes reached.
+@test("the result is a fully-fledged string")
+sr_the_joined_result_is_a_string()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "abc" + "def"
+        print(s[2..<4], s[0], s.bytes.len, s > "abc")
+        """), "cd 97 6 true\n")
+
+@test("operands that share a buffer join by content")
+sr_operands_that_share_a_buffer()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "abcdef"
+        print(s[0..<2] + s[4..])
+        """), "abef\n")
+
+@test("a NUL survives concatenation as an ordinary byte")
+sr_a_nul_survives_concatenation()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "a\0" + "b"
+        print(s.len, s[1])
+        """), "3 0\n")
+
+@test("a joined string outlives the frame when it is returned")
+sr_a_joined_string_outlives_the_frame()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        join(a: string, b: string) -> string
+            a + b
+        end join
+        print(join("out", "live"))
+        """), "outlive\n")
+
+@test("a joined string survives being put on the heap")
+sr_a_joined_string_on_the_heap()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        struct Label
+            text: string
+        end Label
+        tag() -> string
+            var l: &Label = Label("v" + "1")
+            l.text
+        end tag
+        print(tag())
+        """), "v1\n")
+
+@test("joining in a loop neither leaks nor frees twice")
+sr_joining_in_a_loop()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var total = 0
+        for i in 1..20000 do
+            var s = "ab" + "cd"
+            total += int(s[2]) - int(s[0])
+        print(total)
+        """), "40000\n")
+
+// ---- in-place append ----
+
+@test("`+=` grows a string in place")
+sr_plus_equals_grows_a_string()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "a"
+        s += "b"
+        s += "cd"
+        print(s, s.len)
+        """), "abcd 4\n")
+
+@test("appending the empty string is a no-op on the contents")
+sr_appending_the_empty_string()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "keep"
+        s += ""
+        print(s, s.len)
+        """), "keep 4\n")
+
+// Appending a string to itself must read the old value before the slot is overwritten.
+@test("a string can be appended to itself")
+sr_a_string_appended_to_itself()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "ab"
+        s += s
+        print(s)
+        """), "abab\n")
+
+@test("repeated append accumulates a growing string")
+sr_repeated_append_accumulates()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = ""
+        for i in 0..<5 do s += "-"
+        print(s, s.len)
+        """), "----- 5\n")
+
+@test("appending in a loop neither leaks nor frees twice")
+sr_appending_in_a_loop()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var t = 0
+        for i in 1..20000 do
+            var s = "ab"
+            s += "cd"
+            t += int(s[2])
+        print(t)
+        """), "1980000\n")
+
+// ---- str ----
+
+@test("renders an integer as its decimal digits, sign and all")
+sr_str_renders_an_integer()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print(str(0), str(7), str(-7), str(42), str(-1000))
+        """), "0 7 -7 42 -1000\n")
+
+@test("renders the extremes of a 64-bit integer, signed and unsigned")
+sr_str_renders_the_extremes()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var lo: i64 = -9223372036854775808
+        var hi: i64 = 9223372036854775807
+        var um: u64 = 18446744073709551615
+        print(str(lo), str(hi), str(um))
+        """), "-9223372036854775808 9223372036854775807 18446744073709551615\n")
+
+// A narrow unsigned value renders by its magnitude, not sign-extended -- 200 as a `u8`, not -56.
+@test("renders a narrow value by widening for its signedness")
+sr_str_renders_a_narrow_value()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var b: u8 = 200
+        var s: i8 = -5
+        print(str(b), str(s))
+        """), "200 -5\n")
+
+@test("renders a bool as one of two words")
+sr_str_renders_a_bool()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print(str(true), str(false))
+        """), "true false\n")
+
+@test("renders a char as its UTF-8, one byte or several")
+sr_str_renders_a_char()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print(str('A'), str('é'), str('☃'), str('😀'))
+        """), "A é ☃ 😀\n")
+
+// The NUL scalar value is a one-byte string, not the empty string a terminator would make it.
+@test("renders the NUL char as a single byte")
+sr_str_renders_the_nul_char()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = str('\0')
+        print(s.len, s[0])
+        """), "1 0\n")
+
+@test("renders a float the way print does")
+sr_str_renders_a_float()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print(str(3.5), str(-0.25), str(0.0), str(100.0))
+        """), "3.5 -0.25 0 100\n")
+
+@test("hands a string straight back")
+sr_str_hands_a_string_back()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "hello"
+        print(str(s), str(s) == s, str("x").len)
+        """), "hello true 1\n")
+
+// The result owns its buffer: it can be joined, sliced, indexed, and compared.
+@test("produces a fully-fledged string")
+sr_str_produces_a_string()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = str(-40) + "!"
+        print(s, s.len, s[0], s[1..<3])
+        """), "-40! 4 45 40\n")
+
+@test("a rendered string outlives the frame when it is returned")
+sr_a_rendered_string_outlives_the_frame()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        label(n: int) -> string
+            "#" + str(n)
+        end label
+        print(label(17))
+        """), "#17\n")
+
+@test("a rendered string survives being put on the heap")
+sr_a_rendered_string_on_the_heap()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        struct Tag
+            text: string
+        end Tag
+        make() -> string
+            var t: &Tag = Tag(str(99))
+            t.text
+        end make
+        print(make())
+        """), "99\n")
+
+// 1..9 -> 1 digit (9), 10..99 -> 2 (180), 100..999 -> 3 (2700), 1000..9999 -> 4 (36000),
+// 10000..20000 -> 5 (50005): 9 + 180 + 2700 + 36000 + 50005.
+@test("rendering in a loop neither leaks nor frees twice")
+sr_rendering_in_a_loop()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var total = 0
+        for i in 1..20000 do
+            var s = str(i)
+            total += int(s.len)
+        print(total)
+        """), "88894\n")
+
+// `str(s)` on a string is the identity -- the same value, so the loop must not release it a second
+// time on top of the variable it came from.
+@test("the identity on a string does not free it twice")
+sr_the_identity_does_not_free_twice()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "abcd"
+        var total = 0
+        for i in 1..20000 do
+            var t = str(s)
+            total += int(t[0])
+        print(total)
+        """), "1940000\n")
+
+// ---- interpolation ----
+
+@test("a name is spliced in where it is written")
+sr_a_name_is_spliced_in()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var who = "ada"
+        print(s"hello, $who!")
+        """), "hello, ada!\n")
+
+@test("a braced hole is any expression, rendered by str")
+sr_a_braced_hole_is_any_expression()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var n = 20
+        print(s"n is $n, doubled ${n * 2}")
+        """), "n is 20, doubled 40\n")
+
+@test("each primitive type renders as str gives it")
+sr_each_primitive_type_renders()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print(s"${1 < 2} ${3.5} ${'x'} ${-9}")
+        """), "true 3.5 x -9\n")
+
+@test("a hole may itself hold a string expression")
+sr_a_hole_may_hold_a_string_expression()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var a = "foo"
+        print(s"[${ a + "!" }]")
+        """), "[foo!]\n")
+
+@test("an interpolation with no holes is the literal, escapes and all")
+sr_an_interpolation_with_no_holes()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print(s"tab\tend", s"")
+        """), "tab\tend \n")
+
+@test("adjacent holes butt together with nothing between them")
+sr_adjacent_holes_butt_together()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var a = "ab"
+        var b = "cd"
+        print(s"$a$b")
+        """), "abcd\n")
+
+@test("a doubled dollar is one literal dollar")
+sr_a_doubled_dollar_is_one_dollar()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var n = 5
+        print(s"$$$n")
+        """), "$5\n")
+
+// `raw` is the one form that reads nothing: no escape decoded and no hole rendered, which is what
+// lets it carry another language's source -- `${` is how shell, Make and JS template literals all
+// spell interpolation.
+@test("raw leaves both a backslash and a hole alone")
+sr_raw_leaves_a_backslash_and_a_hole_alone()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var x = "hi"
+        print(raw"a\n$x and ${x}")
+        """), raw"a\n$x and ${x}" + "\n")
+
+@test("the result is a real owning string, usable like any other")
+sr_the_interpolated_result_is_a_string()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var w = "world"
+        var s = s"hello $w"
+        print(s, s.len, s[0..<5])
+        """), "hello world 11 hello\n")
+
+@test("a nested interpolation composes")
+sr_a_nested_interpolation_composes()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var n = "ada"
+        print(s"[${ s"<$n>" }]")
+        """), "[<ada>]\n")
+
+@test("interpolating in a loop neither leaks nor frees twice")
+sr_interpolating_in_a_loop()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var total = 0
+        for i in 1..20000 do
+            var s = s"n=$i"
+            total += int(s[0])
+        print(total)
+        """), "2200000\n")
+
+// ---- format interpolation ----
+
+@test("an f-string hole formats through its specifier")
+sr_an_f_string_hole_formats()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var n = 42
+        print(f"${n}%d ${n}%x ${n}%o ${n}%X")
+        """), "42 2a 52 2A\n")
+
+@test("width, zero-pad, sign, and left-justify all apply")
+sr_width_zero_pad_sign_and_justify()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var n = 42
+        print(f"[${n}%5d][${n}%05d][${n}%-5d][${n}%+d]")
+        """), "[   42][00042][42   ][+42]\n")
+
+@test("a float takes precision and width")
+sr_a_float_takes_precision_and_width()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var x = 3.14159
+        print(f"${x}%.2f ${x}%8.3f")
+        """), "3.14    3.142\n")
+
+@test("a string takes width, justification, and precision")
+sr_a_string_takes_width_and_precision()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "hi"
+        print(f"[${s}%5s][${s}%-5s][${"hello"}%.3s]")
+        """), "[   hi][hi   ][hel]\n")
+
+// `%x` reads the value's own bit width: a negative i32 shows eight hex digits, a u8 two.
+@test("an unsigned conversion shows the value's width, signed keeps its value")
+sr_an_unsigned_conversion_shows_the_width()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var neg: i32 = -1
+        var b: u8 = 255
+        print(f"${neg}%x ${b}%x ${neg}%d")
+        """), "ffffffff ff -1\n")
+
+@test("a bare percent in an f-string is literal text")
+sr_a_bare_percent_is_literal()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var n = 90
+        print(f"${n}%d% complete")
+        """), "90% complete\n")
+
+@test("plain and formatted holes mix in one string")
+sr_plain_and_formatted_holes_mix()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var name = "ada"
+        var n = 7
+        print(f"$name scored ${n}%03d")
+        """), "ada scored 007\n")
+
+@test("the formatted result is a real owning string")
+sr_the_formatted_result_is_a_string()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var n = 255
+        var s = f"${n}%x"
+        print(s, s.len, s[0])
+        """), "ff 2 102\n")
+
+// Every rendering is zero-padded to eight digits, so `s[0]` is always '0' (48).
+@test("formatting in a loop neither leaks nor frees twice")
+sr_formatting_in_a_loop()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var total = 0
+        for i in 1..20000 do
+            var s = f"${i}%08d"
+            total += int(s[0])
+        print(total)
+        """), "960000\n")
+
+// ---- comparison ----
+
+@test("equality is by bytes")
+sr_equality_is_by_bytes()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print("abc" == "abc", "abc" == "abd", "abc" != "ab")
+        """), "true false true\n")
+
+@test("a shorter string that is a prefix comes first")
+sr_a_prefix_comes_first()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print("ab" < "abc", "abc" < "ab", "" < "a")
+        """), "true false true\n")
+
+@test("ordering is by byte, which for UTF-8 is by codepoint")
+sr_ordering_is_by_byte()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print("a" < "b", "z" < "é", "é" < "☃")
+        """), "true true true\n")
+
+@test("a comparison chains like any other")
+sr_a_string_comparison_chains()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        print("a" < "b" < "c")
+        """), "true\n")
+
+@test("two strings that share a buffer still compare by content")
+sr_shared_buffers_compare_by_content()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "abab"
+        print(s[0..<2] == s[2..], s[0..<2] == s[1..<3])
+        """), "true false\n")
+
+@test("a literal is matched like any other value")
+sr_a_literal_is_matched()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        kind(s: string) -> int
+            s match
+                "yes" -> 1
+                "no" -> 0
+                else -1
+        end kind
+        print(kind("yes"), kind("no"), kind("maybe"))
+        """), "1 0 -1\n")
+
+// ---- bytes ----
+
+@test("a string's bytes are a slice of the same length")
+sr_a_strings_bytes_are_a_slice()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "héllo"
+        print(s.bytes.len, s.bytes[1])
+        """), "6 195\n")
+
+@test("iterating the bytes reaches each one in turn")
+sr_iterating_the_bytes()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "abc"
+        var total = 0
+        for b in s.bytes do total += int(b)
+        print(total)
+        """), "294\n")
+
+// The parameter is `[]const u8` because that is what `.bytes` yields: the bytes may be a literal's,
+// and those live where the platform will not let anybody write.
+@test("a byte view can be handed to anything that takes a view it does not write")
+sr_a_byte_view_can_be_handed_on()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        total(bytes: []const u8) -> int
+            var t = 0
+            for b in bytes do t += int(b)
+            t
+        end total
+        print(total("abc".bytes), total("abc".bytes[1..]))
+        """), "294 197\n")
+
+@test("and the view a program keeps reading is still the string's own storage, not a copy")
+sr_the_view_is_the_strings_own_storage()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "abc"
+        var b = s.bytes
+        print(b.len, b[0], b[2])
+        """), "3 97 99\n")
+
+// ---- content ----
+
+@test("a NUL is an ordinary byte, in the middle and at the end")
+sr_a_nul_is_an_ordinary_byte()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "a\0b"
+        print(s.len, s[1], s)
+        """), "3 0 a\0b\n")
+
+@test("a zero-valued string is the empty string")
+sr_a_zero_valued_string_is_empty()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s: string
+        print(s.len, s == "", s)
+        """), "0 true \n")
+
+@test("a string survives being carried through a struct and an enum")
+sr_a_string_through_a_struct_and_an_enum()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        struct Named
+            name: string
+        end Named
+        enum Answer
+            Word(w: string)
+            Nothing
+        end Answer
+        say(a: Answer) -> string
+            a match
+                Word(w) -> w
+                Nothing -> "-"
+        end say
+        var n = Named("ada")
+        print(n.name, say(Word(n.name)), say(Nothing))
+        """), "ada ada -\n")
+
+@test("a string on the heap outlives the reference that put it there")
+sr_a_string_on_the_heap_outlives_its_reference()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        struct Label
+            text: string
+        end Label
+        name() -> string
+            var l: &Label = Label("boxed")
+            l.text
+        end name
+        print(name())
+        """), "boxed\n")
+
+@test("taking substrings in a loop neither leaks nor frees twice")
+sr_taking_substrings_in_a_loop()
+    if !sr_ready() then return
+
+    assert_eq(sr_ran(raw"""
+        var s = "abcdefgh"
+        var total = 0
+        for i in 1..20000 do
+            var t = s[1..<7]
+            total += int(t[0])
+        print(total)
+        """), "1960000\n")
