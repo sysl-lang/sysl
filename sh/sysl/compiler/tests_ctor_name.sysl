@@ -35,12 +35,23 @@ private can_report(files: Buf[(string, string, string)]) -> string
     val exe = root + "/built"
 
     val said = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
-        Err(why) -> replace_all(failure_text(why), root, "<root>")
+        // A temporary directory can come back with a doubled separator, and a diagnostic quotes the
+        // path the tree was walked from, which has none.
+        Err(why) -> replace_all(failure_text(why), replace_all(root, "//", "/"), "<root>")
         Ok(_) -> "it built"
 
     remove_dir_all(root).unwrap_or(())
     said
 end can_report
+
+// Whether a report holds a diagnostic, and the whole report where it does not -- the runner shows a
+// failing test's output, which is the only place a reader learns what was said instead.
+private can_says(report: string, want: string) -> bool
+    if report.contains(want) then return true
+
+    print(report)
+    false
+end can_says
 
 private can_skipped() -> bool
     if std_root().is_err()
@@ -64,21 +75,21 @@ end can_imported
 can_too_many_values_name_the_module()
     if can_skipped() then return
 
-    assert(can_imported().contains(
+    assert(can_says(can_imported(),
         "error: struct 'b.T' has 1 field, but 2 values were given\n --> <root>/main.sysl:2:9\n"))
 
 @test("and with too few")
 can_too_few_values_name_the_module()
     if can_skipped() then return
 
-    assert(can_imported().contains(
+    assert(can_says(can_imported(),
         "error: struct 'b.T' has 1 field, but 0 values were given\n --> <root>/main.sysl:3:9\n"))
 
 @test("a named value that names no field of an imported struct")
 can_a_name_no_field_has_names_the_module()
     if can_skipped() then return
 
-    assert(can_imported().contains(
+    assert(can_says(can_imported(),
         "error: struct 'b.T' declares no parameter named 'y' — it takes 'x'\n" +
         " --> <root>/main.sysl:4:11\n"))
 
@@ -86,7 +97,7 @@ can_a_name_no_field_has_names_the_module()
 can_a_field_left_out_names_the_module()
     if can_skipped() then return
 
-    assert(can_imported().contains(
+    assert(can_says(can_imported(),
         "error: struct 'b.P' was given no value for 'y', and that parameter declares no default\n" +
         " --> <root>/main.sysl:5:9\n"))
 
@@ -94,7 +105,7 @@ can_a_field_left_out_names_the_module()
 can_a_generic_struct_names_the_module()
     if can_skipped() then return
 
-    assert(can_imported().contains(
+    assert(can_says(can_imported(),
         "error: struct 'b.G' has 1 field, but 2 values were given\n --> <root>/main.sysl:6:9\n"))
 
 private can_elsewhere() -> string
@@ -112,28 +123,28 @@ end can_elsewhere
 can_its_own_module_is_named()
     if can_skipped() then return
 
-    assert(can_elsewhere().contains(
+    assert(can_says(can_elsewhere(),
         "error: struct 'b.T' has 1 field, but 2 values were given\n  --> <root>/b/b.sysl:16:13\n"))
 
 @test("a nested module is quoted whole")
 can_a_nested_module_is_named_whole()
     if can_skipped() then return
 
-    assert(can_elsewhere().contains(
+    assert(can_says(can_elsewhere(),
         "error: struct 'c.d.T' has 1 field, but 2 values were given\n --> <root>/main.sysl:4:9\n"))
 
 @test("a variant built with too many values is quoted bare")
 can_a_variant_is_quoted_bare()
     if can_skipped() then return
 
-    assert(can_elsewhere().contains(
+    assert(can_says(can_elsewhere(),
         "error: variant 'V' has 1 field, but 2 values were given\n --> <root>/main.sysl:3:11\n"))
 
 @test("a positional pattern over an imported struct is quoted by its module")
 can_a_pattern_names_the_module()
     if can_skipped() then return
 
-    assert(can_elsewhere().contains(
+    assert(can_says(can_elsewhere(),
         "error: struct 'b.P' has 2 fields, but 1 sub-pattern was given\n" +
         " --> <root>/main.sysl:6:5\n"))
 
@@ -148,9 +159,9 @@ can_the_entry_files_struct_is_bare()
 
     val said = can_report(fs)
 
-    assert(said.contains(
+    assert(can_says(said,
         "error: struct 'L' has 1 field, but 2 values were given\n --> <root>/main.sysl:4:9\n"))
-    assert(said.contains(
+    assert(can_says(said,
         "error: struct 'L' declares no parameter named 'q' — it takes 'x'\n" +
         " --> <root>/main.sysl:5:11\n"))
 end can_the_entry_files_struct_is_bare
