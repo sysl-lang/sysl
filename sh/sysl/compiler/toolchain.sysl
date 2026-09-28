@@ -554,7 +554,9 @@ compile_c(cc: string, src: string, obj: string, target: Target,
     args.push(src)
     args.push("-o")
     args.push(obj)
-    told(cc, args, s"$cc failed on $src")
+    told(cc, args) match
+        Ok(_) -> Ok(())
+        Err(f) -> Err(if f.unrun then f.said else source_failed(src, cc, f.code, f.said))
 end compile_c
 
 // One module's LLVM text assembled into a relocatable object, which is what a library artifact's
@@ -591,7 +593,7 @@ compile_object(cc: string, ir: string, obj: string, target: Target,
     args.push("-o")
     args.push(obj)
 
-    val said = told(cc, args, s"$cc failed on $obj")
+    val said = as_tool(told(cc, args), cc)
 
     // **The text is left behind where clang refused it**, and only there. A back end that rejects
     // generated IR is reporting a defect in the generator, and the one thing that diagnosis needs is
@@ -655,7 +657,7 @@ archive(archiver: string, members: Buf[string], out: string) -> Result[unit, str
     for i in 0..<members.len()
         args.push(members.at(i))
 
-    told(archiver, args, s"$archiver failed on $out")
+    as_tool(told(archiver, args), archiver)
 end archive
 
 // The whole command line the last link in this process was handed, which `--verbose` prints as it
@@ -693,7 +695,7 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
     for i in 1..<command.len()
         args.push(command.at(i))
 
-    val said = told(command.at(0), args, s"${command.at(0)} failed")
+    val said = as_tool(told(command.at(0), args), command.at(0))
 
     // **The text is left behind where clang refused it**, and only there -- `compile_object` does the
     // same and for the same reason. A back end that rejects generated IR is reporting a defect in the
@@ -706,11 +708,13 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
     said
 end build_native
 
-// Runs one command, and answers with what it said where it failed. The child's own error stream is
-// collected rather than let through, so a tool reporting the failure has the reason to report.
-private told(program: string, args: Buf[string], what: string) -> Result[unit, string]
+// Runs one command, and answers with how it ended and what it said where it failed. The child's own
+// error stream is collected rather than let through, so a tool reporting the failure has the reason
+// to report; the exit status travels beside it because a tool that failed without saying anything
+// leaves the status the only thing there is to go on.
+private told(program: string, args: Buf[string]) -> Result[unit, ToolFault]
     capture(program, args.view(), "", [], true) match
-        Err(_) -> Err(s"cannot run '$program'")
+        Err(_) -> Err(ToolFault(-1, s"cannot run '$program'", true))
         Ok(out) ->
             if out.status.ok() then return Ok(())
 
@@ -718,5 +722,32 @@ private told(program: string, args: Buf[string], what: string) -> Result[unit, s
                 Some(text) -> text
                 None -> ""
 
-            Err(s"$what:\n$said")
+            Err(ToolFault(exit_code(out.status), said.trim(), false))
 end told
+
+// How a tool step failed: the status it exited with and its error stream, trimmed -- or, where
+// `unrun`, the refusal to start it, which is the whole message.
+private struct ToolFault
+    code: int
+    said: string
+    unrun: bool
+
+// A step named by its tool: `clang failed (exit 1):` and what clang said.
+tool_failed(tool: string, code: int, said: string) -> string =
+    s"$tool failed (exit $code):\n$said"
+
+// A carried `.c` file that did not compile, which names the FILE first -- a build compiles many and
+// which one failed is the thing to act on -- and the compiler after it, so a complaint the driver
+// provoked (a bad `-O`, a triple it will not take) reads as the tool's report rather than as sysl's.
+source_failed(src: string, cc: string, code: int, said: string) -> string =
+    s"$src did not compile ($cc, exit $code):\n$said"
+
+private as_tool(r: Result[unit, ToolFault], tool: string) -> Result[unit, string] = r match
+    Ok(_) -> Ok(())
+    Err(f) -> Err(if f.unrun then f.said else tool_failed(tool, f.code, f.said))
+
+// The number a shell would report for how a child ended, a signal as `128 + n`.
+private exit_code(state: Status) -> int = state match
+    Exited(c) -> c
+    Signalled(n) -> 128 + n
+    TimedOut -> -1
