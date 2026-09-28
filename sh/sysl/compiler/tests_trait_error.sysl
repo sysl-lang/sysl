@@ -1,0 +1,657 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// Diagnostics for traits and the bounds they let a generic ask for: a body checked at its definition
+// against what its parameters promise, a member reached on a generic type, conformance of an `impl`
+// to what the trait declared, and the core catalog the compiler knows by name.
+//
+// **Every message quoted here was read out of the reference compiler** (0.0.148) on the same
+// program, whose `AnalyzerTraitErrorTests` these are. Each is a whole program compiled against the
+// standard module, so every test here wants `SYSL_LIB`.
+
+private tre_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end tre_ready
+
+private tre_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program that must be refused is told, every diagnostic in one report.
+private tre_err(text: string) -> string
+    val root = make_temp_dir("sysl-trait-error").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tre_err
+
+// The LLVM text of a program that must compile.
+private tre_ir(text: string) -> string
+    val root = make_temp_dir("sysl-trait-error").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tre_ir
+
+private tre_refused(text: string, part: string)
+    val said = tre_err(text)
+
+    assert(tre_says(said, part), said)
+
+private tre_lowers(text: string, part: string)
+    val out = tre_ir(text)
+
+    assert(tre_says(out, part), out)
+
+private tre_show() -> string = "trait Show\n    show(self) -> int\n"
+
+// -- definition-checked bounds ---------------------------------------------------------------------
+
+@test("the bound is what licenses the call")
+tre_the_bound_licenses_the_call()
+    if !tre_ready() then return
+
+    tre_lowers(tre_show() + raw"""
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> int = self.v
+        render[T: Show](x: T) -> int = x.show()
+        print(render(P(7)))
+        """, "@P.show")
+
+@test("the union of several bounds is available")
+tre_the_union_of_several_bounds()
+    if !tre_ready() then return
+
+    tre_lowers(tre_show() + raw"""
+        trait Size
+            size(self) -> int
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> int = self.v
+        impl Size for P
+            size(self) -> int = 1
+        both[T: Show + Size](x: T) -> int = x.show() + x.size()
+        print(both(P(7)))
+        """, "@P.size")
+
+@test("a bound satisfies the same bound")
+tre_a_bound_satisfies_the_same_bound()
+    if !tre_ready() then return
+
+    tre_lowers(tre_show() + raw"""
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> int = self.v
+        render[T: Show](x: T) -> int = x.show()
+        outer[U: Show](x: U) -> int = render(x)
+        print(outer(P(7)))
+        """, "@P.show")
+
+@test("moving a value around needs no bound")
+tre_moving_a_value_needs_no_bound()
+    if !tre_ready() then return
+
+    tre_lowers(raw"""
+        id[T](x: T) -> T = x
+        keep[T](x: T) -> T
+            var y = x
+            y
+        print(id(3))
+        print(keep(4))
+        """, "@keep.int")
+
+@test("the pass leaves no type parameter in the emitted module")
+tre_no_type_parameter_is_emitted()
+    if !tre_ready() then return
+
+    val out = tre_ir(raw"""
+        struct Box[T]
+            value: T
+        wrap[T](x: T) -> Box[T] = Box(x)
+        var b = wrap(3)
+        print(b.value)
+        """)
+
+    assert(tre_says(out, "%struct.Box.int"), out)
+    assert(!tre_says(out, "Box.T"), out)
+
+// -- members on generic types ----------------------------------------------------------------------
+
+@test("a method call with the wrong arity is reported")
+tre_a_method_call_with_the_wrong_arity()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        struct Box[T]
+            value: T
+            plus(self, other: T) -> T = self.value + other
+        var a = Box(1)
+        print(a.plus(2, 3))
+        """, "method 'Box[int].plus' takes 1 argument, but 2 arguments were given")
+
+@test("a property on a generic type is read without parentheses")
+tre_a_property_is_read_without_parentheses()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        struct Box[T]
+            value: T
+            doubled -> T = self.value + self.value
+        var a = Box(1)
+        print(a.doubled())
+        """, "'doubled' is a property of 'Box' — read it as 'value.doubled', without '()'")
+
+@test("a method on a generic type is called with parentheses")
+tre_a_method_is_called_with_parentheses()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        struct Box[T]
+            value: T
+            get(self) -> T = self.value
+        var a = Box(1)
+        print(a.get)
+        """, "'get' is a method of 'Box[int]' — call it with 'get(…)'")
+
+@test("an unknown method on a generic type is reported against its type")
+tre_an_unknown_method_on_a_generic_type()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        struct Box[T]
+            value: T
+        var a = Box(1)
+        print(a.area())
+        """, "type 'Box' has no method 'area'")
+
+@test("a member may not share a name with a field on a generic type")
+tre_a_member_may_not_share_a_fields_name()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        struct Box[T]
+            value: T
+            value(self) -> T = self.value
+        """, "type 'Box' has both a field and a member named 'value'")
+
+@test("a method body that needs a numeric element is rejected at the definition")
+tre_a_numeric_body_is_rejected_at_the_definition()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        struct Box[T]
+            value: T
+            inc(self) -> T = self.value + 1
+        """, "'+' needs 'T: sysl.Add'")
+
+// -- traits ----------------------------------------------------------------------------------------
+
+@test("an impl that omits a trait method is rejected")
+tre_an_impl_that_omits_a_method()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Show
+            show(self) -> string
+            label(self) -> string
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> string = "p"
+        """, "'P' does not implement 'Show': method 'label' is missing")
+
+@test("an impl method the trait does not declare is rejected")
+tre_an_impl_method_the_trait_does_not_declare()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Show
+            show(self) -> string
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> string = "p"
+            extra(self) -> int = 1
+        """, "trait 'Show' declares no method 'extra', so this 'impl' cannot define it")
+
+@test("an impl method whose parameter type differs from the trait is rejected")
+tre_a_parameter_type_that_differs()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Plus
+            plus(self, x: int) -> int
+        struct P
+            v: int
+        impl Plus for P
+            plus(self, x: string) -> int = self.v
+        """, "parameter 'x' of method 'plus' is string, but trait 'Plus' declares int")
+
+@test("an impl method whose result type differs from the trait is rejected")
+tre_a_result_type_that_differs()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Show
+            show(self) -> string
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> int = self.v
+        """, "method 'show' returns int, but trait 'Show' declares string")
+
+@test("an impl method whose receiver mode differs from the trait is rejected")
+tre_a_receiver_mode_that_differs()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Bump
+            bump(*self)
+        struct P
+            v: int
+        impl Bump for P
+            bump(self)
+                self.v
+        """, "method 'bump' of 'impl Bump for P' takes a different receiver than the trait declares")
+
+@test("implementing an unknown trait is rejected")
+tre_implementing_an_unknown_trait()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        struct P
+            v: int
+        impl Nope for P
+            go(self) -> int = self.v
+        """, "unknown trait 'Nope'")
+
+@test("implementing a trait for an unknown type is rejected")
+tre_implementing_for_an_unknown_type()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Show
+            show(self) -> string
+        impl Show for Ghost
+            show(self) -> string = "g"
+        """, "unknown type 'Ghost'")
+
+@test("two impls of the same trait for one type are rejected")
+tre_two_impls_of_one_trait()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Show
+            show(self) -> string
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> string = "a"
+        impl Show for P
+            show(self) -> string = "b"
+        """, "'P' already implements 'Show'")
+
+@test("calling a trait method on a type with no impl is rejected")
+tre_a_trait_method_on_a_type_with_no_impl()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Show
+            show(self) -> string
+        struct P
+            v: int
+        var p = P(1)
+        print(p.show())
+        """, "type 'P' has no method 'show'")
+
+@test("a generic trait says which one an 'impl' means")
+tre_a_generic_trait_says_which_one()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Into[T]
+            into(self) -> T
+        struct P
+            v: int
+        impl Into for P
+            into(self) -> int = self.v
+        """, "trait 'Into' takes 1 type argument, but 0 type arguments were given")
+
+@test("implementing a trait for a generic struct needs the block's own parameters")
+tre_a_generic_struct_needs_the_blocks_parameters()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Show
+            show(self) -> int
+        struct Box[T]
+            v: T
+        impl Show for Box
+            show(self) -> int = 1
+        """, "'Box' is generic, so an 'impl' for it covers every instantiation at once — " +
+             "write 'impl[T] Show for Box[T]'")
+
+@test("an impl method colliding with a field is rejected")
+tre_an_impl_method_colliding_with_a_field()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Show
+            v(self) -> int
+        struct P
+            v: int
+        impl Show for P
+            v(self) -> int = 1
+        """, "type 'P' has both a field and a member named 'v'")
+
+@test("calling a bounded generic with a type that lacks the impl is rejected")
+tre_a_type_that_lacks_the_impl()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Show
+            show(self) -> string
+        struct P
+            v: int
+        struct Q
+            w: int
+        impl Show for P
+            show(self) -> string = "p"
+        render[T: Show](x: T) -> string = x.show()
+        print(render(Q(1)))
+        """, "'render' requires its type parameter 'T' to implement 'Show', but Q does not")
+
+@test("calling a bounded generic with a scalar type is rejected")
+tre_a_scalar_type_at_a_bound()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Show
+            show(self) -> string
+        struct P
+            v: int
+        impl Show for P
+            show(self) -> string = "p"
+        render[T: Show](x: T) -> string = x.show()
+        print(render(7))
+        """, "'render' requires its type parameter 'T' to implement 'Show', but int does not")
+
+@test("a multi-bound parameter rejects a type missing one of its bounds")
+tre_a_multi_bound_parameter()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Named
+            name(self) -> string
+        trait Aged
+            age(self) -> int
+        struct P
+            v: int
+        impl Named for P
+            name(self) -> string = "p"
+        describe[T: Named + Aged](x: T) -> string = x.name()
+        print(describe(P(1)))
+        """, "'describe' requires its type parameter 'T' to implement 'Aged', but P does not")
+
+@test("a bound naming something that is not a trait is rejected")
+tre_a_bound_that_is_not_a_trait()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        struct Widget
+            v: int
+        consume[T: Widget](x: T) -> int = 1
+        """, "the bound on 'T' in 'consume' names 'Widget', which is not a trait")
+
+// -- the core trait catalog ------------------------------------------------------------------------
+
+@test("'Self' outside a trait or an impl names nothing")
+tre_self_outside_a_trait()
+    if !tre_ready() then return
+
+    tre_refused("var x: Self = 1\n",
+        "'Self' names the type a trait is implemented for, so it is only meaningful inside a " +
+        "'trait' or an 'impl'")
+
+@test("a type may not be declared with the name 'Self'")
+tre_a_type_named_self()
+    if !tre_ready() then return
+
+    tre_refused("struct Self\n    v: int\n", "type 'Self' is already declared")
+
+@test("a built-in's membership cannot be overridden by an impl")
+tre_a_builtin_membership_is_not_overridden()
+    if !tre_ready() then return
+
+    tre_refused("impl Add for int\n    add(self, rhs: Self) -> Self = self\n",
+        "'int' already implements 'sysl.Add' — the compiler provides it")
+
+@test("a scalar outside a membership has no such method")
+tre_a_char_has_no_add()
+    if !tre_ready() then return
+
+    tre_refused("print('a'.add('b'))\n", "type 'char' has no method 'add'")
+
+@test("a bool is equatable and not ordered")
+tre_a_bool_is_not_ordered()
+    if !tre_ready() then return
+
+    tre_refused("print(true.lt(false))\n", "type 'bool' has no method 'lt'")
+
+@test("a float has no remainder")
+tre_a_float_has_no_remainder()
+    if !tre_ready() then return
+
+    tre_refused("print(2.5.rem(1.0))\n", "type 'real' has no method 'rem'")
+
+@test("an unsigned integer cannot be negated")
+tre_an_unsigned_integer_cannot_be_negated()
+    if !tre_ready() then return
+
+    tre_refused("print(7u32.neg())\n", "type 'uint' has no method 'neg'")
+
+@test("a read-only view does not reach a member written for a writable one")
+tre_a_read_only_view_does_not_reach_a_writing_member()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Bump
+            bump(*self)
+
+        impl Bump for []int
+            bump(*self)
+                self[0] = self[0] + 1
+
+        val fixed: [3]int = [1, 2, 3]
+        var v: []const int = fixed[..]
+
+        v.bump()
+        """, "type '[]const int' has no method 'bump'")
+
+@test("a built-in trait method checks its argument against 'Self'")
+tre_a_builtin_method_checks_its_argument()
+    if !tre_ready() then return
+
+    tre_refused("print(3.add(true))\n", "'rhs' of 'Add.add' is int, but bool was given")
+
+@test("a built-in trait method checks its arity")
+tre_a_builtin_method_checks_its_arity()
+    if !tre_ready() then return
+
+    tre_refused("print(3.add(1, 2))\n",
+        "method 'Add.add' takes 1 argument, but 2 arguments were given")
+
+@test("a type outside the bound's membership is rejected at the call")
+tre_a_type_outside_the_membership()
+    if !tre_ready() then return
+
+    tre_refused("sum[T: Add](a: T, b: T) -> T = a.add(b)\nprint(sum(true, false))\n",
+        "'sum' requires its type parameter 'T' to implement 'sysl.Add', but bool does not")
+
+@test("an unbounded parameter cannot call a catalog method")
+tre_an_unbounded_parameter_cannot_call_a_catalog_method()
+    if !tre_ready() then return
+
+    tre_refused("sum[T](a: T, b: T) -> T = a.add(b)\n", "'add' needs 'T: sysl.Add'")
+
+@test("a bound licenses only its own trait's method")
+tre_a_bound_licenses_only_its_own_method()
+    if !tre_ready() then return
+
+    tre_refused("mix[T: Add](a: T, b: T) -> bool = a.lt(b)\n", "'lt' needs 'T: sysl.Ord'")
+
+@test("an operator on an unbounded parameter names the bound it needs")
+tre_an_operator_names_its_bound()
+    if !tre_ready() then return
+
+    tre_refused("sum[T](a: T, b: T) -> T = a + b\n", "'+' needs 'T: sysl.Add'")
+
+@test("an ordering operator on an unbounded parameter names 'Ord'")
+tre_an_ordering_operator_names_ord()
+    if !tre_ready() then return
+
+    tre_refused("less[T](a: T, b: T) -> bool = a < b\n", "'<' needs 'T: sysl.Ord'")
+
+@test("a bound licenses only its own operator")
+tre_a_bound_licenses_only_its_own_operator()
+    if !tre_ready() then return
+
+    tre_refused("less[T: Eq](a: T, b: T) -> bool = a < b\n", "'<' needs 'T: sysl.Ord'")
+
+@test("a prefix operator on an unbounded parameter names 'Neg'")
+tre_a_prefix_operator_names_neg()
+    if !tre_ready() then return
+
+    tre_refused("flip[T](a: T) -> T = -a\n", "'-' needs 'T: sysl.Neg'")
+
+@test("an equality operator on an unbounded parameter names 'Eq'")
+tre_an_equality_operator_names_eq()
+    if !tre_ready() then return
+
+    tre_refused("same[T](a: T, b: T) -> bool = a == b\n", "'==' needs 'T: sysl.Eq'")
+
+private tre_no_fields() -> string =
+    "'T' is a type parameter, so it has no fields to read — a field is layout, and no trait " +
+    "declares a property 'v' that a bound could promise instead"
+
+@test("a field read off a type parameter is refused outright, with no bound to suggest")
+tre_a_field_read_off_a_type_parameter()
+    if !tre_ready() then return
+
+    tre_refused("first[T](x: T) -> int = x.v\n", tre_no_fields())
+
+@test("a field read is refused even where every instantiation would have had the field")
+tre_a_field_read_every_instantiation_would_have()
+    if !tre_ready() then return
+
+    tre_refused("struct P\n    v: int\nfirst[T](x: T) -> int = x.v\nprint(first(P(7)))\n",
+        tre_no_fields())
+
+@test("a chained comparison still needs its operands to agree")
+tre_a_chained_comparison()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        struct M
+            v: int
+        impl Ord for M
+            lt(self, rhs: Self) -> bool = self.v < rhs.v
+        var a = M(1)
+        print(a < a < 3)
+        """, "'<' needs matching types, got M and int")
+
+@test("compound assignment still needs the right operand to agree")
+tre_a_compound_assignment()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        struct M
+            v: int
+        impl Add for M
+            add(self, rhs: Self) -> Self = M(self.v + rhs.v)
+        var a = M(1)
+        a += 2
+        """, "'+' between M and int needs 'sysl.Add[int]' — it implements 'sysl.Add'")
+
+@test("an operator on a user type with no impl is not defined")
+tre_an_operator_with_no_impl()
+    if !tre_ready() then return
+
+    tre_refused("struct M\n    v: int\nvar a = M(1)\nvar b = a + a\n",
+        "operator '+' is not defined for M")
+
+@test("an operator's operands must be the same type")
+tre_an_operators_operands_must_agree()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        struct M
+            v: int
+        impl Add for M
+            add(self, rhs: Self) -> Self = M(self.v + rhs.v)
+        var a = M(1) + 2
+        """, "'+' between M and int needs 'sysl.Add[int]' — it implements 'sysl.Add'")
+
+@test("a member of a built-in may not hide one of its catalog methods")
+tre_a_member_may_not_hide_a_catalog_method()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Tally
+            add(self, k: int) -> int
+        impl Tally for int
+            add(self, k: int) -> int = self + k
+        """, "'add' is how 'Add' is implemented for int, and the compiler provides that — a " +
+             "member of this name would hide it")
+
+@test("a member whose signature does not resolve is reported, not crashed on")
+tre_an_unresolved_member_signature()
+    if !tre_ready() then return
+
+    tre_refused("struct P\n    v: int\n    ping(self, x: Nope) -> int = 1\n", "unknown type 'Nope'")
+    tre_refused("struct P\n    v: int\n    ping(self) -> Nope = 1\n", "unknown type 'Nope'")
+    tre_refused("enum Step\n    Idle\n    Work\n    at(self, x: Nope) -> int = 1\n",
+        "unknown type 'Nope'")
+
+@test("an impl whose result differs from the trait's 'Self' is rejected")
+tre_a_result_that_differs_from_self()
+    if !tre_ready() then return
+
+    tre_refused(raw"""
+        trait Doubler
+            twice(self) -> Self
+        struct M
+            v: int
+        impl Doubler for M
+            twice(self) -> int = self.v
+        """, "method 'twice' returns int, but trait 'Doubler' declares M")
