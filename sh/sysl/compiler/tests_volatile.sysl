@@ -1,0 +1,942 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `volatile` (`reference/memory.md § Device memory`): storage whose reads and writes are effects
+// rather than value computations, so the compiler emits exactly the accesses the source wrote and no
+// others.
+//
+// `volatile` qualifies **storage**, and a value read out of it is an ordinary value -- so the
+// qualifier lives in the composites that name somebody else's storage (a field, an element, a
+// pointee) and is gone by the time anything holds the result. Which spellings are refused, why an
+// address carries the qualifier with it, and why one field of a register block is reached at its own
+// address rather than by reading the block all follow from that.
+//
+// **Every diagnostic and every output quoted here was read out of the reference compiler**, whose
+// `VolatileTests` these are; the fragments of LLVM text are the ones that suite asserts.
+
+private var vo_library_cache: Buf[Program] = buf()
+private var vo_library_read: bool = false
+
+// The standard library's units for the host, read once.
+private vo_library() -> Buf[Program]
+    if vo_library_read then return vo_library_cache
+
+    vo_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> vo_library_cache = units
+
+    vo_library_cache
+end vo_library
+
+// Every claim here is about a whole program, so all of them want the library.
+private vo_ready() -> bool
+    if vo_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end vo_ready
+
+private vo_can_run() -> bool
+    if !vo_ready() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end vo_can_run
+
+// The library's units for a target other than the host, read for it afresh.
+private vo_library_for(t: Target) -> Buf[Program]
+    if t.name == host_target().name then return vo_library()
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end vo_library_for
+
+// The whole module these files lower to for a target beside the real library -- or, where anything
+// was said about them, every message, one to a line.
+private vo_ir_for(t: Target, files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+    val library = vo_library_for(t)
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return parsed.report.at(0).message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    if !done.reported.is_empty()
+        var said = str_builder()
+
+        for i in 0..<done.reported.len()
+            said.push(done.reported.at(i).diag.message)
+            said.push("\n")
+
+        return said.finish()
+    end if
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), buf())
+
+    ir_print_module(codegen_with_gaps(kept, t, promotions).0)
+end vo_ir_for
+
+private vo_ir(text: string) -> string = vo_ir_for(host_target(), [("main.sysl", text)])
+
+// What a refused program is told. The same seam, read for its messages.
+private vo_err(text: string) -> string = vo_ir(text)
+
+// The function named, from its `define` line up to the brace that closes it -- the reference's
+// `defineOf`, which is what every lowering claim in this suite is made against.
+private vo_define(out: string, name: string) -> string
+    val lines = lines_of(out)
+    var said = str_builder()
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !inside && line.starts_with("define") && line.index_of(s"@$name(").is_some()
+            inside = true
+
+        if inside
+            if line == "}" then return said.finish()
+
+            said.push(line)
+            said.push("\n")
+
+    said.finish()
+end vo_define
+
+private vo_has(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// How many lines of `text` hold `part`.
+private vo_count(text: string, part: string) -> usize
+    val lines = lines_of(text)
+    var n: usize = 0
+
+    for i in 0..<lines.len()
+        if lines.at(i).index_of(part).is_some() then n += 1
+
+    n
+end vo_count
+
+// **What a program PRINTS**, where it runs to the end.
+private vo_ran(text: string) -> string
+    val root = make_temp_dir("sysl-volatile").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"it did not exit zero: ${out.text}"
+end vo_ran
+
+// The shape every device header has: a block of registers reached through a pointer at a fixed
+// address, with one field that is a shadow in ordinary memory rather than a register.
+private vo_uart() -> string =
+    "struct Uart\n    status: volatile u32\n    data:   volatile u32\n    baud:   u32\n" +
+    "const UART: usize = 0x10000000\nstatic val regs: *Uart = ptr_cast(UART)\n"
+
+// A block held as an ordinary value, which is what makes it constructible: what a program may not
+// write is a `volatile` *variable*, and a struct whose fields are qualified is not one.
+private vo_gpio() -> string = "struct Gpio\n    input:  volatile uint\n    output: volatile u8\n    shadow: usize\n"
+
+private vo_bank() -> string =
+    "struct Gpio\n    bank: [4]volatile u32\nstatic val gpio: *Gpio = ptr_cast(usize(0x40000000))\n"
+
+// What every refusal of a value-typed position says.
+private vo_storage() -> string =
+    "'volatile u32' is the type of *storage*, and this is a value — what a read of a volatile place " +
+    "hands back is an ordinary 'u32'. The qualifier goes where the storage is named: a struct " +
+    "field, an element, or the pointee of a '*T', as '*volatile u32'"
+
+private vo_counted(spelled: string) -> string =
+    s"'volatile $spelled' is not a type: the qualifier says every access is emitted exactly as " +
+    "written, and a counted value's accesses come with retains and releases that no rule here " +
+    "could hold still — device memory is reached with a raw pointer"
+
+// -- a register block is a struct whose registers are qualified -------------------------------------
+
+@test("reading one is a load marked volatile")
+vo_reading_one_is_a_volatile_load()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_define(vo_ir(vo_uart() + "read() -> u32 = regs.status\nprint(read())"), "read"),
+                  "load volatile i32"))
+end vo_reading_one_is_a_volatile_load
+
+// The load-bearing half: lowering `regs.status` as "read the block, take field 0" would read the data
+// register as a side effect of looking at the status register, which on real hardware pops a FIFO.
+@test("and the block itself is not read on the way to it")
+vo_the_block_is_not_read_on_the_way()
+    if !vo_ready() then return
+
+    val out = vo_define(vo_ir(vo_uart() + "read() -> u32 = regs.status\nprint(read())"), "read")
+
+    assert(vo_has(out, "getelementptr %struct.Uart"))
+    assert(!vo_has(out, "load volatile %struct.Uart"))
+    assert(!vo_has(out, "extractvalue"))
+end vo_the_block_is_not_read_on_the_way
+
+@test("writing one is a store marked volatile")
+vo_writing_one_is_a_volatile_store()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_define(vo_ir(vo_uart() + "go() = regs.data = 65u32\ngo()"), "go"),
+                  "store volatile i32 65"))
+end vo_writing_one_is_a_volatile_store
+
+// A reserved word or a shadow value in RAM sits in the middle of nearly every real block, and
+// qualifying per field rather than per struct is exactly what lets it stay ordinary.
+@test("while a field that is not a register keeps the ordinary instruction")
+vo_an_unqualified_field_keeps_the_ordinary_store()
+    if !vo_ready() then return
+
+    val out = vo_define(vo_ir(vo_uart() + "go() = regs.baud = 115200u32\ngo()"), "go")
+
+    assert(vo_has(out, "store i32 115200"))
+    assert(!vo_has(out, "store volatile"))
+end vo_an_unqualified_field_keeps_the_ordinary_store
+
+@test("a compound assignment is one volatile read and one volatile write")
+vo_a_compound_assignment_is_a_read_and_a_write()
+    if !vo_ready() then return
+
+    val out = vo_define(vo_ir(vo_uart() + "go() = regs.data += 1u32\ngo()"), "go")
+
+    assert(vo_has(out, "load volatile i32"))
+    assert(vo_has(out, "store volatile i32"))
+end vo_a_compound_assignment_is_a_read_and_a_write
+
+@test("and so is an increment")
+vo_an_increment_is_a_read_and_a_write()
+    if !vo_ready() then return
+
+    val out = vo_define(vo_ir(vo_uart() + "go() = regs.data++\ngo()"), "go")
+
+    assert(vo_has(out, "load volatile i32"))
+    assert(vo_has(out, "store volatile i32"))
+end vo_an_increment_is_a_read_and_a_write
+
+// -- a lone register is the pointee of a '*volatile T' ----------------------------------------------
+
+@test("read through the '*'")
+vo_read_through_the_star()
+    if !vo_ready() then return
+
+    val src = "read(p: *volatile u32) -> u32 = *p\nprint(read(ptr_cast(usize(4096))))"
+
+    assert(vo_has(vo_define(vo_ir(src), "read"), "load volatile i32"))
+end vo_read_through_the_star
+
+@test("read through a subscript, which is the same address arrived at the other way")
+vo_read_through_a_subscript()
+    if !vo_ready() then return
+
+    val src = "read(p: *volatile u32) -> u32 = p[0]\nprint(read(ptr_cast(usize(4096))))"
+
+    assert(vo_has(vo_define(vo_ir(src), "read"), "load volatile i32"))
+end vo_read_through_a_subscript
+
+@test("written through either")
+vo_written_through_either()
+    if !vo_ready() then return
+
+    val src = "set(p: *volatile u32, v: u32) -> unit\n    *p = v\n    p[1] = v\n" +
+              "set(ptr_cast(usize(4096)), 1u32)"
+
+    assert_eq(vo_count(vo_define(vo_ir(src), "set"), "store volatile i32"), 2)
+end vo_written_through_either
+
+// The pointer is an ordinary value: what it *addresses* is a device, and copying the address touches
+// no device at all.
+@test("while the pointer holding the address is read like any other value")
+vo_the_pointer_itself_is_an_ordinary_value()
+    if !vo_ready() then return
+
+    val out = vo_define(vo_ir(vo_uart() + "read() -> u32 = regs.status\nprint(read())"), "read")
+
+    assert(vo_has(out, "load ptr, ptr @regs"))
+    assert(!vo_has(out, "load volatile ptr"))
+end vo_the_pointer_itself_is_an_ordinary_value
+
+// -- the qualifier travels with an address taken of a register --------------------------------------
+
+@test("'&' of a qualified field yields a '*volatile T'")
+vo_address_of_a_qualified_field()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_ir(vo_uart() + "at() -> *volatile u32 = &regs.status\nprint(*at())"),
+                  "define ptr @at()"))
+end vo_address_of_a_qualified_field
+
+// Not that the spelling was accepted, but that every access through the result is still an access
+// to a register.
+@test("and reading through the result is still volatile")
+vo_reading_through_the_address_is_volatile()
+    if !vo_ready() then return
+
+    val src = vo_uart() + "at() -> *volatile u32 = &regs.status\nread() -> u32 = *at()\nprint(read())"
+
+    assert(vo_has(vo_define(vo_ir(src), "read"), "load volatile i32"))
+end vo_reading_through_the_address_is_volatile
+
+// An address taken of ordinary storage is an ordinary address, so the qualifier is not something `&`
+// invents.
+@test("while '&' of an unqualified field yields an ordinary '*T'")
+vo_address_of_an_unqualified_field()
+    if !vo_ready() then return
+
+    val src = vo_uart() + "at() -> *u32 = &regs.baud\nread() -> u32 = *at()\nprint(read())"
+
+    assert(!vo_has(vo_define(vo_ir(src), "read"), "load volatile"))
+end vo_address_of_an_unqualified_field
+
+// -- a read of a register hands back an ordinary value ----------------------------------------------
+
+// The whole design in one test: if the qualifier survived the read, this binding would be a volatile
+// one and every mention of `s` below would be a volatile load of a stack slot.
+@test("so what it is bound to is ordinary storage")
+vo_a_read_is_bound_to_ordinary_storage()
+    if !vo_ready() then return
+
+    val src = vo_uart() + "go() -> u32\n    var s = regs.status\n    s += 1u32\n    s\nprint(go())"
+    val out = vo_define(vo_ir(src), "go")
+
+    assert_eq(vo_count(out, "load volatile"), 1)
+    assert(vo_has(out, "store i32"))
+end vo_a_read_is_bound_to_ordinary_storage
+
+@test("and it stands where an ordinary value is asked for")
+vo_a_read_stands_where_a_value_is_asked_for()
+    if !vo_ready() then return
+
+    val src = vo_uart() + "take(v: u32) -> u32 = v + 1u32\ngo() -> u32 = take(regs.status)\nprint(go())"
+
+    assert(vo_has(vo_ir(src), "define i32 @take(i32 %v.param)"))
+end vo_a_read_stands_where_a_value_is_asked_for
+
+// The type a diagnostic names for a read of a register is the unqualified one.
+@test("which is what a diagnostic calls it")
+vo_a_diagnostic_calls_a_read_unqualified()
+    if !vo_ready() then return
+
+    val said = vo_err(vo_uart() + "go() -> string = regs.status\nprint(go())")
+
+    assert(vo_has(said, "function 'go' should return string, but its body yields uint"))
+    assert(!vo_has(said, "volatile"))
+end vo_a_diagnostic_calls_a_read_unqualified
+
+// -- a bare literal takes the type of the register it is going into ---------------------------------
+
+// Construction and assignment once disagreed: `regs.output = 0b0110` was accepted while `Gpio(10, 0)`
+// was refused, the literal being read against the expected type directly while the mismatch was
+// judged through its representation.
+@test("in a constructor, exactly as it does for an ordinary field")
+vo_a_literal_in_a_constructor()
+    if !vo_can_run() then return
+
+    assert_eq(vo_ran(vo_gpio() + "var block = Gpio(10, 6, 3)\nprint(block.input, block.output, block.shadow)"),
+              "10 6 3\n")
+end vo_a_literal_in_a_constructor
+
+// The half that always worked, kept beside the half that did not: the point is that the two agree.
+@test("and in an assignment to one, which is where the two have to agree")
+vo_a_literal_in_an_assignment()
+    if !vo_can_run() then return
+
+    val src = vo_gpio() + "go() -> uint\n    var block = Gpio(0, 0, 0)\n    block.input = 0b0110\n" +
+              "    block.input\nprint(go())"
+
+    assert_eq(vo_ran(src), "6\n")
+end vo_a_literal_in_an_assignment
+
+// Falling back to `int` would make a literal that does not fit `int` refused for a range it was never
+// going to be stored in.
+@test("including one only the field's own width can hold")
+vo_a_literal_only_the_fields_width_holds()
+    if !vo_can_run() then return
+
+    val src = "struct Counter\n    ticks: volatile u64\nvar c = Counter(18446744073709551615)\nprint(c.ticks)"
+
+    assert_eq(vo_ran(src), "18446744073709551615\n")
+end vo_a_literal_only_the_fields_width_holds
+
+@test("and a float literal at a qualified field")
+vo_a_float_literal_at_a_qualified_field()
+    if !vo_can_run() then return
+
+    assert_eq(vo_ran("struct Sensor\n    reading: volatile f32\nvar s = Sensor(1.5)\nprint(s.reading)"), "1.5\n")
+end vo_a_float_literal_at_a_qualified_field
+
+// -- a bank of registers is an array of them --------------------------------------------------------
+
+@test("indexing one is a volatile load at the element")
+vo_indexing_a_bank_is_a_volatile_load()
+    if !vo_ready() then return
+
+    val src = vo_bank() + "read(i: usize) -> u32 = gpio.bank[i]\nprint(read(0))"
+
+    assert(vo_has(vo_define(vo_ir(src), "read"), "load volatile i32"))
+end vo_indexing_a_bank_is_a_volatile_load
+
+// The qualifier changes the instruction and nothing about the rules around it.
+@test("and the index is checked, as it is for any other array")
+vo_a_bank_index_is_checked()
+    if !vo_ready() then return
+
+    val src = vo_bank() + "read(i: usize) -> u32 = gpio.bank[i]\nprint(read(0))"
+
+    assert(vo_has(vo_define(vo_ir(src), "read"), "icmp ult i64"))
+end vo_a_bank_index_is_checked
+
+// A view is three words that say where the elements are, so what it is a view *of* is still where
+// the qualifier lives.
+@test("and a view of registers indexes volatile too")
+vo_a_view_of_registers_indexes_volatile()
+    if !vo_ready() then return
+
+    val src = vo_bank() + "read(xs: []volatile u32) -> u32 = xs[0]\nprint(read(gpio.bank[0..4]))"
+
+    assert(vo_has(vo_define(vo_ir(src), "read"), "load volatile i32"))
+end vo_a_view_of_registers_indexes_volatile
+
+// `const` says this handle may not write, `volatile` says the elements are a device's.
+@test("and 'const' composes with it, being a property of the view rather than of the element")
+vo_const_composes_with_volatile()
+    if !vo_ready() then return
+
+    val src = vo_bank() + "peek(xs: []const volatile u32) -> u32 = xs[0]\nprint(peek(gpio.bank[0..4]))"
+
+    assert(vo_has(vo_define(vo_ir(src), "peek"), "load volatile i32"))
+end vo_const_composes_with_volatile
+
+// A copy of a whole register block reads every register in it, so the aggregate access is marked
+// too rather than being the one hole in the rule.
+@test("copying a whole block is an access to every register in it")
+vo_copying_a_whole_block_is_volatile()
+    if !vo_ready() then return
+
+    val src = vo_uart() + "snapshot() -> u32\n    var u = *regs\n    u.status\nprint(snapshot())"
+
+    assert(vo_has(vo_define(vo_ir(src), "snapshot"), "load volatile %struct.Uart"))
+end vo_copying_a_whole_block_is_volatile
+
+// -- what it refuses --------------------------------------------------------------------------------
+
+// Each of these is a *value* rather than storage, and a value read out of a volatile place is an
+// ordinary value.
+@test("a variable, which holds a value")
+vo_refuses_a_variable()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("var x: volatile u32 = 1u32\nprint(x)"), vo_storage()))
+end vo_refuses_a_variable
+
+@test("a parameter, which receives one")
+vo_refuses_a_parameter()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("f(p: volatile u32) -> unit = ()\nf(1u32)"), vo_storage()))
+end vo_refuses_a_parameter
+
+@test("a result, which hands one back")
+vo_refuses_a_result()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("f() -> volatile u32 = 1u32\nprint(f())"), vo_storage()))
+end vo_refuses_a_result
+
+@test("a 'val', whose storage is this program's own")
+vo_refuses_a_val()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("static val v: volatile u32 = 1u32\nprint(v)"), vo_storage()))
+end vo_refuses_a_val
+
+// An enum's payload is lifted out of a loaded aggregate rather than reached at an address.
+@test("an enum's payload")
+vo_refuses_an_enum_payload()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("enum E\n    V(x: volatile u32)\n    W\nprint(0)"), vo_storage()))
+end vo_refuses_an_enum_payload
+
+@test("an aggregate as a whole, with the per-field spelling named")
+vo_refuses_an_aggregate()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("struct T\n    a: int\nstruct S\n    b: volatile T\nprint(0)"),
+                  "'volatile T' is not a type: a register block is qualified one field at a time, so " +
+                  "write 'volatile' on the fields of 'T' that are registers — which is also what lets a " +
+                  "shadow field in the middle of one stay ordinary"))
+end vo_refuses_an_aggregate
+
+@test("a counted reference, whose accesses come with retains this could not hold still")
+vo_refuses_a_counted_reference()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("struct S\n    r: volatile &int\nprint(0)"), vo_counted("&int")))
+end vo_refuses_a_counted_reference
+
+@test("a string, which is one of those")
+vo_refuses_a_string()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("struct S\n    s: volatile string\nprint(0)"), vo_counted("string")))
+end vo_refuses_a_string
+
+@test("a view, which is another")
+vo_refuses_a_view()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("struct S\n    v: volatile []u32\nprint(0)"), vo_counted("[]uint")))
+end vo_refuses_a_view
+
+// Two words, so one written access is two machine accesses -- and the table beside the value was
+// emitted by this compiler, which no device put there.
+@test("a trait object, which is a pair of words")
+vo_refuses_a_trait_object()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("trait Show\n    show(self) -> unit\nstruct S\n    a: volatile *Show\nprint(0)"),
+                  "'volatile *Show' is not a type: an object over a trait is a pair of words, so " +
+                  "touching one is two accesses whatever the source says — and the table beside the " +
+                  "value is this program's, not a device's"))
+end vo_refuses_a_trait_object
+
+@test("a type that occupies nothing, since there is no access to describe")
+vo_refuses_a_zero_sized_type()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("struct S\n    a: volatile unit\nprint(0)"),
+                  "'volatile unit' is not a type: 'volatile' qualifies a scalar or a raw pointer, since " +
+                  "it promises the one load or the one store the source wrote and nothing else"))
+end vo_refuses_a_zero_sized_type
+
+@test("a data enum, which is a tag beside a payload")
+vo_refuses_a_data_enum()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("enum P\n    None\n    Some(x: int)\nstruct S\n    a: volatile P\nprint(0)"),
+                  "'volatile P' is not a type: 'P' carries a payload beside its tag, so touching one is " +
+                  "more than the single access the qualifier promises. A register field that is a set " +
+                  "of named values is a simple enum, which is one integer"))
+end vo_refuses_a_data_enum
+
+// A simple enum is its underlying integer and nothing else, so reading one is the single load the
+// qualifier promises -- what a register's mode field wants to be declared as.
+@test("while a simple enum, which is one integer, is admitted")
+vo_admits_a_simple_enum()
+    if !vo_ready() then return
+
+    val src = "enum Mode: u32\n    Off\n    Slow\n    Fast\nstruct Ctl\n    mode: volatile Mode\n" +
+              "static val c: *Ctl = ptr_cast(usize(4096))\nget() -> Mode = c.mode\n" +
+              "print(get() == Mode.Fast)"
+
+    assert(vo_has(vo_define(vo_ir(src), "get"), "load volatile i32"))
+end vo_admits_a_simple_enum
+
+// A constrained subtype is the claim that a value has been checked, and a device did not check
+// anything.
+@test("a constrained subtype, whose whole content is that a value was checked")
+vo_refuses_a_constrained_subtype()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("type Level = int within 0..7\nstruct Ctl\n    lvl: volatile Level\nprint(0)"),
+                  "'volatile Level' is not a type: a register holds whatever the device put in it, and " +
+                  "Level is the claim that a value has been checked. Declare the register at int and " +
+                  "convert what you read"))
+end vo_refuses_a_constrained_subtype
+
+// `new` alone changes a type's identity and promises nothing about which values it has.
+@test("while a bare 'new' derivation, which constrains no value, is admitted")
+vo_admits_a_bare_new_derivation()
+    if !vo_ready() then return
+
+    val src = "type Raw = new u32\nstruct Ctl\n    raw: volatile Raw\n" +
+              "static val c: *Ctl = ptr_cast(usize(4096))\nget() -> Raw = c.raw\nprint(u32(get()))"
+
+    assert(vo_has(vo_define(vo_ir(src), "get"), "load volatile i32"))
+end vo_admits_a_bare_new_derivation
+
+// The qualifier is not a modifier that stacks, and writing it twice is a mistake worth naming.
+@test("and writing it twice")
+vo_refuses_writing_it_twice()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("struct S\n    a: volatile volatile u32\nprint(0)"), vo_storage()))
+end vo_refuses_writing_it_twice
+
+// -- a raw pointer may itself sit in device memory --------------------------------------------------
+
+@test("so 'volatile *T' is a field, distinct from '*volatile T'")
+vo_a_volatile_pointer_field()
+    if !vo_ready() then return
+
+    val src = "struct S\n    p: volatile *u32\nstatic val s: *S = ptr_cast(usize(4096))\n" +
+              "read() -> *u32 = s.p\nprint(*read())"
+
+    assert(vo_has(vo_define(vo_ir(src), "read"), "load volatile ptr"))
+end vo_a_volatile_pointer_field
+
+@test("and so may the address of a function")
+vo_a_volatile_function_address()
+    if !vo_ready() then return
+
+    val src = "struct S\n    hook: volatile *extern() -> unit\nstatic val s: *S = ptr_cast(usize(4096))\n" +
+              "fire() -> unit = s.hook()\nfire()"
+
+    assert(vo_has(vo_define(vo_ir(src), "fire"), "load volatile ptr"))
+end vo_a_volatile_function_address
+
+// -- 'volatile' stays an ordinary name everywhere else ----------------------------------------------
+
+// The word is not reserved, for the reason `sync` is not: it is special only in front of another
+// type.
+@test("as a type's name")
+vo_volatile_as_a_type_name()
+    if !vo_can_run() then return
+
+    assert_eq(vo_ran("type volatile = new int\nf(v: volatile) -> int = int(v)\nprint(f(volatile(3)))"), "3\n")
+end vo_volatile_as_a_type_name
+
+@test("as a variable's name")
+vo_volatile_as_a_variable_name()
+    if !vo_can_run() then return
+
+    assert_eq(vo_ran("var volatile = 3\nvolatile += 1\nprint(volatile)"), "4\n")
+end vo_volatile_as_a_variable_name
+
+@test("as a field's name")
+vo_volatile_as_a_field_name()
+    if !vo_can_run() then return
+
+    assert_eq(vo_ran("struct S\n    volatile: int\nprint(S(7).volatile)"), "7\n")
+end vo_volatile_as_a_field_name
+
+@test("and as a function's name")
+vo_volatile_as_a_function_name()
+    if !vo_can_run() then return
+
+    assert_eq(vo_ran("volatile(n: int) -> int = n * 2\nprint(volatile(21))"), "42\n")
+end vo_volatile_as_a_function_name
+
+// -- the accesses are the ones the source wrote, and they do what they say --------------------------
+
+// Heap storage stands in for a device: it is the one kind a test can point a `*volatile T` at and
+// read back.
+@test("a register block written and read through a pointer")
+vo_a_block_written_and_read_through_a_pointer()
+    if !vo_can_run() then return
+
+    val src = "extern malloc(n: usize) -> *u8\nstruct Uart\n    status: volatile u32\n    data:   volatile u32\n" +
+              "    baud:   u32\ngo() -> unit\n    val regs: *Uart = ptr_cast(malloc(sizeof(Uart)))\n" +
+              "    regs.status = 1u32\n    regs.data = 65u32\n    regs.baud = 115200u32\n" +
+              "    print(regs.status, regs.data, regs.baud)\ngo()"
+
+    assert_eq(vo_ran(src), "1 65 115200\n")
+end vo_a_block_written_and_read_through_a_pointer
+
+@test("a lone register incremented in place")
+vo_a_lone_register_incremented_in_place()
+    if !vo_can_run() then return
+
+    val src = "extern malloc(n: usize) -> *u8\ngo() -> unit\n    val p: *volatile u32 = ptr_cast(malloc(4))\n" +
+              "    *p = 0u32\n    p[0] += 5u32\n    p[0]++\n    print(p[0])\ngo()"
+
+    assert_eq(vo_ran(src), "6\n")
+end vo_a_lone_register_incremented_in_place
+
+@test("a bank of them, indexed")
+vo_a_bank_indexed()
+    if !vo_can_run() then return
+
+    val src = "extern malloc(n: usize) -> *u8\nstruct Gpio\n    bank: [4]volatile u32\ngo() -> unit\n" +
+              "    val g: *Gpio = ptr_cast(malloc(sizeof(Gpio)))\n" +
+              "    for i in 0..<4 do g.bank[i] = u32(i) * 10u32\n    print(g.bank[0], g.bank[3])\ngo()"
+
+    assert_eq(vo_ran(src), "0 30\n")
+end vo_a_bank_indexed
+
+@test("and one reached through an address taken of a field")
+vo_one_reached_through_an_address_of_a_field()
+    if !vo_can_run() then return
+
+    val src = "extern malloc(n: usize) -> *u8\nstruct Uart\n    status: volatile u32\n    data:   volatile u32\n" +
+              "go() -> unit\n    val regs: *Uart = ptr_cast(malloc(sizeof(Uart)))\n" +
+              "    val p: *volatile u32 = &regs.data\n    *p = 9u32\n    print(regs.data)\ngo()"
+
+    assert_eq(vo_ran(src), "9\n")
+end vo_one_reached_through_an_address_of_a_field
+
+// -- a driver on a freestanding target, which is what this is for -----------------------------------
+
+// A UART driver of the shape a bring-up actually has: a shadow field configured once, a status
+// register polled, a data register written per byte.
+private vo_driver() -> string =
+    vo_uart() + "init(rate: u32) -> unit\n    regs.baud = rate\n" +
+    "putc(c: u32) -> unit\n    while regs.status & 0x20u32 == 0u32 do ()\n    regs.data = c\n" +
+    "puts(s: []const u8) -> unit\n    for b in s do putc(u32(b))\n" +
+    "boot() -> unit\n    init(115200u32)\n    puts(\"hi\".bytes)\nboot()"
+
+private vo_riscv(text: string) -> string =
+    vo_ir_for(target_named("riscv64-freestanding").unwrap(), [("main.sysl", text)])
+
+@test("the register block is readable before anything has run")
+vo_the_block_is_readable_before_anything_ran()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_riscv(vo_driver()), "@regs = private constant ptr inttoptr (i64 268435456 to ptr)"))
+end vo_the_block_is_readable_before_anything_ran
+
+// The poll is the reason the qualifier exists: an unmarked load here is a loop that spins on the
+// value it saw first.
+@test("the status poll is a volatile load inside the loop")
+vo_the_status_poll_is_volatile()
+    if !vo_ready() then return
+
+    val body = vo_define(vo_riscv(vo_driver()), "putc")
+
+    assert(vo_has(body, "load volatile i32"))
+    assert(vo_has(body, "store volatile i32"))
+end vo_the_status_poll_is_volatile
+
+// Configuring the shadow field touches no register at all.
+@test("while configuring the shadow field touches no device")
+vo_the_shadow_field_touches_no_device()
+    if !vo_ready() then return
+
+    assert(!vo_has(vo_define(vo_riscv(vo_driver()), "init"), "volatile"))
+end vo_the_shadow_field_touches_no_device
+
+// A register block is a type like any other, so it may be declared in one module and driven from
+// another.
+@test("a register block crosses a module boundary")
+vo_a_block_crosses_a_module_boundary()
+    if !vo_ready() then return
+
+    val out = vo_ir_for(host_target(),
+                        [("dev.sysl", "module dev\nstruct Uart\n    status: volatile u32\n    baud:   u32\n"),
+                         ("main.sysl", "import dev\nstatic val regs: *dev.Uart = ptr_cast(usize(0x10000000))\n" +
+                                       "read() -> u32 = regs.status\nset() -> unit = regs.baud = 1u32\n" +
+                                       "print(read())\nset()")])
+
+    assert(vo_has(vo_define(out, "read"), "load volatile i32"))
+    assert(!vo_has(vo_define(out, "set"), "store volatile"))
+end vo_a_block_crosses_a_module_boundary
+
+// -- a struct that holds a register carries no invariant --------------------------------------------
+
+// A check is a call taking every field, so it reads the whole block however few fields the clause
+// names -- which at a device is not a redundant read.
+@test("even where the clause reads only the ordinary fields beside it")
+vo_a_register_block_carries_no_invariant()
+    if !vo_ready() then return
+
+    val src = "struct Uart\n    status: volatile u32\n    baud:   u32\n    invariant baud > 0u32\nprint(0)"
+
+    assert(vo_has(vo_err(src),
+                  "'Uart' holds the register 'status', so it carries no invariant — a check reads every " +
+                  "field of the struct, so one written over the ordinary fields beside a register would " +
+                  "make writing them an access to the device. And a device changes a register between " +
+                  "the check and the instruction after it, which is what no clause could hold. Check a " +
+                  "register where it is read"))
+end vo_a_register_block_carries_no_invariant
+
+@test("while the same struct without the clause is ordinary")
+vo_the_same_struct_without_the_clause()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_ir(vo_uart() + "go() = regs.baud = 1u32\ngo()"), "store i32 1"))
+end vo_the_same_struct_without_the_clause
+
+// The rule is about the register, not about invariants.
+@test("and a struct with no registers keeps its invariants")
+vo_a_struct_with_no_registers_keeps_its_invariant()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_ir("struct Account\n    balance: int\n    invariant balance >= 0\nprint(Account(1).balance)"),
+                  "@Account$inv"))
+end vo_a_struct_with_no_registers_keeps_its_invariant
+
+// A generic body's loads and stores are its own rather than the ones a caller wrote, so a type
+// parameter never binds to a qualified type -- and the caller is told both types.
+@test("a type parameter does not carry the qualifier into a generic body")
+vo_a_type_parameter_does_not_carry_the_qualifier()
+    if !vo_ready() then return
+
+    val said = vo_err("first[T](xs: []T) -> T = xs[0]\nread(bank: []volatile u32) -> u32 = first(bank)\nprint(0)")
+
+    assert(vo_has(said, "'xs' of 'first' is []uint, but []volatile uint was given"))
+end vo_a_type_parameter_does_not_carry_the_qualifier
+
+// -- the edges of the rule --------------------------------------------------------------------------
+
+// The second occurrence is the one an optimizer would have folded into the first.
+@test("reading one register twice is two loads")
+vo_reading_one_register_twice_is_two_loads()
+    if !vo_ready() then return
+
+    val body = vo_define(vo_ir(vo_uart() + "two() -> u32 = regs.data + regs.data\nprint(two())"), "two")
+
+    assert_eq(vo_count(body, "load volatile i32"), 2)
+end vo_reading_one_register_twice_is_two_loads
+
+// A built value touches nothing until it lands, and where it lands is the device.
+@test("building a block and storing it whole is one volatile aggregate store")
+vo_storing_a_built_block_whole()
+    if !vo_ready() then return
+
+    val body = vo_define(vo_ir(vo_uart() + "go() = *regs = Uart(1u32, 2u32, 3u32)\ngo()"), "go")
+
+    assert(vo_has(body, "insertvalue %struct.Uart"))
+    assert(vo_has(body, "store volatile %struct.Uart"))
+end vo_storing_a_built_block_whole
+
+// A zero-sized field takes no slot, so the field written third lands second -- and the marker has to
+// follow the field rather than the slot.
+@test("a field that occupies nothing does not shift the qualifier onto its neighbour")
+vo_a_zero_sized_field_does_not_shift_the_qualifier()
+    if !vo_ready() then return
+
+    val src = "struct Pair\n    nothing: unit\n    reg:     volatile u32\n    plain:   u32\n" +
+              "static val p: *Pair = ptr_cast(usize(4096))\npeek() -> u32 = p.reg\n" +
+              "poke() -> unit = p.plain = 1u32\nprint(peek())\npoke()"
+    val out = vo_ir(src)
+
+    assert(vo_has(vo_define(out, "peek"), "i32 0, i32 0"))
+    assert(vo_has(vo_define(out, "peek"), "load volatile i32"))
+    assert(vo_has(vo_define(out, "poke"), "i32 0, i32 1"))
+    assert(!vo_has(vo_define(out, "poke"), "volatile"))
+end vo_a_zero_sized_field_does_not_shift_the_qualifier
+
+// Two types that lay out identically and are reached by different instructions must never share an
+// instantiated body, which is what mangling the qualifier is for.
+@test("a generic instantiated at a qualified pointee is a different body from one at a plain pointee")
+vo_a_qualified_instantiation_is_its_own_body()
+    if !vo_ready() then return
+
+    val out = vo_ir("id[T](x: T) -> T = x\na(q: *volatile u32) -> *volatile u32 = id(q)\n" +
+                    "b(q: *u32) -> *u32 = id(q)\nprint(*a(ptr_cast(usize(16))), *b(ptr_cast(usize(16))))")
+
+    assert(vo_has(out, "@id.ptr.volatile.uint("))
+    assert(vo_has(out, "@id.ptr.uint("))
+end vo_a_qualified_instantiation_is_its_own_body
+
+// `ptr_cast` is how a device address is reached at all, so it is also the way between the two
+// pointer types.
+@test("'ptr_cast' is what goes between a '*T' and a '*volatile T'")
+vo_ptr_cast_goes_between_the_two()
+    if !vo_ready() then return
+
+    val src = "to(p: *u32) -> *volatile u32 = ptr_cast(p)\nfrom(p: *volatile u32) -> *u32 = ptr_cast(p)\n" +
+              "print(*to(ptr_cast(usize(16))), *from(ptr_cast(usize(16))))"
+
+    assert(vo_has(vo_ir(src), "define ptr @to(ptr %p.param)"))
+end vo_ptr_cast_goes_between_the_two
+
+@test("and one is not the other without it")
+vo_one_pointer_is_not_the_other()
+    if !vo_ready() then return
+
+    assert(vo_has(vo_err("f(p: *volatile u32) -> unit = ()\ng(q: *u32) -> unit = f(q)\ng(ptr_cast(usize(16)))"),
+                  "'p' of 'f' is *volatile uint, but *uint was given"))
+end vo_one_pointer_is_not_the_other
+
+// A driver is exactly the code that runs where there is no allocator.
+@test("a driver module compiles under 'no alloc'")
+vo_a_driver_module_compiles_under_no_alloc()
+    if !vo_ready() then return
+
+    val dev = "module dev\n@no_alloc\nstruct Uart\n    status: volatile u32\n    data:   volatile u32\n" +
+              "val regs: *Uart = ptr_cast(usize(0x10000000))\nputc(c: u32) -> unit\n" +
+              "    while regs.status == 0u32 do ()\n    regs.data = c\n"
+
+    assert(vo_has(vo_ir_for(host_target(), [("dev.sysl", dev), ("main.sysl", "import dev\ndev.putc(65u32)\n")]),
+                  "store volatile i32"))
+end vo_a_driver_module_compiles_under_no_alloc
+
+// -- a register stands where an ordinary value does, and the accesses still happen ------------------
+
+@test("as the scrutinee of a match")
+vo_a_register_as_a_match_scrutinee()
+    if !vo_can_run() then return
+
+    val src = "extern malloc(n: usize) -> *u8\ngo() -> unit\n    val p: *volatile u32 = ptr_cast(malloc(4))\n" +
+              "    *p = 2u32\n    val what = *p match\n        2u32 -> \"two\"\n        _ -> \"other\"\n" +
+              "    print(what)\ngo()"
+
+    assert_eq(vo_ran(src), "two\n")
+end vo_a_register_as_a_match_scrutinee
+
+@test("and compared against a null one")
+vo_a_qualified_pointer_compared_against_null()
+    if !vo_can_run() then return
+
+    val src = "nul() -> *volatile u32 = null\np() -> *volatile u32 = ptr_cast(usize(16))\n" +
+              "print(nul() == nul(), p() == nul())"
+
+    assert_eq(vo_ran(src), "true false\n")
+end vo_a_qualified_pointer_compared_against_null
+
+@test("while 'sizeof' answers for the pointer and for the block")
+vo_sizeof_answers_for_the_pointer_and_the_block()
+    if !vo_can_run() then return
+
+    assert_eq(vo_ran(vo_uart() + "print(sizeof(*volatile u32), sizeof(Uart))"), "8 12\n")
+end vo_sizeof_answers_for_the_pointer_and_the_block
+
+// A qualifier is about the instruction, never about the layout, which is what lets a device header be
+// transcribed field for field.
+@test("it costs no storage")
+vo_it_costs_no_storage()
+    if !vo_can_run() then return
+
+    val src = "struct Regs\n    a: volatile u32\n    b: u32\nstruct Plain\n    a: u32\n    b: u32\n" +
+              "print(sizeof(Regs), alignof(Regs), sizeof(Plain))"
+
+    assert_eq(vo_ran(src), "8 4 8\n")
+end vo_it_costs_no_storage
