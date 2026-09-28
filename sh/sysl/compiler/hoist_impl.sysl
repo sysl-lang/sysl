@@ -58,6 +58,13 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // catalog trait's arguments default to the implementing type, so a block that wrote none of them
     // is the one the compiler already provides, while one that wrote an argument is asking for
     // something else entirely.
+    //
+    // **Every check from here to the coherence rule is about the block as a whole, and the first one
+    // that refuses it ends the block.** A block that fails one is not registered and its members are
+    // not lowered, and it is not asked the questions after it either: `impl Display for i64` is told
+    // that every integer already has one, and being told as well that the block has no home would be
+    // one mistake reported twice, the second time in the terms of a promise it may not make at all.
+    val before = a.complaints()
     val family = a.tables.members.blankets.get(home.key)
     val spelling = library_spelling(key.unwrap())
     var provides = false
@@ -91,40 +98,39 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         if family.is_some() then whose = s"every type in '${module_show(family.unwrap())}'"
 
         a.fault(scope, span, s"$whose already implements '${module_show(key.unwrap())}'$because")
+        return Impl(block, span, scope)
     end if
 
     // A **closed** trait names a family rather than a promise, so there is nothing for a block to
     // supply: it declares no member, and an `impl` of it could only be a claim to belong to the
     // family.
-    if spelling.is_some() && core_closed(spelling.unwrap()) then
+    if spelling.is_some() && core_closed(spelling.unwrap())
         a.fault(scope, span, s"'${module_show(key.unwrap())}' names a family of types the compiler " +
                 "settles, so nothing implements it — a type is one of them or it is not, and " +
                 s"'${home.label}' is not")
+        return Impl(block, span, scope)
 
     // **The overriding side is always a type written out in full**, which is what makes `override` a
     // rule about two blocks rather than a rule about every pair of keys: a shape is one key and so is
     // a generic type, so neither has anything below it to be more specific *than*.
-    if block.overrides && (home.shaped() || !home.tparams.is_empty()) then
+    if block.overrides && (home.shaped() || !home.tparams.is_empty())
         a.fault(scope, span, s"'override' says this block replaces a more general one, and " +
                 s"'${home.label}' is the general kind — an implementation for a shape or for a " +
                 "generic type covers every type it matches at once, so there is nothing below it. " +
                 "The override is written on the block for one type spelled out in full")
+        return Impl(block, span, scope)
 
-    // Everything above is about **the block as a whole**, and a block that fails one of those checks
-    // is not registered and its members are not lowered: what would come back otherwise is one
-    // mistake reported as several, in the terms of a promise the block was already told it may not
-    // make.
-    val before = a.complaints()
     val already = impls_of(a, key.unwrap(), home.key)
     // Asked with **this** block's parameters standing in for the subject's arguments, so a block
     // already filed under them is read in the names this one wrote.
     val mine = stand_in_args(a, scope, home)
 
     for i in 0..<already.len()
-        if supplied_bound(a, already.at(i), key.unwrap(), subject, mine).key() == bound.key() then
+        if supplied_bound(a, already.at(i), key.unwrap(), subject, mine).key() == bound.key()
             a.fault(scope, span, s"'${home.label}' already implements " +
                     s"'${show_bound(a, bound, subject)}'" +
                     second_implementation(key.unwrap(), tr, already.at(i)))
+            return Impl(block, span, scope)
 
     // **A blanket block covering the subject is an implementation the subject already has**, and the
     // list above cannot see it: a blanket is filed under its bound's key rather than under any
@@ -144,6 +150,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
             a.fault(scope, span, s"'${home.label}' already implements '${show_bound(a, bound, subject)}' — " +
                     s"${every_shape(blankets.at(i).0)} does, through one block written over the family" +
                     inherited)
+            return Impl(block, span, scope)
 
     // A shape and a type of that shape written out in full would both implement the trait for that
     // type. By default the second one written is refused, in whichever order the file put them,
@@ -157,16 +164,18 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         if home.shaped()
             val one = a.tables.members.written_shapes.get(impl_key_of(key.unwrap(), h))
 
-            if one.is_some() && !one.unwrap().1 then
+            if one.is_some() && !one.unwrap().1
                 a.fault(scope, span, s"'${one.unwrap().0}' already implements " +
                         s"'${module_show(key.unwrap())}', and this 'impl' would implement it for " +
                         s"${every_shape(h)} — including that one")
+                return Impl(block, span, scope)
         else
-            if !impls_of(a, key.unwrap(), h).is_empty() && !block.overrides then
+            if !impls_of(a, key.unwrap(), h).is_empty() && !block.overrides
                 a.fault(scope, span, s"${every_shape(h)} already implements " +
                         s"'${module_show(key.unwrap())}', so '${home.label}' has an implementation " +
                         "and cannot be given a second one — write 'override impl' to say that " +
                         "replacing it for this one type is what was meant")
+                return Impl(block, span, scope)
 
             a.tables.members.written_shapes.put(impl_key_of(key.unwrap(), h),
                                                 (home.label, block.overrides))
