@@ -896,3 +896,133 @@ im_a_name_only_one_wildcard_has()
 
     assert_eq(im_out(fs), "3\n")
 end im_a_name_only_one_wildcard_has
+
+@test("and two wildcards offering one value are refused the same way, not as an undefined name")
+im_two_wildcards_offering_a_value_are_ambiguous()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import a.*\nimport b.*\nprint(f)"))
+    fs.push(("a", "a.sysl", "module a\nval f: int = 1"))
+    fs.push(("b", "b.sysl", "module b\nval f: int = 2"))
+
+    val said = im_out(fs)
+
+    assert(said.contains("'f' is offered by 'a.*' and 'b.*'"), said)
+end im_two_wildcards_offering_a_value_are_ambiguous
+
+// A constant is asked for before a `val`, each in its own table, so one of each is not a pair.
+@test("while a constant and a val of one spelling are not rivals")
+im_a_const_and_a_val_are_not_rivals()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import a.*\nimport b.*\nprint(f)"))
+    fs.push(("a", "a.sysl", "module a\nconst f: int = 1"))
+    fs.push(("b", "b.sysl", "module b\nval f: int = 2"))
+
+    assert_eq(im_out(fs), "1\n")
+end im_a_const_and_a_val_are_not_rivals
+
+// -- a block's imports are asked before the file's --------------------------------------------------------
+
+// Two modules declaring the same spelling to different effect, so what a program prints says which
+// one a name reached.
+private im_rivals(main: string, a: string, b: string) -> Buf[(string, string, string)]
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    fs.push(("a", "a.sysl", "module a\n" + a))
+    fs.push(("b", "b.sysl", "module b\n" + b))
+    fs
+end im_rivals
+
+@test("a block's wildcard is asked before the name the file imported by name")
+im_a_block_wildcard_beats_a_file_selector()
+    if im_can_run() then return
+
+    val main = "import a.f\nuse() -> int =\n    import b.*\n    f()\nprint(use())"
+
+    assert_eq(im_out(im_rivals(main, "f() -> int = 1", "f() -> int = 2")), "2\n")
+
+@test("and so for a value")
+im_a_block_wildcard_beats_a_file_selector_for_a_value()
+    if im_can_run() then return
+
+    val main = "import a.f\nuse() -> int =\n    import b.*\n    f\nprint(use())"
+
+    assert_eq(im_out(im_rivals(main, "val f: int = 1", "val f: int = 2")), "2\n")
+
+@test("and so for a type")
+im_a_block_wildcard_beats_a_file_selector_for_a_type()
+    if im_can_run() then return
+
+    val main = "import a.T\nuse() -> int =\n    import b.*\n    T(1, 2).m\nprint(use())"
+
+    assert_eq(im_out(im_rivals(main, "struct T\n    n: int", "struct T\n    n: int\n    m: int")),
+              "2\n")
+end im_a_block_wildcard_beats_a_file_selector_for_a_type
+
+@test("a block's wildcard and the file's offering one name are not ambiguous: the block's answers")
+im_a_block_wildcard_beats_a_file_wildcard()
+    if im_can_run() then return
+
+    val main = "import a.*\nuse() -> int =\n    import b.*\n    f\nprint(use())"
+
+    assert_eq(im_out(im_rivals(main, "val f: int = 1", "val f: int = 2")), "2\n")
+
+@test("even where the file's own two wildcards would have been")
+im_a_block_wildcard_settles_the_files_ambiguity()
+    if im_can_run() then return
+
+    val main = "import a.*\nimport b.*\nuse() -> int =\n    import b.*\n    f\nprint(use())"
+
+    assert_eq(im_out(im_rivals(main, "val f: int = 1", "val f: int = 2")), "2\n")
+
+@test("while two wildcards in one block are ambiguous there")
+im_two_wildcards_in_a_block_are_ambiguous()
+    if im_can_run() then return
+
+    val main = "use() -> int =\n    import a.*\n    import b.*\n    f\nprint(use())"
+    val said = im_out(im_rivals(main, "val f: int = 1", "val f: int = 2"))
+
+    assert(said.contains("'f' is offered by 'a.*' and 'b.*'"), said)
+end im_two_wildcards_in_a_block_are_ambiguous
+
+@test("an inner block's wildcard is asked before an outer block's")
+im_an_inner_block_wildcard_beats_an_outer_one()
+    if im_can_run() then return
+
+    val main = "use() -> int =\n    import b.*\n    if true\n        import a.*\n        return f\n" +
+               "    f\nprint(use())"
+
+    assert_eq(im_out(im_rivals(main, "val f: int = 1", "val f: int = 2")), "1\n")
+end im_an_inner_block_wildcard_beats_an_outer_one
+
+@test("and a block's selector beats the file's wildcard")
+im_a_block_selector_beats_a_file_wildcard()
+    if im_can_run() then return
+
+    val main = "import a.*\nuse() -> int =\n    import b.f\n    f\nprint(use())"
+
+    assert_eq(im_out(im_rivals(main, "val f: int = 1", "val f: int = 2")), "2\n")
+
+@test("while this module's own declaration still beats a block's import")
+im_this_module_beats_a_block_import()
+    if im_can_run() then return
+
+    val main = "val f: int = 7\nuse() -> int =\n    import b.*\n    f\nprint(use())"
+
+    assert_eq(im_out(im_rivals(main, "val f: int = 1", "val f: int = 2")), "7\n")
+
+@test("and the file's imports answer again once the block closes")
+im_the_files_imports_answer_after_the_block()
+    if im_can_run() then return
+
+    val main = "import a.f\nuse() -> int =\n    if true\n        import b.*\n        print(f)\n    f\n" +
+               "print(use())"
+
+    assert_eq(im_out(im_rivals(main, "val f: int = 1", "val f: int = 2")), "2\n1\n")
+end im_the_files_imports_answer_after_the_block

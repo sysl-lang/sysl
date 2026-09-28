@@ -392,15 +392,27 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
 
     if ck.is_some() then return const_expr(cx, span, ck.unwrap())
 
+    val c_rivals = ambiguous_value(cx, span, a_consts(cx), name)
+
+    if c_rivals.is_some() then return c_rivals.unwrap()
+
     // A `val` is the other half of that: nothing is folded, because it is storage.
     val vk = lookup_value_key(cx, a_vals(cx), name)
 
     if vk.is_some() then
         return global_expr(cx, span, vk.unwrap(), a_vals(cx), writable_key(cx, vk.unwrap()))
 
+    val v_rivals = ambiguous_value(cx, span, a_vals(cx), name)
+
+    if v_rivals.is_some() then return v_rivals.unwrap()
+
     // An `extern` variable is storage too, and writable: what it names is what the linker supplies,
     // so the storage is not this program's to promise anything about.
     val ek = lookup_value_key(cx, a_extern_vars(cx), name)
+
+    val e_rivals = if ek.is_some() then None else ambiguous_value(cx, span, a_extern_vars(cx), name)
+
+    if e_rivals.is_some() then return e_rivals.unwrap()
 
     if ek.is_some()
         // Storage the linker supplies is **declared** rather than laid down, and only what a body
@@ -502,7 +514,9 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
 
     // **The reader's own module beats an import of the same name**, and a name imported by name beats
     // one a wildcard merely offers -- of which two offering the spelling is an ambiguity, not a pick.
-    val bound = cx.scope.imports.name_key(name)
+    // Each is asked of the innermost level of imports that answers, a block's before the file's.
+    val im = answering_imports(cx.an, cx.scope, name, k -> from.has(k))
+    val bound = im.name_key(name)
 
     if bound.is_some() && from.has(bound.unwrap()) then return bound
 
@@ -510,8 +524,8 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
 
     var found: Option[string] = None
 
-    for i in 0..<cx.scope.imports.wildcards.len()
-        val key = module_qualify(cx.scope.imports.wildcards.at(i), name)
+    for i in 0..<im.wildcards.len()
+        val key = module_qualify(im.wildcards.at(i), name)
 
         if found.is_none() && from.has(key) && reachable_key(cx.an, key, cx.scope) then
             found = Some(key)
@@ -520,6 +534,16 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
 
     found
 end value_key_of
+
+// **Two wildcards offering one spelling in a table of storage refuse the use and name both**, as a
+// call's and a type's do, where falling through would report the name as undefined -- which the
+// reader has plainly defined twice.
+private ambiguous_value(cx: &Analyzer, span: Span, from: &Table[ValueDecl],
+                        name: string) -> Option[TExpr]
+    val rivals = offered_by(cx.an, cx.scope, name, k -> from.has(k))
+
+    if rivals.len() > 1 then Some(cx.err(span, ambiguous_offer(name, rivals))) else None
+end ambiguous_value
 
 // The type a declaration of storage was written at.
 value_type(cx: &Analyzer, d: ValueDecl) -> Type =
