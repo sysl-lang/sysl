@@ -1378,6 +1378,10 @@ end instantiate_named_subtype
 private range_end(a: &Analysis, scope: Scope, e: Expr) -> Option[Decimal]
     *e.kind match
         FloatLit(text, _) -> return decimal_parse(text)
+        // `-0.5` is a negation of a float literal rather than a literal, and folding knows no floats.
+        Unary(op, operand) -> *operand.kind match
+            FloatLit(text, _) -> if op == "-" then return decimal_parse(text).map((d) -> -d)
+            _ -> ()
         _ -> ()
 
     val cx = analyzer_for(a, scope)
@@ -1386,8 +1390,10 @@ private range_end(a: &Analysis, scope: Scope, e: Expr) -> Option[Decimal]
 
     a.restore_complaints(mark)
 
+    // A `char` range is a range over code points, so its ends are the numbers the characters are.
     folded match
         Some(ConstInt(n)) -> Some(decimal_of(n, 0))
+        Some(ConstChar(c)) -> Some(decimal_of(from_int(long(u32(c))), 0))
         _ -> None
 end range_end
 

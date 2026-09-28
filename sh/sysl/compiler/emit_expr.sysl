@@ -871,8 +871,25 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
             val base = underlying(d.base)
 
             base match
-                Floating(_, _) ->
-                    if d.lo.is_some() || d.hi.is_some() then gap_here(e, "a float range check")
+                // A float range is compared at `double` whatever the width, the ends being `double`
+                // constants: a narrower value is widened first, which is exact.
+                Floating(bits, _) ->
+                    val wide = real_type()
+                    val x = if bits == 64 then v else cast_to(e, CastFPExt, base, wide, v)
+
+                    d.lo match
+                        Some(lo) ->
+                            trap_unless(e, compare_value(e, ">=", wide, x, VFloat(double_bits(str(lo)))),
+                                        "within")
+                        None -> ()
+
+                    d.hi match
+                        Some(hi) ->
+                            val op = if d.exclusive_hi then "<" else "<="
+
+                            trap_unless(e, compare_value(e, op, wide, x, VFloat(double_bits(str(hi)))),
+                                        "within")
+                        None -> ()
                 _ ->
                     d.lo match
                         Some(lo) ->
