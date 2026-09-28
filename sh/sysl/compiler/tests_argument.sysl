@@ -1,0 +1,993 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A parameter's default value, and an argument written at the parameter it names
+// (`reference/declarations.md § Default parameters and named arguments`). The two are one question
+// -- what a call may leave to the declaration -- and both are settled before any call form looks at
+// its arguments, so what the arity check, the generic solve and the emitter receive is the call
+// written out in full. Most of these are RUNS for that reason: a default really evaluated per call,
+// a name really reaching the parameter it names, are claims about what a program means.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `ArgumentTests` these
+// are.
+
+private var arg_library_cache: Buf[Program] = buf()
+private var arg_library_read: bool = false
+
+private arg_library() -> Buf[Program]
+    if arg_library_read then return arg_library_cache
+
+    arg_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> arg_library_cache = units
+
+    arg_library_cache
+end arg_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private arg_ready() -> bool
+    if arg_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end arg_ready
+
+private arg_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// Builds what `root` holds and runs it: what it printed, and whether it exited cleanly.
+private arg_build_run(root: string, entry: string) -> (string, bool)
+    val exe = s"$root/built"
+
+    build_native_program(entry, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text, out.status.ok())
+end arg_build_run
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private arg_ran(text: string) -> string
+    val root = make_temp_dir("sysl-argument").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    arg_build_run(root, s"$root/main.sysl").0
+
+// What a program of two files prints: module `name` in a directory of its own, beside the beginning.
+private arg_ran_of(name: string, module_text: string, main_text: string) -> string
+    val root = make_temp_dir("sysl-argument").unwrap()
+
+    make_dir_all(s"$root/$name").unwrap()
+    write_text(s"$root/$name/$name.sysl", module_text).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+
+    arg_build_run(root, root).0
+
+// Whether a program that compiles exits cleanly.
+private arg_exits_cleanly(text: string) -> bool
+    val root = make_temp_dir("sysl-argument").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    arg_build_run(root, s"$root/main.sysl").1
+
+// Everything a source has to say for itself, taken through the lowering, so a refusal a pass after
+// the analysis makes is one of these too.
+private arg_err(text: string) -> string
+    val root = make_temp_dir("sysl-argument").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end arg_err
+
+// The same, for a program of two files: module `lib` in a directory of its own, beside the beginning.
+private arg_err_of(module_text: string, main_text: string) -> string
+    val root = make_temp_dir("sysl-argument").unwrap()
+
+    make_dir_all(s"$root/lib").unwrap()
+    write_text(s"$root/lib/lib.sysl", module_text).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end arg_err_of
+
+private arg_refuses(text: string, part: string)
+    val said = arg_err(text)
+
+    assert(arg_says(said, part), s"expected '$part', got: $said")
+
+private arg_refuses_of(module_text: string, main_text: string, part: string)
+    val said = arg_err_of(module_text, main_text)
+
+    assert(arg_says(said, part), s"expected '$part', got: $said")
+
+// -- a default value ------------------------------------------------------------------------------
+
+@test("a default value stands where the argument was not written")
+arg_stands_where_not_written()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        greet(name: string, greeting: string = "hi") -> string = greeting + ", " + name
+        print(greet("ed"))
+        """), "hi, ed\n")
+
+@test("a default value steps aside where the argument was written")
+arg_steps_aside()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        greet(name: string, greeting: string = "hi") -> string = greeting + ", " + name
+        print(greet("ed", "hello"))
+        """), "hello, ed\n")
+
+// Three different values, so a fill that took the wrong one shows up.
+@test("defaults fill from the right, however many the call stops short of")
+arg_fills_from_the_right()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        f(a: int, b: int = 20, c: int = 300) -> int = a + b + c
+        print(f(1))
+        print(f(1, 2))
+        print(f(1, 2, 3))
+        """), "321\n303\n6\n")
+
+// A fresh call per call site rather than one value computed once and shared: counted by defaulting
+// to something with a side effect.
+@test("a default is an expression evaluated at each call, not one value shared between them")
+arg_evaluated_at_each_call()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        grow(b: &Buf[int] = buf()) -> usize
+            b.push(1)
+            b.len()
+
+        var shared: &Buf[int] = buf()
+
+        print(grow())
+        print(grow())
+        print(grow(shared))
+        print(grow(shared))
+        """), "1\n1\n1\n2\n")
+
+@test("a default may name a module-level value the caller has never heard of")
+arg_names_a_module_value()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran_of("conf", raw"""
+        module conf
+
+        val width: int = 40
+
+        indent(depth: int, w: int = width) -> int = depth * w
+        """, raw"""
+        import conf.indent
+
+        print(indent(2))
+        """), "80\n")
+
+@test("a default reaches a method")
+arg_default_reaches_a_method()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        struct Box
+            n: int
+
+            grown(self, by: int = 10) -> int = self.n + by
+        end Box
+
+        var b = Box(5)
+        print(b.grown())
+        print(b.grown(1))
+        """), "15\n6\n")
+
+// A default is written in the declaration's terms, and the parameter's own type is the first of
+// them: `None` says what it is `None` *of* only because the parameter tells it.
+@test("a default is read at the parameter's type on a method, so a nullary variant needs no annotation")
+arg_read_at_the_type_on_a_method()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        struct Box
+            n: int
+
+            grown(self, by: Option[int] = None) -> int = by match
+                Some(k) -> self.n + k
+                None -> self.n
+        end Box
+
+        var b = Box(5)
+        print(b.grown())
+        print(b.grown(Some(4)))
+        """), "5\n9\n")
+
+// The receiverless kind has no `self` in front of its lowered parameters, which is the offset the
+// expected type is read at.
+@test("a default is read at the parameter's type on an associated function, which has no receiver in front")
+arg_read_at_the_type_on_an_associated_function()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        struct Box
+            n: int
+
+            of(first: Option[int] = None, base: int = 2) -> Box = first match
+                Some(k) -> Box(k + base)
+                None -> Box(base)
+        end Box
+
+        print(Box.of().n)
+        print(Box.of(Some(40)).n)
+        """), "2\n42\n")
+
+@test("a default reaches an associated function")
+arg_default_reaches_an_associated_function()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        struct Box
+            n: int
+
+            of(n: int = 7) -> Box = Box(n)
+        end Box
+
+        print(Box.of().n)
+        print(Box.of(2).n)
+        """), "7\n2\n")
+
+@test("a default reaches a nested function")
+arg_default_reaches_a_nested_function()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        work(base: int) -> int
+            step(n: int, by: int = 4) -> int = n + by
+            step(base) + step(base, 1)
+
+        print(work(1))
+        """), "7\n")
+
+@test("a default reaches an 'extern', whose parameter names are sysl's to choose")
+arg_default_reaches_an_extern()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        extern abs(n: i32 = -5i32) -> i32
+        print(abs())
+        print(abs(-7i32))
+        """), "5\n7\n")
+
+@test("a default reaches a generic function, at the type the call fixes")
+arg_default_reaches_a_generic_function()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        second[T](a: T, b: T, take_first: bool = false) -> T = if take_first then a else b
+        print(second(1, 2))
+        print(second("x", "y", true))
+        """), "2\nx\n")
+
+// The bare arrow is a bounded type parameter, so what says what `y` is here is the bound.
+@test("a default may be a closure literal at a parameter written with the bare arrow")
+arg_closure_default_at_a_bare_arrow()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        apply(g: int -> int = y -> y * 2) -> int = g(21)
+        print(apply())
+        print(apply(x -> x + 1))
+        """), "42\n22\n")
+
+@test("a closure default at a boxed callable, which a call fills rather than the declaration")
+arg_closure_default_at_a_boxed_callable()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        apply(g: &Fn(int) -> int = y -> y * 2) -> int = g(21)
+        print(apply())
+        print(apply(x -> x + 1))
+        """), "42\n22\n")
+
+@test("a closure default may be written with the placeholder")
+arg_closure_default_with_the_placeholder()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        apply(g: int -> int = _ * 2) -> int = g(21)
+        print(apply())
+        """), "42\n")
+
+// Nothing calls `apply`, so a closure held to nothing would have been checked by nobody.
+@test("a closure default that takes the wrong number of parameters is refused where it stands")
+arg_closure_default_of_the_wrong_arity()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        apply(g: int -> int = (a: int, b: int) -> a + b) -> int = 1
+        print(1)
+        """, "this closure takes 2 parameters, and what it is being used as takes 1")
+
+// -- a trait's default -----------------------------------------------------------------------------
+
+// Filled before the dispatch, so it means the same through an object as through a known type.
+@test("a trait's default is the same value through a trait object as through a known type")
+arg_trait_default_through_an_object()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        trait Volume
+            loud(self, times: int = 3) -> int
+
+        struct Horn
+            n: int
+
+        impl Volume for Horn
+            loud(self, times: int) -> int = self.n * times
+
+        shout(v: &Volume) -> int = v.loud()
+
+        var h = Horn(2)
+        var boxed: &Volume = Horn(2)
+        print(h.loud())
+        print(shout(boxed))
+        """), "6\n6\n")
+
+@test("an 'impl' block's member declares no default of its own")
+arg_impl_member_declares_no_default()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        trait Volume
+            loud(self, times: int) -> int
+
+        struct Horn
+            n: int
+
+        impl Volume for Horn
+            loud(self, times: int = 3) -> int = self.n * times
+
+        print(Horn(2).loud(1))
+        """, "a member of an 'impl' block declares no default — a call through a trait object holds " +
+            "something that has forgotten which type it is, so there is no implementation to read one " +
+            "off. Declare it on trait 'Volume', where every implementation shares it")
+
+// -- what a default may not be ---------------------------------------------------------------------
+
+@test("a parameter with no default may not come after one that has")
+arg_no_default_after_a_default()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f(a: int = 1, b: int) -> int = a + b
+        print(f(1, 2))
+        """, "'b' has no default and comes after 'a', which has one — a call writes its arguments in " +
+            "order, so nothing could leave out 'a' and still supply 'b'")
+
+// C reads the tail relative to the last named argument.
+@test("a variadic parameter list declares no default")
+arg_variadic_declares_no_default()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f(a: int, b: int = 2, ...) -> int = a
+        print(f(1))
+        """, "f takes a '...', and a parameter list with a tail declares no default — where the tail " +
+            "begins would then depend on how many arguments a call chose to write")
+
+@test("a default may not name another parameter")
+arg_default_may_not_name_a_parameter()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f(n: int, m: int = n) -> int = n + m
+        print(f(1))
+        """, "undefined name 'n'")
+
+// Without an emptied local scope this would read the caller's `n`, which is 100 and not 1.
+@test("a default may not find a caller's local of that name either")
+arg_default_may_not_find_a_callers_local()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f(m: int = n) -> int = m
+
+        go() -> int
+            var n = 100
+            f()
+
+        print(go())
+        """, "undefined name 'n'")
+
+// Nothing calls `f`, and the mistake is still reported.
+@test("a default that is not the parameter's type is refused where it is written")
+arg_default_of_the_wrong_type()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f(s: string = 3) -> string = s
+        print(1)
+        """, "the default for 's' is int, and the parameter is string")
+
+@test("a method's default of the wrong type is refused there too, at the type its parameter declares")
+arg_method_default_of_the_wrong_type()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        struct Box
+            n: int
+
+            grown(self, by: string = 3) -> int = self.n
+        end Box
+
+        print(1)
+        """, "the default for 'by' is int, and the parameter is string")
+
+@test("a public declaration's default may not name something that reaches less far")
+arg_public_default_may_not_leak()
+    if !arg_ready() then return
+
+    arg_refuses_of(raw"""
+        module lib
+
+        private secret() -> int = 7
+
+        f(n: int = secret()) -> int = n
+        """, raw"""
+        import lib.f
+
+        print(f())
+        """, "the default for 'n' names 'lib.secret', which does not reach as far as lib.f does — a " +
+            "caller that leaves the argument out would be given something they could not have written")
+
+// The control: without it the test above would pass for a rule that refused every default.
+@test("a private default naming a private declaration is no leak")
+arg_private_default_is_no_leak()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran_of("lib", raw"""
+        module lib
+
+        private secret() -> int = 7
+
+        private f(n: int = secret()) -> int = n
+
+        show() -> int = f()
+        """, raw"""
+        import lib.show
+
+        print(show())
+        """), "7\n")
+
+@test("a closure's parameter declares no default, the program's refusal")
+arg_closure_parameter_declares_no_default()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        var f: &Fn(int) -> int = (x: int = 1) -> x
+        print(f(2))
+        """, "a closure's parameter declares no default — a call reaches a closure through 'Fn', which " +
+            "carries the types and not the names, so there would be nothing at the call to fill one " +
+            "from. Give the value a name of its own and capture it")
+
+@test("a field declares no default, the program's refusal")
+arg_field_declares_no_default()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        struct Point
+            x: int = 0
+            y: int
+        end Point
+
+        print(Point(1, 2).x)
+        """, "a field declares no default — what an unwritten field gets is decided by the constructor " +
+            "that builds the value, not by the field")
+
+// -- an argument written by name -------------------------------------------------------------------
+
+@test("a named argument reaches the parameter it names rather than the one at its position")
+arg_name_reaches_the_parameter_it_names()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        div(top: int, bottom: int) -> int = top / bottom
+        print(div(bottom = 2, top = 10))
+        """), "5\n")
+
+@test("a named argument may follow positional arguments")
+arg_name_may_follow_positionals()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        clamp(v: int, lo: int, hi: int) -> int = if v < lo then lo else if v > hi then hi else v
+        print(clamp(50, hi = 10, lo = 0))
+        """), "10\n")
+
+@test("a name is what lets a call skip a default and still write what comes after it")
+arg_name_skips_a_default()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        f(a: int, b: int = 20, c: int = 300) -> int = a + b + c
+        print(f(1, c = 3))
+        """), "24\n")
+
+@test("a named argument reaches a struct's constructor, whose fields are its parameters")
+arg_name_reaches_a_constructor()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        end Point
+
+        var p = Point(y = 2, x = 1)
+        print(p.x)
+        print(p.y)
+        """), "1\n2\n")
+
+@test("a named argument reaches an enum variant's payload")
+arg_name_reaches_a_variant_payload()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        enum Shape
+            Rect(w: int, h: int)
+
+        area(s: Shape) -> int
+            s match
+                Rect(w, h) -> w * h
+
+        print(area(Rect(h = 2, w = 30)))
+        """), "60\n")
+
+@test("a named argument reaches a method")
+arg_name_reaches_a_method()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        struct Span
+            n: int
+
+            between(self, lo: int, hi: int) -> int = self.n + hi - lo
+        end Span
+
+        print(Span(5).between(hi = 30, lo = 10))
+        """), "25\n")
+
+// -- what a name at a call may not do --------------------------------------------------------------
+
+@test("a positional argument may not come after a named one")
+arg_name_before_a_positional()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f(a: int, b: int) -> int = a + b
+        print(f(a = 1, 2))
+        """, "this argument comes after one written by name, so there is no position left for it to " +
+            "stand at — give it its parameter's name too")
+
+@test("a name may not name a parameter the declaration does not have")
+arg_name_of_no_parameter()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f(a: int, b: int) -> int = a + b
+        print(f(a = 1, c = 2))
+        """, "function 'f' declares no parameter named 'c' — it takes 'a' and 'b'")
+
+@test("a name may not name one parameter twice")
+arg_name_given_twice()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f(a: int, b: int) -> int = a + b
+        print(f(a = 1, a = 2))
+        """, "'a' is given twice")
+
+@test("a name may not name one a positional argument already filled")
+arg_name_already_given_by_position()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f(a: int, b: int) -> int = a + b
+        print(f(1, a = 2))
+        """, "'a' was already given by position, so this is a second value for one parameter")
+
+// A call through a `&Fn` carries types and no names.
+@test("a name may not be written at a call through a callable, which carries no names")
+arg_name_through_a_callable()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        apply(f: &Fn(int) -> int) -> int = f(n = 1)
+
+        var c: &Fn(int) -> int = x -> x + 1
+        print(apply(c))
+        """, "'n = …' names an argument, and this is not a call to a declaration that names its " +
+            "parameters — write the value on its own, or '(n = …)' for the assignment")
+
+@test("a name may not be written at a call through a function's address")
+arg_name_through_an_address()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        double(n: int) -> int = n * 2
+
+        var f: *extern(int) -> int = &double
+        print(f(n = 5))
+        """, "'n = …' names an argument, and this is not a call to a declaration that names its " +
+            "parameters — write the value on its own, or '(n = …)' for the assignment")
+
+// -- the collision with assignment ------------------------------------------------------------------
+
+@test("the collision with assignment is decided for the named argument")
+arg_collision_decided_for_the_name()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        f(x: int) -> int = x * 10
+        var x = 7
+        print(f(x = 1))
+        print(x)
+        """), "10\n7\n")
+
+@test("parentheses still say the store was meant")
+arg_parentheses_say_the_store()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        f(x: int) -> int = x * 10
+        var x = 7
+        print(f((x = 1)))
+        print(x)
+        """), "10\n1\n")
+
+// Only a bare identifier before `=` is a name.
+@test("a store through a field or an element at a call is untouched")
+arg_store_through_a_field_untouched()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        struct Cell
+            v: int
+        end Cell
+
+        f(n: int) -> int = n
+        var c = Cell(0)
+        print(f(c.v = 5))
+        print(c.v)
+        """), "5\n5\n")
+
+// -- the corners -----------------------------------------------------------------------------------
+
+// The reference's own case names its function `loop`, which is a keyword now, so what it reports
+// there is the parse error below; the claim it was written for is the second half.
+@test("a default that calls its own declaration is refused rather than recursed into")
+arg_default_calling_itself()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        loop(n: int = loop()) -> int = n
+        print(loop())
+        """, "newline expected")
+    arg_refuses(raw"""
+        again(n: int = again()) -> int = n
+        print(again())
+        """, "filling this default calls something that asks for it again — a default cannot stand " +
+            "in for an argument that is still being worked out")
+
+@test("a default that reaches itself through a second declaration is refused too")
+arg_default_reaching_itself_through_another()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        ping(n: int = pong()) -> int = n
+        pong(n: int = ping()) -> int = n
+        print(ping())
+        """, "filling this default calls something that asks for it again — a default cannot stand " +
+            "in for an argument that is still being worked out")
+
+// Inference sees the arguments in declared order, not written order.
+@test("a name reorders the arguments before inference reads them")
+arg_name_reorders_before_inference()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        pair[T](first: T, second: T) -> T = first
+        print(pair(second = 1, first = 2))
+        print(pair(second = "b", first = "a"))
+        """), "2\na\n")
+
+@test("a type parameter's default and a value parameter's meet without interfering")
+arg_type_and_value_defaults_meet()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        struct Pair[A, B = A]
+            x: A
+            y: B
+
+        first[A, B](p: Pair[A, B], fallback: A = 0) -> A = p.x
+
+        var p: Pair[int] = Pair(y = 2, x = 1)
+        print(first(p))
+        """), "1\n")
+
+@test("a default may itself be a call written with a name")
+arg_default_is_a_named_call()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        span(lo: int, hi: int) -> int = hi - lo
+        width(n: int = span(hi = 10, lo = 4)) -> int = n
+        print(width())
+        print(width(1))
+        """), "6\n1\n")
+
+@test("a default may name a constant")
+arg_default_names_a_constant()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        const limit: int = 9
+        cap(n: int = limit) -> int = n
+        print(cap())
+        """), "9\n")
+
+@test("a declaration with no parameters says so when given a name")
+arg_no_parameters_given_a_name()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f() -> int = 1
+        print(f(a = 1))
+        """, "function 'f' declares no parameter named 'a'")
+
+@test("a named argument takes a trailing comma like any other")
+arg_named_argument_trailing_comma()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        f(a: int, b: int) -> int = a * b
+        print(f(b = 2, a = 3,))
+        """), "6\n")
+
+@test("a nested function takes a name as well as a default")
+arg_nested_function_takes_a_name()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        work(base: int) -> int
+            step(n: int, by: int) -> int = n * 10 + by
+            step(by = 3, n = base)
+
+        print(work(1))
+        """), "13\n")
+
+// A zero-sized parameter is dropped from the emitted signature, so its default is filled and then
+// has nothing left of it.
+@test("a default of a zero-sized type is filled and then emitted as nothing")
+arg_zero_sized_default()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        nothing() -> unit
+            var ignored = 1
+
+        f(u: unit = nothing(), n: int = 4) -> int = n
+        print(f())
+        """), "4\n")
+
+@test("one default may not name the parameter another fills")
+arg_default_names_another_default()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        f(a: int = 1, b: int = a) -> int = a + b
+        print(f())
+        """, "undefined name 'a'")
+
+@test("a variadic method declares no default either, not only a free function")
+arg_variadic_method_declares_no_default()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        struct Log
+            n: int
+
+            say(self, first: int, rest: int = 0, ...) -> int = first
+
+        print(Log(1).say(2))
+        """, "Log.say takes a '...', and a parameter list with a tail declares no default — where the " +
+            "tail begins would then depend on how many arguments a call chose to write")
+
+@test("a member's default is held to the same reach its type is")
+arg_member_default_may_not_leak()
+    if !arg_ready() then return
+
+    arg_refuses_of(raw"""
+        module lib
+
+        private secret() -> int = 7
+
+        struct Box
+            n: int
+
+            grown(self, by: int = secret()) -> int = self.n + by
+        """, raw"""
+        import lib.Box
+
+        print(Box(1).grown())
+        """, "the default for 'by' names 'lib.secret', which does not reach as far as lib.Box.grown " +
+            "does — a caller that leaves the argument out would be given something they could not " +
+            "have written")
+
+// -- what the neighbouring rules say once a name reaches a constructor -----------------------------
+
+// The path in the middle of the message is the temporary directory's.
+@test("a private field still puts the constructor out of reach of a named call")
+arg_private_field_constructor_by_name()
+    if !arg_ready() then return
+
+    val said = arg_err_of(raw"""
+        module lib
+
+        struct Point
+            private x: int
+            y: int
+        """, raw"""
+        import lib.Point
+
+        print(Point(y = 2, x = 1).y)
+        """)
+
+    assert(arg_says(said, "the constructor names every field of 'lib.Point' in order, and 'x' is private to '"), said)
+    assert(arg_says(said, "lib/lib.sysl', the file that declares it — build it through an associated function of its own"), said)
+
+@test("an invariant is still checked when the fields arrive out of order")
+arg_invariant_checked_out_of_order()
+    if !arg_ready() then return
+
+    val text = raw"""
+        struct Span
+            lo: int
+            hi: int
+            invariant lo <= hi
+
+        var s = Span(hi = 1, lo = 9)
+        print(s.lo)
+        """
+
+    // It compiles, so the stop below is the invariant's and not a refusal's.
+    assert_eq(arg_err(text), "")
+    assert(!arg_exits_cleanly(text), "a broken invariant must stop the program")
+
+@test("the same fields in a satisfying order build")
+arg_invariant_satisfied_out_of_order()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        struct Span
+            lo: int
+            hi: int
+            invariant lo <= hi
+
+        var s = Span(hi = 9, lo = 1)
+        print(s.hi - s.lo)
+        """), "8\n")
+
+@test("a variadic call may name its declared parameters only while it writes no tail")
+arg_variadic_call_names_without_a_tail()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        first(a: int, ...) -> int = a
+        print(first(a = 5))
+        """), "5\n")
+    arg_refuses(raw"""
+        first(a: int, ...) -> int = a
+        print(first(a = 5, 6))
+        """, "this argument comes after one written by name, so there is no position left for it to " +
+            "stand at — give it its parameter's name too")
+
+@test("a module-level 'val' may be built by a call that takes a default")
+arg_module_val_built_by_a_default()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        origin(x: int = 3, y: int = 4) -> int = x * 10 + y
+
+        val here: int = origin(y = 9)
+        print(here)
+        """), "39\n")
+
+@test("a trait's default body and its parameter default are copied together")
+arg_trait_default_body_and_parameter_default()
+    if !arg_ready() then return
+
+    assert_eq(arg_ran(raw"""
+        trait Step
+            size(self) -> int
+            walk(self, times: int = 2) -> int = self.size() * times
+
+        struct Foot
+            n: int
+
+        impl Step for Foot
+            size(self) -> int = self.n
+
+        print(Foot(3).walk())
+        print(Foot(3).walk(5))
+        """), "6\n15\n")
+
+@test("a '@test' function's parameter is refused even carrying a default")
+arg_test_function_parameter_with_a_default()
+    if !arg_ready() then return
+
+    arg_refuses(raw"""
+        @test
+        works(n: int = 7) -> unit
+            assert(n == 7, "n")
+        """, "a '@test' function takes no parameters, and 'works' takes one — 'sysl test' calls it " +
+            "with nothing, so there is nowhere for an argument to come from")
+
+// -- the shapes the parser reads -------------------------------------------------------------------
+
+@test("a default is held on the parameter it was written after")
+arg_default_held_on_its_parameter()
+    assert_eq(pf("f(a: int, b: int = 2) -> int\n    a\n"), "(fn f (a:int b:int=2) -> int a)")
+
+@test("a named argument is a node of its own, not an assignment")
+arg_named_argument_is_its_own_node()
+    assert_eq(pf("f(a = 1)\n"), "(call f (named a 1))")
+
+@test("a parenthesized named argument is still the assignment it reads as")
+arg_parenthesized_is_an_assignment()
+    assert_eq(pf("f((a = 1))\n"), "(call f (= a 1))")

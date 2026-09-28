@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
-import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
 
 // A parameter's default, read where it is **written**.
 //
@@ -13,29 +13,88 @@ import sysl.buf.{Buf, buf}
 // **A closure written as a default is lowered here**, which is the visible half of this: the number
 // inside a closure's name is the order the compilation lowered them in, and a default read only at
 // the calls that took it would number every closure after it by how many calls there happened to be.
+//
+// **The shape rules -- a suffix, no variadic -- are checked first**, because each makes the parameter
+// list unreadable rather than a default wrong. An `impl` block's own defaults are refused where the
+// block is hoisted (`hoist_impl.sysl`).
 check_value_defaults(a: &Analysis)
     for i in 0..<a.tables.funcs.len()
+        val key = a.tables.funcs.key_at(i)
         val f = a.tables.funcs.at(i)
+        val shown = module_show(key)
 
-        read_defaults(a, f.scope, f.decl.tparams, f.decl.bounds, f.decl.tvalues, f.decl.tpacks,
-                      f.decl.params)
+        check_default_shape(a, f.scope, shown, f.decl.params, f.decl.variadic)
+        read_defaults(a, f.scope, shown, a.tables.access.get(key), f.decl.tparams, f.decl.bounds,
+                      f.decl.tvalues, f.decl.tpacks, f.decl.params)
 
     val lowered = a.tables.members.lowered
 
+    // A member is held to its **type's** reach, the way a member's signature is.
     for i in 0..<lowered.len()
         val m = lowered.at(i)
         val home = a.tables.members.decl_scope.get(m.name)
+        val shown = module_show(m.name)
 
-        if home.is_some() then
-            read_defaults(a, home.unwrap(), m.tparams, m.bounds, m.tvalues, m.tpacks, m.params)
+        if home.is_some()
+            check_default_shape(a, home.unwrap(), shown, m.params, m.variadic)
+            read_defaults(a, home.unwrap(), shown, a.tables.access.get(member_owner(m.name)),
+                          m.tparams, m.bounds, m.tvalues, m.tpacks, m.params)
+        end if
+end check_value_defaults
+
+// The type a lowered member belongs to: its name up to the last dot.
+private member_owner(name: string) -> string
+    val bytes = name.bytes
+    var i = bytes.len
+
+    while i > 0
+        i -= 1
+        if bytes[i] == u8('.') then return from_utf8_unchecked(bytes[0..<i])
+
+    name
+end member_owner
+
+// What a parameter list has to be for a default in it to mean one thing.
+//
+// C reads a variadic call's tail relative to the last named argument (`reference/ffi.md § Variadic
+// functions`), so an argument that might be the last declared parameter or the first of the tail
+// leaves nowhere for the tail to begin. And a call writes its arguments in order, so a parameter with
+// no default after one that has could never be supplied while the earlier one was left out.
+private check_default_shape(a: &Analysis, scope: Scope, shown: string, params: Buf[Param],
+                            variadic: bool)
+    var first: int = -1
+
+    for i in 0..<params.len()
+        if first < 0 && params.at(i).default.is_some() then first = int(i)
+
+    if first < 0 then return
+
+    val p0 = params.at(usize(first))
+
+    if variadic
+        a.fault(scope, p0.default.unwrap().span, s"$shown takes a '...', and a parameter list with " +
+                "a tail declares no default — where the tail begins would then depend on how many " +
+                "arguments a call chose to write")
+        return
+    end if
+
+    for i in usize(first) + 1..<params.len()
+        val p = params.at(i)
+
+        if p.default.is_none() then
+            a.fault(scope, p.span, s"'${p.name}' has no default and comes after '${p0.name}', which " +
+                    s"has one — a call writes its arguments in order, so nothing could leave out " +
+                    s"'${p0.name}' and still supply '${p.name}'")
+end check_default_shape
 
 // One parameter list's defaults, each at the type its parameter was declared with.
 //
 // The parameters stand in for themselves where the declaration is generic, which is the same reading
 // its signature was resolved against: a default written at a type parameter is held to what the
 // bound promises and to nothing more.
-private read_defaults(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: Buf[NamedBounds],
-                      tvalues: Buf[TypeBinding], tpacks: Buf[string], params: Buf[Param])
+private read_defaults(a: &Analysis, scope: Scope, shown: string, reach: Option[Access],
+                      tparams: Buf[string], bounds: Buf[NamedBounds], tvalues: Buf[TypeBinding],
+                      tpacks: Buf[string], params: Buf[Param])
     var any = false
 
     for i in 0..<params.len()
@@ -74,8 +133,47 @@ private read_defaults(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: 
         val structs = a.tables.struct_insts.len()
         val enums = a.tables.enum_insts.len()
         val constrained = a.tables.constrained_insts.len()
+        val d = p.default.unwrap()
+        val t = type_expr(cx, d, Some(want))
 
-        type_expr(cx, p.default.unwrap(), Some(want))
+        // **Asked only of a parameter whose type is settled here.** Where a type parameter stands
+        // for itself the two sides are not comparable: a closure default at a `$F0` yields the
+        // struct that closure became, which is what an instantiation *solves* `$F0` to.
+        if !mentions_abstract(want) && disagree(texpr_type(t), want) then
+            a.fault(scope, d.span, s"the default for '${p.name}' is ${type_show(texpr_type(t))}, " +
+                    s"and the parameter is ${type_show(want)}")
+
+        if reach.is_some() then exposed_default(a, scope, shown, reach.unwrap(), p.name, t)
 
         a.release(trial)
         rewind_instantiations(a, queued, tables, structs, enums, constrained)
+end read_defaults
+
+// A default is the one part of a signature a call does not write, so what it names has to reach as
+// far as the declaration does (`reference/modules.md § Visibility`) -- otherwise a caller who leaves
+// the argument out has had a call made on their behalf that they could neither have written nor
+// can see. Only what the default names **directly** is asked about: what a function it calls does
+// inside itself is that function's business.
+private exposed_default(a: &Analysis, scope: Scope, shown: string, mine: Access, param: string,
+                        t: TExpr)
+    // A file-private declaration is read in one file, and everything its default names is visible
+    // there or the default would not have resolved.
+    mine.vis match
+        File -> return
+        _ -> ()
+
+    val calls = refs_of_expr(t).calls
+    var said: Buf[string] = buf()
+
+    for i in 0..<calls.len()
+        val named = calls.at(i)
+        val acc = a.tables.access.get(named)
+
+        if acc.is_some() && !holds_string(said, named) &&
+                !reaches_as_far(mine.vis, mine.module_name, acc.unwrap())
+            said.push(named)
+            a.fault(scope, t.span, s"the default for '$param' names '${module_show(named)}', which " +
+                    s"does not reach as far as $shown does — a caller that leaves the argument out " +
+                    "would be given something they could not have written")
+        end if
+end exposed_default
