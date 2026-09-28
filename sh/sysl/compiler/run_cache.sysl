@@ -25,6 +25,8 @@ import sysl.text.{from_utf8_unchecked, join, split, str_builder, StrBuilder}
 //     fingerprint. It is the same reason the standard module's own artifact is keyed by version.
 //   - the **target**, the **allocating pair** and the **optimization** level, each of which changes
 //     what is emitted, and the **`--cc`** a reader named, which is a different compiler.
+//   - what the target **provides** -- the capabilities `package.hocon` leaves it -- which decides
+//     whether the program is legal at all, and is read out of a file that is not source.
 //   - every **source file the program is made of** -- its own tree's and every package's, the C
 //     each of those trees carries among them -- by place and text.
 //   - the **standard module** it is compiled against, by the fingerprint of the library it was read
@@ -107,6 +109,7 @@ run_cache_parts(command: string, path: string, t: Target, level: string,
     parts.push(allocator_pair())
     parts.push(level)
     parts.push(cc.unwrap_or(""))
+    parts.push(provided_part(t))
 
     val library = std_root() match
         Err(why) -> return Err(Refusal(why))
@@ -146,6 +149,21 @@ run_cache_parts(command: string, path: string, t: Target, level: string,
 
     Ok(parts)
 end run_cache_parts
+
+// What the machine provides, as the manifest declared it: sorted, so the part is one string for one
+// set however the file ordered it or whichever block said it.
+//
+// **None of it is a source file, and it decides whether the program is legal at all** -- a tree built
+// while `posix` stood and replayed after the config took it away would skip the refusal the analysis
+// owes, and run a binary the project has just said this machine cannot have.
+private provided_part(t: Target) -> string
+    var given: Buf[string] = buf()
+
+    for i in 0..<CoreCapabilities.len
+        if !t.lacks_capability(CoreCapabilities[i]) then given.push(CoreCapabilities[i])
+
+    s"provides:${join(sort_names(given).view(), ",")}"
+end provided_part
 
 // The key for one command over one tree, or nothing where it cannot be established.
 //
