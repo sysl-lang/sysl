@@ -194,12 +194,12 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             // meant is worked out from what the variant carries -- exactly as it is for the bare
             // name, and for the same reason: `Slot.Live(h, k, v)` is a `Slot[K, V]` because that is
             // what the values say.
-            val qualified_generic = qualified_variant_solved(cx, span, receiver, member, args,
-                                                             expected)
+            val named_at = Span(callee.span.end - member.bytes.len, callee.span.end)
 
-            if qualified_generic.is_some() then
-                return variant_call(cx, span, qualified_generic.unwrap().0,
-                                    qualified_generic.unwrap().1, args)
+            qualified_variant_solved(cx, span, named_at, receiver, member, args, expected) match
+                VsFound(en, v) -> return variant_call(cx, span, en, v, args)
+                VsSaid -> return bad_expr(span)
+                VsNone -> ()
 
             // **A TYPE reached through the module it belongs to**, which is the other half of the
             // function case above: `c.InBuffer(p, n, 0)` is the struct's constructor, `c.Mode(n)` an
@@ -441,10 +441,10 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
         // struct's constructor is: `Some(s)` on its own is an `Option[string]` because `s` is a
         // string, and picking whichever instantiation happened to be registered first would make it
         // whatever some other file asked for.
-        val solved = variant_solved(cx, span, name, args)
-
-        if solved.is_some() then
-            return variant_call(cx, span, solved.unwrap().0, solved.unwrap().1, args)
+        variant_solved(cx, span, Span(span.start, span.start + name.bytes.len), name, args) match
+            VsFound(en, v) -> return variant_call(cx, span, en, v, args)
+            VsSaid -> return bad_expr(span)
+            VsNone -> ()
 
         val v = variant_of(cx, name, expected)
 
@@ -1039,9 +1039,16 @@ end variant_call
 //
 // Nothing for an enum that takes no type parameters, which leaves the ordinary lookup to answer:
 // there the registered instantiation is the only one there could be.
-private variant_solved(cx: &Analyzer, span: Span, name: string,
-                       args: Buf[Expr]) -> Option[(Type, EnumVariant)]
-    if !may_name_variant(cx, name) then return None
+// What working out a generic variant's instantiation came to: the variant at the arguments its values
+// settled, a refusal already said, or nothing -- the name is left to the ordinary lookup.
+private enum VariantSolve
+    VsFound(en: Type, v: EnumVariant)
+    VsSaid
+    VsNone
+
+private variant_solved(cx: &Analyzer, span: Span, named_at: Span, name: string,
+                       args: Buf[Expr]) -> VariantSolve
+    if !may_name_variant(cx, name) then return VsNone
 
     for i in 0..<cx.an.tables.types.len()
         val key = cx.an.tables.types.key_at(i)
@@ -1054,13 +1061,15 @@ private variant_solved(cx: &Analyzer, span: Span, name: string,
                     val found = variant_decl_named(ed, name)
 
                     if found.is_some()
-                        val made = variant_instance(cx, span, key, decl.scope, ed, found.unwrap(),
-                                                    args)
+                        val made = variant_instance(cx, span, named_at, key, decl.scope, ed,
+                                                    found.unwrap(), args)
 
-                        if made.is_some() then return made
+                        made match
+                            VsNone -> ()
+                            _ -> return made
             _ -> ()
 
-    None
+    VsNone
 end variant_solved
 
 private variant_decl_named(ed: EnumDecl, name: string) -> Option[EnumVariantDecl]
@@ -1070,9 +1079,9 @@ private variant_decl_named(ed: EnumDecl, name: string) -> Option[EnumVariantDecl
     None
 end variant_decl_named
 
-private variant_instance(cx: &Analyzer, span: Span, key: string, home: Scope, ed: EnumDecl,
-                         vd: EnumVariantDecl, args: Buf[Expr]) -> Option[(Type, EnumVariant)]
-    if args.len() != vd.fields.len() then return None
+private variant_instance(cx: &Analyzer, span: Span, named_at: Span, key: string, home: Scope,
+                         ed: EnumDecl, vd: EnumVariantDecl, args: Buf[Expr]) -> VariantSolve
+    if args.len() != vd.fields.len() then return VsNone
 
     var field_refs: Buf[TypeRef] = buf()
 
@@ -1095,17 +1104,38 @@ private variant_instance(cx: &Analyzer, span: Span, key: string, home: Scope, ed
     cx.an.restore_complaints(mark)
 
     for i in 0..<targs.len()
-        if targs.at(i) == Unknown then return None
+        if targs.at(i) == Unknown
+            voice_unsolved_variant(cx, named_at, ed, vd, args, prov, i)
+            return VsSaid
+        end if
 
     reinstantiate(cx.an, key, targs) match
         Enum(d) ->
             val v = d.variant(vd.name)
 
-            if v.is_none() then return None
+            if v.is_none() then return VsNone
 
-            Some((Enum(d), v.unwrap()))
-        _ -> None
+            VsFound(Enum(d), v.unwrap())
+        _ -> VsNone
 end variant_instance
+
+// **A variant whose instantiation the values could not settle says why, rather than being left for
+// a lookup that would call its enum undefined.** A value the provisional reading could not type --
+// `E.A(null)`, `E.A(None)`, `E.A(nope)` -- is read once more, for real, and says what it has to say;
+// only the leftmost speaks, as for a generic call. Where every value was read and a parameter is
+// still open, it is in nothing the variant carries (`C(n: int)` of an `E[T]`), and that is the
+// complaint, about the variant's name.
+private voice_unsolved_variant(cx: &Analyzer, named_at: Span, ed: EnumDecl, vd: EnumVariantDecl,
+                               args: Buf[Expr], prov: Buf[Type], open: usize)
+    for i in 0..<args.len()
+        if ref_mentions(vd.fields.at(i).typ, ed.tparams) && mentions_unknown(prov.at(i))
+            type_expr(cx, args.at(i), None)
+            return
+        end if
+
+    cx.fault(named_at, s"cannot infer the type argument '${ed.tparams.at(open)}' of '${vd.name}' " +
+             "here — annotate the expected type")
+end voice_unsolved_variant
 
 // The same where the enum is **generic**: the name in front of the dot says which enum, and the
 // values say which instantiation of it.
