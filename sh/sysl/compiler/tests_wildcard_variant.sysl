@@ -1,0 +1,154 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A bare variant name two wildcards both offer is refused by naming the wildcards**, the imports
+// being what the reader wrote and importing one side selectively being the fix. Naming the two enums
+// instead is right only where no import is involved -- two enums of one module -- and that case is
+// `tests_decl_errors.sysl`'s.
+//
+// Every rendering quoted here was obtained by running the reference compiler (0.0.146) on the same
+// tree; the project root is a temporary directory, so each is asserted from the file name on.
+
+private wcv_m() -> string = "module m\n\nenum M\n    Hit(n: int)\n    Gone\n"
+
+private wcv_m2() -> string = "module m2\n\nenum N\n    Hit(n: int)\n    Gone\n"
+
+private wcv_can_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end wcv_can_run
+
+// What a project of these `(module directory, file, source)` triples prints, or what its build said.
+private wcv_out(files: Buf[(string, string, string)]) -> string
+    val root = make_temp_dir("sysl-wcv").unwrap()
+
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for i in 0..<files.len()
+        val f = files.at(i)
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end wcv_out
+
+// `main` beside the two modules that each declare an enum with a `Hit` and a `Gone`.
+private wcv_pair(main: string) -> Buf[(string, string, string)]
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("", "main.sysl", main))
+    fs.push(("m", "m.sysl", wcv_m()))
+    fs.push(("m2", "m2.sysl", wcv_m2()))
+    fs
+end wcv_pair
+
+private wcv_offered(name: string, from: string) -> string =
+    s"error: '$name' is offered by $from — import it selectively, or write the module it comes from\n --> "
+
+@test("a variant two wildcards offer is refused in call position by naming the wildcards")
+wcv_call_position()
+    if wcv_can_run() then return
+
+    val said = wcv_out(wcv_pair("import m.*\nimport m2.*\n\nval x = Hit(1)\nprint(1)\n"))
+
+    assert(said.contains(wcv_offered("Hit", "'m.*' and 'm2.*'")), said)
+    assert(said.contains("/main.sysl:4:9\n  |\n4 | val x = Hit(1)\n  |         ^^^"), said)
+    assert(!said.contains("is a variant of"), said)
+end wcv_call_position
+
+@test("and a nullary variant two wildcards offer the same way")
+wcv_nullary()
+    if wcv_can_run() then return
+
+    val said = wcv_out(wcv_pair("import m.*\nimport m2.*\n\nval x = Gone\nprint(1)\n"))
+
+    assert(said.contains(wcv_offered("Gone", "'m.*' and 'm2.*'")), said)
+    assert(said.contains("/main.sysl:4:9\n  |\n4 | val x = Gone\n  |         ^^^^"), said)
+end wcv_nullary
+
+@test("three wildcards offering one variant are all named")
+wcv_three_wildcards()
+    if wcv_can_run() then return
+
+    var fs = wcv_pair("import m.*\nimport m2.*\nimport m3.*\n\nval x = Hit(1)\nprint(1)\n")
+
+    fs.push(("m3", "m3.sysl", "module m3\n\nenum O\n    Hit(n: int)\n"))
+
+    val said = wcv_out(fs)
+
+    assert(said.contains(wcv_offered("Hit", "'m.*' and 'm2.*' and 'm3.*'")), said)
+    assert(said.contains("/main.sysl:5:9\n  |\n5 | val x = Hit(1)\n  |         ^^^"), said)
+end wcv_three_wildcards
+
+@test("a pattern takes the variant from its scrutinee, so two wildcards offering it are no clash")
+wcv_pattern()
+    if wcv_can_run() then return
+
+    val main = "import m.*\nimport m2.*\n\nf(v: m.M) -> int = v match\n    Hit(n) -> n\n    _ -> 0\n\n" +
+               "print(f(m.M.Hit(5)))\n"
+
+    assert_eq(wcv_out(wcv_pair(main)), "5\n")
+end wcv_pattern
+
+@test("a selective import of one side settles the variant")
+wcv_selective()
+    if wcv_can_run() then return
+
+    val main = "import m.*\nimport m2.*\nimport m.Hit\n\nval x = Hit(4)\nprint(x match\n" +
+               "    Hit(n) -> n\n    _ -> 0)\n"
+
+    assert_eq(wcv_out(wcv_pair(main)), "4\n")
+end wcv_selective
+
+@test("and so does a selector list naming it beside the enum")
+wcv_selector_list()
+    if wcv_can_run() then return
+
+    val main = "import m.{M, Hit}\nimport m2.*\n\nval x: M = Hit(6)\nprint(x match\n" +
+               "    Hit(n) -> n\n    _ -> 0)\n"
+
+    assert_eq(wcv_out(wcv_pair(main)), "6\n")
+end wcv_selector_list
+
+@test("a struct one wildcard offers beside another's variant of the same name is the struct")
+wcv_struct_and_variant()
+    if wcv_can_run() then return
+
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("", "main.sysl", "import m.*\nimport m2.*\n\nprint(Hit(7).n)\n"))
+    fs.push(("m", "m.sysl", "module m\n\nstruct Hit\n    n: int\n"))
+    fs.push(("m2", "m2.sysl", wcv_m2()))
+
+    assert_eq(wcv_out(fs), "7\n")
+end wcv_struct_and_variant
