@@ -985,14 +985,21 @@ end constrained_call
 
 // A variant with what it carries.
 private variant_call(cx: &Analyzer, span: Span, en: Type, v: EnumVariant,
-                     args: Buf[Expr]) -> TExpr
+                     written: Buf[Expr]) -> TExpr
     // A variant that carries nothing is a name, not a call, so the mistake is the parentheses rather
     // than the count inside them -- and saying "has 0 fields" would be answering a question about an
     // arity the reader was never choosing. An empty pair is left alone: it names the variant.
-    if v.fields.is_empty() && !args.is_empty() then
+    if v.fields.is_empty() && !written.is_empty() then
         return cx.err(span, s"variant '${v.name}' carries nothing, so it is written as a name on " +
-                      s"its own — drop the parentheses and the ${quantity(args.len(), "argument")} " +
+                      s"its own — drop the parentheses and the ${quantity(written.len(), "argument")} " +
                       "inside them")
+
+    // A payload's fields may be named, as a constructor's are.
+    val placed = by_field_name(cx, s"variant '${v.name}'", v.fields, written)
+
+    if placed.is_none() then return bad_expr(span)
+
+    val args = placed.unwrap()
 
     if args.len() != v.fields.len() then
         return cx.err(span, s"variant '${v.name}' has ${quantity(v.fields.len(), "field")}, but " +
@@ -1509,16 +1516,8 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
                              s"${type_show(texpr_type(t))} was given")
 
                 ts.push(t)
-            // A parameter's default, spliced in where the argument was not written. It is analyzed
-            // in the declaration's own terms and with nothing local in scope, which is what makes
-            // it mean the same thing from every module that calls the function -- and what makes a
-            // default of `__LINE__` name the caller's line.
-            None ->
-                val inner = analyzer_for(cx.an, f.scope)
-
-                inner.reported = Some(span)
-                inner.here_src = caller_source(cx)
-                ts.push(type_expr(inner, p.default.unwrap(), Some(want)))
+            // A parameter's default, spliced in where the argument was not written.
+            None -> ts.push(fill_default(cx, span, key, f.scope, p, want))
 
     // The tail of a variadic definition, which no parameter names: the body reads it with `va_arg`,
     // so each argument is analyzed at whatever type it has and passed as C's promotions leave it.
@@ -1550,65 +1549,9 @@ end call_key
 // **A named argument may be written for any parameter, not only one with a default**, and a
 // parameter left unfilled is an error unless it has one.
 bind_arguments(cx: &Analyzer, span: Span, written: string, f: Func, written_args: Buf[Expr],
-                       report: bool) -> Option[Buf[Option[Expr]]]
-    val params = f.decl.params
-    val args = pack_rest(cx, s"function '$written'", params, written_args, report)
-    var slots: Buf[Option[Expr]] = buf()
-
-    for i in 0..<params.len()
-        slots.push(None)
-
-    var next: usize = 0
-    var unknown_name = false
-    var extra: usize = 0
-    var named_seen = false
-
-    for i in 0..<args.len()
-        val a = args.at(i)
-
-        *a.kind match
-            NamedArg(name, value) ->
-                named_seen = true
-
-                val idx = param_index(params, name)
-
-                if idx < 0
-                    if report then
-                        cx.fault(a.span, s"function '$written' declares no parameter named " +
-                                 s"'$name' — it takes ${name_list(params)}")
-                    else
-                        cx.fault(a.span, "no such parameter")
-
-                    unknown_name = true
-                else
-                    slots.set(usize(idx), Some(value))
-            _ ->
-                if next >= params.len() then extra += 1
-                else
-                    slots.set(next, Some(a))
-                    next += 1
-
-    if unknown_name then return None
-
-    var missing: usize = 0
-
-    for i in 0..<params.len()
-        if slots.at(i).is_none() && params.at(i).default.is_none() then missing += 1
-
-    // A variadic definition reads whatever follows its parameters through `va_start`, so arguments
-    // past the last one are its tail rather than a miscount.
-    if missing > 0 || (extra > 0 && !f.decl.variadic)
-        if report then
-            cx.fault(span, arity_refusal(s"function '$written'", params, args, slots, named_seen,
-                                         extra))
-        else
-            cx.fault(span, "wrong arity")
-
-        return None
-    end if
-
-    Some(slots)
-end bind_arguments
+                       report: bool) -> Option[Buf[Option[Expr]]] =
+    bind_params(cx, span, s"function '$written'", f.decl.params, f.decl.variadic, written_args,
+                report)
 
 // The trailing arguments a `...T` parameter collects, packed into the slice it takes.
 //
@@ -1725,13 +1668,6 @@ private named_argument(e: Expr) -> Option[string] = *e.kind match
     NamedArg(n, _) -> Some(n)
     _ -> None
 
-private param_index(params: Buf[Param], name: string) -> int
-    for i in 0..<params.len()
-        if params.at(i).name == name then return int(i)
-
-    -1
-end param_index
-
 // How many arguments a parameter list takes, as a refusal words it. **A defaulted parameter makes it
 // a range rather than a number**, since a call may leave one out and still be a call.
 arity_phrase(params: Buf[Param]) -> string
@@ -1823,34 +1759,42 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
     val scope = extern_scope(cx, key)
     var ts: Buf[TExpr] = buf()
 
-    if !d.variadic && args.len() != d.params.len() then
-        return cx.err(span, s"function '$written' takes ${quantity(d.params.len(), "argument")}, " +
-                      s"but ${quantity(args.len(), "argument")} " +
-                      s"${if args.len() == 1 then "was" else "were"} given")
+    // **An `extern`'s parameter names are sysl's to choose**, so a call may name them and leave a
+    // defaulted one out exactly as it may at a function.
+    val bound = bind_params(cx, span, s"function '$written'", d.params, d.variadic, args, true)
+
+    if bound.is_none() then return bad_expr(span)
+
+    val slots = bound.unwrap()
 
     // **Recorded before the arguments are analyzed**, which is what puts `take` in front of `give`
     // in `take(give())`: this order is the order the `declare` lines come out in.
     cx.an.uses_extern(key)
 
-    for i in 0..<args.len()
-        if i < d.params.len() then
-            // **A C `va_list` parameter takes the address of the walk**, since that is what sysl has
-            // to give and what every target's answer is formed from -- so the argument is checked as
-            // a `*va_list` whichever of C's two spellings the header used, and the difference
-            // between them, whether the callee receives the walk or a pointer to it, is carried by
-            // `TVaPass` rather than by the parameter's type.
-            val by_value = written_va_list(d.params.at(i).typ)
-            val declared = resolve_type(cx.an, scope, d.params.at(i).typ, no_bindings())
-            val want = if by_value then Ptr(VaList) else declared
-            val t = type_expr(cx, args.at(i), Some(want))
+    for i in 0..<slots.len()
+        // **A C `va_list` parameter takes the address of the walk**, since that is what sysl has to
+        // give and what every target's answer is formed from -- so the argument is checked as a
+        // `*va_list` whichever of C's two spellings the header used, and the difference between
+        // them, whether the callee receives the walk or a pointer to it, is carried by `TVaPass`
+        // rather than by the parameter's type.
+        val p = d.params.at(i)
+        val by_value = written_va_list(p.typ)
+        val declared = resolve_type(cx.an, scope, p.typ, no_bindings())
+        val want = if by_value then Ptr(VaList) else declared
 
-            if disagree(texpr_type(t), want) then
-                cx.fault(args.at(i).span, s"'${d.params.at(i).name}' of '$written' is " +
-                         s"${type_show(want)}, but ${type_show(texpr_type(t))} was given")
+        slots.at(i) match
+            Some(e) ->
+                val t = type_expr(cx, e, Some(want))
 
-            ts.push(if by_value then TExpr(args.at(i).span, TVaPass(t)) else t)
-        else
-            ts.push(variadic_extra(cx, args.at(i)))
+                if disagree(texpr_type(t), want) then
+                    cx.fault(e.span, s"'${p.name}' of '$written' is ${type_show(want)}, but " +
+                             s"${type_show(texpr_type(t))} was given")
+
+                ts.push(if by_value then TExpr(e.span, TVaPass(t)) else t)
+            None -> ts.push(fill_default(cx, span, key, scope, p, want))
+
+    for i in slots.len()..<args.len()
+        ts.push(variadic_extra(cx, args.at(i)))
 
     val ret = declared_result(cx, scope, d.ret_type)
 
@@ -1891,6 +1835,9 @@ private extern_scope(cx: &Analyzer, key: string) -> Scope =
 private call_through(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
                      expected: Option[Type]) -> TExpr
     val local = cx.lookup(name).unwrap()
+
+    // A value carries types and no names, so there is nothing a name could be matched against.
+    if refuse_named_args(cx, args) then return bad_expr(span)
 
     local.ty match
         CFn(params, ret) ->
