@@ -883,8 +883,22 @@ end promoted_box
 
 // -- what the heap is called -----------------------------------------------------------------------
 
-// The allocator this compilation reaches. A package may name its own pair; nothing here reads a
-// package's configuration yet, so both are libc's.
-malloc_symbol() -> string = "malloc"
+// The allocator this compilation reaches: libc's pair unless the program's packages named another
+// (`choose_allocator`), which the driver settles once per command before anything is lowered.
+//
+// **Held here rather than threaded through the emitter** because every allocation site, the runtime
+// helpers' text, the artifact's metadata and both caches' keys ask the same question, and one that
+// answered differently from the rest is a mixed heap -- storage handed back to an allocator that did
+// not make it, which no link and no run reports.
+private var heap_alloc: string = "malloc"
+private var heap_free: string = "free"
 
-free_symbol() -> string = "free"
+malloc_symbol() -> string = heap_alloc
+
+free_symbol() -> string = heap_free
+
+// The pair every later allocation is emitted against, for the rest of this process or until the next
+// command settles another.
+use_allocator(pair: (string, string))
+    heap_alloc = pair.0
+    heap_free = pair.1

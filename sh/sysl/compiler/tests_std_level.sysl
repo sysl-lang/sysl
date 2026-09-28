@@ -1,0 +1,179 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// The standard module's artifact is object code, and the level is what object code is made at, so
+// the level is part of where the artifact lives and of which archive a build links.
+
+@test("the standard module's path is keyed by the optimization level, and the default is one of them")
+stdlv_the_level_is_in_the_std_path()
+    if cache_directory().is_none()
+        print("skipped: this machine has no cache directory")
+        return
+    end if
+
+    val t = host_target()
+    val levels: [6]string = ["0", "1", "2", "3", "s", "z"]
+    var seen: Buf[string] = buf()
+
+    for i in 0..<levels.len
+        val here = std_artifact_path(t, "0123456789abcdef", levels[i])
+
+        for j in 0..<seen.len()
+            assert(seen.at(j) != here, s"'$here' is the path of two levels")
+
+        seen.push(here)
+
+    val three = std_artifact_path(t, "0123456789abcdef", "3")
+
+    assert(three.index_of("-O3/").is_some(), s"'$three' names the level")
+    // A caller naming no level and a build that resolved the default one agree on one archive.
+    assert_eq(std_artifact_path(t, "0123456789abcdef"),
+              std_artifact_path(t, "0123456789abcdef", DefaultOptimization))
+end stdlv_the_level_is_in_the_std_path
+
+@test("the standard module's path names the version, library, machine, pair and level in one segment")
+stdlv_the_path_is_one_segment_in_that_order()
+    val dir = cache_directory() match
+        None ->
+            print("skipped: this machine has no cache directory")
+            return
+        Some(d) -> d
+
+    val t = host_target()
+
+    assert_eq(std_artifact_path(t, "0123456789abcdef", "2"),
+              s"$dir/sysl/$Version-0123456789abcdef-${t.name}-${malloc_symbol()}-${free_symbol()}" +
+              s"-O2/std.syslib")
+end stdlv_the_path_is_one_segment_in_that_order
+
+// Before the level was in the key the second build here was handed the first one's archive, both
+// in process and on disk.
+@test("two levels resolve two archives, each compiled at its own level")
+stdlv_two_levels_are_two_archives()
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return
+    end if
+
+    val t = host_target()
+
+    val low = std_artifact(t, "0") match
+        Err(why) ->
+            assert(false, why)
+            return
+        Ok(found) -> found
+
+    val high = std_artifact(t, "2") match
+        Err(why) ->
+            assert(false, why)
+            return
+        Ok(found) -> found
+
+    val again = std_artifact(t, "0") match
+        Err(why) ->
+            assert(false, why)
+            return
+        Ok(found) -> found
+
+    assert(low.archive.ends_with("-O0/std.syslib"), s"'${low.archive}' is the -O0 archive")
+    assert(high.archive.ends_with("-O2/std.syslib"), s"'${high.archive}' is the -O2 archive")
+    assert_eq(again.archive, low.archive)
+    // The symbols a program declares are the same at every level; the code behind them is not.
+    assert_eq(low.precompiled.len(), high.precompiled.len())
+
+    val low_size = metadata(low.archive).unwrap().size
+    val high_size = metadata(high.archive).unwrap().size
+
+    assert(low_size != high_size, s"-O0 and -O2 archives are both $low_size bytes, so one level made both")
+end stdlv_two_levels_are_two_archives
+
+// -- `emit-llvm` and the level ---------------------------------------------------------------------
+//
+// The reference's `emit-llvm` takes the level in the three spellings `build` does and prints the same
+// text at every one: `-O0`, `-O3`, `-O 3` and `--optimize s` over one program were byte-identical
+// (438 lines) out of 0.0.146. What the level changes is the archive resolved for the declarations,
+// so a level clang has no answer for fails the command the way it fails a build -- 0.0.146 answers
+// `-Ononsense` with exit 1 and clang's own `invalid integral value 'nonsense' in '-Ononsense'`.
+
+private stdlv_project(config: string) -> string
+    val root = make_temp_dir("sysl-stdlv-").unwrap()
+
+    write_text(s"$root/main.sysl", "print(\"hi\")\n").unwrap()
+
+    if config != "" then write_text(s"$root/package.hocon", config).unwrap()
+
+    root
+end stdlv_project
+
+private stdlv_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end stdlv_run
+
+@test("emit-llvm takes a level in every spelling build does, and prints the same text at each")
+stdlv_emit_llvm_takes_a_level()
+    if std_root().is_err() then return
+
+    val root = stdlv_project("")
+    val plain = stdlv_run(["sysl", "emit-llvm", root])
+
+    assert_eq(plain.0, 0, plain.1)
+
+    val spellings: [4][]string = [["-O0"], ["-O2"], ["-O", "2"], ["--optimize", "2"]]
+
+    for i in 0..<spellings.len
+        var args: Buf[string] = buf()
+
+        args.push("sysl")
+        args.push("emit-llvm")
+
+        for j in 0..<spellings[i].len
+            args.push(spellings[i][j])
+
+        args.push(root)
+
+        val got = stdlv_run(args.view())
+
+        assert_eq(got.0, 0, got.1)
+        assert_eq(got.1, plain.1)
+
+    remove_dir_all(root).unwrap_or(())
+end stdlv_emit_llvm_takes_a_level
+
+@test("emit-llvm refuses a level flag with nothing after it, as build does")
+stdlv_emit_llvm_refuses_a_bare_level()
+    val spellings = ["-O", "--optimize"]
+
+    for i in 0..<spellings.len
+        val got = stdlv_run(["sysl", "emit-llvm", "/nonexistent/stdlv.sysl", spellings[i]])
+
+        assert_eq(got.0, Misused, got.1)
+        assert(got.1.starts_with("usage: sysl emit-llvm "), got.1)
+        assert(got.1.index_of("[-O<level>]").is_some(), got.1)
+end stdlv_emit_llvm_refuses_a_bare_level
+
+// Nothing in `emit-llvm` hands clang anything but the standard module's build, so clang's refusal of
+// the level is the proof the level reached the archive -- and, over a manifest naming a good one,
+// that the flag beat the key.
+@test("emit-llvm builds the standard module at the level named, and the flag beats the manifest")
+stdlv_emit_llvm_level_reaches_the_archive()
+    if std_root().is_err() then return
+
+    val root = stdlv_project("optimization = \"0\"\n")
+    val keyed = stdlv_run(["sysl", "emit-llvm", root])
+
+    assert_eq(keyed.0, 0, keyed.1)
+
+    val flagged = stdlv_run(["sysl", "emit-llvm", "-Ononsense", root])
+
+    assert_eq(flagged.0, 1, flagged.1)
+    assert(flagged.1.index_of("invalid integral value 'nonsense' in '-Ononsense'").is_some(), flagged.1)
+    remove_dir_all(root).unwrap_or(())
+end stdlv_emit_llvm_level_reaches_the_archive

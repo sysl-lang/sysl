@@ -34,21 +34,27 @@ private var std_held: Buf[string] = buf()
 private var std_held_archive: string = ""
 private var std_held_ok: bool = false
 
-// The artifact for a machine, built at the path both ends agree on when what is there is not one.
-std_artifact(t: Target) -> Result[StdArtifact, string]
-    if std_held_ok && std_held_for == t.name then return Ok(StdArtifact(std_held, std_held_archive))
+// The artifact for a machine at an optimization level, built at the path both ends agree on when what
+// is there is not one.
+std_artifact(t: Target, level: string = DefaultOptimization) -> Result[StdArtifact, string]
+    // The pair and the level are in the key beside the machine, since an artifact is the pair's and
+    // the level's as much as the machine's: a process that built for two heaps, or at two levels, must
+    // not hand the second the first one's archive.
+    val held_for = s"${t.name} ${allocator_pair()} O$level"
+
+    if std_held_ok && std_held_for == held_for then return Ok(StdArtifact(std_held, std_held_archive))
 
     val root = std_root()?
     val fingerprint = std_fingerprint(root, t)?
-    val path = std_artifact_path(t, fingerprint)
+    val path = std_artifact_path(t, fingerprint, level)
 
     val symbols = match_at(path, fingerprint, t) match
         Ok(found) -> found
         Err(why) ->
             eprints(s"building the standard module at $path ($why)\n")
-            write_std_artifact(root, path, fingerprint, t)?
+            write_std_artifact(root, path, fingerprint, t, level)?
 
-    std_held_for = t.name
+    std_held_for = held_for
     std_held = symbols
     std_held_archive = path
     std_held_ok = true
@@ -62,10 +68,10 @@ end std_artifact
 // running on a machine that cannot compile the C at all: a run for a board that reaches clang's
 // complaint about a missing SDK header is a sysl type-check that passed.
 build_library(root: string, t: Target, where: string, units: Buf[Program], own: Buf[string],
-              who: string, probed: PkgAnswer) -> Result[string, string]
+              who: string, probed: PkgAnswer, level: string) -> Result[string, string]
     val fingerprint = std_fingerprint(root, t)?
 
-    write_artifact(units, own, root, where, fingerprint, t, who, probed)?
+    write_artifact(units, own, root, where, fingerprint, t, who, probed, level)?
     Ok(where)
 end build_library
 
@@ -76,11 +82,12 @@ end build_library
 // down rather than inferred from the module names in the tree, because guessing would turn a clear
 // refusal -- you cannot add to the module every program is compiled against -- into an artifact that
 // builds and then collides with the built-in copy at whatever link tried to use it.
-build_std_library(root: string, t: Target, out: Option[string]) -> Result[string, string]
+build_std_library(root: string, t: Target, out: Option[string],
+                  level: string = DefaultOptimization) -> Result[string, string]
     val fingerprint = std_fingerprint(root, t)?
-    val where = out.unwrap_or(std_artifact_path(t, fingerprint))
+    val where = out.unwrap_or(std_artifact_path(t, fingerprint, level))
 
-    write_std_artifact(root, where, fingerprint, t)?
+    write_std_artifact(root, where, fingerprint, t, level)?
     Ok(where)
 end build_std_library
 
@@ -183,12 +190,12 @@ private selects_a_machine(part: string) -> bool =
 // The pending name is the staging directory's own, which the system has already made unique: two
 // builds racing for one artifact must not agree on a pending name either, or one of them would
 // publish the other's half-written archive.
-private write_std_artifact(root: string, out: string, fingerprint: string,
-                           t: Target) -> Result[Buf[string], string]
+private write_std_artifact(root: string, out: string, fingerprint: string, t: Target,
+                           level: string) -> Result[Buf[string], string]
     val units = std_units(root, t)?
 
     write_artifact(units, modules_of(units), root, out, fingerprint, t, "the standard module",
-                   no_probe())
+                   no_probe(), level)
 end write_std_artifact
 
 // The same for **any** library, which is what `sysl build-lib` on a package writes: the tree's own
@@ -201,7 +208,7 @@ end write_std_artifact
 // compilation reached on the library's behalf is declared and left to whoever links this.
 private write_artifact(units: Buf[Program], own: Buf[string], root: string, out: string,
                        fingerprint: string, t: Target, who: string,
-                       probed: PkgAnswer) -> Result[Buf[string], string]
+                       probed: PkgAnswer, level: string) -> Result[Buf[string], string]
     if !t.builds_with_clang() then return Err(t.no_toolchain())
 
     val built = library_build(units, own, t)
@@ -235,7 +242,7 @@ private write_artifact(units: Buf[Program], own: Buf[string], root: string, out:
     var members: Buf[string] = buf()
 
     val made = build_members(clang, archiver, staging, root, out, ir_print_module(lowered.0),
-                             syslib_metadata_ir(meta, t), &members, t, probed)
+                             syslib_metadata_ir(meta, t), &members, t, probed, level)
 
     discard_members(members)
 
@@ -250,13 +257,13 @@ end write_artifact
 // discarded whichever of them failed.
 private build_members(clang: string, archiver: string, staging: string, root: string, out: string,
                       ir: string, meta_ir: string, members: *Buf[string], t: Target,
-                      probed: PkgAnswer) -> Result[unit, string]
+                      probed: PkgAnswer, level: string) -> Result[unit, string]
     val code = s"$staging/$SyslibCodeMember"
     val smeta = s"$staging/$SyslibMetadataMember"
 
-    compile_object(clang, ir, code, t, DefaultOptimization)?
+    compile_object(clang, ir, code, t, level)?
     members.push(code)
-    compile_object(clang, meta_ir, smeta, t, DefaultOptimization)?
+    compile_object(clang, meta_ir, smeta, t, level)?
     members.push(smeta)
 
     val carried = c_sources(root, Some(t.os)) match
@@ -269,7 +276,7 @@ private build_members(clang: string, archiver: string, staging: string, root: st
         // **The standard module names no installed library**, so there is nothing for a probe to
         // have answered there: its C is what a hosted target's libc already carries. A package's is
         // another matter, which is why the answer arrives as an argument.
-        compile_c(clang, carried.at(i), obj, t, DefaultOptimization, probed)?
+        compile_c(clang, carried.at(i), obj, t, level, probed)?
         members.push(obj)
 
     val pending = s"$out.${basename(staging)}"

@@ -149,7 +149,11 @@ private emit_typed_command(args: []string, say: string -> unit) -> int
             Fine
 end emit_typed_command
 
-// `sysl emit-llvm [--gaps] [--target <name>] <path>` -- one whole program's LLVM text.
+// `sysl emit-llvm [--gaps] [--target <name>] [-O<level>] <path>` -- one whole program's LLVM text.
+//
+// **The level changes which standard-module archive is resolved, not the text**: the reference
+// prints the same bytes at every level and builds or reuses the archive at the one named, so a
+// level clang has no answer for fails here exactly as it fails a build.
 //
 // **The reference compiler answers this command line with the text it hands to the back end**, so
 // the two are diffed rather than compared by hand. The path is a program on the same terms
@@ -161,6 +165,7 @@ end emit_typed_command
 // this compiler does not is an absence, and this is what names the reason.
 private emit_llvm_command(args: []string, say: string -> unit) -> int
     var named: Option[string] = None
+    var level: Option[string] = None
     var gaps = false
     var file = ""
     var i: usize = 2
@@ -185,6 +190,17 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
             named = Some(args[i])
         else if args[i] == "--gaps"
             gaps = true
+        else if took_level(args, i).0 != 0
+            val given = took_level(args, i)
+
+            if given.0 < 0
+                say(emit_llvm_usage())
+                return Misused
+            end if
+
+            level = Some(given.1)
+
+            if given.0 == 2 then i += 1
         else
             file = args[i]
 
@@ -195,7 +211,7 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
-    emit_llvm_text(file, named) match
+    emit_llvm_text(file, named, build_level(file, level)) match
         Err(refusal) ->
             say(s"error: ${refusal.message}")
             Failed
@@ -217,7 +233,8 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
             Fine
 end emit_llvm_command
 
-private emit_llvm_usage() -> string = "usage: sysl emit-llvm [--gaps] [--target <name>] " + where_flags() + " <path>"
+private emit_llvm_usage() -> string =
+    "usage: sysl emit-llvm [--gaps] [--target <name>] [-O<level>] " + where_flags() + " <path>"
 
 // `sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path>` -- one program, made
 // into something the machine will run.
@@ -230,7 +247,7 @@ private build_command(args: []string, say: string -> unit) -> int
     var named: Option[string] = None
     var cc: Option[string] = None
     var out: Option[string] = None
-    var level = DefaultOptimization
+    var level: Option[string] = None
     var file = ""
     var i: usize = 2
 
@@ -257,8 +274,17 @@ private build_command(args: []string, say: string -> unit) -> int
             if flag == "--target" then named = Some(args[i])
             else if flag == "--cc" then cc = Some(args[i])
             else out = Some(args[i])
-        else if args[i].len > 2 && args[i].starts_with("-O")
-            level = args[i][2..<args[i].len]
+        else if took_level(args, i).0 != 0
+            val given = took_level(args, i)
+
+            if given.0 < 0
+                say(build_usage())
+                return Misused
+            end if
+
+            level = Some(given.1)
+
+            if given.0 == 2 then i += 1
         else
             file = args[i]
 
@@ -269,7 +295,7 @@ private build_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
-    build_native_program(file, named, cc, level, out) match
+    build_native_program(file, named, cc, build_level(file, level), out) match
         Err(why) ->
             say_failure(why, say)
             Failed
@@ -287,6 +313,20 @@ private say_failure(why: Failure, say: string -> unit)
         Said(refusal) -> say(s"error: ${refusal.message}")
         Reported(report) -> say(report)
 
+// An optimization level at `args[i]`, spelled the way clang spells it -- `-O2` joined, `-O 2` apart
+// -- or as `--optimize 2`: how many arguments it took and the level they named. `0` is "not a level
+// flag", and `-1` a separate spelling with nothing after it. **Only a capital `O`**, since `-o` is
+// the output path and neither may quietly answer for the other.
+took_level(args: []string, i: usize) -> (int, string)
+    if args[i] == "-O" || args[i] == "--optimize"
+        return if i + 1 < args.len then (2, args[i + 1]) else (-1, "")
+    end if
+
+    if args[i].len > 2 && args[i].starts_with("-O") then return (1, args[i][2..<args[i].len])
+
+    (0, "")
+end took_level
+
 private build_usage() -> string =
     "usage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] " + where_flags() +
     " <path>"
@@ -301,7 +341,7 @@ private build_c_command(args: []string, say: string -> unit) -> int
     var cc: Option[string] = None
     var out: Option[string] = None
     var header: Option[string] = None
-    var level = DefaultOptimization
+    var level: Option[string] = None
     var file = ""
     var i: usize = 2
 
@@ -329,8 +369,17 @@ private build_c_command(args: []string, say: string -> unit) -> int
             else if flag == "--cc" then cc = Some(args[i])
             else if flag == "--header" then header = Some(args[i])
             else out = Some(args[i])
-        else if args[i].len > 2 && args[i].starts_with("-O")
-            level = args[i][2..<args[i].len]
+        else if took_level(args, i).0 != 0
+            val given = took_level(args, i)
+
+            if given.0 < 0
+                say(build_c_usage())
+                return Misused
+            end if
+
+            level = Some(given.1)
+
+            if given.0 == 2 then i += 1
         else
             file = args[i]
 
@@ -341,7 +390,7 @@ private build_c_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
-    build_c_archive(file, named, cc, level, out, header, say) match
+    build_c_archive(file, named, cc, build_level(file, level), out, header, say) match
         Err(why) ->
             say_failure(why, say)
             Failed
@@ -364,7 +413,7 @@ private build_c_usage() -> string =
 private run_command(args: []string, say: string -> unit) -> int
     var named: Option[string] = None
     var cc: Option[string] = None
-    var level = DefaultOptimization
+    var level: Option[string] = None
     var file = ""
     var forwarding = false
     var program_args: Buf[string] = buf()
@@ -396,8 +445,17 @@ private run_command(args: []string, say: string -> unit) -> int
                 i += 1
 
                 if flag == "--target" then named = Some(args[i]) else cc = Some(args[i])
-            else if args[i].len > 2 && args[i].starts_with("-O")
-                level = args[i][2..<args[i].len]
+            else if took_level(args, i).0 != 0
+                val given = took_level(args, i)
+
+                if given.0 < 0
+                    say(run_usage())
+                    return Misused
+                end if
+
+                level = Some(given.1)
+
+                if given.0 == 2 then i += 1
             else
                 file = args[i]
 
@@ -408,7 +466,7 @@ private run_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
-    run_native_program(file, named, cc, level, program_args) match
+    run_native_program(file, named, cc, build_level(file, level), program_args) match
         Err(why) ->
             say_failure(why, say)
             Failed
@@ -438,7 +496,7 @@ private test_command(args: []string, say: string -> unit) -> int
     var filter: Option[string] = None
     var fail_fast = false
     var std = false
-    var level = DefaultOptimization
+    var named_level: Option[string] = None
     var file = ""
     var i: usize = 2
 
@@ -469,8 +527,17 @@ private test_command(args: []string, say: string -> unit) -> int
             fail_fast = true
         else if args[i] == "--std"
             std = true
-        else if args[i].len > 2 && args[i].starts_with("-O")
-            level = args[i][2..<args[i].len]
+        else if took_level(args, i).0 != 0
+            val given = took_level(args, i)
+
+            if given.0 < 0
+                say(test_usage())
+                return Misused
+            end if
+
+            named_level = Some(given.1)
+
+            if given.0 == 2 then i += 1
         else
             file = args[i]
 
@@ -480,6 +547,8 @@ private test_command(args: []string, say: string -> unit) -> int
         say(test_usage())
         return Misused
     end if
+
+    val level = build_level(file, named_level)
 
     // **What was built last time, where nothing that can reach the bytes has changed**
     // (`run_cache.sysl`). It is asked before anything is analyzed, because the compile is the whole
@@ -493,7 +562,7 @@ private test_command(args: []string, say: string -> unit) -> int
         None -> ()
 
     val made_build = if std then std_test_build_of(file, named)
-    else test_build_of(file, named)
+    else test_build_of(file, named, level)
 
     val build = made_build match
         Err(refusal) ->
@@ -580,6 +649,7 @@ private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fas
 private build_lib_command(args: []string, say: string -> unit) -> int
     var named: Option[string] = None
     var out: Option[string] = None
+    var level: Option[string] = None
     var std = false
     var file = ""
     var i: usize = 2
@@ -607,6 +677,17 @@ private build_lib_command(args: []string, say: string -> unit) -> int
             if flag == "--target" then named = Some(args[i]) else out = Some(args[i])
         else if args[i] == "--std"
             std = true
+        else if took_level(args, i).0 != 0
+            val given = took_level(args, i)
+
+            if given.0 < 0
+                say(build_lib_usage())
+                return Misused
+            end if
+
+            level = Some(given.1)
+
+            if given.0 == 2 then i += 1
         else
             file = args[i]
 
@@ -618,7 +699,7 @@ private build_lib_command(args: []string, say: string -> unit) -> int
     end if
 
     if !std
-        return build_library_of(file, named, out) match
+        return build_library_of(file, named, out, build_level(file, level)) match
             Err(refusal) ->
                 say(s"error: ${refusal.message}")
                 Failed
@@ -627,7 +708,7 @@ private build_lib_command(args: []string, say: string -> unit) -> int
                 Fine
     end if
 
-    build_std_artifact_of(file, named, out) match
+    build_std_artifact_of(file, named, out, build_level(file, level)) match
         Err(refusal) ->
             say(s"error: ${refusal.message}")
             Failed
@@ -637,7 +718,8 @@ private build_lib_command(args: []string, say: string -> unit) -> int
 end build_lib_command
 
 private build_lib_usage() -> string =
-    "usage: sysl build-lib [--std] [--target <name>] [-o <path>] " + where_flags() + " <path>"
+    "usage: sysl build-lib [--std] [--target <name>] [-O<level>] [-o <path>] " + where_flags() +
+    " <path>"
 
 // One piece of a report, written and **flushed**, so that a run followed through a log file shows each
 // verdict as it lands rather than only once the process exits. The pieces carry their own newlines,
@@ -689,7 +771,7 @@ private add_usage() -> string = "usage: sysl add <coordinate>[@<version>] [<path
 
 usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <file> | " +
     "emit-typed [--no-spans] [--tables] [--target <name>] <path> | " +
-    "emit-llvm [--target <name>] <path> | " +
+    "emit-llvm [--target <name>] [-O<level>] <path> | " +
     "build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path> | " +
     "build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] " +
     "<path> | " +

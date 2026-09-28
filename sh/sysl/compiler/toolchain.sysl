@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.process.{capture, run, Status}
 import sysl.fs.{remove_file, write_text, is_file, is_dir, entries}
-import sysl.text.{split, repeat}
+import sysl.text.{join, split, repeat}
 import sysl.env.{get as env_var}
 
 // **The C toolchain a build drives**: which clang, what it is handed, and what comes back.
@@ -658,6 +658,16 @@ archive(archiver: string, members: Buf[string], out: string) -> Result[unit, str
     told(archiver, args, s"$archiver failed on $out")
 end archive
 
+// The whole command line the last link in this process was handed, which `--verbose` prints as it
+// happens. **It is the one place the flag, the manifest's key and the default have become a single
+// level**, so it is what a question about which level a build used is asked of.
+private var linked_with: string = ""
+
+last_link_command() -> string = linked_with
+
+forget_last_link()
+    linked_with = ""
+
 // Links a module's LLVM text, and whatever objects a tree carried, into a native executable.
 //
 // The triple goes on the command line as well as in the module because the two answer different
@@ -673,6 +683,10 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
         Ok(_) -> ()
 
     val command = link_command(cc, ll, objects, exe, target, level, links, probed)
+
+    linked_with = join(command.view(), " ")
+
+    if verbose() then eprints(s"sysl: link: $linked_with\n")
 
     var args: Buf[string] = buf()
 
