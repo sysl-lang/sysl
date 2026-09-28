@@ -205,7 +205,13 @@ parse_enum_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
         val before = p.report.len()
 
         if refuse_stray_member(p, first, InType) then ()
-        elif at_enum_variant(p) then decl.variants.push(parse_enum_variant(p))
+        elif at_enum_variant(p)
+            decl.variants.push(parse_enum_variant(p))
+
+            // A variant is the whole of its line, so anything after it is where the body ended:
+            // `B x` is not a second variant on the same line but a missing dedent at the `x`.
+            if p.report.len() == before && !(p.at(Newline) || p.at(Dedent) || p.at(Eof))
+                p.want("dedent")
         else parse_member_line(p, &decl.members, InType)
 
         if p.report.len() != before && !p.end_of_statement() then drop_line(p)
@@ -598,7 +604,7 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
         overrides = true
     end if
 
-    parse_member(p, start, site == InTrait) match
+    parse_member(p, start, site) match
         Some(read) ->
             var member = read
 
@@ -614,7 +620,13 @@ end parse_member_line
 const SetterSuffix: string = "$set"
 const SetterValue: string = "$value"
 
-private parse_member(p: *Parser, start: Span, signatures: bool) -> Option[MethodDecl]
+// **A name followed by nothing a member continues with is read as the member the site holds most
+// of**: a type's body is mostly fields, so `y 5` under a struct's fields is a field missing its `:`;
+// a trait's and an `impl` block's hold no fields, so there the name is a property missing its `->`.
+// A written type-parameter list says a method, which is still owed its `(`.
+private parse_member(p: *Parser, start: Span, site: MemberSite) -> Option[MethodDecl]
+    val signatures = site == InTrait
+
     if at_setter(p) then return Some(parse_setter(p, start, signatures))
     if p.at_kw("static") then return Some(parse_static_member(p, start, signatures))
 
@@ -632,7 +644,7 @@ private parse_member(p: *Parser, start: Span, signatures: bool) -> Option[Method
 
     if p.at_kw("->") then return Some(parse_property_tail(p, start, name, signatures))
 
-    p.want("'('")
+    p.want(if site == InType then "':'" else "'->'")
     None
 end parse_member
 

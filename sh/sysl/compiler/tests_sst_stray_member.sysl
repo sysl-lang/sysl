@@ -183,3 +183,94 @@ sst_nested_block()
     sst_dedent("f() -> int\n    struct P\n        x: int\n        123456\n    1\n", 4, 9,
                "        123456")
     sst_dedent("f() -> int\n    enum E\n        A\n        \"hi\"\n    1\n", 4, 9, "        \"hi\"")
+
+// -- a name followed by something no member continues with ---------------------------------------
+//
+// A name that begins a member line and is followed by neither a field's `:` nor a method's `(`,
+// `[` or a property's `->` is read as the member the body holds most of: under a type's body a
+// field missing its `:`, under a trait's or an `impl` block's a property missing its `->`. Every
+// message and position is the reference's (sysl 0.0.149). The caret is asserted one column wide
+// as everywhere in this file; its width is settled by the merge that makes a parse caret cover the
+// token under it, and what these tests pin is the message and the `line:col`.
+
+@test("a name followed by a value under a struct's fields is a field missing its ':'")
+sst_struct_name_missing_colon()
+    if !sst_ready() then return
+
+    sst_expect("struct P\n    x: int\n    y 5\n\nprint(1)\n", "':' expected", 3, 7, "    y 5")
+    sst_expect("struct P\n    x: int\n    y \"s\"\n\nprint(1)\n", "':' expected", 3, 7, "    y \"s\"")
+    sst_expect("struct P\n    x: int\n    y int\n\nprint(1)\n", "':' expected", 3, 7, "    y int")
+    sst_expect("struct P\n    x: int\n    y = 3\n\nprint(1)\n", "':' expected", 3, 7, "    y = 3")
+
+@test("the first line of a struct's body is read the same way")
+sst_struct_first_name_missing_colon()
+    if !sst_ready() then return
+
+    sst_expect("struct P\n    y 5\n    x: int\n\nprint(1)\n", "':' expected", 2, 7, "    y 5")
+    sst_expect("struct P\n    y int\n\nprint(1)\n", "':' expected", 2, 7, "    y int")
+
+@test("a name after a method in a struct's body is still a field missing its ':'")
+sst_struct_after_method_missing_colon()
+    if !sst_ready() then return
+
+    sst_expect("struct P\n    x: int\n    f(self) -> int = 1\n    y 5\n\nprint(1)\n", "':' expected", 4,
+               7, "    y 5")
+
+@test("a name followed by a value in a trait's body is a property missing its '->'")
+sst_trait_name_missing_arrow()
+    if !sst_ready() then return
+
+    val head = "trait T\n    f(self) -> int\n"
+
+    sst_expect(s"${head}    y 5\n\nprint(1)\n", "'->' expected", 3, 7, "    y 5")
+    sst_expect(s"${head}    y \"s\"\n\nprint(1)\n", "'->' expected", 3, 7, "    y \"s\"")
+    sst_expect(s"${head}    y int\n\nprint(1)\n", "'->' expected", 3, 7, "    y int")
+    sst_expect(s"${head}    y = 3\n\nprint(1)\n", "'->' expected", 3, 7, "    y = 3")
+    sst_expect("trait T\n    y 5\n\nprint(1)\n", "'->' expected", 2, 7, "    y 5")
+
+@test("a name followed by a value in an impl block's body is a property missing its '->'")
+sst_impl_name_missing_arrow()
+    if !sst_ready() then return
+
+    val head = "trait T\n    f(self) -> int\nstruct P\n    x: int\nimpl T for P\n"
+
+    sst_expect(s"${head}    f(self) -> int = 1\n    y 5\n\nprint(1)\n", "'->' expected", 7, 7, "    y 5")
+    sst_expect(s"${head}    f(self) -> int = 1\n    y \"s\"\n\nprint(1)\n", "'->' expected", 7, 7,
+               "    y \"s\"")
+    sst_expect(s"${head}    f(self) -> int = 1\n    y int\n\nprint(1)\n", "'->' expected", 7, 7,
+               "    y int")
+    sst_expect(s"${head}    f(self) -> int = 1\n    y = 3\n\nprint(1)\n", "'->' expected", 7, 7,
+               "    y = 3")
+    sst_expect(s"${head}    y 5\n\nprint(1)\n", "'->' expected", 6, 7, "    y 5")
+
+@test("a variant followed by a value is where an enum's body ended")
+sst_enum_variant_then_value()
+    if !sst_ready() then return
+
+    sst_dedent("enum E\n    A\n    B 5\n\nprint(1)\n", 3, 7, "    B 5")
+    sst_dedent("enum E\n    A\n    B x\n\nprint(1)\n", 3, 7, "    B x")
+    sst_dedent("enum E\n    A\n    B \"s\"\n\nprint(1)\n", 3, 7, "    B \"s\"")
+    sst_dedent("enum E\n    B 5\n    A\n\nprint(1)\n", 2, 7, "    B 5")
+    sst_dedent("enum E\n    B x\n\nprint(1)\n", 2, 7, "    B x")
+
+@test("anything after a variant's payload or its value is where an enum's body ended")
+sst_enum_after_variant_tail()
+    if !sst_ready() then return
+
+    sst_dedent("enum E\n    A\n    B(x: int) 5\n\nprint(1)\n", 3, 15, "    B(x: int) 5")
+    sst_dedent("enum E\n    A\n    B = 1 x\n\nprint(1)\n", 3, 11, "    B = 1 x")
+
+@test("a variant's bracket holding no field is owed its ')'")
+sst_enum_variant_open_bracket()
+    if !sst_ready() then return
+
+    sst_expect("enum E\n    A\n    B(5\n\nprint(1)\n", "')' expected", 3, 7, "    B(5")
+    sst_expect("enum E\n    B(5\n\nprint(1)\n", "')' expected", 2, 7, "    B(5")
+
+@test("a variant with a written value is an enum's ordinary variant")
+sst_enum_variant_value_compiles()
+    if !sst_ready() then return
+
+    val (_, _, code) = sst_run("enum E\n    A\n    B = 1\n\nprint(1)\n")
+
+    assert_eq(code, 0)
