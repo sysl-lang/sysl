@@ -45,13 +45,23 @@ end Refusal
 // its source line and its caret -- so a second one in front of it is a word the reference does not
 // print. Carrying both as one string is what put it there, and no amount of reading the string tells
 // the two apart afterwards.
+//
+// **A file that does not parse is `Reported`, not `Said`**: its complaint has a line to point at, so
+// it is rendered exactly as an analysis error is, and one shape serves every error a reader sees.
 enum Failure
     Said(refusal: Refusal)
     Reported(report: string)
+
+    // What it has to say, as `failure_text` reads it.
+    message -> string = failure_text(self)
 end Failure
 
 // A step's refusal on its way out of a command, which is what `.map_err(said)?` writes.
 said(r: Refusal) -> Failure = Said(r)
+
+// And what `?` writes, where a step that can only refuse feeds one that can also report.
+impl From[Refusal] for Failure
+    from(r: Refusal) -> Failure = Said(r)
 
 // What a failure has to say, with no decision about a prefix in it: the command line adds the word
 // where it is owed, and this is what anything else -- a test, the documentation sweep -- reads.
@@ -65,13 +75,13 @@ failure_text(f: Failure) -> string = f match
 // and `sysl prove` read: both stop at the typed tree, and what they are for is comparing what a
 // module *means* rather than what it links against. The canonical prefix is what `emit-llvm` and a
 // build read, and `packaged_compilation_of` is that.
-compilation_of(path: string, t: Target) -> Result[Compilation, Refusal] =
+compilation_of(path: string, t: Target) -> Result[Compilation, Failure] =
     assembled(path, t, false)
 
 // The same, with each fetched package's modules under the canonical prefix its coordinate gives
 // them -- which is what makes two consumers naming one package differently link one copy of it, and
 // is therefore what everything that emits a symbol reads.
-packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Refusal] =
+packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure] =
     assembled(path, t, true)
 
 // A compilation whose tree **is** the standard module, which is what `--std` says.
@@ -84,9 +94,9 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Refusal]
 // So nothing is prepended and nothing is fetched: there is no library beside this tree, because this
 // tree is the library, and a manifest is not read because the library has none. What the files
 // declare is what the compilation holds.
-std_compilation_of(path: string, t: Target) -> Result[Compilation, Refusal]
+std_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     val files = std_sources(path, Some(t.os)) match
-        Err(why) -> return Err(Refusal(why))
+        Err(why) -> return Err(said(Refusal(why)))
         Ok(found) -> found
 
     var units: Buf[Program] = buf()
@@ -94,8 +104,7 @@ std_compilation_of(path: string, t: Target) -> Result[Compilation, Refusal]
     for i in 0..<files.len()
         val parsed = parse(files.at(i).src, t)
 
-        if !parsed.ok()
-            return Err(Refusal(s"${files.at(i).src.name}:${parsed.at()}: ${parsed.first().message}"))
+        if !parsed.ok() then return Err(Reported(parse_report(parsed)))
 
         units.push(parsed.program)
 
@@ -114,7 +123,7 @@ private modules_written(units: Buf[Program]) -> Buf[string]
     out
 end modules_written
 
-private assembled(path: string, t: Target, packaged: bool) -> Result[Compilation, Refusal]
+private assembled(path: string, t: Target, packaged: bool) -> Result[Compilation, Failure]
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
     val manifest = manifest_at(root)?
 
@@ -124,14 +133,14 @@ private assembled(path: string, t: Target, packaged: bool) -> Result[Compilation
     // it parses a line.
     unmet_requirement(manifest, t) match
         None -> ()
-        Some(why) -> return Err(Refusal(why))
+        Some(why) -> return Err(said(Refusal(why)))
 
     val mine = collect(path, Some(t.os)) match
-        Err(e) -> return Err(Refusal(e.message))
+        Err(e) -> return Err(said(Refusal(e.message)))
         Ok(f) -> f
 
     if mine.is_empty()
-        return Err(Refusal(s"$path holds no sysl source files"))
+        return Err(said(Refusal(s"$path holds no sysl source files")))
 
     var units: Buf[Program] = buf()
 
@@ -139,11 +148,11 @@ private assembled(path: string, t: Target, packaged: bool) -> Result[Compilation
     // the program is read. It is read from **source**, for the target being built for: which files
     // the library has at all is a per-target question.
     val library = std_root() match
-        Err(why) -> return Err(Refusal(why))
+        Err(why) -> return Err(said(Refusal(why)))
         Ok(dir) -> dir
 
     val std = std_units(library, t) match
-        Err(why) -> return Err(Refusal(why))
+        Err(why) -> return Err(said(Refusal(why)))
         Ok(u) -> u
 
     for i in 0..<std.len()
@@ -171,8 +180,7 @@ private assembled(path: string, t: Target, packaged: bool) -> Result[Compilation
     for i in 0..<mine.len()
         val parsed = parse(mine.at(i).src, t)
 
-        if !parsed.ok()
-            return Err(Refusal(s"${mine.at(i).src.name}:${parsed.at()}: ${parsed.first().message}"))
+        if !parsed.ok() then return Err(Reported(parse_report(parsed)))
 
         var unit = parsed.program
 
@@ -234,7 +242,7 @@ end dotted
 // module is read from source and analyzed with it, so the library's declarations are in scope
 // exactly as they are for a build.
 emit_typed_text(path: string, named_target: Option[string],
-                tables: bool) -> Result[Emitted, Refusal]
+                tables: bool) -> Result[Emitted, Failure]
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
     val manifest = manifest_at(root)?
 
@@ -244,14 +252,14 @@ emit_typed_text(path: string, named_target: Option[string],
 
     val registered = if chosen == "" then host_target()
     else target_resolved(chosen) match
-        Err(why) -> return Err(Refusal(why))
+        Err(why) -> return Err(said(Refusal(why)))
         Ok(found) -> found
 
     val t = as_declared(manifest, registered)
 
     root_floor_refusal(manifest.floor) match
         None -> ()
-        Some(why) -> return Err(Refusal(why))
+        Some(why) -> return Err(said(Refusal(why)))
 
     val program = compilation_of(path, t)?
 
@@ -269,7 +277,7 @@ end emit_typed_text
 // **The level decides which standard-module archive is resolved** -- the text declares the same
 // symbols at every level, but the archive a later link takes them from is the level's own.
 emit_llvm_text(path: string, named_target: Option[string],
-               level: string = DefaultOptimization) -> Result[Emitted, Refusal]
+               level: string = DefaultOptimization) -> Result[Emitted, Failure]
     val t = target_for(path, named_target)?
     val program = packaged_compilation_of(path, t)?
     val done = analyze_bodies(program.units, program.target)
@@ -302,7 +310,7 @@ emit_llvm_text(path: string, named_target: Option[string],
 
     if t.builds_with_clang() && !std_from_source()
         linked = std_artifact(t, level) match
-            Err(why) -> return Err(Refusal(why))
+            Err(why) -> return Err(said(Refusal(why)))
             Ok(found) -> found
 
     val lowered = codegen_with_gaps(kept with { precompiled = linked.precompiled }, t, promotions)
@@ -496,7 +504,7 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
     // describe the last step rather than the first.
     if !t.builds_with_clang() then return Err(Said(Refusal(t.no_toolchain())))
 
-    val emitted = emit_llvm_text(path, named_target, level).map_err(said)?
+    val emitted = emit_llvm_text(path, named_target, level)?
 
     if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
 
@@ -553,7 +561,7 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
         Err(why) -> return Err(Said(Refusal(why)))
         Ok(found) -> found
 
-    val lowered = lower_for_c(path, t).map_err(said)?
+    val lowered = lower_for_c(path, t)?
 
     if !lowered.emitted.report.is_empty()
         return Err(Reported(analysis_report(lowered.emitted.report)))
@@ -703,7 +711,7 @@ end LoweredForC
 // not a C artifact: it is linked by a program that has one, and the library build has already
 // deferred every function reaching computed storage to it. An archive has nobody to defer to, so it
 // carries a constructor of its own where the platform runs one.
-private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Refusal]
+private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
     val program = packaged_compilation_of(path, t)?
 
     // **Told there is no entry point before a declaration is read, and that is not a detail.** A
@@ -802,7 +810,7 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
             None -> ()
         None -> ()
 
-    val emitted = emit_llvm_text(path, named_target, level).map_err(said)?
+    val emitted = emit_llvm_text(path, named_target, level)?
 
     if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
 
@@ -867,10 +875,10 @@ private discard_staging(staging: Option[string])
 // name, because there is no program to resolve a graph for and the artifact would be keyed to a
 // resolution nobody made.
 build_library_of(path: string, named_target: Option[string], out: Option[string],
-                 level: string = DefaultOptimization) -> Result[string, Refusal]
+                 level: string = DefaultOptimization) -> Result[string, Failure]
     val t = target_for(path, named_target)?
 
-    if !t.builds_with_clang() then return Err(Refusal(t.no_toolchain()))
+    if !t.builds_with_clang() then return Err(said(Refusal(t.no_toolchain())))
 
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
     val manifest = manifest_at(root)?
@@ -883,9 +891,9 @@ build_library_of(path: string, named_target: Option[string], out: Option[string]
 
             labels = labels + s"'${manifest.dependencies.at(i).label}'"
 
-        return Err(Refusal("build-lib compiles the tree it is given and fetches nothing, so this " +
+        return Err(said(Refusal("build-lib compiles the tree it is given and fetches nothing, so this " +
             s"package's dependencies reach it through --lib rather than through 'dependencies' — " +
-            s"supply $labels as a source root or as a '.syslib' built from one"))
+            s"supply $labels as a source root or as a '.syslib' built from one")))
     end if
 
     // The two requirements a command line answers, asked before anything is compiled: a package
@@ -900,7 +908,7 @@ build_library_of(path: string, named_target: Option[string], out: Option[string]
     val where = out.unwrap_or(s"${default_executable(path)}$SyslibExtension")
 
     build_library(root, t, where, c.units, c.own, s"'$named'", probed, level) match
-        Err(why) -> Err(Refusal(why))
+        Err(why) -> Err(said(Refusal(why)))
         Ok(where) -> Ok(where)
 end build_library_of
 
@@ -963,19 +971,19 @@ end TestBuild
 // The analysis in front of it is the analysis every other build gets, and that is deliberate: a test
 // is code somebody wrote and is held to the same rules.
 test_build_of(path: string, named_target: Option[string],
-              level: string = DefaultOptimization) -> Result[TestBuild, Refusal]
+              level: string = DefaultOptimization) -> Result[TestBuild, Failure]
     val t = test_target_of(path, named_target)?
 
-    test_build_from(packaged_compilation_of(path, t)?, false, level)
+    Ok(test_build_from(packaged_compilation_of(path, t)?, false, level)?)
 end test_build_of
 
 // The same for a tree that **is** the standard module (`sysl test <root> --std`), which is how the
 // library's own tests are run: there is no library beside it and no artifact to link, because the
 // bodies the tests call are the ones being compiled.
-std_test_build_of(path: string, named_target: Option[string]) -> Result[TestBuild, Refusal]
+std_test_build_of(path: string, named_target: Option[string]) -> Result[TestBuild, Failure]
     val t = test_target_of(path, named_target)?
 
-    test_build_from(std_compilation_of(path, t)?, true, DefaultOptimization)
+    Ok(test_build_from(std_compilation_of(path, t)?, true, DefaultOptimization)?)
 end std_test_build_of
 
 // What both ask of the machine before anything is read: it has to be this one, because a test run

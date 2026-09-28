@@ -1,0 +1,105 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+
+// A file that does not parse is reported in the shape every other error is: `error:` and the
+// message, the `-->` line, the quoted line and a one-column caret. Every expected text here is the
+// reference's own output for the same file, with the scratch directory put back in for its path.
+
+private pdf_ready() -> bool = std_root().is_ok()
+
+// What `sysl <command> <dir>` says about a project holding one `main.sysl`, and the directory.
+private pdf_run(command: string, text: string) -> (string, string, int)
+    val root = make_temp_dir("sysl-pdf").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", command, root], (line) -> sink.push(line))
+    val out = if lines.is_empty() then "" else lines.at(0)
+
+    remove_dir_all(root).unwrap_or(())
+
+    // A tree is walked from its absolute root with the doubled `/` a temporary directory can carry
+    // taken out, and that is the name a diagnostic quotes.
+    (out, absolute_path(root), code)
+
+// `message` is what follows `error: `, and `tail` everything after the scratch directory -- the
+// file, its line and column, the quoted line and the caret.
+private pdf_expect(command: string, text: string, message: string, tail: string)
+    val (out, root, code) = pdf_run(command, text)
+
+    assert_eq(code, 1)
+    assert_eq(out, s"error: $message\n --> $root$tail")
+
+private pdf_unclosed() -> string = "main() -> unit\n    print(1\n"
+
+private pdf_unclosed_tail() -> string = "/main.sysl:3:1\n  |\n3 | \n  | ^"
+
+@test("a missing ')' is reported with its location line, the quoted line and a caret")
+pdf_a_missing_paren()
+    if !pdf_ready() then return
+
+    pdf_expect("build", pdf_unclosed(), "')' expected", pdf_unclosed_tail())
+
+@test("an indented line where a dedent was wanted")
+pdf_a_bad_indentation()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "main() -> unit\n    val x = 1\n      val y = 2\n", "dedent expected",
+               "/main.sysl:3:7\n  |\n3 |       val y = 2\n  |       ^")
+
+@test("a dotted path in a visibility bracket is ']' expected, pointing at the first dot")
+pdf_a_bracket_expected()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "private[sysl.math] f() -> int = 1\n\nmain() -> unit\n    print(f())\n",
+               "']' expected",
+               "/main.sysl:1:13\n  |\n1 | private[sysl.math] f() -> int = 1\n  |             ^")
+
+@test("an unterminated string is a lexical error, and its caret is one column wide")
+pdf_an_unterminated_string()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "main() -> unit\n    print(\"abc)\n", "unterminated string literal",
+               "/main.sysl:2:11\n  |\n2 |     print(\"abc)\n  |           ^")
+
+// The one place the two compilers point differently: the reference reports this where its type
+// reader stopped, at the `=` in column 25, and this compiler at the type the message is about, the
+// `[` in column 12. The shape and the words are the reference's.
+@test("a 'const' array is refused while the type is read, in the same shape")
+pdf_a_const_array()
+    if !pdf_ready() then return
+
+    pdf_expect("build", "main() -> unit\n    val a: [4]const int = [1, 2, 3, 4]\n    print(a[0])\n",
+               "'const' says a view refuses writes, and an array is storage rather than a view of " +
+               "one — read-only storage is declared with 'val', as 'val name: [N]int'",
+               "/main.sysl:2:12\n  |\n2 |     val a: [4]const int = [1, 2, 3, 4]\n" +
+               "  |            ^")
+
+@test("every command that parses reports the same way: emit-llvm, emit-typed, test and build-lib")
+pdf_every_command_the_same()
+    if !pdf_ready() then return
+
+    pdf_expect("emit-llvm", pdf_unclosed(), "')' expected", pdf_unclosed_tail())
+    pdf_expect("emit-typed", pdf_unclosed(), "')' expected", pdf_unclosed_tail())
+    pdf_expect("test", pdf_unclosed(), "')' expected", pdf_unclosed_tail())
+    pdf_expect("build-lib", pdf_unclosed(), "')' expected", pdf_unclosed_tail())
+
+@test("emit-ast names the file as it was given, in the same shape")
+pdf_emit_ast()
+    val root = make_temp_dir("sysl-pdf").unwrap()
+    val file = s"$root/main.sysl"
+
+    write_text(file, pdf_unclosed()).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "emit-ast", file], (line) -> sink.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 1)
+    assert_eq(lines.at(0), s"error: ')' expected\n --> $root${pdf_unclosed_tail()}")
