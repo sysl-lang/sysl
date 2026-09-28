@@ -82,12 +82,15 @@ private parse_struct_body(p: *Parser, decl: *StructDecl)
     p.bump()
     p.skip_newlines()
 
+    var first = true
+
     loop
         if p.at(Dedent) || p.at(Eof) then break
 
         val before = p.report.len()
 
-        if at_invariant_clause(p)
+        if refuse_stray_member(p, first, InType) then ()
+        elif at_invariant_clause(p)
             p.bump()
             decl.invariants.push(parse_expr(p))
         elif at_field(p)
@@ -102,6 +105,8 @@ private parse_struct_body(p: *Parser, decl: *StructDecl)
         if p.report.len() != before && !p.end_of_statement() then drop_line(p)
 
         p.skip_newlines()
+
+        first = false
 
     if !p.accept(Dedent) then p.want("dedent")
 end parse_struct_body
@@ -128,6 +133,30 @@ private names_a_field(t: Tok) -> bool = t match
     QuotedIdent(_) -> true
     Keyword(w) -> is_reserved(w)
     _ -> false
+
+// Whether a line past a body's first could begin one of its members at all. **One that cannot is
+// where the body ENDED**, so what it is missing is the dedent that closes the body rather than a
+// name: a stray number, string, operator or statement word under a field list is `dedent expected`
+// at that token, as the reference reads it. The first line is not asked -- a body holds at least
+// one member, so there the line is read as a member and the refusal is about what it lacks.
+//
+// A reserved word followed by a `:` is let through, being a field misnamed, which the field rule
+// refuses in words of its own; `type` begins an associated type in a trait or an `impl` and nothing
+// in a type's own body.
+private can_begin_member(p: *Parser, site: MemberSite) -> bool = p.peek() match
+    Ident(_) -> true
+    QuotedIdent(_) -> true
+    Keyword(w) -> w == "@" || w == "#" || w == "private" || w == "static" || w == "override" ||
+        (w == "type" && site != InType) || (is_reserved(w) && p.kw_at(1, ":"))
+    _ -> false
+
+// Refuse a line that cannot begin a member, in the body's own terms; `true` where it was refused.
+private refuse_stray_member(p: *Parser, first: bool, site: MemberSite) -> bool
+    if first || can_begin_member(p, site) then return false
+
+    p.want("dedent")
+    true
+end refuse_stray_member
 
 // -- enum --------------------------------------------------------------------------------------
 
@@ -168,17 +197,22 @@ parse_enum_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
     p.bump()
     p.skip_newlines()
 
+    var first = true
+
     loop
         if p.at(Dedent) || p.at(Eof) then break
 
         val before = p.report.len()
 
-        if at_enum_variant(p) then decl.variants.push(parse_enum_variant(p))
+        if refuse_stray_member(p, first, InType) then ()
+        elif at_enum_variant(p) then decl.variants.push(parse_enum_variant(p))
         else parse_member_line(p, &decl.members, InType)
 
         if p.report.len() != before && !p.end_of_statement() then drop_line(p)
 
         p.skip_newlines()
+
+        first = false
 
     if !p.accept(Dedent) then p.want("dedent")
 
@@ -316,17 +350,22 @@ parse_trait_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
     p.bump()
     p.skip_newlines()
 
+    var first = true
+
     loop
         if p.at(Dedent) || p.at(Eof) then break
 
         val before = p.report.len()
 
-        if at_assoc(p) then decl.assocs.push(parse_assoc_decl(p))
+        if refuse_stray_member(p, first, InTrait) then ()
+        elif at_assoc(p) then decl.assocs.push(parse_assoc_decl(p))
         else parse_member_line(p, &decl.methods, InTrait)
 
         if p.report.len() != before && !p.end_of_statement() then drop_line(p)
 
         p.skip_newlines()
+
+        first = false
 
     if !p.accept(Dedent) then p.want("dedent")
 
@@ -409,17 +448,22 @@ parse_impl_decl(p: *Parser, start: Span, overrides: bool) -> Stmt
         p.bump()
         p.skip_newlines()
 
+        var first = true
+
         loop
             if p.at(Dedent) || p.at(Eof) then break
 
             val before = p.report.len()
 
-            if at_assoc(p) then decl.assocs.push(parse_assoc_bind(p))
+            if refuse_stray_member(p, first, InImpl) then ()
+            elif at_assoc(p) then decl.assocs.push(parse_assoc_bind(p))
             else parse_member_line(p, &decl.methods, InImpl)
 
             if p.report.len() != before && !p.end_of_statement() then drop_line(p)
 
             p.skip_newlines()
+
+            first = false
 
         if !p.accept(Dedent) then p.want("dedent")
     end if

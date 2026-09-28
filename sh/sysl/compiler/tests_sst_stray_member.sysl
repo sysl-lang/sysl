@@ -1,0 +1,185 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{repeat}
+
+// A line under a type's body that no member can begin with is where the body ENDED, so what is
+// missing is the dedent that closes it: `dedent expected`, at the stray token. Every message and
+// location here is the reference's own output (sysl 0.0.149) for the same file, with the scratch
+// directory put back in for its path.
+//
+// **The caret is one column wide**, which is this compiler's parse report by design (`diag.sysl`'s
+// `parse_report` points at a position rather than an extent); the reference draws it as wide as
+// the token under it -- `^^^^^^` under `123456` -- which is a difference about every parse
+// diagnostic and not about this rule.
+
+private sst_ready() -> bool = std_root().is_ok()
+
+// What `sysl build <dir>` says about a project holding one `main.sysl`, and the directory.
+private sst_run(text: string) -> (string, string, int)
+    val root = make_temp_dir("sysl-sst").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build", root], (line) -> sink.push(line))
+    val out = if lines.is_empty() then "" else lines.at(0)
+
+    remove_dir_all(root).unwrap_or(())
+    (out, absolute_path(root), code)
+
+// `quoted` is the line the diagnostic quotes; the caret stands under column `col`.
+private sst_expect(text: string, message: string, line: int, col: int, quoted: string)
+    val (out, root, code) = sst_run(text)
+    val pad = repeat(" ", usize(col - 1))
+
+    assert_eq(code, 1)
+    assert_eq(out, s"error: $message\n --> $root/main.sysl:$line:$col\n  |\n$line | $quoted\n  | $pad^")
+
+private sst_dedent(text: string, line: int, col: int, quoted: string)
+    sst_expect(text, "dedent expected", line, col, quoted)
+
+// -- a struct's body ----------------------------------------------------------------------------
+
+@test("a stray number under a struct's fields is 'dedent expected' at the number")
+sst_struct_number()
+    if !sst_ready() then return
+
+    sst_dedent("struct P\n    x: int\n    123456\n", 3, 5, "    123456")
+
+@test("a stray string under a struct's fields is 'dedent expected' at the string")
+sst_struct_string()
+    if !sst_ready() then return
+
+    sst_dedent("struct P\n    x: int\n    \"hi\"\n", 3, 5, "    \"hi\"")
+
+@test("a stray operator under a struct's fields is 'dedent expected' at the operator")
+sst_struct_operator()
+    if !sst_ready() then return
+
+    sst_dedent("struct P\n    x: int\n    +\n", 3, 5, "    +")
+
+@test("a statement word under a struct's fields is 'dedent expected' at the word")
+sst_struct_keyword()
+    if !sst_ready() then return
+
+    sst_dedent("struct P\n    x: int\n    return\n", 3, 5, "    return")
+    sst_dedent("struct P\n    x: int\n    if\n", 3, 5, "    if")
+    sst_dedent("struct P\n    x: int\n    true\n", 3, 5, "    true")
+
+@test("'type' begins nothing in a struct's body, so it ends the body there")
+sst_struct_type_word()
+    if !sst_ready() then return
+
+    sst_dedent("struct P\n    x: int\n    type\n", 3, 5, "    type")
+
+@test("an opening bracket under a struct's fields is 'dedent expected' at the bracket")
+sst_struct_bracket()
+    if !sst_ready() then return
+
+    sst_dedent("struct P\n    x: int\n    (1)\n", 3, 5, "    (1)")
+    sst_dedent("struct P\n    x: int\n    [1]\n", 3, 5, "    [1]")
+
+@test("a stray line after a method's own block is 'dedent expected' at the stray line")
+sst_struct_after_method()
+    if !sst_ready() then return
+
+    sst_dedent("struct P\n    x: int\n    f(self) -> int\n        val y = 1\n        y\n    123456\n",
+               6, 5, "    123456")
+    sst_dedent("struct P\n    x: int\n    f(self) -> int = 1\n    123456\n", 4, 5, "    123456")
+
+@test("a struct written inside a struct's body ends the body at its 'struct'")
+sst_struct_nested_struct()
+    if !sst_ready() then return
+
+    sst_dedent("struct P\n    x: int\n    struct Q\n        y: int\n        123456\n", 3, 5,
+               "    struct Q")
+
+// The first line of a body is read as a member whatever it is, a body holding at least one, so
+// there the refusal is about the name it lacks.
+@test("a stray line as a body's FIRST line is still 'identifier expected'")
+sst_first_line_wants_a_name()
+    if !sst_ready() then return
+
+    sst_expect("struct P\n    123456\n", "identifier expected", 2, 5, "    123456")
+    sst_expect("enum E\n    123456\n", "identifier expected", 2, 5, "    123456")
+    sst_expect("trait T\n    123456\n", "identifier expected", 2, 5, "    123456")
+
+// A reserved word followed by a `:` is a field misnamed, not a stray line.
+@test("a reserved word written as a later field's name is refused in the field rule's words")
+sst_reserved_field_name()
+    if !sst_ready() then return
+
+    sst_expect("struct P\n    x: int\n    return: int\nmain() -> unit\n    print(1)\n",
+               "'return' is a reserved word, so it cannot stand as a parameter's name or a field's — write it '`return`' if that is the name you want, which is what the backticks are for: a quoted word is an ordinary name wherever one may be written",
+               3, 5, "    return: int")
+
+@test("a later line beginning with 'static' or 'private' is still read as a member")
+sst_later_modifier_is_a_member()
+    if !sst_ready() then return
+
+    sst_expect("struct P\n    x: int\n    static 5\n", "identifier expected", 3, 12, "    static 5")
+    sst_expect("struct P\n    x: int\n    private 5\n", "identifier expected", 3, 13,
+               "    private 5")
+
+// -- an enum's body -----------------------------------------------------------------------------
+
+@test("a stray number, string, operator or statement word under an enum's variants")
+sst_enum_strays()
+    if !sst_ready() then return
+
+    sst_dedent("enum E\n    A\n    123456\n", 3, 5, "    123456")
+    sst_dedent("enum E\n    A\n    \"hi\"\n", 3, 5, "    \"hi\"")
+    sst_dedent("enum E\n    A\n    +\n", 3, 5, "    +")
+    sst_dedent("enum E\n    A\n    return\n", 3, 5, "    return")
+    sst_dedent("enum E\n    A\n    if\n", 3, 5, "    if")
+
+@test("a stray operator after a variant carrying a payload")
+sst_enum_after_payload()
+    if !sst_ready() then return
+
+    sst_dedent("enum E\n    A(x: int)\n    +\n", 3, 5, "    +")
+
+// -- a trait's body -----------------------------------------------------------------------------
+
+@test("a stray number, string, operator or statement word under a trait's members")
+sst_trait_strays()
+    if !sst_ready() then return
+
+    sst_dedent("trait T\n    f(self) -> int\n    123456\n", 3, 5, "    123456")
+    sst_dedent("trait T\n    f(self) -> int\n    \"hi\"\n", 3, 5, "    \"hi\"")
+    sst_dedent("trait T\n    f(self) -> int\n    +\n", 3, 5, "    +")
+    sst_dedent("trait T\n    f(self) -> int\n    return\n", 3, 5, "    return")
+
+@test("'type' in a trait's body begins an associated type, and is read as one")
+sst_trait_type_is_a_member()
+    if !sst_ready() then return
+
+    sst_expect("trait T\n    f(self) -> int\n    type 5\n", "identifier expected", 3, 10, "    type 5")
+
+// -- an impl block's body -----------------------------------------------------------------------
+
+private sst_impl(stray: string) -> string =
+    s"trait T\n    f(self) -> int\nstruct P\n    x: int\nimpl T for P\n    f(self) -> int = 1\n    $stray\n"
+
+@test("a stray number, string, operator or statement word under an impl block's members")
+sst_impl_strays()
+    if !sst_ready() then return
+
+    sst_dedent(sst_impl("123456"), 7, 5, "    123456")
+    sst_dedent(sst_impl("\"hi\""), 7, 5, "    \"hi\"")
+    sst_dedent(sst_impl("+"), 7, 5, "    +")
+    sst_dedent(sst_impl("return"), 7, 5, "    return")
+
+// -- a type declared inside a block -------------------------------------------------------------
+
+@test("a stray line under a struct or an enum declared inside a function's body")
+sst_nested_block()
+    if !sst_ready() then return
+
+    sst_dedent("f() -> int\n    struct P\n        x: int\n        123456\n    1\n", 4, 9,
+               "        123456")
+    sst_dedent("f() -> int\n    enum E\n        A\n        \"hi\"\n    1\n", 4, 9, "        \"hi\"")
