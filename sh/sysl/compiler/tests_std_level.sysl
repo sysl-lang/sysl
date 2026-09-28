@@ -96,8 +96,7 @@ end stdlv_two_levels_are_two_archives
 // The reference's `emit-llvm` takes the level in the three spellings `build` does and prints the same
 // text at every one: `-O0`, `-O3`, `-O 3` and `--optimize s` over one program were byte-identical
 // (438 lines) out of 0.0.146. What the level changes is the archive resolved for the declarations,
-// so a level clang has no answer for fails the command the way it fails a build -- 0.0.146 answers
-// `-Ononsense` with exit 1 and clang's own `invalid integral value 'nonsense' in '-Ononsense'`.
+// so a level clang has no answer for is refused by this command the way a build refuses it.
 
 private stdlv_project(config: string) -> string
     val root = make_temp_dir("sysl-stdlv-").unwrap()
@@ -159,21 +158,38 @@ stdlv_emit_llvm_refuses_a_bare_level()
         assert(got.1.index_of("[-O<level>]").is_some(), got.1)
 end stdlv_emit_llvm_refuses_a_bare_level
 
-// Nothing in `emit-llvm` hands clang anything but the standard module's build, so clang's refusal of
-// the level is the proof the level reached the archive -- and, over a manifest naming a good one,
-// that the flag beat the key.
+// The text is the same at every level, so the proof that a level reached the archive is the archive:
+// `-Og`, which nothing else here builds at, named over a manifest naming `0`, and its directory is
+// what appears -- the flag having beaten the key. A level clang has no answer for never gets that
+// far: 0.0.148 answers `emit-llvm -Ononsense` with exit 1 and
+// `sysl: error: '-Ononsense' names no level clang has — it is one of 0, 1, 2, 3, s, z, fast, g`,
+// and no `-Ononsense` directory is made.
 @test("emit-llvm builds the standard module at the level named, and the flag beats the manifest")
 stdlv_emit_llvm_level_reaches_the_archive()
-    if std_root().is_err() then return
+    if std_root().is_err() || cache_directory().is_none() then return
+
+    val t = host_target()
+    val fingerprint = std_fingerprint(std_root().unwrap(), t).unwrap()
+    val archive = std_artifact_path(t, fingerprint, "g")
+    val refused = std_artifact_path(t, fingerprint, "nonsense")
+
+    remove_dir_all(parent_of(archive).unwrap()).unwrap_or(())
 
     val root = stdlv_project("optimization = \"0\"\n")
     val keyed = stdlv_run(["sysl", "emit-llvm", root])
 
     assert_eq(keyed.0, 0, keyed.1)
+    assert(metadata(archive).is_err(), s"'$archive' was built by a run that named no level")
 
-    val flagged = stdlv_run(["sysl", "emit-llvm", "-Ononsense", root])
+    val flagged = stdlv_run(["sysl", "emit-llvm", "-Og", root])
 
-    assert_eq(flagged.0, 1, flagged.1)
-    assert(flagged.1.index_of("invalid integral value 'nonsense' in '-Ononsense'").is_some(), flagged.1)
+    assert_eq(flagged.0, 0, flagged.1)
+    assert(metadata(archive).is_ok(), s"'$archive' was not built by the run that named it")
+
+    val wrong = stdlv_run(["sysl", "emit-llvm", "-Ononsense", root])
+
+    assert_eq(wrong.0, 1, wrong.1)
+    assert_eq(wrong.1, "error: '-Ononsense' names no level clang has — it is one of 0, 1, 2, 3, s, z, fast, g")
+    assert(metadata(parent_of(refused).unwrap()).is_err(), s"'$refused' has a directory")
     remove_dir_all(root).unwrap_or(())
 end stdlv_emit_llvm_level_reaches_the_archive

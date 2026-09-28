@@ -153,7 +153,7 @@ end emit_typed_command
 //
 // **The level changes which standard-module archive is resolved, not the text**: the reference
 // prints the same bytes at every level and builds or reuses the archive at the one named, so a
-// level clang has no answer for fails here exactly as it fails a build.
+// level clang has no answer for is refused here exactly as a build refuses it.
 //
 // **The reference compiler answers this command line with the text it hands to the back end**, so
 // the two are diffed rather than compared by hand. The path is a program on the same terms
@@ -211,7 +211,13 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
-    emit_llvm_text(file, named, build_level(file, level)) match
+    val at = build_level(file, level) match
+        Err(why) ->
+            say_failure(why, say)
+            return Failed
+        Ok(resolved) -> resolved
+
+    emit_llvm_text(file, named, at) match
         Err(why) ->
             say_failure(why, say)
             Failed
@@ -295,7 +301,13 @@ private build_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
-    build_native_program(file, named, cc, build_level(file, level), out) match
+    val at = build_level(file, level) match
+        Err(why) ->
+            say_failure(why, say)
+            return Failed
+        Ok(resolved) -> resolved
+
+    build_native_program(file, named, cc, at, out) match
         Err(why) ->
             say_failure(why, say)
             Failed
@@ -390,7 +402,13 @@ private build_c_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
-    build_c_archive(file, named, cc, build_level(file, level), out, header, say) match
+    val at = build_level(file, level) match
+        Err(why) ->
+            say_failure(why, say)
+            return Failed
+        Ok(resolved) -> resolved
+
+    build_c_archive(file, named, cc, at, out, header, say) match
         Err(why) ->
             say_failure(why, say)
             Failed
@@ -466,7 +484,13 @@ private run_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
-    run_native_program(file, named, cc, build_level(file, level), program_args) match
+    val at = build_level(file, level) match
+        Err(why) ->
+            say_failure(why, say)
+            return Failed
+        Ok(resolved) -> resolved
+
+    run_native_program(file, named, cc, at, program_args) match
         Err(why) ->
             say_failure(why, say)
             Failed
@@ -548,7 +572,11 @@ private test_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
-    val level = build_level(file, named_level)
+    val level = build_level(file, named_level) match
+        Err(why) ->
+            say_failure(why, say)
+            return Failed
+        Ok(resolved) -> resolved
 
     // **What was built last time, where nothing that can reach the bytes has changed**
     // (`run_cache.sysl`). It is asked before anything is analyzed, because the compile is the whole
@@ -698,8 +726,14 @@ private build_lib_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
+    val at = build_level(file, level) match
+        Err(why) ->
+            say_failure(why, say)
+            return Failed
+        Ok(resolved) -> resolved
+
     if !std
-        return build_library_of(file, named, out, build_level(file, level)) match
+        return build_library_of(file, named, out, at) match
             Err(why) ->
                 say_failure(why, say)
                 Failed
@@ -708,7 +742,7 @@ private build_lib_command(args: []string, say: string -> unit) -> int
                 Fine
     end if
 
-    build_std_artifact_of(file, named, out, build_level(file, level)) match
+    build_std_artifact_of(file, named, out, at) match
         Err(refusal) ->
             say(s"error: ${refusal.message}")
             Failed
