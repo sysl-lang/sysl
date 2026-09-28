@@ -495,6 +495,12 @@ private module_variant(cx: &Analyzer, span: Span, receiver: Expr, name: string) 
 
     if owner.is_none() then return None
 
+    val homes = module_variant_homes(cx, receiver, name)
+
+    if homes.len() > 1 then
+        return Some(module_variant_ambiguous(cx, Span(span.end - name.bytes.len, span.end), homes,
+                                             name))
+
     for i in 0..<cx.an.tables.enum_insts.len()
         val t = cx.an.tables.enum_insts.at(i)
 
@@ -507,6 +513,54 @@ private module_variant(cx: &Analyzer, span: Span, receiver: Expr, name: string) 
 
     None
 end module_variant
+
+// The enum a variant CALL names through the module that declares it -- `m.Hit(5)`, the carrying
+// half of what `module_variant` answers for a bare `m.Gone`. The module is the qualifier whatever
+// the file imported: a wildcard, a selective import of the enum and a plain `import m` all leave
+// `m.Hit` meaning the one variant of that name the module declares, which is why the refusal for
+// two wildcards offering one name advises writing the module.
+//
+// By declaration rather than by instantiation, since a generic enum's instantiation is the values'
+// to settle, and in the order declared -- which is the order a refusal names them in, the module
+// having said where to look but not which of its enums.
+module_variant_homes(cx: &Analyzer, receiver: Expr, name: string) -> Buf[string]
+    var homes: Buf[string] = buf()
+
+    if !may_name_variant(cx, name) then return homes
+
+    val head = dotted_name_written(cx, receiver)
+
+    if head.is_none() then return homes
+
+    val owner = module_owner(cx, head.unwrap())
+
+    if owner.is_none() then return homes
+
+    for i in 0..<cx.an.tables.types.len()
+        val key = cx.an.tables.types.key_at(i)
+
+        cx.an.tables.types.at(i).kind match
+            EnumOf(ed) ->
+                if module_of(key) == owner.unwrap() && reachable_key(cx.an, key, cx.scope) &&
+                        enum_declares(ed, name) then
+                    homes.push(key)
+            _ -> ()
+
+    homes
+end module_variant_homes
+
+// Two enums of the one module declaring the variant: the module narrowed the search and did not end
+// it, so the enum is what is left to write.
+module_variant_ambiguous(cx: &Analyzer, at: Span, homes: Buf[string], name: string) -> TExpr =
+    cx.err(at, s"'$name' is a variant of ${named_series(homes)}, and nothing here says which — " +
+           s"qualify it, as '${module_show(homes.at(0))}.$name'")
+
+private enum_declares(ed: EnumDecl, name: string) -> bool
+    for i in 0..<ed.variants.len()
+        if ed.variants.at(i).name == name then return true
+
+    false
+end enum_declares
 
 // The module a written head names: the one an import bound the name to, or the path itself read
 // through the package the file sits in. Nothing where no module answers to it.
