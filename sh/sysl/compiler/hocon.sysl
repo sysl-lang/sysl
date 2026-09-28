@@ -16,22 +16,57 @@ enum Conf
     // A nested block, as a list of pairs -- in the order the file wrote them, since a warning about
     // an unknown key reads better in the reader's own order.
     Block(pairs: Buf[(string, &Conf)])
+
+    // A quoted string.
     Text(value: string)
+
+    // An unquoted scalar -- a number, or a word written without quotes. **It is kept apart from a
+    // quoted string** because the two are different answers where a key wants prose: `sdl3 = 3` is a
+    // version where a reason belonged, while `optimization = 2` is the level it spells.
+    Word(value: string)
+
     Flag(on: bool)
+
+    // A bracketed list, in the order the file wrote it.
+    Items(values: Buf[&Conf])
 end Conf
 
 // The block a whole file is.
+//
+// **A refusal says where it stopped**, as a line and a column counted from one -- a manifest is
+// edited by hand, and a message with no position leaves the reader to find the one brace that is
+// missing.
 read_conf(text: string) -> Result[&Conf, string]
     var at: usize = 0
-    val out = read_block(text, &at, true)?
+
+    val out = read_block(text, &at, true) match
+        Err(why) -> return Err(s"$why ${position_of(text, at)}")
+        Ok(block) -> block
 
     skip_blank(text, &at)
 
     if at < text.bytes.len
-        return Err(s"unexpected '${one_char(text, at)}' after the last entry")
+        return Err(s"unexpected '${one_char(text, at)}' after the last entry ${position_of(text, at)}")
 
     Ok(out)
 end read_conf
+
+// Where an offset sits, as `(line L, column C)`.
+private position_of(text: string, at: usize) -> string
+    var line: usize = 1
+    var column: usize = 1
+
+    for i in 0..<text.bytes.len
+        if i >= at then break
+
+        if text.bytes[i] == u8('\n')
+            line += 1
+            column = 1
+        else
+            column += 1
+
+    s"(line $line, column $column)"
+end position_of
 
 // One block's entries, up to its closing brace or to the end of the file.
 private read_block(text: string, at: *usize, top: bool) -> Result[&Conf, string]
@@ -43,7 +78,7 @@ private read_block(text: string, at: *usize, top: bool) -> Result[&Conf, string]
         if *at >= text.bytes.len
             if top then break
 
-            return Err("a block was opened and never closed")
+            return Err(UnclosedBlock)
         end if
 
         if text.bytes[*at] == u8('}')
@@ -77,6 +112,10 @@ private read_block(text: string, at: *usize, top: bool) -> Result[&Conf, string]
         *at += 1
         skip_blank(text, at)
 
+        // A binding with nothing after it inside a block is a block that was never closed, which is
+        // the mistake a reader fixes -- the value is what they were still typing.
+        if *at >= text.bytes.len && !top then return Err(UnclosedBlock)
+
         if *at < text.bytes.len && text.bytes[*at] == u8('{')
             *at += 1
             pairs.push((key, read_block(text, at, false)?))
@@ -108,17 +147,16 @@ private bare_key_char(c: u8) -> bool =
     (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) ||
     (c >= u8('0') && c <= u8('9')) || c == u8('_') || c == u8('-') || c == u8('.') || c == u8('+')
 
-// A value: a quoted string, `true`, `false`, or a bare word running to the end of its line.
+// The refusal for a block the file ends inside, in the words the reference's reader uses.
+private val UnclosedBlock: string = "unclosed object — expected '}'"
+
+// A value: a quoted string, `true`, `false`, a list, or a bare word running to the end of its line.
 private read_value(text: string, at: *usize) -> Result[&Conf, string]
     if *at >= text.bytes.len then return Err("a value was expected")
 
     if text.bytes[*at] == u8('"') then return Ok(Text(read_quoted(text, at)?))
 
-    if text.bytes[*at] == u8('[')
-        skip_list(text, at)?
-
-        return Ok(Text(""))
-    end if
+    if text.bytes[*at] == u8('[') then return read_list(text, at)
 
     val start = *at
 
@@ -126,33 +164,71 @@ private read_value(text: string, at: *usize) -> Result[&Conf, string]
           text.bytes[*at] != u8('}')
         *at += 1
 
-    val raw = trimmed_value(text[start..<*at])
-
-    if raw == "true" then Ok(Flag(true))
-    else if raw == "false" then Ok(Flag(false))
-    else Ok(Text(raw))
+    word_of(trimmed_value(text[start..<*at]))
 end read_value
 
-// A list is read past rather than read: nothing the driver asks about is one, and a reader that
-// refused what it does not use would fail a manifest whose other half it understands.
-private skip_list(text: string, at: *usize) -> Result[unit, string]
-    var depth: usize = 0
+private word_of(raw: string) -> Result[&Conf, string] =
+    if raw == "true" then Ok(Flag(true))
+    else if raw == "false" then Ok(Flag(false))
+    else Ok(Word(raw))
 
-    while *at < text.bytes.len
-        if text.bytes[*at] == u8('[') then depth += 1
-        else if text.bytes[*at] == u8(']')
-            depth -= 1
+// A bracketed list: values separated by commas or newlines, each a quoted string, a flag or a bare
+// word.
+//
+// **A colon in a bare word is refused**, which is HOCON's own ruling: a bare `:` separates a key from
+// its value, so `[dep:lmdb]` is a line nothing can read, and the quotes around `"dep:lmdb"` are
+// load-bearing rather than decoration.
+private read_list(text: string, at: *usize) -> Result[&Conf, string]
+    var values: Buf[&Conf] = buf()
+
+    *at += 1
+
+    loop
+        skip_blank(text, at)
+
+        if *at >= text.bytes.len then return Err("a '[' was opened and never closed")
+
+        val c = text.bytes[*at]
+
+        if c == u8(']')
             *at += 1
+            break
+        end if
 
-            if depth == 0 then return Ok(())
-
+        if c == u8(',')
+            *at += 1
             continue
         end if
 
-        *at += 1
+        if c == u8('"')
+            values.push(Text(read_quoted(text, at)?))
+            continue
+        end if
 
-    Err("a '[' was opened and never closed")
-end skip_list
+        if c == u8('[')
+            values.push(read_list(text, at)?)
+            continue
+        end if
+
+        if c == u8('{')
+            *at += 1
+            values.push(read_block(text, at, false)?)
+            continue
+        end if
+
+        val start = *at
+
+        while *at < text.bytes.len && text.bytes[*at] != u8('\n') && text.bytes[*at] != u8(',') &&
+              text.bytes[*at] != u8(']')
+            if text.bytes[*at] == u8(':') || text.bytes[*at] == u8('=') || text.bytes[*at] == u8('{')
+                return Err("unexpected token in value")
+
+            *at += 1
+
+        values.push(word_of(trimmed_value(text[start..<*at]))?)
+
+    Ok(Items(values))
+end read_list
 
 private trimmed_value(text: string) -> string
     var lo: usize = 0
@@ -183,13 +259,21 @@ private read_quoted(text: string, at: *usize) -> Result[string, string]
             return Ok(out.finish())
         end if
 
+        // **A byte at a time is a byte, not a character**: a non-ASCII character is several bytes,
+        // and each pushed as a `char` of its own would re-encode it as something else.
         if c == u8('\\') && *at + 1 < text.bytes.len
             *at += 1
             out.push_char(char(escaped(text.bytes[*at])))
+            *at += 1
         else
-            out.push_char(char(c))
+            val start = *at
 
-        *at += 1
+            *at += 1
+
+            while *at < text.bytes.len && text.bytes[*at] != u8('"') && text.bytes[*at] != u8('\\')
+                *at += 1
+
+            out.push(text[start..<*at])
 
     Err("a quoted string was opened and never closed")
 end read_quoted
@@ -243,9 +327,42 @@ conf_text(c: &Conf, key: string) -> string
         None -> ""
         Some(v) -> *v match
             Text(s) -> s
+            Word(s) -> s
             Flag(b) -> if b then "true" else "false"
             _ -> ""
 end conf_text
+
+// The scalars a list holds, as text, or nothing where the value is not a list of scalars.
+conf_list(c: &Conf) -> Option[Buf[string]]
+    var out: Buf[string] = buf()
+
+    *c match
+        Items(values) ->
+            for i in 0..<values.len()
+                *values.at(i) match
+                    Text(s) -> out.push(s)
+                    Word(s) -> out.push(s)
+                    _ -> return None
+        _ -> return None
+
+    Some(out)
+end conf_list
+
+// Whether a value is prose a person wrote: a quoted string, or a bare word that is not a number.
+conf_is_prose(c: &Conf) -> bool
+    *c match
+        Text(_) -> true
+        Word(s) -> s.is_empty() || !((s.bytes[0] >= u8('0') && s.bytes[0] <= u8('9')) ||
+                                     s.bytes[0] == u8('-'))
+        _ -> false
+end conf_is_prose
+
+// Whether a value is a block.
+conf_is_block(c: &Conf) -> bool
+    *c match
+        Block(_) -> true
+        _ -> false
+end conf_is_block
 
 // The names a block wrote, in the order it wrote them.
 conf_keys(c: &Conf) -> Buf[string]

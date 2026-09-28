@@ -1,0 +1,1313 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, Search}
+
+// The project config (`reference/packages.md § What a project is called`): what `package.hocon`
+// says, and what a file that says it wrongly is told.
+//
+// **Reading is a pure function of the file's text**, so every case here asks `read_manifest` and
+// nothing touches a disk. **Every refusal quoted here was read out of the reference compiler**, by
+// handing the installed `sysl` a project whose manifest is the case's text and quoting what `sysl
+// build` said -- less the `package.hocon: ` a build puts in front of a statement about a key, which
+// `manifest_refusal` adds back.
+
+private read(text: string) -> Manifest = read_manifest(text).unwrap()
+
+private refused(text: string) -> string = read_manifest(text) match
+    Err(why) -> why
+    Ok(_) -> "(read)"
+
+private joined(names: &Buf[string]) -> string = join(names.view(), ",")
+
+private labels_of(deps: &Buf[Dependency]) -> string
+    var out: Buf[string] = buf()
+
+    for i in 0..<deps.len()
+        out.push(deps.at(i).label)
+
+    joined(out)
+end labels_of
+
+private provided(text: string, target: string) -> string = joined(manifest_provides(read(text), target))
+
+private feature(m: &Manifest, name: string) -> string
+    for i in 0..<m.features.len()
+        if m.features.at(i).0 == name then return joined(m.features.at(i).1)
+
+    "(no such feature)"
+end feature
+
+private header(m: &Manifest, name: string) -> string
+    for i in 0..<m.headers.len()
+        if m.headers.at(i).0 == name then return s"${m.headers.at(i).1}|${m.headers.at(i).2}"
+
+    "(no such header)"
+end header
+
+private header_names(m: &Manifest) -> string
+    var out: Buf[string] = buf()
+
+    for i in 0..<m.headers.len()
+        out.push(m.headers.at(i).0)
+
+    joined(out)
+end header_names
+
+private pkg_config_names(m: &Manifest) -> string
+    var out: Buf[string] = buf()
+
+    for i in 0..<m.pkg_config.len()
+        out.push(m.pkg_config.at(i).0)
+
+    joined(out)
+end pkg_config_names
+
+private claim(label: string, alloc: string, free: string) -> (string, (string, string)) =
+    (label, (alloc, free))
+
+private pair_of(r: Result[(string, string), string]) -> string = r match
+    Ok(p) -> s"${p.0} / ${p.1}"
+    Err(why) -> why
+
+private refusal_of(r: Result[(string, string), string]) -> string = r match
+    Ok(_) -> "(chosen)"
+    Err(why) -> why
+
+// -- an unknown key --------------------------------------------------------------------------------
+
+// **An unknown key is said out loud and then ignored.** Whatever a released parser does with a key it
+// does not know is the compatibility floor every later manifest has to clear: refuse, and no key can
+// ever be added without breaking every released compiler; ignore silently, and a mistyped block does
+// nothing and says nothing.
+@test("an unknown key at the top level is reported and ignored")
+pkgcfg_unknown_top_key()
+    val m = read("profiles { release { } }")
+
+    assert_eq(m.warnings.len(), 1)
+    assert_eq(m.warnings.at(0),
+              "package.hocon: 'profiles' is not something this sysl understands, and is ignored — " +
+              "either it is a misspelling, or it was added by a newer compiler")
+
+// The point of warning rather than refusing: the rest of the file still takes effect, so a project
+// built by a compiler older than one of its keys still builds.
+@test("an unknown key does not stop the keys beside it from being read")
+pkgcfg_unknown_key_beside_others()
+    val m = read("package { name = \"thing\", version = \"1.0.0\" }\nprofiles { release { } }\n")
+
+    assert_eq(m.name, "thing")
+    assert_eq(m.version, "1.0.0")
+    assert_eq(m.warnings.len(), 1)
+
+@test("an unknown key inside 'package' is reported the same way, under its own path")
+pkgcfg_unknown_package_key()
+    val m = read("package { name = \"thing\", licence = \"MIT\" }")
+
+    assert_eq(m.warnings.len(), 1)
+    assert_eq(m.warnings.at(0),
+              "package.hocon: 'package.licence' is not something this sysl understands, and is " +
+              "ignored — either it is a misspelling, or it was added by a newer compiler")
+
+// One per key, so a file with two mistakes is told about both rather than about whichever came
+// first -- which is the behaviour a refusal cannot have.
+@test("and each unknown key is reported, not merely the first")
+pkgcfg_each_unknown_key()
+    val m = read("alpha { }\nbeta { }\n")
+
+    assert_eq(m.warnings.len(), 2)
+    assert(m.warnings.at(0).index_of("'alpha'").is_some(), m.warnings.at(0))
+    assert(m.warnings.at(1).index_of("'beta'").is_some(), m.warnings.at(1))
+
+// The negative control: everything the format actually has must stay silent, or the warning is noise
+// and gets ignored the way noise is.
+@test("while a file using every block this compiler knows says nothing")
+pkgcfg_every_known_block_is_silent()
+    val m = read("package { name = \"thing\", version = \"1.0.0\", sysl = \"0.0.80\" }\n" +
+                 "targets { default = \"aarch64-macos\" }\n" +
+                 "capabilities { heap = true }\n" +
+                 "requires { heap = true }\n" +
+                 "dependencies { }\n" +
+                 "defines { }\n")
+
+    assert(m.warnings.is_empty(), joined(m.warnings))
+
+// **The argued refusal is untouched.** It is about a closed vocabulary rather than a growing one:
+// somebody who wrote `versoin` believes they have pinned a version, and resolving the default branch
+// while they believe it is worse than stopping.
+@test("but a misspelling inside 'dependencies' is still refused, not warned about")
+pkgcfg_dependency_misspelling_is_refused()
+    assert_eq(refused("dependencies { ogol { git = \"github.com/sysl-lang/ogol\", versoin = \"0.1.0\" } }"),
+              "'dependencies.ogol.versoin' is not something a dependency says — the keys are " +
+              "'default_features', 'features', 'git', 'mount', 'optional', 'path', 'version'")
+
+// -- no file, an empty file --------------------------------------------------------------------------
+
+@test("a project may have no file at all, and every capability is then provided")
+pkgcfg_no_file_provides_everything()
+    assert_eq(joined(manifest_provides(empty_manifest(), "aarch64-macos")), "heap,os,posix")
+
+@test("an empty file is a project that said nothing")
+pkgcfg_empty_file_is_empty()
+    val m = read("")
+
+    assert_eq(m.name, "")
+    assert_eq(m.version, "")
+    assert_eq(m.floor, "")
+    assert_eq(m.default_target, "")
+    assert(m.requires.is_empty(), "requires")
+    assert(m.dependencies.is_empty(), "dependencies")
+    assert(m.dev_dependencies.is_empty(), "dev_dependencies")
+    assert(m.capabilities.is_empty(), "capabilities")
+    assert(m.target_capabilities.is_empty(), "target capabilities")
+    assert(m.pkg_config.is_empty(), "pkg_config")
+    assert(m.headers.is_empty(), "headers")
+    assert(m.defines.is_empty(), "defines")
+    assert(m.targets.is_empty(), "targets")
+    assert(m.allocator.is_none(), "allocator")
+    assert(m.features.is_empty(), "features")
+    assert(m.optimization.is_none(), "optimization")
+    assert(m.warnings.is_empty(), "warnings")
+end pkgcfg_empty_file_is_empty
+
+// -- identity ----------------------------------------------------------------------------------------
+
+@test("a name and a version")
+pkgcfg_a_name_and_a_version()
+    val m = read("package {\n  name    = \"geom\"\n  version = \"1.4.2\"\n}\n")
+
+    assert_eq(m.name, "geom")
+    assert_eq(m.version, "1.4.2")
+
+@test("and neither a name nor a version is required")
+pkgcfg_neither_is_required()
+    assert_eq(read("targets { default = \"x86_64-linux\" }").name, "")
+
+// The name is what a directory project's output is called, so it reaches the filesystem. Each of
+// these is refused rather than sanitized: both silent repairs -- falling back to the directory name,
+// or flattening the separator -- write a different executable and say nothing.
+@test("a name that is a path rather than a name is refused")
+pkgcfg_a_name_that_is_a_path()
+    assert_eq(refused("package { name = \"build/tool\" }"),
+              "'package.name' is what this project's output is called, so 'build/tool' cannot be " +
+              "one — it names a path rather than a name")
+    assert_eq(refused("package { name = \"..\\\\tool\" }"),
+              "'package.name' is what this project's output is called, so '..\\tool' cannot be one " +
+              "— it names a path rather than a name")
+
+// Both are legal path segments and neither names a file, so the link would fail at the far end with
+// a message about a directory instead of about this line.
+@test("and so are the two segments that name a directory")
+pkgcfg_the_two_directory_segments()
+    assert_eq(refused("package { name = \".\" }"),
+              "'package.name' is what this project's output is called, so '.' cannot be one — it " +
+              "names a path rather than a name")
+    assert_eq(refused("package { name = \"..\" }"),
+              "'package.name' is what this project's output is called, so '..' cannot be one — it " +
+              "names a path rather than a name")
+
+@test("an empty name is refused as its own mistake")
+pkgcfg_an_empty_name()
+    assert_eq(refused("package { name = \"\" }"), "'package.name' is empty")
+
+// A name with spaces or dots in it is awkward rather than wrong, and the shell can quote it.
+@test("while an unusual but usable name is left alone")
+pkgcfg_an_unusual_name()
+    assert_eq(read("package { name = \"my tool\" }").name, "my tool")
+    assert_eq(read("package { name = \"tool.v2\" }").name, "tool.v2")
+
+// -- the compiler floor ------------------------------------------------------------------------------
+
+@test("a package may state a compiler floor")
+pkgcfg_a_floor()
+    assert_eq(read("package { name = \"sdl3\"\n version = \"0.2.6\"\n sysl = \"0.0.62\" }").floor,
+              "0.0.62")
+
+@test("and saying nothing about a floor is the ordinary case")
+pkgcfg_no_floor()
+    assert_eq(read("package { name = \"sdl3\" }").floor, "")
+
+@test("a floor that is not a version is refused, and the field is named")
+pkgcfg_a_floor_that_is_not_a_version()
+    assert_eq(refused("package { sysl = \">= 0.0.62\" }"),
+              "'package.sysl' names the oldest compiler this package builds with, and '>= 0.0.62' " +
+              "is not a version — a version is three numbers, as in '1.4.2'")
+
+@test("an interim spelling of a floor is refused too -- a package states a release")
+pkgcfg_an_interim_floor()
+    assert_eq(refused("package { sysl = \"0.0.66-fcf4e33a\" }"),
+              "'package.sysl' names the oldest compiler this package builds with, and " +
+              "'0.0.66-fcf4e33a' is not a version — a version is three numbers, as in '1.4.2'")
+
+@test("an older compiler is refused, naming the package, the floor and what is in hand")
+pkgcfg_an_older_compiler()
+    val m = read("package { sysl = \"0.0.62\" }")
+
+    assert_eq(check_floor("github.com/sysl-lang/sdl3 v0.2.6", m.floor, "0.0.61").unwrap(),
+              "github.com/sysl-lang/sdl3 v0.2.6 cannot be built because it requires sysl 0.0.62 or " +
+              "newer, while the compiler in hand is 0.0.61")
+
+@test("the floor itself is old enough, and so is anything above it")
+pkgcfg_the_floor_itself()
+    val m = read("package { sysl = \"0.0.62\" }")
+
+    assert(check_floor("this project", m.floor, "0.0.62").is_none(), "the floor itself")
+    assert(check_floor("this project", m.floor, "0.1.0").is_none(), "a minor above it")
+    assert(check_floor("this project", m.floor, "1.0.0").is_none(), "a major above it")
+
+@test("a package that states no floor is never refused")
+pkgcfg_no_floor_is_never_refused()
+    assert(check_floor("this project", empty_manifest().floor, "0.0.1").is_none(), "no floor")
+
+// An interim is stamped `<next patch>-<sha>`, which a floor may not be written as and which a
+// comparison still has to answer. It satisfies whatever its numbers reach, which is Cargo's ruling
+// for a nightly toolchain against `rust-version`.
+@test("an interim compiler is read as the numbers it carries")
+pkgcfg_an_interim_compiler()
+    assert_eq(release_shown(release_of_compiler("0.0.66-fcf4e33a").unwrap()), "0.0.66")
+    assert_eq(release_shown(release_of_compiler("0.0.65").unwrap()), "0.0.65")
+    assert(check_floor("this project", read("package { sysl = \"0.0.65\" }").floor,
+                       "0.0.66-fcf4e33a").is_none(), "dev heading for 0.0.66")
+
+// Nothing here may be the thing that stops a build: a version the compiler cannot read is its own,
+// and making no claim is the only honest answer to that.
+@test("a compiler version that will not read makes no claim")
+pkgcfg_an_unreadable_compiler_version()
+    assert(release_of_compiler("dirty").is_none(), "no claim")
+
+// -- targets -----------------------------------------------------------------------------------------
+
+@test("'default' names a target rather than being one")
+pkgcfg_default_names_a_target()
+    val m = read("targets {\n  default = \"x86_64-linux\"\n}\n")
+
+    assert_eq(m.default_target, "x86_64-linux")
+    assert(m.targets.is_empty(), "and it is not a machine")
+
+@test("a targets block may declare a machine the registry does not have")
+pkgcfg_a_declared_machine()
+    val m = read("targets {\n  aarch64-kernel {\n    triple = \"aarch64-none-elf\"\n  }\n}\n")
+
+    assert_eq(declared_triple(m, "aarch64-kernel").unwrap(), "aarch64-none-elf")
+
+@test("a capability set is read, and what it does not mention stays provided")
+pkgcfg_a_capability_set()
+    assert_eq(provided("targets {\n  aarch64-kernel {\n    triple = \"aarch64-none-elf\"\n" +
+                       "    capabilities { os = false, posix = false }\n  }\n}\n", "aarch64-kernel"),
+              "heap")
+
+@test("a target the file says nothing about provides everything")
+pkgcfg_an_unmentioned_target()
+    val text = "targets {\n  aarch64-kernel { capabilities { heap = false } }\n}\n"
+
+    assert_eq(provided(text, "x86_64-linux"), "heap,os,posix")
+    assert_eq(provided(text, "aarch64-kernel"), "os,posix")
+
+// Whether a heap exists is a project engineering decision, so it is stated once for the project
+// rather than once per machine it is built for.
+@test("a project states its own capability policy, for every target it builds for")
+pkgcfg_a_project_policy()
+    assert_eq(provided("capabilities { heap = false }\n", "aarch64-macos"), "os,posix")
+    assert_eq(provided("capabilities { heap = false }\n", "thumbv7em-freestanding"), "os,posix")
+
+@test("and a target block layers over it, for the one machine where it is not so")
+pkgcfg_a_target_layers_over()
+    val text = "capabilities { heap = false }\ntargets {\n  aarch64-macos { capabilities { heap = true } }\n}\n"
+
+    assert(provided(text, "aarch64-macos").index_of("heap").is_some(), "the machine's own word")
+    assert(provided(text, "thumbv7em-freestanding").index_of("heap").is_none(), "the project's")
+
+// A target block saying one thing does not discard what the project said about the others.
+@test("the layering is per capability, not per block")
+pkgcfg_layering_is_per_capability()
+    assert_eq(provided("capabilities { heap = false, posix = false }\ntargets {\n" +
+                       "  kernel { capabilities { posix = true } }\n}\n", "kernel"),
+              "os,posix")
+
+// `alloc` is what a *module* promises about its conduct and `heap` is the facility, so the config
+// wants `heap`. The old word is accepted and mapped because **a tag is immutable**: every package
+// fetched at a pinned version whose file says `requires { alloc = true }` always will.
+@test("the module's own word is accepted in the config and mapped, so a pinned dependency still reads")
+pkgcfg_alloc_is_mapped_to_heap()
+    assert(provided("capabilities { alloc = false }\n", "aarch64-macos").index_of("heap").is_none(),
+           "a capability")
+    assert_eq(joined(read("requires { alloc = true }\n").requires), "heap")
+
+@test("while a capability word that is neither is still refused")
+pkgcfg_a_capability_word_that_is_neither()
+    assert_eq(refused("capabilities { treads = false }\n"),
+              "'treads' in 'capabilities' is not a capability — the set is 'heap', 'os', 'posix'")
+
+// It parsed cleanly and was then dropped, so the file read as though the project had said something.
+// It is the spelling reached for first.
+@test("'requires' with a false says nothing, and is refused rather than discarded")
+pkgcfg_requires_false_says_nothing()
+    assert_eq(refused("requires { heap = false }\n"),
+              "'requires { heap = false }' says nothing — 'requires' is what this package needs its " +
+              "host to have. To say the machine has no heap, write it in the project's own " +
+              "'capabilities { heap = false }'; to say a module does not use it, write '@no_alloc' " +
+              "in that module's files")
+
+@test("a target's capability that is not one is refused, rather than quietly doing nothing")
+pkgcfg_a_target_capability_that_is_not_one()
+    assert_eq(refused("targets {\n  kernel { capabilities { treads = false } }\n}\n"),
+              "'treads' in 'targets.kernel.capabilities' is not a capability — the set is 'heap', " +
+              "'os', 'posix'")
+
+@test("a capability that is not true or false")
+pkgcfg_a_capability_that_is_not_a_flag()
+    assert_eq(refused("targets {\n  kernel { capabilities { heap = \"no\" } }\n}\n"),
+              "'targets.kernel.capabilities.heap' must be true or false")
+
+@test("a target that is a name where a block was expected")
+pkgcfg_a_target_that_is_a_name()
+    assert_eq(refused("targets {\n  kernel = \"aarch64-none-elf\"\n}\n"),
+              "'targets.kernel' is not a block describing a target")
+
+// -- a package's own requires block ------------------------------------------------------------------
+
+@test("a requires block names what the package needs of whatever builds it")
+pkgcfg_requires_names_a_need()
+    assert_eq(joined(read("requires { os = true }").requires), "os")
+
+@test("and folds in what that implies — posix needs an operating system under it")
+pkgcfg_posix_implies_os()
+    assert_eq(joined(read("requires { posix = true }").requires), "os,posix")
+
+// A package cannot need a facility *not* to exist, so there is nothing for the entry to mean.
+@test("a false requires entry is refused, since 'requires' cannot ask for an absence")
+pkgcfg_requires_cannot_ask_for_an_absence()
+    assert_eq(refused("requires { os = false }"),
+              "'requires { os = false }' says nothing — 'requires' is what this package needs its " +
+              "host to have. To say the machine has no os, write it in the project's own " +
+              "'capabilities { os = false }'; to say a module does not use it, write '@no_os' in " +
+              "that module's files")
+
+@test("a requires entry naming something that is not a capability")
+pkgcfg_requires_a_non_capability()
+    assert_eq(refused("requires { sockets = true }"),
+              "'sockets' in 'requires' is not a capability — the set is 'heap', 'os', 'posix'")
+
+// -- the headers a package requires ------------------------------------------------------------------
+
+@test("required headers are read as a name and the reason the consumer is given")
+pkgcfg_headers_are_read()
+    val m = read("requires {\n  headers { lwip = \"lwIP's headers, from the pico-sdk\" }\n}\n")
+
+    assert_eq(header_names(m), "lwip")
+    assert_eq(header(m, "lwip"), "lwIP's headers, from the pico-sdk|")
+
+// The two kinds of requirement share the block, so each has to survive the other being there.
+@test("required headers sit beside the capabilities without disturbing them")
+pkgcfg_headers_beside_capabilities()
+    val m = read("requires {\n  os = true\n  headers { lwip = \"lwIP's headers\" }\n}\n")
+
+    assert_eq(joined(m.requires), "os")
+    assert_eq(header_names(m), "lwip")
+
+@test("and a file that declares no headers needs none")
+pkgcfg_no_headers()
+    assert(read("requires { os = true }").headers.is_empty(), "none")
+
+@test("a header requirement's name a command line could not carry is refused")
+pkgcfg_a_header_name_a_flag_cannot_carry()
+    assert_eq(refused("requires { headers { \"lw/ip\" = \"why\" } }"),
+              "'lw/ip' is not usable as a header requirement's name — it is written on a command " +
+              "line as '--include-path <name>=<dir>', so it must be letters, digits, '_' and '-', " +
+              "starting with a letter")
+
+@test("a header reason that says nothing is refused, because the reason is the point")
+pkgcfg_a_header_reason_that_says_nothing()
+    assert_eq(refused("requires { headers { lwip = \"\" } }"),
+              "'requires.headers.lwip' says nothing about what it needs — the text is quoted back " +
+              "at whoever has to supply the path, so an empty one helps nobody")
+
+@test("and a flag where the header reason belongs is refused as the wrong kind of thing")
+pkgcfg_a_header_reason_that_is_a_flag()
+    assert_eq(refused("requires { headers { lwip = true } }"),
+              "'requires.headers.lwip' must be a string saying what these headers are and where " +
+              "they come from, or a block with a 'note' and the 'env' the path conventionally " +
+              "lives in")
+
+// **A variable's NAME is not a path**, which is the whole of why this may be in a committed file when
+// a directory may not: `PICO_SDK_PATH` is the same string on every machine.
+@test("a header requirement may name the environment variable the path conventionally lives in")
+pkgcfg_a_header_names_its_variable()
+    val m = read("requires {\n  headers {\n    pico_sdk = { note = \"the pico-sdk's headers\", " +
+                 "env = \"PICO_SDK_PATH\" }\n  }\n}\n")
+
+    assert_eq(header(m, "pico_sdk"), "the pico-sdk's headers|PICO_SDK_PATH")
+
+// The `note` is what a consumer *without* the variable set is shown, so a block that gave only a
+// variable name would leave them nothing to go and look for.
+@test("but the note is still required, because it is what an unset variable falls back to")
+pkgcfg_a_header_block_needs_a_note()
+    assert_eq(refused("requires { headers { pico_sdk = { env = \"PICO_SDK_PATH\" } } }"),
+              "'requires.headers.pico_sdk' needs a 'note' saying what these headers are and where " +
+              "they come from — it is what a consumer without the variable set is shown")
+
+@test("and the env is optional, so a header block may carry only a note")
+pkgcfg_a_header_block_of_a_note()
+    assert_eq(header(read("requires { headers { lwip = { note = \"lwIP's headers\" } } }"), "lwip"),
+              "lwIP's headers|")
+
+@test("a path where the variable's name belongs is refused as what it is")
+pkgcfg_a_header_env_that_is_a_path()
+    assert_eq(refused("requires { headers { pico_sdk = { note = \"why\", env = \"/opt/pico-sdk\" } } }"),
+              "'requires.headers.pico_sdk''s 'env' is '/opt/pico-sdk', which is not the name of an " +
+              "environment variable — letters, digits and '_', not starting with a digit")
+
+@test("a key the headers block does not have is refused rather than ignored")
+pkgcfg_a_header_block_key_it_does_not_have()
+    assert_eq(refused("requires { headers { pico_sdk = { note = \"why\", path = \"/opt\" } } }"),
+              "'requires.headers.pico_sdk' has no 'path' — a headers block takes 'note' and 'env'")
+
+// -- the pkg-config libraries a package requires -----------------------------------------------------
+
+@test("pkg-config libraries are read as a module name and the reason the consumer is given")
+pkgcfg_pkg_config_is_read()
+    val m = read("requires {\n  pkg_config { sdl3 = \"SDL3 — brew install sdl3, or Debian's " +
+                 "libsdl3-dev\" }\n}\n")
+
+    assert_eq(m.pkg_config.len(), 1)
+    assert_eq(m.pkg_config.at(0).0, "sdl3")
+    assert_eq(m.pkg_config.at(0).1, "SDL3 — brew install sdl3, or Debian's libsdl3-dev")
+
+// Three kinds of requirement share the block, so each has to survive the other two being there.
+@test("pkg-config libraries sit beside the capabilities and the headers without disturbing either")
+pkgcfg_pkg_config_beside_the_rest()
+    val m = read("requires {\n  os = true\n  headers { lwip = \"lwIP's headers\" }\n" +
+                 "  pkg_config { sdl3 = \"SDL3\" }\n}\n")
+
+    assert_eq(joined(m.requires), "os")
+    assert_eq(header_names(m), "lwip")
+    assert_eq(pkg_config_names(m), "sdl3")
+
+@test("and a file that declares no pkg-config library needs none")
+pkgcfg_no_pkg_config()
+    assert(read("requires { os = true }").pkg_config.is_empty(), "none")
+
+// A consumer overrides this with `--include-path <name>=<dir>`, exactly as they answer a header
+// requirement, so the name has to survive the same flag.
+@test("a pkg-config name a command line could not carry is refused")
+pkgcfg_a_pkg_config_name_a_flag_cannot_carry()
+    assert_eq(refused("requires { pkg_config { \"sd/l3\" = \"why\" } }"),
+              "'sd/l3' is not usable as a pkg-config module's name — it is written on a command " +
+              "line as '--include-path <name>=<dir>', so it must be letters, digits, '_', '-', '.' " +
+              "and '+', starting with a letter")
+    assert_eq(refused("requires { pkg_config { \"sd=l3\" = \"why\" } }"),
+              "'sd=l3' is not usable as a pkg-config module's name — it is written on a command " +
+              "line as '--include-path <name>=<dir>', so it must be letters, digits, '_', '-', '.' " +
+              "and '+', starting with a letter")
+
+// The name is not the package author's to choose: it is what `pkg-config` answers to, and a great
+// many of the world's libraries file under one with a version in it.
+@test("a '.pc' name with a version in it is taken, which is how much of the world is packaged")
+pkgcfg_a_pc_name_with_a_version()
+    assert_eq(pkg_config_names(read("requires { pkg_config { \"yaml-0.1\" = \"libyaml — brew install libyaml\" } }")),
+              "yaml-0.1")
+    assert_eq(pkg_config_names(read("requires { pkg_config { \"glib-2.0\" = \"GLib — brew install glib\" } }")),
+              "glib-2.0")
+    assert_eq(pkg_config_names(read("requires { pkg_config { \"gtk+-3.0\" = \"GTK 3 — brew install gtk+3\" } }")),
+              "gtk+-3.0")
+
+// A `headers` name *is* invented by whoever writes the manifest, so there is no reason to widen it.
+@test("and the same name in the headers block is still refused, where the author chose it")
+pkgcfg_a_versioned_name_in_headers()
+    assert_eq(refused("requires { headers { \"yaml-0.1\" = \"libyaml\" } }"),
+              "'yaml-0.1' is not usable as a header requirement's name — it is written on a command " +
+              "line as '--include-path <name>=<dir>', so it must be letters, digits, '_' and '-', " +
+              "starting with a letter")
+
+@test("the refusal says what a '.pc' name may be, rather than suggesting a better one")
+pkgcfg_the_pc_name_refusal_says_the_rule()
+    val why = refused("requires { pkg_config { \"sd/l3\" = \"why\" } }")
+
+    assert(why.index_of("pkg-config module's name").is_some(), why)
+    assert(why.index_of("'.' and '+'").is_some(), why)
+
+@test("a pkg-config reason that says nothing is refused, because the reason is the point")
+pkgcfg_a_pkg_config_reason_that_says_nothing()
+    assert_eq(refused("requires { pkg_config { sdl3 = \"\" } }"),
+              "'requires.pkg_config.sdl3' says nothing about what it needs — the text is quoted " +
+              "back at whoever has to install the library, so an empty one helps nobody")
+
+@test("and a version where the pkg-config reason belongs is refused as the wrong kind of thing")
+pkgcfg_a_pkg_config_reason_that_is_a_number()
+    assert_eq(refused("requires { pkg_config { sdl3 = 3 } }"),
+              "'requires.pkg_config.sdl3' must be a string saying what this library is and how it " +
+              "is installed")
+
+// -- the dependencies block --------------------------------------------------------------------------
+
+@test("a dependency is a coordinate and a version")
+pkgcfg_a_coordinate_and_a_version()
+    val deps = read("dependencies {\n  json { git = \"github.com/edadma/sysl-json\", version = \"1.4.0\" }\n}")
+        .dependencies
+
+    assert_eq(deps.len(), 1)
+    assert_eq(deps.at(0).label, "json")
+    assert_eq(dependency_coordinate(deps.at(0)).unwrap(), "github.com/edadma/sysl-json")
+    assert_eq(release_shown(dependency_version(deps.at(0)).unwrap()), "1.4.0")
+    assert(deps.at(0).mount.is_none(), "not mounted")
+
+@test("a dependency may be a path, for a package being written beside its consumer")
+pkgcfg_a_path_dependency()
+    val deps = read("dependencies { local { path = \"../experiment\" } }").dependencies
+
+    assert_eq(deps.len(), 1)
+    assert_eq(deps.at(0).label, "local")
+    assert_eq(dependency_dir(deps.at(0)).unwrap(), "../experiment")
+
+@test("a mount, which is what a consumer writes when two packages want one name")
+pkgcfg_a_mount()
+    val deps = read("dependencies {\n  regex { git = \"github.com/edadma/sysl-regex/v2\", " +
+                    "version = \"2.0.4\", mount = \"re\" }\n}").dependencies
+
+    assert_eq(deps.at(0).mount.unwrap(), "re")
+
+@test("several dependencies, in the order a reader finds them rather than the order they were written")
+pkgcfg_several_dependencies_in_order()
+    assert_eq(labels_of(read("dependencies {\n  zeta { path = \"../z\" }\n  alpha { path = \"../a\" }\n}")
+                            .dependencies),
+              "alpha,zeta")
+
+@test("a URL is refused rather than stripped, because the coordinate is the identity")
+pkgcfg_a_url_is_refused()
+    assert_eq(refused("dependencies { j { git = \"https://github.com/e/j\", version = \"1.0.0\" } }"),
+              "'dependencies.j.git' is a URL — a coordinate is written as 'github.com/you/thing', " +
+              "since it is the package's identity and not the way it is fetched")
+
+@test("a coordinate that is a host with nothing under it")
+pkgcfg_a_bare_host()
+    assert_eq(refused("dependencies { j { git = \"github.com\", version = \"1.0.0\" } }"),
+              "'dependencies.j.git' names a host and nothing under it")
+
+@test("a coordinate with a trailing slash")
+pkgcfg_a_trailing_slash()
+    assert_eq(refused("dependencies { j { git = \"github.com/e/j/\", version = \"1.0.0\" } }"),
+              "'dependencies.j.git' is not a coordinate — 'github.com/you/thing' is the shape")
+
+@test("0.x and 1.x ride in the bare path")
+pkgcfg_the_first_majors_are_bare()
+    val dep = read("dependencies { j { git = \"github.com/e/j\", version = \"1.9.0\" } }").dependencies.at(0)
+
+    assert_eq(dependency_coordinate(dep).unwrap(), "github.com/e/j")
+    assert_eq(release_shown(dependency_version(dep).unwrap()), "1.9.0")
+
+@test("2.x needs the suffix, or two majors would share one module name")
+pkgcfg_a_second_major_needs_a_suffix()
+    assert_eq(refused("dependencies { j { git = \"github.com/e/j\", version = \"2.0.0\" } }"),
+              "'dependencies.j' asks for 2.0.0 from a coordinate with no '/v2' — from the second " +
+              "major version on, the major rides in the coordinate, because two of them are two " +
+              "packages rather than two versions of one")
+
+@test("with the suffix it is accepted, and the suffix stays part of the coordinate")
+pkgcfg_the_suffix_stays()
+    val dep = read("dependencies { j { git = \"github.com/e/j/v2\", version = \"2.0.0\" } }").dependencies.at(0)
+
+    assert_eq(dependency_coordinate(dep).unwrap(), "github.com/e/j/v2")
+    assert_eq(release_shown(dependency_version(dep).unwrap()), "2.0.0")
+    assert_eq(dependency_canonical(dep), "github.com.e.j.v2")
+
+@test("a suffix that disagrees with the version it is asked for")
+pkgcfg_a_disagreeing_suffix()
+    assert_eq(refused("dependencies { j { git = \"github.com/e/j/v3\", version = \"2.0.0\" } }"),
+              "'dependencies.j' asks for 2.0.0 from a coordinate ending '/v3' — a major version is " +
+              "part of the coordinate, so '/v3' holds 3.x and nothing else")
+
+@test("a version of two numbers is not enough")
+pkgcfg_two_numbers_are_not_a_version()
+    assert_eq(refused("dependencies { j { git = \"github.com/e/j\", version = \"1.4\" } }"),
+              "'dependencies.j.version': '1.4' is not a version — a version is three numbers, as in " +
+              "'1.4.2'")
+
+@test("and a leading zero is a typo rather than a number")
+pkgcfg_a_leading_zero()
+    assert_eq(refused("dependencies { j { git = \"github.com/e/j\", version = \"01.4.2\" } }"),
+              "'dependencies.j.version': '01.4.2' is not a version — a version is three numbers, as " +
+              "in '1.4.2'")
+
+@test("a dependency naming both a coordinate and a path")
+pkgcfg_both_a_coordinate_and_a_path()
+    assert_eq(refused("dependencies { j { git = \"github.com/e/j\", version = \"1.0.0\", path = \"../j\" } }"),
+              "'dependencies.j' names both a 'git' coordinate and a 'path' — a dependency is " +
+              "fetched or it is beside you, and it cannot be both")
+
+@test("a dependency naming neither")
+pkgcfg_neither_a_coordinate_nor_a_path()
+    assert_eq(refused("dependencies { j { mount = \"x\" } }"),
+              "'dependencies.j' names neither a 'git' coordinate nor a 'path'")
+
+@test("a coordinate with no version")
+pkgcfg_a_coordinate_with_no_version()
+    assert_eq(refused("dependencies { j { git = \"github.com/e/j\" } }"),
+              "'dependencies.j' names a 'git' coordinate and no 'version' — a coordinate says which " +
+              "repository and a version says which of it")
+
+// Nothing could keep the promise: the directory is whatever it is on disk right now.
+@test("a path with a version")
+pkgcfg_a_path_with_a_version()
+    assert_eq(refused("dependencies { j { path = \"../j\", version = \"1.0.0\" } }"),
+              "'dependencies.j' names a 'path' and a 'version' — a path dependency is the directory " +
+              "as it is now, and there is nothing to resolve a version against")
+
+@test("a misspelled dependency key is refused rather than ignored")
+pkgcfg_a_misspelled_dependency_key()
+    assert_eq(refused("dependencies { j { git = \"github.com/e/j\", versoin = \"1.0.0\" } }"),
+              "'dependencies.j.versoin' is not something a dependency says — the keys are " +
+              "'default_features', 'features', 'git', 'mount', 'optional', 'path', 'version'")
+
+@test("the same coordinate under two labels")
+pkgcfg_one_coordinate_two_labels()
+    assert_eq(refused("dependencies {\n  a { git = \"github.com/e/j\", version = \"1.0.0\" }\n" +
+                      "  b { git = \"github.com/e/j\", version = \"1.2.0\" }\n}"),
+              "'github.com/e/j' is named by 'a' and 'b' — one package is one dependency, and a " +
+              "module gets one version of it")
+
+@test("two packages mounted under one root name")
+pkgcfg_two_packages_one_mount()
+    assert_eq(refused("dependencies {\n  a { path = \"../a\", mount = \"json\" }\n" +
+                      "  b { path = \"../b\", mount = \"json\" }\n}"),
+              "'a' and 'b' are both mounted as 'json' — two packages cannot share a root name")
+
+@test("a mount has to be a name a module could have")
+pkgcfg_a_mount_that_is_not_a_name()
+    assert_eq(refused("dependencies { j { path = \"../j\", mount = \"sysl.json\" } }"),
+              "'dependencies.j.mount' is 'sysl.json', which is not a name a module can have — a " +
+              "mount becomes the first segment of an import line")
+
+@test("a dependency entry that is not a block at all")
+pkgcfg_a_dependency_that_is_not_a_block()
+    assert_eq(refused("dependencies { j = \"github.com/e/j\" }"),
+              "'dependencies.j' is not a block — a dependency is a git coordinate and a version, or " +
+              "a path")
+
+// -- how a coordinate becomes something git can clone ------------------------------------------------
+
+// The suffix is identity and not location: there is no branch or directory called v2 in the
+// repository, so it comes off before the URL is built.
+@test("the major suffix comes off before a coordinate is cloned")
+pkgcfg_the_suffix_comes_off()
+    assert_eq(clone_url("github.com/e/j/v2"), "https://github.com/e/j.git")
+
+@test("and a coordinate without one is left alone")
+pkgcfg_no_suffix_is_left_alone()
+    assert_eq(clone_url("github.com/e/j"), "https://github.com/e/j.git")
+
+@test("v0 and v1 are not suffixes — the first two majors ride in the bare path")
+pkgcfg_v0_and_v1_are_not_suffixes()
+    assert(major_suffix("github.com/e/j/v1").is_none(), "v1")
+    assert_eq(major_suffix("github.com/e/j/v2").unwrap(), 2)
+    assert(major_suffix("github.com/e/j").is_none(), "none")
+
+// A repository whose own name ends in something v-shaped is not a major suffix.
+@test("a path segment that merely starts with a v")
+pkgcfg_a_v_shaped_segment()
+    assert(major_suffix("github.com/e/vector").is_none(), "vector")
+    assert_eq(clone_url("github.com/e/vector"), "https://github.com/e/vector.git")
+
+@test("a version knows the tag it is published under")
+pkgcfg_a_version_knows_its_tag()
+    assert_eq(release_tag(Release(2, 1, 0)), "v2.1.0")
+
+// -- the allocator -----------------------------------------------------------------------------------
+
+@test("a package names an allocating pair")
+pkgcfg_an_allocator()
+    val m = read("allocator {\n  alloc = \"pvPortMalloc\"\n  free  = \"vPortFree\"\n}\n")
+
+    assert_eq(m.allocator.unwrap().0, "pvPortMalloc")
+    assert_eq(m.allocator.unwrap().1, "vPortFree")
+
+// The direction that cannot silently change an existing program.
+@test("a file that says nothing gets libc's allocator, which is what every program had before")
+pkgcfg_no_allocator_is_libc()
+    assert(read("").allocator.is_none(), "nothing named")
+    assert_eq(pair_of(choose_allocator(buf())), "malloc / free")
+
+@test("half an allocating pair is refused rather than completed from libc")
+pkgcfg_half_a_pair()
+    assert_eq(refused("allocator { alloc = \"pvPortMalloc\" }"),
+              "'allocator' names no 'free' — a program takes its storage from one pair and gives it " +
+              "back to the same one, so both halves are said or neither is")
+
+@test("an allocator name a C function could not have")
+pkgcfg_an_allocator_that_is_not_a_symbol()
+    assert_eq(refused("allocator { alloc = \"pv Port\", free = \"vPortFree\" }"),
+              "'allocator.alloc' is 'pv Port', which is not a name a C function can have")
+
+// Somebody wrote `malloc` and believes they have redirected the allocator.
+@test("a key an allocator does not have")
+pkgcfg_an_allocator_key_it_does_not_have()
+    assert_eq(refused("allocator { malloc = \"pvPortMalloc\", free = \"vPortFree\" }"),
+              "'allocator.malloc' is not something an allocator says — the keys are 'alloc' and " +
+              "'free'")
+
+@test("one symbol for both halves of an allocator")
+pkgcfg_one_symbol_for_both_halves()
+    assert_eq(refused("allocator { alloc = \"xmalloc\", free = \"xmalloc\" }"),
+              "'allocator' names 'xmalloc' for both halves")
+
+@test("one package's allocator is the program's")
+pkgcfg_one_package_names_the_allocator()
+    var claims: Buf[(string, (string, string))] = buf()
+
+    claims.push(claim("freertos", "pvPortMalloc", "vPortFree"))
+    assert_eq(pair_of(choose_allocator(claims)), "pvPortMalloc / vPortFree")
+
+// Two packages knowing the same kernel is one fact stated twice.
+@test("two packages naming the same allocating pair agree rather than conflict")
+pkgcfg_two_packages_one_pair()
+    var claims: Buf[(string, (string, string))] = buf()
+
+    claims.push(claim("freertos", "pvPortMalloc", "vPortFree"))
+    claims.push(claim("st7796", "pvPortMalloc", "vPortFree"))
+    assert_eq(pair_of(choose_allocator(claims)), "pvPortMalloc / vPortFree")
+
+@test("two packages naming different allocating pairs is refused, and both are named")
+pkgcfg_two_packages_two_pairs()
+    var claims: Buf[(string, (string, string))] = buf()
+
+    claims.push(claim("freertos", "pvPortMalloc", "vPortFree"))
+    claims.push(claim("arena", "arena_alloc", "arena_free"))
+    assert_eq(refusal_of(choose_allocator(claims)),
+              "two packages name different allocators, and a program has one heap — 'arena' names " +
+              "arena_alloc / arena_free; 'freertos' names pvPortMalloc / vPortFree. Drop one of the " +
+              "declarations, or depend on only one of them")
+
+// The message groups by pair, so three packages against two allocators reads as two claims, and the
+// verb agrees with the count on each claim independently.
+@test("three packages against two allocating pairs reads as two claims")
+pkgcfg_three_packages_two_pairs()
+    var claims: Buf[(string, (string, string))] = buf()
+
+    claims.push(claim("freertos", "pvPortMalloc", "vPortFree"))
+    claims.push(claim("st7796", "pvPortMalloc", "vPortFree"))
+    claims.push(claim("arena", "arena_alloc", "arena_free"))
+    assert_eq(refusal_of(choose_allocator(claims)),
+              "two packages name different allocators, and a program has one heap — 'arena' names " +
+              "arena_alloc / arena_free; 'freertos' and 'st7796' name pvPortMalloc / vPortFree. " +
+              "Drop one of the declarations, or depend on only one of them")
+
+@test("an allocator symbol is what LLVM will accept after an '@'")
+pkgcfg_an_allocator_symbol()
+    assert(is_symbol("pvPortMalloc"), "pvPortMalloc")
+    assert(is_symbol("_malloc_r"), "_malloc_r")
+    assert(!is_symbol(""), "empty")
+    assert(!is_symbol("2malloc"), "a leading digit")
+    assert(!is_symbol("my malloc"), "a space")
+    assert(!is_symbol("my.malloc"), "a dot")
+
+// -- defines -----------------------------------------------------------------------------------------
+
+@test("a carried C file is compiled with the macros the block names")
+pkgcfg_defines_are_the_macros_named()
+    val m = read("defines {\n  \"sh/sysl/miniz/c/miniz.c\" {\n    MINIZ_NO_MALLOC   = true\n" +
+                 "    TDEFL_LESS_MEMORY = 1\n    MZ_ASSERT         = \"((void)0)\"\n  }\n}\n        ")
+
+    assert_eq(joined(defines_for(m, "sh/sysl/miniz/c/miniz.c")),
+              "MINIZ_NO_MALLOC,MZ_ASSERT=((void)0),TDEFL_LESS_MEMORY=1")
+
+@test("a file the defines block does not name is compiled with nothing extra")
+pkgcfg_an_unnamed_file_gets_nothing()
+    assert(defines_for(read("defines {\n  \"a.c\" { X = true }\n}\n        "), "b.c").is_empty(),
+           "nothing")
+
+@test("true is a bare -DNAME, which is what '#ifdef' reads")
+pkgcfg_true_is_a_bare_define()
+    assert_eq(joined(defines_for(read("defines { \"a.c\" { X = true } }"), "a.c")), "X")
+
+// `#ifdef` sees a macro defined as zero, so "don't define it" and "define it as 0" are different
+// instructions and false could be either.
+@test("a false macro is refused, because it does not say which of two things is meant")
+pkgcfg_a_false_macro()
+    assert_eq(refused("defines { \"a.c\" { X = false } }"),
+              "'defines.\"a.c\".X' is false, which does not say which of two things is meant — leave " +
+              "the line out to not define it, or write '0' to define it as zero, which '#ifdef' " +
+              "still sees")
+
+@test("a defines key that is not a C file is refused")
+pkgcfg_a_defines_key_that_is_not_c()
+    assert_eq(refused("defines { \"c/miniz.h\" { X = true } }"),
+              "'defines.\"c/miniz.h\"' does not name a '.c' file — a macro is given to a " +
+              "translation unit, and only the C this package carries is one it compiles")
+
+@test("a defines key that is absolute or climbs out of the package is refused")
+pkgcfg_a_defines_key_outside_the_package()
+    assert_eq(refused("defines { \"/etc/x.c\" { X = true } }"),
+              "'defines.\"/etc/x.c\"' is an absolute path — a key is relative to the package root, " +
+              "since the package is the same tree wherever it was fetched to")
+    assert_eq(refused("defines { \"../other/x.c\" { X = true } }"),
+              "'defines.\"../other/x.c\"' climbs out of the package with '..' — a package " +
+              "configures the C it carries and nothing else")
+
+@test("a macro name the preprocessor would not take is refused")
+pkgcfg_a_macro_name_the_preprocessor_would_not_take()
+    assert_eq(refused("defines { \"a.c\" { \"2X\" = true } }"),
+              "'defines.\"a.c\".2X' is not a name a C macro can have — letters, digits and '_', not " +
+              "starting with a digit")
+
+@test("a macro value that is not scalar is refused, since a macro is text")
+pkgcfg_a_macro_value_that_is_not_scalar()
+    assert_eq(refused("defines { \"a.c\" { X { y = 1 } } }"),
+              "'defines.\"a.c\".X' must be true or a scalar — a macro is text the C preprocessor " +
+              "substitutes, so there is nothing a block or a list could mean")
+
+@test("a defines entry that is not a block says what a key is for")
+pkgcfg_a_defines_entry_that_is_not_a_block()
+    assert_eq(refused("defines { \"a.c\" = true }"),
+              "'defines.\"a.c\"' is not a block of macros — a key is the C this package carries and " +
+              "what follows it is what that C is compiled with")
+
+// A walk answers an absolute path whatever the reader typed, so `sysl test .` in a package's own
+// tree yields an absolute path for a root of `.`. Keying off the root instead matched only when the
+// root happened to be typed the way the walk spells it -- and otherwise the C compiled under its
+// defaults with nothing to say so.
+@test("carried defines are keyed by the path the source walk found, not by the one the manifest wrote")
+pkgcfg_defines_keyed_by_the_walk()
+    val m = read("defines {\n  \"sh/sysl/miniz/c/miniz.c\" { MINIZ_NO_MALLOC = true }\n" +
+                 "  \"sh/sysl/miniz/c/shim.c\"  { MINIZ_NO_MALLOC = true }\n}\n        ")
+    var found: Buf[string] = buf()
+
+    found.push("/private/tmp/miniz/sh/sysl/miniz/c/miniz.c")
+    found.push("/private/tmp/miniz/sh/sysl/miniz/c/shim.c")
+    found.push("/private/tmp/miniz/sh/sysl/miniz/c/unrelated.c")
+
+    val got = carried_defines(m, found).unwrap()
+
+    assert_eq(got.len(), 2)
+    assert_eq(got.at(0).0, "/private/tmp/miniz/sh/sysl/miniz/c/miniz.c")
+    assert_eq(joined(got.at(0).1), "MINIZ_NO_MALLOC")
+    assert_eq(got.at(1).0, "/private/tmp/miniz/sh/sysl/miniz/c/shim.c")
+    assert_eq(joined(got.at(1).1), "MINIZ_NO_MALLOC")
+end pkgcfg_defines_keyed_by_the_walk
+
+@test("a C file at the package root is matched by its own name")
+pkgcfg_a_root_c_file()
+    var found: Buf[string] = buf()
+
+    found.push("/pkg/thing.c")
+
+    val got = carried_defines(read("defines { \"thing.c\" { X = true } }"), found).unwrap()
+
+    assert_eq(got.len(), 1)
+    assert_eq(got.at(0).0, "/pkg/thing.c")
+    assert_eq(joined(got.at(0).1), "X")
+
+// The one mistake in a `defines` block that reading the file cannot catch, and the one that is
+// otherwise silent.
+@test("a defines path naming no file the package carries is refused rather than passed over")
+pkgcfg_a_defines_path_naming_no_file()
+    var found: Buf[string] = buf()
+
+    found.push("/pkg/sh/sysl/miniz/c/miniz.c")
+    assert_eq(carried_defines(read("defines { \"sh/sysl/miniz/c/typo.c\" { X = true } }"), found)
+                  .unwrap_err(),
+              "'defines.\"sh/sysl/miniz/c/typo.c\"' names a file this package does not carry — the " +
+              "block configures the C the package itself holds, and there is no such C file in this " +
+              "tree")
+    assert_eq(manifest_refusal("'defines.\"x.c\"' names a file"), "package.hocon: 'defines.\"x.c\"' names a file")
+
+// Suffix matching is within one package's own file list, so a name that merely ends the same way does
+// not reach across.
+@test("a partial path segment is not a match")
+pkgcfg_a_partial_segment()
+    var found: Buf[string] = buf()
+
+    found.push("/pkg/src/notc/util.c")
+    assert_eq(carried_defines(read("defines { \"c/util.c\" { X = true } }"), found).unwrap_err(),
+              "'defines.\"c/util.c\"' names a file this package does not carry — the block " +
+              "configures the C the package itself holds, and there is no such C file in this tree")
+
+// A package whose C shares one configuration says it once: two copies of the list is how two
+// translation units start to disagree.
+@test("a defines key names several files with braces, as a shell writes them")
+pkgcfg_a_braced_key()
+    val m = read("defines {\n  \"sh/sysl/miniz/c/{miniz,shim}.c\" { MINIZ_NO_MALLOC = true, " +
+                 "TDEFL_LESS_MEMORY = 1 }\n}\n        ")
+
+    assert_eq(joined(defines_for(m, "sh/sysl/miniz/c/miniz.c")), "MINIZ_NO_MALLOC,TDEFL_LESS_MEMORY=1")
+    assert_eq(joined(defines_for(m, "sh/sysl/miniz/c/shim.c")), "MINIZ_NO_MALLOC,TDEFL_LESS_MEMORY=1")
+    assert_eq(m.defines.len(), 2)
+    assert_eq(m.defines.at(0).0, "sh/sysl/miniz/c/miniz.c")
+    assert_eq(m.defines.at(1).0, "sh/sysl/miniz/c/shim.c")
+
+@test("several brace groups multiply out")
+pkgcfg_several_groups()
+    assert_eq(joined(expand_alternatives("{a,b}/{x,y}.c").unwrap()), "a/x.c,a/y.c,b/x.c,b/y.c")
+
+@test("a key with no brace group is itself")
+pkgcfg_no_group()
+    assert_eq(joined(expand_alternatives("a/b.c").unwrap()), "a/b.c")
+
+@test("a brace group of one is that one")
+pkgcfg_a_group_of_one()
+    assert_eq(joined(expand_alternatives("{only}.c").unwrap()), "only.c")
+
+// Each alternative is still a path, so a brace cannot smuggle past the checks a written-out key has
+// to pass.
+@test("an alternative that is not a C file is refused like any other key")
+pkgcfg_an_alternative_that_is_not_c()
+    assert_eq(refused("defines { \"c/{miniz.c,shim.h}\" { X = true } }"),
+              "'defines.\"c/shim.h\"' does not name a '.c' file — a macro is given to a translation " +
+              "unit, and only the C this package carries is one it compiles")
+
+@test("a nested brace group is refused")
+pkgcfg_a_nested_group()
+    assert_eq(refused("defines { \"c/{a,{b,c}}.c\" { X = true } }"),
+              "'defines.\"c/{a,{b,c}}.c\"' nests one group of alternatives inside another, which " +
+              "says nothing a flat list does not")
+
+@test("an empty alternative is refused")
+pkgcfg_an_empty_alternative()
+    assert_eq(refused("defines { \"c/{a,}.c\" { X = true } }"),
+              "'defines.\"c/{a,}.c\"' has an empty alternative — whichever was meant can be written " +
+              "out, and a group naming nothing configures nothing")
+
+@test("an unbalanced brace is refused")
+pkgcfg_an_unbalanced_brace()
+    assert_eq(refused("defines { \"c/{a,b.c\" { X = true } }"),
+              "'defines.\"c/{a,b.c\"' has an unbalanced brace — alternatives are written " +
+              "'{one,two}', as a shell writes them")
+    assert_eq(refused("defines { \"c/a,b}.c\" { X = true } }"),
+              "'defines.\"c/a,b}.c\"' has an unbalanced brace — alternatives are written " +
+              "'{one,two}', as a shell writes them")
+
+// Two blocks reaching one file has no sensible merge -- the later would silently win.
+@test("a file configured from two defines blocks is refused")
+pkgcfg_a_file_from_two_blocks()
+    assert_eq(refused("defines {\n  \"c/{a,b}.c\" { X = true }\n  \"c/a.c\"     { Y = true }\n}\n        "),
+              "'defines' configures 'c/a.c' from more than one block — a file is compiled once, so " +
+              "it is said in one place")
+
+@test("a macro name is one the preprocessor would take")
+pkgcfg_a_macro_name()
+    assert(macro_name("MINIZ_NO_MALLOC"), "MINIZ_NO_MALLOC")
+    assert(macro_name("_X2"), "_X2")
+    assert(!macro_name(""), "empty")
+    assert(!macro_name("2X"), "a leading digit")
+    assert(!macro_name("X-Y"), "a dash")
+    assert(!macro_name("X Y"), "a space")
+
+// -- the notation ------------------------------------------------------------------------------------
+
+@test("a file that is not HOCON at all is one line rather than a stack trace")
+pkgcfg_not_hocon_at_all()
+    val why = refused("package { name = ")
+
+    assert_eq(why, "package.hocon: unclosed object — expected '}' (line 1, column 18)")
+    assert_eq(manifest_refusal(why), why)
+
+// -- dev_dependencies --------------------------------------------------------------------------------
+
+// Read exactly as `dependencies` is, which is the point: the entries are the same shape, get the
+// same refusals, and differ only in who resolves them.
+@test("dev_dependencies reads the same entries dependencies does")
+pkgcfg_dev_reads_the_same()
+    val m = read("\n        dependencies { parsing { git = \"github.com/sysl-lang/parsing\", version = \"0.5.0\" } }\n" +
+                 "        dev_dependencies { quickjs { git = \"github.com/sysl-lang/quickjs\", version = \"0.1.0\" } }\n      ")
+
+    assert_eq(labels_of(m.dependencies), "parsing")
+    assert_eq(labels_of(m.dev_dependencies), "quickjs")
+    assert_eq(dependency_canonical(m.dev_dependencies.at(0)), "github.com.sysl-lang.quickjs")
+
+@test("dev_dependencies is not an unknown key")
+pkgcfg_dev_is_known()
+    assert(read("dev_dependencies { q { path = \"../q\" } }").warnings.is_empty(), "no warning")
+
+@test("dev_dependencies is absent by default")
+pkgcfg_dev_is_absent_by_default()
+    assert(read("package { name = \"p\" }").dev_dependencies.is_empty(), "none")
+
+// It has to name the right block or a reader goes looking in the other one.
+@test("dev_dependencies reports a misspelled key against its own block")
+pkgcfg_dev_misspelling()
+    assert_eq(refused("dev_dependencies { q { versoin = \"1.0.0\", git = \"github.com/e/q\" } }"),
+              "'dev_dependencies.q.versoin' is not something a dependency says — the keys are " +
+              "'default_features', 'features', 'git', 'mount', 'optional', 'path', 'version'")
+
+@test("dev_dependencies is not a block of blocks")
+pkgcfg_dev_entry_not_a_block()
+    assert_eq(refused("dev_dependencies { q = \"1.0.0\" }"),
+              "'dev_dependencies.q' is not a block — a dependency is a git coordinate and a version, " +
+              "or a path")
+
+// A package named by both blocks says two things about one package -- that a consumer gets it, and
+// that a consumer does not.
+@test("a package named by both dependency blocks is refused")
+pkgcfg_named_by_both_blocks()
+    assert_eq(refused("\n        dependencies     { q { git = \"github.com/e/q\", version = \"1.0.0\" } }\n" +
+                      "        dev_dependencies { q { git = \"github.com/e/q\", version = \"1.0.0\" } }\n      "),
+              "'q' is named by both 'dependencies' and 'dev_dependencies' — a dependency reaches " +
+              "this package's consumers or it does not, and it cannot do both. Name it once, in " +
+              "'dependencies' if anything a consumer compiles imports it")
+
+@test("the refusal names every package in both blocks, not only the first")
+pkgcfg_named_by_both_every_one()
+    assert_eq(refused("\n        dependencies     { a { path = \"../a\" }, b { path = \"../b\" } }\n" +
+                      "        dev_dependencies { a { path = \"../a\" }, b { path = \"../b\" } }\n      "),
+              "'a', 'b' are named by both 'dependencies' and 'dev_dependencies' — a dependency " +
+              "reaches this package's consumers or it does not, and it cannot do both. Name it " +
+              "once, in 'dependencies' if anything a consumer compiles imports it")
+
+// The negative control: the refusal is about the label rather than the two blocks both being present.
+@test("both dependency blocks are allowed when they name different packages")
+pkgcfg_both_blocks_different_packages()
+    val m = read("\n        dependencies     { a { path = \"../a\" } }\n" +
+                 "        dev_dependencies { b { path = \"../b\" } }\n      ")
+
+    assert_eq(labels_of(m.dependencies), "a")
+    assert_eq(labels_of(m.dev_dependencies), "b")
+
+// -- features ----------------------------------------------------------------------------------------
+
+// What is checked here is the *manifest* alone: what the block parses to, and what a file can say
+// wrongly about one. Resolving a consumer's `features = [desktop]` against the dependency's own
+// manifest is a separate question.
+private featured_manifest() -> string =
+    "\n        features {\n          default = [server]\n          server  = [llhttp, nghttp2]\n" +
+    "          desktop = [webview]\n        }\n        dependencies {\n" +
+    "          llhttp  { git = \"github.com/sysl-lang/llhttp\",  version = \"0.2.0\", optional = true }\n" +
+    "          nghttp2 { git = \"github.com/sysl-lang/nghttp2\", version = \"0.3.0\", optional = true }\n" +
+    "          webview { git = \"github.com/sysl-lang/webview\", version = \"0.1.0\", optional = true }\n" +
+    "        }\n      "
+
+@test("a feature names optional dependencies and other features, in the order the file writes them")
+pkgcfg_features_in_file_order()
+    val m = read(featured_manifest())
+
+    assert_eq(m.features.len(), 3)
+    assert_eq(m.features.at(0).0, "default")
+    assert_eq(m.features.at(1).0, "server")
+    assert_eq(m.features.at(2).0, "desktop")
+    assert_eq(feature(m, "default"), "server")
+    assert_eq(feature(m, "server"), "llhttp,nghttp2")
+    assert_eq(feature(m, "desktop"), "webview")
+
+@test("the dependencies a feature turns on are read as optional")
+pkgcfg_feature_dependencies_are_optional()
+    val m = read(featured_manifest())
+
+    assert_eq(labels_of(m.dependencies), "llhttp,nghttp2,webview")
+
+    for i in 0..<m.dependencies.len()
+        assert(m.dependencies.at(i).optional, m.dependencies.at(i).label)
+
+// The direction that cannot be allowed to change, since every package in the org is written this way.
+@test("an old-style manifest has no features and its dependencies are unchanged")
+pkgcfg_an_old_style_manifest()
+    val m = read("\n        package { name = \"thing\", version = \"1.0.0\" }\n" +
+                 "        dependencies { json { git = \"github.com/edadma/sysl-json\", version = \"1.4.0\" } }\n      ")
+
+    assert(m.features.is_empty(), "no features")
+    assert_eq(labels_of(m.dependencies), "json")
+    assert_eq(dependency_coordinate(m.dependencies.at(0)).unwrap(), "github.com/edadma/sysl-json")
+    assert_eq(release_shown(dependency_version(m.dependencies.at(0)).unwrap()), "1.4.0")
+    assert(m.dependencies.at(0).mount.is_none(), "no mount")
+    assert(!m.dependencies.at(0).optional, "not optional")
+    assert(m.dependencies.at(0).features.is_empty(), "no features asked for")
+    assert(m.dependencies.at(0).default_features, "the defaults")
+    assert(m.warnings.is_empty(), "no warnings")
+
+@test("'optional' is false and 'default_features' is true where the entry says neither")
+pkgcfg_entry_feature_defaults()
+    val d = read("dependencies { json { path = \"../json\" } }").dependencies.at(0)
+
+    assert(!d.optional, "not optional")
+    assert(d.features.is_empty(), "no features")
+    assert(d.default_features, "the defaults")
+
+// The consumer side: which of the dependency's own features this entry asks for.
+@test("a consumer entry may ask for features and refuse the defaults")
+pkgcfg_an_entry_asks_for_features()
+    val d = read("\n        dependencies { ui { path = \"../ui\", features = [desktop, tray], " +
+                 "default_features = false } }\n      ").dependencies.at(0)
+
+    assert_eq(joined(d.features), "desktop,tray")
+    assert(!d.default_features, "no defaults")
+
+@test("a feature that names a dependency which is not optional is refused")
+pkgcfg_a_feature_naming_a_required_dependency()
+    assert_eq(refused("\n        features     { server = [llhttp] }\n" +
+                      "        dependencies { llhttp { path = \"../llhttp\" } }\n      "),
+              "'features.server' names the dependency 'llhttp', which is not optional — a feature " +
+              "turns an optional dependency on, and this one is taken whatever is asked for. Write " +
+              "'optional = true' in that dependency's entry, or drop it from the feature")
+
+@test("an optional dependency that no feature names is refused")
+pkgcfg_an_optional_dependency_nothing_names()
+    assert_eq(refused("\n        features     { server = [llhttp] }\n        dependencies {\n" +
+                      "          llhttp  { path = \"../llhttp\",  optional = true }\n" +
+                      "          webview { path = \"../webview\", optional = true }\n        }\n      "),
+              "'webview' is an optional dependency no feature names — an optional dependency is " +
+              "reached only by the feature that turns it on, so nothing would ever build it. Name it " +
+              "in a 'features' entry, or drop its 'optional = true'")
+
+@test("a feature that names something declared nowhere is refused")
+pkgcfg_a_feature_naming_nothing()
+    assert_eq(refused("\n        features     { server = [llhttp, nghttp3] }\n" +
+                      "        dependencies { llhttp { path = \"../llhttp\", optional = true } }\n      "),
+              "'features.server' names 'nghttp3', which is neither a dependency of this package nor " +
+              "a feature of it — a feature turns on things this manifest declares, so 'nghttp3' " +
+              "would select nothing")
+
+// A feature may imply a feature, so the implications form a graph and the graph has to be acyclic --
+// otherwise selecting one never finishes.
+@test("features that turn each other on are refused")
+pkgcfg_features_in_a_cycle()
+    assert_eq(refused("features { a = [b], b = [a] }"),
+              "the features here turn each other on — 'a' turns on 'b', which turns on 'a'. A " +
+              "feature may imply another, but following the implications has to reach an end")
+    assert_eq(refused("features { a = [b, c], b = [c], c = [a] }"),
+              "the features here turn each other on — 'a' turns on 'b', which turns on 'c', which " +
+              "turns on 'a'. A feature may imply another, but following the implications has to " +
+              "reach an end")
+
+// A member that is ALSO the label of an optional dependency of the same name names that dependency,
+// not a feature turning itself on.
+@test("a feature naming an optional dependency of its own name is accepted")
+pkgcfg_a_feature_named_for_its_dependency()
+    val m = read("\n        features     { lmdb = [lmdb] }\n" +
+                 "        dependencies { lmdb { path = \"../lmdb\", optional = true } }\n      ")
+
+    assert_eq(feature(m, "lmdb"), "lmdb")
+
+@test("a feature naming a NON-optional dependency of its own name is refused as not optional")
+pkgcfg_a_feature_named_for_a_required_dependency()
+    assert_eq(refused("\n        features     { lmdb = [lmdb] }\n" +
+                      "        dependencies { lmdb { path = \"../lmdb\" } }\n      "),
+              "'features.lmdb' names the dependency 'lmdb', which is not optional — a feature turns " +
+              "an optional dependency on, and this one is taken whatever is asked for. Write " +
+              "'optional = true' in that dependency's entry, or drop it from the feature")
+
+// The exception is a SELF-reference only: a member naming a feature of this package is that feature
+// wherever a dependency happens to share its label.
+@test("a feature member naming another feature is that feature even where a dependency shares its label")
+pkgcfg_a_member_naming_another_feature()
+    val m = read("\n        features     { default = [lmdb], lmdb = [lmdb] }\n" +
+                 "        dependencies { lmdb { path = \"../lmdb\", optional = true } }\n      ")
+
+    assert_eq(feature(m, "default"), "lmdb")
+    assert_eq(feature(m, "lmdb"), "lmdb")
+
+// With no dependency of that label there is nothing else a self-reference could mean.
+@test("a feature that turns itself on with no dependency of that label is refused as a cycle")
+pkgcfg_a_feature_turning_itself_on()
+    assert_eq(refused("features { a = [b], b = [b] }"),
+              "the features here turn each other on — 'b' turns on 'b'. A feature may imply " +
+              "another, but following the implications has to reach an end")
+
+// `dep:X` names the dependency wherever it is written, so it is held to the same optional rule a bare
+// dependency member is.
+@test("a 'dep:' member naming an optional dependency is accepted")
+pkgcfg_a_dep_member()
+    val m = read("\n        features     { server = [\"dep:lmdb\"], lmdb = [lmdb] }\n" +
+                 "        dependencies { lmdb { path = \"../lmdb\", optional = true } }\n      ")
+
+    assert_eq(feature(m, "server"), "dep:lmdb")
+
+// `dep:` is WRITTEN IN QUOTES, because HOCON reads a bare colon as the separator between a key and its
+// value and refuses the line long before any of this is reached.
+@test("a 'dep:' member written without quotes is a parse error")
+pkgcfg_an_unquoted_dep_member()
+    assert_eq(refused("\n        features     { server = [dep:lmdb], lmdb = [lmdb] }\n" +
+                      "        dependencies { lmdb { path = \"../lmdb\", optional = true } }\n      "),
+              "package.hocon: unexpected token in value (line 2, column 37)")
+
+@test("a 'dep:' member naming a NON-optional dependency is refused as not optional")
+pkgcfg_a_dep_member_naming_a_required_dependency()
+    assert_eq(refused("\n        features     { server = [\"dep:lmdb\"] }\n" +
+                      "        dependencies { lmdb { path = \"../lmdb\" } }\n      "),
+              "'features.server' names the dependency 'lmdb', which is not optional — a feature " +
+              "turns an optional dependency on, and this one is taken whatever is asked for. Write " +
+              "'optional = true' in that dependency's entry, or drop it from the feature")
+
+// `dep:` says a dependency and nothing else, so it never falls back to reading as a feature.
+@test("a 'dep:' member naming no dependency of this package is refused")
+pkgcfg_a_dep_member_naming_nothing()
+    assert_eq(refused("\n        features     { server = [\"dep:nosuch\"], lmdb = [lmdb] }\n" +
+                      "        dependencies { lmdb { path = \"../lmdb\", optional = true } }\n      "),
+              "'features.server' names the dependency 'nosuch', which this package does not declare " +
+              "— 'dep:' asks for a dependency of this manifest by name, so write that entry in the " +
+              "'dependencies' block, or drop the 'dep:' to name a feature")
+
+@test("a 'dep:' member naming a feature rather than a dependency is refused")
+pkgcfg_a_dep_member_naming_a_feature()
+    assert_eq(refused("\n        features     { server = [\"dep:extras\"], extras = [lmdb], lmdb = [lmdb] }\n" +
+                      "        dependencies { lmdb { path = \"../lmdb\", optional = true } }\n      "),
+              "'features.server' names the dependency 'extras', which this package does not declare " +
+              "— 'dep:' asks for a dependency of this manifest by name, so write that entry in the " +
+              "'dependencies' block, or drop the 'dep:' to name a feature")
+
+@test("a feature may imply a feature as long as the chain ends")
+pkgcfg_a_chain_of_features()
+    val m = read("\n        features {\n          default = [server]\n          server  = [tls]\n" +
+                 "          tls     = [openssl]\n        }\n" +
+                 "        dependencies { openssl { path = \"../openssl\", optional = true } }\n      ")
+
+    assert_eq(feature(m, "default"), "server")
+    assert_eq(feature(m, "tls"), "openssl")
+
+@test("'features' is a key this compiler knows, so it draws no unknown-key warning")
+pkgcfg_features_is_known()
+    assert(read("features { }").warnings.is_empty(), "no warning")
+
+@test("a feature whose value is not a list is refused")
+pkgcfg_a_feature_that_is_not_a_list()
+    assert_eq(refused("features { server = \"llhttp\" }"),
+              "'features.server' is not a list — what a feature turns on is written in brackets, as " +
+              "'[llhttp, nghttp2]', even where there is one of it")
+
+@test("'optional' that is not a yes-or-no answer is refused")
+pkgcfg_optional_that_is_not_a_flag()
+    assert_eq(refused("dependencies { llhttp { path = \"../llhttp\", optional = \"yes\" } }"),
+              "'dependencies.llhttp.optional' is not 'true' or 'false' — it is a yes or no question, " +
+              "written without quotes")
+
+// -- the optimization level --------------------------------------------------------------------------
+
+// **The refusal is the half worth pinning.** A manifest is read by every later build and by consumers
+// who did not write it, so a level clang has no answer for is refused where the key is.
+@test("the optimization level is what a build hands clang, written as clang spells one after the '-O'")
+pkgcfg_an_optimization_level()
+    assert_eq(read("optimization = \"2\"").optimization.unwrap(), "2")
+
+@test("every level clang always has may be named")
+pkgcfg_every_level()
+    for i in 0..<ManifestLevels.len
+        val level = ManifestLevels[i]
+
+        assert_eq(read(s"optimization = \"$level\"").optimization.unwrap(), level)
+
+// What somebody writes before remembering the quotes, and it says exactly one thing.
+@test("and an unquoted number is the level it spells")
+pkgcfg_an_unquoted_level()
+    assert_eq(read("optimization = 2").optimization.unwrap(), "2")
+
+@test("a file that names no optimization level says nothing about the level")
+pkgcfg_no_level()
+    assert(read("package { name = \"thing\", version = \"1.0.0\" }").optimization.is_none(), "none")
+
+@test("'optimization' is a key this compiler knows, so it draws no unknown-key warning")
+pkgcfg_optimization_is_known()
+    assert(read("optimization = \"2\"").warnings.is_empty(), "no warning")
+
+@test("a level clang does not have is refused here rather than left to clang")
+pkgcfg_a_level_clang_does_not_have()
+    assert_eq(refused("optimization = \"9\""),
+              "'optimization = \"9\"' names no level clang has — it is one of 0, 1, 2, 3, s, z")
+
+// `fast` and `g` are clang's own and are deliberately outside the set a manifest may name.
+@test("including the levels clang has and a manifest may not name")
+pkgcfg_levels_a_manifest_may_not_name()
+    assert_eq(refused("optimization = \"fast\""),
+              "'optimization = \"fast\"' names no level clang has — it is one of 0, 1, 2, 3, s, z")
+    assert_eq(refused("optimization = \"g\""),
+              "'optimization = \"g\"' names no level clang has — it is one of 0, 1, 2, 3, s, z")
+
+@test("and an optimization block is refused with the same set, since there is nothing else it could mean")
+pkgcfg_an_optimization_block()
+    assert_eq(refused("optimization { level = \"2\" }"),
+              "'optimization' names the level this project is built at, so it is one of 0, 1, 2, 3, " +
+              "s, z — written as a string, and not a block or a list")

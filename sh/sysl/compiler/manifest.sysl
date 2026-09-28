@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.fs.{cache_dir, read_text}
-import sysl.text.{split, Search}
+import sysl.text.{join, split, Search}
 
 // `package.hocon` -- what a project says about itself before a line of it is read.
 //
@@ -71,13 +71,28 @@ struct Manifest
     // them than choosing its warning flags.
     defines: Buf[(string, Buf[string])]
 
+    // The machines the `targets` block describes, each with the triple it names -- `""` where the
+    // block names none. `default` is not one of them: it names a machine rather than being one.
+    targets: Buf[(string, string)]
+
+    // The pair a program's storage comes from, where this package names one (`alloc`, `free`).
+    allocator: Option[(string, string)]
+
+    // The `features` block, in the order the file wrote it: each feature and what it turns on --
+    // optional dependencies, other features, and `dep:`-prefixed dependency names.
+    features: Buf[(string, Buf[string])]
+
+    // The level this project's builds hand clang, as clang spells it after the `-O`.
+    optimization: Option[string]
+
     // A key this compiler does not understand is said out loud and then ignored, once per key.
     warnings: Buf[string]
 end Manifest
 
 // A project that said nothing, which is what a missing file means.
 empty_manifest() -> Manifest =
-    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
+    Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
+             buf(), None, buf())
 
 // The manifest a directory carries, or the empty one where it carries none.
 manifest_at(root: string) -> Result[Manifest, Refusal]
@@ -86,9 +101,33 @@ manifest_at(root: string) -> Result[Manifest, Refusal]
     read_text(file) match
         Err(_) -> Ok(empty_manifest())
         Ok(text) -> read_manifest(text) match
-            Err(why) -> Err(Refusal(s"$ManifestName: $why"))
+            Err(why) -> Err(Refusal(manifest_refusal(why)))
             Ok(m) -> Ok(m)
 end manifest_at
+
+// A manifest's refusal as a build reports it, naming the file once -- a notation error already
+// names it, since it is the reader's own and not a statement about a key.
+manifest_refusal(why: string) -> string =
+    if why.starts_with(s"$ManifestName:") then why else s"$ManifestName: $why"
+
+// The capabilities a machine of this name provides, which is what the manifest says about it: the
+// target's own block over the project's, and provided where neither says anything.
+manifest_provides(m: &Manifest, target: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<CoreCapabilities.len
+        if capability_given(m, target, CoreCapabilities[i]) then out.push(CoreCapabilities[i])
+
+    out
+end manifest_provides
+
+// The triple a machine the `targets` block describes names, where it describes that machine.
+declared_triple(m: &Manifest, target: string) -> Option[string]
+    for i in 0..<m.targets.len()
+        if m.targets.at(i).0 == target then return Some(m.targets.at(i).1)
+
+    None
+end declared_triple
 
 // What one invocation is missing, asked of the machine it is being built for.
 //
@@ -236,7 +275,10 @@ end numbers_of
 // regard for quoting: `targets.aarch64-kernel` would resolve and `targets."a.b"` would not, and a
 // target whose name carried a dot would be looked for in a nesting nobody wrote.
 read_manifest(text: string) -> Result[Manifest, string]
-    val root = read_conf(text)?
+    val root = read_conf(text) match
+        Err(why) -> return Err(s"$ManifestName: $why")
+        Ok(r) -> r
+
     var name = ""
     var version = ""
     var floor = ""
@@ -253,8 +295,7 @@ read_manifest(text: string) -> Result[Manifest, string]
 
             for i in 0..<keys.len()
                 if !known_package_key(keys.at(i))
-                    warnings.push(s"$ManifestName: 'package.${keys.at(i)}' is not a key this " +
-                        "compiler understands, so it was ignored")
+                    warnings.push(unknown_key(s"package.${keys.at(i)}"))
 
     val bad_name = name_refusal(root, name)
 
@@ -270,19 +311,17 @@ read_manifest(text: string) -> Result[Manifest, string]
         None -> ""
         Some(block) -> conf_text(block, "default")
 
-    val requires = conf_at(root, "requires") match
-        None -> buf()
-        Some(block) -> conf_flags_set(block)
-
+    val requires = read_requires(root)?
     val pkg_config = read_pkg_config(root)?
     val headers = read_headers(root)?
     val defines = read_defines(root)?
 
     val capabilities = conf_at(root, "capabilities") match
         None -> buf()
-        Some(block) -> conf_flags(block)
+        Some(block) -> read_capabilities(block, "capabilities")?
 
     var target_capabilities: Buf[(string, string, bool)] = buf()
+    var targets: Buf[(string, string)] = buf()
 
     conf_at(root, "targets") match
         None -> ()
@@ -290,12 +329,19 @@ read_manifest(text: string) -> Result[Manifest, string]
             val named = conf_keys(block)
 
             for i in 0..<named.len()
+                if named.at(i) == "default" then continue
+
                 val entry = conf_at(block, named.at(i)).unwrap()
+
+                if !conf_is_block(entry)
+                    return Err(s"'targets.${named.at(i)}' is not a block describing a target")
+
+                targets.push((named.at(i), conf_text(entry, "triple")))
 
                 conf_at(entry, "capabilities") match
                     None -> ()
                     Some(caps) ->
-                        val flags = conf_flags(caps)
+                        val flags = read_capabilities(caps, s"targets.${named.at(i)}.capabilities")?
 
                         for j in 0..<flags.len()
                             target_capabilities.push((named.at(i), flags.at(j).0, flags.at(j).1))
@@ -305,16 +351,424 @@ read_manifest(text: string) -> Result[Manifest, string]
 
     not_in_both(dependencies, dev)?
 
+    val allocator = read_allocator(root)?
+    val features = read_features(root, dependencies)?
+    val optimization = read_optimization(root)?
+
     val keys = conf_keys(root)
 
     for i in 0..<keys.len()
-        if !known_top_key(keys.at(i))
-            warnings.push(s"$ManifestName: '${keys.at(i)}' is not a key this compiler understands, " +
-                "so it was ignored")
+        if !known_top_key(keys.at(i)) then warnings.push(unknown_key(keys.at(i)))
 
     Ok(Manifest(name, version, floor, default_target, requires, dependencies, dev, capabilities,
-                target_capabilities, pkg_config, headers, defines, warnings))
+                target_capabilities, pkg_config, headers, defines, targets, allocator, features,
+                optimization, warnings))
 end read_manifest
+
+// The warning a key this compiler does not know draws. **Said and then ignored, not refused**: a
+// manifest written for a newer compiler must still build with this one wherever the parts it uses
+// are understood, and a refusal would make every key ever added a break with every compiler before
+// it.
+private unknown_key(path: string) -> string =
+    s"$ManifestName: '$path' is not something this sysl understands, and is ignored — either it " +
+    "is a misspelling, or it was added by a newer compiler"
+
+// A capability's name as the manifest reads it. `alloc` is the word a *module* uses for what it
+// promises about its conduct and `heap` is the facility, so a manifest wants `heap` -- but **a tag is
+// immutable**, and every package fetched at a version whose file says `alloc` always will, so the
+// old word is taken and mapped rather than refused.
+private capability_word(written: string) -> string =
+    if written == "alloc" then "heap" else written
+
+private is_core_capability(name: string) -> bool
+    for i in 0..<CoreCapabilities.len
+        if CoreCapabilities[i] == name then return true
+
+    false
+end is_core_capability
+
+private not_a_capability(written: string, where: string) -> string =
+    s"'$written' in '$where' is not a capability — the set is 'heap', 'os', 'posix'"
+
+// A `capabilities` block, the project's or one target's: each name one of the three, and each value
+// a flag. **A misspelled name is refused rather than ignored**, since a `treads = false` that did
+// nothing would leave the writer believing the machine had been described.
+private read_capabilities(block: &Conf, where: string) -> Result[Buf[(string, bool)], string]
+    var out: Buf[(string, bool)] = buf()
+    val keys = conf_keys(block)
+
+    for i in 0..<keys.len()
+        val cap = capability_word(keys.at(i))
+
+        if !is_core_capability(cap) then return Err(not_a_capability(keys.at(i), where))
+
+        *conf_at(block, keys.at(i)).unwrap() match
+            Flag(on) -> out.push((cap, on))
+            _ -> return Err(s"'$where.${keys.at(i)}' must be true or false")
+
+    Ok(out)
+end read_capabilities
+
+// The capabilities a package's `requires` block names, with what each implies folded in -- `posix`
+// needs an operating system under it -- in the order `CoreCapabilities` gives them.
+//
+// **A `false` is refused**: a package cannot need a facility *not* to exist, so the entry has nothing
+// to mean, and dropping it silently would let the file read as though the project had said something.
+// The two sub-blocks beside the capabilities are read by their own readers.
+private read_requires(root: &Conf) -> Result[Buf[string], string]
+    var named: Buf[string] = buf()
+
+    val block = conf_at(root, "requires") match
+        None -> return Ok(named)
+        Some(b) -> b
+
+    val keys = conf_keys(block)
+
+    for i in 0..<keys.len()
+        val written = keys.at(i)
+
+        if written == "headers" || written == "pkg_config" then continue
+
+        val cap = capability_word(written)
+
+        if !is_core_capability(cap) then return Err(not_a_capability(written, "requires"))
+
+        *conf_at(block, written).unwrap() match
+            Flag(true) -> named.push(cap)
+            Flag(false) -> return Err(
+                s"'requires { $cap = false }' says nothing — 'requires' is what this package needs " +
+                s"its host to have. To say the machine has no $cap, write it in the project's own " +
+                s"'capabilities { $cap = false }'; to say a module does not use it, write " +
+                s"'${no_capability_mark(cap)}' in that module's files")
+            _ -> return Err(s"'requires.$written' must be true or false")
+
+    var out: Buf[string] = buf()
+
+    for i in 0..<CoreCapabilities.len
+        val cap = CoreCapabilities[i]
+        var wanted = false
+
+        for j in 0..<named.len()
+            if named.at(j) == cap || (cap == "os" && named.at(j) == "posix") then wanted = true
+
+        if wanted then out.push(cap)
+
+    Ok(out)
+end read_requires
+
+// The attribute a module writes to say it does without a capability.
+private no_capability_mark(cap: string) -> string =
+    if cap == "heap" then "@no_alloc" else s"@no_$cap"
+
+// The `allocator` block: the pair a program's storage comes from, named by a package that knows it
+// (`reference/packages.md § One heap, and the package that names it`).
+//
+// **Both halves or neither**: storage taken from one allocator and handed back to another is the
+// defect this exists to prevent, so half a pair is refused rather than completed from libc.
+private read_allocator(root: &Conf) -> Result[Option[(string, string)], string]
+    val block = conf_at(root, "allocator") match
+        None -> return Ok(None)
+        Some(b) -> b
+
+    if !conf_is_block(block) then return Err("'allocator' is not a block")
+
+    val keys = conf_keys(block)
+
+    for i in 0..<keys.len()
+        if keys.at(i) != "alloc" && keys.at(i) != "free"
+            return Err(s"'allocator.${keys.at(i)}' is not something an allocator says — the keys " +
+                "are 'alloc' and 'free'")
+
+    val halves: []const string = ["alloc", "free"]
+
+    for i in 0..<halves.len
+        if conf_at(block, halves[i]).is_none()
+            return Err(s"'allocator' names no '${halves[i]}' — a program takes its storage from one " +
+                "pair and gives it back to the same one, so both halves are said or neither is")
+
+    for i in 0..<halves.len
+        val symbol = conf_text(block, halves[i])
+
+        if !is_symbol(symbol)
+            return Err(s"'allocator.${halves[i]}' is '$symbol', which is not a name a C function " +
+                "can have")
+
+    val alloc = conf_text(block, "alloc")
+    val free = conf_text(block, "free")
+
+    if alloc == free then return Err(s"'allocator' names '$alloc' for both halves")
+
+    Ok(Some((alloc, free)))
+end read_allocator
+
+// Whether a name is a symbol LLVM takes after an `@` unquoted and a C function could have: a letter
+// or `_`, then letters, digits and `_`.
+is_symbol(name: string) -> bool
+    if name == "" then return false
+
+    for i in 0..<name.bytes.len
+        val b = name.bytes[i]
+        val letter = is_name_letter(b) || b == u8('_')
+
+        if !letter && !(is_name_digit(b) && i > 0) then return false
+
+    true
+end is_symbol
+
+// The pair a program allocates through, out of what each of its packages named.
+//
+// **A program has one heap**, so two packages naming different pairs is refused, and the refusal
+// groups by pair -- three packages against two allocators is two claims, not three. Two packages
+// naming the *same* pair agree: that is one kernel known twice, the ordinary case once a driver is
+// built on the binding that names it. **Nothing named is libc's**, which is what every program had
+// before a package could say otherwise.
+choose_allocator(claims: Buf[(string, (string, string))]) -> Result[(string, string), string]
+    var pairs: Buf[(string, string)] = buf()
+    var labels: Buf[Buf[string]] = buf()
+
+    for i in 0..<claims.len()
+        val pair = claims.at(i).1
+        var at = pairs.len()
+
+        for j in 0..<pairs.len()
+            if pairs.at(j).0 == pair.0 && pairs.at(j).1 == pair.1 then at = j
+
+        if at == pairs.len()
+            pairs.push(pair)
+
+            var fresh: Buf[string] = buf()
+
+            fresh.push(claims.at(i).0)
+            labels.push(fresh)
+        else
+            var grown = labels.at(at)
+
+            grown.push(claims.at(i).0)
+            labels.set(at, grown)
+
+    if pairs.is_empty() then return Ok(("malloc", "free"))
+    if pairs.len() == 1 then return Ok(pairs.at(0))
+
+    var said: Buf[(string, string)] = buf()
+
+    for i in 0..<pairs.len()
+        val who = sorted_labels(labels.at(i))
+        val verb = if who.len() == 1 then "names" else "name"
+
+        said.push((who.at(0), s"${and_joined(who)} $verb ${pairs.at(i).0} / ${pairs.at(i).1}"))
+
+    var claims_said: Buf[string] = buf()
+    val order = sorted_labels(firsts_of(said))
+
+    for i in 0..<order.len()
+        for j in 0..<said.len()
+            if said.at(j).0 == order.at(i) then claims_said.push(said.at(j).1)
+
+    Err("two packages name different allocators, and a program has one heap — " +
+        join(claims_said.view(), "; ") + ". Drop one of the declarations, or depend on only one of " +
+        "them")
+end choose_allocator
+
+private firsts_of(rows: &Buf[(string, string)]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<rows.len()
+        out.push(rows.at(i).0)
+
+    out
+end firsts_of
+
+// Labels quoted and joined as prose writes a list: `'a'`, `'a' and 'b'`, `'a', 'b' and 'c'`.
+private and_joined(labels: &Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<labels.len()
+        if i > 0 then out = out + (if i == labels.len() - 1 then " and " else ", ")
+
+        out = out + s"'${labels.at(i)}'"
+
+    out
+end and_joined
+
+// The levels a manifest may name: the ones clang always has. `fast` and `g` are clang's too and are
+// deliberately outside the set -- one is being retired and the other is about debugging rather than
+// about what a project is built at -- and both stay typable on a command line.
+val ManifestLevels: []const string = ["0", "1", "2", "3", "s", "z"]
+
+// The `optimization` key. **A level clang has no answer for is refused here** rather than left to
+// clang: a manifest is read by every later build and by consumers who did not write it.
+private read_optimization(root: &Conf) -> Result[Option[string], string]
+    val value = conf_at(root, "optimization") match
+        None -> return Ok(None)
+        Some(v) -> v
+
+    val level = *value match
+        Text(s) -> s
+        Word(s) -> s
+        _ -> return Err("'optimization' names the level this project is built at, so it is one of " +
+                        "0, 1, 2, 3, s, z — written as a string, and not a block or a list")
+
+    for i in 0..<ManifestLevels.len
+        if ManifestLevels[i] == level then return Ok(Some(level))
+
+    Err(s"'optimization = \"$level\"' names no level clang has — it is one of 0, 1, 2, 3, s, z")
+end read_optimization
+
+// The `features` block, checked against the dependencies it turns on.
+//
+// A member is a feature of this package, an optional dependency, or `dep:` and a dependency's
+// label. **A member naming another feature is that feature** even where a dependency shares its
+// label; a member naming its *own* feature is the dependency of that label where there is one, which
+// is what lets a package name a feature after the dependency it turns on.
+private read_features(root: &Conf, deps: &Buf[Dependency]) -> Result[Buf[(string, Buf[string])], string]
+    var out: Buf[(string, Buf[string])] = buf()
+
+    conf_at(root, "features") match
+        None -> ()
+        Some(block) ->
+            if !conf_is_block(block)
+                return Err("'features' is not a block — it names each feature and the things that " +
+                    "feature turns on, as 'features { server = [llhttp] }'")
+
+            val names = conf_keys(block)
+
+            for i in 0..<names.len()
+                conf_list(conf_at(block, names.at(i)).unwrap()) match
+                    None -> return Err(not_a_feature_list(s"features.${names.at(i)}"))
+                    Some(members) -> out.push((names.at(i), members))
+
+    var named: Buf[string] = buf()
+
+    for i in 0..<out.len()
+        val feature = out.at(i).0
+        val members = out.at(i).1
+
+        for j in 0..<members.len()
+            val m = members.at(j)
+            val where = s"features.$feature"
+
+            if m.starts_with("dep:")
+                val label = m[4..]
+                val dep = dependency_labelled(deps, label)
+
+                if dep.is_none()
+                    return Err(s"'$where' names the dependency '$label', which this package does " +
+                        "not declare — 'dep:' asks for a dependency of this manifest by name, so " +
+                        "write that entry in the 'dependencies' block, or drop the 'dep:' to name a " +
+                        "feature")
+
+                optional_or_refuse(dep.unwrap(), where)?
+                named.push(label)
+                continue
+            end if
+
+            val is_feature = feature_named(out, m)
+            val dep = dependency_labelled(deps, m)
+
+            if is_feature && (m != feature || dep.is_none()) then continue
+
+            if dep.is_none()
+                return Err(s"'$where' names '$m', which is neither a dependency of this package nor " +
+                    s"a feature of it — a feature turns on things this manifest declares, so '$m' " +
+                    "would select nothing")
+
+            optional_or_refuse(dep.unwrap(), where)?
+            named.push(m)
+
+    for i in 0..<deps.len()
+        if deps.at(i).optional
+            var found = false
+
+            for j in 0..<named.len()
+                if named.at(j) == deps.at(i).label then found = true
+
+            if !found
+                return Err(s"'${deps.at(i).label}' is an optional dependency no feature names — an " +
+                    "optional dependency is reached only by the feature that turns it on, so " +
+                    "nothing would ever build it. Name it in a 'features' entry, or drop its " +
+                    "'optional = true'")
+
+    no_feature_cycle(out, deps)?
+    Ok(out)
+end read_features
+
+private dependency_labelled(deps: &Buf[Dependency], label: string) -> Option[Dependency]
+    for i in 0..<deps.len()
+        if deps.at(i).label == label then return Some(deps.at(i))
+
+    None
+end dependency_labelled
+
+private feature_named(features: &Buf[(string, Buf[string])], name: string) -> bool
+    for i in 0..<features.len()
+        if features.at(i).0 == name then return true
+
+    false
+end feature_named
+
+private optional_or_refuse(dep: Dependency, where: string) -> Result[unit, string]
+    if dep.optional then return Ok(())
+
+    Err(s"'$where' names the dependency '${dep.label}', which is not optional — a feature turns an " +
+        "optional dependency on, and this one is taken whatever is asked for. Write " +
+        "'optional = true' in that dependency's entry, or drop it from the feature")
+end optional_or_refuse
+
+// The features a feature turns on, which are its members that read as features rather than as
+// dependencies.
+private implied_features(features: &Buf[(string, Buf[string])], deps: &Buf[Dependency],
+                         feature: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<features.len()
+        if features.at(i).0 == feature
+            val members = features.at(i).1
+
+            for j in 0..<members.len()
+                val m = members.at(j)
+
+                if m.starts_with("dep:") || !feature_named(features, m) then continue
+                if m == feature && dependency_labelled(deps, m).is_some() then continue
+
+                out.push(m)
+
+    out
+end implied_features
+
+// **The implications have to reach an end**, or selecting one feature never finishes. A walk from
+// each feature in the file's order, and the first feature met twice on one path is the cycle, named
+// from where it closes.
+private no_feature_cycle(features: &Buf[(string, Buf[string])], deps: &Buf[Dependency]) -> Result[unit, string]
+    for i in 0..<features.len()
+        var trail: Buf[string] = buf()
+
+        cycle_from(features, deps, features.at(i).0, &trail)?
+
+    Ok(())
+end no_feature_cycle
+
+private cycle_from(features: &Buf[(string, Buf[string])], deps: &Buf[Dependency], at: string,
+                   trail: *Buf[string]) -> Result[unit, string]
+    for i in 0..<trail.len()
+        if trail.at(i) == at
+            var said = s"'${trail.at(i)}' turns on"
+
+            for j in (i + 1)..<trail.len()
+                said = said + s" '${trail.at(j)}', which turns on"
+
+            return Err(s"the features here turn each other on — $said '$at'. A feature may imply " +
+                "another, but following the implications has to reach an end")
+
+    trail.push(at)
+
+    val next = implied_features(features, deps, at)
+
+    for i in 0..<next.len()
+        cycle_from(features, deps, next.at(i), trail)?
+
+    trail.pop()
+    Ok(())
+end cycle_from
 
 // The `defines` block: what each C file this package carries is compiled with.
 //
@@ -339,9 +793,12 @@ private read_defines(root: &Conf) -> Result[Buf[(string, Buf[string])], string]
                      "package carries and what follows it is what that C is compiled with")
 
         var macros: Buf[string] = buf()
+        val ordered = sort_names(named)
 
-        for j in 0..<named.len()
-            macros.push(macro_of(key, named.at(j), conf_at(sub, named.at(j)).unwrap())?)
+        // **Sorted by name**, so the command line a file is compiled with is a function of what the
+        // block says rather than of the order somebody happened to write it in.
+        for j in 0..<ordered.len()
+            macros.push(macro_of(key, ordered.at(j), conf_at(sub, ordered.at(j)).unwrap())?)
 
         val paths = expand_alternatives(key)?
 
@@ -439,12 +896,13 @@ private macro_of(path: string, name: string, value: &Conf) -> Result[string, str
                            "things is meant — leave the line out to not define it, or write '0' " +
                            "to define it as zero, which '#ifdef' still sees")
         Text(v) -> Ok(s"$name=$v")
+        Word(v) -> Ok(s"$name=$v")
         _ -> Err(s"'defines.\"$path\".$name' must be true or a scalar — a macro is text the C " +
                  "preprocessor substitutes, so there is nothing a block or a list could mean")
 end macro_of
 
 // Whether a name is one the C preprocessor could carry.
-private macro_name(name: string) -> bool
+macro_name(name: string) -> bool
     if name == "" then return false
 
     for i in 0..<name.bytes.len
@@ -465,15 +923,45 @@ private c_source_key(path: string) -> Result[unit, string]
                    "translation unit, and only the C this package carries is one it compiles")
 
     if path.starts_with("/") then
-        return Err(s"'defines.\"$path\"' is an absolute path — a key names the C this package " +
-                   "carries, which is written relative to the package's own root")
+        return Err(s"'defines.\"$path\"' is an absolute path — a key is relative to the package " +
+                   "root, since the package is the same tree wherever it was fetched to")
 
     if path == ".." || path.starts_with("../") || path.index_of("/../").is_some() then
-        return Err(s"'defines.\"$path\"' climbs out of the package — a key names the C this " +
-                   "package carries, and nothing above it is this package's to configure")
+        return Err(s"'defines.\"$path\"' climbs out of the package with '..' — a package " +
+                   "configures the C it carries and nothing else")
 
     Ok(())
 end c_source_key
+
+// Each C file a package's walk found, with the macros the block gives it -- only the files the block
+// names -- or the refusal for a declared path that reaches none of them.
+//
+// **The one mistake in a `defines` block that reading the file cannot catch**, and the one that is
+// otherwise silent: a path that is merely wrong leaves the macros reaching nothing and the C
+// compiling under its defaults. Matching is within this package's own list, so a name that merely
+// ends the way another package's file does cannot reach across.
+carried_defines(m: &Manifest, found: &Buf[string]) -> Result[Buf[(string, Buf[string])], string]
+    for i in 0..<m.defines.len()
+        val declared = m.defines.at(i).0
+        var reached = false
+
+        for j in 0..<found.len()
+            if found.at(j) == declared || found.at(j).ends_with(s"/$declared") then reached = true
+
+        if !reached
+            return Err(s"'defines.\"$declared\"' names a file this package does not carry — the " +
+                "block configures the C the package itself holds, and there is no such C file in " +
+                "this tree")
+
+    var out: Buf[(string, Buf[string])] = buf()
+
+    for j in 0..<found.len()
+        val macros = defines_for(m, found.at(j))
+
+        if !macros.is_empty() then out.push((found.at(j), macros))
+
+    Ok(out)
+end carried_defines
 
 // The macros the C at `src` is compiled with, where the tree it was found in declared any.
 //
@@ -519,35 +1007,44 @@ private read_headers(root: &Conf) -> Result[Buf[(string, string, string)], strin
         val name = names.at(i)
 
         if !header_name(name)
-            return Err(s"'requires.headers.$name' is not usable as a name for a header requirement " +
-                "— it is written on a command line as '--include-path <name>=<dir>', so it may " +
-                "hold neither a separator nor an '=': letters, digits, '_' and '-', starting with " +
-                "a letter")
+            return Err(s"'$name' is not usable as a header requirement's name — it is written on a " +
+                "command line as '--include-path <name>=<dir>', so it must be letters, digits, '_' " +
+                "and '-', starting with a letter")
 
         val entry = conf_at(declared, name).unwrap()
-        val keys = conf_keys(entry)
         var why = ""
         var env = ""
 
-        if keys.is_empty()
-            // The short form: the prose written straight against the name, which is what every
-            // manifest in the org writes today.
-            why = conf_text(declared, name)
-        else
+        if conf_is_block(entry)
+            val keys = conf_keys(entry)
+
             for j in 0..<keys.len()
                 if keys.at(j) != "note" && keys.at(j) != "env"
                     return Err(s"'requires.headers.$name' has no '${keys.at(j)}' — a headers block " +
                         "takes 'note' and 'env'")
 
+            if conf_at(entry, "note").is_none()
+                return Err(s"'requires.headers.$name' needs a 'note' saying what these headers are " +
+                    "and where they come from — it is what a consumer without the variable set is " +
+                    "shown")
+
             why = conf_text(entry, "note")
             env = conf_text(entry, "env")
+        else if conf_is_prose(entry)
+            // The short form: the prose written straight against the name, which is what every
+            // manifest in the org writes today.
+            why = conf_text(declared, name)
+        else
+            return Err(s"'requires.headers.$name' must be a string saying what these headers are " +
+                "and where they come from, or a block with a 'note' and the 'env' the path " +
+                "conventionally lives in")
 
         if why.trim() == ""
             return Err(s"'requires.headers.$name' says nothing about what it needs — the text is " +
                 "quoted back at whoever has to supply the path, so an empty one helps nobody")
 
         if env != "" && !env_name(env)
-            return Err(s"'requires.headers.$name's 'env' is '$env', which is not the name of an " +
+            return Err(s"'requires.headers.$name''s 'env' is '$env', which is not the name of an " +
                 "environment variable — letters, digits and '_', not starting with a digit")
 
         out.push((name, why, env))
@@ -613,9 +1110,13 @@ private read_pkg_config(root: &Conf) -> Result[Buf[(string, string)], string]
         val name = names.at(i)
 
         if !pkg_config_name(name)
-            return Err(s"'requires.pkg_config.$name' is not usable as a pkg-config module's name " +
-                "— it is written on a command line as '--include-path <name>=<dir>', so it may " +
-                "hold neither a separator nor an '='")
+            return Err(s"'$name' is not usable as a pkg-config module's name — it is written on a " +
+                "command line as '--include-path <name>=<dir>', so it must be letters, digits, " +
+                "'_', '-', '.' and '+', starting with a letter")
+
+        if !conf_is_prose(conf_at(mods, name).unwrap())
+            return Err(s"'requires.pkg_config.$name' must be a string saying what this library is " +
+                "and how it is installed")
 
         // **The prose is the only part of a refusal nothing in the compiler could have written**,
         // since it is what is quoted back at whoever has to install the library.
@@ -665,7 +1166,8 @@ name_refusal(root: &Conf, name: string) -> string
     if name == "" then return "'package.name' is empty"
 
     if names_a_path(name)
-        return s"'package.name' is '$name', which names a path rather than a name"
+        return s"'package.name' is what this project's output is called, so '$name' cannot be one " +
+            "— it names a path rather than a name"
 
     ""
 end name_refusal
@@ -705,4 +1207,4 @@ private known_package_key(key: string) -> bool =
 private known_top_key(key: string) -> bool =
     key == "package" || key == "dependencies" || key == "dev_dependencies" || key == "requires" ||
     key == "capabilities" || key == "targets" || key == "allocator" || key == "defines" ||
-    key == "links"
+    key == "links" || key == "features" || key == "optimization"
