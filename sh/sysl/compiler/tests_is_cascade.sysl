@@ -1,0 +1,171 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.{split, str_builder, Search}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// An `is` refused for where it stands says ONE thing. What its pattern binds stays quiet for the rest
+// of the statement it is written in, since the name is written right there, and is undefined again
+// from the next statement on -- which is exactly where the reference compiler, abandoning a statement
+// at its first error, starts reading again.
+//
+// **Every list here is the reference's complete list for the same program**, one line per diagnostic:
+// where it points, then what it says.
+
+private isc_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+        Ok(_) -> true
+
+// Every diagnostic the compiler gives a program, one per line as `line:col message`, which is the
+// whole of a report with the source excerpts dropped.
+isc_diags(text: string) -> string
+    val root = make_temp_dir("sysl-isc").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val report = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val lines = split(report, "\n")
+    var out = str_builder()
+    var message = ""
+
+    for i in 0..<lines.len
+        val line = lines[i]
+
+        if line.starts_with("error: ") then message = line[7..<line.bytes.len]
+
+        if line.starts_with(" --> ")
+            val at = line.last_index_of("main.sysl:")
+
+            if at.is_some() then out.push(s"${line[at.unwrap() + 10..<line.bytes.len]} $message\n")
+        end if
+
+    out.finish()
+end isc_diags
+
+private isc_not_here() -> string =
+    "'is' tests a pattern in the condition of an 'if' or a 'while', and nowhere else — its binding " +
+    "is live from here to the end of the condition and through the branch that condition guards, " +
+    "and there is no such branch here. Chain it with '&&', or write 'match'"
+
+private isc_undefined(name: string) -> string = s"undefined name '$name'"
+
+@test("an `is` under `||` says one thing, and the branch's use of its name is quiet")
+isc_under_or()
+    if !isc_ready() then return
+
+    assert_eq(isc_diags(raw"""
+        var o: Option[int] = Some(1)
+        if o is Some(n) || false then print(n)
+        """), s"2:4 ${isc_not_here()}\n")
+
+@test("a three-clause `for`'s condition says one thing, and its body's use is quiet")
+isc_three_clause_for()
+    if !isc_ready() then return
+
+    assert_eq(isc_diags(raw"""
+        var o: Option[int] = Some(1)
+        for var i = 0; o is Some(n); i += 1 do print(n)
+        """), s"2:16 ${isc_not_here()}\n")
+
+@test("an `is` under `!` says one thing")
+isc_under_not()
+    if !isc_ready() then return
+
+    assert_eq(isc_diags(raw"""
+        var o: Option[int] = Some(1)
+        if !(o is Some(n)) then print(n)
+        """), s"2:6 ${isc_not_here()}\n")
+
+@test("an `is` compared as a value says one thing")
+isc_compared()
+    if !isc_ready() then return
+
+    assert_eq(isc_diags(raw"""
+        var o: Option[int] = Some(1)
+        if (o is Some(n)) == true then print(n)
+        """), s"2:5 ${isc_not_here()}\n")
+
+@test("an `is` as an argument binds nothing for the NEXT statement")
+isc_as_an_argument()
+    if !isc_ready() then return
+
+    assert_eq(isc_diags(raw"""
+        var o: Option[int] = Some(1)
+        print(o is Some(n))
+        print(n)
+        """), s"2:7 ${isc_not_here()}\n3:7 ${isc_undefined("n")}\n")
+
+@test("an `is` as a value binds nothing for the next statement")
+isc_as_a_value()
+    if !isc_ready() then return
+
+    assert_eq(isc_diags(raw"""
+        var o: Option[int] = Some(1)
+        var b = o is Some(n)
+        print(n)
+        """), s"2:9 ${isc_not_here()}\n3:7 ${isc_undefined("n")}\n")
+
+@test("inside a function, the next statement of the body reads again")
+isc_in_a_body()
+    if !isc_ready() then return
+
+    assert_eq(isc_diags(raw"""
+        f(o: Option[int])
+            print(o is Some(n))
+            print(n)
+
+        f(None)
+        """), s"2:11 ${isc_not_here()}\n3:11 ${isc_undefined("n")}\n")
+
+@test("the branch's own statements are inside the statement, and what follows it is not")
+isc_branch_then_after()
+    if !isc_ready() then return
+
+    assert_eq(isc_diags(raw"""
+        var o: Option[int] = Some(1)
+        if (o is Some(n)) || false then print(n)
+        print(n)
+        """), s"2:5 ${isc_not_here()}\n3:7 ${isc_undefined("n")}\n")
+
+    assert_eq(isc_diags(raw"""
+        var o: Option[int] = Some(1)
+        if o is Some(n) || false
+            print(n)
+            print(n + 1)
+        print(n)
+        """), s"2:4 ${isc_not_here()}\n5:7 ${isc_undefined("n")}\n")
+
+@test("an `is` in a match arm's guard says one thing, in either arm")
+isc_in_a_guard()
+    if !isc_ready() then return
+
+    assert_eq(isc_diags(raw"""
+        var o: Option[int] = Some(1)
+        var k = 1
+        k match
+            x if o is Some(n) -> print(n)
+            else print(n)
+        """), s"4:10 ${isc_not_here()}\n")
+
+@test("an `is` in a `require` says one thing, and the body's use is quiet")
+isc_in_a_require()
+    if !isc_ready() then return
+
+    assert_eq(isc_diags(raw"""
+        f(o: Option[int]) -> int
+            require o is Some(n)
+            n
+
+        print(f(Some(1)))
+        """), s"2:13 ${isc_not_here()}\n")

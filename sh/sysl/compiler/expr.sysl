@@ -157,7 +157,14 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
 
     // An `is` outside a condition. The message names every position rather than the one this
     // happens to be, which is why it lives here and not at the reading of a condition's terms.
-    IsPattern(_, _, _) ->
+    //
+    // **The refusal still registers what the pattern binds**, for the rest of the statement: a
+    // `print(n)` in the branch the misplaced `is` guards is written against a name that is right
+    // there, and reporting it as undefined would be a second cause for one mistake.
+    IsPattern(_, patterns, _) ->
+        for i in 0..<patterns.len()
+            pattern_binds_into(patterns.at(i), &cx.refused_is)
+
         cx.err(e.span, "'is' tests a pattern in the condition of an 'if' or a 'while', and nowhere " +
                "else — its binding is live from here to the end of the condition and through the " +
                "branch that condition guards, and there is no such branch here. Chain it with " +
@@ -680,6 +687,8 @@ variant_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) ->
 
     val found = variant_of(cx, name, expected)
 
+    if found.is_none() && refused_is_name(cx, name) then return bad_expr(span)
+
     if found.is_none() then
         return cx.err(span, s"undefined name '${module_show(module_qualify(cx.scope.module_name, name))}'")
 
@@ -695,6 +704,14 @@ variant_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) ->
 
     TExpr(span, TEnumNew(en, v, buf()))
 end variant_expr
+
+// Whether a name was bound by an `is` refused earlier in the statement being read.
+private refused_is_name(cx: &Analyzer, name: string) -> bool
+    for i in 0..<cx.refused_is.len()
+        if cx.refused_is.at(i) == name then return true
+
+    false
+end refused_is_name
 
 // The enum the **position** asked for, where it asked for one that has this variant.
 variant_from_expected(cx: &Analyzer, name: string,
