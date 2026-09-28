@@ -328,9 +328,38 @@ private target_for(path: string, named_target: Option[string]) -> Result[Target,
         None -> ()
         Some(why) -> return Err(Refusal(why))
 
+    // **And the heap it allocates through**, settled here because this is the one funnel every
+    // command that lowers anything comes through, and it comes through before the standard module's
+    // artifact is looked for -- whose path, metadata and object half are all the pair's. Two packages
+    // naming different pairs are refused on every target rather than only where no libc stands in.
+    choose_allocator(allocator_claims(root, manifest)) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(pair) -> use_allocator(pair)
+
     // The machine as the project describes it, which is what the analysis holds a module to.
     Ok(as_declared(manifest, t))
 end target_for
+
+// The level every clang a build drives is handed: what the command line named, then the ROOT
+// manifest's `optimization`, then `DefaultOptimization`.
+//
+// **Naming none and naming the default are two answers**, which is why the flag arrives as an
+// `Option`: a build that typed `-O1` typed it, and no key may overrule it. **A dependency's key is
+// never consulted** -- a library that could set the level would be deciding how its consumer's whole
+// program is compiled -- and is not an error either, since it is simply not the project being built.
+// A manifest that will not read answers the default here, the build that follows refusing it in its
+// own words.
+build_level(path: string, given: Option[string]) -> string
+    given match
+        Some(level) -> return level
+        None -> ()
+
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+
+    manifest_at(root) match
+        Ok(m) -> m.optimization.unwrap_or(DefaultOptimization)
+        Err(_) -> DefaultOptimization
+end build_level
 
 // **A heap the machine has no libc to supply, said before the linker is asked.** A package requiring
 // one, built for a freestanding target by a command that links, has asked for `malloc` and `free`
@@ -833,8 +862,8 @@ private discard_staging(staging: Option[string])
 // a reader has to be told: a `dependencies` block every other command honours is refused here by
 // name, because there is no program to resolve a graph for and the artifact would be keyed to a
 // resolution nobody made.
-build_library_of(path: string, named_target: Option[string],
-                 out: Option[string]) -> Result[string, Refusal]
+build_library_of(path: string, named_target: Option[string], out: Option[string],
+                 level: string = DefaultOptimization) -> Result[string, Refusal]
     val t = target_for(path, named_target)?
 
     if !t.builds_with_clang() then return Err(Refusal(t.no_toolchain()))
@@ -866,7 +895,7 @@ build_library_of(path: string, named_target: Option[string],
     // without depending on where the caller happened to be standing.
     val where = out.unwrap_or(s"${default_executable(path)}$SyslibExtension")
 
-    build_library(root, t, where, c.units, c.own, s"'$named'", probed) match
+    build_library(root, t, where, c.units, c.own, s"'$named'", probed, level) match
         Err(why) -> Err(Refusal(why))
         Ok(where) -> Ok(where)
 end build_library_of
