@@ -434,8 +434,32 @@ private check_exports(a: &Analysis)
             StructOf(d) ->
                 if d.cname.is_some() then
                     check_struct_export(a, types.key_at(i), types.at(i), d, d.cname.unwrap())
+            TypeOf(d) ->
+                if d.cname.is_some() then
+                    check_type_export(a, types.key_at(i), types.at(i), d, d.cname.unwrap())
             _ -> ()
 end check_exports
+
+// Refuses a `type` a header could not declare as a `typedef` -- the struct's rules for its name.
+// What it stands for is refused where the type is built, which every named subtype is whether or not
+// anything writes it: a published name is a claim either way.
+private check_type_export(a: &Analysis, key: string, at: Decl, d: TypeDecl, e: ExportAttr)
+    if e.symbol.is_some() && !c_identifier(e.symbol.unwrap()) then
+        a.fault(at.scope, e.span, s"'${e.symbol.unwrap()}' is not a name C can declare — a type's " +
+                "name in a header is a C identifier, so it is a letter or '_' followed by letters, " +
+                "digits and '_'")
+
+    if e.symbol.is_none() && !c_identifier(module_bare(spelled_key(key))) then
+        a.fault(at.scope, e.span, s"'${qualified_name(key)}' is not a name C can declare, so " +
+                "naming it after itself would put a spelling in the header no C declaration could " +
+                "use — name it instead, '@export(\"...\")'")
+
+    if !is_public(d.vis) then
+        a.fault(at.scope, e.span, s"'${qualified_name(key)}' is private, so no exported function " +
+                "may name it — an export is public, and a declaration may not be more visible " +
+                "than the types it names. No header can carry this type at all, so there is no " +
+                "name in one for it to take")
+end check_type_export
 
 // Refuses a C name a header could not declare, or a struct that has no one name to give.
 //

@@ -64,7 +64,7 @@ end EnumVariant
 //
 // The fields are filled in after the record is registered, which is what lets a struct hold itself
 // through a pointer. `packed`, `min_align` and `cname` are the three things an attribute may say
-// about its layout and its C name.
+// about its layout and its C name; `opaque` is what a C header declares as a tag with no body.
 struct StructType
     base: string
     targs: Buf[Type]
@@ -72,6 +72,7 @@ struct StructType
     packed: bool
     min_align: Option[usize]
     cname: Option[string]
+    opaque: bool
 
     // The name a table keys on and a diagnostic starts from.
     name(self) -> string = qualified(self.base, self.targs)
@@ -122,7 +123,12 @@ end EnumType
 // **The bootstrap compiler holds this inline in the variant, and it is a record here for one
 // reason**: `==` on an enum whose widest variant has six or more counted fields faults in the
 // compiler this is built by, and seven inline fields is exactly that shape. The record keeps every
-// variant narrow, and `type_eq` compares the seven as the case class it mirrors does.
+// variant narrow, and `type_eq` compares the fields as the case class it mirrors does.
+//
+// `cname` is the name `@export` gave the type for a generated C header, which declares it as a
+// `typedef` and spells it by that name wherever it appears. An exported plain alias arrives here
+// too, with no constraint at all, because an alias dissolves into its base and a header could not
+// then say where the name was written; its base may be a pointer, which no other one's may.
 struct ConstrainedType
     name: string
     base: Type
@@ -131,6 +137,7 @@ struct ConstrainedType
     hi: Option[Decimal]
     exclusive_hi: bool
     pred_fn: Option[string]
+    cname: Option[string]
 end ConstrainedType
 
 // A type.
@@ -384,12 +391,18 @@ type_eq(a: Type, b: Type) -> bool = a match
 private constrained_eq(a: &ConstrainedType, b: &ConstrainedType) -> bool =
     a.name == b.name && a.derived == b.derived && a.exclusive_hi == b.exclusive_hi &&
         a.pred_fn == b.pred_fn && decimal_opt_eq(a.lo, b.lo) && decimal_opt_eq(a.hi, b.hi) &&
-        type_eq(a.base, b.base)
+        a.cname == b.cname && type_eq(a.base, b.base)
 
 // A named subtype, built the way the reference compiler's case class is.
 constrained(name: string, base: Type, derived: bool, lo: Option[Decimal], hi: Option[Decimal],
             exclusive_hi: bool, pred_fn: Option[string]) -> Type =
-    Constrained(ConstrainedType(name, base, derived, lo, hi, exclusive_hi, pred_fn))
+    Constrained(ConstrainedType(name, base, derived, lo, hi, exclusive_hi, pred_fn, None))
+
+// The same, carrying the name a C header gives it.
+constrained_exported(name: string, base: Type, derived: bool, lo: Option[Decimal],
+                     hi: Option[Decimal], exclusive_hi: bool, pred_fn: Option[string],
+                     cname: Option[string]) -> Type =
+    Constrained(ConstrainedType(name, base, derived, lo, hi, exclusive_hi, pred_fn, cname))
 
 // Two lists of types, element for element.
 types_eq(xs: Buf[Type], ys: Buf[Type]) -> bool

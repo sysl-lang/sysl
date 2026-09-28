@@ -550,3 +550,38 @@ private struct_advice(t: Type, d: &StructType) -> string
 
     ""
 end struct_advice
+
+// Whether an exported `type` may be declared as a C `typedef` of `t`.
+//
+// **A scalar or a pointer, and nothing with a layout.** An aggregate has a name of its own in the
+// header already -- `@export` on the struct chooses it -- so a second name for it would be a
+// `typedef` the header had no reason to write; a slice, a counted reference and a data enum are the
+// shapes no C declaration spells at all. A function pointer is a pointer, and an alias of an alias
+// is asked about what it stands for.
+typedefable(t: Type) -> bool = t match
+    Constrained(d) -> typedefable(d.base)
+    _ -> repr(t) match
+        Integer(_, _, _) -> true
+        Floating(_, _) -> true
+        Bool -> true
+        Char -> true
+        Constrained(d) -> typedefable(d.base)
+        Ptr(_) -> !erased(repr(t))
+        CFn(_, _) -> true
+        _ -> false
+
+// What to write instead of a `typedef` C could not spell -- there is always something.
+typedef_advice(t: Type) -> string = repr(t) match
+    Struct(_) -> "Put '@export(\"...\")' above the struct itself, which names it in the header, or " +
+                 "export a pointer to it"
+    Enum(d) ->
+        if d.simple then "A simple enum is spelled as the integer it is, so export an alias of that integer"
+        else typedef_fallback(t)
+    Array(_, _) -> "Wrap the array in a struct and name that, which is how C hands one over as a value"
+    _ -> typedef_fallback(t)
+
+private typedef_fallback(t: Type) -> string
+    val said = export_advice(t)
+
+    if said != "" then said else "Export an alias of a scalar or a pointer"
+end typedef_fallback

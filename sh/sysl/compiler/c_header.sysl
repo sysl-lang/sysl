@@ -34,21 +34,34 @@ header_aggregates(exports: Buf[TFunc]) -> Buf[Type]
 end header_aggregates
 
 private header_walk(t: Type, seen: *Buf[Type], named: *Buf[Type])
-    val r = repr(t)
+    t match
+        // An exported `type` is a `typedef`, and what it stands for goes first for a struct's reason:
+        // a pointer to a struct names a type the C compiler must already have met. It is matched
+        // before `surface`, which would see straight through a transparent one to its base.
+        Constrained(d) ->
+            if d.cname.is_some()
+                if !first_sight(t, seen) then return
 
-    for i in 0..<seen.len()
-        if type_eq(seen.at(i), r) then return
+                header_walk(d.base, seen, named)
+                named.push(t)
+            else header_walk(d.base, seen, named)
+        Volatile(inner) -> header_walk(*inner, seen, named)
+        _ -> header_aggregate(header_surface(t), seen, named)
+end header_walk
 
-    seen.push(r)
+private header_aggregate(r: Type, seen: *Buf[Type], named: *Buf[Type])
+    if !first_sight(r, seen) then return
 
     r match
         // The fields go first, so that what this definition lays out is already complete where the
-        // C compiler reads it.
+        // C compiler reads it. An opaque struct lays nothing out, so what its fields reach is not
+        // the header's business -- and a field type with no C spelling is no obstacle.
         Struct(d) ->
-            val fields = d.stored()
+            if !d.opaque
+                val fields = d.stored()
 
-            for i in 0..<fields.len()
-                header_walk(fields.at(i).1, seen, named)
+                for i in 0..<fields.len()
+                    header_walk(fields.at(i).1, seen, named)
 
             named.push(r)
         Array(_, elem) -> header_walk(*elem, seen, named)
@@ -59,7 +72,23 @@ private header_walk(t: Type, seen: *Buf[Type], named: *Buf[Type])
 
             header_walk(*ret, seen, named)
         _ -> ()
-end header_walk
+end header_aggregate
+
+// Whether the walk meets `t` for the first time, recording it where it does.
+private first_sight(t: Type, seen: *Buf[Type]) -> bool
+    for i in 0..<seen.len()
+        if type_eq(seen.at(i), t) then return false
+
+    seen.push(t)
+    true
+end first_sight
+
+// A transparent named subtype or a qualifier taken off the top, and every name inside left where it
+// was written -- a name there is exactly the thing a header is asked to spell.
+private header_surface(t: Type) -> Type = t match
+    Constrained(d) -> if d.derived then t else header_surface(d.base)
+    Volatile(inner) -> header_surface(*inner)
+    _ -> t
 
 // The C name of a named type -- the one the author chose, or the derived one.
 //
@@ -81,6 +110,7 @@ c_name(t: Type) -> string = t match
     Struct(d) -> d.cname match
         Some(name) -> name
         None -> c_header_name(mangled(d.base, d.targs))
+    Constrained(d) -> d.cname.unwrap_or("void")
     _ -> "void"
 
 private c_header_name(name: string) -> string
@@ -217,39 +247,97 @@ c_prototype(f: TFunc) -> string
         for i in 0..<f.params.len()
             if i > 0 then params += ", "
 
-            params += s"${c_spell(f.params.at(i).1)} ${f.params.at(i).0}"
+            params += c_declare(f.params.at(i).1, f.params.at(i).0)
 
     val no_return = if is_never_type(f.ret_ty) then "SYSL_NORETURN " else ""
 
-    s"$no_return${c_spell(f.ret_ty)} ${symbol_of(f)}($params)"
+    // The function's own name and parameter list are the declarator its result type wraps, which is
+    // what puts a returned function pointer's `(*` ... `)` around them: `void (*get(void))(int32_t)`.
+    s"$no_return${c_declare(f.ret_ty, s"${symbol_of(f)}($params)")}"
 end c_prototype
 
 // One aggregate, as C declares it -- a `typedef` of an anonymous struct, so that the name is usable
 // without the `struct` keyword and reads the way a C API's own handles do.
+//
+// **An `opaque` struct is declared incomplete** -- `typedef struct h h;`, a tag with no body -- which
+// is exactly C's `struct foo;`: the C caller may hold a `*h` and never see inside. **An exported
+// `type` declares its name over what it stands for**, which is the declarator walk with the new name
+// where a variable's would go: `typedef int32_t (*on_event)(int32_t);`.
 private c_aggregate_definition(t: Type) -> string = t match
+    Constrained(d) -> s"typedef ${c_declare(d.base, c_name(t))};\n"
     Struct(d) ->
+        if d.opaque then return s"typedef struct ${c_name(t)} ${c_name(t)};\n"
+
         var fields = ""
         val stored = d.stored()
 
         for i in 0..<stored.len()
-            fields += s"\t${c_member(stored.at(i).1, stored.at(i).0)};\n"
+            fields += s"\t${c_declare(stored.at(i).1, stored.at(i).0)};\n"
 
         s"typedef struct {\n$fields} ${c_name(t)};\n"
     _ -> ""
 
-// A field, which is where the **declarator** matters: an array's brackets go after the name, so a
-// member is not simply its type followed by its name the way a parameter is.
-private c_member(t: Type, name: string) -> string = repr(t) match
-    Array(length, elem) -> s"${c_spell(*elem)} $name[$length]"
-    _ -> s"${c_spell(t)} $name"
+// A sysl type declaring `name` -- a parameter, a field, or (with `name` holding the function's own
+// name and parameter list) a whole prototype.
+//
+// **C does not write a type and then a name.** The name is the innermost part of a *declarator* the
+// type wraps around it: an array's `[n]` and a function's parameter list go after it, a pointer's
+// `*` goes before it, and a function pointer is the two together, `R (*name)(A)`. Spelling the type
+// whole and appending the name gives `void (*)(int32_t) f`, which no C compiler accepts. So this
+// builds the declarator outward from the name, and `c_spell` is the same walk with no name at all --
+// C's *abstract* declarator, `void (*)(int32_t)`.
+c_declare(t: Type, name: string) -> string = t match
+    // An exported `type` is spelled by its name wherever it appears, which makes it a base type here
+    // whatever it stands for -- a `typedef` of a pointer is written `h name`, with the `*` already
+    // inside the name. One that is not exported is spelled as what it stands for.
+    Constrained(d) ->
+        if d.cname.is_some() then (if name == "" then c_name(t) else s"${c_name(t)} $name")
+        else c_declare(d.base, name)
+    Volatile(inner) -> c_declare(*inner, name)
+    _ -> c_declarator(t, name)
 
-// A sysl type as C spells it.
+private c_declarator(t: Type, name: string) -> string = header_surface(t) match
+    CFn(params, ret) ->
+        var ps = ""
+
+        if params.is_empty() then ps = "void"
+        else
+            for i in 0..<params.len()
+                if i > 0 then ps += ", "
+
+                ps += c_spell(params.at(i))
+
+        c_declare(*ret, s"(*$name)($ps)")
+    // A pointer to something whose declarator binds tighter than `*` -- an array or a function
+    // pointer -- needs the parentheses that make the `*` apply first. An exported name is a base
+    // type, so a pointer to one takes no parentheses whatever it names.
+    Ptr(inner) ->
+        if binds_tighter(*inner) && !typedefd(*inner) then c_declare(*inner, s"(*$name)")
+        else c_declare(*inner, if name == "" then "*" else s"* $name")
+    Array(length, elem) -> c_declare(*elem, s"$name[$length]")
+    _ -> if name == "" then c_base(t) else s"${c_base(t)} $name"
+
+private binds_tighter(t: Type) -> bool = header_surface(t) match
+    Array(_, _) -> true
+    CFn(_, _) -> true
+    _ -> false
+
+// Whether `t` is spelled by an exported `type`'s name, looking through a qualifier.
+private typedefd(t: Type) -> bool = t match
+    Constrained(d) -> d.cname.is_some()
+    Volatile(inner) -> typedefd(*inner)
+    _ -> false
+
+// A sysl type as C spells it, with no name declared.
+c_spell(t: Type) -> string = c_declare(t, "")
+
+// A type that is not built from a declarator -- a scalar, a struct's name, a simple enum's integer.
 //
 // Only the types the export check admits reach here, so the fallthrough is unreachable rather than a
 // default -- and it is written as a refusal in the text it produces, because a header that quietly
 // emitted `void*` for something it did not understand would compile on both sides and be wrong in
 // between.
-c_spell(t: Type) -> string = repr(t) match
+private c_base(t: Type) -> string = header_surface(t) match
     Unit -> "void"
     Never -> "void"
     Bool -> "bool"
@@ -264,27 +352,11 @@ c_spell(t: Type) -> string = repr(t) match
     Floating(16, true) -> "__bf16"
     Floating(16, _) -> "_Float16"
     Floating(bits, _) -> if bits == 32 then "float" else "double"
-    // Pointed-to `void` has no size in C, so a pointer to nothing is `void *` and everything else
-    // keeps its pointee. A pointer to a type C cannot spell never gets here.
-    Ptr(inner) -> repr(*inner) match
-        Unit -> "void *"
-        _ -> s"${c_spell(*inner)} *"
-    CFn(params, ret) ->
-        var ps = ""
-
-        if params.is_empty() then ps = "void"
-        else
-            for i in 0..<params.len()
-                if i > 0 then ps += ", "
-
-                ps += c_spell(params.at(i))
-
-        s"${c_spell(*ret)} (*)($ps)"
     // A struct is named rather than written out, and `header_aggregates` is what put the definition
     // above the prototype. A **simple** enum is its underlying integer and is spelled as one: C's own
     // `enum` has an implementation-defined width, so naming the integer is what states the same
     // contract the rest of the header states.
-    Struct(_) -> c_name(repr(t))
+    Struct(_) -> c_name(header_surface(t))
     Enum(d) -> if d.simple then c_spell(d.underlying) else s"/* no C spelling for ${type_show(t)} */ void"
     _ -> s"/* no C spelling for ${type_show(t)} */ void"
 

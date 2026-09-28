@@ -386,7 +386,7 @@ tuple_type(ts: Buf[Type]) -> &StructType
     for i in 0..<ts.len()
         fields.push((str(i), ts.at(i)))
 
-    StructType(tuple_base(ts.len()), ts, fields, false, None, None)
+    StructType(tuple_base(ts.len()), ts, fields, false, None, None, false)
 end tuple_type
 
 // The same, recorded -- so that one `(string, string)` is one type wherever it is written, and so
@@ -816,7 +816,7 @@ private opaque_c_type(a: &Analysis, key: string) -> Type
 
     if already.is_some() then return already.unwrap()
 
-    val made = Struct(StructType(key, buf(), buf(), false, None, None))
+    val made = Struct(StructType(key, buf(), buf(), false, None, None, false))
 
     a.tables.struct_insts.put(key, made)
     made
@@ -912,7 +912,7 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     // bare name is what it chose.
     val made: &StructType = StructType(key, targs, buf(), d.packed,
                                        aligned_to(a, scope, span, written, d.alignment),
-                                       exported_c_name(d))
+                                       exported_c_name(d), d.opaque)
     val ty = Struct(made)
 
     a.tables.in_progress.put(inst, ty)
@@ -1201,7 +1201,22 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
     // which is what a conversion into the type calls to test a value.
     val pred = if d.pred.is_none() then None else Some(pred_key(key))
 
-    if !is_plain_alias(d) then made = constrained(key, base, d.derived, lo, hi, exclusive, pred)
+    // An exported name with no constraint is the one shape that may stand for more than a number:
+    // what it asks for is a `typedef`, and C writes one for a pointer as readily as for an integer.
+    // Anything C cannot spell that way is refused here, under the export's reading.
+    if is_exported_alias(d) && !typedefable(base) then
+        a.fault(home, d.cname.unwrap().span,
+                s"'${qualified_name(key)}' is exported to a C header as ${type_show(base)}, which C " +
+                "has no way to spell as a typedef — a header names an integer, a float, 'bool', " +
+                s"'char' or a pointer this way. ${typedef_advice(base)}")
+
+    // Written bare, `@export` gives the header the declared name, as it does a struct's.
+    val cname = d.cname match
+        Some(e) -> Some(e.symbol.unwrap_or(module_bare(spelled_key(key))))
+        None -> None
+
+    if !is_plain_alias(d) then
+        made = constrained_exported(key, base, d.derived, lo, hi, exclusive, pred, cname)
 
     a.tables.constrained_insts.put(key, made)
     made
@@ -1225,16 +1240,23 @@ private range_end(a: &Analysis, scope: Scope, e: Expr) -> Option[Decimal]
         _ -> None
 end range_end
 
-// Whether a `type` declaration is only another spelling for what it names -- no `is`, no range, no
-// predicate.
 // Whether a declaration is another spelling of its base rather than a type of its own.
 //
 // **A measured `c type` is written in exactly this shape and is not one.** It is a distinct scalar
 // whose width came from the C compiler, so a signature naming it says `Tick` where a transparent
 // alias would have said `uint` -- which is the whole point of writing one: the header owns the width
 // and the program names the typedef.
+//
+// **Nor is an exported one**, for the same reason seen from the header's side: `@export` asks a
+// generated header to spell the type by a name of its own, and a name that dissolved into its base
+// here would leave nothing there to spell. It is built as a transparent type with no constraint,
+// interchangeable with its base in both directions, as before.
 is_plain_alias(d: TypeDecl) -> bool =
-    !d.derived && d.range.is_none() && d.pred.is_none() && !d.from_c
+    !d.derived && d.range.is_none() && d.pred.is_none() && !d.from_c && d.cname.is_none()
+
+// Whether a declaration is an alias a C header is asked to declare as a `typedef`.
+private is_exported_alias(d: TypeDecl) -> bool =
+    d.cname.is_some() && !d.derived && d.range.is_none() && d.pred.is_none()
 
 // The name a C header declares a struct under, where the declaration asked for one -- the symbol it
 // wrote, or its own bare name where it named the attribute and nothing else.

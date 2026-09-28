@@ -1076,8 +1076,23 @@ ex_a_struct_name_reaches_every_spelling()
                       "@export\nshift(b: *Body, cb: *extern(V) -> unit) -> V = b.at\n")
 
     assert(h.contains("\tb2Vec2 at;"), h)
-    assert(h.contains("b2Vec2 shift(demo_Body * b, void (*)(b2Vec2) cb);"), h)
+    assert(h.contains("b2Vec2 shift(demo_Body * b, void (*cb)(b2Vec2));"), h)
 end ex_a_struct_name_reaches_every_spelling
+
+// A function pointer is a declarator, not a type followed by a name: the name goes inside the `(*`
+// ... `)`, wherever the pointer stands. `void (*)(int32_t) f` is not C.
+@test("a function pointer puts the name inside its declarator, as a parameter, a field and a result")
+ex_a_function_pointer_is_a_declarator()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\nstruct Sink\n    put: *extern(i32) -> unit\n    n: i32\n\n" +
+                      "@export\nemit(s: *Sink) = s.put(s.n)\n\n" +
+                      "@export\nhook(f: *extern(i32) -> unit) -> *extern(i32) -> unit = f\n")
+
+    assert(h.contains("\tvoid (*put)(int32_t);"), h)
+    assert(h.contains("void (*hook(void (*f)(int32_t)))(int32_t);"), h)
+    assert(!h.contains("(*)"), h)
+end ex_a_function_pointer_is_a_declarator
 
 // The layout pair and the name are three facts about one struct, so they compose -- which is the
 // combination a mirrored C struct actually wants.
@@ -1214,6 +1229,199 @@ ex_two_names_that_reach_no_header()
 
     assert(h.contains("int32_t f(int32_t n);"), h)
 end ex_two_names_that_reach_no_header
+
+// -- the name a type carries in the header -------------------------------------------------------------
+
+// `@export` on a `type`: the header declares a `typedef` and spells the type by that name wherever it
+// appears, rather than dissolving it into its base.
+
+private ex_slate() -> string =
+    "module demo\n\n@export(\"slate_value\")\ntype Handle = u64\n\n" +
+    "@export(\"slate_int\")\nint_of(n: i64) -> Handle = u64(n)\n"
+
+// Where `what` first appears in `text`, or past the end where it does not -- so an ordering claim
+// about a missing line fails rather than passing.
+private ex_at(text: string, what: string) -> usize = text.index_of(what).unwrap_or(text.bytes.len + 1)
+
+@test("the name a type carries is declared as a typedef of what it stands for, and the prototype uses it")
+ex_a_type_is_a_typedef()
+    if ex_no_library() then return
+
+    val h = ex_header(ex_slate())
+
+    assert(h.contains("typedef uint64_t slate_value;\n"), h)
+    assert(h.contains("slate_value slate_int(int64_t n);"), h)
+    assert(ex_at(h, "typedef uint64_t slate_value;") < ex_at(h, "slate_int("), h)
+end ex_a_type_is_a_typedef
+
+@test("and the bare form is the declared name, as a struct's is")
+ex_a_type_name_bare_is_the_declared_name()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export\ntype Handle = u64\n\n@export\nf(h: Handle) -> Handle = h\n")
+
+    assert(h.contains("typedef uint64_t Handle;\n"), h)
+    assert(h.contains("Handle f(Handle h);"), h)
+end ex_a_type_name_bare_is_the_declared_name
+
+// Exporting it changes what the header says and nothing a sysl caller sees: it is still
+// interchangeable with its base in both directions, with no conversion written.
+@test("and a sysl caller still mixes an exported type with its base freely")
+ex_an_exported_type_mixes_with_its_base()
+    if ex_no_library() then return
+
+    val text = ex_ir("module demo\n\n@export(\"v\")\ntype Handle = u64\n\n@export\nf(h: Handle) -> u64 = h + 1\n\n" +
+                     "val a: u64 = f(41)\nval b: Handle = a\nprint(b)\n")
+
+    assert(text.contains("define"), text)
+end ex_an_exported_type_mixes_with_its_base
+
+@test("an exported type is what a struct field and a function pointer's parameter spell too")
+ex_a_type_name_reaches_every_spelling()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export(\"slate_value\")\ntype Handle = u64\n\n" +
+                      "@export(\"box\")\nstruct Box\n    v: Handle\n    cb: *extern(Handle) -> Handle\n\n" +
+                      "@export\nput(b: *Box, f: *extern(Handle, i32) -> unit)\n    f(b.v, 1)\n")
+
+    assert(h.contains("\tslate_value v;"), h)
+    assert(h.contains("\tslate_value (*cb)(slate_value);"), h)
+    assert(h.contains("void put(box * b, void (*f)(slate_value, int32_t));"), h)
+    assert(ex_at(h, "typedef uint64_t slate_value;") < ex_at(h, "typedef struct {"), h)
+end ex_a_type_name_reaches_every_spelling
+
+// A pointer's `*` is part of what the name stands for, so a pointer to a named pointer is `h *`, and
+// a function pointer given a name takes no parentheses of its own where it is used.
+@test("a pointer and a function pointer are declared with their declarators inside the typedef")
+ex_a_pointer_type_is_declared_inside_the_typedef()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export(\"vm\")\nopaque struct Vm\n    n: int\n\n" +
+                      "@export(\"vm_ref\")\ntype VmRef = *Vm\n\n" +
+                      "@export(\"on_event\")\ntype OnEvent = *extern(i32) -> i32\n\n" +
+                      "@export\nrun(v: VmRef, f: OnEvent, fs: *OnEvent) -> VmRef = v\n")
+
+    assert(h.contains("typedef struct vm vm;\n"), h)
+    assert(h.contains("typedef vm * vm_ref;\n"), h)
+    assert(h.contains("typedef int32_t (*on_event)(int32_t);\n"), h)
+    assert(h.contains("vm_ref run(vm_ref v, on_event f, on_event * fs);"), h)
+    assert(ex_at(h, "typedef struct vm vm;") < ex_at(h, "typedef vm * vm_ref;"), h)
+end ex_a_pointer_type_is_declared_inside_the_typedef
+
+// The name is the header's to spell even where the checker sees straight through it: a `*Handle`
+// agrees with a `*u64` in sysl, and is still written by its name here.
+@test("a pointer to an exported type is spelled by the name, though sysl reads it as a pointer to the base")
+ex_a_pointer_to_a_type_keeps_the_name()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export(\"h_t\")\ntype H = u64\n\n" +
+                      "@export\nfirst(p: *H, q: *u64) -> H = p[0] + q[0]\n")
+
+    assert(h.contains("h_t first(h_t * p, uint64_t * q);"), h)
+end ex_a_pointer_to_a_type_keeps_the_name
+
+@test("while a type that is not exported is spelled as what it stands for")
+ex_an_unexported_type_is_its_base()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\ntype Handle = u64\ntype Meters = new f64\ntype Slot = u8 within 0..<8\n\n" +
+                      "@export\nf(h: Handle, m: Meters, s: Slot) -> Handle = h\n")
+
+    assert(h.contains("uint64_t f(uint64_t h, double m, uint8_t s);"), h)
+    assert(!h.contains("typedef uint64_t"), h)
+end ex_an_unexported_type_is_its_base
+
+// A narrowed type is exported the same way: the header has no way to check the bound, and says what
+// the value is made of -- which is all a C declaration ever says.
+@test("and a narrowed or derived type exports as its base, under its own name")
+ex_a_narrowed_type_exports_as_its_base()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export(\"slot\")\ntype Slot = u8 within 0..<8\n\n" +
+                      "@export(\"meters\")\ntype Meters = new f64\n\n@export\nf(s: Slot, m: Meters) -> Meters = m\n")
+
+    assert(h.contains("typedef uint8_t slot;\n"), h)
+    assert(h.contains("typedef double meters;\n"), h)
+    assert(h.contains("meters f(slot s, meters m);"), h)
+end ex_a_narrowed_type_exports_as_its_base
+
+@test("two aliases of one base are two typedefs, and a bare base is still the C name")
+ex_two_aliases_are_two_typedefs()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export(\"value_a\")\ntype A = u64\n\n@export(\"value_b\")\ntype B = u64\n\n" +
+                      "@export\nf(a: A, b: B, n: u64) -> B = b\n")
+
+    assert(h.contains("typedef uint64_t value_a;\n"), h)
+    assert(h.contains("typedef uint64_t value_b;\n"), h)
+    assert(h.contains("value_b f(value_a a, value_b b, uint64_t n);"), h)
+end ex_two_aliases_are_two_typedefs
+
+@test("an alias of an alias is declared after the one it names")
+ex_an_alias_of_an_alias_comes_after()
+    if ex_no_library() then return
+
+    val h = ex_header("module demo\n\n@export(\"base_t\")\ntype A = u32\n\n@export(\"top_t\")\ntype B = A\n\n" +
+                      "@export\nf(b: B) -> A = b\n")
+
+    assert(h.contains("typedef uint32_t base_t;\n"), h)
+    assert(h.contains("typedef base_t top_t;\n"), h)
+    assert(h.contains("base_t f(top_t b);"), h)
+    assert(ex_at(h, "typedef uint32_t base_t;") < ex_at(h, "typedef base_t top_t;"), h)
+end ex_an_alias_of_an_alias_comes_after
+
+@test("a type over a struct is refused, with the struct's own attribute named instead")
+ex_a_type_over_a_struct_is_refused()
+    if ex_no_library() then return
+
+    assert_eq(ex_err("module demo\n\nstruct Point\n    x: i32\n\n@export(\"point_t\")\ntype P = Point\n"),
+              "'demo.P' is exported to a C header as demo.Point, which C has no way to spell as a " +
+              "typedef — a header names an integer, a float, 'bool', 'char' or a pointer this way. " +
+              "Put '@export(\"...\")' above the struct itself, which names it in the header, or " +
+              "export a pointer to it")
+end ex_a_type_over_a_struct_is_refused
+
+@test("and so are a slice and a counted reference, each with its own advice")
+ex_a_type_over_a_slice_or_a_box_is_refused()
+    if ex_no_library() then return
+
+    assert_eq(ex_err("module demo\n\n@export(\"bytes\")\ntype Bytes = []u8\n"),
+              "'demo.Bytes' is exported to a C header as []byte, which C has no way to spell as a " +
+              "typedef — a header names an integer, a float, 'bool', 'char' or a pointer this way. " +
+              "A slice is an address and a length, so C takes them as two parameters — a pointer " +
+              "and a 'usize' — which is the shape its own string and buffer functions already have")
+    assert_eq(ex_err("module demo\n\nstruct N\n    x: i32\n\n@export(\"nref\")\ntype R = &N\n"),
+              "'demo.R' is exported to a C header as &demo.N, which C has no way to spell as a " +
+              "typedef — a header names an integer, a float, 'bool', 'char' or a pointer this way. " +
+              "A counted reference has a header C would have to know the layout of. Hand out a raw " +
+              "pointer and keep the counted one on this side")
+end ex_a_type_over_a_slice_or_a_box_is_refused
+
+@test("a type's C name is held to a function's rules")
+ex_a_type_name_is_held_to_the_rules()
+    if ex_no_library() then return
+
+    assert_eq(ex_err("module demo\n\n@export(\"no-good\")\ntype H = u64\n"),
+              "'no-good' is not a name C can declare — a type's name in a header is a C identifier, " +
+              "so it is a letter or '_' followed by letters, digits and '_'")
+    assert_eq(ex_err("module demo\n\n@export(\"h\")\nprivate type H = u64\n"),
+              "'demo.H' is private, so no exported function may name it — an export is public, and " +
+              "a declaration may not be more visible than the types it names. No header can carry " +
+              "this type at all, so there is no name in one for it to take")
+end ex_a_type_name_is_held_to_the_rules
+
+// C has one namespace for a `typedef` name and a function name, which nothing on the sysl side hints
+// at.
+@test("and an exported type claims its name against a function's symbol, which C has one namespace for")
+ex_a_type_name_claims_against_a_function()
+    if ex_no_library() then return
+
+    assert_eq(ex_err("module demo\n\n@export(\"handle\")\ntype H = u64\n\n@export(\"handle\")\n" +
+                     "make(n: u64) -> H = n\n"),
+              "'handle' is the C name of the function 'demo.make' and the type 'demo.H' — a header " +
+              "declares both in one namespace, so a C project including it would see the name " +
+              "twice. Give each the name it should carry, '@export(\"...\")'")
+end ex_a_type_name_claims_against_a_function
 
 // -- a test build is held to the export rules too ----------------------------------------------------
 
