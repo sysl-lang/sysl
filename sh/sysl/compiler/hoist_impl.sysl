@@ -126,6 +126,29 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                     s"'${show_bound(a, bound, subject)}'" +
                     second_implementation(key.unwrap(), tr, already.at(i)))
 
+    // **A result is not a selector.** An operator trait's last argument is what the operator gives
+    // back, and `a * b` supplies the operands and nothing else -- so two implementations that agree
+    // on the operands and differ only in the result leave a use with nothing to choose by. Refused
+    // here rather than at the use, where it would be too late to say which the program meant. A
+    // block agreeing on the result as well is the duplicate the loop above has already told.
+    if spelling.is_some() && core_selects_by_operand(spelling.unwrap()) && bound.args.len() > 1
+        check_result_selector(a, scope, span, home.label, bound, subject, already, mine)
+
+    // On a **generic** subject a defaulted argument list is one promise per instantiation, the
+    // trait's own default naming the type being asked about. A written argument that *is* the
+    // subject's kind at one instantiation coincides with the default there and nowhere else. What can
+    // coincide is a type of the SUBJECT'S OWN KIND and nothing else: `Box[Pair[T]]` merely contains a
+    // `Pair`, and the subject itself says the same thing at every instantiation.
+    if !home.tparams.is_empty() && defaults_mention_self(tr)
+        for i in 0..<written.len()
+            val w = written.at(i)
+
+            if owner_key(w) == home.key && !type_eq(w, subject) then
+                a.fault(scope, span, s"'${type_show(w)}' is ${a_or_an(home.label)}, and a " +
+                        s"'${module_show(key.unwrap())}' whose arguments default names the type it is " +
+                        s"written for — so at one ${home.label} this block and a defaulted one would " +
+                        "promise the same thing")
+
     // A shape and a type of that shape written out in full would both implement the trait for that
     // type. By default the second one written is refused, in whichever order the file put them,
     // because two overlapping blocks are usually a mistake. **What lifts the refusal is `override`
@@ -406,12 +429,70 @@ second_implementation(trait_key: string, tr: TraitDecl, other: TraitImpl) -> str
     "arguments would have a call no way to say which was meant"
 end second_implementation
 
+// The first block already filed whose operands are this one's and whose result is not, told as the
+// collision it is.
+private check_result_selector(a: &Analysis, scope: Scope, span: Span, label: string, bound: Bound,
+                              subject: Type, already: Buf[TraitImpl], mine: Buf[Type])
+    val n = bound.args.len()
+
+    for i in 0..<already.len()
+        val theirs = supplied_bound(a, already.at(i), bound.name, subject, mine)
+
+        if theirs.args.len() == n && theirs.key() != bound.key()
+            var same = true
+            var operands: Buf[string] = buf()
+
+            for j in 0..<(n - 1)
+                if !type_eq(theirs.args.at(j), bound.args.at(j)) then same = false
+
+                operands.push(type_show(bound.args.at(j)))
+
+            if same
+                val op = core_required(library_spelling(bound.name).unwrap()).unwrap().1
+
+                a.fault(scope, span, s"'$label' already implements '${show_bound(a, theirs, subject)}', " +
+                        s"and this one differs only in what it gives back — '$op' between " +
+                        s"${type_show(subject)} and ${conjoin(operands)} would have two results to " +
+                        "choose from and nothing at the use to choose with")
+                return
+end check_result_selector
+
+// Whether any default the trait declares for its parameters names `Self`.
+private defaults_mention_self(tr: TraitDecl) -> bool
+    var names: Buf[string] = buf()
+
+    names.push("Self")
+
+    for i in 0..<tr.tdefaults.len()
+        if ref_mentions(tr.tdefaults.at(i).typ, names) then return true
+
+    false
+end defaults_mention_self
+
+// `a Box`, `an Option` -- the label read with its article.
+private a_or_an(label: string) -> string
+    if label.bytes.len == 0 then return label
+
+    val c = label.bytes[0]
+    val vowel = c == u8('a') || c == u8('e') || c == u8('i') || c == u8('o') || c == u8('u') ||
+                c == u8('A') || c == u8('E') || c == u8('I') || c == u8('O') || c == u8('U')
+
+    if vowel then s"an $label" else s"a $label"
+end a_or_an
+
 // -- what the block promises ------------------------------------------------------------------------
 
 // The bound the block supplies, and the arguments it actually **wrote** as against the ones the
 // trait's defaults filled in.
 impl_bound(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, tr: TraitDecl,
            home: MemberHome) -> (Bound, Buf[Type])
+    var counted: Buf[Type] = buf()
+
+    for i in 0..<block.trait_args.len()
+        counted.push(Unknown)
+
+    check_trait_arity_at(a, scope, span, module_show(block.trait_name), tr, counted)
+
     // The block's parameters resolve to themselves so that naming one here is caught as the thing it
     // is, rather than reported as an unknown type.
     val declared = abstract_subst(a, scope, block.tparams, block.bounds, block.tvalues, block.tpacks,

@@ -1,0 +1,988 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The heterogeneous operand (`library/core.md § Walking a type of your own`): the binary arithmetic
+// traits take the right-hand type as a parameter and the result as a second one, `Mul[Rhs = Self,
+// Out = Self]`, so `Complex * f64`, a dot product and a matrix applied to a vector are all operators.
+//
+// **What a use supplies is the operand, never the result** -- `a * b` fixes the pair and asks to be
+// told what comes back -- so the operands select the implementation and the implementation supplies
+// the result. Two implementations agreeing on the operands are therefore refused.
+//
+// **Every string quoted here was read out of the reference compiler**, whose
+// `HeterogeneousOperandTests` these are.
+
+private hop_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end hop_ready
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private hop_ran(text: string) -> string
+    val root = make_temp_dir("sysl-hetero").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end hop_ran
+
+// Everything a source has to say for itself, taken through the lowering.
+private hop_err(text: string) -> string
+    val root = make_temp_dir("sysl-hetero").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end hop_err
+
+// The LLVM text of a program that must compile.
+private hop_ir(text: string) -> string
+    val root = make_temp_dir("sysl-hetero").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end hop_ir
+
+// The body of `main` alone, which is where a program's own statements are lowered.
+private hop_ir_main(text: string) -> string
+    val all = hop_ir(text)
+
+    all.index_of("define i32 @main(") match
+        None -> all
+        Some(at) ->
+            val rest = all[at..]
+
+            rest.index_of("\n}\n") match
+                None -> rest
+                Some(end_at) -> rest[0..<end_at]
+end hop_ir_main
+
+private hop_count(text: string, part: string) -> int
+    var n = 0
+    var from = text
+
+    loop
+        from.index_of(part) match
+            None -> break
+            Some(at) ->
+                n += 1
+                from = from[(at + part.bytes.len)..]
+
+    n
+end hop_count
+
+// A complex number over `f64`, scalable by a real.
+private hop_complex() -> string = raw"""
+    struct C
+        re: f64
+        im: f64
+    impl Mul[f64] for C
+        mul(self, k: f64) -> C = C(self.re * k, self.im * k)
+    show(c: C) -> string = str(c.re) + " " + str(c.im)
+    """
+
+// The same, multiplied by another complex number as well: two argument lists for one trait on one type.
+private hop_both() -> string = hop_complex() + raw"""
+    impl Mul for C
+        mul(self, o: C) -> C = C(self.re * o.re - self.im * o.im, self.re * o.im + self.im * o.re)
+    """
+
+// The two products a vector space is made of, and neither returns both operands' type.
+private hop_space() -> string = raw"""
+    struct Vec2
+        x: real
+        y: real
+    struct Mat2
+        a: real
+        b: real
+        c: real
+        d: real
+    impl Mul[Vec2, real] for Vec2
+        mul(self, o: Vec2) -> real = self.x * o.x + self.y * o.y
+    impl Mul[Vec2, Vec2] for Mat2
+        mul(self, o: Vec2) -> Vec2 = Vec2(self.a * o.x + self.b * o.y, self.c * o.x + self.d * o.y)
+    impl Mul[real, Vec2] for Vec2
+        mul(self, k: real) -> Vec2 = Vec2(self.x * k, self.y * k)
+    """
+
+// The vector space above, written once over an element type.
+private hop_generic() -> string = raw"""
+    struct Vec2[T]
+        a: T
+        b: T
+    end Vec2
+    struct Mat2[T]
+        r0: Vec2[T]
+        r1: Vec2[T]
+    end Mat2
+    impl[T: Mul + Add] Mul[Vec2[T], T] for Vec2[T]
+        mul(self, rhs: Vec2[T]) -> T = self.a * rhs.a + self.b * rhs.b
+    impl[T: Mul] Mul[T] for Vec2[T]
+        mul(self, rhs: T) -> Vec2[T] = Vec2(self.a * rhs, self.b * rhs)
+    impl[T: Mul + Add] Mul[Vec2[T], Vec2[T]] for Mat2[T]
+        mul(self, rhs: Vec2[T]) -> Vec2[T] =
+            Vec2(self.r0.a * rhs.a + self.r0.b * rhs.b, self.r1.a * rhs.a + self.r1.b * rhs.b)
+    """
+
+// ---- an operator over two types
+
+@test("a struct scaled by a scalar")
+hop_a_struct_scaled_by_a_scalar()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_complex() + "print(show(C(1.0, 2.0) * 2.5))\n"), "2.5 5\n")
+
+@test("the operand order is the one written")
+hop_the_operand_order_is_the_one_written()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct S
+            v: int
+        impl Sub[int] for S
+            sub(self, k: int) -> S = S(self.v - k)
+        print((S(10) - 3).v)
+        """), "7\n")
+
+// The place is read once and updated from the value already held; a dispatched operator must not
+// have changed that.
+@test("a compound assignment updates through the same implementation")
+hop_a_compound_assignment_updates_through_the_same_implementation()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_complex() + raw"""
+        var c = C(1.0, 2.0)
+        c *= 3.0
+        print(show(c))
+        """), "3 6\n")
+
+@test("and updates the place from one call, not a rebuilt one")
+hop_and_updates_the_place_from_one_call()
+    if !hop_ready() then return
+
+    val out = hop_ir_main(hop_complex() + "var c = C(1.0, 2.0)\nc *= 3.0\n")
+
+    assert_eq(hop_count(out, "@C.mul"), 1)
+
+@test("every binary arithmetic trait takes the right-hand type")
+hop_every_binary_arithmetic_trait_takes_the_right_hand_type()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct B
+            v: int
+        impl Add[int] for B
+            add(self, k: int) -> B = B(self.v + k)
+        impl Div[int] for B
+            div(self, k: int) -> B = B(self.v / k)
+        impl Rem[int] for B
+            rem(self, k: int) -> B = B(self.v % k)
+        impl BitAnd[int] for B
+            bitand(self, k: int) -> B = B(self.v & k)
+        impl BitOr[int] for B
+            bitor(self, k: int) -> B = B(self.v | k)
+        impl BitXor[int] for B
+            bitxor(self, k: int) -> B = B(self.v ^ k)
+        impl Shl[int] for B
+            shl(self, k: int) -> B = B(self.v << k)
+        impl Shr[int] for B
+            shr(self, k: int) -> B = B(self.v >> k)
+        print((B(20) + 1).v)
+        print((B(20) / 2).v)
+        print((B(20) % 7).v)
+        print((B(20) & 6).v)
+        print((B(20) | 1).v)
+        print((B(20) ^ 4).v)
+        print((B(20) << 1).v)
+        print((B(20) >> 2).v)
+        """), "21\n10\n6\n4\n21\n16\n40\n5\n")
+
+// ---- what the default keeps working
+
+@test("an implementation written with no arguments is the homogeneous one")
+hop_no_arguments_is_the_homogeneous_one()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct P
+            v: int
+        impl Mul for P
+            mul(self, k: P) -> P = P(self.v * k.v)
+        print((P(6) * P(7)).v)
+        """), "42\n")
+
+@test("and writing the argument out is the same implementation")
+hop_writing_the_argument_out_is_the_same()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct P
+            v: int
+        impl Mul[P] for P
+            mul(self, k: P) -> P = P(self.v * k.v)
+        print((P(6) * P(7)).v)
+        """), "42\n")
+
+@test("a bare bound still asks for the homogeneous trait")
+hop_a_bare_bound_still_asks_for_the_homogeneous_trait()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct P
+            v: int
+        impl Mul for P
+            mul(self, k: P) -> P = P(self.v * k.v)
+        sq[T: Mul](x: T) -> T = x * x
+        print(sq(P(5)).v)
+        print(sq(9))
+        """), "25\n81\n")
+
+@test("a bound may name the right-hand type instead")
+hop_a_bound_may_name_the_right_hand_type()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_complex() + raw"""
+        twice[T: Mul[f64]](x: T) -> T = x * 2.0
+        print(show(twice(C(1.5, 2.0))))
+        """), "3 4\n")
+
+@test("a requirement carries the default down")
+hop_a_requirement_carries_the_default_down()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct P
+            v: int
+        trait Word: Mul
+            tag(self) -> int
+        impl Mul for P
+            mul(self, k: P) -> P = P(self.v * k.v)
+        impl Word for P
+            tag(self) -> int = self.v
+        sq[T: Word](x: T) -> T = x * x
+        print(sq(P(4)).v)
+        """), "16\n")
+
+// ---- what the scalars kept
+
+@test("a scalar operator is still one instruction")
+hop_a_scalar_operator_is_still_one_instruction()
+    if !hop_ready() then return
+
+    val out = hop_ir_main("var a = 6\nvar b = 7\nprint(a * b)\n")
+
+    assert(out.contains("mul i32"), out)
+
+@test("at every width, signed and not")
+hop_at_every_width_signed_and_not()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        print(200u8 + 100u8)
+        print(3u8 * 4u8)
+        print(-7i16 / 2i16)
+        print(7u16 / 2u16)
+        print(-7 % 3)
+        print(1u8 << 7u8)
+        print(-8i8 >> 1i8)
+        """), "44\n12\n-3\n3\n-1\n128\n-4\n")
+
+@test("and a scalar's trait method called by name is the same instruction")
+hop_a_scalars_trait_method_called_by_name()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran("print(5.add(3))\nprint(5.mul(3))\nprint(5.shl(1))\n"), "8\n15\n10\n")
+
+@test("a transparent subtype is its base's member")
+hop_a_transparent_subtype_is_its_bases_member()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        type Age = int within 0..150
+        var a: Age = 20
+        print(a * 2)
+        """), "40\n")
+
+// ---- what stays homogeneous
+
+@test("a comparison takes no right-hand type")
+hop_a_comparison_takes_no_right_hand_type()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        struct P
+            v: int
+        impl Eq[int] for P
+            eq(self, k: int) -> bool = self.v == k
+        print(1)
+        """)
+
+    assert(e.contains("trait 'sysl.Eq' does not take type arguments"), e)
+
+@test("so comparing two types is still a mismatch")
+hop_so_comparing_two_types_is_still_a_mismatch()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        struct P
+            v: int
+        impl Ord for P
+            lt(self, k: P) -> bool = self.v < k.v
+        print(P(1) < 2)
+        """)
+
+    assert(e.contains("'<' needs matching types, got P and int"), e)
+
+// ---- what a mistake says
+
+@test("the wrong right-hand type names the trait that is missing")
+hop_the_wrong_right_hand_type_names_the_trait()
+    if !hop_ready() then return
+
+    val e = hop_err(hop_complex() + "print(show(C(1.0, 2.0) * 2))\n")
+
+    assert(e.contains("'*' between C and int needs 'sysl.Mul[int]' — it implements 'sysl.Mul[real]'"), e)
+
+@test("a type with no implementation at all keeps the plain diagnostic")
+hop_no_implementation_keeps_the_plain_diagnostic()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        struct P
+            v: int
+        print(1)
+        var q = P(1) * P(2)
+        """)
+
+    assert(e.contains("operator '*' is not defined for P"), e)
+
+@test("a bounded parameter is told which bound to write")
+hop_a_bounded_parameter_is_told_which_bound()
+    if !hop_ready() then return
+
+    val e = hop_err(hop_complex() + "twice[T](k: f64, x: T) -> T = x * k\n")
+
+    assert(e.contains("'*' needs 'T: sysl.Mul[real]'"), e)
+
+// The bare spelling is what a program writes, so it is what the advice has to say.
+@test("and a homogeneous one is told the bare trait")
+hop_a_homogeneous_one_is_told_the_bare_trait()
+    if !hop_ready() then return
+
+    val e = hop_err("sq[T](x: T) -> T = x * x\n")
+
+    assert(e.contains("'*' needs 'T: sysl.Mul'"), e)
+
+// Only the argument list tells a user's block on a scalar from the scalar's own instruction.
+@test("a scalar takes a user implementation at an argument list of its own")
+hop_a_scalar_takes_a_user_implementation()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_complex() + raw"""
+        impl Mul[C] for f64
+            mul(self, c: C) -> f64 = self * c.re
+        print(2.0 * C(1.5, 2.0))
+        """), "3\n")
+
+@test("and keeps its instruction for its own pair, by the operator and by name")
+hop_and_keeps_its_instruction_for_its_own_pair()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_complex() + raw"""
+        impl Mul[C] for f64
+            mul(self, c: C) -> f64 = self * c.re
+        print(2.0 * 3.0, 2.0.mul(3.0))
+        """), "6 6\n")
+
+@test("two implementations at one argument list is still one too many")
+hop_two_implementations_at_one_argument_list()
+    if !hop_ready() then return
+
+    val e = hop_err(hop_complex() + raw"""
+        impl Mul[f64] for C
+            mul(self, k: f64) -> C = C(self.re, self.im)
+        print(1)
+        """)
+
+    assert(e.contains("'C' already implements 'sysl.Mul[real]' — a trait's members become the type's, " +
+                      "so a second 'mul' at these arguments would have a call no way to say which was meant"), e)
+
+// ---- one trait at two argument lists
+
+@test("the operator picks by the pair of operands")
+hop_the_operator_picks_by_the_pair_of_operands()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_both() + raw"""
+        print(show(C(1.0, 2.0) * C(3.0, 4.0)))
+        print(show(C(1.0, 2.0) * 2.5))
+        """), "-5 10\n2.5 5\n")
+
+@test("and so does the named call")
+hop_and_so_does_the_named_call()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_both() + raw"""
+        print(show(C(1.0, 2.0).mul(C(3.0, 4.0))))
+        print(show(C(1.0, 2.0).mul(2.5)))
+        """), "-5 10\n2.5 5\n")
+
+@test("each implementation is a function of its own")
+hop_each_implementation_is_a_function_of_its_own()
+    if !hop_ready() then return
+
+    val out = hop_ir(hop_both() + "print(show(C(1.0, 2.0) * C(3.0, 4.0) * 2.5))\n")
+
+    assert(out.contains("define %struct.C @C.mul(%struct.C %self.param, double %k.param)"), out)
+    assert(out.contains("define %struct.C @C.mul.2(%struct.C %self.param, %struct.C %o.param)"), out)
+    assert(out.contains("call %struct.C @C.mul.2(%struct.C %t2, %struct.C %t4)"), out)
+
+@test("a bound asks for the one it names")
+hop_a_bound_asks_for_the_one_it_names()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_both() + raw"""
+        scaled[T: Mul[f64]](x: T, k: f64) -> T = x * k
+        print(show(scaled(C(1.0, 2.0), 3.0)))
+        """), "3 6\n")
+
+@test("and the other bound reaches the other implementation")
+hop_and_the_other_bound_reaches_the_other()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_both() + raw"""
+        squared[T: Mul](x: T) -> T = x * x
+        print(show(squared(C(1.0, 2.0))))
+        """), "-3 4\n")
+
+@test("a call whose argument names neither is refused rather than guessed at")
+hop_a_call_whose_argument_names_neither_is_refused()
+    if !hop_ready() then return
+
+    val e = hop_err(hop_both() + "print(show(C(1.0, 2.0).mul(2)))\n")
+
+    assert(e.contains("'mul' comes from 2 implementations of one trait on C, and none of them takes (int) — " +
+                      "write the argument at the type of the implementation that was meant"), e)
+
+// ---- a bare literal beside a type parameter
+
+@test("takes the parameter's type where the bound is homogeneous")
+hop_literal_takes_the_parameters_type()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct P
+            v: int
+        impl Sub for P
+            sub(self, k: P) -> P = P(self.v - k.v)
+        dec[T: Sub](x: T, one: T) -> T = x - one
+        print(dec(9u8, 1u8))
+        print(dec(P(9), P(1)).v)
+        """), "8\n8\n")
+
+@test("and the bound's own right-hand type where it names one")
+hop_literal_takes_the_bounds_right_hand_type()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_complex() + raw"""
+        twice[T: Mul[f64]](x: T) -> T = x * 2.0
+        print(show(twice(C(1.0, 3.0))))
+        """), "2 6\n")
+
+@test("and is left homogeneous where no bound names the operator")
+hop_literal_is_left_homogeneous_without_a_bound()
+    if !hop_ready() then return
+
+    val e = hop_err("dec[T](x: T) -> T = x - 1\n")
+
+    assert(e.contains("'-' needs 'T: sysl.Sub'"), e)
+
+@test("a negative literal is read the same way")
+hop_a_negative_literal_is_read_the_same_way()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        neg[T: Add](x: T, d: T) -> T = x + d
+        print(neg(9i8, -1i8))
+        """), "8\n")
+
+@test("and a width-checked literal is still checked at the instantiation")
+hop_a_width_checked_literal_is_still_checked()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        wide[T: Add](x: T) -> T = x + 300
+        print(wide(1u8))
+        """)
+
+    assert(e.contains("the literal 300 does not fit byte"), e)
+
+// ---- a default that is not 'Self'
+
+@test("is what an implementation leaving it out supplies")
+hop_a_concrete_default_is_what_an_implementation_supplies()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        trait Sink[T = int]
+            put(self, x: T) -> int
+        struct C
+            n: int
+        impl Sink for C
+            put(self, x: int) -> int = self.n + x
+        f[T: Sink](c: T) -> int = c.put(5)
+        print(f(C(10)))
+        """), "15\n")
+
+@test("and a generic implementation supplies it at each instantiation")
+hop_a_generic_implementation_supplies_the_default()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct Box[T]
+            v: T
+        impl[T] Mul for Box[T]
+            mul(self, k: Box[T]) -> Box[T] = k
+        print((Box(1) * Box(2)).v)
+        print((Box("a") * Box("b")).v)
+        """), "2\nb\n")
+
+// A shape reaches the fill by a different key than a named type does. The trait is the program's own,
+// since the library's would leave a block on `[]T` with no home.
+@test("including one written for a shape")
+hop_including_one_written_for_a_shape()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        trait Times[Rhs = Self]
+            times(self, rhs: Rhs) -> Rhs
+        impl[T] Times for []T
+            times(self, rhs: []T) -> []T = rhs
+        var a = [1, 2]
+        var b = [3, 4]
+        print(a[0..].times(b[0..])[1])
+        """), "4\n")
+
+// ---- an operator whose result is neither operand's type
+
+@test("a dot product is an operator, and it yields the scalar")
+hop_a_dot_product_is_an_operator()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_space() + "print(Vec2(1.0, 2.0) * Vec2(3.0, 4.0))\n"), "11\n")
+
+@test("the same type's other multiplication still gives back a vector")
+hop_the_other_multiplication_gives_back_a_vector()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_space() + raw"""
+        var v = Vec2(1.0, 2.0) * 3.0
+        print(v.x, v.y)
+        """), "3 6\n")
+
+@test("a matrix applied to a vector yields a vector")
+hop_a_matrix_applied_to_a_vector()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_space() + raw"""
+        var w = Mat2(1.0, 2.0, 3.0, 4.0) * Vec2(1.0, 2.0)
+        print(w.x, w.y)
+        """), "5 11\n")
+
+// A result read off the receiver's type would have type-checked here and then computed with the wrong one.
+@test("the result composes, and it is the declared type rather than the receiver's")
+hop_the_result_composes()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_space() + raw"""
+        var m = Mat2(1.0, 0.0, 0.0, 1.0)
+        var u = Vec2(3.0, 4.0)
+        print((m * u) * u)
+        """), "25\n")
+
+@test("and it is what a nested call is checked against")
+hop_the_result_is_what_a_nested_call_is_checked_against()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_space() + raw"""
+        norm2(v: Vec2) -> real = v * v
+        print(norm2(Vec2(3.0, 4.0)))
+        """), "25\n")
+
+@test("a result mentioning neither operand")
+hop_a_result_mentioning_neither_operand()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct A
+            n: int
+        struct B
+            n: int
+        struct C
+            n: int
+        impl Mul[B, C] for A
+            mul(self, o: B) -> C = C(self.n * o.n)
+        print((A(6) * B(7)).n)
+        """), "42\n")
+
+// ---- the same readings at a generic element type
+
+@test("a dot product whose operand is the subject and whose result is not")
+hop_generic_dot_product()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_generic() + "print(Vec2(1.0, 2.0) * Vec2(3.0, 4.0))\n"), "11\n")
+
+@test("and the same block at another element type")
+hop_generic_dot_product_at_another_element_type()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_generic() + "print(Vec2(1, 2) * Vec2(3, 4))\n"), "11\n")
+
+@test("scaling still gives back the vector")
+hop_generic_scaling_gives_back_the_vector()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_generic() + raw"""
+        var v = Vec2(1.0, 2.0) * 3.0
+        print(v.a, v.b)
+        """), "3 6\n")
+
+@test("and a matrix applied to a vector still gives back a vector")
+hop_generic_matrix_applied_to_a_vector()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_generic() + raw"""
+        var w = Mat2(Vec2(1.0, 2.0), Vec2(3.0, 4.0)) * Vec2(1.0, 2.0)
+        print(w.a, w.b)
+        """), "5 11\n")
+
+// A bounded generic subject written as a trait argument: every block filed after it is read against
+// it under this block's stand-ins, so those stand-ins have to carry the bound.
+@test("a bounded generic subject may be written as a trait argument, with blocks filed after it")
+hop_a_bounded_generic_subject_as_a_trait_argument()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        trait Scalar: Mul + Add
+            tag(self) -> int
+        impl Scalar for real
+            tag(self) -> int = 1
+        struct Vec2[T: Scalar]
+            a: T
+            b: T
+        impl[T: Scalar] Mul[Vec2[T], T] for Vec2[T]
+            mul(self, rhs: Vec2[T]) -> T = self.a * rhs.a + self.b * rhs.b
+        impl[T: Scalar] Mul[T] for Vec2[T]
+            mul(self, k: T) -> Vec2[T] = Vec2(self.a * k, self.b * k)
+        impl[T: Scalar] Add for Vec2[T]
+            add(self, rhs: Vec2[T]) -> Vec2[T] = Vec2(self.a + rhs.a, self.b + rhs.b)
+        var v = Vec2(1.0, 2.0)
+        print(v * v, (v * 3.0).a, (v + v).b)
+        """), "5 3 4\n")
+
+// An argument naming ONE instantiation of the subject collides with the defaulted block there and
+// nowhere else.
+@test("an argument fixed to one instantiation of the subject is still refused")
+hop_an_argument_fixed_to_one_instantiation_is_refused()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        struct Box[T]
+            v: T
+        end Box
+        impl[T] Mul[Box[int]] for Box[T]
+            mul(self, rhs: Box[int]) -> Box[T] = self
+        """)
+
+    assert(e.contains("'Box[int]' is a Box, and a 'sysl.Mul' whose arguments default names the type it is " +
+                      "written for — so at one Box this block and a defaulted one would promise the same thing"), e)
+
+@test("a scalar on the left of a generic subject, whose argument is built out of the subject")
+hop_a_scalar_on_the_left_of_a_generic_subject()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct Box[T]
+            v: T
+        end Box
+        struct Pair[T]
+            a: T
+            b: T
+        end Pair
+        impl[T: Mul] Mul[T] for Pair[T]
+            mul(self, k: T) -> Pair[T] = Pair(self.a * k, self.b * k)
+        impl[T: Mul] Mul[Box[Pair[T]], Box[Pair[T]]] for Pair[T]
+            mul(self, b: Box[Pair[T]]) -> Box[Pair[T]] = Box(b.v * self.a)
+        val p = Pair(2, 3)
+        val q = p * Box(Pair(4, 5))
+        print(q.v.a, q.v.b)
+        """), "8 10\n")
+
+@test("the container on both sides, with the element type as the subject")
+hop_the_container_on_both_sides()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct Vec[T: Mul]
+            a: T
+            b: T
+        end Vec
+        impl[T: Mul] Mul[T] for Vec[T]
+            mul(self, k: T) -> Vec[T] = Vec(self.a * k, self.b * k)
+        impl Mul[Vec[int], Vec[int]] for int
+            mul(self, v: Vec[int]) -> Vec[int] = v * self
+        val v = Vec(2, 3)
+        print((4 * v).a, (v * 4).b)
+        """), "8 12\n")
+
+@test("two generic blocks agreeing on the operands are still refused")
+hop_two_generic_blocks_agreeing_on_the_operands()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        struct V[T]
+            x: T
+        end V
+        impl[T: Mul] Mul[V[T], T] for V[T]
+            mul(self, o: V[T]) -> T = self.x * o.x
+        impl[T: Mul] Mul for V[T]
+            mul(self, o: V[T]) -> V[T] = V(self.x * o.x)
+        """)
+
+    assert(e.contains("'V' already implements 'sysl.Mul[V[T], T]', and this one differs only in what it " +
+                      "gives back — '*' between V[T] and V[T] would have two results to choose from and " +
+                      "nothing at the use to choose with"), e)
+
+// A blanket is filed under its bound's key rather than under any type's, and must still not take the
+// compiler's own member name: `5.mul(2)` is an integer's own multiplication.
+@test("a blanket over the integers on the left covers every width, and hides none of their own")
+hop_a_blanket_over_the_integers_on_the_left()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        struct Ticks
+            n: long
+        end Ticks
+        impl Mul[long] for Ticks
+            mul(self, k: long) -> Ticks = Ticks(self.n * k)
+        impl[N: Integer] Mul[Ticks, Ticks] for N
+            mul(self, t: Ticks) -> Ticks = t * long(self)
+        val t = Ticks(7)
+        var w: u8 = 3
+        var m: i16 = 4
+        print((2 * t).n, (w * t).n, (m * t).n, (t * 5).n)
+        print(5.mul(2), 6.add(1))
+        """), "14 21 28 35\n10 7\n")
+
+// The refusal names the family rather than the block's parameter.
+@test("a blanket over the integers that writes no arguments is the one the compiler provides")
+hop_a_blanket_writing_no_arguments_is_the_compilers()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        impl[N: Integer] Mul for N
+            mul(self, rhs: N) -> N = rhs
+        """)
+
+    assert(e.contains("every type in 'sysl.Integer' already implements 'sysl.Mul' — the compiler provides it"), e)
+
+// `Neg` is provided for the signed integers and not the unsigned ones, so the family is asked whether
+// any member has it.
+@test("a trait provided for only half the family is still the compiler's")
+hop_a_trait_provided_for_half_the_family()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        impl[N: Integer] Neg for N
+            neg(self) -> N = self
+        """)
+
+    assert(e.contains("every type in 'sysl.Integer' already implements 'sysl.Neg' — the compiler provides it"), e)
+
+// It answers 7 rather than 11, so an integer's own `add` is reached and the block's is not.
+@test("a blanket of a program's own trait does not take a member name the compiler owns")
+hop_a_blanket_of_a_programs_own_trait()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        trait Doubling
+            add(self, rhs: int) -> int
+
+        impl[N: Integer] Doubling for N
+            add(self, rhs: int) -> int = int(self) + rhs * 2
+
+        print(5.add(1))
+        """), "7\n")
+
+// ---- a result is not a selector
+
+@test("two implementations agreeing on the operands are refused")
+hop_two_implementations_agreeing_on_the_operands()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        struct V
+            x: real
+        impl Mul[V, real] for V
+            mul(self, o: V) -> real = self.x * o.x
+        impl Mul[V, V] for V
+            mul(self, o: V) -> V = V(self.x * o.x)
+        """)
+
+    assert(e.contains("'V' already implements 'sysl.Mul[V, real]', and this one differs only in what it " +
+                      "gives back — '*' between V and V would have two results to choose from and " +
+                      "nothing at the use to choose with"), e)
+
+@test("a written result colliding with a defaulted one is the same refusal")
+hop_a_written_result_colliding_with_a_defaulted_one()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        struct V
+            x: real
+        impl Mul for V
+            mul(self, o: V) -> V = V(self.x * o.x)
+        impl Mul[V, real] for V
+            mul(self, o: V) -> real = self.x * o.x
+        """)
+
+    assert(e.contains("'V' already implements 'sysl.Mul', and this one differs only in what it " +
+                      "gives back — '*' between V and V would have two results to choose from and " +
+                      "nothing at the use to choose with"), e)
+
+@test("but differing operands remain two ordinary implementations")
+hop_differing_operands_remain_two_implementations()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_space() + raw"""
+        print(Vec2(1.0, 1.0) * Vec2(2.0, 3.0))
+        var s = Vec2(1.0, 1.0) * 2.0
+        print(s.x)
+        """), "5\n2\n")
+
+// ---- what the result being an argument does not change
+
+@test("a compound assignment through a result that is not the place's type is refused")
+hop_a_compound_assignment_through_another_result()
+    if !hop_ready() then return
+
+    val e = hop_err(hop_space() + raw"""
+        var v = Vec2(1.0, 2.0)
+        v *= Vec2(3.0, 4.0)
+        """)
+
+    assert(e.contains("'*=' updates Vec2 in place, but '*' between Vec2 and Vec2 gives real — write the " +
+                      "assignment out to say where it goes"), e)
+
+@test("while one whose result is the place's type still updates it")
+hop_a_compound_assignment_whose_result_is_the_places()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_space() + raw"""
+        var v = Vec2(1.0, 2.0)
+        v *= 3.0
+        print(v.x, v.y)
+        """), "3 6\n")
+
+@test("a method disagreeing with the result its own 'impl' declared is refused")
+hop_a_method_disagreeing_with_its_declared_result()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        struct V
+            x: real
+        impl Mul[V, real] for V
+            mul(self, o: V) -> V = V(self.x * o.x)
+        """)
+
+    assert(e.contains("method 'mul' returns V, but trait 'sysl.Mul' declares real"), e)
+
+@test("an unwritten result still defaults to the implementing type")
+hop_an_unwritten_result_defaults_to_the_implementing_type()
+    if !hop_ready() then return
+
+    val e = hop_err(raw"""
+        struct V
+            x: real
+        impl Mul[V] for V
+            mul(self, o: V) -> real = self.x * o.x
+        """)
+
+    assert(e.contains("method 'mul' returns real, but trait 'sysl.Mul' declares V"), e)
+
+@test("a bare bound is still the homogeneous one")
+hop_a_bare_bound_is_still_the_homogeneous_one()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran("twice[T: Mul](x: T) -> T = x * x\nprint(twice(6))\n"), "36\n")
+
+@test("a bound may name the result, and the body gets it")
+hop_a_bound_may_name_the_result()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(hop_space() + raw"""
+        len2[T: Mul[T, real]](v: T) -> real = v * v
+        print(len2(Vec2(3.0, 4.0)))
+        """), "25\n")
+
+// A result read off a bound has had its own promises dropped one level in, so the second operator is
+// the first thing that could fail to find them.
+@test("one operator's result is an operand of the next, under several bounds")
+hop_one_operators_result_is_an_operand_of_the_next()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran("two[T: BitAnd + BitXor](x: T, y: T) -> T = (x & y) ^ y\nprint(two(6, 3))\n"), "1\n")
+
+@test("and it holds three deep, where each result feeds another trait's operator")
+hop_it_holds_three_deep()
+    if !hop_ready() then return
+
+    assert_eq(hop_ran(raw"""
+        mix[T: BitAnd + BitXor + BitOr](x: T, y: T, z: T) -> T = ((x & y) ^ z) | (x & z)
+        print(mix(12, 10, 6))
+        """), "14\n")
