@@ -31,7 +31,20 @@ struct Dependency
 
     // The one segment a consumer chose to hang the whole package under, where it chose one.
     mount: Option[string]
+
+    // Whether only a feature of this package turns the dependency on. **False where the entry says
+    // nothing**, which is what keeps a manifest written before features read exactly as it did.
+    optional: bool
+
+    // Which of the dependency's own features this entry asks for, and whether its defaults come
+    // too. Accepted as written here and resolved against that package's own manifest elsewhere.
+    features: Buf[string]
+    default_features: bool
 end Dependency
+
+// An entry that says nothing about features, which is what every entry before them said.
+plain_dependency(label: string, origin: Origin, mount: Option[string]) -> Dependency =
+    Dependency(label, origin, mount, false, buf(), true)
 
 // The identity everything mangles, caches and resolves by -- the coordinate, with the separators a
 // module name is allowed to hold.
@@ -165,20 +178,51 @@ end not_in_both
 private read_dependency(label: string, sub: &Conf, block: string) -> Result[Dependency, string]
     val where = s"$block.$label"
 
+    if !conf_is_block(sub)
+        return Err(s"'$where' is not a block — a dependency is a git coordinate and a version, or a " +
+            "path")
+
     val keys = sorted_labels(conf_keys(sub))
 
     for i in 0..<keys.len()
         if !known_dependency_key(keys.at(i))
             return Err(s"'$where.${keys.at(i)}' is not something a dependency says — the keys are " +
-                "'git', 'mount', 'path', 'version'")
+                "'default_features', 'features', 'git', 'mount', 'optional', 'path', 'version'")
 
     val mount = read_mount(sub, where)?
+    val origin = read_origin(sub, where)?
+    val optional = read_yes_no(sub, where, "optional", false)?
+    val defaults = read_yes_no(sub, where, "default_features", true)?
 
-    Ok(Dependency(label, read_origin(sub, where)?, mount))
+    val features = conf_at(sub, "features") match
+        None -> buf()
+        Some(v) -> conf_list(v) match
+            None -> return Err(not_a_feature_list(s"$where.features"))
+            Some(names) -> names
+
+    Ok(Dependency(label, origin, mount, optional, features, defaults))
 end read_dependency
 
 private known_dependency_key(key: string) -> bool =
-    key == "git" || key == "version" || key == "path" || key == "mount"
+    key == "git" || key == "version" || key == "path" || key == "mount" || key == "optional" ||
+    key == "features" || key == "default_features"
+
+// A yes-or-no field of an entry, which is a flag and nothing else: `"yes"` is a string, and a
+// string here was written by somebody who believes they said something the reader cannot see.
+private read_yes_no(sub: &Conf, where: string, key: string, otherwise: bool) -> Result[bool, string]
+    conf_at(sub, key) match
+        None -> Ok(otherwise)
+        Some(v) -> *v match
+            Flag(on) -> Ok(on)
+            _ -> Err(s"'$where.$key' is not 'true' or 'false' — it is a yes or no question, " +
+                     "written without quotes")
+end read_yes_no
+
+// The refusal for a feature list that is not a list, which the `features` block and a dependency's
+// own `features` field share.
+not_a_feature_list(where: string) -> string =
+    s"'$where' is not a list — what a feature turns on is written in brackets, as " +
+    "'[llhttp, nghttp2]', even where there is one of it"
 
 // The root name a consumer may put a dependency under, which has to be a name a module could have:
 // it becomes the first segment of every import line that reaches the package.

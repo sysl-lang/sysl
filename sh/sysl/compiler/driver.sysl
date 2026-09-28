@@ -242,12 +242,14 @@ emit_typed_text(path: string, named_target: Option[string],
         Some(name) -> name
         None -> manifest.default_target
 
-    val t = if chosen == "" then host_target()
+    val registered = if chosen == "" then host_target()
     else target_resolved(chosen) match
         Err(why) -> return Err(Refusal(why))
         Ok(found) -> found
 
-    floor_refusal(who_of(manifest, path), manifest.floor) match
+    val t = as_declared(manifest, registered)
+
+    root_floor_refusal(manifest.floor) match
         None -> ()
         Some(why) -> return Err(Refusal(why))
 
@@ -290,9 +292,11 @@ emit_llvm_text(path: string, named_target: Option[string]) -> Result[Emitted, Re
     // craft-freestanding` is how a program for it is produced at all -- refusing here for want of an
     // archive nothing was going to link would refuse the command in the only case it is essential.
     // Nothing is precompiled, so the library's bodies are lowered into the text with the program's.
+    // **`--no-std-lib` is the same answer asked for on purpose**: nothing is looked for, and the
+    // library's bodies are lowered here while its C is compiled beside the program's.
     var linked = StdArtifact(buf(), "")
 
-    if t.builds_with_clang()
+    if t.builds_with_clang() && !std_from_source()
         linked = std_artifact(t) match
             Err(why) -> return Err(Refusal(why))
             Ok(found) -> found
@@ -320,12 +324,69 @@ private target_for(path: string, named_target: Option[string]) -> Result[Target,
         Err(why) -> return Err(Refusal(why))
         Ok(found) -> found
 
-    floor_refusal(who_of(manifest, path), manifest.floor) match
+    root_floor_refusal(manifest.floor) match
         None -> ()
         Some(why) -> return Err(Refusal(why))
 
-    Ok(t)
+    // The machine as the project describes it, which is what the analysis holds a module to.
+    Ok(as_declared(manifest, t))
 end target_for
+
+// **A heap the machine has no libc to supply, said before the linker is asked.** A package requiring
+// one, built for a freestanding target by a command that links, has asked for `malloc` and `free`
+// from a machine that has neither -- and what a reader got was one `undefined symbol` line per
+// allocation, from a toolchain that already knew the answer.
+//
+// **It cannot be folded into `unmet_requirement`, and the reason is the point**: a capability the
+// manifest does not take away is provided, so a freestanding target answers "I have a heap" and that
+// test is empty. **So the discriminator is who does the link**: only the commands that link call
+// this, `build-c` and `build-lib` leaving the allocator to CMake or Gradle, which the compiler cannot
+// see. **Naming an allocator is the way out, and naming libc's own pair is not** -- the symbols still
+// have to come from somewhere -- so what is tested is the pair the program ends up with, the
+// project's own claim folded in beside every package's.
+private heap_refusal(path: string, t: Target) -> Result[unit, Refusal]
+    if os_hosted(t.os) then return Ok(())
+
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+    val manifest = manifest_at(root)?
+    var wants = false
+
+    for i in 0..<manifest.requires.len()
+        if manifest.requires.at(i) == "heap" then wants = true
+
+    if !wants then return Ok(())
+
+    val pair = choose_allocator(allocator_claims(root, manifest)) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(chosen) -> chosen
+
+    if pair.0 != "malloc" || pair.1 != "free" then return Ok(())
+
+    Err(Refusal(s"this package requires a heap and '${t.name}' is freestanding, so nothing supplies " +
+        s"'${pair.0}' and '${pair.1}' — the link would answer with an undefined symbol for each. " +
+        "Name a heap of your own in package.hocon's 'allocator' block, or build for a target that " +
+        "has a libc"))
+end heap_refusal
+
+// Every allocator a program's packages named, the project's own first under "this project".
+private allocator_claims(root: string, m: Manifest) -> Buf[(string, (string, string))]
+    var claims: Buf[(string, (string, string))] = buf()
+
+    m.allocator match
+        Some(pair) -> claims.push(("this project", pair))
+        None -> ()
+
+    val places = package_places(root, m)
+
+    for i in 0..<places.len()
+        manifest_at(places.at(i).1) match
+            Ok(theirs) -> theirs.allocator match
+                Some(pair) -> claims.push((places.at(i).0, pair))
+                None -> ()
+            Err(_) -> ()
+
+    claims
+end allocator_claims
 
 // What `emit-typed` came to: the text to print, and what the analyzer had to say. A program the
 // compiler refused prints nothing on standard output, exactly as every compiling command does.
@@ -346,13 +407,6 @@ struct Emitted
     // it: an `extern` says which symbol it wants and never which library has it.
     links: Buf[string]
 end Emitted
-
-// What the reader has to act on when a floor refuses a build: a package's name and version, or the
-// path itself where the manifest named neither.
-private who_of(m: Manifest, path: string) -> string =
-    if m.name == "" then s"'$path'"
-    else if m.version == "" then s"'${m.name}'"
-    else s"'${m.name}' ${m.version}"
 
 // The typed tree: every body this compilation could type, in the `funcs:` section the reference
 // compiler prints them in.
@@ -401,6 +455,8 @@ end tables_text
 build_native_program(path: string, named_target: Option[string], cc: Option[string], level: string,
                      out: Option[string]) -> Result[string, Failure]
     val t = target_for(path, named_target).map_err(said)?
+
+    heap_refusal(path, t).map_err(said)?
 
     // Asked **before** anything is lowered: the reader asked for a build of a machine that cannot be
     // built, which is one mistake with one answer, and a failure deep in the toolchain would
@@ -555,6 +611,10 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
 
         val declared: &Manifest = manifest_at(root).unwrap_or(empty_manifest())
 
+        carried_defines(declared, found) match
+            Err(why) -> return Err(Refusal(manifest_refusal(why)))
+            Ok(_) -> ()
+
         for j in 0..<found.len()
             val obj = s"$staging/${native_member(root, found.at(j))}"
 
@@ -664,7 +724,9 @@ private link_lowered_text(path: string, text: string, t: Target, cc: Option[stri
     // **Nothing is linked where the tree being built IS the library**, which is `--std`: its bodies
     // are in the text above rather than in an archive, and an artifact on the line would put a
     // second copy of every one of them in front of the linker.
-    if !standalone
+    // **Nor where the build was told to compile it from source** (`--no-std-lib`): its bodies are in
+    // the text too, and its C is among the objects above.
+    if !standalone && !std_from_source()
         std_artifact(t) match
             Err(why) ->
                 discard_objects(objects)
@@ -696,6 +758,7 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
                    args: Buf[string]) -> Result[int, Failure]
     val t = target_for(path, named_target).map_err(said)?
 
+    heap_refusal(path, t).map_err(said)?
     not_this_machine(t, "run").map_err(said)?
 
     val key = run_cache_key_for("run", path, named_target, level, cc)
@@ -886,6 +949,7 @@ end std_test_build_of
 private test_target_of(path: string, named_target: Option[string]) -> Result[Target, Refusal]
     val t = target_for(path, named_target)?
 
+    heap_refusal(path, t)?
     not_this_machine(t, "test")?
 
     if !t.builds_with_clang() then return Err(Refusal(t.no_toolchain()))
@@ -909,7 +973,7 @@ private test_build_from(program: Compilation, standalone: bool) -> Result[TestBu
 
     var precompiled: Buf[string] = buf()
 
-    if !standalone
+    if !standalone && !std_from_source()
         precompiled = std_artifact(t) match
             Err(why) -> return Err(Refusal(why))
             Ok(found) -> found.precompiled
@@ -1037,6 +1101,14 @@ private native_objects(clang: string, path: string, exe: string, t: Target,
                 trees.push(roots.at(i))
         Err(_) -> ()
 
+    // And the standard module's, where it is compiled from source rather than linked from an
+    // artifact, whose C would otherwise have come with it. A tree that **is** the library already
+    // stands first in the list.
+    if std_from_source()
+        std_root() match
+            Ok(library) -> if library != path then trees.push(library)
+            Err(_) -> ()
+
     var objects: Buf[string] = buf()
     var n = 0
 
@@ -1046,6 +1118,12 @@ private native_objects(clang: string, path: string, exe: string, t: Target,
             Ok(cs) -> cs
 
         val declared: &Manifest = manifest_at(trees.at(i)).unwrap_or(empty_manifest())
+
+        carried_defines(declared, found) match
+            Err(why) ->
+                discard_objects(objects)
+                return Err(Refusal(manifest_refusal(why)))
+            Ok(_) -> ()
 
         for j in 0..<found.len()
             val obj = s"$exe.$n.o"

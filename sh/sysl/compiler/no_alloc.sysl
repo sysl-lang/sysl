@@ -19,22 +19,39 @@ import sysl.buf.{Buf, buf}
 // **Only the module's half moves between the two. The target's does not**: a `@tests` file may take
 // back what the module gave up, because the module's clause is a promise about what ships and the
 // file does not ship -- but it cannot take back what the machine never had.
-private no_alloc_here(a: &Analysis, module_name: string, scaffolding: bool) -> bool
+//
+// **The target's half is a machine the manifest took the heap away from**, which makes every module
+// allocator-free without a clause written anywhere -- what a bare-metal build wants, `@no_alloc` on
+// every file of a kernel being ceremony. **The library is exempt from it, and that is not a
+// loophole**: its files are compiled into every program, so holding them to it would report the
+// allocating half of the standard module as a mistake in source the program's author cannot change.
+// What a program does with that half is still refused, at the call in the program's own body.
+private no_alloc_here(a: &Analysis, scope: Scope, module_name: string, scaffolding: bool) -> bool
+    if machine_has_no_heap(a) && !from_library(a, scope) then return true
+
     if scaffolding then return module_tests_narrowed(a, module_name, CapHeap)
 
     module_narrowed(a, module_name, CapHeap)
 end no_alloc_here
 
-// Which of the two made this module allocator-free, said the way the diagnostic needs it.
+private machine_has_no_heap(a: &Analysis) -> bool = a.tables.target.lacks_capability(CapHeap)
+
+// Which of the three made this module allocator-free, said the way the diagnostic needs it.
 //
 // The distinction is the whole reason it is carried rather than assumed: a reader told their module
 // "declared 'no alloc'" when no file of it says any such thing would go looking for a clause that is
-// not there.
+// not there. Where the machine is what has no allocator, the thing to change is the config or the
+// target, and the message points there instead.
 private because(a: &Analysis, module_name: string, scaffolding: bool) -> string
     if scaffolding && module_tests_own_narrowing(a, module_name, CapHeap) then
         return "this module's '@tests' file declared '@no_alloc'"
 
-    "this module declared '@no_alloc'"
+    val declared = if scaffolding then module_tests_narrowed(a, module_name, CapHeap)
+    else module_narrowed(a, module_name, CapHeap)
+
+    if declared then return "this module declared '@no_alloc'"
+
+    s"'${a.tables.target.name}' provides no allocator"
 end because
 
 // Whether a function is one the test runner calls -- a `@test` or one of the four hooks.
@@ -74,7 +91,7 @@ allocates(e: TExpr) -> Option[string] = *e.kind match
 // rather than dropped, so a module calling a generic that allocates is reported at *its* call, which
 // is the line its author can change.
 check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TVtable])
-    var any = false
+    var any = machine_has_no_heap(a)
 
     for i in 0..<a.tables.module_narrows.len()
         if a.tables.module_narrows.at(i).1 == CapHeap then any = true
@@ -123,7 +140,7 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         // seam through the middle of one module's tests.
         val scaffolding = test_only_file(a, scope.src.name) || runner_func(a, f.name)
 
-        if !no_alloc_here(a, module_name, scaffolding) then continue
+        if !no_alloc_here(a, scope, module_name, scaffolding) then continue
 
         val why = because(a, module_name, scaffolding)
 
@@ -144,7 +161,7 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         val module_name = scope.module_name
         val scaffolding = test_only_file(a, scope.src.name)
 
-        if !no_alloc_here(a, module_name, scaffolding) then continue
+        if !no_alloc_here(a, scope, module_name, scaffolding) then continue
 
         val why = because(a, module_name, scaffolding)
 
@@ -160,10 +177,12 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
 
         val module_name = module_of(v.symbol)
 
-        if !no_alloc_here(a, module_name, holds_string(a.tables.test_only, v.symbol)) then continue
-
-        val why = because(a, module_name, holds_string(a.tables.test_only, v.symbol))
         val scope = val_home(a, v.symbol)
+        val scaffolding = holds_string(a.tables.test_only, v.symbol)
+
+        if !no_alloc_here(a, scope, module_name, scaffolding) then continue
+
+        val why = because(a, module_name, scaffolding)
         val skip: &Skipped = Skipped(buf())
         val said: &Counted = Counted(0)
 
