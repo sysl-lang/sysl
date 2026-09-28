@@ -201,7 +201,22 @@ struct Target
     va_list: VaListAbi
     va_list_bytes: int
 
+    // The capabilities the project's manifest took away from this machine -- `heap`, `os`, `posix`
+    // -- which the registry never knows and every row starts without. **What a machine provides is
+    // read out of the manifest, not derived from the triple**, so the driver layers this on once it
+    // has read the file, and a module built for a machine that lacks one is held to it as though it
+    // had given it up itself.
+    lacks: Buf[string]
+
     hard_float(self) -> bool = !self.soft_float
+
+    // Whether the manifest took this capability away from this machine.
+    lacks_capability(self, cap: string) -> bool
+        for i in 0..<self.lacks.len()
+            if self.lacks.at(i) == cap then return true
+
+        false
+    end lacks_capability
 
     // How wide an address is here, which is the processor's answer and every target on one agrees.
     pointer_bits(self) -> usize = cpu_bits(self.cpu)
@@ -248,6 +263,11 @@ struct Target
     end unsupported
 end Target
 
+// One registry row: a machine as the registry knows it, lacking nothing until a manifest says so.
+private row(name: string, triple: string, cpu: Cpu, os: Os, soft_float: bool, fpu: string,
+            no_fpu: bool, short_enums: bool, va_list: VaListAbi, va_list_bytes: int) -> Target =
+    Target(name, triple, cpu, os, soft_float, fpu, no_fpu, short_enums, va_list, va_list_bytes, buf())
+
 // Every target the compiler knows, in the order `sysl targets` lists them.
 //
 // **A row is added by measuring its answers against a C compiler for the same triple**, not by
@@ -255,49 +275,49 @@ end Target
 all_targets() -> Buf[Target]
     var out: Buf[Target] = buf()
 
-    out.push(Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false, "", false, false,
+    out.push(row("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false, "", false, false,
                     VaLoaded, 8))
-    out.push(Target("x86_64-macos", "x86_64-apple-macosx", X86_64, MacOS, false, "", false, false,
+    out.push(row("x86_64-macos", "x86_64-apple-macosx", X86_64, MacOS, false, "", false, false,
                     VaAddress, 24))
-    out.push(Target("aarch64-linux", "aarch64-unknown-linux-gnu", Aarch64, Linux, false, "", false,
+    out.push(row("aarch64-linux", "aarch64-unknown-linux-gnu", Aarch64, Linux, false, "", false,
                     false, VaCopied, 32))
-    out.push(Target("x86_64-linux", "x86_64-unknown-linux-gnu", X86_64, Linux, false, "", false,
+    out.push(row("x86_64-linux", "x86_64-unknown-linux-gnu", X86_64, Linux, false, "", false,
                     false, VaAddress, 24))
-    out.push(Target("riscv64-linux", "riscv64-unknown-linux-gnu", Riscv64, Linux, false, "", false,
+    out.push(row("riscv64-linux", "riscv64-unknown-linux-gnu", Riscv64, Linux, false, "", false,
                     false, VaLoaded, 8))
-    out.push(Target("x86_64-windows", "x86_64-pc-windows-msvc", X86_64, Windows, false, "", false,
+    out.push(row("x86_64-windows", "x86_64-pc-windows-msvc", X86_64, Windows, false, "", false,
                     false, VaLoaded, 8))
-    out.push(Target("aarch64-android", "aarch64-linux-android24", Aarch64, Android, false, "", false,
+    out.push(row("aarch64-android", "aarch64-linux-android24", Aarch64, Android, false, "", false,
                     false, VaCopied, 32))
-    out.push(Target("aarch64-freestanding", "aarch64-none-elf", Aarch64, Freestanding, false, "",
+    out.push(row("aarch64-freestanding", "aarch64-none-elf", Aarch64, Freestanding, false, "",
                     false, false, VaCopied, 32))
-    out.push(Target("x86_64-freestanding", "x86_64-unknown-none-elf", X86_64, Freestanding, false, "",
+    out.push(row("x86_64-freestanding", "x86_64-unknown-none-elf", X86_64, Freestanding, false, "",
                     false, false, VaAddress, 24))
-    out.push(Target("riscv64-freestanding", "riscv64-unknown-elf", Riscv64, Freestanding, true, "",
+    out.push(row("riscv64-freestanding", "riscv64-unknown-elf", Riscv64, Freestanding, true, "",
                     true, false, VaLoaded, 8))
-    out.push(Target("thumb-freestanding", "thumbv8m.main-none-eabihf", Thumb, Freestanding, false,
+    out.push(row("thumb-freestanding", "thumbv8m.main-none-eabihf", Thumb, Freestanding, false,
                     "fpv5-sp-d16", false, true, VaLoaded, 4))
-    out.push(Target("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Thumb, Freestanding, true,
+    out.push(row("thumb-freestanding-softfp", "thumbv8m.main-none-eabi", Thumb, Freestanding, true,
                     "fpv5-sp-d16", false, true, VaLoaded, 4))
-    out.push(Target("thumb-freestanding-soft", "thumbv8m.main-none-eabi", Thumb, Freestanding, true,
+    out.push(row("thumb-freestanding-soft", "thumbv8m.main-none-eabi", Thumb, Freestanding, true,
                     "", true, true, VaLoaded, 4))
-    out.push(Target("thumbv6m-freestanding", "thumbv6m-none-eabi", Thumb, Freestanding, true, "",
+    out.push(row("thumbv6m-freestanding", "thumbv6m-none-eabi", Thumb, Freestanding, true, "",
                     true, true, VaLoaded, 4))
-    out.push(Target("thumbv7m-freestanding", "thumbv7m-none-eabi", Thumb, Freestanding, true, "",
+    out.push(row("thumbv7m-freestanding", "thumbv7m-none-eabi", Thumb, Freestanding, true, "",
                     true, true, VaLoaded, 4))
-    out.push(Target("thumbv7em-freestanding", "thumbv7em-none-eabihf", Thumb, Freestanding, false,
+    out.push(row("thumbv7em-freestanding", "thumbv7em-none-eabihf", Thumb, Freestanding, false,
                     "fpv4-sp-d16", false, true, VaLoaded, 4))
-    out.push(Target("thumbv7em-freestanding-soft", "thumbv7em-none-eabi", Thumb, Freestanding, true,
+    out.push(row("thumbv7em-freestanding-soft", "thumbv7em-none-eabi", Thumb, Freestanding, true,
                     "", true, true, VaLoaded, 4))
-    out.push(Target("riscv32-freestanding", "riscv32-unknown-elf", Riscv32, Freestanding, true, "",
+    out.push(row("riscv32-freestanding", "riscv32-unknown-elf", Riscv32, Freestanding, true, "",
                     true, false, VaLoaded, 4))
-    out.push(Target("wasm32-freestanding", "wasm32-unknown-unknown", Wasm32, Freestanding, false, "",
+    out.push(row("wasm32-freestanding", "wasm32-unknown-unknown", Wasm32, Freestanding, false, "",
                     false, false, VaLoaded, 4))
-    out.push(Target("wasm32-wasi", "wasm32-wasip1", Wasm32, Wasi, false, "", false, false, VaLoaded,
+    out.push(row("wasm32-wasi", "wasm32-wasip1", Wasm32, Wasi, false, "", false, false, VaLoaded,
                     4))
-    out.push(Target("craft-freestanding", "craft", Craft, Freestanding, true, "", true, false,
+    out.push(row("craft-freestanding", "craft", Craft, Freestanding, true, "", true, false,
                     VaLoaded, 2))
-    out.push(Target("x86-linux", "i386-unknown-linux-gnu", X86, Linux, false, "", false, false,
+    out.push(row("x86-linux", "i386-unknown-linux-gnu", X86, Linux, false, "", false, false,
                     VaAddress, 4))
     out
 end all_targets
@@ -413,6 +433,6 @@ end host_cpu
 host_target() -> Target
     target_named(host_name(cpu_symbol(host_cpu()), os_symbol(host_os()))) match
         Some(t) -> t
-        None -> Target("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false, "", false, false,
+        None -> row("aarch64-macos", "arm64-apple-macosx", Aarch64, MacOS, false, "", false, false,
                        VaLoaded, 8)
 end host_target

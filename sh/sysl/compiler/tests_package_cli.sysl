@@ -1,0 +1,253 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, Search}
+import sysl.fs.{make_temp_dir, metadata, remove_dir_all, write_text}
+
+// `package.hocon` at the seam a person actually meets it: a real file in a real directory, read by
+// the driver through the same `run_cli` a shell reaches (`reference/packages.md`).
+//
+// `tests_package_config.sysl` asks what the text means and `tests_manifest.sysl` what a capability
+// set does to a compilation. Neither would notice if the driver never looked for the file, looked in
+// the wrong place, or read it and threw the answer away -- which is the whole of what is asserted
+// here. **Every sentence quoted was read out of the reference compiler** on the same project.
+
+private pkgcli_library_here() -> bool = std_root().is_ok()
+
+// A project directory holding a program and, where one is given, a config beside it.
+private pkgcli_project(program: string, config: string) -> string
+    val root = make_temp_dir("sysl-package-").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    if config != "" then write_text(s"$root/package.hocon", config).unwrap()
+
+    root
+end pkgcli_project
+
+// What one command line came to: the status the shell hears, and every line the driver said.
+private pkgcli_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end pkgcli_run
+
+private pkgcli_build(root: string) -> (int, string) =
+    pkgcli_run(["sysl", "build", root, "-o", s"$root/out"])
+
+private pkgcli_has(said: string, part: string) -> bool = said.index_of(part).is_some()
+
+// Whether the command said one refusal and nothing else, and that refusal is the sentence given. The
+// sentence is the claim: the reference puts its own name in front of the word (`sysl: error:`), which
+// is a property of how each binary introduces itself rather than of what the config did.
+private pkgcli_refused_with(said: string, sentence: string) -> bool =
+    said.ends_with(s"error: $sentence") && said.index_of("\n").is_none()
+
+// Two hosted targets that are not the machine this suite is running on, whichever that is -- the
+// claim is "a target other than this machine's", so that is what the fixture computes rather than
+// naming a pair that is the host somewhere.
+private pkgcli_elsewhere() -> (string, string)
+    val names = ["aarch64-macos", "x86_64-macos", "aarch64-linux", "x86_64-linux", "riscv64-linux"]
+    var foreign: Buf[string] = buf()
+
+    for i in 0..<names.len
+        if names[i] != host_target().name then foreign.push(names[i])
+
+    (foreign.at(0), foreign.at(1))
+end pkgcli_elsewhere
+
+private val pkgcli_hello: string = "main()\n    print(1)\n"
+
+@test("a project with no config builds exactly as it always did")
+pkgcli_no_config_builds()
+    if !pkgcli_library_here() then return
+
+    val root = pkgcli_project(pkgcli_hello, "")
+    val got = pkgcli_build(root)
+
+    assert_eq(got.0, 0)
+    remove_dir_all(root).unwrap_or(())
+
+// `run` rather than `build`, because it is the **driver** that refuses to run what it cannot
+// execute, before any of this reaches clang -- so the refusal is worded by the driver and names the
+// target, where a failed cross link is worded by whatever linker the machine has. What discriminates
+// is *which* machine is named: with the config unread the build is for this one and nothing is said.
+@test("the config names the target a build is for")
+pkgcli_the_config_names_the_target()
+    if !pkgcli_library_here() then return
+
+    val configured = pkgcli_elsewhere().0
+    val root = pkgcli_project(pkgcli_hello, s"targets { default = \"$configured\" }\n")
+    val got = pkgcli_run(["sysl", "run", root])
+
+    assert(got.0 != 0, got.1)
+    assert(pkgcli_refused_with(got.1, s"'run' executes what it builds, and '$configured' is not " +
+        s"this machine — use 'sysl build --target $configured'"), got.1)
+    assert(!pkgcli_has(got.1, host_target().name), got.1)
+    remove_dir_all(root).unwrap_or(())
+end pkgcli_the_config_names_the_target
+
+@test("and --target beats the config, so a project with a default is still cross-buildable")
+pkgcli_target_beats_the_config()
+    if !pkgcli_library_here() then return
+
+    val pair = pkgcli_elsewhere()
+    val root = pkgcli_project(pkgcli_hello, s"targets { default = \"${pair.0}\" }\n")
+    val got = pkgcli_run(["sysl", "run", "--target", pair.1, root])
+
+    assert(pkgcli_has(got.1, s"'${pair.1}' is not this machine"), got.1)
+    assert(!pkgcli_has(got.1, pair.0), got.1)
+    remove_dir_all(root).unwrap_or(())
+
+@test("a capability the config turns off reaches the compilation")
+pkgcli_a_capability_turned_off()
+    if !pkgcli_library_here() then return
+
+    val root = pkgcli_project("f() -> &int = 1\n\nmain()\n    print(*f())\n",
+        "targets {\n  default = \"aarch64-macos\"\n  aarch64-macos { capabilities { alloc = false } }\n}\n")
+    val got = pkgcli_build(root)
+
+    assert(got.0 != 0, got.1)
+    assert(pkgcli_has(got.1, "error: a reference needs an allocator, and 'aarch64-macos' provides " +
+        "no allocator — it may hold and release storage made elsewhere, and may make none of its own"),
+        got.1)
+    assert(pkgcli_has(got.1, "error: this reaches 'f', which makes heap storage, and 'aarch64-macos' " +
+        "provides no allocator — an allocator-free module may only call what is allocator-free itself"),
+        got.1)
+    remove_dir_all(root).unwrap_or(())
+end pkgcli_a_capability_turned_off
+
+// The config wrote `alloc`, which is the module's word and is accepted transitionally; the refusal
+// names the capability it was mapped to, since that is the one the reader has to write from now on.
+@test("the package's own 'requires' is answered against the machine, before a line is parsed")
+pkgcli_requires_is_answered_first()
+    if !pkgcli_library_here() then return
+
+    val root = pkgcli_project(pkgcli_hello, "requires { alloc = true }\ntargets {\n  default = " +
+        "\"aarch64-macos\"\n  aarch64-macos { capabilities { alloc = false } }\n}\n")
+    val got = pkgcli_build(root)
+
+    assert(got.0 != 0, got.1)
+    assert(pkgcli_refused_with(got.1,
+        "this package requires 'heap', and 'aarch64-macos' does not provide it"), got.1)
+    remove_dir_all(root).unwrap_or(())
+
+// A heap asked for on a machine with no libc to supply one. The refusal cannot come from `requires`
+// alone: a capability a manifest does not take away is provided, so a freestanding target says it has
+// a heap and the test above is empty. What is asserted here is the *other* condition -- that sysl is
+// the one doing the link -- and each case below turns exactly one part of it off.
+private val pkgcli_freestanding_heap: string =
+    "requires { heap = true }\ntargets { default = \"wasm32-freestanding\" }\n"
+
+private val pkgcli_heap_refusal: string =
+    "this package requires a heap and 'wasm32-freestanding' is freestanding, so nothing " +
+    "supplies 'malloc' and 'free' — the link would answer with an undefined symbol for each. Name a " +
+    "heap of your own in package.hocon's 'allocator' block, or build for a target that has a libc"
+
+@test("a heap on a target with no libc is refused before the linker sees it")
+pkgcli_a_freestanding_heap_is_refused()
+    if !pkgcli_library_here() then return
+
+    val root = pkgcli_project(pkgcli_hello, pkgcli_freestanding_heap)
+    val got = pkgcli_build(root)
+
+    assert(got.0 != 0, got.1)
+    // The whole output, which is the claim that nothing reached the toolchain.
+    assert(pkgcli_refused_with(got.1, pkgcli_heap_refusal), got.1)
+    remove_dir_all(root).unwrap_or(())
+
+// Not that the build succeeds -- whether a wasm link does on this machine is a question about the
+// toolchain. What is asserted is that the driver stopped holding the project back.
+@test("and naming a heap of your own is the way out")
+pkgcli_naming_a_heap_is_the_way_out()
+    if !pkgcli_library_here() then return
+
+    val root = pkgcli_project(pkgcli_hello, pkgcli_freestanding_heap +
+        "allocator { alloc = \"heap_alloc\", free = \"heap_free\" }\n")
+    val got = pkgcli_build(root)
+
+    assert(!pkgcli_has(got.1, "requires a heap"), got.1)
+    remove_dir_all(root).unwrap_or(())
+
+@test("declaring libc's own pair is not a way out, because the symbols still come from nowhere")
+pkgcli_libcs_own_pair_is_no_way_out()
+    if !pkgcli_library_here() then return
+
+    val root = pkgcli_project(pkgcli_hello, pkgcli_freestanding_heap +
+        "allocator { alloc = \"malloc\", free = \"free\" }\n")
+    val got = pkgcli_build(root)
+
+    assert(got.0 != 0, got.1)
+    assert(pkgcli_refused_with(got.1, pkgcli_heap_refusal), got.1)
+    remove_dir_all(root).unwrap_or(())
+
+@test("a hosted target is untouched, whatever the package requires")
+pkgcli_a_hosted_target_is_untouched()
+    if !pkgcli_library_here() then return
+
+    val root = pkgcli_project(pkgcli_hello, "requires { heap = true }\n")
+    val got = pkgcli_build(root)
+
+    assert_eq(got.0, 0)
+    remove_dir_all(root).unwrap_or(())
+
+// `build-c` writes an archive and CMake or Gradle links it, so the allocator arrives from somewhere
+// the compiler cannot see -- which is why the test is who links, not the target.
+@test("and an archive is not refused, because sysl is not the one linking it")
+pkgcli_an_archive_is_not_refused()
+    if !pkgcli_library_here() then return
+
+    val root = pkgcli_project("@export(\"main\")\nmain()\n    print(1)\n", pkgcli_freestanding_heap)
+    val got = pkgcli_run(["sysl", "build-c", root, "-o", s"$root/out"])
+
+    assert(!pkgcli_has(got.1, "requires a heap"), got.1)
+    remove_dir_all(root).unwrap_or(())
+
+@test("a config that is there and will not read stops the build")
+pkgcli_a_config_that_will_not_read()
+    val root = pkgcli_project(pkgcli_hello, "targets { default = \n")
+    val got = pkgcli_build(root)
+
+    assert(got.0 != 0, got.1)
+    assert(pkgcli_refused_with(got.1,
+        "package.hocon: unclosed object — expected '}' (line 2, column 1)"), got.1)
+    remove_dir_all(root).unwrap_or(())
+
+// **The root project is "this project", whatever its manifest calls it** -- the reference says so for
+// a manifest naming a package and a version as much as for one naming neither. The sentence is asked
+// of the driver's own funnel with the reference's version in hand, because this compiler is not on
+// the release line floors are written against and so makes no claim at the command line
+// (`floor_refusal`, and `tests_driver.sysl`'s `a_floor_makes_no_claim_here`).
+@test("a project stating a compiler newer than the one in hand is refused")
+pkgcli_a_newer_floor_is_refused()
+    val root = pkgcli_project(pkgcli_hello, "package { name = \"app\", sysl = \"99.0.0\" }\n")
+    val m = manifest_at(root).unwrap()
+
+    assert_eq(project_floor_refusal(m.floor, "0.0.145").unwrap_or("(nothing)"),
+        "this project cannot be built because it requires sysl 99.0.0 or newer, while the compiler " +
+        "in hand is 0.0.145")
+    remove_dir_all(root).unwrap_or(())
+
+@test("and one this compiler satisfies says nothing at all")
+pkgcli_a_satisfied_floor_says_nothing()
+    if !pkgcli_library_here() then return
+
+    val root = pkgcli_project(pkgcli_hello, "package { name = \"app\", sysl = \"0.0.1\" }\n")
+    val got = pkgcli_build(root)
+
+    assert_eq(got.0, 0)
+    assert_eq(got.1, s"wrote $root/out")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a name that is not a capability is refused rather than ignored")
+pkgcli_not_a_capability()
+    val root = pkgcli_project(pkgcli_hello, "targets { kernel { capabilities { treads = false } } }\n")
+    val got = pkgcli_build(root)
+
+    assert(got.0 != 0, got.1)
+    assert(pkgcli_refused_with(got.1, "package.hocon: 'treads' in 'targets.kernel.capabilities' is " +
+        "not a capability — the set is 'heap', 'os', 'posix'"), got.1)
+    remove_dir_all(root).unwrap_or(())
