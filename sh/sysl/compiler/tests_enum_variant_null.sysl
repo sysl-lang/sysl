@@ -1,0 +1,351 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A generic enum's variant whose instantiation the values it was given cannot settle. The name in
+// front of the dot is a declared enum, so what is said is about the value that could not be read, or
+// the parameter nothing carried -- never that the enum is undefined. Each variant written with no
+// values at all is here too: it is neither a value of the enum nor a function making one.
+//
+// **Every message and position quoted here was read out of the reference compiler**, 0.0.146.
+
+private var evn_library_cache: Buf[Program] = buf()
+private var evn_library_read: bool = false
+
+private evn_library() -> Buf[Program]
+    if evn_library_read then return evn_library_cache
+
+    evn_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> evn_library_cache = units
+
+    evn_library_cache
+end evn_library
+
+private evn_ready() -> bool
+    if evn_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end evn_ready
+
+private evn_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// The report a source earns, taken through the lowering.
+private evn_err(text: string) -> string
+    val root = make_temp_dir("sysl-evn").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end evn_err
+
+// What a program prints.
+private evn_ran(text: string) -> string
+    val root = make_temp_dir("sysl-evn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end evn_ran
+
+// The one diagnostic a source earns: its message, and where it points.
+private evn_one(text: string, message: string, at: string)
+    val said = evn_err(text)
+
+    assert(evn_says(said, s"error: $message\n"), said)
+    assert(evn_says(said, s"main.sysl:$at\n"), said)
+    assert(!evn_says(said, "undefined name 'E'"), said)
+end evn_one
+
+@test("a null given to a generic variant through its enum has no context")
+evn_qualified_null()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T]
+            A(x: T)
+            B
+
+        var e = E.A(null)
+        print(1)
+        """, "'null' takes its type from its context, and there is none here", "5:13")
+
+@test("a None given to a generic variant through its enum cannot say what it holds")
+evn_qualified_none()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T]
+            A(x: T)
+            B
+
+        var e = E.A(None)
+        print(1)
+        """, "cannot infer the type argument 'T' of 'None' here — annotate the expected type", "5:13")
+
+@test("an undefined name given to a generic variant is the undefined name")
+evn_qualified_undefined()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T]
+            A(x: T)
+            B
+
+        var e = E.A(nope)
+        print(1)
+        """, "undefined name 'nope'", "5:13")
+
+@test("a null given to a bare generic variant has no context")
+evn_bare_null()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T]
+            A(x: T)
+            B
+
+        var e = A(null)
+        print(1)
+        """, "'null' takes its type from its context, and there is none here", "5:11")
+
+@test("one value settling one parameter leaves a null at the other with no context")
+evn_two_params()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T, U]
+            A(x: T, y: U)
+            B
+
+        var e = E.A(1, null)
+        print(1)
+        """, "'null' takes its type from its context, and there is none here", "5:16")
+
+@test("a parameter no value carries cannot be inferred, through the enum")
+evn_qualified_uncarried()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T]
+            A(x: T)
+            C(n: int)
+
+        var e = E.C(1)
+        print(1)
+        """, "cannot infer the type argument 'T' of 'C' here — annotate the expected type", "5:11")
+
+@test("a parameter no value carries cannot be inferred, bare")
+evn_bare_uncarried()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T]
+            A(x: T)
+            C(n: int)
+
+        var e = C(1)
+        print(1)
+        """, "cannot infer the type argument 'T' of 'C' here — annotate the expected type", "5:9")
+
+@test("a variant of the standard Result settles only what its value says")
+evn_bare_result()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        val r = Ok(1)
+        print(1)
+        """, "cannot infer the type argument 'E' of 'Ok' here — annotate the expected type", "1:9")
+
+@test("a nearer enum's variant of the name is the one meant, not a generic one far off")
+evn_nearer_home()
+    if !evn_ready() then return
+
+    assert_eq(evn_ran(raw"""
+        enum R
+            Ok(n: int)
+            Bad
+
+        val r = Ok(1)
+        print(r match
+            Ok(n) -> n
+            Bad -> 0)
+        """), "1\n")
+
+@test("a variant two enums declare is ambiguous, however its value reads")
+evn_two_homes()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T]
+            A(x: T)
+            B
+
+        enum F
+            A(x: int)
+            C
+
+        val r = A(null)
+        print(1)
+        """, "'A' is a variant of 'E' and 'F', and nothing here says which — qualify it, as 'E.A'",
+        "9:9")
+
+@test("a written type argument is the context a null is read against")
+evn_written_targ_null()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T]
+            A(x: T)
+            B
+
+        var e = E[int].A(null)
+        print(1)
+        """, "'null' is a raw pointer, and int was expected here", "5:18")
+
+@test("a written type argument builds the variant it names")
+evn_written_targ_runs()
+    if !evn_ready() then return
+
+    assert_eq(evn_ran(raw"""
+        enum E[T]
+            A(x: T)
+            B
+
+        val e = E[int].A(3)
+        print(e match
+            A(x) -> x
+            B -> 0)
+        """), "3\n")
+
+@test("and so does a list of them")
+evn_written_targs_two()
+    if !evn_ready() then return
+
+    assert_eq(evn_ran(raw"""
+        enum E[T, U]
+            A(x: T, y: U)
+            B
+
+        val e = E[int, bool].A(3, true)
+        print(e match
+            A(x, _) -> x
+            B -> 0)
+        """), "3\n")
+
+@test("a null is read against the instantiation the position asks for")
+evn_expected_null()
+    if !evn_ready() then return
+
+    assert_eq(evn_ran(raw"""
+        enum E[T]
+            A(x: T)
+            B
+
+        var e: E[*u8] = E.A(null)
+        print(1)
+        """), "1\n")
+
+@test("a generic data variant through its enum is no function value")
+evn_value_generic()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T]
+            A(x: T)
+            B
+
+        val f = E.A
+        print(1)
+        """, "variant 'A' carries data — construct it with 'A(…)'", "5:11")
+
+@test("nor where the position asks for a callable")
+evn_value_as_fn()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T]
+            A(x: T)
+            B
+
+        val f: &Fn(int) -> E[int] = E.A
+        print(f(3) match
+            A(x) -> x
+            B -> 0)
+        """, "variant 'A' carries data — construct it with 'A(…)'", "5:31")
+
+@test("a generic data variant, bare, is no function value")
+evn_value_bare()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T]
+            A(x: T)
+            B
+
+        val f = A
+        print(1)
+        """, "variant 'A' carries data — construct it with 'A(…)'", "5:9")
+
+@test("a plain data variant through its enum is no function value")
+evn_value_plain()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum F
+            A(x: int)
+            B
+
+        val f = F.A
+        print(1)
+        """, "variant 'A' carries data — construct it with 'A(…)'", "5:11")
+
+@test("a generic nullary variant through its enum, with nothing to settle it")
+evn_nullary_open()
+    if !evn_ready() then return
+
+    evn_one(raw"""
+        enum E[T]
+            A(x: T)
+            B
+
+        val f = E.B
+        print(1)
+        """, "cannot infer the type argument 'T' of 'B' here — annotate the expected type", "5:11")
