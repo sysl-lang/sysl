@@ -1397,6 +1397,42 @@ private range_end(a: &Analysis, scope: Scope, e: Expr) -> Option[Decimal]
         _ -> None
 end range_end
 
+// **Every constant declared at a constrained type holds a value its range admits**, settled while
+// compiling -- a constant has no run time to be checked at. It is what makes a range on a constant
+// worth writing: a `c const` measured from a header is a number nobody chose, so a range on the type
+// it is read into is a claim about the configuration the program was built against. A `new` type
+// and a `where` predicate are refused at the declaration (`check_const_named`) and are passed over.
+check_const_admits(a: &Analysis)
+    for i in 0..<a.tables.consts.len()
+        val v = a.tables.consts.at(i)
+
+        if v.typ.is_none() || v.init.is_none() then continue
+
+        val t = resolve_type(a, v.scope, v.typ.unwrap(), no_bindings())
+
+        t match
+            Constrained(cd) -> const_admitted(a, v, t, cd)
+            _ -> ()
+end check_const_admits
+
+private const_admitted(a: &Analysis, v: ValueDecl, t: Type, cd: &ConstrainedType)
+    if cd.derived || cd.pred_fn.is_some() || cd.lo.is_none() || cd.hi.is_none() then return
+
+    val value = range_end(a, v.scope, v.init.unwrap())
+
+    if value.is_none() then return
+
+    val n = value.unwrap()
+    val lo = cd.lo.unwrap()
+    val hi = cd.hi.unwrap()
+    val under = if cd.exclusive_hi then n < hi else n <= hi
+    val top = if cd.exclusive_hi then s"under $hi" else s"$hi"
+
+    if n < lo || !under then
+        a.fault(v.scope, v.span, s"'${v.name}' is $n, which ${type_show(t)} does not admit — it " +
+                s"holds $lo to $top")
+end const_admitted
+
 // Whether a declaration is another spelling of its base rather than a type of its own.
 //
 // **A measured `c type` is written in exactly this shape and is not one.** It is a distinct scalar

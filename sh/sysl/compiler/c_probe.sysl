@@ -1,8 +1,8 @@
 module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
-import sysl.buf.{Buf, buf}
-import sysl.text.{Search, str_builder, StrBuilder, parse_real}
+import sysl.buf.{Buf, buf, byte_sink}
+import sysl.text.{Search, str_builder, StrBuilder, parse_real, from_utf8}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text, read_text}
 import sysl.process.capture
 
@@ -92,14 +92,24 @@ c_probe_lower(a: &Analysis, units: Buf[Program], t: Target) -> Buf[Program]
     out
 end c_probe_lower
 
+//
+// **What is asked is every environment capability the file requires, against what the machine
+// physically has** -- not whether it is hosted alone. Windows is hosted and is not POSIX, so a file
+// requiring `posix` has no `<regex.h>` there either; asking `hosted` measured it and refused it.
 private unmeasurable(unit: Program, t: Target) -> bool
-    if os_hosted(t.os) then return false
+    val machine = inherent_capabilities(t)
 
     for i in 0..<unit.capabilities.len()
         val c = unit.capabilities.at(i)
 
         c.direction match
-            Requires -> if c.name == CapOs || c.name == CapPosix then return true
+            Requires ->
+                val needed = capability_closure(c.name)
+
+                for j in 0..<needed.len()
+                    val cap = needed.at(j)
+
+                    if (cap == CapOs || cap == CapPosix) && !has(machine, cap) then return true
             _ -> ()
 
     false
@@ -775,8 +785,12 @@ private fraction(a: &Analysis, c: CConstDecl, bits: int, name: string, raw: CGlo
                 "program")
         return held(c, expr(c.span, FloatLit("0.0", "")))
 
+    // Reported the way it will be read back: the shortest decimal that is this exact double, which is
+    // also the text the constant is carried as.
+    val shown = float_text(value)
+
     if value > MaxFinite || value < -MaxFinite
-        a.fault(empty_scope(), c.span, s"'${c.c}' is $value here, and a 'c const' carries a finite " +
+        a.fault(empty_scope(), c.span, s"'${c.c}' is $shown here, and a 'c const' carries a finite " +
                 "number — either the C expression overflowed while it was being worked out, or it " +
                 "names an infinity outright")
         return held(c, expr(c.span, FloatLit("0.0", "")))
@@ -785,17 +799,97 @@ private fraction(a: &Analysis, c: CConstDecl, bits: int, name: string, raw: CGlo
     val narrowed = if bits == 64 then value else real(f32(value))
 
     if narrowed > MaxFinite || narrowed < -MaxFinite
-        a.fault(empty_scope(), c.span, s"'${c.c}' is $value here, which '$name' cannot hold — the " +
-                "largest it holds is 3.4028234663852886e38")
+        a.fault(empty_scope(), c.span, s"'${c.c}' is $shown here, which '$name' cannot hold — the " +
+                s"largest it holds is $F32Largest")
         return held(c, expr(c.span, FloatLit("0.0", "")))
 
     if narrowed == 0.0 && value != 0.0
-        a.fault(empty_scope(), c.span, s"'${c.c}' is $value here, which '$name' cannot tell from " +
-                "zero — the smallest it holds that is not zero is 1.401298464324817e-45")
+        a.fault(empty_scope(), c.span, s"'${c.c}' is $shown here, which '$name' cannot tell from " +
+                s"zero — the smallest it holds that is not zero is $F32Smallest")
         return held(c, expr(c.span, FloatLit("0.0", "")))
 
-    held(c, expr(c.span, FloatLit(s"$narrowed", "")))
+    // **The literal carries every digit the double needs to read back as itself.** `str` shows a
+    // person six significant digits, so a constant carried as `s"$narrowed"` was a different number
+    // from the one C measured -- `0.25 * 3.14159265359` came back as `0.785398`, and a program
+    // comparing it against the same expression measured at full width was told they differ.
+    held(c, expr(c.span, FloatLit(float_text(narrowed), "")))
 end fraction
+
+// The two `f32` limits as the refusals quote them, in the spelling `float_text` gives every other
+// number in these messages -- the largest finite `f32` and the smallest one above zero, each the
+// shortest decimal that reads back as that `f32`.
+private const F32Largest: string = "3.4028235E38"
+private const F32Smallest: string = "1.4E-45"
+
+// **The shortest decimal that reads back as this exact double, spelled the way the reference
+// spells one**: a plain decimal with at least one digit after the point for a magnitude from a
+// thousandth up to ten million, and `d.dddE<n>` outside that, with `Infinity` and `NaN` for the
+// values that are not numbers. The digits are `display_real_shortest`'s; only the spelling around
+// them is reworked, since `%g`'s `1e+300` is not what a refusal quoting the value writes.
+float_text(x: real) -> string
+    if x != x then return "NaN"
+    if x > MaxFinite then return "Infinity"
+    if x < -MaxFinite then return "-Infinity"
+
+    var sink = byte_sink()
+
+    display_real_shortest(x, &sink, FormatSpec(0, -1, false))
+
+    val g = from_utf8(sink.text()).unwrap_or("0")
+    val negative = g.starts_with("-")
+    val bare = if negative then g[1..<g.bytes.len] else g
+
+    // The mantissa and the exponent `%g` wrote, the exponent absent where it wrote none.
+    val cut = bare.index_of("e")
+    val mantissa = if cut.is_some() then bare[0..<cut.unwrap()] else bare
+    val written = if cut.is_some() then bare[cut.unwrap() + 1..<bare.bytes.len] else "0"
+    val exponent = int(decimal_of(if written.starts_with("+") then written[1..<written.bytes.len] else written))
+
+    // The digits alone, and where the point falls among them.
+    var digits = ""
+    var point = -1
+
+    for i in 0..<mantissa.bytes.len
+        if mantissa.bytes[i] == u8('.') then point = int(digits.bytes.len)
+        else digits = digits + mantissa[i..<i + 1]
+
+    if point < 0 then point = int(digits.bytes.len)
+
+    point += exponent
+
+    while digits.bytes.len > 1 && digits.starts_with("0")
+        digits = digits[1..<digits.bytes.len]
+        point -= 1
+
+    while digits.bytes.len > 1 && digits.ends_with("0")
+        digits = digits[0..<digits.bytes.len - 1]
+
+    val sign = if negative then "-" else ""
+
+    if digits == "0" then return s"${sign}0.0"
+
+    val scientific = point - 1
+    val count = int(digits.bytes.len)
+
+    if scientific >= -3 && scientific < 7
+        if point <= 0 then return s"${sign}0.${zeros(-point)}$digits"
+        if point >= count then return s"$sign$digits${zeros(point - count)}.0"
+
+        return s"$sign${digits[0..<usize(point)]}.${digits[usize(point)..<digits.bytes.len]}"
+    end if
+
+    val rest = if count > 1 then digits[1..<digits.bytes.len] else "0"
+
+    s"$sign${digits[0..<1]}.${rest}E$scientific"
+end float_text
+
+private zeros(n: int) -> string
+    var out = ""
+
+    for _ in 0..<n
+        out = out + "0"
+
+    out
 
 private silent_float(a: &Analysis, c: CConstDecl) -> Stmt
     a.fault(empty_scope(), c.span, s"the C compiler wrote '${c.c}' in a spelling sysl's probe does " +
@@ -808,7 +902,9 @@ private const MaxFinite: real = 1.7976931348623157e308
 // One `double` operand as LLVM printed it. It writes such a constant **two ways**: a short decimal
 // where that reads back as the same double, and the raw binary64 bits in hex where it does not --
 // with an `f` in front of the `0x` as of LLVM 23, the digits being the same either way.
-private float_operand(operand: string) -> Option[real]
+float_operand(written: string) -> Option[real]
+    // A global that states an alignment after its value leaves a comma on the operand.
+    val operand = if written.ends_with(",") then written[0..<written.bytes.len - 1] else written
     val one: real = 1.0
     val zero: real = 0.0
 
@@ -827,7 +923,26 @@ private float_operand(operand: string) -> Option[real]
         // and `0xK` an x86 long double -- so it is left alone rather than read at the wrong width.
         if hex.bytes.len != 16 then return None
 
-        return Some(real_bits(unsigned_bits(number_of(hex, 16))))
+        // Read as unsigned: the top bit is the sign bit of the double, and `0xFFF0000000000000`
+        // (minus infinity) is past what a signed accumulator holds.
+        var bits: u64 = 0
+
+        for i in 0..<hex.bytes.len
+            val b = hex.bytes[i]
+
+            val digit = b >= u8('0') && b <= u8('9')
+            val upper = b >= u8('A') && b <= u8('F')
+            val lower = b >= u8('a') && b <= u8('f')
+
+            if !digit && !upper && !lower then return None
+
+            val d = if digit then u64(b - u8('0'))
+            else if upper then u64(b - u8('A')) + 10
+            else u64(b - u8('a')) + 10
+
+            bits = (bits << 4) | d
+
+        return Some(real_bits(bits))
 
     parse_real(operand).ok()
 end float_operand

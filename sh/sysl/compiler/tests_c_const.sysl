@@ -1,0 +1,1086 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, parse_real, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `c const` -- a constant whose value the C compiler works out (`reference/ffi.md § A library may
+// carry C`), the reference's `CConstTests`.
+//
+// **Every assertion that reads a number reads one the C compiler gave**, so most of these are
+// agreements -- sysl's answer is the one C gives, on this machine and on a machine of another width
+// -- and the rest are the refusals, which are the half a transcription never had. Every program here
+// is built and run, or compiled and refused, by a real clang; they return saying so where there is
+// none.
+//
+// **Every string quoted here was read out of the reference compiler** (0.0.148) on the same input.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ccn_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end ccn_ready
+
+private ccn_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+private ccn_refuses(said: string, part: string) =
+    assert(ccn_says(said, part), s"expected '$part', got: $said")
+
+// Builds what `entry` names and runs it: what it printed, or why it did not.
+private ccn_build_run(root: string, entry: string) -> string
+    val exe = s"$root/built"
+
+    build_native_program(entry, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ccn_build_run
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private ccn_ran(text: string) -> string
+    val root = make_temp_dir("sysl-cconst").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    ccn_build_run(root, s"$root/main.sysl")
+
+// What the lowering answers for a tree: its LLVM text, or everything it had to say instead.
+private ccn_lowered(path: string, target: Option[string]) -> (string, string) =
+    emit_llvm_text(path, target) match
+        Err(why) -> ("", failure_text(why))
+        Ok(made) -> if made.report.is_empty() then (made.text, "") else ("", analysis_report(made.report))
+
+// Everything one file has to say for itself on a machine, taken through the lowering.
+private ccn_err_for(text: string, target: Option[string]) -> string
+    val root = make_temp_dir("sysl-cconst").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = ccn_lowered(s"$root/main.sysl", target).1
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ccn_err_for
+
+private ccn_err(text: string) -> string = ccn_err_for(text, None)
+
+// The LLVM text of one file on a machine, or a note saying why there is none.
+private ccn_ir_for(text: string, target: Option[string]) -> string
+    val root = make_temp_dir("sysl-cconst").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = ccn_lowered(s"$root/main.sysl", target)
+
+    remove_dir_all(root).unwrap_or(())
+
+    if out.1 != "" then s"refused: ${out.1}" else out.0
+end ccn_ir_for
+
+// A tree of a module in a directory of its own beside the beginning, written into a fresh root.
+private ccn_tree(name: string, module_text: string, main_text: string) -> string
+    val root = make_temp_dir("sysl-cconst").unwrap()
+
+    make_dir_all(s"$root/$name").unwrap()
+    write_text(s"$root/$name/$name.sysl", module_text).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+    root
+end ccn_tree
+
+// The operand of the first `fptrunc double <x> to float`, which is where a measured `f32` lands.
+private ccn_truncated(ir: string) -> string
+    val start = ir.index_of("fptrunc double ") match
+        None -> return ""
+        Some(at) -> at + 15
+
+    val rest = ir[start..<ir.bytes.len]
+
+    rest.index_of(" to float") match
+        None -> ""
+        Some(end_at) -> rest[0..<end_at]
+end ccn_truncated
+
+// -- the block parses -----------------------------------------------------------------------------
+
+@test("as its constants, each with a type and a C expression")
+ccn_the_block_parses_as_its_constants()
+    assert_eq(pf("c const\n    A: usize = \"sizeof(int)\"\n    B: u32 = \"1 + 1\"\n"),
+              "(cconst (A : usize \"sizeof(int)\") (B : u32 \"1 + 1\"))")
+
+// The modifier is written on the header and governs the lines under it, which is the only place
+// there is to write one.
+@test("and a visibility on the header reaches every constant in it")
+ccn_a_visibility_on_the_header_reaches_every_constant()
+    assert_eq(pf("private c const\n    A: usize = \"sizeof(int)\"\n"),
+              "(cconst (private A : usize \"sizeof(int)\"))")
+
+// `c` is contextual, so a program that wants the name keeps it.
+@test("and 'c' is still an ordinary name")
+ccn_c_is_still_an_ordinary_name()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran("var c = 3\nc += 1\nprint(str(c))\n"), "4\n")
+
+// -- the value comes from the C compiler ----------------------------------------------------------
+
+@test("so a 'sizeof' is what a C program would have printed")
+ccn_a_sizeof_is_what_c_would_have_printed()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        @include("<stddef.h>")
+
+        c const
+            N: usize = "sizeof(long long) + sizeof(char)"
+
+        print(str(N))
+        """), "9\n")
+
+@test("a macro with no symbol behind it arrives as a value")
+ccn_a_macro_arrives_as_a_value()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        @include("<limits.h>")
+
+        c const
+            BITS: u32 = "CHAR_BIT"
+
+        print(str(BITS))
+        """), "8\n")
+
+// The case the feature exists for: a length no call could supply, because an array bound is settled
+// before the program runs.
+@test("and it may size an array, which is what a function could never do")
+ccn_it_may_size_an_array()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        @include("<stddef.h>")
+
+        c const
+            SIZE: usize = "sizeof(long long)"
+
+        var xs: [SIZE]u8 = [0; SIZE]
+
+        xs[0] = 7
+        print(str(xs.len) + " " + str(xs[0]))
+        """), "8 7\n")
+
+@test("several blocks in one file are all measured")
+ccn_several_blocks_are_all_measured()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        c const
+            A: usize = "sizeof(char)"
+
+        c const
+            B: usize = "sizeof(short)"
+
+        print(str(A + B))
+        """), "3\n")
+
+@test("a negative value survives, because the probe follows the declared type's signedness")
+ccn_a_negative_value_survives()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran("c const\n    N: i32 = \"-3 * 5\"\n\nprint(str(N))\n"), "-15\n")
+
+@test("and a value past the signed ceiling does too, for the same reason read the other way")
+ccn_a_value_past_the_signed_ceiling_survives()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran("c const\n    N: u64 = \"0xFFFFFFFFFFFFFFFFull\"\n\nprint(str(N))\n"),
+              "18446744073709551615\n")
+
+// -- a float is measured the same way -------------------------------------------------------------
+
+// `0.25 * PI` is the shape a physics header is full of: C's arithmetic and sysl's agree about the
+// same two numbers, so nothing here depends on what either of them is.
+@test("an expression over other constants, which is the case hand-copying gets wrong")
+ccn_a_float_expression_over_other_constants()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        c const
+            WHOLE:   real = "3.14159265359"
+            QUARTER: real = "0.25 * 3.14159265359"
+
+        print(QUARTER * 4.0 == WHOLE)
+        """), "true\n")
+
+// `FLT_EPSILON` is asserted by the property that defines it: the smallest step above one, and half
+// of it is no step at all.
+@test("a value from <float.h>, asserted by the property that defines it")
+ccn_a_value_from_float_h()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        @include("<float.h>")
+
+        c const
+            EPS: f32 = "FLT_EPSILON"
+
+        var one: f32 = 1.0
+
+        print(one + EPS > one, one + EPS / 2.0 == one)
+        """), "true true\n")
+
+@test("a value asked for as 'f32' narrows exactly as a written cast would")
+ccn_f32_narrows_as_a_written_cast_would()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        c const
+            NARROW: f32 = "3.14159265359"
+            WIDE:   real = "3.14159265359"
+
+        print(NARROW == f32(WIDE))
+        """), "true\n")
+
+@test("'f64' and 'real' are the one width under two names")
+ccn_f64_and_real_are_one_width()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        c const
+            A: f64  = "1.0 / 3.0"
+            B: real = "1.0 / 3.0"
+
+        print(A == B)
+        """), "true\n")
+
+@test("an integer expression asked for as a float converts")
+ccn_an_integer_expression_asked_for_as_a_float()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        @include("<limits.h>")
+
+        c const
+            BITS: real = "CHAR_BIT"
+
+        print(BITS / 2.0)
+        """), "4\n")
+
+@test("the type may be a transparent subtype of a float, bound and all")
+ccn_a_transparent_subtype_of_a_float()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        type Fraction = f32 within 0.0..1.0
+
+        c const
+            HALF: Fraction = "1.0 / 2.0"
+
+        print(HALF)
+        """), "0.5\n")
+
+// The two carriers share one probe and one numbering, so a block mixing them, out of order, is where
+// one line reporting another line's number would show.
+@test("a block mixing floats and integers keeps each line's own answer")
+ccn_a_block_mixing_floats_and_integers()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        @include("<limits.h>")
+
+        c const
+            HALF:    real  = "0.5"
+            BITS:    u32   = "CHAR_BIT"
+            QUARTER: real  = "0.5 / 2.0"
+            BYTES:   usize = "sizeof(char)"
+
+        print(HALF == QUARTER * 2.0, BITS == u32(8 * BYTES), QUARTER * 4.0 == 1.0)
+        """), "true true true\n")
+
+@test("a negative one survives, since the carrier is a signed double either way")
+ccn_a_negative_float_survives()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran("c const\n    NEG: real = \"-1.5\"\n\nprint(NEG + 1.5 == 0.0, NEG < 0.0)\n"),
+              "true true\n")
+
+@test("and a bound the measured value misses is refused, as it is for an integer")
+ccn_a_float_bound_the_value_misses()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err(raw"""
+        type Fraction = f32 within 0.0..1.0
+
+        c const
+            OVER: Fraction = "1.5"
+
+        print(OVER)
+        """), "'OVER' is 1.5, which Fraction does not admit — it holds 0.0 to 1.0")
+
+// The probe is compiled for the target and never run, which has to hold for a float as it does for
+// a `sizeof`: the freestanding build and the host build carry the same bit pattern.
+@test("and it is measured for the target, on a machine with no way to run anything")
+ccn_a_float_is_measured_for_the_target()
+    if !ccn_ready() then return
+
+    val src = "c const\n    Q: f32 = \"0.25 * 3.14159265359\"\n\nvar x: f32 = Q\n\nprint(x)\n"
+
+    val bare = ccn_truncated(ccn_ir_for(src, Some("thumbv7em-freestanding")))
+    val here = ccn_truncated(ccn_ir_for(src, None))
+
+    assert(bare != "", "the freestanding build carries no measured float")
+    assert_eq(bare, here)
+    assert_eq(bare, "0x3FE921FB60000000")
+end ccn_a_float_is_measured_for_the_target
+
+// -- the answer is the target's rather than the host's --------------------------------------------
+
+private ccn_pointer_program() -> string = raw"""
+    c const
+        P: usize = "sizeof(void *)"
+
+    var xs: [P]u8 = [0; P]
+
+    print(str(xs.len))
+    """
+
+@test("aarch64-macos sizes the array at 8")
+ccn_the_host_sizes_the_array_at_8()
+    if !ccn_ready() then return
+
+    val ir = ccn_ir_for(ccn_pointer_program(), Some("aarch64-macos"))
+
+    assert(ccn_says(ir, "%xs.addr = alloca [8 x i8]"), ir)
+
+@test("thumbv7em-freestanding sizes the array at 4")
+ccn_a_32_bit_machine_sizes_the_array_at_4()
+    if !ccn_ready() then return
+
+    val ir = ccn_ir_for(ccn_pointer_program(), Some("thumbv7em-freestanding"))
+
+    assert(ccn_says(ir, "%xs.addr = alloca [4 x i8]"), ir)
+
+// -- what it refuses ------------------------------------------------------------------------------
+
+// The C compiler is the judge of what a constant expression is, and its refusal is quoted.
+@test("an expression C cannot settle at compile time, in C's own words")
+ccn_an_expression_c_cannot_settle()
+    if !ccn_ready() then return
+
+    val said = ccn_err(raw"""
+        c const
+            N: usize = "atoi(\"3\")"
+
+        print(str(N))
+        """)
+
+    ccn_refuses(said, "the C compiler refused this file's 'c const' block:")
+    ccn_refuses(said, "error: initializer element is not a compile-time constant")
+end ccn_an_expression_c_cannot_settle
+
+@test("a header that is not there")
+ccn_a_header_that_is_not_there()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err(raw"""
+        @include("no_such_header_at_all.h")
+
+        c const
+            N: usize = "sizeof(int)"
+
+        print(str(N))
+        """), "fatal error: 'no_such_header_at_all.h' file not found")
+
+@test("a value the declared type cannot hold, naming both ends")
+ccn_a_value_the_declared_type_cannot_hold()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err("c const\n    N: u8 = \"sizeof(long long) * 100\"\n\nprint(str(N))\n"),
+                "'sizeof(long long) * 100' is 800 here, which 'u8' cannot hold — it holds 0 to 255")
+
+@test("a type that is not a number, since a string from C is not written this way")
+ccn_a_type_that_is_not_a_number()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err(raw"""
+        c const
+            S: string = "\"hello\""
+
+        print(S)
+        """), "'string' is not a number, and a 'c const' reads a number — the value is read back " +
+              "out of the C compiler's own output, where a number is a number and a string is a " +
+              "block of storage. A string from C is not written this way")
+
+@test("'f16', which is not a width a C constant is written at")
+ccn_f16_is_not_a_width()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err("c const\n    H: f16 = \"0.5\"\n\nprint(H)\n"),
+                "'f16' is not a width a 'c const' is measured at — C writes a constant expression " +
+                "as a 'float', a 'double' or a 'long double', so the two widths that read back " +
+                "without guessing are 'f32' and 'f64'")
+
+// C settles this one and hands back an infinity, so the refusal is sysl's rather than clang's.
+@test("an expression that overflows while C is working it out")
+ccn_an_expression_that_overflows()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err("c const\n    BIG: real = \"1e308 * 10\"\n\nprint(BIG)\n"),
+                "'1e308 * 10' is Infinity here, and a 'c const' carries a finite number — either " +
+                "the C expression overflowed while it was being worked out, or it names an " +
+                "infinity outright")
+
+@test("a NaN, which is not a value to carry either")
+ccn_a_nan_is_not_carried()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err(raw"""
+        c const
+            N: real = "__builtin_nan(\"\")"
+
+        print(N)
+        """), "'__builtin_nan(\"\")' is not a number here, and a 'c const' carries one — a value " +
+              "the C compiler settles as a NaN has no constant to be folded into a program")
+
+@test("a value the declared float width turns into an infinity")
+ccn_a_value_the_float_width_turns_into_an_infinity()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err("c const\n    BIG: f32 = \"1e300\"\n\nprint(BIG)\n"),
+                "'1e300' is 1.0E300 here, which 'f32' cannot hold — the largest it holds is " +
+                "3.4028235E38")
+
+@test("and one it cannot tell from zero, which is the same loss read the other way")
+ccn_a_value_the_float_width_cannot_tell_from_zero()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err("c const\n    TINY: f32 = \"1e-300\"\n\nprint(TINY)\n"),
+                "'1e-300' is 1.0E-300 here, which 'f32' cannot tell from zero — the smallest it " +
+                "holds that is not zero is 1.4E-45")
+
+// Naming a narrower width is asking for the nearest value in it, which is what C does for
+// `float x = M_PI;`.
+@test("but ordinary rounding is not refused, because that is what naming the width asked for")
+ccn_ordinary_rounding_is_not_refused()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran("c const\n    THIRD: f32 = \"1.0 / 3.0\"\n\nprint(THIRD > 0.333, THIRD < 0.334)\n"),
+              "true true\n")
+
+@test("and a block inside a body, which has no file's headers to be compiled against")
+ccn_a_block_inside_a_body()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err(raw"""
+        f() -> int
+            c const
+                N: int = "1"
+            N
+
+        print(str(f()))
+        """), "a 'c const' block is declared at the top level of a file — the C in it is compiled " +
+              "against that file's '@include' headers, and a block inside a body would be asking " +
+              "the same question from a place that cannot answer it")
+
+// -- the type may be a transparent subtype of an integer ------------------------------------------
+
+@test("a 'c type' measured beside it, which is what the pair is for")
+ccn_a_c_type_measured_beside_it()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        @include("<stdint.h>")
+
+        c type
+            T = "uint32_t"
+
+        c const
+            N: T = "42"
+
+        print(str(N))
+        """), "42\n")
+
+@test("and the constant is that type, so it goes where the type goes")
+ccn_the_constant_is_that_type()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        @include("<stdint.h>")
+
+        c type
+            T = "uint16_t"
+
+        c const
+            N: T = "40"
+
+        plus_two(x: T) -> T
+            x + 2
+
+        print(str(plus_two(N)))
+        """), "42\n")
+
+// The C side casts through the typedef and the IR prints an `i64` bit pattern either way, so a
+// full-width unsigned answer is a negative number until the measurement says otherwise.
+@test("a full-width unsigned measurement survives, read at the width C gave")
+ccn_a_full_width_unsigned_measurement_survives()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        @include("<stdint.h>")
+
+        c type
+            T = "uint64_t"
+
+        c const
+            N: T = "0xFFFFFFFFFFFFFFFFull"
+
+        print(str(N))
+        """), "18446744073709551615\n")
+
+@test("and a measured signed one keeps a negative value, read the other way")
+ccn_a_measured_signed_one_keeps_a_negative_value()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        @include("<stdint.h>")
+
+        c type
+            T = "int32_t"
+
+        c const
+            N: T = "-3 * 5"
+
+        print(str(N))
+        """), "-15\n")
+
+// The range checked is the measured type's and the refusal quotes the name the reader wrote -- and
+// the value is not carried through the C type, which would narrow `(uint8_t)800` to `32`.
+@test("a value the measured type cannot hold is refused, naming it as written")
+ccn_a_value_the_measured_type_cannot_hold()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err(raw"""
+        @include("<stdint.h>")
+
+        c type
+            T = "uint8_t"
+
+        c const
+            N: T = "sizeof(long long) * 100"
+
+        print(str(N))
+        """), "'sizeof(long long) * 100' is 800 here, which 'T' cannot hold — it holds 0 to 255")
+
+@test("a measured type that is not an integer is refused at the constant")
+ccn_a_measured_type_that_is_not_an_integer()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err("c type\n    T = \"_Bool\"\n\nc const\n    N: T = \"1\"\n\nprint(str(N))\n"),
+                "'T' is what the C compiler calls '_Bool', which is not an integer here, and a " +
+                "'c const' reads an integer")
+
+@test("a written subtype is followed to its base, and admits a value in range")
+ccn_a_written_subtype_admits_a_value_in_range()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(raw"""
+        type Small = u32 within 0..10
+
+        c const
+            N: Small = "3 + 4"
+
+        print(str(N))
+        """), "7\n")
+
+@test("and refuses one outside the range, naming both ends")
+ccn_a_written_subtype_refuses_one_outside_the_range()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err(raw"""
+        type Small = u32 within 0..10
+
+        c const
+            N: Small = "sizeof(long long) * 100"
+
+        print(str(N))
+        """), "'N' is 800, which Small does not admit — it holds 0 to 10")
+
+// A width the C compiler decides, narrowed by a range the program decides; a value has to satisfy
+// both.
+private ccn_slow(value: string) -> string = replace_all(raw"""
+    @include("<stdint.h>")
+
+    c type
+        Tick = "uint32_t"
+
+    type Slow = Tick within 0..1000
+
+    c const
+        N: Slow = "%"
+
+    print(str(N))
+    """, "%", value)
+
+@test("a written subtype over a measured one is held to both")
+ccn_a_written_subtype_over_a_measured_one()
+    if !ccn_ready() then return
+
+    assert_eq(ccn_ran(ccn_slow("500")), "500\n")
+    ccn_refuses(ccn_err(ccn_slow("sizeof(long long) * 1000")),
+                "'N' is 8000, which Slow does not admit — it holds 0 to 1000")
+
+@test("a 'where' predicate is refused, since a folded constant is made nowhere")
+ccn_a_where_predicate_is_refused()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err(raw"""
+        type Even = int where value % 2 == 0
+
+        c const
+            N: Even = "4"
+
+        print(str(N))
+        """), "'N' is declared Even, whose 'where' predicate is checked where a value is made — " +
+              "and a constant is folded into its uses rather than made anywhere, so the check has " +
+              "no site. A 'within' range is settled here; a predicate cannot be")
+
+@test("a 'new' type is refused, since reaching one is a written conversion")
+ccn_a_new_type_is_refused()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err(raw"""
+        type Ticks = new int within 0..100
+
+        c const
+            N: Ticks = "4"
+
+        print(str(N))
+        """), "'N' is declared Ticks, which is a 'new' type — reaching one from its base is a " +
+              "written conversion, and a constant is the value it is written as, so there is " +
+              "nowhere here to write it")
+
+private ccn_not_declared_here(name: string) -> string =
+    s"'$name' is not a type this file declares, and a 'c const' is measured against its own file " +
+    "— so its type is an integer or a float, a 'c type' written beside it, or a subtype of one " +
+    "declared here"
+
+@test("a name this file does not declare is refused by name")
+ccn_a_name_this_file_does_not_declare()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err("c const\n    N: Nope = \"1\"\n\nprint(str(N))\n"), ccn_not_declared_here("Nope"))
+
+@test("and a name from another module is that same refusal, not a resolution")
+ccn_a_name_from_another_module()
+    if !ccn_ready() then return
+
+    val root = ccn_tree("other", "module other\n\ntype Small = u32 within 0..10\n",
+                        "import other.Small\n\nc const\n    N: Small = \"1\"\n\nprint(str(N))\n")
+
+    val said = ccn_lowered(root, None).1
+
+    remove_dir_all(root).unwrap_or(())
+    ccn_refuses(said, ccn_not_declared_here("Small"))
+end ccn_a_name_from_another_module
+
+// -- a library ships the measured value rather than the expression --------------------------------
+//
+// The reference writes a library's source into its `.syslib` and reads it back; this compiler's
+// artifact carries no tree (CLAUDE.md § Not built). What the first two of its cases rest on is the
+// lowering -- a measured constant becomes an ordinary one holding a literal, which is all a codec
+// would ever have to carry -- and that is asserted here directly.
+
+private ccn_library_consts() -> Buf[(string, string)]
+    val parsed = parse(source_of("demo/lib.sysl", raw"""
+        module demo
+        @include("<limits.h>")
+
+        c const
+            BITS: u32  = "CHAR_BIT"
+            HALF: real = "1.0 / 2.0"
+        """))
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val t = host_target()
+    val lowered = c_probe_lower(analysis_for(t), units, t)
+    var out: Buf[(string, string)] = buf()
+
+    for i in 0..<lowered.len()
+        val body = lowered.at(i).body
+
+        for j in 0..<body.len()
+            *body.at(j).kind match
+                ConstDecl(name, _, value, _) -> *value.kind match
+                    IntLit(digits, _, _) -> out.push((name, s"int $digits"))
+                    FloatLit(text, _) -> out.push((name, s"float $text"))
+                    _ -> out.push((name, "something else"))
+                _ -> ()
+
+    out
+end ccn_library_consts
+
+@test("the artifact carries an ordinary constant holding a literal")
+ccn_a_measured_constant_is_an_ordinary_one()
+    if !ccn_ready() then return
+
+    val consts = ccn_library_consts()
+
+    assert_eq(consts.len(), 2)
+    assert_eq(consts.at(0).0, "BITS")
+    assert_eq(consts.at(0).1, "int 8")
+
+// The value is carried as TEXT, so a rounding or a reformatting there would come back as a number
+// nobody measured; the text has to read back as exactly the number C worked out.
+@test("a measured float crosses the codec as the same number it was measured as")
+ccn_a_measured_float_is_the_same_number()
+    if !ccn_ready() then return
+
+    val consts = ccn_library_consts()
+
+    assert_eq(consts.len(), 2)
+    assert_eq(consts.at(1).0, "HALF")
+    assert(consts.at(1).1.starts_with("float "), consts.at(1).1)
+
+    val text = consts.at(1).1[6..<consts.at(1).1.bytes.len]
+
+    assert_eq(parse_real(text).unwrap(), 0.5)
+end ccn_a_measured_float_is_the_same_number
+
+// -- the edges ------------------------------------------------------------------------------------
+
+// `usize` is the target's width, so its range is too: a 64-bit value is fine here and is not on
+// the 32-bit machine.
+@test("a 'usize' is range-checked at the target's width, not the host's")
+ccn_a_usize_is_range_checked_at_the_targets_width()
+    if !ccn_ready() then return
+
+    val src = "c const\n    N: usize = \"0x1FFFFFFFFull\"\n\nprint(str(N))\n"
+
+    ccn_refuses(ccn_err_for(src, Some("thumbv7em-freestanding")),
+                "'0x1FFFFFFFFull' is 8589934591 here, which 'usize' cannot hold — it holds 0 to " +
+                "4294967295")
+
+    assert_eq(ccn_ran(src), "8589934591\n")
+end ccn_a_usize_is_range_checked_at_the_targets_width
+
+// Two files of one module are two probes, which is what lets each carry its own headers.
+@test("each file is measured against its own '@include' lines")
+ccn_each_file_is_measured_against_its_own_includes()
+    if !ccn_ready() then return
+
+    val root = make_temp_dir("sysl-cconst").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/a.sysl", "@include(\"<limits.h>\")\n\nc const\n    A: u32 = \"CHAR_BIT\"\n").unwrap()
+    write_text(s"$root/b.sysl", raw"""
+        @include("<stddef.h>")
+
+        c const
+            B: usize = "sizeof(long long)"
+
+        print(str(A + u32(B)))
+        """).unwrap()
+
+    assert_eq(ccn_build_run(root, root), "16\n")
+end ccn_each_file_is_measured_against_its_own_includes
+
+// A binding puts its measured constants in a module of its own, so a consumer names them qualified
+// -- and the qualified spelling has to fold in the two positions a constant exists for.
+@test("a module-qualified one is the same constant as the imported one, in every position")
+ccn_a_module_qualified_one_is_the_same_constant()
+    if !ccn_ready() then return
+
+    val root = ccn_tree("bits", raw"""
+        module bits
+        @include("<limits.h>")
+
+        c const
+            byte_width: int = "CHAR_BIT"
+        """, raw"""
+        import bits.byte_width
+
+        const near: int = byte_width
+        const far: int = bits.byte_width
+
+        var here: [byte_width]int
+        var there: [bits.byte_width]int
+
+        print(s"${near == far} ${here.len == there.len}")
+        """)
+
+    assert_eq(ccn_build_run(root, root), "true true\n")
+end ccn_a_module_qualified_one_is_the_same_constant
+
+// A header outside the toolchain's own directories is reached by `--include-path`, exactly as one a
+// shim includes is -- and without it the same program is refused, so the assertion is about the flag.
+@test("a header is found through the search paths the build was given")
+ccn_a_header_is_found_through_the_search_paths()
+    if !ccn_ready() then return
+
+    val hdr = make_temp_dir("sysl-cconst-hdr").unwrap()
+
+    make_dir_all(hdr).unwrap()
+    write_text(s"$hdr/measured.h", "#define MEASURED_WIDTH 37\n").unwrap()
+
+    val text = "@include(\"measured.h\")\n\nc const\n    W: u32 = \"MEASURED_WIDTH\"\n\nprint(str(W))\n"
+
+    reset_search_paths()
+    ccn_refuses(ccn_err(text), "fatal error: 'measured.h' file not found")
+
+    add_include_path(hdr)
+    assert_eq(ccn_ran(text), "37\n")
+
+    reset_search_paths()
+    remove_dir_all(hdr).unwrap_or(())
+end ccn_a_header_is_found_through_the_search_paths
+
+// `sysl test` reaches the probe through the test build and `sysl build` through the ordinary one; a
+// suite pinning only one of them is what lets the other lose the flag.
+@test("every tier of build finds a header through the search paths, the test build included")
+ccn_every_tier_finds_a_header_through_the_search_paths()
+    if !ccn_ready() then return
+
+    val hdr = make_temp_dir("sysl-cconst-tiers").unwrap()
+    val root = make_temp_dir("sysl-cconst").unwrap()
+
+    make_dir_all(hdr).unwrap()
+    make_dir_all(root).unwrap()
+    write_text(s"$hdr/tiered.h", "#define TIERED_WIDTH 41\n").unwrap()
+    write_text(s"$root/main.sysl", raw"""
+        @include("tiered.h")
+
+        c const
+            W: u32 = "TIERED_WIDTH"
+
+        @test
+        it_measured() = assert(W == 41, "the header said 41")
+        """).unwrap()
+
+    val src = s"$root/main.sysl"
+
+    reset_search_paths()
+    add_include_path(hdr)
+
+    test_build_of(src, None) match
+        Err(why) -> assert(false, s"the include path did not reach the test build's probe: ${failure_text(why)}")
+        Ok(made) ->
+            assert(made.emitted.report.is_empty(), analysis_report(made.emitted.report))
+            assert_eq(made.tests.len(), 1)
+            assert_eq(made.tests.at(0).display, "it_measured")
+            assert(ccn_says(made.emitted.text, "main"), "the test build has no entry point")
+
+    val ordinary = ccn_lowered(src, None)
+
+    assert_eq(ordinary.1, "")
+    assert(ccn_says(ordinary.0, "main"), "the ordinary build has no entry point")
+
+    reset_search_paths()
+
+    val bare = test_build_of(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.emitted.report)
+
+    ccn_refuses(bare, "fatal error: 'tiered.h' file not found")
+
+    remove_dir_all(hdr).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end ccn_every_tier_finds_a_header_through_the_search_paths
+
+// A package vendors its headers beside its modules, and the probe is a temporary file somewhere
+// else -- so without a `-I` for the module's own directory the header is unreachable.
+@test("a header vendored beside the module is found with no flag at all")
+ccn_a_header_vendored_beside_the_module()
+    if !ccn_ready() then return
+
+    val root = make_temp_dir("sysl-cconst-pkg").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/vendored.h", "#define VENDORED_WIDTH 41\n").unwrap()
+    write_text(s"$root/lib.sysl",
+               "@include(\"vendored.h\")\n\nc const\n    W: u32 = \"VENDORED_WIDTH\"\n\nprint(str(W))\n").unwrap()
+
+    reset_search_paths()
+    assert_eq(ccn_build_run(root, s"$root/lib.sysl"), "41\n")
+end ccn_a_header_vendored_beside_the_module
+
+// The lowering used to hand both lines the same value, so what got reported was a duplicate of a
+// constant neither line had written.
+@test("a name declared twice is refused as the duplicate it is")
+ccn_a_name_declared_twice()
+    if !ccn_ready() then return
+
+    ccn_refuses(ccn_err(raw"""
+        c const
+            N: u32 = "1"
+
+        c const
+            N: u32 = "2"
+
+        print(str(N))
+        """), "constant 'N' is already declared")
+
+// -- a probe the machine cannot answer ------------------------------------------------------------
+//
+// A library is compiled for every target, so one POSIX module measuring `sizeof(regex_t)` would
+// fail every freestanding build -- including builds of programs that never name it -- were a file
+// that declared what it needs not skipped where the machine has none of it.
+
+private ccn_host_module() -> string = raw"""
+    module host
+    @requires(posix)
+    @include("regex.h")
+
+    c const
+        REGEX_SIZE: usize = "sizeof(regex_t)"
+
+    size() -> usize = REGEX_SIZE
+    """
+
+private ccn_gate(module_text: string, main_text: string, target: Option[string]) -> (string, string)
+    val root = ccn_tree("host", module_text, main_text)
+    val out = ccn_lowered(root, target)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ccn_gate
+
+@test("is not asked for, on a machine whose header it could not have")
+ccn_the_probe_is_skipped_on_a_bare_machine()
+    if !ccn_ready() then return
+
+    val out = ccn_gate(ccn_host_module(), "print(\"nothing here names host\")\n",
+                       Some("thumbv7em-freestanding"))
+
+    assert_eq(out.1, "")
+    assert(ccn_says(out.0, "main"), "no entry point")
+
+// The other half, and the reason this is a gate rather than a suppression.
+@test("and is asked for, on a machine that has it")
+ccn_the_probe_is_asked_for_on_a_machine_that_has_it()
+    if !ccn_ready() then return
+
+    val out = ccn_gate(ccn_host_module(), "print(\"nothing here names host\")\n", None)
+
+    assert_eq(out.1, "")
+    assert(ccn_says(out.0, "main"), "no entry point")
+
+// The header is kept when the body is dropped, so a program that does reach it is told what it
+// requires rather than sent looking for a missing header.
+@test("while a program that reaches it is told what it requires")
+ccn_a_program_that_reaches_it_is_told_what_it_requires()
+    if !ccn_ready() then return
+
+    val said = ccn_gate(ccn_host_module(), "@no_posix\n\nprint(str(host.size()))\n",
+                        Some("thumbv7em-freestanding")).1
+
+    ccn_refuses(said, "this reaches 'host', which requires 'posix', and this module declared " +
+                      "'no posix' — an environment capability gates which modules exist, so a " +
+                      "module that gave one up may not reach one that needs it")
+    assert(!ccn_says(said, "regex.h"), said)
+end ccn_a_program_that_reaches_it_is_told_what_it_requires
+
+@test("but a file that requires nothing is still measured, and still refused where it cannot be")
+ccn_a_file_that_requires_nothing_is_still_measured()
+    if !ccn_ready() then return
+
+    val said = ccn_gate(raw"""
+        module host
+        @include("regex.h")
+
+        c const
+            REGEX_SIZE: usize = "sizeof(regex_t)"
+        """, "print(\"nothing here names host\")\n", Some("thumbv7em-freestanding")).1
+
+    ccn_refuses(said, "fatal error: 'regex.h' file not found")
+
+// **The gate is the machine's capabilities and not only whether it is hosted.** A hosted machine
+// that is not POSIX has no `<regex.h>` either, and the reference's `unmeasurable` asks every
+// environment capability the file requires; asking `hosted` alone measured this file for Windows and
+// refused it there. Whether clang has a Windows back end or not, a measured probe says something.
+@test("a file requiring posix is not measured on a hosted machine that is not POSIX")
+ccn_the_probe_is_skipped_where_posix_is_missing()
+    val windows = target_named("x86_64-windows").unwrap()
+
+    assert_eq(stmt_diagnostics_for(ccn_host_module(), windows).len(), 0)
+
+// -- the probe's reading of LLVM -------------------------------------------------------------------
+
+// LLVM 23 puts an `f` in front of a hex float and writes a non-finite value as a word, and which
+// spelling comes back is a property of whichever clang is installed -- so the runs above cannot see
+// the spelling this machine's clang does not write.
+@test("a hex float operand is read at either LLVM's spelling of it, and a decimal one as itself")
+ccn_a_hex_float_operand_is_read_at_either_spelling()
+    val pi = float_operand("0x400921FB54442EEA").unwrap()
+
+    assert(pi > 3.14159265 && pi < 3.14159266, s"$pi")
+    assert(float_operand("f0x400921FB54442EEA").unwrap() == pi)
+
+    // The trailing comma is what an operand carries when the global states an alignment after it.
+    assert(float_operand("f0x400921FB54442EEA,").unwrap() == pi)
+
+    // The short decimal form, which LLVM prints only where it reads back as the same double.
+    assert(float_operand("5.000000e-01").unwrap() == 0.5)
+
+    // The top bit is a bit rather than a sign: this is a NaN.
+    val nan = float_operand("f0x7FF8000000000000").unwrap()
+
+    assert(nan != nan, "a quiet NaN")
+
+    val zero: real = 0.0
+
+    assert(float_operand("0xFFF0000000000000").unwrap() == -1.0 / zero)
+
+    // A width this probe never asks for is dropped rather than read at the wrong one.
+    assert(float_operand("0xH3C00").is_none())
+    assert(float_operand("f0xH3C00").is_none())
+
+    assert(float_operand("+inf").unwrap() == 1.0 / zero)
+    assert(float_operand("-inf").unwrap() == -1.0 / zero)
+
+    val q = float_operand("+qnan").unwrap()
+    val s = float_operand("-snan").unwrap()
+
+    assert(q != q && s != s, "both NaN spellings")
+end ccn_a_hex_float_operand_is_read_at_either_spelling
+
+// Two vocabularies for one fact: a symbol a source line may test and a capability a module may
+// require both ask whether the machine is hosted, so a target answering differently would gate a
+// `c const` and a `#if` differently.
+@test("the machine's own capabilities are the symbols conditional compilation defines")
+ccn_the_machines_capabilities_are_the_conditional_symbols()
+    val targets = all_targets()
+
+    for i in 0..<targets.len()
+        val t = targets.at(i)
+        val machine = inherent_capabilities(t)
+        val symbols = defined(t)
+
+        assert(has(machine, CapOs) == has(symbols, "hosted"), s"${t.name}: os")
+        assert(has(machine, CapPosix) == has(symbols, "posix"), s"${t.name}: posix")
+end ccn_the_machines_capabilities_are_the_conditional_symbols
