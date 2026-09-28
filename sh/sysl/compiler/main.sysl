@@ -149,7 +149,11 @@ private emit_typed_command(args: []string, say: string -> unit) -> int
             Fine
 end emit_typed_command
 
-// `sysl emit-llvm [--gaps] [--target <name>] <path>` -- one whole program's LLVM text.
+// `sysl emit-llvm [--gaps] [--target <name>] [-O<level>] <path>` -- one whole program's LLVM text.
+//
+// **The level changes which standard-module archive is resolved, not the text**: the reference
+// prints the same bytes at every level and builds or reuses the archive at the one named, so a
+// level clang has no answer for fails here exactly as it fails a build.
 //
 // **The reference compiler answers this command line with the text it hands to the back end**, so
 // the two are diffed rather than compared by hand. The path is a program on the same terms
@@ -161,6 +165,7 @@ end emit_typed_command
 // this compiler does not is an absence, and this is what names the reason.
 private emit_llvm_command(args: []string, say: string -> unit) -> int
     var named: Option[string] = None
+    var level: Option[string] = None
     var gaps = false
     var file = ""
     var i: usize = 2
@@ -185,6 +190,17 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
             named = Some(args[i])
         else if args[i] == "--gaps"
             gaps = true
+        else if took_level(args, i).0 != 0
+            val given = took_level(args, i)
+
+            if given.0 < 0
+                say(emit_llvm_usage())
+                return Misused
+            end if
+
+            level = Some(given.1)
+
+            if given.0 == 2 then i += 1
         else
             file = args[i]
 
@@ -195,7 +211,7 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
-    emit_llvm_text(file, named, build_level(file, None)) match
+    emit_llvm_text(file, named, build_level(file, level)) match
         Err(refusal) ->
             say(s"error: ${refusal.message}")
             Failed
@@ -217,7 +233,8 @@ private emit_llvm_command(args: []string, say: string -> unit) -> int
             Fine
 end emit_llvm_command
 
-private emit_llvm_usage() -> string = "usage: sysl emit-llvm [--gaps] [--target <name>] " + where_flags() + " <path>"
+private emit_llvm_usage() -> string =
+    "usage: sysl emit-llvm [--gaps] [--target <name>] [-O<level>] " + where_flags() + " <path>"
 
 // `sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path>` -- one program, made
 // into something the machine will run.
@@ -754,7 +771,7 @@ private add_usage() -> string = "usage: sysl add <coordinate>[@<version>] [<path
 
 usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <file> | " +
     "emit-typed [--no-spans] [--tables] [--target <name>] <path> | " +
-    "emit-llvm [--target <name>] <path> | " +
+    "emit-llvm [--target <name>] [-O<level>] <path> | " +
     "build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path> | " +
     "build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] " +
     "<path> | " +
