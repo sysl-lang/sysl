@@ -1,0 +1,869 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What `reference/arrays.md` claims, run rather than read: the forms an array is written down in,
+// indexing and slicing, the growable sequence built on the two, what a generic may declare storage
+// for, and the view that may not be written.
+//
+// The sentence that started it is `§ Length`: *"It is a **property** — a member read without
+// parentheses"*, said of `len` on the built-in types. Writing the parentheses is answered with the
+// property diagnostic rather than a denial that the type has the member at all.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `ArrayClaimTests` these
+// are.
+
+private var acl_library_cache: Buf[Program] = buf()
+private var acl_library_read: bool = false
+
+private acl_library() -> Buf[Program]
+    if acl_library_read then return acl_library_cache
+
+    acl_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> acl_library_cache = units
+
+    acl_library_cache
+end acl_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private acl_ready() -> bool
+    if acl_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end acl_ready
+
+// The growable sequence is `sysl.buf`'s, so a program reaching for one says so.
+private acl_growable() -> string = "import sysl.buf.*\n\n"
+
+private acl_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program built from one file does: what it printed, and whether it exited zero. A failure to
+// build is its message and a non-zero exit.
+private acl_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-array-claim").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end acl_outcome
+
+// **What a program PRINTS**, where it runs to the end.
+private acl_ran(text: string) -> string
+    val out = acl_outcome(text)
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+end acl_ran
+
+// Whether a program that BUILT stopped short of exiting zero -- a check that failed.
+private acl_exits(text: string) -> bool
+    val out = acl_outcome(text)
+
+    !out.1 && !out.0.contains("error:")
+end acl_exits
+
+// Everything a source has to say for itself, taken through the lowering, so a refusal a pass after
+// the analysis makes is one of these too.
+private acl_err(text: string) -> string
+    val root = make_temp_dir("sysl-array-claim").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end acl_err
+
+private acl_refused(text: string, part: string)
+    val out = acl_err(text)
+
+    assert(acl_says(out, part), s"expected '$part' in: $out")
+end acl_refused
+
+// The refusal every write through a `[]const int` earns, whichever spelling the write takes.
+private acl_const_write() -> string
+    "this element belongs to a '[]const int', which views elements it may not write, so there is " +
+        "nothing to assign through. Elements you may write are elements of your own: copy them into " +
+        "a '[]int' first"
+end acl_const_write
+
+// The refusal a `[]const int` earns where a `[]int` was asked for.
+private acl_not_a_licence() -> string
+    "a '[]const int' views elements it may not write, and a '[]int' is a licence to write them — so " +
+        "the one does not become the other. Copy what you need into a '[]int' of your own, or take " +
+        "the parameter as '[]const int' if it is only read"
+end acl_not_a_licence
+
+// -- a compiler-provided property written with parentheses says so ----------------------------------
+
+@test("on a fixed array, whose length is a constant")
+acl_on_a_fixed_array()
+    if !acl_ready() then return
+
+    val out = acl_err("var a = [1, 2, 3]\nprint(a.len())")
+
+    assert(acl_says(out, "error: 'len' is a property the compiler provides for '[3]int' — read it as 'value.len', without '()'"), out)
+    assert(!acl_says(out, "has no method"), out)
+
+@test("on a slice, whose length is its third word")
+acl_on_a_slice()
+    if !acl_ready() then return
+
+    acl_refused("var xs: []int = [1, 2, 3]\nprint(xs.len())",
+        "'len' is a property the compiler provides for '[]int' — read it as 'value.len', without '()'")
+
+@test("on a string, of which everything the chapter says about a slice is true")
+acl_on_a_string()
+    if !acl_ready() then return
+
+    acl_refused("var s = \"hello\"\nprint(s.len())",
+        "'len' is a property the compiler provides for 'string' — read it as 'value.len', without '()'")
+
+@test("and on the other two a string provides")
+acl_on_the_other_two_a_string_provides()
+    if !acl_ready() then return
+
+    acl_refused("var s = \"hello\"\nprint(s.bytes())",
+        "'bytes' is a property the compiler provides for 'string' — read it as 'value.bytes', without '()'")
+    acl_refused("var s = \"hello\"\nprint(s.chars())",
+        "'chars' is a property the compiler provides for 'string' — read it as 'value.chars', without '()'")
+
+@test("while the provided members that really are called keep working")
+acl_provided_members_that_are_called_keep_working()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var s = \"hello\"\nvar c = s.copy()\nprint(c, c.len)"), "hello 5\n")
+    assert_eq(acl_ran(raw"""
+        var r: &int = 7
+        var w: weak int = r
+        w.get() match
+            Some(v) -> print(*v)
+            None -> print(0)
+        """), "7\n")
+
+@test("and a name the type genuinely has no member of keeps the plain complaint")
+acl_a_name_with_no_member_keeps_the_plain_complaint()
+    if !acl_ready() then return
+
+    acl_refused("var a = [1, 2, 3]\nprint(a.nope())", "error: type '[3]int' has no method 'nope'")
+
+@test("a property a program declares was already answered this way, and still is")
+acl_a_declared_property_is_answered_the_same_way()
+    if !acl_ready() then return
+
+    acl_refused("struct Box\n    v: int\n\n    doubled -> int = self.v * 2\nvar b = Box(21)\nprint(b.doubled())",
+        "error: 'doubled' is a property of 'Box' — read it as 'value.doubled', without '()'")
+
+@test("reading it without the parentheses is what the paragraph asks for")
+acl_reading_it_without_the_parentheses()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var a = [1, 2, 3]\nprint(a.len, \"hello\".len, \"hello\".bytes.len)"), "3 5 5\n")
+
+// -- the forms a program writes an array down in -----------------------------------------------------
+
+@test("a literal fixes the length from how many elements there are")
+acl_a_literal_fixes_the_length()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var primes = [2, 3, 5, 7]\nprint(primes.len, primes[3])"), "4 7\n")
+
+@test("a declaration with no initializer starts at the zero value")
+acl_a_declaration_starts_at_the_zero_value()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var buf: [64]u8\nvar counters: [8]int\nprint(buf.len, buf[63], counters[7])"), "64 0 0\n")
+
+@test("an empty literal takes its element type from the context")
+acl_an_empty_literal_takes_its_element_type()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var empty: [0]int = []\nprint(empty.len)"), "0\n")
+
+@test("a repeat fills every element, and a const may give the count")
+acl_a_repeat_fills_every_element()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("const n: usize = 64\nvar window = [0u8; n]\nvar ones = [1; 8]\nprint(window.len, ones[7])"), "64 1\n")
+
+@test("a repeat nests, which is how a grid is written")
+acl_a_repeat_nests()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var grid = [[0; 3]; 3]\nprint(grid.len, grid[2].len, grid[2][2])"), "3 3 0\n")
+
+@test("the repeat's value is evaluated ONCE and copied")
+acl_the_repeats_value_is_evaluated_once()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        tick() -> int
+            print("call")
+            5
+        var three = [tick(); 3]
+        print(three[0], three[1], three[2])
+        """), "call\n5 5 5\n")
+
+@test("a 'val' is the same forms written at the top of a file, and may be indexed at a running value")
+acl_a_val_at_the_top_of_a_file()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("val order: [4]usize = [16, 17, 18, 0]\nvar i = 2\nprint(order.len, order[i])"), "4 18\n")
+
+@test("and a table nobody wrote down is the same declaration with a call on the right of it")
+acl_a_table_built_by_a_call()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("build() -> [4]u32 = [7u32; 4]\nprivate val table: [4]u32 = build()\nprint(table.len, table[3])"),
+        "4 7\n")
+
+// -- what a type with no zero value costs ------------------------------------------------------------
+
+@test("a struct holding a reference has none, and the diagnostic asks for the initializer")
+acl_a_struct_holding_a_reference_has_no_zero()
+    if !acl_ready() then return
+
+    acl_refused("struct Node\n    r: &int\nvar bad: Node", "error: Node has no zero value, so 'bad' needs an initial value")
+
+@test("an array of one has none either, and is named as the array")
+acl_an_array_of_one_has_no_zero()
+    if !acl_ready() then return
+
+    acl_refused("struct Node\n    r: &int\nvar nodes: [4]Node",
+        "error: [4]Node has no zero value, so 'nodes' needs an initial value")
+
+// -- storage sized while running ---------------------------------------------------------------------
+
+@test("a slice takes a count the program computes, where an array's must be constant")
+acl_a_slice_takes_a_computed_count()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var n = 5\nvar raw: []u8 = [0u8; n]\nprint(raw.len, raw[4])"), "5 0\n")
+    acl_refused("var k = 5\nvar fixed: [k]int",
+        "error: an array length must be a constant — a literal, or a 'const' naming one")
+
+@test("a function may build one and return it, which the fixed forms cannot")
+acl_a_function_may_build_one_and_return_it()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("decode(n: int) -> []u8 = [7u8; n]\nvar built = decode(9)\nprint(built.len, built[8])"), "9 7\n")
+
+@test("a negative count is read unsigned and so arrives as a very large one, which traps")
+acl_a_negative_count_traps()
+    if !acl_ready() then return
+
+    assert(acl_exits("mk(n: int) -> []u8 = [0u8; n]\nvar neg = -1\nvar v = mk(neg)\nprint(v.len)"))
+
+// -- indexing and slicing ----------------------------------------------------------------------------
+
+@test("an element is a place, so every form the place machinery already had follows")
+acl_an_element_is_a_place()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        var a = [10, 20, 30, 40]
+        a[0] = 11
+        a[1] += 1
+        a[2]++
+        var p = &a[3]
+        *p = 44
+        print(a[0], a[1], a[2], a[3])
+        """), "11 21 31 44\n")
+
+@test("the index may be any integer type, since the check has to happen anyway")
+acl_the_index_may_be_any_integer_type()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var a = [10, 20, 30, 40, 50, 60]\nvar i: i8 = 4\nvar u: u8 = 5u8\nprint(a[i], a[u])"), "50 60\n")
+
+@test("the two range operators keep the meanings they have everywhere else")
+acl_the_two_range_operators()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var a = [10, 20, 30, 40, 50, 60]\nprint(a[2..5].len, a[2..<5].len, a[2..].len, a[..<5].len, a[..].len)"),
+        "4 3 4 5 6\n")
+
+@test("an empty slice is legal, including at the very end")
+acl_an_empty_slice_is_legal()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var a = [10, 20, 30]\nprint(a[a.len..].len, a[2..<2].len)"), "0 0\n")
+
+@test("the inclusive form additionally requires that its named high element exist")
+acl_the_inclusive_form_requires_its_high_element()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var a = [10, 20, 30, 40, 50, 60]\nprint(a[2..<6].len, a[2..5].len)"), "4 4\n")
+    assert(acl_exits("var a = [10, 20, 30, 40, 50, 60]\nprint(a[2..6].len)"))
+
+@test("an open-ended slice has one spelling, and the other is rejected rather than quietly meaning it")
+acl_an_open_ended_slice_has_one_spelling()
+    if !acl_ready() then return
+
+    acl_refused("var a = [1, 2, 3, 4]\nvar bad = a[1..<]", "error: an open-ended slice is written 'a[lo..]'")
+
+@test("a subscript reaches through one level of indirection, as a field selection does")
+acl_a_subscript_reaches_through_one_indirection()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var arr: [4]int = [1, 2, 3, 4]\nvar r: &[4]int = arr\nprint(r[0..<2].len, r[1], r.len)"),
+        "2 2 4\n")
+
+@test("a raw pointer is the one receiver with nothing to check against, and is indexed anyway")
+acl_a_raw_pointer_is_indexed_anyway()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        var a = [10, 20, 30, 40]
+        var p = &a[0]
+        p[1] = 99
+        var run = p[0..<3]
+        print(p[0], a[1], run.len, run[2])
+        """), "10 99 3 30\n")
+
+@test("while a '*[N]T', whose length is in its type, keeps every check an array has")
+acl_a_pointer_to_an_array_keeps_every_check()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var arr: [4]int = [1, 2, 3, 4]\nvar ap = &arr\nprint(ap.len, ap[3], ap[1..<3].len)"), "4 4 2\n")
+
+@test("a type indexed through 'Index' is a call, so a compound assignment is refused")
+acl_an_index_element_refuses_a_compound_assignment()
+    if !acl_ready() then return
+
+    acl_refused(acl_growable() + "var b: Buf[int] = buf()\nb.push(1)\nb[0] += 5",
+        "error: '+=' on an element read through 'sysl.Index' would evaluate the receiver and the index twice — write it out as 'b[i] = b[i] + …'")
+
+// -- iterating binds a copy --------------------------------------------------------------------------
+
+@test("so assigning to the loop variable leaves the sequence alone")
+acl_assigning_the_loop_variable_leaves_the_sequence()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var a = [1, 2, 3]\nfor x in a\n    x += 100\nprint(a[0], a[1], a[2])"), "1 2 3\n")
+
+@test("and the loop evaluates its sequence once, so a slice temporary lives for the whole loop")
+acl_the_loop_evaluates_its_sequence_once()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var a = [1, 2, 3]\nvar n = 0\nfor x in a[1..]\n    n += 1\nprint(n)"), "2\n")
+
+@test("a container is walked through its view rather than by implementing a cursor")
+acl_a_container_is_walked_through_its_view()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(acl_growable() + raw"""
+        var b: Buf[int] = buf()
+        for i in 0..<3 do b.push(i * 7)
+        var sum = 0
+        for x in b.view() do sum += x
+        print(sum)
+        """), "21\n")
+
+// -- the growable array the chapter says is ordinary sysl --------------------------------------------
+
+@test("gives up every member the chapter lists, and 'is_empty' besides")
+acl_buf_gives_up_every_member()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(acl_growable() + raw"""
+        var b: Buf[int] = buf()
+        for i in 0..<5 do b.push(i)
+        print(b.len(), b.cap(), b.is_empty(), b.at(2), b.view().len)
+        """), "5 8 false 2 5\n")
+
+@test("'truncate' does nothing where the length is one the buffer does not have")
+acl_truncate_past_the_length_does_nothing()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(acl_growable() + raw"""
+        var b: Buf[int] = buf()
+        for i in 0..<5 do b.push(i)
+        b.truncate(99usize)
+        print(b.len())
+        """), "5\n")
+
+@test("'remove' shifts the survivors down and hands the element back")
+acl_remove_shifts_the_survivors_down()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(acl_growable() + raw"""
+        var b: Buf[int] = buf()
+        for i in 0..<5 do b.push(i)
+        var gone = b.remove(1)
+        print(gone, b.len(), b.at(0), b.at(1), b.at(2), b.at(3))
+        """), "1 4 0 2 3 4\n")
+
+@test("'clear' is 'truncate(0)', and 'set' and 'pop' reach the ends")
+acl_clear_set_and_pop()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(acl_growable() + raw"""
+        var b: Buf[int] = buf()
+        for i in 0..<3 do b.push(i)
+        b.set(0, 42)
+        b.pop() match
+            Some(v) -> print(v, b.at(0))
+            None -> print(0, 0)
+        b.clear()
+        print(b.len(), b.is_empty())
+        """), "2 42\n0 true\n")
+
+@test("a COPY of a Buf taken before a removal reads the shifted elements at the length it was copied at")
+acl_a_copy_of_a_buf_before_a_removal()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(acl_growable() + raw"""
+        var b: Buf[int] = buf()
+        for i in 0..<5 do b.push(i)
+        var copy = b
+        var gone = b.remove(1)
+        print(copy.len(), copy.at(0), copy.at(1), copy.at(4))
+        print(b.len(), b.at(1))
+        """), "5 0 2 4\n4 2\n")
+
+@test("a view taken before a growth keeps its own storage and its own length")
+acl_a_view_before_a_growth_keeps_its_storage()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(acl_growable() + raw"""
+        var g: Buf[int] = buf()
+        for i in 0..<4 do g.push(i * 10)
+        var before = g.view()
+        for i in 0..<20 do g.push(999)
+        print(before.len, before[0], before[3], g.len())
+        """), "4 0 30 24\n")
+
+@test("how a push is seen follows from how the buffer is held")
+acl_how_a_push_is_seen_follows_the_holding()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(acl_growable() + raw"""
+        var p: &Buf[int] = buf()
+        p.push(1)
+        var q = p
+        var c = *p
+        p.push(2)
+        print(q.len(), c.len())
+        """), "2 1\n")
+
+// -- what a generic may declare storage for ----------------------------------------------------------
+
+@test("a fixed array of a type parameter CAN be written")
+acl_a_fixed_array_of_a_type_parameter()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("fixed[K](witness: K) -> usize\n    var storage: [16]K\n    storage.len\nprint(fixed(0))"), "16\n")
+
+@test("and it is refused per instantiation, at the element type that has no zero value")
+acl_refused_per_instantiation()
+    if !acl_ready() then return
+
+    acl_refused(raw"""
+        struct Node
+            r: &int
+        fixed[K](witness: K) -> usize
+            var storage: [16]K
+            storage.len
+        var n = Node(5)
+        print(fixed(n))
+        """, "error: [16]Node has no zero value, so 'storage' needs an initial value")
+
+@test("a slice declared with no initializer is empty, which is the storage a container cannot get")
+acl_a_slice_with_no_initializer_is_empty()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("sized[K](witness: K) -> usize\n    var storage: []K\n    storage.len\nprint(sized(0))"), "0\n")
+
+@test("while a repeat whose value needs nothing of the parameters works, as the chapter says")
+acl_a_repeat_needing_nothing_of_the_parameters()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        opts[T](n: int) -> []Option[T] = [None; n]
+        var slots: []Option[int] = opts(4)
+        print(slots.len)
+        slots[0] match
+            Some(v) -> print(v)
+            None -> print("none")
+        """), "4\nnone\n")
+
+// -- an array IS its elements ------------------------------------------------------------------------
+
+@test("so a copy is a copy, and writing one leaves the other alone")
+acl_a_copy_is_a_copy()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var a = [1, 2, 3]\nvar b = a\nb[0] = 99\nprint(a[0], b[0])"), "1 99\n")
+
+@test("and a parameter is one too — the callee's writes do not reach the caller's array")
+acl_a_parameter_is_a_copy_too()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("take(xs: [3]int) -> int\n    xs[0] = 77\n    xs[0]\nvar a = [1, 2, 3]\nprint(take(a), a[0])"),
+        "77 1\n")
+
+// -- everything here is true of a string as well -----------------------------------------------------
+
+@test("its length is its bytes, not its characters")
+acl_a_strings_length_is_its_bytes()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var s = \"héllo\"\nprint(s.len, s.bytes.len)"), "6 6\n")
+
+@test("it slices like the view it is")
+acl_a_string_slices_like_a_view()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var s = \"héllo\"\nprint(s[0..<1])"), "h\n")
+
+@test("and 's[i] = v' does not exist, which is the first of the two")
+acl_a_string_byte_cannot_be_written()
+    if !acl_ready() then return
+
+    acl_refused("var s = \"hello\"\ns[0] = 74u8",
+        "error: a string is immutable, so its bytes have no address to write through")
+
+// -- what '§ Not yet' promised, and which half of it a view type reaches -----------------------------
+
+@test("a 'val' CAN be sliced now, and what comes back may not be written")
+acl_a_val_can_be_sliced_now()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("val table: [4]int = [1, 2, 3, 4]\nvar sliced = table[0..<2]\nprint(sliced.len, sliced[1])\n"), "2 2\n")
+    acl_refused("val table: [4]int = [1, 2, 3, 4]\nvar sliced = table[0..<2]\nsliced[0] = 9", acl_const_write())
+
+@test("and it stays read-only through a re-slice and through a call")
+acl_read_only_through_a_reslice_and_a_call()
+    if !acl_ready() then return
+
+    acl_refused(raw"""
+        val table: [4]int = [1, 2, 3, 4]
+        var sliced = table[0..]
+        var again = sliced[1..]
+        again[0] = 9
+        """, acl_const_write())
+    acl_refused(raw"""
+        val table: [4]int = [1, 2, 3, 4]
+        take(xs: []int) = print(xs.len)
+        take(table[0..])
+        """, acl_not_a_licence())
+
+@test("but a '&sync' array still cannot be sliced, since that is the owner's property and not the view's")
+acl_a_sync_array_cannot_be_sliced()
+    if !acl_ready() then return
+
+    acl_refused("var p: &sync [4]int = [1, 2, 3, 4]\nvar v = p[..]",
+        "error: a slice does not record whether its owner's count is atomic, so a '&sync' array cannot be sliced")
+
+// -- what a view that may not be written promises ----------------------------------------------------
+
+private acl_view() -> string = "val k: [4]int = [1, 2, 3, 4]\nvar v = k[0..]\n"
+
+@test("every way of writing an element is refused, not only the plain assignment")
+acl_every_way_of_writing_is_refused()
+    if !acl_ready() then return
+
+    acl_refused(acl_view() + "v[0] = 9", acl_const_write())
+    acl_refused(acl_view() + "v[0] += 1", acl_const_write())
+    acl_refused(acl_view() + "v[0]++", acl_const_write())
+
+// A step is held to everything an assignment is, which the view's refusal above is one case of: the
+// same two refusals an assignment earns from a `val` and from a string's bytes.
+@test("a step is a write, so a 'val' and a string's bytes refuse it as an assignment does")
+acl_a_step_is_a_write()
+    if !acl_ready() then return
+
+    acl_refused("val x = 1\nx++\nprint(x)", "error: a 'val' is written once, so '++' has nothing to write through")
+    acl_refused("var s = \"ab\"\ns[0]--",
+        "error: a string is immutable, so its bytes have no address to write through")
+
+@test("while taking an address is allowed, because that is the raw tier and is how a view reaches C")
+acl_taking_an_address_is_allowed()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        val k: [4]u8 = [104u8, 105u8, 0u8, 0u8]
+        var v = k[0..<2]
+        printf(c"[%.*s]\n", int(v.len), &v[0])
+        """), "[hi]\n")
+
+@test("a length in the brackets contradicts the word, and the message names 'val'")
+acl_a_length_contradicts_const()
+    if !acl_ready() then return
+
+    acl_refused("var bad: [4]const int = [1, 2, 3, 4]",
+        "'const' says a view refuses writes, and an array is storage rather than a view of one — read-only storage is declared with 'val', as 'val name: [N]int'")
+
+@test("storage the expression makes takes the read-only form directly")
+acl_storage_the_expression_makes_is_read_only_directly()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        var lit: []const int = [7, 8, 9]
+        var filled: []const int = [5; 3]
+        var empty: []const int = []
+        print(lit[2], filled[1], empty.len)
+        """), "9 5 0\n")
+
+@test("and it composes — as a field, a type argument, an element, and a result")
+acl_it_composes()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        struct Holder
+            items: []const int
+        sum(h: Holder) -> int
+            var s = 0
+            for x in h.items do s += x
+            s
+        count[T](xs: []const T) -> usize = xs.len
+        give() -> []const int = [4, 5]
+        var a = [1, 2, 3]
+        var nested: [2][]const int = [a[0..], a[1..]]
+        print(sum(Holder(a[0..])), count(a[0..]), count("ab".bytes))
+        print(nested[0].len, nested[1].len, give().len)
+        """), "6 3 2\n3 2 2\n")
+
+@test("widens at a result, and a field holding one may still be reassigned")
+acl_widens_at_a_result()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        widen(xs: []int) -> []const int = xs
+        struct Holder
+            items: []const int
+        var a = [1, 2, 3]
+        var b = [9, 9]
+        var h = Holder(a[0..])
+        h.items = b[0..]
+        print(widen(a[0..]).len, h.items[0])
+        """), "3 9\n")
+
+private acl_cell() -> string
+    raw"""
+    struct Cell[T]
+        item: T
+        got(self) -> T = self.item
+    end Cell
+    val k: [4]int = [1, 2, 3, 4]
+    var r: Cell[[]const int] = Cell(k[0..])
+    """
+end acl_cell
+
+@test("and survives a round trip through a generic container, written or supplied")
+acl_survives_a_generic_container()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(acl_cell() + "print(r.got().len, r.got()[2])"), "4 3\n")
+    acl_refused(acl_cell() + "r.got()[0] = 9", acl_const_write())
+    acl_refused(raw"""
+        val k: [4]int = [1, 2, 3, 4]
+        var o: Option[[]const int] = Some(k[0..])
+        o.unwrap()[0] = 9
+        """, acl_const_write())
+
+@test("while the writable form stored the same way is a different instantiation, and still writes")
+acl_the_writable_form_is_a_different_instantiation()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        struct Cell[T]
+            item: T
+            got(self) -> T = self.item
+        end Cell
+        var a = [1, 2, 3]
+        val k: [4]int = [1, 2, 3, 4]
+        var w: Cell[[]int] = Cell(a[0..])
+        var r: Cell[[]const int] = Cell(k[0..])
+        w.got()[0] = 9
+        print(w.got().len, r.got().len, a[0])
+        """), "3 4 9\n")
+
+// -- an array is a view of itself where a view is asked for ------------------------------------------
+
+@test("at a parameter that may write it, and the write reaches the array")
+acl_at_a_parameter_that_may_write_it()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        fill(s: []int) =
+            for i in 0..<s.len
+                s[i] = int(i) * 2
+        end fill
+        var a: [4]int = [0; 4]
+        fill(a)
+        print(a[0], a[1], a[2], a[3])
+        """), "0 2 4 6\n")
+
+@test("at one that may not, which is what a 'val' array can reach")
+acl_at_one_that_may_not()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        total(xs: []const int) -> int
+            var n = 0
+            for x in xs do n += x
+            n
+        end total
+        val a = [1, 2, 3]
+        print(total(a))
+        """), "6\n")
+
+@test("including a heap array, whose reference is what the view is taken over")
+acl_including_a_heap_array()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("len(xs: []const int) -> usize = xs.len\nval r: &[3]int = [1, 2, 3]\nprint(len(r))\n"), "3\n")
+
+@test("and a binding, a return and a field, which are the other positions that ask")
+acl_a_binding_a_return_and_a_field()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        struct Box
+            xs: [4]int
+        end Box
+        len(xs: []const int) -> usize = xs.len
+        whole() -> []const int
+            val local: [3]int = [7, 8, 9]
+            local
+        end whole
+        val b = Box([1, 2, 3, 4])
+        val v: []const int = b.xs
+        val w = whole()
+        print(v.len, len(b.xs), w[0], w[2])
+        """), "4 4 7 9\n")
+
+@test("the two spellings agree, including where the storage has to outlive the frame")
+acl_the_two_spellings_agree()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        implicitly() -> []const int
+            val local: [3]int = [10, 20, 30]
+            local
+        end implicitly
+        explicitly() -> []const int
+            val local: [3]int = [10, 20, 30]
+            local[..]
+        end explicitly
+        val a = implicitly()
+        val b = explicitly()
+        print(a.len == b.len, a[0] == b[0], a[2] == b[2])
+        """), "true true true\n")
+
+@test("and 'from_utf8_unchecked' is one of the positions that asks, so it takes the bytes as they are")
+acl_from_utf8_unchecked_takes_an_array()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran(raw"""
+        import sysl.text.from_utf8_unchecked
+        val bytes: [3]u8 = [104, 105, 33]
+        print(from_utf8_unchecked(bytes))
+        """), "hi!\n")
+
+@test("a 'val' array is still refused where the view may be written, and told which half is missing")
+acl_a_val_array_is_refused_where_the_view_may_be_written()
+    if !acl_ready() then return
+
+    val out = acl_err("fill(s: []int) = s[0] = 1\nval a = [1, 2, 3]\nfill(a)\n")
+
+    assert(acl_says(out, "error: " + acl_not_a_licence()), out)
+    assert(!acl_says(out, "[3]int was given"), out)
+
+@test("so is one inside a struct whose invariant reads it")
+acl_so_is_one_inside_a_struct_whose_invariant_reads_it()
+    if !acl_ready() then return
+
+    acl_refused(raw"""
+        struct Box
+            xs: [4]int
+
+            invariant xs[0] > 0
+        end Box
+        grab(s: []int) -> usize = s.len
+        var b = Box([1, 2, 3, 4])
+        print(grab(b.xs))
+        """, "error: this view may be written, and it views storage inside Box, whose invariant reads 'xs' — a '[]int' names no Box, so a write through it would break the clause with nothing left to re-check it against. Take it as a '[]const int', which may not write, or make the change through a method")
+
+@test("and a '&sync' array, whose owner's count a view does not record")
+acl_and_a_sync_array()
+    if !acl_ready() then return
+
+    acl_refused("len(xs: []const int) -> usize = xs.len\nval r: &sync [3]int = [1, 2, 3]\nprint(len(r))\n",
+        "error: 'xs' of 'len' is []const int, but &sync [3]int was given")
+
+@test("while an array of other elements is reported as the array it is")
+acl_an_array_of_other_elements()
+    if !acl_ready() then return
+
+    acl_refused("len(xs: []const int) -> usize = xs.len\nvar a: [2]long = [1, 2]\nprint(len(a))\n",
+        "error: 'xs' of 'len' is []const int, but [2]long was given")
+
+// -- array, slice and string answer the same three questions -----------------------------------------
+
+@test("length")
+acl_length()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var a = [1, 2, 3]\nvar s = a[..]\nprint(a.len, s.len, \"abc\".len)\n"), "3 3 3\n")
+
+@test("an index")
+acl_an_index()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var a = [1, 2, 3]\nvar s = a[..]\nprint(a[0], s[0], \"abc\"[0])\n"), "1 1 97\n")
+
+@test("and a slice of themselves")
+acl_and_a_slice_of_themselves()
+    if !acl_ready() then return
+
+    assert_eq(acl_ran("var a = [1, 2, 3]\nvar s = a[..]\nprint(a[1..].len, s[1..].len, \"abcd\"[1..].len)\n"), "2 2 3\n")
+
+@test("but iterating a string directly is refused, since it would have to choose bytes or characters")
+acl_iterating_a_string_directly_is_refused()
+    if !acl_ready() then return
+
+    acl_refused("for c in \"ab\" do print(c)",
+        "error: a string is iterated as 's.bytes' or 's.chars', since a string has bytes and characters both")
