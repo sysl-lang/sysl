@@ -427,7 +427,9 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
        !cx.an.tables.members.alts.has(member_key_of(found.0, name)) then
         return no_such_method(cx, span, receiver, rty, found.0, name, args)
 
-    val chosen = chosen_member(cx, rty, found.0, name, span, args, via)
+    val declaring = core_declaring(name)
+    val provided = declaring.is_some() && core_builtin(declaring.unwrap(), rty)
+    val chosen = chosen_member(cx, rty, found.0, name, span, args, via, provided)
 
     if chosen.is_none() then return bad_expr(span)
 
@@ -827,8 +829,16 @@ end member_func_name
 // rule.
 //
 // Nothing where the name settles nothing, which is what tells the caller to stop.
+//
+// **`provided` says the COMPILER supplies a member of this name for this type as well** -- a candidate
+// with no row in any table, since `5.0.mul(2.0)` is answered by the instruction rather than by a
+// block. It matters only where a block was written for a built-in at *other* arguments: without it
+// that block is the one candidate and takes every call, including the ones the machine has an
+// instruction for. The plain name coming back is what reaches the instruction, nothing being filed
+// under it.
 private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, span: Span,
-                      args: Buf[Expr], via: Buf[string] = no_bound_traits()) -> Option[string]
+                      args: Buf[Expr], via: Buf[string] = no_bound_traits(),
+                      provided: bool = false) -> Option[string]
     val alts = cx.an.tables.members.alts.get(member_key_of(base, mname))
     val subject = type_show(rty)
 
@@ -866,11 +876,13 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
         if member_reachable(cx, base, all.at(i), via) then cands.push(all.at(i))
 
     if cands.is_empty()
+        if provided then return Some(mname)
+
         out_of_scope(cx, span, base, mname, alts.unwrap(), subject)
         return None
     end if
 
-    if cands.len() == 1 then return Some(cands.at(0))
+    if cands.len() == 1 && !provided then return Some(cands.at(0))
 
     var arg_tys: Buf[Option[Type]] = buf()
 
@@ -903,6 +915,10 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
         if member_accepts(cx, rty, base, cands.at(i), arg_tys) then fits.push(cands.at(i))
 
     if fits.len() == 1 then return Some(fits.at(0))
+
+    // No written block takes these arguments and the compiler has a member of this name: that is the
+    // ordinary call the instruction answers.
+    if fits.is_empty() && provided then return Some(mname)
 
     // Nothing has settled it. Which complaint that is depends on what is left standing: several
     // **traits** is a use that reached more than one of them, and no argument could have told those
