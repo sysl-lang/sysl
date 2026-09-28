@@ -265,7 +265,11 @@ end emit_typed_text
 // one `diff` and a disagreement names the line. What this compiler lowers today is the module
 // header and the named types a program's values are stored at; the sections a function body fills
 // are empty, which is what makes the comparison one of a section rather than of a whole.
-emit_llvm_text(path: string, named_target: Option[string]) -> Result[Emitted, Refusal]
+//
+// **The level decides which standard-module archive is resolved** -- the text declares the same
+// symbols at every level, but the archive a later link takes them from is the level's own.
+emit_llvm_text(path: string, named_target: Option[string],
+               level: string = DefaultOptimization) -> Result[Emitted, Refusal]
     val t = target_for(path, named_target)?
     val program = packaged_compilation_of(path, t)?
     val done = analyze_bodies(program.units, program.target)
@@ -297,7 +301,7 @@ emit_llvm_text(path: string, named_target: Option[string]) -> Result[Emitted, Re
     var linked = StdArtifact(buf(), "")
 
     if t.builds_with_clang() && !std_from_source()
-        linked = std_artifact(t) match
+        linked = std_artifact(t, level) match
             Err(why) -> return Err(Refusal(why))
             Ok(found) -> found
 
@@ -492,7 +496,7 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
     // describe the last step rather than the first.
     if !t.builds_with_clang() then return Err(Said(Refusal(t.no_toolchain())))
 
-    val emitted = emit_llvm_text(path, named_target).map_err(said)?
+    val emitted = emit_llvm_text(path, named_target, level).map_err(said)?
 
     if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
 
@@ -756,7 +760,7 @@ private link_lowered_text(path: string, text: string, t: Target, cc: Option[stri
     // **Nor where the build was told to compile it from source** (`--no-std-lib`): its bodies are in
     // the text too, and its C is among the objects above.
     if !standalone && !std_from_source()
-        std_artifact(t) match
+        std_artifact(t, level) match
             Err(why) ->
                 discard_objects(objects)
                 return Err(Refusal(why))
@@ -798,7 +802,7 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
             None -> ()
         None -> ()
 
-    val emitted = emit_llvm_text(path, named_target).map_err(said)?
+    val emitted = emit_llvm_text(path, named_target, level).map_err(said)?
 
     if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
 
@@ -900,13 +904,13 @@ build_library_of(path: string, named_target: Option[string], out: Option[string]
         Ok(where) -> Ok(where)
 end build_library_of
 
-build_std_artifact_of(path: string, named_target: Option[string],
-                      out: Option[string]) -> Result[string, Refusal]
+build_std_artifact_of(path: string, named_target: Option[string], out: Option[string],
+                      level: string = DefaultOptimization) -> Result[string, Refusal]
     val t = target_for(path, named_target)?
 
     if !t.builds_with_clang() then return Err(Refusal(t.no_toolchain()))
 
-    build_std_library(path, t, out) match
+    build_std_library(path, t, out, level) match
         Err(why) -> Err(Refusal(why))
         Ok(where) -> Ok(where)
 end build_std_artifact_of
@@ -958,10 +962,11 @@ end TestBuild
 //
 // The analysis in front of it is the analysis every other build gets, and that is deliberate: a test
 // is code somebody wrote and is held to the same rules.
-test_build_of(path: string, named_target: Option[string]) -> Result[TestBuild, Refusal]
+test_build_of(path: string, named_target: Option[string],
+              level: string = DefaultOptimization) -> Result[TestBuild, Refusal]
     val t = test_target_of(path, named_target)?
 
-    test_build_from(packaged_compilation_of(path, t)?, false)
+    test_build_from(packaged_compilation_of(path, t)?, false, level)
 end test_build_of
 
 // The same for a tree that **is** the standard module (`sysl test <root> --std`), which is how the
@@ -970,7 +975,7 @@ end test_build_of
 std_test_build_of(path: string, named_target: Option[string]) -> Result[TestBuild, Refusal]
     val t = test_target_of(path, named_target)?
 
-    test_build_from(std_compilation_of(path, t)?, true)
+    test_build_from(std_compilation_of(path, t)?, true, DefaultOptimization)
 end std_test_build_of
 
 // What both ask of the machine before anything is read: it has to be this one, because a test run
@@ -986,7 +991,8 @@ private test_target_of(path: string, named_target: Option[string]) -> Result[Tar
     Ok(t)
 end test_target_of
 
-private test_build_from(program: Compilation, standalone: bool) -> Result[TestBuild, Refusal]
+private test_build_from(program: Compilation, standalone: bool,
+                        level: string) -> Result[TestBuild, Refusal]
     val t = program.target
 
     // **Every body the library declares is typed when the library is what is being built**, not only
@@ -1003,7 +1009,7 @@ private test_build_from(program: Compilation, standalone: bool) -> Result[TestBu
     var precompiled: Buf[string] = buf()
 
     if !standalone && !std_from_source()
-        precompiled = std_artifact(t) match
+        precompiled = std_artifact(t, level) match
             Err(why) -> return Err(Refusal(why))
             Ok(found) -> found.precompiled
 
