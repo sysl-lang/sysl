@@ -359,7 +359,8 @@ end subject_named
 
 // `value.member(args)` -- a call, which is what the parentheses said.
 call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr],
-            expected: Option[Type], via: Buf[string] = no_bound_traits()) -> TExpr
+            expected: Option[Type], via: Buf[string] = no_bound_traits(),
+            targs: Buf[Expr] = no_written_members()) -> TExpr
     val rty = receiver_type(texpr_type(receiver))
 
     if rty == Unknown then return bad_expr(span)
@@ -383,13 +384,13 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
 
                 TExpr(span, TFromBytes(TExpr(span, TBytes(receiver))))
             else if claims_lanes(cx, rty, name) then cx.err(span, no_lanes_in_a_string(name))
-            else call_declared(cx, span, receiver, rty, name, args, expected, via)
+            else call_declared(cx, span, receiver, rty, name, args, expected, via, targs)
 
         // The vector's own methods, which are the compiler's for the reason the intrinsic table is
         // closed: each is one LLVM operation and none of them can be written in sysl.
         Vector(_, _) ->
             if is_vector_method(name) then vector_method(cx, span, rty, receiver, name, args)
-            else call_declared(cx, span, receiver, rty, name, args, expected, via)
+            else call_declared(cx, span, receiver, rty, name, args, expected, via, targs)
 
         // The two that move lanes between a register and memory. They are the slice's rather than
         // the vector's because the receiver is what supplies the address and the length -- a vector
@@ -397,11 +398,11 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
         Array(_, _) ->
             if claims_lanes(cx, rty, name) then
                 vector_memory(cx, span, rty, auto_deref(cx, receiver), name, args, expected)
-            else call_declared(cx, span, receiver, rty, name, args, expected, via)
+            else call_declared(cx, span, receiver, rty, name, args, expected, via, targs)
         Slice(_, _) ->
             if claims_lanes(cx, rty, name) then
                 vector_memory(cx, span, rty, auto_deref(cx, receiver), name, args, expected)
-            else call_declared(cx, span, receiver, rty, name, args, expected, via)
+            else call_declared(cx, span, receiver, rty, name, args, expected, via, targs)
         _ ->
             // A `*T` is a bare address, and the unchecked tier is where a program that has one
             // already is. What it does not have is a length, so there is nothing for a run to be
@@ -412,13 +413,14 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
                 cx.err(span, s"a '${type_show(texpr_type(receiver))}' carries no length, so a run " +
                        "of its elements has nothing to be checked against — take a slice of them " +
                        "first, with 'p[0..<n]'")
-            else call_declared(cx, span, receiver, rty, name, args, expected, via)
+            else call_declared(cx, span, receiver, rty, name, args, expected, via, targs)
 end call_member
 
 // A member the tables hold, called.
 private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string,
                       args: Buf[Expr], expected: Option[Type],
-                      via: Buf[string] = no_bound_traits()) -> TExpr
+                      via: Buf[string] = no_bound_traits(),
+                      targs: Buf[Expr] = no_written_members()) -> TExpr
     val found = member_key(cx.an, rty, name)
 
     if !has_member_at(cx.an, found.0, name) &&
@@ -453,7 +455,15 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
 
     if generic.is_some() && generic.unwrap().tparams.len() > found.1.len() then
         return call_generic_member(cx, span, receiver, rty, found.0, decl, generic.unwrap(),
-                                   found.1, args, expected, name)
+                                   found.1, args, expected, name, targs)
+
+    // A list written on a member that has no parameters for it. The receiver's arguments are not
+    // among them -- they are the *type*'s, settled by the value in hand -- so this is the member's
+    // own emptiness rather than the type's.
+    if !targs.is_empty() then
+        return cx.err(span, s"'${chosen.unwrap()}' is not generic, so it has no type arguments to " +
+                      s"write — the call is '$name(…)'. The arguments of ${type_show(rty)} are the " +
+                      "receiver's and are already settled by the value it is read off")
 
     member_dispatch(cx, span, receiver, rty, found.0, chosen.unwrap(), decl, args, expected, name,
                     via)
@@ -470,8 +480,24 @@ end call_declared
 // for, so the substitution needs to know nothing about which parameter came from where.
 private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, base: string,
                             m: MethodDecl, fd: FuncDecl, owner_args: Buf[Type], args: Buf[Expr],
-                            expected: Option[Type], written: string) -> TExpr
+                            expected: Option[Type], written: string, targs: Buf[Expr]) -> TExpr
     val shown = member_subject(cx, rty, source_member_name(m.name))
+
+    // **Only the member's own parameters are written**, and a bare arrow among them is the sugar's
+    // rather than the author's -- so `map[U](f: T -> U)` is written `map[int]`, and the callable's
+    // own parameter goes on being read off the closure.
+    val mine = authored_tparams(m.tparams)
+
+    if !targs.is_empty() && mine.len() != targs.len() then
+        return cx.err(span, s"'${source_member_name(m.name)}' takes " +
+                      s"${quantity(mine.len(), "type argument")} (${quoted_names(mine)}), and " +
+                      s"${targs.len()} ${if targs.len() == 1 then "was" else "were"} written")
+
+    var written_args: Buf[Type] = buf()
+
+    for i in 0..<targs.len()
+        written_args.push(written_type_arg(cx, targs.at(i)))
+
     val home = cx.an.tables.members.generic_scope.get(fd.name).unwrap_or(cx.scope)
     val slots = bind_member_args(cx, span, shown, m, args)
 
@@ -492,15 +518,26 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Typ
     for i in 0..<owner_args.len()
         if i < fd.tparams.len() then seed.push(Binding(fd.tparams.at(i), owner_args.at(i)))
 
+    // What the list wrote settles its parameters outright, the solve below being what it replaces
+    // rather than something it is checked against.
+    var answered: Buf[Binding] = buf()
+
+    for i in 0..<seed.len()
+        answered.push(seed.at(i))
+
+    for i in 0..<written_args.len()
+        answered.push(Binding(mine.at(i), written_args.at(i)))
+
     val prov = provisional_of(cx, span, home, m.tparams, tail, fd.ret_type, m.bounds, slots.unwrap(),
-                              seed, expected)
+                              answered, expected)
     var param_refs: Buf[TypeRef] = buf()
 
     for i in 0..<tail.len()
         param_refs.push(tail.at(i).typ)
 
-    val own = solve(cx.an, home, span, fd.name, m.tparams, param_refs, prov.tys, fd.ret_type,
-                    expected, prov.soft, m.bounds, seed)
+    val own = if !written_args.is_empty() && mine.len() == m.tparams.len() then written_args
+    else solve(cx.an, home, span, fd.name, m.tparams, param_refs, prov.tys, fd.ret_type, expected,
+               prov.soft, m.bounds, answered)
 
     // The member's own bounds, checked with the receiver's arguments to hand. Reading the whole
     // lowered signature's bounds here would sweep the type's own in as well and report anything
@@ -731,6 +768,7 @@ build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
                 cx.fault(span, "'*self' needs a variable, field, or dereference to point at — this " +
                          "receiver has no address")
 
+            refuse_written_once_receiver(cx, span, place, member)
             TExpr(span, TAddrOf(place, Ptr(texpr_type(place))))
     ByRef(sync) -> texpr_type(tr) match
         Ref(_, _) -> tr
@@ -1082,6 +1120,29 @@ end bound_traits
 
 // No bound at all, named so that a default argument can say which kind of run of names it means.
 no_bound_traits() -> Buf[string] = buf()
+
+// No written type-argument list, which is what nearly every member call has.
+no_written_members() -> Buf[Expr] = buf()
+
+// Whether `recv.name[…]` names a METHOD, which is what lets its brackets be a type-argument list:
+// `x.handlers[i](…)` is a field holding a table of callables, indexed and called, so the receiver is
+// read -- a reading thrown away -- and asked whether it declares a method of that name. A field wins,
+// being what the subscript would have been reaching into.
+method_written(cx: &Analyzer, recv: Expr, name: string) -> bool
+    val t = sandboxed_arg(cx, recv, None)
+    val rty = receiver_type(texpr_type(t))
+
+    rty match
+        Unknown -> return false
+        Abstract(_, _) -> return false
+        Trait(_, _, _) -> return false
+        Weak(_) -> return false
+        _ -> ()
+
+    val m = member_at(cx.an, member_key(cx.an, rty, name).0, name)
+
+    m.is_some() && m.unwrap().recv_mode().is_some()
+end method_written
 
 // Whether a member the reader named is one their file may reach.
 private check_member_visible(cx: &Analyzer, span: Span, base: string, filed: string, m: MethodDecl,

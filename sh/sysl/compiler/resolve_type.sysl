@@ -49,9 +49,9 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     NamedType(name, args) -> resolve_named(a, scope, t.span, name, args, subst)
     // **A hop is what makes a cycle finite**, so the four forms that point rather than hold are
     // counted -- and the count is what a type reached again is judged against.
-    PtrType(inner) -> Ptr(under_indirection(a, () -> resolve_type(a, scope, inner, subst)))
+    PtrType(inner) -> Ptr(under_indirection(a, () -> resolve_pointee(a, scope, inner, subst)))
     RefType(inner, sync) -> resolve_ref(a, scope, inner, sync, subst)
-    WeakType(inner) -> Weak(under_indirection(a, () -> resolve_type(a, scope, inner, subst)))
+    WeakType(inner) -> Weak(under_indirection(a, () -> resolve_pointee(a, scope, inner, subst)))
     VolatileType(inner) -> Volatile(resolve_type(a, scope, inner, subst))
     ArrayType(length, elem, read_only) ->
         resolve_array(a, scope, t.span, length, elem, read_only, subst)
@@ -61,7 +61,7 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     PackType(name) -> bound_type(subst, name).unwrap_or(Pack(buf()))
     CFnType(params, ret) ->
         CFn(resolve_list(a, scope, params, subst), resolve_type(a, scope, ret, subst))
-    FnType(params, ret, bare) -> resolve_fn_trait(a, scope, t.span, params, ret, bare, subst)
+    FnType(params, ret, bare) -> resolve_unboxed_callable(a, scope, t, params, ret, bare, subst)
     SomeType(_) -> Unknown
     // `T::Item` -- the associated type, which the member tables are what answer. It resolves like
     // anything else the moment the subject is known: the subject is resolved first, and a parameter
@@ -75,7 +75,7 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
 // formability is asked about.
 private resolve_ref(a: &Analysis, scope: Scope, inner: TypeRef, sync: bool,
                     subst: Buf[Binding]) -> Type
-    val ty = under_indirection(a, () -> resolve_type(a, scope, inner, subst))
+    val ty = under_indirection(a, () -> resolve_pointee(a, scope, inner, subst))
 
     ty match
         Trait(key, _, _) ->
@@ -425,6 +425,29 @@ private bare_arrow_show(args: Buf[Type]) -> string
 
     s"$out) -> $ret"
 end bare_arrow_show
+
+// What stands behind a mode -- `&`, `*` or `weak` -- which is the one place a callable is a type: the
+// trait object of the call trait, whichever of the two spellings wrote it.
+private resolve_pointee(a: &Analysis, scope: Scope, inner: TypeRef, subst: Buf[Binding]) -> Type =
+    *inner.kind match
+        FnType(params, ret, _) -> resolve_fn_trait(a, scope, inner.span, params, ret, false, subst)
+        _ -> resolve_type(a, scope, inner, subst)
+
+// **A callable is not a type: it is a trait**, and a trait stands where a type does only behind a
+// mode. The bare arrow is a parameter's sugar and has a refusal of its own; `Fn(…) -> r` written
+// where a concrete type is required names the box it should have been.
+private resolve_unboxed_callable(a: &Analysis, scope: Scope, t: TypeRef, params: Buf[TypeRef],
+                                 ret: TypeRef, bare: bool, subst: Buf[Binding]) -> Type
+    val made = resolve_fn_trait(a, scope, t.span, params, ret, bare, subst)
+
+    if bare || made == Unknown then return made
+
+    val written = type_text(t)
+
+    a.fault(scope, t.span, s"'$written' is a trait, and a trait is a type only behind a mode — " +
+            s"write '&$written' for the boxed callable a concrete slot takes")
+    Unknown
+end resolve_unboxed_callable
 
 // A written `Fn(a, b) -> r` is the callable trait of that arity, its arguments the parameters with
 // the result last.

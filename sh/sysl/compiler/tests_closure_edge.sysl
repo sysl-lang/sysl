@@ -112,6 +112,31 @@ private ce_err_of(module_text: string, main_text: string) -> string
     out
 end ce_err_of
 
+// What a program of two files prints: one module beside the beginning.
+private ce_ran_of(module_text: string, main_text: string) -> string
+    val root = make_temp_dir("sysl-closure").unwrap()
+
+    make_dir_all(s"$root/m").unwrap()
+    write_text(s"$root/m/m.sysl", module_text).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ce_ran_of
+
 // The LLVM text of a program that must compile.
 private ce_ir(text: string) -> string
     val root = make_temp_dir("sysl-closure").unwrap()
@@ -982,14 +1007,40 @@ ce_a_module_level_val_cannot_hold_one()
 
     assert(ce_says(said, "a module-level 'val' states its type"), said)
 
-@test("and one that names its type cannot reach module storage from there")
-ce_one_that_names_its_type_cannot_reach_module_storage()
+// One that names its type reaches module storage as any function does -- by name, not by capture,
+// since module storage is not a binding of any block. What it writes is the module's `var`, which is
+// writable storage, so nothing here aims a store at a `constant`.
+@test("and one that names its type reaches module storage by name, which is writable")
+ce_one_that_names_its_type_reaches_module_storage()
+    if !ce_ready() then return
+
+    val counter = raw"""
+        struct Counter
+            n: int
+
+            bump(*self) -> int
+                self.n += 1
+                self.n
+
+        private var c: Counter = Counter(0)
+
+        peek() -> int = c.n
+
+        """
+
+    assert_eq(ce_ran_of("module m\n\n" + counter + "val tick: &Fn() -> int = () -> c.bump()\n",
+        "print(m.tick(), m.tick(), m.peek())\n"), "1 2 2\n")
+
+// Untyped, the module `var` is refused for the type it did not state, and for nothing after it.
+@test("while an untyped one is refused for its type alone")
+ce_an_untyped_one_is_refused_for_its_type_alone()
     if !ce_ready() then return
 
     val said = ce_err_of("module m\n\n" + ce_counter() +
         "val tick: &Fn() -> int = () -> c.bump()\n", "print(m.tick())\n")
 
-    assert(ce_says(said, "undefined name 'c'"), said)
+    assert(ce_says(said, "'c' is module storage, and module storage states its type"), said)
+    assert(!ce_says(said, "undefined name"), said)
 
 // -- how a call on one goes wrong -----------------------------------------------------------------
 
@@ -1654,3 +1705,161 @@ ce_an_ordinary_instantiation_keeps_its_linkage()
             assert(!line.starts_with("define internal") && !line.starts_with("define private"), line)
 
     assert_eq(found, 1)
+
+// -- a `*self` receiver is an `&` the caller did not write -----------------------------------------
+//
+// The refusal the closure case above rides on, asked of every kind of storage that is written once.
+// Each message is the reference's own.
+
+private ce_bumper() -> string = raw"""
+    struct C
+        n: int
+
+        bump(*self) -> int
+            self.n += 1
+            self.n
+
+    """
+
+@test("a '*self' method on a 'val' is refused, naming the binding")
+ce_a_self_method_on_a_val_is_refused()
+    if !ce_ready() then return
+
+    val said = ce_err(ce_bumper() + "val c = C(0)\nprint(c.bump())\n")
+
+    assert(ce_says(said, "'bump' takes '*self', so it writes through what it is called on, and a " +
+                         "'val' is written once — write 'var c' if it is meant to change"), said)
+
+@test("and on an element of a 'val' array, which is the binding's own storage")
+ce_on_an_element_of_a_val_array()
+    if !ce_ready() then return
+
+    val said = ce_err(ce_bumper() + "val arr = [C(5)]\nprint(arr[0].bump())\n")
+
+    assert(ce_says(said, "a 'val' is written once — write 'var' if it is meant to change"), said)
+
+@test("and on module storage bound by a 'val'")
+ce_on_a_module_val()
+    if !ce_ready() then return
+
+    val said = ce_err(ce_bumper() + "static val g: C = C(1)\nprint(g.bump())\n")
+
+    assert(ce_says(said, "a 'val' is written once — write 'var' if it is meant to change"), said)
+
+@test("and on a pattern binding, which holds a copy")
+ce_on_a_pattern_binding()
+    if !ce_ready() then return
+
+    val said = ce_err(ce_bumper() + "enum E\n    A(c: C)\n\nvar e = E.A(C(1))\n\ne match\n" +
+                      "    A(c) -> print(c.bump())\n")
+
+    assert(ce_says(said, "a pattern binding holds a copy of what it matched, so the write would " +
+                         "reach that copy rather than the value it came from"), said)
+
+@test("while a 'var', a loop variable and a parameter copy are called on")
+ce_a_var_and_a_parameter_are_called_on()
+    if !ce_ready() then return
+
+    assert_eq(ce_ran(ce_bumper() + "var c = C(0)\nprint(c.bump())\n\nf(k: C) -> int = k.bump()\n\n" +
+                     "print(f(C(1)))\n"), "1\n2\n")
+
+@test("a closure that only reads its captures is called on a 'val'")
+ce_a_reading_closure_on_a_val()
+    if !ce_ready() then return
+
+    assert_eq(ce_ran("var n = 0\nval peek = () -> n + 1\nprint(peek())\n"), "1\n")
+
+// -- a module-level binding states its type ---------------------------------------------------------
+
+@test("a module 'var' with no type is refused for its type alone")
+ce_a_module_var_states_its_type()
+    if !ce_ready() then return
+
+    val said = ce_err_of("module m\n\nvar count = 0\n\nget() -> int = count\n", "print(m.get())\n")
+
+    assert(ce_says(said, "'count' is module storage, and module storage states its type — write " +
+                         "'count: T'"), said)
+    assert(!ce_says(said, "undefined name"), said)
+
+@test("a module 'val' with no type is refused")
+ce_a_module_val_states_its_type()
+    if !ce_ready() then return
+
+    val said = ce_err_of("module m\n\nval limit = 3\n", "print(m.limit)\n")
+
+    assert(ce_says(said, "a module-level 'val' states its type, so 'limit' needs one — " +
+                         "'val limit: T = …'"), said)
+
+// -- a written type-argument list on a method -------------------------------------------------------
+
+private ce_wrap() -> string = raw"""
+    struct Wrap
+        v: int
+
+        mapped[U](self, f: int -> U) -> U = f(self.v)
+
+        get(self) -> int = self.v
+
+        conv[U](self) -> U = U(self.v)
+
+    """
+
+@test("a method's list is counted against the parameters it declared")
+ce_a_methods_list_is_counted()
+    if !ce_ready() then return
+
+    val said = ce_err(ce_wrap() + "print(Wrap(5).mapped[int, int](n -> n * 3))\n")
+
+    assert(ce_says(said, "'mapped' takes 1 type argument ('U'), and 2 were written"), said)
+
+@test("a method with no parameters of its own takes no list")
+ce_a_plain_method_takes_no_list()
+    if !ce_ready() then return
+
+    val said = ce_err(ce_wrap() + "print(Wrap(5).get[int]())\n")
+
+    assert(ce_says(said, "'get' is not generic, so it has no type arguments to write — the call is " +
+                         "'get(…)'. The arguments of Wrap are the receiver's and are already " +
+                         "settled by the value it is read off"), said)
+
+@test("a list that is the whole answer settles the call outright")
+ce_a_list_settles_the_call()
+    if !ce_ready() then return
+
+    assert_eq(ce_ran(ce_wrap() + "print(Wrap(5).conv[i8]())\n"), "5\n")
+
+@test("a field holding callables is still indexed, not read as a list")
+ce_a_field_of_callables_is_indexed()
+    if !ce_ready() then return
+
+    assert_eq(ce_ran(raw"""
+        struct Bag
+            fs: [1]&Fn(int) -> int
+
+        val bag = Bag([x -> x + 1])
+        val i = 0
+
+        print(bag.fs[i](3))
+        """), "4\n")
+
+// -- an extern where a callable is not wanted -------------------------------------------------------
+
+@test("an extern named where nothing wants a callable says what is missing")
+ce_an_extern_named_bare()
+    if !ce_ready() then return
+
+    val said = ce_err("extern \"abs\" c_abs(x: i32) -> i32\n\nval g = c_abs\nprint(1)\n")
+
+    assert(ce_says(said, "'c_abs' is a function, and a function becomes a value only where a " +
+                         "callable is wanted"), said)
+
+// -- a type the position refused -----------------------------------------------------------------
+
+@test("a closure at a declaration whose type was refused says nothing more")
+ce_a_closure_at_a_refused_type()
+    if !ce_ready() then return
+
+    val said = ce_err("var f: Nope = x -> x\n")
+
+    assert(ce_says(said, "unknown type 'Nope'"), said)
+    assert(!ce_says(said, "has no type here"), said)
