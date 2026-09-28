@@ -1,0 +1,62 @@
+module sh.sysl.compiler
+
+import sysl.fs.{is_dir, remove_dir_all, remove_file, rename, write_text, IoError}
+
+// How a file reaches the cache: **written under a name nobody reads, then renamed onto the one they
+// do.**
+//
+// Everything under the cache directory is shared by every compilation on the machine at once -- two
+// suites in two worktrees, a suite and the reference it is being compared against -- and a reader
+// holds no lock. A file written in place is, for as long as the write takes, half a file under the
+// name a reader trusts: a test binary another run is about to start, a test list that decodes to
+// fewer tests than the binary carries, a package that is half its tree. `rename(2)` within one
+// directory replaces the name in one step, so a reader sees the whole of the old file or the whole of
+// the new one, and a reader that already opened the old one keeps reading it.
+//
+// **Two writers of one entry both succeed, and the second one wins.** An entry is a function of its
+// key, so what the loser wrote is what the winner wrote, and losing costs the work and nothing else.
+
+// A count of the pending names this process has minted, so that two in one process differ as well.
+private var pending_minted: u64 = 0
+
+// `sysl.process` deliberately carries no pid, so the one this needs is asked of the C library.
+private extern "getpid" c_getpid() -> int
+
+// A name for `dest` to be written under before it is published: in the same directory, since a
+// rename is only atomic within one filesystem, and unique to this process and this call, since two
+// writers agreeing on a pending name would publish one another's half-written file.
+pending_name(dest: string) -> string
+    pending_minted += 1
+    s"$dest.pending-${c_getpid()}-$pending_minted"
+end pending_name
+
+// A finished file put where it is read. **A failure leaves nothing behind**: the pending file is
+// removed, so a cache never fills up with the names of writes that went wrong.
+publish_file(pending: string, dest: string) -> Result[unit, IoError] = rename(pending, dest) match
+    Ok(_) -> Ok(())
+    Err(e) ->
+        remove_file(pending).unwrap_or(())
+        Err(e)
+
+// Text written to a pending name and published over `dest`.
+publish_text(dest: string, text: string) -> Result[unit, IoError]
+    val pending = pending_name(dest)
+
+    write_text(pending, text) match
+        Ok(_) -> publish_file(pending, dest)
+        Err(e) ->
+            remove_file(pending).unwrap_or(())
+            Err(e)
+end publish_text
+
+// A finished directory put where it is read.
+//
+// **A directory cannot be renamed over one that holds anything**, so a writer that arrives second is
+// refused -- and that refusal is the harmless case above rather than a failure: the entry is there,
+// whole, put there by whoever won. What this writer made is removed and the answer is the same as if
+// it had won. Only a rename that failed with nothing at `dest` is a failure.
+publish_dir(pending: string, dest: string) -> Result[unit, IoError] = rename(pending, dest) match
+    Ok(_) -> Ok(())
+    Err(e) ->
+        remove_dir_all(pending).unwrap_or(())
+        if is_dir(dest) then Ok(()) else Err(e)

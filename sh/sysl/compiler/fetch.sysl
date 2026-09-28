@@ -1,8 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{cache_dir, is_dir, is_file, make_dir_all, read_text, remove_dir_all, rename,
-                write_text}
+import sysl.fs.{cache_dir, is_dir, is_file, make_dir_all, read_text, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.Search
 
@@ -109,14 +108,17 @@ end verify_cached
 // that is half a package: an interrupted fetch leaves the partial one, which is refused on the next
 // run rather than compiled. It is a sibling rather than a temporary somewhere else so that the move
 // is a rename within one filesystem instead of a copy that can fail halfway.
+//
+// **The sibling's name is this fetch's own** (`pending_name`): two builds fetching one package at once
+// would otherwise clone into one directory, each removing the other's half. Both finish, one rename
+// wins, and the other finds the package already there -- the same tag, so the same tree.
 private clone_at_tag(dep: &Dependency, coordinate: string, version: Release, dir: string,
                      sums: &Sums) -> Result[string, string]
-    val partial = s"$dir.partial"
+    val partial = pending_name(dir)
     val url = clone_url(coordinate)
     val tag = release_tag(version)
 
     make_dir_all(parent_of(dir).unwrap_or(".")).unwrap_or(())
-    remove_dir_all(partial).unwrap_or(())
     eprints(s"fetching $coordinate $tag\n")
 
     // `--depth 1` at the tag: a package is read at one version and its history is not part of what
@@ -148,11 +150,10 @@ private clone_at_tag(dep: &Dependency, coordinate: string, version: Release, dir
                 remove_dir_all(partial).unwrap_or(())
                 return Err(hash_mismatch(dep, coordinate, version, want, hash))
 
-    write_text(s"$dir.hash", s"$hash\n").unwrap_or(())
+    publish_text(s"$dir.hash", s"$hash\n").unwrap_or(())
 
-    rename(partial, dir) match
+    publish_dir(partial, dir) match
         Err(_) ->
-            remove_dir_all(partial).unwrap_or(())
             return Err(s"cannot fetch $coordinate $tag: what was cloned could not be moved into " +
                 s"'$dir'")
         Ok(_) -> ()

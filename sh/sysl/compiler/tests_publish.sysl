@@ -1,0 +1,77 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{entries, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.text.Search
+
+// **What a cache writer is held to is that a reader never sees a partial file**, and that is a claim
+// about names: the bytes go to a pending name nobody reads and reach the trusted one in one rename.
+// Two processes racing for one entry cannot be staged deterministically from inside one test, so
+// what is asserted is the contract the race depends on -- a pending name is beside its file and
+// unique, a publish leaves the whole file and nothing else, and the loser of a directory race
+// succeeds without disturbing the winner.
+
+private scratch() -> string = make_temp_dir("atc-").unwrap()
+
+@test("atc: a pending name sits beside its file, and no two are the same")
+atc_a_pending_name_is_beside_its_file_and_unique()
+    val a = pending_name("/x/y/std.syslib")
+    val b = pending_name("/x/y/std.syslib")
+
+    assert(a != b, s"'$a' twice")
+    assert(a.starts_with("/x/y/std.syslib."), s"'$a' is in the file's own directory")
+    assert(parent_of(a).unwrap_or("") == "/x/y", s"'$a' has the file's parent")
+
+@test("atc: a published file is whole and nothing else is left in its directory")
+atc_a_published_file_leaves_no_pending_name()
+    val dir = scratch()
+    val dest = join_path(dir, "entry.tests")
+
+    assert(publish_text(dest, "one\ntwo\n").is_ok(), "the publish succeeds")
+    assert_eq(read_text(dest).unwrap_or(""), "one\ntwo\n")
+
+    val names = entries(dir).unwrap()
+
+    assert_eq(names.len(), 1)
+    assert_eq(names.at(0), "entry.tests")
+    remove_dir_all(dir).unwrap_or(())
+
+@test("atc: publishing over an existing entry replaces it whole")
+atc_a_publish_replaces_what_was_there()
+    val dir = scratch()
+    val dest = join_path(dir, "entry")
+
+    write_text(dest, "an older and much longer entry than the one replacing it\n").unwrap()
+
+    assert(publish_text(dest, "new\n").is_ok(), "the publish succeeds")
+    assert_eq(read_text(dest).unwrap_or(""), "new\n")
+    assert_eq(entries(dir).unwrap().len(), 1)
+    remove_dir_all(dir).unwrap_or(())
+
+@test("atc: a publish that cannot land leaves no pending file behind")
+atc_a_failed_publish_leaves_nothing()
+    val dir = scratch()
+    val dest = join_path(join_path(dir, "missing"), "entry")
+
+    assert(publish_text(dest, "x").is_err(), "a directory that is not there refuses the write")
+    assert_eq(entries(dir).unwrap().len(), 0)
+    remove_dir_all(dir).unwrap_or(())
+
+@test("atc: the second writer of a directory entry succeeds and leaves the first one's alone")
+atc_the_loser_of_a_directory_race_is_harmless()
+    val dir = scratch()
+    val dest = join_path(dir, "@v1.0.0")
+    val first = pending_name(dest)
+    val second = pending_name(dest)
+
+    make_dir_all(first).unwrap()
+    write_text(join_path(first, "who"), "first").unwrap()
+    make_dir_all(second).unwrap()
+    write_text(join_path(second, "who"), "second").unwrap()
+
+    assert(publish_dir(first, dest).is_ok(), "the first publish succeeds")
+    assert(publish_dir(second, dest).is_ok(), "the second finds the entry there and succeeds too")
+    assert_eq(read_text(join_path(dest, "who")).unwrap_or(""), "first")
+    assert(!is_dir(second), "the loser's copy is removed")
+    assert_eq(entries(dir).unwrap().len(), 1)
+    remove_dir_all(dir).unwrap_or(())

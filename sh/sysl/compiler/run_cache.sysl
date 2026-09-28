@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.env.get as env_var
 import sysl.seq.Sequence
-import sysl.fs.{entries, is_file, make_dir_all, metadata, read_text, remove_file, write_text}
+import sysl.fs.{entries, is_file, make_dir_all, metadata, read_text, remove_file}
 import sysl.text.{from_utf8_unchecked, join, split, str_builder, StrBuilder}
 
 // The executable `sysl run` and `sysl test` built last time, kept so that running the same tree
@@ -252,9 +252,9 @@ run_cache_hit(key: string) -> Option[string] = run_cache_slot(key) match
 // Where to link, for a build that is about to happen: a path in the cache with the directory already
 // made, or nothing where there is no cache to write into.
 //
-// **The build links straight into the slot** rather than to a temporary that is copied afterwards. A
-// copy would have to reproduce the executable bit, which is one more thing to get wrong per platform;
-// linking there gets it from the linker.
+// **The build links beside the slot and renames onto it** (`link_into_cache`), rather than into the
+// slot itself -- another run may be starting the binary already there -- or into a temporary copied
+// afterwards, which would have to reproduce the executable bit. A rename keeps the linker's mode.
 run_cache_reserve(key: string) -> Option[string]
     val path = run_cache_slot(key) match
         Some(p) -> p
@@ -284,9 +284,12 @@ run_cache_tests(key: string) -> Option[string] = run_cache_slot(key) match
 
 // The list written beside the binary. A write that fails is not a failure of the build: the worst it
 // costs is the next run's compile.
+//
+// **Published, never written in place**: a list read half-written decodes, at a line boundary, to a
+// shorter list, and a suite reporting fewer tests than it has is a silent failure.
 write_test_list(key: string, tests: Buf[TTest])
     run_cache_tests(key) match
-        Some(path) -> write_text(path, encode_test_list(tests)).unwrap_or(())
+        Some(path) -> publish_text(path, encode_test_list(tests)).unwrap_or(())
         None -> ()
 
 // The list read back, or nothing where there is none or it will not read -- which is a rebuild.
