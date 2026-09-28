@@ -311,6 +311,8 @@ record_capabilities(a: &Analysis, units: Buf[Program])
 
         seen.push(module_name)
 
+        if supplied_unit(a, units.at(i)) then a.tables.supplied_modules.push(module_name)
+
         val shipped = first_file_of(units, module_name, false)
         val scaffolding = first_file_of(units, module_name, true)
 
@@ -351,8 +353,35 @@ private record_module(a: &Analysis, module_name: string, u: Program)
         for j in 0..<spread.len()
             c.direction match
                 Narrows -> a.tables.module_narrows.push((module_name, spread.at(j)))
-                Requires -> a.tables.module_requires.push((module_name, spread.at(j)))
+                Requires ->
+                    a.tables.module_requires.push((module_name, spread.at(j)))
+                    unmet_by_target(a, module_name, u, c, spread.at(j))
 end record_module
+
+// Whether a file is one the program's author did not write: the standard module's, or one a
+// library or a package handed over.
+private supplied_unit(a: &Analysis, u: Program) -> bool =
+    u.pkg.supplied || from_library(a, scope_of_unit(a, u))
+
+// Refuses a module's requirement the machine does not meet, at the clause that states it.
+//
+// **What writing `requires` buys is this one clean error**, naming the module, the capability and
+// the machine, where otherwise the build would fail somewhere inside whatever the module reached.
+// Only the program's own modules are asked -- a library's clause is its author's -- and only a file
+// that ships: a `@tests` file is analyzed and then dropped, so a requirement checked there would
+// refuse a build over a facility only the discarded file wanted.
+private unmet_by_target(a: &Analysis, module_name: string, u: Program, c: CapabilityClause,
+                        cap: string)
+    if !a.tables.target.lacks_capability(cap) then return
+    if supplied_unit(a, u) then return
+
+    val who = if module_name == ModuleRoot then "this module" else s"'$module_name'"
+
+    a.fault(scope_of_unit(a, u), c.span,
+            s"$who requires '$cap', and '${a.tables.target.name}' does not provide it — a " +
+            "target's capabilities are what 'package.hocon' declares, so either the module cannot " +
+            "be built for this machine or the config is understating it")
+end unmet_by_target
 
 // The tests' set is the module's own with the scaffolding's changes folded in, per capability: a
 // `@tests` file writing no clause records the module's, one that requires a capability takes it back
@@ -664,8 +693,11 @@ check_gated_modules(a: &Analysis)
     for i in 0..<a.tables.module_narrows.len()
         if is_environment(a.tables.module_narrows.at(i).1) then any = true
 
-    // Nothing narrowed anything, which is almost every compilation: the walk below reads every edge,
-    // and one with no question to ask should pay nothing at all for it.
+    if a.tables.target.lacks_capability(CapOs) || a.tables.target.lacks_capability(CapPosix) then
+        any = true
+
+    // Nothing narrowed anything and the machine has everything, which is almost every compilation:
+    // the walk below reads every edge, and one with no question to ask should pay nothing for it.
     if !any then return
 
     val needed = environment_requirements(a)
@@ -674,12 +706,44 @@ check_gated_modules(a: &Analysis)
         val e = a.tables.module_edges.at(i)
         val cap = gating_capability(a, e.from, e.to, needed)
 
-        if cap.is_none() then continue
+        if cap.is_some()
+            val here = if e.from == "" then "this module" else s"'${e.from}'"
 
-        val here = if e.from == "" then "this module" else s"'${e.from}'"
+            a.fault(e.scope, e.span,
+                    s"this reaches '${module_show(e.to)}', which requires '${cap.unwrap()}', and " +
+                    s"$here declared 'no ${cap.unwrap()}' — an environment capability gates which " +
+                    "modules exist, so a module that gave one up may not reach one that needs it")
+            continue
+
+        val missing = missing_on_target(a, e, needed)
+
+        if missing.is_none() then continue
 
         a.fault(e.scope, e.span,
-                s"this reaches '${module_show(e.to)}', which requires '${cap.unwrap()}', and " +
-                s"$here declared 'no ${cap.unwrap()}' — an environment capability gates which " +
-                "modules exist, so a module that gave one up may not reach one that needs it")
+                s"this reaches '${module_show(e.to)}', which requires '${missing.unwrap()}', and " +
+                s"'${a.tables.target.name}' does not provide it — a target's capabilities are " +
+                "what 'package.hocon' declares, so either this reference cannot be made on this " +
+                "machine or the config is understating it")
 end check_gated_modules
+
+// The capability the machine lacks that an edge's far end needs, where the edge is one the program's
+// author made.
+//
+// **The ceiling half of the rule**, and what makes a library's exemption from the target safe: a
+// library's gated module refuses no build that merely carries it, and refuses every program that
+// actually reaches it -- at the reference, which is the line the reader wrote. An edge made inside a
+// library is its author's and is never the program's mistake.
+private missing_on_target(a: &Analysis, e: ModuleEdge,
+                          needed: Buf[(string, string)]) -> Option[string]
+    if from_library(a, e.scope) || holds_string(a.tables.supplied_modules, e.from) then return None
+
+    val core = capability_core()
+
+    for i in 0..<core.len()
+        val cap = core.at(i)
+
+        if !is_environment(cap) || !a.tables.target.lacks_capability(cap) then continue
+        if holds_pair(needed, e.to, cap) then return Some(cap)
+
+    None
+end missing_on_target
