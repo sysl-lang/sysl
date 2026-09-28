@@ -102,6 +102,14 @@ private parse_header(p: *Parser, program: *Program)
             if !p.accept_kw(".") then break
 
         program.module_name = Some(ModuleName(at.to(p.just_taken()), parts))
+
+        // **Each clause takes a line of its own**, so one written on the header's line is refused
+        // there rather than read as though it had been written below it.
+        if p.at_kw("@")
+            p.fault(p.here(), "this attribute belongs in the file's header, on the lines directly " +
+                    "after 'module' and before everything else — it is a property of the whole " +
+                    "module, not of the statements below it")
+            skip_line(p)
     end if
 
     loop
@@ -124,6 +132,9 @@ private parse_header_attr(p: *Parser, program: *Program)
 
     p.bump()
 
+    // A narrowing is anchored at its word rather than at the `@`, as the reference anchors it: the
+    // capability it names is spelled inside that word, the way `requires` spells it in the list.
+    val word_at = p.here()
     val word = p.peek() match
         Ident(n) -> n
         _ -> ""
@@ -137,7 +148,7 @@ private parse_header_attr(p: *Parser, program: *Program)
 
     // `@no_alloc` -- this module gives up a capability its importer has.
     if word.starts_with("no_")
-        program.capabilities.push(CapabilityClause(at.to(p.just_taken()), Narrows,
+        program.capabilities.push(CapabilityClause(word_at.to(p.just_taken()), Narrows,
             word[3..<word.len]))
         return
     end if

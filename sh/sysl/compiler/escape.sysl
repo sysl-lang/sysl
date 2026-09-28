@@ -538,6 +538,14 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
 // promoted -- the storage moves to the heap and the program is unchanged otherwise. Where it roots
 // at storage that cannot be moved, the escape is reported against the expression that causes it, so
 // the caret lands on the slice that leaves the frame rather than on the function as a whole.
+// Where a view that escapes is reported: at its `[`, which is where the reference anchors an index
+// or a slice, and at the expression itself for any other form. The bracket directly follows what is
+// indexed, so it begins where the base ends.
+private view_anchor(at: TExpr) -> Span = *at.kind match
+    TSlice(base, _, _, _, _) -> Span(base.span.end, at.span.end)
+    TIndex(receiver, _, _) -> Span(receiver.span.end, at.span.end)
+    _ -> at.span
+
 private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how: string)
     val v = views(p, keeps, w, at)
 
@@ -545,7 +553,7 @@ private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how
         val name = v.named.at(i)
 
         if !holds_string(w.promoted, name)
-            w.sites.push(EscapeSite(name, "", at.span, how))
+            w.sites.push(EscapeSite(name, "", view_anchor(at), how))
             w.promoted.push(name)
 
     // A temporary is promoted like a named array and is reported like one under `no alloc`, since
