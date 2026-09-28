@@ -1,0 +1,1026 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `x is Pat` in the condition of an `if` or a `while` (`reference/expressions.md § is — a pattern
+// where a condition is wanted`). The feature is a binding whose reach is stated rather than
+// inferred, so most of what is worth pinning is *where a name is and is not visible*, and every
+// reach test has the position it does not reach beside it.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `IsPatternTests`
+// these are.
+
+private var ip_library_cache: Buf[Program] = buf()
+private var ip_library_read: bool = false
+
+private ip_library() -> Buf[Program]
+    if ip_library_read then return ip_library_cache
+
+    ip_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> ip_library_cache = units
+
+    ip_library_cache
+end ip_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private ip_ready() -> bool
+    if ip_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end ip_ready
+
+// Something that yields an `Option` at run time, so a test cannot be answered by folding.
+private ip_fetch() -> string = "fetch(i: int) -> Option[int]\n    if i < 3 then Some(i * 10) else None\n\n"
+
+private ip_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program PRINTS, which is the one claim nothing short of building and running it makes.
+private ip_ran(text: string) -> string
+    val root = make_temp_dir("sysl-is").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ip_ran
+
+// What the compiler says about a program it refuses; empty where it compiled.
+private ip_err(text: string) -> string
+    val root = make_temp_dir("sysl-is").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ip_err
+
+// The same, for a program of two files: the module `dir` beside the beginning.
+private ip_err_of(dir: string, module_text: string, main_text: string) -> string
+    val root = make_temp_dir("sysl-is").unwrap()
+
+    make_dir_all(s"$root/$dir").unwrap()
+    write_text(s"$root/$dir/$dir.sysl", module_text).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ip_err_of
+
+// What a program of two files prints: the module `m` beside the beginning.
+private ip_ran_of(module_text: string, main_text: string) -> string
+    val root = make_temp_dir("sysl-is").unwrap()
+
+    make_dir_all(s"$root/m").unwrap()
+    write_text(s"$root/m/m.sysl", module_text).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ip_ran_of
+
+// The LLVM text of a program that must compile.
+private ip_ir(text: string) -> string
+    val root = make_temp_dir("sysl-is").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ip_ir
+
+private ip_refused(text: string, part: string)
+    val said = ip_err(text)
+
+    assert(ip_says(said, part), said)
+
+private ip_not_here() -> string = "'is' tests a pattern in the condition of an 'if' or a 'while'"
+
+// ---- the pattern binds for the rest of the condition and the branch it guards
+
+@test("the plain form, which is the one-arm match written without the arm")
+ip_the_plain_form()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var o: Option[int] = Some(41)
+        if o is Some(n) then print(n + 1)
+        """), "42\n")
+
+// The value the branch prints has to come out of the pattern, or an implementation that only got
+// the tag right and bound garbage would pass.
+@test("the binding holds the payload, not merely the fact that it matched")
+ip_the_binding_holds_the_payload()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(ip_fetch() + raw"""
+        if fetch(2) is Some(n) then print(n) else print(-1)
+        if fetch(9) is Some(n) then print(n) else print(-1)
+        """), "20\n-1\n")
+
+@test("the else is optional, and the no-match path then does nothing")
+ip_the_else_is_optional()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(ip_fetch() + raw"""
+        if fetch(9) is Some(n) then print(n)
+        print("after")
+        """), "after\n")
+
+@test("an indented branch reads the binding throughout")
+ip_an_indented_branch_reads_the_binding()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var o: Option[int] = Some(4)
+        if o is Some(n)
+            var d = n * 2
+            print(d + n)
+        """), "12\n")
+
+@test("and it is an expression, so the branch's value may be what the pattern bound")
+ip_the_branch_value_is_the_binding()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(ip_fetch() + raw"""
+        var a = if fetch(1) is Some(n) then n else 0
+        var b = if fetch(7) is Some(n) then n else 0
+        print(a, b)
+        """), "10 0\n")
+
+// ---- the binding does not reach past the branch it guards
+
+@test("not the else branch")
+ip_not_the_else_branch()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: Option[int] = Some(1)
+        if o is Some(n) then print(n) else print(n)
+        """, "undefined name 'n'")
+
+@test("not an elif's condition")
+ip_not_an_elifs_condition()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: Option[int] = Some(1)
+        if o is Some(n) then print(n)
+        elif n > 0 then print(2)
+        """, "undefined name 'n'")
+
+@test("not after the whole if")
+ip_not_after_the_whole_if()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: Option[int] = Some(1)
+        if o is Some(n) then print(n)
+        print(n)
+        """, "undefined name 'n'")
+
+// ---- chaining with && is what makes the form worth having
+
+@test("a term to the right of the is reads what it bound")
+ip_a_term_to_the_right_reads_the_binding()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(ip_fetch() + raw"""
+        if fetch(2) is Some(n) && n > 15 then print(n) else print(-1)
+        if fetch(1) is Some(n) && n > 15 then print(n) else print(-1)
+        """), "20\n-1\n")
+
+@test("a term to the left of it is an ordinary test, evaluated first")
+ip_a_term_to_the_left_is_ordinary()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(ip_fetch() + raw"""
+        var gate = false
+        if gate && fetch(2) is Some(n) then print(n) else print(-1)
+        gate = true
+        if gate && fetch(2) is Some(n) then print(n) else print(-1)
+        """), "-1\n20\n")
+
+@test("two is terms chain, the second seeing the first's binding")
+ip_two_is_terms_chain()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(ip_fetch() + raw"""
+        if fetch(1) is Some(n) && fetch(n / 10 + 1) is Some(m) then print(n, m)
+        else print(-1)
+        """), "10 20\n")
+
+@test("and the chain fails as a whole when the second does not match")
+ip_the_chain_fails_as_a_whole()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(ip_fetch() + raw"""
+        if fetch(2) is Some(n) && fetch(n) is Some(m) then print(n, m)
+        else print(-1)
+        """), "-1\n")
+
+@test("a term after a failed is is not evaluated")
+ip_a_term_after_a_failed_is()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        noisy(x: int) -> bool
+            print("evaluated")
+            x > 0
+
+        var o: Option[int] = None
+        if o is Some(n) && noisy(n) then print("yes") else print("no")
+        """), "no\n")
+
+// ---- `is not` is the early-exit guard, and binds nothing
+
+@test("it holds exactly when the pattern does not match")
+ip_is_not_holds_when_it_does_not_match()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(ip_fetch() + raw"""
+        if fetch(9) is not Some(_) then print("empty") else print("full")
+        if fetch(1) is not Some(_) then print("empty") else print("full")
+        """), "empty\nfull\n")
+
+@test("it chains like any other term")
+ip_is_not_chains()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var o: Option[int] = None
+        var ready = true
+        if ready && o is not Some(_) then print("nothing yet")
+        """), "nothing yet\n")
+
+@test("and a pattern under it may not bind, there being no path on which the name holds anything")
+ip_is_not_may_not_bind()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: Option[int] = Some(1)
+        if o is not Some(n) then print(n)
+        """, "a pattern under 'is not' cannot bind a name")
+
+// ---- `while` takes the same condition
+
+@test("the drain loop, whose binding is remade each round")
+ip_the_drain_loop()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(ip_fetch() + raw"""
+        var i = 0
+        while fetch(i) is Some(v)
+            print(v)
+            i += 1
+        """), "0\n10\n20\n")
+
+@test("a chained term ends the loop early, exactly as it ends a branch")
+ip_a_chained_term_ends_the_loop()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(ip_fetch() + raw"""
+        var i = 0
+        while fetch(i) is Some(v) && v < 20
+            print(v)
+            i += 1
+        """), "0\n10\n")
+
+@test("the else runs on normal completion and cannot read the binding")
+ip_a_while_else_cannot_read_the_binding()
+    if !ip_ready() then return
+
+    ip_refused(ip_fetch() + raw"""
+        var i = 0
+        while fetch(i) is Some(v)
+            i += 1
+        else
+            print(v)
+        """, "undefined name 'v'")
+
+@test("and a break leaves with the loop's value")
+ip_a_break_leaves_with_the_value()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(ip_fetch() + raw"""
+        var i = 0
+        var found = while fetch(i) is Some(v)
+            if v == 10 then break v
+            i += 1
+        else -1
+        print(found)
+        """), "10\n")
+
+// ---- every pattern form a match arm may write, a condition may write
+
+@test("a struct pattern, named")
+ip_a_struct_pattern_named()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        struct Point
+            x: int
+            y: int
+
+        var p = Point(3, 4)
+        if p is Point{x: 3, y} then print(y) else print(-1)
+        """), "4\n")
+
+@test("a tuple pattern")
+ip_a_tuple_pattern()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var t = (1, 2)
+        if t is (1, b) then print(b) else print(-1)
+        """), "2\n")
+
+@test("a literal pattern, which binds nothing and is still a test")
+ip_a_literal_pattern()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var n = 7
+        if n is 7 then print("seven") else print("other")
+        """), "seven\n")
+
+@test("a range pattern")
+ip_a_range_pattern()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var n = 42
+        if n is 40..50 then print("in") else print("out")
+        """), "in\n")
+
+@test("a nested variant pattern, reaching two levels in")
+ip_a_nested_variant_pattern()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        enum Step
+            Work(n: int)
+            Idle
+
+        var o: Option[Step] = Some(Work(9))
+        if o is Some(Work(n)) then print(n) else print(-1)
+        """), "9\n")
+
+@test("and a nullary variant, which is a test with nothing to bind")
+ip_a_nullary_variant()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        enum Step
+            Work(n: int)
+            Idle
+
+        var s: Step = Idle
+        if s is Idle then print("idle") else print("busy")
+        """), "idle\n")
+
+// ---- the positions an `is` may not be written
+
+@test("not under ||")
+ip_not_under_or()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: Option[int] = Some(1)
+        if o is Some(n) || false then print(n)
+        """, ip_not_here())
+
+@test("not under !")
+ip_not_under_not()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: Option[int] = Some(1)
+        if !(o is Some(_)) then print(0)
+        """, ip_not_here())
+
+@test("not as a value")
+ip_not_as_a_value()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: Option[int] = Some(1)
+        var b = o is Some(_)
+        """, ip_not_here())
+
+@test("not as an argument")
+ip_not_as_an_argument()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: Option[int] = Some(1)
+        print(o is Some(_))
+        """, ip_not_here())
+
+@test("not in a match arm's guard")
+ip_not_in_a_guard()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: Option[int] = Some(1)
+        var n = 1
+        n match
+            x if o is Some(_) -> print(x)
+            else print(0)
+        """, ip_not_here())
+
+// A three-clause `for`'s condition is a `while`'s in every other respect, so this refusal is a
+// boundary rather than a principle.
+@test("and not in a three-clause for's condition")
+ip_not_in_a_three_clause_for()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: Option[int] = Some(1)
+        for var i = 0; o is Some(n); i += 1 do print(n)
+        """, ip_not_here())
+
+// ---- a test that cannot fail is refused rather than folded away
+
+@test("a bare binding, which is a declaration wearing a test's clothes")
+ip_a_bare_binding()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: Option[int] = Some(1)
+        if o is x then print(1)
+        """, "matches every sysl.Option[int], so the test is always true")
+
+@test("a wildcard")
+ip_a_wildcard()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var n = 1
+        if n is _ then print(1)
+        """, "matches every int, so the test is always true")
+
+@test("a struct pattern whose every field is irrefutable, a struct having no tag to test")
+ip_an_irrefutable_struct_pattern()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        struct Point
+            x: int
+            y: int
+
+        var p = Point(1, 2)
+        if p is Point{x} then print(x)
+        """, "matches every Point, so the test is always true")
+
+@test("and under `is not` it is never true, which is said differently")
+ip_under_is_not_it_is_never_true()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var n = 1
+        if n is not _ then print(1)
+        """, "so 'is not' is never true here")
+
+// A one-variant enum stays refutable: adding a second variant must not change what an existing
+// condition means.
+@test("though a variant pattern is refutable even where the enum has one variant")
+ip_a_one_variant_enum_is_refutable()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        enum Only
+            Just(n: int)
+
+        var o = Just(5)
+        if o is Just(n) then print(n)
+        """), "5\n")
+
+// ---- `is` and `not` stay ordinary names
+
+@test("both may be declared and read")
+ip_is_and_not_are_names()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var is = 3
+        var not = 4
+        print(is + not)
+        """), "7\n")
+
+@test("and a statement may start with one")
+ip_a_statement_may_start_with_is()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var is = 3
+        is += 1
+        print(is)
+        """), "4\n")
+
+// ---- the counts a binding takes are given back on every path out
+
+@test("including the edge where a later term of the chain fails")
+ip_released_where_a_later_term_fails()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        struct Node
+            n: int
+
+        var o: Option[&Node] = Some(Node(7))
+        var i = 0
+        while i < 3
+            if o is Some(p) && p.n > 100 then print("big") else print("small")
+            i += 1
+        """), "small\nsmall\nsmall\n")
+
+@test("and the edge where the branch was taken")
+ip_released_where_the_branch_was_taken()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        struct Node
+            n: int
+
+        var o: Option[&Node] = Some(Node(7))
+        var i = 0
+        while i < 3
+            if o is Some(p) then print(p.n)
+            i += 1
+        """), "7\n7\n7\n")
+
+@test("and a while's binding is remade and released each round")
+ip_a_while_binding_is_released_each_round()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        struct Node
+            n: int
+
+        make(i: int) -> Option[&Node]
+            if i < 200 then Some(Node(i)) else None
+
+        var i = 0
+        var total = 0
+        while make(i) is Some(p)
+            total += p.n
+            i += 1
+        print(total)
+        """), "19900\n")
+
+// ---- each term of a chain borrows in a region of its own
+
+// No `is` here at all: a second term's borrowed reference exists only on the edge that reached it,
+// so giving it back where the whole chain meets is invalid IR rather than a wrong answer.
+@test("an ordinary && whose right term borrows, and whose left term is false")
+ip_an_ordinary_and_whose_right_term_borrows()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        struct Node
+            n: int
+
+        make(i: int) -> &Node = Node(i)
+
+        var gate = false
+        if gate && make(1).n > 0 then print("yes") else print("no")
+        """), "no\n")
+
+@test("the same in a while, whose test runs the short-circuiting edge every round")
+ip_the_same_in_a_while()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        struct Node
+            n: int
+
+        make(i: int) -> &Node = Node(i)
+
+        var i = 0
+        while i < 400 && make(i).n >= 0
+            i += 1
+        print(i)
+        """), "400\n")
+
+@test("an is term whose subject borrows, reached only when the term before it held")
+ip_an_is_term_whose_subject_borrows()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        struct Node
+            n: int
+
+        lookup(i: int) -> Option[&Node]
+            if i % 3 == 0 then Some(Node(i)) else None
+
+        var i = 0
+        var hits = 0
+        while i < 600
+            if lookup(i) is Some(a) && lookup(a.n + 3) is Some(b) then hits += b.n - a.n
+            i += 1
+        print(hits)
+        """), "600\n")
+
+// ---- the shape of what is emitted
+
+@test("an ordinary condition is unchanged")
+ip_an_ordinary_condition_is_unchanged()
+    if !ip_ready() then return
+
+    val out = ip_ir("var n = 1\nif n > 0 then print(1)\n")
+
+    assert(ip_says(out, "icmp sgt"), out)
+    assert(!ip_says(out, "cond.bind"), out)
+    assert(!ip_says(out, "cond.unbind"), out)
+
+// The pattern's test is a pure read, so the tag is compared on the way in to the branch and the
+// binding is stored once the branch is the one being taken.
+@test("a pattern's test precedes its bindings")
+ip_the_test_precedes_the_bindings()
+    if !ip_ready() then return
+
+    val out = ip_ir(raw"""
+        var o: Option[int] = Some(1)
+        if o is Some(n) then print(n)
+        """)
+
+    val entry = out.index_of("if.then")
+
+    assert(entry.is_some(), out)
+
+    val at = entry.unwrap()
+
+    assert(out.index_of("icmp eq").map(i -> i < at).unwrap_or(false), out)
+    assert(out.index_of_from("ptr %n.addr", at).is_some(), out)
+
+@test("a chain over plain data needs no unbind block")
+ip_plain_data_needs_no_unbind_block()
+    if !ip_ready() then return
+
+    val out = ip_ir(raw"""
+        var o: Option[int] = Some(1)
+        if o is Some(n) && n > 0 then print(n)
+        """)
+
+    assert(ip_says(out, "cond.bind"), out)
+    assert(!ip_says(out, "cond.unbind"), out)
+
+// ---- an `is` survives the artifact a library is carried in
+
+// The reference stores a generic body as an encoded tree and asserts the round trip; this
+// compiler's artifact carries no source, so what a generic written in another module carries is
+// read from that module's own text, and the claim that survives is that both spellings are
+// instantiated from there whole.
+@test("the codec carries one, both spellings, whole")
+ip_a_generic_in_another_module_carries_both_spellings()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran_of(raw"""
+        module m
+
+        pick[T](o: Option[T], fallback: T) -> T
+            if o is Some(v) then v else fallback
+
+        empty[T](o: Option[T]) -> bool
+            if o is not Some(_) then true else false
+        """, raw"""
+        import m.{pick, empty}
+
+        var a: Option[int] = Some(41)
+        var b: Option[int] = None
+        print(pick(a, 0), pick(b, 9), empty(a), empty(b))
+        """), "41 9 false true\n")
+
+@test("and a generic function whose body tests one instantiates at two types")
+ip_a_generic_instantiates_at_two_types()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        pick[T](o: Option[T], fallback: T) -> T
+            if o is Some(v) then v else fallback
+
+        var a: Option[int] = Some(41)
+        var b: Option[int] = None
+        var c: Option[bool] = Some(true)
+        print(pick(a, 0), pick(b, 9), pick(c, false))
+        """), "41 9 true\n")
+
+// ---- the right side is an arm's left side, `|`-alternatives and all
+
+@test("several alternatives share one answer")
+ip_several_alternatives()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        enum Step
+            Work(n: int)
+            Idle
+            Done
+
+        report(s: Step) -> string
+            if s is Idle | Done then "over" else "running"
+
+        print(report(Idle), report(Done), report(Work(1)))
+        """), "over over running\n")
+
+@test("they work under `is not` too")
+ip_alternatives_under_is_not()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var n = 5
+        if n is not 1 | 2 | 3 then print("outside") else print("inside")
+        """), "outside\n")
+
+@test("and none of them may bind, for the reason an arm's may not")
+ip_alternatives_may_not_bind()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        enum Step
+            Work(n: int)
+            Rest(n: int)
+
+        var s: Step = Work(1)
+        if s is Work(n) | Rest(n) then print(n)
+        """, "alternative patterns joined by '|' cannot bind a name")
+
+@test("and one irrefutable alternative makes the whole test one, since it answers for the rest")
+ip_one_irrefutable_alternative()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var n = 1
+        if n is 1 | _ then print(1)
+        """, "so the test is always true")
+
+// ---- what the neighbouring rules say, asked of `is`
+
+@test("the one-arm statement match `is` replaces really is refused without a catch-all")
+ip_the_one_arm_match_is_refused()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: Option[int] = Some(1)
+        o match
+            Some(n) -> print(n)
+        """, "is not exhaustive")
+
+@test("and the `is` form needs no such arm")
+ip_the_is_form_needs_no_catch_all()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var o: Option[int] = Some(1)
+        if o is Some(n) then print(n)
+        """), "1\n")
+
+@test("a pattern in a condition does not reach through a reference either")
+ip_a_pattern_does_not_reach_through_a_reference()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        var o: &Option[int] = Some(1)
+        if o is Some(n) then print(n)
+        """, "a pattern does not reach through a memory mode")
+
+@test("and the dereference is what makes it match")
+ip_the_dereference_makes_it_match()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var o: &Option[int] = Some(41)
+        if *o is Some(n) then print(n + 1)
+        """), "42\n")
+
+@test("a contract is not a condition an `is` may sit in")
+ip_not_in_a_contract()
+    if !ip_ready() then return
+
+    ip_refused(raw"""
+        f(o: Option[int]) -> int
+            require o is Some(_)
+            0
+
+        print(f(Some(1)))
+        """, ip_not_here())
+
+@test("a closure inside the branch captures what the pattern bound")
+ip_a_closure_captures_the_binding()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        apply(f: int -> int, x: int) -> int = f(x)
+
+        var o: Option[int] = Some(40)
+        if o is Some(n) then print(apply(m -> m + n, 2))
+        """), "42\n")
+
+@test("a positional pattern in a condition owes the same field visibility an arm's does")
+ip_a_positional_pattern_owes_field_visibility()
+    if !ip_ready() then return
+
+    val said = ip_err_of("shape", raw"""
+        module shape
+
+        struct Point
+            x: int
+            private y: int
+        """, raw"""
+        import shape.Point
+
+        f(p: Point) -> int
+            if p is Point(a, b) then a else 0
+        """)
+
+    assert(ip_says(said, "this pattern names every field of 'shape.Point' in order, and 'y' is private"), said)
+
+@test("a range pattern reaches a constrained subtype")
+ip_a_range_pattern_reaches_a_subtype()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        type Small = int within 1..10
+
+        var n: Small = 5
+        if n is 1..6 then print("low") else print("high")
+        """), "low\n")
+
+// ---- the edge cases, each of which compiles under a rule that is not the one written
+
+@test("a binding may shadow the name it was read out of")
+ip_a_binding_may_shadow_its_subject()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var o: Option[int] = Some(7)
+        if o is Some(o) then print(o)
+        """), "7\n")
+
+@test("the same subject may be tested twice in one chain")
+ip_the_same_subject_twice()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var o: Option[int] = Some(20)
+        if o is Some(n) && o is Some(m) then print(n + m)
+        """), "40\n")
+
+@test("a nested is shadows the outer binding without disturbing it")
+ip_a_nested_is_shadows()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var a: Option[int] = Some(1)
+        var b: Option[int] = Some(2)
+        if a is Some(n)
+            if b is Some(n) then print(n)
+            print(n)
+        """), "2\n1\n")
+
+@test("a failed is does not evaluate the next term's subject")
+ip_a_failed_is_skips_the_next_subject()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        noisy() -> Option[int]
+            print("evaluated")
+            Some(1)
+
+        var o: Option[int] = None
+        if o is Some(n) && noisy() is Some(m) then print(n + m) else print("no")
+        """), "no\n")
+
+@test("a chain whose last term is the binding one")
+ip_the_last_term_binds()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var gate = true
+        var o: Option[int] = Some(41)
+        if gate && o is Some(n) then print(n + 1)
+        """), "42\n")
+
+@test("a branch that does not finish is still a branch the binding reaches")
+ip_a_branch_that_returns()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        find(xs: []int, want: int) -> int
+            for x in xs
+                var o: Option[int] = if x == want then Some(x) else None
+                if o is Some(hit) then return hit
+            -1
+
+        var nums: [3]int = [4, 5, 6]
+        var xs = nums[..]
+        print(find(xs, 5), find(xs, 9))
+        """), "5 -1\n")
+
+@test("a refcounted binding may be the branch's value")
+ip_a_refcounted_binding_is_the_value()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        var o: Option[string] = Some("hi" + "!")
+        var s = if o is Some(t) then t else "none"
+        print(s)
+        """), "hi!\n")
+
+@test("a continue out of a while-is body releases the round's binding")
+ip_a_continue_releases_the_binding()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        make(i: int) -> Option[&string]
+            if i < 400 then Some("ab" + "cd") else None
+
+        var i = 0
+        var hits = 0
+        while make(i) is Some(s)
+            i += 1
+            if i % 2 == 0 then continue
+            hits += 1
+        print(hits)
+        """), "200\n")
+
+@test("and a break out of one does too")
+ip_a_break_releases_the_binding()
+    if !ip_ready() then return
+
+    assert_eq(ip_ran(raw"""
+        make(i: int) -> Option[&string]
+            Some("ab" + "cd")
+
+        var rounds = 0
+        var i = 0
+        while i < 400
+            while make(i) is Some(s)
+                rounds += 1
+                break
+            i += 1
+        print(rounds)
+        """), "400\n")
