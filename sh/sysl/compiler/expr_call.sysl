@@ -93,11 +93,13 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
             written_call(cx, span, head, targs, args, expected)
         // `f[A](x)` has no comma to tell its brackets from a subscript, so it arrives as an index
-        // and is re-read here where the name is one a generic declares.
+        // and is re-read here where the name is one a generic declares -- and only where nothing
+        // nearer holds the name: a local shadowing the function is what is indexed.
         Index(head, one) ->
             val name = written_name_of(head)
 
-            if name.is_some() && names_a_function(cx, name.unwrap())
+            if name.is_some() && cx.lookup(name.unwrap()).is_none() &&
+               names_a_function(cx, name.unwrap())
                 var targs: Buf[Expr] = buf()
 
                 targs.push(one)
@@ -681,6 +683,12 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
         val targs = if !named_targs.is_empty() then named_targs
         else struct_targs(cx, span, key, decl.unwrap().scope, sd.unwrap(), args, expected)
 
+        for i in 0..<targs.len()
+            if targs.at(i) == Unknown
+                voice_unknown_fields(cx, sd.unwrap(), args)
+                return bad_expr(span)
+            end if
+
         reinstantiate(cx.an, key, targs) match
             Struct(d) -> inst = Some(Struct(d))
             _ -> return bad_expr(span)
@@ -845,6 +853,19 @@ private struct_targs(cx: &Analyzer, span: Span, key: string, home: Scope, sd: St
     solve(cx.an, home, span, key, sd.tparams, field_refs, prov, None, expected, soft, sd.bounds,
           buf())
 end struct_targs
+
+// **A value the solve could not read is read once more, for real, so that what it could not answer
+// is said** -- `Pair(null)` is told that `null` takes its type from its context. The provisional
+// readings are sandboxed, and the solve stays quiet about a parameter an unknown value left open,
+// taking the value to have spoken already. Only the leftmost speaks.
+private voice_unknown_fields(cx: &Analyzer, sd: StructDecl, args: Buf[Expr])
+    for i in 0..<args.len()
+        if i < sd.fields.len() && ref_mentions(sd.fields.at(i).typ, sd.tparams) &&
+           mentions_unknown(texpr_type(sandboxed_read(cx, args.at(i), None)))
+            type_expr(cx, args.at(i), None)
+            return
+        end if
+end voice_unknown_fields
 
 // A simple enum's name in call position is a checked cast from an integer.
 private enum_cast(cx: &Analyzer, span: Span, key: string, written: string,
@@ -1863,7 +1884,7 @@ end extern_call
 // the widening happens here, in the tree: an integer narrower than 32 bits becomes a 32-bit one of
 // its own signedness, and every floating width narrower than `real` becomes a `real`, both
 // sixteen-bit formats included.
-private variadic_extra(cx: &Analyzer, a: Expr) -> TExpr
+variadic_extra(cx: &Analyzer, a: Expr) -> TExpr
     val t = type_expr_bare(cx, a)
     val ty = texpr_type(t)
 

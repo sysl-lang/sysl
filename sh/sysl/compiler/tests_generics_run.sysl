@@ -546,6 +546,44 @@ gr_null_two()
 
     assert(gr_says(said, "'null' takes its type from its context, and there is none here"), said)
 
+// Not the reference's own case, but the same fault from the other side: the provisional reading of
+// an argument at an unsolved parameter is sandboxed, so a mistake inside it was rewound and nothing
+// was said at all. The reference names the mistake.
+@test("an argument that cannot be read at an unsolved parameter still says why")
+gr_unsolved_arg_says_why()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        id[T](x: T) -> T = x
+        print(id(nope))
+        """)
+
+    assert(gr_says(said, "undefined name 'nope'"), said)
+
+// The same refusal where the parameter is a member's own or a generic struct's field, which go
+// through solves of their own.
+@test("a null nothing settles is refused at a generic member and a generic constructor too")
+gr_null_member_and_constructor()
+    if !gr_ready() then return
+
+    val member = gr_err(raw"""
+        struct Box[T]
+            v: T
+
+            take[U](self, a: *U) -> bool = true
+        print(Box(1).take(null))
+        """)
+
+    assert(gr_says(member, "'null' takes its type from its context, and there is none here"), member)
+
+    val made = gr_err(raw"""
+        struct Pair[T]
+            a: *T
+        var p = Pair(null)
+        """)
+
+    assert(gr_says(made, "'null' takes its type from its context, and there is none here"), made)
+
 @test("a parameter that is not a pointer at all still refuses it")
 gr_null_not_pointer()
     if !gr_ready() then return
@@ -960,6 +998,30 @@ gr_generic_variadic()
         tagged[T](tag: T, n: u8, ...) -> u8 = n
         print(tagged("t", 250, 1, 2), tagged(2.5, 7, 3))
         """), "250 7\n")
+
+// The tail itself reaches the body: a generic callee's call used to be built from its parameters
+// alone, so the arguments after them were never passed and `va_arg` read whatever the registers held.
+@test("a generic variadic passes its tail to the body")
+gr_generic_variadic_tail()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        sum[T](tag: T, n: int, ...) -> int
+            var ap: va_list
+
+            va_start(ap)
+
+            var total = 0
+
+            for i in 0..<n
+                total += va_arg[int](ap)
+
+            va_end(ap)
+            total
+        end sum
+
+        print(sum("t", 3, 1, 2, 3), sum(2.5, 2, 10, 20))
+        """), "6 30\n")
 
 @test("a bare construction at a concrete reference parameter is still boxed")
 gr_boxed_at_reference()
