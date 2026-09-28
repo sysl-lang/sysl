@@ -1,0 +1,433 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+// **The target's half of the capability rule** -- what a machine provides, which the project's
+// config is what finally declares. A module's effective set is the target's intersected with its own
+// narrowing, so a capability the machine does not have is absent whatever any file declares.
+//
+// Each compilation here is the standard module, a library handed over under the names it was written
+// with (what a `--lib` source root arrives as), and the program's own files, analyzed for this
+// machine with the capabilities named taken away. **Every sentence quoted was read out of the
+// reference compiler**, handed the same files as a project whose `package.hocon` turned the same
+// capabilities off.
+
+private var tcap_std_cache: Buf[Program] = buf()
+private var tcap_std_read: bool = false
+
+private tcap_std() -> Buf[Program]
+    if tcap_std_read then return tcap_std_cache
+
+    tcap_std_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tcap_std_cache = units
+
+    tcap_std_cache
+end tcap_std
+
+private tcap_no_std() -> bool
+    if tcap_std().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end tcap_no_std
+
+// This machine, with the capabilities named taken away -- what a config turning them off produces.
+private tcap_machine(lacking: []string) -> Target
+    var lacks: Buf[string] = buf()
+
+    for i in 0..<lacking.len
+        lacks.push(lacking[i])
+
+    host_target() with { lacks = lacks }
+end tcap_machine
+
+private tcap_name() -> string = host_target().name
+
+// Everything the compilation reported, as `file: message` so a test can ask which file said it.
+private tcap_reported(lacking: []string, lib: [](string, string),
+                      files: [](string, string)) -> Buf[string]
+    var units: Buf[Program] = buf()
+    val std = tcap_std()
+
+    for i in 0..<std.len()
+        units.push(std.at(i))
+
+    for i in 0..<lib.len
+        var unit = parse(source_of(lib[i].0, lib[i].1)).program
+
+        unit.pkg = supplied_packaging()
+        units.push(unit)
+
+    for i in 0..<files.len
+        units.push(parse(source_of(files[i].0, files[i].1)).program)
+
+    val done = analyze_bodies(units, tcap_machine(lacking))
+    var out: Buf[string] = buf()
+
+    for i in 0..<done.reported.len()
+        out.push(s"${done.reported.at(i).src.name}: ${done.reported.at(i).diag.message}")
+
+    out
+end tcap_reported
+
+private tcap_said(xs: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<xs.len()
+        out = out + (if i > 0 then "\n" else "") + xs.at(i)
+
+    out
+end tcap_said
+
+private tcap_has(xs: Buf[string], part: string) -> bool = tcap_said(xs).index_of(part).is_some()
+
+private tcap_count(xs: Buf[string], part: string) -> usize
+    var n: usize = 0
+
+    for i in 0..<xs.len()
+        if xs.at(i).index_of(part).is_some() then n += 1
+
+    n
+end tcap_count
+
+private val tcap_nothing: [](string, string) = []
+
+private val tcap_allocates: string = "f() -> &int = 1\n\nprint(*f())\n"
+
+private val tcap_probe: string = "module demo.probe\n@requires(posix)\n\nsize() -> usize = 32\n"
+
+private tcap_no_heap_ref() -> string =
+    s"a reference needs an allocator, and '${tcap_name()}' provides no allocator — it may hold " +
+    "and release storage made elsewhere, and may make none of its own"
+
+private tcap_not_provided(reached: string, cap: string) -> string =
+    s"this reaches '$reached', which requires '$cap', and '${tcap_name()}' does not provide it — " +
+    "a target's capabilities are what 'package.hocon' declares, so either this reference cannot " +
+    "be made on this machine or the config is understating it"
+
+private tcap_requires_unmet(who: string, cap: string) -> string =
+    s"$who requires '$cap', and '${tcap_name()}' does not provide it — a target's capabilities " +
+    "are what 'package.hocon' declares, so either the module cannot be built for this machine or " +
+    "the config is understating it"
+
+// -- a target providing everything is what every build had before there was a file ----------------
+
+@test("a target providing everything still compiles a program that allocates")
+tcap_everything_allocates()
+    if tcap_no_std() then return
+
+    val got = tcap_reported([], tcap_nothing, [("main.sysl", tcap_allocates)])
+
+    assert(got.is_empty(), tcap_said(got))
+
+// -- a target with no allocator makes every module of the program allocator-free -------------------
+
+@test("a target with no allocator refuses allocation without a clause written anywhere")
+tcap_no_heap_without_a_clause()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["heap"], tcap_nothing, [("main.sysl", tcap_allocates)])
+
+    assert(tcap_has(got, s"main.sysl: ${tcap_no_heap_ref()}"), tcap_said(got))
+    assert(tcap_has(got, s"main.sysl: this reaches 'f', which makes heap storage, and " +
+                         s"'${tcap_name()}' provides no allocator — an allocator-free module may " +
+                         "only call what is allocator-free itself"), tcap_said(got))
+end tcap_no_heap_without_a_clause
+
+@test("and the message does not claim a clause the file never wrote")
+tcap_no_heap_claims_no_clause()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["heap"], tcap_nothing, [("main.sysl", tcap_allocates)])
+
+    assert(!got.is_empty())
+    assert(!tcap_has(got, "declared '@no_alloc'"), tcap_said(got))
+
+@test("a module that did write the clause still hears about its own clause")
+tcap_own_clause_is_named()
+    if tcap_no_std() then return
+
+    val got = tcap_reported([], tcap_nothing,
+                            [("thing/a.sysl", "module thing\n@no_alloc\n\nf() -> &int = 1\n"),
+                             ("main.sysl", "print(*thing.f())\n")])
+
+    assert(tcap_has(got, "thing/a.sysl: a reference needs an allocator, and this module declared " +
+                         "'@no_alloc' — it may hold and release storage made elsewhere, and may " +
+                         "make none of its own"), tcap_said(got))
+    assert(!tcap_has(got, "provides no allocator"), tcap_said(got))
+end tcap_own_clause_is_named
+
+@test("a program using only value types is untouched by a target with no allocator")
+tcap_value_types_untouched()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["heap"], tcap_nothing,
+                            [("main.sysl", "f(p: *int) -> int = *p\n\nvar n = 4\nprint(f(&n))\n")])
+
+    assert(got.is_empty(), tcap_said(got))
+
+// -- the standard library is exempt from the target's half -----------------------------------------
+
+// Its files are compiled into every program, so holding them to the target's set would report the
+// allocating half of the library as a mistake in source the program's author cannot change.
+@test("a no-alloc target does not turn the library into a wall of errors")
+tcap_library_is_exempt()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["heap"], tcap_nothing, [("main.sysl", tcap_allocates)])
+
+    assert(!tcap_has(got, s"$StdPrefix/"), tcap_said(got))
+    assert_eq(tcap_count(got, "needs an allocator"), 1)
+
+// -- 'requires' is answered against the target, which is what writing it buys ---------------------
+
+@test("a requirement the target does not meet is one error naming the module, capability, machine")
+tcap_requires_one_clean_error()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["heap"], tcap_nothing,
+                            [("thing/a.sysl", "module thing\n@requires(heap)\n\nf() -> int = 1\n"),
+                             ("main.sysl", "print(thing.f())\n")])
+
+    assert_eq(tcap_said(got), s"thing/a.sysl: ${tcap_requires_unmet("'thing'", "heap")}")
+
+@test("and what a requirement implies is answered too — posix needs an operating system")
+tcap_requires_what_posix_implies()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["os"], tcap_nothing,
+                            [("thing/a.sysl", "module thing\n@requires(posix)\n\nf() -> int = 1\n"),
+                             ("main.sysl", "print(thing.f())\n")])
+
+    assert(tcap_has(got, s"thing/a.sysl: ${tcap_requires_unmet("'thing'", "os")}"), tcap_said(got))
+    assert(tcap_has(got, s"main.sysl: ${tcap_not_provided("thing", "os")}"), tcap_said(got))
+    assert_eq(got.len(), 2)
+end tcap_requires_what_posix_implies
+
+@test("a requirement the target meets says nothing at all")
+tcap_requires_met_is_silent()
+    if tcap_no_std() then return
+
+    val got = tcap_reported([], tcap_nothing,
+                            [("thing/a.sysl", "module thing\n@requires(os)\n\nf() -> int = 1\n"),
+                             ("main.sysl", "print(thing.f())\n")])
+
+    assert(got.is_empty(), tcap_said(got))
+
+@test("the root module has no name to print, and says so as a sentence")
+tcap_requires_root_module()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["heap"], tcap_nothing, [("main.sysl", "@requires(heap)\n\nprint(1)\n")])
+
+    assert_eq(tcap_said(got), s"main.sysl: ${tcap_requires_unmet("this module", "heap")}")
+
+// -- a library's own 'requires' is the library's, not the program's --------------------------------
+
+// A library handed over as source is in the standard module's position: its files are ones the
+// program's author did not write and cannot change. Holding them to the target's set would make one
+// module of a library decide whether the whole library may be used on a machine at all.
+@test("a library module the program never names does not refuse the build")
+tcap_library_unnamed_with_clause()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["posix"], [("probe/probe.sysl", tcap_probe)],
+                            [("main.sysl", "@no_posix\n\nprint(\"never names demo.probe\")\n")])
+
+    assert(got.is_empty(), tcap_said(got))
+
+@test("nor does one in a program that wrote no clause at all")
+tcap_library_unnamed_no_clause()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["posix"], [("probe/probe.sysl", tcap_probe)],
+                            [("main.sysl", "print(\"never names demo.probe\")\n")])
+
+    assert(got.is_empty(), tcap_said(got))
+
+@test("and what the library's requirement implies is exempt with it — posix needs an os")
+tcap_library_implied_exempt()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["os", "posix"], [("probe/probe.sysl", tcap_probe)],
+                            [("main.sysl", "print(1)\n")])
+
+    assert(got.is_empty(), tcap_said(got))
+
+@test("the program's own module is still asked, with a library beside it")
+tcap_own_module_asked_beside_library()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["posix"], [("probe/probe.sysl", tcap_probe)],
+                            [("thing/a.sysl", "module thing\n@requires(posix)\n\nf() -> int = 1\n"),
+                             ("main.sysl", "print(thing.f())\n")])
+
+    assert(tcap_has(got, s"thing/a.sysl: ${tcap_requires_unmet("'thing'", "posix")}"),
+           tcap_said(got))
+    assert(tcap_has(got, s"main.sysl: ${tcap_not_provided("thing", "posix")}"), tcap_said(got))
+end tcap_own_module_asked_beside_library
+
+// The narrowing half answers a reference into a gated module at the reference rather than at the
+// library's clause, which is the line a reader wrote.
+@test("a module that gave posix up is still refused where it reaches the library's")
+tcap_narrowed_reaches_library()
+    if tcap_no_std() then return
+
+    val got = tcap_reported([], [("probe/probe.sysl", tcap_probe)],
+                            [("main.sysl", "@no_posix\n\nprint(demo.probe.size())\n")])
+
+    assert_eq(tcap_said(got), "main.sysl: this reaches 'demo.probe', which requires 'posix', and " +
+                              "this module declared 'no posix' — an environment capability gates " +
+                              "which modules exist, so a module that gave one up may not reach one " +
+                              "that needs it")
+end tcap_narrowed_reaches_library
+
+// The exemption is about the target, which the library's author had no say in. Whether the file is
+// well formed is a different question: a source root is handed over as text, so a clause naming
+// nothing was never read by the build that produced it.
+@test("a clause that names no capability is still refused in a library file")
+tcap_library_unknown_capability()
+    if tcap_no_std() then return
+
+    val got = tcap_reported([], [("probe/probe.sysl",
+                                  "module demo.probe\n@requires(sockets)\n\nsize() -> usize = 32\n")],
+                            [("main.sysl", "print(1)\n")])
+
+    assert_eq(tcap_said(got), "probe/probe.sysl: no capability is called 'sockets' — the set is " +
+                              "'heap', 'os', 'posix'")
+end tcap_library_unknown_capability
+
+@test("and two files of one library module that disagree are still refused")
+tcap_library_files_disagree()
+    if tcap_no_std() then return
+
+    val got = tcap_reported([], [("probe/a.sysl", tcap_probe),
+                                 ("probe/b.sysl", "module demo.probe\n\nother() -> usize = 1\n")],
+                            [("main.sysl", "print(1)\n")])
+
+    assert(tcap_has(got, "are both files of 'demo.probe', and they declare different capabilities " +
+                         "— a capability is a property of the module, so every one of its files " +
+                         "states it: none against '@requires(posix)'"), tcap_said(got))
+end tcap_library_files_disagree
+
+// -- what the target does not provide is out of reach for the program, with no clause written -----
+
+// The ceiling half, which is what makes the exemption above safe: a library's gated module stops
+// refusing a build it has nothing to do with, and refuses the programs that actually reach it.
+@test("a program reaching a library's gated module is refused at the reference")
+tcap_ceiling_library_module()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["posix"], [("probe/probe.sysl", tcap_probe)],
+                            [("main.sysl", "print(demo.probe.size())\n")])
+
+    assert_eq(tcap_said(got), s"main.sysl: ${tcap_not_provided("demo.probe", "posix")}")
+
+@test("and one reaching the standard library's is refused the same way")
+tcap_ceiling_std_module()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["os"], tcap_nothing, [("main.sysl", "print(sysl.fs.exists(\"x\"))\n")])
+
+    assert_eq(tcap_said(got), s"main.sysl: ${tcap_not_provided("sysl.fs", "os")}")
+
+@test("reaching it through a module that says nothing itself is still reaching it")
+tcap_ceiling_through_a_relay()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["posix"], [("probe/probe.sysl", tcap_probe)],
+                            [("relay/relay.sysl", "module relay\n\nn() -> usize = demo.probe.size()\n"),
+                             ("main.sysl", "print(relay.n())\n")])
+
+    assert(tcap_has(got, s"relay/relay.sysl: ${tcap_not_provided("demo.probe", "posix")}"),
+           tcap_said(got))
+    assert(tcap_has(got, s"main.sysl: ${tcap_not_provided("relay", "posix")}"), tcap_said(got))
+    assert_eq(got.len(), 2)
+end tcap_ceiling_through_a_relay
+
+// The clause is the better answer where there is one: it names something the reader wrote, and a
+// message about the config would send them to change the wrong file.
+@test("a module that gave the capability up hears about its own clause, not the machine")
+tcap_ceiling_own_clause_first()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["posix"], [("probe/probe.sysl", tcap_probe)],
+                            [("main.sysl", "@no_posix\n\nprint(demo.probe.size())\n")])
+
+    assert(tcap_has(got, "declared 'no posix'"), tcap_said(got))
+    assert(!tcap_has(got, "does not provide it"), tcap_said(got))
+    assert_eq(got.len(), 1)
+end tcap_ceiling_own_clause_first
+
+@test("a target that provides it is unaffected, which is every build with no config behind it")
+tcap_ceiling_provided()
+    if tcap_no_std() then return
+
+    val got = tcap_reported([], [("probe/probe.sysl", tcap_probe)],
+                            [("main.sysl", "print(demo.probe.size())\n")])
+
+    assert(got.is_empty(), tcap_said(got))
+
+// `demo.probe` requires posix and `demo.relay` reaches it -- an edge entirely inside the library. The
+// program touches neither, so a machine without posix has nothing to say.
+@test("and the library's own edges are never the program author's mistake")
+tcap_ceiling_library_edges()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["posix"],
+                            [("probe/probe.sysl", tcap_probe),
+                             ("probe/relay.sysl", "module demo.relay\n\nn() -> usize = demo.probe.size()\n")],
+                            [("main.sysl", "print(1)\n")])
+
+    assert(got.is_empty(), tcap_said(got))
+
+// -- a '@tests' file lifts its module's clause and not the target's --------------------------------
+
+// A file that ships nowhere may take back a promise the module made about what ships; nothing may
+// take back a facility the machine does not have.
+private val tcap_thing: string = "module thing\n@no_alloc\n\nf() -> int = 1\n"
+
+private val tcap_boxing_tests: string = "module thing\n@tests\n@requires(heap)\n\nboxed() -> &int = 1\n"
+
+@test("the tests of an allocator-free module may allocate on a machine that has an allocator")
+tcap_tests_allocate_with_heap()
+    if tcap_no_std() then return
+
+    val got = tcap_reported([], tcap_nothing,
+                            [("thing/a.sysl", tcap_thing), ("thing/tests.sysl", tcap_boxing_tests),
+                             ("main.sysl", "print(thing.f())\n")])
+
+    assert(got.is_empty(), tcap_said(got))
+
+@test("and may not on one that has none, whatever the file declares")
+tcap_tests_no_heap_on_machine()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["heap"], tcap_nothing,
+                            [("thing/a.sysl", tcap_thing), ("thing/tests.sysl", tcap_boxing_tests),
+                             ("main.sysl", "print(thing.f())\n")])
+
+    assert_eq(tcap_said(got), s"thing/tests.sysl: ${tcap_no_heap_ref()}")
+
+// `sysl build` analyzes a `@tests` file and then drops it, so a requirement checked there would
+// refuse a build over a facility only the discarded file wanted.
+@test("the requirement itself refuses nothing, since the file it is on is about to be dropped")
+tcap_tests_requirement_refuses_nothing()
+    if tcap_no_std() then return
+
+    val got = tcap_reported(["heap"], tcap_nothing,
+                            [("thing/a.sysl", tcap_thing),
+                             ("thing/tests.sysl",
+                              "module thing\n@tests\n@requires(heap)\n\nhelper() -> int = 2\n"),
+                             ("main.sysl", "print(thing.f())\n")])
+
+    assert(got.is_empty(), tcap_said(got))
+end tcap_tests_requirement_refuses_nothing
