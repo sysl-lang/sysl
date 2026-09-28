@@ -287,3 +287,95 @@ can_an_imported_generic_struct_takes_written_type_arguments()
 
     assert(can_says(can_report(fs), "it printed: 1\n"))
 end can_an_imported_generic_struct_takes_written_type_arguments
+
+// -- a type-argument list written on a qualified name -----------------------------------------------
+//
+// `reference/generics.md § Writing the type arguments` writes a list on a function "qualified or
+// not", on a constructor and on a variant, and a qualified name reaches whatever the unqualified one
+// does. The refusals quote what the reader wrote -- `b.Maybe`, never the key the module keeps it
+// under.
+
+private can_q_module_b() -> string =
+    "module b\n\nstruct G[T]\n    x: T\n    y: string\n\nstruct Pair[K, V]\n    key: K\n" +
+    "    value: V\n\nenum Maybe[T]\n    Just(v: T)\n    Nothing\n\nstruct Box[T]\n    v: T\n" +
+    "    of(x: T) -> Self = Box(x)\n\nf[T](x: T) -> usize = sizeof(T)\n"
+
+private can_q(main: string) -> string
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("b", "b.sysl", can_q_module_b()))
+    fs.push(("", "main.sysl", main))
+    can_report(fs)
+end can_q
+
+@test("a qualified generic struct takes one written type argument")
+can_q_a_constructor_takes_one_argument()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval g = b.G[int](1, \"s\")\nprint(g.x, g.y)\n"),
+                    "it printed: 1 s\n"))
+
+@test("a qualified generic struct takes a written list")
+can_q_a_constructor_takes_a_list()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval p = b.Pair[u8, real](7, 2.5)\n" +
+                          "print(p.key, p.value, sizeof(b.Pair[u8, real]))\n"),
+                    "it printed: 7 2.5 16\n"))
+
+@test("a qualified generic function takes a written type argument")
+can_q_a_free_function()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nprint(b.f[u8](3), b.f[i64](3))\n"), "it printed: 1 8\n"))
+
+@test("a variant carrying a payload is built through a qualified generic enum")
+can_q_a_variant_carrying_a_payload()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval m = b.Maybe[int].Just(3)\nval n = m match\n" +
+                          "    b.Maybe.Just(v) -> v\n    b.Maybe.Nothing -> 0\nprint(n)\n"),
+                    "it printed: 3\n"))
+
+@test("a variant carrying nothing is named through a qualified generic enum")
+can_q_a_variant_carrying_nothing()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval m = b.Maybe[string].Nothing\nval n = m match\n" +
+                          "    b.Maybe.Just(v) -> v\n    b.Maybe.Nothing -> \"none\"\nprint(n)\n"),
+                    "it printed: none\n"))
+
+@test("the fields of a qualified generic struct are checked against the written instantiation")
+can_q_the_fields_are_checked_against_it()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval g = b.G[real](1, \"s\")\nprint(g.x)\n"),
+                    "error: 'x' of 'b.G[real]' is real, but int was given\n" +
+                    " --> <root>/main.sysl:3:19\n"))
+
+@test("a qualified enum name applied to arguments is refused by its written name")
+can_q_an_enum_name_applied_to_arguments()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval m = b.Maybe[int](1)\nprint(1)\n"),
+                    "error: 'b.Maybe' is an enum, so it is not built by calling its name — a " +
+                    "variant is what carries a value, as 'b.Maybe[…].Name(…)'\n" +
+                    " --> <root>/main.sysl:3:16\n"))
+
+@test("an associated function selected from a qualified generic type with a written list is refused")
+can_q_an_associated_function_is_asked_for_on_the_binding()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval x = b.Box[int].of(1)\nprint(x.v)\n"),
+                    "error: 'b.Box' cannot be given type arguments where 'of' is selected from " +
+                    "it; write the type on what receives the result — 'var x: b.Box[…] = …' — and " +
+                    "select 'of' from the plain name\n --> <root>/main.sysl:3:20\n"))
+
+@test("and so is one selected from the imported name written bare")
+can_q_an_associated_function_on_the_bare_name()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b.{Box}\n\nval x = Box[int].of(1)\nprint(x.v)\n"),
+                    "error: 'Box' cannot be given type arguments where 'of' is selected from it; " +
+                    "write the type on what receives the result — 'var x: Box[…] = …' — and " +
+                    "select 'of' from the plain name\n --> <root>/main.sysl:3:18\n"))
