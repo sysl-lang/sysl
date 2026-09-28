@@ -1,0 +1,340 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.text.Search
+
+// `@test(ignore: "why")` — a test that is compiled and checked, and not run. **Every string quoted
+// here was read off the reference compiler (0.0.149)** on the same source; none of it is composed.
+
+// -- the attribute ----------------------------------------------------------------------------------
+
+@test("'ignore' carries the reason the test is not run")
+tig_ignore_carries_its_reason()
+    assert_eq(pf("@test(ignore: \"the parser drops the second arm\")\nt() = 0\n"),
+        "(fn @test@ignore(\"the parser drops the second arm\") t () 0)")
+
+@test("'ignore' follows a description")
+tig_ignore_follows_a_description()
+    assert_eq(pf("@test(\"two arms are both kept\", ignore: \"the parser drops the second arm\")\nt() = 0\n"),
+        "(fn @test(\"two arms are both kept\")@ignore(\"the parser drops the second arm\") t () 0)")
+
+// Ignoring is about whether the test runs; `should_trap` is about what a run means. A test for a check
+// that does not fire yet is exactly the pair, so they compose rather than exclude.
+@test("'ignore' follows 'should_trap', with or without its text")
+tig_ignore_follows_should_trap()
+    assert_eq(pf("@test(should_trap, ignore: \"the check is not emitted yet\")\nt() = 0\n"),
+        "(fn @test@should_trap@ignore(\"the check is not emitted yet\") t () 0)")
+    assert_eq(pf("@test(\"an index past the end is refused\", should_trap: \"past the end\", ignore: \"not yet\")\nt() = 0\n"),
+        "(fn @test(\"an index past the end is refused\")@should_trap(\"past the end\")@ignore(\"not yet\") t () 0)")
+
+// What `emit-ast --no-spans` prints for the attribute, as the reference prints it.
+@test("the untyped tree carries the reason beside the other three")
+tig_the_tree_carries_the_reason()
+    val shown = emit_ast(parse(source_of("e.sysl",
+        "@test(should_trap: \"x\", ignore: \"y\")\nt() =\n    assert(true, \"r\")\n")).program, false)
+
+    assert(shown.contains("        test: TestAttr\n          display: None\n          shouldTrap: true\n" +
+                          "          expected: \"x\"\n          ignored: \"y\"\n        hook: None\n"), shown)
+
+    val plain = emit_ast(parse(source_of("e.sysl", "@test\nt() =\n    assert(true, \"r\")\n")).program,
+                         false)
+
+    assert(plain.contains("          expected: None\n          ignored: None\n        hook: None\n"), plain)
+
+// -- the refusals -----------------------------------------------------------------------------------
+
+private tig_no_reason() -> string =
+    "'ignore' needs the reason the test is not run, written as a string — '@test(ignore: \"the parser drops the second arm\")'. An ignored test that does not say why is one nobody comes back to"
+
+// The reason is the whole of what an ignored test tells its reader, so a form without one is refused
+// rather than read as an ignore with nothing to say.
+@test("'ignore' with no reason is refused, and says what to write")
+tig_ignore_needs_a_reason()
+    assert_eq(pf_err("@test(ignore)\nt() = 0\n"), tig_no_reason())
+    assert_eq(pf_at("@test(ignore)\nt() = 0\n"), "1:13")
+    assert_eq(pf_err("@test(ignore:)\nt() = 0\n"), tig_no_reason())
+    assert_eq(pf_at("@test(ignore:)\nt() = 0\n"), "1:14")
+
+@test("'ignore' after a description with no reason is the same refusal")
+tig_ignore_after_a_description_needs_a_reason()
+    assert_eq(pf_err("@test(\"what holds\", ignore)\nt() = 0\n"), tig_no_reason())
+    assert_eq(pf_at("@test(\"what holds\", ignore)\nt() = 0\n"), "1:27")
+
+@test("a reason that is not a string is the same refusal")
+tig_a_reason_is_a_string()
+    assert_eq(pf_err("@test(ignore: 3)\nt() = 0\n"), tig_no_reason())
+    assert_eq(pf_at("@test(ignore: 3)\nt() = 0\n"), "1:15")
+
+@test("an empty reason says nothing, and is refused like a missing one")
+tig_a_blank_reason_is_refused()
+    assert_eq(pf_err("@test(ignore: \"  \")\nt() = 0\n"), tig_no_reason())
+    assert_eq(pf_at("@test(ignore: \"  \")\nt() = 0\n"), "1:19")
+
+@test("'@ignore' on its own is answered with the spelling that works")
+tig_at_ignore_is_answered()
+    val said = "an ignored test is written '@test(ignore: \"why it is not run\")' — ignoring is something a test is, so it goes inside '@test' beside the description and 'should_trap', and a function that is not a test has no run to withhold"
+
+    assert_eq(pf_err("@ignore(\"the parser drops the second arm\")\nt() = 0\n"), said)
+    assert_eq(pf_at("@ignore(\"the parser drops the second arm\")\nt() = 0\n"), "1:8")
+    assert_eq(pf_err("@ignore\nt() = 0\n"), said)
+    assert_eq(pf_at("@ignore\nt() = 0\n"), "1:8")
+
+// The order is fixed — description, 'should_trap', 'ignore' — so a list written the other way round
+// is told what the order is.
+@test("the arguments out of order are told the order")
+tig_arguments_out_of_order()
+    val said = "'@test' closes what it opened — the description, 'should_trap' and 'ignore' go between parentheses, in that order, and there is no ')' here to end them"
+
+    assert_eq(pf_err("@test(ignore: \"not yet\", should_trap)\nt() = 0\n"), said)
+    assert_eq(pf_at("@test(ignore: \"not yet\", should_trap)\nt() = 0\n"), "1:24")
+
+    // A comma is only taken where an argument follows it, so what is left over is refused at the
+    // comma rather than at whatever follows.
+    assert_eq(pf_at("@test(\"a\", 3)\nt() = 0\n"), "1:10")
+    assert_eq(pf_at("@test(\"a\",)\nt() = 0\n"), "1:10")
+    assert_eq(pf_at("@test(should_trap, 3)\nt() = 0\n"), "1:18")
+    assert_eq(pf_at("@test(\"a\", should_trap, 3)\nt() = 0\n"), "1:23")
+    assert_eq(pf_at("@test(should_trap: \"x\", ignore: \"y\", 3)\nt() = 0\n"), "1:36")
+    assert_eq(pf_err("@test(\"a\" 3)\nt() = 0\n"), said)
+
+@test("the refusal for a description that is not a string mentions 'ignore' too")
+tig_a_bad_description_mentions_ignore()
+    assert_eq(pf_err("@test(3)\nt() = 0\n"),
+        "'@test' takes the description a report shows it under, written as a string — '@test(\"an index past the end is refused\")' — 'should_trap' for a run that is meant not to come back, optionally with the text such a run must have printed, and 'ignore: \"why\"' for a test that is compiled and not run. They compose, in that order")
+    assert_eq(pf_at("@test(3)\nt() = 0\n"), "1:7")
+
+// -- the report -------------------------------------------------------------------------------------
+
+private tig_test(display: string, line: int, ignored: Option[string]) -> TTest =
+    TTest(module_qualify("m", display), display, false, None, "m.sysl", line, no_hooks(), ignored)
+
+// Other readers parse this line — `tests_runner.sysl` pins it, and pages on the site quote it — so a
+// run that ignored nothing prints exactly what it always printed.
+@test("a run that ignored nothing keeps the summary it always had")
+tig_a_run_that_ignored_nothing_keeps_its_summary()
+    var ran: Buf[Outcome] = buf()
+
+    ran.push(Outcome(tig_test("a", 1, None), None, "", 1))
+    ran.push(Outcome(tig_test("b", 2, None), Some("why"), "", 2))
+
+    assert(tests_rendered(ran, 2, 0).contains("\n1 passed, 1 failed — 3ms\n"))
+
+@test("an ignored test gets a row naming its reason, and the summary counts it")
+tig_an_ignored_row_names_its_reason()
+    var ran: Buf[Outcome] = buf()
+
+    ran.push(Outcome(tig_test("a", 1, None), None, "", 1))
+    ran.push(Outcome(tig_test("b", 2, None), Some("why"), "", 2))
+    ran.push(Outcome(tig_test("waits", 11, Some("the parser drops the second arm")), None, "", 0))
+
+    val text = tests_rendered(ran, 3, 0)
+
+    assert(text.contains("  skip  waits  ignored: the parser drops the second arm\n"), text)
+    assert(text.contains("\n1 passed, 1 failed, 1 ignored — 3ms\n"), text)
+    assert_eq(test_row(Outcome(tig_test("waits", 11, Some("not yet")), None, "", 0), 8),
+              "  skip  waits     ignored: not yet\n")
+
+// -- a tree built and run ---------------------------------------------------------------------------
+
+// A one-file tree, built as a test binary and run with the options given; the report it streamed and
+// the outcomes, or nothing where the library or a toolchain is not on this machine.
+private tig_run(text: string, opts: TestOptions) -> Option[(string, Buf[Outcome])]
+    if std_root().is_err() || !clang_available() then return None
+
+    val root = runner_project("main.sysl", text)
+    val file = s"$root/main.sysl"
+
+    val build = test_build_of(file, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return None
+        Ok(made) -> made
+
+    if !build.emitted.report.is_empty()
+        remove_dir_all(root).unwrap_or(())
+        assert(false, analysis_report(build.emitted.report))
+        return None
+    end if
+
+    val exe = build_test_binary(file, build, None, DefaultOptimization) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return None
+        Ok(built) -> built
+
+    val chosen = selected_tests(build.tests, opts.filter)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val outcomes = run_selected(exe, chosen, opts, build.tests.len() - chosen.len(),
+                                piece -> sink.push(piece))
+
+    discard_test_binary(exe)
+    remove_dir_all(root).unwrap_or(())
+
+    var streamed = ""
+
+    for i in 0..<said.len()
+        streamed = streamed + said.at(i)
+
+    Some((streamed, outcomes))
+end tig_run
+
+// Each body below fails if it runs, so a pass here is the absence of a run rather than a run that
+// happened to succeed.
+@test("an ignored test whose body would fail is reported as ignored, with its reason")
+tig_an_ignored_test_is_not_run()
+    val (text, ran) = tig_run("@test(ignore: \"the parser drops the second arm\")\nknown_bug() =\n" +
+                              "    assert(false, \"this must not run\")\n", TestOptions(None, false)) match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran.len(), 1)
+    assert_eq(ran.at(0).test.display, "known_bug")
+    assert_eq(ran.at(0).ignored().unwrap(), "the parser drops the second arm")
+    assert(ran.at(0).detail.is_none(), "nothing failed")
+    assert(ran.at(0).passed(), "an ignored test spoils nothing")
+    assert(runner_timeless(text).ends_with("\n  skip  known_bug  ignored: the parser drops the second arm\n" +
+                                           "\n0 passed, 0 failed, 1 ignored — Nms\n"), text)
+
+// Composed with `should_trap`, a run that returns would be the failure — so the only way this stays
+// clean is for nothing to have been started. And a body that would trap is not started either.
+@test("composed with 'should_trap', a body that returns is not run either")
+tig_an_ignored_should_trap_is_not_run()
+    val (_, ran) = tig_run("@test(should_trap: \"past the end\", ignore: \"the check is not emitted yet\")\n" +
+                           "unchecked() =\n    assert(true, \"returns\")\n\n" +
+                           "@test(ignore: \"would trap\")\ntraps() =\n    val xs = [1, 2, 3]\n" +
+                           "    var i = 3\n    print(xs[i])\n", TestOptions(None, false)) match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran.len(), 2)
+    assert_eq(ran.at(0).ignored().unwrap(), "the check is not emitted yet")
+    assert(ran.at(0).detail.is_none(), "not run, so not failed")
+    assert_eq(ran.at(1).ignored().unwrap(), "would trap")
+    assert(ran.at(1).detail.is_none(), "not run, so not trapped")
+
+// `@setup` fails here, and every test it brackets would be reported against it — except the one that
+// was never run, because there was no process for the hook to run in.
+@test("an ignored test starts no process, its module's hooks included")
+tig_an_ignored_test_runs_no_hooks()
+    val (_, ran) = tig_run("@setup\nup() =\n    assert(false, \"setup ran\")\n\n" +
+                           "@setup_all\nboot() =\n    assert(false, \"setup_all ran\")\n\n" +
+                           "@teardown_all\nhalt() =\n    assert(false, \"teardown_all ran\")\n\n" +
+                           "@test(ignore: \"waiting\")\nt() =\n    assert(true, \"fine\")\n",
+                           TestOptions(None, false)) match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran.len(), 1)
+    assert_eq(ran.at(0).test.display, "t")
+    assert_eq(ran.at(0).ignored().unwrap(), "waiting")
+    assert(ran.at(0).detail.is_none(), "no hook ran to fail it")
+
+@test("the tests beside an ignored one run as they always did")
+tig_the_tests_beside_run()
+    val (text, ran) = tig_run("@test\nfirst() =\n    assert(false, \"down\")\n\n" +
+                              "@test(ignore: \"waiting\")\nsecond() =\n    assert(false, \"never\")\n\n" +
+                              "@test\nthird() =\n    assert(true, \"up\")\n", TestOptions(None, false)) match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran.len(), 3)
+    assert(ran.at(0).detail.is_some(), "the first failed")
+    assert(ran.at(1).detail.is_none(), "the second never ran")
+    assert(ran.at(2).detail.is_none(), "the third passed")
+    assert(runner_timeless(text).ends_with("\n1 passed, 1 failed, 1 ignored — Nms\n"), text)
+
+@test("a filter selects an ignored test, and it is reported as ignored")
+tig_a_filter_selects_an_ignored_test()
+    val (text, ran) = tig_run("@test(ignore: \"waiting\")\nalpha() =\n    assert(false, \"never\")\n\n" +
+                              "@test\nbeta() = 0\n", TestOptions(Some("alph"), false)) match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran.len(), 1)
+    assert_eq(ran.at(0).test.display, "alpha")
+    assert_eq(ran.at(0).ignored().unwrap(), "waiting")
+    assert(runner_timeless(text).starts_with("running 1 test of 2\n"), text)
+
+@test("fail-fast does not stop at an ignored test")
+tig_fail_fast_passes_an_ignored_test()
+    val (_, ran) = tig_run("@test(ignore: \"waiting\")\nfirst() =\n    assert(false, \"never\")\n\n" +
+                           "@test\nsecond() = 0\n", TestOptions(None, true)) match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(ran.len(), 2)
+    assert_eq(ran.at(0).test.display, "first")
+    assert_eq(ran.at(1).test.display, "second")
+
+// End to end: the ignored test's body would fail if it ran, and the exit status says nothing failed.
+@test("an ignored test is reported with its reason, counted, and fails nothing")
+tig_the_command_exits_clean()
+    if std_root().is_err() || !clang_available() then return
+
+    val root = runner_project("main.sysl", "@test\nholds() =\n    assert(1 + 1 == 2, \"two\")\n\n" +
+                                           "@test(ignore: \"the parser drops the second arm\")\n" +
+                                           "known_bug() =\n    assert(false, \"this must not run\")\n")
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "test", s"$root/main.sysl"], (line) -> sink.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 0)
+
+// -- still a test -----------------------------------------------------------------------------------
+
+// The point of ignoring rather than deleting: the test goes on being checked against the code it will
+// one day run on, so it cannot quietly stop compiling while it waits.
+@test("an ignored test is still checked, in a test build and in an ordinary one")
+tig_an_ignored_test_is_still_checked()
+    if std_root().is_err() then return
+
+    val root = runner_project("main.sysl", "@test(ignore: \"waiting on a fix\")\nt() =\n" +
+                                           "    print(undefined_name)\n")
+    val file = s"$root/main.sysl"
+
+    test_build_of(file, None) match
+        Err(refusal) -> assert(refusal.message.contains("undefined name 'undefined_name'"), refusal.message)
+        Ok(made) ->
+            val said = analysis_report(made.emitted.report)
+
+            assert(said.contains("undefined name 'undefined_name'"), said)
+            assert(said.contains("main.sysl:3:11"), said)
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build", file, "-o", s"$root/out"], (line) -> sink.push(line))
+    var all = ""
+
+    for i in 0..<lines.len()
+        all = all + lines.at(i) + "\n"
+
+    remove_dir_all(root).unwrap_or(())
+    assert(code != 0, "an ordinary build refuses it too")
+    assert(all.contains("undefined name 'undefined_name'"), all)
+    assert(all.contains("main.sysl:3:11"), all)
+
+@test("an ignored test is still held to what a test may be")
+tig_an_ignored_test_is_still_a_test()
+    if std_root().is_err() then return
+
+    val root = runner_project("main.sysl", "@test(ignore: \"waiting on a fix\")\ntakes_one(n: int)\n" +
+                                           "    assert(n > 0, \"positive\")\n")
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build", s"$root/main.sysl", "-o", s"$root/out"], (line) -> sink.push(line))
+    var all = ""
+
+    for i in 0..<lines.len()
+        all = all + lines.at(i) + "\n"
+
+    remove_dir_all(root).unwrap_or(())
+    assert(code != 0, "refused")
+    assert(all.contains("a '@test' function takes no parameters, and 'takes_one' takes one — 'sysl test' calls it with nothing, so there is nowhere for an argument to come from"), all)
+    assert(all.contains("main.sysl:1:1"), all)
