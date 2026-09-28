@@ -93,11 +93,13 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
             written_call(cx, span, head, targs, args, expected)
         // `f[A](x)` has no comma to tell its brackets from a subscript, so it arrives as an index
-        // and is re-read here where the name is one a generic declares.
+        // and is re-read here where the name is one a generic declares -- and only where nothing
+        // nearer holds the name: a local shadowing the function is what is indexed.
         Index(head, one) ->
             val name = written_name_of(head)
 
-            if name.is_some() && names_a_function(cx, name.unwrap())
+            if name.is_some() && cx.lookup(name.unwrap()).is_none() &&
+               names_a_function(cx, name.unwrap())
                 var targs: Buf[Expr] = buf()
 
                 targs.push(one)
@@ -183,6 +185,13 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
             // `Status.Exited(0)` -- a variant named through its own enum, which is how one that
             // carries something is written where the bare name would be ambiguous.
+            // `E[int].A(x)` -- the same through a generic enum at the arguments the reader wrote,
+            // which is then the context every value it carries is read against.
+            applied_variant(cx, receiver, member) match
+                VsFound(en, v) -> return variant_call(cx, span, en, v, args)
+                VsSaid -> return bad_expr(span)
+                VsNone -> ()
+
             val qualified = qualified_variant(cx, receiver, member)
 
             if qualified.is_some() then
@@ -192,12 +201,12 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             // meant is worked out from what the variant carries -- exactly as it is for the bare
             // name, and for the same reason: `Slot.Live(h, k, v)` is a `Slot[K, V]` because that is
             // what the values say.
-            val qualified_generic = qualified_variant_solved(cx, span, receiver, member, args,
-                                                             expected)
+            val named_at = Span(callee.span.end - member.bytes.len, callee.span.end)
 
-            if qualified_generic.is_some() then
-                return variant_call(cx, span, qualified_generic.unwrap().0,
-                                    qualified_generic.unwrap().1, args)
+            qualified_variant_solved(cx, span, named_at, receiver, member, args, expected) match
+                VsFound(en, v) -> return variant_call(cx, span, en, v, args)
+                VsSaid -> return bad_expr(span)
+                VsNone -> ()
 
             // **A TYPE reached through the module it belongs to**, which is the other half of the
             // function case above: `c.InBuffer(p, n, 0)` is the struct's constructor, `c.Mode(n)` an
@@ -439,10 +448,10 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
         // struct's constructor is: `Some(s)` on its own is an `Option[string]` because `s` is a
         // string, and picking whichever instantiation happened to be registered first would make it
         // whatever some other file asked for.
-        val solved = variant_solved(cx, span, name, args)
-
-        if solved.is_some() then
-            return variant_call(cx, span, solved.unwrap().0, solved.unwrap().1, args)
+        variant_solved(cx, span, Span(span.start, span.start + name.bytes.len), name, args) match
+            VsFound(en, v) -> return variant_call(cx, span, en, v, args)
+            VsSaid -> return bad_expr(span)
+            VsNone -> ()
 
         val v = variant_of(cx, name, expected)
 
@@ -681,6 +690,12 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
         val targs = if !named_targs.is_empty() then named_targs
         else struct_targs(cx, span, key, decl.unwrap().scope, sd.unwrap(), args, expected)
 
+        for i in 0..<targs.len()
+            if targs.at(i) == Unknown
+                voice_unknown_fields(cx, sd.unwrap(), args)
+                return bad_expr(span)
+            end if
+
         reinstantiate(cx.an, key, targs) match
             Struct(d) -> inst = Some(Struct(d))
             _ -> return bad_expr(span)
@@ -845,6 +860,19 @@ private struct_targs(cx: &Analyzer, span: Span, key: string, home: Scope, sd: St
     solve(cx.an, home, span, key, sd.tparams, field_refs, prov, None, expected, soft, sd.bounds,
           buf())
 end struct_targs
+
+// **A value the solve could not read is read once more, for real, so that what it could not answer
+// is said** -- `Pair(null)` is told that `null` takes its type from its context. The provisional
+// readings are sandboxed, and the solve stays quiet about a parameter an unknown value left open,
+// taking the value to have spoken already. Only the leftmost speaks.
+private voice_unknown_fields(cx: &Analyzer, sd: StructDecl, args: Buf[Expr])
+    for i in 0..<args.len()
+        if i < sd.fields.len() && ref_mentions(sd.fields.at(i).typ, sd.tparams) &&
+           mentions_unknown(texpr_type(sandboxed_read(cx, args.at(i), None)))
+            type_expr(cx, args.at(i), None)
+            return
+        end if
+end voice_unknown_fields
 
 // A simple enum's name in call position is a checked cast from an integer.
 private enum_cast(cx: &Analyzer, span: Span, key: string, written: string,
@@ -1018,28 +1046,36 @@ end variant_call
 //
 // Nothing for an enum that takes no type parameters, which leaves the ordinary lookup to answer:
 // there the registered instantiation is the only one there could be.
-private variant_solved(cx: &Analyzer, span: Span, name: string,
-                       args: Buf[Expr]) -> Option[(Type, EnumVariant)]
-    if !may_name_variant(cx, name) then return None
+// What working out a generic variant's instantiation came to: the variant at the arguments its values
+// settled, a refusal already said, or nothing -- the name is left to the ordinary lookup.
+private enum VariantSolve
+    VsFound(en: Type, v: EnumVariant)
+    VsSaid
+    VsNone
 
-    for i in 0..<cx.an.tables.types.len()
-        val key = cx.an.tables.types.key_at(i)
-        val decl = cx.an.tables.types.at(i)
+private variant_solved(cx: &Analyzer, span: Span, named_at: Span, name: string,
+                       args: Buf[Expr]) -> VariantSolve
+    // Only where the name means one enum: two at the nearest level are the lookup's to refuse, and
+    // the ordinary lookup answers for an enum that takes no type parameters.
+    val homes = variant_homes(cx, name)
 
-        decl.kind match
-            EnumOf(ed) ->
-                if !ed.tparams.is_empty() && reachable_key(cx.an, key, cx.scope) &&
-                        visible_here(cx, key)
-                    val found = variant_decl_named(ed, name)
+    if homes.len() != 1 then return VsNone
 
-                    if found.is_some()
-                        val made = variant_instance(cx, span, key, decl.scope, ed, found.unwrap(),
-                                                    args)
+    val key = homes.at(0)
+    val decl = cx.an.tables.types.get(key)
 
-                        if made.is_some() then return made
-            _ -> ()
+    if decl.is_none() then return VsNone
 
-    None
+    decl.unwrap().kind match
+        EnumOf(ed) ->
+            if ed.tparams.is_empty() then return VsNone
+
+            val found = variant_decl_named(ed, name)
+
+            if found.is_none() then return VsNone
+
+            variant_instance(cx, span, named_at, key, decl.unwrap().scope, ed, found.unwrap(), args)
+        _ -> VsNone
 end variant_solved
 
 private variant_decl_named(ed: EnumDecl, name: string) -> Option[EnumVariantDecl]
@@ -1049,9 +1085,9 @@ private variant_decl_named(ed: EnumDecl, name: string) -> Option[EnumVariantDecl
     None
 end variant_decl_named
 
-private variant_instance(cx: &Analyzer, span: Span, key: string, home: Scope, ed: EnumDecl,
-                         vd: EnumVariantDecl, args: Buf[Expr]) -> Option[(Type, EnumVariant)]
-    if args.len() != vd.fields.len() then return None
+private variant_instance(cx: &Analyzer, span: Span, named_at: Span, key: string, home: Scope,
+                         ed: EnumDecl, vd: EnumVariantDecl, args: Buf[Expr]) -> VariantSolve
+    if args.len() != vd.fields.len() then return VsNone
 
     var field_refs: Buf[TypeRef] = buf()
 
@@ -1074,53 +1110,132 @@ private variant_instance(cx: &Analyzer, span: Span, key: string, home: Scope, ed
     cx.an.restore_complaints(mark)
 
     for i in 0..<targs.len()
-        if targs.at(i) == Unknown then return None
+        if targs.at(i) == Unknown
+            // A number too wide for `int` has no type of its own yet and takes the one its position
+            // gives it, so it is not a value that failed to read: the enclosing reading settles it.
+            for j in 0..<args.len()
+                if mentions_unknown(prov.at(j)) && literal_default(args.at(j)).is_some() then
+                    return VsNone
+
+            voice_unsolved_variant(cx, named_at, ed, vd, args, prov, i)
+            return VsSaid
+        end if
 
     reinstantiate(cx.an, key, targs) match
         Enum(d) ->
             val v = d.variant(vd.name)
 
-            if v.is_none() then return None
+            if v.is_none() then return VsNone
 
-            Some((Enum(d), v.unwrap()))
-        _ -> None
+            VsFound(Enum(d), v.unwrap())
+        _ -> VsNone
 end variant_instance
+
+// **A variant whose instantiation the values could not settle says why, rather than being left for
+// a lookup that would call its enum undefined.** A value the provisional reading could not type --
+// `E.A(null)`, `E.A(None)`, `E.A(nope)` -- is read once more, for real, and says what it has to say;
+// only the leftmost speaks, as for a generic call. Where every value was read and a parameter is
+// still open, it is in nothing the variant carries (`C(n: int)` of an `E[T]`), and that is the
+// complaint, about the variant's name.
+private voice_unsolved_variant(cx: &Analyzer, named_at: Span, ed: EnumDecl, vd: EnumVariantDecl,
+                               args: Buf[Expr], prov: Buf[Type], open: usize)
+    for i in 0..<args.len()
+        if ref_mentions(vd.fields.at(i).typ, ed.tparams) && mentions_unknown(prov.at(i))
+            type_expr(cx, args.at(i), None)
+            return
+        end if
+
+    cx.fault(named_at, s"cannot infer the type argument '${ed.tparams.at(open)}' of '${vd.name}' " +
+             "here — annotate the expected type")
+end voice_unsolved_variant
 
 // The same where the enum is **generic**: the name in front of the dot says which enum, and the
 // values say which instantiation of it.
-private qualified_variant_solved(cx: &Analyzer, span: Span, receiver: Expr, member: string,
-                                 args: Buf[Expr],
-                                 expected: Option[Type]) -> Option[(Type, EnumVariant)]
+private qualified_variant_solved(cx: &Analyzer, span: Span, named_at: Span, receiver: Expr,
+                                 member: string, args: Buf[Expr],
+                                 expected: Option[Type]) -> VariantSolve
     val written = *receiver.kind match
         Ident(n) -> if cx.lookup(n).is_none() then Some(n) else None
         _ -> None
 
-    if written.is_none() then return None
+    if written.is_none() then return VsNone
 
     val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
 
-    if key.is_none() then return None
+    if key.is_none() then return VsNone
 
     val decl = cx.an.tables.types.get(key.unwrap())
 
-    if decl.is_none() then return None
+    if decl.is_none() then return VsNone
 
     decl.unwrap().kind match
         EnumOf(ed) ->
-            if ed.tparams.is_empty() then return None
+            if ed.tparams.is_empty() then return VsNone
 
             val found = variant_decl_named(ed, member)
 
-            if found.is_none() then return None
+            if found.is_none() then return VsNone
 
             // The position is trusted first, since it says outright which instantiation is wanted.
             val wanted = variant_from_expected(cx, member, expected)
 
-            if wanted.is_some() then return wanted
+            if wanted.is_some() then return VsFound(wanted.unwrap().0, wanted.unwrap().1)
 
-            variant_instance(cx, span, key.unwrap(), decl.unwrap().scope, ed, found.unwrap(), args)
-        _ -> None
+            // The name in front of the dot has said which enum, so what could not be settled is
+            // this enum's to say.
+            variant_instance(cx, span, named_at, key.unwrap(), decl.unwrap().scope, ed,
+                             found.unwrap(), args)
+        _ -> VsNone
 end qualified_variant_solved
+
+// A variant named through a generic enum written at its type arguments: `E[int].A` or
+// `E[int, bool].A`. Nothing for any other receiver, or an enum at the wrong number of arguments.
+private applied_variant(cx: &Analyzer, receiver: Expr, member: string) -> VariantSolve
+    var targ_exprs: Buf[Expr] = buf()
+
+    val head = *receiver.kind match
+        Index(h, one) ->
+            targ_exprs.push(one)
+            h
+        TypeArgs(h, many) ->
+            targ_exprs = many
+            h
+        _ -> return VsNone
+
+    val written = *head.kind match
+        Ident(n) -> if cx.lookup(n).is_none() then n else return VsNone
+        _ -> return VsNone
+
+    val key = lookup_type_key(cx.an, cx.scope, written)
+
+    if key.is_none() then return VsNone
+
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return VsNone
+
+    decl.unwrap().kind match
+        EnumOf(ed) ->
+            if ed.tparams.len() != targ_exprs.len() then return VsNone
+            if variant_decl_named(ed, member).is_none() then return VsNone
+
+            var targs: Buf[Type] = buf()
+
+            for i in 0..<targ_exprs.len()
+                val t = written_type_arg(cx, targ_exprs.at(i))
+
+                // A type argument that names nothing has said so already.
+                if mentions_unknown(t) then return VsSaid
+
+                targs.push(t)
+
+            reinstantiate(cx.an, key.unwrap(), targs) match
+                Enum(d) -> d.variant(member) match
+                    Some(v) -> VsFound(Enum(d), v)
+                    None -> VsNone
+                _ -> VsNone
+        _ -> VsNone
+end applied_variant
 
 // A variant named through its enum, where the name in front of the dot stands for one.
 private qualified_variant(cx: &Analyzer, receiver: Expr, member: string) -> Option[(Type, EnumVariant)]
@@ -1868,7 +1983,7 @@ end extern_call
 // the widening happens here, in the tree: an integer narrower than 32 bits becomes a 32-bit one of
 // its own signedness, and every floating width narrower than `real` becomes a `real`, both
 // sixteen-bit formats included.
-private variadic_extra(cx: &Analyzer, a: Expr) -> TExpr
+variadic_extra(cx: &Analyzer, a: Expr) -> TExpr
     val t = type_expr_bare(cx, a)
     val ty = texpr_type(t)
 

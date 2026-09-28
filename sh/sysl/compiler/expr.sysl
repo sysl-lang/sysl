@@ -681,6 +681,10 @@ variant_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) ->
     val found = variant_of(cx, name, expected)
 
     if found.is_none() then
+        // A generic enum nothing has instantiated yet still declares the name, and a variant of it
+        // that carries something is refused for that rather than called undefined.
+        if generic_variant_in_reach(cx, name, true) then return carries_data(cx, span, name)
+
         return cx.err(span, s"undefined name '${module_show(module_qualify(cx.scope.module_name, name))}'")
 
     val clash = ambiguous_variant(cx, span, name, expected)
@@ -689,9 +693,7 @@ variant_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) ->
 
     val (en, v) = found.unwrap()
 
-    if v.carries then
-        return cx.err(span, s"'$name' carries ${quantity(v.fields.len(), "field")}, so it is " +
-                      "constructed with them")
+    if v.carries then return carries_data(cx, span, name)
 
     TExpr(span, TEnumNew(en, v, buf()))
 end variant_expr
@@ -726,10 +728,12 @@ variant_of(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[(Type,
 
     if !may_name_variant(cx, name) then return None
 
-    // The first instantiation in registration order whose enum declares the name and may be named
-    // here. Every test is a question with no side effect, so the cheap one -- does this enum have a
-    // variant of that name at all -- is asked first, and the visibility lookups are paid only for
-    // the few enums that could answer.
+    // The first instantiation in registration order whose enum is one the name could mean here --
+    // the nearest level's, where the module declares one itself.
+    val homes = variant_homes(cx, name)
+
+    if homes.is_empty() then return None
+
     for i in 0..<cx.an.tables.enum_insts.len()
         val t = cx.an.tables.enum_insts.at(i)
 
@@ -737,33 +741,55 @@ variant_of(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[(Type,
             Enum(d) ->
                 val v = d.variant(name)
 
-                if v.is_some() && reachable_key(cx.an, d.base, cx.scope) &&
-                        visible_here(cx, d.base) then
-                    return Some((t, v.unwrap()))
+                if v.is_some() && holds_string(homes, d.base) then return Some((t, v.unwrap()))
             _ -> ()
 
     None
 end variant_of
 
-// The enums in scope that declare a variant of this name, by DECLARATION rather than by
-// instantiation -- `Option[int]` and `Option[string]` are one answer, since the question is which
-// enum was meant and not which of its instantiations. In the order their first instantiation was
-// registered, which is the order the refusal names them in.
+// The enums a bare variant name could mean, by DECLARATION rather than by instantiation --
+// `Option[int]` and `Option[string]` are one answer, since the question is which enum was meant and
+// not which of its instantiations, and a generic enum nothing has instantiated yet is an answer too.
+// In the order they were declared, which is the order the refusal names them in.
+//
+// **The name is resolved as any name is: the module's own declarations are nearer than anything it
+// reaches**, so an `enum R` declaring `Ok` makes a bare `Ok` its own however many modules it can see
+// also declare one. Only a tie at the nearest level is left for the refusal.
 variant_homes(cx: &Analyzer, name: string) -> Buf[string]
     var homes: Buf[string] = buf()
 
     if !may_name_variant(cx, name) then return homes
 
-    for i in 0..<cx.an.tables.enum_insts.len()
-        cx.an.tables.enum_insts.at(i) match
-            Enum(d) ->
-                if d.variant(name).is_some() && !holds_string(homes, d.base) &&
-                        reachable_key(cx.an, d.base, cx.scope) && visible_here(cx, d.base) then
-                    homes.push(d.base)
+    var own = false
+
+    for i in 0..<cx.an.tables.types.len()
+        val key = cx.an.tables.types.key_at(i)
+
+        cx.an.tables.types.at(i).kind match
+            EnumOf(ed) ->
+                if declares_variant(ed, name) && reachable_key(cx.an, key, cx.scope) &&
+                        visible_here(cx, key) then
+                    homes.push(key)
+
+                    if module_of(key) == cx.scope.module_name then own = true
             _ -> ()
 
-    homes
+    if !own then return homes
+
+    var nearest: Buf[string] = buf()
+
+    for i in 0..<homes.len()
+        if module_of(homes.at(i)) == cx.scope.module_name then nearest.push(homes.at(i))
+
+    nearest
 end variant_homes
+
+private declares_variant(ed: EnumDecl, name: string) -> bool
+    for i in 0..<ed.variants.len()
+        if ed.variants.at(i).name == name then return true
+
+    false
+end declares_variant
 
 // `'A'`, then `'A' and 'B'`, then `'A', 'B' and 'C'` -- a series a sentence can carry, with no comma
 // before the `and`.
@@ -1251,7 +1277,12 @@ typed_by_position(cx: &Analyzer, e: Expr) -> bool = *e.kind match
 // a **non-generic** enum has a type the moment it is named -- `Colour.Red` is a `Colour` -- so it is
 // an answer rather than a question. One that **carries** something derives its arguments from what
 // it was given, which is what makes `Some(3)` a type its sibling can be read against.
-private payload_free_generic_variant(cx: &Analyzer, name: string) -> bool
+private payload_free_generic_variant(cx: &Analyzer, name: string) -> bool =
+    generic_variant_in_reach(cx, name, false)
+
+// Whether a generic enum in reach declares a variant of this name that carries something, or --
+// with `carrying` false -- one that carries nothing.
+private generic_variant_in_reach(cx: &Analyzer, name: string, carrying: bool) -> bool
     if !may_name_variant(cx, name) then return false
 
     for i in 0..<cx.an.tables.types.len()
@@ -1262,12 +1293,13 @@ private payload_free_generic_variant(cx: &Analyzer, name: string) -> bool
                 if !d.tparams.is_empty() && reachable_key(cx.an, key, cx.scope) &&
                         visible_here(cx, key)
                     for j in 0..<d.variants.len()
-                        if d.variants.at(j).name == name && d.variants.at(j).fields.is_empty()
+                        if d.variants.at(j).name == name &&
+                           d.variants.at(j).fields.is_empty() != carrying
                             return true
             _ -> ()
 
     false
-end payload_free_generic_variant
+end generic_variant_in_reach
 
 // Whether the position a trailing block stands at is a collection, which is what makes the block an
 // array of its lines rather than a closure over them.

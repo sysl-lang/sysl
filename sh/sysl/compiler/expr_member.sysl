@@ -397,9 +397,21 @@ private enum_member(cx: &Analyzer, span: Span, key: string, written: string, nam
     if settled.is_some() then
         return TExpr(span, TEnumNew(settled.unwrap().0, settled.unwrap().1, buf()))
 
+    // The member's own name, which is what each refusal below is about.
+    val named_at = Span(span.end - name.bytes.len, span.end)
     val inst = cx.an.tables.enum_insts.get(instance_key(key, buf()))
 
     if inst.is_none() then
+        val generic = generic_variant_named(cx, key, name)
+
+        if generic.is_some() then
+            val (open, carries) = generic.unwrap()
+
+            if carries then return carries_data(cx, named_at, name)
+
+            return cx.err(named_at, s"cannot infer the type argument '$open' of '$name' here — " +
+                          "annotate the expected type")
+
         return cx.err(span, s"'$written' takes type arguments, so a variant of it is named " +
                       "through the type at those arguments")
 
@@ -412,14 +424,36 @@ private enum_member(cx: &Analyzer, span: Span, key: string, written: string, nam
             if v.is_none() then
                 return cx.err(span, s"'${module_show(key)}' has no variant '$name'")
 
-            if v.unwrap().carries then
-                return cx.err(span, s"'$name' carries " +
-                              s"${quantity(v.unwrap().fields.len(), "field")}, so it is " +
-                              "constructed with them")
+            if v.unwrap().carries then return carries_data(cx, named_at, name)
 
             TExpr(span, TEnumNew(en, v.unwrap(), buf()))
         _ -> bad_expr(span)
 end enum_member
+
+// **A variant that carries something is constructed, never named**: written without its values it
+// is neither a value of the enum nor a function making one.
+carries_data(cx: &Analyzer, at: Span, name: string) -> TExpr =
+    cx.err(at, s"variant '$name' carries data — construct it with '$name(…)'")
+
+
+// A generic enum's variant of this name, as its first type parameter and whether it carries
+// anything -- what a variant written with no values and no position to settle it is told.
+private generic_variant_named(cx: &Analyzer, key: string, name: string) -> Option[(string, bool)]
+    val decl = cx.an.tables.types.get(key)
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        EnumOf(ed) ->
+            if ed.tparams.is_empty() then return None
+
+            for i in 0..<ed.variants.len()
+                if ed.variants.at(i).name == name then
+                    return Some((ed.tparams.at(0), !ed.variants.at(i).fields.is_empty()))
+
+            None
+        _ -> None
+end generic_variant_named
 
 // A `Field` chain that spells a module path rather than a member read.
 through_module(cx: &Analyzer, receiver: Expr, name: string) -> Option[string]

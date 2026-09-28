@@ -1,0 +1,1127 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Generic functions, structs and enums compiled and run. Each distinct set of type arguments is
+// monomorphized into its own function or aggregate, so these check that the instantiations really
+// are independent -- and that the type arguments are inferred, which is most of what is here: the
+// order inference reads a call's arguments in, what waits for a solution, and what a solution makes
+// an argument read as.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `GenericsRunTests`
+// these are.
+
+private var gr_library_cache: Buf[Program] = buf()
+private var gr_library_read: bool = false
+
+private gr_library() -> Buf[Program]
+    if gr_library_read then return gr_library_cache
+
+    gr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> gr_library_cache = units
+
+    gr_library_cache
+end gr_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private gr_ready() -> bool
+    if gr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end gr_ready
+
+private gr_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program prints, which is the one claim nothing short of building and running it makes.
+private gr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-generics").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end gr_ran
+
+// Everything a source has to say for itself, taken through the lowering, so a refusal a pass after
+// the analysis makes is one of these too.
+private gr_err(text: string) -> string
+    val root = make_temp_dir("sysl-generics").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gr_err
+
+// The LLVM text of a program that must compile.
+private gr_ir(text: string) -> string
+    val root = make_temp_dir("sysl-generics").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gr_ir
+
+// -- instantiation --------------------------------------------------------------------------------
+
+@test("a generic function instantiated at three types")
+gr_three_types()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        id[T](x: T) -> T = x
+        print(id(7), id(2.5), id("hi"))
+        """), "7 2.5 hi\n")
+
+// A stand-in for a type parameter is its name, so two declarations whose parameters are both
+// spelled `T` build ones that render the same -- and an instantiation cached under the rendering
+// would hand the first declaration's bounds to the next. `sysl.container.Heap[T: Ord]` is the
+// library's side of it.
+@test("a program's type parameter does not lend its bounds to a library's of the same name")
+gr_bounds_not_lent()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        import sysl.buf.{Buf, buf}
+        trait Tag: Add + Mul
+            tag(self) -> int
+        impl Tag for real
+            tag(self) -> int = 1
+        struct Holder[T: Tag]
+            cells: &Buf[T]
+            first(self) -> T = self.cells.at(0usize)
+        impl[T: Tag] Mul[Holder[T], T] for Holder[T]
+            mul(self, rhs: Holder[T]) -> T = self.first() * rhs.first()
+        impl[T: Tag] Mul[T] for Holder[T]
+            mul(self, k: T) -> Holder[T] = self
+        var cells: Buf[real] = buf()
+        cells.push(2.5)
+        var h = Holder(cells)
+        print(h.first(), h * h)
+        """), "2.5 6.25\n")
+
+// Counting only `id`'s own definitions: the module also holds the runtime and whatever renderers
+// `print` reached. The reference emits `@id.int` and `@id.real`.
+@test("a generic function is instantiated once per type, not once per call")
+gr_once_per_type()
+    if !gr_ready() then return
+
+    val ir = gr_ir(raw"""
+        id[T](x: T) -> T = x
+        print(id(1), id(2), id(3.5))
+        """)
+    val lines = lines_of(ir)
+    var n = 0
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.starts_with("define") && gr_says(line, "@id.") then n += 1
+
+    assert_eq(n, 2)
+    assert(gr_says(ir, "@id.int("), ir)
+    assert(gr_says(ir, "@id.real("), ir)
+
+@test("a generic struct at two types")
+gr_struct_two_types()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Box[T]
+            value: T
+        end Box
+        var a = Box(41)
+        var b = Box("boxed")
+        print(a.value + 1, b.value)
+        """), "42 boxed\n")
+
+@test("a generic struct with two parameters")
+gr_struct_two_params()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Pair[A, B]
+            first: A
+            second: B
+        end Pair
+        var p = Pair(1, "one")
+        print(p.first, p.second)
+        """), "1 one\n")
+
+@test("a generic struct nested in itself at another type")
+gr_struct_nested()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Box[T]
+            value: T
+        end Box
+        var bb = Box(Box(9))
+        print(bb.value.value)
+        """), "9\n")
+
+@test("a generic struct nested three deep")
+gr_struct_three_deep()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Box[T]
+            value: T
+        end Box
+        var d = Box(Box(Box(7)))
+        print(d.value.value.value)
+        """), "7\n")
+
+@test("nested generic enums destructure through both layers")
+gr_nested_enums()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        var x: Option[Result[int, string]] = Some(Ok(99))
+        var y: Result[Option[int], string] = Ok(Some(5))
+        var a = x match
+            Some(Ok(n)) -> n
+            else -1
+        var b = y match
+            Ok(Some(n)) -> n
+            else -1
+        print(a, b)
+        """), "99 5\n")
+
+@test("a generic function inferred through a generic construction")
+gr_through_construction()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        id[T](x: T) -> T = x
+        struct Box[T]
+            value: T
+        end Box
+        print(id(Box(id(5))).value)
+        """), "5\n")
+
+@test("a generic enum destructured in a match")
+gr_enum_match()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        enum Maybe[T]
+            Just(value: T)
+            Nothing
+        end Maybe
+        say(m: Maybe[string]) -> string
+            m match
+                Just(s) -> s
+                Nothing -> "nothing"
+        end say
+        print(say(Just("here")), say(Nothing))
+        """), "here nothing\n")
+
+@test("a generic function passed through a generic type")
+gr_through_generic_type()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Box[T]
+            value: T
+        end Box
+        unbox[T](b: Box[T]) -> T = b.value
+        print(unbox(Box(3)), unbox(Box("three")))
+        """), "3 three\n")
+
+@test("the expected type supplies a type argument the arguments do not")
+gr_expected_supplies()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        empty[T]() -> Option[T] = None
+        var e: Option[real] = empty()
+        var isNone = e match
+            Some(x) -> false
+            None -> true
+        print(isNone)
+        """), "true\n")
+
+@test("a recursive generic function")
+gr_recursive()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        countdown[T: Display](n: int, x: T)
+            if n > 0 then
+                print(n, x)
+                countdown(n - 1, x)
+        end countdown
+        countdown(3, "go")
+        """), "3 go\n2 go\n1 go\n")
+
+// -- an array where a slice is asked for ----------------------------------------------------------
+
+@test("a literal solves the element type and becomes the slice")
+gr_array_literal_slice()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        count[T](xs: []T) -> int = int(xs.len)
+        print(count([1, 2, 3]))
+        """), "3\n")
+
+@test("the same for a 'const' view, which is what a library parameter is written as")
+gr_array_const_view()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        total[T: Add](xs: []const T, zero: T) -> T
+            var n = zero
+
+            for x in xs
+                n = n + x
+
+            n
+        end total
+        print(total([1, 2, 3], 0))
+        """), "6\n")
+
+@test("the element type is read off the literal rather than defaulted")
+gr_array_element_type()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        kind[T](xs: []T, probe: T) -> T = probe
+        print(kind([1.5, 2.5], 0.25))
+        """), "0.25\n")
+
+@test("and a named array of the same elements arrives at the same place")
+gr_array_named()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        gen[T](xs: []const T) -> int = int(xs.len)
+        var a = [1, 2, 3]
+        print(gen(a))
+        """), "3\n")
+
+@test("and the array parameter it could have been confused with still binds its length")
+gr_array_length_param()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        len[const N: usize, T](xs: [N]T) -> usize = N
+        var a = [1, 2, 3]
+        print(len(a))
+        """), "3\n")
+
+// -- null at a parameter still being solved -------------------------------------------------------
+
+@test("another argument's pointer settles which pointer it is")
+gr_null_after()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        two[T](a: *T, b: *T) -> bool = a == b
+        var x: int = 3
+        print(two(&x, null))
+        """), "false\n")
+
+@test("and it settles it from either side, since a held argument waits rather than queues")
+gr_null_before()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        two[T](a: *T, b: *T) -> bool = a == b
+        var x: int = 3
+        print(two(null, &x))
+        """), "false\n")
+
+@test("a parameter that is the type parameter itself takes it too")
+gr_null_bare_param()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        same[T](a: T, b: T) -> bool = true
+        var x: int = 3
+        print(same(&x, null))
+        """), "true\n")
+
+@test("the pointee is the one the other argument gave, not a default")
+gr_null_pointee()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        first[T](a: *T, b: *T) -> T = *a
+        var x: u8 = 200
+        print(first(&x, null))
+        """), "200\n")
+
+@test("a generic method's parameter answers for it as well")
+gr_null_method()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Box[T]
+            v: T
+
+            beside(self, a: *T, b: *T) -> bool = a == b
+        end Box
+        var x: int = 3
+        print(Box(1).beside(&x, null))
+        """), "false\n")
+
+@test("a generic constructor's field answers for it")
+gr_null_constructor()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Pair[T]
+            a: *T
+            b: *T
+        end Pair
+        var x: int = 3
+        var p = Pair(&x, null)
+        print(p.a == p.b)
+        """), "false\n")
+
+@test("a member's own type parameter answers for it, not only its type's")
+gr_null_member_param()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Box[T]
+            v: T
+
+            take[U](self, a: *U, b: *U) -> bool = a == b
+        end Box
+        var x: int = 3
+        print(Box("held").take(&x, null))
+        """), "false\n")
+
+@test("a parameter the receiver already settled takes it in the first place")
+gr_null_receiver()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Holder[T]
+            p: *T
+
+            only(self, q: *T) -> bool = q == self.p
+        end Holder
+        var x: int = 3
+        print(Holder(&x).only(null))
+        """), "false\n")
+
+@test("the arguments are read by name where they are written by name")
+gr_null_named()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        two[T](a: *T, b: *T) -> bool = a == b
+        var x: int = 3
+        print(two(b = null, a = &x))
+        """), "false\n")
+
+@test("and an overload is chosen with one among the arguments")
+gr_null_overload()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        pick(a: string) -> int = 1
+        pick[T](a: *T, b: *T) -> int = 2
+        var x: int = 3
+        print(pick(&x, null), pick("s"))
+        """), "2 1\n")
+
+@test("a *extern parameter the same solution reached takes the absent callback")
+gr_null_extern_callback()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        hook[T](on: *extern(*T) -> unit, off: *extern(*T) -> unit, state: *T) -> bool = off == null
+
+        ping(n: *int)
+            *n = *n + 1
+
+        var x: int = 0
+        print(hook(&ping, null, &x))
+        """), "true\n")
+
+@test("a solved parameter that is not a pointer refuses it in that parameter's own terms")
+gr_null_reference_param()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        two[T](a: *T, b: &T) -> bool = true
+        var x: int = 3
+        print(two(&x, null))
+        """)
+
+    assert(gr_says(said, "a &int always points at a live object — an absent one is Option[&int]"), said)
+
+@test("a variadic tail is still no context, generic callee or not")
+gr_null_variadic()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        count[T](a: *T, ...) -> int = 0
+        var x: int = 3
+        print(count(&x, null))
+        """)
+
+    assert(gr_says(said, "'null' takes its type from its context, and there is none here"), said)
+
+@test("a concrete parameter beside a solved one is unaffected")
+gr_null_concrete()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        two[T](a: *T, b: *int) -> bool = b == null
+        var x: u8 = 1
+        print(two(&x, null))
+        """), "true\n")
+
+@test("nothing else to read is the refusal it always was, for a null")
+gr_null_alone()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        one[T](a: *T) -> bool = true
+        print(one(null))
+        """)
+
+    assert(gr_says(said, "'null' takes its type from its context, and there is none here"), said)
+
+@test("and neither is two of them")
+gr_null_two()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        two[T](a: *T, b: *T) -> bool = true
+        print(two(null, null))
+        """)
+
+    assert(gr_says(said, "'null' takes its type from its context, and there is none here"), said)
+
+// Not the reference's own case, but the same fault from the other side: the provisional reading of
+// an argument at an unsolved parameter is sandboxed, so a mistake inside it was rewound and nothing
+// was said at all. The reference names the mistake.
+@test("an argument that cannot be read at an unsolved parameter still says why")
+gr_unsolved_arg_says_why()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        id[T](x: T) -> T = x
+        print(id(nope))
+        """)
+
+    assert(gr_says(said, "undefined name 'nope'"), said)
+
+// The same refusal where the parameter is a member's own or a generic struct's field, which go
+// through solves of their own.
+@test("a null nothing settles is refused at a generic member and a generic constructor too")
+gr_null_member_and_constructor()
+    if !gr_ready() then return
+
+    val member = gr_err(raw"""
+        struct Box[T]
+            v: T
+
+            take[U](self, a: *U) -> bool = true
+        print(Box(1).take(null))
+        """)
+
+    assert(gr_says(member, "'null' takes its type from its context, and there is none here"), member)
+
+    val made = gr_err(raw"""
+        struct Pair[T]
+            a: *T
+        var p = Pair(null)
+        """)
+
+    assert(gr_says(made, "'null' takes its type from its context, and there is none here"), made)
+
+@test("a parameter that is not a pointer at all still refuses it")
+gr_null_not_pointer()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        two[T](a: T, b: T) -> bool = true
+        print(two(1, null))
+        """)
+
+    assert(gr_says(said, "'null' is a raw pointer, and int was expected here"), said)
+
+// -- an argument the solution changes -------------------------------------------------------------
+
+@test("a dataless variant waits for the parameter, as a null does")
+gr_dataless_waits()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        same[T: Eq](a: T, b: T) -> bool = a == b
+        var n: Option[usize] = None
+        print(same(n, None))
+        """), "true\n")
+
+@test("and one carrying a literal is read again at the type the others settled")
+gr_literal_reread()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        same[T: Eq](a: T, b: T) -> bool = a == b
+        var s: Option[usize] = Some(3)
+        print(same(s, Some(3)), same(s, Some(4)))
+        """), "true false\n")
+
+@test("the payload takes the width the solution gave it, not its own default")
+gr_payload_width()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        first[T](a: T, b: T) -> T = a
+        var wide: Option[u64] = Some(5000000000)
+        print(str(first(wide, Some(5000000000)).unwrap()))
+        """), "5000000000\n")
+
+@test("an enum of the program's own is read the same way")
+gr_own_enum()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        enum Maybe[T]
+            Just(v: T)
+            Nothing
+        same[T](a: T, b: T) -> bool = true
+        var m: Maybe[u8] = Just(3u8)
+        print(same(m, Nothing), same(m, Just(4u8)))
+        """), "true true\n")
+
+@test("nothing else to read is the refusal it always was, for a dataless variant")
+gr_dataless_alone()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        one[T](a: Option[T]) -> bool = true
+        print(one(None))
+        """)
+
+    assert(gr_says(said, "cannot infer the type argument 'T' of 'None' here — annotate the expected type"), said)
+
+@test("a re-reading that cannot succeed leaves the original complaint")
+gr_reread_fails()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        same[T](a: T, b: T) -> bool = true
+        var s: Option[usize] = Some(3)
+        var t: string = "no"
+        print(same(s, t))
+        """)
+
+    assert(gr_says(said, "'b' of 'same' is sysl.Option[usize], but string was given"), said)
+
+// -- a construction over literals written first ---------------------------------------------------
+
+@test("the argument that knows settles the parameter, whichever end it is written at")
+gr_knows_either_end()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        same[T: Eq](a: T, b: T) -> bool = a == b
+        var s: Option[usize] = Some(3)
+        print(same(Some(3), s), same(Some(4), s))
+        """), "true false\n")
+
+@test("and the operator says the same, because it consults the same predicate")
+gr_operator_same()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        var s: Option[usize] = Some(3)
+        print(Some(3) == s, Some(4) == s)
+        """), "true false\n")
+
+@test("the two orders agree")
+gr_orders_agree()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        same[T: Eq](a: T, b: T) -> bool = a == b
+        var s: Option[usize] = Some(3)
+        print(same(s, Some(3)), same(Some(3), s), s == Some(3), Some(3) == s)
+        """), "true true true true\n")
+
+@test("the payload takes the solution's width at this end too")
+gr_payload_width_first()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        first[T](a: T, b: T) -> T = a
+        var wide: Option[u64] = Some(5000000000)
+        print(str(first(Some(5000000000), wide).unwrap()))
+        """), "5000000000\n")
+
+@test("a generic struct of the program's own is read the same way")
+gr_own_struct()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Box[T] derives Eq
+            v: T
+        same[T: Eq](a: T, b: T) -> bool = a == b
+        var b: Box[usize] = Box(3)
+        print(same(Box(3), b), Box(4) == b)
+        """), "true false\n")
+
+@test("an array literal written first")
+gr_array_first()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        first[T](a: T, b: T) -> T = a
+        var a: [3]usize = [1, 2, 3]
+        print(first([4, 5, 6], a)[0])
+        """), "4\n")
+
+@test("nested one level deep")
+gr_nested_construction()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        same[T: Eq](a: T, b: T) -> bool = a == b
+        var o: Option[Option[usize]] = Some(Some(3))
+        print(same(Some(Some(3)), o), Some(Some(3)) == o)
+        """), "true true\n")
+
+@test("a suffix inside the construction is still load-bearing")
+gr_suffix_load_bearing()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        same[T: Eq](a: T, b: T) -> bool = a == b
+        var s: Option[usize] = Some(3)
+        print(same(Some(3u8), s))
+        """)
+
+    assert(gr_says(said, "'b' of 'same' is sysl.Option[byte], but sysl.Option[usize] was given"), said)
+
+@test("an ordinary call over literals is not adaptable")
+gr_call_not_adaptable()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        same[T: Eq](a: T, b: T) -> bool = a == b
+        f(n: int) -> Option[int] = Some(n)
+        var s: Option[usize] = Some(3)
+        print(same(f(3), s))
+        """)
+
+    assert(gr_says(said, "'b' of 'same' is sysl.Option[int], but sysl.Option[usize] was given"), said)
+
+@test("a construction over a typed payload keeps its own type")
+gr_typed_payload()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        var s: Option[usize] = Some(3)
+        print(Some("x") == s)
+        """)
+
+    assert(gr_says(said, "'==' needs matching types, got sysl.Option[string] and sysl.Option[usize]"), said)
+
+@test("two constructions with nothing else to go on settle as they always did")
+gr_two_constructions()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        same[T: Eq](a: T, b: T) -> bool = a == b
+        print(Some(1) == Some(2), same(Some(1), Some(1)), str(Some(7).unwrap()))
+        """), "false true 7\n")
+
+@test("a negated literal inside is still a literal")
+gr_negated_inside()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        same[T: Eq](a: T, b: T) -> bool = a == b
+        var s: Option[i16] = Some(-3)
+        print(same(Some(-3), s), Some(-3) == s)
+        """), "true true\n")
+
+// -- the literal rule at a generic callee ---------------------------------------------------------
+
+@test("a parameter naming no type parameter fixes a literal")
+gr_fixed_param()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        at[T](xs: []T, i: usize) -> T = xs[i]
+        var ns: [3]int = [10, 20, 30]
+        print(at(ns[..], 2))
+        """), "30\n")
+
+@test("the same parameter fixes it at every width, and the argument is not merely truncated")
+gr_fixed_every_width()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        wide[T](x: T, a: u8, b: i16, c: u64) -> u64 = u64(a) + u64(b) + c
+        print(wide("ignored", 200, 30000, 5000000000))
+        """), "5000030200\n")
+
+@test("a parameter that does name one still takes the literal's own default")
+gr_named_param_default()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        twice[T: Add](x: T) -> T = x + x
+        print(twice(21))
+        """), "42\n")
+
+@test("a generic struct's field fixes one")
+gr_struct_field_fixes()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Slot[T]
+            v: T
+            at: usize
+        end Slot
+        var s = Slot("here", 7)
+        print(s.v, s.at)
+        """), "here 7\n")
+
+@test("a generic variant's field fixes one")
+gr_variant_field_fixes()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        enum Tagged[T]
+            Absent
+            Held(v: T, n: u8)
+        end Tagged
+        var t = Tagged.Held("x", 250)
+        var n: u8 = t match
+            Held(_, k) -> k
+            Absent -> 0
+        print(n)
+        """), "250\n")
+
+@test("a generic method's own parameter fixes one")
+gr_method_param_fixes()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Box[T]
+            v: T
+
+            pick[U](self, other: U, n: u16) -> u16 = n
+        end Box
+        var b = Box(1)
+        print(b.pick("s", 60000))
+        """), "60000\n")
+
+@test("a generic associated function's parameter fixes one")
+gr_associated_param_fixes()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Box[T]
+            v: T
+
+            of(x: T, n: u8) -> Box[T] = if n > 0 then Box(x) else Box(x)
+        end Box
+        print(Box.of("held", 200).v)
+        """), "held\n")
+
+@test("a literal at a parameter still being solved takes the type it solved to")
+gr_literal_solved()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        rotr[T: BitOr + Shl + Shr + Sub](x: T, n: T) -> T = (x >> n) | (x << (32 - n))
+        print(rotr(0x80000001u32, 4))
+        """), "402653184\n")
+
+@test("which one settled it does not matter, only that something did")
+gr_which_settled()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        pick[T: Ord](a: T, b: T, c: T) -> T = if a > b then a else if b > c then b else c
+        print(pick(1, 2, 250u8))
+        """), "250\n")
+
+@test("literals alone still settle it at their default")
+gr_literals_alone()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        id[T](x: T) -> T = x
+        print(id(7), id(2.5))
+        """), "7 2.5\n")
+
+@test("a literal too wide for the type it solved to is refused")
+gr_too_wide_solved()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        pair[T](a: T, b: T) -> T = a
+        print(pair(1u8, 300))
+        """)
+
+    assert(gr_says(said, "the literal 300 does not fit byte"), said)
+
+@test("a negated literal adapts like the one it negates")
+gr_negated_adapts()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        pair[T: Add](a: T, b: T) -> T = a + b
+        print(pair(-5, 100i8), pair(-2.5, 1.0f32))
+        """), "95 -1.5\n")
+
+@test("the type may come from inside another parameter's")
+gr_inside_another()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        nth[T](xs: []T, i: usize, fallback: T) -> T = if i < xs.len then xs[i] else fallback
+        var ns: [3]u16 = [10, 20, 30]
+        print(nth(ns[..], 1, 99), nth(ns[..], 7, 99))
+        """), "20 99\n")
+
+@test("the expected type outranks a literal")
+gr_expected_outranks()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        id[T](x: T) -> T = x
+        var b: u8 = id(200)
+        var big: u64 = id(5000000000)
+        print(b, big)
+        """), "200 5000000000\n")
+
+@test("and it still does when a closure stands at the same parameter")
+gr_expected_with_closure()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        twice[A](x: A, f: &Fn(A) -> A) -> A = f(f(x))
+        val n: usize = twice(0, a -> a + 1)
+        print(n)
+        """), "2\n")
+
+@test("a bare-arrow callable is read at the expected type too")
+gr_expected_bare_arrow()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        twice[A](x: A, f: A -> A) -> A = f(f(x))
+        val n: usize = twice(0, a -> a + 1)
+        print(n)
+        """), "2\n")
+
+@test("an argument with a type of its own still outranks the expected type")
+gr_typed_arg_outranks()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        twice[A](x: A, f: &Fn(A) -> A) -> A = f(f(x))
+        var start: u8 = 1
+        val n: usize = twice(start, a -> a + 1)
+        print(n)
+        """)
+
+    assert(gr_says(said, "cannot initialize 'n': declared usize but the value is byte"), said)
+
+@test("a literal against an argument of a type it cannot be names both")
+gr_literal_names_both()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        pair[T](a: T, b: T) -> T = a
+        print(pair("s", 1))
+        """)
+
+    assert(gr_says(said, "'b' of 'pair' is string, but int was given"), said)
+
+@test("a generic variadic checks its parameters and its tail apart")
+gr_generic_variadic()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        tagged[T](tag: T, n: u8, ...) -> u8 = n
+        print(tagged("t", 250, 1, 2), tagged(2.5, 7, 3))
+        """), "250 7\n")
+
+// The tail itself reaches the body: a generic callee's call used to be built from its parameters
+// alone, so the arguments after them were never passed and `va_arg` read whatever the registers held.
+@test("a generic variadic passes its tail to the body")
+gr_generic_variadic_tail()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        sum[T](tag: T, n: int, ...) -> int
+            var ap: va_list
+
+            va_start(ap)
+
+            var total = 0
+
+            for i in 0..<n
+                total += va_arg[int](ap)
+
+            va_end(ap)
+            total
+        end sum
+
+        print(sum("t", 3, 1, 2, 3), sum(2.5, 2, 10, 20))
+        """), "6 30\n")
+
+@test("a bare construction at a concrete reference parameter is still boxed")
+gr_boxed_at_reference()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Node
+            v: int
+        end Node
+        held[T](x: T, n: &Node) -> int = n.v
+        print(held("ignored", Node(5)))
+        """), "5\n")
+
+@test("a value at a concrete trait-object parameter is still erased")
+gr_erased_at_trait_object()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        struct Node
+            v: int
+        end Node
+        trait Show
+            show(self) -> string
+        impl Show for Node
+            show(self) -> string = "node"
+        named[T](x: T, s: *Show) -> string = s.show()
+        var n = Node(9)
+        print(named("ignored", &n))
+        """), "node\n")
+
+@test("a literal too wide for the parameter is still refused")
+gr_too_wide_param()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        at[T](x: T, i: u8) -> u8 = i
+        print(at("s", 300))
+        """)
+
+    assert(gr_says(said, "the literal 300 does not fit byte"), said)
+
+@test("an argument at a known parameter settles nothing about the unknown one")
+gr_known_settles_nothing()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        only[T](n: usize) -> usize = n
+        print(only(3))
+        """)
+
+    assert(gr_says(said, "'T' is in neither the parameters of 'only' nor its result, so nothing in this call says what it should be — write it out, as 'only[…](…)'"), said)
+
+@test("while a parameter the result mentions is asked for on the binding")
+gr_result_mentions()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        empty[T](n: usize) -> T
+            var zero: T
+            return zero
+        print(empty(3))
+        """)
+
+    assert(gr_says(said, "cannot infer the type argument 'T' of 'empty' here — annotate the expected type"), said)
+
+@test("type arguments at a call name the instantiation")
+gr_written_type_args()
+    if !gr_ready() then return
+
+    assert_eq(gr_ran(raw"""
+        id[T](x: T) -> T = x
+        print(id[int](3))
+        """), "3\n")
+
+@test("a type parameter nothing in the signature mentions is sent to the written list")
+gr_unmentioned_param()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        scale[const W: usize](xs: []const f32, out: []f32)
+            val v: <W>f32 = xs.load(0)
+            out.store(0, v)
+
+        var a: [8]f32
+        var b: [8]f32
+        scale(a[..], b[..])
+        """)
+
+    assert(gr_says(said, "'W' is in neither the parameters of 'scale' nor its result, so nothing in this call says what it should be — write it out, as 'scale[…](…)'"), said)
+    assert(!gr_says(said, "annotate the expected type"), said)
+
+@test("nor a local shadowing a generic name")
+gr_local_shadow()
+    if !gr_ready() then return
+
+    val said = gr_err(raw"""
+        id[T](x: T) -> T = x
+        var id: []int = [1, 2, 3]
+        print(id[0](3))
+        """)
+
+    assert(gr_says(said, "the thing being called must be a name, or something whose type says it is callable"), said)
+    assert(!gr_says(said, "type arguments"), said)

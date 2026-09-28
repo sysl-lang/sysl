@@ -290,7 +290,10 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
     // suppressed as a consequence of one -- and a body made real at `?` would complain again from
     // inside the declaration, about a line the reader did not write.
     for i in 0..<targs.len()
-        if targs.at(i) == Unknown then return bad_expr(span)
+        if targs.at(i) == Unknown
+            voice_unknown_args(cx, slots, prov)
+            return bad_expr(span)
+        end if
 
     // A type argument that does not meet what the declaration asked of it ends the call: the body
     // would be read at a type the bound was supposed to have ruled out, and every complaint that
@@ -347,6 +350,12 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
                     inner.reported = Some(span)
                     inner.here_src = caller_source(cx)
                     ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
+
+    // The tail of a variadic definition, which no parameter names and so no solution reaches: it
+    // is read exactly as a non-generic callee's is, so a `null` there has no context either.
+    if decl.variadic
+        for i in slots.len()..<args.len()
+            ts.push(variadic_extra(cx, args.at(i)))
 
     check_crossings(cx, decl.crossing, written, sig.unwrap().params, ts)
     cx.an.uses(name)
@@ -423,6 +432,24 @@ private argument_at(cx: &Analyzer, decl: FuncDecl, i: usize, e: Expr, want: Type
 
     if disagree(texpr_type(again), want) then fitted else again
 end argument_at
+
+// **An argument the solve could not read is read once more, for real, so that what it could not
+// answer is said.** The provisional reading is sandboxed, so a `null` or a `None` at a parameter
+// nothing else settled came back unknown with its complaint rewound -- and the solve, seeing an
+// unknown argument, rightly stays quiet about the parameter it could not solve, taking the argument
+// to have spoken already. This is where it does: `one(null)` is told that `null` takes its type from
+// its context, and `one(None)` that nothing says what the `Option` holds. A callable was read
+// outside the sandbox and has already said what it had to. Only the leftmost speaks, as in the
+// reference: `two(null, null)` is one mistake written twice.
+voice_unknown_args(cx: &Analyzer, slots: Buf[Option[Expr]], prov: Provisional)
+    for i in 0..<slots.len()
+        val kept = i < prov.kept.len() && prov.kept.at(i).is_some()
+
+        if !kept && slots.at(i).is_some() && i < prov.tys.len() && mentions_unknown(prov.tys.at(i))
+            type_expr(cx, slots.at(i).unwrap(), None)
+            return
+        end if
+end voice_unknown_args
 
 // A written-out array where a view of it was asked for, which is the one conversion the analysis
 // performs rather than one the position repairs afterwards.
