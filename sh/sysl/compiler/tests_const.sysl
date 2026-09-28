@@ -1,0 +1,562 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `const` -- the one kind of module-level binding that is a value rather than storage
+// (`reference/modules.md § const — a value`), the reference's `ConstTests`.
+//
+// A constant is folded into every use and has no storage, so nothing here checks what is emitted:
+// the claims are about the value arriving intact at each of the four places a constant may stand --
+// an expression, an array bound, an enum discriminant and a pattern -- and about the refusals. The
+// last three places are what a nullary function cannot do, and are the reason the declaration exists.
+//
+// **Every string quoted here was read out of the reference compiler** (0.0.149) on the same input.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private cst_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end cst_ready
+
+// A file of a program: the module it belongs to (a directory path), its name, and its text.
+private cst_files() -> Buf[(string, string, string)] = buf()
+
+// **What a program of these files PRINTS**, or what the build had to say about it instead. The project
+// ROOT is handed over rather than an entry file, a module being a directory.
+private cst_out(files: Buf[(string, string, string)]) -> string
+    val root = make_temp_dir("sysl-const").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for i in 0..<files.len()
+        val f = files.at(i)
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end cst_out
+
+// One file, as the whole program.
+private cst_ran(text: string) -> string
+    var fs = cst_files()
+
+    fs.push(("", "main.sysl", text))
+    cst_out(fs)
+
+// A module `limits` of one file beside a beginning.
+private cst_with_limits(limits: string, main: string) -> string
+    var fs = cst_files()
+
+    fs.push(("limits", "limits.sysl", limits))
+    fs.push(("", "main.sysl", main))
+    cst_out(fs)
+
+private cst_says(said: string, part: string) -> bool = said.index_of(part).is_some()
+
+private cst_refuses(said: string, part: string) =
+    assert(cst_says(said, part), s"expected '$part', got: $said")
+
+// -- the declaration parses -----------------------------------------------------------------------
+
+@test("with its type and its value")
+cst_with_its_type_and_its_value()
+    assert_eq(pf("const n: int = 1"), "(const n : int 1)")
+
+@test("and carries a visibility modifier like any other declaration")
+cst_and_carries_a_visibility_modifier()
+    assert_eq(pf("private const n: int = 1"), "(const private n : int 1)")
+    assert_eq(pf("private[geom] const n: int = 1"), "(const private[geom] n : int 1)")
+
+@test("a value is not optional")
+cst_a_value_is_not_optional()
+    assert_eq(pf_err("const n: int"), "'=' expected")
+
+@test("and neither is a type")
+cst_and_neither_is_a_type()
+    assert_eq(pf_err("const n = 1"), "':' expected")
+
+// -- a constant belongs to a module, not to a block -----------------------------------------------
+
+// A constant is folded into its uses before the program runs, so there is nothing for one written
+// inside a body to be folded *in*. The use below it is told the name is undefined, never that it was
+// declared below this -- which would name a mistake the program had not made.
+private cst_in_a_body() -> string = raw"""
+    f() -> int
+        const k: int = 7
+        k + 1
+
+    print(str(f()))
+    """
+
+private cst_a_member() -> string =
+    "a constant is a module member and is declared at the top level — it is folded into its uses " +
+    "before the program runs, so there is no block for one written here to belong to. A name " +
+    "bound to a value inside a body is a 'val'"
+
+@test("so one written inside a function body is refused where it stands")
+cst_so_one_written_inside_a_function_body_is_refused()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran(cst_in_a_body()), cst_a_member())
+
+@test("and the use below it is never told the name was declared below it")
+cst_and_the_use_below_it_is_never_told()
+    if !cst_ready() then return
+
+    val said = cst_ran(cst_in_a_body())
+
+    cst_refuses(said, "undefined name 'k'")
+    assert(!cst_says(said, "declared below this"), said)
+
+@test("the same inside a loop body, which is a block like any other")
+cst_the_same_inside_a_loop_body()
+    if !cst_ready() then return
+
+    val said = cst_ran(raw"""
+        var i = 0
+        while i < 2
+            const step: int = 1
+            i += step
+        """)
+
+    cst_refuses(said, cst_a_member())
+    cst_refuses(said, "undefined name 'step'")
+
+@test("while the one written at the top of the file is untouched")
+cst_while_the_one_written_at_the_top_is_untouched()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran("const k: int = 7\nprint(str(k + 1))"), "8\n")
+
+// -- a constant is a value ------------------------------------------------------------------------
+
+@test("read in an expression")
+cst_read_in_an_expression()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran("const n: int = 7\nprint(str(n + 1))"), "8\n")
+
+@test("with its declared type, not the one the context wanted")
+cst_with_its_declared_type()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("const n: usize = 7\nvar m: int = n"),
+                "cannot initialize 'm': declared int but the value is usize")
+
+// The literal takes its type from the declaration, so no suffix is written and none is needed.
+@test("of any scalar type")
+cst_of_any_scalar_type()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const a: u8 = 255
+        const b: real = 0.5
+        const c: bool = true
+        const d: char = 'q'
+        const e: string = "hi"
+        print(s"${str(a)} ${str(b)} ${str(c)} ${str(d)} $e")
+        """), "255 0.5 true q hi\n")
+
+@test("reachable from another module by its full path")
+cst_reachable_by_its_full_path()
+    if !cst_ready() then return
+
+    assert_eq(cst_with_limits("module limits\nconst width: int = 12\n", "print(str(limits.width))\n"),
+              "12\n")
+
+@test("and by an import")
+cst_and_by_an_import()
+    if !cst_ready() then return
+
+    assert_eq(cst_with_limits("module limits\nconst width: int = 12\n",
+                              "import limits.width\nprint(str(width))\n"),
+              "12\n")
+
+// An array bound, a discriminant and a pattern are what a constant is *for*, and the qualified
+// spelling has to reach them as the imported one does: a full path is a field read after parsing.
+@test("in every position a constant may stand, and not only in an expression")
+cst_in_every_position_a_constant_may_stand()
+    if !cst_ready() then return
+
+    assert_eq(cst_with_limits("module limits\nconst width: int = 3\n", raw"""
+        const same: int = limits.width * 2
+
+        enum Step
+            Small = limits.width
+            Large = 9
+
+        var xs: [limits.width]int
+
+        print(s"$same ${int(Step.Small)} ${xs.len}")
+        """), "6 3 3\n")
+
+// Flattening a chain of field reads is where a fix could stop one level short.
+@test("however deep the module path is")
+cst_however_deep_the_module_path_is()
+    if !cst_ready() then return
+
+    var fs = cst_files()
+
+    fs.push(("a.b", "b.sysl", "module a.b\nconst width: int = 4\n"))
+    fs.push(("", "main.sysl", "const same: int = a.b.width\nvar xs: [a.b.width]int\nprint(s\"$same ${xs.len}\")\n"))
+
+    assert_eq(cst_out(fs), "4 4\n")
+
+// A field read that names no constant goes on being reported as what it is.
+@test("while a field read of a value is still not a constant")
+cst_while_a_field_read_of_a_value_is_still_not_a_constant()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("struct P\n    x: int\nend P\nval p = P(1)\nconst n: int = p.x"),
+                "the value of 'n' is not a constant expression")
+
+@test("unless it is private to its file")
+cst_unless_it_is_private_to_its_file()
+    if !cst_ready() then return
+
+    var fs = cst_files()
+
+    fs.push(("limits", "a.sysl", "module limits\nprivate const width: int = 12\n"))
+    fs.push(("limits", "b.sysl", "module limits\nwide() -> int = width\n"))
+    fs.push(("", "main.sysl", "print(str(limits.wide()))\n"))
+
+    val said = cst_out(fs)
+
+    // The rest of the line is the temporary directory's path.
+    cst_refuses(said, "'limits.width' is private to '")
+    cst_refuses(said, "/limits/a.sysl', the file that declares it")
+
+// -- a constant expression folds ------------------------------------------------------------------
+
+@test("arithmetic and bit operations")
+cst_arithmetic_and_bit_operations()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const a: int = 2 + 3 * 4
+        const b: int = 1 << 10
+        const c: int = 0xFF & 0x0F | 0x30
+        const d: int = ~0
+        print(s"${str(a)} ${str(b)} ${str(c)} ${str(d)}")
+        """), "14 1024 63 -1\n")
+
+@test("one constant in terms of another, whichever order they were written in")
+cst_one_constant_in_terms_of_another()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const total: usize = head + tail
+        const head: usize = 8
+        const tail: usize = 4
+        print(str(total))
+        """), "12\n")
+
+@test("a comparison, to a boolean")
+cst_a_comparison_to_a_boolean()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran("const big: bool = 100 > 99\nprint(str(big))"), "true\n")
+
+@test("a conversion, which truncates exactly as a written one does")
+cst_a_conversion_which_truncates()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran("const low: u8 = u8(300)\nprint(str(low))"), "44\n")
+
+@test("floating-point arithmetic")
+cst_floating_point_arithmetic()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran("const half: real = 1.0 / 4.0 + 0.25\nprint(str(half))"), "0.5\n")
+
+// -- a constant may be an array bound -------------------------------------------------------------
+
+@test("which is the whole reason for the declaration")
+cst_which_is_the_whole_reason_for_the_declaration()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran("const capacity: usize = 6\nvar buf: [capacity]u8\nprint(str(buf.len))\n"), "6\n")
+
+@test("including one computed from others")
+cst_including_one_computed_from_others()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const lit: usize = 286
+        const dist: usize = 30
+        var lengths: [lit + dist]u8
+        print(str(lengths.len))
+        """), "316\n")
+
+@test("and it sizes a struct's field, so two declarations cannot drift apart")
+cst_and_it_sizes_a_structs_field()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const capacity: usize = 4
+        struct Chunk
+            code: [capacity]u8
+            len: usize
+        end Chunk
+        var c: Chunk
+        print(str(c.code.len))
+        """), "4\n")
+
+@test("a call is still not one")
+cst_a_call_is_still_not_one()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("capacity() -> usize = 8usize\nvar buf: [capacity()]u8"),
+                "an array length must be a constant — a literal, or a 'const' naming one")
+
+// -- a constant may be an enum discriminant -------------------------------------------------------
+
+@test("on its own")
+cst_on_its_own()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const base: int = 10
+        enum Step
+            First = base
+            Second
+        end Step
+        print(s"${str(int(Step.First))} ${str(int(Step.Second))}")
+        """), "10 11\n")
+
+@test("and in an expression, at the enum's own width")
+cst_and_in_an_expression_at_the_enums_own_width()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const top: u8 = 255
+        enum Level: u8
+            Low = 1
+            High = top - 1
+        end Level
+        print(str(u8(Level.High)))
+        """), "254\n")
+
+@test("one that does not fit is still refused")
+cst_one_that_does_not_fit_is_still_refused()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("const top: int = 300\nenum Level: u8\n    High = top\nend Level"),
+                "discriminant 300 of variant 'High' does not fit byte")
+
+// -- a constant may be a pattern ------------------------------------------------------------------
+
+// A name in a pattern resolves against what is declared before it is taken as a binding, so a
+// lowercase constant matches by value rather than silently making the arm irrefutable.
+@test("and matches by value rather than binding")
+cst_and_matches_by_value_rather_than_binding()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        const limit: int = 3
+        describe(n: int) -> string =
+            n match
+                limit -> "at the limit"
+                else "somewhere else"
+        print(s"${describe(3)} ${describe(4)}")
+        """), "at the limit somewhere else\n")
+
+@test("a name that is not a constant still binds")
+cst_a_name_that_is_not_a_constant_still_binds()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        describe(n: int) -> string =
+            n match
+                other -> s"bound ${str(other)}"
+        print(describe(9))
+        """), "bound 9\n")
+
+// -- what a constant may not be -------------------------------------------------------------------
+
+@test("defined in terms of itself")
+cst_defined_in_terms_of_itself()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("const n: int = n + 1"), "constant 'n' is defined in terms of itself: n \u{2192} n")
+
+@test("or in terms of something that is defined in terms of it")
+cst_or_in_terms_of_something_defined_in_terms_of_it()
+    if !cst_ready() then return
+
+    val said = cst_ran("const a: int = b\nconst b: int = a\nprint(str(a))")
+
+    cst_refuses(said, "constant 'a' is defined in terms of itself: a \u{2192} b \u{2192} a")
+    cst_refuses(said, "constant 'b' is defined in terms of itself: b \u{2192} a \u{2192} b")
+
+@test("given a value that is not constant")
+cst_given_a_value_that_is_not_constant()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("f() -> int = 1\nconst n: int = f()"), "the value of 'n' is not a constant expression")
+
+@test("given a value that does not fit its type")
+cst_given_a_value_that_does_not_fit_its_type()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("const n: u8 = 256"), "'n' does not fit byte: 256")
+    cst_refuses(cst_ran("const N: u8 = 300"), "'N' does not fit byte: 300")
+
+@test("given a value of another kind entirely")
+cst_given_a_value_of_another_kind_entirely()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("const n: int = \"twelve\""), "'n' is declared int but its value is a string")
+
+@test("declared at a type that is not a scalar")
+cst_declared_at_a_type_that_is_not_a_scalar()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("enum Mode\n    On\n    Off\nend Mode\nconst m: Mode = 1"),
+                "a constant is a scalar, and Mode is not — 'm'")
+
+// An AGGREGATE is refused for being storage and pointed at the `val` that holds it -- never told its
+// initializer is not a constant expression, which the neighbouring `val` contradicts.
+private cst_storage(src: string, ty: string, name: string)
+    val said = cst_ran(src + "\nprint(1)")
+
+    cst_refuses(said, s"a constant is a scalar, and $ty is storage — write '$name' as a 'val', which is " +
+                      "laid into the object file as constant data")
+    assert(!cst_says(said, "not a constant expression"), said)
+
+@test("declared at an aggregate type, which is storage rather than a value")
+cst_declared_at_an_aggregate_type()
+    if !cst_ready() then return
+
+    cst_storage("const zeros: [3]u8 = [0, 0, 0]", "[3]byte", "zeros")
+    cst_storage("const zeros: [16]u8 = [0; 16]", "[16]byte", "zeros")
+    cst_storage("struct Id\n    raw: [16]u8\nend Id\nconst nil: Id = Id([0; 16])", "Id", "nil")
+    cst_storage("const pair: (int, int) = (1, 2)", "(int, int)", "pair")
+
+@test("and the 'val' the refusal names compiles and holds the value")
+cst_and_the_val_the_refusal_names_compiles()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran(raw"""
+        struct Id
+            raw: [16]u8
+        end Id
+        val nil: Id = Id([0; 16])
+        print(nil.raw[0], nil.raw[15])
+        """), "0 0\n")
+
+@test("divided by zero where the compiler is the one dividing")
+cst_divided_by_zero()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("const n: int = 1 / 0"), "a constant divided by zero")
+
+@test("declared twice")
+cst_declared_twice()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("const n: int = 1\nconst n: int = 2"), "constant 'n' is already declared")
+
+@test("declared over a function's name")
+cst_declared_over_a_functions_name()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("const n: int = 1\nn() -> int = 2"), "'n' is already declared as a constant")
+
+@test("declared over an enum variant's name")
+cst_declared_over_an_enum_variants_name()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("enum Colour\n    Red\nend Colour\nconst Red: int = 1"),
+                "'Red' is already used by enum 'Colour'")
+
+// A constant has no address: it is folded into each use and occupies no storage, which is what
+// divides it from the `val` that exists to be indexed.
+@test("pointed at, since it is folded into each use and sits nowhere")
+cst_pointed_at()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("const capacity: usize = 512\nvar p = &capacity\nprint(*p)"),
+                "'&' needs a variable, a field, an element, or a dereference — something with an address")
+
+// -- a constant may be declared at a constrained subtype ------------------------------------------
+
+// Without `new` a constrained type *is* its base; what it adds is the `within` range, checked against
+// a value that is already known -- the run-time check a `val` would have had, made one step earlier.
+@test("and holds a value the range admits")
+cst_and_holds_a_value_the_range_admits()
+    if !cst_ready() then return
+
+    assert_eq(cst_ran("type Age = int within 0..150\n\nconst a: Age = 42\n\nprint(str(a))\n"), "42\n")
+
+@test("while a value outside it is refused where it is written, naming both ends")
+cst_while_a_value_outside_it_is_refused()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("type Age = int within 0..150\n\nconst a: Age = 200\n\nprint(str(a))\n"),
+                "'a' is 200, which Age does not admit — it holds 0 to 150")
+
+@test("an exclusive upper bound says so rather than naming a value it excludes")
+cst_an_exclusive_upper_bound_says_so()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("type Slot = u8 within 0..<200\n\nconst s: Slot = 200\n\nprint(str(s))\n"),
+                "'s' is 200, which Slot does not admit — it holds 0 to under 200")
+
+// A value no `u8` could hold is not a range's business, so the base's width answers first.
+@test("and the base's width is checked before the range is")
+cst_and_the_bases_width_is_checked_first()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("type Slot = u8 within 0..200\n\nconst s: Slot = 300\n\nprint(str(s))\n"),
+                "'s' does not fit byte: 300")
+
+@test("a 'new' type is refused, since a constant has nowhere to write the conversion")
+cst_a_new_type_is_refused()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("type Meters = new int\n\nconst m: Meters = 3\n\nprint(str(m))\n"),
+                "'m' is declared Meters, which is a 'new' type — reaching one from its base is a written " +
+                "conversion, and a constant is the value it is written as, so there is nowhere here to write it")
+
+@test("and a 'where' predicate is refused, since there is no site to run it at")
+cst_and_a_where_predicate_is_refused()
+    if !cst_ready() then return
+
+    cst_refuses(cst_ran("type Even = int where value % 2 == 0\n\nconst n: Even = 4\n\nprint(str(n))\n"),
+                "'n' is declared Even, whose 'where' predicate is checked where a value is made — and a " +
+                "constant is folded into its uses rather than made anywhere, so the check has no site. A " +
+                "'within' range is settled here; a predicate cannot be")
