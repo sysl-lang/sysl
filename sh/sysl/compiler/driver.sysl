@@ -716,27 +716,47 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
         Some(one) -> run_cache_reserve(one)
         None -> None
 
-    var staging: Option[string] = None
-    var exe = ""
-
     slot match
-        Some(kept) -> exe = kept
+        Some(kept) ->
+            link_into_cache(path, emitted.text, t, cc, level, kept, false, emitted.links).map_err(said)?
+            started(kept, args, None).map_err(said)
         None ->
             val dir = make_temp_dir("sysl-run-") match
                 Err(_) -> return Err(Said(Refusal("no directory to build in")))
                 Ok(made) -> made
 
-            staging = Some(dir)
-            exe = join_path(dir, "program")
+            val staging = Some(dir)
+            val exe = join_path(dir, "program")
 
-    link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links) match
+            link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links) match
+                Err(why) ->
+                    discard_staging(staging)
+                    return Err(Said(why))
+                Ok(_) -> ()
+
+            started(exe, args, staging).map_err(said)
+end run_native_program
+
+// A link whose product is a cache entry: made under a pending name beside the slot and published
+// onto it (`publish.sysl`), so another run that finds the slot finds a whole executable or none.
+//
+// **The linker still writes the file**, which is what the cache has always relied on for the
+// executable bit -- a rename moves a name and leaves the mode the linker gave the file alone.
+private link_into_cache(path: string, text: string, t: Target, cc: Option[string], level: string,
+                        slot: string, standalone: bool,
+                        links: Buf[string]) -> Result[unit, Refusal]
+    val pending = pending_name(slot)
+
+    link_lowered_text(path, text, t, cc, level, pending, standalone, links) match
         Err(why) ->
-            discard_staging(staging)
-            return Err(Said(why))
+            remove_file(pending)
+            return Err(why)
         Ok(_) -> ()
 
-    started(exe, args, staging).map_err(said)
-end run_native_program
+    publish_file(pending, slot) match
+        Err(_) -> Err(Refusal(s"cannot put the program it built at $slot"))
+        Ok(_) -> Ok(())
+end link_into_cache
 
 // The child, with whatever this run has to take away once it has ended.
 //
@@ -945,8 +965,8 @@ end build_test_binary
 // The same, into the cache where this run has a slot in it -- with `true` for a binary that is a
 // cache entry and outlives the run, and `false` for a temporary the caller has to take away.
 //
-// **The link goes straight into the slot** rather than to a temporary that is copied afterwards: a
-// copy would have to reproduce the executable bit, which is one more thing to get wrong per platform.
+// **The link goes to a pending name beside the slot and is renamed onto it** (`link_into_cache`),
+// never straight into the slot: another suite may be starting the binary already there.
 build_test_binary_cached(path: string, build: TestBuild, cc: Option[string], level: string,
                          key: Option[string]) -> Result[(string, bool), Refusal]
     val slot = key match
@@ -955,8 +975,8 @@ build_test_binary_cached(path: string, build: TestBuild, cc: Option[string], lev
 
     slot match
         Some(exe) ->
-            link_lowered_text(path, build.emitted.text, build.target, cc, level, exe,
-                              build.standalone, build.emitted.links)?
+            link_into_cache(path, build.emitted.text, build.target, cc, level, exe,
+                            build.standalone, build.emitted.links)?
             Ok((exe, true))
         None ->
             val made = build_test_binary(path, build, cc, level)?
