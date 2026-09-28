@@ -1,0 +1,986 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The capability clauses of `reference/modules.md § Capabilities are a module property`: `@no_alloc`
+// narrowing a module below what its target offers, `@requires(...)` declaring what it cannot be built
+// without, and `@no_os`/`@no_posix` giving up the modules an environment gates.
+//
+// A capability is a property of the **module** written on each of its **files**, so most of the rules
+// here are about files agreeing, about where in a file the clause sits, and about which set a
+// construction is measured against -- the module's own, or its `@tests` scaffolding's.
+//
+// What `@no_alloc` refuses is *making* heap storage, never holding it, and the cases check that from
+// both sides.
+//
+// **Every string quoted here was read out of the reference compiler** run on the same project, whose
+// `CapabilityClauseTests` these are.
+
+private var cap_library_checked: bool = false
+private var cap_library_there: bool = false
+
+private cap_ready() -> bool
+    if !cap_library_checked
+        cap_library_checked = true
+        cap_library_there = std_root().is_ok()
+
+    if !cap_library_there
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end cap_ready
+
+private cap_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// How many lines of a report say something, for the claims that a mistake is reported once per site.
+private cap_lines_saying(text: string, part: string) -> usize
+    var n: usize = 0
+    var rest = text
+
+    loop
+        rest.index_of(part) match
+            None -> break
+            Some(i) ->
+                n += 1
+                rest = rest[i + part.bytes.len..<rest.bytes.len]
+
+    n
+end cap_lines_saying
+
+// A project: each file is its path under the root and its text, a module being the directory it is in.
+private cap_one(main: string) -> Buf[(string, string)]
+    var fs: Buf[(string, string)] = buf()
+
+    fs.push(("main.sysl", main))
+    fs
+end cap_one
+
+private cap_two(p: string, t: string, main: string) -> Buf[(string, string)]
+    var fs: Buf[(string, string)] = buf()
+
+    fs.push((p, t))
+    fs.push(("main.sysl", main))
+    fs
+end cap_two
+
+private cap_three(p1: string, t1: string, p2: string, t2: string, main: string) -> Buf[(string, string)]
+    var fs: Buf[(string, string)] = buf()
+
+    fs.push((p1, t1))
+    fs.push((p2, t2))
+    fs.push(("main.sysl", main))
+    fs
+end cap_three
+
+private cap_write(files: Buf[(string, string)]) -> string
+    val root = make_temp_dir("sysl-capability").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for i in 0..<files.len()
+        val f = files.at(i)
+        val at = s"$root/${f.0}"
+
+        f.0.last_index_of("/") match
+            Some(k) -> make_dir_all(s"$root/${f.0[0..<k]}").unwrap()
+            None -> ()
+
+        write_text(at, f.1).unwrap()
+
+    root
+end cap_write
+
+// **What the project PRINTS**, or what the build had to say about it.
+private cap_ran(files: Buf[(string, string)]) -> string
+    val root = cap_write(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end cap_ran
+
+// Everything the project has to say for itself, the lowering included, so a refusal a pass after the
+// analysis makes is one of these too.
+private cap_err(files: Buf[(string, string)]) -> string
+    val root = cap_write(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cap_err
+
+// The LLVM text of a project that must compile.
+private cap_ir(files: Buf[(string, string)]) -> string
+    val root = cap_write(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cap_ir
+
+private cap_needs(what: string) -> string =
+    s"$what needs an allocator, and this module declared '@no_alloc' — it may hold and release " +
+    "storage made elsewhere, and may make none of its own"
+
+private cap_header() -> string =
+    "this attribute belongs in the file's header, on the lines directly after 'module' and before " +
+    "everything else — it is a property of the whole module, not of the statements below it"
+
+private cap_reaches(what: string) -> string =
+    s"this reaches '$what', which makes heap storage, and this module declared '@no_alloc' — an " +
+    "allocator-free module may only call what is allocator-free itself"
+
+private cap_gated(what: string, who: string) -> string =
+    s"this reaches '$what', which requires 'os', and $who declared 'no os' — an environment " +
+    "capability gates which modules exist, so a module that gave one up may not reach one that needs it"
+
+private cap_escapes() -> string =
+    "this view of 'a' is returned, so the array would move to the heap to outlive the frame — and " +
+    "this module declared '@no_alloc', so there is nothing to move it into. Keep the view inside the " +
+    "frame, or take the storage from a caller as a '[]T' parameter, which is already wherever its " +
+    "owner put it"
+
+private cap_check(said: string, part: string) = assert(cap_says(said, part), said)
+
+private cap_thing(text: string) -> string = s"module thing\n$text"
+
+// -- the words the clauses used to spend are ordinary names ------------------------------------------
+
+@test("a function may be called 'alloc', which is what an allocator calls its own")
+cap_a_function_called_alloc()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("alloc(n: int) -> int = n + 1\n\nprint(alloc(6))\n")), "7\n")
+
+@test("'no', 'requires' and 'link' too")
+cap_no_requires_and_link_too()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("no(x: int) -> int = x\nrequires(x: int) -> int = x * 2\n" +
+                              "link(x: int) -> int = x + 3\n\nprint(no(1), requires(2), link(4))\n")),
+              "1 4 7\n")
+
+@test("a field may be called 'link', which is what the slab guide threads its free list through")
+cap_a_field_called_link()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("struct Block\n    link: *Block\n    alloc: int\n\n" +
+                              "var b = Block(null, 9)\nprint(b.alloc)\n")), "9\n")
+
+@test("and a local, in a module that gave the capability up")
+cap_a_local_in_an_allocator_free_module()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("@no_alloc\n\nf() -> int\n    val alloc = 3\n    val requires = 4\n\n" +
+                              "    alloc + requires\n\nprint(f())\n")), "7\n")
+
+// -- the clause is read in the file's header ----------------------------------------------------------
+
+@test("'no alloc' beside a module header")
+cap_no_alloc_beside_a_module_header()
+    if !cap_ready() then return
+
+    cap_check(cap_ir(cap_two("thing/a.sysl", cap_thing("@no_alloc\n\nf(p: *int) -> int = *p\n"),
+                             "var n = 7\nprint(thing.f(&n))")), "define")
+
+@test("'requires heap', the other direction")
+cap_requires_heap()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_two("thing/a.sysl", cap_thing("@requires(heap)\n\nf() -> &int = 1\n"),
+                              "print(*thing.f())")), "1\n")
+
+@test("a file with no module header may narrow, since the root module is a module")
+cap_a_file_with_no_module_header_may_narrow()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("@no_alloc\n\nf(p: *int) -> int = *p\n\nvar n = 4\nprint(f(&n))\n")), "4\n")
+
+@test("several clauses on their own lines")
+cap_several_clauses()
+    if !cap_ready() then return
+
+    cap_check(cap_ir(cap_two("thing/a.sysl", cap_thing("@no_alloc\n@requires(os)\n\nf() -> int = 1\n"),
+                             "print(thing.f())")), "define")
+
+@test("an attribute on the header's own line is refused, since each takes a line")
+cap_an_attribute_on_the_header_line()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_one("module m @no_alloc\n\nf() -> int = 1\n"))
+
+    cap_check(said, cap_header())
+    cap_check(said, "main.sysl:1:10")
+
+@test("and a clause written below the statements says where it belongs")
+cap_a_clause_below_the_statements()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_one("f() -> int = 1\n@no_alloc\n"))
+
+    cap_check(said, cap_header())
+    cap_check(said, "main.sysl:2:1")
+    assert(!cap_says(said, "newline expected"), said)
+
+@test("a malformed one is refused where it is malformed, rather than told to move")
+cap_a_malformed_clause()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_one("@requires(\nprint(1)\n"))
+
+    cap_check(said, "')' expected")
+    cap_check(said, "main.sysl:2:6")
+    assert(!cap_says(said, "belongs in the file's header"), said)
+
+@test("the same under a module header, which is the other way a file opens")
+cap_a_malformed_clause_under_a_module_header()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_one("module m\n@requires(\nf() -> int = 1\n"))
+
+    cap_check(said, "')' expected")
+    cap_check(said, "main.sysl:3:2")
+    assert(!cap_says(said, "belongs in the file's header"), said)
+
+@test("and a '@link' whose parenthesis never closed")
+cap_a_link_never_closed()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_one("@link(\"z\"\n\nf() -> int = 1\n"))
+
+    cap_check(said, "')' expected")
+    cap_check(said, "main.sysl:3:1")
+    assert(!cap_says(said, "belongs in the file's header"), said)
+
+// -- a clause that names nothing, or claims something unchecked, is refused --------------------------
+
+@test("a name that is not a capability")
+cap_a_name_that_is_not_a_capability()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_one("@requires(sockets)\n\nf() -> int = 1\n"))
+
+    cap_check(said, "no capability is called 'sockets' — the set is 'heap', 'os', 'posix'")
+    cap_check(said, "main.sysl:1:11")
+
+@test("and the same, spelled the narrowing way")
+cap_the_same_spelled_the_narrowing_way()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_one("@no_sockets\n\nf() -> int = 1\n"))
+
+    cap_check(said, "no capability is called 'sockets' — the set is 'heap', 'os', 'posix'")
+    cap_check(said, "main.sysl:1:2")
+
+@test("the same capability declared twice")
+cap_the_same_capability_declared_twice()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_one("@no_alloc\n@no_alloc\n\nf() -> int = 1\n"))
+
+    cap_check(said, "'alloc' is declared twice, and the second says nothing the first did not")
+    cap_check(said, "main.sysl:2:2")
+
+@test("and a capability both given up and required")
+cap_both_given_up_and_required()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_one("@no_alloc\n@requires(heap)\n\nf() -> int = 1\n"))
+
+    cap_check(said, "'heap' is both given up and required here, and a module cannot do without " +
+                    "something it cannot be built without — '@no_alloc' and 'requires heap' are the " +
+                    "two directions of one capability")
+    cap_check(said, "main.sysl:2:11")
+
+@test("while every capability there is may now be given up, since each of them gates something")
+cap_every_capability_may_be_given_up()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("@no_alloc\n@no_os\n@no_posix\n\nprint(1 + 1)\n")), "2\n")
+
+// -- the files of one module state the same clause ----------------------------------------------------
+
+@test("a file that dropped it is reported against one that kept it")
+cap_a_file_that_dropped_the_clause()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\nf() -> int = 1\n"),
+                                 "thing/b.sysl", cap_thing("\ng() -> int = 2\n"), "print(thing.f())"))
+
+    cap_check(said, "/thing/b.sysl and ")
+    cap_check(said, "/thing/a.sysl are both files of 'thing', and they declare different " +
+                    "capabilities — a capability is a property of the module, so every one of its " +
+                    "files states it: none against '@no_alloc'")
+    cap_check(said, "thing/b.sysl:1:1")
+
+@test("and two files stating it are not")
+cap_two_files_stating_it()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\nf() -> int = 1\n"),
+                                "thing/b.sysl", cap_thing("@no_alloc\n\ng() -> int = 2\n"),
+                                "print(thing.f() + thing.g())")), "3\n")
+
+// -- a '@tests' file states what the module's tests need ----------------------------------------------
+
+@test("it need not repeat the module's clause, which is what used to be refused")
+cap_a_tests_file_need_not_repeat_the_clause()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\nf() -> int = 1\n"),
+                                "thing/tests.sysl", cap_thing("@tests\n\nhelper() -> int = 2\n"),
+                                "print(thing.f())")), "1\n")
+
+@test("and it may take back what the module gave up, since what it declares does not ship")
+cap_a_tests_file_may_take_the_allocator_back()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\nf() -> int = 1\n"),
+                                "thing/tests.sysl",
+                                cap_thing("@tests\n@requires(heap)\n\nboxed() -> &int = 1\n"),
+                                "print(thing.f())")), "1\n")
+
+@test("while the same construction in a file that ships is refused as it always was")
+cap_the_same_construction_in_a_file_that_ships()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\nf() -> &int = 1\n"),
+                                 "thing/tests.sysl",
+                                 cap_thing("@tests\n@requires(heap)\n\nboxed() -> &int = 1\n"),
+                                 "print(1)"))
+
+    cap_check(said, cap_needs("a reference"))
+    cap_check(said, "thing/a.sysl:4:15")
+
+@test("a test file that says nothing is held to its module's clause")
+cap_a_silent_tests_file_is_held_to_the_module()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\nf() -> int = 1\n"),
+                                 "thing/tests.sysl", cap_thing("@tests\n\nboxed() -> &int = 1\n"),
+                                 "print(thing.f())"))
+
+    cap_check(said, cap_needs("a reference"))
+    cap_check(said, "thing/tests.sysl:4:19")
+
+@test("and one that narrows on its own is held to that, where its module narrowed nothing")
+cap_a_tests_file_that_narrows_on_its_own()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_three("thing/a.sysl", cap_thing("\nf() -> &int = 1\n"),
+                                 "thing/tests.sysl", cap_thing("@tests\n@no_alloc\n\nboxed() -> &int = 1\n"),
+                                 "print(*thing.f())"))
+
+    cap_check(said, "a reference needs an allocator, and this module's '@tests' file declared " +
+                    "'@no_alloc' — it may hold and release storage made elsewhere, and may make none " +
+                    "of its own")
+    cap_check(said, "thing/tests.sysl:5:19")
+
+@test("the module's clause is read off a file that ships, whatever order the files arrive in")
+cap_the_clause_is_read_off_a_file_that_ships()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_three("thing/a.sysl", cap_thing("@tests\n@requires(heap)\n\nboxed() -> &int = 1\n"),
+                                 "thing/b.sysl", cap_thing("@no_alloc\n\nf() -> &int = 1\n"), "print(1)"))
+
+    cap_check(said, cap_needs("a reference"))
+    cap_check(said, "thing/b.sysl:4:15")
+
+@test("two '@tests' files of one module state one thing between them")
+cap_two_tests_files_state_one_thing()
+    if !cap_ready() then return
+
+    var fs = cap_three("thing/a.sysl", cap_thing("@no_alloc\n\nf() -> int = 1\n"),
+                       "thing/t1.sysl", cap_thing("@tests\n@requires(heap)\n\nhelper() -> int = 2\n"),
+                       "print(thing.f())")
+
+    fs.push(("thing/t2.sysl", cap_thing("@tests\n\nother() -> int = 3\n")))
+
+    val said = cap_err(fs)
+
+    cap_check(said, "/thing/t2.sysl and ")
+    cap_check(said, "/thing/t1.sysl are both files of 'thing', and they declare different " +
+                    "capabilities — the tests of a module are one body of scaffolding, so its '@tests' " +
+                    "files state one thing between them: none against '@requires(heap)'")
+    cap_check(said, "thing/t2.sysl:1:1")
+
+private cap_beside() -> string =
+    cap_thing("@no_alloc\n\nf() -> int = 1\n\n@test\n" +
+              "beside_what_it_tests() =\n    val r: &int = 1\n    assert(*r == 1)\n")
+
+@test("a '@test' function in an ordinary file answers to the tests' clause too")
+cap_a_test_function_answers_to_the_tests_clause()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_three("thing/a.sysl", cap_beside(),
+                                "thing/tests.sysl", cap_thing("@tests\n@requires(heap)\n\nhelper() -> int = 2\n"),
+                                "print(thing.f())")), "1\n")
+
+@test("and is refused with the module where no '@tests' file took the allocator back")
+cap_a_test_function_refused_with_the_module()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl", cap_beside(), "print(thing.f())"))
+
+    cap_check(said, cap_needs("a reference"))
+    cap_check(said, "thing/a.sysl:8:19")
+
+// -- an allocator-free program reaches the modules that declared themselves so -------------------------
+
+@test("'sysl.math', whose comparisons and integer arithmetic allocate nowhere")
+cap_sysl_math()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("@no_alloc\n\nimport sysl.math.{max, min, gcd}\n\n" +
+                              "print(max(3, 7), min(3, 7), gcd(12, 18))\n")), "7 3 6\n")
+
+@test("'sysl.slices', which works in storage its caller already owns")
+cap_sysl_slices()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("@no_alloc\n\nimport sysl.slices.{reverse, index_of}\n\n" +
+                              "var a: [3]int = [1, 2, 3]\nreverse(a[0..<3])\n" +
+                              "print(a[0], index_of(a[0..<3], 1))\n")), "3 Some(2)\n")
+
+@test("'sysl.rand', whose generator is a value rather than a handle")
+cap_sysl_rand()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("@no_alloc\n\nimport sysl.rand.rng\n\nvar g = rng(42, 54)\n" +
+                              "print(g.next_u32() != 0)\n")), "true\n")
+
+@test("and 'sysl.sync', which a lock-free structure on a board is built out of")
+cap_sysl_sync()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("@no_alloc\n\nimport sysl.sync.Atomic\n\nvar a = Atomic(7)\nprint(a.load())\n")),
+              "7\n")
+
+@test("an 'impl Display' may live in an allocator-free module, since writing into the sink makes nothing")
+cap_an_impl_display_in_an_allocator_free_module()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("@no_alloc\n\nstruct Tag\n    n: int\n\nimpl Display for Tag\n" +
+                              "    display(self, out: *Writer, fmt: FormatSpec) = " +
+                              "display_str(\"tag\", out, fmt)\n\nprint(Tag(1))\n")), "tag\n")
+
+@test("including one whose text is chosen by a match over literals, which are static rather than made")
+cap_a_display_choosing_its_text_by_a_match()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("@no_alloc\n\nenum Fail\n    NotSquare\n    Singular\n\nimpl Display for Fail\n" +
+                              "    display(self, out: *Writer, fmt: FormatSpec)\n" +
+                              "        var text = self match\n" +
+                              "            NotSquare -> \"not square\"\n" +
+                              "            Singular -> \"singular\"\n\n" +
+                              "        display_str(text, out, fmt)\n    end display\n\n" +
+                              "print(Fail.Singular)\n")), "singular\n")
+
+private cap_mark() -> string = raw"""
+    module mark
+    @no_alloc
+
+    struct Mark
+        n: int
+
+    impl Display for Mark
+        display(self, out: *Writer, fmt: FormatSpec) = display_str("mark", out, fmt)
+    """
+
+private cap_mark_main() -> string = raw"""
+    import mark.Mark
+    import sysl.buf.byte_sink
+
+    var sink = byte_sink()
+    var out: *Writer = &sink
+
+    Mark(3).display(out, FormatSpec(0, -1, false))
+    putbytes(sink.text())
+    """
+
+@test("and linking an allocating 'Writer' leaves it alone, since which one is behind a '*Writer' is the caller's")
+cap_linking_an_allocating_writer()
+    if !cap_ready() then return
+
+    val files = cap_two("mark/a.sysl", cap_mark(), cap_mark_main())
+
+    cap_check(cap_ir(files), "mark")
+    assert_eq(cap_ran(files), "mark")
+
+private cap_loud() -> string = raw"""
+    module loud
+
+    struct Loud
+        n: int
+
+    impl Fallible for Loud
+
+    impl Writer for Loud
+        write(*self, bytes: []const u8)
+            var kept: &int = 1
+    """
+
+private cap_mark_say() -> string = raw"""
+    module mark
+    @no_alloc
+
+    import loud.Loud
+
+    say()
+        var sink = Loud(0)
+        var out: *Writer = &sink
+
+        display_str("mark", out, FormatSpec(0, -1, false))
+    """
+
+@test("but a module that erased the value itself is still answerable for what it reaches")
+cap_a_module_that_erased_the_value_itself()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_three("loud/a.sysl", cap_loud(), "mark/a.sysl", cap_mark_say(), "mark.say()\n"))
+
+    cap_check(said, cap_reaches("loud.Loud.write"))
+    cap_check(said, "mark/a.sysl:7:16")
+
+// -- 'no alloc' refuses every construction that makes heap storage -------------------------------------
+
+@test("a reference")
+cap_refuses_a_reference()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl", cap_thing("@no_alloc\n\nf() -> &int = 1\n"), "print(*thing.f())"))
+
+    cap_check(said, cap_needs("a reference"))
+    cap_check(said, "thing/a.sysl:4:15")
+
+private cap_shape() -> string = raw"""
+    module thing
+    @no_alloc
+
+    trait Shape
+        sides(self) -> int
+
+    struct Square
+        side: int
+
+    impl Shape for Square
+        sides(self) -> int = 4
+
+    f() -> &Shape = Square(1)
+    """
+
+@test("a boxed trait object, which is a reference underneath")
+cap_refuses_a_boxed_trait_object()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl", cap_shape(), "print(thing.f().sides())"))
+
+    cap_check(said, cap_needs("a reference"))
+    cap_check(said, "thing/a.sysl:13:17")
+
+@test("a slice with storage of its own")
+cap_refuses_a_slice_with_storage()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl",
+                               cap_thing("@no_alloc\n\nf() -> []int\n    var xs: []int = [1, 2, 3]\n    xs\n"),
+                               "print(thing.f()[0])"))
+
+    cap_check(said, cap_needs("a slice with storage of its own"))
+    cap_check(said, "thing/a.sysl:5:21")
+
+@test("a repeated slice, the other way one is made")
+cap_refuses_a_repeated_slice()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl",
+                               cap_thing("@no_alloc\n\nf(n: int) -> []int\n    var xs: []int = [0; n]\n    xs\n"),
+                               "print(thing.f(3)[0])"))
+
+    cap_check(said, cap_needs("a slice with storage of its own"))
+    cap_check(said, "thing/a.sysl:5:21")
+
+@test("two strings joined")
+cap_refuses_two_strings_joined()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl", cap_thing("@no_alloc\n\nf() -> string = \"a\" + \"b\"\n"),
+                               "print(thing.f())"))
+
+    cap_check(said, cap_needs("the string two strings join into"))
+    cap_check(said, "thing/a.sysl:4:17")
+
+@test("a value rendered as a string")
+cap_refuses_a_value_rendered_as_a_string()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl", cap_thing("@no_alloc\n\nf(n: int) -> string = str(n)\n"),
+                               "print(thing.f(1))"))
+
+    cap_check(said, cap_needs("the string a value renders as"))
+    cap_check(said, "thing/a.sysl:4:23")
+
+@test("and an interpolation, which is the same thing spelled differently")
+cap_refuses_an_interpolation()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl", cap_thing("@no_alloc\n\nf(n: int) -> string = s\"n=$n\"\n"),
+                               "print(thing.f(1))"))
+
+    cap_check(said, cap_needs("the string two strings join into"))
+    cap_check(said, "thing/a.sysl:4:23")
+
+// -- 'no alloc' leaves the whole no-alloc subset alone -------------------------------------------------
+
+@test("printing a slice")
+cap_printing_a_slice()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_two("thing/a.sysl", cap_thing("@no_alloc\n\nshow(xs: []int) = print(xs)\n"),
+                              "var a: [3]int = [4, 5, 6]\nthing.show(a[0..<3])\n")), "[4, 5, 6]\n")
+
+@test("raw pointers, fixed arrays, and views of them")
+cap_raw_pointers_fixed_arrays_and_views()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_two("thing/a.sysl",
+                              cap_thing("@no_alloc\n\nsum(xs: []int) -> int\n    var total = 0\n" +
+                                        "    for x in xs do total += x\n    total\n\nfirst(p: *int) -> int = *p\n"),
+                              "var a: [3]int = [4, 5, 6]\nprint(thing.sum(a[0..<3]))\nprint(thing.first(&a[0]))\n")),
+              "15\n4\n")
+
+@test("holding, passing and releasing a reference made somewhere else")
+cap_holding_a_reference_made_elsewhere()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_two("thing/a.sysl",
+                              cap_thing("@no_alloc\n\nstruct Held\n    r: &int\n\nkeep(r: &int) -> Held = Held(r)\n\n" +
+                                        "read(h: Held) -> int = *h.r\n"),
+                              "var r: &int = 9\nvar h = thing.keep(r)\nprint(thing.read(h))\n")), "9\n")
+
+@test("and a string literal, which is static rather than made")
+cap_a_string_literal()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_two("thing/a.sysl", cap_thing("@no_alloc\n\nname() -> string = \"kernel\"\n"),
+                              "print(thing.name())")), "kernel\n")
+
+@test("an integer of any width, which is what the blanket buys a module with no allocator")
+cap_an_integer_of_any_width()
+    if !cap_ready() then return
+
+    // Called from the program, so the instantiation is live: an uncalled generic emits nothing.
+    val widths = [("u8", "byte"), ("i64", "long"), ("u128", "u128"), ("i256", "i256")]
+
+    for i in 0..<widths.len
+        val w = widths[i].0
+        val files = cap_two("thing/a.sysl",
+                            cap_thing(s"@no_alloc\n\nf(v: $w, out: *Writer) = v.display(out, FormatSpec(0, -1, false))\n"),
+                            s"thing.f(7$w, stdout())\n")
+
+        cap_check(cap_ir(files), s"call void @bound.sysl$$Integer.display.${widths[i].1}")
+        assert_eq(cap_ran(files), "7")
+
+@test("the malloc a module provides itself, which is an extern like any other")
+cap_the_malloc_a_module_provides_itself()
+    if !cap_ready() then return
+
+    cap_check(cap_ir(cap_two("thing/a.sysl",
+                             cap_thing("@no_alloc\n\nextern malloc(n: usize) -> *u8\nextern free(p: *u8)\n\n" +
+                                       "take(n: usize) -> *u8 = malloc(n)\n\ngive(p: *u8) = free(p)\n"),
+                             "var p = thing.take(8usize)\nthing.give(p)\n")), "declare ptr @malloc")
+
+@test("a closure that does not escape, which is inlined rather than boxed")
+cap_a_closure_that_does_not_escape()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_two("thing/a.sysl",
+                              cap_thing("@no_alloc\n\ntwice(f: int -> int, n: int) -> int = f(f(n))\n\n" +
+                                        "four(n: int) -> int = twice(x -> x + 2, n)\n"),
+                              "print(thing.four(1))")), "5\n")
+
+@test("a heap-backed slice made elsewhere and read here")
+cap_a_heap_backed_slice_made_elsewhere()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_two("thing/a.sysl", cap_thing("@no_alloc\n\nfirst(xs: []int) -> int = xs[0]\n"),
+                              "var xs: []int = [7, 8, 9]\nprint(thing.first(xs))")), "7\n")
+
+@test("rendering an integer wider than 64 bits into a sink")
+cap_rendering_an_integer_wider_than_64_bits()
+    if !cap_ready() then return
+
+    cap_check(cap_ir(cap_two("thing/a.sysl",
+                             cap_thing("@no_alloc\n\nunsigned(v: u128, out: *Writer) = " +
+                                       "v.display(out, FormatSpec(0, -1, false))\n\nsigned(v: i128, out: *Writer) = " +
+                                       "v.display(out, FormatSpec(0, -1, false))\n"),
+                             "print(1)")), "define")
+
+// -- the rule reaches every place a module's code can be written ---------------------------------------
+
+@test("a module-level val's initializer")
+cap_a_module_level_vals_initializer()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl",
+                               cap_thing("@no_alloc\n\nval width: usize = (\"a\" + \"b\").bytes.len\n"),
+                               "print(thing.width)"))
+
+    cap_check(said, cap_needs("the string two strings join into"))
+    cap_check(said, "thing/a.sysl:4:21")
+
+@test("but a register block named at file scope runs nothing, so it is admitted")
+cap_a_register_block_at_file_scope()
+    if !cap_ready() then return
+
+    val files = cap_two("thing/a.sysl",
+                        cap_thing("@no_alloc\n\nconst UART: usize = 0x1000\nval regs: *u32 = ptr_cast(UART)\n"),
+                        "print(usize(thing.regs))")
+
+    cap_check(cap_ir(files), "@thing$regs = private constant ptr inttoptr (i64 4096 to ptr)")
+    assert_eq(cap_ran(files), "4096\n")
+
+@test("a method of a trait implementation")
+cap_a_method_of_a_trait_implementation()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl",
+                               cap_thing("@no_alloc\n\ntrait Named\n    name(self) -> string\n\nstruct Box\n" +
+                                         "    n: int\n\nimpl Named for Box\n    name(self) -> string = str(self.n)\n"),
+                               "print(thing.Box(1).name())"))
+
+    cap_check(said, cap_needs("the string a value renders as"))
+    cap_check(said, "thing/a.sysl:11:28")
+
+@test("and a generic, at the instantiation that would have allocated")
+cap_a_generic_at_its_instantiation()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl", cap_thing("@no_alloc\n\nhold[T](v: T) -> &T = v\n"),
+                               "print(*thing.hold(5))"))
+
+    cap_check(said, cap_needs("a reference"))
+    cap_check(said, "thing/a.sysl:4:23")
+    assert_eq(cap_lines_saying(said, "needs an allocator"), 1)
+
+// -- the promotion a module cannot make is reported rather than made silently --------------------------
+
+private cap_view_of_a_local() -> string = "f() -> []int\n    var a: [3]int = [1, 2, 3]\n    a[0..<3]\n"
+
+@test("a slice of a local array that outlives the frame")
+cap_a_slice_of_a_local_array_that_outlives_the_frame()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl", cap_thing("@no_alloc\n\n" + cap_view_of_a_local()),
+                               "print(thing.f()[0])"))
+
+    cap_check(said, cap_escapes())
+    cap_check(said, "thing/a.sysl:6:6")
+
+@test("the same body in a '@tests' file whose module gave the allocator up is promoted")
+cap_the_same_body_in_a_tests_file_that_took_it_back()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\ng() -> int = 1\n"),
+                                "thing/tests.sysl", cap_thing("@tests\n@requires(heap)\n\n" + cap_view_of_a_local()),
+                                "print(thing.g())")), "1\n")
+
+@test("while one whose '@tests' file said nothing is refused with its module")
+cap_the_same_body_in_a_silent_tests_file()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_three("thing/a.sysl", cap_thing("@no_alloc\n\ng() -> int = 1\n"),
+                                 "thing/tests.sysl", cap_thing("@tests\n\n" + cap_view_of_a_local()),
+                                 "print(thing.g())"))
+
+    cap_check(said, cap_escapes())
+    cap_check(said, "thing/tests.sysl:6:6")
+
+@test("and the same body in a module that kept its allocator is promoted with no diagnostic at all")
+cap_the_same_body_in_a_module_that_kept_its_allocator()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_two("thing/a.sysl", cap_thing("\n" + cap_view_of_a_local()), "print(thing.f()[0])")),
+              "1\n")
+
+// -- what the guarantee is worth is readable in the output --------------------------------------------
+
+private cap_sum() -> string = raw"""
+    sum(p: *int, n: usize) -> int
+        var total = 0
+        var i = 0usize
+        while i < n do
+            total += p[i]
+            i += 1
+        total
+
+    var a: [3]int = [4, 5, 6]
+    print(sum(&a[0], 3))
+    """
+
+@test("no function of an allocator-free program calls the allocator")
+cap_no_function_calls_the_allocator()
+    if !cap_ready() then return
+
+    val out = cap_ir(cap_one("@no_alloc\n\n" + cap_sum()))
+
+    assert(!cap_says(out, "call ptr @malloc"), out)
+    cap_check(out, "declare i64 @sysl_stdout_write(ptr, i64)")
+
+@test("a call into a function that allocates is refused too")
+cap_a_call_into_a_function_that_allocates()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl",
+                               cap_thing("@no_alloc\n\nimport sysl.io.line_text\n\n" +
+                                         "text(b: []const u8) -> string = line_text(b)\n"),
+                               "var bytes: [2]u8 = [104u8, 105u8]\nprint(thing.text(bytes[0..<2]))\n"))
+
+    cap_check(said, cap_reaches("sysl.text.from_utf8"))
+    cap_check(said, "thing/a.sysl:6:33")
+
+private cap_bytes_main(call: string) -> string = s"var bytes: [2]u8 = [104u8, 105u8]\nprint($call)\n"
+
+@test("and every call that reaches one is named, not just the first")
+cap_every_call_that_reaches_one_is_named()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl",
+                               cap_thing("@no_alloc\n\nimport sysl.io.line_text\n\n" +
+                                         "two(a: []const u8, b: []const u8) -> usize\n" +
+                                         "    var x = line_text(a)\n    var y = line_text(b)\n    x.len + y.len\n"),
+                               cap_bytes_main("thing.two(bytes[0..<2], bytes[0..<2])")))
+
+    assert_eq(cap_lines_saying(said, cap_reaches("sysl.text.from_utf8")), 2)
+    cap_check(said, "thing/a.sysl:7:13")
+    cap_check(said, "thing/a.sysl:8:13")
+
+@test("while one call reached through several nodes is still one diagnostic")
+cap_one_call_reached_through_several_nodes()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl",
+                               cap_thing("@no_alloc\n\nimport sysl.io.line_text\n\n" +
+                                         "one(a: []const u8) -> usize = line_text(a).len + 1\n"),
+                               cap_bytes_main("thing.one(bytes[0..<2])")))
+
+    assert_eq(cap_lines_saying(said, "which makes heap storage"), 1)
+    cap_check(said, cap_reaches("sysl.text.from_utf8"))
+    cap_check(said, "thing/a.sysl:6:31")
+
+@test("and printing, which an allocator-free module does constantly, is not")
+cap_printing_is_not_refused()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_two("thing/a.sysl", cap_thing("@no_alloc\n\nsay(n: int)\n    print(\"n is\", n)\n"),
+                              "thing.say(3)")), "n is 3\n")
+
+@test("and the same program without the clause is not obliged to say so")
+cap_the_same_program_without_the_clause()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one(cap_sum())), "15\n")
+
+@test("a module with no clause is unaffected")
+cap_a_module_with_no_clause()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_two("thing/a.sysl", cap_thing("\nf() -> int = 1\n"), "print(thing.f())")), "1\n")
+
+// -- 'no os' gives up the modules an operating system gates --------------------------------------------
+
+@test("a module that gave it up may not reach one that requires it")
+cap_no_os_may_not_reach_a_module_requiring_it()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_one("@no_os\n\nimport sysl.fs.exists\n\nprint(exists(\"x\"))\n"))
+
+    cap_check(said, cap_gated("sysl.fs", "this module"))
+    cap_check(said, "main.sysl:3:1")
+
+@test("nor by a qualified path, which needs no import at all")
+cap_no_os_nor_by_a_qualified_path()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_one("@no_os\n\nprint(sysl.fs.exists(\"x\"))\n"))
+
+    cap_check(said, cap_gated("sysl.fs", "this module"))
+    cap_check(said, "main.sysl:3:15")
+
+@test("the import alone is enough, before anything is named through it")
+cap_no_os_the_import_alone()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_one("@no_os\n\nimport sysl.fs.*\n\nprint(1)\n"))
+
+    cap_check(said, cap_gated("sysl.fs", "this module"))
+    cap_check(said, "main.sysl:3:1")
+
+@test("a named module is named in the message rather than called 'this module'")
+cap_no_os_a_named_module_is_named()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("thing/a.sysl", cap_thing("@no_os\n\nf() -> bool = sysl.fs.exists(\"x\")\n"),
+                               "print(thing.f())"))
+
+    cap_check(said, cap_gated("sysl.fs", "'thing'"))
+    cap_check(said, "thing/a.sysl:4:23")
+
+@test("and 'no posix' does not, since posix is what needs an os rather than the other way round")
+cap_no_posix_does_not_give_up_os()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_two("thing/a.sysl", cap_thing("@no_posix\n\nf() -> int = 1\n"), "print(thing.f())")),
+              "1\n")
+
+@test("a module that said nothing reaches it freely")
+cap_a_module_that_said_nothing_reaches_os()
+    if !cap_ready() then return
+
+    assert_eq(cap_ran(cap_one("import sysl.fs.exists\n\nprint(exists(\"/\"))\n")), "true\n")
+
+@test("and may not reach one through a module that says nothing itself")
+cap_no_os_through_a_module_that_says_nothing()
+    if !cap_ready() then return
+
+    val said = cap_err(cap_two("helper/a.sysl", "module helper\n\nthere(p: string) -> bool = sysl.fs.exists(p)\n",
+                               "@no_os\n\nprint(helper.there(\"x\"))\n"))
+
+    cap_check(said, cap_gated("helper", "this module"))
+    cap_check(said, "main.sysl:3:14")
+
+@test("the clause and the requirement may be written on the same module without contradiction")
+cap_requires_os_on_a_module()
+    if !cap_ready() then return
+
+    cap_check(cap_ir(cap_two("thing/a.sysl", cap_thing("@requires(os)\n\nf() -> int = 1\n"), "print(thing.f())")),
+              "define")
