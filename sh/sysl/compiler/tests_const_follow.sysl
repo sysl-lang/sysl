@@ -1,0 +1,303 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Two refusals `const` shares with the other module-level values -- `val`, a module `var` and an
+// `extern` variable -- which the reference's `ConstTests` states for a constant alone:
+//
+// - **a file-private value is private to its FILE**, so a sibling file of its own module reading or
+//   writing it is refused exactly as another module naming it in full is;
+// - **a bare variant is a value in its module's scope**, so a value and a variant of one spelling
+//   clash in whichever order they were written, and the later of the two is the one refused.
+//
+// **Every string quoted here was read out of the reference compiler** (0.0.149) on the same input.
+// A path is shown relative to the project root, which is a temporary directory.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private cfw_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end cfw_ready
+
+// A file of a program: the module it belongs to (a directory path), its name, and its text.
+private cfw_files() -> Buf[(string, string, string)] = buf()
+
+// **What a program of these files PRINTS**, or what the build had to say about it instead, with the
+// project root written as `@`.
+private cfw_out(files: Buf[(string, string, string)]) -> string
+    // `$TMPDIR` ends in a slash, and a diagnostic names the file by its normalized path.
+    val root = replace_all(make_temp_dir("sysl-cfw").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for i in 0..<files.len()
+        val f = files.at(i)
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end cfw_out
+
+// A module `limits` of two files -- the one declaring, the one using -- beside a beginning.
+private cfw_limits(a: string, b: string, main: string) -> string
+    var fs = cfw_files()
+
+    fs.push(("limits", "a.sysl", "module limits\n" + a))
+    if b != "" then fs.push(("limits", "b.sysl", "module limits\n" + b))
+    fs.push(("", "main.sysl", main))
+    cfw_out(fs)
+
+// A module `m` of the given files, and a beginning that does nothing with it.
+private cfw_module(files: Buf[(string, string)]) -> string
+    var fs = cfw_files()
+
+    for i in 0..<files.len()
+        fs.push(("m", files.at(i).0, "module m\n" + files.at(i).1))
+
+    fs.push(("", "main.sysl", "print(1)\n"))
+    cfw_out(fs)
+
+// One file, as the whole program.
+private cfw_ran(text: string) -> string
+    var fs = cfw_files()
+
+    fs.push(("", "main.sysl", text))
+    cfw_out(fs)
+
+private cfw_refuses(said: string, part: string) =
+    assert(said.index_of(part).is_some(), s"expected '$part', got: $said")
+
+private cfw_private(said: string, at: string) =
+    cfw_refuses(said, "error: 'limits.width' is private to '@/limits/a.sysl', the file that declares it\n" +
+                s" --> @/$at")
+
+private cfw_variant(said: string, file: string, line: string, holder: string) =
+    cfw_refuses(said, s"error: variant name 'Red' is already used by $holder\n --> @/$file:$line:1")
+
+private cfw_enum(said: string, file: string, line: string, owner: string) =
+    cfw_refuses(said, s"error: 'Red' is already used by enum '$owner'\n --> @/$file:$line:1")
+
+private cfw_colour() -> string = "enum Colour\n    Red\n    Green\n"
+
+// -- a file-private value is its file's -----------------------------------------------------------
+
+@test("a private 'val' is refused to a sibling file of its own module")
+cfw_private_val_to_a_sibling()
+    if !cfw_ready() then return
+
+    cfw_private(cfw_limits("private val width: int = 12\n", "wide() -> int = width\n",
+                           "print(limits.wide())\n"), "limits/b.sysl:2:17")
+
+@test("and so is a private module 'var', read")
+cfw_private_var_read()
+    if !cfw_ready() then return
+
+    cfw_private(cfw_limits("private var width: int = 12\n", "wide() -> int = width\n",
+                           "print(limits.wide())\n"), "limits/b.sysl:2:17")
+
+@test("written")
+cfw_private_var_written()
+    if !cfw_ready() then return
+
+    cfw_private(cfw_limits("private var width: int = 12\n", "bump()\n    width = 3\n",
+                           "limits.bump()\nprint(1)\n"), "limits/b.sysl:3:5")
+
+@test("written in place")
+cfw_private_var_compound()
+    if !cfw_ready() then return
+
+    cfw_private(cfw_limits("private var width: int = 12\n", "bump()\n    width += 3\n",
+                           "limits.bump()\nprint(1)\n"), "limits/b.sysl:3:5")
+
+@test("or pointed at")
+cfw_private_var_pointed_at()
+    if !cfw_ready() then return
+
+    cfw_private(cfw_limits("private var width: int = 12\n", "p() -> *int = &width\n",
+                           "print(limits.p()[0])\n"), "limits/b.sysl:2:16")
+
+@test("and a private 'extern' variable the same")
+cfw_private_extern_variable()
+    if !cfw_ready() then return
+
+    val said = cfw_limits("private extern optind: int\n", "get() -> int = optind\n",
+                          "print(limits.get())\n")
+
+    cfw_refuses(said, "error: 'limits.optind' is private to '@/limits/a.sysl', the file that " +
+                "declares it\n --> @/limits/b.sysl:2:16")
+
+@test("and another module naming a private 'extern' variable in full")
+cfw_private_extern_in_full()
+    if !cfw_ready() then return
+
+    var fs = cfw_files()
+
+    fs.push(("os", "env.sysl", "module os\n\nprivate extern environ: **u8"))
+    fs.push(("", "main.sysl", "print(os.environ == null)"))
+    cfw_refuses(cfw_out(fs), "error: 'os.environ' is private to '@/os/env.sysl', the file that " +
+                "declares it\n --> @/main.sysl:1:10")
+
+@test("another module naming a private 'val' in full is refused")
+cfw_private_val_in_full()
+    if !cfw_ready() then return
+
+    cfw_private(cfw_limits("private val width: int = 12\n", "", "print(limits.width)\n"),
+                "main.sysl:1:14")
+
+@test("and writing a private 'var' in full")
+cfw_private_var_written_in_full()
+    if !cfw_ready() then return
+
+    cfw_private(cfw_limits("private var width: int = 12\n", "", "limits.width = 3\nprint(1)\n"),
+                "main.sysl:1:8")
+
+@test("while the declaring file reads and writes it freely")
+cfw_private_var_its_own_file()
+    if !cfw_ready() then return
+
+    val said = cfw_limits("private var width: int = 12\nwide() -> int\n    width += 30\n    width\n",
+                          "", "print(limits.wide())\n")
+
+    assert_eq(said, "42\n")
+
+// -- a variant and a value of one spelling, in either order ---------------------------------------
+
+@test("a constant declared before an enum is the variant's clash")
+cfw_constant_before_the_enum()
+    if !cfw_ready() then return
+
+    var fs: Buf[(string, string)] = buf()
+
+    fs.push(("m.sysl", "const Red: int = 1\n" + cfw_colour()))
+    cfw_variant(cfw_module(fs), "m/m.sysl", "3", "a constant")
+
+@test("and so in the program's first file")
+cfw_constant_before_the_enum_in_main()
+    if !cfw_ready() then return
+
+    cfw_variant(cfw_ran("const Red: int = 1\n" + cfw_colour() + "print(1)\n"), "main.sysl", "2",
+                "a constant")
+
+@test("a 'val' before it")
+cfw_val_before_the_enum()
+    if !cfw_ready() then return
+
+    var fs: Buf[(string, string)] = buf()
+
+    fs.push(("m.sysl", "val Red: int = 1\n" + cfw_colour()))
+    cfw_variant(cfw_module(fs), "m/m.sysl", "3", "a 'val'")
+
+@test("a module 'var' before it")
+cfw_var_before_the_enum()
+    if !cfw_ready() then return
+
+    var fs: Buf[(string, string)] = buf()
+
+    fs.push(("m.sysl", "var Red: int = 1\n" + cfw_colour()))
+    cfw_variant(cfw_module(fs), "m/m.sysl", "3", "a module 'var'")
+
+@test("an 'extern' variable before it")
+cfw_extern_before_the_enum()
+    if !cfw_ready() then return
+
+    cfw_variant(cfw_ran("extern Red: int\n" + cfw_colour() + "print(1)\n"), "main.sysl", "2",
+                "an 'extern' variable")
+
+@test("a value in an earlier file of the module, even a private one")
+cfw_value_in_an_earlier_file()
+    if !cfw_ready() then return
+
+    var fs: Buf[(string, string)] = buf()
+
+    fs.push(("a.sysl", "private const Red: int = 1\n"))
+    fs.push(("b.sysl", "enum Colour\n    Red\n"))
+    cfw_variant(cfw_module(fs), "m/b.sysl", "2", "a constant")
+
+@test("of two clashing variants, the first is the one reported, and the enum still stands")
+cfw_first_clash_and_the_enum_stands()
+    if !cfw_ready() then return
+
+    var fs: Buf[(string, string)] = buf()
+
+    fs.push(("m.sysl", "const Red: int = 1\nval Green: int = 2\n" + cfw_colour() +
+                       "f(c: Colour) -> int = 1\n"))
+
+    val said = cfw_module(fs)
+
+    cfw_variant(said, "m/m.sysl", "4", "a constant")
+    assert(said.index_of("'Green'").is_none(), said)
+    assert(said.index_of("unknown type").is_none(), said)
+
+@test("a 'val' declared after an enum is its own clash")
+cfw_val_after_the_enum()
+    if !cfw_ready() then return
+
+    var fs: Buf[(string, string)] = buf()
+
+    fs.push(("m.sysl", cfw_colour() + "val Red: int = 1\n"))
+    cfw_enum(cfw_module(fs), "m/m.sysl", "5", "m.Colour")
+
+@test("a module 'var' after it")
+cfw_var_after_the_enum()
+    if !cfw_ready() then return
+
+    var fs: Buf[(string, string)] = buf()
+
+    fs.push(("m.sysl", cfw_colour() + "var Red: int = 1\n"))
+    cfw_enum(cfw_module(fs), "m/m.sysl", "5", "m.Colour")
+
+@test("an 'extern' variable after it")
+cfw_extern_after_the_enum()
+    if !cfw_ready() then return
+
+    cfw_enum(cfw_ran(cfw_colour() + "extern Red: int\nprint(1)\n"), "main.sysl", "4", "Colour")
+
+@test("a value in a later file of the module")
+cfw_value_in_a_later_file()
+    if !cfw_ready() then return
+
+    var fs: Buf[(string, string)] = buf()
+
+    fs.push(("a.sysl", "enum Colour\n    Red\n"))
+    fs.push(("b.sysl", "val Red: int = 1\n"))
+    cfw_enum(cfw_module(fs), "m/b.sysl", "2", "m.Colour")
+
+@test("while in the program's first file a 'val' and a 'var' are locals, and clash with nothing")
+cfw_main_locals_clash_with_nothing()
+    if !cfw_ready() then return
+
+    assert_eq(cfw_ran("val Red: int = 1\n" + cfw_colour() + "var Green: int = 2\nprint(Red + Green)\n"),
+              "3\n")

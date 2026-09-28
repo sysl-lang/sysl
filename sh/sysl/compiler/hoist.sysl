@@ -397,12 +397,35 @@ private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vi
         EnumOf(d) ->
             for i in 0..<d.variants.len()
                 a.tables.variant_names.put(d.variants.at(i).name, true)
+
+            check_variants_free(a, scope, span, d)
         _ -> ()
 
     record_access(a, scope, span, key, vis)
     record_members_access(a, scope, key, name, vis, kind)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
+
+// The other order of a variant meeting a value of its spelling: the value was registered first, so
+// the enum is the declaration that gives the name its second meaning, and the refusal is its own.
+// The first variant that clashes is the one reported.
+private check_variants_free(a: &Analysis, scope: Scope, span: Span, d: EnumDecl)
+    for i in 0..<d.variants.len()
+        val v = d.variants.at(i).name
+        val holder = variant_value_holder(a, module_qualify(scope.module_name, v))
+
+        if holder.is_some()
+            a.fault(scope, span, s"variant name '$v' is already used by ${holder.unwrap()}")
+            return
+        end if
+end check_variants_free
+
+// What holds a spelling a variant wants, told apart the way the reference tells them: a module `var`
+// is storage the program may write, and says so.
+private variant_value_holder(a: &Analysis, key: string) -> Option[string]
+    if a.tables.vals.has(key) && holds_string(a.tables.writable, key) then return Some("a module 'var'")
+
+    value_name_holder(a, key)
 
 // What a second declaration of a type name is told. A named subtype says "the name", because what
 // it declares may be an alias rather than a type of its own.
@@ -446,15 +469,13 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
         return
     end if
 
-    // **A bare variant is a value in its module's scope**, so a constant or a `val` spelled like one
-    // registered before it would give the name two meanings.
-    if what == "constant" || what == "'val'"
-        val owner = enum_of_variant(a, plain)
+    // **A bare variant is a value in its module's scope**, so any value spelled like one registered
+    // before it would give the name two meanings. The other order is the enum's to report.
+    val owner = enum_of_variant(a, plain)
 
-        if owner.is_some()
-            a.fault(scope, span, s"'$name' is already used by enum '${module_show(owner.unwrap())}'")
-            return
-        end if
+    if owner.is_some()
+        a.fault(scope, span, s"'$name' is already used by enum '${module_show(owner.unwrap())}'")
+        return
     end if
 
     into.put(key, ValueDecl(name, typ, vis, span, scope, init, align, section,
