@@ -20,6 +20,12 @@ field_expr(cx: &Analyzer, span: Span, receiver: Expr, name: string,
 
     if through.is_some() then return name_expr(cx, span, through.unwrap(), expected)
 
+    // A module path to storage this file may not reach is that, and not a read off a value named
+    // after the module -- which is all a module with nothing else to offer would leave it.
+    val hidden = module_value_out_of_reach(cx, receiver, name)
+
+    if hidden.is_some() then return cx.err(span, out_of_reach(cx.an, hidden.unwrap()))
+
     // A **type** in the position a value would be read from. What a type offers under its own name
     // is an associated function and nothing else, so the parentheses are what is missing.
     val on_type = type_member(cx, span, receiver, name, expected)
@@ -454,6 +460,27 @@ private generic_variant_named(cx: &Analyzer, key: string, name: string) -> Optio
             None
         _ -> None
 end generic_variant_named
+
+// The key of a constant, a `val` or a module `var` a `Field` chain spells as a module path, where the
+// declaration exists and is out of this file's reach.
+private module_value_out_of_reach(cx: &Analyzer, receiver: Expr, name: string) -> Option[string]
+    val dotted = module_path(receiver, name)
+
+    if dotted.is_none() then return None
+
+    val keys = module_qualified_keys(cx, dotted.unwrap())
+
+    for i in 0..<keys.len()
+        val k = keys.at(i)
+
+        if names_storage(cx, k) && access_for(cx.an, k).is_some() && !reachable_key(cx.an, k, cx.scope)
+            return Some(k)
+
+    None
+end module_value_out_of_reach
+
+private names_storage(cx: &Analyzer, k: string) -> bool =
+    cx.an.tables.consts.has(k) || cx.an.tables.vals.has(k) || cx.an.tables.extern_vars.has(k)
 
 // A `Field` chain that spells a module path rather than a member read.
 through_module(cx: &Analyzer, receiver: Expr, name: string) -> Option[string]
