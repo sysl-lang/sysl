@@ -1,0 +1,106 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.str_builder
+
+// **An `impl` block is refused once.** Every check about the block as a whole -- the compiler already
+// provides the trait, a blanket already covers the type, the block would be a second implementation,
+// it has no home -- disposes of the whole block, so the first one that refuses it is the only thing
+// said about it: the questions after it are not asked and its members are not read. The expected
+// lists below are the reference's complete output for each program, every diagnostic of it.
+
+private iro_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+// Every diagnostic a one-file program earns, one message to a line in source order, each marked the
+// way the command line marks it.
+private iro_diags(text: string) -> string
+    val root = make_temp_dir("sysl-impl-once").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    var b = str_builder()
+
+    emit_llvm_text(src, None) match
+        Err(why) -> b.push(s"refused: ${why.message}")
+        Ok(made) ->
+            val ordered = in_source_order(made.report)
+
+            for i in 0..<ordered.len()
+                if i > 0 then b.push("\n")
+
+                b.push(if ordered.at(i).is_error() then "error: " else "warning: ")
+                b.push(ordered.at(i).diag.message)
+
+    remove_dir_all(root).unwrap_or(())
+    b.finish()
+end iro_diags
+
+@test("impl refused once: a built-in a blanket already covers is told so, and nothing about a home")
+iro_a_blanket_covered_builtin_is_refused_once()
+    if !iro_ready() then return
+
+    val src = "impl Display for i64\n    show(self) -> string = \"x\"\n\nprint(1)\n"
+
+    assert_eq(iro_diags(src),
+              "error: 'long' already implements 'sysl.Display' — every 'sysl.Integer' does, " +
+              "through one block written over the family")
+
+@test("impl refused once: a trait the compiler provides a built-in is refused once")
+iro_a_provided_trait_is_refused_once()
+    if !iro_ready() then return
+
+    val src = "impl Eq for int\n    eq(self, rhs: int) -> bool = true\n\nprint(1)\n"
+
+    assert_eq(iro_diags(src), "error: 'int' already implements 'sysl.Eq' — the compiler provides it")
+
+@test("impl refused once: and so is an ordering, whose member is not read either")
+iro_an_ordering_is_refused_once()
+    if !iro_ready() then return
+
+    val src = "impl Ord for int\n    cmp(self, rhs: int) -> int = 0\n\nprint(1)\n"
+
+    assert_eq(iro_diags(src), "error: 'int' already implements 'sysl.Ord' — the compiler provides it")
+
+@test("impl refused once: a block that is only homeless is still told it has no home")
+iro_a_homeless_block_still_has_no_home()
+    if !iro_ready() then return
+
+    val src = "impl Neg for bool\n    neg(self) -> bool = self\n\nprint(1)\n"
+
+    assert_eq(iro_diags(src),
+              "error: an 'impl' may be written only in the module that declares the trait or in one " +
+              "that declares a type the block names, and 'sysl.Neg' is the library's while nothing " +
+              "in 'bool' is declared outside the library — so this one has no home. A trait of " +
+              "your own, or a type of your own in what it is written for or in the trait's " +
+              "arguments, gives it one")
+
+@test("impl refused once: while a trait of the program's own gives a built-in's block a home")
+iro_a_program_trait_gives_a_home()
+    if !iro_ready() then return
+
+    val src = "trait Greet\n    greet(self) -> string\n\nimpl Greet for i64\n" +
+        "    greet(self) -> string = \"hi\"\n\nprint(1)\n"
+
+    assert_eq(iro_diags(src), "")
+
+@test("impl refused once: a block for int may not compete with the library's own rendering")
+iro_may_not_compete_with_the_library_rendering()
+    if !iro_ready() then return
+
+    val src = "impl Display for int\n" +
+        "    display(self, out: *Writer, fmt: FormatSpec) = display_str(\"no\", out, fmt)\nprint(1)\n"
+
+    // The whole list, so the subtype clause the reference says `int` does not earn is absent too.
+    assert_eq(iro_diags(src),
+              "error: 'int' already implements 'sysl.Display' — every 'sysl.Integer' does, " +
+              "through one block written over the family")

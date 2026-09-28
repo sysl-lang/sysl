@@ -1,0 +1,704 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A constrained subtype has its base's whole operator catalog, and every value the catalog makes of
+// one is held to what the type says its values are (`reference/errors.md § Constrained types`).
+//
+// The two flavours part company over WHERE the check lands. A **transparent** subtype computes at
+// its base, so `-a` and `a + b` are base values no range applies to, and what is checked is the
+// store that gives one the subtype again. A **derived** subtype computes at itself, so the operation
+// is the produce site and traps there. Reading one expression both ways is what tells a correct
+// compiler from one that checks the wrong end -- and nothing short of running the program says
+// which it did.
+
+private var so_library_cache: Buf[Program] = buf()
+private var so_library_read: bool = false
+
+private so_library() -> Buf[Program]
+    if so_library_read then return so_library_cache
+
+    so_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> so_library_cache = units
+
+    so_library_cache
+end so_library
+
+private so_ready() -> bool
+    if so_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+private so_can_run() -> bool
+    if !so_ready() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end so_can_run
+
+// The whole module a source lowers to beside the real library, or the first thing said about it.
+private so_ir(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = so_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), buf())
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end so_ir
+
+// What the compiler says about a one-file program, or nothing.
+private so_err(text: string) -> string
+    val root = make_temp_dir("sysl-subtype-op").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end so_err
+
+// What a one-file program does: what it printed, and whether it exited zero.
+private so_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-subtype-op").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end so_outcome
+
+// **What a program PRINTS**, where it runs to the end.
+private so_ran(text: string) -> string
+    val out = so_outcome(text)
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+
+// Whether a program that BUILT stopped short of exiting zero -- a check that failed.
+private so_exits(text: string) -> bool
+    val out = so_outcome(text)
+
+    !out.1 && !out.0.contains("error:")
+
+private so_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+private so_age() -> string = "type Age = int within 0..150\n"
+private so_temp() -> string = "type Temp = int within -100..100\n"
+private so_mask() -> string = "type Mask = u8 within 0..15\n"
+private so_slot() -> string = "type Slot = new u8 within 0..<200\n"
+private so_stamp() -> string = "type Stamp = new i64\n"
+private so_small() -> string = "type Small = int within 0..10\n"
+private so_even() -> string = "type Even = int within 0..100 where value % 2 == 0\n"
+
+private so_span() -> string =
+    so_age() + "struct Span\n    lo: Age\n    hi: Age\n    invariant lo <= hi\n"
+
+// -- a transparent subtype computes at its base ------------------------------------------------------
+
+@test("subtype op: unary minus yields a base value, so a result outside the range is not a violation")
+so_unary_minus_yields_a_base_value()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_age() + "var a: Age = 30\nprint(-a)"), "-30\n")
+
+@test("subtype op: and the same value stored back into the subtype is the produce site that traps")
+so_unary_minus_stored_back_traps()
+    if !so_can_run() then return
+
+    assert(so_exits(so_age() + "var a: Age = 30\nvar b: Age = -a\nprint(b)"))
+
+@test("subtype op: bitwise complement likewise yields the base")
+so_complement_yields_the_base()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_mask() + "var m: Mask = 5\nprint(~m)"), "250\n")
+
+@test("subtype op: and storing that back traps")
+so_complement_stored_back_traps()
+    if !so_can_run() then return
+
+    assert(so_exits(so_mask() + "var m: Mask = 5\nvar n: Mask = ~m\nprint(n)"))
+
+// A literal beside one takes the base too: it is about to be an operand of the base's operator, and
+// the product is what has to be in range -- so the trap has to come from the store.
+@test("subtype op: a literal beside one is a base value, not a value of the subtype")
+so_a_literal_beside_one_is_a_base_value()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_small() + "var s: Small = 2\nprint(s * 100)"), "200\n")
+
+@test("subtype op: and a comparison against a literal outside the range is an ordinary comparison")
+so_a_comparison_against_a_literal_outside()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_small() + "var s: Small = 2\nprint(s < 100, s > 100)"), "true false\n")
+
+@test("subtype op: a comparison against a base-typed value it did not take its type from")
+so_a_comparison_against_a_base_typed_value()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_age() + "var a: Age = 5\nvar n: int = 7\nprint(a < n, a == n, a >= n)"),
+              "true false false\n")
+
+@test("subtype op: while a derived subtype compares only with itself")
+so_a_derived_subtype_compares_only_with_itself()
+    if !so_ready() then return
+
+    val said = so_err(so_slot() + "var k: Slot = Slot(5)\nvar n: u8 = 7\nprint(k < n)")
+
+    assert(so_says(said, "cannot compare Slot with byte"))
+
+@test("subtype op: while storing such a product back is what traps")
+so_storing_such_a_product_back_traps()
+    if !so_can_run() then return
+
+    assert(so_exits(so_small() + "var s: Small = 2\ns = s * 100\nprint(s)"))
+
+@test("subtype op: the integer operators the base has all reach it")
+so_the_integer_operators_reach_it()
+    if !so_can_run() then return
+
+    val src = so_age() + "var a: Age = 12\nvar b: Age = 5\nprint(a + b, a - b, a * b, a / b, a % b)"
+
+    assert_eq(so_ran(src), "17 7 60 2 2\n")
+
+@test("subtype op: including the bitwise ones, none of which can leave the base width")
+so_including_the_bitwise_ones()
+    if !so_can_run() then return
+
+    val src = so_mask() + "var m: Mask = 12\nvar n: Mask = 5\nprint(m & n, m | n, m ^ n, m >> n)"
+
+    assert_eq(so_ran(src), "4 13 9 0\n")
+
+// A left shift is the one bitwise operator that can lose a bit, so on a RANGED type it is checked
+// rather than allowed to wrap: `12 << 5` is 384, and the wrapped 128 is a wrong answer a produce-site
+// range check could pass without noticing.
+@test("subtype op: while a shift that pushes a bit out of the base width traps")
+so_a_shift_out_of_the_base_width_traps()
+    if !so_can_run() then return
+
+    assert(so_exits(so_mask() + "var m: Mask = 12\nvar n: Mask = 5\nprint(m << n)"))
+    assert_eq(so_ran(so_mask() + "var m: Mask = 3\nvar n: Mask = 2\nprint(m << n)"), "12\n")
+
+// -- a compound assignment is the produce site its written-out form is --------------------------------
+
+@test("subtype op: an in-range result holds")
+so_an_in_range_result_holds()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_age() + "var a: Age = 10\na += 5\nprint(a)"), "15\n")
+
+@test("subtype op: and the same statement written out gives the same answer")
+so_the_same_statement_written_out()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_age() + "var a: Age = 10\na = a + 5\nprint(a)"), "15\n")
+
+@test("subtype op: a result past the top traps")
+so_a_result_past_the_top_traps()
+    if !so_can_run() then return
+
+    assert(so_exits(so_age() + "var a: Age = 100\na += 100\nprint(a)"))
+
+@test("subtype op: a result below the bottom traps")
+so_a_result_below_the_bottom_traps()
+    if !so_can_run() then return
+
+    assert(so_exits(so_age() + "var a: Age = 10\na -= 100\nprint(a)"))
+
+// 120 is not a temperature, but it is an ordinary number to add to one and the sum is in range -- so
+// a compiler that checks the addend rather than the total traps here and is wrong.
+@test("subtype op: the value added is an ordinary base value, not one of the subtype's own")
+so_the_value_added_is_a_base_value()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_temp() + "var t: Temp = -50\nt += 120\nprint(t)"), "70\n")
+
+@test("subtype op: which is again what the written-out form does")
+so_which_is_what_the_written_out_form_does()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_temp() + "var t: Temp = -50\nt = t + 120\nprint(t)"), "70\n")
+
+@test("subtype op: every compound form the base has is accepted")
+so_every_compound_form_is_accepted()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_mask() + "var m: Mask = 12\nm &= 5\nm |= 2\nm ^= 1\nprint(m)"), "7\n")
+
+@test("subtype op: and each of them checks its result")
+so_each_compound_form_checks_its_result()
+    if !so_can_run() then return
+
+    assert(so_exits(so_mask() + "var m: Mask = 1\nm <<= 5\nprint(m)"))
+
+@test("subtype op: a compound assignment through a pointer checks the place it points at")
+so_a_compound_assignment_through_a_pointer()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_age() + "var a: Age = 10\nvar p = &a\n*p += 5\nprint(a)"), "15\n")
+
+@test("subtype op: and traps when the result leaves the range")
+so_through_a_pointer_traps_out_of_range()
+    if !so_can_run() then return
+
+    assert(so_exits(so_age() + "var a: Age = 10\nvar p = &a\n*p -= 20\nprint(a)"))
+
+@test("subtype op: a compound write into a struct field checks it")
+so_a_compound_write_into_a_struct_field()
+    if !so_can_run() then return
+
+    val p = so_age() + "struct P\n    age: Age\n"
+
+    assert_eq(so_ran(p + "var p = P(Age(40))\np.age += 1\nprint(p.age)"), "41\n")
+    assert(so_exits(p + "var p = P(Age(150))\np.age += 1\nprint(p.age)"))
+
+@test("subtype op: a compound arm of a multi-assignment checks its own result")
+so_a_compound_arm_of_a_multi_assignment()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_age() + "var a: Age = 10\nvar b: Age = 20\na, b += 5, 5\nprint(a, b)"), "15 25\n")
+
+@test("subtype op: and one arm out of range stops the statement")
+so_one_arm_out_of_range_stops_it()
+    if !so_can_run() then return
+
+    assert(so_exits(so_age() + "var a: Age = 10\nvar b: Age = 150\na, b += 5, 5\nprint(a, b)"))
+
+// -- an increment steps one and is checked like any other value produced ------------------------------
+
+@test("subtype op: postfix yields the old value and stores the new one")
+so_postfix_yields_the_old_value()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_age() + "var a: Age = 10\nprint(a++)\nprint(a)"), "10\n11\n")
+
+@test("subtype op: prefix yields the new one")
+so_prefix_yields_the_new_one()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_age() + "var a: Age = 10\nprint(++a)"), "11\n")
+
+@test("subtype op: a step onto the last value of the range is fine")
+so_a_step_onto_the_last_value()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_age() + "var a: Age = 149\na++\nprint(a)"), "150\n")
+
+@test("subtype op: and the step past it traps")
+so_the_step_past_it_traps()
+    if !so_can_run() then return
+
+    assert(so_exits(so_age() + "var a: Age = 150\na++\nprint(a)"))
+
+@test("subtype op: a decrement off the bottom traps")
+so_a_decrement_off_the_bottom_traps()
+    if !so_can_run() then return
+
+    assert(so_exits(so_age() + "var a: Age = 0\na--\nprint(a)"))
+
+// A postfix increment's VALUE is the old one; what has to be checked is what lands in the place.
+@test("subtype op: a postfix step past the end traps even though its value was in range")
+so_a_postfix_step_past_the_end_traps()
+    if !so_can_run() then return
+
+    assert(so_exits(so_age() + "var a: Age = 150\nprint(a++)"))
+
+@test("subtype op: an increment through a pointer traps at the same place")
+so_an_increment_through_a_pointer_traps()
+    if !so_can_run() then return
+
+    assert(so_exits(so_age() + "var a: Age = 150\nvar p = &a\n(*p)++\nprint(a)"))
+
+// -- a derived subtype computes at itself, so the operation is the produce site -----------------------
+
+@test("subtype op: an in-range sum is the derived type")
+so_an_in_range_sum_is_the_derived_type()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_slot() + "var j: Slot = Slot(100)\nvar k: Slot = Slot(50)\nprint(j + k)"), "150\n")
+
+@test("subtype op: a sum past the top traps at the addition, not at some later store")
+so_a_sum_past_the_top_traps_at_the_addition()
+    if !so_can_run() then return
+
+    assert(so_exits(so_slot() + "var j: Slot = Slot(199)\nvar k: Slot = Slot(1)\nprint(j + k)"))
+
+@test("subtype op: a difference below the bottom traps")
+so_a_difference_below_the_bottom_traps()
+    if !so_can_run() then return
+
+    assert(so_exits(so_slot() + "var j: Slot = Slot(1)\nvar k: Slot = Slot(2)\nprint(j - k)"))
+
+@test("subtype op: unary minus on a derived type produces one and is checked")
+so_unary_minus_on_a_derived_type()
+    if !so_can_run() then return
+
+    val off = "type Off = new i32 within -10..5\n"
+
+    assert_eq(so_ran(off + "print(-Off(5))"), "-5\n")
+    assert(so_exits(off + "print(-Off(-10))"))
+
+@test("subtype op: and so is the complement")
+so_and_so_is_the_complement()
+    if !so_can_run() then return
+
+    assert(so_exits("type Nib = new u8 within 0..15\nprint(~Nib(5))"))
+
+@test("subtype op: a compound assignment on one is checked")
+so_a_compound_assignment_on_a_derived_one()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_slot() + "var k: Slot = Slot(100)\nk += Slot(50)\nprint(k)"), "150\n")
+    assert(so_exits(so_slot() + "var k: Slot = Slot(199)\nk += Slot(1)\nprint(k)"))
+
+@test("subtype op: and an increment")
+so_and_an_increment_on_a_derived_one()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_slot() + "var k: Slot = Slot(100)\nk++\nprint(k)"), "101\n")
+    assert(so_exits(so_slot() + "var k: Slot = Slot(199)\nk++\nprint(k)"))
+
+// A check emitted once outside a loop, or a slot written before it is examined, both pass one step.
+@test("subtype op: the check holds for every step of a long walk, and stops it at the end")
+so_every_step_of_a_long_walk()
+    if !so_can_run() then return
+
+    assert(so_exits(so_slot() + "var k: Slot = Slot(0)\nfor i in 0..<100000\n    k++\nprint(k)"))
+
+// -- a derived subtype with no range asks nothing of its values ---------------------------------------
+
+@test("subtype op: its arithmetic runs unchecked")
+so_its_arithmetic_runs_unchecked()
+    if !so_can_run() then return
+
+    val src = so_stamp() + "var a: Stamp = Stamp(3)\nvar b: Stamp = Stamp(4)\nprint(a + b, a * b, -a)"
+
+    assert_eq(so_ran(src), "7 12 -3\n")
+
+@test("subtype op: and emits no check at all")
+so_and_emits_no_check_at_all()
+    if !so_ready() then return
+
+    val out = so_ir(so_stamp() + "var a: Stamp = Stamp(3)\nprint(a + a)")
+
+    assert(so_says(out, "define "))
+    assert(!so_says(out, "within."))
+
+@test("subtype op: while the one with a range emits them")
+so_while_the_one_with_a_range_emits_them()
+    if !so_ready() then return
+
+    assert(so_says(so_ir(so_slot() + "var k: Slot = Slot(3)\nprint(k + k)"), "within."))
+
+// -- a where predicate is asked by the forms that compute and store -----------------------------------
+
+@test("subtype op: a compound assignment landing on an even number holds")
+so_a_compound_landing_on_an_even_number()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_even() + "var e: Even = 4\ne += 2\nprint(e)"), "6\n")
+
+@test("subtype op: and one landing on an odd number traps")
+so_one_landing_on_an_odd_number_traps()
+    if !so_can_run() then return
+
+    assert(so_exits(so_even() + "var e: Even = 4\ne += 1\nprint(e)"))
+
+@test("subtype op: an increment lands on an odd number and traps")
+so_an_increment_lands_on_an_odd_number()
+    if !so_can_run() then return
+
+    assert(so_exits(so_even() + "var e: Even = 4\ne++\nprint(e)"))
+
+@test("subtype op: two increments land back on an even one")
+so_two_increments_land_back_on_an_even_one()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_even() + "var e: Even = 4\ne += 1 + 1\nprint(e)"), "6\n")
+
+// The predicate is a synthesised function, and a call to one the pruning pass dropped would not link.
+@test("subtype op: the predicate the update calls is emitted beside the call")
+so_the_predicate_is_emitted_beside_the_call()
+    if !so_ready() then return
+
+    val out = so_ir(so_even() + "var e: Even = 4\ne += 2\nprint(e)")
+
+    assert(so_says(out, "within."))
+    assert(so_says(out, "where."))
+
+// -- the corners of a computed store ------------------------------------------------------------------
+
+@test("subtype op: a field of a struct carrying an invariant is checked against both")
+so_a_field_of_a_struct_with_an_invariant()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_span() + "var s = Span(Age(3), Age(9))\ns.lo += 2\nprint(s.lo, s.hi)"), "5 9\n")
+    assert(so_exits(so_span() + "var s = Span(Age(9), Age(9))\ns.lo += 1\nprint(s.lo, s.hi)"))
+
+// An increment is a write of one field, which is what the invariant rule is about.
+@test("subtype op: and an increment of one owes the invariant the same re-check")
+so_an_increment_owes_the_invariant()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_span() + "var s = Span(Age(3), Age(9))\ns.hi++\nprint(s.lo, s.hi)"), "3 10\n")
+    assert(so_exits(so_span() + "var s = Span(Age(9), Age(9))\ns.lo++\nprint(s.lo, s.hi)"))
+
+@test("subtype op: an element of an array is a place like any other")
+so_an_element_of_an_array_is_a_place()
+    if !so_can_run() then return
+
+    val src = so_age() + "var xs: [2]Age = [1, 2]\nxs[0]++\nxs[1] += 5\nprint(xs[0], xs[1])"
+
+    assert_eq(so_ran(src), "2 7\n")
+    assert(so_exits(so_age() + "var xs: [2]Age = [150, 2]\nxs[0]++\nprint(xs[0])"))
+
+@test("subtype op: a loop's worth of steps is checked at every step")
+so_a_loops_worth_of_steps()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_age() + "var a: Age = 0\nfor i in 0..<10\n    a += 1\nprint(a)"), "10\n")
+    assert(so_exits(so_age() + "var a: Age = 0\nfor i in 0..<200\n    a += 1\nprint(a)"))
+
+@test("subtype op: two different subtypes over one base meet at the base")
+so_two_subtypes_meet_at_the_base()
+    if !so_can_run() then return
+
+    val src = so_age() + so_small() + "var a: Age = 5\nvar b: Small = 3\na += b\nprint(a)"
+
+    assert_eq(so_ran(src), "8\n")
+
+@test("subtype op: a subtype with a predicate and no range is checked by the predicate alone")
+so_a_predicate_and_no_range()
+    if !so_can_run() then return
+
+    val even = "type Even = int where value % 2 == 0\n"
+
+    assert_eq(so_ran(even + "var e: Even = 4\ne += 2\nprint(e)"), "6\n")
+    assert(so_exits(even + "var e: Even = 4\ne += 1\nprint(e)"))
+
+// Odd numbers are closed under multiplication and not under addition, so which operation was written
+// decides whether the predicate holds -- a check on the RESULT.
+@test("subtype op: and a derived one with a predicate and no range checks its own arithmetic")
+so_a_derived_one_with_a_predicate()
+    if !so_can_run() then return
+
+    val odd = "type Odd = new int where value % 2 == 1\n"
+
+    assert_eq(so_ran(odd + "print(Odd(3) * Odd(3))"), "9\n")
+    assert(so_exits(odd + "print(Odd(3) + Odd(1))"))
+
+@test("subtype op: a float subtype's compound assignment compares in the base's precision")
+so_a_float_subtypes_compound_assignment()
+    if !so_can_run() then return
+
+    val prob = "type Prob = f64 within 0.0..<1.0\n"
+
+    assert_eq(so_ran(prob + "var p: Prob = 0.25\np += 0.5\nprint(p)"), "0.75\n")
+    assert(so_exits(prob + "var p: Prob = 0.75\np += 0.5\nprint(p)"))
+
+// A float range's lower end below zero is a minus written before a literal, which no integer fold
+// reads -- left unread, the bottom of the range was never checked.
+@test("subtype op: a float range whose lower end is negative checks that end")
+so_a_float_range_with_a_negative_lower_end()
+    if !so_can_run() then return
+
+    val q = "type Q = f64 within -2.5..7.0\n"
+
+    assert_eq(so_ran(q + "var q: Q = -2.0\nq -= 0.5\nprint(q)"), "-2.5\n")
+    assert(so_exits(q + "var q: Q = -2.0\nq -= 1.0\nprint(q)"))
+
+// A narrower float is widened once and compared against the bounds as doubles.
+@test("subtype op: an f32 range is checked in double precision")
+so_an_f32_range_is_checked()
+    if !so_can_run() then return
+
+    val p = "type P = f32 within 0.1..<1.0\n"
+
+    assert_eq(so_ran(p + "var p: P = 0.25\np += 0.5\nprint(p)"), "0.75\n")
+    assert(so_exits(p + "var p: P = 0.75\np += 0.25\nprint(p)"))
+
+@test("subtype op: an increment through a pointer to a derived subtype checks it")
+so_an_increment_through_a_pointer_to_a_derived_one()
+    if !so_can_run() then return
+
+    assert_eq(so_ran(so_slot() + "var k: Slot = Slot(5)\nvar p = &k\n(*p)++\nprint(k)"), "6\n")
+    assert(so_exits(so_slot() + "var k: Slot = Slot(199)\nvar p = &k\n(*p)++\nprint(k)"))
+
+@test("subtype op: a multi-assignment of derived subtypes checks each arm")
+so_a_multi_assignment_of_derived_subtypes()
+    if !so_can_run() then return
+
+    val holds = "var j: Slot = Slot(5)\nvar k: Slot = Slot(6)\nj, k += Slot(1), Slot(2)\nprint(j, k)"
+    val traps = "var j: Slot = Slot(5)\nvar k: Slot = Slot(199)\nj, k += Slot(1), Slot(1)\nprint(j, k)"
+
+    assert_eq(so_ran(so_slot() + holds), "6 8\n")
+    assert(so_exits(so_slot() + traps))
+
+// -- what the base does not have, the subtype does not either -----------------------------------------
+
+@test("subtype op: unary minus stays refused over an unsigned base, and names the subtype")
+so_unary_minus_refused_over_an_unsigned_base()
+    if !so_ready() then return
+
+    val said = so_err(so_mask() + "var m: Mask = 5\nprint(-m)")
+
+    assert(so_says(said, "unary '-' is not defined for the unsigned type Mask"))
+
+@test("subtype op: the complement stays refused over a float base")
+so_the_complement_refused_over_a_float_base()
+    if !so_ready() then return
+
+    val said = so_err("type Prob = f64 within 0.0..1.0\nvar p: Prob = 0.5\nprint(~p)")
+
+    assert(so_says(said, "unary '~' is not defined for Prob"))
+
+@test("subtype op: an increment stays refused over a float base")
+so_an_increment_refused_over_a_float_base()
+    if !so_ready() then return
+
+    val said = so_err("type Prob = f64 within 0.0..1.0\nvar p: Prob = 0.5\np++")
+
+    assert(so_says(said, "'++' is not defined for Prob"))
+
+@test("subtype op: and over a char base")
+so_an_increment_refused_over_a_char_base()
+    if !so_ready() then return
+
+    val said = so_err("type Letter = char within 'a'..'z'\nvar c: Letter = 'q'\nc++")
+
+    assert(so_says(said, "'++' is not defined for Letter"))
+
+// The two flavours do not mix without a cast, and a compound form is not a way around that.
+@test("subtype op: a compound assignment may still not change the type of its place")
+so_a_compound_may_not_change_the_type()
+    if !so_ready() then return
+
+    val said = so_err(so_slot() + "var k: Slot = Slot(1)\nk += 1")
+
+    assert(so_says(said, "'+' needs matching types, got Slot and int"))
+
+// -- the catalog is inherited and cannot be replaced --------------------------------------------------
+
+@test("subtype op: an operator trait the compiler provides may not be implemented for a derived subtype")
+so_an_operator_trait_may_not_be_implemented()
+    if !so_ready() then return
+
+    val said = so_err(so_stamp() + "impl Add for Stamp\n    add(self, other: Stamp) -> Stamp\n        self")
+
+    assert(so_says(said, "'Stamp' already implements 'sysl.Add' — the compiler provides it"))
+
+@test("subtype op: and neither may Display")
+so_and_neither_may_display()
+    if !so_ready() then return
+
+    val src = so_stamp() + "impl Display for Stamp\n    display(self, out: &Writer, fmt: string)\n" +
+        "        out.write(\"x\")"
+
+    assert(so_says(so_err(src), "already implements 'sysl.Display'"))
+
+@test("subtype op: nor for a transparent one, which is its base and has the base's rows")
+so_nor_for_a_transparent_one()
+    if !so_ready() then return
+
+    val said = so_err(so_age() + "impl Add for Age\n    add(self, other: Age) -> Age\n        self")
+
+    assert(so_says(said, "'Age' already implements 'sysl.Add' — the compiler provides it"))
+
+// A trait of the program's own is not part of the catalog, so it is ordinary.
+@test("subtype op: while a trait the program declares is ordinary")
+so_a_trait_the_program_declares()
+    if !so_can_run() then return
+
+    val src = so_stamp() + "trait Doubler\n    twice(self) -> int\nimpl Doubler for Stamp\n" +
+        "    twice(self) -> int\n        int(self) * 2\nprint(Stamp(4).twice())"
+
+    assert_eq(so_ran(src), "8\n")
+
+// -- a subtype satisfies the bounds its base satisfies ------------------------------------------------
+
+@test("subtype op: a transparent one reaches an operator bound, computing at its base")
+so_a_transparent_one_reaches_an_operator_bound()
+    if !so_can_run() then return
+
+    val src = so_age() + "twice[T: Mul](x: T) -> T = x * x\nvar a: Age = 7\nprint(int(twice(a)))"
+
+    assert_eq(so_ran(src), "49\n")
+
+@test("subtype op: and the several bounds a generic asks for at once")
+so_the_several_bounds_at_once()
+    if !so_can_run() then return
+
+    val src = so_age() + "show[T: Display + Eq](a: T, b: T) -> unit\n    print(a, a == b)\n" +
+        "var x: Age = 7\nvar y: Age = 7\nshow(x, y)"
+
+    assert_eq(so_ran(src), "7 true\n")
+
+@test("subtype op: a derived one reaches it too")
+so_a_derived_one_reaches_it_too()
+    if !so_can_run() then return
+
+    val src = so_stamp() + "twice[T: Add](x: T) -> T = x + x\nprint(i64(twice(Stamp(7i64))))"
+
+    assert_eq(so_ran(src), "14\n")
+
+// Replacing what the base has is refused; an argument list the base has not is the derivation's own.
+@test("subtype op: and a derived one may add an argument list its base has not, keeping the base's own")
+so_a_derived_one_may_add_an_argument_list()
+    if !so_can_run() then return
+
+    val src = so_stamp() + "type Span = new i64\nimpl Add[Span] for Stamp\n" +
+        "    add(self, s: Span) -> Stamp = Stamp(i64(self) + i64(s))\n" +
+        "print(i64(Stamp(100i64) + Span(7i64)), i64(Stamp(100i64) + Stamp(5i64)))"
+
+    assert_eq(so_ran(src), "107 105\n")
