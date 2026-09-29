@@ -1,0 +1,64 @@
+module sh.sysl.compiler
+@tests
+
+// What a `?` refuses, and where. **Every refusal is told at the `?` itself**, not at the start of its
+// operand: the operand is a well-formed expression, and it is the unwrapping that is being refused.
+//
+// **Every list here is the reference's complete list for the same program** (0.0.150), one line per
+// diagnostic as `line:col message`, read through `isc_diags`. The first three are the reference's
+// `AnalyzerControlFlowErrorTests` "the ? operator" cases on their own inputs.
+
+private qm_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+        Ok(_) -> true
+
+@test("a '?' needs an Option or Result value")
+qm_needs_an_option_or_result()
+    if !qm_ready() then return
+
+    assert_eq(isc_diags("f(n: int) -> Option[int]\n    var x = n?\n    None\n\nprint(1)\n"),
+              "2:14 '?' needs an Option or Result value, not int\n")
+
+@test("a '?' may not be used in a function returning something else")
+qm_in_a_function_returning_something_else()
+    if !qm_ready() then return
+
+    assert_eq(isc_diags("g() -> Option[int] = None\nf() -> int\n    var x = g()?\n    x\nend f\n\nprint(1)\n"),
+              "3:16 '?' may only be used in a function returning sysl.Option, not int\n")
+
+@test("a '?' may not propagate an error the function does not return")
+qm_propagates_an_error_the_function_does_not_return()
+    if !qm_ready() then return
+
+    assert_eq(isc_diags("g() -> Result[int, string] = Ok(1)\nf() -> Result[int, bool]\n" +
+                        "    var x = g()?\n    Ok(x)\nend f\n\nprint(1)\n"),
+              "3:16 '?' propagates a string error, but this function returns bool — a '?' converts " +
+              "through 'sysl.From', so 'impl From[string] for bool' is what joins the two layers\n")
+
+@test("an Option's '?' in a function returning a Result names the whole return type")
+qm_option_in_a_result_function()
+    if !qm_ready() then return
+
+    assert_eq(isc_diags("f() -> Option[int] = Some(1)\ng() -> Result[int, string]\n    val x = f()?\n" +
+                        "    Ok(x)\n\nprint(g().unwrap())\n"),
+              "3:16 '?' may only be used in a function returning sysl.Option, not " +
+              "sysl.Result[int, string]\n")
+
+@test("a '?' in a function returning nothing says unit")
+qm_in_a_unit_function()
+    if !qm_ready() then return
+
+    assert_eq(isc_diags("f() -> Result[int, string] = Ok(1)\ng()\n    val x = f()?\n    print(x)\n\ng()\n"),
+              "3:16 '?' may only be used in a function returning sysl.Result, not unit\n")
+
+@test("a parenthesized operand is still told at the '?', past the bracket")
+qm_after_a_bracket()
+    if !qm_ready() then return
+
+    assert_eq(isc_diags("f() -> Result[int, string] = Ok(1)\ng() -> Result[int, bool]\n" +
+                        "    val x = (f())?\n    Ok(x)\n\nprint(g().unwrap())\n"),
+              "3:18 '?' propagates a string error, but this function returns bool — a '?' converts " +
+              "through 'sysl.From', so 'impl From[string] for bool' is what joins the two layers\n")
