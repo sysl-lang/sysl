@@ -1,0 +1,139 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A statement is the unit a mistake costs.
+//
+// **The first refusal inside a statement abandons the rest of it**, so a second refusal later in the
+// same statement is not told: an operand after a refused one, a later argument, the other branch of
+// an `if`, another arm of a `match`. What starts afresh is the next statement **of a block** -- a
+// block's statements each being a unit of their own, and its trailing expression being part of
+// whatever the block is the value of. So a branch or an arm written as one expression is part of the
+// statement it sits in, and a branch or an arm written as several statements tells each of them.
+//
+// **Every message and position here was read out of the reference compiler** (0.0.151) on the same
+// input.
+
+// Every diagnostic the body pass gives, each as `line:col: message`, one to a line.
+private spn_said(body: string) -> string
+    val text = "two(a: int, b: int) -> int = a\ntake(a: int, b: int) -> int = a\n\n" + body + "\n"
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return "did not parse"
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    var out = ""
+
+    for i in 0..<done.reported.len()
+        val p = done.reported.at(i)
+        val at = p.src.locate(p.diag.span.start)
+
+        if i > 0 then out = out + "\n"
+
+        out = out + s"${at.line}:${at.col}: ${p.diag.message}"
+
+    out
+end spn_said
+
+@test("a second refused call in one 'val' initializer is not told")
+spn_val_initializer() =
+    assert_eq(spn_said("use() -> int\n    val r = two(1, \"y\") + two(\"z\", 2)\n    r"),
+              "5:20: 'b' of 'two' is int, but string was given")
+
+@test("nor in a function's expression body")
+spn_expression_body() =
+    assert_eq(spn_said("use() -> int = two(1, \"y\") + two(\"z\", 2)"),
+              "4:23: 'b' of 'two' is int, but string was given")
+
+@test("nor in the arguments of an expression statement")
+spn_expression_statement() =
+    assert_eq(spn_said("use() -> int\n    take(two(1, \"y\"), two(\"z\", 2))\n    0"),
+              "5:17: 'b' of 'two' is int, but string was given")
+
+@test("nor in a later argument of a call written over several lines")
+spn_multiline_arguments() =
+    assert_eq(spn_said("use() -> int\n    val r = take(\n        two(1, \"y\"),\n        two(\"z\", 2))\n    r"),
+              "6:16: 'b' of 'two' is int, but string was given")
+
+@test("nor in an assignment's value")
+spn_assignment() =
+    assert_eq(spn_said("use() -> int\n    var r = 0\n    r = two(1, \"y\") + two(\"z\", 2)\n    r"),
+              "6:16: 'b' of 'two' is int, but string was given")
+
+@test("a second undefined name in one statement is not told")
+spn_two_undefined_names() =
+    assert_eq(spn_said("use() -> int\n    val r = nope + nope2\n    r"),
+              "5:13: undefined name 'nope'")
+
+@test("a match whose arms are single expressions is one statement, as the body's value")
+spn_match_as_value() =
+    assert_eq(spn_said("use(n: int) -> int\n    n match\n        0 -> two(1, \"y\")\n        _ -> two(\"z\", 2)"),
+              "6:21: 'b' of 'two' is int, but string was given")
+
+@test("and as a statement")
+spn_match_as_statement() =
+    assert_eq(spn_said("use(n: int) -> int\n    n match\n        0 -> two(1, \"y\")\n        _ -> two(\"z\", 2)\n    0"),
+              "6:21: 'b' of 'two' is int, but string was given")
+
+@test("an arm written as several statements tells each of them")
+spn_match_arm_block() =
+    assert_eq(spn_said("use(n: int) -> int\n    n match\n        0 ->\n            two(1, \"y\")\n" +
+                       "            two(\"z\", 2)\n        _ -> 1"),
+              "7:20: 'b' of 'two' is int, but string was given\n" +
+              "8:17: 'a' of 'two' is int, but string was given")
+
+@test("an 'if' whose branches are single expressions is one statement")
+spn_if_statement() =
+    assert_eq(spn_said("use(c: bool) -> int\n    if c\n        two(1, \"y\")\n    else\n        two(\"z\", 2)\n    0"),
+              "6:16: 'b' of 'two' is int, but string was given")
+
+@test("and so is a declared 'val' of one")
+spn_val_of_an_if() =
+    assert_eq(spn_said("use(c: bool) -> int\n    val r = if c\n        two(1, \"y\")\n    else\n        two(\"z\", 2)\n    r"),
+              "6:16: 'b' of 'two' is int, but string was given")
+
+@test("and of the one-line form")
+spn_one_line_if() =
+    assert_eq(spn_said("use(c: bool) -> int\n    val r = if c then two(1, \"y\") else two(\"z\", 2)\n    r"),
+              "5:30: 'b' of 'two' is int, but string was given")
+
+@test("a branch abandoned at its value abandons the other branch's statements too")
+spn_else_block_after_a_refused_branch() =
+    assert_eq(spn_said("use(c: bool) -> int\n    if c\n        two(1, \"y\")\n    else\n" +
+                       "        val q = two(\"z\", 2)\n        q\n    0"),
+              "6:16: 'b' of 'two' is int, but string was given")
+
+@test("a branch written as several statements tells each of them")
+spn_if_block() =
+    assert_eq(spn_said("use(c: bool) -> int\n    if c\n        two(1, \"y\")\n        two(\"z\", 2)\n    0"),
+              "6:16: 'b' of 'two' is int, but string was given\n" +
+              "7:13: 'a' of 'two' is int, but string was given")
+
+@test("and so does a loop body")
+spn_while_body() =
+    assert_eq(spn_said("use(c: bool) -> int\n    while c\n        two(1, \"y\")\n        two(\"z\", 2)\n    0"),
+              "6:16: 'b' of 'two' is int, but string was given\n" +
+              "7:13: 'a' of 'two' is int, but string was given")
+
+@test("two statements of a body are two units")
+spn_two_statements() =
+    assert_eq(spn_said("use() -> int\n    two(1, \"y\")\n    two(\"z\", 2)"),
+              "5:12: 'b' of 'two' is int, but string was given\n" +
+              "6:9: 'a' of 'two' is int, but string was given")
+
+@test("a name whose initializer was refused stops the statement that reads it, saying nothing")
+spn_failed_name_read_first() =
+    assert_eq(spn_said("use() -> int\n    val x = two(\"z\", 2)\n    val y = x + nope\n    y"),
+              "5:17: 'a' of 'two' is int, but string was given")
+
+@test("but what that statement found before reading it is told")
+spn_failed_name_read_after() =
+    assert_eq(spn_said("use() -> int\n    val x = two(\"z\", 2)\n    val y = nope + x\n    y"),
+              "5:17: 'a' of 'two' is int, but string was given\n" +
+              "6:13: undefined name 'nope'")

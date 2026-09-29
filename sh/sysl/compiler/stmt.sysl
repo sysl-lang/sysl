@@ -408,13 +408,15 @@ end type_list_show
 
 // One statement, read so that a mistake costs the statement it is in and nothing after it.
 //
-// **There is nothing here to recover from, and that is the point.** The reference compiler's `err`
-// throws and a `recover` catches it, so a statement that fails is abandoned part-way and its scopes
-// and loops have to be wound back; here every refusal records its diagnostic and answers with a
-// fallback, so the walk never leaves a statement half-read. What the reference's recovery buys --
-// a `var` whose initializer failed still binding its name, at `Unknown`, so that one bad
-// initializer does not turn every later use into an "undefined name" of its own -- each rule below
-// does for itself, by binding before it returns.
+// **The statement is a recovery region** (`Analysis.open_region`): its first refusal is the one it
+// is told about, and whatever the rest of it would have said is taken back when it closes. The
+// reference compiler's `err` throws and a `recover` catches it, so a statement that fails is
+// abandoned part-way and its scopes and loops have to be wound back; here every refusal records its
+// diagnostic and answers with a fallback, so the walk never leaves a statement half-read, and what
+// the abandonment would have kept quiet is removed afterwards instead. What the reference's recovery
+// also buys -- a `var` whose initializer failed still binding its name, at `Unknown`, so that one
+// bad initializer does not turn every later use into an "undefined name" of its own -- each rule
+// below does for itself, by binding before it returns.
 //
 // It is named for what the reference calls it because every caller is a place the reference calls
 // it, and the two walks are read side by side.
@@ -423,9 +425,11 @@ end type_list_show
 // where the reference's abandonment ends.
 recover_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt]
     val refused = cx.refused_is.len()
+    val outer = cx.an.open_region()
     var out = type_stmt(cx, stmt)
 
     push_all(&out, settle_needs(cx, stmt.span, stmt))
+    cx.an.close_region(outer)
     cx.refused_is.truncate(refused)
     out
 end recover_stmt
