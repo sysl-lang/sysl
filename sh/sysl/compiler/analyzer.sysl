@@ -207,6 +207,11 @@ struct Analyzer
     // reporting it as undefined, which it is not -- it is written right there.
     refused_is: Buf[string]
 
+    // Where a binding made now is reported from: the statement, the function header, the closure or
+    // the match arm being read. A binding form is left behind by the time its name is bound, so this
+    // is the position a refusal of that name carries -- the reference's `currentPos`.
+    bind_site: Option[Span]
+
     // What a name bound as a capture reads, or nothing where the name is an ordinary local.
     capture_read(self, unique: string) -> Option[TExpr]
         for i in 0..<self.captured.len()
@@ -265,8 +270,22 @@ struct Analyzer
         self.scope.imports.levels.push(at)
     end open_import_level
 
+    // **Every local binding comes through the four below** -- a `var`, a `val`, a parameter, a
+    // `for`'s element, a pattern's captures, a closure's parameters -- which is what makes this the
+    // one place the reserved shape is refused for all of them, the ones no declaration spells
+    // included: a closure's parameter buried in an argument list binds a name no statement names.
+    private refuse_reserved_binding(*self, name: string)
+        if !reserved_shape(name) then return
+
+        self.bind_site match
+            Some(at) -> self.fault(at, refuse_reserved(name, "binding"))
+            None -> ()
+    end refuse_reserved_binding
+
     // Binds a name in the innermost scope, under a unique name of its own.
     bind(*self, name: string, ty: Type) -> string
+        self.refuse_reserved_binding(name)
+
         val unique = self.fresh_name(name)
 
         self.locals.push(Local(name, unique, ty, false, false))
@@ -275,6 +294,8 @@ struct Analyzer
 
     // Binds a name that may not be assigned to again -- what a local `val` declares.
     bind_read_only(*self, name: string, ty: Type) -> string
+        self.refuse_reserved_binding(name)
+
         val unique = self.fresh_name(name)
 
         self.locals.push(Local(name, unique, ty, true, false))
@@ -284,6 +305,8 @@ struct Analyzer
     // Binds a name a **pattern** captured, which is written once for the reason a `val` is and
     // says so in its own words.
     bind_pattern(*self, name: string, ty: Type) -> string
+        self.refuse_reserved_binding(name)
+
         val unique = self.fresh_name(name)
 
         self.locals.push(Local(name, unique, ty, true, true))
@@ -293,6 +316,7 @@ struct Analyzer
     // Binds a name under a unique name the caller chose, which is what a parameter needs: a
     // parameter is loaded by the name its declaration gave it.
     bind_as(*self, name: string, unique: string, ty: Type)
+        self.refuse_reserved_binding(name)
         self.locals.push(Local(name, unique, ty, false, false))
 
     // A name nothing else in this **function** holds, which is what a slot of the frame is.
@@ -370,7 +394,7 @@ bad_expr(span: Span) -> TExpr = TExpr(span, TZero(Unknown))
 analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
     Analyzer(an, scope, buf(), buf(), buf(), buf(), "", None, None, false, buf(), buf(), false, false,
              None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
-             empty_names(), false, buf(), buf(), buf(), "", buf())
+             empty_names(), false, buf(), buf(), buf(), "", buf(), None)
 
 // A run of names with nothing in it, named so that a constructor can say which kind it means.
 private empty_names() -> Buf[string] = buf()

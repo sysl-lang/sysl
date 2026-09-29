@@ -1,8 +1,10 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
 import sysl.text.{repeat, split, Search}
 
 // A reserved word written where a name is BOUND -- a function's, a member's, a `val`'s, a `for`'s,
@@ -89,3 +91,397 @@ rsv_statement_is_not_a_function()
     val (_, _, code) = rsv_run("val a = true\nif (a)\n    print(1)\n")
 
     assert_eq(code, 0)
+
+// What a program prints, built and run the whole way; a build that fails answers what it said.
+private rsv_ran(text: string) -> string
+    val root = make_temp_dir("sysl-rsv").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end rsv_ran
+
+// The words that open a declaration of their own, each of which the grammar tries before a function.
+private rsv_leading_words() -> []string =
+    ["type", "struct", "enum", "trait", "impl", "extern", "val", "var", "const", "ref", "static",
+     "import", "private", "override", "module"]
+
+private rsv_field() -> string = "a parameter's name or a field's"
+
+// ---- ReservedWordNameTests: a field
+
+@test("a field named with a reserved word is refused at the word, not at the end of the block")
+rsv_field_caret_on_the_word()
+    if !rsv_ready() then return
+
+    rsv_refused("struct S\n    a: int\n    val: int\n\nmain() =\n    print(1)\n", "val", rsv_field(), 3, 5)
+
+@test("a field named with any reserved word is refused as that word")
+rsv_field_whichever_word()
+    if !rsv_ready() then return
+
+    rsv_refused("struct S\n    match: int\n\nmain()\n    print(1)\n", "match", rsv_field(), 2, 5)
+
+@test("a field named with a reserved word as the block's first line")
+rsv_field_first_line()
+    if !rsv_ready() then return
+
+    rsv_refused("struct S\n    struct: int\n\nmain()\n    print(1)\n", "struct", rsv_field(), 2, 5)
+
+// ---- ReservedWordNameTests: a parameter
+
+@test("a function's parameter named with a reserved word")
+rsv_param_in_a_function()
+    if !rsv_ready() then return
+
+    rsv_refused("f(val: int) -> int = 1\n\nmain() =\n    print(f(1))\n", "val", rsv_field(), 1, 3)
+
+@test("an extern's parameter named with a reserved word")
+rsv_param_in_an_extern()
+    if !rsv_ready() then return
+
+    rsv_refused("extern \"puts\" p(val: *u8) -> i32\n\nmain()\n    print(1)\n", "val", rsv_field(),
+                1, 17)
+
+@test("a reserved-word parameter after one that was fine")
+rsv_param_after_a_fine_one()
+    if !rsv_ready() then return
+
+    rsv_refused("f(a: int, val: int) -> int = a\n\nmain()\n    print(f(1, 2))\n", "val", rsv_field(),
+                1, 11)
+
+// ---- ReservedWordNameTests: a function
+
+@test("a function named with a reserved word is told which word, at the word")
+rsv_fn_told_at_the_word()
+    if !rsv_ready() then return
+
+    rsv_refused("loop() -> int = 1\nprint(1)\n", "loop", "a function's name", 1, 1)
+
+@test("a reserved-word function with a block body")
+rsv_fn_block_body()
+    if !rsv_ready() then return
+
+    rsv_refused("match(n: int) -> int\n    n\n\nprint(1)\n", "match", "a function's name", 1, 1)
+
+@test("a reserved-word function with type parameters")
+rsv_fn_type_parameters()
+    if !rsv_ready() then return
+
+    rsv_refused("then[T](x: T) -> T = x\nprint(1)\n", "then", "a function's name", 1, 1)
+
+@test("every declaration-leading word as a function's name is refused at the word")
+rsv_fn_each_leading_word()
+    if !rsv_ready() then return
+
+    val words = rsv_leading_words()
+
+    for i in 0..<words.len
+        rsv_refused(s"${words[i]}() -> int = 1\nprint(1)\n", words[i], "a function's name", 1, 1)
+
+@test("a declaration-leading word as a function with parameters and a block body")
+rsv_fn_leading_word_block_body()
+    if !rsv_ready() then return
+
+    rsv_refused("print(1)\nstruct(x: int) -> int\n    x\n", "struct", "a function's name", 2, 1)
+
+@test("a declaration-leading word as a function with type parameters")
+rsv_fn_leading_word_type_parameters()
+    if !rsv_ready() then return
+
+    rsv_refused("type[T](x: T) -> T = x\nprint(1)\n", "type", "a function's name", 1, 1)
+
+@test("a declaration-leading word as a function after a visibility")
+rsv_fn_leading_word_after_visibility()
+    if !rsv_ready() then return
+
+    rsv_refused("module m\n\nprivate type() -> int = 1\n", "type", "a function's name", 3, 9)
+
+@test("a declaration-leading word as a function after an annotation")
+rsv_fn_leading_word_after_annotation()
+    if !rsv_ready() then return
+
+    rsv_refused("@inline\nval(x: int) -> int = x\nprint(1)\n", "val", "a function's name", 2, 1)
+
+@test("a declaration-leading word as a function inside a function's body")
+rsv_fn_leading_word_in_a_body()
+    if !rsv_ready() then return
+
+    rsv_refused("main()\n    const(x: int) -> int = x\n    print(1)\n", "const", "a function's name",
+                2, 5)
+
+@test("the backticked function name the refusal advises is a function like any other")
+rsv_fn_backticked_is_a_function()
+    if !rsv_ready() then return
+
+    assert_eq(rsv_ran("`type`() -> int = 7\n`struct`(x: int) -> int = x + 1\nprint(`type`() + `struct`(1))\n"),
+              "9\n")
+
+@test("every declaration the leading words open still reads as itself")
+rsv_fn_declarations_still_read()
+    if !rsv_ready() then return
+
+    val text = "type Id = int\ntype Pair = (int, int)\nstruct Box[T]\n    v: T\nenum Shape\n    Dot\n" +
+               "    Line(n: int)\ntrait Sized\n    size(self) -> int\nimpl[T] Sized for Box[T]\n" +
+               "    size(self) -> int = 1\nconst k: int = 2\nextern \"abs\" c_abs(n: i32) -> i32\n" +
+               "val (a, b) = (3, 4)\nvar (c, d) = (5, 6)\nc += 1\nval p: Pair = (a, b)\nval (e, f) = p\n" +
+               "val id: Id = int(c_abs(-8))\nref r = c\nr += 1\n" +
+               "print(Box(1).size() + k + e + f + c + d + id)\n"
+
+    assert_eq(rsv_ran(text), "31\n")
+
+// ---- ReservedWordNameTests: a member
+
+@test("a method named with a reserved word in a struct's body")
+rsv_member_in_a_struct()
+    if !rsv_ready() then return
+
+    rsv_refused("struct Handle\n    n: int\n    ref(self) -> int = self.n\n\nprint(1)\n", "ref",
+                "a member's name", 3, 5)
+
+@test("a property named with a reserved word")
+rsv_member_as_a_property()
+    if !rsv_ready() then return
+
+    rsv_refused("struct S\n    n: int\n    loop -> int = self.n\n\nprint(1)\n", "loop",
+                "a member's name", 3, 5)
+
+@test("a trait signature named with a reserved word")
+rsv_member_trait_signature()
+    if !rsv_ready() then return
+
+    rsv_refused("trait T\n    while(self) -> int\n\nprint(1)\n", "while", "a member's name", 2, 5)
+
+@test("an impl method named with a reserved word")
+rsv_member_in_an_impl()
+    if !rsv_ready() then return
+
+    rsv_refused("trait T\n    f(self) -> int\nstruct S\n    n: int\nimpl T for S\n" +
+                "    for(self) -> int = 1\n\nprint(1)\n", "for", "a member's name", 6, 5)
+
+@test("every declaration-leading word as a member, in every body a member is written in")
+rsv_member_each_leading_word()
+    if !rsv_ready() then return
+
+    val words = rsv_leading_words()
+
+    for i in 0..<words.len
+        val w = words[i]
+
+        rsv_refused(s"struct S\n    n: int\n    $w(self) -> int = self.n\n\nprint(1)\n", w,
+                    "a member's name", 3, 5)
+        rsv_refused(s"enum E\n    A\n    $w(self) -> int = 1\n\nprint(1)\n", w, "a member's name", 3,
+                    5)
+        rsv_refused(s"trait T\n    $w(self) -> int\n\nprint(1)\n", w, "a member's name", 2, 5)
+        rsv_refused(s"trait T\n    $w(self) -> int = 1\n\nprint(1)\n", w, "a member's name", 2, 5)
+        rsv_refused(s"trait T\n    f(self) -> int\nstruct S\n    n: int\nimpl T for S\n" +
+                    s"    $w(self) -> int = 1\n\nprint(1)\n", w, "a member's name", 6, 5)
+
+@test("a declaration-leading word as a trait property")
+rsv_member_leading_word_property()
+    if !rsv_ready() then return
+
+    rsv_refused("trait T\n    static -> int\n\nprint(1)\n", "static", "a member's name", 2, 5)
+
+@test("a declaration-leading word as a member with type parameters")
+rsv_member_leading_word_type_parameters()
+    if !rsv_ready() then return
+
+    rsv_refused("trait T\n    type[U](self, u: U) -> int\n\nprint(1)\n", "type", "a member's name", 2,
+                5)
+
+@test("a declaration-leading word as a member under an annotation")
+rsv_member_leading_word_under_annotation()
+    if !rsv_ready() then return
+
+    rsv_refused("trait T\n    f(self, x: int) -> int\nstruct S\n    n: int\nimpl T for S\n" +
+                "    @crossing(x)\n    private(self, x: int) -> int = x\n\nprint(1)\n", "private",
+                "a member's name", 7, 5)
+
+@test("the backticked member name the refusal advises is a member like any other")
+rsv_member_backticked_is_a_member()
+    if !rsv_ready() then return
+
+    val text = "trait T\n    `type`(self) -> int\n    `static`(self) -> int = 2\nstruct S\n    n: int\n" +
+               "    `private`(self) -> int = self.n\nimpl T for S\n    `type`(self) -> int = 10\n\n" +
+               "val s = S(3)\nprint(s.`type`() + s.`static`() + s.`private`())\n"
+
+    assert_eq(rsv_ran(text), "15\n")
+
+@test("every form the leading words open in a body still reads as itself")
+rsv_member_forms_still_read()
+    if !rsv_ready() then return
+
+    val text = "trait Holds\n    type Item\n    type Key: Eq\n    static zero -> int\n" +
+               "    first(self) -> Self::Item\n    key(self) -> Self::Key\nstruct Box\n    private n: int\n" +
+               "    m: int\n    static seven -> int = 7\n    private get(self) -> int = self.n\n" +
+               "    total(self) -> int = self.get() + self.m\n    set level(v)\n        self.n = v\n" +
+               "    level -> int = self.n\nimpl Holds for Box\n    type Item = int\n    type Key = int\n" +
+               "    static zero -> int = 0\n    first(self) -> int = self.total()\n" +
+               "    key(self) -> int = 1\n\nvar b = Box(1, 2)\nb.level = 4\n" +
+               "print(b.first() + b.key() + Box.seven + Box.zero)\n"
+
+    assert_eq(rsv_ran(text), "14\n")
+
+// A scoped visibility's bracket reads like type parameters, and the member-name refusal must not take
+// it for a member called `private`.
+@test("a scoped visibility is still a visibility, on a member with and without type parameters")
+rsv_member_scoped_visibility()
+    val text = "struct P\n    private[geom] x: int\n    private[geom] get(self) -> int = self.x\n" +
+               "    private[geom] sum[T](self, t: T) -> int = self.x\nend P\n"
+    val parsed = parse(source_of("test.sysl", text))
+
+    assert(parsed.ok(), "the struct parses")
+
+    *parsed.program.body.at(0).kind match
+        StructDecl(d) ->
+            assert_eq(d.members.len(), 2)
+            assert_eq(d.members.at(0).name, "get")
+            assert_eq(d.members.at(1).name, "sum")
+
+            for i in 0..<d.members.len()
+                d.members.at(i).vis match
+                    Scoped(n) -> assert_eq(n, "geom")
+                    _ -> assert(false, s"member $i is not scoped")
+        _ -> assert(false, "the first statement is not a struct")
+
+// ---- ReservedWordNameTests: a binding
+
+@test("a 'val' binding a reserved word")
+rsv_bind_val()
+    if !rsv_ready() then return
+
+    rsv_refused("val type = 3\nprint(1)\n", "type", "the name a 'val' binds", 1, 5)
+
+@test("a 'var' binding a reserved word")
+rsv_bind_var()
+    if !rsv_ready() then return
+
+    rsv_refused("var loop = 3\nprint(1)\n", "loop", "the name a 'var' binds", 1, 5)
+
+@test("a 'const' named with a reserved word")
+rsv_bind_const()
+    if !rsv_ready() then return
+
+    rsv_refused("const match: int = 3\nprint(1)\n", "match", "a constant's name", 1, 7)
+
+@test("a 'ref' binding a reserved word")
+rsv_bind_ref()
+    if !rsv_ready() then return
+
+    rsv_refused("var n = 1\nref loop = n\nprint(n)\n", "loop", "the name a 'ref' binds", 2, 5)
+
+@test("a reserved word as the second name of several")
+rsv_bind_second_of_several()
+    if !rsv_ready() then return
+
+    rsv_refused("val a, if = 1, 2\nprint(a)\n", "if", "the name a 'val' binds", 1, 8)
+    rsv_refused("var a, if = 1, 2\nprint(a)\n", "if", "the name a 'var' binds", 1, 8)
+    rsv_refused("val if, a = 1, 2\nprint(a)\n", "if", "the name a 'val' binds", 1, 5)
+
+@test("a 'for' variable named with a reserved word")
+rsv_bind_for()
+    if !rsv_ready() then return
+
+    rsv_refused("for loop in 0..<3\n    print(1)\n", "loop", "the name a 'for' binds", 1, 5)
+
+// ---- ReservedWordNameTests: a pattern
+
+@test("a reserved word bound inside a variant pattern")
+rsv_pattern_inside_a_variant()
+    if !rsv_ready() then return
+
+    rsv_refused("val o: Option[int] = Some(1)\no match\n    Some(loop) -> print(1)\n    None -> print(0)\n",
+                "loop", "a name a pattern binds", 3, 10)
+
+@test("a reserved word bound before an '@'")
+rsv_pattern_before_an_at()
+    if !rsv_ready() then return
+
+    rsv_refused("val o: Option[int] = Some(1)\no match\n    while @ Some(_) -> print(1)\n    else print(0)\n",
+                "while", "a name a pattern binds", 3, 5)
+
+@test("a reserved word as a struct pattern's shorthand")
+rsv_pattern_struct_shorthand()
+    if !rsv_ready() then return
+
+    rsv_refused("struct P\n    x: int\nval p = P(1)\np match\n    P{loop} -> print(1)\n", "loop",
+                "a name a pattern binds", 5, 7)
+
+// ---- ReservedWordNameTests: statements and arguments left alone
+
+@test("a return of a closure with typed parameters is not a function misnamed")
+rsv_alone_return_of_a_closure()
+    if !rsv_ready() then return
+
+    assert_eq(rsv_ran("f() -> &Fn(int) -> int\n    return (x: int) -> x * 2\n\nval g = f()\nprint(g(4))\n"),
+              "8\n")
+
+@test("a condition in parentheses is not a function misnamed")
+rsv_alone_condition_in_parentheses()
+    if !rsv_ready() then return
+
+    assert_eq(rsv_ran("val n = 3\nif (n > 1) then print(1) else print(0)\nwhile (false)\n    print(2)\n"),
+              "1\n")
+
+@test("a 'true' or 'else' arm in a match is not a pattern misnamed")
+rsv_alone_true_or_else_arm()
+    if !rsv_ready() then return
+
+    assert_eq(rsv_ran("val b = true\nb match\n    true -> print(1)\n    else print(0)\n"), "1\n")
+
+@test("a reserved-word literal beginning an argument is left alone")
+rsv_alone_literal_argument()
+    if !rsv_ready() then return
+
+    assert_eq(rsv_ran("f(x: bool) -> int = if x then 1 else 0\n\nmain()\n    print(f(true))\n"), "1\n")
+
+@test("a conditional beginning an argument is left alone")
+rsv_alone_conditional_argument()
+    if !rsv_ready() then return
+
+    assert_eq(rsv_ran("f(n: int) -> int = n\n\nmain()\n    print(f(if true then 7 else 8))\n"), "7\n")
+
+@test("a call whose whole argument list is a reserved word is left alone")
+rsv_alone_whole_argument_list()
+    if !rsv_ready() then return
+
+    assert_eq(rsv_ran("f(x: bool) -> int = if x then 1 else 0\n\nmain()\n    print(f(false))\n"), "0\n")
+
+// ---- ReservedWordNameTests: the backticked form is a name
+
+@test("a backticked reserved word as a field, constructed and selected")
+rsv_quoted_field()
+    if !rsv_ready() then return
+
+    assert_eq(rsv_ran("struct S\n    a: int\n    `val`: int\n\nmain()\n    var s = S(1, 2)\n    print(s.`val`)\n"),
+              "2\n")
+
+@test("a backticked reserved word as a parameter, called by position")
+rsv_quoted_parameter()
+    if !rsv_ready() then return
+
+    assert_eq(rsv_ran("f(`val`: int) -> int = `val` + 1\n\nmain()\n    print(f(1))\n"), "2\n")
+
+@test("a backticked reserved word as a function, a method and a 'val'")
+rsv_quoted_function_method_val()
+    if !rsv_ready() then return
+
+    val text = "`loop`() -> int = 1\nstruct H\n    n: int\n    `ref`(self) -> int = self.n\n" +
+               "val `type` = `loop`() + H(2).`ref`()\nprint(`type`)\n"
+
+    assert_eq(rsv_ran(text), "3\n")
