@@ -65,7 +65,7 @@ private ghost_call(a: &Analysis, scope: Scope, ghost: Buf[string], e: TExpr)
     *e.kind match
         TCall(name, _, _, _) ->
             if holds_string(ghost, name) then
-                a.fault(scope, e.span, s"'${module_show(name)}' is '@ghost', so it exists for the " +
+                a.fault(scope, e.span, s"'${qualified_name(name)}' is '@ghost', so it exists for the " +
                         "specification and is not there when the program runs — it may be called " +
                         "from a 'require', an 'ensure', a loop's 'invariant' or 'variant', or from " +
                         "another '@ghost' function, and from nowhere else")
@@ -162,9 +162,9 @@ private check_drop_returns(a: &Analysis)
                 if held.is_some() then
                     val name = module_bare(held.unwrap())
 
-                    a.caution(f.scope, f.span, s"'${module_show(key)}' hands back " +
-                              s"'${module_show(held.unwrap())}' by value, and " +
-                              s"'${module_show(held.unwrap())}' has a 'Drop' — a destructor runs " +
+                    a.caution(f.scope, f.span, s"'${qualified_name(key)}' hands back " +
+                              s"'${qualified_name(held.unwrap())}' by value, and " +
+                              s"'${qualified_name(held.unwrap())}' has a 'Drop' — a destructor runs " +
                               "when a box's count reaches zero, so nothing here will ever call " +
                               s"it. Return '&$name' instead, or take the resource apart before " +
                               "returning it")
@@ -294,10 +294,10 @@ private check_conventions(a: &Analysis)
     for i in 0..<funcs.len()
         val f = funcs.at(i)
 
-        if f.decl.conv.is_some() then check_convention(a, f, f.decl.conv.unwrap())
+        if f.decl.conv.is_some() then check_convention(a, funcs.key_at(i), f, f.decl.conv.unwrap())
 end check_conventions
 
-private check_convention(a: &Analysis, f: Func, c: CallConv)
+private check_convention(a: &Analysis, key: string, f: Func, c: CallConv)
     if c.name != InterruptConv then
         a.fault(f.scope, c.span, s"'${c.name}' is not a calling convention — '$InterruptConv' is " +
                 "what there is")
@@ -316,7 +316,7 @@ private check_convention(a: &Analysis, f: Func, c: CallConv)
             // to resolve *to* out here.
             if !f.decl.tparams.is_empty() then
                 a.fault(f.scope, c.span, "an interrupt handler is a single entry point the " +
-                        s"processor jumps to, so '${f.decl.name}' cannot be generic — there would " +
+                        s"processor jumps to, so '${qualified_name(key)}' cannot be generic — there would " +
                         "be no way to say which instantiation the vector holds")
 
             check_convention_shape(a, f, c, form)
@@ -524,23 +524,23 @@ private check_export(a: &Analysis, key: string, f: Func, e: ExportAttr)
     // parameter has nothing to resolve *to* out here.
     if !f.decl.tparams.is_empty() then
         a.fault(f.scope, e.span, "an exported symbol is one function at one signature, so " +
-                s"'${f.decl.name}' cannot be generic — there would be no way to say which " +
+                s"'${qualified_name(key)}' cannot be generic — there would be no way to say which " +
                 "instantiation the linker holds. Export a wrapper per instantiation, each naming " +
                 "its own symbol")
 
     // `private` emits the symbol internal, which is the promise that every caller is inside this
     // module. An export is the opposite promise, and a definition cannot make both.
     if !is_public(f.decl.vis) then
-        a.fault(f.scope, e.span, s"'${module_show(key)}' is private, which promises every caller " +
+        a.fault(f.scope, e.span, s"'${qualified_name(key)}' is private, which promises every caller " +
                 "is inside its own module — and an export promises the opposite. A definition " +
                 "cannot make both claims")
 
     if f.decl.ghost then
-        a.fault(f.scope, e.span, s"'${module_show(key)}' is '@ghost', so it is erased before " +
+        a.fault(f.scope, e.span, s"'${qualified_name(key)}' is '@ghost', so it is erased before " +
                 "codegen and there is no symbol for C to link against")
 
     if f.decl.test.is_some() then
-        a.fault(f.scope, e.span, s"'${module_show(key)}' is a '@test', which only 'sysl test' " +
+        a.fault(f.scope, e.span, s"'${qualified_name(key)}' is a '@test', which only 'sysl test' " +
                 "builds — an exported symbol has to be in the artifact a C project links, and a " +
                 "test is not")
 
@@ -548,7 +548,7 @@ private check_export(a: &Analysis, key: string, f: Func, e: ExportAttr)
     // mechanism -- but the *promotions* a C caller applies to the tail are the caller's, and nothing
     // here has seen that caller's prototype.
     if f.decl.variadic then
-        a.fault(f.scope, e.span, s"'${module_show(key)}' is variadic, and what a C caller promotes " +
+        a.fault(f.scope, e.span, s"'${qualified_name(key)}' is variadic, and what a C caller promotes " +
                 "into the tail is decided by the prototype it compiled against rather than by this " +
                 "declaration — take a 'va_list' parameter instead, which states the same thing and " +
                 "is what C's own 'v' variants do")

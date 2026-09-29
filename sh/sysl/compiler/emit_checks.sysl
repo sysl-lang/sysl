@@ -112,7 +112,7 @@ private become_refusal(a: &Analysis, p: TProgram, f: TFunc, scope: Scope, deferr
         return
 
     if counted_params(f)
-        refuse_become(a, scope, at, s"'${module_show(f.name)}' takes a counted value — the frame's " +
+        refuse_become(a, scope, at, s"'${qualified_name(f.name)}' takes a counted value — the frame's " +
                       "own references are let go before the jump, so an argument read out of one of " +
                       "them would outlive nothing. Pass what the callee needs through a raw pointer " +
                       "or a value that carries no count")
@@ -121,13 +121,13 @@ private become_refusal(a: &Analysis, p: TProgram, f: TFunc, scope: Scope, deferr
     *call.kind match
         TCall(name, _, _, _) ->
             if is_extern_name(p, name)
-                refuse_become(a, scope, at, s"'${module_show(name)}' is an 'extern' — its frame is " +
+                refuse_become(a, scope, at, s"'${qualified_name(name)}' is an 'extern' — its frame is " +
                               "C's, and nothing here knows what C does with one")
                 return
 
             func_named(p, name) match
                 None ->
-                    refuse_become(a, scope, at, s"'${module_show(name)}' has no body here, so there " +
+                    refuse_become(a, scope, at, s"'${qualified_name(name)}' has no body here, so there " +
                                   "is no frame to replace this one with")
                 Some(g) ->
                     become_mismatch(a, f, g) match
@@ -171,21 +171,21 @@ end func_named
 // is the whole of it: same parameter types in order, same result.
 private become_mismatch(a: &Analysis, f: TFunc, g: TFunc) -> Option[string]
     if g.variadic
-        return Some(s"'${module_show(g.name)}' is variadic and this function is not, so the two do " +
+        return Some(s"'${qualified_name(g.name)}' is variadic and this function is not, so the two do " +
                     "not have the same shape")
 
     if f.params.len() != g.params.len()
-        return Some(s"'${module_show(g.name)}' takes ${g.params.len()} " +
+        return Some(s"'${qualified_name(g.name)}' takes ${g.params.len()} " +
                     s"argument${plural_s(g.params.len())} and this function takes " +
                     s"${f.params.len()} — a frame can only be replaced by one of the same shape")
 
     if !param_types_agree(f.params, g.params)
-        return Some(s"'${module_show(g.name)}' takes ${param_type_list(f.params)} where this " +
+        return Some(s"'${qualified_name(g.name)}' takes ${param_type_list(f.params)} where this " +
                     s"function takes ${param_type_list(g.params)} — a frame can only be replaced " +
                     "by one of the same shape")
 
     if !type_eq(f.ret_ty, g.ret_ty)
-        return Some(s"'${module_show(g.name)}' answers ${type_show(g.ret_ty)} and this function " +
+        return Some(s"'${qualified_name(g.name)}' answers ${type_show(g.ret_ty)} and this function " +
                     s"answers ${type_show(f.ret_ty)} — the result comes back the way this frame's " +
                     "caller is waiting for it")
 
@@ -275,11 +275,11 @@ private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
         var named: Buf[string] = buf()
 
         for k in 0..<reached.len()
-            if holds_string(computed, reached.at(k)) then named.push(s"'${module_show(reached.at(k))}'")
+            if holds_string(computed, reached.at(k)) then named.push(s"'${qualified_name(reached.at(k))}'")
 
         if !named.is_empty()
             a.fault(func_home(a, f.name), f.span,
-                    s"'${module_show(f.name)}' is exported and reaches " +
+                    s"'${qualified_name(f.name)}' is exported and reaches " +
                     s"${joined_list(sorted_names(named))}, which is module storage an initializer " +
                     "fills before the program's own statements run. This artifact has no entry point " +
                     s"to fill it in, and '${t.name}' is freestanding — there is no loader to run a " +
@@ -339,7 +339,7 @@ private export_names(a: &Analysis, exported: Buf[TFunc])
     for i in 0..<exported.len()
         val f = exported.at(i)
 
-        claim(&names, &what, f.exported.unwrap(), s"the function '${module_show(f.name)}'")
+        claim(&names, &what, f.exported.unwrap(), s"the function '${qualified_name(f.name)}'")
 
     val order = sorted_names(names)
 
@@ -394,12 +394,12 @@ private export_signature(a: &Analysis, f: TFunc)
         val p = f.params.at(i)
 
         if !export_crosses(p.1)
-            a.fault(scope, f.span, s"'${p.0}' of the exported '${module_show(f.name)}' is " +
+            a.fault(scope, f.span, s"'${p.0}' of the exported '${qualified_name(f.name)}' is " +
                     s"${type_show(p.1)}, which C has no way to spell — an exported function takes " +
                     s"${export_spellable()}. ${export_advice(p.1)}")
 
     if !no_value(f.ret_ty) && !export_crosses(f.ret_ty)
-        a.fault(scope, f.span, s"the exported '${module_show(f.name)}' returns " +
+        a.fault(scope, f.span, s"the exported '${qualified_name(f.name)}' returns " +
                 s"${type_show(f.ret_ty)}, which C has no way to spell — an exported function " +
                 s"returns that or nothing at all. ${export_advice(f.ret_ty)}")
 end export_signature
@@ -423,7 +423,7 @@ private export_duplicates(a: &Analysis, exported: Buf[TFunc])
 
             for j in 0..<exported.len()
                 if exported.at(j).exported.unwrap() == symbol
-                    claimants.push(s"'${module_show(exported.at(j).name)}'")
+                    claimants.push(s"'${qualified_name(exported.at(j).name)}'")
 
             if claimants.len() > 1
                 a.fault(func_home(a, first.name), first.span,
