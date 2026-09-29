@@ -73,9 +73,10 @@ private const Stale: long = 604800000000
 // cannot hold: a name is read out of source, and a NUL does not survive the lexer.
 private const Nul: string = "\0"
 
-// How many separators a well-formed line of the test list has: seven fields for the test and three
-// for each of the four hooks.
-private const Marks: usize = 18
+// How many separators a well-formed line of the test list has: seven fields for the test, three for
+// each of the four hooks, and two for why it is ignored. A line written before `ignore` existed has
+// two fewer, and reads as no cache rather than as a suite with nothing ignored.
+private const Marks: usize = 20
 
 // --- the key --------------------------------------------------------------------------
 
@@ -405,6 +406,11 @@ encode_test_list(tests: Buf[TTest]) -> string
         push_hook(&b, t.hooks.setup_all)
         push_hook(&b, t.hooks.teardown_all)
 
+        b.push(Nul)
+        b.push(t.ignored.unwrap_or(""))
+        b.push(Nul)
+        b.push(if t.ignored.is_some() then "1" else "0")
+
     b.finish()
 end encode_test_list
 
@@ -438,10 +444,12 @@ decode_test_list(text: string) -> Option[Buf[TTest]]
         if f.len != Marks + 1 then return None
 
         val expected = if f[4] == "1" then Some(f[3]) else None
+        val ignored = if f[20] == "1" then Some(f[19]) else None
 
         out.push(TTest(f[0], f[1], f[2] == "true", expected, f[5], read_line_number(f[6]),
                        THooks(hook_from(Setup, f, 7), hook_from(Teardown, f, 10),
-                              hook_from(SetupAll, f, 13), hook_from(TeardownAll, f, 16))))
+                              hook_from(SetupAll, f, 13), hook_from(TeardownAll, f, 16)),
+                       ignored))
 
     Some(out)
 end decode_test_list

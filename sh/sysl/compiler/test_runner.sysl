@@ -45,6 +45,10 @@ end TestOptions
 // the hook standing in for the test: a hook that runs alone has no test to hang its failure on, and
 // what a row needs is a name, a file and a line, which a hook has. So the report grows a row rather
 // than a second kind of row, and the header counts the tests instead of counting the rows.
+//
+// **An ignored test is one of these too, and it never ran**: its test carries the reason, `detail`
+// is absent and `millis` is zero. It fails nothing — `passed` reads true, which an ignored test does
+// not spoil — and it is counted apart in the summary.
 struct Outcome
     test: TTest
     detail: Option[string]
@@ -52,6 +56,9 @@ struct Outcome
     millis: long
 
     passed(self) -> bool = self.detail.is_none()
+
+    // Why the test was not run, where it was ignored.
+    ignored(self) -> Option[string] = self.test.ignored
 end Outcome
 
 // Every selected test, run in the order it was written -- which is the order it is reported in, so
@@ -86,7 +93,10 @@ run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
         if stop then break
 
         val group = groups.at(g)
-        val hooks = group.at(0).hooks
+
+        // A module whose selected tests are all ignored runs nothing at all, its `_all` hooks
+        // included: they bracket the runs, and there are none to bracket.
+        val hooks = if all_ignored(group) then no_hooks() else group.at(0).hooks
 
         // `@setup_all` is a run of its own, before anything else in the module. Where it does not
         // come back it gets a row of its own and the module's tests do not run: there is no test to
@@ -112,7 +122,10 @@ run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
             for i in 0..<group.len()
                 if stop then break
 
-                val outcome = run_one_test(exe, group.at(i))
+                // An ignored test starts no process — not the test's, and not its `@setup` or
+                // `@teardown` either, since those bracket a run and there is none.
+                val t = group.at(i)
+                val outcome = if t.ignored.is_some() then Outcome(t, None, "", 0) else run_one_test(exe, t)
 
                 done.push(outcome)
                 show_outcome(outcome, width, &shown, &any_shown, emit)
@@ -149,6 +162,14 @@ private show_outcome(o: Outcome, width: usize, shown: *string, any_shown: *bool,
 
     emit(test_row(o, width))
 end show_outcome
+
+// Whether every test of a module's group is ignored, so nothing of the module runs.
+private all_ignored(group: Buf[TTest]) -> bool
+    for i in 0..<group.len()
+        if group.at(i).ignored.is_none() then return false
+
+    true
+end all_ignored
 
 // The widest name a row in this run could carry, fixed before anything is run so the first row can be
 // emitted immediately. It covers both what the tests will show and the bare name of every hook their
@@ -293,7 +314,7 @@ const NotStarted: int = 127
 // a file and a line, and a hook has all three. It is shown under the name it was declared with, which
 // is what a reader greps for.
 private hook_outcome(h: THook, r: HookRun) -> Outcome =
-    Outcome(TTest(h.func, module_bare(h.func), false, None, h.file, h.line, no_hooks()),
+    Outcome(TTest(h.func, module_bare(h.func), false, None, h.file, h.line, no_hooks(), None),
             Some(hook_did_not_return(h, r.status)), r.output, r.millis)
 
 private hook_did_not_return(h: THook, state: int) -> string =
@@ -363,11 +384,16 @@ test_file_header(file: string) -> string = s"\n$file\n"
 // happens to be the widest. A failure's own line says what happened; anything the run printed follows
 // it, indented, and is shown **only** for a failure -- output from a test that passed is what the test
 // was doing, not something anyone asked to read.
+//
+// An ignored test's row carries its reason where the time would be: it has no run to time, and the
+// reason is the one thing its reader is owed.
 test_row(o: Outcome, width: usize) -> string
     val mark = if o.passed() then "ok  " else "FAIL"
     val pad = if o.test.display.len < width then repeat(" ", width - o.test.display.len) else ""
 
-    var out = s"  $mark  ${o.test.display}$pad  ${o.millis}ms\n"
+    var out = o.ignored() match
+        Some(why) -> s"  skip  ${o.test.display}$pad  ignored: $why\n"
+        None -> s"  $mark  ${o.test.display}$pad  ${o.millis}ms\n"
 
     o.detail match
         None -> ()
@@ -383,17 +409,23 @@ test_row(o: Outcome, width: usize) -> string
     out
 end test_row
 
-// The closing line: how many of the rows passed, against how long the whole run took.
+// The closing line: how many of the rows passed, against how long the whole run took — and how many
+// were ignored, where any were. **The ignored count appears only when it is not zero**, so a run that
+// ignored nothing prints the line it always has and whatever reads that line keeps reading it.
 tests_summary(outcomes: Buf[Outcome]) -> string
     var failed: usize = 0
+    var ignored: usize = 0
     var total: long = 0
 
     for i in 0..<outcomes.len()
         if !outcomes.at(i).passed() then failed += 1
+        if outcomes.at(i).ignored().is_some() then ignored += 1
 
         total += outcomes.at(i).millis
 
-    s"\n${outcomes.len() - failed} passed, $failed failed — ${total}ms\n"
+    val skipped = if ignored > 0 then s", $ignored ignored" else ""
+
+    s"\n${outcomes.len() - failed - ignored} passed, $failed failed$skipped — ${total}ms\n"
 end tests_summary
 
 // The whole report as one string, for a caller that wants the finished list rather than a run to

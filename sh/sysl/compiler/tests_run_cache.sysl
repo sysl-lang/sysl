@@ -19,9 +19,10 @@ import sysl.fs.{remove_dir_all, remove_file, write_text}
 a_plain_test_list_round_trips()
     var tests: Buf[TTest] = buf()
 
-    tests.push(TTest(module_qualify("m", "adds"), "adds", false, None, "m/t.sysl", 4, no_hooks()))
+    tests.push(TTest(module_qualify("m", "adds"), "adds", false, None, "m/t.sysl", 4, no_hooks(),
+                     None))
     tests.push(TTest(module_qualify("m", "two"), "two plus two", false, None, "m/t.sysl", 9,
-                     no_hooks()))
+                     no_hooks(), None))
 
     val read = decode_test_list(encode_test_list(tests)).unwrap()
 
@@ -50,7 +51,7 @@ a_test_with_hooks_round_trips()
     var tests: Buf[TTest] = buf()
 
     tests.push(TTest(module_qualify("m", "boom"), "boom", true, Some("index 3 is past the end"),
-                     "m/t.sysl", 12, hooks_of(hooks)))
+                     "m/t.sysl", 12, hooks_of(hooks), None))
 
     val read = decode_test_list(encode_test_list(tests)).unwrap()
 
@@ -71,15 +72,52 @@ an_empty_expectation_is_kept()
     var wanting: Buf[TTest] = buf()
 
     wanting.push(TTest(module_qualify("m", "quiet"), "quiet", true, Some(""), "m/t.sysl", 1,
-                       no_hooks()))
+                       no_hooks(), None))
 
     assert_eq(decode_test_list(encode_test_list(wanting)).unwrap().at(0).expected.unwrap(), "")
 
     var silent: Buf[TTest] = buf()
 
-    silent.push(TTest(module_qualify("m", "quiet"), "quiet", true, None, "m/t.sysl", 1, no_hooks()))
+    silent.push(TTest(module_qualify("m", "quiet"), "quiet", true, None, "m/t.sysl", 1, no_hooks(),
+                      None))
 
     assert(decode_test_list(encode_test_list(silent)).unwrap().at(0).expected.is_none())
+
+// A cached suite that forgot a test was ignored would *run* it — the one difference between a cached
+// run and a fresh one the report could not hide.
+@test("an ignored test comes back ignored, with its reason, and the others come back not ignored")
+an_ignored_test_round_trips()
+    var tests: Buf[TTest] = buf()
+
+    tests.push(TTest(module_qualify("m", "adds"), "adds", false, None, "m/t.sysl", 4, no_hooks(),
+                     None))
+    tests.push(TTest(module_qualify("m", "waits"), "one that is ignored", false, None, "m/t.sysl",
+                     30, no_hooks(), Some("the parser drops the second arm")))
+
+    val read = decode_test_list(encode_test_list(tests)).unwrap()
+
+    assert_eq(read.len(), 2)
+    assert(read.at(0).ignored.is_none())
+    assert_eq(read.at(1).ignored.unwrap(), "the parser drops the second arm")
+    assert_eq(read.at(1).display, "one that is ignored")
+    assert_eq(read.at(1).line, 30)
+
+// A sidecar written before `ignore` existed has two fewer fields per line; reading it as a suite with
+// nothing ignored would be a guess, and a rebuild is the answer that cannot be wrong.
+@test("a sidecar written before 'ignore' existed is no cache at all")
+an_older_sidecar_is_no_cache()
+    var tests: Buf[TTest] = buf()
+
+    tests.push(TTest(module_qualify("m", "adds"), "adds", false, None, "m/t.sysl", 4, no_hooks(),
+                     None))
+
+    val line = encode_test_list(tests)
+    // The last three bytes are the two fields `ignore` added: a separator and an empty reason, a
+    // separator and the `0` saying there is none.
+    val older = line[0..<(line.bytes.len - 3)]
+
+    assert(decode_test_list(line).is_some())
+    assert(decode_test_list(older).is_none())
 
 // **A list that will not read is no cache at all**, which is a rebuild rather than a guess at what
 // the missing fields were.
