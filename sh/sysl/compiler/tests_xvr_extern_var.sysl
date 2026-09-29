@@ -1,0 +1,242 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// An `extern` variable is storage the linker supplies, so it is read and declared under the **C
+// symbol** it names -- `extern "optind" idx: i32` is `@optind`, and the unnamed `extern optind: i32`
+// is `@optind` too -- wherever it is written. Inside a module its sysl name is qualified (`m.idx`),
+// and that key is a sysl name, never a linker's: emitting it would declare a global nothing defines.
+//
+// **Every output here was read out of the reference compiler (0.0.151)**, by handing the installed
+// `sysl` the same tree; the IR lines are its `emit-llvm`.
+
+private var xvr_library_cache: Buf[Program] = buf()
+private var xvr_library_read: bool = false
+
+private xvr_library() -> Buf[Program]
+    if xvr_library_read then return xvr_library_cache
+
+    xvr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> xvr_library_cache = units
+
+    xvr_library_cache
+end xvr_library
+
+private xvr_no_library() -> bool
+    if xvr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end xvr_no_library
+
+// The LLVM text of a program of several files, lowered the way the driver lowers it.
+private xvr_ir(files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+    val library = xvr_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return parsed.report.at(0).message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    if !errors_of(done.an.diagnostics()).is_empty()
+        return analysis_report(errors_of(done.an.diagnostics()))
+
+    val kept = prune(strip_tests(whole), buf())
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end xvr_ir
+
+// What a program of several files prints, built and linked for real -- the link is the claim.
+private xvr_ran(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-xvr").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end xvr_ran
+
+// How many times `needle` occurs in `hay`.
+private xvr_count(hay: string, needle: string) -> usize
+    var n: usize = 0
+    var rest = hay
+
+    loop
+        rest.index_of(needle) match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + needle.len..<rest.len]
+
+    n
+end xvr_count
+
+private val xvr_module: string = "module m\n" +
+                                  "extern \"optind\" idx: i32\n" +
+                                  "extern optind: i32\n" +
+                                  "private extern environ: **u8\n" +
+                                  "a() -> i32 = idx\n" +
+                                  "b() -> i32 = optind\n" +
+                                  "c() -> usize = usize(environ)\n"
+
+@test("a module's 'extern' variables link against the symbols they name, and the program runs")
+xvr_module_extern_variables_link_and_run()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("main.sysl", "print(m.a(), m.b(), m.c() > 0)\n"), ("m/a.sysl", xvr_module)]),
+              "1 1 true\n")
+
+@test("a module's 'extern' variable is declared under its C symbol, once however many names reach it")
+xvr_module_extern_variables_are_declared_under_the_symbol()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", "print(m.a(), m.b(), m.c() > 0)\n"), ("m/a.sysl", xvr_module)])
+
+    assert_eq(xvr_count(ir, "@optind = external global i32\n"), 1)
+    assert(ir.contains("@environ = external global ptr\n"))
+    assert_eq(xvr_count(ir, "load i32, ptr @optind\n"), 2)
+    assert(ir.contains("load ptr, ptr @environ\n"))
+    assert(!ir.contains("idx"))
+end xvr_module_extern_variables_are_declared_under_the_symbol
+
+@test("a write through a module's named 'extern' is a store to the C symbol, seen through the other name")
+xvr_module_extern_variable_write()
+    if xvr_no_library() then return
+
+    val files = [("main.sysl", "m.bump()\nprint(m.b(), m.idx)\n"),
+                 ("m/a.sysl", "module m\nextern \"optind\" idx: i32\nextern optind: i32\n" +
+                              "bump()\n    idx = 5\nb() -> i32 = optind\n")]
+
+    assert_eq(xvr_ran(files), "5 5\n")
+
+    val ir = xvr_ir(files)
+
+    assert(ir.contains("store i32 5, ptr @optind\n"))
+    assert(!ir.contains("idx"))
+end xvr_module_extern_variable_write
+
+@test("the entry file's named 'extern' variable is read under the symbol it names")
+xvr_entry_named_extern_variable()
+    if xvr_no_library() then return
+
+    val files = [("main.sysl", "extern \"optind\" idx: i32\nprint(idx)\n")]
+
+    assert_eq(xvr_ran(files), "1\n")
+
+    val ir = xvr_ir(files)
+
+    assert(ir.contains("@optind = external global i32\n"))
+    assert(ir.contains("load i32, ptr @optind\n"))
+    assert(!ir.contains("idx"))
+end xvr_entry_named_extern_variable
+
+@test("a '@pure' function reading a module's named 'extern' is told the C symbol")
+xvr_pure_names_the_symbol()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", "print(m.a())\n"),
+                     ("m/a.sysl", "module m\nextern \"optind\" idx: i32\n@pure\na() -> i32 = idx\n")])
+
+    assert(ir.contains("error: a '@pure' function reaches 'optind', which is storage outside the call " +
+                       "and may change under it, and a caller of one may observe nothing about the call " +
+                       "but its result\n --> m/a.sysl:4:14\n"))
+end xvr_pure_names_the_symbol
+
+// -- ported from the reference's ExternVarTests ----------------------------------------------------
+
+// How many lines of `text` begin with `head`.
+private xvr_lines_starting(text: string, head: string) -> usize
+    xvr_count("\n" + text, "\n" + head)
+
+@test("the link name is what the declaration resolves to, and the sysl name is not emitted at all")
+xvr_link_name_is_what_resolves()
+    if xvr_no_library() then return
+
+    val out = xvr_ir([("main.sysl", "extern \"environ\" env: **u8\nprint(env == null)")])
+
+    assert(out.contains("@environ = external global ptr"))
+    assert(!out.contains("@env ="))
+end xvr_link_name_is_what_resolves
+
+@test("two names for one symbol declare it once")
+xvr_two_names_one_symbol()
+    if xvr_no_library() then return
+
+    val out = xvr_ir([("main.sysl", "extern \"environ\" a: **u8\nextern \"environ\" b: **u8\n" +
+                                    "print(a == null, b == null)")])
+
+    assert_eq(xvr_lines_starting(out, "@environ = external global"), 1)
+end xvr_two_names_one_symbol
+
+@test("a read is a load through the symbol")
+xvr_read_is_a_load()
+    if xvr_no_library() then return
+
+    assert(xvr_ir([("main.sysl", "extern optind: i32\nprint(optind)")]).contains("load i32, ptr @optind"))
+
+@test("and a write is a store through it")
+xvr_write_is_a_store()
+    if xvr_no_library() then return
+
+    assert(xvr_ir([("main.sysl", "extern optind: i32\noptind = 1i32\nprint(optind)")])
+        .contains("store i32 1, ptr @optind"))
+
+@test("and its symbol carries no module, because the linker knows of none")
+xvr_symbol_carries_no_module()
+    if xvr_no_library() then return
+
+    val out = xvr_ir([("os/env.sysl", "module os\n\nextern environ: **u8"),
+                      ("sys/env.sysl", "module sys\n\nextern environ: **u8"),
+                      ("main.sysl", "print(os.environ == null, sys.environ == null)")])
+
+    assert_eq(xvr_lines_starting(out, "@environ = external global"), 1)
+    assert(!out.contains("@os.environ"))
+end xvr_symbol_carries_no_module
+
+// A link name reaching the *linker* rather than just the emitted text, which is only settled by a
+// program that links and runs.
+@test("a link name on a variable resolves to the C symbol it names")
+xvr_link_name_reaches_the_linker()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("main.sysl", "extern \"environ\" the_env: **u8\n" +
+                                     "print(the_env != null, the_env[0] != null)\n")]),
+              "true true\n")
