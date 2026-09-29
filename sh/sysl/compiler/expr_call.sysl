@@ -217,6 +217,13 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                 VsSaid -> return bad_expr(span)
                 VsNone -> ()
 
+            // `m.Hit(5)` -- a variant named through the MODULE that declares it, which says which
+            // enum is meant as plainly as naming the enum would.
+            module_variant_solved(cx, span, named_at, receiver, member, args, expected) match
+                VsFound(en, v) -> return variant_call(cx, span, en, v, args)
+                VsSaid -> return bad_expr(span)
+                VsNone -> ()
+
             // **A TYPE reached through the module it belongs to**, which is the other half of the
             // function case above: `c.InBuffer(p, n, 0)` is the struct's constructor, `c.Mode(n)` an
             // enum's checked cast and `c.Tick(n)` a constrained type's, each exactly what the
@@ -1307,6 +1314,53 @@ private qualified_variant_solved(cx: &Analyzer, span: Span, named_at: Span, rece
                              found.unwrap(), args)
         _ -> VsNone
 end qualified_variant_solved
+
+// The same where the name in front of the dot is the MODULE: the enum is the one the module declares
+// the variant in, and a generic one is settled the way it would be through its own name -- the
+// position first, then the values.
+private module_variant_solved(cx: &Analyzer, span: Span, named_at: Span, receiver: Expr,
+                              member: string, args: Buf[Expr],
+                              expected: Option[Type]) -> VariantSolve
+    val homes = module_variant_homes(cx, receiver, member)
+
+    if homes.is_empty() then return VsNone
+
+    if homes.len() > 1
+        module_variant_ambiguous(cx, named_at, homes, member)
+        return VsSaid
+    end if
+
+    val key = Some(homes.at(0))
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return VsNone
+
+    decl.unwrap().kind match
+        EnumOf(ed) ->
+            val found = variant_decl_named(ed, member)
+
+            if found.is_none() then return VsNone
+
+            if ed.tparams.is_empty() then
+                concrete_instance(cx.an, key.unwrap()) match
+                    Some(Enum(d)) -> d.variant(member) match
+                        Some(v) -> return VsFound(Enum(d), v)
+                        None -> return VsNone
+                    _ -> return VsNone
+
+            val wanted = variant_from_expected(cx, member, expected)
+
+            if wanted.is_some() && instantiation_of_key(wanted.unwrap().0, key.unwrap()) then
+                return VsFound(wanted.unwrap().0, wanted.unwrap().1)
+
+            variant_instance(cx, span, named_at, key.unwrap(), decl.unwrap().scope, ed,
+                             found.unwrap(), args)
+        _ -> VsNone
+end module_variant_solved
+
+private instantiation_of_key(t: Type, key: string) -> bool = t match
+    Enum(d) -> d.base == key
+    _ -> false
 
 // A variant named through a generic enum written at its type arguments: `E[int].A` or
 // `E[int, bool].A`. Nothing for any other receiver, or an enum at the wrong number of arguments.

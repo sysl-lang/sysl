@@ -1,0 +1,172 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A variant may be named through the MODULE that declares it** -- `m.Hit(5)`, `m.Gone`, and the
+// same in a pattern -- whatever the file imported: a wildcard, a selective import of the enum, a plain
+// `import m`, or nothing at all. It is the spelling the two-wildcards refusal advises ("import it
+// selectively, or write the module it comes from"), so it has to be one that works.
+//
+// Every expected output and refusal here was obtained by running the reference compiler (0.0.148) on
+// the same files.
+
+private mqv_m() -> string = "module m\n\nenum M\n    Hit(n: int)\n    Gone\n"
+private mqv_m2() -> string = "module m2\n\nenum N\n    Hit(n: int)\n    Miss\n"
+
+// The body every import shape is asked about: both variants through the module, in an expression and
+// in a pattern, and through the enum as well.
+private mqv_body() -> string =
+    "val a = m.Hit(5)\nval b = m.Gone\nval c = m.M.Hit(5)\n\n" +
+    "a match\n    m.Hit(n) -> print(n)\n    m.Gone -> print(\"gone\")\n" +
+    "b match\n    m.Hit(n) -> print(n)\n    m.Gone -> print(\"gone\")\n" +
+    "c match\n    m.M.Hit(n) -> print(n)\n    _ -> print(\"other\")\n"
+
+private mqv_can_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end mqv_can_run
+
+// A program of these files -- the module directory each sits in, its name, its text -- built and run,
+// answering what it printed or what the build said. The project ROOT is handed over, a module being
+// a directory.
+private mqv_out(files: Buf[(string, string, string)]) -> string
+    val root = make_temp_dir("sysl-mqv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for i in 0..<files.len()
+        val f = files.at(i)
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end mqv_out
+
+private mqv_with_m(main: string) -> string
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("", "main.sysl", main))
+    fs.push(("m", "m.sysl", mqv_m()))
+    mqv_out(fs)
+end mqv_with_m
+
+@test("a variant is named through its module under a wildcard import")
+mqv_through_the_module_under_a_wildcard()
+    if mqv_can_run() then return
+
+    assert_eq(mqv_with_m("import m.*\n\n" + mqv_body()), "5\ngone\n5\n")
+end mqv_through_the_module_under_a_wildcard
+
+@test("a variant is named through its module under a selective import of its enum")
+mqv_through_the_module_under_a_selective_import()
+    if mqv_can_run() then return
+
+    assert_eq(mqv_with_m("import m.{M}\n\n" + mqv_body()), "5\ngone\n5\n")
+end mqv_through_the_module_under_a_selective_import
+
+@test("a variant is named through its module under a plain import of it")
+mqv_through_the_module_under_a_plain_import()
+    if mqv_can_run() then return
+
+    assert_eq(mqv_with_m("import m\n\n" + mqv_body()), "5\ngone\n5\n")
+end mqv_through_the_module_under_a_plain_import
+
+@test("a variant is named through its module with no import at all")
+mqv_through_the_module_with_no_import()
+    if mqv_can_run() then return
+
+    assert_eq(mqv_with_m(mqv_body()), "5\ngone\n5\n")
+end mqv_through_the_module_with_no_import
+
+@test("two wildcards offering one variant: the module qualifies each")
+mqv_the_module_settles_two_wildcards()
+    if mqv_can_run() then return
+
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("", "main.sysl",
+             "import m.*\nimport m2.*\n\nval a = m.Hit(5)\nval d = m2.Hit(7)\n\n" +
+             "a match\n    m.Hit(n) -> print(n)\n    m.Gone -> print(\"gone\")\n" +
+             "d match\n    m2.Hit(n) -> print(n)\n    m2.Miss -> print(\"miss\")\n"))
+    fs.push(("m", "m.sysl", mqv_m()))
+    fs.push(("m2", "m2.sysl", mqv_m2()))
+
+    assert_eq(mqv_out(fs), "5\n7\n")
+end mqv_the_module_settles_two_wildcards
+
+@test("a generic enum's variant through its module is settled by its values or its position")
+mqv_a_generic_variant_through_the_module()
+    if mqv_can_run() then return
+
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("", "main.sysl",
+             "import g.*\n\nval a = g.Full(5)\nval b = g.Full(\"s\")\nval c: g.Box[int] = g.Empty\n" +
+             "a match\n    g.Full(v) -> print(v + 1)\n    g.Empty -> print(\"e\")\n" +
+             "b match\n    g.Full(v) -> print(v)\n    g.Empty -> print(\"e\")\n" +
+             "c match\n    g.Full(v) -> print(v)\n    g.Empty -> print(\"empty\")\n"))
+    fs.push(("g", "g.sysl", "module g\n\nenum Box[T]\n    Full(v: T)\n    Empty\n"))
+
+    assert_eq(mqv_out(fs), "6\ns\nempty\n")
+end mqv_a_generic_variant_through_the_module
+
+private mqv_two_enums(main: string) -> string
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("", "main.sysl", main))
+    fs.push(("d", "d.sysl",
+             "module d\n\nenum A\n    Hit(n: int)\n    Gone\n\nenum B\n    Hit(n: int)\n    Gone\n"))
+    mqv_out(fs)
+end mqv_two_enums
+
+@test("a module declaring the variant in two enums leaves the enum to be written, in a call")
+mqv_two_enums_of_one_module_in_a_call()
+    if mqv_can_run() then return
+
+    val said = mqv_two_enums("import d\n\nval a = d.Hit(5)\nprint(1)\n")
+
+    assert(said.contains("error: 'Hit' is a variant of 'd.A' and 'd.B', and nothing here says " +
+                         "which — qualify it, as 'd.A.Hit'\n"), said)
+    assert(said.contains("/main.sysl:3:11\n"), said)
+end mqv_two_enums_of_one_module_in_a_call
+
+@test("a module declaring the variant in two enums leaves the enum to be written, bare")
+mqv_two_enums_of_one_module_bare()
+    if mqv_can_run() then return
+
+    val said = mqv_two_enums("import d\n\nval a = d.Gone\nprint(1)\n")
+
+    assert(said.contains("error: 'Gone' is a variant of 'd.A' and 'd.B', and nothing here says " +
+                         "which — qualify it, as 'd.A.Gone'\n"), said)
+    assert(said.contains("/main.sysl:3:11\n"), said)
+end mqv_two_enums_of_one_module_bare
