@@ -1,0 +1,258 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// **`sysl test` over a project with dependencies runs the project's tests and no dependency's.** A
+// package's suite is run by `sysl test` over the package; no build of the consumer keeps it, so a
+// failing test in it must not fail the consumer. What a test build keeps is the project's own tests,
+// hooks, and whatever of the test scaffolding those reach -- a closure the project's own test wrote
+// is filed in the root module under a name that says nothing about whose test made it, and it stays.
+//
+// Every report quoted here was read off the reference (0.0.150) run over the same trees.
+
+// -- the whole command, over trees on disk ---------------------------------------------------------
+
+private tdp_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A package declaring one module, plus whatever other files it carries, in a directory of its own.
+private tdp_package(name: string, module_name: string, text: string,
+                    extra: Buf[(string, string)]) -> string
+    val root = make_temp_dir("sysl-tdp-pkg").unwrap()
+
+    make_dir_all(s"$root/$module_name").unwrap()
+    write_text(s"$root/package.hocon", s"package { name = \"$name\", version = \"1.0.0\" }\n").unwrap()
+    write_text(s"$root/$module_name/$module_name.sysl", s"module $module_name\n\n$text\n").unwrap()
+
+    for i in 0..<extra.len()
+        write_text(s"$root/${extra.at(i).0}", extra.at(i).1).unwrap()
+
+    root
+end tdp_package
+
+private tdp_app(program: string, deps: string) -> string
+    val root = make_temp_dir("sysl-tdp-app").unwrap()
+
+    write_text(s"$root/package.hocon",
+               s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { $deps }\n").unwrap()
+    write_text(s"$root/main.sysl", program).unwrap()
+    root
+end tdp_app
+
+// What `sysl test` over the tree reports, streamed exactly as the command streams it.
+private tdp_tested(root: string) -> string
+    val file = s"$root/main.sysl"
+
+    val build = test_build_of(file, None) match
+        Err(refusal) -> return s"refused: ${refusal.message}"
+        Ok(made) -> made
+
+    if !build.emitted.report.is_empty() then return analysis_report(build.emitted.report)
+
+    val exe = build_test_binary(file, build, None, DefaultOptimization) match
+        Err(refusal) -> return s"not linked: ${refusal.message}"
+        Ok(built) -> built
+
+    var said: Buf[string] = buf()
+    val sink = &said
+
+    run_selected(exe, build.tests, TestOptions(None, false), 0, piece -> sink.push(piece))
+    discard_test_binary(exe)
+
+    var streamed = ""
+
+    for i in 0..<said.len()
+        streamed = streamed + said.at(i)
+
+    streamed
+end tdp_tested
+
+private tdp_no_files() -> Buf[(string, string)] = buf()
+
+private tdp_failing_suite() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push(("json/tests.sysl", "module json\n@tests\n\n@test\nfails_if_run()\n    assert_eq(1, 2)\n"))
+    out
+end tdp_failing_suite
+
+// The same two packages a build keeps apart. Without the canonical prefix both are the module `json`,
+// and the second `tag` is refused as already declared.
+@test("keeps two packages wanting one name apart, as a mount does in a build")
+tdp_two_packages_wanting_one_name()
+    if !tdp_ready() then return
+
+    val one = tdp_package("one", "json", "tag() -> int = 40", tdp_no_files())
+    val two = tdp_package("two", "json", "tag() -> int = 2", tdp_no_files())
+    val root = tdp_app("print(json.tag() + other.json.tag())\n\n" +
+                       "@test\nfirst()\n    assert_eq(json.tag(), 40)\n\n" +
+                       "@test\nsecond()\n    assert_eq(other.json.tag(), 2)\n",
+                       s"a { path = \"$one\" }, b { path = \"$two\", mount = \"other\" }")
+    val said = tdp_tested(root)
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(one).unwrap_or(())
+    remove_dir_all(two).unwrap_or(())
+
+    assert_eq(runner_timeless(said),
+              runner_timeless("running 2 tests\n" +
+                              s"\n$root/main.sysl\n" +
+                              "  ok    first   Nms\n" +
+                              "  ok    second  Nms\n" +
+                              "\n2 passed, 0 failed — Nms\n"))
+end tdp_two_packages_wanting_one_name
+
+@test("runs the project's own tests and not a dependency's")
+tdp_runs_only_the_projects_tests()
+    if !tdp_ready() then return
+
+    val one = tdp_package("one", "json", "tag() -> int = 40", tdp_failing_suite())
+    val root = tdp_app("print(json.tag())\n\n@test\nforty()\n    assert_eq(json.tag(), 40)\n",
+                       s"a { path = \"$one\" }")
+    val said = tdp_tested(root)
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(one).unwrap_or(())
+
+    assert_eq(runner_timeless(said),
+              runner_timeless("running 1 test\n" +
+                              s"\n$root/main.sysl\n" +
+                              "  ok    forty  Nms\n" +
+                              "\n1 passed, 0 failed — Nms\n"))
+end tdp_runs_only_the_projects_tests
+
+// **The scaffolding is judged by what the kept tests reach, not by the module its name carries.** A
+// closure the project's own test writes is `$closureN` in the root module and is test-only; dropped
+// alongside the dependency's suite, the test binary would call a function nothing defines.
+@test("a closure the project's own test writes survives the dependency's suite being stripped")
+tdp_an_own_tests_closure_survives()
+    if !tdp_ready() then return
+
+    val one = tdp_package("one", "json", "tag() -> int = 40", tdp_failing_suite())
+    val root = tdp_app("print(json.tag())\n\n@test\nbumped()\n    val k = 1\n" +
+                       "    val f = (x: int) -> x + k\n    assert_eq(f(json.tag()), 41)\n",
+                       s"a { path = \"$one\" }")
+    val said = tdp_tested(root)
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(one).unwrap_or(())
+
+    assert_eq(runner_timeless(said),
+              runner_timeless("running 1 test\n" +
+                              s"\n$root/main.sysl\n" +
+                              "  ok    bumped  Nms\n" +
+                              "\n1 passed, 0 failed — Nms\n"))
+end tdp_an_own_tests_closure_survives
+
+// -- the test build's IR, against a handed package -------------------------------------------------
+
+// A package with a destructor, and a suite of its own that makes one.
+private tdp_handed_package() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push(("pkg/pkg.sysl",
+              "module pkg\nstruct Handle\n    id: int\nend Handle\n\n" +
+              "open(n: int) -> &Handle = Handle(n)\n\n" +
+              "impl Drop for Handle\n    drop(self)\n        release(self.id)\n\n" +
+              "release(n: int) -> int = n\n"))
+    out.push(("pkg/tests.sysl",
+              "module pkg\n@tests\n\n@test\nmakes_one()\n    val h = open(1)\n    release(h.id)\n"))
+    out
+end tdp_handed_package
+
+// The IR of a test build of `main` against the package, beside the names of the tests it would run.
+// The project's own module is the root one and nothing else, so `pkg` is handed.
+private tdp_test_ir(pkg: Buf[(string, string)], main: string) -> (string, Buf[string])
+    val t = host_target()
+    var units = std_units(std_root().unwrap(), t).unwrap()
+    var files: Buf[(string, string)] = buf()
+
+    for i in 0..<pkg.len()
+        files.push(pkg.at(i))
+
+    files.push(("main.sysl", main))
+
+    for i in 0..<files.len()
+        val parsed = parse(source_of(files.at(i).0, files.at(i).1), t)
+
+        if !parsed.ok() then return (parsed.report.at(0).message, buf())
+
+        units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf())
+    val errors = errors_of(done.an.diagnostics())
+
+    if !done.reported.is_empty() then return (analysis_report(done.reported), buf())
+    if !errors.is_empty() then return (analysis_report(errors), buf())
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks_of_tests(done.an, whole, own)
+    val kept = tests_only(whole, own)
+    var names: Buf[string] = buf()
+
+    for i in 0..<kept.tests.len()
+        names.push(kept.tests.at(i).func)
+
+    (ir_print_module(codegen_with_gaps(kept, t, pr).0), names)
+end tdp_test_ir
+
+private tdp_defines(ir: string, name: string) -> bool
+    val lines = lines_of(ir)
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with("define") && lines.at(i).contains(s" @$name(") then return true
+
+    false
+end tdp_defines
+
+// The shape a reader once met: clang refused the test binary with `use of undefined value
+// '@sh.sysl.brotli$Decoder.drop'`, out of a package the project had not imported, for a value only
+// that package's own suite made. That suite is not in the consumer's build, so neither is anything
+// only it made.
+@test("is not the package's own suite, which a consumer's test build does not run")
+tdp_not_the_packages_suite()
+    if !std_root().is_ok() then return
+
+    val built = tdp_test_ir(tdp_handed_package(), "print(1)\n\n@test\nmine()\n    print(2)\n")
+
+    assert_eq(built.1.len(), 1, built.0)
+    assert_eq(built.1.at(0), "mine")
+    assert(!built.0.contains("makes_one"), built.0)
+    assert(!tdp_defines(built.0, "pkg$Handle.drop"), built.0)
+end tdp_not_the_packages_suite
+
+// The call and the definition are asserted together because either alone passes for a compiler that
+// emitted neither.
+@test("is emitted where the project's own test is what reaches it")
+tdp_emitted_where_the_projects_test_reaches_it()
+    if !std_root().is_ok() then return
+
+    val built = tdp_test_ir(tdp_handed_package(),
+                            "print(1)\n\n@test\nopens()\n    val h = pkg.open(1)\n    pkg.release(h.id)\n")
+
+    assert(built.0.contains("call void @pkg$Handle.drop"), built.0)
+    assert(tdp_defines(built.0, "pkg$Handle.drop"), built.0)
+end tdp_emitted_where_the_projects_test_reaches_it
+
+// The control that keeps the test above from passing for a compiler that simply stopped qualifying a
+// root.
+@test("while a handed module holding no test of its own is pruned as before")
+tdp_a_handed_module_with_no_test_is_pruned()
+    if !std_root().is_ok() then return
+
+    var pkg = tdp_handed_package()
+
+    pkg.push(("spare/spare.sysl", "module spare\n@export(\"spare_thing\")\nthing() -> int = 7\n"))
+
+    val built = tdp_test_ir(pkg, "print(1)\n")
+
+    assert(!built.0.starts_with("error"), built.0)
+    assert(!tdp_defines(built.0, "spare_thing"), built.0)
+end tdp_a_handed_module_with_no_test_is_pruned
