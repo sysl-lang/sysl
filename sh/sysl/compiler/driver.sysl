@@ -69,21 +69,6 @@ failure_text(f: Failure) -> string = f match
     Said(r) -> r.message
     Reported(report) -> report
 
-// Everything one invocation reads, given the path the command line named and the machine it is for.
-//
-// **A dependency's modules keep the names they were written with here**, which is what `emit-typed`
-// and `sysl prove` read: both stop at the typed tree, and what they are for is comparing what a
-// module *means* rather than what it links against. The canonical prefix is what `emit-llvm` and a
-// build read, and `packaged_compilation_of` is that.
-compilation_of(path: string, t: Target) -> Result[Compilation, Failure] =
-    assembled(path, t, false)
-
-// The same, with each fetched package's modules under the canonical prefix its coordinate gives
-// them -- which is what makes two consumers naming one package differently link one copy of it, and
-// is therefore what everything that emits a symbol reads.
-packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure] =
-    assembled(path, t, true)
-
 // A compilation whose tree **is** the standard module, which is what `--std` says.
 //
 // **It is written down rather than inferred from the module names in the tree**, and that is the
@@ -123,7 +108,14 @@ private modules_written(units: Buf[Program]) -> Buf[string]
     out
 end modules_written
 
-private assembled(path: string, t: Target, packaged: bool) -> Result[Compilation, Failure]
+// Everything one invocation reads, given the path the command line named and the machine it is for,
+// with each fetched package's modules under the canonical prefix its coordinate gives them -- which
+// is what makes two consumers naming one package differently link one copy of it.
+//
+// **Every command reads this one compilation, `emit-typed` included**, so a dependency has the name
+// in the typed tree that it has in the build: two commands answering about one program agree about
+// what it is.
+packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
     val manifest = manifest_at(root)?
 
@@ -163,7 +155,7 @@ private assembled(path: string, t: Target, packaged: bool) -> Result[Compilation
         units.push(std.at(i))
 
     // Then the packages -- the graph resolved, fetched, and read off disk.
-    val fetched = package_sources(root, manifest, t, packaged)?
+    val fetched = package_sources(root, manifest, t)?
 
     for i in 0..<fetched.units.len()
         units.push(fetched.units.at(i))
@@ -171,9 +163,7 @@ private assembled(path: string, t: Target, packaged: bool) -> Result[Compilation
     // What the project's own files mean by the paths at the head of their import lines. The project
     // itself has no prefix -- its modules keep the names they were written with -- and what it has
     // instead is the table the graph built for it.
-    var mine_pkg = no_packaging()
-
-    if packaged then mine_pkg = Packaging("", fetched.root_mounts, false)
+    val mine_pkg = Packaging("", fetched.root_mounts, false)
 
     var own: Buf[string] = buf()
 
@@ -211,7 +201,7 @@ private assembled(path: string, t: Target, packaged: bool) -> Result[Compilation
         own.push(module_written(unit))
 
     Ok(Compilation(units, own, t))
-end assembled
+end packaged_compilation_of
 
 // The module a file contributes to: what its header says, or the anonymous root module where it
 // declares none.
@@ -325,7 +315,7 @@ emit_typed_text(path: string, named_target: Option[string],
         None -> ()
         Some(why) -> return Err(said(Refusal(why)))
 
-    val program = compilation_of(path, t)?
+    val program = packaged_compilation_of(path, t)?
 
     if tables then Ok(Emitted(tables_text(program), buf(), buf(), buf()))
     else Ok(typed_text(program))
@@ -534,11 +524,16 @@ end Emitted
 // **The sections around it are what reachability decides**, which is the stage above this one: a
 // reference tree holds only the structs, enums and functions a program *reaches*, so printing the
 // whole set here would be printing a different question's answer.
+//
+// **What the compilation was handed has its tests stripped, and the program's own keep theirs**
+// (`strip_handed`): the build strips every test after analysis and this stops before that, so the
+// program's own `@test` functions are part of what it declares, where a dependency's never are in
+// any build of this program.
 private typed_text(c: Compilation) -> Emitted
     val done = analyze_bodies(c.units, c.target)
+    val shown = strip_handed(program_of(done, done.main_module), c.own)
 
-    Emitted(show_typed_program(program_of(done, done.main_module)), errors_of(done.reported), buf(),
-            buf())
+    Emitted(show_typed_program(shown), errors_of(done.reported), buf(), buf())
 end typed_text
 
 // Whether a body is one a program **emits**, which is the question a printed tree answers.

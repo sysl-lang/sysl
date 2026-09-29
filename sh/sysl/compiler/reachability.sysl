@@ -618,17 +618,32 @@ private without_program_entry(p: TProgram) -> TProgram =
 // A hook goes with the tests it brackets, and is read from the program rather than from the tests
 // because a module may declare one and no tests -- a hook left behind is a function nothing calls in
 // a build that runs nothing. Everything declared in a file that said `@tests` goes with them.
-strip_tests(p: TProgram) -> TProgram
+strip_tests(p: TProgram) -> TProgram = stripped(p, buf(), true)
+
+// `strip_tests`, applied to every module but the compilation's **own** -- the tree a consumer is
+// handed by a dependency or by the library, with the program's own tests left where they are.
+//
+// It is what `emit-typed` reads: it stops before a build strips anything, which is right for the
+// program's own `@test` functions -- they are part of what the module declares -- and wrong for a
+// dependency's, which no build of this program ever keeps.
+strip_handed(p: TProgram, own: Buf[string]) -> TProgram = stripped(p, own, false)
+
+// Whether the scaffolding named `name` goes: all of it, or only what the compilation was handed.
+private handed(name: string, own: Buf[string], all: bool) -> bool =
+    all || !holds_string(own, module_of(name))
+
+// The removal both of the above make.
+private stripped(p: TProgram, own: Buf[string], all: bool) -> TProgram
     var gone: Buf[string] = buf()
 
     for i in 0..<p.tests.len()
-        gone.push(p.tests.at(i).func)
+        if handed(p.tests.at(i).func, own, all) then gone.push(p.tests.at(i).func)
 
     for i in 0..<p.hooks.len()
-        gone.push(p.hooks.at(i).func)
+        if handed(p.hooks.at(i).func, own, all) then gone.push(p.hooks.at(i).func)
 
     for i in 0..<p.test_only.len()
-        gone.push(p.test_only.at(i))
+        if handed(p.test_only.at(i), own, all) then gone.push(p.test_only.at(i))
 
     if gone.is_empty() then return p
 
@@ -652,15 +667,26 @@ strip_tests(p: TProgram) -> TProgram
     for i in 0..<p.externs.len()
         if !holds_string(gone, p.externs.at(i).name) then externs.push(p.externs.at(i))
 
-    var no_tests: Buf[TTest] = buf()
-    var no_hooks: Buf[THook] = buf()
-    var no_only: Buf[string] = buf()
+    var tests: Buf[TTest] = buf()
+
+    for i in 0..<p.tests.len()
+        if !holds_string(gone, p.tests.at(i).func) then tests.push(p.tests.at(i))
+
+    var hooks: Buf[THook] = buf()
+
+    for i in 0..<p.hooks.len()
+        if !holds_string(gone, p.hooks.at(i).func) then hooks.push(p.hooks.at(i))
+
+    var only: Buf[string] = buf()
+
+    for i in 0..<p.test_only.len()
+        if !holds_string(gone, p.test_only.at(i)) then only.push(p.test_only.at(i))
 
     TProgram(p.structs, p.enums, vtables, externs, vals, funcs, p.main, p.entry, p.precompiled,
              p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
-             p.main_module, no_tests, no_hooks, p.extern_vars, no_only, p.destructors,
+             p.main_module, tests, hooks, p.extern_vars, only, p.destructors,
              p.warnings, p.module_deps)
-end strip_tests
+end stripped
 
 private fills_a_slot(gone: Buf[string], t: TVtable) -> bool
     for i in 0..<t.slots.len()

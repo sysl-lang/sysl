@@ -1,0 +1,104 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// `emit-typed` over a project with a dependency: the same compilation the build makes, so a
+// package's modules carry the name the build gives them and its test scaffolding is nowhere in the
+// tree.
+//
+// **Every case compares against `emit-llvm` rather than against a spelling written here**, since the
+// claim is agreement with the build; the literal prefix is asserted once so a change to how the build
+// spells it cannot make both sides agree about something nobody meant.
+
+private tpg_library_here() -> bool = std_root().is_ok()
+
+private const TpgPrefixed: string = "github.com.e.geom.geom$double"
+
+// A project whose one dependency is vendored beside it -- the cache moved into the project, so
+// nothing reaches the network. The package has one module and a `@tests` file whose one test is
+// named so that no other line of any output can contain it by accident.
+private tpg_project(program: string, with_dep: bool) -> string
+    val root = make_temp_dir("sysl-typed-app").unwrap()
+
+    if with_dep
+        val here = s"$root/vendor/github.com/e/geom/@v1.0.0"
+
+        make_dir_all(s"$here/geom").unwrap()
+        write_text(s"$here/package.hocon",
+                   "package { name = \"geom\", version = \"1.0.0\" }\n").unwrap()
+        write_text(s"$here/geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 2\n").unwrap()
+        write_text(s"$here/geom/tests.sysl",
+                   "module geom\n@tests\n\n@test(\"doubling\")\ngeom_scaffolding_doubles()\n" +
+                   "    assert_eq(double(21), 42)\n").unwrap()
+        write_text(s"$root/package.hocon",
+                   "package { name = \"app\", version = \"0.1.0\" }\n" +
+                   "dependencies { g { git = \"github.com/e/geom\", version = \"1.0.0\" } }\n").unwrap()
+    else
+        write_text(s"$root/package.hocon",
+                   "package { name = \"app\", version = \"0.1.0\" }\n").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+    root
+end tpg_project
+
+private const TpgConsumer: string = "import geom.double\n\nprint(double(21))\n"
+
+// The two texts one program answers with, the typed tree and the LLVM, each required to be clean.
+private tpg_texts(root: string) -> (string, string)
+    val typed = emit_typed_text(root, None, false).unwrap()
+    val ir = emit_llvm_text(root, None).unwrap()
+
+    assert(typed.report.is_empty(), "emit-typed reports nothing")
+    assert(ir.report.is_empty(), "emit-llvm reports nothing")
+    (typed.text, ir.text)
+end tpg_texts
+
+@test("emit-typed names the package's function by the prefix emit-llvm gives it")
+tpg_names_the_packages_function_by_the_prefix()
+    if !tpg_library_here() then return
+
+    val root = tpg_project(TpgConsumer, true)
+    val (typed, ir) = tpg_texts(root)
+
+    assert(ir.index_of(TpgPrefixed).is_some(), "the build names the prefix")
+    assert(typed.index_of(s"name: \"$TpgPrefixed\"").is_some(), "and so does the typed tree")
+    remove_dir_all(root).unwrap_or(())
+
+@test("emit-typed never names the package's function by the name the package wrote")
+tpg_never_by_the_name_the_package_wrote()
+    if !tpg_library_here() then return
+
+    val root = tpg_project(TpgConsumer, true)
+    val (typed, _) = tpg_texts(root)
+
+    assert(typed.index_of("\"geom$double\"").is_none(), "the written name is nowhere")
+    remove_dir_all(root).unwrap_or(())
+
+@test("emit-typed carries none of the package's @tests scaffolding, exactly as the build does not")
+tpg_carries_none_of_the_packages_scaffolding()
+    if !tpg_library_here() then return
+
+    val root = tpg_project(TpgConsumer, true)
+    val (typed, ir) = tpg_texts(root)
+
+    assert(ir.index_of("geom_scaffolding_doubles").is_none(), "the build drops it")
+    assert(typed.index_of("geom_scaffolding_doubles").is_none(), "and so does the typed tree")
+    remove_dir_all(root).unwrap_or(())
+
+// The strip is of what was *handed* to the compilation. The program's own `@test` functions are
+// part of what it declares, and printing them is what `emit-typed` did before any of this.
+@test("a project with no dependency still shows its own @test functions")
+tpg_still_shows_its_own_test_functions()
+    if !tpg_library_here() then return
+
+    val root = tpg_project("double(n: int) -> int = n * 2\n\n@test(\"doubling\")\n" +
+                           "own_test_doubles()\n    assert_eq(double(21), 42)\n\n" +
+                           "print(double(21))\n", false)
+    val typed = emit_typed_text(root, None, false).unwrap()
+
+    assert(typed.report.is_empty(), "emit-typed reports nothing")
+    assert(typed.text.index_of("own_test_doubles").is_some(), "the program's own test is shown")
+    remove_dir_all(root).unwrap_or(())
