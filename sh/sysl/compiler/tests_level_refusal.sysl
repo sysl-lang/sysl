@@ -1,0 +1,112 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.text.join
+
+// A level named on the command line is refused before anything reaches the cache. The level names
+// the standard module's cache directory, which a build makes before clang sees the flag -- and clang
+// answers `-O7` and `-O-1` with a warning nobody is shown and a build at `-O3`. So the refusal is the
+// driver's, in the manifest's words, on every command that builds.
+//
+// 0.0.148, over one program, answers every one of `-O7`, `-O 7`, `--optimize 7`, `-Ononsense`,
+// `-O-1` and `-O4` on each of `build`, `run`, `test`, `emit-llvm`, `build-lib` and `build-c` with
+// exit 1 and one line, and leaves no directory behind:
+//
+//     sysl: error: '-O7' names no level clang has — it is one of 0, 1, 2, 3, s, z, fast, g
+
+private olv_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end olv_run
+
+private olv_project() -> string
+    val root = make_temp_dir("sysl-olv-").unwrap()
+
+    write_text(s"$root/main.sysl", "print(1)\n\n@test(\"one\")\none() =\n    assert(1 == 1)\n").unwrap()
+    root
+end olv_project
+
+private olv_refusal(level: string) -> string =
+    s"error: '-O$level' names no level clang has — it is one of 0, 1, 2, 3, s, z, fast, g"
+
+@test("every command that builds refuses a level clang lacks, in every spelling, before the cache")
+olv_every_command_refuses_a_bad_level()
+    val root = olv_project()
+    val commands = ["build", "run", "test", "emit-llvm", "build-lib", "build-c"]
+    // The level each spelling names, and the arguments that spell it.
+    val spellings: [6]([]string, string) = [
+        (["-O7"], "7"), (["-O", "7"], "7"), (["--optimize", "7"], "7"),
+        (["-Ononsense"], "nonsense"), (["-O-1"], "-1"), (["-O4"], "4")]
+
+    for c in 0..<commands.len
+        for s in 0..<spellings.len
+            var args: Buf[string] = buf()
+
+            args.push("sysl")
+            args.push(commands[c])
+            args.push(root)
+
+            for k in 0..<spellings[s].0.len
+                args.push(spellings[s].0[k])
+
+            val got = olv_run(args.view())
+            val said = s"${commands[c]} ${join(spellings[s].0, " ")}"
+
+            assert_eq(got.0, Failed, s"$said: ${got.1}")
+            assert_eq(got.1, olv_refusal(spellings[s].1), said)
+
+    remove_dir_all(root).unwrap_or(())
+end olv_every_command_refuses_a_bad_level
+
+// The refusal comes before the manifest is read and before the path is looked at: the reference
+// answers `sysl build /nonexistent -O7` with the level, not the path.
+@test("the level is refused before the path is looked at")
+olv_the_level_comes_before_the_path()
+    val commands = ["build", "run", "test", "emit-llvm", "build-lib", "build-c"]
+
+    for c in 0..<commands.len
+        val got = olv_run(["sysl", commands[c], "/nonexistent/olv", "-O7"])
+
+        assert_eq(got.0, Failed, s"${commands[c]}: ${got.1}")
+        assert_eq(got.1, olv_refusal("7"), commands[c])
+end olv_the_level_comes_before_the_path
+
+// Before the refusal, `-O7` built a whole standard module and kept it under a key naming `7`.
+@test("a refused level leaves no standard module behind")
+olv_a_refused_level_touches_no_cache()
+    if std_root().is_err() || cache_directory().is_none() then return
+
+    val t = host_target()
+    val fingerprint = std_fingerprint(std_root().unwrap(), t).unwrap()
+    val levels = ["7", "nonsense", "-1", "4"]
+    val root = olv_project()
+
+    for i in 0..<levels.len
+        val dir = parent_of(std_artifact_path(t, fingerprint, levels[i])).unwrap()
+
+        remove_dir_all(dir).unwrap_or(())
+
+        val got = olv_run(["sysl", "build", root, s"-O${levels[i]}", "-o", s"$root/out"])
+
+        assert_eq(got.0, Failed, got.1)
+        assert(metadata(dir).is_err(), s"'$dir' was made for a level that was refused")
+
+    remove_dir_all(root).unwrap_or(())
+end olv_a_refused_level_touches_no_cache
+
+// `fast` and `g` are clang's too, and the command line is where a person reaching for one gets it --
+// so the command line takes eight levels where a manifest takes six.
+@test("the levels clang has beyond the manifest's six are taken")
+olv_fast_and_g_are_taken()
+    val levels = ["0", "1", "2", "3", "s", "z", "fast", "g"]
+
+    for i in 0..<levels.len
+        build_level("/nonexistent/olv", Some(levels[i])) match
+            Err(why) -> assert(false, s"-O${levels[i]}: ${failure_text(why)}")
+            Ok(level) -> assert_eq(level, levels[i])
+end olv_fast_and_g_are_taken

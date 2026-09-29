@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Source
 import sysl.buf.{Buf, buf}
-import sysl.text.{str_builder, Search}
+import sysl.text.{join, str_builder, Search}
 import sysl.fs.{make_temp_dir, remove_dir_all, remove_file, current_dir, make_dir_all, write_text}
 import sysl.process.{run as run_child, Status}
 import sysl.env.{get as env_var}
@@ -361,17 +361,32 @@ end target_for
 // program is compiled -- and is not an error either, since it is simply not the project being built.
 // A manifest that will not read answers the default here, the build that follows refusing it in its
 // own words.
-build_level(path: string, given: Option[string]) -> string
+//
+// **A level the command line named is refused here, before anything reaches the cache**, since every
+// command that builds comes through this call before it reads the manifest or looks for the standard
+// module's artifact -- and the level names that artifact's directory. Left to clang, `-O7` and `-O-1`
+// were not refused at all: clang warns that it is using `-O3` instead, nobody is shown the warning,
+// and a whole standard module was built and kept under a key that says something else.
+build_level(path: string, given: Option[string]) -> Result[string, Failure]
     given match
-        Some(level) -> return level
+        Some(level) ->
+            for i in 0..<CommandLineLevels.len
+                if CommandLineLevels[i] == level then return Ok(level)
+
+            return Err(Said(Refusal(s"'-O$level' names no level clang has — it is one of " +
+                                    join(CommandLineLevels, ", "))))
         None -> ()
 
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
 
     manifest_at(root) match
-        Ok(m) -> m.optimization.unwrap_or(DefaultOptimization)
-        Err(_) -> DefaultOptimization
+        Ok(m) -> Ok(m.optimization.unwrap_or(DefaultOptimization))
+        Err(_) -> Ok(DefaultOptimization)
 end build_level
+
+// The levels a command line may name: the manifest's six, and the two more clang has that a person
+// reaches for at a build rather than writes into a file every consumer reads.
+val CommandLineLevels: []const string = ["0", "1", "2", "3", "s", "z", "fast", "g"]
 
 // **A heap the machine has no libc to supply, said before the linker is asked.** A package requiring
 // one, built for a freestanding target by a command that links, has asked for `malloc` and `free`
