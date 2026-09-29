@@ -575,8 +575,13 @@ private with_declarations(p: TProgram, externs: Buf[TExtern], funcs: Buf[TFunc])
 // destructor are each reached from somewhere no walk can see, so replacing the roots does not make
 // them reachable from the tests instead: it makes them reachable from nothing, and a destructor
 // dropped that way leaves the release hook calling a function the tree no longer holds.
+//
+// **Only the program's own tests are kept** (`strip_handed`): a dependency's suite is not the
+// consumer's to run, and a failing test in it would otherwise fail the consumer's `sysl test`. With
+// the dependency's tests gone every root is in an `own` module, which is why `entry_points` is asked
+// about `own` and nothing wider.
 tests_only(p: TProgram, own: Buf[string]) -> TProgram
-    val kept = without_program_entry(p)
+    val kept = without_program_entry(strip_handed(p, own))
     val entries = entry_points(kept, own)
     val root = roots_of(kept, entries, buf())
 
@@ -618,35 +623,101 @@ private without_program_entry(p: TProgram) -> TProgram =
 // A hook goes with the tests it brackets, and is read from the program rather than from the tests
 // because a module may declare one and no tests -- a hook left behind is a function nothing calls in
 // a build that runs nothing. Everything declared in a file that said `@tests` goes with them.
-strip_tests(p: TProgram) -> TProgram = stripped(p, buf(), true)
-
-// `strip_tests`, applied to every module but the compilation's **own** -- the tree a consumer is
-// handed by a dependency or by the library, with the program's own tests left where they are.
-//
-// It is what `emit-typed` reads: it stops before a build strips anything, which is right for the
-// program's own `@test` functions -- they are part of what the module declares -- and wrong for a
-// dependency's, which no build of this program ever keeps.
-strip_handed(p: TProgram, own: Buf[string]) -> TProgram = stripped(p, own, false)
-
-// Whether the scaffolding named `name` goes: all of it, or only what the compilation was handed.
-private handed(name: string, own: Buf[string], all: bool) -> bool =
-    all || !holds_string(own, module_of(name))
-
-// The removal both of the above make.
-private stripped(p: TProgram, own: Buf[string], all: bool) -> TProgram
-    var gone: Buf[string] = buf()
+strip_tests(p: TProgram) -> TProgram
+    var gone: Set[string] = set()
 
     for i in 0..<p.tests.len()
-        if handed(p.tests.at(i).func, own, all) then gone.push(p.tests.at(i).func)
+        gone.add(p.tests.at(i).func)
 
     for i in 0..<p.hooks.len()
-        if handed(p.hooks.at(i).func, own, all) then gone.push(p.hooks.at(i).func)
+        gone.add(p.hooks.at(i).func)
 
     for i in 0..<p.test_only.len()
-        if handed(p.test_only.at(i), own, all) then gone.push(p.test_only.at(i))
+        gone.add(p.test_only.at(i))
 
     if gone.is_empty() then return p
 
+    without_scaffolding(p, gone)
+end strip_tests
+
+// **The same program with a DEPENDENCY's tests taken out and the project's own kept** -- what a test
+// build runs, since a package's suite is run by `sysl test` over the package and no build of the
+// consumer keeps it. It is also what `emit-typed` reads: that stops before a build strips anything,
+// which is right for the program's own `@test` functions -- they are part of what the module
+// declares -- and wrong for a dependency's, which no build of this program ever keeps.
+//
+// **A test and its hook are handed by the module they are declared in; the rest of the scaffolding is
+// not, and is judged by what the kept tests reach.** `test_only` also holds what a test *body* made --
+// a closure, filed as `$closureN` in the root module, and an instantiation, filed under the generic's
+// own module, which may well be a dependency's. Neither name says whose test made it, so dropping by
+// module would take the closure out from under the project's own test that wrote it. What the kept
+// tests and hooks reach stays; everything else in the scaffolding goes with the handed tests.
+//
+// **No `own` at all means every module is the program's**, as it does for `entry_points`: a caller
+// that names no module is not saying that nothing is its own.
+strip_handed(p: TProgram, own: Buf[string]) -> TProgram
+    if own.is_empty() then return p
+
+    var gone: Set[string] = set()
+    var kept: Buf[string] = buf()
+
+    for i in 0..<p.tests.len()
+        sort_by_owner(p.tests.at(i).func, own, &gone, &kept)
+
+    for i in 0..<p.hooks.len()
+        sort_by_owner(p.hooks.at(i).func, own, &gone, &kept)
+
+    if gone.is_empty() then return p
+
+    val reached = reached_by(p, kept)
+
+    for i in 0..<p.test_only.len()
+        val name = p.test_only.at(i)
+
+        if !reached.call_set.has(name) && !reached.val_set.has(name) then gone.add(name)
+
+    without_scaffolding(p, gone)
+end strip_handed
+
+private sort_by_owner(func: string, own: Buf[string], gone: *Set[string], kept: *Buf[string])
+    val home = module_of(func)
+
+    if home == ModuleRoot || holds_string(own, home) then kept.push(func)
+    else gone.add(func)
+
+// Every function and module `val` the named entries reach, taking the initializer of each `val` they
+// read as a root too, until nothing new is reached.
+private reached_by(p: TProgram, entries: Buf[string]) -> &Live
+    val index = func_index(p)
+    var inits: Set[string] = set()
+
+    loop
+        val root = no_reached()
+
+        for i in 0..<entries.len()
+            add_call(root, entries.at(i))
+
+        for i in 0..<p.vals.len()
+            val v = p.vals.at(i)
+
+            if inits.has(v.symbol)
+                v.init match
+                    Some(x) -> walk_texpr(x, expr_walk(false, e -> take_node(root, e)))
+                    None -> ()
+
+        val live = reached_from(p, index, root)
+        var more = false
+
+        for i in 0..<live.vals.len()
+            if inits.add(live.vals.at(i)) then more = true
+
+        if !more then return live
+end reached_by
+
+// The removal both of the above make: every declaration `gone` names, and what names only those --
+// the tests and hooks it holds, a table with a slot pointing at one, and the scaffolding list's own
+// entries for them.
+private without_scaffolding(p: TProgram, gone: Set[string]) -> TProgram
     var vtables: Buf[TVtable] = buf()
 
     for i in 0..<p.vtables.len()
@@ -655,42 +726,42 @@ private stripped(p: TProgram, own: Buf[string], all: bool) -> TProgram
     var funcs: Buf[TFunc] = buf()
 
     for i in 0..<p.funcs.len()
-        if !holds_string(gone, p.funcs.at(i).name) then funcs.push(p.funcs.at(i))
+        if !gone.has(p.funcs.at(i).name) then funcs.push(p.funcs.at(i))
 
     var vals: Buf[TVal] = buf()
 
     for i in 0..<p.vals.len()
-        if !holds_string(gone, p.vals.at(i).symbol) then vals.push(p.vals.at(i))
+        if !gone.has(p.vals.at(i).symbol) then vals.push(p.vals.at(i))
 
     var externs: Buf[TExtern] = buf()
 
     for i in 0..<p.externs.len()
-        if !holds_string(gone, p.externs.at(i).name) then externs.push(p.externs.at(i))
+        if !gone.has(p.externs.at(i).name) then externs.push(p.externs.at(i))
 
     var tests: Buf[TTest] = buf()
 
     for i in 0..<p.tests.len()
-        if !holds_string(gone, p.tests.at(i).func) then tests.push(p.tests.at(i))
+        if !gone.has(p.tests.at(i).func) then tests.push(p.tests.at(i))
 
     var hooks: Buf[THook] = buf()
 
     for i in 0..<p.hooks.len()
-        if !holds_string(gone, p.hooks.at(i).func) then hooks.push(p.hooks.at(i))
+        if !gone.has(p.hooks.at(i).func) then hooks.push(p.hooks.at(i))
 
     var only: Buf[string] = buf()
 
     for i in 0..<p.test_only.len()
-        if !holds_string(gone, p.test_only.at(i)) then only.push(p.test_only.at(i))
+        if !gone.has(p.test_only.at(i)) then only.push(p.test_only.at(i))
 
     TProgram(p.structs, p.enums, vtables, externs, vals, funcs, p.main, p.entry, p.precompiled,
              p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,
              p.main_module, tests, hooks, p.extern_vars, only, p.destructors,
              p.warnings, p.module_deps)
-end stripped
+end without_scaffolding
 
-private fills_a_slot(gone: Buf[string], t: TVtable) -> bool
+private fills_a_slot(gone: Set[string], t: TVtable) -> bool
     for i in 0..<t.slots.len()
-        if holds_string(gone, t.slots.at(i).target) then return true
+        if gone.has(t.slots.at(i).target) then return true
 
     false
 end fills_a_slot
