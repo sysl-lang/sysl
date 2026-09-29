@@ -1,0 +1,136 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// **What a build says when one of somebody else's programs refuses a step.** Every tool step --
+// compiling a carried `.c` file, assembling a module, archiving, linking -- reports the tool's exit
+// status and its own error stream, trimmed, in the reference's words: `clang failed (exit 1):` for a
+// step named by its tool, and `<file> did not compile (clang, exit 1):` for a `.c` file, which is
+// named first because a build compiles many and which one failed is the thing to act on.
+//
+// **Every one of these runs a real tool**, which is the only thing that could fail this way; each
+// test writes the files it needs into a directory of its own.
+
+private tfw_ready() -> bool = clang_available()
+
+private tfw_clang() -> string = find_clang(host_target(), None).unwrap()
+
+private tfw_dir() -> string
+    val root = make_temp_dir("sysl-tfw").unwrap()
+
+    make_dir_all(root).unwrap()
+    root
+end tfw_dir
+
+@test("a carried .c file that does not compile is named first, then the compiler and its exit status")
+tfw_a_carried_c_file_that_does_not_compile()
+    if !tfw_ready() || std_root().is_err() then return
+
+    val root = tfw_dir()
+
+    make_dir_all(s"$root/shim").unwrap()
+    write_text(s"$root/package.hocon", "package {\n  name = \"p1\"\n  version = \"0.1.0\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", "import shim\n\nprint(shim.seven())\n").unwrap()
+    write_text(s"$root/shim/shim.sysl", "module shim\n\nextern \"shim_seven\" seven() -> int\n").unwrap()
+    write_text(s"$root/shim/shim.c",
+               "#error \"deliberately broken\"\nint shim_seven(void) { return 7; }\n").unwrap()
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$root/out")) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "it built"
+
+    remove_dir_all(root).unwrap_or(())
+
+    // The build walks the tree from its absolute, textually cleaned root, which is the name it reports.
+    val src = absolute_path(s"$root/shim/shim.c")
+
+    assert_eq(said, s"$src did not compile (${tfw_clang()}, exit 1):\n" +
+                    s"$src:1:2: error: \"deliberately broken\"\n" +
+                    "    1 | #error \"deliberately broken\"\n" +
+                    "      |  ^\n" +
+                    "1 error generated.")
+end tfw_a_carried_c_file_that_does_not_compile
+
+@test("a flag clang refuses is clang's own words, under the tool's name and exit status")
+tfw_a_refused_flag_names_the_tool()
+    if !tfw_ready() then return
+
+    val root = tfw_dir()
+    val cc = tfw_clang()
+
+    // The optimization level reaches the command line as written, so a level clang cannot read is a
+    // driver refusal of exactly the kind a bad `SYSL_EXTRA_CFLAGS` word is.
+    val said = compile_object(cc, "", s"$root/m.o", host_target(), "bogus") match
+        Err(why) -> why
+        Ok(_) -> "it assembled"
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(said, s"$cc failed (exit 1):\nerror: invalid integral value 'bogus' in '-Obogus'")
+end tfw_a_refused_flag_names_the_tool
+
+@test("a link that cannot resolve a symbol is the linker's report under 'clang failed (exit 1):'")
+tfw_a_failed_link_names_the_tool()
+    if !tfw_ready() || std_root().is_err() then return
+
+    val root = tfw_dir()
+
+    write_text(s"$root/main.sysl",
+               "extern \"nowhere_defined_tfw\" nowhere() -> int\n\nprint(nowhere())\n").unwrap()
+
+    val said = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                    Some(s"$root/out")) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "it linked"
+
+    remove_dir_all(root).unwrap_or(())
+
+    // The object's name is a temporary, so the middle is asserted by what it names rather than
+    // line for line; the head and the trimmed tail are exact.
+    assert(said.starts_with(s"${tfw_clang()} failed (exit 1):\nUndefined symbols for architecture "), said)
+    assert(said.contains("\"_nowhere_defined_tfw\", referenced from:"), said)
+    assert(said.ends_with("clang: error: linker command failed with exit code 1 " +
+                          "(use -v to see invocation)"), said)
+end tfw_a_failed_link_names_the_tool
+
+@test("an archiver that fails is named with its exit status and its own words")
+tfw_a_failed_archive_names_the_tool()
+    if !tfw_ready() then return
+
+    val archiver = find_ar(None) match
+        Err(_) -> return
+        Ok(a) -> a
+
+    val root = tfw_dir()
+    val out = s"$root/missing/lib.a"
+    var members: Buf[string] = buf()
+
+    val said = archive(archiver, members, out) match
+        Err(why) -> why
+        Ok(_) -> "it archived"
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(said, s"$archiver failed (exit 1):\n$archiver: error: $out: No such file or directory")
+end tfw_a_failed_archive_names_the_tool
+
+@test("a 'c const' whose header is missing is the C compiler's words, trimmed, after the block's name")
+tfw_a_c_const_header_that_is_missing()
+    if !tfw_ready() then return
+
+    val said = stmt_diagnostics("@include(\"no_such_header_tfw.h\")\n\n" +
+                                "c const\n    N: int = \"NO_SUCH\"\n\nf() -> int = N\n")
+
+    assert_eq(said.len(), 1)
+
+    // The probe's file is a temporary, so its name is the one thing not asserted exactly.
+    assert(said.at(0).starts_with("the C compiler refused this file's 'c const' block:\n"), said.at(0))
+    assert(said.at(0).contains(".c:1:10: fatal error: 'no_such_header_tfw.h' file not found\n" +
+                               "    1 | #include \"no_such_header_tfw.h\"\n" +
+                               "      |          ^~~~~~~~~~~~~~~~~~~~~~\n" +
+                               "1 error generated."), said.at(0))
+    assert(said.at(0).ends_with("1 error generated."), said.at(0))
+end tfw_a_c_const_header_that_is_missing
