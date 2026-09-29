@@ -248,10 +248,25 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
     // analyzed again for each instantiation with the parameter bound. The array stands at length
     // zero for that one walk. Anything else that will not fold is a length settled while the
     // program runs, which an array's cannot be.
-    if !folds_to_extent(a, scope, span, written, subst) && !awaits_instantiation(a, scope, written,
-                                                                                 subst) then
-        a.fault(scope, span,
-                "an array length must be a constant — a literal, or a 'const' naming one")
+    //
+    // **A length whose fold REFUSED is not that mistake** -- a division by zero is a constant
+    // expression that has no value, and it was told where the division is. The fold is made once
+    // more keeping what it says, since the one above put its complaints back, and the array has no
+    // type to be rather than a length nobody wrote.
+    val refusals = a.const_refusals
+
+    if !folds_to_extent(a, scope, span, written, subst)
+        if const_refused_since(a, refusals)
+            val inner = analyzer_for(a, scope)
+
+            inner.subst = subst
+            const_int(inner, written)
+            return Unknown
+        end if
+
+        if !awaits_instantiation(a, scope, written, subst) then
+            a.fault(scope, span, "an array length must be a constant — a literal, or a 'const' naming one")
+    end if
 
     Array(int(const_extent(a, scope, span, written, subst)), e)
 end resolve_array
@@ -1171,12 +1186,17 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
                 // A discriminant is any compile-time integer, so a negative one under a signed
                 // underlying type folds from the unary negation the parser gives, and a `const` may
                 // stand where a literal does.
-                Some(written_value) -> const_int(cx, written_value) match
-                    Some(n) -> tag = fitting_tag(a, scope, span, v.name, n, underlying, first)
-                    None ->
-                        if first then
-                            a.fault(scope, span,
-                                    s"the value of variant '${v.name}' must be a constant integer")
+                Some(written_value) ->
+                    val refusals = a.const_refusals
+
+                    const_int(cx, written_value) match
+                        Some(n) -> tag = fitting_tag(a, scope, span, v.name, n, underlying, first)
+                        None ->
+                            // A constant whose own fold refused has been told once, where the
+                            // mistake is; a variant reading it is not a second mistake.
+                            if first && !const_refused_since(a, refusals) then
+                                a.fault(scope, span,
+                                        s"the value of variant '${v.name}' must be a constant integer")
                 None -> tag = fitting_tag(a, scope, span, v.name, from_int(long(next_tag)),
                                           underlying, first)
         else if v.value.is_some() && first
@@ -1430,6 +1450,7 @@ check_const_admits(a: &Analysis)
 
         val cx = analyzer_for(a, v.scope)
         val mark = a.complaints()
+        val refusals = a.const_refusals
 
         a.consts_in_progress.push(key)
 
@@ -1437,9 +1458,11 @@ check_const_admits(a: &Analysis)
 
         a.consts_in_progress.truncate(a.consts_in_progress.len() - 1)
 
-        // A fold that stopped at something it had to say -- a division by zero, a loop -- has said it.
+        // A fold that stopped at something it had to say -- a division by zero, a loop -- has said it,
+        // and so has one that read a constant whose own fold refused: that complaint was made once,
+        // where the mistake is, and saying this one would be the same mistake told twice.
         if folded.is_none()
-            if a.complaints() == mark then
+            if a.complaints() == mark && !const_refused_since(a, refusals) then
                 a.fault(v.scope, v.init.unwrap().span, s"the value of '${v.name}' is not a constant expression")
 
             continue
@@ -1491,8 +1514,11 @@ private const_type_refused(a: &Analysis, v: ValueDecl, t: Type) -> bool
     true
 end const_type_refused
 
-// Whether a folded value is one the declared type holds, said at the declaration where it is not.
+// Whether a folded value is one the declared type holds, said at the VALUE where it is not -- the
+// value is what does not fit, and it is where a refusal from inside the fold points too.
 private const_fits(a: &Analysis, v: ValueDecl, value: Const, t: Type) -> bool
+    val at = v.init.unwrap().span
+
     val kind_fits = value match
         ConstInt(_) -> t match
             Integer(_, _, _) -> true
@@ -1511,7 +1537,7 @@ private const_fits(a: &Analysis, v: ValueDecl, value: Const, t: Type) -> bool
             _ -> false
 
     if !kind_fits
-        a.fault(v.scope, v.span, s"'${v.name}' is declared ${type_show(t)} but its value is " +
+        a.fault(v.scope, at, s"'${v.name}' is declared ${type_show(t)} but its value is " +
                 const_kind(value))
         return false
     end if
@@ -1520,7 +1546,7 @@ private const_fits(a: &Analysis, v: ValueDecl, value: Const, t: Type) -> bool
         ConstInt(n) -> t match
             Integer(bits, signed, _) ->
                 if !fits(n, bits, signed)
-                    a.fault(v.scope, v.span, s"'${v.name}' does not fit ${type_show(t)}: ${to_string(n)}")
+                    a.fault(v.scope, at, s"'${v.name}' does not fit ${type_show(t)}: ${to_string(n)}")
                     return false
                 end if
             _ -> ()
@@ -1543,8 +1569,8 @@ private const_admitted(a: &Analysis, v: ValueDecl, t: Type, cd: &ConstrainedType
     val top = if cd.exclusive_hi then s"under $hi" else s"$hi"
 
     if n < lo || !under then
-        a.fault(v.scope, v.span, s"'${v.name}' is $n, which ${type_show(t)} does not admit — it " +
-                s"holds $lo to $top")
+        a.fault(v.scope, v.init.unwrap().span,
+                s"'${v.name}' is $n, which ${type_show(t)} does not admit — it holds $lo to $top")
 end const_admitted
 
 // Whether a declaration is another spelling of its base rather than a type of its own.

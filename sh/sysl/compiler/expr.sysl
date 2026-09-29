@@ -597,26 +597,43 @@ private const_expr(cx: &Analyzer, span: Span, key: string) -> TExpr
     out
 end const_expr
 
-// Whether a constant is already being folded.
+// Whether a constant is already being folded, or is one of a loop already found.
 //
-// **Every constant in the loop is told, at its own declaration and in its own terms**, because every
-// one of them is defined in terms of itself: the loop is the same run of names read from a different
-// starting place, and a reader looking at any of the declarations is owed the account from there.
+// **A loop is ONE mistake, told once** -- at the constant the walk closed it on, naming the loop in
+// the order it was followed -- and every member of it is remembered with that complaint. A later
+// read of any of them, the declaration's own walk included, raises the very same complaint at the
+// very same place, which the report keeps once; raising it rather than passing over it is what keeps
+// the loop reported when the walk that first found it was one a trial took back. Either way it
+// counts as a refusal, so the reader says nothing of its own about a value that is not constant.
 const_cycle_at(cx: &Analyzer, key: string) -> bool
+    for i in 0..<cx.an.const_cycles.len()
+        val known = cx.an.const_cycles.at(i)
+
+        if known.0 == key
+            tell_const_cycle(cx.an, known.1, known.2)
+            return true
+        end if
+
     if !holds_string(cx.an.consts_in_progress, key) then return false
 
     val round = const_loop(cx.an, key)
+    val message = s"constant '${module_show(key)}' is defined in terms of itself: ${loop_from(round, 0)}"
 
     for i in 0..<round.len()
-        val d = cx.an.tables.consts.get(round.at(i))
+        cx.an.const_cycles.push((round.at(i), key, message))
 
-        if d.is_some() then
-            cx.an.fault(d.unwrap().scope, d.unwrap().span,
-                        s"constant '${module_show(round.at(i))}' is defined in terms of itself: " +
-                        loop_from(round, i))
-
+    tell_const_cycle(cx.an, key, message)
     true
 end const_cycle_at
+
+// The complaint a loop of constants is told with, at the declaration it was closed on.
+private tell_const_cycle(a: &Analysis, key: string, message: string)
+    val d = a.tables.consts.get(key)
+
+    if d.is_some() then a.fault(d.unwrap().scope, d.unwrap().span, message)
+
+    a.const_refusals += 1
+end tell_const_cycle
 
 // The constants the loop is made of, in the order the walk followed them.
 private const_loop(a: &Analysis, key: string) -> Buf[string]

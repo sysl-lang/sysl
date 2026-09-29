@@ -1,0 +1,191 @@
+module sh.sysl.compiler
+@tests
+
+// A constant that cannot be folded is ONE mistake, however many places name it -- the reference's
+// `ConstTests` "a refused constant is reported once, where the mistake is". The complaint points at
+// the sub-expression that caused it (the division, the shift, the conversion) or at the value that
+// does not fit, and a use of the refused name -- a `print`, another constant, an array bound, an enum
+// discriminant -- says nothing of its own.
+//
+// Beside it, the entry file's `return`: the body is the platform's `main`, so a `return` there answers
+// at `int`.
+//
+// **Every list here is the reference's complete list for the same program** (0.0.150), one line per
+// diagnostic as `line:col message`, read through `isc_diags`.
+
+private fcf_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+        Ok(_) -> true
+
+private fcf_divided(at: string) -> string = s"$at a constant divided by zero\n"
+
+// -- the refusal inside the fold, said once ------------------------------------------------------
+
+@test("a division by zero, with no use")
+fcf_division_no_use()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const q: int = 1 / 0\n"), fcf_divided("1:16"))
+
+@test("a division by zero, used once")
+fcf_division_used_once()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const q: int = 1 / 0\nprint(q)\n"), fcf_divided("1:16"))
+
+@test("a division by zero, used several times")
+fcf_division_used_several_times()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const q: int = 1 / 0\nprint(q)\nprint(q)\nprint(q + 1)\n"), fcf_divided("1:16"))
+
+@test("a remainder by zero")
+fcf_remainder_by_zero()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const q: int = 7 % 0\nprint(q)\nprint(q)\n"), fcf_divided("1:16"))
+
+@test("at the operation that failed, not at the whole initializer")
+fcf_at_the_operation()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const q: int = 2 + 1 / 0\nprint(q)\n"), fcf_divided("1:20"))
+
+@test("a shift out of range")
+fcf_shift_out_of_range()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const s: int = 1 << -1\nprint(s)\nprint(s)\n"), "1:16 a constant shifted by -1 places\n")
+
+@test("a conversion that fails")
+fcf_conversion_that_fails()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const c: char = char(0xD800)\nprint(c)\nprint(c)\n"),
+              "1:17 55296 is not a Unicode scalar value\n")
+
+@test("a comparison over a refused operand, at the operand's operation")
+fcf_comparison()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const q: bool = 1 / 0 == 1\nprint(q)\n"), fcf_divided("1:17"))
+
+// -- what does not fit is said at the value --------------------------------------------------------
+
+@test("a value that does not fit, at the value")
+fcf_does_not_fit_at_the_value()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const o: u8 = 300\nprint(o)\nprint(o)\n"), "1:15 'o' does not fit byte: 300\n")
+
+@test("an overflow, at the value")
+fcf_overflow_at_the_value()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const o: i32 = 2147483647 + 1\nprint(o)\n"), "1:16 'o' does not fit int: 2147483648\n")
+
+@test("a value of another kind, at the value")
+fcf_another_kind_at_the_value()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const n: int = \"twelve\"\nprint(n)\n"),
+              "1:16 'n' is declared int but its value is a string\n")
+
+@test("a value the constrained range does not admit, at the value")
+fcf_range_at_the_value()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("type Age = int within 0..150\n\nconst a: Age = 200\n\nprint(str(a))\n"),
+              "3:16 'a' is 200, which Age does not admit — it holds 0 to 150\n")
+    assert_eq(isc_diags("type Slot = u8 within 0..<200\n\nconst s: Slot = 200\n\nprint(str(s))\n"),
+              "3:17 's' is 200, which Slot does not admit — it holds 0 to under 200\n")
+
+@test("a value that is not constant")
+fcf_not_constant()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("f() -> int = 1\nconst n: int = f()\nprint(n)\nprint(n)\n"),
+              "2:16 the value of 'n' is not a constant expression\n")
+
+// -- a reader of a refused constant says nothing of its own --------------------------------------
+
+@test("a constant written in terms of a refused one says nothing of its own")
+fcf_written_in_terms_of_a_refused_one()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const a: int = 1 / 0\nconst b: int = a + 1\nprint(b)\nprint(a)\n"), fcf_divided("1:16"))
+    assert_eq(isc_diags("const a: int = 1 / 0\nconst b: int = a + 1\n"), fcf_divided("1:16"))
+    assert_eq(isc_diags("const n: int = 1 / 0\nconst m: int = n\nprint(m)\n"), fcf_divided("1:16"))
+
+@test("whichever of the two was declared first")
+fcf_whichever_declared_first()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const b: int = a + 1\nconst a: int = 1 / 0\nprint(b)\n"), fcf_divided("2:16"))
+
+@test("and a use as an array bound says nothing either")
+fcf_array_bound()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const n: usize = 4 / 0\nvar xs: [n]u8 = [0; n]\nprint(xs[0])\n"), fcf_divided("1:18"))
+    assert_eq(isc_diags("const n: usize = 4 / 0\nstruct S\n    a: [n]u8\nprint(1)\n"), fcf_divided("1:18"))
+
+@test("a length or a repeat count whose own fold refused says only that")
+fcf_length_and_count_written_inline()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("var xs: [4 / 0]u8 = [0, 0]\nprint(xs[0])\n"), fcf_divided("1:10"))
+    assert_eq(isc_diags("var xs = [0u8; 4 / 0]\nprint(xs[0])\n"), fcf_divided("1:16"))
+    assert_eq(isc_diags("const n: usize = 4 / 0\nvar xs = [0u8; n]\nprint(xs[0])\n"), fcf_divided("1:18"))
+
+@test("and an enum discriminant or a pattern naming one says nothing either")
+fcf_discriminant_and_pattern()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const n: int = 4 / 0\nenum E\n    A = n\n    B = 2\nprint(1)\n"), fcf_divided("1:16"))
+    assert_eq(isc_diags("const n: int = 4 / 0\nval x = 3\nprint(x match\n    n -> 1\n    _ -> 2)\n"),
+              fcf_divided("1:16"))
+
+// -- a loop of definitions is one mistake too ----------------------------------------------------
+
+@test("a loop of definitions is told once, where the walk closed it")
+fcf_loop_told_once()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("const a: int = b\nconst b: int = a\nprint(str(a))\n"),
+              "1:1 constant 'a' is defined in terms of itself: a \u{2192} b \u{2192} a\n")
+    assert_eq(isc_diags("const a: int = b\nconst b: int = c\nconst c: int = a\n"),
+              "1:1 constant 'a' is defined in terms of itself: a \u{2192} b \u{2192} c \u{2192} a\n")
+    assert_eq(isc_diags("const a: int = b + 1\nconst b: int = a\nprint(b)\n"),
+              "1:1 constant 'a' is defined in terms of itself: a \u{2192} b \u{2192} a\n")
+    assert_eq(isc_diags("const a: int = a\n"), "1:1 constant 'a' is defined in terms of itself: a \u{2192} a\n")
+
+// -- the entry file's `return` answers at `int` ----------------------------------------------------
+
+@test("a return in the entry file answers at int")
+fcf_entry_return_answers_at_int()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("print(1)\nreturn 3\n"), "")
+    assert_eq(isc_diags("print(1)\nif true then return 3\nprint(2)\n"), "")
+    assert_eq(isc_diags("print(1)\nreturn (x: int) -> x\n"), "2:1 return type mismatch: expected int, got a closure\n")
+    assert_eq(isc_diags("print(1)\nreturn \"s\"\n"), "2:1 return type mismatch: expected int, got string\n")
+    assert_eq(isc_diags("print(1)\nreturn ()\n"), "2:1 return type mismatch: expected int, got unit\n")
+    assert_eq(isc_diags("print(1)\nreturn 3.5\n"), "2:1 return type mismatch: expected int, got real\n")
+    assert_eq(isc_diags("print(1)\nreturn true\n"), "2:1 return type mismatch: expected int, got bool\n")
+
+@test("so a bare return there has no value to give")
+fcf_entry_bare_return()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("print(1)\nreturn\n"), "2:1 this function must return a int value\n")
+
+@test("and a function written in the entry file answers at its own type")
+fcf_entry_nested_function_return()
+    if !fcf_ready() then return
+
+    assert_eq(isc_diags("print(1)\nh() -> int\n    return 5\nprint(h())\n"), "")
+    assert_eq(isc_diags("print(1)\nval f = () -> 7\nprint(f())\n"), "")
