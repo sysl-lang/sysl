@@ -1406,6 +1406,147 @@ private range_end(a: &Analysis, scope: Scope, e: Expr) -> Option[Decimal]
         _ -> None
 end range_end
 
+// **Every constant declared at a constrained type holds a value its range admits**, settled while
+// compiling -- a constant has no run time to be checked at. It is what makes a range on a constant
+// worth writing: a `c const` measured from a header is a number nobody chose, so a range on the type
+// it is read into is a claim about the configuration the program was built against. A `new` type
+// and a `where` predicate are refused at the declaration (`check_const_named`) and are passed over.
+//
+// **Every constant is folded where it is declared, used or not** -- a constant is its value, so a
+// value that does not fold, does not fit, or is of another kind is a mistake in the declaration and
+// not in whichever use happens to read it first. The declared type is asked first: an aggregate is
+// storage and is pointed at `val`, which is the answer a reader needs rather than a claim about
+// constancy.
+check_const_admits(a: &Analysis)
+    for i in 0..<a.tables.consts.len()
+        val v = a.tables.consts.at(i)
+        val key = a.tables.consts.key_at(i)
+
+        if v.typ.is_none() || v.init.is_none() then continue
+
+        val t = resolve_type(a, v.scope, v.typ.unwrap(), no_bindings())
+
+        if const_type_refused(a, v, t) then continue
+
+        val cx = analyzer_for(a, v.scope)
+        val mark = a.complaints()
+
+        a.consts_in_progress.push(key)
+
+        val folded = const_fold(cx, v.init.unwrap())
+
+        a.consts_in_progress.truncate(a.consts_in_progress.len() - 1)
+
+        // A fold that stopped at something it had to say -- a division by zero, a loop -- has said it.
+        if folded.is_none()
+            if a.complaints() == mark then
+                a.fault(v.scope, v.init.unwrap().span, s"the value of '${v.name}' is not a constant expression")
+
+            continue
+        end if
+
+        t match
+            Constrained(cd) ->
+                if const_fits(a, v, folded.unwrap(), underlying(t)) then const_admitted(a, v, t, cd)
+            _ -> const_fits(a, v, folded.unwrap(), t)
+end check_const_admits
+
+// Whether a constant's declared type is one it may not be, said where it is. A struct, an enum, a
+// `new` type and a `where` predicate are told at the declaration by `check_const_named`, and are only
+// passed over here.
+private const_type_refused(a: &Analysis, v: ValueDecl, t: Type) -> bool
+    val named = *v.typ.unwrap().kind match
+        NamedType(_, _) -> true
+        _ -> false
+
+    val scalar = t match
+        Integer(_, _, _) -> true
+        Floating(_, _) -> true
+        Bool -> true
+        Char -> true
+        Str -> true
+        _ -> false
+
+    if scalar then return false
+
+    t match
+        Constrained(cd) -> return cd.derived || cd.pred_fn.is_some()
+        Unknown -> return true
+        _ -> ()
+
+    if named then return true
+
+    val storage = t match
+        Array(_, _) -> true
+        Vector(_, _) -> true
+        Struct(_) -> true
+        _ -> false
+
+    if storage then
+        a.fault(v.scope, v.span, s"a constant is a scalar, and ${type_show(t)} is storage — write " +
+                s"'${v.name}' as a 'val', which is laid into the object file as constant data")
+    else
+        a.fault(v.scope, v.span, s"a constant is a scalar, and ${type_show(t)} is not — '${v.name}'")
+
+    true
+end const_type_refused
+
+// Whether a folded value is one the declared type holds, said at the declaration where it is not.
+private const_fits(a: &Analysis, v: ValueDecl, value: Const, t: Type) -> bool
+    val kind_fits = value match
+        ConstInt(_) -> t match
+            Integer(_, _, _) -> true
+            _ -> false
+        ConstFloat(_) -> t match
+            Floating(_, _) -> true
+            _ -> false
+        ConstBool(_) -> t match
+            Bool -> true
+            _ -> false
+        ConstChar(_) -> t match
+            Char -> true
+            _ -> false
+        ConstStr(_) -> t match
+            Str -> true
+            _ -> false
+
+    if !kind_fits
+        a.fault(v.scope, v.span, s"'${v.name}' is declared ${type_show(t)} but its value is " +
+                const_kind(value))
+        return false
+    end if
+
+    value match
+        ConstInt(n) -> t match
+            Integer(bits, signed, _) ->
+                if !fits(n, bits, signed)
+                    a.fault(v.scope, v.span, s"'${v.name}' does not fit ${type_show(t)}: ${to_string(n)}")
+                    return false
+                end if
+            _ -> ()
+        _ -> ()
+
+    true
+end const_fits
+
+private const_admitted(a: &Analysis, v: ValueDecl, t: Type, cd: &ConstrainedType)
+    if cd.derived || cd.pred_fn.is_some() || cd.lo.is_none() || cd.hi.is_none() then return
+
+    val value = range_end(a, v.scope, v.init.unwrap())
+
+    if value.is_none() then return
+
+    val n = value.unwrap()
+    val lo = cd.lo.unwrap()
+    val hi = cd.hi.unwrap()
+    val under = if cd.exclusive_hi then n < hi else n <= hi
+    val top = if cd.exclusive_hi then s"under $hi" else s"$hi"
+
+    if n < lo || !under then
+        a.fault(v.scope, v.span, s"'${v.name}' is $n, which ${type_show(t)} does not admit — it " +
+                s"holds $lo to $top")
+end const_admitted
+
 // Whether a declaration is another spelling of its base rather than a type of its own.
 //
 // **A measured `c type` is written in exactly this shape and is not one.** It is a distinct scalar

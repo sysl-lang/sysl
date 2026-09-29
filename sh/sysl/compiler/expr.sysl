@@ -401,17 +401,29 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
     // mismatch a `usize` variable would be, not a silent adaptation.
     val ck = lookup_value_key(cx, a_consts(cx), name)
 
-    if ck.is_some() then return const_expr(cx, span, ck.unwrap())
+    // A constant another file made file-private is still found by its spelling, so the reader is
+    // told it is private rather than handed its value.
+    if ck.is_some()
+        if !reachable_key(cx.an, ck.unwrap(), cx.scope) then
+            return cx.err(span, out_of_reach(cx.an, ck.unwrap()))
+
+        return const_expr(cx, span, ck.unwrap())
+    end if
 
     val c_rivals = ambiguous_value(cx, span, a_consts(cx), name)
 
     if c_rivals.is_some() then return c_rivals.unwrap()
 
-    // A `val` is the other half of that: nothing is folded, because it is storage.
+    // A `val` is the other half of that: nothing is folded, because it is storage. It is refused
+    // across a file boundary on the same terms, and so is a module `var`, whether read or written.
     val vk = lookup_value_key(cx, a_vals(cx), name)
 
-    if vk.is_some() then
+    if vk.is_some()
+        if !reachable_key(cx.an, vk.unwrap(), cx.scope) then
+            return cx.err(span, out_of_reach(cx.an, vk.unwrap()))
+
         return global_expr(cx, span, vk.unwrap(), a_vals(cx), writable_key(cx, vk.unwrap()))
+    end if
 
     val v_rivals = ambiguous_value(cx, span, a_vals(cx), name)
 
@@ -426,6 +438,9 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
     if e_rivals.is_some() then return e_rivals.unwrap()
 
     if ek.is_some()
+        if !reachable_key(cx.an, ek.unwrap(), cx.scope) then
+            return cx.err(span, out_of_reach(cx.an, ek.unwrap()))
+
         // Storage the linker supplies is **declared** rather than laid down, and only what a body
         // reaches is declared, so the read is what puts the `external global` line in the module.
         cx.an.uses_extern_var(ek.unwrap())
@@ -542,6 +557,12 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
             found = Some(key)
 
     if found.is_none() && from.has(here) then return Some(here)
+
+    // **A path to a declaration its file made private still names it**, so the reader is told it is
+    // private rather than that the module in front of the dot is undefined.
+    if found.is_none()
+        for i in 0..<qualified.len()
+            if from.has(qualified.at(i)) then return Some(qualified.at(i))
 
     found
 end value_key_of

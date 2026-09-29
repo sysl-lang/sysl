@@ -239,6 +239,23 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                through_module(cx, receiver, member).is_some() then
                 return call_value(cx, span, callee, args, expected)
 
+            // **A function a module does not declare, reached through the module**, is an undefined
+            // FUNCTION there -- the head is a module and not a value, so reading it as one would
+            // report the module itself as an undefined name. The edge into the module is made all
+            // the same, which is what lets a program reaching a module whose body a machine dropped
+            // (a `c const` file requiring `posix`, on a bare target) be told what that module
+            // requires rather than sent looking for a name.
+            val head = dotted_name_written(cx, receiver)
+
+            if head.is_some() then
+                val owner = module_owner(cx, head.unwrap())
+
+                if owner.is_some() then
+                    depends_on_module(cx.an, cx.scope, owner.unwrap(), named_at)
+
+                    return cx.err(span, s"undefined function '${module_qualify(owner.unwrap(), member)}'")
+            end if
+
             val tr = type_expr_bare(cx, receiver)
 
             if texpr_type(tr) == Unknown then return tr
