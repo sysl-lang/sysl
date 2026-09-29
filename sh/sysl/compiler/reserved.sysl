@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.text.from_utf8_unchecked
+import sysl.time.now
 
 // The names the language keeps for itself.
 //
@@ -164,6 +165,60 @@ private collect_reserved(out: *Buf[(string, string, Span)], s: Stmt)
                                d.selectors.at(i).span)
         StaticDecl(inner) -> collect_reserved(out, inner)
         _ -> ()
+
+// The moment `__DATE__` and `__TIME__` report, in milliseconds since the epoch: read once, the first
+// time either is asked for, so that two uses in one compilation cannot disagree with each other.
+private var stamp_ms: long = 0
+private var stamp_read: bool = false
+
+build_stamp() -> long
+    if !stamp_read
+        stamp_ms = now().us / 1000
+        stamp_read = true
+    end if
+
+    stamp_ms
+end build_stamp
+
+// `__DATE__`'s text for a moment, in C's `Mmm dd yyyy`, read as UTC -- the day padded with a space
+// rather than a zero, as C's own is.
+stamp_date(ms: long) -> string
+    val (y, m, d) = civil_of(floor_div(ms, 86400000))
+    val months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    val day = if d < 10 then s" $d" else s"$d"
+
+    s"${months[usize(m - 1)]} $day $y"
+end stamp_date
+
+// `__TIME__`'s text for a moment, in C's `hh:mm:ss`, read as UTC.
+stamp_time(ms: long) -> string
+    val secs = floor_div(ms, 1000) - floor_div(ms, 86400000) * 86400
+
+    s"${two(secs / 3600)}:${two(secs / 60 % 60)}:${two(secs % 60)}"
+end stamp_time
+
+private two(n: long) -> string = if n < 10 then s"0$n" else s"$n"
+
+private floor_div(a: long, b: long) -> long
+    val q = a / b
+
+    if a % b != 0 && (a < 0) != (b < 0) then q - 1 else q
+end floor_div
+
+// The proleptic Gregorian year, month and day of a count of days since 1970-01-01.
+private civil_of(days: long) -> (long, long, long)
+    val z = days + 719468
+    val era = floor_div(z, 146097)
+    val doe = z - era * 146097
+    val yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    val doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    val mp = (5 * doy + 2) / 153
+    val d = doy - (153 * mp + 2) / 5 + 1
+    val m = if mp < 10 then mp + 3 else mp - 9
+    val y = yoe + era * 400 + (if m <= 2 then 1 else 0)
+
+    (y, m, d)
+end civil_of
 
 // The name an import binds, which is its alias where it has one and the last of its path otherwise.
 import_bound(d: ImportDecl) -> string = d.alias match

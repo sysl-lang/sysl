@@ -341,6 +341,10 @@ parse_stmt_at(p: *Parser, inline: bool) -> Stmt
 
     if p.at_kw("@") then return parse_at_stmt(p, start)
     if p.at_kw("#") then return refuse_hash(p, start)
+
+    // Asked ahead of every word that opens a declaration of its own, `private` and `override`
+    // included: `import() -> int = 1` is a function misnamed, not an import missing its path.
+    if at_reserved_func_head(p) then return try_func_decl(p, start, Public, no_attrs()).unwrap()
     if p.at_kw("import") then return parse_import_decl(p, start)
     if p.at_kw("impl") then return parse_impl_decl(p, start, false)
     if p.at_kw("override") then return parse_override_stmt(p, start)
@@ -572,11 +576,19 @@ end parse_static_decl
 
 private parse_multi_decl(p: *Parser, start: Span, mutable: bool) -> Stmt
     var names: Buf[string] = buf()
+    val what = if mutable then "the name a 'var' binds" else "the name a 'val' binds"
 
     loop
-        p.name() match
-            Some(n) -> names.push(n)
-            None -> break
+        // A reserved word among the names is refused as the name it was meant as, wherever in the
+        // list it stands.
+        if reserved_here(p) != ""
+            names.push(reserved_here(p))
+            refuse_reserved_name(p, what)
+        else
+            p.name() match
+                Some(n) -> names.push(n)
+                None -> break
+        end if
 
         if !p.accept_kw(",") then break
 

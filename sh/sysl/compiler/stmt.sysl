@@ -148,9 +148,17 @@ type_block_body(cx: &Analyzer, stmts: Buf[Stmt], expected: Option[Type],
 
         val e = trailing_expr(stmts.at(stmts.len() - 1))
 
+        // The trailing expression is a statement too, and a binding made inside it -- a `for`'s
+        // element -- is reported from it, as one made by any other statement is.
+        val site = cx.bind_site
+
+        cx.bind_site = Some(stmts.at(stmts.len() - 1).span)
+
         // A block whose value *is* the enclosing function's result is the third place a result list
         // may stand, which is what lets a branch or a nested block forward one.
         val tr = trailing_value(cx, e, expected, discarded)
+
+        cx.bind_site = site
         val ty = if discarded && texpr_type(tr) != Never then Unit else texpr_type(tr)
 
         return TBlock(init, Some(tr), ty)
@@ -423,10 +431,15 @@ end type_list_show
 // where the reference's abandonment ends.
 recover_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt]
     val refused = cx.refused_is.len()
+    val site = cx.bind_site
+
+    cx.bind_site = Some(stmt.span)
+
     var out = type_stmt(cx, stmt)
 
     push_all(&out, settle_needs(cx, stmt.span, stmt))
     cx.refused_is.truncate(refused)
+    cx.bind_site = site
     out
 end recover_stmt
 
@@ -597,7 +610,7 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
     val ti = type_expr(cx, init.unwrap(), declared)
     val decl_ty = settled_binding_type(declared, ti)
 
-    check_binding(cx, init.unwrap().span, name, declared, decl_ty, ti)
+    check_binding(cx, span, init.unwrap().span, name, declared, decl_ty, ti)
     one(TVarDecl(cx.bind(name, decl_ty), decl_ty, ti, boundary(cx, name, align)))
 end var_decl
 
@@ -609,7 +622,7 @@ private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], 
     val ti = type_expr(cx, value, declared)
     val decl_ty = settled_binding_type(declared, ti)
 
-    check_binding(cx, value.span, name, declared, decl_ty, ti)
+    check_binding(cx, span, value.span, name, declared, decl_ty, ti)
     one(TVarDecl(cx.bind_read_only(name, decl_ty), decl_ty, ti, boundary(cx, name, align)))
 end val_decl
 
@@ -623,13 +636,16 @@ end settled_binding_type
 // A binding needs a value to hold, and an initializer that does not finish never produces one --
 // the code after it is unreachable, so the declaration is a mistake rather than a clever way to
 // spell divergence.
-private check_binding(cx: &Analyzer, span: Span, name: string, declared: Option[Type],
+//
+// A disagreement is the declaration's and is reported at the statement, as the reference does: the
+// value is not wrong on its own, only against the type written beside the name.
+private check_binding(cx: &Analyzer, at: Span, span: Span, name: string, declared: Option[Type],
                       decl_ty: Type, ti: TExpr)
     if texpr_type(ti) == Never then
         cx.fault(span, s"cannot bind '$name' to an expression that never returns")
 
     if declared.is_some() && disagree(texpr_type(ti), decl_ty) then
-        cx.fault(span, s"cannot initialize '$name': declared ${type_show(decl_ty)} but the value " +
+        cx.fault(at, s"cannot initialize '$name': declared ${type_show(decl_ty)} but the value " +
                  s"is ${type_show(texpr_type(ti))}")
 
 // `ref name = place` -- another name for storage that already exists. The place is read once, here,

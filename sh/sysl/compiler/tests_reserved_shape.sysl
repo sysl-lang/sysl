@@ -1,0 +1,276 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{repeat, Search}
+
+// The reserved identifier shape (`reference/lexical.md § Reserved identifiers`): which names belong
+// to the language, that no declaration may take one, and the build stamp `__DATE__` and `__TIME__`
+// answer with. The shape is tested apart from the built-ins on purpose -- reserving the space is the
+// half that has to be right before anything occupies it. Every message and position is the
+// reference's own output (sysl 0.0.150) for the same file.
+
+private rsv_shape_ready() -> bool = std_root().is_ok()
+
+// The first diagnostic `sysl build <dir>` renders for a project holding one `main.sysl`, and the
+// directory it was written in.
+private rsv_shape_run(text: string) -> (string, string)
+    val root = make_temp_dir("sysl-rsv-shape").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    run_cli(["sysl", "build", root], (line) -> sink.push(line))
+    remove_dir_all(root).unwrap_or(())
+
+    (if lines.is_empty() then "" else lines.at(0), absolute_path(root))
+end rsv_shape_run
+
+// `text` refused with `message`, reported at `line:col`.
+private rsv_shape_says(text: string, message: string, line: int, col: int)
+    val (said, root) = rsv_shape_run(text)
+    val head = s"error: $message\n --> $root/main.sysl:$line:$col\n"
+
+    assert(said.starts_with(head), s"expected\n$head\ngot\n$said")
+
+// The refusal a declaration taking the shape earns, for `name` taken by a `what`.
+private rsv_shape_refusal(name: string, what: string, instead: string) -> string =
+    s"'$name' begins and ends with '__', which is reserved for names the compiler answers for " +
+    s"itself — so it is not a name a $what may take. Everything of that shape belongs to the " +
+    s"language, whether or not it means anything yet, which is what lets a later release add one " +
+    s"without breaking a program that guessed it. Write '$instead' instead"
+
+// ---- the shape
+
+@test("the reserved shape is two underscores, capitals, two underscores")
+rsv_shape_two_capitals_two()
+    assert(reserved_shape("__FILE__"))
+    assert(reserved_shape("__A__"))
+    assert(reserved_shape("__A_B__"))
+    assert(reserved_shape("__WITH_MANY_WORDS__"))
+
+@test("the reserved shape admits an empty middle")
+rsv_shape_empty_middle()
+    assert(reserved_shape("____"))
+    assert(reserved_shape("_____"))
+
+@test("the reserved shape needs both markers whole")
+rsv_shape_both_markers_whole()
+    assert(!reserved_shape("___"))
+    assert(!reserved_shape("__"))
+    assert(!reserved_shape("_"))
+    assert(!reserved_shape(""))
+
+@test("the reserved shape is capitals only")
+rsv_shape_capitals_only()
+    assert(!reserved_shape("__file__"))
+    assert(!reserved_shape("__File__"))
+    assert(!reserved_shape("__F1__"))
+
+@test("the reserved shape needs both ends, so C's half-reserved spellings are ordinary names")
+rsv_shape_needs_both_ends()
+    assert(!reserved_shape("__FILE_"))
+    assert(!reserved_shape("_FILE__"))
+    assert(!reserved_shape("__errno_location"))
+    assert(!reserved_shape("my__name"))
+    assert(!reserved_shape("plain"))
+
+// ---- no declaration may take one
+
+@test("a function may not take the reserved shape")
+rsv_shape_function()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("__F__() -> int = 1\n", rsv_shape_refusal("__F__", "function", "f"), 1, 1)
+
+@test("a type parameter may not take the reserved shape")
+rsv_shape_type_parameter()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("f[__T__](x: __T__) -> __T__ = x\n",
+                   rsv_shape_refusal("__T__", "type parameter", "t"), 1, 1)
+
+@test("a 'val' may not take the reserved shape")
+rsv_shape_val()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("val __V__: int = 1\n", rsv_shape_refusal("__V__", "'val'", "v"), 1, 1)
+
+@test("a 'var' in an entry file is refused as the binding it is")
+rsv_shape_entry_var()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("var __V__ = 1\n", rsv_shape_refusal("__V__", "binding", "v"), 1, 1)
+
+@test("a 'const' may not take the reserved shape")
+rsv_shape_const()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("const __C__: int = 1\n", rsv_shape_refusal("__C__", "'const'", "c"), 1, 1)
+
+@test("a struct, and a field of one, may not take the reserved shape")
+rsv_shape_struct_and_field()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("struct __S__\n    x: int\n", rsv_shape_refusal("__S__", "type", "s"), 1, 1)
+    rsv_shape_says("struct P\n    __X__: int\n", rsv_shape_refusal("__X__", "field", "x"), 2, 5)
+
+@test("an enum, and a variant of one, may not take the reserved shape")
+rsv_shape_enum_and_variant()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("enum __E__\n    A\n", rsv_shape_refusal("__E__", "type", "e"), 1, 1)
+    rsv_shape_says("enum E\n    __A__\n", rsv_shape_refusal("__A__", "variant", "a"), 2, 5)
+
+@test("a trait may not take the reserved shape")
+rsv_shape_trait()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("trait __T__\n    f(self) -> int\n", rsv_shape_refusal("__T__", "trait", "t"), 1, 1)
+
+@test("a type alias may not take the reserved shape")
+rsv_shape_type_alias()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("type __T__ = int\n", rsv_shape_refusal("__T__", "type", "t"), 1, 1)
+
+@test("an extern, and a parameter of one, may not take the reserved shape")
+rsv_shape_extern_and_parameter()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("extern \"puts\" __P__(s: *u8) -> i32\n",
+                   rsv_shape_refusal("__P__", "declaration", "p"), 1, 1)
+    rsv_shape_says("extern \"puts\" p(__S__: *u8) -> i32\n",
+                   rsv_shape_refusal("__S__", "parameter", "s"), 1, 17)
+
+@test("an import alias may not take the reserved shape")
+rsv_shape_import_alias()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("import sysl.text as __TEXT__\nprint(1)\n",
+                   rsv_shape_refusal("__TEXT__", "import", "text"), 1, 1)
+
+@test("an alias inside a selector list may not take the reserved shape")
+rsv_shape_selector_alias()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("import sysl.{text as __T__}\nprint(1)\n",
+                   rsv_shape_refusal("__T__", "import", "t"), 1, 14)
+
+// ---- nor anything that binds a name inside a body
+
+@test("a parameter with a body may not take the reserved shape")
+rsv_shape_parameter()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("f(__A__: int) -> int = __A__\n", rsv_shape_refusal("__A__", "binding", "a"), 1, 1)
+
+@test("a local may not take the reserved shape")
+rsv_shape_local()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("f() -> int\n    var __X__ = 1\n    __X__\n", rsv_shape_refusal("__X__", "binding", "x"),
+                   2, 5)
+
+@test("a 'for' element may not take the reserved shape")
+rsv_shape_for_element()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("f()\n    for __I__ in 0..<3 do print(__I__)\n",
+                   rsv_shape_refusal("__I__", "binding", "i"), 2, 5)
+
+@test("a closure's parameter may not take the reserved shape")
+rsv_shape_closure_parameter()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("apply(f: int -> int) -> int = f(1)\nprint(apply(__X__ -> __X__))\n",
+                   rsv_shape_refusal("__X__", "binding", "x"), 2, 13)
+
+// ---- a reserved name where no built-in could stand
+
+@test("a reserved name in a type position is an unknown type")
+rsv_shape_in_a_type_position()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("var x: __FOO__ = 1\n", "unknown type '__FOO__'", 1, 8)
+
+@test("a built-in assigned to is not a place")
+rsv_shape_assigned_to()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("__FILE__ = 1\n",
+                   "assignment needs a variable, a field, an element, or a dereference — something with an address",
+                   1, 1)
+
+@test("a built-in called is not a function")
+rsv_shape_called()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("print(__FILE__())\n", "undefined function '__FILE__'", 1, 7)
+
+@test("a built-in at a type it is not")
+rsv_shape_at_a_type_it_is_not()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("var n: int = __FILE__\n", "cannot initialize 'n': declared int but the value is string",
+                   1, 1)
+
+@test("the refusal names the shape rather than the six built-ins")
+rsv_shape_names_the_shape()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("var __MY_FLAG__ = 1\n", rsv_shape_refusal("__MY_FLAG__", "binding", "my_flag"), 1, 1)
+
+@test("a name with the shape and no meaning is an error")
+rsv_shape_no_meaning()
+    if !rsv_shape_ready() then return
+
+    rsv_shape_says("print(__NOPE__)\n",
+                   "there is no built-in called '__NOPE__' — the shape '__…__' is the language's, and what it currently holds is __FILE__, __LINE__, __COLUMN__, __FUNCTION__, __DATE__, __TIME__",
+                   1, 7)
+
+@test("a location is a literal, and is range-checked as one")
+rsv_shape_location_range_checked()
+    if !rsv_shape_ready() then return
+
+    val (said, root) = rsv_shape_run(repeat("\n", 300) + "var n: u8 = __LINE__\n")
+
+    assert(said.starts_with(s"error: the literal 301 does not fit byte\n   --> $root/main.sysl:301:13\n"),
+           said)
+
+// ---- the build stamp
+
+@test("the build stamp renders the epoch in C's formats")
+rsv_shape_stamp_epoch()
+    assert_eq(stamp_date(0), "Jan  1 1970")
+    assert_eq(stamp_time(0), "00:00:00")
+
+@test("the build stamp pads the day with a space, as C does")
+rsv_shape_stamp_pads_the_day()
+    assert_eq(stamp_date(86400000), "Jan  2 1970")
+    assert_eq(stamp_date(86400000 * 30), "Jan 31 1970")
+
+@test("the build stamp gets a leap day right")
+rsv_shape_stamp_leap_day()
+    assert_eq(stamp_date(951782400000), "Feb 29 2000")
+
+@test("the build stamp reads a known timestamp as UTC")
+rsv_shape_stamp_known_timestamp()
+    assert_eq(stamp_date(1234567890000), "Feb 13 2009")
+    assert_eq(stamp_time(1234567890000), "23:31:30")
+
+@test("the build stamp is one per compilation")
+rsv_shape_stamp_is_one()
+    assert_eq(build_stamp(), build_stamp())
+
+// The two stamp built-ins are answered, where before they fell through to "there is no built-in".
+@test("__DATE__ and __TIME__ are built-ins a program may use")
+rsv_shape_stamp_builtins_answer()
+    if !rsv_shape_ready() then return
+
+    val (said, _) = rsv_shape_run("val d: string = __DATE__\nval t: string = __TIME__\nprint(d)\nprint(t)\n")
+
+    assert(!said.starts_with("error"), said)

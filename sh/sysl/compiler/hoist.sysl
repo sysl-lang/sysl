@@ -160,10 +160,17 @@ hoist_units(a: &Analysis, units: Buf[Program])
     // The reserved shape is refused before anything is registered, so a declaration that tried to
     // take one is answered by that rather than by the consequences of a name the rest of the
     // compiler then could not resolve.
+    // **The entry file's bindings are left to the body they belong to**, whose statements bind them
+    // and say `binding` -- a `val` there is a local like any other, and saying so twice would answer
+    // one mistake from two places.
     for i in 0..<units.len()
         val body = units.at(i).body
+        val is_entry = a.tables.entry_src != "" && units.at(i).src.name == a.tables.entry_src
 
         for j in 0..<body.len()
+            if is_entry && entry_binding(body.at(j)) &&
+                    !belongs_to_module(body.at(j), a.tables.entry_captures) then continue
+
             val taken = reserved_in(body.at(j))
 
             for k in 0..<taken.len()
@@ -186,6 +193,12 @@ hoist_units(a: &Analysis, units: Buf[Program])
             // which types every body types these too.
             register_predicate(a, scopes.at(i), body.at(j))
 end hoist_units
+
+// Whether a statement of the entry file is a binding its body makes rather than a declaration.
+private entry_binding(s: Stmt) -> bool = *s.kind match
+    ValDecl(_, _, _, _, _, _) -> true
+    VarDecl(_, _, _, _, _, _, _) -> true
+    _ -> false
 
 // What a trait's members may not carry a body for.
 //
