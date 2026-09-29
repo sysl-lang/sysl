@@ -312,17 +312,19 @@ it_cannot_make_a_second_wildcards_name_ambiguous()
 
 // **A file-private name is scoped to its file, and a public one is not.**
 //
-// This is the half that did not move when a file became a namespace as well as a reach: a private
-// declaration against a sibling's public one is a real ambiguity for that sibling's own references,
-// and is still refused.
-@test("a private declaration still collides with a sibling file's public one")
-a_private_declaration_collides_with_a_siblings_public_one()
+// A private declaration SHADOWS a sibling's public one of its spelling: the private file's references
+// mean its own, every other file's the public one. `tests_rlb_file_private.sysl` carries the rule in
+// full.
+@test("a private declaration shadows a sibling file's public one, in its own file only")
+a_private_declaration_shadows_a_siblings_public_one()
     if vis_no_library() then return
 
-    assert(vis_err([("main.sysl", "print(1)\n"),
-                    ("g.sysl", "module geom\nprivate scale(n: int) -> int = n * 2\n"),
-                    ("h.sysl", "module geom\nscale(n: int) -> int = n + 1\n")])
-        .contains("function 'scale' is already declared"))
+    assert_eq(vis_ran([("main.sysl", "print(geom.from_g(), geom.from_h(), geom.scale(10))\n"),
+                       ("geom/g.sysl",
+                        "module geom\nprivate scale(n: int) -> int = n * 2\nfrom_g() -> int = scale(10)\n"),
+                       ("geom/h.sysl",
+                        "module geom\nscale(n: int) -> int = n + 1\nfrom_h() -> int = scale(10)\n")]),
+              "20 11 11\n")
 
 // Two files that each keep a `scale` to themselves have written two declarations no call site can
 // confuse, since neither is ever a candidate where the other is.
@@ -365,19 +367,24 @@ a_file_private_symbol_still_carries_its_module()
 end a_file_private_symbol_still_carries_its_module
 
 // A collision is one mistake, so it is one diagnostic. The losing declaration is still registered
-// under the name, so without care the file that wrote it is then told the name belongs to its
-// sibling -- a name it declares itself, three lines up.
+// under the name, so without care the file that wrote it is then told the name belongs to another
+// declaration -- a name it declares itself, three lines up. What still collides is one file declaring
+// the spelling twice; a public declaration in another file must not turn that into a second
+// complaint either.
 @test("and the file that loses the collision is not also told the name is not its own")
 the_loser_of_a_collision_is_not_also_told_the_name_is_not_its_own()
     if vis_no_library() then return
 
     val out = vis_err([("main.sysl", "print(1)\n"),
-                       ("g.sysl", "module geom\nscale(n: int) -> int = n * 2\n"),
+                       ("g.sysl", "module geom\nscale(n: int) -> int = n * 3\n"),
                        ("h.sysl",
-                        "module geom\nprivate scale(n: int) -> int = n + 1\ntwice(n: int) -> int = scale(n)\n")])
+                        "module geom\nscale(n: int) -> int = n * 2\nprivate scale(n: int) -> int = n + 1\n" +
+                        "twice(n: int) -> int = scale(n)\n")])
 
-    assert(out.contains("function 'scale' is already declared"), out)
+    assert(out.contains("error: function 'scale' is already declared\n --> h.sysl:2:1"), out)
+    assert(out.contains("error: function 'scale' is already declared\n --> h.sysl:3:1"), out)
     assert(!out.contains("private to"), out)
+    assert(!out.contains("ambiguous"), out)
 end the_loser_of_a_collision_is_not_also_told_the_name_is_not_its_own
 
 // -- a file-private declaration is internal to the module that defines it --------------------------

@@ -1512,10 +1512,10 @@ private function_keys_of(cx: &Analyzer, written: string) -> Buf[string]
     // that is genuinely private somewhere else should say so rather than say it does not exist -- so
     // it is held back and used only when nothing else answered.
     // This file's own file-private declaration of the spelling comes before the module's plain key,
-    // where a sibling file took that one first.
-    val here = file_private_key(cx.an, cx.scope.src.name, module_qualify(cx.scope.module_name,
-                                                                        written))
-    val mine = visible_keys(cx, overload_keys(cx.an, here))
+    // where another file also declares it -- together with the public overloads it does not shadow.
+    val plain = module_qualify(cx.scope.module_name, written)
+    val here = file_private_key(cx.an, cx.scope.src.name, plain)
+    val mine = with_unshadowed(cx, visible_keys(cx, overload_keys(cx.an, here)), here, plain)
 
     if !mine.is_empty() then return mine
 
@@ -1631,6 +1631,49 @@ private visible_keys(cx: &Analyzer, keys: Buf[string]) -> Buf[string]
 
     out
 end visible_keys
+
+// `own` -- this file's declarations of a spelling, filed under its private slot `here` -- with the
+// public functions of that spelling the file still sees beside them: **every one no call could
+// confuse with one of the file's own** (`reference/modules.md § A file-private name is scoped to its
+// file`).
+//
+// A private function shadows only the public declarations a call could not tell from it -- the pairs
+// `reference/declarations.md § Overloading` would refuse inside one file -- and joins the rest as an
+// overload set. So a file adding a private `skip_line(s: string)` beside a module's public
+// `skip_line(n: int)` still calls the public one with an `int`, and one adding a private
+// `skip_line(n: int)` calls its own. Where `here` is the plain key there is no slot and nothing to
+// add; **where the slot holds no function** -- a private constant beside a public function of its
+// name -- the private declaration hides the whole spelling, and nothing is added either.
+private with_unshadowed(cx: &Analyzer, own: Buf[string], here: string, plain: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<own.len()
+        out.push(own.at(i))
+
+    if here == plain then return out
+
+    val mine = overload_keys(cx.an, here)
+
+    if mine.is_empty() then return out
+    val wide = visible_keys(cx, overload_keys(cx.an, plain))
+
+    for i in 0..<wide.len()
+        val p = cx.an.tables.funcs.get(wide.at(i))
+
+        if p.is_some() && !shadowed_by(cx, mine, p.unwrap().decl) then out.push(wide.at(i))
+
+    out
+end with_unshadowed
+
+// Whether any of one file's own declarations of a spelling is one a call could not tell from `p`.
+private shadowed_by(cx: &Analyzer, mine: Buf[string], p: FuncDecl) -> bool
+    for i in 0..<mine.len()
+        val o = cx.an.tables.funcs.get(mine.at(i))
+
+        if o.is_some() && overlapping(o.unwrap().decl, p) then return true
+
+    false
+end shadowed_by
 
 // The key a dotted name spells where its head is a module the file bound a name to.
 private module_bound_key(cx: &Analyzer, written: string) -> Option[string]
