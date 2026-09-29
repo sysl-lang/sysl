@@ -43,9 +43,10 @@ module_of(key: string) -> string = module_split(key).0
 // caller writes says nothing about which module answered, and a reader with the bare name has
 // nowhere to go and read the signature. A function of the caller's own root module has no module to
 // put in front, so the two spellings are the same word there and every single-file program reads as
-// it always did.
+// it always did. **A call that already wrote the module (`m.use()`) is quoted from the key too**, so
+// the module is not put in front a second time.
 qualified_callee(key: string, written: string) -> string =
-    if module_of(key) == "" then written else s"${module_of(key)}.$written"
+    if module_of(key) == "" then written else readable_keys(key)
 
 // The name half of a key.
 module_bare(key: string) -> string = module_split(key).1
@@ -120,6 +121,127 @@ end overload_plain
 
 // The qualified name a file wrote, which is what a diagnostic says when it names a declaration.
 qualified_name(key: string) -> string = module_show(spelled_key(key))
+
+// A diagnostic's text with every declaration key in it written as the qualified name a reader
+// would write: `m$P.get` is `m.P.get`, `m$hid.private1` is `m.hid`, `m$f.2` is `m.f`.
+//
+// **This is the one place a message is made readable, so no refusal has to remember to.** A key
+// is whatever a table was keyed by, and dozens of refusals interpolate one straight into their text;
+// doing it here means a key cannot reach a reader however the message was put together. What counts
+// as a key is a run of name characters with a module in front of a `$` -- so `'$'`, a `$name`
+// placeholder and `'..$n'` are left as they were written, and text with no `$` is not touched at
+// all. A `$24` is a `$` the name itself held, and reads as one again. A root-module name has no
+// module to show and prints bare, which it already is.
+readable_keys(message: string) -> string
+    val bytes = message.bytes
+    var dollar = false
+
+    for b in bytes
+        if b == u8('$') then dollar = true
+
+    if !dollar then return message
+
+    var out: Buf[u8] = buf()
+    var i: usize = 0
+
+    while i < bytes.len
+        if !key_byte(bytes[i])
+            out.push(bytes[i])
+            i += 1
+            continue
+
+        var j = i
+
+        while j < bytes.len && key_byte(bytes[j])
+            j += 1
+
+        push_readable(&out, bytes[i..<j])
+        i = j
+
+    from_utf8_unchecked(out.view())
+end readable_keys
+
+// One run of name characters, written into `out` as a reader would spell it.
+private push_readable(out: *Buf[u8], run: []const u8)
+    val sep = key_separator(run)
+
+    if sep < 0
+        push_unguarded(out, run)
+        return
+
+    val at = usize(sep)
+
+    for k in 0..<at
+        out.push(run[k])
+
+    out.push(u8('.'))
+
+    val name = from_utf8_unchecked(run[at + 1..<run.len])
+
+    push_unguarded(out, drop_private_slots(spelled_key(name)).bytes)
+end push_readable
+
+// Where the module ends in a run, or -1 where the run is not a key: the first `$` that is not a
+// guarded one, with a module in front of it that begins with a name character and does not end in
+// a dot.
+private key_separator(run: []const u8) -> isize
+    if run.len == 0 || !name_start(run[0]) then return -1
+
+    for k in 0..<run.len
+        if run[k] == u8('$') && !guarded_at(run, k)
+            if k == 0 || run[k - 1] == u8('.') || k + 1 >= run.len then return -1
+
+            return isize(k)
+
+    -1
+end key_separator
+
+// Whether the `$` at `k` is the start of a `$24`, a dollar the name held rather than a separator.
+private guarded_at(run: []const u8, k: usize) -> bool =
+    k + 2 < run.len && run[k + 1] == u8('2') && run[k + 2] == u8('4')
+
+// A run with each `$24` turned back into the `$` it stands for.
+private push_unguarded(out: *Buf[u8], run: []const u8)
+    var k: usize = 0
+
+    while k < run.len
+        if run[k] == u8('$') && guarded_at(run, k)
+            out.push(u8('$'))
+            k += 3
+        else
+            out.push(run[k])
+            k += 1
+end push_unguarded
+
+// A member name with a file-private slot taken out of its middle -- `P.private1.get` is `P.get`;
+// `spelled_key` has already taken the ones at the end.
+private drop_private_slots(name: string) -> string
+    val bytes = name.bytes
+    var out: Buf[u8] = buf()
+    var start: usize = 0
+    var k: usize = 0
+
+    while k <= bytes.len
+        if k == bytes.len || bytes[k] == u8('.')
+            val segment = from_utf8_unchecked(bytes[start..<k])
+
+            if start == 0 || !private_slot(segment)
+                if start > 0 then out.push(u8('.'))
+
+                for b in segment.bytes
+                    out.push(b)
+
+            start = k + 1
+
+        k += 1
+
+    from_utf8_unchecked(out.view())
+end drop_private_slots
+
+private key_byte(b: u8) -> bool =
+    c_letter(b) || c_digit(b) || b == u8('_') || b == u8('.') || b == u8('$') || b == u8('-')
+
+private name_start(b: u8) -> bool = c_letter(b) || b == u8('_')
 
 private last_dot(key: string) -> isize
     val bytes = key.bytes
