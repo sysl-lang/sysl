@@ -1,0 +1,148 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// The order a program's computed module storage is filled in.
+//
+// **A `val` and a module `var` are one kind of thing here**, storage belonging to a module rather than
+// to a call, and a cycle may run through either.
+//
+// Storage whose initializer is a constant tree is laid straight into the object file and has no order
+// to have; it comes first and keeps the order it was declared in. Storage whose initializer is *code*
+// runs before the program's own statements, and **each initializer runs after every piece of storage
+// it reads**, directly or through anything it calls. That is a graph over the storage itself, finer
+// than the module graph: a module's own files have no order at all, so ordering by module could not
+// settle two tables in one directory. A cross-module read follows a module edge, and those may not
+// cycle, so a cycle here is always inside one module.
+//
+// What an initializer reads is the reachability walk asked of one root, and everything that walk
+// over-approximates -- a call through a method table above all -- orders a piece of storage *earlier*
+// than it had to be, which is the harmless direction.
+
+// Every piece of storage the program lays down, the computed ones in the order they run, with a cycle
+// that makes such an order impossible reported where it closes.
+init_ordered(a: &Analysis, vals: Buf[TVal], funcs: Buf[TFunc]) -> Buf[TVal]
+    var constant: Buf[TVal] = buf()
+    var computed: Buf[TVal] = buf()
+
+    for i in 0..<vals.len()
+        if vals.at(i).computed then computed.push(vals.at(i)) else constant.push(vals.at(i))
+
+    if computed.is_empty() then return vals
+
+    var names: Buf[string] = buf()
+
+    for i in 0..<computed.len()
+        names.push(computed.at(i).symbol)
+
+    val vtables = reached_vtables(a)
+    var deps: Buf[Buf[string]] = buf()
+
+    for i in 0..<computed.len()
+        val read = vals_read_by(computed.at(i).init.unwrap(), funcs, vtables)
+        var mine: Buf[string] = buf()
+
+        for j in 0..<read.len()
+            if holds_string(names, read.at(j)) && !holds_string(mine, read.at(j)) then mine.push(read.at(j))
+
+        deps.push(sorted_names(mine))
+
+    var w = InitWalk(computed, names, deps, constant, buf(), buf(), buf())
+
+    for i in 0..<names.len()
+        init_walk(a, &w, names.at(i))
+
+    w.out
+end init_ordered
+
+private struct InitWalk
+    computed: Buf[TVal]
+    names: Buf[string]
+    deps: Buf[Buf[string]]
+    out: Buf[TVal]
+    placed: Buf[string]
+    walking: Buf[string]
+    blamed: Buf[string]
+
+private init_walk(a: &Analysis, w: *InitWalk, name: string)
+    val at = index_of_name(w.walking, name)
+
+    if at < w.walking.len()
+        var cycle: Buf[string] = buf()
+
+        for i in at..<w.walking.len()
+            cycle.push(w.walking.at(i))
+
+        report_init_cycle(a, w, cycle)
+        return
+
+    if holds_string(w.placed, name) then return
+
+    w.walking.push(name)
+
+    val k = index_of_name(w.names, name)
+    val needs = w.deps.at(k)
+
+    for i in 0..<needs.len()
+        init_walk(a, w, needs.at(i))
+
+    w.walking.truncate(w.walking.len() - 1)
+    w.placed.push(name)
+    w.out.push(w.computed.at(k))
+end init_walk
+
+// Reported at the declaration that comes first by name, once per cycle: a second declaration on the
+// same loop has the same mistake in it, and saying so twice would not help anyone find it.
+private report_init_cycle(a: &Analysis, w: *InitWalk, cycle: Buf[string])
+    var h: usize = 0
+
+    for i in 1..<cycle.len()
+        if cycle.at(i) < cycle.at(h) then h = i
+
+    val head = cycle.at(h)
+
+    if holds_string(w.blamed, head) then return
+
+    w.blamed.push(head)
+
+    var b = str_builder()
+
+    b.push(s"'${qualified_name(head)}' cannot be initialized: its value needs ")
+
+    for n in 1..cycle.len()
+        if n > 1 then b.push(", whose value needs ")
+
+        b.push(s"'${qualified_name(cycle.at((h + n) % cycle.len()))}'")
+
+    b.push(" — computed module storage runs once before anything else does, so what it needs has to " +
+        "be settled first")
+
+    val d = a.tables.vals.get(head).unwrap()
+
+    a.fault(d.scope, d.span, b.finish())
+end report_init_cycle
+
+private index_of_name(xs: Buf[string], name: string) -> usize
+    for i in 0..<xs.len()
+        if xs.at(i) == name then return i
+
+    xs.len()
+end index_of_name
+
+// Names in the order a string compares, which is the order a node's dependencies are visited in.
+private sorted_names(xs: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<xs.len()
+        var at = out.len()
+
+        for j in 0..<out.len()
+            if xs.at(i) < out.at(j)
+                at = j
+                break
+
+        out.insert(at, xs.at(i))
+
+    out
+end sorted_names

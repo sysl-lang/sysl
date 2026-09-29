@@ -177,12 +177,30 @@ private assembled(path: string, t: Target, packaged: bool) -> Result[Compilation
     // every other -- it is code somebody wrote, held to the same rules -- and what a `@tests` file
     // declares is *marked* rather than dropped, so that an ordinary body reaching one of those names
     // is something to report about rather than a name that was never there.
+    //
+    // **Every file is parsed before any refusal is made**, so a syntax error in one file does not hide
+    // one in another: each file's first complaint is reported, in the order the files were found.
+    var mine_units: Buf[Program] = buf()
+    var unparsed: Buf[string] = buf()
+
     for i in 0..<mine.len()
         val parsed = parse(mine.at(i).src, t)
 
-        if !parsed.ok() then return Err(Reported(parse_report(parsed)))
+        if !parsed.ok() then unparsed.push(parse_report(parsed))
+        else mine_units.push(parsed.program)
 
-        var unit = parsed.program
+    if !unparsed.is_empty() then return Err(Reported(joined_reports(unparsed)))
+
+    // A module is a directory, so where the project is a tree each file's header is held to where the
+    // file sits. A file named on its own has nothing to be measured against, its header being the
+    // whole of what says which module it is in.
+    if is_directory(path)
+        val strayed = location_reports(mine, mine_units)
+
+        if !strayed.is_empty() then return Err(Reported(joined_reports(strayed)))
+
+    for i in 0..<mine_units.len()
+        var unit = mine_units.at(i)
 
         unit.pkg = mine_pkg
         units.push(unit)
@@ -206,18 +224,60 @@ check_locations(found: Buf[Found], units: Buf[Program]) -> Buf[string]
     var out: Buf[string] = buf()
 
     for i in 0..<found.len()
-        val expected = dotted(found.at(i).dir)
-        val declared = module_written(units.at(i))
-
-        if declared != expected
-            val theirs = if declared == "" then "declares no module" else s"declares '$declared'"
-            val here = if expected == "" then "sits at the project root" else s"sits in '$expected'"
-
-            out.push(s"${found.at(i).src.name} $theirs, but it $here -- a module is a directory, " +
-                "so the two must agree")
+        location_refusal(found.at(i), units.at(i)) match
+            Some(said) -> out.push(said)
+            None -> ()
 
     out
 end check_locations
+
+// What one file's header and location have to say about each other, where they disagree.
+private location_refusal(found: Found, unit: Program) -> Option[string]
+    val expected = dotted(found.dir)
+    val declared = module_written(unit)
+
+    if declared == expected then return None
+
+    val theirs = if declared == "" then "declares no module" else s"declares '$declared'"
+    val here = if expected == "" then "sits at the project root" else s"sits in '$expected'"
+
+    Some(s"${found.src.name} $theirs, but it $here — a module is a directory, so the two must agree")
+end location_refusal
+
+// The same, rendered: at the header where the file wrote one, at its first statement where it wrote
+// none, and with no location at all for a file with nothing in it, there being nothing to point at.
+private location_reports(found: Buf[Found], units: Buf[Program]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<found.len()
+        val unit = units.at(i)
+
+        location_refusal(found.at(i), unit) match
+            None -> ()
+            Some(said) ->
+                var one: Buf[Placed] = buf()
+
+                if unit.module_name.is_some() then
+                    one.push(placed_error(unit.src, unit.module_name.unwrap().span, said))
+                else if !unit.body.is_empty() then
+                    one.push(placed_error(unit.src, unit.body.at(0).span, said))
+
+                out.push(if one.is_empty() then s"error: $said" else analysis_report(one))
+
+    out
+end location_reports
+
+// Several rendered reports, one blank line between each, as an analysis report separates them.
+private joined_reports(all: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<all.len()
+        if i > 0 then out = out + "\n\n"
+
+        out = out + all.at(i)
+
+    out
+end joined_reports
 
 private dotted(parts: Buf[string]) -> string
     var out = ""

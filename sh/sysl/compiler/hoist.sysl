@@ -463,9 +463,7 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
     // A second constant of one name is the duplicate it is, and said the way a second type is; a
     // constant meeting a name something else holds is told what holds it.
     if holder.is_some() then
-        if what == "constant" && into.has(key) then a.fault(scope, span, s"constant '$name' is already declared")
-        else a.fault(scope, span, s"'$name' is already declared as ${holder.unwrap()}")
-
+        a.fault(scope, span, value_taken_message(a, key, name, what))
         return
     end if
 
@@ -483,6 +481,31 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
     record_access(a, scope, span, key, vis)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
+
+// What a second declaration of a value name is told. **The same kind twice is one declaration
+// written twice**, and says only that; **two kinds are two different things** contending for one
+// name, so the message says which kind already has it -- and a module `var` is a kind of its own
+// there, though it is filed in the table a `val` is.
+private value_taken_message(a: &Analysis, key: string, name: string, what: string) -> string
+    var held = "'val'"
+
+    if a.tables.consts.has(key) then held = "constant"
+    else if a.tables.extern_vars.has(key) then held = "'extern' variable"
+    else if holds_string(a.tables.writable, key) then held = "'var'"
+
+    if held == what
+        if what == "constant" then return s"constant '$name' is already declared"
+
+        return s"'$name' is already declared"
+
+    val described = held match
+        "constant" -> "a constant"
+        "'extern' variable" -> "an 'extern' variable"
+        "'var'" -> "a module 'var'"
+        _ -> "a 'val'"
+
+    s"'$name' is already used by $described"
+end value_taken_message
 
 // Whether a name another file already registered is one this declaration could be confused with.
 //

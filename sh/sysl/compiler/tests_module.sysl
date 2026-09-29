@@ -1,0 +1,700 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A module is a directory, so its files are one scope.** Four sides of that claim: the header a
+// file writes to say which module it contributes to, the fact that splitting a module across files
+// changes nothing about what its declarations can see, the agreement between a header and the
+// directory the file was found in, and which one file of a program carries the statements it runs.
+//
+// **Every refusal and every output quoted here was obtained by running the reference compiler on the
+// same tree.**
+
+private mod_can_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end mod_can_run
+
+// A file of a program: the directory it sits in (a dotted module path, `""` for the project root),
+// its name, and its text.
+private mod_write(files: []const (string, string, string)) -> string
+    val root = make_temp_dir("sysl-module").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for i in 0..<files.len
+        val f = files[i]
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    root
+end mod_write
+
+// **What a project PRINTS**, or what the build had to say about it.
+private mod_ran(files: []const (string, string, string)) -> string
+    val root = mod_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end mod_ran
+
+// Everything a project has to say for itself, rendered the way a reader sees it; empty where it
+// compiled.
+private mod_err(files: []const (string, string, string)) -> string
+    val root = mod_write(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end mod_err
+
+// The LLVM text of files handed over with **no project around them**, so each carries no location and
+// its header is the whole of what says which module it is in.
+private mod_ir(files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> return "no library"
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> return "no library"
+            Ok(lib) ->
+                for i in 0..<lib.len()
+                    units.push(lib.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return parsed.report.at(0).message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/")
+            return done.reported.at(i).diag.message
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val kept = prune(strip_tests(whole), own)
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), pr).0)
+end mod_ir
+
+private mod_agree(said: string) -> string = s"$said — a module is a directory, so the two must agree"
+
+// -- the module header ------------------------------------------------------------------------------
+
+@test("the module header names the module a file contributes to")
+mod_names_the_module_a_file_contributes_to()
+    assert_eq(pf_module("module oskit.arch\nprint(1)"), "oskit.arch")
+
+@test("the module header may be a single segment")
+mod_may_be_a_single_segment()
+    assert_eq(pf_module("module std\nprint(1)"), "std")
+
+@test("the module header is absent from a file that writes none")
+mod_is_absent_from_a_file_that_writes_none()
+    assert_eq(pf_module("print(1)"), "")
+
+@test("the module header does not become a statement")
+mod_does_not_become_a_statement()
+    assert_eq(pf("module a.b\nprint(1)"), pf("print(1)"))
+
+// It is read as the start of an expression statement, so what is refused is the word where an
+// expression was expected -- on the third line, the one the second header is on.
+@test("the module header comes before everything, so a second one is not a statement")
+mod_a_second_header_is_not_a_statement()
+    assert_eq(pf_err("module a\nprint(1)\nmodule b"), "expression expected")
+
+    val lines = pf_lines("module a\nprint(1)\nmodule b")
+
+    assert(lines.len() == 1 && lines.at(0) == 3, "the refusal is on the second header's line")
+
+@test("the module header does not carry the capability annotation on its own line")
+mod_does_not_carry_the_capability_annotation()
+    assert_eq(pf_err("module m @no_alloc\nprint(1)"),
+        "this attribute belongs in the file's header, on the lines directly after 'module' and before " +
+        "everything else — it is a property of the whole module, not of the statements below it")
+
+@test("the module header may be preceded by blank lines")
+mod_may_be_preceded_by_blank_lines()
+    assert_eq(pf_module("\n\nmodule a.b\nprint(1)"), "a.b")
+
+@test("'module' is spent as a word, so nothing else may be called it")
+mod_spends_the_word()
+    assert_eq(pf_err("var module = 1"), "identifier expected")
+
+// -- one module, however many files --------------------------------------------------------------
+
+@test("a call reaches a function declared in another file")
+mod_a_call_reaches_another_file()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(double(21))"),
+                       ("", "math.sysl", "double(n: int) -> int = n * 2")]), "42\n")
+
+@test("and the order the files are handed over does not matter")
+mod_the_order_of_the_files_does_not_matter()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "math.sysl", "double(n: int) -> int = n * 2"),
+                       ("", "main.sysl", "print(double(21))")]), "42\n")
+
+@test("two files may call each other")
+mod_two_files_may_call_each_other()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(even(10))"),
+                       ("", "a.sysl", "even(n: int) -> bool =\n    if n == 0 then true else odd(n - 1)"),
+                       ("", "b.sysl", "odd(n: int) -> bool =\n    if n == 0 then false else even(n - 1)")]),
+        "true\n")
+
+@test("a type declared in one file is used in another")
+mod_a_type_is_used_in_another_file()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "var p = Point(3, 4)\nprint(p.x + p.y)"),
+                       ("", "point.sysl", "struct Point\n    x: int\n    y: int")]), "7\n")
+
+@test("a trait, its implementation, and its use may each be in their own file")
+mod_a_trait_its_impl_and_its_use()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "var s: &Show = Point(3, 4)\nprint(s.show())"),
+                       ("", "trait.sysl", "trait Show\n    show(self) -> int"),
+                       ("", "point.sysl", "struct Point\n    x: int\n    y: int"),
+                       ("", "impl.sysl", "impl Show for Point\n    show(self) -> int = self.x + self.y")]),
+        "7\n")
+
+@test("a generic declared in one file is instantiated from another")
+mod_a_generic_is_instantiated_from_another_file()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(first(Pair(7, 9)))"),
+                       ("", "pair.sysl", "struct Pair[T]\n    a: T\n    b: T\nfirst[T](p: Pair[T]) -> T = p.a")]),
+        "7\n")
+
+@test("every file writes the same header")
+mod_every_file_writes_the_same_header()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("oskit.arch", "main.sysl", "module oskit.arch\nprint(halt())"),
+                       ("oskit.arch", "cpu.sysl", "module oskit.arch\nhalt() -> int = 3")]), "3\n")
+
+@test("and one file is the whole module where that is all there is")
+mod_one_file_is_the_whole_module()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "only.sysl", "print(1)")]), "1\n")
+
+@test("a file may be a header and nothing else")
+mod_a_file_may_be_a_header_and_nothing_else()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("m", "main.sysl", "module m\nprint(halt())"),
+                       ("m", "spare.sysl", "module m\n"),
+                       ("m", "cpu.sysl", "module m\nhalt() -> int = 3")]), "3\n")
+
+// A module none of whose files carries a statement still has an entry point, which does nothing and
+// succeeds. What nothing reaches is not written out.
+@test("a module that runs nothing still compiles")
+mod_a_module_that_runs_nothing_still_compiles()
+    if mod_can_run() then return
+
+    val out = mod_ir([("a.sysl", "f() -> int = 1")])
+
+    assert(out.contains("define i32 @main("), out)
+    assert(!out.contains("define i32 @f()"), out)
+
+@test("and a module of no files at all is the empty program")
+mod_no_files_at_all_is_the_empty_program()
+    if mod_can_run() then return
+
+    val out = mod_ir([])
+
+    assert(out.contains("define i32 @main("), out)
+
+// -- a header and the directory it was found in ----------------------------------------------------
+
+@test("a header and the directory it was found in must agree")
+mod_a_header_and_its_directory_must_agree()
+    if mod_can_run() then return
+
+    val said = mod_err([("geom", "point.sysl", "module oskit\nf() -> int = 1")])
+
+    assert(said.contains(mod_agree("/geom/point.sysl declares 'oskit', but it sits in 'geom'")), said)
+
+@test("so a file at the root writes no header")
+mod_a_file_at_the_root_writes_no_header()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "main.sysl", "module geom\nf() -> int = 1")])
+
+    assert(said.contains(mod_agree("/main.sysl declares 'geom', but it sits at the project root")), said)
+
+@test("and a file in a directory writes one")
+mod_a_file_in_a_directory_writes_one()
+    if mod_can_run() then return
+
+    val said = mod_err([("geom", "point.sysl", "f() -> int = 1")])
+
+    assert(said.contains(mod_agree("/geom/point.sysl declares no module, but it sits in 'geom'")), said)
+
+@test("however deep the directory is")
+mod_however_deep_the_directory_is()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(text.util.wrap(1))"),
+                       ("text.util", "pad.sysl", "module text.util\nwrap(n: int) -> int = n + 1")]), "2\n")
+
+// A file edited without its siblings is reported on its own line rather than as a disagreement with
+// whichever sibling happened to be read first.
+@test("with one report per file that strayed")
+mod_one_report_per_file_that_strayed()
+    if mod_can_run() then return
+
+    val said = mod_err([("m", "a.sysl", "module m\nf() -> int = 1"),
+                        ("m", "b.sysl", "module n\ng() -> int = 2"),
+                        ("m", "c.sysl", "module o\nh() -> int = 3")])
+
+    assert(said.contains(mod_agree("/m/b.sysl declares 'n', but it sits in 'm'")), said)
+    assert(said.contains(mod_agree("/m/c.sysl declares 'o', but it sits in 'm'")), said)
+    assert(!said.contains("a.sysl declares"), said)
+
+// There is nothing to point at, so the diagnostic names the file and carries no location.
+@test("and a file with nothing in it has not said which module it is")
+mod_an_empty_file_has_not_said_its_module()
+    if mod_can_run() then return
+
+    val said = mod_err([("m", "a.sysl", "module m\nf() -> int = 1"), ("m", "empty.sysl", "")])
+
+    assert(said.contains(mod_agree("/m/empty.sysl declares no module, but it sits in 'm'")), said)
+    assert(!said.contains("empty.sysl:"), said)
+
+@test("which is no complaint at all at the root, where the empty path is what it says")
+mod_an_empty_file_at_the_root_is_fine()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "a.sysl", "print(1)"), ("", "empty.sysl", "")]), "1\n")
+
+@test("with no project around them, the headers are the whole of it")
+mod_with_no_project_the_headers_are_the_whole_of_it()
+    if mod_can_run() then return
+
+    val out = mod_ir([("a.sysl", "module oskit.arch\nf() -> int = 1"),
+                      ("b.sysl", "module oskit.vm\ng() -> int = 2"),
+                      ("main.sysl", "print(oskit.arch.f() + oskit.vm.g())")])
+
+    assert(out.contains("define i32 @oskit.arch$f()"), out)
+    assert(out.contains("define i32 @oskit.vm$g()"), out)
+
+// -- which one file of a program runs ---------------------------------------------------------------
+
+@test("which one file of a program runs is a question with one answer")
+mod_which_file_runs_has_one_answer()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "a.sysl", "print(1)"), ("", "b.sysl", "print(2)")])
+
+    assert(said.contains("/a.sysl already carries the statements this program runs, so "), said)
+    assert(said.contains("/b.sysl may hold declarations only"), said)
+
+@test("across modules just as within one")
+mod_which_file_runs_across_modules()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "a.sysl", "print(1)"), ("m", "b.sysl", "module m\nprint(2)")])
+
+    assert(said.contains("/a.sysl already carries the statements this program runs, so "), said)
+    assert(said.contains("/m/b.sysl may hold declarations only"), said)
+
+// A `var` beside a file that really does carry statements is module storage, not a second beginning.
+@test("though a binding beside them is module storage rather than a second beginning")
+mod_a_binding_beside_statements_is_storage()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "counter.bump()\ncounter.bump()\nprint(str(counter.count))"),
+                       ("counter", "c.sysl", "module counter\n\nvar count: int = 0\n\nbump() = count += 1")]),
+        "2\n")
+
+// Not the `module` line but the beginning being somewhere else is what makes the binding storage.
+@test("with no header on the sibling either, since it is the statements that decide")
+mod_no_header_on_the_sibling_either()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "a.sysl", "bump()\nprint(str(x))"),
+                       ("", "b.sysl", "var x: int = 2\n\nbump() = x += 1")]), "3\n")
+
+@test("while several files of bindings and nothing else is a library, not a mistake")
+mod_several_files_of_bindings_is_a_library()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "a.sysl", "var x: int = 1"), ("", "b.sysl", "var y: int = 2")]), "")
+
+@test("though a file of nothing but declarations is never the one that runs")
+mod_a_file_of_declarations_never_runs()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "a.sysl", "f() -> int = 1"),
+                       ("", "b.sysl", "g() -> int = 2"),
+                       ("", "c.sysl", "print(f() + g())")]), "3\n")
+
+@test("and the statements read their names in the module that wrote them")
+mod_the_statements_read_their_own_module()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("m", "a.sysl", "module m\nf() -> int = 4\nprint(f())")]), "4\n")
+
+// -- a 'var' outside the entry file is the module's storage ---------------------------------------
+
+@test("a module 'var' is read by another module through its qualified name")
+mod_another_module_reads_it_qualified()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(str(counter.count))"),
+                       ("counter", "c.sysl", "module counter\n\nvar count: int = 7")]), "7\n")
+
+@test("and a sibling file of the same module writes it")
+mod_a_sibling_file_writes_it()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "m.bump()\nm.bump()\nm.bump()\nprint(str(m.n))"),
+                       ("m", "a.sysl", "module m\n\nvar n: int = 0"),
+                       ("m", "b.sysl", "module m\n\nbump() = n += 1")]), "3\n")
+
+@test("including a headerless file that is not the one the program starts in")
+mod_a_headerless_file_that_does_not_start()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "bump()\nprint(str(n))"),
+                       ("", "other.sysl", "var n: int = 5\n\nbump() = n += 1")]), "6\n")
+
+@test("its initializer may be absent, and the type's zero is what it starts at")
+mod_an_absent_initializer_starts_at_zero()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(str(m.slot))"),
+                       ("m", "a.sysl", "module m\n\nvar slot: int")]), "0\n")
+
+@test("so the type of module storage is mandatory")
+mod_the_type_is_mandatory()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "main.sysl", "print(str(m.n))"), ("m", "a.sysl", "module m\n\nvar n = 1")])
+
+    assert(said.contains("'n' is module storage, and module storage states its type — write 'n: T'"), said)
+
+// The file refuses `static`, so a diagnostic telling a reader to write it would be telling them
+// something false.
+@test("and the diagnostic does not name a spelling this file refuses")
+mod_the_diagnostic_does_not_name_static()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "main.sysl", "print(str(m.n))"), ("m", "a.sysl", "module m\n\nvar n = 1")])
+
+    assert(said != "", "the declaration is refused")
+    assert(!said.contains("static"), said)
+
+@test("and it may hold a value that owes a release")
+mod_it_may_hold_a_counted_value()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(m.greeting)"),
+                       ("m", "a.sysl", "module m\n\nvar greeting: string = \"hello\"")]), "hello\n")
+
+@test("which a slice may as much as a string, however much it reads like a view")
+mod_a_slice_may_as_much_as_a_string()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(str(m.name.len))"),
+                       ("m", "a.sysl", "module m\n\nvar name: []const u8 = \"abc\".bytes")]), "3\n")
+
+@test("including one built while the program runs")
+mod_one_built_while_the_program_runs()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(m.label)"),
+                       ("m", "a.sysl", "module m\n\nvar label: string = \"n=\" + str(6 * 7)")]), "n=42\n")
+
+@test("and reassigning one lets go of what was there")
+mod_reassigning_lets_go()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "m.set(str(1))\nm.set(str(2))\nprint(m.get())"),
+                       ("m", "a.sysl",
+                        "module m\n\nvar cur: string = \"\"\n\nset(s: string) = cur = s\n\nget() -> string = cur")]),
+        "2\n")
+
+@test("as may a 'val', whose value is built the same way")
+mod_a_val_is_built_the_same_way()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(m.banner)"),
+                       ("m", "a.sysl", "module m\n\nval banner: string = \"v\" + str(1) + \".\" + str(0)")]),
+        "v1.0\n")
+
+@test("though one with no zero must be given a value")
+mod_one_with_no_zero_needs_a_value()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "main.sysl", "print(str(m.cell.v))"),
+                        ("m", "a.sysl", "module m\n\nstruct Cell\n    v: int\n\nvar cell: &Cell")])
+
+    assert(said.contains("'m.cell' needs a value: storage with no initializer starts at its type's zero, " +
+        "and &m.Cell has none — the same rule a local with no initializer is held to. A 'string' and a " +
+        "slice both start empty and need no value written; a reference and an enum need one"), said)
+
+@test("and is fine once it has one")
+mod_and_is_fine_once_it_has_one()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(str(m.cell.v))"),
+                       ("m", "a.sysl", "module m\n\nstruct Cell\n    v: int\n\nvar cell: &Cell = Cell(7)")]),
+        "7\n")
+
+// A C interface that calls back takes a function pointer and an opaque word, so a binding offering a
+// sysl closure has to keep it somewhere that outlives the call.
+@test("which is what lets a callable be kept where something else finds it again")
+mod_a_callable_may_be_kept()
+    if mod_can_run() then return
+
+    val m = "module m\n\nprivate var pending: Option[&Fn(int) -> unit] = None\n\n" +
+        "on_done(f: &Fn(int) -> unit) = pending = Some(f)\n\nfire(n: int)\n    pending match\n" +
+        "        Some(f) ->\n            f(n)\n            pending = None\n" +
+        "        None -> print(\"nothing registered\")"
+
+    assert_eq(mod_ran([("", "main.sysl", "m.on_done(n -> print(str(n * 2)))\nm.fire(21)\nm.fire(1)"),
+                       ("m", "a.sysl", m)]), "42\nnothing registered\n")
+
+@test("while 'private' keeps module storage inside the file that declares it")
+mod_private_keeps_it_inside_its_file()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "main.sysl", "print(str(m.n))"),
+                        ("m", "a.sysl", "module m\n\nprivate var n: int = 1")])
+
+    assert(said.contains("'m.n' is private to '"), said)
+    assert(said.contains("/m/a.sysl', the file that declares it"), said)
+
+@test("though the file that declares it reads and writes it as before")
+mod_the_declaring_file_reads_and_writes_it()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(str(m.peek()))"),
+                       ("m", "a.sysl", "module m\n\nprivate var n: int = 1\n\npeek() -> int\n    n += 1\n    n")]),
+        "2\n")
+
+@test("and a '@pure' function may not read one, as of any module storage")
+mod_a_pure_function_may_not_read_one()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "main.sysl", "print(str(m.peek()))"),
+                        ("m", "a.sysl", "module m\n\nvar seed: int = 1\n\n@pure\npeek() -> int = seed")])
+
+    assert(said.contains("a '@pure' function reaches 'm.seed', which is storage outside the call and may " +
+        "change under it, and a caller of one may observe nothing about the call but its result"), said)
+
+@test("though 'static' is still refused there, having nothing to ask for")
+mod_static_is_still_refused_there()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "main.sysl", "print(1)"),
+                        ("m", "a.sysl", "module m\n\nstatic var n: int = 0")])
+
+    assert(said.contains("'static' says a declaration belongs to the module rather than to the body of the " +
+        "file the program starts in — and this file has no such body, so everything it declares is the " +
+        "module's already"), said)
+
+@test("while the entry file's own 'var' stays a local, invisible to a sibling")
+mod_the_entry_files_var_stays_a_local()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "main.sysl", "var n: int = 1\nprint(str(peek()))"),
+                        ("", "other.sysl", "peek() -> int = n")])
+
+    assert(said.contains("undefined name 'n'"), said)
+
+@test("and its address may be taken, which a module 'val' is refused")
+mod_its_address_may_be_taken()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "m.bump()\nprint(str(m.k[0]))"),
+                       ("m", "a.sysl",
+                        "module m\n\nvar k: [2]int = [1, 2]\n\nbump()\n    var p: *int = &k[0]\n    *p = 9\nend bump")]),
+        "9\n")
+
+@test("and a cycle between two of them is reported as one")
+mod_a_cycle_is_reported_as_one()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "main.sysl", "print(str(m.a))"),
+                        ("m", "x.sysl", "module m\n\nvar a: int = b + 1\n\nvar b: int = a + 1")])
+
+    assert(said.contains(mod_cycle("'m.a' cannot be initialized: its value needs 'm.b', whose value needs 'm.a'")),
+        said)
+
+private mod_cycle(said: string) -> string =
+    s"$said — computed module storage runs once before anything else does, so what it needs has to be " +
+    "settled first"
+
+// The other half of the cycle rule: an initializer runs after everything it reads, whatever order the
+// file declared them in.
+@test("computed module storage is filled after what its initializer reads")
+mod_storage_is_filled_after_what_it_reads()
+    if mod_can_run() then return
+
+    assert_eq(mod_ran([("", "main.sysl", "print(m.a)"),
+                       ("m", "x.sysl", "module m\n\nval a: string = b + \"x\"\n\nval b: string = str(1)")]),
+        "1x\n")
+
+@test("and what it reads through a call it makes counts, so a cycle through one is reported")
+mod_a_cycle_through_a_call()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "main.sysl", "print(m.a)"),
+                        ("m", "x.sysl",
+                         "module m\n\nval a: string = f()\n\nf() -> string = b\n\nval b: string = a + \"y\"")])
+
+    assert(said.contains(mod_cycle("'m.a' cannot be initialized: its value needs 'm.b', whose value needs 'm.a'")),
+        said)
+
+@test("a cycle of three names every link, and one reading itself names only itself")
+mod_a_cycle_of_three_and_of_one()
+    if mod_can_run() then return
+
+    val three = mod_err([("", "main.sysl", "print(str(m.a))"),
+                         ("m", "x.sysl", "module m\n\nvar a: int = b + 1\n\nvar b: int = c + 1\n\nvar c: int = a + 1")])
+
+    assert(three.contains(mod_cycle("'m.a' cannot be initialized: its value needs 'm.b', whose value needs " +
+        "'m.c', whose value needs 'm.a'")), three)
+
+    val one = mod_err([("", "main.sysl", "print(str(m.a))"), ("m", "x.sysl", "module m\n\nvar a: int = a + 1")])
+
+    assert(one.contains(mod_cycle("'m.a' cannot be initialized: its value needs 'm.a'")), one)
+
+@test("and it shares the value namespace with a 'val' of the same name")
+mod_it_shares_the_value_namespace()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "main.sysl", "print(str(m.n))"),
+                        ("m", "x.sysl", "module m\n\nvar n: int = 1"),
+                        ("m", "y.sysl", "module m\n\nval n: int = 2")])
+
+    assert(said.contains("'n' is already used by a module 'var'"), said)
+
+@test("while a binding beside two real beginnings is not named as a third")
+mod_a_binding_beside_two_beginnings()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "a.sysl", "print(1)"), ("", "b.sysl", "print(2)"), ("", "c.sysl", "var x: int = 3")])
+
+    assert(said.contains("/b.sysl may hold declarations only"), said)
+    assert(!said.contains("c.sysl"), said)
+
+// -- what one scope means for a mistake ------------------------------------------------------------
+
+@test("a name declared twice across two files is declared twice")
+mod_a_name_declared_twice_across_files()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "a.sysl", "f() -> int = 1"), ("", "b.sysl", "f() -> int = 2")])
+
+    assert(said.contains("function 'f' is already declared"), said)
+
+@test("a type declared twice across two files is too")
+mod_a_type_declared_twice_across_files()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "a.sysl", "struct P\n    x: int"), ("", "b.sysl", "struct P\n    y: int")])
+
+    assert(said.contains("type 'P' is already declared"), said)
+
+@test("and one implementation per type holds across files")
+mod_one_implementation_per_type_across_files()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "t.sysl", "trait Show\n    show(self) -> int"),
+                        ("", "p.sysl", "struct P\n    x: int"),
+                        ("", "a.sysl", "impl Show for P\n    show(self) -> int = 1"),
+                        ("", "b.sysl", "impl Show for P\n    show(self) -> int = 2")])
+
+    assert(said.contains("'P' already implements 'Show'"), said)
+
+// Diagnostics sort by file and then by line, so reading them top to bottom is reading the module top to
+// bottom.
+@test("an error in each file is reported against that file")
+mod_an_error_in_each_file()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "b.sysl", "g() -> int = nope"), ("", "a.sysl", "f() -> int = missing")])
+
+    assert(said.contains("undefined name 'missing'"), said)
+    assert(said.contains("undefined name 'nope'"), said)
+
+    val a = said.index_of("a.sysl")
+    val b = said.index_of("b.sysl")
+
+    assert(a.is_some() && b.is_some() && a.unwrap() < b.unwrap(), said)
+
+@test("a syntax error in one file does not hide one in another")
+mod_a_syntax_error_does_not_hide_another()
+    if mod_can_run() then return
+
+    val said = mod_err([("", "a.sysl", "f() -> int = ("), ("", "b.sysl", "g() -> int = )")])
+
+    assert(said.contains("/a.sysl:1:15"), said)
+    assert(said.contains("/b.sysl:1:14"), said)
+
+// -- the emitted module is one module -------------------------------------------------------------
+
+@test("the emitted module is one module, whatever it was written across")
+mod_one_emitted_module_whatever_it_was_written_across()
+    if mod_can_run() then return
+
+    val out = mod_ir([("main.sysl", "print(double(21))"), ("math.sysl", "double(n: int) -> int = n * 2")])
+
+    assert(out.contains("define i32 @double(i32 %n.param)"), out)
+    assert(out.contains("define i32 @main("), out)
+
+@test("and holds exactly what the single-file spelling holds")
+mod_the_same_as_the_single_file_spelling()
+    if mod_can_run() then return
+
+    val split = mod_ir([("main.sysl", "print(double(21))"), ("math.sysl", "double(n: int) -> int = n * 2")])
+
+    assert_eq(split, mod_ir([("main.sysl", "double(n: int) -> int = n * 2\nprint(double(21))")]))

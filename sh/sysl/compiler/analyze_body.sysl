@@ -238,9 +238,14 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     // in it and have to be put back for the walk. Left out, a `@no_alloc` or a `@no_os` written at
     // the top of a single-file program said nothing about the program's own statements -- the one
     // place a reader of such a program writes anything at all.
-    whole_program_checks(a, with_entry_body(funcs, started), ordered_vals(storage))
+    //
+    // **The storage is ordered first**, each initializer after what it reads, since that needs every
+    // body it could reach to have been typed and the checks below walk it in that order.
+    val ordered = init_ordered(a, storage, funcs)
 
-    TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, ordered_vals(storage), a, units,
+    whole_program_checks(a, with_entry_body(funcs, started), ordered)
+
+    TypedBodies(funcs, a.diagnostics(), generic, defaults, declared, ordered, a, units,
                 entry, started.0, started.1)
 end analyze_produced
 
@@ -1346,6 +1351,16 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                 var init: Option[TExpr] = None
 
                 if d.init.is_some() then init = Some(type_expr(cx, d.init.unwrap(), Some(ty)))
+                else if !mentions_unknown(ty) && !has_zero(ty)
+                    // The rule a local with no initializer is held to, and for the same reason:
+                    // there is nothing for the storage to start at.
+                    val shown = if d.scope.module_name == "" then d.name
+                    else s"${d.scope.module_name}.${d.name}"
+
+                    cx.fault(d.span, s"'$shown' needs a value: storage with no initializer starts at its " +
+                        s"type's zero, and ${type_show(ty)} has none — the same rule a local with no " +
+                        "initializer is held to. A 'string' and a slice both start empty and need no " +
+                        "value written; a reference and an enum need one")
                 else if !zero_sized(ty) && has_zero(ty)
                     // A zero that holds a struct carrying clauses is checked as a construction is,
                     // which makes it an initializer that runs rather than an image the object file
@@ -1437,22 +1452,3 @@ private all_laid_down(xs: Buf[TExpr]) -> bool
     true
 end all_laid_down
 
-// The storage in the order it is filled: what the object file lays down first, then what has to be
-// worked out -- each after everything it reads.
-private ordered_vals(vals: Buf[TVal]) -> Buf[TVal]
-    var out: Buf[TVal] = buf()
-    var computed = false
-
-    for i in 0..<vals.len()
-        if vals.at(i).computed then computed = true
-
-    if !computed then return vals
-
-    for i in 0..<vals.len()
-        if !vals.at(i).computed then out.push(vals.at(i))
-
-    for i in 0..<vals.len()
-        if vals.at(i).computed then out.push(vals.at(i))
-
-    out
-end ordered_vals
