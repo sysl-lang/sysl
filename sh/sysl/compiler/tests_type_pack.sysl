@@ -1,0 +1,805 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Type packs and the unrolled loop that walks one (`reference/generics.md § A parameter may stand
+// for a list of types`) -- a parameter standing for a LIST of types, written `[..A]`, which is what
+// lets one declaration cover every tuple.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `TypePackTests` these
+// are.
+
+private var tpk_library_cache: Buf[Program] = buf()
+private var tpk_library_read: bool = false
+
+private tpk_library() -> Buf[Program]
+    if tpk_library_read then return tpk_library_cache
+
+    tpk_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tpk_library_cache = units
+
+    tpk_library_cache
+end tpk_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private tpk_ready() -> bool
+    if tpk_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end tpk_ready
+
+private tpk_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private tpk_ran(text: string) -> string
+    val root = make_temp_dir("sysl-type-pack").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tpk_ran
+
+// Everything a source has to say for itself, taken through the lowering, so a refusal a pass after
+// the analysis makes is one of these too.
+private tpk_err(text: string) -> string
+    val root = make_temp_dir("sysl-type-pack").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tpk_err
+
+// The source is refused, and in words that hold `part`.
+private tpk_refused(text: string, part: string)
+    val out = tpk_err(text)
+
+    assert(tpk_says(out, part), s"expected a refusal holding '$part', got: $out")
+
+// ---- the parameter list ----
+
+@test("reads a pack beside an ordinary type parameter")
+tpk_reads_a_pack_beside_an_ordinary_parameter()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        first[..A, T](t: (..A), x: T) -> T = x
+        print(first((1, 2, 3), "ok"))
+        """), "ok\n")
+
+@test("refuses a default on a pack")
+tpk_refuses_a_default_on_a_pack()
+    if !tpk_ready() then return
+
+    tpk_refused("f[..A = int](t: (..A)) = 0\nprint(1)\n",
+                "a type pack takes no default — a default is one type, and a pack stands for a list of them")
+
+@test("refuses a pack on a struct, whose parameters are its own shape")
+tpk_refuses_a_pack_on_a_struct()
+    if !tpk_ready() then return
+
+    tpk_refused("struct Row[..A]\n    x: int\nend Row\nprint(1)\n",
+                "'..A' is a type pack, and a struct has no way to spread one over its own shape — a product of however many parts is a tuple, and '(..A)' is how an 'impl' or a function takes one")
+
+@test("refuses a pack on an enum")
+tpk_refuses_a_pack_on_an_enum()
+    if !tpk_ready() then return
+
+    tpk_refused("enum E[..A]\n    One\nend E\nprint(1)\n",
+                "'..A' is a type pack, and an enum has no way to spread one over its own shape")
+
+@test("refuses a pack on a trait")
+tpk_refuses_a_pack_on_a_trait()
+    if !tpk_ready() then return
+
+    tpk_refused("trait T[..A]\n    f(self) -> int\nprint(1)\n",
+                "'..A' is a type pack, and a trait has no way to spread one over its own shape")
+
+// ---- the tuple of a pack ----
+
+@test("matches a tuple of any arity")
+tpk_matches_a_tuple_of_any_arity()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        count[..A](t: (..A)) -> usize = A.len
+        print(count((1, 2)))
+        print(count((1, 2, 3)))
+        print(count((1, "a", true, 2.5, 'c')))
+        """), "2\n3\n5\n")
+
+// `(..A, int)` is pack EXPANSION, which is not built -- so it is refused by name rather than left
+// to fail as a type called `..A`.
+@test("refuses parts written beside a pack")
+tpk_refuses_parts_beside_a_pack()
+    if !tpk_ready() then return
+
+    tpk_refused("f[..A](t: (..A, int)) = 0\nprint(1)\n",
+                "a type pack is the whole of the tuple it stands for — '(..A, T)' appends to a pack, which is not built; write '(..A)' and reach the parts with 'for const'")
+
+@test("refuses a bare pack where a type belongs")
+tpk_refuses_a_bare_pack()
+    if !tpk_ready() then return
+
+    tpk_refused("f[..A](x: ..A) = 0\nprint(1)\n",
+                "'..A' is a type pack and not a type — the only place one may be written is inside a tuple, as '(..A)'")
+
+@test("refuses a name declared as one type but spread as a list")
+tpk_refuses_one_type_spread_as_a_list()
+    if !tpk_ready() then return
+
+    tpk_refused("f[T](t: (..T)) -> int = 0\nprint(1)\n",
+                "'T' stands for one type, and '(..T)' spreads a list of them — a parameter that stands for a list is declared '..T'")
+
+@test("refuses a pack that was never declared")
+tpk_refuses_an_undeclared_pack()
+    if !tpk_ready() then return
+
+    tpk_refused("f(t: (..A)) -> int = 0\nprint(1)\n",
+                "'..A' names no type pack — a pack is declared in the parameter list, as '[..A]'")
+
+// ---- 'for const' ----
+
+@test("unrolls over a pack's length")
+tpk_unrolls_over_a_packs_length()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        shout[..A: Display](t: (..A))
+            for const i in 0..<A.len
+                print(t.i)
+        shout((1, "two", true))
+        """), "1\ntwo\ntrue\n")
+
+// The whole feature: one written line covers parts of DIFFERENT types, because each copy is
+// type-checked on its own.
+@test("type-checks each copy separately")
+tpk_type_checks_each_copy()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        widths[..A: Display](t: (..A)) -> usize
+            var n = 0usize
+            for const i in 0..<A.len
+                n = n + str(t.i).len
+            n
+        print(widths((1, "abc", true)))
+        """), "8\n")
+
+@test("folds the index into an ordinary comparison")
+tpk_folds_the_index()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        joined[..A: Display](t: (..A)) -> string
+            var s = ""
+            for const i in 0..<A.len
+                if i > 0usize then s = s + "-"
+                s = s + str(t.i)
+            s
+        print(joined((1, 2, 3)))
+        """), "1-2-3\n")
+
+@test("takes an inclusive range too")
+tpk_takes_an_inclusive_range()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        f[..A: Display](t: (..A))
+            for const i in 0..1
+                print(t.i)
+        f((7, 8, 9))
+        """), "7\n8\n")
+
+// A copy is a block, so a `var` written in one is that copy's own.
+@test("gives each copy its own scope")
+tpk_gives_each_copy_its_own_scope()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        f[..A: Display](t: (..A))
+            for const i in 0..<A.len
+                var here = str(t.i)
+                print(here)
+        f((1, 2))
+        """), "1\n2\n")
+
+@test("returns out of the enclosing function")
+tpk_returns_out_of_the_function()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        any_empty[..A: Display](t: (..A)) -> bool
+            for const i in 0..<A.len
+                if str(t.i).len == 0usize then return true
+            false
+        print(any_empty(("a", "")), any_empty(("a", "b")))
+        """), "true false\n")
+
+@test("wants a range known at compile time")
+tpk_wants_a_compile_time_range()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        f(n: usize)
+            for const i in 0..<n
+                print(i)
+        f(3usize)
+        """, "a 'for const' is unrolled, so its range must be known at compile time — 'A.len' for a type pack, a 'const', or a literal. A range computed at run time is what the ordinary 'for' walks")
+
+@test("wants a range at all")
+tpk_wants_a_range_at_all()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        f(xs: []int)
+            for const i in xs
+                print(i)
+        f([1, 2])
+        """, "a 'for const' walks a range with both ends written, as '0..<A.len' — it is unrolled into one copy of its body per value, so there is nothing else for it to iterate")
+
+// There is no loop at run time for either to act on: a `break` here would silently leave whatever
+// loop the `for const` happens to sit inside.
+@test("refuses 'break'")
+tpk_refuses_break()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        f[..A: Display](t: (..A))
+            for const i in 0..<A.len
+                break
+        f((1, 2))
+        """, "a 'for const' is unrolled into one copy of its body per value, so there is no loop for 'break' to act on — a loop that is walked at run time is the ordinary 'for'")
+
+@test("refuses 'continue'")
+tpk_refuses_continue()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        f[..A: Display](t: (..A))
+            for const i in 0..<A.len
+                continue
+        f((1, 2))
+        """, "a 'for const' is unrolled into one copy of its body per value, so there is no loop for 'continue' to act on — a loop that is walked at run time is the ordinary 'for'")
+
+@test("allows a real loop written inside the body to break")
+tpk_allows_an_inner_loop_to_break()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        f[..A: Display](t: (..A))
+            for const i in 0..<A.len
+                for n in 0..<5
+                    if n > 0 then break
+                    print(t.i)
+        f((1, 2))
+        """), "1\n2\n")
+
+@test("refuses 'break' even inside an enclosing loop")
+tpk_refuses_break_inside_an_outer_loop()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        f[..A: Display](t: (..A))
+            for n in 0..<2
+                for const i in 0..<A.len
+                    break
+        f((1, 2))
+        """, "so there is no loop for 'break' to act on")
+
+@test("refuses a range longer than it will unroll")
+tpk_refuses_a_range_too_long()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        f()
+            for const i in 0..<100
+                print(i)
+        f()
+        """, "a 'for const' over 100 values would emit that many copies of its body, and 64 is the most one is unrolled to — a loop this long is a run-time 'for', which costs one copy whatever it counts to")
+
+// The edge of that limit, read off the reference: it compares the distance between the two ends
+// against 64, so 65 copies are accepted and 66 are the first refused.
+@test("the unroll limit's edge is where the reference puts it")
+tpk_the_unroll_limit_edge()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_err("f()\n    for const i in 0..<65\n        print(i)\nf()\n"), "")
+    tpk_refused("f()\n    for const i in 0..<66\n        print(i)\nf()\n",
+                "a 'for const' over 66 values would emit that many copies of its body, and 64 is the most one is unrolled to")
+
+// ---- the edges ----
+
+// Zero copies, which is what an empty range unrolls to.
+@test("an empty range unrolls to nothing")
+tpk_an_empty_range_unrolls_to_nothing()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        f()
+            print("before")
+            for const i in 0..<0
+                print("never")
+            print("after")
+        f()
+        """), "before\nafter\n")
+
+@test("nested unrolled loops multiply")
+tpk_nested_unrolled_loops_multiply()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        f[..A: Display](t: (..A))
+            for const i in 0..<A.len
+                for const j in 0..<A.len
+                    print(t.i, t.j)
+        f((1, 2))
+        """), "1 1\n1 2\n2 1\n2 2\n")
+
+@test("one pack may stand in two parameters, at one arity")
+tpk_one_pack_in_two_parameters()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        zip_len[..A: Display](x: (..A), y: (..A)) -> usize = A.len
+        print(zip_len((1, 2), (3, 4)))
+        """), "2\n")
+
+// The reference (0.0.148) says "'x' of 'zip_len' is (int, int, int), but (int, int) was given":
+// its pack binding is the LAST argument's, where an ordinary parameter keeps the FIRST
+// (`same[T](x: T, y: T)` at `(a, "a")` blames 'y' in both compilers). This compiler keeps the first
+// for a pack too and blames 'y' -- a reported divergence, so what is asserted is the reference
+// suite's own claim: the two arities are refused, at a parameter of 'zip_len'.
+@test("and refuses two arities for one pack")
+tpk_refuses_two_arities_for_one_pack()
+    if !tpk_ready() then return
+
+    val out = tpk_err(raw"""
+        zip_len[..A: Display](x: (..A), y: (..A)) -> usize = A.len
+        print(zip_len((1, 2), (3, 4, 5)))
+        """)
+
+    assert(tpk_says(out, "of 'zip_len' is (int, int"), out)
+    assert(tpk_says(out, "was given"), out)
+
+// Every part is counted: strings built at run time are what makes this a real question.
+@test("counts the parts of a tuple whose members are refcounted")
+tpk_counts_refcounted_parts()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        var a = "x" + "y"
+        var b = "p" + "q"
+        val t = (a, b, a + b)
+        print(t)
+        print(t)
+        """), "(xy, pq, xypq)\n(xy, pq, xypq)\n")
+
+// Each part erased to a `&Display` individually, passed as it stands rather than as `&t.i`.
+@test("erases each part to a trait object on its own")
+tpk_erases_each_part()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        import sysl.buf.byte_sink
+        width(v: &Display) -> usize
+            var sink = byte_sink()
+            var out: *Writer = &sink
+            v.display(out, FormatSpec(0, -1, false))
+            sink.text().len
+        row[..A: Display](t: (..A)) -> usize
+            var n = 0usize
+            for const i in 0..<A.len
+                n = n + width(t.i)
+            n
+        print(row((1, "abc", true)))
+        """), "8\n")
+
+// A pack on a METHOD's own parameter list, which is a different position from a struct's.
+@test("may stand on a method of an ordinary struct")
+tpk_on_a_method_of_a_struct()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        struct Row
+            n: usize
+            take[..A: Display](*self, t: (..A))
+                for const i in 0..<A.len
+                    self.n = self.n + str(t.i).len
+        end Row
+        var r = Row(0usize)
+        r.take((1, "abc", true))
+        print(r.n)
+        """), "8\n")
+
+@test("and on a trait's member, which is the same list written another way")
+tpk_on_a_trait_member()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        trait Take
+            take[..A: Display](self, t: (..A)) -> usize
+        struct Row
+            n: usize
+        impl Take for Row
+            take[..A: Display](self, t: (..A)) -> usize
+                var total = self.n
+                for const i in 0..<A.len
+                    total = total + str(t.i).len
+                total
+        print(Row(0).take((1, "abc", true)))
+        """), "8\n")
+
+@test("a bound reaches one, and unrolls it at the instantiation")
+tpk_a_bound_reaches_one()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        trait Take
+            take[..A: Display](self, t: (..A)) -> usize
+        struct Row
+            n: usize
+        impl Take for Row
+            take[..A: Display](self, t: (..A)) -> usize
+                var total = self.n
+                for const i in 0..<A.len
+                    total = total + str(t.i).len
+                total
+        through[S: Take](s: S) -> usize = s.take((1, "abc", true))
+        print(through(Row(0)))
+        """), "8\n")
+
+@test("an object cannot, and the refusal names the member")
+tpk_an_object_cannot()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        trait Take
+            tag(self) -> usize
+            take[..A: Display](self, t: (..A)) -> usize
+        struct Row
+            n: usize
+        impl Take for Row
+            tag(self) -> usize = self.n
+            take[..A: Display](self, t: (..A)) -> usize = self.n
+        val o: &Take = Row(5)
+        print(o.take((1, "ab")))
+        """, "'take' of 'Take' declares type parameters of its own, so it is not a function until a call names them and no slot of a &Take's table can point at it — reach it through a bound, where the type is known")
+
+@test("reaches the parts through a reference receiver")
+tpk_through_a_reference_receiver()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[..A: Display] Tag for (..A)
+            tag(self) -> string
+                var s = ""
+                for const i in 0..<A.len
+                    s = s + str(self.i)
+                s
+        var t = (1, 2, 3)
+        var r = &t
+        print(r.tag())
+        """), "123\n")
+
+// ---- a pack in a signature ----
+
+@test("may be the result")
+tpk_may_be_the_result()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        pair[..A](t: (..A)) -> (..A) = t
+        print(pair((1, "x")))
+        """), "(1, x)\n")
+
+// Spreading a pack into an ARGUMENT LIST is expansion, which is not built; `..t` reads as a range
+// with an open end, and is refused as one.
+@test("is not spread into a call's arguments")
+tpk_is_not_spread_into_arguments()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        f[..A: Display](t: (..A))
+            print(..t)
+        f((1, 2))
+        """, "a range with an open end is only allowed in a slice index — as a value it would have to say what the missing bound is, and only the thing being indexed knows that. Write both ends")
+
+// ---- a compile-time index ----
+
+@test("selects a part by its value")
+tpk_selects_a_part_by_its_value()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        f[..A: Display](t: (..A))
+            for const i in 0..<A.len
+                print(t.i)
+        f(("x", "y"))
+        """), "x\ny\n")
+
+@test("names the constant when it runs past the end")
+tpk_names_the_constant_past_the_end()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        f[..A: Display](t: (..A))
+            for const i in 0..2
+                print(t.i)
+        f((1, 2))
+        """, "'i' is 2 here, and (int, int) has 2 parts — the parts are numbered from 0")
+
+// A struct's fields have names, and a number does not address one.
+@test("is refused on a struct")
+tpk_index_is_refused_on_a_struct()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        struct P
+            x: int
+            y: int
+        end P
+        f(p: P)
+            for const i in 0..<1
+                print(p.i)
+        f(P(1, 2))
+        """, "'i' is a compile-time index, and P is a struct — its fields are reached by name, and a position addresses the parts of a tuple")
+
+// ---- a pack's bound ----
+
+@test("distributes over the members")
+tpk_the_bound_distributes()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        show_all[..A: Display](t: (..A))
+            for const i in 0..<A.len
+                print(t.i)
+        show_all((1, 2.5, 'z'))
+        """), "1\n2.5\nz\n")
+
+// The membership is answered where the call is written, not inside a body already committed to.
+@test("is checked at the call, not inside the body")
+tpk_the_bound_is_checked_at_the_call()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        struct Q
+            x: int
+        end Q
+        show_all[..A: Display](t: (..A))
+            for const i in 0..<A.len
+                print(t.i)
+        show_all((1, Q(2)))
+        """, "'show_all' requires its type parameter 'A' to implement 'sysl.Display', but int, Q does not")
+
+// With no bound the parts promise nothing, and the complaint names the pack the way the reader
+// wrote it -- `A`, not the numbered stand-in the walk builds behind it.
+@test("reports the missing bound inside the body when nothing promises it")
+tpk_reports_the_missing_bound()
+    if !tpk_ready() then return
+
+    val out = tpk_err(raw"""
+        f[..A](t: (..A))
+            for const i in 0..<A.len
+                print(t.i)
+        f((1, 2))
+        """)
+
+    assert(tpk_says(out, "'print' needs 'A: sysl.Display'"), out)
+    assert(!tpk_says(out, "A#"), out)
+
+@test("'len' is the whole of what a pack offers")
+tpk_len_is_all_a_pack_offers()
+    if !tpk_ready() then return
+
+    tpk_refused("f[..A](t: (..A)) -> usize = A.size\nprint(f((1, 2)))\n",
+                "'..A' is a type pack, and 'len' — how many types it stands for — is the whole of what one offers; there is no 'A.size'")
+
+// ---- the body is checked at a representative arity of two ----
+
+// Nothing calls `f`, so this is the walk of the generic body reporting and nothing else.
+@test("reports a bound the body wants with no call anywhere")
+tpk_reports_a_bound_with_no_call()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        f[..A](t: (..A))
+            for const i in 0..<A.len
+                print(t.i)
+        print(1)
+        """, "'print' needs 'A: sysl.Display'")
+
+// The parts are two DIFFERENT types, so a body that would only work if they were the same is caught.
+@test("makes the parts two types rather than one")
+tpk_the_parts_are_two_types()
+    if !tpk_ready() then return
+
+    tpk_refused("f[..A: Display](t: (..A)) -> bool = t.0 == t.1\nprint(1)\n",
+                "'==' needs 'A: sysl.Eq'")
+
+// An arity mistake is the instantiation's to report, which has a real arity to be past.
+@test("leaves an arity mistake to the instantiation")
+tpk_leaves_arity_to_the_instantiation()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        f[..A: Display](t: (..A))
+            for const i in 0..2
+                print(t.i)
+        f((1, 2, 3))
+        """), "1\n2\n3\n")
+
+// ---- an 'impl' over every tuple ----
+
+@test("is filed under a shape of its own")
+tpk_filed_under_a_shape_of_its_own()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[..A: Display] Tag for (..A)
+            tag(self) -> string
+                var s = ""
+                for const i in 0..<A.len
+                    s = s + str(self.i)
+                s
+        print((1, 2).tag(), (1, 2, 3).tag(), ("a", "b", "c", "d").tag())
+        """), "12 123 abcd\n")
+
+@test("loses to a block written for one arity")
+tpk_loses_to_one_arity()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[..A: Display] Tag for (..A)
+            tag(self) -> string = "any"
+        impl[A: Display, B: Display] Tag for (A, B)
+            tag(self) -> string = "pair"
+        print((1, 2).tag(), (1, 2, 3).tag())
+        """), "pair any\n")
+
+@test("loses to a block written for one tuple type")
+tpk_loses_to_one_tuple_type()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[..A: Display] Tag for (..A)
+            tag(self) -> string = "any"
+        impl Tag for (int, int)
+            tag(self) -> string = "two ints"
+        print((1, 2).tag(), (1, "x").tag())
+        """), "two ints any\n")
+
+@test("makes two arities two instantiations")
+tpk_two_arities_two_instantiations()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        trait Size
+            size(self) -> usize
+        impl[..A] Size for (..A)
+            size(self) -> usize = A.len
+        print((1, 2).size(), (1, 2, 3, 4).size())
+        """), "2 4\n")
+
+// ---- the library's catalog ----
+
+@test("prints a tuple of any arity")
+tpk_prints_a_tuple_of_any_arity()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran("print((1, \"a\", true, 2.5))\n"), "(1, a, true, 2.5)\n")
+
+@test("prints a pair and a triple exactly as before")
+tpk_prints_a_pair_and_a_triple()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        print((1, "one"))
+        print(str((1, 2, 3)))
+        """), "(1, one)\n(1, 2, 3)\n")
+
+@test("pads the whole tuple as one field")
+tpk_pads_the_whole_tuple()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        val p = (1, 2)
+        print(f"[${p}%10s]", f"[${p}%-10s]")
+        """), "[    (1, 2)] [(1, 2)    ]\n")
+
+@test("compares wide tuples for equality")
+tpk_compares_wide_tuples()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran("print((1, 2, 3, 4) == (1, 2, 3, 4), (1, 2, 3, 4) == (1, 2, 9, 4))\n"),
+              "true false\n")
+
+// Lexicographic: every position runs the two-test ladder and all-tied ends `false`.
+@test("orders wide tuples lexicographically")
+tpk_orders_wide_tuples()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran("print((1, 1, 1, 2) < (1, 1, 1, 3), (1, 2, 0, 0) < (1, 1, 9, 9), (1, 2) < (1, 2))\n"),
+              "true false false\n")
+
+@test("hashes a wide tuple, and by the order of its parts")
+tpk_hashes_a_wide_tuple()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran("print((1, 2, 3, 4).hash() == (1, 2, 3, 4).hash(), (1, 2, 3, 4).hash() == (4, 3, 2, 1).hash())\n"),
+              "true false\n")
+
+@test("still refuses a tuple whose parts are not all printable")
+tpk_refuses_an_unprintable_part()
+    if !tpk_ready() then return
+
+    tpk_refused(raw"""
+        struct Q
+            x: int
+        end Q
+        print((1, Q(2)))
+        """, "cannot print a (int, Q) value — the 'impl' that covers it asks 'sysl.Display' of int, Q, which does not implement it")
+
+// The array block covers every length and the tuple block every arity, so the two compose.
+@test("prints an array of tuples")
+tpk_prints_an_array_of_tuples()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran(raw"""
+        var a: [2](int, int) = [(1, 2), (3, 4)]
+        print(a)
+        """), "[(1, 2), (3, 4)]\n")
+
+@test("prints a tuple of tuples")
+tpk_prints_a_tuple_of_tuples()
+    if !tpk_ready() then return
+
+    assert_eq(tpk_ran("print(((1, 2), (3, 4, 5)))\n"), "((1, 2), (3, 4, 5))\n")

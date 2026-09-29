@@ -93,7 +93,12 @@ call_bound_method(cx: &Analyzer, span: Span, receiver: TExpr, subject: Type, nam
         val written = m.params.at(i).typ
         val at = if names_own_tparam(written, m.tparams) then terms else open_terms
 
-        params.push((m.params.at(i).name, resolve_type(cx.an, scope, written, at)))
+        // **A tuple of the member's own pack is open at ANY arity**: the call is what says how many
+        // parts there are, so the argument is read bare rather than held to the two stand-ins.
+        val ty = if spreads_own_pack(written, m.tpacks) then Unknown
+        else resolve_type(cx.an, scope, written, at)
+
+        params.push((m.params.at(i).name, ty))
 
     if args.len() != params.len() && !m.variadic
         cx.an.bound_fault(cx.scope, span, s"$shown takes ${quantity(params.len(), "argument")}, but " +
@@ -156,6 +161,15 @@ end call_bound_method
 // arrow in a signature became.
 private names_own_tparam(t: TypeRef, tparams: Buf[string]) -> bool = *t.kind match
     NamedType(n, args) -> args.is_empty() && holds_string(tparams, n)
+    _ -> false
+
+// Whether a written type is `(..A)` over one of the member's own packs.
+private spreads_own_pack(t: TypeRef, tpacks: Buf[string]) -> bool = *t.kind match
+    TupleType(parts, _) -> parts.len() == 1 && is_own_pack(parts.at(0), tpacks)
+    _ -> false
+
+private is_own_pack(t: TypeRef, tpacks: Buf[string]) -> bool = *t.kind match
+    PackType(n) -> holds_string(tpacks, n)
     _ -> false
 
 // One binding, as a list of one.
