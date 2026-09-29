@@ -1,0 +1,105 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// **What the target provides is part of the run cache's key.** The capabilities a machine has are
+// what `package.hocon` declares -- `capabilities { … }` for the project, `targets { <t> { capabilities
+// { … } } }` for one machine -- and they decide whether a program is legal at all. None of that is a
+// source file, so a key over the sources alone replayed a binary built while `posix` stood after the
+// config had taken it away: the refusal the analysis owes was never reached. The sentence quoted is
+// the reference's (0.0.148), which refuses the second run of the same tree.
+
+private val rck_name: string = "package { name = \"probe\", version = \"0.1.0\" }\n"
+
+private val rck_posix_program: string = "import sysl.posix.tty.is_tty\n\nmain()\n    print(is_tty(1))\n"
+
+private rck_project(config: string) -> string
+    val root = make_temp_dir("sysl-rck-").unwrap()
+
+    write_text(s"$root/main.sysl", rck_posix_program).unwrap()
+    write_text(s"$root/package.hocon", rck_name + config).unwrap()
+    root
+
+private rck_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+
+private rck_key(root: string) -> Option[string] =
+    run_cache_key_for("run", root, None, DefaultOptimization, None)
+
+private rck_has(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+@test("a tree run with posix and then with posix taken away is refused, not replayed")
+rck_narrowing_is_refused_not_replayed()
+    if !std_root().is_ok() then return
+
+    val root = rck_project("")
+    val first = rck_run(["sysl", "run", root])
+
+    assert_eq(first.0, 0, first.1)
+    write_text(s"$root/package.hocon", rck_name + "capabilities { posix = false }\n").unwrap()
+
+    val second = rck_run(["sysl", "run", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(second.0 != 0, second.1)
+    assert(rck_has(second.1, s"error: this reaches 'sysl.posix.tty', which requires 'posix', and " +
+        s"'${host_target().name}' does not provide it — a target's capabilities are what " +
+        "'package.hocon' declares, so either this reference cannot be made on this machine or the " +
+        "config is understating it"), second.1)
+    assert(rck_has(second.1, s"/${basename(root)}/main.sysl:1:1\n"), second.1)
+end rck_narrowing_is_refused_not_replayed
+
+@test("two configs differing only in what the target provides key differently")
+rck_provides_changes_the_key()
+    if !std_root().is_ok() then return
+
+    val root = rck_project("")
+    val everything = rck_key(root)
+
+    write_text(s"$root/package.hocon", rck_name + "capabilities { posix = false }\n").unwrap()
+
+    val narrowed = rck_key(root)
+
+    write_text(s"$root/package.hocon", rck_name + s"targets { ${host_target().name} { " +
+        "capabilities { os = false } } }\n").unwrap()
+
+    val other = rck_key(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(everything.is_some() && narrowed.is_some() && other.is_some())
+    assert(everything.unwrap() != narrowed.unwrap(), "taking posix away is a different program")
+    assert(narrowed.unwrap() != other.unwrap(), "taking os away is a different program again")
+end rck_provides_changes_the_key
+
+// The key is over what the machine **provides**, not over how the file spelled it: the same set, in
+// either order or from the target's block rather than the project's, is one program.
+@test("the same provides keys the same, whatever order or block said it")
+rck_same_provides_same_key()
+    if !std_root().is_ok() then return
+
+    val root = rck_project("capabilities { os = false, posix = false }\n")
+    val first = rck_key(root)
+    val again = rck_key(root)
+
+    write_text(s"$root/package.hocon", rck_name + "capabilities { posix = false, os = false }\n").unwrap()
+
+    val reordered = rck_key(root)
+
+    write_text(s"$root/package.hocon", rck_name + s"targets { ${host_target().name} { " +
+        "capabilities { posix = false, os = false } } }\n").unwrap()
+
+    val per_target = rck_key(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(first.is_some() && again.is_some() && reordered.is_some() && per_target.is_some())
+    assert_eq(again.unwrap(), first.unwrap())
+    assert_eq(reordered.unwrap(), first.unwrap())
+    assert_eq(per_target.unwrap(), first.unwrap())
+end rck_same_provides_same_key
