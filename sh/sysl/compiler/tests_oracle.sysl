@@ -466,6 +466,9 @@ struct TableAgreement
     mismatched: usize
     skipped: usize
     first_bad: string
+
+    // The blocks whose set of sections was compared.
+    sections: usize
 end TableAgreement
 
 // The reference compiler's declaration tables for one file.
@@ -570,6 +573,27 @@ private compare_tables(binary: string, path: string, label: string, text: string
         return
     end if
 
+    // **The set of sections is compared as well as the rows**, since a per-key comparison of one
+    // section cannot see a section that is missing: a table printing `funcs:` alone agreed with the
+    // reference on every row it had.
+    var alone: Buf[Program] = buf()
+
+    alone.push(parsed.program)
+
+    val done = analyze_bodies(alone, host_target())
+    val our_sections = section_heads(show_tables(program_of(done, done.main_module)))
+    val their_sections = section_heads(theirs.unwrap())
+
+    found.sections += 1
+
+    if our_sections != their_sections
+        found.mismatched += 1
+
+        if found.mismatched <= 12 then
+            found.first_bad = s"${found.first_bad}\n$label: reference sections [$their_sections] " +
+                              s"ours [$our_sections]"
+    end if
+
     val rows = funcs_rows(theirs.unwrap())
 
     for i in 0..<ours.len()
@@ -587,6 +611,16 @@ private compare_tables(binary: string, path: string, label: string, text: string
                     found.first_bad = s"${found.first_bad}\n$label: reference " +
                                       s"[${theirs_row.unwrap()}] ours [${mine.1}]"
 end compare_tables
+
+// The lines of a tables answer that open a section, in the order printed, joined by spaces.
+private section_heads(text: string) -> string
+    var out = ""
+
+    for line in split(text, "\n")
+        if line != "" && !line.starts_with(" ") then out = if out == "" then line else s"$out $line"
+
+    out
+end section_heads
 
 private row_named(rows: Buf[(string, string)], key: string) -> Option[string]
     for i in 0..<rows.len()
@@ -612,7 +646,7 @@ the_declaration_tables_agree()
             val dir = make_temp_dir("sysl-tables").unwrap()
             val scratch = dir + "/block.sysl"
 
-            var found = TableAgreement(0, 0, 0, "")
+            var found = TableAgreement(0, 0, 0, "", 0)
 
             for item in walk(root)
                 item match
@@ -632,12 +666,14 @@ the_declaration_tables_agree()
             remove_file(scratch)
 
             val tables = s"declaration tables: ${found.files} files compared, " +
+                         s"${found.sections} section sets compared, " +
                          s"${found.mismatched} mismatched, ${found.skipped} skipped"
 
             print(tables)
             record_summary(s"$tables${found.first_bad}")
 
             assert(found.files > 0, "the sweep compared something")
+            assert(found.sections > 0, "and compared the sections as well as the rows")
             assert_eq(found.first_bad, "")
             assert_eq(found.mismatched, 0)
 end the_declaration_tables_agree

@@ -1,0 +1,241 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+
+// `sysl emit-typed --tables`: a program's declaration tables rather than its tree -- every struct,
+// enum, trait implementation, extern, module `val` and function the lowered program carries, sorted
+// by name, with every field and parameter's type written as a diagnostic would write it.
+//
+// **It is a second rendering of the same `TProgram` the tree printer reads**, not a reading of the
+// declarations: what it holds is what the program *reached*, the library's functions and storage
+// included, and a function nobody calls is here only where the program declared it itself. So the
+// seven sections are always all present, each possibly empty, in the reference compiler's order.
+//
+// A trait's own declaration carries no row: a trait survives lowering only as the tables its `impl`s
+// produced, so `traits:` is the distinct names those tables implement. `impls:` groups the tables
+// by the trait and the implementing type, since `*Shape` and `&Shape` are two tables for one
+// `impl Shape for Circle`.
+show_tables(p: TProgram) -> string
+    var out = str_builder()
+
+    out.push("structs:\n")
+
+    val structs = by_key(p.structs.len(), (i) -> table_name(p.structs.at(i)))
+
+    for i in 0..<structs.len()
+        val t = p.structs.at(structs.at(i))
+
+        table_row(&out, "  ", table_name(t))
+
+        for f in table_fields(t).view()
+            table_row(&out, "    ", s"${f.0}: ${type_show(f.1)}")
+
+    out.push("enums:\n")
+
+    val enums = by_key(p.enums.len(), (i) -> table_name(p.enums.at(i)))
+
+    for i in 0..<enums.len()
+        val t = p.enums.at(enums.at(i))
+
+        table_row(&out, "  ", table_name(t))
+        t match
+            Enum(d) -> write_variants(&out, d.variants)
+            _ -> ()
+
+    out.push("traits:\n")
+
+    var traits: Buf[string] = buf()
+
+    for i in 0..<p.vtables.len()
+        if !has_name(traits, p.vtables.at(i).trait_name) then traits.push(p.vtables.at(i).trait_name)
+
+    for name in sort_names(traits).view()
+        table_row(&out, "  ", name)
+
+    out.push("impls:\n")
+    write_impls(&out, p.vtables)
+    out.push("externs:\n")
+
+    val externs = by_key(p.externs.len(), (i) -> p.externs.at(i).name)
+
+    for i in 0..<externs.len()
+        val e = p.externs.at(externs.at(i))
+
+        table_row(&out, "  ", s"${e.name}(${joined_types(e.params)}) -> ${type_show(e.ret_ty)}")
+
+    out.push("consts:\n")
+
+    val vals = by_key(p.vals.len(), (i) -> p.vals.at(i).symbol)
+
+    for i in 0..<vals.len()
+        val v = p.vals.at(vals.at(i))
+
+        table_row(&out, "  ", s"${v.symbol}: ${type_show(v.ty)}")
+
+    out.push("funcs:\n")
+
+    val funcs = by_key(p.funcs.len(), (i) -> p.funcs.at(i).name)
+
+    for i in 0..<funcs.len()
+        val f = p.funcs.at(funcs.at(i))
+        var params = str_builder()
+
+        for j in 0..<f.params.len()
+            if j > 0 then params.push(", ")
+
+            params.push(s"${f.params.at(j).0}: ${type_show(f.params.at(j).1)}")
+
+        table_row(&out, "  ", s"${f.name}(${params.finish()}) -> ${type_show(f.ret_ty)}")
+
+    out.finish()
+end show_tables
+
+// Every `(trait, type)` pair the tables implement, each followed by the distinct slots of every
+// table for that pair, sorted by what they call.
+private write_impls(out: *StrBuilder, vtables: Buf[TVtable])
+    var pairs: Buf[(string, string)] = buf()
+
+    for i in 0..<vtables.len()
+        val pair = (vtables.at(i).trait_name, type_show(vtables.at(i).for_type))
+
+        if !has_pair(pairs, pair) then pairs.push(pair)
+
+    // Sorted by the trait and then by the type: each trait, in order, takes its pairs in the type's
+    // order.
+    val order = by_key(pairs.len(), (i) -> pairs.at(i).0)
+    val by_type = by_key(pairs.len(), (i) -> pairs.at(i).1)
+    var sorted: Buf[usize] = buf()
+
+    for i in 0..<order.len()
+        if i == 0 || pairs.at(order.at(i)).0 != pairs.at(order.at(i - 1)).0
+            val t = pairs.at(order.at(i)).0
+
+            for j in 0..<by_type.len()
+                if pairs.at(by_type.at(j)).0 == t then sorted.push(by_type.at(j))
+        end if
+
+    for i in 0..<sorted.len()
+        val pair = pairs.at(sorted.at(i))
+        var slots: Buf[TVSlot] = buf()
+
+        table_row(out, "  ", s"${pair.0} for ${pair.1}")
+
+        for j in 0..<vtables.len()
+            val v = vtables.at(j)
+
+            if v.trait_name == pair.0 && type_show(v.for_type) == pair.1
+                for k in 0..<v.slots.len()
+                    if !has_slot(slots, v.slots.at(k).target) then slots.push(v.slots.at(k))
+            end if
+
+        val slot_order = by_key(slots.len(), (k) -> slots.at(k).target)
+
+        for k in 0..<slot_order.len()
+            val s = slots.at(slot_order.at(k))
+
+            table_row(out, "    ", s"${s.target}(${joined_types(s.params)}) -> ${type_show(s.ret_ty)}")
+end write_impls
+
+private write_variants(out: *StrBuilder, variants: Buf[EnumVariant])
+    val order = by_key(variants.len(), (i) -> pad_tag(variants.at(i).tag))
+
+    for i in 0..<order.len()
+        val v = variants.at(order.at(i))
+        var line = s"${v.name} = ${v.tag}"
+
+        if v.carries
+            var fields = str_builder()
+
+            for j in 0..<v.fields.len()
+                if j > 0 then fields.push(", ")
+
+                fields.push(s"${v.fields.at(j).0}: ${type_show(v.fields.at(j).1)}")
+
+            line = s"$line (${fields.finish()})"
+        end if
+
+        table_row(out, "    ", line)
+end write_variants
+
+// A tag as a key that sorts the way the number does, a tag being never negative.
+private pad_tag(tag: int) -> string
+    var digits = s"$tag"
+
+    while digits.len < 20
+        digits = "0" + digits
+
+    digits
+end pad_tag
+
+// The name a struct or an enum is filed under: its module, a `$`, and its name at its arguments --
+// except a tuple, which the compiler declares and which is filed under its parentheses.
+private table_name(t: Type) -> string = t match
+    Struct(d) -> if is_tuple(d) then type_show(t) else d.name()
+    Results(d) -> d.name()
+    Enum(d) -> d.name()
+    _ -> type_show(t)
+
+private table_fields(t: Type) -> Buf[(string, Type)] = t match
+    Struct(d) -> d.fields
+    Results(d) -> d.fields
+    _ -> buf()
+
+private table_row(out: *StrBuilder, indent: string, text: string)
+    out.push(indent)
+    out.push(text)
+    out.push_char('\n')
+
+private joined_types(xs: Buf[Type]) -> string
+    var out = str_builder()
+
+    for i in 0..<xs.len()
+        if i > 0 then out.push(", ")
+
+        out.push(type_show(xs.at(i)))
+
+    out.finish()
+end joined_types
+
+// The indices `0..<n` in the order of their keys, ties kept in their original order.
+private by_key(n: usize, key: &Fn(usize) -> string) -> Buf[usize]
+    var keys: Buf[string] = buf()
+    var order: Buf[usize] = buf()
+
+    for i in 0..<n
+        keys.push(key(i))
+        order.push(i)
+
+    for i in 1..<n
+        var j = i
+
+        while j > 0 && keys.at(order.at(j)) < keys.at(order.at(j - 1))
+            val held = order.at(j)
+
+            order.set(j, order.at(j - 1))
+            order.set(j - 1, held)
+            j -= 1
+
+    order
+end by_key
+
+private has_name(xs: Buf[string], name: string) -> bool
+    for x in xs.view()
+        if x == name then return true
+
+    false
+end has_name
+
+private has_pair(xs: Buf[(string, string)], pair: (string, string)) -> bool
+    for x in xs.view()
+        if x.0 == pair.0 && x.1 == pair.1 then return true
+
+    false
+end has_pair
+
+private has_slot(xs: Buf[TVSlot], target: string) -> bool
+    for x in xs.view()
+        if x.target == target then return true
+
+    false
+end has_slot
