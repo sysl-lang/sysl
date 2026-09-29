@@ -1562,6 +1562,16 @@ private builtin_operator_method(cx: &Analyzer, span: Span, receiver: TExpr, rty:
 
     val rhs = type_expr(cx, args.at(0), Some(rty))
 
+    // The call is checked against the trait's signature, whose argument is `Self` — so on this
+    // receiver an argument of any other type is the wrong thing to hand it, named as the trait
+    // names its parameter.
+    if disagree(texpr_type(rhs), rty)
+        cx.fault(args.at(0).span, s"'${operator_param_name(cx, declaring.unwrap(), name)}' of " +
+                 s"'${declaring.unwrap()}.$name' is ${type_show(rty)}, but " +
+                 s"${type_show(texpr_type(rhs))} was given")
+        return Some(bad_expr(span))
+    end if
+
     if kind == Compare
         var ts: Buf[TExpr] = buf()
         var cmps: Buf[TCmp] = buf()
@@ -1578,6 +1588,24 @@ private builtin_operator_method(cx: &Analyzer, span: Span, receiver: TExpr, rty:
 
     Some(produced(TExpr(span, TBinary(op, receiver, rhs, ty))))
 end builtin_operator_method
+
+// What the catalog trait calls its method's one parameter (`rhs` throughout the standard module),
+// read off the declaration rather than assumed.
+private operator_param_name(cx: &Analyzer, trait_name: string, method: string) -> string
+    val found = catalog_key(cx.an, trait_name)
+
+    if found.is_none() then return "rhs"
+
+    val d = trait_decl_at(cx.an, found.unwrap())
+
+    if d.is_none() then return "rhs"
+
+    val m = trait_method(d.unwrap(), method)
+
+    if m.is_none() || m.unwrap().params.is_empty() then return "rhs"
+
+    m.unwrap().params.at(0).name
+end operator_param_name
 
 // The trait a compiler-provided receiverless member is declared by, as a diagnostic spells it —
 // `Zero` and `One` for the identities, `Bits` for a width.
