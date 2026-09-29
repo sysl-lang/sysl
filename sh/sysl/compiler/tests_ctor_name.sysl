@@ -1,0 +1,381 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A construction's count and naming refusals quote the DECLARATION, not the spelling.** A program
+// that imported `b.T` and wrote a bare `T` is told about `struct 'b.T'`, since the bare name says
+// nothing about which module's fields are being counted. A type the entry file declares has no module
+// to put in front, so it reads as it always did; a variant is quoted bare.
+//
+// **Every refusal quoted here was obtained by running the reference compiler on the same tree**, the
+// position included -- save that a field's type refusal names the struct as the count refusals do,
+// where the reference writes its internal `b$T`.
+
+private can_module_b() -> string =
+    "module b\n\nstruct T\n    x: int\n\nstruct P\n    x: int\n    y: int\n\n" +
+    "struct G[A]\n    a: A\n\nenum E\n    V(n: int)\n"
+
+// What the build of a tree said, with the tree's root replaced by `<root>` so a position can be
+// quoted whole.
+private can_report(files: Buf[(string, string, string)]) -> string
+    val root = make_temp_dir("sysl-ctor-name").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for i in 0..<files.len()
+        val f = files.at(i)
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    val exe = root + "/built"
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        // A temporary directory can come back with a doubled separator, and a diagnostic quotes the
+        // path the tree was walked from, which has none.
+        Err(why) -> replace_all(failure_text(why), replace_all(root, "//", "/"), "<root>")
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Ok(out) -> "it printed: " + out.text
+            Err(_) -> "it built, and what was built could not be run"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end can_report
+
+// Whether a report holds a diagnostic, and the whole report where it does not -- the runner shows a
+// failing test's output, which is the only place a reader learns what was said instead.
+private can_says(report: string, want: string) -> bool
+    if report.contains(want) then return true
+
+    print(report)
+    false
+end can_says
+
+private can_skipped() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end can_skipped
+
+private can_imported() -> string
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("b", "b.sysl", can_module_b()))
+    fs.push(("", "main.sysl",
+             "import b.{T, P, G}\nval t = T(1, 2)\nval u = T()\nval w = T(y = 1)\n" +
+             "val p = P(x = 1)\nval g = G(1, 2)\nprint(0)\n"))
+    can_report(fs)
+end can_imported
+
+@test("an imported struct built with too many values is quoted by its module")
+can_too_many_values_name_the_module()
+    if can_skipped() then return
+
+    assert(can_says(can_imported(),
+        "error: struct 'b.T' has 1 field, but 2 values were given\n --> <root>/main.sysl:2:9\n"))
+
+@test("and with too few")
+can_too_few_values_name_the_module()
+    if can_skipped() then return
+
+    assert(can_says(can_imported(),
+        "error: struct 'b.T' has 1 field, but 0 values were given\n --> <root>/main.sysl:3:9\n"))
+
+@test("a named value that names no field of an imported struct")
+can_a_name_no_field_has_names_the_module()
+    if can_skipped() then return
+
+    assert(can_says(can_imported(),
+        "error: struct 'b.T' declares no parameter named 'y' — it takes 'x'\n" +
+        " --> <root>/main.sysl:4:11\n"))
+
+@test("a construction by name that leaves a field of an imported struct out")
+can_a_field_left_out_names_the_module()
+    if can_skipped() then return
+
+    assert(can_says(can_imported(),
+        "error: struct 'b.P' was given no value for 'y', and that parameter declares no default\n" +
+        " --> <root>/main.sysl:5:9\n"))
+
+@test("an imported generic struct is quoted by its module too, and without its type arguments")
+can_a_generic_struct_names_the_module()
+    if can_skipped() then return
+
+    assert(can_says(can_imported(),
+        "error: struct 'b.G' has 1 field, but 2 values were given\n --> <root>/main.sysl:6:9\n"))
+
+private can_elsewhere() -> string
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("b", "b.sysl", can_module_b() + "\nmk() -> T = T(1, 2)\n"))
+    fs.push(("c.d", "d.sysl", "module c.d\n\nstruct T\n    x: int\n"))
+    fs.push(("", "main.sysl",
+             "import b.{P, E}\nimport c.d.T\nval e = E.V(1, 2)\nval f = T(1, 2)\n" +
+             "val n = P(1, 2) match\n    P(q) -> q\nprint(0)\n"))
+    can_report(fs)
+end can_elsewhere
+
+@test("a struct built inside its own module is still quoted by the module")
+can_its_own_module_is_named()
+    if can_skipped() then return
+
+    assert(can_says(can_elsewhere(),
+        "error: struct 'b.T' has 1 field, but 2 values were given\n  --> <root>/b/b.sysl:16:13\n"))
+
+@test("a nested module is quoted whole")
+can_a_nested_module_is_named_whole()
+    if can_skipped() then return
+
+    assert(can_says(can_elsewhere(),
+        "error: struct 'c.d.T' has 1 field, but 2 values were given\n --> <root>/main.sysl:4:9\n"))
+
+@test("a variant built with too many values is quoted bare")
+can_a_variant_is_quoted_bare()
+    if can_skipped() then return
+
+    assert(can_says(can_elsewhere(),
+        "error: variant 'V' has 1 field, but 2 values were given\n --> <root>/main.sysl:3:11\n"))
+
+@test("a positional pattern over an imported struct is quoted by its module")
+can_a_pattern_names_the_module()
+    if can_skipped() then return
+
+    assert(can_says(can_elsewhere(),
+        "error: struct 'b.P' has 2 fields, but 1 sub-pattern was given\n" +
+        " --> <root>/main.sysl:6:5\n"))
+
+@test("a struct the entry file declares has no module to quote")
+can_the_entry_files_struct_is_bare()
+    if can_skipped() then return
+
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("", "main.sysl",
+             "struct L\n    x: int\n\nval l = L(1, 2)\nval m = L(q = 1)\nprint(0)\n"))
+
+    val said = can_report(fs)
+
+    assert(can_says(said,
+        "error: struct 'L' has 1 field, but 2 values were given\n --> <root>/main.sysl:4:9\n"))
+    assert(can_says(said,
+        "error: struct 'L' declares no parameter named 'q' — it takes 'x'\n" +
+        " --> <root>/main.sysl:5:11\n"))
+end can_the_entry_files_struct_is_bare
+
+// -- a field given a value of the wrong type ----------------------------------------------------------
+
+private can_mismatched() -> string
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("b", "b.sysl", can_module_b() + "\nmk() -> T = T(\"s\")\n"))
+    fs.push(("", "main.sysl", "import b.T\nval a = T(\"s\")\nprint(0)\n"))
+    can_report(fs)
+end can_mismatched
+
+@test("a field of an imported struct given the wrong type names the struct by its module")
+can_a_mismatched_field_names_the_module()
+    if can_skipped() then return
+
+    assert(can_says(can_mismatched(),
+        "error: 'x' of 'b.T' is int, but string was given\n --> <root>/main.sysl:2:11\n"))
+
+@test("and so does one built inside the struct's own module")
+can_a_mismatched_field_in_its_own_module_names_the_module()
+    if can_skipped() then return
+
+    assert(can_says(can_mismatched(),
+        "error: 'x' of 'b.T' is int, but string was given\n  --> <root>/b/b.sysl:16:15\n"))
+
+@test("a field of a struct the entry file declares is quoted bare")
+can_a_mismatched_field_of_the_entry_files_struct_is_bare()
+    if can_skipped() then return
+
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("", "main.sysl", "struct L\n    x: int\n\nval l = L(\"s\")\nprint(0)\n"))
+
+    assert(can_says(can_report(fs),
+        "error: 'x' of 'L' is int, but string was given\n --> <root>/main.sysl:4:11\n"))
+
+// -- a constructor written through its module ----------------------------------------------------------
+//
+// **A refusal about the construction points at the NAME after the dot**, `T` in `d.T(1, 2)`, since it
+// is that name the refusal is about; one about a value points at the value.
+
+private can_qualified() -> string
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("b", "b.sysl", can_module_b()))
+    fs.push(("c.d", "d.sysl", "module c.d\n\nstruct T\n    x: int\n"))
+    fs.push(("", "main.sysl",
+             "import b\nimport c.d\nval a = d.T(1, 2)\nval z = d.T(y = 1)\nval q = b.P(x = 1)\n" +
+             "val e = d.T(\"s\")\nprint(0)\n"))
+    can_report(fs)
+end can_qualified
+
+@test("a qualified constructor given too many values is refused at the struct's name")
+can_a_qualified_count_points_at_the_name()
+    if can_skipped() then return
+
+    assert(can_says(can_qualified(),
+        "error: struct 'c.d.T' has 1 field, but 2 values were given\n --> <root>/main.sysl:3:11\n"))
+
+@test("a qualified constructor naming no field is refused at the named value")
+can_a_qualified_unknown_name_points_at_the_value()
+    if can_skipped() then return
+
+    assert(can_says(can_qualified(),
+        "error: struct 'c.d.T' declares no parameter named 'y' — it takes 'x'\n" +
+        " --> <root>/main.sysl:4:13\n"))
+
+@test("a qualified constructor leaving a field out is refused at the struct's name")
+can_a_qualified_missing_field_points_at_the_name()
+    if can_skipped() then return
+
+    assert(can_says(can_qualified(),
+        "error: struct 'b.P' was given no value for 'y', and that parameter declares no default\n" +
+        " --> <root>/main.sysl:5:11\n"))
+
+@test("a qualified constructor given a value of the wrong type is refused at the value")
+can_a_qualified_mismatch_points_at_the_value()
+    if can_skipped() then return
+
+    assert(can_says(can_qualified(),
+        "error: 'x' of 'c.d.T' is int, but string was given\n --> <root>/main.sysl:6:13\n"))
+
+private can_qualified_variants() -> string
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("b", "b.sysl", "module b\n\nenum E\n    V(n: int)\n"))
+    fs.push(("", "main.sysl",
+             "import b.E\nval f = E.V(1, 2)\nval g = E.V(\"s\")\nprint(0)\n"))
+    can_report(fs)
+end can_qualified_variants
+
+@test("a variant written through its enum given too many values is refused at the variant's name")
+can_a_qualified_variant_count_points_at_the_name()
+    if can_skipped() then return
+
+    assert(can_says(can_qualified_variants(),
+        "error: variant 'V' has 1 field, but 2 values were given\n --> <root>/main.sysl:2:11\n"))
+
+@test("a variant written through its enum given the wrong type is refused at the value")
+can_a_qualified_variant_mismatch_points_at_the_value()
+    if can_skipped() then return
+
+    assert(can_says(can_qualified_variants(),
+        "error: 'n' of 'V' is int, but string was given\n --> <root>/main.sysl:3:13\n"))
+
+// -- an imported generic struct with its type arguments written ------------------------------------
+
+@test("an imported generic struct built with its type arguments written compiles and runs")
+can_an_imported_generic_struct_takes_written_type_arguments()
+    if can_skipped() then return
+
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("b", "b.sysl", "module b\n\nstruct G[T]\n    x: T\n"))
+    fs.push(("", "main.sysl", "import b.G\nval g = G[int](1)\nprint(g.x)\n"))
+
+    assert(can_says(can_report(fs), "it printed: 1\n"))
+end can_an_imported_generic_struct_takes_written_type_arguments
+
+// -- a type-argument list written on a qualified name -----------------------------------------------
+//
+// `reference/generics.md § Writing the type arguments` writes a list on a function "qualified or
+// not", on a constructor and on a variant, and a qualified name reaches whatever the unqualified one
+// does. The refusals quote what the reader wrote -- `b.Maybe`, never the key the module keeps it
+// under.
+
+private can_q_module_b() -> string =
+    "module b\n\nstruct G[T]\n    x: T\n    y: string\n\nstruct Pair[K, V]\n    key: K\n" +
+    "    value: V\n\nenum Maybe[T]\n    Just(v: T)\n    Nothing\n\nstruct Box[T]\n    v: T\n" +
+    "    of(x: T) -> Self = Box(x)\n\nf[T](x: T) -> usize = sizeof(T)\n"
+
+private can_q(main: string) -> string
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("b", "b.sysl", can_q_module_b()))
+    fs.push(("", "main.sysl", main))
+    can_report(fs)
+end can_q
+
+@test("a qualified generic struct takes one written type argument")
+can_q_a_constructor_takes_one_argument()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval g = b.G[int](1, \"s\")\nprint(g.x, g.y)\n"),
+                    "it printed: 1 s\n"))
+
+@test("a qualified generic struct takes a written list")
+can_q_a_constructor_takes_a_list()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval p = b.Pair[u8, real](7, 2.5)\n" +
+                          "print(p.key, p.value, sizeof(b.Pair[u8, real]))\n"),
+                    "it printed: 7 2.5 16\n"))
+
+@test("a qualified generic function takes a written type argument")
+can_q_a_free_function()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nprint(b.f[u8](3), b.f[i64](3))\n"), "it printed: 1 8\n"))
+
+@test("a variant carrying a payload is built through a qualified generic enum")
+can_q_a_variant_carrying_a_payload()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval m = b.Maybe[int].Just(3)\nval n = m match\n" +
+                          "    b.Maybe.Just(v) -> v\n    b.Maybe.Nothing -> 0\nprint(n)\n"),
+                    "it printed: 3\n"))
+
+@test("a variant carrying nothing is named through a qualified generic enum")
+can_q_a_variant_carrying_nothing()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval m = b.Maybe[string].Nothing\nval n = m match\n" +
+                          "    b.Maybe.Just(v) -> v\n    b.Maybe.Nothing -> \"none\"\nprint(n)\n"),
+                    "it printed: none\n"))
+
+@test("the fields of a qualified generic struct are checked against the written instantiation")
+can_q_the_fields_are_checked_against_it()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval g = b.G[real](1, \"s\")\nprint(g.x)\n"),
+                    "error: 'x' of 'b.G[real]' is real, but int was given\n" +
+                    " --> <root>/main.sysl:3:19\n"))
+
+@test("a qualified enum name applied to arguments is refused by its written name")
+can_q_an_enum_name_applied_to_arguments()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval m = b.Maybe[int](1)\nprint(1)\n"),
+                    "error: 'b.Maybe' is an enum, so it is not built by calling its name — a " +
+                    "variant is what carries a value, as 'b.Maybe[…].Name(…)'\n" +
+                    " --> <root>/main.sysl:3:16\n"))
+
+@test("an associated function selected from a qualified generic type with a written list is refused")
+can_q_an_associated_function_is_asked_for_on_the_binding()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b\n\nval x = b.Box[int].of(1)\nprint(x.v)\n"),
+                    "error: 'b.Box' cannot be given type arguments where 'of' is selected from " +
+                    "it; write the type on what receives the result — 'var x: b.Box[…] = …' — and " +
+                    "select 'of' from the plain name\n --> <root>/main.sysl:3:20\n"))
+
+@test("and so is one selected from the imported name written bare")
+can_q_an_associated_function_on_the_bare_name()
+    if can_skipped() then return
+
+    assert(can_says(can_q("import b.{Box}\n\nval x = Box[int].of(1)\nprint(x.v)\n"),
+                    "error: 'Box' cannot be given type arguments where 'of' is selected from it; " +
+                    "write the type on what receives the result — 'var x: Box[…] = …' — and " +
+                    "select 'of' from the plain name\n --> <root>/main.sysl:3:18\n"))

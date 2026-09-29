@@ -141,7 +141,8 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                 var one_targ: Buf[Expr] = buf()
 
                 one_targ.push(one)
-                return applied_type_call(cx, span, name.unwrap(), one_targ, args, expected)
+                return applied_type_call(cx, span, bracket_after(head), name.unwrap(), one_targ,
+                                         args, expected)
             end if
 
             // `x.m[T](…)` -- the same list on a METHOD.
@@ -172,6 +173,14 @@ call_expr(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
             type_attr_call(cx, span, name.unwrap(), attr, args)
         Field(receiver, member) ->
+            // `Maybe[int].Just(3)` and `b.Maybe[int].Just(3)` -- a selection from a generic type
+            // the reader wrote the instantiation of.
+            val on_type_args = written_on_generic_type(cx, receiver)
+
+            if on_type_args.is_some() then
+                return type_args_at_selection(cx, span, on_type_args.unwrap().0,
+                                              on_type_args.unwrap().1, member, args)
+
             val dotted = module_path_of(receiver, member)
 
             if dotted.is_some() && names_a_function(cx, dotted.unwrap()) then
@@ -327,15 +336,20 @@ private written_call(cx: &Analyzer, span: Span, head: Expr, targs: Buf[Expr], ar
     // plainly as an annotation on what receives it would.
     if cx.lookup(name.unwrap()).is_none() && !names_a_function(cx, name.unwrap()) &&
        lookup_type_key(cx.an, cx.scope, name.unwrap()).is_some() then
-        return applied_type_call(cx, span, name.unwrap(), targs, args, expected)
+        return applied_type_call(cx, span, bracket_after(head), name.unwrap(), targs, args,
+                                 expected)
 
     written_generic_call(cx, span, name.unwrap(), targs, args, expected)
 end written_call
 
 // A type application in call position: the type's own arguments are what the reader wrote, and what
 // is called is the constructor those arguments name.
-private applied_type_call(cx: &Analyzer, span: Span, name: string, targ_exprs: Buf[Expr],
-                          args: Buf[Expr], expected: Option[Type]) -> TExpr
+//
+// **A generic enum's name is not a constructor at all**, so what it is owed is the sentence about
+// variants rather than a type it cannot build -- quoting the name as written, `b.Maybe`, and
+// anchored at the bracket, which is where the reading as a construction went wrong.
+private applied_type_call(cx: &Analyzer, span: Span, bracket: Span, name: string,
+                          targ_exprs: Buf[Expr], args: Buf[Expr], expected: Option[Type]) -> TExpr
     val key = lookup_type_key(cx.an, cx.scope, name).unwrap()
     var targs: Buf[Type] = buf()
 
@@ -344,8 +358,99 @@ private applied_type_call(cx: &Analyzer, span: Span, name: string, targ_exprs: B
 
     cx.an.tables.types.get(key).unwrap().kind match
         StructOf(_) -> struct_call(cx, span, key, name, args, expected, targs)
+        EnumOf(ed) ->
+            if ed.tparams.is_empty() then
+                return cx.err(span, "this is not something that can be called")
+
+            cx.err(bracket, s"'$name' is an enum, so it is not built by calling its name — a variant " +
+                   s"is what carries a value, as '$name[…].Name(…)'")
         _ -> cx.err(span, "this is not something that can be called")
 end applied_type_call
+
+// Where the `[` of a list written straight after `head` sits, which is the anchor a refusal of the
+// list takes. An index node's own span runs from its head, so the bracket is the offset the head
+// ends at.
+private bracket_after(head: Expr) -> Span = Span(head.span.end, head.span.end + 1)
+
+// The generic struct or enum a type-argument list is written on -- bare, or reached through the
+// module that declares it -- as the key it is filed under and the spelling a refusal quotes back. A
+// local of the name stands in front, since then the brackets are a subscript.
+generic_type_head(cx: &Analyzer, head: Expr) -> Option[(string, string)]
+    val written = written_name_of(head)
+
+    if written.is_none() || local_head(cx, head) then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+
+    if key.is_none() then return None
+
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return None
+
+    val generic = decl.unwrap().kind match
+        StructOf(sd) -> !sd.tparams.is_empty()
+        EnumOf(ed) -> !ed.tparams.is_empty()
+        _ -> false
+
+    if generic then Some((key.unwrap(), written.unwrap())) else None
+end generic_type_head
+
+// The head and the list of `H[A]` or `H[A, B]` where the brackets are written on a generic type,
+// which is what a selection after them is made from.
+written_on_generic_type(cx: &Analyzer, e: Expr) -> Option[((string, string), Buf[Expr])]
+    var head = e
+    var targs: Buf[Expr] = buf()
+
+    *e.kind match
+        Index(h, one) ->
+            head = h
+            targs.push(one)
+        TypeArgs(h, list) ->
+            head = h
+            targs = list
+        _ -> return None
+
+    val found = generic_type_head(cx, head)
+
+    if found.is_none() then return None
+
+    Some((found.unwrap(), targs))
+end written_on_generic_type
+
+// `Maybe[int].Just(3)`, and `b.Maybe[string].Nothing` with nothing called -- a variant selected from
+// the instantiation its enum's name was written at. **A variant is the only thing a written list
+// may be selected from**: an associated function takes its type from what receives the result, so
+// the list is refused there with the place to write it instead.
+type_args_at_selection(cx: &Analyzer, span: Span, head: (string, string), targ_exprs: Buf[Expr],
+                       sel: string, args: Buf[Expr]) -> TExpr
+    val variant = cx.an.tables.types.get(head.0).unwrap().kind match
+        EnumOf(ed) -> variant_decl_named(ed, sel).is_some()
+        _ -> false
+
+    if !variant then
+        return cx.err(span, s"'${head.1}' cannot be given type arguments where '$sel' is selected " +
+                      s"from it; write the type on what receives the result — 'var x: ${head.1}[…] " +
+                      s"= …' — and select '$sel' from the plain name")
+
+    var targs: Buf[Type] = buf()
+
+    for i in 0..<targ_exprs.len()
+        val t = written_type_arg(cx, targ_exprs.at(i))
+
+        if t == Unknown then return bad_expr(span)
+
+        targs.push(t)
+
+    reinstantiate(cx.an, head.0, targs) match
+        Enum(d) ->
+            val v = d.variant(sel)
+
+            if v.is_none() then return bad_expr(span)
+
+            variant_call(cx, span, Enum(d), v.unwrap(), args)
+        _ -> bad_expr(span)
+end type_args_at_selection
 
 // No written list at all, named so that a default argument can say which kind of run of types it
 // means.
@@ -709,7 +814,11 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
             // **A field's name says which slot a value fills**, exactly as a parameter's does: a
             // construction of a dozen fields reads by the names rather than by counting commas,
             // which is what `syslui`'s themes are written as.
-            val slots = bind_field_args(cx, span, written, d, args)
+            //
+            // **The count and naming refusals quote the DECLARATION, not the spelling** -- `struct
+            // 'b.T'` where the call wrote a bare `T` it imported, as a callee is quoted: a reader with
+            // only the bare name has nowhere to go and read the fields.
+            val slots = bind_field_args(cx, span, qualified_name(key), d, args)
 
             if slots.is_none() then return bad_expr(span)
 
@@ -721,13 +830,17 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
 
             var ts: Buf[TExpr] = buf()
 
+            // The type refusal names the instantiation being built, `b.G[real]`, since that is what
+            // fixed the field's type.
+            val built = qualified(qualified_name(key), d.targs)
+
             for i in 0..<d.fields.len()
                 val want = d.fields.at(i).1
                 val e = slots.unwrap().at(i).unwrap()
                 val t = type_expr(cx, e, Some(want))
 
                 if disagree(texpr_type(t), want) then
-                    cx.fault(e.span, s"'${d.fields.at(i).0}' of '$written' is " +
+                    cx.fault(e.span, s"'${d.fields.at(i).0}' of '$built' is " +
                              s"${type_show(want)}, but ${type_show(texpr_type(t))} was given")
 
                 ts.push(t)
