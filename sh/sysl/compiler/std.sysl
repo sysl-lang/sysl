@@ -190,21 +190,77 @@ end by_place
 // **The strip is here rather than at the caller** because the library's `@tests` files are
 // scaffolding for the library's own suite: a name only one of them writes is not a name the standard
 // module declares, and every build but that suite's drops them.
+//
+// **Every file is parsed and every failure reported together**, since two broken files are two
+// things for whoever is repairing the library to find.
 std_units(root: string, t: Target) -> Result[Buf[Program], string]
     val files = std_sources(root, Some(t.os))?
     var out: Buf[Program] = buf()
+    var unparsed: Buf[string] = buf()
 
     for i in 0..<files.len()
         val parsed = parse(files.at(i).src, t)
 
-        if !parsed.ok()
-            return Err(s"the standard module does not parse: ${files.at(i).src.name}:" +
-                s"${parsed.at()}: ${parsed.first().message}")
+        if !parsed.ok() then unparsed.push(parse_report(parsed))
+        elif !parsed.program.test_only then out.push(parsed.program)
 
-        if !parsed.program.test_only then out.push(parsed.program)
+    if !unparsed.is_empty() then return Err(std_unparsed(root, joined_reports(unparsed)))
 
     Ok(out)
 end std_units
+
+// What a library that does not parse is reported as: one sentence saying whose fault it is, and the
+// parser's own diagnostics under it, located as they would be for any file.
+//
+// **The directory is named because the diagnostics cannot name it** -- a library file is reported as
+// `library/sysl/...` whatever it was read from, which leaves no way to find the file when the library
+// is not the installed one. **And it carries none of the rebuild advice**: building the artifact and
+// compiling the source in both parse this same library, so recommending either sends the reader
+// round a loop.
+std_unparsed(root: string, report: string) -> string =
+    s"the standard module does not parse, so nothing can be compiled against it — the mistake is in " +
+        s"the library at $root, not in the program\n$report"
+
+// The library's units parsed and measured -- everything that can make a library found on disk
+// unusable, each answered as the refusal the driver prints on its own.
+std_usable_units(root: string, t: Target) -> Result[Buf[Program], string] =
+    std_measured(std_units(root, t)?, t)
+
+// The library's units with their `c const` blocks measured, or the C compiler's refusal rendered
+// under one sentence naming whose it is -- a header the standard module cannot read is a broken
+// installation, not something the program did. Measuring here rather than inside the program's
+// analysis is what lets the refusal say so; the analysis then finds no block left to measure.
+//
+// **Each file is measured on its own**, because the probe reports against no file in particular and
+// a refusal is rendered against the one it was measuring.
+std_measured(units: Buf[Program], t: Target) -> Result[Buf[Program], string]
+    var out: Buf[Program] = buf()
+    var said: Buf[Placed] = buf()
+
+    for i in 0..<units.len()
+        var one: Buf[Program] = buf()
+
+        one.push(units.at(i))
+
+        if !c_probe_wanted(one)
+            out.push(units.at(i))
+            continue
+
+        val a = analysis_for(t)
+        val lowered = c_probe_lower(a, one, t)
+        val found = a.diagnostics()
+
+        for j in 0..<found.len()
+            said.push(Placed(units.at(i).src, found.at(j).diag))
+
+        for j in 0..<lowered.len()
+            out.push(lowered.at(j))
+
+    if !said.is_empty()
+        return Err(s"the standard module's 'c const' could not be measured\n${analysis_report(said)}")
+
+    Ok(out)
+end std_measured
 
 // Where this compiler's own binary is, or nothing on a machine that will not say.
 //

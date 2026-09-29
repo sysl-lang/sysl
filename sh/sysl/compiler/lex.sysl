@@ -427,6 +427,9 @@ private scan_token(s: *Scanner, lay: *Layout, out: *Buf[Spanned[Tok]]) -> Result
                 scan_string(s, out, m, Quoted.Plain)
             elif c == '`' then
                 scan_quoted_ident(s, out, m)
+            elif is_combining_mark(c) then
+                Err(error(point(m), f"illegal character: U+${u32(c)}%04X is a combining mark, which continues " +
+                    "the letter before it and may not begin a name"))
             else
                 scan_punct(s, lay, out, m)
 end scan_token
@@ -534,13 +537,25 @@ is_name_start(c: char) -> bool =
     c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
         (u32(c) <= 0xFFFF && unicode.is_alpha(c))
 
-// What may continue one: anything that may begin it, plus a digit.
+// What may continue one: anything that may begin it, plus a digit or a combining mark.
 //
 // **Unicode's digits, not ASCII's**, so a name written in a script with its own digits may use them.
 // The number *literal* grammar is deliberately unmoved: a literal is a value the arithmetic has to
 // read, and a digit outside ASCII is not a spelling of a number any of it knows.
+//
+// **A combining mark continues a name because it is part of the letter in front of it.** `café`
+// spelled `e` + U+0301 is the same word on the screen as the precomposed one, and the two are
+// different identifiers -- nothing is normalized. It is also how most of the world's scripts are
+// written: a Devanagari vowel sign or virama is a mark, not a letter.
 private is_name_cont(c: char) -> bool =
-    is_name_start(c) || (c >= '0' && c <= '9') || (u32(c) <= 0xFFFF && unicode.is_digit(c))
+    is_name_start(c) || (c >= '0' && c <= '9') || (u32(c) <= 0xFFFF && unicode.is_digit(c)) ||
+        is_combining_mark(c)
+
+// Unicode general category M -- `Mn`, `Mc` and `Me` -- which may continue a name and never begin
+// one, since a mark with nothing before it has nothing to combine with. Bounded at the Basic
+// Multilingual Plane for the same reason a letter is.
+private is_combining_mark(c: char) -> bool =
+    u32(c) > 0x7F && u32(c) <= 0xFFFF && unicode.is_mark(c)
 
 // The name under the cursor, consumed. The ASCII test comes first because it is what almost every
 // character is, and asking Unicode is a table lookup.

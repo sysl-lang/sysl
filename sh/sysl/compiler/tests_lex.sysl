@@ -97,13 +97,49 @@ no_normalization()
     assert_eq(bare(precomposed), of([Ident(precomposed)]))
     assert(bare(precomposed) != bare("caf\u{e8}"), "two accents, two names")
 
-@test("a combining mark may not continue a name, being neither a letter nor a digit")
-a_combining_mark_is_not_a_name_character()
-    // The rule is Unicode's *letter*, which is narrower than UAX #31's `ID_Continue`: a combining
-    // acute is category Mn and continues nothing. The reference page illustrates non-normalization
-    // with an `e` and a combining acute, and that spelling is not a name in either compiler.
-    assert_eq(bad("cafe\u{301}"), "illegal character")
-    assert_eq(bad_at("cafe\u{301}"), 4)
+// The declaration is what a caller has to spell, so the two forms are two names rather than one
+// spelling of it -- and both must still BE names, which a lexer refusing the mark outright would
+// not make them.
+@test("a precomposed letter and a base plus a combining mark are different names")
+f15_precomposed_and_decomposed_are_two_names()
+    val precomposed = "caf\u{e9}"
+    val decomposed = "cafe\u{301}"
+
+    assert_eq(bare(precomposed), of([Ident(precomposed)]))
+    assert_eq(bare(decomposed), of([Ident(decomposed)]))
+    assert(precomposed != decomposed, "two spellings")
+
+// A mark is part of the letter before it (Unicode category M: Mn, Mc, Me). Most of the world's
+// scripts write their words with them: Devanagari's vowel signs are spacing marks (Mc) and its
+// virama a non-spacing one (Mn).
+@test("a combining mark of any kind continues a name")
+f15_a_combining_mark_continues_a_name()
+    val hindi = "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940}"
+
+    assert_eq(bare(hindi), of([Ident(hindi)]))
+    assert_eq(bare("x\u{301}"), of([Ident("x\u{301}")]))
+    assert_eq(bare("a\u{20dd}"), of([Ident("a\u{20dd}")]))
+    assert_eq(bare("_\u{301}"), of([Ident("_\u{301}")]))
+
+// A mark with nothing before it has nothing to combine with, and it draws on top of whatever
+// precedes it -- so the message says what the eye cannot.
+@test("a combining mark may not begin a name, and the refusal says why")
+f15_a_combining_mark_may_not_begin_a_name()
+    assert_eq(bad("\u{301}a"), "illegal character: U+0301 is a combining mark, which continues the " +
+              "letter before it and may not begin a name")
+    assert_eq(bad_at("\u{301}a"), 0)
+    assert_eq(bad("\u{93f}x"), "illegal character: U+093F is a combining mark, which continues the " +
+              "letter before it and may not begin a name")
+
+@test("and no normalization folds the decomposed spelling into the precomposed one")
+f15_no_normalization_of_a_decomposed_name()
+    assert(bare("cafe\u{301}") != of([Ident("caf\u{e9}")]), "the decomposed spelling is its own name")
+
+// A literal's suffix is read as a name, so a mark after a number is a suffix -- one no literal has.
+@test("a combining mark after a number is read into its suffix")
+f15_a_mark_after_a_number_is_a_suffix()
+    assert_eq(bad("val y = 1\u{301}"), "invalid literal suffix '\u{301}'")
+    assert_eq(bad_at("val y = 1\u{301}"), 8)
 
 @test("a letter above the Basic Multilingual Plane is refused")
 above_the_bmp_is_refused()

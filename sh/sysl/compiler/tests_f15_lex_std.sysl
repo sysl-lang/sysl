@@ -1,0 +1,188 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, replace_all}
+
+// Two claims from the reference's `UnicodeIdentTests` and `StdLibraryTests`, each quoted from 0.0.150:
+// a name written with combining marks, compiled and run; and a standard library found on disk that
+// cannot be used, refused with a sentence saying the mistake is the library's.
+
+// -- a name written with combining marks, as a whole program ---------------------------------------
+
+private f15_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end f15_ready
+
+// What a program prints, or everything the build said where it was refused, with the scratch
+// directory's own name taken out so that the report can be compared whole.
+private f15_ran(text: string) -> string
+    val root = make_temp_dir("sysl-f15").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return replace_all(failure_text(why), s"$root/", "")
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end f15_ran
+
+// `reference/lexical.md § Identifiers`: the precomposed and the decomposed `café` are different
+// identifiers, so one scope may bind both and each read finds its own.
+@test("the precomposed and decomposed spellings bind two names in one scope")
+f15_two_spellings_bind_two_names()
+    if !f15_ready() then return
+
+    assert_eq(f15_ran("val caf\u{e9} = 1\nval cafe\u{301} = 2\nprint(caf\u{e9}, cafe\u{301})"), "1 2\n")
+
+@test("a name in a script written with marks, declared and called")
+f15_a_name_written_with_marks_is_called()
+    if !f15_ready() then return
+
+    val hindi = "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940}"
+
+    assert_eq(f15_ran(s"$hindi(x: int) -> int = x + 1\nprint($hindi(41))"), "42\n")
+
+@test("a combining mark beginning a name is refused in a program")
+f15_a_leading_mark_is_refused_in_a_program()
+    if !f15_ready() then return
+
+    assert_eq(f15_ran("val x = \u{301}a\nprint(x)"),
+              "error: illegal character: U+0301 is a combining mark, which continues the letter before " +
+              "it and may not begin a name\n" +
+              " --> main.sysl:1:9\n" +
+              "  |\n" +
+              "1 | val x = \u{301}a\n" +
+              "  |         ^")
+
+// -- a standard library that cannot be used ----------------------------------------------------------
+
+// A library root holding a 'sysl' directory with the given files in it.
+private f15_library(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-f15-lib").unwrap()
+
+    make_dir_all(s"$root/$StdModule").unwrap()
+
+    for i in 0..<files.len
+        write_text(s"$root/$StdModule/${files[i].0}", files[i].1).unwrap()
+
+    root
+end f15_library
+
+private f15_unparsed_head(root: string) -> string =
+    s"the standard module does not parse, so nothing can be compiled against it — the mistake is in " +
+        s"the library at $root, not in the program\n"
+
+@test("a library file that does not parse is refused with the parser's own diagnostic under one sentence")
+f15_a_library_that_does_not_parse()
+    val root = f15_library([("std.sysl", "module sysl\n)))) broken\n")])
+
+    assert_eq(std_units(root, host_target()).unwrap_err(),
+              f15_unparsed_head(root) +
+              "error: expression expected\n" +
+              " --> library/sysl/std.sysl:2:1\n" +
+              "  |\n" +
+              "2 | )))) broken\n" +
+              "  | ^")
+    remove_dir_all(root).unwrap_or(())
+
+@test("and names every file that does not parse, not only the first")
+f15_every_unparsed_library_file_is_named()
+    val root = f15_library([("a.sysl", "module sysl\n)))\n"), ("fine.sysl", "module sysl\n"),
+                            ("b.sysl", "module sysl\n\n]]]\n")])
+
+    assert_eq(std_units(root, host_target()).unwrap_err(),
+              f15_unparsed_head(root) +
+              "error: expression expected\n" +
+              " --> library/sysl/a.sysl:2:1\n" +
+              "  |\n" +
+              "2 | )))\n" +
+              "  | ^\n" +
+              "\n" +
+              "error: expression expected\n" +
+              " --> library/sysl/b.sysl:3:1\n" +
+              "  |\n" +
+              "3 | ]]]\n" +
+              "  | ^")
+    remove_dir_all(root).unwrap_or(())
+
+@test("while a library that parses is handed back whole, in the order it came")
+f15_a_library_that_parses_is_whole()
+    val root = f15_library([("b.sysl", "module sysl\n"), ("a.sysl", "module sysl\n")])
+    val units = std_units(root, host_target()).unwrap()
+
+    assert_eq(units.len(), 2)
+    assert_eq(units.at(0).src.name, "library/sysl/a.sysl")
+    assert_eq(units.at(1).src.name, "library/sysl/b.sysl")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a library whose module directory holds no source is refused")
+f15_an_empty_library_is_refused()
+    val root = make_temp_dir("sysl-f15-lib").unwrap()
+
+    make_dir_all(s"$root/$StdModule").unwrap()
+
+    assert_eq(std_sources(root, Some(host_target().os)).unwrap_err(),
+              s"the library at $root holds no sysl source files")
+    remove_dir_all(root).unwrap_or(())
+
+@test("a library 'c const' that cannot be measured is refused, with the C compiler's diagnostic rendered")
+f15_an_unmeasurable_library_c_const()
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return
+    end if
+
+    val root = f15_library([("zz.sysl", "module sysl\n\nc const\n    NOPE: int = \"SYSL_NO_SUCH_MACRO\"\n")])
+    val said = std_usable_units(root, host_target()).unwrap_err()
+
+    remove_dir_all(root).unwrap_or(())
+
+    // The probe's own file name is a fresh temporary, so the C compiler's lines are held to their shape
+    // and the rest of the report to the reference's text.
+    assert(said.starts_with("the standard module's 'c const' could not be measured\n" +
+                            "error: the C compiler refused this file's 'c const' block:\n"), said)
+    assert(said.index_of("error: use of undeclared identifier 'SYSL_NO_SUCH_MACRO'").is_some(), said)
+    assert(said.ends_with("1 error generated.\n" +
+                          " --> library/sysl/zz.sysl:4:5\n" +
+                          "  |\n" +
+                          "4 |     NOPE: int = \"SYSL_NO_SUCH_MACRO\"\n" +
+                          "  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"), said)
+    assert(said.index_of("Diagnostic(").is_none(), said)
+
+// Resolving the library for a build answers the refusal on its own: the rebuild advice would send the
+// reader to build or compile in the very source that just failed.
+@test("is answered by a build as the refusal it carries, without the rebuild advice")
+f15_an_unusable_library_is_not_a_rebuild_failure()
+    val root = f15_library([("std.sysl", "module sysl\n)))) broken\n")])
+    val said = std_artifact_at(root, s"$root/out/std.syslib", "0", host_target(), "1").unwrap_err()
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(said.starts_with(f15_unparsed_head(root)), said)
+    assert(said.index_of("build-lib").is_none(), said)
+    assert(said.index_of("--no-std-lib").is_none(), said)

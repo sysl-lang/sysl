@@ -64,7 +64,11 @@ std_artifact_at(root: string, path: string, fingerprint: string, t: Target,
     Err(why) ->
         eprints(s"building the standard module at $path ($why)\n")
 
-        write_std_artifact(root, path, fingerprint, t, level) match
+        // A library that cannot be used is refused on its own: the rebuild advice would recommend
+        // building or compiling in the very source that just failed.
+        val units = std_usable_units(root, t)?
+
+        write_std_artifact(units, root, path, fingerprint, t, level) match
             Ok(made) -> Ok(made)
             Err(err) -> Err(std_rebuild_failure(err, std_toolchain(t)))
 
@@ -114,7 +118,7 @@ build_std_library(root: string, t: Target, out: Option[string],
     val fingerprint = std_fingerprint(root, t)?
     val where = out.unwrap_or(std_artifact_path(t, fingerprint, level))
 
-    write_std_artifact(root, where, fingerprint, t, level)?
+    write_std_artifact(std_usable_units(root, t)?, root, where, fingerprint, t, level)?
     Ok(where)
 end build_std_library
 
@@ -218,13 +222,10 @@ private selects_a_machine(part: string) -> bool =
 // reading the artifact while another writes it finds the whole of one or the whole of the other;
 // `pending_name` is unique to this process and this call, so two builds racing for one artifact never
 // publish each other's half-written archive.
-private write_std_artifact(root: string, out: string, fingerprint: string, t: Target,
-                           level: string) -> Result[Buf[string], string]
-    val units = std_units(root, t)?
-
+private write_std_artifact(units: Buf[Program], root: string, out: string, fingerprint: string,
+                           t: Target, level: string) -> Result[Buf[string], string] =
     write_artifact(units, modules_of(units), root, out, fingerprint, t, "the standard module",
                    no_probe(), level)
-end write_std_artifact
 
 // The same for **any** library, which is what `sysl build-lib` on a package writes: the tree's own
 // declarations compiled ahead of time into an object half, the metadata beside it, and one member
