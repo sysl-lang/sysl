@@ -449,7 +449,7 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
     RefDecl(name, place) -> ref_decl(cx, stmt.span, name, place)
 
     // A statement's value is nobody's, so whatever branching it contains is read knowing that.
-    ExprStmt(e) -> one_stmt(TExprStmt(type_expr_discarded(cx, e, None, true)))
+    ExprStmt(e) -> one(TExprStmt(type_expr_discarded(cx, e, None, true)))
 
     Return(value) -> return_stmt(cx, stmt.span, value)
     Become(call) -> become_stmt(cx, stmt.span, call)
@@ -457,12 +457,12 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
     Continue(label) -> continue_stmt(cx, stmt.span, label)
     Defer(inner) -> defer_stmt(cx, stmt.span, inner)
 
-    AsmStmt(arms) -> one_stmt(type_asm(cx, stmt.span, arms))
+    AsmStmt(arms) -> one(type_asm(cx, stmt.span, arms))
 
     // An import binds a name for the statements after it and emits nothing. The declaration pass
     // reads a **file's** imports, which is every one written at the top of it; one written inside a
     // body is this walk's to bind, and the scope it was written in gives it back at the dedent.
-    ImportDecl(d) -> one_stmt(block_import(cx, stmt.span, d))
+    ImportDecl(d) -> one(block_import(cx, stmt.span, d))
 
     // A `const` written at the top of a file is folded into its uses before anything runs, so it
     // never reaches the statement walk. One that reaches here was written **inside a body**, where
@@ -541,7 +541,7 @@ type_stmt(cx: &Analyzer, stmt: Stmt) -> Buf[TStmt] = *stmt.kind match
         check_assert(cx, stmt.span, cond, message)
         buf()
 
-    Bad -> one_stmt(TExprStmt(TExpr(stmt.span, TUnitLit)))
+    Bad -> one(TExprStmt(TExpr(stmt.span, TUnitLit)))
 
 private clause_out_of_place() -> string =
     "'require'/'ensure' clauses must come before any other statement in a function body"
@@ -551,16 +551,16 @@ private top_level_only() -> string =
 
 private refuse(cx: &Analyzer, span: Span, message: string) -> Buf[TStmt]
     cx.fault(span, message)
-    one_stmt(TExprStmt(TExpr(span, TUnitLit)))
+    one(TExprStmt(TExpr(span, TUnitLit)))
 end refuse
 
 // A list holding one statement, which is what most of the forms hand back.
-one_stmt(s: TStmt) -> Buf[TStmt]
+private one(s: TStmt) -> Buf[TStmt]
     var out: Buf[TStmt] = buf()
 
     out.push(s)
     out
-end one_stmt
+end one
 
 push_all(out: *Buf[TStmt], xs: Buf[TStmt])
     for i in 0..<xs.len()
@@ -582,7 +582,7 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
         if declared.is_none()
             cx.fault(span, s"'$name' needs either a type or an initial value")
 
-            return one_stmt(TVarDecl(cx.bind(name, Unknown), Unknown, TExpr(span, TZero(Unknown)), None))
+            return one(TVarDecl(cx.bind(name, Unknown), Unknown, TExpr(span, TZero(Unknown)), None))
         end if
 
         val ty = declared.unwrap()
@@ -590,7 +590,7 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
         if !has_zero(ty) then
             cx.fault(span, s"${type_show(ty)} has no zero value, so '$name' needs an initial value")
 
-        return one_stmt(TVarDecl(cx.bind(name, ty), ty, checked_zero(cx, span, ty),
+        return one(TVarDecl(cx.bind(name, ty), ty, checked_zero(cx, span, ty),
                             boundary(cx, name, align)))
     end if
 
@@ -598,7 +598,7 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
     val decl_ty = settled_binding_type(declared, ti)
 
     check_binding(cx, init.unwrap().span, name, declared, decl_ty, ti)
-    one_stmt(TVarDecl(cx.bind(name, decl_ty), decl_ty, ti, boundary(cx, name, align)))
+    one(TVarDecl(cx.bind(name, decl_ty), decl_ty, ti, boundary(cx, name, align)))
 end var_decl
 
 private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], value: Expr,
@@ -610,7 +610,7 @@ private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], 
     val decl_ty = settled_binding_type(declared, ti)
 
     check_binding(cx, value.span, name, declared, decl_ty, ti)
-    one_stmt(TVarDecl(cx.bind_read_only(name, decl_ty), decl_ty, ti, boundary(cx, name, align)))
+    one(TVarDecl(cx.bind_read_only(name, decl_ty), decl_ty, ti, boundary(cx, name, align)))
 end val_decl
 
 // The type a binding holds: the one it was declared with, and the value's where it was not.
@@ -647,7 +647,7 @@ private ref_decl(cx: &Analyzer, span: Span, name: string, place: Expr) -> Buf[TS
     if texpr_type(tp) == Never then
         cx.fault(span, s"cannot bind '$name' to an expression that never returns")
 
-    one_stmt(TRefDecl(cx.bind(name, texpr_type(tp)), texpr_type(tp), tp))
+    one(TRefDecl(cx.bind(name, texpr_type(tp)), texpr_type(tp), tp))
 end ref_decl
 
 // `@section("…")` above a **local**, which is refused here rather than in the grammar: a local's
@@ -710,7 +710,7 @@ private return_stmt(cx: &Analyzer, span: Span, value: Option[Expr]) -> Buf[TStmt
         if want != Unit then
             cx.fault(span, s"this function must return a ${type_show(want)} value")
 
-        return one_stmt(TReturn(None))
+        return one(TReturn(None))
     end if
 
     val tv = returned_value(cx, value.unwrap(), want)
@@ -721,7 +721,7 @@ private return_stmt(cx: &Analyzer, span: Span, value: Option[Expr]) -> Buf[TStmt
         cx.fault(span, s"return type mismatch: expected ${type_show(want)}, got " +
                  s"${type_show(texpr_type(tv))}")
 
-    one_stmt(TReturn(Some(tv)))
+    one(TReturn(Some(tv)))
 end return_stmt
 
 // What a `return` hands back, read in the one position a function's own result list may stand.
@@ -787,7 +787,7 @@ private become_stmt(cx: &Analyzer, span: Span, call: Expr) -> Buf[TStmt]
         cx.fault(span, s"'become' hands on this function's result, so the call has to answer " +
                  s"${type_show(want)} — this one answers ${type_show(texpr_type(t))}")
 
-    one_stmt(TBecome(t))
+    one(TBecome(t))
 end become_stmt
 
 private is_call(t: TExpr) -> bool = *t.kind match
@@ -805,20 +805,20 @@ private break_stmt(cx: &Analyzer, span: Span, label: Option[string],
     if found.is_none()
         if value.is_some() then type_expr_bare(cx, value.unwrap())
 
-        return one_stmt(TBreak(None, 0))
+        return one(TBreak(None, 0))
     end if
 
     val ctx = found.unwrap().0
     val tv = value.map(e -> type_expr(cx, e, ctx.expected))
 
     ctx.break_tys.push(if tv.is_none() then Unit else texpr_type(tv.unwrap()))
-    one_stmt(TBreak(tv, found.unwrap().1))
+    one(TBreak(tv, found.unwrap().1))
 end break_stmt
 
 private continue_stmt(cx: &Analyzer, span: Span, label: Option[string]) -> Buf[TStmt]
     val found = resolve_loop(cx, span, "continue", label)
 
-    one_stmt(TContinue(if found.is_none() then 0 else found.unwrap().1))
+    one(TContinue(if found.is_none() then 0 else found.unwrap().1))
 end continue_stmt
 
 // Resolves a `break`/`continue` to the loop it targets and that loop's distance out from the
@@ -891,7 +891,7 @@ private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
                  "has nowhere to return to. Check the result and handle the failure in the " +
                  "deferred statement itself")
 
-    one_stmt(TDefer(t))
+    one(TDefer(t))
 end defer_stmt
 
 private deferred_jump() -> string =
