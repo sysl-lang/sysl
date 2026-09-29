@@ -747,6 +747,9 @@ variant_of(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[(Type,
 
     if !may_name_variant(cx, name) then return None
 
+    // **A variant imported by name is that enum's**, whatever a wildcard beside it also offers.
+    val chosen = imported_variant_enum(cx, name)
+
     // The first instantiation in registration order whose enum is one the name could mean here --
     // the nearest level's, where the module declares one itself.
     val homes = variant_homes(cx, name)
@@ -760,11 +763,22 @@ variant_of(cx: &Analyzer, name: string, expected: Option[Type]) -> Option[(Type,
             Enum(d) ->
                 val v = d.variant(name)
 
-                if v.is_some() && holds_string(homes, d.base) then return Some((t, v.unwrap()))
+                if v.is_some() && (chosen.is_none() || chosen.unwrap() == d.base) &&
+                        holds_string(homes, d.base) then
+                    return Some((t, v.unwrap()))
             _ -> ()
 
     None
 end variant_of
+
+// The enum whose variant this name was imported as, by name rather than through a wildcard, at the
+// innermost level of imports that answers for it.
+imported_variant_enum(cx: &Analyzer, name: string) -> Option[string]
+    val im = answering_imports(cx.an, cx.scope, name, k -> enum_of_variant(cx.an, k).is_some())
+    val bound = im.name_key(name)
+
+    if bound.is_none() then None else enum_of_variant(cx.an, bound.unwrap())
+end imported_variant_enum
 
 // The enums a bare variant name could mean, by DECLARATION rather than by instantiation --
 // `Option[int]` and `Option[string]` are one answer, since the question is which enum was meant and
@@ -826,13 +840,22 @@ end named_series
 // The refusal a bare variant name earns where more than one enum in scope declares it and nothing
 // here chose between them. Picking the first registered would make what the line means depend on
 // which file happened to name an enum first, which is not something a reader can see.
+//
+// **Where the rival enums arrived through two wildcards, the refusal names the imports** rather than
+// the enums -- the imports are what the reader wrote, and importing one side selectively is the fix.
 ambiguous_variant(cx: &Analyzer, span: Span, name: string,
                   expected: Option[Type]) -> Option[TExpr]
     if variant_from_expected(cx, name, expected).is_some() then return None
 
+    if imported_variant_enum(cx, name).is_some() then return None
+
     val homes = variant_homes(cx, name)
 
     if homes.len() < 2 then return None
+
+    val offers = offered_by(cx.an, cx.scope, name, k -> enum_of_variant(cx.an, k).is_some())
+
+    if offers.len() > 1 then return Some(cx.err(span, ambiguous_offer(name, offers)))
 
     Some(cx.err(span, s"'$name' is a variant of ${named_series(homes)}, and nothing here says " +
                 s"which — qualify it, as '${module_show(homes.at(0))}.$name'"))
