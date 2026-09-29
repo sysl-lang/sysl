@@ -129,14 +129,19 @@ end analysis_report
 // the lexer itself refused.
 parse_report(p: Parsed) -> string
     val at = p.first().span.start
+    val message = p.first().message
 
-    ended(Placed(p.src, error(token_at(p.src, at), p.first().message)))
+    ended(Placed(p.src, error(token_at(p.src, at, message == "dedent expected"), message)))
 end parse_report
 
-// The written token that begins at `at`, or the point itself where none does. **The first token
-// there decides**: an indent in front of a line's first word starts where the word does, and a
-// complaint about the layout (`dedent expected`) is the reference's one column rather than the word.
-private token_at(src: Source, at: usize) -> Span
+// The written token that begins at `at`, or the point itself where none does. **An indent or a
+// dedent in front of a line's first word starts where the word does and is stepped over**, the
+// complaint being about the word -- `^^^^^^` under a stray `123456` after a block has closed, or as
+// a body's first line. The one exception is an indent that was itself the complaint: a line
+// indented where nothing opened a block is `dedent expected` AT the indent, and the reference draws
+// that one column wide rather than under the word (`indent_complained`). A line's end and the end
+// of the file are one column too.
+private token_at(src: Source, at: usize, indent_complained: bool) -> Span
     val tokens = lex(src) match
         Ok(ts) -> ts
         Err(_) -> return point(at)
@@ -145,7 +150,9 @@ private token_at(src: Source, at: usize) -> Span
         val t = tokens.at(i)
 
         if t.span.start == at
-            if is_layout(t.value) || t.span.end <= at then return point(at)
+            if t.value == Indent && indent_complained then return point(at)
+            if is_layout(t.value) then continue
+            if t.value == Eof || t.span.end <= at then return point(at)
 
             return t.span
         end if
@@ -153,11 +160,13 @@ private token_at(src: Source, at: usize) -> Span
     point(at)
 end token_at
 
+// The tokens a line's layout makes, stepped over on the way to the word they stand in front of. A
+// block that closes is a `Dedent` and a `Newline` both placed at the next line's first word, while a
+// line's own `Newline` sits at its end, where no word begins -- which is what leaves that one a point.
 private is_layout(t: Tok) -> bool = t match
     Newline -> true
     Indent -> true
     Dedent -> true
-    Eof -> true
     _ -> false
 
 // A note rather than a complaint: the location first, in the one-line form a build log wants, since

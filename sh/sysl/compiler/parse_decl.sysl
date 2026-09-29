@@ -45,17 +45,41 @@ blank_impl(name: string, for_type: TypeRef) -> ImplDecl =
 // the grammar's complaint that a name was missing: a field called `module` is a reasonable thing to
 // want, and what the reader needs is the spelling that works.
 private parse_param_name(p: *Parser, what: string) -> string
-    p.peek() match
-        Keyword(w) ->
-            if is_reserved(w) && p.kw_at(1, ":")
-                p.fault(p.here(), s"'${w}' is a reserved word, so it cannot stand as ${what} — write it '`${w}`' if that is the name you want, which is what the backticks are for: a quoted word is an ordinary name wherever one may be written")
-                p.bump()
-                return w
-            end if
-        _ -> ()
+    val w = reserved_here(p)
+
+    if w != "" && p.kw_at(1, ":")
+        refuse_reserved_name(p, what)
+        return w
+    end if
 
     parse_bound_name(p)
 end parse_param_name
+
+// The reserved word at the cursor, or `""` where what stands there is not one.
+reserved_here(p: *Parser) -> string = p.peek() match
+    Keyword(w) -> if is_reserved(w) then w else ""
+    _ -> ""
+
+// Refuses the reserved word at the cursor as `what` -- a function's name, the name a `val` binds --
+// and steps past it, so the declaration it began is read on under that name. **Every position a name
+// is bound at says the same sentence**, the spelling that works being the one thing the reader needs.
+refuse_reserved_name(p: *Parser, what: string)
+    val w = reserved_here(p)
+
+    p.fault(p.here(), s"'${w}' is a reserved word, so it cannot stand as ${what} — write it '`${w}`' if that is the name you want, which is what the backticks are for: a quoted word is an ordinary name wherever one may be written")
+    p.bump()
+end refuse_reserved_name
+
+// A name a `val`, `var`, `const` or `ref` binds, where nothing but a name may follow the keyword --
+// so a reserved word there can only have been meant as the name, and is refused as one.
+parse_binding_name(p: *Parser, what: string) -> string
+    val w = reserved_here(p)
+
+    if w == "" then return parse_bound_name(p)
+
+    refuse_reserved_name(p, what)
+    w
+end parse_binding_name
 
 // One parameter of a declaration.
 parse_param(p: *Parser, what: string) -> Param
@@ -150,13 +174,18 @@ end parse_param_list
 // parenthesised list and the body after it. Nothing is reported by a probe that fails -- the report
 // is wound back with the cursor, since a reading nobody chose said nothing about the file.
 try_func_decl(p: *Parser, start: Span, vis: Visibility, attrs: Buf[Attr]) -> Option[Stmt]
-    if !looks_like_func_decl(p) then return None
+    val reserved = at_reserved_func_head(p)
+
+    if !reserved && !looks_like_func_decl(p) then return None
 
     var conv: Option[CallConv] = None
 
-    if at_call_conv(p) then conv = Some(parse_call_conv(p))
+    if !reserved && at_call_conv(p) then conv = Some(parse_call_conv(p))
 
-    val name = parse_bound_name(p)
+    var name = reserved_here(p)
+
+    if reserved then refuse_reserved_name(p, "a function's name")
+    else name = parse_bound_name(p)
     var tp = no_type_params()
 
     if p.at_kw("[") then tp = parse_type_params(p)
@@ -241,9 +270,67 @@ private looks_like_func_decl(p: *Parser) -> bool
     false
 end looks_like_func_decl
 
+// Whether a reserved word stands where a function's name would -- `loop() -> int = 1` -- followed
+// by the WHOLE rest of a function's shape: a parameter list of `name: type`s and then a body, after
+// a result type or a `where` if there is one. **Nothing shorter will do**, because a function
+// stands where a statement does and statements open with a reserved word and a bracket:
+// `return (x: int) -> x + 1` reads like a declaration as far as its result type, and only the
+// missing body tells the two apart. So this is asked ahead of every declaration a reserved word
+// opens, and declines everything a correct program writes.
+at_reserved_func_head(p: *Parser) -> bool
+    if reserved_here(p) == "" then return false
+
+    var i: usize = 1
+
+    if p.kw_at(i, "[")
+        i = past_bracket(p, i)
+
+        if i == 0 then return false
+    end if
+
+    if !p.kw_at(i, "(") then return false
+
+    val listed = p.kw_at(i + 1, ")") || (names_a_decl(p.peek_at(i + 1)) && p.kw_at(i + 2, ":"))
+
+    if !listed then return false
+
+    i = past_bracket(p, i)
+
+    if i == 0 then return false
+
+    // A result type is stepped over as far as the body it has to be followed by.
+    if p.kw_at(i, "->")
+        i += 1
+
+        while !opens_func_body(p, i) && p.peek_at(i) != Newline
+            if p.peek_at(i) == Eof then return false
+
+            if p.kw_at(i, "(") || p.kw_at(i, "[") || p.kw_at(i, "{")
+                i = past_bracket(p, i)
+
+                if i == 0 then return false
+            else
+                i += 1
+            end if
+    end if
+
+    if opens_func_body(p, i) then return true
+
+    p.peek_at(i) == Newline && p.peek_at(i + 1) == Indent
+end at_reserved_func_head
+
+// Whether the token at `i` is an `=` or a `where`, either of which only a function's body follows.
+private opens_func_body(p: *Parser, i: usize) -> bool
+    if p.kw_at(i, "=") then return true
+
+    p.peek_at(i) match
+        Ident(n) -> n == "where"
+        _ -> false
+end opens_func_body
+
 // Where the bracket pair opening at `i` ends, one token past its close -- or `0` where it never
 // closes, which is a file that will not parse whatever this decides.
-private past_bracket(p: *Parser, at: usize) -> usize
+past_bracket(p: *Parser, at: usize) -> usize
     var i = at
     var depth: usize = 0
 

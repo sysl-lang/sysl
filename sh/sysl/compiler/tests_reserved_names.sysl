@@ -1,0 +1,91 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{repeat, split, Search}
+
+// A reserved word written where a name is BOUND -- a function's, a member's, a `val`'s, a `for`'s,
+// a pattern's -- is refused as the word it is, with the backticks that would have let it stand,
+// rather than with the grammar's complaint about the token after it. Every message, position and
+// caret here is the reference's own output (sysl 0.0.150) for the same file.
+
+private rsv_ready() -> bool = std_root().is_ok()
+
+// What `sysl build <dir>` says first about a project holding one `main.sysl`, the directory, and
+// the exit status.
+private rsv_run(text: string) -> (string, string, int)
+    val root = make_temp_dir("sysl-rsv").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build", root], (line) -> sink.push(line))
+    val out = if lines.is_empty() then "" else lines.at(0)
+
+    remove_dir_all(root).unwrap_or(())
+    (out, absolute_path(root), code)
+
+// The word `w` at `line:col` refused as `what`, the caret as wide as the word.
+private rsv_refused(text: string, w: string, what: string, line: int, col: int)
+    val (out, root, code) = rsv_run(text)
+    val message = s"'$w' is a reserved word, so it cannot stand as $what — write it '`$w`' if that is the name you want, which is what the backticks are for: a quoted word is an ordinary name wherever one may be written"
+    val quoted = split(text, "\n")[usize(line - 1)]
+    val pad = repeat(" ", usize(col - 1))
+    val carets = repeat("^", w.len)
+
+    assert_eq(code, 1)
+    assert_eq(out, s"error: $message\n --> $root/main.sysl:$line:$col\n  |\n$line | $quoted\n  | $pad$carets")
+
+@test("a reserved word as a function's name is refused as the word it is")
+rsv_function_name()
+    if !rsv_ready() then return
+
+    rsv_refused("match() -> int = 1\nprint(1)\n", "match", "a function's name", 1, 1)
+    rsv_refused("type() -> int = 1\nprint(1)\n", "type", "a function's name", 1, 1)
+    rsv_refused("loop(x: int) -> int\n    x\nprint(1)\n", "loop", "a function's name", 1, 1)
+
+@test("a reserved word as the name a binding keyword introduces")
+rsv_binding_name()
+    if !rsv_ready() then return
+
+    rsv_refused("val match = 1\nprint(1)\n", "match", "the name a 'val' binds", 1, 5)
+    rsv_refused("var if = 1\nprint(1)\n", "if", "the name a 'var' binds", 1, 5)
+    rsv_refused("const if: int = 1\nprint(1)\n", "if", "a constant's name", 1, 7)
+    rsv_refused("for match in [1]\n    print(1)\n", "match", "the name a 'for' binds", 1, 5)
+
+@test("a reserved word as a member's name, in a type's body and in a trait's")
+rsv_member_name()
+    if !rsv_ready() then return
+
+    rsv_refused("struct P\n    x: int\n    ref(self) -> int = 1\nprint(1)\n", "ref", "a member's name",
+                3, 5)
+    rsv_refused("struct P\n    x: int\n    static(self) -> int = 1\nprint(1)\n", "static",
+                "a member's name", 3, 5)
+    rsv_refused("trait T\n    type(self) -> int\nprint(1)\n", "type", "a member's name", 2, 5)
+    rsv_refused("trait T\n    f(self) -> int\n    private(self) -> int\nprint(1)\n", "private",
+                "a member's name", 3, 5)
+
+@test("a reserved word as a name a pattern binds")
+rsv_pattern_name()
+    if !rsv_ready() then return
+
+    rsv_refused("val x = 1\nx match\n    loop -> print(1)\n", "loop", "a name a pattern binds", 3, 5)
+    rsv_refused("val (a, loop) = (1, 2)\nprint(1)\n", "loop", "a name a pattern binds", 1, 9)
+    rsv_refused("struct P\n    x: int\nval p = P(1)\np match\n    P{x, loop} -> print(1)\n", "loop",
+                "a name a pattern binds", 5, 10)
+
+// The function-name refusal looks as far as a body, so a statement opening with a reserved word and
+// a bracket is left alone -- the reference's `return (x: int) -> x + 1` has no body after its arrow.
+@test("a statement opening with a reserved word and a bracket is not a function misnamed")
+rsv_statement_is_not_a_function()
+    if !rsv_ready() then return
+
+    val (said, _, _) = rsv_run("return (x: int) -> x + 1\n")
+
+    assert(!said.contains("reserved word"), said)
+
+    val (_, _, code) = rsv_run("val a = true\nif (a)\n    print(1)\n")
+
+    assert_eq(code, 0)
