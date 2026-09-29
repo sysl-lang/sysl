@@ -265,6 +265,7 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         VarDecl(name, typ, init, vis, align, section, thread_local) ->
             hoist_storage(a, scope, s.span, name, typ, vis, init, align, section, thread_local)
         ExternVarDecl(name, typ, link, vis) ->
+            check_foreign_symbol(a, scope, s.span, link.unwrap_or(name), link.is_some())
             hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.extern_vars,
                         "'extern' variable", None, None, None, false, link)
         ExternDecl(d) -> hoist_extern(a, scope, s.span, d)
@@ -578,10 +579,46 @@ private hoist_extern(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
                 "apart by")
         return
 
+    if a.tables.extern_vars.has(key) then
+        a.fault(scope, span, s"'${d.name}' is already declared as an 'extern' variable")
+        return
+
     a.tables.externs.put(key, d)
     a.tables.extern_scopes.put(key, ExternHome(scope, span))
     record_access(a, scope, span, key, d.vis)
+
+    if d.link.is_some() then check_foreign_symbol(a, scope, span, d.link.unwrap(), true)
+
     check_signature_rules(a, scope, span, d.name, d.params, d.ret_type, d.variadic, true)
+end hoist_extern
+
+// The symbol an `extern` resolves to has to be one a linker can: letters, digits, `_`, `.` and `$`,
+// which is what an object file's names are made of -- asked only of a link name, since a sysl name
+// is one already. **And never `main`**: this program defines that symbol, so an `extern` naming it
+// would be a declaration of the program's own entry point.
+private check_foreign_symbol(a: &Analysis, scope: Scope, span: Span, symbol: string, written: bool)
+    if written && !is_link_symbol(symbol)
+        a.fault(scope, span, s"'$symbol' is not a symbol a linker can resolve")
+        return
+    end if
+
+    if symbol == "main" then
+        a.fault(scope, span, "'main' is where the platform starts this program, so an 'extern' may " +
+                "not name that symbol")
+end check_foreign_symbol
+
+private is_link_symbol(symbol: string) -> bool
+    if symbol == "" then return false
+
+    for i in 0..<symbol.bytes.len
+        val b = symbol.bytes[i]
+        val letter = (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z'))
+        val digit = b >= u8('0') && b <= u8('9')
+
+        if !letter && !digit && b != u8('_') && b != u8('.') && b != u8('$') then return false
+
+    true
+end is_link_symbol
 
 // The rules a declared signature must satisfy whichever declaration form it came from, checked after
 // the name is registered so a failure reports the mistake without also erasing the declaration it is

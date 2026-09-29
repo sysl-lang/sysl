@@ -1,0 +1,498 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// The rest of the reference's `ExternVarTests`: `extern name: type`, storage the linker supplies.
+// What the declaration is, what its name, symbol and type may be, that it is a place where a `val`
+// is not, and a real C global reached, read and written.
+//
+// **Every diagnostic and every output here was read out of the reference compiler (0.0.151)** by
+// handing the installed `sysl` the same tree; the IR lines are its `emit-llvm`. The harness is the
+// one `tests_xvr_extern_var.sysl` builds: `xvr_ir` for the text, `xvr_ran` for a program linked and
+// run, which answers with the build's refusal where there is one.
+
+// A refusal carries this message, anchored at this `file:line:column`.
+private xvs_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> "), said)
+    assert(said.contains(s"/$at\n"), said)
+
+private xvs_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private xvs_ran(text: string) -> string = xvr_ran(xvs_main(text))
+
+private xvs_ir(text: string) -> string = xvr_ir(xvs_main(text))
+
+// -- the declaration -------------------------------------------------------------------------------
+
+@test("is a name and a type where a function's is a name and a parameter list")
+xvs_a_name_and_a_type()
+    assert_eq(pf("extern stdout: *u8\n"), "(extern-var stdout : (ptr u8))")
+
+@test("takes a link name exactly as the function form does")
+xvs_takes_a_link_name()
+    assert_eq(pf("extern \"environ\" env: **u8\n"), "(extern-var \"environ\" env : (ptr (ptr u8)))")
+
+@test("carries a visibility of its own")
+xvs_carries_a_visibility()
+    assert_eq(pf("private extern optind: i32\n"), "(extern-var private optind : i32)")
+
+@test("states a type and cannot leave it out")
+xvs_states_a_type()
+    val said = "an 'extern' declares a function — 'stdout(params) -> result' — or a variable — " +
+               "'stdout: type' — so what follows the name is '(' or ':'"
+
+    assert_eq(pf_err("extern stdout"), said)
+    assert_eq(pf_err("extern stdout ="), said)
+end xvs_states_a_type
+
+@test("a colon with no type after it says so")
+xvs_a_colon_with_no_type()
+    assert_eq(pf_err("extern stdout:"),
+              "an 'extern' variable states the type the other side laid down — 'extern stdout: T'")
+
+@test("and so does anything after the colon that cannot begin a type")
+xvs_nothing_that_begins_a_type()
+    assert_eq(pf_err("extern x: =\n"), "an 'extern' variable states the type the other side laid down — 'extern x: T'")
+    assert_eq(pf_err("extern x: 5\nprint(1)\n"),
+              "an 'extern' variable states the type the other side laid down — 'extern x: T'")
+    assert_eq(pf_err("extern x: (i32, i32)\n"), "")
+
+@test("and type parameters are no more an extern variable's than a function's")
+xvs_no_type_parameters()
+    assert_eq(pf_err("extern env[T]: *T"),
+              "an 'extern' declares no type parameters — there is no body to monomorphize, and a " +
+              "foreign symbol is one function at one signature")
+
+// -- what the name may be --------------------------------------------------------------------------
+
+@test("not one already declared")
+xvs_not_one_already_declared()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("extern stdout: *u8\nextern stdout: *u8\nprint(1)"),
+                "'stdout' is already declared", "main.sysl:2:1")
+
+@test("not one a 'val' holds")
+xvs_not_one_a_val_holds()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("static val n: int = 1\nextern n: i32\nprint(1)"),
+                "'n' is already used by a 'val'", "main.sysl:2:1")
+
+@test("not one a constant holds")
+xvs_not_one_a_constant_holds()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("const n: int = 1\nextern n: i32\nprint(1)"),
+                "'n' is already used by a constant", "main.sysl:2:1")
+
+@test("and a function declared afterwards may not take it either")
+xvs_nor_a_function_afterwards()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("extern optind: i32\noptind() -> int = 1\nprint(1)"),
+                "'optind' is already declared as an 'extern' variable", "main.sysl:2:1")
+    xvs_refused(xvs_ran("extern optind: i32\nextern optind(n: int) -> int\nprint(1)"),
+                "'optind' is already declared as an 'extern' variable", "main.sysl:2:1")
+end xvs_nor_a_function_afterwards
+
+// -- what the symbol may be ------------------------------------------------------------------------
+
+@test("something a linker could resolve")
+xvs_a_linker_could_resolve()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("extern \"not a symbol\" x: i32\nprint(1)"),
+                "'not a symbol' is not a symbol a linker can resolve", "main.sysl:1:1")
+
+@test("and never the one the platform starts the program at")
+xvs_never_main()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("extern \"main\" start: i32\nprint(1)"),
+                "'main' is where the platform starts this program, so an 'extern' may not name that symbol",
+                "main.sysl:1:1")
+
+// The characters an object file's names are made of, asked of a variable's link name and of a
+// function's, which are held to one rule; a sysl name needs no asking.
+@test("a link name is letters, digits, '_', '.' and '$', for a variable and a function alike")
+xvs_the_characters_of_a_symbol()
+    if xvr_no_library() then return
+
+    assert_eq(xvs_ran("extern \"A_z9.$\" x: i32\nextern \"a.b\" f() -> int\nprint(1)"), "1\n")
+
+    for sym in ["x@y", "a-b", "é", ""]
+        val said = xvs_ran(s"extern \"$sym\" x: i32\nextern \"$sym\" f() -> int\nprint(1)")
+
+        xvs_refused(said, s"'$sym' is not a symbol a linker can resolve", "main.sysl:1:1")
+        xvs_refused(said, s"'$sym' is not a symbol a linker can resolve", "main.sysl:2:1")
+end xvs_the_characters_of_a_symbol
+
+@test("and a function's link name may not be 'main' either")
+xvs_a_function_may_not_link_main()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("extern \"main\" f() -> int\nprint(1)"),
+                "'main' is where the platform starts this program, so an 'extern' may not name that symbol",
+                "main.sysl:1:1")
+
+// -- what the type may be --------------------------------------------------------------------------
+
+@test("a pointer, which is what nearly every C global is")
+xvs_a_pointer()
+    if xvr_no_library() then return
+
+    assert(xvs_ir("extern stdout: *u8\nprint(stdout == null)").contains("@stdout = external global ptr\n"))
+    assert(xvs_ir("extern environ: **u8\nprint(environ == null)").contains("@environ = external global ptr\n"))
+
+@test("a counted reference, which both kinds of module storage take")
+xvs_a_counted_reference()
+    if xvr_no_library() then return
+
+    val node = "struct Node\n    v: int\nend Node\n"
+
+    assert(xvs_ir(node + "extern r: &Node\nprint(str(r.v))").contains("@r = external global ptr\n"))
+    assert_eq(xvs_ran(node + "mk() -> &Node = Node(1)\nstatic val r: &Node = mk()\nprint(r.v)"), "1\n")
+end xvs_a_counted_reference
+
+@test("a scalar, laid out as the type says")
+xvs_a_scalar()
+    if xvr_no_library() then return
+
+    assert(xvs_ir("extern optind: i32\nprint(optind)").contains("@optind = external global i32\n"))
+    assert(xvs_ir("extern tzoff: i64\nprint(tzoff)").contains("@tzoff = external global i64\n"))
+
+@test("and nothing that occupies no storage at all")
+xvs_nothing_that_occupies_no_storage()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("extern nothing: unit\nprint(1)"),
+                "'nothing' cannot be an 'extern' variable: a unit value occupies nothing, so there is " +
+                "no storage for the linker to resolve the name to", "main.sysl:1:1")
+
+@test("which is reported even where nothing names it")
+xvs_reported_where_nothing_names_it()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("extern nothing: unit\nprint(2)"),
+                "'nothing' cannot be an 'extern' variable: a unit value occupies nothing, so there is " +
+                "no storage for the linker to resolve the name to", "main.sysl:1:1")
+
+// -- what is emitted -------------------------------------------------------------------------------
+
+@test("an extern variable nothing reads is not declared")
+xvs_nothing_reads_it()
+    if xvr_no_library() then return
+
+    assert(!xvs_ir("extern stdout: *u8\nprint(1)").contains("@stdout"))
+
+// -- it is a place, unlike a 'val' -----------------------------------------------------------------
+
+@test("assignment reaches it, where a 'val' refuses")
+xvs_assignment_reaches_it()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("static val n: int = 1\nn = 2\nprint(n)"),
+                "a 'val' is written once, so assignment has nothing to write through", "main.sysl:2:1")
+    assert(xvs_ir("extern optind: i32\noptind = 3i32\nprint(optind)").contains("define i32 @main("))
+end xvs_assignment_reaches_it
+
+// The `val` half of the comparison, asked of a module's own storage from one of its functions: a
+// compound assignment is a write like any other, and the module `var` beside it is not refused.
+@test("a module's 'val' refuses a compound assignment from its own function, and its 'var' does not")
+xvs_a_module_val_refuses_a_write()
+    if xvr_no_library() then return
+
+    xvs_refused(xvr_ran([("m/a.sysl", "module m\n\nval n: int = 1\nvar k: int = 1\n\nbump()\n    k = 2\n    n += 1\n"),
+                         ("main.sysl", "m.bump()\nprint(m.k)\n")]),
+                "a 'val' is written once, so '+=' has nothing to write through", "m/a.sysl:8:5")
+    assert_eq(xvr_ran([("m/a.sysl", "module m\n\nval n: int = 1\nvar k: int = 1\n\nbump()\n    k = 2\n"),
+                       ("main.sysl", "m.bump()\nprint(m.k)\n")]),
+              "2\n")
+end xvs_a_module_val_refuses_a_write
+
+@test("and so does its address, where a 'val' refuses that too")
+xvs_so_does_its_address()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("static val n: int = 1\nvar p = &n\nprint(*p)"),
+                "a 'val' is written once, so '&' has nothing to write through", "main.sysl:2:9")
+    assert(xvs_ir("extern optind: i32\nvar p = &optind\nprint(*p)").contains("define i32 @main("))
+end xvs_so_does_its_address
+
+@test("while a pattern still cannot be written against one")
+xvs_no_pattern_against_one()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("extern optind: i32\n1i32 match\n    optind -> print(1)\n    _ -> print(2)"),
+                "'optind' is an 'extern' variable, which is read while the program runs, so a bare name " +
+                "here would bind rather than match — write it as '`optind`' to test the value it " +
+                "holds, or bind a different name", "main.sysl:3:5")
+
+// -- reached through the module system -------------------------------------------------------------
+
+@test("a public one is named fully-qualified with no import")
+xvs_named_fully_qualified()
+    if xvr_no_library() then return
+
+    assert(xvr_ir([("os/env.sysl", "module os\n\nextern environ: **u8"),
+                   ("main.sysl", "print(os.environ == null)")])
+        .contains("@environ = external global ptr\n"))
+
+@test("an imported one is named by its short name")
+xvs_named_by_its_short_name()
+    if xvr_no_library() then return
+
+    assert(xvr_ir([("os/env.sysl", "module os\n\nextern environ: **u8"),
+                   ("main.sysl", "import os.environ\n\nprint(environ == null)")])
+        .contains("@environ = external global ptr\n"))
+
+// -- the rules around it, asked rather than assumed ------------------------------------------------
+
+@test("it is a top-level declaration, like every other extern")
+xvs_a_top_level_declaration()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("f() -> int\n    extern optind: i32\n    1\nprint(f())"),
+                "structs, enums, traits, impls, externs, and types may only be declared at the top level",
+                "main.sysl:2:5")
+
+@test("a 'no alloc' module may name one, because reading C's storage allocates nothing")
+xvs_no_alloc_may_name_one()
+    if xvr_no_library() then return
+
+    assert(xvr_ir([("drv/a.sysl", "module drv\n@no_alloc\n\nextern optind: i32\n\nstep()\n    optind = 1i32\n"),
+                   ("main.sysl", "drv.step()\nprint(1)")])
+        .contains("@optind = external global i32\n"))
+
+@test("an aggregate one is declared after the type it names")
+xvs_an_aggregate_one()
+    if xvr_no_library() then return
+
+    val out = xvs_ir("struct Pair\n    a: i32\n    b: i32\nextern the_pair: Pair\nprint(the_pair.a)")
+    val ty = out.index_of("%struct.Pair = type { i32, i32 }\n")
+    val global = out.index_of("@the_pair = external global %struct.Pair\n")
+
+    assert(ty.is_some(), out)
+    assert(global.is_some(), out)
+    assert(ty.unwrap() < global.unwrap(), out)
+end xvs_an_aggregate_one
+
+@test("an array one is indexed, and its elements are places")
+xvs_an_array_one()
+    if xvr_no_library() then return
+
+    val out = xvs_ir("extern tab: [4]i32\ntab[0] = 7i32\nprint(tab[1])")
+
+    assert(out.contains("@tab = external global [4 x i32]\n"), out)
+    assert(out.contains("getelementptr i32, ptr @tab, i64 0\n"), out)
+    assert(out.contains("store i32 7, ptr"), out)
+    assert(out.contains("icmp ult i64 0, 4\n"), out)
+end xvs_an_array_one
+
+@test("a local of the same name shadows it, as a local shadows any module member")
+xvs_a_local_shadows_it()
+    if xvr_no_library() then return
+
+    assert_eq(xvs_ran("extern optind: i32\nvar optind = 5\nprint(optind)"), "5\n")
+
+@test("and two files of one module may not both declare it")
+xvs_two_files_of_one_module()
+    if xvr_no_library() then return
+
+    xvs_refused(xvr_ran([("os/a.sysl", "module os\n\nextern environ: **u8"),
+                         ("os/b.sysl", "module os\n\nextern environ: **u8"),
+                         ("main.sysl", "print(1)")]),
+                "'environ' is already declared", "os/b.sysl:3:1")
+
+// -- everything a place does, it does --------------------------------------------------------------
+
+@test("a compound assignment, and an increment, both reaching the one storage")
+xvs_compound_and_increment()
+    if xvr_no_library() then return
+
+    assert_eq(xvs_ran("extern optind: i32\noptind = 1i32\noptind += 4i32\noptind++\nprint(optind)"), "6\n")
+
+@test("slicing yields a view that may be written, where a 'val's yields one that may not")
+xvs_slicing_yields_a_writable_view()
+    if xvr_no_library() then return
+
+    xvs_refused(xvs_ran("static val t: [4]i32 = [0i32, 0i32, 0i32, 0i32]\nvar v = t[0..<2]\nv[0] = 1i32\nprint(v[0])"),
+                "this element belongs to a '[]const int', which views elements it may not write, so " +
+                "there is nothing to assign through. Elements you may write are elements of your own: " +
+                "copy them into a '[]int' first", "main.sysl:3:1")
+    assert(xvs_ir("extern tab: [4]i32\nvar v = tab[0..<2]\nv[0] = 1i32\nprint(v[0])").contains("define i32 @main("))
+end xvs_slicing_yields_a_writable_view
+
+@test("iterating one walks its elements")
+xvs_iterating_one()
+    if xvr_no_library() then return
+
+    assert(xvs_ir("extern tab: [4]i32\nvar n = 0i32\nfor x in tab\n    n += x\nprint(n)")
+        .contains("@tab = external global [4 x i32]\n"))
+
+@test("and a field of an aggregate one is written through")
+xvs_a_field_written_through()
+    if xvr_no_library() then return
+
+    val out = xvs_ir("struct Pair\n    a: i32\n    b: i32\nextern the_pair: Pair\nthe_pair.a = 3i32\nprint(the_pair.b)")
+
+    assert(out.contains("getelementptr %struct.Pair, ptr @the_pair, i32 0, i32 0\n"), out)
+    assert(out.contains("store i32 3, ptr"), out)
+end xvs_a_field_written_through
+
+@test("its address outlives every frame, so a function may hand one back")
+xvs_its_address_outlives_every_frame()
+    if xvr_no_library() then return
+
+    assert_eq(xvs_ran("extern optind: i32\nwhere_is() -> *i32 = &optind\noptind = 9i32\nprint(*where_is())"),
+              "9\n")
+
+@test("and it renders like any other value of its type")
+xvs_it_renders()
+    if xvr_no_library() then return
+
+    assert_eq(xvs_ran("extern optind: i32\noptind = 12i32\nprint(f\"[${optind}%4d]\")"), "[  12]\n")
+
+// -- what the chapters around it claim -------------------------------------------------------------
+
+@test("a sysl layout is the author's business here as it is at a parameter")
+xvs_a_sysl_layout()
+    if xvr_no_library() then return
+
+    assert(xvs_ir("extern s: string\nprint(s == \"\")").contains("@s = external global { ptr, ptr, i64 }\n"))
+
+// The library is a tree of one file holding the declaration, handed over in place of the installed
+// one: what is asked is what a LIBRARY module's key becomes, and `sysl` is where it differs most.
+@test("a symbol carries no module even where the key is a library one")
+xvs_no_module_even_in_the_library()
+    val root = make_temp_dir("sysl-xvs").unwrap()
+
+    make_dir_all(s"$root/sysl").unwrap()
+    write_text(s"$root/sysl/std.sysl", "module sysl\nextern environ: **u8\nmark(n: int) -> int = n + 1").unwrap()
+
+    val library = std_units(root, host_target())
+
+    remove_dir_all(root).unwrap_or(())
+
+    val out = xvr_ir_with(library.unwrap(), xvs_main("mark(if environ == null then 0 else 1)"))
+
+    assert(out.contains("@environ = external global ptr\n"), out)
+    assert(!out.contains(s"@${module_qualify("sysl", "environ")}"), out)
+end xvs_no_module_even_in_the_library
+
+@test("a 'no alloc' module writing one is not a narrowing it broke")
+xvs_no_alloc_writing_one()
+    if xvr_no_library() then return
+
+    assert(xvr_ir([("drv/a.sysl", "module drv\n@no_alloc\n\nextern optind: i32\n\nreset()\n    optind = 1i32\n"),
+                   ("main.sysl", "drv.reset()\nprint(1)")])
+        .contains("store i32 1, ptr @optind\n"))
+
+@test("a computed 'val' may be filled from one, and the loader has already filled it")
+xvs_a_computed_val_filled_from_one()
+    if xvr_no_library() then return
+
+    assert_eq(xvs_ran("extern optind: i32\nstatic val start: i32 = optind\nprint(start)"), "1\n")
+
+// A test build's roots are the tests, so the one reader of the storage is a test.
+@test("a '@test' build declares one that only a test reads")
+xvs_a_test_build_declares_one()
+    if std_root().is_err() || !clang_available() then return
+
+    val root = runner_project("main.sysl", "extern optind: i32\n\n@test(\"a write to C's storage is read back from it\")\n" +
+                                           "round_trips() =\n    optind = 7i32\n    assert(optind == 7i32, \"optind\")\n")
+    val file = s"$root/main.sysl"
+
+    val build = test_build_of(file, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return
+        Ok(made) -> made
+
+    assert(build.emitted.report.is_empty(), analysis_report(build.emitted.report))
+    assert(build.emitted.text.contains("@optind = external global i32\n"), build.emitted.text)
+
+    val exe = build_test_binary(file, build, None, DefaultOptimization) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return
+        Ok(built) -> built
+
+    val ran = run_selected(exe, build.tests, TestOptions(None, false), 0, piece -> ())
+
+    discard_test_binary(exe)
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(ran.len(), 1)
+    assert(ran.at(0).passed(), ran.at(0).output)
+end xvs_a_test_build_declares_one
+
+@test("a public one may not name a private type, exactly as a public function may not")
+xvs_a_public_one_may_not_name_a_private_type()
+    if xvr_no_library() then return
+
+    val hidden = "module os\n\nprivate struct Hidden\n    a: i32\n"
+    val rest = "/os/env.sysl', the file that declares it — a declaration may not be more visible than the types it names\n"
+
+    val got = xvr_ran([("os/env.sysl", hidden + "\nget() -> Hidden = Hidden(1)"), ("main.sysl", "print(1)")])
+
+    assert(got.contains("error: 'get' is public, but its result names 'os.Hidden', which is private to '"), got)
+    assert(got.contains(rest), got)
+    assert(got.contains("/os/env.sysl:6:10\n"), got)
+
+    val there = xvr_ran([("os/env.sysl", hidden + "\nextern there: Hidden"), ("main.sysl", "print(1)")])
+
+    assert(there.contains("error: 'there' is public, but its type names 'os.Hidden', which is private to '"), there)
+    assert(there.contains(rest), there)
+    assert(there.contains("/os/env.sysl:6:15\n"), there)
+
+    assert(xvr_ir([("os/env.sysl", hidden + "\nprivate extern there: Hidden"), ("main.sysl", "print(1)")])
+        .contains("define i32 @main("))
+end xvs_a_public_one_may_not_name_a_private_type
+
+// -- reaching a C global that is actually there ----------------------------------------------------
+
+// `stdout` is a macro in C, and what the linker has under it is the platform's: macOS exports
+// `__stdoutp`, glibc `stdout` itself, so the fixture says both the way a program would.
+@test("stdout is libc's own stream, in the order print writes to it")
+xvs_stdout_is_libcs_own()
+    if xvr_no_library() then return
+
+    assert_eq(xvs_ran("#if macos\nextern \"__stdoutp\" stdout: *u8\n#else\nextern stdout: *u8\n#endif\n" +
+                      "extern fputs(s: *u8, stream: *u8) -> i32\nprint(\"one\")\nfputs(c\"two\\n\", stdout)\n" +
+                      "print(\"three\")"),
+              "one\ntwo\nthree\n")
+
+@test("and stderr is a different stream, so what goes there is not what came back")
+xvs_stderr_is_a_different_stream()
+    if xvr_no_library() then return
+
+    assert_eq(xvs_ran("#if macos\nextern \"__stderrp\" stderr: *u8\n#else\nextern stderr: *u8\n#endif\n" +
+                      "extern fputs(s: *u8, stream: *u8) -> i32\nfputs(c\"to stderr\\n\", stderr)\n" +
+                      "print(\"to stdout\")"),
+              "to stdout\n")
+
+@test("environ is a null-terminated vector of NAME=VALUE, walked to its end")
+xvs_environ_walked_to_its_end()
+    if xvr_no_library() then return
+
+    assert_eq(xvs_ran("extern environ: **u8\nvar n = 0\nvar all_named = true\nwhile environ[n] != null\n" +
+                      "    var e = environ[n]\n    var i = 0\n    var named = false\n    while e[i] != 0u8\n" +
+                      "        if e[i] == 61u8 then named = true\n        i++\n" +
+                      "    if !named then all_named = false\n    n++\nprint(n > 0, all_named)"),
+              "true true\n")
+
+@test("optind is written, and getopt reads back what was written")
+xvs_optind_is_written()
+    if xvr_no_library() then return
+
+    assert_eq(xvs_ran("extern optind: i32\nextern getopt(argc: i32, argv: **u8, opts: *u8) -> i32\n" +
+                      "var argv: [3]*u8 = [c\"prog\", c\"-a\", null]\noptind = 1i32\n" +
+                      "var first = getopt(2i32, &argv[0], c\"a\")\nprint(first == 97i32, optind)"),
+              "true 2\n")

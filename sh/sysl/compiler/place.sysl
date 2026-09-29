@@ -20,8 +20,14 @@ analyze_place(cx: &Analyzer, target: Expr, what: string) -> TExpr =
 //
 // `writes` separates the two questions. Both need an address, and only one of them *is* a write:
 // `&` hands back a `*T`, and what a program does with a raw pointer is the unsafe tier's business.
-require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool) -> TExpr
+//
+// `anchor` is where a refusal is reported, where that is not the target itself: a `&` is refused at
+// the whole `&x`, which is the form that asked for the address.
+require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool,
+              anchor: Option[Span] = None) -> TExpr
     if texpr_type(t) == Unknown then return t
+
+    val at = anchor.unwrap_or(target.span)
 
     // A **captured** name reaches storage the walk below cannot see the binding of, so being
     // written once is asked of the name it was declared under rather than of what it turned into.
@@ -31,7 +37,7 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool)
         val local = cx.lookup(named.unwrap())
 
         if local.is_some() && local.unwrap().read_only
-            cx.fault(target.span, written_once(local.unwrap(), what))
+            cx.fault(at, written_once(local.unwrap(), what))
 
             return t
         end if
@@ -42,15 +48,14 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool)
     *t.kind match
         TIndex(recv, _, _) ->
             if texpr_type(recv) == Str
-                cx.fault(target.span,
-                         "a string is immutable, so its bytes have no address to write through")
+                cx.fault(at, "a string is immutable, so its bytes have no address to write through")
                 return t
             end if
 
             // `s.bytes` reinterprets the string's own storage rather than a copy of it, so writing
             // through one is writing the string.
             if writes && is_bytes(recv)
-                cx.fault(target.span, "a string is immutable, and 'bytes' views the string's own " +
+                cx.fault(at, "a string is immutable, and 'bytes' views the string's own " +
                          "storage rather than a copy of it — so writing through one is writing " +
                          "the string. Bytes you may write are bytes of your own: copy them into a " +
                          "'[]u8' first")
@@ -58,7 +63,7 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool)
             end if
 
             if writes && read_only_view(texpr_type(recv)) && texpr_type(recv) != Str
-                cx.fault(target.span, s"this element belongs to a " +
+                cx.fault(at, s"this element belongs to a " +
                          s"'${type_show(texpr_type(recv))}', which views elements it may not " +
                          "write, so there is nothing to assign through. Elements you may write " +
                          "are elements of your own: copy them into a " +
@@ -68,7 +73,7 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool)
         _ -> ()
 
     if !writable_place(t)
-        cx.fault(target.span, s"$what needs a variable, a field, an element, or a dereference — " +
+        cx.fault(at, s"$what needs a variable, a field, an element, or a dereference — " +
                  "something with an address")
 
         return t
@@ -77,7 +82,12 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool)
     val root = root_local(cx, t)
 
     if root.is_some() && root.unwrap().read_only then
-        cx.fault(target.span, written_once(root.unwrap(), what))
+        cx.fault(at, written_once(root.unwrap(), what))
+
+    // Module storage bound by a `val` is written once for the same reason a local one is: the
+    // promise is about the name, and the name is the module's.
+    if root.is_none() && global_written_once(t) then
+        cx.fault(at, s"a 'val' is written once, so $what has nothing to write through")
 
     t
 end require_place
