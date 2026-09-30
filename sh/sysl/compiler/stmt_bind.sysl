@@ -324,6 +324,11 @@ private bind_pattern(cx: &Analyzer, span: Span, p: Pattern, subject: TExpr,
         VariantPattern(written, args) ->
             underlying(texpr_type(subject)) match
                 Struct(d) -> bind_positional(cx, span, written, args, subject, mutable, d)
+                // A `?` value was refused where it was made. Its names are not bound -- the
+                // reference reports a later use of one as undefined -- and nothing is said here.
+                Unknown ->
+                    cx.an.poison_quietly()
+                    buf()
                 _ ->
                     cx.fault(span, "a binding cannot choose among variants — this pattern matches " +
                              "one of several shapes, and a binding has no other arm to take when " +
@@ -389,6 +394,8 @@ private bind_parts(cx: &Analyzer, span: Span, args: Buf[Pattern], subject: TExpr
 
             out
 
+        Unknown -> unknown_parts(cx, span, args, subject, mutable)
+
         other ->
             cx.fault(span, s"one ${type_show(other)} is not something to take apart — only a " +
                      "tuple is")
@@ -428,9 +435,32 @@ private bind_fields(cx: &Analyzer, span: Span, name: string, fields: Buf[FieldPa
 
             out
 
+        Unknown ->
+            var subs: Buf[Pattern] = buf()
+
+            for i in 0..<fields.len()
+                subs.push(fields.at(i).pat)
+
+            unknown_parts(cx, span, subs, subject, mutable)
+
         other ->
             cx.fault(span, s"'$name{…}' matches a struct, but the value is ${type_show(other)}")
             buf()
+
+// Taking apart a value whose type could not be worked out: its mistake was told where it was made,
+// so the binding says nothing more and the statement gives up over it -- and every name it writes
+// is still bound, at `?`, so the statements after it read them quietly.
+private unknown_parts(cx: &Analyzer, span: Span, args: Buf[Pattern], subject: TExpr,
+                      mutable: bool) -> Buf[TStmt]
+    cx.an.poison_quietly()
+
+    var out: Buf[TStmt] = buf()
+
+    for i in 0..<args.len()
+        push_all(&out, bind_pattern(cx, span, args.at(i), subject, mutable))
+
+    out
+end unknown_parts
 
 private bind_positional(cx: &Analyzer, span: Span, written: string, args: Buf[Pattern],
                         subject: TExpr, mutable: bool, d: &StructType) -> Buf[TStmt]

@@ -300,9 +300,18 @@ private solved_subject(cx: &Analyzer, span: Span, key: string, name: string, arg
     var arg_tys: Buf[Type] = buf()
     var soft: Buf[bool] = buf()
 
+    // **A bare reading that was refused settles nothing**: `Box.arr([1, 5000000000], wide)` is a
+    // `Box[u64]` call, where reading the array alone refuses its second element at `int`. Taken as
+    // the `[2]int` that reading produced, it would settle `T` ahead of the argument that knew; taken
+    // as a soft `?`, it is read again below at the parameter the others settled.
     for i in 0..<args.len()
-        arg_tys.push(texpr_type(sandboxed_arg(cx, args.at(i), None)))
-        soft.push(false)
+        sandboxed_attempt(cx, args.at(i)) match
+            Some(t) ->
+                arg_tys.push(texpr_type(t))
+                soft.push(false)
+            None ->
+                arg_tys.push(Unknown)
+                soft.push(true)
 
     // **The call is what the refusal names, not the type** -- `M.one`, since a reader told the
     // argument of `M` could not be inferred has nowhere to write one, `M` not being what they wrote.

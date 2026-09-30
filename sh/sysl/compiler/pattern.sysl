@@ -274,6 +274,8 @@ private variant_pattern(cx: &Analyzer, span: Span, written: string, args: Buf[Pa
                                 "match the fields it does offer by name, as 'Name{…}'")
             TStructPattern(d, sub_patterns(cx, args, d.fields))
 
+        Unknown -> unknown_subject(cx, args, ty)
+
         other ->
             cx.fault(span, s"'$name(…)' matches an enum variant or a struct, but the value is " +
                      s"${type_show(other)}${held_behind(other)}")
@@ -297,6 +299,8 @@ private tuple_pattern(cx: &Analyzer, span: Span, args: Buf[Pattern], ty: Type) -
                          s"but ${supplied(args.len(), "sub-pattern")}")
 
             TStructPattern(d, sub_patterns(cx, args, d.fields))
+
+        Unknown -> unknown_subject(cx, args, ty)
 
         other ->
             cx.fault(span, s"'(…)' matches a tuple, but the value is " +
@@ -336,10 +340,31 @@ private struct_pattern(cx: &Analyzer, span: Span, name: string, fields: Buf[Fiel
 
             TStructPattern(d, args)
 
+        Unknown ->
+            var subs: Buf[Pattern] = buf()
+
+            for i in 0..<fields.len()
+                subs.push(fields.at(i).pat)
+
+            unknown_subject(cx, subs, ty)
+
         other ->
             cx.fault(span, s"'$name{…}' matches a struct, but the value is " +
                      s"${type_show(other)}${held_behind(other)}")
             TWildPattern(ty)
+
+// A shape tested against a value whose type could not be worked out -- `if y is Some(v)` over a `y`
+// whose initializer was refused. That mistake was told where it was made, so the pattern says
+// nothing more and the statement gives up over it; the names inside are still bound, at `?`, so an
+// arm that reads one is as quiet as the pattern.
+private unknown_subject(cx: &Analyzer, args: Buf[Pattern], ty: Type) -> TPattern
+    cx.an.poison_quietly()
+
+    var none: Buf[(string, Type)] = buf()
+
+    sub_patterns(cx, args, none)
+    TWildPattern(ty)
+end unknown_subject
 
 private field_pattern_named(fields: Buf[FieldPattern], name: string) -> Option[Pattern]
     for i in 0..<fields.len()
