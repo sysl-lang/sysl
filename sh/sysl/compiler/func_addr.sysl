@@ -15,8 +15,15 @@ import sysl.buf.{Buf, buf}
 names_a_declared_function(cx: &Analyzer, operand: Expr) -> Option[string] = *operand.kind match
     Ident(n) ->
         if cx.lookup(n).is_some() then None
-        else if function_keys(cx, n).is_empty() then None
-        else Some(n)
+        else if !function_keys(cx, n).is_empty() then Some(n)
+        else if extern_key(cx, n).is_some() then Some(n)
+        else None
+    // **A function named through its module** is a chain of member reads after parsing, and it is
+    // the same declaration the imported spelling names. A head bound to a value makes the chain a
+    // member read and nothing else: the nearest binding wins, as it does for every qualified form.
+    Field(_, _) -> dotted_name_written(cx, operand) match
+        Some(dotted) -> if names_a_function(cx, dotted) then Some(dotted) else None
+        None -> None
     // **`&f[T]` is the spelling the refusal below tells a reader to write**, and brackets in an
     // expression are indexing, so a generic function addressed at written type arguments arrives
     // as an index over its own name. A name that is a place indexes as one, the `Ident` arm above
@@ -38,6 +45,12 @@ addressed_type_args(operand: Expr) -> Buf[Expr] = *operand.kind match
 // The address itself.
 function_address(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf[Expr],
                  expected: Option[Type]) -> TExpr
+    if function_keys(cx, written).is_empty()
+        val foreign = extern_key(cx, written)
+
+        if foreign.is_some() then return extern_address(cx, span, written, foreign.unwrap(), targ_exprs)
+    end if
+
     val key = addressed_overload(cx, span, written, expected)
 
     if key == "" then return bad_expr(span)
@@ -133,6 +146,74 @@ function_address(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf[Exp
     TExpr(span, TFuncAddr(inst, inst, CFn(ptypes, ret)))
 end function_address
 
+// A call through a C function pointer, which goes through the pointer rather than through a table.
+//
+// **The type is the only thing describing what it takes**: a function pointer's parameters have no
+// names and no defaults, so the count is exact, a mismatch names the position, and the callee the
+// refusal names is the type itself. The positions are the written ones -- a zero-sized parameter is
+// dropped from the emitted call and still counts here.
+call_pointer(cx: &Analyzer, span: Span, recv: TExpr, ty: Type, params: Buf[Type], ret: Type,
+             args: Buf[Expr]) -> TExpr
+    if args.len() != params.len()
+        val noun = if params.len() == 1 then "argument" else "arguments"
+
+        return cx.err(span, s"a ${type_show(ty)} is called with ${params.len()} $noun, and " +
+                      s"${args.len()} were given")
+    end if
+
+    val before = cx.an.complaints()
+    var ts: Buf[TExpr] = buf()
+
+    for i in 0..<args.len()
+        ts.push(type_expr(cx, args.at(i), Some(params.at(i))))
+
+    // An argument that could not be read has been told already, and is the call's one mistake.
+    if cx.an.complaints() > before
+        for i in 0..<ts.len()
+            if texpr_type(ts.at(i)) == Unknown then return bad_expr(span)
+
+    for i in 0..<ts.len()
+        val got = texpr_type(ts.at(i))
+
+        if disagree(got, params.at(i)) then
+            return cx.err(args.at(i).span, s"the ${ordinal(i + 1)} argument of ${type_show(ty)} is " +
+                          s"${type_show(params.at(i))}, but ${type_show(got)} was given")
+
+    TExpr(span, TCallPtr(recv, ts, params, ret))
+end call_pointer
+
+// The address of an `extern`, which is the symbol the linker resolves.
+//
+// **Nothing about its signature is asked**: the rule that refuses an aggregate is a statement about
+// code this compiler laid out its own way, and a C function is code it neither compiled nor chose a
+// convention for. Its type is what the declaration transcribed from the header, parameter by
+// parameter, and the address is of exactly that.
+private extern_address(cx: &Analyzer, span: Span, written: string, key: string,
+                       targ_exprs: Buf[Expr]) -> TExpr
+    if !reachable_key(cx.an, key, cx.scope) then return cx.err(span, out_of_reach(cx.an, key))
+
+    val d = cx.an.tables.externs.get(key).unwrap()
+    val scope = extern_scope(cx, key)
+
+    if !targ_exprs.is_empty() then
+        return cx.err(span, s"'$written' is not generic, so it has no type arguments to write — " +
+                      s"the address is '&$written'")
+
+    if d.variadic then
+        return cx.err(span, s"'$written' is variadic, and a '*extern' fixes the arguments a call " +
+                      "passes — a tail has no width a signature could state, so a variadic " +
+                      "function is reached by calling it")
+
+    var ptypes: Buf[Type] = buf()
+
+    for i in 0..<d.params.len()
+        ptypes.push(resolve_type(cx.an, scope, d.params.at(i).typ, no_bindings()))
+
+    cx.an.uses_extern(key)
+
+    TExpr(span, TFuncAddr(key, key, CFn(ptypes, declared_result(cx, scope, d.ret_type))))
+end extern_address
+
 // Which declaration of an overloaded name an address is of.
 //
 // **The expected type decides, and it is the same mechanism a generic function's arguments are read
@@ -157,17 +238,31 @@ private addressed_overload(cx: &Analyzer, span: Span, written: string,
 
     val wanted = if expected.is_none() then None else cfn_of(expected.unwrap())
     var fits: Buf[string] = buf()
+    var declared = ""
 
+    // **A declaration with no type parameters has no instantiation in the tables**, so what it takes
+    // is read off the declaration itself -- which is every member of an ordinary overload set.
     for i in 0..<keys.len()
         val sig = cx.an.tables.members.func_insts.get(keys.at(i))
+        val f = cx.an.tables.funcs.get(keys.at(i))
+        var ps: Buf[Type] = buf()
+        var ret = Unit
 
-        if wanted.is_some() && sig.is_some()
-            var ps: Buf[Type] = buf()
-
+        if sig.is_some()
             for j in 0..<sig.unwrap().params.len()
                 ps.push(sig.unwrap().params.at(j).1)
 
-            if types_eq(ps, wanted.unwrap().0) then fits.push(keys.at(i))
+            ret = sig.unwrap().ret
+        else if f.is_some() && f.unwrap().decl.tparams.is_empty()
+            for j in 0..<f.unwrap().decl.params.len()
+                ps.push(param_type(cx, f.unwrap(), f.unwrap().decl.params.at(j)))
+
+            ret = declared_result(cx, f.unwrap().scope, f.unwrap().decl.ret_type)
+        else continue
+
+        declared = declared + s"\n    $written: ${type_show(CFn(ps, ret))}"
+
+        if wanted.is_some() && types_eq(ps, wanted.unwrap().0) then fits.push(keys.at(i))
 
     if fits.len() == 1 then return fits.at(0)
 
@@ -180,7 +275,8 @@ private addressed_overload(cx: &Analyzer, span: Span, written: string,
 
     if fits.is_empty()
         cx.fault(span, s"no '$written' has the parameters " +
-                 s"'${type_show(expected.unwrap())}' asks for")
+                 s"'${type_show(expected.unwrap())}' asks for — the declarations of that name " +
+                 s"are:$declared")
         return ""
     end if
 
