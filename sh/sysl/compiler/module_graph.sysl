@@ -1,0 +1,154 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// The rule that no two modules may depend on each other, directly or through a chain.
+//
+// **The graph the rule is about is the REFERENCE graph, not the import graph.** A qualified path
+// reaches another module's declaration with no import at all, so a file can depend on a module its
+// header never mentions; the edges are therefore the ones resolution recorded (`depends_on`), and an
+// import contributes one of its own whether or not the name it bought is ever written.
+//
+// Being acyclic is what makes a module's dependencies *finished* before the module itself is looked
+// at, which is what lets capability propagation be one sweep and would let modules compile in
+// dependency order. Cycles **within** a module stay free: sibling files share one scope, and a
+// module does not depend on itself, so there is no edge for one to be found along.
+
+// Reports every cycle in the module graph.
+//
+// It runs once every body a program reaches has been typed, because an edge is made by a reference
+// and a reference may be anywhere a body is -- including one only reached by instantiating a generic.
+//
+// **Each cycle reported is broken at the reference the diagnostic points at**, so the search goes on
+// and finds one somewhere else in the graph. Without that a second, unrelated cycle would be
+// invisible until the first was fixed; with it one mistake is still reported once, because the edge
+// taken out is exactly the one the reader was told about.
+check_module_graph(a: &Analysis)
+    var live: Buf[(string, string)] = buf()
+
+    for i in 0..<a.tables.module_edges.len()
+        val e = a.tables.module_edges.at(i)
+
+        live.push((e.from, e.to))
+
+    loop
+        val cycle = find_cycle(live)
+
+        if cycle.is_empty() then break
+
+        report_cycle(a, cycle)
+        live = without_edge(live, cycle.at(0), cycle.at(1))
+end check_module_graph
+
+// Some cycle among the edges, as the modules on it in the order they depend on one another -- `a`,
+// `b`, `c` for `a` depending on `b` depending on `c` depending on `a` -- or nothing.
+//
+// A depth-first walk, with the modules and each module's dependencies both taken in name order so
+// that which cycle is found does not depend on the order the files happened to be read in. **A
+// module whose walk came back clean is not walked again**, which is what keeps a diamond from
+// costing exponential time.
+private find_cycle(edges: Buf[(string, string)]) -> Buf[string]
+    var starts: Buf[string] = buf()
+
+    for i in 0..<edges.len()
+        if !holds_string(starts, edges.at(i).0) then starts.push(edges.at(i).0)
+
+    val order = sort_names(starts)
+    var settled: Buf[string] = buf()
+    val nowhere: Buf[string] = buf()
+
+    for i in 0..<order.len()
+        val found = cycle_through(edges, order.at(i), nowhere, &settled)
+
+        if !found.is_empty() then return found
+
+    nowhere
+end find_cycle
+
+// The cycle a walk from one module arrives at, having come along `path` to reach it.
+private cycle_through(edges: Buf[(string, string)], m: string, path: Buf[string],
+                      settled: *Buf[string]) -> Buf[string]
+    for i in 0..<path.len()
+        if path.at(i) == m then return turned(path, i)
+
+    val none: Buf[string] = buf()
+
+    if holds_string(*settled, m) then return none
+
+    var here: Buf[string] = buf()
+
+    for i in 0..<path.len()
+        here.push(path.at(i))
+
+    here.push(m)
+
+    val next = reached_from(edges, m)
+
+    for i in 0..<next.len()
+        val found = cycle_through(edges, next.at(i), here, settled)
+
+        if !found.is_empty() then return found
+
+    settled.push(m)
+    none
+end cycle_through
+
+// What a module depends on, in name order.
+private reached_from(edges: Buf[(string, string)], m: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<edges.len()
+        if edges.at(i).0 == m then out.push(edges.at(i).1)
+
+    sort_names(out)
+end reached_from
+
+// The part of a path that is a cycle, turned so that it begins at the first of its modules by name.
+//
+// **Which module a walk REACHES a cycle at is an accident of where it started; which module the
+// message begins with should not be.** Turning it makes one cycle read one way whatever found it, so
+// a program's diagnostics do not change when a file is renamed.
+private turned(path: Buf[string], from: usize) -> Buf[string]
+    var least = from
+
+    for i in from..<path.len()
+        if path.at(i) < path.at(least) then least = i
+
+    var out: Buf[string] = buf()
+
+    for i in least..<path.len()
+        out.push(path.at(i))
+
+    for i in from..<least
+        out.push(path.at(i))
+
+    out
+end turned
+
+// The edges with one taken out.
+private without_edge(edges: Buf[(string, string)], from: string, to: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    for i in 0..<edges.len()
+        if edges.at(i).0 != from || edges.at(i).1 != to then out.push(edges.at(i))
+
+    out
+end without_edge
+
+// One cycle, said as the chain it is, pointing at the reference that begins the chain -- the place
+// in the first module where it reaches the second, from which a reader can follow the rest.
+private report_cycle(a: &Analysis, cycle: Buf[string])
+    val first = cycle.at(0)
+    var chain = ""
+
+    for i in 1..<cycle.len()
+        chain = chain + s"'${cycle.at(i)}', which depends on "
+
+    for i in 0..<a.tables.module_edges.len()
+        val e = a.tables.module_edges.at(i)
+
+        if e.from == first && e.to == cycle.at(1)
+            a.fault(e.scope, e.span, s"'$first' depends on $chain'$first' — modules may not depend " +
+                    "on each other, directly or through a chain")
+            return
+end report_cycle
