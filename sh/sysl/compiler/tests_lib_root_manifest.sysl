@@ -267,7 +267,11 @@ lbm_a_roots_header_requirement_is_asked()
     val expected = lbm_header_refusal(lib, "the probe library's headers")
     val built = lbr_cli(["sysl", "build", app, "--lib", lib, "-o", s"$out_dir/program"])
     val ran = lbr_cli(["sysl", "run", app, "--lib", lib])
-    val tested = lbr_cli(["sysl", "test", app, "--lib", lib])
+    // A tree with no test is answered here before any toolchain is asked (the reference asks anyway),
+    // so the one `test` is handed has something to link.
+    val with_test = lbr_tree(lbr_two("main.sysl", "print(hroot.value())\n", "t/t.sysl",
+        "module t\n\n@test(\"reaches the root\")\nreaches()\n    assert(hroot.value() == 42, \"value\")\n"))
+    val tested = lbr_cli(["sysl", "test", with_test, "--lib", lib])
     val archived = lbr_cli(["sysl", "build-c", app, "--lib", lib])
 
     assert_eq(built.0, Failed)
@@ -278,7 +282,7 @@ lbm_a_roots_header_requirement_is_asked()
     assert_eq(tested.1, expected)
     assert_eq(archived.0, Failed)
     assert_eq(archived.1, expected)
-    lbr_drop([lib, app, out_dir])
+    lbr_drop([lib, app, with_test, out_dir])
 end lbm_a_roots_header_requirement_is_asked
 
 @test("and answered by the flag that names it")
@@ -397,6 +401,23 @@ lbm_a_roots_pkg_config_is_probed()
         "nosuchlib-9=<dir>' and '--link-path <dir>'")
     lbr_drop([lib, app])
 end lbm_a_roots_pkg_config_is_probed
+
+// The advice names both flags that stand in for a probe, the project's own need as much as a root's
+// -- it used to end at "Install it", leaving the other way out unsaid.
+@test("a pkg_config refusal names the flags that answer it instead of an install")
+lbm_a_pkg_config_refusal_names_the_flags()
+    if !lbr_ready() then return
+
+    val app = lbm_project("print(1)\n",
+        "package { name = \"app\" }\nrequires { pkg_config { nosuchlib-9 = \"a library nobody has\" } }\n")
+    val said = lbr_cli(["sysl", "run", app])
+
+    assert_eq(said.0, Failed)
+    assert_eq(said.1, "error: this project needs the 'nosuchlib-9' library and 'pkg-config' knows no " +
+        "'nosuchlib-9' — a library nobody has. Install it, or say where it is with '--include-path " +
+        "nosuchlib-9=<dir>' and '--link-path <dir>'")
+    lbr_drop([app])
+end lbm_a_pkg_config_refusal_names_the_flags
 
 // The half a refusal cannot show: what was found reaches the link line. Without the manifest the
 // same root is `Undefined symbols: _zlibVersion` at the link.
