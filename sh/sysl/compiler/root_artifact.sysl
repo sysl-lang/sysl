@@ -104,19 +104,21 @@ roots_linked(program: Compilation, project: string, level: string,
     if libs.is_empty() || std_from_source() || !t.builds_with_clang() then return out
 
     for i in 0..<libs.len()
-        root_linked(program, project, libs.at(i), level, cc, &out)
+        root_linked(program, project, libs.at(i), level, cc, &out) match
+            Err(why) -> from_source(libs.at(i), why)
+            Ok(_) -> ()
 
     out
 end roots_linked
 
-// One root, added to `out` where it can be precompiled.
+// One root, added to `out` where it can be precompiled, or why it is compiled from source.
 private root_linked(program: Compilation, project: string, given: string, level: string,
-                    cc: Option[string], out: *RootsLinked)
+                    cc: Option[string], out: *RootsLinked) -> Result[unit, string]
     val t = program.target
     val root = absolute_path(given)
     val mine = root_unit_indices(program, root)
 
-    if mine.is_empty() then return from_source(given, "it holds no files of this compilation")
+    if mine.is_empty() then return Err("it holds no files of this compilation")
 
     var modules: Buf[string] = buf()
     var files: Buf[string] = buf()
@@ -135,11 +137,9 @@ private root_linked(program: Compilation, project: string, given: string, level:
             val name = module_written(program.units.at(i))
 
             if holds_string(modules, name)
-                return from_source(given, s"another file declares into its module '$name'")
+                return Err(s"another file declares into its module '$name'")
 
-    val key = root_key(program, project, root, mine, level, cc) match
-        Err(why) -> return from_source(given, why)
-        Ok(k) -> k
+    val key = root_key(program, project, root, mine, level, cc)?
 
     val dir = root_cache_dir()
 
@@ -153,7 +153,7 @@ private root_linked(program: Compilation, project: string, given: string, level:
                     root_hits += 1
                     in_use(path)
                     take(out, symbols, path)
-                    return
+                    return Ok(())
                 Err(_) -> ()
         None -> ()
 
@@ -169,31 +169,31 @@ private root_linked(program: Compilation, project: string, given: string, level:
 
     // **Closed**: the root analyzes without the project.
     if !built.report.is_empty()
-        return from_source(given, s"it does not analyze without the program: " +
+        return Err(s"it does not analyze without the program: " +
             s"${built.report.at(0).render().trim_end()}")
 
     val place = dir match
         Some(d) -> s"$d/$key$SyslibExtension"
         None -> make_temp_dir("sysl-root-") match
-            Err(_) -> return from_source(given, "no directory to build its artifact in")
+            Err(_) -> return Err("no directory to build its artifact in")
             Ok(made) ->
                 out.staging.push(made)
                 s"$made/root$SyslibExtension"
 
-    write_root_artifact(built, place, key, t, cc, level) match
-        Err(why) -> return from_source(given, why)
-        Ok(symbols) ->
-            root_built += 1
+    val symbols = write_root_artifact(built, place, key, t, cc, level)?
 
-            dir match
-                Some(d) ->
-                    in_use(place)
-                    evict_roots(d)
-                None -> ()
+    root_built += 1
 
-            if verbose() then eprints(s"sysl: --lib $given: compiled into $place\n")
+    dir match
+        Some(d) ->
+            in_use(place)
+            evict_roots(d)
+        None -> ()
 
-            take(out, symbols, place)
+    if verbose() then eprints(s"sysl: --lib $given: compiled into $place\n")
+
+    take(out, symbols, place)
+    Ok(())
 end root_linked
 
 private take(out: *RootsLinked, symbols: Buf[string], archive: string)

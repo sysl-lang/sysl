@@ -1,0 +1,335 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, make_dir_all, make_temp_dir, read_bytes, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, Search}
+
+// **A `--lib` root's compiled sysl is kept** (`root_artifact.sysl`). What a case observes is the
+// cache's own count of hits, artifacts built and roots compiled from source, never a clock; every
+// case keeps its artifacts (and its C objects) in directories of its own, so nothing here reads or
+// leaves an entry in the machine's cache.
+//
+// **The proof that a hit is sound is the executable**: one built from a cached artifact is the same
+// bytes as one built with `SYSL_NO_CACHE=1`, each linked under one basename, the linker's ad-hoc
+// signature carrying it.
+
+private extern "setenv" rtc_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" rtc_c_unsetenv(name: *u8) -> int
+
+private rtc_setenv(name: string, value: string)
+    val n = cstring(name)
+    val v = cstring(value)
+
+    rtc_c_setenv(n.ptr, v.ptr, 1)
+end rtc_setenv
+
+private rtc_unsetenv(name: string)
+    val n = cstring(name)
+
+    rtc_c_unsetenv(n.ptr)
+end rtc_unsetenv
+
+private rtc_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A directory for the case's executables and one for its caches, with the counts cleared.
+private rtc_begin() -> (string, string)
+    val work = absolute_path(make_temp_dir("sysl-rtc").unwrap())
+    val cache = make_temp_dir("sysl-rtc-cache").unwrap()
+
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    clear_root_artifact_counts()
+    (work, cache)
+end rtc_begin
+
+private rtc_end(dirs: (string, string), trees: []string)
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    reset_search_paths()
+    remove_dir_all(dirs.0).unwrap_or(())
+    remove_dir_all(dirs.1).unwrap_or(())
+    lbr_drop(trees)
+end rtc_end
+
+// What a build of `path` with these roots prints, the executable left at `exe`.
+private rtc_build(path: string, libs: []string, exe: string) -> string
+    lbr_hand(libs)
+    make_dir_all(parent_of(exe).unwrap()).unwrap()
+
+    build_native_program(path, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+end rtc_build
+
+private rtc_counts() -> string
+    val c = root_artifact_counts()
+
+    s"hits ${c.0}, built ${c.1}, from source ${c.2}"
+end rtc_counts
+
+// The artifacts a cache holds.
+private rtc_artifacts(cache: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    entries(s"$cache/sysl/roots") match
+        Err(_) -> ()
+        Ok(names) ->
+            for i in 0..<names.len()
+                if names.at(i).ends_with(SyslibExtension) then out.push(s"$cache/sysl/roots/${names.at(i)}")
+
+    out
+end rtc_artifacts
+
+// What the one artifact in a cache advertises.
+private rtc_advertised(cache: string) -> Buf[string]
+    val found = rtc_artifacts(cache)
+
+    assert_eq(found.len(), 1)
+
+    val meta = syslib_metadata_at(found.at(0)).unwrap()
+
+    syslib_read(found.at(0), meta, host_target()).unwrap().0
+end rtc_advertised
+
+private rtc_same(a: string, b: string) -> bool
+    val x = read_bytes(a).unwrap()
+    val y = read_bytes(b).unwrap()
+
+    if x.len != y.len then return false
+
+    for i in 0..<x.len
+        if x[i] != y[i] then return false
+
+    true
+end rtc_same
+
+// Built with the cache (a hit) and with `SYSL_NO_CACHE=1`, each at `<dir>/<which>/prog`: the same
+// bytes, and the same output.
+private rtc_identical(path: string, libs: []string, work: string, expected: string)
+    assert_eq(rtc_build(path, libs, s"$work/cached/prog"), expected)
+
+    rtc_setenv("SYSL_NO_CACHE", "1")
+
+    val plain = rtc_build(path, libs, s"$work/uncached/prog")
+
+    rtc_unsetenv("SYSL_NO_CACHE")
+    assert_eq(plain, expected)
+    assert(rtc_same(s"$work/cached/prog", s"$work/uncached/prog"),
+           "the executable linked from a cached artifact is the uncached build's, byte for byte")
+end rtc_identical
+
+private rtc_geom() -> string = lbr_tree(lbr_one("geom/geom.sysl",
+    "module geom\n\ndouble(n: int) -> int = n * 2\n\nquad(n: int) -> int = double(double(n))\n"))
+
+private rtc_app() -> string = lbr_program("print(geom.quad(5))\nprint(geom.double(21))\n")
+
+private rtc_edit(root: string, at: string, text: string) = write_text(s"$root/$at", text).unwrap()
+
+@test("a second build reuses the root's artifact, and links the same executable as an uncached build")
+rtc_a_second_build_reuses_the_artifact()
+    if !rtc_ready() then return
+
+    val dirs = rtc_begin()
+    val geom = rtc_geom()
+    val app = rtc_app()
+
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/first/prog"), "20\n42\n")
+    assert_eq(rtc_counts(), "hits 0, built 1, from source 0")
+    assert_eq(rtc_artifacts(dirs.1).len(), 1)
+
+    clear_root_artifact_counts()
+    rtc_identical(app, [geom], dirs.0, "20\n42\n")
+    assert_eq(rtc_counts(), "hits 1, built 1, from source 0")
+    assert_eq(rtc_artifacts(dirs.1).len(), 1)
+    rtc_end(dirs, [geom, app])
+end rtc_a_second_build_reuses_the_artifact
+
+@test("an edit to a file of the root misses, and the build prints the edited answer")
+rtc_an_edit_to_the_root_misses()
+    if !rtc_ready() then return
+
+    val dirs = rtc_begin()
+    val geom = rtc_geom()
+    val app = rtc_app()
+
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/a/prog"), "20\n42\n")
+    rtc_edit(geom, "geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 3\n\n" +
+        "quad(n: int) -> int = double(double(n))\n")
+    clear_root_artifact_counts()
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/b/prog"), "45\n63\n")
+    assert_eq(rtc_counts(), "hits 0, built 1, from source 0")
+    rtc_end(dirs, [geom, app])
+end rtc_an_edit_to_the_root_misses
+
+@test("an edit to a tree the root depends on misses, though the root itself is unchanged")
+rtc_an_edit_to_a_dependency_misses()
+    if !rtc_ready() then return
+
+    val dirs = rtc_begin()
+    val base = lbr_tree(lbr_one("base/base.sysl", "module base\n\nconst K: int = 3\n\nk() -> int = K\n"))
+    val scale = lbr_tree(lbr_one("scale/scale.sysl",
+        "module scale\n\nimport base\n\ntimes(n: int) -> int = n * base.K\n"))
+    val app = lbr_program("print(scale.times(5))\n")
+
+    assert_eq(rtc_build(app, [base, scale], s"${dirs.0}/a/prog"), "15\n")
+    assert_eq(rtc_counts(), "hits 0, built 2, from source 0")
+
+    // The constant is folded into `scale`'s object code, so a stale artifact would still print 15.
+    rtc_edit(base, "base/base.sysl", "module base\n\nconst K: int = 4\n\nk() -> int = K\n")
+    clear_root_artifact_counts()
+    assert_eq(rtc_build(app, [base, scale], s"${dirs.0}/b/prog"), "20\n")
+    assert_eq(rtc_counts(), "hits 0, built 2, from source 0")
+    rtc_end(dirs, [base, scale, app])
+end rtc_an_edit_to_a_dependency_misses
+
+@test("a project that declares into the root's module does not use an artifact, and still builds right")
+rtc_a_disturbed_root_compiles_from_source()
+    if !rtc_ready() then return
+
+    val dirs = rtc_begin()
+    val geom = rtc_geom()
+    val app = lbr_tree(lbr_two(
+        "main.sysl", "print(geom.quad(5))\nprint(geom.own(2))\n",
+        "geom/own.sysl", "module geom\n\nown(n: int) -> int = double(n) + 1\n"))
+
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/a/prog"), "20\n5\n")
+    assert_eq(rtc_counts(), "hits 0, built 0, from source 1")
+    assert_eq(rtc_artifacts(dirs.1).len(), 0)
+    rtc_end(dirs, [geom, app])
+end rtc_a_disturbed_root_compiles_from_source
+
+@test("a root that is not closed -- it calls what only the project declares -- is never cached, and still builds right")
+rtc_a_root_that_is_not_closed_is_never_cached()
+    if !rtc_ready() then return
+
+    val dirs = rtc_begin()
+    val geom = lbr_tree(lbr_one("geom/geom.sysl",
+        "module geom\n\nimport app\n\nbump(n: int) -> int = app.step() + n\n"))
+    val app = lbr_tree(lbr_two(
+        "main.sysl", "print(geom.bump(40))\n",
+        "app/app.sysl", "module app\n\nstep() -> int = 2\n"))
+
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/a/prog"), "42\n")
+    assert_eq(rtc_counts(), "hits 0, built 0, from source 1")
+
+    clear_root_artifact_counts()
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/b/prog"), "42\n")
+    assert_eq(rtc_counts(), "hits 0, built 0, from source 1")
+    assert_eq(rtc_artifacts(dirs.1).len(), 0)
+    rtc_end(dirs, [geom, app])
+end rtc_a_root_that_is_not_closed_is_never_cached
+
+@test("a generic and a function reaching module storage are compiled by the program, never taken from the artifact")
+rtc_generics_and_storage_are_compiled_per_consumer()
+    if !rtc_ready() then return
+
+    val dirs = rtc_begin()
+    val geom = lbr_tree(lbr_one("geom/geom.sysl",
+        "module geom\n\nimport sysl.buf.{Buf, buf}\n\n" +
+        "private val table: Buf[int] = squares(4)\n\n" +
+        "private squares(n: int) -> Buf[int]\n    var out: Buf[int] = buf()\n\n" +
+        "    for i in 0..<n\n        out.push(i * i)\n\n    out\nend squares\n\n" +
+        "lookup(i: usize) -> int = table.at(i)\n\n" +
+        "larger[T: Ord](a: T, b: T) -> T = if a < b then b else a\n\n" +
+        "double(n: int) -> int = n * 2\n"))
+    val app = lbr_program("print(geom.lookup(3))\nprint(geom.larger(4, 9))\nprint(geom.double(8))\n")
+
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/a/prog"), "9\n9\n16\n")
+
+    val said = rtc_advertised(dirs.1)
+
+    assert(holds_string(said, "geom$double"), "the determined function is advertised")
+    assert(!holds_string(said, "geom$lookup"), "a function reading module storage is not")
+
+    for i in 0..<said.len()
+        assert(!said.at(i).contains("larger"), s"no instantiation of a generic: ${said.at(i)}")
+
+    // The program's own text defines what the artifact left out and declares what it holds.
+    lbr_hand([geom])
+
+    val text = emit_llvm_text(app, None, DefaultOptimization, true).unwrap().text
+
+    reset_search_paths()
+    assert(rtc_line(text, "define ", "@\"geom$lookup\"(") || rtc_line(text, "define ", "@geom$lookup("),
+           "the program defines the storage-reaching function")
+    assert(rtc_line(text, "define ", "larger"), "the program defines the generic's instantiation")
+    assert(rtc_line(text, "declare ", "double"), "the program declares the precompiled function")
+    assert(!rtc_line(text, "define ", "geom$double"), "and does not define it")
+    rtc_end(dirs, [geom, app])
+end rtc_generics_and_storage_are_compiled_per_consumer
+
+private rtc_line(text: string, head: string, part: string) -> bool
+    val lines = lines_of(text)
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with(head) && lines.at(i).contains(part) then return true
+
+    false
+end rtc_line
+
+@test("SYSL_NO_CACHE=1 keeps nothing and compiles the root afresh every build")
+rtc_no_cache_keeps_nothing()
+    if !rtc_ready() then return
+
+    val dirs = rtc_begin()
+    val geom = rtc_geom()
+    val app = rtc_app()
+
+    rtc_setenv("SYSL_NO_CACHE", "1")
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/a/prog"), "20\n42\n")
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/b/prog"), "20\n42\n")
+    rtc_unsetenv("SYSL_NO_CACHE")
+    assert_eq(rtc_counts(), "hits 0, built 2, from source 0")
+    assert_eq(rtc_artifacts(dirs.1).len(), 0)
+    rtc_end(dirs, [geom, app])
+end rtc_no_cache_keeps_nothing
+
+@test("a corrupt artifact is not used: it is built again and the build succeeds")
+rtc_a_corrupt_artifact_is_not_used()
+    if !rtc_ready() then return
+
+    val dirs = rtc_begin()
+    val geom = rtc_geom()
+    val app = rtc_app()
+
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/a/prog"), "20\n42\n")
+
+    val found = rtc_artifacts(dirs.1)
+
+    assert_eq(found.len(), 1)
+    write_text(found.at(0), "!<arch>\nnot an artifact at all\n").unwrap()
+
+    clear_root_artifact_counts()
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/b/prog"), "20\n42\n")
+    assert_eq(rtc_counts(), "hits 0, built 1, from source 0")
+
+    clear_root_artifact_counts()
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/c/prog"), "20\n42\n")
+    assert_eq(rtc_counts(), "hits 1, built 0, from source 0")
+    rtc_end(dirs, [geom, app])
+end rtc_a_corrupt_artifact_is_not_used
+
+@test("two roots each keep an artifact, both are hit, and the executable is the uncached build's")
+rtc_two_roots_each_cached()
+    if !rtc_ready() then return
+
+    val dirs = rtc_begin()
+    val geom = rtc_geom()
+    val extra = lbr_tree(lbr_one("extra/lib.sysl",
+        "module extra\n\ntriple(n: int) -> int = n * 3\n\nsay(n: int)\n    print(s\"extra $n\")\n"))
+    val app = lbr_program("extra.say(extra.triple(geom.quad(1)))\n")
+
+    assert_eq(rtc_build(app, [geom, extra], s"${dirs.0}/a/prog"), "extra 12\n")
+    assert_eq(rtc_counts(), "hits 0, built 2, from source 0")
+    assert_eq(rtc_artifacts(dirs.1).len(), 2)
+
+    clear_root_artifact_counts()
+    rtc_identical(app, [geom, extra], dirs.0, "extra 12\n")
+    assert_eq(rtc_counts(), "hits 2, built 2, from source 0")
+    rtc_end(dirs, [geom, extra, app])
+end rtc_two_roots_each_cached
