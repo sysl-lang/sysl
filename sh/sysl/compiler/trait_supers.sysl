@@ -1,0 +1,155 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a trait **requires** of the types that implement it, checked at the declaration once every
+// trait is registered -- `trait Ord: Eq` is ordinary whichever of the two is written first.
+//
+// Four things are answered, all about the declarations rather than any use: each required trait is
+// a trait, applied to as many arguments as it declares; the requirements do not come back around to
+// the trait that made them; one trait is not required at two argument lists; and no two traits in
+// the closure declare a member of one name. The last two are one rule seen twice -- a trait's members
+// become the implementing type's, and a type's members are one namespace.
+//
+// **Each trait's walk stops at its first complaint**, which is the recovery region the reference
+// gives it: a cycle would otherwise be reported once per lap, and a collision once per member.
+
+struct SuperWalk
+    root: string
+    visited: Buf[(string, Bound)]
+    declares: Buf[(string, string)]
+end SuperWalk
+
+check_trait_supers(a: &Analysis, key: string, d: TraitDecl)
+    var w = SuperWalk(key, buf(), buf())
+
+    w.visited.push((key, Bound(key, buf())))
+
+    for i in 0..<d.methods.len()
+        w.declares.push((d.methods.at(i).name, qualified_name(key)))
+
+    var path: Buf[string] = buf()
+
+    path.push(key)
+    walk_required(a, &w, key, path)
+end check_trait_supers
+
+// The requirements `name` writes, each read in the terms of the trait that WROTE it: which trait a
+// short name reaches is what that trait's own file imported. False once something was said.
+private walk_required(a: &Analysis, w: *SuperWalk, name: string, path: Buf[string]) -> bool
+    val found = trait_decl_at(a, name)
+
+    if found.is_none() then return true
+
+    val tr = found.unwrap()
+    val scope = trait_scope_of(a, name)
+
+    // `Self` is the type implementing the requiring trait, which nothing here is yet, so it stands in
+    // for itself -- enough for the arguments to resolve and for two requirements of one trait to be
+    // compared, and the same stand-in whether it was written out or arrived from a default.
+    var subst: Buf[Binding] = buf()
+
+    for i in 0..<tr.tparams.len()
+        subst.push(Binding(tr.tparams.at(i), Abstract(tr.tparams.at(i), buf())))
+
+    subst.push(Binding("Self", Abstract("Self", buf())))
+
+    for i in 0..<tr.supers.len()
+        val s = tr.supers.at(i)
+        val skey = lookup_trait_key(a, scope, s.name)
+
+        if skey.is_none()
+            a.fault(scope, s.span, s"trait '${qualified_name(name)}' requires '${s.name}', which is not " +
+                    "a trait")
+            return false
+        end if
+
+        val sk = skey.unwrap()
+        val sdecl = trait_decl_at(a, sk).unwrap()
+
+        if s.args.len() > sdecl.tparams.len() || s.args.len() < least_trait_args(sdecl)
+            var unknown: Buf[Type] = buf()
+
+            for k in 0..<s.args.len()
+                unknown.push(Unknown)
+
+            check_trait_arity_at(a, scope, s.span, s.name, sdecl, unknown)
+            return false
+        end if
+
+        val mark = a.complaints()
+        val bound = resolve_bound(a, scope, s.span, s, subst)
+
+        if a.complaints() != mark then return false
+
+        val at = index_of_name(path, sk)
+
+        if at.is_some()
+            var chain = ""
+
+            for k in at.unwrap()..<path.len()
+                chain = chain + qualified_name(path.at(k)) + " -> "
+
+            a.fault(scope, s.span, s"trait '${qualified_name(sk)}' requires itself, through " +
+                    chain + qualified_name(sk))
+            return false
+        end if
+
+        val first = visited_bound(*w, sk)
+
+        if first.is_some()
+            if first.unwrap().key() != bound.key()
+                a.fault(scope, s.span, s"'${qualified_name(w.root)}' requires both " +
+                        s"'${first.unwrap().show()}' and '${bound.show()}', and a type implements one " +
+                        "trait once — so no type could satisfy both")
+                return false
+            end if
+        else
+            w.visited.push((sk, bound))
+
+            for k in 0..<sdecl.methods.len()
+                val m = sdecl.methods.at(k).name
+                val other = declared_by(*w, m)
+
+                if other.is_some()
+                    a.fault(scope, s.span, s"'${qualified_name(sk)}' and '${other.unwrap()}' both " +
+                            s"declare '$m', and a trait's members become the implementing type's — " +
+                            s"so '${qualified_name(w.root)}' cannot require both")
+                    return false
+                end if
+
+                w.declares.push((m, qualified_name(sk)))
+
+            var deeper: Buf[string] = buf()
+
+            for k in 0..<path.len()
+                deeper.push(path.at(k))
+
+            deeper.push(sk)
+
+            if !walk_required(a, w, sk, deeper) then return false
+
+    true
+end walk_required
+
+private index_of_name(xs: Buf[string], name: string) -> Option[usize]
+    for i in 0..<xs.len()
+        if xs.at(i) == name then return Some(i)
+
+    None
+end index_of_name
+
+private visited_bound(w: SuperWalk, key: string) -> Option[Bound]
+    for i in 0..<w.visited.len()
+        if w.visited.at(i).0 == key then return Some(w.visited.at(i).1)
+
+    None
+end visited_bound
+
+private declared_by(w: SuperWalk, member: string) -> Option[string]
+    for i in 0..<w.declares.len()
+        if w.declares.at(i).0 == member then return Some(w.declares.at(i).1)
+
+    None
+end declared_by
