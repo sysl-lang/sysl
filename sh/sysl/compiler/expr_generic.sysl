@@ -581,10 +581,18 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
             tys.push(texpr_type(t))
             soft.push(false)
         else
-            val t = sandboxed_arg(inner, e.unwrap(), None)
-
-            tys.push(texpr_type(t))
-            soft.push(adaptable(e.unwrap(), t))
+            // **A bare reading that was refused unifies nothing**: it is waited on like a callable,
+            // so the parameter it stands at is settled by the others -- `first(Some(5000000000),
+            // wide)` is an `Option[u64]` call, where reading the literal alone refuses it at `int`
+            // -- and the second pass reads it against that. Taken as a hard `?` it would have
+            // settled the parameter at nothing, ahead of an argument that knew.
+            sandboxed_attempt(inner, e.unwrap()) match
+                Some(t) ->
+                    tys.push(texpr_type(t))
+                    soft.push(adaptable(e.unwrap(), t))
+                None ->
+                    tys.push(Unknown)
+                    soft.push(true)
 
     if held.is_empty() then return Provisional(tys, soft, kept)
 
@@ -711,6 +719,22 @@ sandboxed_arg(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     cx.an.closure_funcs.truncate(made)
     t
 end sandboxed_arg
+
+// A bare reading of an argument, with everything it said put back -- and nothing where it said
+// anything, the reference's `attempt`: a reading that was refused is no evidence about the type.
+private sandboxed_attempt(cx: &Analyzer, e: Expr) -> Option[TExpr]
+    val mark = cx.an.complaints()
+    val lowered = cx.an.closure_count
+    val made = cx.an.closure_funcs.len()
+    val t = type_expr(cx, e, None)
+    val refused = cx.an.complaints() > mark
+
+    cx.an.restore_complaints(mark)
+    cx.an.closure_count = lowered
+    cx.an.closure_funcs.truncate(made)
+
+    if refused then None else Some(t)
+end sandboxed_attempt
 
 // Whether a written type names one of a list of type parameters, anywhere inside it.
 ref_mentions(t: TypeRef, names: Buf[string]) -> bool
