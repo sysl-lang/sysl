@@ -263,6 +263,50 @@ rtc_generics_and_storage_are_compiled_per_consumer()
     rtc_end(dirs, [geom, app])
 end rtc_generics_and_storage_are_compiled_per_consumer
 
+// **The root's object is ONE member, so a program linking any symbol of it takes all of it** --
+// including a function the program never reached, whose callees the program pruned. `total` is
+// reached and instantiates `Buf[Pt]` only inside its body, so the program has to define that
+// instantiation though its own text never names it; `spare` is unreached and instantiates
+// `Buf[Box]`, which nothing in the program defines, so its reference is left to the linker's
+// dead-stripping.
+@test("a root function the program reaches, or leaves unreached, links though its callees are instantiated nowhere else")
+rtc_what_a_root_member_calls_is_linked_or_stripped()
+    if !rtc_ready() then return
+
+    val dirs = rtc_begin()
+    val geom = lbr_tree(lbr_one("geom/geom.sysl",
+        "module geom\n\nimport sysl.buf.{Buf, buf}\n\n" +
+        "struct Pt\n    x: int\n\nstruct Box\n    w: int\n\n" +
+        "total(n: int) -> int\n    var ps: Buf[Pt] = buf()\n\n" +
+        "    for i in 0..<n\n        ps.push(Pt(i))\n\n" +
+        "    var sum = 0\n\n    for i in 0..<ps.len()\n        sum += ps.at(i).x\n\n    sum\nend total\n\n" +
+        "spare(n: int) -> usize\n    var bs: Buf[Box] = buf()\n\n" +
+        "    bs.push(Box(n))\n    bs.len()\nend spare\n"))
+    val app = lbr_program("print(geom.total(5))\n")
+
+    assert_eq(rtc_build(app, [geom], s"${dirs.0}/first/prog"), "10\n")
+    assert_eq(rtc_counts(), "hits 0, built 1, from source 0")
+
+    val said = rtc_advertised(dirs.1)
+
+    assert(holds_string(said, "geom$total"), "the reached function is precompiled")
+    assert(holds_string(said, "geom$spare"), "and so is the unreached one")
+
+    lbr_hand([geom])
+
+    val text = emit_llvm_text(app, None, DefaultOptimization, true).unwrap().text
+
+    reset_search_paths()
+    assert(rtc_line(text, "define ", "Pt.push"), "the program defines what the reached function calls")
+    assert(!rtc_line(text, "define ", "Box.push") && !rtc_line(text, "declare ", "Box.push"),
+           "and nothing of the unreached one's")
+
+    clear_root_artifact_counts()
+    rtc_identical(app, [geom], dirs.0, "10\n")
+    assert_eq(rtc_counts(), "hits 1, built 1, from source 0")
+    rtc_end(dirs, [geom, app])
+end rtc_what_a_root_member_calls_is_linked_or_stripped
+
 private rtc_line(text: string, head: string, part: string) -> bool
     val lines = lines_of(text)
 
