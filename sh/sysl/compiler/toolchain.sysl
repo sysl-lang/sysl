@@ -551,10 +551,10 @@ compile_c(cc: string, src: string, obj: string, target: Target,
     for i in 0..<macros.len()
         args.push(s"-D${macros.at(i)}")
 
-    args.push(src)
-    args.push("-o")
-    args.push(obj)
-    told(cc, args) match
+    // **The object is kept and reused while nothing that reaches its bytes has changed**
+    // (`c_object_cache.sysl`), which is sound here with no condition at all: a C object depends on
+    // the compiler, this command line and the files it reads, and on nothing the sysl side declares.
+    cached_c_compile(cc, src, obj, args) match
         Ok(_) -> Ok(())
         Err(f) -> Err(if f.unrun then f.said else source_failed(src, cc, f.code, f.said))
 end compile_c
@@ -712,7 +712,7 @@ end build_native
 // error stream is collected rather than let through, so a tool reporting the failure has the reason
 // to report; the exit status travels beside it because a tool that failed without saying anything
 // leaves the status the only thing there is to go on.
-private told(program: string, args: Buf[string]) -> Result[unit, ToolFault]
+told(program: string, args: Buf[string]) -> Result[unit, ToolFault]
     capture(program, args.view(), "", [], true) match
         Err(_) -> Err(ToolFault(-1, s"cannot run '$program'", true))
         Ok(out) ->
@@ -727,7 +727,7 @@ end told
 
 // How a tool step failed: the status it exited with and its error stream, trimmed -- or, where
 // `unrun`, the refusal to start it, which is the whole message.
-private struct ToolFault
+struct ToolFault
     code: int
     said: string
     unrun: bool
