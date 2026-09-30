@@ -3,6 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.text.Search
 
 // What an interpolation hole holds is code the reader wrote at a line and a column of their file,
 // and a complaint about it is placed there.
@@ -145,6 +146,39 @@ iha_malformed_hole()
     assert_eq(iha_said("use(a: int) -> string = s\"v ${a a} w\"\n"),
               "1:25: in interpolation 'a a': newline expected")
 end iha_malformed_hole
+
+// -- the reference's own cases, `DiagnosticPositionTests` and `AstPrinterTests` ---------------------
+
+@test("a braced hole, after another one on the same line")
+iha_ref_braced_after_another() =
+    assert_eq(iha_said("val a = 1\nprint(s\"x ${a} y ${nope} z\")"), "2:20: undefined name 'nope'")
+
+@test("a bare '$name' hole")
+iha_ref_bare_hole() = assert_eq(iha_said("print(s\"x $nope\")"), "1:12: undefined name 'nope'")
+
+@test("a hole inside a hole")
+iha_ref_hole_inside_a_hole() =
+    assert_eq(iha_said("print(s\"a ${s\"b ${nope}\"}\")"), "1:19: undefined name 'nope'")
+
+@test("a hole in a text block, on the block's own line and column")
+iha_ref_text_block()
+    val text = "print(s" + iha_q() + "\n    x ${nope}\n    " + iha_q() + ")\n"
+
+    assert_eq(iha_said(text), "2:9: undefined name 'nope'")
+end iha_ref_text_block
+
+@test("and the nodes inside a hole are where the hole was written")
+iha_ref_nodes_inside_a_hole()
+    val parsed = parse(source_of("test.sysl", "val n = 1\nval s = s\"a${n}b${n + 1}c\"\n"))
+
+    assert(parsed.ok(), "the file parses")
+
+    val printed = emit_ast(parsed.program, true)
+
+    assert(printed.contains("Ident 2:14-2:15"), printed)
+    assert(printed.contains("Binary 2:19-2:24"), printed)
+    assert(!printed.contains("Ident 1:1-1:2"), printed)
+end iha_ref_nodes_inside_a_hole
 
 @test("a hole's nodes carry their own extent, and what is built around them the literal's")
 iha_spans_in_the_tree()
