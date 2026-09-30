@@ -107,8 +107,29 @@ field_expr(cx: &Analyzer, span: Span, receiver: Expr, name: string,
             cx.err(span, s"a ${type_show(rt)} may be gone, so nothing is read off one directly — " +
                    s"'get()' hands back 'Option[&${type_show(*inner)}]', and '$name' is read off " +
                    "what is inside it")
+        // Still a mode after the one automatic dereference, so the receiver carries more indirection
+        // than selection reaches through. Going on would name what is LEFT after that dereference --
+        // a type the reader never wrote -- and say the field does not exist, when it does and the
+        // shorthand simply stops short of it.
+        Ptr(_) -> beyond_one_level(cx, span, outer, tr, name, expected, via)
+        Ref(_, _) -> beyond_one_level(cx, span, outer, tr, name, expected, via)
         _ -> lookup_trait_member(cx, span, tr, name, buf(), expected, via)
 end field_expr
+
+// A selection whose receiver is still a pointer or a reference once one level has come off. A member
+// declared for that very type is the type's to answer; anything else is told where the shorthand
+// stopped and how the rest is written.
+private beyond_one_level(cx: &Analyzer, span: Span, outer: TExpr, tr: TExpr, name: string,
+                         expected: Option[Type], via: Buf[string]) -> TExpr
+    val left = texpr_type(tr)
+
+    if member_at(cx.an, member_key(cx.an, left, name).0, name).is_some() then
+        return lookup_trait_member(cx, span, tr, name, buf(), expected, via)
+
+    cx.err(span, s"selection reaches through one level of indirection and " +
+           s"${type_show(texpr_type(outer))} has more, so the rest is written: '(*x).$name' reads " +
+           s"'$name' off the ${type_show(left)} it leaves")
+end beyond_one_level
 
 // A struct's field, by the index the declaration gave it. A tuple's parts are named for their
 // positions, so `t.0` arrives here as an ordinary field selection.

@@ -1,0 +1,515 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The reference's `MemoryModelClaimTests`: what `reference/memory.md` claims, run rather than read.
+//
+// The chapter's mechanisms have suites of their own. What these pin is its CONNECTIVE prose -- the
+// sentences that enumerate something, or that say where a rule stops: the positions in which a
+// construction goes on the heap, what a place is, how far selection reaches through a mode, which
+// cycles of types have a finite size, and what `null` and a `weak T` are for.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.152)** by
+// handing the installed `sysl` the same program. Positions are the reference's `line:column`; the
+// extent a caret underlines is the open span divergence and is not asserted.
+
+// What a program does: what it printed, and whether it exited zero. A failure to build is its
+// message and a non-zero exit.
+private mmc_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-mmc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end mmc_outcome
+
+// The program runs to the end and prints exactly this. Returns at once without the library.
+private mmc_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = mmc_outcome(text)
+
+    assert(out.1, s"it did not exit zero: ${out.0}")
+    assert_eq(out.0, want)
+end mmc_prints
+
+// The build is refused with this message, anchored at this `line:column` of `main.sysl`.
+private mmc_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val said = mmc_outcome(text).0
+
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+end mmc_refused
+
+private val mmc_point: string ="struct Point\n    x: int\n    y: int\n"
+
+// The generic that holds its parameter BY VALUE, so that what stands between a cycle and an infinite
+// type really is the argument position and nothing else.
+private val mmc_wrap: string ="struct Wrap[T]\n    x: T\n"
+
+private val mmc_bufs: string ="import sysl.buf.{Buf, buf}\n\n"
+
+private val mmc_shape: string ="enum Shape\n    Circle(r: int)\n    Square(s: int)\n"
+
+// -- a construction goes on the heap wherever a '&T' is what was asked for ---------------------------
+
+@test("a declared local, with no expectation making it an ordinary value")
+mmc_a_declared_local() =
+    mmc_prints(mmc_point + "var p: &Point = Point(1, 2)\nvar q = Point(3, 4)\nprint(p.x, q.x)\n", "1 3\n")
+
+@test("a parameter, a return type, a struct field, and an enum variant's payload")
+mmc_parameter_return_field_payload()
+    val src = mmc_point + "\nstruct Holder\n    p: &Point\nenum Maybe\n    Has(p: &Point)\n    Nothing\n" +
+        "take(p: &Point) -> int = p.x\nmake() -> &Point = Point(3, 4)\nvar h = Holder(Point(5, 6))\n" +
+        "var m = Maybe.Has(Point(7, 8))\nprint(take(Point(1, 2)))\nprint(make().x)\nprint(h.p.x)\n" +
+        "m match\n    Has(q) -> print(q.y)\n    Nothing -> print(0)\n"
+
+    mmc_prints(src, "1\n3\n5\n8\n")
+end mmc_parameter_return_field_payload
+
+@test("whatever produced it, and something already a '&T' passes through, leaving two names on one object")
+mmc_whatever_produced_it()
+    val src = mmc_point + "\nid(p: Point) -> Point = p\nvar a: &Point = id(Point(1, 2))\n" +
+        "var already: &Point = Point(9, 9)\nvar same: &Point = already\nsame.x = 4\nprint(a.x, already.x)\n"
+
+    mmc_prints(src, "1 4\n")
+end mmc_whatever_produced_it
+
+@test("a branch at a time, so a value branch and an already-'&T' branch meet at '&T'")
+mmc_a_branch_at_a_time()
+    val src = mmc_point + "\nstruct Holder\n    origin: &Point\nvar q = Holder(Point(9, 9))\nvar c = true\n" +
+        "var p: &Point = if c then Point(1, 2) else q.origin\nvar d = false\n" +
+        "var r: &Point = if d then Point(1, 2) else q.origin\nprint(p.x, r.x)\n"
+
+    mmc_prints(src, "1 9\n")
+end mmc_a_branch_at_a_time
+
+@test("including through a loop's breaks, which is how a loop yields a value at all")
+mmc_through_a_loops_breaks()
+    val src = mmc_point + "\nvar p: &Point = for i in 0..<3 do\n    if i == 1 then break Point(i, 0)\n" +
+        "else\n    Point(7, 7)\nprint(p.x)\n"
+
+    mmc_prints(src, "1\n")
+end mmc_through_a_loops_breaks
+
+@test("and a scalar is referenced without 'int' needing a constructor of its own")
+mmc_a_scalar_is_referenced() =
+    mmc_prints("var n: &int = 0\nn = 5\nvar m: &int = 7\nprint(*n, *m + *n)\n", "5 12\n")
+
+// The chapter names five positions and then generalizes past them -- a `T` written where a `&T` is
+// expected goes on the heap, whatever produced it. These are positions the list does not name, each
+// reached by a different part of the analysis: an element type, a tuple part, and a place being
+// assigned into rather than a binding being introduced.
+@test("an array element and a tuple part, neither of which the chapter's list names")
+mmc_an_array_element_and_a_tuple_part()
+    val src = mmc_point + "\nvar arr: [2]&Point = [Point(1, 2), Point(3, 4)]\n" +
+        "var tu: (&Point, int) = (Point(5, 6), 7)\nprint(arr[1].x, tu.0.y, tu.1)\n"
+
+    mmc_prints(src, "3 6 7\n")
+end mmc_an_array_element_and_a_tuple_part
+
+@test("a place being assigned into, for an element, a field, and one arm of a multi-assignment")
+mmc_a_place_being_assigned_into()
+    val src = mmc_point + "\nstruct Holder\n    p: &Point\nvar arr: [2]&Point = [Point(1, 1), Point(2, 2)]\n" +
+        "arr[0] = Point(8, 0)\nvar h = Holder(Point(1, 1))\nh.p = Point(9, 0)\nvar a: &Point = Point(1, 1)\n" +
+        "var b: &Point = Point(2, 2)\na, b = Point(3, 0), Point(4, 0)\nprint(arr[0].x, h.p.x, a.x, b.x)\n"
+
+    mmc_prints(src, "8 9 3 4\n")
+end mmc_a_place_being_assigned_into
+
+// A default is written once at the declaration and produced at each call that omits the argument, so
+// the expectation has to reach it there rather than at the call.
+@test("a default parameter value, produced per call that omits it")
+mmc_a_default_parameter_value()
+    val src = mmc_point + "\nfrom(p: &Point = Point(11, 12)) -> int = p.x + p.y\n" +
+        "print(from(), from(Point(1, 2)), from())\n"
+
+    mmc_prints(src, "23 3 23\n")
+end mmc_a_default_parameter_value
+
+@test("a named argument, which reaches the parameter it names rather than its position")
+mmc_a_named_argument()
+    val src = mmc_point + "\npair(n: int, p: &Point) -> int = n + p.x\nprint(pair(p = Point(5, 0), n = 1))\n"
+
+    mmc_prints(src, "6\n")
+end mmc_a_named_argument
+
+@test("a value copies, and a reference inside one is shared by the copy rather than duplicated")
+mmc_a_value_copies()
+    val src = mmc_point + "\nstruct Holder\n    p: &Point\n    n: int\nvar h = Holder(Point(1, 2), 5)\n" +
+        "var copy = h\ncopy.n = 9\ncopy.p.x = 42\nprint(h.n, copy.n)\nprint(h.p.x, copy.p.x)\n"
+
+    mmc_prints(src, "5 9\n42 42\n")
+end mmc_a_value_copies
+
+// -- a place is a local, a dereference, an element, or a field of any of them -------------------------
+
+@test("an element of a fixed array has an address, which is what the chapter's own example takes")
+mmc_a_fixed_array_element_has_an_address()
+    val src = "var buf = [10, 20, 30]\nvar hit = &buf[1]\nvar at = usize(hit - &buf[0])\nprint(at)\n" +
+        "*hit = 99\nprint(buf[1])\n"
+
+    mmc_prints(src, "1\n99\n")
+end mmc_a_fixed_array_element_has_an_address
+
+@test("so does an element of a slice, and of a view taken out of one")
+mmc_a_slice_element_has_an_address()
+    mmc_prints("var buf: []int = [10, 20, 30]\nvar p = &buf[2]\nprint(*p)\n", "30\n")
+    mmc_prints("var buf = [10, 20, 30]\nvar s = buf[0..<2]\nvar p = &s[1]\nprint(*p)\n", "20\n")
+
+// The element is in the buffer rather than in the view, which is what makes a write through a call
+// land.
+@test("a slice's element is a place even when the slice is a temporary")
+mmc_a_temporary_slices_element_is_a_place()
+    val src = "struct Grid\n    cells: []int\nrow(g: &Grid) -> []int = g.cells\nvar g: &Grid = Grid([1, 2, 3])\n" +
+        "row(g)[1] = 99\nprint(g.cells[1])\nvar p = &row(g)[2]\n*p = 42\nprint(g.cells[2])\n"
+
+    mmc_prints(src, "99\n42\n")
+end mmc_a_temporary_slices_element_is_a_place
+
+// Nothing computed is a place -- and `&` in front of one does not ask it to be. It writes the value
+// into a hidden local of the scope it stands in and hands back that slot's address.
+@test("and anything computed is not one — but '&' gives it a slot rather than refusing")
+mmc_amp_gives_a_computed_value_a_slot()
+    mmc_prints("f() -> int = 3\nvar p = &f()\nprint(*p)\n", "3\n")
+    mmc_prints("var a = 1\nvar b = 2\nvar p = &(a + b)\nprint(*p)\n", "3\n")
+    mmc_prints(mmc_point + "var p = &Point(1, 2)\nprint(p.x)\n", "1\n")
+end mmc_amp_gives_a_computed_value_a_slot
+
+// The enumeration is the ASSIGNMENT target's, which is where a place is still the only thing that
+// will do.
+@test("the complaint names the element too, since leaving it out denied a form the chapter uses")
+mmc_the_complaint_names_the_element() =
+    mmc_refused("var a = 1\nvar b = 2\na + b = 4\n",
+                "assignment needs a variable, a field, an element, or a dereference — something with an address", "3:1")
+
+// A place the program may not WRITE through is a different question again, so `&` goes on refusing a
+// `val` rather than quietly copying it into a slot the program could write.
+@test("a 'val' is refused rather than given a slot of its own")
+mmc_a_val_is_refused_a_slot() =
+    mmc_refused("val v = 3\nvar p = &v\n", "a 'val' is written once, so '&' has nothing to write through", "2:9")
+
+@test("a string's own subscript is refused for immutability rather than for having no address")
+mmc_a_strings_subscript_is_refused() =
+    mmc_refused("var s = \"hi\"\ns[0] = 74u8\n",
+                "a string is immutable, so its bytes have no address to write through", "2:1")
+
+// -- a string's bytes are the string's own storage, so writing one is writing the string -------------
+
+@test("the subscript is refused, and the message says the view is not a copy")
+mmc_a_bytes_subscript_is_refused() =
+    mmc_refused("var s = \"hi\"\ns.bytes[0] = 74u8\n",
+                "a string is immutable, and 'bytes' views the string's own storage rather than a copy of it — so writing through one is writing the string. Bytes you may write are bytes of your own: copy them into a '[]u8' first",
+                "2:1")
+
+// That is a `*T`, and the guarantee is about programs that have none -- it is also how a string
+// reaches printf's `%.*s`.
+@test("taking the address of one is still allowed")
+mmc_a_bytes_address_is_allowed()
+    val src = "extern printf(fmt: *u8, ...) -> int\nvar s = \"hello\"\n" +
+        "printf(c\"[%.*s]\\n\", int(s.bytes.len), &s.bytes[0])\n"
+
+    mmc_prints(src, "[hello]\n")
+end mmc_a_bytes_address_is_allowed
+
+@test("reading them is untouched, since reading is what the view is for")
+mmc_reading_bytes_is_untouched() =
+    mmc_prints("var s = \"hi\"\nprint(s.bytes[0], s.bytes.len)\n", "104 2\n")
+
+@test("a copy of the string gives bytes that may be read the same way")
+mmc_a_copys_bytes_are_read() =
+    mmc_prints("var s = \"hi\"\nvar c = s.copy()\nprint(c.bytes[1])\n", "105\n")
+
+@test("the view refuses a write once it has been bound to a name")
+mmc_a_bound_view_refuses_a_write() =
+    mmc_refused("var s = \"hello\"\nvar b = s.bytes\nb[0] = 74u8\n",
+                "this element belongs to a '[]const byte', which views elements it may not write, so there is nothing to assign through. Elements you may write are elements of your own: copy them into a '[]byte' first",
+                "3:1")
+
+// Refused at the call rather than at the write: the callee is written against a `[]u8` and is not
+// wrong, so what is wrong is handing it these bytes.
+@test("and once it has been handed to something that takes a '[]u8'")
+mmc_a_handed_view_is_refused() =
+    mmc_refused("poke(b: []u8)\n    b[0] = 74u8\nvar s = \"hello\"\npoke(s.bytes)\n",
+                "a '[]const byte' views elements it may not write, and a '[]byte' is a licence to write them — so the one does not become the other. Copy what you need into a '[]byte' of your own, or take the parameter as '[]const byte' if it is only read",
+                "4:8")
+
+// The address stays available under a name: `&` is a `*T`, the tier this guarantee excludes, and a
+// read-only view that could not yield one could not reach the C functions it exists to reach.
+@test("while its address may still be taken under a name, since that is the raw tier either way")
+mmc_a_named_views_address_is_allowed()
+    val src = "extern printf(fmt: *u8, ...) -> int\nvar s = \"hello\"\nvar b = s.bytes\n" +
+        "printf(c\"[%.*s]\\n\", int(b.len), &b[0])\n"
+
+    mmc_prints(src, "[hello]\n")
+end mmc_a_named_views_address_is_allowed
+
+// -- selection dereferences one level and only one ---------------------------------------------------
+
+@test("so a field is reached through a '*T' and through a '&T' with nothing written")
+mmc_a_field_is_reached_through_one_level() =
+    mmc_prints(mmc_point + "var v = Point(1, 2)\nvar p = &v\nvar r: &Point = Point(3, 4)\nprint(p.x, r.y)\n", "1 4\n")
+
+@test("and a '**T' is told that the shorthand stops short, not that the field does not exist")
+mmc_two_levels_stop_short()
+    if xvr_no_library() then return
+
+    val src = mmc_point + "var v = Point(1, 2)\nvar p = &v\nvar pp = &p\nprint(pp.x)\n"
+
+    mmc_refused(src,
+                "selection reaches through one level of indirection and **Point has more, so the rest is written: '(*x).x' reads 'x' off the *Point it leaves",
+                "7:10")
+    assert(!mmc_outcome(src).0.contains("cannot read field"), "the missing-field complaint was made too")
+end mmc_two_levels_stop_short
+
+@test("while the written dereference gets through")
+mmc_the_written_dereference_gets_through() =
+    mmc_prints(mmc_point + "var v = Point(1, 2)\nvar p = &v\nvar pp = &p\nprint((*pp).x)\n", "1\n")
+
+@test("and a type that genuinely has no such field keeps the plain complaint")
+mmc_no_such_field_keeps_the_plain_complaint() =
+    mmc_refused("var n = 5\nprint(n.x)\n", "cannot read field 'x' of int", "2:9")
+
+// The one level is the same one whatever is read: a member the compiler provides, a tuple's part, a
+// name the type does not have at all, and a selection that is being written to rather than read. A
+// reference behind a pointer is two modes as much as two pointers are.
+@test("the one level holds for 'len', a tuple part, a missing name and a write")
+mmc_one_level_whatever_is_selected()
+    mmc_refused("var arr = [1, 2, 3]\nvar p = &arr\nvar pp = &p\nprint(pp.len)\n",
+                "selection reaches through one level of indirection and **[3]int has more, so the rest is written: '(*x).len' reads 'len' off the *[3]int it leaves",
+                "4:10")
+    mmc_refused("var s = \"hi\"\nvar p = &s\nvar pp = &p\nprint(pp.len)\n",
+                "selection reaches through one level of indirection and **string has more, so the rest is written: '(*x).len' reads 'len' off the *string it leaves",
+                "4:10")
+    mmc_refused("var t = (1, 2)\nvar p = &t\nvar pp = &p\nprint(pp.0)\n",
+                "selection reaches through one level of indirection and **(int, int) has more, so the rest is written: '(*x).0' reads '0' off the *(int, int) it leaves",
+                "4:10")
+    mmc_refused(mmc_point + "var v = Point(1, 2)\nvar p = &v\nvar pp = &p\nprint(pp.zzz)\n",
+                "selection reaches through one level of indirection and **Point has more, so the rest is written: '(*x).zzz' reads 'zzz' off the *Point it leaves",
+                "7:10")
+    mmc_refused(mmc_point + "var v = Point(1, 2)\nvar p = &v\nvar pp = &p\npp.x = 5\nprint(v.x)\n",
+                "selection reaches through one level of indirection and **Point has more, so the rest is written: '(*x).x' reads 'x' off the *Point it leaves",
+                "7:4")
+end mmc_one_level_whatever_is_selected
+
+@test("a reference behind a pointer is two levels too")
+mmc_a_reference_behind_a_pointer() =
+    mmc_refused(mmc_point + "var r: &Point = Point(1, 2)\nvar p = &r\nprint(p.x)\n",
+                "selection reaches through one level of indirection and *&Point has more, so the rest is written: '(*x).x' reads 'x' off the &Point it leaves",
+                "6:9")
+
+// A walk reaches through one level as a selection does: a pointer to an array is walked, and a
+// pointer to one of those is not something a `for` iterates.
+@test("a 'for' walks through one level and no further")
+mmc_a_for_walks_through_one_level()
+    mmc_prints("var arr = [1, 2, 3]\nvar p = &arr\nfor x in p do print(x)\n", "1\n2\n3\n")
+    mmc_refused("var arr = [1, 2, 3]\nvar p = &arr\nvar pp = &p\nfor x in pp do print(x)\n",
+                "'for' iterates an integer range, an array, a slice, or a type that implements 'sysl.Iterate', and *[3]int is none of those",
+                "4:1")
+end mmc_a_for_walks_through_one_level
+
+// What is refused about a target is the WRITE, so the refusal is reported at the assignment rather
+// than at the last name of the target -- which for a field is some way into the line.
+@test("a refused target is reported at the assignment it is the target of")
+mmc_a_refused_target_is_reported_at_the_assignment()
+    val s = "struct S\n    f: int\n"
+
+    mmc_refused(s + "val s = S(1)\ns.f = 2\n", "a 'val' is written once, so assignment has nothing to write through", "4:1")
+    mmc_refused(s + "val s = S(1)\ns.f += 2\n", "a 'val' is written once, so '+=' has nothing to write through", "4:1")
+    mmc_refused(s + "struct H\n    s: S\nval h = H(S(1))\nh.s.f = 2\n",
+                "a 'val' is written once, so assignment has nothing to write through", "6:1")
+    mmc_refused("var s = \"hi\"\ns.bytes[0] += 1u8\n",
+                "a string is immutable, and 'bytes' views the string's own storage rather than a copy of it — so writing through one is writing the string. Bytes you may write are bytes of your own: copy them into a '[]u8' first",
+                "2:1")
+end mmc_a_refused_target_is_reported_at_the_assignment
+
+// -- a match does not reach through a mode, so matching a reference to an enum writes the '*' --------
+
+@test("through a '&T'")
+mmc_match_through_a_reference()
+    mmc_prints(mmc_shape + "var e: &Shape = Shape.Circle(3)\n*e match\n    Circle(r) -> print(\"circle\", r)\n" +
+               "    Square(s) -> print(\"square\", s)\n", "circle 3\n")
+    mmc_refused(mmc_shape + "var e: &Shape = Shape.Circle(3)\ne match\n    Circle(r) -> print(r)\n    Square(s) -> print(s)\n",
+                "'Circle(…)' matches an enum variant or a struct, but the value is &Shape — a pattern does not reach through a memory mode the way a field selection does, so match what it holds: '*x match'",
+                "6:5")
+end mmc_match_through_a_reference
+
+@test("and through a '*T'")
+mmc_match_through_a_pointer()
+    mmc_prints(mmc_shape + "var v = Shape.Square(4)\nvar e = &v\n*e match\n    Circle(r) -> print(\"circle\", r)\n" +
+               "    Square(s) -> print(\"square\", s)\n", "square 4\n")
+    mmc_refused(mmc_shape + "var v = Shape.Square(4)\nvar e = &v\ne match\n    Circle(r) -> print(r)\n    Square(s) -> print(s)\n",
+                "'Circle(…)' matches an enum variant or a struct, but the value is *Shape — a pattern does not reach through a memory mode the way a field selection does, so match what it holds: '*x match'",
+                "7:5")
+end mmc_match_through_a_pointer
+
+// -- a cycle is legal per cycle rather than per field -------------------------------------------------
+
+@test("so two types reaching each other through one pointer edge have a finite size")
+mmc_a_cycle_through_a_pointer_is_finite() =
+    mmc_prints("struct A\n    b: B\nstruct B\n    a: *A\nvar x: A\nprint(x.b.a == null)\n", "true\n")
+
+@test("and one with no indirection anywhere on it is refused, naming the type")
+mmc_a_cycle_with_no_indirection_is_refused() =
+    mmc_refused("struct A\n    b: B\nstruct B\n    a: A\nvar x: A\nprint(1)\n",
+                "type 'A' contains itself, so it has no finite size", "4:8")
+
+// -- a type argument is not containment, and which type was declared first does not decide it --------
+//
+// Every case is a pair, because only the comparison says anything. `Buf` reaches its elements through
+// a `[]T` and `Wrap` holds its parameter by value, so the two differ in exactly the thing the argument
+// list cannot tell you -- and each is written in both declaration orders.
+
+@test("a type whose children are a growable sequence of itself is finite")
+mmc_a_buf_of_itself_is_finite() =
+    mmc_prints(mmc_bufs + "struct A\n    xs: Buf[A]\nvar n: Buf[A] = buf()\nprint(A(n).xs.len())\n", "0\n")
+
+@test("and so is a mutual cycle through one, whichever of the two is written first")
+mmc_a_mutual_cycle_through_a_buf_is_finite()
+    mmc_prints(mmc_bufs + "struct A\n    xs: Buf[B]\nstruct B\n    a: A\nvar n: Buf[B] = buf()\nprint(A(n).xs.len())\n",
+               "0\n")
+    mmc_prints(mmc_bufs + "struct B\n    a: A\nstruct A\n    xs: Buf[B]\nvar n: Buf[B] = buf()\nprint(A(n).xs.len())\n",
+               "0\n")
+end mmc_a_mutual_cycle_through_a_buf_is_finite
+
+// The shape a syntax tree has, and the one that has no order to escape through: the enum is the type
+// holding the `Buf`, so it is the one in progress whichever way round the two are written.
+@test("an enum reaching itself through a struct in a Buf is finite, in both orders")
+mmc_an_enum_through_a_struct_in_a_buf()
+    val json = "enum Json\n    Null\n    Obj(ms: Buf[Member])\n"
+    val member = "struct Member\n    key: string\n    value: Json\n"
+    val use = "var ms: Buf[Member] = buf()\nms.push(Member(\"a\", Null))\nprint(ms.at(0).key)\n"
+
+    mmc_prints(mmc_bufs + json + member + use, "a\n")
+    mmc_prints(mmc_bufs + member + json + use, "a\n")
+end mmc_an_enum_through_a_struct_in_a_buf
+
+@test("a plain slice was never order-dependent, which is the comparison that made this a defect")
+mmc_a_plain_slice_is_not_order_dependent()
+    mmc_prints("struct A\n    xs: []B\nstruct B\n    a: A\nvar n = A([])\nprint(n.xs.len)\n", "0\n")
+    mmc_prints("struct B\n    a: A\nstruct A\n    xs: []B\nvar n = A([])\nprint(n.xs.len)\n", "0\n")
+
+@test("while a generic holding its parameter by value is refused")
+mmc_a_by_value_generic_is_refused() =
+    mmc_refused(mmc_wrap + "struct Node\n    w: Wrap[Node]\nvar n: Node\nprint(1)\n",
+                "type 'Node' contains itself, so it has no finite size", "2:8")
+
+// The deferral has to survive nesting: the inner `Wrap[Node]` is itself an argument, so nothing may be
+// condemned while it is being resolved and the answer comes at the outer substitution.
+@test("including at one remove, where the generic is itself a type argument")
+mmc_a_by_value_generic_at_one_remove() =
+    mmc_refused(mmc_wrap + "struct Node\n    w: Wrap[Wrap[Node]]\nvar n: Node\nprint(1)\n",
+                "type 'Node' contains itself, so it has no finite size", "2:8")
+
+// The case a deferred question must not lose: `B` finishes long before `Wrap`'s `x: T` substitutes it,
+// so what has to be asked is what the argument reaches rather than whether it is in progress.
+@test("and around a mutual cycle, in both orders")
+mmc_a_by_value_generic_around_a_mutual_cycle()
+    mmc_refused(mmc_wrap + "struct A\n    w: Wrap[B]\nstruct B\n    a: A\nvar x: A\nprint(1)\n",
+                "type 'A' contains itself, so it has no finite size", "2:8")
+    mmc_refused(mmc_wrap + "struct B\n    a: A\nstruct A\n    w: Wrap[B]\nvar x: A\nprint(1)\n",
+                "type 'B' contains itself, so it has no finite size", "2:8")
+end mmc_a_by_value_generic_around_a_mutual_cycle
+
+// A tuple holds its parts the way a struct holds its fields, so it is a by-value edge and the walk
+// has to cross it. Both directions are asserted, since a walk that simply did not descend into tuples
+// would pass the first for the wrong reason.
+@test("a tuple is a by-value edge, so the walk crosses it in both directions")
+mmc_a_tuple_is_a_by_value_edge()
+    mmc_prints(mmc_bufs + "enum Json\n    Null\n    Obj(ms: Buf[(string, Json)])\n" +
+               "var ms: Buf[(string, Json)] = buf()\nms.push((\"a\", Null))\nprint(ms.at(0).0)\n", "a\n")
+    mmc_refused(mmc_wrap + "struct A\n    w: Wrap[(int, B)]\nstruct B\n    a: A\nvar x: A\nprint(1)\n",
+                "type 'A' contains itself, so it has no finite size", "2:8")
+end mmc_a_tuple_is_a_by_value_edge
+
+@test("a generic holding a Buf of the type is finite again, since the Buf is where the edge is")
+mmc_a_generic_holding_a_buf_is_finite() =
+    mmc_prints(mmc_bufs + mmc_wrap + "struct Node\n    w: Wrap[Buf[Node]]\nvar n: Buf[Node] = buf()\n" +
+               "print(Node(Wrap(n)).w.x.len())\n", "0\n")
+
+// The indirection on the far side of the loop: `R` points at `S`, and everything from `S` back round
+// to `R` is by value. The cycle is finite, and what says so is the depth each type was ENTERED at.
+@test("and a cycle whose one pointer is on the way DOWN to the generic is finite too")
+mmc_a_pointer_on_the_way_down_is_finite() =
+    mmc_prints(mmc_wrap + "struct R\n    s: *S\nstruct S\n    c: Wrap[C]\nstruct C\n    r: R\nvar r: R\n" +
+               "print(r.s == null)\n", "true\n")
+
+// The same walk reaching two of them at once, which is why it may not stop at the first: `C` reaching
+// `R` is excused and `C` reaching `Q` is not. Field order decides which the walk sees first, and must
+// not decide whether this compiles.
+@test("so a second one further along the same fields is still refused, in either field order")
+mmc_a_second_cycle_is_still_refused()
+    mmc_refused(mmc_wrap + "struct R\n    q: *Q\nstruct Q\n    w: Wrap[C]\nstruct C\n    r: R\n    q: Q\nvar r: R\nprint(1)\n",
+                "type 'Q' contains itself, so it has no finite size", "2:8")
+    mmc_refused(mmc_wrap + "struct R\n    q: *Q\nstruct Q\n    w: Wrap[C]\nstruct C\n    q: Q\n    r: R\nvar r: R\nprint(1)\n",
+                "type 'Q' contains itself, so it has no finite size", "2:8")
+end mmc_a_second_cycle_is_still_refused
+
+// A type reached first as an argument is still judged on its own account. `Phantom` never uses its
+// parameter in a field, so there is no substitution to ask the question at.
+@test("a type that contains itself is refused even where it was first reached as a type argument")
+mmc_a_self_containing_argument_is_refused()
+    val phantom = "struct Phantom[T]\n    n: int\n"
+
+    mmc_refused(phantom + "struct Use\n    p: Phantom[Bad]\nstruct Bad\n    b: Bad\nvar u: Use\nprint(1)\n",
+                "type 'Bad' contains itself, so it has no finite size", "6:8")
+    mmc_refused(phantom + "struct Bad\n    b: Bad\nstruct Use\n    p: Phantom[Bad]\nvar u: Use\nprint(1)\n",
+                "type 'Bad' contains itself, so it has no finite size", "4:8")
+end mmc_a_self_containing_argument_is_refused
+
+// -- null exists only for the raw tier ---------------------------------------------------------------
+
+@test("so a reference refuses it, and names what an absent one is written as")
+mmc_a_reference_refuses_null() =
+    mmc_refused("var r: &int = null\nprint(*r)\n",
+                "a &int always points at a live object — an absent one is Option[&int]", "1:15")
+
+@test("and pointers have equality with no ordering, since an address answers nothing else")
+mmc_pointers_have_no_ordering() =
+    mmc_refused("var a = 1\nvar b = 2\nvar p = &a\nvar q = &b\nprint(p < q)\n", "'<' is not defined for *int", "5:7")
+
+// -- reaching through the modes ----------------------------------------------------------------------
+//
+// A value, a `&T` and a `*T` all reach the thing they point at; a `weak T` is the one that does not,
+// because it may be gone.
+
+@test("a field is read through a value, a counted reference and a raw pointer alike")
+mmc_a_field_through_the_modes() =
+    mmc_prints("struct P\n    x: int\n\nvar owned = P(7)\nvar r: &P = P(8)\nvar p: *P = &owned\n" +
+               "print(owned.x, r.x, p.x)\n", "7 8 7\n")
+
+@test("and a method is called the same three ways")
+mmc_a_method_through_the_modes() =
+    mmc_prints("struct P\n    x: int\n\n    get(self) -> int = self.x\n\nvar owned = P(7)\nvar r: &P = P(8)\n" +
+               "var p: *P = &owned\nprint(owned.get(), r.get(), p.get())\n", "7 8 7\n")
+
+@test("an array is indexed and sliced through them too")
+mmc_an_array_through_the_modes() =
+    mmc_prints("var arr = [1, 2, 3]\nvar p: *[3]int = &arr\nvar r: &[3]int = [4, 5, 6]\n" +
+               "print(arr[0], p[0], r[0], arr[1..].len, p[1..].len, r[1..].len)\n", "1 1 4 2 2 2\n")
+
+@test("but nothing is read off a weak reference, which may be gone")
+mmc_nothing_is_read_off_a_weak_reference() =
+    mmc_refused("struct P\n    x: int\n\nvar r: &P = P(8)\nvar w: weak P = r\nprint(w.x)\n",
+                "a weak P may be gone, so nothing is read off one directly — 'get()' hands back 'Option[&P]', and 'x' is read off what is inside it",
+                "6:9")
