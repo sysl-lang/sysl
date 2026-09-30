@@ -1,0 +1,853 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The run-time behaviour of the core trait catalog (`reference/traits.md § Declaring a trait`, `§2`,
+// `§5`): `Self`, the operator traits the library declares, and the memberships the compiler provides
+// for the built-in types. A membership is invisible at run time -- a scalar's `add` is the machine's
+// `add`, not a call -- so what these check is that the type system agrees a scalar satisfies a bound,
+// and that everything reached through that agreement computes what the operator computes.
+//
+// **Every output and every refusal quoted here was read out of the reference compiler**, whose
+// `CoreTraitRunTests` these are.
+
+private var ctr_library_cache: Buf[Program] = buf()
+private var ctr_library_read: bool = false
+
+private ctr_library() -> Buf[Program]
+    if ctr_library_read then return ctr_library_cache
+
+    ctr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> ctr_library_cache = units
+
+    ctr_library_cache
+end ctr_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private ctr_ready() -> bool
+    if ctr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end ctr_ready
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private ctr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-core-trait").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ctr_ran
+
+// Everything a source has to say for itself, taken the whole way through the lowering.
+private ctr_err(text: string) -> string
+    val root = make_temp_dir("sysl-core-trait").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ctr_err
+
+// A refusal is its whole first line and its position; the `-->` line carries the temporary
+// directory, so the position is read from the end of it.
+private ctr_refused(text: string, message: string, at: string)
+    val said = ctr_err(text)
+
+    assert(said.starts_with(s"error: $message\n"), said)
+    assert(said.contains(s"main.sysl:$at\n"), said)
+
+private ctr_prints(text: string, expected: string)
+    if !ctr_ready() then return
+
+    assert_eq(ctr_ran(text), expected)
+
+// A user type with the three memberships an operand-sharing form needs, plus a way of building one
+// that says when it is evaluated.
+private ctr_tagged() -> string = raw"""
+    struct M
+        v: int
+    impl Ord for M
+        lt(self, rhs: Self) -> bool = self.v < rhs.v
+    impl Eq for M
+        eq(self, rhs: Self) -> bool = self.v == rhs.v
+    impl Add for M
+        add(self, rhs: Self) -> Self = M(self.v + rhs.v)
+    tag(v: int) -> M
+        print(v)
+        M(v)
+    """
+
+// -- Self -----------------------------------------------------------------------------------------
+
+@test("a trait signature written with 'Self' is the implementing type")
+ctr_self_in_a_trait_signature()
+    ctr_prints(raw"""
+        trait Doubler
+            twice(self) -> Self
+        struct Money
+            cents: int
+        impl Doubler for Money
+            twice(self) -> Self = Money(self.cents * 2)
+        var m = Money(21)
+        print(m.twice().cents)
+        """, "42\n")
+
+// The trait says `Self` and the impl says `Money`: conformance compares resolved types, so the two
+// spellings have to be one signature.
+@test("'Self' and the concrete name are interchangeable in an impl")
+ctr_self_and_the_concrete_name_interchange()
+    ctr_prints(raw"""
+        trait Combine
+            join(self, other: Self) -> Self
+        struct Money
+            cents: int
+        impl Combine for Money
+            join(self, other: Money) -> Money = Money(self.cents + other.cents)
+        var m = Money(30).join(Money(12))
+        print(m.cents)
+        """, "42\n")
+
+@test("'Self' works in a type's own members, signature and body alike")
+ctr_self_in_a_types_own_members()
+    ctr_prints(raw"""
+        struct Money
+            cents: int
+            grow(self, by: Self) -> Self
+                var sum: Self = Money(self.cents + by.cents)
+                sum
+        var m = Money(40).grow(Money(2))
+        print(m.cents)
+        """, "42\n")
+
+// -- a scalar satisfies the bound the compiler gave it ---------------------------------------------
+
+// No `impl Add for int` was written, yet `int` and `real` both pass a `[T: Add]` -- two
+// instantiations, so a single accidental specialization could not serve both.
+@test("a numeric type instantiates a '[T: Add]' generic")
+ctr_a_numeric_type_instantiates_an_add_generic()
+    ctr_prints(raw"""
+        sum[T: Add](a: T, b: T) -> T = a.add(b)
+        print(sum(19, 23))
+        print(sum(1.5, 2.25))
+        """, "42\n3.75\n")
+
+@test("an operator on a bounded parameter resolves through its bound")
+ctr_an_operator_on_a_bounded_parameter()
+    ctr_prints(raw"""
+        sum[T: Add](a: T, b: T) -> T = a + b
+        print(sum(19, 23))
+        print(sum(1.5, 2.25))
+        """, "42\n3.75\n")
+
+@test("an ordering operator on a bounded parameter yields a bool")
+ctr_an_ordering_operator_on_a_bounded_parameter()
+    ctr_prints(raw"""
+        smaller[T: Ord](a: T, b: T) -> T = if a < b then a else b
+        larger[T: Ord](a: T, b: T) -> T = if a > b then a else b
+        print(smaller(7, 3), larger(7, 3))
+        print(smaller("beta", "alpha"), larger("beta", "alpha"))
+        """, "3 7\nalpha beta\n")
+
+// The same `a + b` is a native instruction for `int` and a call to `Point.add` for a user type.
+@test("one operator body serves a scalar and a user type")
+ctr_one_operator_body_serves_a_scalar_and_a_user_type()
+    ctr_prints(raw"""
+        struct Point
+            x: int
+            y: int
+        impl Add for Point
+            add(self, rhs: Self) -> Self = Point(self.x + rhs.x, self.y + rhs.y)
+        sum[T: Add](a: T, b: T) -> T = a + b
+        print(sum(40, 2))
+        var p = sum(Point(1, 2), Point(30, 9))
+        print(p.x, p.y)
+        """, "42\n31 11\n")
+
+@test("a string satisfies 'Add', which is concatenation")
+ctr_a_string_satisfies_add()
+    ctr_prints(raw"""
+        sum[T: Add](a: T, b: T) -> T = a.add(b)
+        print(sum("four", "two"))
+        """, "fourtwo\n")
+
+@test("'Ord' yields a bool, and the bound licenses the comparison")
+ctr_ord_yields_a_bool()
+    ctr_prints(raw"""
+        smaller[T: Ord](a: T, b: T) -> T = if a.lt(b) then a else b
+        print(smaller(7, 3))
+        print(smaller('z', 'a'))
+        print(smaller("beta", "alpha"))
+        """, "3\na\nalpha\n")
+
+@test("'Eq' reaches further than 'Ord' — a bool is equatable and not ordered")
+ctr_eq_reaches_further_than_ord()
+    ctr_prints(raw"""
+        same[T: Eq](a: T, b: T) -> bool = a.eq(b)
+        print(same(true, true))
+        print(same(true, false))
+        """, "true\nfalse\n")
+
+@test("two bounds on one parameter are both available")
+ctr_two_bounds_on_one_parameter()
+    ctr_prints(raw"""
+        clamp_add[T: Add + Ord](a: T, b: T, cap: T) -> T
+            var s = a.add(b)
+            if cap.lt(s) then cap else s
+        print(clamp_add(20, 22, 100))
+        print(clamp_add(20, 22, 30))
+        """, "42\n30\n")
+
+// -- a core-trait method on a scalar is the operator -----------------------------------------------
+
+// The operands are chosen so that no two operators agree on them.
+@test("each arithmetic and bitwise method computes its own operator")
+ctr_each_arithmetic_and_bitwise_method()
+    ctr_prints(raw"""
+        print(20.add(3))
+        print(20.sub(3))
+        print(20.mul(3))
+        print(20.div(3))
+        print(20.rem(3))
+        print(20.bitand(3))
+        print(20.bitor(3))
+        print(20.bitxor(3))
+        print(20.shl(3))
+        print(20.shr(3))
+        """, "23\n17\n60\n6\n2\n0\n23\n23\n160\n2\n")
+
+@test("the prefix methods negate and complement")
+ctr_the_prefix_methods()
+    ctr_prints(raw"""
+        print(20.neg())
+        print(20.not())
+        print(2.5.neg())
+        """, "-20\n-21\n-2.5\n")
+
+@test("the comparison methods are the one each trait requires")
+ctr_the_comparison_methods()
+    ctr_prints(raw"""
+        print(3.eq(3), 3.eq(4))
+        print(3.lt(4), 4.lt(3), 3.lt(3))
+        """, "true false\ntrue false false\n")
+
+// `a.add(b)` and `a + b` are the same instruction, so the two agree where a call through anything
+// else could not -- at the wrap.
+@test("a method call and the operator agree")
+ctr_a_method_call_and_the_operator_agree()
+    ctr_prints(raw"""
+        var a = 2147483647
+        print(a.add(1) == a + 1)
+        print(a.mul(3) == a * 3)
+        """, "true\ntrue\n")
+
+@test("a member of a struct wins over a core-trait method of the same name")
+ctr_a_struct_member_wins_over_a_core_trait_method()
+    ctr_prints(raw"""
+        struct Tally
+            n: int
+            add(self, k: int) -> int = self.n + k * 100
+        print(Tally(2).add(4))
+        """, "402\n")
+
+// -- a user type carries its own impl --------------------------------------------------------------
+
+@test("one generic body serves a user type and a scalar alike")
+ctr_one_generic_body_serves_both()
+    ctr_prints(raw"""
+        struct Point
+            x: int
+            y: int
+        impl Add for Point
+            add(self, rhs: Self) -> Self = Point(self.x + rhs.x, self.y + rhs.y)
+        sum[T: Add](a: T, b: T) -> T = a.add(b)
+        var p = sum(Point(1, 2), Point(30, 9))
+        print(p.x, p.y)
+        print(sum(40, 2))
+        """, "31 11\n42\n")
+
+@test("a user type's own 'Eq' impl satisfies the bound")
+ctr_a_user_types_eq_satisfies_the_bound()
+    ctr_prints(raw"""
+        struct Point
+            x: int
+            y: int
+        impl Eq for Point
+            eq(self, rhs: Self) -> bool = self.x == rhs.x && self.y == rhs.y
+        same[T: Eq](a: T, b: T) -> bool = a.eq(b)
+        print(same(Point(1, 2), Point(1, 2)))
+        print(same(Point(1, 2), Point(1, 3)))
+        """, "true\nfalse\n")
+
+@test("an operator on a user type is its trait's method")
+ctr_an_operator_on_a_user_type()
+    ctr_prints(raw"""
+        struct Point
+            x: int
+            y: int
+        impl Add for Point
+            add(self, rhs: Self) -> Self = Point(self.x + rhs.x, self.y + rhs.y)
+        var p = Point(1, 2) + Point(30, 9)
+        print(p.x, p.y)
+        """, "31 11\n")
+
+// `>` and `<=` swap the operands, `!=`, `<=` and `>=` negate, so a wrong entry in the derivation table
+// shows up as a flipped answer.
+@test("all four ordering operators derive from one 'lt'")
+ctr_all_four_ordering_operators_derive_from_lt()
+    ctr_prints(raw"""
+        struct Money
+            cents: int
+        impl Ord for Money
+            lt(self, rhs: Self) -> bool = self.cents < rhs.cents
+        var a = Money(1)
+        var b = Money(2)
+        print(a < b, b < a, a < a)
+        print(a > b, b > a, a > a)
+        print(a <= b, b <= a, a <= a)
+        print(a >= b, b >= a, a >= a)
+        """, "true false false\nfalse true false\ntrue false true\nfalse true true\n")
+
+// The catalog stays flat: being `Ord` does not imply `Eq`.
+@test("and being ordered does not make a type equatable")
+ctr_being_ordered_does_not_make_a_type_equatable()
+    if !ctr_ready() then return
+
+    ctr_refused(raw"""
+        struct Money
+            cents: int
+        impl Ord for Money
+            lt(self, rhs: Self) -> bool = self.cents < rhs.cents
+        print(Money(1) == Money(2))
+        """, "'==' is not defined for Money", "5:7")
+
+// `Some` is never equal to `None`, and both directions are asked, since a comparison reading the left
+// operand's variant alone answers one of them correctly by accident.
+@test("and an Option is equatable when what it holds is")
+ctr_an_option_is_equatable_when_its_payload_is()
+    ctr_prints(raw"""
+        var a: Option[u8] = Some(3u8)
+        var b: Option[u8] = Some(3u8)
+        var c: Option[u8] = Some(4u8)
+        var n: Option[u8] = None
+        print(a == b, a == c, a == n, n == a, n == n)
+        """, "true false false false true\n")
+
+// An operand is settled by its neighbour: whichever side has a type of its own supplies it, and the
+// other is read again against it. `None` has no reading of its own at all, so it waits.
+@test("and the literal spelling of either side reads at the other's type")
+ctr_the_literal_spelling_reads_at_the_others_type()
+    ctr_prints(raw"""
+        var a: Option[usize] = Some(166)
+        var n: Option[usize] = None
+        print(a == Some(166), a == Some(167), a == n, n == None, a != n)
+        """, "true false false true true\n")
+
+@test("a result reads the same way, at both of its payloads")
+ctr_a_result_reads_the_same_way()
+    ctr_prints(raw"""
+        var ok: Result[usize, usize] = Ok(3)
+        var bad: Result[usize, usize] = Err(3)
+        print(ok == Ok(3), bad == Err(3), ok == bad, ok == Ok(4))
+        """, "true true false false\n")
+
+// Reading the neighbour is not agreeing with it.
+@test("an operand that cannot be read at the other's type is still refused")
+ctr_an_unreadable_operand_is_still_refused()
+    if !ctr_ready() then return
+
+    ctr_refused(raw"""
+        var a: Option[usize] = Some(166)
+        print(a == "no")
+        """, "'==' needs matching types, got sysl.Option[usize] and string", "2:12")
+
+// The bound is on the payload, so the refusal names the half that is missing rather than the option.
+@test("but not when it holds something that is not")
+ctr_but_not_when_it_holds_something_that_is_not()
+    if !ctr_ready() then return
+
+    ctr_refused(raw"""
+        struct Opaque
+            n: int
+        var a: Option[Opaque] = Some(Opaque(1))
+        var b: Option[Opaque] = Some(Opaque(2))
+        print(a == b)
+        """, "'==' between sysl.Option[Opaque] needs 'sysl.Eq' — the 'impl' that covers it asks 'sysl.Eq' of Opaque, which does not implement it", "5:7")
+
+@test("and the row itself is writable for an enum of its own")
+ctr_the_row_is_writable_for_an_enum_of_its_own()
+    ctr_prints(raw"""
+        enum Maybe[T]
+            Just(v: T)
+            Nothing
+        impl[T: Eq] Eq for Maybe[T]
+            eq(self, rhs: Maybe[T]) -> bool = self match
+                Just(a) -> rhs match
+                    Just(b) -> a == b
+                    Nothing -> false
+                Nothing -> rhs match
+                    Just(b) -> false
+                    Nothing -> true
+        var a: Maybe[u8] = Just(3u8)
+        var b: Maybe[u8] = Just(4u8)
+        var c: Maybe[u8] = Nothing
+        print(a == a, a == b, a == c, c == c)
+        """, "true false false true\n")
+
+// -- a simple enum is equatable, and a data enum is not --------------------------------------------
+
+@test("two of them compare by their discriminant")
+ctr_two_simple_variants_compare_by_discriminant()
+    ctr_prints(raw"""
+        enum Colorspace
+            Srgb
+            Linear
+        var a = Srgb
+        var b = Linear
+        print(a == a, a == b, a != b, b != b)
+        """, "true false true false\n")
+
+// The comparison happens at the storage type the annotation named, not at `int`.
+@test("at the width the ': iN' annotation gave it")
+ctr_at_the_width_the_annotation_gave_it()
+    ctr_prints(raw"""
+        enum Small: u8
+            A = 1
+            B = 255
+        var a = A
+        var b = B
+        print(a == b, b == b)
+        """, "false true\n")
+
+@test("and it satisfies an 'Eq' bound, so a bounded generic takes one")
+ctr_a_simple_enum_satisfies_an_eq_bound()
+    ctr_prints(raw"""
+        enum Colorspace
+            Srgb
+            Linear
+        same[T: Eq](a: T, b: T) -> bool = a == b
+        print(same(Srgb, Srgb), same(Srgb, Linear))
+        """, "true false\n")
+
+@test("while an enum that carries data is refused, as it was")
+ctr_a_data_enum_is_refused()
+    if !ctr_ready() then return
+
+    ctr_refused(raw"""
+        enum Shape
+            Dot
+            Line(n: int)
+        print(Dot == Dot)
+        """, "'==' is not defined for Shape", "4:7")
+
+@test("and writing the 'impl' by hand is refused, saying why the type is already a member")
+ctr_writing_the_impl_by_hand_is_refused()
+    if !ctr_ready() then return
+
+    ctr_refused(raw"""
+        enum Colorspace
+            Srgb
+            Linear
+        impl Eq for Colorspace
+            eq(self, rhs: Colorspace) -> bool = int(self) == int(rhs)
+        print(Srgb == Srgb)
+        """, "'Colorspace' already implements 'sysl.Eq' — no variant of it carries anything, so its value is its discriminant and '==' is that comparison. Delete the block; a variant that needs an equality of its own has to carry something for it to be about", "4:1")
+
+@test("while a data enum may still be given one by hand")
+ctr_a_data_enum_may_be_given_one_by_hand()
+    ctr_prints(raw"""
+        enum Shape
+            Dot
+            Line(n: int)
+        impl Eq for Shape
+            eq(self, rhs: Shape) -> bool = self match
+                Dot -> rhs match
+                    Dot -> true
+                    Line(_) -> false
+                Line(a) -> rhs match
+                    Dot -> false
+                    Line(b) -> a == b
+        print(Dot == Dot, Line(1) == Line(1), Line(1) == Line(2))
+        """, "true true false\n")
+
+@test("both equality operators derive from one 'eq'")
+ctr_both_equality_operators_derive_from_eq()
+    ctr_prints(raw"""
+        struct Money
+            cents: int
+        impl Eq for Money
+            eq(self, rhs: Self) -> bool = self.cents == rhs.cents
+        var a = Money(1)
+        print(a == Money(1), a == Money(2))
+        print(a != Money(1), a != Money(2))
+        """, "true false\nfalse true\n")
+
+@test("a prefix operator on a user type is its trait's method")
+ctr_a_prefix_operator_on_a_user_type()
+    ctr_prints(raw"""
+        struct Point
+            x: int
+            y: int
+        impl Neg for Point
+            neg(self) -> Self = Point(-self.x, -self.y)
+        var p = -Point(3, 4)
+        print(p.x, p.y)
+        """, "-3 -4\n")
+
+@test("a catalog method reaches its receiver through a pointer")
+ctr_a_catalog_method_through_a_pointer()
+    ctr_prints(raw"""
+        var n = 40
+        var p = &n
+        print(p.add(2))
+        """, "42\n")
+
+// Every member the compiler provides a built-in is an operation on the value, so each shape of it --
+// an arithmetic, a comparison, a prefix, the bit surface -- reads through a `*T` and a `&T` alike.
+// The pointer used to reach the `+` itself, which no lowering accepts, and the program then linked
+// without a `main`.
+@test("every provided method reads its receiver through a pointer or a reference")
+ctr_every_provided_method_reads_through_an_indirection()
+    ctr_prints(raw"""
+        import sysl.math.Bits
+        var n: u32 = 40
+        var p = &n
+        print(p.count_ones(), p.eq(40), p.lt(41), p.bitor(1))
+        var k = -3
+        var q = &k
+        print(q.neg(), q.not())
+        var r: &int = 5
+        print(r.add(2), r.mul(3), r.eq(5))
+        """, "2 true true 41\n3 2\n7 15 true\n")
+
+// -- an operand-sharing form evaluates each operand once -------------------------------------------
+
+@test("a chain of user types compares each neighbouring pair")
+ctr_a_chain_of_user_types()
+    ctr_prints(raw"""
+        struct M
+            v: int
+        impl Ord for M
+            lt(self, rhs: Self) -> bool = self.v < rhs.v
+        var a = M(1)
+        var b = M(2)
+        var c = M(3)
+        print(a < b < c, a < c < b, c < b < a)
+        """, "true false false\n")
+
+@test("the middle operand of a dispatched chain is evaluated once")
+ctr_the_middle_operand_is_evaluated_once()
+    ctr_prints(ctr_tagged() + "print(tag(1) < tag(2) < tag(3))\n", "1\n2\n3\ntrue\n")
+
+// The chain stops at the comparison that failed, so the third operand is never reached.
+@test("a dispatched chain short-circuits at the first failure")
+ctr_a_dispatched_chain_short_circuits()
+    ctr_prints(ctr_tagged() + "print(tag(2) < tag(1) < tag(3))\n", "2\n1\nfalse\n")
+
+// `>` derives as `lt(b, a)`, which swaps the values at the call and not the expressions that produced
+// them.
+@test("a derived operator does not reorder evaluation")
+ctr_a_derived_operator_does_not_reorder()
+    ctr_prints(ctr_tagged() + "print(tag(1) > tag(2))\n", "1\n2\nfalse\n")
+
+// `n <= one` is `!lt(one, n)` and `n >= one` is `!lt(n, one)`, so both come back true where a float
+// would say false -- the documented consequence of deriving from one partial `lt`.
+@test("a user type whose 'lt' is partial reaches the discrepancy the derivation has")
+ctr_a_partial_lt_reaches_the_discrepancy()
+    ctr_prints(raw"""
+        struct Maybe
+            v: f64
+        impl Ord for Maybe
+            lt(self, rhs: Self) -> bool = self.v < rhs.v
+        var n = Maybe(0.0 / 0.0)
+        var one = Maybe(1.0)
+        print(n < one, n > one, n <= one, n >= one)
+        """, "false false true true\n")
+
+@test("while the float the type wraps answers false to all four")
+ctr_the_float_answers_false_to_all_four()
+    ctr_prints("var n = 0.0 / 0.0\nprint(n < 1.0, n > 1.0, n <= 1.0, n >= 1.0)\n", "false false false false\n")
+
+// `<=` is derived and `<` is not, so a chain carries the two derivations independently.
+@test("a longer chain shares every middle operand")
+ctr_a_longer_chain_shares_every_middle_operand()
+    ctr_prints(ctr_tagged() + "print(tag(1) < tag(2) <= tag(2) < tag(3))\n", "1\n2\n2\n3\ntrue\n")
+
+@test("compound assignment on a user type updates through its 'Add'")
+ctr_compound_assignment_on_a_user_type()
+    ctr_prints(raw"""
+        struct M
+            v: int
+        impl Add for M
+            add(self, rhs: Self) -> Self = M(self.v + rhs.v)
+        var a = M(1)
+        a += M(2)
+        a += M(39)
+        print(a.v)
+        """, "42\n")
+
+@test("compound assignment reads its place once")
+ctr_compound_assignment_reads_its_place_once()
+    ctr_prints(raw"""
+        struct M
+            v: int
+        impl Add for M
+            add(self, rhs: Self) -> Self = M(self.v + rhs.v)
+        var a = [M(1), M(10)]
+        at(i: int) -> int
+            print(i)
+            i
+        a[at(1)] += M(32)
+        print(a[0].v, a[1].v)
+        """, "1\n1 42\n")
+
+@test("a chain inside a bounded generic serves both a scalar and a user type")
+ctr_a_chain_inside_a_bounded_generic()
+    ctr_prints(raw"""
+        between[T: Ord](lo: T, x: T, hi: T) -> bool = lo < x < hi
+        struct M
+            v: int
+        impl Ord for M
+            lt(self, rhs: Self) -> bool = self.v < rhs.v
+        print(between(1, 5, 9), between(5, 1, 9))
+        print(between(M(1), M(5), M(9)), between(M(5), M(1), M(9)))
+        """, "true false\ntrue false\n")
+
+@test("a compound assignment inside a bounded generic serves both")
+ctr_a_compound_assignment_inside_a_bounded_generic()
+    ctr_prints(raw"""
+        total[T: Add](a: T, b: T, c: T) -> T
+            var acc = a
+            acc += b
+            acc += c
+            acc
+        struct M
+            v: int
+        impl Add for M
+            add(self, rhs: Self) -> Self = M(self.v + rhs.v)
+        print(total(1, 2, 3))
+        print(total(M(10), M(20), M(12)).v)
+        """, "6\n42\n")
+
+// Each operand is released once, by the region opened for it, however early the chain exits.
+@test("a dispatched chain over reference-carrying operands neither leaks nor frees twice")
+ctr_a_chain_over_reference_carrying_operands()
+    ctr_prints(raw"""
+        struct Tag
+            name: string
+        impl Ord for Tag
+            lt(self, rhs: Self) -> bool = self.name < rhs.name
+        var n = 0
+        while n < 1000
+            var a = Tag(str(n))
+            if Tag("a") < a < Tag("z") then n += 1 else n += 1
+        print(n)
+        """, "1000\n")
+
+// -- an operator whose operand is past the by-value boundary hands over an address ----------------
+//
+// An operand-sharing form reaches the trait's method with the value already in hand, a second route
+// to the same call. Past the direct-bytes boundary a parameter is an address, so the value has to be
+// staged into storage and the address handed over. A string is three words, which puts six of them
+// one field past the boundary and five exactly on it.
+
+// An enum whose widest variant carries six counted fields, compared at a variant that carries none;
+// `eq` answers without reading either operand, so anything but `true` is the handover.
+private ctr_wide() -> string = raw"""
+    enum Wide
+        Empty
+        Many(a: string, b: string, c: string, d: string, e: string, f: string)
+    impl Eq for Wide
+        eq(self, rhs: Wide) -> bool = true
+    """
+
+@test("the same method answers whether it is reached by name or by operator")
+ctr_the_same_method_by_name_or_by_operator()
+    ctr_prints(ctr_wide() + "var w: Wide = Empty\nprint(w.eq(w))\nprint(w == w)\n", "true\ntrue\n")
+
+@test("and it reads the operands it was handed, not the words underneath them")
+ctr_it_reads_the_operands_it_was_handed()
+    ctr_prints(raw"""
+        enum Wide
+            Empty
+            Many(a: string, b: string, c: string, d: string, e: string, f: string)
+        impl Eq for Wide
+            eq(self, rhs: Wide) -> bool
+                tail(self) == tail(rhs)
+        tail(w: Wide) -> string
+            w match
+                Empty -> ""
+                Many(a, b, c, d, e, f) -> f
+        var x: Wide = Many("a", "b", "c", "d", "e", "f")
+        var y: Wide = Many("a", "b", "c", "d", "e", "z")
+        print(x == x, x == y, x != y)
+        """, "true false true\n")
+
+@test("one field further past it is no different")
+ctr_one_field_further_past_it()
+    ctr_prints(raw"""
+        struct Seven
+            a: string
+            b: string
+            c: string
+            d: string
+            e: string
+            f: string
+            g: string
+        impl Eq for Seven
+            eq(self, rhs: Self) -> bool = self.g == rhs.g
+        var s = Seven("1", "2", "3", "4", "5", "6", "7")
+        var t = Seven("1", "2", "3", "4", "5", "6", "x")
+        print(s == s, s == t, s != t)
+        """, "true false true\n")
+
+@test("a mixed payload past the boundary behaves the same")
+ctr_a_mixed_payload_past_the_boundary()
+    ctr_prints(raw"""
+        struct Mixed
+            name: string
+            cells: [12]i64
+            tag: int
+            flag: bool
+            ratio: f64
+            note: string
+        impl Eq for Mixed
+            eq(self, rhs: Self) -> bool = self.tag == rhs.tag && self.note == rhs.note
+        var m = Mixed("m", [0; 12], 7, true, 1.5, "n")
+        var n = Mixed("m", [0; 12], 8, true, 1.5, "n")
+        print(m == m, m == n, m != n)
+        """, "true false true\n")
+
+// The operand reaches the operator through a type parameter, so the instantiation is where the width
+// has to be got right.
+@test("a generic function over an 'Eq' bound compares one the same way")
+ctr_a_generic_over_eq_past_the_boundary()
+    ctr_prints(raw"""
+        struct Wide6
+            a: string
+            b: string
+            c: string
+            d: string
+            e: string
+            f: string
+        impl Eq for Wide6
+            eq(self, rhs: Self) -> bool = self.f == rhs.f
+        same[T: Eq](x: T, y: T) -> bool = x == y
+        differ[T: Eq](x: T, y: T) -> bool = x != y
+        var p = Wide6("1", "2", "3", "4", "5", "6")
+        var q = Wide6("1", "2", "3", "4", "5", "z")
+        print(same(p, p), same(p, q), differ(p, q))
+        """, "true false true\n")
+
+@test("'<' and a chain of them cross it too")
+ctr_lt_and_a_chain_cross_the_boundary()
+    ctr_prints(raw"""
+        struct Wide6
+            a: string
+            b: string
+            c: string
+            d: string
+            e: string
+            f: string
+        impl Ord for Wide6
+            lt(self, rhs: Self) -> bool = self.f < rhs.f
+        var p = Wide6("1", "2", "3", "4", "5", "1")
+        var q = Wide6("1", "2", "3", "4", "5", "5")
+        var r = Wide6("1", "2", "3", "4", "5", "9")
+        print(p < q, r < q, p >= q, p < q < r, r < q < p)
+        """, "true false false true false\n")
+
+// A compound assignment's method returns a large value, which comes back through an out-pointer.
+@test("a compound assignment whose method returns a large value still assigns it")
+ctr_a_compound_assignment_returning_a_large_value()
+    ctr_prints(raw"""
+        struct Wide6
+            a: string
+            b: string
+            c: string
+            d: string
+            e: string
+            f: string
+        impl Add for Wide6
+            add(self, rhs: Self) -> Self = Wide6(self.a + rhs.a, "b", "c", "d", "e", self.f + rhs.f)
+        var p = Wide6("1", "2", "3", "4", "5", "6")
+        var q = Wide6("x", "2", "3", "4", "5", "y")
+        p += q
+        print(p.a, p.f)
+        """, "1x 6y\n")
+
+// Five strings are exactly the boundary, so this pair still crosses the call as a value.
+@test("while an operand that stops short of it is still passed as a value")
+ctr_an_operand_short_of_the_boundary()
+    ctr_prints(raw"""
+        struct Narrow5
+            a: string
+            b: string
+            c: string
+            d: string
+            e: string
+        impl Eq for Narrow5
+            eq(self, rhs: Self) -> bool = self.e == rhs.e
+        var p = Narrow5("1", "2", "3", "4", "5")
+        var q = Narrow5("1", "2", "3", "4", "z")
+        print(p == p, p == q, p != q)
+        """, "true false true\n")
+
+// Driven hard enough that a count taken once too often or once too seldom shows up as a leak or a
+// double free rather than a wrong answer.
+@test("and one carrying references is counted exactly once either way")
+ctr_a_large_operand_is_counted_exactly_once()
+    ctr_prints(raw"""
+        struct Wide6
+            a: string
+            b: string
+            c: string
+            d: string
+            e: string
+            f: string
+        impl Eq for Wide6
+            eq(self, rhs: Self) -> bool = self.f == rhs.f
+        var n = 0
+        while n < 1000
+            var p = Wide6(str(n), "b", "c", "d", "e", str(n))
+            var q = Wide6(str(n), "b", "c", "d", "e", "z")
+            if p == q then n += 2 else n += 1
+        print(n)
+        """, "1000\n")
