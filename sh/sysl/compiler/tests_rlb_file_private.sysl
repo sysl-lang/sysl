@@ -1,0 +1,607 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A **file-private** name is scoped to its file (`reference/modules.md § A file-private name is
+// scoped to its file`).
+//
+// Two files of one module may each keep a name to themselves, and **a private name SHADOWS a public
+// one of the same spelling in another file**: inside the declaring file its own declaration answers,
+// and every other file -- and every importer -- sees only the public one. It is C's `static` in one
+// translation unit beside an `extern` of that name in another. Between two functions the private one
+// shadows only the public overloads a call could not tell from it. What stays refused is a second
+// declaration of one spelling inside a single file, whatever the two visibilities, and two public
+// declarations of one spelling anywhere in a module.
+//
+// **Every output and every message here was read out of the reference compiler**, by handing the
+// installed `sysl` the same tree and quoting what came back.
+
+// -- a program of several files --------------------------------------------------------------------
+
+private var rlb_library_cache: Buf[Program] = buf()
+private var rlb_library_read: bool = false
+
+private rlb_library() -> Buf[Program]
+    if rlb_library_read then return rlb_library_cache
+
+    rlb_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> rlb_library_cache = units
+
+    rlb_library_cache
+end rlb_library
+
+private rlb_no_library() -> bool
+    if rlb_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end rlb_no_library
+
+// The standard module and then the files of one program, each named the way a diagnostic about it
+// will be: a bare file name, since the module a file contributes to is whatever its header says.
+private rlb_units(files: []const (string, string)) -> Result[Buf[Program], string]
+    var units: Buf[Program] = buf()
+    val library = rlb_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return Err(parsed.report.at(0).message)
+
+        units.push(parsed.program)
+
+    Ok(units)
+end rlb_units
+
+// The whole report a program is refused with, rendered the way a reader sees it.
+private rlb_err(files: []const (string, string)) -> string
+    val units = rlb_units(files) match
+        Err(why) -> return why
+        Ok(us) -> us
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end rlb_err
+
+// The LLVM text of a program of several files, which is what a claim about a symbol is read out of.
+private rlb_ir(files: []const (string, string)) -> string
+    val units = rlb_units(files) match
+        Err(why) -> return why
+        Ok(us) -> us
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    if !errors_of(done.an.diagnostics()).is_empty()
+        return analysis_report(errors_of(done.an.diagnostics()))
+
+    val kept = prune(strip_tests(whole), buf())
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end rlb_ir
+
+// What a program of several files **prints**. The tree goes on disk, since a module is a directory
+// and a build reads one.
+private rlb_ran(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-rlb").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end rlb_ran
+
+// -- two files may each keep a name to themselves --------------------------------------------------
+
+@test("two files may each keep a constant of one name to themselves")
+rlb_two_files_each_keep_a_constant()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_one(), m.from_two())\n"),
+                       ("m/one.sysl", "module m\nprivate const Limit: int = 1\nfrom_one() -> int = Limit\n"),
+                       ("m/two.sysl", "module m\nprivate const Limit: int = 2\nfrom_two() -> int = Limit\n")]),
+              "1 2\n")
+
+@test("and a function, which is the case the card was filed from")
+rlb_two_files_each_keep_a_function()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_one(), m.from_two())\n"),
+                       ("m/one.sysl", "module m\nprivate helper() -> int = 1\nfrom_one() -> int = helper()\n"),
+                       ("m/two.sysl", "module m\nprivate helper() -> int = 2\nfrom_two() -> int = helper()\n")]),
+              "1 2\n")
+
+@test("and a module 'val'")
+rlb_two_files_each_keep_a_val()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_one(), m.from_two())\n"),
+                       ("m/one.sysl", "module m\nprivate val base: int = 10\nfrom_one() -> int = base\n"),
+                       ("m/two.sysl", "module m\nprivate val base: int = 20\nfrom_two() -> int = base\n")]),
+              "10 20\n")
+
+@test("and a struct")
+rlb_two_files_each_keep_a_struct()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_one(), m.from_two())\n"),
+                       ("m/one.sysl", "module m\nprivate struct Cell\n    n: int\nfrom_one() -> int = Cell(1).n\n"),
+                       ("m/two.sysl", "module m\nprivate struct Cell\n    s: int\n    t: int\n" +
+                                      "from_two() -> int = Cell(2, 3).t\n")]),
+              "1 3\n")
+
+// Each file's own declaration is what its bodies see -- the assertion the cases above would still
+// pass if both files somehow shared one declaration.
+@test("and each file names its own, not the other's")
+rlb_each_file_names_its_own()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.one_says(), m.two_says())\n"),
+                       ("m/one.sysl", "module m\nprivate const Which: int = 111\none_says() -> int = Which\n"),
+                       ("m/two.sysl", "module m\nprivate const Which: int = 222\ntwo_says() -> int = Which\n")]),
+              "111 222\n")
+
+// -- a private name shadows a public one of its spelling in another file ---------------------------
+
+// A public `helper`, a private one, and a third file that declares none. Every case is written with
+// the private file both before and after the public one, because the plain key is claimed at
+// hoisting and the files are hoisted in the order they arrive -- a private declaration hoisted first
+// must still leave the key to the public one every other file resolves.
+private rlb_helpers(private_first: bool) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+    val pub = ("m/pub.sysl", "module m\nhelper() -> int = 1\nfrom_pub() -> int = helper()\n")
+    val priv = ("m/priv.sysl", "module m\nprivate helper() -> int = 2\nfrom_priv() -> int = helper()\n")
+
+    out.push(("main.sysl", "print(m.from_pub(), m.from_priv(), m.from_third(), m.helper())\n"))
+
+    if private_first
+        out.push(priv)
+        out.push(pub)
+    else
+        out.push(pub)
+        out.push(priv)
+
+    out.push(("m/third.sysl", "module m\nfrom_third() -> int = helper()\n"))
+    out
+end rlb_helpers
+
+@test("a function of the same signature: its own file calls the private one, every other file the public")
+rlb_a_function_of_the_same_signature()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran(rlb_helpers(false).view()), "1 2 1 1\n")
+
+@test("and the same whichever of the two files is hoisted first")
+rlb_whichever_file_is_hoisted_first()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran(rlb_helpers(true).view()), "1 2 1 1\n")
+
+@test("a type: the private file's 'T' is its own, a third file's is the public one")
+rlb_a_type_is_shadowed_in_its_own_file()
+    if rlb_no_library() then return
+
+    val main = ("main.sysl", "print(m.from_a(), m.from_b(), m.from_c(), m.T(\"main\").s)\n")
+    val pub = ("m/b.sysl", "module m\nstruct T\n    s: string\nfrom_b() -> string = T(\"public\").s\n")
+    val priv = ("m/a.sysl", "module m\nprivate struct T\n    n: int\n    k: int\nfrom_a() -> int = T(3, 4).k\n")
+    val third = ("m/c.sysl", "module m\nfrom_c() -> string = T(\"third\").s\n")
+
+    assert_eq(rlb_ran([main, priv, pub, third]), "4 public third main\n")
+    assert_eq(rlb_ran([main, pub, third, priv]), "4 public third main\n")
+end rlb_a_type_is_shadowed_in_its_own_file
+
+@test("a constant shadows a public constant")
+rlb_a_constant_shadows_a_public_one()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_a(), m.from_b(), m.Limit)\n"),
+                       ("m/a.sysl", "module m\nprivate const Limit: int = 1\nfrom_a() -> int = Limit\n"),
+                       ("m/b.sysl", "module m\nconst Limit: int = 2\nfrom_b() -> int = Limit\n")]),
+              "1 2 2\n")
+
+@test("a module 'val' shadows a public one")
+rlb_a_val_shadows_a_public_one()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_a(), m.from_b(), m.base)\n"),
+                       ("m/a.sysl", "module m\nprivate val base: int = 10\nfrom_a() -> int = base\n"),
+                       ("m/b.sysl", "module m\nval base: int = 20\nfrom_b() -> int = base\n")]),
+              "10 20 20\n")
+
+// Storage is where two declarations sharing one key would show: a write through one name read back
+// through the other.
+@test("module storage, which is two cells rather than one")
+rlb_module_storage_is_two_cells()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "m.bump_a()\nm.bump_a()\nm.bump_b()\nprint(m.read_a(), m.read_b(), m.count)\n"),
+                       ("m/a.sysl", "module m\nprivate var count: int = 100\nbump_a()\n    count += 1\n" +
+                                    "read_a() -> int = count\n"),
+                       ("m/b.sysl", "module m\nvar count: int = 0\nbump_b()\n    count += 1\n" +
+                                    "read_b() -> int = count\n")]),
+              "102 1 1\n")
+
+// `optind` is libc's, an `int` starting at 1 on every platform this runs on.
+@test("an 'extern' variable shadows a public 'val'")
+rlb_an_extern_variable_shadows_a_public_val()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_a(), m.from_b())\n"),
+                       ("m/a.sysl", "module m\nprivate extern \"optind\" idx: i32\nfrom_a() -> i32 = idx\n"),
+                       ("m/b.sysl", "module m\nval idx: i32 = 7\nfrom_b() -> i32 = idx\n")]),
+              "1 7\n")
+
+// Public is not the only reach wider than a file: a `private[m]` declaration is one every file of the
+// module may write, so a bare `private` one shadows it the same way.
+@test("a 'private[m]' declaration counts as wider, and is shadowed the same way")
+rlb_a_scoped_declaration_counts_as_wider()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_a(), m.from_b())\n"),
+                       ("m/a.sysl", "module m\nprivate const Limit: int = 1\nfrom_a() -> int = Limit\n"),
+                       ("m/b.sysl", "module m\nprivate[m] const Limit: int = 2\nfrom_b() -> int = Limit\n")]),
+              "1 2\n")
+
+// A private declaration is never exported, so an importer's name is the public one whether it spells
+// the path out or imports the name.
+@test("an importer from another module sees only the public one")
+rlb_an_importer_sees_only_the_public_one()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "import m.helper\n\nprint(helper(), m.helper(), m.from_a())\n"),
+                       ("m/a.sysl", "module m\nprivate helper() -> string = \"private\"\n" +
+                                    "from_a() -> string = helper()\n"),
+                       ("m/b.sysl", "module m\nhelper() -> string = \"public\"\n")]),
+              "public public private\n")
+
+// A generic is resolved in the scope of the file that declared it, wherever it is instantiated -- so
+// a body naming `helper` means the public one even when the instantiating file has a private one.
+@test("a generic from another file resolves its body in its own file, not in the caller's")
+rlb_a_generic_resolves_in_its_own_file()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_a())\n"),
+                       ("m/a.sysl", "module m\nprivate helper() -> int = 100\nprivate struct Box\n    tag: string\n" +
+                                    "from_a() -> string = s\"${twice(0)} ${boxed(0).n} ${helper()} ${Box(\"mine\").tag}\"\n"),
+                       ("m/b.sysl", "module m\nhelper() -> int = 1\nstruct Box\n    n: int\n" +
+                                    "twice[T](x: T) -> int = helper() + helper()\nboxed[T](x: T) -> Box = Box(5)\n")]),
+              "2 5 100 mine\n")
+
+// The escape hatch: the module's own path resolves the plain key directly.
+@test("and the private file reaches the public one by the module's own path")
+rlb_the_module_path_reaches_the_public_one()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_a())\n"),
+                       ("m/a.sysl", "module m\nprivate helper() -> int = 2\n" +
+                                    "from_a() -> string = s\"${helper()} ${m.helper()}\"\n"),
+                       ("m/b.sysl", "module m\nhelper() -> int = 1\n")]),
+              "2 1\n")
+
+// Both are emitted, under two symbols -- the private one at its numbered slot and with internal
+// linkage, since every caller it has is in its own file.
+@test("and both functions are emitted, each under a symbol of its own")
+rlb_both_functions_are_emitted()
+    if rlb_no_library() then return
+
+    val out = rlb_ir([("main.sysl", "print(m.from_a(), m.helper())\n"),
+                      ("a.sysl", "module m\nprivate helper() -> int = 2\nfrom_a() -> int = helper()\n"),
+                      ("b.sysl", "module m\nhelper() -> int = 1\n")])
+
+    assert(out.contains("define i32 @m$helper() {"), out)
+    assert(out.contains("define internal i32 @m$helper.private1() {"), out)
+    assert(out.contains("call i32 @m$helper.private1()"), out)
+end rlb_both_functions_are_emitted
+
+// -- the private file's spelling, against a public one of another signature or kind ----------------
+
+@test("a private overload of another signature joins the public set in its own file")
+rlb_a_private_overload_joins_the_public_set()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.use_b(), m.use_b_int())\n"),
+                       ("m/one.sysl", "module m\nskip_line(n: int) -> int = n + 1\n"),
+                       ("m/two.sysl", "module m\nprivate skip_line(s: string) -> string = s\n" +
+                                      "use_b() -> string = skip_line(\"x\")\nuse_b_int() -> int = skip_line(1)\n")]),
+              "x 2\n")
+
+// Both at once, from the other file order: the private `(n: int)` shadows its public twin, and the
+// public `(b: bool)` -- which no private declaration could be confused with -- is still called.
+@test("and shadows exactly the public overloads a call could not tell from it")
+rlb_shadows_exactly_the_indistinguishable_overloads()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_priv(), m.from_pub(), m.flip(true))\n"),
+                       ("m/priv.sysl", "module m\nprivate flip(n: int) -> int = n * 100\n" +
+                                       "from_priv() -> string = s\"${flip(1)} ${flip(false)}\"\n"),
+                       ("m/pub.sysl", "module m\nflip(n: int) -> int = -n\nflip(b: bool) -> bool = !b\n" +
+                                      "from_pub() -> int = flip(1)\n")]),
+              "100 true -1 false\n")
+
+// A difference behind a default is the other pair the overloading rule refuses: a one-argument call
+// fits both, so the private declaration shadows the public one rather than colliding.
+@test("a public overload a default makes indistinguishable is shadowed too")
+rlb_a_default_makes_an_overload_indistinguishable()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_priv(), m.g(1))\n"),
+                       ("m/priv.sysl", "module m\nprivate g(x: int, y: int = 0) -> string = \"private\"\n" +
+                                       "from_priv() -> string = g(1)\n"),
+                       ("m/pub.sysl", "module m\ng(x: int) -> string = \"public\"\n")]),
+              "private public\n")
+
+@test("and the module's path reaches the public set from there")
+rlb_the_module_path_reaches_the_public_set()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.use_b(), m.use_b_int())\n"),
+                       ("m/one.sysl", "module m\nskip_line(n: int) -> int = n + 1\n"),
+                       ("m/two.sysl", "module m\nprivate skip_line(s: string) -> string = s\n" +
+                                      "use_b() -> string = skip_line(\"x\")\nuse_b_int() -> int = m.skip_line(1)\n")]),
+              "x 2\n")
+
+@test("a private constant beside a public function of its name")
+rlb_a_private_constant_beside_a_public_function()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_a(), m.size(), m.from_b())\n"),
+                       ("m/a.sysl", "module m\nprivate const size: int = 3\nfrom_a() -> int = size + m.size()\n"),
+                       ("m/b.sysl", "module m\nsize() -> int = 40\nfrom_b() -> int = size()\n")]),
+              "43 40 40\n")
+
+// Any pairing but two functions hides the whole spelling: the private file's constant leaves nothing
+// for a call to tell apart, so the public function is not a candidate there by its bare name.
+@test("and a call of the public function's bare name in that file is refused")
+rlb_a_private_constant_hides_the_public_function()
+    if rlb_no_library() then return
+
+    assert(rlb_err([("main.sysl", "print(m.from_a())\n"),
+                    ("a.sysl", "module m\nprivate const size: int = 3\nfrom_a() -> int = size + size()\n"),
+                    ("b.sysl", "module m\nsize() -> int = 40\n")])
+        .contains("error: undefined function 'size'\n --> a.sysl:3:26"))
+
+@test("a private struct shadows a public function of its name")
+rlb_a_private_struct_shadows_a_public_function()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_a(), m.Thing())\n"),
+                       ("m/a.sysl", "module m\nprivate struct Thing\n    n: int\nfrom_a() -> int = Thing(9).n\n"),
+                       ("m/b.sysl", "module m\nThing() -> int = 4\n")]),
+              "9 4\n")
+
+@test("a private function shadows a public 'extern' of its name")
+rlb_a_private_function_shadows_a_public_extern()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_a())\n"),
+                       ("m/a.sysl", "module m\nprivate strlen(n: int) -> int = n\nfrom_a() -> int = strlen(5)\n"),
+                       ("m/b.sysl", "module m\nextern \"strlen\" strlen(s: *u8) -> usize\n")]),
+              "5\n")
+
+@test("two private files and a public one: each private file its own, the rest the public")
+rlb_two_private_files_beside_a_public_one()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.a(), m.b(), m.c(), m.helper())\n"),
+                       ("m/a.sysl", "module m\nprivate helper() -> int = 1\na() -> int = helper()\n"),
+                       ("m/b.sysl", "module m\nprivate helper() -> int = 2\nb() -> int = helper()\n"),
+                       ("m/c.sysl", "module m\nhelper() -> int = 3\nc() -> int = helper()\n")]),
+              "1 2 3 3\n")
+
+@test("and a function's address taken in the private file is its own")
+rlb_an_address_in_the_private_file_is_its_own()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.from_a())\n"),
+                       ("m/a.sysl", "module m\nprivate helper() -> int = 2\nfrom_a() -> int\n" +
+                                    "    val f = &helper\n    f()\n"),
+                       ("m/b.sysl", "module m\nhelper() -> int = 1\n")]),
+              "2\n")
+
+// -- what is still refused -------------------------------------------------------------------------
+
+@test("one file declaring the same private name twice, which is the ordinary duplicate")
+rlb_one_file_declaring_a_private_name_twice()
+    if rlb_no_library() then return
+
+    assert(rlb_err([("main.sysl", "print(1)\n"),
+                    ("one.sysl", "module m\nprivate const Limit: int = 1\nprivate const Limit: int = 2\n")])
+        .contains("error: constant 'Limit' is already declared\n --> one.sysl:3:1"))
+
+@test("and one file declaring a name both privately and publicly")
+rlb_one_file_declaring_a_name_privately_and_publicly()
+    if rlb_no_library() then return
+
+    val other = ("two.sysl", "module m\nconst Other: int = 3\n")
+    val first = rlb_err([("main.sysl", "print(1)\n"),
+                         ("one.sysl", "module m\nprivate const Limit: int = 1\nconst Limit: int = 2\n"), other])
+    val second = rlb_err([("main.sysl", "print(1)\n"),
+                          ("one.sysl", "module m\nconst Limit: int = 1\nprivate const Limit: int = 2\n"), other])
+
+    assert(first.contains("error: constant 'Limit' is already declared\n --> one.sysl:3:1"), first)
+    assert(second.contains("error: constant 'Limit' is already declared\n --> one.sysl:3:1"), second)
+end rlb_one_file_declaring_a_name_privately_and_publicly
+
+// A public declaration in another file is no licence for one file to declare the spelling twice. The
+// public one in the second file is then a duplicate of the first file's public one as well.
+@test("and the same in a file whose name another file also declares publicly")
+rlb_the_same_beside_a_public_declaration_elsewhere()
+    if rlb_no_library() then return
+
+    val out = rlb_err([("main.sysl", "print(1)\n"),
+                       ("one.sysl", "module m\nprivate helper() -> int = 1\nhelper() -> int = 2\n"),
+                       ("two.sysl", "module m\nhelper() -> int = 3\n")])
+
+    assert(out.contains("error: function 'helper' is already declared\n --> one.sysl:3:1"), out)
+    assert(out.contains("error: function 'helper' is already declared\n --> two.sysl:2:1"), out)
+end rlb_the_same_beside_a_public_declaration_elsewhere
+
+@test("two public declarations of one name in two files")
+rlb_two_public_declarations_in_two_files()
+    if rlb_no_library() then return
+
+    assert(rlb_err([("main.sysl", "print(1)\n"),
+                    ("one.sysl", "module m\nconst Limit: int = 1\n"),
+                    ("two.sysl", "module m\nconst Limit: int = 2\n")])
+        .contains("error: constant 'Limit' is already declared\n --> two.sysl:2:1"))
+
+// Told once, at the second declaration, and not again at the call as an ambiguity between the two.
+@test("and two public functions of one signature, reported once rather than again at each call")
+rlb_two_public_functions_reported_once()
+    if rlb_no_library() then return
+
+    val out = rlb_err([("main.sysl", "print(m.use())\n"),
+                       ("one.sysl", "module m\nhelper() -> int = 1\n"),
+                       ("two.sysl", "module m\nhelper() -> int = 2\nuse() -> int = helper()\n")])
+
+    assert(out.contains("error: function 'helper' is already declared\n --> two.sysl:2:1"), out)
+    assert_eq(rlb_times(out, "error:"), 1)
+end rlb_two_public_functions_reported_once
+
+@test("and a sibling file still cannot name the other's private declaration")
+rlb_a_sibling_still_cannot_name_it()
+    if rlb_no_library() then return
+
+    assert(rlb_err([("main.sysl", "print(1)\n"),
+                    ("one.sysl", "module m\nprivate const Limit: int = 1\n"),
+                    ("two.sysl", "module m\nborrow() -> int = Limit\n")])
+        .contains("error: 'm.Limit' is private to 'one.sysl', the file that declares it\n --> two.sysl:2:19"))
+
+// -- a private declaration is no candidate outside its own file ------------------------------------
+
+@test("the public one takes the call its own file makes")
+rlb_the_public_one_takes_its_own_files_call()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.use())\n"),
+                       ("m/one.sysl", "module m\nskip_line(n: int) -> int = n + 1\nuse() -> int = skip_line(1)\n"),
+                       ("m/two.sysl", "module m\nprivate skip_line(s: string) -> string = s\n")]),
+              "2\n")
+
+@test("and a call the public one does not take is refused rather than reaching the private one")
+rlb_a_call_the_public_one_does_not_take_is_refused()
+    if rlb_no_library() then return
+
+    assert(rlb_err([("main.sysl", "print(1)\n"),
+                    ("one.sysl", "module m\nskip_line(n: int) -> int = n\nuse() -> string = skip_line(\"x\")\n"),
+                    ("two.sysl", "module m\nprivate skip_line(s: string) -> string = s\n")])
+        .contains("error: 'n' of 'm.skip_line' is int, but string was given\n --> one.sysl:3:29"))
+
+@test("and a public declaration is found from a third file though a private one was written first")
+rlb_a_public_declaration_is_found_from_a_third_file()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.use_c())\n"),
+                       ("m/one.sysl", "module m\nprivate skip_line(n: int) -> int = n\nuse_a() -> int = skip_line(1)\n"),
+                       ("m/two.sysl", "module m\nskip_line(s: string) -> string = s\n"),
+                       ("m/three.sysl", "module m\nuse_c() -> string = skip_line(\"y\")\n")]),
+              "y\n")
+
+@test("and one file may overload the name it keeps to itself")
+rlb_one_file_may_overload_its_own_name()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "print(m.use_b(), m.use_b2())\n"),
+                       ("m/one.sysl", "module m\nprivate skip_line(b: bool) -> bool = b\nuse_a() -> bool = skip_line(true)\n"),
+                       ("m/two.sysl", "module m\nprivate skip_line(n: int) -> int = n\n" +
+                                      "private skip_line(s: string) -> string = s\n" +
+                                      "use_b() -> string = skip_line(\"x\")\nuse_b2() -> int = skip_line(3)\n")]),
+              "x 3\n")
+
+private rlb_result_only() -> string =
+    "error: function 'skip_line' is already declared — which declaration a call means is decided " +
+    "by its arguments and never by what it returns, so two that differ only in the result have no " +
+    "call that tells them apart\n --> two.sysl:3:1"
+
+@test("and two of them a call could not tell apart are refused, under the name as written")
+rlb_two_indistinguishable_private_overloads_are_refused()
+    if rlb_no_library() then return
+
+    val out = rlb_err([("main.sysl", "print(1)\n"),
+                       ("one.sysl", "module m\nprivate skip_line(b: bool) -> bool = b\n"),
+                       ("two.sysl", "module m\nprivate skip_line(n: int) -> int = n\n" +
+                                    "private skip_line(n: int) -> string = \"x\"\n")])
+
+    assert(out.contains(rlb_result_only()), out)
+    assert(!out.contains("private1"), out)
+end rlb_two_indistinguishable_private_overloads_are_refused
+
+@test("and the same beside a public declaration, which is in no set with them")
+rlb_the_same_beside_a_public_declaration()
+    if rlb_no_library() then return
+
+    val out = rlb_err([("main.sysl", "print(1)\n"),
+                       ("one.sysl", "module m\nskip_line(n: int) -> int = n\n"),
+                       ("two.sysl", "module m\nprivate skip_line(n: int) -> int = n\n" +
+                                    "private skip_line(n: int) -> string = \"x\"\n")])
+
+    assert(out.contains(rlb_result_only()), out)
+    assert(!out.contains("private1"), out)
+    assert_eq(rlb_times(out, "error:"), 1)
+end rlb_the_same_beside_a_public_declaration
+
+// -- the enum variant is not a declaration the rule is about ---------------------------------------
+
+// A struct and a variant of one name never contended -- they coexist in one file, and at each use the
+// expected type decides which answers -- so a private struct beside a sibling file's public variant
+// of its name leaves both as candidates in the struct's own file.
+@test("while in the declaring file both are candidates, and the ordinary rule chooses")
+rlb_a_private_struct_does_not_shadow_a_variant()
+    if rlb_no_library() then return
+
+    assert_eq(rlb_ran([("main.sysl", "import shapes.*\nprint(raw(), wrapped())\n"),
+                       ("shapes/other.sysl", "module shapes\nprivate struct Circle\n    x: int\n" +
+                                             "raw() -> int = Circle(7).x\nwrapped() -> int = area(Circle(5))\n"),
+                       ("shapes/shape.sysl", "module shapes\nenum Shape\n    Circle(r: int)\n    Square(s: int)\n" +
+                                             "area(s: Shape) -> int = s match\n    Circle(r) -> r * r\n" +
+                                             "    Square(x) -> x * x\n")]),
+              "7 25\n")
+
+// How many times a report says something.
+private rlb_times(text: string, needle: string) -> usize
+    var seen: usize = 0
+    var at: usize = 0
+
+    loop
+        text.index_of_from(needle, at) match
+            None -> return seen
+            Some(i) ->
+                seen += 1
+                at = i + 1
+end rlb_times

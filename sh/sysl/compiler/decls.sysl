@@ -219,7 +219,17 @@ struct ValueDecl
 
     // `@thread_local`: one copy of the storage per thread. Only a module `var` carries it.
     thread_local: bool
+
+    // The C symbol an `extern` variable names, where it wrote one: `extern "optind" idx: i32` is
+    // read under `optind`, however the module qualifies `idx`. Nothing else carries one.
+    link: Option[string]
 end ValueDecl
+
+// The symbol an `extern` variable is read and declared under: the one it named, and its own name
+// otherwise -- never the module-qualified key, which is a sysl name and no linker's.
+extern_var_symbol(d: ValueDecl) -> string = d.link match
+    Some(sym) -> sym
+    None -> d.name
 
 // An `impl` block, kept in the order the sources wrote them, since nothing keys one.
 struct Impl
@@ -248,8 +258,9 @@ struct Tables
     funcs: &Table[Func]
     overloads: &Table[Buf[string]]
 
-    // The key one file's own file-private declaration of a spelling took, where a sibling file
-    // already held the plain one. Keyed by the file and the spelling together (`file_slot_key`).
+    // The key one file's own file-private declaration of a spelling took -- the plain one, or a
+    // numbered slot where another file also declares the spelling. Keyed by the file and the
+    // spelling together (`file_slot_key`).
     file_private: &Table[string]
 
     // The storage: `const`, `val`, `static var` and the `extern` variables.
@@ -375,6 +386,12 @@ struct Tables
     // from the tables themselves. A name absent from it is a name no walk could have found.
     variant_names: &Table[bool]
 
+    // Every spelling some declaration makes nameable beyond its own file -- public, or `private[M]`
+    // -- by its plain key, and again by the plain key held with each file that declares it
+    // (`file_slot_key`). **Filled from the parsed files before anything is hoisted**, since the
+    // question `decl_key` asks of it is about declarations that may not be registered yet.
+    wider: &Table[bool]
+
     // Whether a key is one this compilation has a declaration for, whatever kind.
     declares_type(self, key: string) -> bool = self.types.has(key)
 
@@ -399,6 +416,7 @@ tables_for(t: Target) -> &Tables =
            table(),
            member_tables(),
            buf(),
+           table(),
            table())
 
 // One trait a registered `impl` block still owes the implementing type, and everything a refusal

@@ -176,6 +176,19 @@ hoist_units(a: &Analysis, units: Buf[Program])
             for k in 0..<taken.len()
                 a.fault(scopes.at(i), taken.at(k).2, refuse_reserved(taken.at(k).0, taken.at(k).1))
 
+    // **What each file makes nameable beyond itself is read before anything is registered**, so a
+    // file-private declaration hoisted ahead of a public one of its spelling knows to leave the plain
+    // key to it (`decl_key`). Asking the tables instead would make where each declaration lands
+    // depend on the order the files arrived in.
+    for i in 0..<units.len()
+        val body = units.at(i).body
+        val is_entry = a.tables.entry_src != "" && units.at(i).src.name == a.tables.entry_src
+
+        for j in 0..<body.len()
+            if is_entry && !belongs_to_module(body.at(j), a.tables.entry_captures) then continue
+
+            note_wider(a, scopes.at(i), body.at(j))
+
     for i in 0..<units.len()
         val body = units.at(i).body
         val is_entry = a.tables.entry_src != "" && units.at(i).src.name == a.tables.entry_src
@@ -264,9 +277,10 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // never reach this walk.
         VarDecl(name, typ, init, vis, align, section, thread_local) ->
             hoist_storage(a, scope, s.span, name, typ, vis, init, align, section, thread_local)
-        ExternVarDecl(name, typ, _, vis) ->
+        ExternVarDecl(name, typ, link, vis) ->
+            check_foreign_symbol(a, scope, s.span, link.unwrap_or(name), link.is_some())
             hoist_value(a, scope, s.span, name, Some(typ), vis, a.tables.extern_vars,
-                        "'extern' variable", None)
+                        "'extern' variable", None, None, None, false, link)
         ExternDecl(d) -> hoist_extern(a, scope, s.span, d)
         // A bare-arrow parameter is sugar for a bounded type parameter, and the rewrite happens
         // at the declaration so that everything after it is the generic machinery that exists.
@@ -468,7 +482,7 @@ type_name_taken(a: &Analysis, key: string, written: string) -> bool =
 private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: Option[TypeRef],
                     vis: Visibility, into: &Table[ValueDecl], what: string, init: Option[Expr],
                     align: Option[Expr] = None, section: Option[string] = None,
-                    thread_local: bool = false)
+                    thread_local: bool = false, link: Option[string] = None)
     val plain = module_qualify(scope.module_name, name)
     val key = decl_key(a, scope, plain, vis, value_scope_of(a, plain).is_some())
     val holder = if contested(a, scope, vis, key) then value_name_holder(a, key) else None
@@ -489,8 +503,8 @@ private hoist_value(a: &Analysis, scope: Scope, span: Span, name: string, typ: O
         return
     end if
 
-    into.put(key, ValueDecl(name, typ, vis, span, scope, init, align, section,
-                                  thread_local))
+    into.put(key, ValueDecl(name, typ, vis, span, scope, init, align, section, thread_local,
+                            link))
     record_access(a, scope, span, key, vis)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
@@ -578,10 +592,46 @@ private hoist_extern(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
                 "apart by")
         return
 
+    if a.tables.extern_vars.has(key) then
+        a.fault(scope, span, s"'${d.name}' is already declared as an 'extern' variable")
+        return
+
     a.tables.externs.put(key, d)
     a.tables.extern_scopes.put(key, ExternHome(scope, span))
     record_access(a, scope, span, key, d.vis)
+
+    if d.link.is_some() then check_foreign_symbol(a, scope, span, d.link.unwrap(), true)
+
     check_signature_rules(a, scope, span, d.name, d.params, d.ret_type, d.variadic, true)
+end hoist_extern
+
+// The symbol an `extern` resolves to has to be one a linker can: letters, digits, `_`, `.` and `$`,
+// which is what an object file's names are made of -- asked only of a link name, since a sysl name
+// is one already. **And never `main`**: this program defines that symbol, so an `extern` naming it
+// would be a declaration of the program's own entry point.
+private check_foreign_symbol(a: &Analysis, scope: Scope, span: Span, symbol: string, written: bool)
+    if written && !is_link_symbol(symbol)
+        a.fault(scope, span, s"'$symbol' is not a symbol a linker can resolve")
+        return
+    end if
+
+    if symbol == "main" then
+        a.fault(scope, span, "'main' is where the platform starts this program, so an 'extern' may " +
+                "not name that symbol")
+end check_foreign_symbol
+
+private is_link_symbol(symbol: string) -> bool
+    if symbol == "" then return false
+
+    for i in 0..<symbol.bytes.len
+        val b = symbol.bytes[i]
+        val letter = (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z'))
+        val digit = b >= u8('0') && b <= u8('9')
+
+        if !letter && !digit && b != u8('_') && b != u8('.') && b != u8('$') then return false
+
+    true
+end is_link_symbol
 
 // The rules a declared signature must satisfy whichever declaration form it came from, checked after
 // the name is registered so a failure reports the mistake without also erasing the declaration it is
@@ -716,43 +766,46 @@ extern_symbol(d: ExternDecl) -> string = d.link match
 // them apart by its arguments, and are the same declaration written twice where it cannot.
 private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
     val plain = module_qualify(scope.module_name, d.name)
-    val holder = value_name_holder(a, plain)
+
+    // **Overloads are counted off whichever key this FILE's declarations of the name share**, which
+    // is why the private slot is worked out first. Counting them off the plain key alone would file
+    // a file that declares one spelling twice, privately, beside a sibling contending it under one
+    // slot -- and the second would overwrite the first. Every question below is asked of that key:
+    // a declaration in a slot of its own shadows what the plain key holds rather than contending
+    // with it.
+    val base = decl_key(a, scope, plain, d.vis, a.tables.funcs.has(plain))
+    val holder = value_name_holder(a, base)
 
     if holder.is_some() then
         a.fault(scope, span, s"'${d.name}' is already declared as ${holder.unwrap()}")
         return
 
-    if a.tables.externs.has(plain) then
+    if a.tables.externs.has(base) then
         a.fault(scope, span, s"'${d.name}' is already declared as an 'extern', which this would " +
                 "overload — what tells two declarations of one name apart is their parameters, and " +
                 "an 'extern' has none the analyzer may read")
         return
 
-    val already = overload_keys(a, plain)
+    // **Every declaration already in the set is one some call site sees beside this one**: a
+    // file-private declaration that another file's declaration of the spelling contends with is
+    // filed under a slot of its own (`decl_key`), so the only private declarations left in a set
+    // are its own file's.
+    val siblings = overload_keys(a, base)
     var clash = false
 
-    for i in 0..<already.len()
-        val other = a.tables.funcs.get(already.at(i))
+    for i in 0..<siblings.len()
+        val other = a.tables.funcs.get(siblings.at(i))
 
-        val rival = rival_of(scope, d.vis, other)
-
-        if rival.is_some() then
-            if same_params(d.params, rival.unwrap().decl.params) then
+        if other.is_some() then
+            if same_params(d.params, other.unwrap().decl.params) then
                 a.fault(scope, span, s"function '${d.name}' is already declared" +
-                        differing_result(d, rival.unwrap().decl))
+                        differing_result(d, other.unwrap().decl))
                 clash = true
-            else if overlapping(d, rival.unwrap().decl) then
-                a.fault(scope, span, indistinguishable(plain, d, rival.unwrap().decl))
+            else if overlapping(d, other.unwrap().decl) then
+                a.fault(scope, span, indistinguishable(plain, d, other.unwrap().decl))
                 clash = true
 
     if clash then return
-
-    // **Overloads are counted off whichever key this FILE's declarations of the name share**, which
-    // is why the private slot is worked out first. Counting them off the plain key alone would file
-    // a file that declares one spelling twice, privately, beside a sibling contending it under one
-    // slot -- and the second would overwrite the first.
-    val base = decl_key(a, scope, plain, d.vis, a.tables.funcs.has(plain))
-    val siblings = overload_keys(a, base)
 
     // **The slot is one-based**, so the second declaration of a name is `f.2` and never `f.1`.
     // It is the key an object file and a diff both read, so the two compilers have to spell it the
@@ -808,18 +861,26 @@ private runner_signature(a: &Analysis, scope: Scope, at: Span, d: FuncDecl, what
                 s"'${joined(d.tparams, ", ")}' — a generic is compiled for the arguments a caller " +
                 "fixes, and the runner supplies none")
 
-// The key a declaration is filed under, where a SIBLING FILE already holds the plain one privately.
+// The key a declaration is filed under: the module's plain one, unless this declaration is
+// **file-private** and another file of the module also declares the spelling -- in which case it
+// takes a numbered private slot of its own (`reference/modules.md § A file-private name is scoped to
+// its file`).
 //
-// **Two files may each keep a helper of one spelling to themselves.** Neither is ever a candidate at
-// the other's call sites, so there is nothing for a call to be told apart and the two are not an
-// overload pair at all -- but a table is keyed by one string, so they may not share a key either.
-// The first file read takes the plain key and each one after it takes a numbered private slot.
+// **A file-private declaration steps aside from the plain key whenever another file has a claim on
+// it**:
 //
-// Three cases, and only the third is new. Nothing holds the key: this declaration takes it, and the
-// claim is recorded so that its own file resolves to it. Something holds it that is not another
-// file's file-private declaration: the plain key comes back and the duplicate check above reports
-// it, so a private name against a PUBLIC one of the same spelling is refused exactly as it was.
-// Something holds it and IS another file's file-private declaration: a slot, and the two coexist.
+// - **a wider declaration of the spelling in another file** -- public, or a `private[M]` -- asked
+//   FIRST, and asked of `wider` rather than of the tables, because the wider one may not have been
+//   hoisted yet. The plain key is what every other file and every importer resolves, so it belongs to
+//   the declaration they can see, and the private one *shadows* it only inside its own file: C's
+//   `static` beside an `extern` of the same name in another translation unit;
+// - **another file's file-private declaration already holding the key**, where the first file keeps
+//   it and this one takes a slot, since neither can see the other.
+//
+// Nothing holds the key and nothing wider is coming: this declaration takes it, and the claim is
+// recorded so that its own file resolves to it. Something holds it from **this** file: the plain key
+// comes back and the caller's duplicate check reports it -- one file declaring a spelling twice,
+// whatever the two visibilities, is the ordinary duplicate.
 //
 // `taken` is the question "does something already hold the plain key", asked by the caller because
 // each kind of declaration asks it of a different table -- a function of the functions, a name that
@@ -835,10 +896,11 @@ private decl_key(a: &Analysis, scope: Scope, plain: string, vis: Visibility, tak
     // at the same key for the check above to see it as one.
     if claimed.is_some() then return claimed.unwrap()
 
+    val shadows = a.tables.wider.has(plain) && !a.tables.wider.has(mine)
     val held = a.tables.access.get(plain)
     var key = plain
 
-    if taken && held.is_some() && is_file_private(held.unwrap().vis) &&
+    if shadows || taken && held.is_some() && is_file_private(held.unwrap().vis) &&
             held.unwrap().file != scope.src.name
         var n: usize = 1
 
@@ -852,6 +914,44 @@ private decl_key(a: &Analysis, scope: Scope, plain: string, vis: Visibility, tak
     key
 end decl_key
 
+// Records what one top-level declaration makes nameable beyond its own file -- public, or
+// `private[M]` -- for `decl_key` (`wider`): the plain key, and the plain key held with the file
+// that wrote it.
+//
+// **An enum's variants are not recorded**, only the enum: a struct and a variant of one name never
+// contended -- they coexist, and the expected type chooses at each use -- so a variant is not a
+// declaration the shadowing rule is about, and a file-private struct beside a sibling file's public
+// variant of its name keeps the plain key it always had.
+private note_wider(a: &Analysis, scope: Scope, s: Stmt)
+    *s.kind match
+        StructDecl(d) -> note_wider_name(a, scope, d.name, d.vis)
+        EnumDecl(d) -> note_wider_name(a, scope, d.name, d.vis)
+        TraitDecl(d) -> note_wider_name(a, scope, d.name, d.vis)
+        TypeDecl(d) -> note_wider_name(a, scope, d.name, d.vis)
+        CTypeBlock(ts) ->
+            for i in 0..<ts.len()
+                note_wider_name(a, scope, ts.at(i).name, ts.at(i).vis)
+        CConstBlock(cs) ->
+            for i in 0..<cs.len()
+                note_wider_name(a, scope, cs.at(i).name, cs.at(i).vis)
+        ConstDecl(name, _, _, vis) -> note_wider_name(a, scope, name, vis)
+        ValDecl(name, _, _, vis, _, _) -> note_wider_name(a, scope, name, vis)
+        VarDecl(name, _, _, vis, _, _, _) -> note_wider_name(a, scope, name, vis)
+        ExternVarDecl(name, _, _, vis) -> note_wider_name(a, scope, name, vis)
+        ExternDecl(d) -> note_wider_name(a, scope, d.name, d.vis)
+        FuncDecl(d) -> note_wider_name(a, scope, d.name, d.vis)
+        StaticDecl(inner) -> note_wider(a, scope, inner)
+        _ -> ()
+end note_wider
+
+private note_wider_name(a: &Analysis, scope: Scope, name: string, vis: Visibility)
+    if is_file_private(vis) then return
+
+    val plain = module_qualify(scope.module_name, name)
+
+    a.tables.wider.put(plain, true)
+    a.tables.wider.put(file_slot_key(scope.src.name, plain), true)
+
 // How a file and a spelling are held as one key, so that the claims of one name by several files are
 // one table rather than a table of tables. A file's name cannot hold a newline and a key cannot
 // either, so nothing else can be spelled this way.
@@ -862,27 +962,10 @@ file_slot_key(file: string, plain: string) -> string = s"$file\n$plain"
 file_private_key(a: &Analysis, file: string, plain: string) -> string =
     a.tables.file_private.get(file_slot_key(file, plain)).unwrap_or(plain)
 
-// The other declaration a call site would have to be told apart from, where there is one: a
-// declaration this file cannot name is not one a call here could be confused with.
-private rival_of(here: Scope, mine: Visibility, other: Option[Func]) -> Option[Func]
-    if other.is_none() then return None
-    if separable(here, other.unwrap().scope, mine, other.unwrap().decl.vis) then return None
-
-    other
-end rival_of
-
 // The keys the declarations of one name are filed under.
 overload_keys(a: &Analysis, plain: string) -> Buf[string] = a.tables.overloads.get(plain) match
     Some(set) -> set
     None -> buf()
-
-// Whether two declarations of one name are ones no call site sees both of, which is what makes them
-// not an overload pair at all.
-//
-// The condition is deliberately both ways: it takes a file-private declaration past a sibling's
-// file-private one, and takes nothing past a public one.
-private separable(here: Scope, there: Scope, mine: Visibility, theirs: Visibility) -> bool =
-    is_file_private(mine) && is_file_private(theirs) && here.src.name != there.src.name
 
 private is_file_private(v: Visibility) -> bool = v match
     File -> true
@@ -900,8 +983,10 @@ private same_params(a: Buf[Param], b: Buf[Param]) -> bool
 end same_params
 
 // Whether a call could fit both declarations: the arities they accept overlap, and the parameters up
-// to the shorter of the two are written the same way.
-private overlapping(d: FuncDecl, other: FuncDecl) -> bool
+// to the shorter of the two are written the same way. **Compared as written rather than as
+// resolved**: hoisting has not resolved a generic parameter's type, and the written form is what a
+// reader is looking at.
+overlapping(d: FuncDecl, other: FuncDecl) -> bool
     val lo = max_usize2(required(d.params), required(other.params))
     val hi = min_usize2(accepted(d.params, d.variadic), accepted(other.params, other.variadic))
 
