@@ -1,0 +1,349 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The model a `sysl doc` page is written from (`doc_model.sysl`): which modules exist, what each
+// lists and in what order, and the prose and tags each declaration carries.
+//
+// **Every assertion is on parsed source rather than on a hand-built tree**, as the reference's
+// `DocGeneratorTests` are. Each expected value is what the installed `sysl-doc` (0.0.152) produced
+// for the same input, except where a test says the model departs from it on purpose -- those are
+// defects of the reference the user decided are fixed rather than copied.
+
+private dml_unit(name: string, text: string) -> Program = parse(source_of(name, text)).program
+
+private dml_modules(text: string, include_private: bool) -> Buf[DocModule]
+    var us: Buf[Program] = buf()
+
+    us.push(dml_unit("t.sysl", text))
+    build_doc_modules(us, include_private)
+end dml_modules
+
+private dml_only(text: string) -> DocModule
+    val ms = dml_modules(text, false)
+
+    assert_eq(ms.len(), 1)
+    ms.at(0)
+end dml_only
+
+// The one module made of these files, given as name, source, name, source...
+private dml_named(pairs: []const string) -> DocModule
+    var us: Buf[Program] = buf()
+    var i: usize = 0
+
+    while i + 1 < pairs.len
+        us.push(dml_unit(pairs[i], pairs[i + 1]))
+        i += 2
+
+    val ms = build_doc_modules(us, false)
+
+    assert_eq(ms.len(), 1)
+    ms.at(0)
+end dml_named
+
+private dml_names(syms: Buf[DocSymbol]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<syms.len()
+        out.push(syms.at(i).name)
+
+    out
+end dml_names
+
+private dml_subjects(tags: Buf[DocTag]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<tags.len()
+        out.push(tags.at(i).subject.unwrap_or("<none>"))
+
+    out
+end dml_subjects
+
+private dml_strs(ts: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for t in ts
+        out.push(t)
+
+    out
+end dml_strs
+
+private dml_prose(d: Option[DocProse]) -> DocProse = d.unwrap()
+
+// -- the model groups a module's declarations ----------------------------------------------------------
+
+private dml_demo() -> string =
+    "module sysl.demo\n\nconst limit: usize = 8\n\nfirst(xs: []int) -> int = xs[0]\n\nstruct Point\n" +
+    "    x: int\n\ntrait Shape\n    area(self) -> int\n"
+
+@test("a module is the unit, named as it was declared")
+dml_a_module_is_the_unit()
+    assert_eq(dml_only(dml_demo()).name, "sysl.demo")
+
+@test("each declaration lands in its own group")
+dml_each_declaration_in_its_group()
+    val m = dml_only(dml_demo())
+
+    assert_eq(dml_names(m.of(DocKind.Const)), dml_strs(["limit"]))
+    assert_eq(dml_names(m.of(DocKind.Function)), dml_strs(["first"]))
+    assert_eq(dml_names(m.of(DocKind.Type)), dml_strs(["Point"]))
+    assert_eq(dml_names(m.of(DocKind.Trait)), dml_strs(["Shape"]))
+end dml_each_declaration_in_its_group
+
+@test("a private declaration is absent, because a reader can only call what is exported")
+dml_a_private_declaration_is_absent()
+    val m = dml_only("module m\n\nprivate helper(n: int) -> int = n\n\npublic(n: int) -> int = n")
+
+    assert_eq(dml_names(m.symbols), dml_strs(["public"]))
+
+@test("a private declaration is present when asked for, since a maintainer reads their own package")
+dml_present_when_asked_for()
+    val ms = dml_modules("module m\n\nprivate helper(n: int) -> int = n", true)
+
+    assert_eq(dml_names(ms.at(0).symbols), dml_strs(["helper"]))
+
+@test("a module's files are merged, and symbols sort by name rather than by file order")
+dml_files_merged_sorted_by_name()
+    var us: Buf[Program] = buf()
+
+    us.push(dml_unit("a.sysl", "module m\n\nzeta() -> int = 1"))
+    us.push(dml_unit("b.sysl", "module m\n\nalpha() -> int = 2"))
+
+    val ms = build_doc_modules(us, false)
+
+    assert_eq(ms.len(), 1)
+    assert_eq(dml_names(ms.at(0).symbols), dml_strs(["alpha", "zeta"]))
+end dml_files_merged_sorted_by_name
+
+@test("a file with no module header contributes nothing, because it is a program and not an API")
+dml_no_module_header_contributes_nothing()
+    assert_eq(dml_modules("main() = print(1)", false).len(), 0)
+
+@test("a @tests file contributes nothing, because its functions are not API")
+dml_a_tests_file_contributes_nothing()
+    var us: Buf[Program] = buf()
+
+    us.push(dml_unit("text.sysl", "module sysl.text\n\nsplit(s: string) -> int = 1"))
+    us.push(dml_unit("tests.sysl", "module sysl.text\n@tests\n\n@test(\"splits\")\nsplit_cuts()\n    print(1)"))
+
+    val ms = build_doc_modules(us, false)
+
+    assert_eq(ms.len(), 1)
+    assert_eq(dml_names(ms.at(0).symbols), dml_strs(["split"]))
+end dml_a_tests_file_contributes_nothing
+
+@test("a capability clause is carried, because it is the headline for an embedded reader")
+dml_a_capability_clause_is_carried()
+    assert_eq(dml_only("module m\n@requires(alloc)\n\nf()\n    print(1)").capabilities,
+              dml_strs(["requires { alloc }"]))
+
+// -- prose is attached to the declaration below it --------------------------------------------------
+
+@test("a doc comment reaches the function under it")
+dml_a_doc_comment_reaches_the_function()
+    val m = dml_only("module m\n\n/** Answers the first element. */\nfirst(xs: []int) -> int = xs[0]")
+
+    assert_eq(m.symbols.at(0).summary(), "Answers the first element.")
+
+@test("an annotation between the prose and the declaration does not break the association")
+dml_an_annotation_between()
+    val m = dml_only("module m\n\n/** Answers one. */\n@export(\"one\")\none() -> int = 1")
+
+    assert_eq(m.symbols.at(0).summary(), "Answers one.")
+
+@test("a blank line ends the association, which is what lets a file open with prose")
+dml_a_blank_line_ends_the_association()
+    val m = dml_only("module m\n\n/** About this module. */\n\nf() -> int = 1")
+
+    assert(!m.symbols.at(0).documented())
+    assert_eq(m.summary(), "About this module.")
+end dml_a_blank_line_ends_the_association
+
+@test("a member's prose reaches the member and not its type")
+dml_a_members_prose_reaches_the_member()
+    val m = dml_only("module m\n\n/** A point. */\nstruct Point\n    x: int\n\n    /** Answers x. */\n" +
+                     "    getx(self) -> int = self.x\n")
+    val t = m.of(DocKind.Type).at(0)
+
+    assert_eq(t.summary(), "A point.")
+    assert_eq(t.members.at(0).summary(), "Answers x.")
+end dml_a_members_prose_reaches_the_member
+
+@test("an undocumented declaration says so rather than pretending")
+dml_an_undocumented_declaration()
+    assert(!dml_only("module m\n\nf() -> int = 1").symbols.at(0).documented())
+
+// -- a module's headline comes from the file named for it -------------------------------------------
+
+@test("the eponymous file's prose is the module's, and a sibling's is not")
+dml_the_eponymous_file()
+    val m = dml_named(["glob.sysl", "module m.path\n\n/** Matching a path against a pattern. */\n\nf() -> int = 1",
+                       "path.sysl", "module m.path\n\n/** Path handling decided by the string alone. */\n\ng() -> int = 2"])
+
+    assert_eq(m.summary(), "Path handling decided by the string alone.")
+
+@test("and the answer does not depend on which file was collected first")
+dml_not_the_first_collected()
+    val m = dml_named(["path.sysl", "module m.path\n\n/** Path handling decided by the string alone. */\n\ng() -> int = 2",
+                       "glob.sysl", "module m.path\n\n/** Matching a path against a pattern. */\n\nf() -> int = 1"])
+
+    assert_eq(m.summary(), "Path handling decided by the string alone.")
+
+@test("a headline file with no prose leaves the summary BLANK rather than borrowing a sibling's")
+dml_a_headline_file_with_no_prose()
+    val m = dml_named(["check.sysl", "module m\n\n/** What a program does when an assumption does not hold. */\n\nf() -> int = 1",
+                       "m.sysl", "module m\n\ng() -> int = 2"])
+
+    assert_eq(m.summary(), "")
+
+@test("and so does a module with no file named for it at all")
+dml_no_file_named_for_it()
+    val m = dml_named(["bytes.sysl", "module m.io\n\n/** Reading from memory and writing to it. */\n\nf() -> int = 1",
+                       "read.sysl", "module m.io\n\n/** Reading from a descriptor. */\n\ng() -> int = 2"])
+
+    assert_eq(m.summary(), "")
+
+@test("a module of ONE file is its own headline file, whatever it is called")
+dml_a_module_of_one_file()
+    assert_eq(dml_named(["anything.sysl", "module m\n\n/** About this module. */\n\nf() -> int = 1"]).summary(),
+              "About this module.")
+
+// The fixture is a real literate document rather than sysl under an `.lsysl` name: a file is tangled
+// by its name before anything is parsed, so plain sysl in an `.lsysl` file contributes no module and
+// would make this pass for the wrong reason.
+@test("a literate file may be the headline file, since a literate module is a module")
+dml_a_literate_headline_file()
+    val literate = "m.regex — the matcher\n=====================\n\n    module m.regex\n\n" +
+                   "    /** Matching text against a pattern. */\n\n    g() -> int = 2\n"
+    val m = dml_named(["vm.sysl", "module m.regex\n\n/** The backtracking machine. */\n\nf() -> int = 1",
+                       "regex.lsysl", literate])
+
+    assert_eq(m.summary(), "Matching text against a pattern.")
+end dml_a_literate_headline_file
+
+@test("the deepest segment is what names the file, not the whole dotted path")
+dml_the_deepest_segment()
+    val m = dml_named(["other.sysl", "module m.math.bigint\n\n/** Something else. */\n\nf() -> int = 1",
+                       "m.math.bigint.sysl", "module m.math.bigint\n\n/** The whole path, which is not the rule. */\n\ng() -> int = 2",
+                       "bigint.sysl", "module m.math.bigint\n\n/** Integers with no width. */\n\nh() -> int = 3"])
+
+    assert_eq(m.summary(), "Integers with no width.")
+
+@test("a directory in front of the name does not stop it matching")
+dml_a_directory_in_front()
+    val m = dml_named(["a.sysl", "module m.path\n\n/** Something else. */\n\nf() -> int = 1",
+                       "lib/sysl/path/path.sysl", "module m.path\n\n/** Path handling. */\n\ng() -> int = 2"])
+
+    assert_eq(m.summary(), "Path handling.")
+
+// -- the reference's defects, fixed -------------------------------------------------------------------
+//
+// Each of these departs from the `sysl-doc` of 0.0.152 on purpose; the fix is the user's decision.
+
+// 0.0.152 differs: over this module it writes the summary `Geometry for points, wrapped here.` into
+// the frontmatter and then the whole body again under it -- `Geometry for points,\nwrapped here.
+// More prose follows.` -- because it strips the flattened summary off the unflattened body. The
+// model cuts the first sentence off the body as written.
+@test("a summary wrapped over two lines is cut off the prose whole, so a page prints it once")
+dml_a_wrapped_summary_is_cut_off_whole()
+    val m = dml_only("module m\n\n/** Geometry for points,\n * wrapped here. More prose follows.\n */\n\nf() -> int = 1")
+    val d = dml_prose(m.doc)
+
+    assert_eq(d.summary, "Geometry for points, wrapped here.")
+    assert_eq(d.rest, "More prose follows.")
+    assert_eq(doc_rest("One sentence only."), "")
+    assert_eq(doc_rest("No stop at all"), "")
+end dml_a_wrapped_summary_is_cut_off_whole
+
+// 0.0.152 differs: it renders this struct as `struct P\n    a: int\n    b: int`, the private field
+// unmarked. The model carries each field's visibility, and the signature marks it.
+@test("a private field carries its visibility, and the signature marks it")
+dml_a_private_field_carries_its_visibility()
+    val t = dml_only("module m\n\nstruct P\n    private a: int\n    b: int\n").symbols.at(0)
+
+    assert_eq(t.signature, "struct P\n    private a: int\n    b: int")
+    assert_eq(t.fields.len(), 2)
+    assert_eq(t.fields.at(0).name, "a")
+    assert(t.fields.at(0).access == DocAccess.File)
+    assert_eq(t.fields.at(0).text, "private a: int")
+    assert(t.fields.at(1).access == DocAccess.Public)
+end dml_a_private_field_carries_its_visibility
+
+// 0.0.152 differs: a `type` alias, an `extern` and a module `val` are absent from its page. The model
+// lists each as its own kind, after the kind it is a variety of: a `val` after the constants, an
+// `extern` after the functions, an alias after the types.
+@test("an alias, an extern and a module val are listed, each after the kind it is a variety of")
+dml_alias_extern_and_val_are_listed()
+    val m = dml_only("module m\n\nimpl Shape for Point\n    area(self) -> int = 0\n\ntrait Shape\n" +
+                     "    area(self) -> int\n\ntype Alias = int\n\nstruct Point\n    x: int\n\n" +
+                     "extern \"getpid\" c_pid() -> int\n\nfirst() -> int = 1\n\nval origin: int = 0\n\n" +
+                     "const limit: usize = 8\n")
+
+    assert_eq(dml_names(m.symbols),
+              dml_strs(["limit", "origin", "first", "c_pid", "Point", "Alias", "Shape", "Shape for Point"]))
+    assert_eq(m.of(DocKind.Value).at(0).signature, "val origin: int = 0")
+    assert_eq(m.of(DocKind.Extern).at(0).signature, "extern c_pid() -> int")
+    assert_eq(m.of(DocKind.Alias).at(0).signature, "type Alias = int")
+end dml_alias_extern_and_val_are_listed
+
+// 0.0.152 differs: with `--private` it lists the private struct but still only `shown` among its
+// members. The model lists every private item when asked, members included.
+@test("a private member is listed when private items are asked for, and not otherwise")
+dml_private_members_when_asked_for()
+    val text = "module m\n\nstruct P\n    b: int\n\n    private hidden(self) -> int = self.b\n" +
+               "    shown(self) -> int = self.b\n"
+
+    assert_eq(dml_names(dml_modules(text, true).at(0).symbols.at(0).members), dml_strs(["hidden", "shown"]))
+    assert_eq(dml_names(dml_modules(text, false).at(0).symbols.at(0).members), dml_strs(["shown"]))
+end dml_private_members_when_asked_for
+
+// 0.0.152 differs: it renders `| \`nope\` | not a parameter |` in the parameter table. The compiler's
+// doc check refuses a `@param` naming no parameter, so the model leaves the tag out and a page built
+// from it does not show it.
+@test("a @param naming no parameter is left out, since the doc check refuses it")
+dml_an_unknown_param_is_left_out()
+    val m = dml_only("module m\n\n/** Adds.\n * @param a the left\n * @param nope not a parameter\n */\n" +
+                     "add(a: int) -> int = a\n")
+    val d = dml_prose(m.symbols.at(0).doc)
+
+    assert_eq(dml_subjects(d.params), dml_strs(["a"]))
+    assert_eq(dml_subjects(d.tags), dml_strs(["a"]))
+end dml_an_unknown_param_is_left_out
+
+// -- the tags as data, and what hangs under a type ----------------------------------------------------
+
+@test("the tags are laid out by what a page does with each, the carried ones in written order")
+dml_the_tags_as_data()
+    val m = dml_only("module m\n\n/** Sums.\n * @tparam T the element\n * @param xs the values\n" +
+                     " * @since 0.1\n * @return the total\n * @deprecated use total\n * @see sub\n" +
+                     " * @note wraps\n */\nsum[T](xs: []T) -> int = 0\n")
+    val d = dml_prose(m.symbols.at(0).doc)
+
+    assert_eq(dml_subjects(d.tparams), dml_strs(["T"]))
+    assert_eq(d.tparams.at(0).text, "the element")
+    assert_eq(dml_subjects(d.params), dml_strs(["xs"]))
+    assert_eq(d.returns.unwrap_or("<none>"), "the total")
+    assert_eq(d.deprecated.unwrap_or("<none>"), "use total")
+
+    var carried: Buf[string] = buf()
+
+    for i in 0..<d.carried.len()
+        carried.push(s"${d.carried.at(i).name} ${d.carried.at(i).text}")
+
+    assert_eq(carried, dml_strs(["since 0.1", "see sub", "note wraps"]))
+end dml_the_tags_as_data
+
+@test("an enum's variants and methods hang under it, a variant's prose with it")
+dml_variants_hang_under_their_enum()
+    val m = dml_only("module m\n\nenum Shape\n    /** A round one. */\n    Circle(r: int)\n    Square\n\n" +
+                     "    sides(self) -> int = 0\n")
+    val t = m.symbols.at(0)
+
+    assert_eq(t.variants.len(), 2)
+    assert_eq(t.variants.at(0).signature, "Circle(r: int)")
+    assert_eq(dml_prose(t.variants.at(0).doc).summary, "A round one.")
+    assert_eq(t.variants.at(1).name, "Square")
+    assert_eq(dml_names(t.members), dml_strs(["sides"]))
+end dml_variants_hang_under_their_enum

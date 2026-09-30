@@ -1,0 +1,521 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+import sysl.unicode
+
+// The model an API reference page is written from: which modules exist, which declarations each
+// lists and in what order, the prose each carries, and the tags in that prose laid out as data.
+//
+// **The unit is a MODULE and not a type.** sysl's importable thing is a module, so that is what a
+// reader arrives wanting and what a page is about.
+//
+// **It is built from PARSED files and asks for nothing analyzed.** Every question it answers -- what
+// is declared, what is public, what the signature says, what the prose above it was -- is answered
+// by the syntax, so a package whose dependencies are missing, or which does not compile today, still
+// documents. The signatures are `doc_signature.sysl`'s, rendered once here so that a page never
+// walks a tree.
+
+// What kind of thing a symbol is, which is also the group a page lists it under.
+//
+// **The order is the order of the groups on a page**: a reader wants the values and the functions a
+// module offers before the types those mention, and the trait implementations last, being facts
+// about the types above rather than things to call. Each kind the `sysl-doc` of 0.0.152 left off the
+// page follows the kind it is a variety of -- a module `val` after the constants, an `extern` after
+// the functions, a `type` alias after the types.
+enum DocKind
+    Const
+    Value
+    Function
+    Extern
+    Type
+    Alias
+    Trait
+    Implementation
+end DocKind
+
+// Where a symbol may be seen from. `private` is file-private and `private[m]` module-wide, which are
+// two different answers to "should this be on the page", so they are kept apart.
+enum DocAccess
+    Public
+    Module
+    File
+
+// A doc comment as a page uses it: the prose, and the tags sorted by what a page does with them.
+//
+// `rest` is the body AFTER its first sentence -- what a module page prints under a summary that
+// its frontmatter already carries. It is cut from the body as written rather than by stripping the
+// flattened summary off the front, which fails for a summary wrapped over two lines: the `sysl-doc`
+// of 0.0.152 printed such a sentence twice, and cutting it here is a decided fix.
+//
+// A `@param` or `@tparam` naming nothing the declaration has is **left out**: the compiler's own
+// doc check refuses it, so a page showing it would document a parameter that does not exist. The
+// `sysl-doc` of 0.0.152 rendered it; leaving it out is a decided fix.
+struct DocProse
+    summary: string
+    body: string
+    rest: string
+    params: Buf[DocTag]
+    tparams: Buf[DocTag]
+    returns: Option[string]
+    deprecated: Option[string]
+    // `@see`, `@note`, `@example` and `@since`, in the order they were written -- `@see` in
+    // particular depends on it.
+    carried: Buf[DocTag]
+    // Every tag kept, in written order, for a reader wanting more than the four groups above.
+    tags: Buf[DocTag]
+end DocProse
+
+// One field of a struct, with its visibility: a private field is state a caller cannot reach, which
+// is information a page may show (the signature marks it `private`) rather than drop.
+struct DocField
+    name: string
+    access: DocAccess
+    text: string
+
+// One variant of an enum, as the signature renders it, with any prose written above it.
+struct DocVariant
+    name: string
+    signature: string
+    doc: Option[DocProse]
+
+// One documented declaration.
+//
+// `members` is a type's or a trait's methods, documented under the type they belong to. An `impl`
+// block's methods are deliberately absent: their signatures are the trait's, written where the
+// trait is.
+struct DocSymbol
+    name: string
+    kind: DocKind
+    access: DocAccess
+    signature: string
+    doc: Option[DocProse]
+    members: Buf[DocSymbol]
+    fields: Buf[DocField]
+    variants: Buf[DocVariant]
+    // The line it was declared on, which orders two symbols of one name.
+    line: usize
+
+    // The first sentence of the prose, for an index with one column to spend.
+    summary(self) -> string = self.doc match
+        Some(d) -> d.summary
+        None -> ""
+
+    // Whether the author said anything at all.
+    documented(self) -> bool = self.doc match
+        Some(d) -> d.body.len > 0 || !d.tags.is_empty()
+        None -> false
+end DocSymbol
+
+// One module's page.
+struct DocModule
+    name: string
+    symbols: Buf[DocSymbol]
+    doc: Option[DocProse]
+    // Each capability clause as a reader writes it -- the headline for somebody choosing a module
+    // for a microcontroller.
+    capabilities: Buf[string]
+
+    summary(self) -> string = self.doc match
+        Some(d) -> d.summary
+        None -> ""
+
+    // The symbols of one kind, in the order they are listed.
+    of(self, k: DocKind) -> Buf[DocSymbol]
+        var out: Buf[DocSymbol] = buf()
+
+        for i in 0..<self.symbols.len()
+            if self.symbols.at(i).kind == k then out.push(self.symbols.at(i))
+
+        out
+    end of
+end DocModule
+
+// -- building ---------------------------------------------------------------------------------------
+
+// The modules of these parsed files, sorted by name.
+//
+// **Dropped**: a `@tests` file, whose functions are stripped from every build but `sysl test` and so
+// are no API; a file with no `module` header, which is a program; a top-level `var`, which is a local
+// of an entry file's body or a mutable global no caller should be shown. **Private declarations and
+// private members are dropped unless `include_private`**, and with it every one is listed -- the
+// `sysl-doc` of 0.0.152 still left private members off, which is a decided fix.
+//
+// Within a module, symbols sort by kind, then by lowercased name, then by line: a module's files
+// have no order of their own, so a listing in file order would change when a file was renamed.
+build_doc_modules(units: Buf[Program], include_private: bool) -> Buf[DocModule]
+    var names: Buf[string] = buf()
+    var out: Buf[DocModule] = buf()
+
+    for i in 0..<units.len()
+        val u = units.at(i)
+
+        if u.test_only then continue
+
+        u.module_name match
+            Some(n) -> if !dm_has(names, n.show()) then dm_insert_name(&names, n.show())
+            None -> ()
+
+    for i in 0..<names.len()
+        out.push(dm_module(names.at(i), dm_units_of(units, names.at(i)), include_private))
+
+    out
+end build_doc_modules
+
+private dm_units_of(units: Buf[Program], name: string) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    for i in 0..<units.len()
+        val u = units.at(i)
+
+        if u.test_only then continue
+
+        u.module_name match
+            Some(n) -> if n.show() == name then out.push(u)
+            None -> ()
+
+    out
+end dm_units_of
+
+private dm_module(name: string, us: Buf[Program], include_private: bool) -> DocModule
+    var symbols: Buf[DocSymbol] = buf()
+    var caps: Buf[string] = buf()
+
+    for i in 0..<us.len()
+        val u = us.at(i)
+
+        for j in 0..<u.body.len()
+            dm_symbol_of(u, u.body.at(j), include_private) match
+                Some(s) -> if include_private || s.access == Public then dm_insert_symbol(&symbols, s)
+                None -> ()
+
+        for j in 0..<u.capabilities.len()
+            val c = dm_capability_text(u.capabilities.at(j))
+
+            if !dm_has(caps, c) then dm_insert_name(&caps, c)
+
+    DocModule(name, symbols, dm_headline(name, us), caps)
+end dm_module
+
+// A capability clause as a reader would write it.
+private dm_capability_text(c: CapabilityClause) -> string = c.direction match
+    Requires -> s"requires { ${c.name} }"
+    Narrows -> s"no ${c.name}"
+
+// -- the module's own prose -------------------------------------------------------------------------
+
+// The module's prose: the unclaimed leading doc comment of its HEADLINE file, and no other.
+//
+// **The headline file is the one named for the module's last path segment** -- `sysl.path` is
+// `path.sysl`, `sysl.regex` is `regex.lsysl` -- **and a module of one file is its own**, whatever it
+// is called. A module whose headline file is absent or has no prose has no summary, rather than
+// borrowing a sibling's: a blank row is a defect somebody can see, and a plausible wrong one is not.
+private dm_headline(name: string, us: Buf[Program]) -> Option[DocProse]
+    if us.len() == 1 then return dm_module_doc(us.at(0))
+
+    val last = dm_last_segment(name)
+    var files: Buf[Program] = buf()
+
+    // Sorted by name, so a module carrying both `x.sysl` and `x.lsysl` answers the same way every
+    // time rather than by directory order.
+    for i in 0..<us.len()
+        val u = us.at(i)
+
+        if dm_stem(u.src.name) == last
+            var at = files.len()
+
+            while at > 0 && files.at(at - 1).src.name > u.src.name
+                at -= 1
+
+            files.insert(at, u)
+
+    for i in 0..<files.len()
+        dm_module_doc(files.at(i)) match
+            Some(d) -> return Some(d)
+            None -> ()
+
+    None
+end dm_headline
+
+// A file's first doc comment, where no declaration below adopted it -- the attachment rule run
+// backwards, so the two can never disagree.
+private dm_module_doc(u: Program) -> Option[DocProse]
+    if u.docs.is_empty() then return None
+
+    val first = u.docs.at(0)
+
+    for i in 0..<u.body.len()
+        val s = u.body.at(i)
+
+        if !dm_carries_prose(s) then continue
+
+        doc_above(u.src, u.docs, dm_line(u, s.span)) match
+            Some(d) -> if d.start_line == first.start_line then return None
+            None -> ()
+
+    Some(doc_prose(first, buf(), buf()))
+end dm_module_doc
+
+// Whether a top-level statement is a declaration that adopts the doc comment above it.
+private dm_carries_prose(s: Stmt) -> bool = *s.kind match
+    FuncDecl(_) -> true
+    StructDecl(_) -> true
+    EnumDecl(_) -> true
+    TraitDecl(_) -> true
+    ConstDecl(_, _, _, _) -> true
+    ImplDecl(_) -> true
+    TypeDecl(_) -> true
+    ExternDecl(_) -> true
+    ExternVarDecl(_, _, _, _) -> true
+    ValDecl(_, _, _, _, _, _) -> true
+    _ -> false
+
+// `lib/sysl/path/glob.sysl` is `glob`: the directory and the one extension off.
+private dm_stem(name: string) -> string
+    val b = name.bytes
+    var start: usize = 0
+
+    for i in 0..<b.len
+        if b[i] == u8('/') || b[i] == u8('\\') then start = i + 1
+
+    val base = name[start..]
+    val bb = base.bytes
+    var dot: usize = 0
+
+    for i in 0..<bb.len
+        if bb[i] == u8('.') then dot = i
+
+    if dot > 0 then base[0..<dot] else base
+end dm_stem
+
+private dm_last_segment(name: string) -> string
+    val b = name.bytes
+    var start: usize = 0
+
+    for i in 0..<b.len
+        if b[i] == u8('.') then start = i + 1
+
+    name[start..]
+end dm_last_segment
+
+// -- one declaration --------------------------------------------------------------------------------
+
+private dm_line(u: Program, at: Span) -> usize = u.src.locate(at.start).line
+
+private dm_access(v: Visibility) -> DocAccess = v match
+    Public -> DocAccess.Public
+    Scoped(_) -> DocAccess.Module
+    File -> DocAccess.File
+
+// The prose above `at`, its unanswerable parameter tags left out.
+private dm_doc_at(u: Program, at: Span, params: Buf[string], tparams: Buf[string]) -> Option[DocProse] =
+    doc_above(u.src, u.docs, dm_line(u, at)) match
+        Some(d) -> Some(doc_prose(d, params, tparams))
+        None -> None
+
+private dm_symbol(name: string, kind: DocKind, access: DocAccess, signature: string,
+                  doc: Option[DocProse], line: usize) -> DocSymbol =
+    DocSymbol(name, kind, access, signature, doc, buf(), buf(), buf(), line)
+
+// One top-level statement as a symbol, or nothing where it is not one a page lists.
+private dm_symbol_of(u: Program, s: Stmt, include_private: bool) -> Option[DocSymbol]
+    val line = dm_line(u, s.span)
+    val sig = doc_signature(s).unwrap_or("")
+
+    *s.kind match
+        FuncDecl(d) ->
+            Some(dm_symbol(d.name, DocKind.Function, dm_access(d.vis), sig,
+                           dm_doc_at(u, s.span, dm_param_names(false, d.params), d.tparams), line))
+        StructDecl(d) ->
+            var sym = dm_symbol(d.name, DocKind.Type, dm_access(d.vis), sig, dm_doc_at(u, s.span, buf(), d.tparams), line)
+
+            sym.members = dm_members(u, d.members, include_private)
+
+            for i in 0..<d.fields.len()
+                val f = d.fields.at(i)
+
+                sym.fields.push(DocField(f.name, dm_access(f.vis), doc_field_text(f)))
+
+            Some(sym)
+        EnumDecl(d) ->
+            var sym = dm_symbol(d.name, DocKind.Type, dm_access(d.vis), sig, dm_doc_at(u, s.span, buf(), d.tparams), line)
+
+            sym.members = dm_members(u, d.members, include_private)
+
+            for i in 0..<d.variants.len()
+                val v = d.variants.at(i)
+
+                sym.variants.push(DocVariant(v.name, doc_variant_text(v), dm_doc_at(u, v.span, buf(), buf())))
+
+            Some(sym)
+        TraitDecl(d) ->
+            var sym = dm_symbol(d.name, DocKind.Trait,dm_access(d.vis), sig, dm_doc_at(u, s.span, buf(), d.tparams), line)
+
+            sym.members = dm_members(u, d.methods, include_private)
+            Some(sym)
+        ConstDecl(name, _, _, vis) ->
+            Some(dm_symbol(name, DocKind.Const,dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
+        // An `impl` is named for what it says -- this type has this trait -- which is also what a
+        // reader searches for. It has no visibility of its own.
+        ImplDecl(d) ->
+            Some(dm_symbol(s"${d.trait_name} for ${doc_type_text(d.for_type)}", DocKind.Implementation, DocAccess.Public,
+                           sig, dm_doc_at(u, s.span, buf(), d.tparams), line))
+        TypeDecl(d) ->
+            Some(dm_symbol(d.name, DocKind.Alias,dm_access(d.vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
+        ExternDecl(d) ->
+            Some(dm_symbol(d.name, DocKind.Extern,dm_access(d.vis), sig,
+                           dm_doc_at(u, s.span, dm_param_names(false, d.params), buf()), line))
+        ExternVarDecl(name, _, _, vis) ->
+            Some(dm_symbol(name, DocKind.Extern,dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
+        ValDecl(name, _, _, vis, _, _) ->
+            Some(dm_symbol(name, DocKind.Value,dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
+        _ -> None
+end dm_symbol_of
+
+// A type's or trait's methods, in the order written; private ones only when asked for.
+private dm_members(u: Program, ms: Buf[MethodDecl], include_private: bool) -> Buf[DocSymbol]
+    var out: Buf[DocSymbol] = buf()
+
+    for i in 0..<ms.len()
+        val m = ms.at(i)
+        val access = dm_access(m.vis)
+
+        if !include_private && access != Public then continue
+
+        out.push(dm_symbol(m.name, DocKind.Function, access, doc_method(m),
+                           dm_doc_at(u, m.span, dm_param_names(m.receiver.is_some(), m.params), m.tparams),
+                           dm_line(u, m.span)))
+
+    out
+end dm_members
+
+// The names a `@param` may name; a receiver counts, being spelled in the declaration.
+private dm_param_names(receiver: bool, params: Buf[Param]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if receiver then out.push("self")
+
+    for i in 0..<params.len()
+        out.push(params.at(i).name)
+
+    out
+end dm_param_names
+
+// -- the prose --------------------------------------------------------------------------------------
+
+// A doc comment read into what a page does with it.
+doc_prose(d: Doc, params: Buf[string], tparams: Buf[string]) -> DocProse
+    val faults = check_doc(d, params, tparams)
+    var kept: Buf[DocTag] = buf()
+    var ps: Buf[DocTag] = buf()
+    var tps: Buf[DocTag] = buf()
+    var carried: Buf[DocTag] = buf()
+    var returns: Option[string] = None
+    var deprecated: Option[string] = None
+
+    for i in 0..<d.tags.len()
+        val t = d.tags.at(i)
+
+        if dm_faulted(faults, t) then continue
+
+        kept.push(t)
+
+        if t.name == "param"
+            ps.push(t)
+        elif t.name == "tparam"
+            tps.push(t)
+        elif t.name == "return"
+            if returns.is_none() then returns = Some(t.text)
+        elif t.name == "deprecated"
+            if deprecated.is_none() then deprecated = Some(t.text)
+        elif t.name == "see" || t.name == "note" || t.name == "example" || t.name == "since"
+            carried.push(t)
+
+    DocProse(d.summary, d.body, doc_rest(d.body), ps, tps, returns, deprecated, carried, kept)
+end doc_prose
+
+private dm_faulted(faults: Buf[DocFault], t: DocTag) -> bool
+    for i in 0..<faults.len()
+        val f = faults.at(i).tag
+
+        if f.line == t.line && f.name == t.name && f.text == t.text then return true
+
+    false
+end dm_faulted
+
+// The prose after its first sentence -- the same sentence `Doc.summary` flattens, found in the body
+// as written, so a summary wrapped over lines is cut off whole.
+doc_rest(body: string) -> string
+    val t = body.trim()
+    val b = t.bytes
+
+    for i in 0..<b.len
+        if b[i] == u8('.') || b[i] == u8('!') || b[i] == u8('?')
+            if i + 1 == b.len then return ""
+            if dm_is_space(b[i + 1]) then return t[(i + 1)..].trim()
+
+    ""
+end doc_rest
+
+private dm_is_space(b: u8) -> bool =
+    b == u8(' ') || b == u8('\t') || b == u8('\n') || b == u8('\r') || b == 11 || b == 12
+
+// -- ordering ---------------------------------------------------------------------------------------
+
+private dm_rank(k: DocKind) -> int = k match
+    Const -> 0
+    Value -> 1
+    Function -> 2
+    Extern -> 3
+    Type -> 4
+    Alias -> 5
+    Trait -> 6
+    Implementation -> 7
+
+private dm_lower(s: string) -> string
+    var out = str_builder()
+
+    for c in s.chars
+        out.push_char(unicode.to_lower(c))
+
+    out.finish()
+end dm_lower
+
+// Whether `a` is listed before `b`: by kind, then lowercased name, then line.
+private dm_before(a: DocSymbol, b: DocSymbol) -> bool
+    if dm_rank(a.kind) != dm_rank(b.kind) then return dm_rank(a.kind) < dm_rank(b.kind)
+
+    val la = dm_lower(a.name)
+    val lb = dm_lower(b.name)
+
+    if la != lb then return la < lb
+
+    a.line < b.line
+end dm_before
+
+// Inserted after every symbol it does not come before, so equal keys keep the order they came in.
+private dm_insert_symbol(out: *Buf[DocSymbol], s: DocSymbol)
+    var at = out.len()
+
+    while at > 0 && dm_before(s, out.at(at - 1))
+        at -= 1
+
+    out.insert(at, s)
+end dm_insert_symbol
+
+private dm_insert_name(out: *Buf[string], s: string)
+    var at = out.len()
+
+    while at > 0 && s < out.at(at - 1)
+        at -= 1
+
+    out.insert(at, s)
+end dm_insert_name
+
+private dm_has(xs: Buf[string], s: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == s then return true
+
+    false
+end dm_has
