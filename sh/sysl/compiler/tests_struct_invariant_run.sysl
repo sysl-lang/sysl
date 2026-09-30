@@ -1,0 +1,584 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A struct's `invariant` clauses are checked whenever a value of it is built: an in-range
+// construction proceeds, an out-of-range one traps. Several clauses all have to hold; a clause may
+// read a module constant; and the check reaches through the ordinary construction path, so a struct
+// built to be returned or passed is checked just the same. A write re-checks it too -- a field, a
+// compound update, an increment, a write through a pointer -- and a clause that reads THROUGH a field
+// is owed by every struct a place is written inside, not only by the one whose field is named last.
+//
+// **Every output quoted here was read out of the reference compiler**, whose `StructInvariantRunTests`
+// these are. A trap is silent there: the program stops on a signal and prints nothing.
+
+private var sir_library_cache: Buf[Program] = buf()
+private var sir_library_read: bool = false
+
+private sir_library() -> Buf[Program]
+    if sir_library_read then return sir_library_cache
+
+    sir_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> sir_library_cache = units
+
+    sir_library_cache
+end sir_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private sir_ready() -> bool
+    if sir_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end sir_ready
+
+// Builds a program and runs it, answering what it printed and whether it exited cleanly -- or why
+// it could not be built or run.
+private sir_build_run(text: string) -> Result[(string, bool), string]
+    val root = make_temp_dir("sysl-invariant-run").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return Err(failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> Err("the program that was built could not be run")
+        Ok(out) -> Ok((out.text + out.err.unwrap_or(""), out.status.ok()))
+end sir_build_run
+
+// **What a program PRINTS**, where it runs to the end.
+private sir_ran(text: string) -> string
+    sir_build_run(text) match
+        Err(why) -> s"it did not build: $why"
+        Ok((out, clean)) -> if clean then out else s"it did not exit zero: $out"
+
+// **That a program that BUILT stopped itself, saying nothing** -- which is all a failed clause does.
+// Answers what is wrong, or the empty string.
+private sir_traps(text: string) -> string
+    sir_build_run(text) match
+        Err(why) -> s"it did not build: $why"
+        Ok((out, clean)) ->
+            if clean then return s"it exited cleanly: $out"
+
+            if out != "" then return s"it stopped, but said: $out"
+
+            ""
+end sir_traps
+
+private sir_account() -> string = "struct Account\n    balance: int\n    invariant balance >= 0\n"
+
+// A clause that reads through a field. `Inner` carries none of its own, so it is `Outer`'s clause or
+// nothing -- which is what makes `o.a.n` the discriminating write.
+private sir_outer() -> string =
+    "struct Inner\n    n: int\nstruct Outer\n    a: Inner\n    b: int\n    invariant a.n <= b\n"
+
+// The same, with an array between the struct and the field the clause reads.
+private sir_grid() -> string =
+    "struct Cell\n    n: int\nstruct Grid\n    items: [2]Cell\n    cap: int\n    invariant items[0].n <= cap\n"
+
+private sir_span() -> string = "struct Span\n    lo: int\n    hi: int\n    invariant lo <= hi\n"
+
+private sir_span_two() -> string = sir_span() + "    invariant lo >= 0\n"
+
+private sir_nested() -> string =
+    "struct Bounded\n    n: int\n    invariant n >= 0\nstruct Holder\n    b: Bounded\n"
+
+// ---- at a construction ----
+
+@test("a construction that satisfies the invariant proceeds")
+sir_a_construction_that_satisfies_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_account() + "var a = Account(10)\nprint(a.balance)"), "10\n")
+
+@test("a construction that violates the invariant traps")
+sir_a_construction_that_violates_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_account() + "var a = Account(-1)\nprint(a.balance)"), "")
+
+@test("the boundary value of an invariant is allowed")
+sir_the_boundary_value_is_allowed()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_account() + "var a = Account(0)\nprint(a.balance)"), "0\n")
+
+// ---- whole-struct reassignment is re-checked ----
+
+@test("an in-range whole-struct reassignment proceeds")
+sir_an_in_range_reassignment_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_account() + "var a = Account(5)\na = Account(7)\nprint(a.balance)"), "7\n")
+
+@test("an out-of-range whole-struct reassignment traps")
+sir_an_out_of_range_reassignment_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_account() + "var a = Account(5)\na = Account(-3)"), "")
+
+// ---- several invariants must all hold ----
+
+@test("several invariants all satisfied proceeds")
+sir_all_satisfied_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_span_two() + "var r = Span(2, 5)\nprint(r.lo, r.hi)"), "2 5\n")
+
+@test("the first of several invariants failing traps")
+sir_the_first_clause_failing_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_span_two() + "var r = Span(5, 2)"), "")
+
+@test("the second of several invariants failing traps")
+sir_the_second_clause_failing_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_span_two() + "var r = Span(-1, 5)"), "")
+
+@test("an invariant may read a module constant")
+sir_an_invariant_may_read_a_module_constant()
+    if !sir_ready() then return
+
+    val capped = "const LIMIT: int = 100\nstruct Capped\n    n: int\n    invariant n <= LIMIT\n"
+
+    assert_eq(sir_ran(capped + "var c = Capped(100)\nprint(c.n)"), "100\n")
+    assert_eq(sir_traps(capped + "var c = Capped(101)"), "")
+
+// ---- the check reaches through the ordinary construction path ----
+
+@test("a struct built to be returned is checked")
+sir_a_struct_built_to_be_returned_is_checked()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_account() + "make(n: int) -> Account = Account(n)\nprint(make(4).balance)"), "4\n")
+
+@test("a struct built as an argument is checked")
+sir_a_struct_built_as_an_argument_is_checked()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_account() + "bal(a: Account) -> int = a.balance\nprint(bal(Account(-2)))"), "")
+
+@test("a float invariant traps on violation")
+sir_a_float_invariant_traps_on_violation()
+    if !sir_ready() then return
+
+    val prob = "struct Prob\n    p: f64\n    invariant p >= 0.0 && p <= 1.0\n"
+
+    assert_eq(sir_ran(prob + "var x = Prob(0.5)\nprint(x.p)"), "0.5\n")
+    assert_eq(sir_traps(prob + "var x = Prob(1.5)"), "")
+
+// ---- a field assignment re-checks the invariant ----
+
+@test("an in-range field write proceeds")
+sir_an_in_range_field_write_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_account() + "var a = Account(5)\na.balance = 8\nprint(a.balance)"), "8\n")
+
+@test("an out-of-range field write traps")
+sir_an_out_of_range_field_write_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_account() + "var a = Account(5)\na.balance = -1"), "")
+
+// ---- a compound field assignment re-checks the invariant ----
+
+@test("an in-range compound field update proceeds")
+sir_an_in_range_update_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_account() + "var a = Account(5)\na.balance += 3\nprint(a.balance)"), "8\n")
+
+@test("a compound field update that drops below the bound traps")
+sir_an_update_that_drops_below_the_bound_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_account() + "var a = Account(5)\na.balance -= 9"), "")
+
+// ---- an increment of a field re-checks the invariant ----
+//
+// An increment is a write of one field, so it owes the same re-check the compound form owes: a `--`
+// off the bottom of a bound may not leave the struct holding a value its own clause forbids.
+
+@test("an increment of a field that keeps the invariant proceeds")
+sir_a_step_that_keeps_the_invariant_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_account() + "var a = Account(5)\na.balance++\nprint(a.balance)"), "6\n")
+
+@test("a decrement of a field that breaks the invariant traps")
+sir_a_step_that_breaks_it_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_account() + "var a = Account(0)\na.balance--"), "")
+
+@test("and so does a decrement written prefix")
+sir_and_so_does_one_written_prefix()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_account() + "var a = Account(0)\n--a.balance"), "")
+
+@test("a decrement of a field through a pointer is checked too")
+sir_an_increment_through_a_pointer_is_checked_too()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_account() + "var a = Account(0)\nvar p = &a\n(*p).balance--"), "")
+
+// ---- through a pointer ----
+
+@test("a field write through a pointer is checked")
+sir_a_field_write_through_a_pointer_is_checked()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_account() + "var a = Account(5)\nvar p = &a\n(*p).balance = -2"), "")
+
+// The walk survives a pointer because the pointee's type names the struct: `(*p).a.n` reaches
+// `Outer`'s clause through `p`'s static type exactly as `o.a.n` reaches it through `o`.
+
+@test("a nested field write through a pointer to the enclosing struct that keeps the invariant proceeds")
+sir_a_nested_pointer_write_that_keeps_it_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_outer() + "var o = Outer(Inner(1), 5)\nvar p = &o\n(*p).a.n = 4\nprint(o.a.n, o.b)"),
+              "4 5\n")
+
+@test("a nested field write through a pointer to the enclosing struct that breaks the invariant traps")
+sir_a_nested_pointer_write_that_breaks_it_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_outer() + "var o = Outer(Inner(1), 5)\nvar p = &o\n(*p).a.n = 9"), "")
+
+// ---- a field write into an array element is checked ----
+
+@test("an in-range field write into an array element proceeds")
+sir_an_in_range_element_write_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_account() + "var xs = [Account(1), Account(2)]\nxs[0].balance = 5\nprint(xs[0].balance)"),
+              "5\n")
+
+@test("an out-of-range field write into an array element traps")
+sir_an_out_of_range_element_write_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_account() + "var xs = [Account(1), Account(2)]\nxs[1].balance = -1"), "")
+
+// ---- each field write is checked as it happens ----
+//
+// Every field write is its own checkpoint: a sequence in which each intermediate state holds
+// proceeds, but a single write that breaks the clause traps even if a later write would mend it.
+
+@test("a sequence of field writes whose every step holds proceeds")
+sir_a_sequence_whose_every_step_holds_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_span() + "var s = Span(2, 8)\ns.hi = 5\ns.lo = 4\nprint(s.lo, s.hi)"), "4 5\n")
+
+@test("an intermediate write that breaks the invariant traps at that write")
+sir_an_intermediate_write_traps_at_that_write()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_span() + "var s = Span(2, 8)\ns.lo = 10\ns.hi = 12"), "")
+
+// ---- a struct inside a struct is checked as it is built ----
+//
+// A struct held as a field of another struct is still constructed, so its clause is checked where
+// it is built -- the outer struct's construction is not a way in.
+
+@test("a satisfied inner struct value proceeds")
+sir_a_satisfied_inner_value_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_nested() + "var h = Holder(Bounded(5))\nprint(h.b.n)"), "5\n")
+
+@test("and a violated inner struct value traps")
+sir_and_a_violated_one_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_nested() + "var h = Holder(Bounded(-1))\nprint(h.b.n)"), "")
+
+// ---- a whole-struct assignment through self is checked ----
+//
+// `*self = T(...)` is the escape offered a struct that cannot be updated one field at a time, so it
+// had better be checked -- an escape from the ordering, not from the invariant.
+
+private sir_span_members() -> string = sir_span() + raw"""
+        widen(*self)
+            *self = Span(self.lo, self.hi + 1)
+        end widen
+        wreck(*self)
+            *self = Span(9, 5)
+        end wreck
+    end Span
+    """
+
+@test("a whole-struct assignment through self that holds proceeds")
+sir_a_self_assignment_that_holds_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_span_members() + "var s = Span(2, 8)\ns.widen()\nprint(s.lo, s.hi)"), "2 9\n")
+
+@test("a whole-struct assignment through self that does not hold traps")
+sir_a_self_assignment_that_does_not_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_span_members() + "var s = Span(2, 8)\ns.wreck()"), "")
+
+// Assigning a struct-typed field is a construction, and a construction is already a produce site --
+// so the inner value is judged on its way in, before the field it lands in is considered.
+@test("a struct assigned into a field is checked as the value it is")
+sir_a_struct_assigned_into_a_field_is_checked()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_nested() + "var h = Holder(Bounded(1))\nh.b = Bounded(5)\nprint(h.b.n)"), "5\n")
+    assert_eq(sir_traps(sir_nested() + "var h = Holder(Bounded(1))\nh.b = Bounded(-1)"), "")
+
+// ---- an invariant that reads through a field is checked when the nested field changes ----
+//
+// A clause may read *through* a field, and then the field it depends on is not one of the struct's
+// own -- so the write that breaks it is a write the struct never sees.
+
+@test("a nested field write that keeps the enclosing invariant proceeds")
+sir_a_nested_write_that_keeps_it_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_outer() + "var o = Outer(Inner(1), 5)\no.a.n = 4\nprint(o.a.n, o.b)"), "4 5\n")
+
+// The write the enclosing struct would otherwise never hear about: `a.n` is not `Outer`'s field and
+// `Inner` has no clause of its own.
+@test("a nested field write that breaks the enclosing invariant traps")
+sir_a_nested_write_that_breaks_it_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_outer() + "var o = Outer(Inner(1), 5)\no.a.n = 9"), "")
+
+// The two ways the enclosing struct was always reached, kept beside the nested one so a regression
+// that narrows the walk shows up as the pair disagreeing.
+@test("as are the whole-field and plain-field writes that always were")
+sir_the_whole_field_and_plain_field_writes()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_outer() + "var o = Outer(Inner(1), 5)\no.a = Inner(9)"), "")
+    assert_eq(sir_traps(sir_outer() + "var o = Outer(Inner(1), 5)\no.b = 0"), "")
+
+// `reference/expressions.md § Several places at once` promises every write lands before any clause
+// is consulted, and that has to survive the walk: each arm alone would be refused.
+@test("and a multi-assignment is judged only once both writes have landed")
+sir_a_multi_assignment_is_judged_once_both_landed()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_outer() + "var o = Outer(Inner(1), 5)\no.a.n, o.b = 9, 9\nprint(o.a.n, o.b)"), "9 9\n")
+
+// The other half of the walk: the innermost struct's own clause still fires through a nested place.
+@test("while the nested struct's own clause still fires through the same place")
+sir_the_nested_structs_own_clause_still_fires()
+    if !sir_ready() then return
+
+    val own = "struct Bounded\n    n: int\n    invariant n >= 0\nstruct Box\n    b: Bounded\n    tag: int\n"
+
+    assert_eq(sir_ran(own + "var x = Box(Bounded(1), 0)\nx.b.n = 5\nprint(x.b.n)"), "5\n")
+    assert_eq(sir_traps(own + "var x = Box(Bounded(1), 0)\nx.b.n = -1"), "")
+
+// ---- an invariant that reads through an array element is checked when that element changes ----
+//
+// An index locates a place rather than owning one, so it contributes no check of its own and the
+// walk passes through it to the struct that does.
+
+@test("an element write that keeps the invariant reading through it proceeds")
+sir_an_element_write_that_keeps_it_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_grid() + "var g = Grid([Cell(0), Cell(0)], 5)\ng.items[0].n = 4\nprint(g.items[0].n)"),
+              "4\n")
+
+@test("an element write that breaks the invariant reading through it traps")
+sir_an_element_write_that_breaks_it_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_grid() + "var g = Grid([Cell(0), Cell(0)], 5)\ng.items[0].n = 9"), "")
+
+// The clause is re-run whole rather than tracked field by field, so a write to an element it does
+// not read is checked and passes.
+@test("and an element the clause does not read is permitted")
+sir_an_element_the_clause_does_not_read_is_permitted()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_grid() + "var g = Grid([Cell(0), Cell(0)], 5)\ng.items[1].n = 9\nprint(g.items[1].n)"),
+              "9\n")
+
+// ---- a mutating method call on a field an invariant reads is re-checked at the call ----
+//
+// A `*self` method reached through a field mutates an `Inner` knowing nothing of any `Outer`. The
+// call site still knows the whole place -- `o.a` is the receiver and `o` is right there -- so the
+// clause is re-run the moment the call returns.
+
+private sir_bumping() -> string = raw"""
+    struct Inner
+        n: int
+
+        set(*self, v: int)
+            self.n = v
+    struct Outer
+        a: Inner
+        b: int
+        invariant a.n <= b
+    """
+
+@test("a mutating method call that leaves the enclosing invariant true proceeds")
+sir_a_call_that_leaves_the_invariant_true_proceeds()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_bumping() + "var o = Outer(Inner(1), 5)\no.a.set(4)\nprint(o.a.n, o.b)"), "4 5\n")
+
+@test("a mutating method call reaching the boundary value is allowed")
+sir_a_call_reaching_the_boundary_value_is_allowed()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_bumping() + "var o = Outer(Inner(1), 5)\no.a.set(5)\nprint(o.a.n)"), "5\n")
+
+@test("a mutating method call that breaks the enclosing invariant traps")
+sir_a_call_that_breaks_it_traps()
+    if !sir_ready() then return
+
+    assert_eq(sir_traps(sir_bumping() + "var o = Outer(Inner(1), 5)\no.a.set(9)"), "")
+
+// The re-check is attached to the place, not to the method: the same call on a receiver that lies
+// below nothing is checked by nobody.
+@test("and the same method on a free value is untouched")
+sir_the_same_method_on_a_free_value_is_untouched()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran(sir_bumping() + "var i = Inner(1)\ni.set(9)\nprint(i.n)"), "9\n")
+
+// Two levels down, where the struct that owns the clause is neither the receiver nor its immediate
+// owner -- the walk out of the place is what finds it, so depth costs nothing.
+@test("a receiver two fields below the clause is found by the same walk")
+sir_a_receiver_two_fields_below_the_clause()
+    if !sir_ready() then return
+
+    val deep = raw"""
+        struct Inner
+            n: int
+
+            set(*self, v: int)
+                self.n = v
+        struct Middle
+            i: Inner
+        struct Top
+            m: Middle
+            cap: int
+            invariant m.i.n <= cap
+        """
+
+    assert_eq(sir_ran(deep + "var t = Top(Middle(Inner(1)), 5)\nt.m.i.set(4)\nprint(t.m.i.n)"), "4\n")
+    assert_eq(sir_traps(deep + "var t = Top(Middle(Inner(1)), 5)\nt.m.i.set(9)"), "")
+
+// ---- an alias that carries every promise its storage has is left alone ----
+//
+// An alias has to be refused only where its type stops carrying a promise the storage has, so the
+// address of a field no clause reads, a view that may not write, and a method of a struct that lies
+// inside nothing are all ordinary.
+
+@test("a pointer to a field no clause reads is left alone")
+sir_a_pointer_to_a_field_no_clause_reads()
+    if !sir_ready() then return
+
+    val spare = "struct Inner\n    n: int\nstruct Outer\n    a: Inner\n    b: int\n    c: int\n    invariant a.n <= b\n"
+
+    assert_eq(sir_ran(spare + "bump(p: *int)\n    *p = 9\nvar o = Outer(Inner(1), 5, 0)\nbump(&o.c)\nprint(o.c)"),
+              "9\n")
+
+@test("a read-only view of an array a clause reads is left alone")
+sir_a_read_only_view_of_an_array_a_clause_reads()
+    if !sir_ready() then return
+
+    val grid = "struct Grid\n    items: [2]int\n    cap: int\n    invariant items[0] <= cap\n"
+
+    assert_eq(sir_ran(grid + "var g = Grid([1, 2], 5)\nvar v: []const int = g.items[0..<2]\nprint(v[1])"), "2\n")
+
+// A view's `len` is the struct's own three words rather than somebody else's elements, so a clause
+// may read it -- the one thing on the near side of a view hop.
+@test("a clause reading a view's length")
+sir_a_clause_reading_a_views_length()
+    if !sir_ready() then return
+
+    assert_eq(sir_ran("struct Buf\n    xs: []int\n    invariant xs.len > 0\nvar b = Buf([1, 2, 3])\nprint(b.xs.len)"),
+              "3\n")
+
+// A string is immutable, so a view of one carries no licence to write and there is no promise for
+// it to drop.
+@test("part of a string field a clause reads")
+sir_part_of_a_string_field_a_clause_reads()
+    if !sir_ready() then return
+
+    val named = "struct Named\n    name: string\n    invariant name.len >= 2\n"
+
+    assert_eq(sir_ran(named + "var n = Named(\"abcd\")\nprint(n.name[0..<2])"), "ab\n")
+
+// A view field points somewhere else, so the elements are not the receiver's storage to lose and a
+// pointer at one is not a pointer into the receiver. This is the shape of `CString.ptr`.
+@test("a '*self' method handing out a pointer past a view hop")
+sir_a_self_method_handing_out_a_pointer_past_a_view_hop()
+    if !sir_ready() then return
+
+    val viewing = raw"""
+        struct Cell
+            bytes: []u8
+            n: int
+
+            at(*self) -> *u8
+                &self.bytes[0]
+        struct Outer
+            a: Cell
+            b: int
+            invariant a.n <= b
+        """
+
+    assert_eq(sir_ran(viewing + "var o = Outer(Cell([7, 8], 1), 5)\nvar p = o.a.at()\nprint(*p)"), "7\n")
+
+// A struct that is nobody's field can never be a severed receiver, so its methods may hand out
+// pointers into it however they like -- even in a program where some *other* struct has a clause.
+@test("a '*self' method of a struct that lies inside nothing")
+sir_a_self_method_of_a_struct_that_lies_inside_nothing()
+    if !sir_ready() then return
+
+    val free = raw"""
+        struct Guarded
+            m: int
+            invariant m >= 0
+        struct Free
+            n: int
+
+            at(*self) -> *int
+                &self.n
+        """
+
+    assert_eq(sir_ran(free + "var g = Guarded(1)\nvar f = Free(1)\nvar p = f.at()\n*p = 9\nprint(f.n, g.m)"), "9 1\n")
