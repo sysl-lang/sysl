@@ -91,6 +91,25 @@ multi_assign(cx: &Analyzer, span: Span, op: string, targets: Buf[Expr],
         cx.fault(span, s"this assignment has ${targets.len()} places on the left and " +
                  s"${values.len()} ${if values.len() == 1 then "value" else "values"} on the right")
 
+    // `b[i] = v` on a container is a call to `index_set` rather than a store, so it has no address
+    // for the phase that locates the places to find, and no reading of it separates what it reads
+    // from what it writes. A property set through a setter is the second form of the same kind.
+    for i in 0..<targets.len()
+        val t = targets.at(i)
+
+        *t.kind match
+            Index(receiver, _) ->
+                // Anchored at the `[`, where the reference anchors an element.
+                if indexes_written(cx, "IndexSet", receiver) then
+                    cx.fault(Span(receiver.span.end, t.span.end),s"an element set through '${qualified_name(library_key("Index"))}' " +
+                             "is a call rather than a store, so it cannot be one place of a multiple " +
+                             "assignment — write that one on its own")
+            Field(receiver, name) ->
+                if settable(cx, receiver, name) then
+                    cx.fault(t.span, s"'$name' is set by a call rather than by a store, so it cannot be " +
+                             "one place of a multiple assignment — write that one on its own")
+            _ -> ()
+
     val what = if op == "=" then "assignment" else s"'$op'"
     var places: Buf[TExpr] = buf()
 

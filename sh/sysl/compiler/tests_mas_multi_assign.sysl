@@ -1,0 +1,395 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, replace_all}
+
+// The reference's `MultiAssignTests`: `a, b = b, a` and `val a, b = …`, the comma forms at an
+// assignment and at a binding (`reference/expressions.md § Several places at once`).
+//
+// The form's whole promise is an ORDER -- everything is read before anything is written -- so the
+// cases that matter are the ones that can tell a simultaneous write from two sequential ones: a swap,
+// a compound arm whose right side names the other arm's place, a counted value whose last count
+// would go if the first store let go of it.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.152)** by
+// handing the installed `sysl` the same program. Positions are the reference's `line:column`; the
+// extent a caret underlines is the open span divergence and is not asserted.
+
+// What a program does: what it printed, and whether it exited zero. A failure to build is its
+// message and a non-zero exit.
+private mas_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-mas").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end mas_outcome
+
+// The program runs to the end and prints exactly this. Returns at once without the library.
+private mas_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = mas_outcome(text)
+
+    assert(out.1, s"it did not exit zero: ${out.0}")
+    assert_eq(out.0, want)
+end mas_prints
+
+// The program builds and then stops short of exiting zero -- a check that failed.
+private mas_stops(text: string)
+    if xvr_no_library() then return
+
+    val out = mas_outcome(text)
+
+    assert(!out.1 && !out.0.contains("error:"), out.0)
+
+// The build is refused with this message, anchored at this `line:column` of `main.sysl`.
+private mas_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val said = mas_outcome(text).0
+
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+end mas_refused
+
+// The build is refused with this message, wherever it is anchored.
+private mas_refused_somewhere(text: string, message: string)
+    if xvr_no_library() then return
+
+    val said = mas_outcome(text).0
+
+    assert(said.contains(s"error: $message\n"), said)
+
+// A body, wrapped in a function the program calls -- the reference suite's `fn`.
+private mas_fn(body: string) -> string = "demo()\n    " + replace_all(body, "\n", "\n    ") + "\nend demo\ndemo()\n"
+
+// -- the form parses -------------------------------------------------------------------------------
+
+@test("as a list of places and a list of values")
+mas_parses_places_and_values() = assert_eq(pf("a, b = b, a\n"), "(= (a b) (b a))")
+
+@test("with any place form on the left")
+mas_parses_any_place() = assert_eq(pf("xs[i], p.f, *q = 1, 2, 3\n"), "(= ((index xs i) (field p f) (* q)) (1 2 3))")
+
+// One place is an ordinary assignment, so the comma form commits only at the second name.
+@test("and one place is still a plain assignment")
+mas_parses_one_place() = assert_eq(pf("a = b\n"), "(= a b)")
+
+@test("a compound operator is read, not refused by the grammar")
+mas_parses_compound() = assert_eq(pf("a, b += 1, 2\n"), "(+= (a b) (1 2))")
+
+@test("a binding names several things")
+mas_parses_binding()
+    assert_eq(pf("val a, b = 1, 2\n"), "(val (a b) 1 2)")
+    assert_eq(pf("var a, b = 1, 2\n"), "(var (a b) 1 2)")
+
+@test("and a single-name binding is unchanged")
+mas_parses_single_binding()
+    assert_eq(pf("val a = 1\n"), "(val a 1)")
+    assert_eq(pf("var a = 1\n"), "(var a 1)")
+
+@test("the step of a three-clause 'for' takes one")
+mas_parses_for_step() =
+    assert_eq(pf("for var i = 0; i < 3; i, j = i + 1, j - 1\n    print(i)\n"),
+              "(cfor (var i 0) (cmp i < 3) (= (i j) ((+ i 1) (- j 1))) (call print i))")
+
+// -- everything is read before anything is written ------------------------------------------------
+
+@test("so two names swap")
+mas_two_names_swap() = mas_prints(mas_fn("var a = 1\nvar b = 2\na, b = b, a\nprint(a, b)"), "2 1\n")
+
+@test("three places rotate")
+mas_three_rotate() = mas_prints(mas_fn("var a = 1\nvar b = 2\nvar c = 3\na, b, c = c, a, b\nprint(a, b, c)"), "3 1 2\n")
+
+@test("two elements of an array swap")
+mas_array_elements_swap() =
+    mas_prints(mas_fn("var xs: [4]int\nxs[0usize], xs[1usize] = 7, 8\n" +
+                      "xs[0usize], xs[1usize] = xs[1usize], xs[0usize]\nprint(xs[0usize], xs[1usize])"),
+               "8 7\n")
+
+// Written out, `c += d` then `d += c` folds the NEW c into d.
+@test("and a compound arm sees the value its place started with")
+mas_compound_sees_start() = mas_prints(mas_fn("var c = 3\nvar d = 4\nc, d += d, c\nprint(c, d)"), "7 7\n")
+
+@test("a plain compound form advances every place at once")
+mas_compound_plain() = mas_prints(mas_fn("var a = 2\nvar b = 1\na, b += 10, 20\nprint(a, b)"), "12 21\n")
+
+// A place's own subexpressions run exactly once, before the values, and in written order -- the
+// whole trace is asserted, not just the answer.
+@test("a place's subexpressions run once, in written order")
+mas_subexpressions_once() =
+    mas_prints("note(s: string, i: usize) -> usize\n    print(s)\n    i\nend note\n" +
+               "demo()\n    var xs: [4]int\n    xs[0usize] = 10\n    xs[1usize] = 20\n" +
+               "    xs[note(\"f\", 0usize)], xs[note(\"g\", 1usize)] = xs[note(\"G\", 1usize)], xs[note(\"F\", 0usize)]\n" +
+               "    print(xs[0usize], xs[1usize])\nend demo\ndemo()\n",
+               "f\ng\nG\nF\n20 10\n")
+
+// -- a counted value survives the store that lets go of it ----------------------------------------
+
+@test("two strings swap")
+mas_strings_swap() = mas_prints(mas_fn("var s = \"one\"\nvar t = \"two\"\ns, t = t, s\nprint(s, t)"), "two one\n")
+
+@test("two references swap")
+mas_references_swap() =
+    mas_prints("struct Node\n    n: int\nend Node\ndemo()\n    var p: &Node = Node(1)\n" +
+               "    var q: &Node = Node(2)\n    p, q = q, p\n    print(p.n, q.n)\nend demo\ndemo()\n",
+               "2 1\n")
+
+// A compound arm holds the value it read as well as the value on the right, and both are at risk
+// from the other arm's store.
+@test("two strings append each other")
+mas_strings_append() = mas_prints(mas_fn("var s = \"a\"\nvar t = \"b\"\ns, t += t, s\nprint(s, t)"), "ab ba\n")
+
+@test("and the counts hold up over enough traffic to show it")
+mas_counts_hold_up() =
+    mas_prints(mas_fn("var s = \"x\"\nvar t = \"y\"\nfor i in 0..<100000\n    s, t = t, s\nprint(s, t)"), "x y\n")
+
+// -- a binding names several things ---------------------------------------------------------------
+
+@test("and infers each from its own value")
+mas_binding_infers_each() = mas_prints(mas_fn("val a, b = 1, \"two\"\nprint(a, b)"), "1 two\n")
+
+@test("a 'var' binding is assignable afterwards")
+mas_var_binding_assignable() = mas_prints(mas_fn("var lo, hi = 0, 9\nlo, hi = hi, lo\nprint(lo, hi)"), "9 0\n")
+
+// The right side is produced before any name is bound, so the binding does not shadow itself half
+// way through.
+@test("and a value on the right sees the outer name, not the one being bound")
+mas_right_sees_outer() = mas_prints(mas_fn("val a = 5\nval b, a2 = a, a + 1\nprint(b, a2)"), "5 6\n")
+
+@test("a 'val' part may not be assigned to afterwards")
+mas_val_part_written_once() =
+    mas_refused(mas_fn("val a, b = 1, 2\na = 3"), "a 'val' is written once, so assignment has nothing to write through", "3:5")
+
+// The parenthesised spelling takes one tuple apart, and divides between 'var' and 'val' exactly as
+// an ordinary binding does.
+@test("the tuple form divides the same way, and 'var' is the writable one")
+mas_tuple_form_divides()
+    mas_prints(mas_fn("var (a, b) = (1, 2)\na = 3\nprint(a, b)"), "3 2\n")
+    mas_refused(mas_fn("val (a, b) = (1, 2)\na = 3"), "a 'val' is written once, so assignment has nothing to write through", "3:5")
+
+// -- the rules the form still owes ----------------------------------------------------------------
+
+// One value for several places is the one mismatch with another reading -- a tuple to take apart --
+// so it is complained about in those terms.
+@test("the two sides must be the same length")
+mas_sides_same_length()
+    mas_refused(mas_fn("var a = 1\nvar b = 2\na, b = 1, 2, 3"),
+                "this assignment has 2 places on the left and 3 values on the right", "4:5")
+    mas_refused(mas_fn("var a = 1\nvar b = 2\na, b = 1"),
+                "this assignment has 2 places on the left, and one int is not something to take apart — only a tuple is",
+                "4:12")
+end mas_sides_same_length
+
+@test("a binding names as many things as it is given")
+mas_binding_count() =
+    mas_refused(mas_fn("val a, b = 1, 2, 3"), "this binding names 2 things and has 3 values to give them", "2:5")
+
+@test("each value must suit the place it is heading for")
+mas_value_suits_place() =
+    mas_refused(mas_fn("var a = 1\nvar b = \"\"\na, b = 1, 2"), "cannot assign int to 'b' of type string", "4:15")
+
+// The expected type reaches each value, exactly as it does after a single `=`.
+@test("a literal takes the width of the place it is heading for")
+mas_literal_takes_width() =
+    mas_prints(mas_fn("var a: u8 = 0u8\nvar b: i16 = 0i16\na, b = 200, -300\nprint(a, b)"), "200 -300\n")
+
+@test("every place must be one")
+mas_every_place_is_one() =
+    mas_refused(mas_fn("var a = 1\n1, a = 1, 2"),
+                "assignment needs a variable, a field, an element, or a dereference — something with an address", "3:5")
+
+@test("a 'val' is not a place to write through")
+mas_val_not_a_place() =
+    mas_refused(mas_fn("val v = 1\nvar a = 2\nv, a = 1, 2"),
+                "a 'val' is written once, so assignment has nothing to write through", "4:5")
+
+@test("a binding may not name the same thing twice")
+mas_binding_names_twice() = mas_refused(mas_fn("val a, a = 1, 2"), "'a' is named twice in one binding", "2:5")
+
+// An element of a container is set by a call, so it has no address the locating phase can find --
+// the one place form a single `=` accepts and this does not.
+@test("an element set through 'Index' is not a place of one")
+mas_index_set_not_a_place() =
+    mas_refused("struct Bag\n    n: int\nend Bag\nimpl IndexSet[int, int] for Bag\n" +
+                "    index_set(*self, i: int, v: int)\n        self.n = v\nimpl Index[int, int] for Bag\n" +
+                "    index(self, i: int) -> int = self.n\ndemo()\n    var b = Bag(0)\n    var a = 1\n" +
+                "    b[0], a = 1, 2\nend demo\ndemo()\n",
+                "an element set through 'sysl.Index' is a call rather than a store, so it cannot be one place " +
+                "of a multiple assignment — write that one on its own",
+                "12:6")
+
+// A property set through a setter is the second form of the same kind: the call both reads and
+// writes, so there is nothing to separate into the two halves the ordering rule is about.
+@test("nor is a property set through a setter")
+mas_setter_not_a_place() =
+    mas_refused("struct Cell\n    v: int\n\n    count -> int = self.v\n\n    set count(x)\n        self.v = x * 10\n" +
+                "demo()\n    var c = Cell(0)\n    var a = 1\n    c.count, a = 1, 2\nend demo\ndemo()\n",
+                "'count' is set by a call rather than by a store, so it cannot be one place of a multiple " +
+                "assignment — write that one on its own",
+                "11:7")
+
+// Each arm is checked by the rule its own operator already has.
+@test("a compound arm is held to its operator's own rule")
+mas_compound_arm_rule() =
+    mas_refused(mas_fn("var s = \"\"\nvar n = 0\ns, n += 1, 1"), "'+' needs matching types, got string and int", "4:13")
+
+@test("and no arm may be given a value that never arrives")
+mas_no_arm_never() =
+    mas_refused(mas_fn("var a = 1\nvar b = 2\na, b = 1, exit(1)"), "cannot assign never to 'b' of type int", "4:15")
+
+@test("nor may a binding take one")
+mas_binding_never() =
+    mas_refused(mas_fn("val a, b = 1, exit(1)"), "cannot bind a name to an expression that never returns", "2:19")
+
+// -- a multiple 'val' is a local form -------------------------------------------------------------
+
+@test("so written plain at the top of a program it is simply a local")
+mas_top_level_local() = mas_prints("val a, b = 1, 2\nprint(a, b)\n", "1 2\n")
+
+// The reference says this one with no position, beside the `undefined name 'a'` the refused binding
+// leaves behind.
+@test("while asking for the module's is refused, since the parts have nowhere to state a type")
+mas_static_refused()
+    val text = "static val a, b = 1, 2\nprint(a, b)\n"
+
+    mas_refused_somewhere(text, "a module-level 'val' states its type, and a binding that names several " +
+                          "things has nowhere to write one — declare 'a' and 'b' separately")
+    mas_refused(text, "undefined name 'a'", "2:7")
+end mas_static_refused
+
+@test("and so is one written as a pattern")
+mas_static_pattern_refused()
+    val text = "static val (a, b) = (1, 2)\nprint(a, b)\n"
+
+    mas_refused_somewhere(text, "a module-level 'val' states its type, and a binding written as a pattern has " +
+                          "nowhere to write one — take the value apart inside a function, or declare the " +
+                          "parts separately")
+    mas_refused(text, "undefined name 'a'", "2:7")
+end mas_static_pattern_refused
+
+// -- a field write re-checks its struct's invariant -----------------------------------------------
+
+private mas_span(body: string) -> string =
+    "struct Span\n    lo: int\n    hi: int\n    invariant lo <= hi\nend Span\n" + mas_fn(body)
+
+@test("one that still holds is let through")
+mas_invariant_holds() = mas_prints(mas_span("var s = Span(1, 5)\ns.lo, s.hi = 2, 9\nprint(s.lo, s.hi)"), "2 9\n")
+
+// A struct that starts at its zero value is never constructed, so nothing else names the predicate.
+@test("one whose struct was never constructed still finds its predicate")
+mas_invariant_never_constructed() = mas_prints(mas_span("var s: Span\ns.lo, s.hi = 2, 9\nprint(s.lo, s.hi)"), "2 9\n")
+
+// Both fields move at once, and the state in between is not held against it.
+@test("a transition through a state neither end holds is let through")
+mas_invariant_transition() = mas_prints(mas_span("var s = Span(1, 5)\ns.lo, s.hi = 6, 8\nprint(s.lo, s.hi)"), "6 8\n")
+
+@test("and one that does not stops the program")
+mas_invariant_fails() = mas_stops(mas_span("var s = Span(1, 5)\ns.lo, s.hi = 9, 2\nprint(s.lo, s.hi)"))
+
+@test("the three-clause 'for' takes one in its step")
+mas_for_step_runs() =
+    mas_prints(mas_fn("var j = 10\nfor var i = 0; i < 3; i, j = i + 1, j - 1\n    print(i, j)"), "0 10\n1 9\n2 8\n")
+
+// The check happens in the phase that locates the places, before any store.
+@test("an element place is bounds-checked")
+mas_element_bounds_checked() = mas_stops(mas_fn("var xs: [2]int\nvar i = 5usize\nxs[i], xs[0usize] = 1, 2"))
+
+// -- the claims the section makes about the form --------------------------------------------------
+
+@test("a dereference is a place, as it is after a single '='")
+mas_deref_is_a_place() =
+    mas_prints(mas_fn("var a = 1\nvar b = 2\nvar p = &a\nvar q = &b\n*p, *q = *q, *p\nprint(a, b)"), "2 1\n")
+
+@test("a field through a pointer is one too")
+mas_field_through_pointer() =
+    mas_prints("struct Pair\n    x: int\n    y: int\nend Pair\nflip(p: *Pair)\n    p.x, p.y = p.y, p.x\n" +
+               "demo()\n    var s = Pair(1, 2)\n    flip(&s)\n    print(s.x, s.y)\nend demo\ndemo()\n",
+               "2 1\n")
+
+@test("a nested element is one too")
+mas_nested_element() =
+    mas_prints(mas_fn("var grid: [2][2]int\ngrid[0usize][1usize] = 5\ngrid[1usize][0usize] = 9\n" +
+                      "grid[0usize][1usize], grid[1usize][0usize] = grid[1usize][0usize], grid[0usize][1usize]\n" +
+                      "print(grid[0usize][1usize], grid[1usize][0usize])"),
+               "9 5\n")
+
+@test("and any number of places, not only two")
+mas_any_number_of_places() =
+    mas_prints(mas_fn("var a, b, c, d, e = 1, 2, 3, 4, 5\na, b, c, d, e = e, d, c, b, a\nprint(a, b, c, d, e)"),
+               "5 4 3 2 1\n")
+
+// A form that has no value cannot sit anywhere a value is read, and the grammar settles it.
+@test("it has no value, so it cannot stand where one is read")
+mas_no_value()
+    assert_eq(pf_err("if a, b = 1, 2\n    print(1)\n"), "newline expected")
+    assert_eq(pf_at("if a, b = 1, 2\n    print(1)\n"), "1:5")
+
+// Below statement level the comma always means something else: `b = 1` at a call is a named
+// argument, and there are three arguments either way.
+@test("a comma below statement level goes on meaning what it meant")
+mas_comma_below_statement() = assert_eq(pf("print(a, b = 1, 2)\n"), "(call print a (named b 1) 2)")
+
+@test("and a parenthesized one is the assignment it always was")
+mas_parenthesized_assignment() = assert_eq(pf("print(a, (b = 1), 2)\n"), "(call print a (= b 1) 2)")
+
+@test("and parentheses around one read as a tuple, not as this")
+mas_parentheses_tuple()
+    assert_eq(pf("var x = (a, b)\n"), "(var x (tuple a b))")
+    mas_prints("var x = (1, 2)\nprint(x.0, x.1)\n", "1 2\n")
+
+// -- it is an ordinary statement ------------------------------------------------------------------
+
+@test("among the statements the program itself runs")
+mas_among_program_statements() = mas_prints("var a = 1\nvar b = 2\na, b = b, a\nprint(a, b)\n", "2 1\n")
+
+@test("inside a branch")
+mas_inside_a_branch() = mas_prints(mas_fn("var a = 1\nvar b = 2\nif a < b\n    a, b = b, a\nprint(a, b)"), "2 1\n")
+
+@test("inside a loop body, where a binding is made afresh each time round")
+mas_inside_a_loop() =
+    mas_prints(mas_fn("var total = 0\nfor i in 0..<3\n    val lo, hi = i, i * 10\n    total += lo + hi\nprint(total)"),
+               "33\n")
+
+@test("as the last statement of a function that returns nothing")
+mas_last_statement() =
+    mas_prints("flip(p: *int, q: *int)\n    *p, *q = *q, *p\ndemo()\n    var a = 1\n    var b = 2\n" +
+               "    flip(&a, &b)\n    print(a, b)\nend demo\ndemo()\n",
+               "2 1\n")
+
+// The ordering rule is about the reads, so two writes to one place leave the last.
+@test("one place written twice takes the last value")
+mas_place_written_twice() = mas_prints(mas_fn("var a = 0\na, a = 1, 2\nprint(a)"), "2\n")
+
+// A multi-assignment the escape analysis did not walk would leave the array in the frame and the
+// returned view dangling.
+@test("a view assigned by one of these still moves its array to the heap")
+mas_view_moves_array()
+    val src = "leak() -> []int\n    var buf: [4]int\n    var s: []int\n    var t: []int\n" +
+              "    s, t = buf[..], buf[0..<2]\n    buf[0usize] = 7\n    print(t.len)\n    s\nend leak\n" +
+              "var v = leak()\nprint(v.len, v[0usize])\n"
+
+    mas_prints(src, "2\n4 7\n")
+
+    if xvr_no_library() then return
+
+    assert(xvr_ir([("main.sysl", src)]).contains("call ptr @malloc"))
+end mas_view_moves_array
