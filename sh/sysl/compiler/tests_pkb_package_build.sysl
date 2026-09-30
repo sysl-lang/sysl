@@ -145,6 +145,28 @@ private pkb_run(root: string) -> string
     said
 end pkb_run
 
+// A `--lib` source root with no manifest, holding one module that declares one function nobody
+// calls. `module_path` is the module's directory below the root.
+private pkb_lib_root(module_path: string) -> string
+    val root = pkb_temp("sysl-pkb-lib").unwrap()
+
+    make_dir_all(s"$root/$module_path").unwrap()
+    write_text(s"$root/$module_path/${basename(module_path)}.sysl",
+               s"module ${replace_all(module_path, "/", ".")}\n\nunused() -> int = 0\n").unwrap()
+    root
+end pkb_lib_root
+
+// The same build with one source root handed over, as `--lib <lib>` hands it.
+private pkb_run_beside(root: string, lib: string) -> string
+    reset_search_paths()
+    add_lib_root(lib)
+
+    val said = pkb_run(root)
+
+    reset_search_paths()
+    said
+end pkb_run_beside
+
 // What a build of `root` was refused with, as the command line prints it after `sysl: error: `.
 private pkb_refused(root: string) -> string
     val out_dir = pkb_temp("sysl-pkb-exe").unwrap()
@@ -399,14 +421,31 @@ pkb_namespaced_by_qualified_reference()
 end pkb_namespaced_by_qualified_reference
 
 // The same two with an unrelated `--lib` source root beginning with the same segment in the
-// compilation, which this compiler has no flag for.
-@test("by import", ignore: "needs '--lib' source roots, which are not built here")
+// compilation: whether a segment begins a module is asked of the package's own tree first, so a
+// root supplying `sh.sysl.other` does not take the package's path away from it.
+@test("by import")
 pkb_namespaced_by_import_beside_a_lib()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
 
-@test("by qualified reference", ignore: "needs '--lib' source roots, which are not built here")
+    val ns = pkb_namespaced("import sh.sysl.inner.double\n\nquadruple(n: int) -> int = double(double(n))")
+    val root = pkb_app("print(sh.sysl.outer.quadruple(10))", s"n { path = \"$ns\" }")
+    val lib = pkb_lib_root("sh/sysl/other")
+
+    assert_eq(pkb_run_beside(root, lib), "40\n")
+    pkb_drop([root, ns, lib])
+end pkb_namespaced_by_import_beside_a_lib
+
+@test("by qualified reference")
 pkb_namespaced_by_reference_beside_a_lib()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
+
+    val ns = pkb_namespaced("triple(n: int) -> int = sh.sysl.inner.double(n) + n")
+    val root = pkb_app("print(sh.sysl.outer.triple(14))", s"n { path = \"$ns\" }")
+    val lib = pkb_lib_root("sh/sysl/other")
+
+    assert_eq(pkb_run_beside(root, lib), "42\n")
+    pkb_drop([root, ns, lib])
+end pkb_namespaced_by_reference_beside_a_lib
 
 // A name the consumer chose has no tree to be read off, so it still hangs the whole package.
 @test("and a mount still hangs the whole tree under one segment")
@@ -616,60 +655,70 @@ end pkb_no_dependencies_block
 
 // -- a --lib source root's own dependencies -----------------------------------------------------------
 
-// Every case of this group names a source root with `--lib`, which this compiler has no flag for.
+// Every case of this group names a source root with `--lib`. The ones still ignored read the root's
+// own `package.hocon` -- its dependencies, its header requirement, its allocator.
 
 @test("are fetched, so its own code reaches what it declared",
-      ignore: "needs '--lib' source roots, which are not built here")
+      ignore: "needs a '--lib' root's own package.hocon to be read, which is not built here")
 pkb_lib_deps_are_fetched()
     assert(false, "needs --lib")
 
 @test("and a relative one is read against ITS OWN directory, never the project's",
-      ignore: "needs '--lib' source roots, which are not built here")
+      ignore: "needs a '--lib' root's own package.hocon to be read, which is not built here")
 pkb_lib_relative_path()
     assert(false, "needs --lib")
 
 @test("and a coordinate is fetched, not only a directory already on this machine",
-      ignore: "needs '--lib' source roots, which are not built here")
+      ignore: "needs a '--lib' root's own package.hocon to be read, which is not built here")
 pkb_lib_coordinate_fetched()
     assert(false, "needs --lib")
 
 @test("and are version-selected together with the project's own claims",
-      ignore: "needs '--lib' source roots, which are not built here")
+      ignore: "needs a '--lib' root's own package.hocon to be read, which is not built here")
 pkb_lib_selected_together()
     assert(false, "needs --lib")
 
 @test("and two roots naming one coordinate get one copy of it, at the higher version",
-      ignore: "needs '--lib' source roots, which are not built here")
+      ignore: "needs a '--lib' root's own package.hocon to be read, which is not built here")
 pkb_lib_two_roots_one_copy()
     assert(false, "needs --lib")
 
 @test("its header requirement, named rather than left to clang",
-      ignore: "needs '--lib' source roots, which are not built here")
+      ignore: "needs a '--lib' root's own package.hocon to be read, which is not built here")
 pkb_lib_header_requirement()
     assert(false, "needs --lib")
 
 @test("and its allocator, which cannot then disagree with one the project names",
-      ignore: "needs '--lib' source roots, which are not built here")
+      ignore: "needs a '--lib' root's own package.hocon to be read, which is not built here")
 pkb_lib_allocator()
     assert(false, "needs --lib")
 
-@test("while a root with no manifest depends on nothing",
-      ignore: "needs '--lib' source roots, which are not built here")
+// A source root need not be a package at all, and one with no manifest depends on nothing: nothing
+// is fetched on its account and nothing breaks.
+@test("while a root with no manifest depends on nothing")
 pkb_lib_no_manifest()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
+
+    val root = pkb_temp("sysl-pkb-plain").unwrap()
+    val lib = pkb_lib_root("sh/sysl/other")
+
+    write_text(s"$root/main.sysl", "print(41 + 1)").unwrap()
+    assert_eq(pkb_run_beside(s"$root/main.sysl", lib), "42\n")
+    pkb_drop([root, lib])
+end pkb_lib_no_manifest
 
 @test("and a dependency claiming a name the root itself declares is refused",
-      ignore: "needs '--lib' source roots, which are not built here")
+      ignore: "needs a '--lib' root's own package.hocon to be read, which is not built here")
 pkb_lib_claiming_the_roots_name()
     assert(false, "needs --lib")
 
 @test("while a mount settles that, as it does every other collision",
-      ignore: "needs '--lib' source roots, which are not built here")
+      ignore: "needs a '--lib' root's own package.hocon to be read, which is not built here")
 pkb_lib_mount_settles()
     assert(false, "needs --lib")
 
 @test("and the program may write a name only the root's manifest bound",
-      ignore: "needs '--lib' source roots, which are not built here")
+      ignore: "needs a '--lib' root's own package.hocon to be read, which is not built here")
 pkb_lib_name_only_the_root_bound()
     assert(false, "needs --lib")
 
