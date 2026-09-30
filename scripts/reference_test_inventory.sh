@@ -1,12 +1,21 @@
 #!/bin/sh
-# Every test case of the reference compiler's suites, one per line, as
+# Every test case WRITTEN in the reference compiler's suites, one per line, as
 #
-#     <suite file>\t<line>\t<case name>
+#     <suite file>\t<line>\t<case name>\t<flags>\t<source path, relative to the bootstrap root>
 #
-# The reference is scalatest's AnyFreeSpec, so a leaf case is a string literal followed by `in`
-# (`ignore` for a disabled one, whose name is printed with an `IGNORED\t` prefix). Three spellings of
-# the literal appear: `"name" in {` on one line; `"name"` with the `in` on the next; and a name
-# written as a stripMargin literal spanning two or more source lines --
+# This is the SOURCE half of the census: what a reader of the Scala sees. It is one row per case as
+# written, so a case written once inside a loop is one row here and many in sbt's reports -- the
+# per-iteration list is `reference_test_reports.sh`, and the census joins the two.
+#
+# <flags> is `-`, or any of: `t` the name is an interpolated literal (`s"$name sizes the array at
+# $width"`), so it is a TEMPLATE, one case per iteration of the loop around it; `v` the name is not
+# a literal at all but an expression (`label in {`, `s.what in {`), printed verbatim, and every
+# iteration's name is whatever the loop computes; `i` the case is `ignore`d.
+#
+# The reference is scalatest's AnyFreeSpec, so a leaf case is a name followed by `in` (`ignore` for
+# a disabled one). Three spellings of a literal name appear: `"name" in {` on one line; `"name"`
+# with the `in` on the next; and a name written as a stripMargin literal spanning two or more source
+# lines --
 #
 #     """the first line of the name, wrapped for width
 #       |the rest of it, however many '|'-continued lines it takes""".stripMargin in {
@@ -16,11 +25,12 @@
 # to "the first line of the name, wrapped for width the rest of it, however many '|'-continued lines
 # it takes". That is a deliberate departure from "verbatim" (the real value carries embedded
 # newlines, which a tab-separated line here cannot), and it is the same join `reference_tests.map`
-# documents at its own header, so a row written against this output matches a row written by reading
-# the source directly. A `"""..."""` literal closed on the SAME line it opens on is read as a single
-# line and needs no join. An interpolated name -- `s"$name sizes the array at $width"` -- is one case
-# per iteration of the loop around it, so the count here is a floor on what sbt prints rather than
-# the same number.
+# documents at its own header and `reference_test_reports.sh` applies to sbt's names. A `"""..."""`
+# literal closed on the SAME line it opens on is read as a single line and needs no join.
+#
+# EVERY `.scala` UNDER ANY `src/test/scala` OF THE TREE IS READ, at any depth -- the root project's
+# `shared`/`jvm`/`native` and the `doc` subproject's alike. A glob naming the directories once missed
+# four whole suites; the census checks that every file with an `in {` in it produced a row here.
 #
 # The bootstrap tree is $SYSL_BOOTSTRAP, defaulting to the sibling checkout.
 
@@ -28,9 +38,36 @@ set -u
 
 root=${SYSL_BOOTSTRAP:-$HOME/dev/sysl-lang/sysl-bootstrap}
 
-for f in "$root"/shared/src/test/scala/sh/sysl/*.scala "$root"/jvm/src/test/scala/sh/sysl/*.scala; do
+# `--groups` prints the GROUP names instead -- every `"name" - {` -- in the same five columns, for
+# the census to strip from the front of sbt's full names when it attributes an iteration.
+groups=0
+[ "${1:-}" = "--groups" ] && groups=1
+
+find "$root" -path '*/src/test/scala/*' -name '*.scala' -not -path '*/target/*' |
+    LC_ALL=C sort |
+while IFS= read -r f; do
     [ -r "$f" ] || continue
-    awk -v file="${f##*/}" '
+    awk -v file="${f##*/}" -v rel="${f#"$root"/}" -v groups="$groups" '
+        # The position, within s (which opens with a quote), of the quote that closes it -- the
+        # first one not escaped by a backslash, so `"beside '"'"'@section(\"x\")'"'"'"` is read whole.
+        function closing(s,   i, c) {
+            for (i = 2; i <= length(s); i++) {
+                c = substr(s, i, 1)
+                if (c == "\\") { i++; continue }
+                if (c == "\"") return i
+            }
+            return 0
+        }
+        function emit(ln, nm, fl) {
+            if (groups) return
+            if (fl == "") fl = "-"
+            printf "%s\t%d\t%s\t%s\t%s\n", file, ln, nm, fl, rel
+        }
+        function group(ln, nm, fl) {
+            if (!groups) return
+            if (fl == "") fl = "-"
+            printf "%s\t%d\t%s\t%s\t%s\n", file, ln, nm, fl, rel
+        }
         # A name written as a stripMargin literal is found by tracking, for the WHOLE file, whether
         # each line is inside an already-open triple-quoted string -- `inString` -- because a line
         # that only closes an earlier one (most often a bare `""")` ending a multi-line fixture
@@ -71,10 +108,10 @@ for f in "$root"/shared/src/test/scala/sh/sysl/*.scala "$root"/jvm/src/test/scal
                         rest = substr(scanline, abspos + 3)
                         sub(/^\.stripMargin/, "", rest)
                         sub(/^[ \t]+/, "", rest)
-                        if (rest ~ /^(in|ignore)([ \t{(]|$)/) {
-                            tag = (rest ~ /^ignore/) ? "IGNORED\t" : ""
-                            printf "%s\t%d\t%s%s\n", file, tripleline, tag, tripletext
-                        }
+                        if (rest ~ /^(in|ignore)([ \t{(]|$)/)
+                            emit(tripleline, tripletext, (rest ~ /^ignore/) ? "i" : "")
+                        else if (rest ~ /^-[ \t]*\{/)
+                            group(tripleline, tripletext, "")
                         nameCandidate = 0
                     }
                     inString = 0
@@ -91,28 +128,47 @@ for f in "$root"/shared/src/test/scala/sh/sysl/*.scala "$root"/jvm/src/test/scal
         {
             line = $0
             sub(/^[ \t]+/, "", line)
-            sub(/^s"/, "\"", line)
+            interp = sub(/^s"/, "\"", line)
             if (match(line, /^"([^"]|\\")*"[ \t]*(in|ignore)([ \t{(]|$)/)) {
-                q = index(substr(line, 2), "\"")
-                name = substr(line, 2, q - 1)
-                rest = substr(line, q + 2)
+                q = closing(line)
+                name = substr(line, 2, q - 2)
+                rest = substr(line, q + 1)
                 sub(/^[ \t]+/, "", rest)
-                tag = (rest ~ /^ignore/) ? "IGNORED\t" : ""
-                printf "%s\t%d\t%s%s\n", file, NR, tag, name
+                emit(NR, name, ((interp && index(name, "$")) ? "t" : "") ((rest ~ /^ignore/) ? "i" : ""))
+                pending = ""
+                next
+            }
+            if (match(line, /^"([^"]|\\")*"[ \t]*-[ \t]*\{/)) {
+                q = closing(line)
+                name = substr(line, 2, q - 2)
+                group(NR, name, (interp && index(name, "$")) ? "t" : "")
                 pending = ""
                 next
             }
             if (match(line, /^"([^"]|\\")*"[ \t]*$/)) {
-                q = index(substr(line, 2), "\"")
-                pending = substr(line, 2, q - 1)
+                q = closing(line)
+                pending = substr(line, 2, q - 2)
+                pendingflag = (interp && index(pending, "$")) ? "t" : ""
                 pendingline = NR
                 next
             }
             if (pending != "" && (line ~ /^in([ \t{(]|$)/ || line ~ /^ignore([ \t{(]|$)/)) {
-                tag = (line ~ /^ignore/) ? "IGNORED\t" : ""
-                printf "%s\t%d\t%s%s\n", file, pendingline, tag, pending
+                emit(pendingline, pending, pendingflag ((line ~ /^ignore/) ? "i" : ""))
+                pending = ""
+                next
+            }
+            if (pending != "" && line ~ /^-[ \t]*\{/) {
+                group(pendingline, pending, pendingflag)
+                pending = ""
+                next
             }
             pending = ""
+            # A case named by an expression rather than a literal: `label in {`, `s.what in {`.
+            if (!inString && match(line, /^[A-Za-z_][A-Za-z0-9_.]*[ \t]+(in|ignore)[ \t]*[{(]/)) {
+                expr = line
+                sub(/[ \t]+(in|ignore)[ \t]*[{(].*$/, "", expr)
+                emit(NR, expr, "v" ((line ~ /[ \t]ignore[ \t]*[{(]/) ? "i" : ""))
+            }
         }
     ' "$f"
 done
