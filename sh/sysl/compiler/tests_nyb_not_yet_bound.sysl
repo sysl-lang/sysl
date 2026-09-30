@@ -1,0 +1,226 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A name used above the place it is bound is told that, rather than told it stands for nothing
+// (`reference/declarations.md`): a name is in scope from where it is bound onward, and a block's
+// bindings are known where the block is entered.
+//
+// **Every diagnostic and position here was read out of the reference compiler (0.0.152)** by handing
+// the installed `sysl` the same program, with three exceptions named where they stand: the reference
+// says a binding "is bound after the nested functions of this block begin" of a name read in its own
+// initializer and of a default reading a local bound ABOVE the nested functions, neither of which is
+// true, and this compiler keeps `undefined name` there.
+
+private nyb_below(name: string) -> string =
+    s"'$name' is declared below this, and a name is in scope from where it is bound onward"
+
+private nyb_after_group(name: string) -> string =
+    s"'$name' is bound after the nested functions of this block begin, so it is not in this " +
+    "one's environment — they share a single environment, formed where the first of them is " +
+    "written, and what it holds is what the block had bound by that point. Bind " +
+    s"'$name' above them, or make it module storage with 'static'"
+
+// What a build of these files says, and what the program printed where it built.
+private nyb_outcome(main: string, lib: Option[string]) -> (string, bool)
+    val root = make_temp_dir("sysl-nyb").unwrap()
+
+    make_dir_all(s"$root/m").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+
+    if lib.is_some() then write_text(s"$root/m/lib.sysl", lib.unwrap()).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end nyb_outcome
+
+// The build is refused with this message, anchored at this `file:line:column`.
+private nyb_refused(main: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val said = nyb_outcome(main, None).0
+
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/$at\n"), said)
+    assert(!said.contains("bound after the nested functions") ||
+           message.contains("bound after the nested functions"), said)
+end nyb_refused
+
+private nyb_prints(main: string, want: string)
+    if xvr_no_library() then return
+
+    val out = nyb_outcome(main, None)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, want)
+end nyb_prints
+
+@test("a use above a val in the entry file is told the name is declared below it")
+nyb_val_in_the_entry_file()
+    nyb_refused("print(x)\nval x = 1\n", nyb_below("x"), "main.sysl:1:7")
+    nyb_refused("var t = 0\nt += x\nvar x = 1\nprint(t)\n", nyb_below("x"), "main.sysl:2:6")
+
+@test("and so is one above a var in a function body")
+nyb_var_in_a_function()
+    nyb_refused("f() -> int\n    val y = x + 1\n    var x = 1\n    y + x\n\nprint(f())\n",
+                nyb_below("x"), "main.sysl:2:13")
+
+@test("and one above a ref")
+nyb_ref()
+    nyb_refused("f() -> int\n    var n = 1\n    print(r)\n    ref r = n\n    r\n\nprint(f())\n",
+                nyb_below("r"), "main.sysl:3:11")
+
+@test("a name a pattern or a multiple binding makes is one the block binds")
+nyb_pattern_and_multi()
+    nyb_refused("f() -> int\n    print(b)\n    val (a, b) = (1, 2)\n    a + b\n\nprint(f())\n",
+                nyb_below("b"), "main.sysl:2:11")
+    nyb_refused("f() -> int\n    print(b)\n    val a, b = 1, 2\n    a + b\n\nprint(f())\n",
+                nyb_below("b"), "main.sysl:2:11")
+
+@test("a block inside the one that binds the name is written above it too")
+nyb_inner_block()
+    nyb_refused("f(c: bool) -> int\n    if c\n        print(x)\n    val x = 1\n    x\n\nprint(f(true))\n",
+                nyb_below("x"), "main.sysl:3:15")
+    nyb_refused("f(c: bool) -> int\n    val r = if c\n        val a = b\n        val b = 1\n" +
+                "        a + b\n    else 0\n    r\n\nprint(f(true))\n",
+                nyb_below("b"), "main.sysl:3:17")
+
+@test("a loop body is a block whose bindings are known where it is entered")
+nyb_loop_body()
+    nyb_refused("f() -> int\n    var t = 0\n    for i in 0..<3\n        t += k\n        val k = i\n" +
+                "    t\n\nprint(f())\n", nyb_below("k"), "main.sysl:4:14")
+    nyb_refused("f() -> int\n    var t = 0\n    while t < 3\n        t += k\n        val k = 1\n" +
+                "    t\n\nprint(f())\n", nyb_below("k"), "main.sysl:4:14")
+
+@test("a closure written above the binding is told so, and so is a use inside a closure's own body")
+nyb_closure()
+    nyb_refused("f() -> int\n    val g = () -> x + 1\n    val x = 1\n    g()\n\nprint(f())\n",
+                nyb_below("x"), "main.sysl:2:19")
+    nyb_refused("f() -> int\n    val g = () ->\n        print(z)\n        val z = 1\n        z\n" +
+                "    g()\n\nprint(f())\n", nyb_below("z"), "main.sysl:3:15")
+
+@test("a write, a compound write, an address and a field read above the binding say the same")
+nyb_places()
+    nyb_refused("f() -> int\n    x = 2\n    var x = 1\n    x\n\nprint(f())\n",
+                nyb_below("x"), "main.sysl:2:5")
+    nyb_refused("f() -> int\n    x += 2\n    var x = 1\n    x\n\nprint(f())\n",
+                nyb_below("x"), "main.sysl:2:5")
+    nyb_refused("f() -> int\n    val p = &x\n    var x = 1\n    *p\n\nprint(f())\n",
+                nyb_below("x"), "main.sysl:2:14")
+    nyb_refused("struct P\n    a: int\n\nf() -> int\n    print(p.a)\n    val p = P(1)\n    p.a\n\n" +
+                "print(f())\n", nyb_below("p"), "main.sysl:5:11")
+
+@test("a function of a module that is not the entry file says it too")
+nyb_module_function()
+    if xvr_no_library() then return
+
+    val said = nyb_outcome("import m\n\nprint(m.use())\n",
+                           Some("module m\n\nuse() -> int\n    val y = x + 1\n    val x = 1\n" +
+                                "    y + x\n")).0
+
+    assert(said.contains(s"error: ${nyb_below("x")}\n"), said)
+    assert(said.contains("/m/lib.sysl:4:13\n"), said)
+end nyb_module_function
+
+@test("a name an enclosing scope already binds is that one, whatever is declared below")
+nyb_shadowing_reads_the_outer_name()
+    nyb_prints("f() -> int\n    val x = 1\n    if x > 0\n        print(x)\n        val x = 2\n" +
+               "        print(x)\n    x\n\nprint(f())\n", "1\n2\n1\n")
+    nyb_prints("f(x: int) -> int\n    print(x)\n    val x = 2\n    x\n\nprint(f(1))\n", "1\n2\n")
+
+@test("a name bound in a sibling block or an inner one is undefined, not declared below")
+nyb_other_blocks_are_undefined()
+    nyb_refused("f(c: bool) -> int\n    if c\n        val x = 1\n        print(x)\n    else\n" +
+                "        print(x)\n    0\n\nprint(f(true))\n", "undefined name 'x'", "main.sysl:6:15")
+    nyb_refused("f(c: bool) -> int\n    print(x)\n    if c\n        val x = 1\n        print(x)\n" +
+                "    0\n\nprint(f(true))\n", "undefined name 'x'", "main.sysl:2:11")
+    nyb_refused("f(c: bool) -> int\n    if c\n        val x = 1\n        print(x)\n    print(x)\n" +
+                "    0\n\nprint(f(true))\n", "undefined name 'x'", "main.sysl:5:11")
+
+@test("a loop variable, a match binding and a match arm's own block bind nothing a block records")
+nyb_not_recorded()
+    nyb_refused("f() -> int\n    print(i)\n    for i in 0..<3\n        print(i)\n    0\n\nprint(f())\n",
+                "undefined name 'i'", "main.sysl:2:11")
+    nyb_refused("f(o: Option[int]) -> int\n    print(v)\n    o match\n        Some(v) -> v\n" +
+                "        None -> 0\n\nprint(f(Some(1)))\n", "undefined name 'v'", "main.sysl:2:11")
+    nyb_refused("f(o: Option[int]) -> int\n    o match\n        Some(v) ->\n            print(z)\n" +
+                "            val z = v\n            z\n        None -> 0\n\nprint(f(Some(1)))\n",
+                "undefined name 'z'", "main.sysl:4:19")
+
+@test("a call of a closure bound below is an undefined function, as it was")
+nyb_call_is_undefined_function()
+    nyb_refused("f() -> int\n    val y = g(1)\n    val g = (n: int) -> n + 1\n    y\n\nprint(f())\n",
+                "undefined function 'g'", "main.sysl:2:13")
+
+@test("a nested function still reads a binding written below it")
+nyb_nested_reads_below()
+    nyb_prints("f() -> int\n    g() -> int = x + 1\n    val x = 1\n    g()\n\nprint(f())\n", "2\n")
+    nyb_prints("f() -> int\n    g() -> int\n        val c = () -> late + 1\n        c()\n" +
+               "    var late = 3\n    g()\n\nprint(f())\n", "4\n")
+
+@test("a nested function's default reading a local bound after the group began is told about the environment")
+nyb_default_bound_after_the_group()
+    nyb_refused("f() -> int\n    first() -> int = 1\n    var late = 3\n" +
+                "    second(w: int = late) -> int = w\n    second()\n\nprint(f())\n",
+                nyb_after_group("late"), "main.sysl:4:21")
+    nyb_refused("f() -> int\n    first() -> int = 1\n    g() -> int\n        val y = late + 1\n" +
+                "        y\n    var late = 3\n    h(w: int = late) -> int = w\n" +
+                "    g() + h() + first()\n\nprint(f())\n",
+                nyb_after_group("late"), "main.sysl:7:16")
+
+// The reference says "bound after the nested functions of this block begin" here as well, of a name
+// bound ABOVE them; a default is read with no locals in scope, and that is the whole reason.
+@test("and one reading a local bound above the group is not told the binding came after it")
+nyb_default_bound_above_the_group()
+    nyb_refused("f() -> int\n    var early = 3\n    second(w: int = early) -> int = w\n" +
+                "    second()\n\nprint(f())\n", "undefined name 'early'", "main.sysl:3:21")
+    nyb_refused("f() -> int\n    var early = 3\n    first() -> int = 1\n    var late = 4\n" +
+                "    second(w: int = early, z: int = late) -> int = w + z\n" +
+                "    second() + first()\n\nprint(f())\n", "undefined name 'early'", "main.sysl:5:21")
+
+@test("a nested function's default nobody takes is not read")
+nyb_default_not_taken()
+    nyb_prints("f() -> int\n    var early = 3\n    second(w: int = early) -> int = w\n" +
+               "    second(1)\n\nprint(f())\n", "1\n")
+
+// The reference words these as "bound after the nested functions of this block begin" too, in a
+// block that may have no nested function at all.
+@test("a name read in its own initializer is undefined there, and nothing is said of nested functions")
+nyb_own_initializer()
+    nyb_refused("f() -> int\n    val x = x + 1\n    x\n\nprint(f())\n",
+                "undefined name 'x'", "main.sysl:2:13")
+    nyb_refused("f() -> int\n    first() -> int = 1\n    val x = x + first()\n    x\n\nprint(f())\n",
+                "undefined name 'x'", "main.sysl:3:13")
+    nyb_refused("f() -> int\n    val (a, b) = (b, 1)\n    a + b\n\nprint(f())\n",
+                "undefined name 'b'", "main.sysl:2:19")
+
+// The reference reads the caller's block into a default written in another module and says the
+// caller's local "is declared below this", of a line in a different file.
+@test("a module function's default is never measured against the caller's block")
+nyb_module_default_is_not_the_callers()
+    if xvr_no_library() then return
+
+    val said = nyb_outcome("import m\n\nprint(m.h())\n",
+                           Some("module m\n\ng(w: int = late) -> int = w\n\nh() -> int\n" +
+                                "    var late = 3\n    g() + late\n")).0
+
+    assert(said.contains("error: undefined name 'm.late'\n"), said)
+    assert(said.contains("/m/lib.sysl:3:12\n"), said)
+    assert(!said.contains("declared below this"), said)
+end nyb_module_default_is_not_the_callers
