@@ -1,0 +1,812 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// What `extern` and `never` do as a program runs (`reference/declarations.md`): a call into the C
+// library that really links and runs, a diverging call that really stops the program, and the two
+// forcing combinators the library writes on top of them. The externs are the ones every hosted
+// target has -- `abs`, `printf`, `snprintf`, `getchar` -- so nothing beyond the libc the toolchain
+// already links is needed.
+//
+// **Every output and every exit status quoted here was read out of the reference compiler**
+// (0.0.152), whose `ExternRunTests` these are. The reference's own assertions on a program that
+// stops are weaker than the ones here -- a non-zero status, and the output holding a phrase --
+// so each of those is pinned to the whole output and the exact status the reference's build left.
+
+private var exr_library_cache: Buf[Program] = buf()
+private var exr_library_read: bool = false
+
+private exr_library() -> Buf[Program]
+    if exr_library_read then return exr_library_cache
+
+    exr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> exr_library_cache = units
+
+    exr_library_cache
+end exr_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private exr_ready() -> bool
+    if exr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end exr_ready
+
+// **What a program leaves behind**: everything it wrote, standard output first, and -- where it did
+// not exit cleanly -- its status after that, as `[exit 3]`. So a program that ran to its end answers
+// exactly what it printed, and one that stopped itself answers what it had printed by then and the
+// status it chose.
+//
+// The program is started with its standard input at end of input, which is what the reference's
+// harness hands one and what the `getchar` cases below are written against.
+private exr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-extern-run").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture("sh", ["-c", "exec \"$0\" < /dev/null", exe], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) ->
+            val all = out.text + out.err.unwrap_or("")
+
+            out.status match
+                Exited(code) -> if code == 0 then all else s"$all[exit $code]"
+                Signalled(signal) -> s"$all[signal $signal]"
+                TimedOut -> s"$all[timed out]"
+end exr_ran
+
+// ---- calling into the C library ----
+
+@test("an extern's result is an ordinary value")
+exr_an_externs_result_is_an_ordinary_value()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern abs(n: int) -> int
+        print(abs(-7), abs(7), abs(0))
+        """), "7 7 0\n")
+
+@test("an extern composes like any other function")
+exr_an_extern_composes_like_any_other_function()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern abs(n: int) -> int
+        distance(a: int, b: int) -> int = abs(a - b)
+        var total = 0
+        for i in 1..4
+            total += distance(i, 10)
+        print(total)
+        """), "30\n")
+
+@test("an extern reached only through a generic function is still declared")
+exr_an_extern_reached_only_through_a_generic()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern abs(n: int) -> int
+        magnitude[T](x: T, f: int) -> int = abs(f)
+        print(magnitude("ignored", -3), magnitude(1.5, -4))
+        """), "3 4\n")
+
+@test("a link name resolves to the C function it names")
+exr_a_link_name_resolves_to_the_c_function()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern "abs" magn(n: int) -> int
+        print(magn(-7), magn(7))
+        """), "7 7\n")
+
+// The library renders through `snprintf` itself, under a name of its own, so a program declaring
+// the C name is declaring something nothing else has taken.
+@test("the library leaves the C names it renders through free")
+exr_the_library_leaves_the_c_names_free()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern snprintf(buf: *u8, n: usize, fmt: *u8, ...) -> int
+        var buf: [8]u8
+        var fmt: [3]u8 = [37u8, 100u8, 0u8]
+        var k = snprintf(&buf[0], 8usize, &fmt[0], 42)
+        print(k, int(buf[0]), int(buf[1]))
+        """), "2 52 50\n")
+
+// ---- a variadic extern ----
+//
+// `printf` wants a NUL-terminated format, which a `string` is not, so each of these spells its
+// format out as a `[N]u8` ending in a zero and hands over `&fmt[0]`. The bytes are named beside
+// each one.
+
+// "%d %g %c|"
+@test("carries what it is given, in order")
+exr_variadic_carries_what_it_is_given()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        var fmt: [10]u8 = [37u8, 100u8, 32u8, 37u8, 103u8, 32u8, 37u8, 99u8, 124u8, 0u8]
+        printf(&fmt[0], 42, 2.5, 'A')
+        print("")
+        """), "42 2.5 A|\n")
+
+// "%u %d %g|"
+@test("widens a narrow argument the way C would have")
+exr_variadic_widens_a_narrow_argument()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        var fmt: [10]u8 = [37u8, 117u8, 32u8, 37u8, 100u8, 32u8, 37u8, 103u8, 124u8, 0u8]
+        var a: u8  = 200
+        var b: i8  = -5
+        var c: f32 = 1.5f32
+        printf(&fmt[0], a, b, c)
+        print("")
+        """), "200 -5 1.5|\n")
+
+// "%lld|"
+@test("passes a 64-bit value at its own width")
+exr_variadic_passes_a_64_bit_value()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        var fmt: [6]u8 = [37u8, 108u8, 108u8, 100u8, 124u8, 0u8]
+        printf(&fmt[0], 9000000000i64)
+        print("")
+        """), "9000000000|\n")
+
+// "plain|"
+@test("may be called with no tail at all")
+exr_variadic_may_be_called_with_no_tail()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        var fmt: [7]u8 = [112u8, 108u8, 97u8, 105u8, 110u8, 124u8, 0u8]
+        printf(&fmt[0])
+        print("")
+        """), "plain|\n")
+
+// "abc"
+@test("returns its result like any other call")
+exr_variadic_returns_its_result()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        var fmt: [4]u8 = [97u8, 98u8, 99u8, 0u8]
+        var n = printf(&fmt[0])
+        print("")
+        print(n)
+        """), "abc\n3\n")
+
+// "%d-%d" rendered into a buffer, and "%s|" printing the buffer.
+@test("several named parameters precede the tail")
+exr_variadic_several_named_parameters()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern snprintf(buf: *u8, n: usize, fmt: *u8, ...) -> int
+        extern printf(fmt: *u8, ...) -> int
+        var fmt: [6]u8 = [37u8, 100u8, 45u8, 37u8, 100u8, 0u8]
+        var out: [4]u8 = [37u8, 115u8, 124u8, 0u8]
+        var buf: [16]u8
+        var n = snprintf(&buf[0], 16usize, &fmt[0], 7, 8)
+        printf(&out[0], &buf[0])
+        print("")
+        print(n)
+        """), "7-8|\n3\n")
+
+// "%d,"
+@test("a call in a loop neither leaks nor gets confused")
+exr_variadic_a_call_in_a_loop()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        var fmt: [4]u8 = [37u8, 100u8, 44u8, 0u8]
+        var total = 0
+        for i in 1..5
+            total += printf(&fmt[0], i)
+        print("")
+        print(total)
+        """), "1,2,3,4,5,\n10\n")
+
+// "reached %d" and then a backslash and an `n` -- two bytes, as the reference's case spells them,
+// not a newline -- so what `printf` wrote is still sitting in C's buffer when `exit` is called, and
+// it arrives because `exit` flushes.
+@test("what it printed survives a departure taken right after it")
+exr_variadic_output_survives_a_departure()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        var fmt: [13]u8 = [114u8, 101u8, 97u8, 99u8, 104u8, 101u8, 100u8, 32u8, 37u8, 100u8, 92u8, 110u8, 0u8]
+        printf(&fmt[0], 1)
+        exit(3)
+        printf(&fmt[0], 2)
+        """), "reached 1\\n[exit 3]")
+
+// ---- reading standard input ----
+//
+// Standard input asks nothing of the language: `getchar` is an ordinary `extern` returning an
+// `int`, and the negative value it hands back at end of input is an ordinary comparison. Every read
+// here is at end of input by construction.
+
+@test("the end-of-input value is what C says it is")
+exr_the_end_of_input_value()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern "getchar" get_char() -> int
+        print(get_char())
+        """), "-1\n")
+
+@test("a read loop over empty input completes without reading anything")
+exr_a_read_loop_over_empty_input()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern "getchar" get_char() -> int
+        var n = 0
+        var c = get_char()
+        while c >= 0
+            n += 1
+            c = get_char()
+        print("bytes:", n)
+        """), "bytes: 0\n")
+
+@test("an input byte becomes text through the conversion every integer takes")
+exr_an_input_byte_becomes_text()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        extern "getchar" get_char() -> int
+        read_or(fallback: char) -> char
+            var c = get_char()
+            if c < 0 then fallback else char(u32(c))
+        print(read_or('x'))
+        """), "x\n")
+
+// ---- a call that does not return ----
+
+@test("stops the program where it stands")
+exr_exit_stops_the_program_where_it_stands()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        print("before")
+        exit(2)
+        print("after")
+        """), "before\n[exit 2]")
+
+@test("carries its status out")
+exr_exit_carries_its_status_out()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        print("gone")
+        exit(3)
+        """), "gone\n[exit 3]")
+
+@test("a zero status is still a departure")
+exr_a_zero_status_is_still_a_departure()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        print("done")
+        exit(0)
+        """), "done\n")
+
+@test("a user function may declare that it does not return")
+exr_a_user_function_may_not_return()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        fail(code: int) -> never
+            print("stopping")
+            exit(code)
+        print("first")
+        fail(4)
+        print("never")
+        """), "first\nstopping\n[exit 4]")
+
+// ---- a diverging branch ----
+
+@test("an if yields the other branch's type")
+exr_an_if_yields_the_other_branchs_type()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        positive(n: int) -> int = if n > 0 then n else exit(1)
+        print(positive(5))
+        """), "5\n")
+
+@test("a match arm that diverges leaves the others' type alone")
+exr_a_diverging_arm_leaves_the_others_type()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        enum Shape
+            Circle(r: int)
+            Bad
+        area(s: Shape) -> int = s match
+            Circle(r) -> 3 * r * r
+            Bad -> exit(1)
+        print(area(Circle(2)))
+        """), "12\n")
+
+@test("the diverging arm really does stop the program")
+exr_the_diverging_arm_really_stops()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        enum Shape
+            Circle(r: int)
+            Bad
+        area(s: Shape) -> int = s match
+            Circle(r) -> 3 * r * r
+            Bad ->
+                print("bad shape")
+                exit(1)
+        print(area(Circle(2)))
+        print(area(Bad))
+        print("unreachable")
+        """), "12\nbad shape\n[exit 1]")
+
+// Half a million rounds, so a reference leaked or released twice on the arriving branch shows as
+// memory or as a fault rather than as nothing.
+@test("a reference from the arriving branch is still owned")
+exr_a_reference_from_the_arriving_branch()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        struct Inner
+            v: int
+        grab(seed: int) -> &Inner
+            if seed >= 0 then Inner(seed) else exit(1)
+        var i = 0
+        var total = 0
+        while i < 500000
+            var g = grab(i % 4)
+            total += g.v
+            i++
+        print(total)
+        """), "750000\n")
+
+@test("a diverging arm beside one that yields a reference neither leaks nor frees twice")
+exr_a_diverging_arm_beside_a_reference()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        struct Inner
+            v: int
+        enum Src
+            Have(v: int)
+            Gone
+        grab(s: Src) -> &Inner = s match
+            Have(v) -> Inner(v)
+            Gone -> exit(1)
+        var i = 0
+        var total = 0
+        while i < 500000
+            var g = grab(Have(i % 4))
+            total += g.v
+            i++
+        print(total)
+        """), "750000\n")
+
+// ---- where a divergence may stand ----
+
+@test("an if with no else is a guard clause")
+exr_an_if_with_no_else_is_a_guard_clause()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        check(n: int) -> int
+            if n < 0 then exit(1)
+            n * 2
+        print(check(21))
+        """), "42\n")
+
+@test("and the guard clause really guards")
+exr_the_guard_clause_really_guards()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        check(n: int) -> int
+            if n < 0 then
+                print("negative")
+                exit(1)
+            n * 2
+        print(check(21))
+        print(check(-1))
+        """), "42\nnegative\n[exit 1]")
+
+@test("an elif chain may diverge in the middle")
+exr_an_elif_chain_may_diverge()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        grade(n: int) -> int
+            if n > 100 then exit(1)
+            elif n > 50 then 1
+            else 0
+        print(grade(60), grade(10))
+        """), "1 0\n")
+
+@test("a statement match may have a diverging arm")
+exr_a_statement_match_may_diverge()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        enum Shape
+            Circle(r: int)
+            Bad
+        show(s: Shape)
+            s match
+                Circle(r) -> print("circle", r)
+                Bad -> exit(1)
+        show(Circle(3))
+        print("after")
+        """), "circle 3\nafter\n")
+
+@test("a guarded arm may diverge")
+exr_a_guarded_arm_may_diverge()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        enum Shape
+            Circle(r: int)
+            Bad
+        area(s: Shape) -> int = s match
+            Circle(r) if r < 0 -> exit(1)
+            Circle(r) -> 3 * r * r
+            Bad -> exit(2)
+        print(area(Circle(2)))
+        """), "12\n")
+
+@test("every arm may diverge, and then the match itself does not return")
+exr_every_arm_may_diverge()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        stop(c: bool) -> never = c match
+            true ->
+                print("true side")
+                exit(1)
+            false -> exit(2)
+        print("before")
+        stop(true)
+        """), "before\ntrue side\n[exit 1]")
+
+@test("a loop's break value meets a diverging else")
+exr_a_break_value_meets_a_diverging_else()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        first_even(hi: int) -> int
+            var i = 1
+            while i <= hi
+                if i % 2 == 0 then break i
+                i++
+            else exit(1)
+        print(first_even(5))
+        """), "2\n")
+
+@test("an argument may diverge, and the call never happens")
+exr_an_argument_may_diverge()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        f(n: int) -> int = n * 2
+        print("before")
+        f(exit(1))
+        print("after")
+        """), "before\n[exit 1]")
+
+@test("a returned value may diverge")
+exr_a_returned_value_may_diverge()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        f(n: int) -> int
+            if n > 0 then return n
+            return exit(1)
+        print(f(4))
+        """), "4\n")
+
+@test("a member may declare that it does not return")
+exr_a_member_may_not_return()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        struct Fail
+            code: int
+            raise(self) -> never
+                print("failing with", self.code)
+                exit(self.code)
+        print("before")
+        Fail(3).raise()
+        """), "before\nfailing with 3\n[exit 3]")
+
+@test("a trait method may declare that it does not return")
+exr_a_trait_method_may_not_return()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        trait Stop
+            halt(self) -> never
+        enum Reason
+            Broken
+        impl Stop for Reason
+            halt(self) -> never
+                print("halting")
+                exit(1)
+        print("before")
+        Broken.halt()
+        """), "before\nhalting\n[exit 1]")
+
+// ---- a block that ends in a jump ----
+
+@test("a branch may return instead of yielding")
+exr_a_branch_may_return()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        halve(n: int) -> int
+            var h = if n % 2 == 0 then n / 2 else return -1
+            h * 10
+        print(halve(8), halve(7))
+        """), "40 -1\n")
+
+@test("an arm may return instead of yielding")
+exr_an_arm_may_return()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        first(o: Option[int]) -> int = o match
+            Some(v) -> v
+            None -> return -1
+        print(first(Some(4)), first(None))
+        """), "4 -1\n")
+
+@test("a branch may continue to the next iteration")
+exr_a_branch_may_continue()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        sum_even(hi: int) -> int
+            var total = 0
+            var i = 1
+            while i <= hi
+                i++
+                var v = if (i - 1) % 2 == 0 then i - 1 else continue
+                total += v
+            total
+        print(sum_even(10))
+        """), "30\n")
+
+@test("a branch may break with the loop's value")
+exr_a_branch_may_break_with_a_value()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        find(hi: int) -> int
+            var i = 1
+            while i <= hi
+                var keep = if i * i > 20 then break i else i
+                i = keep + 1
+            else -1
+        print(find(10), find(3))
+        """), "5 -1\n")
+
+@test("a loop's else may return")
+exr_a_loops_else_may_return()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        find(hi: int) -> int
+            var i = 1
+            var found = while i <= hi
+                if i * i > 20 then break i
+                i++
+            else return -1
+            found * 100
+        print(find(10), find(3))
+        """), "500 -1\n")
+
+@test("a body whose every branch returns needs no fall-through value")
+exr_every_branch_returns()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        sign(c: bool) -> int
+            if c then return 1 else return 2
+        print(sign(true), sign(false))
+        """), "1 2\n")
+
+@test("a body whose every arm returns is the same shape")
+exr_every_arm_returns()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        pick(o: Option[int]) -> int = o match
+            Some(v) -> return v * 2
+            None -> return -1
+        print(pick(Some(3)), pick(None))
+        """), "6 -1\n")
+
+@test("a nested all-returning if is still a value in the outer one")
+exr_a_nested_all_returning_if()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        classify(n: int) -> int
+            var kind = if n > 0 then
+                if n > 10 then return 99 else return 1
+            else 0
+            kind + 5
+        print(classify(-1), classify(5), classify(50))
+        """), "5 1 99\n")
+
+@test("a diverging block still owns what it took")
+exr_a_diverging_block_still_owns()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        struct Inner
+            v: int
+        grab(seed: int) -> &Inner
+            var held: &Inner = Inner(seed)
+            var out = if held.v >= 0 then held else return Inner(0)
+            out
+        var i = 0
+        var total = 0
+        while i < 500000
+            var g = grab(i % 4)
+            total += g.v
+            i++
+        print(total)
+        """), "750000\n")
+
+// ---- the library's unwrap and expect ----
+
+@test("Option hands over the value it holds")
+exr_option_hands_over_its_value()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        half(n: int) -> Option[int]
+            if n % 2 == 0 then Some(n / 2) else None
+        print(half(10).unwrap(), half(8).expect("even"))
+        """), "5 4\n")
+
+@test("Result hands over the value it holds")
+exr_result_hands_over_its_value()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        parse(ok: bool) -> Result[int, string]
+            if ok then Ok(9) else Err("bad")
+        print(parse(true).unwrap(), parse(true).expect("parsed"))
+        """), "9 9\n")
+
+@test("unwrapping a None says so and stops")
+exr_unwrapping_a_none_stops()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        half(n: int) -> Option[int]
+            if n % 2 == 0 then Some(n / 2) else None
+        print(half(7).unwrap())
+        """), "panic: unwrap of a None value\n[exit 1]")
+
+@test("unwrapping an Err says so and stops")
+exr_unwrapping_an_err_stops()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        parse(ok: bool) -> Result[int, string]
+            if ok then Ok(9) else Err("bad")
+        print(parse(false).unwrap())
+        """), "panic: unwrap of an Err value\n[exit 1]")
+
+@test("expect carries the caller's own message")
+exr_expect_carries_the_callers_message()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        half(n: int) -> Option[int]
+            if n % 2 == 0 then Some(n / 2) else None
+        print(half(7).expect("7 is odd"))
+        """), "panic: 7 is odd\n[exit 1]")
+
+@test("expect on a Result carries it too")
+exr_expect_on_a_result_carries_it_too()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        parse(ok: bool) -> Result[int, string]
+            if ok then Ok(9) else Err("bad")
+        print(parse(false).expect("could not parse"))
+        """), "panic: could not parse\n[exit 1]")
+
+@test("a string payload survives being unwrapped")
+exr_a_string_payload_survives()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        pick(n: int) -> Option[string]
+            if n > 0 then Some("held") else None
+        print(pick(1).unwrap(), pick(2).expect("positive"))
+        """), "held held\n")
+
+@test("unwrapping a reference neither leaks nor frees twice")
+exr_unwrapping_a_reference()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        struct Inner
+            v: int
+        grab(seed: int) -> &Inner
+            var o: Option[&Inner] = Some(Inner(seed))
+            o.unwrap()
+        var i = 0
+        var total = 0
+        while i < 500000
+            var g = grab(i % 4)
+            total += g.v
+            i++
+        print(total)
+        """), "750000\n")
+
+@test("expecting a reference out of a Result neither leaks nor frees twice")
+exr_expecting_a_reference_out_of_a_result()
+    if !exr_ready() then return
+
+    assert_eq(exr_ran(raw"""
+        struct Inner
+            v: int
+        grab(seed: int) -> &Inner
+            var r: Result[&Inner, string] = Ok(Inner(seed))
+            r.expect("built")
+        var i = 0
+        var total = 0
+        while i < 500000
+            var g = grab(i % 4)
+            total += g.v
+            i++
+        print(total)
+        """), "750000\n")
