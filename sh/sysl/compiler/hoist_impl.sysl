@@ -33,6 +33,10 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                                  written_subject(block),
                                  tr.methods)
 
+    // A TYPE parameter written as the subject's length is refused before the subject is read: read,
+    // it would stand at zero and the block would quietly implement the trait for `[0]T`.
+    if target_length_refused(a, scope, block) then return im
+
     val target = impl_target(a, scope, span, block)
     val ty = target.0
     var home = target.1
@@ -771,6 +775,42 @@ private length_param(block: ImplDecl) -> Option[string]
                 _ -> None
         _ -> None
 end length_param
+
+// Whether the block's subject writes one of its TYPE parameters where a length belongs --
+// `impl[N, T] Tag for [N]T` -- told at the length itself.
+private target_length_refused(a: &Analysis, scope: Scope, block: ImplDecl) -> bool
+    var types: Buf[string] = buf()
+
+    for i in 0..<block.tparams.len()
+        if !has_binding(block.tvalues, block.tparams.at(i)) then types.push(block.tparams.at(i))
+
+    if types.is_empty() then return false
+
+    val before = a.complaints()
+
+    target_lengths(a, scope, block.for_type, types)
+    a.complaints() > before
+end target_length_refused
+
+private target_lengths(a: &Analysis, scope: Scope, t: TypeRef, types: Buf[string])
+    *t.kind match
+        ArrayType(length, elem, _) ->
+            if length.is_some() then length_not_a_type(a, scope, t.span, length.unwrap(), types)
+
+            target_lengths(a, scope, elem, types)
+        VectorType(lanes, elem) ->
+            length_not_a_type(a, scope, t.span, lanes, types)
+            target_lengths(a, scope, elem, types)
+        NamedType(_, args) ->
+            for i in 0..<args.len()
+                target_lengths(a, scope, args.at(i), types)
+        TupleType(parts, _) ->
+            for i in 0..<parts.len()
+                target_lengths(a, scope, parts.at(i), types)
+        PtrType(inner) -> target_lengths(a, scope, inner, types)
+        RefType(inner, _) -> target_lengths(a, scope, inner, types)
+        _ -> ()
+end target_lengths
 
 // The block's own **pack** parameter, where the subject is `(..A)` and `A` is one.
 private pack_param(block: ImplDecl) -> Option[string]
