@@ -1,0 +1,966 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The reference's `LibraryMoveTests`: each declaration that lives in the standard module rather than
+// in the compiler, held to what that promises -- a program reaches it by the name it always wrote, it
+// is the library's rather than the program's, and whatever the language itself resolves through it
+// still resolves when a program declares the same word.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.152)** by
+// handing the installed `sysl` the same program. A run case asserts what was printed and that the
+// program exited cleanly; a refusal asserts the message and its `file:line:column`.
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private lmv_ready() -> bool
+    if xvr_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end lmv_ready
+
+private lmv_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+// Builds a program of several files and runs it, answering what it printed and whether it exited
+// cleanly -- or the refusal, where it could not be built.
+private lmv_build_run(files: []const (string, string),
+                      args: []const string) -> Result[(string, bool), string]
+    val root = make_temp_dir("sysl-lmv").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+    val target = if files.len == 1 then s"$root/main.sysl" else root
+
+    build_native_program(target, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return Err(failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, args, "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> Err("the program that was built could not be run")
+        Ok(out) -> Ok((out.text, out.status.ok()))
+end lmv_build_run
+
+// A program handed these arguments prints exactly this and exits cleanly.
+private lmv_prints_with(text: string, args: []const string, want: string)
+    lmv_build_run(lmv_main(text), args) match
+        Err(why) -> assert(false, why)
+        Ok((out, clean)) ->
+            assert_eq(out, want)
+            assert(clean, s"it did not exit cleanly, having printed: $out")
+
+private lmv_prints(text: string, want: string) = lmv_prints_with(text, [], want)
+
+// A tree is refused with this message, anchored at this `file:line:column`.
+private lmv_refused_tree(files: []const (string, string), message: string, at: string)
+    lmv_build_run(files, []) match
+        Ok((out, _)) -> assert(false, s"it compiled, and printed: $out")
+        Err(said) ->
+            assert(said.contains(s"error: $message\n --> "), said)
+            assert(said.contains(s"/$at\n"), said)
+
+private lmv_refused(text: string, message: string, at: string) =
+    lmv_refused_tree(lmv_main(text), message, at)
+
+// -- a declaration that has moved into the standard module -------------------------------------------
+
+@test("arrives unqualified, with no import written")
+lmv_arrives_unqualified()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        struct P
+            x: int
+
+        impl Display for P
+            display(self, w: *Writer, spec: FormatSpec) = str(self.x).display(w, spec)
+
+        print(P(6))
+        """, "6\n")
+end lmv_arrives_unqualified
+
+@test("is the same type by its full path as by the name that arrives")
+lmv_same_type_by_its_full_path()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        show(spec: FormatSpec) -> int = spec.width
+        print(show(sysl.FormatSpec(5, -1, false)))
+        """, "5\n")
+
+@test("is what a format hole builds, which the compiler names rather than resolves")
+lmv_what_a_format_hole_builds()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        print(f"[${str(42)}%5s]")
+        print(f"[${1.5}%8.3f]")
+        """, "[   42]\n[   1.500]\n")
+
+@test("and a program may now declare one of its own beside it")
+lmv_a_program_declares_its_own_format_spec()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        struct FormatSpec
+            n: int
+
+        var mine = FormatSpec(3)
+        print(mine.n)
+        print(f"[${str(42)}%5s]")
+        """, "3\n[   42]\n")
+end lmv_a_program_declares_its_own_format_spec
+
+@test("which does not reach into the library, whose own signatures still mean the library's")
+lmv_the_librarys_signatures_mean_the_librarys()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        struct FormatSpec
+            n: int
+
+        struct P
+            x: int
+
+        impl Display for P
+            display(self, w: *Writer, spec: sysl.FormatSpec) = str(self.x).display(w, spec)
+
+        print(FormatSpec(3).n)
+        print(P(6))
+        """, "3\n6\n")
+end lmv_the_librarys_signatures_mean_the_librarys
+
+// The refusal is the block's -- it is the block that claims the trait -- and it is the only one: the
+// member is not lowered, so `spec` handed on inside its body earns nothing of its own.
+@test("and writing the shadowed one where the library's is wanted says which is which")
+lmv_the_shadowed_one_is_told_apart()
+    if !lmv_ready() then return
+
+    val text = raw"""
+        struct FormatSpec
+            n: int
+
+        struct P
+            x: int
+
+        impl Display for P
+            display(self, w: *Writer, spec: FormatSpec) = str(self.x).display(w, spec)
+        """
+
+    lmv_refused(text, "parameter 'spec' of method 'display' is FormatSpec, but trait " +
+                "'sysl.Display' declares sysl.FormatSpec", "main.sysl:7:1")
+
+    lmv_build_run(lmv_main(text), []) match
+        Ok(_) -> assert(false, "it compiled")
+        Err(said) -> assert_eq(xvr_count(said, "error: "), 1, said)
+end lmv_the_shadowed_one_is_told_apart
+
+// -- a moved declaration whose own signature names other moved ones ------------------------------------
+
+@test("an impl matches the trait's signature, every name in it the library's")
+lmv_an_impl_matches_the_traits_signature()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        struct P
+            x: int
+
+        impl Display for P
+            display(self, out: *Writer, fmt: FormatSpec) = str(self.x).display(out, fmt)
+
+        print(P(4))
+        """, "4\n")
+end lmv_an_impl_matches_the_traits_signature
+
+@test("and the sink it names means the library's even where the program declares a 'Writer'")
+lmv_the_sink_means_the_librarys()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        trait Writer
+            log(self) -> int
+
+        struct P
+            x: int
+
+        impl Display for P
+            display(self, out: *sysl.Writer, fmt: FormatSpec) = str(self.x).display(out, fmt)
+
+        print(P(9))
+        """, "9\n")
+end lmv_the_sink_means_the_librarys
+
+// `str(self.x).display(…)` is a member the library's `Display` gave `string`, reached from a file
+// whose bare `Display` is its own: the wildcard that offers the library's trait still offers it.
+@test("a program may declare a 'Display' of its own, and the library's is still what print asks for")
+lmv_a_program_declares_its_own_display()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        trait Display
+            describe(self) -> int
+
+        struct P
+            x: int
+
+        impl Display for P
+            describe(self) -> int = self.x * 2
+
+        impl sysl.Display for P
+            display(self, out: *Writer, fmt: FormatSpec) = str(self.x).display(out, fmt)
+
+        print(P(5).describe())
+        print(P(5))
+        """, "10\n5\n")
+end lmv_a_program_declares_its_own_display
+
+@test("a sink of the program's own is refused where the library's is asked for, and named apart")
+lmv_a_sink_of_the_programs_own_is_refused()
+    if !lmv_ready() then return
+
+    lmv_refused(raw"""
+        trait Writer
+            log(self) -> int
+
+        struct S
+            n: int
+
+        impl Fallible for S
+
+        impl Writer for S
+            log(self) -> int = self.n
+
+        var s: S
+        var w: *Writer = &s
+        display_int(1, w, FormatSpec(0, -1, false))
+        """, "a *Writer has forgotten which type it holds, so there is nothing for a *sysl.Writer " +
+             "to be built from — 'sysl.Writer' is reachable *through* the value, and a bound on " +
+             "it is satisfied by one, but its slots are not a table of their own",
+                "main.sysl:14:16")
+end lmv_a_sink_of_the_programs_own_is_refused
+
+@test("the bound that advice names is one a program can actually write")
+lmv_the_bound_advice_names_is_writable()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        show[T: sysl.Display](x: T) = print(x)
+        show(7)
+        show("s")
+        """, "7\ns\n")
+
+@test("and the advice names the trait by the path that reaches it, not by the shadowed spelling")
+lmv_the_advice_names_the_trait_by_path()
+    if !lmv_ready() then return
+
+    lmv_refused(raw"""
+        trait Display
+            describe(self) -> int
+
+        struct P
+            x: int
+
+        impl Display for P
+            describe(self) -> int = self.x
+
+        print(P(5))
+        """, "cannot print a P value — write an 'impl sysl.Display for P' to say how it renders",
+                "main.sysl:10:1")
+end lmv_the_advice_names_the_trait_by_path
+
+// -- a moved FUNCTION, which is what a renderer is -----------------------------------------------------
+
+@test("a program may declare one of its own over it, and both are reachable")
+lmv_a_renderer_of_the_programs_own()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        display_int(n: long, out: *Writer, fmt: FormatSpec) = display_str("mine", out, fmt)
+
+        struct P
+            x: int
+
+        impl sysl.Display for P
+            display(self, out: *Writer, fmt: FormatSpec) = display_int(long(self.x), out, fmt)
+
+        print(P(5))
+        print(7)
+        """, "mine\n7\n")
+end lmv_a_renderer_of_the_programs_own
+
+@test("and the library's own is still reachable, by the path that names it")
+lmv_the_librarys_renderer_by_path()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        display_int(n: long, out: *Writer, fmt: FormatSpec) = display_str("mine", out, fmt)
+
+        struct P
+            x: int
+
+        impl sysl.Display for P
+            display(self, out: *Writer, fmt: FormatSpec) =
+                sysl.display_int(long(self.x), out, fmt)
+
+        print(P(5))
+        """, "5\n")
+end lmv_the_librarys_renderer_by_path
+
+// The program's own `display_int` is refused for its body as well (it yields a `long` where it
+// declared an `int`), which is the reference's program as written; the claim is the second refusal.
+@test("and a rendering the compiler chose names the library's in a diagnostic, not the program's")
+lmv_a_diagnostic_names_the_librarys_renderer()
+    if !lmv_ready() then return
+
+    lmv_refused(raw"""
+        display_int(n: long) -> int = n
+
+        struct S
+            n: usize
+
+        impl Fallible for S
+
+        impl Writer for S
+            write(*self, bytes: []const u8)
+                self.n += bytes.len
+
+        var w: &Writer = S(0usize)
+        sysl.display_int(1, w, FormatSpec(0, -1, false))
+        """, "'out' of 'sysl.display_int' is *sysl.Writer, but &sysl.Writer was given",
+                "main.sysl:13:21")
+end lmv_a_diagnostic_names_the_librarys_renderer
+
+// -- a moved surface a program is expected to build on ------------------------------------------------
+
+@test("a program may declare a 'Reader' of its own, and the library's cursor still means the library's")
+lmv_a_program_declares_its_own_reader()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        trait Reader
+            poll(self) -> int
+
+        struct Tick
+            n: int
+
+        impl Fallible for Tick
+
+        impl Reader for Tick
+            poll(self) -> int = self.n
+
+        struct Bytes
+            src: []const u8
+            at: usize
+
+        impl sysl.Fallible for Bytes
+
+        impl sysl.io.Reader for Bytes
+            read(*self, into: []u8) -> []const u8
+                var n = self.src.len - self.at
+                if n > into.len then n = into.len
+                for i in 0usize..<n do into[i] = self.src[self.at + i]
+                self.at += n
+                into[0..<n]
+
+        var b = Bytes("a\nbb\n".bytes, 0usize)
+        var r: *sysl.io.Reader = &b
+        for line in sysl.io.lines(r) do print(line, Tick(3).poll())
+        """, "a 3\nbb 3\n")
+end lmv_a_program_declares_its_own_reader
+
+@test("and a sink of the program's own is refused where the library's reader is asked for")
+lmv_a_reader_of_the_programs_own_is_refused()
+    if !lmv_ready() then return
+
+    lmv_refused(raw"""
+        trait Reader
+            poll(self) -> int
+
+        struct Tick
+            n: int
+
+        impl Fallible for Tick
+
+        impl Reader for Tick
+            poll(self) -> int = self.n
+
+        var t: Tick
+        var r: *Reader = &t
+        for line in sysl.io.lines(r) do print(line)
+        """, "a *Reader has forgotten which type it holds, so there is nothing for a " +
+             "*sysl.io.Reader to be built from — 'sysl.io.Reader' is reachable *through* the " +
+             "value, and a bound on it is satisfied by one, but its slots are not a table of " +
+             "their own", "main.sysl:14:27")
+end lmv_a_reader_of_the_programs_own_is_refused
+
+// -- a moved surface the LANGUAGE reaches by name, not the program -------------------------------------
+
+@test("a string's characters reach the library's cursor, under the key the standard module files it as")
+lmv_chars_reach_the_librarys_cursor()
+    if xvr_no_library() then return
+
+    val out = xvr_ir(lmv_main("for c in \"ab\".chars do print(c)\n"))
+
+    assert(out.contains("@sysl.text$chars_of("), "the library's key is not what '.chars' calls")
+    assert(!out.contains("@chars_of("), "a bare 'chars_of' was emitted")
+end lmv_chars_reach_the_librarys_cursor
+
+@test("and a program declaring 'chars_of' of its own does not become what '.chars' walks")
+lmv_a_chars_of_of_the_programs_own()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        chars_of(b: []const u8) -> int = int(b.len)
+
+        print(chars_of("abc".bytes))
+        for c in "ab".chars do print(c)
+        """, "3\na\nb\n")
+
+@test("the validator is asked for by name, and its error type comes with it")
+lmv_the_validator_is_asked_for_by_name()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        import sysl.text.from_utf8
+
+        from_utf8([0xC3u8, 0xA9u8]) match
+            Ok(s) -> print(s)
+            Err(e) -> print("bad at", e.offset)
+        """, "é\n")
+
+@test("and a program may declare a 'Utf8Error' of its own beside the library's")
+lmv_a_utf8_error_of_the_programs_own()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        import sysl.text.from_utf8
+
+        struct Utf8Error
+            why: string
+
+        bad() -> Utf8Error = Utf8Error("mine")
+
+        print(bad().why)
+
+        from_utf8([0xFFu8]) match
+            Ok(s) -> print(s)
+            Err(e) -> print("bad at", e.offset, e.truncated)
+        """, "mine\nbad at 0 false\n")
+end lmv_a_utf8_error_of_the_programs_own
+
+@test("the conversion advice names the validator by the path that reaches it")
+lmv_the_conversion_advice_names_the_validator()
+    if !lmv_ready() then return
+
+    lmv_refused(raw"""
+        var b = [0x61u8]
+        var s = string(b[..])
+        """, "a 'string' conversion encodes a char — bytes are already text or are not, so " +
+             "'sysl.text.from_utf8(b)' is what says which", "main.sysl:2:9")
+
+@test("and a program's own 'from_utf8' leaves both of the library's callers alone")
+lmv_a_from_utf8_of_the_programs_own()
+    if !lmv_ready() then return
+
+    lmv_prints_with(raw"""
+        from_utf8(b: []const u8) -> string = "mine"
+
+        struct Bytes
+            src: []const u8
+            at: usize
+
+        impl sysl.Fallible for Bytes
+
+        impl sysl.io.Reader for Bytes
+            read(*self, into: []u8) -> []const u8
+                var n = self.src.len - self.at
+                if n > into.len then n = into.len
+                for i in 0usize..<n do into[i] = self.src[self.at + i]
+                self.at += n
+                into[0..<n]
+
+        main(args: []string)
+            print(from_utf8("x".bytes))
+            for a in args[1..] do print(a)
+            var b = Bytes("hi\nthere\n".bytes, 0usize)
+            var r: *sysl.io.Reader = &b
+            for line in sysl.io.lines(r) do print(line)
+        """, ["one", "two"], "mine\none\ntwo\nhi\nthere\n")
+end lmv_a_from_utf8_of_the_programs_own
+
+@test("and the fallible half of a scalar conversion came across too")
+lmv_the_fallible_scalar_conversion()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        import sysl.text.char_from_u32
+
+        char_from_u32(9731u32) match
+            Some(c) -> print(c)
+            None -> print("no")
+        char_from_u32(0xD800u32) match
+            Some(c) -> print(c)
+            None -> print("no")
+        """, "☃\nno\n")
+end lmv_the_fallible_scalar_conversion
+
+@test("a program may declare its own 'printi', and 'print' still reaches the library's")
+lmv_a_printi_of_the_programs_own()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        printi(n: int) -> string = "mine"
+
+        print(printi(1))
+        print(42)
+        """, "mine\n42\n")
+
+@test("and its own 'putbytes', which the writer table still resolves past")
+lmv_a_putbytes_of_the_programs_own()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        import sysl.buf.byte_sink
+
+        putbytes(b: []const u8) -> int = 7
+
+        var g = byte_sink()
+        var w: *Writer = &g
+
+        display_str("hi", w, FormatSpec(0, -1, false))
+        print(putbytes("x".bytes), g.text().len)
+        """, "7 2\n")
+end lmv_a_putbytes_of_the_programs_own
+
+// -- storage of the program's own under a library function's name --------------------------------------
+
+@test("an 'extern' variable, which is how a program reaches libc's own stream")
+lmv_an_extern_variable_under_a_library_name()
+    if !lmv_ready() then return
+
+    // Written as joined lines rather than as one block, so that the conditional lines are the
+    // program's and never this file's.
+    lmv_prints("#if macos\n" +
+               "extern \"__stdoutp\" stdout: *u8\n" +
+               "#else\n" +
+               "extern stdout: *u8\n" +
+               "#endif\n" +
+               "extern fputs(s: *u8, stream: *u8) -> i32\n" +
+               "print(\"one\")\n" +
+               "fputs(c\"two\\n\", stdout)\n" +
+               "print(\"three\")\n", "one\ntwo\nthree\n")
+end lmv_an_extern_variable_under_a_library_name
+
+@test("a module-level 'val', which is storage this program laid down")
+lmv_a_val_under_a_library_name()
+    if !lmv_ready() then return
+
+    lmv_prints("val stdout: int = 7\n\nprint(stdout + 1)\n", "8\n")
+
+@test("a 'const', which is folded into the use rather than loaded")
+lmv_a_const_under_a_library_name()
+    if !lmv_ready() then return
+
+    lmv_prints("const stdout: int = 7\n\nprint(stdout + 1)\n", "8\n")
+
+// A variant is the fourth thing a bare name can be, and the one the function table answered for:
+// `stderr` is the library's function as well as this program's variant.
+@test("an enum variant, which is reached unqualified and so collides the same way")
+lmv_a_variant_under_a_library_name()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        enum Stream
+            stdout
+            stderr
+
+        var s: Stream = stderr
+
+        s match
+            stdout -> print("out")
+            stderr -> print("err")
+        """, "err\n")
+end lmv_a_variant_under_a_library_name
+
+@test("while the library's function is still reached by the path that names it")
+lmv_the_librarys_function_by_path()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        val stdout: int = 7
+
+        print(stdout)
+        sysl.stdout().write("hi\n".bytes)
+        """, "7\nhi\n")
+
+// -- a moved GENERIC, which is what a growable sequence is ---------------------------------------------
+
+@test("an instantiation a program asks for is keyed by the module the generic is declared in")
+lmv_an_instantiation_is_keyed_by_its_module()
+    if xvr_no_library() then return
+
+    val out = xvr_ir(lmv_main("import sysl.buf.*\n\n" +
+                              "var b: Buf[int] = buf()\n" +
+                              "b.push(7)\n" +
+                              "print(b[0usize], b.len())\n"))
+
+    assert(out.contains("%struct.sysl.buf$Buf.int = type"), "the struct is not keyed by its module")
+    assert(out.contains("@sysl.buf$Buf.push.int("), "the member is not keyed by its module")
+    assert(out.contains("@sysl.buf$buf.int("), "the constructor is not keyed by its module")
+    assert(!out.contains("@Buf.push.int("), "a bare 'Buf.push.int' was emitted")
+end lmv_an_instantiation_is_keyed_by_its_module
+
+@test("and its impl of a trait declared elsewhere is keyed under the subject, not the trait")
+lmv_an_impl_is_keyed_under_its_subject()
+    if xvr_no_library() then return
+
+    val out = xvr_ir(lmv_main("import sysl.buf.*\n\n" +
+                              "var b: Buf[int] = buf()\n" +
+                              "b.push(7)\n" +
+                              "print(b[0usize])\n"))
+
+    assert(out.contains("@sysl.buf$Buf.index.int("), "the impl's member is not under its subject")
+end lmv_an_impl_is_keyed_under_its_subject
+
+@test("a program may declare a 'Buf' of its own, and what the library builds on still means the library's")
+lmv_a_buf_of_the_programs_own()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        import sysl.text.str_builder
+
+        struct Buf[T]
+            only: T
+
+        mine[T](v: T) -> Buf[T] = Buf(v)
+
+        print(mine(4).only)
+
+        var s = str_builder()
+        s.push("hi")
+        print(s.finish())
+        """, "4\nhi\n")
+end lmv_a_buf_of_the_programs_own
+
+@test("and the library's own is still reachable beside it, by the path that names it")
+lmv_the_librarys_buf_by_path()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        struct Buf[T]
+            only: T
+
+        var mine: Buf[int] = Buf(9)
+        var theirs: sysl.buf.Buf[int] = sysl.buf.buf()
+
+        theirs.push(3)
+        print(mine.only, theirs[0usize], theirs.len())
+        """, "9 3 1\n")
+end lmv_the_librarys_buf_by_path
+
+@test("a sink the library supplies gathers a rendering that pads across the whole value")
+lmv_a_sink_gathers_a_rendering()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        import sysl.buf.byte_sink
+        import sysl.text.from_utf8
+
+        struct Pair
+            a: int
+            b: int
+
+        impl sysl.Display for Pair
+            display(self, out: *Writer, fmt: FormatSpec)
+                var g = byte_sink()
+                var w: *Writer = &g
+                display_int(long(self.a), w, FormatSpec(0, -1, false))
+                display_str(":", w, FormatSpec(0, -1, false))
+                display_int(long(self.b), w, FormatSpec(0, -1, false))
+                display_str(from_utf8(g.text()).unwrap(), out, fmt)
+
+        print(f"[${Pair(1, 2)}%6s]")
+        """, "[   1:2]\n")
+end lmv_a_sink_gathers_a_rendering
+
+// -- a moved surface whose whole point is the last line the compiler supplies --------------------------
+
+@test("a builder gathers text and hands back one string, from the module that holds it")
+lmv_a_builder_gathers_text()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        import sysl.text.str_builder
+
+        var b = str_builder()
+
+        b.push("ab")
+        b.push_char('é')
+        print(b.finish(), b.len)
+        """, "abé 4\n")
+end lmv_a_builder_gathers_text
+
+@test("and a program may declare a 'StrBuilder' of its own beside the library's")
+lmv_a_str_builder_of_the_programs_own()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        import sysl.text.str_builder
+
+        struct StrBuilder
+            tag: int
+
+        var mine = StrBuilder(7)
+        var theirs = str_builder()
+
+        theirs.push("hi")
+        print(mine.tag, theirs.finish())
+        """, "7 hi\n")
+end lmv_a_str_builder_of_the_programs_own
+
+@test("the C copy is owned by a value, and its length excludes the terminator")
+lmv_the_c_copy_is_owned_by_a_value()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        import sysl.text.cstring
+
+        var c = cstring("abc")
+
+        print(c.len, c.bytes.len, c.bytes[3])
+        """, "3 4 0\n")
+
+@test("and what it hands a foreign function is a pointer to those bytes")
+lmv_the_c_copy_hands_over_a_pointer()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        import sysl.text.cstring
+
+        extern "strlen" c_strlen(p: *u8) -> usize
+
+        var c = cstring("hello")
+        print(c_strlen(c.ptr))
+        """, "5\n")
+end lmv_the_c_copy_hands_over_a_pointer
+
+// -- the moved OPERATOR CATALOG ------------------------------------------------------------------------
+
+@test("a program may declare a catalog trait of its own, and the operator still means the library's")
+lmv_a_catalog_trait_of_the_programs_own()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        trait Ord
+            rank(self) -> int
+
+        struct Tier
+            n: int
+
+        impl Ord for Tier
+            rank(self) -> int = self.n
+
+        print(Tier(3).rank(), 1 < 2, "b" < "a")
+        """, "3 true false\n")
+end lmv_a_catalog_trait_of_the_programs_own
+
+// The reference names this case twice, once under the catalog and once under `Hash`; this is the
+// catalog's.
+@test("and a bound on the program's own does not accept a built-in, which is the whole distinction")
+lmv_a_bound_on_the_programs_own_ord()
+    if !lmv_ready() then return
+
+    lmv_refused(raw"""
+        trait Ord
+            rank(self) -> int
+
+        top[T: Ord](x: T) -> int = x.rank()
+
+        print(top(3))
+        """, "'top' requires its type parameter 'T' to implement 'Ord', but int does not",
+                "main.sysl:6:7")
+end lmv_a_bound_on_the_programs_own_ord
+
+@test("the structural rows still make a tuple comparable exactly when its parts are")
+lmv_a_tuple_is_comparable_as_its_parts_are()
+    if !lmv_ready() then return
+
+    lmv_prints("print((1, \"a\") == (1, \"a\"), (1, 2) < (1, 3), (1, 2, 3) == (1, 2, 4))\n",
+               "true true false\n")
+
+@test("and a tuple renders as one field, so a width pads the whole of it")
+lmv_a_tuple_renders_as_one_field()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        print(f"[${(1, 2)}%8s]")
+        """, "[  (1, 2)]\n")
+
+// -- the moved traits the LANGUAGE'S OWN SYNTAX resolves through ---------------------------------------
+
+// The subscript is the compiler's choice of `index`, a member the library's `Index` gave `Buf`, in a
+// file whose bare `Index` is its own.
+@test("a program may declare an 'Index' of its own, and a subscript still means the library's")
+lmv_an_index_of_the_programs_own()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        import sysl.buf.*
+
+        trait Index[I, E]
+            lookup(self, i: I) -> E
+
+        var b: Buf[int] = buf()
+
+        b.push(4)
+        b.push(9)
+        print(b[1usize], b.len())
+        """, "9 2\n")
+end lmv_an_index_of_the_programs_own
+
+@test("and an 'Iterate' of its own, while a 'for' still walks through the library's")
+lmv_an_iterate_of_the_programs_own()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        trait Iterate[E]
+            step(*self) -> E
+
+        var total = 0
+
+        for c in "abc".chars do total += 1
+        print(total)
+        """, "3\n")
+end lmv_an_iterate_of_the_programs_own
+
+@test("a subscript refused through the library's Index names it by the path that reaches it")
+lmv_a_refused_subscript_names_index_by_path()
+    if !lmv_ready() then return
+
+    lmv_refused(raw"""
+        import sysl.buf.*
+
+        var b: Buf[int] = buf()
+
+        b.push(1)
+        b[0usize] += 2
+        """, "'+=' on an element read through 'sysl.Index' would evaluate the receiver and the " +
+             "index twice — write it out as 'b[i] = b[i] + …'", "main.sysl:6:1")
+end lmv_a_refused_subscript_names_index_by_path
+
+@test("and a 'for' over something that walks nowhere names 'Iterate' the same way")
+lmv_a_refused_for_names_iterate_by_path()
+    if !lmv_ready() then return
+
+    lmv_refused(raw"""
+        struct Still
+            n: int
+
+        for x in Still(1) do print(x)
+        """, "'for' iterates an integer range, an array, a slice, or a type that implements " +
+             "'sysl.Iterate', and Still is none of those", "main.sysl:4:1")
+
+// The same refusal whatever was handed over: a scalar, a tuple, an `Option`.
+@test("a 'for' over a scalar, a tuple or an Option is refused in the same words")
+lmv_a_for_over_what_walks_nowhere()
+    if !lmv_ready() then return
+
+    val said = "'for' iterates an integer range, an array, a slice, or a type that implements " +
+               "'sysl.Iterate', and"
+
+    lmv_refused("for x in 5 do print(x)\n", s"$said int is none of those", "main.sysl:1:1")
+    lmv_refused("for x in (1, 2) do print(x)\n", s"$said (int, int) is none of those",
+                "main.sysl:1:1")
+    lmv_refused("val o: Option[int] = Some(1)\nfor x in o do print(x)\n",
+                s"$said sysl.Option[int] is none of those", "main.sysl:2:1")
+end lmv_a_for_over_what_walks_nowhere
+
+// -- a moved trait whose memberships the compiler supplies ---------------------------------------------
+
+@test("a program may declare a 'Hash' of its own, and a built-in still satisfies the library's")
+lmv_a_hash_of_the_programs_own()
+    if !lmv_ready() then return
+
+    lmv_prints(raw"""
+        trait Hash
+            digest(self) -> int
+
+        struct Token
+            n: int
+
+        impl Hash for Token
+            digest(self) -> int = self.n
+
+        keyed[K: sysl.Hash](k: K) -> u64 = k.hash()
+
+        print(Token(4).digest())
+        print(keyed(1u8) == keyed(1i64))
+        """, "4\ntrue\n")
+end lmv_a_hash_of_the_programs_own
+
+// The second of the two cases the reference gives this name, under `Hash`.
+@test("and a bound on the program's own does not accept a built-in, which is the whole distinction")
+lmv_a_bound_on_the_programs_own_hash()
+    if !lmv_ready() then return
+
+    lmv_refused(raw"""
+        trait Hash
+            digest(self) -> int
+
+        keyed[K: Hash](k: K) -> int = k.digest()
+
+        print(keyed(1))
+        """, "'keyed' requires its type parameter 'K' to implement 'Hash', but int does not",
+                "main.sysl:6:7")
+end lmv_a_bound_on_the_programs_own_hash
+
+// -- the standard module is the library's, and a program may not add to it -----------------------------
+
+// The refusal quotes the file by the path it was read from, which is a temporary directory here, so
+// the two halves of the sentence are asserted either side of it.
+private lmv_not_the_programs_module(said: string)
+    assert(said.contains("error: 'sysl' is the module every program is compiled against, so /"), said)
+    assert(said.contains("/sysl/extra.sysl cannot declare it — its declarations would join the " +
+                         "library's rather than sit beside them\n --> "), said)
+    assert(said.contains("/sysl/extra.sysl:1:1\n"), said)
+end lmv_not_the_programs_module
+
+@test("a file declaring it is refused")
+lmv_a_file_declaring_the_standard_module()
+    if !lmv_ready() then return
+
+    lmv_build_run([("sysl/extra.sysl", "module sysl\n\nstruct Extra\n    n: int\n"),
+                   ("main.sysl", "print(1)\n")], []) match
+        Ok((out, _)) -> assert(false, s"it compiled, and printed: $out")
+        Err(said) -> lmv_not_the_programs_module(said)
+end lmv_a_file_declaring_the_standard_module
+
+@test("and so is one that redeclares a name it already carries")
+lmv_a_file_redeclaring_a_library_name()
+    if !lmv_ready() then return
+
+    lmv_build_run([("sysl/extra.sysl", "module sysl\n\nstruct FormatSpec\n    n: int\n"),
+                   ("main.sysl", "print(1)\n")], []) match
+        Ok((out, _)) -> assert(false, s"it compiled, and printed: $out")
+        Err(said) ->
+            lmv_not_the_programs_module(said)
+            assert(said.contains("error: type 'FormatSpec' is already declared\n --> "), said)
+            assert(said.contains("/sysl/extra.sysl:3:1\n"), said)
+end lmv_a_file_redeclaring_a_library_name
