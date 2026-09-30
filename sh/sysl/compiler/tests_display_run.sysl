@@ -1,0 +1,838 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What `Display` and its `Writer` sink do as a program runs (`library/core.md § Rendering to a sink`).
+//
+// The claim is that rendering is ONE mechanism: a scalar, a struct, an enum and a bounded type
+// parameter all reach text the same way, and the difference between `print` and `str` is only which
+// sink the text lands in. So most cases drive one value through both and expect the two to agree to
+// the byte.
+//
+// **Every output and every refusal quoted here was read out of the reference compiler**, whose
+// `DisplayRunTests` these are. Each program is built and then run, and a case asserts what it
+// printed AND that it exited cleanly, so a program that failed to build cannot pass as one that ran.
+
+private var dsp_library_cache: Buf[Program] = buf()
+private var dsp_library_read: bool = false
+
+private dsp_library() -> Buf[Program]
+    if dsp_library_read then return dsp_library_cache
+
+    dsp_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> dsp_library_cache = units
+
+    dsp_library_cache
+end dsp_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private dsp_ready() -> bool
+    if dsp_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end dsp_ready
+
+// Builds a program and runs it, answering what it printed and whether it exited cleanly -- or why
+// it could not be built or run.
+private dsp_build_run(text: string) -> Result[(string, bool), string]
+    val root = make_temp_dir("sysl-display-run").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return Err(failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> Err("the program that was built could not be run")
+        Ok(out) -> Ok((out.text, out.status.ok()))
+end dsp_build_run
+
+// **What a program PRINTS, and that it came back.** `Display`, `Writer` and the renderers are the
+// standard module's; the one sink the library supplies is `sysl.buf`'s, so every program imports it,
+// as the reference's suite does.
+private dsp_prints(text: string, expected: string)
+    if !dsp_ready() then return
+
+    dsp_build_run("import sysl.buf.*\n\n" + text) match
+        Err(why) -> assert(false, why)
+        Ok((out, clean)) ->
+            assert_eq(out, expected)
+            assert(clean, s"it did not exit cleanly: $out")
+end dsp_prints
+
+// Everything a source has to say for itself, taken the whole way through the lowering.
+private dsp_err(text: string) -> string
+    val root = make_temp_dir("sysl-display-run").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end dsp_err
+
+// A refusal is its whole first line and its position; the `-->` line carries the temporary
+// directory, so the position is read from the end of it.
+private dsp_refused(text: string, message: string, at: string)
+    if !dsp_ready() then return
+
+    val said = dsp_err(text)
+
+    assert(said.starts_with(s"error: $message\n"), said)
+    assert(said.contains(s"main.sysl:$at\n"), said)
+end dsp_refused
+
+// A pair whose rendering is unmistakable -- punctuation the two fields could not have produced on
+// their own, so a call that reached the wrong renderer shows up as missing text rather than as a
+// plausible wrong number.
+private dsp_point() -> string = raw"""
+    struct Point
+        x: int
+        y: int
+    impl Display for Point
+        display(self, out: *Writer, fmt: FormatSpec)
+            display_str("(", out, fmt)
+            self.x.display(out, fmt)
+            display_str(", ", out, fmt)
+            self.y.display(out, fmt)
+            display_str(")", out, fmt)
+    """
+
+// The two widths past what `snprintf` can take, each behind a struct that forwards to it -- since
+// `print` and `str` on a scalar do not go through `Display` at all, and a test driving those would
+// pass whatever the wide renderers did.
+private dsp_wide() -> string = raw"""
+    struct W
+        n: u128
+    impl Display for W
+        display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+    struct S
+        n: i128
+    impl Display for S
+        display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+    """
+
+// ---- a type that renders itself ----
+
+@test("prints through the impl its type carries")
+dsp_prints_through_the_impl_its_type_carries()
+    dsp_prints(dsp_point() + raw"""
+        print(Point(3, 4))
+        """, "(3, 4)\n")
+
+// The same text through the other sink. If the two ever disagreed, one of them would be doing its
+// own rendering rather than reaching the one `display` the type declares.
+@test("makes the same string as it prints")
+dsp_makes_the_same_string_as_it_prints()
+    dsp_prints(dsp_point() + raw"""
+        var p = Point(3, 4)
+        print(p)
+        print(str(p))
+        """, "(3, 4)\n(3, 4)\n")
+
+@test("produces a real string, which joins and slices like any other")
+dsp_produces_a_real_string()
+    dsp_prints(dsp_point() + raw"""
+        var s = str(Point(1, 2)) + "!"
+        print(s.len, s[0..<3])
+        """, "7 (1,\n")
+
+@test("is spliced into an interpolation")
+dsp_is_spliced_into_an_interpolation()
+    dsp_prints(dsp_point() + raw"""
+        print(s"a ${Point(1, 2)} b")
+        """, "a (1, 2) b\n")
+
+@test("renders an enum")
+dsp_renders_an_enum()
+    dsp_prints(raw"""
+        enum Colour
+            Red
+            Green
+        impl Display for Colour
+            display(self, out: *Writer, fmt: FormatSpec)
+                var name = self match
+                    Red -> "red"
+                    Green -> "green"
+                display_str(name, out, fmt)
+        print(Green, str(Red))
+        """, "green red\n")
+
+@test("renders a type whose fields render themselves")
+dsp_renders_a_type_whose_fields_render_themselves()
+    dsp_prints(raw"""
+        struct Leaf
+            n: int
+        struct Node
+            a: Leaf
+            b: Leaf
+        impl Display for Leaf
+            display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+        impl Display for Node
+            display(self, out: *Writer, fmt: FormatSpec)
+                self.a.display(out, fmt)
+                display_char('/', out, fmt)
+                self.b.display(out, fmt)
+        print(Node(Leaf(1), Leaf(2)))
+        """, "1/2\n")
+
+// A render inside a render: the inner one has a buffer of its own, so the two cannot be sharing the
+// stack slot the sink lives in.
+@test("renders through a string it built on the way")
+dsp_renders_through_a_string_it_built_on_the_way()
+    dsp_prints(raw"""
+        struct Leaf
+            n: int
+        struct Node
+            a: Leaf
+        impl Display for Leaf
+            display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+        impl Display for Node
+            display(self, out: *Writer, fmt: FormatSpec)
+                display_str("<" + str(self.a) + ">", out, fmt)
+        print(str(Node(Leaf(5))))
+        """, "<5>\n")
+
+@test("writes nothing at all when its impl writes nothing")
+dsp_writes_nothing_when_its_impl_writes_nothing()
+    dsp_prints(raw"""
+        struct E
+            n: int
+        impl Display for E
+            display(self, out: *Writer, fmt: FormatSpec)
+                if self.n > 0 then display_str("x", out, fmt)
+        var s = str(E(0))
+        print(s.len, "[" + s + "]")
+        """, "0 []\n")
+
+// Far past the buffer's starting capacity, so growth has run several times and every byte has been
+// carried across at least one reallocation.
+@test("renders text far larger than the buffer starts at")
+dsp_renders_text_far_larger_than_the_buffer_starts_at()
+    dsp_prints(raw"""
+        struct Rep
+            n: int
+        impl Display for Rep
+            display(self, out: *Writer, fmt: FormatSpec)
+                var i = 0
+                while i < 1000
+                    display_str("ab", out, fmt)
+                    i++
+        var s = str(Rep(0))
+        print(s.len, s[0..<4], s[1996..<2000])
+        """, "2000 abab abab\n")
+
+// ---- the built-ins render through the same trait ----
+
+// Every scalar `reference/expressions.md § Operator dispatch` calls `Display`, reached as a method
+// rather than through `print` -- which is the call a struct's own `display` makes about its fields.
+@test("every scalar type has a display of its own")
+dsp_every_scalar_type_has_a_display_of_its_own()
+    dsp_prints(raw"""
+        struct All
+            n: int
+        impl Display for All
+            display(self, out: *Writer, fmt: FormatSpec)
+                (1).display(out, fmt)
+                display_char(' ', out, fmt)
+                (2u8).display(out, fmt)
+                display_char(' ', out, fmt)
+                (2.5).display(out, fmt)
+                display_char(' ', out, fmt)
+                true.display(out, fmt)
+                display_char(' ', out, fmt)
+                'é'.display(out, fmt)
+                display_char(' ', out, fmt)
+                "s".display(out, fmt)
+        print(All(0))
+        """, "1 2 2.5 true é s\n")
+
+@test("a scalar prints the same whether it goes direct or through the sink")
+dsp_a_scalar_prints_the_same_direct_or_through_the_sink()
+    dsp_prints(raw"""
+        struct W
+            n: int
+        impl Display for W
+            display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+        print(-2147483648)
+        print(W(-2147483648))
+        """, "-2147483648\n-2147483648\n")
+
+// ---- a writer a program wrote itself ----
+
+@test("receives the bytes of everything rendered into it")
+dsp_receives_the_bytes_of_everything_rendered_into_it()
+    dsp_prints(raw"""
+        struct Counter
+            n: usize
+        impl Fallible for Counter
+
+        impl Writer for Counter
+            write(*self, bytes: []const u8)
+                self.n += bytes.len
+        var c: Counter
+        var w: *Writer = &c
+        display_int(12345, w, FormatSpec(0, -1, false))
+        display_str("abc", w, FormatSpec(0, -1, false))
+        print(c.n)
+        """, "8\n")
+
+// Most sinks cannot fail, and `Writer.failed` defaults to saying so -- a writer that only counts
+// bytes writes nothing about failure at all.
+@test("may leave out 'failed', which the trait defaults to false")
+dsp_may_leave_out_failed()
+    dsp_prints(raw"""
+        struct Counter
+            n: usize
+        impl Fallible for Counter
+
+        impl Writer for Counter
+            write(*self, bytes: []const u8)
+                self.n += bytes.len
+        var c: Counter
+        var w: *Writer = &c
+        display_str("abc", w, FormatSpec(0, -1, false))
+        print(c.n, w.failed())
+        """, "3 false\n")
+
+// The latch: a write that overruns sets a flag the *required* trait reports, and nothing in between
+// had to return or check anything. A sink that can fail is where the two blocks earn their
+// separation -- `Fallible` carries the answer and `Writer` carries the writing.
+@test("latches a failure the writes themselves do not report")
+dsp_latches_a_failure_the_writes_do_not_report()
+    dsp_prints(raw"""
+        struct Cap
+            n: usize
+            over: bool
+        impl Fallible for Cap
+            override failed(*self) -> bool = self.over
+
+        impl Writer for Cap
+            write(*self, bytes: []const u8)
+                self.n += bytes.len
+                if self.n > 4usize then self.over = true
+        var c: Cap
+        var w: *Writer = &c
+        display_str("abc", w, FormatSpec(0, -1, false))
+        print(w.failed())
+        display_str("defg", w, FormatSpec(0, -1, false))
+        print(w.failed())
+        """, "false\ntrue\n")
+
+@test("takes a value's own display, so a program can choose where its text goes")
+dsp_takes_a_values_own_display()
+    dsp_prints(dsp_point() + raw"""
+        struct Counter
+            n: usize
+        impl Fallible for Counter
+
+        impl Writer for Counter
+            write(*self, bytes: []const u8)
+                self.n += bytes.len
+        var c: Counter
+        var w: *Writer = &c
+        Point(10, 20).display(w, FormatSpec(0, -1, false))
+        print(c.n)
+        """, "8\n")
+
+// ---- the sink the library supplies ----
+//
+// `ByteSink` exists because a specifier describes the field the WHOLE value occupies, so an
+// implementation rendering more than one part has to know what those parts came to before it can
+// pad once. What a sink is for is the case where the *bytes* are wanted rather than the width.
+
+@test("keeps what is written into it")
+dsp_keeps_what_is_written_into_it()
+    dsp_prints(raw"""
+        var g = byte_sink()
+        var w: *Writer = &g
+        display_str("abc", w, FormatSpec(0, -1, false))
+        display_int(45, w, FormatSpec(0, -1, false))
+        print(g.text().len, str(g.text()[0]), str(g.text()[4]))
+        """, "5 97 53\n")
+
+@test("reports no failure, having nothing to fail at")
+dsp_reports_no_failure()
+    dsp_prints(raw"""
+        var g = byte_sink()
+        var w: *Writer = &g
+        display_str("abc", w, FormatSpec(0, -1, false))
+        print(w.failed())
+        """, "false\n")
+
+@test("starts with nothing and grows to whatever is written")
+dsp_starts_with_nothing_and_grows()
+    dsp_prints(raw"""
+        var g = byte_sink()
+        var w: *Writer = &g
+        print(g.text().len)
+        for i in 0..<200 do display_str("xy", w, FormatSpec(0, -1, false))
+        print(g.text().len, str(g.text()[399]))
+        """, "0\n400 121\n")
+
+// The point of it: the three pieces are rendered plainly and the field applied to the whole, so
+// `%9s` pads once rather than three times.
+@test("lets an implementation put its whole rendering in one field")
+dsp_lets_an_implementation_put_its_rendering_in_one_field()
+    dsp_prints(raw"""
+        struct Pair
+            a: int
+            b: int
+        impl Display for Pair
+            display(self, out: *Writer, fmt: FormatSpec)
+                var g = byte_sink()
+                var plain = FormatSpec(0, -1, false)
+                display_int(long(self.a), &g, plain)
+                display_str(":", &g, plain)
+                display_int(long(self.b), &g, plain)
+                display_pad(g.text(), out, fmt)
+            end display
+        print(f"[${Pair(1, 2)}%9s]")
+        print(f"[${Pair(1, 2)}%-9s]")
+        print(f"[${Pair(1, 2)}%2s]")
+        print(Pair(30, -4))
+        """, "[      1:2]\n[1:2      ]\n[1:2]\n30:-4\n")
+
+// A sink written into by two implementations in the same expression keeps them apart, since each is
+// a value of its own with its own buffer.
+@test("two of them do not run into each other")
+dsp_two_of_them_do_not_run_into_each_other()
+    dsp_prints(raw"""
+        var a = byte_sink()
+        var b = byte_sink()
+        display_str("left", &a, FormatSpec(0, -1, false))
+        display_str("right", &b, FormatSpec(0, -1, false))
+        print(a.text().len, b.text().len)
+        """, "4 5\n")
+
+// ---- a format specifier reaches the implementation ----
+
+// The parts are handed the neutral specifier rather than the one that arrived: `%-12.3s` describes
+// the field this *value* occupies, so applying it to each piece would pad three times.
+@test("an f-string hole hands its width, precision, and justification over")
+dsp_an_f_string_hole_hands_its_specifier_over()
+    dsp_prints(raw"""
+        struct W
+            n: int
+        impl Display for W
+            display(self, out: *Writer, fmt: FormatSpec)
+                var plain = FormatSpec(0, -1, false)
+                fmt.width.display(out, plain)
+                display_char(' ', out, plain)
+                fmt.prec.display(out, plain)
+                display_char(' ', out, plain)
+                fmt.left.display(out, plain)
+        print(f"${W(0)}%-12.3s")
+        """, "12 3 true\n")
+
+// `print` and `str` write no specifier, so what a `Display` gets is the neutral one -- and a width
+// of zero has to be distinguishable from a precision that was not written at all.
+@test("print and str hand over a neutral specifier")
+dsp_print_and_str_hand_over_a_neutral_specifier()
+    dsp_prints(raw"""
+        struct W
+            n: int
+        impl Display for W
+            display(self, out: *Writer, fmt: FormatSpec)
+                fmt.width.display(out, fmt)
+                display_char(' ', out, fmt)
+                fmt.prec.display(out, fmt)
+                display_char(' ', out, fmt)
+                fmt.left.display(out, fmt)
+        print(W(0))
+        print(str(W(0)))
+        """, "0 -1 false\n0 -1 false\n")
+
+// A wrapper whose whole rendering *is* one field's hands the specifier straight down, and the width
+// arrives where the text does.
+@test("is honoured by the renderer an implementation forwards it to")
+dsp_is_honoured_by_the_renderer_it_is_forwarded_to()
+    dsp_prints(raw"""
+        struct P
+            n: int
+        impl Display for P
+            display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+        print(f"[${P(7)}%10s]")
+        """, "[         7]\n")
+
+// An implementation is free to drop it, and then nothing pads: the specifier is something a
+// `Display` is told, not something applied around it.
+@test("leaves an implementation that ignores it rendering plainly")
+dsp_leaves_an_implementation_that_ignores_it_plain()
+    dsp_prints(raw"""
+        struct P
+            n: int
+        impl Display for P
+            display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, FormatSpec(0, -1, false))
+        print(f"[${P(7)}%10s]")
+        """, "[7]\n")
+
+// ---- a bounded type parameter ----
+
+// One body, three instantiations: two built-ins that render by the compiler's rule and a user type
+// that renders by its `impl`. If the bound were not doing the work, one of the three would have had
+// to be written differently.
+@test("renders whatever satisfies 'Display'")
+dsp_renders_whatever_satisfies_display()
+    dsp_prints(raw"""
+        struct P
+            v: int
+        impl Display for P
+            display(self, out: *Writer, fmt: FormatSpec) = self.v.display(out, fmt)
+        both[T: Display](a: T, b: T)
+            print(a)
+            print(str(b))
+        both(1, 2)
+        both("x", "y")
+        both(P(7), P(8))
+        """, "1\n2\nx\ny\n7\n8\n")
+
+@test("carries the bound down into another generic it calls")
+dsp_carries_the_bound_down_into_another_generic()
+    dsp_prints(raw"""
+        twice[T: Display](x: T)
+            print(x)
+            print(x)
+        once[T: Display](x: T) = twice(x)
+        once(5)
+        """, "5\n5\n")
+
+// ---- a slice renders its elements ----
+//
+// A slice of anything printable, which is one `impl[T: Display] Display for []T` rather than a case
+// per element type. The elements go straight to the writer as they are met, and a width -- the one
+// thing that needs a length before any byte is written -- is answered by rendering once into a sink
+// that counts and keeps nothing.
+
+@test("of a built-in")
+dsp_a_slice_of_a_built_in()
+    dsp_prints(raw"""
+        var a = [1, 2, 3]
+        print(a[..])
+        """, "[1, 2, 3]\n")
+
+@test("of strings, which are not scalars")
+dsp_a_slice_of_strings()
+    dsp_prints(raw"""
+        var a = ["a", "b"]
+        print(a[..])
+        """, "[a, b]\n")
+
+// The bound is doing the work: `Rect` renders by its own `impl` and nothing about slices knows
+// that, so an element type the library never heard of goes through the same one block.
+@test("of a user type, through that type's own impl")
+dsp_a_slice_of_a_user_type()
+    dsp_prints(raw"""
+        struct Rect
+            w: int
+            h: int
+        impl Display for Rect
+            display(self, out: *Writer, fmt: FormatSpec) = display_str("a rect", out, fmt)
+        var r = [Rect(3, 4), Rect(1, 2)]
+        print(r[..])
+        """, "[a rect, a rect]\n")
+
+// The impl satisfies its own bound, so a slice is an element type like any other.
+@test("of slices, which is the impl reaching itself")
+dsp_a_slice_of_slices()
+    dsp_prints(raw"""
+        var n = [[1, 2][..], [3, 4][..]]
+        print(n[..])
+        """, "[[1, 2], [3, 4]]\n")
+
+@test("with no elements at all")
+dsp_a_slice_with_no_elements()
+    dsp_prints(raw"""
+        var e: [0]int = []
+        print(e[..])
+        """, "[]\n")
+
+@test("and reached through an ordinary bound, not only through print")
+dsp_a_slice_reached_through_an_ordinary_bound()
+    dsp_prints(raw"""
+        show[T: Display](x: T) = print(x)
+        var a = [1, 2, 3]
+        show(a[..])
+        """, "[1, 2, 3]\n")
+
+@test("and through str, which is the other sink")
+dsp_a_slice_through_str()
+    dsp_prints(raw"""
+        var a = [1, 2, 3]
+        print(str(a[..]) + "!")
+        """, "[1, 2, 3]!\n")
+
+// A specifier describes the field the WHOLE value occupies, which for a slice is the part that
+// cannot be done in one pass. The width is 14 and the rendering is 9 bytes, so five spaces land on
+// whichever side the justification says; getting the count wrong in either direction moves them.
+@test("padded as one field, on the right")
+dsp_a_slice_padded_on_the_right()
+    dsp_prints(raw"""
+        var a = [1, 2, 3]
+        print(f"[${a[..]}%14s]")
+        """, "[     [1, 2, 3]]\n")
+
+@test("and on the left")
+dsp_a_slice_padded_on_the_left()
+    dsp_prints(raw"""
+        var a = [1, 2, 3]
+        print(f"[${a[..]}%-14s]")
+        """, "[[1, 2, 3]     ]\n")
+
+// The counting pass measures what the second pass writes, so an element whose rendering is not its
+// own length -- a user type whose text is nothing like its fields -- still pads correctly.
+@test("including where an element's text is unrelated to its value")
+dsp_a_slice_padded_where_the_text_is_unrelated()
+    dsp_prints(raw"""
+        struct Rect
+            w: int
+            h: int
+        impl Display for Rect
+            display(self, out: *Writer, fmt: FormatSpec) = display_str("a rect", out, fmt)
+        var r = [Rect(3, 4)]
+        print(f"[${r[..]}%12s]")
+        """, "[    [a rect]]\n")
+
+// A fixed array renders, and it renders ITSELF rather than through a view the reader had to know to
+// take: one `impl[const N: usize, T: Display] Display for [N]T` covers every length.
+@test("and a fixed-size array renders itself, at whatever length it is")
+dsp_a_fixed_size_array_renders_itself()
+    dsp_prints(raw"""
+        var a = [1, 2, 3]
+        print(a)
+        """, "[1, 2, 3]\n")
+    dsp_prints(raw"""
+        var a: [2]int = [7, 8]
+        print(a)
+        """, "[7, 8]\n")
+
+// The view still renders, and renders the same, since the block for an array is a delegation to the
+// one for a slice rather than a second copy of it.
+@test("and the view of it renders the same")
+dsp_the_view_of_an_array_renders_the_same()
+    dsp_prints(raw"""
+        var a = [1, 2, 3]
+        print(a[..])
+        """, "[1, 2, 3]\n")
+
+// An array whose *elements* do not render fails the covering block's CONDITION, which is the answer
+// a slice of them gets -- the element is named, because the element is the part a reader can act on.
+@test("while an array whose elements do not render names the element")
+dsp_an_array_of_unprintable_elements_names_the_element()
+    dsp_refused(raw"""
+        struct P
+            v: int
+        var p: [1]P = [P(1)]
+        print(p)
+        """,
+        "cannot print a [1]P value — the 'impl' that covers it asks 'sysl.Display' of P, which does not implement it",
+        "4:1")
+
+// A nested one is answered one level at a time, exactly as a `[][]P` is: the block covering
+// `[2][1]P` asks `Display` of `[1]P`, and the block covering *that* is what asks it of `P`.
+@test("and a nested one names the array its own block asks about")
+dsp_a_nested_array_names_the_array_its_block_asks_about()
+    dsp_refused(raw"""
+        struct P
+            v: int
+        var p: [2][1]P = [[P(1)], [P(2)]]
+        print(p)
+        """,
+        "cannot print a [2][1]P value — the 'impl' that covers it asks 'sysl.Display' of [1]P, which does not implement it",
+        "4:1")
+
+// And an array of a type that *does* render needs no block of its own, which is the whole point of
+// one library block covering every length.
+@test("and an array of a printable user type renders")
+dsp_an_array_of_a_printable_user_type_renders()
+    dsp_prints(raw"""
+        struct P
+            v: int
+        impl Display for P
+            display(self, out: *Writer, fmt: FormatSpec) = display_str("p", out, fmt)
+        var p: [1]P = [P(1)]
+        print(p)
+        """, "[p]\n")
+
+// The element type is where the bound bites, and the message names the element rather than the
+// slice -- which is the part a reader can act on.
+@test("and a slice of something unprintable names the element")
+dsp_a_slice_of_something_unprintable_names_the_element()
+    dsp_refused(raw"""
+        struct P
+            v: int
+        var p = [P(1)]
+        print(p[..])
+        """,
+        "cannot print a []P value — the 'impl' that covers it asks 'sysl.Display' of P, which does not implement it",
+        "4:1")
+
+// A program's own `override` beats the library's block for one element type
+// (`reference/traits.md § override — when the overlap is deliberate`).
+@test("and a program may override it for a slice of its own type")
+dsp_a_program_may_override_it_for_a_slice_of_its_own_type()
+    dsp_prints(raw"""
+        struct P
+            v: int
+        override impl Display for []P
+            display(self, out: *Writer, fmt: FormatSpec) = display_str("points", out, fmt)
+        var p = [P(1), P(2)]
+        print(p[..])
+        """, "points\n")
+
+// ---- ownership ----
+//
+// A render owns the buffer it fills and the string it hands back, so the ordinary discipline has to
+// hold: a leak grows without bound and a double free crashes, and a long loop is what makes either
+// show up as something other than a passing test.
+
+@test("rendering in a loop neither leaks nor frees twice")
+dsp_rendering_in_a_loop_neither_leaks_nor_frees_twice()
+    dsp_prints(dsp_point() + raw"""
+        var i = 0
+        var total: usize = 0
+        while i < 200000
+            total += str(Point(i, i)).len
+            i++
+        print(total)
+        """, "2977780\n")
+
+// The rendered value holds a count of its own, so the render has to leave it exactly where it found
+// it: the receiver is borrowed by the call, not consumed by it.
+@test("a value carrying a string is rendered without disturbing its count")
+dsp_a_value_carrying_a_string_keeps_its_count()
+    dsp_prints(raw"""
+        struct Tag
+            name: string
+            n: int
+        impl Display for Tag
+            display(self, out: *Writer, fmt: FormatSpec)
+                display_str(self.name, out, fmt)
+                self.n.display(out, fmt)
+        var i = 0
+        var total: usize = 0
+        while i < 200000
+            var t = Tag("tag" + "!", i)
+            total += str(t).len
+            total += str(t).len
+            i++
+        print(total)
+        """, "3777780\n")
+
+@test("printing in a loop reaches the impl every time")
+dsp_printing_in_a_loop_reaches_the_impl_every_time()
+    dsp_prints(raw"""
+        struct T
+            n: int
+        impl Display for T
+            display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+        var i = 0
+        while i < 3
+            print(T(i))
+            i++
+        """, "0\n1\n2\n")
+
+// ---- an integer wider than 64 bits ----
+//
+// Integers past 64 bits reach renderers of their own: C never had a conversion wider than `%lld`, so
+// these work the digits out against a frame-local buffer, which is also what keeps them inside
+// `Display`'s allocation-free promise.
+
+@test("renders every unsigned digit, to the full width of the type")
+dsp_renders_every_unsigned_digit()
+    dsp_prints(dsp_wide() + raw"""
+        print(W(u128(0)))
+        print(W(u128(7)))
+        print(W(u128(10)))
+        print(W(340282366920938463463374607431768211455))
+        """, "0\n7\n10\n340282366920938463463374607431768211455\n")
+
+// The most negative value is the case a magnitude taken in the value's own type gets wrong: negating
+// it overflows, so the digits are worked out in the unsigned domain instead.
+@test("renders a signed one, including the value that cannot be negated")
+dsp_renders_a_signed_one()
+    dsp_prints(dsp_wide() + raw"""
+        print(S(i128(0)))
+        print(S(i128(42)))
+        print(S(i128(-42)))
+        print(S(170141183460469231731687303715884105727))
+        print(S(-170141183460469231731687303715884105728))
+        """, "0\n42\n-42\n170141183460469231731687303715884105727\n-170141183460469231731687303715884105728\n")
+
+// The padding is `display_digits`', not each renderer's, so a wide value fills a field exactly as a
+// narrow one does -- sign inside the width, and justification either way.
+@test("fills a field the same way a narrow one does")
+dsp_fills_a_field_the_same_way_a_narrow_one_does()
+    dsp_prints(dsp_wide() + raw"""
+        print(f"[${W(u128(42))}%8s]")
+        print(f"[${S(i128(-42))}%8s]")
+        print(f"[${W(u128(42))}%-8s]")
+        print(f"[${W(u128(0))}%4s]")
+        """, "[      42]\n[     -42]\n[42      ]\n[   0]\n")
+
+// Wider still keeps the path that renders through the digits `str` writes. Nothing here is a width
+// to widen to, so a buffer sized from the receiver would be what covered it, and a fixed array's
+// length cannot be written in terms of one.
+@test("beyond 128 bits it still renders, through the digits")
+dsp_beyond_128_bits_it_still_renders()
+    dsp_prints(raw"""
+        struct H
+            n: u256
+        impl Display for H
+            display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+        print(H(u256(12345)))
+        print(f"[${H(u256(7))}%4s]")
+        """, "12345\n[   7]\n")
+
+// ---- a view of a temporary ----
+//
+// Not the reference's cases: the slice-of-slices program above is where this compiler stopped
+// answering, and these are what it reduces to. A binding that views an array nobody named is joined
+// with its own view on every round of the escape pass, so the view has to come out the same the
+// second time or the pass never ends. Both outputs are the reference's.
+
+@test("a binding that views a temporary array is settled, and the program runs")
+dsp_a_view_of_a_temporary_is_settled()
+    dsp_prints(raw"""
+        var s = [1, 2][..]
+        print(s[0])
+        """, "1\n")
+
+@test("and so is one that views two of them")
+dsp_a_view_of_two_temporaries_is_settled()
+    dsp_prints(raw"""
+        var n = [[1, 2][..], [3, 4][..]]
+        print(n[1][0])
+        """, "3\n")
