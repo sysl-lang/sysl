@@ -1,0 +1,900 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, read_bytes, read_text, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{join, Search}
+
+// `sysl build-c` and `sysl emit-header` -- the archive and the header a C project is handed
+// (`reference/ffi.md § @export`), the reference's `ExportCliTests`, driven through the same `run_cli`
+// a shell reaches.
+//
+// **The tests that matter are the ones a C compiler judges.** Everything read off the header proves
+// only that sysl agrees with itself; what nothing else answers is whether clang accepts the header,
+// whether its linker resolves the symbol out of the archive, and whether the value that comes back is
+// the one the sysl function computed. So those tests write a C `main`, build it with clang against
+// both artifacts, run it, and read the answer.
+//
+// Every expected line was read out of the reference (0.0.152) on the same project, and each archive's
+// header, defined symbols, members and C caller's output were compared between the two compilers
+// before these were written. Each test works in a directory of its own and removes it.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ecl_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end ecl_ready
+
+private ecl_has(said: string, part: string) -> bool = said.index_of(part).is_some()
+
+// What one command line came to: the status the shell hears, and every line the driver said.
+private ecl_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end ecl_run
+
+// A project root holding the module `mylib` in `mylib/lib.sysl`, as the reference's `rootOf` does.
+private ecl_project(text: string) -> string
+    val root = make_temp_dir("sysl-ecl-").unwrap()
+
+    make_dir_all(s"$root/mylib").unwrap()
+    write_text(s"$root/mylib/lib.sysl", text).unwrap()
+    root
+end ecl_project
+
+// `build-c` over a root, the archive at `<root>/libmylib.a`: what it said, having succeeded.
+private ecl_build_c(root: string) -> string
+    val got = ecl_run(["sysl", "build-c", root, "-o", s"$root/libmylib.a"])
+
+    assert(got.0 == 0, got.1)
+    got.1
+end ecl_build_c
+
+// The same with `--lto <mode>` on the command line.
+private ecl_build_c_lto(root: string, mode: string) -> string
+    val got = ecl_run(["sysl", "build-c", root, "-o", s"$root/libmylib.a", "--lto", mode])
+
+    assert(got.0 == 0, got.1)
+    got.1
+end ecl_build_c_lto
+
+private ecl_header(root: string) -> string = read_text(s"$root/libmylib.a.h").unwrap()
+
+private ecl_exited_zero(s: Status) -> bool = s match
+    Exited(code) -> code == 0
+    _ -> false
+
+// A C `main` written beside the archive, built by clang against it with `flags` in front, and run:
+// what it printed, trimmed. The header is included by its name, the source sitting beside it.
+private ecl_c_run(root: string, source: string, flags: []string) -> string
+    write_text(s"$root/main.c", source).unwrap()
+
+    var args: Buf[string] = buf()
+
+    for i in 0..<flags.len
+        args.push(flags[i])
+
+    args.push(s"$root/main.c")
+    args.push(s"$root/libmylib.a")
+    args.push("-o")
+    args.push(s"$root/caller")
+
+    val built = capture("clang", args.view(), "", [], true).unwrap()
+
+    assert(ecl_exited_zero(built.status), built.err.unwrap_or(built.text))
+
+    val ran = capture(s"$root/caller", [], "", [], true, 20).unwrap()
+
+    assert(ecl_exited_zero(ran.status), ran.err.unwrap_or(ran.text))
+    ran.text.trim()
+end ecl_c_run
+
+// The names of the archive's members.
+private ecl_members(archive: string) -> Buf[string]
+    var names: Buf[string] = buf()
+    val members = ar_members(read_bytes(archive).unwrap()).unwrap()
+
+    for i in 0..<members.len()
+        names.push(members.at(i).name)
+
+    names
+end ecl_members
+
+private ecl_holds(xs: Buf[string], x: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == x then return true
+
+    false
+end ecl_holds
+
+// The first four bytes of the member holding the sysl code.
+private ecl_code_head(archive: string) -> Buf[u8]
+    val members = ar_members(read_bytes(archive).unwrap()).unwrap()
+    var head: Buf[u8] = buf()
+
+    for i in 0..<members.len()
+        if members.at(i).name == SyslibCodeMember
+            for j in 0usize..<4
+                head.push(members.at(i).body.at(j))
+
+    head
+end ecl_code_head
+
+// The bytes as a failure message shows them.
+private ecl_hex(h: Buf[u8]) -> string
+    var out = ""
+
+    for i in 0..<h.len()
+        out = out + s" ${u32(h.at(i))}"
+
+    out
+end ecl_hex
+
+// Whether the bytes begin as a native object this machine's linkers read without LLVM's plugin: ELF,
+// or 64-bit Mach-O in either byte order.
+private ecl_native(h: Buf[u8]) -> bool =
+    h.len() == 4 && ((h.at(0) == 0x7f && h.at(1) == 0x45 && h.at(2) == 0x4c && h.at(3) == 0x46) ||
+                     (h.at(0) == 0xcf && h.at(1) == 0xfa && h.at(2) == 0xed && h.at(3) == 0xfe) ||
+                     (h.at(0) == 0xfe && h.at(1) == 0xed && h.at(2) == 0xfa && h.at(3) == 0xcf))
+
+// Whether they begin as LLVM bitcode: the raw bitstream's `BC 0xC0DE`, or Apple's wrapper's
+// `0x0B17C0DE` little-endian.
+private ecl_bitcode(h: Buf[u8]) -> bool =
+    h.len() == 4 && ((h.at(0) == 0x42 && h.at(1) == 0x43 && h.at(2) == 0xc0 && h.at(3) == 0xde) ||
+                     (h.at(0) == 0xde && h.at(1) == 0xc0 && h.at(2) == 0x17 && h.at(3) == 0x0b))
+
+// -- the modules ----------------------------------------------------------------------------------
+
+// A boundary layer: free functions, scalars, no module storage that has to be computed.
+private ecl_boundary() -> string = raw"""
+    module mylib
+
+    @export("mylib_add")
+    add(a: i32, b: i32) -> i32 = a + b
+
+    @export("mylib_scale")
+    scale(a: i32, by: i32) -> i32 = a * by
+
+    helper(n: i32) -> i32 = n + 1
+    """
+
+// One `print`, which makes the object refer to the standard module's `sysl$prints` -- whether that
+// is IN the archive is the only question a C project asks of this command.
+private ecl_talkative() -> string = raw"""
+    module mylib
+
+    @export("mylib_greet")
+    greet(n: i32) =
+        print("hello", n)
+    """
+
+// A HEADERLESS module that keeps state: a lone top-level `var` in a file with no `module` header
+// would be a body's local in a program, and `build-c` has no body.
+private ecl_stateful() -> string = raw"""
+    var counter: i32 = 0
+
+    @export("bump_set")
+    bump_set(n: i32)
+        counter = n
+    end bump_set
+
+    @export("bump_get")
+    bump_get() -> i32 = counter
+    """
+
+private ecl_vectors() -> string = raw"""
+    module mylib
+
+    @export("mylib_vec2")
+    struct Vec2
+        x: i32
+        y: i32
+
+    @export("mylib_add_vec")
+    add(a: Vec2, b: Vec2) -> Vec2 = Vec2(a.x + b.x, a.y + b.y)
+    """
+
+private ecl_handles() -> string = raw"""
+    module mylib
+
+    @export("mylib_handle")
+    opaque struct Handle
+        name: string
+        n: int
+
+    @export("mylib_count")
+    count(h: *Handle) -> int = h.n
+    """
+
+private ecl_aliases() -> string = raw"""
+    module mylib
+
+    @export("slate_value")
+    type Handle = u64
+
+    @export("slate_vm")
+    opaque struct Vm
+        base: u64
+
+    @export("slate_vm_ref")
+    type VmRef = *Vm
+
+    @export("slate_pair")
+    struct Pair
+        a: Handle
+        each: *extern(Handle) -> Handle
+
+    var vm: Vm = Vm(100)
+
+    @export("slate_open")
+    open() -> VmRef = &vm
+
+    @export("slate_int")
+    int_of(h: VmRef, n: i64) -> Handle = h.base + u64(n)
+
+    @export("slate_apply")
+    apply(p: *Pair) -> Handle = p.each(p.a)
+    """
+
+private ecl_callbacks() -> string = raw"""
+    module mylib
+
+    @export("mylib_each")
+    each(xs: *i32, n: usize, f: *extern(i32) -> unit)
+        for i in 0..<n do f(xs[i])
+
+    @export("mylib_sink")
+    struct Sink
+        put: *extern(i32) -> unit
+        n: i32
+
+    @export("mylib_emit")
+    emit(s: *Sink) = s.put(s.n)
+
+    @export("mylib_hook")
+    hook(f: *extern(i32) -> unit) -> *extern(i32) -> unit = f
+    """
+
+// A `Buf` at module scope: computed storage, which an archive has no `main` to fill.
+private ecl_counted() -> string = raw"""
+    module mylib
+
+    import sysl.buf.{Buf, buf}
+
+    val squares: Buf[i32] = fill()
+
+    fill() -> Buf[i32]
+        var b: Buf[i32] = buf()
+
+        for i in 1..<4
+            b.push(i32(i) * i32(i))
+
+        b
+
+    @export("mylib_count")
+    count() -> i32 = i32(squares.len())
+
+    @export("mylib_at")
+    at(i: i32) -> i32 = squares[usize(i)]
+    """
+
+// A closure at module scope: a counted reference the constructor has to take a count of.
+private ecl_callback() -> string = raw"""
+    module mylib
+
+    import sysl.buf.{Buf, buf}
+
+    var seen: Buf[i32] = buf()
+
+    var sink: &Fn(i32) -> unit = (n) -> seen.push(n * 2)
+
+    @export("mylib_fire")
+    fire(n: i32) = sink(n)
+
+    @export("mylib_last")
+    last() -> i32 = if seen.len() == 0 then -1 else seen[seen.len() - 1]
+    """
+
+// The C caller of `ecl_boundary`, shared by the four links of it.
+private ecl_boundary_caller() -> string = raw"""
+    #include <stdio.h>
+    #include "libmylib.a.h"
+
+    int main(void) {
+        printf("%d %d\n", mylib_add(2, 3), mylib_scale(4, 5));
+        return 0;
+    }
+    """
+
+// -- the header and the archive -------------------------------------------------------------------
+
+// Both exports go, not just the one that touches the storage: a fix that only re-rooted the reaching
+// function would still pass a one-export test.
+@test("a header-less module that keeps state still exports, and exports all of it")
+ecl_headerless_state_exports_all()
+    if !ecl_ready() then return
+
+    val root = make_temp_dir("sysl-ecl-").unwrap()
+
+    write_text(s"$root/main.sysl", ecl_stateful()).unwrap()
+    ecl_build_c(root)
+
+    val header = ecl_header(root)
+
+    assert(ecl_has(header, "void bump_set(int32_t n);"), header)
+    assert(ecl_has(header, "int32_t bump_get(void);"), header)
+    assert(!ecl_has(header, "exports nothing"), header)
+    remove_dir_all(root).unwrap_or(())
+
+// Both symbols are DEFINED in the archive rather than merely declared in the header, which is what
+// the C project's linker will ask.
+@test("and the storage it keeps is the module's, reachable from both")
+ecl_state_is_the_modules()
+    if !ecl_ready() then return
+
+    val root = make_temp_dir("sysl-ecl-").unwrap()
+
+    write_text(s"$root/main.sysl", ecl_stateful()).unwrap()
+    ecl_build_c(root)
+
+    val listed = capture("nm", [s"$root/libmylib.a"], "", [], true).unwrap()
+
+    assert(ecl_has(listed.text, "bump_set"), listed.text)
+    assert(ecl_has(listed.text, "bump_get"), listed.text)
+    remove_dir_all(root).unwrap_or(())
+
+// The two lines are the reference's, in its order: the paths written, then what to link with.
+@test("build-c writes an archive and a header beside it")
+ecl_writes_archive_and_header()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_boundary())
+    val said = ecl_build_c(root)
+
+    assert(exists(s"$root/libmylib.a"), said)
+    assert(exists(s"$root/libmylib.a.h"), said)
+    assert(ecl_has(said, s"wrote $root/libmylib.a\nwrote $root/libmylib.a.h\nsysl: link this against: m"),
+           said)
+    remove_dir_all(root).unwrap_or(())
+
+@test("the header declares each export under the symbol it named")
+ecl_header_declares_each_export()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_boundary())
+
+    ecl_build_c(root)
+
+    val text = ecl_header(root)
+
+    assert(ecl_has(text, "int32_t mylib_add(int32_t a, int32_t b);"), text)
+    assert(ecl_has(text, "int32_t mylib_scale(int32_t a, int32_t by);"), text)
+    remove_dir_all(root).unwrap_or(())
+
+@test("and does not declare what was not exported")
+ecl_header_omits_the_unexported()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_boundary())
+
+    ecl_build_c(root)
+
+    val text = ecl_header(root)
+
+    assert(!ecl_has(text, "helper"), text)
+    remove_dir_all(root).unwrap_or(())
+
+// The include guard is named for the project's directory where it has no manifest -- the
+// reference's spelling, so the two headers are the same bytes.
+@test("the header's guard is named for the project, not for the archive")
+ecl_guard_names_the_project()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_boundary())
+
+    ecl_build_c(root)
+
+    val text = ecl_header(root)
+
+    // `sysl-ecl-…` upper-cased with its dashes made underscores, and never the archive's name.
+    assert(ecl_has(text, "#ifndef SYSL_SYSL_ECL_"), text)
+    assert(!ecl_has(text, "LIBMYLIB_A"), text)
+    remove_dir_all(root).unwrap_or(())
+
+// The directory it names does not exist yet, and is made.
+@test("--header puts it somewhere else")
+ecl_header_flag_moves_it()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_boundary())
+    val got = ecl_run(["sysl", "build-c", root, "-o", s"$root/libmylib.a", "--header",
+                       s"$root/include/mylib.h"])
+
+    assert(got.0 == 0, got.1)
+    assert(exists(s"$root/include/mylib.h"), got.1)
+    remove_dir_all(root).unwrap_or(())
+
+// Printed rather than written, and the same bytes `build-c` writes for the same tree.
+@test("emit-header prints the same declarations without building anything")
+ecl_emit_header_prints()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_boundary())
+    val got = ecl_run(["sysl", "emit-header", root, "--no-std-lib"])
+
+    assert(got.0 == 0, got.1)
+    assert(ecl_has(got.1, "int32_t mylib_add(int32_t a, int32_t b);"), got.1)
+    assert(!exists(s"$root/libmylib.a"), got.1)
+
+    ecl_build_c(root)
+    assert(ecl_header(root) == s"${got.1}\n", got.1)
+    remove_dir_all(root).unwrap_or(())
+
+// A module with no entry point still has to compile, and it would have been pruned to nothing if an
+// export were not a reachability root.
+@test("a module with no statements and no 'main' builds, because the exports are the roots")
+ecl_no_main_builds()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_boundary())
+
+    ecl_build_c(root)
+    assert(exists(s"$root/libmylib.a"), root)
+    remove_dir_all(root).unwrap_or(())
+
+@test("a C program links against the archive and gets the answers sysl computed")
+ecl_c_program_links()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_boundary())
+
+    ecl_build_c(root)
+    assert_eq(ecl_c_run(root, ecl_boundary_caller(), []), "5 20")
+    remove_dir_all(root).unwrap_or(())
+
+// -- link-time optimization -----------------------------------------------------------------------
+
+// A project whose manifest asks for thin LTO -- slate's own shape.
+private ecl_lto_project() -> string
+    val root = ecl_project(ecl_boundary())
+
+    write_text(s"$root/package.hocon", "package { name = \"mylib\", version = \"0.1.0\" }\nlto = \"thin\"\n")
+        .unwrap()
+    root
+end ecl_lto_project
+
+// The manifest's `lto` is how the project's OWN link is done, and `build-c` does no link, so the
+// member is an object whatever the manifest says.
+@test("a project whose manifest asks for LTO still archives a native object, not bitcode")
+ecl_manifest_lto_still_native()
+    if !ecl_ready() then return
+
+    val root = ecl_lto_project()
+
+    ecl_build_c(root)
+
+    val head = ecl_code_head(s"$root/libmylib.a")
+
+    assert(ecl_native(head), s"the first bytes of the code member:${ecl_hex(head)}")
+    remove_dir_all(root).unwrap_or(())
+
+// Checked before anything is read, so a path that does not exist is not what `full` is told about.
+@test("'--lto' on the build-c command line is parsed, and a mode clang does not have is refused")
+ecl_lto_flag_parsed()
+    val medium = ecl_run(["sysl", "build-c", "/somewhere", "--lto", "medium"])
+
+    assert(medium.0 == 2, medium.1)
+    assert(ecl_has(medium.1, "'--lto medium' names no kind of link-time optimization clang has — it " +
+                   "is thin or full"), medium.1)
+
+    val full = ecl_run(["sysl", "build-c", "/somewhere", "--lto", "full"])
+
+    assert(!ecl_has(full.1, "link-time optimization"), full.1)
+
+    val thin = ecl_run(["sysl", "build-c", "/somewhere", "--lto", "thin"])
+
+    assert(!ecl_has(thin.1, "link-time optimization"), thin.1)
+
+@test("build-c's own help lists '--lto', saying the archive is native objects without it")
+ecl_help_lists_lto()
+    val got = ecl_run(["sysl", "build-c"])
+
+    assert(got.0 == 2, got.1)
+    assert(ecl_has(got.1, "--lto"), got.1)
+    assert(ecl_has(got.1, "native objects"), got.1)
+
+// A manifest that says nothing about LTO, archived with `--lto thin`: what `build` compiles under
+// that mode, and the advice line is half the contract.
+@test("a project archived with '--lto thin' holds bitcode, and build-c says how it must be linked")
+ecl_lto_thin_is_bitcode()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_boundary())
+
+    write_text(s"$root/package.hocon", "package { name = \"mylib\", version = \"0.1.0\" }\n").unwrap()
+
+    val said = ecl_build_c_lto(root, "thin")
+    val head = ecl_code_head(s"$root/libmylib.a")
+
+    assert(ecl_bitcode(head), s"the first bytes of the code member:${ecl_hex(head)}")
+    assert(ecl_has(said, "sysl: this archive is LLVM bitcode: link it with clang and lld " +
+                   "(-fuse-ld=lld), or with a linker that carries LLVM's plugin"), said)
+    remove_dir_all(root).unwrap_or(())
+
+@test("and without the flag build-c gives no bitcode advice, whatever the manifest's 'lto' says")
+ecl_no_flag_no_advice()
+    if !ecl_ready() then return
+
+    val root = ecl_lto_project()
+    val said = ecl_build_c(root)
+
+    assert(!ecl_has(said, "LLVM bitcode"), said)
+    remove_dir_all(root).unwrap_or(())
+
+// The link the advice names. Skipped where this machine's clang cannot reach lld at all, which is
+// found out on a trivial program first so that a missing linker is never read as a bad archive.
+@test("a C program links against a '--lto thin' archive with clang and lld")
+ecl_lld_links_thin_archive()
+    if !ecl_ready() then return
+
+    val probe = make_temp_dir("sysl-ecl-lld-").unwrap()
+
+    write_text(s"$probe/p.c", "int main(void) { return 0; }\n").unwrap()
+
+    val linked = capture("clang", ["-fuse-ld=lld", s"$probe/p.c", "-o", s"$probe/p"], "", [], true)
+        .unwrap()
+
+    remove_dir_all(probe).unwrap_or(())
+
+    if !ecl_exited_zero(linked.status)
+        print("skipped: clang cannot link with lld here")
+        return
+    end if
+
+    val root = ecl_project(ecl_boundary())
+
+    write_text(s"$root/package.hocon", "package { name = \"mylib\", version = \"0.1.0\" }\n").unwrap()
+    ecl_build_c_lto(root, "thin")
+
+    // The C side is compiled natively: what is under test is lld reading the archive's bitcode.
+    assert_eq(ecl_c_run(root, ecl_boundary_caller(), ["-fuse-ld=lld"]), "5 20")
+    remove_dir_all(root).unwrap_or(())
+
+// The same archive through the system linker -- no `-fuse-ld=lld`, which was the one link that could
+// read the bitcode the manifest's `lto` used to put here.
+@test("a C program links against an archive built under the manifest's LTO with the system linker")
+ecl_system_linker_links_manifest_lto()
+    if !ecl_ready() then return
+
+    val root = ecl_lto_project()
+
+    ecl_build_c(root)
+    assert_eq(ecl_c_run(root, ecl_boundary_caller(), []), "5 20")
+    remove_dir_all(root).unwrap_or(())
+
+// -- what else the link line needs ----------------------------------------------------------------
+
+// A module `pkg-config` on this machine knows about, when it knows about any -- the first word of
+// `--list-all`'s first line, which makes the case independent of what is installed.
+private ecl_some_pc_module() -> Option[string]
+    val listed = capture("pkg-config", ["--list-all"], "", [], true)
+
+    if listed.is_err() || !ecl_exited_zero(listed.unwrap().status) then return None
+
+    val first = listed.unwrap().text.trim()
+
+    if first.is_empty() then return None
+
+    val space = first.index_of(" ")
+
+    Some(if space.is_some() then first[0..<space.unwrap()] else first)
+end ecl_some_pc_module
+
+// A package binds an installed library through `pkg_config` and need say `@link` nowhere, so the
+// directives alone are not the link line.
+@test("the link advice names the pkg-config modules the manifest requires, which '@link' never sees")
+ecl_advice_names_pkg_config()
+    if !ecl_ready() then return
+
+    val pc = ecl_some_pc_module()
+
+    if pc.is_none()
+        print("skipped: pkg-config knows of no module here")
+        return
+    end if
+
+    val root = ecl_project(ecl_boundary())
+
+    write_text(s"$root/package.hocon", "package { name = \"mylib\", version = \"0.1.0\" }\n" +
+               s"requires { pkg_config { ${pc.unwrap()} = \"the library this test found installed\" } }\n")
+        .unwrap()
+
+    val said = ecl_build_c(root)
+
+    assert(ecl_has(said, "sysl: and against what the packages require, which pkg-config answers " +
+                   s"for: pkg-config --libs ${pc.unwrap()}"), said)
+    remove_dir_all(root).unwrap_or(())
+
+// -- the types a header names ---------------------------------------------------------------------
+
+@test("the header names a struct what its '@export' said, not what the module path derives")
+ecl_header_names_struct_as_exported()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_vectors())
+
+    ecl_build_c(root)
+
+    val text = ecl_header(root)
+
+    assert(ecl_has(text, "} mylib_vec2;"), text)
+    assert(ecl_has(text, "mylib_vec2 mylib_add_vec(mylib_vec2 a, mylib_vec2 b);"), text)
+    assert(!ecl_has(text, "mylib_Vec2"), text)
+    remove_dir_all(root).unwrap_or(())
+
+// The name is only worth anything if a C compiler takes it: clang declares a `mylib_vec2` of its own,
+// fills it, hands it over by value and reads the result back.
+@test("and a C program declares that struct by that name, fills it and gets sysl's answer back")
+ecl_c_fills_named_struct()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_vectors())
+
+    ecl_build_c(root)
+
+    val caller = raw"""
+        #include <stdio.h>
+        #include "libmylib.a.h"
+
+        int main(void) {
+            mylib_vec2 a = { 1, 2 };
+            mylib_vec2 b = { 10, 20 };
+            mylib_vec2 c = mylib_add_vec(a, b);
+            printf("%d %d\n", c.x, c.y);
+            return 0;
+        }
+        """
+
+    assert_eq(ecl_c_run(root, caller, []), "11 22")
+    remove_dir_all(root).unwrap_or(())
+
+// An `opaque` struct is incomplete to everything outside its module, and a C caller is outside every
+// module: a tag with no body, and a `string` field -- which has no C spelling -- never written.
+@test("the header declares an 'opaque' struct incomplete, and lays out none of its fields")
+ecl_opaque_struct_incomplete()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_handles())
+
+    ecl_build_c(root)
+
+    val text = ecl_header(root)
+
+    assert(ecl_has(text, "typedef struct mylib_handle mylib_handle;\n"), text)
+    assert(ecl_has(text, "int32_t mylib_count(mylib_handle * h);"), text)
+    assert(!ecl_has(text, "no C spelling"), text)
+    assert(!ecl_has(text, "typedef struct {"), text)
+    remove_dir_all(root).unwrap_or(())
+
+@test("and a C program holding only a pointer to that handle compiles and links against it")
+ecl_c_holds_opaque_pointer()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_handles())
+
+    ecl_build_c(root)
+
+    val caller = raw"""
+        #include <stdio.h>
+        #include "libmylib.a.h"
+
+        int main(int argc, char **argv) {
+            mylib_handle *h = NULL;
+            if (argc > 99) printf("%d\n", (int) mylib_count(h));
+            return 0;
+        }
+        """
+
+    assert_eq(ecl_c_run(root, caller, ["-Werror"]), "")
+    remove_dir_all(root).unwrap_or(())
+
+// An exported `type` is a `typedef`, used by name in a prototype, a field, a function pointer's
+// parameter and -- as a pointer -- where a handle is passed.
+@test("an exported 'type' is a typedef the header declares and every position spells")
+ecl_exported_type_is_typedef()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_aliases())
+
+    ecl_build_c(root)
+
+    val text = ecl_header(root)
+
+    assert(ecl_has(text, "typedef uint64_t slate_value;\n"), text)
+    assert(ecl_has(text, "typedef slate_vm * slate_vm_ref;\n"), text)
+    assert(ecl_has(text, "slate_value slate_int(slate_vm_ref h, int64_t n);"), text)
+    assert(ecl_has(text, "\tslate_value a;"), text)
+    assert(ecl_has(text, "\tslate_value (*each)(slate_value);"), text)
+    assert(!ecl_has(text, "no C spelling"), text)
+    remove_dir_all(root).unwrap_or(())
+
+// `h.base` on a `VmRef` reads through the pointer the alias names, which this compiler refused
+// (`cannot read field 'base' of mylib.VmRef`) until `pointee` saw through an exported alias.
+@test("and a C program written against those names compiles under -Werror, links and runs")
+ecl_c_uses_typedef_names()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_aliases())
+
+    ecl_build_c(root)
+
+    val caller = raw"""
+        #include <stdio.h>
+        #include "libmylib.a.h"
+
+        static slate_value twice(slate_value v) { return v * 2; }
+
+        int main(void) {
+            slate_vm_ref vm = slate_open();
+            slate_value v = slate_int(vm, 23);
+            slate_pair p = { v, twice };
+            printf("%llu %llu\n", (unsigned long long) v, (unsigned long long) slate_apply(&p));
+            return 0;
+        }
+        """
+
+    assert_eq(ecl_c_run(root, caller, ["-Werror"]), "123 246")
+    remove_dir_all(root).unwrap_or(())
+
+// A function pointer in all three places a C declarator can hold one.
+@test("the header names a function pointer inside its declarator, as a parameter, a field and a result")
+ecl_function_pointer_declarators()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_callbacks())
+
+    ecl_build_c(root)
+
+    val text = ecl_header(root)
+
+    assert(ecl_has(text, "void mylib_each(int32_t * xs, uint64_t n, void (*f)(int32_t));"), text)
+    assert(ecl_has(text, "\tvoid (*put)(int32_t);"), text)
+    assert(ecl_has(text, "void (*mylib_hook(void (*f)(int32_t)))(int32_t);"), text)
+    remove_dir_all(root).unwrap_or(())
+
+@test("and a C program passes, stores and gets back a real callback, under -Werror")
+ecl_c_passes_callbacks()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_callbacks())
+
+    ecl_build_c(root)
+
+    val caller = raw"""
+        #include <stdio.h>
+        #include "libmylib.a.h"
+
+        static int32_t total = 0;
+
+        static void add(int32_t x) { total += x; }
+
+        int main(void) {
+            int32_t xs[3] = {1, 2, 3};
+            mylib_each(xs, 3, add);
+            mylib_sink s = { mylib_hook(add), 10 };
+            mylib_emit(&s);
+            printf("%d\n", (int) total);
+            return 0;
+        }
+        """
+
+    assert_eq(ecl_c_run(root, caller, ["-Werror"]), "16")
+    remove_dir_all(root).unwrap_or(())
+
+// -- the standard module inside the archive -------------------------------------------------------
+
+@test("a C program links an export that uses the standard library, which is the case a '.syslib' cannot serve")
+ecl_c_links_std_using_export()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_talkative())
+
+    ecl_build_c(root)
+
+    val caller = raw"""
+        #include "libmylib.a.h"
+
+        int main(void) {
+            mylib_greet(7);
+            return 0;
+        }
+        """
+
+    assert_eq(ecl_c_run(root, caller, []), "hello 7")
+    remove_dir_all(root).unwrap_or(())
+
+@test("and a closure it holds at module scope, which is what the card was filed from")
+ecl_closure_at_module_scope()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_callback())
+
+    ecl_build_c(root)
+
+    val caller = raw"""
+        #include <stdio.h>
+        #include "libmylib.a.h"
+
+        int main(void) {
+            printf("%d ", mylib_last());
+            mylib_fire(21);
+            printf("%d\n", mylib_last());
+            return 0;
+        }
+        """
+
+    assert_eq(ecl_c_run(root, caller, []), "-1 42")
+    remove_dir_all(root).unwrap_or(())
+
+// `1 4 9` and not zeros: an archive whose constructor never ran answers a length of nothing, and the
+// elements say the storage holds what sysl put there rather than merely something.
+@test("a C program reads module storage a constructor filled, which an archive has no 'main' to fill")
+ecl_constructor_fills_storage()
+    if !ecl_ready() then return
+
+    val root = ecl_project(ecl_counted())
+
+    ecl_build_c(root)
+
+    val caller = raw"""
+        #include <stdio.h>
+        #include "libmylib.a.h"
+
+        int main(void) {
+            printf("%d", mylib_count());
+            for (int i = 0; i < mylib_count(); i++) printf(" %d", mylib_at(i));
+            printf("\n");
+            return 0;
+        }
+        """
+
+    assert_eq(ecl_c_run(root, caller, []), "3 1 4 9")
+    remove_dir_all(root).unwrap_or(())
+
+// `library/sysl/fs/__<os>__/dirent.c` is in the module `sysl.fs`, the folder naming nothing -- so the
+// member is named for the module and the file, with no trace of which system's copy it was.
+@test("is a member of the archive, because build-c compiles the library into it")
+ecl_std_c_is_a_member()
+    if !ecl_ready() then return
+
+    val listing = raw"""
+        module mylib
+
+        import sysl.fs.entries
+
+        @export("mylib_count")
+        count() -> i32 = i32(entries("/tmp").unwrap().len())
+        """
+
+    val root = ecl_project(listing)
+
+    ecl_build_c(root)
+
+    val names = ecl_members(s"$root/libmylib.a")
+
+    assert(ecl_holds(names, "sysl.fs.dirent.o"), join(names.view(), " "))
+    remove_dir_all(root).unwrap_or(())
