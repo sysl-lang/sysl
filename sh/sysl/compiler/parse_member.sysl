@@ -206,6 +206,7 @@ parse_enum_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
         val before = p.report.len()
 
         if refuse_stray_member(p, first, InType) then ()
+        elif refuse_reserved_variant(p) then ()
         elif refuse_positional_payload(p) then ()
         elif at_enum_variant(p)
             decl.variants.push(parse_enum_variant(p))
@@ -240,8 +241,19 @@ end parse_enum_decl
 // The type is read and then put back, so nothing is taken and the fault lands on the name. It stands
 // aside for everything that is not this mistake: a named field stops at its `:`, empty brackets hold
 // no type, and a receiver -- `area(self)`, `write(*self, …)` -- is a member's.
+//
+// **A type the brackets never closed after is the same reading, kept**: `A([]u8` with the next line
+// under it is a payload still owed its `,` or its `)`, said where the type ended, and a type that
+// broke off partway -- `A([]Buf[int` -- is owed whatever the type was. Neither is put back, so the
+// complaint sits where the line stopped making sense rather than on the bracket the type opened
+// with. A lone name is left to the variant's own rule, which reads it as a field missing its `:`.
 private refuse_positional_payload(p: *Parser) -> bool
-    if !names_a_variant(p.peek()) || !p.kw_at(1, "(") then return false
+    if !names_a_variant(p.peek()) || !p.kw_at(1, "(") || opens_with_receiver(p) then return false
+
+    val named = names_a_field(p.peek_at(2))
+
+    if named && p.kw_at(3, ":") then return false
+    if !named && !opens_a_type(p) then return false
 
     val at = p.here()
     val tokens_at = p.mark()
@@ -251,17 +263,59 @@ private refuse_positional_payload(p: *Parser) -> bool
     p.bump()
     p.bump()
 
+    val type_at = p.mark()
     val typ = parse_type(p)
-    val fits = p.errors_at() == errors_at && (p.at_kw(")") || p.at_kw(","))
+    val clean = p.errors_at() == errors_at
+    val lone = named && p.mark() == type_at + 1
+    val closed = p.at_kw(")") || p.at_kw(",")
 
-    p.rewind(tokens_at, errors_at)
-    p.ph_count = placeholders
+    if clean && closed && !names_self(typ)
+        p.rewind(tokens_at, errors_at)
+        p.ph_count = placeholders
+        p.fault(at, positional_payload_refusal(typ))
+        return true
+    end if
 
-    if !fits || names_self(typ) then return false
+    if lone || closed || (clean && names_self(typ))
+        p.rewind(tokens_at, errors_at)
+        p.ph_count = placeholders
+        return false
+    end if
 
-    p.fault(at, positional_payload_refusal(typ))
+    if clean then p.want("','")
+
     true
 end refuse_positional_payload
+
+// Whether the brackets after a name open with a receiver: `self`, `*self`, `&self`, `&sync self`.
+private opens_with_receiver(p: *Parser) -> bool
+    if p.kw_at(2, "self") then return true
+    if !p.kw_at(2, "*") && !p.kw_at(2, "&") then return false
+
+    if p.kw_at(3, "self") then return true
+
+    p.peek_at(3) match
+        Ident(n) -> n == "sync" && p.kw_at(4, "self")
+        _ -> false
+end opens_with_receiver
+
+// Whether what the brackets after a name open with is a token only a type begins with: the bracket
+// of a slice or an array, the sigil of a pointer or a reference, `weak`, the bracket of a tuple or of
+// a vector.
+private opens_a_type(p: *Parser) -> bool =
+    p.kw_at(2, "[") || p.kw_at(2, "*") || p.kw_at(2, "&") || p.kw_at(2, "(") ||
+        p.kw_at(2, "weak") || p.kw_at(2, "<")
+
+// A reserved word written where a variant's name stands -- `val(x: int)`, `type()` -- refused as the
+// name it was meant as, with the backticks that would have let it stand. The rest of the line is
+// dropped by the caller, a payload under a name nothing can bind having nothing more to say. A line
+// that goes on as a member does is the member rule's, which says the same sentence.
+private refuse_reserved_variant(p: *Parser) -> bool
+    if !at_reserved_member_head(p) || !at_enum_variant(p) then return false
+
+    refuse_reserved_name(p, "a member's name")
+    true
+end refuse_reserved_variant
 
 private names_a_variant(t: Tok) -> bool = t match
     Ident(_) -> true
@@ -285,7 +339,11 @@ private positional_payload_refusal(typ: TypeRef) -> string =
 // value pinned to it, are variants and nothing else.
 private at_enum_variant(p: *Parser) -> bool
     if p.at_kw("@") || p.at_kw("private") || p.at_kw("static") then return false
-    if p.at_word("set") then return false
+    // `override` opens a member's line as a visibility does, and is refused there in words of its own.
+    if p.at_kw("override") && !at_reserved_member_head(p) then return false
+    // `set` is a name like any other, so `set`, `set = 3` and `set(x: int)` are variants; only a
+    // name after it makes the line a setter's.
+    if at_setter(p) then return false
 
     if !names_a_field(p.peek()) then return false
 
@@ -368,7 +426,9 @@ private parse_enum_variant(p: *Parser) -> EnumVariantDecl
             fields.push(parse_field_param(p))
 
             if !p.accept_kw(",") then break
-            if p.at_kw(")") then break
+            // A comma may trail the last field, so what follows one is a field only where it could
+            // name one; anything else is where the bracket should have closed.
+            if !names_a_field(p.peek()) then break
 
     p.expect_kw(")")
     EnumVariantDecl(start.to(p.just_taken()), name, None, fields)
@@ -665,6 +725,8 @@ parse_member_line(p: *Parser, out: *Buf[MethodDecl], site: MemberSite)
 
     if p.at_kw("override")
         if site != InImpl
+            // The complaint sits on what the word was written in front of, as the reference has it.
+            p.bump()
             p.fault(p.here(), "'override' says a member replaces a body its trait supplied, and it is written on that member inside the 'impl' block — a trait's own member is where a default is written rather than replaced, and a member of a type's body implements no trait")
             skip_line(p)
             return
@@ -698,7 +760,7 @@ const SetterValue: string = "$value"
 private parse_member(p: *Parser, start: Span, site: MemberSite) -> Option[MethodDecl]
     val signatures = site == InTrait
 
-    if at_setter(p) then return Some(parse_setter(p, start, signatures))
+    if at_setter(p) then return parse_setter(p, start, signatures)
     if p.at_kw("static") then return Some(parse_static_member(p, start, signatures))
 
     parse_member_named(p, start, site, parse_bound_name(p))
@@ -747,13 +809,23 @@ private at_reserved_member_head(p: *Parser) -> bool
 end at_reserved_member_head
 
 // `set width(w)` -- the member a write to a property reaches.
-private at_setter(p: *Parser) -> bool = p.at_word("set") && names_a_field(p.peek_at(1)) &&
-    p.kw_at(2, "(")
+//
+// **`set` is not a reserved word, and what makes it open a setter is the NAME after it.** Followed by
+// anything else it is the line's own name: a field `set: int`, a method `set(self, v: int)`, a
+// property `set -> int`, a variant `set`. A reserved word after it is not a name, so `set val(v)`
+// is a member called `set` with something wrong after it. Once a name has followed, the line is a
+// setter whatever comes next, and `set width` with no list is one owed its `(`.
+private at_setter(p: *Parser) -> bool = p.at_word("set") && names_a_variant(p.peek_at(1))
 
-private parse_setter(p: *Parser, start: Span, signatures: bool) -> MethodDecl
+private parse_setter(p: *Parser, start: Span, signatures: bool) -> Option[MethodDecl]
     p.bump()
 
     val name = parse_bound_name(p)
+
+    if !p.at_kw("(")
+        p.want("'('")
+        return None
+    end if
 
     p.bump()
 
@@ -774,7 +846,7 @@ private parse_setter(p: *Parser, start: Span, signatures: bool) -> MethodDecl
     end if
 
     decl.span = start.to(p.just_taken())
-    decl
+    Some(decl)
 end parse_setter
 
 // `static area -> real` -- a property of the type rather than of a value, and the associated

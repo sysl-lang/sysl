@@ -1,0 +1,333 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `set` is not a reserved word. It opens a setter only where a NAME follows it -- `set width(w)` --
+// and everywhere else it is the line's own name: a variant, a field, a method, a property, a local.
+//
+// **Every tree, message and position here was read out of the reference compiler (0.0.152)** by
+// handing the installed `sysl emit-ast --no-spans` the same text.
+
+// The complaint and where it points, as one string; empty where the text parses.
+private svn_said(text: string) -> string
+    val said = pf_err(text)
+
+    if said == "" then "" else s"${said} @ t.sysl:${pf_at(text)}"
+
+// A rendering without the newline its last line may or may not end in.
+private svn_no_last_newline(text: string) -> string =
+    if text.ends_with("\n") then text[0..<text.len - 1] else text
+
+// Whether a line of the reference's tree rendering says what a declaration IS: the node it opens,
+// a name, a pinned value, a receiver, and whether a member is a property.
+private svn_kept(line: string) -> bool =
+    line.starts_with("name: ") || line.starts_with("value: ") || line.starts_with("isProperty: ") ||
+        line.starts_with("receiver: By") || line == "receiver: None" ||
+        (line.starts_with("- ") && (line.ends_with("Decl") || line == "- Param"))
+
+// A line with its quotes taken off, so an expectation reads without escapes.
+private svn_unquoted(line: string) -> string
+    var out = ""
+    var last: usize = 0
+
+    for i in 0..<line.len
+        if line.bytes[i] == u8('"')
+            out = out + line[last..<i]
+            last = i + 1
+
+    out + line[last..<line.len]
+end svn_unquoted
+
+// The tree a text parses to, as the reference renders it, cut down to the lines `svn_kept` keeps --
+// each with its indentation and quotes removed, and a `|` after it. A refused text is `!` and its
+// message.
+private svn_shape(text: string) -> string
+    val r = parse(source_of("t.sysl", text))
+
+    if !r.ok() then return s"!${r.first().message}"
+
+    val tree = emit_ast(r.program, false)
+    var out = ""
+    var here: usize = 0
+
+    while here < tree.len
+        var stop = here
+
+        while stop < tree.len && tree.bytes[stop] != u8('\n')
+            stop += 1
+
+        var lead = here
+
+        while lead < stop && tree.bytes[lead] == u8(' ')
+            lead += 1
+
+        val line = tree[lead..<stop]
+
+        if svn_kept(line) then out = out + svn_unquoted(line) + "|"
+
+        here = stop + 1
+    end while
+
+    out
+end svn_shape
+
+// The whole of what the reference prints for `enum E`, `set`, `get`.
+private svn_two_variants() -> string =
+    "Program\n" +
+    "  body: \n" +
+    "    - EnumDecl\n" +
+    "        name: \"E\"\n" +
+    "        tparams: []\n" +
+    "        underlying: None\n" +
+    "        variants: \n" +
+    "          - EnumVariantDecl\n" +
+    "              name: \"set\"\n" +
+    "              value: None\n" +
+    "              fields: []\n" +
+    "          - EnumVariantDecl\n" +
+    "              name: \"get\"\n" +
+    "              value: None\n" +
+    "              fields: []\n" +
+    "        members: []\n" +
+    "        bounds: {}\n" +
+    "        vis: Public\n" +
+    "        tdefaults: {}\n" +
+    "        tvalues: {}\n" +
+    "        deriving: []\n" +
+    "  module: None\n" +
+    "  capabilities: []\n" +
+    "  links: []\n" +
+    "  source: t.sysl\n" +
+    "  testOnly: false\n" +
+    "  includes: []\n" +
+    "  docs: []\n"
+
+// -- a variant ----------------------------------------------------------------------------------------
+
+@test("a bare 'set' in an enum's body is a variant, and the tree is the reference's line for line")
+svn_a_bare_set_is_a_variant()
+    val r = parse(source_of("t.sysl", "enum E\n    set\n    get\n"))
+
+    assert(r.ok(), svn_said("enum E\n    set\n    get\n"))
+    assert_eq(svn_no_last_newline(emit_ast(r.program, false)), svn_no_last_newline(svn_two_variants()))
+    assert_eq(svn_shape("enum E\n    set\n"), "- EnumDecl|name: E|- EnumVariantDecl|name: set|value: None|")
+end svn_a_bare_set_is_a_variant
+
+@test("a 'set' variant takes a pinned value")
+svn_set_with_a_value()
+    assert_eq(svn_shape("enum E\n    set = 3\n    get = 4\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: set|value: IntLit|value: 3|- EnumVariantDecl|name: get|value: IntLit|value: 4|")
+
+@test("a 'set' variant takes a named payload, and empty brackets")
+svn_set_with_a_payload()
+    assert_eq(svn_shape("enum E\n    set(x: int)\n    get\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: set|value: None|- Param|name: x|name: int|- EnumVariantDecl|name: get|value: None|")
+    assert_eq(svn_shape("enum E\n    set()\n    get\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: set|value: None|- EnumVariantDecl|name: get|value: None|")
+end svn_set_with_a_payload
+
+@test("a 'set' variant stands among others, on any line of the body")
+svn_set_among_others()
+    assert_eq(svn_shape("enum E\n    A\n    set\n    B(y: int)\n    set2\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: A|value: None|- EnumVariantDecl|name: set|value: None|- EnumVariantDecl|name: B|value: None|- Param|name: y|name: int|- EnumVariantDecl|name: set2|value: None|")
+
+@test("a 'set' variant of a generic enum carries the enum's parameter")
+svn_set_in_a_generic_enum()
+    assert_eq(svn_shape("enum E[T]\n    set(v: T)\n    none\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: set|value: None|- Param|name: v|name: T|- EnumVariantDecl|name: none|value: None|")
+
+// -- a setter, and a member called `set`, in an enum --------------------------------------------------
+
+@test("a name after 'set' makes the line a setter in an enum's body, beside a 'set' variant too")
+svn_a_setter_in_an_enum()
+    assert_eq(svn_shape("enum E\n    A\n    set x(v)\n        ()\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: A|value: None|- MethodDecl|name: x$set|receiver: ByPtr|isProperty: false|- Param|name: v|name: $value|")
+    assert_eq(svn_shape("enum E\n    A\n    set\n    set x(v)\n        ()\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: A|value: None|- EnumVariantDecl|name: set|value: None|- MethodDecl|name: x$set|receiver: ByPtr|isProperty: false|- Param|name: v|name: $value|")
+    assert_eq(svn_shape("enum E\n    A\n    set set(v)\n        ()\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: A|value: None|- MethodDecl|name: set$set|receiver: ByPtr|isProperty: false|- Param|name: v|name: $value|")
+end svn_a_setter_in_an_enum
+
+@test("an enum's method, property and associated function may each be called 'set'")
+svn_an_enums_member_called_set()
+    assert_eq(svn_shape("enum E\n    A\n    set(self) -> int = 1\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: A|value: None|- MethodDecl|name: set|receiver: ByValue|isProperty: false|name: int|value: 1|")
+    assert_eq(svn_shape("enum E\n    A\n    set -> int = 1\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: A|value: None|- MethodDecl|name: set|receiver: None|isProperty: true|name: int|value: 1|")
+    assert_eq(svn_shape("enum E\n    set -> int = 1\n    A\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: A|value: None|- MethodDecl|name: set|receiver: None|isProperty: true|name: int|value: 1|")
+    assert_eq(svn_shape("enum E\n    set(x: int) -> E = A\n    A\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: A|value: None|- MethodDecl|name: set|receiver: None|isProperty: false|- Param|name: x|name: int|name: E|name: A|")
+    assert_eq(svn_shape("enum E\n    A\n    set[T](self, v: T) -> int = 1\n"),
+        "- EnumDecl|name: E|- EnumVariantDecl|name: A|value: None|- MethodDecl|name: set|receiver: ByValue|isProperty: false|- Param|name: v|name: T|name: int|value: 1|")
+end svn_an_enums_member_called_set
+
+// -- the other member positions -----------------------------------------------------------------------
+
+@test("a struct's field, method and property may each be called 'set'")
+svn_a_structs_member_called_set()
+    assert_eq(svn_shape("struct S\n    set: int\n    get: int\n"),
+        "- StructDecl|name: S|- Param|name: set|name: int|- Param|name: get|name: int|")
+    assert_eq(svn_shape("struct S\n    x: int\n    set(self, v: int) -> int = v\n"),
+        "- StructDecl|name: S|- Param|name: x|name: int|- MethodDecl|name: set|receiver: ByValue|isProperty: false|- Param|name: v|name: int|name: int|name: v|")
+    assert_eq(svn_shape("struct S\n    x: int\n    set(*self, v: int)\n        self.x = v\n"),
+        "- StructDecl|name: S|- Param|name: x|name: int|- MethodDecl|name: set|receiver: ByPtr|isProperty: false|- Param|name: v|name: int|name: self|name: x|value: Ident|name: v|")
+    assert_eq(svn_shape("struct S\n    w: int\n    set -> int = self.w\n"),
+        "- StructDecl|name: S|- Param|name: w|name: int|- MethodDecl|name: set|receiver: None|isProperty: true|name: int|name: self|name: w|")
+    assert_eq(svn_shape("struct S\n    set[T](self, v: T) -> int = 1\n"),
+        "- StructDecl|name: S|- MethodDecl|name: set|receiver: ByValue|isProperty: false|- Param|name: v|name: T|name: int|value: 1|")
+end svn_a_structs_member_called_set
+
+@test("a setter in a struct, and the setter of a property itself called 'set'")
+svn_a_setter_in_a_struct()
+    assert_eq(svn_shape("struct S\n    w: int\n    x -> int = self.w\n    set x(v)\n        self.w = v\n"),
+        "- StructDecl|name: S|- Param|name: w|name: int|- MethodDecl|name: x|receiver: None|isProperty: true|name: int|name: self|name: w|- MethodDecl|name: x$set|receiver: ByPtr|isProperty: false|- Param|name: v|name: $value|name: self|name: w|value: Ident|name: v|")
+    assert_eq(svn_shape("struct S\n    w: int\n    set -> int = self.w\n    set set(v)\n        self.w = v\n"),
+        "- StructDecl|name: S|- Param|name: w|name: int|- MethodDecl|name: set|receiver: None|isProperty: true|name: int|name: self|name: w|- MethodDecl|name: set$set|receiver: ByPtr|isProperty: false|- Param|name: v|name: $value|name: self|name: w|value: Ident|name: v|")
+end svn_a_setter_in_a_struct
+
+@test("a trait's method, property and setter, and an impl block's, with 'set' as the name")
+svn_a_traits_member_called_set()
+    assert_eq(svn_shape("trait T\n    set(self, v: int) -> int\n    get(self) -> int\n"),
+        "- TraitDecl|name: T|- MethodDecl|name: set|receiver: ByValue|isProperty: false|- Param|name: v|name: int|name: int|- MethodDecl|name: get|receiver: ByValue|isProperty: false|name: int|")
+    assert_eq(svn_shape("trait T\n    set -> int\n"),
+        "- TraitDecl|name: T|- MethodDecl|name: set|receiver: None|isProperty: true|name: int|")
+    assert_eq(svn_shape("trait T\n    x -> int\n    set x(v)\n"),
+        "- TraitDecl|name: T|- MethodDecl|name: x|receiver: None|isProperty: true|name: int|- MethodDecl|name: x$set|receiver: ByPtr|isProperty: false|- Param|name: v|name: $value|")
+    assert_eq(svn_shape("trait T\n    set -> int\n    set set(v)\n"),
+        "- TraitDecl|name: T|- MethodDecl|name: set|receiver: None|isProperty: true|name: int|- MethodDecl|name: set$set|receiver: ByPtr|isProperty: false|- Param|name: v|name: $value|")
+    assert_eq(svn_shape("struct S\n    w: int\n\ntrait T\n    set -> int\n    set set(v)\n\nimpl T for S\n    set -> int = self.w\n    set set(v)\n        self.w = v\n"),
+        "- StructDecl|name: S|- Param|name: w|name: int|- TraitDecl|name: T|- MethodDecl|name: set|receiver: None|isProperty: true|name: int|- MethodDecl|name: set$set|receiver: ByPtr|isProperty: false|- Param|name: v|name: $value|- ImplDecl|name: S|- MethodDecl|name: set|receiver: None|isProperty: true|name: int|name: self|name: w|- MethodDecl|name: set$set|receiver: ByPtr|isProperty: false|- Param|name: v|name: $value|name: self|name: w|value: Ident|name: v|")
+end svn_a_traits_member_called_set
+
+@test("a parameter, a function and a local may each be called 'set'")
+svn_a_binding_called_set()
+    assert_eq(svn_shape("f(set: int) -> int = set + 1\n\nset(a: int) -> int = a\n\ng() -> int\n    val set = 3\n    var get = set\n    set + get\n"),
+        "- FuncDecl|name: f|- Param|name: set|name: int|name: int|name: set|value: 1|- FuncDecl|name: set|- Param|name: a|name: int|name: int|name: a|- FuncDecl|name: g|name: int|- ValDecl|name: set|value: IntLit|value: 3|- VarDecl|name: get|name: set|name: set|name: get|")
+
+// -- what is refused ----------------------------------------------------------------------------------
+
+@test("a name after 'set' is a setter owed its '(', in every body and whatever the line goes on as")
+svn_a_setter_owed_its_bracket()
+    assert_eq(svn_said("enum E\n    set x\n"), "'(' expected @ t.sysl:3:1")
+    assert_eq(svn_said("enum E\n    set set\n"), "'(' expected @ t.sysl:3:1")
+    assert_eq(svn_said("enum E\n    set `x`\n"), "'(' expected @ t.sysl:3:1")
+    assert_eq(svn_said("enum E\n    A\n    set x = 3\n"), "'(' expected @ t.sysl:3:11")
+    assert_eq(svn_said("struct S\n    set x: int\n"), "'(' expected @ t.sysl:2:10")
+    assert_eq(svn_said("struct S\n    set set: int\n"), "'(' expected @ t.sysl:2:12")
+    assert_eq(svn_said("struct S\n    set fn: int\n"), "'(' expected @ t.sysl:2:11")
+    assert_eq(svn_said("struct S\n    w: int\n    set x\n    y: int\n"), "'(' expected @ t.sysl:3:10")
+    assert_eq(svn_said("struct S\n    set x -> int = 1\n"), "'(' expected @ t.sysl:2:11")
+    assert_eq(svn_said("struct S\n    w: int\n    set x[T](v)\n        ()\n"), "'(' expected @ t.sysl:3:10")
+    assert_eq(svn_said("trait T\n    set x\n"), "'(' expected @ t.sysl:3:1")
+end svn_a_setter_owed_its_bracket
+
+@test("a reserved word after 'set' is no name, so the line is a member called 'set' with something after it")
+svn_a_reserved_word_after_set()
+    assert_eq(svn_said("struct S\n    w: int\n    set val(v)\n        ()\n"), "':' expected @ t.sysl:3:9")
+    assert_eq(svn_said("trait T\n    set val(v)\n"), "'->' expected @ t.sysl:2:9")
+    assert_eq(svn_said("enum E\n    A\n    set val(v)\n"), "dedent expected @ t.sysl:3:9")
+    assert_eq(svn_said("enum E\n    A\n    set self\n"), "dedent expected @ t.sysl:3:9")
+end svn_a_reserved_word_after_set
+
+@test("a 'set' variant is the whole of its line, and its payload names its fields")
+svn_a_set_variant_refused()
+    assert_eq(svn_said("enum E\n    A\n    set 3\n"), "dedent expected @ t.sysl:3:9")
+    assert_eq(svn_said("enum E\n    set, get\n"), "dedent expected @ t.sysl:2:8")
+    assert_eq(svn_said("enum E\n    set(x)\n    A\n"),
+        "a variant's payload names its fields, as 'Circle(r: real)' — write a name before the type, as 'name: x' @ t.sysl:2:5")
+    assert_eq(svn_said("enum E\n    set[T](v: T)\n"), "indent expected @ t.sysl:3:1")
+end svn_a_set_variant_refused
+
+@test("a member called 'set' is held to what its body's members are: a field's ':', a property's '->'")
+svn_a_member_called_set_refused()
+    assert_eq(svn_said("struct S\n    set\n"), "':' expected @ t.sysl:3:1")
+    assert_eq(svn_said("struct S\n    set, get: int\n"), "':' expected @ t.sysl:2:8")
+    assert_eq(svn_said("struct S\n    w: int\n    set(v)\n        self.w = v\n"), "':' expected @ t.sysl:3:10")
+    assert_eq(svn_said("trait T\n    set\n"), "'->' expected @ t.sysl:3:1")
+end svn_a_member_called_set_refused
+
+@test("a setter takes one bare name, and says what it was owed where the list holds anything else")
+svn_a_setters_list()
+    assert_eq(svn_said("struct S\n    w: int\n    set x()\n        ()\n"), "identifier expected @ t.sysl:3:11")
+    assert_eq(svn_said("struct S\n    w: int\n    set x(val)\n        ()\n"), "identifier expected @ t.sysl:3:11")
+    assert_eq(svn_said("struct S\n    w: int\n    set x(v: int)\n        ()\n"), "')' expected @ t.sysl:3:12")
+    assert_eq(svn_said("struct S\n    w: int\n    set x(v, u)\n        ()\n"), "')' expected @ t.sysl:3:12")
+    assert_eq(svn_said("enum E\n    A\n    set x(self, v: int)\n        ()\n"), "identifier expected @ t.sysl:3:11")
+end svn_a_setters_list
+
+@test("'set' opens no statement: a name after it at the top of a file is a line that should have ended")
+svn_set_opens_no_statement()
+    assert_eq(svn_said("set x = 3\n"), "newline expected @ t.sysl:1:5")
+
+// -- a program ----------------------------------------------------------------------------------------
+
+// What a program does: what it printed, and whether it exited zero. A failure to build is its
+// message and a non-zero exit.
+private svn_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-svn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end svn_outcome
+
+private svn_program() -> string =
+    "enum Mode\n    set\n    get(n: int)\n    clear\n\n" +
+    "enum Pin\n    low\n    set = 5\n\n" +
+    "struct Box\n    set: int\n\n    get -> int = self.set\n    set get(v)\n        self.set = v\n\n" +
+    "describe(m: Mode) -> string = m match\n    set -> \"set\"\n    get(n) -> str(n)\n    clear -> \"clear\"\n\n" +
+    "var b = Box(1)\n\nb.get = 41\nb.set += 1\n\nval set = Mode.set\n\n" +
+    "print(describe(set))\nprint(describe(get(3)))\nprint(describe(Mode.clear))\nprint(int(Pin.set))\n" +
+    "print(b.get)\nprint(b.set)\n"
+
+@test("a program whose variants, field and local are called 'set' runs, beside a setter that is one")
+svn_a_program_runs()
+    if xvr_no_library() then return
+
+    val out = svn_outcome(svn_program())
+
+    assert(out.1, s"it did not exit zero: ${out.0}")
+    assert_eq(out.0, "set\n3\nclear\n5\n42\n42\n")
+end svn_a_program_runs
+
+// The reference's `SettablePropertyTests` case of the same name.
+@test("'set' is still an ordinary name")
+svn_set_is_still_an_ordinary_name()
+    if xvr_no_library() then return
+
+    val out = svn_outcome("struct Cell\n    set: int\n    get -> int = self.set\nvar set = Cell(3)\nprint(set.get)")
+
+    assert(out.1, s"it did not exit zero: ${out.0}")
+    assert_eq(out.0, "3\n")
+end svn_set_is_still_an_ordinary_name
+
+@test("a 'set' variant a match leaves out is refused by name, as any other variant is")
+svn_a_missing_set_arm()
+    if xvr_no_library() then return
+
+    val out = svn_outcome("enum Mode\n    set\n    clear\n\nname(m: Mode) -> string = m match\n    clear -> \"clear\"\n\nprint(name(Mode.set))\n")
+
+    assert(!out.1, out.0)
+    assert(out.0.starts_with("error: match on 'Mode' is not exhaustive; missing set (add an 'else' arm)\n"), out.0)
+    assert(out.0.contains("main.sysl:5:27\n"), out.0)
+end svn_a_missing_set_arm
