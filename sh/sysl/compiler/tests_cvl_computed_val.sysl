@@ -1,0 +1,851 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, replace_all, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A module-level `val` whose initializer is **computed** (`reference/modules.md § val — a thing`):
+// storage the program fills before its own statements run, in the order the initializers' own
+// dependencies describe -- a `val` is filled after everything it reads, where "reads" follows
+// through whatever its initializer calls.
+//
+// Two properties fall out of `reference/modules.md § The module graph is acyclic` and are pinned
+// here: a cycle can only ever be inside one module, and a call through a method table can be
+// followed without knowing what it lands in.
+//
+// **Every output, status and refusal quoted here was obtained by running the reference compiler
+// (0.0.152) on the same files.** The reference quotes a declaration by its bare name and this
+// compiler by its qualified one; the two spell a root-module name alike, so nothing here differs.
+
+private cvl_skipped() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end cvl_skipped
+
+// A project with no manifest: each file is its path below the root and its text.
+private cvl_write(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-computed-val").unwrap()
+
+    make_dir_all(root).unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    root
+end cvl_write
+
+// **What a project PRINTS and the status it exits with**, which only building and running it can
+// say. A project that does not build answers what the build said and `-1`, so a refusal cannot pass
+// for a trap.
+private cvl_outcome(files: []const (string, string)) -> (string, int)
+    val root = cvl_write(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (s"did not build: ${failure_text(why)}", -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text, shell_status(out.status))
+end cvl_outcome
+
+// The program ran to the end, exited zero, and printed exactly this.
+private cvl_prints(text: string, printed: string)
+    val out = cvl_outcome([("main.sysl", text)])
+
+    assert_eq(out.0, printed)
+    assert_eq(out.1, 0)
+end cvl_prints
+
+// The program was built, and stopped itself at a trap before printing anything: a bounds violation
+// and a failed constraint are both SIGTRAP, which a shell reports as 133.
+private cvl_traps(text: string)
+    val out = cvl_outcome([("main.sysl", text)])
+
+    assert_eq(out.0, "")
+    assert_eq(out.1, 133)
+end cvl_traps
+
+// Everything a project has to say for itself, rendered the way a reader sees it with the temporary
+// root taken off each path; empty where it compiled.
+private cvl_err(files: []const (string, string)) -> string
+    val root = cvl_write(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    // A diagnostic names a file by its path with the doubled separators gone, and a temporary
+    // directory's name may carry one.
+    replace_all(out, replace_all(root, "//", "/") + "/", "")
+end cvl_err
+
+private cvl_refused(text: string) -> string = cvl_err([("main.sysl", text)])
+
+// The LLVM text of a program that must compile.
+private cvl_ir(text: string) -> string
+    val root = cvl_write([("main.sysl", text)])
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cvl_ir
+
+// What every file of a cycle test says first: none of them carries a statement, so `static` has no
+// body to opt out of, and the reference says so once per declaration before it reaches the cycle.
+private cvl_static(at: string, line: string) -> string
+    var carets = str_builder()
+
+    for i in 0..<line.bytes.len do carets.push("^")
+
+    val from = at.index_of(":").unwrap() + 1
+    val row = at[from..<at.last_index_of(":").unwrap()]
+
+    "error: 'static' says a declaration belongs to the module rather than to the body of the file the " +
+    "program starts in — and this file has no such body, so everything it declares is the module's " +
+    s"already\n --> $at\n  |\n$row | $line\n  | ${carets.finish()}"
+end cvl_static
+
+private cvl_cycle(chain: string) -> string =
+    s"error: $chain — computed module storage runs once before anything else does, so what it needs has " +
+    "to be settled first"
+
+// A report holds every one of these. **Asked part by part rather than as one text** for the two
+// places this compiler's rendering is known to differ from the reference's while the words agree:
+// the reference prints a cycle and a `val` with no storage with no position at all (and so last),
+// where this compiler anchors each at the declaration; and an assignment refusal's carets run the
+// whole statement there and the place here.
+private cvl_says(said: string, parts: []const string)
+    for i in 0..<parts.len
+        assert(said.contains(parts[i]), said)
+
+// ---- what the documents claim ----
+
+// The customer the feature was opened for: a CRC table is derived rather than written down, so a
+// constant tree could never have carried it.
+@test("a table a function builds is a 'val'")
+cvl_a_table_a_function_builds()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        build() -> [256]u32
+            var t: [256]u32
+            for n in 0usize..<256
+                var c = u32(n)
+                for k in 0..<8
+                    c = if c & 1u32 != 0u32 then c >> 1u32 ^ 0xEDB88320u32 else c >> 1u32
+                t[n] = c
+            t
+        static val crc_table: [256]u32 = build()
+        print(crc_table[0], crc_table[1], crc_table[255])
+        """, "0 1996959894 755167117\n")
+end cvl_a_table_a_function_builds
+
+// The declaration a constant initializer already accepted is unchanged -- it is still laid into the
+// object file, and the way to see that from outside is that it is still a `constant`.
+@test("a constant initializer is still written into the object file")
+cvl_a_constant_initializer_is_still_a_constant()
+    if cvl_skipped() then return
+
+    val out = cvl_ir("static val k: [4]int = [1, 2, 3, 4]\nprint(k[2])\n")
+
+    assert(out.contains("@k = private constant [4 x i32] [i32 1, i32 2, i32 3, i32 4]"), out)
+    assert(!out.contains("@k = private global"), out)
+
+// ...and a computed one is storage that gets written, which is a different LLVM declaration. The
+// write is asserted as the store into that storage, which is what the reference's `emit-llvm` shows.
+@test("a computed one is storage that the program fills")
+cvl_a_computed_one_is_storage()
+    if cvl_skipped() then return
+
+    val out = cvl_ir("f() -> int = 7\nstatic val n: int = f()\nprint(n)\n")
+
+    assert(out.contains("@n = private global i32 zeroinitializer"), out)
+    assert(out.contains("  store i32 %t1, ptr @n\n"), out)
+
+@test("and it is filled before the program's own statements run")
+cvl_it_is_filled_before_the_statements()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        report() -> int
+            print("built")
+            3
+        static val n: int = report()
+        print("running")
+        print(n)
+        """, "built\nrunning\n3\n")
+
+// The ordering rule at its smallest: `b` reads `a`, so `a` is filled first whatever order the two
+// were written in.
+@test("one built out of another is filled after it")
+cvl_one_built_out_of_another()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        double(x: int) -> int = x * 2
+        static val b: int = double(a)
+        static val a: int = double(21)
+        print(a, b)
+        """, "42 84\n")
+
+// The same when the read is not in the initializer at all but in what it calls, which a rule that
+// looked only at the initializer expression would get wrong.
+@test("the read may be inside a function the initializer calls")
+cvl_the_read_may_be_inside_a_function()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        base() -> int = 10
+        static val a: int = base()
+        from_a() -> int = a + 5
+        static val b: int = from_a()
+        print(a, b)
+        """, "10 15\n")
+
+@test("a cycle between two initializers is refused")
+cvl_a_cycle_between_two_is_refused()
+    if cvl_skipped() then return
+
+    cvl_says(cvl_refused(raw"""
+        from_b() -> int = b + 1
+        from_a() -> int = a + 1
+        static val a: int = from_b()
+        static val b: int = from_a()
+        """), [
+        cvl_static("main.sysl:3:1", "static val a: int = from_b()"),
+        cvl_static("main.sysl:4:1", "static val b: int = from_a()"),
+        cvl_cycle("'a' cannot be initialized: its value needs 'b', whose value needs 'a'")])
+
+@test("and so is an initializer that needs itself")
+cvl_an_initializer_that_needs_itself()
+    if cvl_skipped() then return
+
+    cvl_says(cvl_refused("me() -> int = n\nstatic val n: int = me()\n"), [
+        cvl_static("main.sysl:2:1", "static val n: int = me()"),
+        cvl_cycle("'n' cannot be initialized: its value needs 'n'")])
+
+// The same cycle through the WRITABLE half of module storage: a `var` is the same kind of thing, and
+// the report has to find its name as it finds a `val`'s.
+@test("including a cycle through a 'var', which is the same storage")
+cvl_a_cycle_through_a_var()
+    if cvl_skipped() then return
+
+    cvl_says(cvl_refused(raw"""
+        from_b() -> int = b + 1
+        from_a() -> int = a + 1
+        static var a: int = from_b()
+        static var b: int = from_a()
+        """), [
+        cvl_static("main.sysl:3:1", "static var a: int = from_b()"),
+        cvl_static("main.sysl:4:1", "static var b: int = from_a()"),
+        cvl_cycle("'a' cannot be initialized: its value needs 'b', whose value needs 'a'")])
+
+// A cycle with one of each, which proves both kinds are consulted.
+@test("and one that runs through a 'val' and a 'var' together")
+cvl_a_cycle_through_a_val_and_a_var()
+    if cvl_skipped() then return
+
+    cvl_says(cvl_refused(raw"""
+        from_b() -> int = b + 1
+        from_a() -> int = a + 1
+        static val a: int = from_b()
+        static var b: int = from_a()
+        """), [
+        cvl_static("main.sysl:3:1", "static val a: int = from_b()"),
+        cvl_static("main.sysl:4:1", "static var b: int = from_a()"),
+        cvl_cycle("'a' cannot be initialized: its value needs 'b', whose value needs 'a'")])
+
+// A computed `val` may hold a count, and the count it takes is never given back: that is what
+// storage lasting the whole run means.
+@test("a reference may be held in one")
+cvl_a_reference_may_be_held()
+    if cvl_skipped() then return
+
+    cvl_prints("struct P\n    x: int\nend P\nmk() -> &P = P(1)\nstatic val p: &P = mk()\nprint(p.x)\n", "1\n")
+
+@test("as may a string a function returned, where the constant form holds a literal")
+cvl_a_string_a_function_returned()
+    if cvl_skipped() then return
+
+    cvl_prints("static val s: string = str(12)\nprint(s)\n", "12\n")
+    cvl_prints("static val s: string = \"hi\"\nprint(s)\n", "hi\n")
+
+// The storage takes a count of its own for what the prologue gives it. Without that retain the slice
+// would be released at the end of its own initializer's region, so this asks for the elements back
+// rather than the length alone.
+@test("and a slice, whose elements are still there after the initializer's region ends")
+cvl_a_slice_is_still_there()
+    if cvl_skipped() then return
+
+    cvl_prints("static val xs: []int = [1, 2, 3]\nprint(xs[0], xs[2], xs.len)\n", "1 3 3\n")
+
+// The read-only rule is about the storage, not about how it was filled.
+@test("a computed one is still read-only")
+cvl_a_computed_one_is_still_read_only()
+    if cvl_skipped() then return
+
+    cvl_says(cvl_refused("build() -> [2]int = [1, 2]\nstatic val k: [2]int = build()\nk[0] = 9\n"), [
+        "error: a 'val' is written once, so assignment has nothing to write through\n" +
+        " --> main.sysl:3:1\n  |\n3 | k[0] = 9\n  | ^^^^"])
+
+// ---- what the edges do ----
+
+// A struct of numbers is the shape the constant form could not build and the computed one can.
+@test("a struct of numbers counts nothing and may be computed")
+cvl_a_struct_of_numbers()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        struct Point
+            x: int
+            y: int
+        end Point
+        origin() -> Point = Point(3, 4)
+        static val o: Point = origin()
+        print(o.x, o.y)
+        """, "3 4\n")
+
+@test("so is an enum, including one that carries a payload")
+cvl_an_enum_that_carries_a_payload()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        enum Shape
+            Dot
+            Round(r: int)
+        end Shape
+        pick() -> Shape = Round(5)
+        static val s: Shape = pick()
+        s match
+            Round(r) -> print(r)
+            Dot -> print(0)
+        """, "5\n")
+
+// An enum whose payload is a reference is the recursive case, asked through a `Node` so the count
+// actually has something to be taken of.
+@test("including an enum whose payload is a reference")
+cvl_an_enum_whose_payload_is_a_reference()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        enum Tree
+            Leaf
+            Node(next: &Tree)
+        end Tree
+        mk() -> Tree = Node(Leaf)
+        static val t: Tree = mk()
+        t match
+            Node(_) -> print(1)
+            Leaf -> print(0)
+        """, "1\n")
+
+@test("an array of structs is computed element by element")
+cvl_an_array_of_structs()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        struct Pair
+            a: int
+            b: int
+        end Pair
+        build() -> [3]Pair
+            var out: [3]Pair
+            for i in 0usize..<3
+                out[i] = Pair(int(i), int(i) * int(i))
+            out
+        static val ps: [3]Pair = build()
+        print(ps[2].a, ps[2].b)
+        """, "2 4\n")
+end cvl_an_array_of_structs
+
+// Three in a chain, declared in the order that would be wrong if the sort did nothing.
+@test("a chain of three is sorted whichever way it was written")
+cvl_a_chain_of_three()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        plus(x: int, y: int) -> int = x + y
+        static val c: int = plus(b, 1)
+        static val b: int = plus(a, 1)
+        static val a: int = plus(0, 1)
+        print(a, b, c)
+        """, "1 2 3\n")
+
+// A diamond: two independent tables over one base, both correct, and the base filled once.
+@test("a diamond fills the shared dependency once")
+cvl_a_diamond()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        count() -> int
+            print("base")
+            2
+        static val base: int = count()
+        left() -> int = base * 10
+        right() -> int = base * 100
+        static val l: int = left()
+        static val r: int = right()
+        print(l, r)
+        """, "base\n20 200\n")
+end cvl_a_diamond
+
+// A constant `val` is not in the graph at all, so reading one puts no edge anywhere -- and the
+// computed one that reads it is still correct, the constant having been there before the process
+// started.
+@test("reading a constant 'val' needs no ordering")
+cvl_reading_a_constant_val()
+    if cvl_skipped() then return
+
+    val src = raw"""
+        static val seed: [3]int = [4, 5, 6]
+        sum() -> int = seed[0] + seed[1] + seed[2]
+        static val total: int = sum()
+        print(total)
+        """
+
+    cvl_prints(src, "15\n")
+
+    val out = cvl_ir(src)
+
+    assert(out.contains("@seed = private constant [3 x i32] [i32 4, i32 5, i32 6]"), out)
+end cvl_reading_a_constant_val
+
+// A table in one module built out of a table in another is ordered without anyone having said what
+// order the modules run in, because the graph over the `val`s already answers it. The importing
+// module's table is declared first here, so a walk that took the modules in the order it read them
+// would get this wrong.
+@test("a table built out of another module's table is ordered across the seam")
+cvl_a_table_across_the_seam()
+    if cvl_skipped() then return
+
+    val out = cvl_outcome([
+        ("main.sysl", "print(scaled[0], scaled[3])\n"),
+        ("tables/base.sysl", raw"""
+            module tables
+            seed() -> [4]int
+                var t: [4]int
+                for i in 0usize..<4
+                    t[i] = int(i) + 1
+                t
+            val base: [4]int = seed()
+            """),
+        ("derived.sysl", raw"""
+            import tables
+            grow() -> [4]int
+                var t: [4]int
+                for i in 0usize..<4
+                    t[i] = tables.base[i] * 10
+                t
+            val scaled: [4]int = grow()
+            """)])
+
+    assert_eq(out.0, "10 40\n")
+    assert_eq(out.1, 0)
+end cvl_a_table_across_the_seam
+
+// A generic function reaches its callee under the name its instantiation was given, and the
+// dependency walk reads the same names the lowering does.
+@test("an initializer that goes through a generic is ordered")
+cvl_an_initializer_through_a_generic()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        twice[T: Add](x: T) -> T = x + x
+        static val a: int = twice(21)
+        from_a() -> int = twice(a)
+        static val b: int = from_a()
+        print(a, b)
+        """, "42 84\n")
+
+// A cycle of three, to check the chain is said as a chain rather than as one pair of it.
+@test("a cycle of three names all three")
+cvl_a_cycle_of_three()
+    if cvl_skipped() then return
+
+    cvl_says(cvl_refused(raw"""
+        fa() -> int = c
+        fb() -> int = a
+        fc() -> int = b
+        static val a: int = fa()
+        static val b: int = fb()
+        static val c: int = fc()
+        """), [
+        cvl_static("main.sysl:4:1", "static val a: int = fa()"),
+        cvl_static("main.sysl:5:1", "static val b: int = fb()"),
+        cvl_static("main.sysl:6:1", "static val c: int = fc()"),
+        cvl_cycle("'a' cannot be initialized: its value needs 'c', whose value needs 'b', whose value needs 'a'")])
+end cvl_a_cycle_of_three
+
+// Mutual recursion among the *functions* an initializer calls is not a cycle among the `val`s: what
+// is accumulated is a set of reads, and a function already walked adds nothing.
+@test("recursion in the functions an initializer calls is not a cycle")
+cvl_recursion_is_not_a_cycle()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        even(n: int) -> bool = if n == 0 then true else odd(n - 1)
+        odd(n: int) -> bool = if n == 0 then false else even(n - 1)
+        start() -> int = if even(10) then 1 else 0
+        static val flag: int = start()
+        print(flag)
+        """, "1\n")
+
+// The initializer may allocate on its way to the value -- the region it runs in lets go of the
+// buffer before the next one starts.
+@test("an initializer may allocate on the way to a plain value")
+cvl_an_initializer_may_allocate()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        import sysl.buf.*
+
+        total() -> int
+            var b: &Buf[int] = buf()
+            for i in 0..<5 do b.push(i)
+            var s = 0
+            for x in b.view()
+                s += x
+            s
+        static val n: int = total()
+        print(n)
+        """, "10\n")
+end cvl_an_initializer_may_allocate
+
+// A call through a method table is followed by taking every function that trait's tables put in the
+// slot. This program's `val` reads another one only through such a call, so getting it wrong reads a
+// zero rather than the value.
+@test("a read through a trait object is still ordered")
+cvl_a_read_through_a_trait_object()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        trait Source
+            get(self) -> int
+        struct FromBase
+            tag: int
+        impl Source for FromBase
+            get(self) -> int = base * 7
+        ask() -> int
+            var f = FromBase(0)
+            var s: *Source = &f
+            s.get()
+        seed() -> int = 6
+        static val answer: int = ask()
+        static val base: int = seed()
+        print(base, answer)
+        """, "6 42\n")
+end cvl_a_read_through_a_trait_object
+
+// A `val` nothing reads is still filled: a side-effecting initializer is the only way to see it.
+@test("an unread computed 'val' is still filled")
+cvl_an_unread_one_is_still_filled()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        noisy() -> int
+            print("filled")
+            1
+        static val unread: int = noisy()
+        print("done")
+        """, "filled\ndone\n")
+
+// Two independent ones keep the order they were declared in, which is the only thing left to decide
+// once the dependencies have had their say.
+@test("independent initializers run in declaration order")
+cvl_independent_ones_run_in_declaration_order()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        say(s: string) -> int
+            print(s)
+            0
+        static val first: int = say("one")
+        static val second: int = say("two")
+        print(first + second)
+        """, "one\ntwo\n0\n")
+
+// A local `val` is untouched by any of this: it is a frame's binding, initialized where it stands.
+@test("a local 'val' still holds what a module one may not")
+cvl_a_local_val()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        import sysl.buf.*
+
+        head() -> int
+            var b: &Buf[int] = buf()
+            b.push(3)
+            val xs = b.view()
+            xs[0]
+        print(head())
+        """, "3\n")
+
+// The value may be produced by an expression that is not a call at all -- what decides is whether
+// the object file could have carried it, not what shape the source took.
+@test("an arithmetic initializer is computed, not folded")
+cvl_an_arithmetic_initializer()
+    if cvl_skipped() then return
+
+    val out = cvl_ir("const w: int = 3\nstatic val n: int = w * w\nprint(n)\n")
+
+    assert(out.contains("@n = private global i32 zeroinitializer"), out)
+
+// A `val` whose initializer traps takes the program down before a statement of the program's own has
+// run. What is observable is the status, since a trap says nothing.
+@test("an initializer that traps stops the program")
+cvl_an_initializer_that_traps()
+    if cvl_skipped() then return
+
+    cvl_traps(raw"""
+        boom() -> int
+            var xs: [2]int
+            var i = 5
+            xs[i]
+        static val n: int = boom()
+        print("never")
+        """)
+
+// A struct whose field is a reference carries the count in the storage even though the struct itself
+// is a value, and the retain the prologue takes has to reach into it. Reading the field back is what
+// says it did.
+@test("a struct with a reference field is held, and its field is still there")
+cvl_a_struct_with_a_reference_field()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        struct Holder
+            it: &int
+        end Holder
+        mk() -> Holder = Holder(3)
+        static val h: Holder = mk()
+        print(*h.it)
+        """, "3\n")
+
+// A computed `val` slices exactly as a written-down one does, and the view carries the read-only
+// property for the same reason: the property is the storage's, not the initializer's.
+@test("slicing a computed one gives a view that may not be written, as a written-down one's does")
+cvl_slicing_a_computed_one()
+    if cvl_skipped() then return
+
+    cvl_says(cvl_refused("build() -> [4]int = [1, 2, 3, 4]\nstatic val k: [4]int = build()\nvar s = k[1..<3]\ns[0] = 9\n"), [
+        "error: this element belongs to a '[]const int', which views elements it may not write, so there is " +
+        "nothing to assign through. Elements you may write are elements of your own: copy them into a " +
+        "'[]int' first\n --> main.sysl:4:1\n  |\n4 | s[0] = 9\n  | ^^^^"])
+
+// A comparison is the one operator that does *not* become a call -- the method rides on the
+// comparison node instead, so a walk that followed only calls would miss the read behind it. `flag`
+// is declared first, so getting this wrong reads a zero and flips the answer.
+@test("a read behind a comparison's dispatch is followed")
+cvl_a_read_behind_a_comparison()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        struct Rank
+            n: int
+        impl Ord for Rank
+            lt(self, o: Rank) -> bool = self.n + bias < o.n
+        pick() -> int = if Rank(1) < Rank(3) then 1 else 0
+        seed() -> int = 5
+        static val flag: int = pick()
+        static val bias: int = seed()
+        print(bias, flag)
+        """, "5 0\n")
+end cvl_a_read_behind_a_comparison
+
+// A subtype's `where` predicate is the one function whose name lives inside a *type* rather than
+// beside it in the tree, so the node that checks a value against one has to give the name up itself
+// or the predicate's own reads are never followed.
+@test("a read inside a subtype's predicate is followed")
+cvl_a_read_inside_a_predicate()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        ten() -> int = 10
+        type Small = int within 0..100 where value < limit
+        make() -> Small = 3
+        static val flag: int = int(make())
+        static val limit: int = ten()
+        print(limit, flag)
+        """, "10 3\n")
+
+// A contract clause is part of the function without being part of its body, so it is the other place
+// a read can hide. Getting the order wrong here traps rather than printing the wrong number.
+@test("a read inside a precondition is followed")
+cvl_a_read_inside_a_precondition()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        guarded(x: int) -> int
+            require x < limit
+            x * 2
+        seed() -> int = 4
+        static val v: int = guarded(3)
+        static val limit: int = seed()
+        print(v)
+        """, "6\n")
+
+// A `val` is defined by having an address, and a value with no representation has nothing to put one
+// on.
+@test("a 'val' of a type that occupies nothing is refused")
+cvl_a_val_that_occupies_nothing()
+    if cvl_skipped() then return
+
+    cvl_says(cvl_refused("noise() -> unit\n    print(\"hi\")\nstatic val u: unit = noise()\n"), [
+        cvl_static("main.sysl:3:1", "static val u: unit = noise()"),
+        "error: 'u' cannot be a 'val': a unit value occupies nothing, so there is no storage for the name to " +
+        "stand for — write the call as a statement instead"])
+
+    // With a body for `static` to opt out of, the refusal is the only thing either compiler says.
+    val alone = cvl_refused("noise() -> unit\n    print(\"hi\")\nstatic val u: unit = noise()\nprint(1)\n")
+
+    assert(alone.starts_with("error: 'u' cannot be a 'val': a unit value occupies nothing, so there is no " +
+        "storage for the name to stand for — write the call as a statement instead"), alone)
+    assert(!alone.contains("\n\nerror: "), alone)
+
+// The edge a `val` reference makes is an ordinary module edge, so two modules reading each other's
+// tables is refused as a module cycle. Both compilers go on to report the `val` cycle as well, the
+// names qualified by both because neither is the root module's.
+@test("two modules reading each other's tables is a module cycle", ignore: "the module graph is not checked for cycles here")
+cvl_two_modules_reading_each_other()
+    if cvl_skipped() then return
+
+    val said = cvl_err([
+        ("main.sysl", "print(up.a)\n"),
+        ("up/up.sysl", "module up\nfrom_down() -> int = down.b + 1\nstatic val a: int = from_down()\n"),
+        ("down/down.sysl", "module down\nfrom_up() -> int = up.a + 1\nstatic val b: int = from_up()\n")])
+
+    assert_eq(said,
+        "error: 'down' depends on 'up', which depends on 'down' — modules may not depend on each other, " +
+        "directly or through a chain\n --> down/down.sysl:2:23\n  |\n2 | from_up() -> int = up.a + 1\n" +
+        "  |                       ^\n\n" +
+        cvl_static("down/down.sysl:3:1", "static val b: int = from_up()") + "\n\n" +
+        cvl_static("up/up.sysl:3:1", "static val a: int = from_down()") + "\n\n" +
+        cvl_cycle("'down.b' cannot be initialized: its value needs 'up.a', whose value needs 'down.b'"))
+end cvl_two_modules_reading_each_other
+
+// A cycle between *constants* is a different mechanism -- a constant folds and never runs -- and it
+// says so its own way, at the declaration.
+@test("a cycle between constants is still reported at the declaration")
+cvl_a_cycle_between_constants()
+    if cvl_skipped() then return
+
+    assert_eq(cvl_refused("const a: int = b\nconst b: int = a\n"),
+        "error: constant 'a' is defined in terms of itself: a → b → a\n" +
+        " --> main.sysl:1:1\n  |\n1 | const a: int = b\n  | ^^^^^^^^^^^^^^^^")
+
+// Iterating one reads its storage, which is what having an address is for.
+@test("a computed table can be walked")
+cvl_a_computed_table_can_be_walked()
+    if cvl_skipped() then return
+
+    cvl_prints(raw"""
+        build() -> [4]int
+            var t: [4]int
+            for i in 0usize..<4
+                t[i] = int(i) * 3
+            t
+        static val k: [4]int = build()
+        var s = 0
+        for x in k
+            s += x
+        print(s)
+        """, "18\n")
+end cvl_a_computed_table_can_be_walked
+
+// ---- a val at a checked type is filled, because a check is code ----
+//
+// A `val` at a constrained type is written as a plain number, so the constant-tree rule alone would
+// lay it straight into the object file and skip its check. It does not: the value goes into storage
+// the program fills, and the check runs there. The load-bearing assertions are the out-of-range ones.
+
+private cvl_age() -> string = "type Age = int within 0..150\n"
+
+@test("a constrained one is storage rather than a constant, though its initializer is a literal")
+cvl_a_constrained_one_is_storage()
+    if cvl_skipped() then return
+
+    val out = cvl_ir(cvl_age() + "static val a: Age = 30\nprint(a)\n")
+
+    assert(out.contains("@a = private global i32 zeroinitializer"), out)
+    assert(!out.contains("@a = private constant"), out)
+
+@test("and the value it is out of range for stops the program")
+cvl_out_of_range_stops_the_program()
+    if cvl_skipped() then return
+
+    cvl_traps(cvl_age() + "static val a: Age = 200\nprint(a)\n")
+
+@test("while the one in range reads back")
+cvl_the_one_in_range_reads_back()
+    if cvl_skipped() then return
+
+    cvl_prints(cvl_age() + "static val a: Age = 30\nprint(a)\n", "30\n")
+
+@test("a 'where' predicate is checked there too")
+cvl_a_where_predicate_is_checked()
+    if cvl_skipped() then return
+
+    cvl_prints("type Even = int where value % 2 == 0\nstatic val e: Even = 30\nprint(e)\n", "30\n")
+    cvl_traps("type Even = int where value % 2 == 0\nstatic val e: Even = 7\nprint(e)\n")
+
+// An element of an array is a produce site of its own, so a table of a constrained type is checked
+// element by element -- and the array is filled rather than laid down for that reason.
+@test("so is every element of a table of them")
+cvl_every_element_of_a_table()
+    if cvl_skipped() then return
+
+    val good = cvl_age() + "static val xs: [2]Age = [1, 2]\nprint(xs[1])\n"
+    val out = cvl_ir(good)
+
+    assert(out.contains("@xs = private global [2 x i32] zeroinitializer"), out)
+    cvl_prints(good, "2\n")
+    cvl_traps(cvl_age() + "static val xs: [2]Age = [1, 200]\nprint(xs[1])\n")
+
+// A struct invariant is the same question about a different check.
+@test("and a struct invariant")
+cvl_a_struct_invariant()
+    if cvl_skipped() then return
+
+    val span = "struct Span\n    lo: int\n    hi: int\n    invariant lo <= hi\n\n"
+
+    cvl_prints(span + "val s: Span = Span(1, 2)\nprint(s.hi)\n", "2\n")
+    cvl_traps(span + "val s: Span = Span(9, 2)\nprint(s.hi)\n")
+
+// The derived case, which carries no check at all and is still filled: a conversion is not one of
+// the things a constant tree is made of, so it is code by that rule alone.
+@test("a derivation with nothing to check is code all the same")
+cvl_a_derivation_is_code()
+    if cvl_skipped() then return
+
+    val src = "type Meters = new int\nstatic val m: Meters = Meters(30)\nprint(int(m))\n"
+    val out = cvl_ir(src)
+
+    assert(out.contains("@m = private global i32 zeroinitializer"), out)
+    cvl_prints(src, "30\n")
