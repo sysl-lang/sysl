@@ -243,6 +243,13 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
     val e = resolve_qualified(a, scope, elem, subst)
     val written = length.unwrap()
 
+    // The two rules the declaration asks of a written length, asked again of the substitution --
+    // which is what reaches a length written inside a BODY, where the declaration-time walk never
+    // looks: a name bound to a value may be the length but not be computed with, and a name bound to
+    // a type may not be the length at all.
+    length_arithmetic(a, scope, span, written, const_arg_names(subst))
+    length_not_a_type(a, scope, span, written, abstract_names(subst))
+
     // A length over a type parameter has no value during the walk that checks the generic body
     // itself, there being no `T` yet — and that is not a mistake to report, since the body is
     // analyzed again for each instantiation with the parameter bound. The array stands at length
@@ -268,8 +275,64 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
             a.fault(scope, span, "an array length must be a constant — a literal, or a 'const' naming one")
     end if
 
+    // A negative length folds, and is a mistake of its own rather than one that does not fold -- it
+    // reaches here through a value argument, `Buf[-1]`, as readily as through a literal.
+    val negative = negative_extent(a, scope, written, subst)
+
+    if negative.is_some()
+        a.fault(scope, span, s"an array cannot have ${str(negative.unwrap())} elements")
+        return Unknown
+    end if
+
     Array(int(const_extent(a, scope, span, written, subst)), e)
 end resolve_array
+
+// The length a written one folds to, where that is below zero.
+private negative_extent(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Option[BigInt]
+    *e.kind match
+        IntLit(_, _, _) -> return None
+        _ -> ()
+
+    val inner = analyzer_for(a, scope)
+
+    inner.subst = subst
+
+    val mark = a.complaints()
+    val folded = const_int(inner, e)
+
+    a.restore_complaints(mark)
+
+    if folded.is_none() then return None
+
+    val n = folded.unwrap()
+
+    if n < from_int(0) then Some(n) else None
+end negative_extent
+
+// The names a substitution binds to a value -- a value parameter, or the loop variable of a
+// `for const`.
+private const_arg_names(subst: Buf[Binding]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<subst.len()
+        subst.at(i).ty match
+            ConstArg(_, _) -> out.push(subst.at(i).name)
+            _ -> ()
+
+    out
+end const_arg_names
+
+// The names a substitution binds to a type parameter standing for itself.
+private abstract_names(subst: Buf[Binding]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<subst.len()
+        subst.at(i).ty match
+            Abstract(n, _) -> if n == subst.at(i).name then out.push(n)
+            _ -> ()
+
+    out
+end abstract_names
 
 // Whether this length reads as a constant at all, asked without leaving a complaint behind: the walk
 // that answers it is the same one `const_extent` makes, and a length that does not fold is either a
@@ -693,7 +756,11 @@ end fits_i32
 
 private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args: Buf[TypeRef],
                       subst: Buf[Binding]) -> Type
-    val targs = under_type_arg(a, () -> resolve_list(a, scope, args, subst))
+    val read = read_type_args(a, scope, span, name, args, subst)
+
+    if read.is_none() then return Unknown
+
+    val targs = read.unwrap()
 
     if args.is_empty() then
         val stood_for = bound_type(subst, name)
@@ -780,6 +847,141 @@ private at_declared_widths(a: &Analysis, key: string, targs: Buf[Type]) -> Buf[T
 
     out
 end at_declared_widths
+
+// A written argument list, resolved **against the declaration whose parameters it fills**, because
+// which argument is a type and which a value is the declaration's fact and nothing the grammar can
+// see: `Buf[4]` and `Buf[int]` are one shape to a parser, and so are `Buf[SIZE]` and `Box[T]`. So a
+// bare name in a value position is read as the expression it is -- a constant, an enclosing block's
+// value parameter, a simple enum's variant -- and a value in a type position is refused. `None` is
+// an argument refused, which makes the whole type nothing rather than one built over a hole.
+private read_type_args(a: &Analysis, scope: Scope, span: Span, name: string, args: Buf[TypeRef],
+                       subst: Buf[Binding]) -> Option[Buf[Type]]
+    a.type_arg_depth += 1
+
+    val out = read_type_args_at(a, scope, span, name, args, subst)
+
+    a.type_arg_depth -= 1
+    out
+end read_type_args
+
+private read_type_args_at(a: &Analysis, scope: Scope, span: Span, name: string,
+                          args: Buf[TypeRef], subst: Buf[Binding]) -> Option[Buf[Type]]
+    if args.is_empty() || bound_type(subst, name).is_some() then
+        return Some(resolve_list(a, scope, args, subst))
+
+    val key = lookup_type_key(a, scope, name)
+
+    if key.is_none() then return Some(resolve_list(a, scope, args, subst))
+
+    val pair = declared_values(a, key.unwrap())
+
+    if pair.0.is_empty() then return Some(resolve_list(a, scope, args, subst))
+
+    val home = a.tables.types.get(key.unwrap()).unwrap().scope
+    var out: Buf[Type] = buf()
+
+    for i in 0..<args.len()
+        val arg = args.at(i)
+        val written = if i < pair.0.len() then binding_named(pair.1, pair.0.at(i)) else None
+
+        if written.is_some()
+            val ty = resolve_type(a, home, written.unwrap(), no_bindings())
+            val v = value_arg(a, scope, span, arg, ty, subst)
+
+            if v.is_none() then return None
+
+            out.push(v.unwrap())
+        else
+            *arg.kind match
+                ValueArgType(_) ->
+                    a.fault(scope, span, "a value stands here, and this argument is a type — a value " +
+                            "argument belongs where the declaration wrote 'const', and nowhere else")
+                    return None
+                _ -> out.push(resolve_type(a, scope, arg, subst))
+        end if
+
+    Some(out)
+end read_type_args_at
+
+// One **value** argument: the expression it was written as, folded to the constant that goes in the
+// type's identity, at the type the declaration wrote for its parameter. An enclosing declaration's
+// value parameter stands at zero for the walk that checks a generic body, exactly as a length
+// written over one does -- there is no argument yet, and that walk's tree is discarded.
+private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type,
+                  subst: Buf[Binding]) -> Option[Type]
+    val written = *arg.kind match
+        ValueArgType(e) -> Some(e)
+        NamedType(n, targs) -> if targs.is_empty() then Some(expr(arg.span, Ident(n))) else None
+        _ -> None
+
+    if written.is_none()
+        a.fault(scope, span, "this argument stands where the declaration wrote 'const', so a value " +
+                s"belongs here rather than a type — one of ${type_show(ty)}")
+        return None
+    end if
+
+    val e = written.unwrap()
+    val folded = const_arg_value(a, scope, e, subst)
+
+    if folded.is_some() then return Some(ConstArg(folded.unwrap(), ty))
+
+    val tag = variant_tag(e, ty)
+
+    if tag.is_some() then return Some(ConstArg(from_int(long(tag.unwrap())), ty))
+
+    if awaits_instantiation(a, scope, e, subst) then return Some(ConstArg(from_int(0), ty))
+
+    // A name that turns out to be a TYPE is the likely mistake in this position, and gets its own
+    // sentence: `Buf[int]` reads as a list of types until the declaration says otherwise.
+    *e.kind match
+        Ident(n) ->
+            if lookup_type_key(a, scope, n).is_some() ||
+               scalar_named(n, int(a.tables.target.pointer_bits())).is_some()
+                a.fault(scope, span, s"'$n' is a type, and this argument stands where the declaration " +
+                        s"wrote 'const' — so a value of ${type_show(ty)} belongs here")
+                return None
+            end if
+        _ -> ()
+
+    a.fault(scope, span, "a value argument must be a constant — a literal, or a 'const' naming one")
+    None
+end value_arg
+
+// The number a value argument folds to, whichever admissible kind it is.
+private const_arg_value(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Option[BigInt]
+    val inner = analyzer_for(a, scope)
+
+    inner.subst = subst
+
+    val mark = a.complaints()
+    val folded = const_fold(inner, e)
+
+    a.restore_complaints(mark)
+
+    folded match
+        Some(ConstBool(b)) -> Some(from_int(if b then 1 else 0))
+        Some(ConstChar(c)) -> Some(from_int(long(int(u32(c)))))
+        Some(ConstInt(v)) -> Some(v)
+        _ -> None
+end const_arg_value
+
+// The tag a **simple enum's variant** stands for, where the value parameter's declared type is that
+// enum. A simple enum's value IS its identity -- nothing else tells two of its variants apart -- so
+// its tag is exactly the number a type's identity wants; a data enum's is not, and gets no case.
+private variant_tag(e: Expr, ty: Type) -> Option[int]
+    val n = *e.kind match
+        Ident(n) -> n
+        _ -> return None
+
+    ty match
+        Enum(d) ->
+            if !d.simple then return None
+
+            val v = d.variant(n)
+
+            if v.is_some() then Some(v.unwrap().tag) else None
+        _ -> None
+end variant_tag
 
 // A nominal declaration's type parameters and the ones of them it wrote a `const` type for.
 private declared_values(a: &Analysis, key: string) -> (Buf[string], Buf[TypeBinding]) =
