@@ -1,0 +1,338 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A name bound by `ref` is not an assembly operand (`reference/inline-assembly.md § What an operand
+// may be` asks for a plain variable; `reference/memory.md § ref — a name for a place` is why a
+// `ref` is not one).
+//
+// An operand is loaded from a variable's slot before the instructions run, or stored to it after
+// them, and a `ref` has no slot: it is a second name for storage somewhere else. So the operand is
+// refused by name, whichever direction it travels and whatever the place is -- and it is refused
+// **before** the two questions an operand is otherwise asked, which is why a `ref` to a `val`
+// written by the instructions, and a `ref` to a float, are each told about the `ref` and nothing
+// else.
+//
+// **Every message and position here was read out of the reference compiler** (0.0.152), one probe
+// per shape, on `aarch64-macos` -- and on `x86_64-linux` for the case its own `InlineAssemblyTests`
+// carries. The machine is named rather than taken from the host, the arm that is read being the
+// machine's.
+
+private val aro_arm: string = "aarch64-macos"
+private val aro_intel: string = "x86_64-linux"
+
+private var aro_arm_cache: Buf[Program] = buf()
+private var aro_arm_read: bool = false
+private var aro_intel_cache: Buf[Program] = buf()
+private var aro_intel_read: bool = false
+
+private aro_units(machine: string) -> Buf[Program]
+    std_root() match
+        Err(_) -> buf()
+        Ok(root) -> std_units(root, target_named(machine).unwrap()) match
+            Err(_) -> buf()
+            Ok(units) -> units
+end aro_units
+
+// The library as one machine reads it, read once for each of the two machines named here.
+private aro_library(machine: string) -> Buf[Program]
+    if machine == aro_intel
+        if !aro_intel_read then aro_intel_cache = aro_units(machine)
+
+        aro_intel_read = true
+
+        return aro_intel_cache
+    end if
+
+    if !aro_arm_read then aro_arm_cache = aro_units(machine)
+
+    aro_arm_read = true
+    aro_arm_cache
+end aro_library
+
+private aro_ready() -> bool
+    if aro_library(aro_arm).is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end aro_ready
+
+// The whole report a program is refused with on one machine, and nothing where it is accepted.
+private aro_err(text: string, machine: string) -> string
+    var units: Buf[Program] = buf()
+    val library = aro_library(machine)
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    val parsed = parse(source_of("main.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, target_named(machine).unwrap())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end aro_err
+
+private aro_not_an_operand(name: string) -> string =
+    s"'$name' is bound by 'ref', so it names storage somewhere else rather than a variable of its " +
+        "own, and there is nothing here for an operand to be. Copy it into a 'var' first, and " +
+        "write that back afterwards if the instructions set it"
+
+// That a report is this one diagnostic at this position, and says nothing else.
+private aro_refused(report: string, name: string, line: int, col: int)
+    val wide = if line < 10 then "" else " "
+    val head = s"error: ${aro_not_an_operand(name)}\n$wide --> main.sysl:$line:$col\n"
+
+    assert(report.starts_with(head), s"expected the report to begin\n$head\nand it is\n$report")
+    assert_eq(report.count_of("error: "), 1)
+end aro_refused
+
+@test("an operand read by the instructions may not name a ref to a local")
+aro_an_input_naming_a_ref_to_a_local()
+    if !aro_ready() then return
+
+    aro_refused(aro_err(raw"""
+        f()
+            var n: int = 1
+            ref r = n
+            asm
+                [aarch64]
+                    "mov x9, {r}"
+                    in r : reg
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """, aro_arm), "r", 7, 13)
+
+@test("nor may an operand the instructions write")
+aro_an_output_naming_a_ref_to_a_local()
+    if !aro_ready() then return
+
+    aro_refused(aro_err(raw"""
+        f()
+            var n: int = 1
+            ref r = n
+            asm
+                [aarch64]
+                    "mov {r}, x9"
+                    out r : reg
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """, aro_arm), "r", 7, 13)
+
+@test("a ref to a field is refused as an operand")
+aro_a_ref_to_a_field()
+    if !aro_ready() then return
+
+    aro_refused(aro_err(raw"""
+        struct P
+            x: int
+            y: int
+
+        f()
+            var p = P(1, 2)
+            ref r = p.x
+            asm
+                [aarch64]
+                    "mov x9, {r}"
+                    in r : reg
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """, aro_arm), "r", 11, 13)
+
+@test("a ref to an array element is refused as an operand")
+aro_a_ref_to_an_element()
+    if !aro_ready() then return
+
+    aro_refused(aro_err(raw"""
+        f()
+            var a: [3]int = [1, 2, 3]
+            ref r = a[1]
+            asm
+                [aarch64]
+                    "mov {r}, x9"
+                    out r : reg
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """, aro_arm), "r", 7, 13)
+
+@test("a ref to module storage is refused as an operand")
+aro_a_ref_to_module_storage()
+    if !aro_ready() then return
+
+    aro_refused(aro_err(raw"""
+        static var count: int = 0
+
+        f()
+            ref r = count
+            asm
+                [aarch64]
+                    "mov x9, {r}"
+                    in r : reg
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """, aro_arm), "r", 8, 13)
+
+@test("a ref to a volatile register is refused as an operand")
+aro_a_ref_to_a_register()
+    if !aro_ready() then return
+
+    aro_refused(aro_err(raw"""
+        struct Uart
+            data: volatile uint
+
+        f(u: *Uart)
+            ref r = u.data
+            asm
+                [aarch64]
+                    "mov {r}, x9"
+                    out r : reg
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        var u = Uart(0)
+        f(&u)
+        """, aro_arm), "r", 9, 13)
+
+@test("a ref of a ref is refused under the name the operand wrote")
+aro_a_ref_of_a_ref()
+    if !aro_ready() then return
+
+    aro_refused(aro_err(raw"""
+        f()
+            var n: int = 1
+            ref r = n
+            ref q = r
+            asm
+                [aarch64]
+                    "mov x9, {q}"
+                    in q : reg
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """, aro_arm), "q", 8, 13)
+
+@test("a written ref to a val is told about the ref, and nothing about the val")
+aro_a_written_ref_to_a_val()
+    if !aro_ready() then return
+
+    aro_refused(aro_err(raw"""
+        f()
+            val n: int = 1
+            ref r = n
+            asm
+                [aarch64]
+                    "mov {r}, x9"
+                    out r : reg
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """, aro_arm), "r", 7, 13)
+
+@test("a ref to a float is told about the ref, and nothing about the register it would not fit")
+aro_a_ref_to_a_float()
+    if !aro_ready() then return
+
+    aro_refused(aro_err(raw"""
+        f()
+            var n: real = 1.0
+            ref r = n
+            asm
+                [aarch64]
+                    "mov x9, {r}"
+                    in r : reg
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """, aro_arm), "r", 7, 13)
+
+@test("the operand beside it that names a variable is left alone")
+aro_the_variable_beside_it_is_left_alone()
+    if !aro_ready() then return
+
+    aro_refused(aro_err(raw"""
+        f()
+            var n: int = 1
+            ref r = n
+            asm
+                [aarch64]
+                    "mov {n}, {r}"
+                    in r : reg
+                    out n : reg
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """, aro_arm), "r", 7, 13)
+
+@test("a name bound by 'ref' is not an operand, since it has no slot of its own")
+aro_a_name_bound_by_ref_is_not_an_operand()
+    if !aro_ready() then return
+
+    aro_refused(aro_err(raw"""
+        f()
+            var n: int = 1
+            ref r = n
+            asm
+                [x86_64]
+                    "nop {r}"
+                    in r : reg
+                [aarch64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+
+        f()
+        """, aro_intel), "r", 7, 13)
+
+@test("copying the ref into a var first, and writing it back, is accepted")
+aro_copying_into_a_var_first_is_accepted()
+    if !aro_ready() then return
+
+    assert_eq(aro_err(raw"""
+        f() -> int
+            var n: int = 1
+            ref r = n
+            var was = r
+            var now: int = 0
+            asm
+                [aarch64]
+                    "add {now}, {was}, #1"
+                    in was : reg
+                    out now : reg
+                [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+            r = now
+            n
+
+        print(f())
+        """, aro_arm), "")
+
+@test("an arm for another processor is not read, so a ref named there is not refused here")
+aro_another_processors_arm_is_not_read()
+    if !aro_ready() then return
+
+    assert_eq(aro_err(raw"""
+        f() -> int
+            var n: int = 1
+            ref r = n
+            asm
+                [x86_64]
+                    "nop {r}"
+                    in r : reg
+                [aarch64]
+                    "nop"
+                [thumb, riscv64, riscv32, craft, wasm32] unavailable "not this test's business"
+            r
+
+        print(f())
+        """, aro_arm), "")
