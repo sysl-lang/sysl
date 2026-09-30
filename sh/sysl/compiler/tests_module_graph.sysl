@@ -387,6 +387,55 @@ mgr_a_root_file_names_several_modules()
 
     assert_eq(mgr_out(fs), "42\n")
 
+// -- a copied default is read where the trait wrote it ------------------------------------------------
+
+// What the case above rests on. A default's body is the trait's source, so the names in it are the
+// trait's file's -- a helper private to that file included -- wherever the block that took it is.
+@test("a default copied into another module's generic type reads its own file's names")
+mgr_a_copied_default_reads_its_traits_names()
+    if mgr_skip() then return
+
+    var fs = mgr_of("import a.Show\nprint(b.P(1).twice())")
+
+    fs.push(("a", "a.sysl", "module a\nhelper(n: int) -> int = n * 2\ntrait Show\n" +
+                            "    n(self) -> int\n    twice(self) -> int = helper(self.n())"))
+    fs.push(("b", "b.sysl", "module b\nimport a.Show\nstruct P[T]\n    v: T\n" +
+                            "impl[T] Show for P[T]\n    n(self) -> int = 21"))
+
+    assert_eq(mgr_out(fs), "42\n")
+
+@test("and so does one copied into a plain type, by a block that named the trait through its module")
+mgr_a_copied_default_on_a_plain_type()
+    if mgr_skip() then return
+
+    var fs = mgr_of("import a.Show\nprint(b.P(1).twice())")
+
+    fs.push(("a", "a.sysl", "module a\nprivate helper(n: int) -> int = n * 2\ntrait Show\n" +
+                            "    n(self) -> int\n    twice(self) -> int = helper(self.n())"))
+    fs.push(("b", "b.sysl", "module b\nstruct P\n    v: int\nimpl a.Show for P\n" +
+                            "    n(self) -> int = 21"))
+
+    assert_eq(mgr_out(fs), "42\n")
+
+// A default the trait's own walk refused is one mistake, told once and in the trait's file: the copy
+// is not read again at the implementing type, where it would land on a line of another file.
+@test("a refused default is reported once, in the trait's file")
+mgr_a_refused_default_is_reported_in_the_traits_file()
+    if mgr_skip() then return
+
+    var fs = mgr_of("import a.Show\nprint(b.P(1).twice())")
+
+    fs.push(("a", "a.sysl", "module a\ntrait Show\n    n(self) -> int\n" +
+                            "    twice(self) -> int = self.n() * \"x\""))
+    fs.push(("b", "b.sysl", "module b\nimport a.Show\nstruct P[T]\n    v: T\n" +
+                            "impl[T] Show for P[T]\n    n(self) -> int = 21"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, "'*' needs matching types, got int and string")
+    mgr_says(said, "a/a.sysl:4:37")
+    assert(!said.contains("b/b.sysl"), said)
+
 // -- what the reference suite does not ask ------------------------------------------------------------
 
 // The case `ComputedValTests` states as "two modules reading each other's tables is a module cycle":
