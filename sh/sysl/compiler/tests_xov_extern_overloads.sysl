@@ -1,0 +1,379 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Status, capture}
+import sysl.text.Search
+
+// Two `extern` declarations of one name are an overload set exactly when they name two C symbols
+// (`reference/declarations.md § Overloading an 'extern'`): a call chooses among them by its
+// arguments and an address by the type the context wants, each reaching the symbol its own
+// declaration named.
+//
+// **Every output, exit status and diagnostic here was read out of the reference compiler (0.0.152)**
+// by handing the installed `sysl` the same tree. Three things differ on purpose and are said where
+// they are asserted: a declaration in a module is quoted by its qualified name (`'m.mag'`) where the
+// reference prints it bare, the `@needs` refusal names the function (`'m.mag'`) where the reference
+// prints the slot it filed the overload under (`'m.mag.2'`), and a sysl function declared after an
+// `extern` of its name *and then called* is refused here where the reference stops with an
+// exception.
+
+// What a program of several files prints and the status it exits with, built and linked for real:
+// which symbol a call reached is a claim only a linker settles. A build that was refused answers
+// with the refusal.
+private xov_ran(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-xov").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Exited(code) -> s"${out.text}exit $code\n"
+            _ -> s"${out.text}did not exit\n"
+end xov_ran
+
+private xov_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+// A refusal carries this message, anchored at this `file:line:column`.
+private xov_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> "), said)
+    assert(said.contains(s"/$at\n"), said)
+
+// The refusal two declarations of one name naming one symbol earn.
+private xov_one_symbol(name: string, symbol: string) -> string =
+    s"'$name' is already declared as an 'extern' for the symbol '$symbol' — two declarations of " +
+    "one name are two functions, and one C function cannot be two. Overloads of an 'extern' are " +
+    "told apart by the symbol each names, so give this one a symbol of its own or take its " +
+    "address and 'ptr_cast' it where the other signature is wanted"
+
+// `abs` and `labs` under one sysl name, which is the pair every program here begins with.
+private xov_pair() -> string =
+    "extern \"abs\" mag(x: int) -> int\nextern \"labs\" mag(x: long) -> long\n\n"
+
+// -- the legal shapes ------------------------------------------------------------------------------
+
+// The reference's own case, against two C functions that answer differently for the same input: a
+// call reaching the wrong one prints the wrong number rather than failing to build.
+@test("two externs of one name naming two symbols are two functions")
+xov_two_symbols_are_two_functions()
+    if xvr_no_library() then return
+
+    val shim = "int probe_one(int a) { return a + 1; }\n" +
+               "int probe_two(int a, int b) { return a * b; }\n"
+
+    assert_eq(xov_ran([("shim.c", shim),
+                       ("main.sysl", "extern \"probe_one\" bump(a: int) -> int\n" +
+                                     "extern \"probe_two\" bump(a: int, b: int) -> int\n\n" +
+                                     "print(str(bump(41)), str(bump(6, 7)))\n")]),
+              "42 42\nexit 0\n")
+end xov_two_symbols_are_two_functions
+
+@test("a call chooses by its argument's type, and an address by the type the context wants")
+xov_chosen_by_type()
+    if xvr_no_library() then return
+
+    assert_eq(xov_ran(xov_main(xov_pair() +
+                               "val a: int = -3\nval b: long = -40\n\n" +
+                               "print(mag(a), mag(b))\n\n" +
+                               "val one: *extern(int) -> int = &mag\n" +
+                               "val two: *extern(long) -> long = &mag\n\n" +
+                               "print(one(a), two(b))\n")),
+              "3 40\n3 40\nexit 0\n")
+end xov_chosen_by_type
+
+@test("each overload is declared once under its own symbol, and each call and address names it")
+xov_each_under_its_own_symbol()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(xov_main(xov_pair() +
+                             "val a: int = -3\nval b: long = -40\n\n" +
+                             "print(mag(a), mag(b))\n\n" +
+                             "val one: *extern(int) -> int = &mag\n" +
+                             "val two: *extern(long) -> long = &mag\n\n" +
+                             "print(one(a), two(b))\n"))
+
+    assert_eq(xvr_count(ir, "declare i32 @abs(i32)\n"), 1)
+    assert_eq(xvr_count(ir, "declare i64 @labs(i64)\n"), 1)
+    assert(ir.contains(" = call i32 @abs(i32 "), ir)
+    assert(ir.contains(" = call i64 @labs(i64 "), ir)
+    assert(ir.contains("store ptr @abs, ptr %one.addr\n"), ir)
+    assert(ir.contains("store ptr @labs, ptr %two.addr\n"), ir)
+    assert(!ir.contains("@mag"), ir)
+end xov_each_under_its_own_symbol
+
+@test("a literal both overloads could take is the first one's")
+xov_a_literal_takes_the_first()
+    if xvr_no_library() then return
+
+    assert_eq(xov_ran(xov_main(xov_pair() + "print(mag(-7))\n")), "7\nexit 0\n")
+
+@test("an extern with no link name overloads under its own name, and there may be three")
+xov_a_bare_name_is_a_symbol_too()
+    if xvr_no_library() then return
+
+    assert_eq(xov_ran(xov_main("extern abs(x: int) -> int\n" +
+                               "extern \"labs\" abs(x: long) -> long\n" +
+                               "extern \"llabs\" abs(x: i64, y: int) -> i64\n\n" +
+                               "val a: int = -3\nval b: long = -40\n\n" +
+                               "print(abs(a), abs(b))\n")),
+              "3 40\nexit 0\n")
+end xov_a_bare_name_is_a_symbol_too
+
+@test("the overloads of an extern may sit in two files of one module")
+xov_across_two_files()
+    if xvr_no_library() then return
+
+    assert_eq(xov_ran([("main.sysl", "import m\n\nval a: int = -3\nval b: long = -40\n\n" +
+                                     "print(m.mag(a), m.mag(b), m.both(a, b))\n"),
+                       ("m/one.sysl", "module m\n\nextern \"abs\" mag(x: int) -> int\n"),
+                       ("m/two.sysl", "module m\n\nextern \"labs\" mag(x: long) -> long\n\n" +
+                                      "both(a: int, b: long) -> long = long(mag(a)) + mag(b)\n")]),
+              "3 40 43\nexit 0\n")
+end xov_across_two_files
+
+@test("an overloaded extern imported by name brings every declaration of the name")
+xov_imported_by_name()
+    if xvr_no_library() then return
+
+    assert_eq(xov_ran([("main.sysl", "import m.mag\n\nval a: int = -3\nval b: long = -40\n\n" +
+                                     "print(mag(a), mag(b))\n" +
+                                     "val two: *extern(long) -> long = &mag\nprint(two(b))\n"),
+                       ("m/one.sysl", "module m\n\n" + xov_pair())]),
+              "3 40\n40\nexit 0\n")
+end xov_imported_by_name
+
+private xov_private_second() -> (string, string) =
+    ("m/two.sysl", "module m\n\nprivate extern \"labs\" mag(x: long) -> long\n\n" +
+                   "both(a: int, b: long) -> long = long(mag(a)) + mag(b)\n")
+
+@test("a file-private overload is one of the set in its own file")
+xov_a_private_overload_in_its_own_file()
+    if xvr_no_library() then return
+
+    assert_eq(xov_ran([("main.sysl", "import m\n\nval a: int = -3\nval b: long = -40\n\n" +
+                                     "print(m.mag(a), m.both(a, b))\n"),
+                       ("m/one.sysl", "module m\n\nextern \"abs\" mag(x: int) -> int\n"),
+                       xov_private_second()]),
+              "3 43\nexit 0\n")
+end xov_a_private_overload_in_its_own_file
+
+// The one declaration another file can see is the whole of the name there, so the refusal is that
+// declaration's own complaint about its parameter rather than a roster.
+@test("and is no part of it anywhere else")
+xov_a_private_overload_elsewhere()
+    if xvr_no_library() then return
+
+    xov_refused(xov_ran([("main.sysl", "import m\n\nval a: int = -3\nval b: long = -40\n\n" +
+                                       "print(m.mag(a), m.both(a, b))\nprint(m.mag(b))\n"),
+                         ("m/one.sysl", "module m\n\nextern \"abs\" mag(x: int) -> int\n"),
+                         xov_private_second()]),
+                "'x' of 'm.mag' is int, but long was given", "main.sysl:7:13")
+end xov_a_private_overload_elsewhere
+
+// -- what a declaration may not be -----------------------------------------------------------------
+
+@test("two externs of one name naming ONE symbol are refused")
+xov_one_symbol_is_refused()
+    if xvr_no_library() then return
+
+    xov_refused(xov_ran(xov_main("extern \"strlen\" size(s: *u8) -> usize\n" +
+                                 "extern \"strlen\" size(s: *u8, cap: usize) -> usize\n\n" +
+                                 "print(1)\n")),
+                xov_one_symbol("size", "strlen"), "main.sysl:2:1")
+end xov_one_symbol_is_refused
+
+@test("the symbol a third declaration repeats is the one the refusal names")
+xov_the_symbol_repeated_is_named()
+    if xvr_no_library() then return
+
+    val said = xov_ran(xov_main(xov_pair() +
+                                "extern \"labs\" mag(x: long, y: int) -> long\n\nprint(1)\n"))
+
+    xov_refused(said, xov_one_symbol("mag", "labs"), "main.sysl:4:1")
+    assert_eq(xvr_count(said, "error: "), 1)
+end xov_the_symbol_repeated_is_named
+
+@test("an outright duplicate is told both things that are wrong with it")
+xov_a_duplicate_is_told_both()
+    if xvr_no_library() then return
+
+    val said = xov_ran(xov_main("extern \"abs\" mag(x: int) -> int\n" +
+                                "extern \"abs\" mag(x: int) -> int\n\nprint(1)\n"))
+
+    xov_refused(said, xov_one_symbol("mag", "abs"), "main.sysl:2:1")
+    xov_refused(said, "function 'mag' is already declared", "main.sysl:2:1")
+    assert_eq(xvr_count(said, "error: "), 2)
+end xov_a_duplicate_is_told_both
+
+@test("a file-private extern does not free its symbol for another file's declaration of the name")
+xov_a_private_extern_keeps_its_symbol()
+    if xvr_no_library() then return
+
+    xov_refused(xov_ran([("main.sysl", "import m\n\nprint(1)\n"),
+                         ("m/one.sysl", "module m\n\nprivate extern \"abs\" mag(x: int) -> int\n"),
+                         ("m/two.sysl", "module m\n\nextern \"abs\" mag(x: long) -> long\n")]),
+                xov_one_symbol("mag", "abs"), "m/two.sysl:3:1")
+end xov_a_private_extern_keeps_its_symbol
+
+@test("two symbols at one parameter list are a duplicate, there being no call to tell them apart")
+xov_same_parameters()
+    if xvr_no_library() then return
+
+    val said = xov_ran(xov_main("extern \"abs\" mag(x: int) -> int\n" +
+                                "extern \"labs\" mag(x: int) -> int\n\nprint(1)\n"))
+
+    xov_refused(said, "function 'mag' is already declared", "main.sysl:2:1")
+    assert_eq(xvr_count(said, "error: "), 1)
+end xov_same_parameters
+
+@test("and a file-private one beside another file's public one is that duplicate too")
+xov_same_parameters_across_files()
+    if xvr_no_library() then return
+
+    xov_refused(xov_ran([("main.sysl", "import m\n\nprint(1)\n"),
+                         ("m/one.sysl", "module m\n\nprivate extern \"abs\" mag(x: int) -> int\n"),
+                         ("m/two.sysl", "module m\n\nextern \"labs\" mag(x: int) -> int\n")]),
+                "function 'mag' is already declared", "m/two.sysl:3:1")
+end xov_same_parameters_across_files
+
+@test("two differing only in what they return are told that a result decides nothing")
+xov_differing_only_in_the_result()
+    if xvr_no_library() then return
+
+    xov_refused(xov_ran(xov_main("extern \"abs\" mag(x: int) -> int\n" +
+                                 "extern \"labs\" mag(x: int) -> long\n\nprint(1)\n")),
+                "function 'mag' is already declared — which declaration a call means is decided " +
+                "by its arguments and never by what it returns, so two that differ only in the " +
+                "result have no call that tells them apart", "main.sysl:2:1")
+end xov_differing_only_in_the_result
+
+@test("as are two whose difference is behind a default")
+xov_behind_a_default()
+    if xvr_no_library() then return
+
+    xov_refused(xov_ran(xov_main("extern \"abs\" mag(x: int) -> int\n" +
+                                 "extern \"labs\" mag(x: int, y: int = 0) -> int\n\nprint(1)\n")),
+                "'mag' is already declared with parameters this one could not be told from — a " +
+                "call passing 1 argument would fit both, and which declaration a call means is " +
+                "decided by its arguments and never by what it returns. Two declarations of one " +
+                "name have to differ in a way a call site can show", "main.sysl:2:1")
+end xov_behind_a_default
+
+@test("an 'extern' may not overload a sysl function")
+xov_an_extern_after_a_function()
+    if xvr_no_library() then return
+
+    xov_refused(xov_ran(xov_main("mag(x: long) -> long = x\n" +
+                                 "extern \"abs\" mag(x: int) -> int\n\nprint(1)\n")),
+                "'mag' is already declared as a function, so this 'extern' would overload it — " +
+                "what tells overloads of an 'extern' apart is the symbol each names, and a sysl " +
+                "function declares no symbol", "main.sysl:2:1")
+end xov_an_extern_after_a_function
+
+// **The reference stops with an exception where the refused function is then called** (`key not
+// found: mag.2`, out of its overloaded-call reading); the declaration's refusal is what the page
+// says and what the reference prints where nothing calls the name, so that is what a call gets here
+// too.
+@test("nor a sysl function an 'extern', called or not")
+xov_a_function_after_an_extern()
+    if xvr_no_library() then return
+
+    val message = "'mag' is already declared as an 'extern', which this would overload — what " +
+                  "tells overloads of an 'extern' apart is the symbol each names, and a sysl " +
+                  "function declares no symbol"
+
+    xov_refused(xov_ran(xov_main("extern \"abs\" mag(x: int) -> int\n" +
+                                 "mag(x: long) -> long = x\n\nprint(1)\n")),
+                message, "main.sysl:2:1")
+    xov_refused(xov_ran(xov_main("extern \"abs\" mag(x: int) -> int\n" +
+                                 "mag(x: long) -> long = x\n\n" +
+                                 "val a: int = -3\n\nprint(mag(a))\n")),
+                message, "main.sysl:2:1")
+end xov_a_function_after_an_extern
+
+// -- what a use may not be -------------------------------------------------------------------------
+
+private xov_roster() -> string =
+    "no 'mag' takes these arguments — the declarations of that name are:\n" +
+    "    mag(x: int)\n    mag(x: long)"
+
+@test("a call no overload fits is shown the declarations there are")
+xov_no_overload_fits()
+    if xvr_no_library() then return
+
+    xov_refused(xov_ran(xov_main(xov_pair() + "print(mag(\"no\"))\n")), xov_roster(),
+                "main.sysl:4:7")
+
+@test("and so is one passing a count none of them takes")
+xov_no_overload_takes_the_count()
+    if xvr_no_library() then return
+
+    xov_refused(xov_ran(xov_main(xov_pair() + "print(mag(1, 2))\n")), xov_roster(), "main.sysl:4:7")
+
+@test("an overloaded extern addressed where no type is wanted is refused rather than guessed at")
+xov_an_address_with_no_expected_type()
+    if xvr_no_library() then return
+
+    xov_refused(xov_ran(xov_main(xov_pair() + "print(mag(-7))\n\nval f = &mag\n")),
+                "'mag' names 2 functions, and an address is of one of them — which is read off " +
+                "the type the context wants, and there is none here. Annotate what this address " +
+                "is being stored in or passed as", "main.sysl:6:9")
+end xov_an_address_with_no_expected_type
+
+@test("and one addressed at parameters no declaration has is shown what each is")
+xov_an_address_none_matches()
+    if xvr_no_library() then return
+
+    xov_refused(xov_ran(xov_main(xov_pair() + "val q: *extern(*u8) -> int = &mag\n")),
+                "no 'mag' has the parameters '*extern(*byte) -> int' asks for — the declarations " +
+                "of that name are:\n    mag: *extern(int) -> int\n    mag: *extern(long) -> long",
+                "main.sysl:4:30")
+end xov_an_address_none_matches
+
+@test("a variadic overload is chosen by its named parameters and then has no address")
+xov_a_variadic_overload_addressed()
+    if xvr_no_library() then return
+
+    xov_refused(xov_ran(xov_main("extern \"abs\" mag(x: int) -> int\n" +
+                                 "extern \"printf\" mag(fmt: *u8, ...) -> int\n\n" +
+                                 "val v: *extern(*u8) -> int = &mag\n")),
+                "'mag' is variadic, and a '*extern' fixes the arguments a call passes — a tail " +
+                "has no width a signature could state, so a variadic function is reached by " +
+                "calling it", "main.sysl:4:30")
+end xov_a_variadic_overload_addressed
+
+// **The reference names the slot here** -- `this reaches 'm.mag.2'` -- which is the key the second
+// declaration was filed under and nothing a reader wrote; this compiler names the function.
+@test("'@needs' is each overload's own: the call that reaches the one carrying it is the one refused")
+xov_needs_is_per_overload()
+    if xvr_no_library() then return
+
+    val said = xov_ran([("main.sysl", "import m\n\nval a: int = -3\nval b: long = -40\n\n" +
+                                      "print(m.quiet(a), m.loud(b))\n"),
+                        ("m/one.sysl", "module m\n@no_os\n\n" +
+                                       "extern \"abs\" mag(x: int) -> int\n\n" +
+                                       "@needs(os)\nextern \"labs\" mag(x: long) -> long\n\n" +
+                                       "quiet(a: int) -> int = mag(a)\n\n" +
+                                       "loud(b: long) -> long = mag(b)\n")])
+
+    xov_refused(said, "this reaches 'm.mag', which needs 'os', and 'm' declared '@no_os'",
+                "m/one.sysl:11:25")
+    assert_eq(xvr_count(said, "error: "), 1)
+end xov_needs_is_per_overload
