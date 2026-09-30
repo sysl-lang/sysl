@@ -1,0 +1,322 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What value generics left to settle (`reference/generics.md § A parameter may stand for a value`):
+// where a TYPE parameter written as a length is refused, what a value argument is held to, and what
+// is said after a length that was refused.
+//
+// **Every string quoted here was read out of the reference compiler** (0.0.152). Where this compiler
+// says less than the reference does, the test says so and why.
+
+private var vgf_library_cache: Buf[Program] = buf()
+private var vgf_library_read: bool = false
+
+private vgf_library() -> Buf[Program]
+    if vgf_library_read then return vgf_library_cache
+
+    vgf_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> vgf_library_cache = units
+
+    vgf_library_cache
+end vgf_library
+
+private vgf_ready() -> bool
+    if vgf_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end vgf_ready
+
+// How many times a report says something.
+private vgf_count(text: string, part: string) -> int
+    var rest = text
+    var n = 0
+
+    loop
+        rest.index_of(part) match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + part.bytes.len..<rest.bytes.len]
+
+    n
+end vgf_count
+
+private vgf_ran(text: string) -> string
+    val root = make_temp_dir("sysl-value-generics-followups").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vgf_ran
+
+private vgf_err(text: string) -> string
+    val root = make_temp_dir("sysl-value-generics-followups").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vgf_err
+
+private vgf_not_a_length(n: string) -> string =
+    s"'$n' is a type parameter, and an array's length is a value rather than a type — a parameter " +
+    s"that stands for a length is declared 'const $n: usize'"
+
+// The one sentence, once, at one place.
+private vgf_told_once(said: string, n: string, at: string)
+    assert_eq(vgf_count(said, vgf_not_a_length(n)), 1, said)
+    assert_eq(vgf_count(said, "main.sysl:"), 1, said)
+    assert(said.index_of(s"main.sysl:$at").is_some(), said)
+end vgf_told_once
+
+// -- a type parameter written as a length, told where the type is read ------------------------------
+
+@test("a trait's member writing the trait's type parameter as a length is refused at the type")
+vgf_a_trait_members_length()
+    if !vgf_ready() then return
+
+    vgf_told_once(vgf_err(raw"""
+        trait Tr[T]
+            f(self, xs: [T]int) -> usize
+        print(1)
+        """), "T", "2:17")
+
+@test("and the member's own type parameter")
+vgf_a_trait_members_own_parameter()
+    if !vgf_ready() then return
+
+    vgf_told_once(vgf_err(raw"""
+        trait Tr
+            f[U](self, xs: [U]int) -> usize
+        print(1)
+        """), "U", "2:20")
+
+@test("and in the member's result")
+vgf_a_trait_members_result()
+    if !vgf_ready() then return
+
+    vgf_told_once(vgf_err(raw"""
+        trait Tr[T]
+            f(self) -> [T]int
+        print(1)
+        """), "T", "2:16")
+
+@test("and as a vector's lane count")
+vgf_a_trait_members_lanes()
+    if !vgf_ready() then return
+
+    vgf_told_once(vgf_err(raw"""
+        trait Tr[T]
+            f(self, xs: <T>f32) -> usize
+        print(1)
+        """), "T", "2:17")
+
+@test("and where the member carries a default body")
+vgf_a_trait_members_default()
+    if !vgf_ready() then return
+
+    vgf_told_once(vgf_err(raw"""
+        trait Tr[T]
+            f(self, xs: [T]int) -> usize = 0
+        print(1)
+        """), "T", "2:17")
+
+@test("a type's own member is told once, at the member")
+vgf_a_types_member_is_told_once()
+    if !vgf_ready() then return
+
+    vgf_told_once(vgf_err(raw"""
+        struct S[T]
+            v: T
+            f(self, xs: [T]int) -> usize = 0
+        var s = S(1)
+        print(s.v)
+        """), "T", "3:5")
+
+@test("and so is a member generic in its own right")
+vgf_a_generic_member_is_told_once()
+    if !vgf_ready() then return
+
+    vgf_told_once(vgf_err(raw"""
+        struct S
+            v: int
+            f[T](self, xs: [T]int) -> usize = 0
+        var s = S(1)
+        print(s.v)
+        """), "T", "3:5")
+
+@test("an 'impl' for a vector over a type parameter's lane count is refused at the subject")
+vgf_an_impl_subjects_lanes()
+    if !vgf_ready() then return
+
+    vgf_told_once(vgf_err(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[N] Tag for <N>f32
+            tag(self) -> string = "any"
+        print(1)
+        """), "N", "3:17")
+
+// -- a value parameter stands as a number wherever a signature is read ------------------------------
+
+@test("a value parameter is a length in a member's signature, the type's and the member's own")
+vgf_value_parameters_in_member_signatures()
+    if !vgf_ready() then return
+
+    assert_eq(vgf_ran(raw"""
+        struct Buf[const N: usize]
+            data: [N]byte
+            f(self, xs: [N]int) -> usize = xs.len
+            g[const M: usize](self, xs: [M]int) -> usize = M
+        var b: Buf[2] = Buf([1, 2])
+        print(b.f([1, 2]))
+        print(b.g([1, 2, 3]))
+        """), "2\n3\n")
+
+@test("and in an enum's, and in a trait member's own")
+vgf_value_parameters_in_enum_and_trait_members()
+    if !vgf_ready() then return
+
+    assert_eq(vgf_ran(raw"""
+        enum E[const N: usize]
+            A(xs: [N]int)
+            B
+            f(self, xs: [N]int) -> usize = N
+        trait Tr
+            k[const M: usize](self, xs: [M]int) -> usize
+        struct S
+            v: int
+        impl Tr for S
+            k[const M: usize](self, xs: [M]int) -> usize = M
+        var e: E[2] = A([1, 2])
+        print(e.f([3, 4]))
+        print(S(1).k([1, 2, 3]))
+        """), "2\n3\n")
+
+// -- a value argument against its slot ---------------------------------------------------------------
+
+// The reference reads a variant as a value argument only where the slot's declared type is that
+// variant's own enum, so another enum's variant is not a constant of any kind here. It says the
+// general sentence rather than one about the two enums.
+@test("a variant of another enum is not a value of the slot's enum")
+vgf_a_variant_of_another_enum()
+    if !vgf_ready() then return
+
+    val said = vgf_err(raw"""
+        enum Level
+            Low
+            High
+        enum Other
+            X
+            Y
+        struct Gauge[const L: Level]
+            v: int
+        var g: Gauge[X] = Gauge(1)
+        print(g.v)
+        """)
+
+    assert_eq(vgf_count(said, "a value argument must be a constant — a literal, or a 'const' " +
+                              "naming one"), 1, said)
+    assert_eq(vgf_count(said, "main.sysl:"), 1, said)
+    assert(said.index_of("main.sysl:9:8").is_some(), said)
+
+@test("and a variant is not a value of an integer slot")
+vgf_a_variant_at_an_integer_slot()
+    if !vgf_ready() then return
+
+    val said = vgf_err(raw"""
+        enum Level
+            Low
+            High
+        struct Gauge[const L: usize]
+            v: int
+        var g: Gauge[Low] = Gauge(1)
+        print(g.v)
+        """)
+
+    assert_eq(vgf_count(said, "a value argument must be a constant — a literal, or a 'const' " +
+                              "naming one"), 1, said)
+    assert_eq(vgf_count(said, "main.sysl:"), 1, said)
+    assert(said.index_of("main.sysl:6:8").is_some(), said)
+
+// -- what is said after a length that was refused ----------------------------------------------------
+
+// **A deliberate divergence.** The reference follows this with `an empty array literal takes its
+// element type from its context, and there is none here` at 3:22. That is not a rule about the
+// literal: the reference reads each field of an instantiation in a recovery of its own, so the
+// refused field is left with no type, the statement that asked for `Buf[-1]` is never told anything
+// went wrong, and the literal is then read against a field that has none. Here a statement is one
+// recovery region and its first refusal is the only one it makes -- the literal HAS a context, and
+// it is the one already refused.
+@test("a negative length through a value argument is one mistake, told at the length")
+vgf_a_negative_length_is_told_once()
+    if !vgf_ready() then return
+
+    val said = vgf_err(raw"""
+        struct Buf[const N: usize]
+            data: [N]byte
+        var b: Buf[-1] = Buf([])
+        print(b.data.len)
+        """)
+
+    assert_eq(vgf_count(said, "an array cannot have -1 elements"), 1, said)
+    assert_eq(vgf_count(said, "main.sysl:"), 1, said)
+    assert(said.index_of("main.sysl:2:11").is_some(), said)
+
+// The same divergence, reached the other way: a generic type's field is judged where the type is
+// instantiated, and the reference adds the same sentence about the literal at 3:19.
+@test("and a type argument where a field wrote a length is one mistake, told at the field")
+vgf_a_type_argument_as_a_fields_length()
+    if !vgf_ready() then return
+
+    val said = vgf_err(raw"""
+        struct S[T]
+            data: [T]int
+        var s: S[int] = S([])
+        print(s.data.len)
+        """)
+
+    assert_eq(vgf_count(said, "an array length must be a constant — a literal, or a 'const' " +
+                              "naming one"), 1, said)
+    assert_eq(vgf_count(said, "main.sysl:"), 1, said)
+    assert(said.index_of("main.sysl:2:11").is_some(), said)
