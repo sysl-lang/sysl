@@ -448,6 +448,12 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
         return TExpr(span, TGlobal(extern_var_symbol(d), value_type(cx, d), true))
     end if
 
+    // **A variant this module declares is asked before the function table is.** The tables are read
+    // one at a time, and the function table answers for the library as well as for the module -- so
+    // asked first it hands `stderr`, a variant the program declared on the screen in front of the
+    // reader, to the library's function of that name.
+    if own_variant_name(cx, name) then return variant_expr(cx, span, name, expected)
+
     // A declared function standing where a callable is wanted is one, with nothing captured. It is
     // asked for only where the context says a callable, so a bare function name anywhere else is
     // still the mistake it was. **An `extern` is a declared function too**, and the closure made of
@@ -913,6 +919,31 @@ variant_homes(cx: &Analyzer, name: string) -> Buf[string]
 
     nearest
 end variant_homes
+
+// Whether the module being read declares the name as an enum variant, and declares no function of
+// that name itself. A module that declares both is left as it was, so the duplicate is still reported
+// as one rather than settled here.
+private own_variant_name(cx: &Analyzer, name: string) -> bool
+    if !may_name_variant(cx, name) then return false
+
+    val plain = module_qualify(cx.scope.module_name, name)
+    val here = file_private_key(cx.an, cx.scope.src.name, plain)
+
+    if !overload_keys(cx.an, here).is_empty() || !overload_keys(cx.an, plain).is_empty() then
+        return false
+
+    for i in 0..<cx.an.tables.types.len()
+        val key = cx.an.tables.types.key_at(i)
+
+        cx.an.tables.types.at(i).kind match
+            EnumOf(ed) ->
+                if module_of(key) == cx.scope.module_name && declares_variant(ed, name) &&
+                        reachable_key(cx.an, key, cx.scope) then
+                    return true
+            _ -> ()
+
+    false
+end own_variant_name
 
 private declares_variant(ed: EnumDecl, name: string) -> bool
     for i in 0..<ed.variants.len()
