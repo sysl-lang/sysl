@@ -1,0 +1,125 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// A member read or called through an enum's own name, where the enum does not declare it. **Whether
+// the enum is generic says which instantiation a variant would build and nothing about a name it
+// never declared**, so a library `Result` or `Option` is told the same thing a program's own enum
+// is, and a generic enum's bare name is not reported as undefined.
+//
+// **Every message and location here was read out of the reference compiler** (0.0.151) on the same
+// single-file program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private eml_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end eml_ready
+
+// What analysing a one-file program had to say, rendered as the command line renders it.
+private eml_said(text: string) -> string
+    val root = make_temp_dir("sysl-eml").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end eml_said
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private eml_refused(text: string, message: string, at: string)
+    val out = eml_said(text)
+
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end eml_refused
+
+private eml_accepted(text: string)
+    val out = eml_said(text)
+
+    assert(out == "", s"expected no complaint, got: $out")
+end eml_accepted
+
+// A generic enum with a carrying variant, a nullary one and an associated function.
+private eml_generic() -> string = "enum G[T]\n    A(v: T)\n    B\n\n    make(t: T) -> G[T] = A(t)\n"
+
+// The same shape without a parameter.
+private eml_plain() -> string = "enum E\n    A\n    B\n\n    make() -> E = A\n"
+
+// -- the library's generic enums ------------------------------------------------------------------
+
+@test("a variant a library generic enum does not declare is named as missing, not as a type argument")
+eml_library_enum_missing_variant()
+    if !eml_ready() then return
+
+    eml_refused("val x = Result.Nope\nprint(\"hi\")", "enum 'sysl.Result' has no variant 'Nope'", "1:16")
+    eml_refused("val x = Result.nope\nprint(\"hi\")", "enum 'sysl.Result' has no variant 'nope'", "1:16")
+    eml_refused("val x = Option.nope\nprint(\"hi\")", "enum 'sysl.Option' has no variant 'nope'", "1:16")
+
+@test("a call a library generic enum answers to nothing for is refused about the member, not the enum")
+eml_library_enum_missing_call()
+    if !eml_ready() then return
+
+    eml_refused("val x = Result.Nope(1)\nprint(\"hi\")",
+                "enum 'sysl.Result' has no variant or associated function 'Nope'", "1:16")
+    eml_refused("val x = Option.nope()\nprint(\"hi\")",
+                "enum 'sysl.Option' has no variant or associated function 'nope'", "1:16")
+
+@test("a variant a library generic enum declares is still built through its bare name")
+eml_library_enum_present_variant()
+    if !eml_ready() then return
+
+    eml_accepted("val x: Result[int, string] = Result.Ok(1)\nprint(\"hi\")")
+    eml_accepted("val x = Option.Some(1)\nprint(\"hi\")")
+
+// -- a program's own enums ------------------------------------------------------------------------
+
+@test("a program's generic enum is told about the missing member, read or called")
+eml_own_generic_enum_missing()
+    if !eml_ready() then return
+
+    eml_refused(eml_generic() + "\nval x = G.Nope\nprint(\"hi\")", "enum 'G' has no variant 'Nope'", "7:11")
+    eml_refused(eml_generic() + "\nval x = G.nope()\nprint(\"hi\")",
+                "enum 'G' has no variant or associated function 'nope'", "7:11")
+    eml_refused(eml_generic() + "\nval x = G.Nope(1)\nprint(\"hi\")",
+                "enum 'G' has no variant or associated function 'Nope'", "7:11")
+
+@test("a program's plain enum is told about the missing member with the enum named")
+eml_own_plain_enum_missing()
+    if !eml_ready() then return
+
+    eml_refused(eml_plain() + "\nval x = E.Nope\nprint(\"hi\")", "enum 'E' has no variant 'Nope'", "7:11")
+    eml_refused(eml_plain() + "\nval x = E.nope\nprint(\"hi\")", "enum 'E' has no variant 'nope'", "7:11")
+    eml_refused(eml_plain() + "\nval x = E.nope()\nprint(\"hi\")",
+                "enum 'E' has no variant or associated function 'nope'", "7:11")
+
+@test("an associated function read without its call is told to be called, generic enum or not")
+eml_associated_function_read_bare()
+    if !eml_ready() then return
+
+    eml_refused(eml_generic() + "val x = G.make\nprint(\"hi\")",
+                "'make' is an associated function of 'G' — call it with 'G.make(…)'", "6:11")
+    eml_refused(eml_plain() + "val x = E.make\nprint(\"hi\")",
+                "'make' is an associated function of 'E' — call it with 'E.make(…)'", "6:11")
+
+@test("a present variant and a present associated function of a program's enum still answer")
+eml_own_enum_present_members()
+    if !eml_ready() then return
+
+    eml_accepted(eml_generic() + "\nval x = G.A(1)\nprint(\"hi\")")
+    eml_accepted(eml_generic() + "\nval x = G.make(1)\nprint(\"hi\")")
+    eml_accepted(eml_plain() + "\nval x = E.make()\nprint(\"hi\")")
