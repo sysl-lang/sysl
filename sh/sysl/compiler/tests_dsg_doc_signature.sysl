@@ -1,0 +1,252 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// The signatures `sysl doc` prints, rendered back out of the parsed tree (`doc_signature.sysl`).
+//
+// **Every assertion is on parsed source rather than on a hand-built tree**: the renderer's whole job
+// is to be right about what somebody actually wrote, and parsing is also what proves it needs
+// nothing analyzed. Each expected string is what the installed `sysl-doc` (0.0.152) printed for the
+// same input, except where a test says the renderer departs from it on purpose.
+
+// The rendered signature of the one declaration in `src`, which is written into a module as the
+// reference's own helper does.
+private dsg_sig_of(src: string) -> string
+    val r = parse(source_of("t.sysl", s"module m\n\n${src}\n"))
+
+    if !r.ok() then return s"!${r.first().message}"
+
+    var found: Buf[string] = buf()
+
+    for i in 0..<r.program.body.len()
+        doc_signature(r.program.body.at(i)) match
+            Some(t) -> found.push(t)
+            None -> ()
+
+    if found.len() != 1 then return s"!${found.len()} declarations"
+
+    found.at(0)
+end dsg_sig_of
+
+// The signature of the first member of the one struct in `src`.
+private dsg_member(src: string) -> string
+    val r = parse(source_of("t.sysl", s"module m\n\n${src}\n"))
+
+    if !r.ok() then return s"!${r.first().message}"
+
+    for i in 0..<r.program.body.len()
+        *r.program.body.at(i).kind match
+            StructDecl(d) -> return doc_method(d.members.at(0))
+            _ -> ()
+
+    "!no struct"
+end dsg_member
+
+// -- the reference's cases (DocGeneratorTests, "a signature is rendered back out of the AST") -------
+
+@test("a function keeps its parameters, its result and its order")
+dsg_a_function_keeps_its_parameters()
+    assert_eq(dsg_sig_of("add(a: int, b: int) -> int = a + b"), "add(a: int, b: int) -> int")
+
+@test("a procedure has no arrow, because sysl does not write one")
+dsg_a_procedure_has_no_arrow()
+    assert_eq(dsg_sig_of("greet(name: string)\n    print(name)"), "greet(name: string)")
+
+@test("a slice, a read-only slice and a fixed array are three different types")
+dsg_slice_read_only_slice_and_array()
+    assert_eq(dsg_sig_of("f(a: []u8, b: []const u8, c: [4]u8)\n    print(1)"),
+        "f(a: []u8, b: []const u8, c: [4]u8)")
+
+@test("a pointer, a reference and a sync reference each keep their sigil")
+dsg_pointer_reference_and_sync_reference()
+    assert_eq(dsg_sig_of("f(a: *u8, b: &int, c: &sync int)\n    print(1)"), "f(a: *u8, b: &int, c: &sync int)")
+
+@test("a rest parameter renders as the caller writes it, not as the body sees it")
+dsg_a_rest_parameter_renders_as_the_caller_writes_it()
+    assert_eq(dsg_sig_of("total(xs: ...int) -> int = 0"), "total(xs: ...int) -> int")
+
+@test("and beside the fixed parameters in front of it")
+dsg_a_rest_parameter_beside_fixed_ones()
+    assert_eq(dsg_sig_of("label(tag: string, xs: ...&Display) -> string = tag"),
+        "label(tag: string, xs: ...&Display) -> string")
+
+@test("while C's own ellipsis is still the bare marker it was")
+dsg_c_ellipsis_is_the_bare_marker()
+    assert_eq(dsg_sig_of("count(first: int, ...) -> int = first"), "count(first: int, ...) -> int")
+
+@test("a generic function renders its type parameters and their bounds")
+dsg_a_generic_function_renders_its_type_parameters()
+    assert_eq(dsg_sig_of("show[T: Display](x: T) -> string = \"\""), "show[T: Display](x: T) -> string")
+
+@test("two bounds on one parameter are joined with +")
+dsg_two_bounds_are_joined_with_plus()
+    assert_eq(dsg_sig_of("f[T: Display + Eq](x: T)\n    print(1)"), "f[T: Display + Eq](x: T)")
+
+@test("a value parameter states its type where a type parameter states its bounds")
+dsg_a_value_parameter_states_its_type()
+    assert_eq(dsg_sig_of("f[const N: usize](xs: [N]u8)\n    print(1)"), "f[const N: usize](xs: [N]u8)")
+
+@test("an applied generic type keeps its arguments")
+dsg_an_applied_generic_type_keeps_its_arguments()
+    assert_eq(dsg_sig_of("f(x: Option[int]) -> Result[int, string] = Ok(x.value)"),
+        "f(x: Option[int]) -> Result[int, string]")
+
+@test("a bare arrow stays a bare arrow, because that is the form a parameter may use")
+dsg_a_bare_arrow_stays_a_bare_arrow()
+    assert_eq(dsg_sig_of("apply(f: int -> int, x: int) -> int = f(x)"), "apply(f: int -> int, x: int) -> int")
+
+@test("a written Fn stays a written Fn")
+dsg_a_written_fn_stays_a_written_fn()
+    assert_eq(dsg_sig_of("apply(f: Fn(int) -> int, x: int) -> int = f(x)"),
+        "apply(f: Fn(int) -> int, x: int) -> int")
+
+@test("a tuple renders its parts")
+dsg_a_tuple_renders_its_parts()
+    assert_eq(dsg_sig_of("f(p: (int, string)) -> (usize, bool) = (0, true)"), "f(p: (int, string)) -> (usize, bool)")
+
+@test("a default is shown, so a caller knows what may be left out")
+dsg_a_default_is_shown()
+    assert_eq(dsg_sig_of("f(n: usize = 0)\n    print(n)"), "f(n: usize = 0)")
+
+@test("a struct renders its head and its fields")
+dsg_a_struct_renders_its_head_and_fields()
+    assert_eq(dsg_sig_of("struct Point\n    x: int\n    y: int"), "struct Point\n    x: int\n    y: int")
+
+@test("a struct with no fields keeps its end marker, which is required and not optional")
+dsg_a_struct_with_no_fields_keeps_its_end()
+    assert_eq(dsg_sig_of("struct Stdout\nend Stdout"), "struct Stdout\nend Stdout")
+
+@test("an enum renders its variants with their named payloads")
+dsg_an_enum_renders_its_variants()
+    assert_eq(dsg_sig_of("enum Option[T]\n    Some(value: T)\n    None"), "enum Option[T]\n    Some(value: T)\n    None")
+
+@test("a simple enum keeps a constant it pinned")
+dsg_a_simple_enum_keeps_a_pinned_constant()
+    assert_eq(dsg_sig_of("enum Colour\n    Red = 1\n    Green = 2"), "enum Colour\n    Red = 1\n    Green = 2")
+
+@test("a trait renders its associated types before its members")
+dsg_a_trait_renders_associated_types_first()
+    assert_eq(dsg_sig_of("trait Iterate\n    type Item\n    next(&self) -> Option[Self::Item]"),
+        "trait Iterate\n    type Item\n    next(&self) -> Option[Self::Item]")
+
+@test("a const renders its type and its value")
+dsg_a_const_renders_its_type_and_value()
+    assert_eq(dsg_sig_of("const capacity: usize = 512"), "const capacity: usize = 512")
+
+@test("an impl renders its head and NOT its methods")
+dsg_an_impl_renders_its_head_only()
+    assert_eq(dsg_sig_of("impl Display for Point\n    show(self) -> string = \"p\""), "impl Display for Point")
+
+@test("a receiver is rendered in the mode it was declared in")
+dsg_a_receiver_keeps_its_mode()
+    assert_eq(dsg_member("struct S\n    v: int\n    get(&self) -> int = self.v"), "get(&self) -> int")
+
+@test("a property is written without parentheses, because that is how it is called")
+dsg_a_property_has_no_parentheses()
+    assert_eq(dsg_member("struct S\n    v: int\n    len -> int = self.v"), "len -> int")
+
+@test("a static property keeps the word, which is the only thing saying it is read on the type")
+dsg_a_static_property_keeps_the_word()
+    assert_eq(dsg_member("struct S\n    v: int\n    static zero -> int = 0"), "static zero -> int")
+
+// -- beyond the reference's cases, each checked against what 0.0.152 printed -----------------------
+
+@test("a default is spelled out in every form that can stand there, and anything else is an ellipsis")
+dsg_every_default_form()
+    // An integer reads in decimal whatever base it was written in; `if` and a comparison are not
+    // forms a signature paraphrases.
+    assert_eq(dsg_sig_of("f(n: int = 0x10, c: char = '\\n', d: char = 'a', x: real = 1.5f32, y: int = -1, z: int = a.b + 2, w: int = g(1, 2), q: (int, int) = (1, 2), r: []int = [1, 2], u: int = if true then 1 else 2, v: bool = a < b, nn: *u8 = null, uu: unit = ())\n    print(1)"),
+        "f(n: int = 16, c: char = '\\n', d: char = 'a', x: real = 1.5f32, y: int = -1, z: int = a.b + 2, w: int = g(1, 2), q: (int, int) = (1, 2), r: []int = [1, 2], u: int = \u{2026}, v: bool = \u{2026}, nn: *u8 = null, uu: unit = ())")
+
+@test("every type form keeps its written spelling")
+dsg_every_type_form()
+    assert_eq(dsg_sig_of("f[T: From[int] = int, ..P](x: [4]T, y: <4>f32, z: volatile u32, w: weak T, e: *extern(int) -> int, g: (int, int) -> int, k: Iterator[Item = int])\n    print(1)"),
+        "f[T: From[int] = int, ..P](x: [4]T, y: <4>f32, z: volatile u32, w: weak T, e: *extern(int) -> int, g: (int, int) -> int, k: Iterator[Item = int])")
+
+@test("an enum keeps its underlying type, and a variant with no pinned constant is its bare name")
+dsg_an_enum_keeps_its_underlying_type()
+    assert_eq(dsg_sig_of("enum Small: u8\n    A = 1\n    B"), "enum Small: u8\n    A = 1\n    B")
+
+@test("a trait keeps its parameters, its supertraits, an associated type's bound and every receiver")
+dsg_a_trait_keeps_its_supertraits_and_receivers()
+    assert_eq(dsg_sig_of("trait Conv[T]: Display + Eq\n    type Out: Display\n    conv(self, t: T) -> Self::Out\n    make(n: int) -> Self\n    each(*self, f: &sync Fn(int) -> unit)"),
+        "trait Conv[T]: Display + Eq\n    type Out: Display\n    conv(self, t: T) -> Self::Out\n    make(n: int) -> Self\n    each(*self, f: &sync Fn(int) -> unit)")
+
+@test("a generic impl keeps its parameters and its trait's arguments")
+dsg_a_generic_impl_head()
+    assert_eq(dsg_sig_of("impl[T: Display, const N: usize] From[[N]T] for Wrap[T]\n    from(x: [N]T) -> Wrap[T] = Wrap()"),
+        "impl[T: Display, const N: usize] From[[N]T] for Wrap[T]")
+
+@test("a member keeps its type parameters, a sync receiver, C's ellipsis and a rest parameter")
+dsg_member_forms()
+    assert_eq(dsg_member("struct Grid[const W: usize]\n    cells: [W]u8\n    at[T](&sync self, i: usize, ...) -> u8 = 0"),
+        "at[T](&sync self, i: usize, ...) -> u8")
+    assert_eq(dsg_member("struct G\n    v: int\n    make(n: usize) -> G = G(0)"), "make(n: usize) -> G")
+    assert_eq(dsg_member("struct G\n    v: int\n    total(*self, xs: ...int) -> int = 0"), "total(*self, xs: ...int) -> int")
+    assert_eq(dsg_sig_of("struct Grid[const W: usize]\n    cells: [W]u8"), "struct Grid[const W: usize]\n    cells: [W]u8")
+
+@test("a literal keeps its suffix, a float its text, and a control character its escape")
+dsg_literal_spellings()
+    assert_eq(dsg_sig_of("f() -> (int, string) = (1, \"a\")"), "f() -> (int, string)")
+    assert_eq(dsg_sig_of("const big: u64 = 1_000_000u64"), "const big: u64 = 1000000u64")
+    assert_eq(dsg_sig_of("const fl: f64 = 2.5e3"), "const fl: f64 = 2.5e3")
+    assert_eq(dsg_sig_of("const ch: char = '\\u{7}'"), "const ch: char = '\\u{7}'")
+    assert_eq(dsg_sig_of("const del: char = '\\u{7f}'"), "const del: char = '\\u{7f}'")
+    assert_eq(dsg_sig_of("const q: char = '\\''"), "const q: char = '\\''")
+
+// -- where the renderer departs from 0.0.152 on purpose: each is a decided fix ----------------------
+
+// 0.0.152's `sysl-doc` prints a string default's decoded value between quotes, so `"a\tb"` puts a
+// raw tab in the signature and `"a\"b"` closes the literal early. Escaping it as source would have
+// to write it is a decided fix.
+@test("a string default is written as source would have to write it")
+dsg_a_string_default_is_escaped()
+    assert_eq(dsg_sig_of("f(s: string = \"a\\tb\", t: string = \"a\\\"b\", u: string = \"\\n\", v: string = \"\\\\\", w: string = \"it's \u{e9}\")\n    print(1)"),
+        "f(s: string = \"a\\tb\", t: string = \"a\\\"b\", u: string = \"\\n\", v: string = \"\\\\\", w: string = \"it's \u{e9}\")")
+
+// 0.0.152 renders a by-name parameter's thunk whole, `m: -> () -> int`, which its own comment says
+// is `m: -> int`.
+@test("a by-name parameter reads as the caller writes it")
+dsg_a_by_name_parameter_reads_as_written()
+    assert_eq(dsg_sig_of("f(m: -> int, n: -> Option[int])\n    print(1)"), "f(m: -> int, n: -> Option[int])")
+
+// 0.0.152 drops a value parameter's default: `[const N: usize = 4]` printed as `[const N: usize]`.
+@test("a value parameter keeps its default")
+dsg_a_value_parameter_keeps_its_default()
+    assert_eq(dsg_sig_of("f[const N: usize = 4](xs: [N]u8)\n    print(1)"), "f[const N: usize = 4](xs: [N]u8)")
+
+// 0.0.152 writes an operand bare, so `-(3 * 4)` printed as `-3 * 4` and `(a + b) * 2` as
+// `a + b * 2` -- different values.
+@test("the parentheses a tree does not record are put back where the grouping needs them")
+dsg_parentheses_are_put_back()
+    assert_eq(dsg_sig_of("const a: int = -(3 * 4)"), "const a: int = -(3 * 4)")
+    assert_eq(dsg_sig_of("const b: int = (x + y) * 2"), "const b: int = (x + y) * 2")
+    assert_eq(dsg_sig_of("const c: int = x - (y - z)"), "const c: int = x - (y - z)")
+    assert_eq(dsg_sig_of("const d: int = x + y + z"), "const d: int = x + y + z")
+    assert_eq(dsg_sig_of("const e: int = x + y * z"), "const e: int = x + y * z")
+    assert_eq(dsg_sig_of("const g: int = -x * 2"), "const g: int = -x * 2")
+
+// 0.0.152 shows a private field unmarked, though its own comment says it is marked.
+@test("a field that is not public is marked")
+dsg_a_private_field_is_marked()
+    assert_eq(dsg_sig_of("struct Pair[A, B = int]\n    private a: A\n    private[m] b: B\n    c: int"),
+        "struct Pair[A, B = int]\n    private a: A\n    private[m] b: B\n    c: int")
+
+// 0.0.152 renders an opaque struct as an empty one, `struct Handle` / `end Handle`.
+@test("an opaque struct keeps the word and has no body")
+dsg_an_opaque_struct_keeps_the_word()
+    assert_eq(dsg_sig_of("opaque struct Handle"), "opaque struct Handle")
+
+// 0.0.152 leaves `type` aliases, `extern`s and module `val`s off the page altogether.
+@test("an alias, an extern and a module val each have a signature")
+dsg_alias_extern_and_val()
+    assert_eq(dsg_sig_of("type FRect = c.FRect"), "type FRect = c.FRect")
+    assert_eq(dsg_sig_of("type Port = new u16 within 1..65535"), "type Port = new u16 within 1..65535")
+    assert_eq(dsg_sig_of("type Digit = new int within 0..<10"), "type Digit = new int within 0..<10")
+    assert_eq(dsg_sig_of("extern \"getpid\" c_pid() -> int"), "extern c_pid() -> int")
+    assert_eq(dsg_sig_of("extern printf(fmt: *u8, ...) -> int"), "extern printf(fmt: *u8, ...) -> int")
+    assert_eq(dsg_sig_of("extern environ: **u8"), "extern environ: **u8")
+    assert_eq(dsg_sig_of("val limit: usize = 8"), "val limit: usize = 8")
+    assert_eq(dsg_sig_of("val origin = Point(0, 0)"), "val origin = Point(0, 0)")
