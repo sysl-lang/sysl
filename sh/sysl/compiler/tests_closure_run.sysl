@@ -116,6 +116,34 @@ private cr_err(text: string) -> string
     out
 end cr_err
 
+// The same, each diagnostic as `line:col: message`, one to a line -- for a claim about exactly what
+// is said and where, which the rendered carets would make a claim about spans as well.
+private cr_said(text: string) -> string
+    val root = make_temp_dir("sysl-closure-run").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    var out = ""
+
+    emit_llvm_text(src, None) match
+        Err(why) -> out = why.message
+        Ok(made) ->
+            val ordered = in_source_order(made.report)
+
+            for i in 0..<ordered.len()
+                val p = ordered.at(i)
+                val at = p.src.locate(p.diag.span.start)
+
+                if i > 0 then out = out + "\n"
+
+                out = out + s"${at.line}:${at.col}: ${p.diag.message}"
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cr_said
+
 // The LLVM text of a program that must compile.
 private cr_ir(text: string) -> string
     val root = make_temp_dir("sysl-closure-run").unwrap()
@@ -1017,3 +1045,29 @@ cr_the_callables_type_reads_as_one()
 
     assert(cr_says(said, "&Fn(int) -> bool"), said)
     assert(!cr_says(said, "Fn1"), said)
+
+// **An intentional divergence from the reference.** A closure's body is a block, so each of its
+// statements tells its own mistake -- 5:24 and 6:21, which the reference (0.0.151) says too. The
+// reference then adds `'f' is ? and is not callable — a callable is a closure, or a value of a type
+// that implements the call trait` at 8:5, the call of the closure whose body was refused. That is a
+// consequence reported as a second cause: `f` IS a closure, its body's mistakes were told where they
+// were made, and nothing about the call is wrong -- so a reader fixing the call would be fixing
+// nothing. This compiler says nothing there, and the director agrees that is the right answer.
+@test("a closure whose body was refused tells each statement, and its call says nothing more")
+cr_a_refused_closure_body_leaves_its_call_quiet()
+    if !cr_ready() then return
+
+    assert_eq(cr_said(raw"""
+        two(a: int, b: int) -> int = a
+
+        use() -> int
+            val f = () ->
+                val a = two(1, "y")
+                val b = two("z", 2)
+                a + b
+            f()
+
+        print(use())
+        """),
+              "5:24: 'b' of 'two' is int, but string was given\n" +
+              "6:21: 'a' of 'two' is int, but string was given")

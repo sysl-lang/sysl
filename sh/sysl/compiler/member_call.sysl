@@ -276,6 +276,16 @@ private generic_subject(cx: &Analyzer, span: Span, receiver: Expr, name: string,
 
     if solved.is_some() then return solved
 
+    // **An argument whose bare reading was refused is the mistake**, where nothing else settled the
+    // type argument: `Box.one(Some(5000000000))` is told that the literal does not fit `int`, at the
+    // literal, as the reference tells it. It was read in a sandbox to learn what it settles, so it is
+    // read once more for real here, and that complaint is the statement's one.
+    for i in 0..<args.len()
+        if cx.an.complaints() == said && sandboxed_reading(cx, args.at(i)).1
+            type_expr(cx, args.at(i), None)
+            break
+        end if
+
     // The reference's own words, and the advice is what a reader can act on: there is nowhere else
     // for the arguments to come from, a receiverless call carrying no value of the type.
     //
@@ -336,9 +346,17 @@ private solved_subject(cx: &Analyzer, span: Span, key: string, name: string, arg
     var arg_tys: Buf[Type] = buf()
     var soft: Buf[bool] = buf()
 
+    // **A bare reading that was refused is consulted last**, as a literal is: `Box.arr([1,
+    // 5000000000], wide)` is a `Box[u64]` call, where reading the array alone refuses its second
+    // element at `int`. Taken first, the `[2]int` that reading produced would settle `T` ahead of the
+    // argument that knew. Where nothing else settles it, it still does -- `Box.one([1, 5000000000])`
+    // is refused at `int`, as the reference refuses it -- and the argument is read again below at
+    // whatever the solve arrived at.
     for i in 0..<args.len()
-        arg_tys.push(texpr_type(sandboxed_arg(cx, args.at(i), None)))
-        soft.push(false)
+        val read = sandboxed_reading(cx, args.at(i))
+
+        arg_tys.push(texpr_type(read.0))
+        soft.push(read.1)
 
     // **The call is what the refusal names, not the type** -- `M.one`, since a reader told the
     // argument of `M` could not be inferred has nowhere to write one, `M` not being what they wrote.

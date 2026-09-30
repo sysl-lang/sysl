@@ -1,0 +1,206 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A value whose type could not be worked out is a consequence of a mistake already told, so every
+// form that reads one gives up on its statement quietly: an array literal holding one, a compound
+// assignment taking one, a pattern tested against one, a binding taking one apart. And a bare
+// reading of a generic type's argument that was refused settles its type argument last.
+//
+// **Every message and position here was read out of the reference compiler** (0.0.151) on the same
+// program.
+
+private var pfu_library_cache: Buf[Program] = buf()
+private var pfu_library_read: bool = false
+
+private pfu_library() -> Buf[Program]
+    if pfu_library_read then return pfu_library_cache
+
+    pfu_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> pfu_library_cache = units
+
+    pfu_library_cache
+end pfu_library
+
+private pfu_ready() -> bool
+    if pfu_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end pfu_ready
+
+// Every diagnostic a whole program gives, each as `line:col: message`, one to a line.
+private pfu_said(text: string) -> string
+    val root = make_temp_dir("sysl-pfu").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> pfu_lines(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end pfu_said
+
+private pfu_lines(report: Buf[Placed]) -> string
+    val ordered = in_source_order(report)
+    var out = ""
+
+    for i in 0..<ordered.len()
+        val p = ordered.at(i)
+        val at = p.src.locate(p.diag.span.start)
+
+        if i > 0 then out = out + "\n"
+
+        out = out + s"${at.line}:${at.col}: ${p.diag.message}"
+
+    out
+end pfu_lines
+
+// What a program prints.
+private pfu_ran(text: string) -> string
+    val root = make_temp_dir("sysl-pfu").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end pfu_ran
+
+private pfu_head() -> string = "struct P\n    a: int\n\n"
+
+private pfu_nope() -> string = "5:13: undefined function 'nope'"
+
+@test("a '?' value made into a string, or interpolated, says nothing more")
+pfu_str_of_unknown()
+    if !pfu_ready() then return
+
+    assert_eq(pfu_said(pfu_head() + "f()\n    val y = nope()\n    print(str(y))\n    print(s\"v=$y\")\n"),
+              pfu_nope())
+
+@test("an array literal holding a '?' element says nothing more, wherever the element stands")
+pfu_array_of_unknown()
+    if !pfu_ready() then return
+
+    assert_eq(pfu_said(pfu_head() + "f()\n    val y = nope()\n    val a = [y, 1]\n    val b = [1, y]\n" +
+                       "    print(a.len + b.len)\n"),
+              pfu_nope())
+
+@test("a compound assignment taking a '?' value says nothing more")
+pfu_compound_of_unknown()
+    if !pfu_ready() then return
+
+    assert_eq(pfu_said(pfu_head() + "f()\n    val y = nope()\n    var z = 0\n    z -= y\n" +
+                       "    var s = \"a\"\n    s += y\n"),
+              pfu_nope())
+
+@test("an 'is' testing a '?' value says nothing, and the names it binds read quietly")
+pfu_is_against_unknown()
+    if !pfu_ready() then return
+
+    assert_eq(pfu_said(pfu_head() + "f() -> int\n    val y = nope()\n" +
+                       "    if y is Some(v) && v > 0 then return v\n    if y is P(a) then a else 0\n"),
+              pfu_nope())
+
+@test("but an 'is' outside a condition is still refused for where it stands")
+pfu_is_outside_condition()
+    if !pfu_ready() then return
+
+    assert_eq(pfu_said(pfu_head() + "f() -> bool\n    val y = nope()\n    y is Some(_)\n"),
+              pfu_nope() + "\n6:5: 'is' tests a pattern in the condition of an 'if' or a 'while', and " +
+              "nowhere else — its binding is live from here to the end of the condition and " +
+              "through the branch that condition guards, and there is no such branch here. Chain " +
+              "it with '&&', or write 'match'")
+
+@test("a match on a '?' value says nothing about its patterns, and an arm's block reads its names quietly")
+pfu_match_on_unknown()
+    if !pfu_ready() then return
+
+    assert_eq(pfu_said(pfu_head() + "f() -> int\n    val y = nope()\n    y match\n        Some(v) ->\n" +
+                       "            val w = v + 1\n            w\n        None -> 0\n\n" +
+                       "g() -> int\n    val y = nope()\n    y match\n        (a, b) -> a + b\n" +
+                       "        _ -> 0\n"),
+              pfu_nope() + "\n13:13: undefined function 'nope'")
+
+@test("a '?' value taken apart by a tuple or a field pattern binds every name, quietly")
+pfu_destructure_unknown()
+    if !pfu_ready() then return
+
+    assert_eq(pfu_said(pfu_head() + "f() -> int\n    val y = nope()\n    val (a, b) = y\n" +
+                       "    val P { a: c } = y\n    a + b + c\n"),
+              pfu_nope())
+
+@test("a '?' value taken apart positionally binds nothing, so a later read is undefined")
+pfu_positional_unknown()
+    if !pfu_ready() then return
+
+    assert_eq(pfu_said(pfu_head() + "f() -> int\n    val y = nope()\n    val P(a) = y\n    a\n"),
+              pfu_nope() + "\n7:5: undefined name 'a'")
+
+@test("calling a '?' value is still refused, as the reference refuses it")
+pfu_call_unknown()
+    if !pfu_ready() then return
+
+    assert_eq(pfu_said(pfu_head() + "f() -> int\n    val y = nope()\n    y()\n"),
+              pfu_nope() + "\n6:5: 'y' is ? and is not callable — a callable is a closure, or a " +
+              "value of a type that implements the call trait")
+
+// -- a generic type's member, settled from its arguments -------------------------------------------
+
+private pfu_box() -> string =
+    "struct Box[T]\n    v: T\n\n    of(a: Option[T], b: T) -> Box[T] = Box(b)\n" +
+    "    arr(a: [2]T, b: T) -> Box[T] = Box(b)\n    one(a: [2]T) -> Box[T] = Box(a[0])\n" +
+    "    opt(a: Option[T]) -> Box[T] = Box(a.unwrap())\n\n" +
+    "struct Holder\n    x: int\n\n    parr[T](self, a: [2]T, b: T) -> T = b\n\n" +
+    "val wide: u64 = 7\n"
+
+@test("an argument whose bare reading is refused yields to one that settles the type argument")
+pfu_refused_argument_yields()
+    if !pfu_ready() then return
+
+    assert_eq(pfu_ran(pfu_box() + "print(Box.arr([1, 5000000000], wide).v)\n" +
+                      "print(Box.of(Some(5000000000), wide).v)\n" +
+                      "print(Holder(1).parr([1, 5000000000], wide))\n"),
+              "7\n7\n7\n")
+
+@test("and where nothing else settles it, the refused reading still does, and is refused there")
+pfu_refused_argument_alone()
+    if !pfu_ready() then return
+
+    assert_eq(pfu_said(pfu_box() + "print(Box.one([1, 5000000000]).v)\n" +
+                       "print(Box.opt(Some(5000000000)).v)\n"),
+              "15:19: the literal 5000000000 does not fit int\n" +
+              "16:20: the literal 5000000000 does not fit int")
