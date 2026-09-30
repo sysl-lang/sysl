@@ -171,10 +171,11 @@ struct Emit
     defers: Buf[TStmt]
     defer_marks: Buf[usize]
 
-    // The locals this body has given storage to, and the ones it has given storage to more than
-    // once: a deferred statement is laid down at every edge that leaves its block, so a local it
-    // declares is declared once per edge, and each laying after the first stores it under a name of
-    // its own. A pair is the name the program's tree uses and the name that laying's storage has.
+    // The registers this body has named for a local's storage, and the locals whose address has been
+    // named more than once: a deferred statement is laid down at every edge that leaves its block,
+    // so a local it declares is declared once per edge. A slot is shared by every laying; an address
+    // an instruction computes cannot be, and a pair is the name the program's tree uses and the name
+    // the latest laying's address has.
     declared: Set[string]
     relaid: Buf[(string, string)]
 
@@ -439,15 +440,30 @@ alloca(e: *Emit, name: Val, ty: LType) -> Val = emit_alloca(e, name, ty, None)
 
 // -- a local's storage, by name ---------------------------------------------------------------------
 
-// Gives a local its storage name, at the point its declaration is lowered.
-//
-// A name is unique within a function, so the first time it is lowered its storage is simply named
-// for it. **A declaration can be lowered more than once**, though: a deferred statement is laid down
-// at every edge that leaves its block, and each laying declares the statement's locals again. Two
-// definitions of one name are not a function, so every laying after the first takes storage of its
-// own -- `j.d1`, `j.d2` -- and the uses that follow it, which belong to the same laying, read that.
+// A name is unique within a function, so a local's storage is simply named for it. **A declaration
+// can be lowered more than once**, though: a deferred statement is laid down at every edge that
+// leaves its block, and each laying declares the statement's locals again. Two definitions of one
+// name are not a function, and the two kinds of storage answer that differently.
+
+// A slot named for something the program declared, laid down once however many times the
+// declaration is lowered. Every laying of a deferred statement stores into the one slot: a body
+// runs on one edge at a time and each laying writes the local before it reads it, so they never
+// need two.
+named_alloca(e: *Emit, slot: string, ty: LType, align: Option[int]) -> Val
+    if e.declared.add(slot) then emit_alloca(e, VReg(slot), ty, align)
+
+    VReg(slot)
+end named_alloca
+
+// The slot a local's own declaration lays down, `%name.addr`.
+local_alloca(e: *Emit, name: string, ty: LType) -> Val = named_alloca(e, s"$name.addr", ty, None)
+
+// Names a local whose address is a register an instruction defines where it stands -- a `ref`, and
+// an array moved to a buffer. A register is defined once, so every laying after the first takes a
+// name of its own -- `r.d1`, `r.d2` -- and the uses that follow it, which belong to the same
+// laying, read that.
 declare_local(e: *Emit, name: string) -> string
-    if e.declared.add(name) then return name
+    if e.declared.add(s"$name.addr") then return name
 
     var n = 1
 
@@ -471,9 +487,8 @@ local_name(e: *Emit, name: string) -> string
     name
 end local_name
 
-// The address a local lives at, for a use of it and for its declaration.
+// The address a local lives at, for a use of it.
 local_slot(e: *Emit, name: string) -> Val = VReg(s"${local_name(e, name)}.addr")
-declare_slot(e: *Emit, name: string) -> Val = VReg(s"${declare_local(e, name)}.addr")
 
 // The one overload of `llvm.memcpy` this compiler emits, so the two sites that name it -- the
 // declaration and the call -- cannot spell it differently. Both pointers are in the default address

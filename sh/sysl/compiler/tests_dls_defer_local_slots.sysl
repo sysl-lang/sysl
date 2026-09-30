@@ -10,8 +10,10 @@ import sysl.process.capture
 // A deferred statement runs on every way out of its block, last registered first, so it is laid
 // down once per edge -- and a local it declares is declared once per edge. Its storage is named for
 // it, a name being unique within a function, so two layings used to define one name twice and the
-// text was refused by the back end: `multiple definition of local value named 'j.addr'`. Each laying
-// after the first now stores the local under a name of its own.
+// text was refused by the back end: `multiple definition of local value named 'j.addr'`. The slot
+// is now laid down once and every laying stores into it, which is what the reference does from
+// bootstrap 91fe162d. An address an instruction computes -- a `ref`, an array moved to a buffer --
+// cannot be shared that way, and there each laying after the first takes a name of its own.
 //
 // **Most of what is printed here is derived rather than quoted.** The reference compiler (0.0.152)
 // emits the same doubled definition and fails at clang on every program marked so below, and there
@@ -178,7 +180,7 @@ dls_a_while_over_a_var_runs()
         """, "0\n1\nx\n0\n1\n")
 
 // 0.0.152 fails at clang on this. Same shape with the loop's measure checked, whose two slots are
-// the loop's own and are declared per laying as the `var` is.
+// the loop's own and are shared by the layings as the `var`'s is.
 @test("a 'while' with a 'variant' in a deferred block runs on both ways out")
 dls_a_while_with_a_variant_runs()
     dls_prints(raw"""
@@ -199,24 +201,71 @@ dls_a_while_with_a_variant_runs()
         f(false)
         """, "2\n1\nx\n2\n1\n")
 
-// 0.0.152 fails at clang on this. `o match` binds `v` in each laying; `f(None, true)` takes the
-// other arm.
-@test("a deferred 'match' binds its arm's name on each way out")
+// 0.0.152 fails at clang on this. `o match` binds `v` in each of three layings -- two `return`s and
+// the end; `f(None, 9)` takes the other arm on the first of them.
+@test("a deferred 'match' binds its arm's name on each of three ways out")
 dls_a_match_binding_runs()
     dls_prints(raw"""
-        f(o: Option[int], c: bool)
+        f(o: Option[int], n: int)
             defer o match
                 Some(v) -> print(v)
                 None -> print("none")
 
-            if c then return
+            if n > 5 then return
+            if n > 2 then return
 
             print("x")
 
-        f(Some(7), true)
-        f(Some(8), false)
-        f(None, true)
-        """, "7\nx\n8\nnone\n")
+        f(Some(7), 9)
+        f(Some(8), 4)
+        f(Some(9), 1)
+        f(None, 9)
+        """, "7\n8\nx\n9\nnone\n")
+
+// 0.0.152 fails at clang on this. The string is counted, and each laying gives back the one it
+// made: `n=9` then 1, `n=4` then 2, `n=1` then 3.
+@test("a counted local in a deferred block is made and let go on each of three ways out")
+dls_a_counted_local_runs()
+    dls_prints(raw"""
+        f(n: int) -> int
+            defer if true
+                val s = "n=" + str(n)
+
+                print(s)
+
+            if n > 5 then return 1
+            if n > 2 then return 2
+
+            3
+
+        print(f(9))
+        print(f(4))
+        print(f(1))
+        """, "n=9\n1\nn=4\n2\nn=1\n3\n")
+
+// 0.0.152 fails at clang on this. One deferred block holding an array, an `is` that binds and a
+// walk of a string's characters: `f(Some(10), 9)` prints 10 + 10, the characters, then 1;
+// `f(None, 1)` prints `x`, binds nothing, prints the characters, then 2.
+@test("an array, an 'is' binding and an iteration in one deferred block run on both ways out")
+dls_an_array_an_is_and_an_iteration_run()
+    dls_prints(raw"""
+        f(o: Option[int], n: int) -> int
+            defer if true
+                val xs = [n, n + 1]
+
+                if o is Some(v) then print(v + xs[1])
+
+                for ch in "ab".chars
+                    print(ch)
+
+            if n > 5 then return 1
+
+            print("x")
+            2
+
+        print(f(Some(10), 9))
+        print(f(None, 1))
+        """, "20\na\nb\n1\nx\na\nb\n2\n")
 
 // 0.0.152 fails at clang on this. The closure captures `base` by value from the laying it was
 // written in: 10 + (1 + 1) on the `return`, 10 + (2 + 1) at the end.
@@ -238,8 +287,10 @@ dls_a_closure_over_a_deferred_local_runs()
         f(false, 2)
         """, "12\nx\n13\n")
 
-// 0.0.152 fails at clang on this, at the `getelementptr` that names a `ref`. Each laying adds ten
-// to the field through its own `ref`, and each call starts from a fresh `P(1, 2)`.
+// 0.0.152 fails at clang on this, at the `getelementptr` that names a `ref` -- and so does
+// bootstrap 91fe162d, a register having no slot to share; here the second laying's address is
+// `r.d1.addr`. Each laying adds ten to the field through its own `ref`, and each call starts from a
+// fresh `P(1, 2)`.
 @test("a 'ref' in a deferred block names its place on each way out")
 dls_a_ref_in_a_deferred_block_runs()
     dls_prints(raw"""
@@ -288,7 +339,8 @@ dls_a_for_each_and_an_iteration_run()
 
 // 0.0.152 fails at clang on this, at the box the array moved to. A view of the array outlives the
 // frame, so the array lives in a buffer, and each laying makes its own: 7 on the `return`, 9 at the
-// end.
+// end. The slot holding the box is shared; the address of the elements is a register, so the second
+// laying's is `a.d1.addr`.
 @test("an array in a deferred block whose view gets out is a buffer of its own on each way out")
 dls_a_promoted_array_in_a_deferred_block_runs()
     dls_prints(raw"""
@@ -477,10 +529,11 @@ dls_a_nested_function_with_its_own_defer_runs()
 
 // -- what the text says -----------------------------------------------------------------------------
 
-// The first laying keeps the name a program with one way out has always had, which is what leaves
-// every program the reference builds with the text the reference gives it; the second takes `j.d1`.
-@test("the first laying's slot is the local's own name and the second's is 'j.d1'")
-dls_the_second_laying_has_a_slot_of_its_own()
+// One slot under the name a program with one way out has always had, which is what leaves every
+// program the reference builds with the text the reference gives it, and one store of the loop's
+// first value per laying.
+@test("a deferred 'for' on two ways out has one slot for its local and a store into it per laying")
+dls_the_layings_share_one_slot()
     if xvr_no_library() then return
 
     val root = make_temp_dir("sysl-dls").unwrap()
@@ -507,9 +560,9 @@ dls_the_second_laying_has_a_slot_of_its_own()
         Ok(emitted) ->
             assert(emitted.report.is_empty(), analysis_report(emitted.report))
             assert_eq(dls_count(emitted.text, "  %j.addr = alloca i32\n"), 1)
-            assert_eq(dls_count(emitted.text, "  %j.d1.addr = alloca i32\n"), 1)
-            assert_eq(dls_count(emitted.text, "  %j.d2.addr = alloca i32\n"), 0)
-end dls_the_second_laying_has_a_slot_of_its_own
+            assert_eq(dls_count(emitted.text, "  store i32 0, ptr %j.addr\n"), 2)
+            assert_eq(dls_count(emitted.text, "%j.d1"), 0)
+end dls_the_layings_share_one_slot
 
 // How many times a piece of text occurs in another.
 private dls_count(text: string, piece: string) -> int
