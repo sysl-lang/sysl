@@ -72,9 +72,10 @@ private lmv_prints(text: string, want: string) = lmv_prints_with(text, [], want)
 private lmv_refused_tree(files: []const (string, string), message: string, at: string)
     lmv_build_run(files, []) match
         Ok((out, _)) -> assert(false, s"it compiled, and printed: $out")
+        // The arrow is indented by the width of the line number, so it is the path that is matched.
         Err(said) ->
-            assert(said.contains(s"error: $message\n --> "), said)
-            assert(said.contains(s"/$at\n"), said)
+            assert(said.contains(s"error: $message\n"), said)
+            assert(said.contains(" --> ") &&said.contains(s"/$at\n"), said)
 
 private lmv_refused(text: string, message: string, at: string) =
     lmv_refused_tree(lmv_main(text), message, at)
@@ -171,6 +172,36 @@ lmv_the_shadowed_one_is_told_apart()
         Ok(_) -> assert(false, "it compiled")
         Err(said) -> assert_eq(xvr_count(said, "error: "), 1, said)
 end lmv_the_shadowed_one_is_told_apart
+
+// A block whose member does not match the trait supplies none of its members, the ones that do match
+// included -- so a use of one is told the type has no such method, and the mismatched body is not
+// read for a second complaint.
+@test("a block that does not conform supplies none of its members")
+lmv_a_block_that_does_not_conform_supplies_nothing()
+    if !lmv_ready() then return
+
+    val text = raw"""
+        trait T
+            a(self) -> int
+            b(self) -> int
+
+        struct P
+            x: int
+
+        impl T for P
+            a(self) -> string = self.x + 1
+            b(self) -> int = 2
+
+        print(P(1).b())
+        """
+
+    lmv_refused(text, "method 'a' returns string, but trait 'T' declares int", "main.sysl:8:1")
+    lmv_refused(text, "type 'P' has no method 'b'", "main.sysl:12:12")
+
+    lmv_build_run(lmv_main(text), []) match
+        Ok(_) -> assert(false, "it compiled")
+        Err(said) -> assert_eq(xvr_count(said, "error: "), 2, said)
+end lmv_a_block_that_does_not_conform_supplies_nothing
 
 // -- a moved declaration whose own signature names other moved ones ------------------------------------
 
