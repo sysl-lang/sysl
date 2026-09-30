@@ -394,19 +394,13 @@ rfb_the_same_alias_as_a_pointer()
 
 // A ref into read-only storage is read-only: the property survives being given a shorter name,
 // which is the same rule that makes an element of a `val` array read-only.
-//
-// The reference underlines the whole statement and this compiler the target, which is the open
-// divergence about where an assignment refusal is anchored -- so the message and the position are
-// what is asserted.
 @test("a ref into a 'val' may not be written through")
 rfb_a_ref_into_a_val()
     if !rfb_ready() then return
 
-    val out = rfb_err("val xs: [3]int = [1, 2, 3]\nref e = xs[1]\ne = 9\n")
-
-    assert(out.starts_with(rfb_head("a 'val' is written once, so assignment has nothing to write " +
-                                    "through", 3, 1)), out)
-    assert(out.index_of("\n\nerror: ").is_none(), out)
+    assert_eq(rfb_err("val xs: [3]int = [1, 2, 3]\nref e = xs[1]\ne = 9\n"),
+              rfb_shown("a 'val' is written once, so assignment has nothing to write through",
+                        3, 1, "e = 9", "^^^^^"))
 
 // A `within` bound is the slot's, so it is still checked when the write goes through a name.
 @test("a ref to a constrained slot is still checked on assignment")
@@ -477,9 +471,7 @@ rfb_the_message_names_what_a_place_is()
 
 // -- what may move underneath it ------------------------------------------------------------------
 //
-// The four assignment refusals underline the whole statement in the reference and the target here
-// (the open divergence about where an assignment refusal is anchored), so each asserts the message
-// and the position, and that nothing else was said.
+// An assignment refusal is reported at the whole statement, from the first character of its target.
 
 // The rule a language with no collector cannot avoid: overwriting the view releases the buffer the
 // ref is standing in.
@@ -487,7 +479,7 @@ rfb_the_message_names_what_a_place_is()
 rfb_a_view_step()
     if !rfb_ready() then return
 
-    val out = rfb_err(raw"""
+    assert_eq(rfb_err(raw"""
         struct Table
             cell: []int
         end Table
@@ -495,25 +487,20 @@ rfb_a_view_step()
         ref e = t.cell[1]
         t.cell = [0; 8]
         e = 5
-        """)
-
-    assert(out.starts_with(rfb_head(rfb_standing("e"), 6, 1)), out)
-    assert(out.index_of("\n\nerror: ").is_none(), out)
+        """), rfb_shown(rfb_standing("e"), 6, 1, "t.cell = [0; 8]", "^^^^^^^^^^^^^^^"))
 
 @test("a local view may not be reassigned either")
 rfb_a_local_view()
     if !rfb_ready() then return
 
-    val out = rfb_err("var v: []int = [0; 4]\nref e = v[1]\nv = [0; 8]\ne = 5\n")
-
-    assert(out.starts_with(rfb_head(rfb_standing("e"), 3, 1)), out)
-    assert(out.index_of("\n\nerror: ").is_none(), out)
+    assert_eq(rfb_err("var v: []int = [0; 4]\nref e = v[1]\nv = [0; 8]\ne = 5\n"),
+              rfb_shown(rfb_standing("e"), 3, 1, "v = [0; 8]", "^^^^^^^^^^"))
 
 @test("nor a reference step")
 rfb_a_reference_step()
     if !rfb_ready() then return
 
-    val out = rfb_err(raw"""
+    assert_eq(rfb_err(raw"""
         struct Node
             n: int
         end Node
@@ -524,10 +511,7 @@ rfb_a_reference_step()
         ref x = h.node.n
         h.node = Node(2)
         x = 5
-        """)
-
-    assert(out.starts_with(rfb_head(rfb_standing("x"), 9, 1)), out)
-    assert(out.index_of("\n\nerror: ").is_none(), out)
+        """), rfb_shown(rfb_standing("x"), 9, 1, "h.node = Node(2)", "^^^^^^^^^^^^^^^^"))
 
 // The prefix half: releasing the thing the owning step is read *out of* frees it just as surely, so
 // refusing only the assignment to the step itself would leave the shorter route open.
@@ -535,7 +519,7 @@ rfb_a_reference_step()
 rfb_a_prefix_of_an_owning_step()
     if !rfb_ready() then return
 
-    val out = rfb_err(raw"""
+    assert_eq(rfb_err(raw"""
         struct Inner
             cell: []int
         end Inner
@@ -546,18 +530,19 @@ rfb_a_prefix_of_an_owning_step()
         ref e = o.a.cell[1]
         o.a = Inner([0; 8])
         e = 5
-        """)
-
-    assert(out.starts_with(rfb_head(rfb_standing("e"), 9, 1)), out)
-    assert(out.index_of("\n\nerror: ").is_none(), out)
+        """), rfb_shown(rfb_standing("e"), 9, 1, "o.a = Inner([0; 8])", "^^^^^^^^^^^^^^^^^^^"))
 
 // The mutating-call half, and it is the conservative one on purpose: nothing here reads whether
 // `grow` reassigns anything, because a module compiles against signatures and not bodies.
+//
+// The reference underlines the member's name and this compiler the call from the name on (the open
+// divergence between an anchor and an extent), so what is asserted is the message, the position,
+// where the underline starts, and that nothing else was said.
 @test("a '*self' method may not be called on a prefix while a ref stands on a view")
 rfb_a_self_method_on_a_prefix()
     if !rfb_ready() then return
 
-    assert_eq(rfb_err(raw"""
+    val out = rfb_err(raw"""
         struct Table
             cell: []int
 
@@ -568,11 +553,14 @@ rfb_a_self_method_on_a_prefix()
         ref e = t.cell[1]
         t.grow()
         e = 5
-        """),
-        rfb_shown("'e' is a 'ref' standing on storage this call could release, since a '*self' " +
-                  "method may write its receiver — so the name could be left pointing at freed " +
-                  "memory. Make the call before the 'ref', or put the 'ref' in a block that closes " +
-                  "first", 9, 3, "t.grow()", "  ^^^^"))
+        """)
+
+    assert(out.starts_with(rfb_head("'e' is a 'ref' standing on storage this call could release, " +
+                                    "since a '*self' method may write its receiver — so the name " +
+                                    "could be left pointing at freed memory. Make the call before " +
+                                    "the 'ref', or put the 'ref' in a block that closes first",
+                                    9, 3) + "  |\n9 | t.grow()\n  |   ^^^^"), out)
+    assert(out.index_of("\n\nerror: ").is_none(), out)
 
 // The disagreement half of the whole rule, and the case it was designed around: a chain with no
 // owning step has nothing to hold still, so a program reaching fixed tables through a `*Self`
@@ -757,8 +745,11 @@ rfb_a_closure_may_not_capture_a_ref()
 
     val out = rfb_err("var xs = [1, 2, 3]\nref e = xs[1]\nvar f: &Fn() -> int = () -> e\nprint(f())\n")
 
-    assert(out.starts_with(rfb_shown(rfb_captured("e"), 3, 23, "var f: &Fn() -> int = () -> e",
-                                     "                      ^^^^^^^")), out)
+    // The closure is underlined from its first character, and how far differs: the reference
+    // underlines all of `() -> e` and this compiler's span for a closure ends at its arrow.
+    assert(out.starts_with(rfb_head(rfb_captured("e"), 3, 23) +
+                           "  |\n3 | var f: &Fn() -> int = () -> e\n  |                       ^^^^^"),
+           out)
 
 @test("nor may a nested function")
 rfb_nor_may_a_nested_function()
@@ -943,3 +934,74 @@ rfb_a_ref_in_a_multi_assignment()
         a, b = b, a
         print(xs[0], xs[1], xs[2])
         """), "3 2 1\nexit 0")
+
+// -- what the remembered place reaches beside the suite's own cases -------------------------------
+//
+// Each of these compiled and ran before a `ref` kept its place, and each is refused by the
+// reference in the words quoted.
+
+// `&r` is `&o.a` written one line longer, so it is refused as the pointer would have been.
+@test("the address of a ref into a struct whose invariant reads it is refused like the path")
+rfb_the_address_of_a_ref_below_an_invariant()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err(raw"""
+        struct Inner
+            n: int
+        end Inner
+        struct Outer
+            a: Inner
+            b: int
+            invariant a.n <= b
+        end Outer
+        var o = Outer(Inner(1), 5)
+        ref r = o.a
+        var p: *Inner = &r
+        print(p.n)
+        """),
+        rfb_shown("'&' here makes a '*Inner' pointing inside Outer, whose invariant reads 'a.n' — " +
+                  "and a '*Inner' names no Outer, so a write through it would break the clause " +
+                  "with nothing left to re-check it against. Take the address of the Outer itself, " +
+                  "which keeps the invariant in its type, or make the change through a method",
+                  11, 17, "var p: *Inner = &r", "                ^^"))
+
+@test("a ref into module storage bound by a 'val' may not be written through")
+rfb_a_ref_into_a_static_val()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err("static val table: [3]int = [1, 2, 3]\nref e = table[1]\ne = 9\nprint(table[1])\n"),
+              rfb_shown("a 'val' is written once, so assignment has nothing to write through",
+                        3, 1, "e = 9", "^^^^^"))
+
+@test("nor may a field reached through a ref to a 'val' struct")
+rfb_a_field_through_a_ref_to_a_val()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err("struct P\n    x: int\nend P\nval p = P(1)\nref r = p\nr.x = 2\nprint(p.x)\n"),
+              rfb_shown("a 'val' is written once, so assignment has nothing to write through",
+                        6, 1, "r.x = 2", "^^^^^^^"))
+
+@test("and its address may not be taken, a pointer being a licence to write")
+rfb_the_address_of_a_ref_into_a_val()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err("val xs: [3]int = [1, 2, 3]\nref e = xs[1]\nvar q: *int = &e\nprint(*q)\n"),
+              rfb_shown("a 'val' is written once, so '&' has nothing to write through",
+                        3, 15, "var q: *int = &e", "              ^^"))
+
+// A ref of a ref has no path of its own to hold still, and the one it was bound through is still in
+// scope -- so that one answers.
+@test("a ref of a ref leaves the first one standing guard")
+rfb_a_ref_of_a_ref_leaves_the_first_on_guard()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err(raw"""
+        struct Holder
+            cell: []int
+        end Holder
+        var h = Holder([0; 4])
+        ref a = h.cell[0]
+        ref b = a
+        h.cell = [0; 2]
+        print(b)
+        """), rfb_shown(rfb_standing("a"), 7, 1, "h.cell = [0; 2]", "^^^^^^^^^^^^^^^"))
