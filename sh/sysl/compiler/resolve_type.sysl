@@ -50,7 +50,7 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     // **A hop is what makes a cycle finite**, so the four forms that point rather than hold are
     // counted -- and the count is what a type reached again is judged against.
     PtrType(inner) -> resolve_ptr(a, scope, inner, subst)
-    RefType(inner, sync) -> resolve_ref(a, scope, inner, sync, subst)
+    RefType(inner, sync) -> resolve_ref(a, scope, t.span, inner, sync, subst)
     WeakType(inner) -> Weak(under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, false)))
     // Everywhere but a field, an element and a pointee, what is being named is a **value** -- what a
     // binding holds, what a parameter receives, what a call hands back -- and a value read out of a
@@ -159,11 +159,23 @@ private volatile_constrains(t: Type) -> bool = t match
 
 // `&T` — and where `T` is a trait, the one place a trait object is formed, so the one place its
 // formability is asked about.
-private resolve_ref(a: &Analysis, scope: Scope, inner: TypeRef, sync: bool,
+//
+// **An atomic reference promises that a second domain may hold the object**, which is a promise
+// about everything the object holds (`reference/memory.md § Crossing a concurrency domain`). A trait
+// object is the one pointee whose contents are not known here -- the type it forgot is settled
+// where a value is erased into one, and that is where it is asked.
+private resolve_ref(a: &Analysis, scope: Scope, span: Span, inner: TypeRef, sync: bool,
                     subst: Buf[Binding]) -> Type
     val ty = under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, false))
 
     check_object_written(a, scope, inner, ty, "&", subst)
+
+    if sync
+        ty match
+            Trait(_, _, _) -> ()
+            _ -> check_shared(a, scope, span, ty)
+    end if
+
     Ref(ty, sync)
 end resolve_ref
 

@@ -533,7 +533,7 @@ private led_word(lhs: Expr, at: Span, w: string, p: *Parser) -> Expr
     if is_compare_op(w) then return led_compare(lhs, w, p)
     if w == ".." || w == "..<" then return led_range(lhs, at, w == "..", p)
     if w == "(" then return led_call(lhs, p)
-    if w == "[" then return led_index(lhs, p)
+    if w == "[" then return led_index(lhs, at, p)
     if w == "." then return led_field(lhs, p)
     if w == "::" then return led_type_attr(lhs, p)
     if w == "?" then return expr(from.to(at), TryExpr(lhs))
@@ -654,12 +654,16 @@ end parse_trailing_block
 // **One thing in the brackets is a subscript; more than one never was.** The comma is what tells the
 // two readings apart without asking what the name is, and the multi-argument form exists for `&f[A,
 // B]`, the address of an instantiation.
-private led_index(lhs: Expr, p: *Parser) -> Expr
+//
+// **The span starts at the `[`, not at the receiver**, as the reference's does: a complaint about a
+// subscript -- what cannot be indexed, what cannot be sliced -- points at the brackets, the receiver
+// having a span of its own.
+private led_index(lhs: Expr, at: Span, p: *Parser) -> Expr
     val first = parse_expr(p)
 
     if !p.at_kw(",")
         p.expect_kw("]")
-        return expr(lhs.span.to(p.just_taken()), Index(lhs, first))
+        return expr(at.to(p.just_taken()), Index(lhs, first))
     end if
 
     var args: Buf[Expr] = buf()
@@ -673,7 +677,7 @@ private led_index(lhs: Expr, p: *Parser) -> Expr
         args.push(parse_expr(p))
 
     p.expect_kw("]")
-    expr(lhs.span.to(p.just_taken()), TypeArgs(lhs, args))
+    expr(at.to(p.just_taken()), TypeArgs(lhs, args))
 end led_index
 
 // `a.b`, and `a.0` -- a tuple's parts are selected by number and are fields like any other.
