@@ -1,0 +1,202 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// **Whether a trait may be erased into an object at all**, asked where `&Trait` or `*Trait` is
+// written. An erased value has forgotten its type, so a method may promise nothing that depends on
+// knowing it: `Self` may stand for the receiver and nowhere else, an associated function has no
+// receiver to dispatch on, an associated type the object did not fix is the implementing type's
+// choice, and `&self` asks for a reference-counted box only the counted object carries.
+//
+// A trait offers what it requires as well as what it declares, so a required trait that cannot be
+// erased makes the one requiring it unerasable too -- and the refusal names the trait the member
+// came from, which for a required trait is not the one the object was written as. **The first
+// refusal is the only one**, each being a reason there is no object.
+
+// The object a written `&T` or `*T` forms, checked; `inner` is what the sigil was written in front
+// of, and a type parameter standing for a trait forms nothing here.
+check_object_written(a: &Analysis, scope: Scope, inner: TypeRef, made: Type, sigil: string,
+                     subst: Buf[Binding])
+    val positional = *inner.kind match
+        NamedType(n, args) ->
+            if args.is_empty() && bound_in(subst, n) then return
+
+            var k: usize = 0
+
+            for i in 0..<args.len()
+                *args.at(i).kind match
+                    AssocArgType(_, _) -> ()
+                    _ -> k += 1
+
+            k
+        FnType(ps, _, _) -> ps.len() + 1
+        _ -> return
+
+    made match
+        Trait(key, args, fixed) -> check_object_safe(a, scope, inner.span, key, args, fixed, sigil,
+                                                     positional)
+        _ -> ()
+end check_object_written
+
+private bound_in(subst: Buf[Binding], name: string) -> bool
+    for i in 0..<subst.len()
+        if subst.at(i).name == name then return true
+
+    false
+end bound_in
+
+private check_object_safe(a: &Analysis, scope: Scope, span: Span, key: string, args: Buf[Type],
+                          fixed: Buf[(string, Type)], sigil: string, positional: usize)
+    val decl = trait_decl_at(a, key)
+
+    if decl.is_none() then return
+
+    val own = decl.unwrap()
+    val shown_key = qualified_name(key)
+    val obj = s"'$sigil${Bound(key, args).show()}'"
+    val fixed_names = names_fixed(fixed)
+    val self_bind = self_binding(Abstract("Self", buf()))
+    val closure = trait_closure(a, Bound(key, args), self_bind)
+
+    for i in 0..<closure.len()
+        val d = trait_decl_at(a, closure.at(i).name)
+
+        if d.is_some()
+            val assocs = d.unwrap().assocs
+
+            for j in 0..<assocs.len()
+                val an = assocs.at(j).name
+
+                if !holds_string(fixed_names, an)
+                    val from = qualified_name(closure.at(i).name)
+
+                    a.fault(scope, span, s"'$from' declares the associated type '$an', whose meaning " +
+                            "is the implementing type's — an erased value has forgotten which type " +
+                            s"that is, so there is no $obj to form. Say which it is and there is: " +
+                            s"write '$sigil$shown_key[$an = …]', or take a bound instead, which keeps " +
+                            s"the type and so keeps the answer: '[T: $from]'")
+                    return
+
+    // The parameters of the object's OWN trait that were left to a default: a `Self` arriving that
+    // way is the default's to explain, in words that name writing the argument as the fix.
+    var defaulted: Buf[string] = buf()
+
+    for i in positional..<own.tparams.len()
+        defaulted.push(own.tparams.at(i))
+
+    val members = trait_members(a, Bound(key, args), self_bind)
+
+    for i in 0..<members.len()
+        val from = members.at(i).0
+        val m = members.at(i).1
+        val shown = qualified_name(from.name)
+
+        if m.recv_mode().is_none()
+            a.fault(scope, span, s"'$shown' declares the associated function '${m.name}', which has no " +
+                    s"receiver to dispatch on — so there is no $obj to form")
+            return
+        end if
+
+        if sigil == "*" && takes_ref_self(m)
+            a.fault(scope, span, s"'${m.name}' of '$shown' takes '&self', so it needs its receiver inside " +
+                    s"a reference-counted box — $obj points straight at a value, so write " +
+                    s"'&$shown_key' instead")
+            return
+        end if
+
+        // A `Self` reaches a signature two ways: WRITTEN there, or arriving through one of the
+        // trait's own arguments, which is how the operator catalog carries it -- `add(self, rhs: Rhs)`
+        // spells no `Self`, and `Add`'s two defaults are `Self`.
+        var names = params_bound_to_self(a, from, if from.name == key then defaulted else buf())
+
+        names.push("Self")
+
+        if member_mentions(m, names, fixed_names)
+            a.fault(scope, span, s"'${m.name}' of '$shown' mentions 'Self' away from its receiver, and " +
+                    s"an erased value has forgotten which type that is — so there is no $obj to form")
+            return
+        end if
+
+        if m.variadic
+            a.fault(scope, span, s"'${m.name}' of '$shown' takes a '...', and a call to one names the " +
+                    "whole function type it is reaching — a slot in a method table is a word and names " +
+                    s"none, so there is no $obj to form")
+            return
+        end if
+end check_object_safe
+
+private takes_ref_self(m: MethodDecl) -> bool = m.receiver match
+    Some(ByRef(_)) -> true
+    _ -> false
+
+private names_fixed(fixed: Buf[(string, Type)]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<fixed.len()
+        out.push(fixed.at(i).0)
+
+    out
+end names_fixed
+
+private holds_string(xs: Buf[string], s: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == s then return true
+
+    false
+end holds_string
+
+// Which of a trait's own parameters were given `Self` at this application, less the ones left out.
+private params_bound_to_self(a: &Analysis, b: Bound, left_out: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+    val d = trait_decl_at(a, b.name)
+
+    if d.is_none() then return out
+
+    val tps = d.unwrap().tparams
+
+    for i in 0..<tps.len()
+        if i < b.args.len() && !holds_string(left_out, tps.at(i))
+            b.args.at(i) match
+                Abstract(n, _) -> if n == "Self" then out.push(tps.at(i))
+                _ -> ()
+
+    out
+end params_bound_to_self
+
+private member_mentions(m: MethodDecl, names: Buf[string], settled: Buf[string]) -> bool
+    for i in 0..<m.params.len()
+        if mentions_any(m.params.at(i).typ, names, settled) then return true
+
+    m.ret_type.is_some() && mentions_any(m.ret_type.unwrap(), names, settled)
+end member_mentions
+
+// Whether a written type names any of `names` anywhere inside it. `Self::Body` the object fixed
+// mentions nothing it has forgotten, which is what `settled` is for.
+private mentions_any(t: TypeRef, names: Buf[string], settled: Buf[string]) -> bool = *t.kind match
+    NamedType(n, args) -> holds_string(names, n) || any_mentions(args, names, settled)
+    ValueArgType(_) -> false
+    PtrType(i) -> mentions_any(i, names, settled)
+    RefType(i, _) -> mentions_any(i, names, settled)
+    WeakType(i) -> mentions_any(i, names, settled)
+    ArrayType(_, e, _) -> mentions_any(e, names, settled)
+    VectorType(_, e) -> mentions_any(e, names, settled)
+    VolatileType(i) -> mentions_any(i, names, settled)
+    TupleType(parts, _) -> any_mentions(parts, names, settled)
+    PackType(n) -> holds_string(names, n)
+    FnType(ps, r, _) -> any_mentions(ps, names, settled) || mentions_any(r, names, settled)
+    CFnType(ps, r) -> any_mentions(ps, names, settled) || mentions_any(r, names, settled)
+    AssocType(base, member) -> *base.kind match
+        NamedType(n, args) ->
+            if n == "Self" && args.is_empty() && holds_string(settled, member) then false
+            else mentions_any(base, names, settled)
+        _ -> mentions_any(base, names, settled)
+    AssocArgType(_, inner) -> mentions_any(inner, names, settled)
+    SomeType(_) -> false
+
+private any_mentions(ts: Buf[TypeRef], names: Buf[string], settled: Buf[string]) -> bool
+    for i in 0..<ts.len()
+        if mentions_any(ts.at(i), names, settled) then return true
+
+    false
+end any_mentions
