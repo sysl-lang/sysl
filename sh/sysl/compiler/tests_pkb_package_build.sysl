@@ -1,0 +1,928 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{replace_all, Search}
+
+// **A program built against what its `package.hocon` depends on** -- the package system from the
+// outside. The suites either side of this one check the resolver's answers and the hash's
+// definition; none of them says that a build of a project with a `dependencies` block compiles the
+// fetched code, links it and prints the right number. Every case here does that or refuses to.
+//
+// A `git` dependency is laid out in the project's `vendor/` tree, with the tree hash recorded beside
+// it as a fetch would have left it, so nothing reaches the network and the road from resolution on
+// is the one a fetched package takes. Every refusal quoted here was read off the reference (0.0.152)
+// run over the same trees.
+
+// -- trees on disk --------------------------------------------------------------------------------
+
+private pkb_ready() -> bool = std_root().is_ok() && clang_available()
+
+private pkb_none() -> Buf[(string, string)] = buf()
+
+private pkb_one(at: string, body: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push((at, body))
+    out
+end pkb_one
+
+private pkb_two(a: string, x: string, b: string, y: string) -> Buf[(string, string)]
+    var out = pkb_one(a, x)
+
+    out.push((b, y))
+    out
+end pkb_two
+
+private pkb_three(a: string, x: string, b: string, y: string, c: string, z: string) -> Buf[(string, string)]
+    var out = pkb_two(a, x, b, y)
+
+    out.push((c, z))
+    out
+end pkb_three
+
+private pkb_write_all(root: string, files: Buf[(string, string)])
+    for i in 0..<files.len()
+        val at = s"$root/${files.at(i).0}"
+
+        make_dir_all(parent_of(at).unwrap_or(root)).unwrap()
+        write_text(at, files.at(i).1).unwrap()
+
+private pkb_manifest(name: string, version: string, deps: string) -> string =
+    s"package { name = \"$name\", version = \"$version\" }\n" +
+    (if deps.is_empty() then "" else s"dependencies { $deps }\n")
+
+// A package laid out at `root`: a manifest, one module in a directory of its own, and whatever else
+// it carries. The module may be a path, which is how a package namespaced by reverse DNS is laid out.
+private pkb_lay(root: string, extra: string, name: string, module_path: string, text: string,
+                deps: string, files: Buf[(string, string)])
+    make_dir_all(s"$root/$module_path").unwrap()
+    write_text(s"$root/package.hocon", pkb_manifest(name, "1.0.0", deps) + extra).unwrap()
+    write_text(s"$root/$module_path/${basename(module_path)}.sysl",
+               s"module ${replace_all(module_path, "/", ".")}\n\n$text\n").unwrap()
+    pkb_write_all(root, files)
+end pkb_lay
+
+// The same in a directory of its own, plus whatever else the manifest says -- a `defines` block.
+private pkb_package_saying(extra: string, name: string, module_path: string, text: string,
+                           files: Buf[(string, string)]) -> string
+    val root = make_temp_dir("sysl-pkb-pkg").unwrap()
+
+    pkb_lay(root, extra, name, module_path, text, "", files)
+    root
+end pkb_package_saying
+
+private pkb_package(name: string, module_path: string, text: string) -> string =
+    pkb_package_saying("", name, module_path, text, pkb_none())
+
+private pkb_carrying(name: string, module_path: string, text: string,
+                     files: Buf[(string, string)]) -> string =
+    pkb_package_saying("", name, module_path, text, files)
+
+// A project with a program in it and the dependencies its manifest names.
+private pkb_app(program: string, deps: string) -> string
+    val root = make_temp_dir("sysl-pkb-app").unwrap()
+
+    write_text(s"$root/package.hocon",
+               s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { $deps }\n").unwrap()
+    write_text(s"$root/main.sysl", program).unwrap()
+    root
+end pkb_app
+
+// A package in the project's `vendor/` tree at a coordinate and version, as a fetch would have left
+// it once `pkb_seal` has recorded what it hashed to.
+private pkb_published(project: string, coordinate: string, version: string, config: string) -> string
+    val dir = s"$project/vendor/$coordinate/@v$version"
+
+    make_dir_all(dir).unwrap()
+    write_text(s"$dir/package.hocon", config).unwrap()
+    dir
+end pkb_published
+
+// A vendored package holding one module, `module_name`, whose text is `text`; sealed.
+private pkb_vendored(project: string, coordinate: string, version: string, config: string,
+                     module_name: string, text: string) -> string
+    val dir = pkb_published(project, coordinate, version, config)
+
+    make_dir_all(s"$dir/$module_name").unwrap()
+    write_text(s"$dir/$module_name/$module_name.sysl", s"module $module_name\n\n$text\n").unwrap()
+    pkb_seal(dir)
+end pkb_vendored
+
+private pkb_seal(dir: string) -> string
+    val hash = tree_hash(dir).unwrap()
+
+    write_text(s"$dir.hash", s"$hash\n").unwrap()
+    hash
+end pkb_seal
+
+private pkb_drop(dirs: []string)
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+// -- the whole command ----------------------------------------------------------------------------
+
+// What the program a build of `root` makes prints, or what stopped it.
+private pkb_run(root: string) -> string
+    val out_dir = make_temp_dir("sysl-pkb-exe").unwrap()
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end pkb_run
+
+// What a build of `root` was refused with, as the command line prints it after `sysl: error: `.
+private pkb_refused(root: string) -> string
+    val out_dir = make_temp_dir("sysl-pkb-exe").unwrap()
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "built"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end pkb_refused
+
+// -- a dependency's code, reached ------------------------------------------------------------------
+
+@test("a program calls a package's function")
+pkb_a_program_calls_a_package()
+    if !pkb_ready() then return
+
+    val geom = pkb_package("geom-lib", "geom", "double(n: int) -> int = n * 2")
+    val root = pkb_app("print(geom.double(21))", s"g { path = \"$geom\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, geom])
+end pkb_a_program_calls_a_package
+
+// The import line is the one the library's own documentation would show.
+@test("and may import from it rather than qualifying every use")
+pkb_may_import_from_it()
+    if !pkb_ready() then return
+
+    val geom = pkb_package("geom-lib", "geom", "double(n: int) -> int = n * 2")
+    val root = pkb_app("import geom.double\n\nprint(double(21))", s"g { path = \"$geom\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, geom])
+end pkb_may_import_from_it
+
+// The label is the consumer's private word for the dependency, a canonical prefix rather than a
+// module path, so no import line may be refused on account of it.
+@test("and the name it binds is not refused by the label the consumer filed it under")
+pkb_the_label_refuses_nothing()
+    if !pkb_ready() then return
+
+    val widget = pkb_package("widget-lib", "sh/sysl/widget", "widget() -> int = 42")
+    val root = pkb_app("import sh.sysl.widget.widget\n\nprint(widget())",
+                       s"widget { path = \"$widget\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, widget])
+end pkb_the_label_refuses_nothing
+
+@test("a mount puts the package under a name of the consumer's choosing")
+pkb_a_mount_names_the_package()
+    if !pkb_ready() then return
+
+    val geom = pkb_package("geom-lib", "geom", "double(n: int) -> int = n * 2")
+    val root = pkb_app("print(shapes.geom.double(21))", s"g { path = \"$geom\", mount = \"shapes\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, geom])
+end pkb_a_mount_names_the_package
+
+// The point of the canonical prefix: the project's own `geom` and the dependency's are two modules.
+@test("a project's own module may share a name with a mounted package's")
+pkb_our_module_beside_a_mounted_one()
+    if !pkb_ready() then return
+
+    val geom = pkb_package("geom-lib", "geom", "double(n: int) -> int = n * 2")
+    val root = pkb_app("print(geom.triple(14) + shapes.geom.double(0))",
+                       s"g { path = \"$geom\", mount = \"shapes\" }")
+
+    pkb_write_all(root, pkb_one("geom/geom.sysl", "module geom\n\ntriple(n: int) -> int = n * 3\n"))
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, geom])
+end pkb_our_module_beside_a_mounted_one
+
+@test("a package whose own modules call each other")
+pkb_a_packages_modules_call_each_other()
+    if !pkb_ready() then return
+
+    val two = make_temp_dir("sysl-pkb-two").unwrap()
+
+    write_text(s"$two/package.hocon", pkb_manifest("two", "1.0.0", "")).unwrap()
+    // Written with the package's own short name, so its source reads the same whoever depends on it.
+    pkb_write_all(two, pkb_two("inner/inner.sysl", "module inner\n\ndouble(n: int) -> int = n * 2\n",
+                               "outer/outer.sysl",
+                               "module outer\n\nimport inner.double\n\nquadruple(n: int) -> int = double(double(n))\n"))
+
+    val root = pkb_app("print(outer.quadruple(10))", s"t { path = \"$two\" }")
+
+    assert_eq(pkb_run(root), "40\n")
+    pkb_drop([root, two])
+end pkb_a_packages_modules_call_each_other
+
+// A package's table is its own: `middle` reaches `bottom` because *its* manifest names it.
+private pkb_middle(project: string, body: string) -> string
+    pkb_vendored(project, "github.com/e/bottom", "1.0.0", pkb_manifest("bottom", "1.0.0", ""),
+                 "bottom", "double(n: int) -> int = n * 2")
+
+    val middle = make_temp_dir("sysl-pkb-mid").unwrap()
+
+    pkb_lay(middle, "", "middle", "middle", body, "b { git = \"github.com/e/bottom\", version = \"1.0.0\" }",
+            pkb_none())
+    middle
+end pkb_middle
+
+@test("a package that depends on a package")
+pkb_a_package_depending_on_a_package()
+    if !pkb_ready() then return
+
+    val root = pkb_app("print(middle.quadruple(10))", "")
+    val middle = pkb_middle(root, "quadruple(n: int) -> int = bottom.double(bottom.double(n))")
+
+    write_text(s"$root/package.hocon", "package { name = \"app\", version = \"0.1.0\" }\n" +
+               s"dependencies { m { path = \"$middle\" } }\n").unwrap()
+    assert_eq(pkb_run(root), "40\n")
+    pkb_drop([root, middle])
+end pkb_a_package_depending_on_a_package
+
+// And it reaches what its dependency reaches: the consumer names `middle` and writes `bottom.double`.
+@test("and the consumer reaches what its dependency reaches")
+pkb_the_consumer_reaches_through()
+    if !pkb_ready() then return
+
+    val root = pkb_app("print(bottom.double(21))", "")
+    val middle = pkb_middle(root, "quadruple(n: int) -> int = bottom.double(bottom.double(n))")
+
+    write_text(s"$root/package.hocon", "package { name = \"app\", version = \"0.1.0\" }\n" +
+               s"dependencies { m { path = \"$middle\" } }\n").unwrap()
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, middle])
+end pkb_the_consumer_reaches_through
+
+// -- two packages wanting one name ------------------------------------------------------------------
+
+@test("is refused rather than resolved by whichever was read first")
+pkb_two_packages_one_name_refused()
+    if !pkb_ready() then return
+
+    val one = pkb_package("one", "json", "tag() -> int = 1")
+    val two = pkb_package("two", "json", "tag() -> int = 2")
+    val root = pkb_app("print(json.tag())", s"a { path = \"$one\" }, b { path = \"$two\" }")
+
+    assert_eq(pkb_refused(root),
+              "package.hocon: 'json' and 'json' cannot both be imported — a and b claim the same " +
+              "module. Give one of them a 'mount' in package.hocon to say which name it takes here")
+    pkb_drop([root, one, two])
+end pkb_two_packages_one_name_refused
+
+@test("and a mount settles it")
+pkb_a_mount_settles_two_packages()
+    if !pkb_ready() then return
+
+    val one = pkb_package("one", "json", "tag() -> int = 40")
+    val two = pkb_package("two", "json", "tag() -> int = 2")
+    val root = pkb_app("print(json.tag() + other.json.tag())",
+                       s"a { path = \"$one\" }, b { path = \"$two\", mount = \"other\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, one, two])
+end pkb_a_mount_settles_two_packages
+
+// The common case rather than an exotic one.
+@test("including one the project already uses for a module of its own")
+pkb_one_the_project_already_uses()
+    if !pkb_ready() then return
+
+    val one = pkb_package("one", "json", "tag() -> int = 1")
+    val root = pkb_app("print(json.tag())", s"a { path = \"$one\" }")
+
+    pkb_write_all(root, pkb_one("json/json.sysl", "module json\n\nmine() -> int = 2\n"))
+    assert_eq(pkb_refused(root),
+              "package.hocon: 'json' is both a module of this project and one a offers — give the " +
+              "dependency a 'mount' to say what it is called here")
+    pkb_drop([root, one])
+end pkb_one_the_project_already_uses
+
+// The reference's case seeds its run cache with the entry a different build of the same version
+// left, and requires this build to compile rather than replay it. The run cache here is keyed on
+// `Version` alone -- `0.0.1` for the whole of development -- with no identity for which build of that
+// version wrote an entry, so there is nothing for the case to vary.
+@test("and is not handed a test build another build of this version cached for the same project",
+      ignore: "the run cache has no compiler identity beside the version (the reference's CompilerIdentity)")
+pkb_not_handed_another_builds_test_binary()
+    assert(false, "needs a compiler identity in the run cache's key")
+
+// -- packages namespaced under a shared prefix -------------------------------------------------------
+
+@test("are all reachable at once, under the names their own documentation shows")
+pkb_namespaced_all_reachable()
+    if !pkb_ready() then return
+
+    val sqlite = pkb_package("sqlite3", "sh/sysl/sqlite", "answer() -> int = 40")
+    val table = pkb_package("table", "sh/sysl/table", "answer() -> int = 2")
+    val root = pkb_app("print(sh.sysl.sqlite.answer() + sh.sysl.table.answer())",
+                       s"s { path = \"$sqlite\" }, t { path = \"$table\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, sqlite, table])
+end pkb_namespaced_all_reachable
+
+@test("and are imported without a mount, which is the whole point of the convention")
+pkb_namespaced_imported_without_a_mount()
+    if !pkb_ready() then return
+
+    val sqlite = pkb_package("sqlite3", "sh/sysl/sqlite", "double(n: int) -> int = n * 2")
+    val table = pkb_package("table", "sh/sysl/table", "half(n: int) -> int = n / 2")
+    val root = pkb_app("import sh.sysl.sqlite.double\nimport sh.sysl.table.half\n\nprint(double(half(42)))",
+                       s"s { path = \"$sqlite\" }, t { path = \"$table\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, sqlite, table])
+end pkb_namespaced_imported_without_a_mount
+
+// A binding covers the module it names and everything under it.
+@test("a module below a bound one comes with it")
+pkb_a_module_below_comes_with_it()
+    if !pkb_ready() then return
+
+    val deep = pkb_carrying("deep", "sh/sysl/outer", "double(n: int) -> int = n * 2",
+                            pkb_one("sh/sysl/outer/inner/inner.sysl",
+                                    "module sh.sysl.outer.inner\n\ntriple(n: int) -> int = n * 3\n"))
+    val root = pkb_app("print(sh.sysl.outer.double(15) + sh.sysl.outer.inner.triple(4))",
+                       s"d { path = \"$deep\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, deep])
+end pkb_a_module_below_comes_with_it
+
+// A namespaced package's own modules reaching each other: the segment that travels past the head.
+private pkb_namespaced(outer: string) -> string
+    val ns = make_temp_dir("sysl-pkb-ns").unwrap()
+
+    write_text(s"$ns/package.hocon", pkb_manifest("ns", "1.0.0", "")).unwrap()
+    pkb_write_all(ns, pkb_two("sh/sysl/inner/inner.sysl",
+                              "module sh.sysl.inner\n\ndouble(n: int) -> int = n * 2\n",
+                              "sh/sysl/outer/outer.sysl", s"module sh.sysl.outer\n\n$outer\n"))
+    ns
+end pkb_namespaced
+
+@test("a namespaced package's own modules reach each other by import")
+pkb_namespaced_by_import()
+    if !pkb_ready() then return
+
+    val ns = pkb_namespaced("import sh.sysl.inner.double\n\nquadruple(n: int) -> int = double(double(n))")
+    val root = pkb_app("print(sh.sysl.outer.quadruple(10))", s"n { path = \"$ns\" }")
+
+    assert_eq(pkb_run(root), "40\n")
+    pkb_drop([root, ns])
+end pkb_namespaced_by_import
+
+@test("and by qualified reference")
+pkb_namespaced_by_qualified_reference()
+    if !pkb_ready() then return
+
+    val ns = pkb_namespaced("triple(n: int) -> int = sh.sysl.inner.double(n) + n")
+    val root = pkb_app("print(sh.sysl.outer.triple(14))", s"n { path = \"$ns\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, ns])
+end pkb_namespaced_by_qualified_reference
+
+// The same two with an unrelated `--lib` source root beginning with the same segment in the
+// compilation, which this compiler has no flag for.
+@test("by import", ignore: "needs '--lib' source roots, which are not built here")
+pkb_namespaced_by_import_beside_a_lib()
+    assert(false, "needs --lib")
+
+@test("by qualified reference", ignore: "needs '--lib' source roots, which are not built here")
+pkb_namespaced_by_reference_beside_a_lib()
+    assert(false, "needs --lib")
+
+// A name the consumer chose has no tree to be read off, so it still hangs the whole package.
+@test("and a mount still hangs the whole tree under one segment")
+pkb_a_mount_hangs_the_namespaced_tree()
+    if !pkb_ready() then return
+
+    val table = pkb_package("table", "sh/sysl/table", "answer() -> int = 42")
+    val root = pkb_app("print(tb.sh.sysl.table.answer())", s"t { path = \"$table\", mount = \"tb\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, table])
+end pkb_a_mount_hangs_the_namespaced_tree
+
+// The reference prints `'g.geom.triple'`; this compiler names a declaration qualified, and the
+// qualifier of a path dependency's module is its label, so the two spellings agree here.
+@test("a name the package does not declare is refused where it is written")
+pkb_an_undeclared_name_is_refused()
+    if !pkb_ready() then return
+
+    val geom = pkb_package("geom-lib", "geom", "double(n: int) -> int = n * 2")
+    val root = pkb_app("print(geom.triple(21))", s"g { path = \"$geom\" }")
+
+    assert_eq(pkb_refused(root),
+              "error: undefined function 'g.geom.triple'\n" +
+              s" --> $root/main.sysl:1:12\n" +
+              "  |\n" +
+              "1 | print(geom.triple(21))\n" +
+              "  |            ^^^^^^\n")
+    pkb_drop([root, geom])
+end pkb_an_undeclared_name_is_refused
+
+// -- a package's C --------------------------------------------------------------------------------
+
+// Seven is a number only the C knows, and the multiplication is only the sysl's.
+private pkb_shim() -> string = "int geom_seven(void) { return 7; }\n"
+
+private pkb_calling() -> string = "extern \"geom_seven\" c_seven() -> int\n\nseven_times(n: int) -> int = c_seven() * n"
+
+@test("is compiled and linked beside its sysl")
+pkb_c_beside_its_sysl()
+    if !pkb_ready() then return
+
+    val geom = pkb_carrying("geom-lib", "geom", pkb_calling(), pkb_one("geom/shim.c", pkb_shim()))
+    val root = pkb_app("print(geom.seven_times(6))", s"g { path = \"$geom\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, geom])
+end pkb_c_beside_its_sysl
+
+// The package root is the one place that declares no module.
+@test("is found at the package root as well as beside a module")
+pkb_c_at_the_package_root()
+    if !pkb_ready() then return
+
+    val geom = pkb_carrying("geom-lib", "geom", pkb_calling(), pkb_one("shim.c", pkb_shim()))
+    val root = pkb_app("print(geom.seven_times(6))", s"g { path = \"$geom\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, geom])
+end pkb_c_at_the_package_root
+
+// Two files at one relative path stay two objects.
+@test("does not collide with another package's at the same relative path")
+pkb_c_at_one_relative_path()
+    if !pkb_ready() then return
+
+    val one = pkb_carrying("one", "left", "extern \"one_util\" c() -> int\n\nvalue() -> int = c()",
+                           pkb_one("left/util.c", "int one_util(void) { return 40; }\n"))
+    val two = pkb_carrying("two", "left", "extern \"two_util\" c() -> int\n\nvalue() -> int = c()",
+                           pkb_one("left/util.c", "int two_util(void) { return 2; }\n"))
+    val root = pkb_app("print(left.value() + other.left.value())",
+                       s"a { path = \"$one\" }, b { path = \"$two\", mount = \"other\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, one, two])
+end pkb_c_at_one_relative_path
+
+// A binding two levels down is compiled on the same footing as one the manifest mentions.
+@test("is compiled for a package the project never named itself")
+pkb_c_two_levels_down()
+    if !pkb_ready() then return
+
+    val root = pkb_app("print(middle.six_sevens())", "")
+    val at = pkb_published(root, "github.com/e/bottom", "1.0.0", pkb_manifest("bottom", "1.0.0", ""))
+
+    pkb_write_all(at, pkb_two("bottom/bottom.sysl",
+                              "module bottom\n\nextern \"bottom_seven\" c() -> int\n\nseven() -> int = c()\n",
+                              "bottom/shim.c", "int bottom_seven(void) { return 7; }\n"))
+    pkb_seal(at)
+
+    val middle = make_temp_dir("sysl-pkb-mid").unwrap()
+
+    pkb_lay(middle, "", "middle", "middle", "six_sevens() -> int = bottom.seven() * 6",
+            "b { git = \"github.com/e/bottom\", version = \"1.0.0\" }", pkb_none())
+    write_text(s"$root/package.hocon", "package { name = \"app\", version = \"0.1.0\" }\n" +
+               s"dependencies { m { path = \"$middle\" } }\n").unwrap()
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, middle])
+end pkb_c_two_levels_down
+
+// Named after a library no machine has, so the observation is the same everywhere: the name reached
+// a command line.
+@test("carries its module's link directive to the command line")
+pkb_a_link_directive_reaches_the_line()
+    if !pkb_ready() then return
+
+    val geom = pkb_package("geom-lib", "geom", "@link(\"sysl-no-such-library\")\n\nvalue() -> int = 42")
+    val root = pkb_app("print(geom.value())", s"g { path = \"$geom\" }")
+
+    assert_eq(pkb_refused(root),
+              "clang failed (exit 1):\n" +
+              "ld: library 'sysl-no-such-library' not found\n" +
+              "clang: error: linker command failed with exit code 1 (use -v to see invocation)")
+    pkb_drop([root, geom])
+end pkb_a_link_directive_reaches_the_line
+
+// The package author's mistake, met by the consumer, so the message names the file.
+@test("that will not compile stops the build, naming the file")
+pkb_c_that_will_not_compile()
+    if !pkb_ready() then return
+
+    val geom = pkb_carrying("geom-lib", "geom", pkb_calling(),
+                            pkb_one("geom/shim.c", "int geom_seven(void) { return\n"))
+    val root = pkb_app("print(geom.seven_times(6))", s"g { path = \"$geom\" }")
+    val c = s"$geom/geom/shim.c"
+
+    assert_eq(pkb_refused(root),
+              s"$c did not compile (clang, exit 1):\n" +
+              s"$c:1:30: error: expected expression\n" +
+              "    1 | int geom_seven(void) { return\n" +
+              "      |                              ^\n" +
+              s"$c:1:30: error: expected '}'\n" +
+              s"$c:1:22: note: to match this '{'\n" +
+              "    1 | int geom_seven(void) { return\n" +
+              "      |                      ^\n" +
+              "2 errors generated.")
+    pkb_drop([root, geom])
+end pkb_c_that_will_not_compile
+
+// -- a directory of C that is not a module ------------------------------------------------------------
+
+// A project whose own tree carries the files named, so the warning is about something its author can
+// change.
+private pkb_stray(files: Buf[(string, string)]) -> string
+    val root = make_temp_dir("sysl-pkb-stray").unwrap()
+
+    write_text(s"$root/package.hocon", "package { name = \"app\", version = \"0.1.0\" }").unwrap()
+    write_text(s"$root/main.sysl", "print(thing.answer())").unwrap()
+    pkb_write_all(root, pkb_one("thing/thing.sysl", "module thing\n\nanswer() -> int = 42\n"))
+    pkb_write_all(root, files)
+    root
+end pkb_stray
+
+@test("is named, with the one-file remedy in the sentence")
+pkb_stray_c_is_named()
+    if !pkb_ready() then return
+
+    val root = pkb_stray(pkb_one("thing/c/side.c", "int side_answer(void) { return 7; }\n"))
+    val said = stray_c_warnings(root)
+
+    assert_eq(said.len(), 1)
+    assert_eq(said.at(0),
+              s"'$root/thing/c' holds C and no sysl, so it is not a module and its '.c' files are " +
+              "compiled by nothing — a directory becomes one by holding the '.sysl' that declares " +
+              "those 'extern's")
+    // The skip is not an error and must not become one.
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root])
+end pkb_stray_c_is_named
+
+// The remedy the warning names, run rather than described.
+@test("and compiles once that directory holds the sysl declaring its externs")
+pkb_stray_c_repaired()
+    if !pkb_ready() then return
+
+    val root = pkb_stray(pkb_two("thing/c/side.c", "int side_answer(void) { return 7; }\n",
+                                 "thing/c/c.sysl", "module thing.c\n\nextern \"side_answer\" side() -> int\n"))
+
+    write_text(s"$root/thing/thing.sysl", "module thing\n\nimport thing.c\n\nanswer() -> int = c.side()\n").unwrap()
+    assert_eq(pkb_run(root), "7\n")
+    assert_eq(stray_c_warnings(root).len(), 0)
+    pkb_drop([root])
+end pkb_stray_c_repaired
+
+@test("while a directory holding no C at all is passed over in silence, as everything else is")
+pkb_no_c_no_warning()
+    if !pkb_ready() then return
+
+    val root = pkb_stray(pkb_one("thing/notes/README.md", "nothing to compile here\n"))
+
+    assert_eq(stray_c_warnings(root).len(), 0)
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root])
+end pkb_no_c_no_warning
+
+@test("a project with no dependencies block is untouched by any of this")
+pkb_no_dependencies_block()
+    if !pkb_ready() then return
+
+    val root = make_temp_dir("sysl-pkb-plain").unwrap()
+
+    write_text(s"$root/package.hocon", "package { name = \"app\", version = \"0.1.0\" }").unwrap()
+    write_text(s"$root/main.sysl", "print(42)").unwrap()
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root])
+end pkb_no_dependencies_block
+
+// -- a --lib source root's own dependencies -----------------------------------------------------------
+
+// Every case of this group names a source root with `--lib`, which this compiler has no flag for.
+
+@test("are fetched, so its own code reaches what it declared",
+      ignore: "needs '--lib' source roots, which are not built here")
+pkb_lib_deps_are_fetched()
+    assert(false, "needs --lib")
+
+@test("and a relative one is read against ITS OWN directory, never the project's",
+      ignore: "needs '--lib' source roots, which are not built here")
+pkb_lib_relative_path()
+    assert(false, "needs --lib")
+
+@test("and a coordinate is fetched, not only a directory already on this machine",
+      ignore: "needs '--lib' source roots, which are not built here")
+pkb_lib_coordinate_fetched()
+    assert(false, "needs --lib")
+
+@test("and are version-selected together with the project's own claims",
+      ignore: "needs '--lib' source roots, which are not built here")
+pkb_lib_selected_together()
+    assert(false, "needs --lib")
+
+@test("and two roots naming one coordinate get one copy of it, at the higher version",
+      ignore: "needs '--lib' source roots, which are not built here")
+pkb_lib_two_roots_one_copy()
+    assert(false, "needs --lib")
+
+@test("its header requirement, named rather than left to clang",
+      ignore: "needs '--lib' source roots, which are not built here")
+pkb_lib_header_requirement()
+    assert(false, "needs --lib")
+
+@test("and its allocator, which cannot then disagree with one the project names",
+      ignore: "needs '--lib' source roots, which are not built here")
+pkb_lib_allocator()
+    assert(false, "needs --lib")
+
+@test("while a root with no manifest depends on nothing",
+      ignore: "needs '--lib' source roots, which are not built here")
+pkb_lib_no_manifest()
+    assert(false, "needs --lib")
+
+@test("and a dependency claiming a name the root itself declares is refused",
+      ignore: "needs '--lib' source roots, which are not built here")
+pkb_lib_claiming_the_roots_name()
+    assert(false, "needs --lib")
+
+@test("while a mount settles that, as it does every other collision",
+      ignore: "needs '--lib' source roots, which are not built here")
+pkb_lib_mount_settles()
+    assert(false, "needs --lib")
+
+@test("and the program may write a name only the root's manifest bound",
+      ignore: "needs '--lib' source roots, which are not built here")
+pkb_lib_name_only_the_root_bound()
+    assert(false, "needs --lib")
+
+// -- sysl.sum -------------------------------------------------------------------------------------
+
+// A path dependency is expected to change under you, so nothing records what it hashed to.
+@test("is not written for a project whose dependencies are all paths")
+pkb_sums_not_written_for_paths()
+    if !pkb_ready() then return
+
+    val geom = pkb_package("geom-lib", "geom", "double(n: int) -> int = n * 2")
+    val root = pkb_app("print(geom.double(21))", s"g { path = \"$geom\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    assert(!is_file(s"$root/sysl.sum"), "a sysl.sum was written for path dependencies")
+    pkb_drop([root, geom])
+end pkb_sums_not_written_for_paths
+
+private pkb_git_geom() -> (string, string)
+    val root = pkb_app("print(geom.double(21))", "g { git = \"github.com/e/geom\", version = \"1.0.0\" }")
+    val hash = pkb_vendored(root, "github.com/e/geom", "1.0.0", pkb_manifest("geom-lib", "1.0.0", ""),
+                            "geom", "double(n: int) -> int = n * 2")
+
+    (root, hash)
+end pkb_git_geom
+
+// Written on the first build, from a package this project did not itself fetch.
+@test("records what a git dependency hashed to, on the first build")
+pkb_sums_recorded_on_the_first_build()
+    if !pkb_ready() then return
+
+    val (root, hash) = pkb_git_geom()
+
+    assert_eq(pkb_run(root), "42\n")
+    assert_eq(read_text(s"$root/sysl.sum").unwrap_or(""), s"github.com/e/geom v1.0.0 $hash\n")
+    pkb_drop([root])
+end pkb_sums_recorded_on_the_first_build
+
+@test("and a build whose record already agrees leaves the file alone")
+pkb_sums_agreeing_left_alone()
+    if !pkb_ready() then return
+
+    val (root, hash) = pkb_git_geom()
+
+    write_text(s"$root/sysl.sum", s"github.com/e/geom v1.0.0 $hash\n").unwrap()
+
+    val before = metadata(s"$root/sysl.sum").unwrap().modified.us
+
+    assert_eq(pkb_run(root), "42\n")
+    assert_eq(metadata(s"$root/sysl.sum").unwrap().modified.us, before)
+    pkb_drop([root])
+end pkb_sums_agreeing_left_alone
+
+// The refusal the file exists for: what is on disk is not what was promised.
+@test("refuses a build whose record disagrees with what is there")
+pkb_sums_disagreeing_refused()
+    if !pkb_ready() then return
+
+    val (root, hash) = pkb_git_geom()
+    val wrong = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+    write_text(s"$root/sysl.sum", s"github.com/e/geom v1.0.0 $wrong\n").unwrap()
+    assert_eq(pkb_refused(root),
+              "'github.com/e/geom' does not hash to what sysl.sum records for github.com/e/geom v1.0.0\n" +
+              s"  recorded: $wrong\n" +
+              s"  fetched:  $hash\n" +
+              "A version's content is not supposed to change. Either the tag was moved and the " +
+              "recorded line should be replaced deliberately, or what was fetched is not the package " +
+              "that was published.")
+    pkb_drop([root])
+end pkb_sums_disagreeing_refused
+
+// -- a package's 'defines' ----------------------------------------------------------------------------
+
+// The header both translation units read, written the way a vendored C library is: an option with a
+// default, so a probe measuring it under the defaults gets a different answer rather than failing.
+private pkb_header() -> string =
+    "#ifndef SIZED_H\n#define SIZED_H\n#ifndef WIDE\n#define WIDE 0\n#endif\n#if WIDE\n" +
+    "typedef struct { char bytes[64]; } state;\n#else\ntypedef struct { char bytes[8]; } state;\n" +
+    "#endif\nint sized_value(void);\n#endif\n"
+
+private pkb_impl() -> string =
+    "#include \"sized.h\"\n#ifdef DOUBLED\nint sized_value(void) { return 42; }\n#else\n" +
+    "int sized_value(void) { return 1; }\n#endif\n"
+
+private pkb_valued() -> string = "extern \"sized_value\" c() -> int\n\nvalue() -> int = c()"
+
+private pkb_measured() -> string =
+    "@include(\"sized.h\")\n\nc const\n    SIZE: usize = \"sizeof(state)\"\n\nsize() -> usize = SIZE"
+
+// A package configured by `defines`, built and run.
+private pkb_defined(defines: string, text: string, files: Buf[(string, string)], program: string) -> string
+    val pkg = pkb_package_saying(defines, "geom-lib", "geom", text, files)
+    val root = pkb_app(program, s"g { path = \"$pkg\" }")
+    val said = pkb_run(root)
+
+    pkb_drop([root, pkg])
+    said
+end pkb_defined
+
+@test("reach the C file the block names")
+pkb_defines_reach_the_named_file()
+    if !pkb_ready() then return
+
+    assert_eq(pkb_defined("defines { \"geom/shim.c\" { DOUBLED = true } }", pkb_valued(),
+                          pkb_two("geom/shim.c", pkb_impl(), "geom/sized.h", pkb_header()),
+                          "print(geom.value())"),
+              "42\n")
+
+@test("do not reach a C file the block does not name")
+pkb_defines_miss_an_unnamed_file()
+    if !pkb_ready() then return
+
+    assert_eq(pkb_defined("defines { \"other.c\" { DOUBLED = true } }", pkb_valued(),
+                          pkb_three("geom/shim.c", pkb_impl(), "geom/sized.h", pkb_header(),
+                                    "other.c", "int other_unused(void) { return 0; }\n"),
+                          "print(geom.value())"),
+              "1\n")
+
+@test("take a value, not only a bare name")
+pkb_defines_take_a_value()
+    if !pkb_ready() then return
+
+    assert_eq(pkb_defined("defines { \"geom/shim.c\" { DOUBLED = 1 } }", pkb_valued(),
+                          pkb_two("geom/shim.c", pkb_impl(), "geom/sized.h", pkb_header()),
+                          "print(geom.value())"),
+              "42\n")
+
+// A `c const` block is measured from a translation unit no key can name, so it inherits from the C in
+// its own directory: 64 under `WIDE`, 8 under the header's defaults.
+@test("reach the probe a 'c const' block is measured from")
+pkb_defines_reach_the_probe()
+    if !pkb_ready() then return
+
+    assert_eq(pkb_defined("defines { \"geom/shim.c\" { WIDE = 1 } }", pkb_measured(),
+                          pkb_two("geom/shim.c", pkb_impl(), "geom/sized.h", pkb_header()),
+                          "print(geom.size())"),
+              "64\n")
+
+@test("do not reach a probe in a different directory")
+pkb_defines_miss_a_probe_elsewhere()
+    if !pkb_ready() then return
+
+    assert_eq(pkb_defined("defines { \"other.c\" { WIDE = 1 } }", pkb_measured(),
+                          pkb_two("geom/sized.h", pkb_header(),
+                                  "other.c", "int other_unused(void) { return 0; }\n"),
+                          "print(geom.size())"),
+              "8\n")
+
+// A path that is merely wrong would leave the macros reaching nothing and the build looking fine.
+@test("naming a file the package does not carry stops the build")
+pkb_defines_naming_a_missing_file()
+    if !pkb_ready() then return
+
+    assert_eq(pkb_defined("defines { \"geom/typo.c\" { DOUBLED = true } }", pkb_valued(),
+                          pkb_two("geom/shim.c", pkb_impl(), "geom/sized.h", pkb_header()),
+                          "print(geom.value())"),
+              "refused: 'g': package.hocon: 'defines.\"geom/typo.c\"' names a file this package does " +
+              "not carry — the block configures the C the package itself holds, and there is no such " +
+              "C file in this tree")
+
+@test("a braced key configures every file it names")
+pkb_defines_a_braced_key()
+    if !pkb_ready() then return
+
+    val second = "#include \"sized.h\"\n#ifdef DOUBLED\nint sized_other(void) { return 800; }\n#else\n" +
+                 "int sized_other(void) { return 0; }\n#endif\n"
+
+    assert_eq(pkb_defined("defines { \"geom/{shim,other}.c\" { DOUBLED = true } }",
+                          "extern \"sized_value\" c() -> int\nextern \"sized_other\" d() -> int\n\n" +
+                          "value() -> int = c() + d()",
+                          pkb_three("geom/shim.c", pkb_impl(), "geom/other.c", second,
+                                    "geom/sized.h", pkb_header()),
+                          "print(geom.value())"),
+              "842\n")
+end pkb_defines_a_braced_key
+
+// A macro is one package's business, never a build-wide setting.
+@test("are scoped to the package that declared them")
+pkb_defines_scoped_to_their_package()
+    if !pkb_ready() then return
+
+    val one = pkb_package_saying("defines { \"left/util.c\" { DOUBLED = true } }", "one", "left",
+                                 "extern \"one_util\" c() -> int\n\nvalue() -> int = c()",
+                                 pkb_one("left/util.c", "#ifdef DOUBLED\nint one_util(void) { return 40; }\n" +
+                                         "#else\nint one_util(void) { return 0; }\n#endif\n"))
+    val two = pkb_carrying("two", "left", "extern \"two_util\" c() -> int\n\nvalue() -> int = c()",
+                           pkb_one("left/util.c", "#ifdef DOUBLED\nint two_util(void) { return 0; }\n" +
+                                   "#else\nint two_util(void) { return 2; }\n#endif\n"))
+    val root = pkb_app("print(left.value() + other.left.value())",
+                       s"a { path = \"$one\" }, b { path = \"$two\", mount = \"other\" }")
+
+    assert_eq(pkb_run(root), "42\n")
+    pkb_drop([root, one, two])
+end pkb_defines_scoped_to_their_package
+
+// -- an executable that would be written over a directory ---------------------------------------------
+
+// A project whose package name is also the name of a module directory in it.
+private pkb_colliding(name: string) -> string
+    val root = make_temp_dir("sysl-pkb-collide").unwrap()
+
+    write_text(s"$root/package.hocon", s"package { name = \"$name\", version = \"0.1.0\" }\n").unwrap()
+    pkb_write_all(root, pkb_one(s"$name/$name.sysl", s"module $name\n\nvalue() -> int = 7\n"))
+    write_text(s"$root/main.sysl", s"print($name.value())\n").unwrap()
+    root
+end pkb_colliding
+
+// The path is whatever the command was handed -- `'./slate'` for `sysl build .` -- here the absolute
+// root, which is what the reference prints for `sysl build <root>`.
+@test("is refused, naming both names and what to do about it")
+pkb_an_executable_over_a_directory()
+    if !pkb_ready() then return
+
+    val root = pkb_colliding("slate")
+
+    build_native_program(root, None, None, DefaultOptimization, None) match
+        Ok(_) -> assert(false, "built over a directory")
+        Err(why) ->
+            assert_eq(failure_text(why),
+                      s"this project builds an executable named 'slate', and '$root/slate' is a " +
+                      "directory — the two cannot both have that name. Rename the package or the " +
+                      "directory, or say where the binary goes with '-o <path>'")
+    pkb_drop([root])
+end pkb_an_executable_over_a_directory
+
+// There is no package name to rename when the reader chose the path.
+@test("and says so differently when '-o' named the directory")
+pkb_o_named_the_directory()
+    if !pkb_ready() then return
+
+    val root = pkb_colliding("slate")
+
+    build_native_program(root, None, None, DefaultOptimization, Some(s"$root/slate")) match
+        Ok(_) -> assert(false, "built over a directory")
+        Err(why) ->
+            assert_eq(failure_text(why),
+                      s"'-o $root/slate' names a directory, and an executable cannot be written over one")
+    pkb_drop([root])
+end pkb_o_named_the_directory
+
+// The other half of the threshold: the refusal is about the collision, not about the directory.
+@test("while a package named something else builds")
+pkb_another_name_builds()
+    if !pkb_ready() then return
+
+    val root = pkb_colliding("slate")
+
+    build_native_program(root, None, None, DefaultOptimization, Some(s"$root/slate-bin")) match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(made) -> assert_eq(made, s"$root/slate-bin")
+    pkb_drop([root])
+end pkb_another_name_builds
