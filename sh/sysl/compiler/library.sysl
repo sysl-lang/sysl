@@ -52,15 +52,33 @@ end LibraryBuild
 // **Ownership and linkage are separate facts.** Two units each call their fourth closure by one
 // name, so a closure body -- and every instantiation made at one -- is `internal`: the library's
 // copy and the program's are two symbols, and neither is advertised.
-library_build(units: Buf[Program], own: Buf[string], t: Target) -> LibraryBuild
-    val done = analyze_produced(units, t, file_names(units))
+//
+// **`producing` narrows which files have every body typed**, which is what a `--lib` root's artifact
+// asks for: the root is being produced and the standard module and the packages beside it are only
+// being handed to it. **`entries_left` leaves a function nothing names out of what is advertised** --
+// an `@export`, a `@section` placement, a calling convention -- so the program that links the artifact
+// compiles it, its thunk included: a root's archive member is pulled in only where something needs a
+// symbol from it, and an export living there would vanish from every program that happened not to.
+library_build(units: Buf[Program], own: Buf[string], t: Target,
+              producing: Option[Buf[string]] = None, entries_left: bool = false) -> LibraryBuild
+    val typed = producing match
+        Some(files) -> files
+        None -> file_names(units)
+
+    val done = analyze_produced(units, t, typed)
     val checked = program_of(done, done.main_module)
     val promotions = post_analysis_checks(done.an, checked, own)
 
     // **A library's tests are not in the library** -- held to the whole-program checks above like any
     // other code, then dropped, so the artifact neither defines nor advertises one.
     val whole = strip_tests(checked)
-    val defers = storage_reaching(whole)
+    var defers = storage_reaching(whole)
+
+    if entries_left
+        for i in 0..<whole.funcs.len()
+            val f = whole.funcs.at(i)
+
+            if f.exported.is_some() || f.section.is_some() || f.conv.is_some() then defers.push(f.name)
 
     var determined: Buf[string] = buf()
     var within: Buf[string] = buf()

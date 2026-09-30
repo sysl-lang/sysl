@@ -1,0 +1,374 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_var
+import sysl.fs.{entries, is_file, make_temp_dir, metadata, read_text, remove_dir_all, remove_file}
+import sysl.text.{from_utf8_unchecked, Search}
+
+// A `--lib` source root's compiled sysl, kept: the mechanism the standard module's artifact already
+// is (`std_artifact.sysl`), pointed at a root. The root's determined functions are lowered and
+// compiled once into an archive of their own, and every program naming the root DECLARES them rather
+// than emitting them -- so the inner loop "edit the program, the root unchanged" pays neither the
+// lowering nor the clang of the root again.
+//
+// **Nothing about the trees is kept.** A program still parses and analyzes the root, since a module
+// is a set of declarations a program may add to; what is saved is only what comes after the
+// analysis. The artifact holds the objects, the symbols they advertise and the key they were built
+// under, the standard module's container exactly.
+//
+// **A root is not closed the way the standard module is**, and that is the whole difficulty. A program
+// may not declare into `sysl`, so the standard module's object code is a function of its own source;
+// a root's modules are open to the project and to every other root, so a root's body may resolve a
+// call, an overload or an `impl` somebody else wrote. Its artifact is therefore made and used only
+// where two things hold, and the root is compiled from source for that build where either does not:
+//
+//   - **closed** -- the root analyzes with nothing but what it can see: the standard module, the
+//     packages, the other roots, and not the project. Its code is then a function of those trees,
+//     which is what the key is over.
+//   - **undisturbed** -- no other file of this compilation declares into a module the root declares.
+//     The artifact was compiled from the root's modules as the root wrote them, and a program that
+//     adds to one has made a different module.
+//
+// **The root is compiled as its own object whenever both hold, the cache on or off**, and the cache
+// only decides whether that object is made again. So a program built with the cache is the same bytes
+// as one built without it, which is what `rtc_` tests hold it to -- the proof that a hit hands the
+// link exactly what a miss would have.
+
+private const CacheOff: string = "SYSL_NO_CACHE"
+
+// Bumped when what an entry holds changes shape, so an old entry reads as a miss.
+private const Format: string = "root-1"
+
+// What the roots came to for one build: the symbols its text declares rather than defines, the
+// archives the link takes their bodies from, and the directories to take away once the link is done
+// -- an archive made with the cache off lives for one build.
+struct RootsLinked
+    precompiled: Buf[string]
+    archives: Buf[string]
+    staging: Buf[string]
+end RootsLinked
+
+no_roots_linked() -> RootsLinked = RootsLinked(buf(), buf(), buf())
+
+// A directory a test keeps its entries in, in place of the machine's cache. Empty is none.
+private var root_home: string = ""
+
+// How many roots were answered from the cache, how many were compiled into an artifact, and how many
+// were compiled from source instead -- what a test observes rather than a clock.
+private var root_hits: int = 0
+private var root_built: int = 0
+private var root_from_source: int = 0
+
+// Keep the artifacts under `dir` rather than the machine's cache directory, or go back to the
+// machine's with `None`.
+use_root_cache_dir(dir: Option[string])
+    root_home = dir.unwrap_or("")
+
+// `(hits, built, from source)` since the last `clear_root_artifact_counts`.
+root_artifact_counts() -> (int, int, int) = (root_hits, root_built, root_from_source)
+
+clear_root_artifact_counts()
+    root_hits = 0
+    root_built = 0
+    root_from_source = 0
+end clear_root_artifact_counts
+
+// Where artifacts are kept, or nothing where the cache is off, the machine has no cache directory, or
+// this compiler cannot say which build it is -- a key without that part would be every build's.
+private root_cache_dir() -> Option[string]
+    if env_var(CacheOff).unwrap_or("") != "" then return None
+    if !compiler_build_known() then return None
+    if root_home != "" then return Some(s"$root_home/sysl/roots")
+
+    cache_directory() match
+        Some(dir) -> Some(s"$dir/sysl/roots")
+        None -> None
+end root_cache_dir
+
+// Each `--lib` root's artifact for a compilation about to be lowered and linked, found or made.
+//
+// **Nothing here fails a build.** A root that cannot be precompiled -- not closed, disturbed, an
+// artifact that would not assemble -- is compiled from source, which is what every build did before
+// the cache existed; `-v` says which and why.
+//
+// It is asked **before** the program is analyzed: the root's own analysis is a second compilation,
+// and running it ahead of the program's keeps the two from interleaving.
+roots_linked(program: Compilation, project: string, level: string,
+             cc: Option[string]) -> RootsLinked
+    var out = no_roots_linked()
+    val t = program.target
+    val libs = lib_roots()
+
+    // `--no-std-lib` links no precompiled code at all, and a machine without a toolchain links
+    // nothing.
+    if libs.is_empty() || std_from_source() || !t.builds_with_clang() then return out
+
+    for i in 0..<libs.len()
+        root_linked(program, project, libs.at(i), level, cc, &out)
+
+    out
+end roots_linked
+
+// One root, added to `out` where it can be precompiled.
+private root_linked(program: Compilation, project: string, given: string, level: string,
+                    cc: Option[string], out: *RootsLinked)
+    val t = program.target
+    val root = absolute_path(given)
+    val mine = root_unit_indices(program, root)
+
+    if mine.is_empty() then return from_source(given, "it holds no files of this compilation")
+
+    var modules: Buf[string] = buf()
+    var files: Buf[string] = buf()
+
+    for i in 0..<mine.len()
+        val unit = program.units.at(mine.at(i))
+        val name = module_written(unit)
+
+        files.push(unit.src.name)
+
+        if !holds_string(modules, name) then modules.push(name)
+
+    // **Undisturbed**: nothing else declares into the root's modules.
+    for i in 0..<program.units.len()
+        if !holds_index(mine, i)
+            val name = module_written(program.units.at(i))
+
+            if holds_string(modules, name)
+                return from_source(given, s"another file declares into its module '$name'")
+
+    val key = root_key(program, project, root, mine, level, cc) match
+        Err(why) -> return from_source(given, why)
+        Ok(k) -> k
+
+    val dir = root_cache_dir()
+
+    // **A hit**: the artifact at the key, read back and held to it.
+    dir match
+        Some(d) ->
+            val path = s"$d/$key$SyslibExtension"
+
+            root_artifact_matching(path, key, t) match
+                Ok(symbols) ->
+                    root_hits += 1
+                    in_use(path)
+                    take(out, symbols, path)
+                    return
+                Err(_) -> ()
+        None -> ()
+
+    // **A miss**: the root analyzed with only what it can see -- every unit of this compilation but
+    // the project's -- and every body of its own typed.
+    var alone: Buf[Program] = buf()
+
+    for i in 0..<program.units.len()
+        if !holds_string(program.own, module_written(program.units.at(i)))
+            alone.push(program.units.at(i))
+
+    val built = library_build(alone, modules, t, Some(files), true)
+
+    // **Closed**: the root analyzes without the project.
+    if !built.report.is_empty()
+        return from_source(given, s"it does not analyze without the program: " +
+            s"${built.report.at(0).render().trim_end()}")
+
+    val place = dir match
+        Some(d) -> s"$d/$key$SyslibExtension"
+        None -> make_temp_dir("sysl-root-") match
+            Err(_) -> return from_source(given, "no directory to build its artifact in")
+            Ok(made) ->
+                out.staging.push(made)
+                s"$made/root$SyslibExtension"
+
+    write_root_artifact(built, place, key, t, cc, level) match
+        Err(why) -> return from_source(given, why)
+        Ok(symbols) ->
+            root_built += 1
+
+            dir match
+                Some(d) ->
+                    in_use(place)
+                    evict_roots(d)
+                None -> ()
+
+            if verbose() then eprints(s"sysl: --lib $given: compiled into $place\n")
+
+            take(out, symbols, place)
+end root_linked
+
+private take(out: *RootsLinked, symbols: Buf[string], archive: string)
+    for i in 0..<symbols.len()
+        out.precompiled.push(symbols.at(i))
+
+    out.archives.push(archive)
+end take
+
+private from_source(given: string, why: string)
+    root_from_source += 1
+
+    if verbose() then eprints(s"sysl: --lib $given: compiled from source, since $why\n")
+end from_source
+
+// Which units of the compilation the root at `root` contributed: handed over, unprefixed, and read
+// from below it.
+private root_unit_indices(program: Compilation, root: string) -> Buf[usize]
+    val prefix = if root.ends_with("/") then root else root + "/"
+    var out: Buf[usize] = buf()
+
+    for i in 0..<program.units.len()
+        val unit = program.units.at(i)
+
+        if unit.pkg.supplied && unit.pkg.prefix == "" && unit.src.name.starts_with(prefix)
+            out.push(i)
+
+    out
+end root_unit_indices
+
+private holds_index(xs: Buf[usize], i: usize) -> bool
+    for k in 0..<xs.len()
+        if xs.at(k) == i then return true
+
+    false
+end holds_index
+
+// What an artifact on disk says, held to the key it should have been built under.
+private root_artifact_matching(path: string, key: string, t: Target) -> Result[Buf[string], string]
+    if !metadata(path).is_ok() then return Err(s"$path does not exist")
+
+    val meta = syslib_metadata_at(path)?
+    val answer = syslib_read(path, meta, t)?
+
+    if answer.1 != key then return Err(s"$path was built under another key")
+
+    Ok(answer.0)
+end root_artifact_matching
+
+// --- the key ------------------------------------------------------------------------------
+//
+// **Everything that can reach the root's object code**, which is more than the root: a struct layout,
+// a `const`, an inlined body or a `c const` answer from any tree the root can see is compiled into it.
+// So the key is over the root's files and its `package.hocon`, every other file of the compilation
+// but the project's (the standard module, the packages at their selected versions, the other roots),
+// the C and the headers of every tree the build takes, the project's manifest (its table is the one a
+// root's import lines are read through), and every part of the build that is not a file -- the
+// compiler, the machine and what it provides, the allocator pair, the level, `--cc`, the environment
+// variables a build reads and the flags naming headers. **Where the root stands is in it too**, the
+// absolute path being what `__FILE__` and every record carry out of its files.
+private root_key(program: Compilation, project: string, root: string, mine: Buf[usize], level: string,
+                 cc: Option[string]) -> Result[string, string]
+    val t = program.target
+    var parts: Buf[string] = buf()
+
+    parts.push(Format)
+    parts.push(compiler_identity())
+    parts.push(t.name)
+    parts.push(allocator_pair())
+    parts.push(level)
+    parts.push(cc.unwrap_or(""))
+    parts.push(provided_part(t))
+    parts.push(root)
+    parts.push(build_environment())
+
+    val given = supplied_cflags()
+
+    for i in 0..<given.len()
+        parts.push(given.at(i))
+
+    val library = std_root()?
+
+    parts.push(s"std:${std_fingerprint(library, t)?}")
+
+    // The sysl this compilation read, the project's own excepted -- each file by its name and its text.
+    var files: Buf[(string, string)] = buf()
+
+    for i in 0..<program.units.len()
+        val unit = program.units.at(i)
+
+        if !holds_string(program.own, module_written(unit))
+            files.push((unit.src.name, from_utf8_unchecked(unit.src.bytes)))
+
+    parts.push(s"sysl:${library_fingerprint(files)}")
+
+    // The C and the headers of the root and of every tree beside it, and each tree's manifest.
+    val dir = if is_directory(project) then project else parent_of(project).unwrap_or(".")
+    var carried: Buf[(string, string)] = buf()
+
+    read_into(&carried, join_path(root, "package.hocon"))
+    read_into(&carried, join_path(dir, "package.hocon"))
+    tree_c_into(&carried, root, t)?
+
+    manifest_at(dir) match
+        Ok(m) ->
+            val trees = handed_trees(dir, m)
+
+            for i in 0..<trees.len()
+                tree_c_into(&carried, absolute_path(trees.at(i).dir), t)?
+                read_into(&carried, join_path(trees.at(i).dir, "package.hocon"))
+        Err(_) -> ()
+
+    parts.push(s"c:${library_fingerprint(carried)}")
+
+    Ok(run_cache_key(parts))
+end root_key
+
+private tree_c_into(out: *Buf[(string, string)], tree: string, t: Target) -> Result[unit, string]
+    val cs = c_sources(tree, Some(t.os)) match
+        Err(e) -> return Err(e.message)
+        Ok(found) -> found
+
+    val hs = c_headers(tree, Some(t.os)) match
+        Err(e) -> return Err(e.message)
+        Ok(found) -> found
+
+    for i in 0..<cs.len()
+        read_into(out, cs.at(i))
+
+    for i in 0..<hs.len()
+        read_into(out, hs.at(i))
+
+    Ok(())
+end tree_c_into
+
+// A file's text under its path, or the absence of one: a manifest that is not there is a fact about
+// the tree as much as one that is.
+private read_into(out: *Buf[(string, string)], file: string)
+    read_text(file) match
+        Ok(text) -> out.push((absolute_path(file), text))
+        Err(_) -> out.push((absolute_path(file), "\0absent"))
+end read_into
+
+// --- eviction -----------------------------------------------------------------------------
+//
+// **The run cache's policy, with its two numbers** (`CacheKeep`, `CacheStale`): nothing is removed
+// until the directory holds `CacheKeep` artifacts, and then only what is older than `CacheStale`,
+// measured against the newest entry, and never what this process used or made.
+
+private var roots_in_use: Buf[string] = buf()
+
+private in_use(path: string) = roots_in_use.push(path)
+
+evict_roots(dir: string)
+    val names = entries(dir) match
+        Ok(n) -> n
+        Err(_) -> return
+
+    var kept: usize = 0
+    var now: long = 0
+
+    for i in 0..<names.len()
+        val one = s"$dir/${names.at(i)}"
+
+        if names.at(i).ends_with(SyslibExtension) then kept += 1
+
+        val at = cache_modified_at(one)
+
+        if at > now then now = at
+
+    if kept < CacheKeep then return
+
+    for i in 0..<names.len()
+        val one = s"$dir/${names.at(i)}"
+
+        if is_file(one) && !holds_string(roots_in_use, one) && now - cache_modified_at(one) > CacheStale
+            remove_file(one).unwrap_or(())
+end evict_roots
