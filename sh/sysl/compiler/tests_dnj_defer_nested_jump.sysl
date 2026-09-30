@@ -1,0 +1,355 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A deferred statement may not contain a jump that leaves it (`reference/statements.md § defer`).
+//
+// A deferred statement runs while its block is being left, so a jump out of it has no edge to take:
+// a `return` anywhere in it, and a `break` or `continue` of a loop that stands around it. Written
+// as the deferred statement itself (`defer break`) each is refused; written one level down
+// (`defer if c then break`) each used to be scheduled, and laying down the jump runs the block's
+// deferred statements, of which it is one, so the build never came back.
+//
+// **The refusals here are decided rather than quoted.** The reference compiler (0.0.152) does not
+// refuse these programs: it overflows its stack lowering them. Each is told what the direct form of
+// the same jump is told -- that wording is the reference's, read off `defer break`, `defer continue`
+// and `defer return 1` -- anchored at the jump, once per deferred statement. The programs that run
+// were handed to the reference and what they print is what it printed.
+
+// What a program does: what it printed and the status it exited with, as a shell reports one. A
+// failure to build is its message and `-1`, which no program exits with.
+private dnj_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-dnj").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end dnj_outcome
+
+// The program runs to the end, prints exactly this and leaves with status 0 -- both, so that a
+// build that failed cannot pass for a program that stopped. Returns at once without the library.
+private dnj_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = dnj_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end dnj_prints
+
+// The build is refused with this message and no other, anchored at this `line:column` of
+// `main.sysl`.
+private dnj_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val out = dnj_outcome(text)
+    val said = out.0
+
+    assert_eq(out.1, -1)
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+    val first = said.index_of("error: ").unwrap_or(0)
+
+    assert(!said[first + 7..<said.len].contains("error: "), said)
+end dnj_refused
+
+// What `defer break` and `defer continue` are told.
+private dnj_loop_edge() -> string =
+    "a deferred statement runs while its block is being left, so it cannot 'break' or 'continue' " +
+        "— the loop edge it would take is the one already being taken"
+
+// What `defer return 1` is told.
+private dnj_no_exit() -> string =
+    "a deferred statement runs while its block is being left, so it cannot 'return' — there is " +
+        "no exit left to take. Compute what the function returns before the block ends"
+
+// -- a jump that leaves the deferred statement ----------------------------------------------------
+
+// 0.0.152 crashes on this input: `java.lang.StackOverflowError`, in `sh.sysl.Emitter.freshReg`.
+@test("a 'break' of the loop around a deferred 'if' is refused where it stands")
+dnj_a_nested_break_is_refused()
+    dnj_refused(raw"""
+        for i in 0..<3
+            defer if i == 1 then break
+            print(i)
+        """, dnj_loop_edge(), "2:26")
+
+// 0.0.152 crashes on this input: `java.lang.StackOverflowError`.
+@test("a 'return' under a deferred 'if' is refused where it stands")
+dnj_a_nested_return_is_refused()
+    dnj_refused(raw"""
+        f(c: bool) -> int
+            defer if c then return 1
+            2
+
+        print(f(true))
+        """, dnj_no_exit(), "2:21")
+
+// 0.0.152 crashes on this input: `java.lang.StackOverflowError`.
+@test("a 'continue' of the loop around a deferred 'if' is refused")
+dnj_a_nested_continue_is_refused()
+    dnj_refused(raw"""
+        for i in 0..<3
+            defer if i == 1 then continue
+            print(i)
+        """, dnj_loop_edge(), "2:26")
+
+// 0.0.152 does not refuse this input: it lays the deferred loop down twice and clang refuses the
+// text for `multiple definition of local value named 'j.addr'`.
+@test("a labelled 'break' of an outer loop from a loop inside the deferred statement is refused")
+dnj_a_labelled_break_of_an_outer_loop_is_refused()
+    dnj_refused(raw"""
+        'outer for i in 0..<3
+            defer for j in 0..<3
+                if j == 1 then break 'outer
+
+            print(i)
+        """, dnj_loop_edge(), "3:24")
+
+// 0.0.152 crashes on this input: `java.lang.StackOverflowError`.
+@test("a labelled 'continue' of an outer loop is refused the same way")
+dnj_a_labelled_continue_of_an_outer_loop_is_refused()
+    dnj_refused(raw"""
+        'outer for i in 0..<3
+            defer for j in 0..<3
+                if j == 1 then continue 'outer
+
+            print(i)
+        """, dnj_loop_edge(), "3:24")
+
+// 0.0.152 crashes on this input: `java.lang.StackOverflowError`.
+@test("a 'return' several statements deep in a deferred block is refused at the 'return'")
+dnj_a_return_deep_in_a_deferred_block_is_refused()
+    dnj_refused(raw"""
+        f(c: bool) -> int
+            defer if c
+                print("a")
+                print("b")
+
+                for j in 0..<2
+                    print(j)
+                    if j == 1 then return 7
+
+                print("c")
+
+            2
+
+        print(f(true))
+        """, dnj_no_exit(), "8:32")
+
+// 0.0.152 crashes on this input: `java.lang.StackOverflowError`.
+@test("two jumps in one deferred statement are one refusal, of the first in source order")
+dnj_two_jumps_are_one_refusal()
+    dnj_refused(raw"""
+        f(n: int) -> int
+            for i in 0..<n
+                defer if i == 1 then break else if i == 2 then return 5
+                print(i)
+
+            2
+
+        print(f(3))
+        """, dnj_loop_edge(), "3:30")
+
+// 0.0.152 crashes on this input: `java.lang.StackOverflowError`.
+@test("a 'return' in an arm of a deferred 'match' is refused")
+dnj_a_return_in_a_match_arm_is_refused()
+    dnj_refused(raw"""
+        f(n: int) -> int
+            defer n match
+                0 -> print("zero")
+                _ -> return 9
+
+            2
+
+        print(f(1))
+        """, dnj_no_exit(), "4:14")
+
+// 0.0.152 crashes on this input: `java.lang.StackOverflowError`.
+@test("a 'return' in a 'defer' written inside a deferred statement is one refusal")
+dnj_a_return_in_a_defer_inside_a_defer_is_one_refusal()
+    dnj_refused(raw"""
+        f(c: bool) -> int
+            defer if c
+                defer if c then return 1
+                print("inner")
+
+            2
+
+        print(f(true))
+        """, dnj_no_exit(), "3:25")
+
+// 0.0.152 reads the value and refuses the loop for its result type (`a loop's break values and its
+// 'else' must have the same type, but got string and int`, at 1:9). The jump is what is wrong, so
+// its value is not read and the loop hears nothing of it.
+@test("a 'break' that leaves the deferred statement is refused before its value is read")
+dnj_a_refused_break_does_not_reach_the_loops_result()
+    dnj_refused(raw"""
+        val r = for i in 0..<3
+            defer if i == 1 then break "early"
+            print(i)
+        else 0
+
+        print(r)
+        """, dnj_loop_edge(), "2:26")
+
+// 0.0.152 crashes on this input: `java.lang.StackOverflowError`.
+@test("a 'return' under a deferred 'if' does not have its value read either")
+dnj_a_refused_return_does_not_have_its_value_read()
+    dnj_refused(raw"""
+        f(c: bool) -> int
+            defer if c then return nope
+            2
+
+        print(f(true))
+        """, dnj_no_exit(), "2:21")
+
+// The reference's own answer, which is a refusal of another kind and stays the only one: the jump
+// names no loop at all, so there is no edge it could have left by.
+@test("a 'break' under a deferred 'if' with no loop around it is told there is no loop")
+dnj_a_nested_break_with_no_loop_is_told_so()
+    dnj_refused(raw"""
+        work(c: bool)
+            defer if c then break
+            print("body")
+
+        work(true)
+        """, "'break' is only allowed inside a loop", "2:21")
+
+// -- a jump that stays inside it ------------------------------------------------------------------
+
+@test("a 'break' of a loop written inside the deferred statement leaves that loop")
+dnj_a_break_of_an_inner_loop_runs()
+    dnj_prints(raw"""
+        work()
+            defer for i in 0..<5
+                if i == 2 then break
+                print(i)
+
+            print("body")
+
+        work()
+        """, "body\n0\n1\n")
+
+@test("a 'continue' of a loop written inside the deferred statement restarts that loop")
+dnj_a_continue_of_an_inner_loop_runs()
+    dnj_prints(raw"""
+        work()
+            defer for i in 0..<4
+                if i == 1 then continue
+                print(i)
+
+            print("body")
+
+        work()
+        """, "body\n0\n2\n3\n")
+
+@test("a labelled jump to a loop written inside the deferred statement stays inside it")
+dnj_a_labelled_jump_to_an_inner_loop_runs()
+    dnj_prints(raw"""
+        work()
+            defer 'rows for i in 0..<3
+                for j in 0..<3
+                    if j == 2 then continue 'rows
+                    if i == 2 then break 'rows
+                    print(i, j)
+
+            print("body")
+
+        work()
+        """, "body\n0 0\n0 1\n1 0\n1 1\n")
+
+@test("a 'break' carrying a value out of a loop inside a deferred block gives the loop its value")
+dnj_a_break_with_a_value_inside_runs()
+    dnj_prints(raw"""
+        work(c: bool)
+            defer if c
+                val hit = for j in 0..<9
+                    if j * j > 10 then break j
+                else -1
+
+                print(hit)
+
+            print("body")
+
+        work(true)
+        """, "body\n4\n")
+
+@test("a 'while' and a 'loop' written as deferred statements are left by their own 'break'")
+dnj_a_deferred_while_and_loop_run()
+    dnj_prints(raw"""
+        work()
+            defer while true do break
+            defer loop
+                print("once")
+                break
+
+            print("body")
+
+        work()
+        """, "body\nonce\n")
+
+@test("a loop inside a deferred 'for const' is left by its own 'break'")
+dnj_a_loop_in_a_deferred_for_const_runs()
+    dnj_prints(raw"""
+        work()
+            defer for const k in 0..<2
+                for j in 0..<3
+                    if j == 1 then break
+                    print(k, j)
+
+            print("body")
+
+        work()
+        """, "body\n0 0\n1 0\n")
+
+@test("a 'return' in a closure written inside the deferred statement leaves the closure")
+dnj_a_return_in_a_closure_runs()
+    dnj_prints(raw"""
+        twice(f: int -> int, x: int) -> int = f(f(x))
+
+        work()
+            defer print(twice((x) ->
+                if x > 3 then return 100
+                x + 3, 1))
+
+            print("body")
+
+        work()
+        """, "body\n100\n")
+
+@test("a 'return' in a nested function written inside the deferred statement leaves that function")
+dnj_a_return_in_a_nested_function_runs()
+    dnj_prints(raw"""
+        work(c: bool)
+            defer if c
+                pick(n: int) -> int
+                    if n > 1 then return 10
+                    n
+
+                print(pick(1), pick(2))
+
+            print("body")
+
+        work(true)
+        """, "body\n1 10\n")

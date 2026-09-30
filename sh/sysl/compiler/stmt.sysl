@@ -724,6 +724,13 @@ end not_a_boundary
 // -- the jumps ------------------------------------------------------------------------------------
 
 private return_stmt(cx: &Analyzer, span: Span, value: Option[Expr]) -> Buf[TStmt]
+    // A `return` at any depth of a deferred statement leaves it. Nothing of it is read past that,
+    // exactly as nothing is where it is the deferred statement itself.
+    if cx.defer_outer.is_some()
+        cx.note_deferred_jump(span, deferred_return())
+        return one(TReturn(None))
+    end if
+
     val want = cx.ret_ty.unwrap_or(Unit)
 
     if value.is_none()
@@ -825,6 +832,15 @@ private break_stmt(cx: &Analyzer, span: Span, label: Option[string],
     if found.is_none()
         if value.is_some() then type_expr_bare(cx, value.unwrap())
 
+        if cx.defer_outer.is_some() then cx.note_deferred_jump(span, "")
+
+        return one(TBreak(None, 0))
+    end if
+
+    // The loop stands around the deferred statement this is written in, so its value is not read
+    // and the loop's result hears nothing of it.
+    if cx.leaves_deferred(found.unwrap().1)
+        cx.note_deferred_jump(span, deferred_jump())
         return one(TBreak(None, 0))
     end if
 
@@ -837,6 +853,13 @@ end break_stmt
 
 private continue_stmt(cx: &Analyzer, span: Span, label: Option[string]) -> Buf[TStmt]
     val found = resolve_loop(cx, span, "continue", label)
+
+    // One that names no loop at all has been refused for that, and is kept out of the block's
+    // deferred statements all the same.
+    if found.is_none() then
+        if cx.defer_outer.is_some() then cx.note_deferred_jump(span, "")
+    else if cx.leaves_deferred(found.unwrap().1) then
+        cx.note_deferred_jump(span, deferred_jump())
 
     one(TContinue(if found.is_none() then 0 else found.unwrap().1))
 end continue_stmt
@@ -889,10 +912,7 @@ end not_in_an_unrolled_loop
 // not there.
 private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
     val refusal: Option[string] = *inner.kind match
-        Return(_) ->
-            Some("a deferred statement runs while its block is being left, so it cannot " +
-                 "'return' — there is no exit left to take. Compute what the function returns " +
-                 "before the block ends")
+        Return(_) -> Some(deferred_return())
         Break(_, _) -> Some(deferred_jump())
         Continue(_) -> Some(deferred_jump())
         Defer(_) ->
@@ -914,7 +934,26 @@ private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
 
     body.push(inner)
 
+    // The statement is read knowing which loops stand around it, which is what lets a jump at any
+    // depth of it be told from one that stays inside.
+    val around = (cx.defer_outer, cx.defer_jump)
+
+    cx.defer_outer = Some(cx.loops.len())
+    cx.defer_jump = None
+
     val t = type_stmts(cx, body)
+    val jump = cx.defer_jump
+
+    cx.defer_outer = around.0
+    cx.defer_jump = around.1
+
+    // A jump that leaves the statement is the direct form's mistake written one level down, and is
+    // told the same thing where it stands -- once, for the first of them.
+    if jump.is_some()
+        if jump.unwrap().1 != "" then cx.fault(jump.unwrap().0, jump.unwrap().1)
+
+        return buf()
+    end if
 
     // A `?` leaves the function, which is the same exit a `return` would take and is refused for
     // the same reason. It is read out of the analyzed body rather than the written statement,
@@ -927,6 +966,10 @@ private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
 
     one(TDefer(t))
 end defer_stmt
+
+private deferred_return() -> string =
+    "a deferred statement runs while its block is being left, so it cannot 'return' — there is " +
+        "no exit left to take. Compute what the function returns before the block ends"
 
 private deferred_jump() -> string =
     "a deferred statement runs while its block is being left, so it cannot 'break' or 'continue' " +

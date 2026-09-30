@@ -208,6 +208,34 @@ struct Analyzer
     // is the position a refusal of that name carries -- the reference's `currentPos`.
     bind_site: Option[Span]
 
+    // How many of the open loops stand **around** the deferred statement being read, or nothing
+    // outside one. A deferred statement runs while its block is being left, so a jump that leaves
+    // it has no edge to take: a `return` anywhere in it, and a `break` or `continue` of one of
+    // these loops. A loop written inside the statement is not among them, and a closure or a nested
+    // function is read by an analyzer of its own, which is outside every deferred statement.
+    defer_outer: Option[usize]
+
+    // The first jump, in source order, that leaves the deferred statement being read: where it
+    // stands and what it is told. The message is empty where the jump was already refused for a
+    // reason of its own, which still keeps the statement from being scheduled.
+    defer_jump: Option[(Span, string)]
+
+    // Whether a jump to the loop this many places out from the innermost leaves the deferred
+    // statement being read.
+    leaves_deferred(self, depth: int) -> bool
+        if self.defer_outer.is_none() then return false
+
+        usize(depth) + self.defer_outer.unwrap() >= self.loops.len()
+    end leaves_deferred
+
+    // Records a jump that leaves the deferred statement being read. A statement may be read more
+    // than once, so what is kept is the earliest in the source rather than the first one met.
+    note_deferred_jump(*self, span: Span, why: string)
+        if self.defer_jump.is_some() && self.defer_jump.unwrap().0.start <= span.start then return
+
+        self.defer_jump = Some((span, why))
+    end note_deferred_jump
+
     // What a name bound as a capture reads, or nothing where the name is an ordinary local.
     capture_read(self, unique: string) -> Option[TExpr]
         for i in 0..<self.captured.len()
@@ -388,7 +416,7 @@ bad_expr(span: Span) -> TExpr = TExpr(span, TZero(Unknown))
 analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
     Analyzer(an, scope, buf(), buf(), buf(), buf(), "", None, None, buf(), buf(), false, false,
              None, 0, None, None, buf(), false, false, false, None, buf(), buf(), buf(),
-             empty_names(), false, buf(), buf(), buf(), "", buf(), None)
+             empty_names(), false, buf(), buf(), buf(), "", buf(), None, None, None)
 
 // A run of names with nothing in it, named so that a constructor can say which kind it means.
 private empty_names() -> Buf[string] = buf()
