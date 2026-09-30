@@ -224,3 +224,89 @@ lbl_build_lib_on_a_source_root()
     remove_dir_all(good).unwrap_or(())
     remove_dir_all(bad).unwrap_or(())
 end lbl_build_lib_on_a_source_root
+
+// -- what crosses from a library root into the program that links it ----------------------------------
+//
+// The reference hands each of these over as a named artifact built from a root; here the root itself
+// is the `--lib`, and what the program links is the compiler's own cache of it. The claim is the
+// same: the library is compiled on its own, and the program that runs is linked against that.
+
+// What a program built against one library root prints.
+private lbl_ran(files: Buf[(string, string)], program: string) -> string
+    val lib = lbr_tree(files)
+    val prog = lbr_program(program)
+    val said = lbr_run(prog, [lib])
+
+    lbr_drop([lib, prog])
+    said
+end lbl_ran
+
+private lbl_widen(helper: string) -> string =
+    "module demo\n\ntrait Widen\n    base(self) -> int\n\n    scaled(self) -> int = tripled(self.base())\n\n" +
+    s"impl Widen for int\n    base(self) -> int = self\n\n${helper}tripled(n: int) -> int = n * 3\n"
+
+private lbl_messages() -> string =
+    "module demo\n\nval names: [3]string = [\"alpha\", \"beta\", \"gamma\"]\n\n" +
+    "struct Device\n    name: string\n    code: int\nend Device\n\n" +
+    "val devices: [2]Device = [Device(\"uart\", 16), Device(\"timer\", 32)]\n"
+
+@test("a literate library builds, links, and answers what its indented half says")
+lbl_a_literate_library_answers_its_indented_half()
+    if !lbl_ready() then return
+
+    val doc = "A library, explained\n====================\n\n" +
+        "This paragraph is not compiled, and neither is the fenced block below it.\n\n" +
+        "```\ndouble(n: int) -> int = n * 3\n```\n\nThat would be wrong. This is right:\n\n" +
+        "    module demo\n\n    double(n: int) -> int = n * 2\n"
+
+    assert_eq(lbl_ran(lbr_one("demo/lib.lsysl", doc), "import demo.*\n\nprint(double(21))\n"), "42\n")
+end lbl_a_literate_library_answers_its_indented_half
+
+@test("a private helper reached only from a trait default survives, so a program instantiating the default links")
+lbl_a_private_helper_behind_a_default_links()
+    if !lbl_ready() then return
+
+    assert_eq(lbl_ran(lbr_one("demo/lib.sysl", lbl_widen("private ")),
+        "import demo.*\n\nvar x = 7\nprint(x.scaled())\n"), "21\n")
+
+@test("and so does the same library with the helper public")
+lbl_a_public_helper_behind_a_default_links()
+    if !lbl_ready() then return
+
+    assert_eq(lbl_ran(lbr_one("demo/lib.sysl", lbl_widen("")),
+        "import demo.*\n\nvar x = 7\nprint(x.scaled())\n"), "21\n")
+
+@test("and a library that calls its own default on a builtin type links too")
+lbl_a_library_calling_its_own_default_links()
+    if !lbl_ready() then return
+
+    val lib = "module demo\n\ntrait Widen\n    base(self) -> int\n\n    scaled(self) -> int = self.base() * 3\n\n" +
+        "impl Widen for int\n    base(self) -> int = self\n\nthrice(n: int) -> int = n.scaled()\n"
+
+    assert_eq(lbl_ran(lbr_one("demo/lib.sysl", lib), "import demo.*\n\nprint(thrice(7))\n"), "21\n")
+end lbl_a_library_calling_its_own_default_links
+
+@test("a bare-arrow parameter across a module boundary takes a function by name, exactly as it takes a closure literal")
+lbl_a_bare_arrow_takes_a_function_by_name()
+    if !lbl_ready() then return
+
+    val lib = "module demo\n\nstruct Point\n    x: int\n\napply(p: Point, f: Point -> Point) -> Point = f(p)\n"
+    val prog = "import demo.*\n\ndouble(p: Point) -> Point = Point(p.x * 2)\n\n" +
+        "print(apply(Point(3), double).x, apply(Point(4), p -> double(p)).x)\n"
+
+    assert_eq(lbl_ran(lbr_one("demo/lib.sysl", lib), prog), "6 8\n")
+end lbl_a_bare_arrow_takes_a_function_by_name
+
+@test("a library's 'val' holding a table of string literals is indexed at a value only known while running")
+lbl_a_library_string_table_crosses()
+    if !lbl_ready() then return
+
+    assert_eq(lbl_ran(lbr_one("demo/lib.sysl", lbl_messages()),
+        "import demo.*\n\nvar i = 2\n\nprint(names[i], names[0].len)\n"), "gamma 5\n")
+
+@test("and so does a library's table of structs holding them")
+lbl_a_library_struct_table_crosses()
+    if !lbl_ready() then return
+
+    assert_eq(lbl_ran(lbr_one("demo/lib.sysl", lbl_messages()),
+        "import demo.*\n\nvar i = 1\n\nprint(devices[i].name, devices[i].code)\n"), "timer 32\n")
