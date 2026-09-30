@@ -1,0 +1,754 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{split, join, Search}
+import sysl.slices.sort
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// `Buf[T]` -- a growable array (`reference/arrays.md § Growing one`) -- is ordinary sysl in the
+// library rather than a type the compiler knows, so every claim here is about what a whole program
+// built against that library DOES: what it prints and the status it exits with. Each test asserts
+// both, so a program that failed to build cannot pass for one that stopped itself.
+//
+// What a push does to the other views follows from how the buffer is held: a `&Buf` is one buffer
+// under two names, and a `Buf` copied out of its box is a copy of two fields over shared storage.
+
+private var bft_library_cache: Buf[Program] = buf()
+private var bft_library_read: bool = false
+
+private bft_library() -> Buf[Program]
+    if bft_library_read then return bft_library_cache
+
+    bft_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> bft_library_cache = units
+
+    bft_library_cache
+end bft_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private bft_ready() -> bool
+    if bft_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end bft_ready
+
+// What a program does, as `<exit status>: <everything it printed>`. A growable sequence is
+// something a program asks for, so the import is written once here and each program below is about
+// the sequence. A program that could not be built answers `unbuilt: <why>`, and one a signal
+// stopped answers `signalled: …`, so neither can be mistaken for a status the program chose.
+private bft_does(text: string) -> string
+    val root = make_temp_dir("sysl-buf").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", "import sysl.buf.*\n\n" + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"unbuilt: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "unbuilt: the program that was built could not be run"
+        Ok(out) ->
+            val all = out.text + out.err.unwrap_or("")
+
+            out.status match
+                Status.Exited(code) -> s"$code: $all"
+                _ -> s"signalled: $all"
+end bft_does
+
+// An outcome with the lines it printed put in order, behind the status it began with, for the
+// programs whose order of release is the reaper's rather than the buffer's.
+private bft_sorted(outcome: string) -> string
+    val cut = outcome.index_of(": ").unwrap_or(0) + 2
+    var text = outcome[cut..<outcome.len]
+
+    if text.ends_with("\n") then text = text[0..<text.len - 1]
+
+    var lines = split(text, "\n")
+
+    sort(lines)
+    outcome[0..<cut] + join(lines, "\n")
+end bft_sorted
+
+// A type whose destructor announces itself, so that the lines a program prints count the releases
+// the buffer made: a missing line is a leak and a repeated one is a double release.
+private bft_handle() -> string =
+    "struct Handle\n    id: int\n\nimpl Drop for Handle\n    drop(self) = print(\"drop\", self.id)\n\n"
+
+private bft_three() -> string = "var b: Buf[int] = buf()\nfor i in 1..3 do b.push(i)\n"
+
+// ---- the basic shape ----
+
+@test("a Buf: push, len, and read back")
+bft_push_len_and_read_back()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        for i in 0..<5 do b.push(i * i)
+        print(b.len(), b.at(0), b.at(4))
+        """), "0: 5 0 16\n")
+
+@test("a Buf: set writes an element that is there")
+bft_set_writes_an_element_that_is_there()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        b.push(1)
+        b.push(2)
+        b.set(0, 99)
+        print(b.at(0), b.at(1))
+        """), "0: 99 2\n")
+
+@test("a Buf: pop takes the last one back off")
+bft_pop_takes_the_last_one_back_off()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        for i in 0..<3 do b.push(i)
+        print(b.pop().unwrap(), b.pop().unwrap(), b.len(), b.pop().unwrap(), b.pop().is_none())
+        """), "0: 2 1 1 0 true\n")
+
+@test("a Buf: clear empties it without giving the storage back")
+bft_clear_empties_it_keeping_the_storage()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        for i in 0..<10 do b.push(i)
+        var had = b.cap()
+        b.clear()
+        print(b.len(), b.is_empty(), b.cap() == had)
+        """), "0: 0 true true\n")
+
+@test("a Buf: a view is the elements that are actually there")
+bft_a_view_is_the_elements_that_are_there()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        for i in 0..<5 do b.push(i)
+        var s = b.view()
+        var total = 0
+        for x in s do total += x
+        print(s.len, total, s[4])
+        """), "0: 5 10 4\n")
+
+// The view is the WRITABLE form: a read site pays nothing for it, `[]T` widening to `[]const T` on
+// its own, while a read-only view would foreclose mutating a buffer in place.
+@test("a Buf: the view may be written, and still satisfies a reader asking for a read-only one")
+bft_the_view_may_be_written()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        total(xs: []const int) -> int
+            var s = 0
+            for x in xs do s += x
+            s
+        var b: &Buf[int] = buf()
+        b.push(3)
+        b.push(4)
+        var v = b.view()
+        v[0] = 10
+        print(total(b.view()), b.at(0))
+        """), "0: 14 10\n")
+
+// ---- shortening one ----
+
+@test("a Buf: truncating to nothing is what clear does")
+bft_truncating_to_nothing_is_what_clear_does()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        for i in 0..<4 do b.push(i)
+        var had = b.cap()
+        b.truncate(0)
+        print(b.len(), b.is_empty(), b.cap() == had)
+        """), "0: 0 true true\n")
+
+@test("a Buf: remove hands back the element it took out")
+bft_remove_hands_back_the_element()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        for i in 0..<5 do b.push(i * 10)
+        print(b.remove(1), b.len(), b.at(0), b.at(1), b.at(2), b.at(3))
+        """), "0: 10 4 0 20 30 40\n")
+
+// The first and last elements are where an off-by-one in the shift shows: removing at 0 moves every
+// survivor, and removing the last moves none.
+@test("a Buf: remove at either end")
+bft_remove_at_either_end()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        for i in 0..<4 do b.push(i)
+        print(b.remove(0), b.at(0), b.at(2), b.len())
+        print(b.remove(2), b.at(0), b.at(1), b.len())
+        """), "0: 0 1 3 3\n3 1 2 2\n")
+
+@test("a Buf: remove of the only element")
+bft_remove_the_only_element()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        b.push(7)
+        print(b.remove(0), b.len(), b.is_empty())
+        """), "0: 7 0 true\n")
+
+// Every element removed one at a time, always at the front, so each removal shifts the whole
+// remainder -- the order it comes out in is the whole assertion.
+@test("a Buf: removed one at a time until there is nothing left")
+bft_removed_one_at_a_time()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        import sysl.text.str_builder
+
+        var b: &Buf[int] = buf()
+        for i in 0..<6 do b.push(i)
+        var out = str_builder()
+        while !b.is_empty() do out.push(str(b.remove(0)))
+        print(out.finish(), b.len())
+        """), "0: 012345 0\n")
+
+// An element that holds something is handed to the caller AND shifted past by its neighbours, so a
+// count taken once and a count taken twice look identical until a buffer of references is churned.
+@test("a Buf: removing an element that holds something balances its count")
+bft_removing_a_counted_element_balances()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        struct Cell
+            v: int
+        end Cell
+
+        var total = 0
+
+        for round in 0..<100000
+            var b: &Buf[&Cell] = buf()
+            b.push(Cell(1))
+            b.push(Cell(2))
+            b.push(Cell(3))
+
+            var gone = b.remove(0)
+            total += gone.v + b.at(0).v + b.at(1).v
+
+        print(total)
+        """), "0: 600000\n")
+
+@test("a Buf: a truncated counted element is let go of too")
+bft_a_truncated_one_is_let_go_of()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var total = 0
+
+        for round in 0..<100000
+            var b: &Buf[string] = buf()
+            for i in 0..<4 do b.push(s"item $i")
+            b.truncate(1)
+            total += int(b.at(0).len)
+
+        print(total)
+        """), "0: 600000\n")
+
+// A copy of a `Buf` copies the two fields and not the allocation behind them, so what a copy keeps
+// is the COUNT it was taken at -- the shift a removal makes lands in storage they share.
+@test("a Buf: a copy taken before a removal keeps the length, not the elements")
+bft_a_copy_keeps_the_length_not_the_elements()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var p: &Buf[int] = buf()
+        for i in 0..<3 do p.push(i)
+        var c = *p
+        print(p.remove(0), p.len(), p.at(0), c.len(), c.at(0), c.at(2))
+        """), "0: 0 2 1 3 1 2\n")
+
+@test("a Buf: removing an index that names no element says which and how many there were")
+bft_removing_past_the_end_panics()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        b.push(1)
+        b.push(2)
+        print(b.remove(2))
+        """), "1: panic: index 2 past the 2 elements of a Buf\n")
+
+@test("a Buf: and so does removing from an empty one")
+bft_removing_from_an_empty_one_panics()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        print(b.remove(0))
+        """), "1: panic: index 0 past the 0 elements of a Buf\n")
+
+// ---- growth ----
+
+@test("a Buf: capacity doubles from nothing, and every element survives it")
+bft_capacity_doubles_from_nothing()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        for i in 0..<100 do b.push(i)
+        var total = 0
+        for x in b.view() do total += x
+        print(b.len(), b.cap(), total, b.at(0), b.at(99))
+        """), "0: 100 128 4950 0 99\n")
+
+// The count is the thing that grows; capacity is only ever a power of two above it, so a push that
+// fits costs no allocation at all.
+@test("a Buf: a push that fits does not reallocate")
+bft_a_push_that_fits_does_not_reallocate()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        b.push(1)
+        var had = b.cap()
+        for i in 0..<7 do b.push(i)
+        print(had, b.cap(), b.len())
+        """), "0: 8 8 8\n")
+
+@test("a Buf: growth carries elements that hold something")
+bft_growth_carries_counted_elements()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[string] = buf()
+        for i in 0..<40 do b.push(s"k$i")
+        print(b.len(), b.at(0), b.at(39))
+        """), "0: 40 k0 k39\n")
+
+// ---- how a push is seen follows from how the buffer is held ----
+
+@test("a Buf: two names for one buffer see each other's pushes")
+bft_two_names_for_one_buffer()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var p: &Buf[int] = buf()
+        var q = p
+        p.push(7)
+        q.push(8)
+        print(p.len(), q.len(), p.at(1), q.at(0))
+        """), "0: 2 2 8 7\n")
+
+// A struct copied out of its box is a copy, which is what copying a struct means everywhere in the
+// language.
+@test("a Buf: a copy taken out of the reference is a copy")
+bft_a_copy_out_of_the_reference_is_a_copy()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var p: &Buf[int] = buf()
+        p.push(1)
+        var c = *p
+        c.push(2)
+        print(p.len(), c.len())
+        """), "0: 1 2\n")
+
+@test("a Buf: one passed by reference is grown by the callee")
+bft_passed_by_reference_is_grown_by_the_callee()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        fill(b: &Buf[int], n: int)
+            for i in 0..<n do b.push(i)
+        var p: &Buf[int] = buf()
+        fill(p, 30)
+        print(p.len(), p.at(29))
+        """), "0: 30 29\n")
+
+// ---- a view taken before a grow stays valid ----
+
+// An append can move the storage, and a view taken before it keeps the storage it was made from
+// alive rather than dangling.
+@test("a Buf: a view taken before a grow shows the elements it was made from")
+bft_an_early_view_shows_its_elements()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        b.push(1)
+        b.push(2)
+        var early = b.view()
+        for i in 0..<50 do b.push(i)
+        print(early.len, early[0], early[1], b.len())
+        """), "0: 2 1 2 52\n")
+
+@test("a Buf: and a view of references keeps them alive too")
+bft_an_early_view_of_references_keeps_them_alive()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        struct Node
+            value: int
+        var b: &Buf[&Node] = buf()
+        b.push(Node(5))
+        var early = b.view()
+        for i in 0..<50 do b.push(Node(i))
+        print(early.len, early[0].value)
+        """), "0: 1 5\n")
+
+// ---- elements that hold something are held and let go ----
+
+@test("a Buf: a buffer of references reads back what went in")
+bft_a_buffer_of_references_reads_back()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        struct Node
+            value: int
+        var b: &Buf[&Node] = buf()
+        for i in 0..<30 do b.push(Node(i * 3))
+        print(b.len(), b.at(0).value, b.at(29).value)
+        """), "0: 30 0 87\n")
+
+@test("a Buf: many grown buffers come apart rather than accumulating")
+bft_many_grown_buffers_come_apart()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        struct Node
+            value: int
+        var i = 0
+        while i < 20000
+            var t: &Buf[&Node] = buf()
+            for k in 0..<10 do t.push(Node(k))
+            i++
+        print("done")
+        """), "0: done\n")
+
+@test("a Buf: a buffer of buffers")
+bft_a_buffer_of_buffers()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var rows: &Buf[&Buf[int]] = buf()
+        for y in 0..<5
+            var row: &Buf[int] = buf()
+            for x in 0..<4 do row.push(y * 10 + x)
+            rows.push(row)
+        print(rows.len(), rows.at(0).len(), rows.at(4).at(3))
+        """), "0: 5 4 43\n")
+
+// ---- a counted element is released exactly once ----
+//
+// The lines are sorted rather than pinned in order, because the order is the reaper's -- a worklist
+// drained when the first count reaches zero. What the buffer promises is that each element is let
+// go of exactly once, and a sorted comparison says exactly that.
+
+// Growth is where a double release would come from: the storage is seeded by repeating the value
+// being pushed, the old storage is copied across, and then the buffer lets the old storage go.
+@test("a Buf: a counted element is released once across the growth the first push causes")
+bft_released_once_across_the_first_growth()
+    if !bft_ready() then return
+
+    assert_eq(bft_sorted(bft_does(bft_handle() + raw"""
+        hold()
+            var b: &Buf[&Handle] = buf()
+            for i in 0..<3 do b.push(Handle(i))
+            print("filled", b.len())
+
+        hold()
+        print("out")
+        """)), "0: drop 0\ndrop 1\ndrop 2\nfilled 3\nout")
+
+// A slot past the count still holds whatever seeded it, so pushing over one releases that occupant.
+@test("a Buf: a counted element is released once when a push writes over a slot the count left behind")
+bft_released_once_when_a_push_overwrites_a_slot()
+    if !bft_ready() then return
+
+    assert_eq(bft_sorted(bft_does(bft_handle() + raw"""
+        hold()
+            var b: &Buf[&Handle] = buf()
+            b.push(Handle(1))
+            b.truncate(0)
+            b.push(Handle(2))
+            print("swapped", b.len())
+
+        hold()
+        print("out")
+        """)), "0: drop 1\ndrop 2\nout\nswapped 1")
+
+// Many growths rather than one, so that an element released once too often somewhere in the middle
+// of the doublings is caught as well as one at the join.
+@test("a Buf: a counted element is released once through every doubling on the way up")
+bft_released_once_through_every_doubling()
+    if !bft_ready() then return
+
+    val did = bft_does(bft_handle() + raw"""
+        hold()
+            var b: &Buf[&Handle] = buf()
+            for i in 0..<40 do b.push(Handle(i))
+            print("filled", b.len())
+
+        hold()
+        print("out")
+        """)
+
+    var drops = 0
+
+    for line in split(did, "\n")
+        if line.starts_with("drop ") then drops += 1
+
+    assert(did.starts_with("0: "), did)
+    assert_eq(drops, 40)
+end bft_released_once_through_every_doubling
+
+// ---- extending by a whole slice ----
+
+@test("a Buf: extend appends every element after the ones already there")
+bft_extend_appends_after_what_is_there()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        b.push(1)
+        b.push(2)
+        b.extend([3, 4, 5])
+        print(b.len(), b.at(0), b.at(2), b.at(4))
+        """), "0: 5 1 3 5\n")
+
+// The run is longer than one doubling would give, so an implementation that grew once by a factor
+// of two and then copied would write past the end.
+@test("a Buf: extend grows enough for a run far longer than the current capacity")
+bft_extend_grows_enough_for_a_long_run()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        b.push(7)
+        var xs: [40]int
+        for i in 0..<40 do xs[i] = i
+        b.extend(xs[..])
+        print(b.len(), b.at(0), b.at(1), b.at(40))
+        """), "0: 41 7 0 39\n")
+
+@test("a Buf: extending an empty buffer works the same as filling one")
+bft_extending_an_empty_buffer()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        b.extend([9, 8])
+        print(b.len(), b.at(0), b.at(1))
+        """), "0: 2 9 8\n")
+
+@test("a Buf: many extends in a row keep every element in order")
+bft_many_extends_keep_every_element_in_order()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        for i in 0..<20 do b.extend([i, i])
+        print(b.len(), b.at(0), b.at(1), b.at(38), b.at(39))
+        """), "0: 40 0 0 19 19\n")
+
+// ---- starting with room ----
+
+@test("a Buf: a buffer with capacity is still empty")
+bft_a_buffer_with_capacity_is_still_empty()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf_with_capacity(32usize, 0)
+        print(b.len(), b.is_empty(), b.cap())
+        """), "0: 0 true 32\n")
+
+// Pushing up to the capacity does not reallocate, so the capacity is the one it was given rather
+// than a power of two arrived at by doubling from eight.
+@test("a Buf: filling up to the capacity does not grow it")
+bft_filling_up_to_the_capacity_does_not_grow_it()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf_with_capacity(32usize, 0)
+        for i in 0..<32 do b.push(i)
+        print(b.len(), b.cap(), b.at(31))
+        """), "0: 32 32 31\n")
+
+@test("a Buf: going past the capacity grows the way any other buffer does")
+bft_going_past_the_capacity_grows()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf_with_capacity(4usize, 0)
+        for i in 0..<5 do b.push(i)
+        print(b.len(), b.cap(), b.at(4))
+        """), "0: 5 8 4\n")
+
+// The fill is a parameter because a generic `T` has no zero, and none of those slots is ever read:
+// the count is what says which elements are real, so `at` refuses them all.
+@test("a Buf: the fill is never visible, since the count starts at zero")
+bft_the_fill_is_never_visible()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf_with_capacity(8usize, 99)
+        print(b.at(0))
+        """), "1: panic: index 0 past the 0 elements of a Buf\n")
+
+// ---- comparing and rendering one ----
+//
+// The buffers below are VALUES, where every other block in this file holds a `&Buf`. A reference
+// compares by address, so `==` between two `&Buf` asks whether they are the same buffer and not
+// whether they hold the same elements.
+
+@test("a Buf: two buffers with the same elements are equal")
+bft_two_buffers_with_the_same_elements_are_equal()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(bft_three() + "var c: Buf[int] = buf()\nfor i in 1..3 do c.push(i)\nprint(b == c)"),
+              "0: true\n")
+
+@test("a Buf: a differing element or a differing length makes them unequal")
+bft_a_differing_element_or_length_makes_them_unequal()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: Buf[int] = buf()
+        var c: Buf[int] = buf()
+        var d: Buf[int] = buf()
+        for i in 1..3 do b.push(i)
+        c.push(1)
+        c.push(9)
+        c.push(3)
+        d.push(1)
+        d.push(2)
+        print(b == c, b == d, b != d)
+        """), "0: false false true\n")
+
+// The capacity is eight after two pushes and sixteen after nine, so a comparison reading the backing
+// slice rather than the view would be comparing slots nobody wrote.
+@test("a Buf: the spare capacity is not part of the value")
+bft_the_spare_capacity_is_not_part_of_the_value()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: Buf[int] = buf()
+        var c: Buf[int] = buf()
+        b.push(1)
+        b.push(2)
+        for i in 0..<9 do c.push(i)
+        c.truncate(2)
+        c.set(0, 1)
+        c.set(1, 2)
+        print(b.cap() == c.cap(), b == c)
+        """), "0: false true\n")
+
+@test("a Buf: two empty buffers are equal")
+bft_two_empty_buffers_are_equal()
+    if !bft_ready() then return
+
+    assert_eq(bft_does("var b: Buf[int] = buf()\nvar c: Buf[int] = buf()\nprint(b == c)"), "0: true\n")
+
+@test("a Buf: it renders as the sequence it holds")
+bft_it_renders_as_the_sequence_it_holds()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(bft_three() + "print(b)"), "0: [1, 2, 3]\n")
+
+@test("a Buf: an empty one renders as an empty sequence")
+bft_an_empty_one_renders_as_an_empty_sequence()
+    if !bft_ready() then return
+
+    assert_eq(bft_does("var b: Buf[int] = buf()\nprint(b)"), "0: []\n")
+
+// A specifier describes the field the whole value occupies, which is the padding the slice block
+// already measures -- the delegation is what gets it, rather than a second copy.
+@test("a Buf: a width pads the whole rendering, on either side")
+bft_a_width_pads_the_whole_rendering()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(bft_three() + raw"""
+        print(f"${b}%13s|")
+        print(f"${b}%-13s|")
+        """), "0:     [1, 2, 3]|\n[1, 2, 3]    |\n")
+
+// Neither of these is about `Buf`: a reference compares by address and implements nothing its
+// referent implements, whatever the referent is.
+@test("a Buf: a reference to one compares by address, and the deref is the way past")
+bft_a_reference_compares_by_address()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        var c: &Buf[int] = buf()
+        var d = b
+        for i in 1..3
+            b.push(i)
+            c.push(i)
+        print(b == c, b == d, *b == *c)
+        """), "0: false true true\n")
+
+// ---- what stops the program ----
+
+// Reading past the end is a panic rather than a trap, because a `Buf` is written in sysl and what
+// sysl has to stop with is the library's own `exit` -- so it can say what went wrong.
+@test("a Buf: reading past the last element says which index and how many there were")
+bft_reading_past_the_last_element_panics()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        b.push(1)
+        print(b.at(3))
+        """), "1: panic: index 3 past the 1 elements of a Buf\n")
+
+// The spare capacity is real storage holding real values, so an index inside it would read a copy
+// of whatever seeded the growth rather than failing -- which is why `at` checks against the count.
+@test("a Buf: reading an index inside the spare capacity panics too")
+bft_reading_inside_the_spare_capacity_panics()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        b.push(1)
+        print(b.at(5))
+        """), "1: panic: index 5 past the 1 elements of a Buf\n")
+
+@test("a Buf: and writing past the last element likewise")
+bft_writing_past_the_last_element_panics()
+    if !bft_ready() then return
+
+    assert_eq(bft_does(raw"""
+        var b: &Buf[int] = buf()
+        b.push(1)
+        b.set(2, 9)
+        """), "1: panic: index 2 past the 1 elements of a Buf\n")
