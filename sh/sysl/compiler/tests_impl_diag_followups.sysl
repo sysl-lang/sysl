@@ -1,0 +1,344 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// Two things an `impl` block is told about itself, each **once and at the block**: that its subject
+// fixes an argument of a generic type (`reference/generics.md`), and that it defines a member the
+// trait never declared (`reference/traits.md`).
+//
+// **Every message and every `line:col` quoted here was read out of the reference compiler**
+// (0.0.152), on the program the test holds. Each program is a single file with no `module` header,
+// so the names a message quotes are the ones it wrote: the reference's bare spelling of a
+// declaration and this compiler's qualified one (`'m.W'`) are the same text here, and a test that
+// moved one of these into a module would have to keep this compiler's.
+
+private var idf_library_cache: Buf[Program] = buf()
+private var idf_library_read: bool = false
+
+private idf_library() -> Buf[Program]
+    if idf_library_read then return idf_library_cache
+
+    idf_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> idf_library_cache = units
+
+    idf_library_cache
+end idf_library
+
+private idf_ready() -> bool
+    if idf_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+end idf_ready
+
+// What the compiler says about a program, as the command line prints it.
+private idf_err(text: string) -> string
+    val root = make_temp_dir("sysl-impl-diag-followups").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end idf_err
+
+// How many times a report says something.
+private idf_count(text: string, part: string) -> int
+    var rest = text
+    var n = 0
+
+    loop
+        rest.index_of(part) match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + part.bytes.len..<rest.bytes.len]
+
+    n
+end idf_count
+
+// How many complaints a report holds: each names its place once.
+private idf_complaints(said: string) -> int = idf_count(said, "main.sysl:")
+
+// One complaint of a report: the whole message, and the `line:col` it is anchored at.
+private idf_told(said: string, message: string, at: string)
+    val head = s"error: $message\n --> "
+
+    said.index_of(head) match
+        None -> assert(false, said)
+        Some(i) ->
+            val rest = said[i + head.bytes.len..<said.bytes.len]
+            val place = rest.index_of("\n") match
+                Some(n) -> rest[0..<n]
+                None -> rest
+
+            assert(place.ends_with(s"main.sysl:$at"), said)
+end idf_told
+
+// The one complaint a program earns.
+private idf_only(said: string, message: string, at: string)
+    idf_told(said, message, at)
+    assert_eq(idf_complaints(said), 1, said)
+
+private idf_fixes(written: string, owner: string) -> string =
+    s"'$written' fixes an argument of '$owner' to one type, and an 'impl' covers the whole of a " +
+    "generic type — write one of the block's own parameters here"
+
+private idf_undeclared(kind: string, name: string) -> string =
+    s"trait 'Tr' declares no $kind '$name', so this 'impl' cannot define it"
+
+// A generic struct, a trait, and one block written for the struct at `subject`.
+private idf_block(params: string, subject: string) -> string =
+    "struct W[T]\n    x: T\ntrait Tag\n    tag(self) -> int\n" +
+    s"impl[$params] Tag for $subject\n    tag(self) -> int = 1\nprint(1)\n"
+
+// -- a subject that fixes an argument of a generic type ---------------------------------------------
+
+@test("an array over the block's own parameters fixes the argument it is written at, told at the block")
+idf_an_array_over_the_blocks_parameters()
+    if !idf_ready() then return
+
+    // `N` is a TYPE parameter here, and a length is a value -- which is a second thing wrong with
+    // the block and not the one it is told: the argument may not be an array at all.
+    idf_only(idf_err(idf_block("N, T", "W[[N]T]")), idf_fixes("[…]T", "W"), "5:1")
+
+@test("and with the length declared as a value")
+idf_an_array_over_a_value_parameter()
+    if !idf_ready() then return
+
+    idf_only(idf_err(idf_block("const N: usize, T", "W[[N]T]")), idf_fixes("[…]T", "W"), "5:1")
+
+@test("and with the length written out, where nothing is said about the parameter it left unused")
+idf_an_array_of_a_written_length()
+    if !idf_ready() then return
+
+    idf_only(idf_err(idf_block("T", "W[[2]T]")), idf_fixes("[2]T", "W"), "5:1")
+
+@test("a slice, a tuple, a pointer and every other composed argument are told the same way")
+idf_every_composed_argument()
+    if !idf_ready() then return
+
+    idf_only(idf_err(idf_block("T", "W[[]T]")), idf_fixes("[]T", "W"), "5:1")
+    idf_only(idf_err(idf_block("T, U", "W[(T, U)]")), idf_fixes("(T, U)", "W"), "5:1")
+    idf_only(idf_err(idf_block("T", "W[*T]")), idf_fixes("*T", "W"), "5:1")
+    idf_only(idf_err(idf_block("T", "W[&T]")), idf_fixes("&T", "W"), "5:1")
+    idf_only(idf_err(idf_block("T", "W[weak T]")), idf_fixes("weak T", "W"), "5:1")
+    idf_only(idf_err(idf_block("N, T", "W[<N>T]")), idf_fixes("<N>T", "W"), "5:1")
+    idf_only(idf_err(idf_block("T", "W[T -> T]")), idf_fixes("T -> T", "W"), "5:1")
+    idf_only(idf_err(idf_block("T", "W[W[T]]")), idf_fixes("W[T]", "W"), "5:1")
+
+@test("the first argument a block fixes is the one it is told about")
+idf_the_first_fixed_argument()
+    if !idf_ready() then return
+
+    idf_only(idf_err(raw"""
+        struct P[A, B]
+            a: A
+            b: B
+        trait Tag
+            tag(self) -> int
+        impl[T] Tag for P[[]T, *T]
+            tag(self) -> int = 1
+        print(1)
+        """), idf_fixes("[]T", "P"), "6:1")
+
+@test("a block refused for its subject gives the type nothing, so a call finds no member")
+idf_a_refused_subject_files_nothing()
+    if !idf_ready() then return
+
+    val said = idf_err(raw"""
+        struct W[T]
+            x: T
+        trait Tag
+            tag(self) -> int
+        impl[T] Tag for W[[2]T]
+            tag(self) -> int = 1
+        val w = W([1, 2])
+        print(w.tag())
+        """)
+
+    idf_told(said, idf_fixes("[2]T", "W"), "5:1")
+    idf_told(said, "type 'W' has no method 'tag'", "8:9")
+    assert_eq(idf_complaints(said), 2, said)
+
+@test("a block for one instantiation of a generic type is told to declare a parameter, and nothing else")
+idf_a_block_for_one_instantiation()
+    if !idf_ready() then return
+
+    // The reference's `IndexTraitTests` case, whose point is that there is no overlap to resolve:
+    // the second block is refused outright. `int` fixing the argument is the same mistake seen from
+    // the other side, and is not told as a second one.
+    idf_only(idf_err(raw"""
+        trait Named
+            name(self) -> string
+        struct Box[T]
+            v: T
+        impl[T] Named for Box[T]
+            name(self) -> string = "any"
+        impl Named for Box[int]
+            name(self) -> string = "int"
+        """), "'Box' is generic, so an 'impl' for it covers every instantiation at once — write " +
+              "'impl[T] Named for Box[T]'", "7:1")
+
+@test("implementing a trait for a generic enum needs the block's own parameters")
+idf_a_generic_enum_needs_the_blocks_parameters()
+    if !idf_ready() then return
+
+    idf_only(idf_err(raw"""
+        trait Show
+            show(self) -> int
+        enum Maybe[T]
+            Just(value: T)
+        impl Show for Maybe
+            show(self) -> int = 1
+        """), "'Maybe' is generic, so an 'impl' for it covers every instantiation at once — write " +
+              "'impl[T] Show for Maybe[T]'", "5:1")
+
+@test("a parameter the subject never names, and an argument too many, are each the one thing told")
+idf_an_unused_parameter_and_an_argument_too_many()
+    if !idf_ready() then return
+
+    idf_only(idf_err(idf_block("T, U", "W[T]")),
+             "'U' is declared by this 'impl' but does not appear in 'W[T]', so nothing would ever " +
+             "fix it", "5:1")
+    idf_only(idf_err(idf_block("T", "W[T, T]")),
+             "'W' takes 1 type argument, but 2 type arguments were given", "5:1")
+
+// -- a member the trait does not declare ------------------------------------------------------------
+
+// A struct, a trait that declares `g`, and one block whose members are `members`.
+private idf_members(members: string) -> string =
+    s"struct X\n    n: int\ntrait Tr\n    g(self) -> int\nimpl Tr for X\n${members}print(1)\n"
+
+@test("a method the trait does not declare is told at the block that defines it")
+idf_a_method_the_trait_does_not_declare()
+    if !idf_ready() then return
+
+    idf_only(idf_err(idf_members("    g(self) -> int = 1\n    f(self) -> int = 2\n")),
+             idf_undeclared("method", "f"), "5:1")
+
+@test("and a property, and an associated function, each by its own kind")
+idf_a_property_and_an_associated_function()
+    if !idf_ready() then return
+
+    idf_only(idf_err(idf_members("    g(self) -> int = 1\n    f -> int = 2\n")),
+             idf_undeclared("property", "f"), "5:1")
+    idf_only(idf_err(idf_members("    g(self) -> int = 1\n    f() -> int = 2\n")),
+             idf_undeclared("associated function", "f"), "5:1")
+    idf_only(idf_err(idf_members("    g(self) -> int = 1\n    static top -> int = 4\n")),
+             idf_undeclared("property", "top"), "5:1")
+
+@test("two members the trait does not declare are one complaint, naming the first written")
+idf_two_undeclared_members()
+    if !idf_ready() then return
+
+    idf_only(idf_err(idf_members("    g(self) -> int = 1\n    f(self) -> int = 2\n" +
+                                 "    h(self) -> int = 3\n")),
+             idf_undeclared("method", "f"), "5:1")
+    idf_only(idf_err(idf_members("    f -> int = 2\n    h(self) -> int = 3\n" +
+                                 "    g(self) -> int = 1\n")),
+             idf_undeclared("property", "f"), "5:1")
+
+@test("a block that leaves out what the trait asked for is told that, and not what it added")
+idf_a_missing_member_is_told_first()
+    if !idf_ready() then return
+
+    idf_only(idf_err(idf_members("    f(self) -> int = 2\n")),
+             "'X' does not implement 'Tr': method 'g' is missing", "5:1")
+
+@test("and so is a block whose member disagrees with the trait's signature")
+idf_a_mismatched_member_is_told_first()
+    if !idf_ready() then return
+
+    // The message is the reference's and the only one. **Its anchor is not asserted**: the
+    // reference places a signature's disagreement at the block (5:1) and this compiler at the
+    // member that disagrees (6:5), which is a difference of its own and not this test's subject.
+    val said = idf_err(idf_members("    g(self) -> bool = true\n    f(self) -> int = 2\n"))
+
+    assert(said.index_of("error: method 'g' returns bool, but trait 'Tr' declares int\n").is_some(),
+           said)
+    assert_eq(idf_complaints(said), 1, said)
+
+@test("the body of a member the trait does not declare is never read")
+idf_an_undeclared_members_body_is_not_read()
+    if !idf_ready() then return
+
+    idf_only(idf_err(idf_members("    g(self) -> int = 1\n    f(self) -> int = self.g() + nope\n")),
+             idf_undeclared("method", "f"), "5:1")
+    idf_only(idf_err(idf_members("    g(self) -> int = 1\n    f(self) -> Nope = 2\n")),
+             idf_undeclared("method", "f"), "5:1")
+
+@test("each block is told at itself, a generic one and one for a built-in alike")
+idf_each_block_is_told_at_itself()
+    if !idf_ready() then return
+
+    val said = idf_err(raw"""
+        struct B[T]
+            v: T
+        trait Tr
+            g(self) -> int
+        impl[T] Tr for B[T]
+            g(self) -> int = 1
+            f(self) -> T = self.v
+        impl Tr for int
+            g(self) -> int = 1
+            f(self) -> int = 2
+        print(1)
+        """)
+
+    idf_told(said, idf_undeclared("method", "f"), "5:1")
+    assert_eq(idf_count(said, s"error: ${idf_undeclared("method", "f")}\n --> "), 2, said)
+    assert_eq(idf_count(said, "main.sysl:8:1\n"), 1, said)
+    assert_eq(idf_complaints(said), 2, said)
+
+@test("a member the trait does not declare is reported the same way on a slice")
+idf_an_undeclared_member_on_a_slice()
+    if !idf_ready() then return
+
+    idf_only(idf_err(raw"""
+        trait Show
+            show(self) -> string
+        impl Show for []int
+            show(self) -> string = "s"
+            extra(self) -> int = 1
+        """), "trait 'Show' declares no method 'extra', so this 'impl' cannot define it", "3:1")
+
+@test("the type does not gain the member, and keeps the ones the trait did declare")
+idf_the_type_does_not_gain_the_member()
+    if !idf_ready() then return
+
+    // The reference says a third thing here -- `type 'X' has no method 'g'` at 10:9 -- because it
+    // drops the whole block while still counting `X` as a `Tr`. That is a consequence of the first
+    // complaint rather than a mistake in the program, `g` being declared and supplied, so it is
+    // deliberately not said.
+    val said = idf_err(raw"""
+        struct X
+            n: int
+        trait Tr
+            g(self) -> int
+        impl Tr for X
+            g(self) -> int = 1
+            f(self) -> int = 2
+        val x = X(1)
+        print(x.f())
+        print(x.g())
+        """)
+
+    idf_told(said, idf_undeclared("method", "f"), "5:1")
+    idf_told(said, "type 'X' has no method 'f'", "9:9")
+    assert_eq(idf_complaints(said), 2, said)
