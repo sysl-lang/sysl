@@ -1,0 +1,656 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `&sync T` -- the reference whose count is atomic, and so the one that may be held in two
+// concurrency domains at once (`reference/memory.md § Crossing a concurrency domain`).
+//
+// The type has always parsed and always lowered to the atomic pair. What is checked here is the
+// condition the chapter attaches to it: an atomic count on the object promises nothing about the
+// counts the object *reaches*, so a `&sync T` is sound only when every one of them is atomic too.
+// That question is asked wherever a `&sync T` is written, and -- for the one shape whose contents
+// are not known there -- wherever a value is erased into a `&sync Trait`.
+//
+// **Every diagnostic and every output here was read out of the reference compiler (0.0.152)**, whose
+// `SharedObjectTests` these are, by handing the installed `sysl` the same program. A program is built
+// and run for real in a directory of its own, removed afterwards; a refusal is asserted by its message
+// and its `file:line:column`.
+
+private sho_inner() -> string = "struct Inner\n    v: int\n"
+
+private sho_show() -> string = "trait Show\n    show(&self) -> string\n"
+
+// What a one-file program prints and how it ends, as `<output>exit <code>` -- or, where the build is
+// refused, what it was refused for. Run under a twenty-second limit, so a hang is a failure rather
+// than a stalled suite.
+private sho_ran(text: string) -> string
+    val root = make_temp_dir("sysl-sho").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true, 20000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Exited(code) -> s"${out.text}exit $code"
+            Signalled(n) -> s"${out.text}signal $n"
+            TimedOut -> s"${out.text}timed out"
+end sho_ran
+
+// A refusal carries this message, anchored at this `line:column` of `main.sysl`.
+private sho_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> "), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+// The part of the sentence every `&sync T` refusal shares.
+private sho_reached(shown: string) -> string =
+    s"'&sync $shown' may be reached from two domains at once, so every count inside it has to be atomic — "
+
+private sho_hold(inner: string) -> string = s"whose count is not. Hold it as a '&sync $inner' ('06')"
+
+private sho_view(what: string) -> string =
+    s"which owns its $what through a count that is not atomic. A literal's $what are immortal and " +
+    s"would be safe to share, but nothing in the type says whether these are, so a shared object " +
+    "holds no view at all ('06')"
+
+// `'&sync H'`'s refusal when its `kid` is a `&Inner`, which most of the placement cases share.
+private sho_h_kid() -> string = sho_reached("H") + "but its 'kid' reaches a '&Inner', " + sho_hold("Inner")
+
+// -- an object reached from two domains may hold -------------------------------------------------
+
+@test("scalars, a char, and a bool")
+sho_scalars_a_char_and_a_bool()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(raw"""
+        struct Reading
+            n: i64
+            scale: real
+            unit: char
+            ok: bool
+        var r: &sync Reading = Reading(7, 0.5, 'm', true)
+        print(r.n, r.scale, r.unit, r.ok)
+        """), "7 0.5 m true\nexit 0")
+
+@test("a 'unit', which the crossable list names beside the three above")
+sho_a_unit()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(raw"""
+        struct Marked
+            n: int
+            tag: unit
+        var m: &sync Marked = Marked(7, ())
+        print(m.n)
+        """), "7\nexit 0")
+
+@test("a fixed array of them")
+sho_a_fixed_array_of_them()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(raw"""
+        struct Table
+            cells: [4]int
+        var t: &sync Table = Table([1, 2, 3, 4])
+        print(t.cells[0] + t.cells[3])
+        """), "5\nexit 0")
+
+@test("another object held atomically, including itself")
+sho_another_object_held_atomically()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(raw"""
+        struct Node
+            v: int
+            peer: Option[&sync Node]
+        var a: &sync Node = Node(1, None)
+        var b: &sync Node = Node(2, Some(a))
+        print(b.peer.unwrap().v)
+        """), "1\nexit 0")
+
+// The unsafe tier the chapter names as the *other* greppable way to share: a `*T` carries no count,
+// so there is none to make atomic and nothing here to say about it.
+@test("a raw pointer, which carries no count at all")
+sho_a_raw_pointer()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(raw"""
+        struct Reg
+            slot: *int
+            width: usize
+        var n = 41
+        var r: &sync Reg = Reg(&n, 4)
+        print(r.slot[0] + 1)
+        """), "42\nexit 0")
+
+@test("a data enum whose every payload is crossable")
+sho_a_data_enum_whose_payloads_are_crossable()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(raw"""
+        enum Signal
+            Idle
+            Tick(n: int)
+        struct Port
+            last: Signal
+        var p: &sync Port = Port(Signal.Tick(3))
+        var out = 0
+        p.last match
+            Tick(n) -> out = n
+            Idle -> out = 0
+        print(out)
+        """), "3\nexit 0")
+
+@test("a tuple of them")
+sho_a_tuple_of_them()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(raw"""
+        struct Span
+            ends: (int, int)
+        var s: &sync Span = Span((2, 5))
+        print(s.ends.1 - s.ends.0)
+        """), "3\nexit 0")
+
+@test("a constrained scalar, which is its base")
+sho_a_constrained_scalar()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(raw"""
+        type Small = int within 0..9
+        struct Dial
+            at: Small
+        var d: &sync Dial = Dial(4)
+        print(d.at)
+        """), "4\nexit 0")
+
+@test("a scalar directly, with no struct around it")
+sho_a_scalar_directly()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(raw"""
+        keep(n: &sync int) -> &sync int = n
+        var n: &sync int = 41
+        print(keep(n) == n)
+        """), "true\nexit 0")
+
+// -- an object reached from two domains may not hold ---------------------------------------------
+
+@test("an ordinary reference, and the message says which spelling to reach for")
+sho_an_ordinary_reference()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_inner() + "struct Holder\n    kid: &Inner\nvar h: &sync Holder = Holder(Inner(1))"),
+                sho_reached("Holder") + "but its 'kid' reaches a '&Inner', " + sho_hold("Inner"), "5:8")
+
+@test("a weak reference, which has no atomic form yet")
+sho_a_weak_reference()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(raw"""
+                    struct Node
+                        v: int
+                        peer: weak Node
+                    var n: &sync Node = Node(1, None)
+                    """),
+                sho_reached("Node") + "but its 'peer' reaches a 'weak Node', and a weak count has no atomic form yet",
+                "4:8")
+
+// The chapter says an immortal string would be safe to share and a heap-backed one would not.
+// Nothing in a `string`'s type says which it is, so the rule as written cannot be applied and the
+// strict half is what ships.
+@test("a string, whichever kind of bytes it turns out to hold")
+sho_a_string_whichever_bytes()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran("struct Reg\n    tag: string\nvar r: &sync Reg = Reg(\"dev0\")"),
+                sho_reached("Reg") + "but its 'tag' reaches a 'string', " + sho_view("bytes"), "3:8")
+
+@test("a slice, for the same reason")
+sho_a_slice()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran("struct Win\n    cells: []int\nvar xs = [1, 2, 3]\nvar w: &sync Win = Win(xs[..])"),
+                sho_reached("Win") + "but its 'cells' reaches a '[]int', " + sho_view("elements"), "4:8")
+
+@test("one inside a fixed array")
+sho_one_inside_a_fixed_array()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_inner() + "struct Bad\n    kids: [2]&Inner\nvar b: &sync Bad = Bad([Inner(1), Inner(2)])"),
+                sho_reached("Bad") + "but its 'kids' reaches a '&Inner', " + sho_hold("Inner"), "5:8")
+
+@test("one inside a tuple")
+sho_one_inside_a_tuple()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_inner() + "struct Bad\n    pair: (int, &Inner)\nvar b: &sync Bad = Bad((1, Inner(2)))"),
+                sho_reached("Bad") + "but its 'pair.1' reaches a '&Inner', " + sho_hold("Inner"), "5:8")
+
+@test("one inside an enum payload, wherever the variant sits")
+sho_one_inside_an_enum_payload()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_inner() + raw"""
+                    enum Slot
+                        Empty
+                        Full(p: &Inner)
+                    struct Bag
+                        slot: Slot
+                    var b: &sync Bag = Bag(Slot.Empty)
+                    """),
+                sho_reached("Bag") + "but its 'slot.Full(p)' reaches a '&Inner', " + sho_hold("Inner"), "8:8")
+
+// The path is what makes a deep one findable: naming only the type in the way would leave the reader
+// to search a struct they may not have written.
+@test("one several fields down, and the whole path is named")
+sho_one_several_fields_down()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_inner() + raw"""
+                    struct Mid
+                        kid: &Inner
+                    struct Top
+                        mid: Mid
+                    struct Root
+                        top: Top
+                    var r: &sync Root = Root(Top(Mid(Inner(1))))
+                    """),
+                sho_reached("Root") + "but its 'top.mid.kid' reaches a '&Inner', " + sho_hold("Inner"), "9:8")
+
+@test("a string, when the string is the whole of what is shared")
+sho_a_string_that_is_the_whole()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran("var s: &sync string = \"hi\""),
+                sho_reached("string") + "but it is a 'string', " + sho_view("bytes"), "1:8")
+
+// -- the question is asked wherever a '&sync' is written -----------------------------------------
+
+private sho_h() -> string = sho_inner() + "struct H\n    kid: &Inner\n"
+
+@test("a declared local")
+sho_a_declared_local()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_h() + "var h: &sync H = H(Inner(1))"), sho_h_kid(), "5:8")
+
+@test("a parameter")
+sho_a_parameter()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_h() + "f(h: &sync H) -> int = h.kid.v"), sho_h_kid(), "5:6")
+
+@test("a result")
+sho_a_result()
+    if xvr_no_library() then return
+
+    val said = sho_ran(sho_h() + "f(h: &H) -> &sync H = h")
+
+    sho_refused(said, sho_h_kid(), "5:13")
+    sho_refused(said, "'&H' and '&sync H' are distinct types, and neither converts to the other: a " +
+                      "count is atomic or it is not from the moment the object is allocated, and a " +
+                      "conversion would put an ordinary retain beside an atomic one. Allocate H as a " +
+                      "'&sync H' where it is constructed", "5:23")
+end sho_a_result
+
+@test("a field of another type")
+sho_a_field_of_another_type()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_h() + "struct Reg\n    slot: &sync H"), sho_h_kid(), "6:11")
+
+@test("an element type")
+sho_an_element_type()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_h() + "struct Reg\n    slots: [2]&sync H"), sho_h_kid(), "6:15")
+
+@test("a type argument")
+sho_a_type_argument()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_h() + "struct Box[T]\n    it: T\nvar b: Box[&sync H] = Box(H(Inner(1)))"),
+                sho_h_kid(), "7:12")
+
+// A generic type is one declaration covering every instantiation, so the question belongs to the
+// argument rather than to the parameter: `Box[int]` shares and `Box[&Inner]` does not.
+@test("the argument of a generic pointee, and not its parameter")
+sho_the_argument_of_a_generic_pointee()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran("struct Box[T]\n    it: T\nvar b: &sync Box[int] = Box(7)\nprint(b.it)"), "7\nexit 0")
+
+    sho_refused(sho_ran(sho_inner() + "struct Box[T]\n    it: T\nvar b: &sync Box[&Inner] = Box(Inner(1))"),
+                sho_reached("Box[&Inner]") + "but its 'it' reaches a '&Inner', " + sho_hold("Inner"), "5:8")
+end sho_the_argument_of_a_generic_pointee
+
+// A member's receiver is a type like any other, and a `&sync self` on a type nothing may share is a
+// member no call could reach.
+@test("a '&sync self' receiver")
+sho_a_sync_self_receiver()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran("struct P\n    tag: string\n    ping(&sync self) -> int = 1"),
+                sho_reached("P") + "but its 'tag' reaches a 'string', " + sho_view("bytes"), "3:5")
+
+// -- the question waits for an answer rather than being asked early ------------------------------
+
+// A type reaching itself through a `&sync` field is resolved while its own field list is still being
+// filled, so asking then would find nothing in the way of anything.
+@test("a type that reaches itself is still checked, and passes")
+sho_a_type_that_reaches_itself_passes()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(raw"""
+        struct Ring
+            v: int
+            next: Option[&sync Ring]
+        var a: &sync Ring = Ring(1, None)
+        print(a.v)
+        """), "1\nexit 0")
+
+@test("a type that reaches itself and holds something unshareable is caught")
+sho_a_type_that_reaches_itself_is_caught()
+    if xvr_no_library() then return
+
+    val said = sho_ran(sho_inner() + raw"""
+        struct Ring
+            kid: &Inner
+            next: Option[&sync Ring]
+        var a: &sync Ring = Ring(Inner(1), None)
+        """)
+    val message = sho_reached("Ring") + "but its 'kid' reaches a '&Inner', " + sho_hold("Inner")
+
+    sho_refused(said, message, "5:18")
+    sho_refused(said, message, "6:8")
+end sho_a_type_that_reaches_itself_is_caught
+
+@test("two types that reach each other")
+sho_two_types_that_reach_each_other()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_inner() + raw"""
+                    struct A
+                        b: Option[&sync B]
+                    struct B
+                        kid: &Inner
+                    var a: &sync A = A(None)
+                    """),
+                sho_reached("B") + "but its 'kid' reaches a '&Inner', " + sho_hold("Inner"), "4:15")
+
+// A type parameter promises nothing about its counts, so a declaration writing `&sync T` is not a
+// mistake -- the instantiation is where the question has an answer, and it is asked there.
+@test("a declaration over a type parameter is not asked, and its instantiation is")
+sho_a_declaration_over_a_type_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran("share[T](x: T) -> &sync T = x\nvar n = share(7)\nprint(n == n)"), "true\nexit 0")
+
+    sho_refused(sho_ran(sho_inner() + raw"""
+                    struct Box[T]
+                        it: T
+                    share[T](x: Box[T]) -> &sync Box[T] = x
+                    var k: &Inner = Inner(1)
+                    var r = share(Box(k))
+                    """),
+                sho_reached("Box[&Inner]") + "but its 'it' reaches a '&Inner', " + sho_hold("Inner"), "5:24")
+end sho_a_declaration_over_a_type_parameter
+
+// A trait's own signature is resolved where the trait is written, so a promise nothing can keep is
+// refused there -- with nothing implementing it, and again when something does.
+@test("a trait's signature is asked at the trait, implemented or not")
+sho_a_traits_signature_is_asked()
+    if xvr_no_library() then return
+
+    val declared = sho_h() + "trait Registry\n    put(self, h: &sync H) -> int\n"
+
+    sho_refused(sho_ran(declared + "var n = 1\nprint(n)"), sho_h_kid(), "6:18")
+    val implemented = sho_ran(declared + raw"""
+                    struct R
+                        n: int
+                    impl Registry for R
+                        put(self, h: &sync H) -> int = 1
+                    """)
+
+    sho_refused(implemented, sho_h_kid(), "6:18")
+
+    // The implementation restates the trait's promise and is not asked it a second time.
+    assert(!implemented.contains("/main.sysl:10:18\n"), implemented)
+end sho_a_traits_signature_is_asked
+
+// Found porting the suite: the implementation's own signature was asked again, and a trait member
+// no implementation restates is asked only at the trait -- the reference's reading, checked on a
+// parameter and a result.
+@test("an implementation's member is not asked again what its trait was asked")
+sho_an_implementation_is_not_asked_again()
+    if xvr_no_library() then return
+
+    val said = sho_ran(sho_h() + raw"""
+        struct R
+            n: int
+        trait T
+            t(self, h: &sync H) -> int
+        impl T for R
+            t(self, h: &sync H) -> int = 1
+        trait U
+            u(self) -> &sync H
+        impl U for R
+            u(self) -> &sync H = H(Inner(1))
+        """)
+
+    sho_refused(said, sho_h_kid(), "8:16")
+    sho_refused(said, sho_h_kid(), "12:16")
+    assert(!said.contains("/main.sysl:10:16\n"), said)
+    assert(!said.contains("/main.sysl:14:16\n"), said)
+end sho_an_implementation_is_not_asked_again
+
+// Found porting the suite: a subscript's complaints pointed at its receiver, where the reference
+// points at the `[` -- every one of them, not only the `&sync` one.
+@test("a subscript's refusal points at its bracket")
+sho_a_subscript_refusal_points_at_its_bracket()
+    if xvr_no_library() then return
+
+    val said = sho_ran("var n = 5\nvar x = n[0]\nvar a = [1, 2, 3, 4]\nvar bad = a[1..<]\nvar z = n[0..<1]")
+
+    sho_refused(said, "cannot index int", "2:10")
+    sho_refused(said, "an open-ended slice is written 'a[lo..]'", "4:12")
+    sho_refused(said, "cannot slice int", "5:10")
+end sho_a_subscript_refusal_points_at_its_bracket
+
+// -- a pointee that is not a struct --------------------------------------------------------------
+
+@test("an array of references is named as something the object holds, not as what it is")
+sho_an_array_of_references()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_inner() + "var a: &sync [2]&Inner = [Inner(1), Inner(2)]"),
+                sho_reached("[2]&Inner") + "but it holds a '&Inner', " + sho_hold("Inner"), "3:8")
+
+@test("a shareable generic of the library's is ordinary")
+sho_a_shareable_library_generic()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran("var o: &sync Option[int] = Some(3)\nprint(o.unwrap())"), "3\nexit 0")
+
+@test("and an unshareable one is not")
+sho_an_unshareable_library_generic()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_inner() + "var k: &Inner = Inner(1)\nvar o: &sync Option[&Inner] = Some(k)"),
+                sho_reached("sysl.Option[&Inner]") + "but its 'Some(value)' reaches a '&Inner', " +
+                sho_hold("Inner"), "4:8")
+
+// -- a trait object is asked where the type it forgot is known -----------------------------------
+
+@test("an implementor that may be shared is erased as usual")
+sho_a_shareable_implementor_is_erased()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(sho_show() + raw"""
+        struct P
+            v: int
+        impl Show for P
+            show(&self) -> string = "p"
+        var s: &sync Show = P(1)
+        print(s.show())
+        """), "p\nexit 0")
+
+// The type is not in the `&sync Show` that was written, so this is the one place the question can be
+// asked at all -- and what it names is the concrete type, which is the thing in the way.
+@test("one that may not is refused at the value, not at the type")
+sho_an_unshareable_implementor_is_refused()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_show() + raw"""
+                    struct P
+                        tag: string
+                    impl Show for P
+                        show(&self) -> string = self.tag
+                    var s: &sync Show = P("x")
+                    """),
+                sho_reached("P") + "but its 'tag' reaches a 'string', " + sho_view("bytes"), "7:21")
+
+// -- a closure is asked about what it captured ---------------------------------------------------
+
+@test("one capturing only crossable values may be shared")
+sho_a_closure_of_crossable_values()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran("var k = 5\nvar f: &sync Fn(int) -> int = x -> x + k\nprint(f(37))"), "42\nexit 0")
+
+// A closure is a struct a program wrote and did not name, so nothing it is told may repeat the name
+// the compiler filed it under.
+@test("one capturing a reference is refused, and the message says 'closure'")
+sho_a_closure_capturing_a_reference()
+    if xvr_no_library() then return
+
+    val said = sho_ran(sho_inner() + "var k: &Inner = Inner(3)\nvar f: &sync Fn(int) -> int = x -> x + k.v")
+
+    sho_refused(said, "a closure shared between two domains may be called from either, so every count " +
+                      "it captures has to be atomic — but the 'k' it captures reaches a '&Inner', " +
+                      sho_hold("Inner"), "4:31")
+    assert(!said.contains("closure0"), said)
+end sho_a_closure_capturing_a_reference
+
+// -- the two reference modes ---------------------------------------------------------------------
+
+private sho_distinct(want: string) -> string =
+    "'&Inner' and '&sync Inner' are distinct types, and neither converts to the other: a count is " +
+    "atomic or it is not from the moment the object is allocated, and a conversion would put an " +
+    s"ordinary retain beside an atomic one. Allocate Inner as a '$want' where it is constructed"
+
+@test("do not convert in either direction, and the complaint says why")
+sho_the_modes_do_not_convert()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran(sho_inner() + "f(p: &Inner) -> int = p.v\nvar a: &sync Inner = Inner(1)\nprint(f(a))"),
+                sho_distinct("&Inner"), "5:9")
+    sho_refused(sho_ran(sho_inner() + "f(p: &sync Inner) -> int = p.v\nvar a: &Inner = Inner(1)\nprint(f(a))"),
+                sho_distinct("&sync Inner"), "5:9")
+end sho_the_modes_do_not_convert
+
+@test("are separately allocated, so a program may hold both")
+sho_the_modes_are_separately_allocated()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(sho_inner() + "var a: &Inner = Inner(1)\nvar b: &sync Inner = Inner(2)\nprint(a.v + b.v)"),
+              "3\nexit 0")
+
+// -- the atomic count itself ---------------------------------------------------------------------
+
+// The orderings are the standard sequence and are written down because getting one wrong produces a
+// bug nobody finds (`library/sync.md § Ordering`).
+@test("takes a share with no ordering and gives one back with release, acquiring before it frees")
+sho_the_atomic_count_orderings()
+    if xvr_no_library() then return
+
+    val out = xvr_ir([("main.sysl", sho_inner() + "var a: &sync Inner = Inner(1)\nvar b = a\nprint(b.v)")])
+
+    assert(out.contains("atomicrmw add ptr %p, i64 1 monotonic"), out)
+    assert(out.contains("atomicrmw sub ptr %p, i64 1 release"), out)
+    assert(out.contains("fence acquire"), out)
+end sho_the_atomic_count_orderings
+
+@test("is emitted only into a program that has one")
+sho_the_atomic_count_only_where_used()
+    if xvr_no_library() then return
+
+    val out = xvr_ir([("main.sysl", sho_inner() + "var a: &Inner = Inner(1)\nprint(a.v)")])
+
+    assert(out.contains("define"), out)
+    assert(!out.contains("arc.retain_sync"), out)
+end sho_the_atomic_count_only_where_used
+
+@test("neither leaks nor frees twice over a long run")
+sho_the_atomic_count_over_a_long_run()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(sho_inner() + raw"""
+        var i = 0
+        var last = 0
+        while i < 200000 do
+            var a: &sync Inner = Inner(i)
+            var b = a
+            last = b.v
+            i += 1
+        print(last)
+        """), "199999\nexit 0")
+
+// -- what the chapter says the language does not have --------------------------------------------
+
+// No `async`, no `await`, and no task runtime -- so none of the three is a reserved word, and a
+// program may use all of them as names (`library/threads.md § There is no async`).
+@test("no async, await, or actor, so all three are ordinary names")
+sho_no_async_await_or_actor()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran("var async = 1\nvar await = 2\nvar actor = 3\nprint(async + await + actor)"), "6\nexit 0")
+
+// "`&sync T` makes the reference safe to share, not the object safe to mutate" -- the chapter's own
+// most important sentence. A field of one is written exactly as any other field is.
+@test("an atomic reference does not make its object's fields any less writable")
+sho_an_atomic_reference_leaves_fields_writable()
+    if xvr_no_library() then return
+
+    assert_eq(sho_ran(raw"""
+        struct Counter
+            n: int
+        var a: &sync Counter = Counter(1)
+        var b = a
+        b.n = 41
+        print(a.n + 1)
+        """), "42\nexit 0")
+
+// A view records nothing about whether its owner's count is atomic, which is the same gap the string
+// rule above runs into, one level out.
+@test("a '&sync' array still cannot be sliced")
+sho_a_sync_array_cannot_be_sliced()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran("var b: &sync [4]int = [1, 2, 3, 4]\nvar s = b[..]"),
+                "a slice does not record whether its owner's count is atomic, so a '&sync' array cannot " +
+                "be sliced", "2:10")
+
+@test("and 'weak sync T' still names the chapter it is waiting for")
+sho_weak_sync_names_its_chapter()
+    if xvr_no_library() then return
+
+    sho_refused(sho_ran("struct Node\n    v: int\nvar w: weak sync Node = None"),
+                "an atomic reference has no weak form yet — 'weak sync T' wants the concurrency model of " +
+                "'06', which is not built", "3:8")
