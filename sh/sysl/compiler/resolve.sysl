@@ -492,6 +492,10 @@ private inherit(owner: string, owner_root: string, table: Buf[MountedName], bind
     for i in 0..<ours.len()
         if module_overlap(ours.at(i), local) then return Ok(table)
 
+    // A source root's modules stand at the project's own level, so they are offered the name first
+    // on the same terms.
+    if root_claiming(owner, local).is_some() then return Ok(table)
+
     var out = table
 
     out.push(MountedName(local, binding.canonical, mine))
@@ -607,8 +611,35 @@ private no_collision(owner: string, owner_root: string, table: &Buf[MountedName]
             return Err(s"$owner: '$local' is both a module of this project and one $mine offers — " +
                 "give the dependency a 'mount' to say what it is called here")
 
-    Ok(())
+    // And a source root's, which are filed under the project's names rather than under a prefix of
+    // their own: a root declaring `geom` beside a dependency offering `geom` is the same collision,
+    // named by the root as the command line wrote it.
+    root_claiming(owner, local) match
+        Some(given) ->
+            Err(s"$owner: '$local' is both a module of the source root '$given' and one $mine " +
+                "offers — give the dependency a 'mount' to say what it is called here")
+        None -> Ok(())
 end no_collision
+
+// The `--lib` source root declaring a module that `local` would be read as, where the table being
+// built is the project's own.
+//
+// **Only the project's table**, because a root's modules sit in the project's name space and in
+// nobody else's: a package's own files read a written path through their own tree and their own
+// manifest first, so what a root declares is no claim against them.
+private root_claiming(owner: string, local: string) -> Option[string]
+    if owner != ManifestName then return None
+
+    val libs = lib_roots()
+
+    for i in 0..<libs.len()
+        val theirs = package_modules(libs.at(i))
+
+        for j in 0..<theirs.len()
+            if module_overlap(theirs.at(j), local) then return Some(libs.at(i))
+
+    None
+end root_claiming
 
 // What to say about two packages claiming one module name, which is not always the same thing.
 //
@@ -760,42 +791,49 @@ resolved_graph(root: string, m: &Manifest) -> Result[Graph, Refusal]
     Ok(graph)
 end resolved_graph
 
-// The directory each of this project's packages was fetched into, which is what a build walks for
-// the C they carry.
+// One tree a compilation was handed beside the project's own: a package its `dependencies` reached,
+// or a source root a `--lib` named.
+struct Handed
+    // What a refusal about this tree calls it: a package's canonical prefix, since the consumer has
+    // the coordinate they wrote in front of them where two packages may have written one `name`; a
+    // source root exactly as the command line wrote it.
+    who: string
+
+    // Where its files are.
+    dir: string
+
+    // Whether it is a `--lib` source root rather than a package the graph reached. A root's modules
+    // carry no prefix and its manifest is not the consumer's to be bound by in every respect, so a
+    // reader of manifests asks this before reading one.
+    from_lib: bool
+end Handed
+
+// **Every other tree this build takes, which is one question and is asked in one place.** The C
+// walk of a build and of an archive, the allocator claims, the installed libraries and the headers
+// a build is answerable for, the words a `defines` refusal names a tree in, and the run cache's key
+// all ask it -- and a tree that appeared in some of those answers and not the others would be a
+// build that is wrong in a way only one command shows.
 //
-// A dependency that cannot be resolved is not a refusal here: whatever needed its *source* has
-// already said so, and a build that got this far has one to walk.
-package_roots(root: string, m: &Manifest) -> Buf[string]
-    if m.dependencies.is_empty() then return buf()
+// The packages come first, in the order the graph resolved them, and then the source roots in the
+// order they were written. A dependency that cannot be resolved is not a refusal here: whatever
+// needed its *source* has already said so, and a build that got this far has one to walk.
+handed_trees(root: string, m: &Manifest) -> Buf[Handed]
+    var out: Buf[Handed] = buf()
 
-    resolved_graph(root, m) match
-        Err(_) -> buf()
-        Ok(graph) ->
-            var out: Buf[string] = buf()
+    if !m.dependencies.is_empty()
+        resolved_graph(root, m) match
+            Err(_) -> ()
+            Ok(graph) ->
+                for i in 0..<graph.packages.len()
+                    val p = graph.packages.at(i)
 
-            for i in 0..<graph.packages.len()
-                if !is_root_package(graph.packages.at(i)) then out.push(graph.packages.at(i).root)
+                    if !is_root_package(p) then out.push(Handed(p.canonical, p.root, false))
+    end if
 
-            out
-end package_roots
+    val libs = lib_roots()
 
-// The same, each root paired with the canonical prefix its modules sit under.
-//
-// **What a refusal about a package calls it is its canonical prefix**, and not the name in its
-// manifest: a consumer looking for who asked for a library has the coordinate they wrote in front of
-// them, where two packages may perfectly well have written the same `name`.
-package_places(root: string, m: &Manifest) -> Buf[(string, string)]
-    if m.dependencies.is_empty() then return buf()
+    for i in 0..<libs.len()
+        out.push(Handed(libs.at(i), libs.at(i), true))
 
-    resolved_graph(root, m) match
-        Err(_) -> buf()
-        Ok(graph) ->
-            var out: Buf[(string, string)] = buf()
-
-            for i in 0..<graph.packages.len()
-                val p = graph.packages.at(i)
-
-                if !is_root_package(p) then out.push((p.canonical, p.root))
-
-            out
-end package_places
+    out
+end handed_trees
