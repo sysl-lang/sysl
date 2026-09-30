@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.text.{str_builder, StrBuilder}
+import sysl.text.{Search, str_builder, StrBuilder}
 import sysl.unicode
 
 // The model an API reference page is written from: which modules exist, which declarations each
@@ -24,23 +24,26 @@ import sysl.unicode
 // about the types above rather than things to call. Each kind the `sysl-doc` of 0.0.152 left off the
 // page follows the kind it is a variety of -- a module `val` after the constants, an `extern` after
 // the functions, a `type` alias after the types.
+//
+// **Every variant carries a prefix** because a variant is resolved module-wide: a bare `Type`,
+// `Trait` or `Public` here would collide with the compiler's own `Type` and `Visibility`.
 enum DocKind
-    Const
-    Value
-    Function
-    Extern
-    Type
-    Alias
-    Trait
-    Implementation
+    DkConst
+    DkValue
+    DkFunction
+    DkExtern
+    DkType
+    DkAlias
+    DkTrait
+    DkImplementation
 end DocKind
 
 // Where a symbol may be seen from. `private` is file-private and `private[m]` module-wide, which are
 // two different answers to "should this be on the page", so they are kept apart.
 enum DocAccess
-    Public
-    Module
-    File
+    DaPublic
+    DaModule
+    DaFile
 
 // A doc comment as a page uses it: the prose, and the tags sorted by what a page does with them.
 //
@@ -187,7 +190,7 @@ private dm_module(name: string, us: Buf[Program], include_private: bool) -> DocM
 
         for j in 0..<u.body.len()
             dm_symbol_of(u, u.body.at(j), include_private) match
-                Some(s) -> if include_private || s.access == Public then dm_insert_symbol(&symbols, s)
+                Some(s) -> if include_private || s.access == DocAccess.DaPublic then dm_insert_symbol(&symbols, s)
                 None -> ()
 
         for j in 0..<u.capabilities.len()
@@ -304,9 +307,9 @@ end dm_last_segment
 private dm_line(u: Program, at: Span) -> usize = u.src.locate(at.start).line
 
 private dm_access(v: Visibility) -> DocAccess = v match
-    Public -> DocAccess.Public
-    Scoped(_) -> DocAccess.Module
-    File -> DocAccess.File
+    Public -> DocAccess.DaPublic
+    Scoped(_) -> DocAccess.DaModule
+    File -> DocAccess.DaFile
 
 // The prose above `at`, its unanswerable parameter tags left out.
 private dm_doc_at(u: Program, at: Span, params: Buf[string], tparams: Buf[string]) -> Option[DocProse] =
@@ -325,10 +328,10 @@ private dm_symbol_of(u: Program, s: Stmt, include_private: bool) -> Option[DocSy
 
     *s.kind match
         FuncDecl(d) ->
-            Some(dm_symbol(d.name, DocKind.Function, dm_access(d.vis), sig,
+            Some(dm_symbol(d.name, DocKind.DkFunction, dm_access(d.vis), sig,
                            dm_doc_at(u, s.span, dm_param_names(false, d.params), d.tparams), line))
         StructDecl(d) ->
-            var sym = dm_symbol(d.name, DocKind.Type, dm_access(d.vis), sig, dm_doc_at(u, s.span, buf(), d.tparams), line)
+            var sym = dm_symbol(d.name, DocKind.DkType, dm_access(d.vis), sig, dm_doc_at(u, s.span, buf(), d.tparams), line)
 
             sym.members = dm_members(u, d.members, include_private)
 
@@ -339,7 +342,7 @@ private dm_symbol_of(u: Program, s: Stmt, include_private: bool) -> Option[DocSy
 
             Some(sym)
         EnumDecl(d) ->
-            var sym = dm_symbol(d.name, DocKind.Type, dm_access(d.vis), sig, dm_doc_at(u, s.span, buf(), d.tparams), line)
+            var sym = dm_symbol(d.name, DocKind.DkType, dm_access(d.vis), sig, dm_doc_at(u, s.span, buf(), d.tparams), line)
 
             sym.members = dm_members(u, d.members, include_private)
 
@@ -350,26 +353,26 @@ private dm_symbol_of(u: Program, s: Stmt, include_private: bool) -> Option[DocSy
 
             Some(sym)
         TraitDecl(d) ->
-            var sym = dm_symbol(d.name, DocKind.Trait,dm_access(d.vis), sig, dm_doc_at(u, s.span, buf(), d.tparams), line)
+            var sym = dm_symbol(d.name, DocKind.DkTrait,dm_access(d.vis), sig, dm_doc_at(u, s.span, buf(), d.tparams), line)
 
             sym.members = dm_members(u, d.methods, include_private)
             Some(sym)
         ConstDecl(name, _, _, vis) ->
-            Some(dm_symbol(name, DocKind.Const,dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
+            Some(dm_symbol(name, DocKind.DkConst,dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
         // An `impl` is named for what it says -- this type has this trait -- which is also what a
         // reader searches for. It has no visibility of its own.
         ImplDecl(d) ->
-            Some(dm_symbol(s"${d.trait_name} for ${doc_type_text(d.for_type)}", DocKind.Implementation, DocAccess.Public,
+            Some(dm_symbol(s"${d.trait_name} for ${doc_type_text(d.for_type)}", DocKind.DkImplementation, DocAccess.DaPublic,
                            sig, dm_doc_at(u, s.span, buf(), d.tparams), line))
         TypeDecl(d) ->
-            Some(dm_symbol(d.name, DocKind.Alias,dm_access(d.vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
+            Some(dm_symbol(d.name, DocKind.DkAlias,dm_access(d.vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
         ExternDecl(d) ->
-            Some(dm_symbol(d.name, DocKind.Extern,dm_access(d.vis), sig,
+            Some(dm_symbol(d.name, DocKind.DkExtern,dm_access(d.vis), sig,
                            dm_doc_at(u, s.span, dm_param_names(false, d.params), buf()), line))
         ExternVarDecl(name, _, _, vis) ->
-            Some(dm_symbol(name, DocKind.Extern,dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
+            Some(dm_symbol(name, DocKind.DkExtern,dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
         ValDecl(name, _, _, vis, _, _) ->
-            Some(dm_symbol(name, DocKind.Value,dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
+            Some(dm_symbol(name, DocKind.DkValue,dm_access(vis), sig, dm_doc_at(u, s.span, buf(), buf()), line))
         _ -> None
 end dm_symbol_of
 
@@ -381,9 +384,9 @@ private dm_members(u: Program, ms: Buf[MethodDecl], include_private: bool) -> Bu
         val m = ms.at(i)
         val access = dm_access(m.vis)
 
-        if !include_private && access != Public then continue
+        if !include_private && access != DocAccess.DaPublic then continue
 
-        out.push(dm_symbol(m.name, DocKind.Function, access, doc_method(m),
+        out.push(dm_symbol(m.name, DocKind.DkFunction, access, doc_method(m),
                            dm_doc_at(u, m.span, dm_param_names(m.receiver.is_some(), m.params), m.tparams),
                            dm_line(u, m.span)))
 
@@ -464,14 +467,14 @@ private dm_is_space(b: u8) -> bool =
 // -- ordering ---------------------------------------------------------------------------------------
 
 private dm_rank(k: DocKind) -> int = k match
-    Const -> 0
-    Value -> 1
-    Function -> 2
-    Extern -> 3
-    Type -> 4
-    Alias -> 5
-    Trait -> 6
-    Implementation -> 7
+    DkConst -> 0
+    DkValue -> 1
+    DkFunction -> 2
+    DkExtern -> 3
+    DkType -> 4
+    DkAlias -> 5
+    DkTrait -> 6
+    DkImplementation -> 7
 
 private dm_lower(s: string) -> string
     var out = str_builder()
