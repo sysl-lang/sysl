@@ -290,6 +290,27 @@ hoist_stmt(a: &Analysis, scope: Scope, s: Stmt)
         // registered exactly as another file's declaration of it would be -- which is the whole of
         // what the modifier does, in the one file where an ordinary `var` is a local instead.
         StaticDecl(inner) -> hoist_stmt(a, scope, inner)
+        // The rule a module `val` meets, and a form that cannot satisfy it: a binding naming several
+        // things, or written as a pattern, has nowhere to write a type for any of its parts, so it
+        // can only ever be a local. Saying so here is what stops one asking for the module from
+        // quietly becoming a local of the entry point.
+        MultiDecl(names, mutable, _) ->
+            if !mutable
+                var named = ""
+
+                for i in 0..<names.len()
+                    if i > 0 then named = named + " and "
+
+                    named = named + s"'${names.at(i)}'"
+
+                a.fault(scope, s.span, "a module-level 'val' states its type, and a binding that " +
+                        s"names several things has nowhere to write one — declare $named separately")
+            end if
+        PatternDecl(_, mutable, _) ->
+            if !mutable then
+                a.fault(scope, s.span, "a module-level 'val' states its type, and a binding written " +
+                        "as a pattern has nowhere to write one — take the value apart inside a " +
+                        "function, or declare the parts separately")
         _ -> ()
 
 // Module storage: a `val` that may be written to, which is what a top-level `var` declares.
