@@ -1,0 +1,86 @@
+module sh.sysl.compiler
+@tests
+
+// A variant's brackets hold named fields, and one holding a bare type is refused at the variant's
+// name with the line that should have been written -- whatever the type opens with. The brackets of
+// a slice or an array, the star of a pointer and the bracket of a tuple each used to send the line
+// somewhere that complained about the type instead.
+
+// The complaint and where it points, as one string.
+private vpm_said(text: string) -> string = s"${pf_err(text)} @ t.sysl:${pf_at(text)}"
+
+// The refusal for a payload written as `typ`, under a variant on the file's second line.
+private vpm_refusal(typ: string) -> string =
+    s"a variant's payload names its fields, as 'Circle(r: real)' — write a name before the type, as 'name: ${typ}' @ t.sysl:2:5"
+
+@test("a positional payload is refused by naming the form that was wanted, and the line to write")
+vpm_a_positional_payload_is_refused()
+    assert_eq(vpm_said("enum Event\n    Url([]const u8)\n"), vpm_refusal("[]const u8"))
+
+@test("and the suggestion carries whatever type was written")
+vpm_the_suggestion_carries_the_type()
+    assert_eq(vpm_said("enum Event\n    At(*u8)\n"), vpm_refusal("*u8"))
+    assert_eq(vpm_said("enum Event\n    Buf([4]u8)\n"), vpm_refusal("[4]u8"))
+
+@test("whatever the type is written as")
+vpm_whatever_the_type_is_written_as()
+    for t in ["[]const u8", "[4]u8", "*u8", "&Node", "int", "(int, real)", "Buf[int]", "Fn(int) -> int"]
+        assert_eq(vpm_said(s"enum Event\n    V(${t})\n"), vpm_refusal(t))
+
+@test("a bare type in a generic enum's variant is refused the same way")
+vpm_in_a_generic_enum()
+    assert_eq(vpm_said("enum E[T]\n    A(T)\n"), vpm_refusal("T"))
+    assert_eq(vpm_said("enum E[T]\n    A(*T)\n"), vpm_refusal("*T"))
+    assert_eq(vpm_said("enum E[T]\n    A([]T)\n"), vpm_refusal("[]T"))
+    assert_eq(vpm_said("enum E[T]\n    A((T, int))\n"), vpm_refusal("(T, int)"))
+
+// An array's length is written back only where it is a literal, so one that names something is
+// elided rather than guessed at.
+@test("an array payload whose length is a name is written back with the length elided")
+vpm_an_array_length_that_is_a_name()
+    assert_eq(vpm_said("enum E[T]\n    A([T]int)\n"), vpm_refusal("[\u{2026}]int"))
+    assert_eq(vpm_said("enum E\n    A([4]int)\n"), vpm_refusal("[4]int"))
+
+@test("and in a non-generic enum, for a name, a pointer, a slice and a tuple")
+vpm_in_a_plain_enum()
+    assert_eq(vpm_said("enum E\n    A(int)\n"), vpm_refusal("int"))
+    assert_eq(vpm_said("enum E\n    A(*int)\n"), vpm_refusal("*int"))
+    assert_eq(vpm_said("enum E\n    A([]int)\n"), vpm_refusal("[]int"))
+    assert_eq(vpm_said("enum E\n    A((int, int))\n"), vpm_refusal("(int, int)"))
+
+// The first type is the one named, and the fault is on the variant's own line wherever that is.
+@test("the first of several bare types is the one the suggestion names, at the variant's own line")
+vpm_the_first_type_and_the_variants_line()
+    assert_eq(vpm_said("enum E\n    Ok\n    A(*u8, real)\n"),
+        "a variant's payload names its fields, as 'Circle(r: real)' — write a name before the type, as 'name: *u8' @ t.sysl:3:5")
+    assert_eq(vpm_said("enum E\n    A\n    size(self) -> int = 1\n    B((int, int))\n    C([]u8)\n"),
+        "a variant's payload names its fields, as 'Circle(r: real)' — write a name before the type, as 'name: (int, int)' @ t.sysl:4:5")
+
+// A line that goes on like a function is refused the same way: what its brackets hold is a type and
+// not a parameter, whatever follows them.
+@test("a bare type in the brackets of a line that goes on as a function is the same refusal")
+vpm_a_function_shaped_line()
+    assert_eq(vpm_said("enum E\n    A\n    of(i32) -> E = A\n"),
+        "a variant's payload names its fields, as 'Circle(r: real)' — write a name before the type, as 'name: i32' @ t.sysl:3:5")
+
+// A payload that names its first field and not its second is past the point of this refusal: the
+// second is read as a field, and what it lacks is its colon.
+@test("a bare type after a named field is a field missing its colon")
+vpm_a_bare_type_after_a_named_field()
+    assert_eq(vpm_said("enum E\n    A(x: int, real)\n"), "':' expected @ t.sysl:2:19")
+    assert_eq(vpm_said("enum E[T]\n    A(x: T, real)\n"), "':' expected @ t.sysl:2:17")
+
+@test("but a member's receiver is not a payload")
+vpm_a_receiver_is_not_a_payload()
+    assert_eq(pf("enum Shape\n    Circle(r: real)\n\n    area(self) -> real = 1.0\n"), "?")
+    assert_eq(pf("enum Shape\n    Circle(r: real)\n    grow(*self, by: real) -> real = by\n    keep(&self) -> real = 2.0\n"), "?")
+
+@test("while a named payload, a bare variant and an explicit value are unaffected")
+vpm_the_named_forms_are_unaffected()
+    assert_eq(pf("enum Shape\n    Circle(r: real)\n    Empty\n"), "(enum Shape (Circle (r:real)) (Empty))")
+    assert_eq(pf("enum Code\n    Ok = 0\n"), "(enum Code (Ok = 0))")
+
+@test("and empty parentheses are still a variant with no payload")
+vpm_empty_parentheses()
+    assert_eq(pf("enum Event\n    Nothing()\n"), "(enum Event (Nothing))")
+    assert_eq(pf("enum E[T]\n    A()\n"), "?")
