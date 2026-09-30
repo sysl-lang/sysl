@@ -206,6 +206,7 @@ parse_enum_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
         val before = p.report.len()
 
         if refuse_stray_member(p, first, InType) then ()
+        elif refuse_positional_payload(p) then ()
         elif at_enum_variant(p)
             decl.variants.push(parse_enum_variant(p))
 
@@ -227,6 +228,56 @@ parse_enum_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
     stmt(start.to(p.just_taken()), EnumDecl(decl))
 end parse_enum_decl
 
+// A variant whose brackets hold a bare **type** rather than `name: type`, refused at the variant's
+// name with the line that should have been written.
+//
+// **It is asked before the line is sorted into a variant or a member, so that the answer does not
+// depend on how the type is spelled.** Sorting looks at the token after the bracket, and a type may
+// open with `[`, `*`, `&` or `(` -- each of which sends the line somewhere that complains about the
+// type (`')' expected` at a `[`) or about a receiver the line never meant to have. Positional
+// payloads are what Rust, Swift and OCaml write, so this is the first thing a newcomer's enum says.
+//
+// The type is read and then put back, so nothing is taken and the fault lands on the name. It stands
+// aside for everything that is not this mistake: a named field stops at its `:`, empty brackets hold
+// no type, and a receiver -- `area(self)`, `write(*self, …)` -- is a member's.
+private refuse_positional_payload(p: *Parser) -> bool
+    if !names_a_variant(p.peek()) || !p.kw_at(1, "(") then return false
+
+    val at = p.here()
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+    val placeholders = p.ph_count
+
+    p.bump()
+    p.bump()
+
+    val typ = parse_type(p)
+    val fits = p.errors_at() == errors_at && (p.at_kw(")") || p.at_kw(","))
+
+    p.rewind(tokens_at, errors_at)
+    p.ph_count = placeholders
+
+    if !fits || names_self(typ) then return false
+
+    p.fault(at, positional_payload_refusal(typ))
+    true
+end refuse_positional_payload
+
+private names_a_variant(t: Tok) -> bool = t match
+    Ident(_) -> true
+    QuotedIdent(_) -> true
+    _ -> false
+
+// Whether a type is `self` under whatever a receiver may be written with.
+private names_self(t: TypeRef) -> bool = *t.kind match
+    NamedType(n, _) -> n == "self"
+    PtrType(inner) -> names_self(inner)
+    RefType(inner, _) -> names_self(inner)
+    _ -> false
+
+private positional_payload_refusal(typ: TypeRef) -> string =
+    s"a variant's payload names its fields, as 'Circle(r: real)' — write a name before the type, as 'name: ${type_text(typ)}'"
+
 // Whether the line names a variant rather than a member of the enum.
 //
 // **The payload is what settles it**: a variant's fields are named -- `Circle(r: real)` -- and a
@@ -243,7 +294,12 @@ private at_enum_variant(p: *Parser) -> bool
 
     // Inside the brackets: a receiver is a member, and a named field is a variant's.
     if p.kw_at(2, "*") || p.kw_at(2, "&") || p.kw_at(2, "self") then return false
-    if p.kw_at(2, ")") then return !p.kw_at(3, "->") && !p.kw_at(3, "=") && p.peek_at(3) != Newline
+    // Empty brackets are a variant with no fields unless the line goes on as a function does: with
+    // a result type, an `=`, or a block under it.
+    if p.kw_at(2, ")")
+        return !p.kw_at(3, "->") && !p.kw_at(3, "=") &&
+            !(p.peek_at(3) == Newline && p.peek_at(4) == Indent)
+    end if
 
     if !names_a_field(p.peek_at(2)) then return false
     if !(p.kw_at(3, ":") || p.kw_at(3, ")") || p.kw_at(3, ",")) then return false
@@ -302,7 +358,7 @@ private parse_enum_variant(p: *Parser) -> EnumVariantDecl
     if names_a_field(p.peek()) && (p.kw_at(1, ")") || p.kw_at(1, ","))
         val typ = parse_type(p)
 
-        p.fault(start, s"a variant's payload names its fields, as 'Circle(r: real)' — write a name before the type, as 'name: ${type_text(typ)}'")
+        p.fault(start, positional_payload_refusal(typ))
         skip_line(p)
         return EnumVariantDecl(start.to(p.just_taken()), name, None, fields)
     end if
