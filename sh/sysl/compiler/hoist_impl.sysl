@@ -35,9 +35,23 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
 
     // A TYPE parameter written as the subject's length leaves the block with no subject, and it
     // ends here: read on, the block would be asked about the shape of a type nobody wrote.
-    if target_length_refused(a, scope, block) then return im
+    //
+    // **A generic struct or enum is not read that way**: its subject is the type applied to the
+    // block's own parameters and nothing else, so what stands at an argument is asked about as
+    // written -- `impl[N, T] Tag for W[[N]T]` is told that `[…]T` fixes `W`'s argument, which is the
+    // mistake, and nothing about the length inside a type that may not be there at all.
+    val covers_whole = names_generic_type(a, scope, block)
 
+    if !covers_whole && target_length_refused(a, scope, block) then return im
+
+    val asked = a.complaints()
     val target = impl_target(a, scope, span, block)
+
+    // A subject that is not the generic type applied to the block's parameters leaves nothing to
+    // file the block under, and it ends here, told once: read on, every name the subject left out
+    // would be reported as unknown wherever a member wrote it.
+    if covers_whole && a.complaints() > asked then return im
+
     val ty = target.0
     var home = target.1
     val promise = impl_bound(a, scope, span, block, tr, home)
@@ -324,9 +338,13 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
             s"${home.symbol}.${inherited.at(i).name}${home.alt}",
             s"${block.trait_name}.${inherited.at(i).name}")
 
+    // A member the trait does not declare is not one the type gains: the block was told it may not
+    // define it, and a member filed anyway would have its body read and answer a call by its name.
     var supplied: Buf[MethodDecl] = buf()
 
     for i in 0..<block.methods.len()
+        if trait_method(tr, block.methods.at(i).name).is_none() then continue
+
         refuse_impl_defaults(a, scope, block.trait_name, block.methods.at(i))
         supplied.push(with_trait_defaults(tr, block.methods.at(i)))
 
@@ -564,6 +582,18 @@ impl_target(a: &Analysis, scope: Scope, span: Span, block: ImplDecl) -> (Type, M
             else structural_target(a, scope, span, block, block.for_type)
         _ -> structural_target(a, scope, span, block, block.for_type)
 end impl_target
+
+// Whether the block's subject names a struct or an enum that takes type parameters -- the one kind
+// of subject whose arguments are the block's own parameters and nothing else.
+private names_generic_type(a: &Analysis, scope: Scope, block: ImplDecl) -> bool
+    *block.for_type.kind match
+        NamedType(written, _) ->
+            val key = lookup_type_key(a, scope, written)
+            val nom = if key.is_some() then nominal_of(a, key.unwrap()) else None
+
+            nom.is_some() && !nom.unwrap().0.is_empty()
+        _ -> false
+end names_generic_type
 
 // A struct's or an enum's parameters, the names its body already spoke for, and what a diagnostic
 // calls one of those.
@@ -830,23 +860,33 @@ impl_args(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, key: string,
     val spelled = s"impl[${joined(tparams, ", ")}] ${module_show(block.trait_name)} for " +
                   s"${module_show(key)}[${joined(tparams, ", ")}]"
 
-    if block.tparams.is_empty() then
+    // **The first thing wrong with the subject is the only one told**, and the block ends with it
+    // (`hoist_impl`): each question below is asked of a subject the one above it found well formed,
+    // so `impl Tag for W[int]` is told to declare a parameter and not also that `int` fixes one.
+    var names: Buf[string] = buf()
+
+    if block.tparams.is_empty()
         a.fault(scope, span, s"'${qualified_name(key)}' is generic, so an 'impl' for it covers every " +
                 s"instantiation at once — write '$spelled'")
+        return names
 
-    if arg_refs.len() != tparams.len() then
+    if arg_refs.len() != tparams.len()
         a.fault(scope, span, s"'${qualified_name(key)}' takes " +
                 s"${quantity(tparams.len(), "type argument")}, but " +
                 s"${supplied_phrase(arg_refs.len(), "type argument")}")
-
-    var names: Buf[string] = buf()
+        return names
 
     for i in 0..<arg_refs.len()
-        *arg_refs.at(i).kind match
+        val own: Option[string] = *arg_refs.at(i).kind match
             NamedType(n, as_written) ->
-                if as_written.is_empty() && holds_string(block.tparams, n) then names.push(n)
-                else fix_refused(a, scope, span, arg_refs.at(i), module_show(key))
-            _ -> fix_refused(a, scope, span, arg_refs.at(i), module_show(key))
+                if as_written.is_empty() && holds_string(block.tparams, n) then Some(n) else None
+            _ -> None
+
+        if own.is_none()
+            fix_refused(a, scope, span, arg_refs.at(i), module_show(key))
+            return names
+
+        names.push(own.unwrap())
 
     check_argument_names(a, scope, span, block, names, written)
     names
@@ -861,9 +901,10 @@ private check_argument_names(a: &Analysis, scope: Scope, span: Span, block: Impl
                              names: Buf[string], written: string)
     for i in 0..<names.len()
         for j in 0..<i
-            if names.at(i) == names.at(j) then
+            if names.at(i) == names.at(j)
                 a.fault(scope, span, s"each argument of '$written' takes a type parameter of its " +
                         s"own, and this 'impl' names '${names.at(i)}' twice")
+                return
 
     var missing: Buf[string] = buf()
 
