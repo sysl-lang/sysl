@@ -112,17 +112,8 @@ call_bound_method(cx: &Analyzer, span: Span, receiver: TExpr, subject: Type, nam
 
     for i in 0..<args.len()
         val want = if i < params.len() then Some(params.at(i).1) else None
-        val t = type_expr(cx, args.at(i), want)
 
-        // A parameter standing in for itself is held to its **bounds** and not to being the same
-        // type as what arrived: that is the whole of what a bound licenses.
-        if want.is_some() && !stands_for_itself(want.unwrap()) &&
-                disagree(texpr_type(t), want.unwrap()) then
-            cx.an.bound_fault(cx.scope, args.at(i).span,
-                              s"'${params.at(i).0}' of '${qualified_name(tr.name)}.$name' is " +
-                              s"${type_show(want.unwrap())}, but ${type_show(texpr_type(t))} was given")
-
-        ts.push(t)
+        ts.push(type_expr(cx, args.at(i), want))
 
     // **The member's own type parameters are solved from what the call supplied**, exactly as a
     // generic function's are: `apply[U](self, f: &Fn(int) -> U) -> U` learns what `U` is from the
@@ -148,6 +139,35 @@ call_bound_method(cx: &Analyzer, span: Span, receiver: TExpr, subject: Type, nam
             if i < own.len() && own.at(i) != Unknown then
                 solved = joined_bindings(solved, one_binding(m.tparams.at(i), own.at(i)))
     end if
+
+    // **Each argument is held to its parameter once the member's own parameters are solved**, and
+    // put into the shape it asks for: a closure at `f: &Fn(int) -> U` arrives as its own struct and
+    // is read against a result nothing had settled, so the `&Fn` it stands at is only nameable now.
+    // A parameter standing in for itself is held to its **bounds** and not to being the same type as
+    // what arrived: that is the whole of what a bound licenses.
+    var settled = solved
+
+    for i in 0..<m.tparams.len()
+        if bound_type(solved, m.tparams.at(i)).is_none() then
+            settled = joined_bindings(settled, one_binding(m.tparams.at(i), Unknown))
+
+    for i in 0..<args.len()
+        if i < params.len()
+            val written = m.params.at(i).typ
+            val want = if m.tparams.is_empty() || names_own_tparam(written, m.tparams) ||
+                              spreads_own_pack(written, m.tpacks) then params.at(i).1
+            else resolve_type(cx.an, scope, written, settled)
+            var t = ts.at(i + 1)
+
+            if !stands_for_itself(want) && disagree(texpr_type(t), want) then t = coerce(cx, t, want)
+
+            if !stands_for_itself(want) && disagree(texpr_type(t), want) then
+                cx.an.bound_fault(cx.scope, args.at(i).span,
+                                  s"'${params.at(i).0}' of '${qualified_name(tr.name)}.$name' is " +
+                                  s"${type_show(want)}, but ${type_show(texpr_type(t))} was given")
+
+            ts.set(i + 1, t)
+        end if
 
     val ret = if m.ret_type.is_some() then
                   declared_result_type(Some(resolve_type(cx.an, scope, m.ret_type.unwrap(), solved)))
