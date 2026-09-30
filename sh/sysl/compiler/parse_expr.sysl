@@ -516,6 +516,15 @@ private led(lhs: Expr, t: Spanned[Tok], p: *Parser) -> Expr
         _ -> lhs
 end led
 
+// Where an expression BEGINS in the text. A `Field`'s span is its name -- the anchor a complaint
+// about a member wants -- so a target built on one (`p.a`, `arr[1].a`, `f().a`) has a span that
+// starts at the name rather than at the first thing the reader wrote.
+private begins_at(e: Expr) -> Span = *e.kind match
+    Field(receiver, _) -> begins_at(receiver)
+    Index(receiver, _) -> begins_at(receiver)
+    Call(callee, _) -> begins_at(callee)
+    _ -> e.span
+
 private led_word(lhs: Expr, at: Span, w: string, p: *Parser) -> Expr
     val from = lhs.span
 
@@ -526,7 +535,9 @@ private led_word(lhs: Expr, at: Span, w: string, p: *Parser) -> Expr
         // is taken by the loop that reads the value.
         val value = parse_expr_bp(p, AssignRightPower)
 
-        return expr(from.to(p.just_taken()), Assign(w, lhs, value))
+        // **An assignment is the whole statement**, from the first character of its target: a
+        // refusal of the write is reported there, whatever the target's own anchor is.
+        return expr(begins_at(lhs).to(p.just_taken()), Assign(w, lhs, value))
     end if
 
     if is_compare_op(w) then return led_compare(lhs, w, p)
