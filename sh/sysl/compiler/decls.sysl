@@ -607,17 +607,13 @@ struct Analysis
     // a value whose type could not be worked out -- a name whose declaration failed, a call refused
     // over its arguments -- is a consequence of a mistake reported where it was made.
     //
-    // **It is recorded as a complaint with no message**, which is what a trial reading counts, so a
-    // reading that came to such a value fails as one that complained does; `close_region` and
-    // `restore_complaints` take it back like any other, and `diagnostics` never shows one.
-    poison_quietly(*self, scope: Scope, span: Span)
+    // **Nothing is recorded**, so a trial reading that counts complaints does not see it: the
+    // abandonment is about what the region goes on to say, and a trial is asking a different question.
+    // Its two lengths are equal, which is what tells it from a mistake that was recorded.
+    poison_quietly(*self)
         if self.regions == 0 || self.poison.is_some() then return
 
-        val before = self.found.len()
-
-        self.found.push(placed_error(scope.src, span, ""))
-        self.poison = Some((before, self.found.len()))
-    end poison_quietly
+        self.poison = Some((self.found.len(), self.found.len()))
 
     // Opens a recovery region, answering what the enclosing one had found so `close_region` can put
     // it back.
@@ -638,14 +634,8 @@ struct Analysis
     // Closes a region: everything it said after its first mistake is taken back, and the enclosing
     // region carries on as it was.
     close_region(*self, outer: Option[(usize, usize)])
-        if self.poison.is_some()
-            val at = self.poison.unwrap()
-
-            if self.found.len() > at.1 then self.found.truncate(at.1)
-
-            if self.found.len() > at.0 && self.found.at(at.0).diag.message == "" then
-                self.found.truncate(at.0)
-        end if
+        if self.poison.is_some() && self.found.len() > self.poison.unwrap().1 then
+            self.found.truncate(self.poison.unwrap().1)
 
         self.regions -= 1
         self.poison = outer
@@ -666,7 +656,7 @@ struct Analysis
         var all: Buf[Placed] = buf()
 
         for i in 0..<self.found.len()
-            if self.found.at(i).diag.message != "" then all.push(self.found.at(i))
+            all.push(self.found.at(i))
 
         for i in 0..<self.kept.len()
             if !already_said(self.found, self.kept.at(i)) then all.push(self.kept.at(i))
@@ -678,11 +668,17 @@ struct Analysis
 
     // Puts the complaints back to what they were, which is what a trial that is thrown away owes.
     //
-    // A mistake the trial made is taken back with it, and so is the region's giving up over it.
+    // A mistake the trial made is taken back with it, and so is the region's giving up over it. A
+    // quiet abandonment at exactly `n` is kept: nothing tells one made inside the trial from one made
+    // just before it, and the trial read the same value the region's own reading goes on to read.
     restore_complaints(*self, n: usize)
         self.found.truncate(n)
 
-        if self.poison.is_some() && self.poison.unwrap().0 >= n then self.poison = None
+        if self.poison.is_some()
+            val at = self.poison.unwrap()
+
+            if at.0 > n || (at.0 == n && at.1 > at.0) then self.poison = None
+        end if
     end restore_complaints
 
     // Runs a trial with everything it writes recorded, and puts all of it back afterwards.
