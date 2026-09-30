@@ -1783,11 +1783,26 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
 
     val chosen = narrowed(cx, fitting)
 
-    if chosen.is_none() then
-        return cx.err(span, s"no '$written' takes these arguments — the declarations of that name " +
-                      s"are:\n${signature_list(cx, keys)}")
+    if chosen.is_some() then return call_key(cx, span, written, chosen.unwrap(), args, expected, true)
 
-    call_key(cx, span, written, chosen.unwrap(), args, expected, true)
+    // **Nothing fits, and where exactly one declaration could have taken this many arguments, its
+    // own complaint is the message** -- the reader wrote a call meaning that one and got an argument
+    // wrong -- so it is made again and allowed to report. Otherwise the mistake is about which
+    // function was meant, and the answer is the roster. The arity question alone: a default makes
+    // the low end, so a declaration takes any count up to its parameters, and a variadic tail
+    // removes the high one.
+    var plausible: Buf[string] = buf()
+
+    for i in 0..<keys.len()
+        val d = cx.an.tables.funcs.get(keys.at(i)).unwrap().decl
+
+        if args.len() <= d.params.len() || (d.variadic && args.len() >= d.params.len())
+            plausible.push(keys.at(i))
+
+    if plausible.len() == 1 then return call_key(cx, span, written, plausible.at(0), args, expected, true)
+
+    cx.err(span, s"no '${qualified_callee(keys.at(0), written)}' takes these arguments — the " +
+           s"declarations of that name are:\n${signature_list(cx, keys)}")
 end function_call
 
 // Which of the declarations a call fits is the one meant.
@@ -1827,7 +1842,7 @@ private signature_list(cx: &Analyzer, keys: Buf[string]) -> string
 
             params = params + s"${p.name}: ${type_show(param_type(cx, f, p))}"
 
-        out = out + s"    ${f.decl.name}($params)"
+        out = out + s"    ${qualified_callee(keys.at(i), f.decl.name)}($params)"
 
         if i + 1 < keys.len() then out = out + "\n"
 

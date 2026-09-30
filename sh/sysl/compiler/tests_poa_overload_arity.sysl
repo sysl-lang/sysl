@@ -1,0 +1,162 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **A call no declaration of its name fits is answered by the one declaration that could have taken
+// that many arguments**, where there is exactly one: the reader wrote a call meaning it and got an
+// argument wrong, so that declaration's own complaint is the message. Where none could, or several
+// could, the mistake is about which function was meant and the answer is the roster of the name.
+// "Could have taken" is the count alone -- up to the parameters, a default making the low end, and
+// with no upper end past a variadic tail.
+//
+// A file-private overload joins the set only in its own file, so the same call reads differently
+// there and elsewhere -- and in this pair both readings end at the public declaration.
+//
+// **Every message here was read out of the reference compiler** (0.0.151), by handing the installed
+// `sysl` the same tree and quoting what came back.
+
+private var poa_library_cache: Buf[Program] = buf()
+private var poa_library_read: bool = false
+
+private poa_library() -> Buf[Program]
+    if poa_library_read then return poa_library_cache
+
+    poa_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> poa_library_cache = units
+
+    poa_library_cache
+end poa_library
+
+private poa_no_library() -> bool
+    if poa_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end poa_no_library
+
+// The whole report a program of several files is refused with, rendered the way a reader sees it.
+private poa_err(files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+    val library = poa_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return parsed.report.at(0).message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end poa_err
+
+private const poa_private: string = "module m\nprivate hid(x: int) -> int = x\n"
+private const poa_public: string = "module m\nhid(x: int, y: int, z: int) -> int = x + y + z\n"
+
+private poa_from_private(call: string) -> string =
+    poa_err([("main.sysl", "print(m.use())\n"), ("a.sysl", s"${poa_private}use() -> int = $call\n"),
+             ("b.sysl", poa_public)])
+
+@test("two arguments to a private one-parameter overload beside a public three: the three's count is the message")
+poa_the_only_declaration_that_takes_the_count_answers()
+    if poa_no_library() then return
+
+    val out = poa_from_private("hid(1, 2)")
+
+    assert(out.contains("error: function 'm.hid' takes 3 arguments, but 2 arguments were given\n" +
+                        " --> a.sysl:3:16"), out)
+
+@test("and a wrong type at the one declaration that takes the count is that declaration's complaint")
+poa_a_wrong_type_at_the_only_plausible_declaration()
+    if poa_no_library() then return
+
+    val out = poa_from_private("hid(\"s\", 2, 3)")
+
+    assert(out.contains("error: 'x' of 'm.hid' is int, but string was given\n --> a.sysl:3:20"), out)
+
+@test("a count both could take, with a type neither does, is the roster, named as the module names it")
+poa_a_count_both_take_is_the_roster()
+    if poa_no_library() then return
+
+    val out = poa_from_private("hid(\"s\")")
+
+    assert(out.contains("error: no 'm.hid' takes these arguments — the declarations of that name are:\n" +
+                        "    m.hid(x: int)\n    m.hid(x: int, y: int, z: int)\n --> a.sysl:3:16"), out)
+
+@test("and a count neither could take is the roster too")
+poa_a_count_neither_takes_is_the_roster()
+    if poa_no_library() then return
+
+    val out = poa_from_private("hid(1, 2, 3, 4)")
+
+    assert(out.contains("error: no 'm.hid' takes these arguments — the declarations of that name are:\n" +
+                        "    m.hid(x: int)\n    m.hid(x: int, y: int, z: int)\n --> a.sysl:3:16"), out)
+
+@test("two public overloads answer the same way, with no private declaration among them")
+poa_two_public_overloads_answer_the_same_way()
+    if poa_no_library() then return
+
+    val out = poa_err([("main.sysl", "print(m.use())\n"), ("a.sysl", "module m\nuse() -> int = hid(1, 2)\n"),
+                       ("b.sysl", "module m\nhid(x: int) -> int = x\nhid(x: int, y: int, z: int) -> int = x + y + z\n")])
+
+    assert(out.contains("error: function 'm.hid' takes 3 arguments, but 2 arguments were given\n" +
+                        " --> a.sysl:2:16"), out)
+
+@test("overloads of one parameter each, handed two, are the roster")
+poa_equal_arity_overloads_handed_too_many()
+    if poa_no_library() then return
+
+    val out = poa_err([("main.sysl", "print(m.use())\n"),
+                       ("a.sysl", "module m\nprivate hid(x: int) -> int = x\nuse() -> int = hid(1, 2)\n"),
+                       ("b.sysl", "module m\nhid(s: string) -> int = 0\n")])
+
+    assert(out.contains("error: no 'm.hid' takes these arguments — the declarations of that name are:\n" +
+                        "    m.hid(x: int)\n    m.hid(s: string)\n --> a.sysl:3:16"), out)
+
+@test("one file: the roster, when nothing takes these arguments")
+poa_the_roster_when_nothing_takes_them()
+    if poa_no_library() then return
+
+    val out = poa_err([("main.sysl", "k(x: int) -> string = \"a\"\nk(x: string) -> string = \"b\"\nprint(k(1.5))\n")])
+
+    assert(out.contains("error: no 'k' takes these arguments — the declarations of that name are:\n" +
+                        "    k(x: int)\n    k(x: string)\n --> main.sysl:3:7"), out)
+
+// A second parameter with no default makes the count one of the pair cannot take -- but one argument
+// is a count both can, so this is still the roster.
+@test("one file: a count both could take is the roster, whatever the other parameters")
+poa_one_argument_both_could_take()
+    if poa_no_library() then return
+
+    val out = poa_err([("main.sysl",
+                        "k(x: int) -> string = \"a\"\nk(x: string, y: string) -> string = \"b\"\nprint(k(1.5))\n")])
+
+    assert(out.contains("error: no 'k' takes these arguments — the declarations of that name are:\n" +
+                        "    k(x: int)\n    k(x: string, y: string)\n --> main.sysl:3:7"), out)
+
+@test("a third file does not see the private overload, and is told about the public one")
+poa_a_third_file_sees_only_the_public_one()
+    if poa_no_library() then return
+
+    val out = poa_err([("main.sysl", "print(m.use())\n"),
+                       ("a.sysl", "module m\nprivate hid(x: int) -> int = x\nother() -> int = 0\n"),
+                       ("b.sysl", poa_public), ("c.sysl", "module m\nuse() -> int = hid(1, 2)\n")])
+
+    assert(out.contains("error: function 'm.hid' takes 3 arguments, but 2 arguments were given\n" +
+                        " --> c.sysl:2:16"), out)
