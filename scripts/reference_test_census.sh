@@ -181,6 +181,9 @@ if [ "$have_source" -eq 1 ]; then
 fi
 sort -u "$work/checks.tsv" -o "$work/checks.tsv"
 
+# awk creates the orphan file only when it prints a row, and no orphans is the state to reach.
+: > "$work/orphans.tsv"
+
 # One line per iteration: suite, mapped?, the name a map row would be written against, written case.
 awk -F'\t' -v mapfile="$map" -v orphans="$work/orphans.tsv" '
     FILENAME == mapfile {
