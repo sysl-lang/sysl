@@ -7,7 +7,8 @@ import sysl.env.{get as env_var}
 import sysl.fs.{remove_file, write_text}
 import sysl.posix.threads.{spawn, Thread}
 import sysl.process.capture
-import sysl.text.{str_builder, StrBuilder}
+import sysl.slices.as_ptr
+import sysl.text.{str_builder, StrBuilder, Search}
 
 // **A program's LLVM text compiled as several modules at once** -- codegen units, as rustc has them.
 //
@@ -271,13 +272,24 @@ end global_rest
 
 // A global this can move between modules: not an alias, an ifunc, a comdat member or an `appending`
 // array, each of which means something only in the module it was written in.
+//
+// What decides is the words in front of `global` or `constant` -- never the rest of the line, where an
+// initializer may be a string saying anything. A comdat is also a top-level `$name = comdat` line,
+// which `read_module` refuses on its own.
 private plain_global(line: string) -> bool
-    val rest = global_rest(line)
+    val b = line.bytes
+    var at = symbol_end(b, 1) + 3
 
-    if rest.contains(" alias ") || rest.starts_with("alias ") || rest.contains("ifunc ") then return false
-    if rest.contains("appending ") || rest.contains("comdat") then return false
+    while at < b.len
+        val stop = word_stop(b, at)
+        val word = line[at..<stop]
 
-    true
+        if word == "global" || word == "constant" then return true
+        if word == "alias" || word == "ifunc" || word == "appending" then return false
+
+        at = stop + 1
+
+    false
 end plain_global
 
 // Every `@symbol` between `from` and `to`, outside a string, recorded as an index where it names one
@@ -487,7 +499,7 @@ private copy_renamed(m: Module, i: usize, promoted: *Buf[bool], out: *StrBuilder
     // Its own definition: `define private` / `@x = internal` become hidden.
     if promoted.at(i)
         if e.piece == PieceDefine
-            val head = if m.text[e.start..].starts_with("define private ") then 15 else 16
+            val head: usize = if m.text[e.start..].starts_with("define private ") then 15 else 16
 
             out.push("define hidden ")
             from = e.start + head
@@ -495,7 +507,7 @@ private copy_renamed(m: Module, i: usize, promoted: *Buf[bool], out: *StrBuilder
         else
             val nameEnd = symbol_end(b, e.start + 1)
             val rest = m.text[nameEnd + 3..]
-            val word = if rest.starts_with("private ") then 8 else 9
+            val word: usize = if rest.starts_with("private ") then 8 else 9
 
             out.push(s"@${spelled(e.name)} = hidden ")
             from = nameEnd + 3 + word
@@ -677,8 +689,8 @@ end run_unit_job
 // answers the objects in order. An object whose text was compiled before is taken from the cache;
 // where one fails, it is compiled again alone so that what clang said can be reported.
 compile_units(cc: string, parts: Buf[string], base: string, target: Target,
-              level: string) -> Result[Buf[string], string]
-    val args = ir_object_args(target, level)
+              level: string, sections: bool) -> Result[Buf[string], string]
+    val args = ir_object_args(target, level, sections)
     var objects: Buf[string] = buf()
     var keys: Buf[string] = buf()
     var todo: Buf[usize] = buf()
@@ -752,6 +764,47 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
 
     Ok(objects)
 end compile_units
+
+// A module's text compiled into the one object `obj`, the way `compile_object` compiles it -- in
+// several units where there are to be several, merged by a relocatable link into one object again.
+//
+// **The merge is what keeps an archive's symbols what they were.** A promoted local is hidden, and
+// hidden is a fact about the final link: inside a relocatable object it is still a global symbol, so
+// an archive of the units would list every promoted name among what it defines. The linker's `-r`
+// turns a hidden symbol into a local one, and the archive holds one object defining what it always
+// defined.
+compile_object_in_units(cc: string, ir: string, obj: string, target: Target,
+                        level: string) -> Result[unit, string]
+    val units = codegen_units(ir.len, target)
+
+    if units < 2 then return compile_object(cc, ir, obj, target, level)
+
+    val parts = split_module(ir, units) match
+        Some(p) -> p
+        None -> return compile_object(cc, ir, obj, target, level)
+
+    val made = compile_units(cc, parts, obj, target, level, true)?
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${target.triple}")
+    args.push("-nostdlib")
+    args.push("-r")
+
+    for i in 0..<made.len()
+        args.push(made.at(i))
+
+    args.push("-o")
+    args.push(obj)
+
+    val said = told(cc, args)
+
+    for i in 0..<made.len()
+        remove_file(made.at(i)).unwrap_or(())
+
+    said match
+        Ok(_) -> Ok(())
+        Err(f) -> Err(if f.unrun then f.said else tool_failed(cc, f.code, f.said))
+end compile_object_in_units
 
 // A unit clang refused, compiled again alone for its words. The text is left where it is, as
 // `compile_object` leaves it, since the line numbers are counted in it.

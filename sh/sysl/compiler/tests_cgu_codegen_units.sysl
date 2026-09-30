@@ -1,0 +1,404 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_bytes, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, join, replace_all, split, Search}
+
+// **A program's text compiled as several codegen units** (`codegen_units.sysl`). The cut is checked
+// twice over: on a hand-written module, where which symbol lands where is known and clang links the
+// pieces, and on whole programs, where the executable a split build makes has to behave as the
+// one-unit build's does. Nothing here times anything: what a rebuild recompiled is read off the
+// cache's own counts, in a cache directory of the case's own.
+//
+// `SYSL_CODEGEN_UNITS` is part of what is under test and `sysl.env` sets nothing, so a case sets it
+// through libc and unsets it before it returns.
+
+private extern "setenv" cgu_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" cgu_c_unsetenv(name: *u8) -> int
+
+private cgu_units(n: string)
+    val k = cstring("SYSL_CODEGEN_UNITS")
+    val v = cstring(n)
+
+    cgu_c_setenv(k.ptr, v.ptr, 1)
+end cgu_units
+
+private cgu_units_default()
+    val k = cstring("SYSL_CODEGEN_UNITS")
+
+    cgu_c_unsetenv(k.ptr)
+end cgu_units_default
+
+private cgu_begin() -> (string, string)
+    val work = absolute_path(make_temp_dir("sysl-cgu").unwrap())
+    val cache = make_temp_dir("sysl-cgu-cache").unwrap()
+
+    use_c_object_cache_dir(Some(cache))
+    clear_unit_object_counts()
+    (work, cache)
+end cgu_begin
+
+private cgu_end(dirs: (string, string))
+    cgu_units_default()
+    use_c_object_cache_dir(None)
+    remove_dir_all(dirs.0).unwrap_or(())
+    remove_dir_all(dirs.1).unwrap_or(())
+end cgu_end
+
+private cgu_ready() -> bool = std_root().is_ok() && clang_available()
+
+private cgu_same(a: string, b: string) -> bool
+    val x = read_bytes(a).unwrap()
+    val y = read_bytes(b).unwrap()
+
+    if x.len != y.len then return false
+
+    for i in 0..<x.len
+        if x[i] != y[i] then return false
+
+    true
+end cgu_same
+
+private cgu_output(exe: string) -> string = capture(exe, []).unwrap().text
+
+// The names `nm -gU` lists, one per line, sorted as nm sorts them.
+private cgu_exported(f: string) -> Buf[string]
+    val text = capture("nm", ["-gU", f]).unwrap().text
+    val lines = split(text, "\n")
+    var out: Buf[string] = buf()
+
+    for i in 0..<lines.len
+        val words = split(lines[i], " ")
+
+        if words.len >= 3 then out.push(words[2])
+
+    out
+end cgu_exported
+
+private cgu_has(xs: Buf[string], x: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == x then return true
+
+    false
+end cgu_has
+
+// A module of eight public functions -- spread over the partitions by their names -- each calling a
+// small private helper and reading a private counter, and a `main` calling all eight.
+private cgu_module() -> string
+    var text = "target triple = \"arm64-apple-macosx\"\n\n%pair = type { i32, i32 }\n\n" +
+               "@count = private global i32 0\n@fmt = private constant [4 x i8] c\"%d\\0A\\00\"\n\n" +
+               "declare i32 @printf(ptr, ...)\n\n" +
+               "define private i32 @helper(i32 %x) {\nentry:\n  %y = add i32 %x, 1\n  ret i32 %y\n}\n\n"
+
+    for i in 0..<8
+        text = text + s"define i32 @f$i(i32 %a) {\nentry:\n  %b = call i32 @helper(i32 %a)\n" +
+               "  %c = load i32, ptr @count\n  %d = add i32 %c, %b\n  store i32 %d, ptr @count\n" +
+               "  ret i32 %d\n}\n\n"
+
+    text = text + "define i32 @main() {\nentry:\n"
+
+    for i in 0..<8
+        text = text + s"  %r$i = call i32 @f$i(i32 $i)\n"
+
+    text + "  %n = load i32, ptr @count\n  %p = call i32 (ptr, ...) @printf(ptr @fmt, i32 %n)\n  ret i32 0\n}\n"
+end cgu_module
+
+@test("a module cut into units keeps a small local function local in each unit and shares a local global under a hidden name")
+cgu_a_split_copies_helpers_and_promotes_globals()
+    val parts = split_module(cgu_module(), 4).unwrap()
+
+    assert(parts.len() >= 2, s"${parts.len()} units")
+
+    var defines_helper = 0
+    var defines_count = 0
+    var declares_count: usize = 0
+
+    for i in 0..<parts.len()
+        val p = parts.at(i)
+
+        assert(p.starts_with("target triple = \"arm64-apple-macosx\"\n"), "every unit carries the triple")
+        assert(p.contains("%pair = type { i32, i32 }\n"), "every unit carries the type definitions")
+
+        if p.contains("define private i32 @helper(i32 %x) {") then defines_helper += 1
+        if p.contains("@\"sysl.cgu:count\" = hidden global i32 0\n") then defines_count += 1
+        if p.contains("@\"sysl.cgu:count\" = external hidden global i32\n") then declares_count += 1
+
+        assert(!p.contains("@count "), "no unit names the counter by its private name")
+
+    assert_eq(defines_count, 1)
+    assert_eq(declares_count, parts.len() - 1)
+    assert(defines_helper >= 2, s"the helper is copied into $defines_helper units")
+end cgu_a_split_copies_helpers_and_promotes_globals
+
+@test("a function defined in another unit is declared from its definition's first line")
+cgu_a_function_elsewhere_is_declared()
+    val parts = split_module(cgu_module(), 4).unwrap()
+    var declared = 0
+
+    for k in 0..<8
+        var defined = 0
+
+        for i in 0..<parts.len()
+            if parts.at(i).contains(s"declare i32 @f$k(i32 %a)\n") then declared += 1
+            if parts.at(i).contains(s"define i32 @f$k(i32 %a) {\n") then defined += 1
+
+        assert_eq(defined, 1)
+
+    // Only `main` calls them, so each is declared once where it is not beside `main`.
+    assert(declared >= 1, "a call across units")
+    assert(declared <= 8, s"$declared declarations")
+end cgu_a_function_elsewhere_is_declared
+
+@test("the same text is cut into the same units every time")
+cgu_the_cut_is_deterministic()
+    val a = split_module(cgu_module(), 4).unwrap()
+    val b = split_module(cgu_module(), 4).unwrap()
+
+    assert_eq(a.len(), b.len())
+
+    for i in 0..<a.len()
+        assert(a.at(i) == b.at(i), s"unit $i")
+end cgu_the_cut_is_deterministic
+
+@test("a module holding something that belongs to one module is not cut")
+cgu_module_asm_and_aliases_are_not_cut()
+    assert(split_module("module asm \"nop\"\n" + cgu_module(), 4).is_none(), "module asm")
+    assert(split_module(cgu_module() + "@g = alias i32, ptr @count\n", 4).is_none(), "an alias")
+    assert(split_module(cgu_module(), 1).is_none(), "one unit")
+end cgu_module_asm_and_aliases_are_not_cut
+
+@test("a private global and a private helper used from several units link, and the program prints what one module prints")
+cgu_a_private_symbol_used_from_two_units_links()
+    if !clang_available() || host_target().triple != "arm64-apple-macosx" then return
+
+    val dirs = cgu_begin()
+    val cc = find_clang(host_target(), None).unwrap()
+    val parts = split_module(cgu_module(), 4).unwrap()
+    val objects = compile_units(cc, parts, s"${dirs.0}/split", host_target(), "1", false).unwrap()
+    var args: Buf[string] = buf()
+
+    for i in 0..<objects.len()
+        args.push(objects.at(i))
+
+    args.push("-o")
+    args.push(s"${dirs.0}/split")
+    assert(capture(cc, args.view()).unwrap().status.ok(), "the units link")
+
+    write_text(s"${dirs.0}/whole.ll", cgu_module()).unwrap()
+    assert(capture(cc, ["-Wno-override-module", s"${dirs.0}/whole.ll", "-o", s"${dirs.0}/whole"]).unwrap().status.ok(),
+           "the module links")
+
+    // 1 + 2 + ... + 8, each call adding its argument plus one to the counter.
+    assert_eq(cgu_output(s"${dirs.0}/split"), "36\n")
+    assert_eq(cgu_output(s"${dirs.0}/whole"), "36\n")
+
+    val exported = cgu_exported(s"${dirs.0}/split")
+
+    for i in 0..<exported.len()
+        assert(!exported.at(i).contains("sysl.cgu:"), s"exports ${exported.at(i)}")
+
+    cgu_end(dirs)
+end cgu_a_private_symbol_used_from_two_units_links
+
+// A program with enough in it to spread over four units: a struct, a closure, a string, a trait
+// object, an `@export`, and a loop.
+private cgu_program() -> string = raw"""
+    trait Shape
+        area(self) -> int
+
+    struct Square
+        side: int
+
+    impl Shape for Square
+        area(self) -> int = self.side * self.side
+
+    struct Rect
+        w: int
+        h: int
+
+    impl Shape for Rect
+        area(self) -> int = self.w * self.h
+
+    @export("cgu_twice")
+    twice(n: int) -> int = n * 2
+
+    total(xs: []const &Shape) -> int
+        var t = 0
+
+        for x in xs
+            t += x.area()
+
+        t
+
+    label(n: int) -> string = s"total ${n}"
+
+    val shapes: [2]&Shape = [Square(3), Rect(2, 5)]
+    val add = (a: int) -> a + twice(1)
+
+    print(label(add(total(shapes[..]))))
+    """
+
+@test("a program built as four units prints what the one-unit build prints")
+cgu_a_split_program_runs_the_same()
+    if !cgu_ready() then return
+
+    val dirs = cgu_begin()
+
+    write_text(s"${dirs.0}/main.sysl", cgu_program()).unwrap()
+    cgu_units("1")
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/one")).unwrap()
+    cgu_units("4")
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/four")).unwrap()
+
+    assert_eq(cgu_output(s"${dirs.0}/one"), "total 21\n")
+    assert_eq(cgu_output(s"${dirs.0}/four"), "total 21\n")
+    assert(unit_object_counts().1 >= 2, s"units compiled: ${unit_object_counts().1}")
+    cgu_end(dirs)
+end cgu_a_split_program_runs_the_same
+
+@test("SYSL_CODEGEN_UNITS=1 is the build there always was: the text goes to the link, and the executable is the same bytes")
+cgu_one_unit_is_the_unsplit_build()
+    if !cgu_ready() then return
+
+    val dirs = cgu_begin()
+
+    write_text(s"${dirs.0}/main.sysl", cgu_program()).unwrap()
+    make_dir_all(s"${dirs.0}/a").unwrap()
+    make_dir_all(s"${dirs.0}/b").unwrap()
+
+    // Below the size threshold the default is one unit, which is the path this build always took.
+    cgu_units_default()
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/a/prog")).unwrap()
+    cgu_units("1")
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/b/prog")).unwrap()
+
+    assert(last_link_command().contains(s"${dirs.0}/b/prog.ll"), "the link is handed the text")
+    assert(!last_link_command().contains(".cgu0.o"), "and no unit's object")
+    assert(cgu_same(s"${dirs.0}/a/prog", s"${dirs.0}/b/prog"), "one unit links the default build's bytes")
+    assert_eq(unit_object_counts().1, 0)
+    cgu_end(dirs)
+end cgu_one_unit_is_the_unsplit_build
+
+@test("two four-unit builds of one program are the same bytes, with and without the cache")
+cgu_a_split_build_is_reproducible()
+    if !cgu_ready() then return
+
+    val dirs = cgu_begin()
+
+    write_text(s"${dirs.0}/main.sysl", cgu_program()).unwrap()
+    make_dir_all(s"${dirs.0}/a").unwrap()
+    make_dir_all(s"${dirs.0}/b").unwrap()
+    make_dir_all(s"${dirs.0}/c").unwrap()
+    cgu_units("4")
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/a/prog")).unwrap()
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/b/prog")).unwrap()
+
+    assert(unit_object_counts().0 >= 2, s"the second build's units came from the cache: ${unit_object_counts().0}")
+
+    use_c_object_cache_dir(Some(s"${dirs.1}/other"))
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/c/prog")).unwrap()
+
+    assert(cgu_same(s"${dirs.0}/a/prog", s"${dirs.0}/b/prog"), "a cached rebuild")
+    assert(cgu_same(s"${dirs.0}/a/prog", s"${dirs.0}/c/prog"), "a build compiled afresh")
+    cgu_end(dirs)
+end cgu_a_split_build_is_reproducible
+
+@test("a split build exports nothing it did not name: every one-unit export is there, and no promoted local")
+cgu_a_split_build_exports_no_promoted_name()
+    if !cgu_ready() then return
+
+    val dirs = cgu_begin()
+
+    write_text(s"${dirs.0}/main.sysl", cgu_program()).unwrap()
+    cgu_units("1")
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/one")).unwrap()
+    cgu_units("4")
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/four")).unwrap()
+
+    val one = cgu_exported(s"${dirs.0}/one")
+    val four = cgu_exported(s"${dirs.0}/four")
+
+    assert(cgu_has(four, "_cgu_twice"), "the @export")
+
+    for i in 0..<one.len()
+        assert(cgu_has(four, one.at(i)), s"${one.at(i)} is exported by one unit and not by four")
+
+    for i in 0..<four.len()
+        assert(!four.at(i).contains("sysl.cgu:"), s"exports ${four.at(i)}")
+
+    cgu_end(dirs)
+end cgu_a_split_build_exports_no_promoted_name
+
+@test("build-c in four units writes the same header and an archive defining the same symbols")
+cgu_build_c_keeps_its_header_and_symbols()
+    if !cgu_ready() then return
+
+    val dirs = cgu_begin()
+    val src = "@export(\"cgu_area\")\narea(w: int, h: int) -> int = w * h\n\n" +
+              "@export(\"cgu_greet\")\ngreet(n: int) -> usize = s\"hello $n\".len\n"
+
+    write_text(s"${dirs.0}/lib.sysl", src).unwrap()
+    cgu_units("1")
+    build_c_archive(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/one.a"), Some(s"${dirs.0}/one.h"),
+                    (m) -> ()).unwrap()
+    cgu_units("4")
+    build_c_archive(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/four.a"), Some(s"${dirs.0}/four.h"),
+                    (m) -> ()).unwrap()
+
+    assert(unit_object_counts().1 >= 2, s"units compiled: ${unit_object_counts().1}")
+    assert_eq(read_text(s"${dirs.0}/four.h").unwrap(), read_text(s"${dirs.0}/one.h").unwrap())
+
+    val one = cgu_exported(s"${dirs.0}/one.a")
+    val four = cgu_exported(s"${dirs.0}/four.a")
+
+    assert_eq(join(four.view(), "\n"), join(one.view(), "\n"))
+    cgu_end(dirs)
+end cgu_build_c_keeps_its_header_and_symbols
+
+@test("an edit to one function recompiles only the units whose text changed")
+cgu_an_edit_recompiles_some_units()
+    if !cgu_ready() then return
+
+    val dirs = cgu_begin()
+
+    write_text(s"${dirs.0}/main.sysl", cgu_program()).unwrap()
+    cgu_units("4")
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/prog")).unwrap()
+
+    val made = unit_object_counts().1
+
+    clear_unit_object_counts()
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/prog")).unwrap()
+
+    assert_eq(unit_object_counts().0, made)
+    assert_eq(unit_object_counts().1, 0)
+
+    write_text(s"${dirs.0}/main.sysl", replace_all(cgu_program(), "self.w * self.h", "self.h * self.w + 0")).unwrap()
+    clear_unit_object_counts()
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/prog")).unwrap()
+
+    val (hits, compiled) = unit_object_counts()
+
+    assert(compiled >= 1, s"compiled $compiled")
+    assert(hits >= 1, s"hits $hits of $made")
+    assert_eq(hits + compiled, made)
+    assert_eq(cgu_output(s"${dirs.0}/prog"), "total 21\n")
+    cgu_end(dirs)
+end cgu_an_edit_recompiles_some_units
+
+@test("the unit count: an override is a count from one up, and a small or foreign build is one unit")
+cgu_the_unit_count()
+    cgu_units("3")
+    assert_eq(codegen_units(10, host_target()), 3)
+    cgu_units("1000")
+    assert_eq(codegen_units(10, host_target()), 64)
+    cgu_units("zero")
+    assert_eq(codegen_units(10, host_target()), 1)
+    cgu_units("3")
+    assert_eq(codegen_units(100000000, target_named("thumbv6m-freestanding").unwrap()), 1)
+    cgu_units_default()
+    assert_eq(codegen_units(1000, host_target()), 1)
+    assert(codegen_units(100000000, host_target()) >= 1, "a large program")
+end cgu_the_unit_count
