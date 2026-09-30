@@ -64,6 +64,18 @@ end erase_to
 private erase(cx: &Analyzer, t: TExpr, tr: Type, inner: Type, want: Type, boxed: bool) -> TExpr
     val bound = trait_bound_of(tr)
 
+    // **A `&sync Trait` has forgotten what it points at**, so what an atomic reference asks of its
+    // pointee cannot be asked where the type is written. It is asked here, the one place the type is
+    // known -- and a closure erased into a `&sync Fn` is asked about what it captured.
+    want match
+        Ref(_, sync) ->
+            if sync
+                val why = share_complaint(inner)
+
+                if why.is_some() then return cx.err(t.span, why.unwrap())
+            end if
+        _ -> ()
+
     if !conforms(cx.an, bound, inner)
         // A type an implementation covers is told what that implementation asked of it, since the
         // reason it does not conform is a condition rather than an absence.

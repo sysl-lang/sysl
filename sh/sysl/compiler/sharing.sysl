@@ -86,6 +86,73 @@ private extended_path(path: Buf[string], name: string) -> Buf[string]
     out
 end extended_path
 
+// Why a `&sync T` may not be formed over `inner`, or nothing where it may. The complaint names the
+// part in the way and what to do about it.
+//
+// **A closure is a struct a program wrote and did not name**, so nothing said about one repeats the
+// name the compiler filed it under: it is "a closure", and what is in the way is something "it
+// captures" (`reference/types.md § Function types`).
+share_complaint(inner: Type) -> Option[string]
+    val part = unshareable(inner)
+
+    if part.is_none() then return None
+
+    val p = part.unwrap()
+    val named = !is_closure_literal(inner)
+
+    if named
+        return Some(share_remedy(s"'&sync ${type_show(inner)}' may be reached from two domains at " +
+                                 s"once, so every count inside it has to be atomic — " +
+                                 s"${share_where(p, inner)}, ", p.ty))
+    end if
+
+    val where = if p.path.is_empty() then share_where(p, inner)
+    else s"but the '${joined(p.path, ".")}' it captures reaches a '${type_show(p.ty)}'"
+
+    Some(share_remedy("a closure shared between two domains may be called from either, so every " +
+                      s"count it captures has to be atomic — $where, ", p.ty))
+end share_complaint
+
+// Holds a `&sync T` written at `span` to the rule about what `T` may contain -- now if every type's
+// fields are in, and once they are if not.
+check_shared(a: &Analysis, scope: Scope, span: Span, inner: Type)
+    if a.shares_asked_at_trait then return
+
+    if !a.types_hoisted
+        a.shared_checks.push((inner, scope, span))
+        return
+    end if
+
+    val why = share_complaint(inner)
+
+    if why.is_some() then a.fault(scope, span, why.unwrap())
+end check_shared
+
+// A type a trait implementation's member signature writes, resolved without asking the `&sync`
+// question: the signature restates the trait's, and the trait's own is where it is asked.
+restated(a: &Analysis, resolve: &Fn() -> Type) -> Type
+    val before = a.shares_asked_at_trait
+
+    a.shares_asked_at_trait = true
+
+    val t = resolve()
+
+    a.shares_asked_at_trait = before
+    t
+end restated
+
+// Asks every question `check_shared` had to hold back, now that it has an answer.
+settle_shared_checks(a: &Analysis)
+    a.types_hoisted = true
+
+    for i in 0..<a.shared_checks.len()
+        val c = a.shared_checks.at(i)
+
+        check_shared(a, c.1, c.2, c.0)
+
+    a.shared_checks = buf()
+end settle_shared_checks
+
 // Why a value may not be handed to a `@crossing` parameter, or nothing where it may.
 //
 // `subject` is the caller's words for what is crossing -- the argument, or what the argument points
