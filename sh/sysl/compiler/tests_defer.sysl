@@ -1,0 +1,888 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The reference's `DeferTests`: `defer`, scope exit for what the language does not own
+// (`reference/memory.md § Where defer sits`).
+//
+// Almost everything here builds a program and runs it, because the order things happened in is the
+// whole content of the form and it is not visible in the lowered text: a deferred statement is laid
+// down at each edge that leaves its block, so reading one edge says nothing about the others. What
+// is pinned is what the chapter claims -- it runs at the end of its **block**, on every ordinary
+// exit including `?`, last-registered-first, only if control reached it, and never on a trap.
+//
+// **Every output, exit status and diagnostic here was read out of the reference compiler (0.0.152)**
+// by handing the installed `sysl` the same program. Positions are the reference's `line:column`; the
+// extent a caret underlines is the open span divergence and is not asserted.
+
+// What a program does: what it printed and the status it exited with, as a shell reports one. A
+// failure to build is its message and `-1`, which no program exits with.
+private dfr_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-dfr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end dfr_outcome
+
+// The program prints exactly this and leaves with this status -- both, so that a build that failed
+// cannot pass for a program that stopped. Returns at once without the library.
+private dfr_leaves(text: string, want: string, code: int)
+    if xvr_no_library() then return
+
+    val out = dfr_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, code)
+end dfr_leaves
+
+// The program runs to the end and prints exactly this.
+private dfr_prints(text: string, want: string) = dfr_leaves(text, want, 0)
+
+// The build is refused with this message and no other, anchored at this `line:column` of
+// `main.sysl`.
+private dfr_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val out = dfr_outcome(text)
+    val said = out.0
+
+    assert_eq(out.1, -1)
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+    val first = said.index_of("error: ").unwrap_or(0)
+
+    assert(!said[first + 7..<said.len].contains("error: "), said)
+end dfr_refused
+
+// The body of `@main`, from its `define` to the closing brace.
+private dfr_main_of(ir: string) -> string
+    val at = ir.index_of("define i32 @main(").unwrap_or(0)
+    val rest = ir[at..<ir.len]
+    val close = rest.index_of("\n}").unwrap_or(rest.len)
+
+    rest[0..<close]
+end dfr_main_of
+
+// The entry point's lowered text, or nothing without the library.
+private dfr_main_ir(text: string) -> Option[string]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-dfr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val made = emit_llvm_text(root, None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    made match
+        Err(why) ->
+            assert(false, failure_text(why))
+            None
+        Ok(emitted) ->
+            assert(emitted.report.is_empty(), analysis_report(emitted.report))
+            Some(dfr_main_of(emitted.text))
+end dfr_main_ir
+
+// Every array the escape analysis moved to the heap, one `function: name` line each, the entry
+// file's own statements under `<entry>`. Nothing without the library.
+private dfr_promoted(text: string) -> Option[string]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-dfr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val program = packaged_compilation_of(root, host_target()) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return None
+        Ok(read) -> read
+
+    val done = analyze_bodies(program.units, program.target)
+    val whole = program_of(done, done.main_module)
+    val moved = post_analysis_checks(done.an, whole, program.own)
+
+    remove_dir_all(root).unwrap_or(())
+
+    var out = ""
+
+    for i in 0..<moved.by_func.len()
+        val (name, names) = moved.by_func.at(i)
+
+        for j in 0..<names.len()
+            out = out + s"$name: ${names.at(j)}\n"
+
+    for i in 0..<moved.in_main.len()
+        out = out + s"<entry>: ${moved.in_main.at(i)}\n"
+
+    Some(out)
+end dfr_promoted
+
+// The file built as a test binary and run: each test's name and what it failed with, `passed`
+// where it did not. Nothing where the library or a toolchain is not on this machine.
+private dfr_verdicts(text: string) -> Option[string]
+    if !(std_root().is_ok() && clang_available()) then return None
+
+    val root = make_temp_dir("sysl-dfr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val build = test_build_of(root, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(refusal))
+            return None
+        Ok(made) -> made
+
+    if !build.emitted.report.is_empty()
+        remove_dir_all(root).unwrap_or(())
+        assert(false, analysis_report(build.emitted.report))
+        return None
+    end if
+
+    val exe = build_test_binary(root, build, None, DefaultOptimization) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return None
+        Ok(built) -> built
+
+    val opts = TestOptions(None, false)
+    val chosen = selected_tests(build.tests, opts.filter)
+    val ran = run_selected(exe, chosen, opts, build.tests.len() - chosen.len(), piece -> ())
+
+    discard_test_binary(exe)
+    remove_dir_all(root).unwrap_or(())
+
+    var out = ""
+
+    for i in 0..<ran.len()
+        out = out + s"${ran.at(i).test.display}: ${ran.at(i).detail.unwrap_or("passed")}\n"
+
+    Some(out)
+end dfr_verdicts
+
+// -- when a deferred statement runs ----------------------------------------------------------------
+
+@test("at the end of the block, after everything written after it")
+dfr_at_the_end_of_the_block()
+    dfr_prints(raw"""
+        print("open")
+        defer print("close")
+        print("work")
+        """, "open\nwork\nclose\n")
+
+// The registration is the only thing that happens where the `defer` stands. If the statement ran
+// there instead, this would print in written order and the form would be nothing.
+@test("and not where it is written")
+dfr_not_where_it_is_written()
+    dfr_prints(raw"""
+        defer print("last")
+        print("first")
+        """, "first\nlast\n")
+
+@test("on an early return, before the caller sees the result")
+dfr_on_an_early_return()
+    dfr_prints(raw"""
+        f(early: bool) -> int
+            defer print("cleanup")
+            if early then return 1
+            2
+
+        print(f(true))
+        print(f(false))
+        """, "cleanup\n1\ncleanup\n2\n")
+
+// `?` is the ordinary way to leave a function, so a form that did not fire on it would miss the
+// exit that matters most.
+@test("on the failure arm of a '?'")
+dfr_on_the_failure_arm_of_a_try()
+    dfr_prints(raw"""
+        parse(ok: bool) -> Result[int, string] =
+            if ok then Ok(7) else Err("bad")
+
+        use(ok: bool) -> Result[int, string]
+            defer print("released")
+            var n = parse(ok)?
+            Ok(n + 1)
+
+        use(true) match
+            Ok(v) -> print("ok", v)
+            Err(e) -> print("err", e)
+
+        use(false) match
+            Ok(v) -> print("ok", v)
+            Err(e) -> print("err", e)
+        """, "released\nok 8\nreleased\nerr bad\n")
+
+// The trailing expression is the function's result and the deferred statement runs after it is
+// computed, so a defer that changes what was already returned cannot change the result.
+@test("after the returned value has been computed")
+dfr_after_the_returned_value()
+    dfr_prints(raw"""
+        f() -> int
+            var n = 1
+            defer n = 99
+            n
+
+        print(f())
+        """, "1\n")
+
+// -- the block it belongs to -----------------------------------------------------------------------
+
+// The case that decided block scope over function scope: each iteration closes what it opened,
+// where under function scope all three would print after the loop.
+@test("is the loop body, so each iteration runs its own")
+dfr_the_loop_body()
+    dfr_prints(raw"""
+        for i in 0..<3
+            print("open", i)
+            defer print("close", i)
+            print("use", i)
+        """, "open 0\nuse 0\nclose 0\nopen 1\nuse 1\nclose 1\nopen 2\nuse 2\nclose 2\n")
+
+@test("is the branch arm, so an arm not taken schedules nothing")
+dfr_the_branch_arm()
+    dfr_prints(raw"""
+        f(t: bool)
+            if t
+                defer print("then")
+                print("in then")
+            else
+                defer print("else")
+                print("in else")
+            print("after")
+
+        f(true)
+        f(false)
+        """, "in then\nthen\nafter\nin else\nelse\nafter\n")
+
+@test("is the function body when that is where it was written")
+dfr_the_function_body()
+    dfr_prints(raw"""
+        f()
+            defer print("body end")
+            if true
+                print("inner")
+            print("still in body")
+
+        f()
+        print("returned")
+        """, "inner\nstill in body\nbody end\nreturned\n")
+
+// A `defer` in an inner block must not wait for the outer one, and the outer must still run after
+// it -- one test for both halves, the mistake being the nesting order written backwards.
+@test("nests, innermost block first")
+dfr_nests_innermost_first()
+    dfr_prints(raw"""
+        defer print("outer")
+        if true
+            defer print("inner")
+            print("work")
+        print("between")
+        """, "work\ninner\nbetween\nouter\n")
+
+// -- leaving from the middle -----------------------------------------------------------------------
+
+@test("runs a loop body's defer before the 'break' takes effect")
+dfr_before_the_break()
+    dfr_prints(raw"""
+        for i in 0..<5
+            defer print("close", i)
+            if i == 1 then break
+            print("use", i)
+        print("after")
+        """, "use 0\nclose 0\nclose 1\nafter\n")
+
+@test("runs it on a 'continue' too")
+dfr_on_a_continue()
+    dfr_prints(raw"""
+        for i in 0..<3
+            defer print("close", i)
+            if i == 1 then continue
+            print("use", i)
+        print("after")
+        """, "use 0\nclose 0\nclose 1\nuse 2\nclose 2\nafter\n")
+
+// A `return` from inside a loop leaves two blocks at once, so both scopes' deferred statements
+// run, innermost first.
+@test("runs every enclosing block's defers on a return from inside a loop")
+dfr_a_return_from_inside_a_loop()
+    dfr_prints(raw"""
+        f() -> int
+            defer print("function")
+            for i in 0..<3
+                defer print("loop", i)
+                if i == 1 then return i
+            9
+
+        print(f())
+        """, "loop 0\nloop 1\nfunction\n1\n")
+
+// -- several in one block --------------------------------------------------------------------------
+
+@test("run last-registered-first")
+dfr_last_registered_first()
+    dfr_prints(raw"""
+        defer print("c")
+        defer print("b")
+        defer print("a")
+        print("body")
+        """, "body\na\nb\nc\n")
+
+// Last-in-first-out is what lets a later defer depend on an earlier one's resource still being
+// there, written as an ordering a first-in-first-out implementation gets exactly backwards.
+@test("so a later one may rely on what an earlier one has not yet undone")
+dfr_a_later_one_relies_on_an_earlier()
+    dfr_prints(raw"""
+        var log = ""
+        defer print(log)
+        defer log = log + "outer "
+        defer log = log + "inner "
+        log = "start "
+        """, "start inner outer \n")
+
+// -- only if control reached it --------------------------------------------------------------------
+
+@test("one after an early return never registers")
+dfr_one_after_an_early_return()
+    dfr_prints(raw"""
+        f(early: bool)
+            defer print("first")
+            if early then return
+            defer print("second")
+
+        f(true)
+        print("--")
+        f(false)
+        """, "first\n--\nsecond\nfirst\n")
+
+@test("one in a loop that never iterates schedules nothing")
+dfr_a_loop_that_never_iterates()
+    dfr_prints(raw"""
+        for i in 0..<0
+            defer print("never")
+        print("done")
+        """, "done\n")
+
+// -- what it costs ---------------------------------------------------------------------------------
+
+// It allocates nothing and takes no count, which is what keeps it usable under `no alloc` --
+// asserted at the capability, which is the surface that would refuse it.
+@test("nothing that 'no alloc' forbids")
+dfr_nothing_no_alloc_forbids()
+    dfr_prints(raw"""
+        @no_alloc
+
+        f() -> i32
+            defer print("released")
+            7i32
+
+        print(f())
+        """, "released\n7\n")
+
+// The statement is laid down at each edge, so a block with one exit carries one copy and there is no
+// run-time list of deferred statements to consult.
+@test("no registration at the point the 'defer' stands")
+dfr_no_registration_where_it_stands()
+    val main = dfr_main_ir(raw"""
+        defer print("x")
+        print("y")
+        """)
+
+    main match
+        None -> ()
+        Some(ir) ->
+            assert(ir.contains("define i32 @main("), ir)
+            assert(!ir.contains("defer"), ir)
+            assert(!ir.contains("alloca"), ir)
+end dfr_no_registration_where_it_stands
+
+// -- what it is refused for, and why ---------------------------------------------------------------
+
+@test("a 'return', which would leave a block already being left")
+dfr_a_return_is_refused()
+    dfr_refused(raw"""
+        f() -> int
+            defer return 1
+            2
+        """, "a deferred statement runs while its block is being left, so it cannot 'return' — " +
+                 "there is no exit left to take. Compute what the function returns before the block ends",
+                "2:5")
+
+// The reference's own case. **It doubles as the guard on what a refused statement becomes**: a
+// build lowers the tree it was handed whether or not the analysis complained, and a `break` left
+// scheduled is an edge that runs the deferred statements, of which it is one -- a lowering that
+// followed it would never come back, and the build would end in a fault instead of this diagnostic.
+@test("a 'break', for the same reason")
+dfr_a_break_is_refused()
+    dfr_refused(raw"""
+        for i in 0..<3
+            defer break
+        """, "a deferred statement runs while its block is being left, so it cannot 'break' or " +
+                 "'continue' — the loop edge it would take is the one already being taken", "2:5")
+
+@test("a '?', which is the same exit written as an operator")
+dfr_a_try_is_refused()
+    dfr_refused(raw"""
+        parse() -> Result[int, string] = Ok(1)
+
+        f() -> Result[int, string]
+            defer parse()?
+            Ok(2)
+        """, "a deferred statement runs while its block is being left, so a '?' in it has nowhere " +
+                 "to return to. Check the result and handle the failure in the deferred statement itself",
+                "4:5")
+
+@test("a declaration, whose name nothing could ever read")
+dfr_a_declaration_is_refused()
+    dfr_refused(raw"""
+        f()
+            defer var x = 1
+        """, "a deferred declaration binds a name that dies the moment the statement finishes, so " +
+                 "nothing could read it — defer what uses the value instead of what declares it", "2:5")
+
+@test("another 'defer', which would schedule a scheduling")
+dfr_another_defer_is_refused()
+    dfr_refused(raw"""
+        f()
+            defer defer print("x")
+        """, "'defer' schedules a statement, and scheduling a scheduling has nothing to run: write " +
+                 "the statement itself after this 'defer'", "2:5")
+
+// The three below are this compiler's own, beside the reference's 'break': each is the same refusal
+// reached where the refused statement would otherwise have been lowered -- a `continue` in the
+// entry file's loop, and a `return` and a `?` in a function the program CALLS, a function nothing
+// calls being pruned before it is lowered. The `return` names nothing that exists, and the refusal is
+// still the only thing said: nothing of a refused statement is read past the refusal.
+
+@test("a refused 'continue' is not scheduled either")
+dfr_a_refused_continue_is_not_scheduled()
+    dfr_refused(raw"""
+        for i in 0..<3
+            defer continue
+        """, "a deferred statement runs while its block is being left, so it cannot 'break' or " +
+                 "'continue' — the loop edge it would take is the one already being taken", "2:5")
+
+@test("a refused 'return' in a function the program calls is one diagnostic")
+dfr_a_refused_return_is_one_diagnostic()
+    dfr_refused(raw"""
+        f() -> int
+            defer return nope
+            2
+
+        print(f())
+        """, "a deferred statement runs while its block is being left, so it cannot 'return' — " +
+                 "there is no exit left to take. Compute what the function returns before the block ends",
+                "2:5")
+
+@test("a refused '?' in a function the program calls is not scheduled")
+dfr_a_refused_try_is_not_scheduled()
+    dfr_refused(raw"""
+        parse() -> Result[int, string] = Ok(1)
+
+        f() -> Result[int, string]
+            defer parse()?
+            Ok(2)
+
+        f() match
+            Ok(v) -> print(v)
+            Err(e) -> print(e)
+        """, "a deferred statement runs while its block is being left, so a '?' in it has nowhere " +
+                 "to return to. Check the result and handle the failure in the deferred statement itself",
+                "4:5")
+
+// -- against the rest of the memory model ----------------------------------------------------------
+
+// The load-bearing ordering claim: a deferred statement runs before its block's counts are given
+// back, so the local holding the resource is still alive. A counted value read in the defer proves
+// it -- were the release first, this would read freed storage.
+@test("a deferred statement still sees the block's counted locals")
+dfr_still_sees_counted_locals()
+    dfr_prints(raw"""
+        struct Box
+            n: int
+
+        f()
+            var b: &Box = Box(42)
+            defer print("closing", b.n)
+            print("using", b.n)
+
+        f()
+        """, "using 42\nclosing 42\n")
+
+// The outer scope's counts must outlive the inner scope's deferred statement, which is what
+// unwinding outward one scope at a time buys.
+@test("an inner block's defer may name an outer block's local")
+dfr_an_inner_defer_names_an_outer_local()
+    dfr_prints(raw"""
+        struct Box
+            n: int
+
+        f()
+            var b: &Box = Box(7)
+            if true
+                defer print("inner sees", b.n)
+                print("inner")
+            print("outer")
+
+        f()
+        """, "inner\ninner sees 7\nouter\n")
+
+// A deferred statement is still a statement of the body, so a view it lets out of the frame has to
+// be seen -- the array is promoted to the heap or the slice reads a dead frame. A walk that stopped
+// at a `defer` would compile this silently and the reads below would be of storage that is gone.
+//
+// The reference asserts its one note, `'xs' is promoted to the heap`; this compiler carries no
+// notes, so what is asserted is the promotion itself: one array, `xs`, in `f`.
+@test("a view let out by a deferred statement still promotes its array")
+dfr_a_view_let_out_promotes_its_array()
+    val src = raw"""
+        struct Sink
+            v: []int
+
+        f(s: &Sink)
+            var xs = [1, 2, 3]
+            defer s.v = xs[..]
+
+        var sink: &Sink = Sink([0])
+        f(sink)
+        print(sink.v[0], sink.v[1], sink.v[2])
+        """
+
+    dfr_promoted(src) match
+        None -> ()
+        Some(moved) -> assert_eq(moved, "f: xs\n")
+
+    dfr_prints(src, "1 2 3\n")
+end dfr_a_view_let_out_promotes_its_array
+
+// The function whose only call site is a deferred statement must survive pruning -- the failure
+// would be a link error rather than a wrong answer.
+@test("a function called only from a deferred statement is not pruned")
+dfr_called_only_from_a_defer()
+    dfr_prints(raw"""
+        release()
+            print("released")
+
+        f()
+            defer release()
+            print("working")
+
+        f()
+        """, "working\nreleased\n")
+
+// -- what the chapters claim -----------------------------------------------------------------------
+
+// A trap aborts without stack cleanup. Asserted through the exit status rather than through output,
+// because a trap does not flush: a program whose deferred statement is `exit(0)` exits zero if
+// defers ran on the trap path and with the trap's status if they did not.
+@test("a trap runs no deferred statement")
+dfr_a_trap_runs_no_defer()
+    dfr_leaves(raw"""
+        f()
+            var xs = [1, 2, 3]
+            var i = 5
+            defer exit(0)
+            print(xs[i])
+
+        f()
+        """, "", 133)
+
+// The same program with the trap removed must exit through the defer, or the test above would pass
+// for a compiler that never ran a deferred statement at all.
+@test("and the same program without the trap exits through it")
+dfr_without_the_trap_exits_through_it()
+    dfr_leaves(raw"""
+        f()
+            var xs = [1, 2, 3]
+            var i = 1
+            defer exit(3)
+            print(xs[i])
+
+        f()
+        """, "2\n", 3)
+
+// The chapter names the loop body as a block without saying which loop, so each form is asked. Both
+// read `i` at its exit-time value, per the rule pinned below.
+@test("a 'while' body is a block like any other")
+dfr_a_while_body()
+    dfr_prints(raw"""
+        var i = 0
+        while i < 2
+            defer print("close", i)
+            print("use", i)
+            i += 1
+        """, "use 0\nclose 1\nuse 1\nclose 2\n")
+
+@test("so is a 'loop' body")
+dfr_a_loop_body()
+    dfr_prints(raw"""
+        var i = 0
+        loop
+            defer print("close", i)
+            if i == 1 then break
+            print("use", i)
+            i += 1
+        """, "use 0\nclose 1\nclose 1\n")
+
+// The whole statement runs later, so everything in it is read at exit -- where eager capture of a
+// deferred call's arguments would print the other number and need a slot to hold it in.
+@test("a deferred statement reads its variables at exit, not at registration")
+dfr_reads_its_variables_at_exit()
+    dfr_prints(raw"""
+        f()
+            var n = 1
+            defer print("n at exit:", n)
+            n = 2
+            print("n now:", n)
+
+        f()
+        """, "n now: 2\nn at exit: 2\n")
+
+@test("so is a 'match' arm")
+dfr_a_match_arm()
+    dfr_prints(raw"""
+        f(n: int)
+            n match
+                0 ->
+                    defer print("zero out")
+                    print("zero in")
+                _ ->
+                    defer print("other out")
+                    print("other in")
+            print("after")
+
+        f(0)
+        f(1)
+        """, "zero in\nzero out\nafter\nother in\nother out\nafter\n")
+
+// A nested function is a function, so its body is a block and its defers are its own rather than the
+// enclosing body's.
+@test("a nested function's defers belong to the nested function")
+dfr_a_nested_functions_defers()
+    dfr_prints(raw"""
+        outer()
+            inner()
+                defer print("inner out")
+                print("inner in")
+
+            defer print("outer out")
+            inner()
+            print("outer in")
+
+        outer()
+        """, "inner in\ninner out\nouter in\nouter out\n")
+
+@test("a closure body is a block too")
+dfr_a_closure_body()
+    dfr_prints(raw"""
+        var f: &Fn(int) -> int = n ->
+            defer print("in closure")
+            n * 2
+
+        print(f(21))
+        """, "in closure\n42\n")
+
+// A postcondition is checked before the function returns and a deferred statement is cleanup that
+// runs after the result is fixed -- the reverse order would let cleanup invalidate what was checked.
+@test("an 'ensure' is checked before the deferred statement runs")
+dfr_an_ensure_is_checked_first()
+    dfr_prints(raw"""
+        f() -> int
+            ensure result == 1
+            defer print("after the check")
+            1
+
+        print(f())
+        """, "after the check\n1\n")
+
+// A `@test` function is an ordinary body the runner calls. The inner block is what makes the defer
+// observable: one at the top of the test would run after the assertion that has to check it.
+@test("a '@test' function's body is a block like any other")
+dfr_a_test_functions_body()
+    val ran = dfr_verdicts(raw"""
+        @test
+        t() =
+            var log = ""
+            if true
+                defer log = log + "torn "
+                log = log + "in "
+            assert(log == "in torn ", "the defer ran at the end of the inner block")
+        """)
+
+    ran match
+        None -> ()
+        Some(verdicts) -> assert_eq(verdicts, "t: passed\n")
+end dfr_a_test_functions_body
+
+// -- the edges -------------------------------------------------------------------------------------
+
+@test("a defer alone in a body still runs")
+dfr_alone_in_a_body()
+    dfr_prints(raw"""
+        f()
+            defer print("only")
+
+        f()
+        """, "only\n")
+
+// Two loops and a function body, left at once: every scope between the `return` and the function
+// runs its own, innermost first.
+@test("a return from two loops deep runs all three scopes' defers")
+dfr_a_return_from_two_loops_deep()
+    dfr_prints(raw"""
+        f() -> int
+            defer print("function")
+            for i in 0..<2
+                defer print("outer loop", i)
+                for j in 0..<2
+                    defer print("inner loop", j)
+                    if j == 1 then return 5
+            0
+
+        print(f())
+        """, "inner loop 0\ninner loop 1\nouter loop 0\nfunction\n5\n")
+
+// A deferred statement is an ordinary statement, so a function it calls has its own defers and they
+// run inside it. The nesting must not flatten into one list.
+@test("a deferred call's own defers run inside it")
+dfr_a_deferred_calls_own_defers()
+    dfr_prints(raw"""
+        inner()
+            defer print("inner out")
+            print("inner in")
+
+        f()
+            defer inner()
+            print("body")
+
+        f()
+        print("done")
+        """, "body\ninner in\ninner out\ndone\n")
+
+// A `defer` written inside a nested block registers against that block, so a second one in the outer
+// block runs after it even though it was written later.
+@test("written order across nesting is not run order")
+dfr_written_order_is_not_run_order()
+    dfr_prints(raw"""
+        if true
+            defer print("inner")
+            print("in block")
+        defer print("outer, written second")
+        print("after block")
+        """, "in block\ninner\nafter block\nouter, written second\n")
+
+// A branch used as a value computes it and then leaves the block, so the defer runs after the value
+// is fixed -- the rule the function result follows.
+@test("a block used as a value runs its defers after the value is computed")
+dfr_a_block_used_as_a_value()
+    dfr_prints(raw"""
+        f(c: bool) -> int
+            var n = 1
+            var got = if c
+                defer n = 99
+                n
+            else
+                0
+            print("n after:", n)
+            got
+
+        print(f(true))
+        """, "n after: 99\n1\n")
+
+// A deferred statement carrying its own branch makes the teardown walk re-entrant. Counted locals on
+// both sides of it, and a `return` from the middle so the whole-function unwind is the path taken.
+@test("a deferred statement may itself branch, while the scopes are being unwound")
+dfr_a_deferred_statement_may_branch()
+    dfr_prints(raw"""
+        struct Box
+            n: int
+
+        f(c: bool) -> int
+            var a: &Box = Box(1)
+            for i in 0..<2
+                var b: &Box = Box(2)
+                defer if c then print("chose", a.n, b.n) else print("other", b.n)
+                if i == 1 then return a.n + b.n
+            0
+
+        print(f(true))
+        print(f(false))
+        """, "chose 1 2\nchose 1 2\n3\nother 2\nother 2\n3\n")
+
+// A multi-assignment is a statement in its own right (`reference/expressions.md § Several places at
+// once`), and deferring one reaches the arm-walking every pass does through a shape it does not
+// otherwise meet inside a `defer`.
+@test("a multi-assignment may be the deferred statement")
+dfr_a_multi_assignment_deferred()
+    dfr_prints(raw"""
+        f()
+            var a = 1
+            var b = 2
+            defer print(a, b)
+            defer a, b = b, a
+            print(a, b)
+
+        f()
+        """, "1 2\n2 1\n")
+
+// A loop's `else` runs when the loop ends without breaking, and it is its own block.
+@test("a loop's 'else' block carries its own")
+dfr_a_loops_else_block()
+    dfr_prints(raw"""
+        for i in 0..<2
+            print("body", i)
+        else
+            defer print("else out")
+            print("else in")
+        """, "body 0\nbody 1\nelse in\nelse out\n")
+
+// -- a real resource -------------------------------------------------------------------------------
+
+// What the form exists for, run against libc rather than simulated: the descriptor is closed on the
+// failure path without the failure path saying so.
+@test("closes a descriptor on the path that did not open successfully")
+dfr_closes_a_descriptor()
+    dfr_prints(raw"""
+        extern open(path: *u8, flags: i32) -> i32
+        extern close(fd: i32) -> i32
+
+        read_it() -> Result[int, string]
+            var fd = open(c"/etc/hosts", 0i32)
+            if fd < 0i32 then return Err("cannot open")
+            defer close(fd)
+
+            if fd >= 0i32 then return Err("gave up early")
+            Ok(int(fd))
+
+        read_it() match
+            Ok(v) -> print("ok", v)
+            Err(e) -> print("err", e)
+        """, "err gave up early\n")
