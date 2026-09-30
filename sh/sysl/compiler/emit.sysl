@@ -171,6 +171,14 @@ struct Emit
     defers: Buf[TStmt]
     defer_marks: Buf[usize]
 
+    // The registers this body has named for a local's storage, and the locals whose address has been
+    // named more than once: a deferred statement is laid down at every edge that leaves its block,
+    // so a local it declares is declared once per edge. A slot is shared by every laying; an address
+    // an instruction computes cannot be, and a pair is the name the program's tree uses and the name
+    // the latest laying's address has.
+    declared: Set[string]
+    relaid: Buf[(string, string)]
+
     // The names whose array lives in a buffer rather than a slot, because a view of it gets out of
     // this frame, and the box each of those buffers is. The **temporaries** are whole-program rather
     // than per-function, since a span already says which body a node is in.
@@ -328,6 +336,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
     var owned_marks: Buf[usize] = buf()
     var defers: Buf[TStmt] = buf()
     var defer_marks: Buf[usize] = buf()
+    var relaid: Buf[(string, string)] = buf()
     var promoted: Buf[string] = buf()
     var promoted_boxes: Buf[(string, Val)] = buf()
     var promoted_temps: Buf[Span] = buf()
@@ -341,7 +350,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          foreigns, variadics, variadic_types, export_symbols, ensures, None, "", tail_calls, tail_params,
          "", self_params, None, ghost_funcs, destructors, false, false, false,
          false, boxes, bufs, requested, requested_set, queue, temps, temp_marks, owned_slots, owned_marks, defers,
-         defer_marks, promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
+         defer_marks, set(), relaid, promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
          set(), set(), map(), map(), false, None)
 end emitter_for
 
@@ -392,6 +401,8 @@ start_function(e: *Emit)
     e.owned_marks.clear()
     e.defers.clear()
     e.defer_marks.clear()
+    e.declared.clear()
+    e.relaid.clear()
     e.promoted_boxes.clear()
     e.ref_places.clear()
     e.caller_exposed = exposed_unknown()
@@ -426,6 +437,58 @@ end emit_alloca
 
 // A slot with whatever boundary the type it holds already asks for.
 alloca(e: *Emit, name: Val, ty: LType) -> Val = emit_alloca(e, name, ty, None)
+
+// -- a local's storage, by name ---------------------------------------------------------------------
+
+// A name is unique within a function, so a local's storage is simply named for it. **A declaration
+// can be lowered more than once**, though: a deferred statement is laid down at every edge that
+// leaves its block, and each laying declares the statement's locals again. Two definitions of one
+// name are not a function, and the two kinds of storage answer that differently.
+
+// A slot named for something the program declared, laid down once however many times the
+// declaration is lowered. Every laying of a deferred statement stores into the one slot: a body
+// runs on one edge at a time and each laying writes the local before it reads it, so they never
+// need two.
+named_alloca(e: *Emit, slot: string, ty: LType, align: Option[int]) -> Val
+    if e.declared.add(slot) then emit_alloca(e, VReg(slot), ty, align)
+
+    VReg(slot)
+end named_alloca
+
+// The slot a local's own declaration lays down, `%name.addr`.
+local_alloca(e: *Emit, name: string, ty: LType) -> Val = named_alloca(e, s"$name.addr", ty, None)
+
+// Names a local whose address is a register an instruction defines where it stands -- a `ref`, and
+// an array moved to a buffer. A register is defined once, so every laying after the first takes a
+// name of its own -- `r.d1`, `r.d2` -- and the uses that follow it, which belong to the same
+// laying, read that.
+declare_local(e: *Emit, name: string) -> string
+    if e.declared.add(s"$name.addr") then return name
+
+    var n = 1
+
+    for i in 0..<e.relaid.len()
+        if e.relaid.at(i).0 == name then n += 1
+
+    val own = s"$name.d$n"
+
+    e.relaid.push((name, own))
+    own
+end declare_local
+
+// The storage name a use of a local means: the one its most recent declaration took. Layings are
+// lowered one after another and never inside one another, so the most recent is the use's own.
+local_name(e: *Emit, name: string) -> string
+    for i in 0..<e.relaid.len()
+        val r = e.relaid.at(e.relaid.len() - 1 - i)
+
+        if r.0 == name then return r.1
+
+    name
+end local_name
+
+// The address a local lives at, for a use of it.
+local_slot(e: *Emit, name: string) -> Val = VReg(s"${local_name(e, name)}.addr")
 
 // The one overload of `llvm.memcpy` this compiler emits, so the two sites that name it -- the
 // declaration and the call -- cannot spell it differently. Both pointers are in the default address

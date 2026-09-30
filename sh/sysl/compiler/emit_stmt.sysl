@@ -25,8 +25,9 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
         else
             // The slot is laid down **before** the initializer runs, because a large one is written
             // into it rather than handed to it.
-            emit_alloca(e, VReg(s"$name.addr"), lty(e, ty), int_align(align))
-            gen_into(e, VReg(s"$name.addr"), init)
+            val slot = named_alloca(e, s"$name.addr", lty(e, ty), int_align(align))
+
+            gen_into(e, slot, init)
             own_slot(e, name, ty)
 
     // `ref name = place`. The walk to the place is made **once**, here, and its result becomes the
@@ -42,12 +43,17 @@ private gen_stmt_body(e: *Emit, s: TStmt) = s match
         // What keeps the storage alive belongs to the place, and the name that replaces the path has
         // no declaration to read it off -- so it is recorded here and asked for at every view taken
         // through the name.
-        e.ref_places.push((name, place))
+        //
+        // **A declaration nothing reaches takes no name**: its instruction is dropped, so a name
+        // taken for it would be one nothing defines.
+        val own = if e.terminated then local_name(e, name) else declare_local(e, name)
+
+        e.ref_places.push((own, place))
 
         var idx: Buf[IrArg] = buf()
 
         idx.push(ir_arg(LInt(64), VInt(from_int(0))))
-        emit(e, InGep(VReg(s"$name.addr"), LInt(8), base, idx))
+        emit(e, InGep(VReg(s"$own.addr"), LInt(8), base, idx))
 
     TExprStmt(expr) -> gen_expr(e, expr)
 
@@ -657,6 +663,8 @@ end emit_ensures
 // type.
 private gen_variant_check(e: *Emit, slot: string, var_ty: Type, expr: TExpr)
     val w = lty(e, var_ty)
+    val armed_at = VReg(s"$slot.armed")
+    val prev_at = VReg(s"$slot.prev")
 
     push_temps(e)
 
@@ -666,7 +674,7 @@ private gen_variant_check(e: *Emit, slot: string, var_ty: Type, expr: TExpr)
 
     val armed_v = fresh_reg(e)
 
-    emit(e, InLoad(armed_v, l_i1(), VReg(s"$slot.armed"), AccPlain, None))
+    emit(e, InLoad(armed_v, l_i1(), armed_at, AccPlain, None))
 
     val cmp_l = fresh_label(e, "variant.cmp")
     val set_l = fresh_label(e, "variant.set")
@@ -676,7 +684,7 @@ private gen_variant_check(e: *Emit, slot: string, var_ty: Type, expr: TExpr)
 
     val prev = fresh_reg(e)
 
-    emit(e, InLoad(prev, w, VReg(s"$slot.prev"), AccPlain, None))
+    emit(e, InLoad(prev, w, prev_at, AccPlain, None))
 
     val ok = fresh_reg(e)
 
@@ -684,8 +692,8 @@ private gen_variant_check(e: *Emit, slot: string, var_ty: Type, expr: TExpr)
     trap_unless(e, ok, "variant")
     emit_term(e, InBr(set_l))
     emit_label(e, set_l)
-    emit(e, InStore(w, cur, VReg(s"$slot.prev"), AccPlain, None))
-    emit(e, InStore(l_i1(), VInt(from_int(1)), VReg(s"$slot.armed"), AccPlain, None))
+    emit(e, InStore(w, cur, prev_at, AccPlain, None))
+    emit(e, InStore(l_i1(), VInt(from_int(1)), armed_at, AccPlain, None))
 end gen_variant_check
 
 // Checks a struct value against its `invariant` function: read each stored field out of the

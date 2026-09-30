@@ -350,9 +350,11 @@ gen_for_each(e: *Emit, name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt]
     val ev = fresh_reg(e)
 
     emit(e, InLoad(ev, lty(e, elem_ty), ep, AccPlain, None))
-    alloca(e, VReg(s"$name.addr"), lty(e, elem_ty))
+
+    val home = local_alloca(e, name, lty(e, elem_ty))
+
     retain_value(e, elem_ty, ev)
-    emit(e, InStore(lty(e, elem_ty), ev, VReg(s"$name.addr"), AccPlain, None))
+    emit(e, InStore(lty(e, elem_ty), ev, home, AccPlain, None))
     push_owned(e)
     own_slot(e, name, elem_ty)
     gen_stmts(e, body)
@@ -384,9 +386,11 @@ gen_iterate(e: *Emit, cursor: string, cursor_ty: Type, init: TExpr, next: TExpr,
     val iv = gen_expr(e, init)
 
     push_owned(e)
-    alloca(e, VReg(s"$cursor.addr"), lty(e, cursor_ty))
+
+    val kept = local_alloca(e, cursor, lty(e, cursor_ty))
+
     retain_value(e, cursor_ty, iv)
-    emit(e, InStore(lty(e, cursor_ty), iv, VReg(s"$cursor.addr"), AccPlain, None))
+    emit(e, InStore(lty(e, cursor_ty), iv, kept, AccPlain, None))
     own_slot(e, cursor, cursor_ty)
 
     val cond_l = fresh_label(e, "iter.cond")
@@ -484,14 +488,16 @@ gen_quantifier(e: *Emit, universal: bool, name: string, var_ty: Type, lo: TExpr,
     val acc = alloca(e, fresh_reg(e), l_i1())
 
     emit(e, InStore(l_i1(), VInt(from_int(if universal then 1 else 0)), acc, AccPlain, None))
-    alloca(e, VReg(s"$name.addr"), w)
-    emit(e, InStore(w, lo_v, VReg(s"$name.addr"), AccPlain, None))
+
+    val home = local_alloca(e, name, w)
+
+    emit(e, InStore(w, lo_v, home, AccPlain, None))
     emit_term(e, InBr(cond_l))
     emit_label(e, cond_l)
 
     val iv = fresh_reg(e)
 
-    emit(e, InLoad(iv, w, VReg(s"$name.addr"), AccPlain, None))
+    emit(e, InLoad(iv, w, home, AccPlain, None))
 
     val cmp = fresh_reg(e)
 
@@ -516,7 +522,7 @@ gen_quantifier(e: *Emit, universal: bool, name: string, var_ty: Type, lo: TExpr,
 
     val cur = fresh_reg(e)
 
-    emit(e, InLoad(cur, w, VReg(s"$name.addr"), AccPlain, None))
+    emit(e, InLoad(cur, w, home, AccPlain, None))
 
     // The same wrap `gen_for` guards against, at the same place and for the same reason: without
     // this, `for all i in 0..255u8 do p` never finishes, and a quantifier that does not finish is
@@ -532,7 +538,7 @@ gen_quantifier(e: *Emit, universal: bool, name: string, var_ty: Type, lo: TExpr,
     val nxt = fresh_reg(e)
 
     emit(e, InBin(nxt, OpAdd, w, cur, VInt(from_int(1))))
-    emit(e, InStore(w, nxt, VReg(s"$name.addr"), AccPlain, None))
+    emit(e, InStore(w, nxt, home, AccPlain, None))
     emit_term(e, InBr(cond_l))
     emit_label(e, end_l)
 
@@ -550,9 +556,11 @@ end gen_quantifier
 // armed once per call would compare the second entry's first measure against the first entry's last,
 // and trap on a loop that was decreasing perfectly well.
 gen_checked_loop(e: *Emit, slot: string, var_ty: Type, loop_expr: TExpr) -> Val
-    alloca(e, VReg(s"$slot.prev"), lty(e, var_ty))
-    alloca(e, VReg(s"$slot.armed"), l_i1())
-    emit(e, InStore(l_i1(), VInt(from_int(0)), VReg(s"$slot.armed"), AccPlain, None))
+    named_alloca(e, s"$slot.prev", lty(e, var_ty), None)
+
+    val armed = named_alloca(e, s"$slot.armed", l_i1(), None)
+
+    emit(e, InStore(l_i1(), VInt(from_int(0)), armed, AccPlain, None))
     gen_expr(e, loop_expr)
 end gen_checked_loop
 
@@ -572,9 +580,9 @@ gen_for(e: *Emit, name: string, var_ty: Type, lo: TExpr, hi: TExpr, inclusive: b
     val end_l = fresh_label(e, "for.end")
     val else_l = if else_block.is_some() then fresh_label(e, "for.else") else end_l
     val slot = result_slot(e, ty)
+    val home = local_alloca(e, name, w)
 
-    alloca(e, VReg(s"$name.addr"), w)
-    emit(e, InStore(w, lo_v, VReg(s"$name.addr"), AccPlain, None))
+    emit(e, InStore(w, lo_v, home, AccPlain, None))
     e.loops.push(GenLoop(end_l, step_l, slot, !no_value(ty), e.owned_marks.len(),
                          e.temp_marks.len()))
     emit_term(e, InBr(cond_l))
@@ -582,7 +590,7 @@ gen_for(e: *Emit, name: string, var_ty: Type, lo: TExpr, hi: TExpr, inclusive: b
 
     val iv = fresh_reg(e)
 
-    emit(e, InLoad(iv, w, VReg(s"$name.addr"), AccPlain, None))
+    emit(e, InLoad(iv, w, home, AccPlain, None))
 
     val cmp = fresh_reg(e)
 
@@ -598,7 +606,7 @@ gen_for(e: *Emit, name: string, var_ty: Type, lo: TExpr, hi: TExpr, inclusive: b
 
     val cur = fresh_reg(e)
 
-    emit(e, InLoad(cur, w, VReg(s"$name.addr"), AccPlain, None))
+    emit(e, InLoad(cur, w, home, AccPlain, None))
 
     if inclusive
         val done = fresh_reg(e)
@@ -611,7 +619,7 @@ gen_for(e: *Emit, name: string, var_ty: Type, lo: TExpr, hi: TExpr, inclusive: b
     val nxt = fresh_reg(e)
 
     emit(e, InBin(nxt, OpAdd, w, cur, VInt(from_int(1))))
-    emit(e, InStore(w, nxt, VReg(s"$name.addr"), AccPlain, None))
+    emit(e, InStore(w, nxt, home, AccPlain, None))
     emit_term(e, InBr(cond_l))
     e.loops.pop()
     gen_loop_result(e, slot, ty, else_l, end_l, else_block)

@@ -724,6 +724,13 @@ end not_a_boundary
 // -- the jumps ------------------------------------------------------------------------------------
 
 private return_stmt(cx: &Analyzer, span: Span, value: Option[Expr]) -> Buf[TStmt]
+    // A `return` at any depth of a deferred statement leaves it. Nothing of it is read past that,
+    // exactly as nothing is where it is the deferred statement itself.
+    if cx.defer_outer.is_some()
+        cx.note_deferred_jump(span, deferred_return())
+        return one(TReturn(None))
+    end if
+
     val want = cx.ret_ty.unwrap_or(Unit)
 
     if value.is_none()
@@ -807,6 +814,12 @@ private become_stmt(cx: &Analyzer, span: Span, call: Expr) -> Buf[TStmt]
         cx.fault(span, s"'become' hands on this function's result, so the call has to answer " +
                  s"${type_show(want)} — this one answers ${type_show(texpr_type(t))}")
 
+    // A `become` at any depth of a deferred statement is a jump out of it, and the function it
+    // stands in has a `defer` by construction -- so it is told what any `become` beside a `defer`
+    // is told, at the call, and the statement is not scheduled.
+    if cx.defer_outer.is_some() then
+        cx.note_deferred_jump(t.span, become_refused(become_past_a_defer()))
+
     one(TBecome(t))
 end become_stmt
 
@@ -825,6 +838,15 @@ private break_stmt(cx: &Analyzer, span: Span, label: Option[string],
     if found.is_none()
         if value.is_some() then type_expr_bare(cx, value.unwrap())
 
+        if cx.defer_outer.is_some() then cx.note_deferred_jump(span, "")
+
+        return one(TBreak(None, 0))
+    end if
+
+    // The loop stands around the deferred statement this is written in, so its value is not read
+    // and the loop's result hears nothing of it.
+    if cx.leaves_deferred(found.unwrap().1)
+        cx.note_deferred_jump(span, deferred_jump())
         return one(TBreak(None, 0))
     end if
 
@@ -837,6 +859,13 @@ end break_stmt
 
 private continue_stmt(cx: &Analyzer, span: Span, label: Option[string]) -> Buf[TStmt]
     val found = resolve_loop(cx, span, "continue", label)
+
+    // One that names no loop at all has been refused for that, and is kept out of the block's
+    // deferred statements all the same.
+    if found.is_none() then
+        if cx.defer_outer.is_some() then cx.note_deferred_jump(span, "")
+    else if cx.leaves_deferred(found.unwrap().1) then
+        cx.note_deferred_jump(span, deferred_jump())
 
     one(TContinue(if found.is_none() then 0 else found.unwrap().1))
 end continue_stmt
@@ -880,39 +909,73 @@ end not_in_an_unrolled_loop
 //
 // What may be deferred is bounded by what teardown can mean, and each refusal is a different
 // mistake so each is named on its own.
+//
+// **A refused statement is not scheduled.** A build lowers the tree it was given whether or not the
+// analysis complained, and a deferred statement is laid down at every edge out of its block -- so a
+// scheduled `break`, `continue`, `return` or `?` is an edge that runs the deferred statements, of
+// which it is one, and the lowering never comes back. The refusal is the whole answer: nothing of
+// the statement is read past it, so it is one diagnostic and the block is left as if the line were
+// not there.
 private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
-    *inner.kind match
-        Return(_) ->
-            cx.fault(span, "a deferred statement runs while its block is being left, so it cannot " +
-                     "'return' — there is no exit left to take. Compute what the function returns " +
-                     "before the block ends")
-        Break(_, _) -> cx.fault(span, deferred_jump())
-        Continue(_) -> cx.fault(span, deferred_jump())
+    val refusal: Option[string] = *inner.kind match
+        Return(_) -> Some(deferred_return())
+        Break(_, _) -> Some(deferred_jump())
+        Continue(_) -> Some(deferred_jump())
         Defer(_) ->
-            cx.fault(span, "'defer' schedules a statement, and scheduling a scheduling has " +
-                     "nothing to run: write the statement itself after this 'defer'")
-        VarDecl(_, _, _, _, _, _, _) -> cx.fault(span, deferred_declaration())
-        ValDecl(_, _, _, _, _, _) -> cx.fault(span, deferred_declaration())
-        MultiDecl(_, _, _) -> cx.fault(span, deferred_declaration())
-        ConstDecl(_, _, _, _) -> cx.fault(span, deferred_declaration())
-        _ -> ()
+            Some("'defer' schedules a statement, and scheduling a scheduling has " +
+                 "nothing to run: write the statement itself after this 'defer'")
+        VarDecl(_, _, _, _, _, _, _) -> Some(deferred_declaration())
+        ValDecl(_, _, _, _, _, _) -> Some(deferred_declaration())
+        MultiDecl(_, _, _) -> Some(deferred_declaration())
+        ConstDecl(_, _, _, _) -> Some(deferred_declaration())
+        _ -> None
+
+    refusal match
+        Some(why) ->
+            cx.fault(span, why)
+            return buf()
+        None -> ()
 
     var body: Buf[Stmt] = buf()
 
     body.push(inner)
 
+    // The statement is read knowing which loops stand around it, which is what lets a jump at any
+    // depth of it be told from one that stays inside.
+    val around = (cx.defer_outer, cx.defer_jump)
+
+    cx.defer_outer = Some(cx.loops.len())
+    cx.defer_jump = None
+
     val t = type_stmts(cx, body)
+    val jump = cx.defer_jump
+
+    cx.defer_outer = around.0
+    cx.defer_jump = around.1
+
+    // A jump that leaves the statement is the direct form's mistake written one level down, and is
+    // told the same thing where it stands -- once, for the first of them.
+    if jump.is_some()
+        if jump.unwrap().1 != "" then cx.fault(jump.unwrap().0, jump.unwrap().1)
+
+        return buf()
+    end if
 
     // A `?` leaves the function, which is the same exit a `return` would take and is refused for
     // the same reason. It is read out of the analyzed body rather than the written statement,
     // because `?` is an operator inside an expression at whatever depth the expression has.
-    if stmts_try(t) then
+    if stmts_try(t)
         cx.fault(span, "a deferred statement runs while its block is being left, so a '?' in it " +
                  "has nowhere to return to. Check the result and handle the failure in the " +
                  "deferred statement itself")
+        return buf()
 
     one(TDefer(t))
 end defer_stmt
+
+private deferred_return() -> string =
+    "a deferred statement runs while its block is being left, so it cannot 'return' — there is " +
+        "no exit left to take. Compute what the function returns before the block ends"
 
 private deferred_jump() -> string =
     "a deferred statement runs while its block is being left, so it cannot 'break' or 'continue' " +
