@@ -767,10 +767,23 @@ ref_mentions(t: TypeRef, names: Buf[string]) -> bool
         _ -> false
 end ref_mentions
 
-// Whether a written extent names one of them, which for a bare name is the whole of the question:
-// an extent written as arithmetic over a parameter is refused at resolution rather than solved.
+// Whether a written extent names one of them. An extent written as arithmetic over a parameter
+// still NAMES it -- `[N + 1]int` is refused at its declaration rather than solved, and a call to it is
+// told the parameter cannot be inferred, not that nothing mentions it.
 private expr_mentions(e: Expr, names: Buf[string]) -> bool = *e.kind match
     Ident(n) -> holds_string(names, n)
+    LayoutOf(_, tr) -> ref_mentions(tr, names)
+    OffsetOf(tr, _) -> ref_mentions(tr, names)
+    Unary(_, operand) -> expr_mentions(operand, names)
+    Binary(_, l, r) -> expr_mentions(l, names) || expr_mentions(r, names)
+    Compare(operands, _) ->
+        operands.len() == 2 && (expr_mentions(operands.at(0), names) ||
+                                expr_mentions(operands.at(1), names))
+    Call(_, args) ->
+        for i in 0..<args.len()
+            if expr_mentions(args.at(i), names) then return true
+
+        false
     _ -> false
 
 any_ref_mentions(ts: Buf[TypeRef], names: Buf[string]) -> bool

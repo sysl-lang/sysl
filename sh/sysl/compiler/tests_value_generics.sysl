@@ -1,0 +1,633 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Value generics (`reference/generics.md § A parameter may stand for a value`): a parameter standing
+// for a VALUE rather than a type, written `[const N: usize]`, which is what lets one declaration
+// cover every array length -- inferred from an argument for a function, written out for a struct,
+// and admitting integers, `bool`, `char` and a simple enum's variants.
+//
+// **Every string quoted here was read out of the reference compiler** (0.0.152), whose
+// `ValueGenericsTests` these are.
+
+private var vgn_library_cache: Buf[Program] = buf()
+private var vgn_library_read: bool = false
+
+private vgn_library() -> Buf[Program]
+    if vgn_library_read then return vgn_library_cache
+
+    vgn_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> vgn_library_cache = units
+
+    vgn_library_cache
+end vgn_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private vgn_ready() -> bool
+    if vgn_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end vgn_ready
+
+private vgn_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program PRINTS, which is the one claim nothing short of building and running it makes.
+private vgn_ran(text: string) -> string
+    val root = make_temp_dir("sysl-value-generics").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vgn_ran
+
+// Everything a source has to say for itself, taken the whole way through the lowering.
+private vgn_err(text: string) -> string
+    val root = make_temp_dir("sysl-value-generics").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vgn_err
+
+// -- the parameter list ---------------------------------------------------------------------------
+
+@test("reads a value parameter beside a type one")
+vgn_value_parameter_beside_a_type_one()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        f[const N: usize, T](xs: [N]T) -> usize = N
+        var a: [3]int = [1, 2, 3]
+        print(f(a))
+        """), "3\n")
+
+// A value parameter with no type is a reader who has understood the feature and mis-spelled it.
+@test("wants the type its argument must have")
+vgn_wants_the_type_its_argument_must_have()
+    if !vgn_ready() then return
+
+    val said = vgn_err("f[const N](xs: [N]int) = 0\nprint(1)\n")
+
+    assert(vgn_says(said, "a value parameter needs the type its argument must have, as 'const N: " +
+                          "usize' — the type is what says which values may stand there"), said)
+    assert(vgn_says(said, "main.sysl:1:10"), said)
+
+// -- an array length -----------------------------------------------------------------------------
+
+@test("is inferred from the argument")
+vgn_length_inferred_from_the_argument()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        len[const N: usize](xs: [N]int) -> usize = N
+        var a: [4]int = [1, 2, 3, 4]
+        print(len(a))
+        """), "4\n")
+
+@test("is a constant inside the body, so it may be looped to")
+vgn_length_is_a_constant_inside_the_body()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        total[const N: usize](xs: [N]int) -> int
+            var t = 0
+            for i in 0..<N do t = t + xs[i]
+            t
+        var a: [3]int = [10, 20, 30]
+        print(total(a))
+        """), "60\n")
+
+@test("makes two lengths two instantiations")
+vgn_two_lengths_two_instantiations()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        len[const N: usize](xs: [N]int) -> usize = N
+        var a: [2]int = [1, 2]
+        var b: [5]int = [1, 2, 3, 4, 5]
+        print(len(a))
+        print(len(b))
+        """), "2\n5\n")
+
+// -- a struct ------------------------------------------------------------------------------------
+
+// A struct's arguments are written out rather than inferred -- the one place the grammar cannot
+// tell which kind of argument it is reading, so the declaration decides.
+@test("may carry a value parameter, written out at the use")
+vgn_struct_may_carry_a_value_parameter()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        struct Buf[const N: usize]
+            data: [N]byte
+        var b: Buf[4] = Buf([0u8, 0u8, 0u8, 0u8])
+        print(b.data.len)
+        """), "4\n")
+
+@test("at two lengths is two types")
+vgn_struct_at_two_lengths_is_two_types()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        struct Buf[const N: usize]
+            data: [N]byte
+        var a: Buf[2] = Buf([1u8, 2u8])
+        var b: Buf[4] = Buf([1u8, 2u8, 3u8, 4u8])
+        print(a.data.len + b.data.len)
+        """), "6\n")
+
+@test("and does not accept one for the other")
+vgn_struct_does_not_accept_one_for_the_other()
+    if !vgn_ready() then return
+
+    val said = vgn_err(raw"""
+        struct Buf[const N: usize]
+            data: [N]byte
+        var a: Buf[2] = Buf([1u8, 2u8])
+        var b: Buf[4] = a
+        print(b.data.len)
+        """)
+
+    assert(vgn_says(said, "cannot initialize 'b': declared Buf[4] but the value is Buf[2]"), said)
+    assert(vgn_says(said, "main.sysl:4:1"), said)
+
+// A bare name in a value-argument position is read as the value it names.
+@test("takes an enclosing block's value parameter as its argument")
+vgn_struct_takes_an_enclosing_value_parameter()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        struct Buf[const N: usize]
+            data: [N]byte
+        wrap[const N: usize](xs: [N]byte) -> usize
+            var b: Buf[N] = Buf(xs)
+            b.data.len
+        var a: [3]byte = [1u8, 2u8, 3u8]
+        print(wrap(a))
+        """), "3\n")
+
+// And a declared constant, a value parameter being a `const` whose value the use supplies.
+@test("and a declared constant")
+vgn_struct_takes_a_declared_constant()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        const SIZE: usize = 3usize
+        struct Buf[const N: usize]
+            data: [N]byte
+        var b: Buf[SIZE] = Buf([1u8, 2u8, 3u8])
+        print(b.data.len)
+        """), "3\n")
+
+// A member's OWN list, solved at the call, beside the type's, fixed by the receiver.
+@test("a method declares one of its own, solved from the argument")
+vgn_method_declares_one_of_its_own()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        struct Sum
+            seen: usize
+            take[const N: usize](*self, xs: [N]int) -> usize
+                self.seen = self.seen + N
+                N
+        end Sum
+        var s = Sum(0usize)
+        print(s.take([1, 2, 3]))
+        print(s.take([4, 5]))
+        print(s.seen)
+        """), "3\n2\n5\n")
+
+// -- the admissible types ------------------------------------------------------------------------
+
+@test("take a bool, written out")
+vgn_admits_a_bool()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        struct Flag[const B: bool]
+            v: int
+        var a: Flag[true] = Flag(1)
+        print(a.v)
+        """), "1\n")
+
+// Read back in the body, `B` has to be the `bool` it was declared, not the number it travelled as.
+@test("and reads it back as a bool, not as the number it travelled as")
+vgn_reads_a_bool_back_as_a_bool()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        struct Flag[const B: bool]
+            v: int
+        impl[const B: bool] Display for Flag[B]
+            display(self, out: *Writer, fmt: FormatSpec) =
+                display_str(if B then "on" else "off", out, fmt)
+        var a: Flag[true] = Flag(1)
+        var b: Flag[false] = Flag(2)
+        print(a)
+        print(b)
+        """), "on\noff\n")
+
+@test("a char")
+vgn_admits_a_char()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        struct Sep[const C: char]
+            v: int
+        var a: Sep['x'] = Sep(1)
+        print(a.v)
+        """), "1\n")
+
+// A simple enum's value IS its identity, so its tag is exactly the number a type's identity wants.
+@test("and a simple enum's variant")
+vgn_admits_a_simple_enum_variant()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        enum Mode
+            Fast
+            Slow
+        struct Run[const M: Mode]
+            v: int
+        var a: Run[Fast] = Run(1)
+        print(a.v)
+        """), "1\n")
+
+// Two variants are two types, and the diagnostic names them as written rather than by tag.
+@test("so two variants are two types, named the way they were written")
+vgn_two_variants_two_types()
+    if !vgn_ready() then return
+
+    val said = vgn_err(raw"""
+        enum Mode
+            Fast
+            Slow
+        struct Run[const M: Mode]
+            v: int
+        var a: Run[Fast] = Run(1)
+        var b: Run[Slow] = a
+        print(b.v)
+        """)
+
+    assert(vgn_says(said, "cannot initialize 'b': declared Run[Slow] but the value is Run[Fast]"), said)
+    assert(vgn_says(said, "main.sysl:7:1"), said)
+
+@test("and inside a body the parameter is a value of that enum")
+vgn_enum_parameter_is_a_value_in_a_body()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        enum Mode
+            Fast
+            Slow
+        struct Run[const M: Mode]
+            v: int
+        impl[const M: Mode] Display for Run[M]
+            display(self, out: *Writer, fmt: FormatSpec) =
+                display_str(if M == Fast then "y" else "n", out, fmt)
+        var a: Run[Fast] = Run(1)
+        var b: Run[Slow] = Run(2)
+        print(a, b)
+        """), "y n\n")
+
+// -- a type parameter where a value belongs ------------------------------------------------------
+
+// Both reference cases on this input ("is refused in a function's signature" and "and the message
+// names the spelling that was meant") assert parts of this one message.
+@test("is refused in a function's signature, naming the spelling that was meant")
+vgn_type_parameter_as_a_length_in_a_signature()
+    if !vgn_ready() then return
+
+    val said = vgn_err(raw"""
+        f[T](xs: [T]int) -> usize = 0
+        var a: [2]int = [1, 2]
+        print(f(a))
+        """)
+
+    assert(vgn_says(said, "'T' is a type parameter, and an array's length is a value rather than a " +
+                          "type — a parameter that stands for a length is declared 'const T: usize'"),
+           said)
+    assert(vgn_says(said, "main.sysl:1:1"), said)
+
+@test("and in an 'impl', where it silently became a block for '[0]T'")
+vgn_type_parameter_as_a_length_in_an_impl()
+    if !vgn_ready() then return
+
+    val said = vgn_err(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[N, T] Tag for [N]T
+            tag(self) -> string = "any"
+        var a: [2]int = [1, 2]
+        print(a.tag())
+        """)
+
+    assert(vgn_says(said, "'N' is a type parameter, and an array's length is a value rather than a " +
+                          "type — a parameter that stands for a length is declared 'const N: usize'"),
+           said)
+    assert(vgn_says(said, "main.sysl:3:20"), said)
+
+// The other direction: a type written where the declaration wrote `const`.
+@test("while a type written as a value argument says which of the two the slot is")
+vgn_type_written_as_a_value_argument()
+    if !vgn_ready() then return
+
+    val said = vgn_err(raw"""
+        struct Buf[const N: usize]
+            data: [N]byte
+        var b: Buf[int] = Buf([])
+        print(b.data.len)
+        """)
+
+    assert(vgn_says(said, "'int' is a type, and this argument stands where the declaration wrote " +
+                          "'const' — so a value of usize belongs here"), said)
+    assert(vgn_says(said, "main.sysl:3:8"), said)
+
+@test("and a value written where a type argument belongs says the same in reverse")
+vgn_value_written_as_a_type_argument()
+    if !vgn_ready() then return
+
+    val said = vgn_err(raw"""
+        struct Box[T]
+            v: T
+        var b: Box[4] = Box(1)
+        print(b.v)
+        """)
+
+    assert(vgn_says(said, "a value stands here, and this argument is a type — a value argument " +
+                          "belongs where the declaration wrote 'const', and nowhere else"), said)
+    assert(vgn_says(said, "main.sysl:3:8"), said)
+
+// -- the ordinary cases that have to keep working ------------------------------------------------
+
+@test("two value parameters at once")
+vgn_two_value_parameters_at_once()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        f[const A: usize, const B: usize](xs: [A]int, ys: [B]int) -> usize = A + B
+        var p: [2]int = [1, 2]
+        var q: [3]int = [1, 2, 3]
+        print(f(p, q))
+        """), "5\n")
+
+// A parameter is the outermost binding of its name, not the only one.
+@test("a local of the same name shadows the parameter")
+vgn_a_local_shadows_the_parameter()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        f[const N: usize](xs: [N]int) -> usize
+            var N: usize = 99usize
+            N
+        var a: [3]int = [1, 2, 3]
+        print(f(a))
+        """), "99\n")
+
+// Zero is the placeholder a value parameter stands at, so a really empty array is where the two
+// coincide.
+@test("and the empty array reaches the library's block like any other")
+vgn_the_empty_array_prints()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran("var a: [0]int = []\nprint(a)\n"), "[]\n")
+
+@test("while a negative length is refused as it always was")
+vgn_a_negative_length_is_refused()
+    if !vgn_ready() then return
+
+    val said = vgn_err(raw"""
+        struct Buf[const N: usize]
+            data: [N]byte
+        var b: Buf[-1] = Buf([])
+        print(b.data.len)
+        """)
+
+    assert(vgn_says(said, "an array cannot have -1 elements"), said)
+    assert(vgn_says(said, "main.sysl:2:11"), said)
+
+// -- the motivating case: one library block covers every array length ----------------------------
+
+@test("one impl covers every array length")
+vgn_one_impl_covers_every_length()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        var a: [3]int = [1, 2, 3]
+        var b: [2]int = [7, 8]
+        print(a)
+        print(b)
+        """), "[1, 2, 3]\n[7, 8]\n")
+
+@test("reaches an element type the library never saw")
+vgn_reaches_an_element_type_the_library_never_saw()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        struct P
+            x: int
+        impl Display for P
+            display(self, out: *Writer, fmt: FormatSpec) = out.write(str(self.x).bytes)
+        var a: [2]P = [P(1), P(2)]
+        print(a)
+        """), "[1, 2]\n")
+
+// An `impl` on a NAMED generic type whose members read the value parameter.
+@test("an 'impl' on a named generic type reads its value parameter in a member")
+vgn_impl_on_a_named_type_reads_its_value_parameter()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        struct Run[const N: usize]
+            v: int
+        impl[const N: usize] Display for Run[N]
+            display(self, out: *Writer, fmt: FormatSpec) =
+                display_str(str(self.v) + "/" + str(N), out, fmt)
+        var a: Run[3] = Run(7)
+        var b: Run[5] = Run(8)
+        print(a)
+        print(b)
+        """), "7/3\n8/5\n")
+
+// And a type's OWN method reading its own value parameter.
+@test("a type's own method reads the type's value parameter")
+vgn_own_method_reads_the_value_parameter()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        struct Buf[const N: usize]
+            used: usize
+            room(self) -> usize = N - self.used
+        end Buf
+        var a: Buf[8] = Buf(3usize)
+        var b: Buf[2] = Buf(1usize)
+        print(a.room())
+        print(b.room())
+        """), "5\n1\n")
+
+// The length reaches the symbol, so two lengths are two emitted bodies.
+@test("renders an array of arrays, which is two lengths at once")
+vgn_renders_an_array_of_arrays()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        var a: [2][3]int = [[1, 2, 3], [4, 5, 6]]
+        print(a)
+        """), "[[1, 2, 3], [4, 5, 6]]\n")
+
+// A block written for one length is the more specific of the two and answers first.
+@test("a block written for one length beats the one written for every length")
+vgn_one_length_beats_every_length()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[const N: usize, T] Tag for [N]T
+            tag(self) -> string = "any"
+        impl[T] Tag for [2]T
+            tag(self) -> string = "pair"
+        var a: [2]int = [1, 2]
+        var b: [3]int = [1, 2, 3]
+        print(a.tag())
+        print(b.tag())
+        """), "pair\nany\n")
+
+// -- what is refused: arithmetic on a length in a type -------------------------------------------
+
+private vgn_arithmetic(n: string) -> string =
+    s"this length does arithmetic on '$n', and a type may name a value parameter but not compute " +
+    "with one — deciding that two such lengths are one type is type-level arithmetic, which is a " +
+    s"separate feature. A body may compute with '$n' freely"
+
+@test("arithmetic on a length in a type")
+vgn_arithmetic_on_a_length()
+    if !vgn_ready() then return
+
+    val said = vgn_err("f[const N: usize](xs: [N]int) -> [N + 1]int = xs\nprint(1)\n")
+
+    assert(vgn_says(said, vgn_arithmetic("N")), said)
+    assert(vgn_says(said, "main.sysl:1:1"), said)
+
+@test("including where the parameter is buried in the expression")
+vgn_arithmetic_buried_in_the_expression()
+    if !vgn_ready() then return
+
+    val said = vgn_err("f[const N: usize](xs: [N]int) -> [2 * N]int = xs\nprint(1)\n")
+
+    assert(vgn_says(said, vgn_arithmetic("N")), said)
+    assert(vgn_says(said, "main.sysl:1:1"), said)
+
+// The declaration is what reports, and it reports FIRST -- before the call that cannot be solved.
+@test("and in a parameter, which no call could ever be solved against")
+vgn_arithmetic_in_a_parameter()
+    if !vgn_ready() then return
+
+    val said = vgn_err(raw"""
+        f[const N: usize](xs: [N + 1]int) -> usize = 0
+        var a: [3]int = [1, 2, 3]
+        print(f(a))
+        """)
+
+    val cause = said.index_of(vgn_arithmetic("N"))
+    val call = said.index_of("cannot infer the type argument 'N' of 'f' here — annotate the expected type")
+
+    assert(cause.is_some() && call.is_some(), said)
+    assert(cause.unwrap() < call.unwrap(), said)
+    assert(vgn_says(said, "main.sysl:1:1"), said)
+    assert(vgn_says(said, "main.sysl:3:7"), said)
+
+@test("and in a type written inside a member's body")
+vgn_arithmetic_in_a_members_body()
+    if !vgn_ready() then return
+
+    val said = vgn_err(raw"""
+        trait Grow
+            grow(self) -> usize
+        impl[const N: usize, T] Grow for [N]T
+            grow(self) -> usize
+                var b: [N * 2]int
+                b.len
+        var a: [2]int = [1, 2]
+        print(a.grow())
+        """)
+
+    assert(vgn_says(said, vgn_arithmetic("N")), said)
+    assert(vgn_says(said, "main.sysl:5:16"), said)
+
+@test("and in a local's type inside a function")
+vgn_arithmetic_in_a_functions_local()
+    if !vgn_ready() then return
+
+    val said = vgn_err(raw"""
+        f[const N: usize](xs: [N]int) -> usize
+            var b: [N + 1]int
+            b.len
+        var a: [3]int = [1, 2, 3]
+        print(f(a))
+        """)
+
+    assert(vgn_says(said, vgn_arithmetic("N")), said)
+    assert(vgn_says(said, "main.sysl:2:12"), said)
+
+// A length measuring a TYPE parameter is a number the type argument fixes outright.
+@test("while a length measuring a type parameter is untouched")
+vgn_a_measured_length_is_untouched()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        f[T](x: T) -> usize
+            var buf: [sizeof(T) * 2 + 1]u8
+            buf.len
+        print(f(1))
+        """), "9\n")
+
+@test("and a body computes with the parameter freely")
+vgn_a_body_computes_freely()
+    if !vgn_ready() then return
+
+    assert_eq(vgn_ran(raw"""
+        f[const N: usize](xs: [N]int) -> usize = N * 2usize + 1usize
+        var a: [3]int = [1, 2, 3]
+        print(f(a))
+        """), "7\n")

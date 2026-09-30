@@ -685,26 +685,65 @@ end check_signature_rules
 // of the signature as written, with no substitution. Left to resolution it is never said at all:
 // inference binds whatever `(..T)` matched, so a `T` declared as one type quietly starts standing
 // for a list, and a signature nothing ever calls is never resolved.
+//
+// **The lengths are asked here too, and for the same reason** (`reference/generics.md § A parameter
+// may stand for a value`): a length doing arithmetic on a value parameter, `[N + 1]int`, is never
+// resolved where it is a parameter -- nothing unifies with it, so the call fails first and says the
+// argument cannot be inferred, which is about the wrong line -- and a type parameter written as a
+// length, `f[T](xs: [T]int)`, is solved before it is resolved: `unify` binds `T` to the length it
+// read off the argument, after which it is indistinguishable from one declared `const`.
 check_pack_spellings(a: &Analysis, scope: Scope, span: Span, tparams: Buf[string],
-                     packs: Buf[string], params: Buf[Param], ret: Option[TypeRef])
-    for i in 0..<params.len()
-        walk_pack_spellings(a, scope, span, tparams, packs, params.at(i).typ)
+                     packs: Buf[string], values: Buf[TypeBinding], params: Buf[Param],
+                     ret: Option[TypeRef])
+    var names: Buf[string] = buf()
+    var types: Buf[string] = buf()
 
-    if ret.is_some() then walk_pack_spellings(a, scope, span, tparams, packs, ret.unwrap())
+    for i in 0..<values.len()
+        names.push(values.at(i).name)
+
+    for i in 0..<tparams.len()
+        if !has_binding(values, tparams.at(i)) then types.push(tparams.at(i))
+
+    val lengths = LengthNames(names, types)
+
+    for i in 0..<params.len()
+        walk_pack_spellings(a, scope, span, tparams, packs, lengths, params.at(i).typ)
+
+    if ret.is_some() then walk_pack_spellings(a, scope, span, tparams, packs, lengths, ret.unwrap())
 end check_pack_spellings
 
+// The names a written length is judged against: the value parameters, which a length may name but
+// not compute with, and the type parameters, which a length may not name at all.
+private struct LengthNames
+    values: Buf[string]
+    types: Buf[string]
+
 private walk_pack_spellings(a: &Analysis, scope: Scope, span: Span, tparams: Buf[string],
-                            packs: Buf[string], t: TypeRef)
+                            packs: Buf[string], lengths: LengthNames, t: TypeRef)
     *t.kind match
         NamedType(_, args) ->
             for i in 0..<args.len()
-                walk_pack_spellings(a, scope, span, tparams, packs, args.at(i))
-        PtrType(inner) -> walk_pack_spellings(a, scope, span, tparams, packs, inner)
-        RefType(inner, _) -> walk_pack_spellings(a, scope, span, tparams, packs, inner)
-        WeakType(inner) -> walk_pack_spellings(a, scope, span, tparams, packs, inner)
-        VolatileType(inner) -> walk_pack_spellings(a, scope, span, tparams, packs, inner)
-        ArrayType(_, elem, _) -> walk_pack_spellings(a, scope, span, tparams, packs, elem)
-        VectorType(_, elem) -> walk_pack_spellings(a, scope, span, tparams, packs, elem)
+                walk_pack_spellings(a, scope, span, tparams, packs, lengths, args.at(i))
+        PtrType(inner) -> walk_pack_spellings(a, scope, span, tparams, packs, lengths, inner)
+        RefType(inner, _) -> walk_pack_spellings(a, scope, span, tparams, packs, lengths, inner)
+        WeakType(inner) -> walk_pack_spellings(a, scope, span, tparams, packs, lengths, inner)
+        VolatileType(inner) -> walk_pack_spellings(a, scope, span, tparams, packs, lengths, inner)
+        ArrayType(length, elem, _) ->
+            if length.is_some()
+                length_arithmetic(a, scope, span, length.unwrap(), lengths.values)
+                length_not_a_type(a, scope, span, length.unwrap(), lengths.types)
+            end if
+
+            walk_pack_spellings(a, scope, span, tparams, packs, lengths, elem)
+        VectorType(lanes, elem) ->
+            length_arithmetic(a, scope, span, lanes, lengths.values)
+            length_not_a_type(a, scope, span, lanes, lengths.types)
+            walk_pack_spellings(a, scope, span, tparams, packs, lengths, elem)
+        // A written value argument is held to the rule a length is, for the same reason: `Buf[N + 1]`
+        // puts a computation where an identity belongs.
+        ValueArgType(e) ->
+            length_arithmetic(a, scope, span, e, lengths.values)
+            length_not_a_type(a, scope, span, e, lengths.types)
         TupleType(parts, _) ->
             if parts.len() == 1
                 *parts.at(0).kind match
@@ -715,7 +754,7 @@ private walk_pack_spellings(a: &Analysis, scope: Scope, span: Span, tparams: Buf
             end if
 
             for i in 0..<parts.len()
-                walk_pack_spellings(a, scope, span, tparams, packs, parts.at(i))
+                walk_pack_spellings(a, scope, span, tparams, packs, lengths, parts.at(i))
         // A pack reached anywhere else is one written outside the tuple that is the only place for it.
         PackType(n) ->
             declared_pack(a, scope, span, tparams, packs, n)
@@ -723,18 +762,76 @@ private walk_pack_spellings(a: &Analysis, scope: Scope, span: Span, tparams: Buf
                     s"written is inside a tuple, as '(..$n)'")
         FnType(ps, r, _) ->
             for i in 0..<ps.len()
-                walk_pack_spellings(a, scope, span, tparams, packs, ps.at(i))
+                walk_pack_spellings(a, scope, span, tparams, packs, lengths, ps.at(i))
 
-            walk_pack_spellings(a, scope, span, tparams, packs, r)
+            walk_pack_spellings(a, scope, span, tparams, packs, lengths, r)
         CFnType(ps, r) ->
             for i in 0..<ps.len()
-                walk_pack_spellings(a, scope, span, tparams, packs, ps.at(i))
+                walk_pack_spellings(a, scope, span, tparams, packs, lengths, ps.at(i))
 
-            walk_pack_spellings(a, scope, span, tparams, packs, r)
-        AssocType(base, _) -> walk_pack_spellings(a, scope, span, tparams, packs, base)
-        AssocArgType(_, inner) -> walk_pack_spellings(a, scope, span, tparams, packs, inner)
+            walk_pack_spellings(a, scope, span, tparams, packs, lengths, r)
+        AssocType(base, _) -> walk_pack_spellings(a, scope, span, tparams, packs, lengths, base)
+        AssocArgType(_, inner) -> walk_pack_spellings(a, scope, span, tparams, packs, lengths, inner)
         _ -> ()
 end walk_pack_spellings
+
+// A length that names a value parameter and computes with it (`[N + 1]int`). The length that IS
+// the parameter is the whole of what a type may say about one; anything else built over it would
+// need the compiler to decide when two expressions denote one length, which is type-level
+// arithmetic and a separate feature. Left alone, the length resolves to whatever the placeholder
+// made it and the array is silently the wrong size. A length measuring a TYPE parameter,
+// `[sizeof(T) * 2]u8`, is a number the type argument fixes outright and is not asked about.
+length_arithmetic(a: &Analysis, scope: Scope, span: Span, len: Expr, names: Buf[string])
+    *len.kind match
+        Ident(_) -> return
+        _ -> ()
+
+    var found: Buf[string] = buf()
+
+    value_params_in(len, names, &found)
+
+    if found.is_empty() then return
+
+    val n = found.at(0)
+    val message = s"this length does arithmetic on '$n', and a type may name a value parameter but " +
+                  "not compute with one — deciding that two such lengths are one type is type-level " +
+                  s"arithmetic, which is a separate feature. A body may compute with '$n' freely"
+
+    // A signature is walked here at its declaration and resolved again later; the declaration is
+    // where the reader is told.
+    if !a.said_around(scope, span, message) then a.fault(scope, span, message)
+end length_arithmetic
+
+// The value parameters an expression names, walking only the forms arithmetic is written in.
+private value_params_in(e: Expr, names: Buf[string], out: *Buf[string])
+    *e.kind match
+        Ident(n) -> if holds_string(names, n) then out.push(n)
+        Unary(_, operand) -> value_params_in(operand, names, out)
+        Binary(_, l, r) ->
+            value_params_in(l, names, out)
+            value_params_in(r, names, out)
+        Compare(operands, _) ->
+            if operands.len() == 2
+                value_params_in(operands.at(0), names, out)
+                value_params_in(operands.at(1), names, out)
+            end if
+        Call(_, args) ->
+            for i in 0..<args.len()
+                value_params_in(args.at(i), names, out)
+        _ -> ()
+end value_params_in
+
+// A TYPE parameter written where a length belongs (`f[T](xs: [T]int)`). A length is a value, and a
+// parameter standing for one is declared `const`.
+length_not_a_type(a: &Analysis, scope: Scope, span: Span, len: Expr, types: Buf[string])
+    *len.kind match
+        Ident(n) ->
+            if holds_string(types, n) then
+                a.fault(scope, span, s"'$n' is a type parameter, and an array's length is a value " +
+                        s"rather than a type — a parameter that stands for a length is declared " +
+                        s"'const $n: usize'")
+        _ -> ()
+end length_not_a_type
 
 private declared_pack(a: &Analysis, scope: Scope, span: Span, tparams: Buf[string],
                       packs: Buf[string], n: string)
@@ -853,7 +950,7 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
     a.tables.funcs.put(key, Func(d, span, scope))
     record_access(a, scope, span, key, d.vis)
     check_signature_rules(a, scope, span, d.name, d.params, d.ret_type, d.variadic, false)
-    check_pack_spellings(a, scope, span, d.tparams, d.tpacks, d.params, d.ret_type)
+    check_pack_spellings(a, scope, span, d.tparams, d.tpacks, d.tvalues, d.params, d.ret_type)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
 

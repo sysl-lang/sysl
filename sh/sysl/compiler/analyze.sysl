@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
 
 // The declaration pass, from parsed files to the tables the later stages read.
 //
@@ -550,18 +551,18 @@ private resolve_signatures(a: &Analysis)
         decl.kind match
             StructOf(d) ->
                 check_bound_names(a, decl.scope, d.name, d.bounds)
-                resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.members)
+                resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.tvalues, d.members)
 
                 // What an `invariant` may read is settled here, where the field types have just
                 // been made real and the whole aliasing rule that rests on them is still ahead.
                 check_invariants_of(a, decl.scope, decl.span, key, d)
             EnumOf(d) ->
                 check_bound_names(a, decl.scope, d.name, d.bounds)
-                resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.members)
+                resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.tvalues, d.members)
             TraitOf(d) ->
                 check_bound_names(a, decl.scope, d.name, d.bounds)
                 check_trait_supers(a, key, d)
-                resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.methods, true)
+                resolve_members(a, decl.scope, key, d.tparams, d.bounds, buf(), d.methods, true)
             _ -> ()
 
     // **An `impl` block's signatures are resolved where its members are lowered**, which is the
@@ -614,16 +615,27 @@ private resolve_extern_var_types(a: &Analysis)
                     "occupies nothing, so there is no storage for the linker to resolve the name to")
 end resolve_extern_var_types
 
-// A declaration's own type parameters, each standing for itself: what a signature is read against
-// before anything instantiates it.
-stand_ins(tparams: Buf[string]) -> Buf[Binding]
+// A declaration's own parameters, each standing for itself: what a signature is read against before
+// anything instantiates it. A type parameter stands as its own name and a **value** parameter as a
+// zero of the type the declaration wrote for it -- it is not a type, and standing at a number is
+// what lets `[N]T` read as an array.
+stand_ins(a: &Analysis, scope: Scope, tparams: Buf[string],
+          tvalues: Buf[TypeBinding]) -> Buf[Binding]
     var out: Buf[Binding] = buf()
 
     for i in 0..<tparams.len()
-        out.push(Binding(tparams.at(i), Abstract(tparams.at(i), buf())))
+        out.push(Binding(tparams.at(i), stand_in(a, scope, tparams.at(i), tvalues)))
 
     out
 end stand_ins
+
+private stand_in(a: &Analysis, scope: Scope, tp: string, tvalues: Buf[TypeBinding]) -> Type
+    val written = binding_named(tvalues, tp)
+
+    if written.is_none() then return Abstract(tp, buf())
+
+    ConstArg(from_int(0), resolve_type(a, scope, written.unwrap(), no_bindings()))
+end stand_in
 
 private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string],
                                bounds: Buf[NamedBounds], tvalues: Buf[TypeBinding],
@@ -646,10 +658,11 @@ private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string],
 // the declaration of `read(*self, start: u8 -> bool) -> Option[Span]`, ahead of every type the
 // library's bodies make real.
 private resolve_members(a: &Analysis, scope: Scope, owner: string, tparams: Buf[string],
-                        bounds: Buf[NamedBounds], members: Buf[MethodDecl], is_trait: bool = false)
+                        bounds: Buf[NamedBounds], tvalues: Buf[TypeBinding],
+                        members: Buf[MethodDecl], is_trait: bool = false)
     val shape = is_trait || !tparams.is_empty()
     val whole = if shape then Some(registration_mark(a)) else None
-    var subst = abstract_subst(a, scope, tparams, bounds, buf(), buf(), buf())
+    var subst = abstract_subst(a, scope, tparams, bounds, tvalues, buf(), buf())
 
     subst.push(Binding("Self", self_type(a, scope, owner, tparams, bounds)))
 
@@ -658,12 +671,44 @@ private resolve_members(a: &Analysis, scope: Scope, owner: string, tparams: Buf[
         val generic = !shape && !with_member_call_bounds(m).tparams.is_empty()
         val own = if generic then Some(registration_mark(a)) else None
 
+        // A type's own member is told about a length at its DECLARATION, which the member hoist
+        // asks -- after this. Asked here first, the reading below finds the sentence already said
+        // about the member and adds nothing at the type inside it. A trait's member is never
+        // lowered, so the reading is the only thing that says it.
+        if !is_trait then
+            check_pack_spellings(a, scope, m.span, joined_names(tparams, m.tparams), m.tpacks,
+                                 joined_values(tvalues, m.tvalues), m.params, m.ret_type)
+
         resolve_method(a, scope, m, subst)
 
         if own.is_some() then rewind_to(a, own.unwrap())
 
     if whole.is_some() then rewind_to(a, whole.unwrap())
 end resolve_members
+
+private joined_names(outer: Buf[string], own: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<outer.len()
+        out.push(outer.at(i))
+
+    for i in 0..<own.len()
+        out.push(own.at(i))
+
+    out
+end joined_names
+
+private joined_values(outer: Buf[TypeBinding], own: Buf[TypeBinding]) -> Buf[TypeBinding]
+    var out: Buf[TypeBinding] = buf()
+
+    for i in 0..<outer.len()
+        out.push(outer.at(i))
+
+    for i in 0..<own.len()
+        out.push(own.at(i))
+
+    out
+end joined_values
 
 // How far each instantiation table had been filled when a reading at stand-ins began, and the trial
 // that reading runs in: what it rewinds to.
@@ -692,7 +737,7 @@ private resolve_method(a: &Analysis, scope: Scope, m: MethodDecl, outer: Buf[Bin
         subst.push(outer.at(i))
 
     for i in 0..<m.tparams.len()
-        subst.push(Binding(m.tparams.at(i), Abstract(m.tparams.at(i), buf())))
+        subst.push(Binding(m.tparams.at(i), stand_in(a, scope, m.tparams.at(i), m.tvalues)))
 
     for i in 0..<m.params.len()
         resolve_type(a, scope, m.params.at(i).typ, subst)
@@ -709,6 +754,11 @@ private self_type(a: &Analysis, scope: Scope, owner: string, tparams: Buf[string
     // The arguments are the declaration's own parameters standing in for themselves, **carrying what
     // it asked of them** -- a field written `[8]C::W` is answerable exactly where `C` is bounded by
     // the trait declaring a `W`.
+    //
+    // **A value parameter stands here as a NAME, not as the number it stands as in a signature.**
+    // This builds the type at its own parameters, which reads its fields -- and a field's length is
+    // judged where something instantiates the type, not here. Standing at a number, `[N + 1]int`
+    // and `[N - 1]int` would be judged as the lengths of a type nobody asked for.
     val stood = abstract_subst(a, scope, tparams, bounds, buf(), buf(), buf())
     var targs: Buf[Type] = buf()
 

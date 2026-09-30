@@ -16,6 +16,7 @@ import sysl.text.{str_builder, StrBuilder}
 check_conformance(a: &Analysis, scope: Scope, span: Span, tr: TraitDecl, block: ImplDecl,
                   home: MemberHome) -> Buf[MethodDecl]
     var inherited: Buf[MethodDecl] = buf()
+    val before = a.complaints()
     val shown = trait_shown(a, block)
     val sig = signatures_under(a, home)
 
@@ -32,12 +33,19 @@ check_conformance(a: &Analysis, scope: Scope, span: Span, tr: TraitDecl, block: 
             a.fault(scope, span, s"'${home.label}' does not implement '$shown': ${member_kind(tm)} " +
                     s"'${source_member_name(tm.name)}' is missing")
 
+    // **A member the trait never declared is the block's mistake, told at the block and told once**:
+    // the first such member is named, and only where the block kept every promise the trait did
+    // make -- a block already told what it owes is not also told what it may not add. The member
+    // itself is left out of what the block supplies (`hoist_impl`), so its body is never read.
+    if a.complaints() > before then return inherited
+
     for i in 0..<block.methods.len()
         val im = block.methods.at(i)
 
-        if trait_method(tr, im.name).is_none() then
-            a.fault(home.scope, span, s"trait '$shown' declares no ${member_kind(im)} " +
+        if trait_method(tr, im.name).is_none()
+            a.fault(scope, span, s"trait '$shown' declares no ${member_kind(im)} " +
                     s"'${source_member_name(im.name)}', so this 'impl' cannot define it")
+            break
 
     inherited
 end check_conformance
