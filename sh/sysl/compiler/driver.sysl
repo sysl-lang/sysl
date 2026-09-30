@@ -552,6 +552,12 @@ private heap_refusal(path: string, t: Target) -> Result[unit, Refusal]
 end heap_refusal
 
 // Every allocator a program's packages named, the project's own first under "this project".
+//
+// **A `--lib` source root's claim is read too, named as the root was given**: a heap is a property
+// of the package and not of the road it arrived by, so the same directory settles the program's heap
+// whether a coordinate or the flag handed it over (`reference/packages.md § One heap`). Read from a
+// coordinate alone, the package's own objects came out of its heap and every string beside them out
+// of libc's, with nothing said. A root with no `package.hocon` has nothing to claim.
 private allocator_claims(root: string, m: Manifest) -> Buf[(string, (string, string))]
     var claims: Buf[(string, (string, string))] = buf()
 
@@ -562,9 +568,6 @@ private allocator_claims(root: string, m: Manifest) -> Buf[(string, (string, str
     val trees = handed_trees(root, m)
 
     for i in 0..<trees.len()
-        // What is read here is a package's manifest; a source root contributes its files alone.
-        if trees.at(i).from_lib then continue
-
         manifest_at(trees.at(i).dir) match
             Ok(theirs) -> theirs.allocator match
                 Some(pair) -> claims.push((trees.at(i).who, pair))
@@ -1086,7 +1089,8 @@ build_library_of(path: string, named_target: Option[string], out: Option[string]
 
     // The two requirements a command line answers, asked before anything is compiled: a package
     // whose C cannot be reached has nothing to gain from the ten seconds of analysis in front of it.
-    val probed = supplied_or_refused(path, t)?
+    // A `--lib` root is there to type-check against, its C not compiled, so its own are not asked.
+    val probed = supplied_or_refused(path, t, false)?
     val c = packaged_compilation_of(path, t)?
     val named = if manifest.name == "" then basename(root) else manifest.name
 
@@ -1384,7 +1388,12 @@ end native_objects
 // left to whoever wrote the package: the archive goes on *this* link line, so a machine without it
 // stops *this* build. Sorted within a manifest by the `.pc` name so that which library a build
 // complains about first does not depend on the order a HOCON block happened to be written in.
-private pkg_config_needs(path: string) -> Result[Buf[LibNeed], Refusal]
+//
+// **A `--lib` source root's need is collected as a coordinate's is, named as the root was given** --
+// its C goes on this link line exactly the same, so a binding handed over by the flag would otherwise
+// link without its library. `roots` is false for `build-lib`, where a root is there to type-check
+// against and none of its C is compiled.
+private pkg_config_needs(path: string, roots: bool) -> Result[Buf[LibNeed], Refusal]
     var out: Buf[LibNeed] = buf()
 
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
@@ -1395,8 +1404,7 @@ private pkg_config_needs(path: string) -> Result[Buf[LibNeed], Refusal]
     val trees = handed_trees(root, mine)
 
     for i in 0..<trees.len()
-        // What is read here is a package's manifest; a source root contributes its files alone.
-        if trees.at(i).from_lib then continue
+        if trees.at(i).from_lib && !roots then continue
 
         manifest_at(trees.at(i).dir) match
             Err(_) -> ()
@@ -1423,7 +1431,9 @@ end HeaderNeed
 // Every header requirement this compilation is answerable for -- this project's, then each package
 // it reaches. **A dependency's need is the consumer's problem** for the same reason a library's is:
 // the header is included by C compiled into *this* build, so a machine without it stops this build.
-header_needs(path: string) -> Result[Buf[HeaderNeed], Refusal]
+// A `--lib` source root's requirement is asked the same way, named as the root was given, except
+// where `roots` is false: `build-lib` compiles none of a root's C, so it has no header to ask for.
+header_needs(path: string, roots: bool = true) -> Result[Buf[HeaderNeed], Refusal]
     var out: Buf[HeaderNeed] = buf()
 
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
@@ -1434,8 +1444,7 @@ header_needs(path: string) -> Result[Buf[HeaderNeed], Refusal]
     val trees = handed_trees(root, mine)
 
     for i in 0..<trees.len()
-        // What is read here is a package's manifest; a source root contributes its files alone.
-        if trees.at(i).from_lib then continue
+        if trees.at(i).from_lib && !roots then continue
 
         manifest_at(trees.at(i).dir) match
             Err(_) -> ()
@@ -1503,9 +1512,11 @@ unmet_headers(needs: Buf[HeaderNeed]) -> Option[string]
 end unmet_headers
 
 // The two requirements a command line answers, checked together and in the order a reader can act
-// on: the headers a package's C includes, then the installed libraries it links.
-private supplied_or_refused(path: string, t: Target) -> Result[PkgAnswer, Refusal]
-    val headers = header_needs(path)?
+// on: the headers a package's C includes, then the installed libraries it links. `roots` says whether
+// the `--lib` source roots' own requirements are this command's to answer, which they are wherever
+// their C is compiled -- everywhere but `build-lib`.
+private supplied_or_refused(path: string, t: Target, roots: bool = true) -> Result[PkgAnswer, Refusal]
+    val headers = header_needs(path, roots)?
 
     answer_headers_from_env(headers)
 
@@ -1513,7 +1524,7 @@ private supplied_or_refused(path: string, t: Target) -> Result[PkgAnswer, Refusa
         Some(why) -> return Err(Refusal(why))
         None -> ()
 
-    probe_libs(pkg_config_needs(path)?, t) match
+    probe_libs(pkg_config_needs(path, roots)?, t) match
         Err(why) -> Err(Refusal(why))
         Ok(found) -> Ok(found)
 end supplied_or_refused
