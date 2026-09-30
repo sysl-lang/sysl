@@ -1,0 +1,229 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A diagnostic names a declaration by its QUALIFIED name, module and all, in the dotted spelling a
+// reader writes: `'m.use'`, `'m.P.get'`, `'sysl.fs.write_bytes'` -- never the `$` key a table holds
+// it under, and never with a file-private slot or an overload number on the end. A declaration of
+// the root module, a single-file program's own, has no module to show and prints bare.
+//
+// **This is the user's rule for this compiler (2026-09-29), and it differs from the reference on
+// purpose**: the installed sysl still quotes some keys as it holds them (`type 'm$P' has no method
+// 'nope'`, `so 'm$gen' cannot be generic`). Every message here is otherwise the reference's own
+// text, read off the installed `sysl` over the same tree.
+
+private var qnm_library_cache: Buf[Program] = buf()
+private var qnm_library_read: bool = false
+
+private qnm_library() -> Buf[Program]
+    if qnm_library_read then return qnm_library_cache
+
+    qnm_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> qnm_library_cache = units
+
+    qnm_library_cache
+end qnm_library
+
+private qnm_no_library() -> bool
+    if qnm_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end qnm_no_library
+
+// The whole report a program of several files is refused with, rendered as a reader sees it.
+private qnm_err(files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+    val library = qnm_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return parsed.report.at(0).message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end qnm_err
+
+private qnm_says(out: string, part: string)
+    assert(out.contains(part), s"expected '$part', got: $out")
+
+// The module every case below is about, in a file of its own.
+private qnm_module() -> string =
+    "module m\n" +
+    "\n" +
+    "use(x: int) -> int = x\n" +
+    "\n" +
+    "struct P\n" +
+    "    x: int\n" +
+    "\n" +
+    "    get(self) -> int = self.x\n"
+
+@test("a refusal about a call names the function with its module")
+qnm_a_function_is_named_with_its_module()
+    if qnm_no_library() then return
+
+    val out = qnm_err([("main.sysl", "import m\n\nval a = m.use()\nprint(a)\n"), ("m.sysl", qnm_module())])
+
+    qnm_says(out, "error: function 'm.use' takes 1 argument, but 0 arguments were given\n" +
+                  " --> main.sysl:3:11")
+
+@test("a method is named through its type, the type's module in front")
+qnm_a_method_is_named_through_its_type()
+    if qnm_no_library() then return
+
+    val out = qnm_err([("main.sysl", "import m\n\nval p = m.P(1)\nprint(p.get(2))\n"),
+                       ("m.sysl", qnm_module())])
+
+    qnm_says(out, "error: method 'm.P.get' takes 0 arguments, but 1 argument was given\n" +
+                  " --> main.sysl:4:9")
+
+@test("a type with no such method is named with its module, not by its key")
+qnm_a_type_is_named_with_its_module()
+    if qnm_no_library() then return
+
+    val out = qnm_err([("main.sysl", "import m\n\nval p = m.P(1)\nprint(p.nope())\n"),
+                       ("m.sysl", qnm_module())])
+
+    qnm_says(out, "error: type 'm.P' has no method 'nope'\n --> main.sysl:4:9")
+
+@test("an export that cannot be generic names the function with its module")
+qnm_a_generic_export_is_named_with_its_module()
+    if qnm_no_library() then return
+
+    val out = qnm_err([("main.sysl", "print(1)\n"), ("m.sysl", "module m\n\n@export\ngen[T](x: T) -> T = x\n")])
+
+    qnm_says(out, "error: an exported symbol is one function at one signature, so 'm.gen' cannot be " +
+                  "generic — there would be no way to say which instantiation the linker holds. " +
+                  "Export a wrapper per instantiation, each naming its own symbol\n --> m.sysl:3:1")
+
+@test("a function the program wrote in full is named once, not with its module twice")
+qnm_a_library_function_is_named_once()
+    if qnm_no_library() then return
+
+    val out = qnm_err([("main.sysl", "val b = sysl.fs.write_bytes()\n")])
+
+    qnm_says(out, "error: function 'sysl.fs.write_bytes' takes 2 arguments, but 0 arguments were " +
+                  "given\n --> main.sysl:1:17")
+
+@test("a file-private declaration is named without the slot a sibling made it take")
+qnm_a_private_declaration_is_named_without_its_slot()
+    if qnm_no_library() then return
+
+    val out = qnm_err([("main.sysl", "import m\n\nprint(m.hid(1))\n"),
+                       ("a.sysl", "module m\n\nprivate hid(x: int) -> int = x\n")])
+
+    qnm_says(out, "error: 'm.hid' is private to 'a.sysl', the file that declares it\n --> main.sysl:3:9")
+
+@test("a declaration of the root module has no module to show, and prints bare")
+qnm_a_root_declaration_prints_bare()
+    if qnm_no_library() then return
+
+    val out = qnm_err([("main.sysl", "use(x: int) -> int = x\n\nval a = use()\nprint(a)\n")])
+
+    qnm_says(out, "error: function 'use' takes 1 argument, but 0 arguments were given\n" +
+                  " --> main.sysl:3:9")
+
+// -- AnalyzerDeclErrorTests: an undefined function in another module -------------------------------
+
+// The one error a report holds, and nothing else: the reference compares the whole list.
+private qnm_only(out: string, part: string)
+    qnm_says(out, part)
+
+    assert(out.index_of("error:").unwrap() == out.last_index_of("error:").unwrap(),
+           s"more than one error: $out")
+
+private qnm_host() -> (string, string) = ("host.sysl", "module host\n\nwidth() -> int = 3\n")
+
+private qnm_nested() -> (string, string) = ("b.sysl", "module a.b\n\nwidth() -> int = 3\n")
+
+@test("is named as written, with a dot rather than the key's separator")
+qnm_an_undefined_function_is_named_with_a_dot()
+    if qnm_no_library() then return
+
+    val out = qnm_err([("main.sysl", "import host\n\nprint(host.size())\n"), qnm_host()])
+
+    qnm_only(out, "error: undefined function 'host.size'\n --> main.sysl:3:12")
+
+@test("and the same when its result is used further")
+qnm_and_the_same_when_its_result_is_used()
+    if qnm_no_library() then return
+
+    val out = qnm_err([("main.sysl", "import host\n\nprint(host.size(1) + 1)\n"), qnm_host()])
+
+    qnm_only(out, "error: undefined function 'host.size'\n --> main.sysl:3:12")
+
+@test("a nested module's path is dotted throughout")
+qnm_a_nested_module_is_dotted_throughout()
+    if qnm_no_library() then return
+
+    val out = qnm_err([("main.sysl", "import a.b\n\nprint(a.b.f())\n"), qnm_nested()])
+
+    qnm_only(out, "error: undefined function 'a.b.f'\n --> main.sysl:3:11")
+
+@test("and reached by its last segment it is still named by the whole path")
+qnm_reached_by_its_last_segment_it_is_named_whole()
+    if qnm_no_library() then return
+
+    val out = qnm_err([("main.sysl", "import a.b\n\nprint(b.f())\n"), qnm_nested()])
+
+    qnm_only(out, "error: undefined function 'a.b.f'\n --> main.sysl:3:9")
+
+// -- the rewrite itself ----------------------------------------------------------------------------
+
+@test("a key in a message is written as the qualified name")
+qnm_a_key_is_written_dotted()
+    assert_eq(readable_keys("function 'm$use' takes 1 argument"), "function 'm.use' takes 1 argument")
+    assert_eq(readable_keys("type 'm$P' has no method 'nope'"), "type 'm.P' has no method 'nope'")
+    assert_eq(readable_keys("'m$P.get'"), "'m.P.get'")
+    assert_eq(readable_keys("'sysl$Result'"), "'sysl.Result'")
+    assert_eq(readable_keys("'sysl.fs$write_bytes'"), "'sysl.fs.write_bytes'")
+
+@test("a file-private slot and an overload number are taken off")
+qnm_a_slot_and_an_overload_come_off()
+    assert_eq(readable_keys("'m$hid.private1'"), "'m.hid'")
+    assert_eq(readable_keys("'m$pick.private1.2'"), "'m.pick'")
+    assert_eq(readable_keys("'m$f.2'"), "'m.f'")
+    assert_eq(readable_keys("'m$P.private1.get'"), "'m.P.get'")
+
+@test("a guarded dollar reads as the dollar it stands for")
+qnm_a_guarded_dollar_is_a_dollar()
+    assert_eq(readable_keys("'m$a$24b'"), "'m.a$b'")
+    assert_eq(readable_keys("'a$24b'"), "'a$b'")
+
+@test("a generic instantiation keeps its type arguments")
+qnm_an_instantiation_keeps_its_arguments()
+    assert_eq(readable_keys("'Buf.push.int'"), "'Buf.push.int'")
+    assert_eq(readable_keys("'sysl.buf$Buf.push.int'"), "'sysl.buf.Buf.push.int'")
+
+@test("a dollar that is not a key is left as it was written")
+qnm_what_is_not_a_key_is_left_alone()
+    assert_eq(readable_keys("expected a name or '{' after '$'"), "expected a name or '{' after '$'")
+    assert_eq(readable_keys("'$name' is a placeholder"), "'$name' is a placeholder")
+    assert_eq(readable_keys("'..$n' names no type pack"), "'..$n' names no type pack")
+    assert_eq(readable_keys("'m.use' is dotted already"), "'m.use' is dotted already")
+    assert_eq(readable_keys("'use' is the root's own"), "'use' is the root's own")
+
+@test("a root-module key is its name, and qualified_name leaves it bare")
+qnm_a_root_key_is_bare()
+    assert_eq(qualified_name("use"), "use")
+    assert_eq(qualified_name("use.2"), "use")
+    assert_eq(qualified_name("m$hid.private1"), "m.hid")
