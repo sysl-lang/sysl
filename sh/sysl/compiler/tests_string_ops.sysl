@@ -1,0 +1,625 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Searching, trimming, splitting and joining (`reference/strings.md § What lives in the library`),
+// as a compiled program does them.
+//
+// Two properties are under test throughout. **The operations are written once and reach two
+// types**: `Search` is a trait with two required members, so `s.starts_with(t)` on a `string` and on
+// a `[]const u8` are the same code, and the cases running one spelling against both receivers are
+// checking the design and not just the answer. **Byte-level search is correct over UTF-8**: the
+// encoding is self-synchronizing, so a well-formed needle cannot match anywhere but at a character
+// boundary, and `s[a..b]` traps on a mid-codepoint bound — a case that slices at a returned offset
+// is checking that claim rather than restating it.
+//
+// **Every output quoted here was read out of the reference compiler** (0.0.152), whose
+// `StringOpsTests` these are. Each case asserts what the program printed AND that it exited
+// cleanly, so neither a refused build nor a trap can stand in for an answer.
+
+private var sop_library_cache: Buf[Program] = buf()
+private var sop_library_read: bool = false
+
+private sop_library() -> Buf[Program]
+    if sop_library_read then return sop_library_cache
+
+    sop_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> sop_library_cache = units
+
+    sop_library_cache
+end sop_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private sop_ready() -> bool
+    if sop_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end sop_ready
+
+// Builds a program exactly as written and runs it. Answers what it printed where it exited
+// cleanly, and otherwise a sentence no expected output can equal: why it was refused, or that it
+// stopped itself.
+private sop_whole(text: string) -> string
+    val root = make_temp_dir("sysl-string-ops").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it was refused: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"it did not exit cleanly: ${out.text}"
+end sop_whole
+
+// The suite's own `run`: every program is handed `sysl.text` wholesale, above what it wrote.
+private sop_ran(text: string) -> string = sop_whole("import sysl.text.*\n\n" + text)
+
+// ---- prefixes and suffixes ----
+
+@test("match at either end and nowhere else")
+sop_match_at_either_end_and_nowhere_else()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print("hello".starts_with("he"), "hello".starts_with("lo"))
+        print("hello".ends_with("lo"), "hello".ends_with("he"))
+        """), "true false\ntrue false\n")
+
+@test("the empty affix matches everything, and a whole string matches itself")
+sop_the_empty_affix_matches_everything()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print("abc".starts_with(""), "abc".ends_with(""), "abc".starts_with("abc"))
+        print("".starts_with(""), "".starts_with("x"))
+        """), "true true true\ntrue false\n")
+
+@test("an affix longer than the string is not one")
+sop_an_affix_longer_than_the_string_is_not_one()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print("ab".starts_with("abc"), "ab".ends_with("xab"))
+        """), "false false\n")
+
+// ---- finding ----
+
+@test("reports where the first and last occurrences start")
+sop_reports_where_the_first_and_last_occurrences_start()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print("abcabc".index_of("bc").unwrap(), "abcabc".last_index_of("bc").unwrap())
+        """), "1 4\n")
+
+@test("and nothing when it is not there")
+sop_and_nothing_when_it_is_not_there()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print("abc".index_of("z").is_none(), "abc".last_index_of("z").is_none())
+        print("ab".index_of("abc").is_none())
+        """), "true true\ntrue\n")
+
+// The two conventions read from opposite ends, which is what makes `split` on an empty separator
+// terminate rather than loop.
+@test("the empty needle is at the start going forwards and at the end going back")
+sop_the_empty_needle_is_at_the_start_and_at_the_end()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print("abc".index_of("").unwrap(), "abc".last_index_of("").unwrap())
+        """), "0 3\n")
+
+@test("single bytes are found from either end")
+sop_single_bytes_are_found_from_either_end()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print("a,b,c".index_of_byte(u8(',')).unwrap(), "a,b,c".last_index_of_byte(u8(',')).unwrap())
+        print("abc".index_of_byte(u8('z')).is_none())
+        """), "1 3\ntrue\n")
+
+@test("containment is the same question asked for a yes or no")
+sop_containment_is_the_same_question()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print("hello".contains("ell"), "hello".contains("elle"))
+        """), "true false\n")
+
+// Non-overlapping and left to right, which is the rule `replace_all` substitutes by — so the count
+// and the number of replacements always agree. In "aaa" there is one "aa", not two.
+@test("counting is non-overlapping, so it agrees with replacing")
+sop_counting_is_non_overlapping()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print("aaa".count_of("aa"), "aaaa".count_of("aa"), "abcabc".count_of("bc"))
+        print("abc".count_of("z"), "abc".count_of(""))
+        """), "1 2 2\n0 0\n")
+
+// ---- finding from an offset ----
+//
+// One rule across the family: `from` names a place to START, so the search is over `self[from..]`
+// and the answer is an offset in the whole receiver — and a backward search given a `from` looks at
+// that same suffix and answers with the LAST occurrence in it, rather than running downwards.
+
+@test("walks the occurrences without cutting the haystack up")
+sop_walks_the_occurrences_without_cutting_the_haystack_up()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var s = "abcabcabc"
+        print(s.index_of_from("abc", 1).unwrap(), s.index_of_from("abc", 4).unwrap())
+        print(s.index_of_from("abc", 7).is_none())
+        """), "3 6\ntrue\n")
+
+@test("and the backward one answers the last occurrence in the same suffix")
+sop_the_backward_one_answers_the_last_occurrence_in_the_suffix()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var s = "abcabcabc"
+        print(s.last_index_of_from("abc", 0).unwrap(), s.last_index_of_from("abc", 4).unwrap())
+        print(s.index_of_byte_from(u8('c'), 3).unwrap(), s.last_index_of_byte_from(u8('c'), 3).unwrap())
+        """), "6 6\n5 8\n")
+
+// A `from` past the end is not a position, so it is `None` rather than a trap — and `h.len` IS a
+// position, which is where the empty needle is still found.
+@test("an offset past the end answers nothing rather than trapping")
+sop_an_offset_past_the_end_answers_nothing()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var s = "abcabc"
+        print(s.index_of_from("abc", 9999).is_none(), s.last_index_of_from("abc", 9999).is_none())
+        print(s.index_of_byte_from(u8('a'), 9999).is_none(), s.index_of_from("", 9999).is_none())
+        print(s.index_of_from("", 3).unwrap(), s.last_index_of_from("", 3).unwrap())
+        """), "true true\ntrue true\n3 6\n")
+
+// The same surface on the other receiver, which is what says the offsets are trait defaults rather
+// than something written twice.
+@test("and it is the same code over bytes")
+sop_and_it_is_the_same_code_over_bytes()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var b = "abcabcabc".bytes
+        print(b.index_of_from("abc".bytes, 1).unwrap(), b.last_index_of_from("abc".bytes, 4).unwrap())
+        """), "3 6\n")
+
+// ---- the sub-linear search ----
+//
+// The searches are Boyer-Moore-Horspool for a needle of two bytes or more, and below a floor the
+// naive scan is still what runs — so a short haystack and a long one are two different functions
+// answering.
+
+// 900 bytes of one letter is over the threshold in every case, so every answer here comes from the
+// shifting search, and they are the answers the short fixtures above give for the same shapes.
+@test("agrees with the short-haystack answers on a haystack long enough to shift through")
+sop_agrees_on_a_haystack_long_enough_to_shift_through()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var hay: [900]u8
+        for i in 0..<hay.len do hay[i] = u8('a')
+        var h = hay[..]
+        print(h.count_of("aa".bytes), h.count_of("aaa".bytes))
+        print(h.index_of("aaa".bytes).unwrap(), h.last_index_of("aaa".bytes).unwrap())
+        print(h.index_of("aab".bytes).is_none(), h.last_index_of("b".bytes).is_none())
+        """), "450 300\n0 897\ntrue true\n")
+
+// The last window is the one the shift arithmetic reaches last, and an off-by-one in it answers
+// `None` here while passing everything shorter.
+@test("finds a needle in the last window, from either direction")
+sop_finds_a_needle_in_the_last_window()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var hay: [800]u8
+        for i in 0..<hay.len do hay[i] = u8('x')
+        hay[797] = u8('y')
+        hay[798] = u8('z')
+        hay[799] = u8('w')
+        var h = hay[..]
+        print(h.index_of("yzw".bytes).unwrap(), h.last_index_of("yzw".bytes).unwrap())
+        print(h.last_index_of_from("yzw".bytes, 797).unwrap(), h.last_index_of_from("yzw".bytes, 798).is_none())
+        """), "797 797\n797 true\n")
+
+// A shift table is the first thing in the search to want scratch storage of its own, and a
+// `[256]u8` local is what keeps it off the heap: `@no_alloc` is checked against the call graph, so
+// a table promoted to the heap would be refused here rather than merely being slower. The
+// reference's case asks only that the program compiles; it is run here too, and `529` is what the
+// reference's build of it prints.
+@test("and it allocates nothing, which the shift table is the first thing to threaten")
+sop_and_it_allocates_nothing()
+    if !sop_ready() then return
+
+    assert_eq(sop_whole(raw"""
+        @no_alloc
+
+        import sysl.text.*
+
+        look(h: []const u8, n: []const u8) -> usize
+            h.index_of(n).unwrap_or(0) + h.last_index_of(n).unwrap_or(0) + h.count_of(n)
+
+        var hay: [400]u8
+
+        for i in 0..<hay.len do hay[i] = u8(97 + i % 3)
+
+        print(look(hay[..], "cab".bytes))
+        """), "529\n")
+
+// ---- searching text that is not ASCII ----
+
+// The self-synchronizing property, stated as a test: `é` is `C3 A9`, and the `A9` byte cannot be
+// mistaken for the start of anything, so a needle can only ever match at a boundary.
+@test("a needle matches only at a character boundary")
+sop_a_needle_matches_only_at_a_character_boundary()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print("héllo".index_of("llo").unwrap(), "héllo".index_of("é").unwrap())
+        """), "3 1\n")
+
+// `s[a..]` traps on a mid-codepoint bound, so this printing at all is the guarantee — a search that
+// could report an interior byte would abort here.
+@test("so an offset it reports is always safe to slice at")
+sop_an_offset_it_reports_is_always_safe_to_slice_at()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var s = "αβγ-δε"
+        var at = s.index_of("-").unwrap()
+        print(s[..<at], s[at + 1usize..])
+        """), "αβγ δε\n")
+
+// ---- trimming answers with a view of what it was given ----
+
+@test("whitespace comes off either end or both")
+sop_whitespace_comes_off_either_end_or_both()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(f"[${"  hi  ".trim_start()}%s]", f"[${"  hi  ".trim_end()}%s]", f"[${"  hi  ".trim()}%s]")
+        """), "[hi  ] [  hi] [hi]\n")
+
+// All six of C's whitespace characters, since the trim is written on `Ascii.is_space` and a
+// hand-rolled one would stop after space and tab.
+@test("and it is all of the whitespace, not just the space")
+sop_and_it_is_all_of_the_whitespace()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(f"[${" \t\n\u{b}\u{c}\rhi\r\u{c}\u{b}\n\t ".trim()}%s]")
+        """), "[hi]\n")
+
+@test("a string that is all whitespace trims to nothing")
+sop_a_string_that_is_all_whitespace_trims_to_nothing()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print("   ".trim().is_empty(), "".trim().is_empty(), "x".trim())
+        """), "true true x\n")
+
+@test("a cutset trims the bytes the caller names instead")
+sop_a_cutset_trims_the_bytes_the_caller_names()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print("xxhixx".trim_matches("x"), "//a//".trim_start_matches("/"), "//a//".trim_end_matches("/"))
+        """), "hi a// //a\n")
+
+// A set, not a sequence: any of its bytes is trimmed, in any order and any number of times.
+@test("the cutset is a set of bytes rather than a string to match")
+sop_the_cutset_is_a_set_of_bytes()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(f"[${"ab-ba-x-abba".trim_matches("ab")}%s]")
+        """), "[-ba-x-]\n")
+
+// ---- the same operations reach bytes that are not text ----
+
+// The whole point of the trait: one spelling, two types, one implementation.
+@test("a byte view answers exactly as the string does")
+sop_a_byte_view_answers_exactly_as_the_string_does()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var s = "hello, world"
+        var b = s.bytes
+        print(s.starts_with("hello"), b.starts_with("hello".bytes))
+        print(s.index_of("world").unwrap(), b.index_of("world".bytes).unwrap())
+        print(s.count_of("l"), b.count_of("l".bytes))
+        """), "true true\n7 7\n3 3\n")
+
+@test("and trimming a byte view yields a byte view")
+sop_trimming_a_byte_view_yields_a_byte_view()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var b = "  hi  ".bytes
+        print(b.trim().len, b.len)
+        """), "2 6\n")
+
+// `s.bytes` is already read-only. A buffer a program is still filling is a WRITABLE `[]u8`, and a
+// `[]T` is accepted wherever a `[]const T` is wanted — a receiver being such a place
+// (`reference/arrays.md § []const T — a view that may not be written`).
+@test("a writable byte view reaches them too, since it is the same type with a bit")
+sop_a_writable_byte_view_reaches_them_too()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var raw = [104u8, 105u8, 33u8]
+        var needle = [105u8, 33u8]
+        print(raw[..].contains(needle[..]), raw[..].index_of(needle[..]).unwrap())
+        print(raw[..].starts_with([104u8][..]), raw[..].is_empty())
+        """), "true 1\ntrue false\n")
+
+@test("and a trim of one still answers, through the same widening")
+sop_a_trim_of_a_writable_view_still_answers()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var raw = [32u8, 104u8, 105u8, 32u8]
+        print(raw[..].trim().len, raw[..].len)
+        """), "2 4\n")
+
+// ---- splitting ----
+
+@test("yields one more piece than there are separators")
+sop_yields_one_more_piece_than_there_are_separators()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        for p in split("a,b,c", ",") do print(f"[$p%s]")
+        """), "[a]\n[b]\n[c]\n")
+
+// Nothing is silently dropped: adjacent separators and separators at the ends all produce the empty
+// pieces they imply, which is what makes the count predictable.
+@test("including the empty pieces that adjacent and edge separators imply")
+sop_including_the_empty_pieces()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        for p in split(",a,,b,", ",") do print(f"[$p%s]")
+        """), "[]\n[a]\n[]\n[b]\n[]\n")
+
+@test("a separator that is not there leaves one piece")
+sop_a_separator_that_is_not_there_leaves_one_piece()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var ps = split("abc", ",")
+        print(ps.len, ps[0])
+        """), "1 abc\n")
+
+@test("a multi-byte separator works like any other")
+sop_a_multi_byte_separator_works_like_any_other()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        for p in split("a::b::c", "::") do print(f"[$p%s]")
+        """), "[a]\n[b]\n[c]\n")
+
+// Splitting on nothing has no meaningful byte-level answer for text — it would cut multi-byte
+// characters apart — and the character-level reading is what `s.chars` already is.
+@test("an empty separator yields the whole string rather than its bytes")
+sop_an_empty_separator_yields_the_whole_string()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var ps = split("abc", "")
+        print(ps.len, ps[0])
+        """), "1 abc\n")
+
+@test("an empty string splits to one empty piece")
+sop_an_empty_string_splits_to_one_empty_piece()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var ps = split("", ",")
+        print(ps.len, ps[0].is_empty())
+        """), "1 true\n")
+
+// ---- fields is not split on a space ----
+
+// A run of whitespace separates two fields rather than producing empty ones between them, and the
+// edges produce nothing at all.
+@test("runs of whitespace separate, and the edges produce nothing")
+sop_runs_of_whitespace_separate()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        for f in fields("  one   two\tthree  ") do print(f"[$f%s]")
+        """), "[one]\n[two]\n[three]\n")
+
+@test("where split would have produced empties")
+sop_where_split_would_have_produced_empties()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(fields("a  b").len, split("a  b", " ").len)
+        """), "2 3\n")
+
+@test("nothing but whitespace has no fields at all")
+sop_nothing_but_whitespace_has_no_fields_at_all()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(fields("   ").len, fields("").len)
+        """), "0 0\n")
+
+// ---- joining ----
+
+@test("is split's inverse for a separator split would have found")
+sop_join_is_splits_inverse()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(join(split("a,b,c", ","), ","))
+        print(join(split("a,b,c", ","), " - "))
+        """), "a,b,c\na - b - c\n")
+
+@test("one piece needs no separator, and none needs nothing")
+sop_one_piece_needs_no_separator()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(f"[${join(["solo"], ",")}%s]", f"[${join([], ",")}%s]")
+        """), "[solo] []\n")
+
+@test("an empty separator lays the pieces end to end")
+sop_an_empty_separator_lays_the_pieces_end_to_end()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(join(["a", "b", "c"], ""))
+        """), "abc\n")
+
+// ---- repeating ----
+
+@test("lays down the text n times")
+sop_lays_down_the_text_n_times()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(repeat("ab", 3usize), f"[${repeat("ab", 1usize)}%s]")
+        """), "ababab [ab]\n")
+
+@test("zero times, and of nothing, is nothing")
+sop_zero_times_and_of_nothing_is_nothing()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(repeat("ab", 0usize).is_empty(), repeat("", 5usize).is_empty())
+        """), "true true\n")
+
+// ---- replacing ----
+
+@test("substitutes every occurrence, whether the replacement is longer or shorter")
+sop_substitutes_every_occurrence()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(replace_all("a.b.c", ".", "->"), replace_all("a->b->c", "->", "."))
+        """), "a->b->c a.b.c\n")
+
+@test("and leaves a string with no occurrence exactly as it was")
+sop_leaves_a_string_with_no_occurrence_as_it_was()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(replace_all("abc", "z", "!"), replace_all("ab", "abc", "!"))
+        """), "abc ab\n")
+
+// The scan continues after what was substituted, so a replacement containing the pattern does not
+// feed on itself — which is the loop an implementation restarting from the same place hangs in.
+@test("a replacement containing the pattern does not feed on itself")
+sop_a_replacement_containing_the_pattern_does_not_feed_on_itself()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(replace_all("aa", "a", "aa"))
+        """), "aaaa\n")
+
+@test("non-overlapping, so the count of replacements matches count_of")
+sop_the_count_of_replacements_matches_count_of()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(replace_all("aaa", "aa", "-"), "aaa".count_of("aa"))
+        """), "-a 1\n")
+
+// Everywhere would insert between every pair of bytes, which for text cuts characters apart.
+@test("an empty pattern matches nowhere rather than everywhere")
+sop_an_empty_pattern_matches_nowhere()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(replace_all("abc", "", "-"))
+        """), "abc\n")
+
+// ---- case conversion ----
+
+@test("converts the ASCII letters, which is where it started")
+sop_converts_the_ascii_letters()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(to_upper("hello, world! 42"), to_lower("HELLO, WORLD! 42"))
+        """), "HELLO, WORLD! 42 hello, world! 42\n")
+
+// The conversion is a walk over the Unicode Character Database rather than an ASCII map, so a
+// character outside ASCII changes case like any other.
+@test("a character outside ASCII is mapped rather than passed through")
+sop_a_character_outside_ascii_is_mapped()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(to_upper("héllo"), to_lower("HÉLLO"))
+        """), "HÉLLO héllo\n")
+
+// Stronger than comparing the text: the result is a `string` like any other, so it still walks as
+// the same characters. The byte length is not part of the claim — a Unicode mapping can change a
+// character's width in either direction — and the character count is.
+@test("and what comes out is still well-formed, with its character count intact")
+sop_what_comes_out_is_still_well_formed()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        var s = "héllo-→-𝄞"
+        var u = to_upper(s)
+        var n = 0
+        for _ in u.chars do n += 1
+        var m = 0
+        for _ in s.chars do m += 1
+        print(u, n, n == m)
+        """), "HÉLLO-→-𝄞 9 true\n")
+
+// Full casing gives `SS`, and the simple mapping a `char -> char` signature can promise gives the
+// capital sharp s.
+@test("a sharp s uppercases to the capital sharp s, not to SS")
+sop_a_sharp_s_uppercases_to_the_capital_sharp_s()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(to_upper("straße"))
+        """), "STRAẞE\n")
+
+@test("an empty string converts to an empty string")
+sop_an_empty_string_converts_to_an_empty_string()
+    if !sop_ready() then return
+
+    assert_eq(sop_ran(raw"""
+        print(to_upper("").is_empty(), to_lower("").is_empty())
+        """), "true true\n")
