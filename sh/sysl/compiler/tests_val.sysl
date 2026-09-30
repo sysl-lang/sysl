@@ -1,0 +1,560 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `val` -- a binding written once (`reference/modules.md § val — a thing`).
+//
+// This file is about the **module member**: read-only storage laid into the object file, which is
+// what a table of round constants needs and what a `const` can never be, a constant being folded
+// into its uses and having no address to index.
+//
+// In a file the program *starts* in -- which is what a single-file program is -- that is spelled
+// `static val`, such a file being a body and a plain `val` written there one of its locals. A file
+// with no statements needs no modifier, which is why the two-file programs here are written plain.
+//
+// The two properties worth pinning are that it has an **address** -- so it can be indexed, iterated
+// and reached into -- and that the address is not a writable one, at any depth.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private vlt_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end vlt_ready
+
+// The untyped tree of a file as `emit-ast --no-spans` prints it.
+private vlt_tree(text: string) -> string
+    val r = parse(source_of("t.sysl", text))
+
+    if !r.ok() then return s"!${r.first().message}"
+
+    emit_ast(r.program, false)
+end vlt_tree
+
+// What the reference prints for a file holding one `static val n … = 3`, down to the line after the
+// declaration, with the two things the three spellings differ in handed over.
+private vlt_decl(typ: string, vis: string) -> string =
+    "Program\n  body: \n    - StaticDecl\n        inner: ValDecl\n          name: \"n\"\n" +
+    s"          typ: $typ\n          value: IntLit\n            value: 3\n            suffix: None\n" +
+    s"          vis: $vis\n          align: None\n          section: None\n  module: None\n"
+
+private vlt_int() -> string = "NamedType\n            name: \"int\"\n            args: []"
+
+// A file of a program: the module it belongs to (a directory path), its name, and its text.
+private vlt_files() -> Buf[(string, string, string)] = buf()
+
+// **What a program of these files PRINTS and whether it exited zero**, or what the build had to say
+// about it instead, with the project root written as `@`.
+private vlt_outcome(files: Buf[(string, string, string)]) -> (string, bool)
+    // `$TMPDIR` ends in a slash, and a diagnostic names the file by its normalized path.
+    val root = replace_all(make_temp_dir("sysl-vlt").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+
+    for i in 0..<files.len()
+        val f = files.at(i)
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return (said, false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text, out.status.ok())
+end vlt_outcome
+
+private vlt_one(text: string) -> Buf[(string, string, string)]
+    var fs = vlt_files()
+
+    fs.push(("", "main.sysl", text))
+    fs
+
+// A module `tables` of one file beside a beginning that reads it.
+private vlt_tables(t: string, main: string) -> Buf[(string, string, string)]
+    var fs = vlt_files()
+
+    fs.push(("tables", "t.sysl", t))
+    fs.push(("", "main.sysl", main))
+    fs
+
+// One file, as the whole program: what it printed, or why it did not get that far.
+private vlt_ran(text: string) -> string
+    val out = vlt_outcome(vlt_one(text))
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+end vlt_ran
+
+private vlt_prints(text: string, expected: string)
+    if !vlt_ready() then return
+
+    assert_eq(vlt_ran(text), expected)
+
+// Whether a program that BUILT stopped short of exiting zero -- a check that failed.
+private vlt_exits(text: string) -> bool
+    val out = vlt_outcome(vlt_one(text))
+
+    !out.1 && !out.0.contains("error:")
+
+// The LLVM text `emit-llvm` prints for one file, or what the compiler said instead.
+private vlt_ir(text: string) -> string
+    val root = make_temp_dir("sysl-vlt").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vlt_ir
+
+private vlt_has(text: string, part: string) =
+    assert(text.contains(part), s"expected '$part' in: $text")
+
+private vlt_has_not(text: string, part: string) =
+    assert(!text.contains(part), s"expected no '$part' in: $text")
+
+private vlt_pair() -> string = "struct Pair\n    a: int\n    b: int\nend Pair\n"
+
+// -- the form parses ------------------------------------------------------------------------------
+
+private vlt_parses_as(text: string, typ: string, vis: string)
+    val tree = vlt_tree(text)
+
+    assert(tree.starts_with(vlt_decl(typ, vis)), tree)
+
+@test("a 'static val' parses with a type and a value")
+vlt_parses_with_a_type_and_a_value() = vlt_parses_as("static val n: int = 3", vlt_int(), "Public")
+
+@test("a 'static val' parses with the type left off")
+vlt_parses_with_the_type_left_off() = vlt_parses_as("static val n = 3", "None", "Public")
+
+@test("a 'static val' takes a visibility modifier, as every other declaration does")
+vlt_takes_a_visibility_modifier() = vlt_parses_as("private static val n: int = 3", vlt_int(), "File")
+
+// The value is what tells a `val` from a `var` to the parser as well as to a reader: a binding
+// written once with nothing to hold is not a declaration of anything.
+@test("but a 'static val' does not parse without a value")
+vlt_not_without_a_value()
+    assert_eq(pf_err("static val n: int"), "'=' expected")
+    assert_eq(pf_at("static val n: int"), "1:18")
+
+// -- a module-level 'val' -------------------------------------------------------------------------
+
+@test("a module-level 'val' is read by name")
+vlt_is_read_by_name() = vlt_prints("static val n: int = 7\nprint(str(n))", "7\n")
+
+@test("a module-level 'val' holds a table, which is the thing a 'const' cannot be")
+vlt_holds_a_table() = vlt_prints("static val k: [4]u32 = [11, 22, 33, 44]\nprint(str(k[2]))", "33\n")
+
+@test("a module-level 'val' is indexed at a value only known while running")
+vlt_is_indexed_at_a_running_value() =
+    vlt_prints("static val k: [4]int = [11, 22, 33, 44]\nvar total = 0\nfor i in 0..<4 do total += k[i]\n" +
+               "print(str(total))", "110\n")
+
+@test("a module-level 'val' is iterated")
+vlt_is_iterated() =
+    vlt_prints("static val k: [3]int = [2, 3, 4]\nvar p = 1\nfor x in k do p *= x\nprint(str(p))", "24\n")
+
+@test("a module-level 'val' reports its length")
+vlt_reports_its_length() = vlt_prints("static val k: [5]u8 = [1; 5]\nprint(str(k.len))", "5\n")
+
+@test("a module-level 'val' may be built with a repeat")
+vlt_may_be_built_with_a_repeat() =
+    vlt_prints("static val k: [8]int = [3; 8]\nprint(str(k[7]))\nprint(str(k.len))", "3\n8\n")
+
+@test("a module-level 'val' takes its element type from its declaration, so the elements need no suffix")
+vlt_takes_its_element_type_from_its_declaration() =
+    vlt_prints("static val k: [2]u64 = [0xcbf29ce484222325, 2]\nprint(str(k[0]))", "14695981039346656037\n")
+
+@test("a module-level 'val' is reached from a function, wherever the function is written")
+vlt_is_reached_from_a_function() =
+    vlt_prints("first() -> int = k[0]\nstatic val k: [2]int = [9, 8]\nprint(str(first()))", "9\n")
+
+// Order-freedom is what makes it a declaration rather than a statement: nothing runs to initialize
+// it, so nothing has to run first.
+@test("a module-level 'val' may be written in terms of a 'const' declared below it")
+vlt_in_terms_of_a_const_declared_below() =
+    vlt_prints("static val k: [n]int = [4; n]\nconst n: usize = 3\nprint(str(k.len))\nprint(str(k[2]))",
+               "3\n4\n")
+
+// The other half of order-freedom, and the sharp one: where the initializer *does* have to run, it
+// runs with the module's other initializers and not in the place it was written. So a `static val`
+// sitting between two statements is **not** evaluated between them -- it is already bound by the
+// time the first of them runs.
+@test("a module-level 'val' runs its initializer ahead of the script, wherever it was written")
+vlt_runs_its_initializer_ahead_of_the_script() =
+    vlt_prints("print(\"script\")\n\nstatic val n: int = noisy()\n\nprint(str(n))\n\nnoisy() -> int\n" +
+               "    print(\"initializer\")\n    7\nend noisy", "initializer\nscript\n7\n")
+
+@test("a module-level 'val' is reached from another module, fully qualified")
+vlt_is_reached_from_another_module()
+    if !vlt_ready() then return
+
+    val out = vlt_outcome(vlt_tables("module tables\nval k: [2]int = [5, 6]", "print(str(tables.k[1]))"))
+
+    assert_eq(out.0, "6\n")
+
+@test("and privately, a module-level 'val' is reached only from its own file")
+vlt_privately_only_from_its_own_file()
+    if !vlt_ready() then return
+
+    val out = vlt_outcome(vlt_tables("module tables\nprivate val k: [2]int = [5, 6]",
+                                     "print(str(tables.k[1]))"))
+
+    vlt_has(out.0, "error: 'tables.k' is private to '@/tables/t.sysl', the file that declares it\n" +
+                   " --> @/main.sysl:1:18")
+
+@test("a module-level 'val' nests")
+vlt_nests() =
+    vlt_prints("static val g: [2][3]int = [[1, 2, 3], [4, 5, 6]]\nprint(str(g[1][0]))", "4\n")
+
+@test("a module-level 'val' holds floats")
+vlt_holds_floats() = vlt_prints("static val w: [2]f64 = [0.5, 0.25]\nprint(str(w[0] + w[1]))", "0.75\n")
+
+@test("a module-level 'val' holds narrow floats")
+vlt_holds_narrow_floats() =
+    vlt_prints("static val w: [2]f32 = [0.5, 0.25]\nprint(str(w[0] + w[1]))", "0.75\n")
+
+@test("a module-level 'val' holds bools")
+vlt_holds_bools() =
+    vlt_prints("static val b: [3]bool = [true, false, true]\nprint(str(b[0] && b[2]))", "true\n")
+
+// An array is a value, so binding one to a `var` copies it -- which is how a program that wants to
+// work from a table gets writable storage without the table being writable.
+@test("a module-level 'val' is copied, not aliased, when it is bound to a 'var'")
+vlt_is_copied_not_aliased() =
+    vlt_prints("static val k: [3]int = [1, 2, 3]\nvar c = k\nc[0] = 99\nprint(str(c[0]))\nprint(str(k[0]))",
+               "99\n1\n")
+
+@test("a module-level 'val' is passed to a function by value")
+vlt_is_passed_by_value() =
+    vlt_prints("sum(a: [3]int) -> int = a[0] + a[1] + a[2]\nstatic val k: [3]int = [1, 2, 3]\n" +
+               "print(str(sum(k)))", "6\n")
+
+// -- it is laid into the object file ---------------------------------------------------------------
+//
+// The point of the whole exercise: storage that costs nothing to reach and nothing to set up.
+
+@test("a 'val' is laid into the object file as a constant global, with no code to initialize it")
+vlt_laid_as_a_constant_global()
+    if !vlt_ready() then return
+
+    vlt_has(vlt_ir("static val k: [3]u32 = [7, 8, 9]\nprint(str(k[0]))"),
+            "@k = private constant [3 x i32] [i32 7, i32 8, i32 9]")
+
+@test("a 'val' is laid down with a repeat written out, since a global has no loop to run")
+vlt_laid_with_a_repeat_written_out()
+    if !vlt_ready() then return
+
+    vlt_has(vlt_ir("static val k: [4]u8 = [2; 4]\nprint(str(k[0]))"),
+            "@k = private constant [4 x i8] [i8 2, i8 2, i8 2, i8 2]")
+
+// A narrow float has to be rounded where the constant is written, there being no `fptrunc` to run
+// before the program starts -- and LLVM refuses a hex constant a `float` cannot hold, so the f64
+// bits of `0.1` (0x3FB999999999999A) would not merely be imprecise, it would not build.
+@test("a 'val' is laid down with a narrow float rounded to its own width, not to a double's")
+vlt_laid_with_a_narrow_float_rounded()
+    if !vlt_ready() then return
+
+    vlt_has(vlt_ir("static val w: [1]f32 = [0.1]\nprint(str(w[0]))"),
+            "@w = private constant [1 x float] [float 0x3FB99999A0000000]")
+
+@test("and reaching an element of a 'val' is a 'getelementptr' from the global itself")
+vlt_an_element_is_a_gep_from_the_global()
+    if !vlt_ready() then return
+
+    vlt_has(vlt_ir("static val k: [4]int = [1, 2, 3, 4]\nprint(str(k[1]))"),
+            "getelementptr i32, ptr @k, i64 1")
+
+// A struct is fields laid side by side, so it is a constant tree exactly when its fields are -- the
+// same rule the array above follows.
+@test("a 'val' is laid down as a struct constant, field by field, rather than stores a prologue makes")
+vlt_laid_as_a_struct_constant()
+    if !vlt_ready() then return
+
+    val out = vlt_ir(vlt_pair() + "static val p: Pair = Pair(1, 2)\nprint(str(p.a))")
+
+    vlt_has(out, "@p = private constant %struct.Pair { i32 1, i32 2 }")
+    vlt_has_not(out, "@p = private global")
+
+@test("and a 'val' is a table of structs, which is the shape a driver's device list has")
+vlt_laid_as_a_table_of_structs()
+    if !vlt_ready() then return
+
+    vlt_has(vlt_ir(vlt_pair() + "static val ps: [2]Pair = [Pair(1, 2), Pair(3, 4)]\nprint(str(ps[1].a))"),
+            "@ps = private constant [2 x %struct.Pair] " +
+            "[%struct.Pair { i32 1, i32 2 }, %struct.Pair { i32 3, i32 4 }]")
+
+// The other side of the line, which is what keeps the arm above from being vacuous: one field that
+// has to be computed makes the whole struct code, and the storage writable again.
+@test("while a struct 'val' with one computed field is a computed 'val' like any other")
+vlt_one_computed_field_is_computed()
+    if !vlt_ready() then return
+
+    val out = vlt_ir(vlt_pair() + "n() -> int = 1\nstatic val p: Pair = Pair(n(), 2)\nprint(str(p.a))")
+
+    vlt_has(out, "@p = private global %struct.Pair zeroinitializer")
+    vlt_has_not(out, "@p = private constant")
+
+// -- a module-level 'val' holds a string literal ---------------------------------------------------
+//
+// The rule it relaxes was never about `string`. It is about a count with nowhere to write the
+// release, and a literal takes none: its bytes are a constant in read-only data and its owner word
+// is null, which both retain and release test for and do nothing about. So what decides is the
+// initializer -- a literal is admitted and a built string is not.
+
+@test("a string 'val' is read by name")
+vlt_a_string_is_read_by_name() =
+    vlt_prints("static val greeting: string = \"hello\"\nprint(greeting)", "hello\n")
+
+@test("a string 'val' is three words with a null owner, laid straight into the object file")
+vlt_a_string_is_three_words_with_a_null_owner()
+    if !vlt_ready() then return
+
+    val out = vlt_ir("static val greeting: string = \"hello\"\nprint(greeting)")
+
+    vlt_has(out, "@greeting = private constant { ptr, ptr, i64 } { ptr null, ptr @.str")
+    vlt_has_not(out, "@greeting = private global")
+
+// The case the whole feature is for: a table indexed at a position only known while running, which
+// is the one thing a `const` can never be.
+@test("a table of string literals is indexed at a value only known while running")
+vlt_a_table_of_strings_is_indexed() =
+    vlt_prints("static val names: [3]string = [\"alpha\", \"beta\", \"gamma\"]\nvar i = 2\nprint(names[i])",
+               "gamma\n")
+
+@test("a table of string literals is iterated, since it is storage rather than a folded value")
+vlt_a_table_of_strings_is_iterated() =
+    vlt_prints("static val names: [3]string = [\"a\", \"bb\", \"ccc\"]\nvar total: usize = 0\n" +
+               "for s in names do total += s.len\nprint(str(total))", "6\n")
+
+@test("a repeat of a string literal is written out, as a global has no loop to run")
+vlt_a_repeat_of_strings() =
+    vlt_prints("static val xs: [3]string = [\"x\"; 3]\nvar i = 1\nprint(xs[i])", "x\n")
+
+// A text block is joined by the lexer into one constant, so it arrives as a literal and needs no
+// rule of its own.
+@test("a text block in a 'val' is one literal by the time the analyzer sees it")
+vlt_a_text_block_is_one_literal() =
+    vlt_prints("val banner: string = \"\"\"\n    one\n    two\n    \"\"\"\nprint(banner)", "one\ntwo\n\n")
+
+// A struct is admitted by the same recursion, so a `{name, code}` pair -- which is what a device
+// table actually is -- is one declaration rather than two parallel arrays.
+@test("a 'val' holds a struct with a string literal in it, and a table of those")
+vlt_a_struct_with_a_string_and_a_table_of_those() =
+    vlt_prints("struct Device\n    name: string\n    code: int\nend Device\n" +
+               "static val devices: [2]Device = [Device(\"uart\", 16), Device(\"timer\", 32)]\n" +
+               "var i = 1\nprint(devices[i].name, str(devices[i].code))", "timer 32\n")
+
+@test("a 'val' holds a tuple with a string literal in it, a struct with its fields named for their positions")
+vlt_a_tuple_with_a_string() =
+    vlt_prints("static val t: (int, string) = (1, \"one\")\nprint(str(t.0), t.1)", "1 one\n")
+
+// The motivation, stated as a test: a module that has declared it will not allocate may still name
+// its messages, index them, measure them, and cut them up.
+@test("a table of string literals in a module that declared '@no_alloc', which is what the relaxation is for")
+vlt_strings_in_a_no_alloc_module() =
+    vlt_prints("@no_alloc\n\n" +
+               "static val messages: [3]string = [\"out of range\", \"not permitted\", \"no such device\"]\n\n" +
+               "var i = 2\nprint(messages[i])\nprint(messages[i].len)\nprint(messages[0][0..<3])",
+               "no such device\n14\nout\n")
+
+// -- a constant tree nests --------------------------------------------------------------------------
+//
+// A constant expression is written out in full rather than built, so every shape that can nest
+// inside another has to be spelled correctly at every depth.
+
+@test("a constant tree nests a struct inside a struct")
+vlt_nests_a_struct_inside_a_struct()
+    if !vlt_ready() then return
+
+    vlt_has(vlt_ir("struct Inner\n    a: int\n    b: int\nend Inner\nstruct Outer\n    i: Inner\n    c: int\n" +
+                   "end Outer\nstatic val o: Outer = Outer(Inner(1, 2), 3)\nprint(str(o.i.b))"),
+            "@o = private constant %struct.Outer { %struct.Inner { i32 1, i32 2 }, i32 3 }")
+
+@test("a constant tree nests an array inside a struct")
+vlt_nests_an_array_inside_a_struct()
+    if !vlt_ready() then return
+
+    vlt_has(vlt_ir("struct S\n    xs: [2]int\n    n:  int\nend S\nstatic val s: S = S([4, 5], 6)\n" +
+                   "print(str(s.xs[1]))"),
+            "@s = private constant %struct.S { [2 x i32] [i32 4, i32 5], i32 6 }")
+
+@test("a constant tree holds a bool and a narrow float in one, each at its own width")
+vlt_nests_a_bool_and_a_narrow_float()
+    if !vlt_ready() then return
+
+    vlt_has(vlt_ir("struct S\n    on: bool\n    w:  f32\nend S\nstatic val s: S = S(true, 0.1)\n" +
+                   "print(str(s.on))"),
+            "@s = private constant %struct.S { i1 1, float 0x3FB99999A0000000 }")
+
+// A pointer written as a number is an `inttoptr`, which is itself a constant expression -- so it
+// nests inside a struct constant the same way a number does. This is the driver's register block
+// with its own name beside it.
+@test("a constant tree holds an address the datasheet gives, inside a struct beside its name")
+vlt_nests_a_datasheet_address()
+    if !vlt_ready() then return
+
+    val out = vlt_ir("const UART: usize = 0x1000_0000\nstruct Device\n    name: string\n    base: *u32\n" +
+                     "end Device\nstatic val uart: Device = Device(\"uart\", ptr_cast(UART))\n" +
+                     "print(uart.name)")
+
+    vlt_has(out, "ptr inttoptr (i64 268435456 to ptr) }")
+    vlt_has(out, "@uart = private constant %struct.Device")
+
+@test("a constant tree nests an array of tuples carrying strings")
+vlt_nests_an_array_of_tuples_with_strings() =
+    vlt_prints("static val rows: [2](int, string) = [(1, \"one\"), (2, \"two\")]\nvar i = 1\n" +
+               "print(str(rows[i].0), rows[i].1)", "2 two\n")
+
+@test("a constant tree holds a generic struct instantiated at 'string'")
+vlt_nests_a_generic_struct_at_string() =
+    vlt_prints("struct Cell[T]\n    v: T\nend Cell\nstatic val c: Cell[string] = Cell(\"held\")\nprint(c.v)",
+               "held\n")
+
+// The length a literal carries is its bytes, not its characters, and the empty one is a real value
+// rather than an absent pointer -- both of which the three-word constant has to say.
+@test("a string 'val' holds the empty literal, whose bytes are none of them")
+vlt_the_empty_literal() =
+    vlt_prints("static val e: string = \"\"\nprint(e.len, e == \"\")", "0 true\n")
+
+@test("a string 'val' holds a literal with an escape and a character outside ASCII")
+vlt_a_literal_with_an_escape_and_non_ascii() =
+    vlt_prints("static val s: string = \"a\\tb\\u{e9}\"\nprint(s.len)\nprint(s)", "5\na\tb\u{e9}\n")
+
+// A literal may carry a NUL as an ordinary byte, a string carrying its length -- so the constant's
+// length has to come from the bytes rather than from where a terminator falls.
+@test("a string 'val' holds a literal with a NUL inside it, which is a byte like any other")
+vlt_a_literal_with_a_nul() = vlt_prints("static val s: string = \"a\\u{0}b\"\nprint(s.len)", "3\n")
+
+// The bytes of a literal are not interned across uses, so two `val`s written the same way name two
+// globals. Equality is over the bytes rather than the address, so nothing in the language can see
+// the difference.
+@test("the same literal in two 'val's, which are two globals and one value")
+vlt_the_same_literal_in_two_vals() =
+    vlt_prints("static val a: string = \"same\"\nstatic val b: string = \"same\"\n" +
+               "print(a == b, a.len == b.len)", "true true\n")
+
+// The premise the whole relaxation rests on, exercised rather than asserted: a literal's owner word
+// is null, so retain and release find nothing to do -- including where the value is copied into
+// heap storage that outlives the read and is then let go of.
+@test("a literal read out of a 'val', handed to the heap and released with it")
+vlt_a_literal_handed_to_the_heap() =
+    vlt_prints("struct Box\n    s: string\nend Box\nstatic val greeting: string = \"hello\"\n" +
+               "hold() -> string\n    var b: &Box = Box(greeting)\n    b.s\nend hold\nprint(hold())",
+               "hello\n")
+
+// -- what a constant string 'val' does not disturb -------------------------------------------------
+//
+// A constant `val` skips the initializer order entirely, and it skips every check that would have
+// run in one. Both are correct only if nothing that *needs* either has become constant.
+
+// A value that has to be checked is code, whatever it looks like. The load-bearing assertion is the
+// out-of-range one, an in-range value reading back either way.
+@test("a struct 'val' with a constrained field is filled by code, so the field's check still runs")
+vlt_a_constrained_field_is_filled_by_code()
+    if !vlt_ready() then return
+
+    val head = "type Age = int within 0..150\nstruct P\n    age: Age\nend P\n"
+    val out = vlt_ir(head + "static val p: P = P(40)\nprint(p.age)")
+
+    vlt_has(out, "@p = private global %struct.P zeroinitializer")
+    vlt_has_not(out, "@p = private constant")
+    assert(vlt_exits(head + "static val p: P = P(200)\nprint(p.age)"))
+
+// A constant `val` is readable before any initializer runs, so a computed one may read it -- the
+// ordering graph is over the computed ones, and a constant is already there.
+@test("a computed 'val' may read a constant string one, which is already in place")
+vlt_a_computed_val_reads_a_constant_string() =
+    vlt_prints("static val greeting: string = \"hello\"\nstatic val n: usize = twice()\n" +
+               "twice() -> usize = greeting.len * 2\nprint(n)", "10\n")
+
+// Read-only at every depth is about the storage the declaration lays down, and a struct one lays
+// down a struct -- so a field of it is no more writable than an element of a table.
+@test("a struct 'val' is read-only at every depth, field as well as name")
+vlt_a_struct_val_is_read_only_at_every_depth()
+    if !vlt_ready() then return
+
+    vlt_has(vlt_outcome(vlt_one(vlt_pair() + "static val p: Pair = Pair(1, 2)\np.a = 3")).0,
+            "error: a 'val' is written once, so assignment has nothing to write through\n" +
+            " --> @/main.sysl:6:1")
+
+// **A refused write is told at the whole assignment, from the first character of its target.** A
+// field's own anchor is its name, which is where a complaint about the *member* belongs; a write
+// through one that may not be written is a complaint about the statement.
+@test("a refused write through a field is told at the whole assignment, whatever the target is built on")
+vlt_a_refused_write_is_told_at_the_whole_assignment()
+    if !vlt_ready() then return
+
+    val said = vlt_outcome(vlt_one(vlt_pair() + "f() -> Pair = Pair(1, 2)\ng()\n    val q = Pair(1, 2)\n" +
+                                   "    q.a = 3\n    q.b += 1\n" +
+                                   "    val arr: [2]Pair = [Pair(1, 2), Pair(3, 4)]\n    arr[1].a = 9\n" +
+                                   "    f().a = 1\n    var x = 0\n    x, q.a = 1, 2\ng()\n")).0
+
+    vlt_has(said, "error: a 'val' is written once, so assignment has nothing to write through\n" +
+                  " --> @/main.sysl:8:5\n  |\n8 |     q.a = 3\n  |     ^^^^^^^\n")
+    vlt_has(said, "error: a 'val' is written once, so '+=' has nothing to write through\n" +
+                  " --> @/main.sysl:9:5\n  |\n9 |     q.b += 1\n  |     ^^^^^^^^\n")
+    vlt_has(said, "error: a 'val' is written once, so assignment has nothing to write through\n" +
+                  "  --> @/main.sysl:11:5\n   |\n11 |     arr[1].a = 9\n   |     ^^^^^^^^^^^^\n")
+    vlt_has(said, "error: assignment needs a variable, a field, an element, or a dereference — " +
+                  "something with an address\n" +
+                  "  --> @/main.sysl:12:5\n   |\n12 |     f().a = 1\n   |     ^^^^^^^^^\n")
+    vlt_has(said, "error: a 'val' is written once, so assignment has nothing to write through\n" +
+                  "  --> @/main.sysl:14:5\n   |\n14 |     x, q.a = 1, 2\n   |     ^^^^^^^^^^^^^")
+
+@test("a value of the wrong type for a field is told at the whole assignment too")
+vlt_a_mistyped_field_write_is_told_at_the_whole_assignment()
+    if !vlt_ready() then return
+
+    vlt_has(vlt_outcome(vlt_one(vlt_pair() + "val r: &Pair = Pair(1, 2)\nr.a = \"no\"\nprint(r.a)\n")).0,
+            "error: cannot assign string to field 'a' of type int\n" +
+            " --> @/main.sysl:6:1\n  |\n6 | r.a = \"no\"\n  | ^^^^^^^^^^")
+
+// Slicing a `val` yields a `[]const T`, and the element type being a counted one changes nothing
+// about that.
+@test("slicing a table of literals yields a view that may be read and not written")
+vlt_slicing_a_table_of_literals()
+    if !vlt_ready() then return
+
+    val names = "static val names: [3]string = [\"alpha\", \"beta\", \"gamma\"]\nvar v = names[1..<3]\n"
+
+    assert_eq(vlt_ran(names + "print(v[0], v.len)"), "beta 2\n")
+    vlt_has(vlt_outcome(vlt_one(names + "v[0] = \"other\" ")).0,
+            "error: this element belongs to a '[]const string', which views elements it may not " +
+            "write, so there is nothing to assign through. Elements you may write are elements of " +
+            "your own: copy them into a '[]string' first\n --> @/main.sysl:3:1")
