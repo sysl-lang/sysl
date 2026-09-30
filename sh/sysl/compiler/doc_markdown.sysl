@@ -1,0 +1,437 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{str_builder, StrBuilder}
+import sysl.unicode
+
+// The model written out as Markdown -- one page per module, plus an index listing them.
+//
+// **Markdown rather than a self-contained HTML site**: a `docs/` folder of generated Markdown in a
+// package repository reads in the GitHub UI with nothing installed and nothing hosted, and a commit
+// of it is a diff somebody can review. The site's own pipeline already reads Markdown.
+//
+// **Nothing here emits HTML or a CSS class.** The `juicerapi` theme hooks structure and heading ids
+// instead, and those four shapes are all a page is made of:
+//
+//   - `## Functions` -- one `<h2>` per kind of declaration
+//   - ``### `push` `` -- one `<h3>` per declaration
+//   - a fenced ` ```sysl ` block directly under it -- the signature
+//   - a pipe table -- the parameters, the type parameters, the members
+//
+// plus `## Index` at the top of a module page, whose links the theme turns into pills.
+
+// One generated file: where it goes, relative to the output root, and what is in it.
+struct DocPage
+    path: string
+    text: string
+
+// The heading a group of symbols sits under.
+//
+// **The three kinds the `sysl-doc` of 0.0.152 left off the page are titled in the register of the
+// other five** -- a plural noun naming what the group holds: a module `val` is a Value, an `extern`
+// function or variable an Extern, a `type` alias an Alias.
+doc_group_title(k: DocKind) -> string = k match
+    DkConst -> "Constants"
+    DkValue -> "Values"
+    DkFunction -> "Functions"
+    DkExtern -> "Externs"
+    DkType -> "Types"
+    DkAlias -> "Aliases"
+    DkTrait -> "Traits"
+    DkImplementation -> "Implementations"
+
+// Every kind, in the order a page lists the groups.
+private dmd_kinds() -> Buf[DocKind]
+    var out: Buf[DocKind] = buf()
+
+    out.push(DocKind.DkConst)
+    out.push(DocKind.DkValue)
+    out.push(DocKind.DkFunction)
+    out.push(DocKind.DkExtern)
+    out.push(DocKind.DkType)
+    out.push(DocKind.DkAlias)
+    out.push(DocKind.DkTrait)
+    out.push(DocKind.DkImplementation)
+    out
+end dmd_kinds
+
+// A module page's filename: `sysl.text` is `sysl-text.md`. A dot in a filename reads as an
+// extension to too many things, and the URL a site serves the page at should be one path segment.
+doc_file_name(module_name: string) -> string = s"${dmd_replace_byte(module_name, u8('.'), "-")}.md"
+
+// GitHub's heading-slug rule, which the anchors a page links to have to agree with.
+//
+// **It has to agree with juicer's `githubSlugify`**, because the same file is read in two places --
+// as a page on the site, where juicer gives each heading its id, and as a file in the repository,
+// where GitHub does. A disagreement of one character sends every index link to the top of the page
+// with no complaint from anything, so `tests_dmd_slug_table.sysl` holds juicer's own answer for
+// every heading the standard library's pages carry and for every character below U+0300.
+//
+// The rule: lowercase; keep a letter, a digit, `-` or `_`; turn a space into `-`; delete the rest.
+// **Nothing is collapsed and nothing is trimmed** -- `a  b` is `a--b`, which most slug functions and
+// not GitHub would make `a-b`.
+doc_slug(text: string) -> string
+    var out = str_builder()
+
+    for c in text.chars
+        val l = unicode.to_lower(c)
+
+        if unicode.is_alpha(l) || unicode.is_digit(l) || l == '-' || l == '_'
+            out.push_char(l)
+        elif l == ' '
+            out.push_char('-')
+
+    out.finish()
+end doc_slug
+
+// The anchors of one page's headings, in heading order, with GitHub's numeric suffix for a repeat.
+//
+// A type and the function that constructs it conventionally share a name -- `buf()` and `Buf` -- and
+// case-folding makes them one slug, which GitHub renders the second time as `buf-1`.
+//
+// **The walk past a taken candidate is not belt and braces**: a heading that slugs to `buf-1` ahead
+// of a pair colliding on `buf` sends the second `buf` to `buf-2`, and trusting the counter would hand
+// out `buf-1` twice. juicer's `dedupeHeadingIds` walks the same way.
+//
+// **It answers a LIST rather than a map from heading text**, because sysl has overloading:
+// `parse_int` can be two declarations with one heading, and a map keyed by the text holds one entry
+// for both.
+doc_anchors(headings: Buf[string]) -> Buf[string]
+    var seen: Buf[string] = buf()
+    var counts: Buf[int] = buf()
+    var out: Buf[string] = buf()
+
+    for i in 0..<headings.len()
+        val base = doc_slug(headings.at(i))
+
+        dmd_find(seen, base) match
+            None ->
+                seen.push(base)
+                counts.push(0)
+                out.push(base)
+            Some(at) ->
+                var next = counts.at(at) + 1
+                var cand = s"${base}-${next}"
+
+                while dmd_find(seen, cand).is_some()
+                    next += 1
+                    cand = s"${base}-${next}"
+
+                counts.set(at, next)
+                seen.push(cand)
+                counts.push(0)
+                out.push(cand)
+
+    out
+end doc_anchors
+
+private dmd_find(xs: Buf[string], s: string) -> Option[usize]
+    for i in 0..<xs.len()
+        if xs.at(i) == s then return Some(i)
+
+    None
+end dmd_find
+
+// The heading for a symbol: its name in code, as the thing you type. An `impl`'s name is already a
+// phrase (`Display for Vec2`), and setting the word `for` in the mono face would read wrong.
+private dmd_heading(s: DocSymbol) -> string =
+    if s.kind == DocKind.DkImplementation then s.name else s"`${s.name}`"
+
+// One module's page. `version` is the release the pages were generated for, when the caller says.
+doc_module_page(m: DocModule, version: Option[string]) -> DocPage
+    var kinds: Buf[DocKind] = buf()
+    var headings: Buf[string] = buf()
+    val all = dmd_kinds()
+
+    for i in 0..<all.len()
+        val group = m.of(all.at(i))
+
+        if group.is_empty() then continue
+
+        kinds.push(all.at(i))
+
+        for j in 0..<group.len()
+            headings.push(dmd_heading(group.at(j)))
+
+    val ids = doc_anchors(headings)
+    var out = str_builder()
+
+    // The frontmatter is what the THEME needs and no more: GitHub renders it as a table, so a big
+    // block of metadata is noise at the top of the file people read in the repository.
+    out.push("---\n")
+    out.push(s"title: ${m.name}\n")
+    out.push("layout: api-module\n")
+    // A generated body's `##` groups are already meant to be `<h2>`; the site default assumes a
+    // layout supplies the `<h1>` and shifts an author's headings down.
+    out.push("headingShift: 0\n")
+    // Said per page rather than by the site, which cannot switch its own slug style without moving
+    // the anchor of every hand-written heading that carries punctuation.
+    out.push("slugStyle: github\n")
+    out.push(s"module: ${m.name}\n")
+
+    if m.summary().len > 0 then out.push(s"summary: ${doc_yaml_scalar(m.summary())}\n")
+    if !m.capabilities.is_empty() then out.push(s"requires: ${doc_yaml_scalar(dmd_join(m.capabilities, ", "))}\n")
+
+    version match
+        Some(v) -> out.push(s"since: ${doc_yaml_scalar(v)}\n")
+        None -> ()
+
+    out.push("---\n\n")
+
+    // The summary is the frontmatter's and the theme sets it as the lead, so the body carries only
+    // what came after the first sentence.
+    m.doc match
+        Some(d) -> if d.rest.len > 0 then out.push(s"${d.rest}\n\n")
+        None -> ()
+
+    if !headings.is_empty()
+        out.push("## Index\n\n")
+
+        for i in 0..<headings.len()
+            if i > 0 then out.push(" ")
+
+            out.push(s"[${headings.at(i)}](#${ids.at(i)})")
+
+        out.push("\n\n")
+
+    for i in 0..<kinds.len()
+        out.push(s"## ${doc_group_title(kinds.at(i))}\n\n")
+
+        val group = m.of(kinds.at(i))
+
+        for j in 0..<group.len()
+            dmd_symbol(&out, group.at(j))
+
+    DocPage(doc_file_name(m.name), s"${dmd_strip_trailing(out.finish())}\n")
+end doc_module_page
+
+// One symbol: heading, signature, prose, and the tables its prose and shape call for.
+private dmd_symbol(out: *StrBuilder, s: DocSymbol)
+    out.push(s"### ${dmd_heading(s)}\n\n")
+    out.push(s"```sysl\n${s.signature}\n```\n\n")
+
+    // A deprecation goes directly under the signature: it is what a reader has to see before
+    // deciding to use this, and GitHub renders the callout natively.
+    s.doc match
+        Some(d) -> dmd_prose(out, d)
+        None -> ()
+
+    // A signature with nothing under it already says it is undocumented, so nothing more is said.
+
+    if !s.members.is_empty()
+        out.push("| Member | Signature | Description |\n|---|---|---|\n")
+
+        for i in 0..<s.members.len()
+            val m = s.members.at(i)
+
+            out.push(s"| `${m.name}` | `${doc_inline_code(m.signature)}` | ${doc_cell(m.summary())} |\n")
+
+        out.push("\n")
+end dmd_symbol
+
+private dmd_prose(out: *StrBuilder, d: DocProse)
+    d.deprecated match
+        Some(t) -> out.push(s"> [!WARNING]\n> **Deprecated.** ${doc_one_line(t)}\n\n")
+        None -> ()
+
+    if d.body.len > 0 then out.push(s"${d.body}\n\n")
+
+    dmd_tag_table(out, "Parameter", d.params)
+    dmd_tag_table(out, "Type parameter", d.tparams)
+
+    d.returns match
+        Some(r) -> out.push(s"**Returns** ${doc_one_line(r)}\n\n")
+        None -> ()
+
+    // The rest of the vocabulary is prose that means what it means anywhere, each a labelled line in
+    // the order the author wrote them -- which `@see` in particular depends on.
+    for i in 0..<d.carried.len()
+        val t = d.carried.at(i)
+
+        out.push(s"**${dmd_capitalized(t.name)}** ${doc_one_line(t.text)}\n\n")
+end dmd_prose
+
+// A `@param` or `@tparam` table, or nothing where no tag names a subject.
+private dmd_tag_table(out: *StrBuilder, title: string, tags: Buf[DocTag])
+    var any = false
+
+    for i in 0..<tags.len()
+        tags.at(i).subject match
+            Some(n) ->
+                if !any then out.push(s"| ${title} | Description |\n|---|---|\n")
+
+                any = true
+                out.push(s"| `${n}` | ${doc_cell(tags.at(i).text)} |\n")
+            None -> ()
+
+    if any then out.push("\n")
+end dmd_tag_table
+
+// The index page listing every module.
+//
+// `note` is a line of Markdown the site asked for, under the title and above the table: generated
+// reference and hand-written prose are two halves of one set, and this is where the index links back
+// to the other half. `weight` is where the section sits in the site's navigation. **Both are the
+// site's to say and both are left out entirely when not given**, so a package generating for GitHub
+// alone gets a file with nothing in it about somebody else's menu.
+doc_index_page(modules: Buf[DocModule], title: string, version: Option[string],
+               note: Option[string], weight: Option[int]) -> DocPage
+    var out = str_builder()
+
+    out.push("---\n")
+    out.push(s"title: ${doc_yaml_scalar(title)}\n")
+
+    weight match
+        Some(w) -> out.push(s"weight: ${w}\n")
+        None -> ()
+
+    out.push("layout: api-index\n")
+    out.push("headingShift: 0\n")
+    out.push("slugStyle: github\n")
+
+    version match
+        Some(v) -> out.push(s"version: ${doc_yaml_scalar(v)}\n")
+        None -> ()
+
+    out.push("---\n\n")
+
+    note match
+        Some(n) -> out.push(s"${dmd_trim(n)}\n\n")
+        None -> ()
+
+    out.push("## Modules\n\n")
+    out.push("| Module | Summary |\n|---|---|\n")
+
+    for i in 0..<modules.len()
+        val m = modules.at(i)
+        val f = doc_file_name(m.name)
+
+        out.push(s"| [`${m.name}`](${f[0..<(f.len - 3)]}/) | ${doc_cell(m.summary())} |\n")
+
+    DocPage("_index.md", s"${dmd_strip_trailing(out.finish())}\n")
+end doc_index_page
+
+// Every page for a set of modules: the index first, then one per module. The weight is the index's
+// alone -- the module pages sit inside the section it orders.
+doc_pages(modules: Buf[DocModule], title: string, version: Option[string],
+          note: Option[string], weight: Option[int]) -> Buf[DocPage]
+    var out: Buf[DocPage] = buf()
+
+    out.push(doc_index_page(modules, title, version, note, weight))
+
+    for i in 0..<modules.len()
+        out.push(doc_module_page(modules.at(i), version))
+
+    out
+end doc_pages
+
+// -- text -----------------------------------------------------------------------------------------
+
+// A YAML scalar that cannot be misread. Always quoted, because the prose that needs it -- a summary
+// beginning with `[`, holding `: `, or reading as `yes` -- is the prose nobody thinks of.
+doc_yaml_scalar(s: string) -> string
+    val a = dmd_replace_byte(s, u8('\\'), "\\\\")
+    val b = dmd_replace_byte(a, u8('"'), "\\\"")
+
+    s"\"${dmd_replace_byte(b, u8('\n'), " ")}\""
+end doc_yaml_scalar
+
+// Prose flattened to one line, for somewhere a line break would end the construct.
+doc_one_line(s: string) -> string = dmd_collapse(dmd_trim(s))
+
+// Prose as a table cell: one line, and a `|` escaped, since it would end the cell -- a doc comment
+// describing a bitwise operation is exactly where one turns up.
+doc_cell(s: string) -> string = dmd_replace_byte(doc_one_line(s), u8('|'), "\\|")
+
+// A signature inside a code span in a table cell. A backtick cannot be escaped inside a code span
+// and a `|` still ends the cell, and a table cell has no lines.
+doc_inline_code(s: string) -> string =
+    dmd_replace_byte(dmd_replace_byte(dmd_collapse(s), u8('|'), "\\|"), u8('`'), "'")
+
+// Every occurrence of one byte replaced by a string.
+private dmd_replace_byte(s: string, b: u8, by: string) -> string
+    val bs = s.bytes
+    var out = str_builder()
+    var from: usize = 0
+
+    for i in 0..<bs.len
+        if bs[i] == b
+            out.push(s[from..<i])
+            out.push(by)
+            from = i + 1
+
+    out.push(s[from..])
+    out.finish()
+end dmd_replace_byte
+
+// Whitespace in the sense of a regular expression's `\s`: space, tab, the line breaks, the two feeds.
+private dmd_is_space(b: u8) -> bool =
+    b == u8(' ') || b == u8('\t') || b == u8('\n') || b == u8('\r') || b == 11 || b == 12
+
+// Every run of whitespace made one space.
+private dmd_collapse(s: string) -> string
+    val bs = s.bytes
+    var out = str_builder()
+    var from: usize = 0
+    var i: usize = 0
+
+    while i < bs.len
+        if dmd_is_space(bs[i])
+            out.push(s[from..<i])
+            out.push(" ")
+
+            while i < bs.len && dmd_is_space(bs[i])
+                i += 1
+
+            from = i
+        else
+            i += 1
+
+    out.push(s[from..])
+    out.finish()
+end dmd_collapse
+
+// Every byte at or below a space taken off both ends -- a Java `trim`, which is the reference's.
+private dmd_trim(s: string) -> string
+    val bs = s.bytes
+    var lo: usize = 0
+    var hi = bs.len
+
+    while lo < hi && bs[lo] <= 32
+        lo += 1
+
+    while hi > lo && bs[hi - 1] <= 32
+        hi -= 1
+
+    s[lo..<hi]
+end dmd_trim
+
+// Trailing whitespace taken off, so a page ends in exactly one newline.
+private dmd_strip_trailing(s: string) -> string
+    val bs = s.bytes
+    var hi = bs.len
+
+    while hi > 0 && (dmd_is_space(bs[hi - 1]) || (bs[hi - 1] >= 28 && bs[hi - 1] <= 31))
+        hi -= 1
+
+    s[0..<hi]
+end dmd_strip_trailing
+
+private dmd_capitalized(s: string) -> string
+    if s.len == 0 then return s
+
+    val b = s.bytes[0]
+
+    if b >= u8('a') && b <= u8('z') then s"${char(u32(b) - 32)}${s[1..]}" else s
+end dmd_capitalized
+
+private dmd_join(xs: Buf[string], sep: string) -> string
+    var out = str_builder()
+
+    for i in 0..<xs.len()
+        if i > 0 then out.push(sep)
+
+        out.push(xs.at(i))
+
+    out.finish()
+end dmd_join
