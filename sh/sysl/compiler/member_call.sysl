@@ -77,7 +77,7 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
         // result.
         None -> generic_subject(cx, span, receiver, name, args, expected)
 
-    if subject.is_none() then return None
+    if subject.is_none() then return generic_enum_stranger(cx, span, receiver, name)
 
     val ty = subject.unwrap()
 
@@ -149,8 +149,9 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
         // function is, so a name that is neither is told about both rather than about half of what
         // it could have been.
         underlying(ty) match
-            Enum(_) -> return Some(cx.err(span, s"enum '${module_show(found.0)}' has no variant or " +
-                                          s"associated function '$name'"))
+            Enum(_) ->
+                return Some(cx.err(name_span(span, name), s"enum '${module_show(found.0)}' has no " +
+                                   s"variant or associated function '$name'"))
             _ -> ()
 
         return Some(cx.err(span, s"type '${found.0}' has no associated function " +
@@ -203,6 +204,41 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
     cx.an.uses(fname)
     Some(TExpr(span, TCall(fname, ts, sig.unwrap().ret, false)))
 end associated_call
+
+// `Option.nope()` -- a call through a **generic** enum's bare name of something it declares neither
+// as a variant nor as a member. No instantiation is settled for a name nobody declared, so without
+// this the reading falls through to the receiver and reports the enum as an undefined name, which
+// is about the one part the reader got right.
+private generic_enum_stranger(cx: &Analyzer, span: Span, receiver: Expr,
+                              name: string) -> Option[TExpr]
+    val written = *receiver.kind match
+        Ident(n) -> if cx.lookup(n).is_none() then Some(n) else None
+        _ -> None
+
+    if written.is_none() || name == "try" then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+
+    if key.is_none() then return None
+
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        EnumOf(_) -> ()
+        _ -> return None
+
+    if declares_variant(cx, key.unwrap(), name) then return None
+    if member_at(cx.an, key.unwrap(), name).is_some() then return None
+
+    Some(cx.err(name_span(span, name), s"enum '${module_show(key.unwrap())}' has no variant or " +
+                s"associated function '$name'"))
+end generic_enum_stranger
+
+// The member's own name at the head of a call through a type -- where the reference anchors a
+// refusal about the member, rather than across the parentheses after it.
+private name_span(span: Span, name: string) -> Span = Span(span.start, span.start + name.bytes.len)
 
 // The instantiation a **generic** type's bare name stands for in `Vector.zeros(n)`, read off what
 // receives the result.

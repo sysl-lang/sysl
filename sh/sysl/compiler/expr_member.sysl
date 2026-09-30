@@ -267,12 +267,18 @@ end static_property_at
 // A struct's name with a member selected from it. What a type offers under its own name is an
 // associated function, so each of the other three readings is told where it is reached from.
 private struct_type_member(cx: &Analyzer, span: Span, key: string, written: string,
-                           name: string) -> TExpr
+                           name: string) -> TExpr =
+    type_member_refusal(cx, span, key, written, name,
+                        s"type '${module_show(key)}' has no member '$name' — and " +
+                        s"'${module_show(key)}' is a type, not a value")
+
+// What a member read off a declared type's name is told when it is not a variant: which of the
+// three readings the name turned out to be, or `missing` where the type declares nothing of it.
+private type_member_refusal(cx: &Analyzer, span: Span, key: string, written: string, name: string,
+                            missing: string) -> TExpr
     val m = member_at(cx.an, key, name)
 
-    if m.is_none() then
-        return cx.err(span, s"type '${module_show(key)}' has no member '$name' — and " +
-                      s"'${module_show(key)}' is a type, not a value")
+    if m.is_none() then return cx.err(span, missing)
 
     val decl = m.unwrap()
 
@@ -286,7 +292,7 @@ private struct_type_member(cx: &Analyzer, span: Span, key: string, written: stri
 
     cx.err(span, s"'$name' is an associated function of '${module_show(key)}' — call it with " +
            s"'$written.$name(…)'")
-end struct_type_member
+end type_member_refusal
 
 // A trait's name with a member selected from it, which is the same shape of mistake one type over.
 // A trait is not a value and is not a type on its own: what its members are reached through is a
@@ -413,6 +419,14 @@ private enum_member(cx: &Analyzer, span: Span, key: string, written: string, nam
 
     // The member's own name, which is what each refusal below is about.
     val named_at = Span(span.end - name.bytes.len, span.end)
+
+    // **A name that is not a variant is asked of the DECLARATION**, generic or not: whether the enum
+    // has parameters says which instantiation a variant would build, and nothing about a name it
+    // never declared.
+    if !declares_variant(cx, key, name) then
+        return type_member_refusal(cx, span, key, written, name,
+                                   s"enum '${module_show(key)}' has no variant '$name'")
+
     val inst = cx.an.tables.enum_insts.get(instance_key(key, buf()))
 
     if inst.is_none() then
@@ -436,7 +450,7 @@ private enum_member(cx: &Analyzer, span: Span, key: string, written: string, nam
             val v = d.variant(name)
 
             if v.is_none() then
-                return cx.err(span, s"'${module_show(key)}' has no variant '$name'")
+                return cx.err(span, s"enum '${module_show(key)}' has no variant '$name'")
 
             if v.unwrap().carries then return carries_data(cx, named_at, name)
 
@@ -449,6 +463,22 @@ end enum_member
 carries_data(cx: &Analyzer, at: Span, name: string) -> TExpr =
     cx.err(at, s"variant '$name' carries data — construct it with '$name(…)'")
 
+
+// Whether the enum declared under this key has a variant of this name -- read off the declaration,
+// so a generic enum, which has no instance under its bare key, answers as a plain one does.
+declares_variant(cx: &Analyzer, key: string, name: string) -> bool
+    val decl = cx.an.tables.types.get(key)
+
+    if decl.is_none() then return false
+
+    decl.unwrap().kind match
+        EnumOf(ed) ->
+            for i in 0..<ed.variants.len()
+                if ed.variants.at(i).name == name then return true
+
+            false
+        _ -> false
+end declares_variant
 
 // A generic enum's variant of this name, as its first type parameter and whether it carries
 // anything -- what a variant written with no values and no position to settle it is told.
