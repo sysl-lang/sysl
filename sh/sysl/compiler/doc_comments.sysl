@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.text.{join, Search, split, str_builder, StrBuilder}
+import sysl.text.{from_utf8_unchecked, join, Search, split, str_builder, StrBuilder}
 
 // Documentation comments: `/** ... */` above a declaration, and what a generator reads out of one.
 //
@@ -220,3 +220,213 @@ private is_alpha(b: u8) -> bool =
     (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z'))
 
 private is_alnum(b: u8) -> bool = is_alpha(b) || (b >= u8('0') && b <= u8('9'))
+
+// -- the vocabulary -------------------------------------------------------------------------------
+
+// The closed vocabulary of doc tags.
+//
+// `throws` is deliberately absent: sysl has no exceptions, and what a fallible function answers
+// with is the `E` of its `Result[T, E]` -- which `@return` describes, because it is part of the
+// return type rather than a second channel out of the function.
+private is_doc_tag(name: string) -> bool =
+    name == "param" || name == "tparam" || name == "return" || name == "see" || name == "note" ||
+    name == "example" || name == "since" || name == "deprecated" || name == "group" ||
+    name == "groupname" || name == "inheritdoc"
+
+// sysl's own annotation words, so that prose *about* an annotation is not read as a mistyped tag.
+//
+// This is why an unknown `@name` cannot simply warn: `@requires` in a doc comment is overwhelmingly
+// a sentence about the capability clause, and a warning there would be noise on correct prose.
+private is_annotation_word(name: string) -> bool =
+    name == "test" || name == "tests" || name == "requires" || name == "export" ||
+    name == "no_alloc" || name == "link" || name == "crossing" || name == "borrows" ||
+    name == "packed" || name == "align" || name == "section" || name == "assert" ||
+    name == "ghost" || name == "include" || name == "inline"
+
+// The tags of one name, in the order they were written.
+doc_tags_named(d: Doc, name: string) -> Buf[DocTag]
+    var out: Buf[DocTag] = buf()
+
+    for i in 0..<d.tags.len()
+        if d.tags.at(i).name == name then out.push(d.tags.at(i))
+
+    out
+end doc_tags_named
+
+// The tags whose name is neither a doc tag nor one of sysl's own annotations -- candidate typos.
+//
+// Nothing acts on this: an unknown tag is prose and does not warn. It is computed because the
+// alternative to computing it is not having the evidence the day somebody asks whether `@parm` is
+// worth catching.
+unknown_doc_tags(d: Doc) -> Buf[DocTag]
+    var out: Buf[DocTag] = buf()
+
+    for i in 0..<d.tags.len()
+        val name = d.tags.at(i).name
+
+        if !is_doc_tag(name) && !is_annotation_word(name) then out.push(d.tags.at(i))
+
+    out
+end unknown_doc_tags
+
+// -- which declaration a comment belongs to -------------------------------------------------------
+
+// The doc comment immediately above `line`, if there is one.
+//
+// **Immediately** allows annotations and line comments in between, and nothing else. An annotation
+// between the prose and the declaration is the ordinary shape -- `@test` above a function,
+// `@export` above another -- so a rule that demanded adjacency would silently drop the
+// documentation of every annotated declaration. A **blank line** ends the association, which is
+// what lets a file-level comment sit at the top without being adopted by whatever is declared
+// first.
+doc_above(src: Source, docs: Buf[Doc], line: usize) -> Option[Doc]
+    var i = docs.len()
+
+    while i > 0
+        i -= 1
+
+        val d = docs.at(i)
+
+        // The nearest comment that ENDS above the line is the only candidate: a comment further up
+        // belongs to whatever that nearer one did not.
+        if d.end_line < line
+            for between in (d.end_line + 1)..<line
+                val text = from_utf8_unchecked(src.line_text(between)).trim()
+
+                if !(text.starts_with("@") || text.starts_with("//")) then return None
+
+            return Some(d)
+
+    None
+end doc_above
+
+// -- what a tag says about the signature ----------------------------------------------------------
+
+// One tag that is wrong about the declaration it documents, and what to say about it.
+struct DocFault
+    tag: DocTag
+    message: string
+
+// What a doc comment gets wrong about the signature it sits above.
+//
+// **Only the tags that name the signature are checkable, and only in one direction.** A `@param`
+// naming a parameter the declaration does not have is wrong now and will stay wrong -- it is the
+// shape a rename leaves behind, describing something that is no longer there. A parameter with *no*
+// `@param` is not an error and must never become one: documentation is optional, a partial doc
+// comment is better than none, and a rule requiring the full set is what makes people write
+// `@param n the n` to silence it.
+//
+// So: check what is written, never require what is absent. That is also what lets a library be
+// converted a file at a time.
+check_doc(d: Doc, params: Buf[string], tparams: Buf[string]) -> Buf[DocFault]
+    var out: Buf[DocFault] = buf()
+
+    wrong_subjects(&out, d, "param", params, "parameter")
+    wrong_subjects(&out, d, "tparam", tparams, "type parameter")
+
+    out
+end check_doc
+
+private wrong_subjects(out: *Buf[DocFault], d: Doc, tag_name: string, known: Buf[string],
+                       what: string)
+    for i in 0..<d.tags.len()
+        val tag = d.tags.at(i)
+
+        if tag.name != tag_name then continue
+
+        tag.subject match
+            // A bare tag with no name after it is its own mistake, and is named as one.
+            None ->
+                out.push(DocFault(tag, s"'@${tag.name}' names no $what — write the name it " +
+                                       "documents after the tag"))
+            Some(name) ->
+                if !named_among(known, name) then
+                    val names = join(known.view(), ", ")
+                    val has = if known.is_empty() then s"it has no ${what}s" else s"it has $names"
+
+                    out.push(DocFault(tag, s"'$name' is not a $what of this declaration — $has"))
+end wrong_subjects
+
+private named_among(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end named_among
+
+// Every doc comment in a file that is wrong about the declaration it sits above.
+//
+// **A pass over the file's own statements, not over the hoisted tables.** This is a claim about a
+// *signature*, which exists whether or not a body is ever analyzed -- a generic function nothing
+// instantiates has a doc comment exactly as wrong as one that is called everywhere. And a doc
+// comment belongs to a **file**: it was found by the lexer that scanned that file and is placed by
+// a line number that means nothing anywhere else, where hoisting is the point at which a
+// declaration stops remembering which file wrote it.
+//
+// Members are walked with their type, because a method inside a `struct` is a declaration a reader
+// documents like any other and the enclosing declaration's own doc comment is a different one. An
+// `impl` block has no doc comment of its own to check, and its methods are documented exactly like
+// methods written in the type.
+doc_problems(p: Program) -> Buf[DocFault]
+    var out: Buf[DocFault] = buf()
+
+    if p.docs.is_empty() then return out
+
+    for i in 0..<p.body.len()
+        val s = p.body.at(i)
+
+        *s.kind match
+            FuncDecl(d) -> check_above(&out, p, s.span, param_names(false, d.params), d.tparams)
+            // A struct's fields are not parameters, so only its type parameters are checkable. A
+            // `@param` naming a field is therefore refused, which is right: the tag for a field
+            // would be a different tag, and inventing one silently is worse than saying the tag
+            // does not fit.
+            StructDecl(d) ->
+                check_above(&out, p, s.span, buf(), d.tparams)
+                check_members(&out, p, d.members)
+            EnumDecl(d) ->
+                check_above(&out, p, s.span, buf(), d.tparams)
+                check_members(&out, p, d.members)
+            TraitDecl(d) ->
+                check_above(&out, p, s.span, buf(), d.tparams)
+                check_members(&out, p, d.methods)
+            ImplDecl(d) -> check_members(&out, p, d.methods)
+            _ -> ()
+
+    out
+end doc_problems
+
+private check_above(out: *Buf[DocFault], p: Program, at: Span, params: Buf[string],
+                    tparams: Buf[string])
+    doc_above(p.src, p.docs, p.src.locate(at.start).line) match
+        Some(d) ->
+            val found = check_doc(d, params, tparams)
+
+            for i in 0..<found.len()
+                out.push(found.at(i))
+        None -> ()
+end check_above
+
+// A member's receiver counts as a parameter it may document.
+//
+// `self` is the receiver rather than an entry in the parameter list, which is a real distinction to
+// the analyzer and none at all to somebody writing the prose. It is spelled in the declaration all
+// the same, so `@param self` describes a real part of the signature -- admitted rather than
+// required, like every other parameter.
+private check_members(out: *Buf[DocFault], p: Program, members: Buf[MethodDecl])
+    for i in 0..<members.len()
+        val m = members.at(i)
+
+        check_above(out, p, m.span, param_names(m.receiver.is_some(), m.params), m.tparams)
+end check_members
+
+private param_names(receiver: bool, params: Buf[Param]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if receiver then out.push("self")
+
+    for i in 0..<params.len()
+        out.push(params.at(i).name)
+
+    out
+end param_names
