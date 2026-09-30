@@ -1,0 +1,251 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, is_file, make_dir_all, read_text, remove_file, write_text}
+import sysl.text.{parse_int, Search}
+
+// `sysl doc` -- the API reference, as Markdown, from a tree's declarations and their doc comments.
+//
+// **What it does in one line:** read a tree, build the module model, write one page per module and
+// an index. Nothing is analyzed -- a package that does not build, or whose dependencies are missing,
+// still documents -- so the tree is only walked and parsed.
+//
+// **The Markdown is the artifact.** It is readable in a repository with no tooling at all, and
+// `--check` is what keeps committed pages honest: run in CI, a doc comment edited without
+// regenerating fails the build.
+
+// Everything the command was asked for.
+struct DocOptions
+    dir: string
+    out: string
+    title: string
+    note: Option[string]
+    weight: Option[int]
+    version: Option[string]
+    include_private: bool
+    check: bool
+end DocOptions
+
+// What `sysl doc` does when it is told nothing.
+doc_defaults() -> DocOptions = DocOptions(".", "docs/api", "API reference", None, None, None, false, false)
+
+// The text `sysl doc --help` prints.
+doc_usage() -> string = "sysl doc — API reference from declarations and their doc comments\n" +
+    "\n" +
+    "Usage: sysl doc [options] [<dir>]\n" +
+    "\n" +
+    "  <dir>              the tree to document (default: the working directory)\n" +
+    "\n" +
+    "  -o, --out <dir>    where the Markdown goes (default: docs/api)\n" +
+    "  -t, --title <text> the index page's title (default: \"API reference\")\n" +
+    "  -n, --note <text>  a line of Markdown under the index title, above the table —\n" +
+    "                     where a site links back to its hand-written pages\n" +
+    "  -w, --weight <n>   the index page's place in the site's navigation. Omitted from\n" +
+    "                     the frontmatter entirely when not given\n" +
+    "  -V, --docversion <v>  the version being documented, shown on the pages\n" +
+    "      --private      include file- and module-private declarations\n" +
+    "      --check        write nothing; exit 1 if the committed Markdown is stale\n" +
+    "  -h, --help         print this\n" +
+    "\n" +
+    "The Markdown is the artifact. It is readable in the repository with no tooling at\n" +
+    "all, which is what --check exists to keep true: run it in CI and a doc comment\n" +
+    "edited without regenerating fails the build."
+
+// Whether a flag is one that takes a value after it.
+private dcl_valued(a: string) -> bool =
+    a == "-o" || a == "--out" || a == "-t" || a == "--title" || a == "-n" || a == "--note" ||
+    a == "-w" || a == "--weight" || a == "-V" || a == "--docversion"
+
+// The arguments after `doc`, read. `Err` is what to say instead of running -- the usage text itself
+// for `--help`, which is how `doc_command` tells asking for help from a mistake.
+parse_doc_args(args: []string) -> Result[DocOptions, string]
+    var opts = doc_defaults()
+    var i: usize = 0
+
+    while i < args.len
+        val a = args[i]
+
+        if a == "-h" || a == "--help" then return Err(doc_usage())
+
+        if dcl_valued(a)
+            // A flag that takes a value and was given none says which flag, rather than reading
+            // the end of the line as the tree.
+            if i + 1 >= args.len then return Err(s"sysl doc: '$a' needs a value after it")
+
+            val v = args[i + 1]
+
+            if a == "-o" || a == "--out" then opts.out = v
+            else if a == "-t" || a == "--title" then opts.title = v
+            else if a == "-n" || a == "--note" then opts.note = Some(v)
+            else if a == "-V" || a == "--docversion" then opts.version = Some(v)
+            else
+                // Refused here rather than carried as text, so `--weight nine` fails saying so
+                // instead of writing a frontmatter key a site reads as nothing.
+                parse_int(v) match
+                    Ok(n) -> opts.weight = Some(n)
+                    Err(_) -> return Err(s"sysl doc: '--weight' needs a whole number, got '$v'")
+
+            i += 2
+        else if a == "--private"
+            opts.include_private = true
+            i += 1
+        else if a == "--check"
+            opts.check = true
+            i += 1
+        else if a.starts_with("-")
+            return Err(s"sysl doc: unknown option '$a'\n\n${doc_usage()}")
+        else
+            opts.dir = a
+            i += 1
+    end while
+
+    Ok(opts)
+end parse_doc_args
+
+// A tree's modules, or what to say instead.
+//
+// **A tree of programs documents to nothing**, and saying so beats writing an empty index. A file
+// that does not parse stops the whole command: pages from half a tree would pass for the whole.
+read_doc_tree(dir: string, include_private: bool) -> Result[Buf[DocModule], string]
+    val found = collect(dir, None) match
+        Ok(fs) -> fs
+        Err(sel) ->
+            // A directory that is not there is the commonest mistake of all, and it is not a
+            // selection problem, so it answers the same sentence as an empty one.
+            if !is_directory(dir) then return Err(s"sysl doc: $dir holds no sysl source")
+            return Err(sel.message)
+
+    if found.is_empty() then return Err(s"sysl doc: $dir holds no sysl source")
+
+    var units: Buf[Program] = buf()
+
+    for i in 0..<found.len()
+        val parsed = parse(found.at(i).src)
+
+        if !parsed.ok() then return Err(parse_report(parsed))
+
+        units.push(parsed.program)
+
+    val modules = build_doc_modules(units, include_private)
+
+    if modules.is_empty()
+        return Err(s"sysl doc: nothing in $dir declares a module, so there is no API to document — " +
+            "a program's entry file is a body rather than an importable surface")
+
+    Ok(modules)
+end read_doc_tree
+
+// `sysl doc [options] [<dir>]`. `args` is the whole command line, `sysl` and `doc` included.
+doc_command(args: []string, say: string -> unit) -> int
+    val opts = parse_doc_args(args[2..<args.len]) match
+        Ok(o) -> o
+        Err(message) ->
+            say(message)
+            return if message == doc_usage() then Fine else Failed
+
+    val modules = read_doc_tree(opts.dir, opts.include_private) match
+        Ok(ms) -> ms
+        Err(message) ->
+            say(message)
+            return Failed
+
+    val pages = doc_pages(modules, opts.title, opts.version, opts.note, opts.weight)
+
+    if opts.check then doc_check(opts.out, pages, say) else doc_write(opts.out, pages, modules.len(), say)
+end doc_command
+
+// The pages under `out` that an earlier run wrote for a module the tree no longer has.
+//
+// **Only a page this command wrote is counted** -- one whose frontmatter names the module layout --
+// so a hand-written page kept beside the generated ones is neither reported nor removed.
+private dcl_orphans(out: string, pages: Buf[DocPage]) -> Buf[string]
+    var gone: Buf[string] = buf()
+    val names = entries(out).unwrap_or(buf())
+
+    for i in 0..<names.len()
+        val name = names.at(i)
+
+        if !name.ends_with(".md") then continue
+
+        var generated = false
+
+        for j in 0..<pages.len()
+            if pages.at(j).path == name then generated = true
+
+        if generated then continue
+
+        read_text(s"$out/$name") match
+            Ok(text) -> if text.contains("\nlayout: api-module\n") then gone.push(name)
+            Err(_) -> ()
+
+    gone
+end dcl_orphans
+
+// Write the pages, remove the ones whose module is gone, and say what was written.
+private doc_write(out: string, pages: Buf[DocPage], modules: usize, say: string -> unit) -> int
+    make_dir_all(out) match
+        Err(e) ->
+            say(s"sysl doc: cannot write $out: ${e}")
+            return Failed
+        Ok(_) -> ()
+
+    for i in 0..<pages.len()
+        val p = pages.at(i)
+
+        write_text(s"$out/${p.path}", p.text) match
+            Err(e) ->
+                say(s"sysl doc: cannot write $out/${p.path}: ${e}")
+                return Failed
+            Ok(_) -> ()
+
+    val gone = dcl_orphans(out, pages)
+
+    for i in 0..<gone.len()
+        remove_file(s"$out/${gone.at(i)}") match
+            Err(e) ->
+                say(s"sysl doc: cannot remove $out/${gone.at(i)}: ${e}")
+                return Failed
+            Ok(_) -> ()
+
+    say(s"sysl doc: $modules module${if modules == 1 then "" else "s"} -> $out")
+    Fine
+end doc_write
+
+// Compare what would be written against what is there, and write nothing.
+//
+// **A page whose module was removed is a difference too**: left on disk it documents an API that no
+// longer exists, and a check that compared only the pages it would write could never see it.
+// It names every file that differs rather than stopping at the first, since the fix is one command
+// and a reader wants to know the size of what it will change.
+private doc_check(out: string, pages: Buf[DocPage], say: string -> unit) -> int
+    var stale: Buf[string] = buf()
+
+    for i in 0..<pages.len()
+        val p = pages.at(i)
+        val there = s"$out/${p.path}"
+
+        val fresh = if is_file(there) then read_text(there) match
+            Ok(text) -> text == p.text
+            Err(_) -> false
+        else false
+
+        if !fresh then stale.push(p.path)
+
+    val gone = dcl_orphans(out, pages)
+
+    for i in 0..<gone.len()
+        stale.push(s"${gone.at(i)} (its module is gone)")
+
+    if stale.is_empty()
+        say(s"sysl doc: $out is up to date")
+        return Fine
+
+    say(s"sysl doc: $out is stale — ${stale.len()} file(s) differ:")
+
+    for i in 0..<stale.len()
+        say(s"  ${stale.at(i)}")
+
+    say("")
+    say("Regenerate with 'sysl doc' and commit the result.")
+    Failed
+end doc_check
