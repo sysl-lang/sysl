@@ -235,7 +235,17 @@ end index_of_name
 // **Filling one may call the declaration that asked for it**, directly or through another default,
 // and following that would never end: `owner` is held while its default is read, and a call that
 // asks for it again is refused rather than recursed into.
-fill_default(cx: &Analyzer, span: Span, owner: string, scope: Scope, p: Param, want: Type) -> TExpr
+fill_default(cx: &Analyzer, span: Span, owner: string, scope: Scope, p: Param, want: Type) -> TExpr =
+    fill_default_in(cx, span, owner, scope, p, want, false)
+
+// A nested function's default. It is read with nothing local in scope like any other, and the block
+// it is written in goes with it: a local that block binds is the one name such a default is likely
+// to have meant, and the refusal says why it could not be reached.
+fill_nested_default(cx: &Analyzer, span: Span, owner: string, p: Param, want: Type) -> TExpr =
+    fill_default_in(cx, span, owner, cx.scope, p, want, true)
+
+private fill_default_in(cx: &Analyzer, span: Span, owner: string, scope: Scope, p: Param, want: Type,
+                        carry: bool) -> TExpr
     if holds_string(cx.an.defaults_filling, owner)
         cx.fault(span, "filling this default calls something that asks for it again — a default " +
                  "cannot stand in for an argument that is still being worked out")
@@ -246,10 +256,13 @@ fill_default(cx: &Analyzer, span: Span, owner: string, scope: Scope, p: Param, w
 
     inner.reported = Some(span)
     inner.here_src = caller_source(cx)
+
+    if carry then carry_declares(cx, inner)
+
     cx.an.defaults_filling.push(owner)
 
     val t = type_expr(inner, p.default.unwrap(), Some(want))
 
     cx.an.defaults_filling.truncate(cx.an.defaults_filling.len() - 1)
     t
-end fill_default
+end fill_default_in

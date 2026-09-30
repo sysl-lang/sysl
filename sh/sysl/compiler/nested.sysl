@@ -228,6 +228,55 @@ block_binds(s: Stmt, out: *Buf[string])
         PatternDecl(p, _, _) -> pattern_names(out, p)
         _ -> ()
 
+// A name a block binds: where its statement starts, and whether the block's nested functions had
+// begun by then.
+struct BlockBind
+    name: string
+    at: usize
+    after_group: bool
+
+// What the blocks around a body bind, handed to the analyzer reading that body. The block around it
+// is where a name it could not reach would have been bound, so its bindings are what a use inside
+// it is measured against.
+carry_declares(cx: &Analyzer, inner: &Analyzer)
+    for i in 0..<cx.block_declares.len()
+        inner.block_declares.push(cx.block_declares.at(i))
+
+    inner.carried_declares = inner.block_declares.len()
+
+// What to say of a name that resolved to nothing and that a block in view binds, or nothing where
+// the name is simply not one.
+//
+// **Two mistakes, told apart by where the binding is.** A use written above its declaration is told
+// the rule a reader would state. A use below it that still found nothing is a nested function's
+// default, which is read with no locals in scope -- and the sentence about the shared environment
+// is said only where it is true: the binding was written after the block's nested functions began.
+not_yet_bound(cx: &Analyzer, span: Span, name: string) -> Option[string]
+    var i = cx.block_declares.len()
+
+    while i > 0
+        i -= 1
+
+        val b = cx.block_declares.at(i)
+
+        if b.name != name then continue
+
+        if span.start < b.at then
+            return Some(s"'$name' is declared below this, and a name is in scope from where it " +
+                        "is bound onward")
+
+        if i < cx.carried_declares && b.after_group then
+            return Some(s"'$name' is bound after the nested functions of this block begin, so it " +
+                        "is not in this one's environment — they share a single environment, " +
+                        "formed where the first of them is written, and what it holds is what " +
+                        s"the block had bound by that point. Bind '$name' above them, or make it " +
+                        "module storage with 'static'")
+
+        return None
+
+    None
+end not_yet_bound
+
 // One nested function's body, read in a frame of its own.
 //
 // What it keeps from around it is what a reader would expect to keep: the file's terms, what a type
@@ -278,6 +327,7 @@ private nested_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
         inner.nested.push(siblings.at(i))
 
     carry_outer_nested(cx, inner, siblings)
+    carry_declares(cx, inner)
 
     val written = d.ret_type.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
     val ret = declared_result_type(written)
@@ -354,7 +404,7 @@ call_nested(cx: &Analyzer, span: Span, n: &Nested, written: string, args: Buf[Ex
         slots.at(i) match
             Some(e) -> given.push(type_expr(cx, e, Some(want)))
             // Read with nothing local in scope, in the terms of the module the block sits in.
-            None -> given.push(fill_default(cx, span, n.fname, cx.scope, n.params.at(i), want))
+            None -> given.push(fill_nested_default(cx, span, n.fname, n.params.at(i), want))
 
     val refused = refused_argument(cx, span, s"'$written'", n.params, slots, given, wants, before)
 
