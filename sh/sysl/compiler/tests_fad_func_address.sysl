@@ -1,0 +1,1011 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The reference's `FuncAddressTests`: a function's address, and a call through one. Both directions
+// of the C callback seam are run against a real libc interface rather than read out of the text --
+// `qsort` calls a sysl comparison back and the array comes out sorted, `dlsym` hands an address in
+// that is then called -- and each refusal names a reason rather than a shape.
+//
+// **Every diagnostic and every output here was read out of the reference compiler (0.0.152)** by
+// handing the installed `sysl` the same tree; the IR lines are its `emit-llvm`. The harness is the
+// one `tests_xvr_extern_var.sysl` builds: `xvr_ir` for the text, which answers with the analysis's
+// report where there is one, and `xvr_ran` for a program linked and run.
+
+private fad_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private fad_ran(text: string) -> string = xvr_ran(fad_main(text))
+
+private fad_ir(text: string) -> string = xvr_ir(fad_main(text))
+
+// A refusal carries this message, anchored at this `file:line:column`.
+private fad_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> $at\n"), said)
+
+// The declaration every `qsort` program here begins with.
+private fad_qsort() -> string =
+    "extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)\n\n"
+
+// What an aggregate in an addressed signature is told, after the words naming which part it is.
+private fad_aggregate() -> string =
+    ", an aggregate, and an aggregate crosses to C in whichever registers that machine's " +
+    "convention names rather than the ones a sysl call uses — so this address would be of a " +
+    "function C cannot call correctly. A wrapper taking the parts behind a '*T', or '@export' on " +
+    "this one, is what has an address"
+
+// The LLVM text of one file lowered for a machine, or the first thing the program itself was told.
+private fad_for(t: Target, text: string) -> string
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(library) -> units = library
+
+    if units.is_empty() then return "the library could not be read for this machine"
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    for i in 0..<said.len()
+        if !said.at(i).src.name.starts_with("library/") then return said.at(i).render()
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), buf()), t, promotions).0)
+end fad_for
+
+// -- a sysl function's address, given to C ---------------------------------------------------------
+
+@test("sorts an array through a comparison qsort calls back")
+fad_sorts_through_a_comparison()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(fad_qsort() + raw"""
+        compare(a: *u8, b: *u8) -> i32
+            var pa: *i32 = ptr_cast(a)
+            var pb: *i32 = ptr_cast(b)
+            *pa - *pb
+
+        var xs = [30i32, 10i32, 20i32, 40i32]
+
+        qsort(ptr_cast(&xs[0]), 4usize, 4usize, &compare)
+
+        print(xs[0], xs[1], xs[2], xs[3])
+        """), "10 20 30 40\n")
+end fad_sorts_through_a_comparison
+
+// The comparison decides the order, so reversing it must reverse the answer -- which is what says
+// the callback sorted the array rather than the array having been in order.
+@test("and the reversed comparison reverses it, so the callback is what decided")
+fad_the_reversed_comparison_reverses_it()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(fad_qsort() + raw"""
+        descending(a: *u8, b: *u8) -> i32
+            var pa: *i32 = ptr_cast(a)
+            var pb: *i32 = ptr_cast(b)
+            *pb - *pa
+
+        var xs = [30i32, 10i32, 20i32, 40i32]
+
+        qsort(ptr_cast(&xs[0]), 4usize, 4usize, &descending)
+
+        print(xs[0], xs[1], xs[2], xs[3])
+        """), "40 30 20 10\n")
+end fad_the_reversed_comparison_reverses_it
+
+@test("and two functions of one signature are told apart by the address")
+fad_two_of_one_signature()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(fad_qsort() + raw"""
+        up(a: *u8, b: *u8) -> i32
+            var pa: *i32 = ptr_cast(a)
+            var pb: *i32 = ptr_cast(b)
+            *pa - *pb
+
+        down(a: *u8, b: *u8) -> i32
+            var pa: *i32 = ptr_cast(a)
+            var pb: *i32 = ptr_cast(b)
+            *pb - *pa
+
+        sorted(which: *extern(*u8, *u8) -> i32) -> i32
+            var xs = [3i32, 1i32, 2i32]
+            qsort(ptr_cast(&xs[0]), 3usize, 4usize, which)
+            xs[0]
+
+        print(sorted(&up), sorted(&down))
+        """), "1 3\n")
+end fad_two_of_one_signature
+
+// A function nothing calls is dropped from the program. Taking its address has to count as a use,
+// or the address would be of a definition that is not there.
+@test("keeps a function nothing calls, since the address is the only use")
+fad_keeps_a_function_nothing_calls()
+    if xvr_no_library() then return
+
+    val out = fad_ir(fad_qsort() + raw"""
+        only_addressed(a: *u8, b: *u8) -> i32 = 0
+
+        var xs = [2i32, 1i32]
+
+        qsort(ptr_cast(&xs[0]), 2usize, 4usize, &only_addressed)
+        print(xs[0])
+        """)
+
+    assert(out.contains("define i32 @only_addressed(ptr %a.param, ptr %b.param) {\n"), out)
+    assert(out.contains("i64 2, i64 4, ptr @only_addressed)\n"), out)
+end fad_keeps_a_function_nothing_calls
+
+@test("and a C function's own address is one too")
+fad_a_c_functions_own_address()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        extern abs(n: i32) -> i32
+
+        var f: *extern(i32) -> i32 = &abs
+
+        print(f(-5))
+        """), "5\n")
+end fad_a_c_functions_own_address
+
+// -- an address C hands back -----------------------------------------------------------------------
+
+@test("is callable once it is read as a function pointer")
+fad_callable_once_read_as_a_function_pointer()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        extern dlopen(path: *u8, mode: i32) -> *u8
+        extern dlsym(handle: *u8, name: *u8) -> *u8
+
+        var handle = dlopen(null, 1i32)
+        var raw = dlsym(handle, c"abs")
+        var absolute: *extern(i32) -> i32 = ptr_cast(raw)
+
+        print(absolute(-41), absolute(41))
+        """), "41 41\n")
+end fad_callable_once_read_as_a_function_pointer
+
+// A symbol that is not there gives a null pointer, which is the value C uses for "no callback"
+// everywhere else too -- so it has to be writable and it has to compare.
+@test("and a symbol that is not there compares equal to null")
+fad_a_missing_symbol_is_null()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        extern dlopen(path: *u8, mode: i32) -> *u8
+        extern dlsym(handle: *u8, name: *u8) -> *u8
+
+        var handle = dlopen(null, 1i32)
+        var missing: *extern(i32) -> i32 = ptr_cast(dlsym(handle, c"no_such_symbol_anywhere"))
+        var present: *extern(i32) -> i32 = ptr_cast(dlsym(handle, c"abs"))
+
+        print(missing == null, present == null, missing != present)
+        """), "true false true\n")
+end fad_a_missing_symbol_is_null
+
+@test("and the null callback is writable directly")
+fad_the_null_callback_is_writable()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran("var none: *extern(i32) -> i32 = null\n\nprint(none == null)\n"), "true\n")
+
+// -- where a function pointer may be kept ----------------------------------------------------------
+
+@test("in a struct field, called through the selection that reads it")
+fad_in_a_struct_field()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        extern abs(n: i32) -> i32
+
+        struct Handler
+            name: string
+            run: *extern(i32) -> i32
+
+        var h = Handler("abs", &abs)
+
+        print(h.name, (h.run)(-7))
+        """), "abs 7\n")
+end fad_in_a_struct_field
+
+@test("in an array of them, chosen by index")
+fad_in_an_array()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        double(n: i32) -> i32 = n * 2
+        negate(n: i32) -> i32 = 0i32 - n
+
+        var table: [2]*extern(i32) -> i32 = [&double, &negate]
+
+        print(table[0](21), table[1](21))
+        """), "42 -21\n")
+end fad_in_an_array
+
+@test("as an ordinary parameter of a sysl function")
+fad_as_an_ordinary_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        apply(f: *extern(i32) -> i32, x: i32) -> i32 = f(x)
+
+        triple(n: i32) -> i32 = n * 3
+
+        print(apply(&triple, 14))
+        """), "42\n")
+end fad_as_an_ordinary_parameter
+
+@test("as a result, so a program may choose one and hand it back")
+fad_as_a_result()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        double(n: i32) -> i32 = n * 2
+        negate(n: i32) -> i32 = 0i32 - n
+
+        pick(up: bool) -> *extern(i32) -> i32 = if up then &double else &negate
+
+        print(pick(true)(21), pick(false)(21))
+        """), "42 -21\n")
+end fad_as_a_result
+
+// It is one word, which is the difference from a `*Fn` that the whole design turns on.
+@test("and it costs one word, where a callable trait object costs two")
+fad_it_costs_one_word()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran("print(sizeof(*extern(i32) -> i32), alignof(*extern(i32) -> i32))\n"), "8 8\n")
+
+// -- the shapes an address may have ----------------------------------------------------------------
+
+@test("no parameters, and no result")
+fad_no_parameters_and_no_result()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        announce()
+            print("called")
+
+        var f: *extern() -> unit = &announce
+
+        f()
+        """), "called\n")
+end fad_no_parameters_and_no_result
+
+@test("a pointer in and a pointer out, which is what a thread body is")
+fad_a_pointer_in_and_a_pointer_out()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        identity(p: *u8) -> *u8 = p
+
+        var f: *extern(*u8) -> *u8 = &identity
+        var n = 7
+        var back: *i32 = ptr_cast(f(ptr_cast(&n)))
+
+        print(*back)
+        """), "7\n")
+end fad_a_pointer_in_and_a_pointer_out
+
+@test("a float, which travels in its own registers")
+fad_a_float()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        scale(x: f64) -> f64 = x * 2.5
+
+        var f: *extern(f64) -> f64 = &scale
+
+        print(f(4.0))
+        """), "10\n")
+end fad_a_float
+
+// A simple enum is its underlying integer and nothing else, so it crosses as one -- where a data
+// enum, being a tag beside a union, does not.
+@test("a simple enum, which is an integer")
+fad_a_simple_enum()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        enum Level
+            Low
+            High
+
+        rank(l: Level) -> i32
+            l match
+                Low  -> 0i32
+                High -> 1i32
+
+        var f: *extern(Level) -> i32 = &rank
+
+        print(f(Level.High), f(Level.Low))
+        """), "1 0\n")
+end fad_a_simple_enum
+
+// A generic function is a body per set of type arguments, and the expected type settles them.
+@test("a generic function's address, at the instantiation the type asks for")
+fad_a_generic_functions_address()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        first[T](a: T, b: T) -> T = a
+
+        val f: *extern(i32, i32) -> i32 = &first
+        print(f(7i32, 9i32))
+        """), "7\n")
+end fad_a_generic_functions_address
+
+// -- what is refused, and why ----------------------------------------------------------------------
+
+// With nothing to read the arguments off, there is still no one body to name.
+@test("a generic function with nothing to say which copy")
+fad_a_generic_with_nothing_to_say_which()
+    if xvr_no_library() then return
+
+    fad_refused(fad_ir("first[T](a: T, b: T) -> T = a\n\nvar f = &first\n"),
+                "'first' is generic, so which copy of it this addresses depends on its type " +
+                "arguments, and nothing here says what they are — write them, as '&first[T]', or " +
+                "write the type this is stored in, as 'var f: *extern(…) -> … = &first'",
+                "main.sysl:3:9")
+end fad_a_generic_with_nothing_to_say_which
+
+// A `...` is read relative to the last named argument, and a signature that fixed the tail would
+// not be a variadic one.
+@test("a variadic function, whose tail no signature states")
+fad_a_variadic_function()
+    if xvr_no_library() then return
+
+    fad_refused(fad_ir("total(first: int, ...) -> int = first\n\nvar f: *extern(int) -> int = &total\n"),
+                "'total' is variadic, and a '*extern' fixes the arguments a call passes — a tail has " +
+                "no width a signature could state, so a variadic function is reached by calling it",
+                "main.sysl:3:30")
+end fad_a_variadic_function
+
+// Its environment is the frame it was declared in, which is exactly what an address cannot carry.
+@test("a nested function, whose environment is a frame")
+fad_a_nested_function()
+    if xvr_no_library() then return
+
+    fad_refused(fad_ir(raw"""
+        outer(n: int) -> int
+            inner(k: int) -> int = k + n
+            var f: *extern(int) -> int = &inner
+            inner(1)
+        """),
+                "'inner' is a nested function, so it has no address to take — what would have to " +
+                "travel beside the address is the frame it reads, and a '*extern' is one word. A " +
+                "top-level function is what has an address",
+                "main.sysl:3:34")
+end fad_a_nested_function
+
+// A test is dropped from every build but `sysl test`, so its address would be of a definition the
+// program does not have -- the refusal a call to one gets, for the same reason.
+@test("a '@test' function, which no ordinary build contains")
+fad_a_test_function()
+    if xvr_no_library() then return
+
+    fad_refused(fad_ir("@test\nt()\n    print(1)\n\nvar f: *extern() -> unit = &t\n"),
+                "'t' is a '@test' function, which 'sysl test' calls and nothing else does — every " +
+                "other build leaves it out, so its address would be of a definition the program " +
+                "does not have",
+                "main.sysl:5:28")
+end fad_a_test_function
+
+// An aggregate crosses to C in whichever registers that machine's convention names, which is not
+// where a sysl definition put it -- so the address would be one C cannot call correctly, and nothing
+// downstream could notice.
+@test("a signature carrying an aggregate, which the two conventions disagree about")
+fad_a_signature_carrying_an_aggregate()
+    if xvr_no_library() then return
+
+    fad_refused(fad_ir(raw"""
+        struct Point
+            x: i32
+            y: i32
+
+        sum(p: Point) -> i32 = p.x + p.y
+
+        var f: *extern(Point) -> i32 = &sum
+        """), "the 1st parameter of 'sum' is Point" + fad_aggregate(), "main.sysl:7:32")
+
+    fad_refused(fad_ir(raw"""
+        struct Point
+            x: i32
+            y: i32
+
+        origin() -> Point = Point(0i32, 0i32)
+
+        var f: *extern() -> Point = &origin
+        """), "the result of 'origin' is Point" + fad_aggregate(), "main.sysl:7:29")
+end fad_a_signature_carrying_an_aggregate
+
+// The refusal above is a statement about code this compiler emitted. None of it can be true of a C
+// function: sysl neither compiled it nor chose its convention.
+@test("and an extern is past the question, since its convention was never sysl's to choose")
+fad_an_extern_is_past_the_question()
+    if xvr_no_library() then return
+
+    val out = fad_ir(raw"""
+        struct Point
+            x: i32
+            y: i32
+
+        extern "c_sum" c_sum(p: Point) -> i32
+        extern "c_take" c_take(f: *extern(Point) -> i32) -> i32
+
+        print(c_take(&c_sum))
+        """)
+
+    assert(out.contains(" = call i32 @c_take(ptr @c_sum)\n"), out)
+end fad_an_extern_is_past_the_question
+
+// So is a function carrying `@export`, whose address is its thunk's -- a definition that genuinely
+// has the convention the rule is written about.
+@test("and so is an exported function, whose address is the C-convention entry")
+fad_an_exported_function()
+    if xvr_no_library() then return
+
+    val out = fad_ir(raw"""
+        struct Point
+            x: i32
+            y: i32
+
+        @export("c_sum")
+        sum(p: Point) -> i32 = p.x + p.y
+
+        extern "c_take" c_take(f: *extern(Point) -> i32) -> i32
+
+        print(c_take(&sum))
+        """)
+
+    // The thunk, not the definition -- which is the whole point of the address being admitted.
+    assert(out.contains("define i32 @c_sum("), out)
+    assert(out.contains(" = call i32 @c_take(ptr @c_sum)\n"), out)
+    assert(!out.contains("ptr @sum)"), out)
+end fad_an_exported_function
+
+// A string is three words in sysl and one in C, so it is an aggregate here for the same reason a
+// struct is.
+@test("a string, which is a view rather than the address C would read")
+fad_a_string()
+    if xvr_no_library() then return
+
+    fad_refused(fad_ir("greet(s: string) -> i32 = 0i32\n\nvar f: *extern(string) -> i32 = &greet\n"),
+                "the 1st parameter of 'greet' is string" + fad_aggregate(), "main.sysl:3:33")
+
+@test("a call through one at the wrong arity")
+fad_a_call_at_the_wrong_arity()
+    if xvr_no_library() then return
+
+    fad_refused(fad_ir(raw"""
+        double(n: i32) -> i32 = n * 2
+
+        var f: *extern(i32) -> i32 = &double
+
+        print(f(1i32, 2i32))
+        """), "a *extern(int) -> int is called with 1 argument, and 2 were given", "main.sysl:5:7")
+end fad_a_call_at_the_wrong_arity
+
+// A function pointer's parameters have no names, so a mismatch names the position, and the callee
+// it names is the type itself.
+@test("a call through one at the wrong argument type")
+fad_a_call_at_the_wrong_argument_type()
+    if xvr_no_library() then return
+
+    fad_refused(fad_ir(raw"""
+        double(n: i32) -> i32 = n * 2
+
+        var f: *extern(i32) -> i32 = &double
+
+        print(f("no"))
+        """), "the 1st argument of *extern(int) -> int is int, but string was given", "main.sysl:5:9")
+end fad_a_call_at_the_wrong_argument_type
+
+// A closure carries an environment, and an address is one word with nowhere to put it.
+@test("a closure, which is a value rather than a declaration")
+fad_a_closure()
+    if xvr_no_library() then return
+
+    fad_refused(fad_ir("var c: &Fn(int) -> int = x -> x + 1\nvar f: *extern(int) -> int = &c\n"),
+                "cannot initialize 'f': declared *extern(int) -> int but the value is *&Fn(int) -> int",
+                "main.sysl:2:1")
+
+// The signature is the whole of what makes the call safe to emit, so leaving it off is refused with
+// the spelling rather than with a parse error about the token after it.
+@test("the spelling with no signature on it")
+fad_the_spelling_with_no_signature()
+    if xvr_no_library() then return
+
+    val said = fad_ran("var f: *extern = null\n")
+
+    assert(said.contains("error: '*extern' is a foreign function's address, so it is written with " +
+                         "the signature that address is called at — '*extern(int) -> int', and " +
+                         "'*extern() -> unit' for one that takes nothing and yields nothing\n --> "), said)
+    assert(said.contains("/main.sysl:1:16\n"), said)
+end fad_the_spelling_with_no_signature
+
+// -- what the chapter claims -----------------------------------------------------------------------
+
+// Taking the address of a function with an aggregate in its signature is refused and calling
+// through one is not, because the call site is where the coercion happens. `div` returns a
+// two-integer struct, so a right answer is a real check.
+@test("a call through one coerces an aggregate, where taking the address of one is refused")
+fad_a_call_coerces_an_aggregate()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        struct div_t
+            quot: i32
+            rem: i32
+
+        extern dlopen(path: *u8, mode: i32) -> *u8
+        extern dlsym(handle: *u8, name: *u8) -> *u8
+
+        var d: *extern(i32, i32) -> div_t = ptr_cast(dlsym(dlopen(null, 1i32), c"div"))
+        var r = d(7i32, 2i32)
+
+        print(r.quot, r.rem)
+        """), "3 1\n")
+end fad_a_call_coerces_an_aggregate
+
+// The test is made by shape rather than by asking the target's classification, so a program
+// accepted for one machine is accepted for every machine.
+@test("an address is accepted or refused the same way on every target")
+fad_the_same_way_on_every_target()
+    if xvr_no_library() then return
+
+    val targets = all_targets()
+    val ok = "double(n: i32) -> i32 = n * 2\nvar f: *extern(i32) -> i32 = &double\nprint(f(21))\n"
+    val no = raw"""
+        struct Point
+            x: i32
+            y: i32
+        sum(p: Point) -> i32 = p.x + p.y
+        var f: *extern(Point) -> i32 = &sum
+        """
+
+    for i in 0..<targets.len()
+        val t = targets.at(i)
+        val out = fad_for(t, ok)
+
+        assert(out.contains("define i32 @double(i32 %n.param) {\n"), s"${t.name}: $out")
+        assert(out.contains("store ptr @double, ptr %f.addr\n"), s"${t.name}: $out")
+
+        fad_refused(fad_for(t, no), "the 1st parameter of 'sum' is Point" + fad_aggregate(),
+                    "main.sysl:5:32")
+end fad_the_same_way_on_every_target
+
+// `ptr_cast` reaches between an address of code and an address of bytes -- the direction the dlsym
+// tests do not cover, which is a callback handed to a C interface storing them as `void *`.
+@test("an address of code goes back out as an address of bytes")
+fad_an_address_of_code_as_bytes()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(fad_qsort() + raw"""
+        compare(a: *u8, b: *u8) -> i32
+            var pa: *i32 = ptr_cast(a)
+            var pb: *i32 = ptr_cast(b)
+            *pa - *pb
+
+        var as_bytes: *u8 = ptr_cast(&compare)
+        var back: *extern(*u8, *u8) -> i32 = ptr_cast(as_bytes)
+        var xs = [2i32, 1i32]
+
+        qsort(ptr_cast(&xs[0]), 2usize, 4usize, back)
+
+        print(xs[0], xs[1], as_bytes == null)
+        """), "1 2 false\n")
+end fad_an_address_of_code_as_bytes
+
+@test("two addresses of one function are equal, and of two functions are not")
+fad_two_addresses_compare()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran("a(n: i32) -> i32 = n\nb(n: i32) -> i32 = n\n\nprint(&a == &a, &a == &b)\n"),
+              "true false\n")
+
+// -- the edges -------------------------------------------------------------------------------------
+
+// The mangled name carries the signature, so a generic instantiated at two function-pointer types
+// must get two bodies. Sharing one would be a miscompile no diagnostic could reach.
+@test("a generic at two function-pointer types gets two instantiations")
+fad_two_instantiations()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        struct Box[T]
+            value: T
+
+        unwrap[T](b: Box[T]) -> T = b.value
+
+        narrow(n: i32) -> i32 = n * 2
+        wide(n: i64) -> i64 = n * 3i64
+
+        var a = Box(&narrow)
+        var b = Box(&wide)
+
+        print(unwrap(a)(21i32), unwrap(b)(14i64))
+        """), "42 42\n")
+end fad_two_instantiations
+
+// `*extern(int) -> int` has characters an LLVM name cannot hold.
+@test("and the mangled name of one is a legal symbol")
+fad_the_mangled_name_is_legal()
+    if xvr_no_library() then return
+
+    val out = fad_ir(raw"""
+        struct Box[T]
+            value: T
+
+        double(n: i32) -> i32 = n * 2
+
+        var b = Box(&double)
+        print(b.value(21))
+        """)
+
+    assert(out.contains("%struct.Box.cfn1.int.int = type { ptr }\n"), out)
+    assert(out.contains(" = insertvalue %struct.Box.cfn1.int.int undef, ptr @double, 0\n"), out)
+    assert(!out.contains("*extern"), out)
+end fad_the_mangled_name_is_legal
+
+// A `unit` parameter is zero-sized and dropped from the emitted signature, so the argument is
+// evaluated for its effect and the ones after it shift up. The positions a function-pointer call
+// checks against must be the written ones, not the emitted ones.
+@test("a zero-sized parameter is dropped from the call but not from the arity")
+fad_a_zero_sized_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        second(a: unit, b: i32) -> i32 = b
+
+        var f: *extern(unit, i32) -> i32 = &second
+
+        print(f((), 7i32))
+        """), "7\n")
+
+    fad_refused(fad_ir(raw"""
+        second(a: unit, b: i32) -> i32 = b
+        var f: *extern(unit, i32) -> i32 = &second
+        print(f(7i32))
+        """), "a *extern(unit, int) -> int is called with 2 arguments, and 1 were given",
+                "main.sysl:3:7")
+end fad_a_zero_sized_parameter
+
+// `never` says the callee does not come back, and a call through a pointer has to end the block
+// exactly as a direct one does -- otherwise the code after it is emitted and LLVM rejects it.
+@test("a result of 'never' ends the block")
+fad_a_result_of_never()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        extern exit(code: i32) -> never
+
+        var stop: *extern(i32) -> never = &exit
+
+        print("before")
+        stop(0i32)
+        print("after")
+        """), "before\n")
+end fad_a_result_of_never
+
+// One returning another, which is what a C interface installing a handler and giving back the
+// previous one does -- `signal` is exactly this shape.
+@test("one whose result is another one")
+fad_one_whose_result_is_another()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        double(n: i32) -> i32 = n * 2
+
+        chooser() -> *extern(i32) -> i32 = &double
+
+        var pick: *extern() -> *extern(i32) -> i32 = &chooser
+
+        print(pick()(21))
+        """), "42\n")
+end fad_one_whose_result_is_another
+
+// The shape a re-arming signal handler has.
+@test("a function that takes its own address")
+fad_a_function_that_takes_its_own_address()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(fad_qsort() + raw"""
+        compare(a: *u8, b: *u8) -> i32
+            var pa: *i32 = ptr_cast(a)
+            var pb: *i32 = ptr_cast(b)
+            var mine: *extern(*u8, *u8) -> i32 = &compare
+            if mine == null then 0i32 else *pa - *pb
+
+        var xs = [2i32, 1i32]
+
+        qsort(ptr_cast(&xs[0]), 2usize, 4usize, &compare)
+        print(xs[0], xs[1])
+        """), "1 2\n")
+end fad_a_function_that_takes_its_own_address
+
+// Reachability is transitive through an address: the addressed function is kept, and so is whatever
+// it reaches -- including another function reached only by its address.
+@test("a function reached only through an address that is itself only addressed")
+fad_reached_only_through_an_address()
+    if xvr_no_library() then return
+
+    val out = fad_ir(fad_qsort() + raw"""
+        inner(n: i32) -> i32 = n
+
+        compare(a: *u8, b: *u8) -> i32
+            var f: *extern(i32) -> i32 = &inner
+            f(0i32)
+
+        var xs = [2i32, 1i32]
+        qsort(ptr_cast(&xs[0]), 2usize, 4usize, &compare)
+        print(xs[0])
+        """)
+
+    assert(out.contains("define i32 @compare(ptr %a.param, ptr %b.param) {\n"), out)
+    assert(out.contains("define i32 @inner(i32 %n.param) {\n"), out)
+    assert(out.contains("store ptr @inner, ptr %f.addr\n"), out)
+end fad_reached_only_through_an_address
+
+@test("one held in a module-level val")
+fad_one_held_in_a_module_level_val()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        double(n: i32) -> i32 = n * 2
+
+        val doubler: *extern(i32) -> i32 = &double
+
+        print(doubler(21))
+        """), "42\n")
+end fad_one_held_in_a_module_level_val
+
+// A signature is named once, with a `type` alias; a transparent alias declares no type at all, so
+// neither a pointer nor a signature is refused as a base.
+@test("is named once, with an alias")
+fad_named_once_with_an_alias()
+    if xvr_no_library() then return
+
+    assert(fad_ir(raw"""
+        type Comparison = *extern(*u8, *u8) -> i32
+
+        compare(a: *u8, b: *u8) -> i32 = i32(a[0]) - i32(b[0])
+
+        call(f: Comparison, a: *u8, b: *u8) -> i32 = f(a, b)
+
+        var xs = [9u8, 4u8]
+
+        print(str(call(&compare, &xs[0], &xs[1])))
+        """).contains(" = call i32 @call(ptr @compare, ptr "))
+
+    assert_eq(fad_ran(raw"""
+        type Handle = *u8
+
+        first(h: Handle) -> u8 = h[0]
+
+        var bytes = [7u8]
+
+        print(str(first(&bytes[0])))
+        """), "7\n")
+end fad_named_once_with_an_alias
+
+// An allocator-free module is held to what its calls reach, and taking an address is a way of
+// reaching. The allocator-free half is what makes the test discriminating -- a rule that refused
+// every address would pass the second half and mean nothing.
+@test("an address in a 'no alloc' module reaches what the function reaches")
+fad_an_address_in_a_no_alloc_module()
+    if xvr_no_library() then return
+
+    val plain = xvr_ir([("thing/a.sysl", "module thing\n@no_alloc\n\nplain(n: i32) -> i32 = n * 2\n" +
+                                         "addr() -> *extern(i32) -> i32 = &plain\n"),
+                        ("main.sysl", "print(thing.addr()(21))")])
+
+    assert(plain.contains("define ptr @thing$addr() {\n"), plain)
+    assert(plain.contains("  ret ptr @thing$plain\n"), plain)
+
+    val boxes = xvr_ir([("thing/a.sysl", "module thing\n@no_alloc\n\nboxes(n: int) -> &int = n\n" +
+                                         "addr() -> *extern(int) -> &int = &boxes\n"),
+                        ("main.sysl", "print(*thing.addr()(1))")])
+
+    fad_refused(boxes, "a reference needs an allocator, and this module declared '@no_alloc' — it may " +
+                       "hold and release storage made elsewhere, and may make none of its own",
+                "thing/a.sysl:4:25")
+    fad_refused(boxes, "this reaches 'thing.boxes', which makes heap storage, and this module declared " +
+                       "'@no_alloc' — an allocator-free module may only call what is allocator-free " +
+                       "itself",
+                "thing/a.sysl:5:34")
+end fad_an_address_in_a_no_alloc_module
+
+// The table shape a dispatch loop reads.
+@test("a slice of them, walked")
+fad_a_slice_of_them()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        double(n: i32) -> i32 = n * 2
+        negate(n: i32) -> i32 = 0i32 - n
+
+        var table: &[2]*extern(i32) -> i32 = [&double, &negate]
+
+        sum(fs: []*extern(i32) -> i32, x: i32) -> i32
+            var t = 0i32
+            for f in fs do t += f(x)
+            t
+
+        print(sum(table[..], 10i32))
+        """), "10\n")
+end fad_a_slice_of_them
+
+// -- what it is not --------------------------------------------------------------------------------
+
+// `*Fn(A) -> R` is an unowned trait object over a callable: two words, a method table beside the
+// value. It stays what it was, which is why a C function pointer needed a spelling of its own.
+@test("a '*Fn', which is a trait object over a callable and is unchanged")
+fad_a_star_fn_is_unchanged()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        struct Doubler
+            k: int
+
+        impl Fn(int) -> int for Doubler
+            call(*self, a: int) -> int = a * self.k
+
+        var d = Doubler(3)
+        var raw: *Fn(int) -> int = &d
+
+        print(raw(5), sizeof(*Fn(int) -> int))
+        """), "15 16\n")
+end fad_a_star_fn_is_unchanged
+
+// The two are different types, so neither stands where the other is asked for.
+@test("and the two do not stand in for each other")
+fad_the_two_do_not_stand_in()
+    if xvr_no_library() then return
+
+    fad_refused(fad_ir("double(n: int) -> int = n * 2\n\nvar f: *Fn(int) -> int = &double\n"),
+                "cannot initialize 'f': declared *Fn(int) -> int but the value is *extern(int) -> int",
+                "main.sysl:3:1")
+
+// A bare function name still means the capture-free closure it always meant, so the `&` is what
+// tells the two readings apart and nothing was quietly rerouted.
+@test("and a bare name is still the capture-free closure it was")
+fad_a_bare_name_is_still_a_closure()
+    if xvr_no_library() then return
+
+    assert_eq(fad_ran(raw"""
+        square(n: int) -> int = n * n
+
+        apply(f: int -> int, x: int) -> int = f(x)
+
+        print(apply(square, 7))
+        """), "49\n")
+end fad_a_bare_name_is_still_a_closure
+
+// Where nothing asks for a callable, a bare name is still the mistake it was -- and the message has
+// an address to point at.
+@test("and a bare name where nothing wants a callable still says so")
+fad_a_bare_name_where_nothing_wants_one()
+    if xvr_no_library() then return
+
+    fad_refused(fad_ir("square(n: int) -> int = n * n\nprint(square)\n"),
+                "'square' is a function, and a function becomes a value only where a callable is " +
+                "wanted — a bare-arrow parameter, or a '&Fn' where a concrete type is required. " +
+                "Nothing here asks for one; where the address of code is what is wanted, that is " +
+                "written '&square'",
+                "main.sysl:2:7")
+end fad_a_bare_name_where_nothing_wants_one
+
+// -- a function named through its module -----------------------------------------------------------
+
+private fad_shapes(body: string) -> (string, string) = ("shapes/shapes.sysl", s"module shapes\n$body\n")
+
+// The two spellings must agree: an address is a number nobody can predict, and two spellings of one
+// declaration disagreeing is precisely the defect.
+@test("reaches an address, and it is the address the bare spelling gives")
+fad_the_address_the_bare_spelling_gives()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([fad_shapes("less(a: int, b: int) -> bool = a < b"), ("main.sysl", raw"""
+        import shapes
+        import shapes.less
+
+        val qualified: *extern(int, int) -> bool = &shapes.less
+        val bare: *extern(int, int) -> bool = &less
+
+        print(qualified == bare, qualified(2, 5), qualified(5, 2))
+        """)]), "true true false\n")
+end fad_the_address_the_bare_spelling_gives
+
+// `&f[T]` is the one position where type arguments are written, and a binding's trampoline, which is
+// what that form exists for, is named through the module it lives in.
+@test("including an instantiation with its type argument written")
+fad_an_instantiation_through_its_module()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([fad_shapes("pick[T](a: T, b: T) -> T = a"), ("main.sysl", raw"""
+        import shapes
+
+        val g: *extern(i32, i32) -> i32 = &shapes.pick[i32]
+
+        print(g(7, 9))
+        """)]), "7\n")
+end fad_an_instantiation_through_its_module
+
+@test("and one with more than one type argument written")
+fad_more_than_one_type_argument()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([fad_shapes("either[A, B](a: A, b: B) -> A = a"), ("main.sysl", raw"""
+        import shapes
+
+        val g: *extern(i32, bool) -> i32 = &shapes.either[i32, bool]
+
+        print(g(4, true))
+        """)]), "4\n")
+end fad_more_than_one_type_argument
+
+// A path deeper than one segment is the same question asked twice; flattening a chain of field
+// reads is where a fix could stop one level short.
+@test("however deep the module path is")
+fad_however_deep_the_module_path()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("a/b/b.sysl", "module a.b\nless(x: int, y: int) -> bool = x < y\n"),
+                       ("main.sysl", raw"""
+        import a.b
+
+        val f: *extern(int, int) -> bool = &a.b.less
+
+        print(f(1, 2))
+        """)]), "true\n")
+end fad_however_deep_the_module_path
+
+// A local binding shadows a module name: a head bound to a value makes the chain a field read and
+// nothing else, so reading it as a module path would take an address of the wrong thing entirely.
+@test("while a local of the module's name is still a field read")
+fad_a_local_of_the_modules_name()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([fad_shapes("less(a: int, b: int) -> bool = a < b"), ("main.sysl", raw"""
+        import shapes
+
+        struct Holder
+            less: int
+
+        var shapes = Holder(42)
+        val p: *int = &shapes.less
+
+        print(*p)
+        """)]), "42\n")
+end fad_a_local_of_the_modules_name
+
+// The message names the declaration by the path a reader would type, never by the key the table
+// holds it under -- and the advice it gives is what the first case here compiles.
+@test("and a refusal quotes a spelling the reader can actually type")
+fad_a_refusal_quotes_a_typable_spelling()
+    if xvr_no_library() then return
+
+    val said = xvr_ir([fad_shapes("less(a: int, b: int) -> bool = a < b"),
+                       ("main.sysl", "import shapes\nval x: int = shapes.less\n")])
+
+    fad_refused(said, "'shapes.less' is a function, and a function becomes a value only where a " +
+                      "callable is wanted — a bare-arrow parameter, or a '&Fn' where a concrete type " +
+                      "is required. Nothing here asks for one; where the address of code is what is " +
+                      "wanted, that is written '&shapes.less'",
+                "main.sysl:2:21")
+    assert(!said.contains("shapes$less"), said)
+end fad_a_refusal_quotes_a_typable_spelling
