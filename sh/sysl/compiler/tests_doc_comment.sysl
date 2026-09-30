@@ -1,0 +1,476 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all, split}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// Documentation comments -- `/** ... */` above a declaration, and what is read out of one.
+//
+// The tiers here answer separate questions, and conflating them is how a doc-comment feature comes
+// to be tested only at the end that is easiest to reach:
+//
+//   - the **lexer** collects doc comments and nothing else (`tests_lex.sysl` holds those);
+//   - `parse_doc` turns one comment's text into a summary, a body and its tags;
+//   - `check_doc` holds the tags that name the signature to the signature;
+//   - `doc_above` decides which declaration a comment belongs to.
+//
+// **Every reading and every message quoted here was read out of the reference compiler** (0.0.152),
+// whose `DocCommentTests` these are: the readings from `sysl emit-ast`, the messages from
+// `sysl build` on the same source.
+
+private dcm_docs(text: string) -> Buf[Doc]
+    val src = source_of("test.sysl", text)
+
+    read_doc_comments(src, lex_documented(src).unwrap().docs)
+end dcm_docs
+
+private dcm_one(text: string) -> Doc
+    val all = dcm_docs(text)
+
+    assert_eq(all.len(), 1)
+    all.at(0)
+end dcm_one
+
+private dcm_names(tags: Buf[DocTag]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<tags.len()
+        out.push(tags.at(i).name)
+
+    out
+end dcm_names
+
+private dcm_subjects(tags: Buf[DocTag]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<tags.len()
+        out.push(tags.at(i).subject.unwrap_or("<none>"))
+
+    out
+end dcm_subjects
+
+private dcm_strs(ts: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for t in ts
+        out.push(t)
+
+    out
+end dcm_strs
+
+// -- the lexer ------------------------------------------------------------------------------------
+
+@test("a second scan does not inherit the first scan's comments")
+dcm_a_second_scan_starts_empty()
+    val first = lex_documented(source_of("a.sysl", "/** from the first file */\nval a = 1\n"))
+    val second = lex_documented(source_of("b.sysl", "val b = 2\n"))
+
+    assert_eq(first.unwrap().docs.len(), 1)
+    assert_eq(second.unwrap().docs.len(), 0)
+end dcm_a_second_scan_starts_empty
+
+// -- the margin is stripped, and what the author wrote is kept --------------------------------------
+
+@test("a single-line comment")
+dcm_a_single_line_comment()
+    assert_eq(dcm_one("/** the answer */\nval n = 1\n").body, "the answer")
+
+@test("the scaladoc margin")
+dcm_the_scaladoc_margin()
+    assert_eq(dcm_one("/** The first line.\n *\n * The second paragraph.\n */\nval n = 1\n").body,
+              "The first line.\n\nThe second paragraph.")
+
+@test("a comment written with no margin at all")
+dcm_no_margin_at_all()
+    assert_eq(dcm_one("/**\nThe first line.\nThe second.\n*/\nval n = 1\n").body,
+              "The first line.\nThe second.")
+
+@test("indentation inside a fenced block survives, because a code example is shaped")
+dcm_a_fenced_block_keeps_its_shape()
+    val d = dcm_one("/** Sorting a slice.\n *\n * ```\n * sort(xs)\n *     print(xs)\n * ```\n */\n" +
+                    "val n = 1\n")
+
+    assert_eq(d.body, "Sorting a slice.\n\n```\nsort(xs)\n    print(xs)\n```")
+end dcm_a_fenced_block_keeps_its_shape
+
+// -- the summary is the first sentence, because an index has one column to spend --------------------
+
+@test("a sentence ending in a full stop")
+dcm_a_sentence_ending_in_a_full_stop()
+    assert_eq(dcm_one("/** The answer. And then some more. */\nval n = 1\n").summary, "The answer.")
+
+// The case that matters in a language whose module names are dotted: `sysl.text` mid-sentence would
+// end the summary under a naive rule, and the summary would be two words long.
+@test("a dotted module name does not end a sentence")
+dcm_a_dotted_module_name()
+    assert_eq(dcm_one("/** Reads sysl.text and answers a width. Nothing else. */\nval n = 1\n").summary,
+              "Reads sysl.text and answers a width.")
+
+@test("a body with no sentence stop is all summary")
+dcm_no_sentence_stop()
+    assert_eq(dcm_one("/** a width in columns */\nval n = 1\n").summary, "a width in columns")
+
+@test("a question ends one too")
+dcm_a_question_ends_one()
+    assert_eq(dcm_one("/** Is it sorted? The check is linear. */\nval n = 1\n").summary,
+              "Is it sorted?")
+
+@test("the summary is flattened, so a wrapped sentence is one line")
+dcm_the_summary_is_flattened()
+    val d = dcm_one("/** The first sentence\n * wraps across lines.\n * The second does not.\n */\n" +
+                    "val n = 1\n")
+
+    assert_eq(d.summary, "The first sentence wraps across lines.")
+    assert_eq(d.body, "The first sentence\nwraps across lines.\nThe second does not.")
+end dcm_the_summary_is_flattened
+
+// -- tags -----------------------------------------------------------------------------------------
+
+@test("`@param` takes a name and its prose")
+dcm_param_takes_a_name()
+    val d = dcm_one("/** Sorts a slice.\n *\n * @param xs the slice, sorted in place\n */\nval n = 1\n")
+    val params = doc_tags_named(d, "param")
+
+    assert_eq(d.body, "Sorts a slice.")
+    assert_eq(params.len(), 1)
+    assert_eq(params.at(0).subject.unwrap(), "xs")
+    assert_eq(params.at(0).text, "the slice, sorted in place")
+end dcm_param_takes_a_name
+
+@test("`@return` takes no name")
+dcm_return_takes_no_name()
+    val d = dcm_one("/** Counts.\n * @return the number of BYTES, not characters\n */\nval n = 1\n")
+    val returns = doc_tags_named(d, "return")
+
+    assert_eq(returns.len(), 1)
+    assert_eq(returns.at(0).text, "the number of BYTES, not characters")
+    assert(returns.at(0).subject.is_none())
+end dcm_return_takes_no_name
+
+@test("`@tparam` is a parameter tag over a type")
+dcm_tparam_is_a_parameter_tag()
+    val tparams = doc_tags_named(dcm_one("/** Sorts.\n * @tparam T the element type\n */\nval n = 1\n"),
+                                 "tparam")
+
+    assert_eq(tparams.len(), 1)
+    assert_eq(tparams.at(0).subject.unwrap(), "T")
+    assert_eq(tparams.at(0).text, "the element type")
+end dcm_tparam_is_a_parameter_tag
+
+@test("a tag runs on to its continuation lines, blank lines included")
+dcm_a_tag_runs_on()
+    val d = dcm_one("/** Sorts.\n *\n * @param xs the slice.\n *\n" +
+                    " *   It is sorted in place, so the caller's storage is what changes.\n */\n" +
+                    "val n = 1\n")
+
+    assert_eq(doc_tags_named(d, "param").at(0).text,
+              "the slice.\n\n  It is sorted in place, so the caller's storage is what changes.")
+end dcm_a_tag_runs_on
+
+@test("several tags keep their source order")
+dcm_several_tags_keep_their_order()
+    val d = dcm_one("/** Sorts.\n * @param xs the slice\n * @param lt the comparison\n" +
+                    " * @return nothing\n */\nval n = 1\n")
+
+    assert_eq(dcm_subjects(doc_tags_named(d, "param")), dcm_strs(["xs", "lt"]))
+    assert_eq(dcm_names(d.tags), dcm_strs(["param", "param", "return"]))
+end dcm_several_tags_keep_their_order
+
+@test("a tag knows the line it was written on, so a diagnostic can point at it")
+dcm_a_tag_knows_its_line()
+    val d = dcm_one("/** Sorts.\n * @param xs the slice\n */\nval n = 1\n")
+
+    assert_eq(doc_tags_named(d, "param").at(0).line, 2)
+end dcm_a_tag_knows_its_line
+
+@test("an `@` inside a sentence is prose, not a tag")
+dcm_an_at_inside_a_sentence()
+    val d = dcm_one("/** Reachable from a @test function, which is the point. */\nval n = 1\n")
+
+    assert_eq(d.tags.len(), 0)
+    assert_eq(d.body, "Reachable from a @test function, which is the point.")
+end dcm_an_at_inside_a_sentence
+
+// sysl's `@` is the annotation sigil, so a doc comment discussing one is discussing the language.
+// The vocabulary is closed and this is what closing it buys.
+@test("a line beginning with a language annotation is left in the body, not read as a tag")
+dcm_a_language_annotation_is_not_a_typo()
+    val d = dcm_one("/** Sorting.\n *\n" +
+                    " * @requires is what a capability clause is spelled with, and this module has none.\n" +
+                    " */\nval n = 1\n")
+
+    assert_eq(unknown_doc_tags(d).len(), 0)
+    assert_eq(d.body, "Sorting.")
+    assert_eq(dcm_names(d.tags), dcm_strs(["requires"]))
+end dcm_a_language_annotation_is_not_a_typo
+
+@test("an unrecognized tag is recorded as unknown, though nothing acts on it")
+dcm_an_unrecognized_tag_is_recorded()
+    val d = dcm_one("/** Sorts.\n * @parm xs a typo for param\n */\nval n = 1\n")
+
+    assert_eq(dcm_names(unknown_doc_tags(d)), dcm_strs(["parm"]))
+    assert_eq(d.tags.at(0).text, "xs a typo for param")
+end dcm_an_unrecognized_tag_is_recorded
+
+// A fallible function answers with the `E` of a `Result[T, E]`, which is part of the return type --
+// so `@return` describes it and a second channel would be describing something that does not
+// exist. It reads as an unknown tag rather than being refused.
+@test("there is no `@throws`, because sysl has no exceptions")
+dcm_there_is_no_throws()
+    val d = dcm_one("/** Reads.\n * @throws nothing, ever\n */\nval n = 1\n")
+
+    assert_eq(dcm_names(unknown_doc_tags(d)), dcm_strs(["throws"]))
+end dcm_there_is_no_throws
+
+// -- a tag that names the signature is checked, and only in the one direction ------------------------
+
+private dcm_said(found: Buf[DocFault]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<found.len()
+        out.push(found.at(i).message)
+
+    out
+end dcm_said
+
+// A signature's names, written as one space-separated string so that "none" is the empty one.
+private dcm_words(names: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if names.len == 0 then return out
+
+    for word in split(names, " ")
+        out.push(word)
+
+    out
+end dcm_words
+
+private dcm_checked(text: string, params: string, tparams: string) -> Buf[DocFault] =
+    check_doc(parse_doc(text, 1, 1), dcm_words(params), dcm_words(tparams))
+
+@test("a `@param` naming a real parameter is fine")
+dcm_a_real_parameter_is_fine()
+    assert_eq(dcm_checked("/** Sorts.\n * @param xs the slice\n */", "xs", "").len(), 0)
+
+// The shape a rename leaves behind: the parameter moved on and the paragraph did not.
+@test("a `@param` naming nothing in the signature is refused, and the message says what is there")
+dcm_a_stale_param_is_refused()
+    val found = dcm_checked("/** Sorts.\n * @param items the slice\n */", "xs lt", "")
+
+    assert_eq(found.len(), 1)
+    assert_eq(found.at(0).tag.subject.unwrap(), "items")
+    assert_eq(found.at(0).message, "'items' is not a parameter of this declaration — it has xs, lt")
+end dcm_a_stale_param_is_refused
+
+@test("a declaration with no parameters at all says so, rather than listing nothing")
+dcm_no_parameters_at_all()
+    assert_eq(dcm_said(dcm_checked("/** N.\n * @param x a thing\n */", "", "")),
+              dcm_strs(["'x' is not a parameter of this declaration — it has no parameters"]))
+
+@test("a bare `@param` with no name after it is its own mistake")
+dcm_a_bare_param()
+    assert_eq(dcm_said(dcm_checked("/** Sorts.\n * @param\n */", "xs", "")),
+              dcm_strs(["'@param' names no parameter — write the name it documents after the tag"]))
+
+@test("`@tparam` is checked against the type parameters, separately")
+dcm_tparam_is_checked_separately()
+    val text = "/** Sorts.\n * @tparam E the element\n */"
+
+    assert_eq(dcm_said(dcm_checked(text, "xs", "T")),
+              dcm_strs(["'E' is not a type parameter of this declaration — it has T"]))
+    assert_eq(dcm_checked(text, "xs", "E").len(), 0)
+
+    // A parameter of the same name does not answer for a type parameter.
+    assert_eq(dcm_said(dcm_checked(text, "E", "")),
+              dcm_strs(["'E' is not a type parameter of this declaration — it has no type parameters"]))
+end dcm_tparam_is_checked_separately
+
+// Documentation is optional and a partial doc comment is better than none. Requiring the full set is
+// what makes people write `@param n the n` to silence a warning, and it is what would stop the
+// library being converted a file at a time.
+@test("a parameter with NO `@param` is not an error, and this is the property that matters")
+dcm_an_undocumented_parameter_is_fine()
+    assert_eq(dcm_checked("/** Sorts a slice. */", "xs lt", "T").len(), 0)
+
+@test("an undocumented parameter beside a documented one is still not an error")
+dcm_a_partly_documented_signature()
+    assert_eq(dcm_checked("/** Sorts.\n * @param xs the slice\n */", "xs lt", "").len(), 0)
+
+@test("an unknown tag is not checked, because it is prose")
+dcm_an_unknown_tag_is_not_checked()
+    assert_eq(dcm_checked("/** Sorts.\n * @parm xs a typo\n */", "xs", "").len(), 0)
+
+// -- the check reaches a reader, through a whole compilation -----------------------------------------
+
+private dcm_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end dcm_ready
+
+// Everything a program has to say for itself, the file named as the reference's own test names it.
+private dcm_err(text: string) -> string
+    val root = make_temp_dir("sysl-doc-comment").unwrap()
+    val src = s"$root/t.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end dcm_err
+
+// One refusal as it is printed: at the first column of the tag's own line.
+private dcm_refusal(message: string, line: int, written: string) -> string =
+    s"error: $message\n --> t.sysl:$line:1\n  |\n$line | $written\n  | ^"
+
+private dcm_add() -> string = "add(a: int, b: int) -> int = a + b\n\nprint(add(1, 2))\n"
+
+private dcm_point(tags: string) -> string =
+    "struct Point\n    x: int\n    y: int\n\n    /** Moves it.\n" + tags + "     */\n" +
+    "    shift(self, dx: int) -> Point = Point(self.x + dx, self.y)\n\n" +
+    "print(Point(1, 2).shift(1).x)\n"
+
+@test("a `@param` naming nothing in the signature stops the compilation")
+dcm_a_stale_param_stops_the_compilation()
+    if !dcm_ready() then return
+
+    val out = dcm_err("/** Adds.\n * @param z one of them\n */\n" + dcm_add())
+
+    assert(out.index_of("error: 'z' is not a parameter of this declaration — it has a, b").is_some())
+end dcm_a_stale_param_stops_the_compilation
+
+@test("and it points at the tag's own line, not at the declaration")
+dcm_it_points_at_the_tags_line()
+    if !dcm_ready() then return
+
+    assert_eq(dcm_err("/** Adds.\n * @param z one of them\n */\n" + dcm_add()),
+              dcm_refusal("'z' is not a parameter of this declaration — it has a, b", 2,
+                          " * @param z one of them"))
+end dcm_it_points_at_the_tags_line
+
+@test("a correct doc comment compiles, tags and all")
+dcm_a_correct_doc_comment_compiles()
+    if !dcm_ready() then return
+
+    assert_eq(dcm_err("/** Adds two numbers.\n *\n * @param a the first\n * @param b the second\n" +
+                      " * @return their sum\n */\n" + dcm_add()), "")
+end dcm_a_correct_doc_comment_compiles
+
+@test("an undocumented parameter compiles, which is the property that matters")
+dcm_an_undocumented_parameter_compiles()
+    if !dcm_ready() then return
+
+    assert_eq(dcm_err("/** Adds two numbers.\n *\n * @param a the first\n */\n" + dcm_add()), "")
+end dcm_an_undocumented_parameter_compiles
+
+@test("a `@tparam` on a generic function is checked against its type parameters")
+dcm_a_tparam_on_a_generic_function()
+    if !dcm_ready() then return
+
+    assert_eq(dcm_err("/** The first.\n * @tparam E the element\n */\n" +
+                      "first[T](xs: []const T) -> T = xs[0]\n\nprint(first([1, 2, 3]))\n"),
+              dcm_refusal("'E' is not a type parameter of this declaration — it has T", 2,
+                          " * @tparam E the element"))
+end dcm_a_tparam_on_a_generic_function
+
+@test("a member inside a struct is checked like any other declaration")
+dcm_a_member_is_checked()
+    if !dcm_ready() then return
+
+    assert_eq(dcm_err(dcm_point("     * @param dz how far\n")),
+              dcm_refusal("'dz' is not a parameter of this declaration — it has self, dx", 6,
+                          "     * @param dz how far"))
+end dcm_a_member_is_checked
+
+// `self` is the receiver rather than an entry in the parameter list, which is a real distinction to
+// the analyzer and none at all to somebody writing the prose. Refusing the one tag a reader is most
+// likely to reach for on a method would be pedantry about a real part of the signature.
+@test("and its receiver is a parameter it may document, though never one it must")
+dcm_the_receiver_may_be_documented()
+    if !dcm_ready() then return
+
+    assert_eq(dcm_err(dcm_point("     * @param self the point being moved\n     * @param dx how far\n")),
+              "")
+end dcm_the_receiver_may_be_documented
+
+// The declaration pass is the point: this is checked whether or not a body is ever walked.
+@test("a doc comment nothing is wrong with does not stop a generic function nobody instantiates")
+dcm_an_uninstantiated_generic_compiles()
+    if !dcm_ready() then return
+
+    assert_eq(dcm_err("/** Never called.\n * @tparam T the element\n * @param xs the slice\n */\n" +
+                      "unused[T](xs: []const T) -> usize = xs.len\n\nprint(1)\n"), "")
+end dcm_an_uninstantiated_generic_compiles
+
+@test("and a WRONG one on that same uninstantiated function is still refused")
+dcm_an_uninstantiated_generic_is_still_checked()
+    if !dcm_ready() then return
+
+    assert_eq(dcm_err("/** Never called.\n * @param items the slice\n */\n" +
+                      "unused[T](xs: []const T) -> usize = xs.len\n\nprint(1)\n"),
+              dcm_refusal("'items' is not a parameter of this declaration — it has xs", 2,
+                          " * @param items the slice"))
+end dcm_an_uninstantiated_generic_is_still_checked
+
+@test("an ordinary comment above a declaration is not a doc comment, so nothing is checked")
+dcm_an_ordinary_comment_is_not_checked()
+    if !dcm_ready() then return
+
+    assert_eq(dcm_err("// @param z one of them\n" + dcm_add()), "")
+end dcm_an_ordinary_comment_is_not_checked
+
+// -- which declaration a comment belongs to ----------------------------------------------------------
+
+private dcm_above(text: string, line: usize) -> Option[string] =
+    doc_above(source_of("test.sysl", text), dcm_docs(text), line).map((d) -> d.body)
+
+@test("the one on the next line")
+dcm_the_one_on_the_next_line()
+    assert_eq(dcm_above("/** about n */\nval n = 1\n", 2).unwrap(), "about n")
+
+@test("one separated by a blank line belongs to nothing, which is what lets a file open with prose")
+dcm_a_blank_line_ends_it()
+    assert(dcm_above("/** about the file */\n\nval n = 1\n", 3).is_none())
+
+// The ordinary shape: `@test` above a function, `@export` above another. A rule demanding adjacency
+// would silently drop the documentation of every annotated declaration.
+@test("an annotation may sit between the prose and the declaration")
+dcm_an_annotation_may_sit_between()
+    assert_eq(dcm_above("/** about f */\n@test\nval n = 1\n", 3).unwrap(), "about f")
+
+@test("and so may several, with a line comment among them")
+dcm_several_annotations_and_a_comment()
+    assert_eq(dcm_above("/** about f */\n@test\n// an implementation note\n@export\nval n = 1\n", 5).unwrap(),
+              "about f")
+
+@test("the nearest one wins, so two declarations keep their own prose")
+dcm_the_nearest_one_wins()
+    val text = "/** about a */\nval a = 1\n\n/** about b */\nval b = 2\n"
+
+    assert_eq(dcm_above(text, 2).unwrap(), "about a")
+    assert_eq(dcm_above(text, 5).unwrap(), "about b")
+end dcm_the_nearest_one_wins
+
+@test("a declaration with nothing above it has no doc")
+dcm_nothing_above_it()
+    assert(dcm_above("val n = 1\n", 1).is_none())
+
+@test("a multi-line comment is placed by where it ENDS, not where it starts")
+dcm_placed_by_where_it_ends()
+    val text = "/** About n.\n *\n * At length.\n */\nval n = 1\n"
+    val d = dcm_one(text)
+
+    assert_eq(d.start_line, 1)
+    assert_eq(d.end_line, 4)
+    assert_eq(doc_above(source_of("test.sysl", text), dcm_docs(text), 5).unwrap().summary, "About n.")
+end dcm_placed_by_where_it_ends
