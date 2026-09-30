@@ -1,0 +1,52 @@
+module sh.sysl.compiler
+@tests
+
+// A name and a written type-parameter list are a method's head, so a member line that goes on with
+// anything but `(` is a method missing its parameter list, whatever kind of body holds it. Only `->`
+// after the list makes the line a property, and a property is refused for having type parameters it
+// has no call to solve them at.
+
+// The complaint and where it points, as one string.
+private ybr_said(text: string) -> string = s"${pf_err(text)} @ ${pf_at(text)}"
+
+private const ybr_struct: string = "struct S\n    x: int\n"
+private const ybr_enum: string = "enum E\n    A\n"
+private const ybr_trait: string = "trait R\n    f(self) -> int\n"
+
+private const ybr_paren: string = "'(' expected"
+private const ybr_prop: string = "a property takes no type parameters"
+
+// Each shape in each body, with the reference's complaint and its line:col.
+private ybr_heads(head: string)
+    assert_eq(ybr_said(head + "    y[T] 5\n"), s"$ybr_paren @ 3:10")
+    assert_eq(ybr_said(head + "    y[T] = 1\n"), s"$ybr_paren @ 3:10")
+    assert_eq(ybr_said(head + "    y[T]: int\n"), s"$ybr_paren @ 3:9")
+    // `y[T]` alone leaves nothing on its line, so its parameter list is missing at the next one.
+    assert_eq(ybr_said(head + "    y[T]\n"), s"$ybr_paren @ 4:1")
+
+private ybr_props(head: string)
+    assert_eq(ybr_said(head + "    y[T] -> int = 1\n"), s"$ybr_prop @ 3:10")
+    assert_eq(ybr_said(head + "    y[T] -> int\n"), s"$ybr_prop @ 3:10")
+
+@test("'$line' in $kind is a method missing its parameter list")
+ybr_method_missing_its_list()
+    ybr_heads(ybr_struct)
+    ybr_heads(ybr_enum)
+    ybr_heads(ybr_trait)
+
+@test("'$line' in $kind is a property, and is refused for its type parameters")
+ybr_property_refused()
+    ybr_props(ybr_struct)
+    ybr_props(ybr_enum)
+    ybr_props(ybr_trait)
+
+@test("an 'impl' body reads it the same way")
+ybr_impl_body()
+    val head = "trait Tr\n    f(self) -> int\nstruct S\n    x: int\nimpl Tr for S\n"
+
+    assert_eq(ybr_said(head + "    y[T] 5\n"), s"$ybr_paren @ 6:10")
+    assert_eq(ybr_said(head + "    y[T] -> int = 1\n"), s"$ybr_prop @ 6:10")
+
+@test("a property has no call to fix a parameter, so it may declare none")
+ybr_property_declares_none()
+    assert_eq(ybr_said("struct Box[T]\n    v: T\n    size[U] -> int = 1"), s"$ybr_prop @ 3:13")
