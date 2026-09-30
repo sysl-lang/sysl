@@ -1,0 +1,1008 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The library's input half -- `Reader`, `FdReader`, `find_byte`, and the `Lines` cursor `getline`
+// belongs to -- compiled here and run.
+//
+// Almost everything runs, because what is being checked is that bytes arrive where the program
+// looks for them: a declaration test could not tell a working newline scan from one off by one. The
+// bytes come from a temporary file whose path arrives as `args[1]`, and standard input is
+// `/dev/null`, so a program reading it sees the end at once.
+
+private rds_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end rds_ready
+
+// Every program reads through a module rather than the standard one, so each says so.
+private rds_importing() -> string = "import sysl.io.*\nimport sysl.text.{cstring, from_utf8}\n\n"
+
+// The library offers no way to turn a path into a file descriptor, so every program that reads a
+// file opens its own.
+private rds_opening() -> string = raw"""
+    extern "open" c_open(path: *u8, flags: int) -> int
+    extern "close" c_close(fd: int) -> int
+
+    opened(path: string) -> int
+        var fd = c_open(cstring(path).ptr, 0)
+
+        if fd < 0
+            print("could not open", path)
+            exit(1)
+
+        fd
+
+    """
+
+// A reader over bytes a test chose, which is how input a `string` could not hold gets in.
+private rds_bytes_reader() -> string = raw"""
+    struct Bytes
+        src: []const u8
+        at: usize
+    end Bytes
+
+    bytes_reader(b: []const u8) -> Bytes = Bytes(b, 0usize)
+
+    impl Fallible for Bytes
+
+    impl Reader for Bytes
+        read(*self, into: []u8) -> []const u8
+            var n = 0usize
+
+            while n < into.len && self.at < self.src.len
+                into[n] = self.src[self.at]
+                self.at += 1usize
+                n += 1usize
+
+            into[0..<n]
+
+    """
+
+// A reader handing back at most `bite` bytes at a time, so a test chooses where a refill falls.
+private rds_chunked_reader() -> string = raw"""
+    struct Chunked
+        src: []const u8
+        at: usize
+        bite: usize
+    end Chunked
+
+    chunked(b: []const u8, bite: usize) -> Chunked = Chunked(b, 0, bite)
+
+    impl Fallible for Chunked
+
+    impl Reader for Chunked
+        read(*self, into: []u8) -> []const u8
+            var n: usize = 0
+
+            while n < into.len && n < self.bite && self.at < self.src.len
+                into[n] = self.src[self.at]
+                self.at += 1
+                n += 1
+
+            into[0..<n]
+
+    """
+
+// A program that echoes every line it read, bracketed.
+private rds_echo() -> string = raw"""
+    main(args: []string)
+        var fd = opened(args[1])
+        var r = fd_reader(fd)
+
+        for line in lines(&r)
+            print("[", line, "]")
+
+        c_close(fd)
+    """
+
+// The library reads in bites of this many bytes; the cases either side of one say which.
+private const rds_chunk: usize = 4096
+
+// What a program built from `text` did: what it printed (standard error after standard output), and
+// whether it exited zero. `input`, where there is one, is written to a file whose path is `args[1]`.
+private rds_outcome(text: string, input: Option[string]) -> (string, bool)
+    val root = make_temp_dir("sysl-reading").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", rds_importing() + text).unwrap()
+
+    var args = ""
+
+    if input.is_some()
+        write_text(s"$root/input.txt", input.unwrap()).unwrap()
+        args = s" '$root/input.txt'"
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture("/bin/sh", ["-c", s"'$exe'$args < /dev/null"], "", [], true, 60000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end rds_outcome
+
+private rds_ran(text: string) -> string
+    val out = rds_outcome(text, None)
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+end rds_ran
+
+private rds_reading(body: string, input: string) -> string
+    val out = rds_outcome(rds_opening() + body, Some(input))
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+end rds_reading
+
+// A program that stops: it must not exit zero, and what it said must hold `message`.
+private rds_panics(text: string, message: string)
+    val out = rds_outcome(text, None)
+
+    assert(!out.1, s"expected the program to stop, but it exited cleanly: ${out.0}")
+    assert(out.0.contains(message), out.0)
+end rds_panics
+
+// The LLVM text of a program, as `sysl emit-llvm` prints it.
+private rds_ir(text: string) -> string
+    val root = make_temp_dir("sysl-reading-ir").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val said = emit_llvm_text(s"$root/main.sysl", None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(why) -> s"!${failure_text(why)}"
+        Ok(e) -> e.text
+end rds_ir
+
+private rds_times(s: string, n: usize) -> string = sysl.text.repeat(s, n)
+
+// -- a reader hands back the prefix it filled --------------------------------------------------
+
+@test("the slice is as long as what arrived, not as long as what was offered")
+rds_the_slice_is_as_long_as_what_arrived()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(raw"""
+        main(args: []string)
+            var fd = opened(args[1])
+            var r = fd_reader(fd)
+            var room: [64]u8
+            var got = r.read(room[..])
+            var text = from_utf8(got) match
+                Ok(s) -> s
+                Err(e) -> "not text"
+
+            print("asked", room.len, "got", got.len)
+            print(text)
+            c_close(fd)
+        """, "hello"), "asked 64 got 5\nhello\n")
+
+@test("a second read past the end comes back empty, and says nothing about failing")
+rds_a_second_read_past_the_end_comes_back_empty()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(raw"""
+        main(args: []string)
+            var fd = opened(args[1])
+            var r = fd_reader(fd)
+            var room: [16]u8
+
+            print("first", r.read(room[..]).len)
+            print("second", r.read(room[..]).len)
+            print("failed", r.failed())
+            c_close(fd)
+        """, "abc"), "first 3\nsecond 0\nfailed false\n")
+
+@test("an empty buffer is filled without going anywhere")
+rds_an_empty_buffer_is_filled_without_going_anywhere()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(raw"""
+        main(args: []string)
+            var fd = opened(args[1])
+            var r = fd_reader(fd)
+            var none: [0]u8
+
+            print("got", r.read(none[..]).len, "failed", r.failed())
+            c_close(fd)
+        """, "plenty here"), "got 0 failed false\n")
+
+@test("reading a file a bite at a time reaches every byte")
+rds_reading_a_file_a_bite_at_a_time()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(raw"""
+        main(args: []string)
+            var fd = opened(args[1])
+            var r = fd_reader(fd)
+            var room: [4]u8
+            var total = 0usize
+            var reads = 0
+
+            loop
+                var got = r.read(room[..])
+
+                if got.len == 0usize then break
+
+                total += got.len
+                reads += 1
+
+            print("bytes", total, "reads", reads)
+            c_close(fd)
+        """, "0123456789"), "bytes 10 reads 3\n")
+
+// -- the failure latch ---------------------------------------------------------------------------
+
+@test("a read that could not happen latches, and reads empty")
+rds_a_read_that_could_not_happen_latches()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        var r = fd_reader(99)
+        var room: [8]u8
+
+        print("got", r.read(room[..]).len)
+        print("failed", r.failed())
+        """), "got 0\nfailed true\n")
+
+@test("it stays latched once set")
+rds_it_stays_latched_once_set()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        var r = fd_reader(99)
+        var room: [8]u8
+
+        r.read(room[..])
+        r.read(room[..])
+        print(r.failed())
+        """), "true\n")
+
+@test("a reader that cannot fail inherits the answer rather than writing it")
+rds_a_reader_that_cannot_fail_inherits_the_answer()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        struct Empty
+            unused: int
+        end Empty
+
+        impl Fallible for Empty
+
+        impl Reader for Empty
+            read(*self, into: []u8) -> []const u8 = into[0..<0usize]
+
+        var e = Empty(0)
+        var room: [4]u8
+
+        print(e.read(room[..]).len, e.failed())
+        """), "0 false\n")
+
+// -- find_byte -----------------------------------------------------------------------------------
+
+@test("reports where the byte is, and nothing when it is absent")
+rds_find_byte_reports_where_the_byte_is()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        say(o: Option[usize])
+            o match
+                Some(i) -> print(i)
+                None -> print("-")
+
+        var b = "abcdef".bytes
+
+        say(find_byte(b, 97u8))
+        say(find_byte(b, 102u8))
+        say(find_byte(b, 122u8))
+        """), "0\n5\n-\n")
+
+@test("finds the first of several rather than any of them")
+rds_find_byte_finds_the_first_of_several()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        var at = find_byte("axbxc".bytes, 120u8) match
+            Some(i) -> i
+            None -> 99usize
+
+        print(at)
+        """), "1\n")
+
+@test("an empty slice holds nothing")
+rds_find_byte_an_empty_slice_holds_nothing()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        var b: [0]u8
+        var said = find_byte(b[..], 0u8) match
+            Some(i) -> "found"
+            None -> "nothing"
+
+        print(said)
+        """), "nothing\n")
+
+@test("a NUL is a byte like any other")
+rds_find_byte_a_nul_is_a_byte()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        var b: [4]u8
+
+        b[0] = 65u8
+        b[1] = 0u8
+        b[2] = 66u8
+        b[3] = 0u8
+
+        var at = find_byte(b[..], 0u8) match
+            Some(i) -> i
+            None -> 99usize
+
+        print(at)
+        """), "1\n")
+
+@test("it searches the slice it was given and not one byte past it")
+rds_find_byte_searches_only_the_slice()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        var b: [6]u8
+
+        for i in 0..<6 do b[i] = 65u8
+
+        b[4] = 10u8
+
+        var said = find_byte(b[0..<4], 10u8) match
+            Some(i) -> "found"
+            None -> "nothing in the first four"
+
+        print(said)
+        """), "nothing in the first four\n")
+
+// -- reading lines -------------------------------------------------------------------------------
+
+@test("one line per newline")
+rds_one_line_per_newline()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(rds_echo(), "alpha\nbeta\ngamma\n"), "[ alpha ]\n[ beta ]\n[ gamma ]\n")
+
+@test("a final line without a newline is still a line")
+rds_a_final_line_without_a_newline()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(rds_echo(), "one\ntwo"), "[ one ]\n[ two ]\n")
+
+@test("a trailing newline ends the last line rather than starting an empty one")
+rds_a_trailing_newline_ends_the_last_line()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(rds_echo(), "only\n"), "[ only ]\n")
+
+@test("empty input holds no lines at all")
+rds_empty_input_holds_no_lines()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(rds_echo(), ""), "")
+
+@test("an empty line is a line")
+rds_an_empty_line_is_a_line()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(rds_echo(), "\n\nmid\n\n"), "[  ]\n[  ]\n[ mid ]\n[  ]\n")
+
+@test("a carriage return leaves with the newline it came with")
+rds_a_carriage_return_leaves_with_the_newline()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(rds_echo(), "a\r\nb\r\n"), "[ a ]\n[ b ]\n")
+
+@test("a lone carriage return in the middle of a line stays there")
+rds_a_lone_carriage_return_stays()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(rds_echo(), "a\rb\n"), "[ a\rb ]\n")
+
+@test("a carriage return ending an unterminated last line goes too")
+rds_a_carriage_return_ending_the_last_line_goes()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(rds_echo(), "a\r"), "[ a ]\n")
+
+@test("a line of nothing but a carriage return is an empty line")
+rds_a_line_of_only_a_carriage_return()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(rds_echo(), "\r\nafter\n"), "[  ]\n[ after ]\n")
+
+@test("text is text, whatever width its characters are")
+rds_text_is_text_whatever_width()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(rds_echo(), "héllo\n日本語\n"), "[ héllo ]\n[ 日本語 ]\n")
+
+@test("asking again past the end keeps saying there is nothing")
+rds_asking_again_past_the_end()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(raw"""
+        main(args: []string)
+            var fd = opened(args[1])
+            var r = fd_reader(fd)
+            var ls = lines(&r)
+
+            for i in 0..<4
+                var s = ls.getline() match
+                    Some(t) -> t
+                    None -> "-"
+
+                print(i, s)
+
+            c_close(fd)
+        """, "one\ntwo\n"), "0 one\n1 two\n2 -\n3 -\n")
+
+// -- a line that does not fit in one read --------------------------------------------------------
+
+@test("a line longer than the buffer arrives whole")
+rds_a_line_longer_than_the_buffer()
+    if !rds_ready() then return
+
+    val long = rds_times("z", rds_chunk * 2 + 17)
+
+    assert_eq(rds_reading(rds_echo(), long + "\nafter\n"), s"[ $long ]\n[ after ]\n")
+
+@test("two long lines in a row do not run into each other")
+rds_two_long_lines_in_a_row()
+    if !rds_ready() then return
+
+    val a = rds_times("a", rds_chunk + 500)
+    val b = rds_times("b", rds_chunk + 900)
+
+    assert_eq(rds_reading(rds_echo(), s"$a\n$b\nshort\n"), s"[ $a ]\n[ $b ]\n[ short ]\n")
+
+@test("a newline as the buffer's last byte")
+rds_a_newline_as_the_last_byte()
+    if !rds_ready() then return
+
+    val fits = rds_times("x", rds_chunk - 1)
+
+    assert_eq(rds_reading(rds_echo(), fits + "\nafter\n"), s"[ $fits ]\n[ after ]\n")
+
+@test("a newline as the first byte of the next read")
+rds_a_newline_as_the_first_byte_of_the_next_read()
+    if !rds_ready() then return
+
+    val fills = rds_times("y", rds_chunk)
+
+    assert_eq(rds_reading(rds_echo(), fills + "\nafter\n"), s"[ $fills ]\n[ after ]\n")
+
+@test("a long line with no newline after it")
+rds_a_long_line_with_no_newline()
+    if !rds_ready() then return
+
+    val long = rds_times("w", rds_chunk + 3)
+
+    assert_eq(rds_reading(rds_echo(), long), s"[ $long ]\n")
+
+@test("a character split across two reads is one character")
+rds_a_character_split_across_two_reads()
+    if !rds_ready() then return
+
+    val pad = rds_times("q", rds_chunk - 1)
+
+    assert_eq(rds_reading(rds_echo(), pad + "中rest\n"), s"[ ${pad}中rest ]\n")
+
+@test("many lines come back in order and unchanged")
+rds_many_lines_come_back_in_order()
+    if !rds_ready() then return
+
+    var text = ""
+    var want = ""
+
+    for i in 0..<2000
+        text = text + s"line $i\n"
+        want = want + s"[ line $i ]\n"
+
+    assert_eq(rds_reading(rds_echo(), text), want)
+
+// -- text that is not text -----------------------------------------------------------------------
+
+@test("ill-formed input stops the program and says where in the line")
+rds_ill_formed_input_stops_the_program()
+    if !rds_ready() then return
+
+    rds_panics(rds_bytes_reader() + raw"""
+        var raw: [4]u8
+
+        raw[0] = 97u8
+        raw[1] = 255u8
+        raw[2] = 98u8
+        raw[3] = 10u8
+
+        var r = bytes_reader(raw[..])
+
+        for line in lines(&r)
+            print("[", line, "]")
+        """, "not UTF-8 at byte 1 of the line")
+
+@test("the offset is into the line, not into the file")
+rds_the_offset_is_into_the_line()
+    if !rds_ready() then return
+
+    rds_panics(rds_bytes_reader() + raw"""
+        var raw: [7]u8
+
+        raw[0] = 111u8
+        raw[1] = 107u8
+        raw[2] = 10u8
+        raw[3] = 120u8
+        raw[4] = 121u8
+        raw[5] = 255u8
+        raw[6] = 10u8
+
+        var r = bytes_reader(raw[..])
+
+        for line in lines(&r)
+            print("[", line, "]")
+        """, "not UTF-8 at byte 2 of the line")
+
+@test("the lines before it were handed over before it stopped")
+rds_the_lines_before_it_were_handed_over()
+    if !rds_ready() then return
+
+    rds_panics(rds_bytes_reader() + raw"""
+        var raw: [4]u8
+
+        raw[0] = 111u8
+        raw[1] = 107u8
+        raw[2] = 10u8
+        raw[3] = 255u8
+
+        var r = bytes_reader(raw[..])
+
+        for line in lines(&r)
+            print("[", line, "]")
+        """, "[ ok ]")
+
+@test("the same bytes read as bytes are not fatal")
+rds_the_same_bytes_read_as_bytes()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
+        var raw: [3]u8
+
+        raw[0] = 97u8
+        raw[1] = 98u8
+        raw[2] = 255u8
+
+        var r = bytes_reader(raw[..])
+        var room: [16]u8
+        var got = r.read(room[..])
+        var said = from_utf8(got) match
+            Ok(s) -> 99usize
+            Err(e) -> e.offset
+
+        print(said)
+        """), "2\n")
+
+@test("the same input read through the reporting cursor is inspectable, and reading continues")
+rds_the_reporting_cursor_continues()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
+        var raw: [8]u8
+
+        raw[0] = 111u8
+        raw[1] = 107u8
+        raw[2] = 10u8
+        raw[3] = 97u8
+        raw[4] = 255u8
+        raw[5] = 10u8
+        raw[6] = 122u8
+        raw[7] = 10u8
+
+        var r = bytes_reader(raw[..])
+        var c = lines(&r)
+
+        loop
+            c.try_getline() match
+                None -> break
+                Some(line) ->
+                    line match
+                        Ok(s) -> print("[", s, "]")
+                        Err(e) -> print("< bad at", e.offset, ">")
+        """), "[ ok ]\n< bad at 1 >\n[ z ]\n")
+
+@test("try_line_text is line_text without the trap, and answers the same on good input")
+rds_try_line_text_is_line_text_without_the_trap()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        var good: [4]u8 = [104, 105, 13, 0]
+        var bad: [2]u8 = [97, 255]
+
+        print(try_line_text(good[0..<3]).unwrap())
+        print(try_line_text(bad[..]).is_err())
+        print(line_text(good[0..<3]))
+        """), "hi\ntrue\nhi\n")
+
+// -- the cursor borrows the reader ---------------------------------------------------------------
+
+@test("a 'for' loop leaves the reader in the caller's hands, still answerable")
+rds_a_for_loop_leaves_the_reader_answerable()
+    if !rds_ready() then return
+
+    assert_eq(rds_reading(raw"""
+        main(args: []string)
+            var fd = opened(args[1])
+            var r = fd_reader(fd)
+            var n = 0
+
+            for line in lines(&r)
+                n += 1
+
+            print("lines", n, "failed", r.failed())
+            c_close(fd)
+        """, "a\nb\nc\n"), "lines 3 failed false\n")
+
+@test("a reader that could not be read from says so after the loop, not during it")
+rds_a_failed_reader_says_so_after_the_loop()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        var r = fd_reader(99)
+        var n = 0
+
+        for line in lines(&r)
+            n += 1
+
+        print("lines", n, "failed", r.failed())
+        """), "lines 0 failed true\n")
+
+@test("a 'for' advances a copy of its iterator, not the variable")
+rds_a_for_advances_a_copy()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        struct Count
+            at: int
+        end Count
+
+        impl Iterate for Count
+            type Item = int
+            next(*self) -> Option[int]
+                if self.at >= 3 then return None
+
+                self.at += 1
+                Some(self.at)
+
+        var c = Count(0)
+        var seen = 0
+
+        for v in c do seen += v
+
+        print("seen", seen, "but the var is still at", c.at)
+        """), "seen 6 but the var is still at 0\n")
+
+// -- any reader will do --------------------------------------------------------------------------
+
+@test("a reader over bytes reads lines exactly as a file does")
+rds_a_reader_over_bytes_reads_lines()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
+        var r = bytes_reader("first\nsecond\n".bytes)
+
+        for line in lines(&r)
+            print("[", line, "]")
+        """), "[ first ]\n[ second ]\n")
+
+@test("a reader that yields one byte at a time still yields whole lines")
+rds_a_reader_yielding_one_byte_at_a_time()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
+        struct Trickle
+            inner: &Bytes
+        end Trickle
+
+        impl Fallible for Trickle
+
+        impl Reader for Trickle
+            read(*self, into: []u8) -> []const u8
+                if into.len == 0usize then return into
+
+                self.inner.read(into[0..<1usize])
+
+        var b = bytes_reader("ab\ncd\n".bytes)
+        var t = Trickle(b)
+
+        for line in lines(&t)
+            print("[", line, "]")
+        """), "[ ab ]\n[ cd ]\n")
+
+@test("a reader may hand back its own buffer rather than fill the one it was given")
+rds_a_reader_may_hand_back_its_own_buffer()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        struct Canned
+            text: []const u8
+            at: usize
+        end Canned
+
+        impl Fallible for Canned
+
+        impl Reader for Canned
+            read(*self, into: []u8) -> []const u8
+                if self.at > 0usize then return self.text[0..<0usize]
+
+                self.at = 1usize
+                self.text
+
+        var c = Canned("own\nbuffer\n".bytes, 0usize)
+
+        for line in lines(&c)
+            print("[", line, "]")
+        """), "[ own ]\n[ buffer ]\n")
+
+@test("an empty read ends the cursor even if the reader had more to say")
+rds_an_empty_read_ends_the_cursor()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        struct Stutter
+            step: int
+        end Stutter
+
+        impl Fallible for Stutter
+
+        impl Reader for Stutter
+            read(*self, into: []u8) -> []const u8
+                var text = if self.step == 0 then "first\n" else if self.step == 1 then "" else "late\n"
+
+                self.step += 1
+
+                var n = 0usize
+
+                while n < into.len && n < text.len
+                    into[n] = text.bytes[n]
+                    n += 1usize
+
+                into[0..<n]
+
+        var s = Stutter(0)
+
+        for line in lines(&s)
+            print("[", line, "]")
+
+        print("stopped after step", s.step)
+        """), "[ first ]\nstopped after step 2\n")
+
+@test("a cursor reaches its reader through the trait, whatever the reader is")
+rds_a_cursor_reaches_its_reader_through_the_trait()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
+        count(r: *Reader) -> int
+            var n = 0
+
+            for line in lines(r)
+                n += 1
+
+            n
+
+        var a = bytes_reader("x\ny\n".bytes)
+        var b = fd_reader(99)
+
+        print(count(&a), count(&b))
+        """), "2 0\n")
+
+// -- how a line ends -----------------------------------------------------------------------------
+
+@test("lines still splits on LF alone, and trims a trailing CR")
+rds_lines_still_splits_on_lf_alone()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
+        var r = bytes_reader("a\r\nb\n".bytes)
+
+        for line in lines(&r)
+            print("[", line, "]")
+        """), "[ a ]\n[ b ]\n")
+
+@test("so a console's bare CR is not a line ending to it, and the whole input is one line")
+rds_a_bare_cr_is_not_a_line_ending_to_lines()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
+        var r = bytes_reader("one\rtwo\rthree\n".bytes)
+        var n = 0
+
+        for line in lines(&r)
+            n += 1
+
+        print("lines", n)
+        """), "lines 1\n")
+
+@test("console_lines takes a bare CR as the end of a line")
+rds_console_lines_takes_a_bare_cr()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
+        var r = bytes_reader("one\rtwo\rthree\r".bytes)
+
+        for line in console_lines(&r)
+            print("[", line, "]")
+        """), "[ one ]\n[ two ]\n[ three ]\n")
+
+@test("and LF, and CRLF, without producing an empty line between the two bytes")
+rds_console_lines_takes_lf_and_crlf()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
+        var r = bytes_reader("a\nb\r\nc\rd\n".bytes)
+
+        for line in console_lines(&r)
+            print("[", line, "]")
+        """), "[ a ]\n[ b ]\n[ c ]\n[ d ]\n")
+
+@test("a CRLF split across a refill boundary is still one line ending")
+rds_a_crlf_split_across_a_refill()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_chunked_reader() + raw"""
+        var r = chunked("ab\r\ncd\r\n".bytes, 1)
+
+        for line in console_lines(&r)
+            print("[", line, "]")
+        """), "[ ab ]\n[ cd ]\n")
+
+@test("and one whose LF arrives after the reader has ended the input is not a second line")
+rds_a_late_lf_is_not_a_second_line()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_chunked_reader() + raw"""
+        var r = chunked("ab\r".bytes, 8)
+
+        for line in console_lines(&r)
+            print("[", line, "]")
+        """), "[ ab ]\n")
+
+@test("an empty line between two terminators is a line")
+rds_an_empty_line_between_two_terminators()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
+        var r = bytes_reader("a\r\r\nb\n".bytes)
+
+        for line in console_lines(&r)
+            print("[", line, "]")
+        """), "[ a ]\n[  ]\n[ b ]\n")
+
+@test("a CR-terminated line assembled out of refills is still one line")
+rds_a_cr_terminated_line_out_of_refills()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_chunked_reader() + raw"""
+        var r = chunked("aaaaaaaaaa\rbb\r".bytes, 3)
+
+        for line in console_lines(&r)
+            print("[", line, "]")
+        """), "[ aaaaaaaaaa ]\n[ bb ]\n")
+
+@test("lines_ending is the two named cursors written out")
+rds_lines_ending_is_the_two_cursors()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(rds_bytes_reader() + raw"""
+        count(b: []const u8, e: LineEnding) -> int
+            var r = bytes_reader(b)
+            var n = 0
+
+            for line in lines_ending(&r, e)
+                n += 1
+
+            n
+
+        print(count("x\ry\r".bytes, Lf), count("x\ry\r".bytes, CrOrLf))
+        """), "1 2\n")
+
+// -- standard input ------------------------------------------------------------------------------
+
+@test("is descriptor zero, and reads empty when there is nothing on it")
+rds_stdin_is_descriptor_zero()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        var r = stdin()
+        var room: [16]u8
+
+        print("fd", r.fd, "got", r.read(room[..]).len, "failed", r.failed())
+        """), "fd 0 got 0 failed false\n")
+
+@test("a line cursor over it ends at once rather than hanging")
+rds_a_line_cursor_over_stdin_ends_at_once()
+    if !rds_ready() then return
+
+    assert_eq(rds_ran(raw"""
+        var r = stdin()
+        var n = 0
+
+        for line in lines(&r)
+            n += 1
+
+        print("lines", n)
+        """), "lines 0\n")
+
+// -- a program that reads nothing carries none of it ---------------------------------------------
+
+@test("the platform's read and memchr are not declared")
+rds_a_program_reading_nothing_declares_no_read()
+    if !rds_ready() then return
+
+    val ir = rds_ir("print(1)\n")
+
+    assert(!ir.starts_with("!"), ir)
+    assert(!ir.contains("@read("), ir)
+    assert(!ir.contains("@memchr("), ir)
+
+@test("no part of the cursor is emitted")
+rds_no_part_of_the_cursor_is_emitted()
+    if !rds_ready() then return
+
+    val ir = rds_ir("print(1)\n")
+
+    assert(!ir.starts_with("!"), ir)
+    assert(!ir.contains("@sysl.io\u{24}Lines.getline"), ir)
+    assert(!ir.contains("@sysl.io\u{24}find_byte("), ir)
+    assert(!ir.contains("@sysl.io\u{24}lines("), ir)
+
+@test("only the layout of the types is, which is what the library says it costs")
+rds_only_the_layout_of_the_types_is_emitted()
+    if !rds_ready() then return
+
+    val ir = rds_ir("print(1)\n")
+
+    assert(ir.contains("%struct.sysl.io\u{24}FdReader = type"), ir)
+    assert(ir.contains("%struct.sysl.io\u{24}Lines = type"), ir)
+
+@test("and the platform's read arrives the moment something asks for it")
+rds_the_platform_read_arrives_when_asked()
+    if !rds_ready() then return
+
+    val ir = rds_ir(rds_importing() + raw"""
+        var r = stdin()
+        var room: [8]u8
+
+        print(r.read(room[..]).len)
+        """)
+
+    assert(ir.contains("declare i64 @read(i32, ptr, i64)"), ir)
