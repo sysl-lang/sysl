@@ -5,7 +5,7 @@ import sysl.buf.{Buf, buf}
 import sysl.env.get as env_var
 import sysl.fs.{make_temp_dir, read_bytes, remove_dir_all, remove_file, walk, write_text}
 import sysl.process.capture
-import sysl.text.{from_utf8_unchecked, Search}
+import sysl.text.{from_utf8_unchecked, join, Search}
 
 // Separate compilation: which of a library's declarations its object half can hold, the file that
 // holds them, and the `imports` section a program compiled against one carries.
@@ -652,6 +652,23 @@ the_std_advertises_its_builtin_members()
 
     assert(!holds_string(names, "u32.round_key"), "a member reading module storage is not")
 
+    // **What the object half's code and data name, it defines** -- a keyless member it called and
+    // left undefined would be compiled by no one, which only dead-stripping hides. Each named member
+    // is defined at a name the linker sees, and `u32.round_key` is named by nothing here at all.
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    val defined = sta_defines(half.text)
+
+    assert_eq(join(sta_minus(sta_minus(sta_named_keyless(half.text), defined),
+                             sta_globals(half.text)).view(), ", "), "")
+
+    val external = sta_external(half.text)
+
+    for i in 0..<found.len
+        assert(holds_string(external, found[i]), s"'${found[i]}' is defined at a name the linker sees")
+
     // A closure is the library's too, and internal: its name is a counter in the unit that lowered
     // it, so it is never advertised.
     for i in 0..<names.len()
@@ -668,6 +685,13 @@ a_program_declares_the_std_member()
     assert(names_function(text, "declare ", "constslice.byte.last_index_of_byte"), "it is declared")
     assert(!names_function(text, "define ", "constslice.byte.last_index_of_byte"),
            "and not defined a second time")
+
+    val both = sta_both_define("import sysl.path.{extension}\n\nmain()\n" +
+        "    prints(extension(\"a.txt\").unwrap_or(\"\"))\n") match
+        None -> return
+        Some(b) -> b
+
+    assert_eq(join(both.view(), ", "), "")
 end a_program_declares_the_std_member
 
 // `arr.eq` is a generic default brought to every fixed-size array, and the library reached it at
@@ -695,6 +719,12 @@ an_uninstantiated_member_is_the_programs()
 
     for i in 0..<eqs.len()
         assert(!holds_string(names, eqs.at(i)), s"'${eqs.at(i)}' is not also the library's")
+
+    val both = sta_both_define("var a = [1, 2, 3]\nvar b = [1, 2, 4]\nprint(a == b)\n") match
+        None -> return
+        Some(b) -> b
+
+    assert_eq(join(both.view(), ", "), "")
 end an_uninstantiated_member_is_the_programs
 
 // `char.is_digit` has no module in its name and one declaring module, so the program declares it

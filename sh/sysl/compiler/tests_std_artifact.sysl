@@ -1,0 +1,1175 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, is_dir, is_file, make_temp_dir, metadata, read_bytes, remove_dir_all,
+                write_bytes}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// The standard module as an artifact: what its object half holds, what a program linking it declares
+// rather than defines, what the link then carries, and the file written to disk.
+//
+// **Every expected value was read off the reference 0.0.152** -- its emitted text for the same
+// programs, and `nm` over the artifact it keeps in its own cache (read, never written) -- or is a
+// structural claim both compilers make about their own output.
+//
+// **What this compiler has no half of is left out**: the reference also decodes the whole library
+// back out of an artifact's metadata and compiles against that, and a byte-for-byte comparison of the
+// two compilations is most of its suite. This compiler's metadata carries the symbol list and the
+// fingerprint and nothing a compilation could be handed instead of the source, so every program here
+// is compiled against the library's source -- the one standard module a compilation ever gets.
+//
+// **No test writes to a shared cache entry.** The artifacts built here go to temporary directories;
+// the linked programs resolve this compiler's own `0.0.1-…` entry, as every build does.
+
+// -- the object half, built once ----------------------------------------------------------------
+
+private var sta_half_ok: bool = false
+private var sta_half_text: string = ""
+private var sta_half_names: Buf[string] = buf()
+
+// The standard module's object half for this machine: the text its code member is compiled from and
+// the symbols it advertises. Built once for the whole file, as the reference's suite builds it once.
+sta_half() -> Option[LibraryHalf]
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+    end if
+
+    if !sta_half_ok
+        std_library_half(host_target()) match
+            Err(why) ->
+                assert(false, why)
+                return None
+            Ok(h) ->
+                sta_half_text = h.text
+                sta_half_names = h.advertised
+                sta_half_ok = true
+
+    Some(LibraryHalf(sta_half_text, sta_half_names))
+end sta_half
+
+// -- reading a module's text ---------------------------------------------------------------------
+
+// The name after `@` at `from`, up to its parameter list or the next space, unquoted.
+private sta_name_at(line: string, from: usize) -> string
+    var to = from
+
+    while to < line.bytes.len && line.bytes[to] != u8('(') && line.bytes[to] != u8(' ')
+        to += 1
+
+    var name = line[from..<to]
+
+    if name.starts_with("\"") then name = name[1..<name.bytes.len]
+    if name.ends_with("\"") then name = name[0..<(name.bytes.len - 1)]
+
+    name
+end sta_name_at
+
+// The symbols a text defines (`form` "define") or leaves to the linker (`form` "declare").
+sta_symbols(ir: string, form: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val lines = lines_of(ir)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.starts_with(s"$form ")
+            line.index_of("@") match
+                Some(at) -> out.push(sta_name_at(line, at + 1))
+                None -> ()
+
+    out
+end sta_symbols
+
+sta_defines(ir: string) -> Buf[string] = sta_symbols(ir, "define")
+
+sta_declares(ir: string) -> Buf[string] = sta_symbols(ir, "declare")
+
+// What a text defines at a name the linker can see: every definition but a `private` or `internal`
+// one, those being the symbols a program is *meant* to carry its own copy of.
+sta_external(ir: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val lines = lines_of(ir)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.starts_with("define ") && !line.starts_with("define private") &&
+                !line.starts_with("define internal")
+            line.index_of("@") match
+                Some(at) -> out.push(sta_name_at(line, at + 1))
+                None -> ()
+
+    out
+end sta_external
+
+private sta_name_byte(b: u8) -> bool =
+    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) || (b >= u8('0') && b <= u8('9')) ||
+        b == u8('_') || b == u8('.') || b == u8('$')
+
+// Every keyless name a text's code and data NAME, as opposed to declare: what follows an `@` on any
+// line that is not a `declare`. A declaration nothing uses costs a link nothing.
+sta_named_keyless(ir: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val lines = lines_of(ir)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !line.starts_with("declare ")
+            var at: usize = 0
+
+            while at < line.bytes.len
+                if line.bytes[at] == u8('@')
+                    var from = at + 1
+
+                    if from < line.bytes.len && line.bytes[from] == u8('"') then from += 1
+
+                    var to = from
+
+                    while to < line.bytes.len && sta_name_byte(line.bytes[to])
+                        to += 1
+
+                    if to > from
+                        val name = line[from..<to]
+
+                        if sta_keyless(name) && !holds_string(out, name) then out.push(name)
+
+                    at = to
+                else
+                    at += 1
+
+    out
+end sta_named_keyless
+
+// The globals a text defines: every line opening with `@`, named up to its `=`.
+sta_globals(ir: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val lines = lines_of(ir)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.starts_with("@") then out.push(sta_name_at(line, 1))
+
+    out
+end sta_globals
+
+// A name keyed under no module -- a member of a built-in type, `char.is_digit` -- and not an intrinsic.
+sta_keyless(name: string) -> bool =
+    name.index_of("$").is_none() && name.index_of(".").is_some() && !name.starts_with("llvm.")
+
+sta_minus(a: Buf[string], b: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<a.len()
+        if !holds_string(b, a.at(i)) && !holds_string(out, a.at(i)) then out.push(a.at(i))
+
+    out
+end sta_minus
+
+sta_common(a: Buf[string], b: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<a.len()
+        if holds_string(b, a.at(i)) && !holds_string(out, a.at(i)) then out.push(a.at(i))
+
+    out
+end sta_common
+
+private sta_listed(names: Buf[string]) -> string = join(names.view(), ", ")
+
+private sta_starting(names: Buf[string], prefix: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<names.len()
+        if names.at(i).starts_with(prefix) then out.push(names.at(i))
+
+    out
+end sta_starting
+
+private sta_closures(names: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<names.len()
+        if mentions_closure(names.at(i)) then out.push(names.at(i))
+
+    out
+end sta_closures
+
+// Whether `a` and `b` hold the same names, whatever order each lists them in.
+private sta_same_set(a: Buf[string], b: Buf[string]) -> bool =
+    a.len() == b.len() && sta_minus(a, b).is_empty() && sta_minus(b, a).is_empty()
+
+// -- compiling a program ---------------------------------------------------------------------------
+
+private sta_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end sta_cli
+
+// A program's emitted text: against the artifact (`from_source` false), which declares what the
+// library already compiled, or with the library compiled from its source into the text, which is
+// `--no-std-lib` and the compilation every program got before there was an artifact.
+sta_emit(src: string, from_source: bool) -> Option[string]
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+    end if
+
+    val root = make_temp_dir("sysl-sta-").unwrap()
+
+    write_bytes(s"$root/main.sysl", src.bytes).unwrap()
+
+    var said = (0, "")
+
+    if from_source
+        said = sta_cli(["sysl", "emit-llvm", "--no-std-lib", root])
+    else
+        said = sta_cli(["sysl", "emit-llvm", root])
+
+    remove_dir_all(root).unwrap_or(())
+
+    if said.0 != 0
+        assert(false, said.1)
+        return None
+    end if
+
+    Some(said.1)
+end sta_emit
+
+// What a program and the artifact it links would both define at a name the linker sees -- empty, or
+// a link that fails wherever a duplicate is refused.
+sta_both_define(src: string) -> Option[Buf[string]]
+    val half = sta_half() match
+        None -> return None
+        Some(h) -> h
+
+    val linked = sta_emit(src, false) match
+        None -> return None
+        Some(t) -> t
+
+    Some(sta_common(sta_external(half.text), sta_external(linked)))
+end sta_both_define
+
+// A program built as `sysl build` builds it -- against the artifact -- into a directory of its own.
+// The caller removes the directory.
+private sta_built(src: string) -> Option[(string, string)]
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+    end if
+
+    val root = make_temp_dir("sysl-sta-run-").unwrap()
+
+    write_bytes(s"$root/main.sysl", src.bytes).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            None
+        Ok(_) -> Some((root, exe))
+end sta_built
+
+// What a program built against the artifact printed, and whether it exited cleanly.
+private sta_ran(src: string) -> Option[(bool, string)]
+    val built = sta_built(src) match
+        None -> return None
+        Some(b) -> b
+
+    val said = capture(built.1, [], "", [], true)
+
+    remove_dir_all(built.0).unwrap_or(())
+
+    said match
+        Err(_) ->
+            assert(false, "the program that was built could not be run")
+            None
+        Ok(out) -> Some((out.status.ok(), out.text))
+end sta_ran
+
+// The symbols `nm` lists in a program built against the artifact, and the bytes the program came to.
+private sta_linked_symbols(src: string) -> Option[(Buf[string], usize)]
+    val built = sta_built(src) match
+        None -> return None
+        Some(b) -> b
+
+    val size = metadata(built.1).unwrap().size
+    val listed = capture("nm", [built.1], "", [], true)
+
+    remove_dir_all(built.0).unwrap_or(())
+
+    listed match
+        Err(_) ->
+            print("skipped: nm is not available")
+            None
+        Ok(out) -> Some((lines_of(out.text), usize(size)))
+end sta_linked_symbols
+
+private sta_count_holding(lines: Buf[string], part: string) -> usize
+    var n: usize = 0
+
+    for i in 0..<lines.len()
+        if lines.at(i).index_of(part).is_some() then n += 1
+
+    n
+end sta_count_holding
+
+private sta_count_ending(lines: Buf[string], tail: string) -> usize
+    var n: usize = 0
+
+    for i in 0..<lines.len()
+        if lines.at(i).ends_with(tail) then n += 1
+
+    n
+end sta_count_ending
+
+// -- the library the compilation is handed ---------------------------------------------------------
+
+// **A `@tests` file is scaffolding for `sysl test --std`**; handed to a compilation as the standard
+// module it would be ordinary declarations, nameable and instantiable. Non-vacuous by the first
+// assertion: the files are there on disk and parse as test files.
+@test("and neither carries the library's own test scaffolding")
+sta_the_std_carries_no_test_scaffolding()
+    val root = std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return
+        Ok(r) -> r
+
+    val t = host_target()
+    val found = std_sources(root, Some(t.os)).unwrap()
+
+    var parsed_tests = 0
+
+    for i in 0..<found.len()
+        if parse(found.at(i).src, t).program.test_only then parsed_tests += 1
+
+    assert(parsed_tests > 0, "the library's own test files are on disk")
+
+    val units = std_usable_units(root, t).unwrap()
+
+    for i in 0..<units.len()
+        assert(!units.at(i).test_only, s"'${units.at(i).src.name}' is a test file handed to a compilation")
+end sta_the_std_carries_no_test_scaffolding
+
+private sta_c_const_blocks(units: Buf[Program]) -> usize
+    var n: usize = 0
+
+    for i in 0..<units.len()
+        val body = units.at(i).body
+
+        for j in 0..<body.len()
+            *body.at(j).kind match
+                CConstBlock(_) -> n += 1
+                _ -> ()
+
+    n
+end sta_c_const_blocks
+
+// **A tripwire rather than a demonstration, and vacuous today on purpose**: nothing in `library/`
+// uses a `c const` block (`sysl/unicode/map.sysl` says so), so this cannot fail yet. The day one is
+// added, the units a compilation is handed must carry it measured -- a declaration where the block
+// was -- or every constant it names stops being a constant, in a library file the reader never wrote.
+@test("and neither carries a 'c const' block that was never measured")
+sta_the_std_carries_no_unmeasured_block()
+    val root = std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return
+        Ok(r) -> r
+
+    val t = host_target()
+
+    assert_eq(sta_c_const_blocks(std_usable_units(root, t).unwrap()), 0)
+end sta_the_std_carries_no_unmeasured_block
+
+// -- what the library costs a program that does not use it -----------------------------------------
+
+@test("nothing of it, when nothing reaches it")
+sta_nothing_of_the_library_when_nothing_reaches_it()
+    val text = sta_emit("var x = 2 + 3\nvar y = x * 2\n", true) match
+        None -> return
+        Some(t) -> t
+
+    assert_eq(sta_listed(sta_starting(sta_defines(text), "sysl$")), "")
+end sta_nothing_of_the_library_when_nothing_reaches_it
+
+@test("and the surface it does reach, when something does")
+sta_the_surface_it_reaches_when_something_does()
+    val text = sta_emit("print(1)\n", true) match
+        None -> return
+        Some(t) -> t
+
+    assert(!sta_starting(sta_defines(text), "sysl$").is_empty(), "print(1) carries the library")
+end sta_the_surface_it_reaches_when_something_does
+
+// -- an artifact built from a different standard module ---------------------------------------------
+
+private var sta_disk_ok: bool = false
+private var sta_disk_fresh: bool = false
+private var sta_disk_path: string = ""
+
+// The standard module written to disk as an artifact at level 0, once, into a `.sysl` directory
+// nothing made beforehand -- the shape of the path a fresh clone builds into.
+private sta_disk() -> Option[string]
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+    end if
+
+    if find_ar(None).is_err()
+        print("skipped: llvm-ar is not available")
+        return None
+    end if
+
+    if !sta_disk_ok
+        val dir = s"${make_temp_dir("sysl-sta-write-").unwrap()}/.sysl"
+
+        sta_disk_fresh = !is_dir(dir)
+        sta_disk_path = s"$dir/std$SyslibExtension"
+
+        build_std_library(std_root().unwrap(), host_target(), Some(sta_disk_path), "0") match
+            Err(why) ->
+                assert(false, why)
+                return None
+            Ok(_) -> sta_disk_ok = true
+
+    Some(sta_disk_path)
+end sta_disk
+
+// A library edited after its artifact was built fingerprints differently, and the artifact is then
+// refused in the reference's words -- `LibraryArtifact.read`'s. Where the reference edits a file and
+// rebuilds the metadata, the edit here is to the file list the fingerprint is taken over, which is
+// the same fact: the artifact holds one fingerprint and the library in front of the compiler another.
+@test("is refused, rather than compiled against")
+sta_a_stale_artifact_is_refused()
+    val path = sta_disk() match
+        None -> return
+        Some(p) -> p
+
+    val t = host_target()
+    var files = std_files(std_root().unwrap(), t).unwrap()
+
+    files.push(("drifted.sysl", "\nunreachable() -> int = 1\n"))
+
+    std_artifact_matching(path, library_fingerprint(files), t) match
+        Ok(_) -> assert(false, "a standard module built from other source was accepted")
+        Err(why) ->
+            assert_eq(why, s"$path was built from a different standard module than this compiler's — " +
+                "rebuild it with 'sysl build-lib <library root> --std'")
+end sta_a_stale_artifact_is_refused
+
+@test("while the one built from what the compiler carries is accepted")
+sta_a_current_artifact_is_accepted()
+    val path = sta_disk() match
+        None -> return
+        Some(p) -> p
+
+    val t = host_target()
+
+    assert(std_artifact_matching(path, std_fingerprint(std_root().unwrap(), t).unwrap(), t).is_ok(),
+           "the artifact built from this library is refused")
+end sta_a_current_artifact_is_accepted
+
+// Order does not move the fingerprint and a missing file does. **Where the library sits does not
+// either**, by construction here: a file is keyed by its place below the root, so no key carries the
+// root's path -- the reference's `/elsewhere/` renaming asserts the same thing of its own keys.
+@test("and the fingerprint is what tells them apart")
+sta_the_fingerprint_tells_libraries_apart()
+    val root = std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return
+        Ok(r) -> r
+
+    val t = host_target()
+    val files = std_files(root, t).unwrap()
+    val whole = std_fingerprint(root, t).unwrap()
+
+    assert_eq(library_fingerprint(files), whole)
+
+    var reversed: Buf[(string, string)] = buf()
+    var rest: Buf[(string, string)] = buf()
+
+    for i in 0..<files.len()
+        reversed.push(files.at(files.len() - 1 - i))
+
+        if i > 0 then rest.push(files.at(i))
+
+    assert_eq(library_fingerprint(reversed), whole)
+
+    for i in 0..<files.len()
+        assert(!files.at(i).0.starts_with(root), s"'${files.at(i).0}' carries where the library sits")
+
+    assert(library_fingerprint(rest) != whole, "a library missing a file fingerprints the same")
+end sta_the_fingerprint_tells_libraries_apart
+
+// A known answer over a fixed input, quoted from the reference's own suite. A file's place is its
+// module directories and its name, so `a/one.sysl` read with no module directory is `one.sysl`.
+@test("and it is exactly the hash it says it is")
+sta_the_fingerprint_is_a_known_hash()
+    var one: Buf[(string, string)] = buf()
+
+    one.push(("one.sysl", "module m\n"))
+    assert_eq(library_fingerprint(one), "438db5d52d94904b")
+
+    one.push(("two.sysl", "f() -> int = 1\n"))
+    assert_eq(library_fingerprint(one), "34149c796c985378")
+end sta_the_fingerprint_is_a_known_hash
+
+// -- what the artifact's object half already holds --------------------------------------------------
+
+@test("the printing surface is compiled once, by the library")
+sta_the_printing_surface_is_precompiled()
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    assert(holds_string(half.advertised, "sysl$printi"), "printi is advertised")
+    assert(holds_string(half.advertised, "sysl$putbytes"), "putbytes is advertised")
+end sta_the_printing_surface_is_precompiled
+
+// `Option`'s own members are built wherever a program fixes their arguments; an instantiation the
+// library itself asked for -- `is_some` at `usize`, under the text surface's `contains` -- is compiled
+// like any other function. The reference's own artifact defines `_sysl$Option.is_some.usize`.
+@test("a generic is not, because there is nothing to compile until a caller fixes its arguments")
+sta_a_generic_is_not_precompiled()
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    assert(!holds_string(half.advertised, "sysl$Option.is_some"), "the generic is not advertised")
+    assert(!holds_string(half.advertised, "sysl$Option.unwrap"), "nor is its unwrap")
+    assert(holds_string(half.advertised, "sysl$Option.is_some.usize"), "the library's instantiation is")
+end sta_a_generic_is_not_precompiled
+
+// A closure's name is a counter in the unit that lowered it, so nothing named after one may cross a
+// link. Non-vacuous by the last line: the library lowers closures of its own.
+@test("and it neither advertises a symbol named after a closure nor leaves one to the linker")
+sta_no_closure_crosses_the_link()
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    assert_eq(sta_listed(sta_closures(half.advertised)), "")
+    assert_eq(sta_listed(sta_closures(sta_declares(half.text))), "")
+    assert_eq(sta_listed(sta_closures(sta_external(half.text))), "")
+    assert(!sta_closures(sta_defines(half.text)).is_empty(), "the library lowers closures of its own")
+end sta_no_closure_crosses_the_link
+
+@test("and the library carries no entry point of its own to collide with a program's")
+sta_the_library_has_no_entry_point()
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    assert(half.text.index_of("define i32 @main(").is_none(), "the library defines a main")
+end sta_the_library_has_no_entry_point
+
+// **Two routes to one object half**: the text built in process here and the cache entry a build
+// resolves, which reads its list back out of the archive's metadata. The failure this guards was an
+// object half that came out EMPTY on one route -- every program still compiled and ran, and nothing
+// was precompiled -- so the list is asserted non-empty as well as equal.
+@test("and one library built two ways has one object half, whichever `Source` objects carried it")
+sta_one_library_has_one_object_half()
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    val cached = std_artifact(host_target()) match
+        Err(why) ->
+            assert(false, why)
+            return
+        Ok(found) -> found
+
+    assert(!half.advertised.is_empty(), "the object half is empty")
+    assert(sta_same_set(half.advertised, cached.precompiled),
+           s"${half.advertised.len()} advertised in process, ${cached.precompiled.len()} in the cache")
+end sta_one_library_has_one_object_half
+
+// -- a program that links the object half rather than emitting it -----------------------------------
+
+@test("declares the printing surface instead of defining it")
+sta_the_printing_surface_is_declared()
+    val text = sta_emit("print(1)\n", false) match
+        None -> return
+        Some(t) -> t
+
+    assert(text.index_of("declare void @sysl$printi(").is_some(), "printi is declared")
+    assert(text.index_of("define void @sysl$printi(").is_none(), "and not defined")
+end sta_the_printing_surface_is_declared
+
+// Linking may change the text only in ways that account for themselves: a precompiled function
+// becomes a declaration, and the ARC runtime its bodies needed simply is not there.
+@test("and every definition it loses is one the artifact holds, or the module's own runtime")
+sta_every_lost_definition_is_accounted_for()
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    val program = "print(1)\nprint(\"two\")\nprint(3.5)\n"
+
+    val from_src = sta_emit(program, true) match
+        None -> return
+        Some(t) -> t
+
+    val from_lib = sta_emit(program, false) match
+        None -> return
+        Some(t) -> t
+
+    val lost = sta_minus(sta_defines(from_src), sta_defines(from_lib))
+    val now_linked = sta_common(lost, half.advertised)
+    val now_unneeded = sta_minus(lost, half.advertised)
+
+    assert(!now_linked.is_empty(), "nothing became a declaration")
+    assert(sta_same_set(sta_minus(sta_declares(from_lib), sta_declares(from_src)), now_linked),
+           s"declared anew: ${sta_listed(sta_minus(sta_declares(from_lib), sta_declares(from_src)))}")
+
+    for i in 0..<now_unneeded.len()
+        assert(now_unneeded.at(i).starts_with("arc."), s"'${now_unneeded.at(i)}' went unaccounted for")
+
+    assert_eq(sta_listed(sta_minus(sta_defines(from_lib), sta_defines(from_src))), "")
+end sta_every_lost_definition_is_accounted_for
+
+@test("and the runtime it drops is module-private, which is why the artifact may carry one too")
+sta_the_runtime_is_module_private()
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    val text = sta_emit("var s = \"x\"\nprint(s)\n", true) match
+        None -> return
+        Some(t) -> t
+
+    assert(half.text.index_of("define private void @arc.retain(").is_some(), "the artifact's is private")
+    assert(text.index_of("define private void @arc.retain(").is_some(), "and so is a program's")
+end sta_the_runtime_is_module_private
+
+// The library pushes onto a `Buf[u8]` of its own and ships that instantiation; a program asking for a
+// `Buf[int]` builds its own. **`int` is the argument the library's own `buf/tests.sysl` uses**, so
+// this is also the regression test for stripping the library's tests before analysis.
+@test("while a generic is built here even at a type the library already shipped one instantiation of")
+sta_a_generic_is_built_at_its_own_arguments()
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    val text = sta_emit("import sysl.buf.*\n\nvar b: Buf[int] = buf()\nb.push(1)\nprint(b.len())\n",
+                        false) match
+        None -> return
+        Some(t) -> t
+
+    assert(holds_string(half.advertised, "sysl.buf$Buf.push.byte"), "the library's own is advertised")
+    assert(!holds_string(half.advertised, "sysl.buf$Buf.push.int"), "the program's is not")
+    assert(holds_string(sta_defines(text), "sysl.buf$Buf.push.int"), "and the program defines it")
+end sta_a_generic_is_built_at_its_own_arguments
+
+@test("and it runs, with the library's bodies coming from the artifact's object file")
+sta_a_linked_program_runs()
+    val ran = sta_ran("print(1)\nprint(\"two\")\nprint(3.5)\nprint(true)\n") match
+        None -> return
+        Some(r) -> r
+
+    assert(ran.0, "the program exited cleanly")
+    assert_eq(ran.1, "1\ntwo\n3.5\ntrue\n")
+end sta_a_linked_program_runs
+
+// **A program still running, its output redirected to a file**, which C buffers fully: read while the
+// child is known to be asleep, well short of the exit that would flush it anyway. The shell is what
+// runs the child beside the reading, since `capture` waits for what it runs.
+@test("and flush() makes buffered stdout reach a file before the process that wrote it exits")
+sta_flush_reaches_a_file_before_the_exit()
+    val built = sta_built("import sysl.time.millis\nimport sysl.posix.time.sleep\n\n" +
+        "prints(\"before-flush\\n\")\nflush()\nsleep(millis(1500))\nprints(\"after-flush\\n\")\n") match
+        None -> return
+        Some(b) -> b
+
+    val out = s"${built.0}/out.txt"
+    val script = "\"$0\" > \"$1\" & sleep 1; cat \"$1\"; echo '|'; " +
+        "if kill -0 $! 2>/dev/null; then echo alive; fi; wait $!; echo \"rc=$?\"; cat \"$1\""
+
+    val said = capture("/bin/sh", ["-c", script, built.1, out], "", [], true)
+
+    remove_dir_all(built.0).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the shell could not be run")
+        Ok(o) -> assert_eq(o.text, "before-flush\n|\nalive\nrc=0\nbefore-flush\nafter-flush\n")
+end sta_flush_reaches_a_file_before_the_exit
+
+// A closure a program passes into the library's `resolve` reaches the library's body for it, not a
+// body some other unit lowered under the same counter. 01:30 at -05:00 is 06:30 Z.
+@test("and a capturing closure it passes into the library reaches the library's body and not another")
+sta_a_capturing_closure_reaches_its_own_body()
+    val ran = sta_ran("import sysl.time.{Instant, Offset, datetime_at, resolve}\n\nval mins = 0 - 300\n\n" +
+        "print(resolve(datetime_at(2023, 11, 5, 1, 30, 0), t -> Offset(mins)))\n") match
+        None -> return
+        Some(r) -> r
+
+    assert(ran.0, "the program exited cleanly")
+    assert_eq(ran.1, "2023-11-05 06:30 Z\n")
+end sta_a_capturing_closure_reaches_its_own_body
+
+@test("and carries only the library it reaches, the rest being dropped at the link")
+sta_only_what_is_reached_is_linked()
+    val got = sta_linked_symbols("print(1)\n") match
+        None -> return
+        Some(g) -> g
+
+    var kept: Buf[string] = buf()
+
+    for i in 0..<got.0.len()
+        if got.0.at(i).index_of("sysl$").is_some() then kept.push(got.0.at(i))
+
+    assert_eq(sta_count_holding(kept, "sysl$printi"), 1)
+    assert_eq(sta_count_holding(kept, "sysl$encode_utf8"), 1)
+
+    val gone = ["lines", "find_byte", "str_builder", "cstring", "hash_u128", "fd_reader"]
+
+    for i in 0..<gone.len
+        assert_eq(sta_count_holding(kept, "sysl$" + gone[i]), 0)
+
+    assert(kept.len() < 12, s"${kept.len()} of the library's symbols survived: ${sta_listed(kept)}")
+end sta_only_what_is_reached_is_linked
+
+@test("and carries no Unicode tables for a program that maps no case")
+sta_no_unicode_tables_for_print()
+    val got = sta_linked_symbols("print(1)\n") match
+        None -> return
+        Some(g) -> g
+
+    assert_eq(sta_count_holding(got.0, "utf8proc"), 0)
+    assert(got.1 < 200000, s"the program is ${got.1} bytes")
+end sta_no_unicode_tables_for_print
+
+@test("and carries them for a program that does")
+sta_unicode_tables_for_to_upper()
+    val got = sta_linked_symbols("import sysl.text.to_upper\nprint(to_upper(\"h\\u{e9}llo\"))\n") match
+        None -> return
+        Some(g) -> g
+
+    assert_eq(sta_count_holding(got.0, "utf8proc_toupper"), 1)
+    assert(got.1 > 200000, s"the program is ${got.1} bytes")
+end sta_unicode_tables_for_to_upper
+
+@test("and carries none for a program that measures columns")
+sta_no_unicode_tables_for_columns()
+    val got = sta_linked_symbols("import sysl.text.columns\nprint(columns(\"hi\".bytes))\n") match
+        None -> return
+        Some(g) -> g
+
+    assert_eq(sta_count_holding(got.0, "utf8proc"), 0)
+    assert(got.1 < 200000, s"the program is ${got.1} bytes")
+end sta_no_unicode_tables_for_columns
+
+@test("and carries them for a program that measures grapheme clusters")
+sta_unicode_tables_for_grapheme_columns()
+    val got = sta_linked_symbols("import sysl.text.grapheme_columns\n" +
+        "print(grapheme_columns(\"hi\".bytes))\n") match
+        None -> return
+        Some(g) -> g
+
+    assert_eq(sta_count_holding(got.0, "utf8proc_grapheme_break_stateful"), 1)
+    assert(got.1 > 200000, s"the program is ${got.1} bytes")
+end sta_unicode_tables_for_grapheme_columns
+
+@test("and carries them for a program that trims a string")
+sta_unicode_tables_for_string_trim()
+    val got = sta_linked_symbols("import sysl.text.Search\nprint(\"  hi  \".trim())\n") match
+        None -> return
+        Some(g) -> g
+
+    assert_eq(sta_count_holding(got.0, "utf8proc_category"), 1)
+    assert(got.1 > 200000, s"the program is ${got.1} bytes")
+end sta_unicode_tables_for_string_trim
+
+@test("and carries none for a program that trims bytes")
+sta_no_unicode_tables_for_byte_trim()
+    val got = sta_linked_symbols("import sysl.text.Search\nprint(\"  hi  \".bytes.trim().len)\n") match
+        None -> return
+        Some(g) -> g
+
+    assert_eq(sta_count_holding(got.0, "utf8proc"), 0)
+    assert(got.1 < 200000, s"the program is ${got.1} bytes")
+end sta_no_unicode_tables_for_byte_trim
+
+// -- a program links no code from a module it does not call ---------------------------------------
+
+// Each pair is one module: the symbol a caller's program carries, matched at the END of the `nm` line
+// since an outlined cold half carries the name with a suffix.
+private sta_module_cases() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push(("sysl.encoding$v4", "import sysl.encoding.v4\nimport sysl.rand.rng\n\n" +
+              "var g = rng(1, 1)\n\nprint(v4(&g).version())\n"))
+    out.push(("sysl.path$matches", "import sysl.path.matches\nprint(matches(\"*.sysl\", \"a.sysl\"))\n"))
+    out.push(("sysl.log$log_at", "import sysl.log.info\ninfo(\"up\", [])\n"))
+    out.push(("sysl.math.bigint$from_int", "import sysl.math.bigint.from_int\nprint(from_int(7))\n"))
+    out
+end sta_module_cases
+
+private sta_links_module(at: usize)
+    val case = sta_module_cases().at(at)
+
+    val got = sta_linked_symbols(case.1) match
+        None -> return
+        Some(g) -> g
+
+    assert_eq(sta_count_ending(got.0, case.0), 1)
+end sta_links_module
+
+@test("and does link sysl.encoding when it calls it")
+sta_links_sysl_encoding() = sta_links_module(0)
+
+@test("and does link sysl.path when it calls it")
+sta_links_sysl_path() = sta_links_module(1)
+
+@test("and does link sysl.log when it calls it")
+sta_links_sysl_log() = sta_links_module(2)
+
+@test("and does link sysl.math.bigint when it calls it")
+sta_links_sysl_math_bigint() = sta_links_module(3)
+
+@test("and links none of them for a program that prints an integer")
+sta_links_no_module_for_print()
+    val got = sta_linked_symbols("print(1)\n") match
+        None -> return
+        Some(g) -> g
+
+    val cases = sta_module_cases()
+
+    for i in 0..<cases.len()
+        assert_eq(sta_count_holding(got.0, cases.at(i).0), 0)
+end sta_links_no_module_for_print
+
+// -- the standard module's own C, for a machine with no operating system ---------------------------
+
+// `sysl/unicode/utf8proc.c` is not under a `__posix__` folder, so a freestanding build carries it. It
+// has to compile for one and ask a C library for nothing: compiler-rt's division helpers, which a
+// processor with no divide instruction calls, are the whole of what is left undefined.
+@test("compiles for a bare target, with nothing from a C library left undefined")
+sta_the_library_c_compiles_for_a_bare_target()
+    val root = std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return
+        Ok(r) -> r
+
+    val bare = target_named("thumbv6m-freestanding").unwrap()
+
+    val clang = find_clang(bare, None) match
+        Err(why) ->
+            print(s"skipped: $why")
+            return
+        Ok(c) -> c
+
+    val archiver = find_ar(None) match
+        Err(why) ->
+            print(s"skipped: $why")
+            return
+        Ok(a) -> a
+
+    // Found beside the archiver a library build already needs: the host's `nm` cannot read an
+    // object for another architecture, and a tool that fails reads like one that found nothing.
+    var nm = "llvm-nm"
+
+    if archiver.ends_with("llvm-ar") then nm = archiver[0..<(archiver.bytes.len - 2)] + "nm"
+
+    val sources = c_sources(root, Some(bare.os)).unwrap()
+
+    assert(!sources.is_empty(), "the library carries C for a bare target")
+
+    val dir = make_temp_dir("sysl-sta-bare-").unwrap()
+    var args: Buf[string] = buf()
+
+    args.push("-u")
+
+    for i in 0..<sources.len()
+        val obj = s"$dir/$i.o"
+
+        compile_c(clang, sources.at(i), obj, bare, DefaultOptimization, no_probe()) match
+            Err(why) ->
+                remove_dir_all(dir).unwrap_or(())
+                assert(false, s"${sources.at(i)} did not compile for ${bare.triple}:\n$why")
+                return
+            Ok(_) -> args.push(obj)
+
+    val listed = capture(nm, args.view(), "", [], true)
+
+    remove_dir_all(dir).unwrap_or(())
+
+    val out = listed match
+        Err(_) ->
+            print("skipped: llvm-nm is not available")
+            return
+        Ok(o) -> o
+
+    assert(out.status.ok(), s"$nm failed")
+
+    val lines = lines_of(out.text)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i).trim()
+
+        if line != ""
+            // A line is `U __aeabi_uidiv`: the type letter, then the name.
+            val name = line.last_index_of(" ") match
+                Some(at) -> line[at + 1..<line.bytes.len]
+                None -> line
+
+            assert(name.starts_with("__aeabi_"), s"'$name' should not be needed on a bare target")
+end sta_the_library_c_compiles_for_a_bare_target
+
+// -- the standard module written to disk --------------------------------------------------------------
+
+private sta_code_member(path: string) -> Option[Buf[u8]]
+    val bytes = read_bytes(path).unwrap()
+
+    val members = ar_members(bytes.view()) match
+        Err(why) ->
+            assert(false, why)
+            return None
+        Ok(ms) -> ms
+
+    for i in 0..<members.len()
+        if members.at(i).name == SyslibCodeMember then return Some(members.at(i).body)
+
+    assert(false, "the artifact has no code member")
+    None
+end sta_code_member
+
+// LLVM bitcode, raw (`BC\xC0\xDE`) or in the wrapper Darwin's toolchain puts in front of it.
+private sta_is_bitcode(body: Buf[u8]) -> bool =
+    body.len() >= 4 && ((body.at(0) == 0x42 && body.at(1) == 0x43 && body.at(2) == 0xc0 &&
+                         body.at(3) == 0xde) ||
+                        (body.at(0) == 0xde && body.at(1) == 0xc0 && body.at(2) == 0x17 &&
+                         body.at(3) == 0x0b))
+
+// The exact symbol set and the fingerprint of the library in front of the compiler. **The reference
+// also compares the modules it decodes**; this compiler's metadata carries no source to decode, so
+// the fingerprint is what says the artifact is of this library.
+@test("reads back as the standard module this compiler carries")
+sta_the_written_artifact_reads_back()
+    val path = sta_disk() match
+        None -> return
+        Some(p) -> p
+
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    val t = host_target()
+    val meta = syslib_metadata_at(path).unwrap()
+
+    val back = syslib_read(path, meta, t) match
+        Err(why) ->
+            assert(false, why)
+            return
+        Ok(b) -> b
+
+    assert(sta_same_set(back.0, half.advertised),
+           s"${back.0.len()} symbols read back, ${half.advertised.len()} advertised")
+    assert_eq(back.1, std_fingerprint(std_root().unwrap(), t).unwrap())
+end sta_the_written_artifact_reads_back
+
+// Two levels, two different objects, neither of them bitcode: the level reached clang rather than
+// stopping at the key.
+@test("and without LTO its code is an ordinary object, at the level it was asked for")
+sta_the_code_member_is_an_object_at_its_level()
+    val path = sta_disk() match
+        None -> return
+        Some(p) -> p
+
+    val o0 = sta_code_member(path) match
+        None -> return
+        Some(b) -> b
+
+    val dir = make_temp_dir("sysl-sta-level-").unwrap()
+    val high = s"$dir/std$SyslibExtension"
+
+    build_std_library(std_root().unwrap(), host_target(), Some(high), "3") match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            assert(false, why)
+            return
+        Ok(_) -> ()
+
+    val o3 = sta_code_member(high)
+
+    remove_dir_all(dir).unwrap_or(())
+
+    assert(!sta_is_bitcode(o0), "the -O0 code member is bitcode")
+
+    o3 match
+        None -> ()
+        Some(b) ->
+            var same = b.len() == o0.len()
+
+            if same
+                for i in 0..<b.len()
+                    if b.at(i) != o0.at(i)
+                        same = false
+                        break
+
+            assert(!same, "-O0 and -O3 made one object")
+end sta_the_code_member_is_an_object_at_its_level
+
+@test("carries the library's own C as members, so a program linking it resolves the shims")
+sta_the_artifact_carries_the_library_c()
+    val path = sta_disk() match
+        None -> return
+        Some(p) -> p
+
+    val root = std_root().unwrap()
+    val wanted = c_sources(root, Some(host_target().os)).unwrap()
+
+    assert(!wanted.is_empty(), "the library carries C on this machine")
+
+    val members = ar_members(read_bytes(path).unwrap().view()).unwrap()
+
+    var names: Buf[string] = buf()
+
+    for i in 0..<members.len()
+        names.push(members.at(i).name)
+
+    for i in 0..<wanted.len()
+        val member = native_member(root, wanted.at(i))
+
+        assert(holds_string(names, member), s"'$member' is not in the artifact")
+end sta_the_artifact_carries_the_library_c
+
+// The default path is inside a cache directory no installer creates, so the parent is made rather
+// than assumed.
+@test("makes the directory it is asked to write into, which a fresh clone has never had")
+sta_the_artifact_makes_its_directory()
+    val path = sta_disk() match
+        None -> return
+        Some(p) -> p
+
+    assert(sta_disk_fresh, "the directory was there before the artifact was written")
+    assert(is_file(path), "the artifact was not written")
+end sta_the_artifact_makes_its_directory
+
+// **`find_ar`'s own sentence, which names the flag the reference reads it from.** This compiler's
+// command line has no `--ar` yet; what is asserted is the named archiver being refused rather than
+// searched past, and nothing being left behind.
+@test("and says which flag names the archiver when it cannot run the one it was given")
+sta_a_named_archiver_that_cannot_run_is_refused()
+    val root = std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return
+        Ok(r) -> r
+
+    val out = s"${make_temp_dir("sysl-sta-ar-").unwrap()}/std$SyslibExtension"
+
+    build_std_library(root, host_target(), Some(out), "0", Some("/nonexistent/llvm-ar")) match
+        Ok(_) -> assert(false, "an archiver that cannot run should not have produced an artifact")
+        Err(why) ->
+            assert(why.index_of("/nonexistent/llvm-ar").is_some(), why)
+            assert(why.index_of("--ar").is_some(), why)
+
+    assert(!is_file(out), "an artifact was left behind")
+end sta_a_named_archiver_that_cannot_run_is_refused
+
+// The artifact at the default path is shared, so it is assembled under a pending name and renamed
+// onto: a rebuild whose archiver writes nothing leaves the one already there, and nothing beside it.
+@test("and a build that fails leaves the artifact that was already there readable")
+sta_a_failed_build_leaves_the_artifact()
+    val path = sta_disk() match
+        None -> return
+        Some(p) -> p
+
+    val inert = if is_file("/usr/bin/true") then "/usr/bin/true" else "/bin/true"
+
+    if !is_file(inert)
+        print("skipped: no do-nothing program to stand in for an archiver")
+        return
+    end if
+
+    val was = read_bytes(path).unwrap()
+    val dir = make_temp_dir("sysl-sta-fail-").unwrap()
+    val out = s"$dir/std$SyslibExtension"
+
+    write_bytes(out, was).unwrap()
+
+    build_std_library(std_root().unwrap(), host_target(), Some(out), "0", Some(inert)) match
+        Ok(_) -> assert(false, "an archiver that produced no archive should not have reported success")
+        Err(why) -> assert(why.index_of(out).is_some(), why)
+
+    val now = read_bytes(out).unwrap()
+
+    assert(now.len == was.len, "the artifact already there changed size")
+
+    var same = now.len == was.len
+
+    if same
+        for i in 0..<now.len
+            if now[i] != was[i]
+                same = false
+                break
+
+    assert(same, "the artifact already there changed")
+
+    val listed = entries(dir).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+
+    assert_eq(join(listed.view(), " "), s"std$SyslibExtension")
+end sta_a_failed_build_leaves_the_artifact
+
+// -- nothing is defined twice ---------------------------------------------------------------------
+
+// `display` takes an `out: *Writer`, which reaches `sysl$stdout` -- the one library function a program
+// compiles for itself, because it reads a module-level `val` and a library has no entry point.
+private val sta_displaying: string =
+    "struct Point\n    x: int\n    y: int\n\nimpl Display for Point\n" +
+    "    display(self, out: *Writer, fmt: FormatSpec) =\n" +
+    "        display_pad((\"(\" + str(self.x) + \", \" + str(self.y) + \")\").bytes, out, fmt)\n\n" +
+    "var p = Point(3, 4)\n\nprint(p)\n"
+
+@test("not for a program that reaches the library at all")
+sta_nothing_defined_twice_for_print()
+    val both = sta_both_define("print(\"x\")") match
+        None -> return
+        Some(b) -> b
+
+    assert_eq(sta_listed(both), "")
+end sta_nothing_defined_twice_for_print
+
+@test("not for a program that implements Display, which reaches a writer")
+sta_nothing_defined_twice_for_display()
+    val both = sta_both_define(sta_displaying) match
+        None -> return
+        Some(b) -> b
+
+    assert_eq(sta_listed(both), "")
+end sta_nothing_defined_twice_for_display
+
+@test("and what the program compiles for itself, it really does compile")
+sta_the_program_compiles_stdout_itself()
+    val text = sta_emit(sta_displaying, false) match
+        None -> return
+        Some(t) -> t
+
+    assert(holds_string(sta_external(text), "sysl$stdout"), "the program defines sysl$stdout")
+end sta_the_program_compiles_stdout_itself
+
+@test("which the artifact leaves to it")
+sta_the_artifact_leaves_stdout()
+    val half = sta_half() match
+        None -> return
+        Some(h) -> h
+
+    assert(!holds_string(sta_defines(half.text), "sysl$stdout"), "the artifact defines sysl$stdout")
+    assert(!holds_string(half.advertised, "sysl$stdout"), "the artifact advertises sysl$stdout")
+end sta_the_artifact_leaves_stdout

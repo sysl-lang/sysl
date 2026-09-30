@@ -103,7 +103,7 @@ end std_named_at
 // The artifact for the library at `root`, read from `path` where what is there was built from it and
 // built there first where it was not.
 std_artifact_at(root: string, path: string, fingerprint: string, t: Target,
-                level: string) -> Result[Buf[string], string] = match_at(path, fingerprint, t) match
+                level: string) -> Result[Buf[string], string] = std_artifact_matching(path, fingerprint, t) match
     Ok(found) -> Ok(found)
     Err(why) ->
         eprints(s"building the standard module at $path ($why)\n")
@@ -163,12 +163,16 @@ end build_library
 // down rather than inferred from the module names in the tree, because guessing would turn a clear
 // refusal -- you cannot add to the module every program is compiled against -- into an artifact that
 // builds and then collides with the built-in copy at whatever link tried to use it.
+//
+// `ar` names the archiver rather than searching for one, and is refused rather than fallen back from
+// when it cannot run.
 build_std_library(root: string, t: Target, out: Option[string],
-                  level: string = DefaultOptimization) -> Result[string, string]
+                  level: string = DefaultOptimization,
+                  ar: Option[string] = None) -> Result[string, string]
     val fingerprint = std_fingerprint(root, t)?
     val where = out.unwrap_or(std_search.unwrap_or(std_artifact_path(t, fingerprint, level)))
 
-    write_std_artifact(std_usable_units(root, t)?, root, where, fingerprint, t, level)?
+    write_std_artifact(std_usable_units(root, t)?, root, where, fingerprint, t, level, ar)?
     Ok(where)
 end build_std_library
 
@@ -178,17 +182,21 @@ end build_std_library
 // should be: the reader is handed a file and can say whether it is one of ours and whether it is for
 // this machine, and what it cannot say is whether the source it was built from is the source in
 // front of this compilation.
-private match_at(path: string, fingerprint: string, t: Target) -> Result[Buf[string], string]
+//
+// **A stale artifact is refused in the reference's words**, which the rebuild line quotes in its
+// parentheses: it decodes and links perfectly, and is simply the wrong library.
+std_artifact_matching(path: string, fingerprint: string, t: Target) -> Result[Buf[string], string]
     if !metadata(path).is_ok() then return Err(s"$path does not exist")
 
     val meta = syslib_metadata_at(path)?
     val answer = syslib_read(path, meta, t)?
 
     if answer.1 != fingerprint
-        return Err(s"$path was built from other sources than the library this compiler found")
+        return Err(s"$path was built from a different standard module than this compiler's — " +
+            "rebuild it with 'sysl build-lib <library root> --std'")
 
     Ok(answer.0)
-end match_at
+end std_artifact_matching
 
 // The library's fingerprint: every file it is made of -- its sysl and its C -- reduced to its place
 // in the tree and its text.
@@ -201,7 +209,12 @@ end match_at
 // shipping ones -- and the two are allowed to disagree because a fingerprint is a question about the
 // *source a library was built from*, which is what decides whether an artifact is stale. Editing a
 // library's tests correctly invalidates the artifact even though nothing in it would have changed.
-std_fingerprint(root: string, t: Target) -> Result[string, string]
+std_fingerprint(root: string, t: Target) -> Result[string, string] =
+    Ok(library_fingerprint(std_files(root, t)?))
+
+// Every file the library at `root` is made of for a machine, as the fingerprint reads it: its place
+// in the tree and its text.
+std_files(root: string, t: Target) -> Result[Buf[(string, string)], string]
     var files: Buf[(string, string)] = buf()
 
     val found = std_sources(root, Some(t.os))?
@@ -220,8 +233,8 @@ std_fingerprint(root: string, t: Target) -> Result[string, string]
 
         files.push((place_below(root, carried.at(i)), text))
 
-    Ok(library_fingerprint(files))
-end std_fingerprint
+    Ok(files)
+end std_files
 
 // A sysl file's place: the module directories it sits under, then its own name. The same key
 // wherever the library was found, while its path is not.
@@ -273,9 +286,10 @@ private selects_a_machine(part: string) -> bool =
 // `pending_name` is unique to this process and this call, so two builds racing for one artifact never
 // publish each other's half-written archive.
 private write_std_artifact(units: Buf[Program], root: string, out: string, fingerprint: string,
-                           t: Target, level: string) -> Result[Buf[string], string] =
+                           t: Target, level: string,
+                           ar: Option[string] = None) -> Result[Buf[string], string] =
     write_artifact(units, modules_of(units), root, out, fingerprint, t, "the standard module",
-                   no_probe(), level)
+                   no_probe(), level, ar)
 
 // The same for **any** library, which is what `sysl build-lib` on a package writes: the tree's own
 // declarations compiled ahead of time into an object half, the metadata beside it, and one member
@@ -287,15 +301,11 @@ private write_std_artifact(units: Buf[Program], root: string, out: string, finge
 // compilation reached on the library's behalf is declared and left to whoever links this.
 private write_artifact(units: Buf[Program], own: Buf[string], root: string, out: string,
                        fingerprint: string, t: Target, who: string,
-                       probed: PkgAnswer, level: string) -> Result[Buf[string], string]
+                       probed: PkgAnswer, level: string,
+                       ar: Option[string] = None) -> Result[Buf[string], string]
     if !t.builds_with_clang() then return Err(t.no_toolchain())
 
-    val built = library_build(units, own, t)
-
-    if !built.report.is_empty()
-        return Err(s"$who does not analyze: ${first_message(built.report)}")
-
-    write_built(built, root, out, fingerprint, t, who, probed, level)
+    write_half(library_half(units, own, t, who)?, root, out, fingerprint, t, probed, level, ar)
 end write_artifact
 
 // The artifact written from a library that analyzed.
@@ -303,32 +313,25 @@ private write_built(built: LibraryBuild, root: string, out: string, fingerprint:
                     who: string, probed: PkgAnswer, level: string) -> Result[Buf[string], string]
     if !t.builds_with_clang() then return Err(t.no_toolchain())
 
+    write_half(half_of(built, t, who)?, root, out, fingerprint, t, probed, level)
+end write_built
+
+// The archive assembled around an object half: the code member, the metadata beside it, and one
+// member for each C file the tree carries.
+private write_half(half: LibraryHalf, root: string, out: string, fingerprint: string, t: Target,
+                   probed: PkgAnswer, level: string,
+                   ar: Option[string] = None) -> Result[Buf[string], string]
     val clang = find_clang(t, None)?
-    val archiver = find_ar(None)?
+    val archiver = find_ar(ar)?
     val staging = make_temp_dir("sysl-std-") match
         Err(_) -> return Err("cannot make a directory to build the standard module in")
         Ok(dir) -> dir
 
-    val first = codegen_with_gaps(built.program, t, built.promotions)
-    val lowered = codegen_with_gaps(library_deferring_gaps(built.program, first.1), t,
-                                    built.promotions)
-    val defined = advertised(built.determined, lowered.0)
-
-    // **An artifact that would not assemble is refused here rather than by the back end**, which
-    // reports it in the lines of generated text and says nothing about which library function is
-    // missing. A symbol the compiled half names and neither defines nor declares is a defect in the
-    // split above, and the sentence a reader needs is the name.
-    val loose = undefined_calls(ir_print_module(lowered.0))
-
-    if !loose.is_empty()
-        return Err(s"$who's compiled half would name ${loose.len()} symbol(s) it " +
-            s"neither defines nor declares, the first of them '${loose.at(0)}'")
-
-    val meta = syslib_metadata(t, fingerprint, defined)
+    val meta = syslib_metadata(t, fingerprint, half.advertised)
 
     var members: Buf[string] = buf()
 
-    val made = build_members(clang, archiver, staging, root, out, ir_print_module(lowered.0),
+    val made = build_members(clang, archiver, staging, root, out, half.text,
                              syslib_metadata_ir(meta, t), &members, t, probed, level)
 
     discard_members(members)
@@ -337,8 +340,56 @@ private write_built(built: LibraryBuild, root: string, out: string, fingerprint:
         Err(why) -> return Err(why)
         Ok(_) -> ()
 
-    Ok(defined)
-end write_built
+    Ok(half.advertised)
+end write_half
+
+// A library's object half before anything is assembled: the text its code member is compiled from,
+// and the functions of it a program may declare rather than define.
+struct LibraryHalf
+    text: string
+    advertised: Buf[string]
+end LibraryHalf
+
+// The standard module's object half for a machine, as text -- what `build-lib --std` hands clang,
+// without clang. **It is the same routine the artifact is written by**, so what is read off it is
+// what an artifact on disk holds.
+std_library_half(t: Target) -> Result[LibraryHalf, string]
+    val root = std_root()?
+    val units = std_usable_units(root, t)?
+
+    library_half(units, modules_of(units), t, "the standard module")
+end std_library_half
+
+private library_half(units: Buf[Program], own: Buf[string], t: Target,
+                     who: string) -> Result[LibraryHalf, string]
+    val built = library_build(units, own, t)
+
+    if !built.report.is_empty()
+        return Err(s"$who does not analyze: ${first_message(built.report)}")
+
+    half_of(built, t, who)
+end library_half
+
+// The object half of a library that analyzed.
+private half_of(built: LibraryBuild, t: Target, who: string) -> Result[LibraryHalf, string]
+    val first = codegen_with_gaps(built.program, t, built.promotions)
+    val lowered = codegen_with_gaps(library_deferring_gaps(built.program, first.1), t,
+                                    built.promotions)
+    val defined = advertised(built.determined, lowered.0)
+    val text = ir_print_module(lowered.0)
+
+    // **An artifact that would not assemble is refused here rather than by the back end**, which
+    // reports it in the lines of generated text and says nothing about which library function is
+    // missing. A symbol the compiled half names and neither defines nor declares is a defect in the
+    // split above, and the sentence a reader needs is the name.
+    val loose = undefined_calls(text)
+
+    if !loose.is_empty()
+        return Err(s"$who's compiled half would name ${loose.len()} symbol(s) it " +
+            s"neither defines nor declares, the first of them '${loose.at(0)}'")
+
+    Ok(LibraryHalf(text, defined))
+end half_of
 
 // The steps that make the file, kept apart from the call above so that the staging members are
 // discarded whichever of them failed.
