@@ -2,7 +2,8 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{entries, make_dir_all, make_temp_dir, read_bytes, remove_dir_all, write_bytes, write_text}
+import sysl.fs.{entries, is_file, make_dir_all, make_temp_dir, read_bytes, remove_dir_all, write_bytes, write_text}
+import sysl.process.capture
 import sysl.text.{cstring, Search}
 
 // **Every C file a build compiles is compiled once and kept** (`c_object_cache.sysl`). What a case
@@ -350,3 +351,127 @@ coc_a_relative_include_is_noticed()
     abs.push("-DX=1")
     assert(!names_relative_directory(abs), "all absolute")
 end coc_a_relative_include_is_noticed
+
+// Every file in `dir` dated 2020, which is years older than anything a test writes now.
+private coc_age(dir: string)
+    capture("/bin/sh", ["-c", s"touch -t 202001010000 '$dir'/*"]).unwrap()
+
+// `n` complete entries -- an object and its sidecar -- named `<stem><i>`, with nothing inside them.
+private coc_fake_entries(dir: string, stem: string, n: usize)
+    for i in 0..<n
+        write_text(s"$dir/$stem${i}.o", "x").unwrap()
+        write_text(s"$dir/$stem${i}.o.sum", "1:0").unwrap()
+
+@test("eviction keeps what the current build needs, however old, and takes stale entries past the limit")
+coc_eviction_keeps_what_the_build_uses()
+    if !clang_available() then return
+
+    val dirs = coc_begin()
+    val cobj = s"${dirs.1}/sysl/cobj"
+    val a = s"${dirs.0}/a.c"
+    val b = s"${dirs.0}/b.c"
+
+    write_text(a, "int coc_a(void) { return 1; }\n").unwrap()
+    write_text(b, "int coc_b(void) { return 2; }\n").unwrap()
+    coc_compile(a, s"${dirs.0}/a1.o").unwrap()
+
+    // a's entry, and a full cache's worth of others, all long past `CacheStale` -- and one fresh entry,
+    // which is what `now` is read from.
+    coc_fake_entries(cobj, "old", CacheKeep)
+    coc_age(cobj)
+    coc_fake_entries(cobj, "new", 1)
+
+    coc_compile(a, s"${dirs.0}/a2.o").unwrap()
+    assert_eq(c_object_counts(), (1, 1))
+
+    // The miss that keeps b's object is what evicts.
+    coc_compile(b, s"${dirs.0}/b1.o").unwrap()
+    assert_eq(c_object_counts(), (1, 2))
+    assert(!is_file(s"$cobj/old0.o") && !is_file(s"$cobj/old0.o.sum"), "a stale entry is evicted")
+    assert(is_file(s"$cobj/new0.o") && is_file(s"$cobj/new0.o.sum"), "a fresh entry is kept")
+    assert_eq(coc_objects(dirs.1).len(), 3)
+
+    // a's object was used by this build, so it survived though it is the oldest thing there.
+    coc_compile(a, s"${dirs.0}/a3.o").unwrap()
+    assert_eq(c_object_counts(), (2, 2))
+    coc_end(dirs)
+end coc_eviction_keeps_what_the_build_uses
+
+@test("below the limit nothing is evicted for age")
+coc_below_the_limit_nothing_is_evicted()
+    if !clang_available() then return
+
+    val dirs = coc_begin()
+    val cobj = s"${dirs.1}/sysl/cobj"
+    val a = s"${dirs.0}/a.c"
+
+    write_text(a, "int coc_a(void) { return 1; }\n").unwrap()
+    coc_compile(a, s"${dirs.0}/a1.o").unwrap()
+    coc_fake_entries(cobj, "old", 10)
+    coc_age(cobj)
+
+    write_text(a, "int coc_a(void) { return 3; }\n").unwrap()
+    coc_compile(a, s"${dirs.0}/a2.o").unwrap()
+    assert_eq(c_object_counts(), (0, 2))
+    assert_eq(coc_objects(dirs.1).len(), 12)
+    coc_end(dirs)
+end coc_below_the_limit_nothing_is_evicted
+
+@test("a half entry -- an object with no sidecar, or a sidecar with no object -- is removed at any age")
+coc_a_half_entry_is_removed()
+    if !clang_available() then return
+
+    val dirs = coc_begin()
+    val cobj = s"${dirs.1}/sysl/cobj"
+    val a = s"${dirs.0}/a.c"
+    val b = s"${dirs.0}/b.c"
+
+    write_text(a, "int coc_a(void) { return 1; }\n").unwrap()
+    write_text(b, "int coc_b(void) { return 2; }\n").unwrap()
+    coc_compile(a, s"${dirs.0}/a1.o").unwrap()
+
+    write_text(s"$cobj/lonely.o", "x").unwrap()
+    write_text(s"$cobj/widowed.o.sum", "1:0").unwrap()
+
+    coc_compile(b, s"${dirs.0}/b1.o").unwrap()
+    assert(!is_file(s"$cobj/lonely.o"), "an object with no sidecar is removed")
+    assert(!is_file(s"$cobj/widowed.o.sum"), "a sidecar with no object is removed")
+    assert_eq(coc_objects(dirs.1).len(), 2)
+
+    coc_compile(a, s"${dirs.0}/a2.o").unwrap()
+    coc_compile(b, s"${dirs.0}/b2.o").unwrap()
+    assert_eq(c_object_counts(), (2, 2))
+    coc_end(dirs)
+end coc_a_half_entry_is_removed
+
+// The limitation `c_object_cache.sysl` states, shown rather than described: a header added to a
+// directory searched ahead of the one the last compilation found it in changes nothing the key reads,
+// so the next build hits and links the object made from the header it no longer includes.
+// `SYSL_NO_CACHE=1` sees the new one.
+@test("a header added ahead of the one found last time is not noticed -- the stated limitation, and its escape hatch")
+coc_a_header_added_earlier_on_the_path_is_not_noticed()
+    if !clang_available() then return
+
+    val dirs = coc_begin()
+    val a = s"${dirs.0}/a.c"
+
+    make_dir_all(s"${dirs.0}/early").unwrap()
+    make_dir_all(s"${dirs.0}/late").unwrap()
+    write_text(s"${dirs.0}/late/n.h", "#define COC_N 7\n").unwrap()
+    write_text(a, "#include <n.h>\nint coc_a(void) { return COC_N; }\n").unwrap()
+
+    coc_setenv("SYSL_EXTRA_CFLAGS", s"-I${dirs.0}/early -I${dirs.0}/late")
+    coc_compile(a, s"${dirs.0}/one.o").unwrap()
+
+    write_text(s"${dirs.0}/early/n.h", "#define COC_N 9\n").unwrap()
+    coc_compile(a, s"${dirs.0}/two.o").unwrap()
+    assert_eq(c_object_counts(), (1, 1))
+    assert(coc_same(s"${dirs.0}/one.o", s"${dirs.0}/two.o"), "the object of the header found last time")
+
+    coc_setenv("SYSL_NO_CACHE", "1")
+    coc_compile(a, s"${dirs.0}/three.o").unwrap()
+    coc_unsetenv("SYSL_NO_CACHE")
+    coc_unsetenv("SYSL_EXTRA_CFLAGS")
+    assert(!coc_same(s"${dirs.0}/one.o", s"${dirs.0}/three.o"), "with the cache off, the new header is read")
+    coc_end(dirs)
+end coc_a_header_added_earlier_on_the_path_is_not_noticed

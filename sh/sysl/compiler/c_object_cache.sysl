@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.env.get as env_var
 import sysl.process.capture
-import sysl.fs.{current_dir, is_file, make_dir_all, read_bytes, read_text, remove_file, write_bytes,
+import sysl.fs.{current_dir, entries, is_file, make_dir_all, read_bytes, read_text, remove_file, write_bytes,
                 write_bytes_atomic, write_text_atomic}
 import sysl.text.{from_utf8_unchecked, join, split, Search}
 
@@ -55,7 +55,11 @@ import sysl.text.{from_utf8_unchecked, join, split, Search}
 //
 // A header **added** to a directory searched before the one the file was found in last time: nothing
 // the previous compilation read has changed, so the lookup hits. `SYSL_NO_CACHE=1` is the escape
-// hatch, as it is for the run cache.
+// hatch, as it is for the run cache. This is ccache's direct mode's limitation too, and it is left
+// rather than closed because closing it exactly means replaying clang's search -- the including
+// file's own directory, `-iquote`, `-I`, `-isystem`, the sysroot, frameworks, `#include_next` -- for
+// every header a file reads, and an approximation of that is a key that looks complete and is not.
+// `coc_a_header_added_earlier_on_the_path_is_not_noticed` shows it.
 
 private const CacheOff: string = "SYSL_NO_CACHE"
 
@@ -121,6 +125,7 @@ cached_c_compile(cc: string, src: string, obj: string, args: Buf[string]) -> Res
         Some(second) ->
             if reuse(s"$dir/$second.o", obj)
                 c_object_hits += 1
+                in_use(s"$dir/$second.o", listed)
                 return Ok(())
         None -> ()
 
@@ -148,8 +153,77 @@ cached_c_compile(cc: string, src: string, obj: string, args: Buf[string]) -> Res
 
     // A list that cannot be written costs the next build its compilation and nothing else.
     write_text_atomic(listed, join(read.view(), "\n")).unwrap_or(())
+    in_use(s"$dir/$second.o", listed)
+    evict_c_objects(dir)
     Ok(())
 end cached_c_compile
+
+// --- eviction ----------------------------------------------------------------------------
+//
+// **The run cache's policy, with the run cache's two numbers** (`CacheKeep`, `CacheStale`), so there
+// is one rule to know about what the machine's cache keeps: nothing is removed until the directory
+// holds `CacheKeep` objects, and then only what is older than `CacheStale`, measured against the newest
+// entry rather than a clock. Age is what makes it safe beside another build using the directory.
+//
+// It runs after a miss has kept its object -- a build that hits everything lists nothing -- and two
+// things are exempt from it:
+//
+//   - **what this process has used or made**, whatever its age: a build never evicts an object it
+//     already linked from, nor the file list that found it. A hit does not refresh an object's age, so
+//     an object compiled long ago and hit every day is recompiled once when it ages out, as a run-cache
+//     entry is rebuilt.
+//   - nothing else. **A half entry is garbage at any age** -- an object with no `.o.sum` beside it, or
+//     a `.o.sum` with no object -- since a lookup reads it as a miss and nothing ever completes it. One
+//     removed while another build is between its two renames costs that build's next compilation.
+
+// The objects, and the file lists naming them, this process has used or made.
+private var c_objects_in_use: Buf[string] = buf()
+
+private in_use(object: string, listed: string)
+    c_objects_in_use.push(object)
+    c_objects_in_use.push(s"$object.sum")
+    c_objects_in_use.push(listed)
+end in_use
+
+private used_here(one: string) -> bool
+    for i in 0..<c_objects_in_use.len()
+        if c_objects_in_use.at(i) == one then return true
+
+    false
+end used_here
+
+// Half entries removed, then -- where `CacheKeep` objects are kept -- every entry older than
+// `CacheStale` that this process has not used. A failure is not the build's: the worst an unevicted
+// cache costs is disk.
+evict_c_objects(dir: string)
+    val names = entries(dir) match
+        Ok(n) -> n
+        Err(_) -> return
+
+    var objects: usize = 0
+    var now: long = 0
+
+    for i in 0..<names.len()
+        val n = names.at(i)
+        val one = s"$dir/$n"
+
+        if n.ends_with(".o")
+            if is_file(s"$one.sum") then objects += 1
+            else if !used_here(one) then remove_file(one).unwrap_or(())
+        else if n.ends_with(".o.sum")
+            if !is_file(one[0..<one.len - 4]) && !used_here(one) then remove_file(one).unwrap_or(())
+
+        val at = cache_modified_at(one)
+
+        if at > now then now = at
+
+    if objects < CacheKeep then return
+
+    for i in 0..<names.len()
+        val one = s"$dir/${names.at(i)}"
+
+        if !used_here(one) && now - cache_modified_at(one) > CacheStale then remove_file(one).unwrap_or(())
+end evict_c_objects
 
 private split_lines(text: string) -> Buf[string]
     var out: Buf[string] = buf()
