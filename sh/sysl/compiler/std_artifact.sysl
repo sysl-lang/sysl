@@ -143,10 +143,16 @@ private std_toolchain(t: Target) -> Result[string, string] =
 // running on a machine that cannot compile the C at all: a run for a board that reaches clang's
 // complaint about a missing SDK header is a sysl type-check that passed.
 build_library(root: string, t: Target, where: string, units: Buf[Program], own: Buf[string],
-              who: string, probed: PkgAnswer, level: string) -> Result[string, string]
-    val fingerprint = std_fingerprint(root, t)?
+              who: string, probed: PkgAnswer, level: string) -> Result[string, Failure]
+    val fingerprint = std_fingerprint(root, t).map_err((why) -> said(Refusal(why)))?
+    val built = library_build(units, own, t)
 
-    write_artifact(units, own, root, where, fingerprint, t, who, probed, level)?
+    // **A library that does not analyze is reported as a program that does not analyze is**, every
+    // diagnostic with its place and its line: the mistake is in the reader's own tree, and a sentence
+    // about the library wrapped around the first of them is less than a build would have said.
+    if !built.report.is_empty() then return Err(Reported(analysis_report(built.report)))
+
+    write_built(built, root, where, fingerprint, t, who, probed, level).map_err((why) -> said(Refusal(why)))?
     Ok(where)
 end build_library
 
@@ -289,6 +295,14 @@ private write_artifact(units: Buf[Program], own: Buf[string], root: string, out:
     if !built.report.is_empty()
         return Err(s"$who does not analyze: ${first_message(built.report)}")
 
+    write_built(built, root, out, fingerprint, t, who, probed, level)
+end write_artifact
+
+// The artifact written from a library that analyzed.
+private write_built(built: LibraryBuild, root: string, out: string, fingerprint: string, t: Target,
+                    who: string, probed: PkgAnswer, level: string) -> Result[Buf[string], string]
+    if !t.builds_with_clang() then return Err(t.no_toolchain())
+
     val clang = find_clang(t, None)?
     val archiver = find_ar(None)?
     val staging = make_temp_dir("sysl-std-") match
@@ -324,7 +338,7 @@ private write_artifact(units: Buf[Program], own: Buf[string], root: string, out:
         Ok(_) -> ()
 
     Ok(defined)
-end write_artifact
+end write_built
 
 // The steps that make the file, kept apart from the call above so that the staging members are
 // discarded whichever of them failed.
