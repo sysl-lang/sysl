@@ -1,0 +1,800 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A variant belongs to its enum rather than to the module it was declared in
+// (`reference/types.md § Enums`). Two enums may each name a variant `Circle`, and what a bare
+// `Circle(3)` means is settled by the type expected where it is written; where nothing expects a
+// type, the qualified `Shape.Circle` spelling says which.
+//
+// Beside that rule sit the ones it meets: a struct or an alias of a variant's name (the struct wins
+// where the expected type does not name the variant's enum), a name that is out of reach (never a
+// candidate), a module declaring its own `Ok` (the expected type reaches across modules), and a
+// variant reached through a standard-library module's path.
+//
+// **Every output and every message here was read out of the reference compiler**, whose
+// `VariantNamespaceTests` these are, by handing the installed `sysl` the same tree.
+
+private var vns_library_cache: Buf[Program] = buf()
+private var vns_library_read: bool = false
+
+private vns_library() -> Buf[Program]
+    if vns_library_read then return vns_library_cache
+
+    vns_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> vns_library_cache = units
+
+    vns_library_cache
+end vns_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private vns_ready() -> bool
+    if vns_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end vns_ready
+
+private vns_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// The files of one program laid out under a fresh directory, each at its path relative to it.
+private vns_tree(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-vns").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    root
+end vns_tree
+
+// **What a program of several files PRINTS.**
+private vns_ran_in(files: []const (string, string)) -> string
+    val root = vns_tree(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vns_ran_in
+
+private vns_ran(text: string) -> string = vns_ran_in([("main.sysl", text)])
+
+// Everything a program of several files has to say for itself, taken the whole way the reference's
+// own `err` takes it -- through the lowering. Where nothing is refused, the LLVM text instead.
+private vns_emit_in(files: []const (string, string)) -> (string, string)
+    val root = vns_tree(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> (why.message, "")
+        Ok(made) -> (if made.report.is_empty() then "" else analysis_report(made.report), made.text)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vns_emit_in
+
+private vns_err_in(files: []const (string, string)) -> string = vns_emit_in(files).0
+
+private vns_err(text: string) -> string = vns_err_in([("main.sysl", text)])
+
+private vns_ir(text: string) -> string
+    val out = vns_emit_in([("main.sysl", text)])
+
+    if out.0 != "" then out.0 else out.1
+end vns_ir
+
+// A refusal, by its whole first line and the place it points at.
+private vns_refused(said: string, message: string, at: string)
+    assert(vns_says(said, s"error: $message\n"), said)
+    assert(vns_says(said, at), said)
+end vns_refused
+
+// Two enums with a variant name in common, and a second name apiece so that neither is reachable
+// only through the shared one.
+private vns_two() -> string = raw"""
+    enum Shape
+        Circle(r: int)
+        Square(side: int)
+    enum Hole
+        Circle(r: int)
+        Slot(len: int)
+    """
+
+private vns_area() -> string = raw"""
+    area(s: Shape) -> int
+        s match
+            Circle(r) -> r * 3
+            Square(side) -> side * side
+    """
+
+private vns_depth() -> string = raw"""
+    depth(h: Hole) -> int
+        h match
+            Circle(r) -> r + 100
+            Slot(len) -> len + 200
+    """
+
+private vns_links() -> string = raw"""
+    enum Link
+        Down
+        Up
+    enum Door
+        Down
+        Open
+    """
+
+private vns_name_link() -> string = raw"""
+    name(l: Link) -> string
+        l match
+            Down -> "down"
+            Up -> "up"
+    """
+
+// A struct and an enum variant of one name, which is what a call in a module declaring both has to
+// choose between.
+private vns_both() -> string = raw"""
+    struct Segment
+        a: int
+        b: int
+    enum Kind
+        Circle
+        Segment
+    """
+
+private vns_name_kind() -> string = raw"""
+    name(k: Kind) -> string
+        k match
+            Circle -> "circle"
+            Segment -> "segment"
+    """
+
+// -- two enums in one module may share a variant name ----------------------------------------------
+
+@test("which was refused outright before")
+vns_refused_outright_before()
+    if !vns_ready() then return
+
+    val out = vns_ir(vns_two() + "val s: Shape = Circle(1)\nprint(1)")
+
+    assert(vns_says(out, "%enum.Shape"), out)
+
+@test("and each keeps its own storage")
+vns_each_keeps_its_own_storage()
+    if !vns_ready() then return
+
+    val out = vns_ir(vns_two() + "val s: Shape = Circle(1)\nval h: Hole = Circle(2)\nprint(1)")
+
+    assert(vns_says(out, "%enum.Shape = type"), out)
+    assert(vns_says(out, "%enum.Hole = type"), out)
+
+// -- the expected type says which enum a bare name means -------------------------------------------
+
+@test("at an annotated binding")
+vns_at_an_annotated_binding()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_two() + vns_area() + vns_depth() +
+                      "val s: Shape = Circle(2)\nval h: Hole = Circle(2)\nprint(area(s))\nprint(depth(h))\n"),
+              "6\n102\n")
+
+@test("at an argument, which supplies one without anything being annotated")
+vns_at_an_argument()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_two() + vns_depth() + "print(depth(Circle(5)))\n"), "105\n")
+
+@test("at a return, for a nullary variant")
+vns_at_a_return_for_a_nullary_variant()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_links() + "state() -> Link = Down\n" + vns_name_link() + "print(name(state()))\n"),
+              "down\n")
+
+// -- a qualified name says which, where nothing else does ------------------------------------------
+
+@test("carrying data")
+vns_qualified_carrying_data()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_two() + vns_area() + "var s = Shape.Circle(4)\nprint(area(s))\n"), "12\n")
+
+@test("and nullary")
+vns_qualified_and_nullary()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_links() + vns_name_link() + "var l = Link.Down\nprint(name(l))\n"), "down\n")
+
+@test("picking the other one, from the same line written twice")
+vns_picking_the_other_one()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_two() + vns_area() + vns_depth() +
+                      "print(area(Shape.Circle(2)))\nprint(depth(Hole.Circle(2)))\n"),
+              "6\n102\n")
+
+// -- a bare name with two answers and nothing to choose by is refused ------------------------------
+
+@test("naming both enums")
+vns_naming_both_enums()
+    if !vns_ready() then return
+
+    vns_refused(vns_err(vns_two() + "var s = Circle(1)\nprint(1)"),
+                "'Circle' is a variant of 'Shape' and 'Hole', and nothing here says which — " +
+                "qualify it, as 'Shape.Circle'",
+                "main.sysl:7:9")
+
+@test("and showing the qualified form that fixes it")
+vns_showing_the_qualified_form()
+    if !vns_ready() then return
+
+    val said = vns_err(vns_two() + "var s = Circle(1)\nprint(1)")
+
+    assert(vns_says(said, "qualify it, as 'Shape.Circle'\n"), said)
+
+@test("for a nullary variant too")
+vns_for_a_nullary_variant_too()
+    if !vns_ready() then return
+
+    vns_refused(vns_err(vns_links() + "var l = Down\nprint(1)\n"),
+                "'Down' is a variant of 'Link' and 'Door', and nothing here says which — " +
+                "qualify it, as 'Link.Down'",
+                "main.sysl:7:9")
+
+@test("listing all three where three enums answer")
+vns_listing_all_three()
+    if !vns_ready() then return
+
+    vns_refused(vns_err("enum A\n    X\n    P\nenum B\n    X\n    Q\nenum C\n    X\n    R\nvar v = X\nprint(1)\n"),
+                "'X' is a variant of 'A', 'B' and 'C', and nothing here says which — qualify it, as 'A.X'",
+                "main.sysl:10:9")
+
+@test("one enum answering is not an ambiguity")
+vns_one_enum_answering()
+    if !vns_ready() then return
+
+    vns_refused(vns_err("enum Shape\n    Circle(r: int)\n    Square(s: int)\nvar s = Circle(1, 2)\nprint(1)"),
+                "variant 'Circle' has 1 field, but 2 values were given",
+                "main.sysl:4:9")
+
+// -- a pattern is unaffected, because the scrutinee already says which enum ------------------------
+
+@test("bare, on either of them")
+vns_pattern_bare_on_either()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_two() + vns_area() + vns_depth() +
+                      "print(area(Shape.Circle(1)) + depth(Hole.Circle(1)))\n"),
+              "104\n")
+
+@test("qualified, which the dotted form has always allowed")
+vns_pattern_qualified()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_two() + raw"""
+        area(s: Shape) -> int
+            s match
+                Shape.Circle(r) -> r * 3
+                Shape.Square(side) -> side * side
+        print(area(Shape.Circle(3)))
+        """), "9\n")
+
+// -- a variant still clashes with anything that is not a variant -----------------------------------
+
+@test("while a second enum in the same position is accepted")
+vns_a_second_enum_is_accepted()
+    if !vns_ready() then return
+
+    val out = vns_ir("enum Colour\n    Red\nend Colour\nenum Wine\n    Red\nend Wine\nprint(1)")
+
+    assert(vns_says(out, "define i32 @main"), out)
+
+// -- visibility follows the widest enum that offers the name ---------------------------------------
+
+private vns_hidden_shapes() -> string = raw"""
+    module shapes
+    private enum Hidden
+        Circle(r: int)
+        Slot(len: int)
+    enum Shape
+        Circle(r: int)
+        Square(side: int)
+    """
+
+@test("so a public enum's variant survives a private one naming it too")
+vns_a_public_variant_survives()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran_in([("shapes/shapes.sysl", vns_hidden_shapes() + vns_area()),
+                          ("main.sysl", "import shapes.*\nprint(area(Circle(2)))\n")]),
+              "6\n")
+
+@test("and the private one is not a candidate from outside, so the name is not ambiguous there")
+vns_the_private_one_is_not_a_candidate()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran_in([("shapes/shapes.sysl", vns_hidden_shapes()),
+                          ("main.sysl", raw"""
+                              import shapes.*
+                              var s = Circle(7)
+
+                              s match
+                                  Circle(r) -> print(r)
+                                  Square(side) -> print(side)
+                              """)]),
+              "7\n")
+
+// -- generic enums are no different, since the expected type carries its arguments -----------------
+
+private vns_box_sack() -> string = raw"""
+    enum Box[T]
+        Wrap(v: T)
+        Bare
+    enum Sack[T]
+        Wrap(v: T)
+        Loose
+    unbox(b: Box[int]) -> int
+        b match
+            Wrap(v) -> v
+            Bare -> 0
+    """
+
+@test("two of them sharing a variant name")
+vns_generic_two_sharing()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_box_sack() + "val b: Box[int] = Wrap(9)\nprint(unbox(b))\n"), "9\n")
+
+@test("and qualified, where nothing expects one")
+vns_generic_qualified()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_box_sack() + "var b = Box.Wrap(4)\nprint(unbox(b))\n"), "4\n")
+
+@test("a shared name whose two variants differ in shape is still told apart by the expected type")
+vns_differ_in_shape()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(raw"""
+        enum Reply
+            Done(code: int)
+            Waiting
+        enum Job
+            Done
+            Running(pid: int)
+        say(r: Reply) -> int
+            r match
+                Done(code) -> code
+                Waiting -> -1
+        ran(j: Job) -> int
+            j match
+                Done -> 100
+                Running(pid) -> pid
+        val r: Reply = Done(7)
+        val j: Job = Done
+        print(say(r))
+        print(ran(j))
+        """), "7\n100\n")
+
+// `reference/generics.md § A parameter may stand for a value`: the tag is read off the instantiated
+// enum, so it has to reach the right one of two.
+@test("a simple enum's variant as a value argument picks the right enum")
+vns_value_argument_picks_the_right_enum()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(raw"""
+        enum Level
+            Low
+            High
+        enum Tide
+            Low
+            Slack
+        struct Gauge[const L: Level]
+            reading: int
+        at(g: Gauge[High]) -> int = g.reading
+        val g: Gauge[High] = Gauge(3)
+        print(at(g))
+        """), "3\n")
+
+@test("a program may name a variant the library also names")
+vns_a_program_may_name_a_library_variant()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(raw"""
+        enum Maybe
+            Some(v: int)
+            Nothing
+        unwrap(m: Maybe) -> int
+            m match
+                Some(v) -> v
+                Nothing -> 0
+        val m: Maybe = Some(5)
+        print(unwrap(m))
+        """), "5\n")
+
+// -- the expected type reaches across modules, not only within one ---------------------------------
+
+// All four of the prelude's names, which every package returns.
+private vns_shadows() -> string = raw"""
+    enum Status
+        Ok
+        Bad
+    enum Outcome
+        Err
+        Some
+        None
+    """
+
+@test("so a module declaring its own Ok may still return a Result")
+vns_own_ok_still_returns_a_result()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_shadows() + raw"""
+        f() -> Result[int, string] = Ok(1)
+        g() -> Result[int, string] = Err("no")
+        print(f().unwrap(), g().is_err())
+        """), "1 true\n")
+
+@test("and Some and None still mean Option's")
+vns_some_and_none_still_mean_options()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_shadows() + raw"""
+        h() -> Option[int] = Some(2)
+        k() -> Option[int] = None
+        print(h().unwrap(), k().is_none())
+        """), "2 true\n")
+
+@test("while the module's own still wins where its own type is expected")
+vns_the_modules_own_still_wins()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_shadows() + raw"""
+        s() -> Status = Ok
+        o() -> Outcome = None
+        print(s() == Ok, o() == None)
+        """), "true true\n")
+
+@test("and the qualified spelling says which, as it does everywhere else")
+vns_the_qualified_spelling_says_which()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_shadows() + raw"""
+        want(x: Status) -> bool = x == Status.Ok
+        r() -> Result[int, string] = Ok(1)
+        print(want(Status.Ok), r().unwrap())
+        """), "true 1\n")
+
+@test("and two owners with nothing to choose by are still refused")
+vns_two_owners_still_refused()
+    if !vns_ready() then return
+
+    vns_refused(vns_err("enum A\n    Thing\nenum B\n    Thing\nf() = print(Thing)\n"),
+                "'Thing' is a variant of 'A' and 'B', and nothing here says which — qualify it, as 'A.Thing'",
+                "main.sysl:5:13")
+
+// A module's own function against a distant enum's variant of the same name: the call reaches the
+// function, and the variant is never constructed.
+@test("and a name that resolves to something else is NOT re-pointed at a variant")
+vns_a_name_is_not_repointed()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran_in([("pal/pal.sysl", raw"""
+                              module pal
+                              enum Shape
+                                  Segment(n: int)
+                                  Dot
+                              describe(s: Shape) -> string = s match
+                                  Segment(n) -> s"VARIANT ${n}"
+                                  Dot -> "DOT"
+                              """),
+                          ("app/app.sysl", raw"""
+                              module app
+                              import pal.{Shape, describe}
+                              Segment(n: int) -> Shape = Shape.Dot
+                              go() -> string = describe(Segment(1))
+                              """),
+                          ("main.sysl", "print(app.go())")]),
+              "DOT\n")
+
+@test("and an unimported variant is still out of scope, whatever the expected type names")
+vns_an_unimported_variant_is_out_of_scope()
+    if !vns_ready() then return
+
+    vns_refused(vns_err_in([("pal/pal.sysl", raw"""
+                                module pal
+                                enum Mode
+                                    Fast
+                                    Slow
+                                pick(m: Mode) -> int = m match
+                                    Fast -> 1
+                                    Slow -> 0
+                                """),
+                            ("main.sysl", "print(pal.pick(Fast))")]),
+                "undefined name 'Fast'",
+                "main.sysl:1:16")
+
+// Nothing is constructed: the `Result` comes out of the library, so the only shadowed names in the
+// program are the two in the arms.
+@test("and a pattern was never affected, because the scrutinee already says which")
+vns_a_pattern_was_never_affected()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran("import sysl.text.parse_int\n" + vns_shadows() + raw"""
+        f(s: string) -> int = parse_int(s) match
+            Ok(v) -> v
+            Err(_) -> -1
+        print(f("42"), f("x"))
+        """), "42 -1\n")
+
+// -- a struct and a variant of one name are told apart in call position ----------------------------
+
+@test("the struct is constructed by its own name, which was refused outright")
+vns_the_struct_is_constructed_by_its_own_name()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_both() + "seg(x: int, y: int) -> Segment = Segment(x, y)\nprint(seg(3, 4).b)\n"), "4\n")
+
+@test("with nothing expected at all, since the variant still has a qualified spelling")
+vns_the_struct_with_nothing_expected()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_both() + "var s = Segment(1, 2)\nprint(s.a)\n"), "1\n")
+
+@test("while the variant wins wherever the expected type names its enum")
+vns_the_variant_wins_where_expected()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_both() + vns_name_kind() + "val k: Kind = Segment\nprint(name(k))\n"), "segment\n")
+
+@test("and at an argument, which supplies the expected type without an annotation")
+vns_the_variant_wins_at_an_argument()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_both() + vns_name_kind() + "print(name(Segment))\n"), "segment\n")
+
+@test("the qualified spelling reaches the variant from a call position too")
+vns_the_qualified_spelling_reaches_the_variant()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_both() + vns_name_kind() + "var k = Kind.Segment\nprint(name(k))\n"), "segment\n")
+
+@test("and a struct with no same-named variant is unaffected")
+vns_a_struct_with_no_variant_is_unaffected()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran("struct Point\n    x: int\n    y: int\nvar p = Point(1, 2)\nprint(p.y)\n"), "2\n")
+
+@test("and the struct may be reached through an alias, which is the case this came from")
+vns_the_struct_through_an_alias()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(raw"""
+        struct RawSeg
+            a: int
+            b: int
+        type Segment = RawSeg
+        enum Kind
+            Circle
+            Segment
+        seg(x: int, y: int) -> Segment = Segment(x, y)
+        print(seg(3, 4).b)
+        """), "4\n")
+
+@test("a struct of the same name that is out of reach is not a candidate, and does not refuse")
+vns_an_out_of_reach_struct_is_not_a_candidate()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran_in([("shapes/shapes.sysl", "module shapes\nprivate struct Segment\n    a: int\n    b: int\n" +
+                                                 "enum Kind\n    Circle\n    Segment\n" + vns_name_kind()),
+                          ("main.sysl", "import shapes.*\nprint(name(Segment))\n")]),
+              "segment\n")
+
+@test("while one that is in reach wins, from another module")
+vns_an_in_reach_struct_wins()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran_in([("shapes/shapes.sysl", "module shapes\n" + vns_both()),
+                          ("main.sysl", "import shapes.*\nvar s = Segment(3, 4)\nprint(s.b)\n")]),
+              "4\n")
+
+// -- a sibling file's private struct is not a candidate either -------------------------------------
+
+private vns_sibling() -> (string, string) =
+    ("shapes/other.sysl", "module shapes\nprivate struct Circle\n    x: int\nprivate dummy(c: Circle) -> int = c.x\n")
+
+private vns_shape_file(tail: string) -> (string, string) =
+    ("shapes/shape.sysl", "module shapes\nenum Shape\n    Circle(r: int)\n    Square(s: int)\n" +
+                          "area(s: Shape) -> int = s match\n    Circle(r) -> r * r\n    Square(x) -> x * x\n" + tail)
+
+@test("where the expected type names the enum")
+vns_sibling_where_the_enum_is_expected()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran_in([vns_sibling(), vns_shape_file("unit_circle() -> Shape = Circle(1)\n"),
+                          ("main.sysl", "import shapes.*\nprint(area(unit_circle()))\n")]),
+              "1\n")
+
+@test("and where nothing is expected at all")
+vns_sibling_where_nothing_is_expected()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran_in([vns_sibling(), vns_shape_file("two() -> int\n    val c = Circle(2)\n    area(c)\n"),
+                          ("main.sysl", "import shapes.*\nprint(two())\n")]),
+              "4\n")
+
+@test("and from an importing module, where the struct was never a candidate")
+vns_sibling_from_an_importing_module()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran_in([vns_sibling(), vns_shape_file(""),
+                          ("main.sysl", "import shapes.*\nval s: Shape = Circle(3)\nprint(area(s), area(Circle(1)))\n")]),
+              "9 1\n")
+
+// -- a nullary variant given arguments is told to drop the parentheses -----------------------------
+
+@test("at a construction")
+vns_drop_the_parentheses_at_a_construction()
+    if !vns_ready() then return
+
+    vns_refused(vns_err("enum Kind\n    Circle\n    Flat\nval k: Kind = Circle(1)\nprint(1)\n"),
+                "variant 'Circle' carries nothing, so it is written as a name on its own — " +
+                "drop the parentheses and the 1 argument inside them",
+                "main.sysl:4:15")
+
+@test("and at a pattern")
+vns_drop_the_parentheses_at_a_pattern()
+    if !vns_ready() then return
+
+    vns_refused(vns_err("enum Kind\n    Circle\n    Flat\nval k: Kind = Circle\n\n" +
+                        "k match\n    Circle(r) -> print(r)\n    Flat -> print(0)\n"),
+                "variant 'Circle' carries nothing, so it is matched as a name on its own — " +
+                "drop the parentheses and the 1 sub-pattern inside them",
+                "main.sysl:7:5")
+
+@test("the rule crosses a module boundary intact")
+vns_the_rule_crosses_a_module_boundary()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran_in([("shapes/shapes.sysl", "module shapes\n" + vns_two()),
+                          ("main.sysl", raw"""
+                              import shapes.*
+                              val s: Shape = Circle(1)
+                              val h: Hole = Circle(2)
+
+                              s match
+                                  Circle(r) -> print(r)
+                                  Square(x) -> print(x)
+
+                              h match
+                                  Circle(r) -> print(r)
+                                  Slot(l) -> print(l)
+                              """)]),
+              "1\n2\n")
+
+// -- an alias and a variant of one name are told apart the same way --------------------------------
+
+private vns_aliased() -> string = raw"""
+    enum StmtKind
+        Eval(n: int)
+        Skip
+    type Eval = Result[int, string]
+    """
+
+@test("the variant wins where the expected type names its enum")
+vns_alias_the_variant_wins()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_aliased() + raw"""
+        take(k: StmtKind) -> int = k match
+            Eval(n) -> n
+            Skip -> 0
+        print(take(Eval(3)))
+        """), "3\n")
+
+@test("and the alias keeps it where nothing expects the enum")
+vns_alias_keeps_call_position()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(vns_aliased() + "val e: Eval = Ok(7)\nprint(e.unwrap())\n"), "7\n")
+
+@test("with the old refusal still reached where the alias really is what was named")
+vns_alias_the_old_refusal()
+    if !vns_ready() then return
+
+    vns_refused(vns_err(vns_aliased() + "print(Eval(3))"),
+                "'Eval' is sysl.Result[int, string] here, which carries data — " +
+                "only a simple enum converts to and from an integer",
+                "main.sysl:5:7")
+
+// -- a variant is reached through the module of a standard-library enum ----------------------------
+
+private vns_describe() -> string = raw"""
+    code(e: text.ParseError) -> int = e match
+        Empty -> 0
+        BadDigit(at) -> 100 + int(at)
+        Overflow -> 2
+        BadBase(b) -> 300 + b
+    """
+
+@test("carrying a payload, through the module's import")
+vns_stdlib_carrying_a_payload()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran("import sysl.text\n" + vns_describe() + raw"""
+        val e: text.ParseError = text.ParseError.BadBase(3)
+        print(code(e), code(text.ParseError.BadDigit(7)))
+        print(e)
+        """), "303 107\n3 is not a base between 2 and 36\n")
+
+@test("carrying nothing, through the module's import")
+vns_stdlib_carrying_nothing()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran("import sysl.text\n" + vns_describe() + raw"""
+        val e: text.ParseError = text.ParseError.Overflow
+        print(code(e), code(text.ParseError.Empty))
+        """), "2 0\n")
+
+@test("spelled in full under a wildcard import of the module")
+vns_stdlib_spelled_in_full()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(raw"""
+        import sysl.text.*
+        val a: ParseError = sysl.text.ParseError.BadBase(5)
+        val b = sysl.text.ParseError.Overflow
+        print(a, b)
+        """), "5 is not a base between 2 and 36 value too large for its type\n")
+
+@test("of another module's enum too")
+vns_stdlib_another_modules_enum()
+    if !vns_ready() then return
+
+    assert_eq(vns_ran(raw"""
+        import sysl.time
+        val d = time.Weekday.Monday
+        print(d == time.Weekday.Monday, d == time.Weekday.Friday)
+        """), "true false\n")
+
+// Named as a reader spells the enum, never by the key it is filed under nor an escaped copy of one.
+@test("and a variant the enum lacks is named in the dotted spelling")
+vns_stdlib_a_missing_variant()
+    if !vns_ready() then return
+
+    val called = vns_err("import sysl.text\nval e: text.ParseError = text.ParseError.Missing(3)\nprint(e)\n")
+    val named = vns_err("import sysl.text\nval e: text.ParseError = text.ParseError.Missing\nprint(e)\n")
+
+    vns_refused(called, "enum 'sysl.text.ParseError' has no variant or associated function 'Missing'",
+                "main.sysl:2:42")
+    vns_refused(named, "enum 'sysl.text.ParseError' has no variant 'Missing'", "main.sysl:2:42")
+
+    for said in [called, named]
+        assert(!vns_says(said, "$"), said)
+        assert(!vns_says(said, ".24"), said)
