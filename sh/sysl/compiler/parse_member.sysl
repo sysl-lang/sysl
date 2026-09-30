@@ -341,7 +341,9 @@ private at_enum_variant(p: *Parser) -> bool
     if p.at_kw("@") || p.at_kw("private") || p.at_kw("static") then return false
     // `override` opens a member's line as a visibility does, and is refused there in words of its own.
     if p.at_kw("override") && !at_reserved_member_head(p) then return false
-    if p.at_word("set") then return false
+    // `set` is a name like any other, so `set`, `set = 3` and `set(x: int)` are variants; only a
+    // name after it makes the line a setter's.
+    if at_setter(p) then return false
 
     if !names_a_field(p.peek()) then return false
 
@@ -758,7 +760,7 @@ const SetterValue: string = "$value"
 private parse_member(p: *Parser, start: Span, site: MemberSite) -> Option[MethodDecl]
     val signatures = site == InTrait
 
-    if at_setter(p) then return Some(parse_setter(p, start, signatures))
+    if at_setter(p) then return parse_setter(p, start, signatures)
     if p.at_kw("static") then return Some(parse_static_member(p, start, signatures))
 
     parse_member_named(p, start, site, parse_bound_name(p))
@@ -807,13 +809,23 @@ private at_reserved_member_head(p: *Parser) -> bool
 end at_reserved_member_head
 
 // `set width(w)` -- the member a write to a property reaches.
-private at_setter(p: *Parser) -> bool = p.at_word("set") && names_a_field(p.peek_at(1)) &&
-    p.kw_at(2, "(")
+//
+// **`set` is not a reserved word, and what makes it open a setter is the NAME after it.** Followed by
+// anything else it is the line's own name: a field `set: int`, a method `set(self, v: int)`, a
+// property `set -> int`, a variant `set`. A reserved word after it is not a name, so `set val(v)`
+// is a member called `set` with something wrong after it. Once a name has followed, the line is a
+// setter whatever comes next, and `set width` with no list is one owed its `(`.
+private at_setter(p: *Parser) -> bool = p.at_word("set") && names_a_variant(p.peek_at(1))
 
-private parse_setter(p: *Parser, start: Span, signatures: bool) -> MethodDecl
+private parse_setter(p: *Parser, start: Span, signatures: bool) -> Option[MethodDecl]
     p.bump()
 
     val name = parse_bound_name(p)
+
+    if !p.at_kw("(")
+        p.want("'('")
+        return None
+    end if
 
     p.bump()
 
@@ -834,7 +846,7 @@ private parse_setter(p: *Parser, start: Span, signatures: bool) -> MethodDecl
     end if
 
     decl.span = start.to(p.just_taken())
-    decl
+    Some(decl)
 end parse_setter
 
 // `static area -> real` -- a property of the type rather than of a value, and the associated
