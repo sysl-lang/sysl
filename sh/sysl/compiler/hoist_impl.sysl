@@ -33,8 +33,8 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                                  written_subject(block),
                                  tr.methods)
 
-    // A TYPE parameter written as the subject's length is refused before the subject is read: read,
-    // it would stand at zero and the block would quietly implement the trait for `[0]T`.
+    // A TYPE parameter written as the subject's length leaves the block with no subject, and it
+    // ends here: read on, the block would be asked about the shape of a type nobody wrote.
     if target_length_refused(a, scope, block) then return im
 
     val target = impl_target(a, scope, span, block)
@@ -776,41 +776,28 @@ private length_param(block: ImplDecl) -> Option[string]
         _ -> None
 end length_param
 
-// Whether the block's subject writes one of its TYPE parameters where a length belongs --
-// `impl[N, T] Tag for [N]T` -- told at the length itself.
+// Whether the block's subject has a length that refused to be one -- `impl[N, T] Tag for [N]T`,
+// where `N` is a type -- which the reading of the subject says, at the length itself. It is the
+// same reading `structural_target` opens with, made here so that a subject with no type ends the
+// block before anything is asked about its shape. A nominal subject is left to `named_target`,
+// which has its own things to say about the arguments first.
 private target_length_refused(a: &Analysis, scope: Scope, block: ImplDecl) -> bool
-    var types: Buf[string] = buf()
+    if block.tparams.is_empty() then return false
 
-    for i in 0..<block.tparams.len()
-        if !has_binding(block.tvalues, block.tparams.at(i)) then types.push(block.tparams.at(i))
+    *block.for_type.kind match
+        NamedType(written, _) ->
+            val key = lookup_type_key(a, scope, written)
 
-    if types.is_empty() then return false
-
-    val before = a.complaints()
-
-    target_lengths(a, scope, block.for_type, types)
-    a.complaints() > before
-end target_length_refused
-
-private target_lengths(a: &Analysis, scope: Scope, t: TypeRef, types: Buf[string])
-    *t.kind match
-        ArrayType(length, elem, _) ->
-            if length.is_some() then length_not_a_type(a, scope, t.span, length.unwrap(), types)
-
-            target_lengths(a, scope, elem, types)
-        VectorType(lanes, elem) ->
-            length_not_a_type(a, scope, t.span, lanes, types)
-            target_lengths(a, scope, elem, types)
-        NamedType(_, args) ->
-            for i in 0..<args.len()
-                target_lengths(a, scope, args.at(i), types)
-        TupleType(parts, _) ->
-            for i in 0..<parts.len()
-                target_lengths(a, scope, parts.at(i), types)
-        PtrType(inner) -> target_lengths(a, scope, inner, types)
-        RefType(inner, _) -> target_lengths(a, scope, inner, types)
+            if key.is_some() && nominal_of(a, key.unwrap()).is_some() then return false
         _ -> ()
-end target_lengths
+
+    val refusals = a.const_refusals
+
+    resolve_type(a, scope, block.for_type,
+                 abstract_subst(a, scope, block.tparams, block.bounds, block.tvalues, block.tpacks,
+                                buf()))
+    const_refused_since(a, refusals)
+end target_length_refused
 
 // The block's own **pack** parameter, where the subject is `(..A)` and `A` is one.
 private pack_param(block: ImplDecl) -> Option[string]

@@ -65,8 +65,7 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
         Unknown
     ArrayType(length, elem, read_only) ->
         resolve_array(a, scope, t.span, length, elem, read_only, subst)
-    VectorType(lanes, elem) -> Vector(int(const_extent(a, scope, t.span, lanes, subst)),
-                                      resolve_qualified(a, scope, elem, subst))
+    VectorType(lanes, elem) -> resolve_vector(a, scope, t.span, lanes, elem, subst)
     TupleType(parts, results) -> resolve_tuple(a, scope, parts, results, subst)
     PackType(name) -> bound_type(subst, name).unwrap_or(Pack(buf()))
     CFnType(params, ret) ->
@@ -233,6 +232,14 @@ resolve_list(a: &Analysis, scope: Scope, ts: Buf[TypeRef], subst: Buf[Binding]) 
     out
 end resolve_list
 
+// `<N>T` -- a vector, whose lane count is a constant on the terms an array's length is.
+private resolve_vector(a: &Analysis, scope: Scope, span: Span, lanes: Expr, elem: TypeRef,
+                       subst: Buf[Binding]) -> Type
+    if length_is_type_param(a, scope, span, lanes, subst) then return Unknown
+
+    Vector(int(const_extent(a, scope, span, lanes, subst)), resolve_qualified(a, scope, elem, subst))
+end resolve_vector
+
 private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Expr], elem: TypeRef,
                       read_only: bool, subst: Buf[Binding]) -> Type
     // A fixed array HOLDS its elements and a slice POINTS at them, which is the whole of why one is
@@ -240,8 +247,11 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
     if length.is_none() then
         return Slice(under_indirection(a, () -> resolve_qualified(a, scope, elem, subst)), read_only)
 
-    val e = resolve_qualified(a, scope, elem, subst)
     val written = length.unwrap()
+
+    if length_is_type_param(a, scope, span, written, subst) then return Unknown
+
+    val e = resolve_qualified(a, scope, elem, subst)
 
     // The rule the declaration asks of a written length, asked again of the substitution -- which is
     // what reaches a length written inside a BODY, where the declaration-time walk never looks: a
@@ -284,6 +294,40 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
 
     Array(int(const_extent(a, scope, span, written, subst)), e)
 end resolve_array
+
+// Whether a written length is a bare name standing for a **type** -- `[T]int` where `T` is a type
+// parameter -- which is refused here, where the type is read. A length is a value, and a parameter
+// standing for one is declared `const`; such a parameter stands in as a number rather than as a
+// type, which is what tells the two apart. Read on, the name would stand at zero and the array
+// would quietly be one nobody wrote: `impl[N, T] Tag for [N]T` an implementation for `[0]T`.
+//
+// **A type's own fields are not asked**: a generic type's fields are read at stand-ins only to
+// build the shape its members are checked against, and a length there is judged when something
+// instantiates the type.
+private length_is_type_param(a: &Analysis, scope: Scope, span: Span, len: Expr,
+                             subst: Buf[Binding]) -> bool
+    if !a.resolving.is_empty() then return false
+
+    val n = *len.kind match
+        Ident(n) -> n
+        _ -> return false
+
+    val name = bound_type(subst, n) match
+        Some(Abstract(name, _)) -> name
+        _ -> return false
+
+    val message = s"'$name' is a type parameter, and an array's length is a value rather than a " +
+                  s"type — a parameter that stands for a length is declared 'const $name: usize'"
+
+    // A signature is asked this at its declaration too, from the names alone, and that is where the
+    // reader was told.
+    if !a.said_around(scope, span, message) then a.fault(scope, span, message)
+
+    // A length with no value, told where it is: counted with the folds that refused, so a reader of
+    // the type can tell this from a type that is merely not there.
+    a.const_refusals += 1
+    true
+end length_is_type_param
 
 // The length a written one folds to, where that is below zero.
 private negative_extent(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Option[BigInt]
@@ -341,9 +385,9 @@ private folds_to_extent(a: &Analysis, scope: Scope, span: Span, e: Expr,
     folded.is_some()
 end folds_to_extent
 
-// Whether a length stands over a type parameter that has not been given a type yet. A value
-// parameter is bound to the same `Abstract` stand-in a type parameter gets, so it does not fold and
-// is not an error either; a name bound to a value is not here, because that one folds.
+// Whether a length stands over a type parameter that has not been given a type yet -- a measurement
+// of one, `[sizeof(T)]u8`, or the bare name where a type's own fields are read at stand-ins. A value
+// parameter is not here: it stands in as a number, and that one folds.
 private awaits_instantiation(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> bool =
     *e.kind match
         Ident(n) -> bound_type(subst, n) match
