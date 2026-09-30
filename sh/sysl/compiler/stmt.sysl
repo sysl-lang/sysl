@@ -880,22 +880,35 @@ end not_in_an_unrolled_loop
 //
 // What may be deferred is bounded by what teardown can mean, and each refusal is a different
 // mistake so each is named on its own.
+//
+// **A refused statement is not scheduled.** A build lowers the tree it was given whether or not the
+// analysis complained, and a deferred statement is laid down at every edge out of its block -- so a
+// scheduled `break`, `continue`, `return` or `?` is an edge that runs the deferred statements, of
+// which it is one, and the lowering never comes back. The refusal is the whole answer: nothing of
+// the statement is read past it, so it is one diagnostic and the block is left as if the line were
+// not there.
 private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
-    *inner.kind match
+    val refusal: Option[string] = *inner.kind match
         Return(_) ->
-            cx.fault(span, "a deferred statement runs while its block is being left, so it cannot " +
-                     "'return' — there is no exit left to take. Compute what the function returns " +
-                     "before the block ends")
-        Break(_, _) -> cx.fault(span, deferred_jump())
-        Continue(_) -> cx.fault(span, deferred_jump())
+            Some("a deferred statement runs while its block is being left, so it cannot " +
+                 "'return' — there is no exit left to take. Compute what the function returns " +
+                 "before the block ends")
+        Break(_, _) -> Some(deferred_jump())
+        Continue(_) -> Some(deferred_jump())
         Defer(_) ->
-            cx.fault(span, "'defer' schedules a statement, and scheduling a scheduling has " +
-                     "nothing to run: write the statement itself after this 'defer'")
-        VarDecl(_, _, _, _, _, _, _) -> cx.fault(span, deferred_declaration())
-        ValDecl(_, _, _, _, _, _) -> cx.fault(span, deferred_declaration())
-        MultiDecl(_, _, _) -> cx.fault(span, deferred_declaration())
-        ConstDecl(_, _, _, _) -> cx.fault(span, deferred_declaration())
-        _ -> ()
+            Some("'defer' schedules a statement, and scheduling a scheduling has " +
+                 "nothing to run: write the statement itself after this 'defer'")
+        VarDecl(_, _, _, _, _, _, _) -> Some(deferred_declaration())
+        ValDecl(_, _, _, _, _, _) -> Some(deferred_declaration())
+        MultiDecl(_, _, _) -> Some(deferred_declaration())
+        ConstDecl(_, _, _, _) -> Some(deferred_declaration())
+        _ -> None
+
+    refusal match
+        Some(why) ->
+            cx.fault(span, why)
+            return buf()
+        None -> ()
 
     var body: Buf[Stmt] = buf()
 
@@ -906,10 +919,11 @@ private defer_stmt(cx: &Analyzer, span: Span, inner: Stmt) -> Buf[TStmt]
     // A `?` leaves the function, which is the same exit a `return` would take and is refused for
     // the same reason. It is read out of the analyzed body rather than the written statement,
     // because `?` is an operator inside an expression at whatever depth the expression has.
-    if stmts_try(t) then
+    if stmts_try(t)
         cx.fault(span, "a deferred statement runs while its block is being left, so a '?' in it " +
                  "has nowhere to return to. Check the result and handle the failure in the " +
                  "deferred statement itself")
+        return buf()
 
     one(TDefer(t))
 end defer_stmt
