@@ -188,11 +188,11 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     else span_zero()
 
     val clang = find_clang(t, None) match
-        Err(why) -> return probe_fault(a, where, why)
+        Err(why) -> return probe_fault(a, unit, where,why)
         Ok(found) -> found
 
     val dir = make_temp_dir("sysl-cprobe") match
-        Err(_) -> return probe_fault(a, where, "cannot make a directory to write a C probe in")
+        Err(_) -> return probe_fault(a, unit, where,"cannot make a directory to write a C probe in")
         Ok(made) -> made
 
     val src = join_path(dir, "probe.c")
@@ -200,7 +200,7 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     write_text(src, probe_text(unit, consts, plan, types)) match
         Err(_) ->
             remove_dir_all(dir).unwrap_or(())
-            return probe_fault(a, where, s"cannot write $src")
+            return probe_fault(a, unit, where,s"cannot write $src")
         Ok(_) -> ()
 
     var args: Buf[string] = buf()
@@ -255,7 +255,7 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     val said = capture(clang, args.view(), "", [], true) match
         Err(_) ->
             remove_dir_all(dir).unwrap_or(())
-            return probe_fault(a, where, s"cannot run '$clang'")
+            return probe_fault(a, unit, where,s"cannot run '$clang'")
         Ok(got) -> got
 
     remove_dir_all(dir).unwrap_or(())
@@ -263,7 +263,7 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
     if !said.status.ok()
         val complaint = said.err.unwrap_or("")
 
-        return probe_fault(a, where, s"the C compiler refused this file's " +
+        return probe_fault(a, unit, where,s"the C compiler refused this file's " +
             s"${blocks_named(consts, types)}:\n${complaint.trim()}")
 
     val globals = read_globals(said.text)
@@ -272,7 +272,7 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
 
     for i in 0..<consts.len()
         marked(globals, ConstMarker, i) match
-            None -> return silent(a, consts.at(i).span, s"'${consts.at(i).c}'")
+            None -> return silent(a, unit,consts.at(i).span, s"'${consts.at(i).c}'")
             Some(g) -> values.push(g)
 
     var measured: Buf[CMeasured] = buf()
@@ -281,7 +281,7 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
         val kind = marked(globals, KindMarker, i)
         val size = marked(globals, SizeMarker, i)
 
-        if kind.is_none() || size.is_none() then return silent(a, types.at(i).span, s"'${types.at(i).c}'")
+        if kind.is_none() || size.is_none() then return silent(a, unit,types.at(i).span, s"'${types.at(i).c}'")
 
         measured.push(CMeasured(int(decimal_of(kind.unwrap().operand)),
                                 int(decimal_of(size.unwrap().operand))))
@@ -394,14 +394,17 @@ end manifest_above
 // than running for ever.
 const ClimbCap: usize = 64
 
-private probe_fault(a: &Analysis, where: Span, why: string) -> Option[(Buf[CGlobal], Buf[CMeasured], bool)]
-    a.fault(empty_scope(), where, why)
+// A refusal placed in the file whose blocks were being measured, so that the `-->` line names it.
+private probe_fault(a: &Analysis, unit: Program, where: Span,
+                    why: string) -> Option[(Buf[CGlobal], Buf[CMeasured], bool)]
+    a.fault(empty_scope() with { src = unit.src }, where, why)
     None
 
 // The C compiled and the probe emitted nothing for a line, which is sysl's bug and not the
 // programmer's -- so the message says so rather than sending them back to their own C.
-private silent(a: &Analysis, where: Span, what: string) -> Option[(Buf[CGlobal], Buf[CMeasured], bool)]
-    a.fault(empty_scope(), where, s"the C compiler accepted $what and then emitted nothing for it, " +
+private silent(a: &Analysis, unit: Program, where: Span,
+               what: string) -> Option[(Buf[CGlobal], Buf[CMeasured], bool)]
+    a.fault(empty_scope() with { src = unit.src }, where, s"the C compiler accepted $what and then emitted nothing for it, " +
         "so there is no answer to read — this is a bug in sysl's probe rather than in what was " +
         "written")
     None

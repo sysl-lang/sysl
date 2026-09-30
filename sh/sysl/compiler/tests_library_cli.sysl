@@ -1,0 +1,465 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// Which standard module a compilation is given -- the default path, `--std-lib` and `--no-std-lib`
+// -- and what `build-lib` makes of a library, driven through the same `run_cli` a shell reaches.
+//
+// Every expected message is quoted from the reference (0.0.152) on the same input, less the
+// `sysl: ` it puts in front of `error:`, which is how each binary introduces itself.
+//
+// **The default path is routed to a file of the test's own** (`set_std_search`), as the reference's
+// suite does: the real one is shared by every build on the machine, and an artifact left there by
+// one test would be found by all the others.
+
+private lcl_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end lcl_run
+
+private lcl_has(said: string, part: string) -> bool = said.index_of(part).is_some()
+
+// A program directory holding one `main.sysl`.
+private lcl_program(src: string) -> string
+    val root = make_temp_dir("sysl-lcl-").unwrap()
+
+    write_text(s"$root/main.sysl", src).unwrap()
+    root
+end lcl_program
+
+// A library root holding one module directory with one file in it.
+private lcl_library(name: string, src: string, file: string = "lib.sysl") -> string
+    val root = make_temp_dir("sysl-lcl-lib-").unwrap()
+
+    make_dir_all(s"$root/$name").unwrap()
+    write_text(s"$root/$name/$file", src).unwrap()
+    root
+end lcl_library
+
+// A file of the given text, standing where an artifact would.
+private lcl_file(text: string) -> string
+    val dir = make_temp_dir("sysl-lcl-file-").unwrap()
+
+    write_text(s"$dir/std.syslib", text).unwrap()
+    s"$dir/std.syslib"
+end lcl_file
+
+// Whether the library is here to compile against, which every whole-program test needs.
+private lcl_library_here() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end lcl_library_here
+
+// An artifact of the standard module this compiler reads: the one at the default path, built there
+// where it is not.
+private lcl_good_std() -> string = std_artifact(host_target()).unwrap().archive
+
+// One function's body in a module's text, from its `define` line to its closing brace.
+private lcl_body_of(text: string, name: string) -> string
+    var out = ""
+    var inside = false
+    val lines = lines_of(text)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !inside && line.starts_with("define ") && line.index_of(s"@$name(").is_some()
+            inside = true
+
+        if inside
+            out = out + line + "\n"
+
+            if line == "}" then return out
+
+    out
+end lcl_body_of
+
+private lcl_refused_std(what: string) -> string =
+    s"$what is not a sysl library: it is not an archive"
+
+// -- --std-lib ------------------------------------------------------------------------------------
+
+// Exiting 0 is a strong assertion: every std symbol the artifact defines is one this program only
+// declares, so it does not link unless the named artifact's object half reached the linker.
+@test("--std-lib runs a program whose share of the standard module came from the artifact")
+lcl_std_lib_runs_a_program()
+    if !lcl_library_here() then return
+
+    val root = lcl_program("print(21 * 2)\n")
+    val got = lcl_run(["sysl", "build", root, "--std-lib", lcl_good_std(), "-o", s"$root/out"])
+
+    assert_eq(got.0, 0, got.1)
+    assert(!lcl_has(got.1, "warning"), got.1)
+    assert_eq(capture(s"$root/out").unwrap().text, "42\n")
+    remove_dir_all(root).unwrap_or(())
+end lcl_std_lib_runs_a_program
+
+// `entries` is answered by a shim under `library/sysl/fs/__<os>__`, which travels inside the artifact
+// as an archive member rather than being compiled beside the program.
+@test("--std-lib links a program reaching the library's own C, which travels inside the artifact")
+lcl_std_lib_carries_the_librarys_c()
+    if !lcl_library_here() then return
+
+    val root = lcl_program("import sysl.fs.entries\n\nprint(entries(\"/tmp\").unwrap().len() >= 0)\n")
+    val got = lcl_run(["sysl", "build", root, "--std-lib", lcl_good_std(), "-o", s"$root/out"])
+
+    assert_eq(got.0, 0, got.1)
+    assert_eq(capture(s"$root/out").unwrap().text, "true\n")
+    remove_dir_all(root).unwrap_or(())
+end lcl_std_lib_carries_the_librarys_c
+
+@test("--std-lib builds a library against one too, which is the other thing that gets compiled")
+lcl_std_lib_builds_a_library()
+    if !lcl_library_here() then return
+
+    val root = lcl_library("demo", "module demo\n\ndouble(n: int) -> int = n * 2\n")
+    val got = lcl_run(["sysl", "build-lib", root, "--std-lib", lcl_good_std(), "-o", s"$root/demo.syslib"])
+
+    assert_eq(got.0, 0, got.1)
+    assert(!lcl_has(got.1, "warning"), got.1)
+    remove_dir_all(root).unwrap_or(())
+end lcl_std_lib_builds_a_library
+
+// Someone who wrote down which artifact to compile against is owed the truth about that one, rather
+// than a different one built underneath them.
+@test("--std-lib naming something unreadable is refused and not rebuilt, being the one asked for")
+lcl_std_lib_is_not_rebuilt()
+    if !lcl_library_here() then return
+
+    val bad = lcl_file("not a library\n")
+    val got = lcl_run(["sysl", "emit-llvm", lcl_program("print(1)\n"), "--std-lib", bad])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, s"error: ${lcl_refused_std(bad)}")
+end lcl_std_lib_is_not_rebuilt
+
+@test("--std-lib naming nothing at all is refused")
+lcl_std_lib_naming_nothing_is_refused()
+    if !lcl_library_here() then return
+
+    val gone = s"${make_temp_dir("sysl-lcl-gone-").unwrap()}/absent.syslib"
+    val got = lcl_run(["sysl", "emit-llvm", lcl_program("print(1)\n"), "--std-lib", gone])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, s"error: cannot read $gone: '$gone' does not exist")
+end lcl_std_lib_naming_nothing_is_refused
+
+// Both are unreadable, so both refuse -- what says which was read is how each is broken: the named
+// one is not ours at all, the one at the default path claims a later format.
+@test("--std-lib is the one consulted over the default path, being the one asked for")
+lcl_std_lib_is_consulted_over_the_default()
+    if !lcl_library_here() then return
+
+    val bad = lcl_file("not a library\n")
+
+    set_std_search(Some(lcl_file(s"syslib ${SyslibVersion + 1} 0\n")))
+
+    val got = lcl_run(["sysl", "emit-llvm", lcl_program("print(1)\n"), "--std-lib", bad])
+
+    set_std_search(None)
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, s"error: ${lcl_refused_std(bad)}")
+end lcl_std_lib_is_consulted_over_the_default
+
+// Two spellings a character apart, so a typo lands here; the path names nothing, which says the
+// refusal comes before the artifact is read.
+@test("--no-std-lib is refused beside --std-lib, which asks for the other one")
+lcl_no_std_lib_is_refused_beside_std_lib()
+    if !lcl_library_here() then return
+
+    val any = s"${make_temp_dir("sysl-lcl-both-").unwrap()}/any.syslib"
+    val got = lcl_run(["sysl", "emit-llvm", lcl_program("print(1)\n"), "--no-std-lib", "--std-lib", any])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, "error: --no-std-lib and --std-lib ask for different standard modules")
+end lcl_no_std_lib_is_refused_beside_std_lib
+
+// -- the default path -----------------------------------------------------------------------------
+
+@test("building the standard module with no -o and compiling with no --std-lib is the whole workflow")
+lcl_the_default_path_is_the_whole_workflow()
+    if !lcl_library_here() then return
+
+    val where = s"${make_temp_dir("sysl-lcl-found-").unwrap()}/std.syslib"
+
+    set_std_search(Some(where))
+
+    val made = lcl_run(["sysl", "build-lib", std_root().unwrap(), "--std"])
+    val root = lcl_program("print(21 * 2)\n")
+    val got = lcl_run(["sysl", "build", root, "-o", s"$root/out"])
+
+    set_std_search(None)
+    assert_eq(made.0, 0, made.1)
+    assert(metadata(where).is_ok(), s"'$where' was written")
+    assert_eq(got.0, 0, got.1)
+    assert(!lcl_has(got.1, "warning"), got.1)
+    assert_eq(capture(s"$root/out").unwrap().text, "42\n")
+end lcl_the_default_path_is_the_whole_workflow
+
+// The reference also announces the build on standard error ("building the standard module at ..."),
+// which this compiler writes straight to the stream rather than through the sink a test reads.
+@test("nothing at the default path is built rather than reported, a fresh clone having one answer")
+lcl_nothing_at_the_default_path_is_built()
+    if !lcl_library_here() then return
+
+    val where = s"${make_temp_dir("sysl-lcl-none-").unwrap()}/std.syslib"
+
+    set_std_search(Some(where))
+
+    val got = lcl_run(["sysl", "emit-llvm", lcl_program("print(1)\n")])
+
+    set_std_search(None)
+    assert_eq(got.0, 0, got.1)
+    assert(metadata(where).is_ok(), s"'$where' was built")
+end lcl_nothing_at_the_default_path_is_built
+
+// Replaced, not merely worked around: what is at the path afterwards is a standard module this
+// compiler will read.
+@test("something unreadable at the default path is replaced, the artifact being derived")
+lcl_something_unreadable_is_replaced()
+    if !lcl_library_here() then return
+
+    val where = lcl_file("not a library\n")
+
+    set_std_search(Some(where))
+
+    val got = lcl_run(["sysl", "emit-llvm", lcl_program("print(1)\n")])
+
+    set_std_search(None)
+    assert_eq(got.0, 0, got.1)
+
+    val meta = syslib_metadata_at(where).unwrap()
+
+    assert(syslib_read(where, meta, host_target()).is_ok(), s"'$where' is a library this compiler reads")
+end lcl_something_unreadable_is_replaced
+
+// The one a developer meets after a merge: an artifact whose container is a format ahead.
+@test("a stale artifact at the default path is replaced too, which is the state it is found in")
+lcl_a_stale_artifact_is_replaced()
+    if !lcl_library_here() then return
+
+    set_std_search(Some(lcl_file(s"syslib ${SyslibVersion + 1} 0\n")))
+
+    val got = lcl_run(["sysl", "emit-llvm", lcl_program("print(1)\n")])
+
+    set_std_search(None)
+    assert_eq(got.0, 0, got.1)
+end lcl_a_stale_artifact_is_replaced
+
+// A rebuild that produced an artifact and then compiled against the copy the compiler carries would
+// pass every assertion above; the library's symbols tell the two apart, being declarations when
+// linked.
+@test("the program is compiled against the rebuilt artifact, not against the carried copy")
+lcl_the_program_is_compiled_against_the_rebuilt_one()
+    if !lcl_library_here() then return
+
+    val root = lcl_program("print(1)\n")
+
+    set_std_search(Some(s"${make_temp_dir("sysl-lcl-rebuilt-").unwrap()}/std.syslib"))
+
+    val rebuilt = lcl_run(["sysl", "emit-llvm", root])
+    val carried = lcl_run(["sysl", "emit-llvm", "--no-std-lib", root])
+
+    set_std_search(None)
+    assert_eq(rebuilt.0, 0, rebuilt.1)
+    assert(lcl_has(rebuilt.1, "declare void @sysl$printi(i64)"), "declared against the artifact")
+    assert(!lcl_has(rebuilt.1, "define void @sysl$printi("), "and not defined a second time")
+    assert(lcl_has(carried.1, "define void @sysl$printi(i64 %n.param) {"), "defined from source")
+end lcl_the_program_is_compiled_against_the_rebuilt_one
+
+@test("the default path both ends agree on is an artifact")
+lcl_the_default_path_is_the_documented_one()
+    assert(std_artifact_path(host_target(), "0123456789abcdef").ends_with(SyslibExtension),
+           "the default names an artifact")
+
+@test("the default path sits under the cache directory rather than in the project")
+lcl_the_default_path_is_under_the_cache()
+    val dir = cache_directory() match
+        None ->
+            print("skipped: this machine has no cache directory")
+            return
+        Some(found) -> found
+
+    val here = std_artifact_path(host_target(), "0123456789abcdef")
+
+    assert(here.starts_with(s"$dir/sysl/"), here)
+    // A compilation must not write into whatever directory it was run in.
+    assert(!here.starts_with(std_artifact_local()), here)
+end lcl_the_default_path_is_under_the_cache
+
+// -- --no-std-lib ---------------------------------------------------------------------------------
+
+// This exact artifact at this exact path is replaced without the flag (above), so succeeding here
+// without writing is the artifact going unread.
+@test("--no-std-lib does not read the artifact at the default path, even a broken one")
+lcl_no_std_lib_reads_no_artifact()
+    if !lcl_library_here() then return
+
+    set_std_search(Some(lcl_file("not a library\n")))
+
+    val got = lcl_run(["sysl", "emit-llvm", "--no-std-lib", lcl_program("print(1)\n")])
+
+    set_std_search(None)
+    assert_eq(got.0, 0, got.1)
+    assert(!lcl_has(got.1, "error"), got.1)
+end lcl_no_std_lib_reads_no_artifact
+
+@test("--no-std-lib compiles a tree with no artifact without making one, which the default would")
+lcl_no_std_lib_makes_no_artifact()
+    if !lcl_library_here() then return
+
+    val nowhere = s"${make_temp_dir("sysl-lcl-bare-").unwrap()}/std.syslib"
+
+    set_std_search(Some(nowhere))
+
+    val got = lcl_run(["sysl", "emit-llvm", "--no-std-lib", lcl_program("print(1)\n")])
+
+    set_std_search(None)
+    assert_eq(got.0, 0, got.1)
+    assert(metadata(nowhere).is_err(), s"'$nowhere' was written")
+end lcl_no_std_lib_makes_no_artifact
+
+// What may differ is the standard module's own symbols -- declared when linked, defined when
+// carried -- so what must agree is the code the program lowers to.
+@test("--no-std-lib and the artifact lower one program to the same program")
+lcl_one_program_lowers_the_same_both_ways()
+    if !lcl_library_here() then return
+
+    val root = lcl_program("f(n: int) -> int = n * 2\nprint(f(21))\n")
+    val linked = lcl_run(["sysl", "emit-llvm", root])
+    val carried = lcl_run(["sysl", "emit-llvm", "--no-std-lib", root])
+
+    assert_eq(linked.0, 0, linked.1)
+    assert_eq(carried.0, 0, carried.1)
+
+    val names = ["f", "main"]
+
+    for i in 0..<names.len
+        assert(lcl_body_of(linked.1, names[i]) != "", s"'${names[i]}' is defined")
+        assert_eq(lcl_body_of(linked.1, names[i]), lcl_body_of(carried.1, names[i]), names[i])
+end lcl_one_program_lowers_the_same_both_ways
+
+// -- build-lib --------------------------------------------------------------------------------------
+
+// The column counts the four spaces that made the line program text, while the quoted line is the
+// tangled one. The `-->` column here is the tangled text's (23): `Diagnostic.render` is the parsing
+// package's and takes no column offset, and `Parsed.col_shift` reaches only `Parsed.at`.
+@test("a literate library's diagnostic names the line and column of the document", ignore:"an analysis diagnostic in a .lsysl file names the tangled column; the fix is a column offset in sh.sysl.parsing's Diagnostic.render, released first")
+lcl_a_literate_librarys_diagnostic_names_the_document()
+    val root = lcl_library("demo", "A generic, whose body is checked where it is written\n\n    module demo\n\n" +
+        "    twice[T](x: T) -> T = x + x\n", "lib.lsysl")
+    val got = lcl_run(["sysl", "build-lib", root, "-o", s"$root/demo.syslib"])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, "error: '+' needs 'T: sysl.Add'\n" +
+                     s" --> ${absolute_path(root)}/demo/lib.lsysl:5:27\n" +
+                     "  |\n" +
+                     "5 | twice[T](x: T) -> T = x + x\n" +
+                     "  |                       ^^^^^")
+    remove_dir_all(root).unwrap_or(())
+end lcl_a_literate_librarys_diagnostic_names_the_document
+
+// Every diagnostic, placed, as a program's build reports them -- not the first of them wrapped in a
+// sentence about the library.
+@test("a library that does not analyze is reported diagnostic by diagnostic, as a program is")
+lcl_a_library_that_does_not_analyze_is_reported()
+    val root = lcl_library("demo", "module demo\n\ntwice[T](x: T) -> T = x + x\n\nsquare[T](x: T) -> T = x * x\n")
+    val got = lcl_run(["sysl", "build-lib", root, "-o", s"$root/demo.syslib"])
+    val file = s"${absolute_path(root)}/demo/lib.sysl"
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, "error: '+' needs 'T: sysl.Add'\n" +
+                     s" --> $file:3:23\n" +
+                     "  |\n" +
+                     "3 | twice[T](x: T) -> T = x + x\n" +
+                     "  |                       ^^^^^\n" +
+                     "\n" +
+                     "error: '*' needs 'T: sysl.Mul'\n" +
+                     s" --> $file:5:24\n" +
+                     "  |\n" +
+                     "5 | square[T](x: T) -> T = x * x\n" +
+                     "  |                        ^^^^^")
+    remove_dir_all(root).unwrap_or(())
+end lcl_a_library_that_does_not_analyze_is_reported
+
+private lcl_widen() -> string ="module demo\n\ntrait Widen\n    base(self) -> int\n\n" +
+    "    scaled(self) -> int = tripled(self.base())\n\nimpl Widen for int\n    base(self) -> int = self\n\n" +
+    "tripled(n: int) -> int = n * 3\n"
+
+// The symbols an artifact advertises, read back out of it.
+private lcl_advertised(path: string) -> string
+    val meta = syslib_metadata_at(path).unwrap()
+
+    join(syslib_read(path, meta, host_target()).unwrap().0.view(), " ")
+end lcl_advertised
+
+@test("the same library built twice from disk agrees with itself")
+lcl_the_same_library_built_twice_agrees()
+    if !lcl_library_here() then return
+
+    val root = lcl_library("demo", lcl_widen())
+    val first = lcl_run(["sysl", "build-lib", root, "-o", s"$root/one.syslib"])
+    val second = lcl_run(["sysl", "build-lib", root, "-o", s"$root/two.syslib"])
+
+    assert_eq(first.0, 0, first.1)
+    assert_eq(second.0, 0, second.1)
+    assert(lcl_advertised(s"$root/one.syslib") != "", "the library advertises something")
+    assert_eq(lcl_advertised(s"$root/two.syslib"), lcl_advertised(s"$root/one.syslib"))
+    remove_dir_all(root).unwrap_or(())
+end lcl_the_same_library_built_twice_agrees
+
+private lcl_gated() -> string = "module demo\n@requires(posix)\n@include(\"regex.h\")\n\nc const\n" +
+    "    REGEX_SIZE: usize = \"sizeof(regex_t)\"\n\nsize() -> usize = REGEX_SIZE\n"
+
+@test("a library holding a probe builds for a machine with no such header, the module having said so")
+lcl_a_gated_probe_builds_for_a_bare_machine()
+    if !lcl_library_here() then return
+
+    val root = lcl_library("demo", lcl_gated())
+    val got = lcl_run(["sysl", "build-lib", root, "-o", s"$root/demo.syslib", "--target", "thumbv7em-freestanding"])
+
+    assert_eq(got.0, 0, got.1)
+    remove_dir_all(root).unwrap_or(())
+end lcl_a_gated_probe_builds_for_a_bare_machine
+
+@test("and the probe is measured for a machine that does have the header")
+lcl_a_gated_probe_is_measured_on_the_host()
+    if !lcl_library_here() then return
+
+    val root = lcl_library("demo", lcl_gated())
+    val got = lcl_run(["sysl", "build-lib", root, "-o", s"$root/demo.syslib"])
+
+    assert_eq(got.0, 0, got.1)
+    remove_dir_all(root).unwrap_or(())
+end lcl_a_gated_probe_is_measured_on_the_host
+
+// The message carries the C compiler's own words about a temporary file, so the header's name and
+// the declaration's place are what is asserted.
+@test("while a probe in a module that declares nothing is still refused on a bare machine")
+lcl_an_ungated_probe_is_refused_on_a_bare_machine()
+    if !lcl_library_here() then return
+
+    val root = lcl_library("demo", "module demo\n@include(\"regex.h\")\n\nc const\n" +
+        "    REGEX_SIZE: usize = \"sizeof(regex_t)\"\n")
+    val got = lcl_run(["sysl", "build-lib", root, "-o", s"$root/demo.syslib", "--target", "thumbv7em-freestanding"])
+
+    assert_eq(got.0, Failed)
+    assert(got.1.starts_with("error: the C compiler refused this file's 'c const' block:\n"), got.1)
+    assert(lcl_has(got.1, "fatal error: 'regex.h' file not found"), got.1)
+    assert(got.1.ends_with(s" --> ${absolute_path(root)}/demo/lib.sysl:5:5\n" +
+                           "  |\n" +
+                           "5 |     REGEX_SIZE: usize = \"sizeof(regex_t)\"\n" +
+                           "  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"), got.1)
+    remove_dir_all(root).unwrap_or(())
+end lcl_an_ungated_probe_is_refused_on_a_bare_machine
