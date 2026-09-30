@@ -31,6 +31,48 @@ analyze_decls_of(unit: Program, t: Target) -> Result[&Tables, Buf[Placed]]
     analyze_decls(units, t)
 end analyze_decls_of
 
+// A program's file may not declare a module the library carries.
+//
+// **A module's declarations are one set however many files they came from**, so a program with a
+// `sysl` directory of its own would not be writing a module beside the standard one -- it would be
+// adding to it, sharing its keys and shadowing whatever name it happened to reuse. Nothing in the
+// file tells that from a mistake, and the mistake is the likelier reading.
+//
+// A compilation that **produces** the library is the one reading under which such a file is the
+// library rather than an addition to it, and that is said by the build, never inferred.
+private refuse_library_modules(a: &Analysis, units: Buf[Program])
+    var carried: Buf[string] = buf()
+
+    for i in 0..<units.len()
+        val u = units.at(i)
+
+        if library_file(a, u) then carried.push(module_of_unit(u))
+
+    if carried.is_empty() then return
+
+    for i in 0..<units.len()
+        val u = units.at(i)
+        val name = module_of_unit(u)
+
+        if u.src.name.starts_with(s"$StdPrefix/") || !holds_string(carried, name) then continue
+
+        // No import is read here: the refusal is about the header, and the modules a path could
+        // lead to are not registered yet.
+        val scope = Scope(name, no_imports(), u.src, u.pkg)
+
+        val at = u.module_name match
+            Some(m) -> m.span
+            None -> if u.body.is_empty() then span_zero() else u.body.at(0).span
+
+        a.fault(scope, at, s"'$name' is the module every program is compiled against, so " +
+                s"${u.src.name} cannot declare it — its declarations would join the library's " +
+                "rather than sit beside them")
+end refuse_library_modules
+
+// Whether a file is one the standard module supplied, asked before any scope exists.
+private library_file(a: &Analysis, u: Program) -> bool =
+    u.src.name.starts_with(s"$StdPrefix/") && !holds_string(a.producing, u.src.name)
+
 // The pass itself, on an analysis a caller may go on reading afterwards.
 read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) -> Buf[Program]
     // **A `c const` and a `c type` are measured before anything is registered**, so that everything
@@ -38,6 +80,8 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
     // of an integer. It is first because a `c const` is what the declarations around it are written
     // in terms of -- an array's bound, a field's width -- and a compilation with no block anywhere
     // never looks for a clang.
+    refuse_library_modules(a, written)
+
     val measured = c_probe_lower(a, written, a.tables.target)
 
     // **A `derives` clause becomes the `impl` block a reader could have written**, before anything
