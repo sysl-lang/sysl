@@ -321,46 +321,55 @@ a_raw_literal_ends_at_its_first_quote()
 
 // -- interpolation --------------------------------------------------------------------------------
 
-interp(parts: []const string, exprs: []const string, specs: []const string) -> Tok =
-    StrInterp(of_text(parts), of_text(exprs), of_text(specs))
+// An interpolated literal as the lexer hands it over; `starts` is where each hole's source begins,
+// in bytes from the head of the text.
+interp(parts: []const string, exprs: []const string, specs: []const string,
+        starts: []const usize) -> Tok
+    var at: Buf[usize] = buf()
+
+    for s in starts
+        at.push(s)
+
+    StrInterp(of_text(parts), of_text(exprs), of_text(specs), at)
+end interp
 
 @test("a hole separates the surrounding literals")
 a_hole_separates_the_literals()
-    assert_eq(bare("s\"a${x}b\""), of([interp(["a", "b"], ["x"], [""])]))
+    assert_eq(bare("s\"a${x}b\""), of([interp(["a", "b"], ["x"], [""], [5])]))
 
 @test("a bare $name is a hole whose source is the name")
 a_bare_hole()
-    assert_eq(bare("s\"hi $who\""), of([interp(["hi ", ""], ["who"], [""])]))
+    assert_eq(bare("s\"hi $who\""), of([interp(["hi ", ""], ["who"], [""], [6])]))
 
 @test("the parts still decode escapes")
 the_parts_decode_escapes()
-    assert_eq(bare("s\"a\\tb\""), of([interp(["a\tb"], [], [])]))
+    assert_eq(bare("s\"a\\tb\""), of([interp(["a\tb"], [], [], [])]))
 
 @test("a hole's source keeps a nested string and brace verbatim for re-lexing")
 a_hole_keeps_its_source()
     assert_eq(bare("s\"${ f(\"}\") + {1} }\""),
-              of([interp(["", ""], [" f(\"}\") + {1} "], [""])]))
+              of([interp(["", ""], [" f(\"}\") + {1} "], [""], [4])]))
 
 @test("a doubled sigil is one literal dollar, not a hole")
 a_doubled_sigil()
-    assert_eq(bare("s\"$$\""), of([interp(["$"], [], [])]))
+    assert_eq(bare("s\"$$\""), of([interp(["$"], [], [], [])]))
 
 @test("an f-string captures a printf specifier after a hole")
 an_f_string_captures_a_specifier()
-    assert_eq(bare("f\"n=${x}%04d!\""), of([interp(["n=", "!"], ["x"], ["%04d"])]))
+    assert_eq(bare("f\"n=${x}%04d!\""), of([interp(["n=", "!"], ["x"], ["%04d"], [6])]))
 
 @test("a specifier binds only after a hole; a stray percent is text")
 a_stray_percent_is_text()
     assert_eq(bare("f\"$x%.2f done 100%\""),
-              of([interp(["", " done 100%"], ["x"], ["%.2f"])]))
+              of([interp(["", " done 100%"], ["x"], ["%.2f"], [3])]))
 
 @test("a hole with no specifier in an f-string carries none")
 a_hole_with_no_specifier()
-    assert_eq(bare("f\"$x and ${y}\""), of([interp(["", " and ", ""], ["x", "y"], ["", ""])]))
+    assert_eq(bare("f\"$x and ${y}\""), of([interp(["", " and ", ""], ["x", "y"], ["", ""], [3, 11])]))
 
 @test("s never captures a specifier, so the percent is text")
 s_captures_no_specifier()
-    assert_eq(bare("s\"$x%d\""), of([interp(["", "%d"], ["x"], [""])]))
+    assert_eq(bare("s\"$x%d\""), of([interp(["", "%d"], ["x"], [""], [3])]))
 
 @test("a hole that runs off its line is refused")
 a_hole_running_off_its_line()
@@ -395,7 +404,7 @@ a_block_is_an_ordinary_string()
 
 @test("the interpolation prefixes compose with the block form")
 the_prefixes_compose()
-    assert_eq(bare(s"s${Q}\n    n is $$n\n    ${Q}"), of([interp(["n is ", "\n"], ["n"], [""])]))
+    assert_eq(bare(s"s${Q}\n    n is $$n\n    ${Q}"), of([interp(["n is ", "\n"], ["n"], [""], [15])]))
 
 @test("a raw block leaves a backslash alone")
 a_raw_block_keeps_its_backslash()
@@ -458,7 +467,7 @@ a_c_string_block()
 
 @test("an f-string block keeps its specifiers")
 an_f_string_block()
-    assert_eq(bare(s"f${Q}\n    [$${n}%03d]\n    ${Q}"), of([interp(["[", "]\n"], ["n"], ["%03d"])]))
+    assert_eq(bare(s"f${Q}\n    [$${n}%03d]\n    ${Q}"), of([interp(["[", "]\n"], ["n"], ["%03d"], [12])]))
 
 @test("a carriage return does not reach the value")
 a_carriage_return_in_a_block()

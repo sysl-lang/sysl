@@ -279,7 +279,7 @@ private nud(t: Spanned[Tok], p: *Parser) -> Expr
         CharLit(c) -> expr(at, CharLit(c))
         StrLit(v) -> expr(at, StrLit(v))
         CStrLit(v) -> expr(at, CStrLit(v))
-        StrInterp(parts, exprs, specs) -> desugar_interp(p, at, parts, exprs, specs)
+        StrInterp(parts, exprs, specs, starts) -> desugar_interp(p, at, parts, exprs, specs, starts)
         Ident(n) -> if n == "_" then expr(at, Ident(fresh_placeholder(p))) else expr(at, Ident(n))
         QuotedIdent(n) -> expr(at, Ident(n))
         Label(n) ->
@@ -914,15 +914,19 @@ can_begin_pattern(t: Tok) -> bool = t match
 //
 // **The holes are lexed and parsed here**, the lexer having kept each one as the source between its
 // braces: what a hole says is the grammar's business and not that pass's.
+//
+// **What a hole holds is positioned where it was written, and everything built around it is
+// positioned at the literal**: the `str` call, the `+` and the pieces of text are nothing a reader
+// wrote, so a complaint about one of them has only the literal to point at.
 private desugar_interp(p: *Parser, at: Span, parts: Buf[string], exprs: Buf[string],
-        specs: Buf[string]) -> Expr
+        specs: Buf[string], starts: Buf[usize]) -> Expr
     var terms: Buf[Expr] = buf()
 
     if parts.len() > 0 && parts.at(0) != "" then terms.push(expr(at, StrLit(parts.at(0))))
 
     for i in 0..<exprs.len()
         val hole = exprs.at(i)
-        val inner = parse_embedded(p, at, hole)
+        val inner = parse_embedded(p, at, hole, starts.at(i))
         val spec = specs.at(i)
         var args: Buf[Expr] = buf()
 
@@ -952,8 +956,11 @@ end desugar_interp
 //
 // **A malformed hole is fatal rather than a cue to try something else**, which is what keeps the
 // real message instead of a generic one from whatever the enclosing rule would have tried next.
-private parse_embedded(p: *Parser, at: Span, src: string) -> Expr
-    val inner = parse_expr_text(s"${p.src.name} (interpolation)", src)
+//
+// **It is read out of the file, from where it starts**, so every node of it carries the position
+// the reader sees it at. A malformed one is still reported at the literal, in the hole's own words.
+private parse_embedded(p: *Parser, at: Span, src: string, start: usize) -> Expr
+    val inner = parse_expr_within(p.src, start, start + src.bytes.len)
 
     // An interpolation hole is a boundary too, so a placeholder cannot reach out of a string to
     // close over the whole of one.

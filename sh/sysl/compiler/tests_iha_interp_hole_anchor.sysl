@@ -1,0 +1,201 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// What an interpolation hole holds is code the reader wrote at a line and a column of their file,
+// and a complaint about it is placed there.
+//
+// **A hole is read out of the file, where it stands**, so a name inside one is positioned like a
+// name anywhere else. What is built *around* a hole -- the `str` or `format` call, the `+`, the
+// pieces of text -- is nothing a reader wrote and stays at the literal, which is where a hole that
+// does not parse, and a specifier its value cannot take, are reported.
+//
+// **Every message and position here was read out of the reference compiler** (0.0.152) on the same
+// input. A caret's width is not asserted.
+
+// Every diagnostic a file earns, each as `line:col: message`, one to a line: the parser's where it
+// did not parse, the body pass's where it did.
+private iha_said(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+    var out = ""
+
+    if !parsed.ok()
+        for i in 0..<parsed.report.len()
+            val d = parsed.report.at(i)
+            val at = parsed.src.locate(d.span.start)
+
+            if i > 0 then out = out + "\n"
+
+            out = out + s"${at.line}:${at.col}: ${d.message}"
+
+        return out
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    for i in 0..<done.reported.len()
+        val p = done.reported.at(i)
+        val at = p.src.locate(p.diag.span.start)
+
+        if i > 0 then out = out + "\n"
+
+        out = out + s"${at.line}:${at.col}: ${p.diag.message}"
+
+    out
+end iha_said
+
+private iha_q() -> string = "\"\"\""
+
+@test("a name in a bare hole is reported at the name")
+iha_bare_name() =
+    assert_eq(iha_said("use() -> string = s\"value: $x\"\n"), "1:29: undefined name 'x'")
+
+@test("and so is one in a braced hole")
+iha_braced_name() =
+    assert_eq(iha_said("use() -> string = s\"value: ${x}\"\n"), "1:30: undefined name 'x'")
+
+@test("the second operand of a hole's expression is reported where it is written")
+iha_second_operand() =
+    assert_eq(iha_said("use(x: int) -> string = s\"value: ${x + y}\"\n"),
+              "1:40: undefined name 'y'")
+
+@test("a call in a hole to a function nothing declares is reported at the call")
+iha_undefined_function() =
+    assert_eq(iha_said("use() -> string = s\"value: ${f(1)}\"\n"), "1:30: undefined function 'f'")
+
+@test("a field a hole selects that the struct does not have is reported at the selection")
+iha_missing_field() =
+    assert_eq(iha_said("struct P\n    a: int\n\nuse(p: P) -> string = s\"value: ${p.b}\"\n"),
+              "4:36: 'P' has no field or property 'b'")
+
+@test("a method a hole calls that the type does not have is reported at the method")
+iha_missing_method() =
+    assert_eq(iha_said("use(a: int) -> string = s\"v ${a.nope()} w\"\n"),
+              "1:33: type 'int' has no method 'nope'")
+
+@test("operands that do not agree inside a hole are reported inside the hole")
+iha_type_error() =
+    assert_eq(iha_said("use() -> string = s\"value: ${1 + \"a\"}\"\n"),
+              "1:34: '+' needs matching types, got int and string")
+
+@test("a branch of an 'if' written in a hole is reported at the branch")
+iha_if_branch() =
+    assert_eq(iha_said("use(a: int) -> string = s\"v ${if a > 0 then nope else a} w\"\n"),
+              "1:45: undefined name 'nope'")
+
+@test("blanks inside the braces are counted")
+iha_blanks_inside_the_braces() =
+    assert_eq(iha_said("use(a: int) -> string = s\"v ${  a + q  } w\"\n"),
+              "1:37: undefined name 'q'")
+
+@test("the second hole of a literal is reported at the second hole")
+iha_second_hole() =
+    assert_eq(iha_said("use(a: int) -> string = s\"one $a two ${zz} three\"\n"),
+              "1:40: undefined name 'zz'")
+
+@test("and so is one written directly against the first")
+iha_adjacent_holes() =
+    assert_eq(iha_said("use(a: int) -> string = s\"v ${a}${b} w\"\n"), "1:35: undefined name 'b'")
+
+@test("a hole on a later line of a text block is reported on that line")
+iha_block_second_line()
+    val text = "use(a: int) -> string\n    val t = s" + iha_q() +
+               "\n        one $a\n        two $x three\n        " + iha_q() + "\n    t\n"
+
+    assert_eq(iha_said(text), "4:14: undefined name 'x'")
+end iha_block_second_line
+
+@test("a formatted hole of a text block, indented past the block's margin")
+iha_format_block()
+    val text = "use(a: int) -> string\n    val t = f" + iha_q() +
+               "\n        one $a\n          two ${a}%03d ${a * k}%5d\n        " + iha_q() + "\n    t\n"
+
+    assert_eq(iha_said(text), "4:30: undefined name 'k'")
+end iha_format_block
+
+@test("a hole inside a literal inside a hole is reported at the inner hole")
+iha_hole_in_a_hole() =
+    assert_eq(iha_said("g(s: string) -> string = s\n\nuse() -> string = s\"v ${g(s\"$x\")} w\"\n"),
+              "3:30: undefined name 'x'")
+
+@test("a hole carrying a specifier is positioned like any other")
+iha_format_hole() =
+    assert_eq(iha_said("use(a: int) -> string = f\"v ${a}%03d and ${ y }%5s w\"\n"),
+              "1:45: undefined name 'y'")
+
+@test("the column counts characters, so an escape and a letter of two bytes before a hole move nothing")
+iha_characters_before_a_hole() =
+    assert_eq(iha_said("use(a: int) -> string = s\"caf\\u{e9} é\\t${a} $w\"\n"),
+              "1:46: undefined name 'w'")
+
+@test("a specifier the value cannot take is reported at the literal, the call being nothing a reader wrote")
+iha_specifier_at_the_literal() =
+    assert_eq(iha_said("use(a: int) -> string = f\"v ${a}%s w\"\n"),
+              "1:25: format '%s' expects a string, but the value has type int")
+
+@test("a hole that is not an expression is reported at the literal, in the hole's own words")
+iha_malformed_hole()
+    assert_eq(iha_said("use(a: int) -> string = s\"v ${a +} w\"\n"),
+              "1:25: in interpolation 'a +': expression expected")
+    assert_eq(iha_said("use(a: int) -> string = s\"v ${a a} w\"\n"),
+              "1:25: in interpolation 'a a': newline expected")
+end iha_malformed_hole
+
+// -- the reference's own cases, `DiagnosticPositionTests` and `AstPrinterTests` ---------------------
+
+@test("a braced hole, after another one on the same line")
+iha_ref_braced_after_another() =
+    assert_eq(iha_said("val a = 1\nprint(s\"x ${a} y ${nope} z\")"), "2:20: undefined name 'nope'")
+
+@test("a bare '$name' hole")
+iha_ref_bare_hole() = assert_eq(iha_said("print(s\"x $nope\")"), "1:12: undefined name 'nope'")
+
+@test("a hole inside a hole")
+iha_ref_hole_inside_a_hole() =
+    assert_eq(iha_said("print(s\"a ${s\"b ${nope}\"}\")"), "1:19: undefined name 'nope'")
+
+@test("a hole in a text block, on the block's own line and column")
+iha_ref_text_block()
+    val text = "print(s" + iha_q() + "\n    x ${nope}\n    " + iha_q() + ")\n"
+
+    assert_eq(iha_said(text), "2:9: undefined name 'nope'")
+end iha_ref_text_block
+
+@test("and the nodes inside a hole are where the hole was written")
+iha_ref_nodes_inside_a_hole()
+    val parsed = parse(source_of("test.sysl", "val n = 1\nval s = s\"a${n}b${n + 1}c\"\n"))
+
+    assert(parsed.ok(), "the file parses")
+
+    val printed = emit_ast(parsed.program, true)
+
+    assert(printed.contains("Ident 2:14-2:15"), printed)
+    assert(printed.contains("Binary 2:19-2:24"), printed)
+    assert(!printed.contains("Ident 1:1-1:2"), printed)
+end iha_ref_nodes_inside_a_hole
+
+@test("a hole's nodes carry their own extent, and what is built around them the literal's")
+iha_spans_in_the_tree()
+    val r = parse_expr_text("test.sysl", "s\"ab ${left + right} $tail\"")
+
+    assert(r.ok(), "the literal parses")
+
+    // `("ab " + str(left + right)) + " "` and then `+ str(tail)`: the outermost node is the last `+`.
+    *r.value.kind match
+        Binary(_, _, last) ->
+            assert_eq(r.value.span, Span(0, 27))
+            assert_eq(last.span, Span(0, 27))
+
+            *last.kind match
+                Call(callee, args) ->
+                    assert_eq(callee.span, Span(0, 27))
+                    assert_eq(args.at(0).span, Span(22, 26))
+                _ -> assert(false, "the last term is a call")
+        _ -> assert(false, "the literal is a concatenation")
+end iha_spans_in_the_tree
