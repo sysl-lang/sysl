@@ -1,0 +1,470 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **The module graph is acyclic**, and what the rule is about is the REFERENCE graph: a qualified
+// path reaches another module with no import at all, so an edge is whatever resolution found, and an
+// import adds one of its own. The cases are therefore mostly about *how* a dependency was written --
+// a call, a type, a bound, an instantiation, an import that bought a name and never spent it -- since
+// each of those is a way to make an edge that a scan of the headers would not see.
+//
+// Every case is a whole program spread over several modules, a module being a directory, and is
+// either refused or built and run.
+//
+// **Every refusal and every position quoted here was obtained by running the reference compiler
+// (0.0.152) on the same tree.**
+
+private mgr_cycle() -> string = "modules may not depend on each other, directly or through a chain"
+
+// A program's files: the module each belongs to, its name, and its text.
+private mgr_of(main: string) -> Buf[(string, string, string)]
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("", "main.sysl", main))
+    fs
+end mgr_of
+
+private mgr_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end mgr_skip
+
+// What a program of these files prints, or what the build had to say about it.
+private mgr_out(files: Buf[(string, string, string)]) -> string
+    val root = make_temp_dir("sysl-module-graph").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for i in 0..<files.len()
+        val f = files.at(i)
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end mgr_out
+
+private mgr_says(said: string, part: string) = assert(said.contains(part), said)
+
+// Two modules that call into each other, which is the plainest cycle there is.
+private mgr_each_calls() -> Buf[(string, string, string)]
+    var fs = mgr_of("print(a.f())")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int = b.g()\nh() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\ng() -> int = a.h()"))
+    fs
+end mgr_each_calls
+
+// A module that imports another wholesale and spends nothing it bought, reached back by a path.
+private mgr_import_unused() -> Buf[(string, string, string)]
+    var fs = mgr_of("print(b.g())")
+
+    fs.push(("a", "a.sysl", "module a\nimport b.*\nf() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\ng() -> int = a.f()"))
+    fs
+end mgr_import_unused
+
+// A cycle between `b` and `c` that the walk arrives at from `a`, which is not on it.
+private mgr_reached_from_outside() -> Buf[(string, string, string)]
+    var fs = mgr_of("print(a.f())")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int = b.g()"))
+    fs.push(("b", "b.sysl", "module b\ng() -> int = c.k()\nm() -> int = 1"))
+    fs.push(("c", "c.sysl", "module c\nk() -> int = b.m()"))
+    fs
+end mgr_reached_from_outside
+
+// -- two modules may not depend on each other ---------------------------------------------------------
+
+@test("two modules may not depend on each other when each calls into the other")
+mgr_each_calls_into_the_other()
+    if mgr_skip() then return
+
+    mgr_says(mgr_out(mgr_each_calls()), s"'a' depends on 'b', which depends on 'a' — ${mgr_cycle()}")
+
+// The reference that begins the chain is the one to point at: from there a reader can follow the rest
+// of the message through the modules it names. It lands on the *member* being reached across the
+// boundary -- `b.g()`'s `g`.
+@test("and the diagnostic points at the reference that begins the chain")
+mgr_points_at_the_reference_that_begins_the_chain()
+    if mgr_skip() then return
+
+    mgr_says(mgr_out(mgr_each_calls()), "a/a.sysl:2:16")
+
+@test("when one names the other's type")
+mgr_one_names_the_others_type()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(1)")
+
+    fs.push(("a", "a.sysl", "module a\nstruct P\n    n: int\nuse(q: b.Q) -> int = q.p.n"))
+    fs.push(("b", "b.sysl", "module b\nstruct Q\n    p: a.P"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, s"'a' depends on 'b', which depends on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:4:8")
+
+@test("when one names the other's trait as a bound")
+mgr_one_names_the_others_trait_as_a_bound()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(1)")
+
+    fs.push(("a", "a.sysl", "module a\ntrait Marker\n    tag(self) -> int\nuse() -> int = b.n()"))
+    fs.push(("b", "b.sysl", "module b\nf[T: a.Marker](x: T) -> int = x.tag()\nn() -> int = 7"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, s"'a' depends on 'b', which depends on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:4:18")
+
+// An instantiation is resolved long after the declaration that asked for it, which is why the check
+// waits for the end of the walk.
+@test("when the only reference back is a generic instantiated in a body")
+mgr_the_only_reference_back_is_an_instantiation()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(1)")
+
+    fs.push(("a", "a.sysl", "module a\nstruct Box[T]\n    v: T\nuse() -> int = b.n()"))
+    fs.push(("b", "b.sysl", "module b\nn() -> int =\n    var x: a.Box[int] = a.Box(7)\n    x.v"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, s"'a' depends on 'b', which depends on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:4:18")
+
+// `a` declares no `h`, so the reference reports that import as well; the cycle is what is asserted.
+@test("when each imports the other")
+mgr_each_imports_the_other()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(a.f())")
+
+    fs.push(("a", "a.sysl", "module a\nimport b.{g}\nf() -> int = g()"))
+    fs.push(("b", "b.sysl", "module b\nimport a.{h}\ng() -> int = h()\nh() -> int = 1"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, s"'a' depends on 'b', which depends on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:2:11")
+
+// An import is a dependency whether or not the shorter spelling it bought is ever written: a file's
+// imports are meant to be readable as what it needs.
+@test("even where the import is never used")
+mgr_even_where_the_import_is_never_used()
+    if mgr_skip() then return
+
+    mgr_says(mgr_out(mgr_import_unused()), s"'a' depends on 'b', which depends on 'a' — ${mgr_cycle()}")
+
+@test("and a wildcard and a qualified path are one edge each")
+mgr_a_wildcard_and_a_path_are_one_edge_each()
+    if mgr_skip() then return
+
+    mgr_says(mgr_out(mgr_import_unused()), "a/a.sysl:2:1\n")
+
+// -- a chain of any length closes the same way --------------------------------------------------------
+
+@test("a chain of three modules closes the same way")
+mgr_three_modules()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(a.f())")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int = b.g()\nh() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\ng() -> int = c.k()"))
+    fs.push(("c", "c.sysl", "module c\nk() -> int = a.h()"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, s"'a' depends on 'b', which depends on 'c', which depends on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:2:16")
+
+// Which module a walk *reaches* a cycle at is an accident of where it started, so the message begins
+// at the first of the modules on it by name -- here `b`, though the walk arrives from `a`.
+@test("and the message begins at the first module on the cycle by name")
+mgr_begins_at_the_first_module_by_name()
+    if mgr_skip() then return
+
+    val said = mgr_out(mgr_reached_from_outside())
+
+    mgr_says(said, s"'b' depends on 'c', which depends on 'b' — ${mgr_cycle()}")
+    mgr_says(said, "b/b.sysl:2:16")
+
+@test("a module reached only through the cycle is not named in it")
+mgr_a_module_outside_the_cycle_is_not_named()
+    if mgr_skip() then return
+
+    val said = mgr_out(mgr_reached_from_outside())
+
+    mgr_says(said, mgr_cycle())
+    assert(!said.contains("'a' depends on"), said)
+
+// Reporting a cycle breaks it, so an unrelated one somewhere else in the graph is found too rather
+// than waiting for the first to be fixed.
+@test("and two unrelated cycles are both reported")
+mgr_two_unrelated_cycles_are_both_reported()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(1)")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int = b.g()\nh() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\ng() -> int = a.h()"))
+    fs.push(("c", "c.sysl", "module c\nf() -> int = d.g()\nh() -> int = 1"))
+    fs.push(("d", "d.sysl", "module d\ng() -> int = c.h()"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, s"'a' depends on 'b', which depends on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:2:16")
+    mgr_says(said, s"'c' depends on 'd', which depends on 'c' — ${mgr_cycle()}")
+    mgr_says(said, "c/c.sysl:2:16")
+
+@test("and one module on two cycles is told about each of them")
+mgr_one_module_on_two_cycles()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(1)")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int = b.g() + c.k()\nz() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\ng() -> int = a.z()"))
+    fs.push(("c", "c.sysl", "module c\nk() -> int = a.z()"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, s"'a' depends on 'b', which depends on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:2:16")
+    mgr_says(said, s"'a' depends on 'c', which depends on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:2:24")
+
+// -- a module and a module beneath it are two modules -------------------------------------------------
+
+@test("a module and one beneath it may not depend on each other either")
+mgr_a_module_and_one_beneath_it()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(1)")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int = 1\nuse() -> int = a.b.g()"))
+    fs.push(("a.b", "b.sysl", "module a.b\ng() -> int = a.f()"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, s"'a' depends on 'a.b', which depends on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:3:20")
+
+@test("though one depending on the other is ordinary")
+mgr_one_beneath_depending_on_the_other_is_ordinary()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(a.b.g())")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int = 21"))
+    fs.push(("a.b", "b.sysl", "module a.b\ng() -> int = a.f() * 2"))
+
+    assert_eq(mgr_out(fs), "42\n")
+
+// -- a graph with no cycle in it is left alone --------------------------------------------------------
+
+@test("a chain with no cycle in it is left alone")
+mgr_a_chain_is_left_alone()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(a.f())")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int = b.g() + 1"))
+    fs.push(("b", "b.sysl", "module b\ng() -> int = c.k() + 1"))
+    fs.push(("c", "c.sysl", "module c\nk() -> int = 40"))
+
+    assert_eq(mgr_out(fs), "42\n")
+
+// Two paths to one module is not two visits to it: a diamond is the shape a walk that marked nothing
+// as settled would take exponential time on, and it is a perfectly good graph.
+@test("a diamond is left alone")
+mgr_a_diamond_is_left_alone()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(top.f())")
+
+    fs.push(("top", "t.sysl", "module top\nf() -> int = left.g() + right.h()"))
+    fs.push(("left", "l.sysl", "module left\ng() -> int = base.n()"))
+    fs.push(("right", "r.sysl", "module right\nh() -> int = base.n() * 2"))
+    fs.push(("base", "n.sysl", "module base\nn() -> int = 14"))
+
+    assert_eq(mgr_out(fs), "42\n")
+
+// The standard module is auto-imported everywhere, so it is outside the dependency graph -- if a use
+// of `print` were an edge, every named module would depend on it.
+@test("a module that prints, reached from a root file that prints")
+mgr_a_module_that_prints()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(geom.twice(21))")
+
+    fs.push(("geom", "g.sysl", "module geom\ntwice(n: int) -> int =\n    print(\"in geom\")\n    n * 2"))
+
+    assert_eq(mgr_out(fs), "in geom\n42\n")
+
+// Cycles *within* a module carry no ceremony at all: its files are one scope.
+@test("mutual recursion across the files of one module")
+mgr_mutual_recursion_across_one_modules_files()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(m.even(4))")
+
+    fs.push(("m", "x.sysl", "module m\neven(n: int) -> int = if n == 0 then 1 else odd(n - 1)"))
+    fs.push(("m", "y.sysl", "module m\nodd(n: int) -> int = if n == 0 then 0 else even(n - 1)"))
+
+    assert_eq(mgr_out(fs), "1\n")
+
+@test("a module named from two others that do not name each other")
+mgr_a_module_named_from_two_others()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(a.f() + b.g())")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int = base.n()"))
+    fs.push(("b", "b.sysl", "module b\ng() -> int = base.n() + 1"))
+    fs.push(("base", "n.sysl", "module base\nn() -> int = 20"))
+
+    assert_eq(mgr_out(fs), "41\n")
+
+// A dependency is something a *file* wrote. The compiler copies a trait's default into every
+// implementing type, so the trait's module ends up holding a declaration whose receiver names the
+// implementing module -- a re-spelling of what the `impl` block already said, not a second dependency
+// running the other way.
+@test("a trait whose default is copied into another module's type")
+mgr_a_trait_default_copied_into_another_module()
+    if mgr_skip() then return
+
+    var fs = mgr_of("import a.Show\nprint(b.P(1).twice())")
+
+    fs.push(("a", "a.sysl",
+             "module a\ntrait Show\n    n(self) -> int\n    twice(self) -> int = self.n() * 2"))
+    fs.push(("b", "b.sysl",
+             "module b\nstruct P[T]\n    v: T\nimpl[T] a.Show for P[T]\n    n(self) -> int = 21"))
+
+    assert_eq(mgr_out(fs), "42\n")
+
+@test("and a root file that names several modules depends on them all, being named by none")
+mgr_a_root_file_names_several_modules()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(a.f() + b.g())")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int = 20"))
+    fs.push(("b", "b.sysl", "module b\ng() -> int = 22"))
+
+    assert_eq(mgr_out(fs), "42\n")
+
+// -- what the reference suite does not ask ------------------------------------------------------------
+
+// The case `ComputedValTests` states as "two modules reading each other's tables is a module cycle":
+// storage an initializer fills is a reference like any other, and the message begins at `down`, the
+// first of the two by name, at the call its table makes.
+@test("two modules reading each other's tables is a module cycle")
+mgr_two_modules_reading_each_others_tables()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(up.top())")
+
+    fs.push(("up", "up.sysl", "module up\nval table: [2]int = [down.base(), 2]\n" +
+                              "top() -> int = table[0]\nseed() -> int = 5"))
+    fs.push(("down", "down.sysl", "module down\nval low: [2]int = [up.seed(), 1]\n" +
+                                  "base() -> int = low[0]"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, s"'down' depends on 'up', which depends on 'down' — ${mgr_cycle()}")
+    mgr_says(said, "down/down.sysl:2:23")
+
+@test("a chain of four modules names every one of them, in the order they depend")
+mgr_four_modules()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(a.f())")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int = b.g()\nh() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\ng() -> int = c.k()"))
+    fs.push(("c", "c.sysl", "module c\nk() -> int = d.j()"))
+    fs.push(("d", "d.sysl", "module d\nj() -> int = a.h()"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, "'a' depends on 'b', which depends on 'c', which depends on 'd', which depends " +
+                   s"on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:2:16")
+
+// An import of a whole module is the edge, made at the `import`, and the path written later is a
+// second reference along an edge already there -- so the first is the one pointed at.
+@test("an import of a whole module is where the edge was made, not the path written after it")
+mgr_a_whole_module_import_is_the_edge()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(a.f())")
+
+    fs.push(("a", "a.sysl", "module a\nimport b\nf() -> int = b.g()\nh() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\ng() -> int = a.h()"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, s"'a' depends on 'b', which depends on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:2:1\n")
+
+@test("an edge made by reading another module's value points at the value's name")
+mgr_an_edge_made_by_a_value()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(a.f())")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int = 1 + b.limit\nh() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\nval limit: int = 3\ng() -> int = a.h()"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, s"'a' depends on 'b', which depends on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:2:20")
+
+@test("an edge made by building another module's struct points at the struct's name")
+mgr_an_edge_made_by_a_constructor()
+    if mgr_skip() then return
+
+    var fs = mgr_of("print(a.f())")
+
+    fs.push(("a", "a.sysl", "module a\nf() -> int =\n    val q = b.Q(1)\n    q.n\nh() -> int = 1"))
+    fs.push(("b", "b.sysl", "module b\nstruct Q\n    n: int\ng() -> int = a.h()"))
+
+    val said = mgr_out(fs)
+
+    mgr_says(said, s"'a' depends on 'b', which depends on 'a' — ${mgr_cycle()}")
+    mgr_says(said, "a/a.sysl:3:15")
