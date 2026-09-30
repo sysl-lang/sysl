@@ -1,0 +1,723 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `(a, b)` -- a positional product with no name (`reference/types.md § Tuples`). A tuple IS a struct
+// with its fields named for their positions, so most of what is worth testing is that the reuse is
+// real rather than approximate: the same layout, the same counting, the same patterns, the same
+// generic arguments. The two things a tuple has that a struct does not are an arity no
+// implementation can be generic over, and a spelling (`.0.1`) that collides with a float.
+//
+// **Every string quoted here was read out of the reference compiler (0.0.152)**, whose `TupleTests`
+// these are.
+
+private var tup_library_cache: Buf[Program] = buf()
+private var tup_library_read: bool = false
+
+private tup_library() -> Buf[Program]
+    if tup_library_read then return tup_library_cache
+
+    tup_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tup_library_cache = units
+
+    tup_library_cache
+end tup_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private tup_ready() -> bool
+    if tup_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end tup_ready
+
+private tup_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program PRINTS, which is the one claim nothing short of building and running it makes.
+private tup_ran(text: string) -> string
+    val root = make_temp_dir("sysl-tuple").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tup_ran
+
+// Everything a source has to say for itself, and the LLVM text where it had nothing to say.
+private tup_compiled(text: string) -> (string, string)
+    val root = make_temp_dir("sysl-tuple").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> (why.message, "")
+        Ok(made) -> if made.report.is_empty() then ("", made.text) else (analysis_report(made.report), "")
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end tup_compiled
+
+private tup_err(text: string) -> string = tup_compiled(text).0
+
+private tup_ir(text: string) -> string
+    val made = tup_compiled(text)
+
+    assert(made.0.is_empty(), s"expected the program to compile, got: ${made.0}")
+    made.1
+
+// The source is refused with exactly `message`, at `line:col` of the entry file.
+private tup_refused(text: string, message: string, at: string)
+    val said = tup_err(text)
+
+    assert(tup_says(said, s"error: $message\n --> "), s"expected '$message', got: $said")
+    assert(tup_says(said, s"/main.sysl:$at\n"), s"expected it at $at, got: $said")
+
+// ---- the type and its values ----
+
+@test("a literal builds one, and a written type names it")
+tup_a_literal_builds_one()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        var p: (int, string) = (1, "one")
+        print(p.0, p.1)
+        """), "1 one\n")
+
+@test("the type is inferred where none is written")
+tup_the_type_is_inferred()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        var q = (3, 4)
+        print(q.0 + q.1)
+        """), "7\n")
+
+// The same narrowing a struct's fields get: what the tuple is wanted at reaches each part, so a bare
+// literal takes the width of the position it is heading for rather than defaulting.
+@test("a part takes the width of the position it is heading for")
+tup_a_part_takes_its_positions_width()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        var p: (i8, u16) = (1, 2)
+        print(p.0 + 1i8, p.1 + 1u16)
+        """), "2 3\n")
+
+@test("it goes into and comes out of a function")
+tup_into_and_out_of_a_function()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        swap(p: (int, string)) -> (string, int) = (p.1, p.0)
+        var r = swap((1, "one"))
+        print(r.0, r.1)
+        """), "one 1\n")
+
+@test("a part is a place, so it can be written through")
+tup_a_part_is_a_place()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        demo()
+            var t = (1, 2)
+            t.0 = 5
+            t.1 += 1
+            print(t.0, t.1)
+        end demo
+        demo()
+        """), "5 3\n")
+
+// `unit` occupies no storage, and a tuple lays out as a struct -- so a `unit` part is skipped and the
+// parts behind it shift past, which is only visible if the indices still agree.
+@test("a 'unit' part is skipped by the layout without moving the parts behind it")
+tup_a_unit_part_is_skipped()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        var u: (unit, int, unit, string) = ((), 7, (), "z")
+        print(u.1, u.3)
+        """), "7 z\n")
+
+// ---- two or more parts, never one ----
+
+@test("a one-part type is refused, and told what it already is")
+tup_a_one_part_type_is_refused()
+    if !tup_ready() then return
+
+    tup_refused("var x: (int) = 1\n",
+                "'(int)' is a type in parentheses, and a tuple has two or more parts — a product of one thing is that thing, so write 'int'",
+                "1:14")
+
+// `(x)` is a grouping and always will be, so there is no expression form to refuse.
+@test("a parenthesised expression stays a parenthesised expression")
+tup_a_parenthesised_expression_stays_one()
+    assert_eq(pe("(1)"), "1")
+
+    if !tup_ready() then return
+
+    assert_eq(tup_ran("print((1) + 2)\n"), "3\n")
+
+@test("and there is no trailing-comma spelling to reach a one-tuple by")
+tup_no_trailing_comma_one_tuple()
+    if !tup_ready() then return
+
+    tup_refused("var y = (1,)\n", "expression expected", "1:12")
+
+// The expression form takes no trailing comma at any length -- and a pattern and a type do, which is
+// the reference's line exactly.
+@test("a tuple expression takes no trailing comma at any length")
+tup_no_trailing_comma_at_any_length()
+    if !tup_ready() then return
+
+    tup_refused("var y = (1, 2,)\n", "expression expected", "1:15")
+
+@test("a tuple pattern and a tuple type do take a trailing comma")
+tup_a_pattern_and_a_type_take_a_trailing_comma()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        var p = (1, 2)
+        p match
+            (a, b,) -> print(a, b)
+        var y: (int, int,) = (3, 4)
+        print(y.0)
+        """), "1 2\n3\n")
+
+@test("a one-part pattern is refused too")
+tup_a_one_part_pattern_is_refused()
+    if !tup_ready() then return
+
+    tup_refused("x match\n    (a) -> print(a)\n",
+                "a tuple pattern matches two or more parts — one part is not a tuple", "2:9")
+
+// ---- reading a part by position ----
+
+// `0.1` is a float to the lexer, so the nested selection needs parentheses -- and being told exactly
+// which parentheses is what makes that affordable.
+@test("a nested selection needs parentheses, and says so when it does not have them")
+tup_a_nested_selection_needs_parentheses()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        var n = ((1, 2), 3)
+        print((n.0).1)
+        """), "2\n")
+
+    tup_refused("print((1, 2).0.1)\n",
+                "'.0.1' reads as a number rather than as two tuple indices — write '(x.0).1' to select part 1 of part 0",
+                "1:14")
+
+@test("an index past the last part is its own complaint")
+tup_an_index_past_the_last_part()
+    if !tup_ready() then return
+
+    tup_refused("print((1, 2).2)\n",
+                "(int, int) has 2 parts, so there is no '.2' — the parts are numbered from 0", "1:14")
+
+@test("and a name that is not an index falls back to the member that is missing")
+tup_a_name_that_is_not_an_index()
+    if !tup_ready() then return
+
+    tup_refused("print((1, 2).foo)\n", "'(int, int)' has no field or property 'foo'", "1:14")
+
+@test("a part of something that is not a tuple is not a part at all")
+tup_a_part_of_a_non_tuple()
+    if !tup_ready() then return
+
+    tup_refused("print((1).0)\n", "cannot read field '0' of int", "1:11")
+
+// ---- destructured by pattern ----
+
+@test("one sub-pattern per part, binding each")
+tup_one_sub_pattern_per_part()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        var p = (1, "one")
+        p match
+            (1, t) -> print("one and", t)
+            (_, _) -> print("other")
+        """), "one and one\n")
+
+@test("a wildcard leaves a part unbound")
+tup_a_wildcard_leaves_a_part_unbound()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        var p = (7, 8)
+        p match
+            (_, b) -> print(b)
+        """), "8\n")
+
+@test("a tuple pattern nests, in either position")
+tup_a_tuple_pattern_nests()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        demo()
+            var m = (1, (2, 3))
+            m match
+                (1, (x, y)) -> print("inner", x, y)
+                (_, _) -> print("no")
+            var n = ((1, 2), 3)
+            n match
+                ((_, b), c) -> print(b, c)
+        end demo
+        demo()
+        """), "inner 2 3\n2 3\n")
+
+@test("a pattern of the wrong length is refused against the type it was matched on")
+tup_a_pattern_of_the_wrong_length()
+    if !tup_ready() then return
+
+    tup_refused("var p = (1, 2)\np match\n    (a, b, c) -> print(a)\n",
+                "(int, int) has 2 parts, but 3 sub-patterns were given", "3:5")
+
+@test("and a tuple pattern against something else says what it does match")
+tup_a_tuple_pattern_against_a_non_tuple()
+    if !tup_ready() then return
+
+    tup_refused("var p = 1\np match\n    (a, b) -> print(a)\n",
+                "'(…)' matches a tuple, but the value is int", "3:5")
+
+// ---- taken apart at a binding or an assignment ----
+
+@test("a binding names each part")
+tup_a_binding_names_each_part()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        demo()
+            var p = (1, "one")
+            var a, b = p
+            print(a, b)
+        end demo
+        demo()
+        """), "1 one\n")
+
+@test("an assignment writes each part into a place")
+tup_an_assignment_writes_each_part()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        demo()
+            var p = (1, "one")
+            var a = 0
+            var s = ""
+            a, s = p
+            print(a, s)
+        end demo
+        demo()
+        """), "1 one\n")
+
+@test("a call's one tuple comes apart the same way")
+tup_a_calls_tuple_comes_apart()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        divmod(a: int, b: int) -> (int, int) = (a / b, a % b)
+        var q, r = divmod(17, 5)
+        print(q, r)
+        """), "3 2\n")
+
+// The carrier is evaluated ONCE, which a form that read `f()` per place would fail.
+@test("and the carrier is evaluated exactly once")
+tup_the_carrier_is_evaluated_once()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        pair() -> (int, int)
+            print("called")
+            (1, 2)
+        end pair
+        var a, b = pair()
+        print(a, b)
+        """), "called\n1 2\n")
+
+@test("a carrier of the wrong arity is refused with both counts")
+tup_a_carrier_of_the_wrong_arity()
+    if !tup_ready() then return
+
+    tup_refused("demo()\n    var p = (1, 2)\n    var a, b, c = p\nend demo\ndemo()\n",
+                "this binding names 3 things, and a (int, int) has 2 parts to give them", "3:19")
+
+@test("and something that is not a tuple cannot be taken apart at all")
+tup_a_non_tuple_cannot_be_taken_apart()
+    if !tup_ready() then return
+
+    tup_refused("demo()\n    var a = 1\n    var b = 2\n    a, b = 1\nend demo\ndemo()\n",
+                "this assignment has 2 places on the left, and one int is not something to take apart — only a tuple is",
+                "4:12")
+
+// ---- laid out and counted as a struct ----
+
+// A tuple's aggregate is its parts in order, named for the arity so two arities cannot share one.
+@test("the emitted aggregate is the parts in order")
+tup_the_emitted_aggregate_is_the_parts()
+    if !tup_ready() then return
+
+    val ir = tup_ir("var p = (1, \"one\")\nprint(p.0)\n")
+
+    assert(tup_says(ir, "%struct.$tuple2.int.string = type { i32, { ptr, ptr, i64 } }"), ir)
+
+@test("a counted part is retained and released like a field")
+tup_a_counted_part_is_retained()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        struct Node
+            v: int
+        demo()
+            var i = 0
+            while i < 20000
+                var nd: &Node = Node(i)
+                var p = (nd, "s" + str(i))
+                var q = p
+                i += 1
+            print("done")
+        end demo
+        demo()
+        """), "done\n")
+
+// The ARC walk reaches a reference two aggregates deep only if a tuple is walked as the struct it is.
+@test("a tuple is a struct's field, counted through both")
+tup_a_tuple_is_a_structs_field()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        struct Node
+            v: int
+        struct Holder
+            p: (&Node, string)
+            n: int
+        demo()
+            var i = 0
+            while i < 20000
+                var nd: &Node = Node(i)
+                var h = Holder((nd, "s" + str(i)), i)
+                var g = h
+                i += 1
+            print("done")
+        end demo
+        demo()
+        """), "done\n")
+
+@test("a tuple of nothing but 'unit' parts is a tuple with no storage")
+tup_a_tuple_of_units()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran("var z: (unit, unit) = ((), ())\nprint(\"ok\")\n"), "ok\n")
+
+@test("a tuple sits in an array and comes back out")
+tup_a_tuple_sits_in_an_array()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        demo()
+            var a = [(1, "a"), (2, "b")]
+            for e in a
+                print(e.0, e.1)
+        end demo
+        demo()
+        """), "1 a\n2 b\n")
+
+@test("a tuple stands as a generic argument")
+tup_a_tuple_as_a_generic_argument()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        find(k: int) -> Option[(string, int)] =
+            if k == 1 then Some(("one", 1)) else None
+        find(1) match
+            Some(p) -> print(p.0, p.1)
+            None -> print("none")
+        """), "one 1\n")
+
+@test("and is the element a cursor iterates")
+tup_the_element_a_cursor_iterates()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        struct Cursor
+            i: int
+        impl Iterate for Cursor
+            type Item = (int, string)
+            next(*self) -> Option[(int, string)]
+                if self.i >= 3 then return None
+                var n = self.i
+                self.i += 1
+                Some((n, "x" + str(n)))
+            end next
+        var c = Cursor(0)
+        for kv in c
+            print(kv.0, kv.1)
+        """), "0 x0\n1 x1\n2 x2\n")
+
+// ---- the traits the library provides structurally ----
+
+@test("equality compares part by part")
+tup_equality_compares_part_by_part()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran("print((1, 2) == (1, 2), (1, 2) == (1, 3), (1, \"a\") == (1, \"a\"))\n"),
+              "true false true\n")
+
+@test("ordering is lexicographic, first part first")
+tup_ordering_is_lexicographic()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran("print((1, 2) < (1, 3), (2, 0) < (1, 3), (1, 2) < (1, 2))\n"), "true false false\n")
+
+@test("and it reaches the parts behind an equal first one, not just the first")
+tup_ordering_reaches_past_an_equal_first()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran("print((1, 1, 2) < (1, 1, 3), (1, 2, 9) < (1, 1, 0))\n"), "true false\n")
+
+@test("a hash agrees with the equality and separates the order of the parts")
+tup_a_hash_agrees_with_equality()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran("print((1, 2).hash() == (1, 2).hash(), (1, 2).hash() == (2, 1).hash())\n"),
+              "true false\n")
+
+@test("rendering writes the parts in parentheses")
+tup_rendering_writes_parentheses()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran("print((1, \"one\"))\nprint(str((1, 2, 3)))\n"), "(1, one)\n(1, 2, 3)\n")
+
+// A specifier describes the field the WHOLE value occupies, so the padding is applied once around the
+// whole rendering rather than handed to each part.
+@test("and a specifier pads the whole rendering, not each part")
+tup_a_specifier_pads_the_whole()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        var p = (1, 2)
+        print(f"${p}%10s|", f"${p}%-10s|")
+        """), "    (1, 2)| (1, 2)    |\n")
+
+// A padded rendering walks the parts twice, so a part the tuple owns is read twice and released once;
+// printing the same tuple again afterwards says the first rendering did not consume it.
+@test("a part the tuple owns survives being rendered twice")
+tup_an_owned_part_survives_two_renderings()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        var p = (1, "abc")
+        print(f"${p}%12s|")
+        print(f"${p}%12s|")
+        print(p)
+        """), "    (1, abc)|\n    (1, abc)|\n(1, abc)\n")
+
+@test("a part with no membership takes the trait away from the whole")
+tup_a_part_with_no_membership()
+    if !tup_ready() then return
+
+    tup_refused("struct Opaque\n    v: int\nvar p = (1, Opaque(2))\nprint(p == p)\n",
+                "'==' between (int, Opaque) needs 'sysl.Eq' — the 'impl' that covers it asks 'sysl.Eq' of int, Opaque, which does not implement it",
+                "4:7")
+
+// The rows are written over a type pack and cover every tuple, so there is no widest arity.
+@test("and a tuple wider than three implements the catalog like any other")
+tup_a_wide_tuple_implements_the_catalog()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran("print((1, 2, 3, 4) == (1, 2, 3, 4))\n"), "true\n")
+
+@test("ordering reaches a part of a different type from the one before it")
+tup_ordering_over_mixed_parts()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran("print((1, \"a\") < (1, \"b\"), (1, \"b\") < (1, \"a\"), (1, \"a\") < (2, \"a\"))\n"),
+              "true false true\n")
+
+@test("a hash mixes parts of different types")
+tup_a_hash_mixes_mixed_parts()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran("print((1, \"a\").hash() == (1, \"a\").hash(), (1, \"a\").hash() == (1, \"b\").hash())\n"),
+              "true false\n")
+
+@test("a wide tuple of four unrelated types renders and compares")
+tup_a_wide_heterogeneous_tuple()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        val t = (1, "a", true, 'c')
+        print(t)
+        print(t == (1, "a", true, 'c'), t == (1, "a", false, 'c'))
+        """), "(1, a, true, c)\ntrue false\n")
+
+@test("a part that is itself a tuple is met by the same row")
+tup_a_nested_tuple_part()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        val t = ((1, "a"), (true, 'c'))
+        print(t)
+        print(t == ((1, "a"), (true, 'c')), t == ((1, "b"), (true, 'c')))
+        """), "((1, a), (true, c))\ntrue false\n")
+
+// ---- who may implement what for one ----
+
+@test("a user's own trait may be implemented for a tuple written out in full")
+tup_a_users_trait_for_a_written_tuple()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        trait Tag
+            tag(self) -> string
+        impl Tag for (int, string)
+            tag(self) -> string = "pair " + str(self.0)
+        print((1, "a").tag())
+        """), "pair 1\n")
+
+@test("and for every tuple of an arity at once")
+tup_a_users_trait_for_an_arity()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[A: Display, B: Display] Tag for (A, B)
+            tag(self) -> string = str(self.0) + "/" + str(self.1)
+        print((1, "a").tag(), (2, 3).tag())
+        """), "1/a 2/3\n")
+
+// Each arity is its own key, so a pair's implementation says nothing about a triple's.
+@test("an implementation for one arity does not cover another")
+tup_one_arity_does_not_cover_another()
+    if !tup_ready() then return
+
+    tup_refused(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[A: Display, B: Display] Tag for (A, B)
+            tag(self) -> string = str(self.0)
+        print((1, 2, 3).tag())
+        """, "type '(int, int, int)' has no method 'tag'", "5:17")
+
+@test("a shape and a tuple written out in full may not both supply one name")
+tup_a_shape_and_a_written_tuple_collide()
+    if !tup_ready() then return
+
+    tup_refused(raw"""
+        trait Tag
+            tag(self) -> string
+        impl Tag for (int, string)
+            tag(self) -> string = "one"
+        impl[A, B] Tag for (A, B)
+            tag(self) -> string = "any"
+        print(1)
+        """, "'(int, string)' already implements 'Tag', and this 'impl' would implement it for every tuple of 2 parts — including that one",
+        "5:1")
+
+// The same collision over an array's shape names the family by its length.
+@test("a shape over arrays of one length names the length")
+tup_an_array_shape_names_its_length()
+    if !tup_ready() then return
+
+    tup_refused(raw"""
+        trait Tag
+            tag(self) -> string
+        impl Tag for [3]int
+            tag(self) -> string = "one"
+        impl[T] Tag for [3]T
+            tag(self) -> string = "any"
+        print(1)
+        """, "'[3]int' already implements 'Tag', and this 'impl' would implement it for every array of 3 — including that one",
+        "5:1")
+
+// The trait and the type are both the library's, and coherence is the rule that answers.
+@test("and the library's own rows may not be given a second implementation")
+tup_the_librarys_rows_have_no_second()
+    if !tup_ready() then return
+
+    tup_refused("impl Eq for (int, int)\n    eq(self, rhs: Self) -> bool = true\nprint(1)\n",
+                "an 'impl' may be written only in the module that declares the trait or in one that declares a type the block names, and 'sysl.Eq' is the library's while nothing in '(int, int)' is declared outside the library — so this one has no home. A trait of your own, or a type of your own in what it is written for or in the trait's arguments, gives it one",
+                "1:1")
+
+// ---- a tuple over type parameters belongs to the block that wrote it ----
+
+// Two blocks writing `(A, B)` mean two different types, because each block's parameters carry what
+// that block asked of them.
+@test("two blocks may each ask something different of the same spelling")
+tup_two_blocks_ask_different_things()
+    if !tup_ready() then return
+
+    assert_eq(tup_ran(raw"""
+        trait First
+            first(self) -> string
+        trait Second
+            second(self) -> string
+        impl[A: Display, B: Display] First for (A, B)
+            first(self) -> string = str(self.0)
+        impl[A: Hash, B: Hash] Second for (A, B)
+            second(self) -> string = str(self.0.hash() == self.0.hash())
+        print((1, 2).first(), (1, 2).second())
+        """), "1 true\n")
+
+@test("and the parts of a generic tuple are not laid out as a type of their own")
+tup_a_generic_tuple_has_no_layout()
+    if !tup_ready() then return
+
+    val ir = tup_ir(raw"""
+        trait Tag
+            tag(self) -> string
+        impl[A: Display, B: Display] Tag for (A, B)
+            tag(self) -> string = str(self.0)
+        print((1, 2).tag())
+        """)
+
+    assert(!tup_says(ir, "$tuple2.A.B"), ir)
+
+// ---- the parts must be values ----
+
+@test("a part that never arrives is not a part")
+tup_a_part_that_never_arrives()
+    if !tup_ready() then return
+
+    tup_refused("var p = (1, exit(1))\nprint(p.0)\n",
+                "a tuple part has to be a value, and this expression never produces one", "1:13")
+
+@test("and the two sides of a comparison must be the same tuple")
+tup_both_sides_of_a_comparison()
+    if !tup_ready() then return
+
+    tup_refused("print((1, 2) == (1, 2, 3))\n",
+                "'==' needs matching types, got (int, int) and (int, int, int)", "1:17")
