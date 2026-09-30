@@ -555,7 +555,7 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Typ
     for i in 0..<targs.len()
         written_args.push(written_type_arg(cx, targs.at(i)))
 
-    val home = cx.an.tables.members.generic_scope.get(fd.name).unwrap_or(cx.scope)
+    val home = instantiation_scope(cx, fd.name)
     val slots = bind_member_args(cx, span, shown, m, args)
 
     if slots.is_none() then return bad_expr(span)
@@ -889,10 +889,24 @@ member_func_name(cx: &Analyzer, span: Span, ty: Type, mname: string) -> string
                  "not say which instantiation is meant — call it, and the arguments will")
         return ""
 
-    val home = cx.an.tables.members.generic_scope.get(fd.name).unwrap_or(cx.scope)
-
-    instantiate_func(cx.an, home, fd, found.1, viewed_const(ty, found.0))
+    instantiate_func(cx.an, instantiation_scope(cx, fd.name), fd, found.1, viewed_const(ty, found.0))
 end member_func_name
+
+// The file a generic member's signature and body are read in when it is made real.
+//
+// **An inherited default is read where the TRAIT wrote it, on a generic type as on any other**: the
+// copy's body is the trait's source, so the names in it are the trait's file's and a complaint about
+// it lands there. Everything else is read where its block is. `Self` is the one thing in a copy the
+// trait did not write, and `self_for` resolves that in the block's terms whichever this answers.
+private instantiation_scope(cx: &Analyzer, name: string) -> Scope
+    if cx.an.tables.members.default_origin.has(name) then
+        val written = cx.an.tables.members.decl_scope.get(name)
+
+        if written.is_some() then return written.unwrap()
+    end if
+
+    cx.an.tables.members.generic_scope.get(name).unwrap_or(cx.scope)
+end instantiation_scope
 
 // Which of a type's members a written name means, where more than one thing gave the type a member
 // of that name.
