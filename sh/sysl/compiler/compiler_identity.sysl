@@ -1,0 +1,68 @@
+module sh.sysl.compiler
+
+import sysl.fs.read_bytes
+
+// Which compiler this is, for a cache key: the version, and which build of that version.
+//
+// **The version alone names a release and not a compiler.** A development tree holds `Version` at
+// `0.0.1` while the compiler under it changes, so a cache keyed on the version hands a newer build
+// whatever an older build of the same version left there -- a binary `sysl run` and `sysl test`
+// replay without compiling (`run_cache.sysl`), or the standard module every program links
+// (`std_artifact_path`). Nothing announces it: the program simply behaves the way the compiler before
+// the change made it behave.
+//
+// **The build is a digest of this compiler's own executable**, read once per process the first time a
+// key asks for it. The executable is what the sources compile to, so it moves whenever they do; it
+// also moves when the compiler that *built* it does, which is the case a digest of the sources would
+// miss -- a stage-one binary made by the reference and a stage-two binary made by this compiler hold
+// the same sources and may emit different bytes, and are two compilers to a cache. A rebuild of an
+// unchanged tree links the same bytes and shares its entries; a released binary's digest is fixed with
+// the rest of it.
+//
+// It is read at run time rather than written into the source at build time because nothing in a
+// `sysl build` runs a generator: a constant committed beside the sources is correct until the first
+// edit made without regenerating it, and from then on it is the stale key this exists to remove,
+// silently. Reading the binary cannot be forgotten. It costs one read and one pass of FNV-1a over the
+// file -- about 30ms for this compiler's ten megabytes -- paid only by a command that consults a cache.
+//
+// Spelled `<version>+<build>`, the form a semantic version gives build metadata, as the reference
+// spells its own (`CompilerIdentity`).
+
+// What stands in for the build on a machine that will not say where this executable is. **The run
+// cache refuses to key on it** (`compiler_build_known`), since every build of this version would
+// share it; the standard module's artifact still takes it, which is no worse than keying on the
+// version alone.
+private const UnknownBuild: string = "unknown"
+
+// The digest once read, so a process pays for it once.
+private var identity_read: bool = false
+private var identity_build: string = ""
+
+// A build a test stands in for, in place of the digest. Empty is none.
+private var identity_pinned: string = ""
+
+// `<version>+<build>` for this compiler, or for the one a test has pinned.
+compiler_identity() -> string =
+    if identity_pinned != "" then identity_pinned else s"${Version}+${compiler_build()}"
+
+// Whether the build half is a real digest rather than the stand-in for a machine that would not say.
+compiler_build_known() -> bool = identity_pinned != "" || compiler_build() != UnknownBuild
+
+// Run as though this were the compiler `id` names -- which is how a test puts an entry in a cache
+// that another build of this version made, and then asks what this build finds there. `None` puts
+// the real identity back.
+pin_compiler_identity(id: Option[string])
+    identity_pinned = id.unwrap_or("")
+
+private compiler_build() -> string
+    if identity_read then return identity_build
+
+    identity_build = executable_path() match
+        None -> UnknownBuild
+        Some(exe) -> read_bytes(exe) match
+            Ok(bytes) -> bytes_fingerprint(bytes)
+            Err(_) -> UnknownBuild
+
+    identity_read = true
+    identity_build
+end compiler_build
