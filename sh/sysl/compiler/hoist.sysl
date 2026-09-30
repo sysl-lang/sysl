@@ -604,7 +604,7 @@ value_name_holder(a: &Analysis, key: string) -> Option[string]
 end value_name_holder
 
 private hoist_extern(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
-    val key = module_qualify(scope.module_name, d.name)
+    val base = module_qualify(scope.module_name, d.name)
 
     // The NAME is refused as well as the symbol, in any module: a `main` the program does not start
     // at would read as though it were the one it does.
@@ -612,21 +612,50 @@ private hoist_extern(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
         a.fault(scope, span, "'main' is where a program starts, so it is not a name an 'extern' may take")
         return
 
-    if a.tables.externs.has(key) then
-        a.fault(scope, span, s"'${d.name}' is already declared as an 'extern' for the symbol " +
-                s"'${extern_symbol(a.tables.externs.get(key).unwrap())}' — two 'extern' declarations " +
-                "of one name are one declaration written twice")
-        return
-
-    if a.tables.funcs.has(key) then
+    if a.tables.funcs.has(base) then
         a.fault(scope, span, s"'${d.name}' is already declared as a function, so this 'extern' " +
-                "would overload it — and an 'extern' has no sysl declaration for a call to be told " +
-                "apart by")
+                "would overload it — what tells overloads of an 'extern' apart is the symbol each " +
+                "names, and a sysl function declares no symbol")
         return
 
-    if a.tables.extern_vars.has(key) then
+    if a.tables.extern_vars.has(base) then
         a.fault(scope, span, s"'${d.name}' is already declared as an 'extern' variable")
         return
+
+    // **Two `extern`s of one name are two functions exactly when they name two symbols**, and then
+    // they are an overload set held to what any other is: a call has to be able to tell them apart
+    // by its arguments. The symbol is asked first because it is the mistake only an `extern` can
+    // make -- one C function claimed at two signatures, where both calls would reach the same code.
+    val siblings = extern_overloads(a, base)
+    var clash = false
+
+    for i in 0..<siblings.len()
+        val other = a.tables.externs.get(siblings.at(i)).unwrap()
+
+        if !clash && extern_symbol(other) == extern_symbol(d) then
+            a.fault(scope, span, s"'${d.name}' is already declared as an 'extern' for the symbol " +
+                    s"'${extern_symbol(other)}' — two declarations of one name are two functions, " +
+                    "and one C function cannot be two. Overloads of an 'extern' are told apart by " +
+                    "the symbol each names, so give this one a symbol of its own or take its " +
+                    "address and 'ptr_cast' it where the other signature is wanted")
+            clash = true
+
+    for i in 0..<siblings.len()
+        val other = a.tables.externs.get(siblings.at(i)).unwrap()
+
+        if same_params(d.params, other.params) then
+            a.fault(scope, span, s"function '${d.name}' is already declared" +
+                    differing_results(d.ret_type, other.ret_type))
+            clash = true
+        else if overlapping_lists(d.params, d.variadic, other.params, other.variadic) then
+            a.fault(scope, span, indistinguishable_lists(base, d.params, other.params))
+            clash = true
+
+    if clash then return
+
+    // The slot is a function's: the second declaration of a name is `f.2`, and the symbol a call
+    // reaches is read off the declaration, never off this key.
+    val key = if siblings.is_empty() then base else s"$base.${siblings.len() + 1}"
 
     a.tables.externs.put(key, d)
     a.tables.extern_scopes.put(key, ExternHome(scope, span))
@@ -911,8 +940,8 @@ private hoist_func(a: &Analysis, scope: Scope, span: Span, d: FuncDecl)
 
     if a.tables.externs.has(base) then
         a.fault(scope, span, s"'${d.name}' is already declared as an 'extern', which this would " +
-                "overload — what tells two declarations of one name apart is their parameters, and " +
-                "an 'extern' has none the analyzer may read")
+                "overload — what tells overloads of an 'extern' apart is the symbol each names, " +
+                "and a sysl function declares no symbol")
         return
 
     // **Every declaration already in the set is one some call site sees beside this one**: a
@@ -1096,6 +1125,27 @@ overload_keys(a: &Analysis, plain: string) -> Buf[string] = a.tables.overloads.g
     Some(set) -> set
     None -> buf()
 
+// The keys the `extern` declarations of one name are filed under, in the order they were written.
+//
+// **Read off the table rather than kept beside it**: the first takes the plain key and each one
+// after it the next numbered slot, and a declaration that was refused took none, so the slots of a
+// name are always a run with no gap in it.
+extern_overloads(a: &Analysis, plain: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if !a.tables.externs.has(plain) then return out
+
+    out.push(plain)
+
+    var n: usize = 2
+
+    while a.tables.externs.has(s"$plain.$n")
+        out.push(s"$plain.$n")
+        n += 1
+
+    out
+end extern_overloads
+
 private is_file_private(v: Visibility) -> bool = v match
     File -> true
     _ -> false
@@ -1115,19 +1165,24 @@ end same_params
 // to the shorter of the two are written the same way. **Compared as written rather than as
 // resolved**: hoisting has not resolved a generic parameter's type, and the written form is what a
 // reader is looking at.
-overlapping(d: FuncDecl, other: FuncDecl) -> bool
-    val lo = max_usize2(required(d.params), required(other.params))
-    val hi = min_usize2(accepted(d.params, d.variadic), accepted(other.params, other.variadic))
+overlapping(d: FuncDecl, other: FuncDecl) -> bool =
+    overlapping_lists(d.params, d.variadic, other.params, other.variadic)
+
+// The same question asked of two parameter lists, which is all an `extern` has to be asked about.
+private overlapping_lists(ps: Buf[Param], variadic: bool, others: Buf[Param],
+                          other_variadic: bool) -> bool
+    val lo = max_usize2(required(ps), required(others))
+    val hi = min_usize2(accepted(ps, variadic), accepted(others, other_variadic))
 
     if lo > hi then return false
 
-    val n = min_usize2(lo, min_usize2(d.params.len(), other.params.len()))
+    val n = min_usize2(lo, min_usize2(ps.len(), others.len()))
 
     for i in 0..<n
-        if type_text(d.params.at(i).typ) != type_text(other.params.at(i).typ) then return false
+        if type_text(ps.at(i).typ) != type_text(others.at(i).typ) then return false
 
     true
-end overlapping
+end overlapping_lists
 
 private required(ps: Buf[Param]) -> usize
     var n: usize = 0
@@ -1147,23 +1202,29 @@ private min_usize2(a: usize, b: usize) -> usize = if a < b then a else b
 // The half of the duplicate message that is worth finishing where the two results differ, because
 // that is the pair a reader wrote on purpose and expected to work.
 private differing_result(d: FuncDecl, other: FuncDecl) -> string =
-    if written_result(d) == written_result(other) then ""
+    differing_results(d.ret_type, other.ret_type)
+
+private differing_results(ret: Option[TypeRef], other: Option[TypeRef]) -> string =
+    if written_result(ret) == written_result(other) then ""
     else " — which declaration a call means is decided by its arguments and never by what it " +
         "returns, so two that differ only in the result have no call that tells them apart"
 
-private written_result(d: FuncDecl) -> string = d.ret_type match
+private written_result(ret: Option[TypeRef]) -> string = ret match
     Some(t) -> type_text(t)
     None -> ""
 
-private indistinguishable(plain: string, d: FuncDecl, other: FuncDecl) -> string
-    val n = min_usize2(max_usize2(required(d.params), required(other.params)),
-                       min_usize2(d.params.len(), other.params.len()))
+private indistinguishable(plain: string, d: FuncDecl, other: FuncDecl) -> string =
+    indistinguishable_lists(plain, d.params, other.params)
+
+private indistinguishable_lists(plain: string, ps: Buf[Param], others: Buf[Param]) -> string
+    val n = min_usize2(max_usize2(required(ps), required(others)),
+                       min_usize2(ps.len(), others.len()))
 
     s"'${qualified_name(plain)}' is already declared with parameters this one could not be told from — " +
     s"a call passing $n argument${if n == 1 then "" else "s"} would fit both, and which " +
     "declaration a call means is decided by its arguments and never by what it returns. Two " +
     "declarations of one name have to differ in a way a call site can show"
-end indistinguishable
+end indistinguishable_lists
 
 // Whether the file a scope belongs to said `@tests`, so that what it declares is the module's tests'
 // and no build but a test build keeps it.

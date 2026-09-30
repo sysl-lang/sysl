@@ -305,15 +305,7 @@ private call_value(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
     ty match
         // A C function pointer is called through the pointer rather than through a table.
-        CFn(params, ret) ->
-            var ts: Buf[TExpr] = buf()
-
-            for i in 0..<args.len()
-                val want = if i < params.len() then Some(params.at(i)) else None
-
-                ts.push(type_expr(cx, args.at(i), want))
-
-            TExpr(span, TCallPtr(recv, ts, params, *ret))
+        CFn(params, ret) -> call_pointer(cx, span, recv, ty, params, *ret, args)
         _ ->
             if callable_of(cx.an, ty).is_none() then
                 return cx.err(span, "the thing being called must be a name, or something whose " +
@@ -1777,7 +1769,7 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
     if keys.is_empty() then
         val ext = extern_key(cx, written)
 
-        if ext.is_some() then return extern_call(cx, span, written, ext.unwrap(), args)
+        if ext.is_some() then return extern_named_call(cx, span, written, ext.unwrap(), args)
 
         // **A variant of an enum the library keeps is out of reach rather than undefined**, the
         // same asymmetry a function or a type it keeps has: a variant is named without naming its
@@ -2184,7 +2176,7 @@ end name_list
 
 // -- the calls a later stage resolves --------------------------------------------------------------
 
-private extern_key(cx: &Analyzer, written: string) -> Option[string]
+extern_key(cx: &Analyzer, written: string) -> Option[string]
     // **A module written before the dot**, which a call to a *function* has always asked for and a
     // call to an `extern` did not -- so `c.surface_destroy(h)`, which is what every binding in the
     // org writes next door to its `c` module, reported the module as an undefined name.
@@ -2212,6 +2204,81 @@ private extern_key(cx: &Analyzer, written: string) -> Option[string]
 
     found
 end extern_key
+
+// The `extern` declarations of one name that this file may call, in the order they were written.
+//
+// **A file-private one is a member of the set in its own file and of nobody else's**, so a name a
+// binding declares publicly at one signature and privately at another is two functions where the
+// private one was written and one everywhere else.
+extern_keys_in_reach(cx: &Analyzer, base: string) -> Buf[string]
+    val all = extern_overloads(cx.an, base)
+    var out: Buf[string] = buf()
+
+    for i in 0..<all.len()
+        if reachable_key(cx.an, all.at(i), cx.scope) then out.push(all.at(i))
+
+    out
+end extern_keys_in_reach
+
+// A call of an `extern` by name, where the name may be several C functions.
+//
+// **Two `extern`s of one name are an overload set, read the way a function's is**: each declaration
+// is tried against the arguments with everything the trial built thrown away, the first that fits is
+// the one meant, and where none does the refusal is the roster -- unless exactly one could have
+// taken this many arguments, whose own complaint says more than a list would.
+private extern_named_call(cx: &Analyzer, span: Span, written: string, base: string,
+                          args: Buf[Expr]) -> TExpr
+    if extern_overloads(cx.an, base).len() < 2 then return extern_call(cx, span, written, base, args)
+
+    val keys = extern_keys_in_reach(cx, base)
+
+    if keys.is_empty() then return cx.err(span, out_of_reach(cx.an, base))
+    if keys.len() == 1 then return extern_call(cx, span, written, keys.at(0), args)
+
+    for i in 0..<keys.len()
+        val mark = cx.an.complaints()
+        val sandbox = cx.an.sandboxed()
+        val queued = cx.an.tables.members.pending.len()
+        val tables = cx.an.tables.members.vtables.len()
+        val trial = extern_call(cx, span, written, keys.at(i), args)
+        val said = cx.an.complaints() > mark
+
+        cx.an.release(sandbox)
+        rewind_instantiations(cx.an, queued, tables)
+        cx.an.restore_complaints(mark)
+
+        if !said then return extern_call(cx, span, written, keys.at(i), args)
+
+    var plausible: Buf[string] = buf()
+
+    for i in 0..<keys.len()
+        val d = cx.an.tables.externs.get(keys.at(i)).unwrap()
+
+        if args.len() <= d.params.len() || (d.variadic && args.len() >= d.params.len())
+            plausible.push(keys.at(i))
+
+    if plausible.len() == 1 then return extern_call(cx, span, written, plausible.at(0), args)
+
+    var roster = ""
+
+    for i in 0..<keys.len()
+        val d = cx.an.tables.externs.get(keys.at(i)).unwrap()
+        val scope = extern_scope(cx, keys.at(i))
+        var params = ""
+
+        for j in 0..<d.params.len()
+            val p = d.params.at(j)
+            val takes = resolve_type(cx.an, scope, p.typ, no_bindings())
+
+            if j > 0 then params = params + ", "
+
+            params = params + s"${p.name}: ${type_show(takes)}"
+
+        roster = roster + s"\n    ${qualified_callee(keys.at(i), d.name)}($params)"
+
+    cx.err(span, s"no '${qualified_callee(keys.at(0), written)}' takes these arguments — the " +
+           s"declarations of that name are:$roster")
+end extern_named_call
 
 // An `extern` is declared rather than defined, so its parameters are read off the declaration and
 // its arguments are checked against them exactly as a function's are.
@@ -2300,7 +2367,7 @@ end variadic_extra
 // That was invisible while the only reachable extern was one of the caller's own module -- the two
 // scopes agree there -- and became `'x' of 'c.f' is *?` the moment a call could reach one next door,
 // since an opaque struct declared in the `c` module is not a name the layer above it can resolve.
-private extern_scope(cx: &Analyzer, key: string) -> Scope =
+extern_scope(cx: &Analyzer, key: string) -> Scope =
     cx.an.tables.extern_scopes.get(key) match
         Some(home) -> home.scope
         None -> cx.scope
@@ -2315,14 +2382,8 @@ private call_through(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
 
     local.ty match
         CFn(params, ret) ->
-            var ts: Buf[TExpr] = buf()
-
-            for i in 0..<args.len()
-                val want = if i < params.len() then Some(params.at(i)) else None
-
-                ts.push(type_expr(cx, args.at(i), want))
-
-            TExpr(span, TCallPtr(TExpr(span, TLoad(local.unique, local.ty)), ts, params, *ret))
+            call_pointer(cx, span, TExpr(span, TLoad(local.unique, local.ty)), local.ty, params, *ret,
+                         args)
         // Everything else is called through the call trait its type implements, which makes it the
         // ordinary method call it looks like: a bare-arrow parameter is a direct call and a `&Fn`
         // field an indirect one, with nothing here choosing between them -- the receiver decides,
