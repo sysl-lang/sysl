@@ -361,10 +361,10 @@ emit_llvm_text(path: string, named_target: Option[string],
     // library's bodies are lowered here while its C is compiled beside the program's.
     var linked = StdArtifact(buf(), "")
 
-    if t.builds_with_clang() && !std_from_source()
-        linked = std_artifact(t, level) match
-            Err(why) -> return Err(said(Refusal(why)))
-            Ok(found) -> found
+    std_linked(t, level, !t.builds_with_clang()) match
+        Err(why) -> return Err(said(Refusal(why)))
+        Ok(Some(found)) -> linked = found
+        Ok(None) -> ()
 
     val lowered = codegen_with_gaps(kept with { precompiled = linked.precompiled }, t, promotions)
 
@@ -836,12 +836,12 @@ private link_lowered_text(path: string, text: string, t: Target, cc: Option[stri
     // second copy of every one of them in front of the linker.
     // **Nor where the build was told to compile it from source** (`--no-std-lib`): its bodies are in
     // the text too, and its C is among the objects above.
-    if !standalone && !std_from_source()
-        std_artifact(t, level) match
-            Err(why) ->
-                discard_objects(objects)
-                return Err(Refusal(why))
-            Ok(found) -> link_with.push(found.archive)
+    std_linked(t, level, standalone) match
+        Err(why) ->
+            discard_objects(objects)
+            return Err(Refusal(why))
+        Ok(Some(found)) -> link_with.push(found.archive)
+        Ok(None) -> ()
 
     build_native(clang, text, link_with, exe, t, level, links, probed) match
         Err(why) ->
@@ -1105,10 +1105,10 @@ private test_build_from(program: Compilation, standalone: bool,
 
     var precompiled: Buf[string] = buf()
 
-    if !standalone && !std_from_source()
-        precompiled = std_artifact(t, level) match
-            Err(why) -> return Err(Refusal(why))
-            Ok(found) -> found.precompiled
+    std_linked(t, level, standalone) match
+        Err(why) -> return Err(Refusal(why))
+        Ok(Some(found)) -> precompiled = found.precompiled
+        Ok(None) -> ()
 
     val lowered = codegen_with_gaps(kept with { precompiled = precompiled }, t, promotions)
     val emitted = Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1,
