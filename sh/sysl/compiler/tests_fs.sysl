@@ -1,0 +1,875 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The filesystem module as a program sees it: `File` and the two directions it moves bytes in, the
+// questions a path can be asked, and the whole-file calls above both.
+//
+// **Everything here runs.** What is being checked is that bytes reach a real file and come back, and
+// that a failing call reports the case it failed with -- neither of which a declaration test could
+// tell from a plausible-looking one that never touched the disk. Each program is handed a directory
+// of its own as `args[1]` and builds its paths under it, so nothing here depends on the tree the
+// suite runs in, on two tests not colliding, or on a run having gone before.
+//
+// **Every output and every refusal quoted here was read out of the reference compiler**, whose
+// `FsTests` these are.
+
+// `sysl.fs` is a module of its own, so a program that touches a file says so. Written once and
+// prepended, since what each program below is about is the file and not the import. `Reader` is
+// named as well as `lines`, because `read` is the trait's member and a trait's members are reachable
+// where the trait is.
+private fst_importing() -> string =
+    "import sysl.fs.*\nimport sysl.io.{lines, Reader}\nimport sysl.text.from_utf8\n\n"
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private fst_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end fst_ready
+
+// **What a program prints and how it ended, as one text** -- the output, anything it said on the
+// error stream, and a last line naming the exit. A build that failed answers its refusal with no
+// such line, so nothing a compiler says can be mistaken for something a program printed.
+//
+// The program's directory is a fresh one inside the fresh one the source is built in, and both go
+// when the program has answered.
+private fst_ran(text: string) -> string
+    val root = make_temp_dir("sysl-fs").unwrap()
+    val work = s"$root/work"
+
+    make_dir_all(work).unwrap()
+    write_text(s"$root/main.sysl", fst_importing() + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"the build failed: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [work], "", [], true, 20000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) ->
+            val errs = out.err.unwrap_or("")
+
+            out.status match
+                Exited(code) -> s"${out.text}${errs}exit $code"
+                Signalled(signal) -> s"${out.text}${errs}signal $signal"
+                TimedOut -> s"${out.text}${errs}timed out"
+end fst_ran
+
+private fst_prints(text: string, expected: string)
+    if !fst_ready() then return
+
+    assert_eq(fst_ran(text), s"${expected}exit 0")
+
+// Where the rest of the line is the platform's to choose -- which errno a directory handed to
+// `unlink` earns differs between the two libcs -- the claim is how the line begins and that the
+// program went on to exit cleanly.
+private fst_begins(text: string, prefix: string)
+    if !fst_ready() then return
+
+    val said = fst_ran(text)
+
+    assert(said.starts_with(prefix) && said.ends_with("\nexit 0"), said)
+
+// The LLVM text of a program for a machine this is not, the library lowered from its source beside
+// it -- there is no archive for the other machine and nothing here is going to link.
+private fst_text_for(target: string, text: string) -> (int, string)
+    val root = make_temp_dir("sysl-fs").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", target, s"$root/main.sysl"],
+                       (line) -> sink.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+
+    (code, join(said.view(), "\n"))
+end fst_text_for
+
+private fst_compiles_for(target: string, text: string)
+    val (code, said) = fst_text_for(target, text)
+
+    assert_eq(code, 0)
+    assert(said.contains("define i32 @main("), s"$target: no '@main' in what was emitted")
+
+// Everything a source has to say for itself, taken the whole way through the lowering.
+private fst_err(text: string) -> string
+    val root = make_temp_dir("sysl-fs").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fst_err
+
+// -- bytes make the round trip --------------------------------------------------------------------
+
+@test("written and read back")
+fst_written_and_read_back()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/round"
+
+            write_text(p, "hello\n").unwrap()
+            print(read_text(p).unwrap())
+        """, "hello\n\n")
+
+@test("bytes that are not text survive unchanged")
+fst_bytes_that_are_not_text_survive()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/raw"
+            var b: []u8 = [0u8, 255u8, 128u8, 10u8]
+
+            write_bytes(p, b).unwrap()
+
+            var back = read_bytes(p).unwrap()
+
+            print(back.len, back[0usize], back[1usize], back[2usize], back[3usize])
+        """, "4 0 255 128 10\n")
+
+@test("an empty file reads back empty")
+fst_an_empty_file_reads_back_empty()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/empty"
+
+            write_text(p, "").unwrap()
+            print(read_bytes(p).unwrap().len, size_of(p).unwrap())
+        """, "0 0\n")
+
+// The read loop takes 8192 bytes at a time, so a file either side of that boundary is where an
+// off-by-one in the refill would live.
+@test("a file longer than one read of the loop")
+fst_a_file_longer_than_one_read()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/long"
+            var b: []u8 = [65u8; 20000usize]
+
+            write_bytes(p, b).unwrap()
+
+            var back = read_bytes(p).unwrap()
+
+            print(back.len, back[0usize], back[19999usize])
+        """, "20000 65 65\n")
+
+@test("creating over a file that is there empties it first")
+fst_creating_over_a_file_empties_it()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/over"
+
+            write_text(p, "aaaaaaaaaa").unwrap()
+            write_text(p, "b").unwrap()
+            print(read_text(p).unwrap())
+        """, "b\n")
+
+@test("appending lands after what was there")
+fst_appending_lands_after()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/app"
+
+            write_text(p, "one").unwrap()
+            append_text(p, "two").unwrap()
+            append_text(p, "three").unwrap()
+            print(read_text(p).unwrap())
+        """, "onetwothree\n")
+
+@test("appending to a file that is not there makes it")
+fst_appending_makes_a_missing_file()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/fresh"
+
+            append_text(p, "new").unwrap()
+            print(read_text(p).unwrap())
+        """, "new\n")
+
+// -- a file is a Reader ---------------------------------------------------------------------------
+
+// The whole payoff of implementing the trait that was already there: `lines` was written against
+// `Reader` with no idea a file would exist, and reads one with nothing added to it.
+@test("the line cursor reads a file with nothing added to it")
+fst_the_line_cursor_reads_a_file()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/lines"
+
+            write_text(p, "one\ntwo\nthree\n").unwrap()
+
+            var f = open(p).unwrap()
+
+            for line in lines(&f)
+                print("[", line, "]")
+
+            print("failed", f.failed())
+            f.close().unwrap()
+        """, "[ one ]\n[ two ]\n[ three ]\nfailed false\n")
+
+// A file need not end in a newline, and the last line of one that does not is still a line.
+@test("a final line with no newline after it is still a line")
+fst_a_final_line_with_no_newline()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/ragged"
+
+            write_text(p, "one\ntwo").unwrap()
+
+            var f = open(p).unwrap()
+            var n = 0
+
+            for line in lines(&f)
+                n += 1
+                print("[", line, "]")
+
+            print("lines", n)
+            f.close().unwrap()
+        """, "[ one ]\n[ two ]\nlines 2\n")
+
+@test("and a file of nothing but newlines is that many empty lines")
+fst_nothing_but_newlines()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/blank"
+
+            write_text(p, "\n\n\n").unwrap()
+
+            var f = open(p).unwrap()
+            var n = 0
+
+            for line in lines(&f)
+                n += 1
+                print(n, line.len)
+
+            f.close().unwrap()
+        """, "1 0\n2 0\n3 0\n")
+
+@test("a read hands back the prefix it filled, not the room it was offered")
+fst_a_read_hands_back_the_prefix()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/short"
+
+            write_text(p, "abc").unwrap()
+
+            var f = open(p).unwrap()
+            var room: [64]u8
+            var got = f.read(room[..])
+
+            print("asked", room.len, "got", got.len)
+            f.close().unwrap()
+        """, "asked 64 got 3\n")
+
+@test("a read past the end is empty, and says so every time")
+fst_a_read_past_the_end_is_empty()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/end"
+
+            write_text(p, "x").unwrap()
+
+            var f = open(p).unwrap()
+            var room: [8]u8
+
+            print(f.read(room[..]).len, f.read(room[..]).len, f.read(room[..]).len)
+            print("at_end", f.at_end(), "failed", f.failed())
+            f.close().unwrap()
+        """, "1 0 0\nat_end true failed false\n")
+
+// -- a file is a Writer ---------------------------------------------------------------------------
+
+// The other half of the payoff: anything that renders into a `*Writer` renders into a file.
+@test("a value renders itself into a file")
+fst_a_value_renders_into_a_file()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/render"
+            var f = create(p).unwrap()
+
+            display_int(42i64, &f, FormatSpec(6, -1, false))
+            display_str("!", &f, FormatSpec(0, -1, false))
+            f.close().unwrap()
+
+            print("[", read_text(p).unwrap(), "]")
+        """, "[     42! ]\n")
+
+@test("writing nothing writes nothing")
+fst_writing_nothing_writes_nothing()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/none"
+            var f = create(p).unwrap()
+            var b: []u8 = []
+
+            f.write(b)
+            print("failed", f.failed())
+            f.close().unwrap()
+            print(size_of(p).unwrap())
+        """, "failed false\n0\n")
+
+@test("what was written is not there until it is flushed, and then it is")
+fst_flushed_and_then_it_is_there()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/flush"
+            var f = create(p).unwrap()
+
+            f.write("buffered".bytes)
+            f.flush().unwrap()
+            print(read_text(p).unwrap())
+            f.close().unwrap()
+        """, "buffered\n")
+
+// -- a handle survives being copied, and closing is idempotent ------------------------------------
+
+// The reason `File` holds its state through a reference rather than holding the pointer itself. A
+// struct is a value, so this is genuinely a second `File`; if it held the handle directly then one
+// of these closes would be freeing what the other still holds.
+@test("a copy closes the same file, once")
+fst_a_copy_closes_the_same_file()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/copy"
+            var f = create(p).unwrap()
+            var g = f
+
+            f.write("shared".bytes)
+            g.close().unwrap()
+
+            print("f closed", f.closed(), "g closed", g.closed())
+            print(read_text(p).unwrap())
+        """, "f closed true g closed true\nshared\n")
+
+@test("closing twice is not an error")
+fst_closing_twice_is_not_an_error()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/twice"
+            var f = create(p).unwrap()
+
+            f.write("x".bytes)
+            print(f.close().is_ok(), f.close().is_ok(), f.close().is_ok())
+        """, "true true true\n")
+
+// Which is what makes `defer` the idiom the module is written for: a function that closes on one
+// path and defers it for the rest reaches the end having done both.
+@test("a deferred close runs after an early return")
+fst_a_deferred_close_after_an_early_return()
+    fst_prints(raw"""
+        took(p: string) -> long
+            var f = open(p).unwrap()
+
+            defer f.close()
+
+            if f.size().unwrap() > 2i64 then return 1i64
+
+            0i64
+
+        main(args: []string)
+            var p = args[1] + "/defer"
+
+            write_text(p, "abcdef").unwrap()
+            print(took(p))
+        """, "1\n")
+
+// -- seeking, telling and sizing ------------------------------------------------------------------
+
+@test("size leaves the position where it found it")
+fst_size_leaves_the_position()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/seek"
+
+            write_text(p, "0123456789").unwrap()
+
+            var f = open(p).unwrap()
+            var room: [4]u8
+
+            f.read(room[..])
+            print("at", f.tell().unwrap(), "size", f.size().unwrap(), "still at", f.tell().unwrap())
+            f.close().unwrap()
+        """, "at 4 size 10 still at 4\n")
+
+@test("a seek moves where the next read happens")
+fst_a_seek_moves_the_next_read()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/back"
+
+            write_text(p, "0123456789").unwrap()
+
+            var f = open(p).unwrap()
+            var room: [3]u8
+
+            f.seek(6i64).unwrap()
+
+            var got = f.read(room[..])
+
+            print(from_utf8(got).unwrap())
+            f.close().unwrap()
+        """, "678\n")
+
+@test("size_of asks without the caller opening anything")
+fst_size_of_asks_without_opening()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/sized"
+
+            write_text(p, "seven!!").unwrap()
+            print(size_of(p).unwrap())
+        """, "7\n")
+
+// -- what a path is -------------------------------------------------------------------------------
+
+@test("a file that is there, and one that is not")
+fst_a_file_that_is_there_and_one_that_is_not()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/here"
+
+            write_text(p, "x").unwrap()
+            print(exists(p), exists(args[1] + "/nowhere"))
+            print(is_file(p), is_dir(p))
+            print(readable(p), writable(p))
+        """, "true false\ntrue false\ntrue true\n")
+
+@test("a directory answers the other way round")
+fst_a_directory_answers_the_other_way()
+    fst_prints(raw"""
+        main(args: []string)
+            print(exists(args[1]), is_dir(args[1]), is_file(args[1]))
+        """, "true true false\n")
+
+// -- directories ----------------------------------------------------------------------------------
+
+@test("one is made, found, and removed")
+fst_a_directory_made_found_and_removed()
+    fst_prints(raw"""
+        main(args: []string)
+            var d = args[1] + "/sub"
+
+            print(exists(d))
+            make_dir(d).unwrap()
+            print(exists(d), is_dir(d))
+            remove_dir(d).unwrap()
+            print(exists(d))
+        """, "false\ntrue true\nfalse\n")
+
+@test("a file goes in one and is read back through the path that names both")
+fst_a_file_goes_in_a_directory()
+    fst_prints(raw"""
+        main(args: []string)
+            var d = args[1] + "/nest"
+
+            make_dir(d).unwrap()
+            write_text(d + "/inner", "deep").unwrap()
+            print(read_text(d + "/inner").unwrap())
+        """, "deep\n")
+
+// -- renaming -------------------------------------------------------------------------------------
+
+@test("a file moves, and the old name stops being there")
+fst_a_file_moves()
+    fst_prints(raw"""
+        main(args: []string)
+            var a = args[1] + "/from"
+            var b = args[1] + "/to"
+
+            write_text(a, "moved").unwrap()
+            rename(a, b).unwrap()
+            print(exists(a), exists(b))
+            print(read_text(b).unwrap())
+        """, "false true\nmoved\n")
+
+@test("and it replaces whatever was at the destination")
+fst_a_rename_replaces_the_destination()
+    fst_prints(raw"""
+        main(args: []string)
+            var a = args[1] + "/src"
+            var b = args[1] + "/dst"
+
+            write_text(a, "new").unwrap()
+            write_text(b, "old").unwrap()
+            rename(a, b).unwrap()
+            print(read_text(b).unwrap())
+        """, "new\n")
+
+// -- what a failure says --------------------------------------------------------------------------
+
+// The reason `IoError` is an enum and not a number: a caller that wants to act on *why* matches, and
+// the match is exhaustive where a comparison against 2 is a guess that compiled.
+@test("opening something that is not there is NotFound, by name")
+fst_opening_something_absent_is_not_found()
+    fst_prints(raw"""
+        main(args: []string)
+            open(args[1] + "/absent") match
+                Ok(f)  -> print("opened")
+                Err(e) -> e match
+                    NotFound -> print("not found")
+                    _        -> print("something else:", e)
+        """, "not found\n")
+
+@test("reading a directory as a file fails rather than answering bytes")
+fst_reading_a_directory_as_a_file_fails()
+    fst_begins(raw"""
+        main(args: []string)
+            read_bytes(args[1]) match
+                Ok(b)  -> print("read", b.len)
+                Err(e) -> print("no:", e)
+        """, "no:")
+
+@test("writing under a path whose parent is a file is NotADirectory")
+fst_writing_under_a_file_is_not_a_directory()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/plain"
+
+            write_text(p, "x").unwrap()
+
+            write_text(p + "/under", "y") match
+                Ok(_)  -> print("wrote")
+                Err(e) -> print(e, e.code())
+        """, "not a directory 20\n")
+
+@test("making a directory that is already there is AlreadyExists")
+fst_making_a_directory_twice_is_already_exists()
+    fst_prints(raw"""
+        main(args: []string)
+            var d = args[1] + "/dup"
+
+            make_dir(d).unwrap()
+
+            make_dir(d) match
+                Ok(_)  -> print("made")
+                Err(e) -> print(e, e.code())
+        """, "already exists 17\n")
+
+// The one code in the set the two platforms number differently, which is why the library reads it
+// through a call gated on the platform rather than as a literal -- and why the number is left out of
+// the claim here.
+@test("removing a directory with something in it is DirectoryNotEmpty")
+fst_removing_a_full_directory_is_not_empty()
+    fst_begins(raw"""
+        main(args: []string)
+            var d = args[1] + "/full"
+
+            make_dir(d).unwrap()
+            write_text(d + "/thing", "x").unwrap()
+
+            remove_dir(d) match
+                Ok(_)  -> print("removed")
+                Err(e) -> e match
+                    DirectoryNotEmpty -> print("not empty", e.code())
+                    _                 -> print("something else:", e)
+        """, "not empty ")
+
+@test("removing a file that is not there is NotFound")
+fst_removing_an_absent_file_is_not_found()
+    fst_prints(raw"""
+        main(args: []string)
+            remove_file(args[1] + "/ghost") match
+                Ok(_)  -> print("removed")
+                Err(e) -> print(e, e.code())
+        """, "no such file or directory 2\n")
+
+@test("removing a directory with the call that means files refuses it")
+fst_removing_a_directory_as_a_file_is_refused()
+    fst_begins(raw"""
+        main(args: []string)
+            var d = args[1] + "/adir"
+
+            make_dir(d).unwrap()
+
+            remove_file(d) match
+                Ok(_)  -> print("removed", exists(d))
+                Err(e) -> print("refused:", e)
+        """, "refused:")
+
+@test("renaming something that is not there is NotFound")
+fst_renaming_something_absent_is_not_found()
+    fst_prints(raw"""
+        main(args: []string)
+            rename(args[1] + "/none", args[1] + "/other") match
+                Ok(_)  -> print("moved")
+                Err(e) -> print(e, e.code())
+        """, "no such file or directory 2\n")
+
+@test("sizing something that is not there reports the open's failure, not zero")
+fst_sizing_something_absent_reports_the_failure()
+    fst_prints(raw"""
+        main(args: []string)
+            size_of(args[1] + "/missing") match
+                Ok(n)  -> print("size", n)
+                Err(e) -> print(e)
+        """, "no such file or directory\n")
+
+// `?` is what makes the layered calls readable, and this is it working through two of them:
+// `read_text` propagates out of `read_bytes`, which propagated out of `open`.
+@test("a failure propagates out through the layers with '?'")
+fst_a_failure_propagates_with_question()
+    fst_prints(raw"""
+        first_line(p: string) -> Result[string, IoError]
+            var t = read_text(p)?
+
+            Ok(t)
+
+        main(args: []string)
+            first_line(args[1] + "/nope") match
+                Ok(s)  -> print("got", s)
+                Err(e) -> print("stopped at:", e)
+        """, "stopped at: no such file or directory\n")
+
+// Everything below is about the same hazard: `fclose` frees the handle, so the pointer the struct
+// goes on holding names storage C has released. Every member has to ask before it reaches, and each
+// of these is one member asking.
+@test("using a file after it is closed reports rather than reaching a freed handle")
+fst_using_a_closed_file_reports()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/shut"
+
+            write_text(p, "abcdef").unwrap()
+
+            var f = open(p).unwrap()
+
+            f.close().unwrap()
+            print(f.size().unwrap_err(), f.tell().unwrap_err())
+            print(f.seek(0i64).unwrap_err(), f.flush().unwrap_err())
+        """, "the file is not open the file is not open\nthe file is not open the file is not open\n")
+
+// A closed file must not read as an *empty* one: empty means the end of the input, and a program
+// told that would conclude it had read the whole file when what it had done was close it too early.
+// So the read latches instead.
+@test("a read after the close latches rather than answering quietly empty")
+fst_a_read_after_the_close_latches()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/early"
+
+            write_text(p, "abcdef").unwrap()
+
+            var f = open(p).unwrap()
+            var room: [4]u8
+
+            f.close().unwrap()
+
+            var got = f.read(room[..])
+
+            print("got", got.len, "failed", f.failed(), "at_end", f.at_end())
+        """, "got 0 failed true at_end true\n")
+
+@test("and a write after it latches too")
+fst_a_write_after_the_close_latches()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/late"
+            var f = create(p).unwrap()
+
+            f.write("in".bytes)
+            f.close().unwrap()
+            print("failed", f.failed())
+            f.write("out".bytes)
+            print("failed", f.failed())
+            print(read_text(p).unwrap())
+        """, "failed false\nfailed true\nin\n")
+
+@test("the closed handle's error is EBADF, which is what the platform reports for the same mistake")
+fst_the_closed_handles_error_is_ebadf()
+    fst_prints(raw"""
+        main(args: []string)
+            var p = args[1] + "/bad"
+
+            write_text(p, "x").unwrap()
+
+            var f = open(p).unwrap()
+
+            f.close().unwrap()
+            print(f.size().unwrap_err().code())
+        """, "9\n")
+
+@test("an error renders as its sentence and carries its number")
+fst_an_error_renders_as_its_sentence()
+    fst_prints(raw"""
+        main(args: []string)
+            var e = open(args[1] + "/x").unwrap_err()
+
+            print(e)
+            print(e.message(), e.code())
+            print(Other(99), Other(99).code())
+        """, "no such file or directory\nno such file or directory 2\nerror 99 99\n")
+
+// **A variant is a name of its module, reached unqualified** -- so a second enum in the library
+// naming one `Other` or `File` would give the older name a second answer, and an ordinary use of it
+// becomes ambiguous one program away. Neither is refused at the declaration, which is what makes
+// this a test: `Kind` is `Regular` and `Special` for that reason, and this is what says the two
+// names it gave up still mean what they meant.
+@test("and a name this module already had is not taken by a later enum's variant")
+fst_an_older_name_is_not_taken_by_a_variant()
+    fst_prints(raw"""
+        main(args: []string)
+            var f = create(args[1] + "/k").unwrap()      // 'File', the handle
+
+            f.close().unwrap()
+
+            print(metadata(args[1] + "/k").unwrap().kind())
+            print(Other(99).code())                      // 'Other', the IoError
+        """, "file\n99\n")
+
+// -- the platform branches the module carries -----------------------------------------------------
+
+// The two things in the module that differ between the platforms, built for the platform this is
+// not. A conditional gates **text**, so the branch a build does not take is never lexed; what closes
+// it is compiling for the other machine. There is nothing here to execute the result on, so reading
+// it is the whole of what these can do -- and it is enough, because what would rot in an untaken
+// branch is a name or a signature, and both are settled before any instruction is chosen.
+
+// `errno` is a macro over a call on both platforms and the two libcs spell the function
+// differently; `mkdir`'s `mode_t` is the same shape of hazard one argument down.
+@test("compile for Linux as well as for the machine the suite runs on")
+fst_compiles_for_linux()
+    if !fst_ready() then return
+
+    val src = "import sysl.fs.*\n\nprint(exists(\"/\"), is_dir(\"/\"))\n"
+
+    fst_compiles_for("x86_64-linux", src)
+    fst_compiles_for("aarch64-linux", src)
+
+@test("and the whole surface does, not merely the two calls the gate is under")
+fst_the_whole_surface_compiles_for_linux()
+    if !fst_ready() then return
+
+    val (code, said) = fst_text_for("x86_64-linux", raw"""
+        import sysl.fs.*
+
+        main(args: []string)
+            write_text(args[1], "x").unwrap()
+            make_dir(args[1] + "/d").unwrap()
+            rename(args[1], args[1] + "/e").unwrap()
+            remove_file(args[1]).unwrap()
+            remove_dir(args[1]).unwrap()
+            print(read_text(args[1]).unwrap(), size_of(args[1]).unwrap())
+        """)
+
+    assert_eq(code, 0)
+    assert(said.contains("define i32 @main("), "no '@main' in what was emitted")
+
+    // The Linux arm of the one call the two libcs spell differently, which is the reference's own
+    // text for this program.
+    assert(said.contains("declare ptr @__errno_location()"), "the Linux spelling of errno is not declared")
+
+// -- what a file needed from the trait system, asked of an ordinary program ------------------------
+
+// `Reader` and `Writer` both require `Fallible`, so a type that is both carries one `failed`, and it
+// is the same answer through either trait object and through the value.
+@test("a type may be a Reader and a Writer at once, and carries one 'failed' between them")
+fst_a_reader_and_a_writer_at_once()
+    fst_prints(raw"""
+        struct Both
+            n: usize
+            over: bool
+        end Both
+
+        impl Fallible for Both
+            override failed(*self) -> bool = self.over
+
+        impl Reader for Both
+            read(*self, into: []u8) -> []const u8 = into[0..<0usize]
+
+        impl Writer for Both
+            write(*self, bytes: []const u8)
+                self.n += bytes.len
+                if self.n > 3usize then self.over = true
+
+        main(args: []string)
+            var b = Both(0usize, false)
+            var w: *Writer = &b
+            var r: *Reader = &b
+
+            display_str("ab", w, FormatSpec(0, -1, false))
+            print(b.n, b.failed(), w.failed(), r.failed())
+            display_str("cd", w, FormatSpec(0, -1, false))
+            print(b.n, b.failed(), w.failed(), r.failed())
+        """, "2 false false false\n4 true true true\n")
+
+// And the reason it is one trait rather than two members of one name: two nullary members differ in
+// no argument a call could write, and a program that uses a file has both traits in scope by
+// definition, so scope cannot tell them apart either. Permitted is not the same as answerable.
+@test("two unrelated traits may each declare 'failed', and then a call cannot say which was meant")
+fst_two_traits_each_declare_failed()
+    if !fst_ready() then return
+
+    val said = fst_err(raw"""
+        trait Src
+            failed(*self) -> bool = false
+
+        trait Snk
+            failed(*self) -> bool = false
+
+        struct Two
+            n: int
+        end Two
+
+        impl Src for Two
+
+        impl Snk for Two
+
+        var t = Two(0)
+        print(t.failed())
+        """)
+
+    assert(said.starts_with("error: 'failed' on Two comes from Src and Snk, and each is in scope here — " +
+                            "nothing in the call says which was meant\n"), said)
+    assert(said.contains("main.sysl:16:9\n"), said)
+
+// A trait whose every method has a default leaves nothing to write, so the block is optional and the
+// `impl` line alone is a complete implementation. That claim is what keeps the shared latch from
+// costing every sink a body it does not need.
+@test("a sink that cannot fail opts into the latch on one line, with no block at all")
+fst_a_sink_opts_into_the_latch_on_one_line()
+    fst_prints(raw"""
+        struct Sink
+            n: usize
+        end Sink
+
+        impl Fallible for Sink
+
+        impl Writer for Sink
+            write(*self, bytes: []const u8) = self.n += bytes.len
+
+        main(args: []string)
+            var s = Sink(0usize)
+            var w: *Writer = &s
+
+            display_str("abc", w, FormatSpec(0, -1, false))
+            print(s.n, w.failed(), s.failed())
+        """, "3 false false\n")
