@@ -1,0 +1,185 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A diagnostic quoting a TYPE names it as a reader wrote it: a file-private struct or enum that a
+// sibling file's public one made take a slot is `m.Log`, never `m.Log.private1` -- in a mismatch, in
+// a missing member, in a refused trait bound, and inside the type arguments of an instantiation.
+//
+// **This is the user's rule for this compiler and it differs from the reference on purpose.** The
+// installed sysl 0.0.151 prints the slot in all of these (`'m.Log.private1' has no field or property
+// 'nope'`); every message below is otherwise its own text, read off it over the same two files, with
+// the slot taken out and a function's `m$f1` key written `m.f1` (the qualified-name rule).
+//
+// `type_show` itself still prints the slot, being what `emit-typed` renders and what the typed
+// sweeps compare byte for byte against the reference; the slot comes off at `readable_keys`, the
+// boundary every diagnostic crosses.
+
+private var tss_library_cache: Buf[Program] = buf()
+private var tss_library_read: bool = false
+
+private tss_library() -> Buf[Program]
+    if tss_library_read then return tss_library_cache
+
+    tss_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tss_library_cache = units
+
+    tss_library_cache
+end tss_library
+
+private tss_no_library() -> bool
+    if tss_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end tss_no_library
+
+// The whole report the module is refused with when `b.sysl`'s tail is `body`.
+private tss_err(body: string) -> string
+    var units: Buf[Program] = buf()
+    val library = tss_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    val files = [("main.sysl", "import m\n\nprint(m.run())\n"), ("a.sysl", tss_public()),
+                 ("b.sysl", tss_private() + body)]
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return parsed.report.at(0).message
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end tss_err
+
+// The public declarations, whose names the private file's own shadow.
+private tss_public() -> string =
+    "module m\n\nstruct Log\n    n: int\n\nenum Lvl\n    Hi\n    Lo(n: int)\n\nstruct Box[T]\n    v: T\n\n" +
+    "trait Named\n    name(self) -> string\n\nrun() -> int = 1\n"
+
+// Lines 1 to 10 of `b.sysl`; a case's own line is line 11.
+private tss_private() -> string =
+    "module m\n\nprivate struct Log\n    s: string\n\nprivate enum Lvl\n    Up(s: string)\n\n" +
+    "private need[T: Named](x: T) -> int = 1\n\n"
+
+private tss_only(out: string, part: string)
+    assert(out.contains(part), s"expected '$part', got: $out")
+    assert(!out.contains("private1"), s"a slot reached the reader: $out")
+    assert(out.index_of("error:").unwrap() == out.last_index_of("error:").unwrap(), s"more than one error: $out")
+
+@test("a mismatch names a private struct without its slot")
+tss_a_mismatch_names_a_private_struct()
+    if tss_no_library() then return
+
+    tss_only(tss_err("private f1() -> int = Log(\"a\")\n"),
+             "error: function 'm.f1' should return int, but its body yields m.Log\n --> b.sysl:11:1")
+
+@test("a missing member names a private struct without its slot")
+tss_a_missing_member_names_a_private_struct()
+    if tss_no_library() then return
+
+    tss_only(tss_err("private f2(l: Log) -> int = l.nope\n"),
+             "error: 'm.Log' has no field or property 'nope'\n --> b.sysl:11:31")
+
+@test("a refused trait bound names a private struct without its slot")
+tss_a_bound_names_a_private_struct()
+    if tss_no_library() then return
+
+    tss_only(tss_err("private f3() -> int = need(Log(\"a\"))\n"),
+             "error: 'm.need' requires its type parameter 'T' to implement 'm.Named', but m.Log does not\n" +
+             " --> b.sysl:11:23")
+
+@test("a mismatch names a private enum without its slot")
+tss_a_mismatch_names_a_private_enum()
+    if tss_no_library() then return
+
+    tss_only(tss_err("private f4() -> int = Up(\"x\")\n"),
+             "error: function 'm.f4' should return int, but its body yields m.Lvl\n --> b.sysl:11:1")
+
+@test("a missing member names a private enum without its slot")
+tss_a_missing_member_names_a_private_enum()
+    if tss_no_library() then return
+
+    tss_only(tss_err("private f5(v: Lvl) -> int = v.nope\n"),
+             "error: 'm.Lvl' has no property 'nope'\n --> b.sysl:11:31")
+
+@test("a refused trait bound names a private enum without its slot")
+tss_a_bound_names_a_private_enum()
+    if tss_no_library() then return
+
+    tss_only(tss_err("private f6() -> int = need(Up(\"x\"))\n"),
+             "error: 'm.need' requires its type parameter 'T' to implement 'm.Named', but m.Lvl does not\n" +
+             " --> b.sysl:11:23")
+
+@test("a mismatch names an instantiation over a private struct without the slot")
+tss_a_mismatch_names_an_instantiation()
+    if tss_no_library() then return
+
+    tss_only(tss_err("private f7() -> int = Box(Log(\"a\"))\n"),
+             "error: function 'm.f7' should return int, but its body yields m.Box[m.Log]\n --> b.sysl:11:1")
+
+@test("a missing member names an instantiation over a private struct without the slot")
+tss_a_missing_member_names_an_instantiation()
+    if tss_no_library() then return
+
+    tss_only(tss_err("private f8(b: Box[Log]) -> int = b.nope\n"),
+             "error: 'm.Box[m.Log]' has no field or property 'nope'\n --> b.sysl:11:36")
+
+@test("a refused trait bound names an instantiation over a private struct without the slot")
+tss_a_bound_names_an_instantiation()
+    if tss_no_library() then return
+
+    tss_only(tss_err("private f9() -> int = need(Box(Log(\"a\")))\n"),
+             "error: 'm.need' requires its type parameter 'T' to implement 'm.Named', but m.Box[m.Log] " +
+             "does not\n --> b.sysl:11:23")
+
+@test("an argument mismatch names both private types, inside an instantiation and out")
+tss_an_argument_names_both_private_types()
+    if tss_no_library() then return
+
+    tss_only(tss_err("private f10() -> Box[Lvl] = Box(Log(\"a\"))\n"),
+             "error: 'v' of 'm.Box[m.Lvl]' is m.Lvl, but m.Log was given\n --> b.sysl:11:33")
+
+// -- the boundary and the printer --------------------------------------------------------------------
+
+@test("a private slot comes off a dotted type rendering, which carries no '$'")
+tss_a_slot_comes_off_a_dotted_run()
+    assert_eq(readable_keys("yields m.Log.private1"), "yields m.Log")
+    assert_eq(readable_keys("'m.Box[m.Log.private1]'"), "'m.Box[m.Log]'")
+    assert_eq(readable_keys("yields m.Log.private12."), "yields m.Log.")
+    assert_eq(readable_keys("(Log.private1, *a.b.Lvl.private2)"), "(Log, *a.b.Lvl)")
+
+@test("a dotted run with no slot in it is left as it was written")
+tss_a_dotted_run_without_a_slot_is_kept()
+    assert_eq(readable_keys("'m.Log' has no field 'private'"), "'m.Log' has no field 'private'")
+    assert_eq(readable_keys("x.privately and 1.2"), "x.privately and 1.2")
+    assert_eq(readable_keys("private1 is a name"), "private1 is a name")
+
+@test("type_show keeps the slot, which is what emit-typed prints and the reference renders")
+tss_type_show_keeps_the_slot()
+    val log = Struct(StructType(module_qualify("m", "Log.private1"), buf(), buf(), false, None, None, false))
+    var args: Buf[Type] = buf()
+
+    args.push(log)
+
+    val boxed = Struct(StructType(module_qualify("m", "Box"), args, buf(), false, None, None, false))
+
+    assert_eq(type_show(log), "m.Log.private1")
+    assert_eq(type_show(boxed), "m.Box[m.Log.private1]")

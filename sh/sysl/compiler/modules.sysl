@@ -129,17 +129,23 @@ qualified_name(key: string) -> string = readable_keys(spelled_key(key))
 // is whatever a table was keyed by, and dozens of refusals interpolate one straight into their text;
 // doing it here means a key cannot reach a reader however the message was put together. What counts
 // as a key is a run of name characters with a module in front of a `$` -- so `'$'`, a `$name`
-// placeholder and `'..$n'` are left as they were written, and text with no `$` is not touched at
-// all. A `$24` is a `$` the name itself held, and reads as one again. A root-module name has no
-// module to show and prints bare, which it already is.
+// placeholder and `'..$n'` are left as they were written. A `$24` is a `$` the name itself held, and
+// reads as one again. A root-module name has no module to show and prints bare, which it already is.
+//
+// **A TYPE is quoted through `type_show`, which has already dotted the key** -- `m.Log.private1`,
+// `m.Box[m.Log.private1]` -- so a private slot is taken out of every dotted run too, `$` or none.
+// `type_show` itself keeps the slot, being what `emit-typed` prints and the reference's own
+// rendering: the rule lives here, at the one boundary every diagnostic crosses, rather than in a
+// mode of the printer that forty refusals would each have to ask for. A slot is never the first
+// segment of a run, and text with neither a `$` nor a `.private` in it is not touched at all.
 readable_keys(message: string) -> string
     val bytes = message.bytes
-    var dollar = false
+    var marked = false
 
-    for b in bytes
-        if b == u8('$') then dollar = true
+    for k in 0..<bytes.len
+        if bytes[k] == u8('$') || slot_at(bytes, k) then marked = true
 
-    if !dollar then return message
+    if !marked then return message
 
     var out: Buf[u8] = buf()
     var i: usize = 0
@@ -166,7 +172,7 @@ private push_readable(out: *Buf[u8], run: []const u8)
     val sep = key_separator(run)
 
     if sep < 0
-        push_unguarded(out, run)
+        push_unguarded(out, drop_private_slots(from_utf8_unchecked(run)).bytes)
         return
 
     val at = usize(sep)
@@ -195,6 +201,19 @@ private key_separator(run: []const u8) -> isize
 
     -1
 end key_separator
+
+// Whether a `.private` begins at `k` -- the one thing a dotted run with no `$` in it may need
+// taken out.
+private slot_at(bytes: []const u8, k: usize) -> bool
+    val mark = ".private"
+
+    if k + mark.bytes.len > bytes.len then return false
+
+    for j in 0..<mark.bytes.len
+        if bytes[k + j] != mark.bytes[j] then return false
+
+    true
+end slot_at
 
 // Whether the `$` at `k` is the start of a `$24`, a dollar the name held rather than a separator.
 private guarded_at(run: []const u8, k: usize) -> bool =
