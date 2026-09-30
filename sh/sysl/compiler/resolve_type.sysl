@@ -1071,6 +1071,26 @@ private filled_targs(a: &Analysis, scope: Scope, span: Span, key: string, home: 
     Some(filled)
 end filled_targs
 
+// Holds the arguments a generic **type** was applied to -- the ones a default filled included -- to
+// what the declaration asked of its parameters, now if that can be answered and once every `impl`
+// is registered if it cannot.
+//
+// A bound is resolved in the declaration's terms and the refusal belongs to the file that wrote the
+// application. **Only a settled argument list is asked**: a parameter standing in for itself is
+// answered by its own bounds, where the body it stands in is read at a type.
+private applied_bounds(a: &Analysis, scope: Scope, span: Span, key: string, home: Scope,
+                       tparams: Buf[string], bounds: Buf[NamedBounds], targs: Buf[Type])
+    if bounds.is_empty() || tparams.len() != targs.len() then return
+
+    for i in 0..<targs.len()
+        if targs.at(i) == Unknown || mentions_abstract(targs.at(i)) then return
+
+    if a.tables.members.hoisted then
+        check_param_bounds(a, home, span, key, tparams, bounds, targs, buf(), "type parameter", scope)
+    else a.tables.members.deferred.push(DeferredBound(key, tparams, bounds, targs, span, home, scope,
+                                                      "type parameter"))
+end applied_bounds
+
 // A struct at these arguments.
 //
 // **The record is registered before its fields are resolved**, so a declaration that mentions itself
@@ -1085,6 +1105,9 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     if fill.is_none() then return Unknown
 
     val targs = fill.unwrap()
+
+    applied_bounds(a, scope, span, key, home, d.tparams, d.bounds, targs)
+
     val inst = instance_key(key, targs)
     val already = a.tables.struct_insts.get(inst)
 
@@ -1135,6 +1158,9 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
     if fill.is_none() then return Unknown
 
     val targs = fill.unwrap()
+
+    applied_bounds(a, scope, span, key, home, d.tparams, d.bounds, targs)
+
     val inst = instance_key(key, targs)
     val already = a.tables.enum_insts.get(inst)
 
