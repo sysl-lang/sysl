@@ -1,0 +1,797 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{split, Search}
+
+// `sysl test` end to end: the hooks a module writes, the verdict a run reads off a process, the
+// options that narrow a run, the report, and what a test build and an ordinary build each leave out.
+// **Every string quoted here was read off the reference compiler (0.0.152)** run on the same source
+// as a one-project tree; none of it is composed.
+
+// -- a tree built and run ---------------------------------------------------------------------------
+
+private trn_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A project holding `files`, each at the path relative to the root it names -- a file declaring
+// `module m` sits in `m/`, as a project requires.
+private trn_project(files: Buf[(string, string)]) -> string
+    val root = make_temp_dir("sysl-trn").unwrap()
+
+    for i in 0..<files.len()
+        val (name, text) = files.at(i)
+        val file = s"$root/$name"
+
+        make_dir_all(parent_of(file).unwrap_or(root)).unwrap()
+        write_text(file, text).unwrap()
+
+    root
+end trn_project
+
+private trn_one(name: string, text: string) -> Buf[(string, string)]
+    var files: Buf[(string, string)] = buf()
+
+    files.push((name, text))
+    files
+
+// The tree built as a test binary and run with the options given: every outcome, in the order the run
+// reported them, or nothing where the library or a toolchain is not on this machine.
+private trn_outcomes_of(files: Buf[(string, string)], opts: TestOptions) -> Option[Buf[Outcome]]
+    if !trn_ready() then return None
+
+    val root = trn_project(files)
+
+    val build = test_build_of(root, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(refusal))
+            return None
+        Ok(made) -> made
+
+    if !build.emitted.report.is_empty()
+        remove_dir_all(root).unwrap_or(())
+        assert(false, analysis_report(build.emitted.report))
+        return None
+    end if
+
+    val exe = build_test_binary(root, build, None, DefaultOptimization) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return None
+        Ok(built) -> built
+
+    val chosen = selected_tests(build.tests, opts.filter)
+    val ran = run_selected(exe, chosen, opts, build.tests.len() - chosen.len(), piece -> ())
+
+    discard_test_binary(exe)
+    remove_dir_all(root).unwrap_or(())
+    Some(ran)
+end trn_outcomes_of
+
+private trn_outcomes(text: string, opts: TestOptions = TestOptions(None, false)) -> Option[Buf[Outcome]] =
+    trn_outcomes_of(trn_one("main.sysl", text), opts)
+
+// The same for a file declaring `module m`.
+private trn_outcomes_m(text: string) -> Option[Buf[Outcome]] =
+    trn_outcomes_of(trn_one("m/m.sysl", text), TestOptions(None, false))
+
+// Every test passed, and the message names each one that did not.
+private trn_all_passed(ran: Buf[Outcome])
+    var bad = ""
+
+    for i in 0..<ran.len()
+        if !ran.at(i).passed()
+            bad = bad + s"${ran.at(i).test.display}: ${ran.at(i).detail.unwrap_or("")}\n"
+
+    assert(bad == "", bad)
+    assert(ran.len() > 0, "something ran")
+end trn_all_passed
+
+private trn_displays(ran: Buf[Outcome]) -> string
+    var out = ""
+
+    for i in 0..<ran.len()
+        if i > 0 then out = out + ","
+
+        out = out + ran.at(i).test.display
+
+    out
+end trn_displays
+
+private trn_detail(o: Outcome) -> string = o.detail.unwrap_or("<passed>")
+
+// -- the hooks a module writes around its tests -------------------------------------------------------
+
+@test("'@setup' runs once in each test's process, and the test sees what it left")
+trn_setup_runs_once_per_process()
+    trn_outcomes_m("module m\n\nvar ran: int = 0\n\n@setup\ns() =\n    ran = ran + 1\n\n" +
+                   "@test\none() =\n    assert(ran == 1, \"setup ran exactly once before this test\")\n\n" +
+                   "@test\ntwo() =\n    assert(ran == 1, \"and once before this one, in a process of its own\")\n") match
+        None -> ()
+        Some(ran) -> trn_all_passed(ran)
+
+@test("'@teardown' runs in the test's process where the test returned")
+trn_teardown_runs_in_the_tests_process()
+    trn_outcomes_m("module m\n\nvar ran: int = 0\n\n@setup\ns() =\n    ran = 1\n\n" +
+                   "@test\nt() =\n    ran = 2\n\n" +
+                   "@teardown\nd() =\n    assert(ran == 2, \"teardown sees what the test left\")\n") match
+        None -> ()
+        Some(ran) -> trn_all_passed(ran)
+
+@test("'@teardown' runs in a process of its own where the test did not return")
+trn_teardown_runs_alone_after_a_trap()
+    trn_outcomes_m("module m\n\nvar ran: int = 0\n\n@setup\ns() =\n    ran = 1\n\n" +
+                   "@test(should_trap)\nt() =\n    assert(ran == 1, \"setup ran\")\n" +
+                   "    assert(false, \"and now the process ends\")\n\n" +
+                   "@teardown\nd() =\n" +
+                   "    assert(ran == 0, \"a fresh process sees the initializers and nothing else\")\n") match
+        None -> ()
+        Some(ran) -> trn_all_passed(ran)
+
+@test("a '@setup' that does not return fails the tests it guards, and names itself")
+trn_a_failed_setup_fails_its_tests()
+    val ran = trn_outcomes("@setup\ns() =\n    assert(false, \"the setup broke\")\n\n" +
+                           "@test\nt() =\n    print(\"never reached\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(trn_displays(ran), "t")
+    assert_eq(trn_detail(ran.at(0)),
+              "the module's '@setup', 's', did not return — exit status 1, so this test did not run")
+    assert(ran.at(0).output.contains("panic: the setup broke ("), ran.at(0).output)
+    assert(!ran.at(0).output.contains("never reached"), ran.at(0).output)
+
+// A setup fault and a test fault leave the same exit status; the marks are what tell them apart.
+@test("a test that fails under a '@setup' that worked is still reported as the test failing")
+trn_a_test_failing_under_a_good_setup_is_the_test()
+    val ran = trn_outcomes_m("module m\n\nvar ran: int = 0\n\n@setup\ns() =\n    ran = 1\n\n" +
+                             "@test\nt() =\n    assert(ran == 2, \"the test's own check\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(trn_detail(ran.at(0)), "did not return — exit status 1")
+    assert(ran.at(0).output.contains("panic: the test's own check ("), ran.at(0).output)
+
+@test("a '@teardown' that does not return is a failure counted against the test")
+trn_a_failed_teardown_fails_the_test()
+    val ran = trn_outcomes("@test\nt() =\n    print(\"the test itself was fine\")\n\n" +
+                           "@teardown\nd() =\n    assert(false, \"the teardown broke\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert(!ran.at(0).passed(), "failed")
+    assert_eq(trn_detail(ran.at(0)),
+              "the module's '@teardown', 'd', did not return — exit status 1, after the test returned")
+    assert(ran.at(0).output.starts_with("the test itself was fine\npanic: the teardown broke ("),
+           ran.at(0).output)
+
+@test("a '@teardown' in its own process is a failure counted the same way")
+trn_a_failed_lone_teardown_fails_the_test()
+    val ran = trn_outcomes("@test(should_trap)\nt() =\n    assert(false, \"the test was meant to trap\")\n\n" +
+                           "@teardown\nd() =\n    assert(false, \"and the teardown broke\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert(!ran.at(0).passed(), "failed")
+    assert_eq(trn_detail(ran.at(0)), "the module's '@teardown', 'd', did not return — exit status 1")
+    assert(ran.at(0).output.contains("panic: the test was meant to trap ("), ran.at(0).output)
+    assert(ran.at(0).output.contains("panic: and the teardown broke ("), ran.at(0).output)
+
+@test("'@teardown_all' runs once for the module, whatever the tests did")
+trn_teardown_all_runs_once()
+    val ran = trn_outcomes("@test\none() = 0\n\n@test\ntwo() = 0\n\n@test\nthree() = 0\n\n" +
+                           "@teardown_all\nhalt() =\n    assert(false, \"the module's teardown broke\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(trn_displays(ran), "one,two,three,halt")
+    assert(ran.at(0).passed() && ran.at(1).passed() && ran.at(2).passed(), "the three tests passed")
+    assert_eq(trn_detail(ran.at(3)), "the module's '@teardown_all', 'halt', did not return — exit status 1")
+    assert_eq(ran.at(3).test.line, 10)
+
+@test("a '@setup_all' that does not return stops the module and gets a row of its own")
+trn_a_failed_setup_all_stops_the_module()
+    val ran = trn_outcomes("@setup_all\nboot() =\n    assert(false, \"the module never came up\")\n\n" +
+                           "@test\none() = 0\n\n@test\ntwo() = 0\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(trn_displays(ran), "boot")
+    assert(!ran.at(0).passed(), "failed")
+    assert_eq(trn_detail(ran.at(0)), "the module's '@setup_all', 'boot', did not return — exit status 1")
+    assert_eq(ran.at(0).test.line, 1)
+
+@test("'@teardown_all' still runs where '@setup_all' did not come back")
+trn_teardown_all_runs_after_a_failed_setup_all()
+    val ran = trn_outcomes("@setup_all\nboot() =\n    assert(false, \"up failed\")\n\n" +
+                           "@teardown_all\nhalt() =\n    assert(false, \"and down is asked all the same\")\n\n" +
+                           "@test\nt() = 0\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(trn_displays(ran), "boot,halt")
+    assert_eq(trn_detail(ran.at(1)), "the module's '@teardown_all', 'halt', did not return — exit status 1")
+
+@test("an '_all' hook shares nothing with a test through module storage")
+trn_an_all_hook_shares_nothing()
+    trn_outcomes_m("module m\n\nvar ran: int = 0\n\n@setup_all\nboot() =\n    ran = 1\n\n" +
+                   "@test\nt() =\n    assert(ran == 0, \"a test's process is not the one '@setup_all' ran in\")\n") match
+        None -> ()
+        Some(ran) -> trn_all_passed(ran)
+
+@test("the phase marks never reach the output a failure shows")
+trn_the_marks_never_reach_the_output()
+    val ran = trn_outcomes("@setup\ns() =\n    print(\"from the setup\")\n\n" +
+                           "@teardown\nd() =\n    print(\"from the teardown\")\n\n" +
+                           "@test\nt() =\n    print(\"from the test\")\n    assert(false, \"and now it fails\")\n") match
+        None -> return
+        Some(r) -> r
+
+    val out = ran.at(0).output
+
+    assert(out.starts_with("from the setup\nfrom the test\npanic: and now it fails ("), out)
+    assert(out.ends_with(")\nfrom the teardown\n"), out)
+    assert(!out.contains(setup_mark()) && !out.contains(test_mark()), out)
+
+// The IR of a test build of a one-file tree, or nothing where the library is not on this machine.
+private trn_test_ir(text: string) -> Option[string]
+    if std_root().is_err() then return None
+
+    val root = trn_project(trn_one("main.sysl", text))
+
+    val build = test_build_of(root, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(refusal))
+            return None
+        Ok(made) -> made
+
+    remove_dir_all(root).unwrap_or(())
+    assert(build.emitted.report.is_empty(), analysis_report(build.emitted.report))
+    Some(build.emitted.text)
+end trn_test_ir
+
+private trn_declares_write(ir: string) -> usize
+    var n: usize = 0
+    val lines = split(ir, "\n")
+
+    for i in 0..<lines.len
+        if lines[i].starts_with("declare") && lines[i].contains("@write") then n += 1
+
+    n
+end trn_declares_write
+
+@test("the mark's 'write' is declared once, and only where there is a mark to make")
+trn_write_is_declared_only_for_a_mark()
+    val plain = trn_test_ir("@test\nt() = 0\n") match
+        None -> return
+        Some(ir) -> ir
+
+    assert(!plain.contains("@write"), plain)
+
+    val marked = trn_test_ir("@setup\ns() = 0\n\n@test\nt() = 0\n").unwrap()
+
+    assert_eq(trn_declares_write(marked), 1)
+
+@test("an '_all' hook alone makes no mark and needs no 'write'")
+trn_an_all_hook_needs_no_write()
+    trn_test_ir("@setup_all\nboot() = 0\n\n@test\nt() = 0\n") match
+        None -> ()
+        Some(ir) -> assert(!ir.contains("@write"), ir)
+
+@test("a module with no hooks runs exactly the processes it always ran")
+trn_no_hooks_runs_as_always()
+    trn_outcomes("@test\nt() =\n    assert(1 + 1 == 2, \"arithmetic\")\n") match
+        None -> ()
+        Some(ran) -> trn_all_passed(ran)
+
+@test("each module's tests get their own module's hooks")
+trn_each_module_gets_its_own_hooks()
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("a/a.sysl", "module a\n\nvar ran: int = 0\n\n@setup\ns() =\n    ran = 1\n\n" +
+                            "@test\nmine() =\n    assert(ran == 1, \"a's setup ran for a's test\")\n"))
+    files.push(("b/b.sysl", "module b\n\nvar ran: int = 0\n\n" +
+                            "@test\ntheirs() =\n    assert(ran == 0, \"and nothing ran for b's\")\n"))
+
+    val ran = trn_outcomes_of(files, TestOptions(None, false)) match
+        None -> return
+        Some(r) -> r
+
+    trn_all_passed(ran)
+    assert_eq(trn_displays(ran), "mine,theirs")
+
+// -- the report counts the tests that were selected, not the rows it printed ----------------------------
+
+@test("a hook failure adds a row without adding to the count")
+trn_a_hook_row_is_not_counted()
+    val ran = trn_outcomes("@test\nt() = 0\n\n@teardown_all\nhalt() =\n    assert(false, \"broke\")\n") match
+        None -> return
+        Some(r) -> r
+
+    val text = runner_timeless(tests_rendered(ran, 1, 0))
+
+    assert(text.starts_with("running 1 test\n"), text)
+    assert(text.contains("  ok    t     Nms\n  FAIL  halt  Nms\n" +
+                         "        the module's '@teardown_all', 'halt', did not return — exit status 1\n"), text)
+    assert(text.ends_with("\n1 passed, 1 failed — Nms\n"), text)
+
+// -- a test passes by returning and fails by not ------------------------------------------------------
+
+@test("a test that returns passes")
+trn_a_test_that_returns_passes()
+    val ran = trn_outcomes("@test\nt() =\n    assert(1 + 1 == 2, \"arithmetic\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(trn_displays(ran), "t")
+    assert(ran.at(0).detail.is_none(), trn_detail(ran.at(0)))
+
+@test("a failed assertion fails the test, and the status says so")
+trn_a_failed_assertion_fails()
+    val ran = trn_outcomes("@test\nt() =\n    assert(1 + 1 == 3, \"arithmetic\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(trn_detail(ran.at(0)), "did not return — exit status 1")
+
+private trn_halve() -> string = "halve(n: int) -> int\n    require n % 2 == 0, \"even\"\n    n / 2\n\n"
+
+// A contract clause is checked because it is a contract clause; the trap ends the process, and that
+// is all the runner ever looks at.
+@test("a broken contract fails the test, having been told nothing about tests")
+trn_a_broken_contract_fails()
+    val ran = trn_outcomes(trn_halve() + "@test\nt() =\n    print(halve(3))\n") match
+        None -> return
+        Some(r) -> r
+
+    assert(!ran.at(0).passed(), "failed")
+    assert_eq(trn_detail(ran.at(0)), "did not return — exit status 133")
+
+@test("a bounds violation fails the test the same way")
+trn_a_bounds_violation_fails()
+    val ran = trn_outcomes("@test\nt() =\n    val a = [1, 2, 3]\n    var i = 5\n    print(a[i])\n") match
+        None -> return
+        Some(r) -> r
+
+    assert(!ran.at(0).passed(), "failed")
+    assert_eq(trn_detail(ran.at(0)), "did not return — exit status 133")
+
+// -- 'should_trap' inverts the verdict ----------------------------------------------------------------
+
+@test("a test that traps passes")
+trn_a_should_trap_test_that_traps_passes()
+    trn_outcomes("@test(should_trap)\nt() =\n    assert(false, \"this must fire\")\n") match
+        None -> ()
+        Some(ran) -> trn_all_passed(ran)
+
+@test("a test that returns fails, which is what makes the form worth having")
+trn_a_should_trap_test_that_returns_fails()
+    val ran = trn_outcomes("@test(should_trap)\nt() =\n    assert(true, \"this does not fire\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(trn_detail(ran.at(0)), "returned, and was expected to trap")
+
+@test("with a substring, the run must have printed it")
+trn_a_should_trap_substring_is_found()
+    trn_outcomes("@test(should_trap: \"past the end\")\nt() =\n    assert(false, \"index past the end\")\n") match
+        None -> ()
+        Some(ran) -> trn_all_passed(ran)
+
+@test("a trap that printed something else is not the trap that was asked for")
+trn_a_trap_saying_something_else_fails()
+    val ran = trn_outcomes("@test(should_trap: \"past the end\")\nt() =\n" +
+                           "    assert(false, \"some other complaint\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(trn_detail(ran.at(0)), "trapped, but printed nothing holding \"past the end\"")
+
+// A trap prints nothing at all, so a substring can only be asked of a failure that had something to
+// say on its way out.
+@test("a silent trap satisfies 'should_trap' but not a substring")
+trn_a_silent_trap_has_no_words()
+    val ran = trn_outcomes(trn_halve() + "@test(should_trap)\nsilent() =\n    print(halve(3))\n\n" +
+                           "@test(should_trap: \"even\")\nwanting_words() =\n    print(halve(3))\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(trn_displays(ran), "silent,wanting_words")
+    assert(ran.at(0).passed(), trn_detail(ran.at(0)))
+    assert_eq(trn_detail(ran.at(1)), "trapped, but printed nothing holding \"even\"")
+
+// -- each test runs in a process of its own ---------------------------------------------------------
+
+@test("a test that traps does not stop the ones after it")
+trn_a_trap_does_not_stop_the_rest()
+    val ran = trn_outcomes("@test\nfirst() =\n    assert(false, \"down\")\n\n" +
+                           "@test\nsecond() =\n    assert(true, \"up\")\n\n" +
+                           "@test\nthird() =\n    assert(true, \"up\")\n") match
+        None -> return
+        Some(r) -> r
+
+    assert_eq(trn_displays(ran), "first,second,third")
+    assert_eq(trn_detail(ran.at(0)), "did not return — exit status 1")
+    assert(ran.at(1).passed() && ran.at(2).passed(), "the other two passed")
+
+// A `val` filled by a call is filled by code the entry point runs, which the dispatcher has to run too.
+@test("a computed module-level val is filled before a test runs")
+trn_a_computed_val_is_filled()
+    trn_outcomes("twice(n: int) -> int = n * 2\n\nval start: int = twice(7)\n\n" +
+                 "@test\nreads_it() =\n    assert(start == 14, \"as computed\")\n\n" +
+                 "@test\nreads_it_again() =\n    assert(start == 14, \"still as computed\")\n") match
+        None -> ()
+        Some(ran) ->
+            trn_all_passed(ran)
+            assert_eq(trn_displays(ran), "reads_it,reads_it_again")
+
+// -- a run can be narrowed ----------------------------------------------------------------------------
+
+@test("a filter selects by the name a report shows")
+trn_a_filter_selects_by_display()
+    trn_outcomes("@test\nalpha() = 0\n\n@test\nbeta() = 0\n", TestOptions(Some("alph"), false)) match
+        None -> ()
+        Some(ran) -> assert_eq(trn_displays(ran), "alpha")
+
+@test("a filter selects by module too, which is how a module's tests are named at once")
+trn_a_filter_selects_by_module()
+    var tests: Buf[TTest] = buf()
+
+    tests.push(TTest(module_qualify("geom", "area"), "area", false, None, "geom/a.sysl", 1, no_hooks(), None))
+    tests.push(TTest(module_qualify("text", "trim"), "trim", false, None, "text/b.sysl", 1, no_hooks(), None))
+
+    val chosen = selected_tests(tests, Some("geom"))
+
+    assert_eq(chosen.len(), 1)
+    assert_eq(chosen.at(0).display, "area")
+
+@test("a display name is what the filter sees, not the function's own")
+trn_a_filter_sees_the_display_name()
+    trn_outcomes("@test(\"the sum of an empty list is zero\")\nsum_empty() = 0\n",
+                 TestOptions(Some("empty list"), false)) match
+        None -> ()
+        Some(ran) -> assert_eq(trn_displays(ran), "the sum of an empty list is zero")
+
+@test("fail-fast stops at the first failure and reports what ran")
+trn_fail_fast_stops_at_the_first_failure()
+    trn_outcomes("@test\nfirst() =\n    assert(false, \"down\")\n\n@test\nsecond() =\n    assert(true, \"up\")\n",
+                 TestOptions(None, true)) match
+        None -> ()
+        Some(ran) -> assert_eq(trn_displays(ran), "first")
+
+@test("fail-fast runs everything when nothing fails")
+trn_fail_fast_runs_everything_that_passes()
+    trn_outcomes("@test\nfirst() = 0\n\n@test\nsecond() = 0\n", TestOptions(None, true)) match
+        None -> ()
+        Some(ran) -> assert_eq(trn_displays(ran), "first,second")
+
+// -- the report says what happened --------------------------------------------------------------------
+
+// Two outcomes, built rather than run: the report is a pure function of them.
+private trn_test(key: string, display: string, line: int) -> TTest =
+    TTest(module_qualify("m", key), display, false, None, "m.sysl", line, no_hooks(), None)
+
+private trn_ran() -> Buf[Outcome]
+    var ran: Buf[Outcome] = buf()
+
+    ran.push(Outcome(trn_test("a", "passes", 3), None, "", 1))
+    ran.push(Outcome(trn_test("b", "fails", 7), Some("did not return — exit status 1"), "panic: nope\n", 2))
+    ran
+end trn_ran
+
+@test("it counts what ran and what failed")
+trn_the_report_counts()
+    val text = tests_rendered(trn_ran(), 2, 0)
+
+    assert(text.contains("running 2 tests"), text)
+    assert(text.contains("1 passed, 1 failed"), text)
+
+@test("a failure carries the line the attribute is on")
+trn_a_failure_carries_its_line()
+    val text = tests_rendered(trn_ran(), 2, 0)
+
+    assert(text.contains("at m.sysl:7"), text)
+
+@test("what a failing test printed is shown, and what a passing one printed is not")
+trn_only_a_failure_shows_its_output()
+    var ran = trn_ran()
+
+    ran.push(Outcome(trn_test("c", "quiet", 9), None, "unread\n", 1))
+
+    val text = tests_rendered(ran, 3, 0)
+
+    assert(text.contains("> panic: nope"), text)
+    assert(!text.contains("unread"), text)
+
+@test("a filtered run says how many it did not run")
+trn_a_filtered_run_says_how_many()
+    val text = tests_rendered(trn_ran(), 2, 5)
+
+    assert(text.contains("running 2 tests of 7"), text)
+
+@test("tests are shown under the file they were written in, in source order")
+trn_rows_follow_the_outcomes()
+    var mixed: Buf[Outcome] = buf()
+
+    mixed.push(Outcome(trn_test("b", "second", 20), None, "", 1))
+    mixed.push(Outcome(trn_test("a", "first", 10), None, "", 1))
+
+    val lines = split(tests_rendered(mixed, 2, 0), "\n")
+    var oks: Buf[string] = buf()
+
+    for i in 0..<lines.len
+        if lines[i].contains("ok") then oks.push(lines[i])
+
+    assert(oks.at(0).contains("first"), oks.at(0))
+    assert(oks.at(1).contains("second"), oks.at(1))
+
+// -- streaming a run ----------------------------------------------------------------------------------
+
+// A hook row's display is the hook's bare name, exactly what a failed hook's outcome is built with.
+private trn_hook_row() -> Outcome =
+    Outcome(TTest(module_qualify("m", "halt"), "halt", false, None, "m.sysl", 30, no_hooks(), None),
+            Some("the module's '@teardown_all', 'm.halt', did not return — exit status 1"), "torn down badly\n", 3)
+
+private trn_streamed(outcomes: Buf[Outcome], selected: usize) -> Buf[string]
+    var pieces: Buf[string] = buf()
+    val sink = &pieces
+
+    tests_streamed(outcomes, selected, 0, piece -> sink.push(piece))
+    pieces
+end trn_streamed
+
+@test("streams byte-for-byte the same text 'rendered' produces for the same outcomes")
+trn_streaming_is_rendering()
+    var outcomes = trn_ran()
+
+    outcomes.push(trn_hook_row())
+
+    val pieces = trn_streamed(outcomes, 3)
+    var joined = ""
+
+    for i in 0..<pieces.len()
+        joined = joined + pieces.at(i)
+
+    assert_eq(joined, tests_rendered(outcomes, 3, 0))
+
+@test("emits the header before any row, and the summary after the last")
+trn_the_header_first_and_the_summary_last()
+    var outcomes = trn_ran()
+
+    outcomes.push(trn_hook_row())
+
+    val pieces = trn_streamed(outcomes, 3)
+
+    assert(pieces.at(0).starts_with("running"), pieces.at(0))
+
+    val last = pieces.at(pieces.len() - 1)
+
+    assert(last.contains("passed") && last.contains("failed"), last)
+
+    var headers: usize = 0
+    var tallies: usize = 0
+
+    for i in 0..<pieces.len()
+        if pieces.at(i).starts_with("running") then headers += 1
+        if pieces.at(i).contains(" passed, ") && pieces.at(i).contains(" failed") then tallies += 1
+
+    assert_eq(headers, 1)
+    assert_eq(tallies, 1)
+
+@test("an empty run still gets a header and a summary, in that order")
+trn_an_empty_run_is_two_pieces()
+    val pieces = trn_streamed(buf(), 0)
+
+    assert_eq(pieces.len(), 2)
+    assert(pieces.at(0).starts_with("running 0 tests"), pieces.at(0))
+    assert(pieces.at(1).contains("0 passed, 0 failed"), pieces.at(1))
+
+// -- a test is a member of its module like any other --------------------------------------------------
+
+// The analysis report of a test build of `m/m.sysl`, or nothing where the library is not here.
+private trn_report_m(text: string) -> Option[string]
+    if std_root().is_err() then return None
+
+    val root = trn_project(trn_one("m/m.sysl", text))
+    val said = test_build_of(root, None) match
+        Err(refusal) -> failure_text(refusal)
+        Ok(made) -> analysis_report(made.emitted.report)
+
+    remove_dir_all(root).unwrap_or(())
+    Some(said)
+end trn_report_m
+
+// Tests are dropped after the whole-program checks, so a module's capability clause reaches them.
+@test("a module's 'no alloc' clause reaches its tests")
+trn_no_alloc_reaches_the_tests()
+    trn_report_m("module m\n@no_alloc\n\nadd(a: int, b: int) -> int = a + b\n\n" +
+                 "@test\nadding() =\n    val s = str(add(2, 2))\n    assert(s == \"4\", \"adding\")\n") match
+        None -> ()
+        Some(said) ->
+            assert(said.contains("the string a value renders as needs an allocator, and this module " +
+                                 "declared '@no_alloc' — it may hold and release storage made elsewhere, " +
+                                 "and may make none of its own"), said)
+            assert(said.contains("m.sysl:8:13"), said)
+
+@test("a test that allocates nothing is fine in the same module")
+trn_no_alloc_allows_a_quiet_test()
+    trn_report_m("module m\n@no_alloc\n\nadd(a: int, b: int) -> int = a + b\n\n" +
+                 "@test\nadding() =\n    assert(add(2, 2) == 4, \"adding\")\n") match
+        None -> ()
+        Some(said) -> assert_eq(said, "")
+
+// -- a test has one caller, and it is not the program ---------------------------------------------------
+
+private trn_report(text: string) -> Option[string]
+    if std_root().is_err() then return None
+
+    val root = trn_project(trn_one("main.sysl", text))
+    val said = test_build_of(root, None) match
+        Err(refusal) -> failure_text(refusal)
+        Ok(made) -> analysis_report(made.emitted.report)
+
+    remove_dir_all(root).unwrap_or(())
+    Some(said)
+end trn_report
+
+private trn_called_test(name: string) -> string =
+    s"'$name' is a '@test' function, which 'sysl test' calls and nothing else does — every other build " +
+        "leaves it out, so this call would have no definition to reach. Work two tests share belongs in " +
+        "an ordinary function they both call"
+
+@test("calling a test is refused where the call is written")
+trn_calling_a_test_is_refused()
+    trn_report("@test\nt() =\n    assert(true, \"up\")\n\nt()\n") match
+        None -> ()
+        Some(said) ->
+            assert(said.contains(trn_called_test("t")), said)
+            assert(said.contains("main.sysl:5:1"), said)
+
+@test("a test calling another test is the same refusal")
+trn_a_test_calling_a_test_is_refused()
+    trn_report("@test\nhelper() =\n    assert(true, \"up\")\n\n@test\nt() =\n    helper()\n") match
+        None -> ()
+        Some(said) ->
+            assert(said.contains(trn_called_test("helper")), said)
+            assert(said.contains("main.sysl:7:5"), said)
+
+@test("work two tests share goes in an ordinary function, which both may call")
+trn_shared_work_is_an_ordinary_function()
+    trn_outcomes("shared() -> int = 21\n\n@test\nfirst() =\n    assert(shared() == 21, \"shared\")\n\n" +
+                 "@test\nsecond() =\n    assert(shared() * 2 == 42, \"shared again\")\n") match
+        None -> ()
+        Some(ran) -> trn_all_passed(ran)
+
+// -- a test build is not the program --------------------------------------------------------------------
+
+@test("the program's own statements do not run")
+trn_the_programs_statements_do_not_run()
+    trn_outcomes("print(\"the program ran\")\n\n@test\nt() = 0\n") match
+        None -> ()
+        Some(ran) -> assert_eq(ran.at(0).output, "")
+
+@test("a declared main does not run either")
+trn_a_declared_main_does_not_run()
+    trn_outcomes("main()\n    print(\"main ran\")\n\n@test\nt() = 0\n") match
+        None -> ()
+        Some(ran) -> assert_eq(ran.at(0).output, "")
+
+@test("the dispatcher compares the name it was given against each test")
+trn_the_dispatcher_compares_names()
+    trn_test_ir("@test\nt() = 0\n") match
+        None -> ()
+        Some(ir) ->
+            assert(ir.contains("declare i32 @strcmp(ptr, ptr)"), ir)
+            assert(ir.contains("call i32 @strcmp"), ir)
+            assert(ir.contains("define i32 @main(i32 %argc, ptr %argv)"), ir)
+
+// The body of `@main`, from its `define` to the closing brace.
+private trn_main_of(ir: string) -> string
+    val at = ir.index_of("define i32 @main(").unwrap_or(0)
+    val rest = ir[at..<ir.len]
+    val close = rest.index_of("\n}").unwrap_or(rest.len)
+
+    rest[0..<close]
+end trn_main_of
+
+// Status 2: a runner and a binary that disagree is not a test result.
+@test("a name the binary has no test for is neither a pass nor a failure")
+trn_an_unknown_name_is_status_two()
+    trn_test_ir("@test\nt() = 0\n") match
+        None -> ()
+        Some(ir) -> assert(trn_main_of(ir).contains("ret i32 2"), trn_main_of(ir))
+
+// -- an ordinary build has no tests in it ---------------------------------------------------------------
+
+private trn_ir(text: string) -> Option[string]
+    if std_root().is_err() then return None
+
+    val root = trn_project(trn_one("main.sysl", text))
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return None
+        Ok(made) -> made
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.report.is_empty(), analysis_report(out.report))
+    Some(out.text)
+end trn_ir
+
+@test("a test function is not emitted")
+trn_a_test_is_not_emitted()
+    trn_ir("double(n: int) -> int = n * 2\n\n@test\ndoubling() =\n    assert(double(2) == 4, \"doubling\")\n\n" +
+           "print(double(3))\n") match
+        None -> ()
+        Some(ir) -> assert(!ir.contains("doubling"), ir)
+
+@test("nor is a helper only a test calls")
+trn_a_test_only_helper_is_not_emitted()
+    trn_ir("only_a_test_calls_this() -> int = 42\n\n@test\nt() =\n" +
+           "    assert(only_a_test_calls_this() == 42, \"helper\")\n\nprint(\"hello\")\n") match
+        None -> ()
+        Some(ir) -> assert(!ir.contains("only_a_test_calls_this"), ir)
+
+@test("a helper the program also calls stays")
+trn_a_shared_helper_stays()
+    trn_ir("shared() -> int = 42\n\n@test\nt() =\n    assert(shared() == 42, \"helper\")\n\nprint(shared())\n") match
+        None -> ()
+        Some(ir) -> assert(ir.contains("shared"), ir)
+
+// A library is lowered without pruning, so dropping its tests is a separate act.
+@test("a library's tests are not in the library")
+trn_a_librarys_tests_are_not_in_it()
+    val parsed = parse(source_of("lib.sysl", "module demo\n\ndouble(n: int) -> int = n * 2\n\n" +
+                                             "@test\ndoubling() =\n    assert(double(2) == 4, \"doubling\")\n"))
+
+    assert(parsed.ok(), "the library source parses")
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    var own: Buf[string] = buf()
+
+    own.push("demo")
+
+    val built = library_build(units, own, host_target())
+    val out = ir_print_module(codegen_with_gaps(built.program, host_target(), built.promotions).0)
+
+    assert(out.contains("double"), out)
+    assert(!out.contains("doubling"), out)
+
+    for i in 0..<built.determined.len()
+        assert(!built.determined.at(i).contains("doubling"), built.determined.at(i))
+
+@test("the program still runs, and runs what it always did")
+trn_the_program_still_runs()
+    if !trn_ready() then return
+
+    val root = trn_project(trn_one("main.sysl", "double(n: int) -> int = n * 2\n\n@test\ndoubling() =\n" +
+                                                "    assert(double(2) == 4, \"doubling\")\n\nprint(double(21))\n"))
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert(out.status.ok(), out.text)
+            assert_eq(out.text, "42\n")
+end trn_the_program_still_runs

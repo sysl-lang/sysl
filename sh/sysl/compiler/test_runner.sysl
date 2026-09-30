@@ -432,27 +432,85 @@ end tests_summary
 // watch. Given the same outcomes in the same order it is exactly what the concatenation of a live
 // run's `emit` calls comes to, because both are built from these same four pieces.
 tests_rendered(outcomes: Buf[Outcome], selected: usize, filtered: usize) -> string
+    var out = ""
+    val sink = &out
+
+    tests_streamed(outcomes, selected, filtered, piece -> *sink = *sink + piece)
+    out
+end tests_rendered
+
+// The same report handed to `emit` a piece at a time -- the header, each file's heading, each row, the
+// summary -- which is the shape a live run emits it in, so watching a run and reading the finished
+// report show one text.
+//
+// **The rows are grouped by the file each test was written in, the files in path order, and a file's
+// rows in source order** whatever order the outcomes arrived in: the file is where a reader goes next.
+tests_streamed(outcomes: Buf[Outcome], selected: usize, filtered: usize, emit: string -> unit)
     var width: usize = 0
 
     for i in 0..<outcomes.len()
         if outcomes.at(i).test.display.len > width then width = outcomes.at(i).test.display.len
 
-    var out = tests_header(selected, filtered)
-    var shown = ""
-    var any_shown = false
+    emit(tests_header(selected, filtered))
+
+    val files = files_in_order(outcomes)
+
+    for f in 0..<files.len()
+        emit(test_file_header(files.at(f)))
+
+        val rows = rows_of_file(outcomes, files.at(f))
+
+        for i in 0..<rows.len()
+            emit(test_row(outcomes.at(rows.at(i)), width))
+
+    emit(tests_summary(outcomes))
+end tests_streamed
+
+// Every file an outcome names, once each, in path order.
+private files_in_order(outcomes: Buf[Outcome]) -> Buf[string]
+    var files: Buf[string] = buf()
 
     for i in 0..<outcomes.len()
-        val o = outcomes.at(i)
+        val file = outcomes.at(i).test.file
+        var at = files.len()
+        var seen = false
 
-        if !any_shown || shown != o.test.file
-            out = out + test_file_header(o.test.file)
-            shown = o.test.file
-            any_shown = true
+        for j in 0..<files.len()
+            if files.at(j) == file then seen = true
 
-        out = out + test_row(o, width)
+        if !seen
+            files.push(file)
 
-    out + tests_summary(outcomes)
-end tests_rendered
+            // Moved down into place, so the list stays sorted as it grows.
+            while at > 0 && files.at(at - 1) > file
+                files.set(at, files.at(at - 1))
+                at -= 1
+
+            files.set(at, file)
+        end if
+
+    files
+end files_in_order
+
+// The indices of the outcomes written in `file`, ordered by line; outcomes on one line keep the order
+// they arrived in.
+private rows_of_file(outcomes: Buf[Outcome], file: string) -> Buf[usize]
+    var rows: Buf[usize] = buf()
+
+    for i in 0..<outcomes.len()
+        if outcomes.at(i).test.file == file
+            var at = rows.len()
+
+            rows.push(i)
+
+            while at > 0 && outcomes.at(rows.at(at - 1)).test.line > outcomes.at(i).test.line
+                rows.set(at, rows.at(at - 1))
+                at -= 1
+
+            rows.set(at, i)
+
+    rows
+end rows_of_file
 
 // -- what a run's output has in it --------------------------------------------------------------------
 
