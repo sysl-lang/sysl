@@ -499,7 +499,7 @@ private const_parameter(cx: &Analyzer, span: Span, name: string,
 
                 for i in 0..<d.variants.len()
                     if long(d.variants.at(i).tag) == n then
-                        return Some(variant_expr(cx, span, d.variants.at(i).name, Some(*ty)))
+                        return named_variant_expr(cx, span, d.variants.at(i).name, Some(*ty))
 
                 Some(cx.err(span, s"'$name' stands for no variant of ${type_show(*ty)}"))
             Bool -> Some(TExpr(span, TBoolLit(v != from_int(0))))
@@ -756,9 +756,61 @@ private refused_is_name(cx: &Analyzer, name: string) -> bool
     false
 end refused_is_name
 
-// The enum the **position** asked for, where it asked for one that has this variant.
+// The enum the **position** asked for, where it asked for one that has this variant **and the bare
+// name is in scope here as that enum's variant**.
+//
+// **The expected type RE-POINTS a name and never conjures one**: it says which owner a variant name
+// in scope means, and nothing more. Asked instead of whether the name resolves at all, it made a
+// variant reachable with no import, and let it beat a name that already meant something else --
+// `describe(Segment(1))` constructing a distant enum's variant rather than calling the module's own
+// `Segment` function. Reachability is the import system's; ownership is the expected type's.
 variant_from_expected(cx: &Analyzer, name: string,
                       expected: Option[Type]) -> Option[(Type, EnumVariant)]
+    val found = expected_variant(name, expected)
+
+    if found.is_none() then return None
+
+    found.unwrap().0 match
+        Enum(d) -> if variant_in_scope(cx, d.base, name) then found else None
+        _ -> None
+end variant_from_expected
+
+// Whether a bare variant name reaches the enum `base` from here: the enum is one this file may name,
+// and its module is the file's own or one it imports wholesale, or the variant was imported by name.
+private variant_in_scope(cx: &Analyzer, base: string, name: string) -> bool
+    if !reachable_key(cx.an, base, cx.scope) then return false
+
+    if visible_here(cx, base) then return true
+
+    // A block's own wildcard import offers it as much as the file's does.
+    val owner = module_of(base)
+    val key = module_qualify(owner, name)
+    val im = answering_imports(cx.an, cx.scope, name, k -> k == key)
+
+    for i in 0..<im.wildcards.len()
+        if im.wildcards.at(i) == owner then return true
+
+    imported_variant_enum(cx, name) match
+        Some(owner) -> owner == base
+        None -> false
+end variant_in_scope
+
+// A nullary variant of an enum something other than the bare name already chose -- a module or a
+// type in front of a dot, or a value parameter's declared enum -- so no import of the name is asked
+// for. `None` where that enum has no variant of the name.
+named_variant_expr(cx: &Analyzer, span: Span, name: string, en: Option[Type]) -> Option[TExpr]
+    val wanted = expected_variant(name, en)
+
+    if wanted.is_none() then return None
+
+    if wanted.unwrap().1.carries then return Some(carries_data(cx, span, name))
+
+    Some(TExpr(span, TEnumNew(wanted.unwrap().0, wanted.unwrap().1, buf())))
+end named_variant_expr
+
+// The variant of the expected enum, whether or not a bare name reaches it -- what a DOTTED spelling
+// asks (`Shape.Circle`, `.Circle`), where the text in front of the dot is what put the enum in scope.
+expected_variant(name: string, expected: Option[Type]) -> Option[(Type, EnumVariant)]
     if expected.is_none() then return None
 
     val want = repr(expected.unwrap())
@@ -771,7 +823,7 @@ variant_from_expected(cx: &Analyzer, name: string,
 
             Some((want, v.unwrap()))
         _ -> None
-end variant_from_expected
+end expected_variant
 
 // Whether any enum this compilation has registered carries a variant of this name. A `false` means
 // every walk below would come back empty, so a call or a bare name that is no variant at all -- which
@@ -1490,6 +1542,11 @@ private implicit_member(cx: &Analyzer, span: Span, name: string, expected: Optio
                       "nothing here expects one — write the type's own name in front of the dot. " +
                       "A trait object expects no single type either, since what may be erased into " +
                       "one is whatever implements the trait")
+
+    // The dot is what names the enum, so the variant needs no import of its own.
+    val wanted = named_variant_expr(cx, span, name, expected)
+
+    if wanted.is_some() then return wanted.unwrap()
 
     if variant_of(cx, name, expected).is_some() then return variant_expr(cx, span, name, expected)
 

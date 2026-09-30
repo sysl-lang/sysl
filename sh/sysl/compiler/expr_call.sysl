@@ -527,7 +527,15 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
             return variant_call(cx, span, wanted.unwrap().0, wanted.unwrap().1, args)
     end if
 
-    val tkey = if shadowed then None else lookup_type_key(cx.an, cx.scope, name)
+    var tkey = if shadowed then None else lookup_type_key(cx.an, cx.scope, name)
+
+    // **A type this file may not reach is not a candidate for it** (`reference/modules.md §
+    // Visibility`) where a variant of the name is: a sibling file's `private struct Circle` is out of
+    // reach here, so `Circle(2)` is the variant rather than a refusal about the struct's privacy.
+    // With no variant to answer instead, the type is kept, so that the refusal still names it.
+    if tkey.is_some() && !reachable_key(cx.an, tkey.unwrap(), cx.scope) &&
+       variant_of(cx, name, expected).is_some() then
+        tkey = None
 
     // A conversion, where no declaration claims the name.
     //
@@ -562,7 +570,7 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
                     behind_alias(cx, tkey.unwrap()) match
                         Some(Struct(sd)) ->
                             return struct_call(cx, span, sd.base, name, args, expected)
-                        Some(Enum(ed)) -> return enum_cast(cx, span, ed.base, name, args)
+                        Some(Enum(ed)) -> return enum_cast_at(cx, span, Enum(ed), name, args)
                         _ -> ()
 
                 return constrained_call(cx, span, tkey.unwrap(), name, args)
@@ -1053,6 +1061,34 @@ private enum_cast(cx: &Analyzer, span: Span, key: string, written: string,
         _ -> bad_expr(span)
 end enum_cast
 
+// **The same cast reached with the enum in hand rather than with its name** -- a plain alias names
+// one instantiation, type arguments and all, so `type Eval = Result[int, string]` is an enum at
+// those arguments and the cast is asked of that. A refusal names the enum the alias stands for,
+// since the alias's own name says nothing about why it carries data.
+private enum_cast_at(cx: &Analyzer, span: Span, en: Type, written: string, args: Buf[Expr]) -> TExpr
+    en match
+        Enum(d) ->
+            if !d.simple then
+                return cx.err(span, s"'$written' is ${type_show(en)} here, which carries data — " +
+                              "only a simple enum converts to and from an integer")
+
+            if args.len() != 1 then
+                return cx.err(span, s"'$written' takes exactly one integer argument")
+
+            val v = type_expr(cx, args.at(0), Some(d.underlying))
+            val vt = texpr_type(v)
+
+            if vt == Unknown then return bad_expr(span)
+
+            underlying(vt) match
+                Integer(_, _, _) -> ()
+                _ -> return cx.err(span, s"'$written' converts an integer, but the value has type " +
+                                   type_show(vt))
+
+            TExpr(span, TEnumFromInt(v, en))
+        _ -> bad_expr(span)
+end enum_cast_at
+
 // A constrained subtype's name in call position wraps a base value into the subtype, checking it.
 // Unlike an implicit produce site, the cast is written, so it applies even where the base would not
 // flow in on its own.
@@ -1338,7 +1374,7 @@ private qualified_variant_solved(cx: &Analyzer, span: Span, named_at: Span, rece
             if found.is_none() then return VsNone
 
             // The position is trusted first, since it says outright which instantiation is wanted.
-            val wanted = variant_from_expected(cx, member, expected)
+            val wanted = expected_variant(member, expected)
 
             if wanted.is_some() then return VsFound(wanted.unwrap().0, wanted.unwrap().1)
 
@@ -1382,7 +1418,7 @@ private module_variant_solved(cx: &Analyzer, span: Span, named_at: Span, receive
                         None -> return VsNone
                     _ -> return VsNone
 
-            val wanted = variant_from_expected(cx, member, expected)
+            val wanted = expected_variant(member, expected)
 
             if wanted.is_some() && instantiation_of_key(wanted.unwrap().0, key.unwrap()) then
                 return VsFound(wanted.unwrap().0, wanted.unwrap().1)
@@ -2467,7 +2503,7 @@ implicit_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
                       "A trait object expects no single type either, since what may be erased into " +
                       "one is whatever implements the trait")
 
-    val wanted = variant_from_expected(cx, name, expected)
+    val wanted = expected_variant(name, expected)
 
     if wanted.is_some() then return variant_call(cx, span, wanted.unwrap().0, wanted.unwrap().1, args)
 
