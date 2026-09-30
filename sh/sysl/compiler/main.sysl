@@ -32,6 +32,13 @@ run_cli(args: []string, say: string -> unit) -> int
     // second, and nothing else in the compiler writes this.
     reset_search_paths()
 
+    // A flag that named a `.syslib` is refused by every command in one sentence, before any of them
+    // reads its own flags -- none of them takes it, whatever it was handed.
+    if names_std_lib(args[1..<args.len])
+        say(s"error: ${std_lib_refusal()}")
+        return Misused
+    end if
+
     args[1] match
         "--version" ->
             say(s"sysl ${Version}")
@@ -680,19 +687,19 @@ end tests_run
 private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fast] [--std] " +
     "[--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " <path>"
 
-// `sysl build-lib [--std] [--target <name>] [-o <path>] <path>` -- a library compiled into an
-// artifact for one machine.
+// `sysl build-lib [--std] [--target <name>] <path>` -- a library held to being a library for one
+// machine.
 //
 // **`--std` says the tree is sysl's own standard module**, which is the one thing an ordinary
 // compilation may not declare and is therefore written down rather than inferred: nothing is
-// prepended, no artifact is linked, and the artifact lands where a compilation looks for one.
+// prepended, no artifact is linked, and the artifact lands in the cache where a compilation looks.
 //
-// **Without it the tree is an ordinary library**, compiled against the standard module and written
-// beside itself. What the command is mostly run for is the analysis rather than the file: it type-
-// checks a package for a machine this one is not, which is the only check a board package gets.
+// **Without it the tree is an ordinary library**, compiled against the standard module, and nothing
+// is written: `checked <root>` is the whole answer. What the command is run for is the analysis --
+// it type-checks a package for a machine this one is not, which is the only check a board package
+// gets.
 private build_lib_command(args: []string, say: string -> unit) -> int
     var named: Option[string] = None
-    var out: Option[string] = None
     var level: Option[string] = None
     var std = false
     var file = ""
@@ -708,17 +715,17 @@ private build_lib_command(args: []string, say: string -> unit) -> int
 
         if took > 0
             if took == 2 then i += 1
-        else if args[i] == "--target" || args[i] == "-o"
+        else if args[i] == "-o" || args[i] == "--output"
+            say(s"error: ${build_lib_output_refusal()}")
+            return Misused
+        else if args[i] == "--target"
             if i + 1 >= args.len
                 say(build_lib_usage())
                 return Misused
             end if
 
-            val flag = args[i]
-
             i += 1
-
-            if flag == "--target" then named = Some(args[i]) else out = Some(args[i])
+            named = Some(args[i])
         else if args[i] == "--std"
             std = true
         else if took_level(args, i).0 != 0
@@ -749,16 +756,16 @@ private build_lib_command(args: []string, say: string -> unit) -> int
         Ok(resolved) -> resolved
 
     if !std
-        return build_library_of(file, named, out, at) match
+        return build_library_of(file, named, at) match
             Err(why) ->
                 say_failure(why, say)
                 Failed
-            Ok(where) ->
-                say(s"wrote $where")
+            Ok(root) ->
+                say(s"checked $root")
                 Fine
     end if
 
-    build_std_artifact_of(file, named, out, at) match
+    build_std_artifact_of(file, named, None, at) match
         Err(refusal) ->
             say(s"error: ${refusal.message}")
             Failed
@@ -768,8 +775,17 @@ private build_lib_command(args: []string, say: string -> unit) -> int
 end build_lib_command
 
 private build_lib_usage() -> string =
-    "usage: sysl build-lib [--std] [--target <name>] [-O<level>] [-o <path>] " + where_flags() +
-    " <path>"
+    "usage: sysl build-lib [--std] [--target <name>] [-O<level>] " + where_flags() + " <path>"
+
+// What is said of `-o` given to `build-lib`, which is refused before anything is read.
+//
+// **The command writes nothing anybody names**: it checks a library, and what it compiled on the way
+// is this compiler's cache -- a `--std` build fills the standard module's entry there, found by every
+// compilation after it without being named. A path to write to is a promise of a file somebody will
+// hand to something, and nothing takes one any more.
+build_lib_output_refusal() -> string =
+    "build-lib writes nothing anybody names — it checks a library, and what it compiles is this " +
+    "compiler's cache, found by the compiler alone — so it takes no -o"
 
 // One piece of a report, written and **flushed**, so that a run followed through a log file shows each
 // verdict as it lands rather than only once the process exits. The pieces carry their own newlines,

@@ -1,0 +1,225 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// What `sysl build-lib` is once a `.syslib` is this compiler's private cache: the check that holds a
+// tree to being a library -- the whole analysis, the lowering, and the C compiled for the target --
+// with nothing written that anybody names.
+//
+// **This is a deliberate divergence from the reference.** 0.0.152 writes `<root>/<name>.syslib`,
+// takes `-o`, and answers `wrote <path>`. The user decided on 2026-09-30 that a `.syslib` is a cache
+// nobody names, so here `build-lib` answers `checked <root>`, writes nothing into the root, and
+// refuses `-o`; `build-lib --std` still fills the standard module's cache entry. Every message those
+// tests quote is this compiler's own, and each says so. Where the decision touches nothing -- a
+// root that is not there, a root with no sysl in it, a C file that does not compile -- the expected
+// text is the reference's, quoted from 0.0.152 on the same input less its `sysl: `.
+
+private lbl_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end lbl_run
+
+private lbl_ready() -> bool = std_root().is_ok() && clang_available()
+
+private lbl_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+// A library root holding one module directory, with the given files in it.
+private lbl_library(module_name: string, files: [](string, string)) -> string
+    val root = lbl_temp("sysl-lbl-")
+
+    make_dir_all(s"$root/$module_name").unwrap()
+
+    for i in 0..<files.len
+        write_text(s"$root/$module_name/${files[i].0}", files[i].1).unwrap()
+
+    root
+end lbl_library
+
+// What is in a directory, sorted by nothing but the order the file system answers in, which for one
+// entry is the whole answer.
+private lbl_listing(dir: string) -> string = join(entries(dir).unwrap().view(), " ")
+
+private lbl_output_refused() -> string =
+    "error: build-lib writes nothing anybody names — it checks a library, and what it compiles is " +
+    "this compiler's cache, found by the compiler alone — so it takes no -o"
+
+// -- what it answers --------------------------------------------------------------------------------
+
+// 0.0.152 answers `wrote <root>/demo.syslib` here and leaves the file beside the module. The answer
+// is `checked`, in the register of every other success line this compiler prints (`wrote <path>`):
+// a past-tense verb and the thing it was done to.
+@test("build-lib answers 'checked <root>' and leaves the root as it found it")
+lbl_build_lib_answers_checked_and_writes_nothing()
+    if !lbl_ready() then return
+
+    val root = lbl_library("demo", [("demo.sysl", "module demo\n\ndouble(n: int) -> int = n * 2\n")])
+    val got = lbl_run(["sysl", "build-lib", root])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $root")
+    assert_eq(lbl_listing(root), "demo")
+    assert_eq(lbl_listing(s"$root/demo"), "demo.sysl")
+    remove_dir_all(root).unwrap_or(())
+end lbl_build_lib_answers_checked_and_writes_nothing
+
+// The C is compiled even though nothing is kept, which is the half of the check a type-check alone
+// would miss. Untouched by the decision, so this is the reference's refusal, first line and clang's
+// own words.
+@test("build-lib still compiles the library's C, and a file that does not compile is refused")
+lbl_build_lib_compiles_the_c()
+    if !lbl_ready() then return
+
+    val src = "module cl\n\nextern \"cl_half\" half(n: int) -> int\n\ntwice(n: int) -> int = half(n) * 4\n"
+    val good = lbl_library("cl", [("cl.sysl", src), ("cl.c", "long cl_half(long n) { return n / 2; }\n")])
+    val bad = lbl_library("cl", [("cl.sysl", src), ("cl.c", "long cl_half(long n) { return n / 2 }\n")])
+    val fine = lbl_run(["sysl", "build-lib", good])
+    val refused = lbl_run(["sysl", "build-lib", bad])
+
+    assert_eq(fine.0, Fine, fine.1)
+    assert_eq(fine.1, s"checked $good")
+    assert_eq(refused.0, Failed, refused.1)
+    assert(refused.1.starts_with(s"error: $bad/cl/cl.c did not compile (clang, exit 1):\n"), refused.1)
+    assert(refused.1.contains(s"$bad/cl/cl.c:1:36: error: expected ';' after return statement"), refused.1)
+    remove_dir_all(good).unwrap_or(())
+    remove_dir_all(bad).unwrap_or(())
+end lbl_build_lib_compiles_the_c
+
+// Nothing in the design touches these, so they are 0.0.152's words.
+@test("build-lib refuses a root that is not there, and one with no sysl in it, in the reference's words")
+lbl_build_lib_refuses_a_missing_or_empty_root()
+    val empty = lbl_temp("sysl-lbl-empty-")
+    val gone = s"$empty/nowhere"
+    val missing = lbl_run(["sysl", "build-lib", gone])
+    val bare = lbl_run(["sysl", "build-lib", empty])
+
+    assert_eq(missing.0, Failed, missing.1)
+    assert_eq(missing.1, s"error: cannot read $gone: '$gone' does not exist")
+    assert_eq(bare.0, Failed, bare.1)
+    assert_eq(bare.1, s"error: $empty holds no sysl source files")
+    remove_dir_all(empty).unwrap_or(())
+end lbl_build_lib_refuses_a_missing_or_empty_root
+
+// -- -o, refused -----------------------------------------------------------------------------------
+
+// 0.0.152 takes `-o <path>` and writes the `.syslib` there. Refused here before anything is read, in
+// both spellings and with or without a path after it, and nothing appears at the path.
+@test("build-lib refuses -o and --output before anything is read, and writes nothing there")
+lbl_build_lib_refuses_an_output()
+    val dir = lbl_temp("sysl-lbl-out-")
+    val root = lbl_library("demo", [("demo.sysl", "module demo\n\nf() -> int = 1\n")])
+    val short = lbl_run(["sysl", "build-lib", root, "-o", s"$dir/demo.syslib"])
+    val long = lbl_run(["sysl", "build-lib", "--output", s"$dir/demo.syslib", root])
+    val bare = lbl_run(["sysl", "build-lib", root, "-o"])
+    val nowhere = lbl_run(["sysl", "build-lib", "/nonexistent/lbl", "-o", s"$dir/demo.syslib"])
+
+    assert_eq(short.0, Misused, short.1)
+    assert_eq(short.1, lbl_output_refused())
+    assert_eq(long.0, Misused, long.1)
+    assert_eq(long.1, lbl_output_refused())
+    assert_eq(bare.0, Misused, bare.1)
+    assert_eq(bare.1, lbl_output_refused())
+    assert_eq(nowhere.1, lbl_output_refused())
+    assert(metadata(s"$dir/demo.syslib").is_err(), "nothing was written at the path -o named")
+    assert_eq(lbl_listing(root), "demo")
+    remove_dir_all(dir).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end lbl_build_lib_refuses_an_output
+
+// `--std` fills the standard module's entry in the cache, where every compilation after it finds it;
+// a second copy somewhere a user named has nothing left to consume it.
+@test("build-lib --std refuses -o too, the cache entry being the only place it writes")
+lbl_build_lib_std_refuses_an_output()
+    val dir = lbl_temp("sysl-lbl-std-out-")
+    val got = lbl_run(["sysl", "build-lib", "/nonexistent/lbl-std", "--std", "-o", s"$dir/std.syslib"])
+
+    assert_eq(got.0, Misused, got.1)
+    assert_eq(got.1, lbl_output_refused())
+    assert(metadata(s"$dir/std.syslib").is_err(), "nothing was written at the path -o named")
+    remove_dir_all(dir).unwrap_or(())
+end lbl_build_lib_std_refuses_an_output
+
+// The usage line is what a bare `build-lib` prints, and it no longer offers the flag.
+@test("build-lib's usage line offers no -o")
+lbl_build_lib_usage_offers_no_output()
+    val got = lbl_run(["sysl", "build-lib"])
+
+    assert_eq(got.0, Misused, got.1)
+    assert(got.1.starts_with("usage: sysl build-lib [--std] [--target <name>] [-O<level>] "), got.1)
+    assert(got.1.index_of("-o <path>").is_none(), got.1)
+end lbl_build_lib_usage_offers_no_output
+
+// -- --std still fills the cache -------------------------------------------------------------------
+
+@test("build-lib --std still writes the standard module's cache entry, and says where")
+lbl_build_lib_std_fills_the_cache()
+    if !lbl_ready() then return
+
+    val where = s"${lbl_temp("sysl-lbl-std-")}/std.syslib"
+
+    set_std_search(Some(where))
+
+    val got = lbl_run(["sysl", "build-lib", std_root().unwrap(), "--std"])
+
+    set_std_search(None)
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"wrote $where")
+    assert(metadata(where).is_ok(), s"'$where' was written")
+end lbl_build_lib_std_fills_the_cache
+
+// -- dependencies, refused -------------------------------------------------------------------------
+
+// 0.0.152 refuses this shape too, and ends its sentence "supply 'g' as a source root or as a '.syslib'
+// built from one". A `.syslib` is no longer something to supply, so the sentence ends the way the
+// refusal of a root's own dependencies does.
+@test("build-lib refuses a project's dependencies by name, naming --lib <dir> as the way in")
+lbl_build_lib_refuses_dependencies()
+    val geom = lbl_library("geom", [("geom.sysl", "module geom\n\narea(w: int, h: int) -> int = w * h\n")])
+    val root = lbl_library("dep", [("dep.sysl", "module dep\n\nf() -> int = 1\n")])
+
+    write_text(s"$root/package.hocon", s"dependencies {\n  g = { path = \"$geom\" }\n}\n").unwrap()
+
+    val got = lbl_run(["sysl", "build-lib", root])
+
+    assert_eq(got.0, Failed, got.1)
+    assert_eq(got.1, "error: build-lib compiles the tree it is given and fetches nothing, so this " +
+              "package's dependencies reach it through --lib rather than through 'dependencies' — " +
+              "supply 'g' as --lib <dir>")
+    remove_dir_all(geom).unwrap_or(())
+    remove_dir_all(root).unwrap_or(())
+end lbl_build_lib_refuses_dependencies
+
+// -- a source root -----------------------------------------------------------------------------------
+
+// A library built against a `--lib` root: the root's names are there to type-check against, and a
+// use the root cannot answer is reported where it is written, as a program's would be -- in 0.0.152's
+// words on the same input.
+@test("build-lib checks a library against a source root, and reports a name the root does not have")
+lbl_build_lib_on_a_source_root()
+    if !lbl_ready() then return
+
+    val geom = lbl_library("geom", [("geom.sysl", "module geom\n\narea(w: int, h: int) -> int = w * h\n")])
+    val good = lbl_library("shapes", [("shapes.sysl", "module shapes\n\nsquare(n: int) -> int = geom.area(n, n)\n")])
+    val bad = lbl_library("shapes", [("shapes.sysl", "module shapes\n\nsquare(n: int) -> int = geom.volume(n, n)\n")])
+    val fine = lbl_run(["sysl", "build-lib", good, "--lib", geom])
+    val refused = lbl_run(["sysl", "build-lib", bad, "--lib", geom])
+
+    assert_eq(fine.0, Fine, fine.1)
+    assert_eq(fine.1, s"checked $good")
+    assert_eq(lbl_listing(good), "shapes")
+    assert_eq(lbl_listing(geom), "geom")
+    assert_eq(refused.0, Failed, refused.1)
+    assert_eq(refused.1, "error: undefined function 'geom.volume'\n" +
+                         s" --> $bad/shapes/shapes.sysl:3:30\n" +
+                         "  |\n" +
+                         "3 | square(n: int) -> int = geom.volume(n, n)\n" +
+                         "  |                              ^^^^^^")
+    remove_dir_all(geom).unwrap_or(())
+    remove_dir_all(good).unwrap_or(())
+    remove_dir_all(bad).unwrap_or(())
+end lbl_build_lib_on_a_source_root

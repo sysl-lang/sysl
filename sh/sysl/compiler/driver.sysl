@@ -1063,14 +1063,17 @@ private discard_staging(staging: Option[string])
 //
 // The machine is asked about before anything is read, because a library artifact is object code and
 // a target with no toolchain has nothing an artifact could be.
-// `sysl build-lib [--target <name>] <path>` -- one library compiled ahead of time into the artifact
-// a program links instead of compiling it again.
+// `sysl build-lib [--target <name>] <path>` -- one library held to being a library for one machine,
+// and the answer is the root it checked.
+//
+// **It writes nothing anybody names.** A `.syslib` is this compiler's cache, so what the check
+// assembles is discarded; what the command is run for is that the whole of it went through, which
+// for a board package is the only check it gets.
 //
 // **It compiles the tree it is given and fetches nothing**, which is the one thing about the command
 // a reader has to be told: a `dependencies` block every other command honours is refused here by
-// name, because there is no program to resolve a graph for and the artifact would be keyed to a
-// resolution nobody made.
-build_library_of(path: string, named_target: Option[string], out: Option[string],
+// name, and what the tree depends on is handed over as a source root of its own.
+build_library_of(path: string, named_target: Option[string],
                  level: string = DefaultOptimization) -> Result[string, Failure]
     val t = target_for(path, named_target)?
 
@@ -1089,7 +1092,7 @@ build_library_of(path: string, named_target: Option[string], out: Option[string]
 
         return Err(said(Refusal("build-lib compiles the tree it is given and fetches nothing, so this " +
             s"package's dependencies reach it through --lib rather than through 'dependencies' — " +
-            s"supply $labels as a source root or as a '.syslib' built from one")))
+            s"supply $labels as --lib <dir>")))
     end if
 
     // A source root's `dependencies` are refused on the same terms: a root is there to type-check
@@ -1123,12 +1126,8 @@ build_library_of(path: string, named_target: Option[string], out: Option[string]
     val c = packaged_compilation_of(path, t)?
     val named = if manifest.name == "" then basename(root) else manifest.name
 
-    // Named after the root it was built from and written inside it, which is the rule a build's
-    // executable follows and for the same reason: the root is the one place that names the library
-    // without depending on where the caller happened to be standing.
-    val where = out.unwrap_or(s"${default_executable(path)}$SyslibExtension")
-
-    build_library(root, t, where, c.units, c.own, s"'$named'", probed, level)
+    build_library(root, t, c.units, c.own, s"'$named'", probed, level)?
+    Ok(root)
 end build_library_of
 
 build_std_artifact_of(path: string, named_target: Option[string], out: Option[string],
