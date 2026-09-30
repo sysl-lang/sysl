@@ -20,6 +20,12 @@ import sysl.text.{replace_all, Search}
 
 private pkb_ready() -> bool = std_root().is_ok() && clang_available()
 
+// A temporary directory as the compiler names it: `$TMPDIR` ends in a slash on this machine, and a
+// tree is walked from a normalized absolute root, so every path a diagnostic quotes is this one.
+private pkb_temp(prefix: string) -> Result[string, string] = make_temp_dir(prefix) match
+    Ok(dir) -> Ok(absolute_path(dir))
+    Err(_) -> Err("no temporary directory")
+
 private pkb_none() -> Buf[(string, string)] = buf()
 
 private pkb_one(at: string, body: string) -> Buf[(string, string)]
@@ -68,7 +74,7 @@ end pkb_lay
 // The same in a directory of its own, plus whatever else the manifest says -- a `defines` block.
 private pkb_package_saying(extra: string, name: string, module_path: string, text: string,
                            files: Buf[(string, string)]) -> string
-    val root = make_temp_dir("sysl-pkb-pkg").unwrap()
+    val root = pkb_temp("sysl-pkb-pkg").unwrap()
 
     pkb_lay(root, extra, name, module_path, text, "", files)
     root
@@ -83,7 +89,7 @@ private pkb_carrying(name: string, module_path: string, text: string,
 
 // A project with a program in it and the dependencies its manifest names.
 private pkb_app(program: string, deps: string) -> string
-    val root = make_temp_dir("sysl-pkb-app").unwrap()
+    val root = pkb_temp("sysl-pkb-app").unwrap()
 
     write_text(s"$root/package.hocon",
                s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { $deps }\n").unwrap()
@@ -126,7 +132,7 @@ private pkb_drop(dirs: []string)
 
 // What the program a build of `root` makes prints, or what stopped it.
 private pkb_run(root: string) -> string
-    val out_dir = make_temp_dir("sysl-pkb-exe").unwrap()
+    val out_dir = pkb_temp("sysl-pkb-exe").unwrap()
 
     val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
         Err(why) -> s"refused: ${failure_text(why)}"
@@ -141,7 +147,7 @@ end pkb_run
 
 // What a build of `root` was refused with, as the command line prints it after `sysl: error: `.
 private pkb_refused(root: string) -> string
-    val out_dir = make_temp_dir("sysl-pkb-exe").unwrap()
+    val out_dir = pkb_temp("sysl-pkb-exe").unwrap()
 
     val said = build_native_program(root, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
         Err(why) -> failure_text(why)
@@ -219,7 +225,7 @@ end pkb_our_module_beside_a_mounted_one
 pkb_a_packages_modules_call_each_other()
     if !pkb_ready() then return
 
-    val two = make_temp_dir("sysl-pkb-two").unwrap()
+    val two = pkb_temp("sysl-pkb-two").unwrap()
 
     write_text(s"$two/package.hocon", pkb_manifest("two", "1.0.0", "")).unwrap()
     // Written with the package's own short name, so its source reads the same whoever depends on it.
@@ -238,7 +244,7 @@ private pkb_middle(project: string, body: string) -> string
     pkb_vendored(project, "github.com/e/bottom", "1.0.0", pkb_manifest("bottom", "1.0.0", ""),
                  "bottom", "double(n: int) -> int = n * 2")
 
-    val middle = make_temp_dir("sysl-pkb-mid").unwrap()
+    val middle = pkb_temp("sysl-pkb-mid").unwrap()
 
     pkb_lay(middle, "", "middle", "middle", body, "b { git = \"github.com/e/bottom\", version = \"1.0.0\" }",
             pkb_none())
@@ -370,7 +376,7 @@ end pkb_a_module_below_comes_with_it
 
 // A namespaced package's own modules reaching each other: the segment that travels past the head.
 private pkb_namespaced(outer: string) -> string
-    val ns = make_temp_dir("sysl-pkb-ns").unwrap()
+    val ns = pkb_temp("sysl-pkb-ns").unwrap()
 
     write_text(s"$ns/package.hocon", pkb_manifest("ns", "1.0.0", "")).unwrap()
     pkb_write_all(ns, pkb_two("sh/sysl/inner/inner.sysl",
@@ -500,7 +506,7 @@ pkb_c_two_levels_down()
                               "bottom/shim.c", "int bottom_seven(void) { return 7; }\n"))
     pkb_seal(at)
 
-    val middle = make_temp_dir("sysl-pkb-mid").unwrap()
+    val middle = pkb_temp("sysl-pkb-mid").unwrap()
 
     pkb_lay(middle, "", "middle", "middle", "six_sevens() -> int = bottom.seven() * 6",
             "b { git = \"github.com/e/bottom\", version = \"1.0.0\" }", pkb_none())
@@ -554,7 +560,7 @@ end pkb_c_that_will_not_compile
 // A project whose own tree carries the files named, so the warning is about something its author can
 // change.
 private pkb_stray(files: Buf[(string, string)]) -> string
-    val root = make_temp_dir("sysl-pkb-stray").unwrap()
+    val root = pkb_temp("sysl-pkb-stray").unwrap()
 
     write_text(s"$root/package.hocon", "package { name = \"app\", version = \"0.1.0\" }").unwrap()
     write_text(s"$root/main.sysl", "print(thing.answer())").unwrap()
@@ -609,7 +615,7 @@ end pkb_no_c_no_warning
 pkb_no_dependencies_block()
     if !pkb_ready() then return
 
-    val root = make_temp_dir("sysl-pkb-plain").unwrap()
+    val root = pkb_temp("sysl-pkb-plain").unwrap()
 
     write_text(s"$root/package.hocon", "package { name = \"app\", version = \"0.1.0\" }").unwrap()
     write_text(s"$root/main.sysl", "print(42)").unwrap()
@@ -873,7 +879,7 @@ end pkb_defines_scoped_to_their_package
 
 // A project whose package name is also the name of a module directory in it.
 private pkb_colliding(name: string) -> string
-    val root = make_temp_dir("sysl-pkb-collide").unwrap()
+    val root = pkb_temp("sysl-pkb-collide").unwrap()
 
     write_text(s"$root/package.hocon", s"package { name = \"$name\", version = \"0.1.0\" }\n").unwrap()
     pkb_write_all(root, pkb_one(s"$name/$name.sysl", s"module $name\n\nvalue() -> int = 7\n"))

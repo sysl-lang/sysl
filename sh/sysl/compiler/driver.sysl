@@ -722,7 +722,9 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
         val declared: &Manifest = manifest_at(root).unwrap_or(empty_manifest())
 
         carried_defines(declared, found) match
-            Err(why) -> return Err(Refusal(manifest_refusal(why)))
+            Err(why) ->
+                return Err(Refusal(defines_refusal(
+                    if is_directory(path) then path else parent_of(path).unwrap_or("."), root, why)))
             Ok(_) -> ()
 
         for j in 0..<found.len()
@@ -743,6 +745,23 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
         Err(why) -> Err(Refusal(why))
         Ok(_) -> Ok(())
 end build_c_members
+
+// A `defines` block that names C its tree does not carry, as the refusal reads: where the tree is a
+// package's, its canonical prefix goes in front, since the consumer meets the mistake and has to be
+// told whose manifest made it.
+private defines_refusal(project: string, tree: string, why: string) -> string
+    val said = manifest_refusal(why)
+
+    manifest_at(project) match
+        Err(_) -> said
+        Ok(m) ->
+            val places = package_places(project, m)
+
+            for i in 0..<places.len()
+                if places.at(i).1 == tree then return s"'${places.at(i).0}': $said"
+
+            said
+end defines_refusal
 
 // Every tree whose C belongs in the archive: the project's own, each package it takes, and the
 // standard module's.
@@ -1262,7 +1281,7 @@ private native_objects(clang: string, path: string, exe: string, t: Target,
         carried_defines(declared, found) match
             Err(why) ->
                 discard_objects(objects)
-                return Err(Refusal(manifest_refusal(why)))
+                return Err(Refusal(defines_refusal(root, trees.at(i), why)))
             Ok(_) -> ()
 
         for j in 0..<found.len()
