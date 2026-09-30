@@ -231,8 +231,13 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     // Then the source roots. **Their modules are not the project's own**: `own` is what decides
     // whose tests a test build keeps, so a root's tests run exactly where the project declares the
     // same module and nowhere else.
+    // A root's files read an import line through the project's table, which is where its own
+    // manifest's `dependencies` were bound -- a root's modules being filed under the project's names.
     for i in 0..<handed.len()
-        units.push(handed.at(i))
+        var unit = handed.at(i)
+
+        unit.pkg = Packaging("", fetched.root_mounts, true)
+        units.push(unit)
 
     // What the project's own files mean by the paths at the head of their import lines. The project
     // itself has no prefix -- its modules keep the names they were written with -- and what it has
@@ -1086,6 +1091,30 @@ build_library_of(path: string, named_target: Option[string], out: Option[string]
             s"package's dependencies reach it through --lib rather than through 'dependencies' — " +
             s"supply $labels as a source root or as a '.syslib' built from one")))
     end if
+
+    // A source root's `dependencies` are refused on the same terms: a root is there to type-check
+    // against, and what it depends on reaches `build-lib` as a root of its own.
+    val libs = lib_roots()
+
+    for i in 0..<libs.len()
+        if !is_directory(libs.at(i)) then continue
+
+        val theirs = manifest_of_package(libs.at(i)) match
+            Err(why) -> return Err(said(Refusal(why)))
+            Ok(got) -> got
+
+        if theirs.dependencies.is_empty() then continue
+
+        var labels = ""
+
+        for j in 0..<theirs.dependencies.len()
+            if j > 0 then labels = labels + ", "
+
+            labels = labels + s"'${theirs.dependencies.at(j).label}'"
+
+        return Err(said(Refusal(s"build-lib compiles the trees it is given and fetches nothing, so " +
+            s"the source root '${libs.at(i)}' has its dependencies reach it through --lib rather " +
+            s"than through 'dependencies' — supply $labels as --lib <dir> too")))
 
     // The two requirements a command line answers, asked before anything is compiled: a package
     // whose C cannot be reached has nothing to gain from the ten seconds of analysis in front of it.
