@@ -1,0 +1,899 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A member that declares type parameters of its own, ported from the reference's
+// `GenericMethodRunTests.scala` case for case (`reference/generics.md § Members and associated
+// functions`).
+//
+// The type's parameters and the member's are fixed from two different places: the receiver already
+// says what the type's arguments are, while the member's own are solved at the call, from what it is
+// passed and from the type the context expects -- exactly as a generic free function's are. A type
+// with no parameters at all may still have a member with some.
+//
+// **Every output, message and location here was read out of the reference compiler** (0.0.152) on
+// the same single-file program. Where the reference marks only the member's name with carets and
+// this compiler marks the whole call, the line and column still agree, and that is what is asserted.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private gmr_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end gmr_ready
+
+// What a one-file program PRINTS, built fresh and run, so no run cache stands between the two.
+private gmr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-gmr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end gmr_ran
+
+// The LLVM text of a one-file program, or what refused it.
+private gmr_ir(text: string) -> string
+    val root = make_temp_dir("sysl-gmr-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gmr_ir
+
+// How many functions the module defines for `Box.one`, which is how many instantiations of it the
+// program reached.
+private gmr_defined(text: string) -> usize
+    val ir = gmr_ir(text)
+    var n: usize = 0
+    var at: usize = 0
+
+    loop
+        val next = ir.index_of_from("\n", at)
+        val stop = if next.is_some() then next.unwrap() else ir.bytes.len
+        val line = ir[at..<stop]
+
+        if line.starts_with("define") && line.contains("@Box.one.") then n += 1
+        if next.is_none() then break
+
+        at = stop + 1
+
+    n
+end gmr_defined
+
+// What analysing a one-file program had to say, rendered as the command line renders it.
+private gmr_said(text: string) -> string
+    val root = make_temp_dir("sysl-gmr-err").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gmr_said
+
+// The program is refused with exactly this message, and nothing else, at this line and column.
+private gmr_refused(text: string, message: string, at: string)
+    val out = gmr_said(text)
+
+    assert(out.starts_with(s"error: $message\n --> ") || out.starts_with(s"error: $message\n  --> "),
+           s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+    assert_eq(out.count_of("error: "), 1)
+end gmr_refused
+
+// -- the member's own parameters come from the call -----------------------------------------------
+
+@test("one parameter from one argument, at two different types")
+gmr_one_parameter_at_two_types()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            keep[U](self, x: U) -> U = x
+        var b = Box(1)
+        print(b.keep(7))
+        print(b.keep("s"))
+        """), "7\ns\n")
+
+@test("a type that declares none of its own may still have a member that does")
+gmr_a_plain_type_with_a_generic_member()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Counter
+            n: int
+            with[U](self, x: U) -> U = x
+        var c = Counter(3)
+        print(c.with(9))
+        print(c.with("t"))
+        """), "9\nt\n")
+
+@test("two parameters, one from each argument")
+gmr_two_parameters_one_from_each()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Pair[A, B]
+            a: A
+            b: B
+        struct Box[T]
+            v: T
+            of[U, V](self, x: U, y: V) -> Pair[U, V] = Pair(x, y)
+        var b = Box(0)
+        var p = b.of(4, "e")
+        print(p.a)
+        print(p.b)
+        """), "4\ne\n")
+
+@test("the type's parameter and the member's meet in one result")
+gmr_both_lists_meet_in_one_result()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Pair[A, B]
+            a: A
+            b: B
+        struct Box[T]
+            v: T
+            with[U](self, x: U) -> Pair[T, U] = Pair(self.v, x)
+        var b = Box(41)
+        var p = b.with("hi")
+        print(p.a)
+        print(p.b)
+        """), "41\nhi\n")
+
+@test("a parameter under a composed type is solved from the element")
+gmr_solved_from_the_element()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            first[U](self, xs: []U) -> U = xs[0]
+        var a = [7, 8]
+        var b = Box("k")
+        print(b.first(a[0..<2]))
+        """), "7\n")
+
+// -- the type the context expects settles what the arguments do not -------------------------------
+
+@test("an annotated variable fixes a parameter only the result mentions")
+gmr_an_annotated_variable_fixes_it()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            zero[U](self) -> U = 0
+        var b = Box(1)
+        var x: i8 = b.zero()
+        print(x)
+        """), "0\n")
+
+@test("and so does a result the parameter appears under")
+gmr_a_result_the_parameter_is_under()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            make[U](self) -> Box[U] = Box(0)
+        var b = Box(1)
+        var c: Box[i16] = b.make()
+        print(c.v)
+        """), "0\n")
+
+@test("a declared result of the calling function does it too")
+gmr_a_declared_result_does_it()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            zero[U](self) -> U = 0
+        small(b: Box[int]) -> i8 = b.zero()
+        print(small(Box(1)))
+        """), "0\n")
+
+// -- the receiver still fixes the type's own parameters -------------------------------------------
+
+@test("a result written 'Self' is the receiver's own type")
+gmr_a_self_result()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            again[U](self, x: U) -> Self = self
+        var b = Box(4)
+        print(b.again("z").v)
+        """), "4\n")
+
+@test("a '*self' receiver reaches the type's own parameter")
+gmr_a_pointer_receiver()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            swap[U](*self, x: U, y: T) -> U =
+                self.v = y
+                x
+        var b = Box(1)
+        print(b.swap(5, 2))
+        print(b.v)
+        """), "5\n2\n")
+
+@test("a '&self' receiver does as well")
+gmr_a_counted_receiver()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            both[U](&self, x: U) -> T = self.v
+        var b: &Box[int] = Box(6)
+        print(b.both("q"))
+        """), "6\n")
+
+// -- bounds hold, the type's and the member's alike -----------------------------------------------
+
+@test("a member may bound its own parameter")
+gmr_a_member_bounds_its_own()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        trait Rank
+            rank(self) -> int
+        struct P
+            n: int
+        impl Rank for P
+            rank(self) -> int = self.n
+        struct Box[T]
+            v: T
+            scored[U: Rank](self, x: U) -> int = x.rank()
+        var b = Box("w")
+        print(b.scored(P(12)))
+        """), "12\n")
+
+@test("the type's bound and the member's both hold inside one body")
+gmr_both_bounds_hold()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T: Display]
+            v: T
+            both[U: Display](self, x: U) -> string = f"${self.v}-${x}"
+        var b = Box(3)
+        print(b.both("z"))
+        """), "3-z\n")
+
+@test("a bounded parameter may be handed on to something that asks the same")
+gmr_a_bounded_parameter_handed_on()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        trait Rank
+            rank(self) -> int
+        struct P
+            n: int
+        impl Rank for P
+            rank(self) -> int = self.n
+        scored[T: Rank](x: T) -> int = x.rank()
+        struct Box[T]
+            v: T
+            hand[U: Rank](self, x: U) -> int = scored(x)
+        var b = Box(0)
+        print(b.hand(P(5)))
+        """), "5\n")
+
+// -- it is an ordinary member in every other respect ----------------------------------------------
+
+@test("an enum declares one the same way")
+gmr_an_enum_declares_one()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        enum Opt[T]
+            Empty
+            Full(v: T)
+            tagged[U](self, x: U) -> U = x
+        var o: Opt[int] = Full(2)
+        print(o.tagged(9))
+        """), "9\n")
+
+@test("one generic member calls another")
+gmr_one_calls_another()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            one[U](self, x: U) -> U = x
+            two[U](self, x: U) -> U = self.one(x)
+        var b = Box(1)
+        print(b.two(8))
+        """), "8\n")
+
+@test("a member calls a generic free function with its own parameter")
+gmr_calls_a_generic_free_function()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        id[T](x: T) -> T = x
+        struct Box[T]
+            v: T
+            thru[U](self, x: U) -> U = id(x)
+        var b = Box(1)
+        print(b.thru(6))
+        """), "6\n")
+
+@test("one recurses at a single instantiation")
+gmr_recurses_at_one_instantiation()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            down[U](self, x: U, k: int) -> int =
+                if k <= 0 then 0
+                else self.down(x, k - 1) + 1
+        var b = Box(1)
+        print(b.down("a", 3))
+        """), "3\n")
+
+// An associated function is reached through the type's name, which settles the type's arguments
+// (for a generic type, from the arguments the call passes) and leaves the member's own to the call.
+@test("an associated function may declare parameters of its own")
+gmr_an_associated_function_of_its_own()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Counter
+            n: int
+            make[T](x: T) -> T = x
+        print(Counter.make(5))
+        print(Counter.make("m"))
+        """), "5\nm\n")
+
+@test("and on a generic type both lists are inferred from the call")
+gmr_both_lists_from_the_call()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Pair[A, B]
+            a: A
+            b: B
+            of[U](x: A, y: B, z: U) -> U = z
+        print(Pair.of(1, "s", true))
+        """), "true\n")
+
+@test("an enum's associated function does the same")
+gmr_an_enums_associated_function()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        enum Opt[T]
+            Empty
+            Full(v: T)
+            wrap[U](x: T, y: U) -> U = y
+        print(Opt.wrap(1, "w"))
+        """), "w\n")
+
+@test("a non-generic member of the same type calls one")
+gmr_a_plain_member_calls_one()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            one[U](self, x: U) -> U = x
+            two(self) -> int = self.one(5)
+        var b = Box("q")
+        print(b.two())
+        """), "5\n")
+
+@test("a generic function calls one on a receiver whose type is still a parameter")
+gmr_through_a_receiver_still_a_parameter()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            one[U](self, x: U) -> U = x
+        thru[T](b: Box[T]) -> int = b.one(3)
+        print(thru(Box("z")))
+        """), "3\n")
+
+@test("the member's own parameter may be held in a memory mode")
+gmr_held_in_a_memory_mode()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            deref[U](self, p: *U) -> U = *p
+        var n = 12
+        var b = Box(0)
+        print(b.deref(&n))
+        """), "12\n")
+
+@test("and may be returned by reference")
+gmr_returned_by_reference()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            hold[U](self, x: U) -> &U = x
+        var b = Box(0)
+        var r: &int = b.hold(3)
+        print(*r)
+        """), "3\n")
+
+@test("one lives alongside an 'impl' on the same type")
+gmr_alongside_an_impl()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        trait Show
+            show(self) -> int
+        struct Box[T]
+            v: T
+            one[U](self, x: U) -> U = x
+        impl[T] Show for Box[T]
+            show(self) -> int = 1
+        var b = Box(0)
+        print(b.show())
+        print(b.one("y"))
+        """), "1\ny\n")
+
+@test("and does not keep its type out of a trait object")
+gmr_not_kept_out_of_a_trait_object()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        trait Show
+            show(self) -> int
+        struct P
+            n: int
+            one[U](self, x: U) -> U = x
+        impl Show for P
+            show(self) -> int = self.n
+        var p = P(4)
+        var o: &Show = P(4)
+        print(o.show())
+        print(p.one("g"))
+        """), "4\ng\n")
+
+@test("an owning receiver taken by value neither leaks nor frees twice")
+gmr_an_owning_receiver_by_value()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            one[U](self, x: U) -> T = self.v
+        var i = 0
+        while i < 500
+            var b = Box(f"p${i}")
+            var s = b.one(i)
+            i += 1
+        print(i)
+        """), "500\n")
+
+@test("an owning payload passed through one neither leaks nor frees twice")
+gmr_an_owning_payload_passed_through()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            keep[U](self, x: U) -> U = x
+        var b = Box(0)
+        var i = 0
+        while i < 1000
+            var s = b.keep(f"n${i}")
+            i += 1
+        print(i)
+        """), "1000\n")
+
+// -- each instantiation is its own function -------------------------------------------------------
+
+@test("two argument types make two")
+gmr_two_argument_types_make_two()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_defined(raw"""
+        struct Box[T]
+            v: T
+            one[U](self, x: U) -> U = x
+        var b = Box(1)
+        print(b.one(2))
+        print(b.one("q"))
+        """), 2)
+
+@test("the name carries the type's arguments and the member's, in that order")
+gmr_the_name_carries_both_lists()
+    if !gmr_ready() then return
+
+    val ir = gmr_ir(raw"""
+        struct Box[T]
+            v: T
+            one[U](self, x: U) -> U = x
+        var b = Box(true)
+        print(b.one(2))
+        """)
+
+    assert(ir.contains("@Box.one.bool.int("), s"expected '@Box.one.bool.int(' in: $ir")
+
+@test("two calls at one instantiation make only one")
+gmr_two_calls_make_one()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_defined(raw"""
+        struct Box[T]
+            v: T
+            one[U](self, x: U) -> U = x
+        var b = Box(1)
+        print(b.one(2))
+        print(b.one(3))
+        """), 1)
+
+@test("two receivers of different instantiations make two")
+gmr_two_receivers_make_two()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_defined(raw"""
+        struct Box[T]
+            v: T
+            one[U](self, x: U) -> U = x
+        var a = Box(1)
+        var b = Box(true)
+        print(a.one(2))
+        print(b.one(3))
+        """), 2)
+
+// -- a closure at a parameter naming the type's own parameter -------------------------------------
+
+@test("reads against what the receiver settled")
+gmr_a_closure_reads_against_the_receiver()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            apply[U](self, f: &Fn(T) -> U) -> U = f(self.v)
+        val b = Box(3)
+        print(b.apply(n -> n + 1))
+        """), "4\n")
+
+@test("the free function of the same signature agrees")
+gmr_the_free_function_agrees()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            apply[U](self, f: &Fn(T) -> U) -> U = f(self.v)
+        free_apply[T, U](v: T, f: &Fn(T) -> U) -> U = f(v)
+        val b = Box(3)
+        print(free_apply(3, n -> n + 1))
+        print(b.apply(n -> n + 1))
+        """), "4\n4\n")
+
+@test("what the closure yields is still read off its body")
+gmr_the_yield_is_read_off_the_body()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Box[T]
+            v: T
+            apply[U](self, f: &Fn(T) -> U) -> U = f(self.v)
+        val b = Box(3)
+        print(b.apply(n -> s"<${n}>"))
+        """), "<3>\n")
+
+@test("two of the type's parameters, at a closure taking both")
+gmr_two_of_the_types_parameters()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Pair[A, B]
+            a: A
+            b: B
+            fold[R](self, f: &Fn(A, B) -> R) -> R = f(self.a, self.b)
+        print(Pair(2, "xy").fold((x, y) -> s"${x}${y}"))
+        """), "2xy\n")
+
+@test("a bare arrow naming the type's parameter, on a member that declares one of its own")
+gmr_a_bare_arrow_beside_its_own()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Pair[A, B]
+            a: A
+            b: B
+            arrow[R](self, f: A -> R) -> R = f(self.a)
+        print(Pair(2, "xy").arrow(x -> x * 10))
+        """), "20\n")
+
+@test("a bare arrow naming it, on a member that declares none")
+gmr_a_bare_arrow_on_a_plain_member()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        struct Gen[T]
+            v: T
+            same(self, f: T -> T) -> T = f(self.v)
+        print(Gen(4).same(n -> n * 2))
+        """), "8\n")
+
+@test("the map shape it was all for")
+gmr_the_map_shape()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        import sysl.buf.{Buf, buf}
+        struct Seq[T]
+            items: Buf[T]
+            map[U](self, f: &Fn(T) -> U) -> []U
+                var b: Buf[U] = buf()
+                for i in 0..<self.items.len()
+                    b.push(f(self.items[i]))
+                b.view()
+            end map
+        end Seq
+        var names: Buf[string] = buf()
+        names.push("ab")
+        names.push("c")
+        val lens = Seq(names).map(s -> s.len)
+        print(lens[0], lens[1])
+        """), "2 1\n")
+
+// -- and what the receiver cannot settle is still refused -----------------------------------------
+
+private gmr_unsolved_pick() -> string = raw"""
+    struct Box[T]
+        v: T
+        pick[U](self, f: &Fn(U) -> int) -> int = 0
+    print(Box(3).pick(n -> 1))
+    """
+
+@test("a closure at a parameter naming the member's own unsolved parameter")
+gmr_a_closure_at_an_unsolved_parameter()
+    if !gmr_ready() then return
+
+    gmr_refused(gmr_unsolved_pick(), "'n' has no type here — nothing says what this closure takes, " +
+                "so write it: '(n: …) -> …'", "4:19")
+
+// The advice is an ellipsis and not a `T`: the receiver's type parameter here is *called* `T`, so
+// advising the reader to write one would name something that means nothing where they stand.
+@test("the refusal advises a type position rather than a name that is not in scope")
+gmr_the_advice_is_a_type_position()
+    if !gmr_ready() then return
+
+    val out = gmr_said(gmr_unsolved_pick())
+
+    assert(out.contains("'(n: …) -> …'"), s"expected the ellipsis advice, got: $out")
+    assert(!out.contains("'(n: T) -> …'"), s"expected no 'T' in the advice, got: $out")
+
+@test("a bound the member's own parameter does not meet is reported, once")
+gmr_an_unmet_member_bound_once()
+    if !gmr_ready() then return
+
+    val text = raw"""
+        struct Box[T]
+            v: T
+            show[U: Display](self, f: &Fn(T) -> U) -> string = str(f(self.v))
+        struct Opaque
+            n: int
+        end Opaque
+        print(Box(3).show(n -> Opaque(n)))
+        """
+
+    gmr_refused(text, "'Box.show' requires its type parameter 'U' to implement 'sysl.Display', but " +
+                "Opaque does not", "7:14")
+    assert_eq(gmr_said(text).count_of("requires its type parameter"), 1)
+
+// -- a trait may require a member with type parameters of its own ---------------------------------
+
+private gmr_applies() -> string = raw"""
+    trait Applies[T]
+        apply[U](self, f: &Fn(T) -> U) -> U
+    struct Holder
+        v: int
+    impl Applies[int] for Holder
+        apply[U](self, f: &Fn(int) -> U) -> U = f(self.v)
+    """
+
+@test("an implementation supplies it and a call reaches it")
+gmr_an_implementation_supplies_it()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(gmr_applies() + "print(Holder(3).apply(n -> n + 1))\n"), "4\n")
+
+@test("the implementation may spell the parameter with its own letter")
+gmr_its_own_letter()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        trait Applies[T]
+            apply[U](self, f: &Fn(T) -> U) -> U
+        struct Holder
+            v: int
+        impl Applies[int] for Holder
+            apply[V](self, f: &Fn(int) -> V) -> V = f(self.v)
+        print(Holder(3).apply(n -> s"<${n}>"))
+        """), "<3>\n")
+
+// A closure at `f: &Fn(int) -> U` reached through a bound arrives before `U` is solved, so it is
+// put behind the `&Fn` only once the call has solved `U` off the closure's body.
+@test("a bound reaches it, and solves the member's own parameter at the abstract call")
+gmr_a_bound_reaches_it()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(gmr_applies() + "twice[S: Applies[int]](s: S) -> int = s.apply(n -> n * 2)\n" +
+                      "print(twice(Holder(21)))\n"), "42\n")
+
+@test("one bound body serves two instantiations of the member")
+gmr_one_bound_body_two_instantiations()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(gmr_applies() + raw"""
+        shown[S: Applies[int]](s: S) -> string = s.apply(n -> s"<${n}>")
+        doubled[S: Applies[int]](s: S) -> int = s.apply(n -> n * 2)
+        print(shown(Holder(3)), doubled(Holder(3)))
+        """), "<3> 6\n")
+
+@test("a map on a plain slice, which is what none of this was possible without")
+gmr_a_map_on_a_plain_slice()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        import sysl.buf.{Buf, buf}
+        trait Sequence[T]
+            map[U](self, f: &Fn(T) -> U) -> []U
+        impl[A] Sequence[A] for []const A
+            map[U](self, f: &Fn(A) -> U) -> []U
+                var b: Buf[U] = buf()
+                for i in 0..<self.len
+                    b.push(f(self[i]))
+                b.view()
+        val a = [1, 2, 3]
+        val doubled = a[..].map(n -> n * 2)
+        val shown = a[..].map(n -> s"<${n}>")
+        print(doubled[0], doubled[2])
+        print(shown[0], shown[2])
+        """), "2 6\n<1> <3>\n")
+
+// -- the trait keeps its object, and the member is what is left out of the table ------------------
+
+private gmr_described() -> string = raw"""
+    trait Applies[T]
+        describe(self) -> string
+        apply[U](self, f: &Fn(T) -> U) -> U
+    struct Holder
+        v: int
+    impl Applies[int] for Holder
+        describe(self) -> string = "holder"
+        apply[U](self, f: &Fn(int) -> U) -> U = f(self.v)
+    val o: &Applies[int] = Holder(3)
+    """
+
+@test("the object forms, and its other members dispatch")
+gmr_the_object_forms()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(gmr_described() + "print(o.describe())\n"), "holder\n")
+
+@test("the slot the table did not hold is the one refused, and it says which")
+gmr_the_missing_slot_is_refused()
+    if !gmr_ready() then return
+
+    gmr_refused(gmr_described() + "print(o.apply(n -> n + 1))\n",
+                "'apply' of 'Applies' declares type parameters of its own, so it is not a function " +
+                "until a call names them and no slot of a &Applies[int]'s table can point at it — " +
+                "reach it through a bound, where the type is known", "10:9")
+
+// A bound licenses every member and an object reaches only its table, so the two lists have to be
+// the same for an object to stand at one. This is the one case where they are not.
+@test("an object does not stand at a bound on a trait with such a member")
+gmr_an_object_at_such_a_bound()
+    if !gmr_ready() then return
+
+    gmr_refused(gmr_applies() + "twice[S: Applies[int]](s: S) -> int = s.apply(n -> n * 2)\n" +
+                "val o: &Applies[int] = Holder(21)\nprint(twice(o))\n",
+                "'twice' requires its type parameter 'S' to implement 'Applies[int]', but " +
+                "&Applies[int] does not — a bound promises every member and an erased value reaches " +
+                "only what its table holds, and 'apply' declares type parameters of its own, so it " +
+                "has no slot to be reached through. Call it on the value before erasing it, or take " +
+                "the bound on a type parameter", "9:7")
+
+@test("a trait with no such member keeps standing at its own bound")
+gmr_a_plain_trait_keeps_its_bound()
+    if !gmr_ready() then return
+
+    assert_eq(gmr_ran(raw"""
+        trait Named
+            describe(self) -> string
+        struct Holder
+            v: int
+        impl Named for Holder
+            describe(self) -> string = "holder"
+        tell[S: Named](s: S) -> string = s.describe()
+        val o: &Named = Holder(3)
+        print(tell(o))
+        """), "holder\n")
+
+// -- and the shape still has to match the trait's -------------------------------------------------
+
+// Both refusals are anchored at the `impl` block, as the reference anchors every signature mismatch:
+// what fails is the block's promise to be the trait.
+@test("an implementation declaring no parameter of its own where the trait declares one")
+gmr_an_implementation_declaring_none()
+    if !gmr_ready() then return
+
+    gmr_refused(raw"""
+        trait Applies[T]
+            apply[U](self, f: &Fn(T) -> U) -> U
+        struct Holder
+            v: int
+        impl Applies[int] for Holder
+            apply(self, f: &Fn(int) -> int) -> int = f(self.v)
+        """, "method 'apply' of 'impl Applies for Holder' declares 0 type parameters, but trait " +
+        "'Applies' declares 1", "5:1")
+
+@test("an implementation whose signature disagrees once the parameters are lined up")
+gmr_a_signature_that_disagrees()
+    if !gmr_ready() then return
+
+    gmr_refused(raw"""
+        trait Applies[T]
+            apply[U](self, f: &Fn(T) -> U) -> U
+        struct Holder
+            v: int
+        impl Applies[int] for Holder
+            apply[U](self, f: &Fn(int) -> U) -> int = 0
+        """, "method 'apply' returns int, but trait 'Applies' declares U", "5:1")
