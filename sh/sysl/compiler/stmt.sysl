@@ -40,6 +40,7 @@ struct BlockGroup
     needs: Buf[string]
     awaiting: bool
     in_view: usize
+    declared: usize
 end BlockGroup
 
 open_group(cx: &Analyzer, stmts: Buf[Stmt]) -> BlockGroup
@@ -53,7 +54,8 @@ open_group(cx: &Analyzer, stmts: Buf[Stmt]) -> BlockGroup
     for i in 0..<cx.pending_needs.len()
         needs.push(cx.pending_needs.at(i))
 
-    val was = BlockGroup(pending, needs, cx.awaiting_needs, cx.nested.len())
+    val was = BlockGroup(pending, needs, cx.awaiting_needs, cx.nested.len(),
+                         cx.block_declares.len())
 
     open_block_group(cx, stmts)
     was
@@ -72,6 +74,7 @@ close_group(cx: &Analyzer, was: BlockGroup)
 
     cx.awaiting_needs = was.awaiting
     cx.nested.truncate(was.in_view)
+    cx.block_declares.truncate(was.declared)
 
 // The nested functions a run of statements declares, and what the group of them still needs.
 open_block_group(cx: &Analyzer, stmts: Buf[Stmt])
@@ -84,10 +87,25 @@ open_block_group(cx: &Analyzer, stmts: Buf[Stmt])
 
     // Every name the block binds, whether or not it has been reached yet. A name bound further down
     // is still one the group may read, and the environment waits for it.
+    //
+    // **Where each is bound travels with it**, and whether the block's nested functions had begun
+    // by then: a use above the binding is one mistake, and a nested function's default reading a
+    // binding the group was formed above is another.
     var binds: Buf[string] = buf()
+    var begun = false
 
     for i in 0..<stmts.len()
-        block_binds(stmts.at(i), &binds)
+        val s = stmts.at(i)
+        val mark = binds.len()
+
+        block_binds(s, &binds)
+
+        for j in mark..<binds.len()
+            cx.block_declares.push(BlockBind(binds.at(j), s.span.start, begun))
+
+        *s.kind match
+            FuncDecl(_) -> begun = true
+            _ -> ()
 
     cx.pending_needs.truncate(0)
 
