@@ -1,0 +1,563 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Exited, Output, Signalled}
+
+// The reference's `EntryPointTests`: `main`, the named form of the entry point, and the arguments it
+// is handed (`reference/modules.md § Where a program starts`). A program starts in one place, so
+// statements at the top of a file and a `main` are two spellings of that place and a program writing
+// both is refused. The only signatures are `main()` and `main(args: []string)`, and the arguments
+// arrive as a slice of strings the library's `sysl.args.args_of` builds out of C's pair.
+//
+// **Every diagnostic and every output here was read out of the reference compiler (0.0.152)** by
+// handing the installed `sysl` the same tree; the IR lines are its `emit-llvm`. A program is built
+// and linked for real and run with the arguments a case gives it, so the zeroth argument -- the
+// executable's own path, which no test can predict -- is only ever counted.
+
+// A tree of files built and linked, and what running it with `args` answered -- or, where the build
+// refused, the refusal's text in `text` and no status.
+private ent_exec(files: []const (string, string), args: []const string) -> (Option[Output], string)
+    val root = make_temp_dir("sysl-ent").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (None, failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, args, "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (None, "the program that was built could not be run")
+        Ok(out) -> (Some(out), out.text)
+end ent_exec
+
+// What a one-file program prints, run with `args`.
+private ent_ran(text: string, args: []const string = []) -> string = ent_exec([("main.sysl", text)], args).1
+
+// What a program of several files prints.
+private ent_ran_of(files: []const (string, string)) -> string = ent_exec(files, []).1
+
+// A refusal carries this message, anchored at this `file:line:column`.
+private ent_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> "), said)
+    assert(said.contains(s"/$at\n"), said)
+
+// How many lines of a report open an error.
+private ent_errors(said: string) -> usize
+    var n: usize = 0
+
+    for line in said.split("\n")
+        if line.starts_with("error") then n += 1
+
+    n
+end ent_errors
+
+// The run's status, where it ran.
+private ent_status(files: []const (string, string), args: []const string = []) -> Option[Output] =
+    ent_exec(files, args).0
+
+private ent_one(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+// The body of the platform's entry point in a program's LLVM text.
+private ent_main_of(ir: string) -> string = ir.index_of("define i32 @main(") match
+    Some(at) -> ir[at..]
+    None -> ""
+
+private ent_second_main() -> string =
+    "a program starts in one place, and this 'main' is a second — whichever of the two the program " +
+    "means, the other belongs inside it. The statements this program starts with are in "
+
+// -- a program starts in one place -----------------------------------------------------------------
+
+@test("so statements above a main are refused, naming the file that already carries them")
+ent_statements_above_a_main_are_refused()
+    if xvr_no_library() then return
+
+    val said = ent_ran("main()\n    print(\"main\")\n\nprint(\"statements\")\n")
+
+    assert(said.contains(s"error: ${ent_second_main()}"), said)
+    assert(said.contains("/main.sysl\n --> "), said)
+    assert(said.contains("/main.sysl:1:1\n"), said)
+end ent_statements_above_a_main_are_refused
+
+@test("a main with nothing above it still runs")
+ent_a_main_alone_runs()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main()\n    print(\"only main\")\n"), "only main\n")
+
+@test("a program with no main is what it always was")
+ent_no_main()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("print(\"no main here\")"), "no main here\n")
+
+@test("a val beside it is filled before it runs")
+ent_a_val_beside_it()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("val table: [3]int = [1, 2, 3]\n\nmain()\n    print(\"main\", table[0], table[2])\n"),
+              "main 1 3\n")
+
+private ent_counter(ty: string) -> string =
+    s"var counter$ty = 0\n\nbump() =\n    counter += 1\n\ntwice() =\n    bump()\n    bump()\n\n" +
+    "main() =\n    twice()\n    print(counter)\n"
+
+@test("a var beside it is the module's storage, which the functions and main share")
+ent_a_var_beside_it_is_module_storage()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran(ent_counter(": int")), "2\n")
+
+@test("and untyped, it is refused on its own line for the type and for nothing else")
+ent_untyped_var_beside_main()
+    if xvr_no_library() then return
+
+    val said = ent_ran(ent_counter(""))
+
+    ent_refused(said, "'counter' is module storage, and module storage states its type — write 'counter: T'",
+                "main.sysl:1:1")
+    assert(!said.contains("undefined"), said)
+    assert(!said.contains("this 'main' is a second"), said)
+    assert_eq(ent_errors(said), 1)
+end ent_untyped_var_beside_main
+
+@test("a file with a module line reports an untyped var once, with no undefined name after it")
+ent_module_line_untyped_var()
+    if xvr_no_library() then return
+
+    val said = ent_ran_of([("app/app.sysl",
+        "module app\n\nvar counter = 0\n\nval limit = 3\n\nmain() =\n    counter += limit\n    print(counter)\n")])
+
+    ent_refused(said, "'counter' is module storage, and module storage states its type — write 'counter: T'",
+                "app/app.sysl:3:1")
+    ent_refused(said, "a module-level 'val' states its type, so 'limit' needs one — 'val limit: T = …'",
+                "app/app.sysl:5:1")
+    assert(!said.contains("undefined"), said)
+    assert_eq(ent_errors(said), 2)
+end ent_module_line_untyped_var
+
+@test("while with no main a lone var is still the script's local")
+ent_no_main_lone_var_is_local()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("var counter = 0\n\nbump() =\n    counter += 1\n\nbump()\nprint(counter)\n"), "1\n")
+
+@test("while a statement beside main is still reported on the main")
+ent_statement_beside_main()
+    if xvr_no_library() then return
+
+    val said = ent_ran("var count = 0\n\nprint(count)\n\nmain()\n    print(\"main\")\n")
+
+    assert(said.contains(s"error: ${ent_second_main()}"), said)
+    assert(said.contains("/main.sysl:5:1\n"), said)
+end ent_statement_beside_main
+
+@test("a program may call its own main, which then runs twice")
+ent_main_calls_itself()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main(args: []string)\n    print(\"ran\")\n    if args.len > 0 then main([])\n", ["once"]),
+              "ran\nran\n")
+
+@test("and a main declared in another module is still the program's")
+ent_main_in_another_module()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran_of([("app/app.sysl", "module app\n\nmain()\n    print(\"app's main\", app.tag)\n\nval tag: int = 7\n"),
+                          ("start.sysl", "import app.*\n")]),
+              "app's main 7\n")
+
+@test("even when nothing in the program carries a statement at all")
+ent_main_in_the_only_module()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran_of([("app/only.sysl", "module app\n\nmain()\n    print(\"a module's main, and nothing else\")\n")]),
+              "a module's main, and nothing else\n")
+
+// -- the arguments arrive as a slice of strings ----------------------------------------------------
+
+@test("the zeroth is the program itself, so a bare run has one")
+ent_zeroth_is_the_program()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main(args: []string)\n    print(args.len)\n"), "1\n")
+
+@test("each word given is one element after it")
+ent_each_word_is_one_element()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main(args: []string)\n    print(args.len)\n    for a in args[1..]\n        print(a)\n",
+                      ["alpha", "beta"]),
+              "3\nalpha\nbeta\n")
+
+@test("an argument that looks like an option is an argument")
+ent_option_shaped_argument()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main(args: []string)\n    for a in args[1..]\n        print(a)\n", ["-v", "--target", "-"]),
+              "-v\n--target\n-\n")
+
+@test("an empty argument is an empty string")
+ent_empty_argument()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main(args: []string)\n    print(args.len, args[1].len)\n", [""]), "2 0\n")
+
+@test("a non-ASCII argument arrives as its UTF-8")
+ent_non_ascii_argument()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main(args: []string)\n    print(args[1], args[1].len)\n", ["héllo"]), "héllo 6\n")
+
+@test("and its characters are decodable")
+ent_argument_characters()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main(args: []string)\n    var n = 0\n    for c in args[1].chars do n += 1\n    print(n)\n",
+                      ["héllo"]),
+              "5\n")
+
+@test("twenty arguments all arrive, past two growths of the buffer")
+ent_twenty_arguments()
+    if xvr_no_library() then return
+
+    val src = "main(args: []string)\n    print(args.len)\n    var total = 0usize\n" +
+              "    for a in args[1..] do total += a.len\n    print(total)\n"
+
+    assert_eq(ent_ran(src, ["arg1", "arg2", "arg3", "arg4", "arg5", "arg6", "arg7", "arg8", "arg9", "arg10",
+                            "arg11", "arg12", "arg13", "arg14", "arg15", "arg16", "arg17", "arg18", "arg19",
+                            "arg20"]),
+              "21\n91\n")
+end ent_twenty_arguments
+
+@test("an argument outlives the vector it came from")
+ent_argument_outlives_the_vector()
+    if xvr_no_library() then return
+
+    val src = "import sysl.text.str_builder\n\nkeep(args: []string) -> string\n    var b = str_builder()\n" +
+              "    for a in args[1..]\n        b.push(a)\n        b.push(\"/\")\n    b.finish()\n\n" +
+              "main(args: []string)\n    var s = keep(args)\n    print(s)\n"
+
+    assert_eq(ent_ran(src, ["a", "b", "c"]), "a/b/c/\n")
+end ent_argument_outlives_the_vector
+
+@test("the slice is an ordinary one, so it can be indexed, sliced and iterated")
+ent_ordinary_slice()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main(args: []string)\n    print(args[2])\n    for a in args[2..<4] do print(a)\n" +
+                      "    print(args[1..].len)\n", ["one", "two", "three", "four"]),
+              "two\ntwo\nthree\n4\n")
+
+// -- what a main may not be ------------------------------------------------------------------------
+
+private ent_takes(what: string) -> string =
+    s"'main' takes either nothing or one '[]string' of the program's arguments, not $what"
+
+@test("a parameter that is not a slice of strings")
+ent_parameter_not_a_slice()
+    if xvr_no_library() then return
+
+    ent_refused(ent_ran("main(n: int)\n    print(n)\n"), ent_takes("(int)"), "main.sysl:1:1")
+
+@test("a second parameter beside the arguments")
+ent_second_parameter()
+    if xvr_no_library() then return
+
+    ent_refused(ent_ran("main(args: []string, verbose: bool)\n    print(args.len, verbose)\n"),
+                ent_takes("([]string, bool)"), "main.sysl:1:1")
+
+@test("a slice of something else")
+ent_slice_of_something_else()
+    if xvr_no_library() then return
+
+    ent_refused(ent_ran("main(args: []int)\n    print(args.len)\n"), ent_takes("([]int)"), "main.sysl:1:1")
+
+private ent_no_status() -> string =
+    "'main' yields nothing or a 'Result[unit, E]', so it may not result in int — a program's exit status " +
+    "is not something a signature can say. 'exit(code)' is how a program chooses its own, and prints nothing"
+
+@test("a result, which would be an exit status")
+ent_a_result()
+    if xvr_no_library() then return
+
+    ent_refused(ent_ran("main() -> int\n    0\n"), ent_no_status(), "main.sysl:1:1")
+
+@test("and it says how a program does choose one, which is the half it was missing")
+ent_a_result_names_exit()
+    if xvr_no_library() then return
+
+    val said = ent_ran("main() -> int\n    0\n")
+
+    assert(said.contains("'exit(code)' is how a program chooses its own"), said)
+    ent_refused(said, ent_no_status(), "main.sysl:1:1")
+end ent_a_result_names_exit
+
+@test("type parameters the platform could not supply")
+ent_type_parameters()
+    if xvr_no_library() then return
+
+    ent_refused(ent_ran("main[T]()\n    print(\"hi\")\n"),
+                "'main' is called by the platform, which has no type arguments to give it", "main.sysl:1:1")
+
+@test("a list it reads for itself")
+ent_a_list_it_reads()
+    if xvr_no_library() then return
+
+    ent_refused(ent_ran("main(args: []string, ...)\n    print(args.len)\n"),
+                "'main' is called with the arguments the platform has, not a list it reads", "main.sysl:1:1")
+
+// The reference reports the second file's module line at the root as well; the claim is the second
+// `main`, which is refused on its own whatever else is wrong with the tree.
+@test("a second main, in a module of its own")
+ent_a_second_main_in_a_module()
+    if xvr_no_library() then return
+
+    ent_refused(ent_ran_of([("a.sysl", "main()\n    print(\"a\")\n"),
+                            ("b.sysl", "module lib\n\nmain()\n    print(\"b\")\n")]),
+                "'main' is where a program starts, so there is one — main already declares it", "b.sysl:3:1")
+
+@test("an extern that links to the symbol")
+ent_an_extern_linking_to_main()
+    if xvr_no_library() then return
+
+    ent_refused(ent_ran("extern \"main\" other() -> int\n\nprint(other())\n"),
+                "'main' is where the platform starts this program, so an 'extern' may not name that symbol",
+                "main.sysl:1:1")
+
+@test("and an extern that merely takes the name")
+ent_an_extern_named_main()
+    if xvr_no_library() then return
+
+    ent_refused(ent_ran("extern \"puts\" main(s: *u8) -> int\n\nmain(c\"hi\")\n"),
+                "'main' is where a program starts, so it is not a name an 'extern' may take", "main.sysl:1:1")
+
+// -- an argument that is not text stops the program ------------------------------------------------
+
+// Argv bytes cannot be made ill-formed through a process's arguments, so the conversion is called
+// directly on a vector built here. `0xC3` opens a two-byte sequence and `0x28` cannot continue one.
+private ent_bad() -> string = "var run: [3]u8 = [0xC3u8, 0x28u8, 0u8]\nvar vec: [1]*u8 = [&run[0]]\n"
+
+// A panic's message goes to the error stream and the status is not zero.
+private ent_panics(text: string, message: string)
+    ent_status(ent_one(text)) match
+        None -> assert(false, ent_ran(text))
+        Some(out) ->
+            assert(!out.status.ok(), out.text)
+            assert(out.err.unwrap_or("").contains(message), out.err.unwrap_or(""))
+end ent_panics
+
+@test("with the offset of the byte that made it ill-formed")
+ent_ill_formed_argument_offset()
+    if xvr_no_library() then return
+
+    ent_panics(ent_bad() + "var args = sysl.args.args_of(1i32, &vec[0])\nprint(args.len)\n",
+               "panic: command-line argument 0 is not UTF-8 at byte 0")
+
+@test("and it reports which argument, not just that one was wrong")
+ent_ill_formed_argument_which()
+    if xvr_no_library() then return
+
+    ent_panics("var ok: [3]u8 = [0x68u8, 0x69u8, 0u8]\n" + ent_bad() +
+               "var vec2: [2]*u8 = [&ok[0], &run[0]]\nvar args = sysl.args.args_of(2i32, &vec2[0])\nprint(args.len)\n",
+               "panic: command-line argument 1 is not UTF-8 at byte 0")
+
+@test("while a well-formed vector converts")
+ent_well_formed_vector()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("var a: [3]u8 = [0x68u8, 0x69u8, 0u8]\nvar vec: [1]*u8 = [&a[0]]\n" +
+                      "var args = sysl.args.args_of(1i32, &vec[0])\n\nprint(args.len, args[0])\n"),
+              "1 hi\n")
+
+@test("and an empty vector converts to an empty slice")
+ent_empty_vector()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("var vec: [1]*u8 = [c\"unused\"]\nvar args = sysl.args.args_of(0i32, &vec[0])\n\nprint(args.len)\n"),
+              "0\n")
+
+// -- otherwise it is a function like any other -----------------------------------------------------
+
+@test("it may be private, which is about who may name it and not about who calls it")
+ent_private_main()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("private main()\n    print(\"private main ran\")\n"), "private main ran\n")
+
+@test("it may diverge, which is how a program chooses its status today")
+ent_main_diverges()
+    if xvr_no_library() then return
+
+    ent_status(ent_one("main() -> never\n    print(\"about to stop\")\n    exit(3)\n")) match
+        None -> assert(false, "the program did not build or run")
+        Some(out) ->
+            assert_eq(out.text, "about to stop\n")
+
+            out.status match
+                Exited(code) -> assert_eq(code, 3)
+                _ -> assert(false, "the program did not exit")
+end ent_main_diverges
+
+@test("its contracts are checked")
+ent_contracts_checked()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main(args: []string)\n    require args.len > 0, \"the platform passes the program's own path\"\n\n" +
+                      "    print(\"checked\")\n"),
+              "checked\n")
+
+// A contract traps rather than printing: what a trap leaves is the status (the reference's run exits
+// on SIGTRAP), and the body's line never reaches the pipe.
+@test("and a broken one stops the program before its body runs")
+ent_broken_contract_stops()
+    if xvr_no_library() then return
+
+    ent_status(ent_one("main(args: []string)\n    require args.len > 5, \"more arguments than a bare run has\"\n\n" +
+                       "    print(\"this never reaches the pipe\")\n")) match
+        None -> assert(false, "the program did not build or run")
+        Some(out) ->
+            assert(!out.status.ok(), out.text)
+            assert_eq(out.text, "")
+end ent_broken_contract_stops
+
+@test("it may be passed as a callable")
+ent_main_as_a_callable()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("apply(f: []string -> unit, a: []string)\n    f(a)\n\nmain(args: []string)\n    print(\"ran\")\n" +
+                      "    if args.len > 0 then apply(main, [])\n", ["once"]),
+              "ran\nran\n")
+
+@test("it may recurse, on a slice of its own arguments")
+ent_main_recurses()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main(args: []string)\n    if args.len > 1\n        print(\"descending\", args.len)\n" +
+                      "        main(args[1..])\n    else\n        print(\"done\")\n", ["a", "b"]),
+              "descending 3\ndescending 2\ndone\n")
+
+@test("its parameter is a binding it may write to")
+ent_parameter_is_writable()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main(args: []string)\n    args = args[1..]\n    print(args.len)\n", ["a", "b"]), "2\n")
+
+@test("an escaping view of its local array is promoted, not refused")
+ent_escaping_view_promoted()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("keep(v: []int) -> []int = v\n\nmain()\n    var a: [4]int = [1, 2, 3, 4]\n    var v = keep(a[..])\n\n" +
+                      "    print(v.len, v[3])\n"),
+              "4 4\n")
+
+@test("and the arguments survive being churned through")
+ent_arguments_churned()
+    if xvr_no_library() then return
+
+    val src = "import sysl.text.str_builder\n\nmain(args: []string)\n    var total = 0usize\n\n" +
+              "    for i in 0..<100000\n        var b = str_builder()\n\n        for a in args\n            b.push(a)\n\n" +
+              "        total += b.finish().len\n\n    print(total > 0usize)\n"
+
+    assert_eq(ent_ran(src, ["one", "two"]), "true\n")
+end ent_arguments_churned
+
+// -- what the name does not reserve ----------------------------------------------------------------
+
+@test("a member of a type may be called main")
+ent_member_named_main()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("struct Point\n    x: int\n\n    main(self)\n        print(\"a member named main\", self.x)\nend Point\n\n" +
+                      "var p = Point(7)\n\np.main()\nprint(\"statements\")\n"),
+              "a member named main 7\nstatements\n")
+
+@test("and so may a function nested inside another")
+ent_nested_main()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("outer()\n    main()\n        print(\"a nested main\")\n\n    main()\n\nouter()\nprint(\"statements\")\n"),
+              "a nested main\nstatements\n")
+
+@test("a var inside main may be called argc or argv")
+ent_argc_argv_locals()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("main(args: []string)\n    var argc = 99\n    var argv = \"not the vector\"\n\n" +
+                      "    print(argc, argv)\n    print(\"main sees\", args.len)\n", ["one"]),
+              "99 not the vector\nmain sees 2\n")
+
+@test("while the conversion is a word the program may spend on something else")
+ent_args_of_is_free()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("args_of(n: int) -> string = \"mine\"\n\nmain(args: []string)\n    print(args_of(1), args.len)\n",
+                      ["one", "two"]),
+              "mine 3\n")
+
+@test("and the library's is still there under its path, beside the program's own")
+ent_library_args_of_by_path()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("args_of(n: int) -> string = \"mine\"\n\nmain(args: []string)\n    var vec: [1]*u8 = [c\"direct\"]\n\n" +
+                      "    print(args_of(1), sysl.args.args_of(1i32, &vec[0])[0], args.len)\n", ["one", "two"]),
+              "mine direct 3\n")
+
+// -- what is emitted -------------------------------------------------------------------------------
+
+@test("the entry point takes the pair the platform passes")
+ent_entry_takes_the_pair()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(ent_one("print(\"hi\")"))
+
+    assert(ir.contains("define i32 @main(i32 %argc, ptr %argv)"), ir)
+
+@test("a program's own main is emitted under a reserved symbol")
+ent_main_reserved_symbol()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(ent_one("main()\n    print(\"hi\")\n"))
+
+    assert(ir.contains("define void @$$main()"), ir)
+    assert(ir.contains("call void @$$main()"), ir)
+end ent_main_reserved_symbol
+
+@test("a main taking arguments is called with the conversion's result")
+ent_main_called_with_conversion()
+    if xvr_no_library() then return
+
+    val body = ent_main_of(xvr_ir(ent_one("main(args: []string)\n    print(args.len)\n")))
+
+    assert(body.contains("@sysl.args$args_of(i32 %argc, ptr %argv)"), body)
+    assert(body.contains("call void @$$main("), body)
+end ent_main_called_with_conversion
+
+@test("a program with no main carries none of the conversion")
+ent_no_main_no_conversion()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(ent_one("print(\"hi\")"))
+
+    assert(!ir.contains("args_of"), ir)
+
+@test("and neither does a main that takes no arguments")
+ent_argless_main_no_conversion()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(ent_one("main()\n    print(\"hi\")\n"))
+
+    assert(!ir.contains("args_of"), ir)
