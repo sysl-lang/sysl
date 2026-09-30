@@ -46,7 +46,7 @@ rebind(subst: *Buf[Binding], name: string, ty: Type)
 
 // The type a written one means.
 resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Type = *t.kind match
-    NamedType(name, args) -> resolve_named(a, scope, t.span, name, args, subst)
+    NamedType(name, args) -> resolve_named(a, scope, t.span, name, args, subst, false)
     // **A hop is what makes a cycle finite**, so the four forms that point rather than hold are
     // counted -- and the count is what a type reached again is judged against.
     PtrType(inner) -> resolve_ptr(a, scope, inner, subst)
@@ -486,6 +486,8 @@ private resolve_pointee(a: &Analysis, scope: Scope, inner: TypeRef, subst: Buf[B
                         qualified: bool) -> Type =
     *inner.kind match
         FnType(params, ret, _) -> resolve_fn_trait(a, scope, inner.span, params, ret, false, subst)
+        // A name behind a mode is the one place a trait may be what it names.
+        NamedType(name, args) -> resolve_named(a, scope, inner.span, name, args, subst, true)
         _ -> if qualified then resolve_qualified(a, scope, inner, subst) else resolve_type(a, scope, inner, subst)
 
 // **A callable is not a type: it is a trait**, and a trait stands where a type does only behind a
@@ -643,8 +645,12 @@ end fits_i32
 
 // -- a name -------------------------------------------------------------------------------------
 
+// The type a written name means, with whatever arguments it was given.
+//
+// `behind_a_mode` is whether the name was written as the pointee of a `&`, a `*` or a `weak`, which is
+// the only place a trait stands where a type does.
 private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args: Buf[TypeRef],
-                      subst: Buf[Binding]) -> Type
+                      subst: Buf[Binding], behind_a_mode: bool) -> Type
     val targs = under_type_arg(a, () -> resolve_list(a, scope, args, subst))
 
     if args.is_empty() then
@@ -691,6 +697,16 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
     val d = trait_decl_at(a, key.unwrap())
 
     if d.is_some()
+        // **A trait describes what a value can do, not how one is laid out**, so it stands where a
+        // type is asked for only behind a mode -- and the ways of reaching it are named, since which
+        // one a program wants is the whole of the choice it has to make.
+        if !behind_a_mode
+            a.fault(scope, span, s"'$name' is a trait, so it describes behaviour rather than a " +
+                    s"layout — write '*$name' or '&$name' for a trait object, or bound a type " +
+                    s"parameter with '[T: $name]'")
+            return Unknown
+        end if
+
         var positional: Buf[TypeRef] = buf()
         var named: Buf[(string, Type)] = buf()
 

@@ -439,6 +439,12 @@ private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vi
         a.fault(scope, span, type_taken_message(kind, name))
         return
 
+    kind match
+        StructOf(_) -> check_no_module_of_that_name(a, scope, span, key, name, "member")
+        EnumOf(_) -> check_no_module_of_that_name(a, scope, span, key, name, "variant")
+        TypeOf(_) -> check_no_module_of_that_name(a, scope, span, key, name, "member")
+        _ -> ()
+
     a.tables.types.put(key, Decl(kind, span, scope))
 
     kind match
@@ -453,6 +459,26 @@ private hoist_type_name(a: &Analysis, scope: Scope, span: Span, name: string, vi
     record_members_access(a, scope, key, name, vis, kind)
 
     if test_only_file(a, scope.src.name) then a.tables.test_only.push(key)
+
+// Refuses a type whose module and name together spell a module the program also has.
+//
+// `geom.Point.dist` would then name both `geom`'s `Point.dist` and `geom.Point`'s `dist`, and a dotted
+// reference takes the **longest** prefix that names a module -- so the module would win and the
+// type's member would have no spelling left at all. The keys stay distinct either way; what collides
+// is the path a program writes, which a diagnostic can fix and a silent choice cannot.
+//
+// **Only what a dotted chain reaches INTO is asked**: a struct, an enum, a named subtype. A trait is
+// named in a bound or behind a sigil and never has a member selected off its name, so a module
+// sharing its name takes nothing away from it.
+private check_no_module_of_that_name(a: &Analysis, scope: Scope, span: Span, key: string,
+                                     written: string, reachable: string)
+    if !a.tables.has_module(module_show(key)) then return
+
+    val shown = qualified_name(key)
+
+    a.fault(scope, span, s"'$shown' is also a module, so '$shown.<$reachable>' would name two things — " +
+            s"rename the module or '$written'")
+end check_no_module_of_that_name
 
 // The other order of a variant meeting a value of its spelling: the value was registered first, so
 // the enum is the declaration that gives the name its second meaning, and the refusal is its own.
