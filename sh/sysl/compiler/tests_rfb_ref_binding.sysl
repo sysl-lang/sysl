@@ -1,0 +1,945 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `ref name = place` (`reference/memory.md § ref — a name for a place`) -- a name for a place rather
+// than for a value.
+//
+// The chapter makes two claims that are the whole of the feature, and each needs its own kind of
+// evidence. **At run time a ref stores an address**, which is a claim about the emitted code and is
+// pinned by counting bounds checks in the LLVM text: a `var` copies, a re-written path re-checks, and
+// a ref does neither. **At compile time it remembers a place**, which is a claim about the checks,
+// and is pinned by writing through a ref into a struct carrying an `invariant` and watching the
+// clause fire -- a thing a `*T` into the same field cannot do, and the reason this is not address-of
+// with a nicer spelling.
+//
+// Almost every test here would pass on an implementation that quietly lowered `ref` to a copy, so
+// each run test writes through the ref and then reads the *original* place back. **A run test asserts
+// what the program printed and the status it left with**, so a program that failed to build cannot
+// pass as one that trapped.
+//
+// **Every output and every diagnostic quoted here was read out of the reference compiler** (0.0.152),
+// whose `RefBindingTests` these are.
+
+private var rfb_library_cache: Buf[Program] = buf()
+private var rfb_library_read: bool = false
+
+private rfb_library() -> Buf[Program]
+    if rfb_library_read then return rfb_library_cache
+
+    rfb_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> rfb_library_cache = units
+
+    rfb_library_cache
+end rfb_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private rfb_ready() -> bool
+    if rfb_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end rfb_ready
+
+// What a program printed, followed by the status it left with -- or why it could not be built.
+private rfb_ran(text: string) -> string
+    val root = make_temp_dir("sysl-ref-binding").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> s"${out.text}exit ${shell_status(out.status)}"
+end rfb_ran
+
+// The whole report a program is refused with, rendered the way a reader sees it.
+private rfb_err(text: string) -> string
+    var units: Buf[Program] = buf()
+    val library = rfb_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    val parsed = parse(source_of("main.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end rfb_err
+
+// The LLVM text of a program that must compile.
+private rfb_ir(text: string) -> string
+    val root = make_temp_dir("sysl-ref-binding").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rfb_ir
+
+// One function's definition out of a module's text, from its `define` to its closing brace.
+private rfb_define(text: string, head: string) -> string
+    val found = text.index_of(head)
+
+    if found.is_none() then return s"nothing here begins '$head'"
+
+    val rest = text[found.unwrap()..<text.bytes.len]
+    val stop = rest.index_of("\n}")
+
+    if stop.is_none() then rest else rest[0..<stop.unwrap() + 2]
+end rfb_define
+
+// How many bounds-check comparisons a module holds. The check lowers to one `icmp ult` against the
+// length, so counting them is how "checked once" is measured rather than asserted.
+private rfb_checks(text: string) -> int
+    val lines = lines_of(text)
+    var n = 0
+
+    for i in 0..<lines.len()
+        if lines.at(i).index_of("icmp ult i64").is_some() then n += 1
+
+    n
+end rfb_checks
+
+// One diagnostic as the reference prints it: the message, where, the line and what is under it.
+private rfb_shown(message: string, line: int, col: int, source: string, under: string) -> string
+    val wide = if line < 10 then "" else " "
+
+    s"error: $message\n$wide --> main.sysl:$line:$col\n$wide  |\n$line | $source\n$wide  | $under"
+end rfb_shown
+
+// The head of one: the message and where, without the excerpt under it.
+private rfb_head(message: string, line: int, col: int) -> string
+    val wide = if line < 10 then "" else " "
+
+    s"error: $message\n$wide --> main.sysl:$line:$col\n"
+end rfb_head
+
+private rfb_no_place(name: string) -> string =
+    "'ref' names a place — a local, a field, an element, or a dereference — and this expression " +
+        s"has no address for '$name' to name. Bind it with 'val' to hold the value it produces"
+
+private rfb_standing(name: string) -> string =
+    s"'$name' is a 'ref' standing on storage this assignment would release, so the name would be " +
+        "left pointing at freed memory. Write the assignment before the 'ref', or put the 'ref' in " +
+        "a block that closes first"
+
+private rfb_captured(name: string) -> string =
+    s"'$name' is a 'ref', which names storage for as long as its own block and no longer — so it " +
+        "cannot be captured, since a closure may outlive that block. Capture the place it names, " +
+        "or read the value into a 'val' and capture that"
+
+// The register block `reference/memory.md § Device memory` is written against.
+private rfb_uart() -> string = raw"""
+    struct Uart
+        status: volatile u32
+        data:   volatile u32
+        baud:   u32
+    const UART: usize = 0x10000000
+    static val regs: *Uart = ptr_cast(UART)
+    """
+
+// -- what the chapter claims ----------------------------------------------------------------------
+
+// The headline: a write through the name lands in the storage the place found, not in a copy.
+// Reading `t.state` back through the table is the half that fails on a copying implementation.
+@test("a write through a ref lands in the place it named")
+rfb_a_write_lands_in_the_place()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        struct Task
+            state: int
+            prio: int
+        end Task
+        struct Kernel
+            tasks: [4]Task
+        end Kernel
+        var k = Kernel([Task(0, 0); 4])
+        ref t = k.tasks[2]
+        t.state = 7
+        t.prio = 9
+        print(k.tasks[2].state, k.tasks[2].prio, k.tasks[1].state)
+        """), "7 9 0\nexit 0")
+
+// The place is evaluated once, so the name goes on meaning the element it found. A re-evaluating
+// (call-by-name) implementation prints the *third* element here.
+@test("the place is evaluated once, so a later change to the index does not move the name")
+rfb_the_place_is_evaluated_once()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        var xs = [10, 20, 30, 40]
+        var i = 1
+        ref e = xs[i]
+        i = 3
+        e = 99
+        print(xs[0], xs[1], xs[2], xs[3])
+        """), "10 99 30 40\nexit 0")
+
+// A ref reads as well as writes, and reading it is reading the storage.
+@test("a write through the original place is visible through the ref")
+rfb_a_write_to_the_place_is_seen_through_the_ref()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        var xs = [1, 2, 3]
+        ref e = xs[1]
+        xs[1] = 42
+        print(e)
+        """), "42\nexit 0")
+
+@test("a ref of a ref is one more name for the same place")
+rfb_a_ref_of_a_ref()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        var xs = [1, 2, 3]
+        ref a = xs[2]
+        ref b = a
+        b = 8
+        print(xs[2])
+        """), "8\nexit 0")
+
+@test("a ref names a field, a local, and a dereference as readily as an element")
+rfb_a_field_a_local_and_a_dereference()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        struct P
+            x: int
+            y: int
+        end P
+        var p = P(1, 2)
+        ref fx = p.x
+        fx = 5
+        var n = 3
+        ref rn = n
+        rn += 4
+        var q = P(0, 0)
+        var pq: *P = &q
+        ref dq = *pq
+        dq.y = 6
+        print(p.x, n, q.y)
+        """), "5 7 6\nexit 0")
+
+// A ref is not a fourth mode and introduces no representation: the name has an address and no
+// storage of its own, so the whole feature is one zero-offset `getelementptr` and no `alloca`.
+@test("a ref allocates no slot of its own")
+rfb_a_ref_allocates_no_slot()
+    if !rfb_ready() then return
+
+    val out = rfb_ir("var xs = [1, 2, 3]\nref e = xs[1]\ne = 9\nprint(xs[1])\n")
+
+    assert(out.index_of("%e.addr = getelementptr i8").is_some(), out)
+    assert(out.index_of("%e.addr = alloca").is_none(), out)
+
+// -- the address is taken once --------------------------------------------------------------------
+
+// A subscript owes a bounds check, and a ref pays it at the binding rather than at each use.
+// **Measured as a difference between two spellings of one program**, the count being over the whole
+// module: three writes through paths check three times, three through a ref check once.
+@test("an element ref bounds-checks once however often the name is used")
+rfb_an_element_ref_checks_once()
+    if !rfb_ready() then return
+
+    val paths = rfb_ir("var xs = [1, 2, 3, 4]\nvar i = 2\nxs[i] = 1\nxs[i] = 2\nxs[i] = 3\nprint(xs[2])\n")
+    val named = rfb_ir("var xs = [1, 2, 3, 4]\nvar i = 2\nref e = xs[i]\ne = 1\ne = 2\ne = 3\nprint(xs[2])\n")
+
+    assert(!paths.starts_with("did not compile"), paths)
+    assert(!named.starts_with("did not compile"), named)
+    assert_eq(rfb_checks(paths) - rfb_checks(named), 2)
+
+// The disagreement half: adding uses of the *name* adds no checks at all.
+@test("and adding more uses of the name adds none")
+rfb_more_uses_of_the_name_add_no_checks()
+    if !rfb_ready() then return
+
+    val head = "var xs = [1, 2, 3, 4]\nvar i = 2\nref e = xs[i]\n"
+    val three = rfb_ir(head + "e = 1\ne = 1\ne = 1\nprint(xs[2])\n")
+    val eight = rfb_ir(head + "e = 1\ne = 1\ne = 1\ne = 1\ne = 1\ne = 1\ne = 1\ne = 1\nprint(xs[2])\n")
+
+    assert(!three.starts_with("did not compile"), three)
+    assert(!eight.starts_with("did not compile"), eight)
+    assert(rfb_checks(three) > 0, "a module with a subscript in it holds a bounds check")
+    assert_eq(rfb_checks(three), rfb_checks(eight))
+
+// -- the place is remembered ----------------------------------------------------------------------
+
+// The test the feature exists for: a clause is discharged by walking outward through the place being
+// written. A ref keeps that place, so the clause fires -- and the program traps rather than storing a
+// bad value.
+@test("a write through a ref re-checks the invariant of the struct it lies inside")
+rfb_a_write_rechecks_the_invariant()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        struct Span
+            lo: int
+            hi: int
+            invariant lo <= hi
+        end Span
+        var s = Span(1, 5)
+        ref l = s.lo
+        l = 9
+        print(s.lo)
+        """), "exit 133")
+
+@test("and lets a write that keeps the clause through")
+rfb_a_write_that_keeps_the_clause()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        struct Span
+            lo: int
+            hi: int
+            invariant lo <= hi
+        end Span
+        var s = Span(1, 5)
+        ref l = s.lo
+        l = 3
+        print(s.lo, s.hi)
+        """), "3 5\nexit 0")
+
+// The invariant may read *through* a field, so a ref to the inner struct's field still reaches the
+// outer clause two steps up.
+@test("the walk goes outward through the whole place, not just one step")
+rfb_the_walk_goes_outward()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        struct Inner
+            n: int
+        end Inner
+        struct Outer
+            a: Inner
+            b: int
+            invariant a.n <= b
+        end Outer
+        var o = Outer(Inner(1), 5)
+        ref n = o.a.n
+        n = 9
+        print(o.a.n)
+        """), "exit 133")
+
+// The counterpart: the same alias written as a pointer is refused where it is made, because a
+// `*Inner` names no `Outer`.
+@test("where the same alias as a pointer is refused outright")
+rfb_the_same_alias_as_a_pointer()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err(raw"""
+        struct Inner
+            n: int
+        end Inner
+        struct Outer
+            a: Inner
+            b: int
+            invariant a.n <= b
+        end Outer
+        var o = Outer(Inner(1), 5)
+        var p: *Inner = &o.a
+        print(p.n)
+        """),
+        rfb_shown("'&' here makes a '*Inner' pointing inside Outer, whose invariant reads 'a.n' — " +
+                  "and a '*Inner' names no Outer, so a write through it would break the clause " +
+                  "with nothing left to re-check it against. Take the address of the Outer itself, " +
+                  "which keeps the invariant in its type, or make the change through a method",
+                  10, 17, "var p: *Inner = &o.a", "                ^^^^"))
+
+// A ref into read-only storage is read-only: the property survives being given a shorter name,
+// which is the same rule that makes an element of a `val` array read-only.
+//
+// The reference underlines the whole statement and this compiler the target, which is the open
+// divergence about where an assignment refusal is anchored -- so the message and the position are
+// what is asserted.
+@test("a ref into a 'val' may not be written through")
+rfb_a_ref_into_a_val()
+    if !rfb_ready() then return
+
+    val out = rfb_err("val xs: [3]int = [1, 2, 3]\nref e = xs[1]\ne = 9\n")
+
+    assert(out.starts_with(rfb_head("a 'val' is written once, so assignment has nothing to write " +
+                                    "through", 3, 1)), out)
+    assert(out.index_of("\n\nerror: ").is_none(), out)
+
+// A `within` bound is the slot's, so it is still checked when the write goes through a name.
+@test("a ref to a constrained slot is still checked on assignment")
+rfb_a_constrained_slot()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        type Small = new int within 0..<10
+        var xs: [3]Small = [Small(1); 3]
+        ref e = xs[0]
+        e = Small(50)
+        print(int(xs[0]))
+        """), "exit 133")
+
+// -- what may be written --------------------------------------------------------------------------
+
+@test("a call result is refused, since it has no address")
+rfb_a_call_result()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err("f() -> int = 3\nref x = f()\nprint(x)\n"),
+              rfb_shown(rfb_no_place("x"), 2, 1, "ref x = f()", "^^^^^^^^^^^"))
+
+@test("an arithmetic result is refused")
+rfb_an_arithmetic_result()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err("var a = 1\nref x = a + 1\nprint(x)\n"),
+              rfb_shown(rfb_no_place("x"), 2, 1, "ref x = a + 1", "^^^^^^^^^^^^^"))
+
+@test("a literal is refused")
+rfb_a_literal()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err("ref x = 5\nprint(x)\n"),
+              rfb_shown(rfb_no_place("x"), 1, 1, "ref x = 5", "^^^^^^^^^"))
+
+@test("a freshly built struct is refused")
+rfb_a_freshly_built_struct()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err("struct P\n    x: int\nend P\nref p = P(1)\nprint(p.x)\n"),
+              rfb_shown(rfb_no_place("p"), 4, 1, "ref p = P(1)", "^^^^^^^^^^^^"))
+
+// The first thing a reader will try, and it is refused for a reason that has nothing to do with
+// refs: a container's subscript is a call through `Index`, so it produces a value and there is no
+// address anywhere for a name to mean.
+@test("a container's subscript is a call, not a place, so it is refused")
+rfb_a_containers_subscript()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err(raw"""
+        import sysl.buf.{Buf, buf}
+        var b: &Buf[int] = buf()
+        b.push(1)
+        ref e = b[0]
+        print(e)
+        """), rfb_shown(rfb_no_place("e"), 4, 1, "ref e = b[0]", "^^^^^^^^^^^^"))
+
+@test("and the message names what a place is")
+rfb_the_message_names_what_a_place_is()
+    if !rfb_ready() then return
+
+    val out = rfb_err("f() -> int = 3\nref x = f()\nprint(x)\n")
+
+    assert(out.index_of("a local, a field, an element, or a dereference").is_some(), out)
+    assert(out.index_of("'val'").is_some(), out)
+
+// -- what may move underneath it ------------------------------------------------------------------
+//
+// The four assignment refusals underline the whole statement in the reference and the target here
+// (the open divergence about where an assignment refusal is anchored), so each asserts the message
+// and the position, and that nothing else was said.
+
+// The rule a language with no collector cannot avoid: overwriting the view releases the buffer the
+// ref is standing in.
+@test("a view step may not be reassigned while a ref stands on it")
+rfb_a_view_step()
+    if !rfb_ready() then return
+
+    val out = rfb_err(raw"""
+        struct Table
+            cell: []int
+        end Table
+        var t = Table([0; 4])
+        ref e = t.cell[1]
+        t.cell = [0; 8]
+        e = 5
+        """)
+
+    assert(out.starts_with(rfb_head(rfb_standing("e"), 6, 1)), out)
+    assert(out.index_of("\n\nerror: ").is_none(), out)
+
+@test("a local view may not be reassigned either")
+rfb_a_local_view()
+    if !rfb_ready() then return
+
+    val out = rfb_err("var v: []int = [0; 4]\nref e = v[1]\nv = [0; 8]\ne = 5\n")
+
+    assert(out.starts_with(rfb_head(rfb_standing("e"), 3, 1)), out)
+    assert(out.index_of("\n\nerror: ").is_none(), out)
+
+@test("nor a reference step")
+rfb_a_reference_step()
+    if !rfb_ready() then return
+
+    val out = rfb_err(raw"""
+        struct Node
+            n: int
+        end Node
+        struct Holder
+            node: &Node
+        end Holder
+        var h = Holder(Node(1))
+        ref x = h.node.n
+        h.node = Node(2)
+        x = 5
+        """)
+
+    assert(out.starts_with(rfb_head(rfb_standing("x"), 9, 1)), out)
+    assert(out.index_of("\n\nerror: ").is_none(), out)
+
+// The prefix half: releasing the thing the owning step is read *out of* frees it just as surely, so
+// refusing only the assignment to the step itself would leave the shorter route open.
+@test("nor a prefix of an owning step")
+rfb_a_prefix_of_an_owning_step()
+    if !rfb_ready() then return
+
+    val out = rfb_err(raw"""
+        struct Inner
+            cell: []int
+        end Inner
+        struct Outer
+            a: &Inner
+        end Outer
+        var o = Outer(Inner([0; 4]))
+        ref e = o.a.cell[1]
+        o.a = Inner([0; 8])
+        e = 5
+        """)
+
+    assert(out.starts_with(rfb_head(rfb_standing("e"), 9, 1)), out)
+    assert(out.index_of("\n\nerror: ").is_none(), out)
+
+// The mutating-call half, and it is the conservative one on purpose: nothing here reads whether
+// `grow` reassigns anything, because a module compiles against signatures and not bodies.
+@test("a '*self' method may not be called on a prefix while a ref stands on a view")
+rfb_a_self_method_on_a_prefix()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err(raw"""
+        struct Table
+            cell: []int
+
+            grow(*self)
+                self.cell = [0; 8]
+        end Table
+        var t = Table([0; 4])
+        ref e = t.cell[1]
+        t.grow()
+        e = 5
+        """),
+        rfb_shown("'e' is a 'ref' standing on storage this call could release, since a '*self' " +
+                  "method may write its receiver — so the name could be left pointing at freed " +
+                  "memory. Make the call before the 'ref', or put the 'ref' in a block that closes " +
+                  "first", 9, 3, "t.grow()", "  ^^^^"))
+
+// The disagreement half of the whole rule, and the case it was designed around: a chain with no
+// owning step has nothing to hold still, so a program reaching fixed tables through a `*Self`
+// receiver is asked for nothing at all.
+@test("a chain with no owning step refuses nothing")
+rfb_a_chain_with_no_owning_step()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        struct Task
+            state: int
+        end Task
+        struct Kernel
+            tasks: [4]Task
+            n: int
+
+            bump(*self)
+                self.n += 1
+        end Kernel
+        var k = Kernel([Task(0); 4], 0)
+        ref t = k.tasks[1]
+        k.bump()
+        k.n = 5
+        t.state = 3
+        print(k.tasks[1].state, k.n)
+        """), "3 5\nexit 0")
+
+// The shape the feature was built for: a struct-typed element of a fixed array field, reached
+// through a `*self` receiver. Each part is covered above; this is the combination, which is where
+// a lowering bug would sit.
+@test("a struct element of a fixed table through '*self' is the motivating case")
+rfb_the_motivating_case()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        struct Task
+            state: int
+            prio: int
+        end Task
+        struct Kernel
+            tasks: [4]Task
+
+            advance(*self, i: usize)
+                ref t = self.tasks[i]
+                t.state = 2
+                t.prio = t.prio + 1
+        end Kernel
+        var k = Kernel([Task(0, 7); 4])
+        k.advance(2usize)
+        print(k.tasks[2].state, k.tasks[2].prio, k.tasks[0].state)
+        """), "2 8 0\nexit 0")
+
+// A `*T` step is excluded deliberately: a raw pointer owns nothing, so overwriting it frees nothing.
+// This is what keeps every `self.…()` call in an allocation-free program legal.
+@test("a pointer step is not an owning step")
+rfb_a_pointer_step()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        struct Kernel
+            n: int
+            tasks: [4]int
+
+            bump(*self)
+                self.n += 1
+        end Kernel
+        work(k: *Kernel)
+            ref t = k.tasks[1]
+            k.bump()
+            t = 4
+        var kk = Kernel(0, [0; 4])
+        work(&kk)
+        print(kk.tasks[1], kk.n)
+        """), "4 1\nexit 0")
+
+// The restriction lasts exactly as long as the name does.
+@test("the restriction lifts when the block declaring the ref closes")
+rfb_the_restriction_lifts()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        var v: []int = [0; 4]
+        if true
+            ref e = v[1]
+            e = 7
+        print(v[1])
+        v = [0; 8]
+        print(v[1])
+        """), "7\n0\nexit 0")
+
+// Reading is not releasing, so an ordinary read of the view is fine.
+@test("reading the view a ref stands on is left alone")
+rfb_reading_the_view()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        var v: []int = [1, 2, 3, 4]
+        ref e = v[1]
+        e = 9
+        print(v.len, v[1], v[0])
+        """), "4 9 1\nexit 0")
+
+// -- a ref to a slot holding a reference ----------------------------------------------------------
+
+// Binding names the slot and takes no count. If it retained, the count it took would keep the old
+// object alive past the write that replaced it.
+@test("binding takes no count, and assigning through it replaces what the slot held")
+rfb_binding_takes_no_count()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        struct Node
+            n: int
+        end Node
+        struct Holder
+            node: &Node
+        end Holder
+        var h = Holder(Node(1))
+        ref r = h.node
+        print(r.n)
+        r = Node(2)
+        print(h.node.n, r.n)
+        """), "1\n2 2\nexit 0")
+
+// The count is real: the object stays alive while the struct holds it, and a second name for the
+// slot does not change how many holders there are.
+@test("the object a ref-named slot holds stays alive through the ref")
+rfb_the_object_stays_alive()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        struct Node
+            n: int
+        end Node
+        struct Holder
+            node: &Node
+        end Holder
+        var h = Holder(Node(5))
+        ref r = h.node
+        var keep = r
+        h.node = Node(6)
+        print(keep.n, h.node.n, r.n)
+        """), "5 6 6\nexit 0")
+
+// -- in the shapes a program actually writes ------------------------------------------------------
+
+@test("a ref inside a loop rebinds each iteration")
+rfb_a_ref_inside_a_loop()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        struct Task
+            state: int
+        end Task
+        var ts = [Task(0); 4]
+        for i in 0usize..<4
+            ref t = ts[i]
+            t.state = int(i) * 2
+        print(ts[0].state, ts[1].state, ts[2].state, ts[3].state)
+        """), "0 2 4 6\nexit 0")
+
+@test("a ref survives being shadowed by an inner block")
+rfb_a_ref_shadowed_by_an_inner_block()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        var xs = [1, 2, 3]
+        ref e = xs[0]
+        if true
+            ref e = xs[2]
+            e = 30
+        e = 10
+        print(xs[0], xs[2])
+        """), "10 30\nexit 0")
+
+// A capture is the one construct that carries a name out of the block that bound it, which is
+// exactly what a ref may not do -- so it is refused, and refused for the reason rather than as a
+// limitation.
+@test("a closure may not capture a ref")
+rfb_a_closure_may_not_capture_a_ref()
+    if !rfb_ready() then return
+
+    val out = rfb_err("var xs = [1, 2, 3]\nref e = xs[1]\nvar f: &Fn() -> int = () -> e\nprint(f())\n")
+
+    assert(out.starts_with(rfb_shown(rfb_captured("e"), 3, 23, "var f: &Fn() -> int = () -> e",
+                                     "                      ^^^^^^^")), out)
+
+@test("nor may a nested function")
+rfb_nor_may_a_nested_function()
+    if !rfb_ready() then return
+
+    val out = rfb_err(raw"""
+        f() -> int
+            var xs = [1, 2, 3]
+            ref e = xs[1]
+            read() -> int = e
+            read()
+        print(f())
+        """)
+
+    assert(out.starts_with(rfb_shown(rfb_captured("e"), 4, 5, "    read() -> int = e",
+                                     "    ^^^^^^^^^^^^^^^^^")), out)
+
+// The place itself is capturable as it always was, which is what the refusal points at. The
+// borrowing form is written deliberately: an escaping closure copies its captures, so an `&Fn` here
+// would read the array as it was and prove nothing about reaching the storage.
+@test("where capturing the place it names is ordinary")
+rfb_capturing_the_place_is_ordinary()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        var xs = [1, 2, 3]
+        now(f: () -> int) -> int = f()
+        xs[1] = 42
+        print(now(() -> xs[1]))
+        """), "42\nexit 0")
+
+// -- the neighbouring chapters --------------------------------------------------------------------
+//
+// A ref is a place under a new name, and every rule about places has to keep meaning what it did.
+
+// `volatile` is on the **storage**, and a ref names storage -- so an access through the name has to
+// be the access the path would have been. A ref has no declaration to read a qualifier off, and a
+// register written through one must not get an unmarked store, free to be reordered or dropped.
+@test("a ref to a register keeps the volatile qualifier on the store")
+rfb_a_ref_to_a_register_stores_volatile()
+    if !rfb_ready() then return
+
+    val out = rfb_ir(rfb_uart() + "poke()\n    ref s = regs.status\n    s = 7u32\npoke()\n")
+
+    assert_eq(rfb_define(out, "define void @poke()"),
+              "define void @poke() {\n" +
+              "entry:\n" +
+              "  %t1 = load ptr, ptr @regs\n" +
+              "  %t2 = getelementptr %struct.Uart, ptr %t1, i32 0, i32 0\n" +
+              "  %s.addr = getelementptr i8, ptr %t2, i64 0\n" +
+              "  store volatile i32 7, ptr %s.addr\n" +
+              "  ret void\n" +
+              "}")
+
+@test("and on the load")
+rfb_and_on_the_load()
+    if !rfb_ready() then return
+
+    val out = rfb_ir(rfb_uart() + "peek() -> u32\n    ref s = regs.status\n    s\nprint(peek())\n")
+
+    assert_eq(rfb_define(out, "define i32 @peek()"),
+              "define i32 @peek() {\n" +
+              "entry:\n" +
+              "  %t1 = load ptr, ptr @regs\n" +
+              "  %t2 = getelementptr %struct.Uart, ptr %t1, i32 0, i32 0\n" +
+              "  %s.addr = getelementptr i8, ptr %t2, i64 0\n" +
+              "  %t3 = load volatile i32, ptr %s.addr\n" +
+              "  ret i32 %t3\n" +
+              "}")
+
+// The disagreement half: a ref to the block's *shadow* field is ordinary memory and must not acquire
+// a qualifier it never had.
+@test("where a ref to an ordinary field of the same block does not")
+rfb_a_ref_to_an_ordinary_field()
+    if !rfb_ready() then return
+
+    val out = rfb_ir(rfb_uart() + "poke()\n    ref b = regs.baud\n    b = 7u32\npoke()\n")
+
+    assert_eq(rfb_define(out, "define void @poke()"),
+              "define void @poke() {\n" +
+              "entry:\n" +
+              "  %t1 = load ptr, ptr @regs\n" +
+              "  %t2 = getelementptr %struct.Uart, ptr %t1, i32 0, i32 2\n" +
+              "  %b.addr = getelementptr i8, ptr %t2, i64 0\n" +
+              "  store i32 7, ptr %b.addr\n" +
+              "  ret void\n" +
+              "}")
+
+// An array whose view escapes the frame is promoted, and the pass finds *which* array by walking to
+// the view's root. A ref is a name for storage, so the walk has to carry on through it.
+@test("an escape through a ref promotes the array the ref names")
+rfb_an_escape_through_a_ref()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        keep(v: []int) -> []int = v
+        f() -> []int
+            var xs = [1, 2, 3]
+            ref r = xs
+            keep(r[..])
+        print(f()[1])
+        """), "2\nexit 0")
+
+// A `*self` method may not let a pointer into its receiver outlive the call. A ref is a second name
+// for the receiver's own storage, so taking its address is the same leak written one line longer.
+@test("a '*self' method may not return an address taken through a ref into its receiver")
+rfb_an_address_through_a_ref_into_the_receiver()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_err(raw"""
+        struct Inner
+            n: int
+
+            leak(*self) -> *int
+                ref x = self.n
+                &x
+        struct Outer
+            a: Inner
+            b: int
+            invariant a.n <= b
+        var o = Outer(Inner(1), 5)
+        var p = o.a.leak()
+        """),
+        rfb_shown("a '*self' method may not let a pointer into the receiver's own storage outlive " +
+                  "the call, and this one is returned — the receiver may be a field of a struct " +
+                  "whose invariant reads it, and a pointer that gets out is somewhere to write " +
+                  "that names no such struct. Hand back a copy of the value, or an index into it, " +
+                  "and let the caller reach the storage through the receiver it already has",
+                  6, 9, "        &x", "        ^^"))
+
+// Statements at the top of a file are the entry point's, so a ref written there is an ordinary
+// local of it and needs no rule of its own.
+@test("a ref at the top of a file is a local of the entry point")
+rfb_a_ref_at_the_top_of_a_file()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran("var xs = [1, 2, 3]\nref e = xs[1]\ne = 9\nprint(xs[1])\n"), "9\nexit 0")
+
+// A ref to an enum is matched the way the place is, since what a match reads is the value.
+@test("a ref to an enum is matched like the place it names")
+rfb_a_ref_to_an_enum()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        enum Colour
+            Red
+            Green
+            Blue
+        end Colour
+        var cs = [Red, Green, Blue]
+        ref c = cs[1]
+        c match
+            Red -> print("red")
+            Green -> print("green")
+            Blue -> print("blue")
+        """), "green\nexit 0")
+
+// A deferred statement runs where the block is left, and a ref is still in scope there -- the
+// binding is a declaration of a name, not of storage that could have been released.
+@test("a deferred statement may write through a ref")
+rfb_a_deferred_statement()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        var xs = [1, 2, 3]
+        if true
+            ref e = xs[0]
+            defer e = 9
+            print(xs[0])
+        print(xs[0])
+        """), "1\n9\nexit 0")
+
+// A multi-assignment writes several places at once, and a ref is a place.
+@test("a ref may be one place of a multi-assignment")
+rfb_a_ref_in_a_multi_assignment()
+    if !rfb_ready() then return
+
+    assert_eq(rfb_ran(raw"""
+        var xs = [1, 2, 3]
+        ref a = xs[0]
+        ref b = xs[2]
+        a, b = b, a
+        print(xs[0], xs[1], xs[2])
+        """), "3 2 1\nexit 0")

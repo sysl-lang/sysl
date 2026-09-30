@@ -15,7 +15,23 @@ import sysl.math.bigint.{BigInt, from_int, mul, pow, sub}
 access_of(t: Type) -> IrAccess = if volatile_in(t) then AccVolatile else AccPlain
 
 // The same asked of the node a place came from.
-place_access(x: TExpr) -> IrAccess = access_of(place_ty(x))
+//
+// **A `ref` name is the one node with no declaration to read a qualifier off**: the qualifier is on
+// the storage, the name's own type is the plain value read out of it, and so an access through the
+// name asks the place it was bound to -- or a register written through a `ref` gets an unmarked
+// store, free to be reordered or dropped, where the path it stands for gets `store volatile`.
+place_access(e: *Emit, x: TExpr) -> IrAccess = *x.kind match
+    TLoad(name, ty) -> ref_access(e, name, ty)
+    _ -> access_of(place_ty(x))
+
+// How storage reached through a local's name is accessed: as the place a `ref` stands on was
+// declared, and as the local's own type says everywhere else.
+ref_access(e: *Emit, name: string, ty: Type) -> IrAccess
+    for i in 0..<e.ref_places.len()
+        if e.ref_places.at(i).0 == name then return access_of(place_ty(e.ref_places.at(i).1))
+
+    access_of(ty)
+end ref_access
 
 // The type the storage behind a place is declared at, which is not always the type of the values
 // read out of it -- a qualifier lives on the storage, and a read through it yields a plain value.
@@ -242,7 +258,7 @@ load_place(e: *Emit, place: TExpr, p: Val) -> Val = bit_place(place) match
     None ->
         val t = fresh_reg(e)
 
-        emit(e, InLoad(t, lty(e, texpr_type(place)), p, place_access(place), None))
+        emit(e, InLoad(t, lty(e, texpr_type(place)), p, place_access(e, place), None))
         t
 
 private load_container(e: *Emit, ranges: Buf[BitRange], receiver: TExpr, addr: Val) -> Val
@@ -269,7 +285,7 @@ store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) = bit_place
         emit(e, InStore(container_lty(b.1), write_bits(e, b.1, b.2, c, v), p, acc, None))
     None ->
         val ty = texpr_type(place)
-        val acc = place_access(place)
+        val acc = place_access(e, place)
 
         cur match
             None -> store_into(e, ty, p, v, acc)

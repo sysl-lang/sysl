@@ -130,15 +130,17 @@ private zero_owes(a: &Analysis, t: Type, out: *Buf[&StructType])
 // spelled as a clause spells it, so an index step contributes no name and an element stands for its
 // array -- `g.items[0]` and `g.items[1]` are one path, since a clause reading the first says nothing
 // about which element a dynamic index would reach.
-private severing(a: &Analysis, place: TExpr) -> Buf[(&StructType, Buf[string])]
+private severing(cx: &Analyzer, place: TExpr) -> Buf[(&StructType, Buf[string])]
     var out: Buf[(&StructType, Buf[string])] = buf()
 
-    sever_walk(a, place, buf(), &out)
+    sever_walk(cx, place, buf(), &out)
     out
 end severing
 
-private sever_walk(a: &Analysis, e: TExpr, below: Buf[string],
+private sever_walk(cx: &Analyzer, e: TExpr, below: Buf[string],
                    out: *Buf[(&StructType, Buf[string])])
+    val a = cx.an
+
     *e.kind match
         // A field is a *position* in the typed tree and a *name* in the clause, so the receiver's
         // type is what turns one into the other. Anything else under a field step is storage this
@@ -156,11 +158,18 @@ private sever_walk(a: &Analysis, e: TExpr, below: Buf[string],
 
                         if bears_invariants(a, d.base) then out.push((d, path))
 
-                        sever_walk(a, recv, path, out)
+                        sever_walk(cx, recv, path, out)
                 _ -> ()
         // An alias of a view's element is an alias of the far side, which no struct holding the view
         // owns -- `&b.elems[0]` names storage no clause may read, so it is below no promise.
-        TIndex(recv, _, _) -> if !far_side(texpr_type(recv)) then sever_walk(a, recv, below, out)
+        TIndex(recv, _, _) -> if !far_side(texpr_type(recv)) then sever_walk(cx, recv, below, out)
+
+        // A `ref` is a shorter spelling of the place it stands for, and the path a clause would be
+        // told about is the one through that place -- so `&r` is `&o.a` written one line longer.
+        TLoad(name, _) ->
+            val stood = ref_place(cx, name)
+
+            if stood.is_some() then sever_walk(cx, stood.unwrap(), below, out)
         _ -> ()
 
 // The field paths a struct's clauses read, as a clause spells them.
@@ -347,8 +356,9 @@ end starts_with_path
 private path_shown(path: Buf[string]) -> string = joined(path, ".")
 
 // The first clause an alias of this place would put out of reach, if there is one.
-private severed(a: &Analysis, place: TExpr) -> Option[(&StructType, Buf[string])]
-    val below = severing(a, place)
+private severed(cx: &Analyzer, place: TExpr) -> Option[(&StructType, Buf[string])]
+    val a = cx.an
+    val below = severing(cx, place)
 
     for i in 0..<below.len()
         val s = below.at(i).0
@@ -368,7 +378,7 @@ end severed
 check_addressable(cx: &Analyzer, span: Span, place: TExpr)
     check_packed_field(cx, span, place)
 
-    val cut = severed(cx.an, place)
+    val cut = severed(cx, place)
 
     if cut.is_none() then return
 
@@ -420,7 +430,7 @@ check_sliceable(cx: &Analyzer, span: Span, base: TExpr, view: Type)
     // read -- `self.elems[..<self.count]` shares the buffer's elements and leaves its length alone.
     if read_only_view(view) || far_side(texpr_type(base)) then return
 
-    val cut = severed(cx.an, base)
+    val cut = severed(cx, base)
 
     if cut.is_none() then return
 

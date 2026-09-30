@@ -175,11 +175,39 @@ callable_signature(a: &Analysis, t: Type) -> Option[(Buf[Type], Option[Type])]
     Some((parts.unwrap().0, if ret == Unknown then None else Some(ret)))
 end callable_signature
 
+// Refuses a capture of a `ref`, which is the one construct that would carry one out of its block,
+// and answers whether it did.
+//
+// A `ref` is a **declaration and never a type**, and what that buys is that the compiler still holds
+// the place the name stands for, in the body that wrote it. A capture is exactly the thing that
+// breaks it: the name would be read from an environment, in a body with no place to walk outward
+// through, and an escaping closure would carry the address past the block whose storage it names.
+// **It is refused rather than made to work by capturing the place instead**, which would be a second,
+// hidden meaning for one word: the path re-walked at whatever its index had become is the
+// call-by-name reading a `ref` exists to rule out.
+refuse_ref_captures(cx: &Analyzer, span: Span, captured: Buf[string]) -> bool
+    for i in 0..<captured.len()
+        val local = cx.lookup(captured.at(i))
+
+        if local.is_some() && local.unwrap().stands_for.is_some()
+            cx.fault(span, s"'${captured.at(i)}' is a 'ref', which names storage for as long as " +
+                     "its own block and no longer — so it cannot be captured, since a closure may " +
+                     "outlive that block. Capture the place it names, or read the value into a " +
+                     "'val' and capture that")
+            return true
+        end if
+
+    false
+end refuse_ref_captures
+
 // Builds the struct, the implementation and the body of one closure, and yields the struct value
 // that *is* the closure -- its captures, in the order the fields hold them.
 lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
               result: Option[Type], body: Buf[Stmt]) -> TExpr
     val captured = captures(cx, body, names)
+
+    if refuse_ref_captures(cx, span, captured) then return bad_expr(span)
+
     var fields: Buf[(string, Type)] = buf()
 
     for i in 0..<captured.len()
