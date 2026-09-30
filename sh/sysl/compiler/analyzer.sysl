@@ -33,6 +33,15 @@ struct Local
     // written once", and the reader of an arm wrote no `val`.
     read_only: bool
     from_pattern: bool
+
+    // The place a `ref` stands for, and nothing for every other binding.
+    //
+    // **This is the compile-time half of a `ref`, and the half that earns the feature.** Lowering
+    // needs only an address, taken once; every *check* needs the place, because a promise is
+    // discharged by walking outward through one -- so a write through the name re-runs the
+    // invariants of the structs it lies inside, and the storage its path goes through is held still
+    // for as long as the name is in scope, which is exactly as long as this entry is.
+    stands_for: Option[TExpr]
 end Local
 
 // One loop, while its body is being read.
@@ -312,7 +321,7 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, false, false))
+        self.locals.push(Local(name, unique, ty, false, false, None))
         unique
     end bind
 
@@ -322,9 +331,22 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, true, false))
+        self.locals.push(Local(name, unique, ty, true, false, None))
         unique
     end bind_read_only
+
+    // Binds a name to a **place** rather than to a value -- what `ref` declares. The type is the
+    // place's, a `ref` stating nothing of its own, and the name is written once exactly where the
+    // storage it found is: reaching into a `val` keeps the property, and a `ref` is a way of
+    // reaching in.
+    bind_ref(*self, name: string, place: TExpr, read_only: bool) -> string
+        self.refuse_reserved_binding(name)
+
+        val unique = self.fresh_name(name)
+
+        self.locals.push(Local(name, unique, texpr_type(place), read_only, false, Some(place)))
+        unique
+    end bind_ref
 
     // Binds a name a **pattern** captured, which is written once for the reason a `val` is and
     // says so in its own words.
@@ -333,7 +355,7 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, true, true))
+        self.locals.push(Local(name, unique, ty, true, true, None))
         unique
     end bind_pattern
 
@@ -341,7 +363,7 @@ struct Analyzer
     // parameter is loaded by the name its declaration gave it.
     bind_as(*self, name: string, unique: string, ty: Type)
         self.refuse_reserved_binding(name)
-        self.locals.push(Local(name, unique, ty, false, false))
+        self.locals.push(Local(name, unique, ty, false, false, None))
 
     // A name nothing else in this **function** holds, which is what a slot of the frame is.
     //

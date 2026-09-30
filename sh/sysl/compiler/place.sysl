@@ -92,6 +92,10 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool,
     if root.is_none() && global_written_once(t) then
         cx.fault(at, s"a 'val' is written once, so $what has nothing to write through")
 
+    // Only a write is asked about: `&` produces a pointer and takes nothing away, so the storage a
+    // `ref` found is exactly where it was.
+    if writes then check_ref_guards(cx, at, t)
+
     t
 end require_place
 
@@ -243,6 +247,143 @@ private local_named(cx: &Analyzer, unique: string) -> Option[Local]
 
     None
 end local_named
+
+// -- what a live `ref` holds still ---------------------------------------------------------------
+//
+// A `ref` binds a name to a place, and this is a language with no collector: overwriting a `&T` or
+// a view **releases** what it held, and that release may be the last. So while a `ref` is in scope
+// the steps of its place that own what they point at are held still. **The discriminator is
+// ownership rather than indirection**, which is what keeps the rule from being ruinous -- a `*T`
+// step owns nothing, so a program reaching its tables through a `*Self` receiver has no hazard at
+// all and is asked for nothing.
+
+// The place a `ref` name stands for, asked by the unique name the typed tree loads it through.
+ref_place(cx: &Analyzer, unique: string) -> Option[TExpr] = local_named(cx, unique) match
+    Some(l) -> l.stands_for
+    None -> None
+
+// A place spelled as text, so two places can be compared for being the same storage.
+//
+// **An index is wildcarded**: `xs[i]` and `xs[j]` are one key, whether the two agree being a run-time
+// question, and the answer that costs nothing being the conservative one -- an index that differs
+// means the assignment lands elsewhere and would have been allowed, so this refuses a little more
+// and never a little less. A `ref` name resolves to the place it stands for, so a guard built from
+// one `ref` sees a second that reached the same storage by name. **A step is written after a `/`,
+// which no name holds**, so one key being a prefix of another is a statement about whole steps.
+private place_key(cx: &Analyzer, t: TExpr) -> Option[string] = *t.kind match
+    TLoad(name, _) ->
+        val through = ref_place(cx, name)
+        val stood = if through.is_some() then place_key(cx, through.unwrap()) else None
+
+        if stood.is_some() then stood else Some(name)
+    TGlobal(symbol, _, _) -> Some(s"@$symbol")
+    TDeref(operand, _) -> key_step(place_key(cx, operand), "*")
+    TField(recv, index, _) -> key_step(place_key(cx, recv), s"$index")
+    TIndex(recv, _, _) -> key_step(place_key(cx, recv), "[]")
+    _ -> None
+
+private key_step(base: Option[string], step: string) -> Option[string] = base match
+    Some(k) -> Some(s"$k/$step")
+    None -> None
+
+// Whether overwriting a step of this type could free what it named. A `&T` releases the object it
+// held; a view releases the buffer it owned, and nothing in the type says whether it owns one, so
+// every view counts. A `*T` owns nothing and is deliberately absent.
+private owning_step(t: Type) -> bool = t match
+    Ref(_, _) -> true
+    Slice(_, _) -> true
+    Str -> true
+    _ -> false
+
+// The step a place was reached from, where it was reached from one.
+private step_before(place: TExpr) -> Option[TExpr] = *place.kind match
+    TField(recv, _, _) -> Some(recv)
+    TIndex(recv, _, _) -> Some(recv)
+    TDeref(operand, _) -> Some(operand)
+    _ -> None
+
+// The places a `ref` over `place` holds still: the **owning steps the path goes through**.
+//
+// *Owning*, because an assignment can only strand a `ref` by freeing the storage it stands in, and a
+// value struct assigned in place keeps its address. *Through*, because what an assignment frees is
+// what that step pointed **at**, so it holds the `ref` only when the path carried on past it. The
+// place itself is therefore never in the set: `ref r = h.node` names the slot, so `r = other` and
+// `h.node = other` are one statement written two ways and neither is refused.
+private ref_hazards(cx: &Analyzer, place: TExpr) -> Buf[string]
+    var out: Buf[string] = buf()
+    var at = step_before(place)
+
+    while at.is_some()
+        val step = at.unwrap()
+
+        if owning_step(texpr_type(step))
+            val key = place_key(cx, step)
+
+            if key.is_some() then out.push(key.unwrap())
+        end if
+
+        at = step_before(step)
+
+    out
+end ref_hazards
+
+// Refuses an assignment that would move storage a live `ref` is standing on. **The message names
+// the `ref`**, because the line being refused is ordinary code and what makes it a mistake is a
+// binding somewhere above it. The nearest binding answers, and only one does.
+private check_ref_guards(cx: &Analyzer, at: Span, target: TExpr)
+    val key = place_key(cx, target)
+
+    if key.is_none() then return
+
+    var i = cx.locals.len()
+
+    while i > 0
+        i -= 1
+
+        val l = cx.locals.at(i)
+
+        if l.stands_for.is_some() && holds_string(ref_hazards(cx, l.stands_for.unwrap()), key.unwrap())
+            cx.fault(at, s"'${l.name}' is a 'ref' standing on storage this assignment would " +
+                     "release, so the name would be left pointing at freed memory. Write the " +
+                     "assignment before the 'ref', or put the 'ref' in a block that closes first")
+            return
+        end if
+end check_ref_guards
+
+// The same refusal for the other way the storage can move: a method that may write the place from
+// the inside.
+//
+// A `*self` receiver is the one place a callee is handed somewhere to write without an `&` in the
+// caller's own source, so it is the one call that has to be asked about. **It is refused whether or
+// not that method reassigns anything**: deciding otherwise means reading the body, and a module
+// compiles against its imports' signatures and never their bodies. The receiver reaches a hazard
+// when the hazard is the receiver or lies inside it -- `t.grow()` reaches `t.cell`.
+check_ref_call(cx: &Analyzer, at: Span, place: TExpr)
+    val key = place_key(cx, place)
+
+    if key.is_none() then return
+
+    val inside = s"${key.unwrap()}/"
+    var i = cx.locals.len()
+
+    while i > 0
+        i -= 1
+
+        val l = cx.locals.at(i)
+
+        if l.stands_for.is_none() then continue
+
+        val hazards = ref_hazards(cx, l.stands_for.unwrap())
+
+        for j in 0..<hazards.len()
+            if hazards.at(j) == key.unwrap() || hazards.at(j).starts_with(inside)
+                cx.fault(at, s"'${l.name}' is a 'ref' standing on storage this call could " +
+                         "release, since a '*self' method may write its receiver — so the name " +
+                         "could be left pointing at freed memory. Make the call before the 'ref', " +
+                         "or put the 'ref' in a block that closes first")
+                return
+            end if
+end check_ref_call
 
 // How a diagnostic names an assignment target.
 describe_target(target: Expr) -> string = *target.kind match
