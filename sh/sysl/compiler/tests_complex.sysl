@@ -1,0 +1,729 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `sysl.math.complex` — a `Complex[F: Float]` and its arithmetic, ported from the reference's
+// `ComplexTests.scala` case for case.
+//
+// Three groups of assertion here are not about whether the formulas are right. The first is **the
+// width**: the type is generic over `Float` rather than fixed at `real`, so the identities worth having
+// are run at `f32` as well — a body that quietly widened to binary64 would pass every value test and be
+// wrong. The second is **the operands a textbook formula does not survive**: `abs` through `hypot` and
+// a division that scales before it divides, pinned with inputs near the top and the bottom of the
+// range. The third is **the branch cuts**, each asserted at the boundary rather than near it, because a
+// cut is a statement about exactly the points on it.
+//
+// `cpx_ran` prepends the two imports the way the reference's own `run` override does, and
+// `cpx_ran_plain` is the reference's `super.run` — a file that wrote its own imports, or none.
+//
+// **Every expected output here was read out of the reference compiler.**
+
+private var cpx_library_cache: Buf[Program] = buf()
+private var cpx_library_read: bool = false
+
+private cpx_library() -> Buf[Program]
+    if cpx_library_read then return cpx_library_cache
+
+    cpx_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> cpx_library_cache = units
+
+    cpx_library_cache
+end cpx_library
+
+private cpx_importing() -> string = "import sysl.math.complex.Complex\nimport sysl.math.Float\n\n"
+
+// Everything a source read beside the library has to say about itself, joined — the library's own
+// complaints left out, since they are not what a test about a program is asking.
+private cpx_err(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+    val library = cpx_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    var out = str_builder()
+
+    for i in 0..<done.reported.len()
+        if !done.reported.at(i).src.name.starts_with("library/")
+            out.push(done.reported.at(i).diag.message)
+            out.push_char('\n')
+
+    out.finish()
+end cpx_err
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private cpx_ran_plain(text: string) -> string
+    val root = make_temp_dir("sysl-complex").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end cpx_ran_plain
+
+private cpx_ran(text: string) -> string = cpx_ran_plain(cpx_importing() + text)
+
+private cpx_can_run() -> bool
+    if cpx_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end cpx_can_run
+
+// -- construction and what a value says about itself ----------------------------------------------
+
+@test("the parts, the conjugate and the negation")
+cpx_the_parts_the_conjugate_and_the_negation()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        print(a.re, a.im, a.conj(), -a)
+        """), "3 4 3-4i -3-4i\n")
+
+// The rendering writes its four pieces straight through and pads once between them, so the field
+// belongs to the whole value without a string being built to measure it.
+@test("it renders as a+bi, with the sign written out and never a '+-'")
+cpx_it_renders_as_a_plus_bi()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        print(Complex(3.0, 4.0), Complex(3.0, -4.0), Complex(-3.0, 0.0))
+        print(f"[${Complex(1.0, -2.0)}%12s]")
+        """), "3+4i 3-4i -3+0i\n[        1-2i]\n")
+
+@test("the values that need no receiver, at the width the annotation asks for")
+cpx_the_values_that_need_no_receiver()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var z: Complex[real] = Complex.zero()
+        var o: Complex[real] = Complex.one()
+        var i: Complex[real] = Complex.i()
+        print(z, o, i, i * i)
+        """), "0+0i 1+0i 0+1i -1+0i\n")
+
+@test("polar construction, and the pair it takes back")
+cpx_polar_construction_and_the_pair_it_takes_back()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        var p = a.to_polar()
+        var back = Complex.from_polar(p.0, p.1)
+        print(p.0, p.1, back.near(a, 1.0e-12), Complex.expi(0.0))
+        """), "5 0.927295 true 1+0i\n")
+
+@test("the predicates, including a zero that is both real and imaginary")
+cpx_the_predicates_including_a_zero()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var z: Complex[real] = Complex.zero()
+        var i: Complex[real] = Complex.i()
+        var a = Complex(3.0, 4.0)
+        print(z.is_zero(), z.is_real(), z.is_imaginary())
+        print(a.is_real(), i.is_imaginary(), a.is_finite())
+        """), "true true true\nfalse true true\n")
+
+// A NaN in either part is a NaN value, and such a value is neither finite nor infinite — so the two
+// are not each other's negation, which is the case a `!is_finite()` would get wrong.
+@test("a NaN is neither finite nor infinite")
+cpx_a_nan_is_neither_finite_nor_infinite()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var n = Complex(real.nan(), 0.0)
+        var i = Complex(real.infinity(), 0.0)
+        print(n.is_nan(), n.is_finite(), n.is_infinite())
+        print(i.is_nan(), i.is_finite(), i.is_infinite())
+        """), "true false false\nfalse false true\n")
+
+// -- the operators --------------------------------------------------------------------------------
+
+@test("the four, over another complex number")
+cpx_the_four_over_another_complex_number()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        var b = Complex(1.0, -2.0)
+        print(a + b, a - b, a * b, a / b)
+        """), "4+2i 2+6i 11-2i -1+2i\n")
+
+// The second argument list, which is the operation a transform performs most often.
+@test("and the same four over a real on the right")
+cpx_the_same_four_over_a_real_on_the_right()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        print(a + 1.0, a - 1.0, a * 2.0, a / 2.0)
+        """), "4+4i 2+4i 6+8i 1.5+2i\n")
+
+// The scalar on the **left**: the coherence rule consults the trait's argument list as well as the
+// `impl`'s subject, so `2.0 * z` is a block the module can write. Subtraction and division do not
+// commute, and are the cases worth reading.
+@test("and the same four over a real on the left")
+cpx_the_same_four_over_a_real_on_the_left()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        print(1.0 + a, 1.0 - a, 2.0 * a, 2.0 / a)
+        """), "4+4i -2-4i 6+8i 0.24-0.32i\n")
+
+@test("the two that commute agree with the right-hand form, and the two that do not disagree")
+cpx_the_two_that_commute_agree()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        print(2.0 * a == a * 2.0, 1.0 + a == a + 1.0, 1.0 - a == a - 1.0, 2.0 / a == a / 2.0)
+        """), "true true false false\n")
+
+// At `f32` as well — and here it is also what says the two blocks per operator are two rather than one
+// that happens to fit.
+@test("and at binary32, which is the other block")
+cpx_and_at_binary32_which_is_the_other_block()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0f32, 4.0f32)
+        print(2.0f32 * a, 1.0f32 - a)
+        """), "6+8i -2-4i\n")
+
+// The compiler's own multiplication is unmoved by the block beside it: `real` is a member of `Mul`
+// whatever anybody writes, and only the argument list tells the two apart.
+@test("and the machine's own arithmetic is untouched by either block")
+cpx_the_machines_own_arithmetic_is_untouched()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran("print(2.0 * 3.0, 2.0.mul(3.0), 7 << 2)"), "6 6 28\n")
+
+@test("equality compares both parts")
+cpx_equality_compares_both_parts()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        print(a == Complex(3.0, 4.0), a == Complex(3.0, 4.1), a != Complex(4.0, 4.0))
+        """), "true false true\n")
+
+// The complex numbers are not ordered, and the library keeps `Eq` and `Ord` independent so a type can
+// say so. This is that refusal.
+@test("there is no ordering, which is the mathematics and not an omission")
+cpx_there_is_no_ordering()
+    if cpx_library().is_empty() then return
+
+    assert_eq(cpx_err(cpx_importing() + "print(Complex(1.0, 0.0) < Complex(2.0, 0.0))"),
+        "'<' is not defined for sysl.math.complex.Complex[real]\n")
+
+@test("a reciprocal is the division, and undoes the multiplication")
+cpx_a_reciprocal_is_the_division()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        print(a.recip() * a, (a * a.recip()).near(Complex(1.0, 0.0), 1.0e-15))
+        """), "1+0i true\n")
+
+// -- the operands the obvious formula does not survive --------------------------------------------
+
+// `norm_sqr` overflowing is not a defect — it is the squared magnitude, and that number really is out
+// of range. It is exactly what `abs` would have inherited had it been written as `norm_sqr().sqrt()`.
+@test("abs is finite where the squared magnitude is not")
+cpx_abs_is_finite_where_the_squared_magnitude_is_not()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var huge = Complex(1.0e200, 1.0e200)
+        print(huge.abs().is_finite(), huge.norm_sqr().is_infinite())
+        print((huge.abs() / 1.0e200 - 2.0.sqrt()).abs() < 1.0e-12)
+        """), "true true\ntrue\n")
+
+@test("and it is finite at the bottom of the range too, where a square underflows to zero")
+cpx_and_it_is_finite_at_the_bottom_of_the_range()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var tiny = Complex(1.0e-200, 1.0e-200)
+        print(tiny.abs() > 0.0, tiny.norm_sqr() == 0.0)
+        """), "true true\n")
+
+// Smith's algorithm. The textbook quotient forms the divisor's squared magnitude, so the first two of
+// these would be a NaN; both are exactly one. The third really is out of range.
+@test("division answers at both ends of the range, where the squared magnitude does not exist")
+cpx_division_answers_at_both_ends_of_the_range()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var huge = Complex(1.0e200, 1.0e200)
+        var tiny = Complex(1.0e-200, 1.0e-200)
+        print(huge / huge, tiny / tiny, huge / tiny == Complex(real.infinity(), 0.0))
+        """), "1+0i 1+0i true\n")
+
+// A zero divisor fixes neither a magnitude nor an argument, so the quotient is a NaN.
+@test("a zero divisor has no answer, and says so rather than picking a direction")
+cpx_a_zero_divisor_has_no_answer()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var z = Complex(0.0, 0.0)
+        print((Complex(2.0, 3.0) / z).is_nan(), z.recip().is_nan(), z.is_zero())
+        """), "true true true\n")
+
+// The other half of the same claim: the scaling has not cost accuracy on ordinary operands.
+@test("and it is still exact on operands that need no scaling")
+cpx_and_it_is_still_exact_on_operands_that_need_no_scaling()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran("print(Complex(11.0, -2.0) / Complex(1.0, -2.0), Complex(-5.0, 10.0) / Complex(5.0, 0.0))"),
+        "3+4i -1+2i\n")
+
+// -- exponentials, logarithms and roots -----------------------------------------------------------
+
+@test("the logarithm and the exponential undo each other")
+cpx_the_logarithm_and_the_exponential_undo_each_other()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        print(a.ln().exp().near(a, 1.0e-12))
+        """), "true\n")
+
+// `exp` is periodic, so the logarithm brings the angle back into `(-pi, pi]`.
+@test("the other way round wraps the angle, which is what a principal logarithm means")
+cpx_the_other_way_round_wraps_the_angle()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        var back = a.exp().ln()
+        print(back.re, (back.im - (4.0 - 2.0 * real.pi())).abs() < 1.0e-12)
+        """), "3 true\n")
+
+@test("the square root squares back, and is the principal one")
+cpx_the_square_root_squares_back()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        var minus = Complex(-1.0, 0.0)
+        print(a.sqrt(), a.sqrt().re >= 0.0, minus.sqrt())
+        """), "2+1i true 0+1i\n")
+
+@test("the root of zero is zero rather than a NaN")
+cpx_the_root_of_zero_is_zero()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran("print(Complex(0.0, 0.0).sqrt())"), "0+0i\n")
+
+@test("the three logarithm bases agree with each other")
+cpx_the_three_logarithm_bases_agree()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        print(a.log2().near(a.log(2.0), 1.0e-12),
+              a.log10().near(a.log(10.0), 1.0e-12),
+              a.log(real.one().exp()).near(a.ln(), 1.0e-12))
+        """), "true true true\n")
+
+// The integer power is the one that is exact, which is why it exists beside the other two.
+@test("the three powers agree, and the integer one is exact")
+cpx_the_three_powers_agree()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        print(a.powi(2), a.powi(2) == a * a)
+        print(a.powf(2.0).near(a * a, 1.0e-12), a.powc(Complex(2.0, 0.0)).near(a * a, 1.0e-12))
+        print(a.powi(-1).near(a.recip(), 1.0e-15), a.powi(0))
+        """), "-7+24i true\ntrue true\ntrue 1+0i\n")
+
+// A zero base has no logarithm, so both powers answer it without taking one.
+@test("a zero base is answered without a logarithm")
+cpx_a_zero_base_is_answered_without_a_logarithm()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var z = Complex(0.0, 0.0)
+        print(z.powf(0.0), z.powf(2.0), z.powc(z), z.powc(Complex(2.0, 0.0)))
+        """), "1+0i 0+0i 1+0i 0+0i\n")
+
+// -- trigonometry, circular and hyperbolic --------------------------------------------------------
+
+@test("sine, cosine and tangent agree with the identity over them")
+cpx_sine_cosine_and_tangent_agree()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        print((a.sin() * a.sin() + a.cos() * a.cos()).near(Complex(1.0, 0.0), 1.0e-12),
+              a.tan().near(a.sin() / a.cos(), 1.0e-12))
+        """), "true true\n")
+
+@test("and the hyperbolic three agree with theirs")
+cpx_and_the_hyperbolic_three_agree()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        print((a.cosh() * a.cosh() - a.sinh() * a.sinh()).near(Complex(1.0, 0.0), 1.0e-12),
+              a.tanh().near(a.sinh() / a.cosh(), 1.0e-12))
+        """), "true true\n")
+
+@test("each inverse undoes its own function")
+cpx_each_inverse_undoes_its_own_function()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0, 4.0)
+        print(a.asin().sin().near(a, 1.0e-12),
+              a.acos().cos().near(a, 1.0e-12),
+              a.atan().tan().near(a, 1.0e-12))
+        print(a.asinh().sinh().near(a, 1.0e-12),
+              a.acosh().cosh().near(a, 1.0e-12),
+              a.atanh().tanh().near(a, 1.0e-12))
+        """), "true true true\ntrue true true\n")
+
+// On the real interval where the real functions are defined, the complex ones have to be them.
+@test("on the real interval they answer what the real functions answer")
+cpx_on_the_real_interval_they_answer_what_the_real_functions_answer()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var h = Complex(0.5, 0.0)
+        print((h.asin().re - 0.5.asin()).abs() < 1.0e-12, h.asin().im.abs() < 1.0e-12,
+              (h.atanh().re - 0.5.atanh()).abs() < 1.0e-12)
+        """), "true true true\n")
+
+// -- the branch cuts, which are the contract ------------------------------------------------------
+
+// `arg` puts pi on the cut and -pi just below it, so a negative zero in the imaginary part is the
+// difference between the two sides.
+@test("the logarithm is cut along the negative real axis, and a negative zero says which side")
+cpx_the_logarithm_is_cut_along_the_negative_real_axis()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var above = Complex(-1.0, 0.0)
+        var below = Complex(-1.0, -0.0)
+        print((above.ln().im - real.pi()).abs() < 1.0e-15,
+              (below.ln().im + real.pi()).abs() < 1.0e-15)
+        """), "true true\n")
+
+@test("the square root keeps a non-negative real part, so it is cut along the same axis")
+cpx_the_square_root_keeps_a_non_negative_real_part()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var above = Complex(-4.0, 0.0)
+        var below = Complex(-4.0, -0.0)
+        print(above.sqrt(), below.sqrt())
+        """), "0+2i 0-2i\n")
+
+// Outside [-1, 1] on the real axis `asin` and `acos` leave the reals, which is the cut. The boundary
+// itself is still real, and that is the assertion.
+@test("asin and acos are real exactly on [-1, 1] and leave it outside")
+cpx_asin_and_acos_are_real_exactly_on_the_unit_interval()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var one = Complex(1.0, 0.0)
+        var past = Complex(2.0, 0.0)
+        print((one.asin().re - real.pi() / 2.0).abs() < 1.0e-12, one.asin().im.abs() < 1.0e-12)
+        print(past.asin().im.abs() > 1.0, past.acos().im.abs() > 1.0)
+        """), "true true\ntrue true\n")
+
+// `atanh` has a pole at each end of its cut, and the two-logarithm form reports both the same way.
+@test("atanh runs off to infinity at both poles, and to the same one on each side")
+cpx_atanh_runs_off_to_infinity_at_both_poles()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var up = Complex(1.0, 0.0).atanh()
+        var down = Complex(-1.0, 0.0).atanh()
+        print(up.re.is_infinite(), up.re > 0.0, down.re.is_infinite(), down.re < 0.0)
+        print(Complex(0.0, 0.0).atanh())
+        """), "true true true true\n0+0i\n")
+
+// `acosh`'s cut is everything to the left of one, which is the case the two-root form exists for.
+@test("acosh is cut to the left of one, and the answer there has a positive real part")
+cpx_acosh_is_cut_to_the_left_of_one()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var left = Complex(-2.0, 0.0)
+        print(left.acosh().re > 0.0, (left.acosh().im - real.pi()).abs() < 1.0e-12)
+        """), "true true\n")
+
+// `atan` and `asinh` are cut on the *imaginary* axis outside `[-i, i]`, which is `asin`'s cut turned a
+// quarter turn.
+@test("atan and asinh are cut on the imaginary axis outside [-i, i]")
+cpx_atan_and_asinh_are_cut_on_the_imaginary_axis()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var inside = Complex(0.0, 0.5)
+        var outside = Complex(0.0, 2.0)
+        print(inside.atan().re.abs() < 1.0e-15, outside.atan().re.abs() > 1.0)
+        print(inside.asinh().re.abs() < 1.0e-15, outside.asinh().re.abs() > 1.0)
+        """), "true true\ntrue true\n")
+
+// -- the same type at binary32 --------------------------------------------------------------------
+
+@test("arithmetic, magnitude and the operators")
+cpx_arithmetic_magnitude_and_the_operators()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0f32, 4.0f32)
+        var b = Complex(1.0f32, -2.0f32)
+        print(a, a.abs(), a.norm_sqr())
+        print(a + b, a * b, a / b, a * 2.0f32)
+        """), "3+4i 5 25\n4+2i 11-2i -1+2i 6+8i\n")
+
+@test("the roots, logarithms and both trigonometries round-trip")
+cpx_the_roots_logarithms_and_both_trigonometries_round_trip()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var a = Complex(3.0f32, 4.0f32)
+        var eps: f32 = 1.0e-4f32
+        print(a.sqrt() * a.sqrt(), a.ln().exp().near(a, eps))
+        print(a.asin().sin().near(a, eps), a.atanh().tanh().near(a, eps))
+        print(a.powi(2), a.powf(2.0f32).near(a * a, 1.0e-2f32))
+        """), "3+4i true\ntrue true\n-7+24i true\n")
+
+// The scaling in the division matters more at this width, not less.
+@test("and the division still answers where the squared magnitude would overflow")
+cpx_and_the_division_still_answers_where_the_squared_magnitude_would_overflow()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var huge = Complex(1.0e20f32, 1.0e20f32)
+        print(huge.abs().is_finite(), huge.norm_sqr().is_infinite(), huge / huge)
+        """), "true true 1+0i\n")
+
+// -- the edges ------------------------------------------------------------------------------------
+
+// Smith's algorithm branches on which part of the divisor is the larger, so a divisor with a zero part
+// exercises the arm the ordinary tests do not.
+@test("a divisor with one zero part takes the other arm and is still exact")
+cpx_a_divisor_with_one_zero_part_takes_the_other_arm()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        print(Complex(1.0, 0.0) / Complex(0.0, 1.0), Complex(1.0, 0.0) / Complex(2.0, 0.0))
+        print(Complex(3.0, 4.0) / Complex(0.0, 2.0))
+        """), "0-1i 0.5+0i\n2-1.5i\n")
+
+// The ratio underflows to zero and the answer is still the one the larger part alone gives.
+@test("a divisor whose two parts are nothing like each other")
+cpx_a_divisor_whose_two_parts_are_nothing_like_each_other()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var q = Complex(2.0, 0.0) / Complex(1.0e300, 1.0)
+        print(q.re.is_finite(), (q.re - 2.0e-300).abs() < 1.0e-315)
+        """), "true true\n")
+
+// At zero there is no direction to point in, and both parts say so.
+@test("the unit vector of zero is not a number")
+cpx_the_unit_vector_of_zero_is_not_a_number()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var u = Complex(0.0, 0.0).unit()
+        print(u.is_nan(), Complex(0.0, 0.0).arg())
+        """), "true 0\n")
+
+// A base of one has no logarithm to divide by, so the general `log` runs off the way the real one does.
+@test("a logarithm in base one is infinite, as it is among the reals")
+cpx_a_logarithm_in_base_one_is_infinite()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran("print(Complex(3.0, 4.0).log(1.0).re.is_infinite())"), "true\n")
+
+// `near` is a comparison, and a NaN fails every comparison — so a poisoned value never quietly passes
+// a tolerance check.
+@test("a NaN is near nothing, not even itself")
+cpx_a_nan_is_near_nothing()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var n = Complex(real.nan(), 0.0)
+        print(n.near(n, 1.0), n.near(Complex(0.0, 0.0), 1.0e300))
+        """), "false false\n")
+
+@test("a large integer power stays exact where the polar form would not")
+cpx_a_large_integer_power_stays_exact()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var i: Complex[real] = Complex.i()
+        print(i.powi(100), i.powi(-100), Complex(2.0, 0.0).powi(30))
+        """), "1+0i 1+0i 1.07374e+09+0i\n")
+
+// `powc` is written over `ln`, so its cut is `ln`'s.
+@test("powc inherits the logarithm's cut, so a half power is the principal root")
+cpx_powc_inherits_the_logarithms_cut()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        var half = Complex(0.5, 0.0)
+        print(Complex(-1.0, 0.0).powc(half).near(Complex(0.0, 1.0), 1.0e-15),
+              Complex(-4.0, 0.0).powc(half).near(Complex(-4.0, 0.0).sqrt(), 1.0e-14))
+        """), "true true\n")
+
+// -- the size, which is an ordering the values do not have ----------------------------------------
+
+@test("the modulus reached through the trait is the type's own abs")
+cpx_the_modulus_reached_through_the_trait()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        import sysl.math.Magnitude
+
+        print(Complex(3.0, 4.0).magnitude(), Complex(0.0 - 5.0, 12.0).magnitude())
+        """), "5 13\n")
+
+// The width is the claim: the projection is `F`, made by a body that can only hold what the trait
+// promises.
+@test("and it comes out at the width the value is held in")
+cpx_and_it_comes_out_at_the_width_the_value_is_held_in()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        import sysl.math.Magnitude
+
+        size[T: Magnitude](x: T) -> T::Size = x.magnitude()
+
+        var narrow: f32 = size(Complex(3.0f32, 4.0f32))
+        var wide: real = size(Complex(3.0, 4.0))
+
+        print(narrow, wide)
+        """), "5 5\n")
+
+// One body over element types whose sizes are not the same type as each other.
+@test("so one routine picks the largest by size over the plane and over the line")
+cpx_so_one_routine_picks_the_largest_by_size()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        import sysl.math.Magnitude
+
+        largest[T: Magnitude](xs: []const T) -> T::Size
+            var best = xs[0].magnitude()
+
+            for x in xs do if best < x.magnitude() then best = x.magnitude()
+
+            best
+
+        print(largest([Complex(3.0, 4.0), Complex(1.0, 1.0)]), largest([3.0, 0.0 - 40.0]))
+        """), "5 40\n")
+
+// -- the module is asked for by name --------------------------------------------------------------
+
+// The arithmetic is reachable from a module that has given up both the allocator and the operating
+// system, which is what makes the module usable on a freestanding target.
+@test("and the arithmetic needs no capability, which is what a freestanding target has to have")
+cpx_the_arithmetic_needs_no_capability()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran_plain(raw"""
+        @no_alloc
+        @no_os
+
+        import sysl.math.complex.Complex
+
+        var a = Complex(3.0, 4.0)
+        var q = a.sqrt()
+
+        print(a.abs(), (a * a).re, q.re, q.im, a.exp().ln().re)
+        """), "5 -7 2 1 3\n")
+
+// The width is had by running the same writes through a `Counting` sink, which keeps the length and
+// drops the bytes, so an allocator-free program prints a `Complex` whole.
+@test("and rendering one needs none either, since the width is measured rather than gathered")
+cpx_and_rendering_one_needs_none_either()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran_plain(raw"""
+        @no_alloc
+
+        import sysl.math.complex.Complex
+
+        print(Complex(3.0, 4.0), Complex(0.5, -0.25))
+        """), "3+4i 0.5-0.25i\n")
+
+@test("a program that did not import it cannot spell the type")
+cpx_a_program_that_did_not_import_it_cannot_spell_the_type()
+    if cpx_library().is_empty() then return
+
+    assert_eq(cpx_err("var a = Complex(1.0, 2.0)"), "undefined function 'Complex'\n")
+
+// Every operator here is a conditional conformance whose condition names `Float`, which is the
+// library's own import and not this program's.
+@test("and importing the type is enough to reach every operator")
+cpx_and_importing_the_type_is_enough()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran_plain(raw"""
+        import sysl.math.complex.Complex
+
+        var a = Complex(3.0, 4.0)
+
+        print(a + a, a * a, a / a, a * 2.0, -a, a == a)
+        """), "6+8i -7+24i 1+0i 6+8i -3-4i true\n")
+
+// The bound is written with the short name, under the import.
+@test("and a program may write its own generic over it, bounded the same way")
+cpx_and_a_program_may_write_its_own_generic_over_it()
+    if !cpx_can_run() then return
+
+    assert_eq(cpx_ran(raw"""
+        scaled[F: Float](z: Complex[F], k: F) -> Complex[F] = z * k
+
+        print(scaled(Complex(3.0, 4.0), 2.0), scaled(Complex(3.0f32, 4.0f32), 2.0f32))
+        """), "6+8i 6+8i\n")
