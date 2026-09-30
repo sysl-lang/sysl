@@ -158,6 +158,66 @@ cached_c_compile(cc: string, src: string, obj: string, args: Buf[string]) -> Res
     Ok(())
 end cached_c_compile
 
+// --- codegen units -----------------------------------------------------------------------
+//
+// **A codegen unit's object is kept the same way and in the same directory**, under a key of its
+// own shape: a unit reads no file but its text, so there is no second step -- the key is the C
+// compiler, what it was told, the environment, and the text's bytes. A rebuild after an edit to one
+// function recompiles the units whose text changed and takes the rest from here. The counts are kept
+// apart from the C files', so each question is answered on its own.
+
+private const UnitFormat: string = "cgu-1"
+
+private var unit_hits: int = 0
+private var unit_compilations: int = 0
+
+// `(hits, compilations)` of codegen units since the last `clear_unit_object_counts`.
+unit_object_counts() -> (int, int) = (unit_hits, unit_compilations)
+
+clear_unit_object_counts()
+    unit_hits = 0
+    unit_compilations = 0
+
+// Where the object of a unit with this text and these arguments is kept, or empty with the cache off.
+unit_object_key(cc: string, ir: string, args: Buf[string]) -> string
+    val dir = c_object_dir() match
+        Some(d) -> d
+        None -> return ""
+
+    var parts: Buf[string] = buf()
+
+    parts.push(UnitFormat)
+    parts.push(cc)
+    parts.push(cc_version(cc))
+    parts.push(build_environment())
+    parts.push(join(args.view(), "\0"))
+    parts.push(s"${ir.len}:${bytes_fingerprint(ir.bytes)}")
+
+    s"$dir/${run_cache_key(parts)}.o"
+end unit_object_key
+
+// The kept object copied to `obj`, where there is a whole one.
+unit_object_reused(cached: string, obj: string) -> bool
+    if !reuse(cached, obj) then return false
+
+    unit_hits += 1
+    in_use(cached, cached)
+    true
+end unit_object_reused
+
+// A unit was compiled by clang rather than taken from here.
+unit_compiled()
+    unit_compilations += 1
+
+// The object just compiled for `cached`'s key, kept.
+unit_object_kept(cached: string, obj: string)
+    val dir = parent_of(cached).unwrap_or(".")
+
+    keep(dir, cached, obj)
+    in_use(cached, cached)
+    evict_c_objects(dir)
+end unit_object_kept
+
 // --- eviction ----------------------------------------------------------------------------
 //
 // **The run cache's policy, with the run cache's two numbers** (`CacheKeep`, `CacheStale`), so there
