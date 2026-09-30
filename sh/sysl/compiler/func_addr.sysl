@@ -48,7 +48,13 @@ function_address(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf[Exp
     if function_keys(cx, written).is_empty()
         val foreign = extern_key(cx, written)
 
-        if foreign.is_some() then return extern_address(cx, span, written, foreign.unwrap(), targ_exprs)
+        if foreign.is_some()
+            val chosen = addressed_extern(cx, span, written, foreign.unwrap(), expected)
+
+            if chosen == "" then return bad_expr(span)
+
+            return extern_address(cx, span, written, chosen, targ_exprs)
+        end if
     end if
 
     val key = addressed_overload(cx, span, written, expected)
@@ -264,10 +270,53 @@ private addressed_overload(cx: &Analyzer, span: Span, written: string,
 
         if wanted.is_some() && types_eq(ps, wanted.unwrap().0) then fits.push(keys.at(i))
 
+    the_one_addressed(cx, span, written, keys.len(), fits, declared, expected)
+end addressed_overload
+
+// Which `extern` of an overloaded name an address is of, chosen the way a function's is: the
+// parameter list the context's type states is matched against what each declaration transcribed.
+//
+// A name with one declaration answers with it whatever the context wants, as it always has -- the
+// address of a C function is what it is, and a disagreement with where it is stored is that
+// position's to report.
+private addressed_extern(cx: &Analyzer, span: Span, written: string, base: string,
+                         expected: Option[Type]) -> string
+    if extern_overloads(cx.an, base).len() < 2 then return base
+
+    val keys = extern_keys_in_reach(cx, base)
+
+    if keys.is_empty() then return base
+    if keys.len() == 1 then return keys.at(0)
+
+    val wanted = if expected.is_none() then None else cfn_of(expected.unwrap())
+    var fits: Buf[string] = buf()
+    var declared = ""
+
+    for i in 0..<keys.len()
+        val d = cx.an.tables.externs.get(keys.at(i)).unwrap()
+        val scope = extern_scope(cx, keys.at(i))
+        var ps: Buf[Type] = buf()
+
+        for j in 0..<d.params.len()
+            ps.push(resolve_type(cx.an, scope, d.params.at(j).typ, no_bindings()))
+
+        val shape = CFn(ps, declared_result(cx, scope, d.ret_type))
+
+        declared = declared + s"\n    $written: ${type_show(shape)}"
+
+        if wanted.is_some() && types_eq(ps, wanted.unwrap().0) then fits.push(keys.at(i))
+
+    the_one_addressed(cx, span, written, keys.len(), fits, declared, expected)
+end addressed_extern
+
+// The declaration an address settled on, or the refusal where it settled on none: nothing to read
+// the choice off, nothing that matched what was read, or more than one that did.
+private the_one_addressed(cx: &Analyzer, span: Span, written: string, count: usize,
+                          fits: Buf[string], declared: string, expected: Option[Type]) -> string
     if fits.len() == 1 then return fits.at(0)
 
-    if wanted.is_none()
-        cx.fault(span, s"'$written' names ${keys.len()} functions, and an address is of one of " +
+    if expected.is_none() || cfn_of(expected.unwrap()).is_none()
+        cx.fault(span, s"'$written' names $count functions, and an address is of one of " +
                  "them — which is read off the type the context wants, and there is none here. " +
                  "Annotate what this address is being stored in or passed as")
         return ""
@@ -283,7 +332,7 @@ private addressed_overload(cx: &Analyzer, span: Span, written: string,
     cx.fault(span, s"'$written' is ambiguous as an address — ${fits.len()} of its declarations " +
              s"match '${type_show(expected.unwrap())}'")
     ""
-end addressed_overload
+end the_one_addressed
 
 // Which copy of a generic function this address names, said outright.
 //
