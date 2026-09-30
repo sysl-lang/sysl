@@ -1,0 +1,527 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A deferred statement that declares a local, in a block left by more than one edge
+// (`reference/statements.md § defer`).
+//
+// A deferred statement runs on every way out of its block, last registered first, so it is laid
+// down once per edge -- and a local it declares is declared once per edge. Its storage is named for
+// it, a name being unique within a function, so two layings used to define one name twice and the
+// text was refused by the back end: `multiple definition of local value named 'j.addr'`. Each laying
+// after the first now stores the local under a name of its own.
+//
+// **Most of what is printed here is derived rather than quoted.** The reference compiler (0.0.152)
+// emits the same doubled definition and fails at clang on every program marked so below, and there
+// is nothing of its to quote; what each prints follows from the rule above, worked out by hand. The
+// programs not marked build on 0.0.152 and print what it printed.
+
+// What a program does: what it printed and the status it exited with, as a shell reports one. A
+// failure to build is its message and `-1`, which no program exits with.
+private dls_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-dls").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end dls_outcome
+
+// The program runs to the end, prints exactly this and leaves with status 0 -- both, so that a
+// build that failed cannot pass for a program that stopped. Returns at once without the library.
+private dls_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = dls_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end dls_prints
+
+// -- the neighbours the reference builds ------------------------------------------------------------
+
+@test("a deferred 'for' in a block with one way out runs once, after the body")
+dls_one_way_out_runs()
+    dls_prints(raw"""
+        work()
+            defer for j in 0..<2
+                print(j)
+
+            print("body")
+
+        work()
+        """, "body\n0\n1\n")
+
+@test("a deferred statement with no local of its own runs on both ways out")
+dls_no_local_on_two_ways_out_runs()
+    dls_prints(raw"""
+        f(c: bool)
+            defer print("out")
+
+            if c then return
+
+            print("x")
+
+        f(true)
+        f(false)
+        """, "out\nx\nout\n")
+
+// The `ref` is declared again in the laying that follows the `return`, which nothing reaches: the
+// instruction that would define its address is dropped, so that laying reads the first one's name.
+@test("a deferred 'ref' ahead of a closing 'return' is declared once, the second laying being unreached")
+dls_a_ref_ahead_of_a_closing_return_runs()
+    dls_prints(raw"""
+        struct P
+            a: int
+            b: int
+
+        f(c: bool)
+            var p = P(1, 2)
+
+            defer if true
+                ref r = p.b
+
+                if c then r += 10
+
+                print(r)
+
+            print("x")
+            return
+
+        f(true)
+        f(false)
+        """, "x\n12\nx\n2\n")
+
+// -- two ways out -----------------------------------------------------------------------------------
+
+// 0.0.152 fails at clang on this. `f(true)` leaves by the `return` and runs the loop; `f(false)`
+// prints and leaves by the end, running it again.
+@test("a deferred 'for' runs on a 'return' and on falling off the end")
+dls_a_for_on_a_return_and_the_end_runs()
+    dls_prints(raw"""
+        f(c: bool)
+            defer for j in 0..<2
+                print(j)
+
+            if c then return
+
+            print("x")
+
+        f(true)
+        f(false)
+        """, "0\n1\nx\n0\n1\n")
+
+// 0.0.152 fails at clang on this: the `return` is one laying and the block's own end, which nothing
+// reaches, is another. The body prints, then the deferred loop runs once.
+@test("a deferred 'for' ahead of a closing 'return' runs once")
+dls_a_for_ahead_of_a_closing_return_runs()
+    dls_prints(raw"""
+        f()
+            defer for j in 0..<2
+                print(j)
+
+            print("x")
+            return
+
+        f()
+        """, "x\n0\n1\n")
+
+// 0.0.152 fails at clang on this. The first round prints and ends, running the deferred loop; the
+// second leaves by the labelled `break`, running it again.
+@test("a deferred 'for' in a labelled loop runs at the round's end and at a labelled 'break'")
+dls_a_for_in_a_labelled_loop_runs()
+    dls_prints(raw"""
+        'outer for i in 0..<2
+            defer for j in 0..<2
+                print(j)
+
+            if i == 1 then break 'outer
+
+            print("i")
+        """, "i\n0\n1\n0\n1\n")
+
+// 0.0.152 fails at clang on this. The `var` is set afresh by each laying, so the second count
+// starts at zero again.
+@test("a 'while' over a 'var' in a deferred block counts from the start on each way out")
+dls_a_while_over_a_var_runs()
+    dls_prints(raw"""
+        f(c: bool)
+            defer if true
+                var k = 0
+
+                while k < 2
+                    print(k)
+                    k += 1
+
+            if c then return
+
+            print("x")
+
+        f(true)
+        f(false)
+        """, "0\n1\nx\n0\n1\n")
+
+// 0.0.152 fails at clang on this. Same shape with the loop's measure checked, whose two slots are
+// the loop's own and are declared per laying as the `var` is.
+@test("a 'while' with a 'variant' in a deferred block runs on both ways out")
+dls_a_while_with_a_variant_runs()
+    dls_prints(raw"""
+        f(c: bool)
+            defer if true
+                var k = 2
+
+                while k > 0
+                    variant k
+                    print(k)
+                    k -= 1
+
+            if c then return
+
+            print("x")
+
+        f(true)
+        f(false)
+        """, "2\n1\nx\n2\n1\n")
+
+// 0.0.152 fails at clang on this. `o match` binds `v` in each laying; `f(None, true)` takes the
+// other arm.
+@test("a deferred 'match' binds its arm's name on each way out")
+dls_a_match_binding_runs()
+    dls_prints(raw"""
+        f(o: Option[int], c: bool)
+            defer o match
+                Some(v) -> print(v)
+                None -> print("none")
+
+            if c then return
+
+            print("x")
+
+        f(Some(7), true)
+        f(Some(8), false)
+        f(None, true)
+        """, "7\nx\n8\nnone\n")
+
+// 0.0.152 fails at clang on this. The closure captures `base` by value from the laying it was
+// written in: 10 + (1 + 1) on the `return`, 10 + (2 + 1) at the end.
+@test("a closure in a deferred block captures the local of the laying it is in")
+dls_a_closure_over_a_deferred_local_runs()
+    dls_prints(raw"""
+        f(c: bool, n: int)
+            defer if true
+                val base = n + 1
+                val add = (x: int) -> x + base
+
+                print(add(10))
+
+            if c then return
+
+            print("x")
+
+        f(true, 1)
+        f(false, 2)
+        """, "12\nx\n13\n")
+
+// 0.0.152 fails at clang on this, at the `getelementptr` that names a `ref`. Each laying adds ten
+// to the field through its own `ref`, and each call starts from a fresh `P(1, 2)`.
+@test("a 'ref' in a deferred block names its place on each way out")
+dls_a_ref_in_a_deferred_block_runs()
+    dls_prints(raw"""
+        struct P
+            a: int
+            b: int
+
+        f(c: bool)
+            var p = P(1, 2)
+
+            defer if true
+                ref r = p.b
+
+                r += 10
+                print(r)
+
+            if c then return
+
+            print("x")
+
+        f(true)
+        f(false)
+        """, "12\nx\n12\n")
+
+// 0.0.152 fails at clang on this, at the cursor of the iterating loop. The two are registered in
+// written order and run last first: the characters, then the elements.
+@test("a deferred walk of an array and one of a string's characters run on both ways out")
+dls_a_for_each_and_an_iteration_run()
+    dls_prints(raw"""
+        f(c: bool)
+            val xs = [3, 4]
+
+            defer for x in xs
+                print(x)
+
+            defer for ch in "ab".chars
+                print(ch)
+
+            if c then return
+
+            print("x")
+
+        f(true)
+        f(false)
+        """, "a\nb\n3\n4\nx\na\nb\n3\n4\n")
+
+// 0.0.152 fails at clang on this, at the box the array moved to. A view of the array outlives the
+// frame, so the array lives in a buffer, and each laying makes its own: 7 on the `return`, 9 at the
+// end.
+@test("an array in a deferred block whose view gets out is a buffer of its own on each way out")
+dls_a_promoted_array_in_a_deferred_block_runs()
+    dls_prints(raw"""
+        var kept: []int = []
+
+        f(c: bool)
+            defer if true
+                var a = [1, 2, 3]
+
+                a[0] = if c then 7 else 9
+                kept = a[..]
+
+            if c then return
+
+            print("x")
+
+        f(true)
+        print(kept[0])
+        f(false)
+        print(kept[0])
+        """, "7\nx\n9\n")
+
+// 0.0.152 fails at clang on this. The laying at the block's end is unreached, so it takes no name
+// for the array's address and shares the first one's box slot; the one that runs is the `return`'s.
+@test("an array whose view gets out, deferred ahead of a closing 'return', runs once per call")
+dls_a_promoted_array_ahead_of_a_closing_return_runs()
+    dls_prints(raw"""
+        var kept: []int = []
+
+        f(c: bool)
+            defer if true
+                var a = [1, 2, 3]
+
+                a[0] = if c then 7 else 9
+                kept = a[..]
+
+            print("x")
+            return
+
+        f(true)
+        print(kept[0])
+        f(false)
+        print(kept[0])
+        """, "x\n7\nx\n9\n")
+
+// -- three ways out ---------------------------------------------------------------------------------
+
+// 0.0.152 fails at clang on this. `n * 2` is printed on whichever edge is taken, before the value
+// the caller prints: 18 then 1, 8 then 2, and `small`, 2 then 3.
+@test("a 'val' in a deferred block is set on each of two 'return's and the end")
+dls_a_val_on_three_ways_out_runs()
+    dls_prints(raw"""
+        f(n: int) -> int
+            defer if true
+                val twice = n * 2
+
+                print(twice)
+
+            if n > 5 then return 1
+            if n > 2 then return 2
+
+            print("small")
+            3
+
+        print(f(9))
+        print(f(4))
+        print(f(1))
+        """, "18\n1\n8\n2\nsmall\n2\n3\n")
+
+// 0.0.152 fails at clang on this. The deferred loop is registered each round and runs when the
+// round is left, whichever way: by its end (rounds printing `body`), a `continue` (round 1), a
+// `break` (round 2 of `f(2)`) and a `return` (round 3 of `f(7)`).
+@test("a deferred 'for' in a loop body runs at the round's end, a 'continue', a 'break' and a 'return'")
+dls_a_for_in_a_loop_body_runs()
+    dls_prints(raw"""
+        f(stop: int) -> int
+            for i in 0..<4
+                defer for j in 0..<2
+                    print(i * 10 + j)
+
+                if i == 1 then continue
+                if i == stop then break
+                if i == 3 then return 99
+
+                print("body")
+
+            0
+
+        print(f(2))
+        print(f(7))
+        """, "body\n0\n1\n10\n11\n20\n21\n0\nbody\n0\n1\n10\n11\nbody\n20\n21\n30\n31\n99\n")
+
+// 0.0.152 fails at clang on this. A `?` that fails is a way out like a `return`: `g(4)` prints
+// `even` and runs the loop at the end, `g(7)` runs it on the way out of the `?`.
+@test("a deferred 'for' runs where a '?' leaves and where the block ends")
+dls_a_for_on_a_question_mark_runs()
+    dls_prints(raw"""
+        half(n: int) -> Result[int, string] = if n % 2 == 0 then Ok(n / 2) else Err("odd")
+
+        g(n: int) -> Result[int, string]
+            defer for j in 0..<2
+                print(j)
+
+            val h = half(n)?
+
+            print("even")
+            Ok(h)
+
+        print(g(4).unwrap_or(-1))
+        print(g(7).unwrap_or(-1))
+        """, "even\n0\n1\n2\n0\n1\n-1\n")
+
+// -- more than one deferred statement ---------------------------------------------------------------
+
+// 0.0.152 fails at clang on this. The two `j`s are two locals of one frame, and each is declared
+// twice; the statements run last registered first, so 5 and 6 come before 0 and 1 on both edges.
+@test("two deferred 'for's over one loop name run last first on both ways out")
+dls_two_defers_with_one_local_name_run()
+    dls_prints(raw"""
+        f(c: bool)
+            defer for j in 0..<2
+                print(j)
+
+            defer for j in 5..<7
+                print(j)
+
+            if c then return
+
+            print("x")
+
+        f(true)
+        f(false)
+        """, "5\n6\n0\n1\nx\n5\n6\n0\n1\n")
+
+// 0.0.152 fails at clang on this. The inner `defer` belongs to the deferred block, whose one way
+// out is its end; the block itself is laid down twice, and the inner loop with it.
+@test("a 'defer' with a local, written inside a deferred block, runs at that block's end each time")
+dls_a_defer_inside_a_deferred_block_runs()
+    dls_prints(raw"""
+        f(c: bool, d: bool)
+            defer if true
+                defer for j in 0..<2
+                    print(j)
+
+                if d
+                    print("d")
+                else
+                    print("not d")
+
+            if c then return
+
+            print("x")
+
+        f(true, true)
+        f(false, false)
+        """, "d\n0\n1\nx\nnot d\n0\n1\n")
+
+// 0.0.152 fails at clang on this. A nested function is a frame of its own, so its `j` and the
+// enclosing function's are unrelated: `inner(true)` runs 0 and 1 on its `return`, then the outer
+// `return` runs 8 and 9; the second call prints `inner`, 0, 1, `outer`, 8, 9.
+@test("a nested function's deferred 'for' and its enclosing function's each run on both ways out")
+dls_a_nested_function_with_its_own_defer_runs()
+    dls_prints(raw"""
+        outer(c: bool)
+            inner(d: bool)
+                defer for j in 0..<2
+                    print(j)
+
+                if d then return
+
+                print("inner")
+
+            defer for j in 8..<10
+                print(j)
+
+            if c
+                inner(true)
+                return
+
+            inner(false)
+            print("outer")
+
+        outer(true)
+        outer(false)
+        """, "0\n1\n8\n9\ninner\n0\n1\nouter\n8\n9\n")
+
+// -- what the text says -----------------------------------------------------------------------------
+
+// The first laying keeps the name a program with one way out has always had, which is what leaves
+// every program the reference builds with the text the reference gives it; the second takes `j.d1`.
+@test("the first laying's slot is the local's own name and the second's is 'j.d1'")
+dls_the_second_laying_has_a_slot_of_its_own()
+    if xvr_no_library() then return
+
+    val root = make_temp_dir("sysl-dls").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", raw"""
+        f(c: bool)
+            defer for j in 0..<2
+                print(j)
+
+            if c then return
+
+            print("x")
+
+        f(true)
+        """).unwrap()
+
+    val made = emit_llvm_text(root, None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    made match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(emitted) ->
+            assert(emitted.report.is_empty(), analysis_report(emitted.report))
+            assert_eq(dls_count(emitted.text, "  %j.addr = alloca i32\n"), 1)
+            assert_eq(dls_count(emitted.text, "  %j.d1.addr = alloca i32\n"), 1)
+            assert_eq(dls_count(emitted.text, "  %j.d2.addr = alloca i32\n"), 0)
+end dls_the_second_laying_has_a_slot_of_its_own
+
+// How many times a piece of text occurs in another.
+private dls_count(text: string, piece: string) -> int
+    var n = 0
+    var from: usize = 0
+
+    while from + piece.len <= text.len
+        if text[from..<from + piece.len] == piece
+            n += 1
+            from += piece.len
+        else
+            from += 1
+
+    n
+end dls_count
