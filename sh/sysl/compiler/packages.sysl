@@ -112,6 +112,42 @@ names_module(a: &Analysis, name: string) -> bool
     false
 end names_module
 
+// Whether a file of the package `pkg` could WRITE `name` as a module path or its head: one of that
+// package's own modules, under the name it wrote, or a path its manifest mounted.
+//
+// **This, not `names_module`, is what an import may not hide**, because what a binding can hide is a
+// path somebody could have written rather than a canonical name the compilation keys on. A `path`
+// dependency's canonical prefix is its label, an ordinary identifier, so it looks exactly like the head
+// of a module path while naming nothing a file writes.
+writes_module(a: &Analysis, pkg: Packaging, name: string) -> bool
+    for i in 0..<a.tables.modules.len()
+        val m = a.tables.modules.at(i)
+
+        if package_of_module(a, m) == pkg.prefix
+            val mine = if pkg.prefix == "" then m else m[pkg.prefix.bytes.len + 1..<m.bytes.len]
+
+            if starts_with_module(mine, name) then return true
+
+    for i in 0..<pkg.mounts.len()
+        if starts_with_module(pkg.mounts.at(i).0, name) then return true
+
+    false
+end writes_module
+
+// The canonical prefix a module arrived under: the longest package prefix it sits below, and the
+// empty one for the project, its source roots and the library.
+private package_of_module(a: &Analysis, m: string) -> string
+    var best = ""
+
+    for i in 0..<a.tables.package_prefixes.len()
+        val p = a.tables.package_prefixes.at(i)
+
+        if p.bytes.len > best.bytes.len && m.bytes.len > p.bytes.len && m[0..<p.bytes.len + 1] == s"$p."
+            best = p
+
+    best
+end package_of_module
+
 // Whether a **whole written path** leads anywhere: it is a module, begins one, or names something a
 // module declares.
 //

@@ -188,6 +188,54 @@ private walk_c(path: string, dir: Buf[string], os: Option[Os], within: Option[st
     Ok(())
 end walk_c
 
+// **A `.c` the walk goes past, named rather than left silent.** A directory holding C and no sysl is
+// not a module, so `c_sources` compiles none of its files -- deliberately, as above -- and without this
+// the only trace was a link error naming a symbol, indistinguishable from the C having been dropped.
+// Each such directory of a project's own tree is one sentence carrying the one-file remedy; a
+// dependency's are not asked about, being nothing its consumer can change.
+stray_c_warnings(root: string) -> Buf[string]
+    var dirs: Buf[string] = buf()
+
+    if is_directory(root) then walk_stray_c(absolute_path(root), buf(), None, None, &dirs).unwrap_or(())
+
+    var out: Buf[string] = buf()
+
+    for i in 0..<dirs.len()
+        out.push(s"'${dirs.at(i)}' holds C and no sysl, so it is not a module and its '.c' files are " +
+            "compiled by nothing — a directory becomes one by holding the '.sysl' that declares " +
+            "those 'extern's")
+
+    out
+end stray_c_warnings
+
+private walk_stray_c(path: string, dir: Buf[string], os: Option[Os], within: Option[string],
+                     out: *Buf[string]) -> Result[unit, Selection]
+    val here = contents(path, os, within)?
+    var sysl = false
+    var c = false
+
+    for i in 0..<here.files.len()
+        if is_sysl_file(here.files.at(i)) then sysl = true
+        if here.files.at(i).ends_with(".c") then c = true
+
+    if !dir.is_empty() && c && !sysl then out.push(path)
+
+    for i in 0..<here.subs.len()
+        val sub = here.subs.at(i)
+
+        if !skipped_at_root(dir, sub.0)
+            var below: Buf[string] = buf()
+
+            for k in 0..<dir.len()
+                below.push(dir.at(k))
+
+            below.push(basename(sub.0))
+            walk_stray_c(sub.0, below, os, sub.1, out)?
+        end if
+
+    Ok(())
+end walk_stray_c
+
 // The root's `examples/` and `vendor/` are left out, and the `dir.is_empty()` test is what makes it
 // the *root's* one: everywhere else the name is ordinary.
 private skipped_at_root(dir: Buf[string], sub: string) -> bool
