@@ -91,6 +91,17 @@ library_fingerprint(files: Buf[(string, string)]) -> string
     hex_lower(avalanche(h), 16)
 end library_fingerprint
 
+// The same hash over raw bytes rather than over text -- for a file that is not source, where there
+// are no code units to agree with the reference about and a byte is the unit that changes.
+bytes_fingerprint(bytes: []const u8) -> string
+    var h: u64 = 0xcbf29ce484222325
+
+    for i in 0..<bytes.len
+        h = fnv_unit(h, u64(bytes[i]))
+
+    hex_lower(avalanche(h), 16)
+end bytes_fingerprint
+
 private fnv_text(start: u64, text: string) -> u64
     var h = start
 
@@ -164,7 +175,10 @@ end cache_directory
 // library gets a different path rather than a stale hit. That half alone is not enough, and the way
 // it is not enough is quiet: an artifact is *compiled* code, so a release that changes what the
 // library lowers to while touching none of its source produces different bytes at an identical
-// fingerprint, and the upgrade would read back the artifact its predecessor built.
+// fingerprint, and the upgrade would read back the artifact its predecessor built. **The compiler is
+// named by version AND by build** (`compiler_identity`), since a development tree changes the lowering
+// under one version: keyed on the version alone, every build linked the archive the first build of
+// that version had made.
 //
 // **The key names the TARGET too**, because an artifact is object code for one machine and a tree
 // parsed as that machine sees it -- and the ALLOCATOR, because the object half calls the pair by
@@ -181,7 +195,7 @@ end cache_directory
 // cache directory is for -- everything under it is derived, so removing the lot costs a rebuild.
 std_artifact_path(t: Target, fingerprint: string,
                   level: string = DefaultOptimization) -> string = cache_directory() match
-    Some(dir) -> s"$dir/sysl/${Version}-$fingerprint-${t.name}-${malloc_symbol()}-${free_symbol()}" +
+    Some(dir) -> s"$dir/sysl/${compiler_identity()}-$fingerprint-${t.name}-${malloc_symbol()}-${free_symbol()}" +
         s"-O$level/std$SyslibExtension"
     None -> std_artifact_local()
 

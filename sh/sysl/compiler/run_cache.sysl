@@ -20,9 +20,12 @@ import sysl.text.{from_utf8_unchecked, join, split, str_builder, StrBuilder}
 // rebuilding: everything that can reach the bytes is in the key, and anything that cannot be
 // established cheaply is a miss rather than a guess.
 //
-//   - the **compiler**, by version -- an executable is compiled code, so a release that changes what
-//     a program lowers to while touching none of its source produces different bytes at an identical
-//     fingerprint. It is the same reason the standard module's own artifact is keyed by version.
+//   - the **compiler**, by version and by build (`compiler_identity`) -- an executable is compiled
+//     code, so a release that changes what a program lowers to while touching none of its source
+//     produces different bytes at an identical fingerprint. It is the same reason the standard
+//     module's own artifact is keyed by it. The build is there for a development tree, which changes
+//     the compiler under one version: keyed on the version alone, a fresh build or a stage two
+//     replayed what an earlier build had cached for an identical tree.
 //   - the **target**, the **allocating pair** and the **optimization** level, each of which changes
 //     what is emitted, and the **`--cc`** a reader named, which is a different compiler.
 //   - what the target **provides** -- the capabilities `package.hocon` leaves it -- which decides
@@ -44,17 +47,23 @@ import sysl.text.{from_utf8_unchecked, join, split, str_builder, StrBuilder}
 //
 // ==What it does not cover, stated rather than hidden==
 //
-// A **development tree**, where the compiler changes under a version that stands still. Nothing in a
-// cache can tell those apart without hashing the compiler itself, and it is the same hole the
-// standard module's artifact has and names. `SYSL_NO_CACHE` is the escape hatch. An **`#include`d
-// header** outside the trees this reads is the other, and has the same answer.
+// An **`#include`d header** outside the trees this reads. `SYSL_NO_CACHE` is the escape hatch.
 //
 // **`sysl build` never consults this**, which is the reference's rule and not an omission here: a
 // build writes a binary somebody named and is expected to have built it.
 
-// The variable that turns the cache off. It is for working **on the compiler**, where the version in
-// the key stands still while the bytes it produces do not.
+// The variable that turns the cache off -- for timing a compilation, or for anything that reaches the
+// bytes and is outside what the key covers (an `#include`d header, above).
 private const CacheOff: string = "SYSL_NO_CACHE"
+
+// A directory a test keeps its entries in, in place of the machine's cache. Empty is none.
+private var run_cache_home: string = ""
+
+// Keep the cache's entries under `dir` rather than the machine's cache directory, or go back to the
+// machine's with `None` -- so a test can seed and read a cache of its own without touching anybody
+// else's entries.
+use_run_cache_dir(dir: Option[string])
+    run_cache_home = dir.unwrap_or("")
 
 // How many entries a program's cache holds before eviction is considered at all.
 //
@@ -105,7 +114,12 @@ run_cache_parts(command: string, path: string, t: Target, level: string,
     var parts: Buf[string] = buf()
 
     parts.push(command)
-    parts.push(Version)
+
+    // A build this machine will not name is every build of this version at once, which is the stale
+    // key this part exists to remove -- so it is a miss rather than a guess.
+    if !compiler_build_known() then return Err(Refusal("this compiler cannot say which build it is"))
+
+    parts.push(compiler_identity())
     parts.push(t.name)
     parts.push(allocator_pair())
     parts.push(level)
@@ -257,6 +271,7 @@ end build_environment
 // were no cache.
 private run_cache_slot(key: string) -> Option[string]
     if env_var(CacheOff).unwrap_or("") != "" then return None
+    if run_cache_home != "" then return Some(s"$run_cache_home/sysl/run/$key")
 
     cache_directory() match
         Some(dir) -> Some(s"$dir/sysl/run/$key")
