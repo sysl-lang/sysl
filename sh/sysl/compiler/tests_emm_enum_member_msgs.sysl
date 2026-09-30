@@ -1,0 +1,175 @@
+module sh.sysl.compiler
+@tests
+
+// What an enum's body says about two lines that are nearly a variant: one whose name is a reserved
+// word, and one whose payload bracket never closes. Every expected message and position here is what
+// the reference compiler answers for the same text.
+
+// The complaint and where it points, as one string; empty where the text parses.
+private emm_said(text: string) -> string
+    val said = pf_err(text)
+
+    if said == "" then "" else s"${said} @ t.sysl:${pf_at(text)}"
+
+// The refusal of `w` as a member's name, at `at`.
+private emm_reserved(w: string, at: string) -> string =
+    s"'${w}' is a reserved word, so it cannot stand as a member's name — write it '`${w}`' if that is the name you want, which is what the backticks are for: a quoted word is an ordinary name wherever one may be written @ t.sysl:${at}"
+
+// The refusal of an `override` written outside an `impl` block, at `at`.
+private emm_override(at: string) -> string =
+    s"'override' says a member replaces a body its trait supplied, and it is written on that member inside the 'impl' block — a trait's own member is where a default is written rather than replaced, and a member of a type's body implements no trait @ t.sysl:${at}"
+
+// The words that open no member line of their own, so that one standing bare is a missing name.
+private emm_plain_words() -> [25]string = ["val", "var", "type", "struct", "enum", "const", "ref", "if",
+    "match", "for", "while", "return", "import", "module", "trait", "impl", "self", "true", "false",
+    "null", "loop", "in", "else", "then", "do"]
+
+@test("a reserved word as a variant's name is refused with the backticks that would let it stand")
+emm_a_reserved_word_as_a_variants_name()
+    assert_eq(emm_said("enum E\n    val(int)\n"), emm_reserved("val", "2:5"))
+    assert_eq(emm_said("enum E\n    val(x: int)\n    B\n"), emm_reserved("val", "2:5"))
+
+@test("every reserved word with a payload is refused so, on the first line and on a later one")
+emm_every_reserved_word_with_a_payload()
+    for w in emm_plain_words()
+        assert_eq(emm_said(s"enum E\n    ${w}(x: int)\n    B\n"), emm_reserved(w, "2:5"))
+        assert_eq(emm_said(s"enum E\n    A\n    ${w}(x: int)\n"), emm_reserved(w, "3:5"))
+
+    for w in ["static", "private", "override"]
+        assert_eq(emm_said(s"enum E\n    ${w}(x: int)\n    B\n"), emm_reserved(w, "2:5"))
+        assert_eq(emm_said(s"enum E\n    A\n    ${w}(x: int)\n"), emm_reserved(w, "3:5"))
+end emm_every_reserved_word_with_a_payload
+
+@test("whatever the brackets after the reserved word hold, and whatever the line goes on as")
+emm_whatever_follows_the_reserved_word()
+    assert_eq(emm_said("enum E\n    val([]u8)\n"), emm_reserved("val", "2:5"))
+    assert_eq(emm_said("enum E\n    val()\n    B\n"), emm_reserved("val", "2:5"))
+    assert_eq(emm_said("enum E\n    val(x: int\n    B\n"), emm_reserved("val", "2:5"))
+    assert_eq(emm_said("enum E\n    val([]u8\n    B\n"), emm_reserved("val", "2:5"))
+    assert_eq(emm_said("enum E\n    val[T](x: T)\n"), emm_reserved("val", "2:5"))
+    assert_eq(emm_said("enum E\n    override[T](x: T)\n"), emm_reserved("override", "2:5"))
+    assert_eq(emm_said("enum E\n    val -> int = 1\n"), emm_reserved("val", "2:5"))
+    assert_eq(emm_said("enum E\n    val(self) -> int = 1\n"), emm_reserved("val", "2:5"))
+end emm_whatever_follows_the_reserved_word
+
+// Bare, or with a value pinned to it, the word has nothing after it that says it was meant as a
+// name: on the body's first line a name is what is missing, and on a later one the body has ended.
+@test("a reserved word standing bare or with a value is a missing name, and past the first line a missing dedent")
+emm_a_bare_reserved_word()
+    for w in emm_plain_words()
+        assert_eq(emm_said(s"enum E\n    ${w}\n    B\n"), "identifier expected @ t.sysl:2:5")
+        assert_eq(emm_said(s"enum E\n    ${w} = 3\n    B\n"), "identifier expected @ t.sysl:2:5")
+        assert_eq(emm_said(s"enum E\n    A\n    ${w}\n"), "dedent expected @ t.sysl:3:5")
+
+    assert_eq(emm_said("enum E\n    val: int\n"), "identifier expected @ t.sysl:2:5")
+end emm_a_bare_reserved_word
+
+@test("a visibility or 'static' with no name after it is owed the name, where the line ends")
+emm_a_bare_visibility()
+    assert_eq(emm_said("enum E\n    static\n    B\n"), "identifier expected @ t.sysl:2:11")
+    assert_eq(emm_said("enum E\n    private\n    B\n"), "identifier expected @ t.sysl:2:12")
+    assert_eq(emm_said("enum E\n    static = 3\n    B\n"), "identifier expected @ t.sysl:2:12")
+    assert_eq(emm_said("enum E\n    private = 3\n    B\n"), "identifier expected @ t.sysl:2:13")
+    assert_eq(emm_said("enum E\n    A\n    static\n"), "identifier expected @ t.sysl:4:1")
+    assert_eq(emm_said("enum E\n    A\n    private\n"), "identifier expected @ t.sysl:4:1")
+end emm_a_bare_visibility
+
+@test("'override' in an enum's body is refused as the word it is, at what it was written in front of")
+emm_override_in_an_enum()
+    assert_eq(emm_said("enum E\n    override\n    B\n"), emm_override("2:13"))
+    assert_eq(emm_said("enum E\n    override = 3\n    B\n"), emm_override("2:14"))
+    assert_eq(emm_said("enum E\n    A\n    override\n"), emm_override("4:1"))
+    assert_eq(emm_said("enum E\n    override f(self) -> int = 1\n"), emm_override("2:14"))
+    assert_eq(emm_said("enum E\n    A\n    override f(self) -> int = 1\n"), emm_override("3:14"))
+end emm_override_in_an_enum
+
+@test("and in a struct's body and a trait's the same refusal sits in the same place")
+emm_override_in_a_struct_and_a_trait()
+    assert_eq(emm_said("struct S\n    x: int\n    override f(self) -> int = 1\n"), emm_override("3:14"))
+    assert_eq(emm_said("struct S\n    x: int\n    override\n"), emm_override("4:1"))
+    assert_eq(emm_said("struct S\n    override\n    x: int\n"), emm_override("2:13"))
+    assert_eq(emm_said("trait T\n    override f(self) -> int\n"), emm_override("2:14"))
+
+@test("a reserved word in backticks is a variant's name, bare, with a payload and with a value")
+emm_a_quoted_reserved_word_is_a_name()
+    assert_eq(emm_said("enum E\n    `val`\n    B\n"), "")
+    assert_eq(emm_said("enum E\n    `val`(x: int)\n    B\n"), "")
+    assert_eq(emm_said("enum E\n    `val` = 3\n    B\n"), "")
+
+@test("a word that is reserved nowhere is a variant's name as it stands")
+emm_a_soft_word_is_a_name()
+    for w in ["fn", "end", "invariant", "where", "is"]
+        assert_eq(emm_said(s"enum E\n    ${w}\n    B\n"), "")
+        assert_eq(emm_said(s"enum E\n    ${w}(x: int)\n    B\n"), "")
+        assert_eq(emm_said(s"enum E\n    ${w} = 3\n    B\n"), "")
+
+@test("a reserved word as a payload's field name is refused as a field's name, at the field")
+emm_a_reserved_field_name()
+    assert_eq(emm_said("enum E\n    A(val: int)\n"),
+        "'val' is a reserved word, so it cannot stand as a parameter's name or a field's — write it '`val`' if that is the name you want, which is what the backticks are for: a quoted word is an ordinary name wherever one may be written @ t.sysl:2:7")
+
+// -- the bracket that never closes ------------------------------------------------------------------
+
+@test("a bare type the payload bracket never closes after is owed its comma, where the next line begins")
+emm_an_unclosed_bare_type()
+    assert_eq(emm_said("enum E\n    A([]u8\n    B\n"), "',' expected @ t.sysl:3:5")
+
+@test("whatever the type is written as, and on whichever line the variant sits")
+emm_an_unclosed_bare_type_of_any_shape()
+    for t in ["[]u8", "[4]u8", "*u8", "&T", "weak T", "(int, int)", "Buf[int]", "m.T", "Fn(int) -> int"]
+        assert_eq(emm_said(s"enum E\n    A(${t}\n    B\n"), "',' expected @ t.sysl:3:5")
+
+    assert_eq(emm_said("enum E[T]\n    A([]T\n    B\n"), "',' expected @ t.sysl:3:5")
+    assert_eq(emm_said("enum E\n    Z\n    A([]u8\n    B\n"), "',' expected @ t.sysl:4:5")
+    assert_eq(emm_said("enum E\n    A([]u8\n    f(self) -> int = 1\n"), "',' expected @ t.sysl:3:5")
+    assert_eq(emm_said("enum E\n    A([]u8 x)\n    B\n"), "',' expected @ t.sysl:2:12")
+end emm_an_unclosed_bare_type_of_any_shape
+
+@test("a named field the bracket never closes after is owed the bracket")
+emm_an_unclosed_named_field()
+    assert_eq(emm_said("enum E\n    A(x: []u8\n    B\n"), "')' expected @ t.sysl:3:5")
+    assert_eq(emm_said("enum E\n    A(x: int\n    B\n"), "')' expected @ t.sysl:3:5")
+    assert_eq(emm_said("enum E\n    Z\n    A(x: []u8\n    B\n"), "')' expected @ t.sysl:4:5")
+    assert_eq(emm_said("enum E\n    A(*self\n    B\n"), "')' expected @ t.sysl:3:5")
+
+// A lone name is a field as much as it is a type, so the next line's first word is where its colon
+// was owed; and the name the next line opens with is read as a field where a comma or the bracket
+// itself left one owed.
+@test("a lone name in an unclosed bracket is a field missing its colon")
+emm_an_unclosed_lone_name()
+    assert_eq(emm_said("enum E\n    A(int\n    B\n"), "':' expected @ t.sysl:3:5")
+    assert_eq(emm_said("enum E\n    A(x: int, y\n    B\n"), "':' expected @ t.sysl:3:5")
+    assert_eq(emm_said("enum E\n    A(x: int,\n    B\n"), "':' expected @ t.sysl:4:1")
+    assert_eq(emm_said("enum E\n    A(\n    B\n"), "':' expected @ t.sysl:4:1")
+
+@test("a type argument list left open is owed its own bracket before the payload's")
+emm_an_unclosed_type_argument()
+    assert_eq(emm_said("enum E\n    A(x: Buf[int\n    B\n"), "']' expected @ t.sysl:3:5")
+    assert_eq(emm_said("enum E\n    A(Buf[int\n    B\n"), "']' expected @ t.sysl:3:5")
+    assert_eq(emm_said("enum E\n    A([]Buf[int\n    B\n"), "']' expected @ t.sysl:3:5")
+    assert_eq(emm_said("enum E\n    A([4\n    B\n"), "']' expected @ t.sysl:3:5")
+
+@test("and at the end of the file each is owed the same thing, where the file ends")
+emm_unclosed_at_the_end_of_the_file()
+    assert_eq(emm_said("enum E\n    A([]u8\n"), "',' expected @ t.sysl:3:1")
+    assert_eq(emm_said("enum E\n    A(x: []u8\n"), "')' expected @ t.sysl:3:1")
+    assert_eq(emm_said("enum E\n    A(x: Buf[int\n"), "']' expected @ t.sysl:3:1")
+    assert_eq(emm_said("enum E\n    A([]u8"), "',' expected @ t.sysl:2:11")
+    assert_eq(emm_said("enum E\n    A(x: []u8"), "')' expected @ t.sysl:2:14")
+    assert_eq(emm_said("enum E\n    A(x: Buf[int"), "']' expected @ t.sysl:2:17")
+    assert_eq(emm_said("enum E\n    A("), "')' expected @ t.sysl:2:7")
+end emm_unclosed_at_the_end_of_the_file
+
+// A comma may trail the last field, so what follows one is a field only where it could name one.
+@test("after a comma, what cannot name a field is where the bracket should have closed")
+emm_after_a_comma()
+    assert_eq(emm_said("enum E\n    A(x: int, []u8\n    B\n"), "')' expected @ t.sysl:2:15")
+    assert_eq(emm_said("enum E\n    A(x: int, 3)\n    B\n"), "')' expected @ t.sysl:2:15")
+    assert_eq(emm_said("enum E\n    A(x: int, )\n    B\n"), "")
+
+@test("a member's receiver is still a receiver, and a struct's member line is read as it was")
+emm_receivers_and_structs_are_unchanged()
+    assert_eq(emm_said("enum E\n    A\n    f(&sync self) -> int = 1\n"), "")
+    assert_eq(emm_said("enum E\n    A\n    f(*self, x: int) -> int = 1\n"), "")
+    assert_eq(emm_said("enum E\n    A\n    f(&self) -> int = 1\n"), "")
+    assert_eq(emm_said("struct S\n    x: int\n    f([]u8\n    y: int\n"), "')' expected @ t.sysl:3:7")
