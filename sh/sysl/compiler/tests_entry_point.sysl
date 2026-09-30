@@ -314,15 +314,46 @@ ent_a_list_it_reads()
     ent_refused(ent_ran("main(args: []string, ...)\n    print(args.len)\n"),
                 "'main' is called with the arguments the platform has, not a list it reads", "main.sysl:1:1")
 
-// The reference reports the second file's module line at the root as well; the claim is the second
-// `main`, which is refused on its own whatever else is wrong with the tree.
+// The reference's case writes both files at the root, where a built tree also refuses `module lib`
+// for sitting outside its directory; here the module is in its own directory, so the second `main`
+// is the one thing wrong with the tree.
 @test("a second main, in a module of its own")
 ent_a_second_main_in_a_module()
     if xvr_no_library() then return
 
-    ent_refused(ent_ran_of([("a.sysl", "main()\n    print(\"a\")\n"),
-                            ("b.sysl", "module lib\n\nmain()\n    print(\"b\")\n")]),
-                "'main' is where a program starts, so there is one — main already declares it", "b.sysl:3:1")
+    val said = ent_ran_of([("a.sysl", "main()\n    print(\"a\")\n"),
+                           ("lib/b.sysl", "module lib\n\nmain()\n    print(\"b\")\n")])
+
+    ent_refused(said, "'main' is where a program starts, so there is one — main already declares it",
+                "lib/b.sysl:3:1")
+    assert_eq(ent_errors(said), 1)
+end ent_a_second_main_in_a_module
+
+// An `extern` may not take the name however it is written: with no link name, and inside a module.
+@test("an extern named main with no link name is refused for the name")
+ent_fix_extern_named_main_unlinked()
+    if xvr_no_library() then return
+
+    val said = ent_ran("extern main(s: *u8) -> int\n\nprint(1)\n")
+
+    ent_refused(said, "'main' is where a program starts, so it is not a name an 'extern' may take", "main.sysl:1:1")
+    assert_eq(ent_errors(said), 1)
+end ent_fix_extern_named_main_unlinked
+
+@test("an extern named main inside a module is refused for the name")
+ent_fix_extern_named_main_in_a_module()
+    if xvr_no_library() then return
+
+    ent_refused(ent_ran_of([("main.sysl", "import m\nprint(1)\n"),
+                            ("m/m.sysl", "module m\n\nextern \"puts\" main(s: *u8) -> int\n")]),
+                "'main' is where a program starts, so it is not a name an 'extern' may take", "m/m.sysl:3:1")
+
+// A `var` beside a `main` in a file with no `module` line, where the functions reach it by name.
+@test("a typed var beside main is module storage a nested reading would not reach")
+ent_fix_var_beside_main_is_storage()
+    if xvr_no_library() then return
+
+    assert_eq(ent_ran("var hits: int = 1\n\nmain()\n    hits += 2\n    print(hits)\n"), "3\n")
 
 @test("an extern that links to the symbol")
 ent_an_extern_linking_to_main()
@@ -345,13 +376,14 @@ ent_an_extern_named_main()
 // directly on a vector built here. `0xC3` opens a two-byte sequence and `0x28` cannot continue one.
 private ent_bad() -> string = "var run: [3]u8 = [0xC3u8, 0x28u8, 0u8]\nvar vec: [1]*u8 = [&run[0]]\n"
 
-// A panic's message goes to the error stream and the status is not zero.
+// A panic's message is printed on the output stream, as the reference's run prints it, and the
+// status is not zero.
 private ent_panics(text: string, message: string)
     ent_status(ent_one(text)) match
         None -> assert(false, ent_ran(text))
         Some(out) ->
             assert(!out.status.ok(), out.text)
-            assert(out.err.unwrap_or("").contains(message), out.err.unwrap_or(""))
+            assert(out.text.contains(message), out.text)
 end ent_panics
 
 @test("with the offset of the byte that made it ill-formed")
