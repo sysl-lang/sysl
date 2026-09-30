@@ -1,0 +1,582 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.Buf
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+
+// **A program of more than one module, and the fully-qualified path that reaches into one.**
+//
+// A public member is reachable by its module path with no import at all -- an import only shortens
+// the reference -- so this is the whole of cross-module access: what a path reaches, what two
+// modules may each call their own, and what a module may not see.
+//
+// Every case is a tree of files, a module being a directory, and what is asserted is what the built
+// program prints and the status it leaves, or what the build refused it with. **Each expected output
+// and each refusal was obtained by running the reference compiler on the same tree.**
+
+private mmd_one(main: string, mod: string, file: string, text: string) -> Buf[(string, string, string)]
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    fs.push((mod, file, text))
+    fs
+end mmd_one
+
+private mmd_two(main: string, a: (string, string, string),
+                b: (string, string, string)) -> Buf[(string, string, string)]
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    fs.push(a)
+    fs.push(b)
+    fs
+end mmd_two
+
+// What the program prints with the status it exited under after it, or what the build said instead.
+// The status is part of the answer: a program that prints the right line and then traps has not run.
+private mmd_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true, 20000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Exited(code) -> out.text + "[exit " + str(code) + "]"
+            _ -> out.text + "[did not exit]"
+end mmd_out
+
+// A refusal is its message and where it points. The tree is written under a temporary directory, so
+// the path is asserted on either side of that directory's name.
+private mmd_refused(said: string, message: string, at: string)
+    assert(said.contains("error: " + message + "\n --> "), said)
+    assert(said.contains(at + "\n"), said)
+
+private mmd_point() -> string = "module geom\nstruct Point\n    x: int\n    y: int"
+
+private mmd_shape() -> string = "module geom\nenum Shape\n    Dot\n    Round(r: int)"
+
+private mmd_show() -> string = "module fmt\ntrait Show\n    show(self) -> int"
+
+// A trait whose default calls a function of the trait's own module.
+private mmd_show_default() -> string =
+    "module fmt\nhelper(n: int) -> int = n * 2\ntrait Show\n    raw(self) -> int\n" +
+    "    show(self) -> int = helper(self.raw())"
+
+private mmd_color() -> string = "module geom\nenum Color\n    Red\n    Green"
+
+// -- a module path reaches ---------------------------------------------------------------------------
+
+@test("a module path reaches a function")
+mmd_a_path_reaches_a_function()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("print(geom.twice(21))", "geom", "g.sysl",
+                              "module geom\ntwice(n: int) -> int = n * 2")), "42\n[exit 0]")
+
+@test("a module path reaches a type, written where a type is asked for")
+mmd_a_path_reaches_a_type()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("var p: geom.Point = geom.Point(3, 4)\nprint(p.x + p.y)", "geom", "g.sysl",
+                              mmd_point())), "7\n[exit 0]")
+
+@test("a module path reaches a method, which the receiver's own type finds without being told")
+mmd_a_path_reaches_a_method()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("print(geom.Point(3, 4).norm())", "geom", "g.sysl",
+                              mmd_point() + "\n\n    norm(self) -> int = self.x + self.y")), "7\n[exit 0]")
+
+@test("a module path reaches an associated function")
+mmd_a_path_reaches_an_associated_function()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("print(geom.Point.zero().x)", "geom", "g.sysl",
+                              mmd_point() + "\n\n    zero() -> Point = Point(0, 0)")), "0\n[exit 0]")
+
+@test("a module path reaches an enum variant, through its enum")
+mmd_a_path_reaches_a_variant()
+    if im_can_run() then return
+
+    val main = "var s: geom.Shape = geom.Shape.Round(7)\ns match\n    Dot -> print(0)\n    Round(r) -> print(r)"
+
+    assert_eq(mmd_out(mmd_one(main, "geom", "g.sysl", mmd_shape())), "7\n[exit 0]")
+end mmd_a_path_reaches_a_variant
+
+@test("a module path reaches a nullary variant just as directly")
+mmd_a_path_reaches_a_nullary_variant()
+    if im_can_run() then return
+
+    val main = "var s: geom.Shape = geom.Shape.Dot\ns match\n    Dot -> print(0)\n    Round(r) -> print(r)"
+
+    assert_eq(mmd_out(mmd_one(main, "geom", "g.sysl", mmd_shape())), "0\n[exit 0]")
+end mmd_a_path_reaches_a_nullary_variant
+
+// A pattern names a variant of the scrutinee's own enum, so the module the enum came from is already
+// settled by the value being matched and needs no repeating. Both arms are taken here, one value each.
+@test("and a match on a foreign enum names its variants unqualified")
+mmd_a_match_names_variants_unqualified()
+    if im_can_run() then return
+
+    val main = "var s: geom.Shape = geom.Shape.Round(7)\nvar t: geom.Shape = geom.Shape.Dot\n" +
+               "s match\n    Dot -> print(0)\n    Round(r) -> print(r)\n" +
+               "t match\n    Dot -> print(0)\n    Round(r) -> print(r)"
+
+    assert_eq(mmd_out(mmd_one(main, "geom", "g.sysl", mmd_shape())), "7\n0\n[exit 0]")
+end mmd_a_match_names_variants_unqualified
+
+@test("a module path reaches a trait, as a bound")
+mmd_a_path_reaches_a_trait_as_a_bound()
+    if im_can_run() then return
+
+    val main = "loud[T: fmt.Show](x: T) -> int = x.show()\nprint(loud(Tag(5)))\n" +
+               "struct Tag\n    n: int\nimpl fmt.Show for Tag\n    show(self) -> int = self.n * 2"
+
+    assert_eq(mmd_out(mmd_one(main, "fmt", "f.sysl", mmd_show())), "10\n[exit 0]")
+end mmd_a_path_reaches_a_trait_as_a_bound
+
+@test("a module path reaches a trait, as an object")
+mmd_a_path_reaches_a_trait_as_an_object()
+    if im_can_run() then return
+
+    val main = "var s: &fmt.Show = Tag(5)\nprint(s.show())\n" +
+               "struct Tag\n    n: int\nimpl fmt.Show for Tag\n    show(self) -> int = self.n * 2"
+
+    assert_eq(mmd_out(mmd_one(main, "fmt", "f.sysl", mmd_show())), "10\n[exit 0]")
+end mmd_a_path_reaches_a_trait_as_an_object
+
+@test("a module path reaches a generic, instantiated from where it was named")
+mmd_a_path_reaches_a_generic()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("print(box.first(box.Pair(7, 9)))", "box", "b.sysl",
+                              "module box\nstruct Pair[T]\n    a: T\n    b: T\nfirst[T](p: Pair[T]) -> T = p.a")),
+              "7\n[exit 0]")
+end mmd_a_path_reaches_a_generic
+
+@test("a module path reaches however many segments the path has")
+mmd_a_path_of_many_segments()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("print(a.b.c.deep(1))", "a.b.c", "d.sysl",
+                              "module a.b.c\ndeep(n: int) -> int = n + 41")), "42\n[exit 0]")
+
+// A module `a` and a module `a.b` may both exist, so the prefix has to be the longest one that names
+// a module -- otherwise `a.b.f` would be read as `a`'s `b`, which is a field of nothing.
+@test("and the longest prefix that names a module wins")
+mmd_the_longest_module_prefix_wins()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_two("print(a.b.f())", ("a", "x.sysl", "module a\ng() -> int = 1"),
+                              ("a.b", "y.sysl", "module a.b\nf() -> int = 2"))), "2\n[exit 0]")
+
+// -- two modules may each declare --------------------------------------------------------------------
+
+@test("two modules may each declare a type of the same name")
+mmd_two_modules_one_type_name()
+    if im_can_run() then return
+
+    val main = "var p: geom.Point = geom.Point(3)\nvar q: text.Point = text.Point(4)\nprint(p.x + q.x)"
+
+    assert_eq(mmd_out(mmd_two(main, ("geom", "g.sysl", "module geom\nstruct Point\n    x: int"),
+                              ("text", "t.sysl", "module text\nstruct Point\n    x: int"))), "7\n[exit 0]")
+end mmd_two_modules_one_type_name
+
+@test("two modules may each declare a function of the same name, emitted under distinct symbols")
+mmd_two_modules_one_function_name()
+    if im_can_run() then return
+
+    val out = im_ir(mmd_two("print(geom.size() + text.size())",
+                            ("geom", "g.sysl", "module geom\nsize() -> int = 3"),
+                            ("text", "t.sysl", "module text\nsize() -> int = 4")))
+
+    assert(out.contains("define i32 @geom$size()"), out)
+    assert(out.contains("define i32 @text$size()"), out)
+end mmd_two_modules_one_function_name
+
+// Variant names are unique within a module rather than across the program, since a bare `Round(…)` is
+// resolved against the module it is written in.
+@test("two modules may each declare an enum variant of the same name")
+mmd_two_modules_one_variant_name()
+    if im_can_run() then return
+
+    val main = "var a: geom.Shape = geom.Shape.Round(1)\nvar b: text.Glyph = text.Glyph.Round(2)\n" +
+               "a match\n    Round(r) -> print(r)\nb match\n    Round(r) -> print(r)"
+
+    assert_eq(mmd_out(mmd_two(main, ("geom", "g.sysl", "module geom\nenum Shape\n    Round(r: int)"),
+                              ("text", "t.sysl", "module text\nenum Glyph\n    Round(r: int)"))),
+              "1\n2\n[exit 0]")
+end mmd_two_modules_one_variant_name
+
+@test("and a member of the same name on each of their types")
+mmd_two_modules_one_member_name()
+    if im_can_run() then return
+
+    val geom = "module geom\nstruct Point\n    x: int\n\n    size(self) -> int = self.x"
+    val text = "module text\nstruct Point\n    x: int\n\n    size(self) -> int = self.x * 2"
+
+    assert_eq(mmd_out(mmd_two("print(geom.Point(3).size() + text.Point(4).size())", ("geom", "g.sysl", geom),
+                              ("text", "t.sysl", text))), "11\n[exit 0]")
+end mmd_two_modules_one_member_name
+
+// -- what a module can see ---------------------------------------------------------------------------
+
+// The library is in scope everywhere with no import; nothing else is.
+@test("a module can see the library, wherever it is written")
+mmd_a_module_sees_the_library()
+    if im_can_run() then return
+
+    val m = "module m\nlabel(n: int) -> string =\n    var o: Option[int] = Some(n)\n" +
+            "    o match\n        Some(v) -> str(v)\n        None -> \"-\""
+
+    assert_eq(mmd_out(mmd_one("print(m.label(2))", "m", "a.sysl", m)), "2\n[exit 0]")
+end mmd_a_module_sees_the_library
+
+@test("a module can see its own declarations, unqualified")
+mmd_a_module_sees_its_own()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("print(m.outer())", "m", "a.sysl",
+                              "module m\ninner() -> int = 5\nouter() -> int = inner() * 2")), "10\n[exit 0]")
+
+@test("a module can see its own declarations across its own files, unqualified")
+mmd_a_module_sees_its_own_across_files()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_two("print(m.outer())", ("m", "a.sysl", "module m\nouter() -> int = inner() * 2"),
+                              ("m", "b.sysl", "module m\ninner() -> int = 5"))), "10\n[exit 0]")
+
+// A module earns visibility by being named, and the root module has no name -- so its declarations
+// are its own files' to use and nothing else can reach them.
+@test("and not the root module, which has no name to be reached through")
+mmd_a_module_does_not_see_the_root()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_one("helper() -> int = 1\nprint(m.f())", "m", "a.sysl",
+                               "module m\nf() -> int = helper()"))
+
+    mmd_refused(said, "undefined function 'helper'", "/m/a.sysl:2:14")
+end mmd_a_module_does_not_see_the_root
+
+@test("nor a sibling module's names unqualified")
+mmd_a_module_does_not_see_a_siblings_names()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_two("print(m.f())", ("m", "a.sysl", "module m\nf() -> int = other()"),
+                               ("other", "b.sysl", "module other\nother() -> int = 1")))
+
+    mmd_refused(said, "undefined function 'other'", "/m/a.sysl:2:14")
+end mmd_a_module_does_not_see_a_siblings_names
+
+@test("nor a sibling module's types unqualified")
+mmd_a_module_does_not_see_a_siblings_types()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_two("print(1)", ("m", "a.sysl", "module m\nf(p: Point) -> int = p.x"),
+                               ("geom", "b.sysl", "module geom\nstruct Point\n    x: int")))
+
+    mmd_refused(said, "unknown type 'Point'", "/m/a.sysl:2:6")
+end mmd_a_module_does_not_see_a_siblings_types
+
+// -- a local binding shadows a module name -----------------------------------------------------------
+
+// Resolution is innermost-first, so a value bound to `geom` makes `geom.v` the field read it looks
+// like -- which is also why the module graph cannot come from a textual scan.
+@test("a local binding shadows a module name, so a dotted reference off it is a field read")
+mmd_a_binding_shadows_a_module()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("struct Holder\n    v: int\nvar geom = Holder(9)\nprint(geom.v)", "geom", "g.sysl",
+                              "module geom\nv() -> int = 1")), "9\n[exit 0]")
+
+@test("and the module is still reachable where nothing shadows it")
+mmd_a_module_is_reachable_outside_the_shadow()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("shadowed() -> int =\n    var geom = 1\n    geom\nprint(shadowed() + geom.v())",
+                              "geom", "g.sysl", "module geom\nv() -> int = 41")), "42\n[exit 0]")
+
+// -- a path that names nothing -----------------------------------------------------------------------
+
+@test("a path that names nothing in a module that exists is reported against the name")
+mmd_a_path_naming_nothing()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_one("print(geom.nope())", "geom", "g.sysl", "module geom\nf() -> int = 1"))
+
+    mmd_refused(said, "undefined function 'geom.nope'", "/main.sysl:1:12")
+end mmd_a_path_naming_nothing
+
+@test("and a prefix that is no module at all is read as a value")
+mmd_a_prefix_that_is_no_module()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_one("print(nowhere.f())", "geom", "g.sysl", "module geom\nf() -> int = 1"))
+
+    mmd_refused(said, "undefined name 'nowhere'", "/main.sysl:1:7")
+end mmd_a_prefix_that_is_no_module
+
+@test("a type reached through a module that has none of that name")
+mmd_a_type_a_module_does_not_have()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_one("var p: geom.Nope = 1", "geom", "g.sysl", "module geom\nstruct Point\n    x: int"))
+
+    mmd_refused(said, "unknown type 'geom.Nope'", "/main.sysl:1:8")
+end mmd_a_type_a_module_does_not_have
+
+@test("and a trait named where a type was asked for still says so")
+mmd_a_foreign_trait_where_a_type_was_asked_for()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_one("var s: fmt.Show = 1", "fmt", "f.sysl", mmd_show()))
+
+    mmd_refused(said, "'fmt.Show' is a trait, so it describes behaviour rather than a layout — write " +
+                      "'*fmt.Show' or '&fmt.Show' for a trait object, or bound a type parameter with " +
+                      "'[T: fmt.Show]'", "/main.sysl:1:8")
+end mmd_a_foreign_trait_where_a_type_was_asked_for
+
+// -- a diagnostic names a foreign declaration by the path a program would write ----------------------
+
+@test("a diagnostic names a foreign type by the path a program would write")
+mmd_a_diagnostic_names_a_foreign_type()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_one("var p: geom.Point = geom.Point(1, 2, 3)", "geom", "g.sysl", mmd_point()))
+
+    mmd_refused(said, "struct 'geom.Point' has 2 fields, but 3 values were given", "/main.sysl:1:26")
+end mmd_a_diagnostic_names_a_foreign_type
+
+@test("a diagnostic tells two modules' types of one name apart")
+mmd_a_diagnostic_tells_two_points_apart()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_two("var p: geom.Point = text.Point(1)",
+                               ("geom", "g.sysl", "module geom\nstruct Point\n    x: int"),
+                               ("text", "t.sysl", "module text\nstruct Point\n    x: int")))
+
+    mmd_refused(said, "cannot initialize 'p': declared geom.Point but the value is text.Point", "/main.sysl:1:1")
+end mmd_a_diagnostic_tells_two_points_apart
+
+@test("and a diagnostic names the bound a foreign trait supplies")
+mmd_a_diagnostic_names_a_foreign_bound()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_one("loud[T: fmt.Show](x: T) -> int = x.show()\nprint(loud(5))", "fmt", "f.sysl",
+                               mmd_show()))
+
+    mmd_refused(said, "'loud' requires its type parameter 'T' to implement 'fmt.Show', but int does not",
+                "/main.sysl:2:7")
+end mmd_a_diagnostic_names_a_foreign_bound
+
+// The bound a call would need is named the same way: it is advice to write a line, so it has to be
+// spelled the way that line would be written.
+@test("including the bound a call would have needed")
+mmd_a_diagnostic_names_the_bound_a_call_needs()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_one("loud[T](x: T) -> int = x.show()\nprint(1)", "fmt", "f.sysl", mmd_show()))
+
+    mmd_refused(said, "'show' needs 'T: fmt.Show'", "/main.sysl:1:26")
+end mmd_a_diagnostic_names_the_bound_a_call_needs
+
+@test("and the traits offering one, where several do")
+mmd_a_diagnostic_names_every_trait_offering()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_two("loud[T](x: T) -> int = x.show()\nprint(1)", ("fmt", "f.sysl", mmd_show()),
+                               ("txt", "t.sysl", "module txt\ntrait Render\n    show(self) -> int")))
+
+    mmd_refused(said, "'show' needs a bound on 'T' — it is declared by 'fmt.Show', 'txt.Render'",
+                "/main.sysl:1:26")
+end mmd_a_diagnostic_names_every_trait_offering
+
+// -- a pattern names a foreign type ------------------------------------------------------------------
+
+@test("a pattern names a foreign type by its path, in the named form")
+mmd_a_pattern_names_a_foreign_type()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("var p: geom.Point = geom.Point(3, 4)\np match\n    geom.Point{x} -> print(x)",
+                              "geom", "g.sysl", mmd_point())), "3\n[exit 0]")
+
+@test("and in the positional form")
+mmd_a_positional_pattern_names_a_foreign_type()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("var p: geom.Point = geom.Point(3, 4)\np match\n    geom.Point(x, y) -> print(x + y)",
+                              "geom", "g.sysl", mmd_point())), "7\n[exit 0]")
+
+@test("so the bare name does not match it")
+mmd_a_bare_pattern_does_not_match_a_foreign_type()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_one("var p: geom.Point = geom.Point(3, 4)\np match\n    Point{x} -> print(x)", "geom",
+                               "g.sysl", mmd_point()))
+
+    mmd_refused(said, "'Point{…}' does not match a geom.Point value", "/main.sysl:3:5")
+end mmd_a_bare_pattern_does_not_match_a_foreign_type
+
+// -- a body means what it meant where it was written -------------------------------------------------
+
+// The members an `impl` supplies are filed under the type it is for, which may be another module's --
+// so the module a name in one of those bodies resolves in travels with the body rather than being
+// read back off the key.
+@test("an 'impl' in one module for a type in another reads its own module's names")
+mmd_an_impl_reads_its_own_modules_names()
+    if im_can_run() then return
+
+    val fmt = "module fmt\ntrait Show\n    show(self) -> int\nstruct Tag\n    n: int\n" +
+              "impl Show for geom.Point\n    show(self) -> int = self.x + Tag(1).n\n" +
+              "render() -> int = geom.Point(4).show()"
+
+    assert_eq(mmd_out(mmd_two("print(fmt.render())", ("geom", "g.sysl", "module geom\nstruct Point\n    x: int"),
+                              ("fmt", "f.sysl", fmt))), "5\n[exit 0]")
+end mmd_an_impl_reads_its_own_modules_names
+
+// A default is copied into every implementing type, wherever those are, and its body is the trait's
+// source -- so it reads the trait's module even in a copy made for a foreign type. The `import` is
+// what lets `P(5).show()` be written at all: a member arrives with its trait.
+@test("and a trait's default reads the trait's module in every copy of it")
+mmd_a_default_reads_the_traits_module()
+    if im_can_run() then return
+
+    val main = "import fmt.Show\nstruct P\n    n: int\nimpl fmt.Show for P\n    raw(self) -> int = self.n\n" +
+               "print(P(5).show())"
+
+    assert_eq(mmd_out(mmd_one(main, "fmt", "f.sysl", mmd_show_default())), "10\n[exit 0]")
+end mmd_a_default_reads_the_traits_module
+
+// The receiver's type is the one part of such a copy that was not written in the trait: it came from
+// the `impl` block. On a generic subject it is kept as a reference and resolved again at each
+// instantiation, so it has to mean the same thing read from either of the two modules.
+@test("and the receiver's own type still means the module the 'impl' was written in")
+mmd_a_default_keeps_the_impls_receiver()
+    if im_can_run() then return
+
+    val main = "import fmt.Show\nstruct P[T]\n    v: T\nimpl[T] fmt.Show for P[T]\n    raw(self) -> int = 5\n" +
+               "print(P(1).show())"
+
+    assert_eq(mmd_out(mmd_one(main, "fmt", "f.sysl", mmd_show_default())), "10\n[exit 0]")
+end mmd_a_default_keeps_the_impls_receiver
+
+@test("however the 'impl' spelled it")
+mmd_a_default_keeps_a_qualified_receiver()
+    if im_can_run() then return
+
+    val box = "module box\nstruct P[T]\n    v: T\nimpl[T] fmt.Show for box.P[T]\n    raw(self) -> int = 5"
+
+    assert_eq(mmd_out(mmd_two("import fmt.Show\nprint(box.P(1).show())", ("box", "b.sysl", box),
+                              ("fmt", "f.sysl", mmd_show_default()))), "10\n[exit 0]")
+end mmd_a_default_keeps_a_qualified_receiver
+
+@test("and a generic type's bound on a foreign trait is met by the caller's own type")
+mmd_a_foreign_bound_met_by_the_callers_type()
+    if im_can_run() then return
+
+    val main = "print(box.Box(P(3)).get().n)\nstruct P\n    n: int\nimpl fmt.Show for P\n" +
+               "    show(self) -> int = self.n"
+    val box = "module box\nstruct Box[T: fmt.Show]\n    v: T\n\n    get(self) -> T = self.v"
+
+    assert_eq(mmd_out(mmd_two(main, ("fmt", "f.sysl", mmd_show()), ("box", "b.sysl", box))), "3\n[exit 0]")
+end mmd_a_foreign_bound_met_by_the_callers_type
+
+// -- what the module prefix does not reach -----------------------------------------------------------
+
+// An `extern`'s symbol names something the linker already has, which knows nothing about sysl's
+// modules -- so it is pinned to what was written while the name a program calls it by carries the
+// module like any other.
+@test("the module prefix does not reach an extern's symbol, which two modules may each declare")
+mmd_two_modules_one_extern()
+    if im_can_run() then return
+
+    val a = "module a\nextern abs(v: int) -> int\nn() -> int = abs(0 - 3)"
+    val b = "module b\nextern abs(v: int) -> int\nn() -> int = abs(0 - 4)"
+
+    assert_eq(mmd_out(mmd_two("print(a.n() + b.n())", ("a", "a.sysl", a), ("b", "b.sysl", b))), "7\n[exit 0]")
+end mmd_two_modules_one_extern
+
+@test("nor a scalar type name, which is no module's to shadow")
+mmd_a_module_named_for_a_scalar()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("var x: int = 1\nprint(x + int.two())", "int", "i.sysl",
+                              "module int\ntwo() -> int = 2")), "3\n[exit 0]")
+
+// -- a module and a type may not spell one path ------------------------------------------------------
+
+// A dotted reference takes the longest prefix that names a module, so a module named for a type of
+// its parent would win `geom.Point.dist` outright and leave the member no spelling at all. The keys
+// stay distinct; what collides is the path a program writes.
+@test("a module and a type may not spell one path, since the module would take the whole of it")
+mmd_a_module_named_for_a_type()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_two("print(geom.Point.dist())",
+                               ("geom", "g.sysl", "module geom\nstruct Point\n    x: int\n\n    dist() -> int = 1"),
+                               ("geom.Point", "p.sysl", "module geom.Point\ndist() -> int = 2")))
+
+    mmd_refused(said, "'geom.Point' is also a module, so 'geom.Point.<member>' would name two things — " +
+                      "rename the module or 'Point'", "/geom/g.sysl:2:1")
+end mmd_a_module_named_for_a_type
+
+@test("which holds for an enum too, whose variants are reached the same way")
+mmd_a_module_named_for_an_enum()
+    if im_can_run() then return
+
+    val said = mmd_out(mmd_two("print(1)", ("geom", "g.sysl", "module geom\nenum Shape\n    Dot"),
+                               ("geom.Shape", "s.sysl", "module geom.Shape\nf() -> int = 2")))
+
+    mmd_refused(said, "'geom.Shape' is also a module, so 'geom.Shape.<variant>' would name two things — " +
+                      "rename the module or 'Shape'", "/geom/g.sysl:2:1")
+end mmd_a_module_named_for_an_enum
+
+// -- an enum reached through its module --------------------------------------------------------------
+
+@test("an enum reached through its module converts from an integer")
+mmd_a_foreign_enum_converts_from_an_integer()
+    if im_can_run() then return
+
+    val main = "var c: geom.Color = geom.Color(1)\nc match\n    Red -> print(0)\n    Green -> print(1)"
+
+    assert_eq(mmd_out(mmd_one(main, "geom", "g.sysl", mmd_color())), "1\n[exit 0]")
+end mmd_a_foreign_enum_converts_from_an_integer
+
+@test("and offers the fallible constructor beside it")
+mmd_a_foreign_enum_offers_try()
+    if im_can_run() then return
+
+    val main = "var c = geom.Color.try(5)\nc match\n    Some(v) -> print(1)\n    None -> print(0)"
+
+    assert_eq(mmd_out(mmd_one(main, "geom", "g.sysl", mmd_color())), "0\n[exit 0]")
+end mmd_a_foreign_enum_offers_try
+
+// -- a path is an ordinary operand -------------------------------------------------------------------
+
+@test("a path is an ordinary operand, so it stands wherever an expression does")
+mmd_a_path_is_an_operand()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("for i in 0..<geom.limit() do print(i)", "geom", "g.sysl",
+                              "module geom\nlimit() -> int = 2")), "0\n1\n[exit 0]")
+
+// A directory that holds no source is no module, but the modules under it are still reached through
+// its name -- the driver walks past it rather than stopping.
+@test("and a directory between two modules need hold no source of its own")
+mmd_a_directory_with_no_source()
+    if im_can_run() then return
+
+    assert_eq(mmd_out(mmd_one("print(a.b.f())", "a.b", "y.sysl", "module a.b\nf() -> int = 7")), "7\n[exit 0]")
