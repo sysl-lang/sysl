@@ -1,0 +1,719 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// How a **large** aggregate is handed about (`TargetLayout.indirect`).
+//
+// A small one is a value: LLVM carries it in registers, and the `insertvalue` and `extractvalue`
+// that build and read one cost nothing. Above `DirectBytes` that stops being true -- the back end is
+// copying memory whatever the text says, and a first-class value only obliges every pass to reason
+// about each byte of it. So a large result leaves through an out-pointer, a large literal is built
+// where it is going to live, a field of one is read at its address, a copy of one is a copy of
+// bytes, and a large argument crosses the call in memory.
+//
+// **The tests come in pairs**: what a large aggregate does, and that a small one still does what it
+// always did. A threshold with only one side tested is a threshold that could be anywhere.
+//
+// Ported from the reference's `AggregateLoweringTests`, whose programs and expected strings these
+// are. Every program here was also emitted by both compilers as a whole file, and the two texts were
+// byte for byte the same (reference 0.0.152).
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private agl_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end agl_ready
+
+// The LLVM text of the whole module a program lowers to -- what `sysl emit-llvm` prints -- or
+// whatever the compiler had to say instead.
+private agl_ir(text: string) -> string
+    val root = make_temp_dir("sysl-aggregate").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end agl_ir
+
+private agl_names(line: string, name: string) -> bool =
+    line.contains("@" + name + "(") || line.contains("$" + name + "(")
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private agl_body(out: string, name: string) -> string
+    val lines = lines_of(out)
+    var b = str_builder()
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !inside && line.starts_with("define ") && agl_names(line, name) then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end agl_body
+
+// The entry point's text, which is where a program's own statements are lowered.
+private agl_main(text: string) -> string = agl_body(agl_ir(text), "main")
+
+// What a program PRINTS and whether it came back cleanly.
+private agl_ran(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-aggregate").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text, out.status.ok())
+end agl_ran
+
+// A run is its exact output **and** a clean exit: a program that printed the right thing and then
+// trapped is a different program.
+private agl_prints(text: string, expected: string)
+    if !agl_ready() then return
+
+    val got = agl_ran(text)
+
+    assert_eq(got.0, expected)
+    assert(got.1, "the program printed what was expected and did not exit cleanly")
+end agl_prints
+
+// 512 bytes of cells and a tag -- comfortably over the threshold, and with a field at each end so a
+// read of the last one cannot pass by reading the first.
+private agl_big() -> string = "struct Big\n    cells: [64]i64\n    tag: int\n"
+
+private agl_small() -> string = "struct Small\n    x: int\n    y: int\n"
+
+// A large struct that carries a counted reference, for the pointer-side ownership walk.
+private agl_holder() -> string =
+    "struct Node\n    value: int\nstruct Holder\n    pad: [64]i64\n    node: &Node\n"
+
+// -- a large result comes back through an out-pointer ----------------------------------------------
+
+@test("a large result comes back through an out-pointer: which is what the definition receives")
+agl_the_definition_receives_an_out_pointer()
+    if !agl_ready() then return
+
+    val out = agl_ir(agl_big() + "make(t: int) -> Big = Big([0; 64], t)\nprint(make(3).tag)")
+
+    assert(out.contains(
+        "define void @make(ptr noalias sret(%struct.Big) align 8 %sret.out, i32 %t.param)"), out)
+    assert(!out.contains("ret %struct.Big"), out)
+end agl_the_definition_receives_an_out_pointer
+
+@test("a large result comes back through an out-pointer: and the caller's own storage is what it points at")
+agl_the_callers_own_storage_is_the_out_pointer()
+    if !agl_ready() then return
+
+    val out = agl_main(agl_big() +
+                       "make(t: int) -> Big = Big([0; 64], t)\nvar b = make(7)\nprint(b.tag)")
+
+    assert(out.contains("call void @make(ptr sret(%struct.Big) align 8 %b.addr, i32 7)"), out)
+
+    // Nothing anywhere makes a `%struct.Big` value: not the call, not the store into `b`.
+    assert(!out.contains("load %struct.Big"), out)
+    assert(!out.contains("store %struct.Big"), out)
+end agl_the_callers_own_storage_is_the_out_pointer
+
+@test("a large result comes back through an out-pointer: while a small one is still returned in registers")
+agl_a_small_result_is_returned_in_registers()
+    if !agl_ready() then return
+
+    val out = agl_ir(agl_small() + "make(x: int) -> Small = Small(x, 2)\nprint(make(1).y)")
+
+    assert(out.contains("define %struct.Small @make(i32 %x.param)"), out)
+    assert(out.contains("ret %struct.Small"), out)
+    assert(!out.contains("sret(%struct.Small)"), out)
+end agl_a_small_result_is_returned_in_registers
+
+// -- a large literal is built where it is going to live --------------------------------------------
+
+@test("a large literal is built where it is going to live: field by field, with no chain of inserts")
+agl_a_large_literal_is_built_field_by_field()
+    if !agl_ready() then return
+
+    val out = agl_ir(agl_big() + "make(t: int) -> Big = Big([0; 64], t)\nprint(make(1).tag)")
+
+    assert(!out.contains("insertvalue %struct.Big"), out)
+    assert(agl_body(out, "make").contains("getelementptr %struct.Big, ptr %sret.out, i32 0, i32 1"),
+           out)
+end agl_a_large_literal_is_built_field_by_field
+
+@test("a large literal is built where it is going to live: and a repeated element fills the destination rather than a buffer of its own")
+agl_a_repeated_element_fills_the_destination()
+    if !agl_ready() then return
+
+    val out = agl_body(agl_ir(agl_big() + "make(t: int) -> Big = Big([7; 64], t)\nprint(make(1).tag)"),
+                       "make")
+
+    assert(out.contains("fill.test"), out)
+    assert(!out.contains("load [64 x i64]"), out)
+end agl_a_repeated_element_fills_the_destination
+
+@test("a large literal is built where it is going to live: while a small one is still the chain it always was")
+agl_a_small_literal_is_still_a_chain()
+    if !agl_ready() then return
+
+    val out = agl_main(agl_small() + "var s = Small(1, 2)\nprint(s.x)")
+
+    assert(out.contains("insertvalue %struct.Small"), out)
+
+// -- a field of a large aggregate is read at its address -------------------------------------------
+
+@test("a field of a large aggregate is read at its address: rather than by producing the whole value first")
+agl_a_large_field_is_read_at_its_address()
+    if !agl_ready() then return
+
+    val out = agl_main(agl_big() + "var b = Big([0; 64], 5)\nprint(b.tag)")
+
+    assert(out.contains("getelementptr %struct.Big, ptr %b.addr, i32 0, i32 1"), out)
+    assert(!out.contains("extractvalue %struct.Big"), out)
+end agl_a_large_field_is_read_at_its_address
+
+@test("a field of a large aggregate is read at its address: while a field of a small one is still lifted out of it")
+agl_a_small_field_is_lifted_out()
+    if !agl_ready() then return
+
+    val out = agl_main(agl_small() + "var s = Small(1, 2)\nvar t = s\nprint(t.y)")
+
+    assert(out.contains("extractvalue %struct.Small"), out)
+
+// -- a copy of a large aggregate is a copy of bytes ------------------------------------------------
+
+@test("a copy of a large aggregate is a copy of bytes: from one local to another")
+agl_a_large_copy_is_a_copy_of_bytes()
+    if !agl_ready() then return
+
+    val out = agl_main(agl_big() + "var a = Big([0; 64], 1)\nvar b = a\nprint(b.tag)")
+
+    assert(out.contains(
+        "call void @llvm.memcpy.p0.p0.i64(ptr align 8 %b.addr, ptr align 8 %a.addr, i64 520, i1 false)"),
+        out)
+end agl_a_large_copy_is_a_copy_of_bytes
+
+@test("a copy of a large aggregate is a copy of bytes: while a small one is still a load and a store")
+agl_a_small_copy_is_a_load_and_a_store()
+    if !agl_ready() then return
+
+    val out = agl_main(agl_small() + "var a = Small(1, 2)\nvar b = a\nprint(b.x)")
+
+    assert(out.contains("load %struct.Small, ptr %a.addr"), out)
+    assert(!out.contains("llvm.memcpy"), out)
+end agl_a_small_copy_is_a_load_and_a_store
+
+// -- a large argument crosses the call in memory ---------------------------------------------------
+
+@test("a large argument crosses the call in memory: so the parameter is declared as an address")
+agl_a_large_parameter_is_an_address()
+    if !agl_ready() then return
+
+    val out = agl_ir(agl_big() + "tag(b: Big) -> int = b.tag\nprint(tag(Big([0; 64], 6)))")
+
+    assert(out.contains("define i32 @tag(ptr %b.param)"), out)
+    assert(agl_body(out, "tag").contains(
+        "call void @llvm.memcpy.p0.p0.i64(ptr align 8 %b.addr, ptr align 8 %b.param, i64 520, i1 false)"),
+        out)
+end agl_a_large_parameter_is_an_address
+
+@test("a large argument crosses the call in memory: and the caller hands over storage it already has")
+agl_the_caller_hands_over_storage_it_has()
+    if !agl_ready() then return
+
+    val out = agl_main(agl_big() +
+                       "tag(b: Big) -> int = b.tag\nvar b = Big([0; 64], 6)\nprint(tag(b))")
+
+    assert(out.contains("call i32 @tag(ptr %b.addr)"), out)
+end agl_the_caller_hands_over_storage_it_has
+
+@test("a large argument crosses the call in memory: while a small one is still passed in registers")
+agl_a_small_argument_is_passed_in_registers()
+    if !agl_ready() then return
+
+    val out = agl_ir(agl_small() + "sum(s: Small) -> int = s.x + s.y\nprint(sum(Small(1, 2)))")
+
+    assert(out.contains("define i32 @sum(%struct.Small %s.param)"), out)
+
+// Handing over an address is only a lowering if the callee's copy is genuinely its own. A callee
+// that wrote through the caller's storage would pass every test above, and this is the one it fails.
+@test("a large argument crosses the call in memory: and what the callee does to its copy stays in the callee")
+agl_the_callees_copy_is_its_own()
+    agl_prints(agl_big() + raw"""
+        spoil(b: Big) -> int
+            var c = b
+            c.tag = 99
+            c.cells[0] = 99
+            c.tag
+        var b = Big([1; 64], 2)
+        print(spoil(b), b.tag, b.cells[0])
+        """, "99 2 1\n")
+
+// -- an operator dispatched to a trait method crosses the boundary the same way --------------------
+//
+// A comparison and a compound assignment reach an operator's trait method with the operands already
+// evaluated, which is a **second route** to a call the definition knows nothing about -- so it owes
+// the boundary everything the ordinary route owes it. A `call` naming the aggregate where the
+// definition names a pointer assembles and links: the callee reads the first word of the value as
+// the address it was promised.
+
+@test("an operator dispatched to a trait method crosses the boundary the same way: so '==' hands its operands over at an address")
+agl_a_dispatched_comparison_hands_over_addresses()
+    if !agl_ready() then return
+
+    val out = agl_ir(agl_big() + raw"""
+        impl Eq for Big
+            eq(self, rhs: Self) -> bool = self.tag == rhs.tag
+        var b = Big([0; 64], 1)
+        print(b == b)
+        """)
+    val main = agl_body(out, "main")
+
+    assert(out.contains("define zeroext i1 @Big.eq(ptr %self.param, ptr %rhs.param)"), out)
+    assert(main.contains("call zeroext i1 @Big.eq(ptr"), main)
+    assert(!main.contains("@Big.eq(%struct.Big"), main)
+end agl_a_dispatched_comparison_hands_over_addresses
+
+@test("an operator dispatched to a trait method crosses the boundary the same way: and a compound assignment takes its result back through the out-pointer")
+agl_a_compound_assignment_uses_the_out_pointer()
+    if !agl_ready() then return
+
+    val out = agl_ir(agl_big() + raw"""
+        impl Add for Big
+            add(self, rhs: Self) -> Self = Big([0; 64], self.tag + rhs.tag)
+        var b = Big([0; 64], 1)
+        b += b
+        print(b.tag)
+        """)
+    val main = agl_body(out, "main")
+
+    assert(out.contains(
+        "define void @Big.add(ptr noalias sret(%struct.Big) align 8 %sret.out, ptr %self.param, ptr %rhs.param)"),
+        out)
+    assert(main.contains("call void @Big.add(ptr sret(%struct.Big) align 8 "), main)
+    assert(!main.contains("@Big.add(%struct.Big"), main)
+end agl_a_compound_assignment_uses_the_out_pointer
+
+@test("an operator dispatched to a trait method crosses the boundary the same way: while a small operand is still handed over as a value")
+agl_a_small_operand_is_handed_over_as_a_value()
+    if !agl_ready() then return
+
+    val out = agl_ir(agl_small() + raw"""
+        impl Eq for Small
+            eq(self, rhs: Self) -> bool = self.x == rhs.x
+        var s = Small(1, 2)
+        print(s == s)
+        """)
+    val main = agl_body(out, "main")
+
+    assert(out.contains(
+        "define zeroext i1 @Small.eq(%struct.Small %self.param, %struct.Small %rhs.param)"), out)
+    assert(main.contains("call zeroext i1 @Small.eq(%struct.Small"), main)
+end agl_a_small_operand_is_handed_over_as_a_value
+
+// -- the threshold falls where the layout says it does ---------------------------------------------
+//
+// The threshold is a number, so the test that matters is the one either side of it. Sixteen 8-byte
+// cells are exactly `DirectBytes`; seventeen are one word past it.
+
+@test("the threshold falls where Layout says it does: an aggregate of exactly DirectBytes is still a value")
+agl_exactly_direct_bytes_is_still_a_value()
+    assert_eq(DirectBytes, 128)
+
+    if !agl_ready() then return
+
+    val out = agl_ir(
+        "struct At\n    cells: [16]i64\nmake() -> At = At([0; 16])\nprint(make().cells[0])")
+
+    assert(out.contains("ret %struct.At"), out)
+end agl_exactly_direct_bytes_is_still_a_value
+
+@test("the threshold falls where Layout says it does: and one word past it is not")
+agl_one_word_past_direct_bytes_is_not()
+    if !agl_ready() then return
+
+    val out = agl_ir(
+        "struct Over\n    cells: [17]i64\nmake() -> Over = Over([0; 17])\nprint(make().cells[0])")
+
+    assert(out.contains("sret(%struct.Over)"), out)
+end agl_one_word_past_direct_bytes_is_not
+
+// -- the values it produces are the values the program wrote ---------------------------------------
+
+@test("the values it produces are the values the program wrote: a large struct survives being returned, bound and read")
+agl_a_large_struct_survives_the_round_trip()
+    agl_prints(agl_big() + raw"""
+        make(t: int) -> Big
+            var c: [64]i64 = [0; 64]
+            c[0] = 11
+            c[63] = 22
+            Big(c, t)
+        var b = make(33)
+        print(b.cells[0], b.cells[63], b.tag)
+        """, "11 22 33\n")
+
+// The memcpy has to be a *copy*. Aliasing here would be invisible until something wrote.
+@test("the values it produces are the values the program wrote: a copy is independent of what it was copied from")
+agl_a_copy_is_independent()
+    agl_prints(agl_big() + raw"""
+        var a = Big([0; 64], 1)
+        var b = a
+        a.tag = 9
+        a.cells[3] = 4
+        print(b.tag, b.cells[3], a.tag, a.cells[3])
+        """, "1 0 9 4\n")
+
+@test("the values it produces are the values the program wrote: an assignment over an existing one replaces all of it")
+agl_an_assignment_replaces_all_of_it()
+    agl_prints(agl_big() + raw"""
+        var a = Big([1; 64], 1)
+        var b = Big([2; 64], 2)
+        a = b
+        print(a.cells[0], a.cells[63], a.tag)
+        """, "2 2 2\n")
+
+@test("the values it produces are the values the program wrote: an early return writes the same storage the fall-through would have")
+agl_an_early_return_writes_the_same_storage()
+    agl_prints(agl_big() + raw"""
+        pick(which: bool) -> Big
+            if which
+                return Big([5; 64], 1)
+            Big([6; 64], 2)
+        print(pick(true).cells[0], pick(false).cells[0])
+        """, "5 6\n")
+
+@test("the values it produces are the values the program wrote: a large array is returned the same way a large struct is")
+agl_a_large_array_is_returned_the_same_way()
+    agl_prints(raw"""
+        make() -> [64]i64
+            var c: [64]i64 = [0; 64]
+            c[63] = 8
+            c
+        print(make()[63])
+        """, "8\n")
+
+@test("the values it produces are the values the program wrote: and a large one nested inside a larger one still lands in the right place")
+agl_a_large_one_nested_in_a_larger_one()
+    agl_prints(raw"""
+        struct Inner
+            cells: [32]i64
+        struct Outer
+            a: Inner
+            b: Inner
+            tag: int
+        make() -> Outer = Outer(Inner([1; 32]), Inner([2; 32]), 3)
+        var o = make()
+        print(o.a.cells[0], o.b.cells[31], o.tag)
+        """, "1 2 3\n")
+
+// -- everywhere else a large one can turn up still works -------------------------------------------
+//
+// Each of these is a path where the value form is still what runs, or where the destination is not
+// known until the expression is half-emitted -- and each has to keep producing the right answer.
+
+@test("everywhere else a large one can turn up still works: a branch that yields one")
+agl_a_branch_that_yields_one()
+    agl_prints(agl_big() + raw"""
+        pick(which: bool) -> Big = if which then Big([1; 64], 1) else Big([2; 64], 2)
+        print(pick(true).cells[0], pick(false).cells[0])
+        """, "1 2\n")
+
+@test("everywhere else a large one can turn up still works: an arm of a match that yields one")
+agl_an_arm_of_a_match_that_yields_one()
+    agl_prints(agl_big() + raw"""
+        pick(n: int) -> Big = n match
+            0 -> Big([5; 64], 0)
+            _ -> Big([6; 64], 1)
+        print(pick(0).cells[0], pick(1).cells[0])
+        """, "5 6\n")
+
+// The box's address does not exist until `malloc` has returned, so this is the one destination that
+// cannot be handed to the expression before the expression starts.
+@test("everywhere else a large one can turn up still works: one put on the heap behind a reference")
+agl_one_put_on_the_heap_behind_a_reference()
+    agl_prints(agl_big() + raw"""
+        var b: &Big = Big([3; 64], 4)
+        var c = b
+        c.tag = 5
+        print(b.cells[63], b.tag)
+        """, "3 5\n")
+
+@test("everywhere else a large one can turn up still works: an element of an array of them")
+agl_an_element_of_an_array_of_them()
+    agl_prints(agl_big() + raw"""
+        var bs: [3]Big = [Big([7; 64], 1); 3]
+        bs[1].tag = 2
+        print(bs[0].cells[0], bs[0].tag, bs[1].tag)
+        """, "7 1 2\n")
+
+@test("everywhere else a large one can turn up still works: one a closure captured and returns")
+agl_one_a_closure_captured_and_returns()
+    agl_prints(agl_big() + raw"""
+        call(f: () -> Big) -> int = f().tag
+        var b = Big([8; 64], 9)
+        print(call(() -> b))
+        """, "9\n")
+
+@test("everywhere else a large one can turn up still works: one bound at module level")
+agl_one_bound_at_module_level()
+    agl_prints(agl_big() + raw"""
+        val shared: Big = Big([4; 64], 5)
+        print(shared.cells[0], shared.tag)
+        """, "4 5\n")
+
+@test("everywhere else a large one can turn up still works: one behind a pointer, written through")
+agl_one_behind_a_pointer_written_through()
+    agl_prints(agl_big() + raw"""
+        bump(p: *Big)
+            p.tag = p.tag + 1
+        var b = Big([0; 64], 1)
+        bump(&b)
+        print(b.tag)
+        """, "2\n")
+
+@test("everywhere else a large one can turn up still works: and the two the edge-case pass turned up are destinations too")
+agl_a_box_and_a_payload_are_destinations_too()
+    if !agl_ready() then return
+
+    val boxed = agl_main(agl_big() + "var b: &Big = Big([3; 64], 4)\nprint(b.tag)")
+
+    assert(!boxed.contains("insertvalue %struct.Big"), boxed)
+    assert(!boxed.contains("store %struct.Big"), boxed)
+
+    val tagged = agl_main(agl_big() + raw"""
+        enum Slot
+            Empty
+            Full(b: Big)
+        take(s: Slot) -> int = 0
+        print(take(Full(Big([0; 64], 6))))
+        """)
+
+    assert(tagged.contains("define i32 @main("), tagged)
+    assert(!tagged.contains("load %enum.Slot"), tagged)
+end agl_a_box_and_a_payload_are_destinations_too
+
+@test("everywhere else a large one can turn up still works: and a large payload inside a data enum")
+agl_a_large_payload_inside_a_data_enum()
+    agl_prints(agl_big() + raw"""
+        enum Slot
+            Empty
+            Full(b: Big)
+        take(s: Slot) -> int = s match
+            Full(b) -> b.tag
+            Empty -> 0
+        print(take(Full(Big([0; 64], 6))), take(Empty))
+        """, "6 0\n")
+
+// -- an early return out of one leaves through the out-pointer too ---------------------------------
+//
+// `?` out of a function whose result is large is an early `return`, and has to leave the way the
+// written one does: through the out-pointer, with the function itself `void`. A `ret` of the
+// aggregate out of a function the convention has already made `void` is text clang refuses.
+
+private agl_chk() -> string =
+    "chk(c: int) -> Result[unit, int] = if c < 0 then Err(c) else Ok(())\n"
+
+@test("an early return out of one leaves through the out-pointer too: the value arrives when nothing fails")
+agl_question_mark_the_value_arrives()
+    agl_prints(agl_big() + agl_chk() + raw"""
+        mk(x: int) -> Result[Big, int]
+            chk(x)?
+            Ok(Big([1; 64], 2))
+        print(mk(3).unwrap().tag)
+        """, "2\n")
+
+@test("an early return out of one leaves through the out-pointer too: and the failure arrives when something does")
+agl_question_mark_the_failure_arrives()
+    agl_prints(agl_big() + agl_chk() + raw"""
+        mk(x: int) -> Result[Big, int]
+            chk(x)?
+            Ok(Big([1; 64], 2))
+        mk(-7) match
+            Err(e) -> print("err", e)
+            Ok(_) -> print("ok")
+        """, "err -7\n")
+
+// Two of them, since each emits its own early return and the second one's block is reached only
+// after the first has already terminated one.
+@test("an early return out of one leaves through the out-pointer too: twice in one function")
+agl_question_mark_twice_in_one_function()
+    agl_prints(agl_big() + agl_chk() + raw"""
+        mk(x: int) -> Result[Big, int]
+            chk(x)?
+            chk(x)?
+            Ok(Big([1; 64], 3))
+        print(mk(3).unwrap().tag, mk(-1).is_err())
+        """, "3 true\n")
+
+// The text side of the same claim: the function is `void` with an `sret` parameter, so no `ret` in
+// it may carry the enum. Named at the *big* instantiation: `chk` returns a small `Result[unit, int]`
+// and hands it back directly, which is correct.
+@test("an early return out of one leaves through the out-pointer too: and no return in it hands the result back directly")
+agl_question_mark_no_return_hands_it_back_directly()
+    if !agl_ready() then return
+
+    val out = agl_ir(agl_big() + agl_chk() + raw"""
+        mk(x: int) -> Result[Big, int]
+            chk(x)?
+            Ok(Big([1; 64], 2))
+        print(mk(3).unwrap().tag)
+        """)
+
+    assert(out.contains("sret"), out)
+    assert(out.contains("define void @mk("), out)
+    assert(!out.contains("ret %enum.sysl$Result.Big.int"), out)
+end agl_question_mark_no_return_hands_it_back_directly
+
+// -- rendering one hands it over at an address, like any other large argument ----------------------
+//
+// Rendering hands the value to `display` as an **argument**, and a large argument crosses at an
+// address -- so producing it as a first-class value puts the struct's first word where the callee
+// reads a pointer. `print(x)` goes through an ordinary call; `str(x)` and an interpolation build the
+// string first.
+
+private agl_shown() -> string =
+    "impl Display for Big\n" +
+    "    display(self, out: *Writer, fmt: FormatSpec) = self.tag.display(out, fmt)\n"
+
+@test("rendering one hands it over at an address, like any other large argument: print, which was always the working path")
+agl_rendering_through_print()
+    agl_prints(agl_big() + agl_shown() + "var b = Big([0; 64], 7)\nprint(b)", "7\n")
+
+@test("rendering one hands it over at an address, like any other large argument: str, which built the string first and did not")
+agl_rendering_through_str()
+    agl_prints(agl_big() + agl_shown() + "var b = Big([0; 64], 7)\nprint(str(b))", "7\n")
+
+@test("rendering one hands it over at an address, like any other large argument: an interpolation, which is the shape a message is actually written in")
+agl_rendering_through_an_interpolation()
+    agl_prints(agl_big() + agl_shown() + raw"""
+        var b = Big([0; 64], 7)
+        print(s"<$b>")
+        """, "<7>\n")
+
+@test("rendering one hands it over at an address, like any other large argument: and one through a specifier, which is the other renderer")
+agl_rendering_through_a_specifier()
+    agl_prints(agl_big() + agl_shown() + raw"""
+        var b = Big([0; 64], 7)
+        print(f"${b}%3s|")
+        """, "  7|\n")
+
+// A small one keeps crossing as a value, which is the other side of the threshold and the reason the
+// lowering is a branch rather than a change of convention.
+@test("rendering one hands it over at an address, like any other large argument: while a small one still crosses as a value")
+agl_rendering_a_small_one()
+    agl_prints(agl_small() + raw"""
+        impl Display for Small
+            display(self, out: *Writer, fmt: FormatSpec) = self.y.display(out, fmt)
+        var s = Small(1, 4)
+        print(str(s))
+        """, "4\n")
+
+// -- contracts, trait objects -----------------------------------------------------------------------
+
+// The value a postcondition is written about is read back out of the out-pointer, which is the one
+// whole-aggregate load this lowering still emits -- and only on a function that asked for it.
+@test("a contract on one still sees the value it is written about")
+agl_a_contract_still_sees_the_value()
+    agl_prints(agl_big() + raw"""
+        make(t: int) -> Big
+            ensure result.tag == t
+            Big([0; 64], t)
+        print(make(4).tag)
+        """, "4\n")
+
+@test("a large result reached through a trait object goes through the same out-pointer")
+agl_a_large_result_through_a_trait_object()
+    agl_prints(agl_big() + raw"""
+        trait Source
+            supply(self) -> Big
+        struct Ones
+            n: int
+        struct Twos
+            n: int
+        impl Source for Ones
+            supply(self) -> Big = Big([1; 64], self.n)
+        impl Source for Twos
+            supply(self) -> Big = Big([2; 64], self.n)
+        var a = Ones(10)
+        var b = Twos(20)
+        var s: *Source = &a
+        print(s.supply().cells[0], s.supply().tag)
+        s = &b
+        print(s.supply().cells[0], s.supply().tag)
+        """, "1 10\n2 20\n")
+
+// -- a large aggregate that carries references still counts them -----------------------------------
+//
+// A large struct never becomes a value, so there is nothing to hand the value-side walk; the counts
+// are taken and given back at its address. A weak reference is the observable -- it reports the
+// object gone exactly when the last strong count went.
+
+@test("a large aggregate that carries references still counts them: a copy takes a share, so the object outlives the one it was copied from")
+agl_a_copy_takes_a_share()
+    agl_prints(agl_holder() + raw"""
+        keep() -> weak Node
+            var n: &Node = Node(5)
+            var w: weak Node = n
+            var a = Holder([0; 64], n)
+            var b = a
+            print(str(b.node.value))
+            w
+        var w = keep()
+        print(str(w.get().is_none()))
+        """, "5\ntrue\n")
+
+@test("a large aggregate that carries references still counts them: and one built by a callee keeps what the caller handed it")
+agl_one_built_by_a_callee_keeps_its_reference()
+    agl_prints(agl_holder() + raw"""
+        make(n: &Node) -> Holder = Holder([0; 64], n)
+        var n: &Node = Node(7)
+        var h = make(n)
+        print(str(h.node.value))
+        """, "7\n")
+
+@test("a large aggregate that carries references still counts them: an assignment over one lets go of what was there")
+agl_an_assignment_lets_go_of_what_was_there()
+    agl_prints(agl_holder() + raw"""
+        probe() -> weak Node
+            var first: &Node = Node(1)
+            var w: weak Node = first
+            var h = Holder([0; 64], first)
+            h = Holder([0; 64], Node(2))
+            print(str(h.node.value))
+            w
+        print(str(probe().get().is_none()))
+        """, "2\ntrue\n")
