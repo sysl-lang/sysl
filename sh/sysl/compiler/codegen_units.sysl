@@ -773,12 +773,15 @@ end compile_units
 //
 // **The merge is what keeps an archive's symbols what they were.** A promoted local is hidden, and
 // hidden is a fact about the final link: inside a relocatable object it is still a global symbol, so
-// an archive of the units would list every promoted name among what it defines. The linker's `-r`
-// turns a hidden symbol into a local one, and the archive holds one object defining what it always
-// defined.
+// an archive of the units would list every promoted name among what it defines. Mach-O's `-r` turns
+// a hidden symbol into a local one, and the archive holds one object defining what it always
+// defined. **ELF's does not** -- `ld.lld -r` and GNU `ld -r` both keep it GLOBAL HIDDEN, which a
+// static link still resolves against, so two archives promoting one name would collide at the C
+// project's link. Localizing it takes an `objcopy` no build here otherwise needs, so everywhere but
+// Mach-O an archive is compiled as one unit, as it always was.
 compile_object_in_units(cc: string, ir: string, obj: string, target: Target,
                         level: string) -> Result[unit, string]
-    val units = codegen_units(ir.len, target)
+    val units = if merge_localizes_hidden(target) then codegen_units(ir.len, target) else 1
 
     if units < 2 then return compile_object(cc, ir, obj, target, level)
 
@@ -808,6 +811,10 @@ compile_object_in_units(cc: string, ir: string, obj: string, target: Target,
         Ok(_) -> Ok(())
         Err(f) -> Err(if f.unrun then f.said else tool_failed(cc, f.code, f.said))
 end compile_object_in_units
+
+// Whether a relocatable link for `t` turns a hidden symbol into a local one: Mach-O's does, ELF's,
+// COFF's and WebAssembly's do not.
+merge_localizes_hidden(t: Target) -> bool = t.os == MacOS
 
 // A unit clang refused, compiled again alone for its words. The text is left where it is, as
 // `compile_object` leaves it, since the line numbers are counted in it.

@@ -404,3 +404,64 @@ cgu_the_unit_count()
     assert_eq(codegen_units(1000, host_target()), 1)
     assert(codegen_units(100000000, host_target()) >= 1, "a large program")
 end cgu_the_unit_count
+
+// Two units sharing a hidden function, compiled for `triple` and merged by `clang -r`: the letter
+// `nm` gives the shared name in the merged object -- `t` local, `T` global.
+private cgu_merged_kind(cc: string, dir: string, triple: string, linker: Option[string]) -> string
+    write_text(s"$dir/a.ll", "define hidden i32 @\"sysl.cgu:x\"(i32 %a) {\n  ret i32 %a\n}\n" +
+               "define i32 @pub() {\n  %r = call i32 @\"sysl.cgu:x\"(i32 3)\n  ret i32 %r\n}\n").unwrap()
+    write_text(s"$dir/b.ll", "declare hidden i32 @\"sysl.cgu:x\"(i32)\n" +
+               "define i32 @pub2() {\n  %r = call i32 @\"sysl.cgu:x\"(i32 4)\n  ret i32 %r\n}\n").unwrap()
+
+    for u in ["a", "b"]
+        assert(capture(cc, ["-Wno-override-module", "-c", s"--target=$triple", s"$dir/$u.ll", "-o",
+                            s"$dir/$u.o"]).unwrap().status.ok(), s"$u compiles for $triple")
+
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=$triple")
+    args.push("-nostdlib")
+    args.push("-r")
+
+    if linker is Some(l) then args.push(s"-fuse-ld=$l")
+
+    args.push(s"$dir/a.o")
+    args.push(s"$dir/b.o")
+    args.push("-o")
+    args.push(s"$dir/ab.o")
+    assert(capture(cc, args.view()).unwrap().status.ok(), s"the units merge for $triple")
+
+    val lines = split(capture("nm", [s"$dir/ab.o"]).unwrap().text, "\n")
+
+    for i in 0..<lines.len
+        val words = split(lines[i], " ")
+
+        if words.len >= 3 && words[2].ends_with("sysl.cgu:x") then return words[1]
+
+    ""
+end cgu_merged_kind
+
+@test("a relocatable link makes a hidden symbol local on Mach-O and leaves it global on ELF, so build-c splits for Mach-O alone")
+cgu_only_mach_o_localizes_a_merged_hidden_symbol()
+    assert(merge_localizes_hidden(target_named("aarch64-macos").unwrap()), "Mach-O")
+    assert(!merge_localizes_hidden(target_named("aarch64-linux").unwrap()), "aarch64 ELF")
+    assert(!merge_localizes_hidden(target_named("x86_64-linux").unwrap()), "x86_64 ELF")
+    assert(!merge_localizes_hidden(target_named("wasm32-freestanding").unwrap()), "WebAssembly")
+
+    if !clang_available() || host_target().triple != "arm64-apple-macosx" then return
+
+    val dirs = cgu_begin()
+    val cc = find_clang(host_target(), None).unwrap()
+
+    assert_eq(cgu_merged_kind(cc, dirs.0, "arm64-apple-macosx", None), "t")
+
+    val has_lld = capture("ld.lld", ["--version"]) match
+        Ok(c) -> c.status.ok()
+        Err(_) -> false
+
+    if has_lld
+        assert_eq(cgu_merged_kind(cc, dirs.0, "aarch64-unknown-linux-gnu", Some("lld")), "T")
+        assert_eq(cgu_merged_kind(cc, dirs.0, "x86_64-unknown-linux-gnu", Some("lld")), "T")
+
+    cgu_end(dirs)
+end cgu_only_mach_o_localizes_a_merged_hidden_symbol
