@@ -1,6 +1,6 @@
 module sh.sysl.compiler
 
-import sh.sysl.parsing.Span
+import sh.sysl.parsing.{point, Span}
 import sysl.buf.{Buf, buf}
 import sysl.text.{Search, from_utf8_unchecked}
 
@@ -13,9 +13,10 @@ import sysl.text.{Search, from_utf8_unchecked}
 // about what it says.
 
 // Everything a program has to answer for, run in the order the reference runs them.
-whole_program_checks(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
+whole_program_checks(a: &Analysis, units: Buf[Program], funcs: Buf[TFunc], vals: Buf[TVal])
     check_conventions(a)
     check_exports(a)
+    check_doc_comments(a, units)
     check_drop_returns(a)
     check_ghost(a, funcs)
     check_module_graph(a)
@@ -30,6 +31,29 @@ end whole_program_checks
 
 // The file a typed body was written in, or an empty one where the body has no source of its own.
 func_home(a: &Analysis, name: string) -> Scope = a.tables.homes.get(name).unwrap_or(empty_scope())
+
+// -- doc comments ----------------------------------------------------------------------------
+
+// Holds every doc comment's `@param` and `@tparam` tags to the signature it sits above.
+//
+// **It walks the files rather than the tables**, a doc comment belonging to the file the lexer
+// found it in and being placed by a line number. Only what a tag NAMES is checked: a parameter with
+// no `@param` is not an error and must not become one. The complaint points at the tag's own line,
+// which is where the stale name is, not at the declaration.
+private check_doc_comments(a: &Analysis, units: Buf[Program])
+    for i in 0..<units.len()
+        val unit = units.at(i)
+        val found = doc_problems(unit)
+
+        if found.is_empty() then continue
+
+        val scope = scope_of_unit(a, unit)
+
+        for j in 0..<found.len()
+            val at = point(unit.src.line_span(found.at(j).tag.line).start)
+
+            a.fault(scope, at, found.at(j).message)
+end check_doc_comments
 
 // -- `@ghost` --------------------------------------------------------------------------------
 
