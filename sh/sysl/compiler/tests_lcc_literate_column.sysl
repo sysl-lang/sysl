@@ -1,0 +1,85 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.join
+
+// A literate file's diagnostics name the column of the DOCUMENT, driven through the same `run_cli` a
+// shell reaches. The tangle takes four columns from every program line before the lexer sees it, so
+// a span measures the tangled text; the `-->` line adds the four back, and the quoted line and caret
+// stay the text that was read.
+//
+// Every expected rendering is quoted from the reference (0.0.152) on the same input.
+
+private lcc_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end lcc_run
+
+// A directory holding one file of the given text, `sub` deep.
+private lcc_tree(sub: string, file: string, text: string) -> string
+    val root = make_temp_dir("sysl-lcc-").unwrap()
+    val dir = if sub == "" then root else s"$root/$sub"
+
+    make_dir_all(dir).unwrap()
+    write_text(s"$dir/$file", text).unwrap()
+    root
+end lcc_tree
+
+// Where the analysis complains -- a generic body checked where it is written -- in a library whose
+// one file is literate.
+@test("a literate library's analysis diagnostic names the document's column")
+lcc_a_literate_librarys_analysis_diagnostic_names_the_document()
+    if std_root().is_err() then return
+
+    val root = lcc_tree("demo", "lib.lsysl", "A generic, whose body is checked where it is written\n\n    module demo\n\n" +
+        "    twice[T](x: T) -> T = x + x\n")
+    val got = lcc_run(["sysl", "build-lib", root, "-o", s"$root/demo.syslib"])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, "error: '+' needs 'T: sysl.Add'\n" +
+                     s" --> ${absolute_path(root)}/demo/lib.lsysl:5:27\n" +
+                     "  |\n" +
+                     "5 | twice[T](x: T) -> T = x + x\n" +
+                     "  |                       ^^^^^")
+    remove_dir_all(root).unwrap_or(())
+end lcc_a_literate_librarys_analysis_diagnostic_names_the_document
+
+// The grammar's complaint goes through the same rendering, so it names the document's column too --
+// here the end of the file, which is column 1 of the tangled text and column 5 of the document.
+@test("a literate program's parse diagnostic names the document's column")
+lcc_a_literate_programs_parse_diagnostic_names_the_document()
+    if std_root().is_err() then return
+
+    val root = lcc_tree("", "main.lsysl", "Prose\n\n    val x = (1 +\n    print(x)\n")
+    val got = lcc_run(["sysl", "build", s"$root/main.lsysl"])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, "error: ')' expected\n" +
+                     s" --> ${absolute_path(root)}/main.lsysl:5:5\n" +
+                     "  |\n" +
+                     "5 | \n" +
+                     "  | ^")
+    remove_dir_all(root).unwrap_or(())
+end lcc_a_literate_programs_parse_diagnostic_names_the_document
+
+// An ordinary file is not shifted: the same library written as `.sysl` names the column as read.
+@test("an ordinary library's diagnostic keeps the column it was read at")
+lcc_an_ordinary_librarys_diagnostic_is_not_shifted()
+    if std_root().is_err() then return
+
+    val root = lcc_tree("demo", "lib.sysl", "module demo\n\ntwice[T](x: T) -> T = x + x\n")
+    val got = lcc_run(["sysl", "build-lib", root, "-o", s"$root/demo.syslib"])
+
+    assert_eq(got.0, Failed)
+    assert_eq(got.1, "error: '+' needs 'T: sysl.Add'\n" +
+                     s" --> ${absolute_path(root)}/demo/lib.sysl:3:23\n" +
+                     "  |\n" +
+                     "3 | twice[T](x: T) -> T = x + x\n" +
+                     "  |                       ^^^^^")
+    remove_dir_all(root).unwrap_or(())
+end lcc_an_ordinary_librarys_diagnostic_is_not_shifted
