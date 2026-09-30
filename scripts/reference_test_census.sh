@@ -89,6 +89,10 @@ unread() {
 # The test files the bootstrap changed after the commit a snapshot was measured on.
 changed_since() {
     [ "$1" = "unknown" ] && { printf 'changed\t*\tthe measured commit is unknown\n'; return; }
+    if ! git -C "$bootstrap" rev-parse -q --verify "$1^{commit}" > /dev/null 2>&1; then
+        printf 'changed\t*\t%s is not a commit of the checkout at %s\n' "$1" "$bootstrap"
+        return
+    fi
     git -C "$bootstrap" diff --name-only "$1" HEAD -- '*/src/test/scala/*' |
         while IFS= read -r f; do printf 'changed\t%s\t%s\n' "${f##*/}" "$f"; done
 }
@@ -205,7 +209,8 @@ awk -F'\t' -v mapfile="$map" -v orphans="$work/orphans.tsv" '
         printf "%s\t%d\t%s\t%s\n", s, (how == "" ? 0 : 1), k, $3
     }
     END {
-        for (r in seen) if (!(r in used)) print r > orphans
+        # The site'"'"'s rows are pages, not reference cases -- not orphans.
+        for (r in seen) if (!(r in used) && r !~ /^DocsTests\.scala\t/) print r > orphans
         for (s in wild) if (!(s in usedw)) print s "\t*" > orphans
     }
 ' "$map" "$work/snap.tsv" > "$work/state.tsv"
@@ -293,7 +298,9 @@ awk -F'\t' '
         printf "by WRITTEN case (one per case in source):   %d total, %d mapped, %d unmapped\n", w, wm, w - wm
     }
 ' "$work/written.tsv" "$work/state.tsv"
-awk -F'\t' '$8 == "source" { n++ } END { if (n) printf "  (%d of the iterations are counted from source: their suites have no report)\n", n }' "$work/snap.tsv"
+awk -F'\t' '$8 == "source" { n++ } END { if (n) printf "  (%d of the iterations are counted from source, no report having run them)\n", n }' "$work/snap.tsv"
+[ "$have_source" -eq 1 ] ||
+    echo "  (no bootstrap source here: the written count is the snapshot's, where a leaf written twice counts once)"
 orph=$(wc -l < "$work/orphans.tsv" | tr -d ' ')
 [ "$orph" -gt 0 ] && echo "  $orph map rows match no case -- see --orphans"
 
