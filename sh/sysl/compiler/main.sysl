@@ -45,6 +45,7 @@ run_cli(args: []string, say: string -> unit) -> int
         "build" -> build_command(args, say)
         "build-lib" -> build_lib_command(args, say)
         "build-c" -> build_c_command(args, say)
+        "emit-header" -> emit_header_command(args, say)
         "run" -> run_command(args, say)
         "test" -> test_command(args, say)
         "add" -> add_command(args, say)
@@ -354,6 +355,7 @@ private build_c_command(args: []string, say: string -> unit) -> int
     var out: Option[string] = None
     var header: Option[string] = None
     var level: Option[string] = None
+    var lto: Option[string] = None
     var file = ""
     var i: usize = 2
 
@@ -367,7 +369,8 @@ private build_c_command(args: []string, say: string -> unit) -> int
 
         if took > 0
             if took == 2 then i += 1
-        else if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o" || args[i] == "--header"
+        else if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o" || args[i] == "--header" ||
+                args[i] == "--lto"
             if i + 1 >= args.len
                 say(build_c_usage())
                 return Misused
@@ -380,6 +383,17 @@ private build_c_command(args: []string, say: string -> unit) -> int
             if flag == "--target" then named = Some(args[i])
             else if flag == "--cc" then cc = Some(args[i])
             else if flag == "--header" then header = Some(args[i])
+            else if flag == "--lto"
+                // A mode clang does not have is the command line's mistake, told before anything is
+                // read, as the reference's parser tells it.
+                if args[i] != "thin" && args[i] != "full"
+                    say(s"sysl: error: '--lto ${args[i]}' names no kind of link-time optimization " +
+                        "clang has — it is thin or full")
+                    say(build_c_usage())
+                    return Misused
+                end if
+
+                lto = Some(args[i])
             else out = Some(args[i])
         else if took_level(args, i).0 != 0
             val given = took_level(args, i)
@@ -408,19 +422,67 @@ private build_c_command(args: []string, say: string -> unit) -> int
             return Failed
         Ok(resolved) -> resolved
 
-    build_c_archive(file, named, cc, at, out, header, say) match
+    // The two paths written are said by the build, ahead of the advice about what to link them with.
+    build_c_archive(file, named, cc, at, out, header, say, lto) match
         Err(why) ->
             say_failure(why, say)
             Failed
-        Ok(written) ->
-            say(s"wrote ${written.0}")
-            say(s"wrote ${written.1}")
-            Fine
+        Ok(_) -> Fine
 end build_c_command
 
 private build_c_usage() -> string =
     "usage: sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] " +
-    "[--header <path>] " + where_flags() + " <path>"
+    "[--header <path>] [--lto thin|full] " + where_flags() + " <path>\n" +
+    "  --lto <mode>  make the archive's members LLVM bitcode for this mode of link-time " +
+    "optimization, 'thin' or 'full', so a host linking with clang and lld can optimize across the " +
+    "boundary. Without it the members are native objects any C toolchain links, and the project's " +
+    "'lto' key does not change that"
+
+// `sysl emit-header <path>` -- the header `build-c` would write, printed, with nothing built.
+private emit_header_command(args: []string, say: string -> unit) -> int
+    var named: Option[string] = None
+    var file = ""
+    var i: usize = 2
+
+    while i < args.len
+        val took = took_search_flag(args, i)
+
+        if took == 0
+            say(emit_header_usage())
+            return Misused
+        end if
+
+        if took > 0
+            if took == 2 then i += 1
+        else if args[i] == "--target"
+            if i + 1 >= args.len
+                say(emit_header_usage())
+                return Misused
+            end if
+
+            i += 1
+            named = Some(args[i])
+        else
+            file = args[i]
+
+        i += 1
+
+    if file == ""
+        say(emit_header_usage())
+        return Misused
+    end if
+
+    c_header_of(file, named) match
+        Err(why) ->
+            say_failure(why, say)
+            Failed
+        Ok(text) ->
+            say(text.trim_end())
+            Fine
+end emit_header_command
+
+private emit_header_usage() -> string =
+    "usage: sysl emit-header [--target <name>] " + where_flags() + " <path>"
 
 // `sysl run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>]` -- one program, built and
 // then run, with whatever it exits with passed straight back to the shell.
@@ -808,7 +870,7 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     "emit-llvm [--target <name>] [-O<level>] <path> | " +
     "build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path> | " +
     "build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] " +
-    "<path> | " +
+    "[--lto thin|full] <path> | emit-header [--target <name>] <path> | " +
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
     "test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
     "add <coordinate>[@<version>] [<path>]"

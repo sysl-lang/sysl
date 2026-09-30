@@ -617,9 +617,14 @@ end build_native_program
 // `@link` named -- and the report says so rather than leaving it to be discovered at the C project's
 // link. Those are libraries the author chose and can be given to a linker, which is exactly the
 // distinction the standard module fails.
+//
+// **`lto` makes every member LLVM bitcode, and only the command line asks for it.** The manifest's
+// `lto` key is how the project's OWN link is done, and `build-c` does no link: the archive is for a C
+// project whose linker may be GNU ld, which refuses bitcode as "file format not recognized". So a
+// host linking with clang and lld opts in with `--lto`, and is told how the archive must be linked.
 build_c_archive(path: string, named_target: Option[string], cc: Option[string], level: string,
                 out: Option[string], header_at: Option[string],
-                say: string -> unit) -> Result[(string, string), Failure]
+                say: string -> unit, lto: Option[string] = None) -> Result[(string, string), Failure]
     val t = target_for(path, named_target).map_err(said)?
 
     if !t.builds_with_clang() then return Err(Said(Refusal(t.no_toolchain())))
@@ -656,7 +661,7 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
     var members: Buf[string] = buf()
 
     val made = build_c_members(clang, archiver, staging, path, archive_at, lowered.emitted.text,
-                               &members, t, level, probed)
+                               &members, t, level, probed, lto)
 
     discard_objects(members)
     remove_dir_all(staging)
@@ -665,15 +670,14 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
         Err(why) -> return Err(Said(why))
         Ok(_) -> ()
 
-    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+    make_dir_all(parent_of(header_out).unwrap_or("."))
 
-    val named = manifest_at(root) match
-        Ok(m) -> if m.name == "" then basename(archive_at) else m.name
-        Err(_) -> basename(archive_at)
-
-    write_text(header_out, c_header_render(lowered.exports, named)) match
+    write_text(header_out, c_header_render(lowered.exports, header_name(path))) match
         Err(_) -> return Err(Said(Refusal(s"cannot write $header_out")))
         Ok(_) -> ()
+
+    say(s"wrote $archive_at")
+    say(s"wrote $header_out")
 
     // A build that exported nothing produced an archive with no way in, and the author almost
     // certainly meant to mark something. It is a warning rather than a refusal because an archive of
@@ -688,17 +692,70 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
     if !lowered.emitted.links.is_empty()
         say(s"sysl: link this against: ${joined(lowered.emitted.links, ", ")}")
 
+    // **A package binds an installed library through `pkg_config` and need say `@link` nowhere**, so
+    // the directives alone are not the link line: the C author would meet the library's symbols as
+    // undefined. `pkg-config` itself is what answers for them, so that is what is named.
+    val required = pkg_config_names(path)
+
+    if !required.is_empty()
+        say("sysl: and against what the packages require, which pkg-config answers for: " +
+            s"pkg-config --libs ${joined(required, " ")}")
+
+    if lto.is_some()
+        say("sysl: this archive is LLVM bitcode: link it with clang and lld (-fuse-ld=lld), or with " +
+            "a linker that carries LLVM's plugin")
+
     Ok((archive_at, header_out))
 end build_c_archive
+
+// What a header's include guard is named for: the project's manifest name, and the directory it is
+// in where it has none.
+private header_name(path: string) -> string
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+
+    manifest_at(root) match
+        Ok(m) -> if m.name == "" then basename(root) else m.name
+        Err(_) -> basename(root)
+end header_name
+
+// Every `pkg_config` name the project and its packages require, each once, in the order met.
+private pkg_config_names(path: string) -> Buf[string]
+    var names: Buf[string] = buf()
+
+    pkg_config_needs(path) match
+        Err(_) -> ()
+        Ok(needs) ->
+            for i in 0..<needs.len()
+                val pc = needs.at(i).pc
+                var seen = false
+
+                for j in 0..<names.len()
+                    if names.at(j) == pc then seen = true
+
+                if !seen then names.push(pc)
+
+    names
+end pkg_config_names
+
+// `sysl emit-header <path>` -- the header `build-c` writes, with nothing compiled or archived.
+c_header_of(path: string, named_target: Option[string]) -> Result[string, Failure]
+    val t = target_for(path, named_target).map_err(said)?
+    val lowered = lower_for_c(path, t)?
+
+    if !lowered.emitted.report.is_empty()
+        return Err(Reported(analysis_report(lowered.emitted.report)))
+
+    Ok(c_header_render(lowered.exports, header_name(path)))
+end c_header_of
 
 // What the archive is made of, kept apart from the call above so that the staging members are
 // discarded whichever step failed.
 private build_c_members(clang: string, archiver: string, staging: string, path: string,
                         out: string, ir: string, members: *Buf[string], t: Target, level: string,
-                        probed: PkgAnswer) -> Result[unit, Refusal]
+                        probed: PkgAnswer, lto: Option[string]) -> Result[unit, Refusal]
     val code = s"$staging/$SyslibCodeMember"
 
-    compile_object(clang, ir, code, t, level) match
+    compile_object(clang, ir, code, t, level, lto) match
         Err(why) -> return Err(Refusal(why))
         Ok(_) -> ()
 
@@ -733,7 +790,7 @@ private build_c_members(clang: string, archiver: string, staging: string, path: 
             make_dir_all(parent_of(obj).unwrap_or("."))
 
             compile_c(clang, found.at(j), obj, t, level, probed,
-                      defines_for(declared, found.at(j))) match
+                      defines_for(declared, found.at(j)), lto) match
                 Err(why) -> return Err(Refusal(why))
                 Ok(_) -> ()
 
