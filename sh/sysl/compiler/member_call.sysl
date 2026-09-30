@@ -178,26 +178,27 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
 
     if slots.is_none() then return Some(bad_expr(span))
 
+    val before = cx.an.complaints()
     var ts: Buf[TExpr] = buf()
+    var wants: Buf[Type] = buf()
 
     for i in 0..<slots.unwrap().len()
         val want = if i < sig.unwrap().params.len() then sig.unwrap().params.at(i).1 else Unknown
 
+        wants.push(want)
+
         slots.unwrap().at(i) match
-            Some(e) ->
-                val t = type_expr(cx, e, Some(want))
-
-                if disagree(texpr_type(t), want) then
-                    cx.fault(e.span, s"'${decl.params.at(i).name}' of $shown is ${type_show(want)}, " +
-                             s"but ${type_show(texpr_type(t))} was given")
-
-                ts.push(t)
+            Some(e) -> ts.push(type_expr(cx, e, Some(want)))
             None ->
                 val inner = analyzer_for(cx.an, member_default_scope(cx, fname))
 
                 inner.reported = Some(span)
                 inner.here_src = caller_source(cx)
                 ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
+
+    val refused = refused_argument(cx, span, shown, decl.params, slots.unwrap(), ts, wants, before)
+
+    if refused.is_some() then return refused
 
     check_crossings(cx, decl.crossing, shown, sig.unwrap().params, ts)
     cx.an.uses(fname)
@@ -583,8 +584,14 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Typ
     ts.push(as_read_only(build_receiver(cx, span, m.recv_mode().unwrap(), receiver, written),
                          if params.is_empty() then Unknown else params.at(0).1))
 
+    val before = cx.an.complaints()
+    var given: Buf[TExpr] = buf()
+    var wants: Buf[Type] = buf()
+
     for i in 0..<slots.unwrap().len()
         val want = if i + 1 < params.len() then params.at(i + 1).1 else Unknown
+
+        wants.push(want)
 
         slots.unwrap().at(i) match
             Some(e) ->
@@ -601,17 +608,21 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: TExpr, rty: Typ
                     if disagree(texpr_type(t), want) then t = coerce(cx, t, want)
                 else t = type_expr(cx, e, Some(want))
 
-                if disagree(texpr_type(t), want) then
-                    cx.fault(e.span, s"'${m.params.at(i).name}' of '$name' is ${type_show(want)}, " +
-                             s"but ${type_show(texpr_type(t))} was given")
-
-                ts.push(t)
+                given.push(t)
             None ->
                 val inner = analyzer_for(cx.an, member_default_scope(cx, name))
 
                 inner.reported = Some(span)
                 inner.here_src = caller_source(cx)
-                ts.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
+                given.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
+
+    val refused = refused_argument(cx, span, s"'$name'", m.params, slots.unwrap(), given, wants,
+                                   before)
+
+    if refused.is_some() then return refused.unwrap()
+
+    for i in 0..<given.len()
+        ts.push(given.at(i))
 
     check_crossings(cx, m.crossing, shown, params, ts)
     cx.an.uses(name)
@@ -657,24 +668,31 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
     ts.push(as_read_only(build_receiver(cx, span, m.recv_mode().unwrap(), receiver, written),
                          if params.is_empty() then Unknown else params.at(0).1))
 
+    val before = cx.an.complaints()
+    var given: Buf[TExpr] = buf()
+    var wants: Buf[Type] = buf()
+
     for i in 0..<slots.unwrap().len()
         val want = if i + 1 < params.len() then params.at(i + 1).1 else Unknown
 
+        wants.push(want)
+
         slots.unwrap().at(i) match
-            Some(e) ->
-                val t = type_expr(cx, e, Some(want))
-
-                if disagree(texpr_type(t), want) then
-                    cx.fault(e.span, s"'${m.params.at(i).name}' of '$fname' is ${type_show(want)}, " +
-                             s"but ${type_show(texpr_type(t))} was given")
-
-                ts.push(t)
+            Some(e) -> given.push(type_expr(cx, e, Some(want)))
             None ->
                 val inner = analyzer_for(cx.an, member_default_scope(cx, fname))
 
                 inner.reported = Some(span)
                 inner.here_src = caller_source(cx)
-                ts.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
+                given.push(type_expr(inner, m.params.at(i).default.unwrap(), Some(want)))
+
+    val refused = refused_argument(cx, span, s"'$fname'", m.params, slots.unwrap(), given, wants,
+                                   before)
+
+    if refused.is_some() then return refused.unwrap()
+
+    for i in 0..<given.len()
+        ts.push(given.at(i))
 
     check_crossings(cx, m.crossing, shown, params, ts)
     cx.an.uses(fname)

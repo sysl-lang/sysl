@@ -858,16 +858,16 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
             // fixed the field's type.
             val built = qualified(qualified_name(key), d.targs)
 
+            val before = cx.an.complaints()
+            var given: Buf[Expr] = buf()
+
             for i in 0..<d.fields.len()
-                val want = d.fields.at(i).1
-                val e = slots.unwrap().at(i).unwrap()
-                val t = type_expr(cx, e, Some(want))
+                given.push(slots.unwrap().at(i).unwrap())
+                ts.push(type_expr(cx, given.at(i), Some(d.fields.at(i).1)))
 
-                if disagree(texpr_type(t), want) then
-                    cx.fault(e.span, s"'${d.fields.at(i).0}' of '$built' is " +
-                             s"${type_show(want)}, but ${type_show(texpr_type(t))} was given")
+            val refused = refused_field(cx, span, built, d.fields, given, ts, before)
 
-                ts.push(t)
+            if refused.is_some() then return refused.unwrap()
 
             // **A struct with `invariant` clauses is checked the moment it is built**, and every
             // construction flows through here, so one wrap covers them all. A generic one has no
@@ -1171,20 +1171,36 @@ private variant_call(cx: &Analyzer, span: Span, en: Type, v: EnumVariant,
                       s"${quantity(args.len(), "value")} " +
                       s"${if args.len() == 1 then "was" else "were"} given")
 
+    val before = cx.an.complaints()
     var ts: Buf[TExpr] = buf()
 
     for i in 0..<args.len()
-        val want = v.fields.at(i).1
-        val t = type_expr(cx, args.at(i), Some(want))
+        ts.push(type_expr(cx, args.at(i), Some(v.fields.at(i).1)))
 
-        if disagree(texpr_type(t), want) then
-            cx.fault(args.at(i).span, s"'${v.fields.at(i).0}' of '${v.name}' is " +
-                     s"${type_show(want)}, but ${type_show(texpr_type(t))} was given")
+    val refused = refused_field(cx, span, v.name, v.fields, args, ts, before)
 
-        ts.push(t)
+    if refused.is_some() then return refused.unwrap()
 
     TExpr(span, TEnumNew(en, v, ts))
 end variant_call
+
+// The same as `refused_argument`, for the values a constructor or a variant was given: `None` where
+// every one is what its field declared, and otherwise the node with no type to disagree with.
+refused_field(cx: &Analyzer, span: Span, shown: string, fields: Buf[(string, Type)],
+              given: Buf[Expr], ts: Buf[TExpr], before: usize) -> Option[TExpr]
+    if cx.an.complaints() > before
+        for i in 0..<ts.len()
+            if texpr_type(ts.at(i)) == Unknown then return Some(bad_expr(span))
+
+    for i in 0..<ts.len()
+        val got = texpr_type(ts.at(i))
+
+        if disagree(got, fields.at(i).1) then
+            return Some(cx.err(given.at(i).span, s"'${fields.at(i).0}' of '$shown' is " +
+                               s"${type_show(fields.at(i).1)}, but ${type_show(got)} was given"))
+
+    None
+end refused_field
 
 // A **generic** enum's variant, at the arguments the values it carries determine.
 //
@@ -1848,23 +1864,24 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
     if cx.an.tables.externs.has(key) then cx.an.uses_extern(key)
 
     val slots = bound.unwrap()
+    val before = cx.an.complaints()
     var ts: Buf[TExpr] = buf()
+    var wants: Buf[Type] = buf()
 
     for i in 0..<slots.len()
         val p = f.decl.params.at(i)
         val want = param_type(cx, f, p)
 
+        wants.push(want)
+
         slots.at(i) match
-            Some(e) ->
-                val t = type_expr(cx, e, Some(want))
-
-                if disagree(texpr_type(t), want) then
-                    cx.fault(e.span, s"'${p.name}' of '$shown' is ${type_show(want)}, but " +
-                             s"${type_show(texpr_type(t))} was given")
-
-                ts.push(t)
+            Some(e) -> ts.push(type_expr(cx, e, Some(want)))
             // A parameter's default, spliced in where the argument was not written.
             None -> ts.push(fill_default(cx, span, key, f.scope, p, want))
+
+    val refused = refused_argument(cx, span, s"'$shown'", f.decl.params, slots, ts, wants, before)
+
+    if refused.is_some() then return refused.unwrap()
 
     // The tail of a variadic definition, which no parameter names: the body reads it with `va_arg`,
     // so each argument is analyzed at whatever type it has and passed as C's promotions leave it.
@@ -1890,6 +1907,41 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
     cx.an.uses(key)
     TExpr(span, TCall(key, ts, ret, false))
 end call_key
+
+// What a call whose arguments are read stands for when one of them is wrong: `None` where every
+// argument is what its parameter declared, and otherwise the node that has no type for anything
+// downstream to disagree with. `shown` is the callee as the refusal names it, quotes and all, and
+// `report` is off for a trial reading, which only has to say that it did not fit.
+//
+// **A refused argument is the call's one mistake.** Every argument is read before any is checked,
+// so an argument that could not be read at all is told rather than the parameter it went to, and
+// the checks stop at the first that disagrees -- the reference gives up on the whole statement
+// there, so a second bad argument, and a result the call never had, are consequences.
+refused_argument(cx: &Analyzer, span: Span, shown: string, params: Buf[Param],
+                 slots: Buf[Option[Expr]], ts: Buf[TExpr], wants: Buf[Type],
+                 before: usize, report: bool = true) -> Option[TExpr]
+    // Only where reading them said something: an `Unknown` nothing reported is not a mistake
+    // already told, and must not quietly become one the build never mentions.
+    if cx.an.complaints() > before
+        for i in 0..<ts.len()
+            if texpr_type(ts.at(i)) == Unknown then return Some(bad_expr(span))
+
+    for i in 0..<slots.len()
+        slots.at(i) match
+            Some(e) ->
+                val got = texpr_type(ts.at(i))
+
+                // A trial reading says only that it did not fit, which is all it is asked.
+                if disagree(got, wants.at(i)) && !report then
+                    return Some(cx.err(e.span, "argument disagrees"))
+
+                if disagree(got, wants.at(i)) then
+                    return Some(cx.err(e.span, s"'${params.at(i).name}' of $shown is " +
+                                       s"${type_show(wants.at(i))}, but ${type_show(got)} was given"))
+            None -> ()
+
+    None
+end refused_argument
 
 // Which written argument fills which parameter.
 //
@@ -2118,6 +2170,9 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
     // in `take(give())`: this order is the order the `declare` lines come out in.
     cx.an.uses_extern(key)
 
+    val before = cx.an.complaints()
+    var wants: Buf[Type] = buf()
+
     for i in 0..<slots.len()
         // **A C `va_list` parameter takes the address of the walk**, since that is what sysl has to
         // give and what every target's answer is formed from -- so the argument is checked as a
@@ -2129,16 +2184,21 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
         val declared = resolve_type(cx.an, scope, p.typ, no_bindings())
         val want = if by_value then Ptr(VaList) else declared
 
+        wants.push(want)
+
         slots.at(i) match
-            Some(e) ->
-                val t = type_expr(cx, e, Some(want))
-
-                if disagree(texpr_type(t), want) then
-                    cx.fault(e.span, s"'${p.name}' of '$written' is ${type_show(want)}, but " +
-                             s"${type_show(texpr_type(t))} was given")
-
-                ts.push(if by_value then TExpr(e.span, TVaPass(t)) else t)
+            Some(e) -> ts.push(type_expr(cx, e, Some(want)))
             None -> ts.push(fill_default(cx, span, key, scope, p, want))
+
+    val refused = refused_argument(cx, span, s"'$written'", d.params, slots, ts, wants, before)
+
+    if refused.is_some() then return refused.unwrap()
+
+    // The walk is handed over only once every argument is known to be what its parameter wanted,
+    // since the check reads the argument's own type.
+    for i in 0..<slots.len()
+        if written_va_list(d.params.at(i).typ) && slots.at(i).is_some() then
+            ts.set(i, TExpr(slots.at(i).unwrap().span, TVaPass(ts.at(i))))
 
     for i in slots.len()..<args.len()
         ts.push(variadic_extra(cx, args.at(i)))

@@ -1,0 +1,117 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A call whose arguments were refused has no result for anything downstream to disagree with.
+//
+// **The refusal is the one mistake**, so what the call stands in -- a body's result, a declared
+// `val`, an operand, another call's argument, a `return` -- says nothing of its own about it. And the
+// checks stop at the call's first refused argument, so a second one is not told either.
+//
+// **Every message and position here was read out of the reference compiler** (0.0.151) on the same
+// input.
+
+// Every diagnostic the body pass gives, each as `line:col: message`, one to a line.
+private afo_said(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return "did not parse"
+
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    var out = ""
+
+    for i in 0..<done.reported.len()
+        val p = done.reported.at(i)
+        val at = p.src.locate(p.diag.span.start)
+
+        if i > 0 then out = out + "\n"
+
+        out = out + s"${at.line}:${at.col}: ${p.diag.message}"
+
+    out
+end afo_said
+
+private afo_decl() -> string ="skip_line(n: int) -> int = n\n\n"
+
+@test("a refused argument is the body's one mistake, not also a result of the wrong type")
+afo_refused_argument_as_the_body() =
+    assert_eq(afo_said(afo_decl() + "use() -> string = skip_line(\"x\")\n"),
+              "3:29: 'n' of 'skip_line' is int, but string was given")
+
+// The reference anchors this one at the declaration (3:1) and this compiler at the body (3:19),
+// which is the open divergence about anchors, so the message alone is asserted.
+@test("and a call whose arguments were fine still owes the declared result")
+afo_accepted_call_still_checked()
+    val ds = stmt_diagnostics(afo_decl() + "use() -> string = skip_line(1)\n")
+
+    assert_eq(ds.len(), 1)
+    assert_eq(ds.at(0), "function 'use' should return string, but its body yields int")
+end afo_accepted_call_still_checked
+
+@test("a refused call initializing a declared 'val' is not also a mismatch with the declaration")
+afo_refused_call_at_a_declared_val() =
+    assert_eq(afo_said(afo_decl() + "use() -> int\n    val s: string = skip_line(\"x\")\n    0\n"),
+              "4:31: 'n' of 'skip_line' is int, but string was given")
+
+@test("a refused call bound without a type leaves its name nothing to disagree with")
+afo_refused_call_at_an_inferred_val() =
+    assert_eq(afo_said(afo_decl() + "use() -> string\n    val s = skip_line(\"x\")\n    s\n"),
+              "4:23: 'n' of 'skip_line' is int, but string was given")
+
+@test("a refused call as an operand says nothing about the operator")
+afo_refused_call_as_an_operand() =
+    assert_eq(afo_said(afo_decl() + "use() -> string = skip_line(\"x\") + 1\n"),
+              "3:29: 'n' of 'skip_line' is int, but string was given")
+
+@test("a refused call as another call's argument says nothing about the outer parameter")
+afo_refused_call_as_an_argument() =
+    assert_eq(afo_said(afo_decl() + "take(s: string) -> int = 0\n\nuse() -> int = take(skip_line(\"x\"))\n"),
+              "5:31: 'n' of 'skip_line' is int, but string was given")
+
+@test("a refused call as a 'return' value says nothing about the declared result")
+afo_refused_call_returned() =
+    assert_eq(afo_said(afo_decl() + "use() -> string\n    return skip_line(\"x\")\n"),
+              "4:22: 'n' of 'skip_line' is int, but string was given")
+
+@test("too many arguments is the one mistake too")
+afo_too_many_arguments() =
+    assert_eq(afo_said(afo_decl() + "use() -> string = skip_line(1, 2)\n"),
+              "3:19: function 'skip_line' takes 1 argument, but 2 arguments were given")
+
+@test("and so is too few")
+afo_too_few_arguments() =
+    assert_eq(afo_said(afo_decl() + "use() -> string = skip_line()\n"),
+              "3:19: function 'skip_line' takes 1 argument, but 0 arguments were given")
+
+@test("two refused arguments of one call are told once, at the first")
+afo_two_refused_arguments() =
+    assert_eq(afo_said("two(a: int, b: int) -> int = a\n\nuse() -> string = two(\"x\", \"y\")\n"),
+              "3:23: 'a' of 'two' is int, but string was given")
+
+@test("an argument that could not be read at all is told instead of its parameter")
+afo_unreadable_argument_first() =
+    assert_eq(afo_said("two(a: int, b: int) -> int = a\n\nuse() -> int = two(\"x\", nope)\n"),
+              "3:25: undefined name 'nope'")
+
+@test("each statement's refused call is told, the next statement being read afresh")
+afo_one_refusal_per_statement() =
+    assert_eq(afo_said("two(a: int, b: int) -> int = a\n\nuse() -> int\n    val x = two(1, \"y\")\n" +
+                       "    val y = two(\"z\", 2)\n    x\n"),
+              "4:20: 'b' of 'two' is int, but string was given\n" +
+              "5:17: 'a' of 'two' is int, but string was given")
+
+@test("a method's refused argument is the one mistake")
+afo_refused_method_argument() =
+    assert_eq(afo_said("struct P\n    x: int\n\n    get(self, n: int) -> int = n\n\nuse(p: P) -> string = p.get(\"x\")\n"),
+              "6:29: 'n' of 'P.get' is int, but string was given")
+
+@test("a constructor's refused field is the one mistake")
+afo_refused_constructor_field() =
+    assert_eq(afo_said("struct P\n    x: int\n\nuse() -> string = P(\"x\")\n"),
+              "4:21: 'x' of 'P' is int, but string was given")
