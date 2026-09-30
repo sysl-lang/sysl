@@ -76,7 +76,12 @@ enum Tok derives Eq, Display
     //
     // `parts.len() == exprs.len() + 1` and `specs.len() == exprs.len()`, which is what lets the
     // parser interleave them: `parts[0] + render(exprs[0]) + parts[1] + ...`.
-    StrInterp(parts: Buf[string], exprs: Buf[string], specs: Buf[string])
+    //
+    // `starts` carries one entry per hole too: the offset its source begins at, in the text the
+    // literal was read from. A hole is a run of that text and never crosses a line, so its start is
+    // all it takes to read the hole where it stands -- which is what puts a complaint about a name
+    // inside one under that name rather than at the head of the file.
+    StrInterp(parts: Buf[string], exprs: Buf[string], specs: Buf[string], starts: Buf[usize])
 
     // `'name` -- the name a loop carries, so that a `break` can say which one it leaves. It is told
     // from a character literal by the absence of a closing quote.
@@ -136,8 +141,18 @@ end Lexed
 lex(src: Source) -> Result[Buf[Spanned[Tok]], Diagnostic] = Ok(lex_documented(src)?.tokens)
 
 // The same read, with the documentation comments kept.
-lex_documented(src: Source) -> Result[Lexed, Diagnostic]
-    var s = scan(src)
+lex_documented(src: Source) -> Result[Lexed, Diagnostic] = lex_from(scan(src))
+
+// One run of a source read into tokens, every span an offset into the whole source.
+//
+// **This is how an interpolation hole is read**: `${ f(x) }` is an expression written inside a
+// literal, and reading it out of the file it sits in -- rather than out of a copy of its own text --
+// is what gives every token of it the position the reader sees it at.
+lex_within(src: Source, from: usize, to: usize) -> Result[Buf[Spanned[Tok]], Diagnostic] =
+    Ok(lex_from(Scanner(src.bytes[0..<to], from))?.tokens)
+
+private lex_from(start: Scanner) -> Result[Lexed, Diagnostic]
+    var s = start
     var lay = layout()
     var out: Buf[Spanned[Tok]] = buf()
     var docs: Buf[Spanned[string]] = buf()
@@ -212,7 +227,7 @@ lex_documented(src: Source) -> Result[Lexed, Diagnostic]
 
     out.push(Spanned(Eof, eof))
     Ok(Lexed(out, docs))
-end lex_documented
+end lex_from
 
 // Turn one line's indentation into the tokens that stand for it.
 //

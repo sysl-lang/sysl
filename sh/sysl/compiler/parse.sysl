@@ -253,7 +253,7 @@ can_begin_expr(t: Tok) -> bool = t match
     CharLit(_) -> true
     StrLit(_) -> true
     CStrLit(_) -> true
-    StrInterp(_, _, _) -> true
+    StrInterp(_, _, _, _) -> true
     Ident(_) -> true
     QuotedIdent(_) -> true
     Label(_) -> true
@@ -352,7 +352,24 @@ parser_over(src: Source) -> Result[Parser, Diagnostic] =
 parse_expr_text(name: string, text: string) -> ParsedExpr
     val src = source_of(name, text)
 
-    parser_over(src) match
+    one_expr(src, parser_over(src))
+end parse_expr_text
+
+// One expression, read from a run of a source where it stands.
+//
+// **Every node it builds is positioned in the source itself**, which is the difference between this
+// and reading a copy of the run: an interpolation hole is code a reader sees at a line and a column
+// of their file, and a complaint about a name inside one belongs there.
+parse_expr_within(src: Source, from: usize, to: usize) -> ParsedExpr
+    val toks = lex_within(src, from, to) match
+        Ok(ts) -> ts
+        Err(d) -> return one_expr(src, Err(d))
+
+    one_expr(src, Ok(Parser(tokens_of(toks), src, report(), 0, 0, 0, 0)))
+end parse_expr_within
+
+private one_expr(src: Source, over: Result[Parser, Diagnostic]) -> ParsedExpr
+    over match
         Err(d) ->
             var r = report()
 
@@ -368,7 +385,7 @@ parse_expr_text(name: string, text: string) -> ParsedExpr
             if !p.end_of_statement() then p.want("newline")
 
             ParsedExpr(e, p.report, src)
-end parse_expr_text
+end one_expr
 
 // One type, read from text.
 parse_type_text(name: string, text: string) -> ParsedType
