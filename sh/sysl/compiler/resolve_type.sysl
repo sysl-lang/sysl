@@ -986,9 +986,22 @@ end bindings_for
 // They are filled left to right, each resolved under the arguments already fixed, so a later default
 // may name an earlier parameter and `[A, B = A]` means what it reads as. A default is written in the
 // file that declares it, so it is resolved in **that** file's terms rather than the applying one's.
-filled_targs(a: &Analysis, home: Scope, tparams: Buf[string], tdefaults: Buf[TypeBinding],
-             targs: Buf[Type]) -> Buf[Type]
-    if targs.len() >= tparams.len() || tdefaults.is_empty() then return targs
+//
+// **Nothing is answered where a default leads back to the declaration being filled**: that is
+// reported (`default_cycle`), and the use has no type.
+private filled_targs(a: &Analysis, scope: Scope, span: Span, key: string, home: Scope,
+                     tparams: Buf[string], tdefaults: Buf[TypeBinding],
+                     targs: Buf[Type]) -> Option[Buf[Type]]
+    if targs.len() >= tparams.len() || tdefaults.is_empty() then return Some(targs)
+
+    val mark = type_filling_mark(key)
+
+    if holds_string(a.defaults_filling, mark)
+        default_cycle(a, scope, span, key)
+        return None
+    end if
+
+    a.defaults_filling.push(mark)
 
     var filled: Buf[Type] = buf()
 
@@ -1006,8 +1019,29 @@ filled_targs(a: &Analysis, home: Scope, tparams: Buf[string], tdefaults: Buf[Typ
         if w.is_none() then filled.push(Unknown)
         else filled.push(resolve_type(a, home, w.unwrap(), here))
 
-    filled
+    a.defaults_filling.truncate(a.defaults_filling.len() - 1)
+    Some(filled)
 end filled_targs
+
+// Holds the arguments a generic **type** was applied to -- the ones a default filled included -- to
+// what the declaration asked of its parameters, now if that can be answered and once every `impl`
+// is registered if it cannot.
+//
+// A bound is resolved in the declaration's terms and the refusal belongs to the file that wrote the
+// application. **Only a settled argument list is asked**: a parameter standing in for itself is
+// answered by its own bounds, where the body it stands in is read at a type.
+private applied_bounds(a: &Analysis, scope: Scope, span: Span, key: string, home: Scope,
+                       tparams: Buf[string], bounds: Buf[NamedBounds], targs: Buf[Type])
+    if bounds.is_empty() || tparams.len() != targs.len() then return
+
+    for i in 0..<targs.len()
+        if targs.at(i) == Unknown || mentions_abstract(targs.at(i)) then return
+
+    if a.tables.members.hoisted then
+        check_param_bounds(a, home, span, key, tparams, bounds, targs, buf(), "type parameter", scope)
+    else a.tables.members.deferred.push(DeferredBound(key, tparams, bounds, targs, span, home, scope,
+                                                      "type parameter"))
+end applied_bounds
 
 // A struct at these arguments.
 //
@@ -1018,7 +1052,14 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, written_targs) then
         return Unknown
 
-    val targs = filled_targs(a, home, d.tparams, d.tdefaults, written_targs)
+    val fill = filled_targs(a, scope, span, key, home, d.tparams, d.tdefaults, written_targs)
+
+    if fill.is_none() then return Unknown
+
+    val targs = fill.unwrap()
+
+    applied_bounds(a, scope, span, key, home, d.tparams, d.bounds, targs)
+
     val inst = instance_key(key, targs)
     val already = a.tables.struct_insts.get(inst)
 
@@ -1064,7 +1105,14 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
     if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, written_targs) then
         return Unknown
 
-    val targs = filled_targs(a, home, d.tparams, d.tdefaults, written_targs)
+    val fill = filled_targs(a, scope, span, key, home, d.tparams, d.tdefaults, written_targs)
+
+    if fill.is_none() then return Unknown
+
+    val targs = fill.unwrap()
+
+    applied_bounds(a, scope, span, key, home, d.tparams, d.bounds, targs)
+
     val inst = instance_key(key, targs)
     val already = a.tables.enum_insts.get(inst)
 
@@ -1255,7 +1303,11 @@ private instantiate_trait(a: &Analysis, scope: Scope, span: Span, written: strin
     if !d.tparams.is_empty() then
         if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, targs) then return Unknown
 
-    Trait(key, targs, named)
+    // **What the use leaves out the trait supplies**, exactly as it does at a bound or an `impl` --
+    // so `&Sink` over `trait Sink[T = int]` is `&Sink[int]`, one type under either spelling. The one
+    // default that cannot be taken is one naming `Self`.
+    object_defaults(a, scope, span, key, d, targs.len())
+    Trait(key, trait_args_with_defaults(a, scope, span, key, d, targs, buf()), named)
 end instantiate_trait
 
 private joined_assocs(a: Buf[(string, Type)], b: Buf[(string, Type)]) -> Buf[(string, Type)]

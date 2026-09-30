@@ -1,0 +1,205 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// A type parameter's default, checked where it is **written** (`reference/generics.md § A parameter
+// may carry a default`).
+//
+// A default belongs only where arguments are written: a trait, a struct and an enum are applied to
+// an argument list, and a default fills the arguments a use left out. A function's parameters are
+// fixed by what a call passes, a method's by that and its receiver, an `impl` block's by the type it
+// is for -- there are no call-site type arguments, so in none of the three is there a list with a
+// gap in it, and a default there is refused.
+//
+// What a default has to **satisfy** is asked at each use instead, where the filled list is read.
+
+// -- where a parameter is solved rather than written ----------------------------------------------
+
+// Refuses every default written on a parameter that is solved, over one file's declarations.
+check_solved_defaults(a: &Analysis, scope: Scope, body: Buf[Stmt])
+    for i in 0..<body.len()
+        *body.at(i).kind match
+            FuncDecl(d) -> refuse_solved(a, scope, "the function", d.name, d.tdefaults)
+            StructDecl(d) -> refuse_solved_members(a, scope, d.name, d.members)
+            EnumDecl(d) -> refuse_solved_members(a, scope, d.name, d.members)
+            TraitDecl(d) -> refuse_solved_members(a, scope, d.name, d.methods)
+            ImplDecl(d) ->
+                refuse_solved(a, scope, "the 'impl' block",
+                              s"${module_show(d.trait_name)} for ${type_text(d.for_type)}", d.tdefaults)
+                refuse_solved_members(a, scope, module_show(d.trait_name), d.methods)
+            _ -> ()
+end check_solved_defaults
+
+private refuse_solved_members(a: &Analysis, scope: Scope, owner: string, ms: Buf[MethodDecl])
+    for i in 0..<ms.len()
+        refuse_solved(a, scope, "the method", s"$owner.${ms.at(i).name}", ms.at(i).tdefaults)
+
+// One complaint per default, in the order of the parameters' names.
+private refuse_solved(a: &Analysis, scope: Scope, noun: string, label: string,
+                      tdefaults: Buf[TypeBinding])
+    var said: Buf[string] = buf()
+
+    for round in 0..<tdefaults.len()
+        var next: Option[usize] = None
+
+        for i in 0..<tdefaults.len()
+            val name = tdefaults.at(i).name
+
+            if !holds_string(said, name) && (next.is_none() || name < tdefaults.at(next.unwrap()).name) then
+                next = Some(i)
+
+        if next.is_none() then return
+
+        val b = tdefaults.at(next.unwrap())
+
+        said.push(b.name)
+        a.fault(scope, b.typ.span, s"'${b.name}' is a type parameter of $noun '$label', whose type " +
+                "parameters are solved from what it is given rather than written where it is used " +
+                s"— so '= ${type_text(b.typ)}' has nothing to stand in for")
+end refuse_solved
+
+// -- what a written default has to be -------------------------------------------------------------
+
+// Checks the defaults of the three declarations whose arguments *are* written, once every type is
+// registered, since a default may name one declared below it.
+//
+// **Each declaration's first complaint is its only one**, and what resolving a default makes real is
+// thrown away: a default is read here to be held to being a type, and the types a program has are the
+// ones its uses ask for.
+check_type_defaults(a: &Analysis)
+    for i in 0..<a.tables.types.len()
+        val key = a.tables.types.key_at(i)
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            TraitOf(d) -> check_declared(a, decl.scope, decl.span, "trait", key, d.tparams, d.tdefaults)
+            StructOf(d) -> check_declared(a, decl.scope, decl.span, "struct", key, d.tparams, d.tdefaults)
+            EnumOf(d) -> check_declared(a, decl.scope, decl.span, "enum", key, d.tparams, d.tdefaults)
+            _ -> ()
+end check_type_defaults
+
+private check_declared(a: &Analysis, scope: Scope, span: Span, noun: string, key: string,
+                       tparams: Buf[string], tdefaults: Buf[TypeBinding])
+    if tdefaults.is_empty() then return
+
+    val outer = a.open_region()
+    val trial = a.sandboxed()
+    val queued = a.tables.members.pending.len()
+    val tables = a.tables.members.vtables.len()
+    val structs = a.tables.struct_insts.len()
+    val enums = a.tables.enum_insts.len()
+    val constrained = a.tables.constrained_insts.len()
+
+    read_declared(a, scope, span, noun, key, tparams, tdefaults)
+
+    a.release(trial)
+    rewind_instantiations(a, queued, tables, structs, enums, constrained)
+    a.close_region(outer)
+end check_declared
+
+private read_declared(a: &Analysis, scope: Scope, span: Span, noun: string, key: string,
+                      tparams: Buf[string], tdefaults: Buf[TypeBinding])
+    var first: Option[usize] = None
+
+    for i in 0..<tparams.len()
+        if first.is_none() && has_binding(tdefaults, tparams.at(i)) then first = Some(i)
+
+    if first.is_none() then return
+
+    // Arguments are written left to right, so a parameter with no default sitting behind one that
+    // has could never be reached: leaving the earlier one out would leave nothing for the later one
+    // to be written after. The shape is refused here rather than at every use.
+    val head = tparams.at(first.unwrap())
+
+    for i in first.unwrap() + 1..<tparams.len()
+        val tp = tparams.at(i)
+
+        if !has_binding(tdefaults, tp) then
+            a.fault(scope, span, s"'$tp' has no default and comes after '$head', which has one — a " +
+                    s"use writes its arguments in order, so nothing could leave out '$head' and " +
+                    s"still supply '$tp'")
+
+    // Resolved in the order a use fills them, each under the ones already fixed. A parameter with
+    // no default stands in for itself, so a default naming one to its left is ordinary and one
+    // naming a parameter to its right is caught as the forward reference it is.
+    val is_trait = noun == "trait"
+    var known: Buf[Binding] = buf()
+
+    if is_trait then known.push(Binding("Self", Abstract("Self", buf())))
+
+    for i in 0..<tparams.len()
+        val tp = tparams.at(i)
+        val written = binding_named(tdefaults, tp)
+
+        if written.is_none()
+            known.push(Binding(tp, Abstract(tp, buf())))
+            continue
+        end if
+
+        val t = written.unwrap()
+
+        if ref_mentions(t, one_name(tp)) then
+            a.fault(scope, t.span, s"the default for '$tp' names '$tp' — a parameter cannot stand " +
+                    "in for itself")
+
+        for j in i + 1..<tparams.len()
+            val later = tparams.at(j)
+
+            if ref_mentions(t, one_name(later)) then
+                a.fault(scope, t.span, s"the default for '$tp' names '$later', which is fixed " +
+                        "after it — a default may name only the parameters written before it")
+
+        if !is_trait && ref_mentions(t, one_name("Self")) then
+            a.fault(scope, t.span, s"'Self' is the type implementing a trait, and $noun " +
+                    s"'${qualified_name(key)}' is not a trait — so the default for '$tp' has " +
+                    "nothing to name")
+
+        known.push(Binding(tp, resolve_type(a, scope, t, known)))
+end read_declared
+
+private one_name(name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(name)
+    out
+end one_name
+
+// -- a default that leads back to its own declaration ---------------------------------------------
+
+// The name a declaration is filed under while its type parameters' defaults are being filled. It
+// shares `Analysis.defaults_filling` with the value parameters' defaults, so it is spelled as
+// nothing a function's key can be.
+type_filling_mark(key: string) -> string = s"type $key"
+
+// A default that leads back to the declaration it belongs to would fill for ever, since each arrival
+// applies the declaration to fewer arguments than it declares and so asks for the defaults again.
+//
+// **It is told once for a declaration**, where the walk first closed it: that is the default's own
+// position, the declarations being checked before anything uses them, and every use after it is a
+// consequence of the same mistake.
+default_cycle(a: &Analysis, scope: Scope, span: Span, key: string)
+    val shown = qualified_name(key)
+    val message = s"filling a type argument of '$shown' from its default leads back to '$shown' — " +
+                  "a default cannot stand in for a type that is still being worked out"
+
+    for i in 0..<a.found.len()
+        if a.found.at(i).diag.message == message then return
+
+    a.fault(scope, span, message)
+end default_cycle
+
+// -- an object ------------------------------------------------------------------------------------
+
+// An object has forgotten which type it holds, so a default that names the implementing type has
+// nothing to stand for there, and writing the argument is the fix.
+object_defaults(a: &Analysis, scope: Scope, span: Span, key: string, d: TraitDecl, written: usize)
+    for i in written..<d.tparams.len()
+        val tp = d.tparams.at(i)
+        val t = binding_named(d.tdefaults, tp)
+
+        if t.is_some() && ref_mentions(t.unwrap(), one_name("Self")) then
+            a.fault(scope, span, s"'$tp' defaults to '${type_text(t.unwrap())}', which names the " +
+                    s"type implementing '${qualified_name(key)}', and an object has forgotten " +
+                    "which type it holds — write the argument")
+end object_defaults

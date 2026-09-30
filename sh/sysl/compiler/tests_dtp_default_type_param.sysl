@@ -1,0 +1,681 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A type parameter that carries a default (`reference/generics.md § A parameter may carry a
+// default`): `trait Scale[R = Self]`, `struct Pair[A, B = A]`.
+//
+// The customer is the operator catalog: a heterogeneous operand -- `Complex * f64` -- wants
+// `Mul[Rhs]` rather than `Mul`, and that change cannot be made without defaults, since every
+// `impl Mul for Point` already written would become `impl Mul[Point] for Point` and `[T: Mul]` would
+// stop saying what it says now. So the case that matters most is `Self` as the default, which is what
+// makes those two spellings mean the same thing.
+//
+// **A default belongs only where arguments are WRITTEN.** There are no call-site type arguments, so a
+// function's, a method's and an `impl` block's parameters are solved rather than supplied, and a
+// default there is refused.
+//
+// **Every output, message and location here was read out of the reference compiler** (0.0.152) on
+// the same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private dtp_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end dtp_skip
+
+private dtp_skip_run() -> bool
+    if dtp_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end dtp_skip_run
+
+// A program of one entry file, and optionally a module `m` beside it. A module is a directory, so
+// what is written is a tree with a manifest at its root.
+private dtp_write(main: string, m: string) -> string
+    val root = make_temp_dir("sysl-dtp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    if m != ""
+        make_dir_all(root + "/m").unwrap()
+        write_text(root + "/m/m.sysl", m).unwrap()
+    end if
+
+    root
+end dtp_write
+
+// What the program PRINTS, or what the build had to say about it.
+private dtp_ran_in(m: string, main: string) -> string
+    val root = dtp_write(main, m)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end dtp_ran_in
+
+private dtp_ran(main: string) -> string = dtp_ran_in("", main)
+
+// What analysing the program had to say, rendered as the command line renders it.
+private dtp_said_in(m: string, main: string) -> string
+    val root = dtp_write(main, m)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end dtp_said_in
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private dtp_refused(main: string, message: string, at: string)
+    val out = dtp_said_in("", main)
+
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end dtp_refused
+
+// A public declaration of the module `m` is refused for a default that reaches less far than it
+// does. **The message quotes the declaring file by its path**, which is a scratch directory here, so
+// the two halves around it are what is asserted.
+private dtp_default_too_private(m: string, name: string, at: string)
+    val out = dtp_said_in(m, s"import m.$name\nprint(1)")
+    val head = s"error: '$name' is public, but the default for 'T' names 'm.Secret', which is private to '"
+    val tail = "/m/m.sysl', the file that declares it — a declaration may not be more visible than " +
+               "the types it names\n --> "
+
+    assert(out.starts_with(head), s"expected the refusal first, got: $out")
+    assert(out.index_of(tail).is_some(), s"expected the declaring file named, got: $out")
+    assert(out.index_of(s"/m/m.sysl:$at\n").is_some(), s"expected it at m/m.sysl:$at, got: $out")
+end dtp_default_too_private
+
+// The LLVM text of the program, for a claim about what was emitted rather than about what ran.
+private dtp_ir(main: string) -> string
+    val root = dtp_write(main, "")
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end dtp_ir
+
+// How many times `what` is written in `text`.
+private dtp_count(text: string, what: string) -> int
+    var n = 0
+    var rest = text
+
+    loop
+        rest.index_of(what) match
+            None -> break
+            Some(i) ->
+                n += 1
+                rest = rest[i + what.bytes.len..<rest.bytes.len]
+
+    n
+end dtp_count
+
+// A trait whose parameter is the operand type, defaulting to the implementing type -- the shape the
+// catalog's `Mul` is meant to take.
+private dtp_scale() -> string =
+    "trait Scale[R = Self]\n    scale(self, k: R) -> Self\nstruct P\n    v: int\n" +
+    "impl Scale for P\n    scale(self, k: P) -> P = P(self.v * k.v)\n"
+
+private dtp_pair() -> string = "struct Pair[A, B = A]\n    x: A\n    y: B\n"
+
+// -- what a default stands in for -----------------------------------------------------------------
+
+@test("a trait applied to nothing takes its default")
+dtp_a_trait_takes_its_default()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("trait Sink[T = int]\n    put(self, x: T) -> int\nstruct C\n    n: int\n" +
+                      "impl Sink for C\n    put(self, x: int) -> int = self.n + x\n" +
+                      "f[T: Sink](c: T) -> int = c.put(5)\nprint(f(C(10)))"), "15\n")
+
+// The half the catalog is waiting on: an `impl` written with no arguments means the one written with
+// `Self`'s value, so nothing already in the language has to be respelled.
+@test("'Self' as a default is the implementing type at an impl")
+dtp_self_is_the_implementing_type()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran(dtp_scale() + "print(P(6).scale(P(7)).v)"), "42\n")
+
+@test("and writing that argument out is the same implementation")
+dtp_the_written_argument_is_the_same()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("trait Scale[R = Self]\n    scale(self, k: R) -> Self\nstruct P\n    v: int\n" +
+                      "impl Scale[P] for P\n    scale(self, k: P) -> P = P(self.v * k.v)\n" +
+                      "print(P(6).scale(P(7)).v)"), "42\n")
+
+// And the other half: a bound naming the trait bare asks for it at the bounded parameter, so
+// `[T: Scale]` keeps meaning what it meant before the trait took a parameter at all.
+@test("'Self' as a default is the parameter itself at a bound")
+dtp_self_is_the_parameter_at_a_bound()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran(dtp_scale() + "f[T: Scale](a: T, b: T) -> T = a.scale(b)\n" +
+                      "print(f(P(6), P(7)).v)"), "42\n")
+
+@test("a bound may still fix the argument to something else")
+dtp_a_bound_may_fix_the_argument()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("trait Scale[R = Self]\n    scale(self, k: R) -> Self\nstruct P\n    v: int\n" +
+                      "impl Scale[int] for P\n    scale(self, k: int) -> P = P(self.v * k)\n" +
+                      "f[T: Scale[int]](a: T) -> T = a.scale(3)\nprint(f(P(14)).v)"), "42\n")
+
+@test("a struct takes its default")
+dtp_a_struct_takes_its_default()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran(dtp_pair() + "var p: Pair[int] = Pair(3, 4)\nprint(p.x + p.y)"), "7\n")
+
+@test("an enum takes its default")
+dtp_an_enum_takes_its_default()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("enum Slot[T = int]\n    Empty\n    Full(value: T)\n" +
+                      "held(s: Slot) -> int = s match\n    Full(v) -> v\n    Empty -> 0\n" +
+                      "var s: Slot = Full(9)\nprint(held(s))"), "9\n")
+
+@test("a default may name a parameter written before it")
+dtp_a_default_names_an_earlier_parameter()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran(dtp_pair() + "var p: Pair[string] = Pair(\"a\", \"b\")\nprint(p.x + p.y)"),
+              "ab\n")
+
+@test("and may build a type out of one")
+dtp_a_default_builds_a_type_out_of_one()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("struct Holder[A, B = []A]\n    one: A\n    many: B\nvar xs = [1, 2, 3]\n" +
+                      "var h: Holder[int] = Holder(4, xs[0..<3])\nprint(h.one + h.many[2])"), "7\n")
+
+// Filling happens before anything is keyed on the arguments, so the written-out and the left-out
+// spellings are one instantiation rather than two that happen to have the same fields. Asserted on
+// the emitted module, the only place two would show up as two.
+@test("the filled and the written spelling are one instantiation")
+dtp_filled_and_written_are_one_instantiation()
+    if dtp_skip() then return
+
+    val out = dtp_ir(dtp_pair() + "var p: Pair[int] = Pair(1, 2)\nvar q: Pair[int, int] = Pair(3, 4)\n" +
+                     "print(p.x + q.y)")
+
+    assert(out.index_of("\n%struct.Pair.int.int = type { i32, i32 }\n").is_some(), out)
+    assert_eq(dtp_count(out, "\n%struct.Pair"), 1)
+
+@test("different fills are different types")
+dtp_different_fills_are_different_types()
+    if dtp_skip() then return
+
+    val out = dtp_ir(dtp_pair() + "var p: Pair[int] = Pair(1, 2)\n" +
+                     "var q: Pair[int, bool] = Pair(3, true)\nprint(p.x + q.x)")
+
+    assert(out.index_of("\n%struct.Pair.int.int = type { i32, i32 }\n").is_some(), out)
+    assert(out.index_of("\n%struct.Pair.int.bool = type { i32, i1 }\n").is_some(), out)
+    assert_eq(dtp_count(out, "\n%struct.Pair"), 2)
+
+@test("a default may name a type declared below the one that defaults to it")
+dtp_a_default_names_a_type_declared_below()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("struct Holder[T = Later]\n    v: T\nstruct Later\n    n: int\n" +
+                      "var h: Holder = Holder(Later(7))\nprint(h.v.n)"), "7\n")
+
+// -- what a requirement does with one -------------------------------------------------------------
+
+// A required trait is applied like any other, so it takes the defaults too -- and `Self` in one of
+// them is the type implementing the *requiring* trait, the same type all the way down a chain.
+@test("a required trait takes its default")
+dtp_a_required_trait_takes_its_default()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("trait Scale[R = Self]\n    scale(self, k: R) -> Self\n" +
+                      "trait Vector: Scale\n    dim(self) -> int\nstruct P\n    v: int\n" +
+                      "impl Scale for P\n    scale(self, k: P) -> P = P(self.v * k.v)\n" +
+                      "impl Vector for P\n    dim(self) -> int = 1\n" +
+                      "f[T: Vector](a: T, b: T) -> T = a.scale(b)\nprint(f(P(6), P(7)).v)"), "42\n")
+
+// The filled argument has to be the one the `impl` was filed under, or the requirement would be
+// "satisfied" by an implementation at other arguments.
+@test("an implementation at other arguments does not answer the requirement")
+dtp_other_arguments_do_not_answer_a_requirement()
+    if dtp_skip() then return
+
+    dtp_refused("trait Scale[R = Self]\n    scale(self, k: R) -> Self\n" +
+                "trait Vector: Scale\n    dim(self) -> int\nstruct P\n    v: int\n" +
+                "impl Scale[int] for P\n    scale(self, k: int) -> P = P(self.v * k)\n" +
+                "impl Vector for P\n    dim(self) -> int = 1",
+                "'Vector' requires 'Scale[P]', so 'P' has to implement that too — write " +
+                "'impl Scale[P] for P'", "9:1")
+
+// -- what the declaration has to satisfy ----------------------------------------------------------
+
+// Arguments are written left to right, so a parameter with no default sitting behind one that has
+// could never be reached.
+@test("a defaulted parameter may not come before an undefaulted one")
+dtp_a_default_may_not_precede_an_undefaulted()
+    if dtp_skip() then return
+
+    dtp_refused("struct S[A = int, B]\n    x: A\n    y: B",
+                "'B' has no default and comes after 'A', which has one — a use writes its " +
+                "arguments in order, so nothing could leave out 'A' and still supply 'B'", "1:1")
+
+@test("a default may not name a parameter fixed after it")
+dtp_a_default_may_not_name_a_later_parameter()
+    if dtp_skip() then return
+
+    dtp_refused("struct S[A = B, B]\n    x: A\n    y: B",
+                "'B' has no default and comes after 'A', which has one — a use writes its " +
+                "arguments in order, so nothing could leave out 'A' and still supply 'B'", "1:1")
+
+@test("nor one fixed after it when the shape is otherwise legal")
+dtp_nor_a_later_one_in_a_legal_shape()
+    if dtp_skip() then return
+
+    dtp_refused("struct S[A, B = C, C = int]\n    x: A\n    y: B\n    z: C",
+                "the default for 'B' names 'C', which is fixed after it — a default may name only " +
+                "the parameters written before it", "1:17")
+
+@test("a default may not name its own parameter")
+dtp_a_default_may_not_name_itself()
+    if dtp_skip() then return
+
+    dtp_refused("struct S[A = A]\n    x: int",
+                "the default for 'A' names 'A' — a parameter cannot stand in for itself", "1:14")
+
+@test("a struct has no 'Self' for a default to name")
+dtp_a_struct_has_no_self()
+    if dtp_skip() then return
+
+    dtp_refused("struct S[A = Self]\n    x: int",
+                "'Self' is the type implementing a trait, and struct 'S' is not a trait — so the " +
+                "default for 'A' has nothing to name", "1:14")
+
+@test("and neither has an enum")
+dtp_an_enum_has_no_self()
+    if dtp_skip() then return
+
+    dtp_refused("enum E[A = Self]\n    Empty\n    Full(value: A)",
+                "'Self' is the type implementing a trait, and enum 'E' is not a trait — so the " +
+                "default for 'A' has nothing to name", "1:12")
+
+@test("a default has to name a type")
+dtp_a_default_has_to_name_a_type()
+    if dtp_skip() then return
+
+    dtp_refused("struct S[A = Nope]\n    x: A", "unknown type 'Nope'", "1:14")
+
+// -- where a parameter is solved rather than written ----------------------------------------------
+
+// The three refusals are one rule: there are no call-site type arguments, so in none of these is
+// there an argument list with a gap for a default to fill.
+@test("a function may not default a type parameter")
+dtp_a_function_may_not_default_one()
+    if dtp_skip() then return
+
+    dtp_refused("f[T = int](x: T) -> T = x\nprint(f(1))",
+                "'T' is a type parameter of the function 'f', whose type parameters are solved " +
+                "from what it is given rather than written where it is used — so '= int' has " +
+                "nothing to stand in for", "1:7")
+
+@test("nor may a method")
+dtp_a_method_may_not_default_one()
+    if dtp_skip() then return
+
+    dtp_refused("struct P\n    v: int\n    m[T = int](self, x: T) -> int = self.v",
+                "'T' is a type parameter of the method 'P.m', whose type parameters are solved " +
+                "from what it is given rather than written where it is used — so '= int' has " +
+                "nothing to stand in for", "3:11")
+
+// A trait's method may be generic, so the default on its parameter is the only thing wrong with it --
+// the same refusal an inherent member's gets.
+@test("a trait's method may be generic, and still may not default one")
+dtp_a_trait_method_may_not_default_one()
+    if dtp_skip() then return
+
+    dtp_refused("trait T\n    m[U = int](self, x: U) -> int",
+                "'U' is a type parameter of the method 'T.m', whose type parameters are solved " +
+                "from what it is given rather than written where it is used — so '= int' has " +
+                "nothing to stand in for", "2:11")
+
+@test("nor may an 'impl' block")
+dtp_an_impl_block_may_not_default_one()
+    if dtp_skip() then return
+
+    dtp_refused("trait Show\n    show(self) -> string\nstruct Box[T]\n    v: T\n" +
+                "impl[T = int] Show for Box[T]\n    show(self) -> string = \"box\"",
+                "'T' is a type parameter of the 'impl' block 'Show for Box[T]', whose type " +
+                "parameters are solved from what it is given rather than written where it is " +
+                "used — so '= int' has nothing to stand in for", "5:10")
+
+// -- what a use has to satisfy --------------------------------------------------------------------
+
+@test("supplying more arguments than there are parameters")
+dtp_more_arguments_than_parameters()
+    if dtp_skip() then return
+
+    dtp_refused(dtp_pair_s() + "var s: S[int, int, int] = S(1, 2)",
+                "type 'S' takes between 1 and 2 type arguments, but 3 type arguments were given",
+                "4:8")
+
+@test("supplying fewer than the ones with no default")
+dtp_fewer_arguments_than_undefaulted()
+    if dtp_skip() then return
+
+    dtp_refused(dtp_pair_s() + "var s: S = S(1, 2)",
+                "type 'S' takes between 1 and 2 type arguments, but 0 type arguments were given",
+                "4:8")
+
+@test("a trait applied to too many is told the same way")
+dtp_a_trait_applied_to_too_many()
+    if dtp_skip() then return
+
+    dtp_refused("trait Sink[T = int]\n    count(self) -> int\n" +
+                "f[U: Sink[int, int]](x: U) -> int = x.count()",
+                "trait 'Sink' takes between 0 and 1 type arguments, but 2 type arguments were given",
+                "3:6")
+
+// The arity is what is wrong, and the reader should not also be told that the trait's own signature
+// does not resolve. Written against a trait with **no** default, so that it says something about
+// arity checking generally rather than about defaults.
+@test("an arity mistake does not also report the trait's own signature")
+dtp_an_arity_mistake_says_nothing_else()
+    if dtp_skip() then return
+
+    val main = "trait Sink[T]\n    put(self, x: T) -> int\nf[U: Sink[int, int]](x: U) -> int = x.put(1)"
+    val out = dtp_said_in("", main)
+
+    dtp_refused(main, "trait 'Sink' takes 1 type argument, but 2 type arguments were given", "3:6")
+    assert(out.index_of("unknown type 'T'").is_none(), out)
+    assert_eq(dtp_count(out, "error: "), 1)
+
+// The parameter's own bound is checked on the filled list by the deferral every other type argument
+// goes through, so a default that fails it is caught wherever the declaration is applied.
+@test("a default that fails the parameter's bound is caught at the use")
+dtp_a_default_failing_its_bound()
+    if dtp_skip() then return
+
+    dtp_refused("trait Named\n    name(self) -> string\nstruct Plain\n    n: int\n" +
+                "struct Box[T: Named = Plain]\n    v: T\nvar b: Box = Box(Plain(1))",
+                "'Box' requires its type parameter 'T' to implement 'Named', but Plain does not",
+                "7:8")
+
+// The deferral is the one a **written** argument goes through, so that is held to the bound too --
+// the rule the default's case is an instance of.
+@test("a written type argument that fails the parameter's bound is refused where it is applied")
+dtp_a_written_argument_failing_its_bound()
+    if dtp_skip() then return
+
+    dtp_refused("trait Named\n    name(self) -> string\nstruct Plain\n    n: int\n" +
+                "struct Box[T: Named]\n    v: T\nvar b: Box[Plain] = Box(Plain(1))\nprint(b.v.n)",
+                "'Box' requires its type parameter 'T' to implement 'Named', but Plain does not",
+                "7:8")
+
+@test("and a fill that meets it is accepted")
+dtp_a_fill_meeting_its_bound()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("trait Named\n    name(self) -> string\nstruct Plain\n    n: int\n" +
+                      "impl Named for Plain\n    name(self) -> string = \"plain\"\n" +
+                      "struct Box[T: Named = Plain]\n    v: T\nvar b: Box = Box(Plain(1))\n" +
+                      "print(b.v.name())"), "plain\n")
+
+private dtp_pair_s() -> string = "struct S[A, B = A]\n    x: A\n    y: B\n"
+
+// -- how far a default reaches --------------------------------------------------------------------
+
+// A declaration may not be more visible than the types it names (`reference/modules.md §
+// Visibility`), and a default is one of those: it is not written at the use, so a caller that leaves
+// the argument out ends up holding a type the default named.
+@test("a struct may not default to a type that reaches less far than it does")
+dtp_a_struct_default_too_private()
+    if dtp_skip() then return
+
+    dtp_default_too_private("module m\nprivate struct Secret\n    n: int\n" +
+                            "struct Holder[T = Secret]\n    v: T", "Holder", "4:19")
+
+@test("nor may a trait")
+dtp_a_trait_default_too_private()
+    if dtp_skip() then return
+
+    dtp_default_too_private("module m\nprivate struct Secret\n    n: int\n" +
+                            "trait Sink[T = Secret]\n    put(self, x: T) -> int", "Sink", "4:16")
+
+@test("nor an enum")
+dtp_an_enum_default_too_private()
+    if dtp_skip() then return
+
+    dtp_default_too_private("module m\nprivate struct Secret\n    n: int\n" +
+                            "enum Slot[T = Secret]\n    Empty\n    Full(value: T)", "Slot", "4:15")
+
+// A default naming one of the declaration's *own* parameters names nothing anyone has to reach.
+@test("a default naming a sibling parameter reaches nowhere")
+dtp_a_sibling_parameter_reaches_nowhere()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran_in("module m\nstruct Pair[A, B = A]\n    x: A\n    y: B",
+                         "import m.Pair\nvar p: Pair[int] = Pair(3, 4)\nprint(p.x + p.y)"), "7\n")
+
+// A default is written where the declaration is, so it is resolved in **that** file's terms. A user
+// who cannot see the type the default names still gets it filled in -- which is the whole reason the
+// rule above has to exist rather than the default simply failing to resolve.
+@test("a default is resolved in the file that declares it")
+dtp_a_default_is_resolved_where_declared()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran_in("module m\nstruct Unit\n    n: int\nstruct Holder[T = Unit]\n    v: T\n" +
+                         "made() -> Holder = Holder(Unit(7))",
+                         "import m.made\nprint(made().v.n)"), "7\n")
+
+// -- one default reaching another -----------------------------------------------------------------
+
+@test("a default may name a generic type that has defaults of its own")
+dtp_a_default_names_a_defaulted_generic()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("struct Inner[U = int]\n    n: U\nstruct Outer[T = Inner]\n    v: T\n" +
+                      "var o: Outer = Outer(Inner(7))\nprint(o.v.n)"), "7\n")
+
+// Each arrival applies the declaration to fewer arguments than it declares, so a default that leads
+// back to its own declaration would ask for the defaults again for ever. Caught rather than recursed
+// into.
+@test("a default may not lead back to its own declaration")
+dtp_a_default_may_not_lead_back()
+    if dtp_skip() then return
+
+    dtp_refused("struct S[T = S]\n    v: int\nvar s: S = S(1)",
+                "filling a type argument of 'S' from its default leads back to 'S' — a default " +
+                "cannot stand in for a type that is still being worked out", "1:14")
+
+@test("nor around a longer way")
+dtp_nor_around_a_longer_way()
+    if dtp_skip() then return
+
+    val main = "struct A[T = B]\n    v: int\nstruct B[U = A]\n    w: int\nvar a: A = A(1)"
+    val out = dtp_said_in("", main)
+
+    dtp_refused(main, "filling a type argument of 'B' from its default leads back to 'B' — a " +
+                "default cannot stand in for a type that is still being worked out", "1:14")
+    assert(out.index_of("error: filling a type argument of 'A' from its default leads back to 'A' " +
+                        "— a default cannot stand in for a type that is still being worked out\n" +
+                        " --> ").is_some(), out)
+    assert(out.index_of("/main.sysl:3:14\n").is_some(), out)
+    assert_eq(dtp_count(out, "error: "), 2)
+
+// Applied in full, nothing is filled at all, so a type may name itself in a written argument exactly
+// as a field may -- the indirection is what makes it finite.
+@test("a type fully applied inside its own default is not a cycle")
+dtp_fully_applied_is_not_a_cycle()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("struct Node[T = int]\n    v: T\n    next: *Node[int]\n" +
+                      "var n: Node = Node(7, null)\nprint(n.v)"), "7\n")
+
+// -- what the table does with one -----------------------------------------------------------------
+
+private dtp_tagged() -> string =
+    "trait Tag[R = int]\n    tag(self, k: R) -> int\ntrait Shown: Tag\n    show(self) -> string\n" +
+    "struct P\n    v: int\nimpl Tag for P\n    tag(self, k: int) -> int = self.v + k\n" +
+    "impl Shown for P\n    show(self) -> string = \"p\"\nvar o: &Shown = P(5)\nprint(o.tag(1))"
+
+// The slot list a table is built from and the one a call site indexes by are the same walk, and a
+// defaulted requirement is where they could most easily disagree. Pinned on the emitted table rather
+// than on the program's output, since a disagreement about order is exactly what running one call
+// would fail to show.
+@test("a defaulted requirement lays out one slot per member, in one order")
+dtp_a_defaulted_requirement_lays_out_its_slots()
+    if dtp_skip() then return
+
+    val out = dtp_ir(dtp_tagged())
+
+    assert(out.index_of("\n@vt.ref.Shown.P = private constant { i64, [2 x ptr] } { i64 " +
+                        "12154016848417211509, [2 x ptr] [ptr @vt.adapt.ref.P.tag, ptr " +
+                        "@vt.adapt.ref.P.show] }\n").is_some(), out)
+
+@test("and the call reaches the required trait's member through it")
+dtp_the_call_reaches_the_required_member()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran(dtp_tagged()), "6\n")
+
+// Three deep, with `Self` at every step -- the requirement is the implementing type all the way down
+// rather than being rebound to whatever declared the next link.
+@test("'Self' carries the whole length of a chain of requirements")
+dtp_self_carries_a_chain_of_requirements()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("trait Scale[R = Self]\n    scale(self, k: R) -> Self\n" +
+                      "trait Vector: Scale\n    dim(self) -> int\n" +
+                      "trait Space: Vector\n    origin(self) -> int\nstruct P\n    v: int\n" +
+                      "impl Scale for P\n    scale(self, k: P) -> P = P(self.v * k.v)\n" +
+                      "impl Vector for P\n    dim(self) -> int = 1\n" +
+                      "impl Space for P\n    origin(self) -> int = 0\n" +
+                      "f[T: Space](a: T, b: T) -> T = a.scale(b)\nprint(f(P(6), P(7)).v)"), "42\n")
+
+// -- what an implementation may be written for ----------------------------------------------------
+
+@test("a shape rather than a named type still fills 'Self'")
+dtp_a_shape_still_fills_self()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("trait Size[R = Self]\n    size(self, other: R) -> int\n" +
+                      "impl Size for []int\n    size(self, other: []int) -> int = self[0] + other[0]\n" +
+                      "var a = [1, 2, 3]\nvar b = [4, 5]\nprint(a[0..<3].size(b[0..<2]))"), "5\n")
+
+// A conditional block's own parameters are solved, so its subject is the type applied to them -- and
+// `Self` in the trait's default is that, not the bare declaration.
+@test("a conditional implementation fills 'Self' with its own subject")
+dtp_a_conditional_impl_fills_self()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("trait Named\n    name(self) -> string\n" +
+                      "trait Pairable[R = Self]\n    pair(self, other: R) -> string\n" +
+                      "struct Box[T]\n    v: T\n" +
+                      "impl[T: Named] Named for Box[T]\n    name(self) -> string = self.v.name()\n" +
+                      "impl[T: Named] Pairable for Box[T]\n" +
+                      "    pair(self, other: Box[T]) -> string = self.name() + other.name()\n" +
+                      "struct P\n    n: string\nimpl Named for P\n    name(self) -> string = self.n\n" +
+                      "print(Box(P(\"a\")).pair(Box(P(\"b\"))))"), "ab\n")
+
+// -- what inference does with one -----------------------------------------------------------------
+
+// A default fills a **written** argument list. Inference solves from the arguments, and where it
+// reaches an answer that answer is the type -- the default is not a preference that overrides what
+// the construction actually holds.
+@test("a construction is inferred, not defaulted")
+dtp_a_construction_is_inferred()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran(dtp_pair() + "var p = Pair(1, true)\nprint(p.y)"), "true\n")
+
+@test("and the annotation that leaves the argument out still fills it")
+dtp_the_annotation_still_fills_it()
+    if dtp_skip() then return
+
+    dtp_refused(dtp_pair() + "var p: Pair[int] = Pair(1, true)\nprint(p.y)",
+                "'y' of 'Pair[int, int]' is int, but bool was given", "4:28")
+
+// -- one implementation per trait per type --------------------------------------------------------
+
+// The coherence rule reads the *filled* arguments, so the two spellings of one implementation are the
+// one implementation -- and writing both is the duplicate it looks like.
+@test("the bare and the written 'impl' are the same implementation")
+dtp_bare_and_written_impl_are_the_same()
+    if dtp_skip() then return
+
+    dtp_refused(dtp_scale() + "impl Scale[P] for P\n    scale(self, k: P) -> P = P(self.v + k.v)",
+                "'P' already implements 'Scale' — arguments left out are the ones 'Scale' declares " +
+                "them to default to, so the two blocks implement the same trait at the same " +
+                "arguments", "7:1")
+
+@test("while two genuinely different arguments are two implementations")
+dtp_two_different_arguments_are_two_impls()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran(dtp_scale() + "f[T: Scale](a: T, b: T) -> T = a.scale(b)\n" +
+                      "struct Q\n    v: int\n" +
+                      "impl Scale[int] for Q\n    scale(self, k: int) -> Q = Q(self.v + k)\n" +
+                      "print(f(P(6), P(7)).v)"), "42\n")
+
+// -- what erasure does with one -------------------------------------------------------------------
+
+// An object has forgotten which type it holds, so there is no `Self` for a default to stand for. The
+// argument has to be written out, and saying that here is better than letting `Self` resolve to
+// nothing further in.
+@test("an object cannot take a default of 'Self'")
+dtp_an_object_cannot_default_to_self()
+    if dtp_skip() then return
+
+    dtp_refused("trait Scale[R = Self]\n    scale(self, k: R) -> int\n" +
+                "f(x: &Scale) -> int = x.scale(x)",
+                "'R' defaults to 'Self', which names the type implementing 'Scale', and an object " +
+                "has forgotten which type it holds — write the argument", "3:7")
+
+@test("with the argument written out it is an ordinary object")
+dtp_a_written_argument_is_an_ordinary_object()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("trait Scale[R = Self]\n    scale(self, k: R) -> int\nstruct P\n    v: int\n" +
+                      "impl Scale[int] for P\n    scale(self, k: int) -> int = self.v * k\n" +
+                      "f(x: &Scale[int]) -> int = x.scale(3)\nvar o: &Scale[int] = P(14)\n" +
+                      "print(f(o))"), "42\n")
+
+@test("a trait defaulting to something concrete erases without being written out")
+dtp_a_concrete_default_erases()
+    if dtp_skip_run() then return
+
+    assert_eq(dtp_ran("trait Sink[T = int]\n    put(self, x: T) -> int\nstruct C\n    n: int\n" +
+                      "impl Sink for C\n    put(self, x: int) -> int = self.n + x\n" +
+                      "f(s: &Sink) -> int = s.put(5)\nvar o: &Sink = C(10)\nprint(f(o))"), "15\n")

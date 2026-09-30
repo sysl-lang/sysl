@@ -74,6 +74,14 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
     // never made real.
     refuse_pinned_generic_enums(a)
 
+    // **A type parameter's default is held to being one where it is written**, before anything
+    // applies the declaration: a default on a parameter that is solved is refused, and a written
+    // one is read in the order a use would fill it.
+    for i in 0..<units.len()
+        check_solved_defaults(a, scopes.at(i), units.at(i).body)
+
+    check_type_defaults(a)
+
     // **The asserts a module file declared beside its declarations are settled BEFORE the eager
     // instantiation**, and the order is observable: `@assert(sizeof(Cell) <= 32)` makes `Cell` real,
     // and every type its variants name with it, ahead of every other type the compilation has. The
@@ -781,6 +789,8 @@ end check_const_named
 // visible there or the signature would not have resolved. What this finds is a public declaration
 // naming something private.
 private check_exposed_types(a: &Analysis)
+    check_exposed_defaults(a)
+
     for i in 0..<a.tables.funcs.len()
         val f = a.tables.funcs.at(i)
 
@@ -844,6 +854,28 @@ private check_exposed_types(a: &Analysis)
                                        s.span, d.tparams)
             _ -> ()
 end check_exposed_types
+
+// **A type parameter's default is one of the types a declaration names**: it is not written at the
+// use, so a caller that leaves the argument out ends up holding a type the default named -- and if
+// that type does not reach them, they are holding something they could not have written.
+private check_exposed_defaults(a: &Analysis)
+    for i in 0..<a.tables.types.len()
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            StructOf(d) -> exposed_defaults(a, decl.scope, d.name, d.vis, d.tparams, d.tdefaults)
+            EnumOf(d) -> exposed_defaults(a, decl.scope, d.name, d.vis, d.tparams, d.tdefaults)
+            TraitOf(d) -> exposed_defaults(a, decl.scope, d.name, d.vis, d.tparams, d.tdefaults)
+            _ -> ()
+end check_exposed_defaults
+
+private exposed_defaults(a: &Analysis, scope: Scope, label: string, vis: Visibility,
+                         tparams: Buf[string], tdefaults: Buf[TypeBinding])
+    for i in 0..<tdefaults.len()
+        val b = tdefaults.at(i)
+
+        check_exposed(a, scope, label, vis, s"the default for '${b.name}'", b.typ, tparams)
+end exposed_defaults
 
 private is_private_reach(v: Visibility) -> bool = v match
     File -> true
