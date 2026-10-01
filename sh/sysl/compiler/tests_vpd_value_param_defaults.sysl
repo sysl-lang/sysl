@@ -1,0 +1,215 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A **value** parameter's default (`reference/generics.md § A parameter may carry a default`):
+// `struct Ring[T, const N: usize = 4]`. It is the argument a use would have written in its place, so
+// it fills the same gap a type parameter's default does, counts toward the same arity, sits in the
+// same suffix and is refused on the same three solved declarations -- a function, a method and an
+// `impl` block. A written value argument, and a default, have to be values the declared type holds.
+//
+// **Every output, message and location here was read out of the reference compiler** (0.0.153) on
+// the same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private vpd_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end vpd_skip
+
+private vpd_skip_run() -> bool
+    if vpd_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end vpd_skip_run
+
+private vpd_write(main: string) -> string
+    val root = make_temp_dir("sysl-vpd").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end vpd_write
+
+// What the program PRINTS, or what the build had to say about it.
+private vpd_ran(main: string) -> string
+    val root = vpd_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vpd_ran
+
+// The LLVM text of the program, or what analysing it had to say.
+private vpd_ir(main: string) -> string
+    val root = vpd_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vpd_ir
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private vpd_refused(main: string, message: string, at: string)
+    val out = vpd_ir(main)
+
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end vpd_refused
+
+// How many times `what` is written in `text`.
+private vpd_count(text: string, what: string) -> int
+    var n = 0
+    var rest = text
+
+    loop
+        rest.index_of(what) match
+            None -> break
+            Some(i) ->
+                n += 1
+                rest = rest[i + what.bytes.len..<rest.bytes.len]
+
+    n
+end vpd_count
+
+private vpd_ring() -> string = "struct Ring[T, const N: usize = 4]\n    items: [N]T\n"
+
+// The words every refusal on a solved declaration shares.
+private vpd_solved(name: string, owner: string, written: string) -> string =
+    s"'$name' is a value parameter of $owner, whose type parameters are solved from what it is " +
+    s"given rather than written where it is used — so '= $written' has nothing to stand in for"
+
+// -- what a default stands in for -----------------------------------------------------------------
+
+@test("a struct takes a value parameter's default")
+vpd_a_struct_takes_it()
+    if vpd_skip_run() then return
+
+    assert_eq(vpd_ran(vpd_ring() + "val r: Ring[int] = Ring([1, 2, 3, 4])\nprint(r.items.len)"), "4\n")
+
+@test("an enum takes a value parameter's default")
+vpd_an_enum_takes_it()
+    if vpd_skip_run() then return
+
+    assert_eq(vpd_ran("enum Slot[const N: usize = 2]\n    Empty\n    Full(xs: [N]int)\n" +
+                      "held(s: Slot) -> usize = s match\n    Full(xs) -> xs.len\n    Empty -> 0\n" +
+                      "var s: Slot = Full([5, 6])\nprint(held(s))"), "2\n")
+
+@test("type and value defaults fill together")
+vpd_type_and_value_defaults_fill_together()
+    if vpd_skip_run() then return
+
+    assert_eq(vpd_ran("struct Grid[T = int, const N: usize = 3]\n    cells: [N]T\n" +
+                      "var g: Grid = Grid([1, 2, 3])\nvar h: Grid[bool] = Grid([true, false, true])\n" +
+                      "var k: Grid[bool, 2] = Grid([true, false])\n" +
+                      "print(g.cells.len, h.cells.len, k.cells.len)"), "3 3 2\n")
+
+@test("a value default may name a value parameter written before it")
+vpd_a_default_names_an_earlier_value_parameter()
+    if vpd_skip_run() then return
+
+    assert_eq(vpd_ran("struct Pad[const M: usize, const N: usize = M * 2]\n    a: [M]int\n    b: [N]int\n" +
+                      "var p: Pad[2] = Pad([1, 2], [3, 4, 5, 6])\nprint(p.a.len, p.b.len)"), "2 4\n")
+
+// Two instantiations would show up in the emitted module as two struct types.
+@test("the filled and the written value spelling are one instantiation")
+vpd_filled_and_written_are_one_instantiation()
+    if vpd_skip() then return
+
+    val out = vpd_ir(vpd_ring() + "var p: Ring[int] = Ring([1, 2, 3, 4])\n" +
+                     "var q: Ring[int, 4] = Ring([5, 6, 7, 8])\nprint(p.items[0] + q.items[3])")
+
+    assert(out.index_of("\n%struct.Ring.int.c4 = type { [4 x i32] }\n").is_some(), out)
+    assert_eq(vpd_count(out, "\n%struct.Ring"), 1)
+
+// -- what a default may be ------------------------------------------------------------------------
+
+@test("a defaulted value parameter may not come before an undefaulted one")
+vpd_a_default_is_a_suffix()
+    if vpd_skip() then return
+
+    vpd_refused("struct S[const N: usize = 4, T]\n    x: [N]T\n",
+                "'T' has no default and comes after 'N', which has one — a use writes its arguments " +
+                "in order, so nothing could leave out 'N' and still supply 'T'", "1:1")
+
+@test("a value default may not name a value parameter fixed after it")
+vpd_a_default_may_not_name_a_later_parameter()
+    if vpd_skip() then return
+
+    vpd_refused("struct S[const M: usize = N, const N: usize = 2]\n    x: [M]int\n",
+                "the default for 'M' names 'N', which is fixed after it — a default may name only " +
+                "the parameters written before it", "1:27")
+
+@test("a value default has to fit the parameter's type")
+vpd_a_default_has_to_fit()
+    if vpd_skip() then return
+
+    vpd_refused("struct S[const N: u8 = 300]\n    x: int\n", "the default for 'N' does not fit byte: 300",
+                "1:24")
+
+@test("and so does a written value argument")
+vpd_a_written_argument_has_to_fit()
+    if vpd_skip() then return
+
+    vpd_refused("struct S[const N: u8]\n    x: int\nvar s: S[300] = S(1)\nprint(s.x)\n",
+                "this argument does not fit byte: 300", "3:8")
+
+@test("a value default has to be a value")
+vpd_a_default_has_to_be_a_value()
+    if vpd_skip() then return
+
+    vpd_refused("struct S[const N: usize = int]\n    x: [N]int\n",
+                "'int' is a type, and this argument stands where the declaration wrote 'const' — so a " +
+                "value of usize belongs here", "1:27")
+
+// -- where a parameter is solved rather than written ----------------------------------------------
+
+@test("a function may not default a value parameter")
+vpd_a_function_may_not_default_one()
+    if vpd_skip() then return
+
+    vpd_refused("total[const N: usize = 3](xs: [N]int) -> usize = N\nprint(total([1, 2]))\n",
+                vpd_solved("N", "the function 'total'", "3"), "1:24")
+
+@test("nor may a method")
+vpd_nor_may_a_method()
+    if vpd_skip() then return
+
+    vpd_refused("struct P\n    v: int\n    m[const N: usize = 2](self, xs: [N]int) -> usize = N\n",
+                vpd_solved("N", "the method 'P.m'", "2"), "3:24")
+
+@test("nor may an 'impl' block")
+vpd_nor_may_an_impl_block()
+    if vpd_skip() then return
+
+    vpd_refused("trait Show\n    show(self) -> string\nstruct Buf[const N: usize]\n    v: [N]int\n" +
+                "impl[const N: usize = 2] Show for Buf[N]\n    show(self) -> string = \"buf\"\n",
+                vpd_solved("N", "the 'impl' block 'Show for Buf[N]'", "2"), "5:23")

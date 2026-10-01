@@ -20,24 +20,27 @@ import sysl.buf.{Buf, buf}
 check_solved_defaults(a: &Analysis, scope: Scope, body: Buf[Stmt])
     for i in 0..<body.len()
         *body.at(i).kind match
-            FuncDecl(d) -> refuse_solved(a, scope, "the function", d.name, d.tdefaults)
+            FuncDecl(d) -> refuse_solved(a, scope, "the function", d.name, d.tdefaults, d.tvalues)
             StructDecl(d) -> refuse_solved_members(a, scope, d.name, d.members)
             EnumDecl(d) -> refuse_solved_members(a, scope, d.name, d.members)
             TraitDecl(d) -> refuse_solved_members(a, scope, d.name, d.methods)
             ImplDecl(d) ->
                 refuse_solved(a, scope, "the 'impl' block",
-                              s"${module_show(d.trait_name)} for ${type_text(d.for_type)}", d.tdefaults)
+                              s"${module_show(d.trait_name)} for ${type_text(d.for_type)}", d.tdefaults,
+                              d.tvalues)
                 refuse_solved_members(a, scope, module_show(d.trait_name), d.methods)
             _ -> ()
 end check_solved_defaults
 
 private refuse_solved_members(a: &Analysis, scope: Scope, owner: string, ms: Buf[MethodDecl])
     for i in 0..<ms.len()
-        refuse_solved(a, scope, "the method", s"$owner.${ms.at(i).name}", ms.at(i).tdefaults)
+        refuse_solved(a, scope, "the method", s"$owner.${ms.at(i).name}", ms.at(i).tdefaults,
+                      ms.at(i).tvalues)
 
-// One complaint per default, in the order of the parameters' names.
+// One complaint per default, in the order of the parameters' names. A value parameter's default is
+// refused in the same words, the parameter named for the kind it is.
 private refuse_solved(a: &Analysis, scope: Scope, noun: string, label: string,
-                      tdefaults: Buf[TypeBinding])
+                      tdefaults: Buf[TypeBinding], tvalues: Buf[TypeBinding])
     var said: Buf[string] = buf()
 
     for round in 0..<tdefaults.len()
@@ -54,7 +57,10 @@ private refuse_solved(a: &Analysis, scope: Scope, noun: string, label: string,
         val b = tdefaults.at(next.unwrap())
 
         said.push(b.name)
-        a.fault(scope, b.typ.span, s"'${b.name}' is a type parameter of $noun '$label', whose type " +
+
+        val kind = if binding_named(tvalues, b.name).is_some() then "value" else "type"
+
+        a.fault(scope, b.typ.span, s"'${b.name}' is a $kind parameter of $noun '$label', whose type " +
                 "parameters are solved from what it is given rather than written where it is used " +
                 s"— so '= ${type_text(b.typ)}' has nothing to stand in for")
 end refuse_solved
@@ -73,14 +79,17 @@ check_type_defaults(a: &Analysis)
         val decl = a.tables.types.at(i)
 
         decl.kind match
-            TraitOf(d) -> check_declared(a, decl.scope, decl.span, "trait", key, d.tparams, d.tdefaults)
-            StructOf(d) -> check_declared(a, decl.scope, decl.span, "struct", key, d.tparams, d.tdefaults)
-            EnumOf(d) -> check_declared(a, decl.scope, decl.span, "enum", key, d.tparams, d.tdefaults)
+            TraitOf(d) ->
+                check_declared(a, decl.scope, decl.span, "trait", key, d.tparams, d.tdefaults, buf())
+            StructOf(d) ->
+                check_declared(a, decl.scope, decl.span, "struct", key, d.tparams, d.tdefaults, d.tvalues)
+            EnumOf(d) ->
+                check_declared(a, decl.scope, decl.span, "enum", key, d.tparams, d.tdefaults, d.tvalues)
             _ -> ()
 end check_type_defaults
 
 private check_declared(a: &Analysis, scope: Scope, span: Span, noun: string, key: string,
-                       tparams: Buf[string], tdefaults: Buf[TypeBinding])
+                       tparams: Buf[string], tdefaults: Buf[TypeBinding], tvalues: Buf[TypeBinding])
     if tdefaults.is_empty() then return
 
     val outer = a.open_region()
@@ -91,7 +100,7 @@ private check_declared(a: &Analysis, scope: Scope, span: Span, noun: string, key
     val enums = a.tables.enum_insts.len()
     val constrained = a.tables.constrained_insts.len()
 
-    read_declared(a, scope, span, noun, key, tparams, tdefaults)
+    read_declared(a, scope, span, noun, key, tparams, tdefaults, tvalues)
 
     a.release(trial)
     rewind_instantiations(a, queued, tables, structs, enums, constrained)
@@ -99,7 +108,7 @@ private check_declared(a: &Analysis, scope: Scope, span: Span, noun: string, key
 end check_declared
 
 private read_declared(a: &Analysis, scope: Scope, span: Span, noun: string, key: string,
-                      tparams: Buf[string], tdefaults: Buf[TypeBinding])
+                      tparams: Buf[string], tdefaults: Buf[TypeBinding], tvalues: Buf[TypeBinding])
     var first: Option[usize] = None
 
     for i in 0..<tparams.len()
@@ -155,7 +164,19 @@ private read_declared(a: &Analysis, scope: Scope, span: Span, noun: string, key:
                     s"'${qualified_name(key)}' is not a trait — so the default for '$tp' has " +
                     "nothing to name")
 
-        known.push(Binding(tp, resolve_type(a, scope, t, known)))
+        // A value parameter's default is held to what a written argument is: a value, of the type
+        // the declaration wrote, that the type holds.
+        val declared = binding_named(tvalues, tp)
+
+        if declared.is_none()
+            known.push(Binding(tp, resolve_type(a, scope, t, known)))
+            continue
+        end if
+
+        val v = default_value(a, scope, t.span, tp, t, resolve_type(a, scope, declared.unwrap(), known),
+                              known)
+
+        known.push(Binding(tp, if v.is_some() then v.unwrap() else Abstract(tp, buf())))
 end read_declared
 
 private one_name(name: string) -> Buf[string]
