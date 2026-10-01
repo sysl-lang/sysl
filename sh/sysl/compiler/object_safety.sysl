@@ -15,12 +15,14 @@ import sysl.buf.{Buf, buf}
 // refusal is the only one**, each being a reason there is no object.
 
 // The object a written `&T` or `*T` forms, checked; `inner` is what the sigil was written in front
-// of, and a type parameter standing for a trait forms nothing here.
+// of, and a type parameter standing for a trait forms nothing here. Answers whether it refused: a
+// refused object is no type at all, so what was written stands as `Unknown` and a use of it says
+// nothing more -- the reference's recovery region giving up on the type it was reading.
 check_object_written(a: &Analysis, scope: Scope, inner: TypeRef, made: Type, sigil: string,
-                     subst: Buf[Binding])
+                     subst: Buf[Binding]) -> bool
     val positional = *inner.kind match
         NamedType(n, args) ->
-            if args.is_empty() && bound_in(subst, n) then return
+            if args.is_empty() && bound_in(subst, n) then return false
 
             var k: usize = 0
 
@@ -31,13 +33,126 @@ check_object_written(a: &Analysis, scope: Scope, inner: TypeRef, made: Type, sig
 
             k
         FnType(ps, _, _) -> ps.len() + 1
-        _ -> return
+        _ -> return false
 
     made match
         Trait(key, args, fixed) -> check_object_safe(a, scope, inner.span, key, args, fixed, sigil,
                                                      positional)
-        _ -> ()
+        _ -> false
 end check_object_written
+
+// Every associated type an object over this trait has to account for: the trait's own, and those of
+// every trait it requires. One flat list, because a type may implement at most one trait declaring an
+// associated type of any given name -- the rule that lets a projection be written without its trait.
+object_assocs(a: &Analysis, key: string) -> Buf[AssocDecl]
+    val closure = trait_closure(a, Bound(key, buf()), self_binding(Abstract("Self", buf())))
+    var out: Buf[AssocDecl] = buf()
+    var seen: Buf[string] = buf()
+
+    for i in 0..<closure.len()
+        val d = trait_decl_at(a, closure.at(i).name)
+
+        if d.is_some()
+            val assocs = d.unwrap().assocs
+
+            for j in 0..<assocs.len()
+                if !holds_string(seen, assocs.at(j).name)
+                    seen.push(assocs.at(j).name)
+                    out.push(assocs.at(j))
+
+    out
+end object_assocs
+
+// `&Seq[Item]`: a bare argument naming one of the trait's own associated types, which an object fixes
+// by name. Says so and answers `true` where it found one.
+bare_assoc_name(a: &Analysis, scope: Scope, span: Span, key: string, args: Buf[TypeRef],
+                sigil: string) -> bool
+    val declared = object_assocs(a, key)
+
+    for i in 0..<args.len()
+        *args.at(i).kind match
+            NamedType(n, inner) ->
+                if inner.is_empty() && declares_assoc(declared, n)
+                    val shown = qualified_name(key)
+
+                    a.fault(scope, span, s"'$n' is an associated type of '$shown', which an object fixes " +
+                            s"by name rather than by position — write '$sigil$shown[$n = …]'")
+                    return true
+            _ -> ()
+
+    false
+end bare_assoc_name
+
+private declares_assoc(declared: Buf[AssocDecl], name: string) -> bool
+    for i in 0..<declared.len()
+        if declared.at(i).name == name then return true
+
+    false
+end declares_assoc
+
+// Holds an object's `Name = T` clauses to the associated types the trait actually declares: each one
+// declared, each named once, and each meeting the bounds the trait asked of it -- the last deferred
+// as every applied bound is, the `impl` that makes the supplied type conform possibly not hoisted yet.
+// Whether the value erased into the object agrees is the erasure's question, not this one. Answers
+// whether a name was refused, which leaves no object to form.
+check_assoc_args(a: &Analysis, scope: Scope, span: Span, key: string, declared: Buf[AssocDecl],
+                 supplied: Buf[(string, Type)], sigil: string, args: Buf[Type]) -> bool
+    val shown = qualified_name(key)
+    val obj = s"'$sigil${Bound(key, args).show()}'"
+    var refused = false
+
+    for i in 0..<supplied.len()
+        val n = supplied.at(i).0
+
+        if !declares_assoc(declared, n)
+            if declared.is_empty()
+                a.fault(scope, span, s"'$shown' declares no associated types, so there is nothing in $obj " +
+                        s"for '$n' to fix — a trait declares one with 'type $n: …' among its members")
+            else
+                var listed: Buf[string] = buf()
+
+                for j in 0..<declared.len()
+                    listed.push(s"'${declared.at(j).name}'")
+
+                a.fault(scope, span, s"'$shown' declares no associated type '$n' — it declares " +
+                        joined(listed, ", "))
+            end if
+
+            refused = true
+    end for
+
+    var told: Buf[string] = buf()
+
+    for i in 0..<supplied.len()
+        val n = supplied.at(i).0
+
+        if !holds_string(told, n)
+            for j in (i + 1)..<supplied.len()
+                if supplied.at(j).0 == n && !holds_string(told, n)
+                    told.push(n)
+                    a.fault(scope, span, s"$obj fixes '$n' more than once, and a type has one of each")
+                    refused = true
+    end for
+
+    if refused then return true
+
+    var names: Buf[string] = buf()
+    var bounds: Buf[NamedBounds] = buf()
+    var types: Buf[Type] = buf()
+
+    for i in 0..<declared.len()
+        val d = declared.at(i)
+
+        for j in 0..<supplied.len()
+            if supplied.at(j).0 == d.name && !holds_string(names, d.name)
+                names.push(d.name)
+                types.push(supplied.at(j).1)
+
+                if !d.bounds.is_empty() then bounds.push(NamedBounds(d.name, d.bounds))
+
+    deferred_bounds(a, scope, span, key, names, bounds, types, "associated type")
+    false
+end check_assoc_args
 
 private bound_in(subst: Buf[Binding], name: string) -> bool
     for i in 0..<subst.len()
@@ -47,10 +162,10 @@ private bound_in(subst: Buf[Binding], name: string) -> bool
 end bound_in
 
 private check_object_safe(a: &Analysis, scope: Scope, span: Span, key: string, args: Buf[Type],
-                          fixed: Buf[(string, Type)], sigil: string, positional: usize)
+                          fixed: Buf[(string, Type)], sigil: string, positional: usize) -> bool
     val decl = trait_decl_at(a, key)
 
-    if decl.is_none() then return
+    if decl.is_none() then return false
 
     val own = decl.unwrap()
     val shown_key = qualified_name(key)
@@ -76,7 +191,7 @@ private check_object_safe(a: &Analysis, scope: Scope, span: Span, key: string, a
                             s"that is, so there is no $obj to form. Say which it is and there is: " +
                             s"write '$sigil$shown_key[$an = …]', or take a bound instead, which keeps " +
                             s"the type and so keeps the answer: '[T: $from]'")
-                    return
+                    return true
 
     // The parameters of the object's OWN trait that were left to a default: a `Self` arriving that
     // way is the default's to explain, in words that name writing the argument as the fix.
@@ -95,14 +210,14 @@ private check_object_safe(a: &Analysis, scope: Scope, span: Span, key: string, a
         if m.recv_mode().is_none()
             a.fault(scope, span, s"'$shown' declares the associated function '${m.name}', which has no " +
                     s"receiver to dispatch on — so there is no $obj to form")
-            return
+            return true
         end if
 
         if sigil == "*" && takes_ref_self(m)
             a.fault(scope, span, s"'${m.name}' of '$shown' takes '&self', so it needs its receiver inside " +
                     s"a reference-counted box — $obj points straight at a value, so write " +
                     s"'&$shown_key' instead")
-            return
+            return true
         end if
 
         // A `Self` reaches a signature two ways: WRITTEN there, or arriving through one of the
@@ -115,15 +230,17 @@ private check_object_safe(a: &Analysis, scope: Scope, span: Span, key: string, a
         if member_mentions(m, names, fixed_names)
             a.fault(scope, span, s"'${m.name}' of '$shown' mentions 'Self' away from its receiver, and " +
                     s"an erased value has forgotten which type that is — so there is no $obj to form")
-            return
+            return true
         end if
 
         if m.variadic
             a.fault(scope, span, s"'${m.name}' of '$shown' takes a '...', and a call to one names the " +
                     "whole function type it is reaching — a slot in a method table is a word and names " +
                     s"none, so there is no $obj to form")
-            return
+            return true
         end if
+
+    false
 end check_object_safe
 
 private takes_ref_self(m: MethodDecl) -> bool = m.receiver match

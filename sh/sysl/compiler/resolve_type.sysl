@@ -46,12 +46,12 @@ rebind(subst: *Buf[Binding], name: string, ty: Type)
 
 // The type a written one means.
 resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Type = *t.kind match
-    NamedType(name, args) -> resolve_named(a, scope, t.span, name, args, subst, false)
+    NamedType(name, args) -> resolve_named(a, scope, t.span, name, args, subst, "")
     // **A hop is what makes a cycle finite**, so the four forms that point rather than hold are
     // counted -- and the count is what a type reached again is judged against.
     PtrType(inner) -> resolve_ptr(a, scope, inner, subst)
     RefType(inner, sync) -> resolve_ref(a, scope, t.span, inner, sync, subst)
-    WeakType(inner) -> Weak(under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, false)))
+    WeakType(inner) -> Weak(under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "weak")))
     // Everywhere but a field, an element and a pointee, what is being named is a **value** -- what a
     // binding holds, what a parameter receives, what a call hands back -- and a value read out of a
     // volatile place is an ordinary value, so there is nothing left for the qualifier to say.
@@ -165,9 +165,9 @@ private volatile_constrains(t: Type) -> bool = t match
 // where a value is erased into one, and that is where it is asked.
 private resolve_ref(a: &Analysis, scope: Scope, span: Span, inner: TypeRef, sync: bool,
                     subst: Buf[Binding]) -> Type
-    val ty = under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, false))
+    val ty = under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "&"))
 
-    check_object_written(a, scope, inner, ty, "&", subst)
+    if check_object_written(a, scope, inner, ty, "&", subst) then return Unknown
 
     if sync
         ty match
@@ -180,9 +180,10 @@ end resolve_ref
 
 // `*T` — and where `T` is a trait, a raw object, asked about as the counted one is.
 private resolve_ptr(a: &Analysis, scope: Scope, inner: TypeRef, subst: Buf[Binding]) -> Type
-    val ty = under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, true))
+    val ty = under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "*"))
 
-    check_object_written(a, scope, inner, ty, "*", subst)
+    if check_object_written(a, scope, inner, ty, "*", subst) then return Unknown
+
     Ptr(ty)
 end resolve_ptr
 
@@ -586,14 +587,14 @@ end bare_arrow_show
 
 // What stands behind a mode -- `&`, `*` or `weak` -- which is the one place a callable is a type: the
 // trait object of the call trait, whichever of the two spellings wrote it.
-// `qualified` is a raw pointer's pointee, which is the one of the three that may be `volatile`.
+// `sigil` is the mode written; a raw pointer's pointee is the one of the three that may be `volatile`.
 private resolve_pointee(a: &Analysis, scope: Scope, inner: TypeRef, subst: Buf[Binding],
-                        qualified: bool) -> Type =
+                        sigil: string) -> Type =
     *inner.kind match
         FnType(params, ret, _) -> resolve_fn_trait(a, scope, inner.span, params, ret, false, subst)
         // A name behind a mode is the one place a trait may be what it names.
-        NamedType(name, args) -> resolve_named(a, scope, inner.span, name, args, subst, true)
-        _ -> if qualified then resolve_qualified(a, scope, inner, subst) else resolve_type(a, scope, inner, subst)
+        NamedType(name, args) -> resolve_named(a, scope, inner.span, name, args, subst, sigil)
+        _ -> if sigil == "*" then resolve_qualified(a, scope, inner, subst) else resolve_type(a, scope, inner, subst)
 
 // **A callable is not a type: it is a trait**, and a trait stands where a type does only behind a
 // mode. The bare arrow is a parameter's sugar and has a refusal of its own; `Fn(…) -> r` written
@@ -752,10 +753,22 @@ end fits_i32
 
 // The type a written name means, with whatever arguments it was given.
 //
-// `behind_a_mode` is whether the name was written as the pointee of a `&`, a `*` or a `weak`, which is
-// the only place a trait stands where a type does.
+// `sigil` is the mode the name was written behind -- `&`, `*` or `weak`, the only place a trait
+// stands where a type does -- and empty where it was written bare.
 private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args: Buf[TypeRef],
-                      subst: Buf[Binding], behind_a_mode: bool) -> Type
+                      subst: Buf[Binding], sigil: string) -> Type
+    val behind_a_mode = sigil != ""
+
+    // **A bare associated-type name is the mistake to catch before the arguments are read**, because
+    // after it the reader is told there is no type of that name -- which is true and is about the
+    // wrong thing. `&Seq[Item]` is somebody one `=` short of the form they meant.
+    if behind_a_mode && !args.is_empty() && bound_type(subst, name).is_none()
+        val tk = lookup_type_key(a, scope, name)
+
+        if tk.is_some() && trait_decl_at(a, tk.unwrap()).is_some()
+            if bare_assoc_name(a, scope, span, tk.unwrap(), args, sigil) then return Unknown
+    end if
+
     val read = read_type_args(a, scope, span, name, args, subst)
 
     if read.is_none() then return Unknown
@@ -830,8 +843,8 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
                     named.push((bound, resolve_type(a, scope, inner, subst)))
                 _ -> positional.push(args.at(i))
 
-        return instantiate_trait(a, scope, span, name, key.unwrap(), d.unwrap(),
-                                 resolve_list(a, scope, positional, subst), named)
+        return object_of(a, scope, span, name, key.unwrap(), d.unwrap(),
+                         resolve_list(a, scope, positional, subst), named, sigil)
     end if
 
     instantiate(a, scope, span, name, key.unwrap(),
@@ -1664,6 +1677,83 @@ private instantiate_trait(a: &Analysis, scope: Scope, span: Span, written: strin
     object_defaults(a, scope, span, key, d, targs.len())
     Trait(key, trait_args_with_defaults(a, scope, span, key, d, targs, buf()), named)
 end instantiate_trait
+
+// A trait written behind a mode: the object it forms, its brackets read as the object reads them.
+//
+// **The one unambiguous case is written without the name**, and it is the common one: a trait with
+// no parameters of its own and exactly one associated type has only one thing a bare argument could
+// mean, so `*Iterate[string]` is `*Iterate[Item = string]`. Where the trait has parameters too, a
+// bare argument means one of *those* and the associated type has to be named.
+private object_of(a: &Analysis, scope: Scope, span: Span, written: string, key: string, d: TraitDecl,
+                  targs: Buf[Type], named: Buf[(string, Type)], sigil: string) -> Type
+    val declared = object_assocs(a, key)
+    val sugared = d.tparams.is_empty() && declared.len() == 1 && named.is_empty() && targs.len() == 1
+
+    if sugared
+        var fixed: Buf[(string, Type)] = buf()
+
+        fixed.push((declared.at(0).name, targs.at(0)))
+        return checked_object(a, scope, span, written, key, d, buf(), fixed, declared, sigil)
+    end if
+
+    // **A bare argument too many, on a trait that declares associated types.** The arity refusal is
+    // right about the count and says the wrong thing about the cause -- this trait has something
+    // open that is simply not fixed by position.
+    if !declared.is_empty() && targs.len() > d.tparams.len()
+        a.fault(scope, span, too_many_bare(key, d, declared, targs.len(), sigil))
+        return Unknown
+
+    checked_object(a, scope, span, written, key, d, targs, named, declared, sigil)
+end object_of
+
+private checked_object(a: &Analysis, scope: Scope, span: Span, written: string, key: string,
+                       d: TraitDecl, targs: Buf[Type], fixed: Buf[(string, Type)],
+                       declared: Buf[AssocDecl], sigil: string) -> Type
+    val made = instantiate_trait(a, scope, span, written, key, d, targs, fixed)
+
+    // A refused binding is no object, as a refused erasure is not.
+    made match
+        Trait(_, args, _) ->
+            if check_assoc_args(a, scope, span, key, declared, fixed, sigil, args) then return Unknown
+        _ -> ()
+
+    made
+end checked_object
+
+private too_many_bare(key: string, d: TraitDecl, declared: Buf[AssocDecl], given: usize,
+                     sigil: string) -> string
+    val shown = qualified_name(key)
+    var fixes: Buf[string] = buf()
+    var whole: Buf[string] = buf()
+    var quoted: Buf[string] = buf()
+
+    for i in 0..<d.tparams.len()
+        whole.push("…")
+
+    for i in 0..<declared.len()
+        val n = declared.at(i).name
+
+        fixes.push(s"$n = …")
+        whole.push(s"$n = …")
+        quoted.push(s"'$n'")
+
+    val owns = if d.tparams.is_empty() then s"'$shown' takes no type arguments of its own"
+    else s"'$shown' takes ${quantity(d.tparams.len(), "type argument")} of its own"
+
+    // Why the short form did not apply, and there are two reasons: more than one thing is open, or
+    // exactly one is and the count is wrong -- and a reader in the second case has the form right.
+    var why = "A bare argument is the short form only for a trait with no parameters of its own and " +
+              "exactly one associated type, so here it would not say which"
+
+    if d.tparams.is_empty() && declared.len() == 1
+        why = s"One bare argument is the short form for '${joined(fixes, ", ")}', and " +
+              s"${quantity(given, "argument")} ${if given == 1 then "is" else "are"} not"
+
+    val what = if declared.len() == 1 then "the associated type" else "the associated types"
+
+    s"$owns, and what it leaves for an object to fix is $what ${joined(quoted, ", ")} — an object " +
+    s"fixes one by name, so write '$sigil$shown[${joined(whole, ", ")}]'. $why"
+end too_many_bare
 
 private joined_assocs(a: Buf[(string, Type)], b: Buf[(string, Type)]) -> Buf[(string, Type)]
     var out: Buf[(string, Type)] = buf()
