@@ -81,7 +81,7 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
     // `sizeof(T)` and `alignof(T)` are compile-time constants, so they fold exactly as a literal
     // does -- which is what makes them usable in an array bound and in a `const`.
     LayoutOf(what, t) -> layout_bytes(cx, what, resolve_type(cx.an, cx.scope, t, cx.subst))
-    OffsetOf(t, field) -> offset_bytes(cx, resolve_type(cx.an, cx.scope, t, cx.subst), field)
+    OffsetOf(t, field) -> offset_bytes(cx, e.span, resolve_type(cx.an, cx.scope, t, cx.subst), field)
 
     // `T::Min` and `T::Max` on a built-in integer are constants for the reason `sizeof` is: the
     // answer is a property of the type and is known once the type is.
@@ -306,14 +306,38 @@ layout_bytes(cx: &Analyzer, what: string, t: Type) -> Option[Const]
 end layout_bytes
 
 // Where a field sits in a struct, in bytes.
-offset_bytes(cx: &Analyzer, t: Type, field: string) -> Option[Const]
+//
+// **A name the struct does not store is refused here, naming what it does store**, and so is an
+// operand that is not a struct: a misspelled field is the mistake an `@assert` over `offsetof`
+// exists to catch, and answering only that the condition did not fold would pass it over in
+// silence. The refusal is counted, so the `const` or the `@assert` around it says nothing more.
+offset_bytes(cx: &Analyzer, span: Span, t: Type, field: string) -> Option[Const]
     if t == Unknown || mentions_abstract(t) then return None
 
     underlying(t) match
-        Struct(d) -> cx.an.tables.layout.field_offset(d, field)
-                       .map(n -> ConstInt(from_int(long(n))))
-        _ -> None
+        Struct(d) ->
+            val at = cx.an.tables.layout.field_offset(d, field)
+
+            if at.is_some() then return Some(ConstInt(from_int(long(at.unwrap()))))
+
+            refuse(cx, span, s"'${type_show(t)}' has no field '$field'" + stored_names(d))
+        _ -> refuse(cx, span, s"'offsetof' measures a field of a struct, and ${type_show(t)} is not one")
 end offset_bytes
+
+// The fields a struct stores, quoted, as the tail of a refusal naming one it does not.
+private stored_names(d: &StructType) -> string
+    val fields = d.stored()
+
+    if fields.len() == 0 then return ""
+
+    var out = " — it stores "
+
+    for i in 0..<fields.len()
+        if i > 0 then out = out + ", "
+        out = out + s"'${fields.at(i).0}'"
+
+    out
+end stored_names
 
 // A width family name, measured with nothing to say about a spelling that is not one.
 private width_of(cx: &Analyzer, name: string) -> Option[Type] =
@@ -395,6 +419,8 @@ private converted(cx: &Analyzer, span: Span, v: Const, target: Type) -> Option[C
 // which is the only moment `sizeof(T)` is a number -- and a condition that is still waiting for one
 // is not a mistake, since a later instantiation settles it.
 check_assert(cx: &Analyzer, span: Span, cond: Expr, message: Option[string])
+    val refusals = cx.an.const_refusals
+
     const_fold(cx, cond) match
         Some(ConstBool(true)) -> ()
         Some(ConstBool(false)) ->
@@ -404,8 +430,9 @@ check_assert(cx: &Analyzer, span: Span, cond: Expr, message: Option[string])
         Some(other) ->
             cx.fault(span, s"'@assert' takes a condition, and this is ${const_kind(other)} — an " +
                      "assertion is something that can be true or false")
+        // A fold that refused has already said why, at the part that stopped it.
         None ->
-            if !awaits_instantiation(cx, cond) then
+            if !awaits_instantiation(cx, cond) && !const_refused_since(cx.an, refusals) then
                 cx.fault(span, "'@assert' is settled while compiling, so its condition has to be " +
                          "a constant expression — a literal, a 'const', 'sizeof', 'alignof', " +
                          "'offsetof', or the arithmetic and comparisons over them, and never a call")

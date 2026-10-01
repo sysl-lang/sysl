@@ -1,0 +1,660 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// `@assert`, a condition settled while compiling, and `assert_eq` with the two beside it, an
+// assertion that reports the values it compared (`reference/declarations.md`, `library/core.md
+// § assert_eq`).
+//
+// **Every string quoted here was read out of the reference compiler** (0.0.153), whose
+// `AssertTests` and `AssertEqTests` these are. Where the reference's program reports `<input>:2`
+// this one reports the file it was written to, so the claim is the line, `main.sysl:2`.
+
+private var asr_library_cache: Buf[Program] = buf()
+private var asr_library_read: bool = false
+
+private asr_library() -> Buf[Program]
+    if asr_library_read then return asr_library_cache
+
+    asr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> asr_library_cache = units
+
+    asr_library_cache
+end asr_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private asr_ready() -> bool
+    if asr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end asr_ready
+
+// What the program at `target` inside `root` does, as `<exit status>: <everything it printed>`. A
+// program that could not be built answers `unbuilt: <why>`, which is where every refusal below is
+// read from, and one a signal stopped answers `signalled: …`.
+private asr_built(root: string, target: string) -> string
+    val exe = s"$root/built"
+
+    build_native_program(target, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"unbuilt: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "unbuilt: the program that was built could not be run"
+        Ok(out) ->
+            val all = out.text + out.err.unwrap_or("")
+
+            out.status match
+                Status.Exited(code) -> s"$code: $all"
+                _ -> s"signalled: $all"
+end asr_built
+
+private asr_does(text: string) -> string
+    val root = make_temp_dir("sysl-assert").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    asr_built(root, s"$root/main.sysl")
+end asr_does
+
+// The same, for a program of two files: the module `m` beside the beginning.
+private asr_does_of(module_text: string, main_text: string) -> string
+    val root = make_temp_dir("sysl-assert").unwrap()
+
+    make_dir_all(s"$root/m").unwrap()
+    write_text(s"$root/m/m.sysl", module_text).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+    asr_built(root, root)
+end asr_does_of
+
+// The LLVM text of a program that must compile.
+private asr_ir(text: string) -> string
+    val root = make_temp_dir("sysl-assert").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end asr_ir
+
+private asr_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// How many times `part` occurs in `text`.
+private asr_count(text: string, part: string) -> usize
+    var n: usize = 0
+    var from: usize = 0
+
+    loop
+        text[from..<text.len].index_of(part) match
+            Some(i) ->
+                n += 1
+                from += i + part.len
+            None -> break
+
+    n
+end asr_count
+
+// A refusal: the build stopped, and what it said holds `part`.
+private asr_refused(outcome: string, part: string)
+    assert(outcome.starts_with("unbuilt: "), s"expected a refusal, got: $outcome")
+    assert(asr_says(outcome, part), s"expected '$part' in: $outcome")
+end asr_refused
+
+// A panic: the program ran and stopped itself with status 1, having said `part`.
+private asr_stopped(outcome: string, part: string)
+    assert(outcome.starts_with("1: "), s"expected a panic, got: $outcome")
+    assert(asr_says(outcome, part), s"expected '$part' in: $outcome")
+end asr_stopped
+
+// ---- AssertTests: a true assertion emits nothing and gets out of the way ----
+
+@test("@assert: over literals")
+asr_over_literals()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("@assert(1 + 1 == 2)\nprint(1)\n"), "0: 1\n")
+
+// Asserts are settled after every constant has folded, so the condition may name one wherever it
+// was written -- below included.
+@test("@assert: naming a const declared below it")
+asr_naming_a_const_declared_below_it()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("@assert(capacity == 512)\nconst capacity: usize = 512\nprint(1)\n"), "0: 1\n")
+
+@test("@assert: over sizeof, which is the case it exists for")
+asr_over_sizeof()
+    if !asr_ready() then return
+
+    assert_eq(asr_does(raw"""
+        struct FRect
+            x: f32
+            y: f32
+            w: f32
+            h: f32
+        end FRect
+        @assert(sizeof(FRect) == 16, "FRect must match SDL_FRect")
+        print(1)
+        """), "0: 1\n")
+
+@test("@assert: over alignof")
+asr_over_alignof()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("@assert(alignof(i32) == 4)\nprint(1)\n"), "0: 1\n")
+
+// `sizeof` pins the total; it says nothing about order, so this is the half that tells a
+// transposition from a match.
+@test("@assert: over offsetof, which is what tells a transposition from a match")
+asr_over_offsetof()
+    if !asr_ready() then return
+
+    assert_eq(asr_does(raw"""
+        struct Header
+            tag: u8
+            length: u32
+            flags: u16
+        end Header
+        @assert(offsetof(Header, tag) == 0)
+        @assert(offsetof(Header, length) == 4, "the padding after 'tag' is what puts it at 4")
+        @assert(offsetof(Header, flags) == 8)
+        @assert(sizeof(Header) == 12)
+        print(1)
+        """), "0: 1\n")
+
+@test("@assert: over offsetof on a packed struct, where the offsets are the widths before")
+asr_over_offsetof_on_a_packed_struct()
+    if !asr_ready() then return
+
+    assert_eq(asr_does(raw"""
+        @packed
+        struct Wire
+            tag: u8
+            length: u32
+            flags: u16
+        end Wire
+        @assert(offsetof(Wire, tag) == 0)
+        @assert(offsetof(Wire, length) == 1)
+        @assert(offsetof(Wire, flags) == 5)
+        print(1)
+        """), "0: 1\n")
+
+// Two same-width fields swapped leave `sizeof` right and every read wrong.
+@test("@assert: and a transposition of two same-width fields is what it catches")
+asr_a_transposition_is_what_it_catches()
+    if !asr_ready() then return
+
+    asr_refused(asr_does(raw"""
+        struct Status
+            state: u32
+            priority: u8
+            runtime: u32
+        end Status
+        @assert(sizeof(Status) == 12)
+        @assert(offsetof(Status, state) == 8, "Status.state moved")
+        print(1)
+        """), "assertion failed: Status.state moved — the left side is 0")
+
+@test("@assert: several, each settled on its own")
+asr_several_each_settled_on_its_own()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("@assert(sizeof(u8) == 1)\n@assert(sizeof(u16) == 2)\n@assert(sizeof(u32) == 4)\nprint(1)\n"),
+              "0: 1\n")
+
+// ---- a false assertion stops the compilation ----
+
+private asr_frect(cond: string) -> string = s"struct FRect\n    x: f32\n    y: f32\nend FRect\n$cond\nprint(1)\n"
+
+@test("@assert: quoting the message where there is one")
+asr_quoting_the_message_where_there_is_one()
+    if !asr_ready() then return
+
+    asr_refused(asr_does(asr_frect("@assert(sizeof(FRect) == 16, \"FRect must match SDL_FRect\")")),
+                "assertion failed: FRect must match SDL_FRect")
+
+@test("@assert: and saying so plainly where there is not")
+asr_and_saying_so_plainly_where_there_is_not()
+    if !asr_ready() then return
+
+    asr_refused(asr_does("@assert(1 == 2)\nprint(1)\n"), "error: assertion failed\n")
+
+// ---- a failed comparison says what the sides actually were ----
+
+@test("@assert: naming the computed side")
+asr_naming_the_computed_side()
+    if !asr_ready() then return
+
+    asr_refused(asr_does(asr_frect("@assert(sizeof(FRect) == 16, \"FRect must match SDL_FRect\")")),
+                "assertion failed: FRect must match SDL_FRect — the left side is 8\n")
+
+// The literal is on screen directly above the message, so repeating it back teaches nothing.
+@test("@assert: and not the side the reader wrote as a literal")
+asr_and_not_the_side_written_as_a_literal()
+    if !asr_ready() then return
+
+    val out = asr_does(asr_frect("@assert(sizeof(FRect) == 16)"))
+
+    asr_refused(out, "assertion failed — the left side is 8\n")
+    assert(!asr_says(out, "the right side"), out)
+
+@test("@assert: both, where both were computed")
+asr_both_where_both_were_computed()
+    if !asr_ready() then return
+
+    asr_refused(asr_does(raw"""
+        struct Wide
+            a: u64
+        end Wide
+        struct Narrow
+            a: u8
+        end Narrow
+        @assert(sizeof(Wide) == sizeof(Narrow))
+        print(1)
+        """), "assertion failed — the left side is 8 and the right side is 1\n")
+
+// A negative bound parses as a unary minus over a literal, and is still something the reader wrote.
+@test("@assert: treating a written negative as the literal it is")
+asr_treating_a_written_negative_as_a_literal()
+    if !asr_ready() then return
+
+    val out = asr_does("const limit: int = 3\n@assert(limit == -1)\nprint(1)\n")
+
+    asr_refused(out, "assertion failed — the left side is 3\n")
+    assert(!asr_says(out, "the right side"), out)
+
+// What the sides were, then which instantiation asked.
+@test("@assert: alongside the instantiation note, not instead of it")
+asr_alongside_the_instantiation_note()
+    if !asr_ready() then return
+
+    asr_refused(asr_does("slab[T](x: T) -> int\n    @assert(sizeof(T) >= 8, \"too narrow\")\n    3\n\nprint(slab(1u8))\n"),
+                "assertion failed: too narrow — the left side is 1 — where T = byte\n")
+
+// A condition that is not a comparison has no operand worth naming.
+@test("@assert: and adds nothing to a condition that is not a comparison")
+asr_adds_nothing_to_a_condition_not_a_comparison()
+    if !asr_ready() then return
+
+    val out = asr_does("const enabled: bool = false\n@assert(enabled, \"the feature has to be on\")\nprint(1)\n")
+
+    asr_refused(out, "assertion failed: the feature has to be on\n")
+    assert(!asr_says(out, "side is"), out)
+
+// ---- the parentheses left off are answered as the bracket they are ----
+
+private asr_parentheses() -> string =
+    "'@assert' takes its condition in parentheses — '@assert(sizeof(T) == 16)', with an optional " +
+    "message after a comma. It is the parentheses that make it this declaration rather than an " +
+    "annotation about the one under it"
+
+@test("@assert: at a declaration's position")
+asr_at_a_declarations_position()
+    if !asr_ready() then return
+
+    asr_refused(asr_does("struct S\n    a: u64\n\n@assert sizeof(S) == 8\nprint(1)\n"), asr_parentheses())
+
+@test("@assert: inside a body, where it is a statement")
+asr_inside_a_body_where_it_is_a_statement()
+    if !asr_ready() then return
+
+    asr_refused(asr_does("main()\n    @assert 1 + 1 == 2\n    print(1)\n"), asr_parentheses())
+
+// The roster is what a reader leaving the parentheses off used to get; a word that genuinely is not
+// an annotation must still get it.
+@test("@assert: and the roster is kept for a word that really is not one")
+asr_the_roster_is_kept_for_a_word_that_is_not_one()
+    if !asr_ready() then return
+
+    val out = asr_does("@wibble\nf() -> int = 1\nprint(f())\n")
+
+    asr_refused(out, "'wibble' is not an annotation a declaration takes — '@test', '@setup'")
+    assert(!asr_says(out, "takes its condition in parentheses"), out)
+
+@test("@assert: which the parenthesised form is not touched by")
+asr_which_the_parenthesised_form_is_not_touched_by()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("struct S\n    a: u64\n\n@assert(sizeof(S) == 8)\nprint(1)\n"), "0: 1\n")
+
+// ---- what it refuses ----
+
+private asr_not_constant() -> string =
+    "'@assert' is settled while compiling, so its condition has to be a constant expression — a " +
+    "literal, a 'const', 'sizeof', 'alignof', 'offsetof', or the arithmetic and comparisons over " +
+    "them, and never a call"
+
+@test("@assert: a condition that is not a constant expression")
+asr_a_condition_that_is_not_a_constant_expression()
+    if !asr_ready() then return
+
+    asr_refused(asr_does("f() -> int = 3\n@assert(f() == 3)\nprint(1)\n"), asr_not_constant())
+
+@test("@assert: a condition that is not a boolean")
+asr_a_condition_that_is_not_a_boolean()
+    if !asr_ready() then return
+
+    asr_refused(asr_does("@assert(1 + 1)\nprint(1)\n"),
+                "'@assert' takes a condition, and this is an integer — an assertion is something " +
+                "that can be true or false")
+
+@test("@assert: a val, which is read while the program runs")
+asr_a_val_which_is_read_while_the_program_runs()
+    if !asr_ready() then return
+
+    asr_refused(asr_does("val limit: int = 10\n@assert(limit == 10)\nprint(1)\n"), asr_not_constant())
+
+// A misspelled field is the mistake this form exists to catch, in miniature: it names what the
+// struct does store, and says nothing about the condition not folding.
+@test("@assert: a field the struct does not have, by name")
+asr_a_field_the_struct_does_not_have()
+    if !asr_ready() then return
+
+    val out = asr_does("struct Header\n    tag: u8\n    length: u32\nend Header\n@assert(offsetof(Header, len) == 4)\nprint(1)\n")
+
+    asr_refused(out, "'Header' has no field 'len' — it stores 'tag', 'length'\n")
+    assert(!asr_says(out, "constant expression"), out)
+
+@test("@assert: an operand that is not a struct at all")
+asr_an_operand_that_is_not_a_struct()
+    if !asr_ready() then return
+
+    val out = asr_does("@assert(offsetof(u32, x) == 0)\nprint(1)\n")
+
+    asr_refused(out, "'offsetof' measures a field of a struct, and uint is not one\n")
+    assert(!asr_says(out, "constant expression"), out)
+
+// The same two refusals where `offsetof` is an ordinary expression or a `const`'s value, which is
+// the one place they are said; a struct that stores nothing has nothing to list.
+@test("offsetof: a missing field is refused by name in an expression and in a const")
+asr_offsetof_refusals_outside_an_assert()
+    if !asr_ready() then return
+
+    val out = asr_does(raw"""
+        struct Header
+            tag: u8
+            length: u32
+        end Header
+        struct Empty
+        end Empty
+        print(offsetof(Header, len))
+        print(offsetof(u32, x))
+        print(offsetof(Empty, x))
+        const k: usize = offsetof(Header, nope)
+        print(k)
+        """)
+
+    asr_refused(out, "'Header' has no field 'len' — it stores 'tag', 'length'\n")
+    asr_refused(out, "'offsetof' measures a field of a struct, and uint is not one\n")
+    asr_refused(out, "'Empty' has no field 'x'\n")
+    asr_refused(out, "'Header' has no field 'nope' — it stores 'tag', 'length'\n")
+    assert(!asr_says(out, "not a constant expression"), out)
+
+// ---- in a module file: a declaration there, a statement in the entry file, one message ----
+
+@test("@assert: a true one is silent")
+asr_in_a_module_a_true_one_is_silent()
+    if !asr_ready() then return
+
+    assert_eq(asr_does_of("module m\nconst capacity: usize = 512\n@assert(capacity == 512)\n", "print(1)\n"), "0: 1\n")
+
+@test("@assert: a false one is reported exactly once")
+asr_in_a_module_a_false_one_is_reported_once()
+    if !asr_ready() then return
+
+    val out = asr_does_of("module m\n@assert(1 == 2, \"arithmetic broke\")\n", "print(1)\n")
+
+    asr_refused(out, "assertion failed: arithmetic broke\n")
+    assert_eq(asr_count(out, "assertion failed"), 1)
+
+// ---- inside a generic body, settled once per instantiation ----
+
+private asr_slab(arg: string) -> string =
+    "slab[T](x: T) -> int\n    @assert(sizeof(T) >= sizeof(*u8), \"a free block has to hold the link through it\")\n" +
+    s"    3\n\nprint(slab($arg))\n"
+
+@test("@assert: a claim the argument satisfies is silent")
+asr_a_claim_the_argument_satisfies_is_silent()
+    if !asr_ready() then return
+
+    assert_eq(asr_does(asr_slab("1u64")), "0: 3\n")
+
+@test("@assert: and one it does not stops the compilation")
+asr_and_one_it_does_not_stops_the_compilation()
+    if !asr_ready() then return
+
+    val out = asr_does(asr_slab("1u8"))
+
+    asr_refused(out, "assertion failed: a free block has to hold the link through it — the left side " +
+                "is 1 and the right side is 8 — where T = byte\n")
+    assert(!asr_says(out, "unknown type"), out)
+
+// The mistake is at the call that chose `u8`, the sentence explaining why at the declaration.
+@test("@assert: naming which instantiation asked")
+asr_naming_which_instantiation_asked()
+    if !asr_ready() then return
+
+    asr_refused(asr_does("slab[T](x: T) -> int\n    @assert(sizeof(T) >= 8, \"too narrow\")\n    3\n\nprint(slab(1u8))\n"),
+                "where T = byte\n")
+
+@test("@assert: one instantiation may fail while another passes")
+asr_one_instantiation_may_fail_while_another_passes()
+    if !asr_ready() then return
+
+    val out = asr_does("slab[T](x: T) -> int\n    @assert(sizeof(T) >= 8, \"too narrow\")\n    3\n\n" +
+                       "print(slab(1u64))\nprint(slab(1u16))\n")
+
+    asr_refused(out, "assertion failed: too narrow — the left side is 2 — where T = ushort\n")
+    assert(!asr_says(out, "where T = ulong"), out)
+
+// A concrete type's members carry a `Self` binding too, resolved once rather than per call -- so
+// the note names it without announcing an instantiation nothing made.
+@test("@assert: a concrete type's member names its Self without claiming to have been instantiated")
+asr_a_concrete_types_member_names_its_self()
+    if !asr_ready() then return
+
+    val out = asr_does(raw"""
+        struct Point
+            x: int
+            y: int
+
+            check(self) -> int
+                @assert(sizeof(Point) == 4, "Point must be four bytes")
+                1
+        end Point
+
+        var p = Point(1, 2)
+        print(p.check())
+        """)
+
+    asr_refused(out, "assertion failed: Point must be four bytes — the left side is 8 — where Self = Point\n")
+    assert(!asr_says(out, "instantiation"), out)
+
+@test("@assert: over a value parameter, which is inferred from the argument's length")
+asr_over_a_value_parameter()
+    if !asr_ready() then return
+
+    asr_refused(asr_does(raw"""
+        buffer[const N: usize](xs: [N]int) -> usize
+            @assert(N <= 4, "the scratch buffer is a stack array")
+            N
+
+        var small: [2]int = [1, 2]
+        var big: [8]int = [1, 2, 3, 4, 5, 6, 7, 8]
+        print(buffer(small))
+        print(buffer(big))
+        """), "assertion failed: the scratch buffer is a stack array — the left side is 8 — where N = 8\n")
+
+// A generic nothing calls carries an unchecked claim, the same deferral `[sizeof(T)]u8` lives under.
+@test("@assert: a generic nothing instantiates is not complained about")
+asr_a_generic_nothing_instantiates()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("slab[T](x: T) -> int\n    @assert(sizeof(T) >= 8, \"too narrow\")\n    3\n\nprint(1)\n"), "0: 1\n")
+
+// The deferral is about a type that will become concrete and nothing else.
+@test("@assert: and a condition that will never be constant is still refused there")
+asr_a_condition_never_constant_is_refused_in_a_generic()
+    if !asr_ready() then return
+
+    asr_refused(asr_does("f() -> int = 3\n\nslab[T](x: T) -> int\n    @assert(f() == 3)\n    3\n\nprint(slab(1u64))\n"),
+                asr_not_constant())
+
+// ---- AssertEqTests: a check that holds says nothing and returns ----
+
+@test("assert_eq: for an integer")
+asr_eq_for_an_integer()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("assert_eq(6 * 7, 42)\nprint(\"through\")\n"), "0: through\n")
+
+@test("assert_eq: for a string, which is a different 'impl Display' and the same function")
+asr_eq_for_a_string()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("assert_eq(\"ab\" + \"c\", \"abc\")\nprint(\"through\")\n"), "0: through\n")
+
+@test("assert_eq: and for a slice, element by element")
+asr_eq_for_a_slice()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("assert_slice_eq([1, 2, 3], [1, 2, 3])\nprint(\"through\")\n"), "0: through\n")
+
+@test("assert_eq: written either as a literal or as a slice of something named")
+asr_eq_a_slice_of_something_named()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("var a = [1, 2, 3]\nvar b = [1, 2, 3]\nassert_slice_eq(a[..], b[..])\nprint(\"through\")\n"),
+              "0: through\n")
+
+// The read-only view, which is the slice most tests actually hold: `.bytes` answers one.
+@test("assert_eq: and for a read-only view, which is what '.bytes' answers")
+asr_eq_for_a_read_only_view()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("val a: []const u8 = \"ab\".bytes\nval b: []const u8 = \"ab\".bytes\n" +
+                       "assert_eq(a, b)\nprint(\"through\")\n"), "0: through\n")
+
+// ---- a check that fails names both values and where it was written ----
+
+@test("assert_eq: the pair, in the order 'got' then 'want'")
+asr_eq_the_pair_got_then_want()
+    if !asr_ready() then return
+
+    asr_stopped(asr_does("assert_eq(6 * 6, 42)\n"), "panic: got 36, want 42 (")
+
+@test("assert_eq: the caller's line, not this library's")
+asr_eq_the_callers_line()
+    if !asr_ready() then return
+
+    val out = asr_does("print(\"x\")\nassert_eq(1, 2)\n")
+
+    asr_stopped(out, "x\npanic: got 1, want 2 (")
+    asr_stopped(out, "main.sysl:2)")
+
+@test("assert_eq: a message where one was given, ahead of the values")
+asr_eq_a_message_ahead_of_the_values()
+    if !asr_ready() then return
+
+    asr_stopped(asr_does("assert_eq(1, 2, \"the counter\")\n"), "panic: the counter: got 1, want 2 (")
+
+@test("assert_eq: and nothing but the values where one was not")
+asr_eq_nothing_but_the_values()
+    if !asr_ready() then return
+
+    asr_stopped(asr_does("assert_eq(1, 2)\n"), "panic: got 1, want 2 (")
+
+// ---- a slice reports which element, and a length before any of them ----
+
+@test("assert_eq: the first index the two disagree at")
+asr_eq_the_first_index_they_disagree_at()
+    if !asr_ready() then return
+
+    asr_stopped(asr_does("assert_slice_eq([1, 2, 3], [1, 5, 3])\n"), "panic: got 2, want 5 at index 1 (")
+
+@test("assert_eq: the lengths, when those are what differ")
+asr_eq_the_lengths_when_they_differ()
+    if !asr_ready() then return
+
+    asr_stopped(asr_does("assert_slice_eq([1, 2], [1, 2, 3])\n"), "panic: got 2 elements, want 3 (")
+
+@test("assert_eq: a read-only view renders both sequences when they differ")
+asr_eq_a_read_only_view_renders_both()
+    if !asr_ready() then return
+
+    asr_stopped(asr_does("val a: []const u8 = \"ab\".bytes\nval b: []const u8 = \"az\".bytes\nassert_eq(a, b)\n"),
+                "panic: got [97, 98], want [97, 122] (")
+
+@test("assert_eq: and a length mismatch is reported instead of an index, not as well")
+asr_eq_a_length_mismatch_instead_of_an_index()
+    if !asr_ready() then return
+
+    val out = asr_does("assert_slice_eq([9], [1, 2, 3])\n")
+
+    asr_stopped(out, "panic: got 1 elements, want 3 (")
+    assert(!asr_says(out, "at index"), out)
+
+// ---- the float pair, which cannot use '==' and so cannot use 'assert_eq' ----
+
+@test("assert_eq: an absolute tolerance admits what rounding moved")
+asr_eq_an_absolute_tolerance_admits()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("import sysl.math.*\nassert_approx_eq(0.1 + 0.2, 0.3, 1e-9)\nprint(\"through\")\n"),
+              "0: through\n")
+
+@test("assert_eq: and refuses what it did not, naming the tolerance")
+asr_eq_refuses_naming_the_tolerance()
+    if !asr_ready() then return
+
+    asr_stopped(asr_does("import sysl.math.*\nassert_approx_eq(1.0, 2.0, 0.001)\n"),
+                "panic: got 1, want 2 to within 0.001 (")
+
+@test("assert_eq: a relative tolerance is the test at large magnitudes")
+asr_eq_a_relative_tolerance()
+    if !asr_ready() then return
+
+    assert_eq(asr_does("import sysl.math.*\nassert_approx_eq_rel(1e18, 1e18 + 1.0, 1e-9)\nprint(\"through\")\n"),
+              "0: through\n")
+
+// `@no_alloc` is checked against the call graph, so a report that built a string would be refused
+// here rather than merely being slower.
+@test("assert_eq: and none of it allocates, which is what a hand-written message could not promise")
+asr_eq_none_of_it_allocates()
+    if !asr_ready() then return
+
+    val text = asr_ir("@no_alloc\n\ncheck(n: int)\n    assert_eq(n, 42)\n\ncheck(42)\n")
+
+    assert(asr_says(text, "@main"), text)
