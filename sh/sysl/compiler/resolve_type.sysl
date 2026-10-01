@@ -894,8 +894,12 @@ end read_type_args_at
 // type's identity, at the type the declaration wrote for its parameter. An enclosing declaration's
 // value parameter stands at zero for the walk that checks a generic body, exactly as a length
 // written over one does -- there is no argument yet, and that walk's tree is discarded.
+//
+// **The value has to be one the declared type holds** -- a value argument is the declaration's
+// parameter, so `Buf[-1]` is refused at the argument rather than at the array it would have sized.
+// `what` is the subject that sentence is about: the argument, or the default standing in for one.
 private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type,
-                  subst: Buf[Binding]) -> Option[Type]
+                  subst: Buf[Binding], what: string = "this argument") -> Option[Type]
     val written = *arg.kind match
         ValueArgType(e) -> Some(e)
         NamedType(n, targs) -> if targs.is_empty() then Some(expr(arg.span, Ident(n))) else None
@@ -910,7 +914,17 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
     val e = written.unwrap()
     val folded = const_arg_value(a, scope, e, subst)
 
-    if folded.is_some() then return Some(ConstArg(folded.unwrap(), ty))
+    if folded.is_some()
+        ty match
+            Integer(bits, signed, _) ->
+                if !fits(folded.unwrap(), bits, signed)
+                    a.fault(scope, span, s"$what does not fit ${type_show(ty)}: ${to_string(folded.unwrap())}")
+                    return None
+                end if
+            _ -> ()
+
+        return Some(ConstArg(folded.unwrap(), ty))
+    end if
 
     val tag = variant_tag(e, ty)
 
@@ -933,6 +947,12 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
     a.fault(scope, span, "a value argument must be a constant — a literal, or a 'const' naming one")
     None
 end value_arg
+
+// A value parameter's default, read as the argument it stands in for -- at the type the declaration
+// wrote for the parameter, under the arguments already fixed to its left.
+default_value(a: &Analysis, scope: Scope, span: Span, name: string, arg: TypeRef, ty: Type,
+              subst: Buf[Binding]) -> Option[Type] =
+    value_arg(a, scope, span, arg, ty, subst, s"the default for '$name'")
 
 // The number a value argument folds to, whichever admissible kind it is.
 private const_arg_value(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Option[BigInt]
@@ -1226,8 +1246,11 @@ end bindings_for
 //
 // **Nothing is answered where a default leads back to the declaration being filled**: that is
 // reported (`default_cycle`), and the use has no type.
+//
+// **A value parameter's default is read as the argument it stands for**, at the type the declaration
+// wrote for the parameter, so `Ring[int]` and `Ring[int, 4]` are one instantiation.
 private filled_targs(a: &Analysis, scope: Scope, span: Span, key: string, home: Scope,
-                     tparams: Buf[string], tdefaults: Buf[TypeBinding],
+                     tparams: Buf[string], tdefaults: Buf[TypeBinding], tvalues: Buf[TypeBinding],
                      targs: Buf[Type]) -> Option[Buf[Type]]
     if targs.len() >= tparams.len() || tdefaults.is_empty() then return Some(targs)
 
@@ -1252,9 +1275,17 @@ private filled_targs(a: &Analysis, scope: Scope, span: Span, key: string, home: 
             here.push(Binding(tparams.at(j), filled.at(j)))
 
         val w = binding_named(tdefaults, tparams.at(i))
+        val declared = binding_named(tvalues, tparams.at(i))
 
-        if w.is_none() then filled.push(Unknown)
-        else filled.push(resolve_type(a, home, w.unwrap(), here))
+        if w.is_none() || declared.is_none()
+            filled.push(if w.is_none() then Unknown else resolve_type(a, home, w.unwrap(), here))
+            continue
+        end if
+
+        val v = default_value(a, home, w.unwrap().span, tparams.at(i), w.unwrap(),
+                              resolve_type(a, home, declared.unwrap(), no_bindings()), here)
+
+        filled.push(if v.is_some() then v.unwrap() else Unknown)
 
     a.defaults_filling.truncate(a.defaults_filling.len() - 1)
     Some(filled)
@@ -1289,7 +1320,7 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
     if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, written_targs) then
         return Unknown
 
-    val fill = filled_targs(a, scope, span, key, home, d.tparams, d.tdefaults, written_targs)
+    val fill = filled_targs(a, scope, span, key, home, d.tparams, d.tdefaults, d.tvalues, written_targs)
 
     if fill.is_none() then return Unknown
 
@@ -1342,7 +1373,7 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
     if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, written_targs) then
         return Unknown
 
-    val fill = filled_targs(a, scope, span, key, home, d.tparams, d.tdefaults, written_targs)
+    val fill = filled_targs(a, scope, span, key, home, d.tparams, d.tdefaults, d.tvalues, written_targs)
 
     if fill.is_none() then return Unknown
 
