@@ -1,0 +1,695 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// How much of a C library can actually be externed (`reference/ffi.md § extern — a declaration with
+// no body`), and what `c"…"` hands across the boundary.
+//
+// The question is not whether `extern` works but whether the signatures a real header contains can
+// be spelled, because one that cannot is a library sysl cannot bind. So the first half is a sweep of
+// libc declarations, each required to compile; a declaration nothing calls is not emitted, which is
+// what makes the sweep cheap. The second half runs the values across, and the third pins the shapes
+// a reader still reaches for wrongly.
+//
+// **Every output and every diagnostic quoted here was read out of the reference compiler** (0.0.153),
+// whose `CInteropTests` and `CStringTests` these are.
+
+private var cin_library_cache: Buf[Program] = buf()
+private var cin_library_read: bool = false
+
+private cin_library() -> Buf[Program]
+    if cin_library_read then return cin_library_cache
+
+    cin_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> cin_library_cache = units
+
+    cin_library_cache
+end cin_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private cin_ready() -> bool
+    if cin_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end cin_ready
+
+private cin_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program prints.
+private cin_ran(text: string) -> string
+    val root = make_temp_dir("sysl-c-interop").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end cin_ran
+
+// Everything a source has to say for itself, through the lowering.
+private cin_err(text: string) -> string
+    val root = make_temp_dir("sysl-c-interop").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cin_err
+
+// The LLVM text of a program that must compile, for the named target or the host.
+private cin_ir_for(target: Option[string], text: string) -> string
+    val root = make_temp_dir("sysl-c-interop").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, target) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cin_ir_for
+
+private cin_ir(text: string) -> string = cin_ir_for(None, text)
+
+// Every one of these must compile, each on its own with a `print(1)` after it, as the reference's
+// sweep compiles them. The answer is the first that did not, with what it was told.
+private cin_spellable(ds: []string) -> string
+    for d in ds
+        val out = cin_ir(s"$d\nprint(1)")
+
+        if out.starts_with("did not compile") then return s"could not spell:\n$d\n\n$out"
+
+    ""
+end cin_spellable
+
+// ---- the signatures a C header contains can be spelled ----
+
+@test("stdio, including the variadic and va_list forms")
+cin_stdio()
+    if !cin_ready() then return
+
+    assert_eq(cin_spellable([
+        "extern puts(s: *u8) -> int",
+        "extern printf(f: *u8, ...) -> int",
+        "extern fprintf(st: *u8, f: *u8, ...) -> int",
+        "extern snprintf(b: *u8, n: usize, f: *u8, ...) -> int",
+        "extern sscanf(s: *u8, f: *u8, ...) -> int",
+        "extern vfprintf(st: *u8, f: *u8, ap: va_list) -> int",
+        "extern fopen(p: *u8, m: *u8) -> *u8",
+        "extern fread(b: *u8, sz: usize, n: usize, st: *u8) -> usize",
+        "extern fgets(b: *u8, n: int, st: *u8) -> *u8",
+        "extern getline(lineptr: **u8, n: *usize, st: *u8) -> isize",
+        "extern fseek(st: *u8, off: isize, whence: int) -> int",
+        "extern setvbuf(st: *u8, b: *u8, mode: int, n: usize) -> int"]), "")
+
+// A struct-returning declaration compiles; that it also returns the right bytes is the second
+// section's business.
+@test("stdlib, including a struct returned by value")
+cin_stdlib()
+    if !cin_ready() then return
+
+    assert_eq(cin_spellable([
+        "extern malloc(n: usize) -> *u8",
+        "extern free(p: *u8)",
+        "extern strtol(s: *u8, endp: **u8, base: int) -> i64",
+        "extern strtod(s: *u8, endp: **u8) -> f64",
+        "extern qsort(b: *u8, n: usize, sz: usize, cmp: *u8)",
+        "extern bsearch(k: *u8, b: *u8, n: usize, sz: usize, cmp: *u8) -> *u8",
+        "extern atexit(f: *u8) -> int",
+        "extern setenv(n: *u8, v: *u8, ow: int) -> int",
+        "extern abort() -> never",
+        "struct div_t\n    quot: i32\n    rem: i32\nextern div(a: i32, b: i32) -> div_t"]), "")
+
+@test("string and memory, the whole interior-pointer family included")
+cin_string_and_memory()
+    if !cin_ready() then return
+
+    assert_eq(cin_spellable([
+        "extern strlen(p: *u8) -> usize",
+        "extern strcmp(a: *u8, b: *u8) -> int",
+        "extern strdup(s: *u8) -> *u8",
+        "extern strchr(s: *u8, c: int) -> *u8",
+        "extern strstr(h: *u8, n: *u8) -> *u8",
+        "extern strerror(e: int) -> *u8",
+        "extern memcpy(d: *u8, s: *u8, n: usize) -> *u8",
+        "extern memset(d: *u8, c: int, n: usize) -> *u8",
+        "extern memchr(p: *u8, c: int, n: usize) -> *u8",
+        "extern memmem(h: *u8, hn: usize, n: *u8, nn: usize) -> *u8"]), "")
+
+@test("math, including the out-parameter forms")
+cin_math()
+    if !cin_ready() then return
+
+    assert_eq(cin_spellable([
+        "extern sqrt(x: f64) -> f64",
+        "extern atan2(y: f64, x: f64) -> f64",
+        "extern frexp(x: f64, e: *i32) -> f64",
+        "extern modf(x: f64, ip: *f64) -> f64",
+        "extern sqrtf(x: f32) -> f32"]), "")
+
+@test("unistd and the filesystem, including a struct the callee fills")
+cin_unistd()
+    if !cin_ready() then return
+
+    assert_eq(cin_spellable([
+        "extern read(fd: int, p: *u8, n: usize) -> isize",
+        "extern write(fd: int, p: *u8, n: usize) -> isize",
+        "extern open(p: *u8, flags: int, ...) -> int",
+        "extern lseek(fd: int, off: i64, whence: int) -> i64",
+        "extern execv(p: *u8, argv: **u8) -> int",
+        "extern pipe(fds: *i32) -> int",
+        "extern mmap(a: *u8, n: usize, prot: int, flags: int, fd: int, off: i64) -> *u8",
+        "struct stat_t\n    dev: i32\n    mode: u16\n    ino: u64\nextern stat(p: *u8, st: *stat_t) -> int",
+        "struct dirent_t\n    ino: u64\n    reclen: u16\nextern readdir(d: *u8) -> *dirent_t"]), "")
+
+@test("time, whose every interface is a struct behind a pointer")
+cin_time()
+    if !cin_ready() then return
+
+    assert_eq(cin_spellable([
+        "extern time(t: *i64) -> i64",
+        "struct tm\n    sec: i32\n    min: i32\nextern localtime(t: *i64) -> *tm",
+        "struct tm\n    sec: i32\nextern strftime(b: *u8, n: usize, f: *u8, t: *tm) -> usize",
+        "struct timespec\n    sec: i64\n    nsec: i64\nextern clock_gettime(id: i32, t: *timespec) -> int"]), "")
+
+// Each of these declares fine -- the callback is a `void *` and so is spellable.
+@test("the callback-taking interfaces, as declarations")
+cin_callback_declarations()
+    if !cin_ready() then return
+
+    assert_eq(cin_spellable([
+        "extern signal(sig: int, h: *u8) -> *u8",
+        "struct sigaction_t\n    handler: *u8\n    mask: u32\nextern sigaction(s: int, a: *sigaction_t, o: *sigaction_t) -> int",
+        "extern pthread_create(t: *u8, a: *u8, start: *u8, arg: *u8) -> int",
+        "extern dlopen(p: *u8, f: int) -> *u8\nextern dlsym(h: *u8, n: *u8) -> *u8",
+        "extern setjmp(b: *u8) -> int\nextern longjmp(b: *u8, v: int) -> never"]), "")
+
+// ---- and the values cross correctly ----
+
+// `div_t` is eight bytes, which AAPCS64 packs into one register; reading field 1 out of a second
+// register would get the second argument, still sitting there. A struct smaller than two registers
+// is the one that tells.
+@test("a struct returned by value comes back in its fields")
+cin_a_struct_returned_by_value()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        struct div_t
+            quot: i32
+            rem: i32
+        extern div(a: i32, b: i32) -> div_t
+        var d = div(7, 2)
+        print(d.quot, d.rem)
+        """), "3 1\n")
+
+// The same thing read off the declaration, for a named target: "the way C classifies it" is a
+// different answer per convention, and both of these are what clang declares.
+@test("a struct-returning extern is declared the way C classifies it")
+cin_a_struct_returning_extern_is_declared()
+    if !cin_ready() then return
+
+    assert(cin_says(cin_ir_for(Some("aarch64-macos"), raw"""
+        struct div_t
+            quot: i32
+            rem: i32
+        extern div(a: i32, b: i32) -> div_t
+        print(div(7, 2).quot)
+        """), "declare i64 @div(i32, i32)"))
+
+    assert(cin_says(cin_ir_for(Some("aarch64-macos"), raw"""
+        struct ldiv_t
+            quot: i64
+            rem: i64
+        extern ldiv(a: i64, b: i64) -> ldiv_t
+        print(ldiv(7i64, 2i64).quot)
+        """), "declare [2 x i64] @ldiv(i64, i64)"))
+
+@test("a struct the callee fills is read back out")
+cin_a_struct_the_callee_fills()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        struct timespec
+            sec: i64
+            nsec: i64
+        extern clock_gettime(id: i32, t: *timespec) -> int
+        var ts: timespec
+        print(clock_gettime(0, &ts) == 0)
+        """), "true\n")
+
+@test("a struct C hands back a pointer to is read through it")
+cin_a_struct_c_hands_back_a_pointer_to()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        struct tm
+            sec: i32
+            min: i32
+        extern localtime(t: *i64) -> *tm
+        var now: i64 = 0i64
+        print(localtime(&now).sec >= 0)
+        """), "true\n")
+
+// `char **endp`: the pointer C wrote is indexed to show it points where C says it does.
+@test("a 'char **' the callee writes through is followed afterwards")
+cin_a_char_star_star_is_followed()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        extern strtol(s: *u8, endp: **u8, base: int) -> i64
+        var endp: *u8 = null
+        var n = strtol(c"42rest", &endp, 10)
+        print(n, endp[0usize] == 114u8)
+        """), "42 true\n")
+
+@test("a real file descriptor is written to")
+cin_a_real_file_descriptor()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        extern write(fd: int, p: *u8, n: usize) -> isize
+        var msg: [3]u8 = [104u8, 105u8, 10u8]
+        print(write(1, &msg[0], 3usize) == 3isize)
+        """), "hi\ntrue\n")
+
+// The caller-allocated opaque type `regcomp` and half of POSIX are written in. Both layouts are
+// macOS's `<regex.h>`, transcribed by hand and verified there; glibc's `regex_t` is a different size
+// and its `regoff_t` an `int`, so elsewhere these say they were skipped rather than pass.
+@test("a caller-allocated C struct, transcribed field by field")
+cin_a_caller_allocated_c_struct()
+    if !cin_ready() then return
+
+    if host_target().os != MacOS
+        print("skipped: the struct layouts here are macOS's <regex.h>, not glibc's")
+        return
+    end if
+
+    assert_eq(cin_ran(raw"""
+        struct regex_t
+            magic: i32
+            nsub: usize
+            endp: *u8
+            g: *u8
+        struct regmatch_t
+            so: i64
+            eo: i64
+        extern regcomp(preg: *regex_t, pattern: *u8, cflags: int) -> int
+        extern regexec(preg: *regex_t, s: *u8, nmatch: usize, pmatch: *regmatch_t, eflags: int) -> int
+        extern regfree(preg: *regex_t)
+        var re: regex_t
+        print(regcomp(&re, c"a+b", 1) == 0)
+        var m: regmatch_t
+        print(regexec(&re, c"xxaaab", 1usize, &m, 0) == 0)
+        print(m.so, m.eo)
+        regfree(&re)
+        """), "true\ntrue\n2 6\n")
+
+@test("and the same one as nothing but sized, aligned storage")
+cin_the_same_one_as_sized_storage()
+    if !cin_ready() then return
+
+    if host_target().os != MacOS
+        print("skipped: four words is macOS's regex_t; glibc's is larger")
+        return
+    end if
+
+    assert_eq(cin_ran(raw"""
+        struct regex_t
+            words: [4]u64
+        struct regmatch_t
+            so: i64
+            eo: i64
+        extern regcomp(preg: *regex_t, pattern: *u8, cflags: int) -> int
+        extern regexec(preg: *regex_t, s: *u8, nmatch: usize, pmatch: *regmatch_t, eflags: int) -> int
+        extern regfree(preg: *regex_t)
+        var re: regex_t
+        print(regcomp(&re, c"a+b", 1) == 0)
+        var m: regmatch_t
+        print(regexec(&re, c"xxaaab", 1usize, &m, 0) == 0)
+        print(m.so, m.eo)
+        regfree(&re)
+        """), "true\ntrue\n2 6\n")
+
+// ---- what a C library still cannot be given ----
+
+// A bare `f` is the capture-free closure it has always been, so what reaching for an address needs is
+// the `&`, and the message says so rather than reporting a typo.
+@test("a function's address is reached with '&', not with the bare name C allows")
+cin_a_functions_address_is_reached_with_amp()
+    if !cin_ready() then return
+
+    val bare = cin_err(raw"""
+        cmp(a: *u8, b: *u8) -> int = 0
+        print(cmp)
+        """)
+
+    assert(cin_says(bare, "is a function, and a function becomes a value only where a callable is wanted — a bare-arrow parameter, or a '&Fn' where a concrete type is required. Nothing here asks for one; where the address of code is what is wanted, that is written '&cmp'"))
+    assert(!cin_says(bare, "undefined name"))
+
+    assert(cin_says(cin_err(raw"""
+        extern qsort(b: *u8, n: usize, sz: usize, c: *extern(*u8, *u8) -> int)
+        cmp(a: *u8, b: *u8) -> int = 0
+        var xs: [2]i32 = [2, 1]
+        qsort(ptr_cast(&xs[0]), 2usize, 4usize, cmp)
+        print(xs[0])
+        """), "is a function, and what is wanted here is the address of one — write '&cmp'. A bare name is the capture-free closure, which has no address a C interface could call"))
+
+// A `*u8` is an address of bytes and says nothing about a signature, so it is read as a `*extern`
+// first.
+@test("and one C handed back is called after it is read as a function pointer, not before")
+cin_one_c_handed_back_is_called_after_it_is_read()
+    if !cin_ready() then return
+
+    assert(cin_says(cin_err(raw"""
+        extern dlsym(h: *u8, n: *u8) -> *u8
+        var f = dlsym(null, c"abs")
+        print(f(1))
+        """), "'f' is *byte and is not callable — a callable is a closure, or a value of a type that implements the call trait"))
+
+    assert_eq(cin_ran(raw"""
+        extern dlopen(p: *u8, m: i32) -> *u8
+        extern dlsym(h: *u8, n: *u8) -> *u8
+        var f: *extern(i32) -> i32 = ptr_cast(dlsym(dlopen(null, 1i32), c"abs"))
+        print(f(-3))
+        """), "3\n")
+
+// A header's variables are as much of its interface as its calls.
+@test("a global variable, which half of stdio's interface is reached through")
+cin_a_global_variable()
+    if !cin_ready() then return
+
+    assert_eq(cin_spellable([
+        "extern environ: **u8",
+        "extern optind: i32",
+        "extern \"__stdoutp\" stdout: *u8",
+        "extern \"__stderrp\" stderr: *u8",
+        "extern \"__stdinp\" stdin: *u8"]), "")
+
+    assert(cin_says(cin_ir("extern environ: **u8\nprint(environ == null)"), "@environ = external global ptr"))
+
+// `errno` is a macro on both platforms and the symbol behind it differs, so the declaration is gated
+// the way `sysl.fs`'s own is.
+@test("while a global C also exposes as a function is reachable that way too")
+cin_a_global_c_also_exposes_as_a_function()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        #if macos
+        extern "__error" errno_at() -> *i32
+        #else
+        extern "__errno_location" errno_at() -> *i32
+        #endif
+        print(*errno_at() == 0)
+        """), "true\n")
+
+// A callable's sysl type is a trait object, nothing like a C function pointer; the bare arrow is
+// refused for its own reason, and the advice names the boxed callable.
+@test("a bare arrow in an extern is refused, and names a boxed callable that C could not read")
+cin_a_bare_arrow_in_an_extern_is_refused()
+    if !cin_ready() then return
+
+    assert(cin_says(cin_err("extern qsort(b: *u8, n: usize, sz: usize, cmp: (*u8, *u8) -> int)\nprint(1)"),
+        "'(*u8, *u8) -> int' is a callable a function is passed and does not keep, which only a parameter may be — anywhere a concrete type is required, a callable is boxed, so write '&Fn(*u8, *u8) -> int'"))
+
+// The refusal quotes the arrow AS WRITTEN: `u8`, not the `byte` it resolves to, and a one-parameter
+// arrow without parentheses. Quoted from the reference (0.0.153).
+@test("a bare arrow's refusal quotes the types the reader wrote")
+cin_a_bare_arrows_refusal_quotes_the_written_types()
+    if !cin_ready() then return
+
+    assert(cin_says(cin_err("struct S\n    f: u8 -> [2]u8\nprint(1)"),
+        "'u8 -> [2]u8' is a callable a function is passed and does not keep, which only a parameter may be — anywhere a concrete type is required, a callable is boxed, so write '&Fn(u8) -> [2]u8'"))
+
+// `reference/ffi.md § What crosses the boundary` leaves a sysl layout handed to C to its author, so a
+// `*Fn` compiles; `*extern` is the spelling that crosses as the one word C reads.
+@test("while a '*Fn' in an extern still compiles, being a sysl layout the chapter leaves to its author")
+cin_a_star_fn_in_an_extern_still_compiles()
+    if !cin_ready() then return
+
+    assert(cin_says(cin_ir("extern qsort(b: *u8, n: usize, sz: usize, cmp: *Fn(*u8, *u8) -> int)\nprint(1)"), "define"))
+    assert(cin_says(cin_ir("extern qsort(b: *u8, n: usize, sz: usize, cmp: *extern(*u8, *u8) -> int)\nprint(1)"), "define"))
+
+@test("the widest C float is not lowered")
+cin_the_widest_c_float_is_not_lowered()
+    if !cin_ready() then return
+
+    assert(cin_says(cin_err("extern sqrtl(x: f128) -> f128\nprint(1)"), "'f128' is not lowered yet — the widest float is 'f64'"))
+
+// ---- c"…": typing ----
+
+@test("a C string is a raw byte pointer")
+cin_a_c_string_is_a_raw_byte_pointer()
+    if !cin_ready() then return
+
+    assert(cin_says(cin_err("var n: int = c\"hi\""), "cannot initialize 'n': declared int but the value is *byte"))
+
+@test("it is not a string, and a string is not it")
+cin_it_is_not_a_string()
+    if !cin_ready() then return
+
+    assert(cin_says(cin_err("var s: string = c\"hi\""), "cannot initialize 's': declared string but the value is *byte"))
+    assert(cin_says(cin_err("extern f(p: *u8)\nf(\"hi\")"), "'p' of 'f' is *byte, but string was given"))
+
+// The bytes after an interior NUL could never be read by the callee. An ordinary string is
+// unaffected -- carrying a length is what lets it hold one.
+@test("an interior NUL is refused")
+cin_an_interior_nul_is_refused()
+    if !cin_ready() then return
+
+    assert(cin_says(cin_err("var a = c\"a\\0b\""), "a C string ends at its first NUL, so it cannot contain one — the bytes after it could never be read"))
+    assert(cin_says(cin_ir(raw"""
+        var a = "a\0b"
+        print(a.bytes.len)
+        """), "define i32 @main("))
+
+@test("a NUL is still refused when it ends the literal, where it would be silently redundant")
+cin_a_nul_ending_the_literal_is_refused()
+    if !cin_ready() then return
+
+    assert(cin_says(cin_err("var a = c\"hi\\0\""), "a C string ends at its first NUL, so it cannot contain one — the bytes after it could never be read"))
+
+// ---- c"…": codegen ----
+
+@test("the constant carries the terminator, uncounted")
+cin_the_constant_carries_the_terminator()
+    if !cin_ready() then return
+
+    val out = cin_ir("extern f(p: *u8)\nf(c\"hi\")")
+
+    assert(cin_says(out, "[3 x i8] c\"hi\\00\""))
+    assert(cin_says(out, "call void @f(ptr @.str"))
+
+@test("no allocation and no copy — the literal is passed by address")
+cin_no_allocation_and_no_copy()
+    if !cin_ready() then return
+
+    val out = cin_ir("extern f(p: *u8)\nf(c\"hi\")")
+
+    assert(cin_says(out, "define i32 @main("))
+    assert(!cin_says(out, "@malloc"))
+    assert(!cin_says(out, "sysl.str.from_bytes"))
+
+// An ordinary literal is interned NUL-terminated too; the two forms differ only in what is read out
+// of the constant: a three-word view, or the address.
+@test("an ordinary string of the same text is a view over the same shape of constant")
+cin_an_ordinary_string_is_a_view()
+    if !cin_ready() then return
+
+    val out = cin_ir("var s = \"hi\"\nprint(s)")
+
+    assert(cin_says(out, "[3 x i8] c\"hi\\00\""))
+    assert(cin_says(out, "{ ptr, ptr, i64 }"))
+
+// ---- c"…": running ----
+
+@test("a C string reaches a C function as the string it spells")
+cin_a_c_string_reaches_a_c_function()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        printf(c"plain\n")
+        """), "plain\n")
+
+@test("it carries a format a variadic call then fills in")
+cin_it_carries_a_format()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        printf(c"%d and %g\n", 42, 2.5)
+        """), "42 and 2.5\n")
+
+// A sysl string is length-delimited, so `%.*s` is how one crosses to C without a copy.
+@test("a sysl string crosses through a C string format, by length")
+cin_a_sysl_string_crosses_by_length()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        var s = "hello"
+        printf(c"[%.*s]\n", int(s.bytes.len), &s.bytes[0])
+        """), "[hello]\n")
+
+@test("an escape in a C string is the byte it stands for, not two")
+cin_an_escape_is_the_byte_it_stands_for()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        printf(c"a\tb\n")
+        """), "a\tb\n")
+
+@test("the same literal used twice is one constant, and both reads work")
+cin_the_same_literal_used_twice()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        extern printf(fmt: *u8, ...) -> int
+        printf(c"%d\n", 1)
+        printf(c"%d\n", 2)
+        """), "1\n2\n")
+
+// ---- from_cstring: a pointer C hands back, copied out to where a string can own it ----
+
+@test("round-trips a C string literal")
+cin_from_cstring_round_trips()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        import sysl.text.from_cstring
+
+        print(from_cstring(c"hello").unwrap())
+        """), "hello\n")
+
+@test("gives the empty string for a pointer at an immediate NUL")
+cin_from_cstring_gives_the_empty_string()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        import sysl.text.from_cstring
+
+        print(f"[${from_cstring(c"").unwrap()}]")
+        """), "[]\n")
+
+// Bytes do follow the terminator here, so a length taken from the allocation rather than from the
+// scan would show.
+@test("stops at the first NUL and reads nothing after it")
+cin_from_cstring_stops_at_the_first_nul()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        import sysl.text.from_cstring
+
+        var b: [6]u8 = [104u8, 105u8, 0u8, 120u8, 121u8, 0u8]
+        print(f"[${from_cstring(&b[0]).unwrap()}]")
+        """), "[hi]\n")
+
+// A view would print "xi" here.
+@test("copies, so the string outlives what C did next with the buffer")
+cin_from_cstring_copies()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        import sysl.text.from_cstring
+
+        var b: [4]u8 = [104u8, 105u8, 0u8, 0u8]
+        var s = from_cstring(&b[0]).unwrap()
+        b[0] = 120u8
+        print(s)
+        """), "hi\n")
+
+@test("carries multi-byte UTF-8 through as characters, not bytes")
+cin_from_cstring_carries_utf8()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        import sysl.text.from_cstring
+
+        var s = from_cstring(c"héllo").unwrap()
+        var n = 0
+        for c in s.chars do n += 1
+        print(n)
+        """), "5\n")
+
+// Not a literal: `snprintf` writes the bytes and the terminator at run time.
+@test("reads what a real C function wrote")
+cin_from_cstring_reads_what_c_wrote()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        import sysl.text.from_cstring
+
+        extern "snprintf" c_snprintf(b: *u8, n: usize, f: *u8, ...) -> int
+        var buf: [16]u8
+        c_snprintf(&buf[0], 16usize, c"%d-%s", 42, c"ok")
+        print(from_cstring(&buf[0]).unwrap())
+        """), "42-ok\n")
+
+@test("refuses bytes that are not UTF-8, rather than making a string of them")
+cin_from_cstring_refuses_bytes_not_utf8()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        import sysl.text.from_cstring
+
+        var b: [3]u8 = [255u8, 0u8, 0u8]
+        from_cstring(&b[0]) match
+            Ok(s) -> print(f"wrongly accepted ${s}")
+            Err(e) -> print(e.offset, e.truncated)
+        """), "0 false\n")
+
+// `0xC3` opens a two-byte sequence and the NUL ends the input before its continuation.
+@test("and says a sequence merely ran out, where that is what happened")
+cin_from_cstring_says_a_sequence_ran_out()
+    if !cin_ready() then return
+
+    assert_eq(cin_ran(raw"""
+        import sysl.text.from_cstring
+
+        var b: [2]u8 = [195u8, 0u8]
+        from_cstring(&b[0]) match
+            Ok(s) -> print(f"wrongly accepted ${s}")
+            Err(e) -> print(e.offset, e.truncated)
+        """), "0 true\n")
