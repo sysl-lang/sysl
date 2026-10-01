@@ -106,7 +106,12 @@ end parse_doc_args
 //
 // **A tree of programs documents to nothing**, and saying so beats writing an empty index. A file
 // that does not parse stops the whole command: pages from half a tree would pass for the whole.
-read_doc_tree(dir: string, include_private: bool) -> Result[Buf[DocModule], string]
+//
+// **A doc tag naming a parameter the declaration does not have is a warning here, not a refusal.**
+// The page leaves the tag out; `warn` hears the compiler's own doc-check sentence, as
+// `<file>:<line>: warning: …`, and the command still succeeds -- a tree that would not compile
+// still documents, and one stale tag is no reason to publish nothing.
+read_doc_tree(dir: string, include_private: bool, warn: string -> unit) -> Result[Buf[DocModule], string]
     val found = collect(dir, None) match
         Ok(fs) -> fs
         Err(sel) ->
@@ -126,6 +131,18 @@ read_doc_tree(dir: string, include_private: bool) -> Result[Buf[DocModule], stri
 
         units.push(parsed.program)
 
+    for i in 0..<units.len()
+        val unit = units.at(i)
+
+        // A test file and a program are not documented, so what their tags say is not this
+        // command's business.
+        if unit.test_only || unit.module_name.is_none() then continue
+
+        val found = doc_problems(unit)
+
+        for j in 0..<found.len()
+            warn(s"${unit.src.name}:${found.at(j).tag.line}: warning: ${found.at(j).message}")
+
     val modules = build_doc_modules(units, include_private)
 
     if modules.is_empty()
@@ -143,7 +160,7 @@ doc_command(args: []string, say: string -> unit) -> int
             say(message)
             return if message == doc_usage() then Fine else Failed
 
-    val modules = read_doc_tree(opts.dir, opts.include_private) match
+    val modules = read_doc_tree(opts.dir, opts.include_private, say) match
         Ok(ms) -> ms
         Err(message) ->
             say(message)
