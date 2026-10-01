@@ -587,22 +587,23 @@ registered_tuple(a: &Analysis, ts: Buf[Type]) -> &StructType
     made
 end registered_tuple
 
-// `int -> unit`, `(int, int) -> int` -- a callable as the arrow spelling writes it, for a message
-// about the spelling. The result is last, as it is everywhere a call trait's arguments are held.
-private bare_arrow_show(args: Buf[Type]) -> string
-    val ret = type_show(args.at(args.len() - 1))
+// The parameter list of a callable AS IT WAS WRITTEN -- `*u8, *u8`, not the `*byte, *byte` the
+// resolved types would show -- for a message about the spelling, which quotes the reader's words.
+private written_params(params: Buf[TypeRef]) -> string
+    var out = ""
 
-    if args.len() == 2 then return s"${type_show(args.at(0))} -> $ret"
-
-    var out = "("
-
-    for i in 0..<args.len() - 1
+    for i in 0..<params.len()
         if i > 0 then out = out + ", "
 
-        out = out + type_show(args.at(i))
+        out = out + type_text(params.at(i))
 
-    s"$out) -> $ret"
-end bare_arrow_show
+    out
+end written_params
+
+// `int -> unit`, `(int, int) -> int` -- a bare arrow as the arrow spelling writes it.
+private bare_arrow_show(params: Buf[TypeRef], ret: TypeRef) -> string =
+    if params.len() == 1 then s"${type_text(params.at(0))} -> ${type_text(ret)}"
+    else s"(${written_params(params)}) -> ${type_text(ret)}"
 
 // What stands behind a mode -- `&`, `*` or `weak` -- which is the one place a callable is a type: the
 // trait object of the call trait, whichever of the two spellings wrote it.
@@ -650,11 +651,12 @@ private resolve_fn_trait(a: &Analysis, scope: Scope, span: Span, params: Buf[Typ
 
     // **A bare arrow is a parameter's form and nothing else**, and by the time a type is resolved
     // every parameter that wrote one has been rewritten into the bound it is sugar for — so an arrow
-    // arriving here stands somewhere a concrete type is required, where a callable is a box.
+    // arriving here stands somewhere a concrete type is required, where a callable is a box. Both
+    // halves of the message quote the types as WRITTEN, as the reference's does.
     if bare
-        val boxed = s"&${type_show(Trait(fn_base(params.len()), args, buf()))}"
+        val boxed = s"&Fn(${written_params(params)}) -> ${type_text(ret)}"
 
-        a.fault(scope, span, s"'${bare_arrow_show(args)}' is a callable a function is passed and " +
+        a.fault(scope, span, s"'${bare_arrow_show(params, ret)}' is a callable a function is passed and " +
                 "does not keep, which only a parameter may be — anywhere a concrete type is " +
                 s"required, a callable is boxed, so write '$boxed'")
         return Unknown
