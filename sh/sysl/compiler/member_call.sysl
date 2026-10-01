@@ -159,10 +159,15 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
     end if
 
     val decl = m.unwrap()
+    val receiving = receiving_member(cx, span, found.0, name, decl)
 
-    if decl.recv_mode().is_some() then
-        return Some(cx.err(span, s"'$name' is a method of '${qualified_name(found.0)}' — call it on a " +
-                           s"value of ${type_show(ty)}, not on the type itself"))
+    if receiving.is_some() then return receiving
+
+    // **A subject whose own arguments miss its bounds was refused where they were written** -- at the
+    // annotation, or where the call's arguments settled them -- so the member is not made real at
+    // them: its signature would be read at those arguments and refused a second time, at a place
+    // nobody wrote.
+    if !subject_bounds_met(cx, span, ty) then return Some(bad_expr(span))
 
     // One declaring type parameters of its own is instantiated from the call, as a method is: the
     // subject settled the type's arguments and the arguments settle the member's.
@@ -185,6 +190,8 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
 
     check_member_visible(cx, span, found.0, picked, decl, via)
 
+    // The arity names what kind of thing was called, and an argument's refusal names the callee
+    // alone -- `'x' of 'Box.of' is int`, as a free function's does.
     val shown = s"associated function '${qualified_name(found.0)}.$picked'"
     val slots = bind_member_args(cx, span, shown, decl, args)
 
@@ -208,7 +215,8 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
                 inner.here_src = caller_source(cx)
                 ts.push(type_expr(inner, decl.params.at(i).default.unwrap(), Some(want)))
 
-    val refused = refused_argument(cx, span, shown, decl.params, slots.unwrap(), ts, wants, before)
+    val refused = refused_argument(cx, span, s"'${qualified_name(found.0)}.$picked'", decl.params,
+                                   slots.unwrap(), ts, wants, before)
 
     if refused.is_some() then return refused
 
@@ -275,7 +283,27 @@ private generic_subject(cx: &Analyzer, span: Span, receiver: Expr, name: string,
 
     if key.is_none() then return None
     if concrete_instance(cx.an, key.unwrap()).is_some() then return None
-    if member_at(cx.an, key.unwrap(), name).is_none() then return None
+
+    val m = member_at(cx.an, key.unwrap(), name)
+
+    // **A name the type does not declare is the type's mistake, not the name's** -- `Box` is right
+    // and `of` is what is missing. An enum's is told by `generic_enum_stranger`, which names its
+    // variants too.
+    if m.is_none()
+        val declared = cx.an.tables.types.get(key.unwrap())
+
+        if declared.is_none() then return None
+
+        declared.unwrap().kind match
+            StructOf(_) ->
+                cx.fault(span, s"type '${qualified_name(key.unwrap())}' has no associated function '$name'")
+                return Some(Unknown)
+            _ -> return None
+    end if
+
+    // A member with a receiver is told so before anything is inferred: there is no instantiation to
+    // settle for a call that cannot be made through the type at all.
+    if receiving_member(cx, span, key.unwrap(), name, m.unwrap()).is_some() then return Some(Unknown)
 
     expected match
         Some(want) ->
@@ -311,6 +339,59 @@ private generic_subject(cx: &Analyzer, span: Span, receiver: Expr, name: string,
 
     Some(Unknown)
 end generic_subject
+
+// The refusal for a member reached through its type that needs a value to be reached through -- a
+// property or a method -- and nothing for an associated function or a static property.
+private receiving_member(cx: &Analyzer, span: Span, key: string, name: string,
+                         decl: MethodDecl) -> Option[TExpr]
+    if decl.is_property && !decl.is_static then
+        return Some(cx.err(span, s"'$name' is a property of '${qualified_name(key)}' — read it on a " +
+                           s"value, as 'value.$name'"))
+
+    if decl.recv_mode().is_some() then
+        return Some(cx.err(span, s"'$name' is an instance method of '${qualified_name(key)}' — call " +
+                           "it on a value, not the type"))
+
+    None
+end receiving_member
+
+// Whether a subject's own type arguments meet what its declaration asks of them, asked without a
+// word: where they do not, the refusal was made where the arguments were written or settled.
+//
+// A parameter standing in for itself is answered by its own bounds where it was written, so an
+// argument list holding one is not asked again here.
+private subject_bounds_met(cx: &Analyzer, span: Span, ty: Type) -> bool
+    val applied = repr(ty) match
+        Struct(d) -> Some((d.base, d.targs))
+        Enum(d) -> Some((d.base, d.targs))
+        _ -> None
+
+    if applied.is_none() || applied.unwrap().1.is_empty() then return true
+
+    val targs = applied.unwrap().1
+
+    for i in 0..<targs.len()
+        if targs.at(i) == Unknown || mentions_abstract(targs.at(i)) then return true
+
+    val declared = cx.an.tables.types.get(applied.unwrap().0)
+
+    if declared.is_none() then return true
+
+    val shape = declared.unwrap().kind match
+        StructOf(d) -> Some((d.tparams, d.bounds))
+        EnumOf(d) -> Some((d.tparams, d.bounds))
+        _ -> None
+
+    if shape.is_none() || shape.unwrap().1.is_empty() then return true
+
+    val mark = cx.an.complaints()
+    val met = check_param_bounds(cx.an, declared.unwrap().scope, span, applied.unwrap().0,
+                                 shape.unwrap().0, shape.unwrap().1, targs, buf(), "type parameter",
+                                 cx.scope)
+
+    cx.an.restore_complaints(mark)
+    met
+end subject_bounds_met
 
 // The instantiation the **arguments** settle, where the expected type did not.
 //
@@ -349,10 +430,14 @@ private solved_subject(cx: &Analyzer, span: Span, key: string, name: string, arg
 
     // A member of its own is a second list of parameters to solve, and nothing here is solving it:
     // what is wanted is the *type's* arguments, and the member's are settled where the call is read.
+    //
+    // **`Self` is the type applied to its own parameters**, so `joined(x: Self, y: Self)` settles `T`
+    // from a `Box[int]` argument exactly as `joined(x: Box[T], …)` would.
+    val written_name = module_bare(key)
     var param_refs: Buf[TypeRef] = buf()
 
     for i in 0..<member.params.len()
-        param_refs.push(member.params.at(i).typ)
+        param_refs.push(self_spelled(member.params.at(i).typ, written_name, tparams))
 
     var arg_tys: Buf[Type] = buf()
     var soft: Buf[bool] = buf()
@@ -367,7 +452,10 @@ private solved_subject(cx: &Analyzer, span: Span, key: string, name: string, arg
         val read = sandboxed_reading(cx, args.at(i))
 
         arg_tys.push(texpr_type(read.0))
-        soft.push(read.1)
+        // **A bare literal is consulted last too**, having no type of its own: `Pair.of(1, "two")`
+        // is a `Pair[string]` call whose `1` is then the argument that disagrees, as a generic free
+        // function's call reads it.
+        soft.push(read.1 || adaptable(args.at(i), read.0))
 
     // **The call is what the refusal names, not the type** -- `M.one`, since a reader told the
     // argument of `M` could not be inferred has nowhere to write one, `M` not being what they wrote.
@@ -381,6 +469,24 @@ private solved_subject(cx: &Analyzer, span: Span, key: string, name: string, arg
 
     Some(instantiate(cx.an, cx.scope, span, module_show(key), key, targs))
 end solved_subject
+
+// A written type with a bare `Self` spelled out as the type applied to its own parameters --
+// `Box[T]` -- which is the one reading a receiverless member's signature gives it.
+private self_spelled(t: TypeRef, written: string, tparams: Buf[string]) -> TypeRef
+    *t.kind match
+        NamedType(n, args) ->
+            if n == "Self" && args.is_empty()
+                var own: Buf[TypeRef] = buf()
+
+                for i in 0..<tparams.len()
+                    own.push(TypeRef(t.span, NamedType(tparams.at(i), buf())))
+
+                return TypeRef(t.span, NamedType(written, own))
+            end if
+        _ -> ()
+
+    t
+end self_spelled
 
 // Whether a type is an instantiation of the declaration a key names.
 private instantiation_of(t: Type, key: string) -> bool = repr(t) match
