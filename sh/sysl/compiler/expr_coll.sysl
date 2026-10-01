@@ -23,8 +23,16 @@ array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type
     val elem_exp = expected.and_then(t -> element_wanted(t))
     var ts: Buf[TExpr] = buf()
 
-    for i in 0..<elems.len()
-        ts.push(type_expr(cx, elems.at(i), elem_exp))
+    // With nothing asked of it, the literal's elements are operands that must share one type, and
+    // they settle it the way the two sides of an operator do: a bare literal takes the type of an
+    // element that has one, wherever that element stands. So `[1usize, 2, 7]` and `[1, 2usize, 7]`
+    // are both `[3]usize` -- and `[1u8, 300]` is refused at the `300` for not fitting, rather than
+    // for being an `int` nobody wrote. Where the position asks for an element type, every element
+    // is read at that type and nothing here decides it.
+    if elem_exp.is_none() then ts = analyze_operands(cx, elems, None)
+    else
+        for i in 0..<elems.len()
+            ts.push(type_expr(cx, elems.at(i), elem_exp))
 
     // An element whose type could not be worked out was refused where it was written, so the
     // literal is a consequence of that mistake rather than a second one: `[y, 1]` over a refused `y`.
