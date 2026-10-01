@@ -134,8 +134,14 @@ span_zero() -> Span = Span(0, 0)
 // **Deliberately lenient**: a structural mismatch simply leaves the parameter unbound, and the
 // argument is type-checked properly against the instantiated signature afterwards, where the message
 // can name both types.
+//
+// **The actual type is matched nameless**, so what a parameter binds is never a second name for a
+// type: `Size` measured as `size_t` binds a `T` to the `u64` it is.
 unify(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, tparams: Buf[string],
-      sub: *Buf[Binding])
+      sub: *Buf[Binding]) = unify_nameless(a, scope, want, nameless(actual), tparams, sub)
+
+private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, tparams: Buf[string],
+                       sub: *Buf[Binding])
     *want.kind match
         PtrType(inner) -> actual match
             Ptr(t) -> unify(a, scope, inner, *t, tparams, sub)
@@ -281,7 +287,7 @@ unify(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, tparams: Buf[stri
                 // The reference is the declaration's, written in the declaration's terms, so the
                 // name it uses is matched against the resolved type by the key it names here.
                 unify_named(a, scope, n, arg_refs, actual, tparams, sub)
-end unify
+end unify_nameless
 
 private unify_named(a: &Analysis, scope: Scope, n: string, arg_refs: Buf[TypeRef], actual: Type,
                     tparams: Buf[string], sub: *Buf[Binding])
@@ -437,7 +443,11 @@ end mentions_unknown_any
 // `const_self` is the slice shape's second instantiation: the same block, made real at the read-only
 // view because that is what the receiver was. It is a different name because it is a different
 // **body** -- the machine code is identical and only one of the two had its writes checked.
-instantiate_func(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type], const_self: bool) -> string
+instantiate_func(a: &Analysis, home: Scope, f: FuncDecl, solved: Buf[Type], const_self: bool) -> string
+    // Nameless for `instantiate_struct`'s reason: an instantiation at a `c type` is the
+    // instantiation at what it names, one body with one signature -- the mangled name already says
+    // so, and the signature filed under it has to agree.
+    val targs = nameless_all(solved)
     val plain = if const_self then slice_const_owner(f.name) else f.name
 
     // **An instantiation is filed under the declaration's own key, module and all.** A generic
