@@ -63,7 +63,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     val bound = promise.0
     val written = promise.1
 
-    home.outer = trait_outer(tr, bound)
+    home.outer = trait_outer(tr, bound, block)
 
     // What this block's own promise is read against: the type where it has one, and the type applied
     // to the block's own parameters where it is generic -- the subject every comparison below has to
@@ -429,14 +429,33 @@ private written_subject(block: ImplDecl) -> string = type_text(block.for_type)
 
 // What a trait's own parameters mean inside this block's members: the arguments the block fixed them
 // to.
-private trait_outer(tr: TraitDecl, bound: Bound) -> Buf[Binding]
+//
+// **A trait's value parameter fixed to one of the block's own** -- `impl[const M: usize] Bytes[M]
+// for Bits[M]` -- is bound to that parameter, left open, rather than to the number the block's
+// generic reading stands `M` at: each instantiation fixes `M`, and the trait's `N` has to read what
+// it fixed (`refixed_outer`).
+private trait_outer(tr: TraitDecl, bound: Bound, block: ImplDecl) -> Buf[Binding]
     var out: Buf[Binding] = buf()
 
     for i in 0..<tr.tparams.len()
-        if i < bound.args.len() then out.push(Binding(tr.tparams.at(i), bound.args.at(i)))
+        if i >= bound.args.len() then continue
+
+        val tp = tr.tparams.at(i)
+        var own: Option[string] = None
+
+        if has_binding(tr.tvalues, tp) && i < block.trait_args.len() then
+            own = block_value_named(block, block.trait_args.at(i))
+
+        out.push(Binding(tp, if own.is_some() then Abstract(own.unwrap(), buf()) else bound.args.at(i)))
 
     out
 end trait_outer
+
+// The block's own value parameter an argument is written as, where it is written as one bare.
+private block_value_named(block: ImplDecl, arg: TypeRef) -> Option[string] =
+    *arg.kind match
+        NamedType(n, targs) -> if targs.is_empty() && has_binding(block.tvalues, n) then Some(n) else None
+        _ -> None
 
 // The block's own parameters standing in for themselves, in the subject's argument order -- what a
 // comparison against an already-filed block is read under.

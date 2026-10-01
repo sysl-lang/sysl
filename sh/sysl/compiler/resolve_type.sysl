@@ -863,19 +863,6 @@ private read_type_args_at(a: &Analysis, scope: Scope, span: Span, name: string,
     read_args_for(a, scope, span, key.unwrap(), args, subst)
 end read_type_args_at
 
-// An argument that is a bare name an enclosing generic declaration stands in for, as its stand-in.
-private open_value_param(arg: TypeRef, subst: Buf[Binding]) -> Option[Type] =
-    *arg.kind match
-        NamedType(n, targs) -> if targs.is_empty() then abstract_bound(subst, n) else None
-        _ -> None
-
-private abstract_bound(subst: Buf[Binding], name: string) -> Option[Type] =
-    bound_type(subst, name) match
-        Some(t) -> t match
-            Abstract(_, _) -> Some(t)
-            _ -> None
-        None -> None
-
 // A **trait's** arguments as written at a bound or an `impl`, each value argument read at the type
 // the trait wrote for its `const` parameter. An argument refused stands as `Unknown`, so the list
 // keeps the length the arity check is asked about.
@@ -883,7 +870,7 @@ trait_args_read(a: &Analysis, scope: Scope, span: Span, key: string, args: Buf[T
                 subst: Buf[Binding]) -> Buf[Type]
     a.type_arg_depth += 1
 
-    val read = read_args_for(a, scope, span, key, args, subst, true)
+    val read = read_args_for(a, scope, span, key, args, subst)
 
     a.type_arg_depth -= 1
 
@@ -906,13 +893,8 @@ trait_args_read(a: &Analysis, scope: Scope, span: Span, key: string, args: Buf[T
 end trait_args_read
 
 // The arguments of the declaration at `key`, a value argument read where it wrote `const`.
-//
-// `keep_open` is a trait's: a generic block's own value parameter written as the argument --
-// `impl[const M: usize] Bytes[M] for Bits[M]` -- stays the parameter, as a type parameter does, so
-// the members the trait supplies read the number each instantiation fixes rather than the zero a
-// generic body's walk stands it at.
 private read_args_for(a: &Analysis, scope: Scope, span: Span, key: string, args: Buf[TypeRef],
-                      subst: Buf[Binding], keep_open: bool = false) -> Option[Buf[Type]]
+                      subst: Buf[Binding]) -> Option[Buf[Type]]
     val pair = declared_values(a, key)
 
     if pair.0.is_empty() then return Some(resolve_list(a, scope, args, subst))
@@ -924,11 +906,7 @@ private read_args_for(a: &Analysis, scope: Scope, span: Span, key: string, args:
         val arg = args.at(i)
         val written = if i < pair.0.len() then binding_named(pair.1, pair.0.at(i)) else None
 
-        val open = if keep_open && written.is_some() then open_value_param(arg, subst) else None
-
-        if open.is_some()
-            out.push(open.unwrap())
-        elif written.is_some()
+        if written.is_some()
             val ty = resolve_type(a, home, written.unwrap(), no_bindings())
             val v = value_arg(a, scope, span, arg, ty, subst)
 
