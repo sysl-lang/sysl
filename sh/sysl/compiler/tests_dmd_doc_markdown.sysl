@@ -780,3 +780,65 @@ dmd_private_member_under_private()
     dmd_has(shown, "| `hidden` |")
     dmd_lacks(dmd_page(src), "hidden")
 end dmd_private_member_under_private
+
+// -- the reference's "what a page used to get wrong" cases (DocGeneratorTests, 0.0.153) --------------
+
+private dmd_member_sigs(syms: Buf[DocSymbol]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<syms.len()
+        out.push(syms.at(i).signature)
+
+    out
+
+@test("the three kinds get groups of their own, in the page's order")
+dmd_three_kinds_in_page_order()
+    val text = dmd_page("module m\n\ntype Meters = real\n\nextern \"abs\" c_abs(n: int) -> int\n\n" +
+                        "extern errno: int\n\nval zero: int = 0\n\nconst one: int = 1\n\nf() -> int = 1\n\nstruct S\n    x: int")
+    val heads = ["## Index", "## Constants", "## Values", "## Functions", "## Externs", "## Types", "## Aliases"]
+
+    for i in 1..<heads.len
+        assert(dmd_at(text, s"\n${heads[i - 1]}\n") < dmd_at(text, s"\n${heads[i]}\n"))
+
+    assert(dmd_at(text, "## Externs") < dmd_at(text, "### `c_abs`"))
+    assert(dmd_at(text, "### `c_abs`") < dmd_at(text, "### `errno`"))
+    assert(dmd_at(text, "### `errno`") < dmd_at(text, "## Types"))
+end dmd_three_kinds_in_page_order
+
+@test("a doc comment above an alias is the alias's, not the module's headline")
+dmd_an_alias_keeps_its_comment()
+    val m = dmd_only("module m\n\n/** An alias. */\ntype Meters = real")
+    val headline = m.doc match
+        Some(d) -> d.summary
+        None -> ""
+
+    assert_eq(headline, "")
+    assert_eq(m.symbols.at(0).doc.unwrap().summary, "An alias.")
+
+@test("--private shows a type's private methods, marked, and the default leaves them out")
+dmd_private_methods_marked()
+    val src = "module m\n\nstruct S\n    x: int\n\n    private hidden(self) -> int = self.x\n\n" +
+              "    shown(self) -> int = self.x"
+    val all = dmd_modules(["t.sysl", src], true).at(0)
+
+    assert_eq(dmd_member_sigs(dmd_only(src).symbols.at(0).members), dmd_strs(["shown(self) -> int"]))
+    assert_eq(dmd_member_sigs(all.symbols.at(0).members), dmd_strs(["private hidden(self) -> int", "shown(self) -> int"]))
+    dmd_has(doc_module_page(all, None).text, "| `hidden` | `private hidden(self) -> int` |")
+end dmd_private_methods_marked
+
+@test("--private marks a private top-level declaration, so it is not mistaken for API")
+dmd_private_top_level_marked()
+    val m = dmd_modules(["t.sysl", "module m\n\nprivate helper(n: int) -> int = n"], true).at(0)
+
+    assert_eq(m.symbols.at(0).signature, "private helper(n: int) -> int")
+
+@test("a @param naming a method's receiver is kept, as the compiler admits it")
+dmd_a_receiver_param_is_kept()
+    val src = "module m\n\nstruct S\n    x: int\n\n    /** Gets.\n     * @param self it\n     */\n" +
+              "    get(self) -> int = self.x"
+    val params = dmd_only(src).symbols.at(0).members.at(0).doc.unwrap().params
+
+    dmd_has(dmd_page(src), "| `get` |")
+    assert_eq(params.len(), 1)
+    assert_eq(params.at(0).subject.unwrap_or("<none>"), "self")
+end dmd_a_receiver_param_is_kept
