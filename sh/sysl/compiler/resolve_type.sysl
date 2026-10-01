@@ -1479,6 +1479,8 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
 
         made.fields.push((f.name, resolve_qualified(a, home, f.typ, subst)))
 
+    check_bitfields(a, scope, span, made)
+
     a.resolving.truncate(a.resolving.len() - 1)
     a.tables.in_progress.remove(inst)
     a.tables.struct_insts.put(inst, ty)
@@ -1637,6 +1639,38 @@ end refuse_repeated_tags
 
 // The boundary a struct asked to begin on, where it asked for one. A boundary is a power of two,
 // since an address is aligned by having low bits clear, and it has to be settled while compiling.
+// **A `@packed` struct with a field narrower than a byte IS one integer**, its fields ranges of it,
+// so every field has to be an integer too -- a pointer, a float or a `bool` (an `i1` whose storage
+// is a byte) has no bit range to occupy. Nesting is the answer and costs nothing: an outer `@packed`
+// struct lays a bitfield struct out as an ordinary field of its size. A struct one of whose fields
+// did not resolve has been complained about already, and is left alone.
+private check_bitfields(a: &Analysis, scope: Scope, span: Span, s: &StructType)
+    if !s.packed then return
+
+    val stored = s.stored()
+    var narrow = false
+
+    for i in 0..<stored.len()
+        if underlying(stored.at(i).1) == Unknown then return
+
+        bitfield_width(stored.at(i).1) match
+            Some(w) -> if w % 8 != 0 then narrow = true
+            None -> ()
+
+    if !narrow then return
+
+    val name = type_show(Struct(s))
+
+    for i in 0..<stored.len()
+        if bitfield_width(stored.at(i).1).is_none()
+            val shown = type_show(stored.at(i).1)
+
+            a.fault(scope, span, s"'$name.${stored.at(i).0}' is $shown, and '$name' is '@packed' with a " +
+                    "field narrower than a byte — so it is one integer, and every field of it has to be " +
+                    "one too. Put the narrow fields in a '@packed' struct of their own and hold that " +
+                    s"here: it lays out identically and leaves $shown what it is")
+end check_bitfields
+
 private aligned_to(a: &Analysis, scope: Scope, span: Span, written: string,
                    asked: Option[Expr]) -> Option[usize]
     if asked.is_none() then return None

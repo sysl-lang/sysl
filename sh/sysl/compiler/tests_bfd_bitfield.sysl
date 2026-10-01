@@ -1,0 +1,620 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A bitfield struct (`reference/types.md § Structs`): inside `@packed`, an `iN` field occupies exactly
+// N bits, the struct IS one unsigned integer, and its fields are ranges of it filled from the least
+// significant bit upward in declaration order. Three halves, as the reference's `BitfieldRunTests`,
+// `BitfieldIrTests` and `BitfieldErrorTests` are: what a program prints, the shape of the IR it
+// lowers to, and what may not be held or asked of one.
+//
+// **Every expected string here was read out of the reference compiler** on the same program, and
+// every IR program below emits byte-identical text from both compilers.
+
+private var bfd_library_cache: Buf[Program] = buf()
+private var bfd_library_read: bool = false
+
+private bfd_library() -> Buf[Program]
+    if bfd_library_read then return bfd_library_cache
+
+    bfd_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> bfd_library_cache = units
+
+    bfd_library_cache
+end bfd_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private bfd_ready() -> bool
+    if bfd_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end bfd_ready
+
+private bfd_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// The struct most of these are about: three fields, one byte.
+private bfd_ctrl() -> string = "@packed\nstruct Ctrl\n    enable: u1\n    mode: u3\n    prescale: u4\n"
+
+// A twenty-four-bit container, where a sixteen-bit field straddles two byte boundaries.
+private bfd_odd() -> string = "@packed\nstruct Odd\n    a: u3\n    b: u16\n    c: u5\nval o = Odd(1, 2, 3)\n"
+
+// A register whose every field is qualified, at an address nothing dereferences while compiling.
+private bfd_reg() -> string =
+    "@packed\nstruct Reg\n    enable: volatile u1\n    mode: volatile u3\n    prescale: volatile u4\n" +
+    "static val p: *Reg = ptr_cast(usize(4096))\n"
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private bfd_ran(text: string) -> string
+    val root = make_temp_dir("sysl-bitfield").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end bfd_ran
+
+// Everything a source has to say for itself, taken the whole way the reference's `err` takes it.
+private bfd_err(text: string) -> string
+    val root = make_temp_dir("sysl-bitfield").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end bfd_err
+
+// The LLVM text of a program that must compile.
+private bfd_ir(text: string) -> string
+    val root = make_temp_dir("sysl-bitfield").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end bfd_ir
+
+// The function named, from its `define` line up to the brace that closes it -- the reference's
+// `defineOf`.
+private bfd_define(out: string, name: string) -> string
+    val lines = lines_of(out)
+    var said = str_builder()
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !inside && line.starts_with("define") && line.index_of(s"@$name(").is_some()
+            inside = true
+
+        if inside
+            if line == "}" then return said.finish()
+
+            said.push(line)
+            said.push("\n")
+
+    said.finish()
+end bfd_define
+
+// How many lines of `text` hold `part`.
+private bfd_count(text: string, part: string) -> usize
+    val lines = lines_of(text)
+    var n: usize = 0
+
+    for i in 0..<lines.len()
+        if lines.at(i).index_of(part).is_some() then n += 1
+
+    n
+end bfd_count
+
+// -- a field occupies exactly its declared width ------------------------------------------------------
+
+@test("three fields totalling eight bits are one byte")
+bfd_three_fields_are_one_byte()
+    if !bfd_ready() then return
+
+    assert_eq(bfd_ran(bfd_ctrl() + "print(sizeof(Ctrl), alignof(Ctrl))"), "1 1\n")
+
+@test("two twelve-bit fields are three bytes rather than four")
+bfd_two_twelve_bit_fields_are_three_bytes()
+    if !bfd_ready() then return
+
+    assert_eq(bfd_ran("@packed\nstruct Pair\n    a: u12\n    b: u12\nprint(sizeof(Pair))"), "3\n")
+
+@test("a total that is not a whole number of bytes rounds up")
+bfd_a_partial_byte_rounds_up()
+    if !bfd_ready() then return
+
+    assert_eq(bfd_ran("@packed\nstruct Odd\n    a: u3\n    b: u4\n    c: u5\nprint(sizeof(Odd))"), "2\n")
+
+@test("an array of them has no gap between elements")
+bfd_an_array_of_them_has_no_gap()
+    if !bfd_ready() then return
+
+    assert_eq(bfd_ran(bfd_ctrl() + "print(sizeof([4]Ctrl))"), "4\n")
+
+// The trigger is a field that is NOT a whole number of bytes; a struct of `u8` and `u32` already
+// occupies exactly those bits under the byte layout.
+@test("it lays out exactly as it did before")
+bfd_a_whole_byte_packed_struct_is_untouched()
+    if !bfd_ready() then return
+
+    val src = "@packed\nstruct Head\n    tag: u8\n    len: u32\nprint(sizeof(Head), alignof(Head))"
+
+    assert_eq(bfd_ran(src), "5 1\n")
+
+// -- the fields carry their own values ----------------------------------------------------------------
+
+@test("each reads back what construction put in it")
+bfd_each_field_reads_back()
+    if !bfd_ready() then return
+
+    assert_eq(bfd_ran(bfd_ctrl() + "val c = Ctrl(1, 5, 9)\nprint(c.enable, c.mode, c.prescale)"), "1 5 9\n")
+
+@test("a write to one leaves its neighbours alone")
+bfd_a_write_leaves_neighbours_alone()
+    if !bfd_ready() then return
+
+    val src = bfd_ctrl() + "var c = Ctrl(1, 5, 9)\nc.mode = 2\nprint(c.enable, c.mode, c.prescale)"
+
+    assert_eq(bfd_ran(src), "1 2 9\n")
+
+@test("a compound assignment reads and writes the same range")
+bfd_a_compound_assignment_keeps_its_range()
+    if !bfd_ready() then return
+
+    val src = bfd_ctrl() + "var c = Ctrl(1, 5, 9)\nc.mode += 2\nprint(c.enable, c.mode, c.prescale)"
+
+    assert_eq(bfd_ran(src), "1 7 9\n")
+
+@test("two fields of one struct may be written by one statement")
+bfd_two_fields_written_by_one_statement()
+    if !bfd_ready() then return
+
+    val src = bfd_ctrl() + "var c = Ctrl(1, 5, 9)\nc.enable, c.prescale = 0, 3\n" +
+        "print(c.enable, c.mode, c.prescale)"
+
+    assert_eq(bfd_ran(src), "0 5 3\n")
+
+@test("a signed field keeps its sign")
+bfd_a_signed_field_keeps_its_sign()
+    if !bfd_ready() then return
+
+    assert_eq(bfd_ran("@packed\nstruct S\n    a: u4\n    b: i5\nval s = S(3, -7)\nprint(s.a, s.b)"), "3 -7\n")
+
+@test("a field wider than a byte is still a bit range")
+bfd_a_wide_field_is_still_a_range()
+    if !bfd_ready() then return
+
+    val src = "@packed\nstruct W\n    tag: u3\n    len: u16\nval w = W(5, 40000)\nprint(w.tag, w.len)"
+
+    assert_eq(bfd_ran(src), "5 40000\n")
+
+// -- the bits fill from the least significant upward, in declaration order ----------------------------
+
+// 1 | (5 << 1) | (9 << 4): the first field declared is the low bits, read back through a `*u8` so the
+// claim is about where the bits sit rather than the struct agreeing with itself.
+@test("the byte holds the first field in its low bits")
+bfd_the_first_field_is_the_low_bits()
+    if !bfd_ready() then return
+
+    val src = bfd_ctrl() + "var arena: [4]u8 = [0u8; 4]\nvar c: *Ctrl = ptr_cast(&arena[0])\n" +
+        "c.enable = 1\nc.mode = 5\nc.prescale = 9\nprint(arena[0])"
+
+    assert_eq(bfd_ran(src), "155\n")
+
+// 7 | (0xABCD << 3) | (0x15 << 19) = 0xAD5E6F, little-endian.
+@test("and a field straddles a byte boundary rather than moving off it")
+bfd_a_field_straddles_a_byte_boundary()
+    if !bfd_ready() then return
+
+    val src = "@packed\nstruct Straddle\n    a: u3\n    b: u16\n    c: u5\n" +
+        "var arena: [4]u8 = [0u8; 4]\nvar s: *Straddle = ptr_cast(&arena[0])\n" +
+        "s.a = 7\ns.b = 43981\ns.c = 21\nprint(sizeof(Straddle), arena[0], arena[1], arena[2], arena[3])"
+
+    assert_eq(bfd_ran(src), "3 111 94 173 0\n")
+
+@test("a write through a pointer reads back through the struct")
+bfd_a_write_through_a_pointer_reads_back()
+    if !bfd_ready() then return
+
+    val src = bfd_ctrl() + "var arena: [4]u8 = [0u8; 4]\nvar c: *Ctrl = ptr_cast(&arena[0])\n" +
+        "arena[0] = 155u8\nprint(c.enable, c.mode, c.prescale)"
+
+    assert_eq(bfd_ran(src), "1 5 9\n")
+
+@test("a simple enum is an integer and may be a bitfield")
+bfd_a_simple_enum_may_be_a_bitfield()
+    if !bfd_ready() then return
+
+    val src = "enum Mode: u3\n    Off\n    Slow\n    Fast\n" +
+        "@packed\nstruct Reg\n    enable: u1\n    mode: Mode\n    rest: u4\n" +
+        "val r = Reg(1, Mode.Fast, 6)\nprint(sizeof(Reg), r.mode == Mode.Fast, r.rest)"
+
+    assert_eq(bfd_ran(src), "1 true 6\n")
+
+// A volatile bitfield's write is a read-modify-write of the whole container, and it puts the
+// neighbouring ranges back exactly as it found them.
+@test("a volatile bitfield keeps its neighbours through the read-modify-write")
+bfd_a_volatile_bitfield_keeps_its_neighbours()
+    if !bfd_ready() then return
+
+    val src = "@packed\nstruct Reg\n    enable: volatile u1\n    mode: volatile u3\n    prescale: volatile u4\n" +
+        "var arena: [4]u8 = [0u8; 4]\nvar r: *Reg = ptr_cast(&arena[0])\n" +
+        "r.enable = 1\nr.prescale = 9\nr.mode = 5\nprint(arena[0], r.enable, r.mode, r.prescale)"
+
+    assert_eq(bfd_ran(src), "155 1 5 9\n")
+
+// -- a bitfield struct nests inside an ordinary one ---------------------------------------------------
+
+@test("the outer struct lays it out as a field of its size")
+bfd_the_outer_struct_lays_it_out_by_size()
+    if !bfd_ready() then return
+
+    val src = bfd_ctrl() + "@packed\nstruct Block\n    ctrl: Ctrl\n    count: u32\nprint(sizeof(Block))"
+
+    assert_eq(bfd_ran(src), "5\n")
+
+@test("and the field's own fields are still reachable")
+bfd_the_nested_fields_are_reachable()
+    if !bfd_ready() then return
+
+    val src = bfd_ctrl() + "@packed\nstruct Block\n    ctrl: Ctrl\n    count: u32\n" +
+        "var b = Block(Ctrl(1, 5, 9), 3u32)\nb.ctrl.mode = 2\nprint(b.ctrl.enable, b.ctrl.mode, b.count)"
+
+    assert_eq(bfd_ran(src), "1 2 3\n")
+
+@test("@align composes with it, as it does with any packed struct")
+bfd_align_composes_with_it()
+    if !bfd_ready() then return
+
+    assert_eq(bfd_ran("@align(8)\n" + bfd_ctrl() + "print(sizeof(Ctrl), alignof(Ctrl))"), "8 8\n")
+
+@test("a struct pattern destructures the ranges")
+bfd_a_struct_pattern_destructures_the_ranges()
+    if !bfd_ready() then return
+
+    val src = bfd_ctrl() + "val c = Ctrl(1, 5, 9)\nc match\n    Ctrl(e, m, p) -> print(e, m, p)"
+
+    assert_eq(bfd_ran(src), "1 5 9\n")
+
+// A `unit` field occupies nothing and is not stored, so the field written third is the range stored
+// second -- every site reaching a range by a written index has to say which index it has.
+@test("a zero-sized field is written and occupies no bits")
+bfd_a_zero_sized_field_occupies_no_bits()
+    if !bfd_ready() then return
+
+    val src = "@packed\nstruct Odd\n    a: u3\n    u: unit\n    b: u5\nvar o = Odd(5, (), 20)\no.b = 9\n" +
+        "o match\n    Odd(x, _, y) -> print(sizeof(Odd), x, y)"
+
+    assert_eq(bfd_ran(src), "1 5 9\n")
+
+@test("an invariant sees the fields it relates")
+bfd_an_invariant_sees_its_fields()
+    if !bfd_ready() then return
+
+    val src = "@packed\nstruct Span\n    lo: u5\n    hi: u5\n    invariant lo <= hi\n" +
+        "val s = Span(2, 9)\nprint(sizeof(Span), s.lo, s.hi)"
+
+    assert_eq(bfd_ran(src), "2 2 9\n")
+
+// -- the IR: the struct is one integer ----------------------------------------------------------------
+
+@test("the emitted type has a single member, the container")
+bfd_the_type_is_one_container()
+    if !bfd_ready() then return
+
+    val out = bfd_ir(bfd_ctrl() + "val c = Ctrl(1, 5, 9)\nprint(c.mode)")
+
+    assert(bfd_says(out, "%struct.Ctrl = type <{ i8 }>"), out)
+
+@test("and its width is the fields' total rounded up to a byte")
+bfd_the_container_rounds_up_to_a_byte()
+    if !bfd_ready() then return
+
+    val out = bfd_ir(bfd_odd() + "print(o.b)")
+
+    assert(bfd_says(out, "%struct.Odd = type <{ i24 }>"), out)
+
+// -- a read is a shift and a truncation ---------------------------------------------------------------
+
+@test("the shift is the field's own offset")
+bfd_a_read_shifts_by_the_offset()
+    if !bfd_ready() then return
+
+    val out = bfd_ir(bfd_ctrl() + "var c = Ctrl(1, 5, 9)\nprint(c.prescale)")
+
+    assert(bfd_says(out, "lshr i8"), out)
+
+// An `i5` field IS an LLVM `i5`, so truncating the shifted container lands the two's-complement value
+// already in place -- no sign fixup, where a C bitfield needs one.
+@test("and a signed field needs no sign fixup")
+bfd_a_signed_field_needs_no_fixup()
+    if !bfd_ready() then return
+
+    val out = bfd_ir("@packed\nstruct S\n    a: u4\n    b: i5\nval s = S(3, -7)\nprint(s.b)")
+
+    assert(bfd_says(out, "trunc i16"), out)
+    assert(!bfd_says(out, "ashr"), out)
+
+// Against a twenty-four-bit container, because the claim is an ABSENCE and the module holds the
+// standard library too: `lshr i8` is emitted by plenty else, `lshr i24` by nothing else at all.
+@test("a field starting at bit zero is not shifted at all")
+bfd_bit_zero_is_not_shifted()
+    if !bfd_ready() then return
+
+    val out = bfd_ir(bfd_odd() + "print(o.a)")
+
+    assert(bfd_says(out, "trunc i24"), out)
+    assert(!bfd_says(out, "lshr i24"), out)
+
+@test("and one further up is shifted by exactly its own offset")
+bfd_a_higher_field_shifts_by_its_offset()
+    if !bfd_ready() then return
+
+    val out = bfd_ir(bfd_odd() + "print(o.c)")
+    val lines = lines_of(out)
+    var found = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.index_of("lshr i24 %").is_some() && line.ends_with(", 19") then found = true
+
+    assert(found, out)
+
+// 0b11110001 -- every bit but the three `mode` occupies, as an unsigned `i8`.
+@test("a write reads the container, masks the range out, and puts the new one in")
+bfd_a_write_masks_and_ors()
+    if !bfd_ready() then return
+
+    val out = bfd_ir(bfd_ctrl() + "var c = Ctrl(1, 5, 9)\nc.mode = 2\nprint(c.mode)")
+
+    assert(bfd_says(out, "and i8"), out)
+    assert(bfd_says(out, "241"), out)
+    assert(bfd_says(out, "or i8"), out)
+    assert(bfd_says(out, "shl i8"), out)
+
+@test("a field filling the container is neither masked nor or-ed")
+bfd_a_field_filling_the_container()
+    if !bfd_ready() then return
+
+    val out = bfd_ir("@packed\nstruct Whole\n    a: u16\n    b: u3\nvar w = Whole(9, 1)\nw.a = 5\nprint(w.a)")
+
+    assert(bfd_says(out, "%struct.Whole = type <{ i24 }>"), out)
+    assert(bfd_says(out, "or i24"), out)
+
+// -- a volatile bitfield is reached through its container ---------------------------------------------
+
+@test("reading one is a single volatile load of the whole container")
+bfd_a_volatile_read_is_one_load()
+    if !bfd_ready() then return
+
+    val out = bfd_define(bfd_ir(bfd_reg() + "read() -> u4 = p.prescale\nprint(read())"), "read")
+
+    assert(bfd_says(out, "load volatile i8"), out)
+    assert(bfd_says(out, "lshr i8"), out)
+    assert(!bfd_says(out, "extractvalue"), out)
+
+@test("writing one is a volatile load and a volatile store, and nothing between them touches memory")
+bfd_a_volatile_write_is_one_load_one_store()
+    if !bfd_ready() then return
+
+    val out = bfd_define(bfd_ir(bfd_reg() + "go() = p.mode = 5\ngo()"), "go")
+
+    assert(bfd_says(out, "load volatile i8"), out)
+    assert(bfd_says(out, "store volatile i8"), out)
+    assert(bfd_says(out, "and i8"), out)
+    assert(bfd_says(out, "or i8"), out)
+    assert_eq(bfd_count(out, "load volatile"), 1)
+    assert_eq(bfd_count(out, "store volatile"), 1)
+
+// The qualifier is a property of the container rather than of one range of it.
+@test("one qualified field makes every access to the container volatile")
+bfd_one_qualified_field_qualifies_the_container()
+    if !bfd_ready() then return
+
+    val src = "@packed\nstruct Mixed\n    flag: volatile u1\n    rest: u7\n" +
+        "static val p: *Mixed = ptr_cast(usize(4096))\nread() -> u7 = p.rest\nprint(read())"
+    val out = bfd_define(bfd_ir(src), "read")
+
+    assert(bfd_says(out, "load volatile i8"), out)
+
+@test("a simple enum field may be one")
+bfd_a_simple_enum_field_may_be_volatile()
+    if !bfd_ready() then return
+
+    val src = "enum Mode: u3\n    Off\n    Slow\n    Fast\n" +
+        "@packed\nstruct Ctrl\n    enable: volatile u1\n    mode: volatile Mode\n    rest: volatile u4\n" +
+        "static val p: *Ctrl = ptr_cast(usize(4096))\ngo() = p.mode = Mode.Fast\ngo()"
+    val out = bfd_define(bfd_ir(src), "go")
+
+    assert(bfd_says(out, "load volatile i8"), out)
+    assert(bfd_says(out, "store volatile i8"), out)
+
+// The control for the four above: the same program with the qualifier taken off.
+@test("and the same struct with no qualified field is still read out of a loaded value")
+bfd_an_unqualified_bitfield_is_extracted()
+    if !bfd_ready() then return
+
+    val src = bfd_ctrl() + "static val p: *Ctrl = ptr_cast(usize(4096))\nread() -> u4 = p.prescale\nprint(read())"
+    val out = bfd_define(bfd_ir(src), "read")
+
+    assert(bfd_says(out, "extractvalue %struct.Ctrl"), out)
+    assert(!bfd_says(out, "volatile"), out)
+
+@test("a packed struct of whole bytes is still a register block, one field at a time")
+bfd_a_whole_byte_register_block()
+    if !bfd_ready() then return
+
+    val src = "@packed\nstruct Block\n    a: volatile u32\n    b: volatile u32\n" +
+        "var p: *Block = ptr_cast(4096usize)\np.a = 1u32\n"
+    val out = bfd_ir(src)
+
+    assert(bfd_says(out, "store volatile i32"), out)
+
+@test("construction ors the fields together rather than inserting each")
+bfd_construction_ors_the_fields()
+    if !bfd_ready() then return
+
+    val out = bfd_ir(bfd_odd() + "print(o.b)")
+
+    assert(bfd_says(out, "insertvalue %struct.Odd undef, i24"), out)
+    assert_eq(bfd_count(out, "insertvalue %struct.Odd"), 1)
+
+// -- what a bitfield struct may not hold --------------------------------------------------------------
+
+@test("a pointer beside a narrow field is refused")
+bfd_a_pointer_beside_a_narrow_field()
+    if !bfd_ready() then return
+
+    val e = bfd_err("@packed\nstruct Mixed\n    p: *u8\n    a: u3\nval m = Mixed(null, 1)\nprint(m.a)")
+
+    assert(bfd_says(e, "'Mixed.p' is *byte"), e)
+    assert(bfd_says(e, "narrower than a byte"), e)
+    assert(bfd_says(e, "every field of it has to be one too"), e)
+
+@test("and so is a float")
+bfd_and_so_is_a_float()
+    if !bfd_ready() then return
+
+    val e = bfd_err("@packed\nstruct Mixed\n    x: f32\n    a: u3\nval m = Mixed(1.0, 1)\nprint(m.a)")
+
+    assert(bfd_says(e, "'Mixed.x' is f32, and 'Mixed' is '@packed' with a field narrower than a byte"), e)
+    assert(bfd_says(e, "every field of it has to be one too"), e)
+
+// `bool` is an `i1` whose storage is a byte, so admitting it would make one type mean one width inside
+// a container and another outside it. A flag is a `u1`.
+@test("a 'bool' is not an integer here")
+bfd_a_bool_is_not_an_integer_here()
+    if !bfd_ready() then return
+
+    val e = bfd_err("@packed\nstruct Mixed\n    f: bool\n    a: u3\nval m = Mixed(true, 1)\nprint(m.a)")
+
+    assert(bfd_says(e, "'Mixed.f' is bool"), e)
+    assert(bfd_says(e, "every field of it has to be one too"), e)
+
+@test("the suggestion is the nesting that does work")
+bfd_the_suggestion_is_nesting()
+    if !bfd_ready() then return
+
+    val e = bfd_err("@packed\nstruct Mixed\n    p: *u8\n    a: u3\nval m = Mixed(null, 1)\nprint(m.a)")
+
+    assert(bfd_says(e, "Put the narrow fields in a '@packed' struct of their own and hold that here: it " +
+                       "lays out identically and leaves *byte what it is"), e)
+
+// -- the struct itself still may not carry the qualifier, by either route -----------------------------
+
+@test("not as a field, and the message names the per-field spelling")
+bfd_volatile_struct_not_as_a_field()
+    if !bfd_ready() then return
+
+    val e = bfd_err("@packed\nstruct Ctrl\n    a: u3\n    b: u5\n@packed\nstruct Regs\n" +
+                    "    ctrl: volatile Ctrl\nvar p: *Regs = ptr_cast(4096usize)\nprint(p.ctrl.a)")
+
+    assert(bfd_says(e, "'volatile Ctrl' is not a type"), e)
+    assert(bfd_says(e, "qualified one field at a time"), e)
+
+@test("and not as a '*T' pointee")
+bfd_volatile_struct_not_as_a_pointee()
+    if !bfd_ready() then return
+
+    val e = bfd_err("@packed\nstruct Ctrl\n    a: u3\n    b: u5\n" +
+                    "var p: *volatile Ctrl = ptr_cast(4096usize)\nprint(p.a)")
+
+    assert(bfd_says(e, "'volatile Ctrl' is not a type: a register block is qualified one field at a time"), e)
+
+// A simple enum is one integer and may be a volatile bitfield; a data enum is a tag beside a payload,
+// so no single access reaches one whatever the source says.
+@test("a data enum is not a register field")
+bfd_a_data_enum_is_not_a_register_field()
+    if !bfd_ready() then return
+
+    val e = bfd_err("enum P\n    None\n    Some(x: int)\n@packed\nstruct Bad\n" +
+                    "    a: volatile u3\n    b: volatile P\nprint(0)")
+
+    assert(bfd_says(e, "'volatile P' is not a type"), e)
+    assert(bfd_says(e, "carries a payload beside its tag"), e)
+
+// -- a bitfield has no byte offset --------------------------------------------------------------------
+
+@test("'offsetof' says so rather than rounding down to the byte it begins in")
+bfd_offsetof_a_bitfield_is_refused()
+    if !bfd_ready() then return
+
+    val e = bfd_err(bfd_ctrl() + "print(offsetof(Ctrl, mode))")
+
+    assert(bfd_says(e, "'Ctrl.mode' is a bitfield — it starts at bit 1 of the struct and is 3 bits wide, " +
+                       "so it has no byte offset. 'offsetof' answers in bytes, and the byte it begins in " +
+                       "is not where it is"), e)
+
+@test("even for the field that does begin on a byte")
+bfd_offsetof_even_at_bit_zero()
+    if !bfd_ready() then return
+
+    val e = bfd_err(bfd_ctrl() + "print(offsetof(Ctrl, enable))")
+
+    assert(bfd_says(e, "'Ctrl.enable' is a bitfield — it starts at bit 0 of the struct and is 1 bits wide"), e)
+    assert(bfd_says(e, "has no byte offset"), e)
+
+@test("a misspelled field is still the diagnostic it was")
+bfd_offsetof_a_misspelled_field()
+    if !bfd_ready() then return
+
+    val e = bfd_err(bfd_ctrl() + "print(offsetof(Ctrl, mdoe))")
+
+    assert(bfd_says(e, "'Ctrl' has no field 'mdoe' — it stores 'enable', 'mode', 'prescale'"), e)
+
+// The rule `@packed` already had: a field of one need not sit on its own type's boundary.
+@test("a bitfield has no address, which is the rule packed already had")
+bfd_a_bitfield_has_no_address()
+    if !bfd_ready() then return
+
+    val e = bfd_err(bfd_ctrl() + "var c = Ctrl(1, 5, 9)\nval p = &c.mode\nprint(p[0])")
+
+    assert(bfd_says(e, "'&' here makes a '*u3' into Ctrl, which is '@packed'"), e)
