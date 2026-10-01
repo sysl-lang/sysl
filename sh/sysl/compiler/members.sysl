@@ -66,6 +66,10 @@ end FuncSig
 //     from `written` and that separation is the whole feature: an argument in `written` was *chosen*
 //     where the trait was applied, so it is part of the key an implementation is selected by, while
 //     an associated type is *determined* by the subject and selects nothing.
+//   - `opaque` are the associated types the block supplies through a `some` **result** rather than a
+//     written `type` line: the associated type's name, the lowered function whose body says what it
+//     is, and the stand-in a projection answers with until that body has been read
+//     (`settle_opaque_results`).
 struct TraitImpl
     decl: ImplDecl
     span: Span
@@ -76,6 +80,7 @@ struct TraitImpl
     tparams: Buf[string]
     conditional: bool
     assocs: Buf[(string, Type)]
+    opaque: Buf[(string, string, string)]
 
     // Whether this block asks anything of the arguments its subject is applied to.
     condition(self) -> Buf[NamedBounds] = self.decl.bounds
@@ -196,7 +201,33 @@ struct MemberTables
     // lowered to. `selves` holds what the generic walk stood `M` at; each instantiation reads `N` at
     // the number it gives `M` instead (`self_for`).
     opened: &Table[Buf[Binding]]
+
+    // What each `some` result turned out to be, keyed by the lowered function whose body settled it.
+    // It is a table of its own rather than a field of `TraitImpl` because it is filled in *after* the
+    // block was registered: a body cannot be read until every declaration exists, and the block has
+    // to exist before that for the body to be able to name anything.
+    opaque_results: &Table[Type]
+
+    // Every `some` result in the program waiting to be settled, in the order the blocks were hoisted.
+    opaque_jobs: Buf[OpaqueJob]
 end MemberTables
+
+// One `some` result waiting to be settled: the lowered function whose body says what the type is,
+// the declaration to read it from, what the member **promised** about it, the trait bound and the
+// associated type whose bounds say what the trait **asked** of it, and where to report either failing.
+// `label` and `member` are carried so a diagnostic names the block and the member rather than the
+// mangled function they became.
+struct OpaqueJob
+    func: string
+    decl: FuncDecl
+    promised: Buf[BoundRef]
+    bound: Bound
+    assoc: AssocDecl
+    label: string
+    member: string
+    scope: Scope
+    span: Span
+end OpaqueJob
 
 // One instantiation waiting for its body to be typed: the name it goes under, the declaration it was
 // made from, and what its type parameters were fixed to.
@@ -242,7 +273,7 @@ end DeferredBound
 member_tables() -> &MemberTables =
     MemberTables(table(), table(), table(), table(), table(), table(), table(), table(), table(),
                  table(), table(), table(), table(), table(), table(), table(), table(), buf(),
-                 buf(), table(), false, buf(), buf(), table(), table())
+                 buf(), table(), false, buf(), buf(), table(), table(), table(), buf())
 
 // -- reading the tables --------------------------------------------------------------------------
 

@@ -71,7 +71,26 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
     CFnType(params, ret) ->
         CFn(resolve_list(a, scope, params, subst), resolve_type(a, scope, ret, subst))
     FnType(params, ret, bare) -> resolve_unboxed_callable(a, scope, t, params, ret, bare, subst)
-    SomeType(_) -> Unknown
+    // A `some` result that reached resolution is one written where the inference behind it has
+    // nothing to read: a type position already refused it at the parse, so what arrives here is a
+    // **result** in the two places a result is not an `impl` block's member -- a free function and
+    // the trait's own declaration. An `impl` member's has been rewritten to its projection by now.
+    SomeType(bounds) ->
+        if !bounds.is_empty()
+            var shown = str_builder()
+
+            for i in 0..<bounds.len()
+                if i > 0 then shown.push(" + ")
+
+                shown.push(bound_text(bounds.at(i)))
+
+            a.fault(scope, t.span, s"'some ${shown.finish()}' says the type is read off the body of a " +
+                    "member that supplies a trait's associated type, so it stands only in an 'impl' " +
+                    s"block — a trait writes 'type Name: ${bound_text(bounds.at(0))}' among its members " +
+                    "and gives the member the result 'Self::Name'")
+        end if
+
+        Unknown
     // `T::Item` -- the associated type, which the member tables are what answer. It resolves like
     // anything else the moment the subject is known: the subject is resolved first, and a parameter
     // standing in for itself answers off the bounds it carries.

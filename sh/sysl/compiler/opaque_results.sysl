@@ -1,0 +1,105 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// Settling every `some` result: the one pass that reads a body in order to learn a **type**.
+//
+// `-> some View` says the concrete result is whatever the body produced, and that the reader may rely
+// on it implementing `View`. Nothing else in sysl infers a declared result -- a signature says what it
+// says -- so this is the one place a body is read before anything asks about it, and it is a *pass*
+// rather than something done on demand: a body may name anything the program declares, so it cannot
+// be looked at until every declaration is in, and everything that reads an associated type runs
+// after it.
+//
+// What it produces is one entry per job in `MemberTables.opaque_results`, keyed by the lowered
+// function the member became. `impl_assoc` reads it, and a projection off a concrete subject then
+// answers with a concrete type exactly as a written `type Item = int` would have.
+
+// Reads each `some` member's body, binds the associated type to what it produced, and holds that
+// type both to what the member promised and to what the trait asked.
+//
+// **A job whose body reaches ANOTHER `some` result is why there is a second sweep.** The second job's
+// type is not known on the first, so its projection is still the stand-in `impl_assoc` hands out; one
+// more sweep is what a chain of two costs. A chain leading back to where it started never settles,
+// and `check_opaque` names it as the loop it is.
+settle_opaque_results(a: &Analysis)
+    val jobs = a.tables.members.opaque_jobs
+
+    if jobs.is_empty() then return
+
+    for i in 0..<jobs.len()
+        settle_opaque(a, jobs.at(i))
+
+    for i in 0..<jobs.len()
+        val settled = a.tables.members.opaque_results.get(jobs.at(i).func)
+
+        if settled.is_some() && mentions_abstract(settled.unwrap()) then settle_opaque(a, jobs.at(i))
+
+    for i in 0..<jobs.len()
+        check_opaque(a, jobs.at(i))
+end settle_opaque_results
+
+// Reads one body and records what it produced.
+//
+// **A member of a concrete type had its signature resolved and filed at the hoist**, before this
+// pass could exist -- so what `func_insts` holds for it is the stand-in, and every later reading of
+// the member's result comes from there rather than from the projection. Correcting the entry is what
+// makes the settled type reach a call, the member's own body, and the declared type of anything
+// holding what it returned. A **generic** block has no entry to correct: its members are
+// instantiated on demand, after this pass, and each resolves the projection freshly.
+private settle_opaque(a: &Analysis, job: OpaqueJob)
+    val scope = a.tables.members.decl_scope.get(job.func).unwrap_or(job.scope)
+    val ty = opaque_body_type(a, scope, job.decl)
+
+    a.tables.members.opaque_results.put(job.func, ty)
+
+    val sig = a.tables.members.func_insts.get(job.func)
+
+    if sig.is_some() then a.tables.members.func_insts.put(job.func, FuncSig(sig.unwrap().params, ty))
+end settle_opaque
+
+// Holds a settled type to the two promises made about it, which are made by two different people.
+// `some View` is the **implementation's** promise, written on the member; `type Body: View` is the
+// **trait's** requirement. They are usually the same trait and are checked separately anyway,
+// because the fix differs -- one is a word on this line, the other a type this block chose.
+private check_opaque(a: &Analysis, job: OpaqueJob)
+    val settled = a.tables.members.opaque_results.get(job.func)
+
+    if settled.is_none() || mentions_unknown(settled.unwrap()) then return
+
+    val ty = settled.unwrap()
+
+    // A result that never settled to a real type is a chain this pass could not unwind -- said here
+    // rather than left to the bound checks, which would blame the bound for it.
+    if mentions_abstract(ty) && job.decl.tparams.is_empty()
+        a.fault(job.scope, job.span, s"the result of '${job.member}' in '${job.label}' is read off its " +
+                "own body, and working out what that body produces needs the same answer — a 'some' " +
+                "result cannot depend on itself, however many members the loop runs through")
+        return
+    end if
+
+    val own = abstract_subst(a, job.scope, job.decl.tparams, job.decl.bounds, job.decl.tvalues,
+                             job.decl.tpacks, buf())
+
+    for i in 0..<job.promised.len()
+        val ref = job.promised.at(i)
+        val b = resolve_bound(a, job.scope, ref.span, ref, own)
+
+        if !satisfies(a, b, ty)
+            a.fault(job.scope, job.span, s"'${job.member}' promises 'some ${bound_text(ref)}' and its " +
+                    s"body yields ${type_show(ty)}, which does not implement '${show_bound(a, b, ty)}'")
+            return
+        end if
+
+    // The trait's bounds on the associated type, with `Self` in them standing for the settled type --
+    // a `type W: Add` asks whether it is an `Add[<it>, <it>]`, never an `Add` of the implementing type.
+    val asked = assoc_bounds_of(a, job.bound, job.assoc, ty)
+
+    for i in 0..<asked.len()
+        if satisfies(a, asked.at(i), ty) then continue
+
+        a.fault(job.scope, job.span, s"the associated type '${job.assoc.name}' must implement " +
+                s"'${show_bound(a, asked.at(i), ty)}', and the body of '${job.member}' — which is " +
+                s"what settles it — yields ${type_show(ty)}, which does not")
+        return
+end check_opaque

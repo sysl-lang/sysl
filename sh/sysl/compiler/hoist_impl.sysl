@@ -282,6 +282,17 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
 
         assocs.push((bind.name, resolve_type(a, scope, bind.typ, assoc_subst)))
 
+    // Which associated type each `some` result settles, and the lowered function that settles it.
+    // The name is built here rather than read back, because it is the same name `synthesize` gives
+    // the member and the two must not be able to disagree.
+    val opaque_members = opaque_bindings(tr, im.decl)
+    var opaque: Buf[(string, string, string)] = buf()
+
+    for i in 0..<opaque_members.len()
+        val (aname, m) = opaque_members.at(i)
+
+        opaque.push((aname, s"${home.symbol}.${m.name}${home.alt}", s"${home.key}::$aname"))
+
     // **A block that does not supply every associated type is not registered at all**, and its
     // members are not lowered. Everything below reads a signature written in terms the block never
     // settled, so what would come back is one mistake reported as several -- and the reader is owed
@@ -289,7 +300,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     for i in 0..<tr.assocs.len()
         val ad = tr.assocs.at(i)
 
-        if !holds_assoc(assocs, ad.name)
+        if !holds_assoc(assocs, ad.name) && !holds_opaque(opaque, ad.name)
             a.fault(scope, span, s"'${home.label}' does not implement " +
                     s"'${qualified_name(block.trait_name)}': the associated type '${ad.name}' is " +
                     s"missing — supply it with 'type ${ad.name} = …', or give the member that " +
@@ -323,7 +334,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         rows.push(already.at(i))
 
     rows.push(TraitImpl(block, span, scope, written, wkey, home.alt, home.tparams,
-                        !home.tparams.is_empty() && !home.bounds.is_empty(), assocs))
+                        !home.tparams.is_empty() && !home.bounds.is_empty(), assocs, opaque))
     a.tables.members.impls.put(impl_key_of(key.unwrap(), home.key), rows)
 
     // What the trait **requires** is asked of the implementing type here, at the block that makes
@@ -435,9 +446,75 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // edge short is a graph the reachability walk reads differently.
     if !supplied.is_empty() then depends_on_module(a, scope, StdModule, span)
 
-    hoist_member_list(a, home, supplied)
+    val lowered = hoist_member_list(a, home, supplied)
+
+    // Each `some` result becomes a job for the pass that runs once every declaration is in: a body
+    // cannot be read until then, and the block has to be registered before that for the body to be
+    // able to name anything at all.
+    for i in 0..<opaque_members.len()
+        val (aname, m) = opaque_members.at(i)
+        val func = opaque.at(i).1
+        val ad = assoc_decl_named(tr, aname)
+        var fd: Option[FuncDecl] = None
+
+        for j in 0..<lowered.len()
+            if lowered.at(j).name == func then fd = Some(lowered.at(j))
+
+        val promised = *m.ret_type.unwrap().kind match
+            SomeType(bs) -> bs
+            _ -> buf()
+
+        if fd.is_some() && ad.is_some() then
+            a.tables.members.opaque_jobs.push(OpaqueJob(func, fd.unwrap(), promised, bound, ad.unwrap(),
+                                                        home.label,
+                                                        source_member_name(m.name), scope, m.span))
+    end for
+
     Impl(block, span, scope)
 end hoist_impl
+
+// Which associated type each `some` member settles, read off the **trait's** declaration of that
+// member. A member whose trait counterpart is not a projection has already been refused by
+// `opened_results`, so what reaches here is exactly the members that settle one.
+private opaque_bindings(tr: TraitDecl, written: ImplDecl) -> Buf[(string, MethodDecl)]
+    var out: Buf[(string, MethodDecl)] = buf()
+
+    for i in 0..<written.methods.len()
+        val m = written.methods.at(i)
+
+        if m.ret_type.is_none() then continue
+
+        val is_some = *m.ret_type.unwrap().kind match
+            SomeType(_) -> true
+            _ -> false
+
+        if !is_some then continue
+
+        val tm = trait_method(tr, m.name)
+
+        if tm.is_none() || tm.unwrap().ret_type.is_none() then continue
+
+        val projected = assoc_of_self(tm.unwrap().ret_type.unwrap())
+
+        if projected.is_some() && declares_assoc(tr, projected.unwrap()) then
+            out.push((projected.unwrap(), m))
+
+    out
+end opaque_bindings
+
+private holds_opaque(opaque: Buf[(string, string, string)], name: string) -> bool
+    for i in 0..<opaque.len()
+        if opaque.at(i).0 == name then return true
+
+    false
+end holds_opaque
+
+private assoc_decl_named(tr: TraitDecl, name: string) -> Option[AssocDecl]
+    for i in 0..<tr.assocs.len()
+        if tr.assocs.at(i).name == name then return Some(tr.assocs.at(i))
+
+    None
+end assoc_decl_named
 
 // Whether each `impl` of a trait that requires others supplies those too.
 //
