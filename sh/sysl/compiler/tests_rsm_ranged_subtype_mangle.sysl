@@ -1,0 +1,189 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// A subtype that checks anything -- a range, a `where`, or `new` -- is a type of its own in a
+// mangled name, where one that is only a name (`type H = int`) is its base. `Buf[Small]` and
+// `Buf[int]`, `conv[Small]` and `conv[int]`, are two instantiations with two bodies: the one at
+// `Small` checks what it makes and the one at `int` does not. Sharing a name let whichever was met
+// first stand in for the other, so `conv[Small](50)` returned 50 through `conv.int`'s body and a
+// `Buf[int]` beside a `Buf[Small]` was refused as the other one.
+//
+// **Every symbol and every outcome here was read out of the reference compiler** (0.0.154) on the
+// same input.
+
+private rsm_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end rsm_ready
+
+private rsm_root_with(text: string) -> string
+    val root = make_temp_dir("sysl-rsm").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end rsm_root_with
+
+// The LLVM text of one file, or a note saying why there is none.
+private rsm_ir(text: string) -> string
+    val root = rsm_root_with(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) -> if made.report.is_empty() then made.text else s"refused: ${analysis_report(made.report)}"
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rsm_ir
+
+// What one file does when built and run, as `<exit status>: <what it printed>`, `signalled: …`
+// for a program a trap stopped, or `unbuilt: <why>`.
+private rsm_does(text: string) -> string
+    val root = rsm_root_with(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"unbuilt: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "unbuilt: the program that was built could not be run"
+        Ok(out) ->
+            out.status match
+                Status.Exited(code) -> s"$code: ${out.text}"
+                _ -> s"signalled: ${out.text}"
+end rsm_does
+
+private rsm_has(text: string, part: string) =
+    assert(text.index_of(part).is_some(), s"expected '$part' in: $text")
+
+private rsm_lacks(text: string, part: string) =
+    assert(text.index_of(part).is_none(), s"did not expect '$part' in: $text")
+
+private const RsmBoth: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    type Small = int within 0..10
+
+    struct Box[T]
+        v: T
+
+    ident[T](x: T) -> T = x
+
+    put[T](p: *T, v: T)
+        *p = v
+
+    var bs: Buf[Small] = buf()
+    var bi: Buf[int] = buf()
+    bs.push(3)
+    bi.push(30)
+    print(ident[Small](4))
+    print(ident[int](40))
+    val xs = Box[Small](6)
+    val xi = Box[int](60)
+    var s: Small = 1
+    var i = 11
+    put(&s, 2)
+    put(&i, 12)
+    print(bs[0] + bi[0] + s + i + xs.v + xi.v)
+    """
+
+@test("a ranged subtype is instantiated under its own name, beside its base's")
+rsm_a_ranged_subtype_is_its_own_instantiation()
+    if !rsm_ready() then return
+
+    val ir = rsm_ir(RsmBoth)
+
+    rsm_has(ir, "%struct.sysl.buf$Buf.Small = type { { ptr, ptr, i64 }, i64 }")
+    rsm_has(ir, "%struct.sysl.buf$Buf.int = type { { ptr, ptr, i64 }, i64 }")
+    rsm_has(ir, "%struct.Box.Small = type { i32 }")
+    rsm_has(ir, "%struct.Box.int = type { i32 }")
+    rsm_has(ir, "define i32 @ident.Small(i32 %x.param) {")
+    rsm_has(ir, "define i32 @ident.int(i32 %x.param) {")
+    rsm_has(ir, "define void @put.Small(ptr %p.param, i32 %v.param) {")
+    rsm_has(ir, "define void @put.int(ptr %p.param, i32 %v.param) {")
+    rsm_has(ir, "define ptr @sysl.slices$as_ptr.Small({ ptr, ptr, i64 } %xs.param) {")
+end rsm_a_ranged_subtype_is_its_own_instantiation
+
+@test("and a Buf of it beside a Buf of its base builds and runs")
+rsm_both_instantiations_run()
+    if !rsm_ready() then return
+
+    assert(rsm_does(RsmBoth) == "0: 4\n40\n113\n")
+
+private const RsmConv: string = raw"""
+    type Small = int within 0..10
+
+    conv[T](n: int) -> T = T(n)
+
+    print(conv[int](50))
+    print(conv[Small](5))
+    """
+
+@test("a generic converting to a ranged subtype checks the range in its own body")
+rsm_the_ranged_body_checks_and_the_base_body_does_not()
+    if !rsm_ready() then return
+
+    val ir = rsm_ir(RsmConv)
+
+    rsm_has(ir, "define i32 @conv.int(i32 %n.param) {")
+    rsm_has(ir, "define i32 @conv.Small(i32 %n.param) {")
+    rsm_has(ir, "  %t2 = icmp sge i32 %t1, 0\n  br i1 %t2, label %within.ok1, label %within.bad2\n")
+    rsm_has(ir, "call i32 @conv.Small(i32 5)")
+    rsm_has(ir, "call i32 @conv.int(i32 50)")
+    assert(rsm_does(RsmConv) == "0: 50\n5\n")
+end rsm_the_ranged_body_checks_and_the_base_body_does_not
+
+@test("and a value outside the range traps rather than coming back through the base's body")
+rsm_the_range_check_still_fires()
+    if !rsm_ready() then return
+
+    val said = rsm_does(raw"""
+        type Small = int within 0..10
+
+        conv[T](n: int) -> T = T(n)
+
+        print(conv[int](50))
+        print(conv[Small](50))
+        """)
+
+    assert(said.starts_with("signalled"), s"expected a trap, got: $said")
+end rsm_the_range_check_still_fires
+
+@test("a subtype that is only a name shares its base's instantiation")
+rsm_a_name_only_subtype_is_its_base()
+    if !rsm_ready() then return
+
+    val ir = rsm_ir(raw"""
+        type H = int
+
+        ident[T](x: T) -> T = x
+
+        print(ident[H](5))
+        print(ident[int](6))
+        """)
+
+    rsm_has(ir, "define i32 @ident.int(i32 %x.param) {")
+    rsm_lacks(ir, "@ident.H")
+    rsm_has(ir, "call i32 @ident.int(i32 5)")
+end rsm_a_name_only_subtype_is_its_base
