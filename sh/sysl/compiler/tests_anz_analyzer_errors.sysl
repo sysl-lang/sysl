@@ -1,0 +1,719 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// What the analyzer says about control flow and pattern matching, about a type's own members, and
+// what a speculative walk costs to take back -- the reference's `AnalyzerControlFlowErrorTests`,
+// `AnalyzerMemberErrorTests` and `AnalyzerRewindTests`.
+//
+// **Every message and every `line:col` quoted here was read out of the reference compiler**
+// (0.0.153), on the program the test holds. Each program is a single file with no `module` header,
+// so the names a message quotes are the ones it wrote.
+
+private var anz_library_cache: Buf[Program] = buf()
+private var anz_library_read: bool = false
+
+private anz_library() -> Buf[Program]
+    if anz_library_read then return anz_library_cache
+
+    anz_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> anz_library_cache = units
+
+    anz_library_cache
+end anz_library
+
+private anz_ready() -> bool
+    if anz_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+end anz_ready
+
+// What the compiler says about a program, as the command line prints it.
+private anz_err(text: string) -> string
+    val root = make_temp_dir("sysl-analyzer-errors").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end anz_err
+
+// The text a program lowers to.
+private anz_ir(text: string) -> string
+    val root = make_temp_dir("sysl-analyzer-errors").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end anz_ir
+
+// How many complaints a report holds: each names its place once.
+private anz_complaints(said: string) -> int
+    var rest = said
+    var n = 0
+
+    loop
+        rest.index_of("main.sysl:") match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + 10..<rest.bytes.len]
+
+    n
+end anz_complaints
+
+// One complaint of a report: the whole message, and the `line:col` it is anchored at.
+private anz_told(said: string, message: string, at: string)
+    val head = s"error: $message\n --> "
+
+    said.index_of(head) match
+        None -> assert(false, said)
+        Some(i) ->
+            val rest = said[i + head.bytes.len..<said.bytes.len]
+            val place = rest.index_of("\n") match
+                Some(n) -> rest[0..<n]
+                None -> rest
+
+            assert(place.ends_with(s"main.sysl:$at"), said)
+end anz_told
+
+// The one complaint a program earns.
+private anz_only(said: string, message: string, at: string)
+    anz_told(said, message, at)
+    assert_eq(anz_complaints(said), 1, said)
+
+private anz_says(said: string, part: string) -> bool = said.index_of(part).is_some()
+
+private anz_point() -> string = "struct Point\n    x: int\n    y: int\nend Point\n"
+
+// -- loops --------------------------------------------------------------------------------------------
+
+@test("break outside a loop is rejected")
+anz_break_outside_a_loop()
+    if !anz_ready() then return
+
+    anz_only(anz_err("break 5\n"), "'break' is only allowed inside a loop", "1:1")
+
+@test("continue outside a loop is rejected")
+anz_continue_outside_a_loop()
+    if !anz_ready() then return
+
+    anz_only(anz_err("continue\n"), "'continue' is only allowed inside a loop", "1:1")
+
+@test("a value-carrying break with no else is rejected")
+anz_a_valued_break_with_no_else()
+    if !anz_ready() then return
+
+    anz_only(anz_err("var r = for x in [1, 2, 3]\n    if x == 2 then break x\n"),
+             "this loop breaks with a int but has no 'else' to give a value when it finishes " +
+             "normally — add an 'else'", "1:9")
+
+@test("a break value and else of different types are rejected")
+anz_a_break_and_an_else_that_disagree()
+    if !anz_ready() then return
+
+    anz_only(anz_err("var r = for x in [1, 2, 3]\n    if x == 2 then break x\nelse \"no\"\n"),
+             "a loop's break values and its 'else' must have the same type, but got int and string",
+             "1:9")
+
+@test("two breaks of different types are rejected")
+anz_two_breaks_that_disagree()
+    if !anz_ready() then return
+
+    anz_only(anz_err("var r = while true\n    if true then break 1\n    break \"two\"\nelse 0\n"),
+             "a loop's break values and its 'else' must have the same type, but got int and string",
+             "1:9")
+
+@test("two breaks of different types out of a loop are rejected")
+anz_two_breaks_out_of_a_loop_that_disagree()
+    if !anz_ready() then return
+
+    anz_only(anz_err("var r = loop\n    if true then break 1\n    break \"two\"\n"),
+             "a loop's break values must have the same type, but got int and string", "1:9")
+
+@test("a valued break and a bare one out of a loop are rejected")
+anz_a_valued_break_and_a_bare_one()
+    if !anz_ready() then return
+
+    anz_only(anz_err("var r = loop\n    if true then break 1\n    break\n"),
+             "a loop's break values must have the same type, but got int and unit", "1:9")
+
+@test("breaking or continuing to an unknown label is rejected")
+anz_an_unknown_label()
+    if !anz_ready() then return
+
+    anz_only(anz_err("for i in 0..<3\n    break 'nope\n"), "no enclosing loop is labeled 'nope", "2:5")
+    anz_only(anz_err("for i in 0..<3\n    continue 'gone\n"), "no enclosing loop is labeled 'gone",
+             "2:5")
+
+@test("a label used outside its loop is rejected")
+anz_a_label_outside_its_loop()
+    if !anz_ready() then return
+
+    anz_only(anz_err("'outer for i in 0..<3\n    print(i)\nbreak 'outer\n"),
+             "no enclosing loop is labeled 'outer", "3:1")
+
+@test("reusing a label already in scope is rejected")
+anz_a_label_reused()
+    if !anz_ready() then return
+
+    anz_only(anz_err("'dup for i in 0..<3\n    'dup for j in 0..<3\n        break 'dup\n"),
+             "label 'dup is already in scope", "2:5")
+
+// -- match patterns and results -------------------------------------------------------------------
+
+@test("a value match must be exhaustive")
+anz_a_value_match_must_be_exhaustive()
+    if !anz_ready() then return
+
+    anz_only(anz_err("var x = 1 match\n    1 -> 10\n    2 -> 20\n"),
+             "a 'match' that yields a value must be exhaustive — add an 'else' arm", "1:9")
+
+@test("a value match on a bool covering only one value is rejected")
+anz_a_bool_match_covering_one_value()
+    if !anz_ready() then return
+
+    anz_only(anz_err("var x = true match\n    true -> 1\n"),
+             "a 'match' on 'bool' that yields a value must cover both 'true' and 'false' — add the " +
+             "missing arm or an 'else'", "1:9")
+
+@test("a string range pattern is rejected")
+anz_a_string_range_pattern()
+    if !anz_ready() then return
+
+    anz_only(anz_err("f(s: string) -> int = s match\n    \"a\"..\"z\" -> 1\n    else 0\n"),
+             "a range pattern needs a numeric or char value, not string", "2:5")
+
+@test("arms that yield different value types are rejected")
+anz_arms_that_disagree()
+    if !anz_ready() then return
+
+    anz_only(anz_err("var x = 3 match\n    1 -> 10\n    else \"big\"\n"),
+             "match arms have different types: int and string", "1:9")
+
+@test("a positional struct pattern with the wrong field count is rejected")
+anz_a_short_positional_pattern()
+    if !anz_ready() then return
+
+    anz_only(anz_err(anz_point() + "f(p: Point) -> int = p match\n    Point(x) -> x\n    else 0\n"),
+             "struct 'Point' has 2 fields, but 1 sub-pattern was given", "6:5")
+
+@test("a variant pattern against a reference to the enum says to dereference it")
+anz_a_variant_pattern_through_a_reference()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Shape\n    Dot\n    Round(r: int)\nend Shape\n" +
+                     "f(s: &Shape) -> int = s match\n    Round(r) -> r\n    else 0\n"),
+             "'Round(…)' matches an enum variant or a struct, but the value is &Shape — a pattern " +
+             "does not reach through a memory mode the way a field selection does, so match what " +
+             "it holds: '*x match'", "6:5")
+
+@test("and so does a struct pattern against a pointer to the struct")
+anz_a_struct_pattern_through_a_pointer()
+    if !anz_ready() then return
+
+    anz_only(anz_err(anz_point() + "f(p: *Point) -> int = p match\n    Point{x: n} -> n\n    else 0\n"),
+             "'Point{…}' matches a struct, but the value is *Point — a pattern does not reach " +
+             "through a memory mode the way a field selection does, so match what it holds: " +
+             "'*x match'", "6:5")
+
+@test("but a value of no such shape is not")
+anz_a_value_of_no_such_shape()
+    if !anz_ready() then return
+
+    val said = anz_err("struct Point\n    x: int\nend Point\n" +
+                       "f(n: int) -> int = n match\n    Point(x) -> x\n    else 0\n")
+
+    anz_only(said, "'Point(…)' matches an enum variant or a struct, but the value is int", "5:5")
+    assert(!anz_says(said, "*x match"), said)
+
+@test("a named struct pattern naming an unknown field is rejected")
+anz_a_named_pattern_naming_an_unknown_field()
+    if !anz_ready() then return
+
+    anz_only(anz_err(anz_point() + "f(p: Point) -> int = p match\n    Point{z} -> z\n    else 0\n"),
+             "struct 'Point' has no field 'z'", "6:5")
+
+@test("a named struct pattern matching a field twice is rejected")
+anz_a_named_pattern_matching_a_field_twice()
+    if !anz_ready() then return
+
+    anz_only(anz_err(anz_point() + "f(p: Point) -> int = p match\n    Point{x, x} -> x\n    else 0\n"),
+             "field 'x' is matched more than once", "6:5")
+
+@test("a struct pattern for a different type is rejected")
+anz_a_struct_pattern_for_another_type()
+    if !anz_ready() then return
+
+    anz_only(anz_err(anz_point() + "f(p: Point) -> int = p match\n    Other(x, y) -> x\n    else 0\n"),
+             "'Other(…)' does not match a Point value", "6:5")
+
+@test("a refutable struct pattern in a value match still needs an else")
+anz_a_refutable_struct_pattern_needs_an_else()
+    if !anz_ready() then return
+
+    anz_only(anz_err(anz_point() + "var r = Point(1, 2) match\n    Point(0, 0) -> 1\n"),
+             "a 'match' that yields a value must be exhaustive — add an 'else' arm", "5:9")
+
+@test("a qualified nullary pattern on a data variant still says it carries data")
+anz_a_qualified_nullary_pattern_on_a_data_variant()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Shape\n    Circle(radius: int)\n    Empty\n" +
+                     "f(s: Shape) -> int = s match\n    Shape.Circle -> 1\n    else 0\n"),
+             "variant 'Circle' carries data — match it as 'Circle(…)'", "5:5")
+
+// -- methods --------------------------------------------------------------------------------------
+
+@test("a '&self' method rejects a bare stack value")
+anz_a_ref_self_method_rejects_a_stack_value()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct C\n    n: int\n    bump(&self)\n        self.n += 1\nvar c = C(0)\nc.bump()\n"),
+             "'&self' needs a counted reference, and this receiver is a C on the stack — a '&self' " +
+             "method may keep hold of what it is called on, so what it wants is a share of a box " +
+             "rather than an address. Bind the value into one and call it on that: 'var r: &C = …'",
+             "6:3")
+
+@test("a property is read without parentheses")
+anz_a_property_is_read_without_parentheses()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct P\n    x: int\n    twice -> int = self.x * 2\nvar p = P(1)\nprint(p.twice())\n"),
+             "'twice' is a property of 'P' — read it as 'value.twice', without '()'", "5:9")
+
+@test("a method is called with parentheses")
+anz_a_method_is_called_with_parentheses()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct P\n    x: int\n    twice(self) -> int = self.x * 2\nvar p = P(1)\n" +
+                     "print(p.twice)\n"),
+             "'twice' is a method of 'P' — call it with 'twice(…)'", "5:9")
+
+@test("an unknown method is reported against its type")
+anz_an_unknown_method()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct P\n    x: int\nvar p = P(1)\nprint(p.area())\n"),
+             "type 'P' has no method 'area'", "4:9")
+
+@test("an unknown associated function is reported against its type")
+anz_an_unknown_associated_function()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct P\n    x: int\n    id(self) -> int = self.x\nvar p = P.make()\n"),
+             "type 'P' has no associated function 'make'", "4:11")
+
+// A member is filed before its signature is built, so a use reaching it through that window -- above
+// it or below it -- reports the signature and nothing else: the body is not read against a result
+// nobody could name.
+@test("a call to a method whose signature does not resolve reports the signature")
+anz_a_call_to_a_method_whose_signature_failed()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct S\n    n: int\n    inner(*self) -> Nonesuch = Nonesuch()\n" +
+                     "    outer(*self) -> int\n        self.inner()\n        self.n\n" +
+                     "var s = S(0)\nprint(s.outer())\n"),
+             "unknown type 'Nonesuch'", "3:21")
+
+@test("and the same where the call is written above the method")
+anz_a_call_above_a_method_whose_signature_failed()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct S\n    n: int\n    outer(*self) -> int\n        self.inner()\n" +
+                     "        self.n\n    inner(*self) -> Nonesuch = Nonesuch()\n" +
+                     "var s = S(0)\nprint(s.outer())\n"),
+             "unknown type 'Nonesuch'", "6:21")
+
+@test("a read of a property whose signature does not resolve reports the signature")
+anz_a_read_of_a_property_whose_signature_failed()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct P\n    x: int\n    inner -> Nonesuch = Nonesuch()\n" +
+                     "    outer(self) -> int = self.inner\nvar p = P(1)\nprint(p.outer())\n"),
+             "unknown type 'Nonesuch'", "3:14")
+
+@test("and the same where the read is written above the property")
+anz_a_read_above_a_property_whose_signature_failed()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct P\n    x: int\n    outer(self) -> int = self.inner\n" +
+                     "    inner -> Nonesuch = Nonesuch()\nvar p = P(1)\nprint(p.outer())\n"),
+             "unknown type 'Nonesuch'", "4:14")
+
+@test("a call to an associated function whose signature does not resolve reports the signature")
+anz_a_call_to_an_associated_function_whose_signature_failed()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct P\n    x: int\n    outer(self) -> int = P.make()\n" +
+                     "    make() -> Nonesuch = Nonesuch()\nvar p = P(1)\nprint(p.outer())\n"),
+             "unknown type 'Nonesuch'", "4:15")
+
+@test("a member may not share a name with a field")
+anz_a_member_sharing_a_field_name()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct P\n    x: int\n    x(self) -> int = 1\n"),
+             "type 'P' has both a field and a member named 'x'", "3:5")
+
+@test("an associated function whose signature never mentions the parameter cannot be called")
+anz_an_associated_function_with_nothing_to_infer_from()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct Box[T]\n    value: T\n    empty() -> int = 0\nprint(Box.empty())\n"),
+             "cannot infer the type argument 'T' of 'Box.empty' here — annotate the expected type",
+             "4:11")
+
+@test("a method's own type parameter is inferred at the call, and must be")
+anz_a_methods_own_type_parameter()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct Registry\n    n: int\n    store[T](&self) -> int = self.n\n" +
+                     "var r: &Registry = Registry(1)\nprint(r.store())\n"),
+             "cannot infer the type argument 'T' of 'Registry.store' here — annotate the expected " +
+             "type", "5:9")
+
+@test("a member may not reuse a type parameter name the type declares")
+anz_a_member_reusing_the_types_parameter()
+    if !anz_ready() then return
+
+    anz_only(anz_err("struct Box[T]\n    value: T\n    cast[T](self, u: T) -> T = u\n"),
+             "'Box' already declares a type parameter 'T', so member 'cast' cannot declare one of " +
+             "that name", "3:5")
+
+// -- members on enums -----------------------------------------------------------------------------
+
+@test("a member may not share a name with a variant")
+anz_a_member_sharing_a_variant_name()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Color\n    Red\n    Red(self) -> int = 1\n"),
+             "type 'Color' has both a variant and a member named 'Red'", "3:5")
+
+@test("an unknown method on an enum is reported against its type")
+anz_an_unknown_method_on_an_enum()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Color\n    Red\nvar c = Red\nprint(c.area())\n"),
+             "type 'Color' has no method 'area'", "4:9")
+
+@test("an absent name read off an enum value is reported as a property")
+anz_an_absent_name_on_an_enum_value()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Color\n    Red\nvar c = Red\nprint(c.nope)\n"),
+             "'Color' has no property 'nope'", "4:9")
+
+@test("a property on an enum is read without parentheses")
+anz_a_property_on_an_enum()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Color\n    Red\n    code -> int = 1\nvar c = Red\nprint(c.code())\n"),
+             "'code' is a property of 'Color' — read it as 'value.code', without '()'", "5:9")
+
+@test("a method on an enum is called with parentheses")
+anz_a_method_on_an_enum()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Color\n    Red\n    code(self) -> int = 1\nvar c = Red\nprint(c.code)\n"),
+             "'code' is a method of 'Color' — call it with 'code(…)'", "5:9")
+
+@test("a '&self' method on an enum rejects a bare stack value")
+anz_a_ref_self_method_on_an_enum()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Color\n    Red\n    code(&self) -> int = 1\nvar c = Red\nprint(c.code())\n"),
+             "'&self' needs a counted reference, and this receiver is a Color on the stack — a " +
+             "'&self' method may keep hold of what it is called on, so what it wants is a share of a " +
+             "box rather than an address. Bind the value into one and call it on that: " +
+             "'var r: &Color = …'", "5:9")
+
+@test("an instance member reached through the enum name says to use a value")
+anz_an_instance_member_through_the_enum_name()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Color\n    Red\n    code(self) -> int = 1\nprint(Color.code())\n"),
+             "'code' is an instance method of 'Color' — call it on a value, not the type", "4:13")
+    anz_only(anz_err("enum Color\n    Red\n    code(self) -> int = 1\nprint(Color.code)\n"),
+             "'code' is a method of 'Color' — call it on a value, as 'value.code(…)'", "4:13")
+    anz_only(anz_err("enum Color\n    Red\n    code -> int = 1\nprint(Color.code)\n"),
+             "'code' is a property of 'Color' — read it on a value, as 'value.code'", "4:13")
+
+@test("an associated function read off the enum name without parentheses is rejected")
+anz_an_associated_function_without_parentheses()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Color\n    Red\n    make() -> int = 1\nprint(Color.make)\n"),
+             "'make' is an associated function of 'Color' — call it with 'Color.make(…)'", "4:13")
+
+@test("an unknown associated function on an enum is reported against its type")
+anz_an_unknown_associated_function_on_an_enum()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Color\n    Red\n    make() -> int = 1\nprint(Color.bogus())\n"),
+             "enum 'Color' has no variant or associated function 'bogus'", "4:13")
+
+@test("a method's own type parameter is inferred at the call here too")
+anz_a_methods_own_type_parameter_on_an_enum()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Color\n    Red\n    store[T](self) -> int = 1\nvar c = Red\nprint(c.store())\n"),
+             "cannot infer the type argument 'T' of 'Color.store' here — annotate the expected type",
+             "5:9")
+
+@test("an associated function on a generic enum infers the enum's arguments from the call")
+anz_an_associated_function_on_a_generic_enum()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Maybe[T]\n    Just(value: T)\n    make() -> int = 1\nprint(Maybe.make())\n"),
+             "cannot infer the type argument 'T' of 'Maybe.make' here — annotate the expected type",
+             "4:13")
+
+@test("a data enum's method body must still cover every variant")
+anz_a_data_enums_method_body_must_cover_every_variant()
+    if !anz_ready() then return
+
+    anz_only(anz_err("enum Shape\n    Circle(r: int)\n    Empty\n    area(self) -> int = self match\n" +
+                     "        Empty -> 0\n"),
+             "match on 'Shape' is not exhaustive; missing Circle (add an 'else' arm)", "4:25")
+
+// The reference quotes the library's declaration by its bare name ('Option.unwrap_or.int') and this
+// compiler by its qualified one, so what is quoted is the rest of the sentence.
+@test("the library's Option members are checked against the element type")
+anz_the_librarys_option_members_are_checked()
+    if !anz_ready() then return
+
+    val said = anz_err("var a: Option[int] = Some(1)\nprint(a.unwrap_or(\"no\"))\n")
+
+    assert(anz_says(said, "Option.unwrap_or.int' is int, but string was given\n --> "), said)
+    assert(anz_says(said, "main.sysl:2:19"), said)
+    assert_eq(anz_complaints(said), 1, said)
+
+// -- traits on enums ------------------------------------------------------------------------------
+
+@test("an impl for an enum that omits a trait method is rejected")
+anz_an_impl_omitting_a_trait_method()
+    if !anz_ready() then return
+
+    anz_only(anz_err("trait Show\n    show(self) -> int\n    label(self) -> int\nenum Color\n    Red\n" +
+                     "impl Show for Color\n    show(self) -> int = 1\n"),
+             "'Color' does not implement 'Show': method 'label' is missing", "6:1")
+
+@test("an impl method colliding with a variant is rejected")
+anz_an_impl_method_colliding_with_a_variant()
+    if !anz_ready() then return
+
+    anz_only(anz_err("trait Show\n    Red(self) -> int\nenum Color\n    Red\nimpl Show for Color\n" +
+                     "    Red(self) -> int = 1\n"),
+             "type 'Color' has both a variant and a member named 'Red'", "6:5")
+
+@test("implementing a trait for an unknown type says the name is unknown")
+anz_an_impl_for_an_unknown_type()
+    if !anz_ready() then return
+
+    anz_only(anz_err("trait Show\n    show(self) -> int\nimpl Show for Ghost\n    show(self) -> int = 1\n"),
+             "unknown type 'Ghost'", "3:15")
+
+@test("a built-in type may carry an impl, and its methods resolve on a value of it")
+anz_a_builtin_type_may_carry_an_impl()
+    if !anz_ready() then return
+
+    val ir = anz_ir("trait Show\n    show(self) -> string\nimpl Show for int\n" +
+                    "    show(self) -> string = \"i\"\nprint(5.show())\n")
+
+    assert(anz_says(ir, "define { ptr, ptr, i64 } @int.show("), ir)
+
+@test("two spellings of one built-in type are one implementation")
+anz_two_spellings_of_one_builtin_type()
+    if !anz_ready() then return
+
+    anz_only(anz_err("trait Show\n    show(self) -> string\nimpl Show for int\n" +
+                     "    show(self) -> string = \"a\"\nimpl Show for i32\n" +
+                     "    show(self) -> string = \"b\"\nprint(1)\n"),
+             "'int' already implements 'Show'", "5:1")
+
+@test("a type with no values, and one with only one, carry nothing")
+anz_a_type_with_no_values_or_one()
+    if !anz_ready() then return
+
+    val show = "trait Show\n    show(self) -> string\n"
+
+    anz_only(anz_err(show + "impl Show for never\n    show(self) -> string = \"n\"\nprint(1)\n"),
+             "'never' has no values, so nothing can be implemented for it", "3:1")
+    anz_only(anz_err(show + "impl Show for unit\n    show(self) -> string = \"u\"\nprint(1)\n"),
+             "'unit' has one value and no behaviour — a trait for it would say nothing", "3:1")
+
+@test("an enum that does not implement a bound's trait is rejected at the call")
+anz_an_enum_missing_a_bounds_trait()
+    if !anz_ready() then return
+
+    anz_only(anz_err("trait Show\n    show(self) -> int\nenum Color\n    Red\n" +
+                     "render[T: Show](x: T) -> int = x.show()\nprint(render(Red))\n"),
+             "'render' requires its type parameter 'T' to implement 'Show', but Color does not",
+             "6:7")
+
+@test("an unbounded generic may not call a method its parameter does not promise")
+anz_an_unbounded_generic_calling_a_method()
+    if !anz_ready() then return
+
+    anz_only(anz_err("trait Show\n    show(self) -> int\nstruct P\n    v: int\nimpl Show for P\n" +
+                     "    show(self) -> int = self.v\nloose[T](x: T) -> int = x.show()\n" +
+                     "print(loose(P(7)))\n"),
+             "'show' needs 'T: Show'", "7:27")
+
+// -- what a speculative walk costs to take back ----------------------------------------------------
+
+// `n` structs, each with a function over it, a generic function called at one type, and a body
+// whose arguments have to be tried at their positions -- which is what makes the walk speculate.
+private anz_generated(n: int) -> string
+    var b = "module main\n\n"
+
+    for i in 1..n
+        b = b + s"struct P$i\n    a$i: int\n    b$i: string\n\n"
+        b = b + s"sum$i(p: P$i) -> int = p.a$i + p.a$i * 2 - ($i + 1)\n\n"
+        b = b + s"pick$i[T](x: T, y: T, c: bool) -> T = if c then x else y\n\n"
+        b = b + s"job$i(n: int) -> int\n"
+        b = b + s"    var p = P$i(n + $i, \"p$i\")\n"
+        b = b + s"    var m = pick$i(sum$i(p), n * 2, n > $i)\n"
+        b = b + s"    return m + n * 3 - (n / 2) + $i\n\n"
+
+    b = b + "main()\n    var t = 0\n"
+
+    for i in 1..n
+        b = b + s"    t = t + job$i($i)\n"
+
+    b + "    print(t)\n"
+end anz_generated
+
+// The undo entries one whole analysis of that program had to write, beside its line count.
+private anz_rewinding(n: int) -> (long, long)
+    val src = anz_generated(n)
+    val parsed = parse(source_of("gen.sysl", src))
+
+    assert(parsed.ok(), "the generated program did not parse")
+
+    var units: Buf[Program] = buf()
+    val lib = anz_library()
+
+    for i in 0..<lib.len()
+        units.push(lib.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    assert(done.reported.is_empty(), "the generated program was refused")
+
+    var lines: long = 0
+
+    for i in 0..<src.bytes.len
+        if src.bytes[i] == u8('\n') then lines += 1
+
+    (done.an.journal.recorded, lines)
+end anz_rewinding
+
+@test("so twice the program costs about twice the rewinding, rather than four times")
+anz_twice_the_program_costs_twice_the_rewinding()
+    if !anz_ready() then return
+
+    val small = anz_rewinding(60).0
+    val large = anz_rewinding(120).0
+
+    assert(small > 0)
+    assert(real(large) / real(small) < 3.0, s"$small then $large")
+
+@test("and the cost per line of source stays small and flat")
+anz_the_cost_per_line_stays_small()
+    if !anz_ready() then return
+
+    val counted = anz_rewinding(120)
+
+    assert(counted.0 / counted.1 < 25, s"${counted.0} over ${counted.1} lines")
+
+// The tables a trial writes through the log are the reached sets, so they are what is put back.
+@test("an insertion made inside a region is gone again")
+anz_an_insertion_inside_a_region_is_gone()
+    val a = analysis_for(host_target())
+
+    a.uses("a")
+
+    val mark = a.journal.enter()
+
+    a.uses("b")
+    a.journal.rewind(mark)
+    a.journal.leave()
+
+    assert_eq(a.funcs_used().len(), 1)
+    assert_eq(a.funcs_used().at(0), "a")
+    assert(!a.used("b"))
+
+@test("nested regions are taken back one at a time")
+anz_nested_regions_are_taken_back_one_at_a_time()
+    val a = analysis_for(host_target())
+    val outer = a.journal.enter()
+
+    a.uses("a")
+
+    val inner = a.journal.enter()
+
+    a.uses("b")
+    a.journal.rewind(inner)
+    a.journal.leave()
+
+    assert_eq(a.funcs_used().len(), 1)
+    assert_eq(a.funcs_used().at(0), "a")
+
+    a.journal.rewind(outer)
+    a.journal.leave()
+
+    assert(a.funcs_used().is_empty())
+
+@test("so the log does not grow over a build that is not speculating")
+anz_the_log_does_not_grow_outside_a_trial()
+    val a = analysis_for(host_target())
+
+    for i in 1..1000
+        a.uses(s"k$i")
+
+    assert_eq(a.journal.recorded, 0)
+
+@test("and what a region does remember is its own writes, not the table's size")
+anz_a_region_remembers_its_own_writes()
+    val a = analysis_for(host_target())
+
+    for i in 1..1000
+        a.uses(s"k$i")
+
+    val mark = a.journal.enter()
+
+    a.uses("one more")
+    a.journal.rewind(mark)
+    a.journal.leave()
+
+    assert_eq(a.journal.recorded, 1)
