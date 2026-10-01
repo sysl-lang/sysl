@@ -1,0 +1,99 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// `impl X for Self` and a trait member called through a type parameter -- every message and
+// `line:col` here was read out of the reference compiler (0.0.153) on the program the test holds.
+
+private var ist_library_cache: Buf[Program] = buf()
+private var ist_library_read: bool = false
+
+private ist_library() -> Buf[Program]
+    if ist_library_read then return ist_library_cache
+
+    ist_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> ist_library_cache = units
+
+    ist_library_cache
+end ist_library
+
+private ist_ready() -> bool
+    if ist_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+end ist_ready
+
+private ist_err(text: string) -> string
+    val root = make_temp_dir("sysl-impl-self").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ist_err
+
+// The one complaint a program earns: the whole message and the `line:col` it is anchored at.
+private ist_only(said: string, message: string, at: string)
+    val head = s"error: $message\n --> "
+
+    said.index_of(head) match
+        None -> assert(false, said)
+        Some(i) ->
+            val rest = said[i + head.bytes.len..<said.bytes.len]
+            val place = rest.index_of("\n") match
+                Some(n) -> rest[0..<n]
+                None -> rest
+
+            assert(place.ends_with(s"main.sysl:$at"), said)
+
+    var rest = said
+    var n = 0
+
+    loop
+        rest.index_of("main.sysl:") match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + 10..<rest.bytes.len]
+
+    assert_eq(n, 1, said)
+end ist_only
+
+@test("an impl cannot be for Self")
+ist_an_impl_for_self()
+    if !ist_ready() then return
+
+    ist_only(ist_err("trait T\n    m(self) -> int\n\nimpl T for Self\n    m(self) -> int = 1\n"),
+             "'Self' is the type an 'impl' is for, so it cannot also be the type it names", "4:1")
+    ist_only(ist_err("trait T\n    m(self) -> int\n\nimpl[A] T for Self\n    m(self) -> int = 1\n"),
+             "'Self' is the type an 'impl' is for, so it cannot also be the type it names", "4:1")
+
+@test("a method reached through a type parameter says to call it on a value")
+ist_a_method_through_a_type_parameter()
+    if !ist_ready() then return
+
+    ist_only(ist_err("trait T\n    m(self) -> int\n\nf[A: T](x: A) -> int = A.m()\nprint(1)\n"),
+             "'m' is a method of 'T' — call it on a value of 'A', not on the type itself", "4:26")
+
+@test("a property reached through a type parameter says to read it on a value")
+ist_a_property_through_a_type_parameter()
+    if !ist_ready() then return
+
+    ist_only(ist_err("trait T\n    m(self) -> int\n    p -> int\n\nf[A: T](x: A) -> int = A.p\nprint(1)\n"),
+             "'p' is a property of 'T' — read it on a value, as 'value.p'", "5:26")
