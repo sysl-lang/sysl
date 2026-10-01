@@ -1,0 +1,172 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The checked conversions between a simple enum and an integer (`reference/types.md § Enums`): enum
+// to integer is total, `Color(n)` is a checked cast that traps on an undeclared discriminant, and
+// `Color.try(n)` is the fallible constructor answering an `Option`. The `: iN` underlying type is
+// exercised alongside, the conversions being defined in terms of it.
+//
+// **Every string quoted here was read out of the reference compiler**, whose
+// `EnumConversionRunTests` these are. The helpers are `tests_enm_enum_run.sysl`'s.
+
+// Two declared values, a jump to 10, and one more that carries on from it.
+private enm_color() -> string = raw"""
+    enum Color: u8
+        Red
+        Green
+        Blue = 10
+        Yellow
+    """
+
+@test("the integer a checked cast takes may be a transparent subtype, which is its base")
+enm_a_checked_cast_takes_a_transparent_subtype()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_color() + raw"""
+        type Small = int within 0..2
+        var s: Small = 1
+        print(int(Color(s)))
+        """), "1\n")
+
+@test("and the fallible constructor takes one too, sharing the same gate")
+enm_the_fallible_constructor_takes_a_transparent_subtype()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_color() + raw"""
+        type Small = int within 0..2
+        var s: Small = 1
+        Color.try(s) match
+            Some(c) -> print(int(c))
+            None -> print("none")
+        """), "1\n")
+
+@test("while a 'new' derivation is a type of its own, and says so")
+enm_a_new_derivation_is_a_type_of_its_own()
+    if !enm_ready() then return
+
+    val out = enm_err(enm_color() + raw"""
+        type Tag = new int
+        var t = Tag(1)
+        print(int(Color(t)))
+        """)
+
+    assert(enm_says(out, "'Color' converts an integer, but the value has type Tag"), out)
+
+@test("enum to integer is total, each variant yielding its discriminant")
+enm_enum_to_integer_is_total()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_color() + "print(int(Red), int(Green), int(Blue), int(Yellow))\n"), "0 1 10 11\n")
+
+@test("enum to integer honours an explicit discriminant that jumps and then resumes")
+enm_enum_to_integer_honours_a_jump()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_color() + "var y = Yellow\nprint(int(y))\n"), "11\n")
+
+@test("enum converts to a wider integer than its underlying type")
+enm_enum_converts_to_a_wider_integer()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_color() + "var b = Blue\nvar n = int(b)\nprint(n + 5)\n"), "15\n")
+
+@test("a checked cast from a declared discriminant yields that variant")
+enm_a_checked_cast_from_a_declared_discriminant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_color() + "var c = Color(10)\nprint(int(c))\n"), "10\n")
+
+@test("a checked cast round-trips every discriminant, including the boundary auto-value")
+enm_a_checked_cast_round_trips_every_discriminant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_color() + raw"""
+        var vals = [0, 1, 10, 11]
+        var i = 0
+        while i < 4
+            print(int(Color(vals[i])))
+            i++
+        """), "0\n1\n10\n11\n")
+
+@test("a checked cast from an undeclared value traps")
+enm_a_checked_cast_from_an_undeclared_value_traps()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits(enm_color() + "var c = Color(5)\nprint(int(c))\n"), "")
+
+@test("a checked cast from a value past the last discriminant traps")
+enm_a_checked_cast_past_the_last_discriminant_traps()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits(enm_color() + "var c = Color(200)\nprint(int(c))\n"), "")
+
+@test("the fallible constructor returns Some for a declared discriminant")
+enm_the_fallible_constructor_returns_some()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_color() + raw"""
+        Color.try(11) match
+            Some(c) -> print(int(c))
+            None -> print(-1)
+        """), "11\n")
+
+@test("the fallible constructor returns None for an undeclared value")
+enm_the_fallible_constructor_returns_none()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_color() + raw"""
+        Color.try(7) match
+            Some(c) -> print(int(c))
+            None -> print(-1)
+        """), "-1\n")
+
+@test("the fallible constructor discriminates across the whole u8 range")
+enm_the_fallible_constructor_discriminates()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_color() + raw"""
+        decode(n: u8) -> int
+            Color.try(n) match
+                Some(c) -> int(c)
+                None -> -1
+        var i: u8 = 0
+        while i <= 12
+            print(decode(i))
+            i++
+        """), "0\n1\n-1\n-1\n-1\n-1\n-1\n-1\n-1\n-1\n10\n11\n-1\n")
+
+@test("an unannotated simple enum defaults to i32 and still converts both ways")
+enm_an_unannotated_simple_enum_converts_both_ways()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Dir
+            North
+            East
+            South
+            West
+        var d = Dir(2)
+        print(int(d))
+        Dir.try(9) match
+            Some(x) -> print(int(x))
+            None -> print(-1)
+        """), "2\n-1\n")
+
+@test("a signed underlying type carries a negative discriminant through both conversions")
+enm_a_signed_underlying_type_carries_a_negative_discriminant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Trend: i8
+            Down = -1
+            Flat = 0
+            Up = 1
+        print(int(Down))
+        var t = Trend(-1)
+        print(int(t))
+        Trend.try(5) match
+            Some(x) -> print(int(x))
+            None -> print(99)
+        """), "-1\n-1\n99\n")

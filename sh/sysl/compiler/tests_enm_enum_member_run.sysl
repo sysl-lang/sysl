@@ -1,0 +1,460 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Members declared on an `enum` (`reference/types.md § Enums`): methods, properties and associated
+// functions on simple and data enums alike, on generic enums, reached through a trait `impl`, and the
+// library's `Option` and `Result` as the first real users of the whole path.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `EnumMemberRunTests`
+// these are. The helpers are `tests_enm_enum_run.sysl`'s.
+
+// The lines of an LLVM text that open with `prefix`, each cut to the symbol it names.
+private enm_symbols(out: string, prefix: string) -> Buf[string]
+    var got: Buf[string] = buf()
+
+    for line in lines_of(out)
+        if !line.starts_with(prefix) then continue
+
+        val at = line.index_of("@")
+        val open = line.index_of("(")
+
+        if at.is_some() && open.is_some() then got.push(line[at.unwrap()..<open.unwrap()])
+
+    got
+end enm_symbols
+
+@test("a value receiver on a data enum matches on itself")
+enm_a_value_receiver_on_a_data_enum()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Shape
+            Circle(r: int)
+            Square(side: int)
+            area(self) -> int = self match
+                Circle(r) -> 3 * r * r
+                Square(s) -> s * s
+        var c = Circle(2)
+        var q = Square(5)
+        print(c.area(), q.area())
+        """), "12 25\n")
+
+@test("a value receiver on a simple enum reads its discriminant")
+enm_a_value_receiver_on_a_simple_enum()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Color: u8
+            Red = 1
+            Green = 2
+            next(self) -> int = int(self) + 1
+        var g = Green
+        print(Red.next(), g.next())
+        """), "2 3\n")
+
+@test("a pointer receiver replaces a simple enum in place")
+enm_a_pointer_receiver_replaces_a_simple_enum()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Step
+            Zero
+            One
+            advance(*self)
+                *self = One
+            n(self) -> int = self match
+                Zero -> 0
+                One -> 1
+        var s = Zero
+        print(s.n())
+        s.advance()
+        print(s.n())
+        """), "0\n1\n")
+
+@test("a pointer receiver replaces a data enum whose payload owns a string")
+enm_a_pointer_receiver_replaces_a_data_enum()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Box
+            Full(name: string)
+            Empty
+            label(self) -> string = self match
+                Full(n) -> n
+                Empty -> "empty"
+            clear(*self)
+                *self = Empty
+        var b = Full("held")
+        print(b.label())
+        b.clear()
+        print(b.label())
+        """), "held\nempty\n")
+
+@test("a reference receiver reads the shared heap enum")
+enm_a_reference_receiver_reads_the_heap_enum()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Box
+            Full(name: string)
+            Empty
+            peek(&self) -> string = *self match
+                Full(n) -> n
+                Empty -> "none"
+        var h: &Box = Full("heaped")
+        print(h.peek())
+        """), "heaped\n")
+
+@test("a computed property on an enum reads with no parentheses")
+enm_a_computed_property_on_an_enum()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Shape
+            Circle(r: int)
+            Square(side: int)
+            area(self) -> int = self match
+                Circle(r) -> 3 * r * r
+                Square(s) -> s * s
+            doubled -> int = self.area() * 2
+        var c = Circle(2)
+        print(c.doubled)
+        """), "24\n")
+
+@test("an associated function on an enum is called through the type name")
+enm_an_associated_function_on_an_enum()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Shape
+            Circle(r: int)
+            Square(side: int)
+            unit() -> Shape = Square(1)
+            area(self) -> int = self match
+                Circle(r) -> 3 * r * r
+                Square(s) -> s * s
+        print(Shape.unit().area())
+        """), "1\n")
+
+@test("a method on an enum recurses through a value it constructs")
+enm_a_method_on_an_enum_recurses()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Nat
+            Lit(n: int)
+            countdown(self) -> int = self match
+                Lit(n) -> if n <= 0 then 0 else Lit(n - 1).countdown() + n
+        print(Lit(4).countdown())
+        """), "10\n")
+
+@test("a generic enum's method is instantiated from the receiver's type arguments")
+enm_a_generic_enum_method_is_instantiated()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Maybe[T]
+            Just(value: T)
+            Nothing
+            or_else(self, d: T) -> T = self match
+                Just(v) -> v
+                Nothing -> d
+        var a: Maybe[int] = Just(7)
+        var b: Maybe[int] = Nothing
+        var c: Maybe[string] = Just("hi")
+        var d: Maybe[string] = Nothing
+        print(a.or_else(0), b.or_else(-1))
+        print(c.or_else("none"), d.or_else("gone"))
+        """), "7 -1\nhi gone\n")
+
+@test("a property on a generic enum reads with no parentheses")
+enm_a_property_on_a_generic_enum()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Maybe[T]
+            Just(value: T)
+            Nothing
+            tag -> int = self match
+                Just(_) -> 1
+                Nothing -> 0
+        var a: Maybe[real] = Just(1.5)
+        var b: Maybe[real] = Nothing
+        print(a.tag, b.tag)
+        """), "1 0\n")
+
+@test("the same generic enum method is monomorphized once per element type")
+enm_a_generic_enum_method_is_monomorphized_per_type()
+    if !enm_ready() then return
+
+    val out = enm_ir(raw"""
+        enum Maybe[T]
+            Just(value: T)
+            Nothing
+            get(self, d: T) -> T = self match
+                Just(v) -> v
+                Nothing -> d
+        var a: Maybe[int] = Just(1)
+        var b: Maybe[real] = Just(2.5)
+        print(a.get(0), b.get(0.0))
+        """)
+
+    var gets: Buf[string] = buf()
+
+    for name in enm_symbols(out, "define")
+        if name.starts_with("@Maybe.get.") then gets.push(name)
+
+    assert_eq(gets.len, 2, out)
+    assert_eq(gets[0], "@Maybe.get.int")
+    assert_eq(gets[1], "@Maybe.get.real")
+
+@test("an impl for an enum makes its methods inherent")
+enm_an_impl_for_an_enum_makes_its_methods_inherent()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        trait Show
+            show(self) -> int
+        enum Dim
+            Small
+            Large
+        impl Show for Dim
+            show(self) -> int = self match
+                Small -> 1
+                Large -> 100
+        var d = Large
+        print(d.show(), Small.show())
+        """), "100 1\n")
+
+@test("an enum satisfies a trait bound alongside a struct")
+enm_an_enum_satisfies_a_trait_bound()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        trait Show
+            show(self) -> int
+        enum Dim
+            Small
+            Large
+        struct Fixed
+            v: int
+        impl Show for Dim
+            show(self) -> int = self match
+                Small -> 1
+                Large -> 100
+        impl Show for Fixed
+            show(self) -> int = self.v
+        render[T: Show](x: T) -> int = x.show()
+        print(render(Large), render(Fixed(7)))
+        """), "100 7\n")
+
+@test("Option answers whether it holds a value, and falls back when it does not")
+enm_option_answers_and_falls_back()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        half(n: int) -> Option[int]
+            if n % 2 == 0 then Some(n / 2) else None
+        var a = half(10)
+        var b = half(7)
+        print(a.is_some(), a.is_none(), b.is_some(), b.is_none())
+        print(a.unwrap_or(-1), b.unwrap_or(-1))
+        """), "true false false true\n5 -1\n")
+
+@test("Result answers which side it holds, and falls back on the error")
+enm_result_answers_and_falls_back()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        parse(ok: bool) -> Result[int, string]
+            if ok then Ok(9) else Err("bad")
+        var r = parse(true)
+        var e = parse(false)
+        print(r.is_ok(), r.is_err(), e.is_ok(), e.is_err())
+        print(r.unwrap_or(0), e.unwrap_or(0))
+        """), "true false false true\n9 0\n")
+
+@test("the fallible enum constructor's Option is asked the same questions")
+enm_the_fallible_constructors_option()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Color: u8
+            Red = 1
+            Green = 2
+        print(Color.try(2).is_some(), Color.try(9).is_some())
+        """), "true false\n")
+
+@test("a string payload survives unwrap_or on both sides")
+enm_a_string_payload_survives_unwrap_or()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        pick(n: int) -> Option[string]
+            if n > 0 then Some("yes") else None
+        print(pick(1).unwrap_or("fallback"), pick(0).unwrap_or("fallback"))
+        """), "yes fallback\n")
+
+@test("unwrap_or on an Option of references neither leaks nor frees twice")
+enm_unwrap_or_on_an_option_of_references()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Inner
+            v: int
+        grab(seed: int) -> &Inner
+            var o: Option[&Inner] = Some(Inner(seed))
+            o.unwrap_or(Inner(0))
+        var i = 0
+        var total = 0
+        while i < 500000
+            var g = grab(i % 4)
+            total += g.v
+            i++
+        print(total)
+        """), "750000\n")
+
+@test("unwrap_or falling back to a reference neither leaks nor frees twice")
+enm_unwrap_or_falling_back_to_a_reference()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Inner
+            v: int
+        grab(seed: int) -> &Inner
+            var o: Option[&Inner] = None
+            o.unwrap_or(Inner(seed))
+        var i = 0
+        var total = 0
+        while i < 500000
+            var g = grab(i % 4)
+            total += g.v
+            i++
+        print(total)
+        """), "750000\n")
+
+@test("a library member calling another member instantiates it too")
+enm_a_library_member_calling_another_member()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var a: Option[real] = Some(0.5)
+        var b: Option[real] = None
+        print(a.is_none(), b.is_none())
+        """), "false true\n")
+
+@test("Result hands over the error the same way it hands over the value")
+enm_result_hands_over_the_error()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        parse(ok: bool) -> Result[int, string]
+            if ok then Ok(7) else Err("not a number")
+
+        print(parse(false).unwrap_err())
+        print(parse(false).expect_err("a refusal"))
+        """), "not a number\nnot a number\n")
+
+@test("an error payload of a type of its own comes back whole")
+enm_an_error_payload_of_its_own_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Fault
+            Empty
+            TooLong
+
+            describe(self) -> string = self match
+                Empty -> "nothing at all"
+                TooLong -> "too long"
+        end Fault
+
+        check(n: int) -> Result[int, Fault] = if n == 0 then Err(Empty) else Err(TooLong)
+
+        print(check(0).unwrap_err().describe(), check(1).unwrap_err().describe())
+        """), "nothing at all too long\n")
+
+@test("unwrap_err on a value that succeeded stops the program")
+enm_unwrap_err_on_ok_stops_the_program()
+    if !enm_ready() then return
+
+    val out = enm_panic_text(raw"""
+        var r: Result[int, string] = Ok(1)
+        print(r.unwrap_err())
+        """)
+
+    assert(enm_says(out, "unwrap_err of an Ok value"), out)
+
+@test("expect_err says what was expected instead")
+enm_expect_err_says_what_was_expected()
+    if !enm_ready() then return
+
+    val out = enm_panic_text(raw"""
+        var r: Result[int, string] = Ok(1)
+        print(r.expect_err("a refusal"))
+        """)
+
+    assert(enm_says(out, "a refusal"), out)
+
+@test("an error carrying a reference is reached without disturbing its count")
+enm_an_error_carrying_a_reference()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Inner
+            n: int
+
+        var total = 0
+        var i = 0
+
+        while i < 20000
+            var r: Result[int, &Inner] = Err(Inner(i))
+            total += r.unwrap_err().n
+            i += 1
+
+        print(total)
+        """), "199990000\n")
+
+// The reference's own case compiles the library from source and lists what it DEFINES; a program
+// built against the precompiled library declares those same functions instead, so the exact set is
+// read off the `declare` lines, and nothing but `main` is defined.
+@test("an unused library declaration costs nothing in the output")
+enm_an_unused_library_declaration_costs_nothing()
+    if !enm_ready() then return
+
+    val out = enm_ir("print(1)\n")
+    var library: Buf[string] = buf()
+
+    for name in enm_symbols(out, "declare")
+        if name.starts_with("@sysl$") then library.push(name)
+
+    assert_eq(enm_symbols(out, "define").len, 1, out)
+    assert_eq(enm_symbols(out, "define")[0], "@main")
+    assert_eq(library.len, 6, out)
+
+    for want in ["printi", "printc", "putbytes", "encode_utf8", "digits_long", "digits_ulong"]
+        var found = false
+
+        for name in library
+            if name == "@sysl$" + want then found = true
+
+        assert(found, want)
+
+@test("a library member a program calls is emitted")
+enm_a_library_member_a_program_calls_is_emitted()
+    if !enm_ready() then return
+
+    val out = enm_ir(raw"""
+        import sysl.buf.byte_sink
+
+        var g = byte_sink()
+        var w: *Writer = &g
+        display_str("x", w, FormatSpec(0, -1, false))
+        print(g.text().len)
+        """)
+
+    assert(enm_says(out, "@sysl.buf$ByteSink.text("), out)
+    assert(enm_says(out, "@sysl.buf$ByteSink.write("), out)
