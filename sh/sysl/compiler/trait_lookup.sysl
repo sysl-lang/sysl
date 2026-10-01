@@ -266,10 +266,11 @@ end builtin_shape_member
 // A bound as written, resolved: the trait's key, and the arguments with the ones the bound left out
 // taken from the trait's own defaults.
 resolve_bound(a: &Analysis, scope: Scope, span: Span, b: BoundRef, subst: Buf[Binding]) -> Bound
-    val written = resolve_list(a, scope, b.args, subst)
     val key = lookup_trait_key(a, scope, b.name)
 
-    if key.is_none() then return Bound(b.name, written)
+    if key.is_none() then return Bound(b.name, resolve_list(a, scope, b.args, subst))
+
+    val written = trait_args_read(a, scope, span, key.unwrap(), b.args, subst)
 
     // **A bound names a type as much as a parameter's own written type does.** It is checked here
     // and not in `instantiate`, a bound never being instantiated -- a trait in bound position is a
@@ -375,9 +376,19 @@ trait_args_with_defaults(a: &Analysis, scope: Scope, span: Span, key: string, d:
             here.push(Binding(d.tparams.at(j), filled.at(j)))
 
         val w = binding_named(d.tdefaults, d.tparams.at(i))
+        val declared = binding_named(d.tvalues, d.tparams.at(i))
+        val home = scope_of_trait(a, key, scope)
 
         if w.is_none() then filled.push(Unknown)
-        else filled.push(resolve_type(a, scope_of_trait(a, key, scope), w.unwrap(), here))
+        elif declared.is_none() then filled.push(resolve_type(a, home, w.unwrap(), here))
+        else
+            // A value parameter's default is the argument it stands in for, read at the type the
+            // trait declared for it -- so `impl Hash for Sha` and `impl Hash[32] for Sha` agree.
+            val v = default_value(a, home, w.unwrap().span, d.tparams.at(i), w.unwrap(),
+                                  resolve_type(a, home, declared.unwrap(), no_bindings()), here)
+
+            filled.push(if v.is_some() then v.unwrap() else Unknown)
+        end if
 
     a.defaults_filling.truncate(a.defaults_filling.len() - 1)
     filled

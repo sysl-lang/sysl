@@ -860,11 +860,38 @@ private read_type_args_at(a: &Analysis, scope: Scope, span: Span, name: string,
 
     if key.is_none() then return Some(resolve_list(a, scope, args, subst))
 
-    val pair = declared_values(a, key.unwrap())
+    read_args_for(a, scope, span, key.unwrap(), args, subst)
+end read_type_args_at
+
+// A **trait's** arguments as written at a bound or an `impl`, each value argument read at the type
+// the trait wrote for its `const` parameter. An argument refused stands as `Unknown`, so the list
+// keeps the length the arity check is asked about.
+trait_args_read(a: &Analysis, scope: Scope, span: Span, key: string, args: Buf[TypeRef],
+                subst: Buf[Binding]) -> Buf[Type]
+    a.type_arg_depth += 1
+
+    val read = read_args_for(a, scope, span, key, args, subst)
+
+    a.type_arg_depth -= 1
+
+    if read.is_some() then return read.unwrap()
+
+    var out: Buf[Type] = buf()
+
+    for i in 0..<args.len()
+        out.push(Unknown)
+
+    out
+end trait_args_read
+
+// The arguments of the declaration at `key`, a value argument read where it wrote `const`.
+private read_args_for(a: &Analysis, scope: Scope, span: Span, key: string, args: Buf[TypeRef],
+                      subst: Buf[Binding]) -> Option[Buf[Type]]
+    val pair = declared_values(a, key)
 
     if pair.0.is_empty() then return Some(resolve_list(a, scope, args, subst))
 
-    val home = a.tables.types.get(key.unwrap()).unwrap().scope
+    val home = a.tables.types.get(key).unwrap().scope
     var out: Buf[Type] = buf()
 
     for i in 0..<args.len()
@@ -888,7 +915,7 @@ private read_type_args_at(a: &Analysis, scope: Scope, span: Span, name: string,
         end if
 
     Some(out)
-end read_type_args_at
+end read_args_for
 
 // One **value** argument: the expression it was written as, folded to the constant that goes in the
 // type's identity, at the type the declaration wrote for its parameter. An enclosing declaration's
@@ -997,6 +1024,7 @@ private declared_values(a: &Analysis, key: string) -> (Buf[string], Buf[TypeBind
         Some(d) -> d.kind match
             StructOf(sd) -> (sd.tparams, sd.tvalues)
             EnumOf(ed) -> (ed.tparams, ed.tvalues)
+            TraitOf(td) -> (td.tparams, td.tvalues)
             _ -> (buf(), buf())
 
 // A type that takes no arguments, told so where any were written.
