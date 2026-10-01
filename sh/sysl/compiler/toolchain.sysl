@@ -1,8 +1,8 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.process.{capture, run, Status}
-import sysl.fs.{remove_file, write_text, is_file, is_dir, entries}
+import sysl.process.{capture, run, Output, Status}
+import sysl.fs.{IoError, remove_file, write_text, is_file, is_dir, entries}
 import sysl.text.{join, split, repeat, Search}
 import sysl.env.{get as env_var}
 
@@ -684,24 +684,38 @@ forget_last_link()
 // honestly at the link rather than silently produce a host binary.
 build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: Target,
              level: string, links: Buf[string], probed: PkgAnswer) -> Result[unit, string]
+    // **Several codegen units where the text is large enough** (`codegen_units.sysl`): the partitions
+    // are compiled at once and their objects take the text's place on the link line. One unit is the
+    // text handed to the link as it always was.
+    val units = codegen_units(ir.len, target)
+
+    if units > 1
+        split_module(ir, units) match
+            Some(parts) ->
+                val made = compile_units(cc, parts, exe, target, level, false)?
+                var rest: Buf[string] = buf()
+
+                for i in 1..<made.len()
+                    rest.push(made.at(i))
+
+                for i in 0..<objects.len()
+                    rest.push(objects.at(i))
+
+                val said = link_objects(cc, made.at(0), rest, exe, target, level, links, probed)
+
+                for i in 0..<made.len()
+                    remove_file(made.at(i)).unwrap_or(())
+
+                return said
+            None -> ()
+
     val ll = s"$exe.ll"
 
     write_text(ll, ir) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 
-    val command = link_command(cc, ll, objects, exe, target, level, links, probed)
-
-    linked_with = join(command.view(), " ")
-
-    if verbose() then eprints(s"sysl: link: $linked_with\n")
-
-    var args: Buf[string] = buf()
-
-    for i in 1..<command.len()
-        args.push(command.at(i))
-
-    val said = as_tool(told(command.at(0), args), command.at(0))
+    val said = link_objects(cc, ll, objects, exe, target, level, links, probed)
 
     // **The text is left behind where clang refused it**, and only there -- `compile_object` does the
     // same and for the same reason. A back end that rejects generated IR is reporting a defect in the
@@ -714,12 +728,66 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
     said
 end build_native
 
+// The link command run over `first` (the text, or the first unit's object) and `objects`.
+private link_objects(cc: string, first: string, objects: Buf[string], exe: string, target: Target,
+                     level: string, links: Buf[string], probed: PkgAnswer) -> Result[unit, string]
+    val command = link_command(cc, first, objects, exe, target, level, links, probed)
+
+    linked_with = join(command.view(), " ")
+
+    if verbose() then eprints(s"sysl: link: $linked_with\n")
+
+    var args: Buf[string] = buf()
+
+    for i in 1..<command.len()
+        args.push(command.at(i))
+
+    as_tool(told(command.at(0), args), command.at(0))
+end link_objects
+
+// What clang is told to turn one codegen unit's text into an object: everything the link command
+// says about compiling the text -- the triple, the level, `SYSL_EXTRA_CFLAGS`, the machine -- and
+// nothing about linking. The file and the output are the caller's.
+//
+// `sections` adds `compile_object`'s sectioning flags, for an object that goes into an archive.
+ir_object_args(target: Target, level: string, sections: bool) -> Buf[string]
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${target.triple}")
+    args.push("-Wno-override-module")
+    args.push("-c")
+    args.push("-x")
+    args.push("ir")
+    args.push(level_flag(level))
+
+    if sections
+        args.push("-ffunction-sections")
+        args.push("-fdata-sections")
+
+    val extra = extra_cflags()
+
+    for i in 0..<extra.len()
+        args.push(extra.at(i))
+
+    val machine = machine_flags(target)
+
+    for i in 0..<machine.len()
+        args.push(machine.at(i))
+
+    args
+end ir_object_args
+
 // Runs one command, and answers with how it ended and what it said where it failed. The child's own
 // error stream is collected rather than let through, so a tool reporting the failure has the reason
 // to report; the exit status travels beside it because a tool that failed without saying anything
 // leaves the status the only thing there is to go on.
-told(program: string, args: Buf[string]) -> Result[unit, ToolFault]
-    capture(program, args.view(), "", [], true) match
+told(program: string, args: Buf[string]) -> Result[unit, ToolFault] =
+    told_by(program, capture(program, args.view(), "", [], true))
+
+// What one run of `program` came to, read the way `told` reads it: a run that could not start, or
+// one that exited other than cleanly, with what it wrote to its error stream.
+told_by(program: string, ran: Result[Output, IoError]) -> Result[unit, ToolFault]
+    ran match
         Err(_) -> Err(ToolFault(-1, s"cannot run '$program'", true))
         Ok(out) ->
             if out.status.ok() then return Ok(())
@@ -729,7 +797,7 @@ told(program: string, args: Buf[string]) -> Result[unit, ToolFault]
                 None -> ""
 
             Err(ToolFault(exit_code(out.status), said.trim(), false))
-end told
+end told_by
 
 // How a tool step failed: the status it exited with and its error stream, trimmed -- or, where
 // `unrun`, the refusal to start it, which is the whole message.

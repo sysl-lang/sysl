@@ -1,0 +1,759 @@
+module sh.sysl.compiler
+@include("unistd.h")
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.env.{get as env_var}
+import sysl.fs.{IoError, remove_file, write_text}
+import sysl.process.{start, Child}
+import sysl.text.{str_builder, StrBuilder, Search}
+
+// **A program's LLVM text compiled as several modules at once** -- codegen units, as rustc has them.
+//
+// Emission produces one module, and clang turning one module into one object is single-threaded: on
+// a large program it is the largest single cost of a build, spent on one core of many. Here the
+// module is cut into `n` partitions after emission, each is compiled by its own clang concurrently,
+// and the objects are linked where the one text used to be. **`emit-llvm` is untouched**: it still
+// prints the whole program as one module, so everything that compares emitted text compares what it
+// always did, and the cut is a fact about how a build hands that text to the back end.
+//
+// ==What goes where==
+//
+// Every function or global with **external linkage** is placed by a hash of its name, which is what
+// keeps a partition's contents stable when one function is edited: the edited function's partition
+// changes and the others do not. Everything local (`private`, `internal`) follows its users:
+//
+//   - a **small local function** -- the ARC runtime's blocks, a closure body, a helper -- is copied
+//     into every partition that calls it. It stays local in each, so each copy can still be inlined,
+//     which is the one thing a call across partitions cannot be.
+//   - **anything else local** -- a global of any kind (a string, a vtable, a thread-local), or a
+//     large function -- lives in the first partition found to use it, and where a second partition
+//     uses it too it is given **hidden** linkage under a name no sysl or C symbol can spell
+//     (`sysl.cgu:` in front; a colon is in no mangled name and no C identifier). Hidden is visible
+//     across the objects of one link and to nothing after it: an executable exports nothing it did
+//     not export before, and an archive's objects are merged into one first.
+//
+// A partition is then its own definitions, a declaration of everything else it names, and every
+// type definition and module-level line of the whole text.
+//
+// ==When it does not happen==
+//
+// One unit is exactly the build that there always was -- the text goes to the link command as it
+// stands. It is one unit for a program below `MinSplitBytes` of text (where spawning clangs costs
+// more than it saves), for a target that is not this machine (whose linker and object format this
+// has not been proven against), for a module holding something whose meaning depends on being in one
+// module (`module asm`, an alias, a comdat, an `appending` global), and wherever
+// `SYSL_CODEGEN_UNITS=1` says so.
+
+// The most units a build makes of its own accord. Past it, a machine's efficiency cores are handed
+// work at a fraction of the speed of the performance ones, and each unit repeats the type table and
+// the copied helpers: on an 18-thread machine `syslui-demo` built in ~2.1 s at 8 units and ~2.5 s at
+// 12.
+private const DefaultMaxUnits: int = 8
+
+// The most any override may ask for: one clang, and one thread waiting on it, per unit.
+private const MaxUnits: int = 64
+
+// Text below this compiles in one clang about as fast as it is cut, compiled in several, and linked.
+// Measured: `box2d-demo`'s 715 KB saves ~0.15 s of its ~1.65 s warm build in 4 to 8 units, and
+// `syslui-demo`'s 4.4 MB saves ~1.9 s of ~4 s in 8.
+private const MinSplitBytes: usize = 524288
+
+// Each unit gets at least this much text, so a program just past the threshold makes fewer units.
+private const MinUnitBytes: usize = 65536
+
+// A local function at most this long is copied into every partition that calls it.
+private const CopyLimit: usize = 2048
+
+// What a promoted local is renamed to, in front of its own name.
+private const Promoted: string = "sysl.cgu:"
+
+// How many units `text` is compiled as for `t`. `SYSL_CODEGEN_UNITS=<n>` decides where it is set to a
+// number from 1 up; otherwise the machine's processors, capped, and no more than the text divides
+// into `MinUnitBytes` pieces.
+codegen_units(size: usize, t: Target) -> int
+    if t.triple != host_target().triple then return 1
+
+    val asked = env_var("SYSL_CODEGEN_UNITS").unwrap_or("")
+
+    if asked != ""
+        val n = parse_count(asked)
+
+        if n >= 1 then return if n > MaxUnits then MaxUnits else n
+
+    if size < MinSplitBytes then return 1
+
+    val cpus = int(cpu_count())
+    val by_size = int(size / MinUnitBytes)
+    var n = if cpus < DefaultMaxUnits then cpus else DefaultMaxUnits
+
+    if by_size < n then n = by_size
+    if n < 1 then 1 else n
+end codegen_units
+
+// A decimal count, or 0 where the text is not one.
+private parse_count(text: string) -> int
+    var n = 0
+
+    for b in text.bytes
+        if b < u8('0') || b > u8('9') then return 0
+        if n > 100000 then return 0
+
+        n = n * 10 + int(b - u8('0'))
+
+    n
+end parse_count
+
+// --- reading the module ------------------------------------------------------------------------
+
+// What a top-level piece of the module text is.
+private enum Piece
+    PieceLine        // a type, the triple, an attribute group: every partition carries it
+    PieceDefine      // a function definition, from `define` to its closing brace
+    PieceDeclare     // a function declaration
+    PieceGlobal      // a global variable or constant
+
+private struct Entity
+    piece: Piece
+    start: usize
+    end: usize        // past the entity's last newline
+    name: string      // the symbol as written after '@', quotes included
+    local: bool       // private or internal
+
+// The module cut into its top-level pieces, with what each one names -- the whole of what the
+// partitioning reads.
+private struct Module
+    text: string
+    items: Buf[Entity]
+    ref_start: Buf[usize]     // item i names refs[ref_start[i] ..< ref_start[i + 1]]
+    refs: Buf[usize]
+
+// The module's pieces, or nothing where it holds something that has to stay in one module.
+private read_module(text: string) -> Option[Module]
+    val b = text.bytes
+    var items: Buf[Entity] = buf()
+    var at: usize = 0
+
+    while at < b.len
+        val eol = line_end(b, at)
+        val line = text[at..<eol]
+        val next = if eol < b.len then eol + 1 else eol
+
+        if line.starts_with("define ")
+            var close = next
+
+            loop
+                if close >= b.len then return None
+
+                val e = line_end(b, close)
+
+                if e - close == 1 && b[close] == u8('}')
+                    close = if e < b.len then e + 1 else e
+                    break
+
+                close = if e < b.len then e + 1 else e
+
+            items.push(Entity(PieceDefine, at, close, symbol_after(line, "@"), is_local_define(line)))
+            at = close
+        elif line.starts_with("declare ")
+            items.push(Entity(PieceDeclare, at, next, symbol_after(line, "@"), false))
+            at = next
+        elif line.starts_with("@")
+            if !plain_global(line) then return None
+
+            items.push(Entity(PieceGlobal, at, next, symbol_after(line, ""), is_local_global(line)))
+            at = next
+        elif line.starts_with("module asm") || line.starts_with("$")
+            return None
+        else
+            items.push(Entity(PieceLine, at, next, "", false))
+            at = next
+
+    var named: Map[string, usize] = map()
+
+    for i in 0..<items.len()
+        val e = items.at(i)
+
+        if e.piece != PieceLine then named.put(e.name, i)
+
+    var ref_start: Buf[usize] = buf()
+    var refs: Buf[usize] = buf()
+
+    for i in 0..<items.len()
+        ref_start.push(refs.len())
+
+        val e = items.at(i)
+
+        if e.piece == PieceDefine || e.piece == PieceGlobal
+            // A global's own name is on its line too, and is not a use of itself.
+            val from = if e.piece == PieceGlobal then e.start + 1 + e.name.len else e.start
+            scan_symbols(b, from, e.end, &named, i, &refs)
+
+    ref_start.push(refs.len())
+    Some(Module(text, items, ref_start, refs))
+end read_module
+
+private line_end(b: []const u8, from: usize) -> usize
+    var i = from
+
+    while i < b.len && b[i] != u8('\n')
+        i += 1
+
+    i
+end line_end
+
+// The symbol a line names first after `marker`: `@name` or `@"quoted name"`, returned as written
+// after the '@'. An empty marker reads from the line's first byte, which is the '@'.
+private symbol_after(line: string, marker: string) -> string
+    val b = line.bytes
+    var i: usize = 0
+
+    if marker != ""
+        while i < b.len && b[i] != u8('@')
+            i += 1
+
+    if i >= b.len then return ""
+
+    i += 1
+    line[i..<symbol_end(b, i)]
+end symbol_after
+
+// Where a symbol starting at `i` (just past its '@') ends.
+private symbol_end(b: []const u8, i: usize) -> usize
+    var j = i
+
+    if j < b.len && b[j] == u8('"')
+        j += 1
+
+        while j < b.len && b[j] != u8('"')
+            j += 1
+
+        return if j < b.len then j + 1 else j
+
+    while j < b.len && ident_byte(b[j])
+        j += 1
+
+    j
+end symbol_end
+
+private ident_byte(c: u8) -> bool =
+    (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || (c >= u8('0') && c <= u8('9')) ||
+    c == u8('.') || c == u8('_') || c == u8('$') || c == u8('-')
+
+private is_local_define(line: string) -> bool =
+    line.starts_with("define private ") || line.starts_with("define internal ")
+
+private is_local_global(line: string) -> bool
+    val after = global_rest(line)
+
+    after.starts_with("private ") || after.starts_with("internal ")
+end is_local_global
+
+// What follows `@name = ` on a global's line.
+private global_rest(line: string) -> string
+    val b = line.bytes
+    val e = symbol_end(b, 1)
+
+    if e + 3 > b.len then return ""
+
+    line[e + 3..]
+end global_rest
+
+// A global this can move between modules: not an alias, an ifunc, a comdat member or an `appending`
+// array, each of which means something only in the module it was written in.
+//
+// What decides is the words in front of `global` or `constant` -- never the rest of the line, where an
+// initializer may be a string saying anything. A comdat is also a top-level `$name = comdat` line,
+// which `read_module` refuses on its own.
+private plain_global(line: string) -> bool
+    val b = line.bytes
+    var at = symbol_end(b, 1) + 3
+
+    while at < b.len
+        val stop = word_stop(b, at)
+        val word = line[at..<stop]
+
+        if word == "global" || word == "constant" then return true
+        if word == "alias" || word == "ifunc" || word == "appending" then return false
+
+        at = stop + 1
+
+    false
+end plain_global
+
+// Every `@symbol` between `from` and `to`, outside a string, recorded as an index where it names one
+// of the module's pieces other than `me`.
+private scan_symbols(b: []const u8, from: usize, to: usize, named: *Map[string, usize], me: usize,
+                     out: *Buf[usize])
+    var i = from
+
+    while i < to
+        val c = b[i]
+
+        if c == u8('"')
+            i = skip_quoted(b, i, to)
+        elif c == u8('%') && i + 1 < to && b[i + 1] == u8('"')
+            i = skip_quoted(b, i + 1, to)
+        elif c == u8(';')
+            while i < to && b[i] != u8('\n')
+                i += 1
+        elif c == u8('@')
+            val e = symbol_end(b, i + 1)
+
+            if e > i + 1
+                named.get(str_cast(b[i + 1..<e])) match
+                    Some(k) -> if k != me then out.push(k)
+                    None -> ()
+
+            i = e
+        else
+            i += 1
+end scan_symbols
+
+// Past the string whose opening quote is at `i`. LLVM escapes a quote inside one as `\22`, so the
+// next quote is the closing one.
+private skip_quoted(b: []const u8, i: usize, to: usize) -> usize
+    var j = i + 1
+
+    while j < to && b[j] != u8('"')
+        j += 1
+
+    if j < to then j + 1 else j
+end skip_quoted
+
+// --- partitioning ------------------------------------------------------------------------------
+
+// `text` cut into `n` modules, or nothing where it cannot be (see above) or where fewer than two of
+// them would hold a definition.
+split_module(text: string, n: int) -> Option[Buf[string]]
+    if n < 2 then return None
+
+    val m = read_module(text) match
+        Some(found) -> found
+        None -> return None
+
+    val count = m.items.len()
+    val units = usize(n)
+
+    // `member[p * count + e]`: item e is defined in partition p. `needed`: p names it and it is
+    // defined elsewhere, so p declares it.
+    var member: Buf[bool] = buf()
+    var needed: Buf[bool] = buf()
+
+    for i in 0..<units * count
+        member.push(false)
+        needed.push(false)
+
+    var home: Buf[int] = buf()
+    var promoted: Buf[bool] = buf()
+
+    for i in 0..<count
+        home.push(-1)
+        promoted.push(false)
+
+    // (partition, item) pairs still to be read for what they name.
+    var work: Buf[(usize, usize)] = buf()
+
+    for i in 0..<count
+        val e = m.items.at(i)
+
+        if (e.piece == PieceDefine || e.piece == PieceGlobal) && !e.local
+            val p = usize(name_hash(e.name) % u64(units))
+
+            home.set(i, int(p))
+            member.set(p * count + i, true)
+            work.push((p, i))
+
+    var placed: Buf[bool] = buf()
+
+    for p in 0..<units
+        placed.push(false)
+
+    var next: usize = 0
+    var swept = false
+
+    loop
+        while next < work.len()
+            val (p, e) = work.at(next)
+            next += 1
+            placed.set(p, true)
+
+            for k in m.ref_start.at(e)..<m.ref_start.at(e + 1)
+                val r = m.refs.at(k)
+                val it = m.items.at(r)
+
+                if member.at(p * count + r) then continue
+
+                if it.piece == PieceDeclare || !it.local
+                    needed.set(p * count + r, true)
+                elif it.piece == PieceDefine && it.end - it.start <= CopyLimit
+                    member.set(p * count + r, true)
+                    work.push((p, r))
+                elif home.at(r) < 0
+                    home.set(r, int(p))
+                    member.set(p * count + r, true)
+                    work.push((p, r))
+                else
+                    needed.set(p * count + r, true)
+                    promoted.set(r, true)
+
+        if swept then break
+
+        // What nothing reached -- a local nothing names -- is kept, in the first partition.
+        for i in 0..<count
+            val e = m.items.at(i)
+
+            if e.piece != PieceDefine && e.piece != PieceGlobal then continue
+
+            var anywhere = false
+
+            for p in 0..<units
+                if member.at(p * count + i) then anywhere = true
+
+            if !anywhere
+                home.set(i, 0)
+                member.set(i, true)
+                work.push((0, i))
+
+        swept = true
+
+    var used = 0
+
+    for p in 0..<units
+        if placed.at(p) then used += 1
+
+    if used < 2 then return None
+
+    var out: Buf[string] = buf()
+
+    for p in 0..<units
+        if placed.at(p) then out.push(render(m, p, count, &member, &needed, &promoted))
+
+    Some(out)
+end split_module
+
+private name_hash(name: string) -> u64
+    var h: u64 = 0xcbf29ce484222325
+
+    for c in name.bytes
+        h = (h ^ u64(c)) * 0x100000001b3
+
+    h ^ (h >> 29)
+end name_hash
+
+// One partition's text: every module-level line, its own definitions, and a declaration of
+// everything it names from elsewhere, in the order the whole text had them.
+private render(m: Module, p: usize, count: usize, member: *Buf[bool], needed: *Buf[bool],
+               promoted: *Buf[bool]) -> string
+    var out = str_builder()
+
+    for i in 0..<count
+        val e = m.items.at(i)
+
+        if e.piece == PieceLine
+            out.push(m.text[e.start..<e.end])
+        elif member.at(p * count + i)
+            copy_renamed(m, i, promoted, &out)
+        elif needed.at(p * count + i)
+            e.piece match
+                PieceDeclare -> out.push(m.text[e.start..<e.end])
+                PieceDefine -> out.push(declaration_of(m.text[e.start..<line_end(m.text.bytes, e.start)],
+                                                       e, promoted.at(i)))
+                PieceGlobal -> out.push(external_global(m.text[e.start..<e.end], e, promoted.at(i)))
+                PieceLine -> ()
+
+    out.finish()
+end render
+
+// A promoted symbol's name as every partition spells it.
+private spelled(name: string) -> string =
+    if name.starts_with("\"") then s"\"$Promoted${name[1..]}" else s"\"$Promoted$name\""
+
+// Item `i`'s text with every promoted symbol renamed, and its own linkage made hidden where it is one.
+private copy_renamed(m: Module, i: usize, promoted: *Buf[bool], out: *StrBuilder)
+    val e = m.items.at(i)
+    var touches = promoted.at(i)
+
+    for k in m.ref_start.at(i)..<m.ref_start.at(i + 1)
+        if promoted.at(m.refs.at(k)) then touches = true
+
+    if !touches
+        out.push(m.text[e.start..<e.end])
+        return
+
+    val b = m.text.bytes
+    var i2 = e.start
+    var from = e.start
+
+    // Its own definition: `define private` / `@x = internal` become hidden.
+    if promoted.at(i)
+        if e.piece == PieceDefine
+            val head: usize = if m.text[e.start..].starts_with("define private ") then 15 else 16
+
+            out.push("define hidden ")
+            from = e.start + head
+            i2 = from
+        else
+            val nameEnd = symbol_end(b, e.start + 1)
+            val rest = m.text[nameEnd + 3..]
+            val word: usize = if rest.starts_with("private ") then 8 else 9
+
+            out.push(s"@${spelled(e.name)} = hidden ")
+            from = nameEnd + 3 + word
+            i2 = from
+
+    while i2 < e.end
+        val c = b[i2]
+
+        if c == u8('"')
+            i2 = skip_quoted(b, i2, e.end)
+        elif c == u8('%') && i2 + 1 < e.end && b[i2 + 1] == u8('"')
+            i2 = skip_quoted(b, i2 + 1, e.end)
+        elif c == u8('@')
+            val end = symbol_end(b, i2 + 1)
+            val name = m.text[i2 + 1..<end]
+
+            if is_promoted(m, i, name, promoted)
+                out.push(m.text[from..<i2])
+                out.push(s"@${spelled(name)}")
+                from = end
+
+            i2 = end
+        else
+            i2 += 1
+
+    out.push(m.text[from..<e.end])
+end copy_renamed
+
+// Whether `name`, met inside item `i`, is one of the symbols `i` names that was promoted.
+private is_promoted(m: Module, i: usize, name: string, promoted: *Buf[bool]) -> bool
+    if promoted.at(i) && m.items.at(i).name == name then return true
+
+    for k in m.ref_start.at(i)..<m.ref_start.at(i + 1)
+        val r = m.refs.at(k)
+
+        if promoted.at(r) && m.items.at(r).name == name then return true
+
+    false
+end is_promoted
+
+// A function defined elsewhere, declared from its definition's first line: the linkage dropped,
+// hidden where it was promoted, and the body's opening brace gone.
+private declaration_of(head: string, e: Entity, hidden: bool) -> string
+    val b = head.bytes
+    var from: usize = 7
+
+    if head.starts_with("define private ") then from = 15
+    if head.starts_with("define internal ") then from = 16
+
+    var at = from
+
+    while at < b.len && b[at] != u8('@')
+        at += 1
+
+    val name_end = symbol_end(b, at + 1)
+    var tail = head[name_end..].trim_end()
+
+    if tail.ends_with("{") then tail = tail[0..<tail.len - 1].trim_end()
+
+    val name = if hidden then s"@${spelled(e.name)}" else s"@${e.name}"
+    val vis = if hidden then "hidden " else ""
+
+    s"declare $vis${head[from..<at]}$name$tail\n"
+end declaration_of
+
+// A global defined elsewhere, as an external declaration of the same type.
+private external_global(line: string, e: Entity, hidden: bool) -> string
+    val b = line.bytes
+    var at = symbol_end(b, 1) + 3
+    var tls = ""
+    var kind = ""
+
+    loop
+        if at >= b.len then return ""
+
+        val word_end = word_stop(b, at)
+        val word = line[at..<word_end]
+
+        at = word_end + 1
+
+        if word == "global" || word == "constant"
+            kind = word
+            break
+
+        if word.starts_with("thread_local") then tls = s"$word "
+
+    val ty_end = type_end(b, at)
+    val name = if hidden then spelled(e.name) else e.name
+    val vis = if hidden then "hidden " else ""
+
+    s"@$name = external $vis$tls$kind ${line[at..<ty_end]}\n"
+end external_global
+
+private word_stop(b: []const u8, from: usize) -> usize
+    var i = from
+    var depth = 0
+
+    while i < b.len
+        val c = b[i]
+
+        if c == u8('(') then depth += 1
+        if c == u8(')') then depth -= 1
+        if c == u8(' ') && depth == 0 then return i
+
+        i += 1
+
+    i
+end word_stop
+
+// Where the type starting at `from` ends: a bracketed aggregate, a named type, or one word.
+private type_end(b: []const u8, from: usize) -> usize
+    if from >= b.len then return from
+
+    val c = b[from]
+
+    if c == u8('{') || c == u8('[') || c == u8('<')
+        var depth = 0
+        var i = from
+
+        while i < b.len
+            val d = b[i]
+
+            if d == u8('{') || d == u8('[') || d == u8('<') || d == u8('(') then depth += 1
+
+            if d == u8('}') || d == u8(']') || d == u8('>') || d == u8(')')
+                depth -= 1
+
+                if depth == 0 then return i + 1
+
+            i += 1
+
+        return i
+
+    if c == u8('%') && from + 1 < b.len && b[from + 1] == u8('"') then return skip_quoted(b, from + 1, b.len)
+
+    var i = from
+
+    while i < b.len && b[i] != u8(' ') && b[i] != u8(',')
+        i += 1
+
+    i
+end type_end
+
+// --- compiling the units at once ---------------------------------------------------------------
+
+// Compiles each of `parts` into an object beside `base`, as many at once as there are parts, and
+// answers the objects in order. An object whose text was compiled before is taken from the cache.
+// Every clang started is waited for before anything is reported, and where one failed, the first
+// such unit in order is reported with what its clang said.
+compile_units(cc: string, parts: Buf[string], base: string, target: Target,
+              level: string, sections: bool) -> Result[Buf[string], string]
+    val args = ir_object_args(target, level, sections)
+    var objects: Buf[string] = buf()
+    var keys: Buf[string] = buf()
+    var todo: Buf[usize] = buf()
+    var children: Buf[Result[&Child, IoError]] = buf()
+
+    for i in 0..<parts.len()
+        val obj = s"$base.cgu$i.o"
+
+        objects.push(obj)
+
+        val key = unit_object_key(cc, parts.at(i), args)
+
+        keys.push(key)
+
+        if key != "" && unit_object_reused(key, obj) then continue
+
+        val ll = s"$obj.ll"
+
+        write_text(ll, parts.at(i)) match
+            Err(_) -> return Err(s"cannot write $ll")
+            Ok(_) -> ()
+
+        var line: Buf[string] = buf()
+
+        for j in 0..<args.len()
+            line.push(args.at(j))
+
+        line.push(ll)
+        line.push("-o")
+        line.push(obj)
+
+        todo.push(i)
+        children.push(start(cc, line.view(), stderr = true))
+
+    var failure = ""
+
+    for j in 0..<todo.len()
+        val ran = children.at(j) match
+            Ok(child) -> child.wait()
+            Err(e) -> Err(e)
+
+        if failure != "" then continue
+
+        told_by(cc, ran) match
+            Ok(_) -> ()
+            Err(f) -> failure = if f.unrun then f.said else tool_failed(cc, f.code, f.said)
+
+    if failure != "" then return Err(failure)
+
+    for j in 0..<todo.len()
+        val i = todo.at(j)
+        val obj = objects.at(i)
+
+        remove_file(s"$obj.ll").unwrap_or(())
+        unit_compiled()
+
+        if keys.at(i) != "" then unit_object_kept(keys.at(i), obj)
+
+    Ok(objects)
+end compile_units
+
+// A module's text compiled into the one object `obj`, the way `compile_object` compiles it -- in
+// several units where there are to be several, merged by a relocatable link into one object again.
+//
+// **The merge is what keeps an archive's symbols what they were.** A promoted local is hidden, and
+// hidden is a fact about the final link: inside a relocatable object it is still a global symbol, so
+// an archive of the units would list every promoted name among what it defines. Mach-O's `-r` turns
+// a hidden symbol into a local one, and the archive holds one object defining what it always
+// defined. **ELF's does not** -- `ld.lld -r` and GNU `ld -r` both keep it GLOBAL HIDDEN, which a
+// static link still resolves against, so two archives promoting one name would collide at the C
+// project's link. Localizing it takes an `objcopy` no build here otherwise needs, so everywhere but
+// Mach-O an archive is compiled as one unit, as it always was.
+compile_object_in_units(cc: string, ir: string, obj: string, target: Target,
+                        level: string) -> Result[unit, string]
+    val units = if merge_localizes_hidden(target) then codegen_units(ir.len, target) else 1
+
+    if units < 2 then return compile_object(cc, ir, obj, target, level)
+
+    val parts = split_module(ir, units) match
+        Some(p) -> p
+        None -> return compile_object(cc, ir, obj, target, level)
+
+    val made = compile_units(cc, parts, obj, target, level, true)?
+    var args: Buf[string] = buf()
+
+    args.push(s"--target=${target.triple}")
+    args.push("-nostdlib")
+    args.push("-r")
+
+    for i in 0..<made.len()
+        args.push(made.at(i))
+
+    args.push("-o")
+    args.push(obj)
+
+    val said = told(cc, args)
+
+    for i in 0..<made.len()
+        remove_file(made.at(i)).unwrap_or(())
+
+    said match
+        Ok(_) -> Ok(())
+        Err(f) -> Err(if f.unrun then f.said else tool_failed(cc, f.code, f.said))
+end compile_object_in_units
+
+// Whether a relocatable link for `t` turns a hidden symbol into a local one: Mach-O's does, ELF's,
+// COFF's and WebAssembly's do not.
+merge_localizes_hidden(t: Target) -> bool = t.os == MacOS
