@@ -1,0 +1,801 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The atomic tier (`library/sync.md`, `Atomics`), asked three questions that need three kinds of
+// test. What instruction comes out is a claim about the *text*, because an ordering is a keyword and
+// a keyword that came out wrong still runs. What the operations compute is a claim about a running
+// program. And what is refused is most of the surface: the raw tier states its ordering at every
+// call and reaches only what the machine has an instruction for, so nearly every way of writing one
+// wrong has a complaint of its own.
+//
+// **Every instruction and every message quoted here was read out of the reference compiler**, whose
+// `AtomicTests` these are.
+
+private var atm_library_cache: Buf[Program] = buf()
+private var atm_library_read: bool = false
+
+private atm_library() -> Buf[Program]
+    if atm_library_read then return atm_library_cache
+
+    atm_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> atm_library_cache = units
+
+    atm_library_cache
+end atm_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private atm_ready() -> bool
+    if atm_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end atm_ready
+
+// A word to operate on, and its address -- what most of these start from.
+private atm_cell() -> string = "import sysl.sync.*\n\nvar n: i64 = 0\nvar p = &n\n"
+
+private atm_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// Lays out a program in a fresh directory: the beginning, and a module beside it where one is given.
+private atm_lay(main_text: string, module_file: string, module_text: string) -> string
+    val root = make_temp_dir("sysl-atomic").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+
+    if module_file != ""
+        make_dir_all(s"$root/spin").unwrap()
+        write_text(s"$root/spin/$module_file", module_text).unwrap()
+    end if
+
+    root
+end atm_lay
+
+// The LLVM text of a program that must compile, or the reason it did not.
+private atm_ir_in(root: string, entry: string) -> string
+    val out = emit_llvm_text(entry, None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end atm_ir_in
+
+private atm_ir(text: string) -> string
+    val root = atm_lay(text, "", "")
+    atm_ir_in(root, s"$root/main.sysl")
+
+// What a program that must not compile is told.
+private atm_err(text: string) -> string
+    val root = atm_lay(text, "", "")
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end atm_err
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private atm_ran_in(root: string, entry: string) -> string
+    val exe = s"$root/built"
+
+    build_native_program(entry, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end atm_ran_in
+
+private atm_ran(text: string) -> string
+    val root = atm_lay(text, "", "")
+    atm_ran_in(root, s"$root/main.sysl")
+
+// =================================================================================================
+// The orderings
+// =================================================================================================
+
+// The compiler spells five variant names for itself and turns each into a keyword. A match naming
+// exactly those five over the library's `Ordering` compiles only while the library declares those
+// five and no sixth -- a renamed one is unresolvable and a sixth leaves the match open -- and each
+// name then reaches the keyword it stands for.
+@test
+atm_the_orderings_the_compiler_knows_are_the_ones_the_library_declares()
+    if !atm_ready() then return
+
+    val src = "import sysl.sync.*\n\nname(o: Ordering) -> int = o match\n" +
+              "    Relaxed -> 1\n    Acquire -> 1\n    Release -> 1\n    AcqRel -> 1\n" +
+              "    SeqCst -> 1\nprint(name(SeqCst))"
+
+    val out = atm_ir(src)
+
+    assert(atm_says(out, "define"), out)
+
+    for (written, keyword) in [("Relaxed", "monotonic"), ("Acquire", "acquire"),
+                               ("Release", "release"), ("AcqRel", "acq_rel"), ("SeqCst", "seq_cst")]
+        val ir = atm_ir(atm_cell() + s"print(atomic_add(p, 1i64, $written))")
+
+        assert(atm_says(ir, s"%t2 = atomicrmw add ptr %t1, i64 1 $keyword\n"), s"$written: $ir")
+end atm_the_orderings_the_compiler_knows_are_the_ones_the_library_declares
+
+// =================================================================================================
+// What comes out
+// =================================================================================================
+
+@test
+atm_a_load_and_a_store_name_their_ordering_and_state_their_alignment()
+    if !atm_ready() then return
+
+    val out = atm_ir(atm_cell() + "atomic_store(p, 7i64, SeqCst)\nprint(atomic_load(p, Acquire))")
+
+    assert(atm_says(out, "  store atomic i64 7, ptr %t1 seq_cst, align 8\n"), out)
+    assert(atm_says(out, "  %t3 = load atomic i64, ptr %t2 acquire, align 8\n"), out)
+end atm_a_load_and_a_store_name_their_ordering_and_state_their_alignment
+
+// LLVM kept C11's `relaxed` semantics under its own older name, so this is the one ordering whose
+// spelling is a translation rather than a lowercasing -- and the one that would go wrong silently,
+// since a stronger ordering still computes the right answer.
+@test
+atm_relaxed_is_emitted_as_llvm_s_own_name_for_it()
+    if !atm_ready() then return
+
+    val out = atm_ir(atm_cell() + "print(atomic_load(p, Relaxed))")
+
+    assert(atm_says(out, "  %t2 = load atomic i64, ptr %t1 monotonic, align 8\n"), out)
+    assert(!atm_says(out, "relaxed"), out)
+end atm_relaxed_is_emitted_as_llvm_s_own_name_for_it
+
+@test
+atm_every_ordering_reaches_the_instruction_it_names()
+    if !atm_ready() then return
+
+    for (written, keyword) in [("Relaxed", "monotonic"), ("Acquire", "acquire"), ("SeqCst", "seq_cst")]
+        val out = atm_ir(atm_cell() + s"print(atomic_load(p, $written))")
+
+        assert(atm_says(out, s"  %t2 = load atomic i64, ptr %t1 $keyword, align 8\n"), s"$written: $out")
+
+    val rel = atm_ir(atm_cell() + "print(atomic_add(p, 1i64, Release))")
+    val acq_rel = atm_ir(atm_cell() + "print(atomic_add(p, 1i64, AcqRel))")
+
+    assert(atm_says(rel, "  %t2 = atomicrmw add ptr %t1, i64 1 release\n"), rel)
+    assert(atm_says(acq_rel, "  %t2 = atomicrmw add ptr %t1, i64 1 acq_rel\n"), acq_rel)
+end atm_every_ordering_reaches_the_instruction_it_names
+
+@test
+atm_each_read_modify_write_is_the_one_instruction_that_means_it()
+    if !atm_ready() then return
+
+    for (written, kind) in [("add", "add"), ("sub", "sub"), ("and", "and"), ("or", "or"),
+                            ("xor", "xor"), ("swap", "xchg")]
+        val out = atm_ir(atm_cell() + s"print(atomic_$written(p, 1i64, SeqCst))")
+
+        assert(atm_says(out, s"  %t2 = atomicrmw $kind ptr %t1, i64 1 seq_cst\n"), s"$written: $out")
+end atm_each_read_modify_write_is_the_one_instruction_that_means_it
+
+// `cmpxchg` answers a pair, and what the form hands back is the value that was found -- the same
+// information the flag carries, since a caller compares it against what they expected.
+@test
+atm_a_compare_and_swap_takes_the_value_out_of_the_pair_the_instruction_answers()
+    if !atm_ready() then return
+
+    val out = atm_ir(atm_cell() + "print(atomic_cas(p, 1i64, 2i64, SeqCst))")
+
+    assert(atm_says(out, "  %t2 = cmpxchg ptr %t1, i64 1, i64 2 seq_cst seq_cst\n"), out)
+    assert(atm_says(out, "  %t3 = extractvalue { i64, i1 } %t2, 0\n"), out)
+end atm_a_compare_and_swap_takes_the_value_out_of_the_pair_the_instruction_answers
+
+// A failed compare-and-swap stored nothing, so its ordering may not carry a release -- LLVM refuses
+// the instruction outright if it does. The rule applied is C11's: drop the release half and keep
+// whatever acquire was asked for, which is never weaker than the author wrote.
+@test
+atm_and_the_ordering_its_failure_path_gets_can_never_be_a_release()
+    if !atm_ready() then return
+
+    for (written, keywords) in [("Release", "release monotonic"), ("AcqRel", "acq_rel acquire"),
+                                ("Acquire", "acquire acquire"), ("Relaxed", "monotonic monotonic")]
+        val out = atm_ir(atm_cell() + s"print(atomic_cas(p, 1i64, 2i64, $written))")
+
+        assert(atm_says(out, s"  %t2 = cmpxchg ptr %t1, i64 1, i64 2 $keywords\n"), s"$written: $out")
+end atm_and_the_ordering_its_failure_path_gets_can_never_be_a_release
+
+// No `syncscope`, which is the default and means the whole system -- what a program sharing memory
+// with another thread, or with a device, needs.
+@test
+atm_a_fence_is_a_fence_and_reaches_no_address()
+    if !atm_ready() then return
+
+    val out = atm_ir(atm_cell() + "atomic_fence(SeqCst)")
+
+    assert(atm_says(out, "  fence seq_cst\n"), out)
+    assert(!atm_says(out, "syncscope"), out)
+end atm_a_fence_is_a_fence_and_reaches_no_address
+
+@test
+atm_the_width_comes_from_the_address_rather_than_from_the_value_written()
+    if !atm_ready() then return
+
+    val out = atm_ir("import sysl.sync.*\n\nvar f: u32 = 0u32\nvar q = &f\natomic_store(q, 1u32, SeqCst)")
+
+    assert(atm_says(out, "  store atomic i32 1, ptr %t1 seq_cst, align 4\n"), out)
+end atm_the_width_comes_from_the_address_rather_than_from_the_value_written
+
+// A pointer is a word the machine can exchange, and it is what a lock-free list's head is.
+@test
+atm_a_pointer_is_a_word_like_any_other_and_swaps_as_one()
+    if !atm_ready() then return
+
+    val out = atm_ir(raw"""
+        import sysl.sync.*
+
+        var n: i64 = 1
+        var head: *i64 = &n
+        var slot = &head
+        print(atomic_swap(slot, null, SeqCst) == null)
+        """)
+
+    assert(atm_says(out, "  %t2 = atomicrmw xchg ptr %t1, ptr null seq_cst\n"), out)
+end atm_a_pointer_is_a_word_like_any_other_and_swaps_as_one
+
+// =================================================================================================
+// What it computes
+// =================================================================================================
+
+// Every read-modify-write answers the value that was there *before*, which is the property that
+// makes an atomic increment usable as a ticket.
+@test
+atm_a_read_modify_write_answers_what_was_there_before_and_leaves_what_it_computed()
+    if !atm_ready() then return
+
+    val out = atm_ran(raw"""
+        import sysl.sync.*
+
+        var n: i64 = 7
+        var p = &n
+        print(atomic_add(p, 5i64, SeqCst))
+        print(atomic_load(p, SeqCst))
+        print(atomic_sub(p, 2i64, SeqCst))
+        print(atomic_load(p, SeqCst))
+        print(atomic_swap(p, 100i64, SeqCst))
+        print(atomic_load(p, SeqCst))
+        """)
+
+    assert(out == "7\n12\n12\n10\n10\n100\n", out)
+end atm_a_read_modify_write_answers_what_was_there_before_and_leaves_what_it_computed
+
+@test
+atm_the_bitwise_three_run_at_the_width_the_address_gives_them()
+    if !atm_ready() then return
+
+    val out = atm_ran(raw"""
+        import sysl.sync.*
+
+        var flags: u32 = 0b1010u32
+        var q = &flags
+        print(atomic_or(q, 0b0101u32, SeqCst))
+        print(atomic_and(q, 0b1100u32, SeqCst))
+        print(atomic_xor(q, 0b1111u32, SeqCst))
+        print(atomic_load(q, SeqCst))
+        """)
+
+    assert(out == "10\n15\n12\n3\n", out)
+end atm_the_bitwise_three_run_at_the_width_the_address_gives_them
+
+// Both outcomes, since the interesting one is the failure: it answers what it found and leaves the
+// word alone, which is what a retry loop reads to know it must go again.
+@test
+atm_a_compare_and_swap_swaps_when_it_matches_and_reports_what_it_found_when_it_does_not()
+    if !atm_ready() then return
+
+    val out = atm_ran(raw"""
+        import sysl.sync.*
+
+        var n: i64 = 100
+        var p = &n
+        print(atomic_cas(p, 100i64, 42i64, SeqCst))
+        print(atomic_load(p, SeqCst))
+        print(atomic_cas(p, 99i64, 1i64, SeqCst))
+        print(atomic_load(p, SeqCst))
+        """)
+
+    assert(out == "100\n42\n42\n42\n", out)
+end atm_a_compare_and_swap_swaps_when_it_matches_and_reports_what_it_found_when_it_does_not
+
+@test
+atm_a_counter_incremented_in_a_loop_lands_where_the_arithmetic_says()
+    if !atm_ready() then return
+
+    val out = atm_ran(raw"""
+        import sysl.sync.*
+
+        var n: i64 = 0
+        var p = &n
+        var i = 0
+        var last: i64 = -1
+        while i < 1000
+            last = atomic_add(p, 1i64, Relaxed)
+            i++
+        print(atomic_load(p, SeqCst), last)
+        """)
+
+    assert(out == "1000 999\n", out)
+end atm_a_counter_incremented_in_a_loop_lands_where_the_arithmetic_says
+
+// A retry loop, which is what every lock-free algorithm is made of, and the one program shape that
+// reads the result of a failed exchange rather than discarding it.
+@test
+atm_a_compare_and_swap_retry_loop_reaches_its_value()
+    if !atm_ready() then return
+
+    val out = atm_ran(raw"""
+        import sysl.sync.*
+
+        var n: i64 = 5
+        var p = &n
+        double(cell: *i64) -> i64
+            var seen = atomic_load(cell, Acquire)
+            while atomic_cas(cell, seen, seen * 2, AcqRel) != seen
+                seen = atomic_load(cell, Acquire)
+            seen * 2
+        print(double(p), atomic_load(p, SeqCst))
+        """)
+
+    assert(out == "10 10\n", out)
+end atm_a_compare_and_swap_retry_loop_reaches_its_value
+
+@test
+atm_a_fence_runs_and_orders_nothing_a_single_thread_could_notice()
+    if !atm_ready() then return
+
+    val out = atm_ran(raw"""
+        import sysl.sync.*
+
+        var n: i64 = 1
+        var p = &n
+        atomic_store(p, 2i64, Release)
+        atomic_fence(SeqCst)
+        print(atomic_load(p, Acquire))
+        """)
+
+    assert(out == "2\n", out)
+end atm_a_fence_runs_and_orders_nothing_a_single_thread_could_notice
+
+// =================================================================================================
+// The shapes it is meant to be used from
+// =================================================================================================
+
+// A body generic in the word's type, with the address the only thing it holds. A generic body is
+// checked at the instantiation, which is what this pins.
+@test
+atm_a_generic_body_over_ptr_t_lowers_at_whatever_it_is_instantiated_with()
+    if !atm_ready() then return
+
+    val out = atm_ran(raw"""
+        import sysl.sync.*
+
+        bump[T](p: *T, by: T) -> T = atomic_add(p, by, SeqCst)
+        var n: i64 = 1
+        var w: u32 = 10u32
+        print(bump(&n, 4i64), bump(&w, 1u32), n, w)
+        """)
+
+    assert(out == "1 10 5 11\n", out)
+end atm_a_generic_body_over_ptr_t_lowers_at_whatever_it_is_instantiated_with
+
+// And the refusal arrives there too, naming the type the caller supplied rather than the parameter
+// the body was written with.
+@test
+atm_and_a_type_with_no_atomic_instruction_is_refused_at_the_instantiation()
+    if !atm_ready() then return
+
+    val out = atm_err(raw"""
+        import sysl.sync.*
+
+        struct Pair
+            a: int
+            b: int
+        bump[T](p: *T, by: T) -> T = atomic_add(p, by, SeqCst)
+        var v = Pair(1, 2)
+        print(bump(&v, Pair(1, 1)).a)
+        """)
+
+    assert(atm_says(out, "'atomic_add' reaches a word the machine can touch indivisibly — an " +
+                         "integer of 8, 16, 32 or 64 bits, or a pointer — and Pair is neither. An " +
+                         "aggregate is what a 'SpinLock' or a '&sync Mutex[T]' is for (`06`)"), out)
+end atm_and_a_type_with_no_atomic_instruction_is_refused_at_the_instantiation
+
+private atm_spin() -> string = raw"""
+    module spin
+    @no_alloc
+    @no_os
+
+    import sysl.sync.*
+
+    acquire(flag: *i32) -> unit
+        while atomic_swap(flag, 1i32, Acquire) != 0i32
+            atomic_fence(Acquire)
+    release(flag: *i32) -> unit = atomic_store(flag, 0i32, Release)
+    """
+
+// `library/sync.md § The module is the gate` puts these "in a library, available under `no
+// alloc`" -- a form that reached the allocator, or needed a module that did, would make the tier
+// useless in the place it exists for.
+@test
+atm_a_module_that_has_given_up_the_allocator_and_the_operating_system_still_reaches_them()
+    if !atm_ready() then return
+
+    val root = atm_lay("var flag: i32 = 0\nspin.acquire(&flag)\nspin.release(&flag)\nprint(flag)",
+                       "lock.sysl", atm_spin())
+    val out = atm_ir_in(root, root)
+
+    assert(atm_says(out, "  %t2 = atomicrmw xchg ptr %t1, i32 1 acquire\n"), out)
+    assert(atm_says(out, "  fence acquire\n"), out)
+    assert(atm_says(out, "  store atomic i32 0, ptr %t1 release, align 4\n"), out)
+end atm_a_module_that_has_given_up_the_allocator_and_the_operating_system_still_reaches_them
+
+@test
+atm_and_the_same_module_runs()
+    if !atm_ready() then return
+
+    val root = atm_lay("var flag: i32 = 0\nspin.acquire(&flag)\nprint(flag)\nspin.release(&flag)\nprint(flag)",
+                       "lock.sysl", atm_spin())
+
+    val out = atm_ran_in(root, root)
+
+    assert(out == "1\n0\n", out)
+end atm_and_the_same_module_runs
+
+@test
+atm_the_narrow_widths_the_machine_has_as_well_as_the_wide_ones()
+    if !atm_ready() then return
+
+    val out = atm_ran(raw"""
+        import sysl.sync.*
+
+        var b: u8 = 200u8
+        var h: i16 = -3i16
+        print(atomic_add(&b, 1u8, SeqCst), atomic_load(&b, SeqCst))
+        print(atomic_sub(&h, 4i16, SeqCst), atomic_load(&h, SeqCst))
+        """)
+
+    assert(out == "200 201\n-3 -7\n", out)
+end atm_the_narrow_widths_the_machine_has_as_well_as_the_wide_ones
+
+// A constrained subtype is an integer with a promise about the values put into it, and the
+// instruction runs at the integer -- the same resolution `Bits` makes. The promise is the writer's,
+// since an atomic write is not a place the compiler can insert a check.
+@test
+atm_a_constrained_subtype_runs_at_the_integer_underneath_it()
+    if !atm_ready() then return
+
+    val out = atm_ir(raw"""
+        import sysl.sync.*
+
+        type Level = i32 within 0..10
+        var v: Level = 3
+        print(atomic_load(&v, SeqCst))
+        """)
+
+    assert(atm_says(out, "  %t3 = load atomic i32, ptr %v.addr seq_cst, align 4\n"), out)
+end atm_a_constrained_subtype_runs_at_the_integer_underneath_it
+
+// =================================================================================================
+// What is refused
+// =================================================================================================
+
+// The open family of integer widths is what makes this a real case: `u12` is a type a program may
+// name and no machine has an atomic instruction for it.
+@test
+atm_a_width_no_machine_has_an_instruction_for_saying_so()
+    if !atm_ready() then return
+
+    val out = atm_err("import sysl.sync.*\n\nvar n: u12 = 0u12\nvar p = &n\nprint(atomic_load(p, SeqCst))")
+
+    assert(atm_says(out, "'atomic_load' is one machine instruction, and a machine has one for 8, " +
+                         "16, 32 and 64 bits — u12 is 12, so there is nothing to emit. Hold the " +
+                         "value at a width the machine has and narrow it where it is read"), out)
+end atm_a_width_no_machine_has_an_instruction_for_saying_so
+
+@test
+atm_an_aggregate_pointing_at_what_holds_one_instead()
+    if !atm_ready() then return
+
+    val out = atm_err(raw"""
+        import sysl.sync.*
+
+        struct Pair
+            a: int
+            b: int
+        var v = Pair(1, 2)
+        var p = &v
+        print(atomic_load(p, SeqCst))
+        """)
+
+    assert(atm_says(out, "'atomic_load' reaches a word the machine can touch indivisibly — an " +
+                         "integer of 8, 16, 32 or 64 bits, or a pointer — and Pair is neither. An " +
+                         "aggregate is what a 'SpinLock' or a '&sync Mutex[T]' is for (`06`)"), out)
+end atm_an_aggregate_pointing_at_what_holds_one_instead
+
+// The reader is thinking about the right problem and reaching for the wrong tier, since a `&sync
+// T`'s count is already atomic.
+@test
+atm_a_counted_reference_since_what_is_atomic_about_one_is_already_atomic()
+    if !atm_ready() then return
+
+    val out = atm_err(raw"""
+        import sysl.sync.*
+
+        struct Cell
+            v: i64
+        var c: &sync Cell = Cell(1)
+        print(atomic_load(c, SeqCst))
+        """)
+
+    assert(atm_says(out, "'atomic_load' takes a raw address, and a &sync Cell is a counted " +
+                         "reference — atomicity here is about the bytes rather than about the " +
+                         "count, which is already atomic in a '&sync T'. Reach the field with '&' " +
+                         "and hand that in"), out)
+end atm_a_counted_reference_since_what_is_atomic_about_one_is_already_atomic
+
+@test
+atm_a_value_that_is_not_an_address_at_all()
+    if !atm_ready() then return
+
+    val out = atm_err("import sysl.sync.*\n\nvar n: i64 = 0\nprint(atomic_load(n, SeqCst))")
+
+    assert(atm_says(out, "'atomic_load' takes the address of the word to operate on, and this is " +
+                         "a long — write '&place' to hand it one"), out)
+end atm_a_value_that_is_not_an_address_at_all
+
+// Arithmetic on an address is a question the raw tier does not answer, and the two forms that *can*
+// change a pointer are named so the reader is not left with only a refusal.
+@test
+atm_arithmetic_on_a_pointer_naming_the_two_forms_that_do_change_one()
+    if !atm_ready() then return
+
+    val out = atm_err(raw"""
+        import sysl.sync.*
+
+        var n: i64 = 1
+        var head: *i64 = &n
+        var slot = &head
+        print(atomic_add(slot, 1, SeqCst))
+        """)
+
+    assert(atm_says(out, "'atomic_add' is arithmetic, and what an address plus a number means is " +
+                         "the question the raw tier does not answer — use 'atomic_swap' or " +
+                         "'atomic_cas' to change a pointer, or do the arithmetic on a 'usize' " +
+                         "beside it"), out)
+end atm_arithmetic_on_a_pointer_naming_the_two_forms_that_do_change_one
+
+// The refusal the whole design turns on: an ordering held in a variable is well-typed sysl that
+// cannot be lowered, since the instruction spells its ordering as a keyword.
+@test
+atm_an_ordering_that_is_a_value_rather_than_a_name_written_at_the_call()
+    if !atm_ready() then return
+
+    val out = atm_err(raw"""
+        import sysl.sync.*
+
+        var n: i64 = 0
+        var p = &n
+        var how = Relaxed
+        print(atomic_load(p, how))
+        """)
+
+    assert(atm_says(out, "'atomic_load' spells its ordering into the instruction, so it has to be " +
+                         "one of Ordering's names written here — not a value carrying one. Where " +
+                         "a caller chooses, branch on their choice and write a call per ordering"),
+           out)
+end atm_an_ordering_that_is_a_value_rather_than_a_name_written_at_the_call
+
+@test
+atm_something_that_is_not_an_ordering_naming_where_they_come_from()
+    if !atm_ready() then return
+
+    val out = atm_err("import sysl.sync.*\n\nvar n: i64 = 0\nvar p = &n\nprint(atomic_load(p, 3))")
+
+    assert(atm_says(out, "'atomic_load' takes an ordering last, one of Ordering's names from " +
+                         "'sysl.sync' — 'SeqCst' if there is no reason to want another"), out)
+end atm_something_that_is_not_an_ordering_naming_where_they_come_from
+
+@test
+atm_too_few_arguments_counting_what_the_form_takes()
+    if !atm_ready() then return
+
+    val out = atm_err("import sysl.sync.*\n\nvar n: i64 = 0\nvar p = &n\nprint(atomic_load(p))")
+
+    assert(atm_says(out, "'atomic_load' takes 2 arguments — an address, no value, and an ordering " +
+                         "— but 1 argument was given"), out)
+end atm_too_few_arguments_counting_what_the_form_takes
+
+@test
+atm_and_a_compare_and_swap_says_it_takes_two_values()
+    if !atm_ready() then return
+
+    val out = atm_err("import sysl.sync.*\n\nvar n: i64 = 0\nvar p = &n\nprint(atomic_cas(p, 1i64, SeqCst))")
+
+    assert(atm_says(out, "'atomic_cas' takes 4 arguments — an address, 2 values, and an ordering " +
+                         "— but 3 arguments were given"), out)
+end atm_and_a_compare_and_swap_says_it_takes_two_values
+
+@test
+atm_a_value_of_a_type_the_address_does_not_point_at()
+    if !atm_ready() then return
+
+    val out = atm_err("import sysl.sync.*\n\nvar n: i64 = 0\nvar p = &n\natomic_store(p, true, SeqCst)")
+
+    assert(atm_says(out, "'atomic_store' operates at the type its address points at, so argument " +
+                         "2 is a long — this one is a bool"), out)
+end atm_a_value_of_a_type_the_address_does_not_point_at
+
+// The half of an ordering an operation has nothing to do with: a release publishes the writes that
+// came before it and a load makes none.
+@test
+atm_a_load_asked_to_release_which_is_not_an_instruction()
+    if !atm_ready() then return
+
+    for written in ["Release", "AcqRel"]
+        val out = atm_err(atm_cell() + s"print(atomic_load(p, $written))")
+
+        assert(atm_says(out, s"a load has nothing to release, so '$written' asks it to publish " +
+                             "writes it never made and there is no such instruction — write " +
+                             "'Acquire' to see what the releasing side published, 'Relaxed' if " +
+                             "nothing else follows from the read, or 'SeqCst'"), s"$written: $out")
+end atm_a_load_asked_to_release_which_is_not_an_instruction
+
+@test
+atm_a_store_asked_to_acquire_likewise()
+    if !atm_ready() then return
+
+    for written in ["Acquire", "AcqRel"]
+        val out = atm_err(atm_cell() + s"atomic_store(p, 1i64, $written)")
+
+        assert(atm_says(out, s"a store reads nothing, so '$written' asks it to acquire writes it " +
+                             "never looks at and there is no such instruction — write 'Release' " +
+                             "to publish what came before it, 'Relaxed' if nothing else follows " +
+                             "from the write, or 'SeqCst'"), s"$written: $out")
+end atm_a_store_asked_to_acquire_likewise
+
+// The halves each of them *does* have, which is what would go unnoticed if either refusal above were
+// written a variant too wide; every read-modify-write takes all five.
+@test
+atm_while_the_orderings_each_of_them_does_have_are_all_accepted()
+    if !atm_ready() then return
+
+    for (written, keyword) in [("Relaxed", "monotonic"), ("Acquire", "acquire"), ("SeqCst", "seq_cst")]
+        val out = atm_ir(atm_cell() + s"print(atomic_load(p, $written))")
+
+        assert(atm_says(out, s"  %t2 = load atomic i64, ptr %t1 $keyword, align 8\n"), s"load $written: $out")
+
+    for (written, keyword) in [("Relaxed", "monotonic"), ("Release", "release"), ("SeqCst", "seq_cst")]
+        val out = atm_ir(atm_cell() + s"atomic_store(p, 1i64, $written)")
+
+        assert(atm_says(out, s"  store atomic i64 1, ptr %t1 $keyword, align 8\n"), s"store $written: $out")
+
+    for written in ["Relaxed", "Acquire", "Release", "AcqRel", "SeqCst"]
+        val out = atm_ir(atm_cell() + s"print(atomic_add(p, 1i64, $written))")
+
+        assert(atm_says(out, "  %t2 = atomicrmw add ptr %t1, i64 1 "), s"add $written: $out")
+end atm_while_the_orderings_each_of_them_does_have_are_all_accepted
+
+// A fence is nothing but its ordering, so a relaxed one orders nothing and the machine has no
+// instruction for it -- refused here, before the assembler says "fence cannot be monotonic".
+@test
+atm_a_fence_that_would_order_nothing_before_the_assembler_says_so_less_clearly()
+    if !atm_ready() then return
+
+    val out = atm_err("import sysl.sync.*\n\natomic_fence(Relaxed)")
+
+    assert(atm_says(out, "a fence is nothing but its ordering, so 'Relaxed' would ask for a " +
+                         "barrier that orders nothing — write 'Acquire', 'Release', 'AcqRel' or " +
+                         "'SeqCst', or drop the fence. A relaxed *access* is the thing that is " +
+                         "meaningful, and that is the ordering on the operation itself"), out)
+end atm_a_fence_that_would_order_nothing_before_the_assembler_says_so_less_clearly
+
+@test
+atm_while_the_four_a_fence_may_take_are_all_accepted()
+    if !atm_ready() then return
+
+    for (written, keyword) in [("Acquire", "acquire"), ("Release", "release"), ("AcqRel", "acq_rel"),
+                               ("SeqCst", "seq_cst")]
+        val out = atm_ir(s"import sysl.sync.*\n\natomic_fence($written)")
+
+        assert(atm_says(out, s"  fence $keyword\n"), s"$written: $out")
+end atm_while_the_four_a_fence_may_take_are_all_accepted
+
+@test
+atm_a_fence_given_an_address_it_has_nothing_to_do_with()
+    if !atm_ready() then return
+
+    val out = atm_err("import sysl.sync.*\n\nvar n: i64 = 0\nvar p = &n\natomic_fence(p, SeqCst)")
+
+    assert(atm_says(out, "'atomic_fence' takes one argument, the ordering to fence at — it orders " +
+                         "the accesses around it rather than reaching any address of its own"), out)
+end atm_a_fence_given_an_address_it_has_nothing_to_do_with
+
+// The ordering names live in a module, so a program that never imported it cannot write one.
+@test
+atm_and_without_the_module_there_is_no_ordering_to_write()
+    if !atm_ready() then return
+
+    val out = atm_err("var n: i64 = 0\nvar p = &n\nprint(atomic_load(p, SeqCst))")
+
+    assert(atm_says(out, "undefined name 'SeqCst'"), out)
+end atm_and_without_the_module_there_is_no_ordering_to_write
+
+// =================================================================================================
+// The names are the compiler's only where a program has not taken them
+// =================================================================================================
+
+@test
+atm_a_program_s_own_function_of_the_name_is_the_one_that_is_called()
+    if !atm_ready() then return
+
+    val out = atm_ran("atomic_add(a: int, b: int) -> int = a + b\nprint(atomic_add(2, 3))")
+
+    assert(out == "5\n", out)
+end atm_a_program_s_own_function_of_the_name_is_the_one_that_is_called
+
+@test
+atm_a_local_holding_a_closure_is_too()
+    if !atm_ready() then return
+
+    val out = atm_ran("var atomic_load = (n: int) -> n * 3\nprint(atomic_load(4))")
+
+    assert(out == "12\n", out)
+end atm_a_local_holding_a_closure_is_too
+
+@test
+atm_and_the_fence_is_no_different()
+    if !atm_ready() then return
+
+    val out = atm_ran("atomic_fence() -> int = 9\nprint(atomic_fence())")
+
+    assert(out == "9\n", out)
+end atm_and_the_fence_is_no_different
+
+// The other direction of the same rule: what stands aside is the name, not the tier.
+@test
+atm_while_a_form_the_program_did_not_claim_still_means_what_it_means()
+    if !atm_ready() then return
+
+    val out = atm_ran(raw"""
+        import sysl.sync.*
+
+        atomic_add(a: int, b: int) -> int = a + b
+        var n: i64 = 4
+        var p = &n
+        print(atomic_add(2, 3), atomic_swap(p, 8i64, SeqCst), atomic_load(p, SeqCst))
+        """)
+
+    assert(out == "5 4 8\n", out)
+end atm_while_a_form_the_program_did_not_claim_still_means_what_it_means
