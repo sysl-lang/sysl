@@ -4,10 +4,8 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.env.{get as env_var}
-import sysl.fs.{remove_file, write_text}
-import sysl.posix.threads.{spawn, Thread}
-import sysl.process.capture
-import sysl.slices.as_ptr
+import sysl.fs.{IoError, remove_file, write_text}
+import sysl.process.{start, Child}
 import sysl.text.{str_builder, StrBuilder, Search}
 
 // **A program's LLVM text compiled as several modules at once** -- codegen units, as rustc has them.
@@ -70,18 +68,6 @@ private const CopyLimit: usize = 2048
 // What a promoted local is renamed to, in front of its own name.
 private const Promoted: string = "sysl.cgu:"
 
-c const
-    SC_NPROCESSORS_ONLN: int = "_SC_NPROCESSORS_ONLN"
-
-private extern "sysconf" c_sysconf(name: int) -> long
-
-// The logical processors this machine has online, at least one.
-private logical_cpus() -> int
-    val n = c_sysconf(SC_NPROCESSORS_ONLN)
-
-    if n < 1 then 1 else int(n)
-end logical_cpus
-
 // How many units `text` is compiled as for `t`. `SYSL_CODEGEN_UNITS=<n>` decides where it is set to a
 // number from 1 up; otherwise the machine's processors, capped, and no more than the text divides
 // into `MinUnitBytes` pieces.
@@ -97,7 +83,7 @@ codegen_units(size: usize, t: Target) -> int
 
     if size < MinSplitBytes then return 1
 
-    val cpus = logical_cpus()
+    val cpus = int(cpu_count())
     val by_size = int(size / MinUnitBytes)
     var n = if cpus < DefaultMaxUnits then cpus else DefaultMaxUnits
 
@@ -656,48 +642,17 @@ end type_end
 
 // --- compiling the units at once ---------------------------------------------------------------
 
-// One clang to run on a thread of its own: the program and its arguments, each followed by a zero
-// byte, and how it ended.
-//
-// **Only an address and numbers cross to the thread.** A string owns its bytes through a count that
-// is not atomic, so it may not be shared with another domain; the command is laid out as bytes the
-// calling thread keeps alive until every thread has been joined, and the thread builds its own
-// strings from them.
-private struct UnitJob
-    command: *u8
-    size: usize
-    code: int
-
-private run_unit_job(job: *UnitJob)
-    val bytes = job.command[0..<job.size]
-    var words: Buf[string] = buf()
-    var from: usize = 0
-
-    for i in 0..<job.size
-        if bytes[i] == 0
-            words.push(str_cast(bytes[from..<i]))
-            from = i + 1
-
-    var args: Buf[string] = buf()
-
-    for i in 1..<words.len()
-        args.push(words.at(i))
-
-    job.code = capture(words.at(0), args.view(), "", [], true) match
-        Ok(out) -> if out.status.ok() then 0 else 1
-        Err(_) -> -1
-end run_unit_job
-
 // Compiles each of `parts` into an object beside `base`, as many at once as there are parts, and
-// answers the objects in order. An object whose text was compiled before is taken from the cache;
-// where one fails, it is compiled again alone so that what clang said can be reported.
+// answers the objects in order. An object whose text was compiled before is taken from the cache.
+// Every clang started is waited for before anything is reported, and where one failed, the first
+// such unit in order is reported with what its clang said.
 compile_units(cc: string, parts: Buf[string], base: string, target: Target,
               level: string, sections: bool) -> Result[Buf[string], string]
     val args = ir_object_args(target, level, sections)
     var objects: Buf[string] = buf()
     var keys: Buf[string] = buf()
     var todo: Buf[usize] = buf()
-    var commands: Buf[string] = buf()
+    var children: Buf[Result[&Child, IoError]] = buf()
 
     for i in 0..<parts.len()
         val obj = s"$base.cgu$i.o"
@@ -716,45 +671,32 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
             Err(_) -> return Err(s"cannot write $ll")
             Ok(_) -> ()
 
-        var line = str_builder()
-
-        line.push(cc)
-        line.push("\0")
+        var line: Buf[string] = buf()
 
         for j in 0..<args.len()
             line.push(args.at(j))
-            line.push("\0")
 
         line.push(ll)
-        line.push("\0-o\0")
+        line.push("-o")
         line.push(obj)
-        line.push("\0")
 
         todo.push(i)
-        commands.push(line.finish())
+        children.push(start(cc, line.view(), stderr = true))
 
-    // The table is filled before any thread starts and never grows, so each address handed out
-    // stays put until the joins below.
-    var jobs: Buf[UnitJob] = buf()
+    var failure = ""
 
     for j in 0..<todo.len()
-        val c = commands.at(j)
+        val ran = children.at(j) match
+            Ok(child) -> child.wait()
+            Err(e) -> Err(e)
 
-        jobs.push(UnitJob(as_ptr(c.bytes), c.len, -1))
+        if failure != "" then continue
 
-    var slots = jobs.view()
-    var threads: Buf[Option[Thread]] = buf()
+        told_by(cc, ran) match
+            Ok(_) -> ()
+            Err(f) -> failure = if f.unrun then f.said else tool_failed(cc, f.code, f.said)
 
-    for j in 0..<todo.len()
-        threads.push(spawn(&run_unit_job, &slots[j]))
-
-    for j in 0..<todo.len()
-        threads.at(j) match
-            Some(t) -> t.join()
-            None -> run_unit_job(&slots[j])
-
-    for j in 0..<todo.len()
-        if slots[j].code != 0 then return Err(unit_failure(cc, args, objects.at(todo.at(j))))
+    if failure != "" then return Err(failure)
 
     for j in 0..<todo.len()
         val i = todo.at(j)
@@ -815,20 +757,3 @@ end compile_object_in_units
 // Whether a relocatable link for `t` turns a hidden symbol into a local one: Mach-O's does, ELF's,
 // COFF's and WebAssembly's do not.
 merge_localizes_hidden(t: Target) -> bool = t.os == MacOS
-
-// A unit clang refused, compiled again alone for its words. The text is left where it is, as
-// `compile_object` leaves it, since the line numbers are counted in it.
-private unit_failure(cc: string, args: Buf[string], obj: string) -> string
-    var all: Buf[string] = buf()
-
-    for i in 0..<args.len()
-        all.push(args.at(i))
-
-    all.push(s"$obj.ll")
-    all.push("-o")
-    all.push(obj)
-
-    told(cc, all) match
-        Ok(_) -> s"$cc failed on $obj.ll"
-        Err(f) -> if f.unrun then f.said else tool_failed(cc, f.code, f.said)
-end unit_failure

@@ -1,8 +1,8 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.process.{capture, run, Status}
-import sysl.fs.{remove_file, write_text, is_file, is_dir, entries}
+import sysl.process.{capture, run, Output, Status}
+import sysl.fs.{IoError, remove_file, write_text, is_file, is_dir, entries}
 import sysl.text.{join, split, repeat, Search}
 import sysl.env.{get as env_var}
 
@@ -775,8 +775,13 @@ end ir_object_args
 // error stream is collected rather than let through, so a tool reporting the failure has the reason
 // to report; the exit status travels beside it because a tool that failed without saying anything
 // leaves the status the only thing there is to go on.
-told(program: string, args: Buf[string]) -> Result[unit, ToolFault]
-    capture(program, args.view(), "", [], true) match
+told(program: string, args: Buf[string]) -> Result[unit, ToolFault] =
+    told_by(program, capture(program, args.view(), "", [], true))
+
+// What one run of `program` came to, read the way `told` reads it: a run that could not start, or
+// one that exited other than cleanly, with what it wrote to its error stream.
+told_by(program: string, ran: Result[Output, IoError]) -> Result[unit, ToolFault]
+    ran match
         Err(_) -> Err(ToolFault(-1, s"cannot run '$program'", true))
         Ok(out) ->
             if out.status.ok() then return Ok(())
@@ -786,7 +791,7 @@ told(program: string, args: Buf[string]) -> Result[unit, ToolFault]
                 None -> ""
 
             Err(ToolFault(exit_code(out.status), said.trim(), false))
-end told
+end told_by
 
 // How a tool step failed: the status it exited with and its error stream, trimmed -- or, where
 // `unrun`, the refusal to start it, which is the whole message.
