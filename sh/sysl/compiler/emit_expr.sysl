@@ -707,7 +707,15 @@ private gen_compare(e: *Emit, operands: Buf[TExpr], cmps: Buf[TCmp]) -> Val
 
     var left: Val = VNothing
 
+    // **Each link is a region of its own, closed at its exit label** -- the same reason as the right
+    // side of `&&`. An operand a later link builds exists only on the edges that reached that link,
+    // so a release of it placed after the merge would name a register that does not dominate it on
+    // the edge where an earlier comparison failed. The regions nest: link k's is closed at exit k,
+    // after every later link's has been closed on the way through.
     for k in 0..<cmps.len()
+        push_temps(e)
+        push_owned(e)
+
         if k == 0 then left = gen_expr(e, operands.at(0))
 
         val right = gen_expr(e, operands.at(k + 1))
@@ -728,6 +736,8 @@ private gen_compare(e: *Emit, operands: Buf[TExpr], cmps: Buf[TCmp]) -> Val
         val k = cmps.len() - 1 - j
 
         emit_label(e, exits.at(k))
+        pop_owned(e)
+        pop_temps(e)
         emit_term(e, InBr(if k == 0 then end_l else exits.at(k - 1)))
 
     emit_label(e, end_l)

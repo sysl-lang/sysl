@@ -1,0 +1,631 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The reference's `ExpressionRunTests` and `ExternCodegenTests`: what an expression and `print`
+// compute when a program is built and run, and what an `extern` and the `never` type become in the
+// LLVM text.
+//
+// **Every output here was read out of the reference compiler (0.0.153)** by handing the installed
+// `sysl` the same program — `sysl run` for a printed line, `emit-llvm` for an IR line. The harness is
+// `tests_xvr_extern_var.sysl`'s: `xvr_ran` builds, links and runs, `xvr_ir` lowers the way the driver
+// does.
+
+private xrc_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+private xrc_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+// The LLVM text of one file lowered for a named target, against that target's own library -- how an
+// aggregate crosses to C is a property of the convention, so the claim names one.
+private xrc_ir_for(name: string, text: string) -> string
+    val t = target_named(name).unwrap()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("main.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    if !errors_of(done.an.diagnostics()).is_empty()
+        return analysis_report(errors_of(done.an.diagnostics()))
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), buf()), t, promotions).0)
+end xrc_ir_for
+
+// The lines of `text` that begin `declare` and name `symbol` followed by its parameter list.
+private xrc_declares(text: string, symbol: string) -> usize
+    var n: usize = 0
+
+    for line in text.split("\n")
+        if line.starts_with("declare") && line.contains(s"@$symbol(") then n += 1
+
+    n
+end xrc_declares
+
+// Whether any line of `text`, trimmed, is exactly `want`.
+private xrc_has_line(text: string, want: string) -> bool
+    for line in text.split("\n")
+        if line.trim() == want then return true
+
+    false
+end xrc_has_line
+
+// == ExpressionRunTests ============================================================================
+
+@test("hello world prints a string")
+xrc_hello_world()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("print(\"Hello, sysl!\")\n"), "Hello, sysl!\n")
+
+@test("arithmetic evaluates correctly")
+xrc_arithmetic()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("print(6 * 7)\n"), "42\n")
+
+// Asymmetric operands, so an operand-order or wrong-instruction bug shows.
+@test("every binary operator, with order-sensitive operands")
+xrc_every_binary_operator()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("var a = 20\nvar b = 6\n" +
+                      "print(a + b, a - b, b - a, a * b, a / b, a % b, a << 1, a >> 1, a & b, a | b, a ^ b)\n"),
+              "26 14 -14 120 3 2 40 10 4 22 18\n")
+
+// Each comparison yields both outcomes across the row.
+@test("every comparison operator, both outcomes")
+xrc_every_comparison_operator()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("var a = 3\nvar b = 7\nprint(a < b, a > b, a <= b, a >= b, a == b, a != b, b >= b, b == b)\n"),
+              "true false true false false true true true\n")
+
+@test("arguments are space-separated")
+xrc_arguments_space_separated()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("print(\"answer\", 42)\n"), "answer 42\n")
+
+@test("floats print and compute")
+xrc_floats_print_and_compute()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("print(1.5 + 2.5)\n"), "4\n")
+
+@test("booleans print as words")
+xrc_booleans_print_as_words()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("print(1 < 2 && 2 < 3)\n"), "true\n")
+
+private val xrc_loud: string = "loud(b: bool) -> bool\n    print(\"run\")\n    b\nend loud\n"
+
+// The right side runs exactly when it should, never on the decided-left path.
+@test("&& and || short-circuit their right side")
+xrc_short_circuit_right_side()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran(xrc_loud + "print(false && loud(true))\nprint(true || loud(false))\n" +
+                      "print(true && loud(false))\nprint(false || loud(true))\n"),
+              "false\ntrue\nrun\nfalse\nrun\ntrue\n")
+
+// The left side is a guard: without it, `guarded(null)` would read through a null pointer.
+@test("a short-circuited guard protects the unsafe right side")
+xrc_short_circuited_guard()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("guarded(p: *int) -> bool = p != null && *p > 0\nvar n = 5\nprint(guarded(&n), guarded(null))\n"),
+              "true false\n")
+
+@test("logical operators compose under precedence and nesting")
+xrc_logical_operators_compose()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("print(false || true && false)\nprint(true && false || true)\nprint(true && true && false)\n"),
+              "false\ntrue\nfalse\n")
+
+@test("a chained comparison a < b < c")
+xrc_chained_comparison()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("var x = 5\nprint(1 < x < 10, 1 < x < 3, 1 <= x < 10)\n"), "true false true\n")
+
+private val xrc_tick: string = "tick(n: int) -> int\n    print(\"tick\")\n    n\nend tick\n"
+
+private val xrc_tick2: string = "tick(label: int, n: int) -> int\n    print(label)\n    n\nend tick\n"
+
+@test("a chained comparison evaluates each operand exactly once")
+xrc_chain_evaluates_once()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran(xrc_tick + "print(1 < tick(5) < 10)\n"), "tick\ntrue\n")
+
+// One tick: `9 < 2` is false, so the third operand is never reached.
+@test("a chained comparison stops at the first comparison that fails")
+xrc_chain_stops_at_first_failure()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran(xrc_tick + "print(9 < tick(2) < tick(3))\n"), "tick\nfalse\n")
+
+// Operands 1..3 run; `3 < 0` fails, so the fourth is never built.
+@test("and it stops wherever in the chain that happens")
+xrc_chain_stops_wherever()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran(xrc_tick2 + "print(1 < tick(1, 2) < tick(2, 3) < tick(3, 0) < tick(4, 9))\n"),
+              "1\n2\n3\nfalse\n")
+
+@test("a chain that holds all the way through evaluates every operand")
+xrc_chain_holds_all_the_way()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran(xrc_tick2 + "print(1 < tick(1, 2) < tick(2, 3) < tick(3, 4) < 100)\n"), "1\n2\n3\ntrue\n")
+
+// A string operand owns its bytes, so one that is built must be released and one that is never built
+// must not be. Two are built per round, never three: the chain fails at `"z!" < "b!"` and stops.
+// Here a release placed after the merge named the third operand on the edge that never built it,
+// which LLVM refuses outright.
+@test("a chain over owned operands neither leaks nor releases twice")
+xrc_chain_over_owned_operands()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("mk(p: *int, s: string) -> string\n    *p += 1\n    s + \"!\"\nend mk\n" +
+                      "var built = 0\nvar i = 0\nwhile i < 20000\n    var a = mk(&built, \"b\")\n" +
+                      "    if mk(&built, \"z\") < a < mk(&built, \"y\") then print(\"unreachable\")\n" +
+                      "    i += 1\nprint(built)\n"),
+              "40000\n")
+
+@test("a chain over strings compares the whole way when it holds")
+xrc_chain_over_strings()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("var s = \"m\"\nprint(\"a\" < s < \"z\", \"z\" < s < \"a\", \"a\" < s <= \"m\")\n"),
+              "true false true\n")
+
+@test("call arguments are evaluated left to right, once each")
+xrc_call_arguments_left_to_right()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("tick(label: int) -> int\n    print(label)\n    label\nend tick\n" +
+                      "take(a: int, b: int, c: int) -> int = a * 100 + b * 10 + c\n" +
+                      "print(take(tick(1), tick(2), tick(3)))\n"),
+              "1\n2\n3\n123\n")
+
+@test("binary operands are evaluated left first, once each")
+xrc_binary_operands_left_first()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("tick(label: int, v: int) -> int\n    print(label)\n    v\nend tick\n" +
+                      "print(tick(1, 20) - tick(2, 5))\n"),
+              "1\n2\n15\n")
+
+// A shift at or past the operand's width answers what shifting all the way means.
+@test("a shift by the width answers zero rather than anything")
+xrc_shift_by_the_width()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("main()\n    var u: usize = 11\n    print(u >> 64, u << 64, u >> 65, u << 65)\n"), "0 0 0 0\n")
+
+// The amount is a variable, so nothing folds and the emitted compare and select are what runs.
+@test("and it does so when the amount is not a constant")
+xrc_shift_amount_not_constant()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("main()\n    var u: usize = 11\n    var w: usize = 64\n    var past: usize = 1000\n" +
+                      "    print(u >> w, u << w, u >> past, u >> (w - 1))\n"),
+              "0 0 0 0\n")
+
+@test("a signed right shift past the width is the sign, not zero")
+xrc_signed_shift_is_the_sign()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("main()\n    var neg: int = -8\n    var pos: int = 8\n    var w: int = 64\n" +
+                      "    print(neg >> 64, pos >> 64, neg >> w, pos >> w)\n"),
+              "-1 0 -1 0\n")
+
+@test("the width that bounds it is the operand's own, not the machine's")
+xrc_shift_width_is_the_operands()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("main()\n    var b: u8 = 0b1011\n    var s: i8 = -8\n    print(b >> 8, b << 8, b >> 200, s >> 8)\n"),
+              "0 0 0 -1\n")
+
+@test("an in-range shift is untouched")
+xrc_in_range_shift_untouched()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("main()\n    var u: usize = 11\n    var s: int = -8\n    var b: u8 = 0b1011\n" +
+                      "    print(u >> 1, u << 1, s >> 1, b << 1)\n"),
+              "5 22 -4 22\n")
+
+@test("a vector shift is bounded in every lane")
+xrc_vector_shift_bounded()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("main()\n    var counts: <8>u32 = [1, 2, 4, 8, 16, 32, 64, 128]\n" +
+                      "    var big: <8>u32 = [40, 40, 40, 40, 40, 40, 40, 40]\n" +
+                      "    print((counts << 1)[7], (counts << big)[0], (counts >> big)[7], (counts >> 1)[7])\n"),
+              "256 0 0 64\n")
+
+@test("a compound assignment evaluates a side-effecting index exactly once")
+xrc_compound_index_once()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("next() -> int\n    print(99)\n    2\nend next\nvar a = [10, 20, 30, 40]\na[next()] += 5\nprint(a[2])\n"),
+              "99\n35\n")
+
+@test("a compound assignment evaluates a side-effecting receiver exactly once")
+xrc_compound_receiver_once()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("struct Box\n    n: int\nget(b: &Box) -> &Box\n    print(99)\n    b\nend get\n" +
+                      "var box: &Box = Box(100)\nget(box).n += 7\nprint(box.n)\n"),
+              "99\n107\n")
+
+@test("compound assignment operators update in place")
+xrc_compound_assignment()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("var x = 10\nx += 5\nx -= 2\nx *= 3\nx /= 2\nprint(x)\n"), "19\n")
+
+@test("bitwise compound assignment")
+xrc_bitwise_compound_assignment()
+    if xvr_no_library() then return
+
+    assert_eq(xrc_ran("var b = 12\nb &= 10\nb |= 1\nb <<= 2\nprint(b)\n"), "36\n")
+
+// == ExternCodegenTests ============================================================================
+
+// -- declarations ----------------------------------------------------------------------------------
+
+// `zeroext` on the `bool` argument and on the `u8` result; the `i32` and the `double` take nothing.
+@test("a called extern is declared with its lowered signature")
+xrc_declared_with_lowered_signature()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern f(a: int, b: real, c: bool) -> u8\nprint(f(1, 2.0, true))\n")
+
+    assert(out.contains("declare zeroext i8 @f(i32, double, i1 zeroext)"), out)
+
+@test("no result at all is declared void")
+xrc_no_result_declared_void()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern f()\nf()\n")
+
+    assert(out.contains("declare void @f()"), out)
+
+@test("a 'never' result is declared void too, since nothing comes back")
+xrc_never_declared_void()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern stop(code: int) -> never\nstop(1)\n")
+
+    assert(out.contains("declare void @stop(i32)"), out)
+
+// A view is three words, more than AAPCS64 puts in registers, so it crosses by address.
+@test("a pointer lowers as it does everywhere else, and a view as the ABI passes an aggregate")
+xrc_pointer_and_view_cross()
+    if xvr_no_library() then return
+
+    val out = xrc_ir_for("aarch64-macos", "extern f(p: *u8, s: string) -> *int\nvar b: u8 = 0\n" +
+                                          "print(f(&b, \"hi\") == null)\n")
+
+    assert(out.contains("declare ptr @f(ptr, ptr align 8)"), out)
+
+@test("an unused extern is not declared")
+xrc_unused_extern_not_declared()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("print(1)\n")
+
+    assert(!out.contains("@exit"), out)
+    assert(!out.contains("@snprintf"), out)
+
+    val real = xrc_ir("print(1.5)\n")
+
+    assert(real.contains("declare i32 @snprintf(ptr, i64, ptr, ...)"), real)
+end xrc_unused_extern_not_declared
+
+@test("an extern is declared once however many times it is called")
+xrc_extern_declared_once()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern f(n: int) -> int\nprint(f(1), f(2), f(3))\n")
+
+    assert_eq(xrc_declares(out, "f"), 1)
+
+// The runtime declares `malloc` for its own use, so the extern defers to that declaration.
+@test("an extern does not redeclare a name the runtime already declared")
+xrc_extern_defers_to_runtime()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern malloc(n: usize) -> *u8\nstruct Inner\n    v: int\nvar r: &Inner = Inner(1)\n" +
+                     "print(r.v, malloc(8) == null)\n")
+
+    assert_eq(xrc_declares(out, "malloc"), 1)
+    assert(out.contains("declare ptr @malloc(i64)"), out)
+
+// -- a link name -----------------------------------------------------------------------------------
+
+@test("declares and calls the symbol, not the sysl name")
+xrc_link_name_symbol()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern \"abort\" stop() -> never\nstop()\n")
+
+    assert(out.contains("declare void @abort()"), out)
+    assert(out.contains("call void @abort()"), out)
+    assert(!out.contains("@stop"), out)
+
+@test("carries the ellipsis to the symbol as well")
+xrc_link_name_ellipsis()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern \"printf\" say(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(say(p, 1))\n")
+
+    assert(out.contains("declare i32 @printf(ptr, ...)"), out)
+    assert(out.contains("call i32 (ptr, ...) @printf(ptr %t1, i32 1)"), out)
+    assert(!out.contains("@say"), out)
+
+// The library reaches `snprintf` under a name of its own, so a program may still declare it.
+@test("lets two declarations share one symbol")
+xrc_two_declarations_one_symbol()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern \"putchar\" emit(c: int) -> int\nextern putchar(c: int) -> int\n" +
+                     "print(emit(65), putchar(66))\n")
+
+    assert_eq(xrc_declares(out, "putchar"), 1)
+    assert(out.contains("declare i32 @putchar(i32)"), out)
+    assert(out.contains("call i32 @putchar(i32 65)"), out)
+    assert(out.contains("call i32 @putchar(i32 66)"), out)
+
+@test("is rejected when it is not a symbol a linker could resolve")
+xrc_link_name_rejected()
+    if xvr_no_library() then return
+
+    val spaced = xrc_ir("extern \"no such thing\" f()\n")
+
+    assert(spaced.contains("error: 'no such thing' is not a symbol a linker can resolve\n --> main.sysl:1:1"), spaced)
+
+    val empty = xrc_ir("extern \"\" f()\n")
+
+    assert(empty.contains("error: '' is not a symbol a linker can resolve\n --> main.sysl:1:1"), empty)
+end xrc_link_name_rejected
+
+// `_`, `$` and `.` are what LLVM's unquoted identifier admits, so the name goes through as written.
+@test("may hold every character a linker symbol may hold, unquoted")
+xrc_link_name_characters()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern \"foo.bar$baz_9\" f(n: int) -> int\nprint(f(1))\n")
+
+    assert(out.contains("declare i32 @foo.bar$baz_9(i32)"), out)
+    assert(out.contains("call i32 @foo.bar$baz_9(i32 1)"), out)
+    assert(!out.contains("\"foo.bar"), out)
+
+// -- variadic --------------------------------------------------------------------------------------
+
+@test("the declaration carries the ellipsis")
+xrc_variadic_declaration()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern log(fmt: *u8, n: int, ...)\nvar p: *u8 = null\nlog(p, 1)\n")
+
+    assert(out.contains("declare void @log(ptr, i32, ...)"), out)
+
+@test("a call names the callee's whole function type")
+xrc_variadic_call_type()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern f(n: int, ...) -> int\nprint(f(1, 2))\n")
+
+    assert(out.contains("call i32 (i32, ...) @f(i32 1, i32 2)"), out)
+
+@test("a call with no tail at all is written the same way")
+xrc_variadic_no_tail()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern f(n: int, ...) -> int\nprint(f(1))\n")
+
+    assert(out.contains("call i32 (i32, ...) @f(i32 1)"), out)
+
+// An ordinary callee keeps the short form, so the ellipsis is what makes the difference.
+@test("a non-variadic extern is still called by result type alone")
+xrc_non_variadic_short_form()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern f(n: int) -> int\nprint(f(1))\n")
+
+    assert(out.contains("call i32 @f(i32 1)"), out)
+    assert(out.contains("declare i32 @f(i32)"), out)
+
+@test("two variadic externs each get their own signature")
+xrc_two_variadics()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern f(n: int, ...)\nextern g(p: *u8, ...) -> int\nvar p: *u8 = null\nf(1)\nprint(g(p))\n")
+
+    assert(out.contains("call void (i32, ...) @f(i32 1)"), out)
+    assert(out.contains("call i32 (ptr, ...) @g(ptr %t1)"), out)
+    assert(out.contains("declare void @f(i32, ...)"), out)
+    assert(out.contains("declare i32 @g(ptr, ...)"), out)
+
+@test("a raw pointer crosses as it stands")
+xrc_raw_pointer_crosses()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern f(n: int, ...)\nvar x = 1\nf(1, &x)\n")
+
+    assert(out.contains("call void (i32, ...) @f(i32 1, ptr %x.addr)"), out)
+
+// `printf` is an ordinary foreign name: declared where a program asks for it, and nowhere else.
+@test("printf is declared only by a program that declares it")
+xrc_printf_on_demand()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern printf(fmt: *u8, ...) -> int\nvar p: *u8 = null\nprint(printf(p))\n")
+
+    assert_eq(xrc_declares(out, "printf"), 1)
+    assert(out.contains("declare i32 @printf(ptr, ...)"), out)
+
+    val plain = xrc_ir("print(1)\n")
+
+    assert(!plain.contains("@printf"), plain)
+end xrc_printf_on_demand
+
+@test("declaring snprintf does not collide with the runtime's own either")
+xrc_snprintf_no_collision()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern snprintf(buf: *u8, n: usize, fmt: *u8, ...) -> int\nvar buf: [4]u8\n" +
+                     "var fmt: [3]u8 = [37u8, 100u8, 0u8]\nprint(snprintf(&buf[0], 4usize, &fmt[0], 1), str(1.5))\n")
+
+    assert_eq(xrc_declares(out, "snprintf"), 1)
+    assert(out.contains("declare i32 @snprintf(ptr, i64, ptr, ...)"), out)
+
+@test("a variadic that does not return still ends its block")
+xrc_variadic_never_ends_block()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern die(fmt: *u8, ...) -> never\nvar p: *u8 = null\ndie(p, 1)\n")
+
+    assert(out.contains("call void (ptr, ...) @die(ptr %t1, i32 1)"), out)
+    assert(out.contains("declare void @die(ptr, ...)"), out)
+    assert(out.contains("unreachable"), out)
+
+// -- the library's forcing combinators -------------------------------------------------------------
+
+// Three calls, two element types.
+@test("unwrap is monomorphized once per element type, not once per call")
+xrc_unwrap_once_per_type()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("var a: Option[int] = Some(1)\nvar b: Option[real] = Some(2.5)\nvar c: Option[int] = Some(3)\n" +
+                     "print(a.unwrap(), b.unwrap(), c.unwrap())\n")
+
+    var defined: usize = 0
+
+    for line in out.split("\n")
+        if line.starts_with("define") && line.contains("@sysl$Option.unwrap") then defined += 1
+
+    assert_eq(defined, 2)
+    assert(out.contains("define i32 @sysl$Option.unwrap.int("), out)
+    assert(out.contains("define double @sysl$Option.unwrap.real("), out)
+    assert(out.contains("declare void @exit(i32)"), out)
+end xrc_unwrap_once_per_type
+
+@test("unwrap and expect are separate members, each on demand")
+xrc_unwrap_and_expect()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("var a: Option[int] = Some(1)\nprint(a.unwrap(), a.expect(\"here\"))\n")
+
+    assert(out.contains("define i32 @sysl$Option.unwrap.int("), out)
+    assert(out.contains("define i32 @sysl$Option.expect.int("), out)
+
+@test("a program that forces nothing carries neither of them")
+xrc_forces_nothing()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("var a: Option[int] = Some(1)\nprint(a.is_some())\n")
+
+    assert(!out.contains("@sysl$Option.unwrap"), out)
+    assert(!out.contains("@sysl$Option.expect"), out)
+    assert(!out.contains("@exit"), out)
+
+// -- a call that does not return -------------------------------------------------------------------
+
+@test("ends its block with unreachable")
+xrc_never_call_ends_block()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern stop() -> never\nstop()\n")
+
+    assert(out.contains("call void @stop()"), out)
+    assert(out.contains("unreachable"), out)
+
+// The `ret` codegen would otherwise place is dropped: the block is already closed.
+@test("a function whose body diverges needs no return")
+xrc_diverging_body_no_return()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern stop() -> never\nf() -> never = stop()\nf()\n")
+
+    assert(out.contains("define void @f()"), out)
+    assert(!out.contains("ret void\n}"), out)
+
+// A merge slot is a slot for a value, and `never` has none.
+@test("an if whose branches both diverge allocates no slot")
+xrc_diverging_if_no_slot()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern stop() -> never\nf(c: bool) -> never\n    if c then stop() else stop()\nf(true)\n")
+
+    assert(!out.contains("alloca void"), out)
+    assert(out.contains("define void @f(i1 %c.param)"), out)
+
+@test("a match whose arms all diverge allocates no slot")
+xrc_diverging_match_no_slot()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern stop() -> never\nf(c: bool) -> never\n    c match\n        true -> stop()\n" +
+                     "        false -> stop()\nf(true)\n")
+
+    assert(!out.contains("alloca void"), out)
+
+@test("a diverging branch stores nothing into the merge slot")
+xrc_diverging_branch_stores_nothing()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern stop() -> never\nvar x = if true then 5 else stop()\nprint(x)\n")
+
+    assert_eq(xvr_count(out, "store i32 5"), 1)
+    assert(out.contains("call void @stop()"), out)
+
+// -- a merge nothing reaches -----------------------------------------------------------------------
+
+@test("an all-returning if ends in unreachable, not a valueless ret")
+xrc_all_returning_if()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("f(c: bool) -> int\n    if c then return 1 else return 2\nprint(f(true))\n")
+
+    assert(out.contains("ret i32 1"), out)
+    assert(out.contains("ret i32 2"), out)
+    assert(out.contains("unreachable"), out)
+    assert(!xrc_has_line(out, "ret i32"), out)
+
+@test("an all-returning match does too")
+xrc_all_returning_match()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("f(o: Option[int]) -> int = o match\n    Some(v) -> return v\n    None -> return -1\n" +
+                     "print(f(Some(1)))\n")
+
+    assert(!xrc_has_line(out, "ret i32"), out)
+    assert(out.contains("unreachable"), out)
+
+@test("a loop whose break and else both diverge ends the same way")
+xrc_diverging_loop()
+    if xvr_no_library() then return
+
+    val out = xrc_ir("extern stop() -> never\nf(c: bool)\n    while c\n        break stop()\n    else stop()\nf(true)\n")
+
+    assert(out.contains("call void @stop()"), out)
+    assert(!xrc_has_line(out, "store void"), out)
