@@ -1,0 +1,744 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What a program carries into its output, and what it does not -- ported from the reference's
+// `DeadCodeTests.scala` case for case.
+//
+// A declaration nothing can reach is still one the program made: it is checked, and a mistake in it
+// is reported. What it does not get is a place in the object file. Reaching is over-approximated
+// wherever the target is decided at run time -- a slot of a method table stands for every function
+// any table for that trait put there -- and one case below pins that bound.
+//
+// **Every set of defined symbols, every message and every output here was read out of the reference
+// compiler** (0.0.153), `sysl emit-llvm` / `sysl run` on the same program. A function the standard
+// module already compiled is DECLARED rather than defined in that text, so where the reference's own
+// suite asked for a library function among the definitions, this asks for its declaration.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private dcd_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end dcd_skip
+
+// A project: a manifest, and each file at its path below the root.
+private dcd_write(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-dcd").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    root
+end dcd_write
+
+// The LLVM text `emit-llvm` prints for a project, or what refused it.
+private dcd_ir_of(files: []const (string, string)) -> string
+    val root = dcd_write(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end dcd_ir_of
+
+private dcd_ir(main: string) -> string = dcd_ir_of([("main.sysl", main)])
+
+// What a one-file program prints and the status it exits with; a build that failed answers what it
+// said and `-1`, so a refusal cannot pass for a trap.
+private dcd_outcome(main: string) -> (string, int)
+    val root = dcd_write([("main.sysl", main)])
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (s"did not build: ${failure_text(why)}", -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text, shell_status(out.status))
+end dcd_outcome
+
+// Every symbol a line of this form names: `define` (but not `define private`, the compiler's own
+// table adapters and runtime helpers) or `declare`.
+private dcd_named(ir: string, form: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val lines = lines_of(ir)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.starts_with(form) && !line.starts_with("define private")
+            line.index_of("@") match
+                None -> ()
+                Some(at) ->
+                    val rest = line[(at + 1)..<line.bytes.len]
+                    val stop = rest.index_of("(").unwrap_or(rest.bytes.len)
+
+                    out.push(rest[0..<stop].copy())
+
+    out
+end dcd_named
+
+private dcd_has(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end dcd_has
+
+private dcd_shown(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        out = out + " " + names.at(i)
+
+    out
+end dcd_shown
+
+// The text defines exactly these symbols under names a program wrote -- the whole set the reference
+// defined for the same program, so a function kept that the reference dropped is a failure too.
+private dcd_defines_exactly(ir: string, expected: []const string)
+    val names = dcd_named(ir, "define")
+
+    for i in 0..<expected.len
+        assert(dcd_has(names, expected[i]), s"'${expected[i]}' is not defined; defined:${dcd_shown(names)}\n$ir")
+
+    assert(names.len() == expected.len, s"defined:${dcd_shown(names)}")
+end dcd_defines_exactly
+
+private dcd_declares(ir: string, name: string) -> bool = dcd_has(dcd_named(ir, "declare"), name)
+
+// The program is refused with exactly this message, first, at this line and column.
+private dcd_refused(main: string, message: string, at: string)
+    val out = dcd_ir(main)
+
+    assert(out.starts_with(s"error: $message\n"), s"expected 'error: $message' first, got: $out")
+    assert(out.contains(s"main.sysl:$at\n"), s"expected it at main.sysl:$at, got: $out")
+end dcd_refused
+
+// -- what the documents claim ---------------------------------------------------------------------
+
+@test("a function nothing calls is not emitted")
+dcd_a_function_nothing_calls()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        unused() -> int = 1
+        print(2)
+        """), ["main"])
+
+@test("and one something calls is")
+dcd_and_one_something_calls()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        used() -> int = 1
+        print(used())
+        """), ["main", "used"])
+
+// Visibility decides what a program may NAME; reachability decides what is written out. An unmarked
+// declaration is dropped exactly as a private one is.
+@test("a private declaration is dropped the same way an unmarked one is")
+dcd_a_private_declaration_is_dropped()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        private hidden() -> int = 1
+        open() -> int = 2
+        print(3)
+        """), ["main"])
+
+@test("a mistake in a function nothing calls is still reported")
+dcd_a_mistake_in_a_dead_function()
+    if dcd_skip() then return
+
+    dcd_refused(raw"""
+        unused() -> int = true
+        print(1)
+        """, "function 'unused' should return int, but its body yields bool", "1:1")
+
+// Escape analysis reads the parts of the program that are never reached too: everything that checks
+// runs before anything is dropped.
+@test("and a slice escaping a function nothing calls is still rejected")
+dcd_a_slice_escaping_a_dead_function()
+    if dcd_skip() then return
+
+    dcd_refused(raw"""
+        scratch(s: [4]u8) -> []u8
+            s[..]
+        end scratch
+        print(1)
+        """, "a slice of an array this frame owns is returned, so it would outlive the array, and the " +
+             "storage is not this body's to move — it is a field of a value, an array a caller passed " +
+             "by value, or part of an array literal, which has no declaration to move. Declare it as a " +
+             "'[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the length is fixed",
+        "2:6")
+
+@test("a function reached only from a 'val' initializer is emitted")
+dcd_reached_from_a_val_initializer()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        build() -> int = 7
+        static val seed: int = build()
+        print(seed)
+        """), ["build", "main"])
+
+@test("a function reached only from a 'require' is emitted")
+dcd_reached_from_a_require()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        ok(n: int) -> bool = n > 0
+        f(n: int) -> int
+            require ok(n)
+            n
+        end f
+        print(f(3))
+        """), ["f", "main", "ok"])
+
+@test("and one reached only from an 'ensure' is too")
+dcd_reached_from_an_ensure()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        sane(n: int) -> bool = n > 0
+        f(n: int) -> int
+            ensure sane(result)
+            n + 1
+        end f
+        print(f(3))
+        """), ["f", "main", "sane"])
+
+// The only thing naming a deferred call is the `TDefer` the body carries, which the walk follows by
+// shape -- so this is the promise about nodes added later.
+@test("a function reached only from a 'defer' is emitted")
+dcd_reached_from_a_defer()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        bye() -> unit = print("bye")
+        main() -> unit =
+            defer bye()
+            print("hi")
+        """), ["$$main", "bye", "main"])
+
+@test("and it runs, in the order a deferred call runs in")
+dcd_a_deferred_call_runs()
+    if dcd_skip() then return
+
+    val out = dcd_outcome(raw"""
+        bye() -> unit = print("bye")
+        main() -> unit =
+            defer bye()
+            print("hi")
+        """)
+
+    assert_eq(out.0, "hi\nbye\n")
+    assert_eq(out.1, 0)
+
+// A default is produced afresh at each call that omits it, so a function named only there is reached
+// through the call site.
+@test("a function reached only from a default parameter value is emitted")
+dcd_reached_from_a_default()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        seed() -> int = 41
+        takes(n: int = seed() + 1) -> int = n
+        print(takes())
+        """), ["main", "seed", "takes"])
+
+@test("and it is dropped when every call supplies the argument")
+dcd_a_default_every_call_supplies()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        seed() -> int = 41
+        takes(n: int = seed() + 1) -> int = n
+        print(takes(7))
+        """), ["main", "takes"])
+
+@test("a method reached only through a trait object is emitted")
+dcd_reached_through_a_trait_object()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        trait Show
+            show(self) -> int
+        struct Point
+            x: int
+        impl Show for Point
+            show(self) -> int = self.x
+        var s: &Show = Point(3)
+        print(s.show())
+        """), ["Point.show", "main"])
+
+@test("an extern reached only from a function nothing calls is not declared")
+dcd_an_extern_only_dead_code_reaches()
+    if dcd_skip() then return
+
+    val out = dcd_ir(raw"""
+        extern secret(n: int) -> int
+        unused() -> int = secret(1)
+        print(2)
+        """)
+
+    assert(!out.contains("@secret"), out)
+    dcd_defines_exactly(out, ["main"])
+
+@test("and one the program does reach is")
+dcd_an_extern_the_program_reaches()
+    if dcd_skip() then return
+
+    val out = dcd_ir(raw"""
+        extern secret(n: int) -> int
+        print(secret(1))
+        """)
+
+    assert(out.contains("declare i32 @secret(i32)"), out)
+
+// -- what the edges do ----------------------------------------------------------------------------
+
+@test("a function that only calls itself is still unreachable")
+dcd_a_function_that_only_calls_itself()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        spin(n: int) -> int = if n == 0 then 0 else spin(n - 1)
+        print(1)
+        """), ["main"])
+
+@test("and so is a pair that only calls each other")
+dcd_a_pair_that_only_calls_each_other()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        ping(n: int) -> int = if n == 0 then 0 else pong(n - 1)
+        pong(n: int) -> int = ping(n)
+        print(1)
+        """), ["main"])
+
+@test("mutual recursion the program does enter is kept whole")
+dcd_mutual_recursion_entered()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        even(n: int) -> bool = if n == 0 then true else odd(n - 1)
+        odd(n: int) -> bool = if n == 0 then false else even(n - 1)
+        print(even(4))
+        """), ["even", "main", "odd"])
+
+@test("what a function nothing calls calls is dropped with it")
+dcd_what_a_dead_function_calls()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        helper() -> int = 1
+        unused() -> int = helper()
+        print(2)
+        """), ["main"])
+
+@test("but a function two callers share survives the dead one")
+dcd_a_function_two_callers_share()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        helper() -> int = 1
+        unused() -> int = helper()
+        print(helper())
+        """), ["helper", "main"])
+
+@test("a chain of three is followed to its end")
+dcd_a_chain_of_three()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        c() -> int = 3
+        b() -> int = c()
+        a() -> int = b()
+        print(a())
+        """), ["a", "b", "c", "main"])
+
+@test("an instantiation asked for only by a function nothing calls is not emitted")
+dcd_an_instantiation_only_dead_code_asks_for()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        id[T](x: T) -> T = x
+        unused() -> int = id(1)
+        print(2)
+        """), ["main"])
+
+@test("while the same instantiation asked for by live code is")
+dcd_the_same_instantiation_from_live_code()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        id[T](x: T) -> T = x
+        print(id(1))
+        """), ["id.int", "main"])
+
+// The negative is about a name that exists: `sysl$printr` is what printing a `real` reaches, and the
+// text names it nowhere, while `sysl$printi` -- what the live `print(2)` reaches -- is declared.
+@test("a library function reached only from dead code is not emitted either")
+dcd_a_library_function_only_dead_code_reaches()
+    if dcd_skip() then return
+
+    val out = dcd_ir(raw"""
+        unused()
+            print(1.5)
+        end unused
+        print(2)
+        """)
+
+    assert(!out.contains("@sysl$printr"), out)
+    assert(dcd_declares(out, "sysl$printi"), out)
+    dcd_defines_exactly(out, ["main"])
+
+@test("an unused member of a type the program does use is not emitted")
+dcd_an_unused_member_of_a_used_type()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        struct Point
+            x: int
+            double(self) -> int = self.x * 2
+            triple(self) -> int = self.x * 3
+        print(Point(3).double())
+        """), ["Point.double", "main"])
+
+// A `where` predicate is the one function whose name lives inside a TYPE, so the node that checks
+// against one has to read it out.
+@test("a subtype's 'where' predicate is emitted for the check that calls it")
+dcd_a_where_predicate()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        type Even = int within 0..100 where value % 2 == 0
+        var e: Even = 4
+        print(int(e))
+        """), ["Even$pred", "main"])
+
+@test("and it runs, so the check is a real one")
+dcd_the_predicate_runs()
+    if dcd_skip() then return
+
+    val out = dcd_outcome(raw"""
+        type Even = int within 0..100 where value % 2 == 0
+        var n = 5
+        var e: Even = n
+        print(int(e))
+        """)
+
+    assert_eq(out.0, "")
+    assert_eq(out.1, 133)
+
+@test("a struct's invariant function is emitted for the construction that checks it")
+dcd_a_struct_invariant()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        struct Account
+            balance: int
+            invariant balance >= 0
+        print(Account(5).balance)
+        """), ["Account$inv", "main"])
+
+private dcd_point() -> string = raw"""
+    struct Point
+        x: int
+        y: int
+    impl Display for Point
+        display(self, out: *Writer, fmt: FormatSpec)
+            display_str("(", out, fmt)
+            self.x.display(out, fmt)
+            display_str(")", out, fmt)
+    print(Point(3, 4))
+    """
+
+@test("printing a value that renders itself still reaches the sink")
+dcd_printing_a_value_that_renders_itself()
+    if dcd_skip() then return
+
+    val out = dcd_ir(dcd_point())
+
+    dcd_defines_exactly(out, ["Point.display", "main", "sysl$chunk_of.int", "sysl$stdout"])
+    assert(dcd_declares(out, "sysl$putbytes"), out)
+
+@test("and the program prints what it should")
+dcd_the_rendering_prints()
+    if dcd_skip() then return
+
+    val out = dcd_outcome(dcd_point())
+
+    assert_eq(out.0, "(3)\n")
+    assert_eq(out.1, 0)
+
+// A trait's operator method rides on the node the operator lowers to rather than on a call.
+@test("a method reached only through a compound assignment is emitted")
+dcd_reached_through_a_compound_assignment()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        struct Meters
+            v: int
+        impl Add for Meters
+            add(self, other: Meters) -> Meters = Meters(self.v + other.v)
+        var m = Meters(1)
+        m += Meters(2)
+        print(m.v)
+        """), ["Meters.add", "main"])
+
+@test("a method reached only through a comparison is emitted")
+dcd_reached_through_a_comparison()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        struct Meters
+            v: int
+        impl Eq for Meters
+            eq(self, other: Meters) -> bool = self.v == other.v
+        print(Meters(1) == Meters(2))
+        """), ["Meters.eq", "main"])
+
+// The over-approximation, pinned: erasing a value builds the table, a table is a root, so a function
+// nothing can call is kept alive by an erasure that itself never runs.
+@test("a table an unreachable erasure built still holds its implementation alive")
+dcd_a_table_from_an_unreachable_erasure()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        trait Show
+            show(self) -> int
+        struct Point
+            x: int
+        impl Show for Point
+            show(self) -> int = self.x
+        unused() -> int
+            var s: &Show = Point(3)
+            s.show()
+        end unused
+        print(1)
+        """), ["Point.show", "main"])
+
+@test("a program with nothing in it is still a program")
+dcd_a_program_with_nothing_in_it()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(""), ["main"])
+
+// Storage is not code: a `val` whose initializer is code runs whether or not anything reads it.
+@test("a 'val' nothing reads is still laid down")
+dcd_a_val_nothing_reads()
+    if dcd_skip() then return
+
+    val out = dcd_ir(raw"""
+        build() -> int = 7
+        static val seed: int = build()
+        print(1)
+        """)
+
+    assert(out.contains("@seed = private global"), out)
+    assert(out.contains("define i32 @build()"), out)
+
+@test("a function reached only from a dead function's contract goes with it")
+dcd_a_dead_functions_contract()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        ok(n: int) -> bool = n > 0
+        unused(n: int) -> int
+            require ok(n)
+            n
+        end unused
+        print(1)
+        """), ["main"])
+
+@test("a function called only from a subtype's predicate is emitted")
+dcd_called_from_a_predicate()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        even(n: int) -> bool = n % 2 == 0
+        type Even = int within 0..100 where even(value)
+        var e: Even = 4
+        print(int(e))
+        """), ["Even$pred", "even", "main"])
+
+@test("a function called only from a struct's invariant is emitted")
+dcd_called_from_an_invariant()
+    if dcd_skip() then return
+
+    dcd_defines_exactly(dcd_ir(raw"""
+        sane(n: int) -> bool = n >= 0
+        struct Account
+            balance: int
+            invariant sane(balance)
+        print(Account(5).balance)
+        """), ["Account$inv", "main", "sane"])
+
+// The files of a module are one scope, so which file a call was written in decides nothing about
+// what it reaches.
+@test("reaching crosses the files of a module")
+dcd_reaching_crosses_files()
+    if dcd_skip() then return
+
+    val out = dcd_ir_of([
+        ("geom/helper.sysl", "module geom\nprivate[geom] scale(n: int) -> int = n * 2\nprivate[geom] spare() -> int = 9"),
+        ("geom/main.sysl", "module geom\nprint(scale(3))")])
+
+    assert(out.contains("define i32 @geom$scale(i32 %n.param)"), out)
+    assert(!out.contains("@geom$spare"), out)
+    dcd_defines_exactly(out, ["geom$scale", "main"])
+
+@test("a whole program of unreachable declarations still runs")
+dcd_a_program_of_unreachable_declarations_runs()
+    if dcd_skip() then return
+
+    val out = dcd_outcome(raw"""
+        a() -> int = 1
+        b() -> int = a()
+        private c() -> int = b()
+        print(9)
+        """)
+
+    assert_eq(out.0, "9\n")
+    assert_eq(out.1, 0)
+
+// -- a root the library supplies ------------------------------------------------------------------
+//
+// The four unconditional roots of `reference/ffi.md § @export` -- an export, an interrupt handler, a
+// `@section` definition and a destructor -- asked of the LIBRARY, which is handed to every
+// compilation. A stand-in library is what makes this askable: two modules, the submodule holding a
+// type with a destructor, an export, and a function only the destructor reaches (`release`, there to
+// be dragged: a root keeps its whole transitive closure). The reference answers the same question as
+// `SYSL_LIB=<stand-in> sysl emit-llvm --no-std-lib`, and these are its defined sets.
+
+private dcd_stand_in(extra: bool) -> string
+    val root = make_temp_dir("sysl-dcd-lib").unwrap()
+
+    make_dir_all(root + "/sysl/res").unwrap()
+    write_text(root + "/sysl/std.sysl", "module sysl\ntrait Drop\n    drop(self)\nmark(n: int) -> int = n + 1\n").unwrap()
+    write_text(root + "/sysl/res/res.sysl",
+               "module sysl.res\nstruct Handle\n    id: int\nend Handle\n\n" +
+               "open(n: int) -> &Handle = Handle(n)\n\n" +
+               "@export(\"res_tick\")\ntick(n: int) -> int = n\n\n" +
+               "impl Drop for Handle\n    drop(self)\n        release(self.id)\n\n" +
+               "release(n: int) -> int = n\n").unwrap()
+
+    if extra
+        make_dir_all(root + "/sysl/hand").unwrap()
+        write_text(root + "/sysl/hand/hand.sysl",
+                   "module sysl.hand\nlend(n: int) -> &sysl.res.Handle = sysl.res.open(n)\n").unwrap()
+
+    root
+end dcd_stand_in
+
+// The text of a program compiled against the stand-in library alone, lowered whole (nothing
+// precompiled), as `--no-std-lib` does.
+private dcd_against_stand_in(main: string, extra: bool) -> string
+    val lib = dcd_stand_in(extra)
+    val t = host_target()
+
+    var units = std_units(lib, t) match
+        Err(why) ->
+            remove_dir_all(lib).unwrap_or(())
+            return why
+        Ok(found) -> found
+
+    remove_dir_all(lib).unwrap_or(())
+
+    val parsed = parse(source_of("main.sysl", main), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf())
+    val errors = errors_of(done.an.diagnostics())
+
+    if !done.reported.is_empty() then return analysis_report(done.reported)
+    if !errors.is_empty() then return analysis_report(errors)
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end dcd_against_stand_in
+
+// A destructor is a root because the release hook that calls it is not a tree the walk can see -- but
+// a program that never reaches its module gets none of it.
+@test("is not emitted into a program that never reaches its module")
+dcd_a_library_root_never_reached()
+    if dcd_skip() then return
+
+    val out = dcd_against_stand_in("mark(1)\n", false)
+
+    assert(!out.contains("Handle.drop"), out)
+    assert(!out.contains("sysl.res$release"), out)
+    assert(!out.contains("res_tick"), out)
+    dcd_defines_exactly(out, ["main", "sysl$mark"])
+
+@test("and is emitted into one that does")
+dcd_a_library_root_reached()
+    if dcd_skip() then return
+
+    val out = dcd_against_stand_in("sysl.res.open(1)\n", false)
+
+    assert(out.contains("Handle.drop"), out)
+    assert(out.contains("sysl.res$release"), out)
+    dcd_defines_exactly(out, ["main", "sysl.res$Handle.drop", "sysl.res$open", "sysl.res$release"])
+
+@test("which holds for an export as much as for a destructor")
+dcd_a_library_export_reached()
+    if dcd_skip() then return
+
+    val out = dcd_against_stand_in("sysl.res.tick(1)\n", false)
+
+    assert(out.contains("res_tick"), out)
+    dcd_defines_exactly(out, ["main", "res_tick", "sysl.res$Handle.drop", "sysl.res$release", "sysl.res$tick"])
+
+// The under-prune direction: the program names `sysl.hand` and never `sysl.res`, so only the
+// transitive closure of the module graph puts the destructor's module in reach.
+@test("through a module that reaches it, where the program names neither")
+dcd_a_library_root_through_another_module()
+    if dcd_skip() then return
+
+    val out = dcd_against_stand_in("sysl.hand.lend(1)\n", true)
+
+    assert(out.contains("Handle.drop"), out)
+    assert(out.contains("sysl.res$release"), out)
+    dcd_defines_exactly(out, ["main", "sysl.hand$lend", "sysl.res$Handle.drop", "sysl.res$open", "sysl.res$release"])
