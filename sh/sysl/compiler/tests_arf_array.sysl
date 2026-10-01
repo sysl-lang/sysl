@@ -1,0 +1,640 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Fixed arrays, ported from the reference's `ArrayRunTests`, `ArrayFillTests`,
+// `ArrayLiteralAdaptTests` and `ArrayCodegenTests` case for case.
+//
+// An array is its elements and nothing else: a value that copies, a length that is a constant, a
+// subscript that is a bounds test and then a pointer into the storage. `[v; n]` is n copies of one
+// value, evaluated once, at a count the compiler can fold. An array literal with no element type
+// asked of it settles one from whichever element knows its own, as the two sides of an operator do.
+//
+// **Every output, diagnostic and line of LLVM quoted here was read out of the reference compiler**
+// (0.0.153) on the same program.
+
+private var arf_library_cache: Buf[Program] = buf()
+private var arf_library_read: bool = false
+
+private arf_library() -> Buf[Program]
+    if arf_library_read then return arf_library_cache
+
+    arf_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> arf_library_cache = units
+
+    arf_library_cache
+end arf_library
+
+private arf_ready() -> bool
+    if arf_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end arf_ready
+
+private arf_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// What a program PRINTS.
+private arf_ran(text: string) -> string
+    val root = make_temp_dir("sysl-arf").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end arf_ran
+
+// What a program that is meant to STOP exits with: a trap is `128 + n`, and `-1` is a program that
+// did not build, which must not read as a stop.
+private arf_stopped(text: string) -> int
+    val root = make_temp_dir("sysl-arf-stop").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var args: Buf[string] = buf()
+
+    val code = run_native_program(s"$root/main.sysl", None, None, DefaultOptimization, args) match
+        Err(_) -> -1
+        Ok(state) -> state
+
+    remove_dir_all(root).unwrap_or(())
+    code
+end arf_stopped
+
+// The LLVM text a program lowers to -- or, where it is refused, what it was refused with.
+private arf_ir(text: string) -> string
+    val root = make_temp_dir("sysl-arf-ir").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end arf_ir
+
+// Everything a source has to say for itself, taken the whole way through the lowering.
+private arf_err(text: string) -> string
+    val root = make_temp_dir("sysl-arf-err").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end arf_err
+
+// -- ArrayRunTests: arrays as programs actually behave -------------------------------------------
+
+@test("a literal keeps its elements in order")
+arf_a_literal_keeps_its_elements_in_order()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("var a = [2, 3, 5, 7]\nprint(a[0], a[1], a[2], a[3])"), "2 3 5 7\n")
+
+@test("a length is how many were written")
+arf_a_length_is_how_many_were_written()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("var a = [2, 3, 5, 7]\nprint(a.len)"), "4\n")
+
+@test("a declaration with no initializer is all zeros")
+arf_a_declaration_with_no_initializer_is_all_zeros()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("var a: [4]int\nprint(a[0], a[3], a.len)"), "0 0 4\n")
+
+@test("a zero-length array has length zero")
+arf_a_zero_length_array_has_length_zero()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("var empty: [0]int\nprint(empty.len)"), "0\n")
+
+@test("an element is a place, so every assignment form works on it")
+arf_an_element_is_a_place()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        var a: [3]int
+        a[0] = 5
+        a[1] += 7
+        a[2]++
+        print(a[0], a[1], a[2])
+        """), "5 7 1\n")
+
+@test("an array copies, so two names do not share storage")
+arf_an_array_copies()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        var a = [1, 2, 3]
+        var b = a
+        b[0] = 99
+        print(a[0], b[0])
+        """), "1 99\n")
+
+@test("a parameter is a copy too, so a callee cannot reach the caller's array")
+arf_a_parameter_is_a_copy_too()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        clobber(a: [3]int) -> int
+            a[0] = 99
+            a[0]
+        end clobber
+        var a = [1, 2, 3]
+        print(clobber(a), a[0])
+        """), "99 1\n")
+
+@test("iterating binds each element in turn")
+arf_iterating_binds_each_element_in_turn()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        var a = [2, 3, 5, 7]
+        var total = 0
+        for x in a do total += x
+        print(total)
+        """), "17\n")
+
+@test("iterating by index reaches the same elements")
+arf_iterating_by_index_reaches_the_same_elements()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        var a = [2, 3, 5, 7]
+        var total = 0
+        for i in 0..<a.len do total += a[i]
+        print(total)
+        """), "17\n")
+
+@test("the loop variable is a copy, so writing it does not write the array")
+arf_the_loop_variable_is_a_copy()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        var a = [1, 2, 3]
+        for x in a do x = 9
+        print(a[0], a[1], a[2])
+        """), "1 2 3\n")
+
+@test("arrays nest, and the inner subscript is checked too")
+arf_arrays_nest()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        var g: [2][3]int
+        g[1][2] = 5
+        g[0][0] = 1
+        print(g[0][0], g[1][2], g.len, g[0].len)
+        """), "1 5 2 3\n")
+
+@test("an array of structs holds them by value")
+arf_an_array_of_structs_holds_them_by_value()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        end Point
+        var ps = [Point(1, 2), Point(3, 4)]
+        ps[0].x = 9
+        print(ps[0].x, ps[1].y)
+        """), "9 4\n")
+
+@test("an array can hold references, and each one is counted")
+arf_an_array_can_hold_references()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        struct Cell
+            n: int
+        end Cell
+
+        var c: &Cell = Cell(7)
+        var cells = [c, c, c]
+        cells[1].n = 8
+        print(c.n, cells[0].n, cells.len)
+        """), "8 8 3\n")
+
+@test("a big array of references does not leak or double free")
+arf_a_big_array_of_references()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        struct Cell
+            n: int
+        end Cell
+
+        var total = 0
+        for i in 1..2000 do
+            var c: &Cell = Cell(i)
+            var held = [c, c, c, c]
+            total += held[3].n
+        print(total)
+        """), "2001000\n")
+
+@test("an out-of-range index stops the program instead of reading past the end")
+arf_an_out_of_range_index_stops_the_program()
+    if !arf_ready() then return
+
+    assert_eq(arf_stopped("var a = [1, 2, 3]\nvar i = 3\nprint(a[i])\n"), 133)
+
+@test("a negative index is out of range as well")
+arf_a_negative_index_is_out_of_range()
+    if !arf_ready() then return
+
+    assert_eq(arf_stopped("var a = [1, 2, 3]\nvar i = -1\nprint(a[i])\n"), 133)
+
+// -- ArrayFillTests: `[v; n]` ---------------------------------------------------------------------
+
+@test("the fill form parses as a value and a count")
+arf_as_a_value_and_a_count()
+    assert_eq(pf("var xs = [0; 4]"), "(var xs (fill 0 4))")
+
+@test("the fill form parses without disturbing the element list beside it")
+arf_without_disturbing_the_element_list()
+    assert_eq(pf("var xs = [1, 2, 3]"), "(var xs (array 1 2 3))")
+
+@test("the fill form parses beside the empty literal")
+arf_or_the_empty_literal()
+    assert_eq(pf("var xs: [0]int = []"), "(var xs : (array 0 int) (array))")
+
+@test("the fill form's value may be any expression")
+arf_the_value_may_be_any_expression()
+    assert_eq(pf("var xs = [f(1); 2]"), "(var xs (fill (call f 1) 2))")
+
+@test("it fills every element with the value")
+arf_every_element_with_the_value()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("var xs = [7; 4]\nprint(str(xs[0] + xs[1] + xs[2] + xs[3]))"), "28\n")
+
+@test("it fills to the length the count gives")
+arf_to_the_length_the_count_gives()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("var xs = [0u8; 6]\nprint(str(xs.len))"), "6\n")
+
+@test("it fills taking the element type from the value")
+arf_taking_the_element_type_from_the_value()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("var xs = [3u8; 2]\nvar t: u8 = xs[0] + xs[1]\nprint(str(t))"), "6\n")
+
+@test("it fills from the context, where the value is a bare literal")
+arf_or_from_the_context()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("var xs: [3]u8 = [1; 3]\nprint(str(xs[2]))"), "1\n")
+
+@test("it fills with a count a 'const' names")
+arf_with_a_count_a_const_names()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("const n: usize = 5\nvar xs = [2; n]\nprint(str(xs.len))\nprint(str(xs[4]))"),
+              "5\n2\n")
+
+@test("it fills with a count that is a constant expression")
+arf_with_a_count_that_is_a_constant_expression()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("const n: usize = 3\nvar xs = [1; n * 2]\nprint(str(xs.len))"), "6\n")
+
+@test("it fills with a value of a type that has no zero")
+arf_a_value_of_a_type_that_has_no_zero()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        enum Slot
+            Empty
+            Full(v: int)
+        end Slot
+        var xs: [4]Slot = [Empty; 4]
+        var n = 0
+        for x in xs
+            x match
+                Empty -> n += 1
+                Full(v) -> n += v
+        print(str(n))
+        """), "4\n")
+
+@test("it fills with a struct value")
+arf_a_struct_value()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        struct P
+            x: int
+            y: int
+        end P
+        var ps = [P(2, 3); 3]
+        print(str(ps[0].x + ps[1].y + ps[2].x))
+        """), "7\n")
+
+@test("it fills with an array, nested")
+arf_an_array_nested()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("var g = [[5; 3]; 2]\nprint(str(g[1][2]))"), "5\n")
+
+@test("each element a fill makes is its own storage, not a shared one")
+arf_each_element_is_its_own_storage()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("var xs = [1; 3]\nxs[1] = 9\nprint(str(xs[0] + xs[1] + xs[2]))"), "11\n")
+
+@test("a fill's count may be zero, which is an empty array")
+arf_including_a_count_of_zero()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("var xs = [1; 0]\nprint(str(xs.len))"), "0\n")
+
+@test("a fill's value is evaluated once, however many elements it fills")
+arf_however_many_elements_it_fills()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran(raw"""
+        tick() -> int
+            print("call")
+            1
+        var xs = [tick(); 3]
+        print(str(xs[0] + xs[1] + xs[2]))
+        """), "call\n3\n")
+
+@test("a fill's value is evaluated once even where the array is empty")
+arf_and_never_where_the_array_is_empty()
+    if !arf_ready() then return
+
+    // The reference's case is named "and never", but what it asserts -- and what the reference
+    // prints -- is one call: the value is evaluated once whatever the count.
+    assert_eq(arf_ran(raw"""
+        tick() -> int
+            print("call")
+            1
+        var xs = [tick(); 0]
+        print(str(xs.len))
+        """), "call\n0\n")
+
+@test("a fill is built with a loop")
+arf_it_is_built_with_a_loop()
+    if !arf_ready() then return
+
+    val out = arf_ir("var xs = [0u8; 64]\nprint(str(xs.len))")
+
+    assert(arf_says(out, "fill.test"), out)
+    assert(arf_says(out, "fill.elem"), out)
+    assert(arf_says(out, "fill.done"), out)
+
+// The reference's refusal of a count it cannot fold, word for word.
+private arf_not_constant() -> string =
+    "an array's repeat count must be a constant, since it is the array's bound — a literal, or a " +
+    "'const' naming one. A count computed while running makes storage instead, which is written " +
+    "where a '[]T' is expected"
+
+@test("a fill refuses a count that is not a constant")
+arf_a_count_that_is_not_a_constant()
+    if !arf_ready() then return
+
+    val e = arf_err("f() -> usize = 3usize\nvar xs = [0; f()]")
+
+    assert(arf_says(e, arf_not_constant()), e)
+
+@test("a fill refuses a count read from a variable")
+arf_a_count_read_from_a_variable()
+    if !arf_ready() then return
+
+    val e = arf_err("var n: usize = 3usize\nvar xs = [0; n]")
+
+    assert(arf_says(e, arf_not_constant()), e)
+
+@test("a fill refuses a negative count")
+arf_a_negative_count()
+    if !arf_ready() then return
+
+    val e = arf_err("var xs = [0; -2]")
+
+    assert(arf_says(e, "an array cannot have -2 elements"), e)
+
+@test("a fill refuses a unit value")
+arf_a_unit_value()
+    if !arf_ready() then return
+
+    val e = arf_err("var xs = [print(1); 3]")
+
+    assert(arf_says(e, "an array cannot hold unit values"), e)
+
+@test("a fill refuses a count that does not fold to an integer")
+arf_a_count_that_does_not_fold_to_an_integer()
+    if !arf_ready() then return
+
+    val e = arf_err("var xs = [0; \"three\"]")
+
+    assert(arf_says(e, arf_not_constant()), e)
+
+// -- ArrayLiteralAdaptTests: a bare literal adapts to a typed element ----------------------------
+
+@test("a bare array element adapts when the typed element is first")
+arf_when_the_typed_element_is_first()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("val xs = [1usize, 2, 7]\nval n: usize = xs[1] + xs[2]\nprint(n)"), "9\n")
+
+@test("a bare array element adapts when the typed one is second")
+arf_when_it_is_second()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("val xs = [1, 2usize, 7]\nval n: usize = xs[0] + xs[2]\nprint(n)"), "8\n")
+
+@test("a bare array element adapts when the typed one is last")
+arf_when_it_is_last()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("val xs = [1, 2, 7usize]\nval n: usize = xs[0]\nprint(n)"), "1\n")
+
+@test("a bare array element adapts when what knows is a name rather than a suffix")
+arf_when_what_knows_is_a_name()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("val k: usize = 5\nval xs = [1, k, 3]\nval n: usize = xs[0] + xs[1]\nprint(n)"),
+              "6\n")
+
+@test("a negative array element adapts the same way")
+arf_and_a_negative_literal_adapts()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("val xs = [-1, 2i8]\nval n: i8 = xs[0]\nprint(n)"), "-1\n")
+
+@test("an array element is read at the settled width, so a value past int is fine")
+arf_reading_the_literal_at_the_settled_width()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("val xs = [1u64, 5000000000]\nval n: u64 = xs[1]\nprint(n)"), "5000000000\n")
+
+@test("a float array element adapts to a suffixed float beside it")
+arf_a_float_literal_adapts()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("val xs = [1.5f32, 2.25]\nval f: f32 = xs[1]\nprint(f)"), "2.25\n")
+
+@test("a nested array literal settles row by row, from whichever row has a type")
+arf_a_nested_literal_settles_row_by_row()
+    if !arf_ready() then return
+
+    assert_eq(arf_ran("val ys = [[1usize, 2], [3, 4]]\nval n: usize = ys[1][1]\nprint(n)"), "4\n")
+    assert_eq(arf_ran("val ys = [[1, 2], [3usize, 4]]\nval n: usize = ys[0][1]\nprint(n)"), "2\n")
+
+@test("an array element that does not fit the settled width is refused, naming the literal")
+arf_a_literal_that_does_not_fit()
+    if !arf_ready() then return
+
+    val e = arf_err("val zs = [1u8, 300]\nprint(zs[0])")
+
+    assert(arf_says(e, "the literal 300 does not fit byte"), e)
+    assert(!arf_says(e, "one element type"), e)
+
+@test("two array elements that each have a type, and disagree, are still refused")
+arf_two_elements_that_disagree()
+    if !arf_ready() then return
+
+    val e = arf_err("val zs = [1u8, 2usize]\nprint(zs[0])")
+
+    assert(arf_says(e, "an array literal needs one element type, got byte and usize"), e)
+
+@test("an integer array element beside a real is not made a real")
+arf_an_integer_beside_a_real()
+    if !arf_ready() then return
+
+    val e = arf_err("val rs = [1.5, 2]\nprint(rs[0])")
+
+    assert(arf_says(e, "an array literal needs one element type, got real and int"), e)
+
+// -- ArrayCodegenTests: the layout, the checked subscript, the length ----------------------------
+
+@test("an array is its elements, with no header")
+arf_an_array_is_its_elements()
+    if !arf_ready() then return
+
+    val out = arf_ir("var a = [1, 2, 3]\nprint(a[0])")
+
+    assert(arf_says(out, "%a.addr = alloca [3 x i32]"), out)
+
+@test("a declaration of an array with no initializer starts at zero")
+arf_a_declaration_starts_at_zero()
+    if !arf_ready() then return
+
+    val out = arf_ir("var buf: [8]u8\nprint(buf[0])")
+
+    assert(arf_says(out, "%buf.addr = alloca [8 x i8]"), out)
+    assert(arf_says(out, "store [8 x i8] zeroinitializer, ptr %buf.addr"), out)
+
+@test("an element read is a bounds test, then a pointer into the storage")
+arf_an_element_read_is_a_bounds_test()
+    if !arf_ready() then return
+
+    val out = arf_ir("var a = [1, 2, 3]\nprint(a[1])")
+
+    assert(arf_says(out, "  %t4 = icmp ult i64 1, 3\n"), out)
+    assert(arf_says(out, "call void @llvm.trap()"), out)
+    assert(arf_says(out, "  %t5 = getelementptr i32, ptr %a.addr, i64 1\n"), out)
+
+@test("a signed index is widened before the unsigned test, so a negative one fails it")
+arf_a_signed_index_is_widened()
+    if !arf_ready() then return
+
+    val out = arf_ir("var a = [1, 2, 3]\nvar i = 0\nprint(a[i])")
+
+    assert(arf_says(out, "  %t5 = sext i32 %t4 to i64\n  %t6 = icmp ult i64 %t5, 3\n"), out)
+
+@test("an array's length is a constant")
+arf_an_arrays_length_is_a_constant()
+    if !arf_ready() then return
+
+    val out = arf_ir("var a = [1, 2, 3, 4, 5]\nprint(a.len)")
+
+    assert(arf_says(out, "i64 5)"), out)
+    assert(!arf_says(out, "extractvalue [5 x i32]"), out)
+
+@test("writing an element goes through the same address")
+arf_writing_an_element_goes_through_the_same_address()
+    if !arf_ready() then return
+
+    val out = arf_ir("var a = [1, 2, 3]\na[2] = 9")
+
+    assert(arf_says(out, "  %t5 = getelementptr i32, ptr %a.addr, i64 2\n  store i32 9, ptr %t5\n"), out)
+
+@test("iterating walks the storage rather than copying the array")
+arf_iterating_walks_the_storage()
+    if !arf_ready() then return
+
+    val out = arf_ir("var a = [1, 2, 3]\nvar s = 0\nfor x in a do s += x")
+
+    assert(arf_says(out, "  %t6 = icmp ult i64 %t5, 3\n"), out)
+    assert(arf_says(out, "  %t7 = getelementptr i32, ptr %a.addr, i64 %t5\n"), out)
+
+@test("an array of references is walked with a loop, not an unrolled chain")
+arf_an_array_of_references_is_walked_with_a_loop()
+    if !arf_ready() then return
+
+    val out = arf_ir(raw"""
+        struct P
+            x: int
+        hold(a: [4]&P) -> int
+            var kept = a
+            kept[0].x
+        var p: &P = P(1)
+        print(hold([p, p, p, p]))
+        """)
+
+    assert(arf_says(out, "define private void @arc.copy.arr4.ref.P([4 x ptr] %v) {"), out)
+    assert(out.count_of("call void @arc.retain(") < 8, out)
+
+@test("a program with no slice in it emits no null-tolerant helpers")
+arf_a_program_with_no_slice_emits_no_null_tolerant_helpers()
+    if !arf_ready() then return
+
+    val out = arf_ir("struct P\n    x: int\nvar p: &P = P(1)\nvar x = p.x")
+
+    assert(!arf_says(out, "@arc.retain_maybe"), out)
