@@ -239,7 +239,7 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     var args: Buf[TExpr] = buf()
 
     for i in 0..<captured.len()
-        args.push(name_expr(cx, span, captured.at(i), None))
+        args.push(capture_source(cx, span, captured.at(i)))
 
     TExpr(span, TStructNew(st, args))
 end lower_closure
@@ -315,7 +315,13 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
         val read = TExpr(span, TField(TExpr(span, TDeref(TExpr(span, TLoad("self", self_ty)),
                                                          Struct(st))), int(st.slot(i)), stored))
 
-        inner.captured.push((inner.bind(captured.at(i), stored), read))
+        val unique = inner.bind(captured.at(i), stored)
+
+        // A by-name parameter captured is still one: the field holds the callable, and a read of
+        // the name calls it.
+        if reads_by_name(cx, captured.at(i)) then inner.by_name.push(unique)
+
+        inner.captured.push((unique, read))
 
     // A closure is a body of its own, so the nested functions of the body it was written in are
     // names it may not reach -- and it is told so rather than told they stand for nothing.

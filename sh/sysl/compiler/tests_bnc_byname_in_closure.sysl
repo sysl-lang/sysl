@@ -1,0 +1,99 @@
+module sh.sysl.compiler
+@tests
+
+// A by-name parameter (`x: -> T`) read inside a closure or a nested function of the body: the
+// capture holds the callable the call made of the argument, and each read of the name calls it,
+// exactly as a read in the body itself does (`reference/types.md § A parameter passed by name`:
+// "each use is an evaluation, because each use is a call").
+//
+// **Every expected output was read out of the reference (0.0.154)** -- over the same program with
+// the read inside the closure spelled `x()`. The reference refuses the bare `x` there (`'+' needs
+// '$F0: sysl.Add'`), reading a captured by-name parameter as its thunk rather than as a call; that
+// is the reference disagreeing with its own page, and the spelling it does accept says what the
+// program means.
+
+private bnc_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+@test("a by-name parameter read in a closure of the body is called")
+bnc_read_in_a_closure()
+    if xvr_no_library() then return
+
+    assert_eq(bnc_ran(raw"""
+        in_closure(x: -> int) -> int
+            val g = () -> x + 1
+            g()
+
+        print(in_closure(41))
+        """), "42\n")
+end bnc_read_in_a_closure
+
+@test("a by-name parameter read in a nested function of the body is called")
+bnc_read_in_a_nested_function()
+    if xvr_no_library() then return
+
+    assert_eq(bnc_ran(raw"""
+        in_nested(x: -> int) -> int
+            inner() -> int = x + 2
+            inner()
+
+        print(in_nested(40))
+        """), "42\n")
+end bnc_read_in_a_nested_function
+
+@test("a closure reading a by-name parameter evaluates the argument at every call of it")
+bnc_evaluated_at_every_read_in_a_closure()
+    if xvr_no_library() then return
+
+    assert_eq(bnc_ran(raw"""
+        static var calls: int = 0
+
+        tick() -> int
+            calls += 1
+            print("eval")
+            calls
+
+        closure_twice(x: -> int) -> int
+            val g = () -> x
+            g() + g()
+
+        print(closure_twice(tick()))
+        print(calls)
+        """), "eval\neval\n3\n2\n")
+end bnc_evaluated_at_every_read_in_a_closure
+
+@test("a closure capturing a by-name parameter evaluates it when called, after the outer call returned")
+bnc_called_after_the_outer_call_returned()
+    if xvr_no_library() then return
+
+    assert_eq(bnc_ran(raw"""
+        static var calls: int = 0
+
+        tick() -> int
+            calls += 1
+            print("eval")
+            calls
+
+        later(x: -> int) -> &Fn() -> int = () -> x * 100
+
+        val f = later(tick())
+        print("made")
+        print(f())
+        print(f())
+        print(calls)
+        """), "made\neval\n100\neval\n200\n2\n")
+end bnc_called_after_the_outer_call_returned
+
+@test("a closure inside a nested function reaches the frame's by-name parameter through both")
+bnc_a_closure_inside_a_nested_function()
+    if xvr_no_library() then return
+
+    assert_eq(bnc_ran(raw"""
+        deep(x: -> int) -> int
+            inner() -> int
+                val g = () -> x * 2
+                g()
+            inner()
+
+        print(deep(21))
+        """), "42\n")
+end bnc_a_closure_inside_a_nested_function

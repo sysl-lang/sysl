@@ -154,7 +154,7 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
     var addresses: Buf[TExpr] = buf()
 
     for i in 0..<captured.len()
-        val place = name_expr(cx, span, captured.at(i), None)
+        val place = capture_source(cx, span, captured.at(i))
 
         addresses.push(TExpr(span, TAddrOf(place, Ptr(place_type(place)))))
 
@@ -319,11 +319,14 @@ private nested_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
         // The environment holds the address of the frame's own variable, so what the name reaches is
         // the variable itself -- one dereference further, and a place, which is what lets a nested
         // function assign to it.
-        stored match
-            Ptr(pointee) ->
-                inner.captured.push((inner.bind(captured.at(i), *pointee),
-                                     TExpr(span, TDeref(field, *pointee))))
-            _ -> inner.captured.push((inner.bind(captured.at(i), stored), field))
+        val reached = stored match
+            Ptr(pointee) -> (inner.bind(captured.at(i), *pointee), TExpr(span, TDeref(field, *pointee)))
+            _ -> (inner.bind(captured.at(i), stored), field)
+
+        // A by-name parameter of the frame is one in the nested function too: a read calls it.
+        if reads_by_name(cx, captured.at(i)) then inner.by_name.push(reached.0)
+
+        inner.captured.push(reached)
 
     // A sibling is in scope throughout the group, so a body may call one written below it. What a
     // body does *not* reach is a nested function of the frame around it, and remembering their
