@@ -449,9 +449,47 @@ offset_of(cx: &Analyzer, span: Span, t: TypeRef, field: string, expected: Option
     val v = offset_bytes(cx, ty, field)
 
     if v.is_none() then
-        return cx.err(span, s"'${type_show(ty)}' has no field '$field' to measure the offset of")
+        if ty == Unknown || mentions_abstract(ty) then return bad_expr(span)
+
+        return cx.err(span, offset_refusal(ty, field))
 
     v.unwrap() match
         ConstInt(n) -> int_literal(cx, span, n, "", Some(usize_type(word_bits(cx))))
         _ -> bad_expr(span)
 end offset_of
+
+// Why `offsetof(T, field)` has no answer, in the words that name the way it has none. A misspelled
+// field is the one that matters most -- the form exists to be told when a mirror and its original
+// disagree -- so the refusal lists what the struct does store. **A bitfield has no byte offset**,
+// being a range of bits inside the one integer its struct is, and rounding down to the byte it
+// begins in would be a number that is not where it is.
+private offset_refusal(ty: Type, field: string) -> string = underlying(ty) match
+    Struct(d) ->
+        val shown = type_show(ty)
+        val ranges = bitfield_ranges(d)
+
+        if ranges.is_some()
+            val rs = ranges.unwrap()
+
+            for i in 0..<rs.len()
+                val r = rs.at(i)
+
+                if r.name == field
+                    return s"'$shown.$field' is a bitfield — it starts at bit ${r.offset} of the struct and is " +
+                        s"${r.width} bits wide, so it has no byte offset. 'offsetof' answers in bytes, and the " +
+                        "byte it begins in is not where it is"
+        end if
+
+        if d.field_index(field) >= 0
+            return s"'$shown.$field' occupies no storage, so it has no offset — a zero-sized field " +
+                "lands nowhere, and a C struct that is being mirrored has no member matching it either"
+
+        if d.fields.is_empty() then return s"'$shown' has no field '$field'"
+
+        var names: Buf[string] = buf()
+
+        for i in 0..<d.fields.len()
+            names.push(s"'${d.fields.at(i).0}'")
+
+        s"'$shown' has no field '$field' — it stores ${joined(names, ", ")}"
+    _ -> s"'offsetof' measures a field of a struct, and ${type_show(ty)} is not one"
