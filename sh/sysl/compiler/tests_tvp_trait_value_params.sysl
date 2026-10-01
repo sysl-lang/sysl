@@ -1,0 +1,280 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A **trait's value parameter** (`reference/generics.md § A trait declares one too`):
+// `trait Bytes[const N: usize]`. Everything a struct's value parameter does a trait's does in the same
+// words -- the members read it in their signatures and default bodies, an `impl`, a bound and an
+// object fix it, a default stands in where one is left out, and every value is held to the type the
+// trait wrote for it.
+//
+// **Every output, message and location here was read out of the reference compiler** (0.0.153) on
+// the same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private tvp_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end tvp_skip
+
+private tvp_skip_run() -> bool
+    if tvp_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end tvp_skip_run
+
+private tvp_write(main: string) -> string
+    val root = make_temp_dir("sysl-tvp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end tvp_write
+
+// What the program PRINTS, or what the build had to say about it.
+private tvp_ran(main: string) -> string
+    val root = tvp_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tvp_ran
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private tvp_refused(main: string, message: string, at: string)
+    val root = tvp_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end tvp_refused
+
+private tvp_bytes() -> string =
+    "trait Bytes[const N: usize]\n    bytes(self) -> [N]u8\n    size(self) -> usize = N\n" +
+    "struct W\n    x: u8\n"
+
+private tvp_bytes_4() -> string = "impl Bytes[4] for W\n    bytes(self) -> [4]u8 = [self.x, 0, 0, 0]\n"
+
+private tvp_width() -> string =
+    "trait Width[const N: usize]\n    width(self) -> usize = N\nstruct X\n    x: int\nimpl Width[2] for X\n"
+
+private tvp_hash() -> string =
+    "trait Hash[const N: usize = 32]\n    digest_len(self) -> usize = N\nstruct Sha\n    x: int\n" +
+    "impl Hash for Sha\n"
+
+private tvp_sized() -> string = "trait Sized[const N: usize = 3]\n    size(self) -> usize = N\nstruct A\n    x: int\n"
+
+// -- what an `impl` fixes -------------------------------------------------------------------------
+
+@test("a trait's value parameter is a value, so a type written for it is refused")
+tvp_a_type_written_for_it_is_refused()
+    if tvp_skip() then return
+
+    tvp_refused("trait Sized[const N: usize]\n    size(self) -> usize\nstruct W\n    x: int\n" +
+                "impl Sized[int] for W\n    size(self) -> usize = 3\nprint(1)\n",
+                "'int' is a type, and this argument stands where the declaration wrote 'const' — so a " +
+                "value of usize belongs here", "5:1")
+
+@test("a trait's value parameter is fixed by an impl, and the members read it")
+tvp_fixed_by_an_impl()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran(tvp_bytes() + tvp_bytes_4() +
+                      "val w = W(7)\nprint(w.size())\nprint(w.bytes()[0])\nprint(w.bytes().len)"),
+              "4\n7\n4\n")
+
+@test("an impl's signature must agree with the value it fixed")
+tvp_an_impl_signature_must_agree()
+    if tvp_skip() then return
+
+    tvp_refused(tvp_bytes() + "impl Bytes[4] for W\n    bytes(self) -> [2]u8 = [self.x, 0]\nprint(1)\n",
+                "method 'bytes' returns [2]byte, but trait 'Bytes' declares [4]byte", "6:1")
+
+@test("a trait's value parameter written at an impl overrides its default")
+tvp_a_written_argument_beats_the_default()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran(tvp_sized() + "impl Sized[5] for A\nprint(A(0).size())"), "5\n")
+
+@test("a trait's value parameter takes its default where an impl leaves it out")
+tvp_takes_its_default_at_an_impl()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran(tvp_sized() + "impl Sized for A\nprint(A(0).size())"), "3\n")
+
+@test("a trait's negative default is read at the declared signed type")
+tvp_a_negative_default()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran("trait Sized[const N: i8 = -1]\n    size(self) -> i8 = N\nstruct A\n    x: int\n" +
+                      "impl Sized for A\nprint(A(0).size())"), "-1\n")
+
+@test("a default body may call another that reads the trait's value parameter")
+tvp_a_default_body_reads_it_through_another()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran("trait Sized[const N: usize = 3]\n    size(self) -> usize = N\n" +
+                      "    twice(self) -> usize = self.size() * 2\nstruct A\n    x: int\n" +
+                      "impl Sized[7] for A\nprint(A(0).twice())"), "14\n")
+
+@test("a trait's value default may use an earlier value parameter")
+tvp_a_default_uses_an_earlier_value_parameter()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran("trait Pair[const A: usize, const B: usize = A]\n    total(self) -> usize = A + B\n" +
+                      "struct P\n    x: int\nimpl Pair[3] for P\nprint(P(0).total())"), "6\n")
+
+@test("a trait's value default that does not fit is refused at the trait")
+tvp_a_default_that_does_not_fit()
+    if tvp_skip() then return
+
+    tvp_refused("trait Hash[const N: u8 = 300]\n    digest_len(self) -> u8 = N\nprint(1)\n",
+                "the default for 'N' does not fit byte: 300", "1:26")
+
+@test("a trait's value argument that does not fit is refused")
+tvp_an_argument_that_does_not_fit()
+    if tvp_skip() then return
+
+    tvp_refused("trait Small[const N: u8]\n    n(self) -> u8 = N\nstruct S\n    x: int\n" +
+                "impl Small[300] for S\nprint(1)\n", "this argument does not fit byte: 300", "5:1")
+
+@test("a generic impl may abstract over a trait's value")
+tvp_a_generic_impl_abstracts_over_the_value()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran(tvp_bytes() + "struct Bits[const M: usize]\n    raw: [M]u8\n" +
+                      "impl[const M: usize] Bytes[M] for Bits[M]\n    bytes(self) -> [M]u8 = self.raw\n" +
+                      "var r: [3]u8 = [9, 8, 7]\nval b = Bits(r)\nprint(b.size())\nprint(b.bytes()[2])"),
+              "3\n7\n")
+
+// -- two values are two implementations -----------------------------------------------------------
+
+@test("a trait at two values is two implementations, each object reaching its own")
+tvp_two_values_two_implementations()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran(tvp_width() + "impl Width[4] for X\nval two: &Width[2] = X(0)\n" +
+                      "val four: &Width[4] = X(0)\nprint(two.width())\nprint(four.width())"), "2\n4\n")
+
+@test("a direct call with no argument to pick a trait's value by is told so")
+tvp_a_direct_call_cannot_pick()
+    if tvp_skip() then return
+
+    tvp_refused(tvp_width() + "impl Width[4] for X\nprint(X(0).width())\n",
+                "'width' comes from 2 implementations of one trait on X, and the arguments do not say " +
+                "which was meant", "7:12")
+
+@test("a trait implemented twice at one value is refused")
+tvp_twice_at_one_value()
+    if tvp_skip() then return
+
+    tvp_refused(tvp_width() + "impl Width[2] for X\nprint(1)\n",
+                "'X' already implements 'Width[2]' — a trait's members become the type's, so a second " +
+                "'width' at these arguments would have a call no way to say which was meant", "6:1")
+
+@test("a defaulted and a written value that agree are one implementation")
+tvp_the_default_and_the_written_value_agree()
+    if tvp_skip() then return
+
+    tvp_refused(tvp_sized() + "impl Sized for A\nimpl Sized[3] for A\nprint(1)\n",
+                "'A' already implements 'Sized' — arguments left out are the ones 'Sized' declares " +
+                "them to default to, so the two blocks implement the same trait at the same arguments",
+                "6:1")
+
+// -- a bound ---------------------------------------------------------------------------------------
+
+@test("a trait's value parameter is named by a bound")
+tvp_named_by_a_bound()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran(tvp_bytes() + tvp_bytes_4() + "f[T: Bytes[4]](x: T) -> usize = x.size() * 10\n" +
+                      "print(f(W(1)))"), "40\n")
+
+@test("a bound at another value is not met")
+tvp_a_bound_at_another_value()
+    if tvp_skip() then return
+
+    tvp_refused(tvp_bytes() + tvp_bytes_4() + "f[T: Bytes[2]](x: T) -> usize = x.size()\nprint(f(W(1)))\n",
+                "'f' requires its type parameter 'T' to implement 'Bytes[2]', but W does not — it " +
+                "implements 'Bytes[4]'", "9:7")
+
+@test("a bound at another value than the default is not met")
+tvp_a_bound_against_the_default()
+    if tvp_skip() then return
+
+    tvp_refused(tvp_sized() + "impl Sized for A\nf[T: Sized[4]](x: T) -> usize = x.size()\nprint(f(A(0)))\n",
+                "'f' requires its type parameter 'T' to implement 'Sized[4]', but A does not — it " +
+                "implements 'Sized'", "7:7")
+
+@test("a bound leaving a trait's value out takes the default")
+tvp_a_bound_takes_the_default()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran(tvp_sized() + "impl Sized for A\nf[T: Sized](x: T) -> usize = x.size()\nprint(f(A(0)))"),
+              "3\n")
+
+@test("a trait's value is solved from a use where a bound leaves it open")
+tvp_solved_from_a_use()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran(tvp_bytes() + tvp_bytes_4() +
+                      "first[T: Bytes[N], const N: usize](x: T, pad: [N]u8) -> usize = x.size() + pad.len\n" +
+                      "var p: [4]u8 = [0, 0, 0, 0]\nprint(first(W(1), p))"), "8\n")
+
+@test("a trait's value default is taken by an impl, and a bound naming it is met")
+tvp_takes_its_default_where_an_impl_leaves_it_out()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran(tvp_hash() + "f[T: Hash[32]](x: T) -> usize = x.digest_len()\nprint(f(Sha(0)))"),
+              "32\n")
+
+// -- an object -------------------------------------------------------------------------------------
+
+@test("a trait's value parameter is fixed by a trait object")
+tvp_fixed_by_a_trait_object()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran(tvp_bytes() + tvp_bytes_4() +
+                      "val o: &Bytes[4] = W(5)\nprint(o.size())\nprint(o.bytes()[0])"), "4\n5\n")
+
+@test("an object leaving a trait's value out takes the default")
+tvp_an_object_takes_the_default()
+    if tvp_skip_run() then return
+
+    assert_eq(tvp_ran(tvp_hash() + "val o: &Hash = Sha(0)\nprint(o.digest_len())"), "32\n")
+
+@test("an object leaving out a trait's value with no default is refused")
+tvp_an_object_with_no_default_is_refused()
+    if tvp_skip() then return
+
+    tvp_refused(tvp_bytes() + tvp_bytes_4() + "val o: &Bytes = W(5)\nprint(1)\n",
+                "trait 'Bytes' takes 1 type argument, but 0 type arguments were given", "8:9")

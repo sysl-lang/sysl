@@ -863,6 +863,19 @@ private read_type_args_at(a: &Analysis, scope: Scope, span: Span, name: string,
     read_args_for(a, scope, span, key.unwrap(), args, subst)
 end read_type_args_at
 
+// An argument that is a bare name an enclosing generic declaration stands in for, as its stand-in.
+private open_value_param(arg: TypeRef, subst: Buf[Binding]) -> Option[Type] =
+    *arg.kind match
+        NamedType(n, targs) -> if targs.is_empty() then abstract_bound(subst, n) else None
+        _ -> None
+
+private abstract_bound(subst: Buf[Binding], name: string) -> Option[Type] =
+    bound_type(subst, name) match
+        Some(t) -> t match
+            Abstract(_, _) -> Some(t)
+            _ -> None
+        None -> None
+
 // A **trait's** arguments as written at a bound or an `impl`, each value argument read at the type
 // the trait wrote for its `const` parameter. An argument refused stands as `Unknown`, so the list
 // keeps the length the arity check is asked about.
@@ -870,23 +883,36 @@ trait_args_read(a: &Analysis, scope: Scope, span: Span, key: string, args: Buf[T
                 subst: Buf[Binding]) -> Buf[Type]
     a.type_arg_depth += 1
 
-    val read = read_args_for(a, scope, span, key, args, subst)
+    val read = read_args_for(a, scope, span, key, args, subst, true)
 
     a.type_arg_depth -= 1
 
     if read.is_some() then return read.unwrap()
 
+    // The refusal has been said. A value parameter stands at zero of its type from here, as it does
+    // for the walk over a generic body, so the members the trait supplies are read as they would be
+    // with a good argument and say nothing more about the one that was not.
+    val pair = declared_values(a, key)
     var out: Buf[Type] = buf()
 
     for i in 0..<args.len()
-        out.push(Unknown)
+        val declared = if i < pair.0.len() then binding_named(pair.1, pair.0.at(i)) else None
+
+        if declared.is_none() then out.push(Unknown)
+        else out.push(ConstArg(from_int(0), resolve_type(a, a.tables.types.get(key).unwrap().scope,
+                                                         declared.unwrap(), no_bindings())))
 
     out
 end trait_args_read
 
 // The arguments of the declaration at `key`, a value argument read where it wrote `const`.
+//
+// `keep_open` is a trait's: a generic block's own value parameter written as the argument --
+// `impl[const M: usize] Bytes[M] for Bits[M]` -- stays the parameter, as a type parameter does, so
+// the members the trait supplies read the number each instantiation fixes rather than the zero a
+// generic body's walk stands it at.
 private read_args_for(a: &Analysis, scope: Scope, span: Span, key: string, args: Buf[TypeRef],
-                      subst: Buf[Binding]) -> Option[Buf[Type]]
+                      subst: Buf[Binding], keep_open: bool = false) -> Option[Buf[Type]]
     val pair = declared_values(a, key)
 
     if pair.0.is_empty() then return Some(resolve_list(a, scope, args, subst))
@@ -898,7 +924,11 @@ private read_args_for(a: &Analysis, scope: Scope, span: Span, key: string, args:
         val arg = args.at(i)
         val written = if i < pair.0.len() then binding_named(pair.1, pair.0.at(i)) else None
 
-        if written.is_some()
+        val open = if keep_open && written.is_some() then open_value_param(arg, subst) else None
+
+        if open.is_some()
+            out.push(open.unwrap())
+        elif written.is_some()
             val ty = resolve_type(a, home, written.unwrap(), no_bindings())
             val v = value_arg(a, scope, span, arg, ty, subst)
 
@@ -1236,12 +1266,12 @@ end opaque_c_type
 
 // Whether the arity is right, and what to say when it is not.
 private check_arity(a: &Analysis, scope: Scope, span: Span, written: string, tparams: Buf[string],
-                    tdefaults: Buf[TypeBinding], targs: Buf[Type]) -> bool
+                    tdefaults: Buf[TypeBinding], targs: Buf[Type], noun: string = "type") -> bool
     val least = tparams.len() - tdefaults.len()
 
     if targs.len() >= least && targs.len() <= tparams.len() then return true
 
-    a.fault(scope, span, s"type '$written' ${arity_phrase(tparams.len(), least)}, but " +
+    a.fault(scope, span, s"$noun '$written' ${arity_phrase(tparams.len(), least)}, but " +
             s"${quantity(targs.len(), "type argument")} ${if targs.len() == 1 then "was" else "were"} given")
     false
 end check_arity
@@ -1597,7 +1627,8 @@ private instantiate_trait(a: &Analysis, scope: Scope, span: Span, written: strin
         return Trait(key, buf(), joined_assocs(assoc_bindings(d, targs), named))
 
     if !d.tparams.is_empty() then
-        if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, targs) then return Unknown
+        if !check_arity(a, scope, span, written, d.tparams, d.tdefaults, targs, "trait") then
+            return Unknown
 
     // **What the use leaves out the trait supplies**, exactly as it does at a bound or an `impl` --
     // so `&Sink` over `trait Sink[T = int]` is `&Sink[int]`, one type under either spelling. The one
