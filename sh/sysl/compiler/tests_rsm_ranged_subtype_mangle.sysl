@@ -170,6 +170,53 @@ rsm_the_range_check_still_fires()
     assert(said.starts_with("signalled"), s"expected a trap, got: $said")
 end rsm_the_range_check_still_fires
 
+private const RsmKinds: string = raw"""
+    type Even = int where value % 2 == 0
+    type H = int
+    type Id = new int
+
+    conv[T](n: int) -> T = T(n)
+
+    print(conv[Even](4))
+    print(conv[H](5))
+    print(conv[int](6))
+    print(conv[Id](7))
+    """
+
+@test("a predicated and a derived subtype each have an instantiation of their own, a plain alias none")
+rsm_a_predicate_and_new_are_their_own_and_an_alias_is_not()
+    if !rsm_ready() then return
+
+    val ir = rsm_ir(RsmKinds)
+
+    rsm_has(ir, "define i32 @conv.Even(i32 %n.param) {\nentry:\n  %n.addr = alloca i32\n" +
+            "  store i32 %n.param, ptr %n.addr\n  %t1 = load i32, ptr %n.addr\n" +
+            "  %t2 = call i1 @Even$pred(i32 %t1)\n  br i1 %t2, label %where.ok1, label %where.bad2\n")
+    rsm_has(ir, "define i32 @conv.Id(i32 %n.param) {\nentry:\n  %n.addr = alloca i32\n" +
+            "  store i32 %n.param, ptr %n.addr\n  %t1 = load i32, ptr %n.addr\n  ret i32 %t1\n}")
+    rsm_has(ir, "call i32 @conv.Even(i32 4)")
+    rsm_has(ir, "call i32 @conv.int(i32 5)")
+    rsm_has(ir, "call i32 @conv.Id(i32 7)")
+    rsm_lacks(ir, "@conv.H")
+    assert(rsm_does(RsmKinds) == "0: 4\n5\n6\n7\n")
+end rsm_a_predicate_and_new_are_their_own_and_an_alias_is_not
+
+@test("and a value the predicate refuses traps in the predicated body")
+rsm_the_predicate_still_fires()
+    if !rsm_ready() then return
+
+    val said = rsm_does(raw"""
+        type Even = int where value % 2 == 0
+
+        conv[T](n: int) -> T = T(n)
+
+        print(conv[int](3))
+        print(conv[Even](3))
+        """)
+
+    assert(said.starts_with("signalled"), s"expected a trap, got: $said")
+end rsm_the_predicate_still_fires
+
 @test("a subtype that is only a name shares its base's instantiation")
 rsm_a_name_only_subtype_is_its_base()
     if !rsm_ready() then return
