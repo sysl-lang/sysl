@@ -479,7 +479,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     cx.ret_is_list = written.is_some() && is_result_list(written.unwrap())
 
     val split = contract_length(d.body)
-    val contract = analyze_contract(cx, d.body, split, ret)
+    val contract = analyze_contract(cx, span, d.body, split, ret)
     val rest = statements_from(d.body, split)
 
     // A function owing no value is where statement position starts: its body block is the outermost
@@ -637,7 +637,7 @@ private trait_default_decl(td: TraitDecl, m: MethodDecl) -> FuncDecl
     FuncDecl(s"${td.name}.${m.name}", tparams, params, m.ret_type, m.body, bounds, m.variadic, File,
              buf(), joined_values(td.tvalues, m.tvalues), m.tpacks, None, None, None, false, false,
              false, m.reads, m.writes,
-             None, None, m.crossing, buf(), m.marks)
+             None, None, m.crossing, buf(), m.marks, m.named_at)
 end trait_default_decl
 
 // One such body, in a region everything but a kept complaint is rewound out of.
@@ -687,7 +687,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
 
     val split = contract_length(d.body)
 
-    analyze_contract(cx, d.body, split, ret)
+    analyze_contract(cx, decl_anchor(d), d.body, split, ret)
 
     val body = body_block(cx, statements_from(d.body, split), ret)
     var params: Buf[(string, Type)] = buf()
@@ -831,7 +831,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     cx.in_variadic = d.variadic
 
     val split = contract_length(d.body)
-    val contract = analyze_contract(cx, d.body, split, ret)
+    val contract = analyze_contract(cx, decl_anchor(d), d.body, split, ret)
     val rest = statements_from(d.body, split)
     val body = body_block(cx, rest, ret)
     val span = body_span(rest, span_zero())
@@ -955,8 +955,8 @@ end statements_from
 // The leading `require`/`ensure`/`variant` clauses. Both conditions must be `bool`; `result` and
 // `old(e)` are only in scope inside an `ensure` -- `result` also only where the function returns a
 // value -- and the `old` expressions are collected so that the emitter can snapshot them at entry.
-analyze_contract(cx: &Analyzer, body: Buf[Stmt], upto: usize,
-                         ret: Type) -> (Buf[TClause], Buf[TClause], Buf[TExpr], Option[TExpr])
+analyze_contract(cx: &Analyzer, at: Span, body: Buf[Stmt], upto: usize,
+                 ret: Type) -> (Buf[TClause], Buf[TClause], Buf[TExpr], Option[TExpr])
     var requires: Buf[TClause] = buf()
     var ensures: Buf[TClause] = buf()
     var olds: Buf[TExpr] = buf()
@@ -966,13 +966,13 @@ analyze_contract(cx: &Analyzer, body: Buf[Stmt], upto: usize,
         val c = body.at(i)
 
         *c.kind match
-            Require(cond, msg) -> requires.push(TClause(analyze_bool(cx, cond), msg))
+            Require(cond, msg) -> requires.push(TClause(analyze_bool(cx, cond, at), msg))
 
             Ensure(cond, msg) ->
                 cx.ensure_result = if ret == Unit then None else Some(ret)
                 cx.olds = Some(olds)
 
-                val tc = analyze_bool(cx, cond)
+                val tc = analyze_bool(cx, cond, at)
 
                 olds = cx.olds.unwrap()
                 cx.olds = None
@@ -1007,6 +1007,11 @@ end function_measure
 
 // Where a complaint about the whole body points: its last statement, which is the expression the
 // body came to, and the declaration itself for a body with none.
+// Where a diagnostic about a declaration as a whole goes: the line that declared it, or -- for a
+// function the compiler made up, which was written nowhere -- its body.
+decl_anchor(d: FuncDecl) -> Span =
+    if d.at.end > d.at.start then d.at else body_span(d.body, span_zero())
+
 body_span(rest: Buf[Stmt], span: Span) -> Span
     if rest.is_empty() then return span
 
