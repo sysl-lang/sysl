@@ -479,7 +479,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     cx.ret_is_list = written.is_some() && is_result_list(written.unwrap())
 
     val split = contract_length(d.body)
-    val contract = analyze_contract(cx, d.body, split, ret)
+    val contract = analyze_contract(cx, span, d.body, split, ret)
     val rest = statements_from(d.body, split)
 
     // A function owing no value is where statement position starts: its body block is the outermost
@@ -687,7 +687,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
 
     val split = contract_length(d.body)
 
-    analyze_contract(cx, d.body, split, ret)
+    analyze_contract(cx, body_span(d.body, span_zero()), d.body, split, ret)
 
     val body = body_block(cx, statements_from(d.body, split), ret)
     var params: Buf[(string, Type)] = buf()
@@ -831,7 +831,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     cx.in_variadic = d.variadic
 
     val split = contract_length(d.body)
-    val contract = analyze_contract(cx, d.body, split, ret)
+    val contract = analyze_contract(cx, body_span(d.body, span_zero()), d.body, split, ret)
     val rest = statements_from(d.body, split)
     val body = body_block(cx, rest, ret)
     val span = body_span(rest, span_zero())
@@ -955,8 +955,8 @@ end statements_from
 // The leading `require`/`ensure`/`variant` clauses. Both conditions must be `bool`; `result` and
 // `old(e)` are only in scope inside an `ensure` -- `result` also only where the function returns a
 // value -- and the `old` expressions are collected so that the emitter can snapshot them at entry.
-analyze_contract(cx: &Analyzer, body: Buf[Stmt], upto: usize,
-                         ret: Type) -> (Buf[TClause], Buf[TClause], Buf[TExpr], Option[TExpr])
+analyze_contract(cx: &Analyzer, at: Span, body: Buf[Stmt], upto: usize,
+                 ret: Type) -> (Buf[TClause], Buf[TClause], Buf[TExpr], Option[TExpr])
     var requires: Buf[TClause] = buf()
     var ensures: Buf[TClause] = buf()
     var olds: Buf[TExpr] = buf()
@@ -966,13 +966,13 @@ analyze_contract(cx: &Analyzer, body: Buf[Stmt], upto: usize,
         val c = body.at(i)
 
         *c.kind match
-            Require(cond, msg) -> requires.push(TClause(analyze_bool(cx, cond), msg))
+            Require(cond, msg) -> requires.push(TClause(analyze_bool(cx, cond, at), msg))
 
             Ensure(cond, msg) ->
                 cx.ensure_result = if ret == Unit then None else Some(ret)
                 cx.olds = Some(olds)
 
-                val tc = analyze_bool(cx, cond)
+                val tc = analyze_bool(cx, cond, at)
 
                 olds = cx.olds.unwrap()
                 cx.olds = None

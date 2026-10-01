@@ -67,12 +67,14 @@ private unwrap_results(cx: &Analyzer, e: Expr, raw: TExpr, allowed: bool) -> TEx
         _ -> raw
 end unwrap_results
 
-// A condition, which must be a `bool`.
-analyze_bool(cx: &Analyzer, e: Expr) -> TExpr
+// A condition, which must be a `bool`. A refusal is anchored at `at`, the form that asks for the
+// boolean -- the `if`, the loop, the `&&`, the `!`, the clause or the function a contract belongs
+// to -- rather than at the operand, which is where the reference puts it.
+analyze_bool(cx: &Analyzer, e: Expr, at: Span) -> TExpr
     val t = type_expr(cx, e, Some(Bool))
 
     if texpr_type(t) != Bool && texpr_type(t) != Unknown then
-        return cx.err(e.span, s"condition must be bool, got ${type_show(texpr_type(t))}")
+        return cx.err(at, s"condition must be bool, got ${type_show(texpr_type(t))}")
 
     t
 end analyze_bool
@@ -1091,7 +1093,7 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
                 return float_literal(cx, e.span, s"-$text", suffix, expected)
             _ -> ()
 
-    if op == "!" then return TExpr(e.span, TUnary("!", analyze_bool(cx, operand), Bool))
+    if op == "!" then return TExpr(e.span, TUnary("!", analyze_bool(cx, operand, e.span), Bool))
     if op == "&"
         // `&f` on a declared function is C's address of it rather than the address of a place.
         val named = names_a_declared_function(cx, operand)
@@ -1232,7 +1234,7 @@ end inc_dec
 private binary_expr(cx: &Analyzer, span: Span, op: string, l: Expr, r: Expr,
                     expected: Option[Type]) -> TExpr
     if op == "&&" || op == "||" then
-        return TExpr(span, TLogical(op, analyze_bool(cx, l), analyze_bool(cx, r)))
+        return TExpr(span, TLogical(op, analyze_bool(cx, l, span), analyze_bool(cx, r, span)))
 
     var operands: Buf[Expr] = buf()
 

@@ -73,12 +73,12 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
     var settled_else: Option[TBlock] = None
 
     if then_wants.is_some() || else_body.is_none()
-        val side = then_side(cx, cond, then_body, then_wants, discarded)
+        val side = then_side(cx, span, cond, then_body, then_wants, discarded)
 
         tc = side.0
         then_block = side.1
     else
-        val tried = attempt_then(cx, cond, then_body, None, discarded)
+        val tried = attempt_then(cx, span, cond, then_body, None, discarded)
 
         if tried.is_some()
             tc = tried.unwrap().0
@@ -89,7 +89,7 @@ if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
             // *then* raises what the first one swallowed -- the same words, at the branch the
             // reader wrote first.
             val sibling = attempt_block(cx, else_body.unwrap(), None, discarded)
-            val side = then_side(cx, cond, then_body, sibling.and_then(b -> settles(b)), discarded)
+            val side = then_side(cx, span, cond, then_body, sibling.and_then(b -> settles(b)), discarded)
 
             tc = side.0
             then_block = side.1
@@ -114,11 +114,11 @@ end early_else
 // The condition's own scope wraps the condition and the *then* branch and nothing else, which is
 // the whole of what an `is` binding's reach has to be. The `else` is read outside it, and so is an
 // `elif` -- the parser nests one into the else branch, so it is already on the other side of this.
-private then_side(cx: &Analyzer, cond: Expr, then_body: Buf[Stmt], want: Option[Type],
+private then_side(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt], want: Option[Type],
                   discarded: bool) -> (Buf[TCondTerm], TBlock)
     cx.enter()
 
-    val tc = analyze_cond(cx, cond)
+    val tc = analyze_cond(cx, cond, span)
     val tb = type_value_block(cx, then_body, want, discarded)
 
     cx.leave()
@@ -172,8 +172,9 @@ end if_type
 // The chain is flattened here rather than left as nested `&&` because a term may **bind**, and a
 // binding's reach is "from its own `is` rightward" -- which is a statement about the flat sequence
 // and not about a tree. Terms are read left to right, in the scope the caller opened, so each `is`
-// declares into the scope the terms after it look names up in.
-analyze_cond(cx: &Analyzer, e: Expr) -> Buf[TCondTerm]
+// declares into the scope the terms after it look names up in. A term that is not a `bool` is
+// refused at `at`, the `if` or `while` the chain belongs to.
+analyze_cond(cx: &Analyzer, e: Expr, at: Span) -> Buf[TCondTerm]
     var parts: Buf[Expr] = buf()
 
     conjuncts(&parts, e)
@@ -181,7 +182,7 @@ analyze_cond(cx: &Analyzer, e: Expr) -> Buf[TCondTerm]
     var out: Buf[TCondTerm] = buf()
 
     for i in 0..<parts.len()
-        out.push(cond_term(cx, parts.at(i)))
+        out.push(cond_term(cx, parts.at(i), at))
 
     out
 end analyze_cond
@@ -196,9 +197,9 @@ private conjuncts(out: *Buf[Expr], e: Expr)
                 out.push(e)
         _ -> out.push(e)
 
-private cond_term(cx: &Analyzer, e: Expr) -> TCondTerm = *e.kind match
+private cond_term(cx: &Analyzer, e: Expr, at: Span) -> TCondTerm = *e.kind match
     IsPattern(subject, patterns, negated) -> cond_is(cx, e.span, subject, patterns, negated)
-    _ -> TCondTest(analyze_bool(cx, e))
+    _ -> TCondTest(analyze_bool(cx, e, at))
 
 private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern],
                 negated: bool) -> TCondTerm
@@ -323,7 +324,7 @@ private analyze_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, expected: Option[
     if tpats.len() > 1 && any_pattern_binds(tpats) then
         cx.fault(arm.span, "alternative patterns joined by '|' cannot bind a name")
 
-    val guard = arm.guard.map(g -> analyze_bool(cx, g))
+    val guard = arm.guard.map(g -> analyze_bool(cx, g, arm.span))
     val body = type_block_body(cx, arm.body, expected, discarded)
 
     cx.leave()
@@ -457,7 +458,7 @@ while_expr(cx: &Analyzer, span: Span, label: Option[string], cond: Expr, body: B
     // is the one path on which there is nothing bound, so it sits outside.
     cx.enter()
 
-    val tc = analyze_cond(cx, cond)
+    val tc = analyze_cond(cx, cond, span)
     val ctx = open_loop(cx, span, expected, label)
     val tbody = type_stmts(cx, body)
 
@@ -483,7 +484,7 @@ do_while_expr(cx: &Analyzer, span: Span, label: Option[string], body: Buf[Stmt],
 
     close_loop(cx, ctx)
 
-    val tcond = analyze_bool(cx, cond)
+    val tcond = analyze_bool(cx, cond, span)
     val telse = else_body.map(b -> type_value_block(cx, b, expected, discarded))
     val ty = loop_result_type(cx, span, ctx, telse)
 
@@ -510,7 +511,7 @@ c_for_expr(cx: &Analyzer, span: Span, label: Option[string], init: Option[Stmt],
 
     if init.is_some() then push_all(&tinit, recover_stmt(cx, init.unwrap()))
 
-    val tcond = cond.map(c -> analyze_bool(cx, c))
+    val tcond = cond.map(c -> analyze_bool(cx, c, span))
     val ctx = open_loop(cx, span, expected, label)
     val tbody = loop_stmts(cx, body)
 
@@ -840,7 +841,7 @@ quantifier_expr(cx: &Analyzer, span: Span, universal: bool, name: string, iter: 
     cx.enter()
 
     val u = cx.bind(name, vty)
-    val tp = analyze_bool(cx, pred)
+    val tp = analyze_bool(cx, pred, span)
 
     cx.leave()
     TExpr(span, TQuantifier(universal, u, vty, tlo, thi, bounds.unwrap().2, tp))
@@ -992,11 +993,11 @@ private attempt_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, expected: Option[
     Some(t)
 end attempt_arm
 
-private attempt_then(cx: &Analyzer, cond: Expr, then_body: Buf[Stmt], want: Option[Type],
-                     discarded: bool) -> Option[(Buf[TCondTerm], TBlock)]
+private attempt_then(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt],
+                     want: Option[Type], discarded: bool) -> Option[(Buf[TCondTerm], TBlock)]
     val said = cx.an.complaints()
     val mark = cx.an.sandboxed()
-    val t = then_side(cx, cond, then_body, want, discarded)
+    val t = then_side(cx, span, cond, then_body, want, discarded)
 
     if cx.an.complaints() > said
         cx.an.release(mark)

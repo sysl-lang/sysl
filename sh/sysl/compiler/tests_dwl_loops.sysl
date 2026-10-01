@@ -1,0 +1,445 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The reference's `DoWhileTests` and `CForTests`: the post-test loop `do body while cond` and the
+// three-clause `for init; cond; step`. Each is a loop form of its own rather than sugar — a
+// `continue` in a `do` reaches the test, and a `continue` in a three-clause `for` reaches the step —
+// and each joins the loop family's shared behaviour: a `break` carrying a value, an `else` on
+// normal completion, labels.
+//
+// **Every diagnostic and every output here was read out of the reference compiler (0.0.153)** by
+// handing the installed `sysl` the same program; the block labels are its `emit-llvm`. The harness
+// is the one `tests_xvr_extern_var.sysl` builds: `xvr_ran` for a program linked and run, which
+// answers with the build's refusal where there is one, and `xvr_ir` for the text.
+
+private dwl_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private dwl_ran(text: string) -> string = xvr_ran(dwl_main(text))
+
+private dwl_ir(text: string) -> string = xvr_ir(dwl_main(text))
+
+// A refusal carries this message, anchored at this `file:line:column`.
+private dwl_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> "), said)
+    assert(said.contains(s"/$at\n"), said)
+
+// The text of one function's body, from its `define` to the closing brace.
+private dwl_body_of(text: string, symbol: string) -> string
+    val start = text.index_of(s"@$symbol(") match
+        Some(at) -> at
+        None -> return ""
+
+    val rest = text[start..]
+
+    rest.index_of("\n}\n") match
+        Some(end) -> rest[0..<end]
+        None -> rest
+end dwl_body_of
+
+// -- the 'do' form parses ------------------------------------------------------------------------
+
+@test("a 'do' parses with an indented body and the test on the line that closes it")
+dwl_do_with_an_indented_body()
+    assert_eq(pf("do\n    print(1)\nwhile more()"), "(do-while (call print 1) (call more))")
+
+@test("a 'do' parses with the whole loop on one line")
+dwl_do_on_one_line()
+    assert_eq(pf("do total += 1 while more()"), "(do-while (+= total 1) (call more))")
+
+@test("a 'do' parses with a label and an 'else'")
+dwl_do_with_a_label_and_an_else()
+    assert_eq(pf("'scan do\n    print(1)\nwhile more()\nelse 0"), "(do-while 'scan (call print 1) (call more) (else 0))")
+
+// `do` is a body introducer everywhere else, always after a loop header on the same line, so it is
+// never the first token of a statement and the two readings cannot meet.
+@test("'do' after a 'while' header is still the body introducer")
+dwl_do_after_a_while_header()
+    assert_eq(pf("while c do x = 1"), "(while c (= x 1))")
+
+@test("'do' after a 'loop' header is still the body introducer")
+dwl_do_after_a_loop_header()
+    assert_eq(pf("loop do x = 1"), "(loop (= x 1))")
+
+@test("'do' after a 'for' header is still the body introducer")
+dwl_do_after_a_for_header()
+    assert_eq(pf("for x in 0..<3 do print(x)"), "(for x (..< 0 3) (call print x))")
+
+// -- the body runs before anything is asked ------------------------------------------------------
+
+@test("a 'do' runs its body once even when the test is false at entry")
+dwl_do_runs_when_false_at_entry()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var t = 0\ndo\n    t += 1\nwhile false\nprint(str(t))\n"), "1\n")
+
+@test("a 'do' is what makes zero print as a digit")
+dwl_do_prints_zero_as_a_digit()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var n = 0\nvar s = \"\"\ndo\n    s = str(n % 10) + s\n    n /= 10\nwhile n > 0\nprint(s)\n"),
+              "0\n")
+
+@test("the same 'do' still walks a number with several digits")
+dwl_do_walks_several_digits()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var n = 4071\nvar s = \"\"\ndo\n    s = str(n % 10) + s\n    n /= 10\nwhile n > 0\nprint(s)\n"),
+              "4071\n")
+
+@test("a one-line 'do' runs its single statement")
+dwl_do_one_line_runs()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var i = 0\ndo i += 1 while i < 4\nprint(str(i))\n"), "4\n")
+
+// -- 'continue' runs the test --------------------------------------------------------------------
+
+@test("a 'continue' in a 'do' still asks whether to stop")
+dwl_do_continue_runs_the_test()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var i = 0\nvar s = \"\"\ndo\n    i += 1\n    if i % 2 == 0 then continue\n    s += str(i)\nwhile i < 5\nprint(s)\n"),
+              "135\n")
+
+@test("a 'continue' reaching an outer 'do' runs the outer test")
+dwl_do_continue_reaches_an_outer_one()
+    if xvr_no_library() then return
+
+    val text = "var s = \"\"\nvar i = 0\n'outer do\n    i += 1\n    var j = 0\n    do\n        j += 1\n" +
+               "        if j == 2 then continue 'outer\n        s += s\"${str(i)}${str(j)} \"\n    while j < 3\n" +
+               "while i < 3\nprint(s)\n"
+
+    assert_eq(dwl_ran(text), "11 21 31 \n")
+end dwl_do_continue_reaches_an_outer_one
+
+// -- a 'do' is an expression ---------------------------------------------------------------------
+
+@test("a 'do' carries a 'break' value, and its 'else' supplies the other")
+dwl_do_break_carries_a_value()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var i = 0\nvar found = do\n    i += 1\n    if i * i > 20 then break i\nwhile i < 10\nelse -1\nprint(str(found))\n"),
+              "5\n")
+
+@test("a 'do's 'else' is what runs when nothing broke")
+dwl_do_else_runs_when_nothing_broke()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var i = 0\nvar found = do\n    i += 1\n    if i > 99 then break i\nwhile i < 3\nelse -1\nprint(str(found))\n"),
+              "-1\n")
+
+@test("a labelled 'break' leaves an outer 'do'")
+dwl_do_labelled_break()
+    if xvr_no_library() then return
+
+    val text = "var s = \"\"\nvar i = 0\n'outer do\n    for j in 0..<3\n        if i * j == 2 then break 'outer\n" +
+               "        s += s\"${str(i)}${str(j)} \"\n    i += 1\nwhile i < 3\nprint(s)\n"
+
+    assert_eq(dwl_ran(text), "00 01 02 10 11 \n")
+end dwl_do_labelled_break
+
+@test("a bare 'break' with no 'else' is the ordinary statement 'do'")
+dwl_do_bare_break()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var i = 0\ndo\n    i += 1\n    if i == 3 then break\nwhile i < 10\nprint(str(i))\n"), "3\n")
+
+// -- what a 'do' will not accept -----------------------------------------------------------------
+
+@test("a 'do' whose test is not a boolean is refused")
+dwl_do_test_not_bool()
+    if xvr_no_library() then return
+
+    dwl_refused(dwl_ran("do\n    print(1)\nwhile 1\n"), "condition must be bool, got int", "main.sysl:1:1")
+
+// The body's scope has closed by the time the test is reached: a `var` in the body is remade each
+// round, so a test reading one would be reading the round that has just ended.
+@test("a name a 'do' body declared is not in scope for its test")
+dwl_do_test_cannot_read_the_body()
+    if xvr_no_library() then return
+
+    dwl_refused(dwl_ran("do\n    var k = 1\nwhile k < 2\n"), "undefined name 'k'", "main.sysl:3:7")
+
+// A test at the foot guards nothing — the body it belongs to has already run.
+@test("an 'is' binding in a 'do's test has nothing to reach and is refused")
+dwl_do_test_refuses_is()
+    if xvr_no_library() then return
+
+    val said = "'is' tests a pattern in the condition of an 'if' or a 'while', and nowhere else — its " +
+               "binding is live from here to the end of the condition and through the branch that " +
+               "condition guards, and there is no such branch here. Chain it with '&&', or write 'match'"
+
+    dwl_refused(dwl_ran("var p: Option[int] = Some(1)\ndo\n    p = None\nwhile p is Some(v)\n"), said, "main.sysl:4:7")
+end dwl_do_test_refuses_is
+
+@test("a 'do' breaking with a value and no 'else' is refused")
+dwl_do_break_value_without_else()
+    if xvr_no_library() then return
+
+    dwl_refused(dwl_ran("var n = do\n    break 1\nwhile false\nprint(str(n))\n"),
+                "this loop breaks with a int but has no 'else' to give a value when it finishes normally — add an 'else'",
+                "main.sysl:1:9")
+
+@test("a 'do' whose 'break' value and 'else' value disagree is refused")
+dwl_do_break_and_else_disagree()
+    if xvr_no_library() then return
+
+    dwl_refused(dwl_ran("var n = do\n    break 1\nwhile false\nelse \"x\"\nprint(str(n))\n"),
+                "a loop's break values and its 'else' must have the same type, but got int and string",
+                "main.sysl:1:9")
+
+// -- the emitted shape of a 'do' -----------------------------------------------------------------
+
+// Entering at the body rather than at the test is what makes the loop post-test: the entry branch
+// names the body, so the body's label is mentioned before the test's exists at all.
+@test("a 'do' enters at the body, not at the test")
+dwl_do_enters_at_the_body()
+    if xvr_no_library() then return
+
+    val text = dwl_ir("var i = 0\ndo\n    i += 1\nwhile i < 2\nprint(str(i))\n")
+
+    assert(text.contains("br label %dowhile.body"), text)
+
+    val body = text.index_of("dowhile.body").unwrap_or(text.len)
+    val cond = text.index_of("dowhile.cond").unwrap_or(0)
+
+    assert(body < cond, text)
+end dwl_do_enters_at_the_body
+
+@test("a 'do' sends 'continue' to the test, not back to the body")
+dwl_do_continue_goes_to_the_test()
+    if xvr_no_library() then return
+
+    val text = dwl_ir("var i = 0\ndo\n    i += 1\n    if i == 1 then continue\nwhile i < 3\nprint(str(i))\n")
+
+    assert(text.contains("br label %dowhile.cond"), text)
+
+// -- a view broken out of a loop is promoted -----------------------------------------------------
+
+// A loop is an expression, so a `break` of a frame-backed slice out of one carries it out exactly as
+// a `return` does, and the storage has to be promoted to the heap or the caller reads a dead frame.
+private dwl_promoted(text: string) =
+    assert_eq(dwl_ran(text), "4 5\n")
+
+    val body = dwl_body_of(dwl_ir(text), "leak")
+
+    assert(body.contains("call ptr @malloc"), body)
+end dwl_promoted
+
+@test("a view broken out of a 'do' is promoted")
+dwl_view_out_of_a_do()
+    if xvr_no_library() then return
+
+    dwl_promoted("leak() -> []int\n    var buf: [4]int\n    buf[2usize] = 5\n    var i = 0\n    do\n        i += 1\n" +
+                 "        if i == 2 then break buf[..]\n    while i < 4\n    else buf[0..<0]\nend leak\n" +
+                 "var v = leak()\nprint(v.len, v[2usize])\n")
+
+@test("a view broken out of a 'loop' is promoted")
+dwl_view_out_of_a_loop()
+    if xvr_no_library() then return
+
+    dwl_promoted("leak() -> []int\n    var buf: [4]int\n    buf[2usize] = 5\n    var i = 0\n    loop\n        i += 1\n" +
+                 "        if i == 2 then break buf[..]\nend leak\nvar v = leak()\nprint(v.len, v[2usize])\n")
+
+@test("a view broken out of a three-clause 'for' is promoted")
+dwl_view_out_of_a_cfor()
+    if xvr_no_library() then return
+
+    dwl_promoted("leak() -> []int\n    var buf: [4]int\n    buf[2usize] = 5\n    for var i = 0; i < 4; i += 1\n" +
+                 "        if i == 2 then break buf[..]\n    else buf[0..<0]\nend leak\nvar v = leak()\n" +
+                 "print(v.len, v[2usize])\n")
+
+// -- the three-clause 'for' parses ---------------------------------------------------------------
+
+@test("a three-clause 'for' parses with all three clauses")
+dwl_cfor_all_three_clauses()
+    assert_eq(pf("for var i = 0; i < 2; i += 1\n    print(i)"), "(cfor (var i 0) (cmp i < 2) (+= i 1) (call print i))")
+
+@test("a three-clause 'for' parses with every clause left out")
+dwl_cfor_clauses_left_out()
+    assert_eq(pf("for ; ;\n    print(1)"), "(cfor (call print 1))")
+
+// The two forms are told apart by the semicolons, so neither has to be written differently.
+@test("the range 'for' beside the three-clause one still parses as it did")
+dwl_cfor_range_form_undisturbed()
+    assert_eq(pf("for x in 0..<3\n    print(x)"), "(for x (..< 0 3) (call print x))")
+
+@test("a semicolon separates a three-clause header and nothing else")
+dwl_cfor_semicolon_nowhere_else()
+    assert_eq(pf_err("print(1); print(2)"), "newline expected")
+
+// -- it counts -----------------------------------------------------------------------------------
+
+@test("a three-clause 'for' counts over a body")
+dwl_cfor_counts_over_a_body()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var t = 0\nfor var i = 0; i < 5; i += 1\n    t += i\nprint(str(t))\n"), "10\n")
+
+@test("a three-clause 'for' counts at whatever type the counter was declared")
+dwl_cfor_counts_at_the_declared_type()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var t: usize = 0usize\nfor var i: usize = 0usize; i < 4usize; i += 1usize\n    t += i\nprint(str(t))\n"),
+              "6\n")
+
+@test("a three-clause 'for' counts downward, which a range cannot say")
+dwl_cfor_counts_downward()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var s = \"\"\nfor var i = 3; i > 0; i -= 1\n    s += str(i)\nprint(s)\n"), "321\n")
+
+@test("a three-clause 'for' counts by a stride")
+dwl_cfor_counts_by_a_stride()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var s = \"\"\nfor var i = 0; i < 10; i += 3\n    s += str(i)\nprint(s)\n"), "0369\n")
+
+@test("a three-clause 'for' whose body never runs")
+dwl_cfor_body_never_runs()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var t = 0\nfor var i = 5; i < 5; i += 1\n    t += 1\nprint(str(t))\n"), "0\n")
+
+@test("a three-clause 'for' with an empty init counts a counter declared outside it")
+dwl_cfor_empty_init()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var k = 0\nfor ; k < 3; k += 1\n    print(str(k))\n"), "0\n1\n2\n")
+
+@test("a three-clause 'for' with an empty step is advanced by the body instead")
+dwl_cfor_empty_step()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var s = \"\"\nfor var i = 0; i < 3;\n    s += str(i)\n    i += 1\nprint(s)\n"), "012\n")
+
+// -- the step runs on 'continue' -----------------------------------------------------------------
+
+@test("a 'continue' in a three-clause 'for' still advances")
+dwl_cfor_continue_advances()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var odd = 0\nfor var i = 0; i < 10; i += 1\n    if i % 2 == 0 then continue\n    odd += i\nprint(str(odd))\n"),
+              "25\n")
+
+@test("a 'continue' reaching an outer three-clause 'for' runs the outer step")
+dwl_cfor_continue_reaches_an_outer_loop()
+    if xvr_no_library() then return
+
+    val text = "var s = \"\"\n'outer for var i = 0; i < 3; i += 1\n    for var j = 0; j < 3; j += 1\n" +
+               "        if j == 1 then continue 'outer\n        s += s\"${str(i)}${str(j)} \"\nprint(s)\n"
+
+    assert_eq(dwl_ran(text), "00 10 20 \n")
+end dwl_cfor_continue_reaches_an_outer_loop
+
+// -- a three-clause 'for' is an expression -------------------------------------------------------
+
+@test("a three-clause 'for' carries a 'break' value, and its 'else' supplies the other")
+dwl_cfor_break_carries_a_value()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var found = for var i = 0; i < 10; i += 1\n    if i * i > 20 then break i\nelse -1\nprint(str(found))\n"),
+              "5\n")
+
+@test("a three-clause 'for's 'else' is what runs when nothing broke")
+dwl_cfor_else_runs_when_nothing_broke()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var found = for var i = 0; i < 3; i += 1\n    if i > 99 then break i\nelse -1\nprint(str(found))\n"),
+              "-1\n")
+
+@test("a three-clause 'for' with no condition ends only through a 'break', and carries its value with no 'else'")
+dwl_cfor_no_condition_breaks_with_a_value()
+    if xvr_no_library() then return
+
+    assert_eq(dwl_ran("var n = for var i = 0; ; i += 1\n    if i == 4 then break i * 10\nprint(str(n))\n"), "40\n")
+
+@test("a labelled 'break' leaves an outer three-clause 'for'")
+dwl_cfor_labelled_break()
+    if xvr_no_library() then return
+
+    val text = "var s = \"\"\n'outer for var i = 0; i < 3; i += 1\n    for var j = 0; j < 3; j += 1\n" +
+               "        if i * j == 2 then break 'outer\n        s += s\"${str(i)}${str(j)} \"\nprint(s)\n"
+
+    assert_eq(dwl_ran(text), "00 01 02 10 11 \n")
+end dwl_cfor_labelled_break
+
+// -- what a three-clause 'for' will not accept ---------------------------------------------------
+
+@test("a three-clause 'for' whose condition is not a boolean is refused")
+dwl_cfor_condition_not_bool()
+    if xvr_no_library() then return
+
+    dwl_refused(dwl_ran("for var i = 0; i; i += 1\n    print(i)\n"), "condition must be bool, got int", "main.sysl:1:1")
+
+// An `else` runs on normal completion, and a loop with no condition has none.
+@test("an 'else' on a three-clause 'for' that cannot finish on its own is refused")
+dwl_cfor_else_that_cannot_run()
+    if xvr_no_library() then return
+
+    dwl_refused(dwl_ran("var n = for var i = 0; ; i += 1\n    if i == 2 then break i\nelse 0\nprint(str(n))\n"),
+                "this 'for' has no condition, so it never finishes on its own and its 'else' cannot run",
+                "main.sysl:1:9")
+
+@test("a name a three-clause 'for' declared in its init is gone after the loop")
+dwl_cfor_init_name_is_gone_after()
+    if xvr_no_library() then return
+
+    dwl_refused(dwl_ran("for var i = 0; i < 2; i += 1\n    print(i)\nprint(i)\n"), "undefined name 'i'", "main.sysl:3:7")
+
+// -- where a condition that is not a boolean is refused ------------------------------------------
+
+// The refusal is anchored at the form that asks for the boolean, not at the operand that failed to
+// be one: the loop or `if`, the `&&` or `!`, the `invariant`, the guarded arm, the quantifier, and
+// for a `require` or `ensure` the function the contract belongs to. Each anchor below is the
+// reference's on the same program.
+@test("a condition that is not a boolean is refused at the form asking for one")
+dwl_not_bool_is_refused_at_the_asking_form()
+    if xvr_no_library() then return
+
+    val said = "condition must be bool, got int"
+
+    dwl_refused(dwl_ran("var x = 1\nval b =\n    x + 1 > 0 && x\nprint(b)\n"), said, "main.sysl:3:5")
+    dwl_refused(dwl_ran("f(n: int) -> bool\n    val z = 1\n    !n\nprint(f(1))\n"), said, "main.sysl:3:5")
+    dwl_refused(dwl_ran("var x = 2\nx = 3\nwhile x > 0 && 1\n    x -= 1\n"), said, "main.sysl:3:1")
+    dwl_refused(dwl_ran("var i = 0\ndo\n    i += 1\nwhile i < 3 && 1\n"), said, "main.sysl:4:7")
+    dwl_refused(dwl_ran("f(n: int) -> int\n    require n\n    n\nprint(f(1))\n"), said, "main.sysl:1:1")
+    dwl_refused(dwl_ran("f(n: int) -> int\n    ensure n\n    n\nprint(f(1))\n"), said, "main.sysl:1:1")
+    dwl_refused(dwl_ran("val x = 3\nval y = x match\n    n if n * 1 -> 1\n    _ -> 2\nprint(y)\n"), said,
+                "main.sysl:3:5")
+    dwl_refused(dwl_ran("var x = 2\nwhile x > 0\n    invariant x\n    x -= 1\n"), said, "main.sysl:3:5")
+    dwl_refused(dwl_ran("f(n: int) -> bool = for all i in 0..<n do i\nprint(f(1))\n"), said, "main.sysl:1:21")
+    dwl_refused(dwl_ran("val x = 2\nif x > 0 && 1 then print(1)\n"), said, "main.sysl:2:1")
+    dwl_refused(dwl_ran("val x = 2\nval y = if  1 then 1 else 2\nprint(y)\n"), said, "main.sysl:2:9")
+    dwl_refused(dwl_ran("var x = 2\nval y = while  x > 0 && 1 do x -= 1\n"), said, "main.sysl:2:9")
+end dwl_not_bool_is_refused_at_the_asking_form
+
+// Two operands refused at one anchor are one refusal, as the reference reports them.
+@test("two operands of one '&&' that are not booleans are refused once")
+dwl_two_non_bool_operands_are_one_refusal()
+    if xvr_no_library() then return
+
+    val a = dwl_ran("val b = 1 && 2\nprint(b)\n")
+    val b = dwl_ran("if 1 && 2 then print(1)\n")
+
+    dwl_refused(a, "condition must be bool, got int", "main.sysl:1:9")
+    dwl_refused(b, "condition must be bool, got int", "main.sysl:1:1")
+    assert_eq(xvr_count(a, "error:"), 1)
+    assert_eq(xvr_count(b, "error:"), 1)
+end dwl_two_non_bool_operands_are_one_refusal
+
+// -- the emitted shape of a three-clause 'for' ---------------------------------------------------
+
+// `continue` branching to the step block rather than to the condition is the whole difference
+// between this loop and a `while`.
+@test("a three-clause 'for' sends 'continue' to the step, not to the test")
+dwl_cfor_continue_goes_to_the_step()
+    if xvr_no_library() then return
+
+    val text = dwl_ir("for var i = 0; i < 2; i += 1\n    if i == 0 then continue\n    print(i)\n")
+
+    assert(text.contains("cfor.step"), text)
+    assert(text.contains("br label %cfor.step"), text)
+end dwl_cfor_continue_goes_to_the_step
