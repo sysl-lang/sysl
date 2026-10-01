@@ -1,0 +1,306 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, read_bytes, remove_dir_all}
+import sysl.text.{from_utf8_unchecked, Search}
+
+// The `ar` container, read (`ar_members`).
+//
+// A library is one of these, so this is the layer everything about libraries stands on. What is worth
+// pinning is the **names**, because that is the part that fails quietly: a member's body is either
+// there or it is not, but a mis-parsed name comes back as plausible garbage while the bytes beside it
+// are perfect.
+//
+// The fixtures are archives assembled by hand, because the reader's failure paths have no other way to
+// be reached -- every archive a toolchain produces is a good one -- and because which long-name
+// convention appears is decided by the target, so a host archiver would only ever exercise one.
+
+// -- the fixture ------------------------------------------------------------------------------------
+
+private tlc_text(s: string) -> Buf[u8]
+    var out: Buf[u8] = buf()
+
+    for i in 0..<s.bytes.len
+        out.push(s.bytes[i])
+
+    out
+end tlc_text
+
+private tlc_append(out: *Buf[u8], more: Buf[u8])
+    for i in 0..<more.len()
+        out.push(more.at(i))
+
+private tlc_padded(text: string, width: usize) -> string
+    var out = text
+
+    for i in text.bytes.len..<width
+        out = out + " "
+
+    out
+end tlc_padded
+
+// One member: the fixed-width text header, the body, and a pad byte leaving the next member on an even
+// offset -- a pad the size field does not count.
+private tlc_member(name: string, body: Buf[u8]) -> Buf[u8]
+    var out = tlc_text(tlc_padded(name, 16) + tlc_padded("0", 12) + tlc_padded("0", 6) +
+                       tlc_padded("0", 6) + tlc_padded("644", 8) + tlc_padded(s"${body.len()}", 10) +
+                       "`\n")
+
+    tlc_append(&out, body)
+
+    if body.len() % 2 == 1 then out.push(u8('\n'))
+
+    out
+end tlc_member
+
+// GNU style: a short name ends in `/`, and a long one is `/<offset>` into the body of a member called
+// `//`, written ahead of the members that point into it.
+private tlc_gnu(names: Buf[string], bodies: Buf[Buf[u8]]) -> Buf[u8]
+    var table = ""
+    var offsets: Buf[usize] = buf()
+
+    for i in 0..<names.len()
+        if names.at(i).bytes.len > 15
+            offsets.push(table.bytes.len)
+            table = table + names.at(i) + "/\n"
+        else
+            offsets.push(0)
+
+    var out = tlc_text(ArMagic)
+
+    if table.bytes.len > 0 then tlc_append(&out, tlc_member("//", tlc_text(table)))
+
+    for i in 0..<names.len()
+        val name = names.at(i)
+        val written = if name.bytes.len > 15 then s"/${offsets.at(i)}" else s"$name/"
+
+        tlc_append(&out, tlc_member(written, bodies.at(i)))
+
+    out
+end tlc_gnu
+
+// BSD style: a name too long for the header is `#1/<n>`, and the real name occupies the first `n` bytes
+// of the body, NUL-padded to a multiple of eight as `llvm-ar` writes it -- so `n` is longer than the
+// name, and a reader taking all `n` bytes for it comes back with one that equals nothing.
+private tlc_bsd(names: Buf[string], bodies: Buf[Buf[u8]]) -> Buf[u8]
+    var out = tlc_text(ArMagic)
+
+    for i in 0..<names.len()
+        val name = names.at(i)
+
+        if name.bytes.len > 16
+            var padded = tlc_text(name)
+
+            while padded.len() % 8 != 0
+                padded.push(0)
+
+            val n = padded.len()
+
+            tlc_append(&padded, bodies.at(i))
+            tlc_append(&out, tlc_member(s"#1/$n", padded))
+        else
+            tlc_append(&out, tlc_member(name, bodies.at(i)))
+
+    out
+end tlc_bsd
+
+private tlc_one(name: string, body: Buf[u8]) -> Buf[u8]
+    var names: Buf[string] = buf()
+    var bodies: Buf[Buf[u8]] = buf()
+
+    names.push(name)
+    bodies.push(body)
+    tlc_gnu(names, bodies)
+end tlc_one
+
+private tlc_two(a: string, x: Buf[u8], b: string, y: Buf[u8]) -> Buf[u8]
+    var names: Buf[string] = buf()
+    var bodies: Buf[Buf[u8]] = buf()
+
+    names.push(a)
+    names.push(b)
+    bodies.push(x)
+    bodies.push(y)
+    tlc_gnu(names, bodies)
+end tlc_two
+
+// Each member as `name=body`, one per line, so a whole archive is one string to compare.
+private tlc_shown(archive: Buf[u8]) -> string
+    val members = ar_members(archive.view()) match
+        Err(why) -> return s"the archive did not read: $why"
+        Ok(ms) -> ms
+
+    var out = ""
+
+    for i in 0..<members.len()
+        out = out + members.at(i).name + "=" + from_utf8_unchecked(members.at(i).body.view()) + "\n"
+
+    out
+end tlc_shown
+
+private tlc_refusal(archive: Buf[u8]) -> string = ar_members(archive.view()) match
+    Err(why) -> why
+    Ok(_) -> "it was read as an archive"
+
+private val tlc_long: string = "a-really-long-member-name.o"
+
+// -- the members of an archive ----------------------------------------------------------------------
+
+@test("the members of an archive come back in order, with their names and their bytes")
+tlc_members_come_back_in_order()
+    assert_eq(tlc_shown(tlc_two("first.o", tlc_text("one"), "second.o", tlc_text("two"))),
+              "first.o=one\nsecond.o=two\n")
+end tlc_members_come_back_in_order
+
+// The pad byte is not counted by the size field, so a reader that advanced by the size alone would
+// start the next header one byte early -- and only ever on an odd-length member.
+@test("they survive a body of odd length, which is padded without the size saying so")
+tlc_an_odd_body_is_padded()
+    assert_eq(tlc_shown(tlc_two("odd.o", tlc_text("abc"), "next.o", tlc_text("xy"))),
+              "odd.o=abc\nnext.o=xy\n")
+end tlc_an_odd_body_is_padded
+
+// Object files are not text, and the reader must not decode anything to walk past one.
+@test("they carry a body with no characters in it at all")
+tlc_a_body_is_bytes()
+    var body: Buf[u8] = buf()
+
+    body.push(0)
+    body.push(255)
+    body.push(10)
+    body.push(128)
+    body.push(127)
+
+    val members = ar_members(tlc_one("raw.o", body).view()).unwrap()
+    val back = members.at(0).body
+
+    assert_eq(back.len(), 5)
+
+    for i in 0..<back.len()
+        assert_eq(back.at(i), body.at(i))
+end tlc_a_body_is_bytes
+
+@test("they include an empty one rather than stopping at it")
+tlc_an_empty_member_is_kept()
+    assert_eq(tlc_shown(tlc_two("empty.o", buf(), "after.o", tlc_text("z"))), "empty.o=\nafter.o=z\n")
+end tlc_an_empty_member_is_kept
+
+// -- a name too long for the header field -----------------------------------------------------------
+
+@test("a name too long for the header is read back whole from the GNU string table")
+tlc_a_gnu_long_name()
+    assert_eq(tlc_shown(tlc_one(tlc_long, tlc_text("body"))), s"$tlc_long=body\n")
+end tlc_a_gnu_long_name
+
+// The size field counts the name as well as the body, so a reader that took the whole body would hand
+// back the name glued to the front of the object -- which links, and is wrong.
+@test("and from the BSD name-in-the-body form")
+tlc_a_bsd_long_name()
+    var names: Buf[string] = buf()
+    var bodies: Buf[Buf[u8]] = buf()
+
+    names.push(tlc_long)
+    bodies.push(tlc_text("body"))
+
+    val archive = tlc_bsd(names, bodies)
+    val members = ar_members(archive.view()).unwrap()
+
+    assert_eq(members.len(), 1)
+    assert_eq(members.at(0).name.bytes.len, tlc_long.bytes.len)
+    assert_eq(members.at(0).name, tlc_long)
+    assert_eq(from_utf8_unchecked(members.at(0).body.view()), "body")
+end tlc_a_bsd_long_name
+
+// The `//` member is the archiver's bookkeeping, not content.
+@test("the string table itself is not taken for a member")
+tlc_the_string_table_is_not_a_member()
+    val members = ar_members(tlc_one(tlc_long, tlc_text("body")).view()).unwrap()
+
+    assert_eq(members.len(), 1)
+    assert_eq(members.at(0).name, tlc_long)
+end tlc_the_string_table_is_not_a_member
+
+// -- what is not an archive -------------------------------------------------------------------------
+
+// Handing back no members would make a foreign file indistinguishable from a library that happened to
+// be empty.
+@test("what is not an archive is refused rather than read as an empty one")
+tlc_a_foreign_file_is_refused()
+    assert(tlc_refusal(tlc_text("not an archive at all")).contains("not an archive"),
+           tlc_refusal(tlc_text("not an archive at all")))
+end tlc_a_foreign_file_is_refused
+
+@test("and neither is an empty file")
+tlc_an_empty_file_is_refused()
+    var nothing: Buf[u8] = buf()
+
+    assert(ar_members(nothing.view()).is_err(), "an empty file was read as an archive")
+end tlc_an_empty_file_is_refused
+
+@test("nor one whose member runs off the end of it")
+tlc_a_truncated_archive_is_refused()
+    val whole = tlc_one("code.o", tlc_text("0123456789"))
+    var cut: Buf[u8] = buf()
+
+    for i in 0..<(whole.len() - 4)
+        cut.push(whole.at(i))
+
+    assert(tlc_refusal(cut).contains("damaged"), tlc_refusal(cut))
+end tlc_a_truncated_archive_is_refused
+
+@test("nor one whose size field is not a number")
+tlc_a_size_that_is_not_a_number()
+    val whole = tlc_one("code.o", tlc_text("body"))
+    var damaged: Buf[u8] = buf()
+
+    for i in 0..<whole.len()
+        damaged.push(if i == ArMagic.bytes.len + 48 then u8('x') else whole.at(i))
+
+    assert(ar_members(damaged.view()).is_err(), "a damaged size field was read")
+end tlc_a_size_that_is_not_a_number
+
+// -- an archive a real archiver wrote ---------------------------------------------------------------
+
+// Everything above is read from a fixture this file wrote, which pins the reader against the format as
+// *we* understand it; this pins that understanding against the tool.
+@test("an archive a real archiver wrote reads back the member it was given, symbol index and all")
+tlc_a_real_archive()
+    if !clang_available() then return
+
+    val archiver = find_ar(None) match
+        Err(_) -> return
+        Ok(a) -> a
+
+    val dir = make_temp_dir("sysl-ar-").unwrap()
+    val obj = s"$dir/probe.o"
+    val out = s"$dir/probe.a"
+    val cc = find_clang(host_target(), None).unwrap()
+
+    compile_object(cc, "@probe = constant [4 x i8] c\"halt\"\n", obj, host_target(), "1").unwrap()
+
+    var members: Buf[string] = buf()
+
+    members.push(obj)
+    archive(archiver, members, out).unwrap()
+
+    val bytes = read_bytes(out).unwrap()
+    val object = read_bytes(obj).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+
+    val found = ar_members(bytes.view()).unwrap()
+    var probe: Option[Buf[u8]] = None
+
+    for i in 0..<found.len()
+        if found.at(i).name == "probe.o" then probe = Some(found.at(i).body)
+
+    assert(probe.is_some(), s"no member named probe.o among ${found.len()}")
+
+    val body = probe.unwrap()
+
+    assert_eq(body.len(), object.len)
+
+    for i in 0..<body.len()
+        assert_eq(body.at(i), object[i])
+end tlc_a_real_archive
