@@ -2,7 +2,7 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_dir_all, make_temp_dir, read_bytes, read_text, remove_dir_all, write_text}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, read_bytes, read_text, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.{cstring, join, replace_all, split, Search}
 
@@ -201,6 +201,36 @@ cgu_a_private_symbol_used_from_two_units_links()
 
     cgu_end(dirs)
 end cgu_a_private_symbol_used_from_two_units_links
+
+@test("a unit clang refuses is reported with what clang said, and every other unit's clang is waited for")
+cgu_a_failing_unit_is_reported_and_the_rest_are_waited_for()
+    if !clang_available() then return
+
+    val dirs = cgu_begin()
+    val cc = find_clang(host_target(), None).unwrap()
+    var parts: Buf[string] = buf()
+
+    parts.push("define i32 @cgu_first() {\n  ret i32 1\n}\n")
+    parts.push("define i32 @cgu_second() {\n  ret i32 %nowhere\n}\n")
+    parts.push("define i32 @cgu_third() {\n  ret i32 3\n}\n")
+
+    val base = s"${dirs.0}/split"
+    val said = compile_units(cc, parts, base, host_target(), "1", false) match
+        Ok(_) -> "compiled"
+        Err(e) -> e
+
+    assert(said.starts_with(s"$cc failed (exit 1):\n"), said)
+    assert(said.contains("split.cgu1.o.ll"), said)
+    assert(said.contains("use of undefined value '%nowhere'"), said)
+
+    // Both other clangs ran to the end before the failure was answered: their objects are there.
+    assert(is_file(s"$base.cgu0.o"), "the first unit's object")
+    assert(is_file(s"$base.cgu2.o"), "the third unit's object")
+    assert(!is_file(s"$base.cgu1.o"), "no object for the refused unit")
+    assert(is_file(s"$base.cgu1.o.ll"), "the refused unit's text is kept")
+
+    cgu_end(dirs)
+end cgu_a_failing_unit_is_reported_and_the_rest_are_waited_for
 
 // A program with enough in it to spread over four units: a struct, a closure, a string, a trait
 // object, an `@export`, and a loop.
