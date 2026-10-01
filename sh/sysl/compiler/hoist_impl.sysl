@@ -64,6 +64,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     val written = promise.1
 
     home.outer = trait_outer(tr, bound)
+    home.opened = trait_opened(tr, block)
 
     // What this block's own promise is read against: the type where it has one, and the type applied
     // to the block's own parameters where it is generic -- the subject every comparison below has to
@@ -438,6 +439,30 @@ private trait_outer(tr: TraitDecl, bound: Bound) -> Buf[Binding]
     out
 end trait_outer
 
+// The trait's value parameters this block fixed to a value parameter of its own -- `impl[const M:
+// usize] Bytes[M] for Bits[M]` -- each bound to that parameter left open. `trait_outer` binds `N` to
+// the number the block's generic reading stands `M` at, which is what a signature is resolved
+// against; a copied default body reads `N` at the number each instantiation gives `M` instead.
+private trait_opened(tr: TraitDecl, block: ImplDecl) -> Buf[Binding]
+    var out: Buf[Binding] = buf()
+
+    for i in 0..<tr.tparams.len()
+        val tp = tr.tparams.at(i)
+
+        if has_binding(tr.tvalues, tp) && i < block.trait_args.len()
+            val own = block_value_named(block, block.trait_args.at(i))
+
+            if own.is_some() then out.push(Binding(tp, Abstract(own.unwrap(), buf())))
+
+    out
+end trait_opened
+
+// The block's own value parameter an argument is written as, where it is written as one bare.
+private block_value_named(block: ImplDecl, arg: TypeRef) -> Option[string] =
+    *arg.kind match
+        NamedType(n, targs) -> if targs.is_empty() && has_binding(block.tvalues, n) then Some(n) else None
+        _ -> None
+
 // The block's own parameters standing in for themselves, in the subject's argument order -- what a
 // comparison against an already-filed block is read under.
 private stand_in_args(a: &Analysis, scope: Scope, home: MemberHome) -> Buf[Type]
@@ -649,14 +674,14 @@ private named_target(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, su
         val ty = concrete_instance(a, key).unwrap_or(Unknown)
 
         return (ty, MemberHome(key, module_show(key), key, None, subject, buf(), buf(), taken, noun,
-                               self_binding(ty), buf(), "", None, false, buf(), buf(), scope))
+                               self_binding(ty), buf(), "", None, false, buf(), buf(), scope, buf()))
 
     // A generic type has no one instantiation to be, and nothing that reaches this needs one: an
     // implementation covers every one of them at once, and each member is made real per receiver.
     val order = impl_args(a, scope, span, block, key, tparams)
 
     (Unknown, MemberHome(key, module_show(key), key, None, subject, order, block.bounds, taken, noun,
-                         buf(), buf(), "", None, false, block.tvalues, block.tpacks, scope))
+                         buf(), buf(), "", None, false, block.tvalues, block.tpacks, scope, buf()))
 end named_target
 
 // Everything else: a built-in, a composed type written out in full, a shape, or a blanket over a
@@ -690,7 +715,7 @@ private structural_target(a: &Analysis, scope: Scope, span: Span, block: ImplDec
     if block.tparams.is_empty() then
         return (ty, MemberHome(owner_key(ty), type_show(ty), member_symbol(ty), head, subject, buf(),
                                buf(), buf(), "field", self_binding(ty), buf(), "", None, false,
-                               buf(), buf(), scope))
+                               buf(), buf(), scope, buf()))
 
     val shape = head.unwrap_or(owner_key(ty))
     var order: Buf[string] = buf()
@@ -710,7 +735,8 @@ private structural_target(a: &Analysis, scope: Scope, span: Span, block: ImplDec
     // Like a generic type's, the members are made real per receiver -- so there is no one
     // instantiation to be, and the shape rather than any type of it is what they are filed under.
     (Unknown, MemberHome(shape, type_text(subject), symbol, head, subject, order, block.bounds, buf(),
-                         "field", buf(), buf(), "", None, false, block.tvalues, block.tpacks, scope))
+                         "field", buf(), buf(), "", None, false, block.tvalues, block.tpacks, scope,
+                         buf()))
 end structural_target
 
 // Two shapes are refused outright, each because an `impl` for it would be about nothing. A **memory

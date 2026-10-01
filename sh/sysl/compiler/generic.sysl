@@ -526,9 +526,11 @@ private self_for(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type]) -> Bu
     var subst: Buf[Binding] = buf()
     val outer = a.tables.members.selves.get(f.name)
 
+    val opened = a.tables.members.opened.get(f.name).unwrap_or(buf())
+
     if outer.is_some()
         for i in 0..<outer.unwrap().len()
-            subst.push(fixed_value(outer.unwrap().at(i), f.tparams, targs))
+            subst.push(fixed_value(outer.unwrap().at(i), opened, f.tparams, targs))
 
     for i in 0..<f.tparams.len()
         if i < targs.len() then subst.push(Binding(f.tparams.at(i), targs.at(i)))
@@ -547,12 +549,12 @@ private self_for(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type]) -> Bu
 end self_for
 
 // A trait's value parameter a generic block fixed to one of its own -- `impl[const M: usize]
-// Bytes[M] for Bits[M]` binds `N` to `M` -- at the number this instantiation gives `M`. A body reads
-// a value parameter only where it is bound to a number, so the trait's `N` would otherwise stay the
-// block's open `M` in every instantiation.
-private fixed_value(b: Binding, tparams: Buf[string], targs: Buf[Type]) -> Binding
-    val open = b.ty match
-        Abstract(n, _) -> Some(n)
+// Bytes[M] for Bits[M]` binds `N` to `M` -- at the number this instantiation gives `M`. The member's
+// `selves` binds `N` to the number the block's generic reading stood `M` at, so a body reading `N`
+// would otherwise see that number in every instantiation; `opened` says which block parameter it is.
+private fixed_value(b: Binding, opened: Buf[Binding], tparams: Buf[string], targs: Buf[Type]) -> Binding
+    val open = bound_type(opened, b.name) match
+        Some(Abstract(n, _)) -> Some(n)
         _ -> None
 
     if open.is_none() then return b
