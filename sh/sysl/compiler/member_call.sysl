@@ -1620,6 +1620,12 @@ private builtin_method(cx: &Analyzer, span: Span, written: TExpr, rty: Type,
     if found.is_none() then return None
 
     val tr_name = found.unwrap()
+
+    // **A provided membership says which types have the member, never which files may write it**:
+    // the trait has to be nameable here, as a library `impl`'s member has to be. Answering nothing
+    // leaves the call to the ordinary "has no method" refusal.
+    if !names_trait(cx, tr_name) then return None
+
     val d = trait_decl_at(cx.an, tr_name)
 
     if d.is_none() then return None
@@ -1630,24 +1636,21 @@ private builtin_method(cx: &Analyzer, span: Span, written: TExpr, rty: Type,
 
     // The signature is the **trait's**, read with `Self` standing for the receiver: `count_ones`
     // answers a `u32` at every width and `abs` answers the type it was asked of, and both of those
-    // are written in the declaration rather than known here.
+    // are written in the declaration rather than known here. So the arguments bind as any member's
+    // do, a name the trait gave its parameter included.
     val scope = trait_scope_of(cx.an, tr_name)
     val subst = self_binding(rty)
     val decl = m.unwrap()
+    val slots = bind_member_args(cx, span, s"method '${module_bare(tr_name)}.$name'", decl, args)
 
-    if args.len() != decl.params.len()
-        cx.fault(span, s"method '${type_show(rty)}.$name' takes " +
-                 s"${quantity(decl.params.len(), "argument")}, but " +
-                 s"${supplied_phrase(args.len(), "argument")}")
-        return Some(bad_expr(span))
-    end if
+    if slots.is_none() then return Some(bad_expr(span))
 
     var amount: Option[TExpr] = None
 
-    if !decl.params.is_empty()
+    if !decl.params.is_empty() && slots.unwrap().at(0).is_some()
         val want = resolve_type(cx.an, scope, decl.params.at(0).typ, subst)
 
-        amount = Some(type_expr(cx, args.at(0), Some(want)))
+        amount = Some(type_expr(cx, slots.unwrap().at(0).unwrap(), Some(want)))
     end if
 
     val ret = if decl.ret_type.is_some() then

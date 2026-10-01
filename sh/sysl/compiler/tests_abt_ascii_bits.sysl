@@ -1,0 +1,632 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// Two library surfaces whole programs reach: `sysl.text.Ascii`, which classifies a byte or a
+// character over the ASCII range under one spelling for both, and `sysl.math.Bits`, whose
+// membership the compiler supplies over the open integer family and whose members lower to LLVM's
+// bit intrinsics.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `AsciiTests` and
+// `BitsTests` these are. The helpers are `tests_enm_enum_run.sysl`'s.
+
+private abt_ascii(src: string) -> string = enm_ran("import sysl.text.Ascii\n\n" + src)
+
+private abt_bits(src: string) -> string = enm_ran("import sysl.math.Bits\n\n" + src)
+
+private abt_bits_err(src: string) -> string = enm_err("import sysl.math.Bits\n\n" + src)
+
+private abt_bits_ir(src: string) -> string = enm_ir("import sysl.math.Bits\n\n" + src)
+
+// The `declare` lines of an LLVM text.
+private abt_declares(out: string) -> Buf[string]
+    var got: Buf[string] = buf()
+
+    for line in lines_of(out).view()
+        if line.starts_with("declare") then got.push(line)
+
+    got
+
+private abt_has_line(lines: Buf[string], want: string) -> bool
+    for line in lines.view()
+        if line == want then return true
+
+    false
+
+// ---- sysl.text.Ascii: classification
+
+@test("a digit is a digit and a letter is not")
+abt_a_digit_is_a_digit()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print(u8('5').is_digit(), u8('a').is_digit())\n"), "true false\n")
+
+// All six of C's whitespace characters, not the space and tab a hand-rolled test stops after.
+@test("whitespace is all six of C's, not the two that are easy to remember")
+abt_whitespace_is_all_six()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii(raw"""
+        var ws: [6]u8 = [32u8, 9u8, 10u8, 11u8, 12u8, 13u8]
+        var n = 0
+        for b in ws do if b.is_space() then n += 1
+        print(n, u8('x').is_space())
+        """), "6 false\n")
+
+@test("a letter is alpha, a digit is not, and both are alnum")
+abt_a_letter_is_alpha()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print(u8('q').is_alpha(), u8('7').is_alpha(), u8('7').is_alnum())\n"),
+        "true false true\n")
+
+@test("case is distinguished in both directions")
+abt_case_is_distinguished()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print(u8('Q').is_upper(), u8('Q').is_lower(), u8('q').is_lower())\n"),
+        "true false true\n")
+
+@test("hex digits run to f in either case and stop there")
+abt_hex_digits_run_to_f()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii(raw"""
+        print(u8('9').is_hex_digit(), u8('F').is_hex_digit(),
+              u8('f').is_hex_digit(), u8('g').is_hex_digit())
+        """), "true true true false\n")
+
+@test("punctuation is the four runs between the named groups")
+abt_punctuation_is_four_runs()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii(raw"""
+        print(u8('!').is_punct(), u8('@').is_punct(), u8('_').is_punct(),
+              u8('~').is_punct(), u8('a').is_punct(), u8(' ').is_punct())
+        """), "true true true true false false\n")
+
+@test("printability includes the space and excludes the delete")
+abt_printability()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print(u8(' ').is_print(), u8('~').is_print(), u8(127u32).is_print())\n"),
+        "true true false\n")
+
+@test("controls are the C0 range and the delete, which is not below the space")
+abt_controls()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii(raw"""
+        print(u8(0u32).is_control(), u8(31u32).is_control(),
+              u8(127u32).is_control(), u8(32u32).is_control())
+        """), "true true true false\n")
+
+// The newline is whitespace and is not blank, the difference a field splitter gets wrong.
+@test("blank is the two within-a-line separators, and a newline is not one")
+abt_blank()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii(raw"""
+        print(u8(' ').is_blank(), u8(9u32).is_blank(),
+              u8(10u32).is_blank(), u8(10u32).is_space(), u8('x').is_blank())
+        """), "true true false true false\n")
+
+@test("graph is print without the space")
+abt_graph()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii(raw"""
+        print(u8(' ').is_graph(), u8(' ').is_print(), u8('!').is_graph(),
+              u8('~').is_graph(), u8(127u32).is_graph())
+        """), "false true true true false\n")
+
+// ---- sysl.text.Ascii: the range the trait speaks for
+
+@test("a byte past 127 is not ASCII and answers false to everything")
+abt_a_byte_past_127()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii(raw"""
+        var b = 200u8
+        print(b.is_ascii(), b.is_alpha(), b.is_print(), b.is_control())
+        """), "false false false false\n")
+
+@test("a non-ASCII character says so rather than being guessed at")
+abt_a_non_ascii_character_says_so()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print('é'.is_ascii(), 'é'.is_alpha())\n"), "false false\n")
+
+// ---- sysl.text.Ascii: case conversion
+
+@test("converts letters and leaves everything else alone")
+abt_converts_letters()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print(u8('a').to_upper(), u8('Z').to_lower(), u8('5').to_upper(), u8('!').to_lower())\n"),
+        "65 122 53 33\n")
+
+// Clearing the case bit as a mask would turn `?` into `\x1f` and `_` into `?`.
+@test("punctuation that shares the case bit is untouched")
+abt_punctuation_shares_the_case_bit()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print(u8('?').to_upper(), u8('_').to_lower())\n"), "63 95\n")
+
+@test("a non-ASCII character passes through both conversions unchanged")
+abt_a_non_ascii_character_passes_through()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii(raw"""
+        var c = 'é'
+        print(c.to_upper() == c, c.to_lower() == c)
+        """), "true true\n")
+
+// ---- sysl.text.Ascii: one spelling over both types
+
+@test("a byte and a character answer identically")
+abt_a_byte_and_a_character()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii(raw"""
+        print(u8('a').is_alpha(), 'a'.is_alpha())
+        print(u8('a').is_digit(), 'a'.is_digit())
+        print(u8('a').to_upper() == u8('A'), 'a'.to_upper() == 'A')
+        """), "true true\nfalse false\ntrue true\n")
+
+// ---- sysl.text.Ascii: digit_value
+
+@test("reads a decimal digit as its value rather than its code")
+abt_reads_a_decimal_digit()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print(u8('7').digit_value(10).unwrap())\n"), "7\n")
+
+@test("counts letters from ten, in either case")
+abt_counts_letters_from_ten()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print(u8('a').digit_value(16).unwrap(), u8('F').digit_value(16).unwrap())\n"),
+        "10 15\n")
+
+@test("goes all the way to base 36")
+abt_goes_to_base_36()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print(u8('z').digit_value(36).unwrap())\n"), "35\n")
+
+@test("refuses a digit that is out of range for the base")
+abt_refuses_a_digit_out_of_range()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print(u8('8').digit_value(8).is_none(), u8('7').digit_value(8).is_some())\n"),
+        "true true\n")
+
+@test("refuses something that is not a digit at all")
+abt_refuses_a_non_digit()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print(u8('!').digit_value(16).is_none())\n"), "true\n")
+
+@test("answers None for a base outside 2..36 rather than trapping")
+abt_answers_none_for_a_bad_base()
+    if !enm_ready() then return
+
+    assert_eq(abt_ascii("print(u8('1').digit_value(1).is_none(), u8('1').digit_value(37).is_none())\n"),
+        "true true\n")
+
+// ---- sysl.math.Bits: counting
+
+@test("reports how many bits are set and how many are clear")
+abt_reports_bits_set_and_clear()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u8 = 0b10110000
+            print(x.count_ones(), x.count_zeros(), (0u8).count_ones(), (0u8).count_zeros())
+        """), "3 5 0 8\n")
+
+@test("the two always sum to the width, at whatever width the receiver is")
+abt_the_two_sum_to_the_width()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var a: u8 = 0b10110000
+            var b: u32 = 0xF0F0F0F0
+            print(a.count_ones() + a.count_zeros(), b.count_ones() + b.count_zeros())
+        """), "8 32\n")
+
+@test("measures the run of zeroes at each end")
+abt_measures_the_run_of_zeroes()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u8 = 0b10110000
+            print(x.leading_zeros(), x.trailing_zeros())
+        """), "0 4\n")
+
+@test("measures the run of ones at each end")
+abt_measures_the_run_of_ones()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u8 = 0b11100011
+            print(x.leading_ones(), x.trailing_ones())
+        """), "3 2\n")
+
+// The `i1` on `llvm.ctlz` and `llvm.cttz` is what this pins: `true` would make a zero input poison.
+@test("answers the width where there is nothing to count, at both ends")
+abt_answers_the_width_on_zero()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            print((0u8).leading_zeros(), (0u8).trailing_zeros(), (0u32).leading_zeros())
+        """), "8 8 32\n")
+
+@test("and answers zero where there is a run of the other bit instead")
+abt_answers_zero_on_the_other_bit()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var all: u8 = 255
+            print(all.leading_zeros(), all.trailing_zeros(), (0u8).leading_ones(), all.leading_ones())
+        """), "0 0 0 8\n")
+
+// ---- sysl.math.Bits: reversing
+
+@test("puts the lowest bit highest, at the receiver's own width")
+abt_reverse_puts_lowest_highest()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u8 = 0b10110000
+            print(x.reverse_bits(), (1u8).reverse_bits(), (1u32).reverse_bits())
+        """), "13 128 2147483648\n")
+
+@test("is its own inverse")
+abt_reverse_is_its_own_inverse()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u32 = 0xDEADBEEF
+            print(x.reverse_bits().reverse_bits() == x)
+        """), "true\n")
+
+// ---- sysl.math.Bits: rotating
+
+@test("moves the bits leaving one end to the other")
+abt_rotate_moves_bits_around()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u8 = 0b10110000
+            print(x.rotate_left(1), x.rotate_right(1))
+        """), "97 88\n")
+
+// `(x << n) | (x >> (w - n))` shifts by the whole width at zero, which is undefined.
+@test("by zero is the value again, which is what the expression it replaces cannot manage")
+abt_rotate_by_zero()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u8 = 0b10110000
+            print(x.rotate_left(0), x.rotate_right(0))
+        """), "176 176\n")
+
+@test("takes its amount modulo the width, so no amount is out of range")
+abt_rotate_takes_amount_modulo_width()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u8 = 0b10110000
+            print(x.rotate_left(8), x.rotate_left(9), x.rotate_right(201))
+        """), "176 97 88\n")
+
+@test("the two are inverses of each other")
+abt_rotations_are_inverses()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u32 = 0xDEADBEEF
+            print(x.rotate_left(7).rotate_right(7) == x)
+        """), "true\n")
+
+// ---- sysl.math.Bits: the open family
+
+@test("reaches a width no impl could have been written for")
+abt_reaches_an_unlisted_width()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u12 = 0b100000000001
+            print(x.count_ones(), x.leading_zeros(), x.trailing_zeros(), x.reverse_bits())
+        """), "2 0 0 2049\n")
+
+// Narrowing the amount to `u5` first would take it modulo 32, and 5 does not divide 32.
+@test("rotates by an amount larger than a width that is not a power of two")
+abt_rotates_at_a_non_power_of_two_width()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u5 = 0b00001
+            print(x.rotate_left(33), x.rotate_left(3), x.rotate_left(5))
+        """), "8 8 1\n")
+
+@test("covers a width wider than the count it answers in")
+abt_covers_a_wide_width()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u128 = 1
+            print(x.leading_zeros(), x.count_zeros())
+        """), "127 127\n")
+
+@test("asks the same questions of a signed value")
+abt_asks_of_a_signed_value()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: i8 = -1
+            var y: i8 = 1
+            print(x.count_ones(), x.leading_ones(), y.rotate_right(1))
+        """), "8 8 -128\n")
+
+// ---- sysl.math.Bits: what is evaluated
+
+@test("the receiver is read once, however many times the lowering mentions it")
+abt_the_receiver_is_read_once()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        bump() -> u8
+            print("called")
+            0b10110000
+
+        main()
+            print(bump().count_zeros())
+            print(bump().rotate_left(1))
+        """), "called\n5\ncalled\n97\n")
+
+@test("and so is the rotation amount")
+abt_the_amount_is_read_once()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        by() -> u32
+            print("asked")
+            1
+
+        main()
+            var x: u8 = 0b10110000
+            print(x.rotate_left(by()))
+        """), "asked\n97\n")
+
+// ---- sysl.math.Bits: as a bound
+
+@test("a generic body may count the bits of whatever it was instantiated at")
+abt_a_generic_body_counts()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        popcount[T: Bits](x: T) -> u32 = x.count_ones()
+
+        main()
+            var a: u8 = 7
+            var b: u32 = 255
+            var c: u12 = 0b100000000001
+            print(popcount(a), popcount(b), popcount(c))
+        """), "3 8 2\n")
+
+// The amount is a `u32` whatever `T` is, so the widening happens per instantiation.
+@test("and may rotate one, at each instantiation's own width")
+abt_a_generic_body_rotates()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        spin[T: Bits](x: T, n: u32) -> T = x.rotate_left(n)
+
+        main()
+            var a: u8 = 1
+            print(spin(a, 1), spin(0x12345678u32, 4))
+        """), "2 591751041\n")
+
+// `width()` has no receiver, so a member with nothing to dispatch on cannot be a table slot.
+@test("but there is no trait object over it")
+abt_no_trait_object()
+    if !enm_ready() then return
+
+    val out = abt_bits_err("main()\n    var x: &Bits = null\n    print(1)\n")
+
+    assert(enm_says(out, "declares the associated function 'width', which has no receiver to dispatch on"), out)
+    assert(enm_says(out, "so there is no '&sysl.math.Bits' to form"), out)
+
+// ---- sysl.math.Bits: what is refused
+
+@test("the trait has to be in scope, membership or not")
+abt_the_trait_has_to_be_in_scope()
+    if !enm_ready() then return
+
+    val out = enm_err("main()\n    print((1u8).count_ones())\n")
+
+    assert(enm_says(out, "type 'byte' has no method 'count_ones'"), out)
+
+@test("a float has no bits to count")
+abt_a_float_has_no_bits()
+    if !enm_ready() then return
+
+    val out = abt_bits_err("main()\n    var x: real = 1.0\n    print(x.count_ones())\n")
+
+    assert(enm_says(out, "type 'real' has no method 'count_ones'"), out)
+
+@test("a count takes no arguments")
+abt_a_count_takes_no_arguments()
+    if !enm_ready() then return
+
+    val out = abt_bits_err("main()\n    print((1u8).count_ones(3))\n")
+
+    assert(enm_says(out, "method 'Bits.count_ones' takes 0 arguments, but 1 argument was given"), out)
+
+@test("a rotation takes exactly one")
+abt_a_rotation_takes_exactly_one()
+    if !enm_ready() then return
+
+    val none = abt_bits_err("main()\n    print((1u8).rotate_left())\n")
+    val two = abt_bits_err("main()\n    print((1u8).rotate_left(1, 2))\n")
+
+    assert(enm_says(none, "method 'Bits.rotate_left' takes 1 argument, but 0 arguments were given"), none)
+    assert(enm_says(two, "method 'Bits.rotate_left' takes 1 argument, but 2 arguments were given"), two)
+
+@test("and an amount that is not a count")
+abt_an_amount_that_is_not_a_count()
+    if !enm_ready() then return
+
+    val out = abt_bits_err("main()\n    print((1u8).rotate_left(-1))\n")
+
+    assert(enm_says(out, "the literal -1 does not fit uint"), out)
+
+// Reversing the byte order needs a whole number of bytes, so it is not total over the family.
+@test("reordering bytes is not one of the members")
+abt_reordering_bytes_is_not_a_member()
+    if !enm_ready() then return
+
+    val out = abt_bits_err("main()\n    print((1u32).swap_bytes())\n")
+
+    assert(enm_says(out, "type 'uint' has no method 'swap_bytes'"), out)
+
+// ---- sysl.math.Bits: the amount arrives at the width being rotated
+
+// A literal amount reaches the intrinsic as an immediate, with no widening in front of it.
+@test("a literal is the constant itself, not a widening of one")
+abt_a_literal_amount_is_the_constant()
+    if !enm_ready() then return
+
+    val out = abt_bits_ir("main()\n    var x: u64 = 255\n    print(x.rotate_right(8))\n")
+
+    assert(enm_says(out, "call i64 @llvm.fshr.i64("), out)
+    assert(!enm_says(out, "zext i32 8 to i64"), out)
+
+@test("and a computed amount is widened to the receiver's width")
+abt_a_computed_amount_is_widened()
+    if !enm_ready() then return
+
+    val out = abt_bits_ir(raw"""
+        main()
+            var x: u64 = 255
+            var n: u32 = 8
+            print(x.rotate_right(n))
+        """)
+
+    assert(enm_says(out, "zext i32"), out)
+    assert(enm_says(out, "call i64 @llvm.fshr.i64("), out)
+
+@test("either way the answer is the same")
+abt_either_way_the_same()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits(raw"""
+        main()
+            var x: u64 = 0x0123456789abcdef
+            var n: u32 = 8
+            print(x.rotate_right(8) == x.rotate_right(n), x.rotate_right(8))
+        """), "true 17222085231038278605\n")
+
+// ---- sysl.math.Bits: the signature is the trait's own
+
+@test("the amount may be passed by the name the trait gave it")
+abt_the_amount_by_name()
+    if !enm_ready() then return
+
+    assert_eq(abt_bits("main()\n    print((1u8).rotate_left(n = 1))\n"), "2\n")
+
+// The neighbour of the case above: a name the trait did not give is refused, naming the one it did.
+@test("a provided member refuses a parameter name the trait did not give")
+abt_a_provided_member_refuses_an_unknown_name()
+    if !enm_ready() then return
+
+    val out = abt_bits_err("main()\n    print((1u8).rotate_left(m = 1))\n")
+
+    assert(enm_says(out, "method 'Bits.rotate_left' declares no parameter named 'm' — it takes 'n'"), out)
+
+// The other provided membership is held to the same rule: `abs` is `Signed`'s, and a file that never
+// named `Signed` has no `abs` on an `int`.
+@test("a provided Signed member needs its trait in scope too")
+abt_signed_needs_its_trait_in_scope()
+    if !enm_ready() then return
+
+    val out = enm_err("main()\n    var x: int = -3\n    print(x.abs())\n")
+
+    assert(enm_says(out, "type 'int' has no method 'abs'"), out)
+    assert_eq(enm_ran("import sysl.math.Signed\n\nmain()\n    var x: int = -3\n    print(x.abs())\n"), "3\n")
+
+// A subtype narrows which values a type has, never which operations it has.
+@test("a constrained subtype has them, at its base's bits")
+abt_a_constrained_subtype_has_them()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.math.{Bits, Signed}
+
+        type Temp = int within -50..50
+
+        main()
+            var a: Temp = -7
+            print(a.abs(), a.count_ones())
+        """), "7 30\n")
+
+// ---- sysl.math.Bits: the intrinsics
+
+@test("the six intrinsics, each under the signature it is called with")
+abt_the_six_intrinsics()
+    if !enm_ready() then return
+
+    val out = abt_bits_ir(raw"""
+        main()
+            var x: u32 = 0b10110000
+            print(x.count_ones(), x.leading_zeros(), x.trailing_zeros())
+            print(x.reverse_bits(), x.rotate_left(1), x.rotate_right(1))
+        """)
+    val decls = abt_declares(out)
+
+    for want in ["declare i32 @llvm.ctpop.i32(i32)", "declare i32 @llvm.ctlz.i32(i32, i1)",
+                 "declare i32 @llvm.cttz.i32(i32, i1)", "declare i32 @llvm.bitreverse.i32(i32)",
+                 "declare i32 @llvm.fshl.i32(i32, i32, i32)", "declare i32 @llvm.fshr.i32(i32, i32, i32)"]
+        assert(abt_has_line(decls, want), s"$want missing from:\n$out")
+
+@test("each intrinsic is declared once, under the width it was reached at")
+abt_each_intrinsic_declared_once()
+    if !enm_ready() then return
+
+    val out = abt_bits_ir(raw"""
+        main()
+            var a: u8 = 1
+            var b: u32 = 1
+            print(a.count_ones(), b.count_ones(), b.count_ones())
+        """)
+
+    assert(enm_says(out, "declare i8 @llvm.ctpop.i8(i8)"), out)
+    assert(enm_says(out, "declare i32 @llvm.ctpop.i32(i32)"), out)
+
+    var n = 0
+
+    for line in abt_declares(out).view()
+        if line.starts_with("declare i32 @llvm.ctpop.i32") then n += 1
+
+    assert_eq(n, 1)
