@@ -1,0 +1,663 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Automatic reference counting, in two halves (`reference/memory.md § What a heap object costs`).
+//
+// **The lowering**: the shape of a box, where the counts are taken and given back, and that the
+// atomic mode really is atomic. Placement is what makes counting correct, so it is checked in the
+// emitted text rather than only through a program's output. Every fragment asserted below was read
+// out of the reference compiler's `emit-llvm` over the same program.
+//
+// **The behaviour**: heap objects that outlive the expression that made them, aliases that see each
+// other's writes, and recursive structures the counting has to take apart in the right order. The
+// long loops are what make a leak or an over-release visible from the output alone -- a leak grows
+// the resident set without bound and a double release faults. Every output is the reference's.
+
+private var akr_library_cache: Buf[Program] = buf()
+private var akr_library_read: bool = false
+
+private akr_library() -> Buf[Program]
+    if akr_library_read then return akr_library_cache
+
+    akr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> akr_library_cache = units
+
+    akr_library_cache
+end akr_library
+
+private akr_no_library() -> bool
+    if akr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end akr_no_library
+
+// The LLVM text of the whole module a source lowers to for one machine, or the first thing it was
+// refused with. The library is read for that machine, since a selector directory differs by target.
+private akr_ir_for(t: Target, text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    if t.name == host_target().name
+        val library = akr_library()
+
+        for i in 0..<library.len()
+            units.push(library.at(i))
+    else
+        std_root() match
+            Err(why) -> return why
+            Ok(root) -> std_units(root, t) match
+                Err(why) -> return why
+                Ok(library) ->
+                    for i in 0..<library.len()
+                        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), buf())
+    val lowered = codegen_with_gaps(kept, t, promotions)
+
+    ir_print_module(lowered.0)
+end akr_ir_for
+
+private akr_ir(text: string) -> string = akr_ir_for(host_target(), text)
+
+private akr_has(out: string, fragment: string) = assert(out.contains(fragment), s"missing:\n$fragment")
+
+private akr_lacks(out: string, fragment: string) = assert(!out.contains(fragment), s"present:\n$fragment")
+
+private akr_point() -> string = "struct Point\n    x: int\n    y: int\n"
+
+// A payload the reaper's tests hang a `&sync` off, kept apart from the point so that changing either
+// one does not silently change what the other's assertions are counting.
+private akr_chain() -> string = "struct Node\n    v: int\n"
+
+private akr_linked() -> string = "struct Node\n    value: int\n    next: Option[&Node]\n"
+
+// -- the lowering ---------------------------------------------------------------------------------
+
+@test("a box is the strong count, the deallocation hook, the weak count, and the payload")
+akr_a_box_is_four_fields()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)")
+
+    akr_has(out, "%arc.Point = type { i64, ptr, i64, %struct.Point }")
+    akr_has(out, "declare ptr @malloc(i64)")
+    akr_has(out, "declare void @free(ptr)")
+
+// A payload holding nothing has no contents to walk and still has storage to give back, so the hook
+// is the plain one rather than none at all.
+@test("a construction the context wants by reference goes on the heap")
+akr_a_wanted_reference_goes_on_the_heap()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)")
+
+    akr_has(out, "  %t5 = call ptr @malloc(i64 %t4)\n  store i64 1, ptr %t5\n")
+    akr_has(out, "  store ptr @arc.drop.plain, ptr %t6\n")
+
+// The strong references hold one share of the weak count between them, so the storage lives exactly
+// until the object and every weak reference to it are both gone.
+@test("and its weak count starts at the one share the strong references hold together")
+akr_the_weak_count_starts_at_one()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)")
+
+    akr_has(out, "  %t7 = getelementptr %arc.Point, ptr %t5, i32 0, i32 2\n  store i64 1, ptr %t7\n")
+
+@test("the same construction with no expectation stays a value")
+akr_no_expectation_stays_a_value()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "var p = Point(1, 2)")
+
+    akr_lacks(out, "@malloc")
+    akr_has(out, "%p.addr = alloca %struct.Point")
+
+@test("a local takes a count of its own and gives it back when its scope ends")
+akr_a_local_holds_a_count_for_its_scope()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\nprint(p.x)")
+
+    akr_has(out, "  call void @arc.retain(ptr %t5)\n  store ptr %t5, ptr %p.addr\n")
+    akr_has(out, "  %t14 = load ptr, ptr %p.addr\n  call void @arc.release(ptr %t14)\n  ret i32 0\n")
+
+@test("assignment retains the new reference before releasing the old one")
+akr_assignment_retains_before_it_releases()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\np = Point(3, 4)")
+
+    akr_has(out, "  %t17 = load ptr, ptr %p.addr\n" +
+                 "  call void @arc.retain(ptr %t13)\n" +
+                 "  store ptr %t13, ptr %p.addr\n" +
+                 "  call void @arc.release(ptr %t17)\n")
+
+// A by-value parameter is read through the count its caller holds for the length of the call, so
+// nothing is taken at entry; what comes back is the caller's to hold, so it arrives with a count.
+@test("a parameter costs nothing to hand over, and a result still comes back with a count taken")
+akr_a_parameter_is_free_and_a_result_is_counted()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "keep(p: &Point) -> &Point\n    print(p.x)\n    p\n" +
+                     "var q: &Point = Point(1, 2)\nvar r = keep(q)")
+
+    akr_lacks(out, "call void @arc.retain(ptr %p.param)")
+    akr_has(out, "  call void @arc.retain(ptr %t6)\n  ret ptr %t6\n")
+
+// The hook is asked which of its two jobs is wanted: walking the payload and giving the storage back
+// happen at different moments, so the walk ends in `ret void` and the free is the other arm.
+@test("a destructor lets go of what the payload held, and leaves the storage to whoever is last")
+akr_a_destructor_walks_and_leaves_the_storage()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_linked() + "var n: &Node = Node(1, None)")
+
+    akr_has(out, "define private void @arc.drop.Node(ptr %p, i1 %storage) {")
+    akr_has(out, "  call void @arc.dispose.Node(%struct.Node %t2)\n  ret void\n")
+    akr_has(out, "call void @free(ptr %p)")
+    akr_has(out, "store ptr @arc.drop.Node, ptr")
+
+@test("copying an aggregate takes a share of every reference inside it")
+akr_copying_an_aggregate_shares_its_references()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_linked() + "var n: &Node = Node(1, None)")
+
+    akr_has(out, "define private void @arc.copy.Node(%struct.Node %v) {")
+    akr_has(out, "call void @arc.copy.sysl$Option.ref.Node(%enum.sysl$Option.ref.Node %t1)")
+
+// The tag is read straight off the value, being the aggregate's own first member; the payload shares
+// one region with every other variant, so reaching it is a store and a load back at this variant's
+// type (`reference/types.md § Enums`).
+@test("a data enum walks only the variants that carry a reference, behind a tag test")
+akr_a_data_enum_walks_behind_a_tag_test()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_linked() + "var n: &Node = Node(1, None)")
+
+    akr_has(out, "define private void @arc.dispose.sysl$Option.ref.Node(%enum.sysl$Option.ref.Node %v) {")
+    akr_has(out, "  %t1 = extractvalue %enum.sysl$Option.ref.Node %v, 0\n  %t2 = icmp eq i32 %t1, 0\n")
+    akr_has(out, "  %t4 = getelementptr %enum.sysl$Option.ref.Node, ptr %t3, i32 0, i32 1\n" +
+                 "  %t5 = load %sysl$Option.ref.Node.Some, ptr %t4\n")
+    akr_has(out, "  %t6 = extractvalue %sysl$Option.ref.Node.Some %t5, 0\n  call void @arc.release(ptr %t6)\n")
+
+@test("an ordinary reference counts with a plain load and store")
+akr_an_ordinary_reference_counts_plainly()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)")
+
+    akr_has(out, "define private void @arc.release(ptr %p) {")
+    akr_lacks(out, "atomicrmw sub")
+
+// On the zero transition the atomic path fences, then hands the object to the iterative reaper
+// rather than recursing into its destructor.
+@test("an atomic reference counts atomically and fences before it frees")
+akr_an_atomic_reference_counts_atomically()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "var p: &sync Point = Point(1, 2)")
+
+    akr_has(out, "%o = atomicrmw add ptr %p, i64 1 monotonic")
+    akr_has(out, "atomicrmw sub ptr %p, i64 1 release")
+    akr_has(out, "reap:\n  fence acquire")
+    akr_has(out, "call void @arc.reap(ptr %p)")
+
+@test("the two reference modes share one box layout, since atomicity belongs to the reference")
+akr_the_two_modes_share_one_box()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\nvar q: &sync Point = Point(3, 4)")
+    assert_eq(("\n" + out).count_of("\n%arc.Point = type"), 1)
+    akr_has(out, "define private void @arc.release(ptr %p) {")
+    akr_has(out, "define private void @arc.release_sync(ptr %p) {")
+
+// The payload sits behind the three header words, so the field is the box's fourth member and then
+// the struct's second.
+@test("a field through a reference reaches past the header")
+akr_a_field_reaches_past_the_header()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_point() + "var p: &Point = Point(1, 2)\np.y = 9")
+
+    akr_has(out, "  %t10 = getelementptr %arc.Point, ptr %t9, i32 0, i32 3\n" +
+                 "  %t11 = getelementptr %struct.Point, ptr %t10, i32 0, i32 1\n" +
+                 "  store i32 9, ptr %t11\n")
+
+@test("a program that never allocates declares no allocator")
+akr_no_allocation_no_allocator()
+    if akr_no_library() then return
+
+    akr_lacks(akr_ir("var n = 1\nn += 1"), "@malloc")
+
+// A program without a heap: a fixed table of task blocks, walked by index, its lists threaded through
+// the blocks themselves. Handing the table on as a slice declares the counting runtime -- a retain of
+// an owner that is statically null -- so what is asserted is that nothing ever calls the allocator.
+@test("nor does one that walks a fixed table by index ever call it")
+akr_a_fixed_table_never_calls_the_allocator()
+    if akr_no_library() then return
+
+    val out = akr_ir("struct Node\n" +
+                     "    v: int\n" +
+                     "    next: Option[u8]\n" +
+                     "end Node\n" +
+                     "sum(ns: []Node, first: Option[u8]) -> int\n" +
+                     "    var total = 0\n" +
+                     "    var cur = first\n" +
+                     "\n" +
+                     "    while cur.is_some()\n" +
+                     "        var i = usize(cur.unwrap())\n" +
+                     "\n" +
+                     "        total += ns[i].v\n" +
+                     "        cur = ns[i].next\n" +
+                     "\n" +
+                     "    total\n" +
+                     "end sum\n" +
+                     "var t: [3]Node = [Node(0, None); 3]\n" +
+                     "t[0usize] = Node(10, Some(1u8))\n" +
+                     "t[1usize] = Node(20, None)\n" +
+                     "print(sum(t[..], Some(0u8)))\n")
+
+    akr_lacks(out, "call ptr @malloc")
+    akr_lacks(out, "@arc.copy")
+
+// The reaper's worklist is scratch space a thread uses while it drains, not state two threads share,
+// and its being per-thread is invisible from a program's output -- so the storage class is asserted.
+@test("is thread-local, along with the flag saying a drain is already running")
+akr_the_worklist_is_thread_local()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_chain() + "var p: &sync Node = Node(1)")
+
+    akr_has(out, "%arc.reaper = type { ptr, i8 }")
+    akr_has(out, "@arc.reaper.self = internal thread_local global %arc.reaper zeroinitializer")
+
+// A machine that knows what the current thread is has no reason to ask anybody: the slot is reached
+// by name, and the symbol a port would define is not emitted at all.
+@test("and a target with it asks nobody for the slot")
+akr_a_tls_target_asks_nobody()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_chain() + "var p: &sync Node = Node(1)")
+
+    akr_has(out, "%head = getelementptr %arc.reaper, ptr @arc.reaper.self, i32 0, i32 0")
+    akr_lacks(out, reaper_slot_symbol())
+
+// The reaper is unchanged by where the slot came from: it threads the list through the dead count
+// slot and drains in a loop rather than recursing.
+@test("and the reaper reads and writes it exactly as it did")
+akr_the_reaper_reads_and_writes_the_slot()
+    if akr_no_library() then return
+
+    val out = akr_ir(akr_chain() + "var p: &sync Node = Node(1)")
+
+    akr_has(out, "%w = load ptr, ptr %head\n  store ptr %w, ptr %p")
+    akr_has(out, "store ptr %p, ptr %head")
+    akr_has(out, "drain:\n  store i8 1, ptr %flag")
+
+// Asked for a thread-local, LLVM gives a freestanding ELF target the local-exec model, whose offset
+// is read from a thread pointer nothing on a bare machine has written: it links clean and reads a
+// wild address. So the slot is asked for instead, and the answer is the environment's.
+@test("is fetched where nothing has set thread-local storage up")
+akr_a_bare_target_fetches_the_slot()
+    if akr_no_library() then return
+
+    val out = akr_ir_for(target_named("aarch64-freestanding").unwrap(), akr_chain() + "var p: &sync Node = Node(1)")
+
+    akr_has(out, s"%s = call ptr @${reaper_slot_symbol()}()")
+    akr_has(out, "%head = getelementptr %arc.reaper, ptr %s, i32 0, i32 0")
+    akr_lacks(out, "thread_local")
+
+// `weak`, so a bare-metal program with no scheduler links with nothing supplied and drains through
+// the one slot; a port that schedules defines the symbol over this one and wins the link.
+@test("and the program supplies its own answer weakly, so a port can win the link")
+akr_a_bare_target_supplies_the_slot_weakly()
+    if akr_no_library() then return
+
+    val out = akr_ir_for(target_named("aarch64-freestanding").unwrap(), akr_chain() + "var p: &sync Node = Node(1)")
+
+    akr_has(out, s"define weak ptr @${reaper_slot_symbol()}()")
+    akr_has(out, "@arc.reaper.self = internal global %arc.reaper zeroinitializer")
+    akr_has(out, "entry:\n  ret ptr @arc.reaper.self")
+
+// Stated over the whole registry, so that a target added later cannot reach for a thread pointer it
+// has not got, or pay for a call it need not make.
+@test("and every target either has the slot or asks for it, never both and never neither")
+akr_every_target_has_the_slot_or_asks()
+    if akr_no_library() then return
+
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.supported()
+            val out = akr_ir_for(t, akr_chain() + "var p: &sync Node = Node(1)")
+            val tls = if t.thread_local_storage() then "thread_local " else ""
+
+            akr_has(out, s"@arc.reaper.self = internal ${tls}global %arc.reaper zeroinitializer")
+            assert_eq(out.contains(s"define weak ptr @${reaper_slot_symbol()}()"), !t.thread_local_storage())
+end akr_every_target_has_the_slot_or_asks
+
+// -- the behaviour --------------------------------------------------------------------------------
+
+private akr_ready() -> bool
+    if akr_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end akr_ready
+
+// What a program PRINTS, which is the one claim nothing short of building and running it makes.
+private akr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-akr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end akr_ran
+
+private akr_prints(text: string, expected: string)
+    if !akr_ready() then return
+
+    assert_eq(akr_ran(text), expected)
+
+@test("a reference outlives the expression that constructed it")
+akr_a_reference_outlives_its_construction()
+    akr_prints("struct Point\n" +
+               "    x: int\n" +
+               "    y: int\n" +
+               "var p: &Point = Point(3, 4)\n" +
+               "print(p.x, p.y)\n",
+               "3 4\n")
+
+@test("every alias of a reference sees the same object")
+akr_every_alias_sees_one_object()
+    akr_prints("struct Counter\n" +
+               "    n: int\n" +
+               "var a: &Counter = Counter(0)\n" +
+               "var b = a\n" +
+               "a.n = 7\n" +
+               "print(b.n)\n" +
+               "b.n = b.n + 1\n" +
+               "print(a.n)\n",
+               "7\n8\n")
+
+@test("a value struct still copies, so its fields are independent")
+akr_a_value_struct_still_copies()
+    akr_prints("struct Counter\n" +
+               "    n: int\n" +
+               "var a = Counter(0)\n" +
+               "var b = a\n" +
+               "a.n = 7\n" +
+               "print(a.n, b.n)\n",
+               "7 0\n")
+
+@test("a function returns a reference it made itself")
+akr_a_function_returns_its_own_reference()
+    akr_prints("struct Point\n" +
+               "    x: int\n" +
+               "    y: int\n" +
+               "origin() -> &Point = Point(0, 0)\n" +
+               "shifted(by: int) -> &Point\n" +
+               "    var p: &Point = Point(by, by)\n" +
+               "    p\n" +
+               "var a = origin()\n" +
+               "var b = shifted(5)\n" +
+               "print(a.x, b.x, b.y)\n",
+               "0 5 5\n")
+
+@test("a reference passes into a function, which may mutate the caller's object")
+akr_a_callee_mutates_the_callers_object()
+    akr_prints("struct Counter\n" +
+               "    n: int\n" +
+               "bump(c: &Counter)\n" +
+               "    c.n = c.n + 1\n" +
+               "var c: &Counter = Counter(0)\n" +
+               "bump(c)\n" +
+               "bump(c)\n" +
+               "print(c.n)\n",
+               "2\n")
+
+@test("a linked list is built out of references and walked back down")
+akr_a_linked_list_is_walked()
+    akr_prints(akr_linked() +
+               "total(n: Option[&Node]) -> int\n" +
+               "    n match\n" +
+               "        Some(node) -> node.value + total(node.next)\n" +
+               "        None -> 0\n" +
+               "var a: &Node = Node(3, None)\n" +
+               "var b: &Node = Node(2, Some(a))\n" +
+               "var c: &Node = Node(1, Some(b))\n" +
+               "print(total(Some(c)))\n",
+               "6\n")
+
+@test("a list is rebuilt in a loop, so each link is dropped as the head moves on")
+akr_a_list_is_rebuilt_in_a_loop()
+    akr_prints(akr_linked() +
+               "digits(n: Option[&Node], acc: int) -> int\n" +
+               "    n match\n" +
+               "        Some(node) -> digits(node.next, acc * 10 + node.value)\n" +
+               "        None -> acc\n" +
+               "var head: Option[&Node] = None\n" +
+               "for i in 1..5 do\n" +
+               "    head = Some(Node(i, head))\n" +
+               "\n" +
+               "print(digits(head, 0))\n",
+               "54321\n")
+
+@test("a recursive enum evaluates through the references it holds")
+akr_a_recursive_enum_evaluates()
+    akr_prints("enum Expr\n" +
+               "    Num(n: int)\n" +
+               "    Add(l: &Expr, r: &Expr)\n" +
+               "    Mul(l: &Expr, r: &Expr)\n" +
+               "eval(e: &Expr) -> int\n" +
+               "    *e match\n" +
+               "        Num(n) -> n\n" +
+               "        Add(l, r) -> eval(l) + eval(r)\n" +
+               "        Mul(l, r) -> eval(l) * eval(r)\n" +
+               "var tree: &Expr = Mul(Add(Num(2), Num(3)), Num(4))\n" +
+               "print(eval(tree))\n",
+               "20\n")
+
+@test("an absent reference is an Option, matched like any other enum")
+akr_an_absent_reference_is_an_option()
+    akr_prints(akr_linked() +
+               "first(n: Option[&Node]) -> int\n" +
+               "    n match\n" +
+               "        Some(node) -> node.value\n" +
+               "        None -> -1\n" +
+               "var lone: &Node = Node(9, None)\n" +
+               "print(first(Some(lone)), first(None))\n",
+               "9 -1\n")
+
+@test("two references to one object compare equal, and to different objects do not")
+akr_references_compare_by_identity()
+    akr_prints("struct Point\n" +
+               "    x: int\n" +
+               "    y: int\n" +
+               "var a: &Point = Point(1, 1)\n" +
+               "var b = a\n" +
+               "var c: &Point = Point(1, 1)\n" +
+               "print(a == b, a == c)\n",
+               "true false\n")
+
+@test("an atomic reference behaves exactly like an ordinary one")
+akr_an_atomic_reference_behaves_alike()
+    akr_prints("struct Counter\n" +
+               "    n: int\n" +
+               "var a: &sync Counter = Counter(1)\n" +
+               "var b = a\n" +
+               "b.n = 41\n" +
+               "print(a.n + 1)\n",
+               "42\n")
+
+@test("a field holding a reference releases the old one when it is overwritten")
+akr_an_overwritten_field_releases_the_old_one()
+    akr_prints(akr_linked() +
+               "var tail: &Node = Node(2, None)\n" +
+               "var head: &Node = Node(1, Some(tail))\n" +
+               "head.next = None\n" +
+               "head.next = Some(Node(3, None))\n" +
+               "var out = 0\n" +
+               "head.next match\n" +
+               "    Some(n) -> out = n.value\n" +
+               "    None -> out = 0\n" +
+               "print(out)\n",
+               "3\n")
+
+@test("allocating in a long loop neither over-releases nor runs away")
+akr_a_long_allocating_loop_balances()
+    akr_prints(akr_linked() +
+               "var i = 0\n" +
+               "var out = 0\n" +
+               "while i < 300000 do\n" +
+               "    var t: &Node = Node(1, Some(Node(2, None)))\n" +
+               "    out = t.value\n" +
+               "    i = i + 1\n" +
+               "\n" +
+               "print(out, i)\n",
+               "1 300000\n")
+
+@test("a reference survives being handed through a generic function")
+akr_a_reference_survives_a_generic_function()
+    akr_prints("struct Point\n" +
+               "    x: int\n" +
+               "    y: int\n" +
+               "id[T](x: T) -> T = x\n" +
+               "var p: &Point = Point(6, 7)\n" +
+               "var q = id(p)\n" +
+               "print(q.x, q.y)\n",
+               "6 7\n")
+
+// `break value` hands a value out of a loop as a branch or a return does, so a fresh `&Point` broken
+// out of a search is retained past the loop and freed exactly once: a leak grows the resident set
+// over the long loop and a double free faults. `find(t)` breaks with `Point(t, 2t)`, so `x + y` is
+// `3t`, and the total is the sum of `3 * (i % 10)` over 500000.
+@test("a &T value broken out of a loop is retained and freed exactly once")
+akr_a_reference_broken_out_of_a_loop()
+    akr_prints("struct Point\n" +
+               "    x: int\n" +
+               "    y: int\n" +
+               "find(target: int) -> &Point\n" +
+               "    for i in 0..<10\n" +
+               "        if i == target then break Point(i, i * 2)\n" +
+               "    else Point(-1, -1)\n" +
+               "var i = 0\n" +
+               "var total = 0\n" +
+               "while i < 500000\n" +
+               "    var p = find(i % 10)\n" +
+               "    total += p.x + p.y\n" +
+               "    i++\n" +
+               "print(total)\n",
+               "6750000\n")
+
+// The buffer a concatenation builds is a box like any other, and its storage comes back through the
+// hook its header carries -- a null hook would mean "nothing frees this", and every string a program
+// built would leak. `str(i % 10)` builds a second box per round whose length is not a constant, so
+// nothing here folds away.
+@test("a string built in a loop is freed exactly once")
+akr_a_string_built_in_a_loop()
+    akr_prints("var i = 0\n" +
+               "var n = 0\n" +
+               "while i < 200000\n" +
+               "    val s = \"n=\" + str(i % 10)\n" +
+               "    n += int(s.len)\n" +
+               "    i++\n" +
+               "print(n)\n",
+               "600000\n")
+
+// A store to `a.b.c` through two levels of `&T` reaches the innermost reference and releases the `C`
+// it replaced -- not the wrong hop, and not nothing.
+@test("a deep field-path store through nested references releases the innermost old one")
+akr_a_deep_field_store_releases_the_innermost()
+    akr_prints("struct C\n" +
+               "    v: int\n" +
+               "struct B\n" +
+               "    c: &C\n" +
+               "struct A\n" +
+               "    b: &B\n" +
+               "run(seed: int) -> int\n" +
+               "    var a: &A = A(B(C(seed)))\n" +
+               "    a.b.c = C(seed + 100)\n" +
+               "    a.b.c.v\n" +
+               "var i = 0\n" +
+               "var total = 0\n" +
+               "while i < 400000\n" +
+               "    total += run(i % 7)\n" +
+               "    i++\n" +
+               "print(total)\n",
+               "41199997\n")
+
+// Three cut points leave three different sets of `&T` locals live, and a nested `Pair` of `&Inner`
+// exercises a struct field's own references: a skipped release grows the resident set and a release
+// of a slot nothing was stored in faults.
+@test("an early return releases exactly the references live at that point")
+akr_an_early_return_releases_what_is_live()
+    akr_prints("struct Inner\n" +
+               "    v: int\n" +
+               "struct Pair\n" +
+               "    a: &Inner\n" +
+               "    b: &Inner\n" +
+               "build(cut: int, seed: int) -> int\n" +
+               "    var x: &Inner = Inner(seed)\n" +
+               "    if cut == 1 then return x.v\n" +
+               "    var p: &Pair = Pair(Inner(seed + 1), Inner(seed + 2))\n" +
+               "    if cut == 2 then return x.v + p.a.v\n" +
+               "    var y: &Inner = Inner(seed + 3)\n" +
+               "    x.v + p.a.v + p.b.v + y.v\n" +
+               "var i = 0\n" +
+               "var total = 0\n" +
+               "while i < 300000\n" +
+               "    total += build(i % 3, i % 5)\n" +
+               "    i++\n" +
+               "print(total)\n",
+               "2100000\n")
