@@ -526,20 +526,12 @@ private self_for(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type]) -> Bu
     var subst: Buf[Binding] = buf()
     val outer = a.tables.members.selves.get(f.name)
 
-    var own: Buf[Binding] = buf()
+    if outer.is_some()
+        for i in 0..<outer.unwrap().len()
+            subst.push(fixed_value(outer.unwrap().at(i), f.tparams, targs))
 
     for i in 0..<f.tparams.len()
-        if i < targs.len() then own.push(Binding(f.tparams.at(i), targs.at(i)))
-
-    if outer.is_some()
-        val refixed = refixed_outer(outer.unwrap(), own)
-
-        for i in 0..<refixed.len()
-            subst.push(refixed.at(i))
-    end if
-
-    for i in 0..<own.len()
-        subst.push(own.at(i))
+        if i < targs.len() then subst.push(Binding(f.tparams.at(i), targs.at(i)))
 
     // On a generic type `Self` is the type applied to its own parameters, which is not a type until
     // the parameters are fixed -- so the receiver is kept as written and resolved here, where they
@@ -554,25 +546,23 @@ private self_for(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type]) -> Bu
     subst
 end self_for
 
-// What a trait's parameters mean inside a block's member, with each one the block fixed to a value
-// parameter of its own -- `impl[const M: usize] Bytes[M] for Bits[M]` binds `N` to an open `M` --
-// read at the number `fixed` gives `M`. A body reads a value parameter only where it is bound to a
-// number, so the trait's `N` would otherwise stay open in every reading of the member.
-refixed_outer(outer: Buf[Binding], fixed: Buf[Binding]) -> Buf[Binding]
-    var out: Buf[Binding] = buf()
+// A trait's value parameter a generic block fixed to one of its own -- `impl[const M: usize]
+// Bytes[M] for Bits[M]` binds `N` to `M` -- at the number this instantiation gives `M`. A body reads
+// a value parameter only where it is bound to a number, so the trait's `N` would otherwise stay the
+// block's open `M` in every instantiation.
+private fixed_value(b: Binding, tparams: Buf[string], targs: Buf[Type]) -> Binding
+    val open = b.ty match
+        Abstract(n, _) -> Some(n)
+        _ -> None
 
-    for i in 0..<outer.len()
-        val b = outer.at(i)
+    if open.is_none() then return b
 
-        val open = b.ty match
-            Abstract(n, _) -> bound_type(fixed, n)
-            _ -> None
+    for i in 0..<tparams.len()
+        if tparams.at(i) == open.unwrap() && i < targs.len()
+            targs.at(i) match
+                ConstArg(_, _) -> return Binding(b.name, targs.at(i))
+                _ -> ()
+        end if
 
-        val number = open match
-            Some(ConstArg(_, _)) -> true
-            _ -> false
-
-        out.push(if number then Binding(b.name, open.unwrap()) else b)
-
-    out
-end refixed_outer
+    b
+end fixed_value
