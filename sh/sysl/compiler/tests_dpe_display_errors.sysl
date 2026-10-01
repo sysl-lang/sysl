@@ -1,0 +1,651 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// What `Display` and its `Writer` sink lower to, and what they refuse (`library/core.md § Rendering
+// to a sink`) -- the reference's `DisplayCodegenTests` and `DisplayErrorTests`.
+//
+// **Every expected line and every refusal here was read out of the reference compiler's own
+// `emit-llvm`** on the same program. The lowering half asserts the exact lines the reference
+// writes, registers included: both compilers number deterministically and agree on every one of
+// these programs to the byte, so a looser pattern would only be a weaker claim. The refusal half
+// asserts each refusal's first line and its `line:column`, the anchor being the reference's.
+//
+// The point of routing rendering through a trait is that "this cannot be printed" stops being a
+// special case and becomes a missing implementation or a missing bound, like any other -- so each
+// refusal names the thing to WRITE, an `impl` or a bound, rather than merely declining.
+
+// The whole lowered text of a one-file program, or nothing without the library. A program that
+// does not lower cleanly fails the test here, naming what it said.
+private dpe_ir(text: string) -> Option[string]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-dpe").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val made = emit_llvm_text(root, None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    made match
+        Err(why) ->
+            assert(false, failure_text(why))
+            None
+        Ok(emitted) ->
+            assert(emitted.report.is_empty(), analysis_report(emitted.report))
+            Some(emitted.text)
+end dpe_ir
+
+// The body of `@main`, from its `define` to the closing brace.
+private dpe_main_of(ir: string) -> string
+    val at = ir.index_of("define i32 @main(").unwrap_or(0)
+    val rest = ir[at..<ir.len]
+    val close = rest.index_of("\n}").unwrap_or(rest.len)
+
+    rest[0..<close]
+end dpe_main_of
+
+// How many lines of the text begin with this.
+private dpe_lines_starting(text: string, head: string) -> int
+    var n = 0
+    var rest = "\n" + text
+
+    loop
+        rest.index_of("\n" + head) match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + 1..<rest.len]
+
+    n
+end dpe_lines_starting
+
+// Everything a source has to say for itself, taken the whole way through the lowering.
+private dpe_said(text: string) -> string
+    val root = make_temp_dir("sysl-dpe").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end dpe_said
+
+// Refused with this first line, anchored at this `line:column` of `main.sysl`.
+private dpe_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val said = dpe_said(text)
+
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"main.sysl:$at\n"), said)
+end dpe_refused
+
+// A pair whose `Display` writes one of its fields -- the reference suite's `point`.
+private dpe_point() -> string = raw"""
+    struct Point
+        x: int
+        y: int
+    impl Display for Point
+        display(self, out: *Writer, fmt: FormatSpec)
+            self.x.display(out, fmt)
+    """
+
+// A writer of the program's own, so a rendering can be asked for with a specifier the program
+// spells, and what the rendering reaches is nothing but a counter of its own.
+private dpe_sink() -> string = raw"""
+    struct C
+        n: usize
+
+    impl Fallible for C
+
+    impl Writer for C
+        write(*self, bytes: []const u8)
+            self.n += bytes.len
+
+    var c: C
+    var w: *Writer = &c
+
+    """
+
+private dpe_sized() -> string = raw"""
+    struct Size derives Display
+        w: int
+        h: int
+
+    """
+
+// ---- the scalar path is untouched ----
+
+// `library/core.md § Rendering to standard output`: the one rendering that builds no sink is the
+// one to emit, and a program that only prints numbers carries no method table at all.
+@test("a printed scalar calls its renderer directly")
+dpe_a_printed_scalar_calls_its_renderer_directly()
+    dpe_ir("print(5)\n") match
+        None -> ()
+        Some(ir) ->
+            val main = dpe_main_of(ir)
+
+            assert(main.contains("  call void @sysl$printi(i64 %t1)\n"), main)
+            assert(!main.contains("insertvalue { ptr, ptr }"), main)
+end dpe_a_printed_scalar_calls_its_renderer_directly
+
+@test("a program that prints only scalars carries no writer")
+dpe_a_program_that_prints_only_scalars_carries_no_writer()
+    dpe_ir("print(5, \"a\", true)\n") match
+        None -> ()
+        Some(ir) ->
+            assert(!ir.contains("@vt.sysl$Writer.sysl$Stdout"), ir)
+            assert(!ir.contains("@sysl$stdout("), ir)
+            assert(!ir.contains("@sysl.w.buf.write"), ir)
+end dpe_a_program_that_prints_only_scalars_carries_no_writer
+
+@test("str of a scalar still renders without a buffer")
+dpe_str_of_a_scalar_still_renders_without_a_buffer()
+    dpe_ir("print(str(5))\n") match
+        None -> ()
+        Some(ir) ->
+            val main = dpe_main_of(ir)
+
+            assert(main.contains("  %t2 = call { ptr, ptr, i64 } @sysl.str.int(i64 %t1, i1 1)\n"), main)
+            assert(!main.contains("@sysl.w.buf.finish"), main)
+end dpe_str_of_a_scalar_still_renders_without_a_buffer
+
+// ---- the sink a print reaches ----
+
+// The sink is a value the library hands out, so what `print` emits is a call to it -- the two
+// words it comes back as are assembled inside that function, never laid down by the compiler.
+@test("is a call to the library's own, not two words the compiler laid down")
+dpe_is_a_call_to_the_librarys_own()
+    dpe_ir(dpe_point() + "print(Point(1, 2))\n") match
+        None -> ()
+        Some(ir) ->
+            val main = dpe_main_of(ir)
+
+            assert(main.contains("  %t3 = call { ptr, ptr } @sysl$stdout()\n"), main)
+            assert(!main.contains("@sysl.vt.out"), main)
+end dpe_is_a_call_to_the_librarys_own
+
+// The specifier's emitted type name is its key, as every emitted name is.
+@test("hands the value, the sink, and the specifier to the type's own display")
+dpe_hands_the_value_the_sink_and_the_specifier_to_display()
+    dpe_ir(dpe_point() + "print(Point(1, 2))\n") match
+        None -> ()
+        Some(ir) ->
+            val main = dpe_main_of(ir)
+
+            assert(main.contains("  call void @Point.display(%struct.Point %t2, { ptr, ptr } %t3, " +
+                                 "%struct.sysl$FormatSpec %t6)\n"), main)
+end dpe_hands_the_value_the_sink_and_the_specifier_to_display
+
+// The `write` a print ends in is a library function like any other, so the program carries a table
+// pointing at it rather than a body the compiler wrote. The table's line carries the type's
+// identity, a hash, in front of the slots, so what is asserted is the shape and the slot list.
+@test("through a table pointing at the library's own writer")
+dpe_through_a_table_pointing_at_the_librarys_own_writer()
+    dpe_ir(dpe_point() + "print(Point(1, 2))\n") match
+        None -> ()
+        Some(ir) ->
+            assert(ir.contains("@vt.sysl$Writer.sysl$Stdout = private constant { i64, [2 x ptr] }"), ir)
+            assert(ir.contains("[2 x ptr] [ptr @sysl$Stdout.failed, ptr @sysl$Stdout.write]"), ir)
+end dpe_through_a_table_pointing_at_the_librarys_own_writer
+
+// ---- the sink a str builds ----
+
+// A stack slot zeroed on arrival rather than once: an alloca is hoisted to the entry block, so a
+// render inside a loop meets the same slot every time round and has to start it empty.
+@test("is a stack slot the render zeroes each time")
+dpe_is_a_stack_slot_the_render_zeroes_each_time()
+    dpe_ir(dpe_point() + "print(str(Point(1, 2)))\n") match
+        None -> ()
+        Some(ir) ->
+            val main = dpe_main_of(ir)
+
+            assert(main.contains("  %t6 = alloca { ptr, i64, i64 }\n"), main)
+            assert(main.contains("  store { ptr, i64, i64 } zeroinitializer, ptr %t6\n"), main)
+end dpe_is_a_stack_slot_the_render_zeroes_each_time
+
+@test("turns what landed there into a string the statement owns")
+dpe_turns_what_landed_there_into_a_string_the_statement_owns()
+    dpe_ir(dpe_point() + "print(str(Point(1, 2)))\n") match
+        None -> ()
+        Some(ir) ->
+            val main = dpe_main_of(ir)
+
+            assert(main.contains("  %t9 = call { ptr, ptr, i64 } @sysl.w.buf.finish(ptr %t6)\n"), main)
+            assert(main.contains("  call void @arc.release_maybe("), main)
+end dpe_turns_what_landed_there_into_a_string_the_statement_owns
+
+// ---- the writers' tables ----
+
+// The order is the one the trait OFFERS rather than the one `Writer` declares: `Writer: Fallible`
+// puts the required trait's members first, so slot 0 is `failed` and slot 1 is `write`. The
+// buffer's table is laid out by hand and the sink's is derived from the library's `impl`, and the
+// two have to agree -- which is why both are checked here.
+@test("hold failed first and write second, the order the trait offers them")
+dpe_hold_failed_first_and_write_second()
+    dpe_ir(dpe_point() + "print(Point(1, 2))\nprint(str(Point(3, 4)))\n") match
+        None -> ()
+        Some(ir) ->
+            assert(ir.contains("@vt.sysl$Writer.sysl$Stdout = private constant { i64, [2 x ptr] }"), ir)
+            assert(ir.contains("[2 x ptr] [ptr @sysl$Stdout.failed, ptr @sysl$Stdout.write]"), ir)
+            assert(ir.contains("@sysl.vt.buf = private constant { i64, [2 x ptr] }"), ir)
+            assert(ir.contains("[2 x ptr] [ptr @sysl.w.buf.failed, ptr @sysl.w.buf.write]"), ir)
+end dpe_hold_failed_first_and_write_second
+
+@test("are emitted once however many values render")
+dpe_are_emitted_once_however_many_values_render()
+    val text = dpe_point() + "print(Point(1, 2))\nprint(Point(3, 4))\nprint(Point(5, 6))\n"
+
+    dpe_ir(text) match
+        None -> ()
+        Some(ir) -> assert_eq(dpe_lines_starting(ir, "@vt.sysl$Writer.sysl$Stdout ="), 1)
+end dpe_are_emitted_once_however_many_values_render
+
+@test("a program that only prints a user type carries no buffer")
+dpe_a_program_that_only_prints_a_user_type_carries_no_buffer()
+    dpe_ir(dpe_point() + "print(Point(1, 2))\n") match
+        None -> ()
+        Some(ir) ->
+            assert(ir.contains("@vt.sysl$Writer.sysl$Stdout"), ir)
+            assert(!ir.contains("@sysl.vt.buf"), ir)
+end dpe_a_program_that_only_prints_a_user_type_carries_no_buffer
+
+// ---- the renderer a built-in's Display reaches ----
+
+// The symbol an integer's `display` lowers to is spelled by the compiler -- the blanket's members
+// are emitted per receiver -- so it has to carry the library's key, or a program declaring a trait
+// called `Integer` could collide with it.
+@test("is emitted under the library's key, wherever the family lives")
+dpe_is_emitted_under_the_librarys_key()
+    dpe_ir(dpe_point() + "print(Point(1, 2))\n") match
+        None -> ()
+        Some(ir) ->
+            assert(ir.contains("call void @bound.sysl$Integer.display.int("), ir)
+            assert(!ir.contains("call void @bound.Integer.display.int("), ir)
+end dpe_is_emitted_under_the_librarys_key
+
+// The width is part of the name, so one blanket serves an open family; `u8` is named by its
+// mangling, `byte`, not by the spelling written.
+@test("and each width instantiates a renderer of its own")
+dpe_and_each_width_instantiates_a_renderer_of_its_own()
+    val text = raw"""
+        struct B
+            a: u8
+            b: u128
+        impl Display for B
+            display(self, out: *Writer, fmt: FormatSpec)
+                self.a.display(out, fmt)
+                self.b.display(out, fmt)
+        print(B(1u8, 2u128))
+        """
+
+    dpe_ir(text) match
+        None -> ()
+        Some(ir) ->
+            assert(ir.contains("define void @bound.sysl$Integer.display.byte("), ir)
+            assert(ir.contains("define void @bound.sysl$Integer.display.u128("), ir)
+end dpe_and_each_width_instantiates_a_renderer_of_its_own
+
+// `bool` has a written `impl` rather than a share of the blanket, so its rendering is the library's
+// `bool.display`, which forwards to `sysl$display_bool` by name. Against the precompiled library --
+// what `emit-llvm` lowers against, here as in the reference -- the call reaches `bool.display` and
+// both library symbols are declared rather than defined.
+@test("and a closed family still reaches the renderer its own impl names")
+dpe_and_a_closed_family_still_reaches_the_renderer_its_own_impl_names()
+    val text = raw"""
+        struct B
+            v: bool
+        impl Display for B
+            display(self, out: *Writer, fmt: FormatSpec)
+                self.v.display(out, fmt)
+        print(B(true))
+        """
+
+    dpe_ir(text) match
+        None -> ()
+        Some(ir) ->
+            assert(ir.contains("  call void @bool.display(i1 %t2, { ptr, ptr } %t3, " +
+                               "%struct.sysl$FormatSpec %t4)\n"), ir)
+            assert(ir.contains("declare void @sysl$display_bool(i1, { ptr, ptr }, %struct.sysl$FormatSpec)"),
+                   ir)
+end dpe_and_a_closed_family_still_reaches_the_renderer_its_own_impl_names
+
+// ---- a writer a program wrote ----
+
+// An ordinary erasure, so `write`'s `*self` lands in the slot with no adapter between; the required
+// trait's slot comes first, and `C.failed` is the DEFAULT `Fallible` supplied.
+@test("puts its own implementation straight into the table")
+dpe_puts_its_own_implementation_straight_into_the_table()
+    dpe_ir(dpe_sink() + "display_int(1, w, FormatSpec(0, -1, false))\n") match
+        None -> ()
+        Some(ir) -> assert(ir.contains("[2 x ptr] [ptr @C.failed, ptr @C.write]"), ir)
+end dpe_puts_its_own_implementation_straight_into_the_table
+
+// ---- a compound rendering builds no string ----
+
+// A gathered rendering reaches `sysl.str.concat`, and reaching it at all is the defect -- one string
+// per part plus one per separator, every one thrown away as soon as it is written.
+@test("a derived Display writes its parts straight through")
+dpe_a_derived_display_writes_its_parts_straight_through()
+    dpe_ir(dpe_sized() + "print(Size(3, 4))\n") match
+        None -> ()
+        Some(ir) ->
+            assert(!ir.contains("@sysl.str.concat"), ir)
+            assert(!ir.contains("@sysl.str.int"), ir)
+            assert(ir.contains("@render$20Size"), ir)
+end dpe_a_derived_display_writes_its_parts_straight_through
+
+// A width is measured into `Counting`, which stores nothing, rather than gathered into a buffer.
+// The specifier is handed over directly: an f-string concatenates its own pieces, so it would put
+// `sysl.str.concat` in the output whatever the rendering did.
+@test("and a width is measured rather than gathered")
+dpe_and_a_width_is_measured_rather_than_gathered()
+    dpe_ir(dpe_sized() + dpe_sink() + "Size(3, 4).display(w, FormatSpec(12, -1, false))\n") match
+        None -> ()
+        Some(ir) ->
+            assert(!ir.contains("@sysl.str.concat"), ir)
+            assert(ir.contains("@sysl$Counting.write"), ir)
+end dpe_and_a_width_is_measured_rather_than_gathered
+
+@test("a tuple builds none either, padded or not")
+dpe_a_tuple_builds_none_either_padded_or_not()
+    val text = dpe_sink() + "(1, 2).display(w, FormatSpec(0, -1, false))\n" +
+               "(3, 4).display(w, FormatSpec(10, -1, false))\n"
+
+    dpe_ir(text) match
+        None -> ()
+        Some(ir) ->
+            assert(!ir.contains("@sysl.str.concat"), ir)
+            assert(ir.contains("@sysl$Counting.write"), ir)
+end dpe_a_tuple_builds_none_either_padded_or_not
+
+// A shape with no parts renders as one string literal, so no renderer is written for it at all.
+@test("and a shape with no parts gets no renderer")
+dpe_and_a_shape_with_no_parts_gets_no_renderer()
+    dpe_ir("struct Unit derives Display\nend Unit\n\nprint(Unit())\n") match
+        None -> ()
+        Some(ir) ->
+            assert(!ir.contains("@render"), ir)
+            assert(ir.contains("@sysl$display_pad"), ir)
+end dpe_and_a_shape_with_no_parts_gets_no_renderer
+
+// ---- a value with no rendering ----
+
+@test("names the impl that would give a struct one")
+dpe_names_the_impl_that_would_give_a_struct_one()
+    dpe_refused("struct Q\n    a: int\nprint(Q(1))\n",
+                "cannot print a Q value — write an 'impl sysl.Display for Q' to say how it renders",
+                "3:1")
+
+@test("says the same about an enum")
+dpe_says_the_same_about_an_enum()
+    dpe_refused("enum Colour\n    Red\nprint(Red)\n",
+                "cannot print a Colour value — write an 'impl sysl.Display for Colour' to say how it " +
+                "renders", "3:1")
+
+@test("reports 'str' in the words 'str' was asked in")
+dpe_reports_str_in_the_words_str_was_asked_in()
+    dpe_refused("struct Q\n    a: int\nprint(str(Q(1)))\n",
+                "cannot make a string of a Q value — write an 'impl sysl.Display for Q' to say how it " +
+                "renders", "3:7")
+
+// A pointer is deliberately not `Display` -- an address renders differently on every run -- and a
+// composed type cannot carry an `impl`, so there is none to suggest.
+@test("offers no impl for a type that could not carry one")
+dpe_offers_no_impl_for_a_type_that_could_not_carry_one()
+    dpe_refused("var n = 1\nprint(&n)\n",
+                "cannot print a *int value — it does not implement 'sysl.Display'", "2:1")
+
+@test("refuses a reference rather than reaching through it")
+dpe_refuses_a_reference_rather_than_reaching_through_it()
+    dpe_refused("struct P\n    x: int\nvar p: &P = P(1)\nprint(p)\n",
+                "cannot print a &P value — it does not implement 'sysl.Display'", "4:1")
+
+// An array renders at every length through one library block over `[N]T`, so what is refused is an
+// array whose ELEMENT does not render, and it says which.
+@test("refuses an array only when its element does not render")
+dpe_refuses_an_array_only_when_its_element_does_not_render()
+    dpe_refused("struct P\n    v: int\nvar a: [2]P = [P(1), P(2)]\nprint(a)\n",
+                "cannot print a [2]P value — the 'impl' that covers it asks 'sysl.Display' of P, which " +
+                "does not implement it", "4:1")
+
+@test("refuses a trait object, which has forgotten what it renders as")
+dpe_refuses_a_trait_object()
+    val text = raw"""
+        trait Shape
+            area(self) -> int
+        struct R
+            w: int
+        impl Shape for R
+            area(self) -> int = self.w
+        var r = R(1)
+        var s: *Shape = &r
+        print(s)
+        """
+
+    dpe_refused(text, "cannot print a *Shape value — an object offers what its trait declares and " +
+                "what that trait requires, so write 'trait Shape: sysl.Display' to keep the rendering " +
+                "the value had before it was erased", "9:1")
+end dpe_refuses_a_trait_object
+
+// ---- a type parameter ----
+
+// The complaint lands on the DEFINITION, naming the bound that would license it, whether or not
+// anything ever instantiates the function.
+@test("is told which bound would let it be printed")
+dpe_is_told_which_bound_would_let_it_be_printed()
+    dpe_refused("f[T](x: T) = print(x)\nf(1)\n", "'print' needs 'T: sysl.Display'", "1:14")
+
+@test("is told the same about 'str'")
+dpe_is_told_the_same_about_str()
+    dpe_refused("f[T](x: T) -> string = str(x)\nprint(f(1))\n", "'str' needs 'T: sysl.Display'", "1:24")
+
+// No call site at all, which is what tells a definition-time check from a template.
+@test("is told so even where nothing instantiates it")
+dpe_is_told_so_even_where_nothing_instantiates_it()
+    dpe_refused("f[T](x: T) = print(x)\n", "'print' needs 'T: sysl.Display'", "1:14")
+
+@test("is accepted once the bound is written")
+dpe_is_accepted_once_the_bound_is_written()
+    dpe_ir("f[T: Display](x: T) = print(x)\nf(1)\n") match
+        None -> ()
+        Some(ir) -> assert(ir.contains("@main"), ir)
+
+@test("may not pass an unbounded parameter to one that renders")
+dpe_may_not_pass_an_unbounded_parameter_to_one_that_renders()
+    dpe_refused("show[T: Display](x: T) = print(x)\npass[T](x: T) = show(x)\npass(1)\n",
+                "'show' requires its type parameter 'T' to implement 'sysl.Display', but 'T' is not " +
+                "bounded by it", "2:17")
+
+@test("may not instantiate a rendering generic with a type that has no impl")
+dpe_may_not_instantiate_a_rendering_generic_with_no_impl()
+    dpe_refused("struct Q\n    a: int\nshow[T: Display](x: T) = print(x)\nshow(Q(1))\n",
+                "'show' requires its type parameter 'T' to implement 'sysl.Display', but Q does not",
+                "4:1")
+
+// ---- an impl ----
+
+// A program's own type is not a way into the family either: membership is the compiler's answer.
+@test("may not join the family the blanket is written over")
+dpe_may_not_join_the_family_the_blanket_is_written_over()
+    dpe_refused("struct P\n    n: int\nimpl Integer for P\nprint(1)\n",
+                "'sysl.Integer' names a family of types the compiler settles, so nothing implements it " +
+                "— a type is one of them or it is not, and 'P' is not", "3:1")
+
+// A derived subtype is the program's, so coherence would let an `impl` be written -- but it has
+// its base's memberships, so the library's blanket covers it already, and two blocks would cover
+// one type.
+@test("may not be written for a derived subtype the blanket already covers")
+dpe_may_not_be_written_for_a_derived_subtype()
+    val text = raw"""
+        type Stamp = new int
+        impl Display for Stamp
+            display(self, out: *Writer, fmt: FormatSpec) = display_str("x", out, fmt)
+        print(1)
+        """
+
+    dpe_refused(text, "'Stamp' already implements 'sysl.Display' — every 'sysl.Integer' does, " +
+                "through one block written over the family, and a subtype has its base's memberships",
+                "2:1")
+end dpe_may_not_be_written_for_a_derived_subtype
+
+@test("nor for a transparent one, which is its base")
+dpe_nor_for_a_transparent_one()
+    val text = raw"""
+        type Count = int within 0..100
+        impl Display for Count
+            display(self, out: *Writer, fmt: FormatSpec) = display_str("x", out, fmt)
+        print(1)
+        """
+
+    dpe_refused(text, "'Count' already implements 'sysl.Display' — every 'sysl.Integer' does, " +
+                "through one block written over the family, and a subtype has its base's memberships",
+                "2:1")
+end dpe_nor_for_a_transparent_one
+
+@test("must match the trait's signature")
+dpe_must_match_the_traits_signature()
+    val text = raw"""
+        struct P
+            n: int
+        impl Display for P
+            display(self, out: *Writer) = ()
+        print(P(1))
+        """
+
+    dpe_refused(text, "method 'display' of 'impl sysl.Display for P' takes 1 parameter, but the trait " +
+                "declares 2", "3:1")
+end dpe_must_match_the_traits_signature
+
+@test("is called with the arity the trait declares")
+dpe_is_called_with_the_arity_the_trait_declares()
+    val text = raw"""
+        struct P
+            n: int
+        impl Display for P
+            display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out)
+        print(P(1))
+        """
+
+    dpe_refused(text, "method 'int.display' takes 2 arguments, but 1 argument was given", "4:59")
+end dpe_is_called_with_the_arity_the_trait_declares
+
+// ---- a writer ----
+
+// The bytes are borrowed for the call, which is what lets a renderer pass a slice of its own stack
+// buffer -- and that is sound only because an implementation that keeps them is refused. The
+// reference gives this refusal no position, so only its words are asserted.
+@test("may not keep the bytes it is written")
+dpe_may_not_keep_the_bytes_it_is_written()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        struct Bad
+            held: []const u8
+        impl Fallible for Bad
+
+        impl Writer for Bad
+            write(*self, bytes: []const u8)
+                self.held = bytes
+        var b: Bad
+        var w: *Writer = &b
+        display_int(1, w, FormatSpec(0, -1, false))
+        """
+    val said = dpe_said(text)
+
+    assert(said.contains("error: 'Bad.write' keeps what it is passed as 'bytes', but 'sysl.Writer' " +
+                         "declares that parameter borrowed for the call — it may be a view of the " +
+                         "caller's stack, so copy what this needs into storage of its own\n"), said)
+end dpe_may_not_keep_the_bytes_it_is_written
+
+@test("may keep what it copies out of them")
+dpe_may_keep_what_it_copies_out_of_them()
+    dpe_ir(dpe_sink() + "display_int(1, w, FormatSpec(0, -1, false))\n") match
+        None -> ()
+        Some(ir) -> assert(ir.contains("@main"), ir)
+
+@test("is refused as a counted object where a raw one is asked for")
+dpe_is_refused_as_a_counted_object()
+    val text = raw"""
+        struct S
+            n: usize
+        impl Fallible for S
+
+        impl Writer for S
+            write(*self, bytes: []const u8)
+                self.n += bytes.len
+        var w: &Writer = S(0usize)
+        display_int(1, w, FormatSpec(0, -1, false))
+        """
+
+    dpe_refused(text, "'out' of 'sysl.display_int' is *sysl.Writer, but &sysl.Writer was given", "9:16")
+end dpe_is_refused_as_a_counted_object
+
+// A member whose signature does not match the trait's is reported at the `impl` and never
+// registered, and the erasure after it finds no function for the slot -- which is reported rather
+// than read straight out of the table.
+@test("and a member at the wrong signature is reported rather than crashing the table builder")
+dpe_a_member_at_the_wrong_signature_is_reported()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        struct Counter
+            n: usize
+        impl Fallible for Counter
+
+        impl Writer for Counter
+            write(*self, bytes: []u8)
+                self.n += bytes.len
+        var c: Counter
+        var w: *Writer = &c
+        display_int(1, w, FormatSpec(0, -1, false))
+        """
+    val said = dpe_said(text)
+    val first = "error: parameter 'bytes' of method 'write' is []byte, but trait 'sysl.Writer' declares " +
+                "[]const byte\n"
+    val second = "error: Counter has no 'write' that 'sysl.Writer' can point a slot at — the one it " +
+                 "declares does not match what 'sysl.Writer' asks for\n"
+
+    assert(said.contains(first), said)
+    assert(said.contains(second), said)
+    assert(said.index_of(first).unwrap_or(0) < said.index_of(second).unwrap_or(0), said)
+    assert(said.contains("main.sysl:5:1\n"), said)
+    assert(said.contains("main.sysl:9:18\n"), said)
+end dpe_a_member_at_the_wrong_signature_is_reported
+
+// ---- a format specifier ----
+
+// A built-in keeps the strict conversion check, so `%s` on a number stays the mistake it was.
+@test("still refuses the wrong conversion on a built-in")
+dpe_still_refuses_the_wrong_conversion_on_a_built_in()
+    dpe_refused("var n = 1\nprint(f\"${n}%s\")\n",
+                "format '%s' expects a string, but the value has type int", "2:7")
+
+@test("refuses a numeric conversion on a type that renders itself")
+dpe_refuses_a_numeric_conversion_on_a_type_that_renders_itself()
+    val text = raw"""
+        struct P
+            n: int
+        impl Display for P
+            display(self, out: *Writer, fmt: FormatSpec) = self.n.display(out, fmt)
+        print(f"${P(1)}%d")
+        """
+
+    dpe_refused(text, "format '%d' expects an integer, but the value has type P", "5:7")
+end dpe_refuses_a_numeric_conversion_on_a_type_that_renders_itself
+
+// A `%s` hands a value to its own rendering only where it HAS one; a type with none is a mistake in
+// the specifier, refused in the specifier's words rather than as a missing `impl`.
+@test("refuses '%s' on a type with no rendering at all")
+dpe_refuses_s_on_a_type_with_no_rendering_at_all()
+    dpe_refused("struct Q\n    a: int\nprint(f\"${Q(1)}%s\")\n",
+                "format '%s' expects a string, but the value has type Q", "3:7")
