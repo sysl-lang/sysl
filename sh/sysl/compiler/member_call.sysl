@@ -161,8 +161,8 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
     val decl = m.unwrap()
 
     if decl.recv_mode().is_some() then
-        return Some(cx.err(span, s"'$name' is a method of '${qualified_name(found.0)}' — call it on a " +
-                           s"value of ${type_show(ty)}, not on the type itself"))
+        return Some(cx.err(span, s"'$name' is an instance method of '${qualified_name(found.0)}' — " +
+                           "call it on a value, not the type"))
 
     // One declaring type parameters of its own is instantiated from the call, as a method is: the
     // subject settled the type's arguments and the arguments settle the member's.
@@ -891,9 +891,20 @@ build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
             // the caller can be told about.
             check_ref_call(cx, span, place)
             TExpr(span, TAddrOf(place, Ptr(texpr_type(place))))
+    // **What is missing is the COUNT, not an address**: a `&self` method may keep what it is called
+    // on, so it needs a box to keep a share of, and a value on the stack -- a local `var` as much as a
+    // fresh construction -- has none. Boxing a copy here would hand the method a share of something
+    // the caller never sees again. So the refusal names the binding, which is where the box is made.
     ByRef(sync) -> texpr_type(tr) match
         Ref(_, _) -> tr
-        _ -> TExpr(span, TBox(tr, Ref(texpr_type(tr), sync)))
+        _ ->
+            val shown = type_show(texpr_type(tr))
+
+            cx.fault(span, s"'&self' needs a counted reference, and this receiver is a $shown on the " +
+                     "stack — a '&self' method may keep hold of what it is called on, so what it wants " +
+                     "is a share of a box rather than an address. Bind the value into one and call it " +
+                     s"on that: 'var r: &$shown = …'")
+            TExpr(span, TBox(tr, Ref(texpr_type(tr), sync)))
 
 // The name the lowered member goes under. A member of a concrete type was lowered eagerly; a member
 // of a generic type is instantiated here, from the receiver's own type arguments, and its body
