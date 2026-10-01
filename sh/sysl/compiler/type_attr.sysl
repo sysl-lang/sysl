@@ -45,6 +45,17 @@ end type_attr_expr
 
 // `T::Attr(x)` -- the attributes that carry an operand, and the ones that do not, refused by name.
 type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf[Expr]) -> TExpr
+    // **A generic enum written bare names no type at all** -- resolving `Option` with no arguments
+    // is refused for the arguments, which says nothing about the attribute -- so it is told here,
+    // before the name is resolved, that there is no single enum for the attribute to read.
+    val generic = if attr == "Id" then None else generic_enum_named(cx, written)
+
+    if generic.is_some() then
+        val shown = qualified_name(generic.unwrap())
+
+        return cx.err(span, s"'$shown' is generic, so '$shown::$attr' has no single enum to read")
+    end if
+
     val subject = attr_subject(cx, span, written)
 
     if subject.is_none() then
@@ -82,6 +93,24 @@ end type_attr_call
 attr_type_name(receiver: Expr) -> Option[string] = *receiver.kind match
     Ident(n) -> Some(n)
     _ -> None
+
+// The key of the generic enum a written name declares, where it declares one and no type parameter
+// of the body being read stands in front of it.
+private generic_enum_named(cx: &Analyzer, written: string) -> Option[string]
+    if bound_type(cx.subst, written).is_some() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written)
+
+    if key.is_none() then return None
+
+    cx.an.tables.types.get(key.unwrap()).unwrap().kind match
+        EnumOf(_) -> ()
+        _ -> return None
+
+    if cx.an.tables.enum_insts.get(instance_key(key.unwrap(), buf())).is_some() then return None
+
+    key
+end generic_enum_named
 
 // The type a written name stands for here, in the order a reader's own terms are consulted: a type
 // parameter of the body being read, then a declared type, then a built-in integer.

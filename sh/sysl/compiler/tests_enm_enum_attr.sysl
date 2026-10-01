@@ -1,0 +1,212 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The attributes a simple enum exposes (`reference/types.md § Enums`): its endpoints (`First`,
+// `Last`), the two ordinal maps (`Pos`, `Val`), the neighbours (`Succ`, `Pred`) and the two name maps
+// (`Image`, `Value`) -- what each answers, where each traps, and the refusals for one misused.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `EnumAttrRunTests` and
+// `EnumAttrErrorTests` these are. The helpers are `tests_enm_enum_run.sysl`'s.
+
+private enm_rgb() -> string = "enum Color\n    Red\n    Green\n    Blue\n"
+
+// Discriminants that are neither zero-based nor adjacent, so a position has to be looked up.
+private enm_gap() -> string = "enum Gap\n    A = 5\n    B = 10\n    C = 20\n"
+
+@test("First is the first variant")
+enm_first_is_the_first_variant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_rgb() + "print(Color::Pos(Color::First))\n"), "0\n")
+
+@test("Last is the last variant")
+enm_last_is_the_last_variant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_rgb() + "print(Color::Image(Color::Last))\n"), "Blue\n")
+
+@test("Pos of a contiguous enum counts from zero")
+enm_pos_counts_from_zero()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_rgb() + "print(Color::Pos(Color.Green))\n"), "1\n")
+
+@test("Pos of a gapped enum still counts positions, not discriminants")
+enm_pos_counts_positions_not_discriminants()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_gap() + "print(Gap::Pos(Gap.B), Gap::Pos(Gap.C))\n"), "1 2\n")
+
+@test("Val of a contiguous enum")
+enm_val_of_a_contiguous_enum()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_rgb() + "print(Color::Image(Color::Val(2)))\n"), "Blue\n")
+
+@test("Val of a gapped enum returns the discriminant, not the position")
+enm_val_of_a_gapped_enum()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_gap() + "print(Gap::Pos(Gap::Val(2)))\n"), "2\n")
+
+@test("Val at a position past the last variant traps")
+enm_val_past_the_last_variant_traps()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits(enm_rgb() + "print(Color::Pos(Color::Val(3)))\n"), "")
+
+@test("Val at a negative position traps")
+enm_val_at_a_negative_position_traps()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits(enm_rgb() + "print(Color::Pos(Color::Val(-1)))\n"), "")
+
+@test("Succ moves one along")
+enm_succ_moves_one_along()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_rgb() + "print(Color::Pos(Color::Succ(Color.Red)))\n"), "1\n")
+
+@test("Pred moves one back")
+enm_pred_moves_one_back()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_rgb() + "print(Color::Pos(Color::Pred(Color.Blue)))\n"), "1\n")
+
+@test("Succ steps across a gap")
+enm_succ_steps_across_a_gap()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_gap() + "print(Gap::Image(Gap::Succ(Gap.A)))\n"), "B\n")
+
+@test("Succ traps at the last variant")
+enm_succ_traps_at_the_last_variant()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits(enm_rgb() + "print(Color::Pos(Color::Succ(Color.Blue)))\n"), "")
+
+@test("Pred traps at the first variant")
+enm_pred_traps_at_the_first_variant()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits(enm_rgb() + "print(Color::Pos(Color::Pred(Color.Red)))\n"), "")
+
+@test("Image of the first variant")
+enm_image_of_the_first_variant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_rgb() + "print(Color::Image(Color.Red))\n"), "Red\n")
+
+@test("Image of a middle variant")
+enm_image_of_a_middle_variant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_rgb() + "print(Color::Image(Color.Green))\n"), "Green\n")
+
+@test("Value of a known name resolves to its position")
+enm_value_of_a_known_name()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_rgb() + "print(Color::Pos(Color::Value(\"Blue\")))\n"), "2\n")
+
+@test("Value of a known name in a gapped enum resolves to its discriminant")
+enm_value_of_a_known_name_in_a_gapped_enum()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(enm_gap() + "print(Gap::Pos(Gap::Value(\"C\")))\n"), "2\n")
+
+@test("Value of an unknown name traps")
+enm_value_of_an_unknown_name_traps()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits(enm_rgb() + "print(Color::Pos(Color::Value(\"Purple\")))\n"), "")
+
+@test("a single-variant enum has endpoints that meet")
+enm_a_single_variant_enum_has_endpoints_that_meet()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("enum One\n    Only\nprint(One::Pos(One::First), One::Pos(One::Last))\n"), "0 0\n")
+
+@test("a variant named after an attribute does not shadow it")
+enm_a_variant_named_after_an_attribute()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("enum Edge\n    First\n    Last\nprint(Edge::Pos(Edge::First), Edge::Pos(Edge.Last))\n"), "0 1\n")
+
+@test("discriminants out of order, negative, and gapped are ordinary")
+enm_discriminants_out_of_order_are_ordinary()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Level: int
+            Low = 5
+            Deep = -3
+            Mid = 0
+        print(Level::Image(Level.Deep), Level::Pos(Level.Mid), Level::Pos(Level::Last))
+        """), "Deep 2 2\n")
+
+@test("an unknown attribute is rejected")
+enm_an_unknown_attribute_is_rejected()
+    if !enm_ready() then return
+
+    val out = enm_err(enm_rgb() + "print(Color::Middle(Color.Red))\n")
+
+    assert(enm_says(out, "'Color' has no attribute 'Middle'"), out)
+
+@test("a data enum has no simple-enum attributes")
+enm_a_data_enum_has_no_simple_enum_attributes()
+    if !enm_ready() then return
+
+    val out = enm_err("enum Shape\n    Circle(radius: int)\n    Square(side: int)\nprint(Shape::First)\n")
+
+    assert(enm_says(out, "'Shape::First' needs a simple enum, and 'Shape' carries data"), out)
+
+@test("a generic enum has no single enum to read")
+enm_a_generic_enum_has_no_single_enum()
+    if !enm_ready() then return
+
+    val out = enm_err("print(Option::First)\n")
+
+    assert(enm_says(out, "'sysl.Option' is generic, so 'sysl.Option::First' has no single enum to read"), out)
+
+@test("First takes no arguments")
+enm_first_takes_no_arguments()
+    if !enm_ready() then return
+
+    val out = enm_err(enm_rgb() + "print(Color::First(Color.Red))\n")
+
+    assert(enm_says(out, "'Color::First' takes no arguments"), out)
+
+@test("Succ takes exactly one")
+enm_succ_takes_exactly_one()
+    if !enm_ready() then return
+
+    val out = enm_err(enm_rgb() + "print(Color::Succ())\n")
+
+    assert(enm_says(out, "'Color::Succ' takes exactly one argument"), out)
+
+@test("Val takes a position, not an enum value")
+enm_val_takes_a_position()
+    if !enm_ready() then return
+
+    val out = enm_err(enm_rgb() + "print(Color::Val(Color.Red))\n")
+
+    assert(enm_says(out, "'Color::Val' takes a int, not Color"), out)
+
+@test("Value takes a name, not a number")
+enm_value_takes_a_name()
+    if !enm_ready() then return
+
+    val out = enm_err(enm_rgb() + "print(Color::Value(1))\n")
+
+    assert(enm_says(out, "'Color::Value' takes a string, not int"), out)
+
+@test("Succ takes an enum value, not a number")
+enm_succ_takes_an_enum_value()
+    if !enm_ready() then return
+
+    val out = enm_err(enm_rgb() + "print(Color::Succ(1))\n")
+
+    assert(enm_says(out, "'Color::Succ' takes a Color, not int"), out)
