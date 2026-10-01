@@ -145,6 +145,28 @@ private pkb_run(root: string) -> string
     said
 end pkb_run
 
+// A `--lib` source root with no manifest, holding one module that declares one function nobody
+// calls. `module_path` is the module's directory below the root.
+private pkb_lib_root(module_path: string) -> string
+    val root = pkb_temp("sysl-pkb-lib").unwrap()
+
+    make_dir_all(s"$root/$module_path").unwrap()
+    write_text(s"$root/$module_path/${basename(module_path)}.sysl",
+               s"module ${replace_all(module_path, "/", ".")}\n\nunused() -> int = 0\n").unwrap()
+    root
+end pkb_lib_root
+
+// The same build with one source root handed over, as `--lib <lib>` hands it.
+private pkb_run_beside(root: string, lib: string) -> string
+    reset_search_paths()
+    add_lib_root(lib)
+
+    val said = pkb_run(root)
+
+    reset_search_paths()
+    said
+end pkb_run_beside
+
 // What a build of `root` was refused with, as the command line prints it after `sysl: error: `.
 private pkb_refused(root: string) -> string
     val out_dir = pkb_temp("sysl-pkb-exe").unwrap()
@@ -399,14 +421,31 @@ pkb_namespaced_by_qualified_reference()
 end pkb_namespaced_by_qualified_reference
 
 // The same two with an unrelated `--lib` source root beginning with the same segment in the
-// compilation, which this compiler has no flag for.
-@test("by import", ignore: "needs '--lib' source roots, which are not built here")
+// compilation: whether a segment begins a module is asked of the package's own tree first, so a
+// root supplying `sh.sysl.other` does not take the package's path away from it.
+@test("by import")
 pkb_namespaced_by_import_beside_a_lib()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
 
-@test("by qualified reference", ignore: "needs '--lib' source roots, which are not built here")
+    val ns = pkb_namespaced("import sh.sysl.inner.double\n\nquadruple(n: int) -> int = double(double(n))")
+    val root = pkb_app("print(sh.sysl.outer.quadruple(10))", s"n { path = \"$ns\" }")
+    val lib = pkb_lib_root("sh/sysl/other")
+
+    assert_eq(pkb_run_beside(root, lib), "40\n")
+    pkb_drop([root, ns, lib])
+end pkb_namespaced_by_import_beside_a_lib
+
+@test("by qualified reference")
 pkb_namespaced_by_reference_beside_a_lib()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
+
+    val ns = pkb_namespaced("triple(n: int) -> int = sh.sysl.inner.double(n) + n")
+    val root = pkb_app("print(sh.sysl.outer.triple(14))", s"n { path = \"$ns\" }")
+    val lib = pkb_lib_root("sh/sysl/other")
+
+    assert_eq(pkb_run_beside(root, lib), "42\n")
+    pkb_drop([root, ns, lib])
+end pkb_namespaced_by_reference_beside_a_lib
 
 // A name the consumer chose has no tree to be read off, so it still hangs the whole package.
 @test("and a mount still hangs the whole tree under one segment")
@@ -616,62 +655,255 @@ end pkb_no_dependencies_block
 
 // -- a --lib source root's own dependencies -----------------------------------------------------------
 
-// Every case of this group names a source root with `--lib`, which this compiler has no flag for.
+// Every case of this group names a source root with `--lib` whose own `package.hocon` has a
+// `dependencies` block. The program has **no manifest of its own** unless the case gives it one, so
+// the only claims in the build are the root's; a coordinate is laid out in the program directory's
+// `vendor/`, which is the one cache the whole graph is read from.
 
-@test("are fetched, so its own code reaches what it declared",
-      ignore: "needs '--lib' source roots, which are not built here")
+// A source root that is a package: a manifest naming what it depends on, and one module whose code
+// reaches it.
+private pkb_declaring(deps: string, body: string, module_name: string) -> string
+    val root = pkb_temp("sysl-pkb-lib-deps").unwrap()
+
+    pkb_lay(root, "", module_name, module_name, body, deps, pkb_none())
+    root
+end pkb_declaring
+
+// A program directory holding `main.sysl` and nothing else.
+private pkb_program(text: string) -> string
+    val root = pkb_temp("sysl-pkb-lib-deps-app").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end pkb_program
+
+// `github.com/e/bottom` at `version`, whose one function answers `stamp` -- which is how a case says
+// *which* copy was selected rather than only that one was.
+private pkb_bottom(project: string, version: string, stamp: int) -> string
+    pkb_vendored(project, "github.com/e/bottom", version, pkb_manifest("bottom", version, ""),
+                 "bottom", s"stamp() -> int = $stamp")
+end pkb_bottom
+
+// A build of `path` with every root of `libs` handed over, as `--lib` hands each.
+private pkb_run_among(path: string, libs: []string) -> string
+    reset_search_paths()
+
+    for l in libs
+        add_lib_root(l)
+
+    val said = pkb_run(path)
+
+    reset_search_paths()
+    said
+end pkb_run_among
+
+private pkb_refused_among(path: string, libs: []string) -> string
+    reset_search_paths()
+
+    for l in libs
+        add_lib_root(l)
+
+    val said = pkb_refused(path)
+
+    reset_search_paths()
+    said
+end pkb_refused_among
+
+@test("are fetched, so its own code reaches what it declared")
 pkb_lib_deps_are_fetched()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
 
-@test("and a relative one is read against ITS OWN directory, never the project's",
-      ignore: "needs '--lib' source roots, which are not built here")
+    val geom = pkb_package("geom-lib", "geom", "double(n: int) -> int = n * 2")
+    val lib = pkb_declaring(s"g { path = \"$geom\" }",
+                            "quadruple(n: int) -> int = geom.double(geom.double(n))", "mid")
+    val app = pkb_program("print(mid.quadruple(10))")
+
+    assert_eq(pkb_run_among(s"$app/main.sysl", [lib]), "40\n")
+    pkb_drop([geom, lib, app])
+end pkb_lib_deps_are_fetched
+
+// `geom-lib` sits beside `mid` and nowhere near the program, so only the root's own directory can
+// have been what `../geom-lib` was read against.
+@test("and a relative one is read against ITS OWN directory, never the project's")
 pkb_lib_relative_path()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
 
-@test("and a coordinate is fetched, not only a directory already on this machine",
-      ignore: "needs '--lib' source roots, which are not built here")
+    val parent = pkb_temp("sysl-pkb-lib-deps-rel").unwrap()
+
+    pkb_lay(s"$parent/geom-lib", "", "geom-lib", "geom", "double(n: int) -> int = n * 2", "", pkb_none())
+    pkb_lay(s"$parent/mid", "", "mid", "mid", "quadruple(n: int) -> int = geom.double(geom.double(n))",
+            "g { path = \"../geom-lib\" }", pkb_none())
+
+    val app = pkb_program("print(mid.quadruple(10))")
+
+    assert_eq(pkb_run_among(s"$app/main.sysl", [s"$parent/mid"]), "40\n")
+    pkb_drop([parent, app])
+end pkb_lib_relative_path
+
+@test("and a coordinate is fetched, not only a directory already on this machine")
 pkb_lib_coordinate_fetched()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
 
-@test("and are version-selected together with the project's own claims",
-      ignore: "needs '--lib' source roots, which are not built here")
+    val app = pkb_program("print(mid.answer())")
+
+    pkb_bottom(app, "1.0.0", 100)
+
+    val lib = pkb_declaring("b { git = \"github.com/e/bottom\", version = \"1.0.0\" }",
+                            "answer() -> int = bottom.stamp()", "mid")
+
+    assert_eq(pkb_run_among(s"$app/main.sysl", [lib]), "100\n")
+    pkb_drop([lib, app])
+end pkb_lib_coordinate_fetched
+
+// One graph rather than one per road: the project's floor and the root's are read together and one
+// copy is built at the higher of them, so the project's own call answers 120 too.
+@test("and are version-selected together with the project's own claims")
 pkb_lib_selected_together()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
 
-@test("and two roots naming one coordinate get one copy of it, at the higher version",
-      ignore: "needs '--lib' source roots, which are not built here")
+    val app = pkb_app("print(mid.answer() + bottom.stamp())",
+                      "b { git = \"github.com/e/bottom\", version = \"1.0.0\" }")
+
+    pkb_bottom(app, "1.0.0", 100)
+    pkb_bottom(app, "1.2.0", 120)
+
+    val lib = pkb_declaring("b { git = \"github.com/e/bottom\", version = \"1.2.0\" }",
+                            "answer() -> int = bottom.stamp()", "mid")
+
+    assert_eq(pkb_run_among(app, [lib]), "240\n")
+    pkb_drop([lib, app])
+end pkb_lib_selected_together
+
+@test("and two roots naming one coordinate get one copy of it, at the higher version")
 pkb_lib_two_roots_one_copy()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
 
-@test("its header requirement, named rather than left to clang",
-      ignore: "needs '--lib' source roots, which are not built here")
+    val app = pkb_program("print(low.value() + high.value())")
+
+    pkb_bottom(app, "1.0.0", 100)
+    pkb_bottom(app, "1.4.0", 140)
+
+    val low = pkb_declaring("b { git = \"github.com/e/bottom\", version = \"1.0.0\" }",
+                            "value() -> int = bottom.stamp()", "low")
+    val high = pkb_declaring("b { git = \"github.com/e/bottom\", version = \"1.4.0\" }",
+                             "value() -> int = bottom.stamp()", "high")
+
+    assert_eq(pkb_run_among(s"$app/main.sysl", [low, high]), "280\n")
+    pkb_drop([low, high, app])
+end pkb_lib_two_roots_one_copy
+
+// What a package declares is charged to the build that reached it, whichever road reached it.
+@test("its header requirement, named rather than left to clang")
 pkb_lib_header_requirement()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
 
-@test("and its allocator, which cannot then disagree with one the project names",
-      ignore: "needs '--lib' source roots, which are not built here")
+    val app = pkb_program("print(mid.answer())")
+
+    pkb_vendored(app, "github.com/e/probing", "1.0.0",
+                 "package { name = \"probing\", version = \"1.0.0\" }\n" +
+                 "requires { headers { probe = \"the probe library's headers\" } }\n",
+                 "probing", "value() -> int = 42")
+
+    val lib = pkb_declaring("p { git = \"github.com/e/probing\", version = \"1.0.0\" }",
+                            "answer() -> int = probing.value()", "mid")
+
+    assert_eq(pkb_refused_among(s"$app/main.sysl", [lib]),
+              "github.com.e.probing needs the 'probe' headers and nothing supplied them — the probe " +
+              "library's headers. Say where they are with '--include-path probe=<dir>'")
+    pkb_drop([lib, app])
+end pkb_lib_header_requirement
+
+@test("and its allocator, which cannot then disagree with one the project names")
 pkb_lib_allocator()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
 
-@test("while a root with no manifest depends on nothing",
-      ignore: "needs '--lib' source roots, which are not built here")
+    val app = pkb_temp("sysl-pkb-lib-deps-heap").unwrap()
+
+    write_text(s"$app/package.hocon", "package { name = \"app\", version = \"0.1.0\" }\n" +
+               "allocator { alloc = \"kmalloc\", free = \"kfree\" }\n").unwrap()
+    write_text(s"$app/main.sysl", "print(mid.answer())").unwrap()
+    pkb_vendored(app, "github.com/e/heapy", "1.0.0",
+                 "package { name = \"heapy\", version = \"1.0.0\" }\n" +
+                 "allocator { alloc = \"pvPortMalloc\", free = \"vPortFree\" }\n",
+                 "heapy", "value() -> int = 42")
+
+    val lib = pkb_declaring("h { git = \"github.com/e/heapy\", version = \"1.0.0\" }",
+                            "answer() -> int = heapy.value()", "mid")
+
+    assert_eq(pkb_refused_among(app, [lib]),
+              "two packages name different allocators, and a program has one heap — 'this project' " +
+              "names kmalloc / kfree; 'github.com.e.heapy' names pvPortMalloc / vPortFree. Drop one " +
+              "of the declarations, or depend on only one of them")
+    pkb_drop([lib, app])
+end pkb_lib_allocator
+
+// A source root need not be a package at all, and one with no manifest depends on nothing: nothing
+// is fetched on its account and nothing breaks.
+@test("while a root with no manifest depends on nothing")
 pkb_lib_no_manifest()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
 
-@test("and a dependency claiming a name the root itself declares is refused",
-      ignore: "needs '--lib' source roots, which are not built here")
+    val root = pkb_temp("sysl-pkb-plain").unwrap()
+    val lib = pkb_lib_root("sh/sysl/other")
+
+    write_text(s"$root/main.sysl", "print(41 + 1)").unwrap()
+    assert_eq(pkb_run_beside(s"$root/main.sysl", lib), "42\n")
+    pkb_drop([root, lib])
+end pkb_lib_no_manifest
+
+// `github.com/e/mid` at 1.0.0, offering a module `mid` whose one function answers 7.
+private pkb_other_mid(project: string) -> string =
+    pkb_vendored(project, "github.com/e/mid", "1.0.0", pkb_manifest("mid", "1.0.0", ""), "mid",
+                 "stamp() -> int = 7")
+
+// A root's modules are filed under the project's names, so a dependency of that root offering a
+// name the root itself declares is two modules claiming one name -- refused, naming the root as the
+// command line gave it, rather than letting the root's module silently win.
+@test("and a dependency claiming a name the root itself declares is refused")
 pkb_lib_claiming_the_roots_name()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
 
-@test("while a mount settles that, as it does every other collision",
-      ignore: "needs '--lib' source roots, which are not built here")
+    val app = pkb_program("print(mid.answer())")
+
+    pkb_other_mid(app)
+
+    val lib = pkb_declaring("m { git = \"github.com/e/mid\", version = \"1.0.0\" }",
+                            "answer() -> int = 42", "mid")
+
+    assert_eq(pkb_refused_among(s"$app/main.sysl", [lib]),
+              s"package.hocon: 'mid' is both a module of the source root '$lib' and one " +
+              "github.com.e.mid offers — give the dependency a 'mount' to say what it is called here")
+    pkb_drop([lib, app])
+end pkb_lib_claiming_the_roots_name
+
+@test("while a mount settles that, as it does every other collision")
 pkb_lib_mount_settles()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
 
-@test("and the program may write a name only the root's manifest bound",
-      ignore: "needs '--lib' source roots, which are not built here")
+    val app = pkb_program("print(mid.answer())")
+
+    pkb_other_mid(app)
+
+    val lib = pkb_declaring("m { git = \"github.com/e/mid\", version = \"1.0.0\", mount = \"theirs\" }",
+                            "answer() -> int = theirs.mid.stamp() * 6", "mid")
+
+    assert_eq(pkb_run_among(s"$app/main.sysl", [lib]), "42\n")
+    pkb_drop([lib, app])
+end pkb_lib_mount_settles
+
+// The accepted cost, pinned so that it is deliberate: a root's files are filed under the project's
+// own names, so the table its manifest binds into is the project's, and the program may write it.
+@test("and the program may write a name only the root's manifest bound")
 pkb_lib_name_only_the_root_bound()
-    assert(false, "needs --lib")
+    if !pkb_ready() then return
+
+    val geom = pkb_package("geom-lib", "geom", "double(n: int) -> int = n * 2")
+    val lib = pkb_declaring(s"g { path = \"$geom\" }", "unused() -> int = 0", "mid")
+    val app = pkb_program("print(geom.double(21))")
+
+    assert_eq(pkb_run_among(s"$app/main.sysl", [lib]), "42\n")
+    pkb_drop([geom, lib, app])
+end pkb_lib_name_only_the_root_bound
 
 // -- sysl.sum -------------------------------------------------------------------------------------
 

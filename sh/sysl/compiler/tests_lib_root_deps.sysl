@@ -1,0 +1,304 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A `--lib` source root's `dependencies`, resolved in the one graph** -- and the relative `path`
+// every manifest's reader owes: read against the directory holding that manifest, never against
+// wherever the process was started. Every expected output and refusal was read off the reference
+// (0.0.152) run over the same trees; where this compiler answers differently on purpose the test
+// says so.
+//
+// The test binary runs in the repository's own directory, so a relative path read against the
+// working directory lands somewhere these trees are not -- which is what makes each case able to
+// fail.
+
+private lbd_ready() -> bool = std_root().is_ok() && clang_available()
+
+private lbd_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+// A package at `root`: a manifest naming it and what it depends on, and one module in a directory of
+// its own.
+private lbd_lay(root: string, name: string, module_name: string, text: string, deps: string)
+    make_dir_all(s"$root/$module_name").unwrap()
+    write_text(s"$root/package.hocon", s"package { name = \"$name\", version = \"1.0.0\" }\n" +
+               (if deps.is_empty() then "" else s"dependencies { $deps }\n")).unwrap()
+    write_text(s"$root/$module_name/$module_name.sysl", s"module $module_name\n\n$text\n").unwrap()
+end lbd_lay
+
+// A package laid out in `project`'s `vendor/` at a coordinate and version, sealed as a fetch leaves it.
+private lbd_vendored(project: string, coordinate: string, module_name: string, text: string)
+    val dir = s"$project/vendor/$coordinate/@v1.0.0"
+
+    lbd_lay(dir, module_name, module_name, text, "")
+    write_text(s"$dir.hash", s"${tree_hash(dir).unwrap()}\n").unwrap()
+end lbd_vendored
+
+// A directory holding one `main.sysl` and nothing else.
+private lbd_program(text: string) -> string
+    val root = lbd_temp("sysl-lbd-app")
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end lbd_program
+
+// What a build of `path` with `libs` handed over prints, or what stopped it.
+private lbd_run(path: string, libs: []string) -> string
+    reset_search_paths()
+
+    for l in libs
+        add_lib_root(l)
+
+    val out_dir = lbd_temp("sysl-lbd-exe")
+    val said = build_native_program(path, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    reset_search_paths()
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end lbd_run
+
+private lbd_drop(dirs: []string)
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+// Two packages offering a module `mid`, from two coordinates, laid into one project's `vendor/`.
+private lbd_two_mids(project: string)
+    lbd_vendored(project, "github.com/e/mid", "mid", "stamp() -> int = 7")
+    lbd_vendored(project, "github.com/f/mid", "mid", "stamp() -> int = 8")
+end lbd_two_mids
+
+// A root depending on `coordinate`, declaring a module `name` of its own.
+private lbd_depending(name: string, label: string, coordinate: string) -> string
+    val root = lbd_temp("sysl-lbd-root")
+
+    lbd_lay(root, name, name, "v() -> int = 1",
+            s"$label { git = \"$coordinate\", version = \"1.0.0\" }")
+    root
+end lbd_depending
+
+// -- a project's relative path --------------------------------------------------------------------
+
+// The reference, from a working directory that is not the project's, `sysl run ../rel/app`: `42`.
+// Here it said "'g' is a path dependency, and '../dep' is not a directory", having read the path
+// against the working directory.
+@test("a project's relative path dependency is read against the project, wherever the build starts")
+lbd_a_projects_relative_path_is_the_projects()
+    if !lbd_ready() then return
+
+    val parent = lbd_temp("sysl-lbd-rel")
+
+    lbd_lay(s"$parent/dep", "geom-lib", "geom", "double(n: int) -> int = n * 2", "")
+    make_dir_all(s"$parent/app").unwrap()
+    write_text(s"$parent/app/package.hocon",
+               "package { name = \"app\" }\ndependencies { g { path = \"../dep\" } }\n").unwrap()
+    write_text(s"$parent/app/main.sysl", "print(geom.double(21))\n").unwrap()
+
+    assert_eq(lbd_run(s"$parent/app", []), "42\n")
+    assert(!is_file(s"$parent/app/sysl.sum"), "a path dependency records nothing")
+    lbd_drop([parent])
+end lbd_a_projects_relative_path_is_the_projects
+
+// And the refusal quotes the directory it came to, absolute, `..` resolved away:
+// "sysl: error: 'g' is a path dependency, and '<parent>/nowhere' is not a directory".
+@test("and one that is not there is quoted as the directory it was read as")
+lbd_a_missing_relative_path_is_quoted_absolute()
+    if !lbd_ready() then return
+
+    val parent = lbd_temp("sysl-lbd-rel")
+
+    make_dir_all(s"$parent/app").unwrap()
+    write_text(s"$parent/app/package.hocon",
+               "package { name = \"app\" }\ndependencies { g { path = \"../nowhere\" } }\n").unwrap()
+    write_text(s"$parent/app/main.sysl", "print(1)\n").unwrap()
+
+    assert_eq(lbd_run(s"$parent/app", []),
+              s"refused: 'g' is a path dependency, and '$parent/nowhere' is not a directory")
+    lbd_drop([parent])
+end lbd_a_missing_relative_path_is_quoted_absolute
+
+// A root's relative path is the root's: the same refusal names the directory beside the root.
+@test("a root's relative path that is not there names the directory beside the root")
+lbd_a_roots_missing_relative_path()
+    if !lbd_ready() then return
+
+    val parent = lbd_temp("sysl-lbd-rel")
+
+    lbd_lay(s"$parent/mid", "mid", "mid", "v() -> int = 1", "g { path = \"../nowhere\" }")
+
+    val app = lbd_program("print(mid.v())\n")
+
+    assert_eq(lbd_run(s"$app/main.sysl", [s"$parent/mid"]),
+              s"refused: 'g' is a path dependency, and '$parent/nowhere' is not a directory")
+    lbd_drop([parent, app])
+end lbd_a_roots_missing_relative_path
+
+// -- a root's dependencies in the project's table -------------------------------------------------
+
+// What a root's manifest binds is bound into the project's own table, so it meets the project's own
+// modules in the project's words.
+@test("a root's dependency offering a module of the project's own is refused, naming the project")
+lbd_a_roots_dependency_and_the_projects_module()
+    if !lbd_ready() then return
+
+    val app = lbd_program("print(mid.answer())\n")
+
+    make_dir_all(s"$app/mid").unwrap()
+    write_text(s"$app/mid/mid.sysl", "module mid\n\nanswer() -> int = 1\n").unwrap()
+    lbd_two_mids(app)
+
+    val dm = lbd_depending("dm", "m", "github.com/e/mid")
+
+    assert_eq(lbd_run(app, [dm]),
+              "refused: package.hocon: 'mid' is both a module of this project and one github.com.e.mid " +
+              "offers — give the dependency a 'mount' to say what it is called here")
+    lbd_drop([app, dm])
+end lbd_a_roots_dependency_and_the_projects_module
+
+// And another root's modules stand at the project's level, in either order the roots are given.
+@test("and one offering another root's module is refused, naming that root")
+lbd_a_roots_dependency_and_another_roots_module()
+    if !lbd_ready() then return
+
+    val app = lbd_program("print(dm.v())\n")
+
+    lbd_two_mids(app)
+
+    val dm = lbd_depending("dm", "m", "github.com/e/mid")
+    val other = lbd_temp("sysl-lbd-rootmid")
+
+    make_dir_all(s"$other/mid").unwrap()
+    write_text(s"$other/mid/mid.sysl", "module mid\n\nanswer() -> int = 5\n").unwrap()
+
+    val expected = s"refused: package.hocon: 'mid' is both a module of the source root '$other' and one " +
+        "github.com.e.mid offers — give the dependency a 'mount' to say what it is called here"
+
+    assert_eq(lbd_run(s"$app/main.sysl", [other, dm]), expected)
+    assert_eq(lbd_run(s"$app/main.sysl", [dm, other]), expected)
+    lbd_drop([app, dm, other])
+end lbd_a_roots_dependency_and_another_roots_module
+
+// Two roots' dependencies are declared at one level, so two packages offering one name between them
+// are the ordinary collision, named in the order the roots were given.
+@test("two roots depending on two packages that offer one module are refused")
+lbd_two_roots_dependencies_claim_one_module()
+    if !lbd_ready() then return
+
+    val app = lbd_program("print(dm.v() + dm2.v())\n")
+
+    lbd_two_mids(app)
+
+    val dm = lbd_depending("dm", "m", "github.com/e/mid")
+    val dm2 = lbd_depending("dm2", "n", "github.com/f/mid")
+
+    assert_eq(lbd_run(s"$app/main.sysl", [dm, dm2]),
+              "refused: package.hocon: 'mid' and 'mid' cannot both be imported — github.com.e.mid and " +
+              "github.com.f.mid claim the same module. Give one of them a 'mount' in package.hocon to " +
+              "say which name it takes here")
+    lbd_drop([app, dm, dm2])
+end lbd_two_roots_dependencies_claim_one_module
+
+// The project's own declarations come first, so its package is the one named first.
+@test("and so are the project's dependency and a root's, the project's named first")
+lbd_a_projects_and_a_roots_dependency_claim_one_module()
+    if !lbd_ready() then return
+
+    val app = lbd_program("print(dm.v())\n")
+
+    write_text(s"$app/package.hocon", "package { name = \"app\", version = \"0.1.0\" }\n" +
+               "dependencies { n { git = \"github.com/f/mid\", version = \"1.0.0\" } }\n").unwrap()
+    lbd_two_mids(app)
+
+    val dm = lbd_depending("dm", "m", "github.com/e/mid")
+
+    assert_eq(lbd_run(app, [dm]),
+              "refused: package.hocon: 'mid' and 'mid' cannot both be imported — github.com.f.mid and " +
+              "github.com.e.mid claim the same module. Give one of them a 'mount' in package.hocon to " +
+              "say which name it takes here")
+    lbd_drop([app, dm])
+end lbd_a_projects_and_a_roots_dependency_claim_one_module
+
+// While the project and a root naming one package -- under one label or two -- is one package.
+@test("while the project and a root naming one package is one package, whatever each labels it")
+lbd_the_project_and_a_root_name_one_package()
+    if !lbd_ready() then return
+
+    val app = lbd_program("print(dm.v() + mid.stamp())\n")
+
+    write_text(s"$app/package.hocon", "package { name = \"app\", version = \"0.1.0\" }\n" +
+               "dependencies { q { git = \"github.com/e/mid\", version = \"1.0.0\" } }\n").unwrap()
+    lbd_two_mids(app)
+
+    val dm = lbd_depending("dm", "m", "github.com/e/mid")
+
+    assert_eq(lbd_run(app, [dm]), "8\n")
+    lbd_drop([app, dm])
+end lbd_the_project_and_a_root_name_one_package
+
+// A path dependency is expected to change under you, so a root depending only on paths writes no
+// `sysl.sum` into the project that named it.
+@test("a root whose dependencies are all paths leaves no sysl.sum behind")
+lbd_path_only_roots_write_no_sum()
+    if !lbd_ready() then return
+
+    val geom = lbd_temp("sysl-lbd-geom")
+
+    lbd_lay(geom, "geom-lib", "geom", "double(n: int) -> int = n * 2", "")
+
+    val mid = lbd_temp("sysl-lbd-mid")
+
+    lbd_lay(mid, "mid", "mid", "quadruple(n: int) -> int = geom.double(geom.double(n))",
+            s"g { path = \"$geom\" }")
+
+    val app = lbd_program("print(mid.quadruple(10))\n")
+
+    write_text(s"$app/package.hocon", "package { name = \"app\", version = \"0.1.0\" }\n").unwrap()
+    assert_eq(lbd_run(app, [mid]), "40\n")
+    assert(!is_file(s"$app/sysl.sum"), "the project's")
+    assert(!is_file(s"$mid/sysl.sum"), "nor the root's")
+    lbd_drop([geom, mid, app])
+end lbd_path_only_roots_write_no_sum
+
+// -- build-lib ------------------------------------------------------------------------------------
+
+// `build-lib` fetches nothing, and a root is there to be type-checked against, so a root's
+// `dependencies` are refused by name. The reference (0.0.152) does not read them at all and reports
+// the root's first use of one -- "error: undefined name 'geom'" at the root's file -- which is
+// neither the refusal its documentation promises (`cli.md`) nor a build.
+@test("build-lib refuses a root's dependencies by name, naming --lib <dir> as the way in")
+lbd_build_lib_refuses_a_roots_dependencies()
+    if !lbd_ready() then return
+
+    val geom = lbd_temp("sysl-lbd-geom")
+
+    lbd_lay(geom, "geom-lib", "geom", "double(n: int) -> int = n * 2", "")
+
+    val mid = lbd_temp("sysl-lbd-mid")
+
+    lbd_lay(mid, "mid", "mid", "quadruple(n: int) -> int = geom.double(geom.double(n))",
+            s"g { path = \"$geom\" }")
+
+    val lib = lbd_temp("sysl-lbd-blib")
+
+    make_dir_all(s"$lib/blib").unwrap()
+    write_text(s"$lib/blib/blib.sysl", "module blib\n\nx() -> int = mid.quadruple(1)\n").unwrap()
+    reset_search_paths()
+    add_lib_root(mid)
+
+    val said = build_library_of(lib, None) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "checked"
+
+    reset_search_paths()
+    assert_eq(said, s"build-lib compiles the trees it is given and fetches nothing, so the source root " +
+              s"'$mid' has its dependencies reach it through --lib rather than through 'dependencies' — " +
+              "supply 'g' as --lib <dir> too")
+    lbd_drop([geom, mid, lib])
+end lbd_build_lib_refuses_a_roots_dependencies

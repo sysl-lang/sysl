@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_dir_all, make_temp_dir, metadata, pending_name, publish_file, read_text, remove_file}
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, pending_name, publish_file, read_text, remove_dir_all, remove_file}
 import sysl.text.{from_utf8_unchecked, Search}
 
 // The standard module's artifact: where it is, how it is built when it is not there, and what a
@@ -40,21 +40,16 @@ std_artifact(t: Target, level: string = DefaultOptimization) -> Result[StdArtifa
     // The pair and the level are in the key beside the machine, since an artifact is the pair's and
     // the level's as much as the machine's: a process that built for two heaps, or at two levels, must
     // not hand the second the first one's archive.
-    // Which file was asked for is in it too: a named artifact, or the default path moved elsewhere,
-    // is another answer than the one kept for the default.
-    val held_for = s"${t.name} ${allocator_pair()} O$level ${std_named().unwrap_or("")} " +
-        std_search.unwrap_or("")
+    // Which file is looked at is in it too: the default path moved elsewhere is another answer than
+    // the one kept for the default.
+    val held_for = s"${t.name} ${allocator_pair()} O$level ${std_search.unwrap_or("")}"
 
     if std_held_ok && std_held_for == held_for then return Ok(StdArtifact(std_held, std_held_archive))
 
     val root = std_root()?
     val fingerprint = std_fingerprint(root, t)?
-
-    // **A named artifact is read and never rebuilt**: whoever wrote down which one to compile against
-    // is owed the truth about that one, rather than a different one built underneath them.
-    val path = std_named().unwrap_or(std_search.unwrap_or(std_artifact_path(t, fingerprint, level)))
-    val symbols = if std_named().is_some() then std_named_at(path, fingerprint, t)?
-    else std_artifact_at(root, path, fingerprint, t, level)?
+    val path = std_search.unwrap_or(std_artifact_path(t, fingerprint, level))
+    val symbols = std_artifact_at(root, path, fingerprint, t, level)?
 
     std_held_for = held_for
     std_held = symbols
@@ -73,32 +68,11 @@ set_std_search(where: Option[string])
 
 // What standard module a compilation links, where it links one: nothing where the library is
 // compiled into this build (`--no-std-lib`) or `standalone` says there is nothing to link.
-//
-// **`--no-std-lib` beside `--std-lib` is refused rather than resolved by precedence**, the two being a
-// character apart and either precedence silently discarding half of what the command line asked for.
 std_linked(t: Target, level: string, standalone: bool) -> Result[Option[StdArtifact], string]
-    if std_from_source() && std_named().is_some()
-        return Err("--no-std-lib and --std-lib ask for different standard modules")
-
     if standalone || std_from_source() then return Ok(None)
 
     Ok(Some(std_artifact(t, level)?))
 end std_linked
-
-// The artifact `--std-lib` named, which has to be one of ours, for this machine, and built from the
-// library in front of this compilation -- each refused in the reference's words.
-private std_named_at(path: string, fingerprint: string, t: Target) -> Result[Buf[string], string]
-    if !metadata(path).is_ok() then return Err(s"cannot read $path: '$path' does not exist")
-
-    val meta = syslib_metadata_at(path)?
-    val answer = syslib_read(path, meta, t)?
-
-    if answer.1 != fingerprint
-        return Err(s"$path was built from a different standard module than this compiler's — " +
-                   "rebuild it with 'sysl build-lib <library root> --std'")
-
-    Ok(answer.0)
-end std_named_at
 
 // The artifact for the library at `root`, read from `path` where what is there was built from it and
 // built there first where it was not.
@@ -136,14 +110,19 @@ std_rebuild_failure(err: string, toolchain: Result[string, string]) -> string = 
 private std_toolchain(t: Target) -> Result[string, string] =
     if !t.builds_with_clang() then Err(t.no_toolchain()) else find_clang(t, None)
 
-// One library compiled into an artifact for one machine, which is what `sysl build-lib <root>`
-// writes for a package.
+// One library held to being a library for one machine, which is what `sysl build-lib <root>` does
+// for a package: the whole analysis with every body typed, the lowering, the guard against a call
+// nothing defines, and the C compiled for the target.
+//
+// **What it assembles is thrown away.** A `.syslib` is this compiler's cache and nobody names one,
+// so the archive is put together in a directory of its own and that directory removed: the command
+// is the check, and the answer is whether every step of it went through.
 //
 // **The whole analysis runs before a line of C is compiled**, which is what makes the command worth
 // running on a machine that cannot compile the C at all: a run for a board that reaches clang's
 // complaint about a missing SDK header is a sysl type-check that passed.
-build_library(root: string, t: Target, where: string, units: Buf[Program], own: Buf[string],
-              who: string, probed: PkgAnswer, level: string) -> Result[string, Failure]
+build_library(root: string, t: Target, units: Buf[Program], own: Buf[string], who: string,
+              probed: PkgAnswer, level: string) -> Result[unit, Failure]
     val fingerprint = std_fingerprint(root, t).map_err((why) -> said(Refusal(why)))?
     val built = library_build(units, own, t)
 
@@ -152,8 +131,16 @@ build_library(root: string, t: Target, where: string, units: Buf[Program], own: 
     // about the library wrapped around the first of them is less than a build would have said.
     if !built.report.is_empty() then return Err(Reported(analysis_report(built.report)))
 
-    write_built(built, root, where, fingerprint, t, who, probed, level).map_err((why) -> said(Refusal(why)))?
-    Ok(where)
+    val staging = make_temp_dir("sysl-lib-") match
+        Err(_) -> return Err(said(Refusal("cannot make a directory to check the library in")))
+        Ok(dir) -> dir
+
+    val made = write_built(built, root, s"$staging/check$SyslibExtension", fingerprint, t, who, probed,
+                           level)
+
+    remove_dir_all(staging).unwrap_or(())
+    made.map_err((why) -> said(Refusal(why)))?
+    Ok(())
 end build_library
 
 // `sysl build-lib <root> --std` -- the standard module compiled into an artifact, written where a

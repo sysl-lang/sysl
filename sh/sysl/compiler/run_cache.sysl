@@ -47,7 +47,9 @@ import sysl.text.{from_utf8_unchecked, join, split, str_builder, StrBuilder}
 //
 // ==What it does not cover, stated rather than hidden==
 //
-// An **`#include`d header** outside the trees this reads. `SYSL_NO_CACHE` is the escape hatch.
+// An **`#include`d header** outside the trees this reads. `SYSL_NO_CACHE` is the escape hatch. (The
+// C object cache beneath it does cover one: `c_object_cache.sysl` keys an object on every file clang
+// read, so a `build` after that edit recompiles the file, but a `run` never gets that far.)
 //
 // **`sysl build` never consults this**, which is the reference's rule and not an omission here: a
 // build writes a binary somebody named and is expected to have built it.
@@ -68,15 +70,16 @@ use_run_cache_dir(dir: Option[string])
 // How many entries a program's cache holds before eviction is considered at all.
 //
 // The standard module's cache evicts nothing, which is right for it -- one entry per library per
-// release. This one takes an entry per *edit*, so a week's work on one tree leaves hundreds.
-private const Keep: usize = 256
+// release. This one takes an entry per *edit*, so a week's work on one tree leaves hundreds. The C
+// object cache (`c_object_cache.sysl`) evicts by the same two numbers, so both caches are one policy.
+const CacheKeep: usize = 256
 
 // How old an entry has to be before it is a candidate, in microseconds -- a week.
 //
 // **Age is what makes eviction safe beside a build that is running.** Several compilations share one
 // directory, and a hit is a stat and then an exec: an eviction that took a *fresh* entry could take
 // one another process was about to run. Nothing this old is in flight anywhere.
-private const Stale: long = 604800000000
+const CacheStale: long = 604800000000
 
 // The field separator inside the test list, which is the one character a `@test`'s display name
 // cannot hold: a name is read out of source, and a NUL does not survive the lexer.
@@ -138,12 +141,6 @@ run_cache_parts(command: string, path: string, t: Target, level: string,
 
     // A library compiled into the binary rather than linked from an artifact is different bytes.
     if std_from_source() then parts.push("std:from-source")
-
-    // And one named with `--std-lib` is whatever that file holds, which the fingerprint above does
-    // not see.
-    std_named() match
-        Some(named) -> parts.push(s"std:named:${absolute_path(named)}")
-        None -> ()
 
     // **Where the tree stands is part of what reaches the bytes**, so it is in the key beside what
     // the files hold. A tree is walked from an absolute root and that root is what `__FILE__`, every
@@ -212,12 +209,20 @@ private program_fingerprint(path: string, t: Target) -> Result[string, Refusal]
 
     // A manifest that will not read is not a refusal here, for the same reason the C walk does not
     // treat it as one: whatever needed it has already said so.
+    //
+    // **A source root is one of the trees, and where it is goes in beside what it holds.** A root is
+    // walked from an absolute path exactly as the project is, and that path is what `__FILE__` and
+    // every test's record carry out of its files -- so the same root at another path is another
+    // binary, which is the reason the project's own path is in the key.
     manifest_at(root) match
         Ok(m) ->
-            val roots = package_roots(root, m)
+            val roots = handed_trees(root, m)
 
             for i in 0..<roots.len()
-                trees.push(roots.at(i))
+                trees.push(roots.at(i).dir)
+
+                if roots.at(i).from_lib
+                    files.push((s"${i + 1}/", absolute_path(roots.at(i).dir)))
         Err(_) -> ()
 
     for i in 0..<trees.len()
@@ -263,7 +268,7 @@ end found_place
 // fingerprint -- its contents. Adding the path would make two identical trees at two paths miss each
 // other's entry for no gain. `SYSL_NO_CACHE` is absent for a different reason: it turns the cache off
 // rather than selecting an entry in it.
-private build_environment() -> string
+build_environment() -> string
     val names: []const string = ["SYSL_EXTRA_CFLAGS", "WASI_SDK_PATH", "ANDROID_NDK_ROOT",
                                  "ANDROID_NDK_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT"]
 
@@ -378,12 +383,12 @@ private evict_around(fresh: string)
         Ok(names) -> names.map((n) -> join_path(dir, n)).filter((one) -> one != fresh)
         Err(_) -> return
 
-    if kept.len < Keep then return
+    if kept.len < CacheKeep then return
 
     val start: long = 0
-    val now = kept.fold(start, (so_far, one) -> max_long(so_far, modified_at(one)))
+    val now = kept.fold(start, (so_far, one) -> max_long(so_far, cache_modified_at(one)))
 
-    kept.filter((one) -> now - modified_at(one) > Stale)
+    kept.filter((one) -> now - cache_modified_at(one) > CacheStale)
         .each((one) -> remove_file(one).unwrap_or(()))
 end evict_around
 
@@ -391,7 +396,7 @@ private max_long(a: long, b: long) -> long = if a > b then a else b
 
 // When a path was last written, in microseconds, or zero where it cannot be asked -- which evicts
 // nothing, since zero is older than every threshold read against the newest entry.
-private modified_at(path: string) -> long = metadata(path) match
+cache_modified_at(path: string) -> long = metadata(path) match
     Ok(m) -> m.modified.us
     Err(_) -> 0
 

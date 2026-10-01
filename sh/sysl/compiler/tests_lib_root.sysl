@@ -1,0 +1,645 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// **`--lib <directory>`: a source root handed to a compilation** (`reference/modules.md § Source
+// roots`, `reference/packages.md`). A root is simply more modules -- its files join under the names
+// they wrote, with no prefix of their own -- and the C beside them is compiled with the program's.
+//
+// Every expected output and every refusal here was read off the reference (0.0.152) run over the
+// same trees with a **directory** root, never an artifact. The one sentence that is this compiler's
+// own is the refusal of a `.syslib`: the reference reads one as a library, and here it is the
+// compiler's cache, which nobody names.
+//
+// A case hands its roots over the way the command line does -- `add_lib_root`, which is what
+// `--lib` calls -- and puts the search paths back afterwards, so no case inherits another's roots.
+
+// -- trees on disk --------------------------------------------------------------------------------
+
+// The helpers a case needs are module-wide rather than file-private, `tests_lib_root_manifest.sysl`
+// building its roots with them.
+lbr_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A temporary directory as the compiler names it: a tree is walked from a normalized absolute root,
+// so every path a diagnostic quotes is this one.
+lbr_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+lbr_one(at: string, body: string) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    out.push((at, body))
+    out
+end lbr_one
+
+lbr_two(a: string, x: string, b: string, y: string) -> Buf[(string, string)]
+    var out = lbr_one(a, x)
+
+    out.push((b, y))
+    out
+end lbr_two
+
+// A tree holding these files, each at its path below the root.
+lbr_tree(files: Buf[(string, string)]) -> string
+    val root = lbr_temp("sysl-lbr")
+
+    for i in 0..<files.len()
+        val at = s"$root/${files.at(i).0}"
+
+        make_dir_all(parent_of(at).unwrap_or(root)).unwrap()
+        write_text(at, files.at(i).1).unwrap()
+
+    root
+end lbr_tree
+
+// A program that is one file, which is how the reference's own cases hand one over.
+lbr_program(text: string) -> string = s"${lbr_tree(lbr_one("main.sysl", text))}/main.sysl"
+
+lbr_demo() -> string = lbr_tree(lbr_one("demo/lib.sysl",
+    "module demo\n\ndouble(n: int) -> int = n * 2\n\n" +
+    "larger[T: Ord](a: T, b: T) -> T = if a < b then b else a\n"))
+
+private lbr_extra() -> string =
+    lbr_tree(lbr_one("extra/lib.sysl", "module extra\n\ntriple(n: int) -> int = n * 3\n"))
+
+// A root declaring `geom`, with a test in an ordinary file and one in a `@tests` file.
+private lbr_geom() -> string = lbr_tree(lbr_two(
+    "geom/geom.sysl",
+    "module geom\n\ndouble(n: int) -> int = n * 2\n\n@test(\"lib case\")\nlib_case()\n" +
+    "    assert(double(2) == 4, \"double\")\n",
+    "geom/tests.sysl",
+    "module geom\n@tests\n\n@test(\"a tests file of the root\")\nroot_tests_file()\n" +
+    "    assert(double(3) == 6, \"d\")\n"))
+
+// A project that declares `geom` itself, beside a program calling a `double` it does not declare.
+private lbr_app_with_geom() -> string = lbr_tree(lbr_two(
+    "main.sysl", "print(geom.double(21))\nprint(geom.own(2))\n",
+    "geom/own.sysl",
+    "module geom\n\nown(n: int) -> int = n + 2\n\n@test(\"app case\")\napp_case()\n" +
+    "    assert(own(1) == 3, \"own\")\n"))
+
+// A root whose one module is a sysl surface over the C beside it.
+private lbr_cee(c: string, manifest: string) -> string
+    var files = lbr_two(
+        "cee/cee.sysl",
+        "module cee\n\nextern \"cee_seven\" c_seven() -> int\n\nseven_times(n: int) -> int = c_seven() * n\n",
+        "cee/cee.c", c)
+
+    if !manifest.is_empty() then files.push(("package.hocon", manifest))
+
+    lbr_tree(files)
+end lbr_cee
+
+lbr_drop(dirs: []string)
+    for d in dirs
+        remove_dir_all(if d.ends_with("/main.sysl") then parent_of(d).unwrap_or(d) else d).unwrap_or(())
+
+// -- the whole command ----------------------------------------------------------------------------
+
+lbr_hand(libs: []string)
+    reset_search_paths()
+
+    for l in libs
+        add_lib_root(l)
+end lbr_hand
+
+// What the program a build of `path` with these roots makes prints, or what stopped it.
+lbr_run(path: string, libs: []string) -> string
+    val out_dir = lbr_temp("sysl-lbr-exe")
+
+    lbr_hand(libs)
+
+    val said = build_native_program(path, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    reset_search_paths()
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end lbr_run
+
+// What the command line answers, status and text, for a command whose report goes through `say`.
+// A command's flags are put back by the next command, so they are put back here for whatever case
+// runs next without one.
+lbr_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    reset_search_paths()
+    (code, join(lines.view(), "\n"))
+end lbr_cli
+
+// The LLVM text of a program handed these roots.
+lbr_text(path: string, libs: []string) -> string
+    lbr_hand(libs)
+
+    val text = emit_llvm_text(path, None) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    reset_search_paths()
+    text
+end lbr_text
+
+// Whether a module's text defines a function, rather than declaring one somebody else defines.
+private lbr_defines(text: string, name: string) -> bool
+    val lines = lines_of(text)
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with("define ") && lines.at(i).contains(s"@$name(") then return true
+
+    false
+end lbr_defines
+
+// The display names of the tests a test build of `path` with these roots keeps, in order.
+private lbr_tests(path: string, libs: []string) -> string
+    lbr_hand(libs)
+
+    val names = test_build_of(path, None) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(built) ->
+            var out: Buf[string] = buf()
+
+            for i in 0..<built.tests.len()
+                out.push(built.tests.at(i).display)
+
+            join(sort_names(out).view(), ", ")
+
+    reset_search_paths()
+    names
+end lbr_tests
+
+// -- the flag ----------------------------------------------------------------------------------------
+
+@test("--lib is read with the flags that say where things are, and may be given more than once")
+lbr_the_flag_is_read()
+    reset_search_paths()
+
+    var args = ["--lib", "one", "--lib", "two", "--lib"]
+
+    assert_eq(took_search_flag(args, 0), 2)
+    assert_eq(took_search_flag(args, 2), 2)
+    assert_eq(took_search_flag(args, 4), 0)
+    assert_eq(join(lib_roots().view(), ","), "one,two")
+
+    reset_search_paths()
+    assert_eq(lib_roots().len(), 0)
+end lbr_the_flag_is_read
+
+@test("--lib with nothing after it is a misuse, answered with how the command is written")
+lbr_the_flag_needs_an_operand()
+    val said = lbr_cli(["sysl", "build", "main.sysl", "--lib"])
+
+    assert_eq(said.0, Misused)
+    assert_eq(said.1, "usage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] " +
+        "[--lib <dir>] [--include-path <dir>|<name>=<dir>] [--link-path <dir>] [-D <macro>] <path>")
+end lbr_the_flag_needs_an_operand
+
+// -- a source root, compiled -------------------------------------------------------------------------
+
+@test("takes a source root just as well, which is the other shape of the same flag")
+lbr_takes_a_source_root()
+    if !lbr_ready() then return
+
+    val lib = lbr_demo()
+    val prog = lbr_program("print(demo.double(21))\nprint(demo.larger(3, 7))\n")
+    val text = lbr_text(prog, [lib])
+
+    assert(text.starts_with("target triple"), text)
+    assert(lbr_defines(text, "demo$double"), "the root's function is compiled into the program")
+    assert_eq(lbr_run(prog, [lib]), "42\n7\n")
+    lbr_drop([lib, prog])
+end lbr_takes_a_source_root
+
+@test("the command line hands a root over, for every command that compiles a program")
+lbr_every_command_takes_it()
+    if !lbr_ready() then return
+
+    val lib = lbr_demo()
+    val prog = lbr_program("print(demo.double(21))\n")
+    val out_dir = lbr_temp("sysl-lbr-exe")
+    val built = lbr_cli(["sysl", "build", prog, "--lib", lib, "-o", s"$out_dir/program"])
+    val typed = lbr_cli(["sysl", "emit-typed", "--no-spans", "--lib", lib, prog])
+    val text = lbr_cli(["sysl", "emit-llvm", prog, "--lib", lib])
+
+    assert_eq(built.0, Fine, built.1)
+    assert_eq(built.1, s"wrote $out_dir/program")
+    assert_eq(typed.0, Fine, typed.1)
+    assert_eq(text.0, Fine, text.1)
+    assert(lbr_defines(text.1, "demo$double"), "the root reached emit-llvm")
+    lbr_drop([lib, prog, out_dir])
+end lbr_every_command_takes_it
+
+// The reference's three cases hand over two **artifacts** and read `declare` lines; a `.syslib` is
+// not a thing a user names here, so the same three claims are made over two directories, where
+// both halves are compiled and therefore defined.
+@test("links two source roots, both of which the program calls")
+lbr_two_roots_both_called()
+    if !lbr_ready() then return
+
+    val demo = lbr_demo()
+    val extra = lbr_extra()
+    val prog = lbr_program("print(demo.double(21))\nprint(extra.triple(2))\n")
+    val text = lbr_text(prog, [demo, extra])
+
+    assert(lbr_defines(text, "demo$double"), text)
+    assert(lbr_defines(text, "extra$triple"), text)
+    lbr_drop([demo, extra, prog])
+end lbr_two_roots_both_called
+
+@test("and does so whichever order they are given in")
+lbr_two_roots_either_order()
+    if !lbr_ready() then return
+
+    val demo = lbr_demo()
+    val extra = lbr_extra()
+    val prog = lbr_program("print(demo.double(21))\nprint(extra.triple(2))\n")
+    val text = lbr_text(prog, [extra, demo])
+
+    assert(lbr_defines(text, "demo$double"), text)
+    assert(lbr_defines(text, "extra$triple"), text)
+    assert_eq(lbr_run(prog, [extra, demo]), "42\n6\n")
+    lbr_drop([demo, extra, prog])
+end lbr_two_roots_either_order
+
+@test("and runs, which is what says both halves reached the linker")
+lbr_two_roots_run()
+    if !lbr_ready() then return
+
+    val demo = lbr_demo()
+    val extra = lbr_extra()
+    val prog = lbr_program("print(demo.double(21) + extra.triple(2))\n")
+
+    assert_eq(lbr_run(prog, [demo, extra]), "48\n")
+    lbr_drop([demo, extra, prog])
+end lbr_two_roots_run
+
+// -- what is refused -----------------------------------------------------------------------------------
+
+@test("refuses a source root holding no sysl files")
+lbr_refuses_an_empty_root()
+    if !lbr_ready() then return
+
+    val empty = lbr_temp("sysl-lbr-empty")
+    val prog = lbr_program("print(1)\n")
+    val said = lbr_cli(["sysl", "emit-llvm", prog, "--lib", empty])
+
+    assert_eq(said.0, Failed)
+    assert_eq(said.1, s"error: $empty holds no sysl source files")
+    lbr_drop([empty, prog])
+end lbr_refuses_an_empty_root
+
+@test("refuses a source root that is not there, named as it was written")
+lbr_refuses_a_missing_root()
+    if !lbr_ready() then return
+
+    val prog = lbr_program("print(1)\n")
+    val said = lbr_cli(["sysl", "emit-llvm", prog, "--lib", "nowhere/at-all"])
+
+    assert_eq(said.0, Failed)
+    assert_eq(said.1, "error: cannot read a library: 'nowhere/at-all' does not exist")
+    lbr_drop([prog])
+end lbr_refuses_a_missing_root
+
+// **This compiler's own rule.** The reference reads a `.syslib` named with `--lib` as a library; a
+// `.syslib` here is the compiler's cache, so the flag takes the directory and says so -- whether or
+// not the file is there, which is why the reference's "one that is not there at all" is answered by
+// this test.
+@test("refuses a .syslib, which is the compiler's cache and not a file anybody names")
+lbr_refuses_a_syslib()
+    if !lbr_ready() then return
+
+    val dir = lbr_tree(lbr_one("demo.syslib", "syslib 1 0\n"))
+    val prog = lbr_program("print(1)\n")
+    val there = lbr_cli(["sysl", "emit-llvm", prog, "--lib", s"$dir/demo.syslib"])
+    val absent = lbr_cli(["sysl", "emit-llvm", prog, "--lib", s"$dir/absent.syslib"])
+
+    assert_eq(there.0, Failed)
+    assert_eq(there.1, s"error: --lib takes the directory a library's source is in, and " +
+        s"'$dir/demo.syslib' is a '.syslib' — a library is handed over as the tree it is written " +
+        "in, and the compiler keeps its own cache of what it compiled from one, which nobody names")
+    assert_eq(absent.0, Failed)
+    assert_eq(absent.1, "error: " + syslib_named_refusal(s"$dir/absent.syslib"))
+    lbr_drop([dir, prog])
+end lbr_refuses_a_syslib
+
+@test("a root is a tree, so a file whose header disagrees with where it sits is refused")
+lbr_a_strayed_root_file()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_one("geom/geom.sysl", "module elsewhere\n\ndouble(n: int) -> int = n * 2\n"))
+    val prog = lbr_program("print(elsewhere.double(21))\n")
+    val said = lbr_run(prog, [lib])
+
+    assert(said.starts_with(s"refused: error: $lib/geom/geom.sysl declares 'elsewhere', but it sits " +
+        "in 'geom' — a module is a directory, so the two must agree\n" +
+        s" --> $lib/geom/geom.sysl:1:1\n"), said)
+    lbr_drop([lib, prog])
+end lbr_a_strayed_root_file
+
+@test("a root's file that does not parse is reported where it is written")
+lbr_a_root_that_does_not_parse()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/lib.sysl", "module demo\n\ndouble(n: int) -> int = = n * 2\n"))
+    val prog = lbr_program("print(demo.double(21))\n")
+    val said = lbr_run(prog, [lib])
+
+    assert(said.starts_with("refused: error: expression expected\n" +
+        s" --> $lib/demo/lib.sysl:3:25\n"), said)
+    lbr_drop([lib, prog])
+end lbr_a_root_that_does_not_parse
+
+@test("and a root's body is held to the rules a program's is")
+lbr_a_roots_body_is_checked()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/lib.sysl", "module demo\n\ndouble(n: int) -> int = nope(n)\n"))
+    val prog = lbr_program("print(demo.double(21))\n")
+    val said = lbr_run(prog, [lib])
+
+    assert(said.starts_with("refused: error: undefined function 'nope'\n" +
+        s" --> $lib/demo/lib.sysl:3:25\n"), said)
+    lbr_drop([lib, prog])
+end lbr_a_roots_body_is_checked
+
+// -- a module the project and a root both declare ---------------------------------------------------
+
+@test("a module the project and a root both declare is one module")
+lbr_a_shared_module_merges()
+    if !lbr_ready() then return
+
+    val app = lbr_app_with_geom()
+    val lib = lbr_geom()
+
+    assert_eq(lbr_run(app, [lib]), "42\n4\n")
+    lbr_drop([app, lib])
+end lbr_a_shared_module_merges
+
+@test("so a root's code may call what only the project declares")
+lbr_a_root_calls_the_project()
+    if !lbr_ready() then return
+
+    val app = lbr_app_with_geom()
+    val lib = lbr_tree(lbr_one("geom/call.sysl", "module geom\n\ndouble(n: int) -> int = own(n) * 2\n"))
+
+    assert_eq(lbr_run(app, [lib]), "46\n4\n")
+    lbr_drop([app, lib])
+end lbr_a_root_calls_the_project
+
+@test("and one name declared on both sides is the ordinary duplicate")
+lbr_a_name_declared_on_both_sides()
+    if !lbr_ready() then return
+
+    val app = lbr_app_with_geom()
+    val lib = lbr_tree(lbr_one("geom/dup.sysl", "module geom\n\nown(n: int) -> int = n\n"))
+    val said = lbr_run(app, [lib])
+
+    assert(said.starts_with("refused: error: function 'own' is already declared\n" +
+        s" --> $app/geom/own.sysl:3:1\n"), said)
+    lbr_drop([app, lib])
+end lbr_a_name_declared_on_both_sides
+
+// -- whose tests run ---------------------------------------------------------------------------------
+
+@test("a root's tests run where the project declares the same module")
+lbr_a_roots_tests_run_with_the_projects_module()
+    if !lbr_ready() then return
+
+    val app = lbr_app_with_geom()
+    val lib = lbr_geom()
+
+    assert_eq(lbr_tests(app, [lib]), "a tests file of the root, app case, lib case")
+    lbr_drop([app, lib])
+end lbr_a_roots_tests_run_with_the_projects_module
+
+@test("and do not where it declares no such module")
+lbr_a_roots_tests_are_not_the_projects()
+    if !lbr_ready() then return
+
+    val app = lbr_tree(lbr_two(
+        "main.sysl", "print(geom.double(21))\n",
+        "m/m.sysl",
+        "module m\n\n@test(\"app2 case\")\napp2_case()\n    assert(geom.double(1) == 2, \"d\")\n"))
+
+    val lib = lbr_geom()
+
+    assert_eq(lbr_tests(app, [lib]), "app2 case")
+    assert_eq(lbr_run(app, [lib]), "42\n")
+    lbr_drop([app, lib])
+end lbr_a_roots_tests_are_not_the_projects
+
+// -- the C beside a root -------------------------------------------------------------------------------
+
+@test("the C beside a root's module is compiled and linked with the program's")
+lbr_c_beside_a_root()
+    if !lbr_ready() then return
+
+    val lib = lbr_cee("int cee_seven(void) { return 7; }\n", "")
+    val prog = lbr_program("print(cee.seven_times(6))\n")
+
+    assert_eq(lbr_run(prog, [lib]), "42\n")
+    lbr_drop([lib, prog])
+end lbr_c_beside_a_root
+
+@test("under the macros the root's own manifest defines for it")
+lbr_a_roots_defines_reach_its_c()
+    if !lbr_ready() then return
+
+    val lib = lbr_cee("int cee_seven(void) { return SEVEN; }\n",
+        "package { name = \"cee\", version = \"1.0.0\" }\ndefines { \"cee/cee.c\" { SEVEN = 9 } }\n")
+
+    val prog = lbr_program("print(cee.seven_times(6))\n")
+
+    assert_eq(lbr_run(prog, [lib]), "54\n")
+    lbr_drop([lib, prog])
+end lbr_a_roots_defines_reach_its_c
+
+// A package's refusal is prefixed with its coordinate; a root's is read where it stands, as the
+// project's own is.
+@test("and a defines block naming C the root does not carry stops the build")
+lbr_a_roots_defines_naming_a_missing_file()
+    if !lbr_ready() then return
+
+    val lib = lbr_cee("int cee_seven(void) { return 7; }\n",
+        "package { name = \"cee\", version = \"1.0.0\" }\ndefines { \"cee/gone.c\" { SEVEN = 9 } }\n")
+
+    val prog = lbr_program("print(cee.seven_times(6))\n")
+
+    assert_eq(lbr_run(prog, [lib]),
+        "refused: package.hocon: 'defines.\"cee/gone.c\"' names a file this package does not carry " +
+        "— the block configures the C the package itself holds, and there is no such C file in this tree")
+    lbr_drop([lib, prog])
+end lbr_a_roots_defines_naming_a_missing_file
+
+@test("and it goes into the archive a C project links")
+lbr_a_roots_c_reaches_the_archive()
+    if !lbr_ready() then return
+
+    val lib = lbr_cee("int cee_seven(void) { return 7; }\n", "")
+    val app = lbr_tree(lbr_one("main.sysl",
+        "@export(\"answer\")\nanswer() -> int = cee.seven_times(6)\n"))
+
+    val out_dir = lbr_temp("sysl-lbr-ar")
+    val said = lbr_cli(["sysl", "build-c", app, "--lib", lib, "-o", s"$out_dir/app.a"])
+
+    assert_eq(said.0, Fine, said.1)
+
+    val listed = capture("nm", ["-g", s"$out_dir/app.a"], "", [], true) match
+        Err(_) -> "nm could not be run"
+        Ok(out) -> out.text
+
+    assert(listed.contains("T _cee_seven") || listed.contains("T cee_seven"), listed)
+    lbr_drop([lib, app, out_dir])
+end lbr_a_roots_c_reaches_the_archive
+
+// -- precedence -----------------------------------------------------------------------------------------
+
+// A dependency laid out beside the project, offering `geom`.
+private lbr_dependency() -> string = lbr_tree(lbr_two(
+    "package.hocon", "package { name = \"geom-lib\", version = \"1.0.0\" }\n",
+    "geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 100\n"))
+
+private lbr_depending(dep: string, mount: string, files: Buf[(string, string)]) -> string
+    var all = files
+
+    all.push(("package.hocon", "package { name = \"app\", version = \"0.1.0\" }\n" +
+        s"dependencies { g { path = \"$dep\"$mount } }\n"))
+    lbr_tree(all)
+end lbr_depending
+
+// A root's modules stand at the project's own level, above what the manifest declared, and a tie
+// between the two levels is refused rather than settled by order.
+@test("a declared dependency offering a module a root declares is refused, naming the root as it was given")
+lbr_a_dependency_offering_a_roots_module()
+    if !lbr_ready() then return
+
+    val dep = lbr_dependency()
+    val app = lbr_depending(dep, "", lbr_one("main.sysl", "print(geom.double(21))\n"))
+    val lib = lbr_geom()
+
+    assert_eq(lbr_run(app, []), "2100\n")
+    assert_eq(lbr_run(app, [lib]),
+        s"refused: package.hocon: 'geom' is both a module of the source root '$lib' and one g " +
+        "offers — give the dependency a 'mount' to say what it is called here")
+    lbr_drop([dep, app, lib])
+end lbr_a_dependency_offering_a_roots_module
+
+@test("while the project's own module of that name is what is named where it has one")
+lbr_the_projects_module_is_named_first()
+    if !lbr_ready() then return
+
+    val dep = lbr_dependency()
+    val app = lbr_depending(dep, "", lbr_two(
+        "main.sysl", "print(geom.double(21))\n",
+        "geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 5\n"))
+
+    val lib = lbr_geom()
+
+    assert_eq(lbr_run(app, [lib]),
+        "refused: package.hocon: 'geom' is both a module of this project and one g offers — give " +
+        "the dependency a 'mount' to say what it is called here")
+    lbr_drop([dep, app, lib])
+end lbr_the_projects_module_is_named_first
+
+@test("and a mount settles it, the root keeping the name and the dependency hanging under its own")
+lbr_a_mount_settles_a_root_and_a_dependency()
+    if !lbr_ready() then return
+
+    val dep = lbr_dependency()
+    val app = lbr_depending(dep, ", mount = \"far\"",
+        lbr_one("main.sysl", "print(geom.double(21))\nprint(far.geom.double(21))\n"))
+
+    val lib = lbr_geom()
+
+    assert_eq(lbr_run(app, [lib]), "42\n2100\n")
+    lbr_drop([dep, app, lib])
+end lbr_a_mount_settles_a_root_and_a_dependency
+
+// -- the run cache ---------------------------------------------------------------------------------------
+
+private lbr_key(path: string, libs: []string) -> string
+    lbr_hand(libs)
+
+    val key = run_cache_key_of("run", path, host_target(), DefaultOptimization, None).unwrap_or("no key")
+
+    reset_search_paths()
+    key
+end lbr_key
+
+@test("a root is in the run cache's key: what it holds, the C beside it, and where it is")
+lbr_a_root_is_in_the_run_cache_key()
+    if !lbr_ready() then return
+
+    val lib = lbr_cee("int cee_seven(void) { return 7; }\n", "")
+    val prog = lbr_program("print(cee.seven_times(6))\n")
+    val bare = lbr_key(prog, [])
+    val first = lbr_key(prog, [lib])
+
+    assert(first != "no key", "a program with a root has a key")
+    assert(first != bare, "a root changes the key")
+    assert_eq(lbr_key(prog, [lib]), first)
+
+    write_text(s"$lib/cee/cee.sysl",
+        "module cee\n\nextern \"cee_seven\" c_seven() -> int\n\nseven_times(n: int) -> int = c_seven() * n + 1\n")
+        .unwrap()
+
+    val edited = lbr_key(prog, [lib])
+
+    assert(edited != first, "an edit to a root's sysl misses")
+
+    write_text(s"$lib/cee/cee.c", "int cee_seven(void) { return 8; }\n").unwrap()
+
+    val recompiled = lbr_key(prog, [lib])
+
+    assert(recompiled != edited, "an edit to the C beside a root misses")
+
+    // The same files at another path are another binary: a root's absolute path is what `__FILE__`
+    // and every test's record carry out of its files.
+    val twin = lbr_cee("int cee_seven(void) { return 8; }\n", "")
+
+    write_text(s"$twin/cee/cee.sysl",
+        "module cee\n\nextern \"cee_seven\" c_seven() -> int\n\nseven_times(n: int) -> int = c_seven() * n + 1\n")
+        .unwrap()
+    assert(lbr_key(prog, [twin]) != recompiled, "the same root somewhere else misses")
+    lbr_drop([lib, twin, prog])
+end lbr_a_root_is_in_the_run_cache_key
+
+// The whole command, twice: the second run has to compile the root as it now is rather than replay
+// the binary built against the root as it was. The report streams to standard output rather than
+// through `say`, so the verdict is the status.
+@test("so an edit to a root's file is compiled rather than replayed")
+lbr_an_edited_root_is_recompiled()
+    if !lbr_ready() then return
+
+    val cache = lbr_temp("sysl-lbr-cache")
+
+    use_run_cache_dir(Some(cache))
+
+    val lib = lbr_tree(lbr_one("geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 2\n"))
+    val app = lbr_tree(lbr_two(
+        "main.sysl", "print(geom.double(21))\n",
+        "m/m.sysl",
+        "module m\n\n@test(\"forty-two\")\nforty_two()\n    assert(geom.double(21) == 42, \"d\")\n"))
+
+    val first = lbr_cli(["sysl", "test", app, "--lib", lib])
+    val again = lbr_cli(["sysl", "test", app, "--lib", lib])
+
+    write_text(s"$lib/geom/geom.sysl", "module geom\n\ndouble(n: int) -> int = n * 3\n").unwrap()
+
+    val edited = lbr_cli(["sysl", "test", app, "--lib", lib])
+
+    use_run_cache_dir(None)
+    lbr_drop([cache, lib, app])
+
+    assert_eq(first.0, Fine, first.1)
+    assert_eq(again.0, Fine, again.1)
+    assert(edited.0 != Fine, "the edited root was compiled, so the test that held before fails now")
+end lbr_an_edited_root_is_recompiled

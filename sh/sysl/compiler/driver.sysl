@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.Source
 import sysl.buf.{Buf, buf}
 import sysl.text.{join, str_builder, Search}
-import sysl.fs.{make_temp_dir, remove_dir_all, remove_file, current_dir, make_dir_all, pending_name, publish_file, write_text}
+import sysl.fs.{exists, make_temp_dir, remove_dir_all, remove_file, current_dir, make_dir_all, pending_name, publish_file, write_text}
 import sysl.process.{run as run_child, Status}
 import sysl.env.{get as env_var}
 
@@ -96,6 +96,70 @@ std_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     Ok(Compilation(units, modules_written(units), t))
 end std_compilation_of
 
+// What is said of a `--lib` that names a compiled artifact rather than a source tree.
+//
+// **A `.syslib` is this compiler's cache and not a file anybody names.** What is handed over is the
+// directory a library is written in; what was compiled from it is kept where the compiler keeps
+// everything it can make again, and found there by the compiler alone. Told by the name rather than
+// by reading the file, so that one which is not there at all gets the same answer.
+syslib_named_refusal(given: string) -> string =
+    s"--lib takes the directory a library's source is in, and '$given' is a '.syslib' — a library " +
+    "is handed over as the tree it is written in, and the compiler keeps its own cache of what it " +
+    "compiled from one, which nobody names"
+
+// The files of every source root a `--lib` named, parsed for this machine, in the order the roots
+// were written (`reference/modules.md § Source roots`).
+//
+// **A root is simply more modules**: its files join the compilation under the names they wrote,
+// with no prefix of their own, which is the whole difference between a root and a package. They
+// are marked as handed to the compilation, so what the target provides is the program's to state
+// and not the root's.
+//
+// **A root is a tree**, so each file's header is held to where the file sits exactly as the
+// project's are.
+private lib_root_units(t: Target) -> Result[Buf[Program], Failure]
+    var out: Buf[Program] = buf()
+    val libs = lib_roots()
+
+    for i in 0..<libs.len()
+        val given = libs.at(i)
+
+        if is_artifact(given) then return Err(said(Refusal(syslib_named_refusal(given))))
+
+        if !exists(given)
+            return Err(said(Refusal(s"cannot read a library: '$given' does not exist")))
+
+        val found = collect(given, Some(t.os)) match
+            Err(e) -> return Err(said(Refusal(e.message)))
+            Ok(f) -> f
+
+        if found.is_empty() then return Err(said(Refusal(s"$given holds no sysl source files")))
+
+        var theirs: Buf[Program] = buf()
+        var unparsed: Buf[string] = buf()
+
+        for j in 0..<found.len()
+            val parsed = parse(found.at(j).src, t)
+
+            if !parsed.ok() then unparsed.push(parse_report(parsed))
+            else theirs.push(parsed.program)
+
+        if !unparsed.is_empty() then return Err(Reported(joined_reports(unparsed)))
+
+        if is_directory(given)
+            val strayed = location_reports(found, theirs)
+
+            if !strayed.is_empty() then return Err(Reported(joined_reports(strayed)))
+
+        for j in 0..<theirs.len()
+            var unit = theirs.at(j)
+
+            unit.pkg = supplied_packaging()
+            out.push(unit)
+
+    Ok(out)
+end lib_root_units
+
 // The modules a set of files declares, each once.
 private modules_written(units: Buf[Program]) -> Buf[string]
     var out: Buf[string] = buf()
@@ -134,6 +198,10 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
     if mine.is_empty()
         return Err(said(Refusal(s"$path holds no sysl source files")))
 
+    // What each `--lib` named, read before anything is resolved on its account: a root that is not
+    // there is a mistake on the command line, and says so ahead of whatever the graph would.
+    val handed = lib_root_units(t)?
+
     var units: Buf[Program] = buf()
 
     // The library first, so that every name a program's free identifier reaches is declared before
@@ -159,6 +227,17 @@ packaged_compilation_of(path: string, t: Target) -> Result[Compilation, Failure]
 
     for i in 0..<fetched.units.len()
         units.push(fetched.units.at(i))
+
+    // Then the source roots. **Their modules are not the project's own**: `own` is what decides
+    // whose tests a test build keeps, so a root's tests run exactly where the project declares the
+    // same module and nowhere else.
+    // A root's files read an import line through the project's table, which is where its own
+    // manifest's `dependencies` were bound -- a root's modules being filed under the project's names.
+    for i in 0..<handed.len()
+        var unit = handed.at(i)
+
+        unit.pkg = Packaging("", fetched.root_mounts, true)
+        units.push(unit)
 
     // What the project's own files mean by the paths at the head of their import lines. The project
     // itself has no prefix -- its modules keep the names they were written with -- and what it has
@@ -478,6 +557,12 @@ private heap_refusal(path: string, t: Target) -> Result[unit, Refusal]
 end heap_refusal
 
 // Every allocator a program's packages named, the project's own first under "this project".
+//
+// **A `--lib` source root's claim is read too, named as the root was given**: a heap is a property
+// of the package and not of the road it arrived by, so the same directory settles the program's heap
+// whether a coordinate or the flag handed it over (`reference/packages.md § One heap`). Read from a
+// coordinate alone, the package's own objects came out of its heap and every string beside them out
+// of libc's, with nothing said. A root with no `package.hocon` has nothing to claim.
 private allocator_claims(root: string, m: Manifest) -> Buf[(string, (string, string))]
     var claims: Buf[(string, (string, string))] = buf()
 
@@ -485,12 +570,12 @@ private allocator_claims(root: string, m: Manifest) -> Buf[(string, (string, str
         Some(pair) -> claims.push(("this project", pair))
         None -> ()
 
-    val places = package_places(root, m)
+    val trees = handed_trees(root, m)
 
-    for i in 0..<places.len()
-        manifest_at(places.at(i).1) match
+    for i in 0..<trees.len()
+        manifest_at(trees.at(i).dir) match
             Ok(theirs) -> theirs.allocator match
-                Some(pair) -> claims.push((places.at(i).0, pair))
+                Some(pair) -> claims.push((trees.at(i).who, pair))
                 None -> ()
             Err(_) -> ()
 
@@ -812,16 +897,19 @@ private defines_refusal(project: string, tree: string, why: string) -> string
     manifest_at(project) match
         Err(_) -> said
         Ok(m) ->
-            val places = package_places(project, m)
+            val trees = handed_trees(project, m)
 
-            for i in 0..<places.len()
-                if places.at(i).1 == tree then return s"'${places.at(i).0}': $said"
+            // A package is named; a source root is not, its manifest being read where it stands as
+            // the project's is.
+            for i in 0..<trees.len()
+                if trees.at(i).dir == tree && !trees.at(i).from_lib
+                    return s"'${trees.at(i).who}': $said"
 
             said
 end defines_refusal
 
-// Every tree whose C belongs in the archive: the project's own, each package it takes, and the
-// standard module's.
+// Every tree whose C belongs in the archive: the project's own, each package it takes, each source
+// root it was handed, and the standard module's.
 private c_trees_of(path: string) -> Buf[string]
     var trees: Buf[string] = buf()
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
@@ -830,10 +918,10 @@ private c_trees_of(path: string) -> Buf[string]
 
     manifest_at(root) match
         Ok(m) ->
-            val roots = package_roots(root, m)
+            val roots = handed_trees(root, m)
 
             for i in 0..<roots.len()
-                trees.push(roots.at(i))
+                trees.push(roots.at(i).dir)
         Err(_) -> ()
 
     std_root() match
@@ -1032,14 +1120,17 @@ private discard_staging(staging: Option[string])
 //
 // The machine is asked about before anything is read, because a library artifact is object code and
 // a target with no toolchain has nothing an artifact could be.
-// `sysl build-lib [--target <name>] <path>` -- one library compiled ahead of time into the artifact
-// a program links instead of compiling it again.
+// `sysl build-lib [--target <name>] <path>` -- one library held to being a library for one machine,
+// and the answer is the root it checked.
+//
+// **It writes nothing anybody names.** A `.syslib` is this compiler's cache, so what the check
+// assembles is discarded; what the command is run for is that the whole of it went through, which
+// for a board package is the only check it gets.
 //
 // **It compiles the tree it is given and fetches nothing**, which is the one thing about the command
 // a reader has to be told: a `dependencies` block every other command honours is refused here by
-// name, because there is no program to resolve a graph for and the artifact would be keyed to a
-// resolution nobody made.
-build_library_of(path: string, named_target: Option[string], out: Option[string],
+// name, and what the tree depends on is handed over as a source root of its own.
+build_library_of(path: string, named_target: Option[string],
                  level: string = DefaultOptimization) -> Result[string, Failure]
     val t = target_for(path, named_target)?
 
@@ -1058,21 +1149,42 @@ build_library_of(path: string, named_target: Option[string], out: Option[string]
 
         return Err(said(Refusal("build-lib compiles the tree it is given and fetches nothing, so this " +
             s"package's dependencies reach it through --lib rather than through 'dependencies' — " +
-            s"supply $labels as a source root or as a '.syslib' built from one")))
+            s"supply $labels as --lib <dir>")))
     end if
+
+    // A source root's `dependencies` are refused on the same terms: a root is there to type-check
+    // against, and what it depends on reaches `build-lib` as a root of its own.
+    val libs = lib_roots()
+
+    for i in 0..<libs.len()
+        if !is_directory(libs.at(i)) then continue
+
+        val theirs = manifest_of_package(libs.at(i)) match
+            Err(why) -> return Err(said(Refusal(why)))
+            Ok(got) -> got
+
+        if theirs.dependencies.is_empty() then continue
+
+        var labels = ""
+
+        for j in 0..<theirs.dependencies.len()
+            if j > 0 then labels = labels + ", "
+
+            labels = labels + s"'${theirs.dependencies.at(j).label}'"
+
+        return Err(said(Refusal(s"build-lib compiles the trees it is given and fetches nothing, so " +
+            s"the source root '${libs.at(i)}' has its dependencies reach it through --lib rather " +
+            s"than through 'dependencies' — supply $labels as --lib <dir> too")))
 
     // The two requirements a command line answers, asked before anything is compiled: a package
     // whose C cannot be reached has nothing to gain from the ten seconds of analysis in front of it.
-    val probed = supplied_or_refused(path, t)?
+    // A `--lib` root is there to type-check against, its C not compiled, so its own are not asked.
+    val probed = supplied_or_refused(path, t, false)?
     val c = packaged_compilation_of(path, t)?
     val named = if manifest.name == "" then basename(root) else manifest.name
 
-    // Named after the root it was built from and written inside it, which is the rule a build's
-    // executable follows and for the same reason: the root is the one place that names the library
-    // without depending on where the caller happened to be standing.
-    val where = out.unwrap_or(s"${default_executable(path)}$SyslibExtension")
-
-    build_library(root, t, where, c.units, c.own, s"'$named'", probed, level)
+    build_library(root, t, c.units, c.own, s"'$named'", probed, level)?
+    Ok(root)
 end build_library_of
 
 build_std_artifact_of(path: string, named_target: Option[string], out: Option[string],
@@ -1301,18 +1413,18 @@ private native_objects(clang: string, path: string, exe: string, t: Target,
             eprints(s"sysl: warning: ${strays.at(i)}\n")
     end if
 
-    // And every package this project takes, which carries its own `.c` on the same terms the program
-    // does -- a binding is a sysl surface over C, so the C is part of what was fetched. A manifest
-    // that will not read is not a refusal here: whatever needed it has already said so, and a build
-    // that got this far read one.
+    // And every package this project takes and every source root it was handed, which carry their
+    // own `.c` on the same terms the program does -- a binding is a sysl surface over C, so the C is
+    // part of what was fetched. A manifest that will not read is not a refusal here: whatever needed
+    // it has already said so, and a build that got this far read one.
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
 
     manifest_at(root) match
         Ok(m) ->
-            val roots = package_roots(root, m)
+            val roots = handed_trees(root, m)
 
             for i in 0..<roots.len()
-                trees.push(roots.at(i))
+                trees.push(roots.at(i).dir)
         Err(_) -> ()
 
     // And the standard module's, where it is compiled from source rather than linked from an
@@ -1361,7 +1473,12 @@ end native_objects
 // left to whoever wrote the package: the archive goes on *this* link line, so a machine without it
 // stops *this* build. Sorted within a manifest by the `.pc` name so that which library a build
 // complains about first does not depend on the order a HOCON block happened to be written in.
-private pkg_config_needs(path: string) -> Result[Buf[LibNeed], Refusal]
+//
+// **A `--lib` source root's need is collected as a coordinate's is, named as the root was given** --
+// its C goes on this link line exactly the same, so a binding handed over by the flag would otherwise
+// link without its library. `roots` is false for `build-lib`, where a root is there to type-check
+// against and none of its C is compiled.
+private pkg_config_needs(path: string, roots: bool) -> Result[Buf[LibNeed], Refusal]
     var out: Buf[LibNeed] = buf()
 
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
@@ -1369,12 +1486,14 @@ private pkg_config_needs(path: string) -> Result[Buf[LibNeed], Refusal]
 
     add_needs(&out, "this project", mine)
 
-    val places = package_places(root, mine)
+    val trees = handed_trees(root, mine)
 
-    for i in 0..<places.len()
-        manifest_at(places.at(i).1) match
+    for i in 0..<trees.len()
+        if trees.at(i).from_lib && !roots then continue
+
+        manifest_at(trees.at(i).dir) match
             Err(_) -> ()
-            Ok(m) -> add_needs(&out, places.at(i).0, m)
+            Ok(m) -> add_needs(&out, trees.at(i).who, m)
 
     Ok(out)
 end pkg_config_needs
@@ -1397,7 +1516,9 @@ end HeaderNeed
 // Every header requirement this compilation is answerable for -- this project's, then each package
 // it reaches. **A dependency's need is the consumer's problem** for the same reason a library's is:
 // the header is included by C compiled into *this* build, so a machine without it stops this build.
-header_needs(path: string) -> Result[Buf[HeaderNeed], Refusal]
+// A `--lib` source root's requirement is asked the same way, named as the root was given, except
+// where `roots` is false: `build-lib` compiles none of a root's C, so it has no header to ask for.
+header_needs(path: string, roots: bool = true) -> Result[Buf[HeaderNeed], Refusal]
     var out: Buf[HeaderNeed] = buf()
 
     val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
@@ -1405,12 +1526,14 @@ header_needs(path: string) -> Result[Buf[HeaderNeed], Refusal]
 
     add_header_needs(&out, "this project", mine)
 
-    val places = package_places(root, mine)
+    val trees = handed_trees(root, mine)
 
-    for i in 0..<places.len()
-        manifest_at(places.at(i).1) match
+    for i in 0..<trees.len()
+        if trees.at(i).from_lib && !roots then continue
+
+        manifest_at(trees.at(i).dir) match
             Err(_) -> ()
-            Ok(m) -> add_header_needs(&out, places.at(i).0, m)
+            Ok(m) -> add_header_needs(&out, trees.at(i).who, m)
 
     Ok(out)
 end header_needs
@@ -1474,9 +1597,11 @@ unmet_headers(needs: Buf[HeaderNeed]) -> Option[string]
 end unmet_headers
 
 // The two requirements a command line answers, checked together and in the order a reader can act
-// on: the headers a package's C includes, then the installed libraries it links.
-private supplied_or_refused(path: string, t: Target) -> Result[PkgAnswer, Refusal]
-    val headers = header_needs(path)?
+// on: the headers a package's C includes, then the installed libraries it links. `roots` says whether
+// the `--lib` source roots' own requirements are this command's to answer, which they are wherever
+// their C is compiled -- everywhere but `build-lib`.
+private supplied_or_refused(path: string, t: Target, roots: bool = true) -> Result[PkgAnswer, Refusal]
+    val headers = header_needs(path, roots)?
 
     answer_headers_from_env(headers)
 
@@ -1484,7 +1609,7 @@ private supplied_or_refused(path: string, t: Target) -> Result[PkgAnswer, Refusa
         Some(why) -> return Err(Refusal(why))
         None -> ()
 
-    probe_libs(pkg_config_needs(path)?, t) match
+    probe_libs(pkg_config_needs(path, roots)?, t) match
         Err(why) -> Err(Refusal(why))
         Ok(found) -> Ok(found)
 end supplied_or_refused

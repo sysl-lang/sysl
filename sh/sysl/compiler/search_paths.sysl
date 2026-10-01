@@ -52,10 +52,32 @@ reset_search_paths()
     sp_link = buf()
     sp_defines = buf()
     sp_named = buf()
+    sp_libs = buf()
     sp_std_from_source = false
-    sp_std_named = None
     sp_verbose = false
 end reset_search_paths
+
+// Every source root a `--lib` named, as it was written and in the order it was written.
+//
+// **A root is more modules for the compilation in front of the compiler** (`reference/modules.md §
+// Source roots`): its files join under the names they wrote, with no prefix of their own, and the C
+// beside them is compiled with the program's. It is here with the search paths because it is the
+// same kind of fact -- where something is on this machine, which no committed file can say -- and
+// because it has to reach the same places: the compilation, the C walk and the run cache's key.
+private var sp_libs: Buf[string] = buf()
+
+// One `--lib`, as written. A refusal about it names it this way, so nothing is normalized here.
+add_lib_root(dir: string) = sp_libs.push(dir)
+
+// The source roots this command was handed, in the order they were written.
+lib_roots() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<sp_libs.len()
+        out.push(sp_libs.at(i))
+
+    out
+end lib_roots
 
 // Whether `--verbose` (`-v`) was given: a build says on standard error the whole command line it
 // handed the linker, which is the one place the level it was built at is written down.
@@ -69,11 +91,27 @@ private var sp_std_from_source: bool = false
 
 std_from_source() -> bool = sp_std_from_source
 
-// The artifact `--std-lib` named: the standard module a compilation links, read from exactly there
-// and never rebuilt, being the one that was asked for.
-private var sp_std_named: Option[string] = None
+// What is said of `--std-lib`, whatever it names and whichever command it was given to.
+//
+// **It named a `.syslib`, and a `.syslib` is this compiler's cache, which nobody names** -- the same
+// reason `--lib` takes a directory. What it was for, compiling against a standard module other than
+// the one beside the compiler, is said by naming that module's SOURCE: `SYSL_LIB` points at a library
+// root, and the cache keeps what was compiled from it under that root's fingerprint.
+std_lib_refusal() -> string =
+    "--std-lib names a '.syslib', and a '.syslib' is this compiler's cache, which nobody names — " +
+    "to compile against another standard module, set SYSL_LIB to the root its source is in"
 
-std_named() -> Option[string] = sp_std_named
+// Whether a command line carries `--std-lib` among the compiler's own arguments: everything before a
+// `--`, which is where a program's own arguments begin. Asked before any command reads its flags, so
+// no command can take it and every command refuses it in the same words.
+names_std_lib(args: []string) -> bool
+    for i in 0..<args.len
+        if args[i] == "--" then return false
+
+        if args[i] == "--std-lib" then return true
+
+    false
+end names_std_lib
 
 // `--include-path` written as `<name>=<dir>`, which answers a package's declared header requirement,
 // or nothing where it is the ordinary bare directory.
@@ -124,7 +162,7 @@ add_link_path(dir: string) = sp_link.push(dir)
 add_define(macro: string) = sp_defines.push(macro)
 
 // One argument of a command line, where it is one of the flags saying **where things are on this
-// machine**: `--include-path`, `--link-path` and `-D`/`--define`.
+// machine**: `--include-path`, `--link-path`, `-D`/`--define` and `--lib`.
 //
 // Every command that can reach a C compiler takes all three and decides nothing about them, so they
 // are read here once rather than in each command's own loop. The answer is how many arguments were
@@ -134,12 +172,12 @@ took_search_flag(args: []string, i: usize) -> int
     val arg = args[i]
 
     if arg == "-D" || arg == "--define" || arg == "--include-path" || arg == "--link-path" ||
-            arg == "--std-lib"
+            arg == "--lib"
         if i + 1 >= args.len then return 0
 
         if arg == "--include-path" then add_include_path(args[i + 1])
         else if arg == "--link-path" then add_link_path(args[i + 1])
-        else if arg == "--std-lib" then sp_std_named = Some(args[i + 1])
+        else if arg == "--lib" then add_lib_root(args[i + 1])
         else add_define(args[i + 1])
 
         return 2

@@ -1,0 +1,420 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get as env_var
+import sysl.process.capture
+import sysl.fs.{current_dir, entries, is_file, make_dir_all, read_bytes, read_text, remove_file, write_bytes,
+                write_bytes_atomic, write_text_atomic}
+import sysl.text.{from_utf8_unchecked, join, split, Search}
+
+// Every C file a build compiles, compiled once and kept.
+//
+// A package's C, a `--lib` root's, the project's own and the standard module's when it is compiled
+// from source are all compiled by `compile_c`, and before this every build compiled every one of them
+// again -- a binding carrying a large vendored library paid for it on every edit to a line of sysl.
+// **An object depends on nothing sysl-side**, so unlike a cache of compiled sysl this one needs no
+// condition about what else the program declares: the object is a function of the C compiler, what
+// it was told, and the bytes it read. That is the key.
+//
+// ==What the key is over==
+//
+// **A wrong key is a stale object linked into a program, which is worse than a slow build**, so
+// everything that can reach the bytes is in it:
+//
+//   - the **C compiler**: the path it was run as and what its `--version` says, which names the
+//     release and the directory it was installed in. `--cc`, and the NDK or wasi-sdk clang the
+//     environment chose, are therefore both here without being named.
+//   - **every argument it was given**: the target triple, the optimization level, the machine flags,
+//     `SYSL_EXTRA_CFLAGS`, the headers and macros the command line supplied, a `pkg-config` probe's
+//     answer and the package's own `defines`. They are hashed as the command line clang saw rather
+//     than part by part, so a flag added to `compile_c` later is in the key without anybody
+//     remembering to put it there.
+//   - the **environment that reaches the toolchain** (`build_environment`), and the **working
+//     directory** where a flag names a directory relative to it.
+//   - the **source file**, by its path (it is what `__FILE__` expands to) and its bytes, and **every
+//     file the preprocessor read to compile it**, by path and bytes.
+//
+// ==How a header edit is caught==
+//
+// **Which headers a file reads is known only after it has been compiled**, so the key is found in
+// two steps, the way `ccache`'s direct mode finds its own. The first key is over everything but the
+// files; under it is a list of the files the last compilation read, as clang's own `-MD` output named
+// them. A lookup reads each of those files again and hashes them into the second key, under which
+// the object is kept -- so an edit to any header the file includes, however deep, changes the second
+// key and misses. A header that starts including another is itself an edit, and the recompilation it
+// causes writes the new list.
+//
+// ==What a cached object has to prove==
+//
+// **An object is written with its length and its digest beside it**, both through a rename, and a hit
+// reads the object and checks both before a byte of it is handed on. A build killed between the two
+// writes, a disk that filled, a file somebody truncated: each is a miss and a recompilation rather than
+// a broken link or, worse, a link that succeeds with the wrong code.
+//
+// ==What it does not cover, stated rather than hidden==
+//
+// A header **added** to a directory searched before the one the file was found in last time: nothing
+// the previous compilation read has changed, so the lookup hits. `SYSL_NO_CACHE=1` is the escape
+// hatch, as it is for the run cache. This is ccache's direct mode's limitation too, and it is left
+// rather than closed because closing it exactly means replaying clang's search -- the including
+// file's own directory, `-iquote`, `-I`, `-isystem`, the sysroot, frameworks, `#include_next` -- for
+// every header a file reads, and an approximation of that is a key that looks complete and is not.
+// `coc_a_header_added_earlier_on_the_path_is_not_noticed` shows it.
+
+private const CacheOff: string = "SYSL_NO_CACHE"
+
+// Bumped when what an entry holds changes shape, so an old entry reads as a miss.
+private const Format: string = "cobj-1"
+
+// A directory a test keeps its entries in, in place of the machine's cache. Empty is none.
+private var c_object_home: string = ""
+
+// How many compilations were answered from the cache, and how many ran clang, since the counts were
+// last cleared -- what a test observes rather than a clock.
+private var c_object_hits: int = 0
+private var c_object_compiled: int = 0
+
+// The last C compiler asked for its version, and what it said -- one question per compiler per
+// process, a build compiling many files with one clang.
+private var cc_asked: string = ""
+private var cc_said: string = ""
+
+// Keep the cache's objects under `dir` rather than the machine's cache directory, or go back to the
+// machine's with `None`.
+use_c_object_cache_dir(dir: Option[string])
+    c_object_home = dir.unwrap_or("")
+
+// `(hits, compilations)` since the last `clear_c_object_counts`.
+c_object_counts() -> (int, int) = (c_object_hits, c_object_compiled)
+
+clear_c_object_counts()
+    c_object_hits = 0
+    c_object_compiled = 0
+
+// Where objects are kept, or nothing where the cache is off or the machine has no cache directory.
+private c_object_dir() -> Option[string]
+    if env_var(CacheOff).unwrap_or("") != "" then return None
+    if c_object_home != "" then return Some(s"$c_object_home/sysl/cobj")
+
+    cache_directory() match
+        Some(dir) -> Some(s"$dir/sysl/cobj")
+        None -> None
+end c_object_dir
+
+// Compile `src` into `obj` with `args` (everything but the file and the output), from the cache where
+// the same compilation has been made before.
+//
+// **With the cache off, the command line is exactly the one it always was**: `-MD` is added only
+// where there is somewhere to keep what it says.
+cached_c_compile(cc: string, src: string, obj: string, args: Buf[string]) -> Result[unit, ToolFault]
+    val dir = c_object_dir() match
+        Some(d) -> d
+        None ->
+            c_object_compiled += 1
+            return told(cc, with_io(args, src, obj, None))
+
+    val first = first_key(cc, src, args)
+    val listed = s"$dir/$first.deps"
+
+    // **A hit.** The list is what the last compilation read; every file on it is read again now.
+    val known = read_text(listed) match
+        Ok(text) -> second_key(first, split_lines(text))
+        Err(_) -> None
+
+    known match
+        Some(second) ->
+            if reuse(s"$dir/$second.o", obj)
+                c_object_hits += 1
+                in_use(s"$dir/$second.o", listed)
+                return Ok(())
+        None -> ()
+
+    val made = s"$obj.d"
+    val before = file_digest(src)
+
+    c_object_compiled += 1
+    told(cc, with_io(args, src, obj, Some(made)))?
+
+    val read = read_text(made) match
+        Ok(text) -> depended_on(text)
+        Err(_) -> buf()
+
+    remove_file(made).unwrap_or(())
+
+    // **A file edited while clang was reading it is not kept**: the object may be of either text,
+    // and the key would claim the second.
+    if read.len() == 0 || file_digest(src) != before then return Ok(())
+
+    val second = second_key(first, read) match
+        Some(k) -> k
+        None -> return Ok(())
+
+    keep(dir, s"$dir/$second.o", obj)
+
+    // A list that cannot be written costs the next build its compilation and nothing else.
+    write_text_atomic(listed, join(read.view(), "\n")).unwrap_or(())
+    in_use(s"$dir/$second.o", listed)
+    evict_c_objects(dir)
+    Ok(())
+end cached_c_compile
+
+// --- eviction ----------------------------------------------------------------------------
+//
+// **The run cache's policy, with the run cache's two numbers** (`CacheKeep`, `CacheStale`), so there
+// is one rule to know about what the machine's cache keeps: nothing is removed until the directory
+// holds `CacheKeep` objects, and then only what is older than `CacheStale`, measured against the newest
+// entry rather than a clock. Age is what makes it safe beside another build using the directory.
+//
+// It runs after a miss has kept its object -- a build that hits everything lists nothing -- and two
+// things are exempt from it:
+//
+//   - **what this process has used or made**, whatever its age: a build never evicts an object it
+//     already linked from, nor the file list that found it. A hit does not refresh an object's age, so
+//     an object compiled long ago and hit every day is recompiled once when it ages out, as a run-cache
+//     entry is rebuilt.
+//   - nothing else. **A half entry is garbage at any age** -- an object with no `.o.sum` beside it, or
+//     a `.o.sum` with no object -- since a lookup reads it as a miss and nothing ever completes it. One
+//     removed while another build is between its two renames costs that build's next compilation.
+
+// The objects, and the file lists naming them, this process has used or made.
+private var c_objects_in_use: Buf[string] = buf()
+
+private in_use(object: string, listed: string)
+    c_objects_in_use.push(object)
+    c_objects_in_use.push(s"$object.sum")
+    c_objects_in_use.push(listed)
+end in_use
+
+private used_here(one: string) -> bool
+    for i in 0..<c_objects_in_use.len()
+        if c_objects_in_use.at(i) == one then return true
+
+    false
+end used_here
+
+// Half entries removed, then -- where `CacheKeep` objects are kept -- every entry older than
+// `CacheStale` that this process has not used. A failure is not the build's: the worst an unevicted
+// cache costs is disk.
+evict_c_objects(dir: string)
+    val names = entries(dir) match
+        Ok(n) -> n
+        Err(_) -> return
+
+    var objects: usize = 0
+    var now: long = 0
+
+    for i in 0..<names.len()
+        val n = names.at(i)
+        val one = s"$dir/$n"
+
+        if n.ends_with(".o")
+            if is_file(s"$one.sum") then objects += 1
+            else if !used_here(one) then remove_file(one).unwrap_or(())
+        else if n.ends_with(".o.sum")
+            if !is_file(one[0..<one.len - 4]) && !used_here(one) then remove_file(one).unwrap_or(())
+
+        val at = cache_modified_at(one)
+
+        if at > now then now = at
+
+    if objects < CacheKeep then return
+
+    for i in 0..<names.len()
+        val one = s"$dir/${names.at(i)}"
+
+        if !used_here(one) && now - cache_modified_at(one) > CacheStale then remove_file(one).unwrap_or(())
+end evict_c_objects
+
+private split_lines(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for line in split(text, "\n")
+        out.push(line)
+
+    out
+end split_lines
+
+// The command line: the arguments, where the dependency list goes, the file, and the object.
+private with_io(args: Buf[string], src: string, obj: string, deps: Option[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<args.len()
+        out.push(args.at(i))
+
+    deps match
+        Some(d) ->
+            out.push("-MD")
+            out.push("-MF")
+            out.push(d)
+        None -> ()
+
+    out.push(src)
+    out.push("-o")
+    out.push(obj)
+    out
+end with_io
+
+// The key over everything but the files the preprocessor read.
+private first_key(cc: string, src: string, args: Buf[string]) -> string
+    var parts: Buf[string] = buf()
+
+    parts.push(Format)
+    parts.push(cc)
+    parts.push(cc_version(cc))
+    parts.push(build_environment())
+    parts.push(src)
+    parts.push(join(args.view(), "\0"))
+
+    // **A relative `-I` is relative to where clang was started**, so the same command line from
+    // another directory reads other headers under the same names.
+    if names_relative_directory(args) then parts.push(current_dir().unwrap_or("?"))
+
+    run_cache_key(parts)
+end first_key
+
+// The object's key: the first key and every file read, by path and by bytes -- or nothing where one of
+// them is gone, which is a miss.
+private second_key(first: string, files: Buf[string]) -> Option[string]
+    var parts: Buf[string] = buf()
+
+    parts.push(first)
+
+    for i in 0..<files.len()
+        val f = files.at(i)
+
+        if f == "" then continue
+
+        val digest = file_digest(f)
+
+        if digest == "" then return None
+
+        parts.push(f)
+        parts.push(digest)
+
+    Some(run_cache_key(parts))
+end second_key
+
+// A file's bytes as a digest and a length, or empty where it cannot be read.
+private file_digest(f: string) -> string = read_bytes(f) match
+    Ok(bytes) -> s"${bytes.len}:${bytes_fingerprint(bytes)}"
+    Err(_) -> ""
+
+// What the C compiler says it is. A compiler that will not say is keyed on its path alone, which is
+// still a key: the compilation that follows fails in its own words.
+private cc_version(cc: string) -> string
+    if cc_asked == cc then return cc_said
+
+    cc_said = capture(cc, ["--version"], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> ""
+    cc_asked = cc
+    cc_said
+end cc_version
+
+// Whether any argument names a directory or file relative to the working directory.
+names_relative_directory(args: Buf[string]) -> bool
+    val takes: []const string = ["-I", "-iquote", "-isystem", "-idirafter", "-include", "-imacros",
+                                 "-F", "-iframework", "--sysroot", "-isysroot"]
+
+    for i in 0..<args.len()
+        val a = args.at(i)
+
+        for t in takes
+            if a == t
+                if i + 1 < args.len() && relative(args.at(i + 1)) then return true
+            elif a.starts_with(t)
+                val rest = a[t.len..]
+                val named = if rest.starts_with("=") then rest[1..] else rest
+
+                if relative(named) then return true
+
+    false
+end names_relative_directory
+
+private relative(p: string) -> bool = p != "" && !p.starts_with("/")
+
+// A cached object copied into place, where it is whole: its length and digest have to agree with the
+// sidecar written beside it.
+private reuse(cached: string, obj: string) -> bool
+    val said = read_text(s"$cached.sum") match
+        Ok(text) -> text
+        Err(_) -> return false
+
+    val bytes = read_bytes(cached) match
+        Ok(b) -> b
+        Err(_) -> return false
+
+    if said != s"${bytes.len}:${bytes_fingerprint(bytes)}" then return false
+
+    write_bytes(obj, bytes).is_ok()
+end reuse
+
+// The object just compiled, kept: the object first and its sidecar second, each through a rename, so
+// a reader sees either nothing, an object with no sidecar (a miss), or both.
+private keep(dir: string, cached: string, obj: string)
+    make_dir_all(dir) match
+        Err(_) -> return
+        Ok(_) -> ()
+
+    val bytes = read_bytes(obj) match
+        Ok(b) -> b
+        Err(_) -> return
+
+    write_bytes_atomic(cached, bytes) match
+        Err(_) -> return
+        Ok(_) -> ()
+
+    write_text_atomic(s"$cached.sum", s"${bytes.len}:${bytes_fingerprint(bytes)}").unwrap_or(())
+end keep
+
+// The files a Makefile rule written by `-MD` names as prerequisites: everything after the target's
+// colon, with the line continuations joined and a backslash-escaped space kept inside its name.
+depended_on(rule: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var word: Buf[u8] = buf()
+    var past_target = false
+    val b = rule.bytes
+    var i: usize = 0
+
+    while i < b.len
+        val c = b[i]
+
+        if c == u8('\\') && i + 1 < b.len && (b[i + 1] == u8('\n') || b[i + 1] == u8('\r'))
+            i += 2
+            flush_word(&word, &out, &past_target)
+            continue
+
+        if c == u8('\\') && i + 1 < b.len && (b[i + 1] == u8(' ') || b[i + 1] == u8('#'))
+            word.push(b[i + 1])
+            i += 2
+            continue
+
+        if c == u8('$') && i + 1 < b.len && b[i + 1] == u8('$')
+            word.push(c)
+            i += 2
+            continue
+
+        if c == u8(' ') || c == u8('\t') || c == u8('\n') || c == u8('\r')
+            flush_word(&word, &out, &past_target)
+        else
+            word.push(c)
+
+        i += 1
+
+    flush_word(&word, &out, &past_target)
+    out
+end depended_on
+
+private flush_word(word: *Buf[u8], out: *Buf[string], past_target: *bool)
+    if word.len() == 0 then return
+
+    // A fresh buffer rather than a cleared one: the text is read out of this one's storage.
+    val text = from_utf8_unchecked(word.view())
+
+    *word = buf()
+
+    if *past_target
+        out.push(text)
+    elif text.ends_with(":")
+        *past_target = true
+end flush_word

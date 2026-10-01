@@ -1,0 +1,452 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+import sysl.text.Search
+
+// **What a `--lib` source root's own `package.hocon` brings to a build**: its allocator, its header
+// requirements and the installed libraries its `pkg_config` block names (`reference/packages.md § A
+// package reaches a build by three roads`). A directory handed over with the flag is the same package
+// as one named by a coordinate, so each is charged to the build exactly as a dependency's is, and
+// named as the root was given. A root with no manifest has nothing to declare.
+//
+// Every message and every output here was read off the reference (0.0.152) run over the same trees,
+// each root handed over as a directory. `build-lib` is the one command that asks neither a root's
+// headers nor its libraries, compiling none of its C; the allocator it still settles.
+
+// -- trees on disk --------------------------------------------------------------------------------
+
+// A root holding one module, with this manifest beside it (none where it is empty).
+private lbm_root(module_name: string, body: string, manifest: string) -> string
+    var files = lbr_one(s"$module_name/$module_name.sysl", s"module $module_name\n\n$body\n")
+
+    if !manifest.is_empty() then files.push(("package.hocon", manifest))
+
+    lbr_tree(files)
+end lbm_root
+
+// A root that names a heap of its own and allocates through it -- a concatenation being the shortest
+// thing that reaches the allocator through the runtime rather than through a program's own code.
+private lbm_heap(module_name: string, alloc: string, free: string) -> string =
+    lbm_root(module_name, "join(a: string, b: string) -> string = a + b",
+        s"package { name = \"$module_name\" }\nallocator {\n  alloc = \"$alloc\"\n  free  = \"$free\"\n}\n")
+
+// A project directory: this program, and this manifest beside it where one is given.
+private lbm_project(program: string, manifest: string) -> string
+    var files = lbr_one("main.sysl", program)
+
+    if !manifest.is_empty() then files.push(("package.hocon", manifest))
+
+    lbr_tree(files)
+end lbm_project
+
+// A root requiring the `probe` headers, described as `note`, answered by `env` where one is named.
+private lbm_headers(module_name: string, body: string, note: string, env: string) -> string
+    val clause = if env.is_empty() then s"\"$note\"" else s"{ note = \"$note\", env = \"$env\" }"
+
+    lbm_root(module_name, body,
+        s"package { name = \"$module_name\" }\nrequires { headers { probe = $clause } }\n")
+end lbm_headers
+
+// What the program a build of `path` with these roots and these named include paths prints, or what
+// stopped it -- `lbr_run` with the flag `--include-path <name>=<dir>` beside the roots.
+private lbm_run(path: string, libs: []string, includes: []string) -> string
+    val out_dir = lbr_temp("sysl-lbm-exe")
+
+    lbr_hand(libs)
+
+    for inc in includes
+        add_include_path(inc)
+
+    val said = build_native_program(path, None, None, DefaultOptimization, Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    reset_search_paths()
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end lbm_run
+
+private lbm_declares(text: string, name: string) -> bool
+    val lines = lines_of(text)
+
+    for i in 0..<lines.len()
+        if lines.at(i).starts_with("declare ") && lines.at(i).contains(s"@$name(") then return true
+
+    false
+end lbm_declares
+
+private lbm_alloc_refusal(first: string, a: string, second: string, b: string) -> string =
+    s"error: two packages name different allocators, and a program has one heap — '$first' names " +
+    s"$a; '$second' names $b. Drop one of the declarations, or depend on only one of them"
+
+private lbm_header_refusal(who: string, note: string) -> string =
+    s"error: $who needs the 'probe' headers and nothing supplied them — $note. Say where they are " +
+    "with '--include-path probe=<dir>'"
+
+// -- the allocator --------------------------------------------------------------------------------
+
+@test("--lib pointed at a source root that names an allocator: is the pair the whole program allocates through")
+lbm_a_roots_allocator_is_the_programs()
+    if !lbr_ready() then return
+
+    val lib = lbm_heap("heapy", "pvPortMalloc", "vPortFree")
+    val prog = lbr_program("print(heapy.join(\"a\", \"b\"))\n")
+    val text = lbr_text(prog, [lib])
+
+    assert(lbm_declares(text, "pvPortMalloc"), text)
+    assert(lbm_declares(text, "vPortFree"), text)
+    lbr_drop([lib, prog])
+end lbm_a_roots_allocator_is_the_programs
+
+// The half that says the root's pair replaced libc's rather than being declared beside it -- two
+// allocators in one program's text is the mixed heap this exists to prevent.
+@test("and libc's pair is then reached nowhere at all")
+lbm_libcs_pair_is_reached_nowhere()
+    if !lbr_ready() then return
+
+    val lib = lbm_heap("heapy", "pvPortMalloc", "vPortFree")
+    val prog = lbr_program("print(heapy.join(\"a\", \"b\"))\n")
+    val text = lbr_text(prog, [lib])
+
+    assert(!lbm_declares(text, "malloc"), text)
+    assert(!lbm_declares(text, "free"), text)
+    lbr_drop([lib, prog])
+end lbm_libcs_pair_is_reached_nowhere
+
+@test("while a source root with no manifest leaves libc's pair in place")
+lbm_a_root_with_no_manifest_keeps_libcs_pair()
+    if !lbr_ready() then return
+
+    val lib = lbm_root("heapless", "join(a: string, b: string) -> string = a + b", "")
+    val prog = lbr_program("print(heapless.join(\"a\", \"b\"))\n")
+    val text = lbr_text(prog, [lib])
+
+    assert(lbm_declares(text, "malloc"), text)
+    assert(!text.contains("pvPortMalloc"), text)
+    lbr_drop([lib, prog])
+end lbm_a_root_with_no_manifest_keeps_libcs_pair
+
+// The two roots declare different modules, or the refusal would be a duplicate `join` wearing the
+// allocator's clothes. Each root is named as it was given, in the order the command line gave them.
+@test("and two roots naming different pairs are refused rather than resolved by order")
+lbm_two_roots_naming_different_pairs()
+    if !lbr_ready() then return
+
+    val heapy = lbm_heap("heapy", "pvPortMalloc", "vPortFree")
+    val kheap = lbm_heap("kheap", "kmalloc", "kfree")
+    val prog = lbr_program("print(1)\n")
+    val one = lbr_cli(["sysl", "emit-llvm", prog, "--lib", heapy, "--lib", kheap])
+    val other = lbr_cli(["sysl", "emit-llvm", prog, "--lib", kheap, "--lib", heapy])
+
+    assert_eq(one.0, Failed)
+    assert_eq(one.1, lbm_alloc_refusal(heapy, "pvPortMalloc / vPortFree", kheap, "kmalloc / kfree"))
+    assert_eq(other.0, Failed)
+    assert_eq(other.1, lbm_alloc_refusal(kheap, "kmalloc / kfree", heapy, "pvPortMalloc / vPortFree"))
+    lbr_drop([heapy, kheap, prog])
+end lbm_two_roots_naming_different_pairs
+
+@test("while two roots naming the same pair agree")
+lbm_two_roots_naming_the_same_pair()
+    if !lbr_ready() then return
+
+    val heapy = lbm_heap("heapy", "pvPortMalloc", "vPortFree")
+    val also = lbm_heap("alsoheapy", "pvPortMalloc", "vPortFree")
+    val prog = lbr_program("print(1)\n")
+    val said = lbr_cli(["sysl", "emit-llvm", prog, "--lib", heapy, "--lib", also])
+
+    assert_eq(said.0, Fine, said.1)
+    lbr_drop([heapy, also, prog])
+end lbm_two_roots_naming_the_same_pair
+
+@test("a root's pair and the project's are one claim each, so different ones are refused")
+lbm_a_root_and_the_project_disagree()
+    if !lbr_ready() then return
+
+    val heapy = lbm_heap("heapy", "pvPortMalloc", "vPortFree")
+    val app = lbm_project("print(heapy.join(\"a\", \"b\"))\n",
+        "package { name = \"app\", version = \"0.1.0\" }\nallocator { alloc = \"kmalloc\", free = \"kfree\" }\n")
+    val out_dir = lbr_temp("sysl-lbm-exe")
+    val built = lbr_cli(["sysl", "build", app, "--lib", heapy, "-o", s"$out_dir/program"])
+    val text = lbr_cli(["sysl", "emit-llvm", s"$app/main.sysl", "--lib", heapy])
+
+    assert_eq(built.0, Failed)
+    assert_eq(built.1,
+        lbm_alloc_refusal("this project", "kmalloc / kfree", heapy, "pvPortMalloc / vPortFree"))
+    assert_eq(text.0, Failed)
+    assert_eq(text.1,
+        lbm_alloc_refusal("this project", "kmalloc / kfree", heapy, "pvPortMalloc / vPortFree"))
+    lbr_drop([heapy, app, out_dir])
+end lbm_a_root_and_the_project_disagree
+
+@test("and the same one is one pair")
+lbm_a_root_and_the_project_agree()
+    if !lbr_ready() then return
+
+    val heapy = lbm_heap("heapy", "pvPortMalloc", "vPortFree")
+    val app = lbm_project("print(heapy.join(\"a\", \"b\"))\n",
+        "package { name = \"app\", version = \"0.1.0\" }\n" +
+        "allocator { alloc = \"pvPortMalloc\", free = \"vPortFree\" }\n")
+    val said = lbr_cli(["sysl", "emit-llvm", s"$app/main.sysl", "--lib", heapy])
+
+    assert_eq(said.0, Fine, said.1)
+    assert(lbm_declares(said.1, "pvPortMalloc"), said.1)
+    lbr_drop([heapy, app])
+end lbm_a_root_and_the_project_agree
+
+// `build-lib` settles the heap as every other command does: its artifact is compiled against one pair.
+@test("and build-lib settles it too, a library being compiled against one heap")
+lbm_build_lib_settles_the_allocator()
+    if !lbr_ready() then return
+
+    val heapy = lbm_heap("heapy", "pvPortMalloc", "vPortFree")
+    val lib = lbr_tree(lbr_two(
+        "libh/libh.sysl", "module libh\n\nv(a: string) -> string = heapy.join(a, a)\n",
+        "package.hocon", "package { name = \"libh\" }\nallocator { alloc = \"kmalloc\", free = \"kfree\" }\n"))
+    val said = lbr_cli(["sysl", "build-lib", lib, "--lib", heapy])
+
+    assert_eq(said.0, Failed)
+    assert_eq(said.1,
+        lbm_alloc_refusal("this project", "kmalloc / kfree", heapy, "pvPortMalloc / vPortFree"))
+    lbr_drop([heapy, lib])
+end lbm_build_lib_settles_the_allocator
+
+// A heap asked for on a machine with no libc is refused before the linker -- unless a package names
+// a heap of its own, and a root that names one is such a package. Whether the wasm link that follows
+// succeeds is a question about this machine's toolchain; what is asserted is that the driver stopped
+// holding the project back.
+private val lbm_freestanding: string =
+    "package { name = \"app\", version = \"0.1.0\" }\nrequires { heap = true }\n" +
+    "targets { default = \"wasm32-freestanding\" }\n"
+
+@test("a root's heap is the way out of a freestanding target's refusal")
+lbm_a_roots_heap_lifts_the_freestanding_refusal()
+    if !lbr_ready() then return
+
+    val heapy = lbm_heap("heapy", "pvPortMalloc", "vPortFree")
+    val app = lbm_project("print(1)\n", lbm_freestanding)
+    val out_dir = lbr_temp("sysl-lbm-exe")
+    val said = lbr_cli(["sysl", "build", app, "--lib", heapy, "-o", s"$out_dir/program"])
+
+    assert(!said.1.contains("requires a heap"), said.1)
+    lbr_drop([heapy, app, out_dir])
+end lbm_a_roots_heap_lifts_the_freestanding_refusal
+
+@test("while a root with no manifest is not")
+lbm_a_root_with_no_manifest_leaves_the_refusal()
+    if !lbr_ready() then return
+
+    val bare = lbm_root("noman", "value() -> int = 45", "")
+    val app = lbm_project("print(1)\n", lbm_freestanding)
+    val out_dir = lbr_temp("sysl-lbm-exe")
+    val said = lbr_cli(["sysl", "build", app, "--lib", bare, "-o", s"$out_dir/program"])
+
+    assert_eq(said.0, Failed)
+    assert_eq(said.1, "error: this package requires a heap and 'wasm32-freestanding' is freestanding, " +
+        "so nothing supplies 'malloc' and 'free' — the link would answer with an undefined symbol for " +
+        "each. Name a heap of your own in package.hocon's 'allocator' block, or build for a target " +
+        "that has a libc")
+    lbr_drop([bare, app, out_dir])
+end lbm_a_root_with_no_manifest_leaves_the_refusal
+
+// -- the header requirement -----------------------------------------------------------------------
+
+// Every command that compiles C asks it: the root's C is compiled into this build.
+@test("a root's header requirement is asked, naming the root, by every command that compiles its C")
+lbm_a_roots_header_requirement_is_asked()
+    if !lbr_ready() then return
+
+    val lib = lbm_headers("hroot", "value() -> int = 42", "the probe library's headers", "")
+    val app = lbm_project("print(hroot.value())\n", "")
+    val out_dir = lbr_temp("sysl-lbm-exe")
+    val expected = lbm_header_refusal(lib, "the probe library's headers")
+    val built = lbr_cli(["sysl", "build", app, "--lib", lib, "-o", s"$out_dir/program"])
+    val ran = lbr_cli(["sysl", "run", app, "--lib", lib])
+    // A tree with no test is answered here before any toolchain is asked (the reference asks anyway),
+    // so the one `test` is handed has something to link.
+    val with_test = lbr_tree(lbr_two("main.sysl", "print(hroot.value())\n", "t/t.sysl",
+        "module t\n\n@test(\"reaches the root\")\nreaches()\n    assert(hroot.value() == 42, \"value\")\n"))
+    val tested = lbr_cli(["sysl", "test", with_test, "--lib", lib])
+    val archived = lbr_cli(["sysl", "build-c", app, "--lib", lib])
+
+    assert_eq(built.0, Failed)
+    assert_eq(built.1, expected)
+    assert_eq(ran.0, Failed)
+    assert_eq(ran.1, expected)
+    assert_eq(tested.0, Failed)
+    assert_eq(tested.1, expected)
+    assert_eq(archived.0, Failed)
+    assert_eq(archived.1, expected)
+    lbr_drop([lib, app, with_test, out_dir])
+end lbm_a_roots_header_requirement_is_asked
+
+@test("and answered by the flag that names it")
+lbm_a_roots_header_requirement_answered_by_the_flag()
+    if !lbr_ready() then return
+
+    val lib = lbm_headers("hroot", "value() -> int = 42", "the probe library's headers", "")
+    val include = lbr_temp("sysl-lbm-inc")
+    val app = lbm_project("print(hroot.value())\n", "")
+
+    assert_eq(lbm_run(app, [lib], [s"probe=$include"]), "42\n")
+    lbr_drop([lib, include, app])
+end lbm_a_roots_header_requirement_answered_by_the_flag
+
+// `emit-llvm` compiles no C, so nothing is asked.
+@test("while emit-llvm, which compiles no C, does not ask it")
+lbm_emit_llvm_does_not_ask_a_roots_headers()
+    if !lbr_ready() then return
+
+    val lib = lbm_headers("hroot", "value() -> int = 42", "the probe library's headers", "")
+    val app = lbm_project("print(hroot.value())\n", "")
+    val said = lbr_cli(["sysl", "emit-llvm", s"$app/main.sysl", "--lib", lib])
+
+    assert_eq(said.0, Fine, said.1)
+    lbr_drop([lib, app])
+end lbm_emit_llvm_does_not_ask_a_roots_headers
+
+// A root handed to `build-lib` is there to type-check against: none of its C is compiled.
+@test("nor does build-lib, where a root is type-checked against and its C not compiled")
+lbm_build_lib_does_not_ask_a_roots_headers()
+    if !lbr_ready() then return
+
+    val lib = lbm_headers("hroot", "value() -> int = 42", "the probe library's headers", "")
+    val built = lbr_tree(lbr_one("libp/libp.sysl", "module libp\n\nv() -> int = hroot.value()\n"))
+    val said = lbr_cli(["sysl", "build-lib", built, "--lib", lib])
+
+    assert_eq(said.0, Fine, said.1)
+    assert_eq(said.1, s"checked $built")
+    lbr_drop([lib, built])
+end lbm_build_lib_does_not_ask_a_roots_headers
+
+@test("a root's requirement naming a variable says to set it, where nothing set it")
+lbm_a_roots_header_variable_unset()
+    if !lbr_ready() then return
+
+    val lib = lbm_headers("henv", "value() -> int = 44", "the probe headers", "SYSL_LBM_NEVER_SET")
+    val app = lbm_project("print(henv.value())\n", "")
+    val said = lbr_cli(["sysl", "run", app, "--lib", lib])
+
+    assert_eq(said.0, Failed)
+    assert_eq(said.1, s"error: $lib needs the 'probe' headers and nothing supplied them — the probe " +
+        "headers. Set SYSL_LBM_NEVER_SET, which is where this package's own ecosystem looks for it, or " +
+        "say where they are with '--include-path probe=<dir>'")
+    lbr_drop([lib, app])
+end lbm_a_roots_header_variable_unset
+
+// `HOME` is set wherever a test runs, which is what lets the environment's answer be asserted without
+// setting a variable in this process.
+@test("and is answered by that variable where it is set")
+lbm_a_roots_header_variable_set()
+    if !lbr_ready() then return
+
+    val lib = lbm_headers("henv", "value() -> int = 44", "the probe headers", "HOME")
+    val app = lbm_project("print(henv.value())\n", "")
+
+    assert_eq(lbm_run(app, [lib], []), "44\n")
+    lbr_drop([lib, app])
+end lbm_a_roots_header_variable_set
+
+// Two roots requiring one name are two requirements; the first given is the one said, and one flag
+// answers both.
+@test("two roots requiring one header name are asked in the order they were given")
+lbm_two_roots_requiring_one_header()
+    if !lbr_ready() then return
+
+    val one = lbm_headers("hroot", "value() -> int = 42", "the probe library's headers", "")
+    val two = lbm_headers("hroot2", "value2() -> int = 43", "the other probe headers", "")
+    val include = lbr_temp("sysl-lbm-inc")
+    val app = lbm_project("print(hroot.value() + hroot2.value2())\n", "")
+    val first = lbr_cli(["sysl", "run", app, "--lib", one, "--lib", two])
+    val second = lbr_cli(["sysl", "run", app, "--lib", two, "--lib", one])
+
+    assert_eq(first.0, Failed)
+    assert_eq(first.1, lbm_header_refusal(one, "the probe library's headers"))
+    assert_eq(second.0, Failed)
+    assert_eq(second.1, lbm_header_refusal(two, "the other probe headers"))
+    assert_eq(lbm_run(app, [two, one], [s"probe=$include"]), "85\n")
+    lbr_drop([one, two, include, app])
+end lbm_two_roots_requiring_one_header
+
+@test("while a root with no manifest requires nothing")
+lbm_a_root_with_no_manifest_requires_nothing()
+    if !lbr_ready() then return
+
+    val bare = lbm_root("noman", "value() -> int = 45", "")
+    val app = lbm_project("print(noman.value())\n", "")
+
+    assert_eq(lbm_run(app, [bare], []), "45\n")
+    lbr_drop([bare, app])
+end lbm_a_root_with_no_manifest_requires_nothing
+
+// -- the installed libraries ----------------------------------------------------------------------
+
+@test("a root's pkg_config library is probed, naming the root")
+lbm_a_roots_pkg_config_is_probed()
+    if !lbr_ready() then return
+
+    val lib = lbm_root("pkroot", "value() -> int = 46",
+        "package { name = \"pkroot\" }\nrequires { pkg_config { nosuchlib-9 = \"a library nobody has\" } }\n")
+    val app = lbm_project("print(pkroot.value())\n", "")
+    val said = lbr_cli(["sysl", "run", app, "--lib", lib])
+
+    assert_eq(said.0, Failed)
+    assert_eq(said.1, s"error: $lib needs the 'nosuchlib-9' library and 'pkg-config' knows no " +
+        "'nosuchlib-9' — a library nobody has. Install it, or say where it is with '--include-path " +
+        "nosuchlib-9=<dir>' and '--link-path <dir>'")
+    lbr_drop([lib, app])
+end lbm_a_roots_pkg_config_is_probed
+
+// The advice names both flags that stand in for a probe, the project's own need as much as a root's
+// -- it used to end at "Install it", leaving the other way out unsaid.
+@test("a pkg_config refusal names the flags that answer it instead of an install")
+lbm_a_pkg_config_refusal_names_the_flags()
+    if !lbr_ready() then return
+
+    val app = lbm_project("print(1)\n",
+        "package { name = \"app\" }\nrequires { pkg_config { nosuchlib-9 = \"a library nobody has\" } }\n")
+    val said = lbr_cli(["sysl", "run", app])
+
+    assert_eq(said.0, Failed)
+    assert_eq(said.1, "error: this project needs the 'nosuchlib-9' library and 'pkg-config' knows no " +
+        "'nosuchlib-9' — a library nobody has. Install it, or say where it is with '--include-path " +
+        "nosuchlib-9=<dir>' and '--link-path <dir>'")
+    lbr_drop([app])
+end lbm_a_pkg_config_refusal_names_the_flags
+
+// The half a refusal cannot show: what was found reaches the link line. Without the manifest the
+// same root is `Undefined symbols: _zlibVersion` at the link.
+@test("and what the probe found is linked, so a binding handed over by the flag links")
+lbm_a_roots_pkg_config_library_is_linked()
+    if !lbr_ready() then return
+
+    capture("/usr/bin/env", ["pkg-config", "--exists", "zlib"], "", [], true) match
+        Ok(out) -> if !out.status.ok() then return
+        Err(_) -> return
+
+    val lib = lbm_root("zroot",
+        "extern \"zlibVersion\" c_version() -> *u8\n\nhas() -> bool = c_version() != null",
+        "package { name = \"zroot\" }\nrequires { pkg_config { zlib = \"zlib\" } }\n")
+    val app = lbm_project("print(zroot.has())\n", "")
+
+    assert_eq(lbm_run(app, [lib], []), "true\n")
+    lbr_drop([lib, app])
+end lbm_a_roots_pkg_config_library_is_linked
+
+@test("while build-lib, which links nothing of a root's, does not probe it")
+lbm_build_lib_does_not_probe_a_roots_libraries()
+    if !lbr_ready() then return
+
+    val lib = lbm_root("pkroot", "value() -> int = 46",
+        "package { name = \"pkroot\" }\nrequires { pkg_config { nosuchlib-9 = \"a library nobody has\" } }\n")
+    val built = lbr_tree(lbr_one("libq/libq.sysl", "module libq\n\nv() -> int = pkroot.value()\n"))
+    val said = lbr_cli(["sysl", "build-lib", built, "--lib", lib])
+
+    assert_eq(said.0, Fine, said.1)
+    assert_eq(said.1, s"checked $built")
+    lbr_drop([lib, built])
+end lbm_build_lib_does_not_probe_a_roots_libraries
