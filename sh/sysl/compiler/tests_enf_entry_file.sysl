@@ -1,0 +1,415 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What a file's top level means, which depends on where the file sits (`reference/modules.md § Where
+// a program starts`).
+//
+// A file carrying statements is the one the program starts in, and its top level is a **body**: a
+// `val` there is a stack local initialized where it stands, and a function there is a nested
+// function capturing the locals above it. A file carrying no statements declares module members, as
+// does one with a `module` header. `static` is how a declaration in the body opts back into the
+// module.
+//
+// **Which file the program starts in is decided by statements, and what that file's declarations
+// mean is decided by which file it is.** Every expected output and diagnostic here was read out of
+// the reference compiler, run on the same files.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private enf_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end enf_ready
+
+// Writes the files of a project -- each a module directory (dotted, `""` for the root), a file name
+// and its text -- into a fresh directory, and answers that directory.
+private enf_tree(files: []const (string, string, string)) -> string
+    // `$TMPDIR` ends in a slash, and a diagnostic names the file by its normalized path.
+    val root = replace_all(make_temp_dir("sysl-enf").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+
+    for f in files
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    root
+end enf_tree
+
+// **What a program of these files PRINTS and whether it exited zero**, or what the build had to say
+// about it instead, with the project root written as `@`.
+private enf_outcome(files: []const (string, string, string)) -> (string, bool)
+    val root = enf_tree(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), root, "@")
+
+            remove_dir_all(root).unwrap_or(())
+            return (said, false)
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text, out.status.ok())
+end enf_outcome
+
+// A program of several files prints what is expected and exits zero.
+private enf_prints_in(files: []const (string, string, string), expected: string)
+    if !enf_ready() then return
+
+    val out = enf_outcome(files)
+
+    assert(out.1, s"it did not exit zero: ${out.0}")
+    assert_eq(out.0, expected)
+end enf_prints_in
+
+private enf_prints(text: string, expected: string) = enf_prints_in([("", "main.sysl", text)], expected)
+
+// A program of several files is refused, and what the build said holds `part`.
+private enf_refused_in(files: []const (string, string, string), part: string)
+    if !enf_ready() then return
+
+    val out = enf_outcome(files)
+
+    assert(!out.1, s"expected a refusal holding '$part', and it ran: ${out.0}")
+    assert(out.0.contains(part), s"expected '$part' in: ${out.0}")
+end enf_refused_in
+
+private enf_refused(text: string, part: string) = enf_refused_in([("", "main.sysl", text)], part)
+
+// The LLVM text `emit-llvm` prints for one file, or what the compiler said instead.
+private enf_ir(text: string) -> string
+    val root = enf_tree([("", "main.sysl", text)])
+
+    val out = emit_llvm_text(root + "/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end enf_ir
+
+private enf_has(text: string, part: string) =
+    assert(text.contains(part), s"expected '$part' in: $text")
+
+private enf_has_not(text: string, part: string) =
+    assert(!text.contains(part), s"expected no '$part' in: $text")
+
+// What `build-lib` says about a tree of files with no beginning anywhere: `ok`, or the refusal.
+private enf_library(files: []const (string, string, string)) -> string
+    val root = enf_tree(files)
+
+    val out = build_library_of(root, None) match
+        Err(why) -> replace_all(failure_text(why), root, "@")
+        Ok(_) -> "ok"
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end enf_library
+
+// -- a declaration in the file the program starts in is local to it ------------------------------
+
+// A `val` bound from what the statements above it did is what a script wants, and what a module
+// member could never be, a module member being bound before any statement runs.
+@test("so a 'val' runs its initializer where it is written, not ahead of the statements")
+enf_a_val_runs_where_it_is_written() =
+    enf_prints("noisy() -> int\n    print(\"second\")\n    7\nend noisy\n\nprint(\"first\")\n" +
+               "val n: int = noisy()\nprint(str(n))\n", "first\nsecond\n7\n")
+
+// A helper that reads nothing is the module's, so declaration order is free.
+@test("while one that reads nothing may be called above where it is written")
+enf_a_helper_reading_nothing_may_be_called_above() =
+    enf_prints("print(str(later()))\nlater() -> int = 1\n", "1\n")
+
+@test("but one that reads a binding may not, since its environment is formed where it is")
+enf_a_helper_reading_a_binding_may_not_be_called_above() =
+    enf_refused("print(str(later()))\nval base = 1\nlater() -> int = base\n",
+                "error: 'later' is declared below this call — the nested functions of a block share an " +
+                "environment formed where the first of them is written, so they may be called from there on")
+
+@test("and one bound from a variable the statements above it set is ordinary")
+enf_a_val_bound_from_a_variable() =
+    enf_prints("var total = 0\nfor i in 1..<4 do total += i\nval frozen = total\ntotal = 0\n" +
+               "print(str(frozen), str(total))\n", "6 0\n")
+
+// A local has no address in the object file, which is the observable half of "it is not a module
+// member".
+@test("so it is not laid into the object file the way a module member is")
+enf_a_local_val_is_not_laid_into_the_object_file()
+    if !enf_ready() then return
+
+    val ir = enf_ir("val k: [3]u32 = [7, 8, 9]\nprint(str(k[0]))\n")
+
+    enf_has(ir, "define ")
+    enf_has_not(ir, "@k = private constant [3 x i32]")
+end enf_a_local_val_is_not_laid_into_the_object_file
+
+@test("while 'static' on the same declaration puts it back")
+enf_static_puts_it_back()
+    if !enf_ready() then return
+
+    enf_has(enf_ir("static val k: [3]u32 = [7, 8, 9]\nprint(str(k[0]))\n"),
+            "@k = private constant [3 x i32] [i32 7, i32 8, i32 9]")
+
+// -- a function declared there is a nested function ----------------------------------------------
+
+@test("so it reads the bindings above it, with nothing passed in")
+enf_a_nested_function_reads_the_bindings_above() =
+    enf_prints("val base = 10\n\nplus(n: int) -> int = base + n\n\nprint(str(plus(5)))\n", "15\n")
+
+@test("and assigns to them, which is what an environment of addresses buys")
+enf_a_nested_function_assigns_to_them() =
+    enf_prints("var count = 0\n\nbump()\n    count += 1\nend bump\n\nbump()\nbump()\nprint(str(count))\n",
+               "2\n")
+
+@test("and the one-line '=' form writes one just as well")
+enf_the_one_line_form_writes_one() =
+    enf_prints("var count = 0\nbump() = count += 1\nbump()\nbump()\nprint(str(count))\n", "2\n")
+
+@test("while two of them call each other, whichever order they are written in")
+enf_two_call_each_other() =
+    enf_prints("even(n: int) -> bool = if n == 0 then true else odd(n - 1)\n" +
+               "odd(n: int) -> bool = if n == 0 then false else even(n - 1)\n\n" +
+               "print(str(even(4)), str(odd(4)))\n", "true false\n")
+
+// The group's environment is built after the last binding any of its functions reads, so a helper
+// written above the data it uses is ordinary.
+@test("and a binding written below the group is one it can capture too")
+enf_a_binding_below_the_group_is_captured() =
+    enf_prints("show() -> int = later\nval later = 1\nprint(str(show()))\n", "1\n")
+
+// -- what a helper may be depends on whether it reads anything, not on where it is written --------
+
+@test("so a generic one is ordinary")
+enf_a_generic_helper_is_ordinary() =
+    enf_prints("first[A, B](a: A, b: B) -> A = a\nprint(str(first(1, \"x\")))\n", "1\n")
+
+@test("and its address may be taken")
+enf_its_address_may_be_taken() =
+    enf_prints("twice(n: int) -> int = n * 2\nval f: *extern(int) -> int = &twice\nprint(str(f(21)))\n",
+               "42\n")
+
+@test("and another file reads it, since it is the module's")
+enf_another_file_reads_the_helper() =
+    enf_prints_in([("", "main.sysl", "print(str(doubled(4)))"),
+                   ("", "other.sysl", "doubled(n: int) -> int = n * 2")], "8\n")
+
+@test("while one that reads a binding is nested, and has no address")
+enf_a_nested_helper_has_no_address() =
+    enf_refused("val base = 2\nscaled(n: int) -> int = n * base\nval f: *extern(int) -> int = &scaled\n" +
+                "print(str(f(21)))\n",
+                "error: 'scaled' is a nested function, so it has no address to take — what would have to " +
+                "travel beside the address is the frame it reads, and a '*extern' is one word. A " +
+                "top-level function is what has an address")
+
+@test("and may not be generic")
+enf_a_nested_helper_may_not_be_generic() =
+    enf_refused("val base = 2\nscaled[T](n: T) -> int = base\nprint(str(scaled(1)))\n",
+                "error: 'scaled' is declared inside a function body and cannot be generic — the type " +
+                "arguments would have nowhere to come from, since nothing outside the body calls it")
+
+// `main` is the platform's symbol, not a name the program calls, so it is never one of the body's
+// nested functions -- and a file running a statement is a body whatever else it declares.
+@test("while 'main' is never one of them, however it is written")
+enf_main_is_never_a_nested_function() =
+    enf_refused("var count = 0\nprint(\"start\")\nmain()\n    print(count)\n",
+                "error: a program starts in one place, and this 'main' is a second — whichever of the two " +
+                "the program means, the other belongs inside it. The statements this program starts with " +
+                "are in @/main.sysl")
+
+@test("and neither may one that only calls such a helper")
+enf_a_caller_of_a_nested_helper_has_no_address() =
+    enf_refused("val base = 2\nscaled(n: int) -> int = n * base\ntwice(n: int) -> int = scaled(n)\n" +
+                "val f: *extern(int) -> int = &twice\nprint(str(f(21)))\n",
+                "error: 'twice' is a nested function, so it has no address to take")
+
+// -- 'static' is what a binding writes to belong to the module instead ---------------------------
+
+@test("so another file reads it")
+enf_another_file_reads_a_static_val() =
+    enf_prints_in([("", "main.sysl", "static val shared: int = 4\nprint(str(doubled()))"),
+                   ("", "other.sysl", "doubled() -> int = shared * 2")], "8\n")
+
+// A module member is bound before any statement runs, so its initializer cannot call something that
+// is part of the body.
+@test("while its initializer is bound before the body, so it may not call a helper that reads one")
+enf_a_static_initializer_may_not_call_a_nested_helper() =
+    enf_refused("var seed = 1\nhelper() -> int = seed\nstatic val n: int = helper()\nprint(str(n))\n",
+                "error: undefined function 'helper'\n --> @/main.sysl:3:21")
+
+// -- a modifier on the entry file's own binding says nothing, and is not refused for it -----------
+
+@test("a 'val'")
+enf_a_private_val_in_the_body() = enf_prints("private val a: int = 1\nprint(str(a))", "1\n")
+
+@test("and a 'var'")
+enf_a_private_var_in_the_body() = enf_prints("private var n: int = 1\nn += 1\nprint(str(n))", "2\n")
+
+// -- a 'static var' is module storage that may be written ----------------------------------------
+
+@test("so a helper reads and writes it, with nothing passed in")
+enf_a_helper_reads_and_writes_a_static_var() =
+    enf_prints("static var ticks: int = 0\n\ntick() = ticks += 1\n\ntick()\ntick()\ntick()\nprint(str(ticks))\n",
+               "3\n")
+
+@test("and another file writes it too, which a local could never allow")
+enf_another_file_writes_a_static_var() =
+    enf_prints_in([("", "main.sysl", "static var hits: int = 0\nbump()\nbump()\nprint(str(hits))"),
+                   ("", "other.sysl", "bump() = hits += 1")], "2\n")
+
+@test("its initializer may be absent, which a 'val' may not")
+enf_a_static_var_needs_no_initializer() =
+    enf_prints("static var slot: int\nslot = 7\nprint(str(slot))", "7\n")
+
+@test("and it is a 'global' rather than a 'constant', since the program writes it")
+enf_a_static_var_is_a_global()
+    if !enf_ready() then return
+
+    enf_has(enf_ir("static var n: int = 5\nn = 6\nprint(str(n))"), "@n = private global i32 5")
+
+@test("while a 'static val' of the same shape stays a constant")
+enf_a_static_val_stays_a_constant()
+    if !enf_ready() then return
+
+    enf_has(enf_ir("static val n: int = 5\nprint(str(n))"), "@n = private constant i32 5")
+
+// The storage is given a literal and then a built string, so the second store is the one with a
+// release to write; reading it back says the first was let go of without taking the second.
+@test("and it holds a type that owes a release, both given and then reassigned")
+enf_a_static_var_holds_a_counted_value() =
+    enf_prints("static var greeting: string = \"hello\"\ngreeting = greeting + \" \" + str(42)\nprint(greeting)",
+               "hello 42\n")
+
+@test("where a 'static val' given that same literal is admitted")
+enf_a_static_val_holds_a_literal_string() =
+    enf_prints("static val greeting: string = \"hello\"\nprint(greeting)", "hello\n")
+
+@test("though one with no zero must be given a value")
+enf_a_static_var_with_no_zero_needs_a_value() =
+    enf_refused("struct P\n    x: int\nend P\nstatic var p: &P\nprint(str(p.x))",
+                "error: 'p' needs a value: storage with no initializer starts at its type's zero, and &P " +
+                "has none — the same rule a local with no initializer is held to. A 'string' and a slice " +
+                "both start empty and need no value written; a reference and an enum need one")
+
+@test("it states its type, having no value to infer one from")
+enf_a_static_var_states_its_type() =
+    enf_refused("static var n = 1\nprint(str(n))",
+                "error: 'n' is module storage, and module storage states its type — write 'n: T'")
+
+@test("and a '@pure' function may not read one")
+enf_a_pure_function_may_not_read_a_static_var() =
+    enf_refused("static var seed: int = 1\n\n@pure\npeek() -> int = seed\n\nprint(str(peek()))\n",
+                "error: a '@pure' function reaches 'seed', which is storage outside the call and may change " +
+                "under it, and a caller of one may observe nothing about the call but its result\n" +
+                " --> @/main.sysl:4:17")
+
+// -- 'static' says nothing anywhere else, and is refused rather than ignored ----------------------
+
+@test("in a file that carries no statements, where everything is the module's already")
+enf_static_in_a_file_of_declarations() =
+    enf_refused_in([("", "main.sysl", "print(str(k))"), ("", "table.sysl", "static val k: int = 1")],
+                   "error: 'static' says a declaration belongs to the module rather than to the body of the " +
+                   "file the program starts in — and this file has no such body, so everything it declares " +
+                   "is the module's already\n --> @/table.sysl:1:1")
+
+@test("in a file with a module header, for the same reason")
+enf_static_in_a_file_with_a_header() =
+    enf_refused_in([("", "main.sysl", "print(str(tables.k))"),
+                    ("tables", "t.sysl", "module tables\nstatic val k: int = 1")],
+                   "and this file has no such body, so everything it declares is the module's already\n" +
+                   " --> @/tables/t.sysl:2:1")
+
+@test("inside a block, where there is no module member for a declaration to be instead")
+enf_static_inside_a_block() =
+    enf_refused("f() -> int\n    static val n: int = 1\n    n\nend f\nprint(str(f()))\n",
+                "error: 'static' marks a declaration at the top of the file the program starts in, saying " +
+                "it belongs to the module rather than to that file's body. A declaration inside a block is " +
+                "local to that block and there is no module member for it to be instead\n" +
+                " --> @/main.sysl:2:5")
+
+@test("and on a declaration that is a module member wherever it is written")
+enf_static_on_a_const() =
+    enf_refused("static const n: int = 1\nprint(str(n))",
+                "error: 'static' marks a 'val' or a 'var' in the file a program starts in, saying it " +
+                "belongs to the module rather than to that file's body. Everything else there is the " +
+                "module's already: a type, a constant, an 'extern' and an 'import' are wherever they are " +
+                "written, and a function is one unless it reads a binding of the body — which is a frame " +
+                "to carry, and the one thing a module member cannot have\n --> @/main.sysl:1:8")
+
+// A function is settled by what it reads, so the modifier would be either redundant or impossible.
+@test("and on a function, which is settled by what it reads rather than by a modifier")
+enf_static_on_a_function() =
+    enf_refused("static f() -> int = 1\nprint(str(f()))",
+                "and a function is one unless it reads a binding of the body — which is a frame to carry, " +
+                "and the one thing a module member cannot have\n --> @/main.sysl:1:8")
+
+// -- one file carries the statements the program runs --------------------------------------------
+
+@test("so a second that carries any is told which one already does")
+enf_a_second_file_of_statements() =
+    enf_refused_in([("", "main.sysl", "print(1)"), ("", "other.sysl", "print(2)")],
+                   "error: @/main.sysl already carries the statements this program runs, so @/other.sysl " +
+                   "may hold declarations only\n --> @/other.sysl:1:1")
+
+// A file of declarations is not a file of statements however much it declares.
+@test("while a file of nothing but declarations is not one of them")
+enf_a_file_of_declarations_is_not_a_beginning() =
+    enf_prints_in([("", "main.sysl", "print(str(size()))"),
+                   ("", "table.sysl", "val k: [2]int = [1, 2]\nsize() -> usize = k.len\nconst width: int = 2")],
+                  "2\n")
+
+@test("and a program with no statements at all runs and does nothing")
+enf_a_program_with_no_statements() = enf_prints("f() -> int = 1", "")
+
+// -- a file that names a module is not one of them, whatever else the program carries -------------
+
+// A library, which is what `build-lib` compiles: files, and no beginning anywhere.
+@test("so a library's private helper may read its module's storage")
+enf_a_library_private_helper_reads_storage()
+    if !enf_ready() then return
+
+    assert_eq(enf_library([("m", "a.sysl", "module m\n\nvar n: int = 1\n\nprivate peek() -> int = n")]), "ok")
+
+@test("and a generic one may too")
+enf_a_library_generic_helper_reads_storage()
+    if !enf_ready() then return
+
+    assert_eq(enf_library([("m", "a.sysl",
+                            "module m\n\nvar n: int = 0\n\ntally[T: Display](x: T) -> int\n    n += 1\n    n")]),
+              "ok")
+
+// Where the program's beginning is a declared `main`, nothing at any file's top level runs.
+@test("even where the program's beginning is a 'main' and so runs nothing at the top level")
+enf_a_library_beside_a_declared_main() =
+    enf_prints_in([("", "main.sysl", "main()\n    m.bump()\n    print(str(m.peek()))"),
+                   ("m", "a.sysl", "module m\n\nvar n: int = 1\n\nbump() = n += 1\n\n" +
+                                   "private seen() -> int = n\n\npeek() -> int = seen()")], "2\n")
+
+// A **headerless** file is still eligible, so where nothing runs its lone binding is a local of the
+// body it was written in -- which is what a sibling failing to see it says.
+@test("while a headerless one is still eligible, its binding still a local a sibling cannot see")
+enf_a_headerless_lone_binding_is_a_local() =
+    enf_refused_in([("", "a.sysl", "var n: int = 1"), ("", "b.sysl", "peek() -> int = n")],
+                   "error: undefined name 'n'\n --> @/b.sysl:1:17")
