@@ -1,0 +1,782 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+
+// The Markdown a `sysl doc` page is written as (`doc_markdown.sysl`): the frontmatter the `juicerapi`
+// theme reads, the index, the groups, each symbol's section, the index page, and the slug every
+// anchor is made of.
+//
+// **Every expected value is what the installed `sysl-doc` (0.0.152) wrote for the same input**, except
+// where a test says the page departs from it on purpose -- a defect of the reference the user decided
+// is fixed rather than copied, which the bootstrap is being changed to print as well.
+
+private dmd_unit(name: string, text: string) -> Program = parse(source_of(name, text)).program
+
+// The modules of these files, given as name, source, name, source...
+private dmd_modules(pairs: []const string, include_private: bool) -> Buf[DocModule]
+    var us: Buf[Program] = buf()
+    var i: usize = 0
+
+    while i + 1 < pairs.len
+        us.push(dmd_unit(pairs[i], pairs[i + 1]))
+        i += 2
+
+    build_doc_modules(us, include_private)
+end dmd_modules
+
+private dmd_only(text: string) -> DocModule
+    val ms = dmd_modules(["t.sysl", text], false)
+
+    assert_eq(ms.len(), 1)
+    ms.at(0)
+end dmd_only
+
+// The page of the one module in `text`.
+private dmd_page(text: string) -> string = doc_module_page(dmd_only(text), None).text
+
+private dmd_has(text: string, part: string)
+    if !text.contains(part) then assert_eq(text, s"<a text containing> ${part}")
+
+private dmd_lacks(text: string, part: string)
+    if text.contains(part) then assert_eq(text, s"<a text without> ${part}")
+
+private dmd_at(text: string, part: string) -> usize = text.index_of(part).unwrap()
+
+// The anchors a page links to, in the order its index lists them.
+private dmd_links(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var rest = text
+
+    loop
+        rest.index_of("](#") match
+            Some(at) ->
+                val tail = rest[(at + 3)..]
+                val end_at = tail.index_of(")").unwrap()
+
+                out.push(tail[0..<end_at])
+                rest = tail[end_at..]
+            None -> break
+
+    out
+end dmd_links
+
+private dmd_strs(ts: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for t in ts
+        out.push(t)
+
+    out
+end dmd_strs
+
+// -- the Markdown a page is written as -------------------------------------------------------------
+
+@test("carries the frontmatter the theme reads")
+dmd_carries_the_frontmatter()
+    val text = dmd_page("module sysl.text\n\nf() -> int = 1")
+
+    dmd_has(text, "layout: api-module")
+    dmd_has(text, "module: sysl.text")
+    // A generated body's `##` is already meant to be an <h2>; the site default assumes otherwise.
+    dmd_has(text, "headingShift: 0")
+    // The page names its own slug algorithm: a site already carrying hand-written prose cannot switch
+    // its key without rewriting the anchors its existing headings were published with.
+    dmd_has(text, "slugStyle: github")
+end dmd_carries_the_frontmatter
+
+@test("opens with an index whose links resolve to its own headings")
+dmd_opens_with_an_index()
+    val text = dmd_page("module m\n\nstarts_with(s: string) -> bool = true")
+
+    dmd_has(text, "## Index")
+    dmd_has(text, "[`starts_with`](#starts_with)")
+    dmd_has(text, "### `starts_with`")
+
+// juicer's default slug would answer `starts-with`; `slugStyle: github` is what makes the site and the
+// repository agree.
+@test("gives an underscore-bearing name GitHub's anchor and not juicer's default")
+dmd_github_anchor_for_an_underscore()
+    assert_eq(doc_slug("starts_with"), "starts_with")
+    assert_eq(doc_slug("Buf[T]"), "buft")
+    assert_eq(doc_slug("Reading These Pages"), "reading-these-pages")
+
+// sysl has overloading, so `parse_int` really is two declarations with one heading; an anchor table
+// keyed by heading text holds one entry for both.
+@test("gives two overloads of one name different anchors")
+dmd_two_overloads_two_anchors()
+    val text = dmd_page("module m\n\nf(s: string) -> int = 1\n\nf(s: []const u8) -> int = 2")
+
+    dmd_has(text, "[`f`](#f)")
+    dmd_has(text, "[`f`](#f-1)")
+
+@test("gives a type and its constructor different anchors, as GitHub does")
+dmd_type_and_constructor_two_anchors()
+    val text = dmd_page("module m\n\nbuf() -> Buf = Buf()\n\nstruct Buf\n    n: int")
+
+    dmd_has(text, "[`buf`](#buf)")
+    dmd_has(text, "[`Buf`](#buf-1)")
+
+@test("puts the signature in a fenced sysl block directly under the heading")
+dmd_signature_fenced_under_the_heading()
+    dmd_has(dmd_page("module m\n\nf(n: int) -> int = n"), "### `f`\n\n```sysl\nf(n: int) -> int\n```")
+
+@test("renders @param as a table")
+dmd_param_as_a_table()
+    val text = dmd_page("module m\n\n/** Adds.\n *\n * @param a the left side\n */\nadd(a: int) -> int = a")
+
+    dmd_has(text, "| Parameter | Description |")
+    dmd_has(text, "| `a` | the left side |")
+
+@test("renders @return as a labelled line")
+dmd_return_as_a_labelled_line()
+    dmd_has(dmd_page("module m\n\n/** Adds.\n *\n * @return the sum\n */\nadd(a: int) -> int = a"), "**Returns** the sum")
+
+@test("says a deprecation in a callout, above the prose rather than after it")
+dmd_deprecation_callout_above_the_prose()
+    val text = dmd_page("module m\n\n/** Old.\n *\n * @deprecated use `g` instead\n */\nf() -> int = 1")
+
+    dmd_has(text, "> [!WARNING]")
+    dmd_has(text, "**Deprecated.** use `g` instead")
+    assert(dmd_at(text, "[!WARNING]") < dmd_at(text, "Old."))
+end dmd_deprecation_callout_above_the_prose
+
+// Generating the real library put an "Undocumented" callout on 277 of 631 symbols, most of them
+// rightly bare.
+@test("leaves an undocumented symbol bare, because the empty space already says it")
+dmd_undocumented_left_bare()
+    val text = dmd_page("module m\n\nf() -> int = 1")
+
+    dmd_has(text, "### `f`")
+    dmd_lacks(text, "Undocumented")
+
+@test("escapes a pipe in prose, which would otherwise end a table cell")
+dmd_pipe_escaped_in_a_cell()
+    dmd_has(dmd_page("module m\n\n/** Or.\n *\n * @param f the a | b flags\n */\nf(f: int) -> int = f"), "the a \\| b flags")
+
+@test("quotes a summary in frontmatter always, since prose is arbitrary")
+dmd_summary_always_quoted()
+    dmd_has(dmd_page("module m\n\n/** Note: this one has a colon. */\n\nf() -> int = 1"), "summary: \"Note: this one has a colon.\"")
+
+@test("lists a type's members as a table under it")
+dmd_members_as_a_table()
+    val text = dmd_page("module m\n\nstruct S\n    v: int\n\n    get(self) -> int = self.v")
+
+    dmd_has(text, "| Member | Signature | Description |")
+    dmd_has(text, "| `get` |")
+
+@test("gives a module page a filename with no dots in it")
+dmd_filename_without_dots()
+    assert_eq(doc_file_name("sysl.text"), "sysl-text.md")
+
+@test("writes an index page linking every module")
+dmd_index_links_every_module()
+    val ms = dmd_modules(["a.sysl", "module sysl.a\n\nf() -> int = 1", "b.sysl", "module sysl.b\n\ng() -> int = 2"], false)
+    val page = doc_index_page(ms, "Standard library", None, None, None)
+
+    assert_eq(page.path, "_index.md")
+    dmd_has(page.text, "layout: api-index")
+    dmd_has(page.text, "[`sysl.a`](sysl-a/)")
+    dmd_has(page.text, "[`sysl.b`](sysl-b/)")
+end dmd_index_links_every_module
+
+// The module pages link outward; the note is how the index links back to the written half of the set.
+@test("puts the site's note under the index title and above the table")
+dmd_note_above_the_table()
+    val ms = dmd_modules(["a.sysl", "module sysl.a\n\nf() -> int = 1"], false)
+    val note = "The [written pages](/library/#modules) are the argument; this is the list."
+    val page = doc_index_page(ms, "Standard library", None, Some(note), None)
+
+    dmd_has(page.text, note)
+    assert(dmd_at(page.text, note) < dmd_at(page.text, "## Modules"))
+end dmd_note_above_the_table
+
+// The index with no note and no weight, whole: the reference compared a page without a note to one
+// built without the argument, which this port has no second spelling of, so the page itself is
+// pinned -- byte for byte what `sysl-doc` 0.0.152 writes for this module with `--title T`.
+private dmd_bare_index() -> string = raw"""
+        ---
+        title: "T"
+        layout: api-index
+        headingShift: 0
+        slugStyle: github
+        ---
+
+        ## Modules
+
+        | Module | Summary |
+        |---|---|
+        | [`sysl.a`](sysl-a/) |  |
+        """
+
+@test("leaves the index exactly as it was when no note is given")
+dmd_index_unchanged_without_a_note()
+    val ms = dmd_modules(["a.sysl", "module sysl.a\n\nf() -> int = 1"], false)
+
+    assert_eq(doc_index_page(ms, "T", None, None, None).text, dmd_bare_index())
+
+@test("puts the site's weight in the index frontmatter when it is given")
+dmd_weight_in_the_frontmatter()
+    val ms = dmd_modules(["a.sysl", "module sysl.a\n\nf() -> int = 1"], false)
+    val page = doc_index_page(ms, "Library API", None, None, Some(45))
+
+    dmd_has(page.text, "weight: 45")
+    assert(dmd_at(page.text, "weight: 45") < dmd_at(page.text, "---\n\n"))
+
+@test("leaves the index exactly as it was when no weight is given")
+dmd_index_unchanged_without_a_weight()
+    val ms = dmd_modules(["a.sysl", "module sysl.a\n\nf() -> int = 1"], false)
+    val page = doc_index_page(ms, "T", None, None, None)
+
+    assert_eq(page.text, dmd_bare_index())
+    dmd_lacks(page.text, "weight:")
+
+// A weight orders sections, and the module pages are inside one.
+@test("weighs the index and not the module pages")
+dmd_weighs_only_the_index()
+    val ms = dmd_modules(["a.sysl", "module sysl.a\n\nf() -> int = 1"], false)
+    val pages = doc_pages(ms, "Library API", None, None, Some(45))
+
+    assert_eq(pages.len(), 2)
+    assert_eq(pages.at(0).path, "_index.md")
+    dmd_has(pages.at(0).text, "weight: 45")
+    dmd_lacks(pages.at(1).text, "weight:")
+end dmd_weighs_only_the_index
+
+@test("gives the index the same per-page settings as a module page")
+dmd_index_has_the_page_settings()
+    val ms = dmd_modules(["a.sysl", "module sysl.a\n\nf() -> int = 1"], false)
+    val page = doc_index_page(ms, "Standard library", None, None, None)
+
+    dmd_has(page.text, "headingShift: 0")
+    dmd_has(page.text, "slugStyle: github")
+
+@test("emits no HTML and no CSS class, which is what keeps the file readable in a repository")
+dmd_no_html()
+    val text = dmd_page("module m\n\n/** Does a thing. */\nf(n: int) -> int = n")
+
+    dmd_lacks(text, "<div")
+    dmd_lacks(text, "class=")
+    dmd_lacks(text, "{#")
+
+// -- the slug agrees with the renderer's ------------------------------------------------------------
+
+// Every row the table holds that doc_slug answers differently, one to a line.
+private dmd_slug_misses(rows: Buf[(string, string)]) -> string
+    var out = str_builder()
+
+    for i in 0..<rows.len()
+        val (input, want) = rows.at(i)
+        val got = doc_slug(input)
+
+        if got != want then out.push(s"'${input}': juicer '${want}', here '${got}'\n")
+
+    out.finish()
+end dmd_slug_misses
+
+// The shapes the reference's SlugConformanceTests names, and every heading the reference's pages
+// carry for the standard library and `sysl-lang/parsing`, against juicer's committed answers
+// (`tests_dmd_slug_table.sysl` says where they came from).
+@test("on the shapes a generated heading actually has")
+dmd_slug_agrees_on_the_shapes()
+    assert_eq(dmd_slug_misses(dmd_slug_shapes()), "")
+    assert_eq(dmd_slug_misses(dmd_slug_headings()), "")
+
+// A sweep rather than a list: the hazard is a divergence nobody wrote a case for -- collapsing runs
+// of spaces, trimming a trailing hyphen, keeping a dot.
+@test("on every character below U+0300, alone and inside a word")
+dmd_slug_agrees_below_u0300()
+    val rows = dmd_slug_sweep()
+
+    assert_eq(rows.len(), 2 * (0x300 - 0x20))
+    assert_eq(dmd_slug_misses(rows), "")
+
+// `buf()` and `Buf` fold to one slug and the two `parse_int`s are a real overload. The backticked
+// `buf 1` const, listed first, is what makes `Buf` walk past a taken `buf-1` to `buf-2` -- written the
+// other way round every heading resolves on its first try and the walk is never entered.
+private dmd_slug_probe() -> string = raw"""
+        module probe
+
+        /** How many a fresh buffer holds. */
+        const `buf 1`: int = 1
+
+        /** Make an empty buffer. */
+        buf() -> int = 1
+
+        /** Read an int from a string. */
+        parse_int(s: string) -> int = 1
+
+        /** Read an int from bytes. */
+        parse_int(s: []const u8) -> int = 2
+
+        /** A growable buffer. */
+        struct Buf
+            n: usize
+
+        /** Two words with two spaces between them. */
+        struct `a  b`
+            n: usize
+
+        /** A point. */
+        struct Vec2
+            x: real
+            y: real
+
+        /** One cell of a grid. */
+        struct `buf 1`
+            n: usize
+
+        impl Display for Vec2
+            display(self) -> string = "v"
+        """
+
+@test("the page links to the anchors this case was built to produce")
+dmd_page_links_the_built_anchors()
+    val links = dmd_links(dmd_page(dmd_slug_probe()))
+
+    assert_eq(links, dmd_strs(["buf-1", "buf", "parse_int", "parse_int-1", "a--b", "buf-2", "buf-1-1", "vec2",
+                               "display-for-vec2"]))
+
+// The ids juicer 0.4.6 gave the `<h3>`s of this page when it rendered it, read back out of the HTML
+// (`juicer build` over the page `sysl-doc` 0.0.152 wrote for the same source, 2026-09-30). juicer's
+// numbering is private to its build pipeline, so the rendered page is the only way to ask it.
+@test("the renderer gives those headings exactly those ids")
+dmd_links_are_the_rendered_ids()
+    val rendered = dmd_strs(["buf-1", "buf", "parse_int", "parse_int-1", "a--b", "buf-2", "buf-1-1", "vec2",
+                             "display-for-vec2"])
+
+    assert_eq(dmd_links(dmd_page(dmd_slug_probe())), rendered)
+
+// -- whole pages -----------------------------------------------------------------------------------
+
+private dmd_geo() -> string = raw"""
+        /** Plane geometry for small programs. Points, shapes and the
+         * measures over them.
+         *
+         * A second paragraph about the module.
+         */
+
+        module demo.geo
+
+        /** A point in the plane. */
+        struct Point
+            x: real
+            y: real
+
+            /** The distance from the origin. */
+            norm(self) -> real = self.x * self.x + self.y * self.y
+
+            /** Whether it is the origin. */
+            is_zero -> bool = self.x == 0.0 && self.y == 0.0
+
+            private secret(self) -> int = 1
+
+        struct Empty
+        end Empty
+
+        /** How a shape answers its area.
+         * @tparam T unused here
+         */
+        trait Shape
+            type Unit
+            area(self) -> real
+
+        impl Display for Point
+            show(self) -> string = "p"
+
+        /** Largest coordinate allowed. */
+        const limit: usize = 512
+
+        /** Adds two points.
+         *
+         * Longer prose, with a | pipe.
+         *
+         * @param a the left side
+         * @param b the right side
+         * @return the sum
+         * @see sub
+         * @example add(p, q)
+         * @since 0.1
+         */
+        add(a: Point, b: Point) -> Point = Point(a.x + b.x, a.y + b.y)
+
+        /** Old.
+         * @deprecated use `add` instead
+         */
+        plus(a: Point, b: Point) -> Point = add(a, b)
+
+        point(x: real, y: real) -> Point = Point(x, y)
+
+        total(xs: ...int) -> int = 0
+
+        private helper() -> int = 2
+
+        private[geo] modwide() -> int = 3
+
+        enum Colour
+            Red = 1
+            Green = 2
+
+        apply[T: Display + Eq](f: int -> int, g: Fn(int) -> int, n: usize = 0) -> (int, T)
+            panic("x")
+        """
+
+private dmd_geo_sibling() -> string = raw"""
+        /** A sibling's prose, which must not become the module's headline. */
+
+        module demo.geo
+
+        /** Twice. */
+        double(n: int) -> int = n * 2
+
+        /** Parses a thing. */
+        parse_int(s: string) -> int = 0
+
+        /** Parses a thing, with a radix. */
+        parse_int(s: string, radix: int) -> int = 0
+        """
+
+// What `sysl-doc` 0.0.152 wrote for the two files with `-V 0.1.0`, less one table: its `Shape` carried
+// a `| Type parameter |` row for `T`, which `Shape` does not have. The doc check refuses that tag, and
+// leaving it off the page is the user's decided fix.
+private dmd_geo_expected() -> string = raw"""
+        ---
+        title: demo.geo
+        layout: api-module
+        headingShift: 0
+        slugStyle: github
+        module: demo.geo
+        summary: "Plane geometry for small programs."
+        since: "0.1.0"
+        ---
+
+        Points, shapes and the
+        measures over them.
+
+        A second paragraph about the module.
+
+        ## Index
+
+        [`limit`](#limit) [`add`](#add) [`apply`](#apply) [`double`](#double) [`parse_int`](#parse_int) [`parse_int`](#parse_int-1) [`plus`](#plus) [`point`](#point) [`total`](#total) [`Colour`](#colour) [`Empty`](#empty) [`Point`](#point-1) [`Shape`](#shape) [Display for Point](#display-for-point)
+
+        ## Constants
+
+        ### `limit`
+
+        ```sysl
+        const limit: usize = 512
+        ```
+
+        Largest coordinate allowed.
+
+        ## Functions
+
+        ### `add`
+
+        ```sysl
+        add(a: Point, b: Point) -> Point
+        ```
+
+        Adds two points.
+
+        Longer prose, with a | pipe.
+
+        | Parameter | Description |
+        |---|---|
+        | `a` | the left side |
+        | `b` | the right side |
+
+        **Returns** the sum
+
+        **See** sub
+
+        **Example** add(p, q)
+
+        **Since** 0.1
+
+        ### `apply`
+
+        ```sysl
+        apply[T: Display + Eq](f: int -> int, g: Fn(int) -> int, n: usize = 0) -> (int, T)
+        ```
+
+        ### `double`
+
+        ```sysl
+        double(n: int) -> int
+        ```
+
+        Twice.
+
+        ### `parse_int`
+
+        ```sysl
+        parse_int(s: string) -> int
+        ```
+
+        Parses a thing.
+
+        ### `parse_int`
+
+        ```sysl
+        parse_int(s: string, radix: int) -> int
+        ```
+
+        Parses a thing, with a radix.
+
+        ### `plus`
+
+        ```sysl
+        plus(a: Point, b: Point) -> Point
+        ```
+
+        > [!WARNING]
+        > **Deprecated.** use `add` instead
+
+        Old.
+
+        ### `point`
+
+        ```sysl
+        point(x: real, y: real) -> Point
+        ```
+
+        ### `total`
+
+        ```sysl
+        total(xs: ...int) -> int
+        ```
+
+        ## Types
+
+        ### `Colour`
+
+        ```sysl
+        enum Colour
+            Red = 1
+            Green = 2
+        ```
+
+        ### `Empty`
+
+        ```sysl
+        struct Empty
+        end Empty
+        ```
+
+        ### `Point`
+
+        ```sysl
+        struct Point
+            x: real
+            y: real
+        ```
+
+        A point in the plane.
+
+        | Member | Signature | Description |
+        |---|---|---|
+        | `norm` | `norm(self) -> real` | The distance from the origin. |
+        | `is_zero` | `is_zero -> bool` | Whether it is the origin. |
+
+        ## Traits
+
+        ### `Shape`
+
+        ```sysl
+        trait Shape
+            type Unit
+            area(self) -> real
+        ```
+
+        How a shape answers its area.
+
+        | Member | Signature | Description |
+        |---|---|---|
+        | `area` | `area(self) -> real` |  |
+
+        ## Implementations
+
+        ### Display for Point
+
+        ```sysl
+        impl Display for Point
+        ```
+        """
+
+// Byte for byte what `sysl-doc` 0.0.152 wrote for the same module with `--title "API reference"
+// --weight 5 -V 0.1.0 --note "See [the guide](../guide/)."`.
+private dmd_geo_index_expected() -> string = raw"""
+        ---
+        title: "API reference"
+        weight: 5
+        layout: api-index
+        headingShift: 0
+        slugStyle: github
+        version: "0.1.0"
+        ---
+
+        See [the guide](../guide/).
+
+        ## Modules
+
+        | Module | Summary |
+        |---|---|
+        | [`demo.geo`](demo-geo/) | Plane geometry for small programs. |
+        """
+
+@test("a module of two files is written as the reference writes it, whole")
+dmd_geo_page_whole()
+    val ms = dmd_modules(["geo.sysl", dmd_geo(), "measure.sysl", dmd_geo_sibling()], false)
+    val pages = doc_pages(ms, "API reference", Some("0.1.0"), Some("See [the guide](../guide/)."), Some(5))
+
+    assert_eq(pages.len(), 2)
+    assert_eq(pages.at(0).path, "_index.md")
+    assert_eq(pages.at(0).text, dmd_geo_index_expected())
+    assert_eq(pages.at(1).path, "demo-geo.md")
+    assert_eq(pages.at(1).text, dmd_geo_expected())
+end dmd_geo_page_whole
+
+private dmd_q() -> string = raw"""
+        /** A module whose first
+         * sentence spans two lines. And more.
+         */
+
+        module demo.q
+
+        /** Holder. */
+        struct Holder
+            x: int
+            private y: int
+
+        opaque struct Handle
+
+        /** An alias. */
+        type Meters = real
+
+        /** A C function. */
+        extern "abs" c_abs(n: int) -> int
+
+        /** A value. */
+        val zero: int = 0
+
+        /** Answers `a | b`.
+         * @param a bits
+         * @param nope not a parameter
+         */
+        bits(a: int) -> int = a
+        """
+
+// The page every one of the reference's defects this module reaches is fixed on. `sysl-doc` 0.0.152
+// wrote it differently in five places, each a decided fix: the two-line summary printed again as the
+// start of the prose (here only `And more.` follows it); the value, the extern and the alias absent
+// (here under `Values`, `Externs` and `Aliases`); `Handle` written `struct Handle` / `end Handle`
+// (here `opaque`); `Holder`'s private field unmarked (here `private y`); and a `| nope |` row for a
+// `@param` naming no parameter (here left out). The extern's signature is `doc_signature`'s, which
+// leaves the C symbol name (`"abs"`) out -- whether a page should show it is an open question, and
+// this expectation moves with that answer.
+private dmd_q_expected() -> string = raw"""
+        ---
+        title: demo.q
+        layout: api-module
+        headingShift: 0
+        slugStyle: github
+        module: demo.q
+        summary: "A module whose first sentence spans two lines."
+        ---
+
+        And more.
+
+        ## Index
+
+        [`zero`](#zero) [`bits`](#bits) [`c_abs`](#c_abs) [`Handle`](#handle) [`Holder`](#holder) [`Meters`](#meters)
+
+        ## Values
+
+        ### `zero`
+
+        ```sysl
+        val zero: int = 0
+        ```
+
+        A value.
+
+        ## Functions
+
+        ### `bits`
+
+        ```sysl
+        bits(a: int) -> int
+        ```
+
+        Answers `a | b`.
+
+        | Parameter | Description |
+        |---|---|
+        | `a` | bits |
+
+        ## Externs
+
+        ### `c_abs`
+
+        ```sysl
+        extern c_abs(n: int) -> int
+        ```
+
+        A C function.
+
+        ## Types
+
+        ### `Handle`
+
+        ```sysl
+        opaque struct Handle
+        ```
+
+        ### `Holder`
+
+        ```sysl
+        struct Holder
+            x: int
+            private y: int
+        ```
+
+        Holder.
+
+        ## Aliases
+
+        ### `Meters`
+
+        ```sysl
+        type Meters = real
+        ```
+
+        An alias.
+        """
+
+@test("a page lists values, externs and aliases, and carries each fixed defect of 0.0.152")
+dmd_fixed_defects_page_whole()
+    val ms = dmd_modules(["q.sysl", dmd_q()], false)
+
+    assert_eq(ms.len(), 1)
+    assert_eq(doc_module_page(ms.at(0), None).text, dmd_q_expected())
+
+// `sysl-doc` 0.0.152 wrote the default's string unescaped, so the fence held a raw line break. A
+// signature is sysl a reader could paste, and escaping it is a decided fix.
+@test("a string default is written escaped, as it would be typed")
+dmd_string_default_escaped()
+    dmd_has(dmd_page("module demo.s\n\nsay(sep: string = \"\\n\") -> int = 0"), "```sysl\nsay(sep: string = \"\\n\") -> int\n```")
+
+// `sysl-doc` 0.0.152 listed only public members even under `--private`; a maintainer reading their own
+// package is who asks for private declarations, and their private methods are part of that. A
+// decided fix.
+@test("a private method is listed under --private, and absent without it")
+dmd_private_member_under_private()
+    val src = "module m\n\nstruct S\n    v: int\n\n    get(self) -> int = self.v\n\n    private hidden(self) -> int = 1"
+    val shown = doc_module_page(dmd_modules(["t.sysl", src], true).at(0), None).text
+
+    dmd_has(shown, "| `hidden` |")
+    dmd_lacks(dmd_page(src), "hidden")
+end dmd_private_member_under_private

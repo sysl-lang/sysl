@@ -1,0 +1,356 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, Search}
+import sysl.fs.{entries, is_file, make_dir_all, make_temp_dir, read_text, write_text}
+
+// `sysl doc` at the command line: the arguments it takes, the exit code each path answers, and the
+// tree it reads.
+//
+// **Every sentence quoted was read out of the reference** -- `sysl-doc` 0.0.152, which the reference
+// compiler reaches as `sysl doc` -- on the same inputs. Two things differ by design and are asserted
+// as the shared sentence: this compiler is `sysl doc` where the reference's own binary is `sysl-doc`,
+// so the name in front of each sentence is the one the command was typed as; and the reference
+// writes a refusal to stderr where `run_cli` has one channel for every command.
+//
+// **`--site` is in `tests_dst_doc_site.sysl`**: the reference's three cases for it, its two parser
+// cases, and what running juicer's command line adds.
+
+// What one command line came to: the status the shell hears, and every line the command said.
+private dcl_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end dcl_run
+
+private dcl_has(said: string, part: string) -> bool = said.index_of(part).is_some()
+
+// The command line with nothing after `doc`.
+private dcl_parse_none() -> Result[DocOptions, string]
+    var none: Buf[string] = buf()
+
+    parse_doc_args(none.view())
+end dcl_parse_none
+
+private dcl_refusal(r: Result[DocOptions, string]) -> string = r match
+    Ok(_) -> ""
+    Err(m) -> m
+
+// The installed library, which is the tree the reference's own cases document.
+private dcl_library() -> Option[string] = std_root() match
+    Ok(root) -> Some(root)
+    Err(_) -> None
+
+// A fresh directory for one test's pages, which does not exist yet.
+private dcl_out(name: string) -> string = s"${make_temp_dir("sysl-doc-cli-").unwrap()}/$name"
+
+// A tree of two modules, `demo.a` and `demo.b`, each a directory of one file.
+private dcl_two_modules() -> string
+    val root = make_temp_dir("sysl-doc-tree-").unwrap()
+
+    make_dir_all(s"$root/a").unwrap()
+    make_dir_all(s"$root/b").unwrap()
+    write_text(s"$root/a/a.sysl", "module demo.a\n\n/** One. */\none() -> int = 1\n").unwrap()
+    write_text(s"$root/b/b.sysl", "module demo.b\n\n/** Two. */\ntwo() -> int = 2\n").unwrap()
+    root
+end dcl_two_modules
+
+// -- the argument parser ------------------------------------------------------------------------
+
+@test("defaults to the working directory and docs/api")
+dcl_defaults()
+    val opts = dcl_parse_none().unwrap()
+
+    assert_eq(opts.dir, ".")
+    assert_eq(opts.out, "docs/api")
+    assert(!opts.check)
+end dcl_defaults
+
+@test("takes the tree as a positional argument")
+dcl_positional_tree()
+    assert_eq(parse_doc_args(["library"]).unwrap().dir, "library")
+
+@test("takes -o and --out alike")
+dcl_out_both_spellings()
+    assert_eq(parse_doc_args(["-o", "x"]).unwrap().out, "x")
+    assert_eq(parse_doc_args(["--out", "y"]).unwrap().out, "y")
+
+@test("takes -n and --note alike, and has none by default")
+dcl_note_both_spellings()
+    assert_eq(parse_doc_args(["-n", "hello"]).unwrap().note.unwrap(), "hello")
+    assert_eq(parse_doc_args(["--note", "hello"]).unwrap().note.unwrap(), "hello")
+    assert(dcl_parse_none().unwrap().note.is_none())
+
+@test("names --note when its value is missing, as it does every other valued flag")
+dcl_note_needs_a_value()
+    // sysl-doc 0.0.152: "sysl-doc: '--note' needs a value after it"
+    assert_eq(dcl_refusal(parse_doc_args(["--note"])), "sysl doc: '--note' needs a value after it")
+
+@test("takes -w and --weight alike, and has none by default")
+dcl_weight_both_spellings()
+    assert_eq(parse_doc_args(["-w", "45"]).unwrap().weight.unwrap(), 45)
+    assert_eq(parse_doc_args(["--weight", "45"]).unwrap().weight.unwrap(), 45)
+    assert(dcl_parse_none().unwrap().weight.is_none())
+
+@test("refuses a --weight that is not a number, and says what it got")
+dcl_weight_not_a_number()
+    // sysl-doc 0.0.152: "sysl-doc: '--weight' needs a whole number, got 'nine'"
+    assert_eq(dcl_refusal(parse_doc_args(["--weight", "nine"])),
+              "sysl doc: '--weight' needs a whole number, got 'nine'")
+
+@test("names --weight when its value is missing, as it does every other valued flag")
+dcl_weight_needs_a_value()
+    assert_eq(dcl_refusal(parse_doc_args(["--weight"])), "sysl doc: '--weight' needs a value after it")
+
+@test("reads the flags that take no value")
+dcl_flags_without_values()
+    val opts = parse_doc_args(["--private", "--check"]).unwrap()
+
+    assert(opts.include_private)
+    assert(opts.check)
+end dcl_flags_without_values
+
+@test("names the flag when its value is missing, rather than complaining about the end of input")
+dcl_out_needs_a_value()
+    // sysl-doc 0.0.152: "sysl-doc: '--out' needs a value after it"
+    assert_eq(dcl_refusal(parse_doc_args(["--out"])), "sysl doc: '--out' needs a value after it")
+
+@test("refuses an unknown option")
+dcl_unknown_option()
+    // sysl-doc 0.0.152: "sysl-doc: unknown option '--nonsense'", a blank line, then the usage.
+    val said = dcl_refusal(parse_doc_args(["--nonsense"]))
+
+    assert(said.starts_with("sysl doc: unknown option '--nonsense'\n\nsysl doc — "))
+end dcl_unknown_option
+
+@test("answers the usage text for --help")
+dcl_help_is_the_usage()
+    assert(dcl_refusal(parse_doc_args(["--help"])).starts_with("sysl doc — "))
+
+// -- the exit code ------------------------------------------------------------------------------
+
+@test("is 0 when --help was asked for, because asking for help is not a mistake")
+dcl_help_exits_0()
+    val (code, said) = dcl_run(["sysl", "doc", "--help"])
+
+    assert_eq(code, 0)
+    assert_eq(said, doc_usage())
+end dcl_help_exits_0
+
+@test("is 1 for an unknown option")
+dcl_unknown_option_exits_1()
+    val (code, _) = dcl_run(["sysl", "doc", "--nonsense"])
+
+    assert_eq(code, 1)
+end dcl_unknown_option_exits_1
+
+@test("is 1 for a tree that holds no sysl")
+dcl_no_tree_exits_1()
+    // sysl-doc 0.0.152: "sysl-doc: nothing-here holds no sysl source", exit 1.
+    val missing = dcl_out("nothing-here")
+    val (code, said) = dcl_run(["sysl", "doc", missing])
+
+    assert_eq(code, 1)
+    assert_eq(said, s"sysl doc: $missing holds no sysl source")
+end dcl_no_tree_exits_1
+
+@test("is 0 after a successful generate")
+dcl_generate_exits_0()
+    val lib = dcl_library() match
+        Some(l) -> l
+        None -> return
+
+    val out = dcl_out("generate")
+    val (code, said) = dcl_run(["sysl", "doc", lib, "--out", out])
+
+    assert_eq(code, 0)
+    assert(said.starts_with("sysl doc: ") && said.ends_with(s" modules -> $out"))
+    assert(is_file(s"$out/_index.md"))
+end dcl_generate_exits_0
+
+@test("is 0 when --check finds the pages up to date")
+dcl_check_fresh_exits_0()
+    val lib = dcl_library() match
+        Some(l) -> l
+        None -> return
+
+    val out = dcl_out("check-fresh")
+
+    assert_eq(dcl_run(["sysl", "doc", lib, "--out", out]).0, 0)
+
+    val (code, said) = dcl_run(["sysl", "doc", lib, "--out", out, "--check"])
+
+    assert_eq(code, 0)
+    assert_eq(said, s"sysl doc: $out is up to date")
+end dcl_check_fresh_exits_0
+
+@test("is 1 when --check finds nothing generated at all")
+dcl_check_missing_exits_1()
+    val lib = dcl_library() match
+        Some(l) -> l
+        None -> return
+
+    val out = dcl_out("check-missing")
+    val (code, said) = dcl_run(["sysl", "doc", lib, "--out", out, "--check"])
+
+    assert_eq(code, 1)
+    assert(said.starts_with(s"sysl doc: $out is stale — "))
+    assert(said.ends_with("\n\nRegenerate with 'sysl doc' and commit the result."))
+    assert(!is_file(s"$out/_index.md"))
+end dcl_check_missing_exits_1
+
+@test("is 1 when --check finds a page that has drifted")
+dcl_check_drifted_exits_1()
+    val lib = dcl_library() match
+        Some(l) -> l
+        None -> return
+
+    val out = dcl_out("check-stale")
+
+    assert_eq(dcl_run(["sysl", "doc", lib, "--out", out]).0, 0)
+    write_text(s"$out/sysl-text.md", "stale\n").unwrap()
+
+    // sysl-doc 0.0.152 over a two-module tree with one page edited:
+    //   sysl-doc: refout2 is stale — 2 file(s) differ: / _index.md / demo-a.md / blank / Regenerate ...
+    val (code, said) = dcl_run(["sysl", "doc", lib, "--out", out, "--check"])
+
+    assert_eq(code, 1)
+    assert_eq(said, s"sysl doc: $out is stale — 1 file(s) differ:\n  sysl-text.md\n\n" +
+              "Regenerate with 'sysl doc' and commit the result.")
+end dcl_check_drifted_exits_1
+
+// -- reading a tree -----------------------------------------------------------------------------
+
+@test("answers every module of the standard library")
+dcl_reads_the_library()
+    val lib = dcl_library() match
+        Some(l) -> l
+        None -> return
+
+    val modules = read_doc_tree(lib, false, (_) -> ()).unwrap()
+    var text = false
+    var slices = false
+
+    for i in 0..<modules.len()
+        if modules.at(i).name == "sysl.text" then text = true
+        if modules.at(i).name == "sysl.slices" then slices = true
+
+    assert(text)
+    assert(slices)
+    assert(modules.len() >= 20)
+end dcl_reads_the_library
+
+@test("refuses a directory that holds no sysl at all, naming it")
+dcl_refuses_an_empty_tree()
+    // sysl-doc 0.0.152 on an empty directory: "sysl-doc: empty holds no sysl source"
+    val empty = make_temp_dir("sysl-doc-empty-").unwrap()
+
+    read_doc_tree(empty, false, (_) -> ()) match
+        Ok(_) -> assert(false)
+        Err(m) -> assert_eq(m, s"sysl doc: $empty holds no sysl source")
+end dcl_refuses_an_empty_tree
+
+// -- beyond the reference's own cases -----------------------------------------------------------
+
+@test("a tree of programs documents to nothing, and says why")
+dcl_programs_only()
+    // sysl-doc 0.0.152, verbatim after its own name.
+    val root = make_temp_dir("sysl-doc-progs-").unwrap()
+
+    write_text(s"$root/main.sysl", "print(1)\n").unwrap()
+
+    val (code, said) = dcl_run(["sysl", "doc", root])
+
+    assert_eq(code, 1)
+    assert_eq(said, s"sysl doc: nothing in $root declares a module, so there is no API to document — " +
+              "a program's entry file is a body rather than an importable surface")
+end dcl_programs_only
+
+@test("a file that does not parse stops the command, and nothing is written")
+dcl_unparsable_writes_nothing()
+    // sysl-doc 0.0.152: "error: ')' expected", the `-->` line at c.sysl:4:1, the quoted line, a caret.
+    val root = dcl_two_modules()
+    val out = dcl_out("unparsable")
+
+    write_text(s"$root/c.sysl", "module demo.c\n\nbad(\n").unwrap()
+
+    val (code, said) = dcl_run(["sysl", "doc", root, "-o", out])
+
+    assert_eq(code, 1)
+    // The sentence itself is the parser's, where this compiler says `expression expected` for the
+    // same input -- a parser divergence that is not this command's, so only the shape is held here.
+    assert(said.starts_with("error: "))
+    assert(dcl_has(said, "c.sysl:"))
+    assert(!is_file(s"$out/_index.md"))
+end dcl_unparsable_writes_nothing
+
+// The bootstrap's generator as fixed for 0.0.154 (bootstrap dev ebc57109) behaves this way;
+// 0.0.152 is the installed reference and does not, so the behaviour is the coordinator's statement
+// of the fix rather than a quoted run: a page whose module was removed is a difference, and a
+// regenerate deletes it.
+@test("--check names a page whose module was removed, and a regenerate removes it")
+dcl_check_names_an_orphan()
+    val root = dcl_two_modules()
+    val out = dcl_out("orphan")
+
+    assert_eq(dcl_run(["sysl", "doc", root, "-o", out]).0, 0)
+    assert(is_file(s"$out/demo-b.md"))
+
+    write_text(s"$root/b/b.sysl", "print(2)\n").unwrap()
+
+    val (code, said) = dcl_run(["sysl", "doc", root, "-o", out, "--check"])
+
+    assert_eq(code, 1)
+    assert_eq(said, s"sysl doc: $out is stale — 2 file(s) differ:\n  _index.md\n" +
+              "  demo-b.md (its module is gone)\n\nRegenerate with 'sysl doc' and commit the result.")
+
+    assert_eq(dcl_run(["sysl", "doc", root, "-o", out]).0, 0)
+    assert(!is_file(s"$out/demo-b.md"))
+    assert_eq(dcl_run(["sysl", "doc", root, "-o", out, "--check"]).0, 0)
+end dcl_check_names_an_orphan
+
+// Same provenance as the case above: only a page whose frontmatter says `layout: api-module` was
+// written by this command, so a hand-written page beside the generated ones is neither flagged nor
+// removed.
+@test("a hand-written page beside the generated ones is neither flagged nor removed")
+dcl_hand_written_page_is_kept()
+    val root = dcl_two_modules()
+    val out = dcl_out("hand-written")
+
+    assert_eq(dcl_run(["sysl", "doc", root, "-o", out]).0, 0)
+    write_text(s"$out/notes.md", "---\ntitle: notes\n---\n\nWritten by hand.\n").unwrap()
+
+    val (code, _) = dcl_run(["sysl", "doc", root, "-o", out, "--check"])
+
+    assert_eq(code, 0)
+    assert_eq(dcl_run(["sysl", "doc", root, "-o", out]).0, 0)
+    assert(is_file(s"$out/notes.md"))
+end dcl_hand_written_page_is_kept
+
+// The bootstrap for 0.0.154 (dev ebc57109) prints the compiler's own doc-check sentence as a
+// warning and still succeeds; 0.0.152 prints nothing. The behaviour is the coordinator's statement
+// of that fix. The tag itself is left off the page.
+@test("a doc tag naming no parameter is a warning, left off the page, and the command succeeds")
+dcl_bad_param_warns()
+    val root = make_temp_dir("sysl-doc-warn-").unwrap()
+    val out = dcl_out("warn")
+
+    write_text(s"$root/w.sysl",
+               "module demo.w\n\n/** Adds.\n *\n * @param nope gone\n */\nadd(a: int) -> int = a\n").unwrap()
+
+    val (code, said) = dcl_run(["sysl", "doc", root, "-o", out])
+
+    assert_eq(code, 0)
+    // The file is named from the root the walk made absolute, which a temporary directory's own
+    // spelling need not match character for character, so the line is held from the file's name on.
+    assert(said.ends_with("/w.sysl:5: warning: 'nope' is not a parameter of this declaration — it has a\n" +
+                          s"sysl doc: 1 module -> $out"))
+    assert(!dcl_has(read_text(s"$out/demo-w.md").unwrap(), "nope"))
+end dcl_bad_param_warns
+
+@test("`sysl --help` names the doc command")
+dcl_usage_names_doc()
+    assert(dcl_has(usage(), " | doc [-o <dir>] "))

@@ -1,0 +1,454 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{from_int, to_string, to_string_radix}
+import sysl.slices.contains
+import sysl.text.join
+
+// A declaration written back out as the source line a reader of an API reference wants to see --
+// the signature `sysl doc` prints above each symbol's prose.
+//
+// **It renders the parsed tree, not the source text and not the analyzed program.** A signature is
+// not a quotation: the page wants one normalized line with the parameters and the result on it,
+// and the body, the annotations and the author's line breaks gone. And what it renders is what was
+// WRITTEN -- the `usize` a parameter declared, an alias as its author named it, `Self` left as
+// `Self`, a defaulted type parameter showing its default -- so a module whose package does not
+// build still documents.
+//
+// **An expression is spelled out only in the forms that can stand in a type position or as a
+// default** -- a literal, a name, a qualified name, arithmetic, a tuple, a call, an array literal.
+// Anything else answers `…`: printing a guess about an arbitrary constant expression would say
+// something false with no way for a reader to tell.
+//
+// `show.sysl`'s `type_text` is not this: it is the spelling a diagnostic quotes, which renders an
+// array bound it cannot read as `…` and a result list without parentheses. The two answer different
+// readers and are kept apart.
+
+// -- types ----------------------------------------------------------------------------------------
+
+// A written type, as source text. Every `TypeKind` is here, so a kind added to the tree fails this
+// match rather than silently rendering as something else.
+doc_type_text(t: TypeRef) -> string = *t.kind match
+    NamedType(name, args) -> if args.is_empty() then name else s"${name}[${doc_type_list(args)}]"
+    ValueArgType(v) -> doc_expr_text(v)
+    PtrType(inner) -> s"*${doc_type_text(inner)}"
+
+    // `sync` sits after the sigil, because it qualifies the reference and not the referent.
+    RefType(inner, sync) -> if sync then s"&sync ${doc_type_text(inner)}" else s"&${doc_type_text(inner)}"
+    WeakType(inner) -> s"weak ${doc_type_text(inner)}"
+    ArrayType(length, elem, read_only) ->
+        val bound = length match
+            Some(n) -> doc_expr_text(n)
+            None -> ""
+
+        s"[${bound}]${if read_only then "const " else ""}${doc_type_text(elem)}"
+    VectorType(lanes, elem) -> s"<${doc_expr_text(lanes)}>${doc_type_text(elem)}"
+    VolatileType(inner) -> s"volatile ${doc_type_text(inner)}"
+
+    // A result list is written in parentheses in a signature, which is the only place one stands.
+    TupleType(parts, _) -> s"(${doc_type_list(parts)})"
+    PackType(name) -> s"..${name}"
+
+    // The bare arrow is the form a parameter uses, so it is rendered as the author chose it: turning
+    // it into `Fn(...)` would document every callback as something a caller cannot write there.
+    FnType(params, ret, bare) ->
+        if bare && params.len() == 1 then s"${doc_type_list(params)} -> ${doc_type_text(ret)}"
+        else if bare then s"(${doc_type_list(params)}) -> ${doc_type_text(ret)}"
+        else s"Fn(${doc_type_list(params)}) -> ${doc_type_text(ret)}"
+    CFnType(params, ret) -> s"*extern(${doc_type_list(params)}) -> ${doc_type_text(ret)}"
+    AssocType(base, member) -> s"${doc_type_text(base)}::${member}"
+    AssocArgType(name, typ) -> s"${name} = ${doc_type_text(typ)}"
+    SomeType(bounds) -> s"some ${doc_bound_list(bounds, " + ")}"
+end doc_type_text
+
+private doc_type_list(ts: Buf[TypeRef]) -> string
+    var parts: Buf[string] = buf()
+
+    for i in 0..<ts.len()
+        parts.push(doc_type_text(ts.at(i)))
+
+    join(parts.view(), ", ")
+
+// A trait as a bound names it -- `Display`, or `From[int]`.
+doc_bound_text(b: BoundRef) -> string =
+    if b.args.is_empty() then b.name else s"${b.name}[${doc_type_list(b.args)}]"
+
+private doc_bound_list(bs: Buf[BoundRef], sep: string) -> string
+    var parts: Buf[string] = buf()
+
+    for i in 0..<bs.len()
+        parts.push(doc_bound_text(bs.at(i)))
+
+    join(parts.view(), sep)
+
+// -- expressions ----------------------------------------------------------------------------------
+
+// An expression standing in a type position, or as a default. The fallback `…` is load bearing: it
+// says "there is a value here and it is not shown", which a reader can act on.
+//
+// **An integer is written in decimal**, whatever base the source used -- `0x10` reads `16` -- with
+// its suffix kept.
+//
+// **The tree records no parentheses, so they are put back from the operators' binding powers**: an
+// operand binding more loosely than the operator it sits under is parenthesized, and so is a right
+// operand binding exactly as tightly (every infix operator here groups to the left). So `-(3 * 4)`
+// and `(a + b) * 2` survive, and `a + b + c` gains nothing. The `sysl-doc` of 0.0.152 wrote operands
+// bare, printing those two as `-3 * 4` and `a + b * 2`; that is a decided fix.
+doc_expr_text(e: Expr) -> string = *e.kind match
+    IntLit(digits, base, suffix) -> s"${to_string(literal_value(digits, base))}${suffix}"
+    FloatLit(text, suffix) -> s"${text}${suffix}"
+    BoolLit(v) -> if v then "true" else "false"
+    StrLit(v) -> doc_string_text(v)
+    CharLit(c) -> s"'${doc_char_text(c)}'"
+    NullLit -> "null"
+    UnitLit -> "()"
+    Ident(name) -> name
+    Field(recv, name) -> s"${doc_expr_text(recv)}.${name}"
+    Unary(op, operand) -> s"${op}${doc_operand(operand, PrefixPower, false)}"
+    Binary(op, l, r) ->
+        val p = infix_power(op)
+
+        s"${doc_operand(l, p, false)} ${op} ${doc_operand(r, p, true)}"
+    Tuple(elements) -> s"(${doc_expr_list(elements)})"
+    Call(callee, args) -> s"${doc_expr_text(callee)}(${doc_expr_list(args)})"
+    ArrayLit(elements) -> s"[${doc_expr_list(elements)}]"
+    _ -> "\u{2026}"
+end doc_expr_text
+
+// One operand of an operator binding at `p`, in parentheses where the operand binds more loosely --
+// or, on the right, exactly as tightly, since that grouping is not the one the parser would read.
+private doc_operand(e: Expr, p: u8, right: bool) -> string
+    val text = doc_expr_text(e)
+
+    *e.kind match
+        Binary(op, _, _) ->
+            val q = infix_power(op)
+
+            if q < p || (right && q == p) then s"(${text})" else text
+        _ -> text
+end doc_operand
+
+private doc_expr_list(es: Buf[Expr]) -> string
+    var parts: Buf[string] = buf()
+
+    for i in 0..<es.len()
+        parts.push(doc_expr_text(es.at(i)))
+
+    join(parts.view(), ", ")
+
+// A character literal's interior, with the escape a reader would have had to write. The raw
+// codepoint would put a newline inside quotes on the page, which is wrong as sysl and invisible as
+// prose.
+doc_char_text(c: char) -> string
+    if c == '\'' then return "\\'"
+
+    doc_escaped_char(c) match
+        Some(e) -> e
+        None -> str(c)
+
+// A string default as it would have to be written in source: `"a\"b"`, `"\n"`.
+//
+// **The `sysl-doc` of 0.0.152 printed the decoded value between quotes**, so a `"\n"` default put a
+// raw newline inside the signature and a `"a\"b"` one closed the literal early. Escaping it is a
+// decided fix, not an oversight in the port.
+doc_string_text(v: string) -> string
+    val b = v.bytes
+    var out = "\""
+    var from: usize = 0
+
+    for i in 0..<b.len
+        // Only ASCII needs an escape, so a byte of a multi-byte character is never split from its
+        // neighbours: every byte of one is 0x80 or above and is copied as it stands.
+        val esc = if b[i] == u8('"') then Some("\\\"") else doc_escaped_char(char(b[i]))
+
+        esc match
+            Some(e) ->
+                out = out + v[from..<i] + e
+                from = i + 1
+            None -> ()
+
+    out + v[from..<b.len] + "\""
+end doc_string_text
+
+// The escape shared by a character and a string literal, or `None` where the character stands for
+// itself. The quote each form closes on is the caller's business.
+private doc_escaped_char(c: char) -> Option[string]
+    if c == '\n' then return Some("\\n")
+    if c == '\r' then return Some("\\r")
+    if c == '\t' then return Some("\\t")
+    if c == '\0' then return Some("\\0")
+    if c == '\\' then return Some("\\\\")
+
+    val n = u32(c)
+
+    if n < 0x20 || n == 0x7f then Some(s"\\u{${to_string_radix(from_int(long(n)), 16)}}") else None
+end doc_escaped_char
+
+// -- parameters -----------------------------------------------------------------------------------
+
+// A declaration's type-parameter list, `[...]`, or `""` where there is none. The three kinds share
+// one argument position, so they are told apart by what the declaration recorded: `values` marks a
+// value parameter and gives its type, `packs` a pack, and anything in neither is a type parameter.
+// A type parameter's default is shown; a value parameter's (`[const N: usize = 4]`) is not, because
+// a declaration's tree does not keep it -- only `TypeParams.value_defaults` does, and nothing copies
+// it onto the declaration.
+doc_tparams_text(names: Buf[string], bounds: Buf[NamedBounds], values: Buf[TypeBinding],
+        packs: Buf[string], defaults: Buf[TypeBinding]) -> string
+    if names.is_empty() then return ""
+
+    var parts: Buf[string] = buf()
+
+    for i in 0..<names.len()
+        val n = names.at(i)
+        val value = binding_named(values, n)
+        var head = n
+
+        value match
+            Some(t) -> head = s"const ${n}: ${doc_type_text(t)}"
+            None -> if contains(packs.view(), n) then head = s"..${n}"
+
+        // A value parameter states its type where a type parameter states its bounds, so the two
+        // never both apply; a pack takes bounds like any other.
+        var bound = ""
+
+        if value.is_none()
+            for j in 0..<bounds.len()
+                val nb = bounds.at(j)
+
+                if nb.name == n && !nb.bounds.is_empty() then bound = s": ${doc_bound_list(nb.bounds, " + ")}"
+
+        val default = binding_named(defaults, n) match
+            Some(t) -> s" = ${doc_type_text(t)}"
+            None -> ""
+
+        parts.push(s"${head}${bound}${default}")
+
+    s"[${join(parts.view(), ", ")}]"
+end doc_tparams_text
+
+private binding_named(bs: Buf[TypeBinding], name: string) -> Option[TypeRef]
+    for i in 0..<bs.len()
+        if bs.at(i).name == name then return Some(bs.at(i).typ)
+
+    None
+
+// One parameter as written: `xs: []const u8`, `n: usize = 0`, `f: -> int`, `xs: ...int`.
+//
+// **Two of those are properties of the PARAMETER rather than of its type.** A rest parameter's type
+// is the `[]const T` its body sees, and the caller writes `total(1, 2, 3)` -- so it renders as
+// `...T`. A by-name parameter's type is the thunk `() -> T` the body runs, and the caller writes an
+// ordinary expression -- so it renders as `-> T`. The `sysl-doc` of 0.0.152 rendered the thunk
+// whole, `f: -> () -> int`; that is a decided fix.
+doc_param_text(p: Param) -> string
+    val default = p.default match
+        Some(d) -> s" = ${doc_expr_text(d)}"
+        None -> ""
+
+    s"${p.name}: ${doc_param_type_text(p)}${default}"
+
+private doc_param_type_text(p: Param) -> string
+    if p.rest
+        *p.typ.kind match
+            ArrayType(None, elem, true) -> return s"...${doc_type_text(elem)}"
+            _ -> ()
+
+    if p.by_name
+        *p.typ.kind match
+            FnType(params, ret, _) -> if params.is_empty() then return s"-> ${doc_type_text(ret)}"
+            _ -> ()
+
+    doc_type_text(p.typ)
+end doc_param_type_text
+
+// A struct field: a parameter, marked where it is not public -- "there is state here you cannot
+// reach" is information rather than noise. The `sysl-doc` of 0.0.152 left the mark off; showing it
+// is a decided fix.
+doc_field_text(f: Param) -> string = s"${doc_vis_word(f.vis)}${doc_param_text(f)}"
+
+private doc_vis_word(v: Visibility) -> string = v match
+    Public -> ""
+    File -> "private "
+    Scoped(m) -> s"private[${m}] "
+
+private doc_params_text(ps: Buf[string], variadic: bool) -> string
+    var all = ps
+
+    if variadic then all.push("...")
+
+    s"(${join(all.view(), ", ")})"
+
+private doc_param_list(ps: Buf[Param]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for i in 0..<ps.len()
+        out.push(doc_param_text(ps.at(i)))
+
+    out
+
+// The result clause, absent rather than `-> ()` where nothing is returned: sysl writes a procedure
+// with no arrow at all.
+private doc_ret_text(ret: Option[TypeRef]) -> string = ret match
+    Some(r) -> s" -> ${doc_type_text(r)}"
+    None -> ""
+
+// -- declarations ---------------------------------------------------------------------------------
+
+// A free function: `split_once[T](s: []const T, sep: T) -> Option[usize]`.
+doc_func(f: FuncDecl) -> string
+    val tps = doc_tparams_text(f.tparams, f.bounds, f.tvalues, f.tpacks, f.tdefaults)
+
+    s"${f.name}${tps}${doc_params_text(doc_param_list(f.params), f.variadic)}${doc_ret_text(f.ret_type)}"
+
+// A member, its receiver written the way it was declared. An associated function has none, and the
+// absence is rendered by simply having no first parameter, as the source does.
+//
+// A property is called without parentheses, so an empty pair would document a call the language
+// refuses. A static one has no receiver either, so the word is the only thing saying a reader
+// writes `Type.name` rather than `value.name`.
+doc_method(m: MethodDecl) -> string
+    val tps = doc_tparams_text(m.tparams, m.bounds, m.tvalues, buf(), m.tdefaults)
+
+    if m.is_property && m.params.is_empty()
+        return s"${if m.is_static then "static " else ""}${m.name}${tps}${doc_ret_text(m.ret_type)}"
+
+    var all: Buf[string] = buf()
+
+    m.receiver match
+        Some(mode) -> all.push(doc_receiver_text(mode))
+        None -> ()
+
+    val ps = doc_param_list(m.params)
+
+    for i in 0..<ps.len()
+        all.push(ps.at(i))
+
+    s"${m.name}${tps}${doc_params_text(all, m.variadic)}${doc_ret_text(m.ret_type)}"
+end doc_method
+
+private doc_receiver_text(mode: RecvMode) -> string = mode match
+    ByValue -> "self"
+    ByPtr -> "*self"
+    ByRef(sync) -> if sync then "&sync self" else "&self"
+
+// A struct's head and its fields, as a block.
+//
+// **A struct with no fields carries its `end`**, which the language requires: it is the only thing
+// telling a deliberately empty body from one whose author forgot to indent it. **An opaque struct is
+// its head alone, with the word** -- it has no body to close, and its opaqueness is the whole of
+// what a reader needs. The `sysl-doc` of 0.0.152 rendered one as an empty struct; that is a decided
+// fix.
+doc_struct(s: StructDecl) -> string
+    val head = s"struct ${s.name}${doc_tparams_text(s.tparams, s.bounds, s.tvalues, buf(), s.tdefaults)}"
+
+    if s.opaque then return s"opaque ${head}"
+    if s.fields.is_empty() then return s"${head}\nend ${s.name}"
+
+    var lines: Buf[string] = buf()
+
+    lines.push(head)
+
+    for i in 0..<s.fields.len()
+        lines.push(s"    ${doc_field_text(s.fields.at(i))}")
+
+    join(lines.view(), "\n")
+end doc_struct
+
+// An enum's head and its variants, payloads included.
+doc_enum(e: EnumDecl) -> string
+    val underlying = e.underlying match
+        Some(u) -> s": ${doc_type_text(u)}"
+        None -> ""
+
+    var lines: Buf[string] = buf()
+
+    lines.push(s"enum ${e.name}${doc_tparams_text(e.tparams, e.bounds, e.tvalues, buf(), e.tdefaults)}${underlying}")
+
+    for i in 0..<e.variants.len()
+        lines.push(s"    ${doc_variant_text(e.variants.at(i))}")
+
+    join(lines.view(), "\n")
+end doc_enum
+
+// One variant: `None`, `Some(value: T)`, or `Red = 3` on a simple enum that pinned its constants. A
+// payload's fields are always named -- there is no positional `Some(T)` in sysl.
+doc_variant_text(v: EnumVariantDecl) -> string
+    if !v.fields.is_empty() then return s"${v.name}(${join(doc_param_list(v.fields).view(), ", ")})"
+
+    v.value match
+        Some(x) -> s"${v.name} = ${doc_expr_text(x)}"
+        None -> v.name
+
+// A trait's head, its associated types, then its members.
+doc_trait(t: TraitDecl) -> string
+    val supers = if t.supers.is_empty() then "" else s": ${doc_bound_list(t.supers, " + ")}"
+    var lines: Buf[string] = buf()
+
+    lines.push(s"trait ${t.name}${doc_tparams_text(t.tparams, t.bounds, buf(), buf(), t.tdefaults)}${supers}")
+
+    for i in 0..<t.assocs.len()
+        val a = t.assocs.at(i)
+        val bound = if a.bounds.is_empty() then "" else s": ${doc_bound_list(a.bounds, " + ")}"
+
+        lines.push(s"    type ${a.name}${bound}")
+
+    for i in 0..<t.methods.len()
+        lines.push(s"    ${doc_method(t.methods.at(i))}")
+
+    join(lines.view(), "\n")
+end doc_trait
+
+// A module constant: `const capacity: usize = 512`.
+doc_const(name: string, typ: TypeRef, value: Expr) -> string =
+    s"const ${name}: ${doc_type_text(typ)} = ${doc_expr_text(value)}"
+
+// An `impl` block's head -- the trait, its arguments, and the type it is for. Its members are
+// deliberately absent: their signatures are the trait's, already written where the trait is.
+doc_impl_head(i: ImplDecl) -> string
+    val tps = doc_tparams_text(i.tparams, i.bounds, i.tvalues, buf(), i.tdefaults)
+    val args = if i.trait_args.is_empty() then "" else s"[${doc_type_list(i.trait_args)}]"
+
+    s"impl${tps} ${i.trait_name}${args} for ${doc_type_text(i.for_type)}"
+
+// A `type` declaration: `type FRect = c.FRect`, `type Port = new u16 within 1..65535`. An alias is
+// public API -- a package names an ABI struct from its pleasant layer this way -- so it is rendered
+// rather than left off the page, which is what the `sysl-doc` of 0.0.152 did.
+doc_type_decl(d: TypeDecl) -> string
+    var out = s"type ${d.name} = ${if d.derived then "new " else ""}${doc_type_text(d.base)}"
+
+    d.range match
+        Some(r) -> out = out + s" within ${doc_expr_text(r.lo)}${if r.exclusive_hi then "..<" else ".."}${doc_expr_text(r.hi)}"
+        None -> ()
+
+    d.pred match
+        Some(e) -> out = out + s" where ${doc_expr_text(e)}"
+        None -> ()
+
+    out
+end doc_type_decl
+
+// A foreign function, as a caller reaches it: `extern "getpid" c_pid() -> int` renders as
+// `extern c_pid() -> int`. The symbol it links against
+// is how it binds rather than what a caller writes, so it is left off, as an attribute is.
+doc_extern(d: ExternDecl) -> string =
+    s"extern ${d.name}${doc_params_text(doc_param_list(d.params), d.variadic)}${doc_ret_text(d.ret_type)}"
+
+// A module `val`, its type where it wrote one: `val origin: Point = Point(0, 0)`.
+doc_val(name: string, typ: Option[TypeRef], value: Expr) -> string = typ match
+    Some(t) -> s"val ${name}: ${doc_type_text(t)} = ${doc_expr_text(value)}"
+    None -> s"val ${name} = ${doc_expr_text(value)}"
+
+// The signature of a declaration a reference page can list, or `None` for a statement that is not
+// one. Which of these a page actually lists -- and which visibilities -- is the model's decision.
+doc_signature(s: Stmt) -> Option[string] = *s.kind match
+    FuncDecl(d) -> Some(doc_func(d))
+    StructDecl(d) -> Some(doc_struct(d))
+    EnumDecl(d) -> Some(doc_enum(d))
+    TraitDecl(d) -> Some(doc_trait(d))
+    ConstDecl(name, typ, value, _) -> Some(doc_const(name, typ, value))
+    ImplDecl(d) -> Some(doc_impl_head(d))
+    TypeDecl(d) -> Some(doc_type_decl(d))
+    ExternDecl(d) -> Some(doc_extern(d))
+    ExternVarDecl(name, typ, _, _) -> Some(s"extern ${name}: ${doc_type_text(typ)}")
+    ValDecl(name, typ, value, _, _, _) -> Some(doc_val(name, typ, value))
+    _ -> None
