@@ -1,0 +1,786 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Control flow, parsed and run: `if`/`elif`/`else`, `while`, `for` and `loop`, their block and
+// one-line bodies, `break` and `continue` with and without a label or a value, a loop's `else`, and a
+// control-flow form standing where a value is wanted.
+//
+// **Every expected output here was read out of the reference compiler**, whose
+// `ControlFlowParserTests` and `ControlFlowRunTests` these are; the trees are this compiler's spelling
+// of the shapes those tests assert.
+
+private var cfr_library_cache: Buf[Program] = buf()
+private var cfr_library_read: bool = false
+
+private cfr_library() -> Buf[Program]
+    if cfr_library_read then return cfr_library_cache
+
+    cfr_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> cfr_library_cache = units
+
+    cfr_library_cache
+end cfr_library
+
+// Every run claim is about a whole program, so each wants the library and a toolchain.
+private cfr_ready() -> bool
+    if cfr_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end cfr_ready
+
+// **What a program PRINTS**, and that it exited cleanly -- a teardown that frees twice dies after
+// printing everything it was going to.
+private cfr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-control-flow").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"the program failed after printing: ${out.text}"
+end cfr_ran
+
+// -- parsing: blocks ---------------------------------------------------------------------------------
+
+@test("an if with no else has no else body")
+cfr_an_if_with_no_else_has_no_else_body()
+    assert_eq(pf("if x\n    print(1)\n"), "(if x (then (call print 1)))")
+
+@test("a while loop with a multi-statement body")
+cfr_a_while_loop_with_a_multi_statement_body()
+    assert_eq(pf("while i < 10\n    print(i)\n    i++\n"), "(while (cmp i < 10) (call print i) (post++ i))")
+
+@test("nested blocks dedent correctly")
+cfr_nested_blocks_dedent_correctly()
+    assert_eq(pf("while a\n    if b\n        print(1)\n    print(2)\n"),
+        "(while a (if b (then (call print 1))) (call print 2))")
+
+@test("a while with `do` before an indented block")
+cfr_a_while_with_do_before_an_indented_block()
+    assert_eq(pf("while i <= 10 do\n    i++\n"), "(while (cmp i <= 10) (post++ i))")
+
+// -- parsing: break, continue, and else --------------------------------------------------------------
+
+@test("a while with an else block")
+cfr_a_while_with_an_else_block()
+    assert_eq(pf("while c\n    print(1)\nelse\n    print(2)\n"), "(while c (call print 1) (else (call print 2)))")
+
+@test("a for with an else block")
+cfr_a_for_with_an_else_block()
+    assert_eq(pf("for x in xs\n    print(x)\nelse\n    print(0)\n"), "(for x xs (call print x) (else (call print 0)))")
+
+@test("a bare break and a break with a value")
+cfr_a_bare_break_and_a_break_with_a_value()
+    assert_eq(pf("while c\n    break\n    break 5\n"), "(while c (break) (break 5))")
+
+@test("continue parses as its own statement")
+cfr_continue_parses_as_its_own_statement()
+    assert_eq(pf("while c\n    continue\n"), "(while c (continue))")
+
+@test("an inline break inside an inline if")
+cfr_an_inline_break_inside_an_inline_if()
+    assert_eq(pf("for x in xs do if x then break x\n"), "(for x xs (if x (then (break x))))")
+
+@test("a labeled loop and labeled break/continue")
+cfr_a_labeled_loop_and_labeled_break_continue()
+    assert_eq(pf("'outer for i in xs do\n    break 'outer\n    continue 'outer\n"),
+        "(for 'outer i xs (break 'outer) (continue 'outer))")
+
+@test("a labeled break carrying a value")
+cfr_a_labeled_break_carrying_a_value()
+    assert_eq(pf("'scan while c\n    break 'scan 5\n"), "(while 'scan c (break 'scan 5))")
+
+// -- parsing: loop -----------------------------------------------------------------------------------
+
+@test("a break carrying a value")
+cfr_a_break_carrying_a_value()
+    assert_eq(pf("loop\n    break 5\n"), "(loop (break 5))")
+
+@test("a loop is a value, so it may sit on the right of a var")
+cfr_a_loop_may_sit_on_the_right_of_a_var()
+    assert_eq(pf("var x = loop\n    break 5\n"), "(var x (loop (break 5)))")
+
+// -- parsing: inline if/then/else ---------------------------------------------------------------------
+
+@test("an inline if/then/else")
+cfr_an_inline_if_then_else_parses()
+    assert_eq(pf("if x then print(1) else print(2)\n"), "(if x (then (call print 1)) (else (call print 2)))")
+
+@test("a block `then` with an inline `else`")
+cfr_a_block_then_with_an_inline_else()
+    assert_eq(pf("if x then\n    print(1)\nelse print(2)\n"), "(if x (then (call print 1)) (else (call print 2)))")
+
+@test("an inline then with else on its own line")
+cfr_an_inline_then_with_else_on_its_own_line()
+    assert_eq(pf("if cond then true_part()\nelse false_part()\n"),
+        "(if cond (then (call true_part)) (else (call false_part)))")
+
+// -- parsing: an if as a binding's initializer ---------------------------------------------------------
+
+@test("a block-bodied if on the right of a val")
+cfr_a_block_bodied_if_on_the_right_of_a_val()
+    assert_eq(pf("val x = if c\n    1\nelse\n    2\n"), "(val x (if c (then 1) (else 2)))")
+
+@test("a `then`-introduced block on the right of a var")
+cfr_a_then_introduced_block_on_the_right_of_a_var()
+    assert_eq(pf("var x = if c then\n    1\nelse\n    2\n"), pf("var x = if c\n    1\nelse\n    2\n"))
+    assert_eq(pf("var x = if c then\n    1\nelse\n    2\n"), "(var x (if c (then 1) (else 2)))")
+
+@test("the inline form, with a statement after it")
+cfr_the_inline_form_with_a_statement_after_it()
+    assert_eq(pf("val x = if c then 1 else 2\nprint(x)\n"), "(val x (if c (then 1) (else 2))) (call print x)")
+
+@test("a block-bodied if initializing a local, inside a function body")
+cfr_a_block_bodied_if_initializing_a_local()
+    assert_eq(pf("f(b: bool) -> int =\n    val x = if b then\n        1\n    else\n        2\n    x\n"),
+        "(fn f (b:bool) -> int (val x (if b (then 1) (else 2))) x)")
+
+@test("an elif chain on the right of a val")
+cfr_an_elif_chain_on_the_right_of_a_val()
+    assert_eq(pf("val x = if a then 1 elif b then 2 else 3\n"), "(val x (if a (then 1) (else (if b (then 2) (else 3)))))")
+
+@test("an initializer may start on the next line, and a lone branch collapses out of the block")
+cfr_an_initializer_may_start_on_the_next_line()
+    assert_eq(pf("val x =\n    if c then 1 else 2\n"), pf("val x = if c then 1 else 2\n"))
+
+// -- parsing: elif chains --------------------------------------------------------------------------
+
+@test("an elif chain nests into the else branch")
+cfr_an_elif_chain_nests_into_the_else_branch()
+    assert_eq(pf("if a then\n    print(1)\nelif b then\n    print(2)\nelse\n    print(3)\n"),
+        "(if a (then (call print 1)) (else (if b (then (call print 2)) (else (call print 3)))))")
+
+@test("an elif with no else leaves the innermost else empty")
+cfr_an_elif_with_no_else_leaves_the_innermost_else_empty()
+    assert_eq(pf("if a then x()\nelif b then y()\n"), "(if a (then (call x)) (else (if b (then (call y)))))")
+
+// -- parsing: optional end markers -------------------------------------------------------------------
+
+@test("`end if` closes an if/elif/else chain")
+cfr_end_if_closes_an_if_elif_else_chain()
+    val chain = "if a then\n    print(1)\nelif b then\n    print(2)\nelse\n    print(3)\n"
+
+    assert_eq(pf(s"${chain}end if\n"), pf(chain))
+
+@test("a statement after an end marker still parses")
+cfr_a_statement_after_an_end_marker_still_parses()
+    assert_eq(pf("while c\n    print(1)\nend while\nprint(2)\n"), "(while c (call print 1)) (call print 2)")
+
+@test("`end` stays usable as an ordinary identifier")
+cfr_end_stays_usable_as_an_ordinary_identifier()
+    assert_eq(pf("var end = 5\nprint(end)\n"), "(var end 5) (call print end)")
+
+// -- running: branches and ranges ------------------------------------------------------------------
+
+@test("a while loop sums 1..10")
+cfr_a_while_loop_sums_1_to_10()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var sum = 0
+        var i = 1
+        while i <= 10
+            sum = sum + i
+            i++
+        print(sum)
+        """), "55\n")
+
+@test("an empty for range runs its body zero times")
+cfr_an_empty_for_range_runs_its_body_zero_times()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var s = 0
+        for i in 5..<5 do s += 1
+        for i in 5..4 do s += 100
+        print(s)
+        """), "0\n")
+
+@test("an inclusive range of one element runs the body once")
+cfr_an_inclusive_range_of_one_element_runs_once()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var s = 0
+        for i in 7..7 do s += i
+        print(s)
+        """), "7\n")
+
+@test("if/else picks the right branch")
+cfr_if_else_picks_the_right_branch()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        parity(n: int) -> string
+            if n % 2 == 0
+                "even"
+            else
+                "odd"
+        end parity
+        print(parity(4), parity(7))
+        """), "even odd\n")
+
+@test("an elif chain picks the matching branch")
+cfr_an_elif_chain_picks_the_matching_branch()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var n = 2
+        if n == 1 then print("one")
+        elif n == 2 then print("two")
+        elif n == 3 then print("three")
+        else print("many")
+        """), "two\n")
+
+@test("an elif chain falling through to else")
+cfr_an_elif_chain_falling_through_to_else()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var n = 9
+        if n == 1 then print("one")
+        elif n == 2 then print("two")
+        else print("many")
+        """), "many\n")
+
+@test("an inline while body with `do`")
+cfr_an_inline_while_body_with_do()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var i = 0
+        while i < 3 do i++
+        print(i)
+        """), "3\n")
+
+@test("an inline if/then/else runs")
+cfr_an_inline_if_then_else_runs()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran("if 1 < 2 then print(\"yes\") else print(\"no\")\n"), "yes\n")
+
+@test("an inline then with else on the next line")
+cfr_an_inline_then_with_else_on_the_next_line()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        if 1 < 2 then print("t")
+        else print("f")
+        """), "t\n")
+
+@test("a program using end markers runs correctly")
+cfr_a_program_using_end_markers_runs_correctly()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var i = 0
+        var sum = 0
+        while i < 5
+            sum = sum + i
+            i++
+        end while
+        if sum == 10 then
+            print("ten")
+        else
+            print("other")
+        end if
+        """), "ten\n")
+
+@test("a factorial loop")
+cfr_a_factorial_loop()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var n = 5
+        var fact = 1
+        var k = 2
+        while k <= n
+            fact = fact * k
+            k++
+        print("5! =", fact)
+        """), "5! = 120\n")
+
+@test("an inclusive for range sums its bounds")
+cfr_an_inclusive_for_range_sums_its_bounds()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var total = 0
+        for i in 1..5
+            total = total + i
+        print(total)
+        """), "15\n")
+
+@test("an exclusive for range stops before its upper bound")
+cfr_an_exclusive_for_range_stops_before_its_upper_bound()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var total = 0
+        for i in 0..<5 do total = total + i
+        print(total)
+        """), "10\n")
+
+@test("nested for loops accumulate")
+cfr_nested_for_loops_accumulate()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var grid = 0
+        for i in 0..<3
+            for j in 0..<3
+                grid = grid + i * j
+        print(grid)
+        """), "9\n")
+
+@test("if used as a value binds the taken branch")
+cfr_if_used_as_a_value_binds_the_taken_branch()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var n = 7
+        var label = if n % 2 == 0 then "even" else "odd"
+        print(label)
+        """), "odd\n")
+
+@test("a block-bodied if used as a value yields its branch's trailing expression")
+cfr_a_block_bodied_if_yields_its_trailing_expression()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var n = 7
+        var doubled = if n % 2 == 0 then
+            val half = n / 2
+            half * 2
+        else
+            val up = n + 1
+            up * 10
+        print(doubled)
+        """), "80\n")
+
+@test("an if in a &T context unifies a value branch with a reference branch")
+cfr_an_if_in_a_ref_context_unifies_its_branches()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        origin() -> &Point = Point(9, 9)
+        pick(c: bool) -> int
+            var q: &Point = origin()
+            var p: &Point = if c then Point(1, 2) else q
+            p.x
+        print(pick(true), pick(false))
+        """), "1 9\n")
+
+@test("a for loop variable shadows an outer variable")
+cfr_a_for_loop_variable_shadows_an_outer_variable()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var i = 100
+        var sum = 0
+        for i in 1..3
+            sum = sum + i
+        print(i, sum)
+        """), "100 6\n")
+
+// -- running: loops as expressions -----------------------------------------------------------------
+
+@test("a for that breaks with a value yields it, skipping the else")
+cfr_a_for_that_breaks_with_a_value_yields_it()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var xs = [10, 20, 30, 40]
+        var found = for x in xs
+            if x == 30 then break x
+        else -1
+        print(found)
+        """), "30\n")
+
+@test("a for that finds nothing takes the else value")
+cfr_a_for_that_finds_nothing_takes_the_else_value()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var xs = [10, 20, 30, 40]
+        var found = for x in xs
+            if x == 99 then break x
+        else -1
+        print(found)
+        """), "-1\n")
+
+@test("a while true yields its break value")
+cfr_a_while_true_yields_its_break_value()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var n = 0
+        var r = while true
+            n += 1
+            if n == 7 then break n * 100
+        else 0
+        print(r)
+        """), "700\n")
+
+@test("continue skips the rest of the iteration")
+cfr_continue_skips_the_rest_of_the_iteration()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var sum = 0
+        for i in 1..10
+            if i % 2 == 0 then continue
+            sum += i
+        print(sum)
+        """), "25\n")
+
+@test("break leaves only the innermost loop")
+cfr_break_leaves_only_the_innermost_loop()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var hits = 0
+        var total = 0
+        for i in 1..3
+            for j in 0..<5
+                if j == 2 then break
+                total += i * 10 + j
+            hits += 1
+        print(hits, total)
+        """), "3 123\n")
+
+@test("an else on a unit loop runs only on normal completion")
+cfr_an_else_on_a_unit_loop_runs_only_on_normal_completion()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        search(hit: bool)
+            for i in 0..<3
+                if i == 1 then
+                    if hit then break
+                print(i)
+            else print(99)
+        search(false)
+        print(0)
+        search(true)
+        """), "0\n1\n2\n99\n0\n0\n")
+
+@test("a loop is a function's tail expression")
+cfr_a_loop_is_a_functions_tail_expression()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        firstOver(limit: int) -> int
+            for x in [3, 6, 9]
+                if x > limit then break x
+            else -1
+        print(firstOver(5), firstOver(100))
+        """), "6 -1\n")
+
+// -- running: loop -----------------------------------------------------------------------------------
+
+@test("a loop runs until something breaks out of it")
+cfr_a_loop_runs_until_something_breaks_out()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var i = 0
+        loop
+            i += 1
+            if i == 4 then break
+        print(i)
+        """), "4\n")
+
+@test("a loop yields its break value with no else to write")
+cfr_a_loop_yields_its_break_value()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var n = 0
+        var r = loop
+            n += 1
+            if n == 7 then break n * 100
+        print(r)
+        """), "700\n")
+
+@test("an inline loop body with `do`")
+cfr_an_inline_loop_body_with_do()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var i = 0
+        loop do if i == 3 then break else i++
+        print(i)
+        """), "3\n")
+
+@test("continue starts the next iteration")
+cfr_continue_starts_the_next_iteration()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var i = 0
+        var sum = 0
+        loop
+            i += 1
+            if i > 10 then break
+            if i % 2 == 0 then continue
+            sum += i
+        print(sum)
+        """), "25\n")
+
+@test("a labeled break leaves an outer loop from inside an inner one")
+cfr_a_labeled_break_leaves_an_outer_loop()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var i = 0
+        var j = 0
+        var found = 'outer loop
+            j = 0
+            loop
+                j += 1
+                if i * j == 12 then break 'outer i * 10 + j
+                if j == 5 then break
+            i += 1
+        print(found)
+        """), "34\n")
+
+@test("a loop with no break types as never")
+cfr_a_loop_with_no_break_types_as_never()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        spin(n: int) -> int
+            if n > 0 then return n
+            loop
+                print("x")
+        print(spin(5))
+        """), "5\n")
+
+@test("a break in a &T context boxes its value")
+cfr_a_break_in_a_ref_context_boxes_its_value()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        var n = 0
+        var p: &Point = loop
+            n += 1
+            if n == 3 then break Point(n, n * 2)
+        print(p.x, p.y)
+        """), "3 6\n")
+
+@test("a return leaves a loop that has no break")
+cfr_a_return_leaves_a_loop_that_has_no_break()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        first_square_over(limit: int) -> int
+            var i = 0
+            loop
+                i += 1
+                if i * i > limit then return i * i
+        print(first_square_over(20), first_square_over(100))
+        """), "25 121\n")
+
+@test("a loop inside a for catches the unlabeled break")
+cfr_a_loop_inside_a_for_catches_the_unlabeled_break()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var total = 0
+        for i in 1..3
+            var j = 0
+            loop
+                j += 1
+                if j == i then break
+            total += i * 10 + j
+        print(total)
+        """), "66\n")
+
+@test("a loop that owns values neither leaks nor frees twice")
+cfr_a_loop_that_owns_values_neither_leaks_nor_frees_twice()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var total = 0
+        var k = 0
+        loop
+            var s = "ab" + "cd"
+            total += int(s[0])
+            k += 1
+            if k == 2000 then break
+        print(total)
+        """), "194000\n")
+
+// -- running: labeled loops ----------------------------------------------------------------------------
+
+@test("a labeled break leaves the outer loop from inside the inner")
+cfr_a_labeled_break_leaves_the_outer_for()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var found = -1
+        var hits = 0
+        'outer for i in 0..<4
+            for j in 0..<4
+                if i * 4 + j == 7 then
+                    found = i * 10 + j
+                    break 'outer
+            hits += 1
+        print(found, hits)
+        """), "13 1\n")
+
+@test("a labeled continue advances the outer loop")
+cfr_a_labeled_continue_advances_the_outer_loop()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var sum = 0
+        'rows for i in 0..<3
+            for j in 0..<3
+                if j == 1 then continue 'rows
+                sum += i * 10 + j
+        print(sum)
+        """), "30\n")
+
+@test("a labeled break carries a value out of the named loop")
+cfr_a_labeled_break_carries_a_value_out_of_the_named_loop()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        firstSquareOver(limit: int) -> int
+            'scan for i in 0..<100
+                for j in 0..<100
+                    if i * j > limit then break 'scan i * 1000 + j
+            else -1
+        print(firstSquareOver(50), firstSquareOver(100000))
+        """), "1051 -1\n")
+
+@test("an unlabeled break beside a label still leaves only the inner loop")
+cfr_an_unlabeled_break_beside_a_label_leaves_the_inner_loop()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var total = 0
+        'outer for i in 1..3
+            for j in 0..<5
+                if j == 2 then break
+                total += i * 10 + j
+        print(total)
+        """), "123\n")
+
+@test("a break to a middle label leaves two of three loops")
+cfr_a_break_to_a_middle_label_leaves_two_of_three_loops()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var log = 0
+        for a in 0..<3
+            'mid for b in 0..<3
+                for c in 0..<3
+                    if c == 1 then break 'mid
+                    log += a * 100 + b * 10 + c
+            log += 100000
+        print(log)
+        """), "300300\n")
+
+@test("a labeled break through owning loops neither leaks nor frees twice")
+cfr_a_labeled_break_through_owning_loops()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var total = 0
+        for k in 1..2000
+            'find for i in 0..<8
+                for j in 0..<8
+                    var s = "ab" + "cd"
+                    if i == 3 then break 'find
+                    total += int(s[0])
+        print(total)
+        """), "4656000\n")
+
+// -- running: control flow on the right of an assignment -----------------------------------------------
+
+@test("a compound assignment accumulates a match value")
+cfr_a_compound_assignment_accumulates_a_match_value()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var total = 0
+        for i in 0..<4
+            total += i % 2 == 0 match
+                true -> 10
+                false -> 1
+        print(total)
+        """), "22\n")
+
+@test("a plain reassignment takes an if value")
+cfr_a_plain_reassignment_takes_an_if_value()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var x = 0
+        x = if 3 > 2 then 100 else 200
+        print(x)
+        """), "100\n")
+
+@test("a reassignment takes a match value")
+cfr_a_reassignment_takes_a_match_value()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var y = 0
+        y = 5 match
+            5 -> 50
+            else 0
+        print(y)
+        """), "50\n")
+
+@test("a compound assignment takes a loop's break value")
+cfr_a_compound_assignment_takes_a_loops_break_value()
+    if !cfr_ready() then return
+
+    assert_eq(cfr_ran(raw"""
+        var acc = 100
+        acc += for k in 0..<10
+            if k * k > 20 then break k
+        else -1
+        print(acc)
+        """), "105\n")
