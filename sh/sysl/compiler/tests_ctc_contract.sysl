@@ -1,0 +1,371 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Design by contract and the constrained types it sits beside (`reference/errors.md`): a `require`
+// is checked on entry and an `ensure` before every return, `result` and `old` mean something only
+// inside an `ensure`, and every clause stands at the top of the body. A satisfied clause is
+// invisible and a violated one traps, so each passing program is paired with the adjacent violation
+// that must stop it. A constrained type's compound assignment computes at the base and lands back
+// through the same checks a plain store makes, and a derived (`new`) value needs its cast in every
+// position where a transparent one needs none.
+//
+// **Every output, exit status, message and location here was read out of the reference compiler**
+// (0.0.153) on the same program. A trap is the status 133 the shell reports for one.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ctc_root(main: string) -> string
+    val root = make_temp_dir("sysl-ctc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end ctc_root
+
+// What the program in `root` does: what it printed and the status it left with, as a shell reports
+// one. A failure to build is its message and `-1`, which no program exits with.
+private ctc_outcome_in(root: string) -> (string, int)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end ctc_outcome_in
+
+// The program prints exactly this and leaves with this status -- both, so that a build that failed
+// cannot pass for a program that stopped. Returns at once without the library.
+private ctc_leaves(main: string, want: string, code: int)
+    if xvr_no_library() then return
+
+    val out = ctc_outcome_in(ctc_root(main))
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, code)
+end ctc_leaves
+
+private ctc_prints(main: string, want: string) = ctc_leaves(main, want, 0)
+
+private ctc_traps(main: string) = ctc_leaves(main, "", 133)
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private ctc_refused(main: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val root = ctc_root(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end ctc_refused
+
+// -- require --------------------------------------------------------------------------------------
+
+private ctc_half() -> string = "half(x: int) -> int\n    require x >= 0\n    x / 2\n"
+
+@test("a satisfied precondition lets the body run")
+ctc_a_satisfied_precondition_lets_the_body_run() = ctc_prints(ctc_half() + "print(half(10))", "5\n")
+
+@test("the boundary value passes")
+ctc_the_boundary_value_passes() = ctc_prints(ctc_half() + "print(half(0))", "0\n")
+
+@test("a violated precondition traps before the body runs")
+ctc_a_violated_precondition_traps() = ctc_traps(ctc_half() + "print(half(-2))")
+
+// -- ensure, and `result` -------------------------------------------------------------------------
+
+@test("a satisfied postcondition returns normally, result bound to the value")
+ctc_a_satisfied_postcondition_returns_normally() =
+    ctc_prints("abs(x: int) -> int\n    ensure result >= 0\n    if x < 0 then -x else x\n" +
+               "print(abs(-7), abs(4))", "7 4\n")
+
+// The trailing expression is an exit like any other: a negative input comes back negative.
+@test("a violated postcondition on the fall-through path traps")
+ctc_a_violated_postcondition_on_the_fall_through_path_traps() =
+    ctc_traps("bad(x: int) -> int\n    ensure result >= 0\n    x\nprint(bad(-1))")
+
+// An early `return` is its own exit site, so the postcondition is checked there too.
+@test("the early-return path that satisfies it passes")
+ctc_the_early_return_path_that_satisfies_it_passes() =
+    ctc_prints("f(x: int) -> int\n    ensure result >= 10\n    if x < 0 then return 100\n    x + 100\n" +
+               "print(f(-5), f(3))", "100 103\n")
+
+@test("the early-return path that violates it traps")
+ctc_the_early_return_path_that_violates_it_traps() =
+    ctc_traps("f(x: int) -> int\n    ensure result >= 10\n    if x < 0 then return 0\n    x + 100\n" +
+              "print(f(-5))")
+
+@test("require and ensure both hold across every path")
+ctc_both_hold_across_every_path() =
+    ctc_prints("clamp(x: int, hi: int) -> int\n    require hi >= 0\n    ensure result >= 0\n" +
+               "    ensure result <= hi\n    if x < 0 then return 0\n    if x > hi then return hi\n" +
+               "    x\nprint(clamp(-3, 8), clamp(20, 8), clamp(5, 8))", "0 8 5\n")
+
+@test("the precondition is what fails when the caller breaks it")
+ctc_the_precondition_is_what_fails_when_the_caller_breaks_it() =
+    ctc_traps("clamp(x: int, hi: int) -> int\n    require hi >= 0\n    ensure result <= hi\n" +
+              "    if x > hi then return hi\n    x\nprint(clamp(5, -1))")
+
+// `result` is contextual: a real binding of that name wins, so ordinary code using it is unaffected.
+@test("a local named result shadows the contract keyword")
+ctc_a_local_named_result_shadows_the_contract_keyword() =
+    ctc_prints("var result = 3\nresult = result + 4\nprint(result)", "7\n")
+
+@test("and a local actually named 'result' is an ordinary local")
+ctc_a_local_actually_named_result_is_an_ordinary_local() =
+    ctc_prints("shadow(x: int) -> int\n    var result = x * 3\n    result\nprint(shadow(4))", "12\n")
+
+// -- old ------------------------------------------------------------------------------------------
+
+@test("the postcondition that compares against the entry value holds")
+ctc_old_compares_against_the_entry_value() =
+    ctc_prints("bump(x: int) -> int\n    ensure result == old(x) + 10\n    x = x + 5\n    x + 5\n" +
+               "print(bump(100))", "110\n")
+
+// Naming `x` would read the mutated value and pass; `old(x)` reads the entry value, so this traps.
+@test("comparing the mutated value against the entry snapshot traps")
+ctc_comparing_the_mutated_value_against_the_entry_snapshot_traps() =
+    ctc_traps("bad(x: int) -> int\n    ensure result == old(x)\n    x = x + 5\n    x\nprint(bad(100))")
+
+@test("multiple old snapshots are independent")
+ctc_multiple_old_snapshots_are_independent() =
+    ctc_prints("f(a: int, b: int) -> int\n    ensure result == old(a) - old(b)\n    a = 0\n    b = 0\n" +
+               "    9 - 4\nprint(f(9, 4))", "5\n")
+
+@test("several 'old' snapshots in one function are independent of each other")
+ctc_several_old_snapshots_in_one_function() =
+    ctc_prints("spread(a: int, b: int) -> int\n    ensure result == old(a) + old(b)\n    a + b\n" +
+               "print(spread(2, 5))", "7\n")
+
+// -- a method's contract, and `old` through its receiver --------------------------------------------
+
+private ctc_counter() -> string =
+    "struct Counter\n    n: int\n\n    bump(*self, k: int) -> int\n        require k > 0\n" +
+    "        ensure result > old(self.n)\n        self.n += k\n        self.n\n"
+
+@test("a call that satisfies both runs")
+ctc_a_call_that_satisfies_both_runs() =
+    ctc_prints(ctc_counter() + "var c = Counter(1)\nprint(c.bump(2))", "3\n")
+
+@test("one that breaks the precondition traps")
+ctc_one_that_breaks_the_precondition_traps() =
+    ctc_traps(ctc_counter() + "var c = Counter(1)\nprint(c.bump(0))")
+
+@test("'ensure' reads 'result' and 'old' of the receiver's own field")
+ctc_ensure_reads_result_and_old_of_the_receivers_field() =
+    ctc_prints("struct Counter\n    n: int\n\n    bump(*self) -> int\n        ensure result > old(self.n)\n" +
+               "        self.n += 1\n        self.n\nvar c = Counter(5)\nprint(c.bump(), c.n)", "6 6\n")
+
+// -- what is refused ------------------------------------------------------------------------------
+
+private ctc_misplaced() -> string = "'require'/'ensure' clauses must come before any other statement in a function body"
+
+private ctc_result_outside() -> string = "'result' is only meaningful inside an 'ensure' of a value-returning function"
+
+@test("and an ensure written after ordinary work is refused")
+ctc_an_ensure_written_after_ordinary_work_is_refused() =
+    ctc_refused("struct Counter\n    n: int\n\n    bump(*self, k: int) -> int\n        self.n += k\n" +
+                "        ensure result > 0\n        self.n\nvar c = Counter(1)\nprint(c.bump(2))",
+                ctc_misplaced(), "6:9")
+
+@test("a require after an ordinary statement is rejected")
+ctc_a_require_after_an_ordinary_statement_is_rejected() =
+    ctc_refused("f(x: int) -> int\n    var y = x + 1\n    require x >= 0\n    y\n", ctc_misplaced(), "3:5")
+
+@test("an ensure nested inside an inner block is rejected")
+ctc_an_ensure_nested_inside_an_inner_block_is_rejected() =
+    ctc_refused("f(x: int) -> int\n    if x > 0 then\n        ensure result >= 0\n    x\n", ctc_misplaced(), "3:9")
+
+// A condition that is not a `bool` is refused at the declaration the clause belongs to.
+@test("a non-bool require condition is rejected")
+ctc_a_non_bool_require_condition_is_rejected() =
+    ctc_refused("f(x: int) -> int\n    require x + 1\n    x\n", "condition must be bool, got int", "1:1")
+
+@test("a non-bool ensure condition is rejected")
+ctc_a_non_bool_ensure_condition_is_rejected() =
+    ctc_refused("f() -> int\n    ensure 42\n    42\n", "condition must be bool, got int", "1:1")
+
+@test("'result' is rejected in a require, where it has no value yet")
+ctc_result_is_rejected_in_a_require() =
+    ctc_refused("f(x: int) -> int\n    require result >= 0\n    x\n", ctc_result_outside(), "2:13")
+
+@test("'result' is rejected in an ordinary statement outside any contract")
+ctc_result_is_rejected_outside_any_contract() =
+    ctc_refused("print(result)\n", ctc_result_outside(), "1:7")
+
+@test("'result' is rejected in the ensure of a function that returns nothing")
+ctc_result_is_rejected_where_nothing_is_returned() =
+    ctc_refused("f(x: int)\n    ensure result >= 0\n    print(x)\n", ctc_result_outside(), "2:12")
+
+@test("'old' is rejected outside an ensure")
+ctc_old_is_rejected_outside_an_ensure() =
+    ctc_refused("f(x: int) -> int\n    require old(x) >= 0\n    x\n", "undefined function 'old'", "2:13")
+
+@test("'old' takes exactly one argument")
+ctc_old_takes_exactly_one_argument() =
+    ctc_refused("f(x: int) -> int\n    ensure result == old(x, x)\n    x\n",
+                "'old' takes exactly one argument, but got 2", "2:22")
+
+// -- how a clause parses --------------------------------------------------------------------------
+
+@test("a require with a message keeps both the condition and the message")
+ctc_a_require_with_a_message_keeps_both() =
+    assert_eq(pf("f(x: int) -> int\n    require x >= 0, \"x must be non-negative\"\n    x\n"),
+              "(fn f (x:int) -> int (require (cmp x >= 0) \"x must be non-negative\") x)")
+
+@test("a require without a message leaves the message empty")
+ctc_a_require_without_a_message_leaves_it_empty() =
+    assert_eq(pf("f(x: int) -> int\n    require x > 0\n    x\n"), "(fn f (x:int) -> int (require (cmp x > 0)) x)")
+
+// `result` is an ordinary identifier at this stage; only the analyzer gives it meaning.
+@test("an ensure carries the postcondition, with `result` as a bare identifier")
+ctc_an_ensure_carries_result_as_a_bare_identifier() =
+    assert_eq(pf("f(x: int) -> int\n    ensure result >= x\n    x\n"),
+              "(fn f (x:int) -> int (ensure (cmp result >= x)) x)")
+
+@test("an ensure with a message keeps it")
+ctc_an_ensure_with_a_message_keeps_it() =
+    assert_eq(pf("f() -> int\n    ensure result != 0, \"never zero\"\n    1\n"),
+              "(fn f () -> int (ensure (cmp result != 0) \"never zero\") 1)")
+
+@test("several clauses stay in order ahead of the body")
+ctc_several_clauses_stay_in_order_ahead_of_the_body() =
+    assert_eq(pf("f(x: int, hi: int) -> int\n    require hi >= 0\n    ensure result >= 0\n" +
+                 "    ensure result <= hi\n    x\n"),
+              "(fn f (x:int hi:int) -> int (require (cmp hi >= 0)) (ensure (cmp result >= 0)) " +
+              "(ensure (cmp result <= hi)) x)")
+
+// -- a derived value needs its cast in every position ---------------------------------------------
+
+private ctc_meters() -> string = "type Meters = new f64\n"
+
+@test("a derived value needs the cast: not a variable's initializer")
+ctc_not_a_variables_initializer() =
+    ctc_refused(ctc_meters() + "var m = Meters(3.0)\nvar back: f64 = m\n",
+                "cannot initialize 'back': declared real but the value is Meters", "3:1")
+
+@test("a derived value needs the cast: not an argument")
+ctc_not_an_argument() =
+    ctc_refused(ctc_meters() + "takes(x: f64) -> f64 = x * 2.0\nvar m = Meters(3.0)\nprint(takes(m))\n",
+                "'x' of 'takes' is real, but Meters was given", "4:13")
+
+// A body that does not answer with the declared result is refused at the declaration.
+@test("a derived value needs the cast: not a returned value")
+ctc_not_a_returned_value() =
+    ctc_refused(ctc_meters() + "gives(m: Meters) -> f64 = m\n",
+                "function 'gives' should return real, but its body yields Meters", "2:1")
+
+@test("and the written unwrap is what works")
+ctc_the_written_unwrap_is_what_works() =
+    ctc_prints(ctc_meters() + "var m = Meters(2.5)\nvar back: f64 = f64(m)\nprint(back)", "2.5\n")
+
+@test("while a TRANSPARENT subtype is its base, so it needs no cast")
+ctc_a_transparent_subtype_needs_no_cast() =
+    ctc_prints("type Age = int within 0..150\nvar a: Age = 30\nvar n: int = a\nprint(n + 1)", "31\n")
+
+// -- the contextual words -------------------------------------------------------------------------
+
+@test("'new', 'within', 'where' and 'invariant' may each name a function")
+ctc_each_may_name_a_function() =
+    ctc_prints("where(x: int) -> int = x + 1\nwithin(x: int) -> int = x + 2\nnew(x: int) -> int = x + 3\n" +
+               "invariant(x: int) -> int = x + 4\nprint(where(1), within(1), new(1), invariant(1))", "2 3 4 5\n")
+
+@test("and 'where' and 'invariant' may name a field")
+ctc_where_and_invariant_may_name_a_field() =
+    ctc_prints("struct Rec\n    where: int\n    invariant: int\nvar r = Rec(1, 2)\nprint(r.where, r.invariant)",
+               "1 2\n")
+
+// -- the predicate --------------------------------------------------------------------------------
+
+@test("the predicate may read a module constant")
+ctc_the_predicate_may_read_a_module_constant() =
+    ctc_prints("const limit: int = 100\ntype Even = int within 0..limit where value % 2 == 0\n" +
+               "var e: Even = 4\nprint(e)", "4\n")
+
+@test("the predicate binds 'value' only inside itself")
+ctc_the_predicate_binds_value_only_inside_itself() =
+    ctc_refused("type Even = int where value % 2 == 0\nleak(x: int) -> int = value + x\n",
+                "undefined name 'value'", "2:23")
+
+// -- a constrained type declared in another file --------------------------------------------------
+
+private ctc_two_files(main: string) -> string
+    val root = ctc_root(main)
+
+    make_dir_all(root + "/shape").unwrap()
+    write_text(root + "/shape/shape.sysl", "module shape\n\ntype Meters = f64 within 0.0..100.0\n").unwrap()
+    root
+end ctc_two_files
+
+private ctc_two_files_print(main: string, want: string)
+    if xvr_no_library() then return
+
+    val out = ctc_outcome_in(ctc_two_files(main))
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end ctc_two_files_print
+
+@test("a type declared in another file is reached by the qualified path")
+ctc_reached_by_the_qualified_path() = ctc_two_files_print("val d: shape.Meters = 3.5\nprint(d)\n", "3.5\n")
+
+@test("and by an import that shortens it")
+ctc_and_by_an_import_that_shortens_it() =
+    ctc_two_files_print("import shape.Meters\n\nval d: Meters = 3.5\nprint(d)\n", "3.5\n")
+
+// -- compound assignment on a constrained type ----------------------------------------------------
+
+private ctc_age() -> string = "type Age = int within 0..150\n"
+
+private ctc_big() -> string = "type Big = i32 within -2000000000..2000000000\n"
+
+private ctc_even() -> string = "type Even = int within 0..100 where value % 2 == 0\n"
+
+@test("an in-range += updates and reads back")
+ctc_an_in_range_plus_updates() = ctc_prints(ctc_age() + "var a: Age = 10\na += 5\nprint(int(a))", "15\n")
+
+@test("an in-range -= updates")
+ctc_an_in_range_minus_updates() = ctc_prints(ctc_age() + "var a: Age = 40\na -= 15\nprint(int(a))", "25\n")
+
+@test("a result past the top is caught by the range check")
+ctc_a_result_past_the_top_is_caught() = ctc_traps(ctc_age() + "var a: Age = 100\na += 60\nprint(int(a))")
+
+@test("a result below the bottom is caught too")
+ctc_a_result_below_the_bottom_is_caught() = ctc_traps(ctc_age() + "var a: Age = 10\na -= 40\nprint(int(a))")
+
+// A wide range's arithmetic can leave the base width before the range check would see it.
+@test("a += that overflows the width traps")
+ctc_a_plus_that_overflows_the_width_traps() =
+    ctc_traps(ctc_big() + "var x: Big = Big(2000000000)\nx += Big(2000000000)\nprint(int(x))")
+
+@test("a *= that overflows the width traps")
+ctc_a_times_that_overflows_the_width_traps() =
+    ctc_traps(ctc_big() + "var x: Big = Big(100000)\nx *= Big(100000)\nprint(int(x))")
+
+@test("a wide compound that fits computes normally")
+ctc_a_wide_compound_that_fits_computes_normally() =
+    ctc_prints(ctc_big() + "var x: Big = Big(1000000000)\nx += Big(1000000000)\nprint(int(x))", "2000000000\n")
+
+@test("a where-predicate update keeping it even and in range passes")
+ctc_an_update_keeping_it_even_passes() = ctc_prints(ctc_even() + "var e: Even = 4\ne += 2\nprint(int(e))", "6\n")
+
+@test("a where-predicate update past the range traps")
+ctc_an_update_past_the_range_traps() = ctc_traps(ctc_even() + "var e: Even = 100\ne += 2\nprint(int(e))")
