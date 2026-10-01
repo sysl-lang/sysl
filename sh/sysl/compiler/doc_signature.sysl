@@ -305,7 +305,12 @@ doc_func(f: FuncDecl) -> string
 // A property is called without parentheses, so an empty pair would document a call the language
 // refuses. A static one has no receiver either, so the word is the only thing saying a reader
 // writes `Type.name` rather than `value.name`.
-doc_method(m: MethodDecl) -> string
+//
+// A member that is not public carries its mark, as a field does: it is listed only under `--private`,
+// and there the word is what keeps it from being read as API. 0.0.153's `sysl doc` writes it.
+doc_method(m: MethodDecl) -> string = s"${doc_vis_word(m.vis)}${doc_method_bare(m)}"
+
+private doc_method_bare(m: MethodDecl) -> string
     val tps = doc_tparams_text(m.tparams, m.bounds, m.tvalues, buf(), m.tdefaults)
 
     if m.is_property && m.params.is_empty()
@@ -323,7 +328,7 @@ doc_method(m: MethodDecl) -> string
         all.push(ps.at(i))
 
     s"${m.name}${tps}${doc_params_text(all, m.variadic)}${doc_ret_text(m.ret_type)}"
-end doc_method
+end doc_method_bare
 
 private doc_receiver_text(mode: RecvMode) -> string = mode match
     ByValue -> "self"
@@ -438,16 +443,19 @@ doc_val(name: string, typ: Option[TypeRef], value: Expr) -> string = typ match
     None -> s"val ${name} = ${doc_expr_text(value)}"
 
 // The signature of a declaration a reference page can list, or `None` for a statement that is not
-// one. Which of these a page actually lists -- and which visibilities -- is the model's decision.
+// one. Which of these a page actually lists -- and which visibilities -- is the model's decision; a
+// declaration that is not public carries its mark in front (`private helper(n: int) -> int`,
+// `private[m] wide(…)`, `private opaque struct H`), since a page lists one only under `--private` and
+// the word is what keeps it from being read as API. 0.0.153's `sysl doc` writes it the same way.
 doc_signature(s: Stmt) -> Option[string] = *s.kind match
-    FuncDecl(d) -> Some(doc_func(d))
-    StructDecl(d) -> Some(doc_struct(d))
-    EnumDecl(d) -> Some(doc_enum(d))
-    TraitDecl(d) -> Some(doc_trait(d))
-    ConstDecl(name, typ, value, _) -> Some(doc_const(name, typ, value))
+    FuncDecl(d) -> Some(s"${doc_vis_word(d.vis)}${doc_func(d)}")
+    StructDecl(d) -> Some(s"${doc_vis_word(d.vis)}${doc_struct(d)}")
+    EnumDecl(d) -> Some(s"${doc_vis_word(d.vis)}${doc_enum(d)}")
+    TraitDecl(d) -> Some(s"${doc_vis_word(d.vis)}${doc_trait(d)}")
+    ConstDecl(name, typ, value, vis) -> Some(s"${doc_vis_word(vis)}${doc_const(name, typ, value)}")
     ImplDecl(d) -> Some(doc_impl_head(d))
-    TypeDecl(d) -> Some(doc_type_decl(d))
-    ExternDecl(d) -> Some(doc_extern(d))
-    ExternVarDecl(name, typ, _, _) -> Some(s"extern ${name}: ${doc_type_text(typ)}")
-    ValDecl(name, typ, value, _, _, _) -> Some(doc_val(name, typ, value))
+    TypeDecl(d) -> Some(s"${doc_vis_word(d.vis)}${doc_type_decl(d)}")
+    ExternDecl(d) -> Some(s"${doc_vis_word(d.vis)}${doc_extern(d)}")
+    ExternVarDecl(name, typ, _, vis) -> Some(s"${doc_vis_word(vis)}extern ${name}: ${doc_type_text(typ)}")
+    ValDecl(name, typ, value, vis, _, _) -> Some(s"${doc_vis_word(vis)}${doc_val(name, typ, value)}")
     _ -> None
