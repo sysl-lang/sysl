@@ -1,0 +1,513 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What an `if` or a `match` used as a value does when a branch has no type of its own -- a bare
+// literal, a payload-free variant of a generic enum, a nullary generic call. The branch that knows
+// supplies the type and the one that does not takes it, as a binary operator's operands already do;
+// two branches that each know still have to agree, in the same words as before.
+//
+// **Every output, message and location here was read out of the reference compiler** (0.0.153) on
+// the same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private bty_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+
+private bty_skip_run() -> bool
+    if bty_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+
+private bty_write(main: string) -> string
+    val root = make_temp_dir("sysl-bty").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+
+// What the program PRINTS, or what the build had to say about it.
+private bty_ran(main: string) -> string
+    val root = bty_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end bty_ran
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private bty_refused(main: string, message: string, at: string)
+    val root = bty_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(out.starts_with(s"error: $message\n --> ") || out.starts_with(s"error: $message\n  --> "),
+           s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+
+private bty_width() -> string = "width(n: usize) -> usize = n\n\n"
+
+private bty_empty() -> string = "empty[T]() -> Option[T] = None\n\n"
+
+private bty_mk() -> string = raw"""
+    import sysl.buf.*
+
+    mk() -> Buf[int]
+        var b: Buf[int] = buf()
+        b.push(7)
+        b
+
+    """
+
+private bty_views() -> string = "var a = [1, 2, 3]\nvar b = [1, 2, 3]\nval c: []const int = b[..]\n"
+
+// -- a bare literal takes the type of the branch beside it ----------------------------------------
+
+@test("a bare literal in the else branch takes the then branch's usize")
+bty_literal_in_the_else_branch()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_width() + raw"""
+        gap(a: usize, b: usize) -> usize =
+            width(if a > b then a - b else 0)
+
+        print(gap(9, 2))
+        print(gap(2, 9))
+        """), "7\n0\n")
+
+@test("a bare literal in the then branch takes the else branch's usize")
+bty_literal_in_the_then_branch()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_width() + raw"""
+        atLeastOne(n: usize) -> usize =
+            width(if n == 0 then 1 else n)
+
+        print(atLeastOne(0))
+        print(atLeastOne(4))
+        """), "1\n4\n")
+
+@test("a val takes the branch's width without being told it")
+bty_a_val_takes_the_width()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        f(n: usize) -> usize =
+            val w = if n == 0 then 1 else n
+            w
+
+        print(f(0))
+        """), "1\n")
+
+@test("an elif chain settles from the one branch that knows")
+bty_an_elif_chain_settles()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_width() + raw"""
+        f(n: usize) -> usize =
+            width(if n == 0 then 1 elif n == 1 then 2 else n)
+
+        print(f(0))
+        print(f(1))
+        print(f(6))
+        """), "1\n2\n6\n")
+
+@test("a float literal takes its sibling's width")
+bty_a_float_literal_takes_the_width()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        take(x: f32) -> f32 = x
+
+        clamp(x: f32) -> f32 =
+            take(if x > 0.0f32 then x else 0.0)
+
+        print(clamp(2.5f32))
+        print(clamp(-1.0f32))
+        """), "2.5\n0\n")
+
+// -- a match arm is the same rule -----------------------------------------------------------------
+
+@test("a literal arm takes what the arms that know settled")
+bty_a_literal_arm()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_width() + raw"""
+        f(n: usize) -> usize =
+            val w = n match
+                0 -> 1
+                else n
+            width(w)
+
+        print(f(0))
+        print(f(3))
+        """), "1\n3\n")
+
+@test("the arm that knows may be written after the ones that do not")
+bty_the_arm_that_knows_last()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_width() + raw"""
+        f(n: usize) -> usize =
+            val w = n match
+                0 -> 1
+                1 -> 2
+                else n
+            width(w)
+
+        print(f(0))
+        print(f(1))
+        print(f(8))
+        """), "1\n2\n8\n")
+
+@test("an arm that does not finish still settles nothing")
+bty_an_arm_that_does_not_finish()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_width() + raw"""
+        f(n: usize) -> usize =
+            val w = n match
+                0 -> 1
+                1 -> return 99
+                else n
+            width(w)
+
+        print(f(0))
+        print(f(1))
+        print(f(5))
+        """), "1\n99\n5\n")
+
+// -- two views of one slice meet at the read-only one ---------------------------------------------
+
+@test("a writable and a read-only view meet however the branches are ordered")
+bty_views_meet_in_either_order()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_views() + raw"""
+        val j = if a.len > 0 then a[..] else c
+        val k = if a.len > 0 then c else a[..]
+        print(j.len, k.len)
+        """), "3 3\n")
+
+@test("the views' meeting is read-only, so it may not be written through")
+bty_the_meeting_is_read_only()
+    if bty_skip() then return
+
+    bty_refused(bty_views() + "var j = if a.len > 0 then a[..] else c\nj[0] = 9\n",
+                "this element belongs to a '[]const int', which views elements it may not write, so " +
+                "there is nothing to assign through. Elements you may write are elements of your own: " +
+                "copy them into a '[]int' first", "5:1")
+
+@test("a match settles two views the same way")
+bty_a_match_settles_views()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_views() + raw"""
+        val k = a.len match
+            0 -> c
+            else a[..]
+        print(k.len)
+        """), "3\n")
+
+// -- what the rule does not do --------------------------------------------------------------------
+
+@test("two branches that each know their type still have to agree")
+bty_two_known_branches_disagree()
+    if bty_skip() then return
+
+    bty_refused("f(a: int, b: usize) =\n    val w = if a == 0 then a else b\n    print(w)\n",
+                "if branches have different types: int and usize", "2:13")
+
+@test("and so do two arms")
+bty_two_known_arms_disagree()
+    if bty_skip() then return
+
+    bty_refused("f(a: int, b: usize) =\n    val w = a match\n        0 -> a\n        else b\n    print(w)\n",
+                "match arms have different types: int and usize", "2:13")
+
+@test("a literal beside something it cannot be is refused as before")
+bty_a_literal_beside_a_string()
+    if bty_skip() then return
+
+    bty_refused("f(s: string) =\n    val w = if true then 1 else s\n    print(w)\n",
+                "if branches have different types: int and string", "2:13")
+
+@test("a written type still overrules both branches")
+bty_a_written_type_overrules()
+    if bty_skip() then return
+
+    bty_refused("f(b: usize) =\n    val w: string = if true then 1 else b\n    print(w)\n",
+                "if branches have different types: int and usize", "2:21")
+
+// -- a payload-free variant of a generic enum takes its sibling's type too ------------------------
+
+@test("a bare None in the else branch takes its sibling's Option")
+bty_none_in_the_else_branch()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        struct Expr
+            n: int
+
+        maybe(c: bool) -> Option[Expr]
+            val b = if c then Some(Expr(1)) else None
+            b
+
+        print(maybe(true).unwrap().n, maybe(false).is_none())
+        """), "1 true\n")
+
+@test("a bare None in the then branch takes its sibling's Option")
+bty_none_in_the_then_branch()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        maybe(c: bool) -> Option[int]
+            val b = if c then None else Some(4)
+            b
+
+        print(maybe(false).unwrap(), maybe(true).is_none())
+        """), "4 true\n")
+
+@test("a match arm settles a bare None the same way")
+bty_none_in_a_match_arm()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        pick(n: int) -> Option[int]
+            val b = n match
+                0 -> None
+                _ -> Some(n)
+            b
+
+        print(pick(0).is_none(), pick(5).unwrap())
+        """), "true 5\n")
+
+@test("a payload-free variant takes its sibling's type, and it is not special to Option")
+bty_not_special_to_option()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        enum Step[T]
+            Done
+            Going(v: T)
+
+        go(c: bool) -> Step[int]
+            val s = if c then Going(2) else Done
+            s
+
+        go(true) match
+            Going(v) -> print(v)
+            Done -> print("done")
+        """), "2\n")
+
+@test("two variants that both carry nothing still have nothing to go on")
+bty_two_bare_nones()
+    if bty_skip() then return
+
+    bty_refused("f(c: bool) =\n    val b = if c then None else None\n    print(b.is_none())\n",
+                "cannot infer the type argument 'T' of 'None' here — annotate the expected type", "2:23")
+
+@test("a carrying variant still supplies the type rather than taking one")
+bty_a_carrying_variant_supplies()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        f(c: bool, n: usize) -> Option[usize]
+            val b = if c then Some(n) else None
+            b
+
+        print(f(true, 1).unwrap() + 2usize)
+        """), "3\n")
+
+@test("with a bare payload the pair settles at int")
+bty_a_bare_payload_settles_at_int()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        f(c: bool) -> Option[int]
+            val b = if c then Some(1) else None
+            b
+
+        print(f(true).unwrap(), f(false).is_none())
+        """), "1 true\n")
+
+// -- a branch that cannot be read alone takes its sibling's type ----------------------------------
+
+@test("a nullary generic call in the else branch takes its sibling's type")
+bty_nullary_call_in_the_else_branch()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_mk() + raw"""
+        f(c: bool) -> usize
+            var xs = if c then mk() else buf()
+            xs.push(1)
+            xs.len()
+
+        print(f(true), f(false))
+        """), "2 1\n")
+
+@test("a nullary generic call in the then branch is read twice")
+bty_nullary_call_in_the_then_branch()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_mk() + raw"""
+        f(c: bool) -> usize
+            var xs = if c then buf() else mk()
+            xs.push(1)
+            xs.len()
+
+        print(f(true), f(false))
+        """), "1 2\n")
+
+@test("a nullary generic written in the program, not only a library one")
+bty_a_program_nullary_generic()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_empty() + raw"""
+        f(c: bool) -> Option[int]
+            val b = if c then Some(3) else empty()
+            b
+
+        print(f(true).unwrap(), f(false).is_none())
+        """), "3 true\n")
+
+@test("and with the generic branch written first")
+bty_the_generic_branch_first()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_empty() + raw"""
+        f(c: bool) -> Option[int]
+            val b = if c then empty() else Some(3)
+            b
+
+        print(f(false).unwrap(), f(true).is_none())
+        """), "3 true\n")
+
+@test("an elif chain settles a nullary generic from the branch in the middle")
+bty_an_elif_chain_from_the_middle()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_empty() + raw"""
+        f(n: int) -> Option[int]
+            val b = if n == 0 then empty() elif n == 1 then Some(9) else empty()
+            b
+
+        print(f(1).unwrap(), f(0).is_none(), f(2).is_none())
+        """), "9 true true\n")
+
+@test("a match arm settles a nullary generic over as many alternatives as the form has")
+bty_a_nullary_generic_arm()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_empty() + raw"""
+        pick(n: int) -> Option[int]
+            val b = n match
+                0 -> empty()
+                _ -> Some(n)
+            b
+
+        print(pick(0).is_none(), pick(5).unwrap())
+        """), "true 5\n")
+
+@test("and a match arm settled by an arm written before it")
+bty_an_arm_settled_by_an_earlier_one()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(bty_empty() + raw"""
+        pick(n: int) -> Option[int]
+            val b = n match
+                0 -> Some(n)
+                _ -> empty()
+            b
+
+        print(pick(0).unwrap(), pick(5).is_none())
+        """), "0 true\n")
+
+@test("two branches that neither can be read alone give the same diagnostic")
+bty_two_nullary_branches()
+    if bty_skip() then return
+
+    bty_refused("import sysl.buf.*\n\nf(c: bool)\n    val xs = if c then buf() else buf()\n    print(xs.len())\n",
+                "cannot infer the type argument 'T' of 'sysl.buf.buf' here — annotate the expected type",
+                "4:24")
+
+@test("and so do two nullary arms")
+bty_two_nullary_arms()
+    if bty_skip() then return
+
+    bty_refused(bty_empty() + "f(n: int)\n    val b = n match\n        0 -> empty()\n        _ -> empty()\n" +
+                "    print(b.is_none())\n",
+                "cannot infer the type argument 'T' of 'empty' here — annotate the expected type", "5:14")
+
+@test("a branch tried and abandoned closes its scope on the way out")
+bty_an_abandoned_branch_closes_its_scope()
+    if bty_skip() then return
+
+    bty_refused(bty_mk() + raw"""
+        f(c: bool) -> usize
+            var xs =
+                if c then
+                    mk()
+                else
+                    val inner = 1
+                    buf()
+            print(inner)
+            xs.len()
+
+        print(f(true))
+        """, "undefined name 'inner'", "15:11")
+
+@test("and so does an arm")
+bty_an_abandoned_arm_closes_its_scope()
+    if bty_skip() then return
+
+    bty_refused(bty_empty() + raw"""
+        f(n: int) -> Option[int]
+            val b = n match
+                0 ->
+                    val inner = 1
+                    empty()
+                _ -> Some(n)
+            print(inner)
+            b
+
+        print(f(0).is_none())
+        """, "undefined name 'inner'", "9:11")
+
+@test("two branches that each know their type still disagree in the same words")
+bty_known_branches_disagree_in_the_same_words()
+    if bty_skip() then return
+
+    bty_refused("import sysl.buf.*\n\nf(c: bool, n: usize)\n    var b: Buf[int] = buf()\n" +
+                "    val w = if c then b else n\n    print(w)\n",
+                "if branches have different types: sysl.buf.Buf[int] and usize", "5:13")

@@ -1,0 +1,360 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An indented block under a binding's `=`, whose trailing expression is the value
+// (`reference/lexical.md § An unbracketed line continues after an operator`). The value rules are a
+// value block's: the trailing expression is the value, a block ending in a jump is `never`, one
+// ending in neither is `unit`, and the names it binds are its own. A block of one expression IS that
+// expression, so a module `val` moved to the next line is still a constant tree, and a `const` is
+// refused a block that binds something, with the rule.
+//
+// **Every output, message and location here was read out of the reference compiler** (0.0.153) on
+// the same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private bty_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+
+private bty_skip_run() -> bool
+    if bty_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+
+private bty_write(main: string) -> string
+    val root = make_temp_dir("sysl-bty").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+
+// What the program PRINTS, or what the build had to say about it.
+private bty_ran(main: string) -> string
+    val root = bty_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end bty_ran
+
+// What `emit-llvm` prints for the program, or what the build had to say about it.
+private bty_ir(main: string) -> string
+    val root = bty_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private bty_refused(main: string, message: string, at: string)
+    val out = bty_ir(main)
+
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+
+// -- the form -------------------------------------------------------------------------------------
+
+@test("a 'val' takes an indented block, whose trailing expression is the value")
+bty_a_val_takes_a_block()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        val limits =
+            val raw = 7
+            val capped = raw * 2
+            capped
+        print(limits)
+        """), "14\n")
+
+@test("a 'var' takes an indented block too")
+bty_a_var_takes_a_block()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        var total =
+            var t = 0
+            for i in 1..5 do t += i
+            t
+        total += 100
+        print(total)
+        """), "115\n")
+
+@test("a binding's value may be a single expression on the next line")
+bty_a_single_expression_on_the_next_line()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran("val x =\n    1 + 2\nprint(x)"), "3\n")
+
+@test("an 'if' on the line under a binding's '='")
+bty_an_if_on_the_next_line()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        pick(c: bool) -> int
+            val n =
+                if c then
+                    val a = 3
+                    a + 1
+                else
+                    0
+            n * 10
+        print(pick(true))
+        print(pick(false))
+        """), "40\n0\n")
+
+@test("a 'match' on the line under a binding's '='")
+bty_a_match_on_the_next_line()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        describe(n: int) -> string
+            val word =
+                n match
+                    0 -> "none"
+                    1 -> "one"
+                    _ -> "many"
+            word
+        print(describe(0), describe(1), describe(9))
+        """), "none one many\n")
+
+@test("a pattern binding takes a block")
+bty_a_pattern_binding_takes_a_block()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran("val (lo, hi) =\n    val a = 3\n    (a, a * a)\nprint(lo, hi)"), "3 9\n")
+
+// -- the block's scope is its own -----------------------------------------------------------------
+
+@test("a name bound inside a block initializer does not escape")
+bty_a_name_inside_does_not_escape()
+    if bty_skip() then return
+
+    bty_refused("val x =\n    val hidden = 1\n    hidden\nprint(hidden)", "undefined name 'hidden'", "4:7")
+
+@test("a name bound outside a block initializer is readable inside")
+bty_a_name_outside_is_readable()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran("val base = 10\nval x =\n    val step = 4\n    base + step\nprint(x)"), "14\n")
+
+@test("two block initializers may bind the same name")
+bty_two_blocks_bind_one_name()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran("val a =\n    val t = 1\n    t\nval b =\n    val t = 2\n    t * 10\nprint(a, b)"),
+              "1 20\n")
+
+@test("a 'var' inside the block shadows one outside it, and the outer one is unchanged")
+bty_a_var_inside_shadows()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran("var n = 1\nval x =\n    var n = 50\n    n += 1\n    n\nprint(n, x)"), "1 51\n")
+
+// -- the value rules are a value block's ----------------------------------------------------------
+
+@test("the declared type is pushed down to the block's trailing expression")
+bty_the_declared_type_is_pushed_down()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran("val big: u8 =\n    val why = \"the top of a byte\"\n    print(why)\n    255\nprint(big)"),
+              "the top of a byte\n255\n")
+
+@test("a block initializer ending in a jump is 'never'")
+bty_a_block_ending_in_a_jump()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        early(c: bool) -> int
+            val n =
+                if c then 5
+                else
+                    return -1
+            n * 2
+        print(early(true))
+        print(early(false))
+        """), "10\n-1\n")
+
+@test("a block initializer with no trailing expression is 'unit'")
+bty_a_block_with_no_trailing_expression()
+    if bty_skip() then return
+
+    bty_refused("val nothing =\n    var t = 0\n    var u = t + 1\nprint(nothing)",
+                "cannot print a unit value — it does not implement 'sysl.Display'", "4:1")
+
+@test("a block initializer nests inside a block initializer")
+bty_a_block_nests()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran("val x =\n    val inner =\n        val a = 2\n        a * 3\n    inner + 1\nprint(x)"), "7\n")
+
+@test("a context that converts reaches the block's trailing expression")
+bty_a_converting_context_reaches_the_trailing_expression()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        struct Point
+            x: int
+            y: int
+        val p: &Point =
+            val n = 3
+            Point(n, n * 2)
+        print(p.x, p.y)
+        """), "3 6\n")
+
+// -- a block of one expression is that expression -------------------------------------------------
+
+@test("a module 'val' whose value is on the next line is still a constant tree")
+bty_a_module_val_is_still_constant()
+    if bty_skip() then return
+
+    val out = bty_ir("static val k: int =\n    42\nprint(k)")
+
+    assert(out.index_of("@k = private constant i32 42").is_some(), out)
+    assert(out.index_of("@k = private global").is_none(), out)
+
+@test("a module 'val' whose block binds something is computed storage")
+bty_a_module_val_block_is_computed()
+    if bty_skip() then return
+
+    assert(bty_ir("static val k: int =\n    val a = 6\n    a * 7\nprint(k)")
+               .index_of("@k = private global i32 zeroinitializer").is_some())
+
+@test("a computed module 'val' still runs before the program's own statements")
+bty_a_computed_val_runs_first()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran("static val k: int =\n    print(\"built\")\n    7\nprint(k)"), "built\n7\n")
+
+// -- it is a scope like any other block -----------------------------------------------------------
+
+@test("counted locals of a block initializer are released at its end, before the value is used")
+bty_counted_locals_are_released()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        struct Node
+            v: int
+        impl Drop for Node
+            drop(self) = print("dropped", self.v)
+        sum() -> int
+            val n =
+                val a: &Node = Node(1)
+                val b: &Node = Node(2)
+                a.v + b.v
+            print("after", n)
+            n
+        print(sum())
+        """), "dropped 2\ndropped 1\nafter 3\n3\n")
+
+@test("a 'defer' inside a block initializer runs at the end of it")
+bty_a_defer_runs_at_the_end_of_it()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        f() -> int
+            val n =
+                defer print("deferred")
+                print("in")
+                5
+            print("after", n)
+            n
+        print(f())
+        """), "in\ndeferred\nafter 5\n5\n")
+
+@test("a loop around a block initializer still breaks with a value")
+bty_a_loop_still_breaks_with_a_value()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        f() -> int
+            var i = 0
+            val found =
+                loop
+                    i += 1
+                    val step =
+                        val doubled = i * 2
+                        doubled
+                    if step > 6 then break step
+            found
+        print(f())
+        """), "8\n")
+
+@test("a closure body holds a block initializer, and it closes over the parameter")
+bty_a_closure_body_holds_one()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran(raw"""
+        f() -> int
+            var g = (x: int) ->
+                val bumped =
+                    val one = 1
+                    x + one
+                bumped * 10
+            g(4)
+        print(f())
+        """), "50\n")
+
+// -- a 'const' ------------------------------------------------------------------------------------
+
+@test("a 'const' is refused a block, with the rule")
+bty_a_const_is_refused_a_block()
+    if bty_skip() then return
+
+    bty_refused("const C: int =\n    val a = 1\n    a + 1\nprint(C)",
+                "'C' is a 'const', so its value is folded into every use of it — a block is run, and " +
+                "there is nowhere here for it to run. Write a 'val', whose initializer is code", "2:5")
+
+@test("a 'const' still takes a value on the next line, because one expression is not a block")
+bty_a_const_takes_a_value_on_the_next_line()
+    if bty_skip_run() then return
+
+    assert_eq(bty_ran("const C: int =\n    6 * 7\nprint(C)"), "42\n")
+
+// -- what still ends the statement ----------------------------------------------------------------
+
+@test("a binding with nothing after the '=' is still refused")
+bty_nothing_after_the_equals()
+    if bty_skip() then return
+
+    bty_refused("val x =\nprint(1)", "expression expected", "1:8")
+
+@test("a binding with nothing after the '=' at the end of the file is refused")
+bty_nothing_after_the_equals_at_the_end()
+    if bty_skip() then return
+
+    bty_refused("val x =", "expression expected", "1:8")
+
+@test("a mistake inside a block initializer that did begin is reported where it was made")
+bty_a_mistake_inside_the_block()
+    if bty_skip() then return
+
+    bty_refused("f() -> int\n    val x =\n        val y = 1\n        ]\n    x\nprint(f())", "dedent expected", "4:9")
