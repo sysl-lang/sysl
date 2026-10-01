@@ -1,0 +1,234 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, read_text, write_text}
+import sysl.process.capture
+import sysl.text.{join, Search}
+
+// `sysl doc --site`: write the Markdown, then build the juicer site that holds it by running the
+// installed `juicer`.
+//
+// **Every sentence quoted was read out of the reference** -- `sysl-doc` 0.0.152 -- on the same
+// inputs, with the name in front of it being the one this command is typed as. The reference links
+// juicer as a library; this compiler runs juicer's command line, `juicer build -s <site> -d
+// <site>/public`, which over the same pages writes the same files byte for byte but the feeds'
+// timestamps.
+//
+// **A test that needs juicer says so and is skipped where there is none**, printing why; a test
+// that passed because nothing ran would claim a site was built that never was.
+
+// What one command line came to: the status the shell hears, and every line the command said.
+private dst_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end dst_run
+
+private dst_refusal(r: Result[DocOptions, string]) -> string = r match
+    Ok(_) -> ""
+    Err(m) -> m
+
+// Whether a `juicer` answers on this machine; where it does not, says that the test was skipped.
+private dst_juicer() -> bool
+    val there = capture("juicer", ["--version"], "", [], true) match
+        Ok(o) -> o.status.ok()
+        Err(_) -> false
+
+    if !there then print("skipped: there is no 'juicer' on this machine, so no site was built")
+
+    there
+end dst_juicer
+
+// The installed library, which is the tree the reference's own cases document.
+private dst_library() -> Option[string] = std_root() match
+    Ok(root) -> Some(root)
+    Err(_) -> None
+
+// The smallest juicer site that renders a generated page, built from nothing -- the reference's
+// own. `api-module` and `api-index` are the `juicerapi` theme's layouts, so the templates are
+// supplied here: the smallest thing that emits a body, since none of this is about the theme.
+private dst_site(layouts: []const string) -> string
+    val root = make_temp_dir("sysl-doc-site-").unwrap()
+    val page = "<html><body>{{ .content }}</body></html>\n"
+
+    make_dir_all(s"$root/content").unwrap()
+    make_dir_all(s"$root/layouts/_default").unwrap()
+    write_text(s"$root/site.toml", "title = \"probe\"\n").unwrap()
+    write_text(s"$root/content/_index.md", "---\ntitle: home\n---\n\nprobe\n").unwrap()
+
+    for i in 0..<layouts.len
+        write_text(s"$root/layouts/_default/${layouts[i]}.html", page).unwrap()
+
+    root
+end dst_site
+
+private dst_full_site() -> string = dst_site(["folder", "api-module", "api-index"])
+
+// A tree of one module, `demo.geo`, with a doc comment on the module and on a function.
+private dst_tree() -> string
+    val root = make_temp_dir("sysl-doc-tree-").unwrap()
+
+    make_dir_all(s"$root/geo").unwrap()
+    write_text(s"$root/geo/geo.sysl", "/** Plane geometry for small programs. */\n\nmodule demo.geo\n\n" +
+        "/** The distance between two points, `from_x` to `to_x`. */\n" +
+        "span_of(from_x: int, to_x: int) -> int = to_x - from_x\n").unwrap()
+    root
+end dst_tree
+
+private dst_read(file: string) -> string = read_text(file).unwrap_or("")
+
+// -- the argument parser ------------------------------------------------------------------------
+
+@test("takes --site, and has none by default")
+dst_site_flag()
+    var none: Buf[string] = buf()
+
+    assert_eq(parse_doc_args(["--site", "docs"]).unwrap().site.unwrap(), "docs")
+    assert(parse_doc_args(none.view()).unwrap().site.is_none())
+end dst_site_flag
+
+@test("names --site when its value is missing, as it does every other valued flag")
+dst_site_needs_a_value()
+    // sysl-doc 0.0.152: "sysl-doc: '--site' needs a value after it"
+    assert_eq(dst_refusal(parse_doc_args(["--site"])), "sysl doc: '--site' needs a value after it")
+end dst_site_needs_a_value
+
+// -- the --site path ----------------------------------------------------------------------------
+
+@test("refuses pages written outside the site it was asked to build, naming both")
+dst_outside_refused()
+    // Refused before juicer is asked anything, so this runs on a machine without it. The pages are
+    // still written, as the reference writes them: the refusal is about the site.
+    val site = dst_full_site()
+    val out = s"${make_temp_dir("sysl-doc-elsewhere-").unwrap()}/api"
+    val (code, said) = dst_run(["sysl", "doc", dst_tree(), "--out", out, "--site", site])
+
+    // sysl-doc 0.0.152: "sysl-doc: cannot build the site: the pages were written to '<out>', which
+    // is not inside the site at '<site>' — give -o a directory under the site's content tree, or
+    // --site the site that holds them"
+    assert_eq(code, 1)
+    assert_eq(said, s"sysl doc: 1 module -> $out\n" +
+        s"sysl doc: cannot build the site: the pages were written to '$out', which is not inside " +
+        s"the site at '$site' — give -o a directory under the site's content tree, or --site the " +
+        "site that holds them")
+    assert(is_file(s"$out/_index.md"))
+end dst_outside_refused
+
+@test("is 0 when the pages are written inside the site and it builds")
+dst_site_builds()
+    val lib = dst_library() match
+        Some(l) -> l
+        None -> return
+
+    if !dst_juicer() then return
+
+    val site = dst_full_site()
+    val (code, said) = dst_run(["sysl", "doc", lib, "--out", s"$site/content/api", "--site", site])
+
+    assert_eq(code, 0)
+    assert(said.ends_with(s"\nsysl doc: site -> $site"))
+    assert(dst_read(s"$site/public/html/api/index.html").contains("<html>"))
+end dst_site_builds
+
+@test("renders the generated anchors as the ids the pages link to")
+dst_site_anchors()
+    // A juicer that does not know the per-page `slugStyle` key renders `from_utf8_lossy` as
+    // `from-utf8-lossy` while the page's own index links to `#from_utf8_lossy`, and still exits 0 --
+    // which is why only the HTML can say so.
+    val lib = dst_library() match
+        Some(l) -> l
+        None -> return
+
+    if !dst_juicer() then return
+
+    val site = dst_full_site()
+    val (code, _) = dst_run(["sysl", "doc", lib, "--out", s"$site/content/api", "--site", site])
+
+    assert_eq(code, 0)
+    assert(dst_read(s"$site/public/html/api/sysl-text/index.html").contains("<h3 id=\"from_utf8_lossy\">"))
+end dst_site_anchors
+
+@test("a machine with no juicer is told where to get one, and the command fails")
+dst_no_juicer()
+    // The pages are inside the site, so the refusal can only be about the program. Asserted through
+    // `doc_site` with a program name nothing answers to, which is what a machine without juicer is.
+    val site = dst_full_site()
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = doc_site(s"$site/content/api", site, "sysl-no-such-juicer", (line) -> sink.push(line))
+
+    assert_eq(code, 1)
+    assert_eq(join(lines.view(), "\n"), "sysl doc: --site builds the site with juicer, and there is no " +
+        "'sysl-no-such-juicer' on this machine — install it with 'brew install edadma/tap/juicer', or " +
+        "leave out --site to write the Markdown alone")
+end dst_no_juicer
+
+@test("a site juicer refuses is refused in juicer's own sentence, without its stack trace")
+dst_juicer_refusal()
+    if !dst_juicer() then return
+
+    // No `api-module` layout, so juicer has nothing to render the module's page with.
+    val site = dst_site(["folder", "api-index"])
+    val (code, said) = dst_run(["sysl", "doc", dst_tree(), "--out", s"$site/content/api", "--site", site])
+
+    // sysl-doc 0.0.152: "sysl-doc: cannot build the site: no template was found for rendering demo-geo"
+    assert_eq(code, 1)
+    assert_eq(said, s"sysl doc: 1 module -> $site/content/api\n" +
+        "sysl doc: cannot build the site: no template was found for rendering demo-geo")
+end dst_juicer_refusal
+
+@test("-o relative to the working directory is inside a --site written the same way")
+dst_relative_paths()
+    // `-o docs/api --site docs` is the commonest correct invocation; a textual prefix test on what
+    // was typed refuses it once one of the two is spelled differently. Here `--site` has a trailing
+    // `/.` and `-o` a `..` step, and both still name a page directory inside the site.
+    if !dst_juicer() then return
+
+    val site = dst_full_site()
+    val out = s"$site/content/x/../api"
+    val (code, _) = dst_run(["sysl", "doc", dst_tree(), "--out", out, "--site", s"$site/."])
+
+    assert_eq(code, 0)
+    assert(is_file(s"$site/public/html/api/demo-geo/index.html"))
+end dst_relative_paths
+
+@test("the site's pages are the reference's, byte for byte")
+dst_matches_reference()
+    // The reference renders through juicer's library and this command through its command line, so
+    // what is compared is the two HTML pages each writes for the same tree.
+    val oracle = env_var("SYSL_ORACLE").unwrap_or("")
+
+    if oracle == ""
+        print("skipped: SYSL_ORACLE is not set, so there is no sysl-doc to compare with")
+        return
+
+    if !dst_juicer() then return
+
+    val ref_doc = s"${parent_of(oracle).unwrap_or(".")}/sysl-doc"
+    val tree = dst_tree()
+    val ours = dst_full_site()
+    val theirs = dst_full_site()
+    val (code, _) = dst_run(["sysl", "doc", tree, "--out", s"$ours/content/api", "--site", ours])
+
+    assert_eq(code, 0)
+
+    val ran = capture(ref_doc, [tree, "--out", s"$theirs/content/api", "--site", theirs], "", [], true)
+
+    if ran.is_err()
+        print(s"skipped: there is no reference sysl-doc at $ref_doc")
+        return
+
+    assert(ran.unwrap().status.ok())
+
+    val pages = ["public/html/api/index.html", "public/html/api/demo-geo/index.html", "public/index.html"]
+
+    for i in 0..<pages.len
+        val mine = dst_read(s"$ours/${pages[i]}")
+
+        assert(mine != "")
+        assert_eq(mine, dst_read(s"$theirs/${pages[i]}"))
+end dst_matches_reference

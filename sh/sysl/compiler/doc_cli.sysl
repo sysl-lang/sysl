@@ -2,7 +2,8 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.fs.{entries, is_file, make_dir_all, read_text, remove_file, write_text}
-import sysl.text.{parse_int, Search}
+import sysl.process.{capture, Output}
+import sysl.text.{parse_int, Search, split}
 
 // `sysl doc` -- the API reference, as Markdown, from a tree's declarations and their doc comments.
 //
@@ -24,10 +25,11 @@ struct DocOptions
     version: Option[string]
     include_private: bool
     check: bool
+    site: Option[string]
 end DocOptions
 
 // What `sysl doc` does when it is told nothing.
-doc_defaults() -> DocOptions = DocOptions(".", "docs/api", "API reference", None, None, None, false, false)
+doc_defaults() -> DocOptions = DocOptions(".", "docs/api", "API reference", None, None, None, false, false, None)
 
 // The text `sysl doc --help` prints.
 doc_usage() -> string = "sysl doc — API reference from declarations and their doc comments\n" +
@@ -43,7 +45,9 @@ doc_usage() -> string = "sysl doc — API reference from declarations and their 
     "  -w, --weight <n>   the index page's place in the site's navigation. Omitted from\n" +
     "                     the frontmatter entirely when not given\n" +
     "  -V, --docversion <v>  the version being documented, shown on the pages\n" +
-    "      --private      include file- and module-private declarations\n" +
+    "      --site <dir>   after writing, build the juicer site rooted at <dir>\n" +
+    "                     (<dir> must be a juicer site, and -o must be inside it)\n" +
+    "      --private     include file- and module-private declarations\n" +
     "      --check        write nothing; exit 1 if the committed Markdown is stale\n" +
     "  -h, --help         print this\n" +
     "\n" +
@@ -54,7 +58,7 @@ doc_usage() -> string = "sysl doc — API reference from declarations and their 
 // Whether a flag is one that takes a value after it.
 private dcl_valued(a: string) -> bool =
     a == "-o" || a == "--out" || a == "-t" || a == "--title" || a == "-n" || a == "--note" ||
-    a == "-w" || a == "--weight" || a == "-V" || a == "--docversion"
+    a == "-w" || a == "--weight" || a == "-V" || a == "--docversion" || a == "--site"
 
 // The arguments after `doc`, read. `Err` is what to say instead of running -- the usage text itself
 // for `--help`, which is how `doc_command` tells asking for help from a mistake.
@@ -78,6 +82,7 @@ parse_doc_args(args: []string) -> Result[DocOptions, string]
             else if a == "-t" || a == "--title" then opts.title = v
             else if a == "-n" || a == "--note" then opts.note = Some(v)
             else if a == "-V" || a == "--docversion" then opts.version = Some(v)
+            else if a == "--site" then opts.site = Some(v)
             else
                 // Refused here rather than carried as text, so `--weight nine` fails saying so
                 // instead of writing a frontmatter key a site reads as nothing.
@@ -168,8 +173,72 @@ doc_command(args: []string, say: string -> unit) -> int
 
     val pages = doc_pages(modules, opts.title, opts.version, opts.note, opts.weight)
 
-    if opts.check then doc_check(opts.out, pages, say) else doc_write(opts.out, pages, modules.len(), say)
+    if opts.check then return doc_check(opts.out, pages, say)
+
+    val wrote = doc_write(opts.out, pages, modules.len(), say)
+
+    if wrote != Fine then return wrote
+
+    opts.site match
+        Some(site) -> doc_site(opts.out, site, "juicer", say)
+        None -> Fine
 end doc_command
+
+// Build the juicer site rooted at `site` into `<site>/public`, by running `juicer` -- `juicer` is
+// the program to run, which is a parameter so a test can name one that is not there.
+//
+// **It builds a site that already exists rather than making one.** The `juicerapi` theme the pages
+// ask for lives in juicer's own repository, so the site has to carry it, as sysl.sh does; a package
+// wanting a site of its own runs `juicer theme add` once. `out` is not handed to juicer -- the
+// site's `site.toml` decides its content tree -- but it is checked against the site, so generating
+// into one place and building another fails with a sentence rather than building a site that
+// silently lacks the pages. Both are made absolute first, since `-o docs/api --site docs` is the
+// commonest correct invocation and a textual prefix test would refuse it.
+//
+// **The Markdown is the artifact and the site the step after it**, so juicer is needed only here:
+// without `--site` nothing is run, and with it a machine that has no juicer is told where to get one.
+doc_site(out: string, site: string, juicer: string, say: string -> unit) -> int
+    val inner = absolute_path(out)
+    val outer = absolute_path(site)
+    val under = if outer.ends_with("/") then outer else s"$outer/"
+
+    if inner != outer && !inner.starts_with(under)
+        say(s"sysl doc: cannot build the site: the pages were written to '$out', which is not inside " +
+            s"the site at '$site' — give -o a directory under the site's content tree, or --site the " +
+            "site that holds them")
+        return Failed
+
+    val built = capture(juicer, ["build", "-s", site, "-d", s"$site/public"], "", [], true) match
+        Ok(o) -> o
+        Err(NotFound) ->
+            say(s"sysl doc: --site builds the site with juicer, and there is no '$juicer' on this " +
+                "machine — install it with 'brew install edadma/tap/juicer', or leave out --site to " +
+                "write the Markdown alone")
+            return Failed
+        Err(e) ->
+            say(s"sysl doc: cannot run '$juicer': $e")
+            return Failed
+
+    if !built.status.ok()
+        say(s"sysl doc: cannot build the site: ${dst_reason(built)}")
+        return Failed
+
+    say(s"sysl doc: site -> $site")
+    Fine
+end doc_site
+
+// Why juicer refused, in its own words: the first line it wrote to standard error. **Only the first**
+// -- the installed juicer follows its sentence with the stack trace of the exception that carried it,
+// which says where in juicer the sentence was composed and nothing a reader of this command can use.
+private dst_reason(o: Output) -> string
+    val said = o.err.unwrap_or("")
+    val lines = split(said, "\n")
+
+    for i in 0..<lines.len
+        if lines[i] != "" then return lines[i]
+
+    s"juicer ${o.status}"
+end dst_reason
 
 // The pages under `out` that an earlier run wrote for a module the tree no longer has.
 //
