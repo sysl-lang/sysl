@@ -1,0 +1,251 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, metadata, write_text}
+import sysl.text.{join, Search}
+
+// `bf16` on wasm32: the back end cannot select a `bfloat` operation there, so the lowered module is
+// rewritten before it is printed -- every `bf16` a register holds becomes the `i16` of its bits,
+// widened to `float` (`zext`, `shl 16`, `bitcast`) for arithmetic and narrowed back with
+// round-to-nearest-even and a quiet-NaN `select`. Every other machine keeps `bfloat`.
+//
+// **Every expected text here was read out of the reference (0.0.152)** with
+// `sysl emit-llvm main.sysl --target wasm32-freestanding --no-std-lib` over `wbf_source`, and the
+// host text with the same command and no target.
+
+private val wbf_source: string = raw"""
+    import sysl.math.Float
+
+    @export("root")
+    root(x: bf16) -> bf16 = x.sqrt()
+
+    @export("widen")
+    widen(x: bf16) -> f32 = f32(x)
+
+    @export("narrow")
+    narrow(x: f32) -> bf16 = bf16(x)
+
+    @export("add")
+    add(x: bf16, y: bf16) -> bf16 = x + y
+    """
+
+private wbf_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end wbf_run
+
+private wbf_program() -> string
+    val root = make_temp_dir("sysl-wbf-").unwrap()
+
+    write_text(s"$root/main.sysl", wbf_source).unwrap()
+    root
+end wbf_program
+
+private wbf_library_here() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end wbf_library_here
+
+// The definition of `symbol`, from its `define` line to its closing brace.
+private wbf_body(text: string, symbol: string) -> string
+    var out = ""
+    var inside = false
+    val lines = lines_of(text)
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !inside && line.starts_with("define ") && line.index_of(s"@$symbol(").is_some()
+            inside = true
+
+        if inside
+            out = out + line + "\n"
+
+            if line == "}" then return out
+
+    out
+end wbf_body
+
+private wbf_emit(target: Option[string]) -> string
+    val root = wbf_program()
+    val got = target match
+        Some(t) -> wbf_run(["sysl", "emit-llvm", s"$root/main.sysl", "--target", t, "--no-std-lib"])
+        None -> wbf_run(["sysl", "emit-llvm", s"$root/main.sysl", "--no-std-lib"])
+
+    assert_eq(got.0, 0, got.1)
+    got.1
+end wbf_emit
+
+@test("on wasm32 bf16.sqrt widens its bits to float, calls the f32 intrinsic and narrows back")
+wbf_sqrt_on_wasm32()
+    if !wbf_library_here() then return
+
+    assert_eq(wbf_body(wbf_emit(Some("wasm32-freestanding")), "bf16.sqrt"), raw"""
+        define i16 @bf16.sqrt(i16 %self.param) {
+        entry:
+          %self.addr = alloca i16
+          store i16 %self.param, ptr %self.addr
+          %t1 = load i16, ptr %self.addr
+          %bf16.soft.1 = zext i16 %t1 to i32
+          %bf16.soft.2 = shl i32 %bf16.soft.1, 16
+          %t2 = bitcast i32 %bf16.soft.2 to float
+          %t3 = call float @llvm.sqrt.f32(float %t2)
+          %bf16.soft.3 = bitcast float %t3 to i32
+          %bf16.soft.4 = lshr i32 %bf16.soft.3, 16
+          %bf16.soft.5 = and i32 %bf16.soft.4, 1
+          %bf16.soft.6 = add i32 %bf16.soft.5, 32767
+          %bf16.soft.7 = add i32 %bf16.soft.3, %bf16.soft.6
+          %bf16.soft.8 = lshr i32 %bf16.soft.7, 16
+          %bf16.soft.9 = fcmp uno float %t3, %t3
+          %bf16.soft.10 = or i32 %bf16.soft.4, 64
+          %bf16.soft.11 = select i1 %bf16.soft.9, i32 %bf16.soft.10, i32 %bf16.soft.8
+          %t4 = trunc i32 %bf16.soft.11 to i16
+          ret i16 %t4
+        }
+        """)
+end wbf_sqrt_on_wasm32
+
+@test("on wasm32 a bf16 widened to f32 is its bits shifted into the top half of a float")
+wbf_widen_on_wasm32()
+    if !wbf_library_here() then return
+
+    val text = wbf_emit(Some("wasm32-freestanding"))
+
+    assert_eq(wbf_body(text, "widen$$sysl"), raw"""
+        define float @widen$$sysl(i16 %x.param) {
+        entry:
+          %x.addr = alloca i16
+          store i16 %x.param, ptr %x.addr
+          %t1 = load i16, ptr %x.addr
+          %bf16.soft.1 = zext i16 %t1 to i32
+          %bf16.soft.2 = shl i32 %bf16.soft.1, 16
+          %t2 = bitcast i32 %bf16.soft.2 to float
+          ret float %t2
+        }
+        """)
+    assert_eq(wbf_body(text, "widen"), raw"""
+        define float @widen(i16 %c.0) {
+        entry:
+          %t1 = call float @widen$$sysl(i16 %c.0)
+          ret float %t1
+        }
+        """)
+end wbf_widen_on_wasm32
+
+@test("on wasm32 an f32 narrowed to bf16 rounds to nearest even and keeps a NaN quiet")
+wbf_narrow_on_wasm32()
+    if !wbf_library_here() then return
+
+    assert_eq(wbf_body(wbf_emit(Some("wasm32-freestanding")), "narrow$$sysl"), raw"""
+        define i16 @narrow$$sysl(float %x.param) {
+        entry:
+          %x.addr = alloca float
+          store float %x.param, ptr %x.addr
+          %t1 = load float, ptr %x.addr
+          %bf16.soft.1 = bitcast float %t1 to i32
+          %bf16.soft.2 = lshr i32 %bf16.soft.1, 16
+          %bf16.soft.3 = and i32 %bf16.soft.2, 1
+          %bf16.soft.4 = add i32 %bf16.soft.3, 32767
+          %bf16.soft.5 = add i32 %bf16.soft.1, %bf16.soft.4
+          %bf16.soft.6 = lshr i32 %bf16.soft.5, 16
+          %bf16.soft.7 = fcmp uno float %t1, %t1
+          %bf16.soft.8 = or i32 %bf16.soft.2, 64
+          %bf16.soft.9 = select i1 %bf16.soft.7, i32 %bf16.soft.8, i32 %bf16.soft.6
+          %t2 = trunc i32 %bf16.soft.9 to i16
+          ret i16 %t2
+        }
+        """)
+end wbf_narrow_on_wasm32
+
+// The operation's own register is numbered before the widenings that feed it, as the reference
+// takes it first.
+@test("on wasm32 a bf16 addition widens both operands, adds as float and narrows the sum")
+wbf_add_on_wasm32()
+    if !wbf_library_here() then return
+
+    assert_eq(wbf_body(wbf_emit(Some("wasm32-freestanding")), "add$$sysl"), raw"""
+        define i16 @add$$sysl(i16 %x.param, i16 %y.param) {
+        entry:
+          %x.addr = alloca i16
+          %y.addr = alloca i16
+          store i16 %x.param, ptr %x.addr
+          store i16 %y.param, ptr %y.addr
+          %t1 = load i16, ptr %x.addr
+          %t2 = load i16, ptr %y.addr
+          %bf16.soft.2 = zext i16 %t1 to i32
+          %bf16.soft.3 = shl i32 %bf16.soft.2, 16
+          %bf16.soft.4 = bitcast i32 %bf16.soft.3 to float
+          %bf16.soft.5 = zext i16 %t2 to i32
+          %bf16.soft.6 = shl i32 %bf16.soft.5, 16
+          %bf16.soft.7 = bitcast i32 %bf16.soft.6 to float
+          %bf16.soft.1 = fadd float %bf16.soft.4, %bf16.soft.7
+          %bf16.soft.8 = bitcast float %bf16.soft.1 to i32
+          %bf16.soft.9 = lshr i32 %bf16.soft.8, 16
+          %bf16.soft.10 = and i32 %bf16.soft.9, 1
+          %bf16.soft.11 = add i32 %bf16.soft.10, 32767
+          %bf16.soft.12 = add i32 %bf16.soft.8, %bf16.soft.11
+          %bf16.soft.13 = lshr i32 %bf16.soft.12, 16
+          %bf16.soft.14 = fcmp uno float %bf16.soft.1, %bf16.soft.1
+          %bf16.soft.15 = or i32 %bf16.soft.9, 64
+          %bf16.soft.16 = select i1 %bf16.soft.14, i32 %bf16.soft.15, i32 %bf16.soft.13
+          %t3 = trunc i32 %bf16.soft.16 to i16
+          ret i16 %t3
+        }
+        """)
+end wbf_add_on_wasm32
+
+// No other machine is rewritten: the host keeps `bfloat`, the reference's text unchanged.
+@test("on the host bf16 stays bfloat, with no soft lowering")
+wbf_host_keeps_bfloat()
+    if !wbf_library_here() then return
+
+    val text = wbf_emit(None)
+
+    assert(!text.contains("bf16.soft"), text)
+    assert_eq(wbf_body(text, "bf16.sqrt"), raw"""
+        define bfloat @bf16.sqrt(bfloat %self.param) {
+        entry:
+          %self.addr = alloca bfloat
+          store bfloat %self.param, ptr %self.addr
+          %t1 = load bfloat, ptr %self.addr
+          %t2 = fpext bfloat %t1 to float
+          %t3 = call float @llvm.sqrt.f32(float %t2)
+          %t4 = fptrunc float %t3 to bfloat
+          ret bfloat %t4
+        }
+        """)
+    assert_eq(wbf_body(text, "add$$sysl"), raw"""
+        define bfloat @add$$sysl(bfloat %x.param, bfloat %y.param) {
+        entry:
+          %x.addr = alloca bfloat
+          %y.addr = alloca bfloat
+          store bfloat %x.param, ptr %x.addr
+          store bfloat %y.param, ptr %y.addr
+          %t1 = load bfloat, ptr %x.addr
+          %t2 = load bfloat, ptr %y.addr
+          %t3 = fadd bfloat %t1, %t2
+          ret bfloat %t3
+        }
+        """)
+end wbf_host_keeps_bfloat
+
+// What failed before the rewrite was clang, on the standard module's own `bf16.sqrt`
+// (`Cannot select: f32 = bf16_to_fp`), so the proof is a whole build reaching a `.wasm`.
+@test("the standard module builds for wasm32-freestanding, its bf16 bodies included")
+wbf_std_builds_for_wasm32()
+    if !wbf_library_here() then return
+
+    val root = wbf_program()
+    val got = wbf_run(["sysl", "build", s"$root/main.sysl", "--target", "wasm32-freestanding", "-o", s"$root/out.wasm"])
+
+    assert_eq(got.0, 0, got.1)
+    assert(metadata(s"$root/out.wasm").is_ok(), got.1)
+end wbf_std_builds_for_wasm32

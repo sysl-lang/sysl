@@ -1,0 +1,821 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int}
+import sysl.text.Search
+
+// **`bf16` on a machine whose back end cannot convert it** -- a module rewritten so that no `bfloat`
+// is left in it, for the machines `bf16_as_bits` names.
+//
+// `bf16` is a shorter `f32`: its sixteen bits are the top sixteen of a binary32, which is the whole
+// of what this needs. Every other back end sysl targets lowers a `bfloat` operation by widening it to
+// `float`, computing, and rounding back, and WebAssembly's does too -- except that it has no way to
+// select the two conversions themselves, so the first `fpext` or `fptrunc` it meets stops the build
+// with *"Cannot select: bf16_to_fp"*. Every `Float for bf16` body in the standard module has one.
+// Nothing short of removing the type gets past it: a `bitcast` to `i16` and an `xor` of the sign bit
+// is folded straight back into an `fneg bfloat`, which fails the same way.
+//
+// **So a `bf16` is carried as an `i16` of its bits, and every operation on one is the widening
+// written out.** The widening is exact and is a shift; the narrowing is binary32 rounded to the
+// nearest `bf16`, ties to even, with a NaN kept a quiet NaN -- the answer the other back ends give
+// for the same program.
+//
+// **Two conversions need more than the narrowing**, because they are where one rounding would
+// otherwise become two: a `real` and an integer wider than a binary32's significand. Each is first
+// rounded *to odd* at binary32 -- truncated, with the lowest bit set if anything was lost -- which
+// is what makes the second rounding the only one that counts. An arithmetic operation needs no such
+// care: a binary32 result of two `bf16` operands rounds to the same `bf16` either way.
+//
+// The registers it adds are named `bf16.soft.N`, numbered per function, which nothing else
+// produces: a local's slot is `<name>.addr` and a temporary is `t<N>`. The order every register is
+// numbered and every instruction laid down in is the reference's, so the text is the same text.
+
+// Whether a `bf16` reaches this machine's back end as the `i16` of its bits rather than as a
+// `bfloat`. WebAssembly is the one back end that cannot convert a `bfloat`.
+bf16_as_bits(t: Target) -> bool = t.cpu == Wasm32
+
+// The rewrite's state: the register counter of the function being rewritten, the block being
+// rebuilt, and -- across the whole module -- the intrinsics it declared and the ones it replaced.
+private struct SoftBf
+    n: int
+    out: Buf[Inst]
+    added: Buf[IrFuncSig]
+    replaced: Buf[string]
+end SoftBf
+
+// The module with every `bfloat` replaced by the `i16` of its bits.
+soft_bf16_lower(m: IrModule) -> IrModule
+    var s = SoftBf(0, buf(), buf(), buf())
+
+    var funcs: Buf[IrFunc] = buf()
+
+    for i in 0..<m.funcs.len()
+        funcs.push(sb_func(&s, m.funcs.at(i)))
+
+    var thunks: Buf[IrFunc] = buf()
+
+    for i in 0..<m.thunks.len()
+        thunks.push(sb_func(&s, m.thunks.at(i)))
+
+    val entry: Option[IrFunc] = m.entry match
+        Some(f) -> Some(sb_func(&s, f))
+        None -> None
+
+    val init: Option[IrInit] = m.init match
+        Some(it) -> Some(IrInit(sb_func(&s, it.func), sb_global(it.list)))
+        None -> None
+
+    var runtime: Buf[IrRuntime] = buf()
+
+    for i in 0..<m.runtime.len()
+        runtime.push(m.runtime.at(i) match
+            RtEmitted(f) -> RtEmitted(sb_func(&s, f))
+            other -> other)
+
+    var declares: Buf[IrFuncSig] = buf()
+
+    for i in 0..<m.declares.len()
+        val d = m.declares.at(i)
+
+        if !sb_has(s.replaced, d.name) then declares.push(sb_sig(d))
+
+    val kept = declares.len()
+
+    for i in 0..<s.added.len()
+        val a = s.added.at(i)
+        var dup = false
+
+        for j in 0..<kept
+            if declares.at(j).name == a.name then dup = true
+
+        if !dup then declares.push(a)
+
+    var structs: Buf[IrTypeDef] = buf()
+
+    for i in 0..<m.structs.len()
+        structs.push(sb_type_def(m.structs.at(i)))
+
+    var enums: Buf[IrTypeDef] = buf()
+
+    for i in 0..<m.enums.len()
+        enums.push(sb_type_def(m.enums.at(i)))
+
+    var boxes: Buf[IrTypeDef] = buf()
+
+    for i in 0..<m.boxes.len()
+        boxes.push(sb_type_def(m.boxes.at(i)))
+
+    var imports: Buf[IrFuncSig] = buf()
+
+    for i in 0..<m.imports.len()
+        imports.push(sb_sig(m.imports.at(i)))
+
+    var globals: Buf[IrGlobal] = buf()
+
+    for i in 0..<m.globals.len()
+        globals.push(sb_global(m.globals.at(i)))
+
+    val used: Option[IrGlobal] = m.used match
+        Some(g) -> Some(sb_global(g))
+        None -> None
+
+    IrModule(m.triple, declares, structs, enums, boxes, imports, globals, runtime, funcs, thunks,
+             entry, used, init)
+end soft_bf16_lower
+
+// The sixteen bits of the `bf16` nearest a `real`, ties to even -- the narrowing below, at compile
+// time, for a constant. A constant written down at `bf16` is one exactly, so this rounds nothing in
+// practice; it is the general case so that it cannot be wrong.
+bf16_bits_of(double_bits: long) -> int
+    val d = real_of_bits(double_bits)
+    var f = f32(d)
+    val p: *u32 = ptr_cast(&f)
+    var u = *p
+
+    if d == d && real(f) != d
+        if sb_magnitude(real(f)) > sb_magnitude(d) then u -= 1
+
+        u = u | 1
+
+    if f != f then int(((u >> 16) | 0x40) & 0xffff)
+    else int(((u + 0x7fff + ((u >> 16) & 1)) >> 16) & 0xffff)
+end bf16_bits_of
+
+private sb_magnitude(x: real) -> real = if x < 0.0 then -x else x
+
+private sb_has(names: Buf[string], name: string) -> bool
+    for i in 0..<names.len()
+        if names.at(i) == name then return true
+
+    false
+end sb_has
+
+// ---- types and constants, which change spelling and nothing else -------------------------------
+
+private sb_bf() -> LType = LFloat(16, true)
+
+private sb_f32() -> LType = LFloat(32, false)
+
+private sb_ty(t: LType) -> LType = t match
+    LFloat(16, true) -> LInt(16)
+    LArr(n, e) -> LArr(n, sb_ty(*e))
+    LVec(n, e) -> LVec(n, sb_ty(*e))
+    LStruct(fs) -> LStruct(sb_tys(fs))
+    other -> other
+
+private sb_tys(ts: Buf[LType]) -> Buf[LType]
+    var out: Buf[LType] = buf()
+
+    for i in 0..<ts.len()
+        out.push(sb_ty(ts.at(i)))
+
+    out
+end sb_tys
+
+private sb_attr(a: IrAttr) -> IrAttr = a match
+    AttrSRet(t) -> AttrSRet(sb_ty(t))
+    AttrByVal(t) -> AttrByVal(sb_ty(t))
+    other -> other
+
+private sb_attrs(attrs: Buf[IrAttr]) -> Buf[IrAttr]
+    var out: Buf[IrAttr] = buf()
+
+    for i in 0..<attrs.len()
+        out.push(sb_attr(attrs.at(i)))
+
+    out
+end sb_attrs
+
+private sb_fn_type(f: IrFnType) -> IrFnType
+    var params: Buf[IrParam] = buf()
+
+    for i in 0..<f.params.len()
+        val p = f.params.at(i)
+
+        params.push(p with { ty = sb_ty(p.ty), attrs = sb_attrs(p.attrs) })
+
+    f with { ret = sb_ty(f.ret), params = params, ret_attrs = sb_attrs(f.ret_attrs) }
+end sb_fn_type
+
+private sb_sig(s: IrFuncSig) -> IrFuncSig = s with { ty = sb_fn_type(s.ty) }
+
+private sb_type_def(d: IrTypeDef) -> IrTypeDef = d with { fields = sb_tys(d.fields) }
+
+private sb_global(g: IrGlobal) -> IrGlobal
+    val value: Option[Val] = g.value match
+        Some(v) -> Some(sb_value(v, g.ty))
+        None -> None
+
+    g with { ty = sb_ty(g.ty), value = value }
+end sb_global
+
+private sb_arg(a: IrArg) -> IrArg = IrArg(sb_ty(a.ty), sb_value(a.value, a.ty), sb_attrs(a.attrs))
+
+private sb_args(args: Buf[IrArg]) -> Buf[IrArg]
+    var out: Buf[IrArg] = buf()
+
+    for i in 0..<args.len()
+        out.push(sb_arg(args.at(i)))
+
+    out
+end sb_args
+
+// A value of type `t`, respelled. Only a floating constant at `bf16` changes: it becomes its bits,
+// written signed so that it reads as an `i16` whatever the top bit is.
+private sb_value(v: Val, t: LType) -> Val = v match
+    VFloat(bits) ->
+        if sb_is_scalar_bf(t)
+            val b = bf16_bits_of(bits)
+
+            VInt(from_int(long(if b >= 0x8000 then b - 0x10000 else b)))
+        else v
+    VSplat(lane, x) -> VSplat(sb_ty(lane), sb_value(*x, lane))
+    VAgg(fs) -> VAgg(sb_args(fs))
+    VArray(es) -> VArray(sb_args(es))
+    _ -> v
+
+private sb_is_scalar_bf(t: LType) -> bool = t match
+    LFloat(16, true) -> true
+    _ -> false
+
+// Whether `t` is a `bf16` a register holds -- a scalar or a vector of them -- which is what an
+// operation has to be rewritten for. A `bf16` inside an aggregate is only ever moved.
+private sb_is_bf(t: LType) -> bool = t match
+    LFloat(16, true) -> true
+    LVec(_, e) -> sb_is_scalar_bf(*e)
+    _ -> false
+
+// `lane` in the shape of `t`: itself for a scalar, `<N x lane>` for a vector of `N`.
+private sb_as(t: LType, lane: LType) -> LType = t match
+    LVec(n, _) -> LVec(n, lane)
+    _ -> lane
+
+private sb_same(a: LType, b: LType) -> bool = l_render(a) == l_render(b)
+
+// An integer constant in the shape of `t`.
+private sb_k(t: LType, c: int) -> Val = t match
+    LVec(_, lane) -> VSplat(*lane, VInt(from_int(long(c))))
+    _ -> VInt(from_int(long(c)))
+
+// A floating constant in the shape of `t`, from a `real`'s bits.
+private sb_kf(t: LType, bits: long) -> Val = t match
+    LVec(_, lane) -> VSplat(*lane, VFloat(bits))
+    _ -> VFloat(bits)
+
+// The suffix an intrinsic overloaded on `t` is named with.
+private sb_suffix(t: LType) -> string = l_overload_suffix(t) match
+    Some(x) -> x
+    None -> l_render(t)
+
+// ---- one function --------------------------------------------------------------------------
+
+private sb_func(s: *SoftBf, f: IrFunc) -> IrFunc
+    s.n = 0
+
+    var blocks: Buf[IrBlock] = buf()
+
+    for i in 0..<f.blocks.len()
+        val b = f.blocks.at(i)
+
+        s.out = buf()
+
+        for j in 0..<b.instrs.len()
+            sb_inst(s, b.instrs.at(j))
+
+        val term: Option[Inst] = b.terminator match
+            Some(t) -> Some(sb_terminator(t))
+            None -> None
+
+        blocks.push(IrBlock(b.label, s.out, term))
+
+    IrFunc(sb_sig(f.sig), blocks)
+end sb_func
+
+private sb_terminator(i: Inst) -> Inst = i match
+    InRet(Some(t), v) ->
+        val value: Option[Val] = v match
+            Some(x) -> Some(sb_value(x, t))
+            None -> None
+
+        InRet(Some(sb_ty(t)), value)
+    other -> other
+
+private sb_fresh(s: *SoftBf) -> Val
+    s.n += 1
+    VReg(s"bf16.soft.${s.n}")
+end sb_fresh
+
+private sb_reg(s: *SoftBf, dest: Option[Val]) -> Val = dest match
+    Some(d) -> d
+    None -> sb_fresh(s)
+
+private sb_emit(s: *SoftBf, i: Inst) = s.out.push(i)
+
+private sb_declare(s: *SoftBf, callee: string, ret: LType, ps: Buf[LType]) -> Val
+    for i in 0..<s.added.len()
+        if s.added.at(i).name == callee then return VGlobal(callee)
+
+    var params: Buf[IrParam] = buf()
+
+    for i in 0..<ps.len()
+        params.push(ir_param(ps.at(i)))
+
+    s.added.push(ir_sig(callee, ir_fn_type(ret, params)))
+    VGlobal(callee)
+end sb_declare
+
+// ---- the two conversions everything else is built from -----------------------------------------
+
+// A `bf16` (in the shape of `t`) as the binary32 it is the top half of -- exact.
+private sb_widen(s: *SoftBf, v: Val, t: LType, dest: Option[Val]) -> Val
+    val i32 = sb_as(t, LInt(32))
+    val z = sb_fresh(s)
+
+    sb_emit(s, InCast(z, CastZExt, sb_as(t, LInt(16)), v, i32))
+
+    val sh = sb_fresh(s)
+
+    sb_emit(s, InBin(sh, OpShl, i32, z, sb_k(i32, 16)))
+
+    val f = sb_reg(s, dest)
+
+    sb_emit(s, InCast(f, CastBitCast, i32, sh, sb_as(t, sb_f32())))
+    f
+end sb_widen
+
+// A binary32 rounded to the nearest `bf16`, ties to even. Adding `0x7fff` plus the lowest bit that
+// survives is the whole of round-to-nearest-even on the discarded half, and it carries into the
+// exponent exactly where the answer is the next binade or infinity. A NaN is the one input it would
+// get wrong -- its payload could carry into the sign -- so a NaN keeps its top bits and is made
+// quiet instead.
+private sb_narrow(s: *SoftBf, f: Val, t: LType, dest: Option[Val]) -> Val
+    val w = sb_as(t, LInt(32))
+    val u = sb_fresh(s)
+
+    sb_emit(s, InCast(u, CastBitCast, sb_as(t, sb_f32()), f, w))
+
+    val hi = sb_fresh(s)
+
+    sb_emit(s, InBin(hi, OpLShr, w, u, sb_k(w, 16)))
+
+    val odd = sb_fresh(s)
+
+    sb_emit(s, InBin(odd, OpAnd, w, hi, sb_k(w, 1)))
+
+    val bias = sb_fresh(s)
+
+    sb_emit(s, InBin(bias, OpAdd, w, odd, sb_k(w, 0x7fff)))
+
+    val sum = sb_fresh(s)
+
+    sb_emit(s, InBin(sum, OpAdd, w, u, bias))
+
+    val near = sb_fresh(s)
+
+    sb_emit(s, InBin(near, OpLShr, w, sum, sb_k(w, 16)))
+
+    val nan = sb_fresh(s)
+
+    sb_emit(s, InFloatCmp(nan, FUno, sb_as(t, sb_f32()), f, f))
+
+    val quiet = sb_fresh(s)
+
+    sb_emit(s, InBin(quiet, OpOr, w, hi, sb_k(w, 0x40)))
+
+    val pick = sb_fresh(s)
+
+    sb_emit(s, InSelect(pick, nan, w, quiet, near, sb_as(t, LInt(1))))
+
+    val r = sb_reg(s, dest)
+
+    sb_emit(s, InCast(r, CastTrunc, w, pick, sb_as(t, LInt(16))))
+    r
+end sb_narrow
+
+// A binary32 rounded to odd: the truncation towards zero, with the lowest bit set when anything was
+// discarded. `rne` is the round-to-nearest answer and `away` says whether it rounded away from zero,
+// in which case the truncation is the representation one below -- the bit patterns of a
+// sign-magnitude format count magnitudes, across binades and up to infinity alike.
+private sb_to_odd(s: *SoftBf, rne: Val, inexact: Val, away: Val, t: LType) -> Val
+    val w = sb_as(t, LInt(32))
+    val c = sb_as(t, LInt(1))
+    val bits = sb_fresh(s)
+
+    sb_emit(s, InCast(bits, CastBitCast, sb_as(t, sb_f32()), rne, w))
+
+    val step = sb_fresh(s)
+
+    sb_emit(s, InCast(step, CastZExt, c, away, w))
+
+    val down = sb_fresh(s)
+
+    sb_emit(s, InBin(down, OpSub, w, bits, step))
+
+    val jam = sb_fresh(s)
+
+    sb_emit(s, InBin(jam, OpOr, w, down, sb_k(w, 1)))
+
+    val pick = sb_fresh(s)
+
+    sb_emit(s, InSelect(pick, inexact, w, jam, bits, c))
+
+    val r = sb_fresh(s)
+
+    sb_emit(s, InCast(r, CastBitCast, w, pick, sb_as(t, sb_f32())))
+    r
+end sb_to_odd
+
+// A `real` to `bf16`, through binary32 rounded to odd so that only the last rounding counts.
+private sb_from_real(s: *SoftBf, v: Val, from: LType, t: LType, dest: Option[Val]) -> Val
+    val f32t = sb_as(t, sb_f32())
+    val c = sb_as(t, LInt(1))
+    val f = sb_fresh(s)
+
+    sb_emit(s, InCast(f, CastFPTrunc, from, v, f32t))
+
+    val back = sb_fresh(s)
+
+    sb_emit(s, InCast(back, CastFPExt, f32t, f, from))
+
+    val lost = sb_fresh(s)
+
+    sb_emit(s, InFloatCmp(lost, FOne, from, back, v))
+
+    val gt = sb_fresh(s)
+
+    sb_emit(s, InFloatCmp(gt, FOgt, from, back, v))
+
+    val neg = sb_fresh(s)
+
+    sb_emit(s, InFloatCmp(neg, FOlt, from, v, sb_kf(from, 0)))
+
+    val away = sb_fresh(s)
+
+    sb_emit(s, InBin(away, OpXor, c, gt, neg))
+    sb_narrow(s, sb_to_odd(s, f, lost, away, t), t, dest)
+end sb_from_real
+
+private sb_int_bits(t: LType) -> int = t match
+    LInt(b) -> b
+    LVec(_, e) -> sb_int_bits(*e)
+    _ -> 0
+
+// An integer to `bf16`. One that fits a binary32's significand converts exactly and is only
+// narrowed. A wider one keeps its top twenty-four bits with the rest jammed into the lowest --
+// rounding to odd, by hand -- and is scaled back by the power of two it was shifted by. A magnitude
+// past `2^128` is past every `bf16` and is infinity.
+private sb_from_int(s: *SoftBf, v: Val, from: LType, signed: bool, t: LType, dest: Option[Val]) -> Val
+    val bits = sb_int_bits(from)
+    val op = if signed then CastSIToFP else CastUIToFP
+    val f32t = sb_as(t, sb_f32())
+
+    if bits <= 24
+        val f = sb_fresh(s)
+
+        sb_emit(s, InCast(f, op, from, v, f32t))
+        return sb_narrow(s, f, t, dest)
+
+    val c = sb_as(t, LInt(1))
+    var mag = v
+    var neg: Option[Val] = None
+
+    if signed
+        val n = sb_fresh(s)
+
+        sb_emit(s, InIntCmp(n, ISlt, from, v, sb_k(from, 0)))
+
+        val flip = sb_fresh(s)
+
+        sb_emit(s, InBin(flip, OpSub, from, sb_k(from, 0), v))
+
+        val m = sb_fresh(s)
+
+        sb_emit(s, InSelect(m, n, from, flip, v, c))
+        mag = m
+        neg = Some(n)
+
+    val i1 = LInt(1)
+    var ctlz_ps: Buf[LType] = buf()
+
+    ctlz_ps.push(from)
+    ctlz_ps.push(i1)
+
+    val ctlz = sb_declare(s, s"llvm.ctlz.${sb_suffix(from)}", from, ctlz_ps)
+    var ctlz_args: Buf[IrArg] = buf()
+
+    ctlz_args.push(ir_arg(from, mag))
+    ctlz_args.push(ir_arg(i1, VBool(false)))
+
+    val lz = sb_fresh(s)
+
+    sb_emit(s, ir_call(Some(lz), from, ctlz, ctlz_args))
+
+    val length = sb_fresh(s)
+
+    sb_emit(s, InBin(length, OpSub, from, sb_k(from, bits), lz))
+
+    val over = sb_fresh(s)
+
+    sb_emit(s, InIntCmp(over, IUgt, from, length, sb_k(from, 24)))
+
+    val excess = sb_fresh(s)
+
+    sb_emit(s, InBin(excess, OpSub, from, length, sb_k(from, 24)))
+
+    val shift = sb_fresh(s)
+
+    sb_emit(s, InSelect(shift, over, from, excess, sb_k(from, 0), c))
+
+    val kept = sb_fresh(s)
+
+    sb_emit(s, InBin(kept, OpLShr, from, mag, shift))
+
+    val unit = sb_fresh(s)
+
+    sb_emit(s, InBin(unit, OpShl, from, sb_k(from, 1), shift))
+
+    val mask = sb_fresh(s)
+
+    sb_emit(s, InBin(mask, OpSub, from, unit, sb_k(from, 1)))
+
+    val lost = sb_fresh(s)
+
+    sb_emit(s, InBin(lost, OpAnd, from, mag, mask))
+
+    val sticky = sb_fresh(s)
+
+    sb_emit(s, InIntCmp(sticky, INe, from, lost, sb_k(from, 0)))
+
+    val stick = sb_fresh(s)
+
+    sb_emit(s, InCast(stick, CastZExt, c, sticky, from))
+
+    val jammed = sb_fresh(s)
+
+    sb_emit(s, InBin(jammed, OpOr, from, kept, stick))
+
+    val w = sb_as(t, LInt(32))
+    val top = sb_fresh(s)
+
+    sb_emit(s, InCast(top, CastUIToFP, w, sb_word(s, jammed, from, bits, w), f32t))
+
+    val exp = sb_fresh(s)
+
+    sb_emit(s, InBin(exp, OpAdd, w, sb_word(s, shift, from, bits, w), sb_k(w, 127)))
+
+    val field = sb_fresh(s)
+
+    sb_emit(s, InBin(field, OpShl, w, exp, sb_k(w, 23)))
+
+    val scale = sb_fresh(s)
+
+    sb_emit(s, InCast(scale, CastBitCast, w, field, f32t))
+
+    val prod = sb_fresh(s)
+
+    sb_emit(s, InBin(prod, OpFMul, f32t, top, scale))
+
+    var ranged = prod
+
+    if bits > 128
+        val huge = sb_fresh(s)
+
+        sb_emit(s, InIntCmp(huge, IUgt, from, length, sb_k(from, 128)))
+
+        val r = sb_fresh(s)
+
+        sb_emit(s, InSelect(r, huge, f32t, sb_kf(f32t, 9218868437227405312), prod, c))
+        ranged = r
+
+    var signed_value = ranged
+
+    neg match
+        Some(n) ->
+            val flipped = sb_fresh(s)
+
+            sb_emit(s, InNeg(flipped, f32t, ranged))
+
+            val r = sb_fresh(s)
+
+            sb_emit(s, InSelect(r, n, f32t, flipped, ranged, c))
+            signed_value = r
+        None -> ()
+
+    sb_narrow(s, signed_value, t, dest)
+end sb_from_int
+
+// An integer of `bits` as a word of thirty-two.
+private sb_word(s: *SoftBf, x: Val, from: LType, bits: int, w: LType) -> Val
+    if bits == 32 then return x
+
+    val r = sb_fresh(s)
+
+    sb_emit(s, InCast(r, if bits > 32 then CastTrunc else CastZExt, from, x, w))
+    r
+end sb_word
+
+// ---- the instructions ---------------------------------------------------------------------
+
+private sb_inst(s: *SoftBf, i: Inst) = i match
+    InBin(d, op, t, a, b) ->
+        if sb_is_bf(t)
+            val r = sb_fresh(s)
+            val wa = sb_widen(s, sb_value(a, t), t, None)
+            val wb = sb_widen(s, sb_value(b, t), t, None)
+
+            sb_emit(s, InBin(r, op, sb_as(t, sb_f32()), wa, wb))
+            sb_narrow(s, r, t, Some(d))
+        else sb_emit(s, i)
+
+    // Negation is the sign bit, and nothing else: a NaN keeps its payload, which is what `fneg`
+    // promises and what widening would also have kept.
+    InNeg(d, t, v) ->
+        if sb_is_bf(t) then sb_emit(s, InBin(d, OpXor, sb_ty(t), sb_value(v, t), sb_k(sb_ty(t), -32768)))
+        else sb_emit(s, i)
+
+    InFloatCmp(d, p, t, a, b) ->
+        if sb_is_bf(t)
+            val wa = sb_widen(s, sb_value(a, t), t, None)
+            val wb = sb_widen(s, sb_value(b, t), t, None)
+
+            sb_emit(s, InFloatCmp(d, p, sb_as(t, sb_f32()), wa, wb))
+        else sb_emit(s, i)
+
+    InCast(d, op, from, v, to) ->
+        if sb_is_bf(from) || sb_is_bf(to) then sb_cast(s, d, op, from, sb_value(v, from), to)
+        else sb_emit(s, i)
+
+    InCall(d, ret, callee, args, ret_attrs, callee_type, fast, must_tail) ->
+        if sb_is_intrinsic_on_bf(callee, ret, args) then sb_intrinsic(s, d, ret, callee, args, fast)
+        else
+            val ct: Option[IrFnType] = callee_type match
+                Some(f) -> Some(sb_fn_type(f))
+                None -> None
+
+            sb_emit(s, InCall(d, sb_ty(ret), callee, sb_args(args), sb_attrs(ret_attrs), ct, fast,
+                              must_tail))
+
+    InAlloca(d, t, align) -> sb_emit(s, InAlloca(d, sb_ty(t), align))
+    InLoad(d, t, p, acc, align) -> sb_emit(s, InLoad(d, sb_ty(t), p, acc, align))
+    InStore(t, v, p, acc, align) -> sb_emit(s, InStore(sb_ty(t), sb_value(v, t), p, acc, align))
+    InGep(d, t, p, idx) -> sb_emit(s, InGep(d, sb_ty(t), p, sb_args(idx)))
+    InExtract(d, t, agg, idx) -> sb_emit(s, InExtract(d, sb_ty(t), sb_value(agg, t), idx))
+    InInsert(d, t, agg, vt, v, idx) ->
+        sb_emit(s, InInsert(d, sb_ty(t), sb_value(agg, t), sb_ty(vt), sb_value(v, vt), idx))
+    InSelect(d, c, t, a, b, ct) -> sb_emit(s, InSelect(d, c, sb_ty(t), sb_value(a, t), sb_value(b, t), ct))
+    InInsertElement(d, t, vec, et, v, ix) ->
+        sb_emit(s, InInsertElement(d, sb_ty(t), sb_value(vec, t), sb_ty(et), sb_value(v, et), sb_arg(ix)))
+    InExtractElement(d, t, vec, ix) -> sb_emit(s, InExtractElement(d, sb_ty(t), sb_value(vec, t), sb_arg(ix)))
+    InShuffle(d, t, a, b, mask) ->
+        sb_emit(s, InShuffle(d, sb_ty(t), sb_value(a, t), sb_value(b, t), sb_arg(mask)))
+    InAsm(d, ret, text, cons, args) -> sb_emit(s, InAsm(d, sb_ty(ret), text, cons, sb_args(args)))
+    InVaArg(d, list, t) -> sb_emit(s, InVaArg(d, list, sb_ty(t)))
+    InAtomicRmw(d, op, p, t, v, ord) -> sb_emit(s, InAtomicRmw(d, op, p, sb_ty(t), sb_value(v, t), ord))
+    InCmpXchg(d, p, t, e, x, ord) ->
+        sb_emit(s, InCmpXchg(d, p, sb_ty(t), sb_value(e, t), sb_value(x, t), ord))
+    _ -> sb_emit(s, i)
+
+private sb_is_intrinsic_on_bf(callee: Val, ret: LType, args: Buf[IrArg]) -> bool = callee match
+    VGlobal(name) ->
+        if !name.starts_with("llvm.") then return false
+
+        if sb_is_bf(ret) then return true
+
+        for i in 0..<args.len()
+            if sb_is_bf(args.at(i).ty) then return true
+
+        false
+    _ -> false
+
+private sb_cast(s: *SoftBf, d: Val, op: CastOp, from: LType, v: Val, to: LType) = op match
+    CastFPExt ->
+        if sb_same(sb_as(to, sb_f32()), to) then
+            sb_widen(s, v, from, Some(d))
+        else
+            val w = sb_widen(s, v, from, None)
+
+            sb_emit(s, InCast(d, CastFPExt, sb_as(from, sb_f32()), w, to))
+    CastFPTrunc ->
+        if sb_same(sb_as(from, sb_f32()), from) then sb_narrow(s, v, to, Some(d))
+        else sb_from_real(s, v, from, to, Some(d))
+    CastFPToSI -> sb_emit(s, InCast(d, op, sb_as(from, sb_f32()), sb_widen(s, v, from, None), to))
+    CastFPToUI -> sb_emit(s, InCast(d, op, sb_as(from, sb_f32()), sb_widen(s, v, from, None), to))
+    CastSIToFP -> sb_from_int(s, v, from, true, to, Some(d))
+    CastUIToFP -> sb_from_int(s, v, from, false, to, Some(d))
+    _ -> sb_emit(s, InCast(d, op, sb_ty(from), v, sb_ty(to)))
+
+// An intrinsic with a `bf16` in its signature, called at binary32 instead. Each of these gives the
+// same `bf16` computed that way as computed directly -- they round once, or not at all -- except a
+// sum, which rounds at every step and so is written out lane by lane.
+private sb_intrinsic(s: *SoftBf, d: Option[Val], ret: LType, callee: Val, args: Buf[IrArg],
+                     fast: Buf[FastMath])
+    val name = callee match
+        VGlobal(n) -> n
+        _ -> ""
+
+    if !sb_has(s.replaced, name) then s.replaced.push(name)
+
+    // A saturating conversion out of a `bf16`.
+    if args.len() == 1 && !sb_is_bf(ret)
+        val a = args.at(0)
+
+        for k in 0..<2
+            val sat = if k == 0 then "llvm.fptosi.sat" else "llvm.fptoui.sat"
+
+            if s"$sat.${sb_suffix(ret)}.${sb_suffix(a.ty)}" == name
+                val wide = sb_as(a.ty, sb_f32())
+                var ps: Buf[LType] = buf()
+
+                ps.push(wide)
+
+                val target = sb_declare(s, s"$sat.${sb_suffix(ret)}.${sb_suffix(wide)}", ret, ps)
+                var call_args: Buf[IrArg] = buf()
+
+                call_args.push(ir_arg(wide, sb_widen(s, sb_value(a.value, a.ty), a.ty, None)))
+                sb_emit(s, InCall(d, ret, target, call_args, no_ir_attrs(), None, fast, false))
+                return
+
+    // An operation that rounds once, or not at all.
+    if sb_is_bf(ret) && sb_all_at(args, ret)
+        val ops = ["llvm.sqrt", "llvm.fabs", "llvm.floor", "llvm.ceil", "llvm.trunc", "llvm.round",
+                   "llvm.copysign"]
+
+        for k in 0..<ops.len
+            if s"${ops[k]}.${sb_suffix(ret)}" == name
+                val wide = sb_as(ret, sb_f32())
+                val r = sb_fresh(s)
+                var ps: Buf[LType] = buf()
+
+                for j in 0..<args.len()
+                    ps.push(wide)
+
+                val target = sb_declare(s, s"${ops[k]}.${sb_suffix(wide)}", wide, ps)
+                var call_args: Buf[IrArg] = buf()
+
+                for j in 0..<args.len()
+                    val a = args.at(j)
+
+                    call_args.push(ir_arg(wide, sb_widen(s, sb_value(a.value, a.ty), a.ty, None)))
+
+                sb_emit(s, InCall(Some(r), wide, target, call_args, no_ir_attrs(), None, fast, false))
+                sb_narrow(s, r, ret, d)
+                return
+
+    // A vector's least or greatest lane.
+    if args.len() == 1 && sb_is_scalar_bf(ret) && sb_is_bf(args.at(0).ty)
+        val v = args.at(0)
+
+        for k in 0..<2
+            val op = if k == 0 then "fmin" else "fmax"
+
+            if s"llvm.vector.reduce.$op.${sb_suffix(v.ty)}" == name
+                val wide = sb_as(v.ty, sb_f32())
+                val r = sb_fresh(s)
+                var ps: Buf[LType] = buf()
+
+                ps.push(wide)
+
+                val target = sb_declare(s, s"llvm.vector.reduce.$op.${sb_suffix(wide)}", sb_f32(), ps)
+                var call_args: Buf[IrArg] = buf()
+
+                call_args.push(ir_arg(wide, sb_widen(s, sb_value(v.value, v.ty), v.ty, None)))
+                sb_emit(s, InCall(Some(r), sb_f32(), target, call_args, no_ir_attrs(), None, fast, false))
+                sb_narrow(s, r, sb_bf(), d)
+                return
+
+    // A vector's sum, which rounds at every lane and so is written out lane by lane.
+    if args.len() == 2 && sb_is_scalar_bf(ret) && sb_is_bf(args.at(1).ty)
+        val v = args.at(1)
+
+        if s"llvm.vector.reduce.fadd.${sb_suffix(v.ty)}" == name
+            val vec = sb_value(v.value, v.ty)
+            val lanes = sb_lanes(v.ty)
+            var acc = sb_value(args.at(0).value, sb_bf())
+
+            for lane in 0..<lanes
+                val e = sb_fresh(s)
+
+                sb_emit(s, InExtractElement(e, sb_ty(v.ty), vec, ir_arg(LInt(32), VInt(from_int(long(lane))))))
+
+                val sum = sb_fresh(s)
+                val wa = sb_widen(s, acc, sb_bf(), None)
+                val we = sb_widen(s, e, sb_bf(), None)
+
+                sb_emit(s, InBin(sum, OpFAdd, sb_f32(), wa, we))
+                acc = sb_narrow(s, sum, sb_bf(), if lane == lanes - 1 then d else None)
+
+            return
+
+    panic(s"'$name' has no lowering for a bf16 carried as its bits")
+end sb_intrinsic
+
+private sb_lanes(t: LType) -> int = t match
+    LVec(n, _) -> n
+    _ -> 1
+
+private sb_all_at(args: Buf[IrArg], t: LType) -> bool
+    for i in 0..<args.len()
+        if !sb_same(args.at(i).ty, t) then return false
+
+    true
+end sb_all_at
