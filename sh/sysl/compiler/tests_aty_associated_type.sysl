@@ -1,0 +1,766 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An **associated type** -- a trait parameter the implementation supplies (`type Item: Render`, read
+// back as `T::Item`) -- and the `some` result that infers one from a body. What a trait, an
+// implementation and a reader may each say, what an object `&Seq[Item = int]` fixes, and that a
+// projection normalizes to the concrete type all the way down to the code.
+//
+// **Every output, message and location here was read out of the reference compiler** (0.0.153) on
+// the same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private aty_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end aty_skip
+
+private aty_skip_run() -> bool
+    if aty_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end aty_skip_run
+
+private aty_write(main: string) -> string
+    val root = make_temp_dir("sysl-aty").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end aty_write
+
+// What the program PRINTS, or what the build had to say about it.
+private aty_ran(main: string) -> string
+    val root = aty_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end aty_ran
+
+// Everything the analysis had to say about the program.
+private aty_report(main: string) -> string
+    val root = aty_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end aty_report
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private aty_refused(main: string, message: string, at: string)
+    val out = aty_report(main)
+
+    assert(out.starts_with(s"error: $message\n "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end aty_refused
+
+// The program is refused with this message among others, at this line and column of `main.sysl`.
+private aty_reports(main: string, message: string, at: string)
+    val out = aty_report(main)
+
+    out.index_of(s"error: $message\n ") match
+        None -> assert(false, s"expected 'error: $message' among the refusals, got: $out")
+        Some(i) -> assert(out[i..<out.len].index_of(s"/main.sysl:$at\n").is_some(),
+                          s"expected it at main.sysl:$at, got: $out")
+end aty_reports
+
+// The error suite's shape: something to be bounded by, and a trait whose result the implementation
+// chooses.
+private aty_re() -> string = "trait Render\n    render(self) -> string\n"
+
+private aty_seq() -> string = aty_re() + "trait Seq\n    type Item: Render\n    head(self) -> Self::Item\n"
+
+// The run suite's shape: the same, with `int` and `string` able to render.
+private aty_rr() -> string =
+    "trait Render\n    render(self) -> string\nimpl Render for int\n    render(self) -> string = \"i\"\n" +
+    "impl Render for string\n    render(self) -> string = self\n"
+
+private aty_rseq() -> string = aty_rr() + "trait Seq\n    type Item: Render\n    head(self) -> Self::Item\n"
+
+private aty_box_int() -> string =
+    "struct Box\n    v: int\nimpl Seq for Box\n    type Item = int\n    head(self) -> Self::Item = self.v\n"
+
+private aty_cell_box() -> string =
+    "struct Cell[T]\n    v: T\nimpl[T: Render] Render for Cell[T]\n" +
+    "    render(self) -> string = \"[\" + self.v.render() + \"]\"\nstruct Box[T]\n    v: T\n"
+
+private aty_text_box() -> string =
+    "struct Text\n    s: string\nimpl Render for Text\n    render(self) -> string = self.s\n" +
+    "struct Box\n    v: int\nimpl Seq for Box\n    head(self) -> some Render = Text(\"t\")\n"
+
+private aty_seq_open() -> string = "trait Seq\n    type Item\n    head(self) -> Self::Item\nstruct Box\n    v: int\n"
+
+// -- the implementation has to supply exactly what the trait left open ----------------------------
+
+@test("an associated type the block never supplies is missing")
+aty_never_supplied_is_missing()
+    if aty_skip() then return
+
+    aty_refused(aty_seq_open() + "impl Seq for Box\n    head(self) -> Self::Item = self.v\nprint(1)",
+                "'Box' does not implement 'Seq': the associated type 'Item' is missing — supply it with " +
+                "'type Item = …', or give the member that produces it the result 'some Trait' and let the " +
+                "body say what it is", "6:1")
+
+@test("an associated type the trait never declared cannot be supplied")
+aty_never_declared_cannot_be_supplied()
+    if aty_skip() then return
+
+    aty_refused(aty_seq_open() + "impl Seq for Box\n    type Item = int\n    type Extra = bool\n" +
+                "    head(self) -> Self::Item = self.v\nprint(1)",
+                "trait 'Seq' declares no associated type 'Extra', so this 'impl' has nothing to supply — the " +
+                "trait is where one is declared, as 'type Extra: …'", "8:5")
+
+@test("supplying an associated type twice is refused, since a type has one of each")
+aty_supplied_twice()
+    if aty_skip() then return
+
+    aty_refused(aty_seq_open() + "impl Seq for Box\n    type Item = int\n    type Item = bool\n" +
+                "    head(self) -> Self::Item = self.v\nprint(1)",
+                "'Item' is supplied twice by this 'impl', and a type has one associated 'Item' — the trait " +
+                "leaves it open once and the implementation fills it once", "7:5")
+
+@test("a supplied associated type is held to what the trait asked of it")
+aty_supplied_is_held_to_the_bound()
+    if aty_skip() then return
+
+    aty_refused(aty_seq() + aty_box_int() + "print(1)",
+                "trait 'Seq' asks that its associated type 'Item' implement 'Render', and int does not", "9:5")
+
+// -- a `some` result stands in one position and settles one thing ---------------------------------
+
+@test("a 'some' result on a free function has no trait to settle anything for",
+      ignore: "'some' outside an impl member's result is not refused yet -- missing feature: the 'stands only in an impl block' check")
+aty_some_on_a_free_function()
+    if aty_skip() then return
+
+    aty_refused(aty_re() + "f(x: int) -> some Render = x\nprint(1)",
+                "'some Render' says the type is read off the body of a member that supplies a trait's " +
+                "associated type, so it stands only in an 'impl' block — a trait writes 'type Name: Render' " +
+                "among its members and gives the member the result 'Self::Name'", "3:14")
+
+@test("a trait's own member declares the associated type instead of a 'some' result",
+      ignore: "'some' outside an impl member's result is not refused yet -- missing feature: the 'stands only in an impl block' check")
+aty_some_on_a_trait_member()
+    if aty_skip() then return
+
+    aty_refused(aty_re() + "trait Seq\n    head(self) -> some Render\nprint(1)",
+                "'some Render' says the type is read off the body of a member that supplies a trait's " +
+                "associated type, so it stands only in an 'impl' block — a trait writes 'type Name: Render' " +
+                "among its members and gives the member the result 'Self::Name'", "4:19")
+
+@test("a 'some' field is not a result at all")
+aty_some_field()
+    if aty_skip() then return
+
+    aty_refused(aty_re() + "struct Box\n    v: some Render\nprint(1)",
+                "'some Render' is a result whose type is read off the body that produced it, so it may stand " +
+                "only as the result of a member of an 'impl' block — everywhere else the type has to be named",
+                "4:8")
+
+@test("a member whose trait already fixed the result has nothing left to settle")
+aty_some_where_the_trait_fixed_it()
+    if aty_skip() then return
+
+    aty_refused(aty_re() + "trait Seq\n    head(self) -> int\nstruct Box\n    v: int\nimpl Seq for Box\n" +
+                "    head(self) -> some Render = self.v\nprint(1)",
+                "'some Render' says the trait left this result open for the implementation to settle, and " +
+                "'Seq' declares 'head' returning 'int' — which is already the answer, so write it", "8:5")
+
+@test("a member the trait does not declare has no associated type to settle")
+aty_some_on_an_undeclared_member()
+    if aty_skip() then return
+
+    aty_refused(aty_re() + "trait Seq\n    head(self) -> int\nstruct Box\n    v: int\nimpl Seq for Box\n" +
+                "    head(self) -> int = self.v\n    other(self) -> some Render = self.v\nprint(1)",
+                "trait 'Seq' declares no method 'other', so there is no associated type for 'some Render' to " +
+                "settle", "9:5")
+
+@test("a 'some' body has to keep the promise the member made",
+      ignore: "missing feature: settling a 'some' result from its body (the reference's OpaqueResults pass)")
+aty_some_body_keeps_the_promise()
+    if aty_skip() then return
+
+    aty_refused(aty_re() + aty_seq_open() + "impl Seq for Box\n    head(self) -> some Render = self.v\nprint(1)",
+                "'head' promises 'some Render' and its body yields int, which does not implement 'Render'",
+                "9:5")
+
+@test("two paths yielding two types settle no 'some' result, and the ordinary arm rule says so",
+      ignore: "missing feature: settling a 'some' result from its body (the reference's OpaqueResults pass)")
+aty_some_two_paths()
+    if aty_skip() then return
+
+    aty_refused(aty_seq() + "struct A\n    n: int\nstruct B\n    n: int\nimpl Render for A\n" +
+                "    render(self) -> string = \"a\"\nimpl Render for B\n    render(self) -> string = \"b\"\n" +
+                "struct Box\n    flag: bool\nimpl Seq for Box\n" +
+                "    head(self) -> some Render = if self.flag then A(1) else B(2)\nprint(1)",
+                "if branches have different types: A and B", "17:33")
+
+@test("a 'some' result read off a body that reads it back is a loop, and is named as one",
+      ignore: "missing feature: settling a 'some' result from its body (the reference's OpaqueResults pass)")
+aty_some_loop()
+    if aty_skip() then return
+
+    aty_refused(aty_seq() + "struct Box\n    v: int\nimpl Seq for Box\n    head(self) -> some Render = self.head()\n" +
+                "print(1)",
+                "the result of 'head' in 'Box' is read off its own body, and working out what that body " +
+                "produces needs the same answer — a 'some' result cannot depend on itself, however many " +
+                "members the loop runs through", "9:5")
+
+@test("a 'some' result is held to the bound the trait asked for, which is a different promise",
+      ignore: "missing feature: settling a 'some' result from its body (the reference's OpaqueResults pass)")
+aty_some_held_to_the_trait_bound()
+    if aty_skip() then return
+
+    aty_refused("trait Render\n    render(self) -> string\ntrait Countable\n    size(self) -> int\n" +
+                "impl Countable for int\n    size(self) -> int = self\n" +
+                "trait Seq\n    type Item: Render\n    head(self) -> Self::Item\nstruct Box\n    v: int\n" +
+                "impl Seq for Box\n    head(self) -> some Countable = self.v\nprint(1)",
+                "the associated type 'Item' must implement 'Render', and the body of 'head' — which is what " +
+                "settles it — yields int, which does not", "13:5")
+
+// -- a projection has to have something that says what it names -----------------------------------
+
+@test("a projection off a type parameter bounded by nothing that declares one",
+      ignore: "missing refusal: a projection off a type parameter whose bounds declare no such associated type is accepted")
+aty_projection_off_an_unbounded_parameter()
+    if aty_skip() then return
+
+    aty_refused("trait Plain\n    hi(self) -> string\nf[T: Plain](x: T) -> unit\n    var y: T::Item = x\nprint(1)",
+                "'T' is not bounded by a trait declaring an associated type 'Item', so there is nothing here " +
+                "to say what 'T::Item' is — a bound is what gives a type parameter one, written '[T: Trait]' " +
+                "where 'Trait' declares 'type Item'", "4:12")
+
+@test("a projection off a closed family that no blanket block implements",
+      ignore: "missing refusal: a projection off a type parameter whose bounds declare no such associated type is accepted")
+aty_projection_off_a_closed_family()
+    if aty_skip() then return
+
+    aty_refused("trait Seq\n    type Item\n    head(self) -> Self::Item\nf[T: Integer](x: T) -> unit\n" +
+                "    var y: T::Item = x\nprint(1)",
+                "'T' is not bounded by a trait declaring an associated type 'Item', so there is nothing here " +
+                "to say what 'T::Item' is — a bound is what gives a type parameter one, written '[T: Trait]' " +
+                "where 'Trait' declares 'type Item'", "5:12")
+
+@test("a projection naming an associated type no trait declares at all")
+aty_projection_no_trait_declares()
+    if aty_skip() then return
+
+    aty_refused("struct Box\n    v: int\nval x: Box::Element = 1\nprint(1)",
+                "no trait declares an associated type 'Element', so 'Box::Element' names nothing — a trait " +
+                "declares one with 'type Element: …' among its members", "3:8")
+
+private aty_other() -> string =
+    "struct Box\n    v: int\nstruct Other\n    v: int\nimpl Seq for Box\n    type Item = string\n" +
+    "    head(self) -> Self::Item = \"s\"\n"
+
+@test("a projection off a concrete type implementing no trait that declares one")
+aty_projection_off_a_type_implementing_none()
+    if aty_skip() then return
+
+    aty_reports(aty_seq() + aty_other() + "val x: Other::Item = 1\nprint(1)",
+                "Other implements no trait declaring the associated type 'Item' — 2 traits declare one " +
+                "(sysl.Iterate, Seq), and this type implements none of them", "13:8")
+
+@test("a projection in a field off a type implementing none is answered off the declarations")
+aty_projection_in_a_field_off_a_type_implementing_none()
+    if aty_skip() then return
+
+    aty_reports(aty_seq() + aty_other() + "struct Cell[C: Seq]\n    v: C::Item\nstruct Holder\n" +
+                "    inner: Cell[Other]\nprint(1)",
+                "Other implements no trait declaring the associated type 'Item' — 2 traits declare one " +
+                "(sysl.Iterate, Seq), and this type implements none of them", "14:8")
+
+// -- one name, one type ---------------------------------------------------------------------------
+
+@test("two traits cannot bring one associated-type name to one type")
+aty_two_traits_one_name()
+    if aty_skip() then return
+
+    aty_refused("trait A\n    type Item\n    a(self) -> Self::Item\ntrait B\n    type Item\n    b(self) -> Self::Item\n" +
+                "struct Box\n    v: int\nimpl A for Box\n    type Item = int\n    a(self) -> Self::Item = self.v\n" +
+                "impl B for Box\n    type Item = bool\n    b(self) -> Self::Item = true\nprint(1)",
+                "'Box' already implements 'A', which declares an associated type 'Item' — and so does 'B'. An " +
+                "associated type is named without its trait, so one type cannot have two of one name", "12:1")
+
+@test("a blanket block's associated type collides with the library's own over the same family")
+aty_blanket_collides_with_the_library()
+    if aty_skip() then return
+
+    aty_refused("trait Sized\n    type Size\n    extent(self) -> Self::Size\nimpl[T: Integer + Zero] Sized for T\n" +
+                "    type Size = T\n    extent(self) -> Self::Size = self\nprint(1)",
+                "'T' already implements 'sysl.math.Magnitude', which declares an associated type 'Size' — and " +
+                "so does 'Sized'. An associated type is named without its trait, so one type cannot have two " +
+                "of one name", "4:1")
+
+// -- declaring an associated type spends the trait's erasability ----------------------------------
+
+@test("a '&Trait' cannot be formed over a trait declaring an associated type",
+      ignore: "divergence: a slot refusal ('does not say what Item is') answers at the trait before the erasure refusal at the '&Seq'")
+aty_no_counted_object()
+    if aty_skip() then return
+
+    aty_refused(aty_seq() + "impl Render for int\n    render(self) -> string = \"i\"\n" + aty_box_int() +
+                "show(s: &Seq) -> unit\n    print(s.head().render())\nprint(1)",
+                "'Seq' declares the associated type 'Item', whose meaning is the implementing type's — an " +
+                "erased value has forgotten which type that is, so there is no '&Seq' to form. Say which it " +
+                "is and there is: write '&Seq[Item = …]', or take a bound instead, which keeps the type and " +
+                "so keeps the answer: '[T: Seq]'", "13:10")
+
+// The refusal names the binding (`Item = …`) as well as the bound (`[T: Seq]`).
+@test("nor a '*Trait', and the refusal names the binding as well as the bound")
+aty_no_raw_object()
+    if aty_skip() then return
+
+    aty_refused(aty_seq() + "show(s: *Seq) -> unit\n    print(1)\nprint(1)",
+                "'Seq' declares the associated type 'Item', whose meaning is the implementing type's — an " +
+                "erased value has forgotten which type that is, so there is no '*Seq' to form. Say which it " +
+                "is and there is: write '*Seq[Item = …]', or take a bound instead, which keeps the type and " +
+                "so keeps the answer: '[T: Seq]'", "6:10")
+
+@test("a trait that merely requires one declaring an associated type is unerasable too")
+aty_requiring_one_is_unerasable()
+    if aty_skip() then return
+
+    aty_refused(aty_seq() + "trait Bigger: Seq\n    more(self) -> int\nshow(s: &Bigger) -> unit\n    print(1)\nprint(1)",
+                "'Seq' declares the associated type 'Item', whose meaning is the implementing type's — an " +
+                "erased value has forgotten which type that is, so there is no '&Bigger' to form. Say which " +
+                "it is and there is: write '&Bigger[Item = …]', or take a bound instead, which keeps the type " +
+                "and so keeps the answer: '[T: Seq]'", "8:10")
+
+// -- an object that fixes the associated type has to fix the right one ----------------------------
+
+@test("an object fixing a name the trait does not declare",
+      ignore: "missing feature: an object's associated-type bindings are not validated (names, duplicates, bounds, bare forms)")
+aty_object_fixes_an_undeclared_name()
+    if aty_skip() then return
+
+    aty_refused(aty_seq() + "show(s: *Seq[Elem = int]) -> unit\n    print(1)\nprint(1)",
+                "'Seq' declares no associated type 'Elem' — it declares 'Item'", "6:10")
+
+@test("an object over a trait with no associated types has nothing for a binding to name",
+      ignore: "missing feature: an object's associated-type bindings are not validated (names, duplicates, bounds, bare forms)")
+aty_object_binding_on_a_plain_trait()
+    if aty_skip() then return
+
+    aty_refused("trait Plain\n    hi(self) -> string\nshow(s: *Plain[Item = int]) -> unit\n    print(1)\nprint(1)",
+                "'Plain' declares no associated types, so there is nothing in '*Plain' for 'Item' to fix — a " +
+                "trait declares one with 'type Item: …' among its members", "3:10")
+
+@test("an object fixing the same associated type twice",
+      ignore: "missing feature: an object's associated-type bindings are not validated (names, duplicates, bounds, bare forms)")
+aty_object_fixes_one_twice()
+    if aty_skip() then return
+
+    aty_refused(aty_seq() + "show(s: *Seq[Item = int, Item = string]) -> unit\n    print(1)\nprint(1)",
+                "'*Seq' fixes 'Item' more than once, and a type has one of each", "6:10")
+
+@test("an object's associated type has to meet what the trait asked of it",
+      ignore: "missing feature: an object's associated-type bindings are not validated (names, duplicates, bounds, bare forms)")
+aty_object_binding_held_to_the_bound()
+    if aty_skip() then return
+
+    aty_refused(aty_seq() + "impl Render for int\n    render(self) -> string = \"i\"\n" +
+                "show(s: *Seq[Item = bool]) -> unit\n    print(1)\nprint(1)",
+                "'Seq' requires its associated type 'Item' to implement 'Render', but bool does not", "8:10")
+
+@test("a value whose implementation chose otherwise does not go into an object")
+aty_object_refuses_a_value_that_chose_otherwise()
+    if aty_skip() then return
+
+    aty_refused(aty_seq() + "impl Render for int\n    render(self) -> string = \"i\"\nimpl Render for string\n" +
+                "    render(self) -> string = self\n" + aty_box_int() +
+                "show(s: &Seq[Item = string]) -> unit\n    print(s.head().render())\nshow(Box(7))\nprint(1)",
+                "a &Seq[Item = string] says 'Item' is string, and Box supplies int for it — an object fixes the " +
+                "associated type, so only a type that chose the same one goes into it", "17:6")
+
+@test("an object's bare argument that is one of the trait's own associated types",
+      ignore: "missing feature: an object's associated-type bindings are not validated (names, duplicates, bounds, bare forms)")
+aty_object_bare_name_is_an_associated_type()
+    if aty_skip() then return
+
+    aty_refused("trait One\n    type A\n    get(self) -> Self::A\nshow(s: &One[A]) -> unit\n    print(1)\nprint(1)",
+                "'A' is an associated type of 'One', which an object fixes by name rather than by position — " +
+                "write '&One[A = …]'", "4:10")
+
+@test("an object's bare argument where the trait leaves more than one thing open",
+      ignore: "missing feature: an object's associated-type bindings are not validated (names, duplicates, bounds, bare forms)")
+aty_object_bare_argument_two_open()
+    if aty_skip() then return
+
+    aty_refused("trait Two\n    type A\n    type B\n    both(self) -> Self::A\nshow(s: &Two[int]) -> unit\n" +
+                "    print(1)\nprint(1)",
+                "'Two' takes no type arguments of its own, and what it leaves for an object to fix is the " +
+                "associated types 'A', 'B' — an object fixes one by name, so write '&Two[A = …, B = …]'. A " +
+                "bare argument is the short form only for a trait with no parameters of its own and exactly " +
+                "one associated type, so here it would not say which", "5:10")
+
+@test("an object's bare arguments, too many where the short form would otherwise apply",
+      ignore: "missing feature: an object's associated-type bindings are not validated (names, duplicates, bounds, bare forms)")
+aty_object_too_many_bare_arguments()
+    if aty_skip() then return
+
+    aty_refused("trait One\n    type A\n    get(self) -> Self::A\nshow(s: &One[int, string]) -> unit\n" +
+                "    print(1)\nprint(1)",
+                "'One' takes no type arguments of its own, and what it leaves for an object to fix is the " +
+                "associated type 'A' — an object fixes one by name, so write '&One[A = …]'. One bare argument " +
+                "is the short form for 'A = …', and 2 arguments are not", "4:10")
+
+@test("an object's bare form is refused where the trait has parameters of its own")
+aty_object_bare_form_with_trait_parameters()
+    if aty_skip() then return
+
+    aty_refused("trait Render\n    render(self) -> string\ntrait Keyed[K]\n    type Item: Render\n" +
+                "    at(self, k: K) -> Self::Item\nshow(s: *Keyed[int]) -> unit\n    print(1)\nprint(1)",
+                "'Keyed' declares the associated type 'Item', whose meaning is the implementing type's — an " +
+                "erased value has forgotten which type that is, so there is no '*Keyed[int]' to form. Say " +
+                "which it is and there is: write '*Keyed[Item = …]', or take a bound instead, which keeps the " +
+                "type and so keeps the answer: '[T: Keyed]'", "6:10")
+
+// -- the two spellings are told apart by where they are written ------------------------------------
+
+@test("a trait supplies no associated type, so it writes a bound rather than an equals")
+aty_trait_writes_a_bound()
+    if aty_skip() then return
+
+    aty_refused("trait Seq\n    type Item = int\n    head(self) -> Self::Item\nprint(1)",
+                "a trait's 'type Item' is the associated type an implementation supplies, so there is nothing " +
+                "for it to equal here — write 'type Item: Trait' to say what the implementation's must " +
+                "implement, and 'type Item = …' inside the 'impl'", "2:17")
+
+@test("an implementation chooses its associated type, so it writes an equals rather than a bound")
+aty_impl_writes_an_equals()
+    if aty_skip() then return
+
+    aty_refused(aty_seq_open() + "impl Seq for Box\n    type Item: Render\n    head(self) -> Self::Item = self.v\nprint(1)",
+                "an 'impl' supplies the associated type rather than bounding it — the bound is the trait's, " +
+                "written 'type Name: Trait' there, and what goes here is 'type Name = …'", "7:16")
+
+// -- a parameterised bound on an associated type is still a bound ---------------------------------
+
+// `string` adds (concatenation), so a struct with no blocks of its own is what genuinely cannot. The
+// bound is shown bare: its defaults are filled from the associated type (`Add[Plain, Plain]`), never
+// from the implementing type (`Add[S, S]`), and a default-filled argument is not printed.
+@test("a type that cannot add is refused as a 'type W: Add', named in the associated type's own terms")
+aty_parameterised_bound_refuses()
+    if aty_skip() then return
+
+    aty_refused("trait Holder\n    type W: Add\n    one(self) -> Self::W\nstruct Plain\n    v: int\nstruct S\n" +
+                "    v: Plain\nimpl Holder for S\n    type W = Plain\n    one(self) -> Plain = self.v\nprint(1)",
+                "trait 'Holder' asks that its associated type 'W' implement 'sysl.Add', and Plain does not", "9:5")
+
+// -- the run suite: a trait declares one and an implementation supplies it -------------------------
+
+@test("the projection reaches the type the implementation chose")
+aty_projection_reaches_the_choice()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + aty_box_int() + "print(Box(7).head())"), "7\n")
+
+@test("a bound licenses the projection's own bounds, and nothing else")
+aty_bound_licenses_the_projection()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + "struct Box\n    v: string\nimpl Seq for Box\n    type Item = string\n" +
+                      "    head(self) -> Self::Item = self.v\nfirst[S: Seq](s: S) -> string = s.head().render()\n" +
+                      "print(first(Box(\"hi\")))"),
+              "hi\n")
+
+@test("the projection is a type a program may write, off a concrete subject")
+aty_projection_written_off_a_concrete_subject()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + aty_box_int() + "val n: Box::Item = 5\nprint(n.render(), n)"), "i 5\n")
+
+@test("two types answer with two different item types through one bound")
+aty_two_types_two_items()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + "struct Nums\n    v: int\nstruct Words\n    v: string\n" +
+                      "impl Seq for Nums\n    type Item = int\n    head(self) -> Self::Item = self.v\n" +
+                      "impl Seq for Words\n    type Item = string\n    head(self) -> Self::Item = self.v\n" +
+                      "first[S: Seq](s: S) -> string = s.head().render()\n" +
+                      "print(first(Nums(1)), first(Words(\"w\")))"),
+              "i w\n")
+
+// -- a generic block answers with one type per instantiation --------------------------------------
+
+@test("a generic block's own parameter may stand in the associated type")
+aty_generic_block_parameter()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + aty_cell_box() + "impl[T: Render] Seq for Box[T]\n    type Item = Cell[T]\n" +
+                      "    head(self) -> Self::Item = Cell(self.v)\n" +
+                      "first[S: Seq](s: S) -> string = s.head().render()\nprint(first(Box(3)), first(Box(\"x\")))"),
+              "[i] [x]\n")
+
+@test("the projection off one instantiation names that instantiation's answer")
+aty_projection_off_one_instantiation()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + aty_cell_box() + "impl[T: Render] Seq for Box[T]\n    type Item = Cell[T]\n" +
+                      "    head(self) -> Self::Item = Cell(self.v)\nval c: Box[int]::Item = Cell(9)\nprint(c.render())"),
+              "[i]\n")
+
+// -- a `some` result reads the type off the body ---------------------------------------------------
+
+@test("the associated type is whatever the 'some' body produced",
+      ignore: "missing feature: settling a 'some' result from its body (the reference's OpaqueResults pass)")
+aty_some_is_what_the_body_produced()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + aty_text_box() + "print(Box(1).head().render())"), "t\n")
+
+@test("a generic caller sees only the bound of a 'some' result, and the call still dispatches",
+      ignore: "missing feature: settling a 'some' result from its body (the reference's OpaqueResults pass)")
+aty_some_generic_caller()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + aty_text_box() + "first[S: Seq](s: S) -> string = s.head().render()\n" +
+                      "print(first(Box(1)))"),
+              "t\n")
+
+@test("the concrete type of a 'some' result is still nameable through the projection",
+      ignore: "missing feature: settling a 'some' result from its body (the reference's OpaqueResults pass)")
+aty_some_nameable_through_the_projection()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + aty_text_box() + "val t: Box::Item = Box(1).head()\nprint(t.s)"), "t\n")
+
+@test("a generic block infers its 'some' result once per instantiation",
+      ignore: "missing feature: settling a 'some' result from its body (the reference's OpaqueResults pass)")
+aty_some_per_instantiation()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + aty_cell_box() + "impl[T: Render] Seq for Box[T]\n" +
+                      "    head(self) -> some Render = Cell(self.v)\n" +
+                      "first[S: Seq](s: S) -> string = s.head().render()\nprint(first(Box(3)), first(Box(\"x\")))"),
+              "[i] [x]\n")
+
+@test("a property may carry a 'some' result",
+      ignore: "missing feature: settling a 'some' result from its body (the reference's OpaqueResults pass)")
+aty_some_on_a_property()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rr() + "trait View\n    type Body: Render\n    body -> Self::Body\n" +
+                      "struct Text\n    s: string\nimpl Render for Text\n    render(self) -> string = self.s\n" +
+                      "struct Counter\n    n: int\nimpl View for Counter\n    body -> some Render = Text(\"count\")\n" +
+                      "draw[V: View](v: V) -> string = v.body.render()\nprint(draw(Counter(7)))"),
+              "count\n")
+
+@test("'some' is a contextual word and nothing more")
+aty_some_is_contextual()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran("val some = 41\nsome_thing(some: int) -> int = some + 1\nprint(some, some_thing(1))"),
+              "41 2\n")
+
+@test("the type an implementation chooses may be one nobody else can name",
+      ignore: "missing feature: settling a 'some' result from its body (the reference's OpaqueResults pass)")
+aty_chosen_type_may_be_private()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + "private struct Hidden\n    s: string\nimpl Render for Hidden\n" +
+                      "    render(self) -> string = self.s\nstruct Box\n    v: int\nimpl Seq for Box\n" +
+                      "    head(self) -> some Render = Hidden(\"h\")\n" +
+                      "first[S: Seq](s: S) -> string = s.head().render()\nprint(first(Box(1)))"),
+              "h\n")
+
+@test("the trait may take its own parameters beside an associated one")
+aty_trait_parameters_beside_one()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rr() + "trait Tagged[K]\n    type Item: Render\n    tag(self, k: K) -> Self::Item\n" +
+                      "struct Box\n    v: int\nimpl Tagged[int] for Box\n    type Item = int\n" +
+                      "    tag(self, k: int) -> Self::Item = self.v + k\nprint(Box(1).tag(2), Box(1).tag(2).render())"),
+              "3 i\n")
+
+@test("an associated type may itself be a projection")
+aty_associated_type_is_a_projection()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + "struct Inner\n    v: int\nimpl Seq for Inner\n    type Item = int\n" +
+                      "    head(self) -> Self::Item = self.v\nstruct Outer\n    inner: Inner\nimpl Seq for Outer\n" +
+                      "    type Item = Inner::Item\n    head(self) -> Self::Item = self.inner.head()\n" +
+                      "print(Outer(Inner(4)).head())"),
+              "4\n")
+
+// -- an object may fix the associated type, and then it is a table like any other ------------------
+
+@test("an object's named binding carries the answer through the table")
+aty_object_named_binding()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + aty_box_int() + "show(s: &Seq[Item = int]) -> unit\n" +
+                      "    print(s.head(), s.head().render())\nshow(Box(7))"),
+              "7 i\n")
+
+@test("an object's bare form is the same type as the named one")
+aty_object_bare_is_the_named()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + aty_box_int() + "named(s: &Seq[Item = int]) -> int = s.head()\n" +
+                      "bare(s: &Seq[int]) -> int = named(s)\nprint(bare(Box(4)))"),
+              "4\n")
+
+@test("a raw object binds an associated type too")
+aty_raw_object_binds_it()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + aty_box_int() + "show(s: *Seq[Item = int]) -> unit\n    print(s.head())\n" +
+                      "var b = Box(9)\nshow(&b)"),
+              "9\n")
+
+@test("two types choosing differently are two object types")
+aty_two_choices_two_objects()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + "struct Num\n    v: int\nimpl Seq for Num\n    type Item = int\n" +
+                      "    head(self) -> Self::Item = self.v\nstruct Word\n    v: string\nimpl Seq for Word\n" +
+                      "    type Item = string\n    head(self) -> Self::Item = self.v\n" +
+                      "ints(s: &Seq[Item = int]) -> string = s.head().render()\n" +
+                      "words(s: &Seq[Item = string]) -> string = s.head().render()\n" +
+                      "print(ints(Num(2)), words(Word(\"w\")))"),
+              "i w\n")
+
+@test("a required trait's associated type is bound in the same brackets")
+aty_required_trait_bound_in_the_brackets()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + "trait Bigger: Seq\n    more(self) -> int\n" + aty_box_int() +
+                      "impl Bigger for Box\n    more(self) -> int = self.v + 1\n" +
+                      "show(s: &Bigger[Item = int]) -> unit\n    print(s.head(), s.more())\nshow(Box(5))"),
+              "5 6\n")
+
+@test("a trait with both takes its arguments in order and its associated type by name")
+aty_object_arguments_and_binding()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rr() + "trait Keyed[K]\n    type Item: Render\n    at(self, k: K) -> Self::Item\n" +
+                      "struct Row\n    v: int\nimpl Keyed[int] for Row\n    type Item = int\n" +
+                      "    at(self, k: int) -> Self::Item = self.v + k\n" +
+                      "show(s: &Keyed[int, Item = int]) -> unit\n    print(s.at(2), s.at(2).render())\nshow(Row(5))"),
+              "7 i\n")
+
+@test("a generic signature may bind an object's associated type to one of its own parameters")
+aty_object_binding_to_a_type_parameter()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran(aty_rseq() + aty_box_int() + "struct Word\n    v: string\nimpl Seq for Word\n" +
+                      "    type Item = string\n    head(self) -> Self::Item = self.v\n" +
+                      "shown[T: Render](s: &Seq[Item = T]) -> string = s.head().render()\n" +
+                      "print(shown[int](Box(1)), shown[string](Word(\"w\")))"),
+              "i w\n")
+
+// -- a bound on an associated type may be parameterised --------------------------------------------
+
+@test("a bare Add on an associated type fills its defaults from the associated type")
+aty_bare_add_defaults_from_the_associated_type()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran("trait Holder\n    type W: Add\n    one(self) -> Self::W\nstruct N\n    v: u32\n" +
+                      "impl Holder for N\n    type W = u32\n    one(self) -> u32 = self.v\n" +
+                      "sum[H: Holder](h: H) -> H::W = h.one() + h.one()\nprint(sum(N(21)))"),
+              "42\n")
+
+@test("several parameterised bounds on an associated type at once, at two widths")
+aty_several_parameterised_bounds()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran("trait Word\n    type W: Add + Sub + Mul + BitAnd + BitXor\n    seed(self) -> Self::W\n" +
+                      "struct Narrow\n    v: u32\nstruct Wide\n    v: u64\n" +
+                      "impl Word for Narrow\n    type W = u32\n    seed(self) -> u32 = self.v\n" +
+                      "impl Word for Wide\n    type W = u64\n    seed(self) -> u64 = self.v\n" +
+                      "mixed[T: Word](t: T) -> T::W\n    val x = t.seed()\n    (x + x) ^ (x & x)\n" +
+                      "print(mixed(Narrow(3)), mixed(Wide(3)))"),
+              "5 5\n")
+
+@test("a bound on an associated type may be met by a block written below")
+aty_bound_met_below()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran("trait Mine\n    tag(self) -> int\ntrait Holder\n    type W: Mine\n    one(self) -> Self::W\n" +
+                      "struct N\n    v: u32\nimpl Holder for N\n    type W = u32\n    one(self) -> u32 = self.v\n" +
+                      "impl Mine for u32\n    tag(self) -> int = 7\nprint(N(3).one().tag())"),
+              "7\n")
+
+// A program's own `Ord` must not answer for the library's `Magnitude` (`type Size: Ord`), whose
+// supplied type is held to its bound in the library's scope.
+@test("a supplied associated type is held to its bound in the terms the impl was written in")
+aty_bound_in_the_impl_terms()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran("import sysl.math.complex.Complex\ntrait Ord\n    rank(self) -> int\nstruct Tier\n    n: int\n" +
+                      "impl Ord for Tier\n    rank(self) -> int = self.n\n" +
+                      "print(Tier(3).rank(), Complex(3.0, 4.0).abs())"),
+              "3 5\n")
+
+// -- a generic instantiated in a struct field sees the impl supplying its associated type ----------
+
+@test("a field holding a generic applied to a concrete type sees its associated type")
+aty_field_holding_a_concrete_generic()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran("trait Comp\n    type W: Add\n    step(h: *[4]Self::W)\nstruct Machine[C: Comp]\n" +
+                      "    h: [4]C::W\n    run(*self) -> C::W\n        C.step(&self.h)\n        self.h[0]\n" +
+                      "struct Narrow\nend Narrow\nimpl Comp for Narrow\n    type W = u32\n" +
+                      "    step(h: *[4]u32) = h[0] += h[1]\nstruct Wrapper\n    inner: Machine[Narrow]\n" +
+                      "var w = Wrapper(Machine([7; 4]))\nprint(w.inner.run())"),
+              "14\n")
+
+@test("the impl supplying an associated type may be written below the type whose field reads it")
+aty_impl_below_the_field()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran("struct Holder\n    inner: Cell[Tag]\nstruct Cell[C: Named]\n    v: C::Label\n" +
+                      "    show(self) -> C::Label = self.v\ntrait Named\n    type Label: Display\nstruct Tag\nend Tag\n" +
+                      "impl Named for Tag\n    type Label = string\nprint(Holder(Cell(\"hi\")).inner.show())"),
+              "hi\n")
+
+@test("a generic impl block supplies an associated type at the argument the field fixed")
+aty_generic_impl_at_the_field_argument()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran("trait Named\n    type Label: Display\nstruct Wrap[T: Display]\n    v: T\n" +
+                      "impl[T: Display] Named for Wrap[T]\n    type Label = T\nstruct Cell[C: Named]\n    v: C::Label\n" +
+                      "struct Holder\n    inner: Cell[Wrap[int]]\nprint(Holder(Cell(4)).inner.v)"),
+              "4\n")
+
+@test("a variant may carry a generic whose field is an associated type")
+aty_variant_carries_one()
+    if aty_skip_run() then return
+
+    assert_eq(aty_ran("trait Named\n    type Label: Display\nstruct Cell[C: Named]\n    v: C::Label\nstruct Tag\n" +
+                      "end Tag\nimpl Named for Tag\n    type Label = int\nenum Slot\n    Empty\n" +
+                      "    Full(cell: Cell[Tag])\nval s = Slot.Full(Cell(9))\n" +
+                      "print(s match\n    Full(c) -> c.v\n    Empty -> 0)"),
+              "9\n")

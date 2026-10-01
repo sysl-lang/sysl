@@ -298,6 +298,24 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
             return Impl(block, span, scope)
         end if
 
+    // **An associated type is named without its trait**, so a second trait bringing a name the type
+    // already has from another is refused at the block that makes the collision -- not later, at
+    // whichever projection first reads the name and finds two answers.
+    for i in 0..<tr.assocs.len()
+        val ad = tr.assocs.at(i)
+        val others = traits_declaring(a, ad.name)
+
+        for j in 0..<others.len()
+            val other = others.at(j)
+
+            if other == key.unwrap() || impls_of(a, other, home.key).is_empty() then continue
+
+            a.fault(scope, span, s"'${home.label}' already implements '${qualified_name(other)}', which " +
+                    s"declares an associated type '${ad.name}' — and so does " +
+                    s"'${qualified_name(key.unwrap())}'. An associated type is named without its " +
+                    "trait, so one type cannot have two of one name")
+            return Impl(block, span, scope)
+
     val wkey = if written.is_empty() then "" else Bound(key.unwrap(), written).key()
     var rows: Buf[TraitImpl] = buf()
 
@@ -332,7 +350,47 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
 
         a.tables.super_checks.push(SuperCheck(home.label, module_show(block.trait_name),
                                               resolve_bound(a, scope, s.span, s, super_subst),
-                                              subject, span, scope))
+                                              subject, span, scope, ""))
+
+    // What the trait asked of each associated type is asked of the type this block supplied, with
+    // `Self` in the bound standing for **that** type -- a bare `type W: Add` asks for an
+    // `Add[<it>, <it>]`, never an `Add` of the implementing type. Read in the trait's scope, where
+    // the bound was written.
+    val tscope = trait_scope_of(a, key.unwrap())
+
+    for i in 0..<block.assocs.len()
+        val bind = block.assocs.at(i)
+        val supplied = assoc_supplied(assocs, bind.name)
+
+        if supplied.is_none() then continue
+
+        // A type that did not resolve was already refused where it was written.
+        val known = supplied.unwrap() match
+            Unknown -> false
+            _ -> true
+
+        if !known then continue
+
+        for j in 0..<tr.assocs.len()
+            val ad = tr.assocs.at(j)
+
+            if ad.name != bind.name then continue
+
+            var assoc_subst: Buf[Binding] = buf()
+            val its_self = self_binding(supplied.unwrap())
+
+            for k in 0..<its_self.len()
+                assoc_subst.push(its_self.at(k))
+
+            for k in 0..<tr.tparams.len()
+                if k < bound.args.len() then assoc_subst.push(Binding(tr.tparams.at(k), bound.args.at(k)))
+
+            for k in 0..<ad.bounds.len()
+                val b = ad.bounds.at(k)
+
+                a.tables.super_checks.push(SuperCheck(home.label, module_show(block.trait_name),
+                                                      resolve_bound(a, tscope, b.span, b, assoc_subst),
+                                                      supplied.unwrap(), bind.span, scope, ad.name))
 
     // A default the block left out is hoisted for this type exactly as a written method is, from the
     // body the trait supplied -- so everything downstream finds an ordinary member and needs to know
@@ -396,6 +454,13 @@ check_impl_supers(a: &Analysis)
         val c = held.at(i)
 
         if satisfies(a, c.sup, c.subject) then continue
+
+        if c.assoc != ""
+            a.fault(c.scope, c.span, s"trait '${c.required}' asks that its associated type " +
+                    s"'${c.assoc}' implement '${show_bound(a, c.sup, c.subject)}', and " +
+                    s"${type_show(c.subject)} does not")
+            continue
+        end if
 
         // **The requirement is quoted in full, arguments a default supplied included**: what is being
         // asked for is the trait at exactly these arguments, and the block the advice tells a reader
@@ -498,6 +563,13 @@ private count_assoc(block: ImplDecl, name: string) -> usize
 
     n
 end count_assoc
+
+private assoc_supplied(assocs: Buf[(string, Type)], name: string) -> Option[Type]
+    for i in 0..<assocs.len()
+        if assocs.at(i).0 == name then return Some(assocs.at(i).1)
+
+    None
+end assoc_supplied
 
 private holds_assoc(assocs: Buf[(string, Type)], name: string) -> bool
     for i in 0..<assocs.len()
