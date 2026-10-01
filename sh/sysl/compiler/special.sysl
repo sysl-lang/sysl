@@ -123,6 +123,21 @@ str_render(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
     TExpr(span, TRender(t, found.0, format_spec(cx, span), found.1))
 end str_render
 
+// Whether a value has a rendering of its own for a `%s` to hand it to -- a type parameter its
+// bounds promised one, an object whose trait keeps the slot, anything else implementing `Display`.
+// A value with none is a mistake in the specifier rather than a missing implementation, so a `%s`
+// hole over one is refused in the specifier's words.
+renders_itself(cx: &Analyzer, ty: Type) -> bool
+    val tr = display_bound(cx)
+    val here = if !impls_of(cx.an, tr.name, owner_key(ty)).is_empty() then ty else underlying(ty)
+
+    if erased(here) then return display_slot(cx, here).is_some()
+
+    here match
+        Abstract(_, _) -> satisfies(cx.an, tr, here)
+        _ -> conforms(cx.an, tr, here) || satisfies(cx.an, tr, here)
+end renders_itself
+
 // Which `display` a value reaches, and the table slot to read it out of where the value is an
 // object rather than a type.
 //
@@ -165,9 +180,12 @@ private renderer(cx: &Analyzer, span: Span, t: TExpr, asked: string) -> (string,
     // asked for here or nowhere.
     here match
         Abstract(_, _) ->
+            // The bound is asked for in the name of the form that was written -- `print` or
+            // `str` -- rather than in the verb a concrete type's refusal reads with.
+            val form = if asked == "print" then "print" else "str"
+
             if !satisfies(cx.an, tr, here) then
-                cx.an.bound_fault(cx.scope, span,
-                                  s"'$asked' needs '${type_show(here)}: ${tr.show()}'")
+                cx.an.bound_fault(cx.scope, span, s"'$form' needs '${type_show(here)}: ${tr.show()}'")
 
             return (s"${tr.name}.display", None)
         _ -> ()
