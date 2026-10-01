@@ -1,0 +1,66 @@
+module sh.sysl.compiler
+@tests
+
+// A `require` or `ensure` clause that is not a `bool` is refused at the DECLARATION it belongs to --
+// the function's line, or a member's -- wherever its body is read: an instantiation of a generic, a
+// member of a generic type or of a generic `impl`, a trait's default copied into a type, an ordinary
+// member. A body nothing instantiates is not refused at all.
+//
+// **Every position here was read out of the reference compiler (0.0.153)** by handing the installed
+// `sysl` the same program. The harness is `tests_xvr_extern_var.sysl`'s.
+
+private can_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+private can_refused_once(text: string, at: string)
+    val said = can_ran(text)
+
+    assert(said.contains("error: condition must be bool, got int\n --> "), said)
+    assert(said.contains(s"/$at\n"), said)
+    assert_eq(xvr_count(said, "error:"), 1)
+end can_refused_once
+
+@test("a generic function's non-bool 'require' is refused at the function, once instantiated")
+can_generic_function_require()
+    if xvr_no_library() then return
+
+    can_refused_once("f[T](x: T, n: int) -> int\n    require n\n    n\nprint(f(1, 2))\n", "main.sysl:1:1")
+    can_refused_once("private f[T](x: T, n: int) -> int\n    ensure n\n    n\nprint(f(1, 2))\n",
+                     "main.sysl:1:1")
+
+@test("a trait default's non-bool 'ensure' is refused at the default, once a type inherits it")
+can_trait_default_ensure()
+    if xvr_no_library() then return
+
+    can_refused_once("trait Sized\n    size(self) -> int\n    big(self) -> int\n        ensure self.size()\n" +
+                     "        1\n\nstruct B\n    v: int\n\nimpl Sized for B\n    size(self) -> int = self.v\n\n" +
+                     "print(B(1).big())\n", "main.sysl:3:5")
+
+@test("a member's non-bool clause is refused at the member, generic type or not")
+can_member_clause()
+    if xvr_no_library() then return
+
+    can_refused_once("struct Box[T]\n    v: T\n\n    get(self, n: int) -> T\n        require n\n        self.v\n\n" +
+                     "print(Box(1).get(2))\n", "main.sysl:4:5")
+    can_refused_once("struct Box[T]\n    v: T\n\n    private get(self, n: int) -> T\n        ensure n\n" +
+                     "        self.v\n\n    run(self) -> T = self.get(1)\n\nprint(Box(1).run())\n", "main.sysl:4:13")
+    can_refused_once("struct Box\n    v: int\n\n    get(self, n: int) -> int\n        require n\n        self.v\n\n" +
+                     "print(Box(1).get(2))\n", "main.sysl:4:5")
+    can_refused_once("trait Sized\n    size(self) -> int\n\nstruct B[T]\n    v: T\n\nimpl[T] Sized for B[T]\n" +
+                     "    size(self) -> int\n        require 7\n        1\n\nprint(B(1).size())\n", "main.sysl:8:5")
+end can_member_clause
+
+@test("a non-bool clause in a body nothing instantiates is not refused")
+can_uninstantiated_clause_is_not_refused()
+    if xvr_no_library() then return
+
+    val texts = [
+        "f[T](x: T, n: int) -> int\n    require n\n    n\nprint(1)\n",
+        "struct Box[T]\n    v: T\n\n    get(self, n: int) -> T\n        require n\n        self.v\n\nprint(1)\n",
+        "trait Sized\n    size(self) -> int\n    big(self) -> int\n        ensure self.size()\n        1\n\nprint(1)\n",
+        "trait Sized\n    size(self) -> int\n        require 1\n        ensure 2\n\nstruct B\n    v: int\n\nprint(1)\n"]
+
+    for i in 0..<texts.len
+        val said = can_ran(texts[i])
+
+        assert(!said.contains("error:"), said)
+end can_uninstantiated_clause_is_not_refused
