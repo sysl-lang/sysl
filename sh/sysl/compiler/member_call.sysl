@@ -891,9 +891,19 @@ build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
             // the caller can be told about.
             check_ref_call(cx, span, place)
             TExpr(span, TAddrOf(place, Ptr(texpr_type(place))))
-    ByRef(sync) -> texpr_type(tr) match
+    // What a `&self` method is missing on any other receiver is the COUNT, not an address: it may
+    // keep hold of what it was called on, so boxing a copy here would hand it a share of something
+    // the caller never sees again. The refusal names the binding that fixes it.
+    ByRef(_) -> texpr_type(tr) match
         Ref(_, _) -> tr
-        _ -> TExpr(span, TBox(tr, Ref(texpr_type(tr), sync)))
+        Unknown -> tr
+        _ ->
+            val shown = type_show(texpr_type(tr))
+
+            cx.err(span, s"'&self' needs a counted reference, and this receiver is a $shown on the " +
+                   "stack — a '&self' method may keep hold of what it is called on, so what it wants " +
+                   "is a share of a box rather than an address. Bind the value into one and call it " +
+                   s"on that: 'var r: &$shown = …'")
 
 // The name the lowered member goes under. A member of a concrete type was lowered eagerly; a member
 // of a generic type is instantiated here, from the receiver's own type arguments, and its body
