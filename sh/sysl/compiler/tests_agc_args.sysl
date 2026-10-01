@@ -1,0 +1,924 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.Search
+
+// `sysl.args` -- the command-line library: `Scan`, the shape half of a command line driven by hand,
+// and `cli`, the described half with its generated help text and the conventions `parse_or_exit`
+// applies. Every claim here is about a real compiled program started with real arguments, because
+// that is the only place the thing under test exists: `argv` is the platform's, and a scanner
+// asserted against a hand-built `[]string` would be asserting about the harness.
+//
+// The help text is compared whole rather than searched for fragments, because column alignment is
+// the part of it that breaks silently.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `ArgsScanTests` and
+// `ArgsCliTests` these are.
+
+// What one run of a built program did: the status it exited with (-1 for a signal), and the two
+// streams apart. A program that could not be built answers -2 and says why in `out`.
+private struct AgcRun
+    code: int
+    out: string
+    err: string
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private agc_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end agc_ready
+
+// The program built and started with `args`, which are the words after the executable's own path --
+// exactly what a shell passes.
+private agc_outcome(text: string, args: []const string) -> AgcRun
+    val root = make_temp_dir("sysl-args").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return AgcRun(-2, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(exe, args, "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> AgcRun(-2, "the program that was built could not be run", "")
+        Ok(o) -> o.status match
+            Status.Exited(code) -> AgcRun(code, o.text, o.err.unwrap_or(""))
+            _ -> AgcRun(-1, o.text, o.err.unwrap_or(""))
+end agc_outcome
+
+// What a program printed, where it exited 0; anything else answers with its status in front, so a
+// program that stopped cannot pass for one that printed the expected text.
+private agc_ran(text: string, args: []const string) -> string
+    val r = agc_outcome(text, args)
+
+    if r.code == 0 then r.out else s"exited ${r.code}: ${r.out}${r.err}"
+
+// A program that scans its own arguments and reduces the whole scan to one line. `-o`/`--output` is
+// the one option that takes a value, which is what makes the four ways of writing one observable.
+// Every reported piece is spelled distinctly -- `v` for a short, `--n` for a long, `[p]` for an
+// operand, `=v` for a value -- so no two readings of one command line print the same line.
+private agc_scanner() -> string = raw"""
+    import sysl.args.*
+
+    main(args: []string)
+        var a = scan(args)
+        var out = ""
+
+        loop
+            a.next() match
+                Ok(Some(Short('o'))) | Ok(Some(Long("output"))) ->
+                    a.value() match
+                        Ok(v)  -> out += " =" + v
+                        Err(e) -> out += " !" + e.message()
+                Ok(Some(Short(c)))      -> out += " " + string(c)
+                Ok(Some(Long(n)))       -> out += " --" + n
+                Ok(Some(Positional(p))) -> out += " [" + p + "]"
+                Ok(None) -> break
+                Err(e) ->
+                    out += " !" + e.message()
+                    break
+
+        print(out)
+    """
+
+private agc_scanned(args: []const string) -> string = agc_ran(agc_scanner(), args)
+
+// --- ArgsScanTests ------------------------------------------------------------------------------
+
+@test("is reported on its own")
+agc_a_short_is_reported_on_its_own()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["-v"]), " v\n")
+
+// The bundle: one word, three options, and the order they were written in.
+@test("bundles with the others in its word")
+agc_a_short_bundles_with_the_others()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["-abc"]), " a b c\n")
+
+// Two bundles, so a scanner that kept the tail of one across a word would show it.
+@test("and a second bundle starts clean")
+agc_a_second_bundle_starts_clean()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["-ab", "-cd"]), " a b c d\n")
+
+@test("attached to a long option after '='")
+agc_a_value_attached_after_equals()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["--output=x"]), " =x\n")
+
+@test("as the word after a long option")
+agc_a_value_after_a_long_option()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["--output", "x"]), " =x\n")
+
+@test("as the rest of a short option's word")
+agc_a_value_as_the_rest_of_a_short()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["-ox"]), " =x\n")
+
+@test("as the word after a short option")
+agc_a_value_after_a_short_option()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["-o", "x"]), " =x\n")
+
+// The value comes out of the bundle's tail, so the options before it are still reported.
+@test("as the tail of a bundle the option ends")
+agc_a_value_as_the_tail_of_a_bundle()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["-vox"]), " v =x\n")
+
+// getopt's rule: what a value takes is the next word, whatever it looks like.
+@test("even where the next word looks like an option")
+agc_a_value_even_where_it_looks_like_an_option()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["-o", "--verbose"]), " =--verbose\n")
+
+// `--output=` is a value, and it is the empty one -- distinct from `--output` with nothing after it.
+@test("and an empty value is a value")
+agc_an_empty_value_is_a_value()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["--output="]), " =\n")
+
+@test("is anything that does not start with a dash")
+agc_an_operand_is_anything_without_a_dash()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["a", "b"]), " [a] [b]\n")
+
+@test("may stand between options")
+agc_an_operand_may_stand_between_options()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["a", "-v", "b"]), " [a] v [b]\n")
+
+// A lone `-` names standard input by a convention older than any of this.
+@test("and a lone dash is one")
+agc_a_lone_dash_is_an_operand()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["-", "f"]), " [-] [f]\n")
+
+@test("so what follows it is an operand however it starts")
+agc_after_the_separator_everything_is_an_operand()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["--", "-v", "--output=x"]), " [-v] [--output=x]\n")
+
+@test("while what precedes it is read as usual")
+agc_before_the_separator_is_read_as_usual()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["-v", "--", "-v"]), " v [-v]\n")
+
+// The separator itself is consumed rather than reported; only the first one means anything.
+@test("and a second one is just an operand")
+agc_a_second_separator_is_an_operand()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["--", "--"]), " [--]\n")
+
+@test("an option whose value is not there")
+agc_an_option_whose_value_is_not_there()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["-o"]), " !-o requires a value\n")
+
+// Named as it was written: `--output` here, `-o` above.
+@test("the same through the long spelling, named the way it was written")
+agc_a_missing_value_named_as_written()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["--output"]), " !--output requires a value\n")
+
+// `--verbose=yes` at a program whose `--verbose` takes nothing: the value cannot be reported as an
+// operand and must not be dropped, so going on to the next argument is what reveals it.
+@test("a value attached to an option that never asked for one")
+agc_a_value_nobody_asked_for()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["--verbose=yes"]), " --verbose !--verbose takes no value\n")
+
+// `scan` skips the program's own path, so a program started with nothing scans nothing.
+@test("is not an argument, so an empty command line scans to nothing")
+agc_the_zeroth_argument_is_not_an_argument()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned([]), "\n")
+
+// `scan_all` is the other half: given a vector that did not come from the platform, nothing is a
+// program name. Two options in, two options out.
+@test("while 'scan_all' reads every word it is given")
+agc_scan_all_reads_every_word()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(raw"""
+        import sysl.args.*
+
+        var a = scan_all(["-x", "-y"])
+        var out = ""
+
+        loop
+            a.next() match
+                Ok(Some(Short(c))) -> out += " " + string(c)
+                Ok(None) -> break
+                else break
+
+        print(out)
+        """, []), " x y\n")
+
+// `-v` is read as an option; from there on `-x` is a word like any other.
+@test("'rest' takes everything left as operands")
+agc_rest_takes_everything_left()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(raw"""
+        import sysl.args.*
+
+        main(args: []string)
+            var a = scan(args)
+
+            a.next() match
+                Ok(Some(Short(c))) -> print("first", c)
+                else print("first ?")
+
+            var out = ""
+
+            for r in a.rest()
+                out += " [" + r + "]"
+
+            print(out)
+        """, ["-v", "a", "-x"]), "first v\n [a] [-x]\n")
+
+// Only the first `=` splits, so `--define=NAME=value` keeps all of itself.
+@test("a value keeps every '=' after the one that split it")
+agc_a_value_keeps_every_later_equals()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["--output=a=b=c"]), " =a=b=c\n")
+
+// `--=x` is a long option whose name is empty rather than the `--` separator, and the value it
+// carries is one nobody asked for, so the scan stops there.
+@test("a long option with an empty name is an option, not a separator")
+agc_a_long_option_with_an_empty_name()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["--=x", "after"]), " -- !-- takes no value\n")
+
+// A word of no characters is not a dash and not a separator, so it is an operand.
+@test("the empty string is an operand")
+agc_the_empty_string_is_an_operand()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["", "a"]), " [] [a]\n")
+
+// The separator has no special standing once an option has asked for a value.
+@test("a value may be the separator itself")
+agc_a_value_may_be_the_separator()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["-o", "--", "x"]), " =-- [x]\n")
+
+// The scanner has no table to consult, so a dash inside a bundle is a short option named '-'.
+@test("a dash inside a bundle is a short option like any other")
+agc_a_dash_inside_a_bundle()
+    if !agc_ready() then return
+
+    assert_eq(agc_scanned(["-a-b"]), " a - b\n")
+
+// A cursor is a value, so copying one copies where it is -- which is what makes looking ahead
+// possible without a `peek` of its own.
+@test("a copy of a cursor is a second cursor over the same words")
+agc_a_copy_of_a_cursor()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(raw"""
+        import sysl.args.*
+
+        main(args: []string)
+            var a = scan(args)
+            var look = a
+
+            look.next() match
+                Ok(Some(Short(c))) -> print("ahead", c)
+                else print("ahead ?")
+
+            a.next() match
+                Ok(Some(Short(c))) -> print("still", c)
+                else print("still ?")
+        """, ["-a", "-b"]), "ahead a\nstill a\n")
+
+// --- ArgsCliTests -------------------------------------------------------------------------------
+
+// The description most cases are parsed against: two flags, two valued options, one of each with no
+// short spelling, and a version so that `--version` is offered. It is built inside a body: an `Opt`
+// holds strings, and a program keeps its table where it uses it.
+private agc_table() -> string = raw"""
+        var verbose = flag('v', "verbose", "print more about what is happening")
+        var output  = option('o', "output", "path", "write the result here")
+        var dry     = long_flag("dry-run", "work out what would happen, and do none of it")
+        var jobs    = option('j', "jobs", "n", "how many at a time")
+        var spec    = cli("count", [verbose, output, dry, jobs],
+                          about = "Count what is in a file.",
+                          version = "0.1.0",
+                          operands = "[file...]")
+    """
+
+// A program that parses and prints what it found, one exact line. Every option is reported, so a
+// value landing at the wrong option shows up as two wrong readings rather than none.
+private agc_reporter() -> string = "import sysl.args.*\n\nmain(args: []string)\n" + agc_table() + raw"""
+
+        parse(spec, args) match
+            Ok(Ready(p)) ->
+                var s = "v=" + str(p.count(verbose)) + " dry=" + str(p.given(dry))
+
+                s += " out=" + p.value_or(output, "-") + " jobs=" + p.value_or(jobs, "1")
+                s += " rest=" + str(p.positionals.len)
+
+                for x in p.positionals
+                    s += ":" + x
+
+                print(s)
+            Ok(HelpRequested)    -> print("help")
+            Ok(VersionRequested) -> print("version")
+            Err(e)               -> print("err:", e.message())
+    """
+
+private agc_parsed(args: []const string) -> string = agc_ran(agc_reporter(), args)
+
+@test("with nothing on it leaves every option at its default")
+agc_nothing_leaves_every_default()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed([]), "v=0 dry=false out=- jobs=1 rest=0\n")
+
+@test("reads a flag")
+agc_reads_a_flag()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["-v"]), "v=1 dry=false out=- jobs=1 rest=0\n")
+
+// Counting rather than recording a `bool` is what makes `-vvv` mean what it means everywhere.
+@test("counts a flag given more than once")
+agc_counts_a_flag_given_more_than_once()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["-vvv"]), "v=3 dry=false out=- jobs=1 rest=0\n")
+
+@test("counts it across separate words too")
+agc_counts_across_separate_words()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["-v", "--verbose"]), "v=2 dry=false out=- jobs=1 rest=0\n")
+
+@test("reads a flag that has no short spelling")
+agc_reads_a_flag_with_no_short_spelling()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["--dry-run"]), "v=0 dry=true out=- jobs=1 rest=0\n")
+
+@test("reads a value")
+agc_reads_a_value()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["-o", "x"]), "v=0 dry=false out=x jobs=1 rest=0\n")
+
+// The two valued options are distinct, so a value going to the wrong slot is visible.
+@test("keeps two values apart")
+agc_keeps_two_values_apart()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["-o", "x", "-j", "4"]), "v=0 dry=false out=x jobs=4 rest=0\n")
+
+@test("reads a bundle whose last option takes the rest as its value")
+agc_reads_a_bundle_ending_in_a_valued_option()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["-vo", "x"]), "v=1 dry=false out=x jobs=1 rest=0\n")
+
+@test("collects the operands in the order they were written")
+agc_collects_the_operands_in_order()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["a", "-v", "b", "c"]), "v=1 dry=false out=- jobs=1 rest=3:a:b:c\n")
+
+@test("takes the last of a value given twice")
+agc_takes_the_last_of_a_value_given_twice()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["-o", "first", "-o", "second"]), "v=0 dry=false out=second jobs=1 rest=0\n")
+
+@test("and after '--' an option-looking word is an operand")
+agc_after_the_separator_an_option_is_an_operand()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["--", "-v"]), "v=0 dry=false out=- jobs=1 rest=1:-v\n")
+
+@test("'--help' is an outcome, not a print")
+agc_help_is_an_outcome()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["--help"]), "help\n")
+
+@test("and so is '-h'")
+agc_and_so_is_h()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["-h"]), "help\n")
+
+@test("'--version' is offered because a version was given")
+agc_version_is_offered()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["--version"]), "version\n")
+
+@test("and so is '-V'")
+agc_and_so_is_capital_v()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["-V"]), "version\n")
+
+// A description with no version offers no `--version` at all, so the word is an unknown option
+// rather than a silent success.
+@test("while a description with no version offers neither spelling")
+agc_no_version_offers_neither_spelling()
+    if !agc_ready() then return
+
+    val src = raw"""
+        import sysl.args.*
+
+        main(args: []string)
+            var q = flag('q', "quiet", "say less")
+
+            parse(cli("thing", [q]), args) match
+                Ok(Ready(_))         -> print("ready")
+                Ok(HelpRequested)    -> print("help")
+                Ok(VersionRequested) -> print("version")
+                Err(e)               -> print("err:", e.message())
+        """
+
+    assert_eq(agc_ran(src, ["--version"]), "err: unknown option --version\n")
+    assert_eq(agc_ran(src, ["-V"]), "err: unknown option -V\n")
+    assert_eq(agc_ran(src, ["--help"]), "help\n")
+
+// The supplied options never take a spelling away from the program that declared one.
+private agc_owns_both() -> string = raw"""
+    import sysl.args.*
+
+    main(args: []string)
+        var height  = option('h', "height", "n", "how tall")
+        var verbose = flag('V', "verbose", "say more")
+
+        parse(cli("thing", [height, verbose], version = "2.0"), args) match
+            Ok(Ready(p)) ->
+                print("ready h=" + p.value_or(height, "-") + " V=" + str(p.given(verbose)))
+            Ok(HelpRequested)    -> print("help")
+            Ok(VersionRequested) -> print("version")
+            Err(e)               -> print("err:", e.message())
+    """
+
+@test("'-h' stays the program's option")
+agc_h_stays_the_programs_option()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(agc_owns_both(), ["-h", "3"]), "ready h=3 V=false\n")
+
+@test("'-V' stays the program's flag")
+agc_capital_v_stays_the_programs_flag()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(agc_owns_both(), ["-V"]), "ready h=- V=true\n")
+
+@test("and the long spellings still reach help and version")
+agc_the_long_spellings_still_reach_help_and_version()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(agc_owns_both(), ["--help"]), "help\n")
+    assert_eq(agc_ran(agc_owns_both(), ["--version"]), "version\n")
+
+// With `-h` and `-V` taken, the two supplied options are listed with no short spelling rather than
+// claiming a letter that means something else.
+@test("so the help text lists them without a letter")
+agc_the_help_text_lists_them_without_a_letter()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(raw"""
+        import sysl.args.*
+
+        var height  = option('h', "height", "n", "how tall")
+        var verbose = flag('V', "verbose", "say more")
+
+        prints(help(cli("thing", [height, verbose], version = "2.0")))
+        """, []), raw"""
+        usage: thing [options]
+
+        options:
+          -h, --height <n>  how tall
+          -V, --verbose     say more
+              --help        show this help and exit
+              --version     show the version and exit
+        """)
+
+@test("an unknown long option")
+agc_an_unknown_long_option()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["--nope"]), "err: unknown option --nope\n")
+
+@test("an unknown short option")
+agc_an_unknown_short_option()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["-z"]), "err: unknown option -z\n")
+
+@test("an option whose value is missing")
+agc_an_option_whose_value_is_missing()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["-o"]), "err: -o requires a value\n")
+
+@test("a value given to a flag")
+agc_a_value_given_to_a_flag()
+    if !agc_ready() then return
+
+    assert_eq(agc_parsed(["--verbose=yes"]), "err: --verbose takes no value\n")
+
+// The description at the top level, for the cases about the generated text.
+private agc_described() -> string = raw"""
+    import sysl.args.*
+
+    var verbose = flag('v', "verbose", "print more about what is happening")
+    var output  = option('o', "output", "path", "write the result here")
+    var dry     = long_flag("dry-run", "work out what would happen, and do none of it")
+    var jobs    = option('j', "jobs", "n", "how many at a time")
+    var spec    = cli("count", [verbose, output, dry, jobs],
+                      about = "Count what is in a file.",
+                      version = "0.1.0",
+                      operands = "[file...]")
+    """
+
+@test("is a usage line naming the program and its operands")
+agc_a_usage_line()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(agc_described() + "\nprint(usage_line(spec))\n", []),
+              "usage: count [options] [file...]\n")
+
+// The help text that `--help` prints, which `parse_or_exit` is checked against below.
+private agc_count_help() -> string = raw"""
+    usage: count [options] [file...]
+
+    Count what is in a file.
+
+    options:
+      -v, --verbose        print more about what is happening
+      -o, --output <path>  write the result here
+          --dry-run        work out what would happen, and do none of it
+      -j, --jobs <n>       how many at a time
+      -h, --help           show this help and exit
+      -V, --version        show the version and exit
+    """
+
+@test("is a help text whose descriptions line up in one column")
+agc_a_help_text_in_one_column()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(agc_described() + "\nprints(help(spec))\n", []), agc_count_help())
+
+// `<préfé>` is five characters and seven bytes: measured in bytes, the rows under it would be pushed
+// two positions right of the row that set the column.
+@test("and the column is screen columns, so a placeholder that is not ASCII still lines up")
+agc_the_column_is_screen_columns()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(raw"""
+        import sysl.args.*
+
+        var out  = option('o', "output", "préfé", "where to write it")
+        var all  = flag('a', "all", "do every one")
+        var spec = cli("thing", [out, all])
+
+        prints(help(spec))
+        """, []), raw"""
+        usage: thing [options]
+
+        options:
+          -o, --output <préfé>  where to write it
+          -a, --all             do every one
+          -h, --help            show this help and exit
+        """)
+
+// No version, no `--version` row -- the help text lists what the program actually accepts.
+@test("leaves out the version row where no version was given")
+agc_leaves_out_the_version_row()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(raw"""
+        import sysl.args.*
+
+        var q = flag('q', "quiet", "say less")
+
+        prints(help(cli("thing", [q], about = "Do a thing.")))
+        """, []), raw"""
+        usage: thing [options]
+
+        Do a thing.
+
+        options:
+          -q, --quiet  say less
+          -h, --help   show this help and exit
+        """)
+
+// A label past the cap takes its description on the next line rather than moving every other
+// description to the right.
+@test("puts an over-long label's description on the next line")
+agc_an_over_long_label()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(raw"""
+        import sysl.args.*
+
+        var q    = flag('q', "quiet", "say less")
+        var big  = long_option("with-a-very-long-name", "PLACEHOLDER", "the long one")
+
+        prints(help(cli("thing", [q, big])))
+        """, []), raw"""
+        usage: thing [options]
+
+        options:
+          -q, --quiet  say less
+              --with-a-very-long-name <PLACEHOLDER>
+                       the long one
+          -h, --help   show this help and exit
+        """)
+
+// What `parse_or_exit` does with what `parse` found: which stream, which status, and that the help a
+// user asked for is not an error.
+private agc_acting() -> string = "import sysl.args.*\n\nmain(args: []string)\n" + agc_table() + raw"""
+
+        var p = parse_or_exit(spec, args)
+
+        print("ran with", p.positionals.len, "operands")
+    """
+
+@test("a command line it can read simply returns")
+agc_a_readable_command_line_returns()
+    if !agc_ready() then return
+
+    val r = agc_outcome(agc_acting(), ["-v", "a"])
+
+    assert_eq(r.code, 0)
+    assert_eq(r.out, "ran with 1 operands\n")
+    assert_eq(r.err, "")
+
+// Help was what the user asked for, so it succeeds and goes to standard output.
+@test("'--help' prints to standard output and exits 0")
+agc_help_prints_to_standard_output()
+    if !agc_ready() then return
+
+    val r = agc_outcome(agc_acting(), ["--help"])
+
+    assert_eq(r.code, 0)
+    assert_eq(r.err, "")
+    assert(r.out.starts_with("usage: count [options] [file...]\n"))
+    assert(r.out.index_of("  -v, --verbose        print more about what is happening\n").is_some())
+
+@test("'--version' prints the name and the version, and exits 0")
+agc_version_prints_the_name_and_the_version()
+    if !agc_ready() then return
+
+    val r = agc_outcome(agc_acting(), ["--version"])
+
+    assert_eq(r.code, 0)
+    assert_eq(r.out, "count 0.1.0\n")
+    assert_eq(r.err, "")
+
+// A usage error goes to the other stream, with status 2 -- what getopt and every parser since reserve
+// for being invoked wrongly.
+@test("a bad option goes to standard error, with the usage line, and exits 2")
+agc_a_bad_option_goes_to_standard_error()
+    if !agc_ready() then return
+
+    val r = agc_outcome(agc_acting(), ["--nope"])
+
+    assert_eq(r.code, 2)
+    assert_eq(r.out, "")
+    assert_eq(r.err, raw"""
+        count: error: unknown option --nope
+        usage: count [options] [file...]
+        try 'count --help' for more information.
+        """)
+
+@test("and so does a missing value")
+agc_and_so_does_a_missing_value()
+    if !agc_ready() then return
+
+    val r = agc_outcome(agc_acting(), ["-o"])
+
+    assert_eq(r.code, 2)
+    assert_eq(r.out, "")
+    assert(r.err.starts_with("count: error: -o requires a value\n"))
+
+// Asking about an option the description does not declare is a mistake in the program, not in what
+// the user typed, so it stops rather than answering.
+@test("asking about an undeclared option stops the program")
+agc_asking_about_an_undeclared_option_stops()
+    if !agc_ready() then return
+
+    val r = agc_outcome(raw"""
+        import sysl.args.*
+
+        main(args: []string)
+            var declared = flag('d', "declared", "in the table")
+            var stranger = flag('s', "stranger", "not in the table")
+            var p = parse_or_exit(cli("thing", [declared]), args)
+
+            print(p.given(stranger))
+        """, [])
+
+    assert(r.code != 0 && r.code != -2)
+    assert((r.out + r.err).index_of("asked about an option the description does not declare").is_some())
+
+// A table of no options is a real thing -- a program that takes only operands and still wants
+// `--help` -- and the case where the parallel arrays a `Parsed` holds are empty.
+@test("a description with no options of its own still offers help")
+agc_no_options_still_offers_help()
+    if !agc_ready() then return
+
+    val src = raw"""
+        import sysl.args.*
+
+        main(args: []string)
+            var empty: []Opt = []
+
+            parse(cli("thing", empty, operands = "<file>"), args) match
+                Ok(Ready(p))         -> print("ready with", p.positionals.len)
+                Ok(HelpRequested)    -> print("help")
+                Ok(VersionRequested) -> print("version")
+                Err(e)               -> print("err:", e.message())
+        """
+
+    assert_eq(agc_ran(src, ["a", "b"]), "ready with 2\n")
+    assert_eq(agc_ran(src, ["--help"]), "help\n")
+    assert_eq(agc_ran(src, ["-x"]), "err: unknown option -x\n")
+
+@test("and its help text is the usage line and the one row")
+agc_no_options_help_text()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(raw"""
+        import sysl.args.*
+
+        var empty: []Opt = []
+
+        prints(help(cli("thing", empty, operands = "<file>")))
+        """, []), raw"""
+        usage: thing [options] <file>
+
+        options:
+          -h, --help  show this help and exit
+        """)
+
+// Every optional part of a description left out: the usage line is the program's name and
+// `[options]`, and nothing stands above the table.
+@test("a description with only a name and a table")
+agc_only_a_name_and_a_table()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(raw"""
+        import sysl.args.*
+
+        var q = flag('q', "quiet", "say less")
+
+        prints(help(cli("thing", [q])))
+        """, []), raw"""
+        usage: thing [options]
+
+        options:
+          -q, --quiet  say less
+          -h, --help   show this help and exit
+        """)
+
+// Every label is indented past where a letter would go, so the `--`s line up with those of options
+// that have one.
+@test("a table with no short spellings lines its long ones up anyway")
+agc_no_short_spellings_line_up()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(raw"""
+        import sysl.args.*
+
+        var a = long_flag("alpha", "the first")
+        var b = long_option("beta", "n", "the second")
+
+        prints(help(cli("thing", [a, b])))
+        """, []), raw"""
+        usage: thing [options]
+
+        options:
+              --alpha     the first
+              --beta <n>  the second
+          -h, --help      show this help and exit
+        """)
+
+// A short-only option has no `--` to line up with and takes the column on its own.
+@test("a short-only option is listed with no word")
+agc_a_short_only_option_is_listed_with_no_word()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(raw"""
+        import sysl.args.*
+
+        var old = short_flag('x', "kept for something older")
+        var num = short_option('n', "count", "how many")
+
+        prints(help(cli("thing", [old, num])))
+        """, []), raw"""
+        usage: thing [options]
+
+        options:
+          -x          kept for something older
+          -n <count>  how many
+          -h, --help  show this help and exit
+        """)
+
+// And it parses by its letter, with no long spelling to reach it by.
+@test("a short-only option is read by its letter")
+agc_a_short_only_option_is_read_by_its_letter()
+    if !agc_ready() then return
+
+    val src = raw"""
+        import sysl.args.*
+
+        main(args: []string)
+            var num = short_option('n', "count", "how many")
+
+            parse(cli("thing", [num]), args) match
+                Ok(Ready(p)) -> print("n=" + p.value_or(num, "-"))
+                Err(e)       -> print("err:", e.message())
+                else print("other")
+        """
+
+    assert_eq(agc_ran(src, ["-n", "3"]), "n=3\n")
+    assert_eq(agc_ran(src, ["--count", "3"]), "err: unknown option --count\n")
+
+// `value` answers `None` for an option never given, and for one that takes no value however often it
+// was given.
+private agc_asking() -> string = raw"""
+    import sysl.args.*
+
+    main(args: []string)
+        var f = flag('f', "flag", "takes nothing")
+        var o = option('o', "opt", "v", "takes something")
+        var p = parse_or_exit(cli("thing", [f, o]), args)
+
+        p.value(f) match
+            Some(v) -> print("flag has", v)
+            None    -> print("flag has nothing")
+
+        p.value(o) match
+            Some(v) -> print("opt has", v)
+            None    -> print("opt has nothing")
+    """
+
+@test("is None for a flag, however it was given")
+agc_a_flags_value_is_none()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(agc_asking(), ["-f"]), "flag has nothing\nopt has nothing\n")
+
+@test("and None for a valued option nobody gave")
+agc_a_valued_options_value_when_given()
+    if !agc_ready() then return
+
+    assert_eq(agc_ran(agc_asking(), ["-o", "x"]), "flag has nothing\nopt has x\n")
