@@ -124,3 +124,77 @@ pdl_a_coordinate_named_after_its_module()
 
     assert_eq(pdl_run(s"$root/app"), "compressed\n")
     remove_dir_all(root).unwrap_or(())
+
+// The import forms over the same package. `reference/modules.md § Imports`: "An import is a dotted
+// path through the module tree, and how the path ends decides what you get" -- `import sysl.math.max`
+// one member, `import sysl.math.*` every public member, `import sysl.math` the module itself; and
+// `packages.md § What a dependency's modules are called`: "its modules come in under their own names".
+// So each reads the label-named package exactly as the call form `zstd.tag()` does.
+private ilm_run(program: string) -> string
+    val root = pdl_temp()
+
+    pdl_package(s"$root/dep", "zstd", pdl_zstd())
+    pdl_app(s"$root/app", s"zstd { path = \"$root/dep\" }", program)
+
+    val said = pdl_run(s"$root/app")
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end ilm_run
+
+// 0.0.155 refuses this -- "no module is called 'zstd.tag', and nothing declares it" -- a reference bug.
+@test("an import of a declaration through a label naming its module reaches the declaration")
+ilm_import_a_function_through_a_label_naming_its_module()
+    if !pdl_ready() then return
+
+    assert_eq(ilm_run("import zstd.tag\n\nprint(tag())\n"), "compressed\n")
+
+// 0.0.155 refuses this -- "no module is called 'zstd.Level', and nothing declares it" -- a reference bug.
+@test("and an import of a type through it names the type in a declaration and a construction")
+ilm_import_a_type_through_a_label_naming_its_module()
+    if !pdl_ready() then return
+
+    assert_eq(ilm_run("import zstd.Level\n\nval l: Level = Level(3)\nprint(l.n)\n"), "3\n")
+
+// 0.0.155 refuses this -- "unknown type 'zstd.Level'" -- while it accepts `zstd.Level(3)`; a reference
+// bug, `modules.md` making `math.Float` a type wherever `math.max(p)` is a call.
+@test("a type annotation through a label naming its module reads the package's type")
+ilm_annotate_through_a_label_naming_its_module()
+    if !pdl_ready() then return
+
+    assert_eq(ilm_run("val l: zstd.Level = zstd.Level(3)\nprint(l.n)\n"), "3\n")
+
+// 0.0.155 refuses this -- "no module is called 'zstd'" -- a reference bug.
+@test("a wildcard import through a label naming its module brings in its members")
+ilm_wildcard_through_a_label_naming_its_module()
+    if !pdl_ready() then return
+
+    assert_eq(ilm_run("import zstd.*\n\nprint(tag())\n"), "compressed\n")
+
+// 0.0.155 refuses this -- "'zstd' declares no 'tag' — there is no 'zstd.tag'" -- a reference bug.
+@test("a selector import through a label naming its module brings in each name")
+ilm_selectors_through_a_label_naming_its_module()
+    if !pdl_ready() then return
+
+    assert_eq(ilm_run("import zstd.{tag, Level}\n\nprint(tag())\nprint(Level(3).n)\n"), "compressed\n3\n")
+
+// 0.0.155 refuses this -- "no module is called 'zstd', and nothing declares it" -- a reference bug.
+@test("an import of the module itself through a label naming it is the module")
+ilm_import_the_module_through_a_label_naming_it()
+    if !pdl_ready() then return
+
+    assert_eq(ilm_run("import zstd\n\nprint(zstd.tag())\n"), "compressed\n")
+
+// The neighbouring shape, held so the two stay one reading: a label unlike its module, whose module
+// is imported wholesale by the module's own name.
+@test("a wildcard over a module named unlike its label still reads the module")
+ilm_wildcard_over_a_module_named_unlike_its_label()
+    if !pdl_ready() then return
+
+    val root = pdl_temp()
+
+    pdl_package(s"$root/dep", "engine", "tag() -> string = \"eng\"")
+    pdl_app(s"$root/app", s"e { path = \"$root/dep\" }", "import engine.*\n\nprint(tag())\n")
+
+    assert_eq(pdl_run(s"$root/app"), "eng\n")
+    remove_dir_all(root).unwrap_or(())
