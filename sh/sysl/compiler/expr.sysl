@@ -1606,14 +1606,11 @@ private block_line_is_a_loop(e: Expr) -> bool = *e.kind match
 // `var` and an argument of a generic parameter nothing has solved are the ordinary ways to reach it,
 // and none of them has a type to look the name up in.
 //
-// Only the variant reading is built. An associated function or a constant reached this way is the
-// same lookup one step further and is not written anywhere in the org.
+// Written with no parentheses it is a variant or a static property; a member that needs a value, or
+// an associated function missing its parentheses, is told which it is -- in the words the qualified
+// spelling gets, since what the dot leaves off is the type's name and nothing else.
 private implicit_member(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TExpr
-    if expected.is_none() || expected.unwrap() == Unknown
-        return cx.err(span, s"'.$name' is a member of whatever type the context expects, and " +
-                      "nothing here expects one — write the type's own name in front of the dot. " +
-                      "A trait object expects no single type either, since what may be erased into " +
-                      "one is whatever implements the trait")
+    if expected.is_none() || expected.unwrap() == Unknown then return nothing_expected(cx, span, name)
 
     // The dot is what names the enum, so the variant needs no import of its own.
     val wanted = named_variant_expr(cx, span, name, expected)
@@ -1622,10 +1619,38 @@ private implicit_member(cx: &Analyzer, span: Span, name: string, expected: Optio
 
     if variant_of(cx, name, expected).is_some() then return variant_expr(cx, span, name, expected)
 
-    enum_decl_of(cx, expected.unwrap()) match
+    val subject = implicit_subject(expected.unwrap())
+
+    subject match
+        Trait(_, _, _) -> return nothing_expected(cx, span, name)
+        _ -> ()
+
+    val found = member_key(cx.an, subject, name)
+    val m = member_at(cx.an, found.0, name)
+
+    if m.is_some()
+        val decl = m.unwrap()
+
+        if decl.is_property && decl.is_static
+            val read = associated_on(cx, span, subject, name, buf(), expected, no_bound_traits())
+
+            return if read.is_some() then read.unwrap() else bad_expr(span)
+        end if
+
+        val receiving = receiving_member(cx, span, found.0, name, decl)
+
+        if receiving.is_some() then return receiving.unwrap()
+
+        val shown = qualified_name(found.0)
+
+        return cx.err(span, s"'$name' is an associated function of '$shown' — call it with " +
+                      s"'$shown.$name(…)'")
+    end if
+
+    enum_decl_of(cx, subject) match
         Some(base) -> cx.err(span, s"enum '${qualified_name(base)}' has no variant '$name'")
-        None -> cx.err(span, s"'${type_show(expected.unwrap())}' is not an enum, and only a " +
-                       "variant is reached with the type's own name left off")
+        None -> cx.err(span, s"type '${type_show(subject)}' has no member '$name' — and " +
+                       s"'${type_show(subject)}' is a type, not a value")
 end implicit_member
 
 

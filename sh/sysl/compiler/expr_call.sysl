@@ -1848,6 +1848,21 @@ private function_call(cx: &Analyzer, span: Span, callee_at: Span, written: strin
 
         if !said then fitting.push(keys.at(i))
 
+    // **An argument the position types fits every candidate at that candidate's own type**, so
+    // where it is what the candidates differ in, it is no reason to prefer either -- `name(.Ripe)`
+    // over a `Colour` and a `Fruit` that both declare `Ripe` is the ambiguity
+    // (`reference/declarations.md § Overloading`), not a call meaning whichever was written first.
+    val tie = position_tie(cx, fitting, args)
+
+    if tie.len() == 1 then return call_key(cx, span, written, tie.at(0), args, expected, true)
+
+    if tie.len() > 1
+        return cx.err(span, s"'${qualified_callee(keys.at(0), written)}' is ambiguous here — " +
+                      s"${tie.len()} of its declarations take these arguments:\n" +
+                      s"${signature_list(cx, tie)}\nAnnotate an argument, or name the type a " +
+                      "literal is meant at")
+    end if
+
     val chosen = narrowed(cx, fitting)
 
     if chosen.is_some() then return call_key(cx, span, written, chosen.unwrap(), args, expected, true)
@@ -1893,6 +1908,63 @@ private narrowed(cx: &Analyzer, fitting: Buf[string]) -> Option[string]
 
     Some(fitting.at(0))
 end narrowed
+
+// The written-out candidates a call's position-typed arguments leave tied: empty where no argument
+// is typed by its position or the candidates agree at every one that is, the one candidate whose
+// parameters are exactly the other arguments' own types where there is one, and otherwise every
+// candidate still in the running.
+private position_tie(cx: &Analyzer, fitting: Buf[string], args: Buf[Expr]) -> Buf[string]
+    var spelled: Buf[string] = buf()
+
+    for i in 0..<fitting.len()
+        val f = cx.an.tables.funcs.get(fitting.at(i))
+
+        if f.is_some() && f.unwrap().decl.tparams.is_empty() then spelled.push(fitting.at(i))
+
+    if spelled.len() < 2 then return buf()
+
+    var differs = false
+
+    for i in 0..<args.len()
+        if positioned(cx, args.at(i))
+            val first = nth_param_type(cx, spelled.at(0), i)
+
+            for j in 1..<spelled.len()
+                if nth_param_type(cx, spelled.at(j), i) != first then differs = true
+
+    if !differs then return buf()
+
+    // **Exactness still decides, over the arguments that have a type of their own**, as it does
+    // between two widths: a literal's natural type picks the candidate written at it.
+    var exact: Buf[string] = buf()
+
+    for j in 0..<spelled.len()
+        var all = true
+
+        for i in 0..<args.len()
+            if !positioned(cx, args.at(i))
+                val own = texpr_type(sandboxed_reading(cx, args.at(i)).0)
+
+                if own == Unknown || repr(own) != repr(nth_param_type(cx, spelled.at(j), i)) then all = false
+
+        if all then exact.push(spelled.at(j))
+
+    if exact.len() == 1 then exact else spelled
+end position_tie
+
+// Whether an argument takes its whole type from the parameter it stands at.
+private positioned(cx: &Analyzer, e: Expr) -> bool = *e.kind match
+    NullLit -> true
+    _ -> typed_by_position(cx, e)
+
+// The type a candidate declares at a position, or `Unknown` past its parameters.
+private nth_param_type(cx: &Analyzer, key: string, i: usize) -> Type
+    val f = cx.an.tables.funcs.get(key).unwrap()
+
+    if i >= f.decl.params.len() then return Unknown
+
+    param_type(cx, f, f.decl.params.at(i))
+end nth_param_type
 
 // The declarations of one name, as a reader would write them.
 private signature_list(cx: &Analyzer, keys: Buf[string]) -> string
@@ -2604,21 +2676,63 @@ private old_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
     TExpr(span, TOld(int(idx), texpr_type(te)))
 end old_call
 
-// A leading dot's call form: `.Circle(5)`, the qualified constructor with the enum's name left off.
+// A leading dot's call form: `.Circle(5)`, the qualified constructor with the enum's name left off,
+// and `.origin()`, an associated function with its type's name left off.
 implicit_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
               expected: Option[Type]) -> TExpr
-    if expected.is_none() || expected.unwrap() == Unknown
-        return cx.err(span, s"'.$name' is a member of whatever type the context expects, and " +
-                      "nothing here expects one — write the type's own name in front of the dot. " +
-                      "A trait object expects no single type either, since what may be erased into " +
-                      "one is whatever implements the trait")
+    if expected.is_none() || expected.unwrap() == Unknown then return nothing_expected(cx, span, name)
 
     val wanted = expected_variant(name, expected)
 
     if wanted.is_some() then return variant_call(cx, span, wanted.unwrap().0, wanted.unwrap().1, args)
 
-    enum_decl_of(cx, expected.unwrap()) match
-        Some(base) -> cx.err(span, s"enum '${qualified_name(base)}' has no variant '$name'")
-        None -> cx.err(span, s"'${type_show(expected.unwrap())}' is not an enum, and only a " +
-                       "variant is reached with the type's own name left off")
+    val subject = implicit_subject(expected.unwrap())
+
+    // A trait object pushes no single type down -- what may be erased into one is whatever
+    // implements the trait -- so it is the position that expects nothing, whatever is written there.
+    subject match
+        Trait(_, _, _) -> return nothing_expected(cx, span, name)
+        _ -> ()
+
+    // An enum's own names are its variants as well as its members, so a name that is neither is told
+    // about the variant it most plausibly meant.
+    val base = enum_decl_of(cx, subject)
+
+    if base.is_some() && name != "try" &&
+       member_at(cx.an, member_key(cx.an, subject, name).0, name).is_none()
+        return cx.err(span, s"enum '${qualified_name(base.unwrap())}' has no variant '$name'")
+
+    // **Everything else is what the qualified spelling reaches**, through the same body: a generic
+    // type's arguments are settled exactly as `Box.empty()`'s are, from the member's result rather
+    // than from the expectation alone, so the two fail in the same words.
+    val generic_key = repr(subject) match
+        Struct(d) -> if d.targs.is_empty() then None else Some(d.base)
+        Enum(d) -> if d.targs.is_empty() then None else Some(d.base)
+        _ -> None
+
+    var ty = subject
+
+    if generic_key.is_some()
+        val solved = generic_subject_of(cx, span, generic_key.unwrap(), name, args, expected)
+
+        if solved.is_some() then ty = solved.unwrap()
+    end if
+
+    associated_on(cx, span, ty, name, args, expected, no_bound_traits()) match
+        Some(t) -> t
+        None -> cx.err(span, s"'${type_show(subject)}' has no member '$name' reached with the " +
+                       "type's own name left off")
 end implicit_call
+
+// The type a leading dot looks its name up in: the expectation **as written** -- a constrained
+// subtype is not reduced to its base, whose members are not its own -- seen through the counted
+// reference a `&T` position boxes it into.
+implicit_subject(t: Type) -> Type = t match
+    Ref(inner, _) -> implicit_subject(*inner)
+    other -> other
+
+// The refusal for a leading dot where the position supplies no type to look the name up in.
+nothing_expected(cx: &Analyzer, span: Span, name: string) -> TExpr =
+    cx.err(span, s"'.$name' is a member of whatever type the context expects, and nothing here " +
+           "expects one — write the type's own name in front of the dot. A trait object expects no " +
+           "single type either, since what may be erased into one is whatever implements the trait")

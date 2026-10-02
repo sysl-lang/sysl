@@ -79,8 +79,18 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
 
     if subject.is_none() then return generic_enum_stranger(cx, span, receiver, name)
 
-    val ty = subject.unwrap()
+    // **The traits the WRITTEN name was bounded by.** `T.zero()` still has the `T` in it, so a body
+    // whose signature asked `T` for a `Zero` reaches that trait's `zero` even where the file that
+    // instantiated it imported another trait declaring one for the very same type.
+    associated_on(cx, span, subject.unwrap(), name, args, expected, written_bound(cx, receiver))
+end associated_call
 
+// The call `associated_call` makes once it knows which type the name in front of the dot stands for
+// -- and the one a leading dot makes, whose type is the one the position expects rather than one
+// anybody wrote (`reference/expressions.md § A leading dot`). The two spellings reach the member
+// through this one body, which is what makes them fail in the same words.
+associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr],
+              expected: Option[Type], via: Buf[string]) -> Option[TExpr]
     if ty == Unknown then return Some(bad_expr(span))
 
     // A parameter standing in for itself answers off the bounds it carries, exactly as a value of it
@@ -108,11 +118,6 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
         _ -> ()
 
     val found = member_key(cx.an, ty, name)
-
-    // **The traits the WRITTEN name was bounded by.** `T.zero()` still has the `T` in it, so a body
-    // whose signature asked `T` for a `Zero` reaches that trait's `zero` even where the file that
-    // instantiated it imported another trait declaring one for the very same type.
-    val via = written_bound(cx, receiver)
     var picked = name
 
     if member_at(cx.an, found.0, name).is_some()
@@ -223,7 +228,7 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
     check_crossings(cx, decl.crossing, shown, sig.unwrap().params, ts)
     cx.an.uses(fname)
     Some(TExpr(span, TCall(fname, ts, sig.unwrap().ret, false)))
-end associated_call
+end associated_on
 
 // `Option.nope()` -- a call through a **generic** enum's bare name of something it declares neither
 // as a variant nor as a member. No instantiation is settled for a name nobody declared, so without
@@ -284,6 +289,14 @@ private generic_subject(cx: &Analyzer, span: Span, receiver: Expr, name: string,
     if key.is_none() then return None
     if concrete_instance(cx.an, key.unwrap()).is_some() then return None
 
+    generic_subject_of(cx, span, key.unwrap(), name, args, expected)
+end generic_subject
+
+// The same, for a generic type already known by its key -- which is where a leading dot arrives,
+// its type being the expected one rather than a name somebody wrote.
+generic_subject_of(cx: &Analyzer, span: Span, k: string, name: string, args: Buf[Expr],
+                   expected: Option[Type]) -> Option[Type]
+    val key = Some(k)
     val m = member_at(cx.an, key.unwrap(), name)
 
     // **A name the type does not declare is the type's mistake, not the name's** -- `Box` is right
@@ -305,9 +318,15 @@ private generic_subject(cx: &Analyzer, span: Span, receiver: Expr, name: string,
     // settle for a call that cannot be made through the type at all.
     if receiving_member(cx, span, key.unwrap(), name, m.unwrap()).is_some() then return Some(Unknown)
 
+    // **The expected type settles the type's arguments only through the member's result**, as it
+    // settles a generic free function's (`reference/generics.md § Members and associated
+    // functions`): `empty() -> Box[int]` says nothing about `Box`'s `T`, so a `Box[int]` receiving it
+    // is no reason to pick one. A result that mentions every parameter -- `Self`, `Box[T]` -- is read
+    // off the expectation directly; anything else goes to the solve, which names what it could not.
     expected match
         Some(want) ->
-            if instantiation_of(want, key.unwrap()) then return Some(repr(want))
+            if instantiation_of(want, key.unwrap()) && result_settles_type(cx, key.unwrap(), m.unwrap())
+                return Some(repr(want))
         None -> ()
 
     val said = cx.an.complaints()
@@ -338,12 +357,43 @@ private generic_subject(cx: &Analyzer, span: Span, receiver: Expr, name: string,
                  s"'${qualified_name(key.unwrap())}.$name' here — annotate the expected type")
 
     Some(Unknown)
-end generic_subject
+end generic_subject_of
+
+// Whether a receiverless member's written result names every parameter of the type that declares
+// it -- `Self` counting as all of them -- so that the type an expectation names is the type the call
+// answers.
+private result_settles_type(cx: &Analyzer, key: string, m: MethodDecl) -> bool
+    if m.ret_type.is_none() then return false
+
+    val declared = cx.an.tables.types.get(key)
+
+    if declared.is_none() then return false
+
+    val tparams = declared.unwrap().kind match
+        StructOf(d) -> d.tparams
+        EnumOf(d) -> d.tparams
+        _ -> return false
+
+    var self_name: Buf[string] = buf()
+
+    self_name.push("Self")
+
+    if ref_mentions(m.ret_type.unwrap(), self_name) then return true
+
+    for i in 0..<tparams.len()
+        var one: Buf[string] = buf()
+
+        one.push(tparams.at(i))
+
+        if !ref_mentions(m.ret_type.unwrap(), one) then return false
+
+    true
+end result_settles_type
 
 // The refusal for a member reached through its type that needs a value to be reached through -- a
 // property or a method -- and nothing for an associated function or a static property.
-private receiving_member(cx: &Analyzer, span: Span, key: string, name: string,
-                         decl: MethodDecl) -> Option[TExpr]
+receiving_member(cx: &Analyzer, span: Span, key: string, name: string,
+                 decl: MethodDecl) -> Option[TExpr]
     if decl.is_property && !decl.is_static then
         return Some(cx.err(span, s"'$name' is a property of '${qualified_name(key)}' — read it on a " +
                            s"value, as 'value.$name'"))
