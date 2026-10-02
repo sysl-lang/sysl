@@ -1,0 +1,116 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.repeat
+
+// `sysl deps` -- the graph a project resolves to, printed, and who asked for each version.
+//
+// **A package reached through another is importable**, so a program can be built against packages
+// its own manifest never names, and nothing in the files in front of a reader says what those are.
+// Selection is silent by design; this is where somebody goes to ask.
+//
+// **The claims are the half nothing else could reconstruct.** A version that was passed over has its
+// manifest dropped from the graph, so the claim that *lost* -- the whole reason a version is higher
+// than some manifest says -- survives only because the resolver wrote it down as it went.
+//
+// The listing is the project's own heading, a blank line, and then one row per package: a fetched
+// package by the coordinate its manifest wrote and the version settled on, each claim on it indented
+// beneath; a path dependency by its label and its directory, which is the only thing that says which
+// tree it is. Fetched packages come first, sorted by coordinate, then path dependencies by label, and
+// the second column lines up across both.
+
+// The listing for a resolved graph, every line ending in a newline.
+deps_listing(m: &Manifest, g: &Graph) -> string
+    var out = s"${deps_heading(m)}\n\n"
+    var names: Buf[string] = buf()
+    var width: usize = 0
+
+    for i in 0..<g.packages.len()
+        val p = g.packages.at(i)
+
+        if is_root_package(p) then continue
+
+        val name = listed_name(p, g)
+
+        if name.len > width then width = name.len
+
+        names.push(name)
+
+    if names.is_empty() then return out + "this project depends on nothing\n"
+
+    var row: usize = 0
+
+    for i in 0..<g.packages.len()
+        val p = g.packages.at(i)
+
+        if is_root_package(p) then continue
+
+        val name = names.at(row)
+
+        row += 1
+        out = out + name + repeat(" ", width - name.len) + "  "
+
+        p.version match
+            None -> out = out + p.root + "\n"
+            Some(v) ->
+                val claims = claims_on(g, name, root_asker(m))
+                var raised = false
+
+                for j in 0..<claims.len()
+                    if release_before(claims.at(j).version, v) then raised = true
+
+                out = out + release_shown(v) + (if raised then "  (raised)" else "") + "\n"
+
+                for j in 0..<claims.len()
+                    val c = claims.at(j)
+
+                    out = out + s"    ${c.asker} asks for ${release_shown(c.version)}\n"
+
+    out
+end deps_listing
+
+// The project by the name and version its own manifest gives, and a stand-in where it names none: a
+// heading reading as though nobody owned the project is worse than one that says whose it is.
+private deps_heading(m: &Manifest) -> string
+    if m.name.is_empty() then return root_asker(m)
+
+    if m.version.is_empty() then m.name else s"${m.name} ${m.version}"
+end deps_heading
+
+// What a row calls a package: the coordinate as a manifest wrote it, slashes and all, for a fetched
+// one, and the label for a path dependency. A coordinate is full of dots, so the canonical prefix
+// cannot be turned back into one -- the spelling comes from the claims, keyed on what was written.
+private listed_name(p: &ResolvedPackage, g: &Graph) -> string
+    if p.version.is_none() then return p.canonical
+
+    for i in 0..<g.claims.len()
+        val c = g.claims.at(i)
+
+        if canonical_prefix(c.coordinate) == p.canonical then return c.coordinate
+
+    p.canonical
+end listed_name
+
+// The claims on one coordinate, the project's own first and then by who asked, so that the listing
+// does not move with the order the walk happened to reach the manifests in.
+private claims_on(g: &Graph, coordinate: string, root: string) -> Buf[Claim]
+    var out: Buf[Claim] = buf()
+    var askers: Buf[string] = buf()
+
+    for i in 0..<g.claims.len()
+        val c = g.claims.at(i)
+
+        if c.coordinate != coordinate then continue
+
+        if c.asker == root then out.push(c) else askers.push(c.asker)
+
+    val ordered = sorted_labels(askers)
+
+    for i in 0..<ordered.len()
+        for j in 0..<g.claims.len()
+            val c = g.claims.at(j)
+
+            if c.coordinate == coordinate && c.asker == ordered.at(i) then out.push(c)
+
+    out
+end claims_on
