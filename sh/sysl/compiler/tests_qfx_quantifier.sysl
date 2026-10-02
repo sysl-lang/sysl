@@ -1,0 +1,243 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The quantifiers `for all i in r do P(i)` and `for some i in r do P(i)`
+// (`reference/verification.md § for all and for some`): the identities at an empty range, the short
+// circuit, the bound name's scope, the greedy body, the positions the form may stand in, the one
+// token that tells it from a counted loop, and the refusals of a range it cannot quantify over.
+//
+// **Every output, exit status, message and location here was read out of the reference compiler**
+// (0.0.157) on the same program, whose `QuantifierTests` these are. A trap is the status 133 the
+// shell reports for one.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private qfx_root(main: string) -> string
+    val root = make_temp_dir("sysl-qfx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end qfx_root
+
+// What the program in `root` does: what it printed and the status it left with, as a shell reports
+// one. A failure to build is its message and `-1`, which no program exits with.
+private qfx_outcome_in(root: string) -> (string, int)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end qfx_outcome_in
+
+// The program prints exactly this and leaves with this status -- both, so that a build that failed
+// cannot pass for a program that stopped. Returns at once without the library.
+private qfx_leaves(main: string, want: string, code: int)
+    if xvr_no_library() then return
+
+    val out = qfx_outcome_in(qfx_root(main))
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, code)
+end qfx_leaves
+
+private qfx_prints(main: string, want: string) = qfx_leaves(main, want, 0)
+
+// The program is refused with exactly this message, first; and where `at` is not empty, at this line
+// and column of `main.sysl`.
+private qfx_refused(main: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val root = qfx_root(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.starts_with(s"error: $message\n --> "), s"expected 'error: $message' first, got: $out")
+
+    if at != ""
+        assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end qfx_refused
+
+// -- what it computes -----------------------------------------------------------------------------
+
+@test("a universal is true when every element satisfies the predicate")
+qfx_a_universal_is_true_when_every_element_satisfies() =
+    qfx_prints("var a = [2, 4, 6]\nprint(for all i in 0..<3 do a[i] % 2 == 0)\n", "true\n")
+
+// One element fails, and it is the LAST one, so a body that stopped early for the wrong reason would
+// still answer true.
+@test("and false when the last one does not")
+qfx_and_false_when_the_last_one_does_not() =
+    qfx_prints("var a = [2, 4, 7]\nprint(for all i in 0..<3 do a[i] % 2 == 0)\n", "false\n")
+
+@test("an existential is true when one element satisfies the predicate")
+qfx_an_existential_is_true_when_one_element_satisfies() =
+    qfx_prints("var a = [1, 3, 8]\nprint(for some i in 0..<3 do a[i] % 2 == 0)\n", "true\n")
+
+@test("and false when none does")
+qfx_and_false_when_none_does() =
+    qfx_prints("var a = [1, 3, 9]\nprint(for some i in 0..<3 do a[i] % 2 == 0)\n", "false\n")
+
+@test("the inclusive range reaches its upper bound")
+qfx_the_inclusive_range_reaches_its_upper_bound() =
+    qfx_prints("var a = [2, 4, 7]\nprint(for all i in 0..2 do a[i] % 2 == 0)\n", "false\n")
+
+// Same data, same predicate, exclusive bound: the element that decides it is the one `..<` leaves
+// out, so this pair is what shows the bound is read rather than ignored.
+@test("where the exclusive one stops short of it")
+qfx_where_the_exclusive_one_stops_short_of_it() =
+    qfx_prints("var a = [2, 4, 7]\nprint(for all i in 0..<2 do a[i] % 2 == 0)\n", "true\n")
+
+// -- an empty range takes each quantifier's identity ----------------------------------------------
+
+@test("a conjunction over nothing is true")
+qfx_a_conjunction_over_nothing_is_true() = qfx_prints("print(for all i in 0..<0 do false)\n", "true\n")
+
+@test("a disjunction over nothing is false")
+qfx_a_disjunction_over_nothing_is_false() = qfx_prints("print(for some i in 0..<0 do true)\n", "false\n")
+
+// `for all i in 0..<n - 1` with `n` at 0 asks about `0..<-1`, which is empty rather than a trap.
+@test("a range whose lower bound is past its upper is empty too")
+qfx_a_range_whose_lower_bound_is_past_its_upper_is_empty() =
+    qfx_prints("var n = 0\nprint(for all i in 0..<n - 1 do false)\n", "true\n")
+
+// -- both forms short-circuit ---------------------------------------------------------------------
+
+// The predicate counts its own evaluations through a local a nested function captures.
+private qfx_probe(form: string, last: string) -> string =
+    "probe() -> int\n    var seen = 0\n\n    check(i: int) -> bool\n        seen += 1\n        " + last +
+    "\n\n    print(for " + form + " i in 0..<5 do check(i))\n    seen\n\nprint(probe())\n"
+
+@test("a universal stops at the first counterexample")
+qfx_a_universal_stops_at_the_first_counterexample() = qfx_prints(qfx_probe("all", "i != 1"), "false\n2\n")
+
+@test("an existential stops at the first witness")
+qfx_an_existential_stops_at_the_first_witness() = qfx_prints(qfx_probe("some", "i == 1"), "true\n2\n")
+
+@test("a universal that never fails runs the predicate on every element")
+qfx_a_universal_that_never_fails_runs_every_element() = qfx_prints(qfx_probe("all", "true"), "true\n5\n")
+
+// -- the bound name -------------------------------------------------------------------------------
+
+@test("is visible inside the predicate")
+qfx_the_bound_name_is_visible_inside_the_predicate() = qfx_prints("print(for all i in 3..5 do i >= 3)\n", "true\n")
+
+// An outer `i` of a different value is what a wrong implementation would read.
+@test("shadows an outer name of the same spelling")
+qfx_the_bound_name_shadows_an_outer_name() =
+    qfx_prints("var i = 100\nprint(for all i in 0..<3 do i < 3)\n", "true\n")
+
+@test("and the outer one is back afterwards")
+qfx_and_the_outer_one_is_back_afterwards() =
+    qfx_prints("var i = 100\nvar q = for all i in 0..<3 do i < 3\nprint(i)\n", "100\n")
+
+// -- the body extends as far to the right as an expression does -----------------------------------
+
+// Read the other way -- the quantifier over the first operand alone -- `i` would have no meaning in
+// the second, and the program would not compile.
+@test("so a conjunction after it is inside it")
+qfx_so_a_conjunction_after_it_is_inside_it() =
+    qfx_prints("var a = [2, 4, 6]\nprint(for all i in 0..<3 do a[i] % 2 == 0 && a[i] > 0)\n", "true\n")
+
+@test("and a quantifier as a later arm of a chain is parenthesized")
+qfx_a_quantifier_as_a_later_arm_of_a_chain() =
+    qfx_prints("var a = [2, 4, 6]\nprint(a[0] == 2 && (for all i in 0..<3 do a[i] > 0))\n", "true\n")
+
+// -- where it may be written ----------------------------------------------------------------------
+
+private qfx_first_even(data: string) -> string =
+    "first_even(a: []int, n: int) -> int\n    require for all i in 0..<n do a[i] % 2 == 0\n    a[0]\n\n" +
+    "var a = " + data + "\nprint(first_even(a[..], 3))\n"
+
+@test("in a require")
+qfx_in_a_require() = qfx_prints(qfx_first_even("[2, 4, 6]"), "2\n")
+
+@test("and a require it fails stops the program")
+qfx_and_a_require_it_fails_stops_the_program() = qfx_leaves(qfx_first_even("[2, 5, 6]"), "", 133)
+
+@test("in an ensure, where it may read result")
+qfx_in_an_ensure_where_it_may_read_result() =
+    qfx_prints("zeros() -> [3]int\n    ensure for all i in 0..<3 do result[i] == 0\n    [0; 3]\n\nprint(zeros()[1])\n", "0\n")
+
+@test("in an if condition, which is not a contract position at all")
+qfx_in_an_if_condition() =
+    qfx_prints(
+        "var a = [2, 4, 6]\nif for all i in 0..<3 do a[i] % 2 == 0 then print(\"even\") else print(\"mixed\")\n",
+        "even\n")
+
+@test("and on the right of a binding")
+qfx_and_on_the_right_of_a_binding() =
+    qfx_prints("var a = [1, 2]\nvar sorted = for all i in 0..<1 do a[i] <= a[i + 1]\nprint(sorted)\n", "true\n")
+
+// -- it is told from a counted loop by one token --------------------------------------------------
+
+// `all` and `some` stay ordinary identifiers, so a loop whose variable is called `all` is still a loop.
+@test("a loop over a variable named 'all' is still a loop")
+qfx_a_loop_over_a_variable_named_all_is_still_a_loop() =
+    qfx_prints("for all in 0..<3 do print(all)\n", "0\n1\n2\n")
+
+@test("and one named 'some' is too")
+qfx_and_one_named_some_is_too() = qfx_prints("for some in 0..<2 do print(some)\n", "0\n1\n")
+
+@test("a value named 'all' is an ordinary name")
+qfx_a_value_named_all_is_an_ordinary_name() = qfx_prints("var all = 7\nprint(all)\n", "7\n")
+
+// -- the widths the range may take ----------------------------------------------------------------
+
+@test("a quantifier over a sized integer range works at that width")
+qfx_a_quantifier_over_a_sized_integer_range() =
+    qfx_prints("print(for all i in 0u8..<3u8 do i < 3u8)\n", "true\n")
+
+// Two declared bounds rather than two literals, since a literal takes the type it is used at.
+@test("bounds of different types are refused")
+qfx_bounds_of_different_types_are_refused() =
+    qfx_refused("var lo = 0u8\nvar hi = 3i32\nprint(for all i in lo..<hi do true)\n",
+        "a 'for all' range needs matching bounds, got byte and int", "3:7")
+
+@test("a non-integer range is refused")
+qfx_a_non_integer_range_is_refused() =
+    qfx_refused("print(for all i in 0.0..<3.0 do true)", "a 'for all' range iterates integer bounds, not real", "1:7")
+
+@test("something that is not a range at all is refused")
+qfx_something_that_is_not_a_range_at_all_is_refused() =
+    qfx_refused("var a = [1, 2]\nprint(for all i in a do true)\n",
+        "'for all' quantifies over an integer range, written 'lo..<hi' or 'lo..hi'", "2:7")
+
+@test("and the message names the form that was written")
+qfx_and_the_message_names_the_form_that_was_written() =
+    qfx_refused("var a = [1, 2]\nprint(for some i in a do true)\n",
+        "'for some' quantifies over an integer range, written 'lo..<hi' or 'lo..hi'", "2:7")
+
+// The reference places this at the whole quantifier (1:7); this compiler places it at the predicate
+// that is not a bool (1:29), so only the message is held here.
+@test("the predicate must be a bool")
+qfx_the_predicate_must_be_a_bool() =
+    qfx_refused("print(for all i in 0..<3 do i)", "condition must be bool, got int", "")
+
+// -- nesting --------------------------------------------------------------------------------------
+
+@test("a quantifier nests")
+qfx_a_quantifier_nests() =
+    qfx_prints("var a = [1, 2, 3]\nprint(for all i in 0..<3 do (for all j in 0..<3 do a[i] + a[j] > 1))\n", "true\n")
+
+@test("and a nested one that fails somewhere in the middle answers false")
+qfx_a_nested_one_that_fails_in_the_middle_answers_false() =
+    qfx_prints("var a = [1, 2, 3]\nprint(for all i in 0..<3 do (for all j in 0..<3 do a[i] + a[j] > 2))\n", "false\n")
