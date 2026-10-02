@@ -491,6 +491,26 @@ private declared_needs(a: &Analysis, cap: string) -> Buf[string]
     out
 end declared_needs
 
+// Says that the body about to be read is `d`'s, for the edges it makes; hands back what was said
+// before, which `leave_reaching` puts back. A body read while another is open -- an instantiation
+// asked for from inside a call -- is its own declaration's and not the caller's.
+enter_reaching(a: &Analysis, d: FuncDecl) -> (Buf[string], bool)
+    val saved = (a.tables.reaching_needs, a.tables.reaching_test)
+    var needs: Buf[string] = buf()
+    val core = capability_core()
+
+    for i in 0..<core.len()
+        if needs_capability(d.needs, core.at(i)) then needs.push(core.at(i))
+
+    a.tables.reaching_needs = needs
+    a.tables.reaching_test = d.test.is_some()
+    saved
+end enter_reaching
+
+leave_reaching(a: &Analysis, saved: (Buf[string], bool))
+    a.tables.reaching_needs = saved.0
+    a.tables.reaching_test = saved.1
+
 private needs_capability(needs: Buf[string], cap: string) -> bool
     for i in 0..<needs.len()
         if !is_facility(needs.at(i)) then continue
@@ -526,16 +546,25 @@ private check_needs_names(a: &Analysis)
                         "'os', 'posix'")
 end check_needs_names
 
-// Whether a module is without a capability, because it gave the capability up.
+// Whether a module is without a capability -- because it gave the capability up, or because the
+// target it is being built for never had it.
 //
 // **Only the module's half moves between a module and its tests.** A `@tests` file may take back
 // what the module gave up, because the module's clause is a promise about what ships and the file
-// does not ship.
-private lacks(a: &Analysis, module_name: string, cap: string, scaffolding: bool) -> bool
-    if scaffolding then return module_tests_narrowed(a, module_name, cap)
+// does not ship; it cannot take back what the machine never had. The library is exempt from the
+// target's half, as it is at an edge: its files are compiled into every program, and a mistake in
+// them is not one this compilation's author can change.
+private lacks(a: &Analysis, scope: Scope, module_name: string, cap: string, scaffolding: bool) -> bool
+    val narrowed = if scaffolding then module_tests_narrowed(a, module_name, cap)
+    else module_narrowed(a, module_name, cap)
 
-    module_narrowed(a, module_name, cap)
+    narrowed || target_lacks_for(a, scope, module_name, cap)
 end lacks
+
+// Whether the machine lacks an environment capability, asked for a module of the program's own.
+private target_lacks_for(a: &Analysis, scope: Scope, module_name: string, cap: string) -> bool =
+    is_environment(cap) && a.tables.target.lacks_capability(cap) && !from_library(a, scope) &&
+        !holds_string(a.tables.supplied_modules, module_name)
 
 // Which of the two put the capability out of reach, said the way the diagnostic needs it. A reader
 // told their module "declared 'no os'" when no file of it says any such thing would go looking for a
@@ -547,7 +576,14 @@ private why_lacking(a: &Analysis, module_name: string, cap: string, scaffolding:
     if scaffolding && module_tests_own_narrowing(a, module_name, cap) then
         return s"the '@tests' file of $here declared '@no_$word'"
 
-    s"$here declared '@no_$word'"
+    val narrowed = if scaffolding then module_tests_narrowed(a, module_name, cap)
+    else module_narrowed(a, module_name, cap)
+
+    if narrowed then return s"$here declared '@no_$word'"
+
+    s"'${a.tables.target.name}' does not provide it — a target's capabilities are what " +
+        "'package.hocon' declares, so either this reference cannot be made on this machine or the " +
+        "config is understating it"
 end why_lacking
 
 // Refuses a `@needs(...)` naming something that is not a capability, and reports every reference
@@ -588,7 +624,7 @@ check_decl_capabilities(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtable
             // never recorded.
             val scaffolding = test_only_file(a, scope.src.name)
 
-            if !lacks(a, module_name, cap, scaffolding) then continue
+            if !lacks(a, scope, module_name, cap, scaffolding) then continue
 
             blame_needs(a, walk, scope, f.body, cap,
                         why_lacking(a, module_name, cap, scaffolding))
@@ -600,11 +636,10 @@ check_decl_capabilities(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtable
 
             val module_name = module_of(v.symbol)
             val scaffolding = holds_string(a.tables.test_only, v.symbol)
-
-            if !lacks(a, module_name, cap, scaffolding) then continue
-
             val d = a.tables.vals.get(v.symbol)
             val scope = if d.is_some() then d.unwrap().scope else empty_scope()
+
+            if !lacks(a, scope, module_name, cap, scaffolding) then continue
 
             blame_needs_expr(a, walk, scope, v.init.unwrap(), cap,
                              why_lacking(a, module_name, cap, scaffolding))
@@ -649,6 +684,11 @@ private is_environment(cap: string) -> bool = cap == CapOs || cap == CapPosix
 // can. The answer is taken as a FIXPOINT over the edges rather than by a walk, because a program
 // whose module graph has a cycle is a diagnostic of its own and must not also be a walk that never
 // ends.
+//
+// **Only an edge the module SHIPS counts toward what it requires.** One made inside a declaration
+// that wrote `@needs(...)` is charged to whoever reaches that declaration, and one made in a `@tests`
+// file or a `@test` function is scaffolding every build but a test run drops -- neither says anything
+// about what a program that links the module needs.
 private environment_requirements(a: &Analysis) -> Buf[(string, string)]
     var out: Buf[(string, string)] = buf()
 
@@ -662,31 +702,33 @@ private environment_requirements(a: &Analysis) -> Buf[(string, string)]
     while grew
         grew = false
 
-        for i in 0..<a.tables.module_deps.len()
-            val from = a.tables.module_deps.at(i).0
-            val reached = a.tables.module_deps.at(i).1
+        for i in 0..<a.tables.capability_refs.len()
+            val r = a.tables.capability_refs.at(i)
 
-            for j in 0..<reached.len()
-                for k in 0..<out.len()
-                    if out.at(k).0 != reached.at(j) || holds_pair(out, from, out.at(k).1) then
-                        continue
+            if r.scaffolding then continue
 
-                    out.push((from, out.at(k).1))
-                    grew = true
+            for k in 0..<out.len()
+                val cap = out.at(k).1
+
+                if out.at(k).0 != r.to || holds_string(r.needs, cap) || holds_pair(out, r.from, cap) then
+                    continue
+
+                out.push((r.from, cap))
+                grew = true
 
     out
 end environment_requirements
 
 // The capability an edge is refused for, which is the least by name where it is refused for more
 // than one -- so the message does not vary between runs with the order a table happens to be in.
-private gating_capability(a: &Analysis, from: string, to: string,
+private gating_capability(a: &Analysis, from: string, to: string, needs: Buf[string],
                           needed: Buf[(string, string)]) -> Option[string]
     val core = capability_core()
 
     for i in 0..<core.len()
         val cap = core.at(i)
 
-        if !is_environment(cap) then continue
+        if !is_environment(cap) || holds_string(needs, cap) then continue
         if !module_narrowed(a, from, cap) then continue
         if holds_pair(needed, to, cap) then return Some(cap)
 
@@ -715,11 +757,21 @@ check_gated_modules(a: &Analysis)
 
     val needed = environment_requirements(a)
 
-    for i in 0..<a.tables.module_edges.len()
-        val e = a.tables.module_edges.at(i)
-        val cap = gating_capability(a, e.from, e.to, needed)
+    // An edge is refused once, at the first reference to it that is refused -- a reference inside a
+    // declaration that wrote `@needs` for the capability is that declaration's own business, and is
+    // charged where the declaration is reached instead.
+    var refused: Buf[(string, string)] = buf()
+
+    for i in 0..<a.tables.capability_refs.len()
+        val e = a.tables.capability_refs.at(i)
+
+        if holds_pair(refused, e.from, e.to) then continue
+
+        val cap = gating_capability(a, e.from, e.to, e.needs, needed)
 
         if cap.is_some()
+            refused.push((e.from, e.to))
+
             val here = if e.from == "" then "this module" else s"'${e.from}'"
 
             a.fault(e.scope, e.span,
@@ -732,6 +784,7 @@ check_gated_modules(a: &Analysis)
 
         if missing.is_none() then continue
 
+        refused.push((e.from, e.to))
         a.fault(e.scope, e.span,
                 s"this reaches '${qualified_name(e.to)}', which requires '${missing.unwrap()}', and " +
                 s"'${a.tables.target.name}' does not provide it — a target's capabilities are " +
@@ -746,7 +799,7 @@ end check_gated_modules
 // library's gated module refuses no build that merely carries it, and refuses every program that
 // actually reaches it -- at the reference, which is the line the reader wrote. An edge made inside a
 // library is its author's and is never the program's mistake.
-private missing_on_target(a: &Analysis, e: ModuleEdge,
+private missing_on_target(a: &Analysis, e: CapabilityRef,
                           needed: Buf[(string, string)]) -> Option[string]
     if from_library(a, e.scope) || holds_string(a.tables.supplied_modules, e.from) then return None
 
@@ -756,6 +809,7 @@ private missing_on_target(a: &Analysis, e: ModuleEdge,
         val cap = core.at(i)
 
         if !is_environment(cap) || !a.tables.target.lacks_capability(cap) then continue
+        if holds_string(e.needs, cap) then continue
         if holds_pair(needed, e.to, cap) then return Some(cap)
 
     None

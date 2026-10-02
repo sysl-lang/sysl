@@ -335,6 +335,8 @@ depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span)
     // may have said where it is (`Tables.reference_at`).
     val span = if written.is_empty() then a.tables.reference_at else written
 
+    note_capability_ref(a, scope, from, to, span)
+
     for i in 0..<a.tables.module_deps.len()
         if a.tables.module_deps.at(i).0 == from
             val reached = a.tables.module_deps.at(i).1
@@ -355,6 +357,39 @@ depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span)
     first.push(to)
     a.tables.module_deps.push((from, first))
     a.tables.module_edges.push(ModuleEdge(from, to, scope, span))
+
+// Records an edge for the capability check, told apart by the code that made it.
+//
+// **A `@tests` file is scaffolding wherever in it the reference was written** -- its imports as much
+// as its bodies -- and so is a `@test` function written beside what it tests. A reference inside a
+// declaration that wrote `@needs(...)` carries what that declaration needs, since reaching the
+// declaration is what is charged for it.
+private note_capability_ref(a: &Analysis, scope: Scope, from: string, to: string, span: Span)
+    val needs = a.tables.reaching_needs
+    val scaffolding = a.tables.reaching_test || test_only_file(a, scope.src.name)
+
+    for i in 0..<a.tables.capability_refs.len()
+        val r = a.tables.capability_refs.at(i)
+
+        if r.from != from || r.to != to || r.scaffolding != scaffolding then continue
+        if !same_strings(r.needs, needs) then continue
+
+        if r.span.is_empty() && !span.is_empty() then
+            a.tables.capability_refs.set(i, CapabilityRef(from, to, scope, span, needs, scaffolding))
+
+        return
+
+    a.tables.capability_refs.push(CapabilityRef(from, to, scope, span, needs, scaffolding))
+end note_capability_ref
+
+private same_strings(xs: Buf[string], ys: Buf[string]) -> bool
+    if xs.len() != ys.len() then return false
+
+    for i in 0..<xs.len()
+        if xs.at(i) != ys.at(i) then return false
+
+    true
+end same_strings
 
 // Fills in the position of an edge already recorded, where the first reference to make it had none.
 private position_edge(a: &Analysis, from: string, to: string, scope: Scope, span: Span)
