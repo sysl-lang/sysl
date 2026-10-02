@@ -1215,6 +1215,9 @@ private address_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
         return cx.err(span, s"${type_show(ty)} is not a value, so there is nothing to make an " +
                       "address of")
 
+    // An opaque type's shape is its module's, so there is no slot to lay one down in out here.
+    if !value_layout_known(cx, span, ty) then return bad_expr(span)
+
     TExpr(span, TTempAddr(t, Ptr(ty)))
 end address_expr
 
@@ -1226,7 +1229,13 @@ private deref_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
 
     val inner = pointee(ty)
 
-    if inner.is_some() then return TExpr(span, TDeref(t, unqualified(inner.unwrap())))
+    // Reading through the pointer produces the **value**, the one thing an opaque type has no shape
+    // for outside its module -- so `*c` is refused where `c` itself was fine.
+    if inner.is_some()
+        if !value_layout_known(cx, span, inner.unwrap()) then return bad_expr(span)
+
+        return TExpr(span, TDeref(t, unqualified(inner.unwrap())))
+    end if
 
     // A trait object points somewhere, but it has forgotten what is there, so there is no type to
     // read out -- its methods are the whole of what it still offers.

@@ -991,10 +991,18 @@ end as_read_only
 
 build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
                        member: string) -> TExpr = mode match
-    ByValue -> texpr_type(tr) match
-        Struct(_) -> tr
-        Enum(_) -> tr
-        _ -> auto_deref(cx, tr)
+    // A by-value receiver is a **copy**, made by the caller, so calling one needs the layout exactly
+    // as building the value does: without the refusal an opaque type's `self` methods would copy the
+    // fields as they stood when the caller was compiled. `*self` and `&self` need no shape.
+    ByValue ->
+        val value = texpr_type(tr) match
+            Struct(_) -> tr
+            Enum(_) -> tr
+            _ -> auto_deref(cx, tr)
+
+        if !value_layout_known(cx, span, texpr_type(value)) then return bad_expr(span)
+
+        value
     ByPtr -> texpr_type(tr) match
         Ptr(_) -> tr
         _ ->
@@ -1953,6 +1961,9 @@ callable_field(cx: &Analyzer, span: Span, rty: Type, name: string, recv: TExpr, 
         _ -> false
 
     if !is_cfn && callable_of(cx.an, fty).is_none() then return None
+
+    if !layout_known(cx.an, cx.scope, span, d.unwrap().base, qualified_name(d.unwrap().base)) then
+        return Some(bad_expr(span))
 
     if !field_visible(cx, d.unwrap().base, name) then
         return Some(cx.err(span, field_out_of_reach(cx, d.unwrap().base, name)))
