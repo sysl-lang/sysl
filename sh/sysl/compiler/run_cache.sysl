@@ -235,16 +235,15 @@ private program_fingerprint(path: string, t: Target) -> Result[string, Refusal]
             Err(e) -> return Err(Refusal(e.message))
             Ok(f) -> f
 
-        // A tree's manifest, because its `features` block decides which of the files' lines are
-        // compiled at all -- an edit to it alone changes the program.
+        // A tree's `features` block, because it decides which of the files' lines are compiled at all
+        // -- an edit to it alone changes the program. **What it declares goes in, not how the file
+        // spelled it**: the rest of the manifest reaches the key as what it means (what the target
+        // provides, where the trees are), so a reordered block is the same program.
         val tree_root = if i == 0 then root else trees.at(i)
-        val manifest_file = join_path(tree_root, ManifestName)
 
-        if is_file(manifest_file)
-            read_text(manifest_file) match
-                Ok(text) -> files.push((s"$i/$ManifestName", text))
-                Err(_) -> ()
-        end if
+        manifest_at(tree_root) match
+            Ok(m) -> if !m.features.is_empty() then files.push((s"$i/features", features_part(m.features)))
+            Err(_) -> ()
 
         for j in 0..<found.len()
             files.push((s"$i/${found_place(found.at(j))}",
@@ -265,6 +264,19 @@ private program_fingerprint(path: string, t: Target) -> Result[string, Refusal]
 
     Ok(library_fingerprint(files))
 end program_fingerprint
+
+// A `features` block as what it declares: each feature and what it turns on, one to a line.
+private features_part(features: Buf[(string, Buf[string])]) -> string
+    var out = str_builder()
+
+    for i in 0..<features.len()
+        out.push(features.at(i).0)
+        out.push(" = [")
+        out.push(join(features.at(i).1.view(), ", "))
+        out.push("]\n")
+
+    out.finish()
+end features_part
 
 // A file's place: the module directories it was found under, then its own name.
 private found_place(found: Found) -> string
