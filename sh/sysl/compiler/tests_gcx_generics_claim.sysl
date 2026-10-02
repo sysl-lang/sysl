@@ -1,0 +1,443 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What `reference/generics.md` claims, run rather than read. The chapter's ordinary surface has
+// files of its own; what this one covers is `§5`'s list of what an unbounded parameter may not do --
+// *"no `+`, `<`, `==`, or other operator; no method call; no field access; no index"* -- every item
+// refused at the definition, naming the bound to write, whether or not anything instantiates the
+// body. A subscript is `Index`'s one method, so it is asked of the bounds the way a dot call is.
+// Then the rest of the chapter's probes: a type parameter's default, inference in both directions,
+// and what a bound over the open integer family can and cannot do.
+//
+// **Every output, message and location here was read out of the reference compiler** (0.0.157) on
+// the same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private gcx_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end gcx_skip
+
+private gcx_skip_run() -> bool
+    if gcx_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end gcx_skip_run
+
+private gcx_write(main: string) -> string
+    val root = make_temp_dir("sysl-gcx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end gcx_write
+
+// What the program PRINTS, or what the build had to say about it.
+private gcx_ran(main: string) -> string
+    val root = gcx_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end gcx_ran
+
+// The LLVM text of the program, or everything the analysis had to say about it.
+private gcx_report(main: string) -> string
+    val root = gcx_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gcx_report
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private gcx_refused(main: string, message: string, at: string)
+    val out = gcx_report(main)
+    // The first diagnostic alone, which is where the location has to be.
+    val first = out.index_of("\n\n") match
+        Some(n) -> out[0..<n]
+        None -> out
+
+    assert(out.starts_with(s"error: $message\n "), s"expected 'error: $message' first, got: $out")
+    assert(first.index_of(s"/main.sysl:$at\n").is_some(), s"expected it first at main.sysl:$at, got: $out")
+end gcx_refused
+
+// The report says this somewhere, at this location.
+private gcx_also(main: string, message: string, at: string)
+    val out = gcx_report(main)
+
+    assert(out.index_of(s"error: $message\n --> ").is_some(), s"expected 'error: $message', got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected a refusal at main.sysl:$at, got: $out")
+end gcx_also
+
+private gcx_prints(main: string, expected: string)
+    val out = gcx_ran(main)
+
+    assert(out == expected, s"expected '$expected', got: $out")
+
+// `sysl.math.Magnitude`'s shape reduced to what three cases need: a trait declaring an associated
+// type, implemented for the whole integer family by one blanket block. The names are the trait's own
+// rather than the library's, a second `Size` over the integers being refused where it is written.
+private gcx_mag() -> string =
+    "trait Mag\n    type Extent: Ord\n    extent(self) -> Self::Extent\n\n" +
+    "impl[T: Integer + Zero] Mag for T\n    type Extent = T\n" +
+    "    extent(self) -> T = if self < T.zero() then T.zero() - self else self\n\n"
+
+private gcx_total() -> string =
+    "total[T: Integer + Add](xs: []T) -> T\n    var acc: T = 0\n\n" +
+    "    for i in 0..<xs.len do acc = acc + xs[i]\n\n    acc\n"
+
+private gcx_sink() -> string =
+    "trait Sink[T = Self]\n    put(self, x: T) -> int\nstruct Q\n    n: int\n" +
+    "impl Sink[int] for Q\n    put(self, x: int) -> int = self.n + x\nvar q = Q(6)\n"
+
+// == everything an unbounded parameter may not do is refused at its own definition ================
+
+@test("an operator names the bound that supplies it")
+gcx_operator_names_its_bound()
+    if gcx_skip() then return
+
+    gcx_refused("plus[T](a: T, b: T) -> T = a + b", "'+' needs 'T: sysl.Add'", "1:28")
+    gcx_refused("less[T](a: T, b: T) -> bool = a < b", "'<' needs 'T: sysl.Ord'", "1:31")
+    gcx_refused("same[T](a: T, b: T) -> bool = a == b", "'==' needs 'T: sysl.Eq'", "1:31")
+
+@test("a method call names it, or says no trait declares one")
+gcx_method_call_names_no_trait()
+    if gcx_skip() then return
+
+    gcx_refused("meth[T](x: T) -> int = x.go()",
+                "no trait declares a method 'go', so no bound on 'T' could license this call", "1:26")
+
+@test("a field names none, because a trait promises behaviour and a field is layout — and the diagnostic is reached only after looking for a property of that name")
+gcx_field_names_no_bound()
+    if gcx_skip() then return
+
+    gcx_refused("fld[T](x: T) -> int = x.v",
+                "'T' is a type parameter, so it has no fields to read — a field is layout, and no trait " +
+                "declares a property 'v' that a bound could promise instead", "1:25")
+
+@test("a rendering names 'Display'")
+gcx_rendering_names_display()
+    if gcx_skip() then return
+
+    gcx_refused("shown[T](x: T) = print(x)", "'print' needs 'T: sysl.Display'", "1:18")
+
+@test("A SUBSCRIPT — which went unchecked, so the body compiled and the reader met the mistake at whatever first instantiated it, against a type the definition never named")
+gcx_subscript_names_index()
+    if gcx_skip() then return
+
+    gcx_refused("idx[T](x: T) -> int = x[0]", "'index' needs 'T: sysl.Index'", "1:24")
+
+@test("and none of it depends on anything instantiating the body")
+gcx_no_instantiation_needed()
+    if gcx_skip() then return
+
+    // A whole program with no call, and the complaint still lands.
+    val out = gcx_report("idx[T](x: T) -> int = x[0]")
+
+    assert(out.starts_with("error: "), s"expected a refusal, got: $out")
+
+// == an uncalled generic is checked for more than its bounds ======================================
+
+@test("a name in the body that names nothing is refused")
+gcx_unknown_name_in_generic()
+    if gcx_skip() then return
+
+    gcx_refused("f[T](y: T) -> usize = nosuchthing", "undefined name 'nosuchthing'", "1:23")
+
+@test("and so is the same name in a body nothing makes generic")
+gcx_unknown_name_in_plain()
+    if gcx_skip() then return
+
+    gcx_refused("g(y: int) -> usize = nosuchthing", "undefined name 'nosuchthing'", "1:22")
+
+@test("a type in the signature that names nothing is refused")
+gcx_unknown_type_in_generic()
+    if gcx_skip() then return
+
+    gcx_refused("f[T](xs: []Nope, y: T) -> usize = 0", "unknown type 'Nope'", "1:12")
+
+@test("and so is the same type where there is no parameter to make it generic")
+gcx_unknown_type_in_plain()
+    if gcx_skip() then return
+
+    gcx_refused("g(xs: []Nope) -> usize = 0", "unknown type 'Nope'", "1:9")
+
+// == a bound licenses the subscript ================================================================
+
+@test("a parameter bounded by 'Index' is subscripted and dispatches through it — this only ever worked because the definition-time pass was dropping the complaint")
+gcx_index_bound_dispatches()
+    if gcx_skip_run() then return
+
+    gcx_prints("import sysl.buf.*\n\nidx[T: Index[usize, int]](x: T) -> int = x[0usize]\n" +
+               "var b: Buf[int] = buf()\nb.push(42)\nprint(idx(b))", "42\n")
+
+@test("while a concrete type that indexes nothing keeps the complaint it always had")
+gcx_concrete_indexes_nothing()
+    if gcx_skip() then return
+
+    gcx_refused("struct S\n    n: int\nvar s = S(1)\nprint(s[0])", "cannot index S", "4:8")
+
+@test("a conversion out of a parameter is NOT refused, which '§ Open f' settles against '§5'")
+gcx_conversion_not_refused()
+    if gcx_skip_run() then return
+
+    gcx_prints("conv[T: Ord](x: T) -> int = 1\nwiden[T](x: T) -> T = x\nprint(conv(5), widen(7))", "1 7\n")
+    gcx_prints("shrink(x: u32) -> u8 = u8(x)\nprint(shrink(300u32))", "44\n")
+
+// == a type parameter's default ====================================================================
+
+@test("fills where a use leaves it out, and the filled form is the written one")
+gcx_default_fills()
+    if gcx_skip_run() then return
+
+    gcx_prints("struct Pair[A, B = A]\n    x: A\n    y: B\nvar same: Pair[int] = Pair(1, 2)\n" +
+               "var both: Pair[int, int] = Pair(3, 4)\nprint(same.x, same.y, both.x, both.y)", "1 2 3 4\n")
+
+@test("and 'Self' in a trait's default means the implementing type")
+gcx_default_self_in_trait()
+    if gcx_skip_run() then return
+
+    gcx_prints("trait Scale[R = Self]\n    scale(self, k: R) -> Self\nstruct P\n    n: int\n" +
+               "impl Scale for P\n    scale(self, k: P) -> P = P(self.n * k.n)\n" +
+               "doubled[T: Scale](v: T, k: T) -> T = v.scale(k)\nprint(doubled(P(6), P(7)).n)", "42\n")
+
+@test("a parameter with no default may not follow one that has")
+gcx_default_suffix()
+    if gcx_skip() then return
+
+    gcx_refused("struct Suffix[A = int, B]\n    x: A\n    y: B",
+                "'B' has no default and comes after 'A', which has one — a use writes its arguments in " +
+                "order, so nothing could leave out 'A' and still supply 'B'", "1:1")
+
+@test("a default may name only the parameters written before it")
+gcx_default_forward()
+    if gcx_skip() then return
+
+    gcx_refused("struct Fwd[A = B, B = int]\n    x: A\n    y: B",
+                "the default for 'A' names 'B', which is fixed after it — a default may name only the " +
+                "parameters written before it", "1:16")
+
+@test("'Self' in a struct's default has nothing to name")
+gcx_default_self_in_struct()
+    if gcx_skip() then return
+
+    gcx_refused("struct SelfDef[A = Self]\n    x: A",
+                "'Self' is the type implementing a trait, and struct 'SelfDef' is not a trait — so the " +
+                "default for 'A' has nothing to name", "1:20")
+
+@test("a default may not lead back to its own declaration")
+gcx_default_cycle()
+    if gcx_skip() then return
+
+    gcx_refused("struct Cyc[A = Cyc]\n    x: int",
+                "filling a type argument of 'Cyc' from its default leads back to 'Cyc' — a default cannot " +
+                "stand in for a type that is still being worked out", "1:16")
+
+@test("nor through another's")
+gcx_default_cycle_through_another()
+    if gcx_skip() then return
+
+    val main = "struct Aa[X = Bb]\n    x: int\nstruct Bb[Y = Aa]\n    y: int"
+
+    gcx_also(main, "filling a type argument of 'Bb' from its default leads back to 'Bb' — a default " +
+                   "cannot stand in for a type that is still being worked out", "1:15")
+    gcx_also(main, "filling a type argument of 'Aa' from its default leads back to 'Aa' — a default " +
+                   "cannot stand in for a type that is still being worked out", "3:15")
+
+@test("only a trait, a struct and an enum may carry one — the other three lists are SOLVED from what they are given, so there is no gap for a default to fill")
+gcx_default_only_on_type_lists()
+    if gcx_skip() then return
+
+    gcx_refused("f[T = int](x: T) -> T = x",
+                "'T' is a type parameter of the function 'f', whose type parameters are solved from what " +
+                "it is given rather than written where it is used — so '= int' has nothing to stand in for",
+                "1:7")
+    gcx_refused("struct Holder\n    n: int\n\n    with[U = int](self, x: U) -> int = self.n",
+                "'U' is a type parameter of the method 'Holder.with', whose type parameters are solved " +
+                "from what it is given rather than written where it is used — so '= int' has nothing to " +
+                "stand in for", "4:14")
+
+@test("a trait object writes the argument out, because an erased value has forgotten which type 'Self' was")
+gcx_default_self_in_object()
+    if gcx_skip() then return
+
+    gcx_refused(gcx_sink() + "var bad: &Sink = q",
+                "'T' defaults to 'Self', which names the type implementing 'Sink', and an object has " +
+                "forgotten which type it holds — write the argument", "8:11")
+
+@test("while the written-out form forms an object and dispatches")
+gcx_default_written_object()
+    if gcx_skip_run() then return
+
+    gcx_prints(gcx_sink() + "var obj: &Sink[int] = q\nprint(obj.put(7))", "13\n")
+
+// == inference runs in both directions =============================================================
+
+@test("from the arguments, and through a nested construction")
+gcx_infer_from_arguments()
+    if gcx_skip_run() then return
+
+    gcx_prints("struct Box[T]\n    v: T\n\n    get(self) -> T = self.v\nid[T](x: T) -> T = x\n" +
+               "print(id(7), id(Box(id(5))).get())", "7 5\n")
+
+@test("from the expected type, where the arguments cannot reach a parameter")
+gcx_infer_from_expected()
+    if gcx_skip_run() then return
+
+    gcx_prints("empty[T]() -> Option[T] = None\nvar e: Option[real] = empty()\n" +
+               "e match\n    Some(v) -> print(v)\n    None -> print(\"none\")", "none\n")
+
+@test("and a parameter neither direction reaches asks for an annotation, never a silent default")
+gcx_infer_neither_direction()
+    if gcx_skip() then return
+
+    gcx_refused("empty[T]() -> Option[T] = None\nvar stuck = empty()",
+                "cannot infer the type argument 'T' of 'empty' here — annotate the expected type", "2:13")
+
+// A parameter left unsolved because the expected type could not itself be worked out is a
+// consequence of a mistake already reported; saying so twice sends the reader to the wrong line.
+@test("while one left unsolved by a type that is not there says only that the type is not there")
+gcx_unsolved_by_missing_type()
+    if gcx_skip() then return
+
+    val main = "f() -> Result[unit, IoError] = Ok(())"
+
+    gcx_refused(main, "unknown type 'IoError'", "1:21")
+    assert(gcx_report(main).index_of("cannot infer the type argument").is_none(), "a second, wrong answer")
+
+// The same suppression through an argument, which reaches the unsolved parameter by the other route.
+@test("and one left unsolved by an argument that is not a type says the same")
+gcx_unsolved_by_missing_argument_type()
+    if gcx_skip() then return
+
+    val main = "id[T](x: T) -> T = x\n\nval v: IoError = ()\n\nprint(id(v))"
+
+    gcx_refused(main, "unknown type 'IoError'", "3:8")
+    assert(gcx_report(main).index_of("cannot infer the type argument").is_none(), "a second, wrong answer")
+
+@test("a LITERAL is consulted last, so an argument that knows its type settles the parameter and the literals are then read against it")
+gcx_literal_consulted_last()
+    if gcx_skip_run() then return
+
+    gcx_prints("pick[T](a: T, b: T, c: T) -> T = c\nprint(pick(1, 2, 250u8))", "250\n")
+    gcx_refused("pick[T](a: T, b: T, c: T) -> T = c\nprint(pick(300, 2, 250u8))",
+                "the literal 300 does not fit byte", "2:12")
+
+@test("while a call where none of them knows falls to the literal's own default")
+gcx_literal_default()
+    if gcx_skip_run() then return
+
+    // `id(7)` is an `int`, which the wrap at 32 bits is what shows.
+    gcx_prints("id[T](x: T) -> T = x\nprint(id(7) + 2147483647)", "-2147483642\n")
+
+@test("a parameter naming no type parameter is not part of the question")
+gcx_plain_parameter_not_asked()
+    if gcx_skip_run() then return
+
+    gcx_prints("with_n[T](x: T, n: usize) -> T = x\nvar v = 9\nprint(with_n(v, 7))", "9\n")
+
+@test("an associated function on a generic type infers by that same rule")
+gcx_associated_function_infers()
+    if gcx_skip_run() then return
+
+    gcx_prints("struct Box[T]\n    v: T\n\n    of(x: T) -> Box[T] = Box(x)\n\n    get(self) -> T = self.v\n" +
+               "var b = Box.of(41)\nprint(b.get())", "41\n")
+
+@test("a parameter may stand wherever a type may")
+gcx_parameter_as_local_type()
+    if gcx_skip_run() then return
+
+    gcx_prints("local[T](x: T) -> T\n    var here: T = x\n    here\nprint(local(\"s\"), local(9))", "s 9\n")
+
+// == a bound over the open integer family ==========================================================
+
+@test("seeds an accumulator from a bare literal, at every width, with no member promising a zero")
+gcx_integer_seeds_from_literal()
+    if gcx_skip_run() then return
+
+    gcx_prints(gcx_total() + "print(total([1, 2, 3]))", "6\n")
+    gcx_prints(gcx_total() + "print(total([1u8, 2u8, 3u8]))", "6\n")
+
+@test("carries a blanket implementation's method onto every one of them")
+gcx_integer_blanket_method()
+    if gcx_skip_run() then return
+
+    gcx_prints("trait Show\n    tag(self) -> int\n\nimpl[T: Integer] Show for T\n    tag(self) -> int = 7\n\n" +
+               "print(5.tag(), 5u8.tag())", "7 7\n")
+
+@test("supplies an associated type through a subject that is a parameter")
+gcx_integer_blanket_associated_type()
+    if gcx_skip_run() then return
+
+    gcx_prints(gcx_mag() + "print((0 - 9).extent(), 200u8.extent())", "9 200\n")
+
+@test("so a bound over the family alone can name the projection")
+gcx_integer_bound_names_projection()
+    if gcx_skip_run() then return
+
+    gcx_prints(gcx_mag() + "same[T: Integer](x: T) -> T::Extent = x\nprint(same(4u8))", "4\n")
+
+@test("and a routine bounded by the trait compares what it answers with")
+gcx_integer_routine_compares()
+    if gcx_skip_run() then return
+
+    gcx_prints(gcx_mag() + "biggest[T: Mag](xs: []const T) -> T::Extent\n    var best = xs[0].extent()\n\n" +
+               "    for i in 1..<xs.len\n        if best < xs[i].extent() then best = xs[i].extent()\n\n" +
+               "    best\n\nprint(biggest([3, 0 - 40, 7]))", "40\n")
+
+@test("but not a receiverless one, there being no name a call could reach it through")
+gcx_integer_blanket_receiverless()
+    if gcx_skip() then return
+
+    val main = "trait Additive\n    identity() -> Self\n\nimpl[T: Integer] Additive for T\n    identity() -> T = 0\n\n" +
+               "print(int.identity())"
+
+    gcx_refused(main, "'identity' has no receiver, and 'T' is not a name a call could reach it through — " +
+                      "give it a 'self' parameter", "5:5")
+
+@test("and meets a field-shaped bound outright, identities, size and all")
+gcx_integer_meets_field_bound()
+    if gcx_skip_run() then return
+
+    gcx_prints("import sysl.math.Magnitude\n\n" +
+               "field[T: Add + Sub + Mul + Div + Neg + Zero + One + Eq + Display + Magnitude](a: T, b: T) -> T =\n" +
+               "    (a - b) * (a + b) / (T.one() + T.one()) + T.zero()\n\n" +
+               "print(field(7, 3), field(7.0, 3.0))", "20 20\n")
+
+@test("and nothing may join the family, since the compiler settles who is in it")
+gcx_integer_family_closed()
+    if gcx_skip() then return
+
+    gcx_refused("struct Mine\n    v: int\n\nimpl Integer for Mine",
+                "'sysl.Integer' names a family of types the compiler settles, so nothing implements it — a " +
+                "type is one of them or it is not, and 'Mine' is not", "4:1")
