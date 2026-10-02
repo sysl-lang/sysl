@@ -1,0 +1,440 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `T::Min` and `T::Max` on a built-in integer type (`reference/errors.md § What the type's own name
+// offers: :: attributes`): the common widths, the friendly aliases, an odd width, a width no literal
+// could spell, a subtype that narrows nothing, the bounds as constants, the bounds through a type
+// parameter, and a ranged subtype answering both pairs.
+//
+// **Every string quoted here was read out of the reference compiler**, whose `IntegerAttrRunTests`
+// these are.
+
+private var iax_library_cache: Buf[Program] = buf()
+private var iax_library_read: bool = false
+
+private iax_library() -> Buf[Program]
+    if iax_library_read then return iax_library_cache
+
+    iax_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> iax_library_cache = units
+
+    iax_library_cache
+end iax_library
+
+// Every claim here is about a whole program, so all of them want the library and a toolchain.
+private iax_ready() -> bool
+    if iax_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end iax_ready
+
+private iax_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// **What a program PRINTS**, which is the one claim nothing short of building and running it makes.
+private iax_ran(text: string) -> string
+    val root = make_temp_dir("sysl-integer-attr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end iax_ran
+
+// Everything a source has to say for itself, taken through the lowering as the reference's `err` is.
+private iax_err(text: string) -> string
+    val root = make_temp_dir("sysl-integer-attr").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end iax_err
+
+// `2^n` in decimal, by doubling a little-endian list of digits — worked out here rather than by the
+// compiler under test, so the wide cases are checked against an answer that could disagree.
+private iax_pow2(n: int) -> Buf[u8]
+    var digits: Buf[u8] = buf()
+
+    digits.push(1)
+
+    for _ in 0..<n
+        var carry: u8 = 0
+
+        for i in 0..<digits.len
+            val d = digits.at(i) * 2 + carry
+
+            digits.set(i, d % 10)
+            carry = d / 10
+
+        if carry > 0 then digits.push(carry)
+
+    digits
+end iax_pow2
+
+// The digits read most significant first, after `less` is taken off the units digit. A power of two
+// never ends in zero, so taking one off borrows nothing.
+private iax_decimal(digits: Buf[u8], less: u8) -> string
+    var out: Buf[u8] = buf()
+    var i = digits.len
+
+    while i > 0
+        i -= 1
+        out.push(u8('0') + (if i == 0 then digits.at(i) - less else digits.at(i)))
+
+    str_cast(out.view())
+end iax_decimal
+
+// -- the common widths report their bounds ------------------------------------------------------
+
+@test("unsigned starts at zero")
+iax_unsigned_starts_at_zero()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("print(u8::Min, u8::Max)\n"), "0 255\n")
+
+@test("signed is asymmetric, one further down than up")
+iax_signed_is_asymmetric()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("print(i8::Min, i8::Max)\n"), "-128 127\n")
+
+@test("u32 and i32")
+iax_u32_and_i32()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("print(u32::Max)\n"), "4294967295\n")
+    assert_eq(iax_ran("print(i32::Min, i32::Max)\n"), "-2147483648 2147483647\n")
+
+@test("u64 reaches the width a literal still can")
+iax_u64_reaches_the_width_a_literal_still_can()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("print(u64::Max)\n"), "18446744073709551615\n")
+
+// -- the friendly aliases answer as the widths they stand for -----------------------------------
+
+@test("int is i32")
+iax_int_is_i32()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("print(int::Min, int::Max)\n"), "-2147483648 2147483647\n")
+
+@test("byte is u8")
+iax_byte_is_u8()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("print(byte::Min, byte::Max)\n"), "0 255\n")
+
+@test("usize is pointer-width, so only its floor is fixed across targets")
+iax_usize_floor()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("print(usize::Min)\n"), "0\n")
+
+// -- an odd width is not a special case ---------------------------------------------------------
+
+@test("u3 holds seven")
+iax_u3_holds_seven()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("print(u3::Min, u3::Max)\n"), "0 7\n")
+
+@test("i5 is asymmetric at its own width")
+iax_i5_is_asymmetric()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("print(i5::Min, i5::Max)\n"), "-16 15\n")
+
+@test("u1 is the narrowest the family admits")
+iax_u1_is_the_narrowest()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("print(u1::Min, u1::Max)\n"), "0 1\n")
+
+// -- a width no literal could spell -------------------------------------------------------------
+
+@test("u10000's maximum is 2^10000 - 1, to the digit")
+iax_u10000_maximum()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("print(u10000::Max)\n"), iax_decimal(iax_pow2(10000), 1) + "\n")
+
+@test("and its minimum is still zero")
+iax_u10000_minimum()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("print(u10000::Min)\n"), "0\n")
+
+// Not written as `i10000::Max < u10000::Max`: comparing across signedness is refused.
+@test("a signed one of the same width is one bit narrower in magnitude")
+iax_i10000_bounds()
+    if !iax_ready() then return
+
+    val half = iax_pow2(9999)
+
+    assert_eq(iax_ran("print(i10000::Max)\n"), iax_decimal(half, 1) + "\n")
+    assert_eq(iax_ran("print(i10000::Min)\n"), "-" + iax_decimal(half, 0) + "\n")
+end iax_i10000_bounds
+
+// -- a subtype that narrows nothing answers the integer it is -----------------------------------
+
+@test("a derived subtype with no constraint has its base's maximum")
+iax_derived_unconstrained_maximum()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("type Handle = new u16\nwidest() -> u16 = u16(Handle::Max)\nprint(widest())\n"),
+              "65535\n")
+
+@test("and its base's minimum, which is where the signed case shows")
+iax_derived_unconstrained_minimum()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("type Off = new i8\nprint(i8(Off::Min))\n"), "-128\n")
+
+@test("but 'First' still needs a range, because that is a different question")
+iax_first_still_needs_a_range()
+    val said = iax_err("type Handle = new u16\nprint(u16(Handle::First))\n")
+
+    assert(iax_says(said, "'Handle::First' needs a 'within' range"), said)
+
+// -- the bounds are constants, not calls --------------------------------------------------------
+
+@test("a const initializer folds one")
+iax_const_initializer_folds_one()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("const LIMIT: u16 = u16::Max\nprint(LIMIT)\n"), "65535\n")
+
+@test("arithmetic over them folds too")
+iax_arithmetic_folds_too()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("const HALF: u32 = u32::Max / 2\nprint(HALF)\n"), "2147483647\n")
+
+@test("an @assert reads one at compile time")
+iax_assert_reads_one()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("@assert(u8::Max == 255)\nprint(1)\n"), "1\n")
+
+@test("one sizes an array")
+iax_one_sizes_an_array()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("val a: [u3::Max]u8 = [0u8; 7]\nprint(a.len)\n"), "7\n")
+
+// -- through a type parameter -------------------------------------------------------------------
+
+@test("a generic body reads the argument's maximum")
+iax_generic_reads_maximum()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("widest[T]() -> T = T::Max\nval x: u8 = widest()\nprint(x)\n"), "255\n")
+
+@test("and its minimum, which is where the signed case shows")
+iax_generic_reads_minimum()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("least[T]() -> T = T::Min\nval x: i16 = least()\nprint(x)\n"), "-32768\n")
+
+@test("the argument may be written at the call rather than inferred")
+iax_argument_written_at_the_call()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("widest[T]() -> T = T::Max\nprint(widest[u8]())\n"), "255\n")
+
+@test("one body serves every width it is instantiated at")
+iax_one_body_every_width()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("widest[T]() -> T = T::Max\nval a: u8 = widest()\nval b: u16 = widest()\nprint(a, b)\n"),
+              "255 65535\n")
+
+@test("a derived subtype answers in itself")
+iax_derived_subtype_answers_in_itself()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("type Age = new int within 0..150\nwidest[T]() -> T = T::Max\nval a: Age = widest()\n" +
+                      "print(a)\n"), "150\n")
+
+@test("a transparent one answers its own bound when the argument is written")
+iax_transparent_written_argument()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("type Age = int within 0..150\nwidest[T]() -> T = T::Max\nprint(int(widest[Age]()))\n"),
+              "150\n")
+
+@test("and its own again when the parameter is solved from a value")
+iax_transparent_solved_from_a_value()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("type Age = int within 0..150\nwidest[T](x: T) -> T = T::Max\n" +
+                      "val a = Age(3)\nprint(int(widest(a)))\n"), "150\n")
+
+@test("and its own again when solved from the expected type")
+iax_transparent_solved_from_expected()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("type Age = int within 0..150\nwidest[T]() -> T = T::Max\nval a: Age = widest()\n" +
+                      "print(int(a))\n"), "150\n")
+
+@test("a lower bound outside the subtype's range is the case that made the split visible")
+iax_lower_bound_outside_the_range()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran(raw"""
+        type NonNeg = int within 0..2147483647
+        least[T]() -> T = T::Min
+        val a: NonNeg = least()
+        print(int(a))
+        """), "0\n")
+
+@test("and a base other than 'int' answers the same way")
+iax_base_other_than_int()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("type Small = u8 within 0..10\nwidest[T]() -> T = T::Max\nval a: Small = widest()\n" +
+                      "print(u8(a))\n"), "10\n")
+
+@test("a bound written over the base is still satisfied by the subtype")
+iax_bound_over_the_base_satisfied()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran(raw"""
+        type Age = int within 0..150
+        twice[T: Add](x: T) -> T = x + x
+        val a: Age = twice(Age(3))
+        print(int(a))
+        """), "6\n")
+
+@test("and the body's arithmetic is the base's, so a parameter solved from the annotation adds")
+iax_body_arithmetic_is_the_base()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran(raw"""
+        type Age = int within 0..150
+        sum[T: Add](a: T, b: T) -> T = a + b
+        val a: Age = sum(Age(1), Age(2))
+        print(int(a))
+        """), "3\n")
+
+@test("the rest are asked on a written type name, and say so")
+iax_the_rest_on_a_written_name()
+    val said = iax_err("first[T]() -> T = T::First\nval a: u8 = first()\nprint(a)\n")
+
+    assert(iax_says(said, "'T' is a type parameter, and the only attributes one answers are 'T::Min' and " +
+                          "'T::Max' — '::First' is asked on a written type name"), said)
+
+@test("an argument with no bounds is reported where it was supplied")
+iax_argument_with_no_bounds()
+    val said = iax_err("struct P\n    x: int\nwidest[T]() -> T = T::Max\nval a: P = widest()\nprint(1)\n")
+
+    assert(iax_says(said, "'T::Max' needs an integer type, and 'T' is P here — a maximum is a property " +
+                          "of a range of numbers"), said)
+
+@test("and a bool is the same answer, since a bound is a range of numbers")
+iax_a_bool_is_the_same_answer()
+    val said = iax_err("widest[T]() -> T = T::Max\nval a: bool = widest()\nprint(a)\n")
+
+    assert(iax_says(said, "'T::Max' needs an integer type, and 'T' is bool here"), said)
+
+@test("a bound folds in an array length, where it always did")
+iax_bound_folds_in_an_array_length()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran(raw"""
+        cap[T]() -> usize
+            var buf: [T::Max]u8
+            buf.len
+        print(cap[u8]())
+        """), "255\n")
+
+@test("and in an '@assert', which is checked per instantiation")
+iax_bound_in_an_assert()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran(raw"""
+        ok[T]() -> int
+            @assert(T::Max > 0)
+            1
+        print(ok[u8]())
+        """), "1\n")
+
+@test("and in the fill that initializes such an array")
+iax_bound_in_the_fill()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran(raw"""
+        cap[T]() -> usize
+            val buf: [T::Max]u8 = [0; T::Max]
+            buf.len
+        print(cap[u8]())
+        """), "255\n")
+
+// -- a ranged subtype answers both pairs --------------------------------------------------------
+
+@test("Min and Max read the same numbers First and Last do")
+iax_min_max_first_last()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("type Age = int within 0..150\nprint(Age::Min, Age::Max, Age::First, Age::Last)\n"),
+              "0 150 0 150\n")
+
+@test("and an exclusive upper is one below, for both spellings")
+iax_exclusive_upper()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("type Prob = int within 0..<10\nprint(Prob::Max, Prob::Last)\n"), "9 9\n")
+
+// -- they answer in the type they are the bounds of ---------------------------------------------
+
+@test("a maximum assigns to its own width without a cast")
+iax_maximum_assigns_without_a_cast()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("val x: u8 = u8::Max\nprint(x)\n"), "255\n")
+
+@test("and wraps like any other value of it")
+iax_wraps_like_any_other_value()
+    if !iax_ready() then return
+
+    assert_eq(iax_ran("var x: u8 = u8::Max\nx += 1u8\nprint(x)\n"), "0\n")
