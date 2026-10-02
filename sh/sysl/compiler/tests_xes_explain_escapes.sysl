@@ -13,10 +13,14 @@ import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 // promoted to the heap`; a program that does not compile says only its error; and the flag is one
 // every command that compiles a program takes.
 
-// What one command line came to: the status the shell hears and each line the command said. The
-// program is written to a directory of its own, named by its file, and the directory is removed.
-// `None` without the library.
-private xes_run(command: string, text: string, flag: bool) -> Option[(int, Buf[string], string)]
+// **The report goes to standard error and nothing else does** — the reference writes it there, so a
+// build's, an `emit-llvm`'s or a run's standard output is the same with the flag as without it.
+// `main` hands `run_cli_noted` two channels, and these tests hold the two apart.
+//
+// What one command line came to: the status the shell hears, each line the command said on its
+// output channel, and each line of the report on its own. The program is written to a directory of
+// its own, named by its file, and the directory is removed. `None` without the library.
+private xes_run(command: string, text: string, flag: bool) -> Option[(int, Buf[string], Buf[string], string)]
     if xvr_no_library() then return None
 
     val root = make_temp_dir("sysl-xes").unwrap()
@@ -26,6 +30,8 @@ private xes_run(command: string, text: string, flag: bool) -> Option[(int, Buf[s
 
     var lines: Buf[string] = buf()
     val sink = &lines
+    var notes: Buf[string] = buf()
+    val noted = &notes
     val file = s"$root/main.sysl"
     var args: Buf[string] = buf()
 
@@ -34,16 +40,16 @@ private xes_run(command: string, text: string, flag: bool) -> Option[(int, Buf[s
     if flag then args.push("--explain-escapes")
     args.push(file)
 
-    val code = run_cli(args.view(), (line) -> sink.push(line))
+    val code = run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
 
     remove_dir_all(root).unwrap_or(())
-    Some((code, lines, file))
+    Some((code, lines, notes, file))
 end xes_run
 
 private xes_note(file: string, where: string, name: string) -> string =
     s"$file:$where: '$name' is promoted to the heap, because this view of it is returned"
 
-@test("one promoted array is one line, and it is the first thing said")
+@test("one promoted array is one line of the report, and none of the output")
 xes_one_promotion_is_one_line()
     xes_run("emit-llvm", raw"""
         first() -> []u8
@@ -52,10 +58,11 @@ xes_one_promotion_is_one_line()
         print(first().len)
         """, true) match
         None -> ()
-        Some((code, lines, file)) ->
+        Some((code, lines, notes, file)) ->
             assert_eq(code, Fine)
-            assert_eq(lines.at(0), xes_note(file, "3:8", "buf"))
-            assert(lines.at(1).starts_with("target triple"), lines.at(1))
+            assert_eq(notes.len(), 1)
+            assert_eq(notes.at(0), xes_note(file, "3:8", "buf"))
+            assert(lines.at(0).starts_with("target triple"), lines.at(0))
 end xes_one_promotion_is_one_line
 
 @test("two promoted arrays are two lines, in source order")
@@ -70,11 +77,12 @@ xes_two_promotions_are_two_lines()
         print(first().len + second().len)
         """, true) match
         None -> ()
-        Some((code, lines, file)) ->
+        Some((code, lines, notes, file)) ->
             assert_eq(code, Fine)
-            assert_eq(lines.at(0), xes_note(file, "3:8", "buf"))
-            assert_eq(lines.at(1), xes_note(file, "6:9", "nums"))
-            assert(lines.at(2).starts_with("target triple"), lines.at(2))
+            assert_eq(notes.len(), 2)
+            assert_eq(notes.at(0), xes_note(file, "3:8", "buf"))
+            assert_eq(notes.at(1), xes_note(file, "6:9", "nums"))
+            assert(lines.at(0).starts_with("target triple"), lines.at(0))
 end xes_two_promotions_are_two_lines
 
 @test("a program that promotes nothing says so")
@@ -86,10 +94,11 @@ xes_nothing_promoted_says_so()
         print(use())
         """, true) match
         None -> ()
-        Some((code, lines, _)) ->
+        Some((code, lines, notes, _)) ->
             assert_eq(code, Fine)
-            assert_eq(lines.at(0), "no arrays were promoted to the heap")
-            assert(lines.at(1).starts_with("target triple"), lines.at(1))
+            assert_eq(notes.len(), 1)
+            assert_eq(notes.at(0), "no arrays were promoted to the heap")
+            assert(lines.at(0).starts_with("target triple"), lines.at(0))
 end xes_nothing_promoted_says_so
 
 @test("without the flag nothing is explained")
@@ -101,12 +110,13 @@ xes_no_flag_no_notes()
         print(first().len)
         """, false) match
         None -> ()
-        Some((code, lines, _)) ->
+        Some((code, lines, notes, _)) ->
             assert_eq(code, Fine)
+            assert_eq(notes.len(), 0)
             assert(lines.at(0).starts_with("target triple"), lines.at(0))
 end xes_no_flag_no_notes
 
-@test("a build says why before it says where it wrote")
+@test("a build explains on the report's channel and says only where it wrote on its own")
 xes_a_build_explains_before_it_wrote()
     if !clang_available() then return
 
@@ -117,12 +127,54 @@ xes_a_build_explains_before_it_wrote()
         print(first().len)
         """, true) match
         None -> ()
-        Some((code, lines, file)) ->
+        Some((code, lines, notes, file)) ->
             assert_eq(code, Fine)
-            assert_eq(lines.len(), 2)
-            assert_eq(lines.at(0), xes_note(file, "3:8", "buf"))
-            assert(lines.at(1).starts_with("wrote "), lines.at(1))
+            assert_eq(notes.len(), 1)
+            assert_eq(notes.at(0), xes_note(file, "3:8", "buf"))
+            assert_eq(lines.len(), 1)
+            assert(lines.at(0).starts_with("wrote "), lines.at(0))
 end xes_a_build_explains_before_it_wrote
+
+// The output a program prints is its own: a run with the flag says the report beside it and adds
+// nothing to what the program wrote.
+@test("a run's output carries no line of the report")
+xes_a_run_keeps_its_output()
+    if !clang_available() then return
+
+    xes_run("run", raw"""
+        first() -> []u8
+            var buf: [8]u8
+            buf[0..<3]
+        print(first().len)
+        """, true) match
+        None -> ()
+        Some((code, lines, notes, file)) ->
+            assert_eq(code, Fine)
+            assert_eq(notes.len(), 1)
+            assert_eq(notes.at(0), xes_note(file, "3:8", "buf"))
+            for i in 0..<lines.len()
+                assert(!lines.at(i).contains("promoted"), lines.at(i))
+end xes_a_run_keeps_its_output
+
+// One channel, as a caller of `run_cli` has: the report comes first, in the order it was found.
+@test("handed one channel, the report is said ahead of the output")
+xes_one_channel_says_the_report_first()
+    if xvr_no_library() then return
+
+    val root = make_temp_dir("sysl-xes").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", "first() -> []u8\n    var buf: [8]u8\n    buf[0..<3]\nprint(first().len)\n").unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "emit-llvm", "--explain-escapes", s"$root/main.sysl"], (line) -> sink.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine)
+    assert_eq(lines.at(0), xes_note(s"$root/main.sysl", "3:8", "buf"))
+    assert(lines.at(1).starts_with("target triple"), lines.at(1))
+end xes_one_channel_says_the_report_first
 
 @test("a program that does not compile says its error and no note")
 xes_an_error_says_no_notes()
@@ -133,8 +185,9 @@ xes_an_error_says_no_notes()
         print(first().len + undefined_name)
         """, true) match
         None -> ()
-        Some((code, lines, _)) ->
+        Some((code, lines, notes, _)) ->
             assert_eq(code, Failed)
+            assert_eq(notes.len(), 0)
             assert_eq(lines.len(), 1)
             assert(lines.at(0).starts_with("error: undefined name 'undefined_name'"), lines.at(0))
 end xes_an_error_says_no_notes
