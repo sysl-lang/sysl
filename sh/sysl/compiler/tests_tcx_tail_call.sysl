@@ -1,0 +1,581 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, str_builder}
+
+// The reference's `TailCallTests`: a function that calls itself as the last thing it does reuses its
+// own frame (`reference/declarations.md § Tail calls`).
+//
+// The runtime cases are all deep enough that a second frame per call would exhaust the stack, which is
+// the only assertion that tells the jump apart from a call the machine happens to survive: a recursion
+// of ten works either way. The IR cases are the other half -- that the ordinary shapes really do jump,
+// and that the shapes which must *not* jump still emit the call.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.156)** by
+// handing the installed `sysl` the same program; the IR lines are its `emit-llvm`.
+
+private tcx_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private tcx_ir(text: string) -> string = xvr_ir(tcx_main(text))
+
+private tcx_ran(text: string) -> string = xvr_ran(tcx_main(text))
+
+// A refusal carries this message, anchored at this `line:column` of `main.sysl` (the build names the
+// file by its whole path, which is a temporary directory's).
+private tcx_refused(said: string, message: string, at: string)
+    assert(said.contains(s"error: $message\n --> "), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+// The function named, from its `define` line up to the brace that closes it -- the reference's
+// `defineOf`.
+private tcx_define(out: string, name: string) -> string
+    val lines = lines_of(out)
+    var said = str_builder()
+    var inside = false
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if !inside && line.starts_with("define") && line.index_of(s"@$name(").is_some()
+            inside = true
+
+        if inside
+            if line == "}" then return said.finish()
+
+            said.push(line)
+            said.push("\n")
+
+    said.finish()
+end tcx_define
+
+// **That a program STOPS ITSELF**, which is all a trap has to say: the status is not zero. Answers
+// what is wrong, or the empty string.
+private tcx_exits(text: string) -> string
+    val root = make_temp_dir("sysl-tcx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then s"it exited cleanly: ${out.text}" else ""
+end tcx_exits
+
+// Past the size a value is returned in registers, so it is returned through the caller's storage and
+// passed by address -- the two paths a jump has to carry that a register-sized value does not.
+private tcx_big() -> string = raw"""
+    struct Big
+        tag: int
+        data: [40]int
+
+    """
+
+// The reference's refusal for a '@tailrec' function with no self-call the jump can replace.
+private tcx_nowhere(name: string) -> string =
+    s"'$name' is marked '@tailrec' but calls itself nowhere the jump can replace — a tail call is " +
+    "the last thing the function does, so nothing may wait on its result and no 'defer' may be in " +
+    "scope where it stands"
+
+// -- the jump --------------------------------------------------------------------------------------
+
+@test("a self-call in the trailing expression becomes a branch, not a call")
+tcx_trailing_becomes_a_branch()
+    if xvr_no_library() then return
+
+    val out = tcx_define(tcx_ir(raw"""
+        count(n: int, acc: int) -> int =
+            if n == 0 then acc else count(n - 1, acc + n)
+        print(count(5, 0))
+        """), "count")
+
+    assert(out.contains("br label %tailrec1"), out)
+    assert(!out.contains("call i32 @count"), out)
+end tcx_trailing_becomes_a_branch
+
+@test("the arguments land in the parameter slots the body reads")
+tcx_arguments_land_in_the_slots()
+    if xvr_no_library() then return
+
+    val out = tcx_define(tcx_ir(raw"""
+        count(n: int, acc: int) -> int =
+            if n == 0 then acc else count(n - 1, acc + n)
+        print(count(5, 0))
+        """), "count")
+
+    assert(out.contains("store i32 %t6, ptr %n.addr"), out)
+    assert(out.contains("store i32 %t9, ptr %acc.addr"), out)
+end tcx_arguments_land_in_the_slots
+
+@test("the frame is entered once however deep the recursion goes")
+tcx_frame_entered_once()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        count(n: int, acc: int) -> int =
+            if n == 0 then acc else count(n - 1, acc + 1)
+        print(count(1000000, 0))
+        """), "1000000\n")
+end tcx_frame_entered_once
+
+@test("a self-call in a 'return' is a tail call too")
+tcx_return_is_a_tail_call()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        count(n: int, acc: int) -> int
+            if n == 0 then
+                return acc
+            return count(n - 1, acc + 1)
+        print(count(1000000, 0))
+        """), "1000000\n")
+end tcx_return_is_a_tail_call
+
+@test("a self-call in a match arm is a tail call")
+tcx_match_arm_is_a_tail_call()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        count(n: int, acc: int) -> int
+            n match
+                0 -> acc
+                else count(n - 1, acc + 1)
+        print(count(1000000, 0))
+        """), "1000000\n")
+end tcx_match_arm_is_a_tail_call
+
+@test("both arms may jump, and they are independent")
+tcx_both_arms_jump()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        walk(n: int, evens: int) -> int =
+            if n == 0 then evens
+            elif n % 2 == 0 then walk(n - 1, evens + 1)
+            else walk(n - 1, evens)
+        print(walk(1000000, 0))
+        """), "500000\n")
+end tcx_both_arms_jump
+
+// -- the awkward shapes ----------------------------------------------------------------------------
+
+@test("a 'return' from inside a loop is still a tail position")
+tcx_return_inside_a_loop()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        count(n: int, acc: int) -> int
+            loop
+                if n == 0 then
+                    return acc
+                return count(n - 1, acc + 1)
+        print(count(1000000, 0))
+        """), "1000000\n")
+end tcx_return_inside_a_loop
+
+// The walk names the loop forms one by one, so a loop form added later is a tail call it stops
+// finding -- safely, an unrecognized one being compiled as the call it already was, but silently. A
+// post-test loop yields `unit` rather than `never`, so the body needs a trailing expression the
+// `return`s make unreachable.
+@test("a 'return' from inside a post-test loop is a tail position too")
+tcx_return_inside_a_post_test_loop()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        count(n: int, acc: int) -> int
+            do
+                if n == 0 then
+                    return acc
+                return count(n - 1, acc + 1)
+            while true
+
+            0
+        print(count(1000000, 0))
+        """), "1000000\n")
+end tcx_return_inside_a_post_test_loop
+
+// `held` is a fresh string per invocation and the jump leaves the loop scope from inside it, so a
+// release the jump skipped would be a million strings the program never gives back.
+@test("a loop's own bindings are released on the way out of the frame")
+tcx_loop_bindings_released()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        count(n: int, acc: string) -> string
+            loop
+                var held = acc + ""
+                if n == 0 then
+                    return held
+                return count(n - 1, held)
+        print(count(1000000, "x"))
+        """), "x\n")
+end tcx_loop_bindings_released
+
+@test("a function with no parameters jumps with nothing to rebind")
+tcx_nothing_to_rebind()
+    if xvr_no_library() then return
+
+    val out = tcx_define(tcx_ir(raw"""
+        spin(stop: bool) -> int =
+            if stop then 0 else spin(true)
+        print(spin(false))
+        """), "spin")
+
+    assert(out.contains("tailrec"), out)
+end tcx_nothing_to_rebind
+
+@test("a generic's instantiation jumps to its own entry")
+tcx_generic_instantiation_jumps()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        count[T: sysl.Sub + sysl.Add + sysl.Eq](n: T, acc: T, zero: T, one: T) -> T =
+            if n == zero then acc else count(n - one, acc + one, zero, one)
+        var total: i64 = count(1000000, 0, 0, 1)
+        print(total)
+        """), "1000000\n")
+end tcx_generic_instantiation_jumps
+
+@test("a recursion that ends by trapping still traps")
+tcx_trapping_recursion_traps()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_exits(raw"""
+        down(n: int) -> int
+            require n >= 0
+            down(n - 1)
+        print(down(3))
+        """), "")
+end tcx_trapping_recursion_traps
+
+// -- what is not a tail call -----------------------------------------------------------------------
+
+@test("a call whose result is used is still a call")
+tcx_used_result_is_a_call()
+    if xvr_no_library() then return
+
+    val out = tcx_define(tcx_ir(raw"""
+        sum(n: int) -> int =
+            if n == 0 then 0 else n + sum(n - 1)
+        print(sum(5))
+        """), "sum")
+
+    assert(out.contains("call i32 @sum"), out)
+    assert(!out.contains("tailrec"), out)
+end tcx_used_result_is_a_call
+
+@test("a 'defer' in scope holds the frame, so the call stays a call")
+tcx_defer_holds_the_frame()
+    if xvr_no_library() then return
+
+    val out = tcx_define(tcx_ir(raw"""
+        count(n: int, acc: int) -> int
+            defer print("out")
+            if n == 0 then acc else count(n - 1, acc + 1)
+        print(count(2, 0))
+        """), "count")
+
+    assert(out.contains("call i32 @count"), out)
+    assert(!out.contains("tailrec"), out)
+end tcx_defer_holds_the_frame
+
+@test("a deferred statement still runs once per call")
+tcx_defer_runs_once_per_call()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        count(n: int, acc: int) -> int
+            defer print("out")
+            if n == 0 then acc else count(n - 1, acc + 1)
+        print(count(2, 0))
+        """), "out\nout\nout\n2\n")
+end tcx_defer_runs_once_per_call
+
+@test("an 'ensures' is checked when a call returns, so the call is not replaced")
+tcx_ensures_keeps_the_call()
+    if xvr_no_library() then return
+
+    val out = tcx_define(tcx_ir(raw"""
+        count(n: int, acc: int) -> int
+            ensure result >= acc
+            if n == 0 then acc else count(n - 1, acc + 1)
+        print(count(3, 0))
+        """), "count")
+
+    assert(out.contains("call i32 @count"), out)
+    assert(!out.contains("tailrec"), out)
+end tcx_ensures_keeps_the_call
+
+// `reference/statements.md § return` says the jump is self-recursion only: a large argument crosses
+// as the address of the caller's storage, and a frame being replaced cannot be the frame an argument
+// still points into. The assertion is on the IR rather than the depth, since at `-O1` LLVM's
+// sibling-call pass turns this pair into jumps on its own -- a property of clang, not of sysl.
+@test("a mutual call is a tail call in the same sense and is still emitted as a call")
+tcx_mutual_call_stays_a_call()
+    if xvr_no_library() then return
+
+    val out = tcx_define(tcx_ir(raw"""
+        even(n: int) -> bool = if n == 0 then true else odd(n - 1)
+        odd(n: int) -> bool = if n == 0 then false else even(n - 1)
+        print(even(4))
+        """), "even")
+
+    assert(out.contains("call zeroext i1 @odd"), out)
+    assert(!out.contains("tailrec"), out)
+end tcx_mutual_call_stays_a_call
+
+// -- the invocation, not the frame -----------------------------------------------------------------
+
+// 5, 3, 1, -1 -- the fourth invocation is the one that breaks the requirement, and it is an invocation
+// the jump made. A loop that entered past the check would run away instead.
+@test("a precondition is checked again on every jump")
+tcx_precondition_checked_on_every_jump()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_exits(raw"""
+        down(n: int) -> int
+            require n >= 0
+            if n == 0 then 0 else down(n - 2)
+        print(down(5))
+        """), "")
+end tcx_precondition_checked_on_every_jump
+
+@test("a precondition that holds at every depth lets the recursion finish")
+tcx_precondition_holding_finishes()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        down(n: int) -> int
+            require n >= 0
+            if n == 0 then 0 else down(n - 1)
+        print(down(1000000))
+        """), "0\n")
+end tcx_precondition_holding_finishes
+
+// -- ownership across the jump ---------------------------------------------------------------------
+
+@test("a counted argument survives the frame letting go of the old one")
+tcx_counted_argument_survives()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        join(n: int, acc: string) -> string =
+            if n == 0 then acc else join(n - 1, acc + "x")
+        print(join(3, ""))
+        """), "xxx\n")
+end tcx_counted_argument_survives
+
+// Each jump swaps the two, so the second argument is read out of the slot the first is about to land
+// in. Both are counted and each is the only holder of its string, so an order that released before
+// retaining would free one of them here rather than at the end.
+@test("an argument reading a parameter the jump overwrites sees the value it was called with")
+tcx_argument_reads_the_old_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        flip(a: string, b: string, n: int) -> string =
+            if n == 0 then a + b else flip(b, a, n - 1)
+        print(flip("A", "B", 3))
+        """), "BA\n")
+end tcx_argument_reads_the_old_parameter
+
+@test("a counted accumulator does not leak over a deep recursion")
+tcx_counted_accumulator_does_not_leak()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        last(n: int, acc: string) -> string =
+            if n == 0 then acc else last(n - 1, "y")
+        print(last(1000000, "x"))
+        """), "y\n")
+end tcx_counted_accumulator_does_not_leak
+
+// -- a large value ---------------------------------------------------------------------------------
+
+@test("a result returned through memory jumps without a second out-pointer")
+tcx_large_result_jumps()
+    if xvr_no_library() then return
+
+    val out = tcx_define(tcx_ir(tcx_big() + raw"""
+        grow(n: int, acc: Big) -> Big =
+            if n == 0 then acc else grow(n - 1, Big(acc.tag + 1, acc.data))
+        var b = grow(3, Big(0, [0; 40]))
+        print(b.tag)
+        """), "grow")
+
+    assert(out.contains("tailrec"), out)
+    assert(!out.contains("call void @grow"), out)
+end tcx_large_result_jumps
+
+@test("a large parameter is carried across the jump")
+tcx_large_parameter_carried()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(tcx_big() + raw"""
+        grow(n: int, acc: Big) -> Big =
+            if n == 0 then acc else grow(n - 1, Big(acc.tag + 1, acc.data))
+        var b = grow(1000000, Big(0, [0; 40]))
+        print(b.tag)
+        """), "1000000\n")
+end tcx_large_parameter_carried
+
+// -- @tailrec --------------------------------------------------------------------------------------
+
+@test("a function whose self-call is a tail call is accepted")
+tcx_tailrec_accepted()
+    if xvr_no_library() then return
+
+    assert_eq(tcx_ran(raw"""
+        @tailrec
+        count(n: int, acc: int) -> int =
+            if n == 0 then acc else count(n - 1, acc + 1)
+        print(count(1000000, 0))
+        """), "1000000\n")
+end tcx_tailrec_accepted
+
+@test("it does not change what is emitted — the jump applies either way")
+tcx_tailrec_changes_nothing_emitted()
+    if xvr_no_library() then return
+
+    val marked = tcx_define(tcx_ir(raw"""
+        @tailrec
+        count(n: int, acc: int) -> int =
+            if n == 0 then acc else count(n - 1, acc + 1)
+        print(count(5, 0))
+        """), "count")
+
+    val plain = tcx_define(tcx_ir(raw"""
+        count(n: int, acc: int) -> int =
+            if n == 0 then acc else count(n - 1, acc + 1)
+        print(count(5, 0))
+        """), "count")
+
+    assert(marked.contains("br label %tailrec1"), marked)
+    assert_eq(marked, plain)
+end tcx_tailrec_changes_nothing_emitted
+
+@test("a recursion the jump cannot replace is refused")
+tcx_tailrec_unreplaceable_refused()
+    if xvr_no_library() then return
+
+    tcx_refused(tcx_ran(raw"""
+        @tailrec
+        sum(n: int) -> int =
+            if n == 0 then 0 else n + sum(n - 1)
+        print(sum(5))
+        """), tcx_nowhere("sum"), "1:1")
+end tcx_tailrec_unreplaceable_refused
+
+@test("a function that does not recurse at all is refused")
+tcx_tailrec_no_recursion_refused()
+    if xvr_no_library() then return
+
+    tcx_refused(tcx_ran(raw"""
+        @tailrec
+        double(n: int) -> int = n * 2
+        print(double(5))
+        """), tcx_nowhere("double"), "1:1")
+end tcx_tailrec_no_recursion_refused
+
+@test("an 'ensures' is named as the reason rather than reported as an absence")
+tcx_tailrec_ensures_named()
+    if xvr_no_library() then return
+
+    tcx_refused(tcx_ran(raw"""
+        @tailrec
+        count(n: int, acc: int) -> int
+            ensure result >= acc
+            if n == 0 then acc else count(n - 1, acc + 1)
+        print(count(3, 0))
+        """), "'count' is marked '@tailrec' but it has an 'ensures', which is checked when a call " +
+              "returns — a tail call never returns, so the postcondition of every frame but the " +
+              "last would go unchecked", "1:1")
+end tcx_tailrec_ensures_named
+
+@test("a 'defer' in scope is refused, since it is what ends the tail position")
+tcx_tailrec_defer_refused()
+    if xvr_no_library() then return
+
+    tcx_refused(tcx_ran(raw"""
+        @tailrec
+        count(n: int, acc: int) -> int
+            defer print("out")
+            if n == 0 then acc else count(n - 1, acc + 1)
+        print(count(2, 0))
+        """), tcx_nowhere("count"), "1:1")
+end tcx_tailrec_defer_refused
+
+// A `@test` function is left out of an ordinary build, and the check still runs on it: the whole tree
+// is read before anything is dropped, so a `@tailrec` that has stopped holding is reported in the
+// build that would never have called it.
+@test("it is checked on a function the build goes on to strip")
+tcx_tailrec_checked_on_a_stripped_function()
+    if xvr_no_library() then return
+
+    tcx_refused(tcx_ran(raw"""
+        @test
+        @tailrec
+        counts_down() -> unit =
+            print("ran")
+        print("main")
+        """), tcx_nowhere("counts_down"), "1:1")
+end tcx_tailrec_checked_on_a_stripped_function
+
+// -- the attribute grammar -------------------------------------------------------------------------
+
+// `@serializable` names a facility sysl has no notion of at all; what this is about is that the word
+// written is named back.
+@test("an attribute sysl does not know is named in the refusal")
+tcx_unknown_attribute_named()
+    if xvr_no_library() then return
+
+    val said = tcx_ran(raw"""
+        @serializable
+        double(n: int) -> int = n * 2
+        print(double(5))
+        """)
+
+    assert(said.contains("error: 'serializable' is not an annotation a declaration takes — "), said)
+end tcx_unknown_attribute_named
+
+@test("the same attribute twice is refused")
+tcx_attribute_twice_refused()
+    if xvr_no_library() then return
+
+    tcx_refused(tcx_ran(raw"""
+        @tailrec
+        @tailrec
+        count(n: int, acc: int) -> int =
+            if n == 0 then acc else count(n - 1, acc + 1)
+        print(count(3, 0))
+        """), "'@tailrec' is written twice above one declaration, and it says nothing the once " +
+              "does not", "3:1")
+end tcx_attribute_twice_refused
+
+@test("an attribute above something that is not a function is refused")
+tcx_attribute_on_a_struct_refused()
+    if xvr_no_library() then return
+
+    tcx_refused(tcx_ran(raw"""
+        @tailrec
+        struct Point
+            x: int
+        print(1)
+        """), "an annotation marks a function, and only a function — neither what 'sysl test' " +
+              "calls nor what recurses is anything a declaration of another kind supplies. " +
+              "'@packed', '@align(n)' and '@export(\"...\")' are the three that mark a struct " +
+              "instead", "2:1")
+end tcx_attribute_on_a_struct_refused
