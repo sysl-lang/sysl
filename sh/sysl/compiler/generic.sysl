@@ -109,7 +109,20 @@ last_colons(name: string) -> Option[usize]
 end last_colons
 
 // A named type at fresh arguments, through the instantiator that keeps one instantiation per key.
+// It is made real at no written place, so its bounds are not asked: they were held where the type
+// it substitutes through was written.
 reinstantiate(a: &Analysis, key: string, targs: Buf[Type]) -> Type
+    val decl = a.tables.types.get(key)
+
+    if decl.is_none() then return Unknown
+
+    reinstantiate_at(a, decl.unwrap().scope, span_zero(), key, targs)
+end reinstantiate
+
+// The same, for an application a program wrote at `span` without spelling the type -- a construction
+// `SortedPair(P(1), P(2))`, a variant `A(P(1))`, a selection `W[P].N` -- whose bounds are asked there,
+// in the file being read (`site`), once per place, as a written type's are.
+reinstantiate_at(a: &Analysis, site: Scope, span: Span, key: string, targs: Buf[Type]) -> Type
     val decl = a.tables.types.get(key)
 
     if decl.is_none() then return Unknown
@@ -117,10 +130,10 @@ reinstantiate(a: &Analysis, key: string, targs: Buf[Type]) -> Type
     val d = decl.unwrap()
 
     d.kind match
-        StructOf(sd) -> instantiate_struct(a, d.scope, span_zero(), key, key, sd, d.scope, targs)
-        EnumOf(ed) -> instantiate_enum(a, d.scope, span_zero(), key, key, ed, d.scope, targs)
+        StructOf(sd) -> instantiate_struct(a, site, span, key, key, sd, d.scope, targs)
+        EnumOf(ed) -> instantiate_enum(a, site, span, key, key, ed, d.scope, targs)
         _ -> Unknown
-end reinstantiate
+end reinstantiate_at
 
 // A span standing for nowhere in particular, which is what a walk over already-resolved types has
 // when it has to name a place at all.
@@ -134,8 +147,15 @@ span_zero() -> Span = Span(0, 0)
 // **Deliberately lenient**: a structural mismatch simply leaves the parameter unbound, and the
 // argument is type-checked properly against the instantiated signature afterwards, where the message
 // can name both types.
+//
+// **The actual type is matched nameless**, so what a parameter binds is never a second name for a
+// type: `Size` measured as `size_t` binds a `T` to the `u64` it is, and `same(h, n)` over an exported
+// alias `H` and a `u64` is one instantiation, not two.
 unify(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, tparams: Buf[string],
-      sub: *Buf[Binding])
+      sub: *Buf[Binding]) = unify_nameless(a, scope, want, nameless(actual), tparams, sub)
+
+private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, tparams: Buf[string],
+                       sub: *Buf[Binding])
     *want.kind match
         PtrType(inner) -> actual match
             Ptr(t) -> unify(a, scope, inner, *t, tparams, sub)
@@ -281,7 +301,7 @@ unify(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, tparams: Buf[stri
                 // The reference is the declaration's, written in the declaration's terms, so the
                 // name it uses is matched against the resolved type by the key it names here.
                 unify_named(a, scope, n, arg_refs, actual, tparams, sub)
-end unify
+end unify_nameless
 
 private unify_named(a: &Analysis, scope: Scope, n: string, arg_refs: Buf[TypeRef], actual: Type,
                     tparams: Buf[string], sub: *Buf[Binding])
@@ -441,7 +461,11 @@ end mentions_unknown_any
 // `const_self` is the slice shape's second instantiation: the same block, made real at the read-only
 // view because that is what the receiver was. It is a different name because it is a different
 // **body** -- the machine code is identical and only one of the two had its writes checked.
-instantiate_func(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type], const_self: bool) -> string
+instantiate_func(a: &Analysis, home: Scope, f: FuncDecl, solved: Buf[Type], const_self: bool) -> string
+    // Nameless for `instantiate_struct`'s reason: an instantiation at a `c type` is the
+    // instantiation at what it names, one body with one signature -- the mangled name already says
+    // so, and the signature filed under it has to agree.
+    val targs = nameless_all(solved)
     val plain = if const_self then slice_const_owner(f.name) else f.name
 
     // **An instantiation is filed under the declaration's own key, module and all.** A generic

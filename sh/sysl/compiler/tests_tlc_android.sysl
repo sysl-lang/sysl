@@ -1,0 +1,209 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{Search, to_lower}
+
+// Which compiler a build for Android uses, and what it says when there is none.
+//
+// **Android is the first target where having the back end is not having the toolchain.** Every other
+// row is served by a clang the machine already has; Android needs Bionic's headers, which live in the
+// NDK and nowhere else, so a search by back end picks the machine's own clang and the build then dies
+// on `dirent.h` -- which reads as a broken standard library rather than as the wrong compiler.
+//
+// Everything here asks `android_clang_in` rather than the environment, over an NDK's directory layout
+// made in a temporary directory, so what it decides is asserted on a machine with no NDK on it.
+
+// An NDK's layout, as much of it as the search walks, and the clang at the end of it. The host
+// directory is deliberately not named for the host running this test.
+private tlc_ndk(root: string, host: string) -> string
+    val bin = s"$root/toolchains/llvm/prebuilt/$host/bin"
+
+    make_dir_all(bin).unwrap()
+    write_text(s"$bin/clang", "").unwrap()
+    s"$bin/clang"
+end tlc_ndk
+
+private tlc_refusal(ndk: Option[string], sdk: Option[string]) -> string =
+    android_clang_in(ndk, sdk) match
+        Err(why) -> why
+        Ok(cc) -> s"found a clang: $cc"
+
+// -- with nothing in the environment ----------------------------------------------------------------
+
+// **`ANDROID_HOME`, not `ANDROID_SDK_ROOT`**: the second is deprecated, so recommending it would be
+// advice that ages into a second problem. Both are still read; only the sentence is opinionated.
+@test("with nothing in the environment it refuses, and names the variable that is not deprecated")
+tlc_nothing_set_names_android_home()
+    val why = tlc_refusal(None, None)
+
+    assert(why.contains("ANDROID_HOME"), why)
+    assert(why.contains("ANDROID_NDK_ROOT"), why)
+    assert(!why.contains("ANDROID_SDK_ROOT"), why)
+end tlc_nothing_set_names_android_home
+
+// It has to displace the `dirent.h` diagnostic in the reader's head, which means saying that the
+// *compiler* is what is missing rather than the header.
+@test("and says why the machine's own clang is not a substitute")
+tlc_nothing_set_says_why()
+    val why = tlc_refusal(None, None)
+
+    assert(to_lower(why).contains("ndk"), why)
+    assert(why.contains("back end"), why)
+end tlc_nothing_set_says_why
+
+// -- given an SDK root ------------------------------------------------------------------------------
+
+@test("given an SDK root it finds the NDK under it")
+tlc_an_sdk_root_finds_the_ndk()
+    val sdk = make_temp_dir("sysl-sdk-").unwrap()
+    val cc = tlc_ndk(s"$sdk/ndk/27.0.12077973", "darwin-x86_64")
+    val found = android_clang_in(None, Some(sdk))
+
+    remove_dir_all(sdk).unwrap_or(())
+    assert_eq(found.unwrap(), cc)
+end tlc_an_sdk_root_finds_the_ndk
+
+// **Sorted as numbers, and this pair is the reason.** As text `9.0.111` sorts after `30.0.222`, so a
+// plain sort picks an NDK three major versions out of date -- silently.
+@test("it takes the newest of several, compared as numbers rather than as text")
+tlc_the_newest_ndk_by_number()
+    val sdk = make_temp_dir("sysl-sdk-").unwrap()
+
+    tlc_ndk(s"$sdk/ndk/9.0.111", "darwin-x86_64")
+
+    val newest = tlc_ndk(s"$sdk/ndk/30.0.222", "darwin-x86_64")
+    val found = android_clang_in(None, Some(sdk))
+
+    remove_dir_all(sdk).unwrap_or(())
+    assert_eq(found.unwrap(), newest)
+end tlc_the_newest_ndk_by_number
+
+// **It names the directory and not the variable, because two spellings reach here and this cannot
+// tell which was set.**
+@test("it refuses an SDK with no NDK downloaded, naming the directory rather than a variable")
+tlc_an_sdk_with_no_ndk()
+    val sdk = make_temp_dir("sysl-sdk-").unwrap()
+    val why = tlc_refusal(None, Some(sdk))
+
+    remove_dir_all(sdk).unwrap_or(())
+
+    assert(why.contains(sdk), why)
+    assert(why.contains("ndk"), why)
+    assert(!why.contains("ANDROID_HOME"), why)
+    assert(!why.contains("ANDROID_SDK_ROOT"), why)
+end tlc_an_sdk_with_no_ndk
+
+@test("it refuses an 'ndk' directory that is there and empty")
+tlc_an_empty_ndk_directory()
+    val sdk = make_temp_dir("sysl-sdk-").unwrap()
+
+    make_dir_all(s"$sdk/ndk").unwrap()
+
+    val found = android_clang_in(None, Some(sdk))
+
+    remove_dir_all(sdk).unwrap_or(())
+    assert(found.is_err(), "an empty 'ndk' directory produced a clang")
+end tlc_an_empty_ndk_directory
+
+// -- given an NDK directly --------------------------------------------------------------------------
+
+@test("given an NDK directly it uses it")
+tlc_a_named_ndk_is_used()
+    val root = make_temp_dir("sysl-ndk-").unwrap()
+    val cc = tlc_ndk(root, "darwin-x86_64")
+    val found = android_clang_in(Some(root), None)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(found.unwrap(), cc)
+end tlc_a_named_ndk_is_used
+
+// A standalone NDK is a real installation shape, and somebody who named one is owed it rather than
+// whatever happens to sit under an SDK the environment also mentions.
+@test("and it wins over the SDK root, which is the coarser answer")
+tlc_a_named_ndk_wins()
+    val sdk = make_temp_dir("sysl-sdk-").unwrap()
+    val alone = make_temp_dir("sysl-ndk-").unwrap()
+
+    tlc_ndk(s"$sdk/ndk/30.0.222", "darwin-x86_64")
+
+    val named = tlc_ndk(alone, "darwin-x86_64")
+    val found = android_clang_in(Some(alone), Some(sdk))
+
+    remove_dir_all(sdk).unwrap_or(())
+    remove_dir_all(alone).unwrap_or(())
+    assert_eq(found.unwrap(), named)
+end tlc_a_named_ndk_wins
+
+@test("it refuses a directory that is not an NDK")
+tlc_not_an_ndk()
+    val root = make_temp_dir("sysl-notndk-").unwrap()
+    val why = tlc_refusal(Some(root), None)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(why.contains("toolchains/llvm/prebuilt"), why)
+end tlc_not_an_ndk
+
+@test("it refuses an NDK whose toolchain directory holds no clang")
+tlc_an_ndk_with_no_clang()
+    val root = make_temp_dir("sysl-ndk-").unwrap()
+
+    make_dir_all(s"$root/toolchains/llvm/prebuilt/darwin-x86_64/bin").unwrap()
+
+    val found = android_clang_in(Some(root), None)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(found.is_err(), "an NDK holding no clang produced one")
+end tlc_an_ndk_with_no_clang
+
+// **The host directory is listed, never spelled from the host's own architecture.** The NDK on an Apple
+// Silicon Mac is still `darwin-x86_64`, so the name here is one that matches no host at all.
+@test("and it reads the host directory's name off the disk rather than composing it")
+tlc_the_host_directory_is_listed()
+    val root = make_temp_dir("sysl-ndk-").unwrap()
+    val cc = tlc_ndk(root, "some-host-nobody-runs")
+    val found = android_clang_in(Some(root), None)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(found.unwrap(), cc)
+end tlc_the_host_directory_is_listed
+
+// -- the two searches -------------------------------------------------------------------------------
+
+// The targets whose toolchain is a *download* rather than a back end: Bionic's headers are the NDK's
+// and wasi-libc's are wasi-sdk's.
+private tlc_downloaded(t: Target) -> bool = t.os == Android || t.os == Wasi
+
+private tlc_answer(r: Result[string, string]) -> string = r match
+    Ok(cc) -> s"ok $cc"
+    Err(why) -> s"err $why"
+
+// The split pinned from both sides: `find_backend_clang` answers *can this machine lower for that
+// one*, `find_clang` *can it build a program for it*, and they part company on those two alone.
+@test("the two searches agree for every target whose toolchain is not a download")
+tlc_the_searches_agree()
+    val all = all_targets()
+
+    for i in 0..<all.len()
+        val t = all.at(i)
+
+        if t.supported() && t.builds_with_clang() && !tlc_downloaded(t)
+            assert_eq(s"${t.name}: ${tlc_answer(find_clang(t, None))}",
+                      s"${t.name}: ${tlc_answer(find_backend_clang(t))}")
+end tlc_the_searches_agree
+
+// Which is a claim about those two alone, and would be vacuous if the registry lost either row.
+@test("and both of those are targets, so the case above is excluding something")
+tlc_both_downloads_are_targets()
+    val all = all_targets()
+    var android = false
+    var wasi = false
+
+    for i in 0..<all.len()
+        if all.at(i).os == Android then android = true
+        if all.at(i).os == Wasi then wasi = true
+
+    assert(android, "no Android row in the registry")
+    assert(wasi, "no WASI row in the registry")
+end tlc_both_downloads_are_targets

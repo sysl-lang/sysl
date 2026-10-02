@@ -1,0 +1,497 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// The reference's `ByNameTests` and `BecomeTests`: a parameter passed by name (`x: -> T`), and
+// `become f(…)`, a call that replaces this frame rather than adding to it.
+//
+// A by-name parameter is about *when the argument runs*: not where it is written, once per use in
+// the body, and never where the body does not use it. `become` is about a guarantee rather than an
+// optimization, so its chains run at `-O0`, where nothing is eliminated by luck, and every rule it
+// carries is a refusal at the source.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.153)** by
+// handing the installed `sysl` the same program; the IR line is its `emit-llvm`.
+
+private bnb_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private bnb_ir(text: string) -> string = xvr_ir(bnb_main(text))
+
+private bnb_ran(text: string) -> string = xvr_ran(bnb_main(text))
+
+// What a program prints when it is built unoptimized -- the level at which a chain of calls that
+// were not really replaced overflows the stack.
+private bnb_ran_unoptimized(text: string) -> string
+    val root = make_temp_dir("sysl-bnb").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, "0", Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end bnb_ran_unoptimized
+
+// A refusal carries this message, anchored at this `line:column` of `main.sysl`.
+private bnb_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> main.sysl:$at\n"), said)
+
+// The pair of functions every chain here runs through.
+private bnb_mutual() -> string = raw"""
+    even(n: int) -> bool
+        if n == 0 then return true
+
+        become odd(n - 1)
+
+    odd(n: int) -> bool
+        if n == 0 then return false
+
+        become even(n - 1)
+
+    """
+
+// -- by name: when the argument runs ---------------------------------------------------------------
+
+@test("the argument is evaluated in the callee, not at the call")
+bnb_evaluated_in_the_callee()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        noisy() -> int
+            print(1)
+            7
+
+        take(x: -> int) -> int
+            print(2)
+            x
+
+        print(take(noisy()))
+        """), "2\n1\n7\n")
+end bnb_evaluated_in_the_callee
+
+// The whole of what separates this from a `val`: two uses are two evaluations.
+@test("it is evaluated once per use")
+bnb_evaluated_once_per_use()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        static var calls: int = 0
+
+        tick() -> int
+            calls += 1
+            calls
+
+        twice(x: -> int) -> int = x + x
+
+        print(twice(tick()))
+        print(calls)
+        """), "3\n2\n")
+end bnb_evaluated_once_per_use
+
+@test("a body that never uses it never evaluates it")
+bnb_never_used_never_evaluated()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        boom() -> int
+            print(99)
+            1
+
+        ignore(x: -> int) -> int = 5
+
+        print(ignore(boom()))
+        """), "5\n")
+end bnb_never_used_never_evaluated
+
+// The case the feature is usually reached for: the expensive argument of a call that may not want it.
+@test("a guard that decides whether the argument runs at all")
+bnb_a_guard_decides()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        static var built: int = 0
+
+        message() -> int
+            built += 1
+            42
+
+        log(on: bool, m: -> int)
+            if on then print(m)
+
+        log(false, message())
+        log(true, message())
+        print(built)
+        """), "42\n1\n")
+end bnb_a_guard_decides
+
+@test("an ordinary expression, not just a call")
+bnb_an_ordinary_expression()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        twice(x: -> int) -> int = x + x
+
+        print(twice(3 * 7))
+        """), "42\n")
+end bnb_an_ordinary_expression
+
+@test("several by-name parameters, each independent")
+bnb_several_independent()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        pick(c: bool, a: -> int, b: -> int) -> int
+            if c then a else b
+
+        print(pick(true, 1, 2))
+        print(pick(false, 1, 2))
+        """), "1\n2\n")
+end bnb_several_independent
+
+@test("a by-name parameter beside ordinary ones")
+bnb_beside_ordinary_ones()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        rep(n: int, x: -> int) -> int
+            var t = 0
+            for i in 0..<n
+                t += x
+            t
+
+        print(rep(3, 5))
+        """), "15\n")
+end bnb_beside_ordinary_ones
+
+@test("a by-name parameter of a type other than int")
+bnb_of_a_type_other_than_int()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        greet(s: -> string)
+            print(s)
+            print(s)
+
+        greet("hi")
+        """), "hi\nhi\n")
+end bnb_of_a_type_other_than_int
+
+// The read is keyed by the uniqued name, so a local declared over the parameter is a different name
+// and needs no rule of its own. Without that, this would evaluate the thunk.
+@test("a local shadowing it is an ordinary local")
+bnb_a_local_shadowing_it()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        static var calls: int = 0
+
+        tick() -> int
+            calls += 1
+            calls
+
+        f(x: -> int) -> int
+            var x = 100
+            x + x
+
+        print(f(tick()))
+        print(calls)
+        """), "200\n0\n")
+end bnb_a_local_shadowing_it
+
+@test("it reaches a name the caller had in scope")
+bnb_reaches_the_callers_name()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        twice(x: -> int) -> int = x + x
+
+        var n = 21
+        print(twice(n))
+        """), "42\n")
+end bnb_reaches_the_callers_name
+
+// `() -> T` is the same type; what differs is that the caller writes the callable.
+@test("'() -> T' still asks the caller for a callable")
+bnb_unit_arrow_asks_for_a_callable()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        take(f: () -> int) -> int = f() + f()
+
+        print(take(() -> 21))
+        """), "42\n")
+end bnb_unit_arrow_asks_for_a_callable
+
+@test("a by-name body names it without calling it")
+bnb_named_without_calling()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        take(x: -> int) -> int = x + x
+
+        print(take(21))
+        """), "42\n")
+end bnb_named_without_calling
+
+@test("a struct field written by name, which is storage and not a call")
+bnb_a_struct_field_by_name()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ir(raw"""
+        struct Holder
+            x: -> int
+        end Holder
+
+        print(1)
+        """), "identifier expected")
+end bnb_a_struct_field_by_name
+
+// -- become: a chain of calls between functions is a loop rather than a stack ------------------------
+
+@test("ten million of them, unoptimized")
+bnb_ten_million_unoptimized()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran_unoptimized(bnb_mutual() + "print(even(10000000))\n"), "true\n")
+end bnb_ten_million_unoptimized
+
+@test("and the answer is the one the recursion computes")
+bnb_the_answer_the_recursion_computes()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran_unoptimized(bnb_mutual() + "print(even(4), odd(4), even(7), odd(7))\n"),
+              "true false false true\n")
+end bnb_the_answer_the_recursion_computes
+
+@test("a function may 'become' itself, which is the self-call made explicit")
+bnb_become_itself()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran_unoptimized(raw"""
+        count(n: long, acc: long) -> long
+            if n == 0 then return acc
+
+            become count(n - 1, acc + n)
+
+        print(count(1000000, 0))
+        """), "500000500000\n")
+end bnb_become_itself
+
+@test("the IR says 'musttail', which is what LLVM verifies")
+bnb_the_ir_says_musttail()
+    if xvr_no_library() then return
+
+    val ir = bnb_ir(bnb_mutual() + "print(even(2))\n")
+
+    assert(ir.contains("  %t5 = musttail call zeroext i1 @odd(i32 %t4)\n"), ir)
+    assert(ir.contains("  %t5 = musttail call zeroext i1 @even(i32 %t4)\n"), ir)
+end bnb_the_ir_says_musttail
+
+// Threaded dispatch is the forcing case: the next callee is chosen at run time out of a table of
+// function addresses.
+@test("the callee may be chosen at run time, through a function address")
+bnb_through_a_function_address()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran_unoptimized(raw"""
+        step(vm: *int) -> int
+            vm[0] += 1
+
+            if vm[0] >= 5 then return vm[0]
+
+            var table: [2]*extern(*int) -> int = [&step, &step]
+
+            become table[vm[0] % 2](vm)
+
+        var n = 0
+        print(step(&n))
+        """), "5\n")
+end bnb_through_a_function_address
+
+// -- become: what it refuses, and each refusal says which rule it is ---------------------------------
+
+@test("a callee of a different shape")
+bnb_a_callee_of_a_different_shape()
+    if xvr_no_library() then return
+
+    bnb_refused(bnb_ir(raw"""
+        f(n: int) -> int
+            become g(n, 1)
+
+        g(a: int, b: int) -> int = a + b
+
+        print(f(1))
+        """), "'become' replaces this frame with the call's, and 'g' takes 2 arguments and this " +
+              "function takes 1 — a frame can only be replaced by one of the same shape", "2:12")
+end bnb_a_callee_of_a_different_shape
+
+@test("a callee answering something else")
+bnb_a_callee_answering_something_else()
+    if xvr_no_library() then return
+
+    bnb_refused(bnb_ir(raw"""
+        f(n: int) -> int
+            become g(n)
+
+        g(n: int) -> bool = n > 0
+
+        print(f(1))
+        """), "'become' hands on this function's result, so the call has to answer int — this one " +
+              "answers bool", "2:5")
+end bnb_a_callee_answering_something_else
+
+@test("an 'ensures', which is checked when a call returns")
+bnb_an_ensures()
+    if xvr_no_library() then return
+
+    bnb_refused(bnb_ir(raw"""
+        f(n: int) -> int
+            ensure result > 0
+            become g(n)
+
+        g(n: int) -> int = n + 1
+
+        print(f(1))
+        """), "'become' replaces this frame with the call's, and this function has an 'ensures', " +
+              "which is checked when a call returns — a 'become' never returns, so the " +
+              "postcondition would go unchecked", "3:12")
+end bnb_an_ensures
+
+@test("a 'defer', which runs on the way out and the jump is the way out")
+bnb_a_defer()
+    if xvr_no_library() then return
+
+    bnb_refused(bnb_ir(raw"""
+        f(n: int) -> int
+            defer print("out")
+
+            become g(n)
+
+        g(n: int) -> int = n + 1
+
+        print(f(1))
+        """), "'become' replaces this frame with the call's, and this function has a 'defer', " +
+              "which runs on the way out of its scope — and the jump is the way out, so there " +
+              "would be nowhere left to run it", "4:12")
+end bnb_a_defer
+
+@test("a parameter that carries a reference count")
+bnb_a_counted_parameter()
+    if xvr_no_library() then return
+
+    bnb_refused(bnb_ir(raw"""
+        struct Node
+            v: int
+
+        f(n: &Node) -> int
+            become g(n)
+
+        g(n: &Node) -> int = n.v
+
+        var x: &Node = Node(1)
+        print(f(x))
+        """), "'become' replaces this frame with the call's, and 'f' takes a counted value — the " +
+              "frame's own references are let go before the jump, so an argument read out of one " +
+              "of them would outlive nothing. Pass what the callee needs through a raw pointer or " +
+              "a value that carries no count", "5:12")
+end bnb_a_counted_parameter
+
+@test("an 'extern', whose frame is C's")
+bnb_an_extern()
+    if xvr_no_library() then return
+
+    bnb_refused(bnb_ir(raw"""
+        extern "abs" c_abs(n: i32) -> i32
+
+        f(n: i32) -> i32
+            become c_abs(n)
+
+        print(f(-3))
+        """), "'become' replaces this frame with the call's, and 'c_abs' is an 'extern' — its " +
+              "frame is C's, and nothing here knows what C does with one", "4:12")
+end bnb_an_extern
+
+@test("and something that is not a call at all")
+bnb_not_a_call_at_all()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ir(raw"""
+        f(n: int) -> int
+            become n + 1
+
+        print(f(1))
+        """), "'become' takes a call — it is the call that replaces this frame, so there has to be " +
+              "one. 'return' is what hands a value back without replacing anything")
+end bnb_not_a_call_at_all
+
+// The parser's refusal above is about a form that is not a call at all; this is the analyzer's, a
+// struct construction being a call in the grammar and a call to nothing.
+@test("or a call-shaped form that calls nothing")
+bnb_a_call_shaped_form()
+    if xvr_no_library() then return
+
+    bnb_refused(bnb_ir(raw"""
+        struct P
+            x: int
+
+        f(n: int) -> P
+            become P(n)
+
+        print(f(1).x)
+        """), "'become' replaces this frame with a call's, so what follows it has to be a call — " +
+              "'return' is what hands a value back without replacing anything", "5:5")
+end bnb_a_call_shaped_form
+
+// -- become is a soft word, so it goes on being an ordinary name -------------------------------------
+
+@test("as a variable")
+bnb_become_as_a_variable()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        var become = 41
+
+        become = become + 1
+        print(become)
+        """), "42\n")
+end bnb_become_as_a_variable
+
+@test("and as a function, which a call to it still reaches")
+bnb_become_as_a_function()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran(raw"""
+        become(n: int) -> int = n * 2
+
+        print(become(21))
+        """), "42\n")
+end bnb_become_as_a_function
+
+@test("beside a 'become' of that very function")
+bnb_become_of_become()
+    if xvr_no_library() then return
+
+    assert_eq(bnb_ran_unoptimized(raw"""
+        become(n: int) -> int
+            if n <= 0 then return 0
+
+            become become(n - 1)
+
+        print(become(3))
+        """), "0\n")
+end bnb_become_of_become

@@ -1,0 +1,586 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An **associated function on a generic type** -- a member with no receiver, so the type's arguments
+// have to be inferred from what the call passes or from the type the context expects, rather than read
+// off a value. What the inference may settle, what the instantiation it settles on is held to, how the
+// body is checked at the definition against the type's bounds, and that each instantiation is a
+// function of its own.
+//
+// **Every output, message and location here was read out of the reference compiler** (0.0.153) on
+// the same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private agn_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end agn_skip
+
+private agn_skip_run() -> bool
+    if agn_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end agn_skip_run
+
+private agn_write(main: string) -> string
+    val root = make_temp_dir("sysl-agn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end agn_write
+
+// What the program PRINTS, or what the build had to say about it.
+private agn_ran(main: string) -> string
+    val root = agn_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end agn_ran
+
+// The LLVM text of the program, or everything the analysis had to say about it.
+private agn_report(main: string) -> string
+    val root = agn_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end agn_report
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private agn_refused(main: string, message: string, at: string)
+    val out = agn_report(main)
+    // The first diagnostic alone, which is where the location has to be.
+    val first = out.index_of("\n\n") match
+        Some(n) -> out[0..<n]
+        None -> out
+
+    assert(out.starts_with(s"error: $message\n "), s"expected 'error: $message' first, got: $out")
+    assert(first.index_of(s"/main.sysl:$at\n").is_some(), s"expected it first at main.sysl:$at, got: $out")
+end agn_refused
+
+// Everything the program was refused with, as `line:column` locations in order.
+private agn_places(main: string) -> string
+    val lines = lines_of(agn_report(main))
+    var out = ""
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        line.index_of("/main.sysl:") match
+            Some(n) -> out = out + line[n + 11..<line.len] + " "
+            None -> ()
+
+    out
+end agn_places
+
+private agn_prints(main: string, expected: string)
+    val out = agn_ran(main)
+
+    assert(out == expected, s"expected '$expected', got: $out")
+
+// How many functions the LLVM text defines whose name holds `name`.
+private agn_defines(main: string, name: string) -> usize
+    val lines = lines_of(agn_report(main))
+    var n: usize = 0
+
+    for i in 0..<lines.len()
+        val line = lines.at(i)
+
+        if line.starts_with("define") && line.index_of(name).is_some() then n += 1
+
+    n
+end agn_defines
+
+// The trait whose one member has no receiver, implemented for a width and for a generic type -- the
+// shape `Zero` has in the library.
+private agn_origin() -> string =
+    "trait Origin\n    origin() -> Self\nimpl Origin for int\n    origin() -> int = 0\n" +
+    "struct Pair[T]\n    a: T\n    b: T\nimpl[T: Origin] Origin for Pair[T]\n" +
+    "    origin() -> Pair[T] = Pair(T.origin(), T.origin())\n" +
+    "seed[T: Origin](xs: []const T) -> T\n    var s = T.origin()\n    s\n"
+
+private agn_rank() -> string = "trait Rank\n    rank(self) -> int\n"
+
+private agn_box_of() -> string = "struct Box[T]\n    v: T\n    of(x: T) -> Box[T] = Box(x)\n"
+
+private agn_cursor() -> string = "struct Cursor[T]\n    p: *T\n    none() -> Cursor[T] = Cursor(null)\n"
+
+// == AssociatedGenericErrorTests ==================================================================
+
+// -- inference has to succeed ---------------------------------------------------------------------
+
+@test("an associated function's type parameter the signature never mentions cannot be inferred")
+agn_never_mentioned_cannot_be_inferred()
+    if agn_skip() then return
+
+    agn_refused("struct Box[T]\n    v: T\n    count() -> int = 0\nprint(Box.count())",
+                "cannot infer the type argument 'T' of 'Box.count' here — annotate the expected type", "4:11")
+
+@test("an associated function's type parameter only the body mentions cannot be inferred either")
+agn_body_only_cannot_be_inferred()
+    if agn_skip() then return
+
+    agn_refused(agn_box_of() + "    empty() -> int = 0\nprint(Box.empty())",
+                "cannot infer the type argument 'T' of 'Box.empty' here — annotate the expected type", "5:11")
+
+@test("one of several type parameters left unsettled is named on its own")
+agn_one_of_several_named()
+    if agn_skip() then return
+
+    agn_refused("struct Pair[A, B]\n    a: A\n    b: B\n    only(x: A) -> int = 0\nprint(Pair.only(1))",
+                "cannot infer the type argument 'B' of 'Pair.only' here — annotate the expected type", "5:12")
+
+// -- the instantiation the call resolves to is checked --------------------------------------------
+
+@test("an argument that does not meet the type's bound is refused at the associated call")
+agn_argument_misses_bound()
+    if agn_skip() then return
+
+    val main = agn_rank() + "struct Scored[T: Rank]\n    n: int\n    of(x: T) -> Scored[T] = Scored(x.rank())\n" +
+               "print(Scored.of(3).n)"
+
+    agn_refused(main, "'Scored' requires its type parameter 'T' to implement 'Rank', but int does not", "6:14")
+
+    // Once, at the call: the member is not made real at an instantiation already refused.
+    assert(agn_places(main) == "6:14 ", s"expected one refusal, got: ${agn_report(main)}")
+
+@test("an instantiation inferred from the expected type is held to the type's bound too")
+agn_expected_type_misses_bound()
+    if agn_skip() then return
+
+    val main = agn_rank() + "struct Scored[T: Rank]\n    n: int\n    zero() -> Scored[T] = Scored(0)\n" +
+               "var s: Scored[int] = Scored.zero()"
+
+    agn_refused(main, "'Scored' requires its type parameter 'T' to implement 'Rank', but int does not", "6:8")
+    assert(agn_places(main) == "6:8 ", s"expected one refusal, got: ${agn_report(main)}")
+
+@test("an argument disagreeing with the type parameter the other one fixed is reported")
+agn_argument_disagrees()
+    if agn_skip() then return
+
+    agn_refused("struct Pair[A]\n    a: A\n    b: A\n    of(x: A, y: A) -> Pair[A] = Pair(x, y)\n" +
+                "var p = Pair.of(1, \"two\")",
+                "'x' of 'Pair.of' is string, but int was given", "5:17")
+
+@test("an associated call's result disagreeing with the annotated type is reported as the mismatch")
+agn_result_disagrees_with_annotation()
+    if agn_skip() then return
+
+    agn_refused(agn_box_of() + "var b: Box[string] = Box.of(1)",
+                "'x' of 'Box.of' is string, but int was given", "4:29")
+
+@test("an associated call's arity is checked before anything is inferred")
+agn_arity_first()
+    if agn_skip() then return
+
+    agn_refused(agn_box_of() + "print(Box.of(1, 2).v)",
+                "associated function 'Box.of' takes 1 argument, but 2 arguments were given", "4:11")
+
+// -- the body is checked at the definition, against the type's bounds -----------------------------
+
+@test("rendering an unbounded parameter in an associated function names the bound")
+agn_render_unbounded()
+    if agn_skip() then return
+
+    agn_refused("struct Box[T]\n    v: T\n    describe(x: T) -> string = str(x)",
+                "'str' needs 'T: sysl.Display'", "3:32")
+
+@test("an interpolation hole over an unbounded parameter names 'str' as the form that needs the bound")
+agn_interpolation_names_str()
+    if agn_skip() then return
+
+    agn_refused("f[T](x: T) -> string = s\"a${x}\"", "'str' needs 'T: sysl.Display'", "1:24")
+
+@test("an operator on an unbounded parameter in an associated function names the bound")
+agn_operator_unbounded()
+    if agn_skip() then return
+
+    agn_refused("struct Box[T]\n    v: T\n    twice(x: T) -> T = x + x", "'+' needs 'T: sysl.Add'", "3:24")
+
+@test("a type's bound licenses only what its own trait declares, in an associated function")
+agn_bound_licenses_its_own()
+    if agn_skip() then return
+
+    agn_refused(agn_rank() + "trait Size\n    size(self) -> int\nstruct Box[T: Rank]\n    v: T\n" +
+                "    measure(x: T) -> int = x.size()",
+                "'size' needs 'T: Size'", "7:30")
+
+// -- a generic caller must ask at least what the type asks ----------------------------------------
+
+@test("an unbounded parameter handed to a bounded type is refused at the caller's definition")
+agn_caller_unbounded()
+    if agn_skip() then return
+
+    val main = agn_rank() + "struct Scored[T: Rank]\n    n: int\n    of(x: T) -> Scored[T] = Scored(0)\n" +
+               "keep[T](x: T) -> Scored[T] = Scored.of(x)"
+
+    agn_refused(main, "'Scored' requires its type parameter 'T' to implement 'Rank', but 'T' is not bounded by it",
+                "6:18")
+
+    // At the signature and at the call, and nowhere inside the member the call would have reached.
+    assert(agn_places(main) == "6:18 6:37 ", s"expected the signature and the call, got: ${agn_report(main)}")
+
+@test("a type refused at its written application is not refused again where a value of it is built")
+agn_refused_application_said_once()
+    if agn_skip() then return
+
+    val main = agn_rank() + "struct Scored[T: Rank]\n    n: int\n    of(x: T) -> Scored[T] = Scored(0)\n" +
+               "keep[T](x: T) -> int\n    var s: Scored[T] = Scored(0)\n    s.n"
+
+    agn_refused(main, "'Scored' requires its type parameter 'T' to implement 'Rank', but 'T' is not bounded by it",
+                "7:12")
+    assert(agn_places(main) == "7:12 ", s"expected one refusal, got: ${agn_report(main)}")
+
+// The reference's own positions for each: a construction and a variant at their name, a selection
+// from a written list at the variant, a written list on a constructor at its `[` -- and a position
+// whose expected type already said the arguments at that type alone.
+@test("a construction at arguments nobody spelled is held to the type's bound, once per place")
+agn_inferred_construction_misses_bound()
+    if agn_skip() then return
+
+    val main = "struct SortedPair[T: Ord]\n    lo: T\n    hi: T\n\nstruct P\n    v: int\n\n" +
+               "var s = SortedPair(P(1), P(2))\nvar t = SortedPair(P(3), P(4))\n" +
+               "var u = SortedPair[P](P(5), P(6))\nval w: SortedPair[P] = SortedPair(P(7), P(8))\nprint(1)"
+
+    agn_refused(main, "'SortedPair' requires its type parameter 'T' to implement 'sysl.Ord', but P does not", "8:9")
+    assert(agn_places(main) == "8:9 9:9 10:19 11:8 ", s"expected four refusals, got: ${agn_report(main)}")
+
+@test("a variant built or selected at arguments nobody spelled is held to the enum's bound")
+agn_inferred_variant_misses_bound()
+    if agn_skip() then return
+
+    val main = "enum W[T: Ord]\n    A(v: T)\n    N\n\nstruct P\n    v: int\n\n" +
+               "var w = A(P(1))\nvar x = W[P].N\nval y: W[P] = A(P(2))\nprint(1)"
+
+    agn_refused(main, "'W' requires its type parameter 'T' to implement 'sysl.Ord', but P does not", "8:9")
+    assert(agn_places(main) == "8:9 9:14 10:8 ", s"expected three refusals, got: ${agn_report(main)}")
+
+// -- there has to be a name to reach it through ---------------------------------------------------
+
+@test("a block matching a shape may not declare an associated function")
+agn_shape_block_refused()
+    if agn_skip() then return
+
+    agn_refused("trait Make\n    made(x: int) -> int\nimpl[T] Make for []T\n    made(x: int) -> int = x",
+                "'made' has no receiver, and '[]T' is not a name a call could reach it through — give it a " +
+                "'self' parameter", "4:5")
+
+@test("a block for a composed type written out in full may not declare one either")
+agn_composed_block_refused()
+    if agn_skip() then return
+
+    agn_refused("trait Make\n    made(x: int) -> int\nimpl Make for []int\n    made(x: int) -> int = x",
+                "'made' has no receiver, and '[]int' is not a name a call could reach it through — give it a " +
+                "'self' parameter", "4:5")
+
+@test("a block for a built-in may declare one, and the built-in's name reaches it")
+agn_builtin_block_reached()
+    if agn_skip() then return
+
+    val out = agn_report("trait Make\n    made(x: int) -> int\n\nimpl Make for int\n    made(x: int) -> int = x + 1\n" +
+                         "\nmain()\n    print(int.made(41))")
+
+    assert(out.index_of("call i32 @int.made(i32 41)").is_some(), s"expected the call, got: $out")
+
+@test("a built-in's associated function runs")
+agn_builtin_block_runs()
+    if agn_skip_run() then return
+
+    agn_prints("trait Make\n    made(x: int) -> int\n\nimpl Make for int\n    made(x: int) -> int = x + 1\n" +
+               "\nmain()\n    print(int.made(41))", "42\n")
+
+// -- it is reached through the type, not through a value ------------------------------------------
+
+@test("calling an associated function on a value says where it is reached from instead")
+agn_called_on_value()
+    if agn_skip() then return
+
+    agn_refused(agn_box_of() + "var b = Box(1)\nprint(b.of(2).v)",
+                "'of' is an associated function of 'Box' — call it with 'Box.of(…)'", "5:9")
+
+@test("reading an associated function off the type without parentheses says to call it")
+agn_read_without_parentheses()
+    if agn_skip() then return
+
+    agn_refused(agn_box_of() + "print(Box.of)",
+                "'of' is an associated function of 'Box' — call it with 'Box.of(…)'", "4:11")
+
+@test("a name the type does not have at all is reported as the type it was read off")
+agn_no_member_at_all()
+    if agn_skip() then return
+
+    agn_refused("struct Box[T]\n    v: T\nprint(Box.v)",
+                "type 'Box' has no member 'v' — and 'Box' is a type, not a value", "3:11")
+
+@test("a method reached through the type name says to use a value")
+agn_method_through_type()
+    if agn_skip() then return
+
+    agn_refused("struct Box[T]\n    v: T\n    get(self) -> T = self.v\nprint(Box.get())",
+                "'get' is an instance method of 'Box' — call it on a value, not the type", "4:11")
+
+@test("a property reached through the type name says to read it on a value")
+agn_property_through_type()
+    if agn_skip() then return
+
+    agn_refused("struct Box[T]\n    v: T\n    size -> int = 1\nprint(Box.size())",
+                "'size' is a property of 'Box' — read it on a value, as 'value.size'", "4:11")
+
+@test("a method reached through a non-generic type's name says to use a value")
+agn_method_through_plain_type()
+    if agn_skip() then return
+
+    agn_refused("struct Box\n    v: int\n    get(self) -> int = self.v\nprint(Box.get())",
+                "'get' is an instance method of 'Box' — call it on a value, not the type", "4:11")
+
+@test("a property reached through a non-generic type's name says to read it on a value")
+agn_property_through_plain_type()
+    if agn_skip() then return
+
+    agn_refused("struct Box\n    v: int\n    size -> int = 1\nprint(Box.size())",
+                "'size' is a property of 'Box' — read it on a value, as 'value.size'", "4:11")
+
+@test("an argument disagreeing with a non-generic associated function's parameter names the callee alone")
+agn_plain_argument_disagrees()
+    if agn_skip() then return
+
+    agn_refused("struct Box\n    v: int\n    of(x: int) -> Box = Box(x)\nprint(Box.of(\"s\").v)",
+                "'x' of 'Box.of' is int, but string was given", "4:14")
+
+@test("an associated function the type does not declare is reported against the type")
+agn_undeclared_associated()
+    if agn_skip() then return
+
+    agn_refused("struct Box[T]\n    v: T\nprint(Box.of(1))", "type 'Box' has no associated function 'of'", "3:11")
+
+// == AssociatedGenericRunTests ====================================================================
+
+// -- the arguments come from what the call passes -------------------------------------------------
+
+@test("one type parameter inferred from one argument, at two element types")
+agn_one_from_one_at_two()
+    if agn_skip_run() then return
+
+    agn_prints("struct Box[T]\n    v: T\n    of(x: T) -> Box[T] = Box(x)\n    get(self) -> T = self.v\n" +
+               "var a = Box.of(41)\nvar b = Box.of(\"boxed\")\nprint(a.get(), b.get())", "41 boxed\n")
+
+@test("two type parameters inferred from two arguments, in the order the subject writes them")
+agn_two_from_two()
+    if agn_skip_run() then return
+
+    agn_prints("struct Pair[A, B]\n    a: A\n    b: B\n    of(x: A, y: B) -> Pair[A, B] = Pair(x, y)\n" +
+               "    first(self) -> A = self.a\n    second(self) -> B = self.b\n" +
+               "var p = Pair.of(7, \"seven\")\nprint(p.first(), p.second())", "7 seven\n")
+
+@test("a type parameter appearing under a composed type is reached")
+agn_under_composed_type()
+    if agn_skip_run() then return
+
+    agn_prints("struct Holder[T]\n    v: T\n    head(xs: []T) -> Holder[T] = Holder(xs[0])\n" +
+               "    get(self) -> T = self.v\nvar xs = [3, 4, 5]\nprint(Holder.head(xs[0..<3]).get())", "3\n")
+
+@test("an argument settles the type parameter even where a 'Self' result names it too")
+agn_argument_beside_self_result()
+    if agn_skip_run() then return
+
+    agn_prints("struct Box[T]\n    v: T\n    of(x: T) -> Self = Box(x)\n    get(self) -> T = self.v\n" +
+               "print(Box.of(9).get())", "9\n")
+
+@test("'Self' in an associated function's parameter is the type applied to its own parameters")
+agn_self_in_parameter()
+    if agn_skip_run() then return
+
+    agn_prints("struct Box[T: Add]\n    v: T\n    joined(x: Self, y: Self) -> Self = Box(x.v + y.v)\n" +
+               "    get(self) -> T = self.v\nprint(Box.joined(Box(2), Box(3)).get())", "5\n")
+
+// -- the arguments come from the type the context expects -----------------------------------------
+
+@test("an annotated variable settles a type parameter no argument mentions")
+agn_annotated_variable_settles()
+    if agn_skip_run() then return
+
+    agn_prints(agn_cursor() + "    empty(self) -> bool = self.p == null\nvar c: Cursor[int] = Cursor.none()\n" +
+               "print(c.empty())", "true\n")
+
+@test("an annotated variable settles a result written 'Self'")
+agn_annotated_variable_settles_self()
+    if agn_skip_run() then return
+
+    agn_prints("struct Cursor[T]\n    p: *T\n    none() -> Self = Cursor(null)\n" +
+               "    empty(self) -> bool = self.p == null\nvar c: Cursor[string] = Cursor.none()\n" +
+               "print(c.empty())", "true\n")
+
+@test("a declared parameter of the function being called is the associated call's expected type")
+agn_declared_parameter_expected()
+    if agn_skip_run() then return
+
+    agn_prints(agn_cursor() + "empty(c: Cursor[int]) -> bool = c.p == null\nprint(empty(Cursor.none()))", "true\n")
+
+@test("a declared result is the associated call's expected type")
+agn_declared_result_expected()
+    if agn_skip_run() then return
+
+    agn_prints(agn_cursor() + "start() -> Cursor[real] = Cursor.none()\nprint(start().p == null)", "true\n")
+
+// -- the type's bounds hold at the call and inside the body ---------------------------------------
+
+@test("an associated function's body may assume what the type asks of its parameter")
+agn_body_assumes_bound()
+    if agn_skip_run() then return
+
+    agn_prints("struct Tagged[T: Display]\n    label: string\n" +
+               "    describe(x: T) -> Tagged[T] = Tagged(\"<\" + str(x) + \">\")\n" +
+               "    read(self) -> string = self.label\n" +
+               "print(Tagged.describe(12).read(), Tagged.describe(true).read())", "<12> <true>\n")
+
+@test("an argument the bound is satisfied by is accepted through a user impl")
+agn_bound_by_user_impl()
+    if agn_skip_run() then return
+
+    agn_prints(agn_rank() + "struct P\n    n: int\nimpl Rank for P\n    rank(self) -> int = self.n * 2\n" +
+               "struct Scored[T: Rank]\n    score: int\n    of(x: T) -> Scored[T] = Scored(x.rank())\n" +
+               "    read(self) -> int = self.score\nprint(Scored.of(P(4)).read())", "8\n")
+
+// -- a generic caller hands its own parameter on --------------------------------------------------
+
+@test("an unbounded parameter passes straight through an associated call")
+agn_unbounded_passes_through()
+    if agn_skip_run() then return
+
+    agn_prints(agn_box_of() + "wrap[T](x: T) -> Box[T] = Box.of(x)\nprint(wrap(3).v, wrap(\"s\").v)", "3 s\n")
+
+@test("a bounded parameter satisfies the same bound at the type")
+agn_bounded_passes_through()
+    if agn_skip_run() then return
+
+    agn_prints(agn_rank() + "struct P\n    n: int\nimpl Rank for P\n    rank(self) -> int = self.n\n" +
+               "struct Scored[T: Rank]\n    n: int\n    of(x: T) -> Scored[T] = Scored(x.rank())\n" +
+               "keep[T: Rank](x: T) -> Scored[T] = Scored.of(x)\nprint(keep(P(4)).n)", "4\n")
+
+@test("a member reaches an associated function through Self, at its own instantiation")
+agn_member_through_self()
+    if agn_skip_run() then return
+
+    agn_prints(agn_box_of() + "    twin(self) -> Box[T] = Self.of(self.v)\nprint(Box(7).twin().v, Box(\"s\").twin().v)",
+               "7 s\n")
+
+// -- it is an ordinary member in every other respect ----------------------------------------------
+
+@test("an enum declares an associated function beside its variants")
+agn_enum_declares_one()
+    if agn_skip_run() then return
+
+    agn_prints("enum Maybe[T]\n    Nothing\n    Just(v: T)\n    of(x: T) -> Maybe[T] = Just(x)\n" +
+               "    or(self, fallback: T) -> T = self match\n        Just(v) -> v\n        Nothing -> fallback\n" +
+               "print(Maybe.of(3).or(0))", "3\n")
+
+@test("a generic 'impl' block supplies an associated function for the trait that asked")
+agn_generic_impl_supplies()
+    if agn_skip_run() then return
+
+    agn_prints("trait Make\n    made(x: int) -> Self\nstruct Box[T]\n    v: T\nimpl[T] Make for Box[T]\n" +
+               "    made(x: int) -> Self = Box(x)\nvar b: Box[int] = Box.made(6)\nprint(b.v)", "6\n")
+
+@test("one associated function calls another of the same type")
+agn_calls_another()
+    if agn_skip_run() then return
+
+    agn_prints(agn_box_of() + "    twice(x: T) -> Box[Box[T]] = Box.of(Box.of(x))\nprint(Box.twice(5).v.v)", "5\n")
+
+@test("an associated function recurses at the instantiation it was called at")
+agn_recurses()
+    if agn_skip_run() then return
+
+    agn_prints("struct Box[T]\n    v: T\n    n: int\n" +
+               "    down(x: T, k: int) -> Box[T] = if k <= 0 then Box(x, 0) else Box.down(x, k - 1)\n" +
+               "print(Box.down(\"z\", 4).n)", "0\n")
+
+@test("an associated function may hand back a reference, which the call boxes")
+agn_hands_back_reference()
+    if agn_skip_run() then return
+
+    agn_prints("struct Box[T]\n    v: T\n    of(x: T) -> &Box[T] = Box(x)\nvar b = Box.of(8)\nprint(b.v)", "8\n")
+
+@test("a counted payload through an associated function is retained and released like any other")
+agn_counted_payload()
+    if agn_skip_run() then return
+
+    agn_prints(agn_box_of() + "    get(self) -> T = self.v\nvar n = 0usize\nfor i in 0..<1000\n" +
+               "    n += Box.of(\"xy\").get().len\nprint(n)", "2000\n")
+
+// -- a parameter substituted to a generic type brings that type's arguments with it ---------------
+
+@test("a receiverless member at a generic element type, with nothing but the call to say what it is")
+agn_seed_generic_element()
+    if agn_skip_run() then return
+
+    agn_prints(agn_origin() + "var ps: []Pair[int] = [Pair(1, 2)]\nprint(seed(ps).a, seed(ps).b)", "0 0\n")
+
+@test("the same receiverless body at an element type with no arguments to bring")
+agn_seed_plain_element()
+    if agn_skip_run() then return
+
+    agn_prints(agn_origin() + "var ns: []int = [1, 2]\nprint(seed(ns))", "0\n")
+
+@test("an annotation still settles a receiverless member of a generic type")
+agn_annotation_still_settles()
+    if agn_skip_run() then return
+
+    agn_prints(agn_origin() + "var p: Pair[int] = Pair.origin()\nprint(p.a)", "0\n")
+
+@test("'Self' inside the type's own body needs neither an argument nor an annotation")
+agn_self_inside_needs_neither()
+    if agn_skip_run() then return
+
+    agn_prints("struct Box[T]\n    v: T\n    count() -> int = 0\n" +
+               "    twice(self) -> int = Self.count() + Self.count()\nprint(Box(1).twice(), Box(\"x\").twice())",
+               "0 0\n")
+
+// -- each instantiation is its own function -------------------------------------------------------
+
+@test("two element types give two definitions of the one associated function")
+agn_two_instantiations_two_definitions()
+    if agn_skip() then return
+
+    val n = agn_defines(agn_box_of() + "print(Box.of(1).v)\nprint(Box.of(2.5).v)", "@Box.of.")
+
+    assert(n == 2, s"expected 2 definitions, got $n")
+
+@test("two calls at one element type give one definition of the associated function")
+agn_one_instantiation_one_definition()
+    if agn_skip() then return
+
+    val n = agn_defines(agn_box_of() + "print(Box.of(1).v)\nprint(Box.of(2).v)", "@Box.of.")
+
+    assert(n == 1, s"expected 1 definition, got $n")

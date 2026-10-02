@@ -465,7 +465,7 @@ type_args_at_selection(cx: &Analyzer, span: Span, head: (string, string), targ_e
 
         targs.push(t)
 
-    reinstantiate(cx.an, head.0, targs) match
+    reinstantiate_at(cx.an, cx.scope, span, head.0, targs) match
         Enum(d) ->
             val v = d.variant(sel)
 
@@ -511,7 +511,14 @@ private named_call(cx: &Analyzer, span: Span, callee: Expr, name: string, args: 
         val stands_for = bound_type(cx.subst, name)
 
         if stands_for.is_some() then
-            return convert_call(cx, span, name, stands_for.unwrap(), args)
+            val to = stands_for.unwrap()
+
+            // A subtype that checks anything is made the way its own name makes it.
+            to match
+                Constrained(d) -> if !name_only(d) then return into_subtype(cx, span, to, name, args)
+                _ -> ()
+
+            return convert_call(cx, span, name, to, args)
     end if
 
     // **A variant the position asked for outright claims the name**, before a type of that name is
@@ -832,7 +839,12 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
                 return bad_expr(span)
             end if
 
-        reinstantiate(cx.an, key, targs) match
+        // Built at arguments the program never spelled, so their bounds are asked here, at the
+        // constructor. A position that expects this very struct has asked them where its type was
+        // written, and asking again would say one mistake twice.
+        val at = if named_targs.is_empty() && expects_struct(expected, key) then span_zero() else span
+
+        reinstantiate_at(cx.an, cx.scope, at, key, targs) match
             Struct(d) -> inst = Some(Struct(d))
             _ -> return bad_expr(span)
     end if
@@ -883,6 +895,11 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
             checked_new(cx, span, TExpr(span, TStructNew(d, ts)), d)
         _ -> bad_expr(span)
 end struct_call
+
+// Whether the position expects an instantiation of the struct declared under `key`.
+private expects_struct(expected: Option[Type], key: string) -> bool = expected match
+    Some(Struct(d)) -> d.base == key
+    _ -> false
 
 // Which written value fills which field. The rule is the parameter list's, read over a record: a
 // name chooses its slot, everything else takes the next one, and a field is filled once.
@@ -1168,8 +1185,14 @@ private constrained_call(cx: &Analyzer, span: Span, key: string, written: string
     if inst.is_none() then
         return cx.err(span, s"'$written' is an alias, and an alias is not something that is called")
 
-    val target = inst.unwrap()
+    into_subtype(cx, span, inst.unwrap(), written, args)
+end constrained_call
 
+// A value made into a subtype: converted to its base where it is not already that, then checked
+// against what the subtype states. A type parameter standing for a subtype comes here too, so
+// `T(n)` at `Small` checks the range exactly as `Small(n)` written out does.
+private into_subtype(cx: &Analyzer, span: Span, target: Type, written: string,
+                     args: Buf[Expr]) -> TExpr
     if args.len() != 1 then
         return cx.err(span, s"a '$written' conversion takes exactly one value")
 
@@ -1184,7 +1207,7 @@ private constrained_call(cx: &Analyzer, span: Span, key: string, written: string
 
             TExpr(span, TConstrainedCheck(t, target))
         _ -> bad_expr(span)
-end constrained_call
+end into_subtype
 
 // A variant with what it carries.
 private variant_call(cx: &Analyzer, span: Span, en: Type, v: EnumVariant,
@@ -1319,7 +1342,7 @@ private variant_instance(cx: &Analyzer, span: Span, named_at: Span, key: string,
             return VsSaid
         end if
 
-    reinstantiate(cx.an, key, targs) match
+    reinstantiate_at(cx.an, cx.scope, named_at, key, targs) match
         Enum(d) ->
             val v = d.variant(vd.name)
 
@@ -1474,7 +1497,7 @@ private applied_variant(cx: &Analyzer, receiver: Expr, member: string) -> Varian
 
                 targs.push(t)
 
-            reinstantiate(cx.an, key.unwrap(), targs) match
+            reinstantiate_at(cx.an, cx.scope, receiver.span, key.unwrap(), targs) match
                 Enum(d) -> d.variant(member) match
                     Some(v) -> VsFound(Enum(d), v)
                     None -> VsNone
@@ -1923,6 +1946,16 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
         return cx.err(span, s"'$shown' is a '@test' function, which 'sysl test' calls and nothing else " +
                       "does — every other build leaves it out, so this call would have no definition to " +
                       "reach. Work two tests share belongs in an ordinary function they both call")
+
+    // **An interrupt handler has one caller and it is the processor** (`reference/ffi.md §
+    // interrupt`). It is entered with a frame the hardware pushed and leaves through a
+    // return-from-interrupt, so a call written here would set up an ordinary frame and then unwind one
+    // that never happened. Its address is still worth taking: that is what a vector table holds.
+    if f.decl.conv.is_some() then
+        return cx.err(span, s"'$shown' is an interrupt handler, which the processor enters and no program " +
+                      "calls — it leaves through a return-from-interrupt, which would unwind a frame this " +
+                      s"call never pushed. Take its address for the vector table with '&$shown', and put " +
+                      "whatever the two share in an ordinary function they both call")
 
     // An `extern` is declared in the output only if something reaches it, which is what keeps an
     // unused one -- the library's `exit`, in a program that never panics -- out of the module.
@@ -2389,10 +2422,11 @@ private call_through(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
     // A value carries types and no names, so there is nothing a name could be matched against.
     if refuse_named_args(cx, args) then return bad_expr(span)
 
-    local.ty match
+    // An exported alias of a function pointer is called through as the pointer it names.
+    repr(local.ty) match
         CFn(params, ret) ->
-            call_pointer(cx, span, TExpr(span, TLoad(local.unique, local.ty)), local.ty, params, *ret,
-                         args)
+            call_pointer(cx, span, TExpr(span, TLoad(local.unique, local.ty)), repr(local.ty), params,
+                         *ret, args)
         // Everything else is called through the call trait its type implements, which makes it the
         // ordinary method call it looks like: a bare-arrow parameter is a direct call and a `&Fn`
         // field an indirect one, with nothing here choosing between them -- the receiver decides,

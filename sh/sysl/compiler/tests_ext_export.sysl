@@ -1,0 +1,881 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_bytes, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{join, split, Search}
+
+// The rest of the reference's `ExportCliTests` -- the C a `--lib` tree carries reaching the archive,
+// and which roots a dependency contributes -- and the whole of its `ExportTypeRunTests`, an exported
+// `type` used from the sysl side (`reference/ffi.md § Naming a type`). `tests_export_cli.sysl` holds
+// the first half of `ExportCliTests`.
+//
+// Every expected line was read out of the reference (0.0.155) on the same input. The cases that link
+// C beside sysl build a real C `main` against the archive, run it and read its answer.
+//
+// **The reference lowers its interrupt handlers for `riscv64-linux`**, whose standard module needs
+// Linux headers this machine does not have, so it cannot answer for that row here. The handler is a
+// function attribute on every RISC-V row alike, so these ask `riscv64-freestanding`, which both
+// compilers answer on this machine -- and both answered identically.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ext_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end ext_ready
+
+private ext_has(said: string, part: string) -> bool = said.index_of(part).is_some()
+
+// What one command line came to: the status the shell hears, and every line the driver said.
+private ext_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end ext_run
+
+// A directory holding `<module>/lib.sysl`, as the reference's `rootOf` lays one out.
+private ext_root_of(name: string, text: string) -> string
+    val root = make_temp_dir("sysl-ext-").unwrap()
+
+    make_dir_all(s"$root/$name").unwrap()
+    write_text(s"$root/$name/lib.sysl", text).unwrap()
+    root
+end ext_root_of
+
+// The same, with a C file beside the module's source.
+private ext_root_with_c(name: string, text: string, c_name: string, c_text: string) -> string
+    val root = ext_root_of(name, text)
+
+    write_text(s"$root/$name/$c_name", c_text).unwrap()
+    root
+end ext_root_with_c
+
+// A `--lib` root holding two modules: `used`, which the program calls, and `spare`, which it does
+// not -- the used one is the control and the spare one the measurement.
+private ext_two_module_lib(spare: string) -> string
+    val root = ext_root_of("used", "module used\n\ndouble(n: i32) -> i32 = n * 2\n")
+
+    make_dir_all(s"$root/spare").unwrap()
+    write_text(s"$root/spare/lib.sysl", spare).unwrap()
+    root
+end ext_two_module_lib
+
+// A `--lib` root of two named modules.
+private ext_lib_of(a: string, a_text: string, b: string, b_text: string) -> string
+    val root = ext_root_of(a, a_text)
+
+    make_dir_all(s"$root/$b").unwrap()
+    write_text(s"$root/$b/lib.sysl", b_text).unwrap()
+    root
+end ext_lib_of
+
+private ext_cleanup(roots: []string)
+    for i in 0..<roots.len
+        remove_dir_all(roots[i]).unwrap_or(())
+
+// The LLVM text of `emit-llvm` over a program root with one `--lib` root, having succeeded.
+private ext_emitted(root: string, lib: string) -> string
+    val got = ext_run(["sysl", "emit-llvm", root, "--lib", lib])
+
+    assert(got.0 == 0, got.1)
+    got.1
+end ext_emitted
+
+// The same, lowered for a named target.
+private ext_emitted_for(root: string, lib: string, target: string) -> string
+    val got = ext_run(["sysl", "emit-llvm", root, "--lib", lib, "--target", target])
+
+    assert(got.0 == 0, got.1)
+    got.1
+end ext_emitted_for
+
+// Every symbol a `define` line names, quotes taken off, as the reference's `symbols(ir, "define")`.
+private ext_defines(ir: string) -> Buf[string]
+    var names: Buf[string] = buf()
+    val lines = split(ir, "\n")
+
+    for i in 0..<lines.len
+        val line = lines[i]
+
+        if line.starts_with("define ")
+            line.index_of("@") match
+                None -> ()
+                Some(at) ->
+                    var name = line[at + 1..<line.len]
+
+                    name.index_of("(") match
+                        Some(open) -> name = name[0..<open]
+                        None -> ()
+
+                    if name.starts_with("\"") && name.len >= 2 then name = name[1..<name.len - 1]
+
+                    names.push(name)
+    end for
+
+    names
+end ext_defines
+
+private ext_holds(xs: Buf[string], x: string) -> bool
+    for i in 0..<xs.len()
+        if xs.at(i) == x then return true
+
+    false
+end ext_holds
+
+private ext_defines_name(ir: string, name: string) -> bool = ext_holds(ext_defines(ir), name)
+
+// How many `define` lines lay down a function called `main`.
+private ext_mains(ir: string) -> int
+    var n = 0
+    val lines = split(ir, "\n")
+
+    for i in 0..<lines.len
+        if lines[i].starts_with("define ") && ext_has(lines[i], "@main(") then n += 1
+
+    n
+end ext_mains
+
+// The names of an archive's members.
+private ext_members(archive: string) -> Buf[string]
+    var names: Buf[string] = buf()
+    val members = ar_members(read_bytes(archive).unwrap()).unwrap()
+
+    for i in 0..<members.len()
+        names.push(members.at(i).name)
+
+    names
+end ext_members
+
+private ext_exited_zero(s: Status) -> bool = s match
+    Exited(code) -> code == 0
+    _ -> false
+
+// What a program prints, built and run.
+private ext_ran(text: string) -> string
+    val root = make_temp_dir("sysl-ext-").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ext_ran
+
+// Everything a one-file program has to say for itself, through the lowering.
+private ext_err(text: string) -> string
+    val root = make_temp_dir("sysl-ext-").unwrap()
+    val src = s"$root/main.sysl"
+
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ext_err
+
+// -- the modules ----------------------------------------------------------------------------------
+
+// Seven is a number only the C knows and the multiplication is only the sysl's, so an archive that
+// dropped either object cannot answer 42.
+private ext_shim() -> string = "int demo_seven(void) { return 7; }\n"
+
+private ext_calling_c() -> string = raw"""
+    module demo
+
+    extern "demo_seven" c_seven() -> i32
+
+    seven_times(n: i32) -> i32 = c_seven() * n
+    """
+
+private ext_exporting() -> string = raw"""
+    module mylib
+
+    @export("mylib_answer")
+    answer() -> i32 = demo.seven_times(6)
+    """
+
+private ext_spare_export() -> string = raw"""
+    module spare
+
+    @export("spare_thing")
+    thing() -> i32 = 42
+    """
+
+private ext_using_used() -> string = raw"""
+    module mylib
+
+    @export("mylib_answer")
+    answer(n: i32) -> i32 = used.double(n)
+    """
+
+// The same program, reaching `spare` by an `import` and nothing else.
+private ext_importing_spare() -> string = raw"""
+    module mylib
+
+    import spare
+
+    @export("mylib_answer")
+    answer(n: i32) -> i32 = used.double(n)
+    """
+
+// A handler taking nothing, and an `extern` for its body to call.
+private ext_handler_module() -> string = raw"""
+    module spare
+
+    extern "ack" ack()
+
+    interrupt timer()
+        ack()
+    """
+
+// A type with a destructor, and a function that makes one.
+private ext_dropping_module() -> string = raw"""
+    module spare
+
+    struct Handle
+        n: i32
+
+    impl Drop for Handle
+        drop(self) = print("gone", self.n)
+
+    make() -> &Handle = Handle(1)
+    """
+
+private ext_section_module() -> string = raw"""
+    module spare
+
+    @section(".ramfunc")
+    placed() -> i32 = 7
+    """
+
+private ext_placed() -> string = "spare" + "$" + "placed"
+
+// -- the C of a '--lib' source tree ---------------------------------------------------------------
+
+@test("is a member of the archive, exactly as the project's own is")
+ext_lib_c_is_a_member()
+    if !ext_ready() then return
+
+    val lib = ext_root_with_c("demo", ext_calling_c(), "shim.c", ext_shim())
+    val root = ext_root_of("mylib", ext_exporting())
+    val got = ext_run(["sysl", "build-c", root, "-o", s"$root/libmylib.a", "--lib", lib])
+
+    assert(got.0 == 0, got.1)
+
+    val names = ext_members(s"$root/libmylib.a")
+
+    assert(ext_holds(names, "demo.shim.o"), join(names.view(), " "))
+    ext_cleanup([lib, root])
+end ext_lib_c_is_a_member
+
+@test("and a C program links against it and gets the answer the shim computed")
+ext_lib_c_links_and_answers()
+    if !ext_ready() then return
+
+    val lib = ext_root_with_c("demo", ext_calling_c(), "shim.c", ext_shim())
+    val root = ext_root_of("mylib", ext_exporting())
+    val out = s"$root/libmylib.a"
+    val got = ext_run(["sysl", "build-c", root, "-o", out, "--lib", lib])
+
+    assert(got.0 == 0, got.1)
+
+    val main_c = "#include <stdio.h>\n#include \"" + out + ".h\"\n\n" +
+        "int main(void) {\n    printf(\"%d\\n\", mylib_answer());\n    return 0;\n}\n"
+
+    write_text(s"$root/main.c", main_c).unwrap()
+
+    val built = capture("clang", [s"$root/main.c", out, "-o", s"$root/caller"], "", [], true).unwrap()
+
+    assert(ext_exited_zero(built.status), built.err.unwrap_or(built.text))
+
+    val ran = capture(s"$root/caller", [], "", [], true, 20).unwrap()
+
+    assert(ext_exited_zero(ran.status), ran.err.unwrap_or(ran.text))
+    assert_eq(ran.text.trim(), "42")
+    ext_cleanup([lib, root])
+end ext_lib_c_links_and_answers
+
+// The row of the table that already worked, kept beside the one that did not, so a change moving the
+// collection cannot fix one end while quietly dropping the other.
+@test("beside the project's own, which lands under a name of its own")
+ext_lib_c_beside_the_projects()
+    if !ext_ready() then return
+
+    val lib = ext_root_with_c("demo", ext_calling_c(), "shim.c", ext_shim())
+    val root = ext_root_with_c("mylib", ext_exporting(), "extra.c",
+                               "int mylib_unused(void) { return 0; }\n")
+    val got = ext_run(["sysl", "build-c", root, "-o", s"$root/libmylib.a", "--lib", lib])
+
+    assert(got.0 == 0, got.1)
+
+    val names = ext_members(s"$root/libmylib.a")
+
+    assert(ext_holds(names, "demo.shim.o"), join(names.view(), " "))
+    assert(ext_holds(names, "mylib.extra.o"), join(names.view(), " "))
+    ext_cleanup([lib, root])
+end ext_lib_c_beside_the_projects
+
+// -- an '@export' in a '--lib' source tree --------------------------------------------------------
+
+@test("is dropped where nothing in the program reaches its module")
+ext_dep_export_dropped_unreached()
+    if !ext_ready() then return
+
+    val lib = ext_two_module_lib(ext_spare_export())
+    val root = ext_root_of("mylib", ext_using_used())
+    val ir = ext_emitted(root, lib)
+
+    assert(ext_defines_name(ir, "mylib_answer"), ir)
+    assert(!ext_defines_name(ir, "spare_thing"), ir)
+    ext_cleanup([lib, root])
+end ext_dep_export_dropped_unreached
+
+// The control: the one thing that differs is that the program names the module.
+@test("and is kept where the program does reach it")
+ext_dep_export_kept_reached()
+    if !ext_ready() then return
+
+    val program = raw"""
+        module mylib
+
+        @export("mylib_answer")
+        answer(n: i32) -> i32 = used.double(n) + spare.thing()
+        """
+
+    val lib = ext_two_module_lib(ext_spare_export())
+    val root = ext_root_of("mylib", program)
+    val ir = ext_emitted(root, lib)
+
+    assert(ext_defines_name(ir, "spare_thing"), ir)
+    ext_cleanup([lib, root])
+end ext_dep_export_kept_reached
+
+// An `import` is a reference like any other, and it is what a module holding nothing but an exported
+// C entry has instead of a call.
+@test("including where the only reference is an 'import'")
+ext_dep_export_kept_by_import()
+    if !ext_ready() then return
+
+    val lib = ext_two_module_lib(ext_spare_export())
+    val root = ext_root_of("mylib", ext_importing_spare())
+    val ir = ext_emitted(root, lib)
+
+    assert(ext_defines_name(ir, "spare_thing"), ir)
+    ext_cleanup([lib, root])
+end ext_dep_export_kept_by_import
+
+// The header is written from the pruned tree, so it says what the archive does.
+@test("and the header does not declare it either")
+ext_dep_export_not_in_header()
+    if !ext_ready() then return
+
+    val lib = ext_two_module_lib(ext_spare_export())
+    val root = ext_root_of("mylib", ext_using_used())
+    val got = ext_run(["sysl", "emit-header", root, "--lib", lib])
+
+    assert(got.0 == 0, got.1)
+    assert(ext_has(got.1, "mylib_answer"), got.1)
+    assert(!ext_has(got.1, "spare_thing"), got.1)
+    ext_cleanup([lib, root])
+end ext_dep_export_not_in_header
+
+// Counted rather than looked for: the program has a `main` of its own, so the symbol is present
+// either way, and a second one is a module with two `define`s of it.
+@test("so a package carrying its own program no longer hands every consumer a second 'main'")
+ext_dep_main_not_a_second_main()
+    if !ext_ready() then return
+
+    val lib = ext_two_module_lib("module spare\n\n@export(\"main\")\nrun() -> i32 = 0\n")
+    val root = ext_root_of("mylib", ext_using_used())
+    val ir = ext_emitted(root, lib)
+
+    assert(ext_defines_name(ir, "mylib_answer"), ir)
+    assert_eq(ext_mains(ir), 1)
+    ext_cleanup([lib, root])
+end ext_dep_main_not_a_second_main
+
+// The closure and not the direct edges: the program names `used`, `used` names `middle`.
+@test("and a module reached only through another dependency is reached")
+ext_dep_reached_through_another()
+    if !ext_ready() then return
+
+    val lib = ext_lib_of("used", "module used\n\ndouble(n: i32) -> i32 = middle.step(n)\n",
+                         "middle", "module middle\n\n@export(\"middle_thing\")\nstep(n: i32) -> i32 = n * 2\n")
+    val root = ext_root_of("mylib", ext_using_used())
+    val ir = ext_emitted(root, lib)
+
+    assert(ext_defines_name(ir, "middle_thing"), ir)
+    ext_cleanup([lib, root])
+end ext_dep_reached_through_another
+
+// The edge has a direction: `spare` imports `used`, which the program reaches, and that does not
+// make `spare` reached.
+@test("while a module that imports a reached one is not itself reached")
+ext_dep_importer_not_reached()
+    if !ext_ready() then return
+
+    val lib = ext_two_module_lib("module spare\n\n@export(\"spare_thing\")\nthing() -> i32 = used.double(1)\n")
+    val root = ext_root_of("mylib", ext_using_used())
+    val ir = ext_emitted(root, lib)
+
+    assert(!ext_defines_name(ir, "spare_thing"), ir)
+    ext_cleanup([lib, root])
+end ext_dep_importer_not_reached
+
+// The rule qualifies a dependency's export and nothing else.
+@test("while two of the program's own exports claiming one symbol are still refused")
+ext_own_duplicate_exports_refused()
+    if !ext_ready() then return
+
+    val program = raw"""
+        module mylib
+
+        @export("mylib_answer")
+        answer() -> i32 = 1
+
+        @export("mylib_answer")
+        other() -> i32 = 2
+        """
+
+    val lib = ext_two_module_lib(ext_spare_export())
+    val root = ext_root_of("mylib", program)
+    val got = ext_run(["sysl", "emit-llvm", root, "--lib", lib])
+
+    assert(got.0 != 0, got.1)
+    assert(ext_has(got.1, "'mylib_answer' is exported by"), got.1)
+    ext_cleanup([lib, root])
+end ext_own_duplicate_exports_refused
+
+// -- the other roots in a '--lib' source tree are qualified the same way --------------------------
+
+@test("a '@section' definition is dropped where nothing reaches its module")
+ext_dep_section_dropped()
+    if !ext_ready() then return
+
+    val lib = ext_two_module_lib(ext_section_module())
+    val root = ext_root_of("mylib", ext_using_used())
+    val ir = ext_emitted(root, lib)
+
+    assert(!ext_defines_name(ir, ext_placed()), ir)
+    assert(!ext_has(ir, ".ramfunc"), ir)
+    ext_cleanup([lib, root])
+end ext_dep_section_dropped
+
+@test("and is kept where the program does reach it")
+ext_dep_section_kept()
+    if !ext_ready() then return
+
+    val program = raw"""
+        module mylib
+
+        @export("mylib_answer")
+        answer(n: i32) -> i32 = used.double(n) + spare.placed()
+        """
+
+    val lib = ext_two_module_lib(ext_section_module())
+    val root = ext_root_of("mylib", program)
+    val ir = ext_emitted(root, lib)
+
+    assert(ext_defines_name(ir, ext_placed()), ir)
+    assert(ext_has(ir, ".ramfunc"), ir)
+    ext_cleanup([lib, root])
+end ext_dep_section_kept
+
+@test("an interrupt handler is dropped where nothing reaches its module")
+ext_dep_handler_dropped()
+    if !ext_ready() then return
+
+    val lib = ext_two_module_lib(ext_handler_module())
+    val root = ext_root_of("mylib", ext_using_used())
+    val ir = ext_emitted_for(root, lib, "riscv64-freestanding")
+
+    assert(!ext_defines_name(ir, "spare" + "$" + "timer"), ir)
+    ext_cleanup([lib, root])
+end ext_dep_handler_dropped
+
+// An `import` and nothing else, which is what a consumer wanting a package's handler writes.
+@test("and an 'import' is enough to keep it")
+ext_dep_handler_kept_by_import()
+    if !ext_ready() then return
+
+    val lib = ext_two_module_lib(ext_handler_module())
+    val root = ext_root_of("mylib", ext_importing_spare())
+    val ir = ext_emitted_for(root, lib, "riscv64-freestanding")
+
+    assert(ext_defines_name(ir, "spare" + "$" + "timer"), ir)
+    ext_cleanup([lib, root])
+end ext_dep_handler_kept_by_import
+
+@test("a destructor is dropped where nothing reaches its module")
+ext_dep_destructor_dropped()
+    if !ext_ready() then return
+
+    val lib = ext_two_module_lib(ext_dropping_module())
+    val root = ext_root_of("mylib", ext_using_used())
+    val ir = ext_emitted(root, lib)
+
+    assert(!ext_defines_name(ir, "spare" + "$" + "Handle.drop"), ir)
+    ext_cleanup([lib, root])
+end ext_dep_destructor_dropped
+
+// The control: a destructor pruned where something can release a box of that payload is a link error
+// against a name no line of the program contains.
+@test("while one whose module the program reaches survives")
+ext_dep_destructor_survives()
+    if !ext_ready() then return
+
+    val program = raw"""
+        module mylib
+
+        @export("mylib_answer")
+        answer(n: i32) -> i32 = used.double(n) + spare.make().n
+        """
+
+    val lib = ext_two_module_lib(ext_dropping_module())
+    val root = ext_root_of("mylib", program)
+    val ir = ext_emitted(root, lib)
+
+    assert(ext_defines_name(ir, "spare" + "$" + "Handle.drop"), ir)
+    ext_cleanup([lib, root])
+end ext_dep_destructor_survives
+
+// Over-pruning a destructor is a link error rather than a size cost, so this one builds and runs: the
+// type is reached through another of the package's modules and never named by the program.
+@test("a destructor reached only through another dependency module still runs")
+ext_dep_destructor_through_another_runs()
+    if !ext_ready() then return
+
+    val lib = ext_lib_of("used", "module used\n\nmake() -> &spare.Handle = spare.Handle(1)\n",
+                         "spare", ext_dropping_module())
+
+    val dir = make_temp_dir("sysl-ext-").unwrap()
+
+    val src = raw"""
+        hold()
+            var h = used.make()
+            print("held", h.n)
+
+        hold()
+        print("out")
+        """
+
+    write_text(s"$dir/main.sysl", src).unwrap()
+
+    val got = ext_run(["sysl", "build", s"$dir/main.sysl", "--lib", lib, "-o", s"$dir/built"])
+
+    assert(got.0 == 0, got.1)
+
+    val ran = capture(s"$dir/built", [], "", [], true, 20).unwrap()
+
+    assert(ext_exited_zero(ran.status), ran.err.unwrap_or(ran.text))
+    assert_eq(ran.text, "held 1\ngone 1\nout\n")
+    ext_cleanup([lib, dir])
+end ext_dep_destructor_through_another_runs
+
+// An export kept alive by a second attribute: counted, since the program has a `main` of its own.
+@test("and an export kept alive by a second attribute no longer defeats the export rule")
+ext_dep_export_with_section_dropped()
+    if !ext_ready() then return
+
+    val lib = ext_two_module_lib("module spare\n\n@section(\".ramfunc\")\n@export(\"main\")\nplaced() -> i32 = 7\n")
+    val root = ext_root_of("mylib", ext_using_used())
+    val ir = ext_emitted(root, lib)
+
+    assert_eq(ext_mains(ir), 1)
+    ext_cleanup([lib, root])
+end ext_dep_export_with_section_dropped
+
+@test("the same for an export carried by a handler")
+ext_dep_export_with_handler_dropped()
+    if !ext_ready() then return
+
+    val lib = ext_two_module_lib(
+        "module spare\n\nextern \"ack\" ack()\n\n@export(\"SysTick_Handler\")\ninterrupt timer()\n    ack()\n")
+    val root = ext_root_of("mylib", ext_using_used())
+    val ir = ext_emitted_for(root, lib, "riscv64-freestanding")
+
+    assert(!ext_defines_name(ir, "SysTick_Handler"), ir)
+    ext_cleanup([lib, root])
+end ext_dep_export_with_handler_dropped
+
+// The reference refuses `--std-lib` here alone, in its own words -- *"build-c compiles the standard
+// module into what it writes, since a C link line cannot carry a '.syslib' -- so --std-lib has nothing
+// to name here"*. This compiler names no `.syslib` on any command (a `.syslib` is its private cache),
+// so every command refuses the flag in one sentence, and `build-c` is one of them.
+@test("naming a prebuilt standard module is refused, since a C link line cannot carry one")
+ext_build_c_refuses_std_lib()
+    val root = ext_root_of("mylib", "module mylib\n\n@export(\"mylib_add\")\nadd(a: i32, b: i32) -> i32 = a + b\n")
+    val got = ext_run(["sysl", "build-c", root, "-o", s"$root/libmylib.a", "--std-lib", s"$root/std.syslib"])
+
+    assert(got.0 != 0, got.1)
+    assert(ext_has(got.1, "--std-lib"), got.1)
+    ext_cleanup([root])
+end ext_build_c_refuses_std_lib
+
+// -- ExportTypeRunTests: an exported `type`, used from the sysl side -------------------------------
+
+@test("an exported scalar mixes with its base in both directions, with no conversion written")
+ext_exported_scalar_mixes_with_its_base()
+    if !ext_ready() then return
+
+    val src = raw"""
+        @export("value")
+        type Handle = u64
+
+        bump(h: Handle) -> u64 = h + 1
+
+        val a: u64 = bump(41)
+        val b: Handle = a
+        print(a, b * 2)
+        """
+
+    assert_eq(ext_ran(src), "42 84\n")
+end ext_exported_scalar_mixes_with_its_base
+
+@test("an exported pointer is selected through, indexed, dereferenced and handed on as the pointer it is",
+      ignore: "analysis accepts it; the lowering of an index or slice through an exported pointer alias is a gap, so the entry body is left out and the link has no _main")
+ext_exported_pointer_is_the_pointer()
+    if !ext_ready() then return
+
+    val src = raw"""
+        struct Vm
+            base: u64
+            xs: [4]i32
+
+        @export("vm_ref")
+        type VmRef = *Vm
+
+        @export("bytes_t")
+        type Bytes = *u8
+
+        plain(v: *Vm) -> u64 = v.base
+
+        var vm: Vm = Vm(100, [1, 2, 3, 4])
+        val p: VmRef = &vm
+        p.base = p.base + 1
+        p.xs[2] = 30
+        print(p.base, p.xs[2], (*p).base, plain(p))
+
+        var arr: [3]u8 = [7, 8, 9]
+        val b: Bytes = &arr[0]
+        b[1] = 80
+        print(b[1], arr[1])
+        val view = b[0..<3]
+        print(view.len, view[2])
+        """
+
+    assert_eq(ext_ran(src), "101 30 101 101\n80 80\n3 9\n")
+end ext_exported_pointer_is_the_pointer
+
+private ext_h_header() -> string = "import sysl.buf.{Buf, buf}\n\n@export(\"h_t\")\ntype H = u64\n\n"
+
+@test("a Buf of it beside a Buf of the base, the alias met first")
+ext_exported_buf_alias_first()
+    if !ext_ready() then return
+
+    val src = raw"""
+        sum(b: *Buf[u64]) -> u64 = b.at(0) + b.at(1)
+
+        main()
+            var a: Buf[H] = buf()
+            a.push(1)
+            a.push(2)
+            var b: Buf[u64] = buf()
+            b.push(10)
+            b.push(20)
+            print(sum(&a), sum(&b), a.at(1) + b.at(0))
+        """
+
+    assert_eq(ext_ran(ext_h_header() + src), "3 30 12\n")
+end ext_exported_buf_alias_first
+
+@test("and the base met first")
+ext_exported_buf_base_first()
+    if !ext_ready() then return
+
+    val src = raw"""
+        sum(b: *Buf[H]) -> H = b.at(0) + b.at(1)
+
+        main()
+            var b: Buf[u64] = buf()
+            b.push(10)
+            b.push(20)
+            var a: Buf[H] = buf()
+            a.push(1)
+            a.push(2)
+            print(sum(&a), sum(&b), b.at(1) + a.at(0))
+        """
+
+    assert_eq(ext_ran(ext_h_header() + src), "3 30 21\n")
+end ext_exported_buf_base_first
+
+@test("a pointer to it is taken from a place of the base, and handed back as one")
+ext_exported_pointer_from_base_place()
+    if !ext_ready() then return
+
+    val src = raw"""
+        first(p: *H) -> H = p[0]
+        firstBase(p: *u64) -> u64 = p[0]
+
+        main()
+            var b: Buf[u64] = buf()
+            b.push(2)
+            val p: *H = &b.elems[0]
+            val q: *u64 = p
+            print(first(p) + b.at(0))
+            p[0] = 5
+            print(first(q), firstBase(p))
+        """
+
+    assert_eq(ext_ran(ext_h_header() + src), "4\n5 5\n")
+end ext_exported_pointer_from_base_place
+
+@test("a type parameter solved from it is solved to the base")
+ext_exported_type_parameter_solved_to_base()
+    if !ext_ready() then return
+
+    val src = raw"""
+        struct Vm
+            base: u64
+
+        @export("vm_ref")
+        type VmRef = *Vm
+
+        load[T](p: *T) -> T = *p
+        same[T](a: T, b: T) -> T = b
+
+        main()
+            var vm: Vm = Vm(7)
+            val r: VmRef = &vm
+            val h: H = 3
+            val n: u64 = 4
+            print(load(r).base, same(h, n), same(n, h))
+        """
+
+    assert_eq(ext_ran(ext_h_header() + src), "7 4 3\n")
+end ext_exported_type_parameter_solved_to_base
+
+// A narrowed type checks what is written into it, so a pointer to one is not a pointer to its base.
+@test("a narrowed type keeps its own identity behind a pointer")
+ext_narrowed_pointer_keeps_identity()
+    if !ext_ready() then return
+
+    val src = raw"""
+        type Small = u64 where value < 100
+
+        main()
+            var x: u64 = 500
+            val p: *Small = &x
+            print(p[0])
+        """
+
+    val said = ext_err(src)
+
+    assert(ext_has(said, "declared *Small but the value is *ulong"), said)
+end ext_narrowed_pointer_keeps_identity
+
+private ext_small_header() -> string = "import sysl.buf.{Buf, buf}\n\ntype Small = u64 where value < 100\n\n"
+
+@test("the narrowed type met first")
+ext_narrowed_buf_narrowed_first()
+    if !ext_ready() then return
+
+    val src = raw"""
+        main()
+            var a: Buf[Small] = buf()
+            a.push(1)
+            var b: Buf[u64] = buf()
+            b.push(200)
+            print(a.at(0) + b.at(0))
+        """
+
+    assert_eq(ext_ran(ext_small_header() + src), "201\n")
+end ext_narrowed_buf_narrowed_first
+
+@test("and the base met first")
+ext_narrowed_buf_base_first()
+    if !ext_ready() then return
+
+    val src = raw"""
+        main()
+            var b: Buf[u64] = buf()
+            b.push(200)
+            var a: Buf[Small] = buf()
+            a.push(1)
+            print(b.at(0) + a.at(0))
+        """
+
+    assert_eq(ext_ran(ext_small_header() + src), "201\n")
+end ext_narrowed_buf_base_first
+
+@test("a plain alias beside them is still its base's instantiation")
+ext_plain_alias_beside_narrowed()
+    if !ext_ready() then return
+
+    val src = raw"""
+        type H = u64
+
+        sum(b: *Buf[u64]) -> u64 = b.at(0) + b.at(1)
+
+        main()
+            var a: Buf[Small] = buf()
+            a.push(1)
+            var h: Buf[H] = buf()
+            h.push(300)
+            h.push(4)
+            var b: Buf[u64] = buf()
+            b.push(200)
+            b.push(5)
+            print(a.at(0), sum(&h), sum(&b))
+        """
+
+    assert_eq(ext_ran(ext_small_header() + src), "1 304 205\n")
+end ext_plain_alias_beside_narrowed
+
+@test("an exported function pointer is called through as one")
+ext_exported_function_pointer_called()
+    if !ext_ready() then return
+
+    val src = raw"""
+        @export("on_event")
+        type OnEvent = *extern(i32) -> i32
+
+        @export
+        twice(n: i32) -> i32 = n * 2
+
+        apply(f: OnEvent, n: i32) -> i32 = f(n)
+
+        val f: OnEvent = &twice
+        print(f(21), apply(f, 5))
+        """
+
+    assert_eq(ext_ran(src), "42 10\n")
+end ext_exported_function_pointer_called
