@@ -210,7 +210,7 @@ import_refusals(a: &Analysis, scope: Scope, span: Span, d: ImportDecl,
     // **A wildcard is over a module's members**, so there has to be a module to have them. An import
     // IS a dependency, whether or not anything below it names what was brought in.
     if d.wildcard
-        if a.tables.has_module(path) then depends_on_module(a, scope, path, span)
+        if a.tables.has_module(path) then depends_on_module(a, scope, path, span, true)
         else out.push((span, s"no module is called '$written'"))
 
         return out
@@ -256,7 +256,7 @@ end import_refusals
 // already true**, so it is left alone rather than reported as the collision with itself it is.
 private import_module(a: &Analysis, scope: Scope, at: Span, bound: string, home: string,
                       taken: *Buf[string], out: *Buf[(Span, string)])
-    depends_on_module(a, scope, home, at)
+    depends_on_module(a, scope, home, at, true)
 
     if bound != home then import_name_free(a, scope, at, bound, taken, out)
 
@@ -266,7 +266,7 @@ private import_module(a: &Analysis, scope: Scope, at: Span, bound: string, home:
 // at whatever later names it: the clause is the mistake, and it is the line a reader has to change.
 private import_name(a: &Analysis, scope: Scope, at: Span, bound: string, home: string, name: string,
                     taken: *Buf[string], out: *Buf[(Span, string)])
-    depends_on_module(a, scope, home, at)
+    depends_on_module(a, scope, home, at, true)
 
     if !import_name_free(a, scope, at, bound, taken, out) then return
 
@@ -326,7 +326,7 @@ depends_on(a: &Analysis, scope: Scope, key: string, span: Span) =
 // edge lands at the line that made it rather than anywhere either module states anything. A bare
 // name resolving to another module carries no span of its own, so such a reference records the file
 // and nothing more, and a later reference that does have one fills the position in.
-depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span)
+depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span, imported: bool = false)
     val from = scope.module_name
 
     if to == from || to == ModuleRoot || !a.tables.has_module(to) then return
@@ -335,7 +335,7 @@ depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span)
     // may have said where it is (`Tables.reference_at`).
     val span = if written.is_empty() then a.tables.reference_at else written
 
-    note_capability_ref(a, scope, from, to, span)
+    note_capability_ref(a, scope, from, to, span, imported)
 
     for i in 0..<a.tables.module_deps.len()
         if a.tables.module_deps.at(i).0 == from
@@ -364,7 +364,8 @@ depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span)
 // as its bodies -- and so is a `@test` function written beside what it tests. A reference inside a
 // declaration that wrote `@needs(...)` carries what that declaration needs, since reaching the
 // declaration is what is charged for it.
-private note_capability_ref(a: &Analysis, scope: Scope, from: string, to: string, span: Span)
+private note_capability_ref(a: &Analysis, scope: Scope, from: string, to: string, span: Span,
+                            imported: bool)
     val needs = a.tables.reaching_needs
     val scaffolding = a.tables.reaching_test || test_only_file(a, scope.src.name)
 
@@ -372,14 +373,16 @@ private note_capability_ref(a: &Analysis, scope: Scope, from: string, to: string
         val r = a.tables.capability_refs.at(i)
 
         if r.from != from || r.to != to || r.scaffolding != scaffolding then continue
+        if r.imported != imported then continue
         if !same_strings(r.needs, needs) then continue
 
         if r.span.is_empty() && !span.is_empty() then
-            a.tables.capability_refs.set(i, CapabilityRef(from, to, scope, span, needs, scaffolding))
+            a.tables.capability_refs.set(i, CapabilityRef(from, to, scope, span, needs, scaffolding,
+                                                          imported))
 
         return
 
-    a.tables.capability_refs.push(CapabilityRef(from, to, scope, span, needs, scaffolding))
+    a.tables.capability_refs.push(CapabilityRef(from, to, scope, span, needs, scaffolding, imported))
 end note_capability_ref
 
 private same_strings(xs: Buf[string], ys: Buf[string]) -> bool
@@ -602,8 +605,11 @@ private resolve_signatures(a: &Analysis)
         val enums = a.tables.enum_insts.len()
         val constrained = a.tables.constrained_insts.len()
 
+        val covered = enter_signature(a, f.decl.needs)
+
         resolve_func_signature(a, f.scope, f.decl.tparams, f.decl.bounds, f.decl.tvalues,
                                f.decl.tpacks, f.decl.params, f.decl.ret_type)
+        leave_reaching(a, covered)
 
         if generic
             a.release(trial)
@@ -616,10 +622,14 @@ private resolve_signatures(a: &Analysis)
         val d = a.tables.externs.get(key).unwrap()
         val scope = scope_of_key(a, key)
 
+        val covered = enter_signature(a, d.needs)
+
         for j in 0..<d.params.len()
             resolve_type(a, scope, d.params.at(j).typ, no_bindings())
 
         if d.ret_type.is_some() then resolve_type(a, scope, d.ret_type.unwrap(), no_bindings())
+
+        leave_reaching(a, covered)
 
     // **Module storage is deliberately absent from this, and its written type is resolved where the
     // storage itself is read.** Resolving it here would make every type a module's storage names
@@ -932,18 +942,22 @@ private check_exposed_types(a: &Analysis)
 
     for i in 0..<a.tables.funcs.len()
         val f = a.tables.funcs.at(i)
+        val covered = enter_signature(a, f.decl.needs)
 
         check_exposed_signature(a, f.scope, f.decl.name, f.decl.vis, f.decl.params, f.decl.ret_type,
                                 f.decl.bounds, f.decl.tparams)
+        leave_reaching(a, covered)
 
     // **An `extern` is held to the rule all the same**: what the linker resolves is beside the
     // point, since the hole is a module holding a value whose type it cannot write.
     for i in 0..<a.tables.externs.len()
         val key = a.tables.externs.key_at(i)
         val d = a.tables.externs.get(key).unwrap()
+        val covered = enter_signature(a, d.needs)
 
         check_exposed_signature(a, scope_of_key(a, key), d.name, d.vis, d.params, d.ret_type, buf(),
                                 buf())
+        leave_reaching(a, covered)
 
     // The declarations that are a **name and one type**. They carry no signature, so the hole is
     // reached by a shorter route than a function's, and it is the same hole. A `const` cannot

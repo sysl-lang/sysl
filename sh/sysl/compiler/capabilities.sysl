@@ -496,16 +496,45 @@ end declared_needs
 // asked for from inside a call -- is its own declaration's and not the caller's.
 enter_reaching(a: &Analysis, d: FuncDecl) -> (Buf[string], bool)
     val saved = (a.tables.reaching_needs, a.tables.reaching_test)
+
+    a.tables.reaching_needs = covered_by(d.needs)
+    a.tables.reaching_test = d.test.is_some()
+    saved
+end enter_reaching
+
+// What a declaration's `@needs(...)` covers, implications folded in. A name nothing has heard of
+// covers nothing; `check_needs_names` refuses it.
+private covered_by(written: Buf[string]) -> Buf[string]
     var needs: Buf[string] = buf()
     val core = capability_core()
 
     for i in 0..<core.len()
-        if needs_capability(d.needs, core.at(i)) then needs.push(core.at(i))
+        if needs_capability(written, core.at(i)) then needs.push(core.at(i))
 
-    a.tables.reaching_needs = needs
-    a.tables.reaching_test = d.test.is_some()
+    needs
+end covered_by
+
+// Says that what is about to be resolved is the SIGNATURE of a declaration needing `needs`, which is
+// covered exactly as its body is: a parameter or result naming a type of a gated module is something
+// only a caller of the declaration meets. **What the declaration covers replaces what the enclosing
+// reading covered** -- a signature is its declaration's own, wherever the request to resolve it came
+// from. `leave_reaching` puts back what was there.
+enter_signature(a: &Analysis, needs: Buf[string]) -> (Buf[string], bool)
+    val saved = (a.tables.reaching_needs, a.tables.reaching_test)
+
+    a.tables.reaching_needs = covered_by(needs)
     saved
-end enter_reaching
+end enter_signature
+
+// One type of a declaration's signature, resolved under that declaration's `@needs(...)`.
+signature_type(a: &Analysis, needs: Buf[string], scope: Scope, written: TypeRef,
+               subst: Buf[Binding]) -> Type
+    val saved = enter_signature(a, needs)
+    val ty = resolve_type(a, scope, written, subst)
+
+    leave_reaching(a, saved)
+    ty
+end signature_type
 
 leave_reaching(a: &Analysis, saved: (Buf[string], bool))
     a.tables.reaching_needs = saved.0
@@ -730,7 +759,8 @@ private environment_requirements(a: &Analysis) -> Buf[(string, string)]
             for k in 0..<out.len()
                 val cap = out.at(k).1
 
-                if out.at(k).0 != r.to || holds_string(r.needs, cap) || holds_pair(out, r.from, cap) then
+                if out.at(k).0 != r.to || holds_string(effective_needs(a, r), cap) ||
+                   holds_pair(out, r.from, cap) then
                     continue
 
                 out.push((r.from, cap))
@@ -738,6 +768,49 @@ private environment_requirements(a: &Analysis) -> Buf[(string, string)]
 
     out
 end environment_requirements
+
+// What a reference covers, an `import` being charged by its uses.
+//
+// **An import is charged by what the references along its edge are charged with**: a file that
+// imports `sysl.fs.write_bytes` for its one `@needs(os)` function has said what that function may
+// write, not that the module reads files. So an import covers whatever EVERY shipping reference
+// along the same edge covers -- nothing, the moment one of them sits in a declaration that wrote no
+// `@needs`, which then charges the module at the import as it always did. An import nothing
+// references is charged as written, there being no use to read it by.
+private effective_needs(a: &Analysis, r: CapabilityRef) -> Buf[string]
+    if !r.imported then return r.needs
+
+    var lifted: Option[Buf[string]] = None
+
+    for i in 0..<a.tables.capability_refs.len()
+        val u = a.tables.capability_refs.at(i)
+
+        if u.from != r.from || u.to != r.to || u.imported || u.scaffolding then continue
+
+        if lifted.is_none()
+            lifted = Some(u.needs)
+            continue
+
+        var both: Buf[string] = buf()
+
+        for j in 0..<u.needs.len()
+            if holds_string(lifted.unwrap(), u.needs.at(j)) then both.push(u.needs.at(j))
+
+        lifted = Some(both)
+
+    var out: Buf[string] = buf()
+
+    for i in 0..<r.needs.len()
+        out.push(r.needs.at(i))
+
+    if lifted.is_some()
+        val more = lifted.unwrap()
+
+        for i in 0..<more.len()
+            if !holds_string(out, more.at(i)) then out.push(more.at(i))
+
+    out
+end effective_needs
 
 // The capability one reference is refused for, which is the least by name where it is refused for
 // more than one -- so the message does not vary between runs with the order a table happens to be in.
@@ -751,11 +824,12 @@ end environment_requirements
 private refused_for(a: &Analysis, e: CapabilityRef, needed: Buf[(string, string)]) -> Option[string]
     val core = capability_core()
     val ours = !from_library(a, e.scope) && !holds_string(a.tables.supplied_modules, e.from)
+    val covers = effective_needs(a, e)
 
     for i in 0..<core.len()
         val cap = core.at(i)
 
-        if !is_environment(cap) || holds_string(e.needs, cap) then continue
+        if !is_environment(cap) || holds_string(covers, cap) then continue
         if !holds_pair(needed, e.to, cap) then continue
         if module_narrowed(a, e.from, cap) then return Some(cap)
         if ours && a.tables.target.lacks_capability(cap) then return Some(cap)
