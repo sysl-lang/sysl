@@ -366,7 +366,8 @@ end stored_names
 private width_of(cx: &Analyzer, name: string) -> Option[Type] =
     width_type(cx.an, cx.scope, Span(0, 0), name)
 
-// `T::Min` and `T::Max` on a built-in integer.
+// `T::Min` and `T::Max` on a built-in integer -- written by name, or reached through a type parameter
+// the instantiation bound to one, which is the nearer binding and so is asked first.
 private const_type_attr(cx: &Analyzer, receiver: Expr, attr: string) -> Option[Const]
     val name = *receiver.kind match
         Ident(n) -> Some(n)
@@ -374,7 +375,8 @@ private const_type_attr(cx: &Analyzer, receiver: Expr, attr: string) -> Option[C
 
     if name.is_none() then return None
 
-    val t = scalar_named(name.unwrap(), word_bits(cx)).or_else(() -> width_of(cx, name.unwrap()))
+    val written = scalar_named(name.unwrap(), word_bits(cx)).or_else(() -> width_of(cx, name.unwrap()))
+    val t = bound_type(cx.subst, name.unwrap()).or_else(() -> written)
 
     if t.is_none() then return None
 
@@ -532,6 +534,7 @@ private awaits_instantiation(cx: &Analyzer, e: Expr) -> bool = *e.kind match
     LayoutOf(_, t) -> is_abstract_underlying(resolve_type(cx.an, cx.scope, t, cx.subst))
     OffsetOf(t, _) -> is_abstract_underlying(resolve_type(cx.an, cx.scope, t, cx.subst))
     Ident(n) -> binding_is_abstract(cx.subst, n)
+    TypeAttr(receiver, _) -> awaits_instantiation(cx, receiver)
     Unary(_, operand) -> awaits_instantiation(cx, operand)
     Binary(_, l, r) -> awaits_instantiation(cx, l) || awaits_instantiation(cx, r)
     Compare(operands, _) ->
