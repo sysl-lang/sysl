@@ -1,0 +1,748 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The reference's `DeferTests`, second half: a jump written INSIDE a deferred statement, and a
+// deferred statement that declares a local in a block with more than one exit
+// (`reference/memory.md § Where defer sits`). `tests_defer.sysl` holds the first half.
+//
+// A deferred statement is laid down once for each edge that leaves its block. So a jump that
+// leaves the deferred statement -- a `return`, or a `break`/`continue` of a loop already open where
+// the `defer` stands -- has nothing to be lowered to, and is refused at the jump, at whatever depth
+// it is written; a jump to a loop written inside the statement is ordinary. And a local the
+// statement declares is declared once per copy: the copies share its slot, and where the address
+// is a register (a `ref`, an array moved to a buffer) each later copy takes `.d1`, `.d2`.
+//
+// **Every output and diagnostic here was read out of the reference compiler (0.0.156)** by
+// handing the installed `sysl` the same program. Positions are the reference's `line:column`.
+
+// What a program does: what it printed and the status it exited with. A failure to build is its
+// message and `-1`, which no program exits with.
+private dfx_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-dfx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end dfx_outcome
+
+// The program runs to the end and prints exactly this. Returns at once without the library.
+private dfx_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = dfx_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+// The build is refused with this message and no other, anchored at this `line:column`.
+private dfx_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val out = dfx_outcome(text)
+    val said = out.0
+
+    assert_eq(out.1, -1)
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+    val first = said.index_of("error: ").unwrap_or(0)
+
+    assert(!said[first + 7..<said.len].contains("error: "), said)
+end dfx_refused
+
+// The program's whole lowered text, or nothing without the library.
+private dfx_ir(text: string) -> Option[string]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-dfx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val made = emit_llvm_text(root, None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    made match
+        Err(why) ->
+            assert(false, failure_text(why))
+            None
+        Ok(emitted) ->
+            assert(emitted.report.is_empty(), analysis_report(emitted.report))
+            Some(emitted.text)
+end dfx_ir
+
+// How many times `piece` occurs in `text`, overlapping occurrences included.
+private dfx_count(text: string, piece: string) -> int
+    var n = 0
+    var from: usize = 0
+
+    loop
+        text[from..<text.len].index_of(piece) match
+            None -> break
+            Some(at) ->
+                n += 1
+                from = from + at + 1
+
+    n
+end dfx_count
+
+private dfx_loop_edge() -> string =
+    "a deferred statement runs while its block is being left, so it cannot 'break' or 'continue' " +
+        "— the loop edge it would take is the one already being taken"
+
+private dfx_no_exit() -> string =
+    "a deferred statement runs while its block is being left, so it cannot 'return' — there is " +
+        "no exit left to take. Compute what the function returns before the block ends"
+
+private dfx_no_frame_left() -> string =
+    "'become' replaces this frame with the call's, and this function has a 'defer', which runs " +
+        "on the way out of its scope — and the jump is the way out, so there would be nowhere " +
+        "left to run it"
+
+// -- a jump that leaves the deferred statement, written inside it ----------------------------------
+
+@test("a 'break' of the loop around a deferred 'if' is refused where it stands")
+dfx_break_under_a_deferred_if()
+    dfx_refused(raw"""
+        for i in 0..<3
+            defer if i == 1 then break
+            print(i)
+        """, dfx_loop_edge(), "2:26")
+
+@test("a 'return' under a deferred 'if' is refused where it stands")
+dfx_return_under_a_deferred_if()
+    dfx_refused(raw"""
+        f(c: bool) -> int
+            defer if c then return 1
+            2
+
+        print(f(true))
+        """, dfx_no_exit(), "2:21")
+
+@test("a 'continue' of the loop around a deferred 'if' is refused")
+dfx_continue_under_a_deferred_if()
+    dfx_refused(raw"""
+        for i in 0..<3
+            defer if i == 1 then continue
+            print(i)
+        """, dfx_loop_edge(), "2:26")
+
+@test("a labelled 'break' of an outer loop from a loop inside the deferred statement is refused")
+dfx_labelled_break_of_an_outer_loop()
+    dfx_refused(raw"""
+        'outer for i in 0..<3
+            defer for j in 0..<3
+                if j == 1 then break 'outer
+
+            print(i)
+        """, dfx_loop_edge(), "3:24")
+
+@test("a labelled 'continue' of an outer loop is refused the same way")
+dfx_labelled_continue_of_an_outer_loop()
+    dfx_refused(raw"""
+        'outer for i in 0..<3
+            defer for j in 0..<3
+                if j == 1 then continue 'outer
+
+            print(i)
+        """, dfx_loop_edge(), "3:24")
+
+@test("a 'return' several statements deep in a deferred block is refused at the 'return'")
+dfx_return_several_statements_deep()
+    dfx_refused(raw"""
+        f(c: bool) -> int
+            defer if c
+                print("a")
+                print("b")
+
+                for j in 0..<2
+                    print(j)
+                    if j == 1 then return 7
+
+                print("c")
+
+            2
+
+        print(f(true))
+        """, dfx_no_exit(), "8:28")
+
+@test("two jumps in one deferred statement are one refusal, of the first in source order")
+dfx_two_jumps_are_one_refusal()
+    dfx_refused(raw"""
+        f(n: int) -> int
+            for i in 0..<n
+                defer if i == 1 then break else if i == 2 then return 5
+                print(i)
+
+            2
+
+        print(f(3))
+        """, dfx_loop_edge(), "3:30")
+
+@test("a 'return' in an arm of a deferred 'match' is refused")
+dfx_return_in_a_deferred_match_arm()
+    dfx_refused(raw"""
+        f(n: int) -> int
+            defer n match
+                0 -> print("zero")
+                _ -> return 9
+
+            2
+
+        print(f(1))
+        """, dfx_no_exit(), "4:14")
+
+@test("a 'return' in a 'defer' written inside a deferred statement is one refusal")
+dfx_return_in_a_nested_defer()
+    dfx_refused(raw"""
+        f(c: bool) -> int
+            defer if c
+                defer if c then return 1
+                print("inner")
+
+            2
+
+        print(f(true))
+        """, dfx_no_exit(), "3:25")
+
+// The jump is what is wrong, so its value is not read and the loop hears nothing of it: no second
+// complaint about a loop whose `break` and `else` disagree.
+@test("a 'break' that leaves the deferred statement is refused before its value is read")
+dfx_break_refused_before_its_value_is_read()
+    dfx_refused(raw"""
+        val r = for i in 0..<3
+            defer if i == 1 then break "early"
+            print(i)
+        else 0
+
+        print(r)
+        """, dfx_loop_edge(), "2:26")
+
+// A `loop` takes its type from its breaks, and the one it has was refused unread -- so it has no
+// type to be wrong about, and nothing after it is complained of on its account.
+@test("a refused 'break' out of a 'loop' leaves the loop's result unquestioned")
+dfx_refused_break_leaves_the_loop_unquestioned()
+    dfx_refused(raw"""
+        var n = 0
+
+        val r = loop
+            defer if n > 2 then break n
+            n += 1
+
+        print(r)
+        """, dfx_loop_edge(), "4:25")
+
+@test("a 'return' under a deferred 'if' does not have its value read either")
+dfx_return_value_is_not_read()
+    dfx_refused(raw"""
+        f(c: bool) -> int
+            defer if c then return nope
+            2
+
+        print(f(true))
+        """, dfx_no_exit(), "2:21")
+
+// A refusal of another kind, and the only one: the jump names no loop at all, so there is no edge
+// it could have left by.
+@test("a 'break' under a deferred 'if' with no loop around it is told there is no loop")
+dfx_break_with_no_loop_around_it()
+    dfx_refused(raw"""
+        work(c: bool)
+            defer if c then break
+            print("body")
+
+        work(true)
+        """, "'break' is only allowed inside a loop", "2:21")
+
+@test("a deferred 'become' is refused at its call")
+dfx_deferred_become()
+    dfx_refused(raw"""
+        g(n: int) -> int = n
+        f(c: bool) -> int
+            defer become g(1)
+            2
+        print(f(true))
+        """, dfx_no_frame_left(), "3:18")
+
+@test("a 'become' under a deferred 'if' is refused the same way")
+dfx_become_under_a_deferred_if()
+    dfx_refused(raw"""
+        g(n: int) -> int = n
+        f(c: bool) -> int
+            defer if c then become g(1)
+            2
+        print(f(true))
+        """, dfx_no_frame_left(), "3:28")
+
+// -- a jump that stays inside the deferred statement -----------------------------------------------
+
+@test("a 'break' of a loop written inside it leaves that loop")
+dfx_break_of_an_inner_loop()
+    dfx_prints(raw"""
+        work()
+            defer for i in 0..<5
+                if i == 2 then break
+                print(i)
+
+            print("body")
+
+        work()
+        """, "body\n0\n1\n")
+
+@test("a 'continue' of a loop written inside it restarts that loop")
+dfx_continue_of_an_inner_loop()
+    dfx_prints(raw"""
+        work()
+            defer for i in 0..<4
+                if i == 1 then continue
+                print(i)
+
+            print("body")
+
+        work()
+        """, "body\n0\n2\n3\n")
+
+@test("a labelled jump to a loop written inside it stays inside it")
+dfx_labelled_jump_stays_inside()
+    dfx_prints(raw"""
+        work()
+            defer 'rows for i in 0..<3
+                for j in 0..<3
+                    if j == 2 then continue 'rows
+                    if i == 2 then break 'rows
+                    print(i, j)
+
+            print("body")
+
+        work()
+        """, "body\n0 0\n0 1\n1 0\n1 1\n")
+
+@test("a 'break' carrying a value out of a loop inside a deferred block gives the loop its value")
+dfx_break_with_a_value_inside()
+    dfx_prints(raw"""
+        work(c: bool)
+            defer if c
+                val hit = for j in 0..<9
+                    if j * j > 10 then break j
+                else -1
+
+                print(hit)
+
+            print("body")
+
+        work(true)
+        """, "body\n4\n")
+
+@test("a 'while' and a 'loop' written as deferred statements are left by their own 'break'")
+dfx_while_and_loop_as_deferred_statements()
+    dfx_prints(raw"""
+        work()
+            defer while true do break
+            defer loop
+                print("once")
+                break
+
+            print("body")
+
+        work()
+        """, "body\nonce\n")
+
+@test("a loop inside a deferred 'for const' is left by its own 'break'")
+dfx_loop_inside_a_deferred_for_const()
+    dfx_prints(raw"""
+        work()
+            defer for const k in 0..<2
+                for j in 0..<3
+                    if j == 1 then break
+                    print(k, j)
+
+            print("body")
+
+        work()
+        """, "body\n0 0\n1 0\n")
+
+@test("a 'return' in a closure written inside it leaves the closure")
+dfx_return_in_a_closure_inside()
+    dfx_prints(raw"""
+        twice(f: int -> int, x: int) -> int = f(f(x))
+
+        work()
+            defer print(twice((x) ->
+                if x > 3 then return 100
+                x + 3, 1))
+
+            print("body")
+
+        work()
+        """, "body\n100\n")
+
+@test("a 'return' in a nested function written inside it leaves that function")
+dfx_return_in_a_nested_function_inside()
+    dfx_prints(raw"""
+        work(c: bool)
+            defer if c
+                pick(n: int) -> int
+                    if n > 1 then return 10
+                    n
+
+                print(pick(1), pick(2))
+
+            print("body")
+
+        work(true)
+        """, "body\n1 10\n")
+
+// -- a deferred statement that declares a local, in a block with more than one exit ----------------
+
+private dfx_two_exits() -> string = raw"""
+    f(c: bool)
+        defer for j in 0..<2
+            print(j)
+        if c then return
+        print("x")
+    f(true)
+    f(false)
+    """
+
+@test("runs on each of them")
+dfx_two_exits_runs_on_each()
+    dfx_prints(dfx_two_exits(), "0\n1\nx\n0\n1\n")
+
+@test("and its copies share the one slot")
+dfx_two_exits_share_the_slot()
+    dfx_ir(dfx_two_exits()) match
+        None -> ()
+        Some(text) -> assert_eq(dfx_count(text, "%j.addr = alloca"), 1)
+
+@test("under a labelled loop left from a loop inside it")
+dfx_under_a_labelled_loop()
+    dfx_prints(raw"""
+        'outer for i in 0..<2
+            defer for j in 0..<2
+                print(i, j)
+
+            for k in 0..<2
+                if i == 1 then break 'outer
+
+            print("end", i)
+        """, "end 0\n0 0\n0 1\n1 0\n1 1\n")
+
+@test("a counted local in a deferred block is released by whichever copy ran")
+dfx_counted_local_released_by_the_copy()
+    dfx_prints(raw"""
+        struct Box
+            n: int
+
+        f(c: bool) -> int
+            defer if true
+                val b: &Box = Box(7)
+                print("box", b.n)
+
+            if c then return 1
+            2
+
+        print(f(true))
+        print(f(false))
+        """, "box 7\n1\nbox 7\n2\n")
+
+@test("a pattern binding in a deferred 'match', across 'continue', 'break' and the end of the body")
+dfx_pattern_binding_in_a_deferred_match()
+    dfx_prints(raw"""
+        for i in 0..<4
+            defer Some(i) match
+                Some(v) -> print("out", v)
+                None -> print("none")
+
+            if i == 1 then continue
+            if i == 2 then break
+            print("in", i)
+        """, "in 0\nout 0\nout 1\nout 2\n")
+
+@test("an iteration, an 'is' binding and an array in one deferred block, across three exits")
+dfx_iteration_is_binding_and_array()
+    dfx_prints(raw"""
+        f(n: int) -> Result[int, string]
+            defer if n >= 0
+                var xs: [3]int = [1, 2, 3]
+                var sum = 0
+
+                for x in xs[0..<3]
+                    sum += x
+
+                val o: Option[int] = Some(sum + n)
+
+                if o is Some(v) then print("out", v)
+
+            if n == 1 then return Ok(10)
+            if n == 2 then return Err("two")
+            Ok(0)
+
+        for i in 0..<3
+            f(i) match
+                Ok(v) -> print("ok", v)
+                Err(e) -> print("err", e)
+        """, "out 6\nok 0\nout 7\nok 10\nout 8\nerr two\n")
+
+@test("a closure in a deferred statement is built by each copy")
+dfx_closure_built_by_each_copy()
+    dfx_prints(raw"""
+        twice(f: int -> int, x: int) -> int = f(f(x))
+
+        f(c: bool)
+            defer print(twice((x) -> x + 3, 1))
+            if c then return
+            print("x")
+
+        f(true)
+        f(false)
+        """, "7\nx\n7\n")
+
+@test("a loop ahead of a closing 'return' runs once, the copy at the block's end being unreached")
+dfx_loop_ahead_of_a_closing_return()
+    dfx_prints(raw"""
+        f()
+            defer for j in 0..<2
+                print(j)
+
+            print("x")
+            return
+
+        f()
+        """, "x\n0\n1\n")
+
+@test("a 'while' with a 'variant' shares the slots its measure is kept in")
+dfx_while_with_a_variant()
+    dfx_prints(raw"""
+        f(c: bool)
+            defer if true
+                var k = 2
+
+                while k > 0
+                    variant k
+                    print(k)
+                    k -= 1
+
+            if c then return
+            print("x")
+
+        f(true)
+        f(false)
+        """, "2\n1\nx\n2\n1\n")
+
+@test("a 'defer' with a local, written inside a deferred block, runs at that block's end each time")
+dfx_defer_with_a_local_inside_a_deferred_block()
+    dfx_prints(raw"""
+        f(c: bool, d: bool)
+            defer if true
+                defer for j in 0..<2
+                    print(j)
+
+                if d
+                    print("d")
+                else
+                    print("not d")
+
+            if c then return
+            print("x")
+
+        f(true, true)
+        f(false, false)
+        """, "d\n0\n1\nx\nnot d\n0\n1\n")
+
+// -- a deferred statement whose local's address is a register, in a block with more than one exit -
+//
+// A slot can be shared by the copies of a deferred statement and a register cannot: it is defined
+// by one instruction, once. So where a local's address is a register -- a `ref`, and an array moved
+// to a buffer -- the first copy keeps the local's name and each later one takes `.d1`, `.d2`.
+
+private dfx_ref_two_exits() -> string = raw"""
+    struct P
+        a: int
+        b: int
+
+    f(c: bool)
+        var p = P(1, 2)
+
+        defer if true
+            ref r = p.b
+
+            r += 10
+            print(r)
+
+        if c then return
+        print("x")
+
+    f(true)
+    f(false)
+    """
+
+@test("a 'ref' names its place on each of them")
+dfx_ref_names_its_place_on_each()
+    dfx_prints(dfx_ref_two_exits(), "12\nx\n12\n")
+
+@test("and the second copy's address is a register of its own, read by that copy's uses")
+dfx_second_copy_address_is_its_own_register()
+    dfx_ir(dfx_ref_two_exits()) match
+        None -> ()
+        Some(text) ->
+            assert_eq(dfx_count(text, "  %r.addr = getelementptr i8, ptr "), 1)
+            assert_eq(dfx_count(text, "  %r.d1.addr = getelementptr i8, ptr "), 1)
+            assert_eq(dfx_count(text, ", ptr %r.d1.addr\n"), 3)
+            assert_eq(dfx_count(text, "%r.d2"), 0)
+
+@test("a third copy takes the next name")
+dfx_third_copy_takes_the_next_name()
+    val three = raw"""
+        struct P
+            a: int
+            b: int
+
+        f(n: int)
+            var p = P(1, n)
+
+            defer if true
+                ref r = p.b
+
+                r += 10
+                print(r)
+
+            if n == 1 then return
+            if n == 2 then return
+            print("x")
+
+        f(1)
+        f(2)
+        f(3)
+        """
+
+    dfx_prints(three, "11\n12\nx\n13\n")
+
+    dfx_ir(three) match
+        None -> ()
+        Some(text) -> assert_eq(dfx_count(text, "  %r.d2.addr = getelementptr i8, ptr "), 1)
+end dfx_third_copy_takes_the_next_name
+
+@test("a 'ref' ahead of a closing 'return' takes no second name, its second copy being unreached")
+dfx_ref_ahead_of_a_closing_return()
+    val closing = raw"""
+        struct P
+            a: int
+            b: int
+
+        f(c: bool)
+            var p = P(1, 2)
+
+            defer if true
+                ref r = p.b
+
+                if c then r += 10
+
+                print(r)
+
+            print("x")
+            return
+
+        f(true)
+        f(false)
+        """
+
+    dfx_prints(closing, "x\n12\nx\n2\n")
+
+    dfx_ir(closing) match
+        None -> ()
+        Some(text) -> assert_eq(dfx_count(text, "%r.d1"), 0)
+end dfx_ref_ahead_of_a_closing_return
+
+private dfx_array_two_exits() -> string = raw"""
+    var kept: []int = []
+
+    f(c: bool)
+        defer if true
+            var a = [1, 2, 3]
+
+            a[0] = if c then 7 else 9
+            kept = a[..]
+
+        if c then return
+        print("x")
+
+    f(true)
+    print(kept[0])
+    f(false)
+    print(kept[0])
+    """
+
+@test("an array whose view gets out is a buffer of its own on each of them")
+dfx_array_view_gets_out_on_each()
+    dfx_prints(dfx_array_two_exits(), "7\nx\n9\n")
+
+@test("and the copies share the slot holding the box while each names its own elements")
+dfx_copies_share_the_box_slot()
+    dfx_ir(dfx_array_two_exits()) match
+        None -> ()
+        Some(text) ->
+            assert_eq(dfx_count(text, "  %a.box = alloca ptr\n"), 1)
+            assert_eq(dfx_count(text, "  %a.addr = getelementptr "), 1)
+            assert_eq(dfx_count(text, "  %a.d1.addr = getelementptr "), 1)
+
+@test("an array whose view gets out, ahead of a closing 'return', runs once per call")
+dfx_array_view_ahead_of_a_closing_return()
+    dfx_prints(raw"""
+        var kept: []int = []
+
+        f(c: bool)
+            defer if true
+                var a = [1, 2, 3]
+
+                a[0] = if c then 7 else 9
+                kept = a[..]
+
+            print("x")
+            return
+
+        f(true)
+        print(kept[0])
+        f(false)
+        print(kept[0])
+        """, "x\n7\nx\n9\n")
+
+@test("a view taken through a 'ref' to such an array counts against the copy's own buffer")
+dfx_view_through_a_ref_to_such_an_array()
+    dfx_prints(raw"""
+        var kept: []int = []
+
+        f(c: bool)
+            defer if true
+                var a = [1, 2, 3]
+                ref r = a
+
+                r[0] = if c then 7 else 9
+                kept = r[..]
+
+            if c then return
+            print("x")
+
+        f(true)
+        print(kept[0])
+        f(false)
+        print(kept[0])
+        """, "7\nx\n9\n")
