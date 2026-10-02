@@ -4,6 +4,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
+import sysl.text.Search
 
 // `invariant` and `variant` at the head of a loop body, and `variant` in a function's contract block
 // (`reference/verification.md § invariant and variant on a loop`, `§ variant on a function`).
@@ -112,6 +113,11 @@ private lcx_variant_misplaced() -> string =
     "a 'variant' belongs at the head of a loop's body, where it is what decreases from one " +
     "iteration to the next, or in a function's contract block, where it is what decreases at each " +
     "recursive call"
+
+private lcx_unmeasured() -> string =
+    "a 'variant' is a top-level function's — the measure is checked where a call to the same body " +
+    "is written, and neither a closure, which is reached through 'Fn', nor a function nested in " +
+    "another, whose calls carry a captured environment, is reached that way"
 
 // ---- a loop invariant ----
 
@@ -331,11 +337,30 @@ lcx_nested_function_declares_none()
     if !lcx_ready() then return
 
     lcx_refused("outer() -> int\n    inner(n: int) -> int\n        variant n\n        if n <= 0 then 0\n" +
-                "        else inner(n - 1) + 1\n\n    inner(3)\n",
-                "a 'variant' is a top-level function's — the measure is checked where a call to the " +
-                "same body is written, and neither a closure, which is reached through 'Fn', nor a " +
-                "function nested in another, whose calls carry a captured environment, is reached " +
-                "that way", "3:9")
+                "        else inner(n - 1) + 1\n\n    inner(3)\n", lcx_unmeasured(), "3:9")
+
+// The other half of the same rule, and the edge of it: a closure's contract block is refused too,
+// and in a nested function every clause is refused where it stands -- a second one is not "one
+// function declares one", and a measure that is not an integer is not asked about at all.
+@test("a closure's variant is refused, and so is each of a nested function's")
+lcx_closure_and_each_nested_variant_refused()
+    if !lcx_ready() then return
+
+    lcx_refused("apply(f: int -> int) -> int = f(2)\nouter() -> int\n    apply((n: int) ->\n" +
+                "        variant n\n        n)\n", lcx_unmeasured(), "4:9")
+
+    val said = lcx_build_run("outer() -> int\n    inner(n: int) -> int\n        variant true\n" +
+                             "        variant n\n        n\n\n    inner(3)\n")
+
+    said match
+        Ok((out, _)) -> assert(false, s"it built and ran, saying: $out")
+        Err(text) ->
+            assert(text.contains(s"error: ${lcx_unmeasured()}\n --> "), text)
+            assert(text.contains("/main.sysl:3:9\n"), text)
+            assert(text.contains("/main.sysl:4:9\n"), text)
+            assert(!text.contains("integer measure"), text)
+            assert(!text.contains("declares one"), text)
+end lcx_closure_and_each_nested_variant_refused
 
 @test("a function with a variant and no recursive call simply carries it")
 lcx_variant_without_recursion()
