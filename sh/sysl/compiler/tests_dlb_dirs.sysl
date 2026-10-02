@@ -1,0 +1,172 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.buf
+
+// **Making the directory a build is about to write into, and reading one, through the library's
+// filesystem module** -- the calls this compiler makes for both (`make_dir_all` and `entries`).
+//
+// Making: every caller wants the directory to exist and none wants to have been the one that made
+// it, so two compilations racing for a cold artifact cache must both succeed -- the loser finding the
+// directory already there, and usually already written into. A failure that leaves no directory
+// behind is still a failure, or an unwritable path would reach the linker with nowhere to put its
+// output.
+//
+// Reading: a compilation walks every directory of every tree it reads, thousands of times in one
+// test process, so a listing that held on to its descriptor would end in "too many open files" an
+// hour into a run.
+//
+// Each case is a program built by this compiler and run, so what is proved is the library compiled
+// HERE. **Every output quoted was obtained by running the reference compiler on the same program.**
+
+private dlb_fs_ran(body: string) -> string
+    var files = im_files()
+
+    files.push(("", "main.sysl",
+                "import sysl.fs.{make_temp_dir, make_dir, make_dir_all, is_dir, remove_dir_all, " +
+                "write_text, entries}\n\nval dir = make_temp_dir(\"sysl-mkdir\").unwrap()\n" + body +
+                "remove_dir_all(dir).unwrap()\n"))
+
+    dlb_built(files, buf())
+end dlb_fs_ran
+
+// -- one directory ------------------------------------------------------------------------------
+
+@test("one directory is made where there is none")
+dlb_dir_made_where_none()
+    if im_can_run() then return
+
+    assert_eq(dlb_fs_ran(raw"""
+        print(make_dir_all(dir + "/fresh").is_ok())
+        print(is_dir(dir + "/fresh"))
+        """), "true\ntrue\n")
+
+@test("one directory is tolerated where it is already there and empty")
+dlb_dir_tolerated_empty()
+    if im_can_run() then return
+
+    assert_eq(dlb_fs_ran(raw"""
+        print(make_dir_all(dir + "/twice").is_ok())
+        print(make_dir_all(dir + "/twice").is_ok())
+        print(is_dir(dir + "/twice"))
+        """), "true\ntrue\ntrue\n")
+
+// The one the race actually produces: the winner has not only made the directory, it has written
+// into it.
+@test("one directory is tolerated where it is already there and something has been written into it")
+dlb_dir_tolerated_occupied()
+    if im_can_run() then return
+
+    assert_eq(dlb_fs_ran(raw"""
+        print(make_dir_all(dir + "/occupied").is_ok())
+        write_text(dir + "/occupied/artifact", "x").unwrap()
+        print(make_dir_all(dir + "/occupied").is_ok())
+        print(is_dir(dir + "/occupied"))
+        """), "true\ntrue\ntrue\n")
+
+@test("one directory is still refused where the name is taken by a file")
+dlb_dir_refused_over_a_file()
+    if im_can_run() then return
+
+    assert_eq(dlb_fs_ran(raw"""
+        write_text(dir + "/taken", "x").unwrap()
+        make_dir_all(dir + "/taken") match
+            Ok(_) -> print("made")
+            Err(e) -> print(e)
+        """), "already exists\n")
+
+// The refusal the tolerant call exists to absorb, pinned so that it is not mistaken for
+// belt-and-braces: the plain call really does refuse a directory that is already there.
+@test("one directory: the plain call refuses exactly what the tolerant one absorbs")
+dlb_dir_plain_call_refuses()
+    if im_can_run() then return
+
+    assert_eq(dlb_fs_ran(raw"""
+        make_dir_all(dir + "/present").unwrap()
+        write_text(dir + "/present/artifact", "x").unwrap()
+        make_dir(dir + "/present") match
+            Ok(_) -> print("made")
+            Err(e) -> print(e)
+        """), "already exists\n")
+
+// -- a whole path -------------------------------------------------------------------------------
+
+@test("a whole path is made a level at a time")
+dlb_path_made_a_level_at_a_time()
+    if im_can_run() then return
+
+    assert_eq(dlb_fs_ran(raw"""
+        print(make_dir_all(dir + "/a/b/c").is_ok())
+        print(is_dir(dir + "/a/b/c"))
+        """), "true\ntrue\n")
+
+// The shape the cache is in on the second target of a run: the root is there and holds the first
+// target's artifact, and the directory being asked for is not.
+@test("a whole path is made under an ancestor that is already there and occupied")
+dlb_path_under_an_occupied_ancestor()
+    if im_can_run() then return
+
+    assert_eq(dlb_fs_ran(raw"""
+        make_dir_all(dir + "/cache/first").unwrap()
+        write_text(dir + "/cache/first/std.syslib", "x").unwrap()
+        print(make_dir_all(dir + "/cache/second").is_ok())
+        print(is_dir(dir + "/cache/second"))
+        """), "true\ntrue\n")
+
+@test("a whole path is tolerated where the whole of it is already there")
+dlb_path_tolerated_whole()
+    if im_can_run() then return
+
+    assert_eq(dlb_fs_ran(raw"""
+        print(make_dir_all(dir + "/a/b/c").is_ok())
+        print(make_dir_all(dir + "/a/b/c").is_ok())
+        print(is_dir(dir + "/a/b/c"))
+        """), "true\ntrue\ntrue\n")
+
+// -- listing a directory ------------------------------------------------------------------------
+
+// `entries` answers names in whatever order the filesystem keeps them; the order and the absolute
+// path are what a reader of a tree applies, as this compiler's own (`sort_names`, `join_path`) does.
+@test("listing a directory answers its entries as absolute paths, sorted")
+dlb_list_sorted_absolute()
+    if im_can_run() then return
+
+    assert_eq(dlb_fs_ran(raw"""
+        import sysl.slices.sort
+        import sysl.path.join
+        import sysl.text.Search
+
+        write_text(dir + "/b.sysl", "").unwrap()
+        write_text(dir + "/a.sysl", "").unwrap()
+        make_dir(dir + "/c").unwrap()
+        val names = entries(dir).unwrap()
+        sort(names.view())
+        for i in 0..<names.len()
+            val full = join(dir, names.at(i))
+            print(names.at(i), full.starts_with("/"))
+        """), "a.sysl true\nb.sysl true\nc true\n")
+
+@test("listing a directory refuses something that is not a directory")
+dlb_list_refuses_a_file()
+    if im_can_run() then return
+
+    assert_eq(dlb_fs_ran(raw"""
+        write_text(dir + "/f", "").unwrap()
+        entries(dir + "/f") match
+            Ok(_) -> print("listed")
+            Err(e) -> print(e)
+        """), "not a directory\n")
+
+// The count is read off `/dev/fd`, which lists the process's open descriptors on macOS and Linux. A
+// leak of one per call is thousands over the bound, and the noise is not.
+@test("listing a directory gives back the descriptor it opened, however many times it is asked")
+dlb_list_gives_back_its_descriptor()
+    if im_can_run() then return
+
+    assert_eq(dlb_fs_ran(raw"""
+        val before = entries("/dev/fd").unwrap().len()
+        for _ in 0..<3000
+            entries(dir).unwrap()
+        val after = entries("/dev/fd").unwrap().len()
+        print(after < before + 1000)
+        """), "true\n")

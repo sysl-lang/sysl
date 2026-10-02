@@ -409,10 +409,11 @@ end emit_typed_text
 // **The level decides which standard-module archive is resolved** -- the text declares the same
 // symbols at every level, but the archive a later link takes them from is the level's own.
 emit_llvm_text(path: string, named_target: Option[string],
-               level: string = DefaultOptimization) -> Result[Emitted, Failure]
+               level: string = DefaultOptimization,
+               also_auto_imported: Buf[string] = buf()) -> Result[Emitted, Failure]
     val t = target_for(path, named_target)?
     val program = packaged_compilation_of(path, t)?
-    val done = analyze_bodies(program.units, program.target)
+    val done = analyze_bodies(program.units, program.target, also_auto_imported)
 
     // Everything a program is held to on the way to being lowered runs on the **unpruned** tree: a
     // declaration nothing can reach is still one the program declared, and checking it is what makes
@@ -677,8 +678,11 @@ end emitted_body
 // The library's own C is compiled beside the program's, because this compiler defines the library's
 // functions rather than declaring them against an artifact somebody already built -- so whatever
 // those definitions call into has to be here too.
+//
+// `also_auto_imported` is `Analysis.also_auto_imported`, and no command line fills it.
 build_native_program(path: string, named_target: Option[string], cc: Option[string], level: string,
-                     out: Option[string]) -> Result[string, Failure]
+                     out: Option[string],
+                     also_auto_imported: Buf[string] = buf()) -> Result[string, Failure]
     val t = target_for(path, named_target).map_err(said)?
 
     heap_refusal(path, t).map_err(said)?
@@ -688,7 +692,7 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
     // describe the last step rather than the first.
     if !t.builds_with_clang() then return Err(Said(Refusal(t.no_toolchain())))
 
-    val emitted = emit_llvm_text(path, named_target, level)?
+    val emitted = emit_llvm_text(path, named_target, level, also_auto_imported)?
 
     if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
 

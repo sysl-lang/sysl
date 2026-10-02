@@ -1,0 +1,317 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+
+// **Compiling a program against a library whose names arrive by auto-import**, proved on a library
+// nothing depends on (`reference/modules.md § Imports`). The standard module relies on every piece
+// of this, so a mistake in it would break every program at once; here the same defect fails alone.
+//
+// The library is the module `demo` below, kept deliberately useless. What it is not useless *about*
+// is shape coverage: a generic is the reason a library's bodies cross (it is instantiated in the
+// program that calls it), and a trait with an `impl` is the reason the orphan rule has to know whose
+// rows those are.
+//
+// `demo` is auto-imported for these tests alone, through `Analysis.also_auto_imported`: a shipped
+// compiler auto-imports only the standard module. The reference carries the library across as a
+// decoded `AstCodec` artifact; this compiler reads every library as source, so the one case comparing
+// the two crossings has no counterpart here.
+//
+// **Every output and every refusal quoted here was obtained by running the reference compiler on the
+// same source**, with the program written beside a `demo` module.
+
+private dlb_numbers() -> string = raw"""
+    module demo
+
+    const answer: int = 42
+
+    val squares: [4]int = [0, 1, 4, 9]
+
+    double(n: int) -> int = n * 2
+
+    // A generic is the reason a library ships bodies rather than signatures: it is instantiated in
+    // the program that calls it.
+    larger[T: Ord](a: T, b: T) -> T = if a < b then b else a
+
+    private helper(n: int) -> int = n + 1
+
+    sum_to(n: int) -> int =
+        var total = 0
+
+        for i in 1..n
+            total += i
+
+        total
+    """
+
+private dlb_pair() -> string = raw"""
+    module demo
+
+    struct Pair
+        a: int
+        b: int
+
+        sum(self) -> int = self.a + self.b
+        scaled(self, by: int) -> Pair = Pair(self.a * by, self.b * by)
+        origin() -> Pair = Pair(0, 0)
+
+    trait Widen
+        widen(self) -> int
+
+    impl Widen for Pair
+        widen(self) -> int = self.sum() * 10
+
+    enum Shade
+        Light
+        Dark
+
+        flip(self) -> Shade =
+            self match
+                Light -> Shade.Dark
+                Dark -> Shade.Light
+    """
+
+// What a program PRINTS, built with `demo` auto-imported -- or what the build had to say about it.
+// `with_demo` says whether the library's files are in the tree at all; the auto-import asks for
+// `demo` either way, which is what the cases without it are about.
+private dlb_out(main: string, with_demo: bool) -> string
+    var files = im_files()
+
+    files.push(("", "main.sysl", main))
+
+    if with_demo
+        files.push(("demo", "numbers.sysl", dlb_numbers()))
+        files.push(("demo", "pair.sysl", dlb_pair()))
+
+    var auto: Buf[string] = buf()
+
+    auto.push("demo")
+    dlb_built(files, auto)
+end dlb_out
+
+// What a tree of files prints once built by this compiler and run, or what the build said. The
+// directory suite (`tests_dlb_dirs.sysl`) builds through it too, with nothing auto-imported.
+dlb_built(files: Buf[(string, string, string)], auto: Buf[string]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe), auto) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end dlb_built
+
+private dlb_ran(main: string) -> string = dlb_out(main, true)
+
+// -- a library reached by its full path ---------------------------------------------------------
+
+@test("a library reached by its full path gives up a function")
+dlb_full_path_function()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("print(demo.double(21))\n"), "42\n")
+
+@test("a library reached by its full path gives up a const, folded like any other")
+dlb_full_path_const()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("print(demo.answer)\n"), "42\n")
+
+@test("a library reached by its full path gives up a module-level val, indexed at run time")
+dlb_full_path_val()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("var i = 3\nprint(demo.squares[i])\n"), "9\n")
+
+@test("a library reached by its full path gives up a struct, its method, and its associated function")
+dlb_full_path_struct()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("var p = demo.Pair(2, 3)\nprint(p.sum())\nprint(demo.Pair.origin().sum())\n"),
+              "5\n0\n")
+
+@test("a library reached by its full path gives up an enum and a member on it")
+dlb_full_path_enum()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran(raw"""
+        var s = demo.Shade.Light
+        var f = s.flip()
+        f match
+            Dark -> print(1)
+            Light -> print(0)
+        """), "1\n")
+
+// The trait is in scope through the auto-import; reached by its full path alone, the reference
+// answers that `demo.Widen` is not in scope, so this is the auto-import working as well.
+@test("a library reached by its full path gives up a trait, and the impl it was linked with")
+dlb_full_path_trait()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("var p = demo.Pair(2, 3)\nprint(p.widen())\n"), "50\n")
+
+// The library ships `larger[T: Ord]` as a tree; `T` is fixed here, not in the library.
+@test("a library reached by its full path instantiates a generic in the program that calls it")
+dlb_full_path_generic()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("print(demo.larger(3, 7))\nprint(demo.larger(\"a\", \"b\"))\n"), "7\nb\n")
+
+@test("a library reached by its full path keeps a file-private helper to its own file")
+dlb_full_path_private()
+    if im_can_run() then return
+
+    val said = dlb_ran("print(demo.helper(1))\n")
+
+    assert(said.contains("'demo.helper' is private to '"), said)
+    assert(said.contains("numbers.sysl', the file that declares it"), said)
+
+// -- the library's names arrive unqualified, with no import written -----------------------------
+
+@test("the library's names arrive unqualified: a function")
+dlb_unqualified_function()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("print(double(21))\n"), "42\n")
+
+@test("the library's names arrive unqualified: a type, where a type is asked for")
+dlb_unqualified_type()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("var p: Pair = Pair(4, 5)\nprint(p.sum())\n"), "9\n")
+
+@test("the library's names arrive unqualified: a const, including where only a constant may stand")
+dlb_unqualified_const()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("var xs: [answer]int\nprint(xs.len)\n"), "42\n")
+
+@test("the library's names arrive unqualified: an enum variant, through its enum")
+dlb_unqualified_variant()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran(raw"""
+        var s = Shade.Dark
+        s match
+            Dark -> print(1)
+            Light -> print(0)
+        """), "1\n")
+
+@test("the library's names arrive unqualified: a trait, as a bound")
+dlb_unqualified_bound()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("show[T: Widen](x: T) -> int = x.widen()\nprint(show(Pair(1, 1)))\n"), "20\n")
+
+// -- the names the compiler spells for itself still reach the library ----------------------------
+
+// `Writer` and `FormatSpec` in the signature the `impl` must match, the specifier `f"..."` builds,
+// the renderer `str` reaches for a scalar: a library auto-imported beside the standard module must
+// not disturb any of them.
+@test("a program's own `Display`, a format hole, and a library name in one program")
+dlb_display_and_format()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran(raw"""
+        struct P
+            x: int
+
+        impl Display for P
+            display(self, w: *Writer, spec: FormatSpec) = str(self.x).display(w, spec)
+
+        var p = P(double(3))
+        print(p)
+        print(f"[${str(answer)}%5s]")
+        """), "6\n[   42]\n")
+
+@test("and a `for` over a library value, which reaches `Iterate` and `Option` by key")
+dlb_for_over_a_library_value()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("for c in \"hi\".chars\n    print(c)\nprint(demo.answer)\n"), "h\ni\n42\n")
+
+// -- the auto-import loses to anything more specific -------------------------------------------
+
+// A local declaration beats a wildcard, so a program may name its own `Pair` without the library's
+// becoming unreachable -- it is still there under its full path.
+@test("the auto-import loses to a declaration the program makes itself")
+dlb_loses_to_a_declaration()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran(raw"""
+        struct Pair
+            n: int
+
+            sum(self) -> int = self.n * 100
+
+        var mine = Pair(7)
+        var theirs = demo.Pair(2, 3)
+        print(mine.sum())
+        print(theirs.sum())
+        """), "700\n5\n")
+
+@test("the auto-import loses to a function the program declares under the same name")
+dlb_loses_to_a_function()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("double(n: int) -> int = n * 3\nprint(double(4))\nprint(demo.double(4))\n"),
+              "12\n8\n")
+
+@test("the auto-import loses to a local binding, which shadows it inside the block")
+dlb_loses_to_a_local()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("var answer = 7\nprint(answer)\nprint(demo.answer)\n"), "7\n42\n")
+
+// -- an explicit import still works alongside the auto-import ----------------------------------
+
+@test("importing the same module by name as the auto-import changes nothing")
+dlb_import_by_name()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("import demo\nprint(demo.double(21))\nprint(double(21))\n"), "42\n42\n")
+
+@test("a selective import with a rename reaches the auto-imported declaration")
+dlb_import_renamed()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("import demo.{double as twice}\nprint(twice(21))\nprint(double(21))\n"),
+              "42\n42\n")
+
+@test("a wildcard over an auto-imported module is not a second offer of its names")
+dlb_import_wildcard()
+    if im_can_run() then return
+
+    assert_eq(dlb_ran("import demo.*\nprint(double(21))\n"), "42\n")
+
+// -- without the library -----------------------------------------------------------------------
+
+// The mechanism is conditional on the module being present, so a program compiled on its own is
+// untouched -- which is what makes aiming it at `demo` safe for every other test.
+@test("without the library the auto-import brings in nothing, and the name is simply undefined")
+dlb_without_the_library_undefined()
+    if im_can_run() then return
+
+    val said = dlb_out("print(double(21))\n", false)
+
+    assert(said.contains("undefined function 'double'"), said)
+
+@test("without the library every other program compiles exactly as it did")
+dlb_without_the_library_compiles()
+    if im_can_run() then return
+
+    assert_eq(dlb_out("print(1)\n", false), "1\n")
