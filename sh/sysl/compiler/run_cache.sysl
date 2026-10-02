@@ -165,6 +165,11 @@ run_cache_parts(command: string, path: string, t: Target, level: string,
     for i in 0..<where.len()
         parts.push(where.at(i))
 
+    // **Which features are on decides which lines reach the compiler**, so the request is part of the
+    // key beside the manifests that declare them (`program_fingerprint`): one tree built under two
+    // requests is two programs, from byte-identical source.
+    parts.push(feature_request_part())
+
     Ok(parts)
 end run_cache_parts
 
@@ -229,6 +234,17 @@ private program_fingerprint(path: string, t: Target) -> Result[string, Refusal]
         val found = collect(trees.at(i), Some(t.os)) match
             Err(e) -> return Err(Refusal(e.message))
             Ok(f) -> f
+
+        // A tree's manifest, because its `features` block decides which of the files' lines are
+        // compiled at all -- an edit to it alone changes the program.
+        val tree_root = if i == 0 then root else trees.at(i)
+        val manifest_file = join_path(tree_root, ManifestName)
+
+        if is_file(manifest_file)
+            read_text(manifest_file) match
+                Ok(text) -> files.push((s"$i/$ManifestName", text))
+                Err(_) -> ()
+        end if
 
         for j in 0..<found.len()
             files.push((s"$i/${found_place(found.at(j))}",

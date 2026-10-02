@@ -31,6 +31,7 @@ run_cli(args: []string, say: string -> unit) -> int
     // answering two of them -- which is what a test does -- must not have the first's paths in the
     // second, and nothing else in the compiler writes this.
     reset_search_paths()
+    reset_feature_request()
 
     // A flag that named a `.syslib` is refused by every command in one sentence, before any of them
     // reads its own flags -- none of them takes it, whatever it was handed.
@@ -286,8 +287,17 @@ private build_command(args: []string, say: string -> unit) -> int
             return Misused
         end if
 
+        val featured = took_feature_flag(args, i)
+
+        if featured == 0
+            say(build_usage())
+            return Misused
+        end if
+
         if took > 0
             if took == 2 then i += 1
+        else if featured > 0
+            if featured == 2 then i += 1
         else if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o"
             if i + 1 >= args.len
                 say(build_usage())
@@ -321,6 +331,8 @@ private build_command(args: []string, say: string -> unit) -> int
         say(build_usage())
         return Misused
     end if
+
+    if refused_features(say) then return Failed
 
     val at = build_level(file, level) match
         Err(why) ->
@@ -362,7 +374,15 @@ end took_level
 
 private build_usage() -> string =
     "usage: sysl build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] " + where_flags() +
-    " <path>"
+    " " + feature_flags() + " <path>"
+
+// The one refusal a feature request is given before any manifest is read: `--all-features` beside
+// either of the flags that say something narrower. Whether it fired.
+private refused_features(say: string -> unit) -> bool = feature_conflict() match
+    Some(why) ->
+        say(s"error: $why")
+        true
+    None -> false
 
 // `sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] <path>`
 // -- a module compiled to a static archive and a C header, for a C project to link against.
@@ -382,13 +402,17 @@ private build_c_command(args: []string, say: string -> unit) -> int
     while i < args.len
         val took = took_search_flag(args, i)
 
-        if took == 0
+        val featured = took_feature_flag(args, i)
+
+        if took == 0 || featured == 0
             say(build_c_usage())
             return Misused
         end if
 
         if took > 0
             if took == 2 then i += 1
+        else if featured > 0
+            if featured == 2 then i += 1
         else if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o" || args[i] == "--header" ||
                 args[i] == "--lto"
             if i + 1 >= args.len
@@ -436,6 +460,8 @@ private build_c_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
+    if refused_features(say) then return Failed
+
     val at = build_level(file, level) match
         Err(why) ->
             say_failure(why, say)
@@ -452,7 +478,7 @@ end build_c_command
 
 private build_c_usage() -> string =
     "usage: sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] " +
-    "[--header <path>] [--lto thin|full] " + where_flags() + " <path>\n" +
+    "[--header <path>] [--lto thin|full] " + where_flags() + " " + feature_flags() + " <path>\n" +
     "  --lto <mode>  make the archive's members LLVM bitcode for this mode of link-time " +
     "optimization, 'thin' or 'full', so a host linking with clang and lld can optimize across the " +
     "boundary. Without it the members are native objects any C toolchain links, and the project's " +
@@ -527,13 +553,17 @@ private run_command(args: []string, say: string -> unit) -> int
         else
             val took = took_search_flag(args, i)
 
-            if took == 0
+            val featured = took_feature_flag(args, i)
+
+            if took == 0 || featured == 0
                 say(run_usage())
                 return Misused
             end if
 
             if took > 0
                 if took == 2 then i += 1
+            else if featured > 0
+                if featured == 2 then i += 1
             else if args[i] == "--target" || args[i] == "--cc"
                 if i + 1 >= args.len
                     say(run_usage())
@@ -566,6 +596,8 @@ private run_command(args: []string, say: string -> unit) -> int
         return Misused
     end if
 
+    if refused_features(say) then return Failed
+
     val at = build_level(file, level) match
         Err(why) ->
             say_failure(why, say)
@@ -580,8 +612,8 @@ private run_command(args: []string, say: string -> unit) -> int
 end run_command
 
 private run_usage() -> string =
-    "usage: sysl run [--target <name>] [--cc <path>] [-O<level>] " + where_flags() +
-    " <path> [-- <args>]"
+    "usage: sysl run [--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " " +
+    feature_flags() + " <path> [-- <args>]"
 
 // The flags every command that compiles a program takes, written once so that seven usage lines
 // cannot come to disagree about them. `--lib` names a source **directory** and may be given more
@@ -612,14 +644,17 @@ private test_command(args: []string, say: string -> unit) -> int
 
     while i < args.len
         val took = took_search_flag(args, i)
+        val featured = took_feature_flag(args, i)
 
-        if took == 0
+        if took == 0 || featured == 0
             say(test_usage())
             return Misused
         end if
 
         if took > 0
             if took == 2 then i += 1
+        else if featured > 0
+            if featured == 2 then i += 1
         else if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter"
             if i + 1 >= args.len
                 say(test_usage())
@@ -657,6 +692,12 @@ private test_command(args: []string, say: string -> unit) -> int
         say(test_usage())
         return Misused
     end if
+
+    if refused_features(say) then return Failed
+
+    // A silent request under test turns on every feature the root declares: gated code the ordinary
+    // build never compiles is code the suite would otherwise never see.
+    set_feature_testing()
 
     val level = build_level(file, named_level) match
         Err(why) ->
@@ -748,7 +789,7 @@ private tests_run(file: string, exe: string, all: Buf[TTest], filter: Option[str
 end tests_run
 
 private test_usage() -> string = "usage: sysl test [--filter <text>] [--fail-fast] [--std] " +
-    "[--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " <path>"
+    "[--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " " + feature_flags() + " <path>"
 
 // `sysl build-lib [--std] [--target <name>] <path>` -- a library held to being a library for one
 // machine.
@@ -907,7 +948,10 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
     "test [--filter <text>] [--fail-fast] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
     "add <coordinate>[@<version>] [<path>] | " +
-    "doc [-o <dir>] [-t <title>] [-n <note>] [-w <n>] [-V <version>] [--private] [--check] [<dir>]"
+    "doc [-o <dir>] [-t <title>] [-n <note>] [-w <n>] [-V <version>] [--private] [--check] [<dir>]\n" +
+    "build, build-c, run and test, which resolve a package graph, also take " + feature_flags() +
+    ": a feature of the root project to turn on beside 'default', comma-separated and repeatable; " +
+    "leave the root's 'default' feature off; turn on every feature the root's manifest declares"
 
 main(args: []string)
     val code = run_cli(args, line -> print(line))
