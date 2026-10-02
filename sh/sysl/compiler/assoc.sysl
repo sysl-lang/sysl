@@ -125,8 +125,80 @@ private abstract_assoc(a: &Analysis, subject: Type, name: string, bounds: Buf[Bo
                         return Some(Abstract(whole, assoc_bounds_of(a, b, assocs.at(k),
                                                                     Abstract(whole, buf()))))
 
-    blanket_assoc(a, subject, name, bounds, member)
+    val blanket = blanket_assoc(a, subject, name, bounds, member)
+
+    if blanket.is_some() then return blanket
+
+    declared_blanket_assoc(a, subject, bounds, member)
 end abstract_assoc
+
+// What a blanket block supplies, read off the **declarations** for the window before the blocks are
+// hoisted -- `declared_assoc`'s answer for a subject that is a parameter.
+//
+// **Every signature is read before any `impl` is hoisted**, so `same[T: Integer](x: T) -> T::Extent`
+// asked an empty blanket table and was refused, by a complaint the walk keeps, for a projection that
+// `impl[T: Integer + Zero] Mag for T` supplies. The block's subject is one of its own parameters,
+// bounded by a family the compiler closes; a parameter bounded by that family is covered by it, and
+// `type Extent = T` is the projection with the parameter in the block's place. Silent where nothing
+// or more than one block answers, as `declared_assoc` is.
+private declared_blanket_assoc(a: &Analysis, subject: Type, bounds: Buf[Bound],
+                               member: string) -> Option[Type]
+    if a.tables.members.hoisted then return None
+
+    var hits: Buf[Type] = buf()
+
+    for i in 0..<a.tables.impls.len()
+        val im = a.tables.impls.at(i)
+        val written = written_assoc(im.decl, member)
+
+        if written.is_none() then continue
+
+        val key = lookup_trait_key(a, im.scope, im.decl.trait_name)
+
+        if key.is_none() || !declares_assoc_named(a, key.unwrap(), member) then continue
+
+        val param = *im.decl.for_type.kind match
+            NamedType(n, inner) -> if inner.is_empty() && holds_string(im.decl.tparams, n) then Some(n) else None
+            _ -> None
+
+        if param.is_none() then continue
+
+        // Read in a trial: the block's parameters are resolved again, for real, where it is hoisted.
+        val mark = a.complaints()
+        val trial = a.sandboxed()
+        val abstracts = abstract_subst(a, im.scope, im.decl.tparams, im.decl.bounds, im.decl.tvalues,
+                                       im.decl.tpacks, buf())
+        var found: Option[Type] = None
+
+        resolve_type(a, im.scope, im.decl.for_type, abstracts) match
+            Abstract(_, family) ->
+                if covers_family(family, bounds)
+                    var subst: Buf[Binding] = buf()
+
+                    subst.push(Binding(param.unwrap(), subject))
+                    subst.push(Binding("Self", subject))
+                    found = Some(resolve_type(a, im.scope, written.unwrap(), subst))
+            _ -> ()
+
+        a.release(trial)
+        a.restore_complaints(mark)
+
+        if found.is_some() && found.unwrap() != Unknown then push_distinct(&hits, found.unwrap())
+
+    if hits.len() == 1 then Some(hits.at(0)) else None
+end declared_blanket_assoc
+
+// Whether a parameter bounded by `bounds` is in the closed family a blanket block's subject is.
+private covers_family(family: Buf[Bound], bounds: Buf[Bound]) -> bool
+    for i in 0..<family.len()
+        val spelling = library_spelling(family.at(i).name)
+
+        if spelling.is_some() && core_closed(spelling.unwrap())
+            for j in 0..<bounds.len()
+                if bounds.at(j).name == family.at(i).name then return true
+
+    false
+end covers_family
 
 // The same question answered by a **blanket** block, for a parameter whose bound is the family that
 // block was written over.
