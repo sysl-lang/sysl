@@ -140,10 +140,73 @@ end variants_volatile
 
 // How a value of this type is *stored*: a named subtype that is only a name is its base, and a
 // qualifier is not part of the representation.
+//
+// **Below the top only a NAME is taken off** (`nameless`): a `*H` agrees with a `*u64` where `H` is a
+// second name for `u64`, while a `*Small` does not agree with a `*u64`, because a write through the
+// one is checked and a write through the other is not.
 repr(t: Type) -> Type = t match
     Constrained(d) -> if d.derived then t else repr(d.base)
     Volatile(inner) -> repr(*inner)
+    _ -> nameless(t)
+
+// Whether a name-only constrained type sits anywhere below the top, which is what says `nameless` has
+// anything to do -- asked first, since `repr` is asked of nearly every type and rebuilding one that
+// holds no name would be allocation for nothing.
+private holds_name(t: Type) -> bool = t match
+    Constrained(d) -> name_only(d) || holds_name(d.base)
+    Ptr(inner) -> holds_name(*inner)
+    Ref(inner, _) -> holds_name(*inner)
+    Weak(inner) -> holds_name(*inner)
+    Array(_, elem) -> holds_name(*elem)
+    Vector(_, elem) -> holds_name(*elem)
+    Slice(elem, _) -> holds_name(*elem)
+    Volatile(inner) -> holds_name(*inner)
+    CFn(ps, r) -> holds_name(*r) || any_holds_name(ps)
+    Pack(es) -> any_holds_name(es)
+    _ -> false
+
+private any_holds_name(ts: Buf[Type]) -> bool
+    for i in 0..<ts.len()
+        if holds_name(ts.at(i)) then return true
+
+    false
+end any_holds_name
+
+// Whether a constrained type is **only a name** -- not derived, and carrying no range and no
+// predicate. A measured `c type` is one, and so is an exported alias (`reference/ffi.md § Naming a
+// type`): both keep a name so a C header can spell it, and are otherwise the type they stand for.
+name_only(d: &ConstrainedType) -> bool =
+    !d.derived && d.lo.is_none() && d.hi.is_none() && d.pred_fn.is_none()
+
+// The type with every name-only constrained type in it replaced by its base, at any depth. This is
+// the identity such a name has everywhere the language checks types -- agreement (through `repr`),
+// and the key an instantiation is filed under -- so `Buf[H]` and `Buf[u64]` are one instantiation and
+// `*H` is a `*u64`. The name stays visible only to what reads a type as written: the C header. A named
+// type is not entered, its arguments having been made nameless when it was instantiated.
+nameless(t: Type) -> Type = if holds_name(t) then strip_names(t) else t
+
+private strip_names(t: Type) -> Type = t match
+    Constrained(d) -> if name_only(d) then strip_names(d.base) else t
+    Ptr(inner) -> Ptr(strip_names(*inner))
+    Ref(inner, sync) -> Ref(strip_names(*inner), sync)
+    Weak(inner) -> Weak(strip_names(*inner))
+    Array(n, elem) -> Array(n, strip_names(*elem))
+    Vector(n, elem) -> Vector(n, strip_names(*elem))
+    Slice(elem, ro) -> Slice(strip_names(*elem), ro)
+    Volatile(inner) -> Volatile(strip_names(*inner))
+    CFn(ps, r) -> CFn(nameless_all(ps), strip_names(*r))
+    Pack(es) -> Pack(nameless_all(es))
     _ -> t
+
+// `nameless` over a list.
+nameless_all(ts: Buf[Type]) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for i in 0..<ts.len()
+        out.push(nameless(ts.at(i)))
+
+    out
+end nameless_all
 
 // The whole of the peeling: every named subtype and every qualifier taken off, whether or not the
 // subtype was a type of its own.
@@ -207,6 +270,8 @@ element(t: Type) -> Option[Type] = t match
     Slice(e, _) -> Some(*e)
     Str -> Some(byte_type())
     Ptr(e) -> Some(*e)
+    // An exported alias of a pointer is indexed as the pointer it names.
+    Constrained(d) -> if name_only(d) then element(d.base) else None
     _ -> None
 
 // What a pointer or a reference points at, where it points at something a program can name. An
