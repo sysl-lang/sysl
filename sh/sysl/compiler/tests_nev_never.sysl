@@ -1,6 +1,8 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.text.{split, Search}
 
@@ -428,3 +430,22 @@ nev_a_tail_belongs_to_its_extern()
     if nev_skip() then return
 
     nev_refused("extern printf(fmt: *u8, ...) -> int\nf(n: int) -> int = n\nprint(f(1, 2))", "function 'f' takes 1 argument, but 2 arguments were given", "3:7")
+
+// The declaration table prints a written result as the type it means, so `-> never` reads back as
+// `never` there too -- the one reading of a result that went through `resolve_type` instead of
+// `resolve_result` printed `?` (`reference/attributes.md` block 30 in the table sweep).
+@test("the function table shows a 'never' result as never")
+nev_the_table_shows_a_never_result()
+    val parsed = parse(source_of("stop.sysl", "stop(code: int) -> never\n    stop(code)\n"))
+
+    assert(parsed.ok(), "parses")
+
+    val a = analysis_for(host_target())
+    var units: Buf[Program] = buf()
+
+    units.push(parsed.program)
+    read_decls(a, units)
+
+    assert(a.diagnostics().is_empty(), "no complaint")
+    assert(show_funcs_table(a).index_of("stop(code: int) -> never").is_some(), show_funcs_table(a))
+end nev_the_table_shows_a_never_result
