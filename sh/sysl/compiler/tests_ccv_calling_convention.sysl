@@ -1,0 +1,638 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `interrupt` -- the calling convention of `reference/ffi.md § interrupt` -- and an aggregate
+// crossing into an `@export`ed function, run rather than read: the reference's
+// `CallingConventionTests` and `CExportAbiTests`.
+//
+// **An interrupt handler is the processor's convention rather than the language's**, and the three
+// processors answer `__attribute__((interrupt))` three ways: x86-64 makes it the calling convention
+// `x86_intrcc` with the frame passed `byval`; RISC-V makes it the function attribute
+// `"interrupt"="machine"` on a function taking nothing; AArch64 and M-profile Thumb do not have it.
+// So those assertions are on the emitted IR for a named machine, never on running anything.
+//
+// **The export half really compiles C beside the sysl and really calls in**, so what is asserted is
+// the number that arrived: `999` is the C saying it read something other than what it wrote. The
+// shapes reach different arms of the classification -- `Id` is `{i32,u16,u16}` (one integer register
+// on AArch64), `Pair` a homogeneous floating aggregate, `Big` past every register threshold, `Xf` a
+// floating aggregate of four members.
+//
+// **Every message and every line of LLVM text here was read out of the reference compiler**
+// (0.0.153) on the same input -- `emit-llvm --no-std-lib --target <machine>` for a Linux machine,
+// whose library headers are not on this one -- and every C answer is clang's.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private var ccv_library_names: Buf[string] = buf()
+private var ccv_library_units: Buf[Buf[Program]] = buf()
+
+// The library as one machine reads it, read once per machine.
+private ccv_library(t: Target) -> Buf[Program]
+    for i in 0..<ccv_library_names.len()
+        if ccv_library_names.at(i) == t.name then return ccv_library_units.at(i)
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    ccv_library_names.push(t.name)
+    ccv_library_units.push(out)
+    out
+end ccv_library
+
+private ccv_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+private ccv_ready_to_run() -> bool
+    if !ccv_ready() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end ccv_ready_to_run
+
+// The library's own complaints are not what a question about a program is asking.
+private ccv_first_of(said: Buf[Placed]) -> string
+    for i in 0..<said.len()
+        if !said.at(i).src.name.starts_with("library/") then return said.at(i).diag.message
+
+    ""
+end ccv_first_of
+
+// What a compilation came to on a machine: the first thing it had to say, or nothing and its text.
+private ccv_build(text: string, machine: string) -> (string, string, Buf[TFunc])
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+    val library = ccv_library(t)
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    val parsed = parse(source_of("test.sysl", text), t)
+
+    if !parsed.ok() then return (parsed.report.at(0).message, "", buf())
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), true)
+    val early = ccv_first_of(done.reported)
+
+    if early != "" then return (early, "", buf())
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+    own.push("demo")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = ccv_first_of(done.an.diagnostics())
+
+    if late != "" then return (late, "", buf())
+
+    val kept = prune(strip_tests(whole), own)
+
+    ("", ir_print_module(codegen_with_gaps(kept, t, pr).0), kept.funcs)
+end ccv_build
+
+// The LLVM text a machine lowers a program to, or what it was refused with.
+private ccv_ir(machine: string, text: string) -> string
+    val b = ccv_build(text, machine)
+
+    if b.0 != "" then return b.0
+
+    b.1
+
+// What a machine refuses a program with, and nothing where it is accepted.
+private ccv_err(machine: string, text: string) -> string = ccv_build(text, machine).0
+
+private ccv_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+private ccv_never_says(text: string, part: string) =
+    assert(!text.contains(part), s"expected no '$part' in:\n$text")
+
+private ccv_count(text: string, part: string) -> usize
+    var n: usize = 0
+    var from: usize = 0
+
+    loop
+        text[from..<text.bytes.len].index_of(part) match
+            Some(at) ->
+                n += 1
+                from += at + part.bytes.len
+            None -> break
+
+    n
+end ccv_count
+
+// Builds the project at `root` and runs it: what it printed, or why it did not.
+private ccv_build_run(root: string) -> string
+    val exe = s"$root/built"
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end ccv_build_run
+
+// What a one-file program prints.
+private ccv_run(text: string) -> string
+    val root = make_temp_dir("sysl-ccv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    ccv_build_run(root)
+
+// A project whose module `p` carries the C that calls back into it, and a `main.sysl` printing the
+// answer -- what it printed.
+private ccv_project(sysl: string, c: string) -> string
+    val root = make_temp_dir("sysl-ccv").unwrap()
+
+    make_dir_all(s"$root/p").unwrap()
+    write_text(s"$root/main.sysl", "print(p.check())\n").unwrap()
+    write_text(s"$root/p/p.sysl", s"module p\n\n$sysl").unwrap()
+    write_text(s"$root/p/probe.c", c).unwrap()
+
+    ccv_build_run(root)
+end ccv_project
+
+// -- the interrupt programs -----------------------------------------------------------------------
+
+// What a handler actually does: tell the device it has been heard.
+private ccv_ack() -> string = "extern \"ack\" ack()\n\n"
+
+// A handler taking nothing -- the shape RISC-V requires.
+private ccv_bare() -> string = ccv_ack() + "interrupt timer()\n    ack()\n"
+
+private ccv_frame() -> string = "struct Frame\n    ip: u64\nend Frame\n\n"
+
+// A handler taking the frame -- the shape x86-64 requires.
+private ccv_framed() -> string = ccv_ack() + ccv_frame() + "interrupt fault(f: *Frame)\n    ack()\n"
+
+private ccv_x86() -> string = "x86_64-linux"
+private ccv_rv() -> string = "riscv64-linux"
+
+// -- on x86-64 it is a calling convention, with the frame passed byval ----------------------------
+
+@test("the define carries 'x86_intrcc'")
+ccv_the_define_carries_x86_intrcc()
+    if !ccv_ready() then return
+
+    ccv_says(ccv_ir(ccv_x86(), ccv_framed()), "define x86_intrcc void @fault")
+
+@test("and the frame parameter is byval over the struct it points at")
+ccv_the_frame_parameter_is_byval()
+    if !ccv_ready() then return
+
+    ccv_says(ccv_ir(ccv_x86(), ccv_framed()), "ptr byval(%struct.Frame) %f.param")
+
+@test("an error code after the frame is an ordinary integer, not a second byval")
+ccv_an_error_code_is_an_ordinary_integer()
+    if !ccv_ready() then return
+
+    val ir = ccv_ir(ccv_x86(), ccv_ack() + ccv_frame() + "interrupt fault(f: *Frame, code: u64)\n    ack()\n")
+
+    ccv_says(ir, "ptr byval(%struct.Frame) %f.param")
+    ccv_says(ir, "i64 %code.param")
+    assert_eq(ccv_count(ir, "byval"), 1)
+end ccv_an_error_code_is_an_ordinary_integer
+
+@test("and an ordinary function beside it is untouched")
+ccv_an_ordinary_function_beside_it_is_untouched()
+    if !ccv_ready() then return
+
+    ccv_says(ccv_ir(ccv_x86(), ccv_framed() + "\nplain(n: int) -> int = n + 1\n\nprint(plain(2))\n"),
+             "define i32 @plain(i32 %n.param)")
+
+@test("a handler survives pruning although nothing calls it")
+ccv_a_handler_survives_pruning()
+    if !ccv_ready() then return
+
+    ccv_says(ccv_ir(ccv_x86(), ccv_framed() + "\nprint(1)\n"), "define x86_intrcc void @fault")
+
+@test("and so does what its own body calls")
+ccv_and_so_does_what_its_body_calls()
+    if !ccv_ready() then return
+
+    ccv_says(ccv_ir(ccv_x86(), ccv_framed() + "\nprint(1)\n"), "declare void @ack()")
+
+// -- on RISC-V it is a function attribute, and the handler takes nothing --------------------------
+
+@test("the define carries the attribute with the default privilege mode")
+ccv_the_define_carries_the_default_mode()
+    if !ccv_ready() then return
+
+    ccv_says(ccv_ir(ccv_rv(), ccv_bare()), "define void @timer() \"interrupt\"=\"machine\"")
+
+@test("a written mode is what is emitted")
+ccv_a_written_mode_is_what_is_emitted()
+    if !ccv_ready() then return
+
+    ccv_says(ccv_ir(ccv_rv(), ccv_ack() + "interrupt(supervisor) timer()\n    ack()\n"),
+             "\"interrupt\"=\"supervisor\"")
+
+@test("and no calling convention is written, since RISC-V's is not one")
+ccv_no_calling_convention_on_riscv()
+    if !ccv_ready() then return
+
+    val ir = ccv_ir(ccv_rv(), ccv_bare())
+
+    ccv_says(ir, "define void @timer()")
+    ccv_never_says(ir, "intrcc")
+end ccv_no_calling_convention_on_riscv
+
+// -- where there is no interrupt form -------------------------------------------------------------
+
+@test("on AArch64 it is refused rather than ignored")
+ccv_on_aarch64_it_is_refused()
+    if !ccv_ready() then return
+
+    assert_eq(ccv_err("aarch64-linux", ccv_bare()),
+              "'interrupt' is not something aarch64 has: its exception entry goes through a vector " +
+              "table of fixed-size instruction slots, so a handler is assembly and there is nothing " +
+              "here for a convention to describe")
+
+// The whole sentence each M-profile machine is refused with, read out of the reference on all four.
+private ccv_thumb_refusal() -> string =
+    "'interrupt' is not something thumb has: a Cortex-M exception is entered with the caller-saved " +
+        "registers already stacked by the processor and 'EXC_RETURN' in the link register, so an " +
+        "ordinary function is already a correct handler and there is no prologue for a convention to " +
+        "arrange — write one, and give it the name the vector table holds with " +
+        "'@export(\"SysTick_Handler\")'"
+
+private ccv_thumb_refuses(machine: string)
+    if !ccv_ready() then return
+
+    val e = ccv_err(machine, ccv_bare())
+
+    assert_eq(e, ccv_thumb_refusal())
+    ccv_says(e, "is not something thumb has")
+    ccv_says(e, "already stacked by the processor")
+    ccv_says(e, "ordinary function is already a correct handler")
+end ccv_thumb_refuses
+
+@test("on thumb-freestanding")
+ccv_on_thumb_freestanding()
+    ccv_thumb_refuses("thumb-freestanding")
+
+@test("on thumb-freestanding-softfp")
+ccv_on_thumb_freestanding_softfp()
+    ccv_thumb_refuses("thumb-freestanding-softfp")
+
+@test("on thumbv6m-freestanding")
+ccv_on_thumbv6m_freestanding()
+    ccv_thumb_refuses("thumbv6m-freestanding")
+
+@test("on thumbv7em-freestanding")
+ccv_on_thumbv7em_freestanding()
+    ccv_thumb_refuses("thumbv7em-freestanding")
+
+@test("and it does not borrow AArch64's account of the machine")
+ccv_thumb_does_not_borrow_aarch64s_account()
+    if !ccv_ready() then return
+
+    val e = ccv_err("thumbv7em-freestanding", ccv_bare())
+
+    ccv_says(e, "is not something thumb has")
+    ccv_never_says(e, "handler is assembly")
+    ccv_never_says(e, "fixed-size instruction slots")
+end ccv_thumb_does_not_borrow_aarch64s_account
+
+@test("and it names the spelling that does work")
+ccv_thumb_names_the_spelling_that_works()
+    if !ccv_ready() then return
+
+    ccv_says(ccv_err("thumbv7em-freestanding", ccv_bare()), "@export(\"SysTick_Handler\")")
+
+@test("the handler the thumb diagnostic asks for reaches the IR under the name it was given")
+ccv_the_handler_thumb_asks_for_reaches_the_ir()
+    if !ccv_ready() then return
+
+    ccv_says(ccv_ir("thumbv7em-freestanding", ccv_ack() + "@export(\"SysTick_Handler\")\nsystick()\n    ack()\n"),
+             "define void @SysTick_Handler()")
+
+// -- the signature each processor demands is enforced ---------------------------------------------
+
+@test("x86-64 refuses a handler with no frame, and says what the frame is for")
+ccv_x86_refuses_a_handler_with_no_frame()
+    if !ccv_ready() then return
+
+    assert_eq(ccv_err(ccv_x86(), ccv_bare()),
+              "an x86-64 interrupt handler is handed the frame the processor pushed, so 'timer' " +
+              "takes a pointer to it — 'interrupt timer(frame: *Frame)'")
+
+@test("x86-64 refuses a first parameter that is not a pointer")
+ccv_x86_refuses_a_first_parameter_not_a_pointer()
+    if !ccv_ready() then return
+
+    assert_eq(ccv_err(ccv_x86(), ccv_ack() + "interrupt fault(n: int)\n    ack()\n"),
+              "an x86-64 interrupt handler takes a pointer to the frame the processor pushed, " +
+              "optionally followed by the error code some vectors push after it — so at most '*T' " +
+              "and one integer, which is not what 'fault' declares")
+
+@test("RISC-V refuses a handler that takes anything")
+ccv_riscv_refuses_a_handler_that_takes_anything()
+    if !ccv_ready() then return
+
+    assert_eq(ccv_err(ccv_rv(), ccv_framed()),
+              "a RISC-V interrupt handler is entered with no arguments, so 'fault' takes none — " +
+              "what the handler needs is read from the machine's own registers")
+
+@test("neither may return a value")
+ccv_neither_may_return_a_value()
+    if !ccv_ready() then return
+
+    assert_eq(ccv_err(ccv_rv(), "interrupt timer() -> int = 1\n"),
+              "an interrupt handler returns to whatever it interrupted, so it yields nothing — " +
+              "'timer' declares int")
+
+@test("nor be generic, there being no way to say which instantiation the vector holds")
+ccv_nor_be_generic()
+    if !ccv_ready() then return
+
+    assert_eq(ccv_err(ccv_rv(), ccv_ack() + "interrupt timer[T]()\n    ack()\n"),
+              "an interrupt handler is a single entry point the processor jumps to, so 'timer' " +
+              "cannot be generic — there would be no way to say which instantiation the vector holds")
+
+// -- a privilege mode is only where there are privilege modes -------------------------------------
+
+@test("an unknown RISC-V mode is refused, and the set is named")
+ccv_an_unknown_riscv_mode_is_refused()
+    if !ccv_ready() then return
+
+    assert_eq(ccv_err(ccv_rv(), ccv_ack() + "interrupt(hypervisor) timer()\n    ack()\n"),
+              "'hypervisor' is not a privilege mode — RISC-V has 'machine', 'supervisor', 'user', " +
+              "and an unwritten one is 'machine'")
+
+@test("and a mode on x86-64 is refused, its convention having no level to name")
+ccv_a_mode_on_x86_is_refused()
+    if !ccv_ready() then return
+
+    assert_eq(ccv_err(ccv_x86(), ccv_ack() + ccv_frame() + "interrupt(machine) fault(f: *Frame)\n    ack()\n"),
+              "'interrupt(machine)' names a privilege mode, and x86_64 has none to name — its " +
+              "interrupt convention describes the frame the processor pushed, not the level it was " +
+              "pushed at. Write 'interrupt' alone")
+
+@test("calling one is refused, since the processor is the only caller")
+ccv_calling_one_is_refused()
+    if !ccv_ready() then return
+
+    assert_eq(ccv_err(ccv_rv(), ccv_bare() + "\ntimer()\n"),
+              "'timer' is an interrupt handler, which the processor enters and no program calls — it " +
+              "leaves through a return-from-interrupt, which would unwind a frame this call never " +
+              "pushed. Take its address for the vector table with '&timer', and put whatever the two " +
+              "share in an ordinary function they both call")
+
+@test("a call inside a function body is refused the same way")
+ccv_a_call_inside_a_body_is_refused()
+    if !ccv_ready() then return
+
+    ccv_says(ccv_err(ccv_rv(), ccv_bare() + "\nf() = timer()\n\nf()\n"),
+             "'timer' is an interrupt handler, which the processor enters and no program calls")
+
+@test("and its address is still one a vector table may hold")
+ccv_its_address_may_still_be_taken()
+    if !ccv_ready() then return
+
+    assert_eq(ccv_err(ccv_rv(), ccv_bare() + "\nval g = &timer\nprint(1)\n"), "")
+
+// -- 'interrupt' is still an ordinary name --------------------------------------------------------
+
+@test("a function may be called it, and called")
+ccv_a_function_may_be_called_interrupt()
+    if !ccv_ready_to_run() then return
+
+    assert_eq(ccv_run("interrupt(n: int) -> int = n + 1\nprint(interrupt(4))\n"), "5\n")
+
+@test("and a variable may be")
+ccv_a_variable_may_be_called_interrupt()
+    if !ccv_ready_to_run() then return
+
+    assert_eq(ccv_run("var interrupt = 7\nprint(interrupt * 2)\n"), "14\n")
+
+// -- an aggregate C passes to an exported function arrives whole ----------------------------------
+
+// The four shapes, declared once in each language so that a case says only what it is about.
+private ccv_types() -> string =
+    "struct Id\n    index1: i32\n    world0: u16\n    generation: u16\n\n" +
+        "struct Pair\n    x: f32\n    y: f32\n\n" +
+        "struct Big\n    a: i64\n    b: i64\n    c: i64\n\n" +
+        "struct Xf\n    p: Pair\n    q: Pair\n\n"
+
+private ccv_c_types() -> string =
+    "#include <stdint.h>\n\n" +
+        "typedef struct { int32_t index1; uint16_t world0; uint16_t generation; } Id;\n" +
+        "typedef struct { float x; float y; } Pair;\n" +
+        "typedef struct { int64_t a; int64_t b; int64_t c; } Big;\n" +
+        "typedef struct { Pair p; Pair q; } Xf;\n\n"
+
+// The C side asks; the sysl side only forwards what it answered.
+private ccv_asked() -> string = "\nextern \"probe_ask\" ask() -> int\n\ncheck() -> int = ask()\n"
+
+private ccv_crosses(sysl: string, c: string)
+    if !ccv_ready_to_run() then return
+
+    assert_eq(ccv_project(ccv_types() + sysl, ccv_c_types() + c), "0\n")
+
+// The single-parameter case: `index1` is the low four bytes either way, so every field is read.
+@test("one parameter, every field of it read")
+ccv_one_parameter_every_field_read()
+    ccv_crosses("@export(\"probe_one\")\none(a: Id) -> int = a.index1 * 1000 + int(a.world0) * 10 + int(a.generation)\n" +
+                    ccv_asked(),
+                "int probe_one( Id a );\n\nint probe_ask( void )\n{\n\tId a = { 7, 3, 9 };\n\n" +
+                    "\treturn probe_one( a ) == 7039 ? 0 : 999;\n}\n")
+
+@test("two parameters, which is the case that was reported")
+ccv_two_parameters()
+    ccv_crosses("@export(\"probe_two\")\ntwo(a: Id, b: Id) -> int = a.index1 * 1000 + b.index1\n" + ccv_asked(),
+                "int probe_two( Id a, Id b );\n\nint probe_ask( void )\n{\n\tId a = { 7, 3, 9 };\n" +
+                    "\tId b = { 5, 4, 8 };\n\n\treturn probe_two( a, b ) == 7005 ? 0 : 999;\n}\n")
+
+@test("an aggregate and a context pointer")
+ccv_an_aggregate_and_a_context_pointer()
+    ccv_crosses("@export(\"probe_ctx\")\nctx(a: Id, context: *u8) -> int = a.index1 * 1000 + int(context[0])\n" +
+                    ccv_asked(),
+                "int probe_ctx( Id a, unsigned char *context );\n\nint probe_ask( void )\n{\n" +
+                    "\tId a = { 7, 3, 9 };\n\tunsigned char buf[1] = { 4 };\n\n" +
+                    "\treturn probe_ctx( a, buf ) == 7004 ? 0 : 999;\n}\n")
+
+@test("a scalar first, then the aggregate")
+ccv_a_scalar_first_then_the_aggregate()
+    ccv_crosses("@export(\"probe_after\")\n" +
+                    "after(n: i32, a: Id) -> int = n * 1000000 + a.index1 * 1000 + int(a.generation)\n" +
+                    ccv_asked(),
+                "int probe_after( int32_t n, Id a );\n\nint probe_ask( void )\n{\n\tId a = { 7, 3, 9 };\n\n" +
+                    "\treturn probe_after( 2, a ) == 2007009 ? 0 : 999;\n}\n")
+
+@test("a homogeneous floating aggregate")
+ccv_a_homogeneous_floating_aggregate()
+    ccv_crosses("@export(\"probe_pair\")\n" +
+                    "pair(p: Pair, q: Pair) -> f64 = f64(p.x) + f64(p.y) * 10.0 + f64(q.x) * 100.0\n" +
+                    ccv_asked(),
+                "double probe_pair( Pair p, Pair q );\n\nint probe_ask( void )\n{\n" +
+                    "\tPair p = { 1.0f, 2.0f };\n\tPair q = { 3.0f, 4.0f };\n" +
+                    "\tdouble got = probe_pair( p, q );\n\n" +
+                    "\treturn got > 320.9 && got < 321.1 ? 0 : 999;\n}\n")
+
+@test("one too large for registers, which crosses in memory")
+ccv_one_too_large_for_registers()
+    ccv_crosses("@export(\"probe_big\")\n" +
+                    "big(v: Big, w: Big) -> i64 = v.a + v.b * 10 + v.c * 100 + w.a * 1000\n" + ccv_asked(),
+                "int64_t probe_big( Big v, Big w );\n\nint probe_ask( void )\n{\n" +
+                    "\tBig v = { 1, 2, 3 };\n\tBig w = { 4, 5, 6 };\n\n" +
+                    "\treturn probe_big( v, w ) == 4321 ? 0 : 999;\n}\n")
+
+// -- an aggregate an exported function returns arrives whole --------------------------------------
+
+@test("a small one, which comes back in registers")
+ccv_a_small_one_comes_back_in_registers()
+    ccv_crosses("@export(\"probe_make\")\nmake(n: i32) -> Id = Id(n, 3, 9)\n" + ccv_asked(),
+                "Id probe_make( int32_t n );\n\nint probe_ask( void )\n{\n\tId a = probe_make( 7 );\n\n" +
+                    "\treturn a.index1 == 7 && a.world0 == 3 && a.generation == 9 ? 0 : 999;\n}\n")
+
+@test("a large one, which comes back through storage the caller supplied")
+ccv_a_large_one_comes_back_through_storage()
+    ccv_crosses("@export(\"probe_make_big\")\nmake_big(n: i64) -> Big = Big(n, n + 1, n + 2)\n" + ccv_asked(),
+                "Big probe_make_big( int64_t n );\n\nint probe_ask( void )\n{\n" +
+                    "\tBig v = probe_make_big( 10 );\n\n" +
+                    "\treturn v.a == 10 && v.b == 11 && v.c == 12 ? 0 : 999;\n}\n")
+
+@test("one that went in and came back out")
+ccv_one_that_went_in_and_came_back_out()
+    ccv_crosses("@export(\"probe_bump\")\nbump(a: Id) -> Id = Id(a.index1 + 1, a.world0, a.generation)\n" +
+                    ccv_asked(),
+                "Id probe_bump( Id a );\n\nint probe_ask( void )\n{\n\tId a = { 7, 3, 9 };\n" +
+                    "\tId b = probe_bump( a );\n\n" +
+                    "\treturn b.index1 == 8 && b.world0 == 3 && b.generation == 9 ? 0 : 999;\n}\n")
+
+// -- the address of an exported function is one C can call through --------------------------------
+
+private ccv_through_c() -> string =
+    "typedef _Bool ( *FilterFn )( Id, Id );\n\n"
+
+private ccv_through_body() -> string =
+    "int probe_through( FilterFn f )\n{\n\tId a = { 1, 3, 9 };\n\tId b = { 2, 4, 8 };\n\n" +
+        "\treturn f( a, b ) && !f( b, a ) ? 0 : 999;\n}\n"
+
+@test("and it is the thunk's, so the aggregate arrives whole through it too")
+ccv_the_address_is_the_thunks()
+    ccv_crosses("@export(\"probe_filter\")\nfilter(a: Id, b: Id) -> bool = a.index1 < b.index1\n\n" +
+                    "extern \"probe_through\" through(f: *extern(Id, Id) -> bool) -> int\n\n" +
+                    "check() -> int = through(&filter)\n",
+                ccv_through_c() + ccv_through_body())
+
+@test("and the address of an extern is C's own, which sysl never had an opinion about")
+ccv_the_address_of_an_extern_is_cs_own()
+    ccv_crosses("extern \"probe_c_filter\" c_filter(a: Id, b: Id) -> bool\n" +
+                    "extern \"probe_through\" through(f: *extern(Id, Id) -> bool) -> int\n\n" +
+                    "check() -> int = through(&c_filter)\n",
+                ccv_through_c() + "_Bool probe_c_filter( Id a, Id b ) { return a.index1 < b.index1; }\n\n" +
+                    ccv_through_body())
+
+@test("and a homogeneous floating aggregate arrives through it too")
+ccv_a_floating_aggregate_through_an_address()
+    ccv_crosses("@export(\"probe_scale\")\n" +
+                    "scale(p: Pair, q: Pair) -> f32 = p.x + p.y * 10.0 + q.x * 100.0 + q.y * 1000.0\n\n" +
+                    "extern \"probe_through_pair\" through_pair(f: *extern(Pair, Pair) -> f32) -> int\n\n" +
+                    "check() -> int = through_pair(&scale)\n",
+                "typedef float ( *PairFn )( Pair, Pair );\n\nint probe_through_pair( PairFn f )\n{\n" +
+                    "\tPair p = { 1.0f, 2.0f };\n\tPair q = { 3.0f, 4.0f };\n\tfloat got = f( p, q );\n\n" +
+                    "\treturn got > 4320.9f && got < 4321.1f ? 0 : 999;\n}\n")
+
+// `Xf` is a floating aggregate of four members, the loose `f32` lands in the first floating
+// register the two aggregates left, and the result is nothing -- three arms through one address.
+@test("and the shape a debug-draw callback actually is")
+ccv_the_shape_of_a_debug_draw_callback()
+    ccv_crosses("@export(\"probe_draw\")\n" +
+                    "draw(xf: Xf, centre: Pair, radius: f32, colour: i32, out: *f32)\n" +
+                    "    out[0] = xf.p.x + xf.p.y * 2.0 + xf.q.x * 4.0 + xf.q.y * 8.0 +\n" +
+                    "             centre.x * 16.0 + centre.y * 32.0 + radius * 64.0 + f32(colour) * 128.0\n\n" +
+                    "extern \"probe_through_draw\" through_draw(\n" +
+                    "    f: *extern(Xf, Pair, f32, i32, *f32) -> unit) -> int\n\n" +
+                    "check() -> int = through_draw(&draw)\n",
+                "typedef void ( *DrawFn )( Xf, Pair, float, int32_t, float * );\n\n" +
+                    "int probe_through_draw( DrawFn f )\n{\n" +
+                    "\tXf xf         = { { 10.0f, 20.0f }, { 0.5f, 0.125f } };\n" +
+                    "\tPair centre   = { 3.5f, 4.5f };\n\tfloat got     = 0.0f;\n\n" +
+                    "\tf( xf, centre, 6.25f, 42, &got );\n\n\treturn got == 6029.0f ? 0 : 999;\n}\n")
+
+@test("an exported function answering nothing still takes its aggregate")
+ccv_an_export_answering_nothing_takes_its_aggregate()
+    ccv_crosses("@export(\"probe_note\")\nnote(a: Id, out: *i32)\n" +
+                    "    out[0] = a.index1 * 1000 + int(a.generation)\n" + ccv_asked(),
+                "void probe_note( Id a, int32_t *out );\n\nint probe_ask( void )\n{\n" +
+                    "\tId a = { 7, 3, 9 };\n\tint32_t got = 0;\n\n\tprobe_note( a, &got );\n\n" +
+                    "\treturn got == 7009 ? 0 : 999;\n}\n")
+
+// A sysl caller reaches the definition rather than the thunk, so the conversion is not paid on a
+// call that never leaves sysl.
+@test("an export costs a sysl caller nothing")
+ccv_an_export_costs_a_sysl_caller_nothing()
+    if !ccv_ready_to_run() then return
+
+    assert_eq(ccv_project(ccv_types() + "@export(\"probe_two\")\n" +
+                              "two(a: Id, b: Id) -> int = a.index1 * 1000 + b.index1\n\n" +
+                              "check() -> int = two(Id(7, 3, 9), Id(5, 4, 8))\n",
+                          ccv_c_types()),
+              "7005\n")
+
+// -- the generated header, given to the compiler it is written for --------------------------------
+
+// A header naming a struct has to define one, and a definition is C the consumer's compiler accepts
+// or does not: included twice, which is what the guard is for, and used, so the struct has to be
+// complete.
+@test("the generated header is C that clang accepts")
+ccv_the_generated_header_is_c_clang_accepts()
+    if !ccv_ready_to_run() then return
+
+    val src = "module demo\n\nstruct Inner\n    x: i32\n\n" +
+        "struct Id\n    index1: i32\n    world0: u16\n    inner: Inner\n    bytes: [4]u8\n\n" +
+        "enum Colour: u8\n    Red\n    Green\n\n" +
+        "@export(\"demo_bump\")\nbump(a: Id, c: Colour, p: *u8) -> Id = a\n\n" +
+        "@export(\"demo_spin\")\nspin() -> never =\n    loop\n        print(1)\n"
+
+    val b = ccv_build(src, host_target().name)
+
+    assert_eq(b.0, "")
+
+    val root = make_temp_dir("sysl-ccv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/demo.h", c_header_render(exports_by_symbol(b.2), "demo")).unwrap()
+    write_text(s"$root/user.c",
+               "#include \"demo.h\"\n#include \"demo.h\"\n\nint use( void )\n{\n" +
+                   "\tdemo_Id a = { 7, 3, { 1 }, { 2, 3, 4, 5 } };\n\tunsigned char b = 9;\n" +
+                   "\tdemo_Id r = demo_bump( a, 1, &b );\n\n" +
+                   "\treturn r.index1 + r.inner.x + r.bytes[3];\n}\n").unwrap()
+
+    val cc = find_clang(host_target(), None).unwrap()
+    val said = capture(cc, ["-std=c99", "-Wall", "-Werror", "-fsyntax-only", s"$root/user.c"], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "clang could not be run")
+        Ok(out) -> assert(out.status.ok(), s"clang refused the generated header:\n${out.text}")
+end ccv_the_generated_header_is_c_clang_accepts
