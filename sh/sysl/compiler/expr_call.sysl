@@ -1955,7 +1955,7 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
     // so each argument is analyzed at whatever type it has and passed as C's promotions leave it.
     if f.decl.variadic
         for i in slots.len()..<args.len()
-            ts.push(variadic_extra(cx, args.at(i)))
+            ts.push(variadic_extra(cx, args.at(i), false))
 
     // **`@crossing` says a parameter hands what it is given to another domain**, so the rule about
     // what may cross is asked at the CALL: the argument is the thing that could have been written
@@ -2154,7 +2154,7 @@ end arity_phrase
 // the whole of it. Anywhere else the empty parameter is NAMED: a reader looking at a defaulted list,
 // or at arguments that chose their own slots, cannot tell from a count which one was left out.
 arity_refusal(subject: string, params: Buf[Param], args: Buf[Expr], slots: Buf[Option[Expr]],
-              named_seen: bool, extra: usize) -> string
+              named_seen: bool, extra: usize, variadic: bool) -> string
     var optional = false
     var missing_at: int = -1
 
@@ -2167,6 +2167,12 @@ arity_refusal(subject: string, params: Buf[Param], args: Buf[Expr], slots: Buf[O
     if extra == 0 && missing_at >= 0 && (named_seen || optional) then
         return s"$subject was given no value for '${params.at(usize(missing_at)).name}', and that " +
                "parameter declares no default"
+
+    // A `...` turns the count into a floor: the declared parameters are all still required, and what
+    // follows them is the tail, which no declaration bounds.
+    if variadic && !optional then
+        return s"$subject takes at least ${quantity(params.len(), "argument")}, but " +
+               s"${supplied_phrase(args.len(), "argument")}"
 
     s"$subject ${arity_phrase(params)}, but ${supplied_phrase(args.len(), "argument")}"
 end arity_refusal
@@ -2344,7 +2350,7 @@ private extern_call(cx: &Analyzer, span: Span, written: string, key: string,
             ts.set(i, TExpr(slots.at(i).unwrap().span, TVaPass(ts.at(i))))
 
     for i in slots.len()..<args.len()
-        ts.push(variadic_extra(cx, args.at(i)))
+        ts.push(variadic_extra(cx, args.at(i), true))
 
     val ret = declared_result(cx, scope, d.ret_type)
 
@@ -2357,15 +2363,36 @@ end extern_call
 // the widening happens here, in the tree: an integer narrower than 32 bits becomes a 32-bit one of
 // its own signedness, and every floating width narrower than `real` becomes a `real`, both
 // sixteen-bit formats included.
-variadic_extra(cx: &Analyzer, a: Expr) -> TExpr
+//
+// What may always cross is what C can name on the other side: an integer, a float, a `char`, a raw
+// pointer, or the address of a function. **An aggregate crosses to a foreign callee and not to a sysl
+// one**: C hands a struct in a tail over under the classification a declared parameter of its type
+// gets, while a sysl callee reads its own tail back with a walk, one register at a time.
+variadic_extra(cx: &Analyzer, a: Expr, foreign: bool) -> TExpr
     val t = type_expr_bare(cx, a)
     val ty = texpr_type(t)
 
     ty match
         Integer(bits, signed, _) ->
-            if bits < 32 then TExpr(a.span, TCast(t, Integer(32, signed, false))) else t
-        Floating(bits, _) -> if bits < 64 then TExpr(a.span, TCast(t, real_type())) else t
-        _ -> t
+            return if bits < 32 then TExpr(a.span, TCast(t, Integer(32, signed, false))) else t
+        Floating(bits, _) -> return if bits < 64 then TExpr(a.span, TCast(t, real_type())) else t
+        _ -> ()
+
+    underlying(ty) match
+        Integer(_, _, _) | Floating(_, _) | Char | Ptr(_) | CFn(_, _) -> return t
+        Unknown | Never | Abstract(_, _) -> return t
+        _ -> ()
+
+    if c_aggregate(cx.an.tables.layout, ty)
+        if foreign then return t
+
+        return cx.err(a.span, s"a ${type_show(ty)} cannot be passed to a sysl function's '...' — a walk over " +
+                              "the tail reads back one register at a time and an aggregate is not one, where a " +
+                              "foreign callee takes it because C says which registers it arrives in")
+    end if
+
+    cx.err(a.span, s"a ${type_show(ty)} cannot be passed to '...' — a variadic argument must be an integer, " +
+                   "a float, a char, a raw pointer, or the address of a function")
 end variadic_extra
 
 // The file an `extern` was written in, which is where the types in its signature mean what they
