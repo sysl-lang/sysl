@@ -1,0 +1,190 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `enum` and `extern` as the parser sees them, ported from the reference's `EnumParserTests` and
+// `ExternParserTests` case for case. A tree is pinned as the shape `show.sysl` prints; each shape was
+// checked against the reference's `emit-ast --no-spans` on the same input (0.0.154), and every
+// refusal quoted here was read out of it.
+
+// The `extern` a one-declaration file holds, as the parser left it.
+private fpx_extern(text: string) -> Option[ExternDecl]
+    val r = parse(source_of("t.sysl", text))
+
+    if !r.ok() || r.program.body.is_empty() then return None
+
+    *r.program.body.at(0).kind match
+        ExternDecl(d) -> Some(d)
+        _ -> None
+end fpx_extern
+
+// -- EnumParserTests: declarations ------------------------------------------------------------------
+
+@test("a simple enum with auto and explicit values")
+fpx_a_simple_enum_with_auto_and_explicit_values()
+    assert_eq(pf("enum Color\n    Red\n    Green\n    Blue = 10\n    Yellow\n"),
+        "(enum Color (Red) (Green) (Blue = 10) (Yellow))")
+
+@test("a simple enum with a pinned underlying integer type")
+fpx_a_simple_enum_with_a_pinned_underlying_type()
+    assert_eq(pf("enum Color: u8\n    Red\n    Green\n    Blue = 10\n"),
+        "(enum Color : u8 (Red) (Green) (Blue = 10))")
+
+@test("a data enum with payload and nullary variants")
+fpx_a_data_enum_with_payload_and_nullary_variants()
+    assert_eq(pf("enum Shape\n    Circle(radius: int)\n    Rect(w: int, h: int)\n    Empty\n"),
+        "(enum Shape (Circle (radius:int)) (Rect (w:int h:int)) (Empty))")
+
+// -- EnumParserTests: members -----------------------------------------------------------------------
+
+// A payload variant is a name followed by `name: type` bindings in parentheses -- exactly the shape of
+// a method header -- so what tells the two apart is the body a member must have.
+@test("a payload variant is not mistaken for a method header")
+fpx_a_payload_variant_is_not_a_method_header()
+    assert_eq(pf("enum Shape\n    Circle(radius: int)\n    sides(self) -> int = 1\n"),
+        "(enum Shape (Circle (radius:int)) (method self sides () -> int 1))")
+
+@test("variants and members intermix, and a variant still parses after a member")
+fpx_variants_and_members_intermix()
+    assert_eq(pf("enum Color\n    Red\n    code(self) -> int = 1\n    Green = 7\n"),
+        "(enum Color (Red) (Green = 7) (method self code () -> int 1))")
+
+// Each receiver shorthand, a property and an associated function parse in an enum body exactly as in
+// a struct's, it being the same member grammar.
+@test("every member kind parses in an enum body")
+fpx_every_member_kind_parses_in_an_enum_body()
+    val src = "enum E\n    A\n    m(self) -> int = 1\n    p(*self) -> int = 2\n    r(&self) -> int = 3\n" +
+        "    doubled -> int = 4\n    make() -> int = 5\n"
+
+    assert_eq(pf(src),
+        "(enum E (A) (method self m () -> int 1) (method *self p () -> int 2) " +
+        "(method &self r () -> int 3) (prop doubled -> int 4) (method make () -> int 5))")
+
+// Blank lines between a variant and a member are how a real enum body is laid out.
+@test("blank lines separate variants from members")
+fpx_blank_lines_separate_variants_from_members()
+    assert_eq(pf("enum E\n    A\n    B\n\n    m(self) -> int = 1\nend E\n"),
+        "(enum E (A) (B) (method self m () -> int 1))")
+
+@test("a generic enum takes members and an underlying-typed one does too")
+fpx_a_generic_enum_takes_members()
+    assert_eq(pf("enum Maybe[T]\n    Just(value: T)\n    tag(self) -> int = 1\n"),
+        "(enum Maybe (T) (Just (value:T)) (method self tag () -> int 1))")
+    assert_eq(pf("enum C: u8\n    Red\n    code(self) -> int = 1\n"),
+        "(enum C : u8 (Red) (method self code () -> int 1))")
+
+// -- EnumParserTests: patterns ----------------------------------------------------------------------
+
+@test("a variant pattern binds its fields")
+fpx_a_variant_pattern_binds_its_fields()
+    assert_eq(pf("s match\n    Circle(r) -> print(r)\n    Empty -> print(0)\n"),
+        "(match s (arm (Circle r) -> (call print r)) (arm Empty -> (call print 0)))")
+
+@test("nested variant patterns and a bare binding")
+fpx_nested_variant_patterns_and_a_bare_binding()
+    assert_eq(pf("o match\n    Wrap(Val(v)) -> print(v)\n    other -> print(0)\n"),
+        "(match o (arm (Wrap (Val v)) -> (call print v)) (arm other -> (call print 0)))")
+
+// -- EnumParserTests: end markers -------------------------------------------------------------------
+
+@test("a matching end name closes a struct")
+fpx_a_matching_end_name_closes_a_struct()
+    assert_eq(pf("struct Point\n    x: int\nend Point\n"), "(struct Point (x:int))")
+
+@test("a matching end name closes an enum and a function")
+fpx_a_matching_end_name_closes_an_enum_and_a_function()
+    assert_eq(pf("enum E\n    A\n    B\nend E\nf() -> int\n    1\nend f\n"),
+        "(enum E (A) (B)) (fn f () -> int 1)")
+
+@test("a mismatched end name is a parse error naming both")
+fpx_a_mismatched_end_name_names_both()
+    assert_eq(pf_err("struct Point\n    x: int\nend Nope\n"), "'end Nope' does not match 'Point'")
+
+// -- ExternParserTests ------------------------------------------------------------------------------
+
+@test("no result at all means unit, as for a function")
+fpx_no_result_at_all_means_unit()
+    assert_eq(pf("extern abort()\n"), "(extern abort ())")
+
+@test("several parameters keep their order and their modes")
+fpx_several_parameters_keep_their_order()
+    assert_eq(pf("extern memcpy(dst: *u8, src: *u8, n: usize) -> *u8\n"),
+        "(extern memcpy (dst:*u8 src:*u8 n:usize) -> (ptr u8))")
+
+// The body is the whole difference between the two declaration forms, so an extern with one is not
+// an extern at all.
+@test("a body is not allowed")
+fpx_a_body_is_not_allowed()
+    assert_eq(pf_err("extern f() = 1\n"), "newline expected")
+    assert_eq(pf_at("extern f() = 1\n"), "1:12")
+
+@test("type parameters are not an extern's to declare")
+fpx_type_parameters_are_not_an_externs()
+    assert_eq(pf_err("extern id[T](x: T) -> T\n"),
+        "an 'extern' declares no type parameters — there is no body to monomorphize, and a " +
+        "foreign symbol is one function at one signature")
+    assert_eq(pf_at("extern id[T](x: T) -> T\n"), "1:11")
+    assert_eq(pf("id[T](x: T) -> T = x\n"), "(fn id (T) (x:T) -> T x)")
+
+@test("an extern sits among other declarations")
+fpx_an_extern_sits_among_other_declarations()
+    assert_eq(pf("extern exit(code: int) -> never\nf(n: int) -> int = n + 1\nprint(f(1))\n"),
+        "(extern exit (code:int) -> never) (fn f (n:int) -> int (+ n 1)) (call print (call f 1))")
+
+@test("several named parameters may precede it")
+fpx_several_named_parameters_may_precede_it()
+    assert_eq(pf("extern snprintf(buf: *u8, n: usize, fmt: *u8, ...) -> int\n"),
+        "(extern snprintf (buf:*u8 n:usize fmt:*u8 ...) -> int)")
+
+// `...` and `..` share a prefix, so the lexer prefers the longer one -- and goes on preferring the
+// shorter one where that is what was written.
+@test("the ellipsis does not swallow a range, nor a range the ellipsis")
+fpx_the_ellipsis_does_not_swallow_a_range()
+    assert_eq(pf("extern f(n: int, ...)\n"), "(extern f (n:int ...))")
+    assert_eq(pf("for i in 1..3\n    print(i)\n"), "(for i (.. 1 3) (call print i))")
+
+@test("a result is optional here as everywhere")
+fpx_a_result_is_optional_here()
+    assert_eq(pf("extern log(fmt: *u8, ...)\n"), "(extern log (fmt:*u8 ...))")
+
+// A string before the name is the symbol the linker resolves, and the name after it is what the
+// program calls it by.
+@test("is the symbol, and the identifier after it is the sysl name")
+fpx_a_link_name_is_the_symbol()
+    assert_eq(pf("extern \"snprintf\" fmt(buf: *u8, ...) -> int\n"),
+        "(extern \"snprintf\" fmt (buf:*u8 ...) -> int)")
+
+@test("is absent by default, and then the name is the symbol")
+fpx_a_link_name_is_absent_by_default()
+    assert_eq(pf("extern abort()\n"), "(extern abort ())")
+
+    fpx_extern("extern abort()\n") match
+        Some(d) ->
+            assert(d.link.is_none(), "no link name was written")
+            assert_eq(extern_symbol(d), "abort")
+        None -> assert(false, "the extern did not parse")
+
+    fpx_extern("extern \"snprintf\" fmt()\n") match
+        Some(d) -> assert_eq(extern_symbol(d), "snprintf")
+        None -> assert(false, "the extern did not parse")
+
+@test("may repeat the name it is already known by")
+fpx_a_link_name_may_repeat_the_name()
+    assert_eq(pf("extern \"abort\" abort()\n"), "(extern \"abort\" abort ())")
+
+// Only an `extern` reaches outside the program, so only an `extern` takes one.
+@test("is not something a sysl function may carry")
+fpx_a_link_name_is_not_a_functions()
+    assert_eq(pf_err("extern \"abort\" abort() = 1\n"), "newline expected")
+    assert_eq(pf_at("extern \"abort\" abort() = 1\n"), "1:24")
+
+@test("never is an ordinary result type on a function")
+fpx_never_on_a_function()
+    assert_eq(pf("stop() -> never = exit(1)\n"), "(fn stop () -> never (call exit 1))")
+
+@test("never is an ordinary result type on a member")
+fpx_never_on_a_member()
+    assert_eq(pf("struct Fail\n    code: int\n    raise(self) -> never = exit(self.code)\n"),
+        "(struct Fail (code:int) (method self raise () -> never (call exit (field self code))))")
