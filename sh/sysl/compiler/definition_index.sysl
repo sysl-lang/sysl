@@ -1,0 +1,126 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+
+// Where the things a program names were declared -- go-to-definition, as data, and what an editor
+// asks of a compiler beside anything a build does.
+//
+// **Every reference is recorded where the name is RESOLVED**, because that is the one moment both
+// halves are in hand and unambiguous: the place the name is written, and the declaration the
+// analyzer decided it means. After resolution a typed node carries a unique name for a local --
+// unique within one function and no further -- and a key for everything else, which is not enough to
+// find the binding again. So a local is noted where `name_expr` finds it in scope (its binding
+// carries where it was bound, `Local.declared`), a call where `function_call` settles which
+// declaration answers it, a nested function's call where the group names it, an address where
+// `function_address` settles the overload, and module storage where `name_expr` reaches it.
+//
+// **It costs nothing when nobody asked.** `Analysis.index` is `None` for every build, and every
+// recording site is one test of it; only `indexed_file` gives an analysis an index to fill.
+//
+// **What is covered is the reference compiler's `DefinitionIndex`**: locals and parameters, module
+// `val`s and `var`s, `extern` variables, and calls -- a call to a generic reaching the generic rather
+// than the instantiation it was compiled as. A type name, a struct field and a trait member are not
+// covered, there as here.
+
+// One name, written somewhere, standing for something declared somewhere else.
+//
+// `name` is what the declaration calls itself, which is not always how the reference spelled it: a
+// name reached through an import is named with its module, as the declaration's own module calls it.
+struct Reference
+    at_file: string
+    at: Loc
+    declared_file: string
+    declared_at: Loc
+    name: string
+end Reference
+
+// The references one analysis made, in the order resolution reached them and each kept once.
+//
+// **A body is read more than once** -- a generic at its definition and again per instantiation, an
+// overloaded call once per candidate -- so one name written once arrives here several times over,
+// identically. Distinctness is about the walk rather than the program, which is why it is a set of
+// what a reference says rather than of where it was written.
+struct DefinitionIndex
+    references: Buf[Reference]
+    seen: Set[string]
+
+    // Records one reference, unless it is already recorded.
+    note(*self, src: Source, at: Span, home: Source, declared: Span, name: string)
+        val here = src.locate(at.start)
+        val there = home.locate(declared.start)
+        val key = s"${src.name}:${here.line}:${here.col}>${home.name}:${there.line}:${there.col}:$name"
+
+        if self.seen.add(key) then
+            self.references.push(Reference(src.name, here, home.name, there, name))
+    end note
+end DefinitionIndex
+
+// An index with nothing in it, for an analysis an editor is asking.
+definition_index() -> &DefinitionIndex = DefinitionIndex(buf(), set())
+
+// What an editor asks for: the references the walk recorded, and every diagnostic it recorded on the
+// way. **The two are not alternatives** -- a file being typed into is a file with a mistake in it, and
+// that is exactly when it is asked where a name came from. This analysis does not escape at its first
+// error, so a walk that recorded a mistake still has the whole index.
+struct Indexing
+    references: Buf[Reference]
+    problems: Buf[Placed]
+
+    // That the file is clean -- an index and nothing to report.
+    is_clean(self) -> bool
+        for i in 0..<self.problems.len()
+            if self.problems.at(i).is_error() then return false
+
+        true
+    end is_clean
+end Indexing
+
+// A reference from a name written at `at` in the file `cx` is reading, where the analysis is
+// recording any.
+note_reference(cx: &Analyzer, at: Span, home: Source, declared: Span, name: string)
+    cx.an.index match
+        Some(ix) -> ix.note(cx.scope.src, at, home, declared, name)
+        None -> ()
+
+// A reference to a local, whose binding is in the file being read.
+note_local_reference(cx: &Analyzer, at: Span, local: Local)
+    if cx.an.index.is_none() then return
+
+    local.declared match
+        Some(where) -> note_reference(cx, at, cx.scope.src, where, local.name)
+        None -> ()
+end note_local_reference
+
+// A reference to a function the tables hold under `key`, named as its own module calls it.
+note_func_reference(cx: &Analyzer, at: Span, key: string)
+    if cx.an.index.is_none() then return
+
+    val f = cx.an.tables.funcs.get(key)
+
+    if f.is_none() then return
+
+    val home = f.unwrap().scope
+
+    note_reference(cx, at, home.src, f.unwrap().span, declared_name(home, f.unwrap().decl.name))
+end note_func_reference
+
+// A reference to module storage -- a `val`, a module `var` or an `extern` variable.
+note_storage_reference(cx: &Analyzer, at: Span, d: ValueDecl)
+    if cx.an.index.is_some() then note_reference(cx, at, d.scope.src, d.span, declared_name(d.scope, d.name))
+
+// What a declaration calls itself: its name, qualified by its module where it has one.
+private declared_name(home: Scope, name: string) -> string =
+    if home.module_name == "" then name else s"${home.module_name}.$name"
+
+// One file analyzed the way an editor asks for it: the compilation `emit-typed` reads, with an index
+// to fill. The reference's `Analyzer.indexed`.
+indexed_file(path: string) -> Result[Indexing, Failure]
+    val t = target_for(path, None)?
+    val program = packaged_compilation_of(path, t)?
+    val ix = definition_index()
+    val done = analyze_produced(program.units, program.target, buf(), true, Some(ix))
+
+    Ok(Indexing(ix.references, done.reported))
+end indexed_file

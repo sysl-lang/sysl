@@ -42,6 +42,12 @@ struct Local
     // invariants of the structs it lies inside, and the storage its path goes through is held still
     // for as long as the name is in scope, which is exactly as long as this entry is.
     stands_for: Option[TExpr]
+
+    // Where the binding was made -- the statement, function header, closure or arm being read when
+    // the name was bound (`Analyzer.bind_site`). Read by the definition index and by nothing in a
+    // build: carried in the binding rather than in a table keyed by the unique name, because a
+    // unique name is unique within one function and a table keyed by it collides across functions.
+    declared: Option[Span]
 end Local
 
 // One loop, while its body is being read.
@@ -331,7 +337,7 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, false, false, None))
+        self.locals.push(Local(name, unique, ty, false, false, None, self.bind_site))
         unique
     end bind
 
@@ -341,7 +347,7 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, true, false, None))
+        self.locals.push(Local(name, unique, ty, true, false, None, self.bind_site))
         unique
     end bind_read_only
 
@@ -354,7 +360,8 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, texpr_type(place), read_only, false, Some(place)))
+        self.locals.push(Local(name, unique, texpr_type(place), read_only, false, Some(place),
+                               self.bind_site))
         unique
     end bind_ref
 
@@ -365,7 +372,7 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, true, true, None))
+        self.locals.push(Local(name, unique, ty, true, true, None, self.bind_site))
         unique
     end bind_pattern
 
@@ -373,7 +380,7 @@ struct Analyzer
     // parameter is loaded by the name its declaration gave it.
     bind_as(*self, name: string, unique: string, ty: Type)
         self.refuse_reserved_binding(name)
-        self.locals.push(Local(name, unique, ty, false, false, None))
+        self.locals.push(Local(name, unique, ty, false, false, None, self.bind_site))
 
     // A name nothing else in this **function** holds, which is what a slot of the frame is.
     //
