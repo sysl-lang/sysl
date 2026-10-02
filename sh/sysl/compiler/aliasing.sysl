@@ -422,10 +422,40 @@ private check_packed_field(cx: &Analyzer, span: Span, place: TExpr)
                 _ -> ()
         _ -> ()
 
+// The `&sync` box a view of this place would count against, if the place lies inside one
+// (`reference/arrays.md § What is still refused`).
+//
+// A view keeps its storage alive by holding a share of the box the storage sits in, and it records
+// nothing about whether that box's count is atomic -- so it takes and gives back its share the
+// ordinary way, which races with every other domain holding the same box. The walk follows the hops
+// that keep a place inside one object -- a field, an array element -- through to the box they are
+// in. A view or a raw pointer on the way is storage of its own, and a box that is not `&sync` is one
+// a non-atomic count is right for, so either ends the walk with nothing to refuse.
+private sync_owner(cx: &Analyzer, place: TExpr) -> Option[Type] = *place.kind match
+    TField(recv, _, _) -> sync_owner(cx, recv)
+    TIndex(recv, _, _) -> if far_side(texpr_type(recv)) then None else sync_owner(cx, recv)
+    TDeref(op, _) -> sync_box(underlying(unqualified(texpr_type(op))))
+    TLoad(name, _) -> ref_place(cx, name) match
+        Some(stood) -> sync_owner(cx, stood)
+        None -> None
+    _ -> None
+
+private sync_box(t: Type) -> Option[Type] = t match
+    Ref(_, sync) -> if sync then Some(t) else None
+    _ -> None
+
 // The same refusal for the other way to reach storage that outlives the expression: a view of it
 // that may be written. A `[]const T` is left alone, since giving up the write is exactly what makes
 // the alias carry no promise it could break.
 check_sliceable(cx: &Analyzer, span: Span, base: TExpr, view: Type)
+    sync_owner(cx, base) match
+        Some(box) ->
+            cx.fault(span, "a slice does not record whether its owner's count is atomic, so storage " +
+                     s"inside a '${type_show(box)}' cannot be sliced — a view of it would take its " +
+                     "share of the box with a count update that is not atomic. Read it by index, or " +
+                     "walk it with 'for'")
+        None -> ()
+
     // Slicing a view makes a view of **its** storage, which is on the far side and no clause's to
     // read -- `self.elems[..<self.count]` shares the buffer's elements and leaves its length alone.
     if read_only_view(view) || far_side(texpr_type(base)) then return
