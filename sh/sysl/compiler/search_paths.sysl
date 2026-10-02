@@ -55,7 +55,36 @@ reset_search_paths()
     sp_libs = buf()
     sp_std_from_source = false
     sp_verbose = false
+    sp_explain = false
+    sp_say = None
 end reset_search_paths
+
+// Whether `--explain-escapes` was given: the build says, one line per array, which local arrays it
+// moved to the heap and the view that forced it -- or that there were none.
+private var sp_explain: bool = false
+
+// Where those lines go. The command line's own output channel is handed over by `run_cli`, so the
+// lines arrive in the order they were found, ahead of anything the command says when it finishes.
+private var sp_say: Option[&Fn(string) -> unit] = None
+
+explaining() -> bool = sp_explain
+
+// Hands the command's output channel to the report `--explain-escapes` asks for.
+set_explain_sink(say: &Fn(string) -> unit)
+    sp_say = Some(say)
+
+// Says each line of the report, where one was asked for. Nothing otherwise.
+explain_escapes(lines: Buf[string])
+    if !sp_explain then return
+
+    sp_say match
+        None -> ()
+        Some(say) ->
+            if lines.is_empty() then say("no arrays were promoted to the heap")
+
+            for i in 0..<lines.len()
+                say(lines.at(i))
+end explain_escapes
 
 // Every source root a `--lib` named, as it was written and in the order it was written.
 //
@@ -192,6 +221,11 @@ took_search_flag(args: []string, i: usize) -> int
 
     if arg == "--verbose" || arg == "-v"
         sp_verbose = true
+        return 1
+    end if
+
+    if arg == "--explain-escapes"
+        sp_explain = true
         return 1
     end if
 

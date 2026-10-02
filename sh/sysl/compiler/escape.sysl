@@ -38,6 +38,13 @@ struct Promotions
     // that made it.
     temporaries: Buf[Span]
 
+    // **Why each array moved**, one line per array in the order the bodies were walked, each
+    // `file:line:col: 'buf' is promoted to the heap, because this view of it is returned` -- the
+    // view that forced it and the route it took out. Promotion is silent, not hidden: this is what
+    // `--explain-escapes` prints, so "why did this allocate?" always has an answer. The file name
+    // rides beside each line, so a reader can keep the lines about one file.
+    notes: Buf[(string, string)]
+
     // The arrays this body must move, in the terms the emitter asks: a function's name, or the empty
     // string for the statements a program runs.
     for_func(self, name: string) -> Buf[string]
@@ -62,8 +69,9 @@ no_promotions() -> Promotions
     var by_func: Buf[(string, Buf[string])] = buf()
     var in_main: Buf[string] = buf()
     var temporaries: Buf[Span] = buf()
+    var notes: Buf[(string, string)] = buf()
 
-    Promotions(by_func, in_main, temporaries)
+    Promotions(by_func, in_main, temporaries, notes)
 end no_promotions
 
 // What one body's walk found: the arrays it must move, the temporaries it must give storage to,
@@ -202,8 +210,10 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
         val w = walk_body(p, keeps, f.body.stmts, f.body.result, true)
+        val home = func_home(a, f.name)
 
-        report_body(a, p, func_home(a, f.name), Some(f.name), w)
+        report_body(a, p, home, Some(f.name), w)
+        note_promotions(&out.notes, home, w)
 
         if !w.promoted.is_empty() then out.by_func.push((f.name, w.promoted))
 
@@ -212,7 +222,10 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
 
     val mw = walk_body(p, keeps, p.main, None, true)
 
-    report_body(a, p, entry_home(a), None, mw)
+    val entry = entry_home(a)
+
+    report_body(a, p, entry, None, mw)
+    note_promotions(&out.notes, entry, mw)
 
     for j in 0..<mw.temps.len()
         out.temporaries.push(mw.temps.at(j).0)
@@ -220,6 +233,20 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
     out.in_main = mw.promoted
     out
 end check_escapes
+
+// One line per array a body moved, at the view that moved it. A temporary is not named here: what
+// the report answers is which *declaration* allocates, and a temporary has none to point at.
+private note_promotions(into: *Buf[(string, string)], home: Scope, w: EscapeWalk)
+    for i in 0..<w.sites.len()
+        val site = w.sites.at(i)
+
+        if site.name != ""
+            val at = home.src.locate(site.at.start)
+            val line = s"${home.src.name}:${at.line}:${at.col + literate_shift(home.src)}: " +
+                s"'${site.name}' is promoted to the heap, because this view of it ${site.how}"
+
+            into.push((home.src.name, line))
+end note_promotions
 
 // For each function, which of its slice-carrying parameters it lets outlive the call. Starts
 // optimistic -- nothing is kept -- and grows until it stops changing, which is what makes a
@@ -572,7 +599,9 @@ private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how
     w.got_out = true
 
     if v.anonymous && w.refusal.is_none()
-        w.refusal = Some((at.span,
+        // Placed at the view's own bracket, as a promotion's note is: what has to change is the
+        // slice, and the function around it is fine.
+        w.refusal = Some((view_anchor(at),
             s"a slice of an array this frame owns $how, so it would outlive the array, and the " +
             "storage is not this body's to move — it is a field of a value, an array a caller " +
             "passed by value, or part of an array literal, which has no declaration to move. " +
