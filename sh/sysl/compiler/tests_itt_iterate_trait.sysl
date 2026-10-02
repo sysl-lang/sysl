@@ -1,0 +1,646 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The reference's `IterateTraitTests`: walking a sequence a program has to produce a value at a time —
+// `for x in cursor` through the library's `Iterate` (`library/core.md § Walking a type of your own`),
+// and `s.chars`, which is what decided the shape. A container is deliberately not a cursor: a `Buf`
+// hands out a view, and the protocol exists for sequences whose elements are computed.
+//
+// **Every output and diagnostic here was read out of the reference compiler (0.0.156)** by handing
+// the installed `sysl` the same program. The harness is `tests_enm_enum_run.sysl`'s.
+
+// A counter: the smallest thing that is a sequence without being storage.
+private itt_upto(rest: string) -> string = raw"""
+    struct Upto
+        at: int
+        last: int
+    end Upto
+    impl Iterate for Upto
+        type Item = int
+        next(*self) -> Option[int]
+            if self.at > self.last then return None
+            self.at += 1
+            Some(self.at - 1)
+        end next
+    """ + rest
+
+// A cursor whose items own heap, which is what an over-release can be seen through: an `int` is
+// copied and has no count to get wrong.
+private itt_cursor(rest: string) -> string = raw"""
+    struct Src
+        at: int
+    end Src
+    impl Iterate for Src
+        type Item = string
+        next(*self) -> Option[string]
+            if self.at >= 3 then return None
+            self.at += 1
+            Some("v" + str(self.at - 1))
+        end next
+    """ + rest
+
+// A refusal carries this message, anchored at this `line:column` of the program's one file.
+private itt_refused(text: string, message: string, at: string)
+    val said = enm_outcome(text).0
+
+    assert(said.contains(s"error: $message\n"), said)
+    assert(said.contains(s"/main.sysl:$at\n"), said)
+
+// -- what the documents claim ----------------------------------------------------------------------
+
+@test("a type that implements 'Iterate' is what a 'for' walks")
+itt_a_type_that_implements_iterate()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto("for i in Upto(1, 4) do print(i)\n")), "1\n2\n3\n4\n")
+
+// Two-, three- and four-byte encodings are all here, so a decoder that handled only the short forms
+// fails.
+@test("'s.chars' decodes a string into its scalar values")
+itt_chars_decodes()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("for c in \"aé→𝄞\".chars do print(c)\n"), "a\né\n→\n𝄞\n")
+
+@test("bytes and characters are two granularities of one string")
+itt_bytes_and_characters()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var b = 0
+        var c = 0
+        for _ in "aé→𝄞".bytes do b += 1
+        for _ in "aé→𝄞".chars do c += 1
+        print(b, c)
+        """), "10 4\n")
+
+@test("the sequence expression is evaluated once")
+itt_evaluated_once()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        start() -> Upto
+            print("built")
+            Upto(1, 3)
+        for i in start() do print(i)
+        """)), "built\n1\n2\n3\n")
+
+@test("an 'else' runs when the elements run out and not when a 'break' left")
+itt_else_runs_when_elements_run_out()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        for i in Upto(1, 3)
+            print(i)
+        else
+            print("done")
+        for i in Upto(1, 3)
+            break
+        else
+            print("unreachable")
+        """)), "1\n2\n3\ndone\n")
+
+@test("'continue' takes the next element")
+itt_continue_takes_the_next()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        for i in Upto(1, 6)
+            if i % 2 == 1 then continue
+            print(i)
+        """)), "2\n4\n6\n")
+
+@test("the loop is an expression, and its 'break' carries a value")
+itt_the_loop_is_an_expression()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        var found = for i in Upto(1, 9)
+            if i * i > 20 then break i
+        else
+            0
+        print(found)
+        """)), "5\n")
+
+@test("'chars' is compiler-provided, so an 'impl' may not redeclare it")
+itt_chars_is_compiler_provided()
+    if !enm_ready() then return
+
+    itt_refused(raw"""
+        trait Mine
+            chars(self) -> int
+        impl Mine for string
+            chars(self) -> int = 1
+        """, "'chars' is a member the compiler provides for string — a member of this name would hide it",
+        "4:5")
+
+@test("'next' is a method a program may call itself")
+itt_next_is_a_method()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        var it = Upto(7, 8)
+        print(it.next().unwrap())
+        print(it.next().unwrap())
+        print(it.next().is_none())
+        """)), "7\n8\ntrue\n")
+
+// -- what the edges do -----------------------------------------------------------------------------
+
+// A `return` out of the body releases what `next` handed over once on the way into the body and once
+// on the exhausted edge — and a `return`'s release of every region must not reach that one a third
+// time. Counted in the IR, since an over-release still prints the right answer until the storage is
+// reused.
+@test("a 'return' from the body gives what 'next' handed over back exactly once per edge")
+itt_a_return_gives_back_once_per_edge()
+    if !enm_ready() then return
+
+    val out = enm_ir(itt_cursor(raw"""
+        first(s: Src) -> string
+            for x in s
+                return x
+
+            "none"
+
+        print(first(Src(0)))
+        """))
+
+    assert_eq(out.count_of("call void @arc.dispose.sysl$Option.string("), 2)
+
+@test("and a value found by an early return survives the loop it was found in")
+itt_an_early_return_survives()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_cursor(raw"""
+        first(s: Src) -> string
+            for x in s
+                return x
+
+            "none"
+
+        print(first(Src(0)))
+        print(first(Src(0)))
+        """)), "v0\nv0\n")
+
+@test("a sequence with no elements runs the body no times")
+itt_no_elements()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        for i in Upto(5, 1)
+            print(i)
+        else
+            print("empty")
+        """)), "empty\n")
+
+@test("an empty string has no characters")
+itt_an_empty_string()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var n = 0
+        for _ in "".chars do n += 1
+        print(n)
+        """), "0\n")
+
+@test("the loop drains a copy, so what it was written from is untouched")
+itt_the_loop_drains_a_copy()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        var it = Upto(1, 2)
+        for i in it do print(i)
+        for i in it do print(i)
+        print(it.next().unwrap())
+        """)), "1\n2\n1\n2\n1\n")
+
+// `Iterate` takes no arguments and its element is an associated type, so a second implementation is
+// the duplicate it looks like, refused where it is written rather than at the loop.
+@test("a type implementing 'Iterate' twice is a duplicate, not a choice a 'for' has to make")
+itt_implementing_twice_is_a_duplicate()
+    if !enm_ready() then return
+
+    itt_refused(raw"""
+        struct Both
+            n: int
+        end Both
+        impl Iterate for Both
+            type Item = int
+            next(*self) -> Option[int] = None
+        impl Iterate for Both
+            type Item = bool
+            next(*self) -> Option[bool] = None
+        for x in Both(0) do print(x)
+        """, "'Both' already implements 'sysl.Iterate'", "7:1")
+
+@test("a bare string is still not iterable, and the message names both granularities")
+itt_a_bare_string()
+    if !enm_ready() then return
+
+    itt_refused("for c in \"abc\" do print(c)\n",
+                "a string is iterated as 's.bytes' or 's.chars', since a string has bytes and characters both",
+                "1:1")
+
+@test("a type that implements nothing is refused with the whole list")
+itt_implements_nothing()
+    if !enm_ready() then return
+
+    itt_refused(raw"""
+        struct P
+            x: int
+        end P
+        for v in P(1) do print(v)
+        """, "'for' iterates an integer range, an array, a slice, or a type that implements " +
+             "'sysl.Iterate', and P is none of those", "4:1")
+
+@test("a 'Buf' names 'view()', which is the road a container takes")
+itt_a_buf_names_view()
+    if !enm_ready() then return
+
+    itt_refused(raw"""
+        import sysl.buf.*
+        var b: Buf[int] = buf()
+        b.push(1)
+        for x in b do print(x)
+        """, "'for' iterates an integer range, an array, a slice, or a type that implements " +
+             "'sysl.Iterate', and sysl.buf.Buf[int] is none of those — what it does have is 'view()', " +
+             "which answers with something a 'for' walks, so 'for x in b.view()' is the loop", "4:1")
+
+// The subject is a call rather than a name, so there is no spelling to hand back: the member is named
+// and the worked line is left off.
+@test("a container that hands out a cursor names the member that does it")
+itt_a_container_names_its_cursor()
+    if !enm_ready() then return
+
+    itt_refused(itt_upto(raw"""
+        struct Bag
+            n: int
+
+            walk(self) -> Upto = Upto(0, self.n)
+        end Bag
+        for x in Bag(2) do print(x)
+        """), "'for' iterates an integer range, an array, a slice, or a type that implements " +
+              "'sysl.Iterate', and Bag is none of those — what it does have is 'walk()', which " +
+              "answers with something a 'for' walks", "17:1")
+
+@test("a member that takes an argument is not offered as the road")
+itt_a_member_taking_an_argument()
+    if !enm_ready() then return
+
+    itt_refused(raw"""
+        struct Win
+            xs: []int
+
+            first(self, n: usize) -> []int = self.xs[0..<n]
+        end Win
+        for x in Win([1, 2]) do print(x)
+        """, "'for' iterates an integer range, an array, a slice, or a type that implements " +
+             "'sysl.Iterate', and Win is none of those", "6:1")
+
+@test("a type with no road to offer gets the list alone")
+itt_no_road_gets_the_list_alone()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        struct P
+            x: int
+        end P
+        for v in P(1) do print(v)
+        """).0
+
+    assert(said.contains("and P is none of those\n"), said)
+    assert(!said.contains("what it does have"), said)
+
+@test("the loop variable is a copy")
+itt_the_loop_variable_is_a_copy()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        for i in Upto(1, 3)
+            i = 9
+            print(i)
+        """)), "9\n9\n9\n")
+
+// The total is the sum of the code points of "ab0" … "ab1999".
+@test("a cursor over a temporary string keeps it alive for the whole loop")
+itt_a_temporary_string_kept_alive()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        build(n: int) -> string = "ab" + str(n)
+        var total = 0
+        for i in 0..<2000
+            for c in build(i).chars
+                total += int(u32(c))
+        print(total)
+        """), "748720\n")
+
+@test("cursors nest")
+itt_cursors_nest()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        for i in Upto(1, 3)
+            for j in Upto(1, i) do print(i, j)
+        """)), "1 1\n2 1\n2 2\n3 1\n3 2\n3 3\n")
+
+@test("a labelled 'break' leaves an outer iterating loop")
+itt_a_labelled_break()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        'outer for i in Upto(1, 9)
+            for j in Upto(1, 9)
+                if i * j > 6 then break 'outer
+                print(i, j)
+        """)), "1 1\n1 2\n1 3\n1 4\n1 5\n1 6\n")
+
+// The cursor `Cells` yields a fresh reference each round.
+private itt_cells(rest: string) -> string = raw"""
+    struct Cell
+        v: int
+    end Cell
+    struct Cells
+        at: int
+        n: int
+    end Cells
+    impl Iterate for Cells
+        type Item = &Cell
+        next(*self) -> Option[&Cell]
+            if self.at >= self.n then return None
+            self.at += 1
+            Some(Cell(self.at))
+        end next
+    """ + rest
+
+@test("an iterator that yields references neither leaks nor double-frees")
+itt_references_neither_leak_nor_double_free()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_cells(raw"""
+        var total = 0
+        for _ in 0..<1000
+            for c in Cells(0, 20) do total += c.v
+        print(total)
+        """)), "210000\n")
+
+@test("a 'break' out of an iterator over references does not free the round's element twice")
+itt_a_break_frees_once()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_cells(raw"""
+        var total = 0
+        for _ in 0..<1000
+            for c in Cells(0, 20)
+                total += c.v
+                if c.v == 3 then break
+        print(total)
+        """)), "6000\n")
+
+@test("a bound promising 'Iterate' licenses the call in a generic body")
+itt_a_bound_licenses_the_call()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        count_all[T: Iterate](it: T) -> int
+            var seen = 0
+            var cur = it
+            loop
+                var got = cur.next()
+                if got.is_none() then break
+                seen += 1
+            seen
+        print(count_all(Upto(1, 4)))
+        """)), "4\n")
+
+@test("and the element is reachable as 'T::Item', which is what a parameter could not be")
+itt_the_element_as_an_associated_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        first[T: Iterate](it: T) -> Option[T::Item]
+            var cur = it
+            cur.next()
+        print(first(Upto(3, 9)).unwrap())
+        """)), "3\n")
+
+@test("a 'for' over a bounded type parameter walks it")
+itt_a_for_over_a_bounded_parameter()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        walk[T: Iterate](it: T) -> int
+            var n = 0
+            for _ in it do n += 1
+            n
+        print(walk(Upto(1, 2)))
+        """)), "2\n")
+
+@test("a 'for' walks an erased cursor, and so does a direct 'next'")
+itt_an_erased_cursor()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        var o: &Iterate[int] = Upto(1, 2)
+        print(o.next().unwrap())
+        print(o.next().unwrap())
+        print(o.next().is_none())
+        """)), "1\n2\ntrue\n")
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        var o: &Iterate[int] = Upto(1, 3)
+        for x in o do print(x)
+        """)), "1\n2\n3\n")
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        var c = Upto(1, 3)
+        var o: *Iterate[int] = &c
+        for x in o do print(x)
+        """)), "1\n2\n3\n")
+end itt_an_erased_cursor
+
+@test("and the element may be named outright, which is the same type as the short form")
+itt_the_element_named_outright()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        var o: &Iterate[Item = int] = Upto(1, 3)
+        for x in o do print(x)
+        """)), "1\n2\n3\n")
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        count(o: *Iterate[Item = int]) -> int
+            var n = 0
+            for _ in o do n += 1
+            n
+        var c = Upto(1, 4)
+        var short: *Iterate[int] = &c
+        print(count(short))
+        """)), "4\n")
+end itt_the_element_named_outright
+
+@test("and one over a trait that requires it, which is the closure being read rather than the name")
+itt_one_over_a_requiring_trait()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        trait Counted: Iterate
+            seen(self) -> int
+
+        struct Upto
+            at: int
+            hi: int
+
+        impl Iterate for Upto
+            type Item = int
+            next(*self) -> Option[int]
+                if self.at > self.hi then None else
+                    var v = self.at
+                    self.at += 1
+                    Some(v)
+
+        impl Counted for Upto
+            seen(self) -> int = self.at
+        end Upto
+
+        var o: &Counted[int] = Upto(1, 3)
+
+        for x in o do print(x)
+
+        print(o.seen())
+        """), "1\n2\n3\n4\n")
+end itt_one_over_a_requiring_trait
+
+@test("an 'Iterate' for a slice does not take over the built-in walk")
+itt_a_slice_keeps_the_built_in_walk()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct N
+            v: int
+        impl Iterate for []N
+            type Item = N
+            next(*self) -> Option[N] = Some(N(99))
+        var xs = [N(1), N(2), N(3)]
+        for x in xs[..] do print(x.v)
+        var s = xs[..]
+        print(s.next().unwrap().v)
+        """), "1\n2\n3\n99\n")
+
+@test("a cursor over a local array walks it and may not leave the frame")
+itt_a_cursor_over_a_local_array()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Take
+            xs: []int
+            at: usize
+        end Take
+        impl Iterate for Take
+            type Item = int
+            next(*self) -> Option[int]
+                if self.at >= self.xs.len then return None
+                self.at += 1
+                Some(self.xs[self.at - 1])
+            end next
+        var a = [4, 5, 6]
+        for v in Take(a[..], 0) do print(v)
+        """), "4\n5\n6\n")
+
+// One scalar value on each side of every encoding-length boundary: the byte length pins the encoder,
+// the code points the decoder.
+@test("every encoding length round-trips at its boundary")
+itt_every_encoding_length()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var pts: [7]u32 = [0x7F, 0x80, 0x7FF, 0x800, 0xFFFF, 0x10000, 0x10FFFF]
+        var s = ""
+        for p in pts do s += str(char(p))
+        var i = 0
+        var bad = 0
+        for c in s.chars
+            if u32(c) != pts[i] then bad += 1
+            i += 1
+        print(s.len, i, bad)
+        """), "19 7 0\n")
+
+@test("a cursor reached through a reference is dereferenced")
+itt_a_cursor_through_a_reference()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(itt_upto(raw"""
+        var r: &Upto = Upto(1, 3)
+        for i in *r do print(i)
+        print(r.next().unwrap())
+        """)), "1\n2\n3\n1\n")
+
+@test("a 'return' from inside the loop lets the cursor go")
+itt_a_return_lets_the_cursor_go()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Cell
+            v: int
+        end Cell
+        struct Once
+            c: &Cell
+            done: bool
+        end Once
+        impl Iterate for Once
+            type Item = int
+            next(*self) -> Option[int]
+                if self.done then return None
+                self.done = true
+                Some(self.c.v)
+            end next
+        first(n: int) -> int
+            for v in Once(Cell(n), false) do return v
+            0
+        var total = 0
+        for i in 0..<5000 do total += first(i)
+        print(total)
+        """), "12497500\n")
+end itt_a_return_lets_the_cursor_go
+
+@test("a cursor with no state is a slot the loop does not need")
+itt_a_cursor_with_no_state()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Tick
+            u: unit
+        end Tick
+        impl Iterate for Tick
+            type Item = int
+            next(*self) -> Option[int] = None
+        for x in Tick(()) do print(x)
+        print("through")
+        """), "through\n")
+
+@test("a hand-built cursor over truncated bytes yields a replacement rather than trapping")
+itt_truncated_bytes_yield_a_replacement()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.text.chars_of
+
+        var b: [1]u8 = [0xF0]
+        for c in chars_of(b[..]) do print(u32(c))
+        print("through")
+        """), "65533\nthrough\n")
+
+@test("an implementation whose 'next' has the wrong shape is refused")
+itt_a_next_of_the_wrong_shape()
+    if !enm_ready() then return
+
+    itt_refused(raw"""
+        struct Bad
+            n: int
+        end Bad
+        impl Iterate for Bad
+            type Item = int
+            next(*self) -> int = 0
+        """, "method 'next' returns int, but trait 'sysl.Iterate' declares sysl.Option[int]", "4:1")
