@@ -1,0 +1,309 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The reference's `PurityTests`: `@pure`, a function a caller can observe nothing about but its
+// result (`reference/verification.md § @pure`). The feature is a list of exclusions, so the cases
+// are the list plus the neighbour of each -- what is banned, and the thing one step away that is
+// not. Allocation and trapping are the two exclusions the design deliberately does NOT make, so
+// they are tested as acceptances.
+//
+// **Every output and every diagnostic here was read out of the reference compiler (0.0.158)** by
+// handing the installed `sysl` the same program. A diagnostic is pinned by its message and its
+// `file:line:column`; where the two compilers anchor one node differently (the open divergence on
+// spans) only the line is pinned. The harness is `tests_enm_enum_run.sysl`'s: a program built and
+// run for real, answering with the build's refusal where there is one.
+
+// A refusal carries this message, anchored at this `file:line:column` (or `file:line:`).
+private pux_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message, and a caller of one may observe nothing about the call " +
+                         s"but its result\n --> "), said)
+    assert(said.contains(s"main.sysl:$at"), said)
+
+private pux_built(text: string) -> string = enm_outcome(text).0
+
+// -- what a pure function may do -------------------------------------------------------------------
+
+@test("a pure function may do arithmetic over its parameters")
+pux_arithmetic_over_its_parameters()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@pure\nsquare(x: int) -> int = x * x\n\nprint(square(7))\n"), "49\n")
+
+@test("a pure function may recurse")
+pux_recurse()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@pure\nfact(n: int) -> int\n    require n >= 0\n    if n <= 1 then 1\n" +
+                      "    else n * fact(n - 1)\n\nprint(fact(5))\n"), "120\n")
+
+@test("a pure function may call another pure function")
+pux_call_another_pure_function()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@pure\ndouble(x: int) -> int = x * 2\n\n@pure\n" +
+                      "quad(x: int) -> int = double(double(x))\n\nprint(quad(3))\n"), "12\n")
+
+// Storage the call made is the call's, however deep the path into it goes -- which is what makes the
+// rule about the *path* rather than about writing at all.
+@test("a pure function may declare and mutate its own locals, including into an array it holds")
+pux_mutate_its_own_locals()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@pure\nsum(a: [4]int) -> int\n    var b = a\n    var t = 0\n\n    b[0] = 99\n\n" +
+                      "    for i in 0..<4\n        t += b[i]\n\n    t\n\n" +
+                      "var xs = [1, 2, 3, 4]\nprint(sum(xs))\n"), "108\n")
+
+// A caller cannot observe an object that did not exist when the call began, so allocating is not an
+// effect -- the departure from old sysl, and a check banning it would refuse every string operation.
+@test("a pure function may allocate, which is the departure from old sysl")
+pux_allocate()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@pure\nshout(s: string) -> string = s + \"!\"\n\nprint(shout(\"hi\"))\n"), "hi!\n")
+
+// Termination is the one effect purity does not exclude: constrained arithmetic can trap, and
+// excluding it would exclude those types wholesale.
+@test("a pure function may trap")
+pux_trap()
+    if !enm_ready() then return
+
+    assert_eq(enm_exits("type Slot = new u8 within 0..<200\n\n@pure\n" +
+                        "narrow(n: int) -> Slot = Slot(u8(n))\n\nprint(int(narrow(250)))\n"), "")
+
+@test("a pure function may carry a contract, and a variant")
+pux_carry_a_contract()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@pure\nhalf(x: int) -> int\n    require x >= 0\n    ensure result >= 0\n" +
+                      "    x / 2\n\nprint(half(9))\n"), "4\n")
+
+@test("a pure function may be generic")
+pux_be_generic()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@pure\ntwice[T: Add](x: T) -> T = x + x\n\nprint(twice(21))\n"), "42\n")
+
+// -- what it may not do ----------------------------------------------------------------------------
+
+@test("a pure function may not call a function that is not pure")
+pux_call_an_impure_function()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("noisy(x: int) -> int = x + 1\n\n@pure\nf(x: int) -> int = noisy(x)\n\n" +
+                          "print(f(1))\n"),
+                "a '@pure' function calls 'noisy', which is not marked '@pure'", "4:20")
+
+@test("a pure function may not perform I/O")
+pux_perform_io()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("@pure\nf(x: int) -> int\n    print(x)\n    x\n\nprint(f(1))\n"),
+                "a '@pure' function calls 'sysl.printi', which is not marked '@pure'", "3:5")
+
+// `print` lowers to a call nobody wrote, so a walk reporting the node's own position would land in
+// the library rather than on the line the reader typed.
+@test("and the I/O diagnostic points at the call that was written")
+pux_io_points_at_the_written_call()
+    if !enm_ready() then return
+
+    val said = pux_built("@pure\nf(x: int) -> int\n    print(x)\n    x\n\nprint(f(1))\n")
+
+    assert(said.contains(" --> main.sysl:3:5\n"), said)
+    assert(said.contains("3 |     print(x)\n"), said)
+end pux_io_points_at_the_written_call
+
+@test("a pure function may not call an extern")
+pux_call_an_extern()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("extern puts(s: *u8) -> int\n\n@pure\nf() -> int\n    puts(c\"hi\")\n    1\n\n" +
+                          "print(f())\n"),
+                "a '@pure' function calls 'puts', which is an 'extern' and says nothing about what it does",
+                "5:5")
+
+@test("a pure function may not write through a pointer")
+pux_write_through_a_pointer()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("@pure\nf(p: *int) -> int\n    *p = 5\n    1\n\nprint(f(null))\n"),
+                "a '@pure' function writes through a reference to storage it did not create", "3:5")
+
+// The lane read is not the observable thing; the call underneath it is, and the test is that the walk
+// got there at all.
+@test("a pure function may not call an impure function and read one lane of what it answers")
+pux_read_one_lane_of_an_impure_call()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("g() -> <4>f32 = [1.0, 2.0, 3.0, 4.0]\n\n@pure\nf() -> f32 = g()[0]\n\n" +
+                          "print(f())\n"),
+                "a '@pure' function calls 'g', which is not marked '@pure'", "4:14")
+
+@test("a pure function may not call an impure function inside the index of a load")
+pux_impure_call_inside_a_load_index()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("g() -> usize = 0\n\n@pure\nf(xs: []const f32) -> f32\n" +
+                          "    val v: <4>f32 = xs.load(g())\n    v[0]\n\nvar a: [8]f32\nprint(f(a[..]))\n"),
+                "a '@pure' function calls 'g', which is not marked '@pure'", "5:29")
+
+// `xs.store(i, v)` is the one write that is not a store node, so it is listed among the observable
+// calls rather than reached by the walk. The fixture's `var b: &[8]f32` is refused in its own right
+// (a counted reference has no zero value) by both compilers; the purity refusal is the one pinned.
+@test("a pure function may not store a vector's lanes into a reference it was handed")
+pux_store_lanes_into_a_reference()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("@pure\nf(a: &[8]f32) -> int\n    val v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\n" +
+                          "    a.store(0, v)\n    1\n\nvar b: &[8]f32\nprint(f(b))\n"),
+                "a '@pure' function writes through a reference to storage it did not create", "4:7")
+
+@test("a pure function may not write into a field of a reference it was handed")
+pux_write_a_field_of_a_reference()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("struct Cell\n    n: int\n\n@pure\nf(c: &Cell) -> int\n    c.n = 5\n    1\n\n" +
+                          "print(f(Cell(1)))\n"),
+                "a '@pure' function writes through a reference to storage it did not create", "6:5")
+
+// The reference anchors an increment at its operator and this compiler at its place: the line is
+// what both agree on.
+@test("a pure function may not increment through a reference it was handed")
+pux_increment_through_a_reference()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("struct Cell\n    n: int\n\n@pure\nf(c: &Cell) -> int\n    c.n++\n    1\n\n" +
+                          "print(f(Cell(1)))\n"),
+                "a '@pure' function writes through a reference to storage it did not create", "6:")
+
+// A call through an `Fn` resolves to the closure's own `call` body, which has a name -- so what is
+// checked is that the reader is told they called through a closure, not the name it was filed under.
+@test("a pure function may not call through a value")
+pux_call_through_a_value()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("@pure\nf(g: int -> int) -> int = g(1)\n\nprint(f(x -> x + 1))\n"),
+                "a '@pure' function calls through a closure, which names no declaration for the " +
+                "compiler to consult", "2:27")
+
+@test("a pure function may not dispatch through a trait object")
+pux_dispatch_through_a_trait_object()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("trait Speak\n    say(self) -> int\n\nstruct Dog\nend Dog\n\n" +
+                          "impl Speak for Dog\n    say(self) -> int = 1\n\n@pure\n" +
+                          "f(s: &Speak) -> int = s.say()\n\nprint(f(Dog()))\n"),
+                "a '@pure' function dispatches through a trait object, where which body runs is " +
+                "settled while the program is", "11:25")
+
+@test("a pure function may not read a mutable global")
+pux_read_a_mutable_global()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("extern optind: i32\n\n@pure\nf() -> int = int(optind)\n\nprint(f())\n"),
+                "a '@pure' function reaches 'optind', which is storage outside the call and may change " +
+                "under it", "4:18")
+
+// One arm naming every processor a target can be built for, so the block is exhaustive and the
+// answer is about purity rather than about a missing arm.
+//
+// The reference (0.0.158) anchors this refusal inside the standard library
+// (`library/sysl/text/width.sysl:299:1`), its 'asm' statement carrying no position of its own; a
+// diagnostic points at what the reader wrote, so here it is the 'asm' block.
+@test("a pure function may not contain an asm block")
+pux_contain_an_asm_block()
+    if !enm_ready() then return
+
+    val said = pux_built("@pure\nf() -> int\n    asm\n" +
+                         "        [aarch64, x86_64, riscv64, riscv32, thumb, wasm32, craft] \"nop\"\n\n" +
+                         "    1\n\nprint(f())\n")
+
+    assert(said.contains("error: a '@pure' function may contain no 'asm' block — what the instructions " +
+                         "do is outside anything the compiler can say about the call\n --> main.sysl:3:5\n"),
+           said)
+end pux_contain_an_asm_block
+
+// The clauses run on every call, so they are held to the rule the body is -- this would otherwise be
+// a pure function that prints.
+@test("a pure function may not print from inside its own contract")
+pux_print_from_its_own_contract()
+    if !enm_ready() then return
+
+    pux_refused(pux_built("noisy(x: int) -> bool\n    print(x)\n    true\n\n@pure\nf(x: int) -> int\n" +
+                          "    require noisy(x)\n    x\n\nprint(f(1))\n"),
+                "a '@pure' function calls 'noisy', which is not marked '@pure'", "7:13")
+
+// -- the diagnostics -------------------------------------------------------------------------------
+
+// `print` lowers to a call for the value and another for the newline: one line, one message.
+@test("the diagnostics give one message per line, not one per lowered node")
+pux_one_message_per_line()
+    if !enm_ready() then return
+
+    val said = pux_built("@pure\nf(x: int) -> int\n    print(x)\n    x\n")
+
+    assert_eq(said.count_of("error:"), 1)
+
+// Two mistakes on two lines are two places to change, so two messages.
+@test("and one per distinct mistake, where they are on distinct lines")
+pux_one_per_distinct_mistake()
+    if !enm_ready() then return
+
+    val said = pux_built("noisy(x: int) -> int = x + 1\n\n@pure\nf(p: *int, x: int) -> int\n" +
+                         "    *p = 5\n    noisy(x)\n")
+
+    assert_eq(said.count_of("error:"), 2)
+    pux_refused(said, "a '@pure' function writes through a reference to storage it did not create", "5:5")
+    pux_refused(said, "a '@pure' function calls 'noisy', which is not marked '@pure'", "6:5")
+end pux_one_per_distinct_mistake
+
+// -- the annotation itself -------------------------------------------------------------------------
+
+@test("the annotation is refused on anything but a function")
+pux_refused_on_anything_but_a_function()
+    if !enm_ready() then return
+
+    val said = pux_built("@pure\nstruct Point\n    x: int\n")
+
+    assert(said.contains("error: an annotation marks a function, and only a function — neither what " +
+                         "'sysl test' calls nor what recurses is anything a declaration of another kind " +
+                         "supplies. '@packed', '@align(n)' and '@export(\"...\")' are the three that mark " +
+                         "a struct instead\n --> main.sysl:2:1\n"), said)
+end pux_refused_on_anything_but_a_function
+
+@test("the annotation written twice is refused")
+pux_written_twice()
+    if !enm_ready() then return
+
+    val said = pux_built("@pure\n@pure\nf(x: int) -> int = x\n")
+
+    assert(said.contains("error: '@pure' is written twice above one declaration, and it says nothing " +
+                         "the once does not\n --> main.sysl:3:1\n"), said)
+
+// The reference anchors the refusal just past the unknown word and this compiler at its '@': the
+// line is what both agree on.
+@test("and an unknown annotation names the three that exist")
+pux_unknown_annotation()
+    if !enm_ready() then return
+
+    val said = pux_built("@sideways\nf(x: int) -> int = x\n")
+
+    assert(said.contains("error: 'sideways' is not an annotation a declaration takes — '@test', " +
+                         "'@setup', '@teardown', '@setup_all', '@teardown_all', '@tailrec', '@pure', " +
+                         "'@ghost', "), said)
+    assert(said.contains(" --> main.sysl:1:"), said)
+end pux_unknown_annotation
+
+@test("the annotation composes with the others")
+pux_composes_with_the_others()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("@pure\n@tailrec\nwalk(n: int, acc: int) -> int\n    if n == 0 then acc\n" +
+                      "    else walk(n - 1, acc + n)\n\nprint(walk(4, 0))\n"), "10\n")
+
+@test("a value may still be called 'pure'")
+pux_a_value_called_pure()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("f() -> int\n    var pure = 41\n    pure + 1\n\nprint(f())\n"), "42\n")
