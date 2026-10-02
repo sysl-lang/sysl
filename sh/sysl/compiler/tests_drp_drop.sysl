@@ -1,0 +1,526 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Status, capture}
+
+// A type-bound destructor (`reference/memory.md § A destructor`), the warning about a declaration
+// that hands one back by value, and integer division by zero -- the reference's `DropTests`,
+// `DropReturnWarningTests` and `DivByZeroRunTests`.
+//
+// **The claim about a destructor is that it runs wherever the last reference to a value goes,
+// including where no program could have written a call.** Each program prints from its destructor,
+// so the order and count of the lines is the assertion: one that ran twice, ran early or did not run
+// shows up as different output.
+//
+// **Every string quoted here was read out of the reference compiler** (0.0.154), by handing the
+// installed `sysl` the same source.
+
+private var drp_library_cache: Buf[Program] = buf()
+private var drp_library_read: bool = false
+
+private drp_library() -> Buf[Program]
+    if drp_library_read then return drp_library_cache
+
+    drp_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> drp_library_cache = units
+
+    drp_library_cache
+end drp_library
+
+private drp_has_library() -> bool
+    if drp_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    true
+end drp_has_library
+
+// A claim about a program that runs wants a toolchain as well.
+private drp_ready() -> bool
+    if !drp_has_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end drp_ready
+
+// **What a program printed, where it exited 0**; anything else answers with how it ended in front,
+// so a program that stopped cannot pass for one that printed the expected text.
+private drp_ran(text: string) -> string
+    val root = make_temp_dir("sysl-drop").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(o) -> o.status match
+            Status.Exited(code) -> if code == 0 then o.text else s"exited $code: ${o.text}"
+            Status.Signalled(sig) -> s"signalled $sig: ${o.text}"
+            _ -> s"timed out: ${o.text}"
+end drp_ran
+
+// Everything a source has to say for itself, taken through the lowering as the reference's `err` is.
+private drp_err(text: string) -> string
+    val root = make_temp_dir("sysl-drop").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end drp_err
+
+// The warnings one program raises, read beside the library -- `Drop` being one of its declarations.
+// A program that is refused has none to report, so a refusal is a broken fixture and says so.
+private drp_warnings(text: string) -> Buf[Placed]
+    val parsed = parse(source_of("test.sysl", text))
+    var units: Buf[Program] = buf()
+    val library = drp_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    assert(!any_errors(done.reported), s"expected a compilation, got:\n${analysis_report(done.reported)}")
+
+    program_of(done, "").warnings
+end drp_warnings
+
+// The LLVM text of the build that keeps a program's tests, which replaces its roots with the tests.
+private drp_test_ir(text: string) -> string
+    var units: Buf[Program] = buf()
+    val library = drp_library()
+
+    for i in 0..<library.len()
+        units.push(library.at(i))
+
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, host_target(), buf(), true)
+
+    if any_errors(done.reported) then return analysis_report(done.reported)
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks_of_tests(done.an, whole, own)
+
+    if any_errors(done.an.diagnostics()) then return analysis_report(done.an.diagnostics())
+
+    ir_print_module(codegen_with_gaps(tests_only(whole, own), host_target(), pr).0)
+end drp_test_ir
+
+// A type whose destructor announces itself. `id` is read *in* the destructor, which is what says the
+// value is still intact when it runs.
+private drp_handle() -> string = raw"""
+    struct Handle
+        id: int
+
+    impl Drop for Handle
+        drop(self) = print("drop", self.id)
+
+    """
+
+// -- DropTests: a destructor runs when the last reference goes --------------------------------------
+
+@test("a destructor runs at the end of the scope that held the only reference")
+drp_at_the_end_of_the_scope()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran(drp_handle() + raw"""
+        hold()
+            var a: &Handle = Handle(1)
+            print("in", a.id)
+
+        hold()
+        print("out")
+        """), "in 1\ndrop 1\nout\n")
+
+// Two references to one value: the first to go must not run it, and the second must.
+@test("a destructor runs once, however many references there were")
+drp_once_however_many_references()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran(drp_handle() + raw"""
+        hold()
+            var a: &Handle = Handle(7)
+            var b = a
+            print("two")
+
+        hold()
+        print("out")
+        """), "two\ndrop 7\nout\n")
+
+// Handing it back keeps it alive past the frame that made it, which is the case a destructor placed
+// at the end of every scope rather than at the count would get wrong.
+@test("a destructor does not run while a reference is still held elsewhere")
+drp_not_while_held_elsewhere()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran(drp_handle() + raw"""
+        make() -> &Handle = Handle(3)
+
+        var kept = make()
+        print("kept", kept.id)
+        print("end")
+        """), "kept 3\nend\ndrop 3\n")
+
+// -- including where no 'defer' could have been written ---------------------------------------------
+
+// Nothing in this program names the moment each element dies: the slice goes, and its elements go
+// with it. **They come apart last-to-first**, teardown draining a worklist that is a stack; no order
+// among siblings is promised, and this pins what it does today.
+@test("a destructor runs for an element of a container that goes out of scope")
+drp_an_element_of_a_container()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran(drp_handle() + raw"""
+        hold()
+            var xs: []&Handle = [Handle(1), Handle(2)]
+            print("held", xs.len)
+
+        hold()
+        print("out")
+        """), "held 2\ndrop 2\ndrop 1\nout\n")
+
+@test("and for one inside a struct inside a container")
+drp_inside_a_struct_inside_a_container()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran(drp_handle() + raw"""
+        struct Slot
+            it: &Handle
+
+        hold()
+            var xs: []Slot = [Slot(Handle(4)), Slot(Handle(5))]
+            print("held")
+
+        hold()
+        print("out")
+        """), "held\ndrop 5\ndrop 4\nout\n")
+
+// A destructor that lets go of a reference of its own: the inner value's destructor runs too, and
+// after the outer one, since the outer is handed a value that is still intact.
+@test("and for one whose own destructor releases the next")
+drp_a_destructor_releasing_the_next()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran(drp_handle() + raw"""
+        struct Chain
+            next: &Handle
+
+        impl Drop for Chain
+            drop(self) = print("chain", self.next.id)
+
+        hold()
+            var c: &Chain = Chain(Handle(9))
+            print("made")
+
+        hold()
+        print("out")
+        """), "made\nchain 9\ndrop 9\nout\n")
+
+// -- what it is handed, and what it may not do ------------------------------------------------------
+
+// It runs *before* the value's own references are released, so a field may be read to close what it
+// names.
+@test("a destructor reads its own fields, which are intact")
+drp_reads_its_own_fields()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran(raw"""
+        struct Pair
+            a: int
+            b: string
+
+        impl Drop for Pair
+            drop(self) = print(self.a, self.b)
+
+        hold()
+            var p: &Pair = Pair(2, "two")
+
+        hold()
+        print("out")
+        """), "2 two\nout\n")
+
+@test("a destructor answers nothing, so a result is refused")
+drp_answers_nothing()
+    if !drp_has_library() then return
+
+    val said = drp_err("struct P\n    x: int\n\nimpl Drop for P\n    drop(self) -> int = 1\n")
+
+    assert(said.starts_with("error: method 'drop' returns int, but trait 'sysl.Drop' declares unit"),
+           said)
+
+// `reference/memory.md § A destructor` states this limit outright: a value type is copied, and a
+// copy is not a second resource.
+@test("a value that never reaches the heap has no single death, so no destructor runs")
+drp_a_value_never_on_the_heap()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran(drp_handle() + raw"""
+        hold()
+            var h = Handle(1)
+            print("value", h.id)
+
+        hold()
+        print("out")
+        """), "value 1\nout\n")
+
+// Storage that lasts the whole run has nothing to write a release on (`reference/modules.md § val --
+// a thing`), so the count never reaches zero.
+@test("module storage never drops, since it is never let go of")
+drp_module_storage_never_drops()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran(drp_handle() + raw"""
+        static var kept: &Handle = Handle(5)
+        print("live", kept.id)
+        """), "live 5\n")
+
+// A test build replaces the roots, so a destructor -- which no reachable body names -- must still be
+// kept, the release hook calling it.
+@test("a test build keeps a destructor, which is the build with no other way to reach it")
+drp_a_test_build_keeps_the_destructor()
+    if !drp_has_library() then return
+
+    val ir = drp_test_ir(drp_handle() + raw"""
+        @test("a counted handle drops")
+        counted()
+            var a: &Handle = Handle(1)
+            assert_eq(a.id, 1)
+        """)
+
+    assert(ir.contains("define void @Handle.drop("), ir)
+
+// -- DropReturnWarningTests: a declaration handing back a Drop type by value ------------------------
+
+private drp_thing() -> string = raw"""
+    struct Thing
+        n: int
+
+    impl Drop for Thing
+        drop(self) = print(s"drop ${self.n}")
+    """
+
+private drp_hands_back() -> string =
+    "'make' hands back 'Thing' by value, and 'Thing' has a 'Drop' — a destructor runs when a box's " +
+    "count reaches zero, so nothing here will ever call it. Return '&Thing' instead, or take the " +
+    "resource apart before returning it"
+
+@test("a Drop type handed back through a Result, which is the shape a constructor actually has")
+drp_warned_through_a_result()
+    if !drp_has_library() then return
+
+    val w = drp_warnings(drp_thing() + "make(n: int) -> Result[Thing, string] = Ok(Thing(n))\nprint(1)\n")
+
+    assert_eq(w.len(), 1)
+    assert_eq(w.at(0).diag.message, drp_hands_back())
+    assert(!w.at(0).is_error(), "a warning, not an error")
+
+@test("and bare, which is the same claim with nothing wrapping it")
+drp_warned_bare()
+    if !drp_has_library() then return
+
+    assert_eq(drp_warnings(drp_thing() + "make(n: int) -> Thing = Thing(n)\nprint(1)\n").len(), 1)
+
+@test("and through an Option")
+drp_warned_through_an_option()
+    if !drp_has_library() then return
+
+    assert_eq(drp_warnings(drp_thing() + "make(n: int) -> Option[Thing] = Some(Thing(n))\nprint(1)\n").len(), 1)
+
+@test("a box handed back through a Result is not warned about, a '&T' being what a destructor is about")
+drp_a_box_through_a_result()
+    if !drp_has_library() then return
+
+    assert_eq(drp_warnings(drp_thing() + "make(n: int) -> Result[&Thing, string] = Ok(Thing(n))\nprint(1)\n").len(), 0)
+
+@test("nor a bare box")
+drp_a_bare_box()
+    if !drp_has_library() then return
+
+    assert_eq(drp_warnings(drp_thing() + "make(n: int) -> &Thing = Thing(n)\nprint(1)\n").len(), 0)
+
+@test("a type with no destructor is never mentioned")
+drp_no_destructor_no_mention()
+    if !drp_has_library() then return
+
+    assert_eq(drp_warnings("struct Plain\n    n: int\nmake(n: int) -> Result[Plain, string] = Ok(Plain(n))\nprint(1)\n").len(), 0)
+
+@test("the 'drop' member a Drop block declares is never warned about")
+drp_the_drop_member_itself()
+    if !drp_has_library() then return
+
+    assert_eq(drp_warnings(drp_thing() + "print(1)\n").len(), 0)
+
+@test("a raw pointer is not a claim about ownership, so it is not warned about")
+drp_a_raw_pointer()
+    if !drp_has_library() then return
+
+    assert_eq(drp_warnings(drp_thing() + "make(p: *Thing) -> *Thing = p\nprint(1)\n").len(), 0)
+
+@test("a slice of them is left alone, which is a decision rather than an oversight")
+drp_a_slice_of_them()
+    if !drp_has_library() then return
+
+    assert_eq(drp_warnings(drp_thing() + "first(xs: []Thing) -> []Thing = xs\nprint(1)\n").len(), 0)
+
+// **The boundary, asserted rather than described**: a Drop type in a struct field leaks exactly as a
+// by-value return does, and the check, keyed on declared return types, does not see it.
+@test("a Drop type held by a struct is not warned about, which is a limit rather than a decision")
+drp_held_by_a_struct()
+    if !drp_has_library() then return
+
+    assert_eq(drp_warnings(drp_thing() + "struct Holder\n    it: Thing\nwrap(t: Thing) -> Holder = Holder(t)\nprint(1)\n").len(), 0)
+
+// **Boxing the HOLDER does not save a field held by value**: the `Thing` inside it is a copy in that
+// box rather than a box of its own, so nothing's count reaches zero for it.
+@test("boxing the holder does not run a by-value field's destructor")
+drp_boxing_the_holder()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran(raw"""
+        struct Thing
+            n: int
+
+        impl Drop for Thing
+            drop(self) = print("drop", self.n)
+
+        struct ByValue
+            inner: Thing
+
+        struct Boxed
+            inner: &Thing
+
+        hold()
+            val a: &ByValue = ByValue(Thing(1))
+            val b: &Boxed = Boxed(Thing(2))
+
+        hold()
+        """), "drop 2\n")
+
+// The position names the declaration rather than the type, because the declaration is what has to
+// change.
+@test("the warning points at the declaration, which is what has to change")
+drp_the_warning_points_at_the_declaration()
+    if !drp_has_library() then return
+
+    val w = drp_warnings(drp_thing() + "make(n: int) -> Thing = Thing(n)\nprint(1)\n")
+
+    assert_eq(w.len(), 1)
+    assert_eq(w.at(0).render(), "warning: " + drp_hands_back() + "\n" + raw"""
+         --> test.sysl:6:1
+          |
+        6 | make(n: int) -> Thing = Thing(n)
+          | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        """)
+
+// A compilation that warns still succeeds -- the whole difference between the two severities.
+@test("a warning does not fail the compilation")
+drp_a_warning_does_not_fail()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran(drp_thing() + "make(n: int) -> Thing = Thing(n)\nprint(1)\n"), "1\n")
+
+// -- DivByZeroRunTests: a zero divisor traps rather than run an undefined `sdiv` --------------------
+
+// Every trapping divisor is read from a variable: a literal zero is already refused by the folder.
+// The reference's program ends on SIGTRAP (exit 133).
+
+@test("division by a nonzero divisor computes as usual")
+drp_division()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran("var d = 2\nprint(10 / d)\n"), "5\n")
+
+@test("remainder by a nonzero divisor computes as usual")
+drp_remainder()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran("var d = 3\nprint(10 % d)\n"), "1\n")
+
+@test("signed division by zero traps")
+drp_signed_division()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran("var d = 0\nprint(10 / d)\n"), "signalled 5: ")
+
+@test("signed remainder by zero traps")
+drp_signed_remainder()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran("var d = 0\nprint(10 % d)\n"), "signalled 5: ")
+
+@test("unsigned division by zero exercises the udiv guard")
+drp_unsigned_division()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran("var d: u64 = 0\nprint(10u64 / d)\n"), "signalled 5: ")
+
+@test("unsigned remainder by zero exercises the urem guard")
+drp_unsigned_remainder()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran("var d: u64 = 0\nprint(10u64 % d)\n"), "signalled 5: ")
+
+// The other undefined signed division: the minimum divided by -1, whose true quotient is one past
+// the maximum. The minimum is built by stepping one below -127, so no INT_MIN literal is needed.
+@test("the signed minimum divided by -1 traps")
+drp_minimum_by_minus_one_traps()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran("var a: i8 = -127\na = a - 1i8\nvar b: i8 = -1i8\nprint(int(a / b))\n"),
+              "signalled 5: ")
+
+@test("the signed minimum's remainder by -1 is its defined zero, not a trap")
+drp_minimum_remainder_is_zero()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran("var a: i8 = -127\na = a - 1i8\nvar b: i8 = -1i8\nprint(int(a % b))\n"), "0\n")
+
+@test("dividing a value other than the minimum by -1 is unaffected")
+drp_other_value_by_minus_one()
+    if !drp_ready() then return
+
+    assert_eq(drp_ran("var a: i8 = 10\nvar b: i8 = -1i8\nprint(int(a / b))\n"), "-10\n")
