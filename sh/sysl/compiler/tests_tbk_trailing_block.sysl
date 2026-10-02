@@ -1,0 +1,558 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `f:` and then an indented block -- an argument written as layout (`reference/expressions.md
+// § A trailing block`). Which of its two readings a block gets is read off the parameter it stands
+// at: an array of its lines at a collection, a closure over them at a callable, where the one value
+// such a closure is passed is called `it`.
+//
+// **Every output, message and location here was read out of the reference compiler** (0.0.155) on
+// the same program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private tbk_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+
+private tbk_write(main: string) -> string
+    val root = make_temp_dir("sysl-tbk").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+
+// What the program PRINTS, or what the build had to say about it.
+private tbk_ran(main: string) -> string
+    val root = tbk_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tbk_ran
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private tbk_refused(main: string, message: string, at: string)
+    val root = tbk_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(out.starts_with(s"error: $message\n --> ") || out.starts_with(s"error: $message\n  --> "),
+           s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+
+private tbk_total() -> string = raw"""
+    total(xs: []int) -> int
+        var t = 0
+
+        for i in 0..<xs.len
+            t += xs[i]
+
+        t
+
+    """
+
+// -- what the parser builds -----------------------------------------------------------------------
+
+@test("a block after an argument list is appended to it")
+tbk_after_an_argument_list()
+    assert_eq(pf("f(7):\n    1\n"), "(call f 7 (blockarg 1))")
+
+@test("a block after a method call is appended to that call")
+tbk_after_a_method_call()
+    assert_eq(pf("x.f(7):\n    1\n"), "(call (field x f) 7 (blockarg 1))")
+
+@test("a block may hold a block")
+tbk_a_block_holds_a_block()
+    assert_eq(pf("outer:\n    inner:\n        1\n"), "(call outer (blockarg (call inner (blockarg 1))))")
+
+@test("a block on the right of a binding")
+tbk_on_the_right_of_a_binding()
+    assert_eq(pf("val v = f:\n    1\n"), "(val v (call f (blockarg 1)))")
+
+// The one other place the language writes a colon after something the expression grammar could
+// have read. The trailing block commits to nothing until the indent is there.
+@test("'should_trap:' is not a block")
+tbk_should_trap_is_not_a_block()
+    assert_eq(pf("@test(\"it traps\", should_trap: \"out of range\")\nf()\n    print(1)\n"),
+              "(fn @test(\"it traps\")@should_trap(\"out of range\") f () (call print 1))")
+
+@test("an annotation's colon is not a block either")
+tbk_an_annotation_is_not_a_block()
+    assert_eq(pf("val x: int = 5\n"), "(val x : int 5)")
+
+// A bracket suspends the off-side rule until it closes, so there is no indent inside one for a
+// trailing block to be made of.
+@test("a block written inside parentheses, which the off-side rule leaves no room for")
+tbk_inside_parentheses()
+    assert_eq(pf_err("print(total:\n    1\n)\n"), "identifier expected")
+    assert_eq(pf_at("print(total:\n    1\n)\n"), "2:5")
+
+// -- a block at a collection parameter is an array of its lines ------------------------------------
+
+@test("the lines become the elements")
+tbk_the_lines_become_the_elements()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran(tbk_total() + "val n = total:\n    1\n    2\n    3\n\nprint(n)\n"), "6\n")
+
+@test("a block beside arguments written in the parentheses")
+tbk_beside_written_arguments()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran(raw"""
+        joined(sep: string, xs: []string) -> string
+            var s = ""
+
+            for i in 0..<xs.len
+                if i > 0 then s += sep
+
+                s += xs[i]
+
+            s
+
+        val out = joined("-"):
+            "a"
+            "b"
+            "c"
+
+        print(out)
+        """), "a-b-c\n")
+
+// `if` is already an expression whose arms must agree in type, so a branch is one line like any other.
+@test("a branch is an ordinary line, because 'if' is an expression")
+tbk_a_branch_is_an_ordinary_line()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran(tbk_total() + "val big = true\n\nval n = total:\n    1\n    if big then 100 else 2\n\n" +
+                      "print(n)\n"), "101\n")
+
+@test("a defaulted parameter after the block still takes its default")
+tbk_a_default_after_the_block()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran(raw"""
+        total(xs: []int, bonus: int = 10) -> int
+            var t = bonus
+
+            for i in 0..<xs.len
+                t += xs[i]
+
+            t
+
+        val n = total:
+            1
+            2
+
+        print(n)
+        """), "13\n")
+
+// A block has no position of its own, so a name written before it does not strand it.
+@test("a named argument before it does not take its place")
+tbk_a_named_argument_before_it()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran(raw"""
+        total(xs: []int, bonus: int) -> int
+            var t = bonus
+
+            for i in 0..<xs.len
+                t += xs[i]
+
+            t
+
+        val n = total(bonus = 100):
+            1
+            2
+
+        print(n)
+        """), "103\n")
+
+@test("the lines may be different types reaching one erased element type")
+tbk_lines_reach_one_erased_type()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran(raw"""
+        trait Shape
+            area(&self) -> int
+
+        struct Square
+            w: int
+
+        impl Shape for Square
+            area(&self) -> int = self.w * self.w
+
+        struct Rect
+            w: int
+            h: int
+
+        impl Shape for Rect
+            area(&self) -> int = self.w * self.h
+
+        total(shapes: []&Shape) -> int
+            var t = 0
+
+            for i in 0..<shapes.len
+                t += shapes[i].area()
+
+            t
+
+        val n = total:
+            Square(3)
+            Rect(2, 5)
+            Square(1)
+
+        print(n)
+        """), "20\n")
+
+@test("nested blocks build a tree")
+tbk_nested_blocks_build_a_tree()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran(raw"""
+        node(name: string, kids: []string) -> string
+            var s = name + "("
+
+            for i in 0..<kids.len
+                if i > 0 then s += " "
+
+                s += kids[i]
+
+            s + ")"
+
+        val tree = node("a"):
+            node("b"):
+                "c"
+                "d"
+            "e"
+
+        print(tree)
+        """), "a(b(c d) e)\n")
+
+// -- a block at a callable parameter is a closure over its lines -----------------------------------
+
+@test("the block is the body and the last line is its value")
+tbk_the_block_is_the_body()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("apply(f: () -> int) -> int = f()\n\nval n = apply:\n    val a = 6\n    val b = 7\n" +
+                      "    a * b\n\nprint(n)\n"), "42\n")
+
+// Unlike a collection's, a callable's block is a body, so a statement in it is ordinary.
+@test("a binding inside it is an ordinary statement")
+tbk_a_binding_inside_it()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("twice(f: () -> unit)\n    f()\n    f()\n\ntwice:\n    var n = 3\n    print(n * n)\n"),
+              "9\n9\n")
+
+@test("a block at a '&Fn' parameter, which is the same reading through a mode")
+tbk_at_a_counted_fn()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("later(f: &Fn() -> unit)\n    f()\n\nlater:\n    print(\"ran\")\n"), "ran\n")
+
+@test("it closes over what it reads")
+tbk_it_closes_over_what_it_reads()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("apply(f: () -> int) -> int = f()\n\nval n = 5\n\nval sq = apply:\n    n * n\n\n" +
+                      "print(sq)\n"), "25\n")
+
+// A by-name parameter's type is `Fn() -> T`, so a block at one is a closure by the ordinary rule --
+// and the thunk the call site would otherwise wrap it in must not be applied twice.
+@test("a block at a by-name parameter is not thunked twice")
+tbk_at_a_by_name_parameter()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran(raw"""
+        rep(n: int, x: -> int) -> int
+            var t = 0
+
+            for i in 0..<n
+                t += x
+
+            t
+
+        val n = rep(3):
+            5
+
+        print(n)
+        """), "15\n")
+
+// -- a block reaches every call form ---------------------------------------------------------------
+
+@test("a method's parameter")
+tbk_a_methods_parameter()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran(raw"""
+        struct Runner
+            n: int
+
+            go(self, f: &Fn() -> unit)
+                for i in 0..<self.n
+                    f()
+        end Runner
+
+        val r = Runner(2)
+
+        r.go:
+            print("tick")
+        """), "tick\ntick\n")
+
+@test("a struct's field")
+tbk_a_structs_field()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran(raw"""
+        struct Menu
+            title: string
+            items: [3]int
+
+        val m = Menu("m"):
+            1
+            2
+            3
+
+        print(m.title + str(m.items[2]))
+        """), "m3\n")
+
+// Overload resolution reads the candidates off the arguments' types before the parameter lists are
+// paired off, so a block is asked a question it cannot answer: it declines, and the reader is told
+// the arguments did not settle it.
+@test("an overload set, which a block cannot tell apart")
+tbk_an_overload_set()
+    if tbk_skip() then return
+
+    tbk_refused(raw"""
+        trait Runs
+            on(&self, f: &Fn() -> unit)
+
+        trait Counts
+            on(&self, n: int)
+
+        struct W
+            k: int
+
+        impl Runs for W
+            on(&self, f: &Fn() -> unit) = f()
+
+        impl Counts for W
+            on(&self, n: int) = print(n)
+
+        val w = W(1)
+
+        w.on:
+            print("x")
+        """, "'on' on W comes from Runs and Counts, and each is in scope here — nothing in the call says " +
+             "which was meant", "18:3")
+
+// -- what a block may not stand at -----------------------------------------------------------------
+
+@test("a parameter that is neither a collection nor a callable")
+tbk_neither_a_collection_nor_a_callable()
+    if tbk_skip() then return
+
+    tbk_refused("f(n: int) = n\n\nval x = f:\n    1\n\nprint(x)\n",
+                "a trailing block stands at 'n', which is a 'int' — a block fills a collection parameter " +
+                "as an array of its lines, or a callable parameter as a closure over them, and this is " +
+                "neither", "3:10")
+
+@test("a call with no parameters to stand at")
+tbk_no_parameters_to_stand_at()
+    if tbk_skip() then return
+
+    tbk_refused("f() = ()\n\nf:\n    1\n",
+                "there is no parameter for this trailing block to stand at — a block fills the parameter " +
+                "its position gives it, exactly as an argument written in the parentheses does", "3:2")
+
+@test("a line of a collection's block that is not a value")
+tbk_a_line_that_is_not_a_value()
+    if tbk_skip() then return
+
+    tbk_refused("total(xs: []int) -> int = 0\n\nval n = total:\n    var k = 1\n    k\n\nprint(n)\n",
+                "every line of a trailing block filling a collection is one of its elements, so it has " +
+                "to be a value — this one declares a name instead. A binding goes outside the block, " +
+                "which is then given what it built", "4:5")
+
+// A loop is a statement, so it is not a line of a list; the message says where the loop goes.
+@test("a loop inside a collection's block, which is the limit the design accepts")
+tbk_a_loop_in_a_collections_block()
+    if tbk_skip() then return
+
+    tbk_refused("total(xs: []int) -> int = 0\n\nval n = total:\n    for k in 0..<3\n        k\n\nprint(n)\n",
+                "a loop inside a trailing block filling a collection would contribute one element and " +
+                "not one per iteration, so it is refused rather than read that way — build the elements " +
+                "into a 'Buf' before the call and pass a view of it", "4:5")
+
+// -- the one value a block is passed is 'it' -------------------------------------------------------
+
+@test("a block at a one-parameter callable binds it")
+tbk_a_one_parameter_callable_binds_it()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("on_change(f: &Fn(int) -> unit) = f(42)\n\non_change:\n    print(it)\n"), "42\n")
+
+@test("and the block is still a body, so it is what the lines are written against")
+tbk_still_a_body()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("apply(f: &Fn(int) -> int) -> int = f(6)\n\nval n = apply:\n    val k = it + 1\n" +
+                      "    k * k\n\nprint(n)\n"), "49\n")
+
+// A bare arrow is a bounded type parameter by the time argument binding reads it, carrying no
+// arity of its own, so this is the test that the arity reaches the place that names the value.
+@test("including a parameter written as a bare arrow, whose arity binding cannot see")
+tbk_a_bare_arrow_parameter()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("each(xs: []int, f: int -> unit)\n    for i in 0..<xs.len\n        f(xs[i])\n\n" +
+                      "each([1, 2, 3]):\n    print(it * 10)\n"), "10\n20\n30\n")
+
+@test("a block that has no use for the value simply never writes it")
+tbk_never_writes_it()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("on_change(f: &Fn(int) -> unit) = f(42)\n\non_change:\n    print(\"changed\")\n"),
+              "changed\n")
+
+@test("a zero-arity callable binds nothing, so 'it' there is whatever the scope already had")
+tbk_zero_arity_binds_nothing()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("later(f: &Fn() -> unit) = f()\n\nval it = 7\n\nlater:\n    print(it)\n"), "7\n")
+
+@test("the block's own binding shadows it, as it would shadow a written parameter")
+tbk_its_own_binding_shadows_it()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("apply(f: &Fn(int) -> int) -> int = f(6)\n\nval n = apply:\n    val it = 100\n" +
+                      "    it + 1\n\nprint(n)\n"), "101\n")
+
+@test("and it shadows an outer name of its own")
+tbk_it_shadows_an_outer_name()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("apply(f: &Fn(int) -> int) -> int = f(6)\n\nval it = 100\n\nval n = apply:\n" +
+                      "    it + 1\n\nprint(n)\n"), "7\n")
+
+@test("an inner block's hides an outer block's")
+tbk_an_inner_block_hides_the_outer()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("outer(f: &Fn(int) -> int) -> int = f(1)\ninner(f: &Fn(int) -> int) -> int = f(2)\n\n" +
+                      "val n = outer:\n    inner:\n        it * 10\n\nprint(n)\n"), "20\n")
+
+// The outer block's `it` is a parameter of the outer closure, so the inner one reaches it by capture.
+@test("and a zero-arity block inside a one-arity block still reads the outer one's")
+tbk_a_zero_arity_block_reads_the_outer()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("outer(f: &Fn(int) -> int) -> int = f(6)\nlater(f: &Fn() -> unit) = f()\n\n" +
+                      "val n = outer:\n    later:\n        print(it)\n\n    it * 2\n\nprint(n)\n"), "6\n12\n")
+
+@test("a closure literal written inside the block captures it")
+tbk_a_closure_literal_captures_it()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran("apply(f: &Fn(int) -> int) -> int = f(6)\ntwice(g: &Fn(int) -> int) -> int = g(1) + g(2)\n\n" +
+                      "val n = apply:\n    twice((k) -> k * it)\n\nprint(n)\n"), "18\n")
+
+@test("it reaches a method's parameter, which is where a widget's handler is")
+tbk_a_methods_handler()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran(raw"""
+        struct Field
+            tag: int
+
+            on_change(self, f: &Fn(int) -> unit) = f(self.tag * 2)
+
+        val fld = Field(21)
+
+        fld.on_change:
+            print(it)
+        """), "42\n")
+
+// The reading is decided by the parameter, and the collection reading binds no name.
+@test("a collection's block binds nothing, so 'it' there is an undefined name")
+tbk_a_collections_block_binds_nothing()
+    if tbk_skip() then return
+
+    tbk_refused("total(xs: []int) -> int = xs[0]\n\nval n = total:\n    it\n\nprint(n)\n",
+                "undefined name 'it'", "4:5")
+
+@test("two or more is refused by name, and the closure literal is what it points at")
+tbk_two_or_more_is_refused()
+    if tbk_skip() then return
+
+    tbk_refused("on_drag(f: &Fn(int, int) -> unit) = f(1, 2)\n\non_drag:\n    print(it)\n",
+                "a trailing block binds the one value it is passed as 'it', so it stands at a callable " +
+                "taking one or none — and what this one is being used as takes 2. Write it as a closure " +
+                "literal, which names its parameters: '(a, b) -> …'", "3:8")
+
+// `*Fn` points at a value the caller owns, and a block is a temporary exactly as a closure literal is.
+@test("a raw trait object is the one callable spelling a block cannot fill")
+tbk_a_raw_trait_object()
+    if tbk_skip() then return
+
+    tbk_refused("on_change(f: *Fn(int) -> unit) = f(42)\n\non_change:\n    print(it)\n",
+                "a *Fn(int) -> unit points at a value, so it needs an address — write '&' in front of " +
+                "the closure to take one", "3:10")
+
+@test("a block reaches the standard library's own callables")
+tbk_reaches_the_librarys_callables()
+    if tbk_skip() then return
+
+    assert_eq(tbk_ran(raw"""
+        import sysl.seq.Sequence
+
+        val xs = [1, 2, 3, 4]
+
+        val evens = xs[..].filter:
+            it % 2 == 0
+
+        print(evens)
+
+        val doubled = xs[..].map:
+            it * 2
+
+        print(doubled)
+        """), "[2, 4]\n[2, 4, 6, 8]\n")
+
+@test("while a written closure's arity is still refused by counting it")
+tbk_a_written_closures_arity()
+    if tbk_skip() then return
+
+    tbk_refused("on_drag(f: &Fn(int, int) -> unit) = f(1, 2)\n\non_drag((a) -> print(a))\n",
+                "this closure takes 1 parameter, and what it is being used as takes 2", "3:9")
